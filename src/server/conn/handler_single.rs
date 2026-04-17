@@ -1098,6 +1098,168 @@ pub async fn handle_connection(
                                         Some(ref mut guard) => &mut **guard,
                                         None => &mut fallback_ts,
                                     };
+                                    // ── 151-03 non-sharded text FT.SEARCH fast path ──
+                                    // Bare text queries bypass ft_search() (KNN/SPARSE/HYBRID
+                                    // only) and route to execute_text_search_local. Mirrors the
+                                    // monoio/sharded single-shard fast paths. HYBRID falls
+                                    // through to the existing ft_search() chain below.
+                                    // Note: we reuse the already-acquired ts_mut borrow instead
+                                    // of re-locking (parking_lot Mutex is not re-entrant).
+                                    #[cfg(feature = "text-index")]
+                                    if cmd.eq_ignore_ascii_case(b"FT.SEARCH") {
+                                        if let Some(crate::protocol::Frame::BulkString(query_bytes)) = cmd_args.get(1) {
+                                            match crate::command::vector_search::parse_hybrid_modifier(cmd_args) {
+                                                Ok(Some(_)) => {
+                                                    // HYBRID present — defer to existing ft_search() chain below.
+                                                }
+                                                Err(frame_err) => {
+                                                    responses.push(frame_err);
+                                                    continue;
+                                                }
+                                                Ok(None) => {
+                                                    if crate::command::vector_search::is_text_query(
+                                                        query_bytes.as_ref(),
+                                                    ) {
+                                                        // Step 1: index_name.
+                                                        let index_name = match cmd_args.first() {
+                                                            Some(crate::protocol::Frame::BulkString(b)) => b.clone(),
+                                                            _ => {
+                                                                responses.push(crate::protocol::Frame::Error(bytes::Bytes::from_static(
+                                                                    b"ERR wrong number of arguments for FT.SEARCH",
+                                                                )));
+                                                                continue;
+                                                            }
+                                                        };
+                                                        // Step 2: TextStore is already borrowed via ts_mut (no extra guard to drop).
+                                                        // When text_store is None, ts_mut points at the empty fallback —
+                                                        // get_index() returns None → Step 3 emits "ERR no such index" (correct).
+                                                        // Step 3: index lookup.
+                                                        let text_index = match ts_mut.get_index(&index_name) {
+                                                            Some(idx) => idx,
+                                                            None => {
+                                                                responses.push(crate::protocol::Frame::Error(bytes::Bytes::from_static(
+                                                                    b"ERR no such index",
+                                                                )));
+                                                                continue;
+                                                            }
+                                                        };
+                                                        // Step 4: ensure at least one TEXT field.
+                                                        if text_index.text_fields.is_empty() {
+                                                            responses.push(crate::protocol::Frame::Error(bytes::Bytes::from_static(
+                                                                b"ERR index has no TEXT fields",
+                                                            )));
+                                                            continue;
+                                                        }
+                                                        // Step 5: parse via first analyzer.
+                                                        let analyzer = match text_index.field_analyzers.first() {
+                                                            Some(a) => a,
+                                                            None => {
+                                                                responses.push(crate::protocol::Frame::Error(bytes::Bytes::from_static(
+                                                                    b"ERR index has no TEXT fields",
+                                                                )));
+                                                                continue;
+                                                            }
+                                                        };
+                                                        let clause = match crate::command::vector_search::parse_text_query(
+                                                            query_bytes.as_ref(),
+                                                            analyzer,
+                                                        ) {
+                                                            Ok(c) => c,
+                                                            Err(msg) => {
+                                                                responses.push(crate::protocol::Frame::Error(
+                                                                    bytes::Bytes::copy_from_slice(msg.as_bytes()),
+                                                                ));
+                                                                continue;
+                                                            }
+                                                        };
+                                                        // Step 5b: resolve field_idx.
+                                                        let field_idx = match &clause.field_name {
+                                                            None => None,
+                                                            Some(field_name) => match text_index
+                                                                .text_fields
+                                                                .iter()
+                                                                .position(|f| {
+                                                                    f.field_name.as_ref().eq_ignore_ascii_case(
+                                                                        field_name.as_ref(),
+                                                                    )
+                                                                }) {
+                                                                Some(idx) => Some(idx),
+                                                                None => {
+                                                                    let bad_name = field_name.clone();
+                                                                    responses.push(crate::protocol::Frame::Error(bytes::Bytes::from(
+                                                                        format!(
+                                                                            "ERR unknown field '{}'",
+                                                                            String::from_utf8_lossy(&bad_name)
+                                                                        ),
+                                                                    )));
+                                                                    continue;
+                                                                }
+                                                            },
+                                                        };
+                                                        // Step 6: query_terms.
+                                                        let query_terms = clause.terms;
+                                                        // Step 7: LIMIT + top_k cap (T-151-03-02).
+                                                        let (offset, count) =
+                                                            crate::command::vector_search::parse_limit_clause(
+                                                                cmd_args,
+                                                            );
+                                                        let top_k = if count == usize::MAX {
+                                                            10000
+                                                        } else {
+                                                            offset.saturating_add(count)
+                                                        }
+                                                        .max(1);
+                                                        // Step 8: HIGHLIGHT / SUMMARIZE.
+                                                        let highlight_opts =
+                                                            crate::command::vector_search::parse_highlight_clause(
+                                                                cmd_args,
+                                                            );
+                                                        let summarize_opts =
+                                                            crate::command::vector_search::parse_summarize_clause(
+                                                                cmd_args,
+                                                            );
+                                                        // Step 9: DB read guard iff post-processing needed.
+                                                        let db_guard_opt = if highlight_opts.is_some()
+                                                            || summarize_opts.is_some()
+                                                        {
+                                                            Some(db[conn.selected_db].read())
+                                                        } else {
+                                                            None
+                                                        };
+                                                        // Step 10: execute + optional post-processing.
+                                                        let mut response =
+                                                            crate::command::vector_search::execute_text_search_local(
+                                                                &*ts_mut,
+                                                                &index_name,
+                                                                field_idx,
+                                                                &query_terms,
+                                                                top_k,
+                                                                offset,
+                                                                count,
+                                                            );
+                                                        if let Some(ref db_guard) = db_guard_opt {
+                                                            let term_strings: Vec<String> = query_terms
+                                                                .iter()
+                                                                .map(|qt| qt.text.clone())
+                                                                .collect();
+                                                            crate::command::vector_search::apply_post_processing(
+                                                                &mut response,
+                                                                &term_strings,
+                                                                text_index,
+                                                                db_guard,
+                                                                highlight_opts.as_ref(),
+                                                                summarize_opts.as_ref(),
+                                                            );
+                                                        }
+                                                        // Explicit drop of db_guard (inner); ts_mut / ts_guard drop at scope end.
+                                                        drop(db_guard_opt);
+                                                        responses.push(response);
+                                                        continue;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
                                     let response = if cmd.eq_ignore_ascii_case(b"FT.CREATE") {
                                         crate::command::vector_search::ft_create(&mut *store, ts_mut, cmd_args)
                                     } else if cmd.eq_ignore_ascii_case(b"FT.SEARCH") {
