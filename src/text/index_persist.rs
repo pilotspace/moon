@@ -311,10 +311,7 @@ pub fn save_fst_sidecar(
 ///
 /// Returns empty Vec if file not present (D-11: missing sidecar = fst_maps stay None).
 /// Returns `Vec<Option<Vec<u8>>>` — one entry per field, None if that field had no FST.
-pub fn load_fst_sidecar(
-    shard_dir: &Path,
-    index_name: &[u8],
-) -> io::Result<Vec<Option<Vec<u8>>>> {
+pub fn load_fst_sidecar(shard_dir: &Path, index_name: &[u8]) -> io::Result<Vec<Option<Vec<u8>>>> {
     let name_str = String::from_utf8_lossy(index_name);
     let path = shard_dir.join(format!("{name_str}.fst"));
     if !path.exists() {
@@ -332,10 +329,7 @@ pub fn load_fst_sidecar(
         ));
     }
     if &data[0..4] != FST_MAGIC {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "bad FST magic",
-        ));
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "bad FST magic"));
     }
     let version = data[4];
     if version != FST_VERSION {

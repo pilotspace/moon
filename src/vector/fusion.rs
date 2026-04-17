@@ -288,8 +288,7 @@ mod tests {
         let sparse = vec![sr(5.0, 10, 100), sr(3.0, 11, 300)];
 
         let (baseline, _, _) = rrf_fuse(&dense, &sparse, 10);
-        let (three, bc, dc, sc) =
-            rrf_fuse_three(&[], &dense, &sparse, [0.0, 1.0, 1.0], 10);
+        let (three, bc, dc, sc) = rrf_fuse_three(&[], &dense, &sparse, [0.0, 1.0, 1.0], 10);
         assert_eq!(bc, 0);
         assert_eq!(dc, 2);
         assert_eq!(sc, 2);
@@ -314,8 +313,7 @@ mod tests {
         let bm25 = vec![sr(-10.0, 1, 100), sr(-5.0, 2, 200)];
         let dense = vec![sr(0.1, 3, 100), sr(0.3, 4, 300)];
         let sparse = vec![sr(5.0, 5, 100), sr(3.0, 6, 400)];
-        let (results, bc, dc, sc) =
-            rrf_fuse_three(&bm25, &dense, &sparse, [1.0, 1.0, 1.0], 10);
+        let (results, bc, dc, sc) = rrf_fuse_three(&bm25, &dense, &sparse, [1.0, 1.0, 1.0], 10);
         assert_eq!(bc, 2);
         assert_eq!(dc, 2);
         assert_eq!(sc, 2);
@@ -335,8 +333,7 @@ mod tests {
         let bm25 = vec![sr(-10.0, 1, 100)];
         let dense = vec![];
         let sparse = vec![sr(5.0, 2, 200)];
-        let (results, _, _, _) =
-            rrf_fuse_three(&bm25, &dense, &sparse, [2.0, 1.0, 0.5], 10);
+        let (results, _, _, _) = rrf_fuse_three(&bm25, &dense, &sparse, [2.0, 1.0, 0.5], 10);
         assert_eq!(results.len(), 2);
         // BM25 doc (weight 2.0 at rank 0) should rank before sparse (weight 0.5 at rank 0).
         assert_eq!(results[0].key_hash, 100);
@@ -349,15 +346,17 @@ mod tests {
         let bm25 = vec![sr(-10.0, 1, 100)]; // bm25-only doc
         let dense = vec![sr(0.1, 2, 200)];
         let sparse = vec![sr(5.0, 3, 300)];
-        let (results, bc, dc, sc) =
-            rrf_fuse_three(&bm25, &dense, &sparse, [0.0, 1.0, 1.0], 10);
+        let (results, bc, dc, sc) = rrf_fuse_three(&bm25, &dense, &sparse, [0.0, 1.0, 1.0], 10);
         // Counts still reflect raw input lengths (100% computed).
         assert_eq!(bc, 1);
         assert_eq!(dc, 1);
         assert_eq!(sc, 1);
         // But key_hash=100 must NOT appear (weight 0 → stream skipped).
         let hashes: Vec<u64> = results.iter().map(|r| r.key_hash).collect();
-        assert!(!hashes.contains(&100), "bm25-only doc must be disabled at w=0");
+        assert!(
+            !hashes.contains(&100),
+            "bm25-only doc must be disabled at w=0"
+        );
         assert!(hashes.contains(&200));
         assert!(hashes.contains(&300));
     }
@@ -367,8 +366,7 @@ mod tests {
         let bm25 = vec![sr(-10.0, 1, 0), sr(-5.0, 2, 200)];
         let dense = vec![sr(0.1, 3, 0)];
         let sparse = vec![sr(5.0, 4, 400)];
-        let (results, bc, dc, sc) =
-            rrf_fuse_three(&bm25, &dense, &sparse, [1.0, 1.0, 1.0], 10);
+        let (results, bc, dc, sc) = rrf_fuse_three(&bm25, &dense, &sparse, [1.0, 1.0, 1.0], 10);
         assert_eq!(bc, 2);
         assert_eq!(dc, 1);
         assert_eq!(sc, 1);
@@ -392,8 +390,7 @@ mod tests {
         let sparse: Vec<SearchResult> = (0..10)
             .map(|i| sr(i as f32, 200 + i, (i + 21) as u64 * 100))
             .collect();
-        let (results, _, _, _) =
-            rrf_fuse_three(&bm25, &dense, &sparse, [1.0, 1.0, 1.0], 5);
+        let (results, _, _, _) = rrf_fuse_three(&bm25, &dense, &sparse, [1.0, 1.0, 1.0], 5);
         assert_eq!(results.len(), 5);
     }
 
@@ -404,8 +401,7 @@ mod tests {
         let bm25 = vec![sr(-10.0, 1, 100)];
         let dense = vec![sr(0.1, 2, 200)];
         let sparse = vec![sr(5.0, 3, 300)];
-        let (results, _, _, _) =
-            rrf_fuse_three(&bm25, &dense, &sparse, [1.0, -0.5, 1.0], 10);
+        let (results, _, _, _) = rrf_fuse_three(&bm25, &dense, &sparse, [1.0, -0.5, 1.0], 10);
         let hashes: Vec<u64> = results.iter().map(|r| r.key_hash).collect();
         // Dense stream (w=-0.5) disabled → doc 200 absent.
         assert!(!hashes.contains(&200));
@@ -419,8 +415,7 @@ mod tests {
         let bm25 = vec![sr(-10.0, 1, 100)];
         let dense = vec![sr(0.1, 2, 200)];
         let sparse = vec![sr(5.0, 3, 300)];
-        let (results, _, _, _) =
-            rrf_fuse_three(&bm25, &dense, &sparse, [1.0, f32::NAN, 1.0], 10);
+        let (results, _, _, _) = rrf_fuse_three(&bm25, &dense, &sparse, [1.0, f32::NAN, 1.0], 10);
         let hashes: Vec<u64> = results.iter().map(|r| r.key_hash).collect();
         assert!(!hashes.contains(&200));
         assert!(hashes.contains(&100));
@@ -432,8 +427,7 @@ mod tests {
         let bm25 = vec![sr(-10.0, 1, 42)];
         let dense = vec![sr(0.1, 2, 99)];
         let sparse = vec![sr(5.0, 3, 77)];
-        let (results, _, _, _) =
-            rrf_fuse_three(&bm25, &dense, &sparse, [1.0, 1.0, 1.0], 10);
+        let (results, _, _, _) = rrf_fuse_three(&bm25, &dense, &sparse, [1.0, 1.0, 1.0], 10);
         let hashes: Vec<u64> = results.iter().map(|r| r.key_hash).collect();
         assert!(hashes.contains(&42));
         assert!(hashes.contains(&99));

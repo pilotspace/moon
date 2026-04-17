@@ -1,3 +1,5 @@
+#[cfg(feature = "text-index")]
+use fst::automaton::Str;
 /// FST-based term dictionary for fuzzy and prefix search.
 ///
 /// Provides three expansion functions:
@@ -10,8 +12,6 @@
 /// All public functions require the `text-index` feature flag.
 #[cfg(feature = "text-index")]
 use fst::{Automaton, IntoStreamer, Map, MapBuilder, Streamer};
-#[cfg(feature = "text-index")]
-use fst::automaton::Str;
 #[cfg(feature = "text-index")]
 use levenshtein_automata::LevenshteinAutomatonBuilder;
 
@@ -240,10 +240,14 @@ fn levenshtein_distance(a: &str, b: &str) -> usize {
     for i in 1..=m {
         curr[0] = i;
         for j in 1..=n {
-            let cost = if a_chars[i - 1] == b_chars[j - 1] { 0 } else { 1 };
-            curr[j] = (prev[j] + 1)          // deletion
-                .min(curr[j - 1] + 1)         // insertion
-                .min(prev[j - 1] + cost);      // substitution
+            let cost = if a_chars[i - 1] == b_chars[j - 1] {
+                0
+            } else {
+                1
+            };
+            curr[j] = (prev[j] + 1) // deletion
+                .min(curr[j - 1] + 1) // insertion
+                .min(prev[j - 1] + cost); // substitution
         }
         std::mem::swap(&mut prev, &mut curr);
     }
@@ -390,7 +394,10 @@ mod tests {
 
         // With high_water_mark=1, only "apricot" is scanned
         let results = expand_prefix_hashmap(&dict, "ap", &ps, 1, 50);
-        assert!(results.contains(&id_new), "apricot should match 'ap' prefix");
+        assert!(
+            results.contains(&id_new),
+            "apricot should match 'ap' prefix"
+        );
         assert!(
             !results.contains(&_id_old),
             "apple (id=0) should be skipped (below high_water_mark)"
