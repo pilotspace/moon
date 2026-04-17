@@ -93,3 +93,41 @@ impl TagFieldDef {
         }
     }
 }
+
+/// NUMERIC field definition parsed from FT.CREATE (Plan 152-07).
+///
+/// NUMERIC semantics (matches RediSearch):
+/// - Range filter lookup via `@field:[min max]`, `[(min max]`, `[min (max]`,
+///   `[(min (max]`, `[-inf +inf]` — closed / half-open, with `-inf` / `+inf`
+///   sentinels for unbounded sides.
+/// - Field-name resolution is case-insensitive (`@Score:[1 10]` resolves `score`).
+/// - Values parsed as `f64` on HSET; non-numeric / NaN / Infinity values are
+///   skipped silently with `tracing::debug!` (RediSearch-compatible — NOT an error).
+///
+/// The `FieldFilter` enum (declared in `command::vector_search::ft_text_search`)
+/// carries NUMERIC range clauses through the query path without invoking the
+/// text analyzer. Storage is `HashMap<field, BTreeMap<OrderedFloat<f64>, RoaringBitmap<doc_id>>>`
+/// so `BTreeMap::range` yields O(log N) range resolution.
+#[cfg(feature = "text-index")]
+#[derive(Debug, Clone)]
+pub struct NumericFieldDef {
+    /// Canonical field name. Stored once; comparisons use `eq_ignore_ascii_case`
+    /// so queries for `@Score:[1 10]` still resolve `score`.
+    pub field_name: bytes::Bytes,
+    /// Whether to expose the field for SORTABLE-aware aggregation (v1: stored, not consumed).
+    pub sortable: bool,
+    /// Declared but not indexed (schema recall only).
+    pub noindex: bool,
+}
+
+#[cfg(feature = "text-index")]
+impl NumericFieldDef {
+    /// Create a new NUMERIC field definition with RediSearch-compatible defaults.
+    pub fn new(field_name: bytes::Bytes) -> Self {
+        Self {
+            field_name,
+            sortable: false,
+            noindex: false,
+        }
+    }
+}

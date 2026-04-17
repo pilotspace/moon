@@ -32,6 +32,7 @@ fn tag_only_index(tag_names: &[&[u8]]) -> TextIndex {
         Vec::new(),
         Vec::new(),
         tag_fields,
+        Vec::new(),
         BM25Config::default(),
     )
 }
@@ -112,6 +113,7 @@ fn tag_index_document_custom_separator() {
         Vec::new(),
         Vec::new(),
         vec![tag_def],
+        Vec::new(),
         BM25Config::default(),
     );
     let args = tag_args(&[(b"tags", b"a;b;c")]);
@@ -145,6 +147,7 @@ fn tag_case_sensitive_preserves_case() {
         Vec::new(),
         Vec::new(),
         vec![tag_def],
+        Vec::new(),
         BM25Config::default(),
     );
     let args = tag_args(&[(b"code", b"Open")]);
@@ -237,6 +240,7 @@ fn tag_ensure_doc_id_shared_allocator() {
         Vec::new(),
         vec![TextFieldDef::new(Bytes::from_static(b"body"))],
         vec![TagFieldDef::new(Bytes::from_static(b"status"))],
+        Vec::new(),
         BM25Config::default(),
     );
     let tag_args_v = tag_args(&[(b"status", b"open")]);

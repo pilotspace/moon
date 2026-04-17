@@ -108,6 +108,8 @@ pub fn ft_create(
     let mut text_field_defs: Vec<crate::text::types::TextFieldDef> = Vec::new();
     #[cfg(feature = "text-index")]
     let mut tag_field_defs: Vec<crate::text::types::TagFieldDef> = Vec::new();
+    #[cfg(feature = "text-index")]
+    let mut numeric_field_defs: Vec<crate::text::types::NumericFieldDef> = Vec::new();
     // Index-level HNSW params from the first field (backward compat)
     let mut first_hnsw_m: u32 = 16;
     let mut first_hnsw_ef_construction: u32 = 200;
@@ -245,9 +247,34 @@ pub fn ft_create(
             continue;
         }
 
+        // Check for NUMERIC field type (Plan 152-07). Must come before the VECTOR catch-all.
+        #[cfg(feature = "text-index")]
+        if pos < args.len() && matches_keyword(&args[pos], b"NUMERIC") {
+            pos += 1;
+            let mut sortable = false;
+            let mut noindex = false;
+            while pos < args.len() {
+                if matches_keyword(&args[pos], b"SORTABLE") {
+                    sortable = true;
+                    pos += 1;
+                } else if matches_keyword(&args[pos], b"NOINDEX") {
+                    noindex = true;
+                    pos += 1;
+                } else {
+                    break; // next token begins a new field
+                }
+            }
+            numeric_field_defs.push(crate::text::types::NumericFieldDef {
+                field_name,
+                sortable,
+                noindex,
+            });
+            continue;
+        }
+
         if pos >= args.len() || !matches_keyword(&args[pos], b"VECTOR") {
             return Frame::Error(Bytes::from_static(
-                b"ERR expected VECTOR, SPARSE, TEXT, or TAG after field name",
+                b"ERR expected VECTOR, SPARSE, TEXT, TAG, or NUMERIC after field name",
             ));
         }
         pos += 1;
@@ -305,28 +332,31 @@ pub fn ft_create(
     }
 
     #[cfg(feature = "text-index")]
-    let no_tag_fields = tag_field_defs.is_empty();
+    let no_tag_or_numeric_fields = tag_field_defs.is_empty() && numeric_field_defs.is_empty();
     #[cfg(not(feature = "text-index"))]
-    let no_tag_fields = true;
+    let no_tag_or_numeric_fields = true;
 
     if vector_fields.is_empty()
         && sparse_field_defs.is_empty()
         && text_field_defs.is_empty()
-        && no_tag_fields
+        && no_tag_or_numeric_fields
     {
         return Frame::Error(Bytes::from_static(
-            b"ERR at least one VECTOR, SPARSE, TEXT, or TAG field is required in SCHEMA",
+            b"ERR at least one VECTOR, SPARSE, TEXT, TAG, or NUMERIC field is required in SCHEMA",
         ));
     }
 
-    // TEXT / TAG-only index (no VECTOR, no SPARSE): create TextIndex without VectorIndex.
-    // Plan 152-06 extends this branch to accept TAG-only schemas (text_field_defs may be empty).
+    // TEXT / TAG / NUMERIC-only index (no VECTOR, no SPARSE): create TextIndex without VectorIndex.
+    // Plan 152-06 extended this branch for TAG-only; Plan 152-07 extends it for NUMERIC-only /
+    // mixed TAG+NUMERIC / TEXT+NUMERIC schemas.
     #[cfg(feature = "text-index")]
-    let has_text_or_tag = !text_field_defs.is_empty() || !tag_field_defs.is_empty();
+    let has_inverted_schema = !text_field_defs.is_empty()
+        || !tag_field_defs.is_empty()
+        || !numeric_field_defs.is_empty();
     #[cfg(not(feature = "text-index"))]
-    let has_text_or_tag = !text_field_defs.is_empty();
+    let has_inverted_schema = !text_field_defs.is_empty();
 
-    if vector_fields.is_empty() && has_text_or_tag {
+    if vector_fields.is_empty() && has_inverted_schema {
         #[cfg(feature = "text-index")]
         {
             let bm25_config = crate::text::types::BM25Config {
@@ -338,6 +368,7 @@ pub fn ft_create(
                 prefixes,
                 text_field_defs,
                 tag_field_defs.clone(),
+                numeric_field_defs.clone(),
                 bm25_config,
             );
             if let Err(e) = text_store.create_index(index_name, text_index) {
@@ -419,10 +450,14 @@ pub fn ft_create(
                     }
                 }
             }
-            // Create TextIndex for mixed TEXT+VECTOR / TAG+VECTOR indexes (Plan 152-06
-            // allows TAG fields to coexist with VECTOR in a schema).
+            // Create TextIndex for mixed TEXT+VECTOR / TAG+VECTOR / NUMERIC+VECTOR indexes
+            // (Plan 152-06 allows TAG fields to coexist with VECTOR; Plan 152-07 extends
+            // this to NUMERIC fields).
             #[cfg(feature = "text-index")]
-            if !text_field_defs.is_empty() || !tag_field_defs.is_empty() {
+            if !text_field_defs.is_empty()
+                || !tag_field_defs.is_empty()
+                || !numeric_field_defs.is_empty()
+            {
                 let bm25_config = crate::text::types::BM25Config {
                     k1: bm25_k1,
                     b: bm25_b,
@@ -432,6 +467,7 @@ pub fn ft_create(
                     prefixes,
                     text_field_defs,
                     tag_field_defs,
+                    numeric_field_defs,
                     bm25_config,
                 );
                 if let Err(e) = text_store.create_index(index_name_clone.clone(), text_index) {

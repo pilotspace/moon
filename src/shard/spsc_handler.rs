@@ -1453,6 +1453,11 @@ fn auto_index_hset(
             // TAG fields (tag_index_document returns early on empty tag_fields).
             #[cfg(feature = "text-index")]
             idx.tag_index_document(key_hash, key, text_args);
+            // NUMERIC auto-indexing (Plan 152-07): safe no-op on indexes with
+            // no NUMERIC fields (numeric_index_document returns early on empty
+            // numeric_fields).
+            #[cfg(feature = "text-index")]
+            idx.numeric_index_document(key_hash, key, text_args);
         }
     }
 }

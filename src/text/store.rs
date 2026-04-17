@@ -14,7 +14,7 @@ use crate::text::index_persist::TextIndexMeta;
 use crate::text::posting::PostingStore;
 use crate::text::term_dict::TermDictionary;
 #[cfg(feature = "text-index")]
-use crate::text::types::TagFieldDef;
+use crate::text::types::{NumericFieldDef, TagFieldDef};
 use crate::text::types::{BM25Config, TextFieldDef};
 
 /// Modifier for a query term — controls expansion strategy (D-16).
@@ -100,6 +100,32 @@ pub struct TextIndex {
     /// indexed for that document. Used to revoke stale entries on per-field upsert.
     #[cfg(feature = "text-index")]
     pub doc_tag_entries: HashMap<u32, smallvec::SmallVec<[(Bytes, Bytes); 8]>>,
+
+    // ── NUMERIC index (Plan 152-07, Phase 152) ────────────────────────────
+    //
+    // NUMERIC semantics bypass the BM25 analyzer entirely. Storage is a two-level
+    // map: field_name -> BTreeMap<OrderedFloat<f64>, RoaringBitmap<doc_id>>.
+    // `BTreeMap::range` resolves `[min max]` filters in O(log N) bucket seek.
+    // `doc_numeric_entries` tracks the per-doc numeric values so per-field
+    // upserts can evict stale entries without wiping untouched fields.
+    /// NUMERIC field definitions from the FT.CREATE schema (empty on non-NUMERIC indexes).
+    #[cfg(feature = "text-index")]
+    pub numeric_fields: Vec<NumericFieldDef>,
+    /// `field_name -> BTreeMap<OrderedFloat<f64>, RoaringBitmap<doc_id>>`.
+    /// Outer key is the canonical declared field name. Inner BTreeMap yields
+    /// O(log N) range scans via `BTreeMap::range`.
+    #[cfg(feature = "text-index")]
+    pub numeric_indexes: HashMap<
+        Bytes,
+        std::collections::BTreeMap<ordered_float::OrderedFloat<f64>, roaring::RoaringBitmap>,
+    >,
+    /// `doc_id -> list of (canonical_field, parsed_value)` entries currently
+    /// indexed for that document. Used to revoke stale entries on per-field upsert.
+    #[cfg(feature = "text-index")]
+    pub doc_numeric_entries: HashMap<
+        u32,
+        smallvec::SmallVec<[(Bytes, ordered_float::OrderedFloat<f64>); 4]>,
+    >,
 }
 
 impl TextIndex {
@@ -152,18 +178,25 @@ impl TextIndex {
             tag_indexes: HashMap::new(),
             #[cfg(feature = "text-index")]
             doc_tag_entries: HashMap::new(),
+            #[cfg(feature = "text-index")]
+            numeric_fields: Vec::new(),
+            #[cfg(feature = "text-index")]
+            numeric_indexes: HashMap::new(),
+            #[cfg(feature = "text-index")]
+            doc_numeric_entries: HashMap::new(),
         }
     }
 
-    /// Create a TextIndex with an explicit TAG schema (Plan 152-06).
+    /// Create a TextIndex with an explicit TAG + NUMERIC schema (Plan 152-06 / 07).
     ///
     /// This is the constructor used by `FT.CREATE` when the parsed schema
-    /// includes TAG fields. Text-only callers continue to use `new()` — the
-    /// signature for `new()` is unchanged, so the 33 existing call sites
-    /// compile untouched.
+    /// includes TAG or NUMERIC fields. Text-only callers continue to use
+    /// `new()` — the signature for `new()` is unchanged, so the 33 existing
+    /// call sites compile untouched.
     ///
-    /// The outer `tag_indexes` map is seeded with one empty inner map per
-    /// declared TAG field so `search_tag` on never-inserted fields returns
+    /// The outer `tag_indexes` / `numeric_indexes` maps are seeded with one
+    /// empty inner map / btree per declared TAG / NUMERIC field so
+    /// `search_tag` / `search_numeric_range` on never-inserted fields returns
     /// empty-but-present rather than missing-key (determinism).
     #[cfg(feature = "text-index")]
     pub fn new_with_schema(
@@ -171,6 +204,7 @@ impl TextIndex {
         key_prefixes: Vec<Bytes>,
         text_fields: Vec<TextFieldDef>,
         tag_fields: Vec<TagFieldDef>,
+        numeric_fields: Vec<NumericFieldDef>,
         bm25_config: BM25Config,
     ) -> Self {
         let mut idx = Self::new(name, key_prefixes, text_fields, bm25_config);
@@ -180,6 +214,12 @@ impl TextIndex {
                 .or_default();
         }
         idx.tag_fields = tag_fields;
+        for num_def in &numeric_fields {
+            idx.numeric_indexes
+                .entry(num_def.field_name.clone())
+                .or_default();
+        }
+        idx.numeric_fields = numeric_fields;
         idx
     }
 
@@ -864,6 +904,196 @@ impl TextIndex {
         }
     }
 
+    // ── NUMERIC indexing (Plan 152-07) ─────────────────────────────────────
+
+    /// Index NUMERIC fields from an HSET payload.
+    ///
+    /// Per-field upsert semantics (mirrors `tag_index_document`): only fields
+    /// present in `args` have their prior entries revoked before re-inserting.
+    /// Fields absent from the HSET payload preserve their previous numeric
+    /// assignments.
+    ///
+    /// Write-path guards (T-152-07-02):
+    /// - Non-UTF8 value → skipped silently + `tracing::debug!`.
+    /// - Non-numeric value → skipped silently + `tracing::debug!` (RediSearch-compatible).
+    /// - NaN / ±Infinity → skipped silently + `tracing::debug!`. These would
+    ///   corrupt BTreeMap ordering (NaN != NaN) or bloat range queries. Rust's
+    ///   f64 parser accepts "NaN" / "Infinity" literals — the post-parse
+    ///   `is_nan() || is_infinite()` guard is load-bearing.
+    ///
+    /// Safety cap (T-152-07-01):
+    /// - `NUMERIC_CARDINALITY_LIMIT = 10_000_000` distinct values per field.
+    ///   Reached = `tracing::warn!` rate-limited, new distinct values dropped.
+    ///
+    /// Allocation profile: write-path, not dispatch hot-path. One
+    /// `Bytes::clone` (Arc bump) per touched NUMERIC field for canonical field
+    /// name tracking; one `OrderedFloat<f64>` copy (16 B) per value. No heap
+    /// allocation from `find_field_value` — it returns a borrowed `&[u8]`.
+    #[cfg(feature = "text-index")]
+    pub fn numeric_index_document(
+        &mut self,
+        key_hash: u64,
+        key: &[u8],
+        args: &[crate::protocol::Frame],
+    ) {
+        if self.numeric_fields.is_empty() {
+            return;
+        }
+
+        const NUMERIC_CARDINALITY_LIMIT: usize = 10_000_000;
+
+        let doc_id = self.ensure_doc_id(key_hash, key);
+
+        // Determine which declared NUMERIC fields the HSET payload touches.
+        let mut touched: smallvec::SmallVec<[Bytes; 4]> = smallvec::SmallVec::new();
+        for num_def in &self.numeric_fields {
+            if num_def.noindex {
+                continue;
+            }
+            if find_field_value(args, &num_def.field_name).is_some() {
+                touched.push(num_def.field_name.clone());
+            }
+        }
+
+        // Rebuild `doc_numeric_entries[doc_id]`: keep untouched-field entries, drop touched-field entries.
+        let prior = self.doc_numeric_entries.remove(&doc_id).unwrap_or_default();
+        let mut next: smallvec::SmallVec<[(Bytes, ordered_float::OrderedFloat<f64>); 4]> =
+            smallvec::SmallVec::new();
+        for (field, value) in prior.into_iter() {
+            let is_touched = touched.iter().any(|f| f == &field);
+            if is_touched {
+                if let Some(btree) = self.numeric_indexes.get_mut(&field) {
+                    if let Some(bm) = btree.get_mut(&value) {
+                        bm.remove(doc_id);
+                        if bm.is_empty() {
+                            btree.remove(&value);
+                        }
+                    }
+                }
+            } else {
+                next.push((field, value));
+            }
+        }
+
+        // Insert fresh entries for each touched field.
+        for num_def in &self.numeric_fields {
+            if num_def.noindex {
+                continue;
+            }
+            let Some(value_bytes) = find_field_value(args, &num_def.field_name) else {
+                continue;
+            };
+            let value_str = match std::str::from_utf8(value_bytes) {
+                Ok(s) => s,
+                Err(_) => {
+                    tracing::debug!(
+                        field = ?num_def.field_name,
+                        "non-UTF8 numeric value skipped"
+                    );
+                    continue;
+                }
+            };
+            let parsed: f64 = match value_str.parse() {
+                Ok(v) => v,
+                Err(_) => {
+                    tracing::debug!(
+                        field = ?num_def.field_name,
+                        raw = ?value_str,
+                        "non-numeric value skipped"
+                    );
+                    continue;
+                }
+            };
+            // T-152-07-02: NaN / ±Infinity guard.
+            if parsed.is_nan() || parsed.is_infinite() {
+                tracing::debug!(
+                    field = ?num_def.field_name,
+                    raw = ?value_str,
+                    "NaN/Inf numeric value skipped"
+                );
+                continue;
+            }
+            let of = ordered_float::OrderedFloat(parsed);
+            let canonical_field = num_def.field_name.clone();
+            let btree = self.numeric_indexes.entry(canonical_field.clone()).or_default();
+            // T-152-07-01: cardinality cap.
+            if !btree.contains_key(&of) && btree.len() >= NUMERIC_CARDINALITY_LIMIT {
+                tracing::warn!(
+                    field = ?canonical_field,
+                    "numeric cardinality cap reached; dropping new value"
+                );
+                continue;
+            }
+            btree.entry(of).or_default().insert(doc_id);
+            next.push((canonical_field, of));
+        }
+
+        if !next.is_empty() {
+            self.doc_numeric_entries.insert(doc_id, next);
+        }
+    }
+
+    /// Resolve a NUMERIC range filter to sorted doc_ids.
+    ///
+    /// Uses `BTreeMap::range` — O(log N) seek + sequential bucket scan. The
+    /// bound encoding matches RediSearch grammar:
+    /// - `min_exclusive=false` (default) → `Included(min)`
+    /// - `min_exclusive=true` (from `(min`) → `Excluded(min)`
+    /// - `min = f64::NEG_INFINITY` → `Unbounded` (sentinel; `-inf` in query)
+    /// - Symmetric for `max` / `max_exclusive` / `f64::INFINITY`.
+    ///
+    /// Field resolution is case-insensitive (`@Score:[1 10]` on an index
+    /// declaring `score` resolves correctly).
+    ///
+    /// NaN bounds MUST be rejected at parse time (`parse_numeric_bound`); they
+    /// never reach this function. Empty / unknown fields return empty Vec.
+    #[cfg(feature = "text-index")]
+    pub fn search_numeric_range(
+        &self,
+        field: &Bytes,
+        min: f64,
+        max: f64,
+        min_exclusive: bool,
+        max_exclusive: bool,
+    ) -> Vec<u32> {
+        use std::ops::Bound::{Excluded, Included, Unbounded};
+
+        // Case-insensitive field resolution (same discipline as search_tag).
+        let canonical_field = match self
+            .numeric_fields
+            .iter()
+            .find(|f| f.field_name.eq_ignore_ascii_case(field.as_ref()))
+        {
+            Some(f) => &f.field_name,
+            None => return Vec::new(),
+        };
+
+        let Some(btree) = self.numeric_indexes.get(canonical_field) else {
+            return Vec::new();
+        };
+
+        let lo = if min == f64::NEG_INFINITY {
+            Unbounded
+        } else if min_exclusive {
+            Excluded(ordered_float::OrderedFloat(min))
+        } else {
+            Included(ordered_float::OrderedFloat(min))
+        };
+        let hi = if max == f64::INFINITY {
+            Unbounded
+        } else if max_exclusive {
+            Excluded(ordered_float::OrderedFloat(max))
+        } else {
+            Included(ordered_float::OrderedFloat(max))
+        };
+
+        let mut result = roaring::RoaringBitmap::new();
+        for (_k, bm) in btree.range((lo, hi)) {
+            result |= bm;
+        }
+        result.iter().collect()
+    }
+
     /// Number of indexed documents.
     pub fn num_docs(&self) -> u32 {
         self.key_hash_to_doc_id.len() as u32
@@ -1380,3 +1610,9 @@ mod tests {
 #[cfg(feature = "text-index")]
 #[path = "store_tag_tests.rs"]
 mod tag_tests;
+
+// Plan 152-07 NUMERIC storage tests — same sibling-file pattern as TAG tests.
+#[cfg(test)]
+#[cfg(feature = "text-index")]
+#[path = "store_numeric_tests.rs"]
+mod numeric_tests;
