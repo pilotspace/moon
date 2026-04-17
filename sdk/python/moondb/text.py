@@ -38,7 +38,7 @@ from __future__ import annotations
 import contextlib
 import math
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Any, Union
+from typing import TYPE_CHECKING, Any, Literal, Union, overload
 
 from .types import (
     AggregateStep,
@@ -350,39 +350,127 @@ _HIGHLIGHT_PREFIX = "__highlight_"
 _HIGHLIGHT_SEPARATOR = "\x1f"  # ASCII unit-separator; configurable only via server
 
 
+# Score-marker field names recognised by _parse_text_search_results. Extended
+# for Plan 153-04: servers emit `__rrf_score` for hybrid RRF fusion and
+# `__vec_score` for dense-KNN paths, in addition to the original
+# `__score__` / `__text_score__` pair for BM25.
+_SCORE_MARKERS: tuple[str, ...] = (
+    "__score__",
+    "__text_score__",
+    "__rrf_score",
+    "__vec_score",
+)
+
+# Trailer keys emitted at the END of a FT.SEARCH HYBRID response as a flat
+# (key, int) stream list — NOT a synthetic doc row. The parser must detect
+# and strip them, else they become bogus "hits" with score 0 (Gap 3 / Gap 5
+# root cause surfaced by Plan 153-04 UAT).
+_TRAILER_KEYS: dict[str, str] = {
+    "bm25_hits": "bm25",
+    "dense_hits": "dense",
+    "sparse_hits": "sparse",
+}
+
+
+@overload
+def _parse_text_search_results(
+    raw: Any,  # noqa: ANN401 -- RESP boundary
+    *,
+    highlight_requested: bool = ...,
+    return_stream_hits: Literal[False] = ...,
+) -> list[TextSearchHit]: ...
+
+
+@overload
+def _parse_text_search_results(
+    raw: Any,  # noqa: ANN401 -- RESP boundary
+    *,
+    highlight_requested: bool = ...,
+    return_stream_hits: Literal[True],
+) -> tuple[list[TextSearchHit], dict[str, int]]: ...
+
+
 def _parse_text_search_results(
     raw: Any,  # noqa: ANN401 -- RESP boundary: server response is dynamic
     *,
     highlight_requested: bool = False,
-) -> list[TextSearchHit]:
+    return_stream_hits: bool = False,
+) -> list[TextSearchHit] | tuple[list[TextSearchHit], dict[str, int]]:
     """Parse FT.SEARCH / FT.SEARCH ... HYBRID response.
 
     Moon (and Redis) return::
 
         [total_count, key1, [field1, val1, ...], key2, [...], ...]
 
-    Defensive guarantees (threat_model T-153-01-02):
-    - Non-list input → ``[]``.
+    For the HYBRID variant, an OPTIONAL flat trailer follows the docs::
+
+        [..., bm25_hits, 5, dense_hits, 4, sparse_hits, 0]
+
+    Parser contract:
+
+    - Iterate pairs (key, field_block) while the second element is a list
+      or tuple. As soon as the second element is NOT a list/tuple (i.e. a
+      bulk string), switch to trailer-parse mode. Raw[0] is a CAPPED count
+      from the server — not a reliable doc-count — so the type-guard on
+      the second element is the authoritative stop signal.
+    - Accept ``__score__``, ``__text_score__``, ``__rrf_score``, and
+      ``__vec_score`` as score markers. Unknown score-like markers are
+      ignored (not raised) for forward-compat.
+    - Trailer parser: consume remaining items as flat ``(key, value)``
+      pairs. Only keys in ``_TRAILER_KEYS`` are surfaced; anything else is
+      silently dropped. Values that fail int coercion are silently dropped.
+
+    Return shape:
+
+    - ``return_stream_hits=False`` (default): ``list[TextSearchHit]``
+      preserves the 96+ existing test contract.
+    - ``return_stream_hits=True``: ``(list[TextSearchHit], dict[str, int])``
+      where the dict maps normalised trailer keys (``bm25``, ``dense``,
+      ``sparse``) to the per-stream candidate counts. Absent streams are
+      OMITTED — an empty dict means the server emitted no trailer.
+
+    Defensive guarantees (threat_model T-153-01-02 + T-153-04-01, T-153-04-04):
+    - Non-list input → ``[]`` (+ ``{}`` when return_stream_hits=True).
     - Truncated rows (key without field-list tail) → stop, return what was
       parsed so far.
-    - Non-list field block → empty ``fields`` for that row, score 0.
+    - Non-list field block → first pair that hits this path becomes the
+      trailer start (T-153-04-01 type-guard).
     - Any unparseable numeric → 0.
+    - Malformed trailer pair (missing value, non-int value) → silently
+      dropped (T-153-04-04).
     """
     del highlight_requested  # reserved for future format-aware parsing
 
     if not isinstance(raw, list) or len(raw) < 1:
-        return []
+        return ([], {}) if return_stream_hits else []
 
     results: list[TextSearchHit] = []
+    stream_hits: dict[str, int] = {}
     i = 1  # skip total count
     while i < len(raw):
-        key = _to_str(raw[i])
-        i += 1
-        if i >= len(raw):
+        if i + 1 >= len(raw):
+            # Dangling key without any tail — truncated, stop.
             break
 
-        fields_raw = raw[i]
-        i += 1
+        next_elem = raw[i + 1]
+        # Trailer detection: in the FT.SEARCH HYBRID response the flat
+        # trailer is ``(trailer_key, int_value)`` pairs AND the trailer_key
+        # is one of ``_TRAILER_KEYS``. The type-guard alone is insufficient
+        # because pre-existing defensive tests pass malformed garbage in
+        # the second-element slot expecting a hit with empty fields (not a
+        # trailer). So: ONLY switch to trailer mode when the current key
+        # matches a known trailer key AND the second element is not a list.
+        current_key_str = _to_str(raw[i])
+        if (
+            current_key_str in _TRAILER_KEYS
+            and not isinstance(next_elem, (list, tuple))
+        ):
+            _parse_trailer(raw, i, stream_hits)
+            break
+
+        key = current_key_str
+        fields_raw = next_elem
+        i += 2
 
         fields: dict[str, Any] = {}
         highlights: dict[str, list[str]] = {}
@@ -394,7 +482,7 @@ def _parse_text_search_results(
                 fname = _to_str(fields_raw[j])
                 fval_raw = fields_raw[j + 1]
 
-                if fname in ("__score__", "__text_score__"):
+                if fname in _SCORE_MARKERS:
                     with contextlib.suppress(ValueError, TypeError):
                         score = float(_to_str(fval_raw))
                 elif fname.startswith(_HIGHLIGHT_PREFIX):
@@ -427,7 +515,33 @@ def _parse_text_search_results(
             )
         )
 
+    if return_stream_hits:
+        return results, stream_hits
     return results
+
+
+def _parse_trailer(raw: list[Any], start: int, stream_hits: dict[str, int]) -> None:
+    """Flat (key, int) trailer parser — mutates ``stream_hits`` in-place.
+
+    Only keys in ``_TRAILER_KEYS`` are surfaced. Anything else — including
+    unknown keys, missing values, or values that fail int coercion — is
+    silently dropped (T-153-04-04 / threat_model).
+    """
+    k = start
+    while k + 1 < len(raw):
+        key = _to_str(raw[k])
+        val = raw[k + 1]
+        k += 2
+        normalised = _TRAILER_KEYS.get(key)
+        if normalised is None:
+            continue
+        try:
+            if isinstance(val, bytes):
+                stream_hits[normalised] = int(val.decode("utf-8", errors="replace"))
+            else:
+                stream_hits[normalised] = int(val)
+        except (ValueError, TypeError):
+            continue
 
 
 def _parse_aggregate_results(raw: Any) -> list[dict[str, Any]]:  # noqa: ANN401 -- RESP boundary
@@ -638,7 +752,8 @@ class TextCommands:
         k_per_stream: int | None = None,
         limit: int = 10,
         return_fields: list[str] | None = None,
-    ) -> list[TextSearchHit]:
+        return_stream_hits: bool = False,
+    ) -> list[TextSearchHit] | tuple[list[TextSearchHit], dict[str, int]]:
         """Run a BM25 + dense [+ sparse] hybrid search fused via RRF.
 
         Args:
@@ -656,13 +771,32 @@ class TextCommands:
                 latency on the dense side).
             limit: Max rows after fusion.
             return_fields: Explicit subset of hash fields to return.
+            return_stream_hits: When ``True``, return a 2-tuple
+                ``(hits, stream_hits)`` where ``stream_hits`` maps
+                per-stream candidate counts (``bm25``, ``dense``,
+                ``sparse``) extracted from the response trailer. Adapters
+                in :mod:`moondb.integrations` use this to surface
+                diagnostic metadata. Default ``False`` preserves the
+                plain ``list[TextSearchHit]`` contract.
 
         Returns:
-            Ordered list of :class:`TextSearchHit` with RRF ``score``.
+            Ordered list of :class:`TextSearchHit` with RRF ``score``, or
+            a ``(hits, stream_hits)`` tuple when
+            ``return_stream_hits=True``.
 
         Raises:
             ValueError: If ``weights`` is malformed (NaN, inf, negative,
                 all-zero, wrong length).
+
+        Example::
+
+            hits, stream = client.text.hybrid_search(
+                "docs",
+                "auth crash",
+                vector=[0.1] * 384,
+                return_stream_hits=True,
+            )
+            # stream == {"bm25": 8, "dense": 8, "sparse": 0}
         """
         args = _build_hybrid_args(
             index,
@@ -677,7 +811,11 @@ class TextCommands:
             return_fields=return_fields,
         )
         raw = self._client.execute_command(*args)  # type: ignore[no-untyped-call]
-        return _parse_text_search_results(raw, highlight_requested=False)
+        return _parse_text_search_results(
+            raw,
+            highlight_requested=False,
+            return_stream_hits=return_stream_hits,
+        )
 
 
 # -- Public async command surface --------------------------------------------
@@ -766,7 +904,8 @@ class AsyncTextCommands:
         k_per_stream: int | None = None,
         limit: int = 10,
         return_fields: list[str] | None = None,
-    ) -> list[TextSearchHit]:
+        return_stream_hits: bool = False,
+    ) -> list[TextSearchHit] | tuple[list[TextSearchHit], dict[str, int]]:
         """Async variant. See :meth:`TextCommands.hybrid_search`."""
         args = _build_hybrid_args(
             index,
@@ -781,7 +920,11 @@ class AsyncTextCommands:
             return_fields=return_fields,
         )
         raw = await self._client.execute_command(*args)
-        return _parse_text_search_results(raw, highlight_requested=False)
+        return _parse_text_search_results(
+            raw,
+            highlight_requested=False,
+            return_stream_hits=return_stream_hits,
+        )
 
 
 # Re-export every builder + parser + union for test + adapter consumption.
