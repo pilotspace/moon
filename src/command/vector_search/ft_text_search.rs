@@ -1628,8 +1628,7 @@ pub(crate) fn execute_query_on_index(
                 max,
                 min_exclusive,
                 max_exclusive,
-            } => text_index
-                .search_numeric_range(field, *min, *max, *min_exclusive, *max_exclusive),
+            } => text_index.search_numeric_range(field, *min, *max, *min_exclusive, *max_exclusive),
         };
         let mut results: Vec<TextSearchResult> = doc_ids
             .into_iter()

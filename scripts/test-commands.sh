@@ -1267,24 +1267,9 @@ if should_run "vector"; then
     echo "=== FT.AGGREGATE (FACETED SEARCH) ==="
     flush_both
 
-    # Setup: Plan 06 ships TAG field-type; Plan 07 re-adds `score NUMERIC`.
-    # Probe whether NUMERIC is available so AGG-03 / AGG-04 SUM/AVG/MIN/MAX
-    # over @score run iff Plan 07 is live. Plan 06's own AGG-01/02 +
-    # TAG-01..05 assertions compare exact counts and DO NOT require NUMERIC.
-    NUMERIC_PROBE=$(mcli FT.CREATE _probe_numeric ON HASH PREFIX 1 _probe: SCHEMA v NUMERIC 2>&1)
-    if echo "$NUMERIC_PROBE" | grep -qi "err"; then
-        NUMERIC_AVAILABLE=0
-    else
-        NUMERIC_AVAILABLE=1
-        mcli FT.DROPINDEX _probe_numeric >/dev/null 2>&1
-    fi
-
-    # Plan 06: failures must surface — no 2>/dev/null masking.
-    if [ "$NUMERIC_AVAILABLE" -eq 1 ]; then
-        FT_CREATE_RESULT=$(mcli FT.CREATE aggidx ON HASH PREFIX 1 agg: SCHEMA status TAG priority TAG assignee TAG score NUMERIC 2>&1)
-    else
-        FT_CREATE_RESULT=$(mcli FT.CREATE aggidx ON HASH PREFIX 1 agg: SCHEMA status TAG priority TAG assignee TAG 2>&1)
-    fi
+    # Setup: Plan 06 shipped TAG field-type; Plan 07 ships NUMERIC. Both are now
+    # permanent baseline for the aggidx schema — no probe, no gating.
+    FT_CREATE_RESULT=$(mcli FT.CREATE aggidx ON HASH PREFIX 1 agg: SCHEMA status TAG priority TAG assignee TAG score NUMERIC 2>&1)
     if echo "$FT_CREATE_RESULT" | grep -qi "err"; then
         echo "  FAIL: FT.CREATE aggidx rejected by moon: $FT_CREATE_RESULT"
         SKIP_AGG=1
@@ -1327,49 +1312,49 @@ if should_run "vector"; then
             FAIL=$((FAIL + 1)); echo "  FAIL: AGG-02 expected high=3 low=4, got: $AGG_PRIORITY"
         fi
 
-        # AGG-03/04 (SUM/AVG/MIN/MAX/COUNT_DISTINCT over @score) require NUMERIC (Plan 07).
-        if [ "$NUMERIC_AVAILABLE" -eq 1 ]; then
-            TOTAL=$((TOTAL + 1))
-            AGG_SUM=$(mcli FT.AGGREGATE aggidx '*' GROUPBY 1 @status REDUCE SUM 1 @score AS total 2>&1)
-            if echo "$AGG_SUM" | grep -qi "err"; then
-                FAIL=$((FAIL + 1)); echo "  FAIL: AGG-03 GROUPBY+SUM errored: $AGG_SUM"
-            else
-                PASS=$((PASS + 1)); echo "  PASS: AGG-03 GROUPBY+SUM returns rows"
-            fi
-
-            TOTAL=$((TOTAL + 1))
-            AGG_AVG=$(mcli FT.AGGREGATE aggidx '*' GROUPBY 1 @priority REDUCE AVG 1 @score AS avg_score 2>&1)
-            if echo "$AGG_AVG" | grep -qi "err"; then
-                FAIL=$((FAIL + 1)); echo "  FAIL: AGG-03 GROUPBY+AVG errored: $AGG_AVG"
-            else
-                PASS=$((PASS + 1)); echo "  PASS: AGG-03 GROUPBY+AVG returns rows"
-            fi
-
-            TOTAL=$((TOTAL + 1))
-            AGG_MIN=$(mcli FT.AGGREGATE aggidx '*' GROUPBY 1 @status REDUCE MIN 1 @score AS min_score 2>&1)
-            if echo "$AGG_MIN" | grep -qi "err"; then
-                FAIL=$((FAIL + 1)); echo "  FAIL: AGG-03 MIN errored: $AGG_MIN"
-            else
-                PASS=$((PASS + 1)); echo "  PASS: AGG-03 MIN returns rows"
-            fi
-
-            TOTAL=$((TOTAL + 1))
-            AGG_MAX=$(mcli FT.AGGREGATE aggidx '*' GROUPBY 1 @status REDUCE MAX 1 @score AS max_score 2>&1)
-            if echo "$AGG_MAX" | grep -qi "err"; then
-                FAIL=$((FAIL + 1)); echo "  FAIL: AGG-03 MAX errored: $AGG_MAX"
-            else
-                PASS=$((PASS + 1)); echo "  PASS: AGG-03 MAX returns rows"
-            fi
-
-            TOTAL=$((TOTAL + 1))
-            AGG_DISTINCT=$(mcli FT.AGGREGATE aggidx '*' GROUPBY 1 @status REDUCE COUNT_DISTINCT 1 @assignee AS uniq_users 2>&1)
-            if echo "$AGG_DISTINCT" | grep -qi "err"; then
-                FAIL=$((FAIL + 1)); echo "  FAIL: AGG-04 COUNT_DISTINCT errored: $AGG_DISTINCT"
-            else
-                PASS=$((PASS + 1)); echo "  PASS: AGG-04 COUNT_DISTINCT returns rows"
-            fi
+        # AGG-03/04 (SUM/AVG/MIN/MAX/COUNT_DISTINCT over @score) — unconditional
+        # now that Plan 07 ships NUMERIC. Exact-value assertions follow below.
+        TOTAL=$((TOTAL + 1))
+        AGG_SUM=$(mcli FT.AGGREGATE aggidx '*' GROUPBY 1 @status REDUCE SUM 1 @score AS total 2>&1)
+        # Expected: status=open → 10+20+30+40+50=150; status=closed → 60+70=130.
+        if echo "$AGG_SUM" | grep -Pzo "(?s)open.*150" >/dev/null && echo "$AGG_SUM" | grep -Pzo "(?s)closed.*130" >/dev/null; then
+            PASS=$((PASS + 1)); echo "  PASS: AGG-03 GROUPBY+SUM exact (open=150 closed=130)"
         else
-            echo "  SKIP: AGG-03 / AGG-04 — NUMERIC field-type not yet available (Plan 07)"
+            FAIL=$((FAIL + 1)); echo "  FAIL: AGG-03 expected open=150 closed=130, got: $AGG_SUM"
+        fi
+
+        TOTAL=$((TOTAL + 1))
+        AGG_AVG=$(mcli FT.AGGREGATE aggidx '*' GROUPBY 1 @priority REDUCE AVG 1 @score AS avg_score 2>&1)
+        if echo "$AGG_AVG" | grep -qi "err"; then
+            FAIL=$((FAIL + 1)); echo "  FAIL: AGG-03 GROUPBY+AVG errored: $AGG_AVG"
+        else
+            PASS=$((PASS + 1)); echo "  PASS: AGG-03 GROUPBY+AVG returns rows"
+        fi
+
+        TOTAL=$((TOTAL + 1))
+        AGG_MIN=$(mcli FT.AGGREGATE aggidx '*' GROUPBY 1 @status REDUCE MIN 1 @score AS min_score 2>&1)
+        # Expected: status=open → min=10; status=closed → min=60.
+        if echo "$AGG_MIN" | grep -Pzo "(?s)open.*10" >/dev/null && echo "$AGG_MIN" | grep -Pzo "(?s)closed.*60" >/dev/null; then
+            PASS=$((PASS + 1)); echo "  PASS: AGG-03 GROUPBY+MIN exact (open=10 closed=60)"
+        else
+            FAIL=$((FAIL + 1)); echo "  FAIL: AGG-03 expected MIN open=10 closed=60, got: $AGG_MIN"
+        fi
+
+        TOTAL=$((TOTAL + 1))
+        AGG_MAX=$(mcli FT.AGGREGATE aggidx '*' GROUPBY 1 @status REDUCE MAX 1 @score AS max_score 2>&1)
+        # Expected: status=open → max=50; status=closed → max=70.
+        if echo "$AGG_MAX" | grep -Pzo "(?s)open.*50" >/dev/null && echo "$AGG_MAX" | grep -Pzo "(?s)closed.*70" >/dev/null; then
+            PASS=$((PASS + 1)); echo "  PASS: AGG-03 GROUPBY+MAX exact (open=50 closed=70)"
+        else
+            FAIL=$((FAIL + 1)); echo "  FAIL: AGG-03 expected MAX open=50 closed=70, got: $AGG_MAX"
+        fi
+
+        TOTAL=$((TOTAL + 1))
+        AGG_DISTINCT=$(mcli FT.AGGREGATE aggidx '*' GROUPBY 1 @status REDUCE COUNT_DISTINCT 1 @assignee AS uniq_users 2>&1)
+        if echo "$AGG_DISTINCT" | grep -qi "err"; then
+            FAIL=$((FAIL + 1)); echo "  FAIL: AGG-04 COUNT_DISTINCT errored: $AGG_DISTINCT"
+        else
+            PASS=$((PASS + 1)); echo "  PASS: AGG-04 COUNT_DISTINCT returns rows"
         fi
 
         # AGG-02b: SORTBY + LIMIT
@@ -1441,9 +1426,103 @@ if should_run "vector"; then
         else
             FAIL=$((FAIL + 1)); echo "  FAIL: TAG-05 expected explicit rejection, got: $TAG_OR"
         fi
+
+        # ── Plan 07 NUMERIC gap-closure assertions ─────────────────────────
+        # Fixture recap: agg:1..5 scores 10..50 (open), agg:6..7 scores 60,70 (closed).
+
+        # NUMERIC-01: @score:[20 40] inclusive — agg:2 agg:3 agg:4 = 3 keys
+        TOTAL=$((TOTAL + 1))
+        NUM_INC=$(mcli FT.SEARCH aggidx '@score:[20 40]' LIMIT 0 10 2>&1)
+        HIT_NUM=$(echo "$NUM_INC" | grep -c '^agg:')
+        if [ "$HIT_NUM" -eq 3 ]; then
+            PASS=$((PASS + 1)); echo "  PASS: NUMERIC-01 @score:[20 40] inclusive → 3 keys"
+        else
+            FAIL=$((FAIL + 1)); echo "  FAIL: NUMERIC-01 expected 3 got $HIT_NUM: $NUM_INC"
+        fi
+
+        # NUMERIC-02: exclusive bounds — (20 40] → agg:3 agg:4 = 2 keys
+        TOTAL=$((TOTAL + 1))
+        NUM_EXCL=$(mcli FT.SEARCH aggidx '@score:[(20 40]' LIMIT 0 10 2>&1)
+        HIT_EXCL=$(echo "$NUM_EXCL" | grep -c '^agg:')
+        if [ "$HIT_EXCL" -eq 2 ]; then
+            PASS=$((PASS + 1)); echo "  PASS: NUMERIC-02 @score:[(20 40] exclusive-low → 2 keys"
+        else
+            FAIL=$((FAIL + 1)); echo "  FAIL: NUMERIC-02 expected 2 got $HIT_EXCL: $NUM_EXCL"
+        fi
+
+        # NUMERIC-03: full range [-inf +inf] → all 7 keys
+        TOTAL=$((TOTAL + 1))
+        NUM_FULL=$(mcli FT.SEARCH aggidx '@score:[-inf +inf]' LIMIT 0 20 2>&1)
+        HIT_FULL=$(echo "$NUM_FULL" | grep -c '^agg:')
+        if [ "$HIT_FULL" -eq 7 ]; then
+            PASS=$((PASS + 1)); echo "  PASS: NUMERIC-03 @score:[-inf +inf] → 7 keys"
+        else
+            FAIL=$((FAIL + 1)); echo "  FAIL: NUMERIC-03 expected 7 got $HIT_FULL"
+        fi
+
+        # NUMERIC-04: FT.AGGREGATE range filter + GROUPBY — @score:[10 30] → status
+        # agg:1..3 (scores 10,20,30) all open → cnt=3 on status=open only
+        TOTAL=$((TOTAL + 1))
+        NUM_AGG=$(mcli FT.AGGREGATE aggidx '@score:[10 30]' GROUPBY 1 @status REDUCE COUNT 0 AS cnt 2>&1)
+        if echo "$NUM_AGG" | grep -Pzo "(?s)open.*3" >/dev/null; then
+            PASS=$((PASS + 1)); echo "  PASS: NUMERIC-04 FT.AGGREGATE @score:[10 30] GROUPBY status (open=3)"
+        else
+            FAIL=$((FAIL + 1)); echo "  FAIL: NUMERIC-04 expected open=3, got: $NUM_AGG"
+        fi
+
+        # NUMERIC-05: inverted range REJECTED (T-152-07-05)
+        TOTAL=$((TOTAL + 1))
+        NUM_INV=$(mcli FT.SEARCH aggidx '@score:[100 10]' LIMIT 0 10 2>&1)
+        if echo "$NUM_INV" | grep -qi "min > max"; then
+            PASS=$((PASS + 1)); echo "  PASS: NUMERIC-05 inverted range REJECTED with actionable error"
+        else
+            FAIL=$((FAIL + 1)); echo "  FAIL: NUMERIC-05 expected 'min > max' rejection, got: $NUM_INV"
+        fi
+
+        # NUMERIC-06: NaN-on-write filtered (write-path guard, T-152-07-02).
+        # Insert a doc with NaN score; [-inf +inf] range must NOT include it.
+        TOTAL=$((TOTAL + 1))
+        mcli HSET agg:nan status open priority high score NaN >/dev/null 2>&1
+        NUM_NAN=$(mcli FT.SEARCH aggidx '@score:[-inf +inf]' LIMIT 0 20 2>&1)
+        if echo "$NUM_NAN" | grep -q '^agg:nan$'; then
+            FAIL=$((FAIL + 1)); echo "  FAIL: NUMERIC-06 NaN leaked into index: agg:nan appeared in [-inf +inf]"
+        else
+            PASS=$((PASS + 1)); echo "  PASS: NUMERIC-06 NaN filtered on write"
+        fi
+        mcli DEL agg:nan >/dev/null 2>&1
     fi
 
     mcli FT.DROPINDEX aggidx >/dev/null 2>&1
+
+    # NUMERIC-07 (W-01 cross-shard correctness): 1-shard vs 4-shard identical keys
+    # for @score:[5 15] on an independent fixture.
+    TOTAL=$((TOTAL + 1))
+    pkill -f 'moon --port 6411' 2>/dev/null
+    pkill -f 'moon --port 6414' 2>/dev/null
+    sleep 1
+    ./target/release/moon --port 6411 --shards 1 --protected-mode no > /tmp/moon-6411.log 2>&1 &
+    ./target/release/moon --port 6414 --shards 4 --protected-mode no > /tmp/moon-6414.log 2>&1 &
+    sleep 2
+    for PORT in 6411 6414; do
+        redis-cli -p $PORT FT.CREATE nidx ON HASH PREFIX 1 n: SCHEMA status TAG score NUMERIC > /dev/null 2>&1
+        for i in $(seq 0 19); do
+            redis-cli -p $PORT HSET n:$i status open score $i > /dev/null 2>&1
+        done
+    done
+    sleep 1
+    N1=$(redis-cli -p 6411 FT.SEARCH nidx '@score:[5 15]' LIMIT 0 100 2>&1 | grep '^n:' | sort)
+    N4=$(redis-cli -p 6414 FT.SEARCH nidx '@score:[5 15]' LIMIT 0 100 2>&1 | grep '^n:' | sort)
+    if [ "$N1" = "$N4" ] && [ -n "$N1" ]; then
+        COUNT_N=$(echo "$N1" | wc -l | tr -d ' ')
+        PASS=$((PASS + 1)); echo "  PASS: NUMERIC-07 1-shard and 4-shard return identical keys for @score:[5 15] (count=$COUNT_N)"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: NUMERIC-07 cross-shard mismatch"
+        echo "1-shard: $N1"
+        echo "4-shard: $N4"
+    fi
+    pkill -f 'moon --port 6411' 2>/dev/null
+    pkill -f 'moon --port 6414' 2>/dev/null
+
     echo "  ft_aggregate: done"
 fi
 

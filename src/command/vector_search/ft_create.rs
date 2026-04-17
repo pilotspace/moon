@@ -350,9 +350,8 @@ pub fn ft_create(
     // Plan 152-06 extended this branch for TAG-only; Plan 152-07 extends it for NUMERIC-only /
     // mixed TAG+NUMERIC / TEXT+NUMERIC schemas.
     #[cfg(feature = "text-index")]
-    let has_inverted_schema = !text_field_defs.is_empty()
-        || !tag_field_defs.is_empty()
-        || !numeric_field_defs.is_empty();
+    let has_inverted_schema =
+        !text_field_defs.is_empty() || !tag_field_defs.is_empty() || !numeric_field_defs.is_empty();
     #[cfg(not(feature = "text-index"))]
     let has_inverted_schema = !text_field_defs.is_empty();
 

@@ -371,9 +371,7 @@ fn numeric_empty_schema_noop() {
 
 // ── FieldFilter::NumericRange parser tests (Plan 152-07 Task 1b) ───────────
 
-fn expect_numeric_range(
-    query: &[u8],
-) -> (bytes::Bytes, f64, f64, bool, bool) {
+fn expect_numeric_range(query: &[u8]) -> (bytes::Bytes, f64, f64, bool, bool) {
     use crate::command::vector_search::ft_text_search::{FieldFilter, pre_parse_field_filter};
     let clause = pre_parse_field_filter(query)
         .expect("ok")
@@ -511,19 +509,19 @@ fn pre_parse_numeric_tag_still_works() {
 #[test]
 fn pre_parse_numeric_bare_text_returns_none() {
     use crate::command::vector_search::ft_text_search::pre_parse_field_filter;
-    assert!(pre_parse_field_filter(b"machine learning").unwrap().is_none());
     assert!(
-        pre_parse_field_filter(b"@title:(terms)")
+        pre_parse_field_filter(b"machine learning")
             .unwrap()
             .is_none()
     );
+    assert!(pre_parse_field_filter(b"@title:(terms)").unwrap().is_none());
 }
 
 #[test]
 fn execute_query_numeric_range_returns_docs() {
     // Task 1b Test 23: execute_query_on_index routes NumericRange → search_numeric_range.
     use crate::command::vector_search::ft_text_search::{
-        TextQueryClause, execute_query_on_index, FieldFilter,
+        FieldFilter, TextQueryClause, execute_query_on_index,
     };
     let mut idx = num_only_index(&[b"score"]);
     for (i, v) in [10.0, 20.0, 30.0].iter().enumerate() {

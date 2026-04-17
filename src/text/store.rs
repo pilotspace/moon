@@ -13,9 +13,9 @@ use crate::text::bm25::{FieldStats, bm25_score};
 use crate::text::index_persist::TextIndexMeta;
 use crate::text::posting::PostingStore;
 use crate::text::term_dict::TermDictionary;
+use crate::text::types::{BM25Config, TextFieldDef};
 #[cfg(feature = "text-index")]
 use crate::text::types::{NumericFieldDef, TagFieldDef};
-use crate::text::types::{BM25Config, TextFieldDef};
 
 /// Modifier for a query term — controls expansion strategy (D-16).
 ///
@@ -122,10 +122,8 @@ pub struct TextIndex {
     /// `doc_id -> list of (canonical_field, parsed_value)` entries currently
     /// indexed for that document. Used to revoke stale entries on per-field upsert.
     #[cfg(feature = "text-index")]
-    pub doc_numeric_entries: HashMap<
-        u32,
-        smallvec::SmallVec<[(Bytes, ordered_float::OrderedFloat<f64>); 4]>,
-    >,
+    pub doc_numeric_entries:
+        HashMap<u32, smallvec::SmallVec<[(Bytes, ordered_float::OrderedFloat<f64>); 4]>>,
 }
 
 impl TextIndex {
@@ -1015,7 +1013,10 @@ impl TextIndex {
             }
             let of = ordered_float::OrderedFloat(parsed);
             let canonical_field = num_def.field_name.clone();
-            let btree = self.numeric_indexes.entry(canonical_field.clone()).or_default();
+            let btree = self
+                .numeric_indexes
+                .entry(canonical_field.clone())
+                .or_default();
             // T-152-07-01: cardinality cap.
             if !btree.contains_key(&of) && btree.len() >= NUMERIC_CARDINALITY_LIMIT {
                 tracing::warn!(
