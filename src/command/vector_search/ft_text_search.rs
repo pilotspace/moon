@@ -946,7 +946,22 @@ pub enum FieldFilter {
     /// `value` is the raw client-provided tag value (normalization applied
     /// at lookup to match the insert-time normalization).
     Tag { field: Bytes, value: Bytes },
-    // Plan 07: NumericRange { field, min, max, min_exclusive, max_exclusive },
+    /// Range filter over a NUMERIC field (Plan 152-07).
+    ///
+    /// `field` is the raw client-provided field name (case preserved); case-
+    /// insensitive resolution happens in `TextIndex::search_numeric_range`.
+    /// `min` / `max` are `f64`; `f64::NEG_INFINITY` / `f64::INFINITY` encode
+    /// unbounded bounds (queried via `-inf` / `+inf` literals).
+    /// `min_exclusive` / `max_exclusive` come from the `(` prefix in the
+    /// bound (e.g. `[(10 100]` → `min_exclusive=true`). Finite `min > max`
+    /// is rejected at parse time, NOT executed as an empty range.
+    NumericRange {
+        field: Bytes,
+        min: f64,
+        max: f64,
+        min_exclusive: bool,
+        max_exclusive: bool,
+    },
 }
 
 /// Parsed text query: an optional field target + analyzed (stemmed) query terms.
@@ -1161,9 +1176,92 @@ pub fn pre_parse_field_filter(query: &[u8]) -> Result<Option<TextQueryClause>, &
                 }),
             }))
         }
-        // Plan 07 will add: Some(b'[') => { /* NumericRange */ }
+        Some(b'[') => {
+            // Plan 152-07 NUMERIC range filter. `after_colon[0]` is the '['.
+            let close_pos = after_colon
+                .iter()
+                .position(|&b| b == b']')
+                .ok_or("ERR unterminated numeric range")?;
+            // T-152-07-04: 256-byte inner cap on the bounds payload. `close_pos`
+            // is the index into `after_colon` of the closing ']'; inner bytes
+            // span `1..close_pos`.
+            if close_pos.saturating_sub(1) > 256 {
+                return Err("ERR numeric range too long");
+            }
+            let inner_bytes = &after_colon[1..close_pos];
+            let inner = std::str::from_utf8(inner_bytes)
+                .map_err(|_| "ERR invalid UTF-8 in numeric range")?;
+            // Split on ASCII whitespace; exactly two bounds required.
+            let mut parts_iter = inner.split_ascii_whitespace();
+            let lo_raw = parts_iter
+                .next()
+                .ok_or("ERR numeric range requires exactly two bounds")?;
+            let hi_raw = parts_iter
+                .next()
+                .ok_or("ERR numeric range requires exactly two bounds")?;
+            if parts_iter.next().is_some() {
+                return Err("ERR numeric range requires exactly two bounds");
+            }
+            let (min, min_exclusive) = parse_numeric_bound(lo_raw)?;
+            let (max, max_exclusive) = parse_numeric_bound(hi_raw)?;
+            // T-152-07-05: inverted range REJECTED (no auto-swap). Only applies
+            // when BOTH bounds are finite — `[-inf +inf]` is always valid.
+            if min.is_finite() && max.is_finite() && min > max {
+                return Err("ERR invalid numeric range (min > max)");
+            }
+            Ok(Some(TextQueryClause {
+                field_name: None,
+                terms: Vec::new(),
+                filter: Some(FieldFilter::NumericRange {
+                    field: Bytes::copy_from_slice(field_name_bytes),
+                    min,
+                    max,
+                    min_exclusive,
+                    max_exclusive,
+                }),
+            }))
+        }
         _ => Ok(None),
     }
+}
+
+/// Parse a single numeric range bound (Plan 152-07).
+///
+/// Accepts:
+/// - Finite floats: `10`, `-3.14`, `1e10`, `-2.5e-3`
+/// - Infinity sentinels (case-insensitive): `-inf`, `+inf`, `inf`, `-infinity`, `+infinity`, `infinity`
+/// - Exclusive-bound prefix `(`: `(10` → `(10.0, excl=true)`
+///
+/// Rejects:
+/// - `NaN` (T-152-07-07): NaN bounds would poison `OrderedFloat` comparison.
+/// - Empty / non-numeric tokens.
+#[cfg(feature = "text-index")]
+fn parse_numeric_bound(s: &str) -> Result<(f64, bool), &'static str> {
+    let (body, excl) = if let Some(stripped) = s.strip_prefix('(') {
+        (stripped, true)
+    } else {
+        (s, false)
+    };
+    if body.is_empty() {
+        return Err("ERR invalid numeric bound");
+    }
+    // Case-insensitive infinity sentinels. Checked BEFORE f64::parse so that
+    // `inf` / `infinity` are always recognized (Rust's f64 parser accepts them
+    // too, but we want explicit recognition + NaN guard).
+    let lower = body.to_ascii_lowercase();
+    let v = match lower.as_str() {
+        "-inf" | "-infinity" => f64::NEG_INFINITY,
+        "+inf" | "+infinity" | "inf" | "infinity" => f64::INFINITY,
+        _ => body
+            .parse::<f64>()
+            .map_err(|_| "ERR invalid numeric bound")?,
+    };
+    // T-152-07-07: NaN bound rejected to prevent OrderedFloat comparison
+    // panic. Rust's f64 parser will produce NaN for "NaN" / "nan" / "NAN".
+    if v.is_nan() {
+        return Err("ERR NaN bound not allowed");
+    }
+    Ok((v, excl))
 }
 
 /// Parse `@field:(terms)` or `@field:terms` syntax.
@@ -1518,13 +1616,20 @@ pub(crate) fn execute_query_on_index(
     global_n: Option<u32>,
     top_k: usize,
 ) -> Vec<TextSearchResult> {
-    // Plan 152-06 short-circuit: FieldFilter clauses (TAG / Plan 07 numeric) bypass
+    // Plan 152-06 short-circuit: FieldFilter clauses (TAG / Plan 07 NUMERIC) bypass
     // BM25 entirely. score=0.0; sorted ascending by doc_id for determinism.
     #[cfg(feature = "text-index")]
     if let Some(filter) = &clause.filter {
         let doc_ids: Vec<u32> = match filter {
             FieldFilter::Tag { field, value } => text_index.search_tag(field, value),
-            // Plan 07: FieldFilter::NumericRange { .. } => text_index.search_numeric_range(...),
+            FieldFilter::NumericRange {
+                field,
+                min,
+                max,
+                min_exclusive,
+                max_exclusive,
+            } => text_index
+                .search_numeric_range(field, *min, *max, *min_exclusive, *max_exclusive),
         };
         let mut results: Vec<TextSearchResult> = doc_ids
             .into_iter()

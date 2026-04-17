@@ -369,6 +369,183 @@ fn numeric_empty_schema_noop() {
     assert!(idx.key_hash_to_doc_id.is_empty());
 }
 
+// ── FieldFilter::NumericRange parser tests (Plan 152-07 Task 1b) ───────────
+
+fn expect_numeric_range(
+    query: &[u8],
+) -> (bytes::Bytes, f64, f64, bool, bool) {
+    use crate::command::vector_search::ft_text_search::{FieldFilter, pre_parse_field_filter};
+    let clause = pre_parse_field_filter(query)
+        .expect("ok")
+        .expect("some clause");
+    match clause.filter {
+        Some(FieldFilter::NumericRange {
+            field,
+            min,
+            max,
+            min_exclusive,
+            max_exclusive,
+        }) => (field, min, max, min_exclusive, max_exclusive),
+        other => panic!("expected NumericRange filter, got {:?}", other),
+    }
+}
+
+#[test]
+fn pre_parse_numeric_range_inclusive() {
+    let (field, min, max, lo_excl, hi_excl) = expect_numeric_range(b"@score:[10 100]");
+    assert_eq!(field.as_ref(), b"score");
+    assert_eq!(min, 10.0);
+    assert_eq!(max, 100.0);
+    assert!(!lo_excl);
+    assert!(!hi_excl);
+}
+
+#[test]
+fn pre_parse_numeric_range_exclusive_bounds() {
+    let (_, _, _, lo, hi) = expect_numeric_range(b"@score:[(10 100]");
+    assert!(lo && !hi);
+    let (_, _, _, lo, hi) = expect_numeric_range(b"@score:[10 (100]");
+    assert!(!lo && hi);
+    let (_, _, _, lo, hi) = expect_numeric_range(b"@score:[(10 (100]");
+    assert!(lo && hi);
+}
+
+#[test]
+fn pre_parse_numeric_range_infinities() {
+    let (_, min, max, _, _) = expect_numeric_range(b"@score:[-inf +inf]");
+    assert!(min == f64::NEG_INFINITY);
+    assert!(max == f64::INFINITY);
+    let (_, min, _, _, _) = expect_numeric_range(b"@score:[-INF 50]");
+    assert!(min == f64::NEG_INFINITY);
+    let (_, _, max, _, _) = expect_numeric_range(b"@score:[50 +inf]");
+    assert!(max == f64::INFINITY);
+    let (_, _, max, _, _) = expect_numeric_range(b"@score:[50 infinity]");
+    assert!(max == f64::INFINITY);
+    let (_, min, _, _, _) = expect_numeric_range(b"@score:[-Infinity 50]");
+    assert!(min == f64::NEG_INFINITY);
+}
+
+#[test]
+fn pre_parse_numeric_range_equality_shorthand() {
+    let (_, min, max, _, _) = expect_numeric_range(b"@score:[42 42]");
+    assert_eq!(min, 42.0);
+    assert_eq!(max, 42.0);
+}
+
+#[test]
+fn pre_parse_numeric_range_inverted_rejected() {
+    // T-152-07-05: inverted range REJECTED with explicit error.
+    use crate::command::vector_search::ft_text_search::pre_parse_field_filter;
+    let err = pre_parse_field_filter(b"@score:[100 10]").unwrap_err();
+    assert!(
+        err.contains("min > max"),
+        "expected 'min > max' error, got: {}",
+        err
+    );
+}
+
+#[test]
+fn pre_parse_numeric_range_error_cases() {
+    use crate::command::vector_search::ft_text_search::pre_parse_field_filter;
+    // Unterminated
+    assert!(
+        pre_parse_field_filter(b"@score:[10 100")
+            .unwrap_err()
+            .contains("unterminated")
+    );
+    // Too few bounds
+    assert!(
+        pre_parse_field_filter(b"@score:[10]")
+            .unwrap_err()
+            .contains("two bounds")
+    );
+    // Too many
+    assert!(
+        pre_parse_field_filter(b"@score:[10 20 30]")
+            .unwrap_err()
+            .contains("two bounds")
+    );
+    // Non-numeric bound
+    assert!(
+        pre_parse_field_filter(b"@score:[bogus 100]")
+            .unwrap_err()
+            .contains("invalid numeric bound")
+    );
+    // Empty field
+    assert!(pre_parse_field_filter(b"@:[10 100]").is_err());
+}
+
+#[test]
+fn pre_parse_numeric_range_nan_bound_rejected() {
+    // T-152-07-07: NaN literal bound rejected.
+    use crate::command::vector_search::ft_text_search::pre_parse_field_filter;
+    let err = pre_parse_field_filter(b"@score:[NaN 100]").unwrap_err();
+    assert!(err.contains("NaN"), "expected NaN rejection, got: {}", err);
+    let err = pre_parse_field_filter(b"@score:[10 NaN]").unwrap_err();
+    assert!(err.contains("NaN"));
+}
+
+#[test]
+fn pre_parse_numeric_range_length_guard() {
+    // T-152-07-04: 256-byte inner cap.
+    use crate::command::vector_search::ft_text_search::pre_parse_field_filter;
+    let mut q = b"@score:[".to_vec();
+    q.extend(std::iter::repeat_n(b'1', 300));
+    q.extend_from_slice(b" 2]");
+    let err = pre_parse_field_filter(&q).unwrap_err();
+    assert!(
+        err.contains("too long"),
+        "expected 'too long' error, got: {}",
+        err
+    );
+}
+
+#[test]
+fn pre_parse_numeric_tag_still_works() {
+    // Regression: TAG parser unchanged.
+    use crate::command::vector_search::ft_text_search::{FieldFilter, pre_parse_field_filter};
+    let clause = pre_parse_field_filter(b"@status:{open}").unwrap().unwrap();
+    assert!(matches!(clause.filter, Some(FieldFilter::Tag { .. })));
+}
+
+#[test]
+fn pre_parse_numeric_bare_text_returns_none() {
+    use crate::command::vector_search::ft_text_search::pre_parse_field_filter;
+    assert!(pre_parse_field_filter(b"machine learning").unwrap().is_none());
+    assert!(
+        pre_parse_field_filter(b"@title:(terms)")
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn execute_query_numeric_range_returns_docs() {
+    // Task 1b Test 23: execute_query_on_index routes NumericRange → search_numeric_range.
+    use crate::command::vector_search::ft_text_search::{
+        TextQueryClause, execute_query_on_index, FieldFilter,
+    };
+    let mut idx = num_only_index(&[b"score"]);
+    for (i, v) in [10.0, 20.0, 30.0].iter().enumerate() {
+        let args = num_args(&[(b"score", format!("{}", v).as_bytes())]);
+        idx.numeric_index_document(i as u64, format!("d:{}", i).as_bytes(), &args);
+    }
+    let clause = TextQueryClause {
+        field_name: None,
+        terms: Vec::new(),
+        filter: Some(FieldFilter::NumericRange {
+            field: Bytes::from_static(b"score"),
+            min: 15.0,
+            max: 25.0,
+            min_exclusive: false,
+            max_exclusive: false,
+        }),
+    };
+    let results = execute_query_on_index(&idx, &clause, None, None, 100);
+    assert_eq!(results.len(), 1, "only d:1 (score=20) matches [15, 25]");
+    assert_eq!(results[0].score, 0.0, "FieldFilter results carry score 0.0");
+}
+
 #[test]
 fn numeric_noindex_field_skipped() {
     let mut num_def = NumericFieldDef::new(Bytes::from_static(b"hidden"));
