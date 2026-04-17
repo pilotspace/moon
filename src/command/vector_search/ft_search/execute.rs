@@ -42,6 +42,7 @@ pub(super) fn search_local_raw(
     k: usize,
     filter: Option<&FilterExpr>,
     field_name: Option<&Bytes>,
+    as_of_lsn: u64,
 ) -> SearchRawResult {
     let idx = match store.get_index_mut(index_name) {
         Some(i) => i,
@@ -115,7 +116,7 @@ pub(super) fn search_local_raw(
     // Dispatch to correct field's segments
     if use_default_field {
         let mvcc_ctx = crate::vector::segment::holder::MvccContext {
-            snapshot_lsn: 0,
+            snapshot_lsn: as_of_lsn,
             my_txn_id: 0,
             committed: &empty_committed,
             dirty_set: &[],
@@ -140,7 +141,7 @@ pub(super) fn search_local_raw(
         let fname = field_name.unwrap();
         if let Some(fs) = idx.field_segments.get_mut(fname.as_ref()) {
             let mvcc_ctx = crate::vector::segment::holder::MvccContext {
-                snapshot_lsn: 0,
+                snapshot_lsn: as_of_lsn,
                 my_txn_id: 0,
                 committed: &empty_committed,
                 dirty_set: &[],
@@ -179,7 +180,7 @@ pub fn search_local(
     query_blob: &[u8],
     k: usize,
 ) -> Frame {
-    search_local_filtered(store, index_name, query_blob, k, None, 0, usize::MAX, None)
+    search_local_filtered(store, index_name, query_blob, k, None, 0, usize::MAX, None, 0)
 }
 
 /// Local search with optional filter expression and pagination.
@@ -201,6 +202,7 @@ pub fn search_local_filtered(
     offset: usize,
     count: usize,
     field_name: Option<&Bytes>,
+    as_of_lsn: u64,
 ) -> Frame {
     let idx = match store.get_index_mut(index_name) {
         Some(i) => i,
@@ -277,7 +279,7 @@ pub fn search_local_filtered(
     // Dispatch to correct field's segments
     if use_default_field {
         let mvcc_ctx = crate::vector::segment::holder::MvccContext {
-            snapshot_lsn: 0,
+            snapshot_lsn: as_of_lsn,
             my_txn_id: 0,
             committed: &empty_committed,
             dirty_set: &[],
@@ -298,7 +300,7 @@ pub fn search_local_filtered(
         let fname = field_name.unwrap();
         if let Some(fs) = idx.field_segments.get_mut(fname.as_ref()) {
             let mvcc_ctx = crate::vector::segment::holder::MvccContext {
-                snapshot_lsn: 0,
+                snapshot_lsn: as_of_lsn,
                 my_txn_id: 0,
                 committed: &empty_committed,
                 dirty_set: &[],

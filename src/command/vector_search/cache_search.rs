@@ -222,7 +222,7 @@ fn cache_probe(
     let _ = idx; // release immutable borrow before mutable search call
 
     let response =
-        search_local_filtered(store, index_name, query_blob, k, None, 0, usize::MAX, None);
+        search_local_filtered(store, index_name, query_blob, k, None, 0, usize::MAX, None, 0);
 
     // Parse the response to find the best cache hit.
     let items = match &response {
@@ -357,6 +357,7 @@ pub fn ft_cachesearch(store: &mut VectorStore, args: &[Frame]) -> Frame {
         parsed.offset,
         parsed.count,
         None, // cache search always uses default field
+        0,    // non-temporal
     );
 
     // Augment each result with cache_hit: "false" metadata.

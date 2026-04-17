@@ -70,7 +70,7 @@ pub fn ft_navigate(
     // Build synthetic FT.SEARCH args by stripping HOPS/HOP_PENALTY keywords.
     let synthetic_args = build_search_args(args);
     // FT.NAVIGATE does not support HYBRID modifier — pass None for text_store.
-    let knn_result = super::ft_search(store, &synthetic_args, db, None);
+    let knn_result = super::ft_search(store, &synthetic_args, db, None, 0);
 
     // --- Step 2: Graph expand ---
     let seed_keys = extract_seeds_from_response(&knn_result);

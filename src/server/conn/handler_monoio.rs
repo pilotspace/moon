@@ -2545,6 +2545,25 @@ pub(crate) async fn handle_connection_sharded_monoio<
                         if cmd.eq_ignore_ascii_case(b"FT.CREATE") {
                             crate::command::vector_search::ft_create(&mut vs, &mut ts, cmd_args)
                         } else if cmd.eq_ignore_ascii_case(b"FT.SEARCH") {
+                            // Resolve AS_OF temporal clause to snapshot LSN (TEMP-04).
+                            let as_of_lsn = {
+                                use crate::command::vector_search::ft_search::parse::parse_as_of_clause;
+                                match parse_as_of_clause(cmd_args) {
+                                    Some(wall_ms) => {
+                                        let guard = shard_databases_ref.temporal_registry(ctx.shard_id);
+                                        match guard.as_ref().and_then(|r| r.lsn_at(wall_ms)) {
+                                            Some(lsn) => lsn,
+                                            None => {
+                                                responses.push(Frame::Error(Bytes::from_static(
+                                                    b"ERR no temporal snapshot registered for the given AS_OF timestamp; call TEMPORAL.SNAPSHOT_AT first",
+                                                )));
+                                                continue;
+                                            }
+                                        }
+                                    }
+                                    None => 0,
+                                }
+                            };
                             // Detect SESSION keyword to provide database access for sorted set tracking
                             let has_session = cmd_args.iter().any(|a| {
                                 if let Frame::BulkString(b) = a {
@@ -2560,6 +2579,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                     cmd_args,
                                     Some(&mut *db_guard),
                                     Some(&*ts),
+                                    as_of_lsn,
                                 )
                             } else {
                                 crate::command::vector_search::ft_search(
@@ -2567,6 +2587,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                     cmd_args,
                                     None,
                                     Some(&*ts),
+                                    as_of_lsn,
                                 )
                             }
                         } else if cmd.eq_ignore_ascii_case(b"FT.DROPINDEX") {

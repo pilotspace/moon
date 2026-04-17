@@ -486,6 +486,7 @@ fn main() -> anyhow::Result<()> {
         let dir_path = std::path::Path::new(dir);
         shard_databases.recover_graph_stores(dir_path);
         shard_databases.replay_graph_wal(dir_path);
+        shard_databases.replay_temporal_wal(dir_path);
     }
 
     // All shards recovered — mark server as ready for /readyz.

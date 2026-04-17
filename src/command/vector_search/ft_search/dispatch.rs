@@ -44,11 +44,15 @@ use super::response::{build_hybrid_response, build_search_response};
 /// `text_store` is an optional TextStore reference for the HYBRID path (Phase 152).
 /// When `None`, HYBRID modifier is rejected with an error; all existing FT.SEARCH
 /// paths (KNN / SPARSE / two-way) are unaffected.
+/// `as_of_lsn` is the resolved snapshot LSN for temporal AS_OF queries (TEMP-04).
+/// When 0, no temporal filtering is applied (default non-temporal behavior).
+/// The caller resolves the wall-clock timestamp to LSN via TemporalRegistry.
 pub fn ft_search(
     store: &mut VectorStore,
     args: &[Frame],
     mut db: Option<&mut crate::storage::db::Database>,
     text_store: Option<&TextStore>,
+    as_of_lsn: u64,
 ) -> Frame {
     // args[0] = index_name, args[1] = query_string, args[2..] = PARAMS ...
     if args.len() < 2 {
@@ -129,6 +133,8 @@ pub fn ft_search(
     // Parse optional AS_OF clause for temporal queries (TEMP-04).
     // The wall-clock timestamp is parsed here; LSN resolution via TemporalRegistry
     // happens at the handler level before calling ft_search.
+    // AS_OF timestamp is parsed here for future use but LSN resolution happens
+    // at the handler level (TEMP-04). The resolved as_of_lsn is passed in as a parameter.
     let _as_of_ts = parse_as_of_clause(args);
 
     // Look up metric for range filtering (cheap immutable borrow before search paths)
@@ -194,6 +200,7 @@ pub fn ft_search(
             k,
             filter_expr.as_ref(),
             field_name.as_ref(),
+            as_of_lsn,
         );
         let (dense_results, key_hash_to_key) = match dense_raw {
             SearchRawResult::Ok {
@@ -350,6 +357,7 @@ pub fn ft_search(
             k,
             filter_expr.as_ref(),
             field_name.as_ref(),
+            as_of_lsn,
         );
         crate::vector::metrics::increment_search();
         return match result {
@@ -411,6 +419,7 @@ pub fn ft_search(
             k,
             filter_expr.as_ref(),
             field_name.as_ref(),
+            as_of_lsn,
         );
         crate::vector::metrics::increment_search();
         match raw {
@@ -433,6 +442,7 @@ pub fn ft_search(
             limit_offset,
             limit_count,
             field_name.as_ref(),
+            as_of_lsn,
         );
         crate::vector::metrics::increment_search();
         result
@@ -455,12 +465,13 @@ pub fn ft_search_with_graph(
     args: &[Frame],
     db: Option<&mut crate::storage::db::Database>,
     text_store: Option<&TextStore>,
+    as_of_lsn: u64,
 ) -> Frame {
     let expand_depth = super::parse::parse_expand_clause(args);
 
     // No expansion requested or no graph store — fall back to standard search.
     if expand_depth.is_none() || graph_store.is_none() {
-        return ft_search(store, args, db, text_store);
+        return ft_search(store, args, db, text_store, as_of_lsn);
     }
 
     let depth = expand_depth.unwrap_or(1);
@@ -468,7 +479,7 @@ pub fn ft_search_with_graph(
     let gs = graph_store.unwrap();
 
     // Run the standard KNN search first (session filtering happens inside ft_search).
-    let knn_result = ft_search(store, args, db, text_store);
+    let knn_result = ft_search(store, args, db, text_store, as_of_lsn);
 
     // Extract (key, score) pairs from the KNN response for seeding graph expansion.
     let seed_keys = super::response::extract_seeds_from_response(&knn_result);

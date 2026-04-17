@@ -2026,9 +2026,9 @@ pub(crate) async fn handle_connection_sharded_inner<
                                     });
                                     if has_session {
                                         let mut db_guard = shard_databases_ref.write_db(ctx.shard_id, 0);
-                                        crate::command::vector_search::ft_search(&mut vs, cmd_args, Some(&mut *db_guard), Some(&*ts))
+                                        crate::command::vector_search::ft_search(&mut vs, cmd_args, Some(&mut *db_guard), Some(&*ts), 0)
                                     } else {
-                                        crate::command::vector_search::ft_search(&mut vs, cmd_args, None, Some(&*ts))
+                                        crate::command::vector_search::ft_search(&mut vs, cmd_args, None, Some(&*ts), 0)
                                     }
                                 } else if cmd.eq_ignore_ascii_case(b"FT.DROPINDEX") {
                                     let mut db_guard = shard_databases_ref.write_db(ctx.shard_id, 0);

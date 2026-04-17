@@ -1294,11 +1294,12 @@ pub(crate) fn dispatch_vector_command(
                 args,
                 db,
                 Some(text_store),
+                0,
             )
         }
         #[cfg(not(feature = "graph"))]
         {
-            vector_search::ft_search(vector_store, args, db, Some(text_store))
+            vector_search::ft_search(vector_store, args, db, Some(text_store), 0)
         }
     } else if cmd.eq_ignore_ascii_case(b"FT.DROPINDEX") {
         vector_search::ft_dropindex(vector_store, text_store, db, args)
