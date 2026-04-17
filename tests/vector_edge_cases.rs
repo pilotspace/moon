@@ -360,7 +360,12 @@ fn test_ft_info_nonexistent_index() {
 #[test]
 fn test_ft_dropindex_missing_args() {
     let mut store = VectorStore::new();
-    let result = ft_dropindex(&mut store, &mut moon::text::store::TextStore::new(), None, &[]);
+    let result = ft_dropindex(
+        &mut store,
+        &mut moon::text::store::TextStore::new(),
+        None,
+        &[],
+    );
     assert_is_error(&result, "ft_dropindex with no args");
 }
 
