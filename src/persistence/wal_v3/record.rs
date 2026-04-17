@@ -45,6 +45,10 @@ pub enum WalRecordType {
     VectorTxnAbort = 0x33,
     /// Vector checkpoint marker.
     VectorCheckpoint = 0x34,
+    /// Temporal KV upsert with literal system_from timestamp.
+    TemporalUpsert = 0x35,
+    /// Graph node/edge valid_to update with literal system_from timestamp.
+    GraphTemporal = 0x36,
     /// File creation event.
     FileCreate = 0x40,
     /// File deletion event.
@@ -72,6 +76,8 @@ impl WalRecordType {
             0x32 => Some(Self::VectorTxnCommit),
             0x33 => Some(Self::VectorTxnAbort),
             0x34 => Some(Self::VectorCheckpoint),
+            0x35 => Some(Self::TemporalUpsert),
+            0x36 => Some(Self::GraphTemporal),
             0x40 => Some(Self::FileCreate),
             0x41 => Some(Self::FileDelete),
             0x42 => Some(Self::FileTierChange),
@@ -199,6 +205,80 @@ pub fn read_wal_v3_record(data: &[u8]) -> Option<WalRecord> {
     })
 }
 
+/// Encode a TemporalUpsert WAL payload.
+///
+/// Layout: `[key_len: u32 LE][key: bytes][valid_from: i64 LE][system_from: i64 LE][value_len: u32 LE][value: bytes]`
+///
+/// `system_from` is the literal wall-clock timestamp captured at the handler
+/// level. Replay MUST restore this value directly -- never substitute NOW().
+pub fn encode_temporal_upsert(key: &[u8], valid_from: i64, system_from: i64, value: &[u8]) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(4 + key.len() + 8 + 8 + 4 + value.len());
+    payload.extend_from_slice(&(key.len() as u32).to_le_bytes());
+    payload.extend_from_slice(key);
+    payload.extend_from_slice(&valid_from.to_le_bytes());
+    payload.extend_from_slice(&system_from.to_le_bytes());
+    payload.extend_from_slice(&(value.len() as u32).to_le_bytes());
+    payload.extend_from_slice(value);
+    payload
+}
+
+/// Decode a TemporalUpsert WAL payload.
+///
+/// Returns `(key, valid_from, system_from, value)` or `None` if payload is malformed.
+pub fn decode_temporal_upsert(payload: &[u8]) -> Option<(&[u8], i64, i64, &[u8])> {
+    if payload.len() < 4 {
+        return None;
+    }
+    let key_len = u32::from_le_bytes(payload[..4].try_into().ok()?) as usize;
+    let pos = 4;
+    if payload.len() < pos + key_len + 8 + 8 + 4 {
+        return None;
+    }
+    let key = &payload[pos..pos + key_len];
+    let valid_from = i64::from_le_bytes(payload[pos + key_len..pos + key_len + 8].try_into().ok()?);
+    let system_from =
+        i64::from_le_bytes(payload[pos + key_len + 8..pos + key_len + 16].try_into().ok()?);
+    let value_len =
+        u32::from_le_bytes(payload[pos + key_len + 16..pos + key_len + 20].try_into().ok()?)
+            as usize;
+    let value_start = pos + key_len + 20;
+    if payload.len() < value_start + value_len {
+        return None;
+    }
+    let value = &payload[value_start..value_start + value_len];
+    Some((key, valid_from, system_from, value))
+}
+
+/// Encode a GraphTemporal WAL payload.
+///
+/// Layout: `[entity_id: u64 LE][is_node: u8][valid_to: i64 LE][system_from: i64 LE]`
+///
+/// `system_from` is the literal wall-clock timestamp captured at the handler
+/// level. Replay MUST restore this value directly -- never substitute NOW().
+pub fn encode_graph_temporal(entity_id: u64, is_node: bool, valid_to: i64, system_from: i64) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(8 + 1 + 8 + 8);
+    payload.extend_from_slice(&entity_id.to_le_bytes());
+    payload.push(is_node as u8);
+    payload.extend_from_slice(&valid_to.to_le_bytes());
+    payload.extend_from_slice(&system_from.to_le_bytes());
+    payload
+}
+
+/// Decode a GraphTemporal WAL payload.
+///
+/// Returns `(entity_id, is_node, valid_to, system_from)` or `None` if payload is malformed.
+pub fn decode_graph_temporal(payload: &[u8]) -> Option<(u64, bool, i64, i64)> {
+    if payload.len() < 25 {
+        // 8 (entity_id) + 1 (is_node) + 8 (valid_to) + 8 (system_from)
+        return None;
+    }
+    let entity_id = u64::from_le_bytes(payload[..8].try_into().ok()?);
+    let is_node = payload[8] != 0;
+    let valid_to = i64::from_le_bytes(payload[9..17].try_into().ok()?);
+    let system_from = i64::from_le_bytes(payload[17..25].try_into().ok()?);
+    Some((entity_id, is_node, valid_to, system_from))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -270,6 +350,8 @@ mod tests {
         assert_eq!(WalRecordType::VectorTxnCommit as u8, 0x32);
         assert_eq!(WalRecordType::VectorTxnAbort as u8, 0x33);
         assert_eq!(WalRecordType::VectorCheckpoint as u8, 0x34);
+        assert_eq!(WalRecordType::TemporalUpsert as u8, 0x35);
+        assert_eq!(WalRecordType::GraphTemporal as u8, 0x36);
         assert_eq!(WalRecordType::FileCreate as u8, 0x40);
         assert_eq!(WalRecordType::FileDelete as u8, 0x41);
         assert_eq!(WalRecordType::FileTierChange as u8, 0x42);
@@ -279,7 +361,8 @@ mod tests {
 
         // from_u8 roundtrips
         for &v in &[
-            0x01, 0x10, 0x20, 0x30, 0x31, 0x32, 0x33, 0x34, 0x40, 0x41, 0x42, 0x50, 0x51, 0x52,
+            0x01, 0x10, 0x20, 0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x40, 0x41, 0x42, 0x50,
+            0x51, 0x52,
         ] {
             assert!(WalRecordType::from_u8(v).is_some());
         }
@@ -293,5 +376,112 @@ mod tests {
 
         // 4 (len) + 8 (lsn) + 1 (type) + 1 (flags) + 2 (pad) + 0 (payload) + 4 (crc) = 20
         assert_eq!(buf.len(), 20);
+    }
+
+    #[test]
+    fn test_temporal_upsert_roundtrip() {
+        let key = b"mykey";
+        let valid_from: i64 = 1_713_394_800_000;
+        let system_from: i64 = 1_713_394_800_001;
+        let value = b"myvalue";
+        let payload = encode_temporal_upsert(key, valid_from, system_from, value);
+        let (dk, dvf, dsf, dv) = decode_temporal_upsert(&payload).unwrap();
+        assert_eq!(dk, key);
+        assert_eq!(dvf, valid_from);
+        assert_eq!(dsf, system_from);
+        assert_eq!(dv, value);
+    }
+
+    #[test]
+    fn test_temporal_upsert_empty_key_and_value() {
+        let payload = encode_temporal_upsert(b"", 0, 0, b"");
+        let (dk, dvf, dsf, dv) = decode_temporal_upsert(&payload).unwrap();
+        assert!(dk.is_empty());
+        assert_eq!(dvf, 0);
+        assert_eq!(dsf, 0);
+        assert!(dv.is_empty());
+    }
+
+    #[test]
+    fn test_temporal_upsert_malformed_returns_none() {
+        assert!(decode_temporal_upsert(b"").is_none());
+        assert!(decode_temporal_upsert(&[0; 3]).is_none());
+        // key_len says 100 but payload is too short
+        let mut bad = Vec::new();
+        bad.extend_from_slice(&100u32.to_le_bytes());
+        assert!(decode_temporal_upsert(&bad).is_none());
+        // Enough for key but not for timestamps + value_len
+        let mut trunc = Vec::new();
+        trunc.extend_from_slice(&2u32.to_le_bytes());
+        trunc.extend_from_slice(b"ab");
+        assert!(decode_temporal_upsert(&trunc).is_none());
+        // Enough header but value_len exceeds remaining
+        let mut short_val = Vec::new();
+        short_val.extend_from_slice(&1u32.to_le_bytes()); // key_len=1
+        short_val.push(b'k');
+        short_val.extend_from_slice(&0i64.to_le_bytes()); // valid_from
+        short_val.extend_from_slice(&0i64.to_le_bytes()); // system_from
+        short_val.extend_from_slice(&100u32.to_le_bytes()); // value_len=100
+        assert!(decode_temporal_upsert(&short_val).is_none());
+    }
+
+    #[test]
+    fn test_graph_temporal_roundtrip() {
+        let entity_id: u64 = 42;
+        let is_node = true;
+        let valid_to: i64 = 1_713_394_800_000;
+        let system_from: i64 = 1_713_394_800_001;
+        let payload = encode_graph_temporal(entity_id, is_node, valid_to, system_from);
+        let (eid, in_, vt, sf) = decode_graph_temporal(&payload).unwrap();
+        assert_eq!(eid, entity_id);
+        assert!(in_);
+        assert_eq!(vt, valid_to);
+        assert_eq!(sf, system_from);
+    }
+
+    #[test]
+    fn test_graph_temporal_edge_roundtrip() {
+        let payload = encode_graph_temporal(99, false, i64::MAX, 12345);
+        let (eid, in_, vt, sf) = decode_graph_temporal(&payload).unwrap();
+        assert_eq!(eid, 99);
+        assert!(!in_);
+        assert_eq!(vt, i64::MAX);
+        assert_eq!(sf, 12345);
+    }
+
+    #[test]
+    fn test_graph_temporal_malformed_returns_none() {
+        assert!(decode_graph_temporal(b"").is_none());
+        assert!(decode_graph_temporal(&[0; 24]).is_none()); // 24 < 25
+    }
+
+    #[test]
+    fn test_temporal_upsert_wal_record_roundtrip() {
+        let payload = encode_temporal_upsert(b"key1", 1000, 1001, b"val1");
+        let mut buf = Vec::new();
+        write_wal_v3_record(&mut buf, 50, WalRecordType::TemporalUpsert, &payload);
+        let record = read_wal_v3_record(&buf).unwrap();
+        assert_eq!(record.record_type, WalRecordType::TemporalUpsert);
+        assert_eq!(record.lsn, 50);
+        let (dk, dvf, dsf, dv) = decode_temporal_upsert(&record.payload).unwrap();
+        assert_eq!(dk, b"key1");
+        assert_eq!(dvf, 1000);
+        assert_eq!(dsf, 1001);
+        assert_eq!(dv, b"val1");
+    }
+
+    #[test]
+    fn test_graph_temporal_wal_record_roundtrip() {
+        let payload = encode_graph_temporal(7, true, 9999, 8888);
+        let mut buf = Vec::new();
+        write_wal_v3_record(&mut buf, 60, WalRecordType::GraphTemporal, &payload);
+        let record = read_wal_v3_record(&buf).unwrap();
+        assert_eq!(record.record_type, WalRecordType::GraphTemporal);
+        assert_eq!(record.lsn, 60);
+        let (eid, in_, vt, sf) = decode_graph_temporal(&record.payload).unwrap();
+        assert_eq!(eid, 7);
+        assert!(in_);
+        assert_eq!(vt, 9999);
+        assert_eq!(sf, 8888);
     }
 }

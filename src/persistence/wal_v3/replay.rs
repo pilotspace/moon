@@ -217,7 +217,9 @@ pub fn replay_wal_v3_file(
             | WalRecordType::FileTierChange
             | WalRecordType::XactBegin
             | WalRecordType::XactCommit
-            | WalRecordType::XactAbort => {
+            | WalRecordType::XactAbort
+            | WalRecordType::TemporalUpsert
+            | WalRecordType::GraphTemporal => {
                 on_command(&record);
                 result.commands_replayed += 1;
             }
