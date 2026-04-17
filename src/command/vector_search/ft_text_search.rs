@@ -1665,7 +1665,11 @@ pub(crate) fn execute_query_on_index(
 ///
 /// `total` is the full number of matched results before pagination.
 /// Document entries are `results[offset..offset+count]`.
-fn build_text_response(results: &[TextSearchResult], offset: usize, count: usize) -> Frame {
+pub(crate) fn build_text_response(
+    results: &[TextSearchResult],
+    offset: usize,
+    count: usize,
+) -> Frame {
     let total = results.len() as i64;
     let page_count = if count == usize::MAX {
         results.len()

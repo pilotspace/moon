@@ -1130,6 +1130,35 @@ pub async fn handle_connection(
                                                                 continue;
                                                             }
                                                         };
+                                                        // B-01 FIX (single-shard handler_single, Plan 152-06):
+                                                        // FieldFilter short-circuit BEFORE text_fields.is_empty() bail.
+                                                        #[cfg(feature = "text-index")]
+                                                        match crate::command::vector_search::pre_parse_field_filter(query_bytes.as_ref()) {
+                                                            Ok(Some(clause)) => {
+                                                                if clause.filter.is_some() {
+                                                                    let (offset, count) = crate::command::vector_search::parse_limit_clause(cmd_args);
+                                                                    let top_k = if count == usize::MAX { 10000 } else { offset.saturating_add(count) }.max(1);
+                                                                    let response = match ts_mut.get_index(&index_name) {
+                                                                        None => crate::protocol::Frame::Error(bytes::Bytes::from_static(b"ERR no such index")),
+                                                                        Some(text_index) => {
+                                                                            let results = crate::command::vector_search::ft_text_search::execute_query_on_index(
+                                                                                text_index, &clause, None, None, top_k,
+                                                                            );
+                                                                            crate::command::vector_search::ft_text_search::build_text_response(
+                                                                                &results, offset, count,
+                                                                            )
+                                                                        }
+                                                                    };
+                                                                    responses.push(response);
+                                                                    continue;
+                                                                }
+                                                            }
+                                                            Ok(None) => { /* fall through */ }
+                                                            Err(e) => {
+                                                                responses.push(crate::protocol::Frame::Error(bytes::Bytes::copy_from_slice(e.as_bytes())));
+                                                                continue;
+                                                            }
+                                                        }
                                                         // Step 2: TextStore is already borrowed via ts_mut (no extra guard to drop).
                                                         // When text_store is None, ts_mut points at the empty fallback —
                                                         // get_index() returns None → Step 3 emits "ERR no such index" (correct).

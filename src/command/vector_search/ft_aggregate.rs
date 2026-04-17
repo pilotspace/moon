@@ -490,13 +490,36 @@ pub fn materialize_rows(
 /// matches RediSearch behaviour where `FT.AGGREGATE idx the GROUPBY ...` yields
 /// `[0]` without surfacing an internal BM25 error.
 fn bm25_candidate_doc_ids(text_index: &TextIndex, query: &Bytes) -> Result<Vec<u32>, Frame> {
-    use crate::command::vector_search::ft_text_search::{execute_query_on_index, parse_text_query};
+    use crate::command::vector_search::ft_text_search::{
+        execute_query_on_index, parse_text_query, pre_parse_field_filter,
+    };
 
+    // Plan 152-06 fast path: non-BM25 FieldFilter clauses (TAG, and Plan 07
+    // NumericRange). Safe on TAG-only / NUMERIC-only indexes because we never
+    // touch `field_analyzers`. Fixes Blocker 1 — `aggidx` fixture with zero
+    // TEXT fields no longer returns `ERR index has no TEXT fields` on
+    // @status:{open}.
+    match pre_parse_field_filter(query.as_ref()) {
+        Ok(Some(clause)) => {
+            let results =
+                execute_query_on_index(text_index, &clause, None, None, u32::MAX as usize);
+            return Ok(results.into_iter().map(|r| r.doc_id).collect());
+        }
+        Ok(None) => { /* fall through to BM25 path */ }
+        Err(e) => {
+            let mut msg = b"ERR ".to_vec();
+            msg.extend_from_slice(e.as_bytes());
+            return Err(Frame::Error(Bytes::from(msg)));
+        }
+    }
+
+    // BM25 path: analyzer is required. Indexes without TEXT fields cannot
+    // serve bare-term queries — surface the cause instead of a generic error.
     let analyzer = match text_index.field_analyzers.first() {
         Some(a) => a,
         None => {
             return Err(Frame::Error(Bytes::from_static(
-                b"ERR index has no TEXT fields",
+                b"ERR bare-term text query requires at least one TEXT field in the index",
             )));
         }
     };

@@ -106,6 +106,10 @@ pub(crate) fn drain_spsc_shared(
                         ShardMessage::FtHybrid(_) => {
                             execute_batch.push(msg);
                         }
+                        #[cfg(feature = "text-index")]
+                        ShardMessage::InvertedSearch(_) => {
+                            execute_batch.push(msg);
+                        }
                         #[cfg(feature = "graph")]
                         ShardMessage::GraphCommand { .. } => {
                             execute_batch.push(msg);
@@ -1094,6 +1098,48 @@ pub(crate) fn handle_shard_message_shared(
                 edge_type_filter,
                 snapshot_lsn,
             );
+            let _ = reply_tx.send(response);
+        }
+        #[cfg(feature = "text-index")]
+        ShardMessage::InvertedSearch(payload) => {
+            // Phase 152 Plan 06 (B-02): remote shard executes a FieldFilter
+            // (TAG — Plan 07 adds NumericRange) and returns the same response
+            // frame shape `build_text_response` emits. No BM25 globals, no
+            // analyzer. Guards dropped before reply.
+            let crate::shard::dispatch::InvertedSearchPayload {
+                index_name,
+                filter,
+                top_k,
+                offset,
+                count,
+                reply_tx,
+            } = *payload;
+            let response = {
+                let text_guard = shard_databases.text_store(shard_id);
+                match text_guard.get_index(&index_name) {
+                    Some(text_index) => {
+                        let clause =
+                            crate::command::vector_search::ft_text_search::TextQueryClause {
+                                field_name: None,
+                                terms: Vec::new(),
+                                filter: Some(filter),
+                            };
+                        let results =
+                            crate::command::vector_search::ft_text_search::execute_query_on_index(
+                                text_index, &clause, None, None, top_k,
+                            );
+                        // Same response shape TextSearch emits — matches what
+                        // the coordinator's merge_text_results consumes.
+                        crate::command::vector_search::ft_text_search::build_text_response(
+                            &results, offset, count,
+                        )
+                    }
+                    None => crate::protocol::Frame::Error(bytes::Bytes::from_static(
+                        b"ERR no such index",
+                    )),
+                }
+                // text_guard dropped here
+            };
             let _ = reply_tx.send(response);
         }
         #[cfg(feature = "text-index")]

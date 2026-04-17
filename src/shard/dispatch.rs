@@ -185,6 +185,30 @@ pub struct TextAggregatePayload {
     pub reply_tx: channel::OneshotSender<Frame>,
 }
 
+/// Boxed payload for `ShardMessage::InvertedSearch` (Phase 152 Plan 06, B-02).
+///
+/// Transports a `FieldFilter` (TAG today; Plan 07 adds NumericRange) across
+/// the SPSC so multi-shard FT.SEARCH with `@field:{value}` carries the
+/// field-scoped semantics instead of degrading to a bag-of-words BM25 scatter.
+///
+/// Unlike `ShardMessage::TextSearch`, this payload carries no `global_df`,
+/// `global_n`, or highlight / summarize options — FieldFilter results have
+/// score=0.0 and no BM25 pairing. Boxed to keep the overall enum within the
+/// 512-byte cap asserted at module bottom (`FieldFilter::Tag` is two Bytes
+/// handles ~32 B plus discriminant, but boxing matches the pattern set by
+/// `TextAggregatePayload` and `FtHybridPayload`).
+///
+/// NOT persisted to WAL / NOT gossiped — in-process SPSC only.
+#[cfg(feature = "text-index")]
+pub struct InvertedSearchPayload {
+    pub index_name: Bytes,
+    pub filter: crate::command::vector_search::ft_text_search::FieldFilter,
+    pub top_k: usize,
+    pub offset: usize,
+    pub count: usize,
+    pub reply_tx: channel::OneshotSender<Frame>,
+}
+
 /// Boxed payload for `ShardMessage::FtHybrid` (Phase 152 Plan 05, D-13).
 ///
 /// Carries a pre-computed global IDF (Phase 1 DFS aggregate) so the shard
@@ -391,6 +415,16 @@ pub enum ShardMessage {
     /// + blob bytes which would otherwise push `ShardMessage` past the 512-byte cap.
     #[cfg(feature = "text-index")]
     FtHybrid(Box<FtHybridPayload>),
+    /// Cross-shard FieldFilter search (Phase 152 Plan 06, B-02).
+    ///
+    /// Used for `@field:{value}` (TAG) — Plan 07 extends to `@field:[min max]`
+    /// numeric ranges. Bypasses BM25 entirely on the shard side: the remote
+    /// shard runs `TextIndex::search_tag` (or Plan 07 `search_numeric_range`)
+    /// and returns matching keys with `score=0.0`.
+    ///
+    /// Boxed for enum-size discipline — see `InvertedSearchPayload` docs.
+    #[cfg(feature = "text-index")]
+    InvertedSearch(Box<InvertedSearchPayload>),
     /// Execute a GRAPH.* command on this shard's GraphStore.
     #[cfg(feature = "graph")]
     GraphCommand {

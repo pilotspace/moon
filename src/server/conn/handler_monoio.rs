@@ -1782,6 +1782,54 @@ pub(crate) async fn handle_connection_sharded_monoio<
                             };
                             let query_str = query_bytes.unwrap();
 
+                            // B-01 SITE 2 FIX (Plan 152-06): FieldFilter short-circuit BEFORE
+                            // the analyzer-first parse_result block. TAG queries (and Plan 07
+                            // NumericRange) route through the InvertedSearch fan-out — no
+                            // analyzer touched, no field_idx resolution (the filter carries
+                            // its own field name; search_tag resolves against tag_fields).
+                            #[cfg(feature = "text-index")]
+                            {
+                                match crate::command::vector_search::pre_parse_field_filter(
+                                    query_str.as_ref(),
+                                ) {
+                                    Ok(Some(clause)) => {
+                                        if let Some(filter) = clause.filter {
+                                            let (offset, count) =
+                                                crate::command::vector_search::parse_limit_clause(
+                                                    cmd_args,
+                                                );
+                                            let top_k = if count == usize::MAX {
+                                                10000
+                                            } else {
+                                                offset.saturating_add(count)
+                                            }
+                                            .max(1);
+                                            let response =
+                                                crate::shard::coordinator::scatter_text_search_filter(
+                                                    index_name,
+                                                    filter,
+                                                    top_k,
+                                                    offset,
+                                                    count,
+                                                    ctx.shard_id,
+                                                    ctx.num_shards,
+                                                    &ctx.shard_databases,
+                                                    &ctx.dispatch_tx,
+                                                    &ctx.spsc_notifiers,
+                                                )
+                                                .await;
+                                            responses.push(response);
+                                            continue;
+                                        }
+                                    }
+                                    Ok(None) => { /* fall through to BM25 path */ }
+                                    Err(e) => {
+                                        responses.push(Frame::Error(Bytes::from(e.to_owned())));
+                                        continue;
+                                    }
+                                }
+                            }
+
                             // Parse query and resolve field_idx inside a block scope so the
                             // MutexGuard from text_store() is dropped BEFORE .await.
                             // We use the TextIndex's own field_analyzers (same pipeline used at index time).
@@ -2056,6 +2104,42 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                                 continue;
                                             }
                                         };
+                                        // B-01 SITE 2 FIX (single-shard 151-03 fast path, Plan 152-06):
+                                        // FieldFilter short-circuit BEFORE the analyzer lookup and
+                                        // BEFORE the text_fields.is_empty() bail.
+                                        #[cfg(feature = "text-index")]
+                                        match crate::command::vector_search::pre_parse_field_filter(
+                                            query_bytes.as_ref(),
+                                        ) {
+                                            Ok(Some(clause)) => {
+                                                if clause.filter.is_some() {
+                                                    let (offset, count) = crate::command::vector_search::parse_limit_clause(cmd_args);
+                                                    let top_k = if count == usize::MAX { 10000 } else { offset.saturating_add(count) }.max(1);
+                                                    let ts_guard = ctx.shard_databases.text_store(ctx.shard_id);
+                                                    let response = match ts_guard.get_index(&index_name) {
+                                                        None => Frame::Error(Bytes::from_static(b"ERR no such index")),
+                                                        Some(text_index) => {
+                                                            let results = crate::command::vector_search::ft_text_search::execute_query_on_index(
+                                                                text_index, &clause, None, None, top_k,
+                                                            );
+                                                            crate::command::vector_search::ft_text_search::build_text_response(
+                                                                &results, offset, count,
+                                                            )
+                                                        }
+                                                    };
+                                                    drop(ts_guard);
+                                                    responses.push(response);
+                                                    continue;
+                                                }
+                                            }
+                                            Ok(None) => { /* fall through */ }
+                                            Err(e) => {
+                                                responses.push(Frame::Error(
+                                                    Bytes::copy_from_slice(e.as_bytes()),
+                                                ));
+                                                continue;
+                                            }
+                                        }
                                         // Step 2: acquire ts guard (single-shard monoio).
                                         let ts_guard = ctx.shard_databases.text_store(ctx.shard_id);
                                         // Step 3: resolve index.

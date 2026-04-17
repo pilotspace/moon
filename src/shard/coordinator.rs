@@ -1074,6 +1074,129 @@ pub async fn scatter_text_search(
     crate::command::vector_search::merge_text_results(&search_responses, top_k, offset, count)
 }
 
+/// Scatter a FieldFilter (TAG — Plan 07 adds NumericRange) across all shards.
+///
+/// Plan 152-06 (B-02): mirrors `scatter_text_search` for FieldFilter clauses
+/// but:
+/// - Skips the DFS pre-pass (FieldFilter has no per-term IDF).
+/// - Dispatches `ShardMessage::InvertedSearch` instead of `TextSearch`.
+/// - Merges response frames via `merge_text_results` — results arrive with
+///   `score=0.0`, `merge_text_results` preserves insertion order within its
+///   bucket so the per-shard doc_id ascending order becomes a consistent
+///   cross-shard ordering after the sort-by-score tie-break (score is
+///   uniform, so the secondary key — key-bytes — resolves deterministically).
+///
+/// # Lock safety
+/// Single-shard fast path scopes the `MutexGuard` inside a block so it
+/// drops before any `.await` (RESEARCH Pitfall 2).
+#[cfg(feature = "text-index")]
+#[allow(clippy::too_many_arguments)]
+pub async fn scatter_text_search_filter(
+    index_name: Bytes,
+    filter: crate::command::vector_search::ft_text_search::FieldFilter,
+    top_k: usize,
+    offset: usize,
+    count: usize,
+    my_shard: usize,
+    num_shards: usize,
+    shard_databases: &Arc<ShardDatabases>,
+    dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
+    spsc_notifiers: &[Arc<channel::Notify>],
+) -> Frame {
+    // ── Single-shard fast path ────────────────────────────────────────────────
+    if num_shards == 1 {
+        let response = {
+            let ts = shard_databases.text_store(my_shard);
+            match ts.get_index(&index_name) {
+                None => Frame::Error(Bytes::from_static(b"ERR no such index")),
+                Some(text_index) => {
+                    let clause = crate::command::vector_search::ft_text_search::TextQueryClause {
+                        field_name: None,
+                        terms: Vec::new(),
+                        filter: Some(filter),
+                    };
+                    let results =
+                        crate::command::vector_search::ft_text_search::execute_query_on_index(
+                            text_index, &clause, None, None, top_k,
+                        );
+                    crate::command::vector_search::ft_text_search::build_text_response(
+                        &results, offset, count,
+                    )
+                }
+            }
+            // MutexGuard dropped here
+        };
+        return response;
+    }
+
+    // ── Multi-shard fan-out ──────────────────────────────────────────────────
+    let mut receivers: Vec<crate::runtime::channel::OneshotReceiver<Frame>> =
+        Vec::with_capacity(num_shards.saturating_sub(1));
+    let mut local_response: Option<Frame> = None;
+
+    for shard_id in 0..num_shards {
+        if shard_id == my_shard {
+            let response = {
+                let ts = shard_databases.text_store(my_shard);
+                match ts.get_index(&index_name) {
+                    None => Frame::Error(Bytes::from_static(b"ERR no such index")),
+                    Some(text_index) => {
+                        let clause =
+                            crate::command::vector_search::ft_text_search::TextQueryClause {
+                                field_name: None,
+                                terms: Vec::new(),
+                                filter: Some(filter.clone()),
+                            };
+                        let results =
+                            crate::command::vector_search::ft_text_search::execute_query_on_index(
+                                text_index, &clause, None, None, top_k,
+                            );
+                        // Each shard returns top_k; coordinator applies final offset+count
+                        // after merging.
+                        crate::command::vector_search::ft_text_search::build_text_response(
+                            &results, 0, top_k,
+                        )
+                    }
+                }
+                // MutexGuard dropped here, before the next `.await`
+            };
+            local_response = Some(response);
+        } else {
+            let (reply_tx, reply_rx) = channel::oneshot();
+            let msg = ShardMessage::InvertedSearch(Box::new(
+                crate::shard::dispatch::InvertedSearchPayload {
+                    index_name: index_name.clone(),
+                    filter: filter.clone(),
+                    top_k,
+                    offset: 0,
+                    count: top_k,
+                    reply_tx,
+                },
+            ));
+            spsc_send(dispatch_tx, my_shard, shard_id, msg, spsc_notifiers).await;
+            receivers.push(reply_rx);
+        }
+    }
+
+    let mut responses = Vec::with_capacity(num_shards);
+    if let Some(local) = local_response {
+        responses.push(local);
+    }
+    for rx in receivers {
+        match rx.recv().await {
+            Ok(frame) => responses.push(frame),
+            Err(_) => {
+                return Frame::Error(Bytes::from_static(
+                    b"ERR InvertedSearch channel closed unexpectedly",
+                ));
+            }
+        }
+    }
+
+    // Uniform score=0.0 across shards; merge_text_results stabilizes order.
+    crate::command::vector_search::merge_text_results(&responses, top_k, offset, count)
+}
+
 /// Aggregate document frequencies from multiple shard `DocFreq` responses.
 ///
 /// Each response is a `Frame::Array` with interleaved `[term, df, ..., "N", n]` entries.
