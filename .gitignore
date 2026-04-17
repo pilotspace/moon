@@ -92,3 +92,4 @@ sdk/python/*.egg-info/
 sdk/python/moondb.egg-info/
 __pycache__/
 *.pyc
+tmp/
