@@ -51,6 +51,12 @@ pub enum WalRecordType {
     FileDelete = 0x41,
     /// File tier change event.
     FileTierChange = 0x42,
+    /// Cross-store transaction begin.
+    XactBegin = 0x50,
+    /// Cross-store transaction commit (contains all store operations).
+    XactCommit = 0x51,
+    /// Cross-store transaction abort.
+    XactAbort = 0x52,
 }
 
 impl WalRecordType {
@@ -69,6 +75,9 @@ impl WalRecordType {
             0x40 => Some(Self::FileCreate),
             0x41 => Some(Self::FileDelete),
             0x42 => Some(Self::FileTierChange),
+            0x50 => Some(Self::XactBegin),
+            0x51 => Some(Self::XactCommit),
+            0x52 => Some(Self::XactAbort),
             _ => None,
         }
     }
@@ -264,10 +273,13 @@ mod tests {
         assert_eq!(WalRecordType::FileCreate as u8, 0x40);
         assert_eq!(WalRecordType::FileDelete as u8, 0x41);
         assert_eq!(WalRecordType::FileTierChange as u8, 0x42);
+        assert_eq!(WalRecordType::XactBegin as u8, 0x50);
+        assert_eq!(WalRecordType::XactCommit as u8, 0x51);
+        assert_eq!(WalRecordType::XactAbort as u8, 0x52);
 
         // from_u8 roundtrips
         for &v in &[
-            0x01, 0x10, 0x20, 0x30, 0x31, 0x32, 0x33, 0x34, 0x40, 0x41, 0x42,
+            0x01, 0x10, 0x20, 0x30, 0x31, 0x32, 0x33, 0x34, 0x40, 0x41, 0x42, 0x50, 0x51, 0x52,
         ] {
             assert!(WalRecordType::from_u8(v).is_some());
         }
