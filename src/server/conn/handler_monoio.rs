@@ -3192,7 +3192,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     parts.extend_from_slice(cmd_args);
                     Frame::Array(parts.into())
                 } else {
-                    frame
+                    frame.clone()
                 };
                 let resp_idx = responses.len();
                 responses.push(Frame::Null); // placeholder, filled after batch dispatch
