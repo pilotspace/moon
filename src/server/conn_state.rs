@@ -143,12 +143,14 @@ impl ConnectionState {
 
     /// Get the active transaction's ID, if any.
     #[inline]
+    #[allow(dead_code)] // API reserved for future handler-level TXN integration
     pub fn cross_txn_id(&self) -> Option<u64> {
         self.active_cross_txn.as_ref().map(|t| t.txn_id)
     }
 
     /// Get the active transaction's snapshot LSN, if any.
     #[inline]
+    #[allow(dead_code)] // API reserved for future handler-level TXN integration
     pub fn cross_txn_snapshot(&self) -> Option<u64> {
         self.active_cross_txn.as_ref().map(|t| t.snapshot_lsn)
     }

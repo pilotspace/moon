@@ -62,6 +62,7 @@ use crate::transaction::CrossStoreTxn;
 /// - `key`: The key being modified
 /// - `is_delete`: True if this is a delete operation (DEL, HDEL, etc.)
 #[inline]
+#[allow(dead_code)] // API reserved for future handler-level KV transaction tracking
 pub(crate) fn record_txn_kv_write(
     txn: &mut CrossStoreTxn,
     db: &mut Database,
