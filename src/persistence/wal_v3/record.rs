@@ -291,6 +291,60 @@ pub fn decode_graph_temporal(payload: &[u8]) -> Option<(u64, bool, i64, i64)> {
     Some((entity_id, is_node, valid_to, system_from))
 }
 
+/// Encode XactCommit WAL payload for crash recovery.
+///
+/// Layout matches `replay_xact_commit()` decoder exactly:
+///   `[txn_id: u64 LE][kv_op_count: u32 LE][ops...]`
+///   Per op: `[op_type: u8 (0=SET, 1=DEL)]`
+///           `[key_len: u32 LE][key bytes]`
+///           `[value_len: u32 LE (SET only)][value bytes (SET only)]`
+///
+/// For SET ops, reads the CURRENT value from `db.data()` (post-commit state).
+/// For DEL ops, encodes just the key (replay calls `db.remove()`).
+///
+/// The undo log carries before-images for rollback; the WAL needs
+/// forward-images (final committed state) for replay.
+pub fn encode_xact_commit_payload(
+    txn_id: u64,
+    undo_records: &[crate::transaction::UndoRecord],
+    db: &crate::storage::Database,
+) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(12 + undo_records.len() * 32);
+    payload.extend_from_slice(&txn_id.to_le_bytes());
+    // Count placeholder — patched at the end
+    let count_offset = payload.len();
+    payload.extend_from_slice(&0u32.to_le_bytes());
+    let mut count = 0u32;
+
+    for record in undo_records {
+        match record {
+            crate::transaction::UndoRecord::Insert { key }
+            | crate::transaction::UndoRecord::Update { key, .. } => {
+                // Read current (post-dispatch) value for forward-image WAL
+                if let Some(entry) = db.data().get(key.as_ref()) {
+                    if let Some(value) = entry.value.as_bytes_owned() {
+                        payload.push(0u8); // op_type = SET
+                        payload.extend_from_slice(&(key.len() as u32).to_le_bytes());
+                        payload.extend_from_slice(key);
+                        payload.extend_from_slice(&(value.len() as u32).to_le_bytes());
+                        payload.extend_from_slice(&value);
+                        count += 1;
+                    }
+                }
+            }
+            crate::transaction::UndoRecord::Delete { key, .. } => {
+                payload.push(1u8); // op_type = DEL
+                payload.extend_from_slice(&(key.len() as u32).to_le_bytes());
+                payload.extend_from_slice(key);
+                count += 1;
+            }
+        }
+    }
+    // Patch count field
+    payload[count_offset..count_offset + 4].copy_from_slice(&count.to_le_bytes());
+    payload
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -499,5 +553,70 @@ mod tests {
         assert!(in_);
         assert_eq!(vt, 9999);
         assert_eq!(sf, 8888);
+    }
+
+    #[test]
+    fn test_encode_xact_commit_payload_roundtrip() {
+        use crate::storage::Database;
+        use crate::transaction::UndoRecord;
+        use bytes::Bytes;
+
+        // Set up a database with current committed state
+        let mut db = Database::new();
+        db.set_string(
+            Bytes::from_static(b"key1"),
+            Bytes::from_static(b"committed_val"),
+        );
+        // key2 was deleted (will appear as DEL op)
+
+        // Build undo records:
+        // - Insert{key1}: key1 was new (current value in db = "committed_val")
+        // - Delete{key2, old_entry}: key2 was deleted during txn
+        let old_entry =
+            crate::storage::entry::Entry::new_string(Bytes::from_static(b"was_here"));
+        let records = vec![
+            UndoRecord::Insert {
+                key: Bytes::from_static(b"key1"),
+            },
+            UndoRecord::Delete {
+                key: Bytes::from_static(b"key2"),
+                old_entry,
+            },
+        ];
+
+        let payload = encode_xact_commit_payload(42, &records, &db);
+
+        // Verify header
+        assert_eq!(
+            u64::from_le_bytes(payload[0..8].try_into().unwrap()),
+            42
+        ); // txn_id
+        assert_eq!(
+            u32::from_le_bytes(payload[8..12].try_into().unwrap()),
+            2
+        ); // 2 ops
+
+        // Verify op 1: SET key1 committed_val
+        let mut offset = 12;
+        assert_eq!(payload[offset], 0); // SET
+        offset += 1;
+        let key_len =
+            u32::from_le_bytes(payload[offset..offset + 4].try_into().unwrap()) as usize;
+        offset += 4;
+        assert_eq!(&payload[offset..offset + key_len], b"key1");
+        offset += key_len;
+        let val_len =
+            u32::from_le_bytes(payload[offset..offset + 4].try_into().unwrap()) as usize;
+        offset += 4;
+        assert_eq!(&payload[offset..offset + val_len], b"committed_val");
+        offset += val_len;
+
+        // Verify op 2: DEL key2
+        assert_eq!(payload[offset], 1); // DEL
+        offset += 1;
+        let key_len2 =
+            u32::from_le_bytes(payload[offset..offset + 4].try_into().unwrap()) as usize;
+        offset += 4;
+        assert_eq!(&payload[offset..offset + key_len2], b"key2");
     }
 }
