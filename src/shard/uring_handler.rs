@@ -221,6 +221,32 @@ pub(crate) fn handle_uring_event(
                             }
                         }
 
+                        // TXN.* not supported in uring batch mode (no per-connection state)
+                        if crate::command::transaction::is_txn_begin(cmd, args)
+                            || crate::command::transaction::is_txn_commit(cmd, args)
+                            || crate::command::transaction::is_txn_abort(cmd, args)
+                        {
+                            return crate::protocol::Frame::Error(bytes::Bytes::from_static(
+                                b"ERR TXN commands not supported in io_uring batch mode; use standard connection handler",
+                            ));
+                        }
+
+                        // TEMPORAL.* not supported in uring batch mode (no per-connection state)
+                        if crate::command::temporal::is_temporal_snapshot_at(cmd)
+                            || crate::command::temporal::is_temporal_invalidate(cmd)
+                        {
+                            return crate::protocol::Frame::Error(bytes::Bytes::from_static(
+                                b"ERR TEMPORAL commands not supported in io_uring batch mode; use standard connection handler",
+                            ));
+                        }
+
+                        // MQ.* not supported in uring batch mode (no per-connection state for durable ACK)
+                        if crate::mq::is_mq_command(cmd) {
+                            return crate::protocol::Frame::Error(bytes::Bytes::from_static(
+                                b"ERR MQ commands not supported in io_uring batch mode; use standard connection handler",
+                            ));
+                        }
+
                         let result = cmd_dispatch(&mut guard, cmd, args, &mut selected, db_count);
                         match result {
                             DispatchResult::Response(f) => f,
