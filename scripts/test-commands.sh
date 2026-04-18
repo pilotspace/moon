@@ -67,6 +67,7 @@ while [[ $# -gt 0 ]]; do
             echo "  persistence  - Persistence commands (BGSAVE, BGREWRITEAOF, etc.)"
             echo "  blocking     - Blocking commands (BLPOP, BRPOP, BZPOPMIN, etc.)"
             echo "  temporal     - Temporal commands (TEMPORAL.SNAPSHOT_AT, TEMPORAL.INVALIDATE)"
+            echo "  workspace    - Workspace commands (WS CREATE, WS LIST, WS INFO, WS AUTH, WS DROP)"
             echo "  benchmark    - redis-benchmark throughput for all benchmarkable commands"
             exit 0
             ;;
@@ -1755,6 +1756,90 @@ if should_run "temporal"; then
 
     mcli GRAPH.DELETE testgraph >/dev/null 2>&1
     echo "  temporal: done"
+fi
+
+# ===========================================================================
+# WORKSPACE COMMANDS (WS CREATE/LIST/INFO/AUTH/DROP)
+# ===========================================================================
+
+if should_run "workspace"; then
+    echo ""
+    echo "=== WORKSPACE COMMANDS ==="
+    mcli FLUSHALL >/dev/null 2>&1
+
+    # WS-01: WS CREATE returns UUID
+    TOTAL=$((TOTAL + 1))
+    WS_ID=$(mcli WS CREATE myworkspace 2>&1)
+    if echo "$WS_ID" | grep -qE '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'; then
+        PASS=$((PASS + 1)); echo "  PASS: WS CREATE returns UUID ($WS_ID)"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: WS CREATE should return UUID, got: $WS_ID"
+    fi
+
+    # WS-02: WS LIST returns workspace
+    TOTAL=$((TOTAL + 1))
+    WS_LIST=$(mcli WS LIST 2>&1)
+    if echo "$WS_LIST" | grep -qF "myworkspace"; then
+        PASS=$((PASS + 1)); echo "  PASS: WS LIST contains myworkspace"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: WS LIST should contain myworkspace: $WS_LIST"
+    fi
+
+    # WS-03: WS INFO returns metadata
+    TOTAL=$((TOTAL + 1))
+    WS_INFO=$(mcli WS INFO "$WS_ID" 2>&1)
+    if echo "$WS_INFO" | grep -qF "myworkspace"; then
+        PASS=$((PASS + 1)); echo "  PASS: WS INFO returns workspace metadata"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: WS INFO should contain name: $WS_INFO"
+    fi
+
+    # WS-04: WS AUTH binds workspace
+    assert_moon "WS AUTH bind" "OK" WS AUTH "$WS_ID"
+
+    # WS-05: Workspace-scoped SET+GET
+    assert_moon "WS SET scoped" "OK" SET testkey testval
+    assert_moon "WS GET scoped" "testval" GET testkey
+
+    # WS-06: WS DROP removes workspace
+    # Need a fresh workspace to drop (current conn already bound)
+    TOTAL=$((TOTAL + 1))
+    WS_ID2=$(mcli WS CREATE dropme 2>&1)
+    DROP_OK=$(mcli WS DROP "$WS_ID2" 2>&1)
+    if echo "$DROP_OK" | grep -q "OK"; then
+        PASS=$((PASS + 1)); echo "  PASS: WS DROP returns OK"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: WS DROP should return OK: $DROP_OK"
+    fi
+
+    # WS-07: WS LIST after drop no longer shows dropped workspace
+    TOTAL=$((TOTAL + 1))
+    WS_LIST2=$(mcli WS LIST 2>&1)
+    if echo "$WS_LIST2" | grep -qF "dropme"; then
+        FAIL=$((FAIL + 1)); echo "  FAIL: WS LIST should not contain 'dropme' after drop"
+    else
+        PASS=$((PASS + 1)); echo "  PASS: WS LIST does not contain dropped workspace"
+    fi
+
+    # WS-08: WS AUTH with invalid UUID
+    TOTAL=$((TOTAL + 1))
+    AUTH_ERR=$(mcli WS AUTH "not-a-uuid" 2>&1)
+    if echo "$AUTH_ERR" | grep -qi "ERR"; then
+        PASS=$((PASS + 1)); echo "  PASS: WS AUTH invalid UUID rejected"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: WS AUTH invalid should error: $AUTH_ERR"
+    fi
+
+    # WS-09: WS CREATE with empty name
+    TOTAL=$((TOTAL + 1))
+    CREATE_ERR=$(mcli WS CREATE 2>&1)
+    if echo "$CREATE_ERR" | grep -qi "ERR"; then
+        PASS=$((PASS + 1)); echo "  PASS: WS CREATE missing name rejected"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: WS CREATE no name should error: $CREATE_ERR"
+    fi
+
+    echo "  workspace: done"
 fi
 
 # ===========================================================================

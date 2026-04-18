@@ -785,6 +785,106 @@ fi
 # Restart moon with the originally-requested shard count so later sections work.
 start_moon_with_shards "$SHARDS" || true
 
+# ===========================================================================
+# WORKSPACE COMMANDS -- cross-shard consistency (moon-only)
+# ===========================================================================
+
+log "Running workspace cross-shard consistency tests (moon-only)..."
+
+WS_RESULT_1=""
+WS_RESULT_4=""
+WS_RESULT_12=""
+
+WS_ISO_RESULT_1=""
+WS_ISO_RESULT_4=""
+WS_ISO_RESULT_12=""
+
+for NSHARDS in 1 4 12; do
+    log "  -- workspace shards=$NSHARDS --"
+    start_moon_with_shards "$NSHARDS" || { echo "  FAIL: moon failed to start with shards=$NSHARDS"; FAIL=$((FAIL + 1)); continue; }
+    redis-cli -p "$PORT_RUST" FLUSHALL >/dev/null 2>&1
+
+    # WS CREATE + WS AUTH + SET + GET consistency
+    WS_ID=$(redis-cli -p "$PORT_RUST" WS CREATE "testws" 2>&1)
+    AUTH_OK=$(redis-cli -p "$PORT_RUST" WS AUTH "$WS_ID" 2>&1)
+    SET_OK=$(redis-cli -p "$PORT_RUST" SET mykey myval 2>&1)
+    GET_VAL=$(redis-cli -p "$PORT_RUST" GET mykey 2>&1)
+    WS_RESULT="$AUTH_OK|$SET_OK|$GET_VAL"
+    case "$NSHARDS" in
+        1)  WS_RESULT_1="$WS_RESULT" ;;
+        4)  WS_RESULT_4="$WS_RESULT" ;;
+        12) WS_RESULT_12="$WS_RESULT" ;;
+    esac
+
+    # WS LIST consistency — should show the created workspace
+    WS_LIST=$(redis-cli -p "$PORT_RUST" WS LIST 2>&1)
+    LIST_HAS_WS="no"
+    echo "$WS_LIST" | grep -qF "testws" && LIST_HAS_WS="yes"
+
+    # Workspace isolation: unbound GET should not see workspace key
+    # Open a fresh connection (redis-cli is one-shot, so each call is a new conn)
+    # We need a separate connection that is NOT bound to the workspace.
+    # Since redis-cli opens a new TCP connection per invocation, and our
+    # WS AUTH above was on the previous connection, a new redis-cli call
+    # will be unbound. But redis-cli reuses connections in interactive mode.
+    # For one-shot mode, each redis-cli is a new connection, so GET mykey
+    # from a fresh connection should return nil (key is workspace-scoped).
+    UNBOUND_GET=$(redis-cli -p "$PORT_RUST" GET mykey 2>&1)
+    WS_ISO_RESULT="$LIST_HAS_WS|$UNBOUND_GET"
+    case "$NSHARDS" in
+        1)  WS_ISO_RESULT_1="$WS_ISO_RESULT" ;;
+        4)  WS_ISO_RESULT_4="$WS_ISO_RESULT" ;;
+        12) WS_ISO_RESULT_12="$WS_ISO_RESULT" ;;
+    esac
+
+    # Cleanup
+    kill "$RUST_PID" 2>/dev/null; wait "$RUST_PID" 2>/dev/null || true
+    RUST_PID=""
+done
+
+# WS CREATE+AUTH+SET+GET consistency: all shard configs should return OK|OK|myval
+if [[ "$WS_RESULT_1" == "OK|OK|myval" && "$WS_RESULT_4" == "OK|OK|myval" && "$WS_RESULT_12" == "OK|OK|myval" ]]; then
+    PASS=$((PASS + 1)); echo "  PASS: WS CREATE+AUTH+SET+GET consistent across 1/4/12 shards"
+else
+    FAIL=$((FAIL + 1))
+    echo "  FAIL: WS CREATE+AUTH+SET+GET cross-shard divergence"
+    echo "    1-shard:  $WS_RESULT_1"
+    echo "    4-shard:  $WS_RESULT_4"
+    echo "    12-shard: $WS_RESULT_12"
+fi
+
+# WS isolation: unbound connection should not see workspace key (returns empty/nil)
+# redis-cli returns empty string for nil values
+WS_ISO_OK=true
+for NSHARDS_LABEL in 1 4 12; do
+    case "$NSHARDS_LABEL" in
+        1)  RESULT="$WS_ISO_RESULT_1" ;;
+        4)  RESULT="$WS_ISO_RESULT_4" ;;
+        12) RESULT="$WS_ISO_RESULT_12" ;;
+    esac
+    LIST_CHECK=$(echo "$RESULT" | cut -d'|' -f1)
+    UNBOUND=$(echo "$RESULT" | cut -d'|' -f2)
+    if [[ "$LIST_CHECK" != "yes" ]]; then
+        WS_ISO_OK=false
+    fi
+    # Unbound GET should return empty (nil) -- not "myval"
+    if [[ "$UNBOUND" == "myval" ]]; then
+        WS_ISO_OK=false
+    fi
+done
+if $WS_ISO_OK; then
+    PASS=$((PASS + 1)); echo "  PASS: WS isolation holds across 1/4/12 shards (unbound conn cannot see workspace keys)"
+else
+    FAIL=$((FAIL + 1))
+    echo "  FAIL: WS isolation cross-shard divergence"
+    echo "    1-shard:  $WS_ISO_RESULT_1"
+    echo "    4-shard:  $WS_ISO_RESULT_4"
+    echo "    12-shard: $WS_ISO_RESULT_12"
+fi
+
+# Restart moon with the originally-requested shard count so later sections work.
+start_moon_with_shards "$SHARDS" || true
+
 echo "============================================"
 echo "  Data Consistency Test Results"
 echo "============================================"
