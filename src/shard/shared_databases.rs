@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use parking_lot::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -279,6 +280,152 @@ impl ShardDatabases {
                     shard_id,
                     create_count,
                     drop_count,
+                );
+            }
+        }
+    }
+
+    /// Replay MQ WAL records to restore DurableQueueRegistry and apply cursor-rollback.
+    ///
+    /// This is the P2 CRITICAL path: after restart, unacknowledged messages must be
+    /// redelivered. The cursor-rollback resets `ConsumerGroup.last_delivered_id` to
+    /// the last-acked position so that MQ.POP will re-deliver unacked messages.
+    ///
+    /// **Cursor-rollback algorithm:**
+    /// For each durable queue, after WAL scan:
+    /// - If PEL is non-empty: rollback target = min(PEL keys) - 1
+    ///   (the ID just before the first unacked message)
+    /// - If PEL is empty: no rollback needed (all messages were acked)
+    ///
+    /// This handles out-of-order acks correctly: if messages 1,2,3,4,5 were delivered
+    /// but only 1,3,5 were acked, the PEL contains {2,4}. Rollback target = 1
+    /// (min(PEL) - 1), so messages 2,3,4,5 are all redelivered.
+    pub fn replay_mq_wal(&self, persistence_dir: &std::path::Path) {
+        use crate::persistence::wal_v3::record::{WalRecord, WalRecordType};
+        use crate::storage::stream::StreamId;
+
+        for shard_id in 0..self.num_shards {
+            let wal_dir = persistence_dir.join(format!("shard-{}", shard_id));
+            if !wal_dir.exists() {
+                continue;
+            }
+
+            // Phase 1: Scan WAL to collect MqCreate configs and MqAck positions
+            let mut durable_configs: HashMap<Vec<u8>, u32> = HashMap::new();
+            let mut ack_count = 0u64;
+
+            let on_command = &mut |record: &WalRecord| {
+                match record.record_type {
+                    WalRecordType::MqCreate => {
+                        if let Some((queue_key, max_delivery_count)) =
+                            crate::mq::wal::decode_mq_create(&record.payload)
+                        {
+                            durable_configs.insert(queue_key, max_delivery_count);
+                        }
+                    }
+                    WalRecordType::MqAck => {
+                        if crate::mq::wal::decode_mq_ack(&record.payload).is_some() {
+                            ack_count += 1;
+                        }
+                    }
+                    _ => {}
+                }
+            };
+            let on_fpi = &mut |_: &WalRecord| {};
+
+            // Scan WAL files in the shard directory
+            if let Ok(entries) = std::fs::read_dir(&wal_dir) {
+                let mut wal_files: Vec<_> = entries
+                    .filter_map(|e| e.ok())
+                    .filter(|e| {
+                        e.file_name()
+                            .to_str()
+                            .is_some_and(|n| n.ends_with(".wal"))
+                    })
+                    .map(|e| e.path())
+                    .collect();
+                wal_files.sort();
+
+                for wal_file in &wal_files {
+                    let _ = crate::persistence::wal_v3::replay::replay_wal_v3_file(
+                        wal_file, 0, on_command, on_fpi,
+                    );
+                }
+            }
+
+            // Phase 2: Restore DurableQueueRegistry from MqCreate records
+            if !durable_configs.is_empty() {
+                let mut guard = self.durable_queue_registries[shard_id].lock();
+                let reg = guard
+                    .get_or_insert_with(|| Box::new(crate::mq::DurableQueueRegistry::new()));
+                for (queue_key_bytes, max_delivery_count) in &durable_configs {
+                    let key = bytes::Bytes::copy_from_slice(queue_key_bytes);
+                    let config =
+                        crate::mq::DurableStreamConfig::new(key.clone(), *max_delivery_count);
+                    reg.insert(key, config);
+                }
+            }
+
+            // Phase 3: Cursor-rollback for each durable queue.
+            // The Stream and its __mq_consumers consumer group were already restored
+            // from RESP Command WAL records (regular KV replay path).
+            // We just need to reset last_delivered_id based on PEL state.
+            for (queue_key_bytes, max_dc) in &durable_configs {
+                let key_bytes = bytes::Bytes::copy_from_slice(queue_key_bytes);
+                let mut db_guard = self.write_db(shard_id, 0);
+
+                // Look up the Stream entry via get_stream_mut
+                if let Ok(Some(stream)) = db_guard.get_stream_mut(&key_bytes) {
+                    // Mark as durable (may not have been set during Command replay)
+                    stream.durable = true;
+                    stream.max_delivery_count = *max_dc;
+
+                    // Find the __mq_consumers group
+                    let group_name = bytes::Bytes::from_static(b"__mq_consumers");
+                    if let Some(group) = stream.groups.get_mut(&group_name) {
+                        // Cursor-rollback: if PEL is non-empty, set last_delivered_id
+                        // to the ID just before the first unacked message
+                        if let Some((min_pel_id, _)) = group.pel.iter().next() {
+                            let rollback_target = if min_pel_id.seq > 0 {
+                                StreamId {
+                                    ms: min_pel_id.ms,
+                                    seq: min_pel_id.seq - 1,
+                                }
+                            } else if min_pel_id.ms > 0 {
+                                // Edge case: seq=0, roll back to previous ms with max seq
+                                StreamId {
+                                    ms: min_pel_id.ms - 1,
+                                    seq: u64::MAX,
+                                }
+                            } else {
+                                StreamId::ZERO
+                            };
+
+                            tracing::info!(
+                                "Shard {}: MQ cursor-rollback for queue {:?}: \
+                                 last_delivered_id {}-{} -> {}-{} (PEL size: {})",
+                                shard_id,
+                                String::from_utf8_lossy(queue_key_bytes),
+                                group.last_delivered_id.ms,
+                                group.last_delivered_id.seq,
+                                rollback_target.ms,
+                                rollback_target.seq,
+                                group.pel.len(),
+                            );
+
+                            group.last_delivered_id = rollback_target;
+                        }
+                        // If PEL is empty: all messages were acked, no rollback needed
+                    }
+                }
+            }
+
+            if !durable_configs.is_empty() {
+                tracing::info!(
+                    "Shard {}: replayed {} MQ queue configs, {} ack records",
+                    shard_id,
+                    durable_configs.len(),
+                    ack_count,
                 );
             }
         }

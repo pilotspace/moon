@@ -495,6 +495,12 @@ fn main() -> anyhow::Result<()> {
         shard_databases.replay_workspace_wal(dir_path);
     }
 
+    // Replay MQ WAL records (cursor-rollback for durable queues).
+    if let Some(ref dir) = persistence_dir {
+        let dir_path = std::path::Path::new(dir);
+        shard_databases.replay_mq_wal(dir_path);
+    }
+
     // All shards recovered — mark server as ready for /readyz.
     moon::admin::metrics_setup::set_server_ready();
     if let Some(ref flag) = readiness_flag {
