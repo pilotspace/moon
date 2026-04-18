@@ -486,6 +486,11 @@ fn main() -> anyhow::Result<()> {
         let dir_path = std::path::Path::new(dir);
         shard_databases.recover_graph_stores(dir_path);
         shard_databases.replay_graph_wal(dir_path);
+    }
+
+    // Replay temporal WAL records (not gated on graph feature — temporal KV is core).
+    if let Some(ref dir) = persistence_dir {
+        let dir_path = std::path::Path::new(dir);
         shard_databases.replay_temporal_wal(dir_path);
     }
 

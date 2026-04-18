@@ -534,14 +534,15 @@ impl ShardDatabases {
 
     /// Replay temporal WAL records into per-shard TemporalKvIndex and GraphStore.
     ///
-    /// Called after `recover_graph_stores` and `replay_graph_wal` during startup.
-    /// Scans per-shard WAL directories for v3 segment files and processes
-    /// TemporalUpsert and GraphTemporal records to restore temporal state.
-    #[cfg(feature = "graph")]
+    /// Called at startup after graph recovery. TemporalUpsert (KV) records are
+    /// always replayed regardless of the `graph` feature. GraphTemporal records
+    /// are only processed when the `graph` feature is enabled.
     pub fn replay_temporal_wal(&self, persistence_dir: &std::path::Path) {
         use crate::persistence::wal_v3::record::{
-            WalRecord, WalRecordType, decode_graph_temporal, decode_temporal_upsert,
+            WalRecord, WalRecordType, decode_temporal_upsert,
         };
+        #[cfg(feature = "graph")]
+        use crate::persistence::wal_v3::record::decode_graph_temporal;
 
         for shard_id in 0..self.num_shards {
             let wal_dir = persistence_dir.join(format!("shard-{}", shard_id));
@@ -550,6 +551,7 @@ impl ShardDatabases {
             }
 
             let mut temporal_upsert_count = 0usize;
+            #[cfg(feature = "graph")]
             let mut graph_temporal_count = 0usize;
 
             let on_command = &mut |record: &WalRecord| {
@@ -570,6 +572,7 @@ impl ShardDatabases {
                             temporal_upsert_count += 1;
                         }
                     }
+                    #[cfg(feature = "graph")]
                     WalRecordType::GraphTemporal => {
                         if let Some((entity_id, is_node, valid_to, _system_from)) =
                             decode_graph_temporal(&record.payload)
@@ -627,12 +630,21 @@ impl ShardDatabases {
                 }
             }
 
+            #[cfg(feature = "graph")]
             if temporal_upsert_count > 0 || graph_temporal_count > 0 {
                 tracing::info!(
                     "Shard {}: replayed {} TemporalUpsert + {} GraphTemporal WAL records",
                     shard_id,
                     temporal_upsert_count,
                     graph_temporal_count,
+                );
+            }
+            #[cfg(not(feature = "graph"))]
+            if temporal_upsert_count > 0 {
+                tracing::info!(
+                    "Shard {}: replayed {} TemporalUpsert WAL records",
+                    shard_id,
+                    temporal_upsert_count,
                 );
             }
         }
