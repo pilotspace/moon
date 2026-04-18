@@ -25,6 +25,18 @@ pub const ERR_TXN_MULTI_CONFLICT: &[u8] = b"ERR cannot use TXN while in MULTI bl
 /// Error: cannot mix MULTI with TXN.
 pub const ERR_MULTI_TXN_CONFLICT: &[u8] = b"ERR cannot use MULTI while in TXN block";
 
+/// Error: cross-shard write attempted inside TXN.
+///
+/// Moon TXN uses a per-connection undo log that is shard-local. Writes that
+/// route to a different shard via SPSC are not captured in the undo log and
+/// therefore cannot be rolled back on TXN.ABORT.
+///
+/// Fix: use Redis cluster hash tags (e.g. {tag}:key) to force all transaction
+/// keys to route to the same shard as the TXN connection.
+pub const ERR_TXN_CROSS_SHARD: &[u8] =
+    b"ERR TXN does not support cross-shard writes \
+      -- use hash tags {tag} to co-locate keys (e.g. SET {txn}:key value)";
+
 /// TXN.BEGIN - Start a new cross-store transaction.
 ///
 /// Returns: +OK on success, or error if already in transaction.
@@ -183,5 +195,11 @@ mod tests {
     fn test_is_txn_abort() {
         let args = vec![Frame::BulkString(Bytes::from_static(b"ABORT"))];
         assert!(is_txn_abort(b"TXN", &args));
+    }
+
+    #[test]
+    fn test_err_txn_cross_shard_is_defined() {
+        assert!(!ERR_TXN_CROSS_SHARD.is_empty());
+        assert!(ERR_TXN_CROSS_SHARD.starts_with(b"ERR TXN"));
     }
 }

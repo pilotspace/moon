@@ -196,11 +196,12 @@ pub(crate) fn handle_uring_event(
                                     if let Some(hex) = ws_hex {
                                         if let Some(ws_id) = crate::workspace::WorkspaceId::from_hex(hex) {
                                             if let Some(meta) = registry.get(&ws_id) {
-                                                let mut info = Vec::with_capacity(4);
-                                                info.push(crate::protocol::Frame::BulkString(bytes::Bytes::from_static(b"id")));
-                                                info.push(crate::protocol::Frame::BulkString(bytes::Bytes::from(ws_id.as_hex())));
-                                                info.push(crate::protocol::Frame::BulkString(bytes::Bytes::from_static(b"name")));
-                                                info.push(crate::protocol::Frame::BulkString(meta.name.clone()));
+                                                let info = vec![
+                                                    crate::protocol::Frame::BulkString(bytes::Bytes::from_static(b"id")),
+                                                    crate::protocol::Frame::BulkString(bytes::Bytes::from(ws_id.as_hex())),
+                                                    crate::protocol::Frame::BulkString(bytes::Bytes::from_static(b"name")),
+                                                    crate::protocol::Frame::BulkString(meta.name.clone()),
+                                                ];
                                                 return crate::protocol::Frame::Array(info.into());
                                             }
                                         }

@@ -3625,6 +3625,15 @@ pub(crate) async fn handle_connection_sharded_monoio<
 
             // (tracking and response push handled inside read/write branches above)
             } else if let Some(target) = target_shard {
+                // TXN cross-shard guard: cross-shard writes bypass the undo log and
+                // cannot be rolled back on TXN.ABORT. Return an explicit error instead
+                // of silently permitting writes that resist rollback.
+                if conn.in_cross_txn() && metadata::is_write(cmd) {
+                    responses.push(Frame::Error(bytes::Bytes::from_static(
+                        crate::command::transaction::ERR_TXN_CROSS_SHARD,
+                    )));
+                    continue;
+                }
                 // SHARED-READ FAST PATH: cross-shard reads bypass SPSC dispatch entirely.
                 // By this point conn.in_multi is false (MULTI queuing happens earlier with `continue`).
                 // Read commands execute directly on the target shard's database via RwLock read guard,
