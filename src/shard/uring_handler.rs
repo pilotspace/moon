@@ -164,7 +164,11 @@ pub(crate) fn handle_uring_event(
                                     let name = args.get(1).and_then(|f| {
                                         if let crate::protocol::Frame::BulkString(b) = f { Some(b.clone()) } else { None }
                                     });
-                                    registry.register(ws_id, name);
+                                    registry.insert(ws_id, crate::workspace::registry::WorkspaceMetadata {
+                                        id: ws_id,
+                                        name: name.unwrap_or_else(|| bytes::Bytes::from_static(b"")),
+                                        created_at: 0,
+                                    });
                                     return crate::protocol::Frame::BulkString(bytes::Bytes::from(ws_id.as_hex()));
                                 }
                                 Some(s) if s.eq_ignore_ascii_case(b"DROP") => {
@@ -173,14 +177,14 @@ pub(crate) fn handle_uring_event(
                                     });
                                     if let Some(hex) = ws_hex {
                                         if let Some(ws_id) = crate::workspace::WorkspaceId::from_hex(hex) {
-                                            registry.unregister(&ws_id);
-                                            return crate::protocol::Frame::ok();
+                                            registry.remove(&ws_id);
+                                            return crate::protocol::Frame::SimpleString(bytes::Bytes::from_static(b"OK"));
                                         }
                                     }
                                     return crate::protocol::Frame::Error(bytes::Bytes::from_static(b"ERR invalid workspace id"));
                                 }
                                 Some(s) if s.eq_ignore_ascii_case(b"LIST") => {
-                                    let list: Vec<crate::protocol::Frame> = registry.list().iter().map(|(id, _)| {
+                                    let list: Vec<crate::protocol::Frame> = registry.iter().map(|(id, _)| {
                                         crate::protocol::Frame::BulkString(bytes::Bytes::from(id.as_hex()))
                                     }).collect();
                                     return crate::protocol::Frame::Array(list.into());
@@ -196,7 +200,7 @@ pub(crate) fn handle_uring_event(
                                                 info.push(crate::protocol::Frame::BulkString(bytes::Bytes::from_static(b"id")));
                                                 info.push(crate::protocol::Frame::BulkString(bytes::Bytes::from(ws_id.as_hex())));
                                                 info.push(crate::protocol::Frame::BulkString(bytes::Bytes::from_static(b"name")));
-                                                info.push(crate::protocol::Frame::BulkString(meta.name.clone().unwrap_or_else(|| bytes::Bytes::from_static(b"(none)"))));
+                                                info.push(crate::protocol::Frame::BulkString(meta.name.clone()));
                                                 return crate::protocol::Frame::Array(info.into());
                                             }
                                         }
