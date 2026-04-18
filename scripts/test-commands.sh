@@ -2067,8 +2067,59 @@ if should_run "txn_kv"; then
     fi
     mcli TXN ABORT >/dev/null 2>&1
 
+    # TXN-05: TXN.BEGIN / SET / MQ PUBLISH / TXN.COMMIT (KV+MQ atomic commit)
+    mcli MQ CREATE txn_mq_test_q MAXDELIVERY 5 >/dev/null 2>&1
+    TOTAL=$((TOTAL + 1))
+    mcli TXN BEGIN >/dev/null 2>&1
+    mcli SET txn_mq_commit_k committed_mq_val >/dev/null 2>&1
+    TXN_MQ_PUB=$(mcli MQ PUBLISH txn_mq_test_q mfield mvalue 2>&1)
+    if echo "$TXN_MQ_PUB" | grep -qi "QUEUED"; then
+        PASS=$((PASS + 1)); echo "  PASS: MQ PUBLISH inside TXN returns QUEUED"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: MQ PUBLISH inside TXN should return QUEUED: $TXN_MQ_PUB"
+    fi
+
+    TOTAL=$((TOTAL + 1))
+    mcli TXN COMMIT >/dev/null 2>&1
+    TXN_MQ_GET=$(mcli GET txn_mq_commit_k 2>&1)
+    if echo "$TXN_MQ_GET" | grep -q "committed_mq_val"; then
+        PASS=$((PASS + 1)); echo "  PASS: GET after KV+MQ TXN COMMIT returns committed value"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: GET after KV+MQ TXN COMMIT should return committed_mq_val: $TXN_MQ_GET"
+    fi
+
+    TOTAL=$((TOTAL + 1))
+    TXN_MQ_POP=$(mcli MQ POP txn_mq_test_q 2>&1)
+    if echo "$TXN_MQ_POP" | grep -q "mfield\|mvalue"; then
+        PASS=$((PASS + 1)); echo "  PASS: MQ POP after TXN COMMIT returns published message"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: MQ POP after TXN COMMIT should contain message: $TXN_MQ_POP"
+    fi
+
+    # TXN-06: TXN.BEGIN / SET / MQ PUBLISH / TXN.ABORT (both KV and MQ absent)
+    mcli MQ CREATE txn_mq_abort_q MAXDELIVERY 5 >/dev/null 2>&1
+    TOTAL=$((TOTAL + 1))
+    mcli TXN BEGIN >/dev/null 2>&1
+    mcli SET txn_mq_abort_k should_vanish >/dev/null 2>&1
+    mcli MQ PUBLISH txn_mq_abort_q afield avalue >/dev/null 2>&1
+    mcli TXN ABORT >/dev/null 2>&1
+    TXN_MQ_ABORT_GET=$(mcli GET txn_mq_abort_k 2>&1)
+    if echo "$TXN_MQ_ABORT_GET" | grep -qvE "should_vanish"; then
+        PASS=$((PASS + 1)); echo "  PASS: GET after KV+MQ TXN ABORT returns nil"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: GET after KV+MQ TXN ABORT should be nil: $TXN_MQ_ABORT_GET"
+    fi
+
+    TOTAL=$((TOTAL + 1))
+    TXN_MQ_ABORT_POP=$(mcli MQ POP txn_mq_abort_q 2>&1)
+    if echo "$TXN_MQ_ABORT_POP" | grep -qvE "afield|avalue"; then
+        PASS=$((PASS + 1)); echo "  PASS: MQ POP after TXN ABORT returns no message"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: MQ POP after TXN ABORT should be empty: $TXN_MQ_ABORT_POP"
+    fi
+
     # Cleanup
-    mcli DEL txn_kv_commit_key txn_kv_del_key >/dev/null 2>&1 || true
+    mcli DEL txn_kv_commit_key txn_kv_del_key txn_mq_commit_k txn_mq_abort_k >/dev/null 2>&1 || true
 
     echo "  txn_kv: done"
 fi
