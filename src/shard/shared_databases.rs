@@ -4,6 +4,7 @@ use parking_lot::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 #[cfg(feature = "graph")]
 use crate::graph::store::GraphStore;
+use crate::mq::{DurableQueueRegistry, TriggerRegistry};
 use crate::storage::Database;
 use crate::temporal::{TemporalKvIndex, TemporalRegistry};
 use crate::text::store::TextStore;
@@ -38,6 +39,12 @@ pub struct ShardDatabases {
     /// Per-shard WorkspaceRegistry for workspace metadata.
     /// Lazy-init: None until first WS.CREATE call on this shard.
     workspace_registries: Vec<Mutex<Option<Box<WorkspaceRegistry>>>>,
+    /// Per-shard DurableQueueRegistry for MQ.* commands.
+    /// Lazy-init: None until first MQ.CREATE call on this shard.
+    durable_queue_registries: Vec<Mutex<Option<Box<DurableQueueRegistry>>>>,
+    /// Per-shard TriggerRegistry for MQ.TRIGGER debounced callbacks.
+    /// Lazy-init: None until first MQ.TRIGGER call on this shard.
+    trigger_registries: Vec<Mutex<Option<Box<TriggerRegistry>>>>,
     num_shards: usize,
     db_count: usize,
 }
@@ -71,6 +78,12 @@ impl ShardDatabases {
         let workspace_registries = (0..num_shards)
             .map(|_| Mutex::new(None))
             .collect();
+        let durable_queue_registries = (0..num_shards)
+            .map(|_| Mutex::new(None))
+            .collect();
+        let trigger_registries = (0..num_shards)
+            .map(|_| Mutex::new(None))
+            .collect();
         Arc::new(Self {
             shards,
             vector_stores,
@@ -81,6 +94,8 @@ impl ShardDatabases {
             temporal_registries,
             temporal_kv_indexes,
             workspace_registries,
+            durable_queue_registries,
+            trigger_registries,
             num_shards,
             db_count,
         })
@@ -167,6 +182,26 @@ impl ShardDatabases {
         shard_id: usize,
     ) -> MutexGuard<'_, Option<Box<WorkspaceRegistry>>> {
         self.workspace_registries[shard_id].lock()
+    }
+
+    /// Acquire the per-shard DurableQueueRegistry lock.
+    /// Caller lazy-inits via `get_or_insert_with(|| Box::new(DurableQueueRegistry::new()))`.
+    #[inline]
+    pub fn durable_queue_registry(
+        &self,
+        shard_id: usize,
+    ) -> MutexGuard<'_, Option<Box<DurableQueueRegistry>>> {
+        self.durable_queue_registries[shard_id].lock()
+    }
+
+    /// Acquire the per-shard TriggerRegistry lock.
+    /// Caller lazy-inits via `get_or_insert_with(|| Box::new(TriggerRegistry::new()))`.
+    #[inline]
+    pub fn trigger_registry(
+        &self,
+        shard_id: usize,
+    ) -> MutexGuard<'_, Option<Box<TriggerRegistry>>> {
+        self.trigger_registries[shard_id].lock()
     }
 
     /// Replay WAL WorkspaceCreate and WorkspaceDrop records to restore workspace registry.
