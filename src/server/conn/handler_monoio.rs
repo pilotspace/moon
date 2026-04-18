@@ -3183,24 +3183,33 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     responses.push(response);
                     continue;
                 }
-                // Cross-shard write: deferred SPSC dispatch (unchanged)
+                // Cross-shard write: deferred SPSC dispatch.
+                // When workspace rewriting occurred, rebuild the frame with
+                // prefixed args so the target shard stores the correct key.
+                let dispatch_frame = if rewritten.is_some() {
+                    let mut parts = Vec::with_capacity(1 + cmd_args.len());
+                    parts.push(Frame::BulkString(Bytes::copy_from_slice(cmd)));
+                    parts.extend_from_slice(cmd_args);
+                    Frame::Array(parts.into())
+                } else {
+                    frame
+                };
                 let resp_idx = responses.len();
                 responses.push(Frame::Null); // placeholder, filled after batch dispatch
                 // Pre-compute AOF bytes before moving frame into Arc
                 let aof_bytes = if ctx.aof_tx.is_some() && metadata::is_write(cmd) {
-                    Some(aof::serialize_command(&frame))
+                    Some(aof::serialize_command(&dispatch_frame))
                 } else {
                     None
                 };
-                // Zero-copy: extract Bytes from frame's first element (refcount bump, no alloc).
-                let cmd_bytes = if let Frame::Array(ref args) = frame {
+                let cmd_bytes = if let Frame::Array(ref args) = dispatch_frame {
                     extract_bytes(&args[0]).unwrap_or_default()
                 } else {
                     Bytes::new()
                 };
                 remote_groups.entry(target).or_default().push((
                     resp_idx,
-                    std::sync::Arc::new(frame),
+                    std::sync::Arc::new(dispatch_frame),
                     aof_bytes,
                     cmd_bytes,
                 ));
