@@ -41,6 +41,14 @@ impl WorkspaceId {
     pub fn as_hex(&self) -> String {
         hex::encode(self.0)
     }
+
+    /// Parse from a hex-encoded byte slice (32 hex chars, no dashes).
+    pub fn from_hex(hex_bytes: &[u8]) -> Option<Self> {
+        let s = std::str::from_utf8(hex_bytes).ok()?;
+        let mut buf = [0u8; 16];
+        hex::decode_to_slice(s, &mut buf).ok()?;
+        Some(Self(buf))
+    }
 }
 
 impl std::fmt::Display for WorkspaceId {

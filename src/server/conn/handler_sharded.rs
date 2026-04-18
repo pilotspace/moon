@@ -1315,6 +1315,18 @@ pub(crate) async fn handle_connection_sharded_inner<
                                                     &payload,
                                                 );
                                                 ctx.shard_databases.wal_append(ctx.shard_id, Bytes::from(wal_buf));
+                                                // Best-effort cleanup: delete all KV keys with ws prefix (WS-03).
+                                                {
+                                                    let prefix = format!("{{{}}}:", ws_id.as_hex());
+                                                    let mut db_guard = ctx.shard_databases.write_db(ctx.shard_id, 0);
+                                                    let keys_to_delete: Vec<Vec<u8>> = db_guard.keys()
+                                                        .filter(|k| k.as_bytes().starts_with(prefix.as_bytes()))
+                                                        .map(|k| k.as_bytes().to_vec())
+                                                        .collect();
+                                                    for key in &keys_to_delete {
+                                                        db_guard.remove(key);
+                                                    }
+                                                }
                                                 responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
                                             } else {
                                                 responses.push(Frame::Error(Bytes::from_static(ERR_WS_NOT_FOUND)));

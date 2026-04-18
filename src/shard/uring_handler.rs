@@ -150,6 +150,73 @@ pub(crate) fn handle_uring_event(
                                 ));
                             }
                         };
+                        // WS.* command intercept (Phase 159) — workspace commands
+                        // are handled at the handler level, not in cmd_dispatch.
+                        if crate::workspace::is_ws_command(cmd) {
+                            let sub = args.first().and_then(|f| {
+                                if let crate::protocol::Frame::BulkString(b) = f { Some(b.as_ref()) } else { None }
+                            });
+                            let mut reg_guard = shard_databases.workspace_registry(shard_id);
+                            let registry = reg_guard.get_or_insert_with(|| Box::new(crate::workspace::registry::WorkspaceRegistry::new()));
+                            match sub {
+                                Some(s) if s.eq_ignore_ascii_case(b"CREATE") => {
+                                    let ws_id = crate::workspace::WorkspaceId::new_v7();
+                                    let name = args.get(1).and_then(|f| {
+                                        if let crate::protocol::Frame::BulkString(b) = f { Some(b.clone()) } else { None }
+                                    });
+                                    registry.register(ws_id, name);
+                                    return crate::protocol::Frame::BulkString(bytes::Bytes::from(ws_id.as_hex()));
+                                }
+                                Some(s) if s.eq_ignore_ascii_case(b"DROP") => {
+                                    let ws_hex = args.get(1).and_then(|f| {
+                                        if let crate::protocol::Frame::BulkString(b) = f { Some(b.as_ref()) } else { None }
+                                    });
+                                    if let Some(hex) = ws_hex {
+                                        if let Some(ws_id) = crate::workspace::WorkspaceId::from_hex(hex) {
+                                            registry.unregister(&ws_id);
+                                            return crate::protocol::Frame::ok();
+                                        }
+                                    }
+                                    return crate::protocol::Frame::Error(bytes::Bytes::from_static(b"ERR invalid workspace id"));
+                                }
+                                Some(s) if s.eq_ignore_ascii_case(b"LIST") => {
+                                    let list: Vec<crate::protocol::Frame> = registry.list().iter().map(|(id, _)| {
+                                        crate::protocol::Frame::BulkString(bytes::Bytes::from(id.as_hex()))
+                                    }).collect();
+                                    return crate::protocol::Frame::Array(list.into());
+                                }
+                                Some(s) if s.eq_ignore_ascii_case(b"INFO") => {
+                                    let ws_hex = args.get(1).and_then(|f| {
+                                        if let crate::protocol::Frame::BulkString(b) = f { Some(b.as_ref()) } else { None }
+                                    });
+                                    if let Some(hex) = ws_hex {
+                                        if let Some(ws_id) = crate::workspace::WorkspaceId::from_hex(hex) {
+                                            if let Some(meta) = registry.get(&ws_id) {
+                                                let mut info = Vec::with_capacity(4);
+                                                info.push(crate::protocol::Frame::BulkString(bytes::Bytes::from_static(b"id")));
+                                                info.push(crate::protocol::Frame::BulkString(bytes::Bytes::from(ws_id.as_hex())));
+                                                info.push(crate::protocol::Frame::BulkString(bytes::Bytes::from_static(b"name")));
+                                                info.push(crate::protocol::Frame::BulkString(meta.name.clone().unwrap_or_else(|| bytes::Bytes::from_static(b"(none)"))));
+                                                return crate::protocol::Frame::Array(info.into());
+                                            }
+                                        }
+                                    }
+                                    return crate::protocol::Frame::Error(bytes::Bytes::from_static(b"ERR workspace not found"));
+                                }
+                                // WS.AUTH not supported in uring_handler (no per-connection state)
+                                Some(s) if s.eq_ignore_ascii_case(b"AUTH") => {
+                                    return crate::protocol::Frame::Error(bytes::Bytes::from_static(
+                                        b"ERR WS.AUTH not available in io_uring batch mode; use standard connection handler",
+                                    ));
+                                }
+                                _ => {
+                                    return crate::protocol::Frame::Error(bytes::Bytes::from_static(
+                                        b"ERR unknown WS subcommand; supported: CREATE, DROP, LIST, INFO, AUTH",
+                                    ));
+                                }
+                            }
+                        }
+
                         let result = cmd_dispatch(&mut guard, cmd, args, &mut selected, db_count);
                         match result {
                             DispatchResult::Response(f) => f,
