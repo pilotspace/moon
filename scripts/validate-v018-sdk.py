@@ -120,21 +120,21 @@ def test_txn_abort_rollback() -> None:
     """TXN.BEGIN -> SET -> TXN.ABORT rolls back to original value."""
     print("\n=== 1.2 TXN: Abort Rollback ===")
     c = MoonClient(port=PORT)
-    c.set("txn:sdk:k2", "original")
+    c.set("{txnsdk}:k2", "original")
 
     c.execute_command("TXN", "BEGIN")
-    c.set("txn:sdk:k2", "should_be_rolled_back")
+    c.set("{txnsdk}:k2", "should_be_rolled_back")
 
     # Read-your-writes inside TXN
-    val_inside = c.get("txn:sdk:k2")
+    val_inside = c.get("{txnsdk}:k2")
     assert_eq("Read-your-writes inside TXN", val_inside, b"should_be_rolled_back")
 
     r = c.execute_command("TXN", "ABORT")
     assert_ok("TXN ABORT returns OK", r)
 
-    val = c.get("txn:sdk:k2")
+    val = c.get("{txnsdk}:k2")
     assert_eq("GET after ABORT restores original", val, b"original")
-    c.delete("txn:sdk:k2")
+    c.delete("{txnsdk}:k2")
     c.close()
 
 
@@ -142,13 +142,13 @@ def test_txn_abort_insert_rollback() -> None:
     """TXN.BEGIN -> SET new key -> TXN.ABORT removes the key."""
     print("\n=== 1.3 TXN: Abort Insert Rollback ===")
     c = MoonClient(port=PORT)
-    c.delete("txn:sdk:k3")
+    c.delete("{txnsdk}:k3")
 
     c.execute_command("TXN", "BEGIN")
-    c.set("txn:sdk:k3", "new_value")
+    c.set("{txnsdk}:k3", "new_value")
     c.execute_command("TXN", "ABORT")
 
-    val = c.get("txn:sdk:k3")
+    val = c.get("{txnsdk}:k3")
     assert_none("Key removed after ABORT of insert", val)
     c.close()
 
@@ -157,20 +157,20 @@ def test_txn_del_rollback() -> None:
     """TXN.BEGIN -> DEL -> TXN.ABORT restores deleted key."""
     print("\n=== 1.4 TXN: DEL Rollback ===")
     c = MoonClient(port=PORT)
-    c.set("txn:sdk:k4", "precious")
+    c.set("{txnsdk}:k4", "precious")
 
     c.execute_command("TXN", "BEGIN")
-    c.delete("txn:sdk:k4")
+    c.delete("{txnsdk}:k4")
 
     # Key should be gone inside TXN
-    val_inside = c.get("txn:sdk:k4")
+    val_inside = c.get("{txnsdk}:k4")
     assert_none("Key deleted inside TXN", val_inside)
 
     c.execute_command("TXN", "ABORT")
 
-    val = c.get("txn:sdk:k4")
+    val = c.get("{txnsdk}:k4")
     assert_eq("DEL rolled back after ABORT", val, b"precious")
-    c.delete("txn:sdk:k4")
+    c.delete("{txnsdk}:k4")
     c.close()
 
 
@@ -179,21 +179,21 @@ def test_txn_multi_key_atomic() -> None:
 
     Moon TXN is shard-scoped: only keys hashing to the connection's home
     shard participate in the undo log. We use keys known to share a shard
-    (txn:sdk:k2, txn:sdk:k3, txn:sdk:k4 all route to the same shard).
+    ({txnsdk}:k2, {txnsdk}:k3, {txnsdk}:k4 all route to the same shard via {txnsdk} hash tag).
     """
     print("\n=== 1.5 TXN: Multi-Key Atomic ===")
     c = MoonClient(port=PORT)
-    c.set("txn:sdk:k3", "a")
-    c.set("txn:sdk:k4", "b")
+    c.set("{txnsdk}:k3", "a")
+    c.set("{txnsdk}:k4", "b")
 
     c.execute_command("TXN", "BEGIN")
-    c.set("txn:sdk:k3", "x")
-    c.set("txn:sdk:k4", "y")
+    c.set("{txnsdk}:k3", "x")
+    c.set("{txnsdk}:k4", "y")
     c.execute_command("TXN", "ABORT")
 
-    assert_eq("k3 rolled back", c.get("txn:sdk:k3"), b"a")
-    assert_eq("k4 rolled back", c.get("txn:sdk:k4"), b"b")
-    c.delete("txn:sdk:k3", "txn:sdk:k4")
+    assert_eq("k3 rolled back", c.get("{txnsdk}:k3"), b"a")
+    assert_eq("k4 rolled back", c.get("{txnsdk}:k4"), b"b")
+    c.delete("{txnsdk}:k3", "{txnsdk}:k4")
     c.close()
 
 
@@ -656,16 +656,16 @@ def test_txn_mq_abort() -> None:
     """TXN.BEGIN -> SET -> MQ.PUBLISH -> TXN.ABORT — both discarded."""
     print("\n=== 5.2 TXN+MQ: Atomic Abort ===")
     c = MoonClient(port=PORT)
-    c.delete("txn:sdk:mq_a")
+    c.delete("{txnsdk}:mq_a")
     c.delete("mq:sdk:txn_qa")
     c.execute_command("MQ", "CREATE", "mq:sdk:txn_qa", "MAXDELIVERY", "5")
 
     c.execute_command("TXN", "BEGIN")
-    c.set("txn:sdk:mq_a", "should_vanish")
+    c.set("{txnsdk}:mq_a", "should_vanish")
     c.execute_command("MQ", "PUBLISH", "mq:sdk:txn_qa", "order_id", "00")
     c.execute_command("TXN", "ABORT")
 
-    val = c.get("txn:sdk:mq_a")
+    val = c.get("{txnsdk}:mq_a")
     assert_none("KV aborted", val)
 
     msg = c.execute_command("MQ", "POP", "mq:sdk:txn_qa", "COUNT", "1")
@@ -675,7 +675,7 @@ def test_txn_mq_abort() -> None:
     else:
         fail("MQ message should be aborted", repr(msg)[:200])
 
-    c.delete("txn:sdk:mq_a", "mq:sdk:txn_qa")
+    c.delete("{txnsdk}:mq_a", "mq:sdk:txn_qa")
     c.close()
 
 
@@ -1034,11 +1034,11 @@ def test_txn_cross_store_commit() -> None:
     # Separate test: TXN.ABORT rolls back KV (graph writes are NOT rolled back)
     print("\n=== 11.2 TXN: Cross-Store Abort (KV rollback) ===")
     c2 = MoonClient(port=PORT)
-    c2.delete("lval05:abort_key")
+    c2.delete("{txnsdk}:abort_key")
     c2.execute_command("TXN", "BEGIN")
-    c2.set("lval05:abort_key", "should_vanish")
+    c2.set("{txnsdk}:abort_key", "should_vanish")
     c2.execute_command("TXN", "ABORT")
-    val = c2.get("lval05:abort_key")
+    val = c2.get("{txnsdk}:abort_key")
     assert_none("KV rolled back on TXN ABORT", val)
     c2.close()
 
