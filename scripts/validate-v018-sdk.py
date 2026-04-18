@@ -6,7 +6,14 @@ Covers: TXN (cross-store ACID), TEMPORAL (bi-temporal MVCC),
         WS (workspace partitioning), MQ (durable message queues).
 
 Usage:
-    python scripts/validate-v018-sdk.py [--port 6399]
+    python scripts/validate-v018-sdk.py [--port 6399] [--txn-port 6398]
+
+TXN tests require --shards 1 on the target server because Moon TXN uses a
+per-connection undo log that is shard-local. With multiple shards, SO_REUSEPORT
+distributes connections across shards and the connection's home shard is
+non-deterministic. Use --txn-port to point TXN tests at a separate --shards 1
+server instance. If --txn-port is not specified, --port is used for all tests
+(works correctly when --shards 1).
 """
 
 from __future__ import annotations
@@ -21,6 +28,7 @@ from moondb import MoonClient, encode_vector
 
 
 PORT = int(sys.argv[sys.argv.index("--port") + 1]) if "--port" in sys.argv else 6399
+TXN_PORT = int(sys.argv[sys.argv.index("--txn-port") + 1]) if "--txn-port" in sys.argv else PORT
 PASS_COUNT = 0
 FAIL_COUNT = 0
 SKIP_COUNT = 0
@@ -100,26 +108,26 @@ def assert_error(name: str, fn, *args, substr: str = "") -> None:
 def test_txn_basic_commit() -> None:
     """TXN.BEGIN -> SET -> TXN.COMMIT persists KV data."""
     print("\n=== 1.1 TXN: Basic Commit ===")
-    c = MoonClient(port=PORT)
-    c.delete("txn:sdk:k1")
+    c = MoonClient(port=TXN_PORT)
+    c.delete("{txnsdk}:k1")
 
     r = c.execute_command("TXN", "BEGIN")
     assert_ok("TXN BEGIN returns OK", r)
 
-    c.set("txn:sdk:k1", "committed_value")
+    c.set("{txnsdk}:k1", "committed_value")
     r = c.execute_command("TXN", "COMMIT")
     assert_ok("TXN COMMIT returns OK", r)
 
-    val = c.get("txn:sdk:k1")
+    val = c.get("{txnsdk}:k1")
     assert_eq("GET after COMMIT", val, b"committed_value")
-    c.delete("txn:sdk:k1")
+    c.delete("{txnsdk}:k1")
     c.close()
 
 
 def test_txn_abort_rollback() -> None:
     """TXN.BEGIN -> SET -> TXN.ABORT rolls back to original value."""
     print("\n=== 1.2 TXN: Abort Rollback ===")
-    c = MoonClient(port=PORT)
+    c = MoonClient(port=TXN_PORT)
     c.set("{txnsdk}:k2", "original")
 
     c.execute_command("TXN", "BEGIN")
@@ -141,7 +149,7 @@ def test_txn_abort_rollback() -> None:
 def test_txn_abort_insert_rollback() -> None:
     """TXN.BEGIN -> SET new key -> TXN.ABORT removes the key."""
     print("\n=== 1.3 TXN: Abort Insert Rollback ===")
-    c = MoonClient(port=PORT)
+    c = MoonClient(port=TXN_PORT)
     c.delete("{txnsdk}:k3")
 
     c.execute_command("TXN", "BEGIN")
@@ -156,7 +164,7 @@ def test_txn_abort_insert_rollback() -> None:
 def test_txn_del_rollback() -> None:
     """TXN.BEGIN -> DEL -> TXN.ABORT restores deleted key."""
     print("\n=== 1.4 TXN: DEL Rollback ===")
-    c = MoonClient(port=PORT)
+    c = MoonClient(port=TXN_PORT)
     c.set("{txnsdk}:k4", "precious")
 
     c.execute_command("TXN", "BEGIN")
@@ -182,7 +190,7 @@ def test_txn_multi_key_atomic() -> None:
     ({txnsdk}:k2, {txnsdk}:k3, {txnsdk}:k4 all route to the same shard via {txnsdk} hash tag).
     """
     print("\n=== 1.5 TXN: Multi-Key Atomic ===")
-    c = MoonClient(port=PORT)
+    c = MoonClient(port=TXN_PORT)
     c.set("{txnsdk}:k3", "a")
     c.set("{txnsdk}:k4", "b")
 
@@ -200,7 +208,7 @@ def test_txn_multi_key_atomic() -> None:
 def test_txn_double_begin_error() -> None:
     """TXN.BEGIN twice returns error."""
     print("\n=== 1.6 TXN: Double BEGIN Error ===")
-    c = MoonClient(port=PORT)
+    c = MoonClient(port=TXN_PORT)
     c.execute_command("TXN", "BEGIN")
     assert_error("Double TXN BEGIN", c.execute_command, "TXN", "BEGIN",
                  substr="already")
@@ -211,7 +219,7 @@ def test_txn_double_begin_error() -> None:
 def test_txn_commit_no_txn_error() -> None:
     """TXN.COMMIT without BEGIN returns error."""
     print("\n=== 1.7 TXN: COMMIT Without BEGIN ===")
-    c = MoonClient(port=PORT)
+    c = MoonClient(port=TXN_PORT)
     assert_error("COMMIT without BEGIN", c.execute_command, "TXN", "COMMIT",
                  substr="not in")
     c.close()
@@ -234,24 +242,24 @@ def test_txn_isolation() -> None:
     and that read-your-writes works within a TXN.
     """
     print("\n=== 1.8 TXN: Read-Your-Writes + Commit Visibility ===")
-    c = MoonClient(port=PORT)
-    c.delete("txn:sdk:k2")
+    c = MoonClient(port=TXN_PORT)
+    c.delete("{txnsdk}:k2")
 
     c.execute_command("TXN", "BEGIN")
-    c.set("txn:sdk:k2", "txn_val")
+    c.set("{txnsdk}:k2", "txn_val")
 
     # Read-your-writes: see own uncommitted write
-    val = c.get("txn:sdk:k2")
+    val = c.get("{txnsdk}:k2")
     assert_eq("Read-your-writes in TXN", val, b"txn_val")
 
     c.execute_command("TXN", "COMMIT")
 
     # After commit, value persists on a fresh connection
-    c2 = MoonClient(port=PORT)
-    val2 = c2.get("txn:sdk:k2")
+    c2 = MoonClient(port=TXN_PORT)
+    val2 = c2.get("{txnsdk}:k2")
     assert_eq("Committed value visible to new conn", val2, b"txn_val")
 
-    c.delete("txn:sdk:k2")
+    c.delete("{txnsdk}:k2")
     c.close()
     c2.close()
 
@@ -630,32 +638,32 @@ def test_mq_multiple_push_pop() -> None:
 def test_txn_mq_commit() -> None:
     """TXN.BEGIN -> SET -> MQ.PUBLISH -> TXN.COMMIT — both persist."""
     print("\n=== 5.1 TXN+MQ: Atomic Commit ===")
-    c = MoonClient(port=PORT)
-    c.delete("txn:sdk:mq_k")
+    c = MoonClient(port=TXN_PORT)
+    c.delete("{txnsdk}:mq_k")
     c.delete("mq:sdk:txn_q")
     c.execute_command("MQ", "CREATE", "mq:sdk:txn_q", "MAXDELIVERY", "5")
 
     c.execute_command("TXN", "BEGIN")
-    c.set("txn:sdk:mq_k", "txn_value")
+    c.set("{txnsdk}:mq_k", "txn_value")
     r = c.execute_command("MQ", "PUBLISH", "mq:sdk:txn_q", "order_id", "99")
     ok("MQ PUBLISH inside TXN", repr(r))
     c.execute_command("TXN", "COMMIT")
 
-    val = c.get("txn:sdk:mq_k")
+    val = c.get("{txnsdk}:mq_k")
     assert_eq("KV committed", val, b"txn_value")
 
     msg = c.execute_command("MQ", "POP", "mq:sdk:txn_q", "COUNT", "1")
     assert_not_none("MQ message committed", msg)
     ok("MQ POP after TXN COMMIT", repr(msg)[:200])
 
-    c.delete("txn:sdk:mq_k", "mq:sdk:txn_q")
+    c.delete("{txnsdk}:mq_k", "mq:sdk:txn_q")
     c.close()
 
 
 def test_txn_mq_abort() -> None:
     """TXN.BEGIN -> SET -> MQ.PUBLISH -> TXN.ABORT — both discarded."""
     print("\n=== 5.2 TXN+MQ: Atomic Abort ===")
-    c = MoonClient(port=PORT)
+    c = MoonClient(port=TXN_PORT)
     c.delete("{txnsdk}:mq_a")
     c.delete("mq:sdk:txn_qa")
     c.execute_command("MQ", "CREATE", "mq:sdk:txn_qa", "MAXDELIVERY", "5")
@@ -685,11 +693,11 @@ def test_txn_mq_abort() -> None:
 def test_ws_txn_commit() -> None:
     """Transactions inside a workspace scope."""
     print("\n=== 6.1 WS+TXN: Workspace-Scoped Transaction ===")
-    c_admin = MoonClient(port=PORT)
+    c_admin = MoonClient(port=TXN_PORT)
     ws_id = c_admin.execute_command("WS", "CREATE", "ws_txn_test")
     ws = ws_id.decode() if isinstance(ws_id, bytes) else str(ws_id)
 
-    c = MoonClient(port=PORT)
+    c = MoonClient(port=TXN_PORT)
     c.execute_command("WS", "AUTH", ws)
 
     c.execute_command("TXN", "BEGIN")
@@ -701,7 +709,7 @@ def test_ws_txn_commit() -> None:
     assert_eq("WS+TXN key EXISTS after commit", exists, 1)
 
     # Verify isolation — un-bound connection cannot see it
-    c_plain = MoonClient(port=PORT)
+    c_plain = MoonClient(port=TXN_PORT)
     val_plain = c_plain.get("ws_txn_key")
     assert_none("Un-bound cannot see WS+TXN key", val_plain)
 
@@ -817,7 +825,7 @@ def test_temporal_vector_as_of() -> None:
 def test_txn_hset_vector_deferral() -> None:
     """HSET with vector inside TXN defers HNSW insert to commit."""
     print("\n=== 9.1 TXN+VECTOR: HNSW Deferral ===")
-    c = MoonClient(port=PORT)
+    c = MoonClient(port=TXN_PORT)
     idx_name = "idx_txn_defer_sdk"
 
     try:
@@ -973,7 +981,7 @@ def test_txn_cross_store_commit() -> None:
     This test validates the commit path only. Do NOT assert graph rollback on ABORT.
     """
     print("\n=== 11.1 TXN: Cross-Store Atomic Commit (LVAL-05) ===")
-    c = MoonClient(port=PORT)
+    c = MoonClient(port=TXN_PORT)
     idx_name = "idx_lval05_xstore"
 
     # Setup: create vector index
@@ -996,14 +1004,14 @@ def test_txn_cross_store_commit() -> None:
         pass
 
     # Clean slate
-    c.delete("lval05:kv_key")
-    c.delete("lval05:doc1")
+    c.delete("{txnsdk}:kv_key")
+    c.delete("{txnsdk}:doc1")
 
     # Cross-store TXN
     c.execute_command("TXN", "BEGIN")
-    c.set("lval05:kv_key", "kv_value")
+    c.set("{txnsdk}:kv_key", "kv_value")
     vec = encode_vector([1.0, 0.0, 0.0, 0.0])
-    c.hset("lval05:doc1", mapping={"vec": vec, "title": "cross-store"})
+    c.hset("{txnsdk}:doc1", mapping={"vec": vec, "title": "cross-store"})
     try:
         node_id = c.execute_command("GRAPH.ADDNODE", graph, "TxnNode", "label", "xstore")
         ok("GRAPH.ADDNODE inside TXN", f"node_id={node_id}")
@@ -1013,14 +1021,14 @@ def test_txn_cross_store_commit() -> None:
     assert_ok("Cross-store TXN COMMIT", r)
 
     # Verify KV persists
-    assert_eq("KV persists after cross-store TXN", c.get("lval05:kv_key"), b"kv_value")
+    assert_eq("KV persists after cross-store TXN", c.get("{txnsdk}:kv_key"), b"kv_value")
 
     # Verify HSET persists
-    title = c.hget("lval05:doc1", "title")
+    title = c.hget("{txnsdk}:doc1", "title")
     assert_eq("HSET persists after cross-store TXN", title, b"cross-store")
 
     # Cleanup
-    c.delete("lval05:kv_key", "lval05:doc1")
+    c.delete("{txnsdk}:kv_key", "{txnsdk}:doc1")
     try:
         c.execute_command("FT.DROPINDEX", idx_name)
     except Exception:
@@ -1033,7 +1041,7 @@ def test_txn_cross_store_commit() -> None:
 
     # Separate test: TXN.ABORT rolls back KV (graph writes are NOT rolled back)
     print("\n=== 11.2 TXN: Cross-Store Abort (KV rollback) ===")
-    c2 = MoonClient(port=PORT)
+    c2 = MoonClient(port=TXN_PORT)
     c2.delete("{txnsdk}:abort_key")
     c2.execute_command("TXN", "BEGIN")
     c2.set("{txnsdk}:abort_key", "should_vanish")
