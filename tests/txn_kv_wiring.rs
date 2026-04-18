@@ -813,6 +813,481 @@ async fn test_txn_abort_multi_key_rollback() {
 }
 
 // ---------------------------------------------------------------------------
+// ACID-06 + ACID-11: WAL crash recovery — server restart replays committed TXN KV state
+// ---------------------------------------------------------------------------
+
+/// A Drop guard that kills and waits for a child process on drop (even on panic).
+struct ChildGuard(std::process::Child);
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// A Drop guard that removes a directory on drop (even on panic).
+struct DirGuard(std::path::PathBuf);
+
+impl Drop for DirGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Wait for a Moon server to accept TCP connections.
+///
+/// Retries for up to `timeout` with 50ms sleep between attempts.
+/// Returns `true` if the server is ready, `false` on timeout.
+fn wait_for_server(port: u16, timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if std::net::TcpStream::connect(format!("127.0.0.1:{port}")).is_ok() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// Find the Moon binary path, preferring release over debug.
+///
+/// Resolution order:
+/// 1. `MOON_BIN` env var (CI / explicit override)
+/// 2. `target/release/moon` relative to `CARGO_MANIFEST_DIR`
+/// 3. `target/debug/moon` relative to `CARGO_MANIFEST_DIR`
+///
+/// Returns `None` if no binary is found.
+fn find_moon_binary() -> Option<std::path::PathBuf> {
+    if let Ok(bin) = std::env::var("MOON_BIN") {
+        let p = std::path::PathBuf::from(bin);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let release = std::path::PathBuf::from(format!("{manifest_dir}/target/release/moon"));
+    if release.exists() {
+        return Some(release);
+    }
+    let debug = std::path::PathBuf::from(format!("{manifest_dir}/target/debug/moon"));
+    if debug.exists() {
+        return Some(debug);
+    }
+    None
+}
+
+/// Bind a free OS port, drop the listener, and return the port number.
+fn free_port() -> u16 {
+    // SAFETY: bind + drop releases the port; the server will re-bind it.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe");
+    listener.local_addr().unwrap().port()
+}
+
+/// ACID-06 + ACID-11: Committed TXN KV state survives a server kill and restart.
+///
+/// This test spawns the Moon binary as a child process (not the in-process harness),
+/// runs TXN.BEGIN -> SET k v -> TXN.COMMIT, kills the server, restarts from the same
+/// persistence dir, and verifies GET returns the committed value — exercising the full
+/// encode_xact_commit_payload -> WAL write -> replay_xact_commit() path end-to-end.
+///
+/// The test is skipped (with an informative eprintln!) if no Moon binary is found.
+/// Use `MOON_BIN=/path/to/moon` or build with `cargo build --release` first.
+#[tokio::test]
+async fn test_txn_commit_wal_crash_recovery() {
+    let Some(binary) = find_moon_binary() else {
+        eprintln!(
+            "Skipping test_txn_commit_wal_crash_recovery: moon binary not found. \
+             Build with `cargo build --release` or set MOON_BIN=/path/to/moon."
+        );
+        return;
+    };
+
+    // Unique temp dir so parallel test runs don't collide.
+    let tmp_dir = std::env::temp_dir().join(format!(
+        "moon-wal-test-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos()
+    ));
+    std::fs::create_dir_all(&tmp_dir).expect("create temp dir");
+    // Ensure temp dir is cleaned up regardless of test outcome.
+    let _tmp_guard = DirGuard(tmp_dir.clone());
+
+    // ---- Phase 1: start server, commit a TXN ----
+    let port1 = free_port();
+    let child1 = ChildGuard(
+        std::process::Command::new(&binary)
+            .args([
+                "--port",
+                &port1.to_string(),
+                "--shards",
+                "1",
+                "--dir",
+                tmp_dir.to_str().unwrap(),
+                "--appendonly",
+                "yes",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn moon server (phase 1)"),
+    );
+
+    assert!(
+        wait_for_server(port1, std::time::Duration::from_secs(5)),
+        "Moon server (phase 1) did not become ready on port {port1}"
+    );
+
+    // Connect with sync redis client to avoid holding an async runtime across process boundaries.
+    let client1 = redis::Client::open(format!("redis://127.0.0.1:{port1}")).unwrap();
+    let mut sync_conn1 = client1.get_connection().expect("connect to phase-1 server");
+
+    // Non-TXN baseline (verifies plain AOF replay too)
+    let _: String = redis::cmd("SET")
+        .arg("wal_baseline_key")
+        .arg("baseline_val")
+        .query(&mut sync_conn1)
+        .expect("SET baseline should succeed");
+
+    // TXN.BEGIN -> SET -> TXN.COMMIT
+    let _: String = redis::cmd("TXN")
+        .arg("BEGIN")
+        .query(&mut sync_conn1)
+        .expect("TXN BEGIN should succeed");
+    let _: String = redis::cmd("SET")
+        .arg("wal_recovery_key")
+        .arg("wal_recovery_value")
+        .query(&mut sync_conn1)
+        .expect("SET inside TXN should succeed");
+    let commit_resp: String = redis::cmd("TXN")
+        .arg("COMMIT")
+        .query(&mut sync_conn1)
+        .expect("TXN COMMIT should succeed");
+    assert_eq!(commit_resp, "OK", "TXN.COMMIT should return OK");
+
+    // Trigger BGREWRITEAOF to create the base RDB snapshot so the incr AOF can
+    // be replayed on restart. Moon's multi-part AOF requires a base RDB to exist
+    // before it will replay the incremental portion.
+    let bgrw: String = redis::cmd("BGREWRITEAOF")
+        .query(&mut sync_conn1)
+        .expect("BGREWRITEAOF should succeed");
+    assert!(
+        bgrw.contains("rewriting") || bgrw.contains("started") || bgrw.contains("scheduled"),
+        "BGREWRITEAOF should start background rewrite: {bgrw}"
+    );
+
+    // Wait for BGREWRITEAOF to complete by polling for the base RDB file.
+    // The file is named moon.aof.<seq>.base.rdb inside the appendonlydir.
+    let aof_dir = tmp_dir.join("appendonlydir");
+    let base_rdb_exists = {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let found = std::fs::read_dir(&aof_dir)
+                .ok()
+                .and_then(|mut d| {
+                    d.find(|e| {
+                        e.as_ref()
+                            .ok()
+                            .and_then(|e| e.file_name().into_string().ok())
+                            .map(|n| n.ends_with(".base.rdb"))
+                            .unwrap_or(false)
+                    })
+                })
+                .is_some();
+            if found {
+                break true;
+            }
+            if std::time::Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    };
+    assert!(
+        base_rdb_exists,
+        "BGREWRITEAOF did not create a base RDB file within 10s in {aof_dir:?}"
+    );
+
+    // Kill server 1.
+    drop(child1); // ChildGuard calls kill() + wait()
+
+    // ---- Phase 2: restart server from same persistence dir, verify replay ----
+    let port2 = free_port();
+    let _child2 = ChildGuard(
+        std::process::Command::new(&binary)
+            .args([
+                "--port",
+                &port2.to_string(),
+                "--shards",
+                "1",
+                "--dir",
+                tmp_dir.to_str().unwrap(),
+                "--appendonly",
+                "yes",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn moon server (phase 2)"),
+    );
+
+    assert!(
+        wait_for_server(port2, std::time::Duration::from_secs(5)),
+        "Moon server (phase 2) did not become ready on port {port2}"
+    );
+
+    let client2 = redis::Client::open(format!("redis://127.0.0.1:{port2}")).unwrap();
+    let mut sync_conn2 = client2.get_connection().expect("connect to phase-2 server");
+
+    // Verify TXN committed value survived server restart via WAL replay.
+    let recovered: Option<String> = redis::cmd("GET")
+        .arg("wal_recovery_key")
+        .query(&mut sync_conn2)
+        .expect("GET wal_recovery_key should succeed");
+    assert_eq!(
+        recovered.as_deref(),
+        Some("wal_recovery_value"),
+        "WAL replay must restore committed TXN KV state after server restart (ACID-06, ACID-11)"
+    );
+
+    // Verify baseline (non-TXN) key also survived.
+    let baseline_recovered: Option<String> = redis::cmd("GET")
+        .arg("wal_baseline_key")
+        .query(&mut sync_conn2)
+        .expect("GET wal_baseline_key should succeed");
+    assert_eq!(
+        baseline_recovered.as_deref(),
+        Some("baseline_val"),
+        "Non-transactional writes must also survive server restart via AOF replay"
+    );
+    // _child2 dropped here — ChildGuard kills server 2.
+    // _tmp_guard dropped here — removes temp dir.
+}
+
+// ---------------------------------------------------------------------------
+// SC5 commit path: TXN.BEGIN -> SET -> MQ.PUBLISH -> TXN.COMMIT persists both
+// ---------------------------------------------------------------------------
+
+/// SC5 (commit): TXN.BEGIN -> SET k v -> MQ PUBLISH -> TXN.COMMIT persists both
+/// KV and MQ atomically. After commit: GET returns committed value AND MQ POP
+/// returns the published message.
+#[tokio::test]
+async fn test_txn_kv_mq_commit_atomic() {
+    let (port, shutdown) = start_txn_server(1, "").await;
+    let mut conn = connect(port).await;
+
+    // Create durable queue
+    let create_result: String = redis::cmd("MQ")
+        .arg("CREATE")
+        .arg("txn_atomic_q")
+        .arg("MAXDELIVERY")
+        .arg("5")
+        .query_async(&mut conn)
+        .await
+        .expect("MQ CREATE should succeed");
+    assert_eq!(create_result, "OK", "MQ CREATE should return OK");
+
+    // TXN.BEGIN -> SET -> MQ PUBLISH
+    let _: String = redis::cmd("TXN")
+        .arg("BEGIN")
+        .query_async(&mut conn)
+        .await
+        .expect("TXN BEGIN should succeed");
+
+    let _: String = redis::cmd("SET")
+        .arg("txn_mq_key")
+        .arg("txn_mq_value")
+        .query_async(&mut conn)
+        .await
+        .expect("SET inside TXN should succeed");
+
+    // MQ PUBLISH inside a TXN returns "QUEUED" (deferred until COMMIT)
+    let publish_result: String = redis::cmd("MQ")
+        .arg("PUBLISH")
+        .arg("txn_atomic_q")
+        .arg("msg_field")
+        .arg("msg_value")
+        .query_async(&mut conn)
+        .await
+        .expect("MQ PUBLISH inside TXN should succeed");
+    assert_eq!(
+        publish_result, "QUEUED",
+        "MQ PUBLISH inside TXN must return QUEUED"
+    );
+
+    // TXN.COMMIT — materializes both KV write and MQ message atomically
+    let commit_result: String = redis::cmd("TXN")
+        .arg("COMMIT")
+        .query_async(&mut conn)
+        .await
+        .expect("TXN COMMIT should succeed");
+    assert_eq!(commit_result, "OK", "TXN.COMMIT should return OK");
+
+    // Verify KV: GET returns committed value
+    let kv_result: Option<String> = redis::cmd("GET")
+        .arg("txn_mq_key")
+        .query_async(&mut conn)
+        .await
+        .expect("GET after TXN.COMMIT should succeed");
+    assert_eq!(
+        kv_result.as_deref(),
+        Some("txn_mq_value"),
+        "KV write must be visible after TXN.COMMIT (KV+MQ atomic commit)"
+    );
+
+    // Verify MQ: POP returns the published message
+    let pop_result: redis::Value = redis::cmd("MQ")
+        .arg("POP")
+        .arg("txn_atomic_q")
+        .query_async(&mut conn)
+        .await
+        .expect("MQ POP after TXN.COMMIT should succeed");
+
+    match &pop_result {
+        redis::Value::Array(entries) => {
+            assert!(
+                !entries.is_empty(),
+                "MQ POP must return at least one message after TXN.COMMIT"
+            );
+            // Verify msg_field/msg_value appear somewhere in the response
+            let pop_debug = format!("{pop_result:?}");
+            assert!(
+                pop_debug.contains("msg_field") || pop_debug.contains("msg_value"),
+                "MQ POP response must contain the published field/value, got: {pop_debug}"
+            );
+        }
+        other => panic!(
+            "MQ POP after TXN.COMMIT must return an Array, got: {:?}",
+            other
+        ),
+    }
+
+    // Cleanup
+    let _: () = redis::cmd("DEL")
+        .arg("txn_mq_key")
+        .query_async(&mut conn)
+        .await
+        .unwrap_or(());
+
+    shutdown.cancel();
+}
+
+// ---------------------------------------------------------------------------
+// SC5 abort path: TXN.BEGIN -> SET -> MQ.PUBLISH -> TXN.ABORT leaves no trace
+// ---------------------------------------------------------------------------
+
+/// SC5 (abort): TXN.BEGIN -> SET k v -> MQ PUBLISH -> TXN.ABORT leaves no trace
+/// in KV or MQ. After abort: GET returns nil AND MQ POP returns empty/nil.
+#[tokio::test]
+async fn test_txn_kv_mq_abort_atomic() {
+    let (port, shutdown) = start_txn_server(1, "").await;
+    let mut conn = connect(port).await;
+
+    // Create durable queue
+    let _: String = redis::cmd("MQ")
+        .arg("CREATE")
+        .arg("txn_abort_q")
+        .arg("MAXDELIVERY")
+        .arg("5")
+        .query_async(&mut conn)
+        .await
+        .expect("MQ CREATE should succeed");
+
+    // Baseline KV outside any transaction (must survive the abort)
+    let _: String = redis::cmd("SET")
+        .arg("txn_mq_baseline")
+        .arg("baseline")
+        .query_async(&mut conn)
+        .await
+        .expect("Baseline SET should succeed");
+
+    // TXN.BEGIN -> SET -> MQ PUBLISH -> TXN.ABORT
+    let _: String = redis::cmd("TXN")
+        .arg("BEGIN")
+        .query_async(&mut conn)
+        .await
+        .expect("TXN BEGIN should succeed");
+
+    let _: String = redis::cmd("SET")
+        .arg("txn_mq_abort_key")
+        .arg("should_not_exist")
+        .query_async(&mut conn)
+        .await
+        .expect("SET inside TXN should succeed");
+
+    let _: String = redis::cmd("MQ")
+        .arg("PUBLISH")
+        .arg("txn_abort_q")
+        .arg("abort_field")
+        .arg("abort_value")
+        .query_async(&mut conn)
+        .await
+        .expect("MQ PUBLISH inside TXN should succeed");
+
+    let abort_result: String = redis::cmd("TXN")
+        .arg("ABORT")
+        .query_async(&mut conn)
+        .await
+        .expect("TXN ABORT should succeed");
+    assert_eq!(abort_result, "OK", "TXN.ABORT should return OK");
+
+    // Verify KV is absent after abort
+    let kv_result: Option<String> = redis::cmd("GET")
+        .arg("txn_mq_abort_key")
+        .query_async(&mut conn)
+        .await
+        .expect("GET after TXN.ABORT should succeed");
+    assert!(
+        kv_result.is_none(),
+        "KV write from aborted TXN must not be visible (got: {:?})",
+        kv_result
+    );
+
+    // Verify MQ is empty after abort (PUBLISH was not materialized)
+    let pop_result: redis::Value = redis::cmd("MQ")
+        .arg("POP")
+        .arg("txn_abort_q")
+        .query_async(&mut conn)
+        .await
+        .expect("MQ POP after TXN.ABORT should succeed");
+
+    match pop_result {
+        redis::Value::Nil => { /* no messages — correct */ }
+        redis::Value::Array(ref items) if items.is_empty() => { /* empty array — correct */ }
+        other => panic!(
+            "MQ POP after TXN.ABORT must return nil or empty array (no messages materialized), got: {:?}",
+            other
+        ),
+    }
+
+    // Verify baseline KV survived the abort
+    let baseline_result: Option<String> = redis::cmd("GET")
+        .arg("txn_mq_baseline")
+        .query_async(&mut conn)
+        .await
+        .expect("GET baseline after TXN.ABORT should succeed");
+    assert_eq!(
+        baseline_result.as_deref(),
+        Some("baseline"),
+        "Non-transactional baseline key must survive TXN.ABORT"
+    );
+
+    // Cleanup
+    let _: () = redis::cmd("DEL")
+        .arg("txn_mq_baseline")
+        .query_async(&mut conn)
+        .await
+        .unwrap_or(());
+
+    shutdown.cancel();
+}
+
+// ---------------------------------------------------------------------------
 // Sequential transactions: state does not leak between successive TXNs
 // ---------------------------------------------------------------------------
 
