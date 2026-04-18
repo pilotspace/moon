@@ -29,6 +29,13 @@ use crate::command::workspace::{
     ERR_WS_NOT_FOUND, ERR_WS_ALREADY_BOUND, ERR_WS_UNKNOWN_SUB,
 };
 use crate::workspace::{is_ws_command, workspace_rewrite_args, strip_workspace_prefix_from_response, WorkspaceId};
+use crate::mq::is_mq_command;
+use crate::command::mq::{
+    parse_mq_subcommand, validate_mq_create, validate_mq_push, validate_mq_pop,
+    validate_mq_ack, validate_mq_dlqlen, validate_mq_trigger, validate_mq_publish,
+    ERR_MQ_NOT_DURABLE, ERR_MQ_UNKNOWN_SUB,
+};
+use crate::storage::stream::StreamId;
 use crate::command::{DispatchResult, dispatch, dispatch_read, is_dispatch_read_supported};
 use crate::transaction::CrossStoreTxn;
 use crate::persistence::aof::{self, AofMessage};
@@ -1550,6 +1557,22 @@ pub(crate) async fn handle_connection_sharded_monoio<
                             vector_store.txn_manager_mut().commit(txn.txn_id);
                             // TODO Phase 157-04: Write WAL XactCommit record
                             // TODO Phase 157-04: Process deferred HNSW inserts
+
+                            // Materialize MQ intents: enqueue deferred MQ.PUBLISH messages
+                            if !txn.mq_intents.is_empty() {
+                                let mut db_guard = ctx.shard_databases.write_db(
+                                    ctx.shard_id, conn.selected_db,
+                                );
+                                for intent in &txn.mq_intents {
+                                    if let Ok(Some(stream)) = db_guard.get_stream_mut(&intent.queue_key) {
+                                        if stream.durable {
+                                            let msg_id = stream.next_auto_id();
+                                            stream.add(msg_id, intent.fields.clone());
+                                        }
+                                    }
+                                }
+                            }
+
                             responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
                         } else {
                             responses
@@ -1883,6 +1906,360 @@ pub(crate) async fn handle_connection_sharded_monoio<
 
                 // Unknown WS subcommand
                 responses.push(Frame::Error(Bytes::from_static(ERR_WS_UNKNOWN_SUB)));
+                continue;
+            }
+
+            // --- MQ.* ---
+            if is_mq_command(cmd) {
+                let sub = match parse_mq_subcommand(cmd_args) {
+                    Ok(s) => s,
+                    Err(e) => { responses.push(e); continue; }
+                };
+
+                if sub.eq_ignore_ascii_case(b"CREATE") {
+                    match validate_mq_create(cmd_args) {
+                        Ok((queue_key, max_delivery_count, _debounce_ms)) => {
+                            let effective_key = crate::workspace::workspace_key(
+                                conn.workspace_id.as_ref(), &queue_key,
+                            );
+                            // Create or get Stream in db
+                            let mut db_guard = ctx.shard_databases.write_db(ctx.shard_id, conn.selected_db);
+                            match db_guard.get_or_create_stream(&effective_key) {
+                                Ok(stream) => {
+                                    stream.durable = true;
+                                    stream.max_delivery_count = max_delivery_count;
+                                    // Auto-create __mq_consumers consumer group if not exists
+                                    let group_name = Bytes::from_static(b"__mq_consumers");
+                                    let _ = stream.create_group(group_name, StreamId::ZERO);
+                                }
+                                Err(e) => {
+                                    responses.push(e);
+                                    continue;
+                                }
+                            }
+                            drop(db_guard);
+
+                            // Store config in per-shard registry
+                            let config = crate::mq::DurableStreamConfig::new(
+                                effective_key.clone(), max_delivery_count,
+                            );
+                            {
+                                let mut guard = ctx.shard_databases.durable_queue_registry(ctx.shard_id);
+                                let reg = guard.get_or_insert_with(|| {
+                                    Box::new(crate::mq::DurableQueueRegistry::new())
+                                });
+                                reg.insert(effective_key.clone(), config);
+                            }
+
+                            // WAL: MqCreate record
+                            let payload = crate::mq::wal::encode_mq_create(
+                                &effective_key, max_delivery_count,
+                            );
+                            let mut wal_buf = Vec::new();
+                            crate::persistence::wal_v3::record::write_wal_v3_record(
+                                &mut wal_buf, 0,
+                                crate::persistence::wal_v3::record::WalRecordType::MqCreate,
+                                &payload,
+                            );
+                            ctx.shard_databases.wal_append(ctx.shard_id, Bytes::from(wal_buf));
+                            responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
+                        }
+                        Err(e) => responses.push(e),
+                    }
+                    continue;
+                }
+
+                if sub.eq_ignore_ascii_case(b"PUSH") {
+                    match validate_mq_push(cmd_args) {
+                        Ok((queue_key, fields)) => {
+                            let effective_key = crate::workspace::workspace_key(
+                                conn.workspace_id.as_ref(), &queue_key,
+                            );
+                            let mut db_guard = ctx.shard_databases.write_db(ctx.shard_id, conn.selected_db);
+                            match db_guard.get_stream_mut(&effective_key) {
+                                Ok(Some(stream)) => {
+                                    if !stream.durable {
+                                        responses.push(Frame::Error(Bytes::from_static(ERR_MQ_NOT_DURABLE)));
+                                    } else {
+                                        let msg_id = stream.next_auto_id();
+                                        let msg_id = stream.add(msg_id, fields);
+                                        drop(db_guard);
+                                        // Mark pending for any registered triggers
+                                        {
+                                            let mut trig_guard = ctx.shard_databases.trigger_registry(ctx.shard_id);
+                                            if let Some(reg) = trig_guard.as_mut() {
+                                                let trig_key = if let Some(ws_id) = conn.workspace_id.as_ref() {
+                                                    let ws_hex = ws_id.as_hex();
+                                                    let mut k = Vec::with_capacity(ws_hex.len() + 1 + queue_key.len());
+                                                    k.extend_from_slice(ws_hex.as_bytes());
+                                                    k.push(b':');
+                                                    k.extend_from_slice(&queue_key);
+                                                    Bytes::from(k)
+                                                } else {
+                                                    queue_key.clone()
+                                                };
+                                                if let Some(trig_entry) = reg.get_mut(&trig_key) {
+                                                    if trig_entry.pending_fire_ms == 0 {
+                                                        let fire_at = ctx.cached_clock.ms() + trig_entry.debounce_ms;
+                                                        trig_entry.pending_fire_ms = fire_at;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        responses.push(Frame::BulkString(Bytes::from(
+                                            format!("{}-{}", msg_id.ms, msg_id.seq),
+                                        )));
+                                    }
+                                }
+                                Ok(None) => {
+                                    responses.push(Frame::Error(Bytes::from_static(ERR_MQ_NOT_DURABLE)));
+                                }
+                                Err(e) => responses.push(e),
+                            }
+                        }
+                        Err(e) => responses.push(e),
+                    }
+                    continue;
+                }
+
+                if sub.eq_ignore_ascii_case(b"POP") {
+                    match validate_mq_pop(cmd_args) {
+                        Ok((queue_key, count)) => {
+                            let effective_key = crate::workspace::workspace_key(
+                                conn.workspace_id.as_ref(), &queue_key,
+                            );
+                            let group_name = Bytes::from_static(b"__mq_consumers");
+                            let consumer_name = Bytes::from_static(b"__mq_default");
+                            let mut db_guard = ctx.shard_databases.write_db(ctx.shard_id, conn.selected_db);
+
+                            // Read max_delivery_count before mutating
+                            let mdc = match db_guard.get_stream_mut(&effective_key) {
+                                Ok(Some(stream)) => {
+                                    if !stream.durable {
+                                        responses.push(Frame::Error(Bytes::from_static(ERR_MQ_NOT_DURABLE)));
+                                        continue;
+                                    }
+                                    stream.max_delivery_count
+                                }
+                                Ok(None) => {
+                                    responses.push(Frame::Error(Bytes::from_static(ERR_MQ_NOT_DURABLE)));
+                                    continue;
+                                }
+                                Err(e) => {
+                                    responses.push(e);
+                                    continue;
+                                }
+                            };
+
+                            // Request more than count to account for DLQ routing
+                            let request_count = count + (mdc as usize);
+                            let stream = match db_guard.get_stream_mut(&effective_key) {
+                                Ok(Some(s)) => s,
+                                _ => { responses.push(Frame::Error(Bytes::from_static(ERR_MQ_NOT_DURABLE))); continue; }
+                            };
+                            let claimed = match stream.read_group_new(
+                                &group_name, &consumer_name, Some(request_count), false,
+                            ) {
+                                Ok(entries) => entries,
+                                Err(_) => {
+                                    responses.push(Frame::Array(vec![].into()));
+                                    continue;
+                                }
+                            };
+
+                            // Filter: check PEL delivery_count for DLQ routing
+                            let mut results = Vec::new();
+                            let mut dlq_entries: Vec<(StreamId, Vec<(Bytes, Bytes)>)> = Vec::new();
+                            let mut dlq_ack_ids: Vec<StreamId> = Vec::new();
+                            for (id, fields) in &claimed {
+                                // Check delivery_count from PEL
+                                let delivery_count = stream.groups.get(group_name.as_ref())
+                                    .and_then(|g| g.pel.get(id))
+                                    .map(|pe| pe.delivery_count)
+                                    .unwrap_or(1);
+                                if mdc > 0 && delivery_count >= mdc as u64 {
+                                    // Route to DLQ
+                                    dlq_entries.push((*id, fields.clone()));
+                                    dlq_ack_ids.push(*id);
+                                } else if results.len() < count {
+                                    results.push((*id, fields.clone()));
+                                }
+                            }
+
+                            // XACK DLQ entries from __mq_consumers group
+                            if !dlq_ack_ids.is_empty() {
+                                let _ = stream.xack(&group_name, &dlq_ack_ids);
+                            }
+
+                            // Move DLQ entries to DLQ stream
+                            if !dlq_entries.is_empty() {
+                                let dlq_key = {
+                                    let mut buf = Vec::with_capacity(effective_key.len() + 8);
+                                    buf.extend_from_slice(&effective_key);
+                                    buf.extend_from_slice(b"::mq:dlq");
+                                    Bytes::from(buf)
+                                };
+                                match db_guard.get_or_create_stream(&dlq_key) {
+                                    Ok(dlq_stream) => {
+                                        for (_id, fields) in dlq_entries {
+                                            let dlq_id = dlq_stream.next_auto_id();
+                                            dlq_stream.add(dlq_id, fields);
+                                        }
+                                    }
+                                    Err(_) => {} // DLQ creation failed -- skip silently
+                                }
+                            }
+
+                            // Format results as array of arrays (XREADGROUP format)
+                            let result_frames: Vec<Frame> = results.iter().map(|(id, fields)| {
+                                let mut entry_frames = Vec::with_capacity(2);
+                                entry_frames.push(Frame::BulkString(Bytes::from(
+                                    format!("{}-{}", id.ms, id.seq),
+                                )));
+                                let field_frames: Vec<Frame> = fields.iter()
+                                    .flat_map(|(f, v)| vec![
+                                        Frame::BulkString(f.clone()),
+                                        Frame::BulkString(v.clone()),
+                                    ])
+                                    .collect();
+                                entry_frames.push(Frame::Array(field_frames.into()));
+                                Frame::Array(entry_frames.into())
+                            }).collect();
+                            responses.push(Frame::Array(result_frames.into()));
+                        }
+                        Err(e) => responses.push(e),
+                    }
+                    continue;
+                }
+
+                if sub.eq_ignore_ascii_case(b"ACK") {
+                    match validate_mq_ack(cmd_args) {
+                        Ok((queue_key, msg_ids)) => {
+                            let effective_key = crate::workspace::workspace_key(
+                                conn.workspace_id.as_ref(), &queue_key,
+                            );
+                            let ids: Vec<StreamId> = msg_ids.iter()
+                                .map(|(ms, seq)| StreamId { ms: *ms, seq: *seq })
+                                .collect();
+                            let mut db_guard = ctx.shard_databases.write_db(ctx.shard_id, conn.selected_db);
+                            match db_guard.get_stream_mut(&effective_key) {
+                                Ok(Some(stream)) => {
+                                    let group_name = Bytes::from_static(b"__mq_consumers");
+                                    match stream.xack(&group_name, &ids) {
+                                        Ok(acked_count) => {
+                                            drop(db_guard);
+                                            // Emit MqAck WAL record for each acked ID
+                                            for (ms, seq) in &msg_ids {
+                                                let payload = crate::mq::wal::encode_mq_ack(
+                                                    &effective_key, *ms, *seq,
+                                                );
+                                                let mut wal_buf = Vec::new();
+                                                crate::persistence::wal_v3::record::write_wal_v3_record(
+                                                    &mut wal_buf, 0,
+                                                    crate::persistence::wal_v3::record::WalRecordType::MqAck,
+                                                    &payload,
+                                                );
+                                                ctx.shard_databases.wal_append(
+                                                    ctx.shard_id, Bytes::from(wal_buf),
+                                                );
+                                            }
+                                            responses.push(Frame::Integer(acked_count as i64));
+                                        }
+                                        Err(_) => responses.push(Frame::Integer(0)),
+                                    }
+                                }
+                                Ok(None) => responses.push(Frame::Integer(0)),
+                                Err(_) => responses.push(Frame::Integer(0)),
+                            }
+                        }
+                        Err(e) => responses.push(e),
+                    }
+                    continue;
+                }
+
+                if sub.eq_ignore_ascii_case(b"DLQLEN") {
+                    match validate_mq_dlqlen(cmd_args) {
+                        Ok(queue_key) => {
+                            let effective_key = crate::workspace::workspace_key(
+                                conn.workspace_id.as_ref(), &queue_key,
+                            );
+                            let dlq_key = {
+                                let mut buf = Vec::with_capacity(effective_key.len() + 8);
+                                buf.extend_from_slice(&effective_key);
+                                buf.extend_from_slice(b"::mq:dlq");
+                                Bytes::from(buf)
+                            };
+                            let mut db_guard = ctx.shard_databases.write_db(ctx.shard_id, conn.selected_db);
+                            let len = match db_guard.get_stream_mut(&dlq_key) {
+                                Ok(Some(stream)) => stream.length as i64,
+                                _ => 0i64,
+                            };
+                            responses.push(Frame::Integer(len));
+                        }
+                        Err(e) => responses.push(e),
+                    }
+                    continue;
+                }
+
+                if sub.eq_ignore_ascii_case(b"TRIGGER") {
+                    match validate_mq_trigger(cmd_args) {
+                        Ok((queue_key, callback_cmd, debounce_ms)) => {
+                            let effective_key = crate::workspace::workspace_key(
+                                conn.workspace_id.as_ref(), &queue_key,
+                            );
+                            let trig_key = if let Some(ws_id) = conn.workspace_id.as_ref() {
+                                let ws_hex = ws_id.as_hex();
+                                let mut k = Vec::with_capacity(ws_hex.len() + 1 + queue_key.len());
+                                k.extend_from_slice(ws_hex.as_bytes());
+                                k.push(b':');
+                                k.extend_from_slice(&queue_key);
+                                Bytes::from(k)
+                            } else {
+                                queue_key.clone()
+                            };
+                            let entry = crate::mq::TriggerEntry {
+                                queue_key: effective_key,
+                                callback_cmd,
+                                debounce_ms,
+                                last_fire_ms: 0,
+                                pending_fire_ms: 0,
+                            };
+                            {
+                                let mut guard = ctx.shard_databases.trigger_registry(ctx.shard_id);
+                                let reg = guard.get_or_insert_with(|| {
+                                    Box::new(crate::mq::TriggerRegistry::new())
+                                });
+                                reg.register(trig_key, entry);
+                            }
+                            responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
+                        }
+                        Err(e) => responses.push(e),
+                    }
+                    continue;
+                }
+
+                if sub.eq_ignore_ascii_case(b"PUBLISH") {
+                    match validate_mq_publish(cmd_args) {
+                        Ok((queue_key, fields)) => {
+                            let effective_key = crate::workspace::workspace_key(
+                                conn.workspace_id.as_ref(), &queue_key,
+                            );
+                            if let Some(ref mut txn) = conn.active_cross_txn {
+                                txn.record_mq(effective_key, fields);
+                                responses.push(Frame::SimpleString(Bytes::from_static(b"QUEUED")));
+                            } else {
+                                responses.push(Frame::Error(Bytes::from_static(
+                                    b"ERR MQ PUBLISH requires an active transaction (use TXN BEGIN first)",
+                                )));
+                            }
+                        }
+                        Err(e) => responses.push(e),
+                    }
+                    continue;
+                }
+
+                // Unknown MQ subcommand
+                responses.push(Frame::Error(Bytes::from_static(ERR_MQ_UNKNOWN_SUB)));
                 continue;
             }
 
