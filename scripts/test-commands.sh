@@ -68,6 +68,7 @@ while [[ $# -gt 0 ]]; do
             echo "  blocking     - Blocking commands (BLPOP, BRPOP, BZPOPMIN, etc.)"
             echo "  temporal     - Temporal commands (TEMPORAL.SNAPSHOT_AT, TEMPORAL.INVALIDATE)"
             echo "  workspace    - Workspace commands (WS CREATE, WS LIST, WS INFO, WS AUTH, WS DROP)"
+            echo "  mq           - Durable Message Queue (MQ CREATE, PUSH, POP, ACK, DLQLEN, TRIGGER)"
             echo "  benchmark    - redis-benchmark throughput for all benchmarkable commands"
             exit 0
             ;;
@@ -1840,6 +1841,135 @@ if should_run "workspace"; then
     fi
 
     echo "  workspace: done"
+fi
+
+# ===========================================================================
+# MQ (DURABLE MESSAGE QUEUE) COMMANDS -- moon-only
+# ===========================================================================
+
+if should_run "mq"; then
+    echo ""
+    echo "=== MQ (DURABLE MESSAGE QUEUE) COMMANDS ==="
+    mcli FLUSHALL >/dev/null 2>&1
+
+    # MQ-01: MQ CREATE basic
+    assert_moon "MQ CREATE basic" "OK" MQ CREATE mqtest MAXDELIVERY 5
+
+    # MQ-02: MQ CREATE default (no MAXDELIVERY)
+    assert_moon "MQ CREATE default" "OK" MQ CREATE mqdefault
+
+    # MQ-03: MQ CREATE idempotent (same key twice)
+    assert_moon "MQ CREATE idempotent" "OK" MQ CREATE mqtest MAXDELIVERY 5
+
+    # MQ-04: MQ PUSH returns stream ID
+    TOTAL=$((TOTAL + 1))
+    MQ_PUSH_ID=$(mcli MQ PUSH mqtest field1 value1 2>&1)
+    if echo "$MQ_PUSH_ID" | grep -qE '^[0-9]+-[0-9]+$'; then
+        PASS=$((PASS + 1)); echo "  PASS: MQ PUSH returns stream ID ($MQ_PUSH_ID)"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: MQ PUSH should return stream ID: $MQ_PUSH_ID"
+    fi
+
+    # MQ-05: MQ POP returns message with fields
+    TOTAL=$((TOTAL + 1))
+    MQ_POP_OUT=$(mcli MQ POP mqtest 2>&1)
+    if echo "$MQ_POP_OUT" | grep -qF "field1"; then
+        PASS=$((PASS + 1)); echo "  PASS: MQ POP returns message with field"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: MQ POP should contain field1: $MQ_POP_OUT"
+    fi
+
+    # MQ-06: MQ ACK returns count
+    # Push a fresh message, pop it, then ack it
+    MQ_ACK_ID=$(mcli MQ PUSH mqtest ackf ackv 2>&1)
+    mcli MQ POP mqtest >/dev/null 2>&1
+    TOTAL=$((TOTAL + 1))
+    MQ_ACK_OUT=$(mcli MQ ACK mqtest "$MQ_ACK_ID" 2>&1)
+    if echo "$MQ_ACK_OUT" | grep -qE '(integer) 1|^1$'; then
+        PASS=$((PASS + 1)); echo "  PASS: MQ ACK returns 1"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: MQ ACK should return 1: $MQ_ACK_OUT"
+    fi
+
+    # MQ-07: MQ ACK non-existent returns 0
+    TOTAL=$((TOTAL + 1))
+    MQ_ACK_ZERO=$(mcli MQ ACK mqtest 999999999-999 2>&1)
+    if echo "$MQ_ACK_ZERO" | grep -qE '(integer) 0|^0$'; then
+        PASS=$((PASS + 1)); echo "  PASS: MQ ACK non-existent returns 0"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: MQ ACK non-existent should return 0: $MQ_ACK_ZERO"
+    fi
+
+    # MQ-08: MQ DLQLEN empty queue
+    assert_moon "MQ DLQLEN empty" "0" MQ DLQLEN mqtest
+
+    # MQ-09: MQ DLQ routing (MAXDELIVERY 1 -> immediate dead-letter)
+    mcli MQ CREATE mqdlqtest MAXDELIVERY 1 >/dev/null 2>&1
+    mcli MQ PUSH mqdlqtest dlqf dlqv >/dev/null 2>&1
+    mcli MQ POP mqdlqtest >/dev/null 2>&1
+    TOTAL=$((TOTAL + 1))
+    MQ_DLQ_LEN=$(mcli MQ DLQLEN mqdlqtest 2>&1)
+    if echo "$MQ_DLQ_LEN" | grep -qE '(integer) 1|^1$'; then
+        PASS=$((PASS + 1)); echo "  PASS: MQ DLQ routing (MAXDELIVERY 1 -> DLQ len 1)"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: MQ DLQLEN after DLQ routing should be 1: $MQ_DLQ_LEN"
+    fi
+
+    # MQ-10: MQ TRIGGER register
+    assert_moon "MQ TRIGGER register" "OK" MQ TRIGGER mqtest "PUBLISH events notify" DEBOUNCE 1000
+
+    # MQ-11: MQ unknown subcommand
+    TOTAL=$((TOTAL + 1))
+    MQ_UNK=$(mcli MQ FOOBAR 2>&1)
+    if echo "$MQ_UNK" | grep -qi "unknown MQ subcommand"; then
+        PASS=$((PASS + 1)); echo "  PASS: MQ unknown subcommand rejected"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: MQ unknown sub should error: $MQ_UNK"
+    fi
+
+    # MQ-12: MQ PUSH missing args
+    TOTAL=$((TOTAL + 1))
+    MQ_PUSH_ERR=$(mcli MQ PUSH 2>&1)
+    if echo "$MQ_PUSH_ERR" | grep -qi "wrong number of arguments"; then
+        PASS=$((PASS + 1)); echo "  PASS: MQ PUSH missing args rejected"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: MQ PUSH no args should error: $MQ_PUSH_ERR"
+    fi
+
+    # MQ-13: MQ ACK invalid ID format
+    TOTAL=$((TOTAL + 1))
+    MQ_ACK_BAD=$(mcli MQ ACK mqtest not-a-valid-id 2>&1)
+    if echo "$MQ_ACK_BAD" | grep -qi "invalid message ID format"; then
+        PASS=$((PASS + 1)); echo "  PASS: MQ ACK invalid ID rejected"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: MQ ACK invalid ID should error: $MQ_ACK_BAD"
+    fi
+
+    # MQ-14: MQ PUSH to non-durable stream
+    mcli XADD nondurable '*' f v >/dev/null 2>&1
+    TOTAL=$((TOTAL + 1))
+    MQ_NONDUR=$(mcli MQ PUSH nondurable f v 2>&1)
+    if echo "$MQ_NONDUR" | grep -qi "not a durable queue"; then
+        PASS=$((PASS + 1)); echo "  PASS: MQ PUSH to non-durable stream rejected"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: MQ PUSH non-durable should error: $MQ_NONDUR"
+    fi
+
+    # MQ-15: MQ POP with COUNT
+    mcli MQ CREATE mqcount MAXDELIVERY 10 >/dev/null 2>&1
+    for i in $(seq 1 3); do
+        mcli MQ PUSH mqcount "f$i" "v$i" >/dev/null 2>&1
+    done
+    TOTAL=$((TOTAL + 1))
+    MQ_POP_CNT=$(mcli MQ POP mqcount COUNT 2 2>&1)
+    # Should contain at least some data (not empty or error)
+    if echo "$MQ_POP_CNT" | grep -qE "f[0-9]|v[0-9]"; then
+        PASS=$((PASS + 1)); echo "  PASS: MQ POP COUNT 2 returns messages"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: MQ POP COUNT 2 should return messages: $MQ_POP_CNT"
+    fi
+
+    echo "  mq: done"
 fi
 
 # ===========================================================================

@@ -885,6 +885,101 @@ fi
 # Restart moon with the originally-requested shard count so later sections work.
 start_moon_with_shards "$SHARDS" || true
 
+# ===========================================================================
+# MQ (DURABLE MESSAGE QUEUE) -- cross-shard consistency (moon-only)
+# ===========================================================================
+
+echo ""
+echo "=== MQ CROSS-SHARD CONSISTENCY ==="
+
+# Stop the current instance to cycle through shard configs
+stop_moon
+
+MQ_RESULT_1=""
+MQ_RESULT_4=""
+MQ_RESULT_12=""
+
+MQ_DLQ_RESULT_1=""
+MQ_DLQ_RESULT_4=""
+MQ_DLQ_RESULT_12=""
+
+for NSHARDS in 1 4 12; do
+    log "  -- MQ shards=$NSHARDS --"
+    start_moon_with_shards "$NSHARDS" || { echo "  FAIL: moon failed to start with shards=$NSHARDS"; FAIL=$((FAIL + 1)); continue; }
+    redis-cli -p "$PORT_RUST" FLUSHALL >/dev/null 2>&1
+
+    # MQ CREATE + PUSH + POP + ACK consistency
+    MQ_CREATE=$(redis-cli -p "$PORT_RUST" MQ CREATE mqconsist MAXDELIVERY 3 2>&1)
+    MQ_PUSH1=$(redis-cli -p "$PORT_RUST" MQ PUSH mqconsist f1 v1 2>&1)
+    MQ_PUSH2=$(redis-cli -p "$PORT_RUST" MQ PUSH mqconsist f2 v2 2>&1)
+    MQ_POP=$(redis-cli -p "$PORT_RUST" MQ POP mqconsist COUNT 2 2>&1)
+    # Check that POP contains our field names
+    POP_HAS_F1="no"; echo "$MQ_POP" | grep -qF "f1" && POP_HAS_F1="yes"
+    POP_HAS_F2="no"; echo "$MQ_POP" | grep -qF "f2" && POP_HAS_F2="yes"
+    # Check DLQLEN is 0 (no dead letters yet)
+    MQ_DLQLEN=$(redis-cli -p "$PORT_RUST" MQ DLQLEN mqconsist 2>&1)
+    MQ_RESULT="$MQ_CREATE|$POP_HAS_F1|$POP_HAS_F2|$MQ_DLQLEN"
+    case "$NSHARDS" in
+        1)  MQ_RESULT_1="$MQ_RESULT" ;;
+        4)  MQ_RESULT_4="$MQ_RESULT" ;;
+        12) MQ_RESULT_12="$MQ_RESULT" ;;
+    esac
+
+    # DLQ routing consistency: MAXDELIVERY 1 -> immediate dead-letter
+    redis-cli -p "$PORT_RUST" MQ CREATE mqdlq MAXDELIVERY 1 >/dev/null 2>&1
+    redis-cli -p "$PORT_RUST" MQ PUSH mqdlq df dv >/dev/null 2>&1
+    redis-cli -p "$PORT_RUST" MQ POP mqdlq >/dev/null 2>&1
+    DLQ_LEN=$(redis-cli -p "$PORT_RUST" MQ DLQLEN mqdlq 2>&1)
+    case "$NSHARDS" in
+        1)  MQ_DLQ_RESULT_1="$DLQ_LEN" ;;
+        4)  MQ_DLQ_RESULT_4="$DLQ_LEN" ;;
+        12) MQ_DLQ_RESULT_12="$DLQ_LEN" ;;
+    esac
+
+    # Cleanup
+    kill "$RUST_PID" 2>/dev/null; wait "$RUST_PID" 2>/dev/null || true
+    RUST_PID=""
+done
+
+# MQ CREATE+PUSH+POP consistency: all shard configs should return OK|yes|yes|0
+EXPECTED_MQ="OK|yes|yes|0"
+if [[ "$MQ_RESULT_1" == "$EXPECTED_MQ" && "$MQ_RESULT_4" == "$EXPECTED_MQ" && "$MQ_RESULT_12" == "$EXPECTED_MQ" ]]; then
+    PASS=$((PASS + 1)); echo "  PASS: MQ CREATE+PUSH+POP consistent across 1/4/12 shards"
+else
+    FAIL=$((FAIL + 1))
+    echo "  FAIL: MQ CREATE+PUSH+POP cross-shard divergence"
+    echo "    expected: $EXPECTED_MQ"
+    echo "    1-shard:  $MQ_RESULT_1"
+    echo "    4-shard:  $MQ_RESULT_4"
+    echo "    12-shard: $MQ_RESULT_12"
+fi
+
+# MQ DLQ routing consistency: all shard configs should return 1
+MQ_DLQ_OK=true
+for NSHARDS_LABEL in 1 4 12; do
+    case "$NSHARDS_LABEL" in
+        1)  DLQ_R="$MQ_DLQ_RESULT_1" ;;
+        4)  DLQ_R="$MQ_DLQ_RESULT_4" ;;
+        12) DLQ_R="$MQ_DLQ_RESULT_12" ;;
+    esac
+    # redis-cli returns "(integer) 1" or just "1" depending on version
+    if ! echo "$DLQ_R" | grep -qE '(integer) 1|^1$'; then
+        MQ_DLQ_OK=false
+    fi
+done
+if $MQ_DLQ_OK; then
+    PASS=$((PASS + 1)); echo "  PASS: MQ DLQ routing consistent across 1/4/12 shards (DLQLEN=1)"
+else
+    FAIL=$((FAIL + 1))
+    echo "  FAIL: MQ DLQ routing cross-shard divergence"
+    echo "    1-shard:  $MQ_DLQ_RESULT_1"
+    echo "    4-shard:  $MQ_DLQ_RESULT_4"
+    echo "    12-shard: $MQ_DLQ_RESULT_12"
+fi
+
+# Restart moon with the originally-requested shard count so summary works.
+start_moon_with_shards "$SHARDS" || true
+
 echo "============================================"
 echo "  Data Consistency Test Results"
 echo "============================================"
