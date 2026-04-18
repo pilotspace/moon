@@ -476,7 +476,11 @@ pub(crate) async fn handle_connection_sharded_monoio<
         // construction or dispatch table lookup. For multi-shard, only local keys
         // are inlined; remote keys fall through to normal cross-shard dispatch.
         // Skip inline dispatch when not conn.authenticated — AUTH must go through normal path.
-        if conn.authenticated {
+        // Skip inline dispatch for workspace-bound connections: workspace key prefix
+        // injection happens in the normal dispatch path (line 2356+) and the inline
+        // path has no equivalent, so GET/SET would use the raw (un-prefixed) key,
+        // causing GET to return nil even after SET succeeds (LVAL-01 bug).
+        if conn.authenticated && conn.workspace_id.is_none() {
             // Inline writes are only safe when every side-effect handled by
             // the normal dispatch path is either covered by the inline path
             // or provably unnecessary:
