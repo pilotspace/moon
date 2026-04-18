@@ -1195,8 +1195,42 @@ pub(crate) async fn handle_connection_sharded_inner<
                                     let mut vector_store =
                                         ctx.shard_databases.vector_store(ctx.shard_id);
                                     vector_store.txn_manager_mut().commit(txn.txn_id);
-                                    // TODO Phase 157-04: Write WAL XactCommit record
-                                    // TODO Phase 157-04: Process deferred HNSW inserts
+                                    drop(vector_store);
+
+                                    // Write XactCommit WAL record with committed KV state
+                                    let txn_id = txn.txn_id;
+                                    if !txn.kv_undo.is_empty() {
+                                        let db_guard = ctx.shard_databases.read_db(ctx.shard_id, conn.selected_db);
+                                        let payload = crate::persistence::wal_v3::record::encode_xact_commit_payload(
+                                            txn_id,
+                                            txn.kv_undo.records(),
+                                            &*db_guard,
+                                        );
+                                        drop(db_guard);
+                                        let mut wal_buf = Vec::new();
+                                        crate::persistence::wal_v3::record::write_wal_v3_record(
+                                            &mut wal_buf,
+                                            txn_id,
+                                            crate::persistence::wal_v3::record::WalRecordType::XactCommit,
+                                            &payload,
+                                        );
+                                        ctx.shard_databases.wal_append(ctx.shard_id, bytes::Bytes::from(wal_buf));
+                                    }
+
+                                    // Release KV write intents from shard side-table
+                                    ctx.shard_databases.kv_intents(ctx.shard_id).release_txn(txn_id);
+
+                                    // Drain deferred HNSW inserts (post-commit hook).
+                                    // The drain prevents phantom neighbors on abort.
+                                    // Actual HNSW graph insertion happens during compaction,
+                                    // not at commit time (point is already in mutable segment).
+                                    let drain_count = ctx.shard_databases
+                                        .hnsw_queue(ctx.shard_id)
+                                        .drain_for_txn(txn_id)
+                                        .count();
+                                    if drain_count > 0 {
+                                        tracing::debug!(txn_id, count = drain_count, "Drained deferred HNSW inserts");
+                                    }
 
                                     // Materialize MQ intents: enqueue deferred MQ.PUBLISH messages
                                     if !txn.mq_intents.is_empty() {
@@ -1246,8 +1280,8 @@ pub(crate) async fn handle_connection_sharded_inner<
                                                 } => {
                                                     db.set(key, old_entry);
                                                 }
-                                                crate::transaction::UndoRecord::Delete { .. } => {
-                                                    // No-op: key was deleted, nothing to restore
+                                                crate::transaction::UndoRecord::Delete { key, old_entry } => {
+                                                    db.set(key, old_entry);
                                                 }
                                             }
                                         }
@@ -1256,7 +1290,14 @@ pub(crate) async fn handle_connection_sharded_inner<
                                     let mut vector_store =
                                         ctx.shard_databases.vector_store(ctx.shard_id);
                                     vector_store.txn_manager_mut().abort(txn.txn_id);
-                                    // TODO Phase 157-04: Discard deferred HNSW inserts for this txn
+                                    drop(vector_store);
+
+                                    // Release KV write intents from shard side-table
+                                    ctx.shard_databases.kv_intents(ctx.shard_id).release_txn(txn.txn_id);
+
+                                    // Discard deferred HNSW inserts (prevent phantom neighbors)
+                                    ctx.shard_databases.hnsw_queue(ctx.shard_id).discard_for_txn(txn.txn_id);
+
                                     responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
                                 } else {
                                     responses.push(Frame::Error(Bytes::from_static(
@@ -2750,6 +2791,37 @@ pub(crate) async fn handle_connection_sharded_inner<
                             }
                             drop(rt);
 
+                            // KV undo-log capture for active cross-store transactions.
+                            // MUST happen BEFORE dispatch() overwrites the database entry.
+                            if let Some(ref mut txn) = conn.active_cross_txn {
+                                if cmd.eq_ignore_ascii_case(b"DEL") || cmd.eq_ignore_ascii_case(b"UNLINK") {
+                                    // Multi-key DEL: iterate all args for undo capture
+                                    for arg in cmd_args.iter() {
+                                        if let Frame::BulkString(key_bytes) = arg {
+                                            if let Some(old_entry) = guard.get(key_bytes.as_ref()).cloned() {
+                                                txn.kv_undo.record_delete(key_bytes.clone(), old_entry);
+                                                let lsn = txn.snapshot_lsn;
+                                                let tid = txn.txn_id;
+                                                ctx.shard_databases.kv_intents(ctx.shard_id)
+                                                    .record_write(key_bytes.clone(), lsn, tid);
+                                            }
+                                            // Key not found: nothing to undo, no intent registered
+                                        }
+                                    }
+                                } else if let Some(key) = crate::server::conn::shared::extract_primary_key(cmd, cmd_args) {
+                                    // SET / HSET / INCR / etc. — single primary key
+                                    let old_entry = guard.get(key.as_ref()).cloned();
+                                    let lsn = txn.snapshot_lsn;
+                                    let tid = txn.txn_id;
+                                    match old_entry {
+                                        None => txn.kv_undo.record_insert(key.clone()),
+                                        Some(entry) => txn.kv_undo.record_update(key.clone(), entry),
+                                    }
+                                    ctx.shard_databases.kv_intents(ctx.shard_id)
+                                        .record_write(key.clone(), lsn, tid);
+                                }
+                            }
+
                             let db_count = ctx.shard_databases.db_count();
                             guard.refresh_now_from_cache(&ctx.cached_clock);
                             let dispatch_start = std::time::Instant::now();
@@ -2834,6 +2906,31 @@ pub(crate) async fn handle_connection_sharded_inner<
                             }
                             responses.push(response);
                         } else {
+                            // Snapshot visibility filter for active cross-store transactions.
+                            // MVCC: hide keys written by uncommitted foreign transactions.
+                            if conn.in_cross_txn() {
+                                if let Some(ref txn) = conn.active_cross_txn {
+                                    if let Some(key) = crate::server::conn::shared::extract_primary_key(cmd, cmd_args) {
+                                        let snapshot_lsn = txn.snapshot_lsn;
+                                        let my_txn_id = txn.txn_id;
+                                        // Clone committed treemap to release vector_store lock
+                                        // before acquiring kv_intents lock (lock ordering).
+                                        let committed = {
+                                            let vs = ctx.shard_databases.vector_store(ctx.shard_id);
+                                            vs.txn_manager().committed_treemap().clone()
+                                        };
+                                        let visible = {
+                                            let intents = ctx.shard_databases.kv_intents(ctx.shard_id);
+                                            intents.is_key_visible(key.as_ref(), snapshot_lsn, my_txn_id, &committed)
+                                        };
+                                        if !visible {
+                                            responses.push(Frame::Null);
+                                            continue;
+                                        }
+                                    }
+                                }
+                            }
+
                             // READ PATH: shared lock — no contention with other shards' reads
                             let guard = ctx.shard_databases.read_db(ctx.shard_id, conn.selected_db);
                             let now_ms = ctx.cached_clock.ms();
