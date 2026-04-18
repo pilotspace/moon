@@ -69,6 +69,7 @@ while [[ $# -gt 0 ]]; do
             echo "  temporal     - Temporal commands (TEMPORAL.SNAPSHOT_AT, TEMPORAL.INVALIDATE)"
             echo "  workspace    - Workspace commands (WS CREATE, WS LIST, WS INFO, WS AUTH, WS DROP)"
             echo "  mq           - Durable Message Queue (MQ CREATE, PUSH, POP, ACK, DLQLEN, TRIGGER)"
+            echo "  txn_kv       - KV Transaction Wiring (TXN.BEGIN, TXN.COMMIT, TXN.ABORT lifecycle)"
             echo "  benchmark    - redis-benchmark throughput for all benchmarkable commands"
             exit 0
             ;;
@@ -1970,6 +1971,106 @@ if should_run "mq"; then
     fi
 
     echo "  mq: done"
+fi
+
+# ===========================================================================
+# TXN KV WIRING (Phase 161) — ACID lifecycle tests
+# ===========================================================================
+
+if should_run "txn_kv"; then
+    echo ""
+    echo "=== TXN KV Wiring ==="
+    mcli FLUSHALL >/dev/null 2>&1 || true
+
+    # TXN-01: TXN.BEGIN / SET / TXN.COMMIT lifecycle
+    TOTAL=$((TOTAL + 1))
+    TXN_BEGIN_OUT=$(mcli TXN BEGIN 2>&1)
+    if echo "$TXN_BEGIN_OUT" | grep -q "OK"; then
+        PASS=$((PASS + 1)); echo "  PASS: TXN BEGIN returns OK"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: TXN BEGIN should return OK: $TXN_BEGIN_OUT"
+    fi
+
+    TOTAL=$((TOTAL + 1))
+    TXN_SET_OUT=$(mcli SET txn_kv_commit_key committed_value 2>&1)
+    if echo "$TXN_SET_OUT" | grep -q "OK"; then
+        PASS=$((PASS + 1)); echo "  PASS: SET inside TXN returns OK"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: SET inside TXN should return OK: $TXN_SET_OUT"
+    fi
+
+    TOTAL=$((TOTAL + 1))
+    TXN_COMMIT_OUT=$(mcli TXN COMMIT 2>&1)
+    if echo "$TXN_COMMIT_OUT" | grep -q "OK"; then
+        PASS=$((PASS + 1)); echo "  PASS: TXN COMMIT returns OK"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: TXN COMMIT should return OK: $TXN_COMMIT_OUT"
+    fi
+
+    TOTAL=$((TOTAL + 1))
+    TXN_GET_AFTER=$(mcli GET txn_kv_commit_key 2>&1)
+    if echo "$TXN_GET_AFTER" | grep -q "committed_value"; then
+        PASS=$((PASS + 1)); echo "  PASS: GET after TXN COMMIT returns committed value"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: GET after TXN COMMIT should return committed_value: $TXN_GET_AFTER"
+    fi
+
+    # TXN-02: TXN.BEGIN / SET / TXN.ABORT (insert rollback — key must vanish)
+    TOTAL=$((TOTAL + 1))
+    mcli TXN BEGIN >/dev/null 2>&1
+    mcli SET txn_kv_abort_key should_vanish >/dev/null 2>&1
+    mcli TXN ABORT >/dev/null 2>&1
+    TXN_ABORT_GET=$(mcli GET txn_kv_abort_key 2>&1)
+    if echo "$TXN_ABORT_GET" | grep -qvE "should_vanish"; then
+        PASS=$((PASS + 1)); echo "  PASS: GET after TXN ABORT (insert) returns nil"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: GET after TXN ABORT (insert) should be nil: $TXN_ABORT_GET"
+    fi
+
+    # TXN-03: TXN.BEGIN / DEL / TXN.ABORT (delete rollback — key must be restored)
+    mcli SET txn_kv_del_key original >/dev/null 2>&1
+    TOTAL=$((TOTAL + 1))
+    mcli TXN BEGIN >/dev/null 2>&1
+    mcli DEL txn_kv_del_key >/dev/null 2>&1
+    mcli TXN ABORT >/dev/null 2>&1
+    TXN_DEL_ABORT_GET=$(mcli GET txn_kv_del_key 2>&1)
+    if echo "$TXN_DEL_ABORT_GET" | grep -q "original"; then
+        PASS=$((PASS + 1)); echo "  PASS: GET after DEL + TXN ABORT restores original value"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: GET after DEL + TXN ABORT should return original: $TXN_DEL_ABORT_GET"
+    fi
+
+    # TXN-04: Error cases — COMMIT/ABORT without BEGIN, double BEGIN
+    TOTAL=$((TOTAL + 1))
+    TXN_NO_BEGIN_COMMIT=$(mcli TXN COMMIT 2>&1)
+    if echo "$TXN_NO_BEGIN_COMMIT" | grep -qi "not in a cross-store transaction"; then
+        PASS=$((PASS + 1)); echo "  PASS: TXN COMMIT without BEGIN rejected"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: TXN COMMIT without BEGIN should error: $TXN_NO_BEGIN_COMMIT"
+    fi
+
+    TOTAL=$((TOTAL + 1))
+    TXN_NO_BEGIN_ABORT=$(mcli TXN ABORT 2>&1)
+    if echo "$TXN_NO_BEGIN_ABORT" | grep -qi "not in a cross-store transaction"; then
+        PASS=$((PASS + 1)); echo "  PASS: TXN ABORT without BEGIN rejected"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: TXN ABORT without BEGIN should error: $TXN_NO_BEGIN_ABORT"
+    fi
+
+    TOTAL=$((TOTAL + 1))
+    mcli TXN BEGIN >/dev/null 2>&1
+    TXN_DOUBLE_BEGIN=$(mcli TXN BEGIN 2>&1)
+    if echo "$TXN_DOUBLE_BEGIN" | grep -qi "already in a cross-store transaction"; then
+        PASS=$((PASS + 1)); echo "  PASS: Double TXN BEGIN rejected"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: Double TXN BEGIN should error: $TXN_DOUBLE_BEGIN"
+    fi
+    mcli TXN ABORT >/dev/null 2>&1
+
+    # Cleanup
+    mcli DEL txn_kv_commit_key txn_kv_del_key >/dev/null 2>&1 || true
+
+    echo "  txn_kv: done"
 fi
 
 # ===========================================================================
