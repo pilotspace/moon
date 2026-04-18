@@ -7,6 +7,7 @@ use parking_lot::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use crate::graph::store::GraphStore;
 use crate::mq::{DurableQueueRegistry, TriggerRegistry};
 use crate::storage::Database;
+use crate::transaction::{DeferredHnswInserts, KvWriteIntents};
 use crate::temporal::{TemporalKvIndex, TemporalRegistry};
 use crate::text::store::TextStore;
 use crate::vector::store::VectorStore;
@@ -46,6 +47,12 @@ pub struct ShardDatabases {
     /// Per-shard TriggerRegistry for MQ.TRIGGER debounced callbacks.
     /// Lazy-init: None until first MQ.TRIGGER call on this shard.
     trigger_registries: Vec<Mutex<Option<Box<TriggerRegistry>>>>,
+    /// Per-shard KV write-intent side-table for transactional MVCC.
+    /// Shard-global: visible to all connections for cross-txn visibility checks.
+    kv_write_intents: Vec<Mutex<KvWriteIntents>>,
+    /// Per-shard deferred HNSW insert queue for post-commit processing.
+    /// Shard-global: survives connection drops before commit.
+    deferred_hnsw_inserts: Vec<Mutex<DeferredHnswInserts>>,
     num_shards: usize,
     db_count: usize,
 }
@@ -85,6 +92,12 @@ impl ShardDatabases {
         let trigger_registries = (0..num_shards)
             .map(|_| Mutex::new(None))
             .collect();
+        let kv_write_intents = (0..num_shards)
+            .map(|_| Mutex::new(KvWriteIntents::new()))
+            .collect();
+        let deferred_hnsw_inserts = (0..num_shards)
+            .map(|_| Mutex::new(DeferredHnswInserts::new()))
+            .collect();
         Arc::new(Self {
             shards,
             vector_stores,
@@ -97,6 +110,8 @@ impl ShardDatabases {
             workspace_registries,
             durable_queue_registries,
             trigger_registries,
+            kv_write_intents,
+            deferred_hnsw_inserts,
             num_shards,
             db_count,
         })
@@ -203,6 +218,20 @@ impl ShardDatabases {
         shard_id: usize,
     ) -> MutexGuard<'_, Option<Box<TriggerRegistry>>> {
         self.trigger_registries[shard_id].lock()
+    }
+
+    /// Acquire the per-shard KV write-intent side-table lock.
+    /// Used by handler write path (record_write) and read path (is_key_visible).
+    #[inline]
+    pub fn kv_intents(&self, shard_id: usize) -> MutexGuard<'_, KvWriteIntents> {
+        self.kv_write_intents[shard_id].lock()
+    }
+
+    /// Acquire the per-shard deferred HNSW insert queue lock.
+    /// Used by TXN.COMMIT (drain_for_txn) and TXN.ABORT (discard_for_txn).
+    #[inline]
+    pub fn hnsw_queue(&self, shard_id: usize) -> MutexGuard<'_, DeferredHnswInserts> {
+        self.deferred_hnsw_inserts[shard_id].lock()
     }
 
     /// Replay WAL WorkspaceCreate and WorkspaceDrop records to restore workspace registry.
