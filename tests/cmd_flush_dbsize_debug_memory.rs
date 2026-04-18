@@ -37,12 +37,14 @@ fn release_binary() -> std::path::PathBuf {
 struct Moon {
     child: Child,
     port: u16,
+    tmp_dir: std::path::PathBuf,
 }
 
 impl Drop for Moon {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        let _ = std::fs::remove_dir_all(&self.tmp_dir);
     }
 }
 
@@ -62,6 +64,8 @@ fn spawn_moon() -> Option<Moon> {
         return None;
     }
     let port = free_port();
+    let tmp_dir = std::env::temp_dir().join(format!("moon-test-{port}"));
+    let _ = std::fs::create_dir_all(&tmp_dir);
     let child = Command::new(&bin)
         .args([
             "--port",
@@ -70,12 +74,16 @@ fn spawn_moon() -> Option<Moon> {
             "1",
             "--admin-port",
             "0",
+            "--appendonly",
+            "no",
+            "--persistence-dir",
+            tmp_dir.to_str().unwrap(),
         ])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
         .ok()?;
-    let moon = Moon { child, port };
+    let moon = Moon { child, port, tmp_dir };
 
     // Wait up to ~5s for PING to succeed.
     let deadline = Instant::now() + Duration::from_secs(5);
