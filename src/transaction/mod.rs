@@ -32,6 +32,13 @@ pub struct GraphIntent {
     pub is_node: bool,
 }
 
+/// MQ write intent: message to enqueue on TXN.COMMIT.
+#[derive(Debug, Clone)]
+pub struct MqIntent {
+    pub queue_key: Bytes,
+    pub fields: Vec<(Bytes, Bytes)>,
+}
+
 /// Cross-store transaction state.
 ///
 /// Tracks all modifications across KV, vector, and graph stores.
@@ -49,6 +56,8 @@ pub struct CrossStoreTxn {
     pub vector_intents: SmallVec<[VectorIntent; 8]>,
     /// Graph entity_ids modified in this transaction.
     pub graph_intents: SmallVec<[GraphIntent; 8]>,
+    /// MQ messages to enqueue on commit.
+    pub mq_intents: SmallVec<[MqIntent; 4]>,
 }
 
 impl CrossStoreTxn {
@@ -61,6 +70,7 @@ impl CrossStoreTxn {
             kv_undo: UndoLog::new(),
             vector_intents: SmallVec::new(),
             graph_intents: SmallVec::new(),
+            mq_intents: SmallVec::new(),
         }
     }
 
@@ -97,12 +107,19 @@ impl CrossStoreTxn {
         self.graph_intents.push(GraphIntent { entity_id, is_node });
     }
 
+    /// Record an MQ publish intent (MQ.PUBLISH inside TXN).
+    #[inline]
+    pub fn record_mq(&mut self, queue_key: Bytes, fields: Vec<(Bytes, Bytes)>) {
+        self.mq_intents.push(MqIntent { queue_key, fields });
+    }
+
     /// Check if this transaction has any modifications.
     #[inline]
     pub fn has_modifications(&self) -> bool {
         !self.kv_undo.is_empty()
             || !self.vector_intents.is_empty()
             || !self.graph_intents.is_empty()
+            || !self.mq_intents.is_empty()
     }
 
     /// Get KV undo log for rollback (consumes self).
@@ -144,5 +161,23 @@ mod tests {
         let mut txn = CrossStoreTxn::new(1, 0);
         txn.record_graph(200, true);
         assert!(txn.has_modifications());
+    }
+
+    #[test]
+    fn test_mq_intent_tracking() {
+        let mut txn = CrossStoreTxn::new(10, 9);
+        assert!(!txn.has_modifications());
+
+        txn.record_mq(
+            Bytes::from_static(b"orders"),
+            vec![(
+                Bytes::from_static(b"item"),
+                Bytes::from_static(b"widget"),
+            )],
+        );
+        assert!(txn.has_modifications());
+        assert_eq!(txn.mq_intents.len(), 1);
+        assert_eq!(txn.mq_intents[0].queue_key.as_ref(), b"orders");
+        assert_eq!(txn.mq_intents[0].fields.len(), 1);
     }
 }

@@ -83,6 +83,10 @@ pub struct Stream {
     pub last_id: StreamId,
     /// Consumer groups keyed by group name.
     pub groups: HashMap<Bytes, ConsumerGroup>,
+    /// True if this stream is managed by MQ.* commands (at-least-once delivery).
+    pub durable: bool,
+    /// Maximum delivery attempts before dead-letter routing (0 = disabled).
+    pub max_delivery_count: u32,
 }
 
 /// Consumer group state.
@@ -116,6 +120,8 @@ impl Stream {
             length: 0,
             last_id: StreamId::ZERO,
             groups: HashMap::new(),
+            durable: false,
+            max_delivery_count: 0,
         }
     }
 
@@ -891,5 +897,15 @@ mod tests {
         );
         let mem = s.estimate_memory();
         assert!(mem > 0);
+    }
+
+    #[test]
+    fn test_stream_new_defaults() {
+        let s = Stream::new();
+        assert!(!s.durable, "new streams should not be durable by default");
+        assert_eq!(
+            s.max_delivery_count, 0,
+            "max_delivery_count should default to 0 (disabled)"
+        );
     }
 }

@@ -65,6 +65,10 @@ pub enum WalRecordType {
     WorkspaceCreate = 0x60,
     /// Workspace deletion record.
     WorkspaceDrop = 0x61,
+    /// MQ queue creation record.
+    MqCreate = 0x70,
+    /// MQ message acknowledge record (used for cursor-rollback).
+    MqAck = 0x71,
 }
 
 impl WalRecordType {
@@ -90,6 +94,8 @@ impl WalRecordType {
             0x52 => Some(Self::XactAbort),
             0x60 => Some(Self::WorkspaceCreate),
             0x61 => Some(Self::WorkspaceDrop),
+            0x70 => Some(Self::MqCreate),
+            0x71 => Some(Self::MqAck),
             _ => None,
         }
     }
@@ -366,11 +372,13 @@ mod tests {
         assert_eq!(WalRecordType::XactAbort as u8, 0x52);
         assert_eq!(WalRecordType::WorkspaceCreate as u8, 0x60);
         assert_eq!(WalRecordType::WorkspaceDrop as u8, 0x61);
+        assert_eq!(WalRecordType::MqCreate as u8, 0x70);
+        assert_eq!(WalRecordType::MqAck as u8, 0x71);
 
         // from_u8 roundtrips
         for &v in &[
             0x01, 0x10, 0x20, 0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x40, 0x41, 0x42, 0x50,
-            0x51, 0x52, 0x60, 0x61,
+            0x51, 0x52, 0x60, 0x61, 0x70, 0x71,
         ] {
             assert!(WalRecordType::from_u8(v).is_some());
         }

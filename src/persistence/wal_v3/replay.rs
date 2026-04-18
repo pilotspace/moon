@@ -266,7 +266,9 @@ pub fn replay_wal_v3_file(
             | WalRecordType::TemporalUpsert
             | WalRecordType::GraphTemporal
             | WalRecordType::WorkspaceCreate
-            | WalRecordType::WorkspaceDrop => {
+            | WalRecordType::WorkspaceDrop
+            | WalRecordType::MqCreate
+            | WalRecordType::MqAck => {
                 on_command(&record);
                 result.commands_replayed += 1;
             }
