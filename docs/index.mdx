@@ -4,7 +4,7 @@ description: "A high-performance, Redis-compatible in-memory data store written 
 keywords: ["redis", "rust", "in-memory", "database", "key-value"]
 ---
 
-Moon is a Redis-compatible in-memory data store built from scratch in Rust. It implements 200+ Redis commands with a thread-per-core shared-nothing architecture, achieving **1.5-3x Redis throughput** while using **27-35% less memory** for real-world value sizes.
+Moon is a Redis-compatible in-memory data store built from scratch in Rust. It implements 230+ commands with a thread-per-core shared-nothing architecture, achieving **1.5-3x Redis throughput** while using **27-35% less memory** for real-world value sizes. Beyond Redis compatibility, Moon provides cross-store ACID transactions, BM25 full-text search, workspace partitioning, durable message queues, and bi-temporal MVCC.
 
 <Warning>
 Moon is **experimental** and under active development. APIs, storage formats, and configuration options may change without notice. Not recommended for production use.
@@ -24,8 +24,8 @@ Moon is **experimental** and under active development. APIs, storage formats, an
 ## Highlights
 
 <Columns cols={2}>
-  <Card title="200+ Redis commands" icon="terminal" href="/commands">
-    Strings, hashes, lists, sets, sorted sets, streams, pub/sub, transactions, Lua scripting, and more.
+  <Card title="230+ commands" icon="terminal" href="/commands">
+    Strings, hashes, lists, sets, sorted sets, streams, pub/sub, transactions, Lua scripting, vector search, graph, and more.
   </Card>
   <Card title="Thread-per-core architecture" icon="microchip" href="/architecture">
     Shared-nothing design with per-shard event loops, DashTable SIMD probing, and lock-free channels.
@@ -36,8 +36,14 @@ Moon is **experimental** and under active development. APIs, storage formats, an
   <Card title="Per-shard persistence" icon="hard-drive" href="/guides/persistence">
     Forkless RDB snapshots and per-shard WAL with no global lock. AOF advantage grows with pipeline depth.
   </Card>
-  <Card title="Cluster and replication" icon="server" href="/guides/clustering">
-    PSYNC2-compatible replication, 16,384 hash slots, gossip protocol, and automatic failover.
+  <Card title="Cross-store transactions" icon="lock" href="/guides/transactions">
+    TXN.BEGIN/COMMIT/ABORT for atomic writes across KV, vector, and graph stores with undo-log rollback.
+  </Card>
+  <Card title="Full-text + vector search" icon="magnifying-glass" href="/commands#full-text-search-2">
+    BM25 inverted index, HNSW + TurboQuant vectors, three-way hybrid fusion, FT.AGGREGATE with GROUPBY/REDUCE.
+  </Card>
+  <Card title="Workspaces and message queues" icon="building" href="/guides/workspaces">
+    Multi-tenant namespace isolation (WS), durable at-least-once queues with dead-letter and triggers (MQ).
   </Card>
   <Card title="Drop-in compatible" icon="plug" href="/quickstart">
     Works with any Redis client. Connect with redis-cli, Jedis, ioredis, or redis-py out of the box.

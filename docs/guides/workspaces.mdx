@@ -1,0 +1,65 @@
+---
+title: "Workspaces"
+description: "Multi-tenant namespace isolation with transparent key prefixing."
+keywords: ["workspaces", "multi-tenant", "namespace", "isolation", "ws"]
+---
+
+Workspaces provide multi-tenant namespace isolation. Each workspace gets a unique UUID v7 prefix that is transparently applied to all keys, ensuring complete data separation without application-level key management.
+
+## Quick start
+
+```bash
+redis-cli -p 6379
+
+# Create a workspace
+127.0.0.1:6379> WS CREATE myapp
+"0193a9f2-e456-7890-abcd-ef1234567890"
+
+# Bind this connection to the workspace
+127.0.0.1:6379> WS AUTH 0193a9f2-e456-7890-abcd-ef1234567890
+OK
+
+# All commands are now transparently prefixed
+127.0.0.1:6379> SET user:1 alice    -- stored as {ws_hex}:user:1
+OK
+127.0.0.1:6379> GET user:1          -- response un-prefixed transparently
+"alice"
+127.0.0.1:6379> KEYS *              -- only shows workspace keys
+1) "user:1"
+```
+
+## Commands
+
+| Command | Description |
+|---------|-------------|
+| `WS CREATE <name>` | Create a new workspace. Name max 64 bytes. Returns UUID v7 |
+| `WS DROP <ws_id>` | Delete a workspace and all its data |
+| `WS AUTH <ws_id>` | Bind the current connection to a workspace. Cannot re-bind |
+| `WS INFO <ws_id>` | Return workspace metadata (name, creation time) |
+| `WS LIST` | List all workspace IDs |
+
+## How it works
+
+1. **WS CREATE** generates a UUID v7 (time-ordered, 74-bit random) and registers it in the per-shard `WorkspaceRegistry`.
+
+2. **WS AUTH** binds the connection to a workspace. All subsequent commands have their key arguments transparently rewritten with a `{ws_hex}:` hash tag prefix. The hash tag `{}` ensures all workspace keys route to the same shard.
+
+3. **Key rewriting** is handled by `workspace_rewrite_args()` which:
+   - Injects the `{ws_hex}:` prefix on all key arguments
+   - Strips the prefix from response values (KEYS, SCAN, etc.)
+   - Skips non-key commands (WS, TXN, TEMPORAL, MQ, etc.)
+
+4. **WS DROP** deletes the workspace registry entry. Keys remain until they expire or are explicitly cleaned.
+
+## Use cases
+
+- **SaaS multi-tenancy**: Each customer gets a workspace — full data isolation with zero application code changes.
+- **Environment separation**: Dev, staging, production on the same Moon instance.
+- **A/B testing**: Isolate experimental data from production keyspace.
+
+## Limitations
+
+- A connection can only be bound to one workspace (no re-binding).
+- Workspace names are limited to 64 bytes.
+- Cross-workspace operations are not supported — each connection sees only its workspace's data.
+- `WS DROP` removes the registry entry but does not currently cascade-delete all prefixed keys.

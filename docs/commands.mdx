@@ -1,11 +1,11 @@
 ---
 title: "Command reference"
-description: "All 200+ supported Redis commands grouped by data type."
+description: "All 230+ supported commands grouped by category."
 keywords: ["commands", "redis", "api", "reference"]
 mode: "wide"
 ---
 
-Moon implements 200+ Redis commands. All commands follow [Redis command semantics](https://redis.io/docs/latest/commands/).
+Moon implements 230+ commands. Redis-compatible commands follow [Redis command semantics](https://redis.io/docs/latest/commands/). Moon-native commands (TXN, WS, MQ, TEMPORAL, FT.AGGREGATE) extend the protocol for cross-store transactions, workspaces, message queues, temporal queries, and full-text search.
 
 ## Connection (7)
 
@@ -55,6 +55,22 @@ Blocking commands (`BLPOP`, `BRPOP`, `BLMOVE`) support timeouts and cross-shard 
 
 `MULTI`, `EXEC`, `DISCARD`, `WATCH`, `UNWATCH`
 
+## Cross-store transactions (3)
+
+`TXN BEGIN`, `TXN COMMIT`, `TXN ABORT`
+
+<Note>
+Cross-store transactions provide ACID semantics across KV, vector, and graph stores. `TXN BEGIN` starts a transaction, subsequent writes are buffered, and `TXN COMMIT` applies them atomically. `TXN ABORT` rolls back via undo-log replay. Cannot be mixed with `MULTI`/`EXEC`.
+</Note>
+
+```
+TXN BEGIN          -- Start a cross-store transaction
+SET key value      -- Buffered in write intents
+HSET doc:1 ...     -- Vector auto-index deferred until commit
+GRAPH.ADDNODE ...  -- Graph write intent recorded
+TXN COMMIT         -- Apply all changes atomically + WAL record
+```
+
 ## Scripting (5)
 
 `EVAL`, `EVALSHA`, `SCRIPT LOAD`, `SCRIPT EXISTS`, `SCRIPT FLUSH`
@@ -78,6 +94,80 @@ Lua 5.4 VM via mlua. Sandboxed with `redis.call()` and `redis.pcall()` API bindi
 ## ACL (8)
 
 `ACL SETUSER`, `ACL GETUSER`, `ACL DELUSER`, `ACL LIST`, `ACL WHOAMI`, `ACL LOG`, `ACL SAVE`, `ACL LOAD`
+
+## Vector search (11)
+
+`FT.CREATE`, `FT.DROPINDEX`, `FT.INFO`, `FT.SEARCH`, `FT.COMPACT`, `FT.RECOMMEND`, `FT.NAVIGATE`, `FT.EXPAND`, `FT.CACHESEARCH`, `FT.CONFIG SET`, `FT.CONFIG GET`
+
+<Tip>
+Vectors are auto-indexed on `HSET`. Create an index with `FT.CREATE`, then `HSET` documents — Moon automatically inserts them into the HNSW graph. See the [vector search guide](/guides/vector-search) for tuning parameters.
+</Tip>
+
+## Full-text search (2)
+
+`FT.AGGREGATE`, `FT.SEARCH` (with BM25 text fields)
+
+<Note>
+`FT.CREATE` supports `TEXT`, `TAG`, and `NUMERIC` field types alongside `VECTOR`. BM25 full-text search uses an inverted index with typo tolerance (Levenshtein fuzzy `%%term%%`), prefix search (`term*`), and three-way RRF hybrid fusion (BM25 + dense vector + sparse vector). `FT.AGGREGATE` provides `GROUPBY`/`REDUCE` with scatter-gather and HLL `COUNT_DISTINCT`.
+</Note>
+
+## Workspaces (5)
+
+`WS CREATE`, `WS DROP`, `WS AUTH`, `WS INFO`, `WS LIST`
+
+<Note>
+Workspaces provide multi-tenant namespace isolation. After `WS AUTH`, all commands on the connection are transparently prefixed to the workspace's keyspace. Workspace names are max 64 bytes. IDs are UUID v7 (time-ordered).
+</Note>
+
+```
+WS CREATE myapp               -- Returns workspace UUID
+WS AUTH <ws_id>                -- Bind this connection to the workspace
+SET user:1 alice               -- Actually stored as {ws_hex}:user:1
+GET user:1                     -- Transparently un-prefixed in response
+WS LIST                        -- Enumerate all workspaces
+WS INFO <ws_id>                -- Workspace statistics
+WS DROP <ws_id>                -- Delete workspace and all its data
+```
+
+## Message queues (7)
+
+`MQ CREATE`, `MQ PUSH`, `MQ POP`, `MQ ACK`, `MQ DLQLEN`, `MQ TRIGGER`, `MQ PUBLISH`
+
+<Note>
+Durable message queues built on Redis Streams with at-least-once delivery. Failed messages are moved to a dead-letter queue after `MAXDELIVERY` attempts (default 3). `MQ TRIGGER` registers debounced callbacks. `MQ PUBLISH` is for transactional enqueue within a `TXN` block.
+</Note>
+
+```
+MQ CREATE orders MAXDELIVERY 5 DEBOUNCE 1000    -- Create durable queue
+MQ PUSH orders action process item_id 42        -- Enqueue a message
+MQ POP orders COUNT 3                           -- Claim up to 3 messages
+MQ ACK orders 1713394800000-0                   -- Acknowledge by stream ID
+MQ DLQLEN orders                                -- Dead-letter queue depth
+MQ TRIGGER orders "PUBLISH events new" DEBOUNCE 2000  -- Register trigger
+```
+
+## Temporal (2)
+
+`TEMPORAL.SNAPSHOT_AT`, `TEMPORAL.INVALIDATE`
+
+<Note>
+Bi-temporal MVCC for point-in-time queries. `TEMPORAL.SNAPSHOT_AT` records a wall-clock → LSN binding. `TEMPORAL.INVALIDATE` sets `valid_to` on a graph entity. Use `FT.SEARCH ... AS_OF <timestamp>` for temporal vector queries and `GRAPH.QUERY ... VALID_AT <timestamp>` for temporal graph queries.
+</Note>
+
+```
+TEMPORAL.SNAPSHOT_AT                             -- Record current time → LSN
+TEMPORAL.INVALIDATE 42 NODE mygraph              -- Expire node 42
+FT.SEARCH idx "*=>[KNN 5 @v $q]" AS_OF 1713394800000  -- Search at point-in-time
+GRAPH.QUERY social "MATCH (a) RETURN a" VALID_AT 1713394800000
+```
+
+## Graph (14)
+
+`GRAPH.CREATE`, `GRAPH.DROP`, `GRAPH.ADDNODE`, `GRAPH.ADDEDGE`, `GRAPH.GETNODE`, `GRAPH.GETEDGE`, `GRAPH.DELNODE`, `GRAPH.DELEDGE`, `GRAPH.NEIGHBORS`, `GRAPH.DEGREE`, `GRAPH.SETPROP`, `GRAPH.QUERY`, `GRAPH.EXPLAIN`, `GRAPH.PROFILE`
+
+<Note>
+Cypher subset: MATCH, WHERE, RETURN, CREATE, DELETE, SET, MERGE, WITH, ORDER BY, LIMIT, SKIP. Supports hybrid graph+vector queries via `EXPAND GRAPH` clause in `FT.SEARCH`.
+</Note>
 
 ## Server (12)
 

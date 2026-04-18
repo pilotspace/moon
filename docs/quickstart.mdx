@@ -126,6 +126,85 @@ Moon is compatible with any Redis client. Here are a few examples:
   </Tab>
 </Tabs>
 
+## Python SDK
+
+```bash
+pip install moondb
+```
+
+```python
+from moondb import MoonClient, encode_vector
+
+client = MoonClient(host="localhost", port=6379)
+
+# Standard Redis commands
+client.set("hello", "world")
+
+# Vector search
+client.vector.create_index("docs", dim=384, metric="COSINE")
+client.hset("doc:1", mapping={"vec": encode_vector([0.1] * 384), "title": "Hello"})
+results = client.vector.search("docs", [0.1] * 384, k=5)
+
+# Graph engine
+client.graph.create("social")
+client.graph.add_node("social", "Person", name="Alice")
+```
+
+See [sdk/python/README.md](https://github.com/pilotspace/moon/tree/main/sdk/python) for async client, LangChain/LlamaIndex integrations, and full API reference.
+
+## Try Moon-native features
+
+<Tabs>
+  <Tab title="Cross-store transactions">
+    ```bash
+    redis-cli -p 6379
+    127.0.0.1:6379> TXN BEGIN
+    OK
+    127.0.0.1:6379> SET user:1 alice
+    OK
+    127.0.0.1:6379> HSET doc:1 title "Hello" vec <vector_bytes>
+    (integer) 2
+    127.0.0.1:6379> TXN COMMIT
+    OK
+    ```
+  </Tab>
+  <Tab title="Workspaces">
+    ```bash
+    redis-cli -p 6379
+    127.0.0.1:6379> WS CREATE myapp
+    "0193a9f2-e456-7890-abcd-ef1234567890"
+    127.0.0.1:6379> WS AUTH 0193a9f2-e456-7890-abcd-ef1234567890
+    OK
+    127.0.0.1:6379> SET user:1 alice
+    OK
+    127.0.0.1:6379> WS LIST
+    1) "0193a9f2-e456-7890-abcd-ef1234567890"
+    ```
+  </Tab>
+  <Tab title="Message queues">
+    ```bash
+    redis-cli -p 6379
+    127.0.0.1:6379> MQ CREATE orders MAXDELIVERY 5
+    OK
+    127.0.0.1:6379> MQ PUSH orders action process item_id 42
+    "1713394800000-0"
+    127.0.0.1:6379> MQ POP orders COUNT 1
+    1) 1) "1713394800000-0"
+       2) 1) "action" 2) "process" 3) "item_id" 4) "42"
+    127.0.0.1:6379> MQ ACK orders 1713394800000-0
+    (integer) 1
+    ```
+  </Tab>
+  <Tab title="Temporal queries">
+    ```bash
+    redis-cli -p 6379
+    127.0.0.1:6379> TEMPORAL.SNAPSHOT_AT
+    OK
+    127.0.0.1:6379> FT.SEARCH idx "*=>[KNN 5 @v $q]" AS_OF 1713394800000 PARAMS 2 q <vec> DIALECT 2
+    ```
+  </Tab>
+</Tabs>
+
 ## Next steps
 
 <Columns cols={2}>
@@ -134,5 +213,11 @@ Moon is compatible with any Redis client. Here are a few examples:
   </Card>
   <Card title="Architecture" icon="microchip" href="/architecture">
     How Moon works under the hood.
+  </Card>
+  <Card title="Transactions" icon="lock" href="/guides/transactions">
+    Cross-store ACID transactions across KV, vector, and graph.
+  </Card>
+  <Card title="Full-text search" icon="magnifying-glass" href="/guides/full-text-search">
+    BM25, hybrid fusion, FT.AGGREGATE with GROUPBY/REDUCE.
   </Card>
 </Columns>

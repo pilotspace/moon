@@ -1,0 +1,81 @@
+---
+title: "Temporal queries"
+description: "Bi-temporal MVCC for point-in-time KV and graph queries."
+keywords: ["temporal", "mvcc", "bi-temporal", "snapshot", "point-in-time", "valid-time"]
+---
+
+Moon provides bi-temporal MVCC for point-in-time queries across KV and graph stores. Record wall-clock snapshots, invalidate graph entities at specific times, and query historical state via `AS_OF` and `VALID_AT` clauses.
+
+## Quick start
+
+```bash
+redis-cli -p 6379
+
+# Record a temporal snapshot (binds current wall-clock to WAL LSN)
+127.0.0.1:6379> TEMPORAL.SNAPSHOT_AT
+OK
+
+# ... make data changes ...
+
+# Query vectors at a historical point in time
+127.0.0.1:6379> FT.SEARCH idx "*=>[KNN 5 @v $q]" AS_OF 1713394800000 \
+    PARAMS 2 q <query_vector> DIALECT 2
+
+# Query graph at a historical point in time
+127.0.0.1:6379> GRAPH.QUERY social "MATCH (a:Person) RETURN a.name" \
+    VALID_AT 1713394800000
+
+# Invalidate a graph entity (set valid_to timestamp)
+127.0.0.1:6379> TEMPORAL.INVALIDATE 42 NODE mygraph
+OK
+127.0.0.1:6379> TEMPORAL.INVALIDATE 99 EDGE social
+OK
+```
+
+## Commands
+
+| Command | Description |
+|---------|-------------|
+| `TEMPORAL.SNAPSHOT_AT` | Record current wall-clock → WAL LSN binding. Takes no arguments |
+| `TEMPORAL.INVALIDATE <entity_id> <NODE\|EDGE> <graph_name>` | Set `valid_to` on a graph entity, making it invisible to future temporal queries |
+
+## Temporal query clauses
+
+| Clause | Used in | Description |
+|--------|---------|-------------|
+| `AS_OF <unix_ms>` | `FT.SEARCH` | Search vectors using the index state at the given timestamp |
+| `VALID_AT <unix_ms>` | `GRAPH.QUERY` | Execute Cypher query against graph state valid at the given timestamp |
+
+## How it works
+
+### Temporal registry
+
+`TEMPORAL.SNAPSHOT_AT` captures the current Unix millisecond timestamp and the current WAL LSN (Log Sequence Number), storing the binding in a `TemporalRegistry` backed by a BTreeMap for O(log n) range lookups.
+
+### Bi-temporal fields
+
+Graph entities (nodes and edges) carry `valid_from` and `valid_to` timestamps in their metadata. `TEMPORAL.INVALIDATE` sets `valid_to` on a specific entity, and `VALID_AT` queries filter entities whose valid interval contains the requested timestamp.
+
+### Vector temporal queries
+
+`FT.SEARCH ... AS_OF <timestamp>` resolves the timestamp to a WAL LSN via the temporal registry, then searches the vector index using only data that existed at that LSN.
+
+### WAL records
+
+- `TemporalUpsert` (0x35): Versioned KV entries with `valid_from` timestamp
+- `GraphTemporal` (0x36): Temporal graph modifications (invalidation, version bumps)
+
+Both record types are replayed on startup to reconstruct the temporal registry and restore entity validity windows.
+
+## Use cases
+
+- **Audit trails**: Query the exact state of data at any historical point.
+- **Regulatory compliance**: Prove what data was visible at a specific time.
+- **ML reproducibility**: Reproduce feature vectors and graph state used for a past model inference.
+- **Soft deletes with temporal visibility**: Invalidate entities instead of deleting them — they remain queryable for historical analysis.
+
+## Limitations
+
+- Temporal snapshots consume memory proportional to the number of snapshots recorded. No automatic GC policy yet.
+- `AS_OF` requires at least one `TEMPORAL.SNAPSHOT_AT` recorded at or before the requested timestamp.
+- Bi-temporal fields are currently limited to graph entities (nodes/edges). KV temporal versioning uses a sparse index.

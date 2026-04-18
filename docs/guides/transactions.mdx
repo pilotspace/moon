@@ -1,0 +1,83 @@
+---
+title: "Cross-store transactions"
+description: "Atomic writes across KV, vector, and graph stores with TXN.BEGIN/COMMIT/ABORT."
+keywords: ["transactions", "acid", "txn", "cross-store", "atomicity", "rollback"]
+---
+
+Moon provides cross-store ACID transactions via `TXN.BEGIN`, `TXN.COMMIT`, and `TXN.ABORT`. These enable atomic writes that span KV operations, vector auto-indexing, graph mutations, and message queue enqueues — all committed or rolled back as a unit.
+
+<Warning>
+Cross-store transactions (`TXN.*`) cannot be mixed with Redis `MULTI`/`EXEC` blocks. Starting a `TXN` while in a `MULTI` block (or vice versa) returns an error.
+</Warning>
+
+## Quick start
+
+```bash
+redis-cli -p 6379
+
+# Start a transaction
+127.0.0.1:6379> TXN BEGIN
+OK
+
+# KV writes are buffered in write intents
+127.0.0.1:6379> SET user:1 alice
+OK
+
+# Vector auto-index is deferred until commit
+127.0.0.1:6379> HSET doc:1 title "Hello" vec <vector_bytes>
+(integer) 2
+
+# Graph mutations are recorded as intents
+127.0.0.1:6379> GRAPH.ADDNODE social alice Person '{"name":"Alice"}'
+(integer) 1
+
+# Commit all changes atomically
+127.0.0.1:6379> TXN COMMIT
+OK
+```
+
+## Commands
+
+| Command | Description |
+|---------|-------------|
+| `TXN BEGIN` | Start a new cross-store transaction. Returns `+OK` or error if already in a transaction |
+| `TXN COMMIT` | Commit all buffered changes atomically. Writes a WAL record for crash recovery |
+| `TXN ABORT` | Roll back all changes via undo-log replay. Releases all write intents |
+
+## How it works
+
+1. **TXN BEGIN** creates a `CrossStoreTxn` on the connection, initializing an undo log and intent buffers for KV, vector, and graph stores.
+
+2. **During the transaction**, writes are intercepted:
+   - **KV writes**: Applied immediately but recorded in the undo log (before-images) for rollback.
+   - **Vector writes**: HNSW index inserts are deferred as `DeferredHnswInserts` — the hash field is written, but the vector is not inserted into the HNSW graph until commit.
+   - **Graph writes**: Entity modifications are recorded as graph intents.
+   - **MQ writes**: `MQ PUBLISH` enqueues are buffered as `MqIntent` entries.
+
+3. **TXN COMMIT** applies deferred vector inserts, flushes MQ intents, writes a `XactCommit` WAL record, and clears the transaction state.
+
+4. **TXN ABORT** replays the undo log in reverse to restore before-images, discards all deferred intents, writes a `XactAbort` WAL record, and clears state.
+
+## Crash recovery
+
+Transaction WAL records (`XactBegin` 0x33, `XactCommit` 0x34, `XactAbort` 0x37) are replayed on startup. Uncommitted transactions (begin without commit/abort) are automatically rolled back during recovery.
+
+## Limitations
+
+- Transactions are **connection-scoped** — a single client connection can have at most one active transaction.
+- Cannot nest transactions or mix with `MULTI`/`EXEC`.
+- Cross-shard atomicity relies on the WAL commit record — there is no two-phase commit across shards.
+
+## Python SDK
+
+```python
+from moondb import MoonClient
+
+client = MoonClient(host="localhost", port=6379)
+
+# Cross-store transactions use raw command execution
+client.execute_command("TXN", "BEGIN")
+client.set("user:1", "alice")
+client.hset("doc:1", mapping={"title": "Hello", "vec": vector_bytes})
+client.execute_command("TXN", "COMMIT")
+```

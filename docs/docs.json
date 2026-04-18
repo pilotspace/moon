@@ -44,6 +44,13 @@
           {
             "group": "Guides",
             "pages": [
+              "guides/sdk",
+              "guides/memory-engine",
+              "guides/full-text-search",
+              "guides/transactions",
+              "guides/workspaces",
+              "guides/message-queues",
+              "guides/temporal",
               "guides/persistence",
               "guides/clustering",
               "guides/tls",

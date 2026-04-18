@@ -7,7 +7,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/pilotspace/moon/releases/tag/v0.1.6"><img src="https://img.shields.io/badge/version-v0.1.6-blue" alt="Version"></a>
+  <a href="https://github.com/pilotspace/moon/releases/tag/v0.1.8"><img src="https://img.shields.io/badge/version-v0.1.8-blue" alt="Version"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="License"></a>
   <img src="https://img.shields.io/badge/status-experimental-orange" alt="Status">
   <img src="https://img.shields.io/badge/rust-edition%202024-orange" alt="Rust">
@@ -28,7 +28,7 @@
 
 ---
 
-Moon speaks the Redis wire protocol (RESP2/RESP3) and implements 200+ commands. It runs on **Linux** (io_uring via monoio) and **macOS** (kqueue via monoio) with a thread-per-core, shared-nothing architecture, per-shard WAL, tiered disk offload, an in-process vector search engine, a property graph engine with Cypher subset, and an embedded web console. Any Redis client connects out of the box.
+Moon speaks the Redis wire protocol (RESP2/RESP3) and implements 230+ commands. It runs on **Linux** (io_uring via monoio) and **macOS** (kqueue via monoio) with a thread-per-core, shared-nothing architecture, per-shard WAL, tiered disk offload, an in-process vector search engine with BM25 full-text search, a property graph engine with Cypher subset, cross-store ACID transactions, workspace partitioning, durable message queues, bi-temporal MVCC, and an embedded web console. Any Redis client connects out of the box.
 
 ## Why Moon
 
@@ -38,7 +38,12 @@ Moon speaks the Redis wire protocol (RESP2/RESP3) and implements 200+ commands. 
 - **Tiered disk offload.** Keys evicted under `maxmemory` spill to NVMe instead of being deleted, with async write and read-through. 100% crash recovery across all tiers.
 - **Memory-optimized types.** `CompactKey` (23-byte SSO), `CompactValue` (16-byte SSO with inline TTL), `HeapString`, B+ tree sorted sets, and per-request bumpalo arenas — **27–35% less RSS** than Redis at 1 KB+ values.
 - **In-process vector search.** `FT.CREATE` / `FT.SEARCH` with HNSW + TurboQuant 4/8-bit quantization. **12.7K search QPS** at 384d COSINE on GCloud x86_64.
+- **BM25 full-text search.** `FT.AGGREGATE` with GROUPBY/REDUCE, typo tolerance (Levenshtein fuzzy), TAG and NUMERIC field types, HIGHLIGHT/SUMMARIZE, and three-way RRF hybrid fusion (BM25 + dense + sparse).
 - **Property graph engine.** 14 `GRAPH.*` commands with Cypher subset, hybrid graph+vector queries, SIMD-accelerated traversal, and memory-mapped CSR segments. **23× FalkorDB insert, 2.4× Cypher QPS.**
+- **Cross-store ACID transactions.** `TXN.BEGIN` / `TXN.COMMIT` / `TXN.ABORT` for atomic writes across KV, vector, and graph stores with undo-log rollback.
+- **Workspace partitioning.** `WS CREATE` / `WS AUTH` — multi-tenant namespace isolation with transparent key prefixing and per-shard registries.
+- **Durable message queues.** `MQ CREATE` / `MQ PUSH` / `MQ POP` / `MQ ACK` — at-least-once delivery with dead-letter queues, debounced triggers, and WAL-backed crash recovery.
+- **Bi-temporal MVCC.** `TEMPORAL.SNAPSHOT_AT` / `TEMPORAL.INVALIDATE` — point-in-time queries across KV (`FT.SEARCH AS_OF`) and graph (`GRAPH.QUERY VALID_AT`).
 - **Embedded web console.** 7-view React UI (Dashboard, Browser, Console, Vectors, Graph, Memory) served at `/ui/` — zero deployment, one binary. REST + WebSocket + SSE gateway with Bearer auth and rate limiting.
 
 <p align="center">
@@ -244,17 +249,22 @@ GRAPH.QUERY social "MATCH (a:Person)-[:FOLLOWS]->(b) RETURN a.name, b.name"
 | **Networking** | RESP2/RESP3, HELLO negotiation, TLS 1.3 (rustls + aws-lc-rs), mTLS, pipelining, client-side caching |
 | **Clustering** | 16,384 hash slots, gossip, MOVED/ASK, live slot migration, PSYNC2 replication, majority-vote failover |
 | **Scripting & security** | Lua 5.4 (EVAL/EVALSHA), ACL users/keys/channels/commands, protected mode |
-| **Vector search** | `FT.CREATE`/`FT.SEARCH`, HNSW + TurboQuant 4-bit, auto-indexing on `HSET` |
+| **Vector search** | `FT.CREATE`/`FT.SEARCH`/`FT.AGGREGATE`, HNSW + TurboQuant 4-bit, auto-indexing on `HSET`, hybrid dense+sparse+BM25 |
+| **Full-text search** | BM25 inverted index, typo tolerance (Levenshtein), TAG and NUMERIC fields, HIGHLIGHT/SUMMARIZE, three-way RRF fusion |
 | **Graph engine** | 14 `GRAPH.*` commands, Cypher subset (MATCH/WHERE/RETURN/CREATE/DELETE/SET/MERGE), hybrid graph+vector queries, CSR segments, SIMD cosine |
+| **Transactions** | `MULTI`/`EXEC` (Redis compat) + `TXN.BEGIN`/`TXN.COMMIT`/`TXN.ABORT` (cross-store ACID with undo-log rollback) |
+| **Workspaces** | `WS CREATE`/`WS AUTH`/`WS LIST` — multi-tenant namespace isolation with transparent key prefixing |
+| **Message queues** | `MQ CREATE`/`MQ PUSH`/`MQ POP`/`MQ ACK` — durable queues with dead-letter, triggers, WAL recovery |
+| **Temporal** | `TEMPORAL.SNAPSHOT_AT`/`TEMPORAL.INVALIDATE` — bi-temporal MVCC for KV and graph point-in-time queries |
 | **Web console** | Dashboard, Browser, Console, Vector Explorer, Graph Explorer, Memory view — embedded in binary, served at `/ui/` |
-| **Observability** | `INFO`, `SLOWLOG`, `COMMAND DOCS`, `OBJECT`, `DEBUG`, `MEMORY`, structured `tracing` logs |
+| **Observability** | `INFO`, `SLOWLOG`, `COMMAND DOCS`, `OBJECT`, `DEBUG`, `MEMORY`, Prometheus metrics, structured `tracing` logs |
 
-Full command list: [docs/commands.mdx](docs/commands.mdx). Configuration flags: [docs/configuration.mdx](docs/configuration.mdx). Architecture deep-dive: [docs/architecture.mdx](docs/architecture.mdx).
+Full command list: [docs/commands.mdx](docs/commands.mdx). Configuration flags: [docs/configuration.mdx](docs/configuration.mdx). Architecture deep-dive: [docs/architecture.mdx](docs/architecture.mdx). Guides: [transactions](docs/guides/transactions.mdx), [workspaces](docs/guides/workspaces.mdx), [message queues](docs/guides/message-queues.mdx), [temporal queries](docs/guides/temporal.mdx), [full-text search](docs/guides/full-text-search.mdx).
 
 ## Development
 
 ```bash
-# Unit tests (2,613+ tests)
+# Unit tests (2,797+ tests)
 cargo test --lib
 
 # Full CI matrix (native macOS + Linux via OrbStack)
@@ -282,10 +292,15 @@ Moon is pre-1.0 and **experimental**. Current focus:
 - GPU-accelerated vector search (CUDA, feature-gated)
 - Production hardening and SLO validation (see [docs/PRODUCTION-CONTRACT.md](docs/PRODUCTION-CONTRACT.md))
 
-Completed in v0.1.0–v0.1.6:
+Completed in v0.1.0–v0.1.8:
 - Tiered disk offload (RAM → NVMe) with 100% crash recovery
 - In-process vector search (HNSW + TurboQuant 4/8-bit) with `FT.*` API
+- BM25 full-text search with three-way hybrid fusion (BM25 + dense + sparse)
 - Property graph engine with Cypher subset (14 `GRAPH.*` commands)
+- Cross-store ACID transactions (`TXN.BEGIN`/`COMMIT`/`ABORT`) across KV, vector, and graph
+- Workspace partitioning for multi-tenant namespace isolation
+- Durable message queues with dead-letter and debounced triggers
+- Bi-temporal MVCC for point-in-time KV and graph queries
 - Web console (7 views, embedded in binary)
 - macOS support (aarch64 + x86_64, both runtimes)
 - Thread-per-core dispatch optimization (5.11M GET/s on x86_64)

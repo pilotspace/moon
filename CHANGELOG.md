@@ -6,6 +6,80 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.8] — 2026-04-18
+
+### Added — Cross-Store ACID Transactions (Phases 157, 161-163)
+
+- **TXN.BEGIN**: Start a cross-store transaction — buffers KV, vector, and graph writes as intents.
+- **TXN.COMMIT**: Commit all changes atomically with WAL record (`XactCommit` 0x34) for crash recovery.
+- **TXN.ABORT**: Roll back all changes via undo-log replay with before-images.
+- **KvWriteIntents**: Sparse MVCC side-table for uncommitted KV writes during transactions.
+- **DeferredHnswInserts**: Vector index inserts deferred until commit, avoiding partial graph states.
+- **UndoLog**: SmallVec-based KV rollback with before-image recording for all mutation types.
+- **WAL transaction records**: `XactBegin` (0x33), `XactCommit` (0x34), `XactAbort` (0x37) with crash recovery replay.
+- **Mutual exclusion**: `TXN` and `MULTI/EXEC` cannot be mixed (enforced at handler level).
+
+### Added — Bi-Temporal MVCC (Phase 158)
+
+- **TEMPORAL.SNAPSHOT_AT**: Record wall-clock → WAL LSN binding for point-in-time queries.
+- **TEMPORAL.INVALIDATE**: Set `valid_to` on a graph entity (NODE or EDGE) for temporal visibility control.
+- **FT.SEARCH AS_OF**: Query vector indexes at a historical timestamp via LSN resolution.
+- **GRAPH.QUERY VALID_AT**: Execute Cypher queries against graph state valid at a specific timestamp.
+- **TemporalRegistry**: BTreeMap-backed wall-clock → LSN mappings with O(log n) range lookups.
+- **TemporalKvIndex**: Sparse versioned KV index with lazy initialization.
+- **CSR segment format v2**: Bi-temporal `NodeMeta` with `valid_from`/`valid_to` fields.
+- **WAL temporal records**: `TemporalUpsert` (0x35) and `GraphTemporal` (0x36) for crash recovery.
+
+### Added — Workspace Partitioning (Phase 159)
+
+- **WS CREATE**: Create a workspace with UUID v7 (time-ordered, 74-bit random). Name max 64 bytes.
+- **WS DROP**: Delete a workspace and its registry entry.
+- **WS AUTH**: Bind a connection to a workspace — all subsequent commands transparently prefixed.
+- **WS INFO**: Return workspace metadata (name, creation timestamp).
+- **WS LIST**: Enumerate all registered workspaces.
+- **Transparent key rewriting**: `workspace_rewrite_args()` injects `{ws_hex}:` hash tag prefix on key arguments and strips it from responses.
+- **WorkspaceRegistry**: Per-shard metadata with creation timestamps and WAL persistence.
+
+### Added — Durable Message Queues (Phase 160)
+
+- **MQ CREATE**: Create a durable queue with `MAXDELIVERY` (default 3) and `DEBOUNCE` options.
+- **MQ PUSH**: Enqueue messages with field/value pairs (returns stream ID).
+- **MQ POP**: Claim messages with optional `COUNT` (defaults to 1). Increments delivery counter.
+- **MQ ACK**: Acknowledge messages by stream ID.
+- **MQ DLQLEN**: Return dead-letter queue depth.
+- **MQ TRIGGER**: Register debounced trigger callbacks with configurable debounce interval.
+- **MQ PUBLISH**: Transactional enqueue within a `TXN` block — applied on `TXN COMMIT`.
+- **Dead-letter queue**: Automatic DLQ at `{queue_key}::mq:dlq` after exceeding `MAXDELIVERY` attempts.
+- **TriggerRegistry**: Debounced callback execution via pub/sub publish.
+- **WAL recovery**: `replay_mq_wal()` with cursor rollback for durable queue state restoration.
+
+### Added — Handler Parity
+
+- All TXN/TEMPORAL/MQ/WS commands wired into `handler_monoio.rs`, `handler_sharded.rs`, `uring_handler.rs`, and `handler_single.rs`.
+- 12 KV transaction integration tests, 14 MQ integration tests, workspace cross-shard dispatch tests.
+- TEMPORAL/MQ/WS/TXN entries added to `test-commands.sh` and `test-consistency.sh`.
+
+## [0.1.7] — 2026-04-17
+
+### Added — BM25 Full-Text Search Engine (Phases 149-156)
+
+- **BM25 inverted index**: Full-text search with multi-field boosting and per-field term frequency tracking.
+- **TEXT field type**: Unicode tokenization with stemming and normalization in `FT.CREATE`.
+- **TAG field type**: Categorical tag filtering with multi-value support (`@field:{val1|val2}`).
+- **NUMERIC field type**: Range filtering (`@field:[min max]`) in `FT.CREATE` and `FT.SEARCH`.
+- **FT.AGGREGATE**: Aggregation pipeline with `GROUPBY`/`REDUCE`, scatter-gather across shards, HLL `COUNT_DISTINCT`.
+- **Three-way RRF hybrid fusion**: Combines BM25 + dense vector + sparse vector results via Reciprocal Rank Fusion.
+- **Typo tolerance**: FST Levenshtein fuzzy matching (`%%term%%`) and prefix search (`term*`).
+- **HIGHLIGHT/SUMMARIZE**: Post-processors for formatting search results with matched term highlighting.
+- **Multi-shard DFS global IDF**: Distributed frequency statistics for accurate BM25 scoring regardless of shard count.
+- **FT.DROPINDEX DD**: Atomic index + document deletion flag — deletes all hash keys matching index prefixes.
+- **Python SDK text module**: `client.text.text_search()`, `client.text.aggregate()`, `client.text.hybrid_search()` with typed pipeline DSL.
+- **LangChain/LlamaIndex hybrid adapters**: Framework integrations updated for three-way hybrid search.
+
+### Statistics
+
+- 8 phases (149-156), 27 plans, 26 requirements, 122 commits.
+
 ## [0.1.6] — 2026-04-15
 
 ### Added — AI-Native Data Primitives

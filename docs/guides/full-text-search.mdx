@@ -1,0 +1,147 @@
+---
+title: "Full-text search"
+description: "BM25 text search with hybrid fusion, FT.AGGREGATE, and typo tolerance."
+keywords: ["full-text", "bm25", "search", "aggregate", "text", "hybrid", "fuzzy"]
+---
+
+Moon v0.1.7 added BM25 full-text search alongside existing vector search. Create indexes with `TEXT`, `TAG`, and `NUMERIC` fields, run full-text queries with typo tolerance, and combine BM25 + dense vector + sparse vector results via three-way Reciprocal Rank Fusion (RRF).
+
+## Quick start
+
+```bash
+redis-cli -p 6379
+
+# Create an index with text, tag, numeric, and vector fields
+127.0.0.1:6379> FT.CREATE articles ON HASH PREFIX 1 "article:" SCHEMA \
+    title TEXT WEIGHT 2.0 \
+    body TEXT \
+    category TAG \
+    views NUMERIC \
+    emb VECTOR HNSW 6 TYPE FLOAT32 DIM 384 DISTANCE_METRIC COSINE
+
+# Insert documents (auto-indexed on HSET)
+127.0.0.1:6379> HSET article:1 title "Introduction to Rust" \
+    body "Rust is a systems programming language..." \
+    category "programming" views 1500 emb <vector_bytes>
+
+# Full-text search
+127.0.0.1:6379> FT.SEARCH articles "rust programming" LIMIT 0 10
+
+# Fuzzy search (typo tolerance)
+127.0.0.1:6379> FT.SEARCH articles "%%programing%%" LIMIT 0 5
+
+# Prefix search
+127.0.0.1:6379> FT.SEARCH articles "prog*" LIMIT 0 5
+
+# Tag filter
+127.0.0.1:6379> FT.SEARCH articles "@category:{programming}" LIMIT 0 10
+
+# Numeric range filter
+127.0.0.1:6379> FT.SEARCH articles "@views:[1000 +inf]" LIMIT 0 10
+```
+
+## Field types
+
+| Type | Description | Filter syntax |
+|------|-------------|---------------|
+| `TEXT` | BM25 full-text with stemming and normalization. Optional `WEIGHT` boost | Free text query terms |
+| `TAG` | Categorical multi-value tags | `@field:{value}` or `@field:{val1\|val2}` |
+| `NUMERIC` | Numeric range filtering | `@field:[min max]` |
+| `VECTOR` | HNSW + TurboQuant dense vectors | `*=>[KNN k @field $param]` |
+
+## FT.AGGREGATE
+
+Aggregation pipeline with scatter-gather across shards.
+
+```bash
+# Group articles by category, count and average views
+127.0.0.1:6379> FT.AGGREGATE articles "*" \
+    GROUPBY 1 @category \
+    REDUCE COUNT 0 AS total \
+    REDUCE AVG 1 @views AS avg_views \
+    SORTBY 2 @total DESC \
+    LIMIT 0 10
+```
+
+### Available reducers
+
+| Reducer | Description |
+|---------|-------------|
+| `COUNT` | Count documents in group |
+| `SUM` | Sum a numeric field |
+| `AVG` | Average a numeric field |
+| `MIN` / `MAX` | Min/max of a numeric field |
+| `COUNT_DISTINCT` | HyperLogLog approximate distinct count |
+
+## Hybrid fusion (three-way RRF)
+
+Combine BM25 text scores, dense vector scores, and sparse vector scores using Reciprocal Rank Fusion:
+
+```bash
+# Hybrid search: BM25 text + dense vector + sparse vector
+127.0.0.1:6379> FT.SEARCH articles "machine learning" \
+    "*=>[KNN 10 @emb $q]" \
+    SPARSE @sparse_emb $sq \
+    PARAMS 4 q <dense_vec> sq <sparse_vec> \
+    LIMIT 0 10 DIALECT 2
+```
+
+RRF merges ranked lists by reciprocal rank: `score = Σ 1/(k + rank_i)` where `k=60` (default). This produces robust results even when individual scoring functions have different scales.
+
+## HIGHLIGHT and SUMMARIZE
+
+Format search results with highlighted matches and text summaries:
+
+```bash
+127.0.0.1:6379> FT.SEARCH articles "rust" \
+    HIGHLIGHT FIELDS 1 title TAGS "<b>" "</b>" \
+    SUMMARIZE FIELDS 1 body LEN 50 \
+    LIMIT 0 5
+```
+
+## Typo tolerance
+
+Moon uses FST (Finite State Transducer) based Levenshtein automata for fuzzy matching:
+
+- **Exact match**: `rust` — matches "rust" only
+- **Fuzzy match**: `%%rustt%%` — matches "rust" (edit distance 1)
+- **Prefix match**: `prog*` — matches "programming", "progress", etc.
+
+## Multi-shard distributed IDF
+
+BM25 scoring requires global Inverse Document Frequency (IDF). Moon implements DFS (Distributed Frequency Statistics) — each shard reports local term frequencies, which are aggregated before scoring. This ensures accurate BM25 rankings regardless of shard count.
+
+## Python SDK
+
+```python
+from moondb import MoonClient
+from moondb.types import GroupBy, Count, Avg, SortBy, Limit
+
+client = MoonClient(host="localhost", port=6379)
+
+# Full-text search
+results = client.text.search("articles", "rust programming", limit=10)
+for hit in results:
+    print(f"{hit.key}: {hit.score:.4f} - {hit.fields}")
+
+# Aggregation
+pipeline = [
+    GroupBy("@category", reducers=[Count(as_name="total"), Avg("@views", as_name="avg_views")]),
+    SortBy("@total", order="DESC"),
+    Limit(0, 10),
+]
+result = client.text.aggregate("articles", "*", steps=pipeline)
+```
+
+See [sdk/python/README.md](https://github.com/pilotspace/moon/tree/main/sdk/python) for the full text search API.
+
+## FT.DROPINDEX DD
+
+Delete an index and all its documents atomically:
+
+```bash
+127.0.0.1:6379> FT.DROPINDEX articles DD
+OK
+```
+
+The `DD` flag deletes all hash keys matching the index's prefixes. Without `DD`, only the index metadata is removed — documents remain.

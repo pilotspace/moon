@@ -71,6 +71,9 @@ All options are available as command-line flags. Run `moon --help` for the full 
   --tls-port 6380 \
   --tls-cert-file /etc/moon/server.crt \
   --tls-key-file /etc/moon/server.key \
+  --admin-port 9100 \
+  --console-auth-required \
+  --console-auth-secret "$ADMIN_SECRET" \
   --shards 8 \
   --requirepass "$REDIS_PASSWORD" \
   --appendonly yes \
@@ -80,6 +83,59 @@ All options are available as command-line flags. Run `moon --help` for the full 
   --maxmemory-policy allkeys-lfu \
   --aclfile /etc/moon/users.acl
 ```
+
+## Web console
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--admin-port` | `0` (disabled) | Admin/metrics HTTP port. Serves `/metrics`, `/healthz`, `/readyz`, and web console at `/ui/` |
+| `--console-auth-required` | `false` | Require Bearer/HMAC auth on the admin/console HTTP port |
+| `--console-auth-secret` | *(ephemeral)* | HMAC-SHA256 secret for token verification. Empty = auto-generated at startup |
+| `--console-cors-origin` | `localhost:5173` | CORS origin allowlist (repeatable). `*` only allowed without auth |
+| `--console-rate-limit` | `1000` | Per-IP rate limit in requests/sec on the admin port |
+| `--console-rate-burst` | `2000` | Token-bucket burst capacity for the rate limiter |
+
+## Performance tuning
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--maxclients` | `10000` | Maximum simultaneous client connections (0 = unlimited) |
+| `--timeout` | `0` (disabled) | Close idle connections after N seconds |
+| `--tcp-keepalive` | `300` | TCP keepalive interval in seconds (0 = disabled) |
+| `--slowlog-log-slower-than` | `10000` | Slowlog threshold in microseconds |
+| `--slowlog-max-len` | `128` | Maximum slowlog entries |
+| `--uring-sqpoll` | *(disabled)* | io_uring SQPOLL idle timeout in ms. Requires CAP_SYS_NICE. Linux only |
+
+## Disk offload (tiered storage)
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--disk-offload` | `enable` | Enable disk offload (RAM → mmap → NVMe) |
+| `--disk-offload-dir` | *(same as `--dir`)* | Directory for disk offload files |
+| `--disk-offload-threshold` | `0.85` | RAM pressure threshold to trigger offload (0.0-1.0) |
+| `--segment-warm-after` | `3600` | Seconds before sealed segments transition to warm tier |
+
+## WAL (Write-Ahead Log)
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--wal-fpi` | `enable` | Enable Full Page Images for torn page defense |
+| `--wal-compression` | `lz4` | FPI compression codec |
+| `--wal-segment-size` | `16mb` | WAL segment file size |
+| `--max-wal-size` | `256mb` | Max WAL size before triggering checkpoint |
+| `--checkpoint-timeout` | `300` | Checkpoint timeout in seconds |
+| `--checkpoint-completion` | `0.9` | Fraction of checkpoint interval for dirty page flush (0.0-1.0) |
+| `--pagecache-size` | *(25% maxmemory)* | PageCache memory budget (e.g., `256mb`, `1gb`) |
+
+## Vector search tuning
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--vec-codes-mlock` | `enable` | mlock vector code pages into RAM |
+| `--vec-diskann-beam-width` | `8` | DiskANN beam width for disk-resident search (reserved) |
+| `--vec-diskann-cache-levels` | `3` | HNSW upper levels cached for DiskANN hybrid (reserved) |
+| `--segment-cold-after` | `86400` | Seconds before warm segments transition to cold tier (reserved) |
+| `--segment-cold-min-qps` | `0.1` | QPS threshold for cold candidates (reserved) |
 
 ## Tips
 
