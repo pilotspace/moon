@@ -15,8 +15,8 @@ pub enum UndoRecord {
     Insert { key: Bytes },
     /// Key had this entry before write - restore on rollback.
     Update { key: Bytes, old_entry: Entry },
-    /// Key was deleted - no rollback action needed (already gone).
-    Delete { key: Bytes },
+    /// Key was deleted — restore old_entry on rollback.
+    Delete { key: Bytes, old_entry: Entry },
 }
 
 /// Per-transaction undo log.
@@ -47,10 +47,10 @@ impl UndoLog {
         self.records.push(UndoRecord::Update { key, old_entry });
     }
 
-    /// Record a delete (key will be removed - no rollback needed).
+    /// Record a delete (captures before-image for rollback).
     #[inline]
-    pub fn record_delete(&mut self, key: Bytes) {
-        self.records.push(UndoRecord::Delete { key });
+    pub fn record_delete(&mut self, key: Bytes, old_entry: Entry) {
+        self.records.push(UndoRecord::Delete { key, old_entry });
     }
 
     /// Number of records in the undo log.
@@ -115,5 +115,26 @@ mod tests {
                 Bytes::from_static(b"a"),
             ]
         );
+    }
+
+    #[test]
+    fn test_delete_undo_captures_entry() {
+        use crate::storage::entry::Entry;
+        let mut log = UndoLog::new();
+        let old = Entry::new_string(Bytes::from_static(b"original_value"));
+        log.record_delete(Bytes::from_static(b"mykey"), old);
+        assert_eq!(log.len(), 1);
+
+        let records: Vec<_> = log.into_rollback_order().collect();
+        match &records[0] {
+            UndoRecord::Delete { key, old_entry } => {
+                assert_eq!(key.as_ref(), b"mykey");
+                assert_eq!(
+                    old_entry.value.as_bytes().expect("string value"),
+                    b"original_value"
+                );
+            }
+            _ => panic!("expected Delete"),
+        }
     }
 }

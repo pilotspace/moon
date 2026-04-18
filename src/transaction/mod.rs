@@ -86,10 +86,10 @@ impl CrossStoreTxn {
         self.kv_undo.record_update(key, old_entry);
     }
 
-    /// Record a KV delete.
+    /// Record a KV delete (captures before-image for rollback).
     #[inline]
-    pub fn record_kv_delete(&mut self, key: Bytes) {
-        self.kv_undo.record_delete(key);
+    pub fn record_kv_delete(&mut self, key: Bytes, old_entry: crate::storage::entry::Entry) {
+        self.kv_undo.record_delete(key, old_entry);
     }
 
     /// Record a vector modification.

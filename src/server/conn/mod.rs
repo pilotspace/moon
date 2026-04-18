@@ -70,8 +70,11 @@ pub(crate) fn record_txn_kv_write(
     is_delete: bool,
 ) {
     if is_delete {
-        // Record delete (no rollback action needed - key is being removed)
-        txn.record_kv_delete(key.clone());
+        // Capture before-image so TXN.ABORT can restore the deleted key.
+        if let Some(old_entry) = db.get(key) {
+            txn.record_kv_delete(key.clone(), old_entry.clone());
+        }
+        // If the key doesn't exist, a delete is a no-op — nothing to undo.
     } else {
         // Check if key exists for insert vs update
         match db.get(key) {
