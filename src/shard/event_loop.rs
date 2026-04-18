@@ -1155,9 +1155,16 @@ impl super::Shard {
                 _ = block_timeout_interval.0.tick() => {
                     timers::expire_blocked_clients(&blocking_rc);
                 }
-                // Cooperative active expiry
+                // Cooperative active expiry + MQ triggers
                 _ = expiry_interval.0.tick() => {
                     timers::run_active_expiry(&shard_databases, shard_id);
+                    // MQ trigger check: fire debounced triggers
+                    timers::fire_pending_mq_triggers(
+                        &shard_databases,
+                        shard_id,
+                        cached_clock.ms(),
+                        &pubsub_arc,
+                    );
                 }
                 // Background eviction timer + memory pressure cascade
                 _ = eviction_interval.0.tick() => {
@@ -1541,7 +1548,7 @@ impl super::Shard {
                 if monoio_tick_counter % 10 == 0 {
                     timers::expire_blocked_clients(&blocking_rc);
                 }
-                // expiry + eviction: every 100ms (100 ticks)
+                // expiry + eviction + MQ triggers: every 100ms (100 ticks)
                 if monoio_tick_counter % 100 == 0 {
                     timers::run_active_expiry(&shard_databases, shard_id);
                     persistence_tick::run_eviction_tick(
@@ -1555,6 +1562,13 @@ impl super::Shard {
                         &mut next_file_id,
                         &mut wal_v3_writer,
                         &spill_file_id,
+                    );
+                    // MQ trigger check: fire debounced triggers
+                    timers::fire_pending_mq_triggers(
+                        &shard_databases,
+                        shard_id,
+                        cached_clock.ms(),
+                        &pubsub_arc,
                     );
                 }
                 // WAL fsync: every 1s (1000 ticks)
