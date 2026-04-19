@@ -1410,6 +1410,18 @@ fn auto_index_hset(
         return;
     }
 
+    // Allocate ONE monotonic insert_lsn per HSET so the MVCC visibility rule
+    // at src/vector/mvcc/visibility.rs filters these inserts out of snapshots
+    // captured before this call (required for FT.SEARCH AS_OF and TXN snapshot
+    // isolation — see Plan 165-03 TEMP-04/ACID-09). Allocation is skipped when
+    // no vector index matches: saves a counter bump on the common-case HSET.
+    // Borrow must complete before `get_index_mut` reborrows vector_store.
+    let insert_lsn = if matching_names.is_empty() {
+        0
+    } else {
+        vector_store.txn_manager_mut().allocate_lsn()
+    };
+
     for idx_name in matching_names {
         let idx = match vector_store.get_index_mut(&idx_name) {
             Some(i) => i,
@@ -1433,10 +1445,12 @@ fn auto_index_hset(
 
             if field_idx == 0 {
                 // Default field: use existing top-level segments
-                handle_vector_insert(idx, key, args, &field_name, dim, key_hash);
+                handle_vector_insert(idx, key, args, &field_name, dim, key_hash, insert_lsn);
             } else {
                 // Additional field: use field_segments
-                handle_vector_insert_field(idx, &field_name, key, args, dim, key_hash);
+                handle_vector_insert_field(
+                    idx, &field_name, key, args, dim, key_hash, insert_lsn,
+                );
             }
             any_vector_inserted = true;
         }
@@ -1503,6 +1517,7 @@ fn handle_vector_insert(
     source_field: &bytes::Bytes,
     dim: usize,
     key_hash: u64,
+    insert_lsn: u64,
 ) {
     let blob = match find_vector_blob(args, source_field, dim) {
         Some(b) => b.clone(),
@@ -1523,9 +1538,12 @@ fn handle_vector_insert(
     idx.key_hash_to_key
         .entry(key_hash)
         .or_insert_with(|| bytes::Bytes::copy_from_slice(key));
-    // Append to mutable segment
+    // Append to mutable segment. `insert_lsn` is the monotonic LSN allocated
+    // by `auto_index_hset`; MVCC visibility (src/vector/mvcc/visibility.rs)
+    // compares against query snapshot_lsn to enforce FT.SEARCH AS_OF and
+    // TXN snapshot isolation.
     let snap = idx.segments.load();
-    let internal_id = snap.mutable.append(key_hash, &f32_vec, &sq_vec, norm, 0);
+    let internal_id = snap.mutable.append(key_hash, &f32_vec, &sq_vec, norm, insert_lsn);
     // Use global_id for payload index so filter bitmaps match
     // search results after compaction advances global_id_base.
     let global_id = snap.mutable.global_id_base() + internal_id;
@@ -1561,6 +1579,7 @@ fn handle_vector_insert_field(
     args: &[crate::protocol::Frame],
     dim: usize,
     key_hash: u64,
+    insert_lsn: u64,
 ) {
     let blob = match find_vector_blob(args, field_name, dim) {
         Some(b) => b.clone(),
@@ -1588,8 +1607,10 @@ fn handle_vector_insert_field(
         Some(fs) => fs,
         None => return, // field not found (should not happen with valid schema)
     };
+    // `insert_lsn` comes from the same allocation as the default-field insert
+    // so both fields share one logical write event (Phase 165 MVCC contract).
     let snap = fs.segments.load();
-    let _internal_id = snap.mutable.append(key_hash, &f32_vec, &sq_vec, norm, 0);
+    let _internal_id = snap.mutable.append(key_hash, &f32_vec, &sq_vec, norm, insert_lsn);
     crate::vector::metrics::add_vectors(1);
     // Note: global_id and payload_index are NOT updated here.
     // Payload is shared and managed by the default field's insert path.
