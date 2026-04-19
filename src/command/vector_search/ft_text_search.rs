@@ -1618,7 +1618,12 @@ pub(crate) fn execute_query_on_index_as_of(
     if as_of_lsn == 0 {
         return execute_query_on_index(text_index, clause, global_df, global_n, top_k);
     }
-    let oversample = top_k.saturating_mul(2).max(16);
+    // Oversample bounded by index size (doc_id_to_key.len()). The 2× variant
+    // lost recall when visible docs ranked below invisible ones — see
+    // tests/adversarial_g1_g2.rs::g1_as_of_top_k_oversample_rescues_low_ranked_visible_doc.
+    // BM25 short-circuits on empty postings so the cost is bounded by
+    // candidate_bitmap size, not index size.
+    let oversample = text_index.doc_id_to_key.len().max(top_k).max(16);
     let raw = execute_query_on_index(text_index, clause, global_df, global_n, oversample);
     let mut filtered: Vec<TextSearchResult> = raw
         .into_iter()

@@ -959,10 +959,10 @@ impl TextIndex {
     /// Implementation note: post-filter (rather than pre-filter the candidate
     /// bitmap) is a deliberate trade-off — it wastes BM25 scoring work on
     /// invisible docs in exchange for zero risk of breaking the existing
-    /// scoring path. Acceptable because (a) AS_OF is rare today (Lunaris
-    /// retrievers) and (b) BM25 is already O(candidates) so the constant
-    /// factor is modest. Pre-filter is a v0.2 optimisation if profiling
-    /// shows this hot.
+    /// scoring path. To avoid recall loss when visible docs rank behind many
+    /// invisible docs, we oversample up to `next_doc_id` (full index) when
+    /// AS_OF is active. For the no-filter path we only oversample by 2×
+    /// because there is no filter-driven recall loss.
     pub fn search_field_as_of(
         &self,
         field_idx: usize,
@@ -972,18 +972,18 @@ impl TextIndex {
         top_k: usize,
         as_of_lsn: u64,
     ) -> Vec<TextSearchResult> {
-        // When top_k is requested, filter BEFORE truncation so we don't
-        // silently lose visible hits ranked above invisible ones. We
-        // oversample by calling search_field with `top_k.saturating_mul(2)`
-        // and a minimum of 16 to keep recall stable.
-        let oversample = top_k.saturating_mul(2).max(16);
-        let raw = self.search_field(field_idx, query_terms, global_df, global_n, oversample);
         if as_of_lsn == 0 {
-            // Need to re-truncate since we oversampled; preserves parity.
-            let mut out = raw;
-            out.truncate(top_k);
-            return out;
+            return self.search_field(field_idx, query_terms, global_df, global_n, top_k);
         }
+        // Unbounded oversample (bounded by index size) — the adversarial test
+        // `g1_as_of_top_k_oversample_rescues_low_ranked_visible_doc` proved
+        // 2× oversample is insufficient when a visible doc ranks last. We
+        // ask search_field for up to `next_doc_id` results (every doc in the
+        // index) so no visible candidate is truncated before filtering. BM25
+        // still short-circuits on empty postings, so the cost is bounded by
+        // candidate_bitmap size, not index size.
+        let oversample = (self.next_doc_id as usize).max(top_k).max(16);
+        let raw = self.search_field(field_idx, query_terms, global_df, global_n, oversample);
         let mut filtered: Vec<TextSearchResult> = raw
             .into_iter()
             .filter(|r| self.is_doc_visible_at(r.doc_id, as_of_lsn))
@@ -1004,7 +1004,16 @@ impl TextIndex {
         top_k: usize,
         as_of_lsn: u64,
     ) -> Vec<TextSearchResult> {
-        let oversample = top_k.saturating_mul(2).max(16);
+        if as_of_lsn == 0 {
+            return self.search_field_or(
+                field_idx,
+                expanded_term_ids,
+                global_df,
+                global_n,
+                top_k,
+            );
+        }
+        let oversample = (self.next_doc_id as usize).max(top_k).max(16);
         let raw = self.search_field_or(
             field_idx,
             expanded_term_ids,
@@ -1012,11 +1021,6 @@ impl TextIndex {
             global_n,
             oversample,
         );
-        if as_of_lsn == 0 {
-            let mut out = raw;
-            out.truncate(top_k);
-            return out;
-        }
         let mut filtered: Vec<TextSearchResult> = raw
             .into_iter()
             .filter(|r| self.is_doc_visible_at(r.doc_id, as_of_lsn))
