@@ -4,10 +4,12 @@
 //! a single shard. Uses undo-log for KV rollback and write-intent tracking
 //! for vector and graph operations.
 
+pub mod abort;
 pub mod commit_hooks;
 pub mod kv_mvcc;
 pub mod undo_log;
 
+pub use abort::abort_cross_store_txn;
 pub use commit_hooks::{DeferredHnswInsert, DeferredHnswInserts};
 pub use kv_mvcc::{KvWriteIntents, WriteIntent};
 pub use undo_log::{UndoLog, UndoRecord};
