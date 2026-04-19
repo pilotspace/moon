@@ -263,3 +263,104 @@ pub(crate) fn is_multi_key_command(cmd: &[u8], args: &[Frame]) -> bool {
         _ => false,
     }
 }
+
+#[cfg(test)]
+mod as_of_tests {
+    //! Unit tests for `resolve_ft_search_as_of_lsn` (TEMP-04 + ACID-09).
+    //!
+    //! Covers the five precedence branches the helper must honour:
+    //!   1. No AS_OF, no TXN            -> Ok(0)
+    //!   2. No AS_OF, TXN present       -> Ok(txn.snapshot_lsn)
+    //!   3. AS_OF present + registry hit (even when TXN present) -> Ok(lsn)
+    //!   4. AS_OF present + registry miss -> Err(Frame::Error)
+    //!   5. AS_OF present + shard_databases=None (handler_single) -> Err(Frame::Error)
+    use super::*;
+    use crate::protocol::Frame;
+    use crate::shard::shared_databases::ShardDatabases;
+    use crate::storage::Database;
+    use crate::temporal::TemporalRegistry;
+    use crate::transaction::CrossStoreTxn;
+    use bytes::Bytes;
+    use std::sync::Arc;
+
+    const ERR_BYTES: &[u8] =
+        b"ERR no temporal snapshot registered for the given AS_OF timestamp; call TEMPORAL.SNAPSHOT_AT first";
+
+    /// Build a 1-shard / 1-db `ShardDatabases` with a registered binding
+    /// `wall_ms=1_000 -> lsn=42` so tests can exercise the registry path.
+    fn build_fixture() -> Arc<ShardDatabases> {
+        let dbs = ShardDatabases::new(vec![vec![Database::new()]]);
+        {
+            let mut guard = dbs.temporal_registry(0);
+            let reg = guard.get_or_insert_with(|| Box::new(TemporalRegistry::new()));
+            reg.record(1_000, 42);
+        }
+        dbs
+    }
+
+    fn frame_bulk(bytes: &'static [u8]) -> Frame {
+        Frame::BulkString(Bytes::from_static(bytes))
+    }
+
+    /// Helper: construct a FT.SEARCH arg vec with or without AS_OF clause.
+    fn ft_search_args(as_of: Option<i64>) -> Vec<Frame> {
+        let mut args = vec![frame_bulk(b"idx"), frame_bulk(b"*")];
+        if let Some(wall_ms) = as_of {
+            args.push(frame_bulk(b"AS_OF"));
+            // parse_as_of_clause reads i64 decimal text from a BulkString.
+            args.push(Frame::BulkString(Bytes::from(wall_ms.to_string())));
+        }
+        args
+    }
+
+    #[test]
+    fn resolve_ft_search_as_of_lsn_default_returns_zero() {
+        let fixture = build_fixture();
+        let args = ft_search_args(None);
+        let got = resolve_ft_search_as_of_lsn(&args, Some(&fixture), 0, None);
+        assert_eq!(got, Ok(0));
+    }
+
+    #[test]
+    fn resolve_ft_search_as_of_lsn_uses_txn_snapshot_when_no_explicit_as_of() {
+        let fixture = build_fixture();
+        let args = ft_search_args(None);
+        let txn = CrossStoreTxn::new(1, 99);
+        let got = resolve_ft_search_as_of_lsn(&args, Some(&fixture), 0, Some(&txn));
+        assert_eq!(got, Ok(99));
+    }
+
+    #[test]
+    fn resolve_ft_search_as_of_lsn_explicit_as_of_beats_txn_snapshot() {
+        let fixture = build_fixture();
+        let args = ft_search_args(Some(1_000));
+        let txn = CrossStoreTxn::new(1, 99);
+        let got = resolve_ft_search_as_of_lsn(&args, Some(&fixture), 0, Some(&txn));
+        // Registry binding at wall_ms=1_000 is lsn=42, NOT txn.snapshot_lsn=99.
+        assert_eq!(got, Ok(42));
+    }
+
+    #[test]
+    fn resolve_ft_search_as_of_lsn_explicit_as_of_missing_snapshot_returns_err() {
+        let fixture = build_fixture();
+        // wall_ms=500 precedes the only registered binding (1_000 -> 42).
+        let args = ft_search_args(Some(500));
+        let got = resolve_ft_search_as_of_lsn(&args, Some(&fixture), 0, None);
+        match got {
+            Err(Frame::Error(msg)) => assert_eq!(msg.as_ref(), ERR_BYTES),
+            other => panic!("expected Err(Frame::Error(ERR_BYTES)), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_ft_search_as_of_lsn_explicit_as_of_with_none_registry_returns_err() {
+        // handler_single.rs has no ShardDatabases in scope -> Option::None.
+        // AS_OF cannot be resolved without a registry; surface the same ERR.
+        let args = ft_search_args(Some(1_000));
+        let got = resolve_ft_search_as_of_lsn(&args, None, 0, None);
+        match got {
+            Err(Frame::Error(msg)) => assert_eq!(msg.as_ref(), ERR_BYTES),
+            other => panic!("expected Err(Frame::Error(ERR_BYTES)), got {other:?}"),
+        }
+    }
+}
