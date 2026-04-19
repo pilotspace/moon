@@ -3966,6 +3966,21 @@ pub(crate) async fn handle_connection_sharded_monoio<
     // the runtime (unlike raw libc::shutdown which corrupts monoio state).
     let _ = stream.shutdown().await;
 
+    // Phase 166: release any leaked cross-store TXN (client disconnected mid-txn).
+    // Idempotent: TXN.ABORT already takes() active_cross_txn so this is a no-op if abort ran.
+    // Closes T-161-05 — without this, a disconnect after TXN.BEGIN + SET would leak
+    // kv_intents and pin the key invisible for all subsequent readers. Mirrors the
+    // sharded runtime block in handler_sharded.rs so both paths delegate to the same
+    // shared helper. FIN has already been sent; shard state is still intact.
+    if let Some(txn) = conn.active_cross_txn.take() {
+        crate::transaction::abort::abort_cross_store_txn(
+            &ctx.shard_databases,
+            ctx.shard_id,
+            conn.selected_db,
+            txn,
+        );
+    }
+
     // --- Disconnect cleanup: propagate unsubscribe to all shards' remote subscriber maps ---
     if conn.subscriber_id > 0 {
         let removed_channels = {
