@@ -185,20 +185,19 @@ pub fn abort_cross_store_txn(
 
     // ------------------------------------------------------------------
     // 3. Vector rollback — tombstone every mutable-HNSW entry appended
-    //    during the transaction via `mark_deleted_by_key_hash`, then
-    //    transition the TransactionManager into the ABORT state.
+    //    during the transaction. We use the txn-scoped variant
+    //    `mark_deleted_by_key_hash_after_lsn(key_hash, txn.snapshot_lsn)`
+    //    so that earlier-committed rows that happen to share the same
+    //    Redis key (same xxh64 `key_hash`) are NOT rolled back. The
+    //    method sets each matching entry's `delete_lsn = insert_lsn`,
+    //    which makes the entry invisible at every snapshot >= its own
+    //    insert LSN (per MVCC visibility) — the row "never existed" from
+    //    any reader's perspective, which is what TXN.ABORT requires.
     //    This is the core of ACID-08 (HNSW rollback).
     // ------------------------------------------------------------------
     {
+        let txn_snapshot_lsn = txn.snapshot_lsn;
         let mut vector_store = shard_databases.vector_store(shard_id);
-
-        // Allocate a rollback LSN from the vector store's own manager so
-        // MVCC visibility (`is_visible`) filters the tombstoned rows out
-        // of every reader whose `snapshot_lsn >= rollback_lsn`. Per
-        // research A4, we use `allocate_lsn()` (monotonic side-effect)
-        // rather than `current_lsn()` (read-only) so subsequent writes
-        // cannot share the rollback LSN and accidentally become visible.
-        let rollback_lsn = vector_store.txn_manager_mut().allocate_lsn();
 
         for intent in &txn.vector_intents {
             let Some(idx) = vector_store.get_index_mut(&intent.index_name) else {
@@ -211,15 +210,18 @@ pub fn abort_cross_store_txn(
                 continue;
             };
             let snap = idx.segments.load();
+            // The threshold is the transaction's snapshot LSN — only rows
+            // appended inside the txn (insert_lsn > snapshot_lsn) get
+            // tombstoned. Preserves pre-txn rows sharing the same key_hash.
             let count = snap
                 .mutable
-                .mark_deleted_by_key_hash(intent.point_id, rollback_lsn);
+                .mark_deleted_by_key_hash_after_lsn(intent.point_id, txn_snapshot_lsn);
             if count == 0 {
                 tracing::warn!(
                     txn_id,
                     index_name = ?intent.index_name,
                     point_id = intent.point_id,
-                    "txn abort: mark_deleted_by_key_hash matched zero entries (rollback may leak)",
+                    "txn abort: mark_deleted_by_key_hash_after_lsn matched zero entries (rollback may leak)",
                 );
             }
         }

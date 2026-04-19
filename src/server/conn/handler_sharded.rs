@@ -1272,40 +1272,16 @@ pub(crate) async fn handle_connection_sharded_inner<
                         match txn_abort_validate(conn.in_cross_txn()) {
                             Ok(()) => {
                                 if let Some(txn) = conn.active_cross_txn.take() {
-                                    // Replay undo log in reverse order
-                                    {
-                                        let mut db = ctx
-                                            .shard_databases
-                                            .write_db(ctx.shard_id, conn.selected_db);
-                                        for record in txn.kv_undo.into_rollback_order() {
-                                            match record {
-                                                crate::transaction::UndoRecord::Insert { key } => {
-                                                    db.remove(&key);
-                                                }
-                                                crate::transaction::UndoRecord::Update {
-                                                    key,
-                                                    old_entry,
-                                                } => {
-                                                    db.set(key, old_entry);
-                                                }
-                                                crate::transaction::UndoRecord::Delete { key, old_entry } => {
-                                                    db.set(key, old_entry);
-                                                }
-                                            }
-                                        }
-                                    }
-                                    // Abort in TransactionManager
-                                    let mut vector_store =
-                                        ctx.shard_databases.vector_store(ctx.shard_id);
-                                    vector_store.txn_manager_mut().abort(txn.txn_id);
-                                    drop(vector_store);
-
-                                    // Release KV write intents from shard side-table
-                                    ctx.shard_databases.kv_intents(ctx.shard_id).release_txn(txn.txn_id);
-
-                                    // Discard deferred HNSW inserts (prevent phantom neighbors)
-                                    ctx.shard_databases.hnsw_queue(ctx.shard_id).discard_for_txn(txn.txn_id);
-
+                                    // Shared rollback (Phase 166 Plan 03):
+                                    // KV undo -> graph intents reverse -> vector
+                                    // tombstone -> side-table release. See
+                                    // src/transaction/abort.rs for lock ordering.
+                                    crate::transaction::abort::abort_cross_store_txn(
+                                        &ctx.shard_databases,
+                                        ctx.shard_id,
+                                        conn.selected_db,
+                                        txn,
+                                    );
                                     responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
                                 } else {
                                     responses.push(Frame::Error(Bytes::from_static(

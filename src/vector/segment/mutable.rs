@@ -619,6 +619,43 @@ impl MutableSegment {
         count
     }
 
+    /// Tombstone entries matching `key_hash` whose `insert_lsn > threshold_lsn`.
+    ///
+    /// Designed for TXN.ABORT: the aborting transaction should only roll back
+    /// rows it inserted, NOT rows committed by earlier transactions that
+    /// happen to share the same Redis key (same xxh64 `key_hash`). The
+    /// `threshold_lsn` is the aborting transaction's `snapshot_lsn` — any
+    /// entry with `insert_lsn > threshold_lsn` must have been appended inside
+    /// the transaction (MVCC invariant: LSN allocated monotonically).
+    ///
+    /// Each matching entry's `delete_lsn` is set to its own `insert_lsn`,
+    /// which makes the entry invisible at every snapshot `>= insert_lsn`
+    /// (per `crate::vector::mvcc::visibility::is_visible`: the delete is
+    /// "at" the insert moment, i.e., the entry never existed from any
+    /// reader's perspective). Returns the number of entries tombstoned.
+    ///
+    /// Preserves earlier-committed entries with the same `key_hash` (e.g.,
+    /// a row inserted at T1, then mutated inside an aborted txn at T2 — the
+    /// T1 row stays visible after the T2 rollback).
+    pub fn mark_deleted_by_key_hash_after_lsn(
+        &self,
+        key_hash: u64,
+        threshold_lsn: u64,
+    ) -> u32 {
+        let mut inner = self.inner.write();
+        let mut count = 0u32;
+        for entry in inner.entries.iter_mut() {
+            if entry.key_hash == key_hash
+                && entry.delete_lsn == 0
+                && entry.insert_lsn > threshold_lsn
+            {
+                entry.delete_lsn = entry.insert_lsn;
+                count += 1;
+            }
+        }
+        count
+    }
+
     /// Set the global ID base offset. Called when replacing a compacted mutable segment
     /// with a new empty one — the new segment's IDs start from where the old one left off.
     pub fn set_global_id_base(&self, base: u32) {
