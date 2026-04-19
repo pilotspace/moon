@@ -3497,19 +3497,27 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     // Auto-index HSET into vector/text stores (if key matches index prefix)
                     if !matches!(response, Frame::Error(_)) && cmd.eq_ignore_ascii_case(b"HSET") {
                         if let Some(key) = cmd_args.first().and_then(|f| extract_bytes(f)) {
-                            let mut vs = ctx.shard_databases.vector_store(ctx.shard_id);
-                            let mut ts = ctx.shard_databases.text_store(ctx.shard_id);
-                            // Plan 166-01: (index_name, key_hash) tuples for
-                            // vector appends; Plan 166-02 will consume this
-                            // to populate CrossStoreTxn::vector_intents so
-                            // TXN.ABORT can tombstone via MutableSegment
-                            // MVCC primitives.
-                            let _ = crate::shard::spsc_handler::auto_index_hset_public(
-                                &mut vs,
-                                &mut *ts,
-                                key.as_ref(),
-                                cmd_args,
-                            );
+                            let inserted = {
+                                let mut vs = ctx.shard_databases.vector_store(ctx.shard_id);
+                                let mut ts = ctx.shard_databases.text_store(ctx.shard_id);
+                                crate::shard::spsc_handler::auto_index_hset_public(
+                                    &mut vs,
+                                    &mut *ts,
+                                    key.as_ref(),
+                                    cmd_args,
+                                )
+                            };
+                            // Phase 166 (Plan 02): if inside an active cross-store
+                            // TXN, push one VectorIntent per (index_name, key_hash)
+                            // so TXN.ABORT (Plan 166-03) can tombstone via
+                            // MutableSegment::mark_deleted_by_key_hash. Non-TXN
+                            // paths discard the tuples — auto_index_hset already
+                            // performed the append.
+                            if let Some(txn) = conn.active_cross_txn.as_mut() {
+                                for (index_name, key_hash) in inserted {
+                                    txn.record_vector(key_hash, index_name);
+                                }
+                            }
                         }
                     }
 

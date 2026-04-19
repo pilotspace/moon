@@ -3007,16 +3007,22 @@ pub(crate) async fn handle_connection_sharded_inner<
                                 && (cmd.eq_ignore_ascii_case(b"HSET") || cmd.eq_ignore_ascii_case(b"HMSET"))
                             {
                                 if let Some(key) = cmd_args.first().and_then(|f| extract_bytes(f)) {
-                                    let mut vs = ctx.shard_databases.vector_store(ctx.shard_id);
-                                    let mut ts = ctx.shard_databases.text_store(ctx.shard_id);
-                                    // Plan 166-01: return value carries the
-                                    // `(index_name, key_hash)` pairs for any
-                                    // vector rows this HSET appended to the
-                                    // mutable segment. Plan 166-02 will consume
-                                    // it to record VectorIntents on the active
-                                    // CrossStoreTxn (enabling TXN.ABORT HNSW
-                                    // tombstoning via mark_deleted_by_key_hash).
-                                    let _ = crate::shard::spsc_handler::auto_index_hset_public(&mut vs, &mut *ts, &key, cmd_args);
+                                    let inserted = {
+                                        let mut vs = ctx.shard_databases.vector_store(ctx.shard_id);
+                                        let mut ts = ctx.shard_databases.text_store(ctx.shard_id);
+                                        crate::shard::spsc_handler::auto_index_hset_public(&mut vs, &mut *ts, &key, cmd_args)
+                                    };
+                                    // Phase 166 (Plan 02): if inside an active cross-store
+                                    // TXN, push one VectorIntent per (index_name, key_hash)
+                                    // so TXN.ABORT (Plan 166-03) can tombstone via
+                                    // MutableSegment::mark_deleted_by_key_hash. Non-TXN
+                                    // paths discard the tuples — auto_index_hset already
+                                    // performed the append.
+                                    if let Some(txn) = conn.active_cross_txn.as_mut() {
+                                        for (index_name, key_hash) in inserted {
+                                            txn.record_vector(key_hash, index_name);
+                                        }
+                                    }
                                 }
                             }
                             // Auto-delete vectors on DEL/UNLINK (local write path)
