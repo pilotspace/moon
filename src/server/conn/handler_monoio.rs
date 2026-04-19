@@ -48,6 +48,7 @@ use crate::storage::eviction::{try_evict_if_needed, try_evict_if_needed_async_sp
 use crate::tracking::TrackingState;
 
 use super::affinity::MigratedConnectionState;
+use super::shared::resolve_ft_search_as_of_lsn;
 use super::{
     apply_resp3_conversion, convert_blocking_to_nonblocking, execute_transaction_sharded,
     extract_bytes, extract_command, extract_primary_key, handle_blocking_command_monoio,
@@ -3197,23 +3198,17 @@ pub(crate) async fn handle_connection_sharded_monoio<
                         if cmd.eq_ignore_ascii_case(b"FT.CREATE") {
                             crate::command::vector_search::ft_create(&mut vs, &mut ts, cmd_args)
                         } else if cmd.eq_ignore_ascii_case(b"FT.SEARCH") {
-                            // Resolve AS_OF temporal clause to snapshot LSN (TEMP-04).
-                            let as_of_lsn = {
-                                use crate::command::vector_search::ft_search::parse::parse_as_of_clause;
-                                match parse_as_of_clause(cmd_args) {
-                                    Some(wall_ms) => {
-                                        let guard = shard_databases_ref.temporal_registry(ctx.shard_id);
-                                        match guard.as_ref().and_then(|r| r.lsn_at(wall_ms)) {
-                                            Some(lsn) => lsn,
-                                            None => {
-                                                responses.push(Frame::Error(Bytes::from_static(
-                                                    b"ERR no temporal snapshot registered for the given AS_OF timestamp; call TEMPORAL.SNAPSHOT_AT first",
-                                                )));
-                                                continue;
-                                            }
-                                        }
-                                    }
-                                    None => 0,
+                            // Resolve AS_OF temporal clause + TXN snapshot precedence (TEMP-04, ACID-09).
+                            let as_of_lsn = match resolve_ft_search_as_of_lsn(
+                                cmd_args,
+                                Some(shard_databases_ref),
+                                ctx.shard_id,
+                                conn.active_cross_txn.as_ref(),
+                            ) {
+                                Ok(lsn) => lsn,
+                                Err(err_frame) => {
+                                    responses.push(err_frame);
+                                    continue;
                                 }
                             };
                             // Detect SESSION keyword to provide database access for sorted set tracking
