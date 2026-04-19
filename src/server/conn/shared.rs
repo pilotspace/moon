@@ -14,15 +14,64 @@ use crate::command::metadata;
 use crate::command::{DispatchResult, dispatch};
 use crate::config::{RuntimeConfig, ServerConfig};
 use crate::protocol::Frame;
+use crate::shard::shared_databases::ShardDatabases;
 #[cfg(feature = "runtime-tokio")]
 use crate::storage::Database;
 use crate::storage::entry::CachedClock;
+use crate::transaction::CrossStoreTxn;
 
 use super::util::extract_command;
 
 /// Type alias for the per-database RwLock container (tokio single-thread mode only).
 #[cfg(feature = "runtime-tokio")]
 pub(crate) type SharedDatabases = Arc<Vec<parking_lot::RwLock<Database>>>;
+
+/// Resolve FT.SEARCH `as_of_lsn` with the canonical precedence (TEMP-04, ACID-09):
+///
+///   1. Explicit `AS_OF <wall_ms>` clause -> `TemporalRegistry::lsn_at(wall_ms)`.
+///   2. Active cross-store TXN            -> `txn.snapshot_lsn`.
+///   3. Default                           -> `0` (latest; visibility is
+///      `created_lsn <= snapshot_lsn`).
+///
+/// The helper is called identically by all three connection handlers
+/// (`handler_monoio.rs`, `handler_sharded.rs`, `handler_single.rs`).
+/// `shard_databases` is `Option<&ShardDatabases>` because the single-shard
+/// tokio handler has no `ShardDatabases` in scope at the FT.SEARCH call site;
+/// it passes `None`.
+///
+/// Returns `Err(Frame::Error)` with the exact bytes
+/// `b"ERR no temporal snapshot registered for the given AS_OF timestamp; call TEMPORAL.SNAPSHOT_AT first"`
+/// when `AS_OF` is present AND either:
+///   (a) `shard_databases` is `None` (no registry available to consult), OR
+///   (b) the registry has no binding at or before the requested `wall_ms`.
+///
+/// No allocations on any path: the error message is `Bytes::from_static`.
+// Intentionally unused in this plan (165-01); Plan 165-02 wires all three
+// connection handlers to this helper. Suppressed to satisfy the
+// `cargo clippy -- -D warnings` zero-warnings policy between plans.
+#[allow(dead_code)]
+#[inline]
+pub(crate) fn resolve_ft_search_as_of_lsn(
+    cmd_args: &[Frame],
+    shard_databases: Option<&ShardDatabases>,
+    shard_id: usize,
+    active_cross_txn: Option<&CrossStoreTxn>,
+) -> Result<u64, Frame> {
+    use crate::command::vector_search::ft_search::parse::parse_as_of_clause;
+    const ERR_MSG: &[u8] =
+        b"ERR no temporal snapshot registered for the given AS_OF timestamp; call TEMPORAL.SNAPSHOT_AT first";
+    if let Some(wall_ms) = parse_as_of_clause(cmd_args) {
+        let Some(shard_dbs) = shard_databases else {
+            return Err(Frame::Error(Bytes::from_static(ERR_MSG)));
+        };
+        let guard = shard_dbs.temporal_registry(shard_id);
+        return guard
+            .as_ref()
+            .and_then(|r| r.lsn_at(wall_ms))
+            .ok_or_else(|| Frame::Error(Bytes::from_static(ERR_MSG)));
+    }
+    Ok(active_cross_txn.map(|t| t.snapshot_lsn).unwrap_or(0))
+}
 
 /// Handle CONFIG GET/SET subcommands.
 pub(crate) fn handle_config(
