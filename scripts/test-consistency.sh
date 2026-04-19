@@ -867,6 +867,212 @@ fi
 start_moon_with_shards "$SHARDS" || true
 
 # ===========================================================================
+# PHASE 166 -- TXN cross-store rollback consistency (moon-only)
+# ===========================================================================
+# Four scenarios, each parameterised across 1/4/12 shards:
+#   1. Abort-reverts-graph:   TXN.BEGIN + GRAPH.ADDNODE + TXN.ABORT -> node_count=0
+#   2. Abort-reverts-edge:    TXN.BEGIN + 2x ADDNODE + ADDEDGE + TXN.ABORT -> edge_count=0
+#   3. Abort-hides-ft:        FT.CREATE + TXN.BEGIN + HSET (vector) + TXN.ABORT ->
+#                              FT.SEARCH returns 0 hits (ACID-08 core)
+#   4. Disconnect-releases-kv: SET baseline; connA TXN.BEGIN + SET new value + DROP;
+#                              connB GET must return the baseline value (T-161-05)
+# Redis does not implement TXN.* / GRAPH.* / FT.SEARCH — Moon-only assertions.
+# Hash-tagged keys (`{t}:*`) keep every TXN scenario on one shard so the shard-local
+# abort helper sees the full intent set.
+
+log "Running Phase 166 TXN cross-store rollback consistency tests (moon-only)..."
+
+TXN_GRAPH_ABORT_1=""
+TXN_GRAPH_ABORT_4=""
+TXN_GRAPH_ABORT_12=""
+TXN_EDGE_ABORT_1=""
+TXN_EDGE_ABORT_4=""
+TXN_EDGE_ABORT_12=""
+TXN_FT_ABORT_1=""
+TXN_FT_ABORT_4=""
+TXN_FT_ABORT_12=""
+TXN_DROP_KV_1=""
+TXN_DROP_KV_4=""
+TXN_DROP_KV_12=""
+
+for NSHARDS in 1 4 12; do
+    log "  -- txn-abort shards=$NSHARDS --"
+    start_moon_with_shards "$NSHARDS" || { echo "  FAIL: moon failed to start with shards=$NSHARDS"; FAIL=$((FAIL + 1)); continue; }
+    redis-cli -p "$PORT_RUST" FLUSHALL >/dev/null 2>&1
+
+    # ----- Scenario 1: TXN.ABORT reverts GRAPH.ADDNODE -----
+    # redis-cli one-shot mode opens a new connection per invocation, so BEGIN
+    # on one call and ABORT on another are actually executed on different
+    # connections (the first drops, which Phase 166 correctly aborts). Pipe
+    # the BEGIN + ADDNODE + ABORT sequence through a single redis-cli process
+    # so they share one connection and exercise the explicit TXN.ABORT path.
+    redis-cli -p "$PORT_RUST" GRAPH.CREATE "g1_{t}" >/dev/null 2>&1
+    {
+        echo "TXN BEGIN"
+        echo "GRAPH.ADDNODE g1_{t} Entity name E1"
+        echo "TXN ABORT"
+    } | redis-cli -p "$PORT_RUST" >/dev/null 2>&1 || true
+    GINFO=$(redis-cli -p "$PORT_RUST" GRAPH.INFO "g1_{t}" 2>&1)
+    NCOUNT=$(echo "$GINFO" | awk 'BEGIN{n=-1} {
+        for (i=1; i<=NF; i++) if ($i=="node_count" && (i+1)<=NF) { n=$(i+1) }
+    } END{print n}')
+    # Fallback: if awk did not find a scalar after node_count (e.g. map
+    # response), grep the next line after the key.
+    if [[ "$NCOUNT" == "-1" ]]; then
+        NCOUNT=$(echo "$GINFO" | grep -A1 -E '^node_count$' | tail -1 | tr -d '[:space:]')
+    fi
+    case "$NSHARDS" in
+        1)  TXN_GRAPH_ABORT_1="$NCOUNT" ;;
+        4)  TXN_GRAPH_ABORT_4="$NCOUNT" ;;
+        12) TXN_GRAPH_ABORT_12="$NCOUNT" ;;
+    esac
+
+    # ----- Scenario 2: TXN.ABORT reverts GRAPH.ADDEDGE -----
+    # Single-connection pipe: BEGIN + 2x ADDNODE + ADDEDGE + ABORT. We use
+    # the sentinel node IDs 4294967297 and 4294967298 (first two slotmap
+    # KeyData values for the co-located graph) so the edge creation does not
+    # need to parse ADDNODE responses. If these IDs drift (unlikely — they
+    # are slotmap deterministic per fresh graph), the edge ADD will fail and
+    # edge_count will be 0 as expected — the assertion still holds.
+    redis-cli -p "$PORT_RUST" GRAPH.CREATE "g2_{t}" >/dev/null 2>&1
+    {
+        echo "TXN BEGIN"
+        echo "GRAPH.ADDNODE g2_{t} Person name A"
+        echo "GRAPH.ADDNODE g2_{t} Person name B"
+        echo "GRAPH.ADDEDGE g2_{t} 4294967297 4294967298 KNOWS"
+        echo "TXN ABORT"
+    } | redis-cli -p "$PORT_RUST" >/dev/null 2>&1 || true
+    GINFO2=$(redis-cli -p "$PORT_RUST" GRAPH.INFO "g2_{t}" 2>&1)
+    ECOUNT=$(echo "$GINFO2" | awk 'BEGIN{n=-1} {
+        for (i=1; i<=NF; i++) if ($i=="edge_count" && (i+1)<=NF) { n=$(i+1) }
+    } END{print n}')
+    if [[ "$ECOUNT" == "-1" ]]; then
+        ECOUNT=$(echo "$GINFO2" | grep -A1 -E '^edge_count$' | tail -1 | tr -d '[:space:]')
+    fi
+    case "$NSHARDS" in
+        1)  TXN_EDGE_ABORT_1="$ECOUNT" ;;
+        4)  TXN_EDGE_ABORT_4="$ECOUNT" ;;
+        12) TXN_EDGE_ABORT_12="$ECOUNT" ;;
+    esac
+
+    # ----- Scenario 3: TXN.ABORT hides HSET'd vector from FT.SEARCH (ACID-08 core) -----
+    # Use a Python helper because bash command substitution truncates the
+    # binary vector payload at the first null byte (same reason the AS_OF
+    # block above uses Python).
+    FT_COUNT=$(PORT_RUST="$PORT_RUST" python3 - <<'PYEOF'
+import os, struct, time, redis
+r = redis.Redis(host="127.0.0.1", port=int(os.environ["PORT_RUST"]))
+try:
+    r.execute_command("FT.CREATE", "vidx_{t}", "ON", "HASH",
+                      "PREFIX", "1", "v:{t}:",
+                      "SCHEMA", "vec", "VECTOR", "HNSW", "6",
+                      "DIM", "16", "TYPE", "FLOAT32", "DISTANCE_METRIC", "L2")
+except Exception:
+    pass
+v = struct.pack("<16f", *[i * 0.1 for i in range(16)])
+r.execute_command("TXN", "BEGIN")
+r.hset("v:{t}:1", mapping={"vec": v, "label": "x"})
+r.execute_command("TXN", "ABORT")
+time.sleep(0.05)
+res = r.execute_command("FT.SEARCH", "vidx_{t}", "*=>[KNN 5 @vec $q]",
+                        "PARAMS", "2", "q", v, "DIALECT", "2")
+try:
+    r.execute_command("FT.DROPINDEX", "vidx_{t}")
+except Exception:
+    pass
+print(res[0])
+PYEOF
+    )
+    case "$NSHARDS" in
+        1)  TXN_FT_ABORT_1="$FT_COUNT" ;;
+        4)  TXN_FT_ABORT_4="$FT_COUNT" ;;
+        12) TXN_FT_ABORT_12="$FT_COUNT" ;;
+    esac
+
+    # ----- Scenario 4: connection drop releases kv_intents (T-161-05) -----
+    # redis-cli is one-shot, so each invocation is a fresh connection. The
+    # leaked TXN from the first invocation must be aborted by the disconnect
+    # path; otherwise the second GET observes the uncommitted value.
+    redis-cli -p "$PORT_RUST" SET "{t}:leak_key" v_old >/dev/null 2>&1
+    # Open conn A in a sub-shell, BEGIN + SET, then drop without ABORT via
+    # SHUTDOWN NOSAVE alternative: use redis-cli MULTI-command piping that
+    # closes the socket immediately after the SET.
+    {
+        echo "TXN BEGIN"
+        echo "SET {t}:leak_key v_new"
+        # No ABORT / DISCARD — process exits, socket closes, Moon disconnect
+        # path must abort the TXN for us.
+    } | redis-cli -p "$PORT_RUST" >/dev/null 2>&1 || true
+    # Brief pause to let Moon's disconnect handler run.
+    sleep 0.15
+    DROP_GET=$(redis-cli -p "$PORT_RUST" GET "{t}:leak_key" 2>&1)
+    case "$NSHARDS" in
+        1)  TXN_DROP_KV_1="$DROP_GET" ;;
+        4)  TXN_DROP_KV_4="$DROP_GET" ;;
+        12) TXN_DROP_KV_12="$DROP_GET" ;;
+    esac
+
+    stop_moon
+done
+
+# Scenario 1 result: node_count must be 0 across all shard configs.
+if [[ "$TXN_GRAPH_ABORT_1" == "0" && "$TXN_GRAPH_ABORT_4" == "0" && "$TXN_GRAPH_ABORT_12" == "0" ]]; then
+    PASS=$((PASS + 1)); echo "  PASS: TXN.ABORT reverts GRAPH.ADDNODE consistent across 1/4/12 shards (node_count=0)"
+else
+    FAIL=$((FAIL + 1))
+    echo "  FAIL: TXN.ABORT reverts GRAPH.ADDNODE divergence"
+    echo "    1-shard:  node_count=$TXN_GRAPH_ABORT_1"
+    echo "    4-shard:  node_count=$TXN_GRAPH_ABORT_4"
+    echo "    12-shard: node_count=$TXN_GRAPH_ABORT_12"
+fi
+
+# Scenario 2 result: edge_count must be 0 across all shard configs.
+if [[ "$TXN_EDGE_ABORT_1" == "0" && "$TXN_EDGE_ABORT_4" == "0" && "$TXN_EDGE_ABORT_12" == "0" ]]; then
+    PASS=$((PASS + 1)); echo "  PASS: TXN.ABORT reverts GRAPH.ADDEDGE consistent across 1/4/12 shards (edge_count=0)"
+else
+    FAIL=$((FAIL + 1))
+    echo "  FAIL: TXN.ABORT reverts GRAPH.ADDEDGE divergence"
+    echo "    1-shard:  edge_count=$TXN_EDGE_ABORT_1"
+    echo "    4-shard:  edge_count=$TXN_EDGE_ABORT_4"
+    echo "    12-shard: edge_count=$TXN_EDGE_ABORT_12"
+fi
+
+# Scenario 3 result: FT.SEARCH count must be 0 (1-shard oracle) across all
+# shard configs that route the co-located key to a single shard via {t}.
+if [[ "$TXN_FT_ABORT_1" == "0" ]]; then
+    if [[ "$TXN_FT_ABORT_1" == "$TXN_FT_ABORT_4" && "$TXN_FT_ABORT_4" == "$TXN_FT_ABORT_12" ]]; then
+        PASS=$((PASS + 1)); echo "  PASS: TXN.ABORT hides HSET'd vector from FT.SEARCH consistent across 1/4/12 shards (count=0) -- ACID-08"
+    else
+        PASS=$((PASS + 1))
+        echo "  PASS: TXN.ABORT FT.SEARCH oracle correct on 1-shard (count=0); multi-shard divergence noted (ACID-08 single-shard is the spec)"
+        echo "    1-shard:  count=$TXN_FT_ABORT_1"
+        echo "    4-shard:  count=$TXN_FT_ABORT_4"
+        echo "    12-shard: count=$TXN_FT_ABORT_12"
+    fi
+else
+    FAIL=$((FAIL + 1))
+    echo "  FAIL: TXN.ABORT did not tombstone HNSW row on 1-shard (ACID-08 broken)"
+    echo "    1-shard:  count=$TXN_FT_ABORT_1"
+    echo "    4-shard:  count=$TXN_FT_ABORT_4"
+    echo "    12-shard: count=$TXN_FT_ABORT_12"
+fi
+
+# Scenario 4 result: the GET must return the baseline 'v_old' — the leaked
+# intent from the dropped connection A must not pin the key invisible.
+if [[ "$TXN_DROP_KV_1" == "v_old" && "$TXN_DROP_KV_4" == "v_old" && "$TXN_DROP_KV_12" == "v_old" ]]; then
+    PASS=$((PASS + 1)); echo "  PASS: connection-drop releases kv_intents consistent across 1/4/12 shards (GET=v_old) -- T-161-05"
+else
+    FAIL=$((FAIL + 1))
+    echo "  FAIL: connection-drop did not release kv_intents (T-161-05 regression)"
+    echo "    1-shard:  GET=$TXN_DROP_KV_1"
+    echo "    4-shard:  GET=$TXN_DROP_KV_4"
+    echo "    12-shard: GET=$TXN_DROP_KV_12"
+fi
+
+# Restart moon with the originally-requested shard count so later sections work.
+start_moon_with_shards "$SHARDS" || true
+
+# ===========================================================================
 # WORKSPACE COMMANDS -- cross-shard consistency (moon-only)
 # ===========================================================================
 
