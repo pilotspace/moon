@@ -3316,6 +3316,19 @@ pub(crate) async fn handle_connection_sharded_inner<
         }
     }
 
+    // Phase 166: release any leaked cross-store TXN (client disconnected mid-txn).
+    // Idempotent: TXN.ABORT already takes() active_cross_txn so this is a no-op if abort ran.
+    // Closes T-161-05 — without this, a disconnect after TXN.BEGIN + SET would leak
+    // kv_intents and pin the key invisible for all subsequent readers.
+    if let Some(txn) = conn.active_cross_txn.take() {
+        crate::transaction::abort::abort_cross_store_txn(
+            &ctx.shard_databases,
+            ctx.shard_id,
+            conn.selected_db,
+            txn,
+        );
+    }
+
     // Clean up pub/sub subscriptions on disconnect
     if conn.subscriber_id > 0 {
         let removed_channels = {
