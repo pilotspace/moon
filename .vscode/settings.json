@@ -1,0 +1,19 @@
+{
+  "//": "Rust-analyzer must analyze with the CI test feature set so integration tests gated on runtime-tokio (redis::aio::MultiplexedConnection is Tokio-based) show as active code rather than dimmed inactive-code hints. Production binary defaults remain runtime-monoio.",
+  "rust-analyzer.cargo.features": [
+    "runtime-tokio",
+    "jemalloc",
+    "graph",
+    "text-index"
+  ],
+  "rust-analyzer.cargo.noDefaultFeatures": true,
+  "rust-analyzer.check.features": [
+    "runtime-tokio",
+    "jemalloc",
+    "graph",
+    "text-index"
+  ],
+  "rust-analyzer.check.noDefaultFeatures": true,
+  "rust-analyzer.check.command": "clippy",
+  "rust-analyzer.check.extraArgs": ["--", "-D", "warnings"]
+}
