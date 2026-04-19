@@ -21,13 +21,24 @@ pub type UnifiedLsn = u64;
 /// Vector write intent: (point_id, index_name)
 #[derive(Debug, Clone)]
 pub struct VectorIntent {
+    /// xxh64 key_hash (not internal_id). Rollback calls
+    /// `MutableSegment::mark_deleted_by_key_hash(point_id, rollback_lsn)` to
+    /// tombstone the entry under MVCC. Using `key_hash` (rather than
+    /// `internal_id`) keeps the intent stable across mutable-segment
+    /// compactions, which renumber internal ids but preserve key hashes.
     pub point_id: u64,
     pub index_name: Bytes,
 }
 
-/// Graph write intent: (entity_id, is_node: bool)
+/// Graph write intent: `(graph_name, entity_id, is_node)`.
+///
+/// `graph_name` is captured at intent-creation time so TXN.ABORT can look up
+/// the correct `MemGraph` on rollback. `entity_id` is the NodeKey or EdgeKey
+/// encoded via `slotmap::KeyData::as_ffi()`. `is_node` distinguishes which
+/// `MemGraph::remove_*` primitive the rollback loop must call.
 #[derive(Debug, Clone)]
 pub struct GraphIntent {
+    pub graph_name: Bytes,
     pub entity_id: u64,
     pub is_node: bool,
 }
@@ -102,9 +113,18 @@ impl CrossStoreTxn {
     }
 
     /// Record a graph modification.
+    ///
+    /// `graph_name` is captured per-intent (not per-txn) to tolerate
+    /// multi-graph transactions — rollback loops over `graph_intents` in
+    /// reverse order (LIFO) and calls `MemGraph::remove_node` or
+    /// `MemGraph::remove_edge` on the graph identified by `graph_name`.
     #[inline]
-    pub fn record_graph(&mut self, entity_id: u64, is_node: bool) {
-        self.graph_intents.push(GraphIntent { entity_id, is_node });
+    pub fn record_graph(&mut self, entity_id: u64, is_node: bool, graph_name: Bytes) {
+        self.graph_intents.push(GraphIntent {
+            graph_name,
+            entity_id,
+            is_node,
+        });
     }
 
     /// Record an MQ publish intent (MQ.PUBLISH inside TXN).
@@ -159,8 +179,39 @@ mod tests {
     #[test]
     fn test_has_modifications_graph() {
         let mut txn = CrossStoreTxn::new(1, 0);
-        txn.record_graph(200, true);
+        txn.record_graph(200, true, Bytes::from_static(b"g"));
         assert!(txn.has_modifications());
+    }
+
+    #[test]
+    fn test_graph_intent_records_graph_name() {
+        let mut txn = CrossStoreTxn::new(1, 0);
+        txn.record_graph(10, true, Bytes::from_static(b"g1"));
+        txn.record_graph(11, false, Bytes::from_static(b"g2"));
+        assert_eq!(txn.graph_intents.len(), 2);
+        assert_eq!(txn.graph_intents[0].graph_name.as_ref(), b"g1");
+        assert_eq!(txn.graph_intents[0].entity_id, 10);
+        assert!(txn.graph_intents[0].is_node);
+        assert_eq!(txn.graph_intents[1].graph_name.as_ref(), b"g2");
+        assert_eq!(txn.graph_intents[1].entity_id, 11);
+        assert!(!txn.graph_intents[1].is_node);
+    }
+
+    #[test]
+    fn test_graph_intent_reverse_order_is_lifo() {
+        let mut txn = CrossStoreTxn::new(1, 0);
+        // Push three intents; reverse iteration must yield them LIFO so Plan
+        // 166-03 can remove edges before their endpoint nodes on rollback.
+        txn.record_graph(1, true, Bytes::from_static(b"g"));
+        txn.record_graph(2, true, Bytes::from_static(b"g"));
+        txn.record_graph(3, false, Bytes::from_static(b"g"));
+        let reversed: Vec<u64> = txn.graph_intents.iter().rev().map(|g| g.entity_id).collect();
+        assert_eq!(reversed, vec![3, 2, 1]);
+        // Spot-check the first reverse element matches the last push.
+        assert_eq!(
+            txn.graph_intents.iter().rev().next().unwrap().entity_id,
+            3
+        );
     }
 
     #[test]
