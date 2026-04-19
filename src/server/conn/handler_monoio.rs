@@ -3477,7 +3477,12 @@ pub(crate) async fn handle_connection_sharded_monoio<
                         if let Some(key) = cmd_args.first().and_then(|f| extract_bytes(f)) {
                             let mut vs = ctx.shard_databases.vector_store(ctx.shard_id);
                             let mut ts = ctx.shard_databases.text_store(ctx.shard_id);
-                            crate::shard::spsc_handler::auto_index_hset_public(
+                            // Plan 166-01: (index_name, key_hash) tuples for
+                            // vector appends; Plan 166-02 will consume this
+                            // to populate CrossStoreTxn::vector_intents so
+                            // TXN.ABORT can tombstone via MutableSegment
+                            // MVCC primitives.
+                            let _ = crate::shard::spsc_handler::auto_index_hset_public(
                                 &mut vs,
                                 &mut *ts,
                                 key.as_ref(),

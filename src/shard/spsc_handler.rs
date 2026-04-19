@@ -359,7 +359,11 @@ pub(crate) fn handle_shard_message_shared(
                 {
                     if let Some(crate::protocol::Frame::BulkString(key_bytes)) = args.first() {
                         let mut ts = shard_databases.text_store(shard_id);
-                        auto_index_hset(vector_store, &mut *ts, key_bytes, args);
+                        // Plan 166-01: return value (index_name, key_hash)
+                        // tuples will be consumed by Plan 166-02 to record
+                        // VectorIntents on the active CrossStoreTxn. Discarded
+                        // here because this path is not txn-aware yet.
+                        let _ = auto_index_hset(vector_store, &mut *ts, key_bytes, args);
                     }
                 }
 
@@ -527,7 +531,9 @@ pub(crate) fn handle_shard_message_shared(
                         // NOT shard_databases.vector_store() which would deadlock
                         // (parking_lot::Mutex is non-reentrant).
                         let mut ts = shard_databases.text_store(shard_id);
-                        auto_index_hset(vector_store, &mut *ts, key_bytes, args);
+                        // Plan 166-01: Vec<(idx, key_hash)> return discarded
+                        // here; Plan 166-02 threads it into CrossStoreTxn.
+                        let _ = auto_index_hset(vector_store, &mut *ts, key_bytes, args);
                     }
                 }
 
@@ -810,7 +816,9 @@ pub(crate) fn handle_shard_message_shared(
                         // NOT shard_databases.vector_store() which would deadlock
                         // (parking_lot::Mutex is non-reentrant).
                         let mut ts = shard_databases.text_store(shard_id);
-                        auto_index_hset(vector_store, &mut *ts, key_bytes, args);
+                        // Plan 166-01: Vec<(idx, key_hash)> return discarded
+                        // here; Plan 166-02 threads it into CrossStoreTxn.
+                        let _ = auto_index_hset(vector_store, &mut *ts, key_bytes, args);
                     }
                 }
 
@@ -1389,13 +1397,22 @@ fn has_session_keyword(frame: &crate::protocol::Frame) -> bool {
 /// a key matches an index prefix (rare per-operation), and f32 decode + SQ encode
 /// is inherently O(dim) work. This is post-dispatch processing, not hot-path.
 /// Public wrapper for auto-indexing on HSET — called from single-shard handler.
+///
+/// Returns the `(index_name, key_hash)` pairs for vector indexes where a
+/// vector value was actually appended to the mutable segment on this call.
+/// Caller must record these as `VectorIntent`s on the active CrossStoreTxn
+/// (if any) so TXN.ABORT can tombstone the entries via
+/// `MutableSegment::mark_deleted_by_key_hash`. Metadata-only updates and
+/// text-only indexes are NOT included — there is nothing to roll back for
+/// those paths. SmallVec inline cap 4 keeps the common case (single index,
+/// single vector field) heap-free.
 pub fn auto_index_hset_public(
     vector_store: &mut VectorStore,
     text_store: &mut crate::text::store::TextStore,
     key: &[u8],
     args: &[crate::protocol::Frame],
-) {
-    auto_index_hset(vector_store, text_store, key, args);
+) -> smallvec::SmallVec<[(bytes::Bytes, u64); 4]> {
+    auto_index_hset(vector_store, text_store, key, args)
 }
 
 fn auto_index_hset(
@@ -1403,11 +1420,12 @@ fn auto_index_hset(
     text_store: &mut crate::text::store::TextStore,
     key: &[u8],
     args: &[crate::protocol::Frame],
-) {
+) -> smallvec::SmallVec<[(bytes::Bytes, u64); 4]> {
+    let mut inserted: smallvec::SmallVec<[(bytes::Bytes, u64); 4]> = smallvec::SmallVec::new();
     let matching_names = vector_store.find_matching_index_names(key);
     let text_matching = text_store.find_matching_index_names(key);
     if matching_names.is_empty() && text_matching.is_empty() {
-        return;
+        return inserted;
     }
 
     // Allocate ONE monotonic insert_lsn per HSET so the MVCC visibility rule
@@ -1455,6 +1473,16 @@ fn auto_index_hset(
             any_vector_inserted = true;
         }
 
+        // Record ONE `(index_name, key_hash)` per index per HSET call — not
+        // per vector field — so multi-vector-field indexes don't produce
+        // duplicate intents. Plan 166-02/03 consumes this: the handler
+        // pushes a `VectorIntent` for each entry here onto the active
+        // CrossStoreTxn so TXN.ABORT can tombstone via
+        // `mark_deleted_by_key_hash(key_hash, rollback_lsn)`.
+        if any_vector_inserted {
+            inserted.push((idx_name.clone(), key_hash));
+        }
+
         // Metadata-only path: if no vector was inserted but key already exists
         if !any_vector_inserted {
             if let Some(&global_id) = idx.key_hash_to_global_id.get(&key_hash) {
@@ -1482,6 +1510,8 @@ fn auto_index_hset(
             idx.numeric_index_document(key_hash, key, text_args);
         }
     }
+
+    inserted
 }
 
 /// Find the vector blob in HSET args for the given source_field.

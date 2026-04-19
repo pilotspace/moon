@@ -675,8 +675,9 @@ mod tests {
                 Frame::BulkString(Bytes::copy_from_slice(b"Machine Learning for NLP")),
             ];
 
-            // Call auto_index_hset_public with empty VectorStore
-            crate::shard::spsc_handler::auto_index_hset_public(
+            // Call auto_index_hset_public with empty VectorStore.
+            // Return value (vector-insert tuples) irrelevant for text-only test.
+            let _ = crate::shard::spsc_handler::auto_index_hset_public(
                 &mut vector_store,
                 &mut text_store,
                 b"doc:1",

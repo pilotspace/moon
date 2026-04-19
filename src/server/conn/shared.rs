@@ -227,7 +227,9 @@ pub(crate) fn execute_transaction_sharded(
             if let Some(Frame::BulkString(key_bytes)) = cmd_args.first() {
                 let mut vs = shard_databases.vector_store(shard_id);
                 let mut ts = shard_databases.text_store(shard_id);
-                crate::shard::spsc_handler::auto_index_hset_public(
+                // Plan 166-01 return value is not consumed here — this is a
+                // non-txn-aware batch write path. Plan 166-02 wires txn paths.
+                let _ = crate::shard::spsc_handler::auto_index_hset_public(
                     &mut vs, &mut *ts, key_bytes, cmd_args,
                 );
             }

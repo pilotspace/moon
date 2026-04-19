@@ -921,11 +921,13 @@ pub async fn handle_connection(
                                                         let mut store = vs.lock();
                                                         if let Some(ref ts) = text_store {
                                                             let mut ts_guard = ts.lock();
-                                                            crate::shard::spsc_handler::auto_index_hset_public(
+                                                            // Plan 166-01: handler_single has no
+                                                            // TXN support; return value discarded.
+                                                            let _ = crate::shard::spsc_handler::auto_index_hset_public(
                                                                 &mut store, &mut *ts_guard, key_bytes, a,
                                                             );
                                                         } else {
-                                                            crate::shard::spsc_handler::auto_index_hset_public(
+                                                            let _ = crate::shard::spsc_handler::auto_index_hset_public(
                                                                 &mut store, &mut fallback_ts, key_bytes, a,
                                                             );
                                                         }
@@ -1777,10 +1779,11 @@ pub async fn handle_connection(
                                             let mut store = vs.lock();
                                             if let Some(ref ts) = text_store {
                                                 let mut ts_guard = ts.lock();
-                                                crate::shard::spsc_handler::auto_index_hset_public(&mut store, &mut *ts_guard, &key, d_args);
+                                                // Plan 166-01: discard return (no TXN here).
+                                                let _ = crate::shard::spsc_handler::auto_index_hset_public(&mut store, &mut *ts_guard, &key, d_args);
                                             } else {
                                                 let mut fallback_ts = crate::text::store::TextStore::new();
-                                                crate::shard::spsc_handler::auto_index_hset_public(&mut store, &mut fallback_ts, &key, d_args);
+                                                let _ = crate::shard::spsc_handler::auto_index_hset_public(&mut store, &mut fallback_ts, &key, d_args);
                                             }
                                         }
                                     }
