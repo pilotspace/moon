@@ -1757,6 +1757,152 @@ if should_run "temporal"; then
     fi
 
     mcli GRAPH.DELETE testgraph >/dev/null 2>&1
+
+    # ── Phase 165-03: FT.SEARCH AS_OF block ──────────────────────────────────
+    # TEMP-04 end-to-end via redis-py (bash command substitution truncates
+    # binary vectors at null bytes, so we delegate to a short Python helper
+    # that speaks the real client protocol — identical pattern to
+    # scripts/validate-v018-sdk.py).
+    echo ""
+    echo "--- FT.SEARCH AS_OF ---"
+    mcli FLUSHALL >/dev/null 2>&1
+
+    FT_ASOF_OUT=$(PORT_RUST="$PORT_RUST" python3 - <<'PYEOF'
+import os, sys, time, struct, redis
+r = redis.Redis(host="127.0.0.1", port=int(os.environ["PORT_RUST"]))
+r.execute_command("FT.CREATE", "asidx", "ON", "HASH", "PREFIX", "1", "as:",
+                  "SCHEMA", "vec", "VECTOR", "HNSW", "6",
+                  "DIM", "4", "TYPE", "FLOAT32", "DISTANCE_METRIC", "L2")
+v1 = struct.pack("<4f", 1.0, 0.0, 0.0, 0.0)
+v2 = struct.pack("<4f", 0.0, 1.0, 0.0, 0.0)
+r.hset("as:1", "vec", v1)
+time.sleep(0.1)
+r.execute_command("TEMPORAL.SNAPSHOT_AT")
+wall_ms_t1 = int(time.time() * 1000)
+time.sleep(0.1)
+r.hset("as:2", "vec", v2)
+time.sleep(0.1)
+as_of = r.execute_command("FT.SEARCH", "asidx", "*=>[KNN 10 @vec $q]",
+                          "PARAMS", "2", "q", v1,
+                          "AS_OF", str(wall_ms_t1), "DIALECT", "2")
+latest = r.execute_command("FT.SEARCH", "asidx", "*=>[KNN 10 @vec $q]",
+                           "PARAMS", "2", "q", v1, "DIALECT", "2")
+try:
+    err = r.execute_command("FT.SEARCH", "asidx", "*=>[KNN 10 @vec $q]",
+                             "PARAMS", "2", "q", v1,
+                             "AS_OF", "1", "DIALECT", "2")
+    err_msg = str(err)
+except redis.exceptions.ResponseError as e:
+    err_msg = f"ERR {e}"
+try:
+    r.execute_command("FT.DROPINDEX", "asidx")
+except Exception:
+    pass
+as_of_keys = [x.decode() if isinstance(x, bytes) else str(x) for x in as_of[1::2]]
+latest_keys = [x.decode() if isinstance(x, bytes) else str(x) for x in latest[1::2]]
+print(f"AS_OF_COUNT={as_of[0]}")
+print(f"AS_OF_KEYS={','.join(as_of_keys)}")
+print(f"LATEST_COUNT={latest[0]}")
+print(f"ERR_MSG={err_msg}")
+PYEOF
+    )
+
+    AS_OF_COUNT=$(echo "$FT_ASOF_OUT" | grep '^AS_OF_COUNT=' | cut -d= -f2)
+    AS_OF_KEYS=$(echo "$FT_ASOF_OUT" | grep '^AS_OF_KEYS=' | cut -d= -f2)
+    LATEST_COUNT=$(echo "$FT_ASOF_OUT" | grep '^LATEST_COUNT=' | cut -d= -f2)
+    ERR_MSG=$(echo "$FT_ASOF_OUT" | grep '^ERR_MSG=' | cut -d= -f2-)
+
+    TOTAL=$((TOTAL + 1))
+    if [[ "$AS_OF_COUNT" == "1" && "$AS_OF_KEYS" == "as:1" ]]; then
+        PASS=$((PASS + 1)); echo "  PASS: FT.SEARCH AS_OF filters post-snapshot doc (count=1, as:1 only)"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: FT.SEARCH AS_OF expected count=1 keys=as:1; got count=$AS_OF_COUNT keys=$AS_OF_KEYS"
+    fi
+
+    TOTAL=$((TOTAL + 1))
+    if [[ "$LATEST_COUNT" == "2" ]]; then
+        PASS=$((PASS + 1)); echo "  PASS: FT.SEARCH without AS_OF returns latest (count=2)"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: FT.SEARCH latest expected count=2; got $LATEST_COUNT"
+    fi
+
+    TOTAL=$((TOTAL + 1))
+    if echo "$ERR_MSG" | grep -q "no temporal snapshot registered"; then
+        PASS=$((PASS + 1)); echo "  PASS: FT.SEARCH AS_OF <unregistered> surfaces helper ERR"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: FT.SEARCH AS_OF unregistered should surface ERR; got: $ERR_MSG"
+    fi
+
+    # ── Phase 165-03: FT.SEARCH inside TXN block ─────────────────────────────
+    # ACID-09: TXN BEGIN on connection A captures snapshot_lsn; a concurrent
+    # HSET on connection B must NOT appear in A's FT.SEARCH until A commits.
+    # redis-py Connection objects are per-object; we open two.
+    echo ""
+    echo "--- FT.SEARCH inside TXN ---"
+    mcli FLUSHALL >/dev/null 2>&1
+
+    FT_TXN_OUT=$(PORT_RUST="$PORT_RUST" python3 - <<'PYEOF'
+import os, sys, time, struct, redis
+port = int(os.environ["PORT_RUST"])
+# Two independent redis.Redis() instances → two independent TCP sessions on
+# the server side (required for cross-client TXN isolation).
+a = redis.Redis(host="127.0.0.1", port=port, single_connection_client=True)
+b = redis.Redis(host="127.0.0.1", port=port, single_connection_client=True)
+setup = redis.Redis(host="127.0.0.1", port=port)
+try:
+    setup.execute_command("FT.CREATE", "txidx", "ON", "HASH", "PREFIX", "1", "tx:",
+                          "SCHEMA", "vec", "VECTOR", "HNSW", "6",
+                          "DIM", "4", "TYPE", "FLOAT32", "DISTANCE_METRIC", "L2")
+except redis.exceptions.ResponseError:
+    pass
+va = struct.pack("<4f", 1.0, 0.0, 0.0, 0.0)
+vb = struct.pack("<4f", 0.0, 1.0, 0.0, 0.0)
+setup.hset("tx:a", "vec", va)
+time.sleep(0.1)
+# Client A: TXN BEGIN captures snapshot_lsn at this moment.
+a.execute_command("TXN", "BEGIN")
+# Client B: HSET tx:b commits AFTER A's snapshot_lsn.
+b.hset("tx:b", "vec", vb)
+time.sleep(0.1)
+inside = a.execute_command("FT.SEARCH", "txidx", "*=>[KNN 10 @vec $q]",
+                           "PARAMS", "2", "q", va, "DIALECT", "2")
+inside_keys = [x.decode() if isinstance(x, bytes) else str(x) for x in inside[1::2]]
+a.execute_command("TXN", "COMMIT")
+post = a.execute_command("FT.SEARCH", "txidx", "*=>[KNN 10 @vec $q]",
+                         "PARAMS", "2", "q", va, "DIALECT", "2")
+post_keys = [x.decode() if isinstance(x, bytes) else str(x) for x in post[1::2]]
+try:
+    setup.execute_command("FT.DROPINDEX", "txidx")
+except Exception:
+    pass
+print(f"INSIDE_COUNT={inside[0]}")
+print(f"INSIDE_KEYS={','.join(sorted(inside_keys))}")
+print(f"POST_COUNT={post[0]}")
+print(f"POST_KEYS={','.join(sorted(post_keys))}")
+PYEOF
+    )
+
+    INSIDE_COUNT=$(echo "$FT_TXN_OUT" | grep '^INSIDE_COUNT=' | cut -d= -f2)
+    INSIDE_KEYS=$(echo "$FT_TXN_OUT" | grep '^INSIDE_KEYS=' | cut -d= -f2)
+    POST_COUNT=$(echo "$FT_TXN_OUT" | grep '^POST_COUNT=' | cut -d= -f2)
+    POST_KEYS=$(echo "$FT_TXN_OUT" | grep '^POST_KEYS=' | cut -d= -f2)
+
+    # Inside TXN: must see tx:a (pre-TXN) but NOT tx:b (post-snapshot).
+    TOTAL=$((TOTAL + 1))
+    if [[ "$INSIDE_COUNT" == "1" && "$INSIDE_KEYS" == "tx:a" ]]; then
+        PASS=$((PASS + 1)); echo "  PASS: FT.SEARCH inside TXN hides post-snapshot foreign write (inside=tx:a)"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: FT.SEARCH inside TXN expected tx:a only; got count=$INSIDE_COUNT keys=$INSIDE_KEYS"
+    fi
+
+    # After COMMIT: must see both.
+    TOTAL=$((TOTAL + 1))
+    if [[ "$POST_COUNT" == "2" && "$POST_KEYS" == "tx:a,tx:b" ]]; then
+        PASS=$((PASS + 1)); echo "  PASS: FT.SEARCH after TXN COMMIT returns both docs (count=2, tx:a+tx:b)"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: FT.SEARCH post-COMMIT expected tx:a+tx:b; got count=$POST_COUNT keys=$POST_KEYS"
+    fi
+
     echo "  temporal: done"
 fi
 
