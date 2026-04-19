@@ -16,40 +16,42 @@ use std::sync::Arc;
 
 use crate::command::connection as conn_cmd;
 use crate::command::metadata;
+use crate::command::mq::{
+    ERR_MQ_NOT_DURABLE, ERR_MQ_UNKNOWN_SUB, parse_mq_subcommand, validate_mq_ack,
+    validate_mq_create, validate_mq_dlqlen, validate_mq_pop, validate_mq_publish, validate_mq_push,
+    validate_mq_trigger,
+};
+#[cfg(feature = "graph")]
+use crate::command::temporal::{ERR_ENTITY_NOT_FOUND, ERR_GRAPH_NOT_FOUND};
 use crate::command::temporal::{
     capture_wall_ms, is_temporal_invalidate, is_temporal_snapshot_at, validate_invalidate,
     validate_snapshot_at,
 };
-#[cfg(feature = "graph")]
-use crate::command::temporal::{ERR_ENTITY_NOT_FOUND, ERR_GRAPH_NOT_FOUND};
 use crate::command::transaction::{
-    is_txn_abort, is_txn_begin, is_txn_commit, txn_abort_validate, txn_begin_validate,
-    txn_commit_validate, ERR_MULTI_TXN_CONFLICT,
+    ERR_MULTI_TXN_CONFLICT, is_txn_abort, is_txn_begin, is_txn_commit, txn_abort_validate,
+    txn_begin_validate, txn_commit_validate,
 };
 use crate::command::workspace::{
-    parse_ws_subcommand, validate_ws_create, validate_ws_drop,
-    validate_ws_auth, validate_ws_info, validate_ws_list,
-    parse_workspace_id_from_bytes,
-    ERR_WS_NOT_FOUND, ERR_WS_ALREADY_BOUND, ERR_WS_UNKNOWN_SUB,
+    ERR_WS_ALREADY_BOUND, ERR_WS_NOT_FOUND, ERR_WS_UNKNOWN_SUB, parse_workspace_id_from_bytes,
+    parse_ws_subcommand, validate_ws_auth, validate_ws_create, validate_ws_drop, validate_ws_info,
+    validate_ws_list,
 };
-use crate::workspace::{is_ws_command, workspace_rewrite_args, strip_workspace_prefix_from_response, WorkspaceId};
-use crate::mq::is_mq_command;
-use crate::command::mq::{
-    parse_mq_subcommand, validate_mq_create, validate_mq_push, validate_mq_pop,
-    validate_mq_ack, validate_mq_dlqlen, validate_mq_trigger, validate_mq_publish,
-    ERR_MQ_NOT_DURABLE, ERR_MQ_UNKNOWN_SUB,
-};
-use crate::storage::stream::StreamId;
 use crate::command::{DispatchResult, dispatch, dispatch_read};
-use crate::transaction::CrossStoreTxn;
+use crate::mq::is_mq_command;
 use crate::persistence::aof::{self, AofMessage};
 use crate::protocol::Frame;
 use crate::shard::dispatch::{ShardMessage, key_to_shard};
 use crate::shard::mesh::ChannelMesh;
 use crate::storage::eviction::try_evict_if_needed;
+use crate::storage::stream::StreamId;
 use crate::tracking::TrackingState;
+use crate::transaction::CrossStoreTxn;
+use crate::workspace::{
+    WorkspaceId, is_ws_command, strip_workspace_prefix_from_response, workspace_rewrite_args,
+};
 
 use super::affinity::MigratedConnectionState;
+use super::shared::resolve_ft_search_as_of_lsn;
 use crate::server::response_slot::ResponseSlotPool;
 
 /// Result of `handle_connection_sharded_inner` execution.
@@ -2758,14 +2760,25 @@ pub(crate) async fn handle_connection_sharded_inner<
                                 if cmd.eq_ignore_ascii_case(b"FT.CREATE") {
                                     crate::command::vector_search::ft_create(&mut vs, &mut ts, cmd_args)
                                 } else if cmd.eq_ignore_ascii_case(b"FT.SEARCH") {
-                                    let has_session = cmd_args.iter().any(|a| {
-                                        if let Frame::BulkString(b) = a { b.eq_ignore_ascii_case(b"SESSION") } else { false }
-                                    });
-                                    if has_session {
-                                        let mut db_guard = shard_databases_ref.write_db(ctx.shard_id, 0);
-                                        crate::command::vector_search::ft_search(&mut vs, cmd_args, Some(&mut *db_guard), Some(&*ts), 0)
-                                    } else {
-                                        crate::command::vector_search::ft_search(&mut vs, cmd_args, None, Some(&*ts), 0)
+                                    // Resolve AS_OF temporal clause + TXN snapshot precedence (TEMP-04, ACID-09).
+                                    match resolve_ft_search_as_of_lsn(
+                                        cmd_args,
+                                        Some(&ctx.shard_databases),
+                                        ctx.shard_id,
+                                        conn.active_cross_txn.as_ref(),
+                                    ) {
+                                        Err(err_frame) => err_frame,
+                                        Ok(as_of_lsn) => {
+                                            let has_session = cmd_args.iter().any(|a| {
+                                                if let Frame::BulkString(b) = a { b.eq_ignore_ascii_case(b"SESSION") } else { false }
+                                            });
+                                            if has_session {
+                                                let mut db_guard = shard_databases_ref.write_db(ctx.shard_id, 0);
+                                                crate::command::vector_search::ft_search(&mut vs, cmd_args, Some(&mut *db_guard), Some(&*ts), as_of_lsn)
+                                            } else {
+                                                crate::command::vector_search::ft_search(&mut vs, cmd_args, None, Some(&*ts), as_of_lsn)
+                                            }
+                                        }
                                     }
                                 } else if cmd.eq_ignore_ascii_case(b"FT.DROPINDEX") {
                                     let mut db_guard = shard_databases_ref.write_db(ctx.shard_id, 0);
