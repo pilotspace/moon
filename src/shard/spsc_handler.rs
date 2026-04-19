@@ -953,9 +953,25 @@ pub(crate) fn handle_shard_message_shared(
             index_name,
             query_blob,
             k,
+            as_of_lsn,
             reply_tx,
         } => {
-            let response = vector_search::search_local(vector_store, &index_name, &query_blob, k);
+            // Phase 171 SCAT-01: honor coordinator-resolved AS_OF / TXN LSN
+            // for multi-shard FT.SEARCH. When `as_of_lsn == 0` the filter is a
+            // no-op and behavior matches the pre-171 path. Route through
+            // `search_local_filtered` with AS_OF threaded in to apply MVCC
+            // filtering against the committed treemap inside `search_local_raw`.
+            let response = vector_search::search_local_filtered(
+                vector_store,
+                &index_name,
+                &query_blob,
+                k,
+                None,
+                0,
+                usize::MAX,
+                None,
+                as_of_lsn,
+            );
             let _ = reply_tx.send(response);
         }
         ShardMessage::DocFreq {
@@ -1203,6 +1219,7 @@ pub(crate) fn handle_shard_message_shared(
                 top_k,
                 global_df,
                 global_n,
+                as_of_lsn,
                 reply_tx,
             } = *payload;
             let response = {
@@ -1211,6 +1228,10 @@ pub(crate) fn handle_shard_message_shared(
                     (Some(f), Some(b)) => Some((f, b)),
                     _ => None,
                 };
+                // Phase 171 HYB-02 / SCAT-02: forward the coordinator-resolved
+                // AS_OF LSN into the raw-streams executor so the dense branch
+                // applies MVCC filtering consistently across shards. BM25
+                // remains AS_OF-unaware until text-index MVCC ships (v0.2).
                 crate::command::vector_search::hybrid_multi::execute_hybrid_search_local_raw_streams(
                     vector_store,
                     &text_guard,
@@ -1224,6 +1245,7 @@ pub(crate) fn handle_shard_message_shared(
                     top_k,
                     &global_df,
                     global_n,
+                    as_of_lsn,
                 )
                 // text_guard drops here (end of block)
             };
@@ -1477,10 +1499,28 @@ fn auto_index_hset(
 
             if field_idx == 0 {
                 // Default field: use existing top-level segments
-                handle_vector_insert(idx, key, args, &field_name, dim, key_hash, insert_lsn, txn_id);
+                handle_vector_insert(
+                    idx,
+                    key,
+                    args,
+                    &field_name,
+                    dim,
+                    key_hash,
+                    insert_lsn,
+                    txn_id,
+                );
             } else {
                 // Additional field: use field_segments
-                handle_vector_insert_field(idx, &field_name, key, args, dim, key_hash, insert_lsn, txn_id);
+                handle_vector_insert_field(
+                    idx,
+                    &field_name,
+                    key,
+                    args,
+                    dim,
+                    key_hash,
+                    insert_lsn,
+                    txn_id,
+                );
             }
             any_vector_inserted = true;
         }

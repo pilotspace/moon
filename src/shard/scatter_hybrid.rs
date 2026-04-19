@@ -56,6 +56,7 @@ use crate::vector::types::SearchResult;
 #[allow(clippy::too_many_arguments)]
 pub async fn scatter_hybrid_search(
     query: HybridQuery,
+    as_of_lsn: u64,
     my_shard: usize,
     num_shards: usize,
     shard_databases: &Arc<ShardDatabases>,
@@ -69,16 +70,15 @@ pub async fn scatter_hybrid_search(
     if num_shards == 1 {
         // Local IDF is globally accurate — skip DFS, go straight through
         // the fused local path (identical to the non-HYBRID-routing code).
+        // Phase 171 HYB-02 / SCAT-02: thread coordinator-resolved AS_OF LSN
+        // through the single-shard fast path so callers routed here still
+        // honor temporal snapshots.
         return {
             let mut vs = shard_databases.vector_store(my_shard);
             let ts = shard_databases.text_store(my_shard);
-            // v0.1.9 HYB-02 partial: single-shard path threads as_of_lsn=0 here;
-            // the FT.SEARCH dispatcher at ft_search/dispatch.rs already routes
-            // HYBRID through the direct call with the resolved LSN. This arm is
-            // a fallback for multi-shard coordinators that chose the single-
-            // shard fast path. Full multi-shard AS_OF scatter ships under
-            // SCAT-01 (ShardMessage::VectorSearch LSN threading).
-            crate::command::vector_search::hybrid::execute_hybrid_search_local(&mut vs, &ts, &query, 0)
+            crate::command::vector_search::hybrid::execute_hybrid_search_local(
+                &mut vs, &ts, &query, as_of_lsn,
+            )
             // guards drop at end of this block
         };
     }
@@ -197,6 +197,9 @@ pub async fn scatter_hybrid_search(
                     (Some(f), Some(b)) => Some((f, b)),
                     _ => None,
                 };
+                // Phase 171 HYB-02 / SCAT-02: forward as_of_lsn to the local
+                // raw-streams executor so the coordinator's own shard honors
+                // AS_OF on the dense branch (symmetric with remote payload below).
                 crate::command::vector_search::hybrid_multi::execute_hybrid_search_local_raw_streams(
                     &mut vs,
                     &ts,
@@ -210,6 +213,7 @@ pub async fn scatter_hybrid_search(
                     top_k,
                     &global_df,
                     global_n,
+                    as_of_lsn,
                 )
                 // guards drop here
             };
@@ -228,6 +232,7 @@ pub async fn scatter_hybrid_search(
                 top_k,
                 global_df: global_df.clone(),
                 global_n,
+                as_of_lsn,
                 reply_tx,
             };
             let msg = ShardMessage::FtHybrid(Box::new(payload));

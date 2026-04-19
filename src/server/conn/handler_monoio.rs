@@ -14,30 +14,26 @@ use std::sync::Arc;
 
 use crate::command::connection as conn_cmd;
 use crate::command::metadata;
+use crate::command::mq::{
+    ERR_MQ_NOT_DURABLE, ERR_MQ_UNKNOWN_SUB, parse_mq_subcommand, validate_mq_ack,
+    validate_mq_create, validate_mq_dlqlen, validate_mq_pop, validate_mq_publish, validate_mq_push,
+    validate_mq_trigger,
+};
 use crate::command::temporal::{
-    capture_wall_ms, is_temporal_invalidate, is_temporal_snapshot_at, validate_invalidate,
-    validate_snapshot_at, ERR_ENTITY_NOT_FOUND, ERR_GRAPH_NOT_FOUND,
+    ERR_ENTITY_NOT_FOUND, ERR_GRAPH_NOT_FOUND, capture_wall_ms, is_temporal_invalidate,
+    is_temporal_snapshot_at, validate_invalidate, validate_snapshot_at,
 };
 use crate::command::transaction::{
-    is_txn_abort, is_txn_begin, is_txn_commit, txn_abort_validate, txn_begin_validate,
-    txn_commit_validate, ERR_MULTI_TXN_CONFLICT,
+    ERR_MULTI_TXN_CONFLICT, is_txn_abort, is_txn_begin, is_txn_commit, txn_abort_validate,
+    txn_begin_validate, txn_commit_validate,
 };
 use crate::command::workspace::{
-    parse_ws_subcommand, validate_ws_create, validate_ws_drop,
-    validate_ws_auth, validate_ws_info, validate_ws_list,
-    parse_workspace_id_from_bytes,
-    ERR_WS_NOT_FOUND, ERR_WS_ALREADY_BOUND, ERR_WS_UNKNOWN_SUB,
+    ERR_WS_ALREADY_BOUND, ERR_WS_NOT_FOUND, ERR_WS_UNKNOWN_SUB, parse_workspace_id_from_bytes,
+    parse_ws_subcommand, validate_ws_auth, validate_ws_create, validate_ws_drop, validate_ws_info,
+    validate_ws_list,
 };
-use crate::workspace::{is_ws_command, workspace_rewrite_args, strip_workspace_prefix_from_response, WorkspaceId};
-use crate::mq::is_mq_command;
-use crate::command::mq::{
-    parse_mq_subcommand, validate_mq_create, validate_mq_push, validate_mq_pop,
-    validate_mq_ack, validate_mq_dlqlen, validate_mq_trigger, validate_mq_publish,
-    ERR_MQ_NOT_DURABLE, ERR_MQ_UNKNOWN_SUB,
-};
-use crate::storage::stream::StreamId;
 use crate::command::{DispatchResult, dispatch, dispatch_read, is_dispatch_read_supported};
-use crate::transaction::CrossStoreTxn;
+use crate::mq::is_mq_command;
 use crate::persistence::aof::{self, AofMessage};
 use crate::protocol::Frame;
 use crate::pubsub::subscriber::Subscriber;
@@ -45,7 +41,12 @@ use crate::pubsub::{self};
 use crate::shard::dispatch::{ShardMessage, key_to_shard};
 use crate::shard::mesh::ChannelMesh;
 use crate::storage::eviction::{try_evict_if_needed, try_evict_if_needed_async_spill};
+use crate::storage::stream::StreamId;
 use crate::tracking::TrackingState;
+use crate::transaction::CrossStoreTxn;
+use crate::workspace::{
+    WorkspaceId, is_ws_command, strip_workspace_prefix_from_response, workspace_rewrite_args,
+};
 
 use super::affinity::MigratedConnectionState;
 use super::shared::resolve_ft_search_as_of_lsn;
@@ -1565,12 +1566,14 @@ pub(crate) async fn handle_connection_sharded_monoio<
                             // Write XactCommit WAL record with committed KV state
                             let txn_id = txn.txn_id;
                             if !txn.kv_undo.is_empty() {
-                                let db_guard = ctx.shard_databases.read_db(ctx.shard_id, conn.selected_db);
-                                let payload = crate::persistence::wal_v3::record::encode_xact_commit_payload(
-                                    txn_id,
-                                    txn.kv_undo.records(),
-                                    &*db_guard,
-                                );
+                                let db_guard =
+                                    ctx.shard_databases.read_db(ctx.shard_id, conn.selected_db);
+                                let payload =
+                                    crate::persistence::wal_v3::record::encode_xact_commit_payload(
+                                        txn_id,
+                                        txn.kv_undo.records(),
+                                        &*db_guard,
+                                    );
                                 drop(db_guard);
                                 let mut wal_buf = Vec::new();
                                 crate::persistence::wal_v3::record::write_wal_v3_record(
@@ -1579,31 +1582,40 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                     crate::persistence::wal_v3::record::WalRecordType::XactCommit,
                                     &payload,
                                 );
-                                ctx.shard_databases.wal_append(ctx.shard_id, bytes::Bytes::from(wal_buf));
+                                ctx.shard_databases
+                                    .wal_append(ctx.shard_id, bytes::Bytes::from(wal_buf));
                             }
 
                             // Release KV write intents from shard side-table
-                            ctx.shard_databases.kv_intents(ctx.shard_id).release_txn(txn_id);
+                            ctx.shard_databases
+                                .kv_intents(ctx.shard_id)
+                                .release_txn(txn_id);
 
                             // Drain deferred HNSW inserts (post-commit hook).
                             // The drain prevents phantom neighbors on abort.
                             // Actual HNSW graph insertion happens during compaction,
                             // not at commit time (point is already in mutable segment).
-                            let drain_count = ctx.shard_databases
+                            let drain_count = ctx
+                                .shard_databases
                                 .hnsw_queue(ctx.shard_id)
                                 .drain_for_txn(txn_id)
                                 .count();
                             if drain_count > 0 {
-                                tracing::debug!(txn_id, count = drain_count, "Drained deferred HNSW inserts");
+                                tracing::debug!(
+                                    txn_id,
+                                    count = drain_count,
+                                    "Drained deferred HNSW inserts"
+                                );
                             }
 
                             // Materialize MQ intents: enqueue deferred MQ.PUBLISH messages
                             if !txn.mq_intents.is_empty() {
-                                let mut db_guard = ctx.shard_databases.write_db(
-                                    ctx.shard_id, conn.selected_db,
-                                );
+                                let mut db_guard =
+                                    ctx.shard_databases.write_db(ctx.shard_id, conn.selected_db);
                                 for intent in &txn.mq_intents {
-                                    if let Ok(Some(stream)) = db_guard.get_stream_mut(&intent.queue_key) {
+                                    if let Ok(Some(stream)) =
+                                        db_guard.get_stream_mut(&intent.queue_key)
+                                    {
                                         if stream.durable {
                                             let msg_id = stream.next_auto_id();
                                             stream.add(msg_id, intent.fields.clone());
@@ -1661,8 +1673,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                         };
                         // Lazy-init and record the wall-clock -> LSN binding
                         {
-                            let mut guard =
-                                ctx.shard_databases.temporal_registry(ctx.shard_id);
+                            let mut guard = ctx.shard_databases.temporal_registry(ctx.shard_id);
                             let registry = guard.get_or_insert_with(|| {
                                 Box::new(crate::temporal::TemporalRegistry::new())
                             });
@@ -1682,14 +1693,12 @@ pub(crate) async fn handle_connection_sharded_monoio<
                         let wall_ms = capture_wall_ms();
                         #[cfg(feature = "graph")]
                         {
-                            let mut gs =
-                                ctx.shard_databases.graph_store_write(ctx.shard_id);
+                            let mut gs = ctx.shard_databases.graph_store_write(ctx.shard_id);
                             if let Some(named_graph) = gs.get_graph_mut(&graph_name) {
                                 let mutated = if is_node {
                                     let node_key: crate::graph::types::NodeKey =
                                         slotmap::KeyData::from_ffi(entity_id).into();
-                                    if let Some(node) =
-                                        named_graph.write_buf.get_node_mut(node_key)
+                                    if let Some(node) = named_graph.write_buf.get_node_mut(node_key)
                                     {
                                         node.valid_to = wall_ms;
                                         true
@@ -1699,8 +1708,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                 } else {
                                     let edge_key: crate::graph::types::EdgeKey =
                                         slotmap::KeyData::from_ffi(entity_id).into();
-                                    if let Some(edge) =
-                                        named_graph.write_buf.get_edge_mut(edge_key)
+                                    if let Some(edge) = named_graph.write_buf.get_edge_mut(edge_key)
                                     {
                                         edge.valid_to = wall_ms;
                                         true
@@ -1721,9 +1729,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                         ctx.shard_databases
                                             .wal_append(ctx.shard_id, Bytes::from(record));
                                     }
-                                    responses.push(Frame::SimpleString(
-                                        Bytes::from_static(b"OK"),
-                                    ));
+                                    responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
                                 } else {
                                     drop(gs);
                                     responses.push(Frame::Error(Bytes::from_static(
@@ -1732,9 +1738,8 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                 }
                             } else {
                                 drop(gs);
-                                responses.push(Frame::Error(Bytes::from_static(
-                                    ERR_GRAPH_NOT_FOUND,
-                                )));
+                                responses
+                                    .push(Frame::Error(Bytes::from_static(ERR_GRAPH_NOT_FOUND)));
                             }
                         }
                         #[cfg(not(feature = "graph"))]
@@ -1754,7 +1759,10 @@ pub(crate) async fn handle_connection_sharded_monoio<
             if is_ws_command(cmd) {
                 let sub = match parse_ws_subcommand(cmd_args) {
                     Ok(s) => s,
-                    Err(e) => { responses.push(e); continue; }
+                    Err(e) => {
+                        responses.push(e);
+                        continue;
+                    }
                 };
 
                 if sub.eq_ignore_ascii_case(b"CREATE") {
@@ -1771,7 +1779,8 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                 created_at,
                             };
                             {
-                                let mut guard = ctx.shard_databases.workspace_registry(ctx.shard_id);
+                                let mut guard =
+                                    ctx.shard_databases.workspace_registry(ctx.shard_id);
                                 let reg = guard.get_or_insert_with(|| {
                                     Box::new(crate::workspace::WorkspaceRegistry::new())
                                 });
@@ -1779,15 +1788,18 @@ pub(crate) async fn handle_connection_sharded_monoio<
                             }
                             // WAL: WorkspaceCreate record
                             let payload = crate::workspace::wal::encode_workspace_create(
-                                ws_id.as_bytes(), &ws_name,
+                                ws_id.as_bytes(),
+                                &ws_name,
                             );
                             let mut wal_buf = Vec::new();
                             crate::persistence::wal_v3::record::write_wal_v3_record(
-                                &mut wal_buf, 0,
+                                &mut wal_buf,
+                                0,
                                 crate::persistence::wal_v3::record::WalRecordType::WorkspaceCreate,
                                 &payload,
                             );
-                            ctx.shard_databases.wal_append(ctx.shard_id, Bytes::from(wal_buf));
+                            ctx.shard_databases
+                                .wal_append(ctx.shard_id, Bytes::from(wal_buf));
                             responses.push(Frame::BulkString(Bytes::from(ws_id.to_string())));
                         }
                         Err(e) => responses.push(e),
@@ -1801,7 +1813,8 @@ pub(crate) async fn handle_connection_sharded_monoio<
                             match parse_workspace_id_from_bytes(&ws_id_raw) {
                                 Some(ws_id) => {
                                     let removed = {
-                                        let mut guard = ctx.shard_databases.workspace_registry(ctx.shard_id);
+                                        let mut guard =
+                                            ctx.shard_databases.workspace_registry(ctx.shard_id);
                                         match guard.as_mut() {
                                             Some(reg) => reg.remove(&ws_id).is_some(),
                                             None => false,
@@ -1818,22 +1831,30 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                             crate::persistence::wal_v3::record::WalRecordType::WorkspaceDrop,
                                             &payload,
                                         );
-                                        ctx.shard_databases.wal_append(ctx.shard_id, Bytes::from(wal_buf));
+                                        ctx.shard_databases
+                                            .wal_append(ctx.shard_id, Bytes::from(wal_buf));
                                         // Best-effort cleanup: delete all KV keys with ws prefix (WS-03).
                                         {
                                             let prefix = format!("{{{}}}:", ws_id.as_hex());
-                                            let mut db_guard = ctx.shard_databases.write_db(ctx.shard_id, 0);
-                                            let keys_to_delete: Vec<Vec<u8>> = db_guard.keys()
-                                                .filter(|k| k.as_bytes().starts_with(prefix.as_bytes()))
+                                            let mut db_guard =
+                                                ctx.shard_databases.write_db(ctx.shard_id, 0);
+                                            let keys_to_delete: Vec<Vec<u8>> = db_guard
+                                                .keys()
+                                                .filter(|k| {
+                                                    k.as_bytes().starts_with(prefix.as_bytes())
+                                                })
                                                 .map(|k| k.as_bytes().to_vec())
                                                 .collect();
                                             for key in &keys_to_delete {
                                                 db_guard.remove(key);
                                             }
                                         }
-                                        responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
+                                        responses
+                                            .push(Frame::SimpleString(Bytes::from_static(b"OK")));
                                     } else {
-                                        responses.push(Frame::Error(Bytes::from_static(ERR_WS_NOT_FOUND)));
+                                        responses.push(Frame::Error(Bytes::from_static(
+                                            ERR_WS_NOT_FOUND,
+                                        )));
                                     }
                                 }
                                 None => responses.push(Frame::Error(Bytes::from_static(
@@ -1851,13 +1872,19 @@ pub(crate) async fn handle_connection_sharded_monoio<
                         Ok(()) => {
                             let guard = ctx.shard_databases.workspace_registry(ctx.shard_id);
                             let entries: Vec<Frame> = match guard.as_ref() {
-                                Some(reg) => reg.iter().map(|(id, meta)| {
-                                    Frame::Array(vec![
-                                        Frame::BulkString(Bytes::from(id.to_string())),
-                                        Frame::BulkString(meta.name.clone()),
-                                        Frame::Integer(meta.created_at),
-                                    ].into())
-                                }).collect(),
+                                Some(reg) => reg
+                                    .iter()
+                                    .map(|(id, meta)| {
+                                        Frame::Array(
+                                            vec![
+                                                Frame::BulkString(Bytes::from(id.to_string())),
+                                                Frame::BulkString(meta.name.clone()),
+                                                Frame::Integer(meta.created_at),
+                                            ]
+                                            .into(),
+                                        )
+                                    })
+                                    .collect(),
                                 None => vec![],
                             };
                             responses.push(Frame::Array(entries.into()));
@@ -1869,30 +1896,34 @@ pub(crate) async fn handle_connection_sharded_monoio<
 
                 if sub.eq_ignore_ascii_case(b"INFO") {
                     match validate_ws_info(cmd_args) {
-                        Ok(ws_id_raw) => {
-                            match parse_workspace_id_from_bytes(&ws_id_raw) {
-                                Some(ws_id) => {
-                                    let guard = ctx.shard_databases.workspace_registry(ctx.shard_id);
-                                    let found = guard.as_ref().and_then(|reg| reg.get(&ws_id));
-                                    match found {
-                                        Some(meta) => {
-                                            responses.push(Frame::Array(vec![
+                        Ok(ws_id_raw) => match parse_workspace_id_from_bytes(&ws_id_raw) {
+                            Some(ws_id) => {
+                                let guard = ctx.shard_databases.workspace_registry(ctx.shard_id);
+                                let found = guard.as_ref().and_then(|reg| reg.get(&ws_id));
+                                match found {
+                                    Some(meta) => {
+                                        responses.push(Frame::Array(
+                                            vec![
                                                 Frame::BulkString(Bytes::from_static(b"id")),
                                                 Frame::BulkString(Bytes::from(meta.id.to_string())),
                                                 Frame::BulkString(Bytes::from_static(b"name")),
                                                 Frame::BulkString(meta.name.clone()),
-                                                Frame::BulkString(Bytes::from_static(b"created_at")),
+                                                Frame::BulkString(Bytes::from_static(
+                                                    b"created_at",
+                                                )),
                                                 Frame::Integer(meta.created_at),
-                                            ].into()));
-                                        }
-                                        None => responses.push(Frame::Error(Bytes::from_static(ERR_WS_NOT_FOUND))),
+                                            ]
+                                            .into(),
+                                        ));
                                     }
+                                    None => responses
+                                        .push(Frame::Error(Bytes::from_static(ERR_WS_NOT_FOUND))),
                                 }
-                                None => responses.push(Frame::Error(Bytes::from_static(
-                                    crate::command::workspace::ERR_WS_INVALID_ID,
-                                ))),
                             }
-                        }
+                            None => responses.push(Frame::Error(Bytes::from_static(
+                                crate::command::workspace::ERR_WS_INVALID_ID,
+                            ))),
+                        },
                         Err(e) => responses.push(e),
                     }
                     continue;
@@ -1902,19 +1933,28 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     match validate_ws_auth(cmd_args) {
                         Ok(ws_id_raw) => {
                             if conn.workspace_id.is_some() {
-                                responses.push(Frame::Error(Bytes::from_static(ERR_WS_ALREADY_BOUND)));
+                                responses
+                                    .push(Frame::Error(Bytes::from_static(ERR_WS_ALREADY_BOUND)));
                             } else {
                                 match parse_workspace_id_from_bytes(&ws_id_raw) {
                                     Some(ws_id) => {
                                         let found = {
-                                            let guard = ctx.shard_databases.workspace_registry(ctx.shard_id);
-                                            guard.as_ref().map_or(false, |reg| reg.get(&ws_id).is_some())
+                                            let guard = ctx
+                                                .shard_databases
+                                                .workspace_registry(ctx.shard_id);
+                                            guard
+                                                .as_ref()
+                                                .map_or(false, |reg| reg.get(&ws_id).is_some())
                                         };
                                         if found {
                                             conn.workspace_id = Some(ws_id);
-                                            responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
+                                            responses.push(Frame::SimpleString(
+                                                Bytes::from_static(b"OK"),
+                                            ));
                                         } else {
-                                            responses.push(Frame::Error(Bytes::from_static(ERR_WS_NOT_FOUND)));
+                                            responses.push(Frame::Error(Bytes::from_static(
+                                                ERR_WS_NOT_FOUND,
+                                            )));
                                         }
                                     }
                                     None => responses.push(Frame::Error(Bytes::from_static(
@@ -1937,17 +1977,22 @@ pub(crate) async fn handle_connection_sharded_monoio<
             if is_mq_command(cmd) {
                 let sub = match parse_mq_subcommand(cmd_args) {
                     Ok(s) => s,
-                    Err(e) => { responses.push(e); continue; }
+                    Err(e) => {
+                        responses.push(e);
+                        continue;
+                    }
                 };
 
                 if sub.eq_ignore_ascii_case(b"CREATE") {
                     match validate_mq_create(cmd_args) {
                         Ok((queue_key, max_delivery_count, _debounce_ms)) => {
                             let effective_key = crate::workspace::workspace_key(
-                                conn.workspace_id.as_ref(), &queue_key,
+                                conn.workspace_id.as_ref(),
+                                &queue_key,
                             );
                             // Create or get Stream in db
-                            let mut db_guard = ctx.shard_databases.write_db(ctx.shard_id, conn.selected_db);
+                            let mut db_guard =
+                                ctx.shard_databases.write_db(ctx.shard_id, conn.selected_db);
                             match db_guard.get_or_create_stream(&effective_key) {
                                 Ok(stream) => {
                                     stream.durable = true;
@@ -1965,10 +2010,12 @@ pub(crate) async fn handle_connection_sharded_monoio<
 
                             // Store config in per-shard registry
                             let config = crate::mq::DurableStreamConfig::new(
-                                effective_key.clone(), max_delivery_count,
+                                effective_key.clone(),
+                                max_delivery_count,
                             );
                             {
-                                let mut guard = ctx.shard_databases.durable_queue_registry(ctx.shard_id);
+                                let mut guard =
+                                    ctx.shard_databases.durable_queue_registry(ctx.shard_id);
                                 let reg = guard.get_or_insert_with(|| {
                                     Box::new(crate::mq::DurableQueueRegistry::new())
                                 });
@@ -1977,15 +2024,18 @@ pub(crate) async fn handle_connection_sharded_monoio<
 
                             // WAL: MqCreate record
                             let payload = crate::mq::wal::encode_mq_create(
-                                &effective_key, max_delivery_count,
+                                &effective_key,
+                                max_delivery_count,
                             );
                             let mut wal_buf = Vec::new();
                             crate::persistence::wal_v3::record::write_wal_v3_record(
-                                &mut wal_buf, 0,
+                                &mut wal_buf,
+                                0,
                                 crate::persistence::wal_v3::record::WalRecordType::MqCreate,
                                 &payload,
                             );
-                            ctx.shard_databases.wal_append(ctx.shard_id, Bytes::from(wal_buf));
+                            ctx.shard_databases
+                                .wal_append(ctx.shard_id, Bytes::from(wal_buf));
                             responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
                         }
                         Err(e) => responses.push(e),
@@ -1997,24 +2047,33 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     match validate_mq_push(cmd_args) {
                         Ok((queue_key, fields)) => {
                             let effective_key = crate::workspace::workspace_key(
-                                conn.workspace_id.as_ref(), &queue_key,
+                                conn.workspace_id.as_ref(),
+                                &queue_key,
                             );
-                            let mut db_guard = ctx.shard_databases.write_db(ctx.shard_id, conn.selected_db);
+                            let mut db_guard =
+                                ctx.shard_databases.write_db(ctx.shard_id, conn.selected_db);
                             match db_guard.get_stream_mut(&effective_key) {
                                 Ok(Some(stream)) => {
                                     if !stream.durable {
-                                        responses.push(Frame::Error(Bytes::from_static(ERR_MQ_NOT_DURABLE)));
+                                        responses.push(Frame::Error(Bytes::from_static(
+                                            ERR_MQ_NOT_DURABLE,
+                                        )));
                                     } else {
                                         let msg_id = stream.next_auto_id();
                                         let msg_id = stream.add(msg_id, fields);
                                         drop(db_guard);
                                         // Mark pending for any registered triggers
                                         {
-                                            let mut trig_guard = ctx.shard_databases.trigger_registry(ctx.shard_id);
+                                            let mut trig_guard =
+                                                ctx.shard_databases.trigger_registry(ctx.shard_id);
                                             if let Some(reg) = trig_guard.as_mut() {
-                                                let trig_key = if let Some(ws_id) = conn.workspace_id.as_ref() {
+                                                let trig_key = if let Some(ws_id) =
+                                                    conn.workspace_id.as_ref()
+                                                {
                                                     let ws_hex = ws_id.as_hex();
-                                                    let mut k = Vec::with_capacity(ws_hex.len() + 1 + queue_key.len());
+                                                    let mut k = Vec::with_capacity(
+                                                        ws_hex.len() + 1 + queue_key.len(),
+                                                    );
                                                     k.extend_from_slice(ws_hex.as_bytes());
                                                     k.push(b':');
                                                     k.extend_from_slice(&queue_key);
@@ -2024,19 +2083,22 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                                 };
                                                 if let Some(trig_entry) = reg.get_mut(&trig_key) {
                                                     if trig_entry.pending_fire_ms == 0 {
-                                                        let fire_at = ctx.cached_clock.ms() + trig_entry.debounce_ms;
+                                                        let fire_at = ctx.cached_clock.ms()
+                                                            + trig_entry.debounce_ms;
                                                         trig_entry.pending_fire_ms = fire_at;
                                                     }
                                                 }
                                             }
                                         }
-                                        responses.push(Frame::BulkString(Bytes::from(
-                                            format!("{}-{}", msg_id.ms, msg_id.seq),
-                                        )));
+                                        responses.push(Frame::BulkString(Bytes::from(format!(
+                                            "{}-{}",
+                                            msg_id.ms, msg_id.seq
+                                        ))));
                                     }
                                 }
                                 Ok(None) => {
-                                    responses.push(Frame::Error(Bytes::from_static(ERR_MQ_NOT_DURABLE)));
+                                    responses
+                                        .push(Frame::Error(Bytes::from_static(ERR_MQ_NOT_DURABLE)));
                                 }
                                 Err(e) => responses.push(e),
                             }
@@ -2050,23 +2112,28 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     match validate_mq_pop(cmd_args) {
                         Ok((queue_key, count)) => {
                             let effective_key = crate::workspace::workspace_key(
-                                conn.workspace_id.as_ref(), &queue_key,
+                                conn.workspace_id.as_ref(),
+                                &queue_key,
                             );
                             let group_name = Bytes::from_static(b"__mq_consumers");
                             let consumer_name = Bytes::from_static(b"__mq_default");
-                            let mut db_guard = ctx.shard_databases.write_db(ctx.shard_id, conn.selected_db);
+                            let mut db_guard =
+                                ctx.shard_databases.write_db(ctx.shard_id, conn.selected_db);
 
                             // Read max_delivery_count before mutating
                             let mdc = match db_guard.get_stream_mut(&effective_key) {
                                 Ok(Some(stream)) => {
                                     if !stream.durable {
-                                        responses.push(Frame::Error(Bytes::from_static(ERR_MQ_NOT_DURABLE)));
+                                        responses.push(Frame::Error(Bytes::from_static(
+                                            ERR_MQ_NOT_DURABLE,
+                                        )));
                                         continue;
                                     }
                                     stream.max_delivery_count
                                 }
                                 Ok(None) => {
-                                    responses.push(Frame::Error(Bytes::from_static(ERR_MQ_NOT_DURABLE)));
+                                    responses
+                                        .push(Frame::Error(Bytes::from_static(ERR_MQ_NOT_DURABLE)));
                                     continue;
                                 }
                                 Err(e) => {
@@ -2079,10 +2146,17 @@ pub(crate) async fn handle_connection_sharded_monoio<
                             let request_count = count + (mdc as usize);
                             let stream = match db_guard.get_stream_mut(&effective_key) {
                                 Ok(Some(s)) => s,
-                                _ => { responses.push(Frame::Error(Bytes::from_static(ERR_MQ_NOT_DURABLE))); continue; }
+                                _ => {
+                                    responses
+                                        .push(Frame::Error(Bytes::from_static(ERR_MQ_NOT_DURABLE)));
+                                    continue;
+                                }
                             };
                             let claimed = match stream.read_group_new(
-                                &group_name, &consumer_name, Some(request_count), false,
+                                &group_name,
+                                &consumer_name,
+                                Some(request_count),
+                                false,
                             ) {
                                 Ok(entries) => entries,
                                 Err(_) => {
@@ -2097,7 +2171,9 @@ pub(crate) async fn handle_connection_sharded_monoio<
                             let mut dlq_ack_ids: Vec<StreamId> = Vec::new();
                             for (id, fields) in &claimed {
                                 // Check delivery_count from PEL
-                                let delivery_count = stream.groups.get(group_name.as_ref())
+                                let delivery_count = stream
+                                    .groups
+                                    .get(group_name.as_ref())
                                     .and_then(|g| g.pel.get(id))
                                     .map(|pe| pe.delivery_count)
                                     .unwrap_or(1);
@@ -2135,20 +2211,27 @@ pub(crate) async fn handle_connection_sharded_monoio<
                             }
 
                             // Format results as array of arrays (XREADGROUP format)
-                            let result_frames: Vec<Frame> = results.iter().map(|(id, fields)| {
-                                let mut entry_frames = Vec::with_capacity(2);
-                                entry_frames.push(Frame::BulkString(Bytes::from(
-                                    format!("{}-{}", id.ms, id.seq),
-                                )));
-                                let field_frames: Vec<Frame> = fields.iter()
-                                    .flat_map(|(f, v)| vec![
-                                        Frame::BulkString(f.clone()),
-                                        Frame::BulkString(v.clone()),
-                                    ])
-                                    .collect();
-                                entry_frames.push(Frame::Array(field_frames.into()));
-                                Frame::Array(entry_frames.into())
-                            }).collect();
+                            let result_frames: Vec<Frame> = results
+                                .iter()
+                                .map(|(id, fields)| {
+                                    let mut entry_frames = Vec::with_capacity(2);
+                                    entry_frames.push(Frame::BulkString(Bytes::from(format!(
+                                        "{}-{}",
+                                        id.ms, id.seq
+                                    ))));
+                                    let field_frames: Vec<Frame> = fields
+                                        .iter()
+                                        .flat_map(|(f, v)| {
+                                            vec![
+                                                Frame::BulkString(f.clone()),
+                                                Frame::BulkString(v.clone()),
+                                            ]
+                                        })
+                                        .collect();
+                                    entry_frames.push(Frame::Array(field_frames.into()));
+                                    Frame::Array(entry_frames.into())
+                                })
+                                .collect();
                             responses.push(Frame::Array(result_frames.into()));
                         }
                         Err(e) => responses.push(e),
@@ -2160,12 +2243,15 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     match validate_mq_ack(cmd_args) {
                         Ok((queue_key, msg_ids)) => {
                             let effective_key = crate::workspace::workspace_key(
-                                conn.workspace_id.as_ref(), &queue_key,
+                                conn.workspace_id.as_ref(),
+                                &queue_key,
                             );
-                            let ids: Vec<StreamId> = msg_ids.iter()
+                            let ids: Vec<StreamId> = msg_ids
+                                .iter()
                                 .map(|(ms, seq)| StreamId { ms: *ms, seq: *seq })
                                 .collect();
-                            let mut db_guard = ctx.shard_databases.write_db(ctx.shard_id, conn.selected_db);
+                            let mut db_guard =
+                                ctx.shard_databases.write_db(ctx.shard_id, conn.selected_db);
                             match db_guard.get_stream_mut(&effective_key) {
                                 Ok(Some(stream)) => {
                                     let group_name = Bytes::from_static(b"__mq_consumers");
@@ -2175,7 +2261,9 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                             // Emit MqAck WAL record for each acked ID
                                             for (ms, seq) in &msg_ids {
                                                 let payload = crate::mq::wal::encode_mq_ack(
-                                                    &effective_key, *ms, *seq,
+                                                    &effective_key,
+                                                    *ms,
+                                                    *seq,
                                                 );
                                                 let mut wal_buf = Vec::new();
                                                 crate::persistence::wal_v3::record::write_wal_v3_record(
@@ -2183,9 +2271,8 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                                     crate::persistence::wal_v3::record::WalRecordType::MqAck,
                                                     &payload,
                                                 );
-                                                ctx.shard_databases.wal_append(
-                                                    ctx.shard_id, Bytes::from(wal_buf),
-                                                );
+                                                ctx.shard_databases
+                                                    .wal_append(ctx.shard_id, Bytes::from(wal_buf));
                                             }
                                             responses.push(Frame::Integer(acked_count as i64));
                                         }
@@ -2205,7 +2292,8 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     match validate_mq_dlqlen(cmd_args) {
                         Ok(queue_key) => {
                             let effective_key = crate::workspace::workspace_key(
-                                conn.workspace_id.as_ref(), &queue_key,
+                                conn.workspace_id.as_ref(),
+                                &queue_key,
                             );
                             let dlq_key = {
                                 let mut buf = Vec::with_capacity(effective_key.len() + 8);
@@ -2213,7 +2301,8 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                 buf.extend_from_slice(b"::mq:dlq");
                                 Bytes::from(buf)
                             };
-                            let mut db_guard = ctx.shard_databases.write_db(ctx.shard_id, conn.selected_db);
+                            let mut db_guard =
+                                ctx.shard_databases.write_db(ctx.shard_id, conn.selected_db);
                             let len = match db_guard.get_stream_mut(&dlq_key) {
                                 Ok(Some(stream)) => stream.length as i64,
                                 _ => 0i64,
@@ -2229,7 +2318,8 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     match validate_mq_trigger(cmd_args) {
                         Ok((queue_key, callback_cmd, debounce_ms)) => {
                             let effective_key = crate::workspace::workspace_key(
-                                conn.workspace_id.as_ref(), &queue_key,
+                                conn.workspace_id.as_ref(),
+                                &queue_key,
                             );
                             let trig_key = if let Some(ws_id) = conn.workspace_id.as_ref() {
                                 let ws_hex = ws_id.as_hex();
@@ -2266,7 +2356,8 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     match validate_mq_publish(cmd_args) {
                         Ok((queue_key, fields)) => {
                             let effective_key = crate::workspace::workspace_key(
-                                conn.workspace_id.as_ref(), &queue_key,
+                                conn.workspace_id.as_ref(),
+                                &queue_key,
                             );
                             if let Some(ref mut txn) = conn.active_cross_txn {
                                 txn.record_mq(effective_key, fields);
@@ -2571,9 +2662,25 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                         offset: limit_offset,
                                         count: limit_count,
                                     };
+                                    // Phase 171 HYB-02 / SCAT-02: resolve AS_OF / TXN LSN
+                                    // ONCE on the coordinator and forward to the scatter
+                                    // helper so responders honor temporal snapshots.
+                                    let as_of_lsn = match resolve_ft_search_as_of_lsn(
+                                        cmd_args,
+                                        Some(&ctx.shard_databases),
+                                        ctx.shard_id,
+                                        conn.active_cross_txn.as_ref(),
+                                    ) {
+                                        Ok(lsn) => lsn,
+                                        Err(err_frame) => {
+                                            responses.push(err_frame);
+                                            continue;
+                                        }
+                                    };
                                     let response =
                                         crate::shard::scatter_hybrid::scatter_hybrid_search(
                                             hq,
+                                            as_of_lsn,
                                             ctx.shard_id,
                                             ctx.num_shards,
                                             &ctx.shard_databases,
@@ -2583,7 +2690,11 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                         .await;
                                     let mut response = response;
                                     if let Some(ws_id) = conn.workspace_id.as_ref() {
-                                        strip_workspace_prefix_from_response(ws_id, cmd, &mut response);
+                                        strip_workspace_prefix_from_response(
+                                            ws_id,
+                                            cmd,
+                                            &mut response,
+                                        );
                                     }
                                     responses.push(response);
                                     continue;
@@ -2650,7 +2761,11 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                                 .await;
                                             let mut response = response;
                                             if let Some(ws_id) = conn.workspace_id.as_ref() {
-                                                strip_workspace_prefix_from_response(ws_id, cmd, &mut response);
+                                                strip_workspace_prefix_from_response(
+                                                    ws_id,
+                                                    cmd,
+                                                    &mut response,
+                                                );
                                             }
                                             responses.push(response);
                                             continue;
@@ -2765,6 +2880,9 @@ pub(crate) async fn handle_connection_sharded_monoio<
                         }
 
                         // ── Vector FT.SEARCH (KNN / SPARSE): existing path ────────────────
+                        // Phase 171 SCAT-01: resolve AS_OF / TXN snapshot LSN ONCE on
+                        // the coordinator and forward through the scatter helper so
+                        // every responder honors the same temporal snapshot.
                         let response =
                             match crate::command::vector_search::parse_ft_search_args(cmd_args) {
                                 Ok((index_name, query_blob, k, filter, _offset, _count)) => {
@@ -2773,17 +2891,28 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                             b"ERR FILTER not supported in multi-shard mode yet",
                                         ))
                                     } else {
-                                        crate::shard::coordinator::scatter_vector_search_remote(
-                                            index_name,
-                                            query_blob,
-                                            k,
-                                            ctx.shard_id,
-                                            ctx.num_shards,
-                                            &ctx.shard_databases,
-                                            &ctx.dispatch_tx,
-                                            &ctx.spsc_notifiers,
-                                        )
-                                        .await
+                                        match resolve_ft_search_as_of_lsn(
+                                        cmd_args,
+                                        Some(&ctx.shard_databases),
+                                        ctx.shard_id,
+                                        conn.active_cross_txn.as_ref(),
+                                    ) {
+                                        Err(err_frame) => err_frame,
+                                        Ok(as_of_lsn) => {
+                                            crate::shard::coordinator::scatter_vector_search_remote(
+                                                index_name,
+                                                query_blob,
+                                                k,
+                                                as_of_lsn,
+                                                ctx.shard_id,
+                                                ctx.num_shards,
+                                                &ctx.shard_databases,
+                                                &ctx.dispatch_tx,
+                                                &ctx.spsc_notifiers,
+                                            )
+                                            .await
+                                        }
+                                    }
                                     }
                                 }
                                 Err(err_frame) => err_frame,
@@ -3015,8 +3144,13 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                                     };
                                                     drop(ts_guard);
                                                     let mut response = response;
-                                                    if let Some(ws_id) = conn.workspace_id.as_ref() {
-                                                        strip_workspace_prefix_from_response(ws_id, cmd, &mut response);
+                                                    if let Some(ws_id) = conn.workspace_id.as_ref()
+                                                    {
+                                                        strip_workspace_prefix_from_response(
+                                                            ws_id,
+                                                            cmd,
+                                                            &mut response,
+                                                        );
                                                     }
                                                     responses.push(response);
                                                     continue;
@@ -3160,7 +3294,11 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                         drop(ts_guard);
                                         let mut response = response;
                                         if let Some(ws_id) = conn.workspace_id.as_ref() {
-                                            strip_workspace_prefix_from_response(ws_id, cmd, &mut response);
+                                            strip_workspace_prefix_from_response(
+                                                ws_id,
+                                                cmd,
+                                                &mut response,
+                                            );
                                         }
                                         responses.push(response);
                                         continue;
@@ -3414,17 +3552,23 @@ pub(crate) async fn handle_connection_sharded_monoio<
                             // Multi-key DEL: iterate all args for undo capture
                             for arg in cmd_args.iter() {
                                 if let Frame::BulkString(key_bytes) = arg {
-                                    if let Some(old_entry) = guard.get(key_bytes.as_ref()).cloned() {
+                                    if let Some(old_entry) = guard.get(key_bytes.as_ref()).cloned()
+                                    {
                                         txn.kv_undo.record_delete(key_bytes.clone(), old_entry);
                                         let lsn = txn.snapshot_lsn;
                                         let tid = txn.txn_id;
-                                        ctx.shard_databases.kv_intents(ctx.shard_id)
-                                            .record_write(key_bytes.clone(), lsn, tid);
+                                        ctx.shard_databases.kv_intents(ctx.shard_id).record_write(
+                                            key_bytes.clone(),
+                                            lsn,
+                                            tid,
+                                        );
                                     }
                                     // Key not found: nothing to undo, no intent registered
                                 }
                             }
-                        } else if let Some(key) = crate::server::conn::shared::extract_primary_key(cmd, cmd_args) {
+                        } else if let Some(key) =
+                            crate::server::conn::shared::extract_primary_key(cmd, cmd_args)
+                        {
                             // SET / HSET / INCR / etc. — single primary key
                             let old_entry = guard.get(key.as_ref()).cloned();
                             let lsn = txn.snapshot_lsn;
@@ -3433,8 +3577,11 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                 None => txn.kv_undo.record_insert(key.clone()),
                                 Some(entry) => txn.kv_undo.record_update(key.clone(), entry),
                             }
-                            ctx.shard_databases.kv_intents(ctx.shard_id)
-                                .record_write(key.clone(), lsn, tid);
+                            ctx.shard_databases.kv_intents(ctx.shard_id).record_write(
+                                key.clone(),
+                                lsn,
+                                tid,
+                            );
                         }
                     }
 
@@ -3557,7 +3704,9 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     // MVCC: hide keys written by uncommitted foreign transactions.
                     if conn.in_cross_txn() {
                         if let Some(ref txn) = conn.active_cross_txn {
-                            if let Some(key) = crate::server::conn::shared::extract_primary_key(cmd, cmd_args) {
+                            if let Some(key) =
+                                crate::server::conn::shared::extract_primary_key(cmd, cmd_args)
+                            {
                                 let snapshot_lsn = txn.snapshot_lsn;
                                 let my_txn_id = txn.txn_id;
                                 // Clone committed treemap to release vector_store lock
@@ -3568,7 +3717,12 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                 };
                                 let visible = {
                                     let intents = ctx.shard_databases.kv_intents(ctx.shard_id);
-                                    intents.is_key_visible(key.as_ref(), snapshot_lsn, my_txn_id, &committed)
+                                    intents.is_key_visible(
+                                        key.as_ref(),
+                                        snapshot_lsn,
+                                        my_txn_id,
+                                        &committed,
+                                    )
                                 };
                                 if !visible {
                                     responses.push(Frame::Null);

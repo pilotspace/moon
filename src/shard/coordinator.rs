@@ -686,6 +686,7 @@ pub async fn scatter_vector_search(
     index_name: Bytes,
     query_blob: Bytes,
     k: usize,
+    as_of_lsn: u64,
     my_shard: usize,
     num_shards: usize,
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
@@ -697,12 +698,19 @@ pub async fn scatter_vector_search(
 
     for shard_id in 0..num_shards {
         if shard_id == my_shard {
-            // Execute locally -- avoid SPSC overhead for local shard
-            local_result = Some(crate::command::vector_search::search_local(
+            // Execute locally -- avoid SPSC overhead for local shard.
+            // Phase 171 SCAT-01: thread as_of_lsn through the local branch so
+            // the coordinator honors temporal filtering on its own shard too.
+            local_result = Some(crate::command::vector_search::search_local_filtered(
                 vector_store,
                 &index_name,
                 &query_blob,
                 k,
+                None,
+                0,
+                usize::MAX,
+                None,
+                as_of_lsn,
             ));
         } else {
             let (reply_tx, reply_rx) = channel::oneshot();
@@ -710,6 +718,7 @@ pub async fn scatter_vector_search(
                 index_name: index_name.clone(),
                 query_blob: query_blob.clone(),
                 k,
+                as_of_lsn,
                 reply_tx,
             };
             spsc_send(dispatch_tx, my_shard, shard_id, msg, spsc_notifiers).await;
@@ -749,16 +758,30 @@ pub async fn scatter_vector_search_remote(
     index_name: Bytes,
     query_blob: Bytes,
     k: usize,
+    as_of_lsn: u64,
     my_shard: usize,
     num_shards: usize,
     shard_databases: &Arc<crate::shard::shared_databases::ShardDatabases>,
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
     spsc_notifiers: &[Arc<channel::Notify>],
 ) -> Frame {
-    // LOCAL: direct vector store access (avoids SPSC self-send)
+    // LOCAL: direct vector store access (avoids SPSC self-send).
+    // Phase 171 SCAT-01: honor AS_OF on the coordinator's own shard by
+    // routing through `search_local_filtered` with the resolved LSN rather
+    // than the AS_OF-unaware `search_local` helper.
     let local_result = {
         let mut vs = shard_databases.vector_store(my_shard);
-        crate::command::vector_search::search_local(&mut vs, &index_name, &query_blob, k)
+        crate::command::vector_search::search_local_filtered(
+            &mut vs,
+            &index_name,
+            &query_blob,
+            k,
+            None,
+            0,
+            usize::MAX,
+            None,
+            as_of_lsn,
+        )
     };
 
     // REMOTE: SPSC to all other shards
@@ -772,6 +795,7 @@ pub async fn scatter_vector_search_remote(
             index_name: index_name.clone(),
             query_blob: query_blob.clone(),
             k,
+            as_of_lsn,
             reply_tx,
         };
         spsc_send(dispatch_tx, my_shard, shard_id, msg, spsc_notifiers).await;

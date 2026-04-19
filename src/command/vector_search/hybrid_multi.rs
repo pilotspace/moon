@@ -77,6 +77,7 @@ pub fn execute_hybrid_search_local_raw_streams(
     top_k: usize,
     global_df: &std::collections::HashMap<String, u32>,
     global_n: u32,
+    as_of_lsn: u64,
 ) -> Frame {
     // ── Stream 1: BM25 with injected global IDF ──────────────────────────────
     let text_index = match text_store.get_index(index_name.as_ref()) {
@@ -99,23 +100,27 @@ pub fn execute_hybrid_search_local_raw_streams(
     let bm25 = bm25_to_search_results(&text_results);
 
     // ── Stream 2: dense KNN ──────────────────────────────────────────────────
+    // Phase 171 HYB-02 / SCAT-02: snapshot the committed treemap BEFORE
+    // get_index_mut so the dense branch honors AS_OF via MVCC filtering on
+    // multi-shard scatter. Matches the single-shard hybrid.rs pattern.
+    // `as_of_lsn == 0` → no temporal filtering (treemap still snapshotted for
+    // ACID-09 committed-entry visibility parity with search_local_raw).
+    let committed = vector_store.txn_manager().committed_treemap().clone();
     let idx = match vector_store.get_index_mut(index_name.as_ref()) {
         Some(ix) => ix,
         None => return Frame::Error(Bytes::from_static(b"ERR unknown index")),
     };
-    // v0.1.9 HYB-02 partial: multi-shard raw-streams path does not yet carry
-    // as_of_lsn — this path is invoked by the scatter coordinator from
-    // spsc_handler, and ShardMessage::VectorSearch / FtHybrid do not yet have
-    // as_of_lsn fields (SCAT-01). Until SCAT-01 lands, multi-shard hybrid
-    // skips AS_OF filtering (matching the non-hybrid multi-shard gap).
-    // Single-shard hybrid (the Lunaris default workspace model) already
-    // honors AS_OF via ft_search/dispatch.rs.
-    let empty_committed = roaring::RoaringTreemap::new();
-    let (dense_results, key_hash_to_key) =
-        match run_dense_knn(idx, dense_field, dense_blob, k_per_stream, 0, &empty_committed) {
-            Ok(v) => v,
-            Err(frame) => return frame,
-        };
+    let (dense_results, key_hash_to_key) = match run_dense_knn(
+        idx,
+        dense_field,
+        dense_blob,
+        k_per_stream,
+        as_of_lsn,
+        &committed,
+    ) {
+        Ok(v) => v,
+        Err(frame) => return frame,
+    };
 
     // ── Stream 3: sparse (optional) ──────────────────────────────────────────
     let sparse_results: Vec<SearchResult> = if let Some((sf, sblob)) = sparse {
@@ -373,6 +378,7 @@ mod tests {
             60,
             10,
             &empty_df,
+            0,
             0,
         );
         match result {

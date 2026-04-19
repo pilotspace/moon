@@ -231,6 +231,11 @@ pub struct FtHybridPayload {
     pub top_k: usize,
     pub global_df: std::collections::HashMap<String, u32>,
     pub global_n: u32,
+    /// Coordinator-resolved AS_OF / TXN snapshot LSN (Phase 171, HYB-02 / SCAT-02).
+    /// `0` means "no temporal filtering" (default for non-AS_OF hybrid callers).
+    /// Non-zero values are forwarded to the dense KNN stream for MVCC filtering.
+    /// BM25 stream remains AS_OF-unaware until text-index MVCC ships (v0.2).
+    pub as_of_lsn: u64,
     pub reply_tx: channel::OneshotSender<Frame>,
 }
 
@@ -335,10 +340,16 @@ pub enum ShardMessage {
     /// Execute a vector search query on this shard's VectorStore.
     /// Used for cross-shard scatter-gather: coordinator sends to all shards,
     /// each returns local top-K, coordinator merges.
+    ///
+    /// `as_of_lsn` carries the coordinator-resolved AS_OF / TXN snapshot LSN
+    /// (Phase 171, SCAT-01). `0` means "no temporal filtering" (default
+    /// behavior for non-AS_OF callers); non-zero values are the LSN boundary
+    /// applied by `search_local_raw` for MVCC filtering on the responder.
     VectorSearch {
         index_name: Bytes,
         query_blob: Bytes,
         k: usize,
+        as_of_lsn: u64,
         reply_tx: channel::OneshotSender<Frame>,
     },
     /// DFS Phase 1: collect per-term document frequency from this shard.

@@ -2313,8 +2313,24 @@ pub(crate) async fn handle_connection_sharded_inner<
                                                 offset: limit_offset,
                                                 count: limit_count,
                                             };
+                                            // Phase 171 HYB-02 / SCAT-02: resolve AS_OF /
+                                            // TXN LSN ONCE on the coordinator and forward to
+                                            // every responder via the scatter helper.
+                                            let as_of_lsn = match resolve_ft_search_as_of_lsn(
+                                                cmd_args,
+                                                Some(&ctx.shard_databases),
+                                                ctx.shard_id,
+                                                conn.active_cross_txn.as_ref(),
+                                            ) {
+                                                Ok(lsn) => lsn,
+                                                Err(err_frame) => {
+                                                    responses.push(err_frame);
+                                                    continue;
+                                                }
+                                            };
                                             let response = crate::shard::scatter_hybrid::scatter_hybrid_search(
                                                 hq,
+                                                as_of_lsn,
                                                 ctx.shard_id,
                                                 ctx.num_shards,
                                                 &ctx.shard_databases,
@@ -2459,6 +2475,9 @@ pub(crate) async fn handle_connection_sharded_inner<
                                 }
 
                                 // ── Vector FT.SEARCH (KNN / SPARSE): existing path ───────────
+                                // Phase 171 SCAT-01: resolve AS_OF / TXN snapshot LSN ONCE
+                                // on the coordinator and thread it through the scatter helper
+                                // so every responder honors the same temporal snapshot.
                                 let response = match crate::command::vector_search::parse_ft_search_args(cmd_args) {
                                     Ok((index_name, query_blob, k, filter, _offset, _count)) => {
                                         if filter.is_some() {
@@ -2466,12 +2485,22 @@ pub(crate) async fn handle_connection_sharded_inner<
                                                 b"ERR FILTER not supported in multi-shard mode yet",
                                             ))
                                         } else {
-                                            crate::shard::coordinator::scatter_vector_search_remote(
-                                                index_name, query_blob, k,
-                                                ctx.shard_id, ctx.num_shards,
-                                                &ctx.shard_databases,
-                                                &ctx.dispatch_tx, &ctx.spsc_notifiers,
-                                            ).await
+                                            match resolve_ft_search_as_of_lsn(
+                                                cmd_args,
+                                                Some(&ctx.shard_databases),
+                                                ctx.shard_id,
+                                                conn.active_cross_txn.as_ref(),
+                                            ) {
+                                                Err(err_frame) => err_frame,
+                                                Ok(as_of_lsn) => {
+                                                    crate::shard::coordinator::scatter_vector_search_remote(
+                                                        index_name, query_blob, k, as_of_lsn,
+                                                        ctx.shard_id, ctx.num_shards,
+                                                        &ctx.shard_databases,
+                                                        &ctx.dispatch_tx, &ctx.spsc_notifiers,
+                                                    ).await
+                                                }
+                                            }
                                         }
                                     }
                                     Err(err_frame) => err_frame,
