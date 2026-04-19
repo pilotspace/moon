@@ -3317,6 +3317,12 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 {
                     let mut gs = ctx.shard_databases.graph_store_write(ctx.shard_id);
                     let resp = if cmd.eq_ignore_ascii_case(b"GRAPH.QUERY") {
+                        // TODO(ACID-08 follow-up, per ROADMAP Phase 166 SC-1):
+                        // Cypher-write intent capture for GRAPH.QUERY CREATE/MERGE —
+                        // deferred. GRAPH.QUERY writes return result-set Frames (not
+                        // Frame::Integer(id)), so per-entity intent capture requires
+                        // plumbing the created NodeKey/EdgeKey list out of
+                        // graph_query_or_write.
                         crate::command::graph::graph_query_or_write(&mut gs, cmd_args)
                     } else {
                         crate::command::graph::dispatch_graph_write(&mut gs, cmd, cmd_args)
@@ -3328,6 +3334,22 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     let resp = crate::command::graph::dispatch_graph_read(&gs, cmd, cmd_args);
                     (resp, Vec::new())
                 };
+                // Phase 166: record graph intent for TXN rollback.
+                // Only capture explicit ADDNODE/ADDEDGE — Cypher-write paths
+                // (GRAPH.QUERY with CREATE/MERGE) do not uniformly return
+                // Frame::Integer and are deferred per the TODO above and
+                // ROADMAP Phase 166 SC-1 scope note.
+                if let Some(txn) = conn.active_cross_txn.as_mut() {
+                    let is_node = cmd.eq_ignore_ascii_case(b"GRAPH.ADDNODE");
+                    let is_edge = cmd.eq_ignore_ascii_case(b"GRAPH.ADDEDGE");
+                    if is_node || is_edge {
+                        if let Frame::Integer(id) = &response {
+                            if let Some(Frame::BulkString(gname)) = cmd_args.first() {
+                                txn.record_graph(*id as u64, is_node, gname.clone());
+                            }
+                        }
+                    }
+                }
                 for record in wal_records {
                     ctx.shard_databases
                         .wal_append(ctx.shard_id, bytes::Bytes::from(record));
