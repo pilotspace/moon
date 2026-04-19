@@ -77,6 +77,18 @@ pub enum PhysicalOp {
         on_create: Vec<SetItem>,
         on_match: Vec<SetItem>,
     },
+    /// `MATCH p = shortestPath(...)` — emits one row per path found from
+    /// `source` to `target` and binds `Value::Path(Vec<NodeKey>)` to
+    /// `path_var`. Added in v0.1.9 (CYP-04/05) on top of
+    /// `traversal::DijkstraTraversal::shortest_path`.
+    ShortestPath {
+        path_var: String,
+        source: String,
+        target: String,
+        max_hops: u32,
+        edge_types: Vec<String>,
+        direction: EdgeDirection,
+    },
 }
 
 /// Error during plan compilation.
@@ -266,6 +278,9 @@ pub fn compile(query: &CypherQuery) -> Result<PhysicalPlan, PlanError> {
             Clause::Match(m) => {
                 compile_match(m, &mut ops);
             }
+            Clause::ShortestPathMatch(sp) => {
+                compile_shortest_path_match(sp, &mut ops);
+            }
             Clause::Where(w) => {
                 ops.push(PhysicalOp::Filter {
                     expr: w.expr.clone(),
@@ -382,6 +397,89 @@ fn compile_match(m: &MatchClause, ops: &mut Vec<PhysicalOp>) {
             });
         }
     }
+}
+
+/// Compile a `MATCH p = shortestPath((a)-[*..N]-(b))` clause.
+///
+/// Emits: NodeScan(a) -> NodeScan(b) -> ShortestPath(a, b). The executor
+/// joins the two endpoint streams and calls the Dijkstra primitive per
+/// (src, dst) pair, binding `Value::Path(...)` to `path_var`.
+fn compile_shortest_path_match(sp: &ShortestPathMatchClause, ops: &mut Vec<PhysicalOp>) {
+    // Anonymous endpoint fallbacks for when the pattern omits variables.
+    let src_var = sp
+        .src
+        .variable
+        .clone()
+        .unwrap_or_else(|| "_sp_src".to_string());
+    let dst_var = sp
+        .dst
+        .variable
+        .clone()
+        .unwrap_or_else(|| "_sp_dst".to_string());
+
+    ops.push(PhysicalOp::NodeScan {
+        variable: src_var.clone(),
+        label: sp.src.labels.first().cloned(),
+    });
+    if !sp.src.properties.is_empty() {
+        ops.push(PhysicalOp::Filter {
+            expr: properties_to_filter(&src_var, &sp.src.properties),
+        });
+    }
+    ops.push(PhysicalOp::NodeScan {
+        variable: dst_var.clone(),
+        label: sp.dst.labels.first().cloned(),
+    });
+    if !sp.dst.properties.is_empty() {
+        ops.push(PhysicalOp::Filter {
+            expr: properties_to_filter(&dst_var, &sp.dst.properties),
+        });
+    }
+
+    ops.push(PhysicalOp::ShortestPath {
+        path_var: sp.path_var.clone(),
+        source: src_var,
+        target: dst_var,
+        max_hops: sp.max_hops,
+        edge_types: sp.edge_types.clone(),
+        direction: sp.direction,
+    });
+}
+
+/// Build a filter expression `var.k1 = v1 AND var.k2 = v2 ...` from a
+/// PatternNode's inline property map. Mirrors how existing MATCH patterns
+/// behave, but expressed as a standalone Filter op for ShortestPath
+/// endpoint selection.
+fn properties_to_filter(var: &str, props: &[(String, Expr)]) -> Expr {
+    let mut iter = props.iter();
+    let first = match iter.next() {
+        Some(p) => p,
+        None => return Expr::Bool(true),
+    };
+    let mut expr = Expr::BinaryOp {
+        left: Box::new(Expr::PropertyAccess {
+            object: Box::new(Expr::Ident(var.to_string())),
+            property: first.0.clone(),
+        }),
+        op: BinaryOperator::Equal,
+        right: Box::new(first.1.clone()),
+    };
+    for (k, v) in iter {
+        let next = Expr::BinaryOp {
+            left: Box::new(Expr::PropertyAccess {
+                object: Box::new(Expr::Ident(var.to_string())),
+                property: k.clone(),
+            }),
+            op: BinaryOperator::Equal,
+            right: Box::new(v.clone()),
+        };
+        expr = Expr::BinaryOp {
+            left: Box::new(expr),
+            op: BinaryOperator::And,
+            right: Box::new(next),
+        };
+    }
+    expr
 }
 
 /// Hash a Cypher query string for plan cache lookup.

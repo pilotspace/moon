@@ -13,6 +13,10 @@ pub struct CypherQuery {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Clause {
     Match(MatchClause),
+    /// `MATCH <ident> = shortestPath((a)-[*..N]-(b))` — path-variable
+    /// binding with the `shortestPath()` function wrapper. Added in v0.1.9
+    /// (CYP-04/05) to support the Lunaris PathReasoningRetriever shape.
+    ShortestPathMatch(ShortestPathMatchClause),
     Where(WhereClause),
     Return(ReturnClause),
     Create(CreateClause),
@@ -25,6 +29,19 @@ pub enum Clause {
     OrderBy(OrderByClause),
     Limit(LimitClause),
     Skip(SkipClause),
+}
+
+/// `MATCH p = shortestPath((a)-[*..N]-(b))` — one source and one target
+/// endpoint pattern plus the variable-length edge in between.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ShortestPathMatchClause {
+    /// Identifier bound to the path result (e.g. `p`).
+    pub path_var: String,
+    pub src: PatternNode,
+    pub dst: PatternNode,
+    pub max_hops: u32,
+    pub edge_types: Vec<String>,
+    pub direction: EdgeDirection,
 }
 
 // ---------------------------------------------------------------------------
@@ -255,6 +272,16 @@ pub enum Expr {
     IsNull { expr: Box<Expr>, negated: bool },
     /// `expr IN list_expr`
     InList { expr: Box<Expr>, list: Box<Expr> },
+    /// `shortestPath((a)-[*..N]-(b))` as a RETURN/expression form.
+    /// Added in v0.1.9 (CYP-04/05). Evaluates to `Value::Path(...)` at
+    /// runtime by resolving `a` and `b` from the current row.
+    ShortestPathCall {
+        src: PatternNode,
+        dst: PatternNode,
+        max_hops: u32,
+        edge_types: Vec<String>,
+        direction: EdgeDirection,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

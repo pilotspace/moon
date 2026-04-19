@@ -36,6 +36,10 @@ pub enum Value {
     Edge(EdgeKey),
     List(Vec<Value>),
     Map(Vec<(String, Value)>),
+    /// A path: ordered list of NodeKey from source to target. v0.1.9
+    /// (CYP-04/05) adds this variant for `MATCH p = shortestPath(...)`.
+    /// Serialized to RESP3 as Array[Integer] of node IDs.
+    Path(Vec<NodeKey>),
 }
 
 /// A single result row: variable bindings.

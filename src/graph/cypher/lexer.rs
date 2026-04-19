@@ -173,10 +173,15 @@ pub struct SpannedToken<'a> {
 
 /// Cypher lexer wrapping logos.
 ///
-/// Provides `next_token()` and `peek()` with zero allocation.
+/// Provides `next_token()`, `peek()`, and `peek_nth(1)` with zero
+/// allocation. 2-slot lookahead is required by the v0.1.9 `MATCH p =
+/// shortestPath(...)` parser rule, which must decide between path-variable
+/// binding and a naked pattern after seeing the `MATCH` keyword.
 pub struct Lexer<'a> {
     inner: logos::Lexer<'a, Token<'a>>,
-    peeked: Option<Option<SpannedToken<'a>>>,
+    /// Ring of prefetched tokens. Index 0 is the next token returned by
+    /// `next_token`; index 1 is the token after it.
+    peeked: [Option<Option<SpannedToken<'a>>>; 2],
 }
 
 impl<'a> Lexer<'a> {
@@ -184,26 +189,41 @@ impl<'a> Lexer<'a> {
     pub fn new(input: &'a [u8]) -> Self {
         Self {
             inner: Token::lexer(input),
-            peeked: None,
+            peeked: [None, None],
         }
     }
 
     /// Advance and return the next token, or `None` at EOF.
     /// Skips comments automatically.
     pub fn next_token(&mut self) -> Option<SpannedToken<'a>> {
-        if let Some(peeked) = self.peeked.take() {
-            return peeked;
+        if let Some(p0) = self.peeked[0].take() {
+            self.peeked[0] = self.peeked[1].take();
+            return p0;
         }
         self.advance()
     }
 
     /// Peek at the next token without consuming it.
     pub fn peek(&mut self) -> Option<&SpannedToken<'a>> {
-        if self.peeked.is_none() {
+        if self.peeked[0].is_none() {
             let next = self.advance();
-            self.peeked = Some(next);
+            self.peeked[0] = Some(next);
         }
-        self.peeked.as_ref().and_then(|opt| opt.as_ref())
+        self.peeked[0].as_ref().and_then(|opt| opt.as_ref())
+    }
+
+    /// Peek two tokens ahead (the token that comes *after* `peek()`).
+    pub fn peek2(&mut self) -> Option<&SpannedToken<'a>> {
+        // Ensure slot 0 is populated first so the ring invariant holds.
+        if self.peeked[0].is_none() {
+            let next = self.advance();
+            self.peeked[0] = Some(next);
+        }
+        if self.peeked[1].is_none() {
+            let next = self.advance();
+            self.peeked[1] = Some(next);
+        }
+        self.peeked[1].as_ref().and_then(|opt| opt.as_ref())
     }
 
     /// Internal: advance the logos lexer, skipping comments and errors.

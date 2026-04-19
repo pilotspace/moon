@@ -37,7 +37,7 @@ impl<'a> Parser<'a> {
         Ok(Pattern { nodes, edges })
     }
 
-    fn parse_pattern_node(&mut self) -> Result<PatternNode, CypherError> {
+    pub(super) fn parse_pattern_node(&mut self) -> Result<PatternNode, CypherError> {
         self.expect_token_match(|t| matches!(t, Token::LParen), "(")?;
 
         let mut variable = None;
@@ -73,7 +73,7 @@ impl<'a> Parser<'a> {
         self.peek_is(|t| matches!(t, Token::Minus | Token::ArrowLeft))
     }
 
-    fn parse_pattern_edge(&mut self) -> Result<PatternEdge, CypherError> {
+    pub(super) fn parse_pattern_edge(&mut self) -> Result<PatternEdge, CypherError> {
         let mut direction = EdgeDirection::Both;
         let left_arrow = self.peek_is(|t| matches!(t, Token::ArrowLeft));
 
@@ -164,6 +164,89 @@ impl<'a> Parser<'a> {
         // Just `*` means `*1..MAX`
 
         Ok((min, max))
+    }
+
+    /// v0.1.9 CYP-04/05: try to parse `MATCH <ident> = shortestPath(pat)`.
+    ///
+    /// Called immediately after the `MATCH` keyword has been consumed.
+    /// Returns `Ok(Some(...))` on a successful path-variable-bound
+    /// `shortestPath` clause, `Ok(None)` if the following tokens do NOT
+    /// look like the path-variable binding form (caller falls back to
+    /// `parse_pattern_list`), or `Err(..)` on a malformed path-variable
+    /// binding (e.g. `MATCH p = foo(...)` where foo is not shortestPath).
+    pub(super) fn try_parse_shortest_path_match(
+        &mut self,
+    ) -> Result<Option<ShortestPathMatchClause>, CypherError> {
+        // Require `Ident` `=` lookahead. Anything else falls back to the
+        // regular MATCH handling.
+        let is_ident = self.peek_is(|t| matches!(t, Token::Ident(_)));
+        if !is_ident {
+            return Ok(None);
+        }
+        let is_eq_after = self
+            .lexer
+            .peek2()
+            .map(|t| matches!(t.token, Token::Equal))
+            .unwrap_or(false);
+        if !is_eq_after {
+            return Ok(None);
+        }
+
+        // Commit: consume Ident `=` shortestPath ( pattern ) .
+        let path_var = self.parse_ident()?;
+        self.expect_token_match(|t| matches!(t, Token::Equal), "=")?;
+
+        // Next must be the identifier `shortestPath` (case-insensitive).
+        let tok = self.lexer.next_token().ok_or(CypherError::UnexpectedEof {
+            expected: "shortestPath",
+        })?;
+        let fname = match &tok.token {
+            Token::Ident(s) => s.to_ascii_lowercase(),
+            _ => {
+                return Err(CypherError::UnexpectedToken {
+                    offset: tok.span.start,
+                    expected: "shortestPath",
+                    found: format!("{:?}", tok.token),
+                });
+            }
+        };
+        if fname != b"shortestpath" {
+            return Err(CypherError::UnexpectedToken {
+                offset: tok.span.start,
+                expected: "shortestPath",
+                found: String::from_utf8_lossy(&fname).into_owned(),
+            });
+        }
+
+        self.expect_token_match(|t| matches!(t, Token::LParen), "(")?;
+
+        // Parse: (src_node)-[edge]-(dst_node) inside the function call.
+        let src = self.parse_pattern_node()?;
+        let edge = self.parse_pattern_edge()?;
+        let dst = self.parse_pattern_node()?;
+
+        self.expect_token_match(|t| matches!(t, Token::RParen), ")")?;
+
+        // The edge MUST be variable-length for shortestPath.
+        let max_hops = match edge.var_length {
+            Some((_, max)) => max,
+            None => {
+                return Err(CypherError::UnexpectedToken {
+                    offset: 0,
+                    expected: "variable-length edge (e.g. -[*..6]-)",
+                    found: "fixed-length edge".to_string(),
+                });
+            }
+        };
+
+        Ok(Some(ShortestPathMatchClause {
+            path_var,
+            src,
+            dst,
+            max_hops,
+            edge_types: edge.edge_types,
+            direction: edge.direction,
+        }))
     }
 
     pub(super) fn parse_property_map(&mut self) -> Result<Vec<(String, Expr)>, CypherError> {

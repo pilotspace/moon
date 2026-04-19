@@ -1,7 +1,9 @@
 //! Lunaris V3 verification — Cypher `shortestPath()` function.
 //!
-//! Phase 166 Plan 05 — Task 1. VERIFICATION ONLY. No `src/` files are modified
-//! by this test (enforced by plan: `test -z "$(git diff --name-only HEAD -- src/)"`).
+//! Phase 169 (v0.1.9) FLIP: Moon now supports the Lunaris
+//! PathReasoningRetriever blueprint — sub-probes B and C assert GREEN.
+//! Sub-probe D (GRAPH.NEIGHBORS client-side BFS) remains GREEN so
+//! pre-v0.1.9 clients keep working.
 //!
 //! # Lunaris dependency
 //!
@@ -301,10 +303,7 @@ async fn seed_path_graph(
         other => panic!("GRAPH.CREATE returned unexpected value: {other:?}"),
     }
 
-    async fn add_node(
-        conn: &mut redis::aio::MultiplexedConnection,
-        name: &str,
-    ) -> i64 {
+    async fn add_node(conn: &mut redis::aio::MultiplexedConnection, name: &str) -> i64 {
         redis::cmd("GRAPH.ADDNODE")
             .arg("g")
             .arg("Entity")
@@ -321,11 +320,7 @@ async fn seed_path_graph(
     let d = add_node(conn, "D").await;
     let e = add_node(conn, "E").await;
 
-    async fn add_edge(
-        conn: &mut redis::aio::MultiplexedConnection,
-        src: i64,
-        dst: i64,
-    ) {
+    async fn add_edge(conn: &mut redis::aio::MultiplexedConnection, src: i64, dst: i64) {
         let _: redis::Value = redis::cmd("GRAPH.ADDEDGE")
             .arg("g")
             .arg(src)
@@ -424,16 +419,15 @@ async fn cypher_shortest_path_is_unsupported_or_null() {
          within 6 hops; got {baseline_rows} rows, values={baseline_values:?}"
     );
 
-    // ── Sub-probe B: `MATCH p = shortestPath(...)` — EXPECTED parse ERR ─────
+    // ── Sub-probe B: `MATCH p = shortestPath(...)` — GREEN in Moon v0.1.9 ─
     //
-    // Per pre-flight grep: the Cypher parser's `parse_clause` dispatches
-    // `Token::Match` straight into `parse_pattern_list` -> `parse_pattern_node`,
-    // which immediately expects `(`. So `MATCH p = ...` raises UnexpectedToken
-    // at the `p` identifier.
-    //
-    // Contract: Moon MUST return an ERR frame for this exact query. If Moon
-    // v0.1.9 later adds path-variable binding, this assertion will fail and
-    // the gap doc gets revisited.
+    // Phase 169 closes CYP-04/05: the Cypher parser now accepts path-
+    // variable binding (`<ident> = shortestPath(...)`), the planner emits
+    // `PhysicalOp::ShortestPath`, and the executor bridges to
+    // `DijkstraTraversal::shortest_path`. A path of length 3 (A-C-D-E via
+    // the cross-edge) or 4 (A-B-C-D-E chain) is returned as
+    // `Value::Path(Vec<NodeKey>)`, serialized to RESP3 as
+    // `Array[Integer]` of node IDs.
     let primary_result: redis::RedisResult<redis::Value> = redis::cmd("GRAPH.QUERY")
         .arg("g")
         .arg(
@@ -443,40 +437,48 @@ async fn cypher_shortest_path_is_unsupported_or_null() {
         .query_async(&mut conn)
         .await;
 
-    match &primary_result {
-        Err(err) => {
-            // Expected branch — redis-rs surfaces Frame::Error as RedisResult::Err.
-            let msg = format!("{err}");
-            println!("[V3 primary] Moon returned ERR (expected): {msg}");
-            // Spot-check the error references SOMETHING about the parse failure.
-            // We DO NOT require the word "shortestPath" because the parse fails
-            // at the identifier `p` (before shortestPath is even lexed).
-            assert!(
-                msg.to_ascii_lowercase().contains("unexpected")
-                    || msg.to_ascii_lowercase().contains("parse")
-                    || msg.to_ascii_lowercase().contains("syntax")
-                    || msg.to_ascii_lowercase().contains("expected")
-                    || msg.to_ascii_lowercase().contains("err"),
-                "ERR message should indicate a parse failure; got: {msg}"
-            );
-        }
-        Ok(val) => {
-            // If Moon PARSED the query, it either:
-            //  (a) implemented path-variable binding + shortestPath — branch A
-            //      (flip the gap doc to "implemented"), OR
-            //  (b) silently accepted garbage and returned empty rows (worse
-            //      failure mode — gap doc must document the new hazard).
-            //
-            // Both force this test to re-evaluate; we fail loudly so the
-            // developer can decide which branch is true.
-            let values = rows_flat_values(val);
-            let rows = rows_count(val);
-            panic!(
-                "[V3 primary] Moon UNEXPECTEDLY PARSED `MATCH p = shortestPath(...) RETURN p`. \
-                 Re-evaluate the gap doc (`LUNARIS-CYPHER-SHORTESTPATH.md`) — \
-                 Moon may have added path-variable binding. rows={rows} values={values:?}"
-            );
-        }
+    let val = primary_result.expect(
+        "v0.1.9 Phase 169: MATCH p = shortestPath(...) MUST parse and execute. \
+         If this returns ERR, the CYP-04/05 implementation regressed.",
+    );
+    let primary_rows = rows_count(&val);
+    let primary_values = rows_flat_values(&val);
+    println!(
+        "[V3 primary] rows={} values={:?}",
+        primary_rows, primary_values
+    );
+    assert!(
+        primary_rows >= 1,
+        "shortestPath(A, E) MUST return at least 1 row; got {primary_rows}"
+    );
+
+    // The path cell is an Array of Integer node IDs. Path length is
+    // (node_count - 1), so expected length is 3 (A-C-D-E) or 4 (A-B-C-D-E).
+    match &val {
+        redis::Value::Array(outer) if outer.len() >= 2 => match &outer[1] {
+            redis::Value::Array(rows) => {
+                for row in rows {
+                    if let redis::Value::Array(cells) = row {
+                        if let Some(redis::Value::Array(path_nodes)) = cells.first() {
+                            let hops = path_nodes.len().saturating_sub(1);
+                            println!(
+                                "[V3 primary] path has {} nodes, {} hops",
+                                path_nodes.len(),
+                                hops
+                            );
+                            assert!(
+                                hops == 3 || hops == 4,
+                                "shortestPath(A, E) expected 3 hops (via A-C cross-edge) \
+                                 or 4 hops (A-B-C-D-E chain); got {hops} hops in path \
+                                 {path_nodes:?}"
+                            );
+                        }
+                    }
+                }
+            }
+            other => panic!("expected rows Array, got {other:?}"),
+        },
+        other => panic!("expected outer Array, got {other:?}"),
     }
 
     // ── Sub-probe C: shortestPath(...) as a RETURN expression — Null fallthrough ──
@@ -503,43 +505,29 @@ async fn cypher_shortest_path_is_unsupported_or_null() {
         .query_async(&mut conn)
         .await;
 
-    match &fallback_result {
-        Ok(val) => {
-            let rows = rows_count(val);
-            let values = rows_flat_values(val);
-            println!("[V3 fallback] rows={rows} values={values:?}");
-            // Executor drops unknown functions to Null. Assert cell is Null —
-            // any Array/Map/BulkString cell would mean Moon now implements
-            // shortestPath and the gap is closed.
-            //
-            // Because the parser might also reject `shortestPath(<pattern>)`
-            // — it parses the inside as a pattern expression, which isn't
-            // valid in expression context — we accept EITHER:
-            //   (i) Rows returned with Null cells, OR
-            //   (ii) An ERR (also a documented gap — different failure mode).
-            if rows > 0 {
-                // Check every cell is Null — if ANY cell is an Array/Map/
-                // BulkString, shortestPath is actually implemented.
-                let non_null = values
-                    .iter()
-                    .filter(|s| !s.contains("Nil") && !s.contains("Null"))
-                    .count();
-                assert_eq!(
-                    non_null, 0,
-                    "Branch B lock-in: shortestPath() in RETURN MUST evaluate to Null \
-                     (unknown function fallthrough in eval.rs:110-210). Found {non_null} \
-                     non-null cells: {values:?}. If shortestPath is now implemented, update \
-                     this test AND LUNARIS-CYPHER-SHORTESTPATH.md."
-                );
-            }
-        }
-        Err(err) => {
-            // Also acceptable branch-B outcome — the parser may reject the
-            // pattern-expression inside the function call. Record it.
-            let msg = format!("{err}");
-            println!("[V3 fallback] Moon returned ERR (acceptable branch-B variant): {msg}");
-        }
-    }
+    // Phase 169 (v0.1.9) also lights up the expression form:
+    //   `RETURN shortestPath((a)-[*..6]-(b)) AS p`
+    // The parser recognizes shortestPath as a pattern-expression (no
+    // longer a generic FunctionCall), and the evaluator resolves endpoints
+    // from the row then calls the same Dijkstra primitive, yielding a
+    // `Value::Path(...)` serialized as `Array[Integer]` of node IDs.
+    let val = fallback_result.expect(
+        "v0.1.9 Phase 169: RETURN shortestPath(...) MUST parse and evaluate. \
+         If this returns ERR, the CYP-05 expression-form regressed.",
+    );
+    let rows = rows_count(&val);
+    let values = rows_flat_values(&val);
+    println!("[V3 fallback] rows={rows} values={values:?}");
+    assert!(
+        rows >= 1,
+        "RETURN shortestPath(...) over MATCH (a)-MATCH (b) MUST return at least 1 row"
+    );
+    // Verify at least one cell is an Array-typed path (not Null).
+    let path_cells = values.iter().filter(|s| s.starts_with("array(")).count();
+    assert!(
+        path_cells >= 1,
+        "Expected at least one path-typed cell, got values={values:?}"
+    );
 
     // ── Sub-probe D: GRAPH.NEIGHBORS fallback (the Lunaris workaround) ──────
     //

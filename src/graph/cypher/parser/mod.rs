@@ -108,6 +108,13 @@ impl<'a> Parser<'a> {
             }
             Token::Match => {
                 self.advance();
+                // v0.1.9 CYP-04: check for path-variable binding
+                //   MATCH <ident> = shortestPath( <pattern> )
+                // If we see `Ident` followed by `=`, it's a path-variable
+                // bind — otherwise fall through to the normal pattern list.
+                if let Some(spmc) = self.try_parse_shortest_path_match()? {
+                    return Ok(Clause::ShortestPathMatch(spmc));
+                }
                 let patterns = self.parse_pattern_list()?;
                 Ok(Clause::Match(MatchClause {
                     patterns,

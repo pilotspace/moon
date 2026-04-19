@@ -340,6 +340,63 @@ pub fn execute(
                     "write operations require GRAPH.QUERY with write lock".into(),
                 ));
             }
+
+            PhysicalOp::ShortestPath {
+                path_var,
+                source,
+                target,
+                max_hops,
+                edge_types,
+                direction,
+            } => {
+                let type_ids: Vec<u16> = edge_types
+                    .iter()
+                    .map(|t| label_to_id(t.as_bytes()))
+                    .collect();
+                let dir = match direction {
+                    EdgeDirection::Right => Direction::Outgoing,
+                    EdgeDirection::Left => Direction::Incoming,
+                    EdgeDirection::Both => Direction::Both,
+                };
+                let edge_type_filter = if type_ids.len() == 1 {
+                    Some(type_ids[0])
+                } else {
+                    None
+                };
+                let snapshot_lsn = if ctx.snapshot_lsn == 0 {
+                    u64::MAX
+                } else {
+                    ctx.snapshot_lsn
+                };
+                let sp_reader = SegmentMergeReader::new(
+                    Some(memgraph),
+                    csr_segs,
+                    dir,
+                    snapshot_lsn,
+                    edge_type_filter,
+                );
+                let cost_fn = crate::graph::scoring::WeightedCostFn::new(0.0, 1.0, 0);
+                let dijkstra =
+                    crate::graph::traversal::DijkstraTraversal::new(cost_fn, (*max_hops).min(32));
+
+                let mut new_rows = Vec::new();
+                for row in &rows {
+                    let src_key = match row.get(source) {
+                        Some(Value::Node(k)) => *k,
+                        _ => continue,
+                    };
+                    let dst_key = match row.get(target) {
+                        Some(Value::Node(k)) => *k,
+                        _ => continue,
+                    };
+                    if let Ok(Some(result)) = dijkstra.shortest_path(&sp_reader, src_key, dst_key) {
+                        let mut new_row = row.clone();
+                        new_row.insert(path_var.clone(), Value::Path(result.path));
+                        new_rows.push(new_row);
+                    }
+                }
+                rows = new_rows;
+            }
         }
     }
 
@@ -393,6 +450,7 @@ pub(crate) fn op_name(op: &PhysicalOp) -> &'static str {
         PhysicalOp::ProcedureCall { .. } => "ProcedureCall",
         PhysicalOp::Unwind { .. } => "Unwind",
         PhysicalOp::Merge { .. } => "Merge",
+        PhysicalOp::ShortestPath { .. } => "ShortestPath",
     }
 }
 
@@ -724,6 +782,64 @@ pub fn execute_profile(
                 return Err(ExecError::Unsupported(
                     "write operations require GRAPH.QUERY with write lock".into(),
                 ));
+            }
+
+            PhysicalOp::ShortestPath {
+                path_var,
+                source,
+                target,
+                max_hops,
+                edge_types,
+                direction,
+            } => {
+                let type_ids: Vec<u16> = edge_types
+                    .iter()
+                    .map(|t| label_to_id(t.as_bytes()))
+                    .collect();
+                let dir = match direction {
+                    EdgeDirection::Right => Direction::Outgoing,
+                    EdgeDirection::Left => Direction::Incoming,
+                    EdgeDirection::Both => Direction::Both,
+                };
+                let edge_type_filter = if type_ids.len() == 1 {
+                    Some(type_ids[0])
+                } else {
+                    None
+                };
+                let snapshot_lsn = if ctx.snapshot_lsn == 0 {
+                    u64::MAX
+                } else {
+                    ctx.snapshot_lsn
+                };
+                let empty_segs: [std::sync::Arc<crate::graph::csr::CsrStorage>; 0] = [];
+                let sp_reader = SegmentMergeReader::new(
+                    Some(memgraph),
+                    &empty_segs,
+                    dir,
+                    snapshot_lsn,
+                    edge_type_filter,
+                );
+                let cost_fn = crate::graph::scoring::WeightedCostFn::new(0.0, 1.0, 0);
+                let dijkstra =
+                    crate::graph::traversal::DijkstraTraversal::new(cost_fn, (*max_hops).min(32));
+
+                let mut new_rows = Vec::new();
+                for row in &rows {
+                    let src_key = match row.get(source) {
+                        Some(Value::Node(k)) => *k,
+                        _ => continue,
+                    };
+                    let dst_key = match row.get(target) {
+                        Some(Value::Node(k)) => *k,
+                        _ => continue,
+                    };
+                    if let Ok(Some(result)) = dijkstra.shortest_path(&sp_reader, src_key, dst_key) {
+                        let mut new_row = row.clone();
+                        new_row.insert(path_var.clone(), Value::Path(result.path));
+                        new_rows.push(new_row);
+                    }
+                }
+                rows = new_rows;
             }
         }
 

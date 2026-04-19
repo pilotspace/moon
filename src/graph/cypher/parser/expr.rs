@@ -276,6 +276,35 @@ impl<'a> Parser<'a> {
 
                 // Check if function call: ident(...)
                 if self.peek_is(|t| matches!(t, Token::LParen)) {
+                    // v0.1.9 CYP-05: `shortestPath((a)-[*..N]-(b))` as a
+                    // RETURN/expression form. The argument is a graph
+                    // pattern, NOT an expression — intercept before the
+                    // generic FunctionCall path.
+                    if name.eq_ignore_ascii_case("shortestPath") {
+                        self.advance(); // consume LParen
+                        let src = self.parse_pattern_node()?;
+                        let edge = self.parse_pattern_edge()?;
+                        let dst = self.parse_pattern_node()?;
+                        self.expect_token_match(|t| matches!(t, Token::RParen), ")")?;
+                        let max_hops = match edge.var_length {
+                            Some((_, max)) => max,
+                            None => {
+                                return Err(CypherError::UnexpectedToken {
+                                    offset: t.span.start,
+                                    expected: "variable-length edge in shortestPath(..)",
+                                    found: "fixed-length edge".to_string(),
+                                });
+                            }
+                        };
+                        return Ok(Expr::ShortestPathCall {
+                            src,
+                            dst,
+                            max_hops,
+                            edge_types: edge.edge_types,
+                            direction: edge.direction,
+                        });
+                    }
+
                     self.advance();
                     let distinct = self.peek_is(|t| matches!(t, Token::Distinct));
                     if distinct {

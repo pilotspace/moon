@@ -243,6 +243,43 @@ pub(crate) fn eval_expr(
                 row.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
             Value::Map(entries)
         }
+
+        // v0.1.9 CYP-05: RETURN shortestPath(...) expression form. The
+        // endpoints' variable names must already be bound in the row via a
+        // prior MATCH; we do not re-scan the graph from an expression.
+        Expr::ShortestPathCall {
+            src,
+            dst,
+            max_hops,
+            edge_types: _,
+            direction: _,
+        } => {
+            let src_key = match src.variable.as_deref().and_then(|v| row.get(v)) {
+                Some(Value::Node(k)) => *k,
+                _ => return Value::Null,
+            };
+            let dst_key = match dst.variable.as_deref().and_then(|v| row.get(v)) {
+                Some(Value::Node(k)) => *k,
+                _ => return Value::Null,
+            };
+            // Build a SegmentMergeReader restricted to MemGraph only
+            // (expression context does not have access to immutable
+            // segments; those arrive through the ShortestPath physical op).
+            let empty_segs: [std::sync::Arc<crate::graph::csr::CsrStorage>; 0] = [];
+            let reader = crate::graph::traversal::SegmentMergeReader::new(
+                Some(memgraph),
+                &empty_segs,
+                crate::graph::types::Direction::Both,
+                u64::MAX,
+                None,
+            );
+            let cost_fn = crate::graph::scoring::WeightedCostFn::new(0.0, 1.0, 0);
+            let dijkstra = crate::graph::traversal::DijkstraTraversal::new(cost_fn, *max_hops);
+            match dijkstra.shortest_path(&reader, src_key, dst_key) {
+                Ok(Some(result)) => Value::Path(result.path),
+                _ => Value::Null,
+            }
+        }
     }
 }
 
@@ -371,6 +408,7 @@ pub(crate) fn compare_values(a: &Value, b: &Value) -> std::cmp::Ordering {
             Value::Edge(_) => 5,
             Value::List(_) => 6,
             Value::Map(_) => 7,
+            Value::Path(_) => 8,
         }
     }
 
@@ -431,6 +469,13 @@ pub(crate) fn value_to_string(v: &Value) -> String {
                 .collect();
             format!("{{{}}}", parts.join(", "))
         }
+        Value::Path(nodes) => {
+            let parts: Vec<String> = nodes
+                .iter()
+                .map(|k| format!("node:{}", k.data().as_ffi()))
+                .collect();
+            format!("path[{}]", parts.join(" -> "))
+        }
     }
 }
 
@@ -451,6 +496,11 @@ pub(crate) fn expr_to_string(expr: &Expr) -> String {
         Expr::StringLit(s) => format!("'{s}'"),
         Expr::Bool(b) => b.to_string(),
         Expr::Null => "NULL".into(),
+        Expr::ShortestPathCall { src, dst, .. } => format!(
+            "shortestPath(({})-(?)-({}))",
+            src.variable.clone().unwrap_or_default(),
+            dst.variable.clone().unwrap_or_default()
+        ),
         _ => format!("{expr:?}"),
     }
 }
@@ -473,6 +523,8 @@ pub(crate) fn value_to_property_value(v: &Value) -> Option<PropertyValue> {
         Value::Float(f) => Some(PropertyValue::Float(*f)),
         Value::String(s) => Some(PropertyValue::String(Bytes::from(s.clone()))),
         Value::Bool(b) => Some(PropertyValue::Bool(*b)),
+        // Path is not storable as a property value (CYP-05 runtime-only).
+        Value::Path(_) => None,
         _ => None,
     }
 }

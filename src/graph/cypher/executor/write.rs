@@ -46,7 +46,7 @@ pub fn execute_mut(
                 source,
                 target,
                 edge_variable: _, // write-path Expand is used for MATCH-before-SET;
-                                  // edge-var binding is a read-side concern (CYP-06).
+                // edge-var binding is a read-side concern (CYP-06).
                 edge_types,
                 direction,
                 min_hops,
@@ -684,6 +684,16 @@ pub fn execute_mut(
             PhysicalOp::ProcedureCall { .. } => {
                 return Err(ExecError::Unsupported(
                     "procedure calls not yet implemented in executor".into(),
+                ));
+            }
+
+            PhysicalOp::ShortestPath { .. } => {
+                // v0.1.9 CYP-04/05: shortestPath() is a read-only query
+                // operator. It is not meaningful inside a CREATE/SET/DELETE
+                // write-path. Reject here and route users to GRAPH.RO_QUERY
+                // or GRAPH.QUERY for reads.
+                return Err(ExecError::Unsupported(
+                    "shortestPath() requires a read-only Cypher query".into(),
                 ));
             }
         }

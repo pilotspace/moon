@@ -881,6 +881,17 @@ fn value_to_frame(value: &cypher::executor::Value) -> Frame {
                 .collect();
             Frame::Map(pairs)
         }
+        // v0.1.9 CYP-04/05: serialize a Path as Array[Integer] of node IDs.
+        // Clients can reconstruct edge IDs via GRAPH.NEIGHBORS between
+        // consecutive node IDs; that keeps the wire format forward-
+        // compatible with a richer Path frame in a future release.
+        Value::Path(nodes) => {
+            let frames: Vec<Frame> = nodes
+                .iter()
+                .map(|k| Frame::Integer(k.data().as_ffi() as i64))
+                .collect();
+            Frame::Array(frames.into())
+        }
     }
 }
 
