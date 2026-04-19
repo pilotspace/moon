@@ -221,8 +221,17 @@ fn cache_probe(
     let k = cache_count.saturating_mul(3).clamp(100, 10_000);
     let _ = idx; // release immutable borrow before mutable search call
 
-    let response =
-        search_local_filtered(store, index_name, query_blob, k, None, 0, usize::MAX, None, 0);
+    let response = search_local_filtered(
+        store,
+        index_name,
+        query_blob,
+        k,
+        None,
+        0,
+        usize::MAX,
+        None,
+        0,
+    );
 
     // Parse the response to find the best cache hit.
     let items = match &response {

@@ -46,7 +46,10 @@ impl TemporalRegistry {
     /// Returns the LSN from the most recent binding at or before `wall_ms`.
     /// Returns `None` if `wall_ms` precedes all known bindings.
     pub fn lsn_at(&self, wall_ms: i64) -> Option<u64> {
-        self.entries.range(..=wall_ms).next_back().map(|(_, &lsn)| lsn)
+        self.entries
+            .range(..=wall_ms)
+            .next_back()
+            .map(|(_, &lsn)| lsn)
     }
 
     /// Number of registered bindings.

@@ -1140,7 +1140,11 @@ mod tests {
         // All node_meta entries must have valid_from=0, valid_to=i64::MAX.
         for (i, nm) in restored.node_meta.iter().enumerate() {
             assert_eq!(nm.valid_from, 0, "node {i} valid_from should be 0");
-            assert_eq!(nm.valid_to, i64::MAX, "node {i} valid_to should be i64::MAX");
+            assert_eq!(
+                nm.valid_to,
+                i64::MAX,
+                "node {i} valid_to should be i64::MAX"
+            );
             // Original fields must be preserved.
             assert_eq!(nm.external_id, csr.node_meta[i].external_id);
             assert_eq!(nm.label_bitmap, csr.node_meta[i].label_bitmap);
@@ -1191,7 +1195,10 @@ mod tests {
         let has_nondefault = temporal_map
             .values()
             .any(|(vf, vt)| *vf != 0 || *vt != i64::MAX);
-        assert!(has_nondefault, "expected non-default temporal values from from_frozen");
+        assert!(
+            has_nondefault,
+            "expected non-default temporal values from from_frozen"
+        );
 
         // Serialize and deserialize.
         let bytes = csr.to_bytes();

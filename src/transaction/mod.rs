@@ -207,13 +207,15 @@ mod tests {
         txn.record_graph(1, true, Bytes::from_static(b"g"));
         txn.record_graph(2, true, Bytes::from_static(b"g"));
         txn.record_graph(3, false, Bytes::from_static(b"g"));
-        let reversed: Vec<u64> = txn.graph_intents.iter().rev().map(|g| g.entity_id).collect();
+        let reversed: Vec<u64> = txn
+            .graph_intents
+            .iter()
+            .rev()
+            .map(|g| g.entity_id)
+            .collect();
         assert_eq!(reversed, vec![3, 2, 1]);
         // Spot-check the first reverse element matches the last push.
-        assert_eq!(
-            txn.graph_intents.iter().rev().next().unwrap().entity_id,
-            3
-        );
+        assert_eq!(txn.graph_intents.iter().rev().next().unwrap().entity_id, 3);
     }
 
     #[test]
@@ -223,10 +225,7 @@ mod tests {
 
         txn.record_mq(
             Bytes::from_static(b"orders"),
-            vec![(
-                Bytes::from_static(b"item"),
-                Bytes::from_static(b"widget"),
-            )],
+            vec![(Bytes::from_static(b"item"), Bytes::from_static(b"widget"))],
         );
         assert!(txn.has_modifications());
         assert_eq!(txn.mq_intents.len(), 1);

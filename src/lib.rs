@@ -51,6 +51,7 @@ pub mod error;
 #[cfg(feature = "graph")]
 pub mod graph;
 pub mod io;
+pub mod mq;
 pub mod persistence;
 pub mod protocol;
 pub mod pubsub;
@@ -69,4 +70,3 @@ pub mod tracking;
 pub mod transaction;
 pub mod vector;
 pub mod workspace;
-pub mod mq;

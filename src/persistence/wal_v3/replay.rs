@@ -306,16 +306,11 @@ fn replay_xact_commit(databases: &mut [crate::storage::Database], payload: &[u8]
     }
 
     let txn_id = u64::from_le_bytes([
-        payload[0],
-        payload[1],
-        payload[2],
-        payload[3],
-        payload[4],
-        payload[5],
-        payload[6],
+        payload[0], payload[1], payload[2], payload[3], payload[4], payload[5], payload[6],
         payload[7],
     ]);
-    let kv_op_count = u32::from_le_bytes([payload[8], payload[9], payload[10], payload[11]]) as usize;
+    let kv_op_count =
+        u32::from_le_bytes([payload[8], payload[9], payload[10], payload[11]]) as usize;
 
     tracing::debug!(txn_id, kv_op_count, "Replaying XactCommit");
 

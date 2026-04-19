@@ -15,8 +15,8 @@ use moon::config::ServerConfig;
 use moon::runtime::cancel::CancellationToken;
 use moon::runtime::channel;
 use moon::server::listener;
-use moon::shard::mesh::{CHANNEL_BUFFER_SIZE, ChannelMesh};
 use moon::shard::Shard;
+use moon::shard::mesh::{CHANNEL_BUFFER_SIZE, ChannelMesh};
 use redis::Value;
 use tokio::net::TcpListener;
 
@@ -98,9 +98,7 @@ async fn start_workspace_server(num_shards: usize) -> (u16, CancellationToken) {
             std::sync::Arc<parking_lot::RwLock<moon::pubsub::PubSubRegistry>>,
         > = (0..num_shards)
             .map(|_| {
-                std::sync::Arc::new(parking_lot::RwLock::new(
-                    moon::pubsub::PubSubRegistry::new(),
-                ))
+                std::sync::Arc::new(parking_lot::RwLock::new(moon::pubsub::PubSubRegistry::new()))
             })
             .collect();
         let all_remote_sub_maps: Vec<
@@ -295,9 +293,7 @@ async fn start_workspace_server_with_auth(
             std::sync::Arc<parking_lot::RwLock<moon::pubsub::PubSubRegistry>>,
         > = (0..num_shards)
             .map(|_| {
-                std::sync::Arc::new(parking_lot::RwLock::new(
-                    moon::pubsub::PubSubRegistry::new(),
-                ))
+                std::sync::Arc::new(parking_lot::RwLock::new(moon::pubsub::PubSubRegistry::new()))
             })
             .collect();
         let all_remote_sub_maps: Vec<
@@ -478,7 +474,10 @@ async fn test_workspace_create_and_auth() {
     // INFO returns [id, <uuid>, name, <name>, created_at, <ts>]
     match &info {
         Value::Array(items) => {
-            assert!(items.len() >= 6, "WS INFO should return at least 6 elements");
+            assert!(
+                items.len() >= 6,
+                "WS INFO should return at least 6 elements"
+            );
             let id_label = extract_string(&items[0]);
             assert_eq!(id_label, "id");
             let id_val = extract_string(&items[1]);
@@ -863,10 +862,7 @@ async fn test_workspace_auth_errors() {
     assert!(result.is_err(), "WS AUTH with invalid UUID should error");
 
     // WS AUTH with no args -> error
-    let result: Result<String, _> = redis::cmd("WS")
-        .arg("AUTH")
-        .query_async(&mut conn)
-        .await;
+    let result: Result<String, _> = redis::cmd("WS").arg("AUTH").query_async(&mut conn).await;
     assert!(result.is_err(), "WS AUTH with no args should error");
 
     // Create workspace and bind
@@ -1175,12 +1171,8 @@ async fn test_workspace_acl_grant() {
     assert_eq!(get_result, "val");
 
     // Connect as bob -- bob has +get +set but NOT +ws, so WS AUTH should fail
-    let bob_client =
-        redis::Client::open(format!("redis://bob:bobpass@127.0.0.1:{port}")).unwrap();
-    let mut bob_conn = bob_client
-        .get_multiplexed_async_connection()
-        .await
-        .unwrap();
+    let bob_client = redis::Client::open(format!("redis://bob:bobpass@127.0.0.1:{port}")).unwrap();
+    let mut bob_conn = bob_client.get_multiplexed_async_connection().await.unwrap();
 
     let bob_ws_result: Result<String, _> = redis::cmd("WS")
         .arg("AUTH")

@@ -15,8 +15,8 @@ use moon::config::ServerConfig;
 use moon::runtime::cancel::CancellationToken;
 use moon::runtime::channel;
 use moon::server::listener;
-use moon::shard::mesh::{CHANNEL_BUFFER_SIZE, ChannelMesh};
 use moon::shard::Shard;
+use moon::shard::mesh::{CHANNEL_BUFFER_SIZE, ChannelMesh};
 use tokio::net::TcpListener;
 
 // ---------------------------------------------------------------------------
@@ -110,9 +110,7 @@ async fn start_txn_server(num_shards: usize, persistence_dir: &str) -> (u16, Can
             std::sync::Arc<parking_lot::RwLock<moon::pubsub::PubSubRegistry>>,
         > = (0..num_shards)
             .map(|_| {
-                std::sync::Arc::new(parking_lot::RwLock::new(
-                    moon::pubsub::PubSubRegistry::new(),
-                ))
+                std::sync::Arc::new(parking_lot::RwLock::new(moon::pubsub::PubSubRegistry::new()))
             })
             .collect();
         let all_remote_sub_maps: Vec<
@@ -312,10 +310,7 @@ async fn test_txn_abort_restores_set_insert() {
         .query_async(&mut conn)
         .await
         .expect("Initial GET should succeed");
-    assert!(
-        pre_check.is_none(),
-        "Key should not exist before test"
-    );
+    assert!(pre_check.is_none(), "Key should not exist before test");
 
     // TXN.BEGIN -> OK
     let _: String = redis::cmd("TXN")
@@ -460,7 +455,10 @@ async fn test_txn_abort_restores_del() {
         .query_async(&mut conn)
         .await
         .expect("DEL inside TXN should succeed");
-    assert_eq!(del_result, 1, "DEL inside TXN should return 1 (key existed)");
+    assert_eq!(
+        del_result, 1,
+        "DEL inside TXN should return 1 (key existed)"
+    );
 
     // TXN.ABORT -> OK (undo log replays DELETE: restores before-image)
     let abort_result: String = redis::cmd("TXN")
@@ -572,10 +570,8 @@ async fn test_txn_error_cases() {
     let mut conn = connect(port).await;
 
     // TXN.COMMIT without BEGIN -> ERR
-    let commit_no_begin: Result<String, redis::RedisError> = redis::cmd("TXN")
-        .arg("COMMIT")
-        .query_async(&mut conn)
-        .await;
+    let commit_no_begin: Result<String, redis::RedisError> =
+        redis::cmd("TXN").arg("COMMIT").query_async(&mut conn).await;
     assert!(
         commit_no_begin.is_err(),
         "TXN.COMMIT without BEGIN should return error"
@@ -588,10 +584,8 @@ async fn test_txn_error_cases() {
     );
 
     // TXN.ABORT without BEGIN -> ERR
-    let abort_no_begin: Result<String, redis::RedisError> = redis::cmd("TXN")
-        .arg("ABORT")
-        .query_async(&mut conn)
-        .await;
+    let abort_no_begin: Result<String, redis::RedisError> =
+        redis::cmd("TXN").arg("ABORT").query_async(&mut conn).await;
     assert!(
         abort_no_begin.is_err(),
         "TXN.ABORT without BEGIN should return error"
@@ -611,10 +605,8 @@ async fn test_txn_error_cases() {
         .expect("TXN.BEGIN should succeed");
 
     // TXN.BEGIN again (double) -> ERR (already in transaction)
-    let double_begin: Result<String, redis::RedisError> = redis::cmd("TXN")
-        .arg("BEGIN")
-        .query_async(&mut conn)
-        .await;
+    let double_begin: Result<String, redis::RedisError> =
+        redis::cmd("TXN").arg("BEGIN").query_async(&mut conn).await;
     assert!(
         double_begin.is_err(),
         "Second TXN.BEGIN should return error when already in a transaction"
@@ -799,7 +791,10 @@ async fn test_txn_abort_multi_key_rollback() {
         .query_async(&mut conn)
         .await
         .expect("GET new key after abort should succeed");
-    assert!(k3.is_none(), "New key inserted in aborted TXN must not exist");
+    assert!(
+        k3.is_none(),
+        "New key inserted in aborted TXN must not exist"
+    );
 
     // Cleanup
     let _: () = redis::cmd("DEL")
@@ -1351,10 +1346,7 @@ async fn test_txn_sequential_independence() {
         .query_async(&mut conn)
         .await
         .expect("GET aborted key should succeed");
-    assert!(
-        aborted.is_none(),
-        "TXN2 aborted value must not be visible"
-    );
+    assert!(aborted.is_none(), "TXN2 aborted value must not be visible");
 
     // Cleanup
     let _: () = redis::cmd("DEL")

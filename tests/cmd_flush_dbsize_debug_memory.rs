@@ -83,7 +83,11 @@ fn spawn_moon() -> Option<Moon> {
         .stderr(Stdio::null())
         .spawn()
         .ok()?;
-    let moon = Moon { child, port, tmp_dir };
+    let moon = Moon {
+        child,
+        port,
+        tmp_dir,
+    };
 
     // Wait up to ~5s for PING to succeed.
     let deadline = Instant::now() + Duration::from_secs(5);

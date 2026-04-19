@@ -33,8 +33,7 @@ pub const ERR_MULTI_TXN_CONFLICT: &[u8] = b"ERR cannot use MULTI while in TXN bl
 ///
 /// Fix: use Redis cluster hash tags (e.g. {tag}:key) to force all transaction
 /// keys to route to the same shard as the TXN connection.
-pub const ERR_TXN_CROSS_SHARD: &[u8] =
-    b"ERR TXN does not support cross-shard writes \
+pub const ERR_TXN_CROSS_SHARD: &[u8] = b"ERR TXN does not support cross-shard writes \
       -- use hash tags {tag} to co-locate keys (e.g. SET {txn}:key value)";
 
 /// TXN.BEGIN - Start a new cross-store transaction.
@@ -90,7 +89,9 @@ pub fn parse_txn_subcommand(args: &[Frame]) -> Result<&[u8], Frame> {
     }
     match &args[0] {
         Frame::BulkString(data) => Ok(data),
-        _ => Err(Frame::Error(Bytes::from_static(b"ERR invalid argument type"))),
+        _ => Err(Frame::Error(Bytes::from_static(
+            b"ERR invalid argument type",
+        ))),
     }
 }
 
@@ -188,7 +189,10 @@ mod tests {
     fn test_is_txn_commit() {
         let args = vec![Frame::BulkString(Bytes::from_static(b"COMMIT"))];
         assert!(is_txn_commit(b"TXN", &args));
-        assert!(!is_txn_commit(b"TXN", &[Frame::BulkString(Bytes::from_static(b"BEGIN"))]));
+        assert!(!is_txn_commit(
+            b"TXN",
+            &[Frame::BulkString(Bytes::from_static(b"BEGIN"))]
+        ));
     }
 
     #[test]

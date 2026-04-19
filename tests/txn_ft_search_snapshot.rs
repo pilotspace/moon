@@ -280,11 +280,7 @@ async fn ft_create_idx(conn: &mut redis::aio::MultiplexedConnection) {
     assert_eq!(r, "OK");
 }
 
-async fn hset_vec_mx(
-    conn: &mut redis::aio::MultiplexedConnection,
-    key: &str,
-    v: [f32; 4],
-) {
+async fn hset_vec_mx(conn: &mut redis::aio::MultiplexedConnection, key: &str, v: [f32; 4]) {
     let bytes = vec4_bytes(v);
     let _: i64 = redis::cmd("HSET")
         .arg(key)
@@ -345,7 +341,10 @@ async fn ft_search_sees_txn_snapshot() {
 
     // Setup on a multiplexed connection (pre-TXN state).
     let mut setup = connect(port).await;
-    let _: redis::Value = redis::cmd("FLUSHALL").query_async(&mut setup).await.unwrap();
+    let _: redis::Value = redis::cmd("FLUSHALL")
+        .query_async(&mut setup)
+        .await
+        .unwrap();
     ft_create_idx(&mut setup).await;
     hset_vec_mx(&mut setup, "doc:a", [1.0, 0.0, 0.0, 0.0]).await;
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -435,7 +434,10 @@ async fn ft_search_explicit_as_of_beats_txn_snapshot() {
     let (port, shutdown) = start_moon_sharded(1).await;
 
     let mut setup = connect(port).await;
-    let _: redis::Value = redis::cmd("FLUSHALL").query_async(&mut setup).await.unwrap();
+    let _: redis::Value = redis::cmd("FLUSHALL")
+        .query_async(&mut setup)
+        .await
+        .unwrap();
     ft_create_idx(&mut setup).await;
 
     // HSET doc:a BEFORE the temporal snapshot.

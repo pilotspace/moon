@@ -56,7 +56,9 @@ impl WorkspaceRegistry {
     ///
     /// Workspaces are expected to be few, so linear scan is acceptable.
     pub fn get_by_name(&self, name: &[u8]) -> Option<&WorkspaceMetadata> {
-        self.entries.values().find(|meta| meta.name.as_ref() == name)
+        self.entries
+            .values()
+            .find(|meta| meta.name.as_ref() == name)
     }
 
     /// Iterate over all workspace entries.

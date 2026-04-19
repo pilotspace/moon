@@ -44,6 +44,10 @@ pub(super) fn search_local_raw(
     field_name: Option<&Bytes>,
     as_of_lsn: u64,
 ) -> SearchRawResult {
+    // Clone committed treemap BEFORE get_index_mut to satisfy the borrow checker.
+    // Non-TXN readers need this to see entries whose owning txn has committed
+    // (entries tagged with txn_id by auto_index_hset_public_txn; ACID-09 fix).
+    let committed = store.txn_manager().committed_treemap().clone();
     let idx = match store.get_index_mut(index_name) {
         Some(i) => i,
         None => {
@@ -111,14 +115,12 @@ pub(super) fn search_local_raw(
         idx.payload_index.evaluate_bitmap(f, total)
     });
 
-    let empty_committed = roaring::RoaringTreemap::new();
-
     // Dispatch to correct field's segments
     if use_default_field {
         let mvcc_ctx = crate::vector::segment::holder::MvccContext {
             snapshot_lsn: as_of_lsn,
             my_txn_id: 0,
-            committed: &empty_committed,
+            committed: &committed,
             dirty_set: &[],
             dimension: dim as u32,
         };
@@ -143,7 +145,7 @@ pub(super) fn search_local_raw(
             let mvcc_ctx = crate::vector::segment::holder::MvccContext {
                 snapshot_lsn: as_of_lsn,
                 my_txn_id: 0,
-                committed: &empty_committed,
+                committed: &committed,
                 dirty_set: &[],
                 dimension: dim as u32,
             };
@@ -180,7 +182,17 @@ pub fn search_local(
     query_blob: &[u8],
     k: usize,
 ) -> Frame {
-    search_local_filtered(store, index_name, query_blob, k, None, 0, usize::MAX, None, 0)
+    search_local_filtered(
+        store,
+        index_name,
+        query_blob,
+        k,
+        None,
+        0,
+        usize::MAX,
+        None,
+        0,
+    )
 }
 
 /// Local search with optional filter expression and pagination.
@@ -204,6 +216,9 @@ pub fn search_local_filtered(
     field_name: Option<&Bytes>,
     as_of_lsn: u64,
 ) -> Frame {
+    // Clone committed treemap BEFORE get_index_mut (borrow-checker ordering).
+    // Ensures non-TXN readers see entries whose owning txn has committed.
+    let committed = store.txn_manager().committed_treemap().clone();
     let idx = match store.get_index_mut(index_name) {
         Some(i) => i,
         None => return Frame::Error(Bytes::from_static(b"Unknown Index name")),
@@ -274,14 +289,12 @@ pub fn search_local_filtered(
         idx.payload_index.evaluate_bitmap(f, total)
     });
 
-    let empty_committed = roaring::RoaringTreemap::new();
-
     // Dispatch to correct field's segments
     if use_default_field {
         let mvcc_ctx = crate::vector::segment::holder::MvccContext {
             snapshot_lsn: as_of_lsn,
             my_txn_id: 0,
-            committed: &empty_committed,
+            committed: &committed,
             dirty_set: &[],
             dimension: dim as u32,
         };
@@ -302,7 +315,7 @@ pub fn search_local_filtered(
             let mvcc_ctx = crate::vector::segment::holder::MvccContext {
                 snapshot_lsn: as_of_lsn,
                 my_txn_id: 0,
-                committed: &empty_committed,
+                committed: &committed,
                 dirty_set: &[],
                 dimension: dim as u32,
             };

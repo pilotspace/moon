@@ -63,9 +63,9 @@ use crate::shard::shared_databases::ShardDatabases;
 use crate::transaction::{CrossStoreTxn, UndoRecord};
 
 #[cfg(feature = "graph")]
-use bytes::Bytes;
-#[cfg(feature = "graph")]
 use crate::graph::types::{EdgeKey, NodeKey};
+#[cfg(feature = "graph")]
+use bytes::Bytes;
 
 /// Roll back every store side-effect of `txn`.
 ///
@@ -240,10 +240,6 @@ pub fn abort_cross_store_txn(
     //    HNSW insertions queued for this txn (prevents phantom neighbors
     //    from showing up post-compaction on a txn that never committed).
     // ------------------------------------------------------------------
-    shard_databases
-        .kv_intents(shard_id)
-        .release_txn(txn_id);
-    shard_databases
-        .hnsw_queue(shard_id)
-        .discard_for_txn(txn_id);
+    shard_databases.kv_intents(shard_id).release_txn(txn_id);
+    shard_databases.hnsw_queue(shard_id).discard_for_txn(txn_id);
 }

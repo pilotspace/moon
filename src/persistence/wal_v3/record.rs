@@ -223,7 +223,12 @@ pub fn read_wal_v3_record(data: &[u8]) -> Option<WalRecord> {
 ///
 /// `system_from` is the literal wall-clock timestamp captured at the handler
 /// level. Replay MUST restore this value directly -- never substitute NOW().
-pub fn encode_temporal_upsert(key: &[u8], valid_from: i64, system_from: i64, value: &[u8]) -> Vec<u8> {
+pub fn encode_temporal_upsert(
+    key: &[u8],
+    valid_from: i64,
+    system_from: i64,
+    value: &[u8],
+) -> Vec<u8> {
     let mut payload = Vec::with_capacity(4 + key.len() + 8 + 8 + 4 + value.len());
     payload.extend_from_slice(&(key.len() as u32).to_le_bytes());
     payload.extend_from_slice(key);
@@ -248,11 +253,16 @@ pub fn decode_temporal_upsert(payload: &[u8]) -> Option<(&[u8], i64, i64, &[u8])
     }
     let key = &payload[pos..pos + key_len];
     let valid_from = i64::from_le_bytes(payload[pos + key_len..pos + key_len + 8].try_into().ok()?);
-    let system_from =
-        i64::from_le_bytes(payload[pos + key_len + 8..pos + key_len + 16].try_into().ok()?);
-    let value_len =
-        u32::from_le_bytes(payload[pos + key_len + 16..pos + key_len + 20].try_into().ok()?)
-            as usize;
+    let system_from = i64::from_le_bytes(
+        payload[pos + key_len + 8..pos + key_len + 16]
+            .try_into()
+            .ok()?,
+    );
+    let value_len = u32::from_le_bytes(
+        payload[pos + key_len + 16..pos + key_len + 20]
+            .try_into()
+            .ok()?,
+    ) as usize;
     let value_start = pos + key_len + 20;
     if payload.len() < value_start + value_len {
         return None;
@@ -267,7 +277,12 @@ pub fn decode_temporal_upsert(payload: &[u8]) -> Option<(&[u8], i64, i64, &[u8])
 ///
 /// `system_from` is the literal wall-clock timestamp captured at the handler
 /// level. Replay MUST restore this value directly -- never substitute NOW().
-pub fn encode_graph_temporal(entity_id: u64, is_node: bool, valid_to: i64, system_from: i64) -> Vec<u8> {
+pub fn encode_graph_temporal(
+    entity_id: u64,
+    is_node: bool,
+    valid_to: i64,
+    system_from: i64,
+) -> Vec<u8> {
     let mut payload = Vec::with_capacity(8 + 1 + 8 + 8);
     payload.extend_from_slice(&entity_id.to_le_bytes());
     payload.push(is_node as u8);
@@ -572,8 +587,7 @@ mod tests {
         // Build undo records:
         // - Insert{key1}: key1 was new (current value in db = "committed_val")
         // - Delete{key2, old_entry}: key2 was deleted during txn
-        let old_entry =
-            crate::storage::entry::Entry::new_string(Bytes::from_static(b"was_here"));
+        let old_entry = crate::storage::entry::Entry::new_string(Bytes::from_static(b"was_here"));
         let records = vec![
             UndoRecord::Insert {
                 key: Bytes::from_static(b"key1"),
@@ -587,26 +601,18 @@ mod tests {
         let payload = encode_xact_commit_payload(42, &records, &db);
 
         // Verify header
-        assert_eq!(
-            u64::from_le_bytes(payload[0..8].try_into().unwrap()),
-            42
-        ); // txn_id
-        assert_eq!(
-            u32::from_le_bytes(payload[8..12].try_into().unwrap()),
-            2
-        ); // 2 ops
+        assert_eq!(u64::from_le_bytes(payload[0..8].try_into().unwrap()), 42); // txn_id
+        assert_eq!(u32::from_le_bytes(payload[8..12].try_into().unwrap()), 2); // 2 ops
 
         // Verify op 1: SET key1 committed_val
         let mut offset = 12;
         assert_eq!(payload[offset], 0); // SET
         offset += 1;
-        let key_len =
-            u32::from_le_bytes(payload[offset..offset + 4].try_into().unwrap()) as usize;
+        let key_len = u32::from_le_bytes(payload[offset..offset + 4].try_into().unwrap()) as usize;
         offset += 4;
         assert_eq!(&payload[offset..offset + key_len], b"key1");
         offset += key_len;
-        let val_len =
-            u32::from_le_bytes(payload[offset..offset + 4].try_into().unwrap()) as usize;
+        let val_len = u32::from_le_bytes(payload[offset..offset + 4].try_into().unwrap()) as usize;
         offset += 4;
         assert_eq!(&payload[offset..offset + val_len], b"committed_val");
         offset += val_len;
@@ -614,8 +620,7 @@ mod tests {
         // Verify op 2: DEL key2
         assert_eq!(payload[offset], 1); // DEL
         offset += 1;
-        let key_len2 =
-            u32::from_le_bytes(payload[offset..offset + 4].try_into().unwrap()) as usize;
+        let key_len2 = u32::from_le_bytes(payload[offset..offset + 4].try_into().unwrap()) as usize;
         offset += 4;
         assert_eq!(&payload[offset..offset + key_len2], b"key2");
     }

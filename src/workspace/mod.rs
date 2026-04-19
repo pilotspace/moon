@@ -116,39 +116,82 @@ pub fn strip_workspace_prefix<'a>(workspace_id: &WorkspaceId, key: &'a [u8]) -> 
 /// Commands that take NO key arguments — return args unchanged.
 /// Checked case-insensitively.
 const NO_KEY_COMMANDS: &[&[u8]] = &[
-    b"PING", b"INFO", b"CLIENT", b"AUTH", b"SELECT", b"MULTI", b"EXEC",
-    b"DISCARD", b"DBSIZE", b"TIME", b"RANDOMKEY", b"QUIT", b"COMMAND",
-    b"CONFIG", b"DEBUG", b"SLOWLOG", b"CLUSTER", b"WAIT", b"SWAPDB",
-    b"MEMORY", b"LATENCY", b"SUBSCRIBE", b"UNSUBSCRIBE", b"PSUBSCRIBE",
-    b"PUNSUBSCRIBE", b"PUBLISH", b"TXN", b"TEMPORAL", b"WS", b"MQ", b"HELLO",
-    b"RESET", b"ECHO", b"OBJECT", b"FLUSHALL", b"FLUSHDB", b"SAVE",
-    b"BGSAVE", b"BGREWRITEAOF", b"LASTSAVE", b"SHUTDOWN", b"REPLICAOF",
-    b"SLAVEOF", b"REPLCONF", b"PSYNC", b"SCRIPT", b"EVALSHA", b"EVAL",
-    b"ACL", b"MODULE", b"XINFO",
+    b"PING",
+    b"INFO",
+    b"CLIENT",
+    b"AUTH",
+    b"SELECT",
+    b"MULTI",
+    b"EXEC",
+    b"DISCARD",
+    b"DBSIZE",
+    b"TIME",
+    b"RANDOMKEY",
+    b"QUIT",
+    b"COMMAND",
+    b"CONFIG",
+    b"DEBUG",
+    b"SLOWLOG",
+    b"CLUSTER",
+    b"WAIT",
+    b"SWAPDB",
+    b"MEMORY",
+    b"LATENCY",
+    b"SUBSCRIBE",
+    b"UNSUBSCRIBE",
+    b"PSUBSCRIBE",
+    b"PUNSUBSCRIBE",
+    b"PUBLISH",
+    b"TXN",
+    b"TEMPORAL",
+    b"WS",
+    b"MQ",
+    b"HELLO",
+    b"RESET",
+    b"ECHO",
+    b"OBJECT",
+    b"FLUSHALL",
+    b"FLUSHDB",
+    b"SAVE",
+    b"BGSAVE",
+    b"BGREWRITEAOF",
+    b"LASTSAVE",
+    b"SHUTDOWN",
+    b"REPLICAOF",
+    b"SLAVEOF",
+    b"REPLCONF",
+    b"PSYNC",
+    b"SCRIPT",
+    b"EVALSHA",
+    b"EVAL",
+    b"ACL",
+    b"MODULE",
+    b"XINFO",
 ];
 
 /// Commands where ALL args are keys (prefix every arg).
 const ALL_KEYS_COMMANDS: &[&[u8]] = &[
-    b"MGET", b"DEL", b"UNLINK", b"EXISTS", b"WATCH", b"SINTER",
-    b"SUNION", b"SDIFF", b"PFCOUNT", b"PFMERGE",
+    b"MGET", b"DEL", b"UNLINK", b"EXISTS", b"WATCH", b"SINTER", b"SUNION", b"SDIFF", b"PFCOUNT",
+    b"PFMERGE",
 ];
 
 /// Commands where args[0] and args[1] are both keys.
 const TWO_KEY_COMMANDS: &[&[u8]] = &[
-    b"RENAME", b"RENAMENX", b"COPY", b"RPOPLPUSH", b"LMOVE",
-    b"SMOVE", b"BRPOPLPUSH",
+    b"RENAME",
+    b"RENAMENX",
+    b"COPY",
+    b"RPOPLPUSH",
+    b"LMOVE",
+    b"SMOVE",
+    b"BRPOPLPUSH",
 ];
 
 /// Commands where the dest key is args[0] and source keys follow a numkeys pattern:
 /// args[0] = dest, args[1] = numkeys, args[2..2+numkeys] = source keys.
-const STORE_NUMKEYS_COMMANDS: &[&[u8]] = &[
-    b"ZUNIONSTORE", b"ZINTERSTORE", b"ZDIFFSTORE",
-];
+const STORE_NUMKEYS_COMMANDS: &[&[u8]] = &[b"ZUNIONSTORE", b"ZINTERSTORE", b"ZDIFFSTORE"];
 
 /// Commands where dest is args[0], all remaining args are source keys.
-const STORE_ALL_COMMANDS: &[&[u8]] = &[
-    b"SINTERSTORE", b"SUNIONSTORE", b"SDIFFSTORE",
-];
+const STORE_ALL_COMMANDS: &[&[u8]] = &[b"SINTERSTORE", b"SUNIONSTORE", b"SDIFFSTORE"];
 
 /// Helper: case-insensitive membership check for command byte slices.
 #[inline]
@@ -273,9 +316,9 @@ pub fn workspace_rewrite_args(cmd: &[u8], args: &[Frame], ws_id: &WorkspaceId) -
     if cmd.eq_ignore_ascii_case(b"XREAD") || cmd.eq_ignore_ascii_case(b"XREADGROUP") {
         let mut out = args.to_vec();
         // Find the STREAMS keyword position.
-        let streams_pos = args.iter().position(|a| {
-            matches!(a, Frame::BulkString(b) if b.eq_ignore_ascii_case(b"STREAMS"))
-        });
+        let streams_pos = args
+            .iter()
+            .position(|a| matches!(a, Frame::BulkString(b) if b.eq_ignore_ascii_case(b"STREAMS")));
         if let Some(pos) = streams_pos {
             // After STREAMS: keys come first, then IDs.
             // Number of keys = (args.len() - pos - 1) / 2
@@ -465,10 +508,7 @@ mod tests {
     fn test_workspace_key_format() {
         let id = WorkspaceId::from_bytes([0u8; 16]);
         let result = workspace_key(Some(&id), b"mykey");
-        assert_eq!(
-            result.as_ref(),
-            b"{00000000000000000000000000000000}:mykey"
-        );
+        assert_eq!(result.as_ref(), b"{00000000000000000000000000000000}:mykey");
     }
 
     #[test]
@@ -841,8 +881,7 @@ mod tests {
     fn test_strip_response_randomkey() {
         let ws = WorkspaceId::from_bytes([0u8; 16]);
         let prefix = b"{00000000000000000000000000000000}:";
-        let mut response =
-            Frame::BulkString(Bytes::from([prefix.as_slice(), b"mykey"].concat()));
+        let mut response = Frame::BulkString(Bytes::from([prefix.as_slice(), b"mykey"].concat()));
         strip_workspace_prefix_from_response(&ws, b"RANDOMKEY", &mut response);
         assert_eq!(extract_bs(&response), b"mykey");
     }

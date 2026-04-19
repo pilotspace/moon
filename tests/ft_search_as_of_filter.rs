@@ -376,8 +376,9 @@ async fn ft_search_as_of_and_filter_compose() {
     let c2 = parse_search_count(&s2);
     assert_eq!(c2, 1, "sanity 2: AS_OF T no filter must return 1 doc (doc:a); got {c2}");
 
-    // --- G4 main: AS_OF T + FILTER @score==10 → count=1 (doc:a passes both).
-    // Moon FT.SEARCH FILTER syntax: FILTER @field==value (see ft_search parse.rs).
+    // --- G4 main: AS_OF T + FILTER @score:[10 10] → count=1 (doc:a passes both).
+    // Moon FT.SEARCH FILTER numeric-equality syntax: @field:[val val] (range where min==max).
+    // The `==` shorthand is not supported; use the RediSearch-compatible range syntax.
     let g4: redis::Value = redis::cmd("FT.SEARCH")
         .arg("fidx")
         .arg("*=>[KNN 10 @vec $q]")
@@ -388,7 +389,7 @@ async fn ft_search_as_of_and_filter_compose() {
         .arg("AS_OF")
         .arg(wall_ms_t.to_string())
         .arg("FILTER")
-        .arg("@score==10")
+        .arg("@score:[10 10]")
         .arg("DIALECT")
         .arg("2")
         .query_async(&mut conn)
@@ -401,7 +402,7 @@ async fn ft_search_as_of_and_filter_compose() {
          Got count={c_g4}. Either temporal or filter constraint not applied."
     );
 
-    // --- Sanity 3: AS_OF T + FILTER @score==99 → count=0 (doc:b is post-snapshot).
+    // --- Sanity 3: AS_OF T + FILTER @score:[99 99] → count=0 (doc:b is post-snapshot).
     let s3: redis::Value = redis::cmd("FT.SEARCH")
         .arg("fidx")
         .arg("*=>[KNN 10 @vec $q]")
@@ -412,7 +413,7 @@ async fn ft_search_as_of_and_filter_compose() {
         .arg("AS_OF")
         .arg(wall_ms_t.to_string())
         .arg("FILTER")
-        .arg("@score==99")
+        .arg("@score:[99 99]")
         .arg("DIALECT")
         .arg("2")
         .query_async(&mut conn)
@@ -421,7 +422,7 @@ async fn ft_search_as_of_and_filter_compose() {
     let c3 = parse_search_count(&s3);
     assert_eq!(
         c3, 0,
-        "sanity 3: AS_OF T + FILTER @score==99 must return 0 (doc:b excluded by temporal); got {c3}"
+        "sanity 3: AS_OF T + FILTER @score:[99 99] must return 0 (doc:b excluded by temporal); got {c3}"
     );
 
     shutdown.cancel();

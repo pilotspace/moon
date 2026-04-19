@@ -251,15 +251,10 @@ mod tests {
     fn test_validate_ws_drop_valid() {
         let args = [
             Frame::BulkString(Bytes::from_static(b"DROP")),
-            Frame::BulkString(Bytes::from_static(
-                b"0193a9f2-e456-7890-abcd-ef1234567890",
-            )),
+            Frame::BulkString(Bytes::from_static(b"0193a9f2-e456-7890-abcd-ef1234567890")),
         ];
         let ws_id = validate_ws_drop(&args).unwrap();
-        assert_eq!(
-            ws_id.as_ref(),
-            b"0193a9f2-e456-7890-abcd-ef1234567890"
-        );
+        assert_eq!(ws_id.as_ref(), b"0193a9f2-e456-7890-abcd-ef1234567890");
     }
 
     #[test]
@@ -283,9 +278,7 @@ mod tests {
     fn test_validate_ws_auth_valid() {
         let args = [
             Frame::BulkString(Bytes::from_static(b"AUTH")),
-            Frame::BulkString(Bytes::from_static(
-                b"0193a9f2-e456-7890-abcd-ef1234567890",
-            )),
+            Frame::BulkString(Bytes::from_static(b"0193a9f2-e456-7890-abcd-ef1234567890")),
         ];
         let ws_id = validate_ws_auth(&args).unwrap();
         assert!(!ws_id.is_empty());
@@ -303,9 +296,7 @@ mod tests {
     fn test_validate_ws_info_valid() {
         let args = [
             Frame::BulkString(Bytes::from_static(b"INFO")),
-            Frame::BulkString(Bytes::from_static(
-                b"0193a9f2-e456-7890-abcd-ef1234567890",
-            )),
+            Frame::BulkString(Bytes::from_static(b"0193a9f2-e456-7890-abcd-ef1234567890")),
         ];
         let ws_id = validate_ws_info(&args).unwrap();
         assert!(!ws_id.is_empty());

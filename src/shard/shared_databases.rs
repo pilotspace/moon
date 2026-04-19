@@ -7,12 +7,12 @@ use parking_lot::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use crate::graph::store::GraphStore;
 use crate::mq::{DurableQueueRegistry, TriggerRegistry};
 use crate::storage::Database;
-use crate::transaction::{DeferredHnswInserts, KvWriteIntents};
 use crate::temporal::{TemporalKvIndex, TemporalRegistry};
 use crate::text::store::TextStore;
+use crate::transaction::{DeferredHnswInserts, KvWriteIntents};
 use crate::vector::store::VectorStore;
-use crate::workspace::{WorkspaceId, WorkspaceMetadata, WorkspaceRegistry};
 use crate::workspace::wal::{decode_workspace_create, decode_workspace_drop};
+use crate::workspace::{WorkspaceId, WorkspaceMetadata, WorkspaceRegistry};
 
 /// Thread-safe wrapper over per-shard databases.
 ///
@@ -77,21 +77,11 @@ impl ShardDatabases {
             .map(|_| RwLock::new(GraphStore::new()))
             .collect();
         let wal_append_txs = (0..num_shards).map(|_| Mutex::new(None)).collect();
-        let temporal_registries = (0..num_shards)
-            .map(|_| Mutex::new(None))
-            .collect();
-        let temporal_kv_indexes = (0..num_shards)
-            .map(|_| Mutex::new(None))
-            .collect();
-        let workspace_registries = (0..num_shards)
-            .map(|_| Mutex::new(None))
-            .collect();
-        let durable_queue_registries = (0..num_shards)
-            .map(|_| Mutex::new(None))
-            .collect();
-        let trigger_registries = (0..num_shards)
-            .map(|_| Mutex::new(None))
-            .collect();
+        let temporal_registries = (0..num_shards).map(|_| Mutex::new(None)).collect();
+        let temporal_kv_indexes = (0..num_shards).map(|_| Mutex::new(None)).collect();
+        let workspace_registries = (0..num_shards).map(|_| Mutex::new(None)).collect();
+        let durable_queue_registries = (0..num_shards).map(|_| Mutex::new(None)).collect();
+        let trigger_registries = (0..num_shards).map(|_| Mutex::new(None)).collect();
         let kv_write_intents = (0..num_shards)
             .map(|_| Mutex::new(KvWriteIntents::new()))
             .collect();
@@ -287,11 +277,7 @@ impl ShardDatabases {
             if let Ok(entries) = std::fs::read_dir(&wal_dir) {
                 let mut wal_files: Vec<_> = entries
                     .filter_map(|e| e.ok())
-                    .filter(|e| {
-                        e.file_name()
-                            .to_str()
-                            .is_some_and(|n| n.ends_with(".wal"))
-                    })
+                    .filter(|e| e.file_name().to_str().is_some_and(|n| n.ends_with(".wal")))
                     .map(|e| e.path())
                     .collect();
                 wal_files.sort();
@@ -343,22 +329,20 @@ impl ShardDatabases {
             let mut durable_configs: HashMap<Vec<u8>, u32> = HashMap::new();
             let mut ack_count = 0u64;
 
-            let on_command = &mut |record: &WalRecord| {
-                match record.record_type {
-                    WalRecordType::MqCreate => {
-                        if let Some((queue_key, max_delivery_count)) =
-                            crate::mq::wal::decode_mq_create(&record.payload)
-                        {
-                            durable_configs.insert(queue_key, max_delivery_count);
-                        }
+            let on_command = &mut |record: &WalRecord| match record.record_type {
+                WalRecordType::MqCreate => {
+                    if let Some((queue_key, max_delivery_count)) =
+                        crate::mq::wal::decode_mq_create(&record.payload)
+                    {
+                        durable_configs.insert(queue_key, max_delivery_count);
                     }
-                    WalRecordType::MqAck => {
-                        if crate::mq::wal::decode_mq_ack(&record.payload).is_some() {
-                            ack_count += 1;
-                        }
-                    }
-                    _ => {}
                 }
+                WalRecordType::MqAck => {
+                    if crate::mq::wal::decode_mq_ack(&record.payload).is_some() {
+                        ack_count += 1;
+                    }
+                }
+                _ => {}
             };
             let on_fpi = &mut |_: &WalRecord| {};
 
@@ -366,11 +350,7 @@ impl ShardDatabases {
             if let Ok(entries) = std::fs::read_dir(&wal_dir) {
                 let mut wal_files: Vec<_> = entries
                     .filter_map(|e| e.ok())
-                    .filter(|e| {
-                        e.file_name()
-                            .to_str()
-                            .is_some_and(|n| n.ends_with(".wal"))
-                    })
+                    .filter(|e| e.file_name().to_str().is_some_and(|n| n.ends_with(".wal")))
                     .map(|e| e.path())
                     .collect();
                 wal_files.sort();
@@ -385,8 +365,8 @@ impl ShardDatabases {
             // Phase 2: Restore DurableQueueRegistry from MqCreate records
             if !durable_configs.is_empty() {
                 let mut guard = self.durable_queue_registries[shard_id].lock();
-                let reg = guard
-                    .get_or_insert_with(|| Box::new(crate::mq::DurableQueueRegistry::new()));
+                let reg =
+                    guard.get_or_insert_with(|| Box::new(crate::mq::DurableQueueRegistry::new()));
                 for (queue_key_bytes, max_delivery_count) in &durable_configs {
                     let key = bytes::Bytes::copy_from_slice(queue_key_bytes);
                     let config =
@@ -538,11 +518,11 @@ impl ShardDatabases {
     /// always replayed regardless of the `graph` feature. GraphTemporal records
     /// are only processed when the `graph` feature is enabled.
     pub fn replay_temporal_wal(&self, persistence_dir: &std::path::Path) {
+        #[cfg(feature = "graph")]
+        use crate::persistence::wal_v3::record::decode_graph_temporal;
         use crate::persistence::wal_v3::record::{
             WalRecord, WalRecordType, decode_temporal_upsert,
         };
-        #[cfg(feature = "graph")]
-        use crate::persistence::wal_v3::record::decode_graph_temporal;
 
         for shard_id in 0..self.num_shards {
             let wal_dir = persistence_dir.join(format!("shard-{}", shard_id));
@@ -614,11 +594,7 @@ impl ShardDatabases {
             if let Ok(entries) = std::fs::read_dir(&wal_dir) {
                 let mut wal_files: Vec<_> = entries
                     .filter_map(|e| e.ok())
-                    .filter(|e| {
-                        e.file_name()
-                            .to_str()
-                            .is_some_and(|n| n.ends_with(".wal"))
-                    })
+                    .filter(|e| e.file_name().to_str().is_some_and(|n| n.ends_with(".wal")))
                     .map(|e| e.path())
                     .collect();
                 wal_files.sort();

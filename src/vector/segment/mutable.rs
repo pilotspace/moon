@@ -637,11 +637,7 @@ impl MutableSegment {
     /// Preserves earlier-committed entries with the same `key_hash` (e.g.,
     /// a row inserted at T1, then mutated inside an aborted txn at T2 — the
     /// T1 row stays visible after the T2 rollback).
-    pub fn mark_deleted_by_key_hash_after_lsn(
-        &self,
-        key_hash: u64,
-        threshold_lsn: u64,
-    ) -> u32 {
+    pub fn mark_deleted_by_key_hash_after_lsn(&self, key_hash: u64, threshold_lsn: u64) -> u32 {
         let mut inner = self.inner.write();
         let mut count = 0u32;
         for entry in inner.entries.iter_mut() {

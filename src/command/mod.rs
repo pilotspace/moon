@@ -13,6 +13,7 @@ pub mod key;
 pub mod key_extra;
 pub mod list;
 pub mod metadata;
+pub mod mq;
 pub mod persistence;
 pub mod server_admin;
 pub mod set;
@@ -23,7 +24,6 @@ pub mod temporal;
 pub mod transaction;
 pub mod vector_search;
 pub mod workspace;
-pub mod mq;
 // NOTE: ACL is an intercepted command handled at the connection level (like AUTH/BGSAVE),
 // not dispatched through the dispatch() function below.
 

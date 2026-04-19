@@ -363,7 +363,7 @@ pub(crate) fn handle_shard_message_shared(
                         // tuples will be consumed by Plan 166-02 to record
                         // VectorIntents on the active CrossStoreTxn. Discarded
                         // here because this path is not txn-aware yet.
-                        let _ = auto_index_hset(vector_store, &mut *ts, key_bytes, args);
+                        let _ = auto_index_hset(vector_store, &mut *ts, key_bytes, args, 0);
                     }
                 }
 
@@ -533,7 +533,7 @@ pub(crate) fn handle_shard_message_shared(
                         let mut ts = shard_databases.text_store(shard_id);
                         // Plan 166-01: Vec<(idx, key_hash)> return discarded
                         // here; Plan 166-02 threads it into CrossStoreTxn.
-                        let _ = auto_index_hset(vector_store, &mut *ts, key_bytes, args);
+                        let _ = auto_index_hset(vector_store, &mut *ts, key_bytes, args, 0);
                     }
                 }
 
@@ -818,7 +818,7 @@ pub(crate) fn handle_shard_message_shared(
                         let mut ts = shard_databases.text_store(shard_id);
                         // Plan 166-01: Vec<(idx, key_hash)> return discarded
                         // here; Plan 166-02 threads it into CrossStoreTxn.
-                        let _ = auto_index_hset(vector_store, &mut *ts, key_bytes, args);
+                        let _ = auto_index_hset(vector_store, &mut *ts, key_bytes, args, 0);
                     }
                 }
 
@@ -1412,7 +1412,20 @@ pub fn auto_index_hset_public(
     key: &[u8],
     args: &[crate::protocol::Frame],
 ) -> smallvec::SmallVec<[(bytes::Bytes, u64); 4]> {
-    auto_index_hset(vector_store, text_store, key, args)
+    auto_index_hset(vector_store, text_store, key, args, 0)
+}
+
+/// TXN-aware variant: tags each inserted vector entry with `txn_id` so
+/// non-transactional readers (snapshot_lsn == 0) see it as uncommitted and
+/// exclude it until TXN.COMMIT calls `txn_manager.commit(txn_id)`.
+pub fn auto_index_hset_public_txn(
+    vector_store: &mut VectorStore,
+    text_store: &mut crate::text::store::TextStore,
+    key: &[u8],
+    args: &[crate::protocol::Frame],
+    txn_id: u64,
+) -> smallvec::SmallVec<[(bytes::Bytes, u64); 4]> {
+    auto_index_hset(vector_store, text_store, key, args, txn_id)
 }
 
 fn auto_index_hset(
@@ -1420,6 +1433,7 @@ fn auto_index_hset(
     text_store: &mut crate::text::store::TextStore,
     key: &[u8],
     args: &[crate::protocol::Frame],
+    txn_id: u64,
 ) -> smallvec::SmallVec<[(bytes::Bytes, u64); 4]> {
     let mut inserted: smallvec::SmallVec<[(bytes::Bytes, u64); 4]> = smallvec::SmallVec::new();
     let matching_names = vector_store.find_matching_index_names(key);
@@ -1463,12 +1477,10 @@ fn auto_index_hset(
 
             if field_idx == 0 {
                 // Default field: use existing top-level segments
-                handle_vector_insert(idx, key, args, &field_name, dim, key_hash, insert_lsn);
+                handle_vector_insert(idx, key, args, &field_name, dim, key_hash, insert_lsn, txn_id);
             } else {
                 // Additional field: use field_segments
-                handle_vector_insert_field(
-                    idx, &field_name, key, args, dim, key_hash, insert_lsn,
-                );
+                handle_vector_insert_field(idx, &field_name, key, args, dim, key_hash, insert_lsn, txn_id);
             }
             any_vector_inserted = true;
         }
@@ -1548,6 +1560,7 @@ fn handle_vector_insert(
     dim: usize,
     key_hash: u64,
     insert_lsn: u64,
+    txn_id: u64,
 ) {
     let blob = match find_vector_blob(args, source_field, dim) {
         Some(b) => b.clone(),
@@ -1571,9 +1584,16 @@ fn handle_vector_insert(
     // Append to mutable segment. `insert_lsn` is the monotonic LSN allocated
     // by `auto_index_hset`; MVCC visibility (src/vector/mvcc/visibility.rs)
     // compares against query snapshot_lsn to enforce FT.SEARCH AS_OF and
-    // TXN snapshot isolation.
+    // TXN snapshot isolation. When inside a TXN (txn_id != 0), use the
+    // transactional variant so non-TXN readers see the entry as uncommitted.
     let snap = idx.segments.load();
-    let internal_id = snap.mutable.append(key_hash, &f32_vec, &sq_vec, norm, insert_lsn);
+    let internal_id = if txn_id != 0 {
+        snap.mutable
+            .append_transactional(key_hash, &f32_vec, &sq_vec, norm, insert_lsn, txn_id)
+    } else {
+        snap.mutable
+            .append(key_hash, &f32_vec, &sq_vec, norm, insert_lsn)
+    };
     // Use global_id for payload index so filter bitmaps match
     // search results after compaction advances global_id_base.
     let global_id = snap.mutable.global_id_base() + internal_id;
@@ -1610,6 +1630,7 @@ fn handle_vector_insert_field(
     dim: usize,
     key_hash: u64,
     insert_lsn: u64,
+    txn_id: u64,
 ) {
     let blob = match find_vector_blob(args, field_name, dim) {
         Some(b) => b.clone(),
@@ -1639,8 +1660,15 @@ fn handle_vector_insert_field(
     };
     // `insert_lsn` comes from the same allocation as the default-field insert
     // so both fields share one logical write event (Phase 165 MVCC contract).
+    // When inside a TXN (txn_id != 0), tag with txn_id for uncommitted visibility.
     let snap = fs.segments.load();
-    let _internal_id = snap.mutable.append(key_hash, &f32_vec, &sq_vec, norm, insert_lsn);
+    let _internal_id = if txn_id != 0 {
+        snap.mutable
+            .append_transactional(key_hash, &f32_vec, &sq_vec, norm, insert_lsn, txn_id)
+    } else {
+        snap.mutable
+            .append(key_hash, &f32_vec, &sq_vec, norm, insert_lsn)
+    };
     crate::vector::metrics::add_vectors(1);
     // Note: global_id and payload_index are NOT updated here.
     // Payload is shared and managed by the default field's insert path.

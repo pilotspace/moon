@@ -151,7 +151,8 @@ mod tests {
             crate::graph::cypher::parse_cypher(b"MATCH (n:Person) RETURN n.name").expect("parse");
         let plan = crate::graph::cypher::planner::compile(&query).expect("compile");
         let graph = store.get_graph(b"test").expect("graph");
-        let result = execute(graph, &plan, &HashMap::new(), &ExecutionContext::default()).expect("exec");
+        let result =
+            execute(graph, &plan, &HashMap::new(), &ExecutionContext::default()).expect("exec");
 
         assert_eq!(result.columns.len(), 1);
         assert_eq!(result.columns[0], "n.name");
@@ -190,7 +191,8 @@ mod tests {
                 .expect("parse");
         let plan = crate::graph::cypher::planner::compile(&query).expect("compile");
         let graph = store.get_graph(b"test").expect("graph");
-        let result = execute(graph, &plan, &HashMap::new(), &ExecutionContext::default()).expect("exec");
+        let result =
+            execute(graph, &plan, &HashMap::new(), &ExecutionContext::default()).expect("exec");
 
         assert_eq!(result.rows.len(), 1);
         match &result.rows[0][0] {
@@ -221,7 +223,8 @@ mod tests {
             .expect("parse");
         let plan = crate::graph::cypher::planner::compile(&query).expect("compile");
         let graph = store.get_graph(b"test").expect("graph");
-        let result = execute(graph, &plan, &HashMap::new(), &ExecutionContext::default()).expect("exec");
+        let result =
+            execute(graph, &plan, &HashMap::new(), &ExecutionContext::default()).expect("exec");
 
         assert_eq!(result.rows.len(), 3);
     }

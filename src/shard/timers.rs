@@ -103,8 +103,7 @@ pub(crate) fn fire_pending_mq_triggers(
 
     // Collect (channel, message) pairs while holding trigger lock,
     // then publish after releasing it to avoid holding two locks.
-    let mut notifications: Vec<(bytes::Bytes, bytes::Bytes)> =
-        Vec::with_capacity(ready_keys.len());
+    let mut notifications: Vec<(bytes::Bytes, bytes::Bytes)> = Vec::with_capacity(ready_keys.len());
 
     for key in &ready_keys {
         if let Some(entry) = reg.get(key) {

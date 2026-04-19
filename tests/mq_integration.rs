@@ -23,8 +23,8 @@ use moon::config::ServerConfig;
 use moon::runtime::cancel::CancellationToken;
 use moon::runtime::channel;
 use moon::server::listener;
-use moon::shard::mesh::{CHANNEL_BUFFER_SIZE, ChannelMesh};
 use moon::shard::Shard;
+use moon::shard::mesh::{CHANNEL_BUFFER_SIZE, ChannelMesh};
 use tokio::net::TcpListener;
 
 /// Start a full sharded Moon server on a random port.
@@ -105,9 +105,7 @@ async fn start_mq_server(num_shards: usize) -> (u16, CancellationToken) {
             std::sync::Arc<parking_lot::RwLock<moon::pubsub::PubSubRegistry>>,
         > = (0..num_shards)
             .map(|_| {
-                std::sync::Arc::new(parking_lot::RwLock::new(
-                    moon::pubsub::PubSubRegistry::new(),
-                ))
+                std::sync::Arc::new(parking_lot::RwLock::new(moon::pubsub::PubSubRegistry::new()))
             })
             .collect();
         let all_remote_sub_maps: Vec<
@@ -864,10 +862,8 @@ async fn test_mq_unknown_subcommand() {
     let (port, shutdown) = start_server().await;
     let mut conn = connect(port).await;
 
-    let result: Result<String, redis::RedisError> = redis::cmd("MQ")
-        .arg("FOOBAR")
-        .query_async(&mut conn)
-        .await;
+    let result: Result<String, redis::RedisError> =
+        redis::cmd("MQ").arg("FOOBAR").query_async(&mut conn).await;
     assert!(result.is_err(), "MQ FOOBAR should return error");
     let err_msg = result.unwrap_err().to_string();
     assert!(
@@ -889,10 +885,8 @@ async fn test_mq_push_missing_args() {
     let mut conn = connect(port).await;
 
     // MQ PUSH with no key and no fields
-    let result: Result<String, redis::RedisError> = redis::cmd("MQ")
-        .arg("PUSH")
-        .query_async(&mut conn)
-        .await;
+    let result: Result<String, redis::RedisError> =
+        redis::cmd("MQ").arg("PUSH").query_async(&mut conn).await;
     assert!(result.is_err(), "MQ PUSH without args should return error");
     let err_msg = result.unwrap_err().to_string();
     assert!(

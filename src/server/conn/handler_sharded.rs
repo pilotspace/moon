@@ -2983,17 +2983,28 @@ pub(crate) async fn handle_connection_sharded_inner<
                                 && (cmd.eq_ignore_ascii_case(b"HSET") || cmd.eq_ignore_ascii_case(b"HMSET"))
                             {
                                 if let Some(key) = cmd_args.first().and_then(|f| extract_bytes(f)) {
+                                    // Phase 166 (Plan 02): if inside an active TXN, tag each
+                                    // inserted mutable-HNSW entry with the txn_id so that
+                                    // non-TXN readers (snapshot_lsn==0) see it as uncommitted
+                                    // and exclude it until TXN.COMMIT calls
+                                    // txn_manager.commit(txn_id) (ACID-09 isolation fix).
+                                    let active_txn_id = conn
+                                        .active_cross_txn
+                                        .as_ref()
+                                        .map(|t| t.txn_id)
+                                        .unwrap_or(0);
                                     let inserted = {
                                         let mut vs = ctx.shard_databases.vector_store(ctx.shard_id);
                                         let mut ts = ctx.shard_databases.text_store(ctx.shard_id);
-                                        crate::shard::spsc_handler::auto_index_hset_public(&mut vs, &mut *ts, &key, cmd_args)
+                                        if active_txn_id != 0 {
+                                            crate::shard::spsc_handler::auto_index_hset_public_txn(&mut vs, &mut *ts, &key, cmd_args, active_txn_id)
+                                        } else {
+                                            crate::shard::spsc_handler::auto_index_hset_public(&mut vs, &mut *ts, &key, cmd_args)
+                                        }
                                     };
-                                    // Phase 166 (Plan 02): if inside an active cross-store
-                                    // TXN, push one VectorIntent per (index_name, key_hash)
-                                    // so TXN.ABORT (Plan 166-03) can tombstone via
-                                    // MutableSegment::mark_deleted_by_key_hash. Non-TXN
-                                    // paths discard the tuples — auto_index_hset already
-                                    // performed the append.
+                                    // Push one VectorIntent per (index_name, key_hash) so
+                                    // TXN.ABORT (Plan 166-03) can tombstone via
+                                    // MutableSegment::mark_deleted_by_key_hash.
                                     if let Some(txn) = conn.active_cross_txn.as_mut() {
                                         for (index_name, key_hash) in inserted {
                                             txn.record_vector(key_hash, index_name);

@@ -539,13 +539,7 @@ mod tests {
 
     #[test]
     fn test_validate_mq_pop_extra_args() {
-        let args = [
-            bs(b"POP"),
-            bs(b"q"),
-            bs(b"COUNT"),
-            bs(b"5"),
-            bs(b"extra"),
-        ];
+        let args = [bs(b"POP"), bs(b"q"), bs(b"COUNT"), bs(b"5"), bs(b"extra")];
         assert!(validate_mq_pop(&args).is_err());
     }
 
@@ -573,7 +567,13 @@ mod tests {
 
     #[test]
     fn test_validate_mq_ack_multiple_ids() {
-        let args = [bs(b"ACK"), bs(b"q"), bs(b"100-0"), bs(b"200-1"), bs(b"300-2")];
+        let args = [
+            bs(b"ACK"),
+            bs(b"q"),
+            bs(b"100-0"),
+            bs(b"200-1"),
+            bs(b"300-2"),
+        ];
         let (_, ids) = validate_mq_ack(&args).unwrap();
         assert_eq!(ids.len(), 3);
         assert_eq!(ids[0], (100, 0));

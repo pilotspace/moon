@@ -44,9 +44,7 @@ pub fn is_visible(
     // (non-transactional reader looking at non-transactional write) would spuriously
     // match and leak post-snapshot writes through — precisely the bug Phase 165
     // guards against for FT.SEARCH AS_OF.
-    if insert_lsn > snapshot_lsn
-        && !(my_txn_id != 0 && txn_id == my_txn_id)
-    {
+    if insert_lsn > snapshot_lsn && !(my_txn_id != 0 && txn_id == my_txn_id) {
         return false;
     }
 
