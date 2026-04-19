@@ -82,6 +82,22 @@ pub struct TextIndex {
     /// Next doc_id to assign.
     next_doc_id: u32,
 
+    // ── Bi-temporal MVCC (v0.1.10 G-1, closing HYB-03 deferral) ──────────
+    //
+    // Mirrors the vector-store MVCC pattern: every doc inserted inside an
+    // auto-index path records its commit LSN so `FT.SEARCH HYBRID AS_OF`
+    // can exclude post-snapshot docs from the BM25 stream. Empty / lsn=0
+    // entries mean "pre-MVCC document" and are always visible (backwards-
+    // compatible with tests and non-AS_OF callers).
+    /// `doc_id -> insert LSN` (monotonic LSN from `VectorStore::txn_manager_mut().allocate_lsn()`).
+    /// Used by `search_field_as_of` + `search_field_or_as_of` to filter
+    /// candidates to those committed at or before the requested AS_OF.
+    pub doc_id_to_insert_lsn: HashMap<u32, u64>,
+    /// `doc_id -> delete LSN`. Reserved for v0.2 logical-delete wiring so
+    /// historical AS_OF queries can still see deleted docs. Present today
+    /// so the visibility helper is future-proof.
+    pub doc_id_to_delete_lsn: HashMap<u32, u64>,
+
     // ── TAG index (Plan 152-06, Phase 152) ────────────────────────────────
     //
     // TAG semantics bypass the BM25 analyzer entirely. Storage is a two-level
@@ -170,6 +186,8 @@ impl TextIndex {
             key_hash_to_doc_id: HashMap::new(),
             doc_id_to_key: HashMap::new(),
             next_doc_id: 0,
+            doc_id_to_insert_lsn: HashMap::new(),
+            doc_id_to_delete_lsn: HashMap::new(),
             #[cfg(feature = "text-index")]
             tag_fields: Vec::new(),
             #[cfg(feature = "text-index")]
@@ -238,6 +256,75 @@ impl TextIndex {
         self.key_hash_to_doc_id.insert(key_hash, id);
         self.doc_id_to_key.insert(id, Bytes::copy_from_slice(key));
         id
+    }
+
+    /// Return `true` if a document is visible at the requested `as_of_lsn`
+    /// snapshot. `as_of_lsn == 0` always returns `true` (no temporal filter,
+    /// backwards-compatible with pre-v0.1.10 callers).
+    ///
+    /// Visibility rule (mirrors the vector-store MVCC filter):
+    ///
+    /// ```text
+    /// insert_lsn <= as_of_lsn  AND  (delete_lsn == 0 OR delete_lsn > as_of_lsn)
+    /// ```
+    ///
+    /// Documents with no recorded `insert_lsn` (empty map entry) are treated
+    /// as pre-MVCC and always visible — prevents false-negatives on the 22+
+    /// call sites in unit tests that construct docs via `index_document`
+    /// without an LSN.
+    #[inline]
+    pub fn is_doc_visible_at(&self, doc_id: u32, as_of_lsn: u64) -> bool {
+        if as_of_lsn == 0 {
+            return true;
+        }
+        let insert_lsn = self
+            .doc_id_to_insert_lsn
+            .get(&doc_id)
+            .copied()
+            .unwrap_or(0);
+        // Pre-MVCC docs (insert_lsn == 0) are always visible in historical snapshots.
+        if insert_lsn != 0 && insert_lsn > as_of_lsn {
+            return false;
+        }
+        let delete_lsn = self
+            .doc_id_to_delete_lsn
+            .get(&doc_id)
+            .copied()
+            .unwrap_or(0);
+        delete_lsn == 0 || delete_lsn > as_of_lsn
+    }
+
+    /// Record the insertion LSN for a doc_id after `index_document` allocates it.
+    /// Callers on the auto-index path (src/shard/spsc_handler.rs) pass the same
+    /// monotonic LSN they allocate for the paired vector-field MVCC row so
+    /// AS_OF queries stay consistent across vector and text streams.
+    #[inline]
+    pub fn set_doc_insert_lsn(&mut self, doc_id: u32, lsn: u64) {
+        if lsn != 0 {
+            self.doc_id_to_insert_lsn.insert(doc_id, lsn);
+        }
+    }
+
+    /// LSN-aware variant of [`Self::index_document`] — returns the assigned or
+    /// reused doc_id AND records `insert_lsn` so AS_OF queries exclude the doc
+    /// from pre-insert snapshots.
+    ///
+    /// `insert_lsn == 0` is a pre-MVCC fallback (e.g., non-HSET indexing paths
+    /// or unit tests) and leaves the doc always-visible.
+    pub fn index_document_with_lsn(
+        &mut self,
+        key_hash: u64,
+        key: &[u8],
+        args: &[crate::protocol::Frame],
+        insert_lsn: u64,
+    ) -> u32 {
+        self.index_document(key_hash, key, args);
+        let doc_id = *self
+            .key_hash_to_doc_id
+            .get(&key_hash)
+            .expect("index_document populated key_hash_to_doc_id");
+        self.set_doc_insert_lsn(doc_id, insert_lsn);
+        doc_id
     }
 
     /// Index a document from HSET args.
@@ -863,6 +950,81 @@ impl TextIndex {
         }
     }
 
+    /// LSN-aware wrapper around [`Self::search_field`] — post-filters the
+    /// scored result list by MVCC visibility at `as_of_lsn`.
+    ///
+    /// Backwards-compatible: `as_of_lsn == 0` is a no-op passthrough and
+    /// produces identical output to `search_field`.
+    ///
+    /// Implementation note: post-filter (rather than pre-filter the candidate
+    /// bitmap) is a deliberate trade-off — it wastes BM25 scoring work on
+    /// invisible docs in exchange for zero risk of breaking the existing
+    /// scoring path. Acceptable because (a) AS_OF is rare today (Lunaris
+    /// retrievers) and (b) BM25 is already O(candidates) so the constant
+    /// factor is modest. Pre-filter is a v0.2 optimisation if profiling
+    /// shows this hot.
+    pub fn search_field_as_of(
+        &self,
+        field_idx: usize,
+        query_terms: &[String],
+        global_df: Option<&HashMap<String, u32>>,
+        global_n: Option<u32>,
+        top_k: usize,
+        as_of_lsn: u64,
+    ) -> Vec<TextSearchResult> {
+        // When top_k is requested, filter BEFORE truncation so we don't
+        // silently lose visible hits ranked above invisible ones. We
+        // oversample by calling search_field with `top_k.saturating_mul(2)`
+        // and a minimum of 16 to keep recall stable.
+        let oversample = top_k.saturating_mul(2).max(16);
+        let raw = self.search_field(field_idx, query_terms, global_df, global_n, oversample);
+        if as_of_lsn == 0 {
+            // Need to re-truncate since we oversampled; preserves parity.
+            let mut out = raw;
+            out.truncate(top_k);
+            return out;
+        }
+        let mut filtered: Vec<TextSearchResult> = raw
+            .into_iter()
+            .filter(|r| self.is_doc_visible_at(r.doc_id, as_of_lsn))
+            .collect();
+        filtered.truncate(top_k);
+        filtered
+    }
+
+    /// LSN-aware counterpart to [`Self::search_field_or`] (fuzzy/prefix OR path).
+    /// See [`Self::search_field_as_of`] for the filter contract.
+    #[cfg(feature = "text-index")]
+    pub fn search_field_or_as_of(
+        &self,
+        field_idx: usize,
+        expanded_term_ids: &[u32],
+        global_df: Option<&HashMap<String, u32>>,
+        global_n: Option<u32>,
+        top_k: usize,
+        as_of_lsn: u64,
+    ) -> Vec<TextSearchResult> {
+        let oversample = top_k.saturating_mul(2).max(16);
+        let raw = self.search_field_or(
+            field_idx,
+            expanded_term_ids,
+            global_df,
+            global_n,
+            oversample,
+        );
+        if as_of_lsn == 0 {
+            let mut out = raw;
+            out.truncate(top_k);
+            return out;
+        }
+        let mut filtered: Vec<TextSearchResult> = raw
+            .into_iter()
+            .filter(|r| self.is_doc_visible_at(r.doc_id, as_of_lsn))
+            .collect();
+        filtered.truncate(top_k);
+        filtered
+    }
+
     /// Look up documents tagged with a specific value on a specific field.
     ///
     /// Returns doc_ids in ascending order. Field resolution is
@@ -1441,10 +1603,7 @@ mod tests {
         // Scores differ when global IDF is used (df=10/N=100 vs df=2/N=2)
         // Both sets return 2 results; just verify global path produces valid positive scores
         for r in &global_results {
-            assert!(
-                r.score > 0.0 || r.score == 0.0,
-                "Score must be non-negative"
-            );
+            assert!(r.score >= 0.0, "Score must be non-negative");
         }
     }
 
@@ -1602,6 +1761,128 @@ mod tests {
         // No file written — load should return empty Vec (not error)
         let loaded = load_fst_sidecar(tmp.path(), b"nonexistent_idx").expect("load");
         assert!(loaded.is_empty(), "Missing sidecar should return empty Vec");
+    }
+
+    // ── v0.1.10 G-1: BM25 AS_OF MVCC filter ──────────────────────────────
+
+    /// Doc with no recorded insert_lsn (pre-MVCC) is always visible.
+    #[test]
+    fn test_is_doc_visible_at_pre_mvcc_doc_always_visible() {
+        let idx = make_index_with_docs(&[("doc:0", "alpha")]);
+        // No insert_lsn recorded (via index_document, not index_document_with_lsn)
+        assert!(
+            idx.is_doc_visible_at(0, 0),
+            "as_of_lsn=0 always visible (no filter)"
+        );
+        assert!(
+            idx.is_doc_visible_at(0, 100),
+            "pre-MVCC doc visible at any AS_OF"
+        );
+    }
+
+    /// Doc inserted at lsn=50 is visible at AS_OF>=50 and invisible before.
+    #[test]
+    fn test_is_doc_visible_at_honours_insert_lsn() {
+        let mut idx = make_index_with_docs(&[("doc:post", "alpha")]);
+        // Retrieve the doc_id that index_document assigned, then record insert_lsn
+        let key_hash = 0u64;
+        let doc_id = *idx.key_hash_to_doc_id.get(&key_hash).expect("doc indexed");
+        idx.set_doc_insert_lsn(doc_id, 50);
+
+        assert!(!idx.is_doc_visible_at(doc_id, 49), "AS_OF before insert");
+        assert!(idx.is_doc_visible_at(doc_id, 50), "AS_OF == insert");
+        assert!(idx.is_doc_visible_at(doc_id, 99), "AS_OF after insert");
+    }
+
+    /// search_field_as_of with as_of_lsn=0 passes through unchanged (regression guard).
+    #[test]
+    fn test_search_field_as_of_zero_lsn_passthrough() {
+        let idx = make_index_with_docs(&[
+            ("doc:0", "alpha"),
+            ("doc:1", "alpha"),
+            ("doc:2", "alpha"),
+        ]);
+        let terms = vec!["alpha".to_string()];
+        let baseline = idx.search_field(0, &terms, None, None, 10);
+        let as_of = idx.search_field_as_of(0, &terms, None, None, 10, 0);
+        assert_eq!(
+            baseline.len(),
+            as_of.len(),
+            "as_of_lsn=0 must not drop hits"
+        );
+        // Ensure the same set of keys is returned
+        let mut baseline_keys: Vec<&[u8]> = baseline.iter().map(|r| r.key.as_ref()).collect();
+        let mut as_of_keys: Vec<&[u8]> = as_of.iter().map(|r| r.key.as_ref()).collect();
+        baseline_keys.sort();
+        as_of_keys.sort();
+        assert_eq!(baseline_keys, as_of_keys);
+    }
+
+    /// search_field_as_of excludes post-snapshot docs.
+    #[test]
+    fn test_search_field_as_of_excludes_post_snapshot() {
+        let mut idx = make_index_with_docs(&[
+            ("doc:pre:0", "alpha"),
+            ("doc:pre:1", "alpha"),
+            ("doc:post:0", "alpha"),
+            ("doc:post:1", "alpha"),
+        ]);
+        // Pre-snapshot: inserted at lsn 10, 20
+        idx.set_doc_insert_lsn(*idx.key_hash_to_doc_id.get(&0).unwrap(), 10);
+        idx.set_doc_insert_lsn(*idx.key_hash_to_doc_id.get(&1).unwrap(), 20);
+        // Snapshot LSN = 25
+        // Post-snapshot: inserted at lsn 30, 40
+        idx.set_doc_insert_lsn(*idx.key_hash_to_doc_id.get(&2).unwrap(), 30);
+        idx.set_doc_insert_lsn(*idx.key_hash_to_doc_id.get(&3).unwrap(), 40);
+
+        let terms = vec!["alpha".to_string()];
+        let results = idx.search_field_as_of(0, &terms, None, None, 10, 25);
+
+        let keys: std::collections::HashSet<&[u8]> =
+            results.iter().map(|r| r.key.as_ref()).collect();
+        assert!(
+            keys.contains(b"doc:pre:0".as_ref()),
+            "pre-snapshot doc visible"
+        );
+        assert!(
+            keys.contains(b"doc:pre:1".as_ref()),
+            "pre-snapshot doc visible"
+        );
+        assert!(
+            !keys.contains(b"doc:post:0".as_ref()),
+            "post-snapshot doc excluded"
+        );
+        assert!(
+            !keys.contains(b"doc:post:1".as_ref()),
+            "post-snapshot doc excluded"
+        );
+    }
+
+    /// `index_document_with_lsn` returns the assigned doc_id AND records insert_lsn.
+    #[test]
+    fn test_index_document_with_lsn_records_lsn_and_returns_doc_id() {
+        use crate::protocol::Frame;
+        use crate::text::types::BM25Config;
+        let field = TextFieldDef::new(Bytes::from_static(b"body"));
+        let mut idx = TextIndex::new(
+            Bytes::from_static(b"t"),
+            Vec::new(),
+            vec![field],
+            BM25Config::default(),
+        );
+        let args = vec![
+            Frame::BulkString(Bytes::from_static(b"body")),
+            Frame::BulkString(Bytes::from_static(b"alpha")),
+        ];
+        let doc_id = idx.index_document_with_lsn(42, b"doc:x", &args, 77);
+        assert_eq!(doc_id, 0, "first doc gets id 0");
+        assert_eq!(
+            idx.doc_id_to_insert_lsn.get(&0).copied(),
+            Some(77),
+            "insert_lsn recorded"
+        );
+        assert!(idx.is_doc_visible_at(0, 77));
+        assert!(!idx.is_doc_visible_at(0, 76));
     }
 }
 

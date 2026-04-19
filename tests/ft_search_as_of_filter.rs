@@ -356,7 +356,10 @@ async fn ft_search_as_of_and_filter_compose() {
         .await
         .expect("sanity 1 should succeed");
     let c1 = parse_search_count(&s1);
-    assert_eq!(c1, 2, "sanity 1: no AS_OF no filter must return 2 docs; got {c1}");
+    assert_eq!(
+        c1, 2,
+        "sanity 1: no AS_OF no filter must return 2 docs; got {c1}"
+    );
 
     // --- Sanity 2: AS_OF T, no filter → only doc:a (count=1).
     let s2: redis::Value = redis::cmd("FT.SEARCH")
@@ -374,7 +377,10 @@ async fn ft_search_as_of_and_filter_compose() {
         .await
         .expect("sanity 2 should succeed");
     let c2 = parse_search_count(&s2);
-    assert_eq!(c2, 1, "sanity 2: AS_OF T no filter must return 1 doc (doc:a); got {c2}");
+    assert_eq!(
+        c2, 1,
+        "sanity 2: AS_OF T no filter must return 1 doc (doc:a); got {c2}"
+    );
 
     // --- G4 main: AS_OF T + FILTER @score:[10 10] → count=1 (doc:a passes both).
     // Moon FT.SEARCH FILTER numeric-equality syntax: @field:[val val] (range where min==max).

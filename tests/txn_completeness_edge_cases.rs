@@ -353,7 +353,10 @@ async fn test_empty_txn_abort_returns_ok() {
         .query_async(&mut conn)
         .await
         .expect("PING after empty abort must succeed");
-    assert_eq!(pong, "PONG", "Server must remain responsive after empty abort");
+    assert_eq!(
+        pong, "PONG",
+        "Server must remain responsive after empty abort"
+    );
 
     shutdown.cancel();
 }
@@ -400,7 +403,10 @@ async fn test_double_abort_second_returns_err() {
         .query_async(&mut conn)
         .await
         .expect("TXN.BEGIN after double abort must succeed");
-    assert_eq!(begin_again, "OK", "TXN.BEGIN after double abort must return OK");
+    assert_eq!(
+        begin_again, "OK",
+        "TXN.BEGIN after double abort must return OK"
+    );
     // Clean up: abort the new TXN.
     let _: String = redis::cmd("TXN")
         .arg("ABORT")
@@ -730,7 +736,10 @@ async fn test_nested_begin_rejected_first_txn_intact() {
         .query_async(&mut conn)
         .await
         .expect("COMMIT of first TXN after nested BEGIN rejection must succeed");
-    assert_eq!(commit_ok, "OK", "COMMIT after nested BEGIN rejection must return OK");
+    assert_eq!(
+        commit_ok, "OK",
+        "COMMIT after nested BEGIN rejection must return OK"
+    );
 
     // Verify the write from the first TXN is visible.
     let got: Option<String> = redis::cmd("GET")

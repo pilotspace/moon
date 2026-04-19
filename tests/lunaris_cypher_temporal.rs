@@ -393,16 +393,16 @@ fn rows_flat_strings(v: &redis::Value) -> Vec<String> {
                     match cell {
                         redis::Value::BulkString(b) => {
                             if let Ok(s) = std::str::from_utf8(b) {
-                                    out.push(s.to_string());
-                                }
+                                out.push(s.to_string());
                             }
-                            redis::Value::SimpleString(s) => out.push(s.clone()),
-                            _ => {}
                         }
+                        redis::Value::SimpleString(s) => out.push(s.clone()),
+                        _ => {}
                     }
                 }
             }
         }
+    }
     out
 }
 

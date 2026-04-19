@@ -129,7 +129,11 @@ pub async fn handle_connection(
                                                     continue;
                                                 }
                                                 #[allow(clippy::unwrap_used)] // conn.pubsub_tx is always Some in subscriber mode
-                                                let sub = Subscriber::new(conn.pubsub_tx.clone().unwrap(), conn.subscriber_id);
+                                                let sub = Subscriber::with_protocol(
+                                                    conn.pubsub_tx.clone().unwrap(),
+                                                    conn.subscriber_id,
+                                                    framed.codec().protocol_version() == 3,
+                                                );
                                                 pubsub_registry.lock().subscribe(channel.clone(), sub);
                                                 conn.subscription_count += 1;
                                                 if framed.send(pubsub::subscribe_response(&channel, conn.subscription_count)).await.is_err() {
@@ -189,7 +193,11 @@ pub async fn handle_connection(
                                                     continue;
                                                 }
                                                 #[allow(clippy::unwrap_used)] // conn.pubsub_tx is always Some in subscriber mode
-                                                let sub = Subscriber::new(conn.pubsub_tx.clone().unwrap(), conn.subscriber_id);
+                                                let sub = Subscriber::with_protocol(
+                                                    conn.pubsub_tx.clone().unwrap(),
+                                                    conn.subscriber_id,
+                                                    framed.codec().protocol_version() == 3,
+                                                );
                                                 pubsub_registry.lock().psubscribe(pattern.clone(), sub);
                                                 conn.subscription_count += 1;
                                                 if framed.send(pubsub::psubscribe_response(&pattern, conn.subscription_count)).await.is_err() {
@@ -815,7 +823,11 @@ pub async fn handle_connection(
                                             continue;
                                         }
                                         #[allow(clippy::unwrap_used)] // conn.pubsub_tx is set to Some just above before this loop
-                                        let sub = Subscriber::new(conn.pubsub_tx.clone().unwrap(), conn.subscriber_id);
+                                        let sub = Subscriber::with_protocol(
+                                            conn.pubsub_tx.clone().unwrap(),
+                                            conn.subscriber_id,
+                                            framed.codec().protocol_version() == 3,
+                                        );
                                         {
                                             let mut registry = pubsub_registry.lock();
                                             if is_pattern {

@@ -90,13 +90,18 @@ pub fn execute_hybrid_search_local_raw_streams(
         #[cfg(feature = "text-index")]
         filter: None,
     };
-    let text_results = crate::command::vector_search::ft_text_search::execute_query_on_index(
-        text_index,
-        &clause,
-        Some(global_df),
-        Some(global_n),
-        k_per_stream,
-    );
+    // v0.1.10 G-1: multi-shard hybrid BM25 honours `as_of_lsn` via the
+    // MVCC visibility filter on TextIndex. Parity with the single-shard
+    // fast path in hybrid.rs.
+    let text_results =
+        crate::command::vector_search::ft_text_search::execute_query_on_index_as_of(
+            text_index,
+            &clause,
+            Some(global_df),
+            Some(global_n),
+            k_per_stream,
+            as_of_lsn,
+        );
     let bm25 = bm25_to_search_results(&text_results);
 
     // ── Stream 2: dense KNN ──────────────────────────────────────────────────

@@ -231,7 +231,11 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                                                 continue;
                                                             }
                                                             #[allow(clippy::unwrap_used)] // conn.pubsub_tx is always Some when in subscriber mode
-                                                            let sub = Subscriber::new(conn.pubsub_tx.clone().unwrap(), conn.subscriber_id);
+                                                            let sub = Subscriber::with_protocol(
+                                                                conn.pubsub_tx.clone().unwrap(),
+                                                                conn.subscriber_id,
+                                                                conn.protocol_version >= 3,
+                                                            );
                                                             ctx.pubsub_registry.write().subscribe(channel.clone(), sub);
                                                             propagate_subscription(&ctx.all_remote_sub_maps, &channel, ctx.shard_id, ctx.num_shards, false);
                                                             conn.subscription_count += 1;
@@ -319,7 +323,11 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                                                 continue;
                                                             }
                                                             #[allow(clippy::unwrap_used)] // conn.pubsub_tx is always Some when in subscriber mode
-                                                            let sub = Subscriber::new(conn.pubsub_tx.clone().unwrap(), conn.subscriber_id);
+                                                            let sub = Subscriber::with_protocol(
+                                                                conn.pubsub_tx.clone().unwrap(),
+                                                                conn.subscriber_id,
+                                                                conn.protocol_version >= 3,
+                                                            );
                                                             ctx.pubsub_registry.write().psubscribe(pattern.clone(), sub);
                                                             propagate_subscription(&ctx.all_remote_sub_maps, &pattern, ctx.shard_id, ctx.num_shards, true);
                                                             conn.subscription_count += 1;
@@ -1167,8 +1175,11 @@ pub(crate) async fn handle_connection_sharded_monoio<
                         }
                         #[allow(clippy::unwrap_used)]
                         // conn.pubsub_tx is set to Some just above before this loop
-                        let sub =
-                            Subscriber::new(conn.pubsub_tx.clone().unwrap(), conn.subscriber_id);
+                        let sub = Subscriber::with_protocol(
+                            conn.pubsub_tx.clone().unwrap(),
+                            conn.subscriber_id,
+                            conn.protocol_version >= 3,
+                        );
                         if is_pattern {
                             ctx.pubsub_registry.write().psubscribe(ch.clone(), sub);
                         } else {
@@ -3427,29 +3438,30 @@ pub(crate) async fn handle_connection_sharded_monoio<
             // --- GRAPH.* graph commands ---
             #[cfg(feature = "graph")]
             if cmd.len() > 6 && cmd[..6].eq_ignore_ascii_case(b"GRAPH.") {
-                let (response, wal_records, cypher_intents) = if crate::command::graph::is_graph_write_cmd(cmd)
-                    || (cmd.eq_ignore_ascii_case(b"GRAPH.QUERY")
-                        && crate::command::graph::is_cypher_write_query(cmd_args))
-                {
-                    let mut gs = ctx.shard_databases.graph_store_write(ctx.shard_id);
-                    let (resp, cypher_intents) = if cmd.eq_ignore_ascii_case(b"GRAPH.QUERY") {
-                        // Phase 167 (CYP-01/02): capture Cypher-created
-                        // nodes/edges so TXN.ABORT can roll them back via
-                        // CrossStoreTxn::record_graph.
-                        crate::command::graph::graph_query_or_write(&mut gs, cmd_args)
+                let (response, wal_records, cypher_intents) =
+                    if crate::command::graph::is_graph_write_cmd(cmd)
+                        || (cmd.eq_ignore_ascii_case(b"GRAPH.QUERY")
+                            && crate::command::graph::is_cypher_write_query(cmd_args))
+                    {
+                        let mut gs = ctx.shard_databases.graph_store_write(ctx.shard_id);
+                        let (resp, cypher_intents) = if cmd.eq_ignore_ascii_case(b"GRAPH.QUERY") {
+                            // Phase 167 (CYP-01/02): capture Cypher-created
+                            // nodes/edges so TXN.ABORT can roll them back via
+                            // CrossStoreTxn::record_graph.
+                            crate::command::graph::graph_query_or_write(&mut gs, cmd_args)
+                        } else {
+                            (
+                                crate::command::graph::dispatch_graph_write(&mut gs, cmd, cmd_args),
+                                Vec::new(),
+                            )
+                        };
+                        let records = gs.drain_wal();
+                        (resp, records, cypher_intents)
                     } else {
-                        (
-                            crate::command::graph::dispatch_graph_write(&mut gs, cmd, cmd_args),
-                            Vec::new(),
-                        )
+                        let gs = ctx.shard_databases.graph_store_read(ctx.shard_id);
+                        let resp = crate::command::graph::dispatch_graph_read(&gs, cmd, cmd_args);
+                        (resp, Vec::new(), Vec::new())
                     };
-                    let records = gs.drain_wal();
-                    (resp, records, cypher_intents)
-                } else {
-                    let gs = ctx.shard_databases.graph_store_read(ctx.shard_id);
-                    let resp = crate::command::graph::dispatch_graph_read(&gs, cmd, cmd_args);
-                    (resp, Vec::new(), Vec::new())
-                };
                 // Phase 166: record graph intent for TXN rollback.
                 // Captures explicit ADDNODE/ADDEDGE by response id plus
                 // Phase 167 Cypher CREATE/MERGE via intents returned from

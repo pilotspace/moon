@@ -1598,6 +1598,36 @@ fn accumulate_cross_field(
     results
 }
 
+/// LSN-aware wrapper around [`execute_query_on_index`] used by the FT.SEARCH
+/// HYBRID path (v0.1.10 G-1). Post-filters the BM25 result list by MVCC
+/// visibility at `as_of_lsn`. `as_of_lsn == 0` passes through with no filter
+/// (backwards-compatible — identical output to the unwrapped call).
+///
+/// Oversampling (2× top_k, floor 16) preserves recall when visible docs rank
+/// below invisible ones in the raw BM25 output. Pre-filtering the candidate
+/// bitmap would be faster at high AS_OF churn; deferred to v0.2 per the
+/// visibility-filter notes in `src/text/store.rs`.
+pub(crate) fn execute_query_on_index_as_of(
+    text_index: &TextIndex,
+    clause: &TextQueryClause,
+    global_df: Option<&HashMap<String, u32>>,
+    global_n: Option<u32>,
+    top_k: usize,
+    as_of_lsn: u64,
+) -> Vec<TextSearchResult> {
+    if as_of_lsn == 0 {
+        return execute_query_on_index(text_index, clause, global_df, global_n, top_k);
+    }
+    let oversample = top_k.saturating_mul(2).max(16);
+    let raw = execute_query_on_index(text_index, clause, global_df, global_n, oversample);
+    let mut filtered: Vec<TextSearchResult> = raw
+        .into_iter()
+        .filter(|r| text_index.is_doc_visible_at(r.doc_id, as_of_lsn))
+        .collect();
+    filtered.truncate(top_k);
+    filtered
+}
+
 /// Execute query on a TextIndex: dispatch to cross-field or field-targeted search.
 ///
 /// When all query terms are Exact, uses the existing AND path (`search_field` /

@@ -331,7 +331,11 @@ pub(crate) async fn handle_connection_sharded_inner<
                                                     continue;
                                                 }
                                                 #[allow(clippy::unwrap_used)] // conn.pubsub_tx is always Some in subscriber mode
-                                                let sub = Subscriber::new(conn.pubsub_tx.clone().unwrap(), conn.subscriber_id);
+                                                let sub = Subscriber::with_protocol(
+                                                    conn.pubsub_tx.clone().unwrap(),
+                                                    conn.subscriber_id,
+                                                    conn.protocol_version >= 3,
+                                                );
                                                 { ctx.pubsub_registry.write().subscribe(ch.clone(), sub); }
                                                 conn.subscription_count += 1;
                                                 // Register pub/sub affinity for this client IP
@@ -367,7 +371,11 @@ pub(crate) async fn handle_connection_sharded_inner<
                                                     continue;
                                                 }
                                                 #[allow(clippy::unwrap_used)] // conn.pubsub_tx is always Some in subscriber mode
-                                                let sub = Subscriber::new(conn.pubsub_tx.clone().unwrap(), conn.subscriber_id);
+                                                let sub = Subscriber::with_protocol(
+                                                    conn.pubsub_tx.clone().unwrap(),
+                                                    conn.subscriber_id,
+                                                    conn.protocol_version >= 3,
+                                                );
                                                 { ctx.pubsub_registry.write().psubscribe(pat.clone(), sub); }
                                                 conn.subscription_count += 1;
                                                 // Register pub/sub affinity for this client IP
@@ -2091,7 +2099,11 @@ pub(crate) async fn handle_connection_sharded_inner<
                                     continue;
                                 }
                                 #[allow(clippy::unwrap_used)] // conn.pubsub_tx is set to Some just above before this loop
-                                let sub = Subscriber::new(conn.pubsub_tx.clone().unwrap(), conn.subscriber_id);
+                                let sub = Subscriber::with_protocol(
+                                    conn.pubsub_tx.clone().unwrap(),
+                                    conn.subscriber_id,
+                                    conn.protocol_version >= 3,
+                                );
                                 if is_pattern {
                                     { ctx.pubsub_registry.write().psubscribe(ch.clone(), sub); }
                                 } else {

@@ -312,12 +312,13 @@ pub fn execute_hybrid_search_local(
 
     // ── Stream 1: BM25 (per D-10 — direct use of existing BM25 ranker) ────────
     //
-    // NOTE (v0.1.9 HYB-03): BM25 path does NOT yet honor `as_of_lsn`. Text index
-    // MVCC filtering (pre-snapshot doc_id exclusion) is deferred to a v0.2
-    // text-index-mvcc work item. For now the dense branch honors AS_OF correctly;
-    // the BM25 branch may leak post-snapshot docs. Lunaris workaround: keep
-    // client-side RRF fallback per LUNARIS-CYPHER-GAPS.md §V2 for text-leaking
-    // workloads until text MVCC lands.
+    // v0.1.10 G-1 (closes v0.1.9 HYB-03 deferral): BM25 path now honours
+    // `as_of_lsn` via `execute_query_on_index_as_of`. Every HSET auto-index
+    // call allocates the same monotonic LSN for its paired text doc and
+    // vector row (src/shard/spsc_handler.rs), and the MVCC visibility helper
+    // on TextIndex (src/text/store.rs) filters post-snapshot rows before RRF
+    // fusion. Lunaris SDK no longer needs the client-side RRF fallback
+    // documented in LUNARIS-CYPHER-GAPS.md §V2 for AS_OF workloads.
     let text_index = match text_store.get_index(query.index_name.as_ref()) {
         Some(ix) => ix,
         None => return Frame::Error(Bytes::from_static(b"ERR unknown index")),
@@ -340,12 +341,13 @@ pub fn execute_hybrid_search_local(
         }
     };
     let text_results: Vec<TextSearchResult> =
-        crate::command::vector_search::ft_text_search::execute_query_on_index(
+        crate::command::vector_search::ft_text_search::execute_query_on_index_as_of(
             text_index,
             &text_clause,
             None,
             None,
             k_per_stream,
+            as_of_lsn,
         );
     let bm25_results = bm25_to_search_results(&text_results);
 

@@ -321,9 +321,8 @@ async fn ft_search_as_of_zero_returns_err() {
         .await;
 
     // G1 contract: AS_OF=0 with no registered binding at/before epoch 0 → ERR.
-    let err = result.expect_err(
-        "FT.SEARCH AS_OF 0 must return ERR (no temporal snapshot at Unix epoch 0)",
-    );
+    let err = result
+        .expect_err("FT.SEARCH AS_OF 0 must return ERR (no temporal snapshot at Unix epoch 0)");
     let err_msg = err.to_string();
     assert!(
         err_msg.contains("no temporal snapshot registered for the given AS_OF timestamp"),

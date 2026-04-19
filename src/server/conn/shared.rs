@@ -46,10 +46,6 @@ pub(crate) type SharedDatabases = Arc<Vec<parking_lot::RwLock<Database>>>;
 ///   (b) the registry has no binding at or before the requested `wall_ms`.
 ///
 /// No allocations on any path: the error message is `Bytes::from_static`.
-// Intentionally unused in this plan (165-01); Plan 165-02 wires all three
-// connection handlers to this helper. Suppressed to satisfy the
-// `cargo clippy -- -D warnings` zero-warnings policy between plans.
-#[allow(dead_code)]
 #[inline]
 pub(crate) fn resolve_ft_search_as_of_lsn(
     cmd_args: &[Frame],

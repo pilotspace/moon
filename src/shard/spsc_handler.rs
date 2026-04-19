@@ -1467,10 +1467,14 @@ fn auto_index_hset(
     // Allocate ONE monotonic insert_lsn per HSET so the MVCC visibility rule
     // at src/vector/mvcc/visibility.rs filters these inserts out of snapshots
     // captured before this call (required for FT.SEARCH AS_OF and TXN snapshot
-    // isolation — see Plan 165-03 TEMP-04/ACID-09). Allocation is skipped when
-    // no vector index matches: saves a counter bump on the common-case HSET.
+    // isolation — see Plan 165-03 TEMP-04/ACID-09). v0.1.10 G-1: the same LSN
+    // is forwarded into the text-index path below so `FT.SEARCH HYBRID AS_OF`
+    // honours snapshot isolation across both dense AND BM25 streams.
+    //
+    // Allocation is skipped only when neither a vector nor a text index
+    // matches the HSET key — saves a counter bump on unrelated HSETs.
     // Borrow must complete before `get_index_mut` reborrows vector_store.
-    let insert_lsn = if matching_names.is_empty() {
+    let insert_lsn = if matching_names.is_empty() && text_matching.is_empty() {
         0
     } else {
         vector_store.txn_manager_mut().allocate_lsn()
@@ -1546,11 +1550,18 @@ fn auto_index_hset(
 
     // TEXT field indexing: use pre-computed text_matching from guard.
     // args[0] is the Redis key; field-value pairs start at args[1..].
+    //
+    // v0.1.10 G-1: thread `insert_lsn` through so every text doc records the
+    // same monotonic LSN as its paired vector entry. `FT.SEARCH HYBRID AS_OF`
+    // uses this to exclude post-snapshot BM25 hits (closing the HYB-03
+    // deferral). Pre-MVCC callers (tests, non-HSET paths) leave `insert_lsn`
+    // at 0 and the visibility filter treats such docs as always-visible.
     let text_args = if args.is_empty() { args } else { &args[1..] };
     for idx_name in text_matching {
         if let Some(idx) = text_store.get_index_mut(&idx_name) {
             let key_hash = xxhash_rust::xxh64::xxh64(key, 0);
-            idx.index_document(key_hash, key, text_args);
+            let doc_id = idx.index_document_with_lsn(key_hash, key, text_args, insert_lsn);
+            let _ = doc_id;
             // TAG auto-indexing (Plan 152-06): safe no-op on indexes with no
             // TAG fields (tag_index_document returns early on empty tag_fields).
             #[cfg(feature = "text-index")]

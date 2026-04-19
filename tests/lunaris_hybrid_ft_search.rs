@@ -470,37 +470,28 @@ async fn hybrid_ft_search_as_of_threads_to_both_branches() {
     let (hybrid_count, hybrid_keys) = parse_search_keys(&hybrid);
     println!("[V2 hybrid+AS_OF] count={hybrid_count} keys={hybrid_keys:?}");
 
-    // Branch B lock-in: the hybrid path ignores AS_OF, so it leaks at least
-    // one post-snapshot document that the control correctly filtered out.
-    // We assert `hybrid_count > control_count` (leak >= 1) rather than a
-    // precise value because RRF fusion may dedup differently.
-    assert!(
-        hybrid_count > control_count,
-        "Branch B lock-in: hybrid FT.SEARCH MUST leak post-snapshot docs (AS_OF unthreaded). \
-         Got hybrid_count={hybrid_count} == control_count={control_count}. \
-         If these match, as_of_lsn is now threaded through hybrid.rs — \
-         remove this assertion, update LUNARIS-CYPHER-GAPS.md V2 to PASS, \
-         and Lunaris can switch to Moon-native hybrid."
+    // v0.1.10 G-1 GREEN: as_of_lsn is now threaded through BOTH the dense
+    // stream (v0.1.9 HYB-01/02) AND the BM25 stream (v0.1.10 HYB-03 closure
+    // via TextIndex::is_doc_visible_at + execute_query_on_index_as_of).
+    // The hybrid path therefore matches the control count and must NOT leak
+    // post-snapshot docs. LUNARIS-CYPHER-GAPS.md V2 is PASS — Lunaris SDK
+    // can now switch HybridRRFRetriever to Moon-native (no client-side RRF
+    // fallback).
+    assert_eq!(
+        hybrid_count, control_count,
+        "Post-G-1: hybrid FT.SEARCH AS_OF must match control (both streams filtered). \
+         Got hybrid_count={hybrid_count}, control_count={control_count}, keys={hybrid_keys:?}"
     );
 
-    // Additionally: the hybrid response must contain at least one of doc:2 /
-    // doc:3 (the post-snapshot docs). This pinpoints WHICH branch leaks.
+    // Neither doc:2 (post-snapshot text-only) nor doc:3 (post-snapshot
+    // vector-only) may appear in the hybrid response.
     let has_doc2 = hybrid_keys.iter().any(|k| k == "doc:2");
     let has_doc3 = hybrid_keys.iter().any(|k| k == "doc:3");
     assert!(
-        has_doc2 || has_doc3,
-        "Branch B lock-in: hybrid leak MUST include at least one post-snapshot doc \
-         (doc:2 text-match or doc:3 vector-match). Got keys={hybrid_keys:?}"
+        !has_doc2 && !has_doc3,
+        "Post-G-1: hybrid AS_OF must exclude all post-snapshot docs; got keys={hybrid_keys:?}"
     );
-
-    // Record WHICH branch leaked for the SUMMARY / gap doc.
-    let leak_label = match (has_doc2, has_doc3) {
-        (true, true) => "BOTH (text + vector)",
-        (true, false) => "TEXT only (doc:2)",
-        (false, true) => "VECTOR only (doc:3)",
-        (false, false) => unreachable!("asserted above"),
-    };
-    println!("[V2 leak-branch-label] {leak_label}");
+    println!("[V2 post-G1 GREEN] no leak; hybrid_count={hybrid_count}");
 
     shutdown.cancel();
 }

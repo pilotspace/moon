@@ -116,12 +116,22 @@ impl PubSubRegistry {
         let mut count: i64 = 0;
         let mut slow_drops: i64 = 0;
 
-        // Exact channel subscribers — pre-serialize once, send Bytes to all
+        // Exact channel subscribers — lazy pre-serialize RESP2/RESP3 variants at most once each
         if let Some(subs) = self.channels.get_mut(channel) {
-            let serialized = serialize_message_bytes(channel, message);
+            let mut resp2_bytes: Option<Bytes> = None;
+            let mut resp3_bytes: Option<Bytes> = None;
             let before = subs.len();
             subs.retain(|sub| {
-                if sub.try_send(serialized.clone()) {
+                let data = if sub.is_resp3 {
+                    resp3_bytes
+                        .get_or_insert_with(|| serialize_message_bytes_push(channel, message))
+                        .clone()
+                } else {
+                    resp2_bytes
+                        .get_or_insert_with(|| serialize_message_bytes(channel, message))
+                        .clone()
+                };
+                if sub.try_send(data) {
                     count += 1;
                     true
                 } else {
@@ -139,10 +149,24 @@ impl PubSubRegistry {
             let mut had_removals = false;
             for (pattern, subs) in &mut self.patterns {
                 if glob_match(pattern, channel) {
-                    let serialized = serialize_pmessage_bytes(pattern, channel, message);
+                    let mut resp2_bytes: Option<Bytes> = None;
+                    let mut resp3_bytes: Option<Bytes> = None;
                     let before = subs.len();
                     subs.retain(|sub| {
-                        if sub.try_send(serialized.clone()) {
+                        let data = if sub.is_resp3 {
+                            resp3_bytes
+                                .get_or_insert_with(|| {
+                                    serialize_pmessage_bytes_push(pattern, channel, message)
+                                })
+                                .clone()
+                        } else {
+                            resp2_bytes
+                                .get_or_insert_with(|| {
+                                    serialize_pmessage_bytes(pattern, channel, message)
+                                })
+                                .clone()
+                        };
+                        if sub.try_send(data) {
                             count += 1;
                             true
                         } else {
@@ -227,12 +251,12 @@ impl PubSubRegistry {
 
 // -- Pre-serialization helpers for zero-copy fan-out --
 //
-// NOTE: Pub/sub messages use Array + BulkString frames, which serialize identically
-// in RESP2 and RESP3. When proper RESP3 Push (`>`) framing is added, these helpers
-// must produce both RESP2 and RESP3 variants, with the subscriber storing which
-// protocol version its client uses.
+// G-2: Pub/sub envelopes are framed as RESP2 Array (`*`) for legacy clients and
+// RESP3 Push (`>`) for clients that negotiated HELLO 3. `publish()` lazily
+// pre-serializes each variant at most once per PUBLISH (on demand) and sends
+// the matching Bytes to each Subscriber based on its `is_resp3` flag.
 
-/// Pre-serialize a "message" delivery into RESP2 wire bytes.
+/// Pre-serialize a "message" delivery into RESP2 (Array-framed) wire bytes.
 /// Called once per PUBLISH; the returned Bytes is cloned (refcount bump) per subscriber.
 #[inline]
 fn serialize_message_bytes(channel: &Bytes, payload: &Bytes) -> Bytes {
@@ -243,12 +267,31 @@ fn serialize_message_bytes(channel: &Bytes, payload: &Bytes) -> Bytes {
     buf.freeze()
 }
 
-/// Pre-serialize a "pmessage" delivery into RESP2 wire bytes.
+/// Pre-serialize a "message" delivery into RESP3 (Push-framed) wire bytes.
+#[inline]
+fn serialize_message_bytes_push(channel: &Bytes, payload: &Bytes) -> Bytes {
+    // >3\r\n$7\r\nmessage\r\n$<chlen>\r\n<ch>\r\n$<plen>\r\n<payload>\r\n
+    let capacity = 32 + channel.len() + payload.len();
+    let mut buf = BytesMut::with_capacity(capacity);
+    crate::protocol::serialize_resp3(&message_frame_push(channel, payload), &mut buf);
+    buf.freeze()
+}
+
+/// Pre-serialize a "pmessage" delivery into RESP2 (Array-framed) wire bytes.
 #[inline]
 fn serialize_pmessage_bytes(pattern: &Bytes, channel: &Bytes, payload: &Bytes) -> Bytes {
     let capacity = 48 + pattern.len() + channel.len() + payload.len();
     let mut buf = BytesMut::with_capacity(capacity);
     crate::protocol::serialize(&pmessage_frame(pattern, channel, payload), &mut buf);
+    buf.freeze()
+}
+
+/// Pre-serialize a "pmessage" delivery into RESP3 (Push-framed) wire bytes.
+#[inline]
+fn serialize_pmessage_bytes_push(pattern: &Bytes, channel: &Bytes, payload: &Bytes) -> Bytes {
+    let capacity = 48 + pattern.len() + channel.len() + payload.len();
+    let mut buf = BytesMut::with_capacity(capacity);
+    crate::protocol::serialize_resp3(&pmessage_frame_push(pattern, channel, payload), &mut buf);
     buf.freeze()
 }
 
@@ -302,6 +345,25 @@ fn message_frame(channel: &Bytes, payload: &Bytes) -> Frame {
 /// Build a pmessage delivery frame for pattern subscription.
 fn pmessage_frame(pattern: &Bytes, channel: &Bytes, payload: &Bytes) -> Frame {
     Frame::Array(framevec![
+        Frame::BulkString(Bytes::from_static(b"pmessage")),
+        Frame::BulkString(pattern.clone()),
+        Frame::BulkString(channel.clone()),
+        Frame::BulkString(payload.clone()),
+    ])
+}
+
+/// Build a RESP3 Push-framed message delivery for exact-channel subscription.
+fn message_frame_push(channel: &Bytes, payload: &Bytes) -> Frame {
+    Frame::Push(framevec![
+        Frame::BulkString(Bytes::from_static(b"message")),
+        Frame::BulkString(channel.clone()),
+        Frame::BulkString(payload.clone()),
+    ])
+}
+
+/// Build a RESP3 Push-framed pmessage delivery for pattern subscription.
+fn pmessage_frame_push(pattern: &Bytes, channel: &Bytes, payload: &Bytes) -> Frame {
+    Frame::Push(framevec![
         Frame::BulkString(Bytes::from_static(b"pmessage")),
         Frame::BulkString(pattern.clone()),
         Frame::BulkString(channel.clone()),
