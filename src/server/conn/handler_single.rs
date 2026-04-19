@@ -26,6 +26,7 @@ use crate::pubsub::{self, PubSubRegistry};
 use crate::storage::eviction::try_evict_if_needed;
 use crate::tracking::{TrackingState, TrackingTable};
 
+use super::shared::resolve_ft_search_as_of_lsn;
 use super::{
     SharedDatabases, apply_resp3_conversion, execute_transaction, extract_bytes, extract_command,
     handle_config,
@@ -1292,14 +1293,22 @@ pub async fn handle_connection(
                                     let response = if cmd.eq_ignore_ascii_case(b"FT.CREATE") {
                                         crate::command::vector_search::ft_create(&mut *store, ts_mut, cmd_args)
                                     } else if cmd.eq_ignore_ascii_case(b"FT.SEARCH") {
-                                        let has_session = cmd_args.iter().any(|a| {
-                                            if let crate::protocol::Frame::BulkString(b) = a { b.eq_ignore_ascii_case(b"SESSION") } else { false }
-                                        });
-                                        if has_session {
-                                            let mut db_guard = db[conn.selected_db].write();
-                                            crate::command::vector_search::ft_search(&mut *store, cmd_args, Some(&mut *db_guard), Some(&*ts_mut), 0)
-                                        } else {
-                                            crate::command::vector_search::ft_search(&mut *store, cmd_args, None, Some(&*ts_mut), 0)
+                                        // TEMP-04: single-shard handler has no TemporalRegistry and no cross-store TXN.
+                                        // Unified helper with shard_databases=None returns ERR on AS_OF (correct per
+                                        // Plan 165-01 contract); non-AS_OF continues to return latest (as_of_lsn=0).
+                                        match resolve_ft_search_as_of_lsn(cmd_args, None, 0, None) {
+                                            Err(err_frame) => err_frame,
+                                            Ok(as_of_lsn) => {
+                                                let has_session = cmd_args.iter().any(|a| {
+                                                    if let crate::protocol::Frame::BulkString(b) = a { b.eq_ignore_ascii_case(b"SESSION") } else { false }
+                                                });
+                                                if has_session {
+                                                    let mut db_guard = db[conn.selected_db].write();
+                                                    crate::command::vector_search::ft_search(&mut *store, cmd_args, Some(&mut *db_guard), Some(&*ts_mut), as_of_lsn)
+                                                } else {
+                                                    crate::command::vector_search::ft_search(&mut *store, cmd_args, None, Some(&*ts_mut), as_of_lsn)
+                                                }
+                                            }
                                         }
                                     } else if cmd.eq_ignore_ascii_case(b"FT.DROPINDEX") {
                                         let mut db_guard = db[conn.selected_db].write();
@@ -1490,18 +1499,26 @@ pub async fn handle_connection(
                                         let mut ts_g2 = text_store.as_ref().map(|ts| ts.lock());
                                         let ts_m2 = match ts_g2 { Some(ref mut g) => &mut **g, None => &mut fb_ts };
                                         let response = if d_cmd.eq_ignore_ascii_case(b"FT.SEARCH") {
-                                            let has_session = d_args.iter().any(|a| {
-                                                if let crate::protocol::Frame::BulkString(b) = a { b.eq_ignore_ascii_case(b"SESSION") } else { false }
-                                            });
-                                            if has_session {
-                                                drop(guard);
-                                                let mut db_guard = db[conn.selected_db].write();
-                                                let r = crate::command::vector_search::ft_search(&mut *store, d_args, Some(&mut *db_guard), Some(&*ts_m2), 0);
-                                                drop(db_guard);
-                                                guard = db[conn.selected_db].read();
-                                                r
-                                            } else {
-                                                crate::command::vector_search::ft_search(&mut *store, d_args, None, Some(&*ts_m2), 0)
+                                            // TEMP-04: single-shard handler has no TemporalRegistry and no cross-store TXN.
+                                            // Unified helper with shard_databases=None returns ERR on AS_OF (correct per
+                                            // Plan 165-01 contract); non-AS_OF continues to return latest (as_of_lsn=0).
+                                            match resolve_ft_search_as_of_lsn(d_args, None, 0, None) {
+                                                Err(err_frame) => err_frame,
+                                                Ok(as_of_lsn) => {
+                                                    let has_session = d_args.iter().any(|a| {
+                                                        if let crate::protocol::Frame::BulkString(b) = a { b.eq_ignore_ascii_case(b"SESSION") } else { false }
+                                                    });
+                                                    if has_session {
+                                                        drop(guard);
+                                                        let mut db_guard = db[conn.selected_db].write();
+                                                        let r = crate::command::vector_search::ft_search(&mut *store, d_args, Some(&mut *db_guard), Some(&*ts_m2), as_of_lsn);
+                                                        drop(db_guard);
+                                                        guard = db[conn.selected_db].read();
+                                                        r
+                                                    } else {
+                                                        crate::command::vector_search::ft_search(&mut *store, d_args, None, Some(&*ts_m2), as_of_lsn)
+                                                    }
+                                                }
                                             }
                                         } else if d_cmd.eq_ignore_ascii_case(b"FT.INFO") {
                                             crate::command::vector_search::ft_info(&*store, ts_m2, d_args)
@@ -1647,8 +1664,13 @@ pub async fn handle_connection(
                                         let response = if d_cmd.eq_ignore_ascii_case(b"FT.CREATE") {
                                             crate::command::vector_search::ft_create(&mut *store, ts_m3, d_args)
                                         } else if d_cmd.eq_ignore_ascii_case(b"FT.SEARCH") {
-                                            // Write run: guard is already write-locked
-                                            crate::command::vector_search::ft_search(&mut *store, d_args, Some(&mut *guard), Some(&*ts_m3), 0)
+                                            // Write run: guard is already write-locked.
+                                            // TEMP-04: single-shard handler has no registry and no TXN; helper returns
+                                            // ERR on AS_OF and Ok(0) otherwise (Plan 165-01 contract).
+                                            match resolve_ft_search_as_of_lsn(d_args, None, 0, None) {
+                                                Err(err_frame) => err_frame,
+                                                Ok(as_of_lsn) => crate::command::vector_search::ft_search(&mut *store, d_args, Some(&mut *guard), Some(&*ts_m3), as_of_lsn),
+                                            }
                                         } else if d_cmd.eq_ignore_ascii_case(b"FT.DROPINDEX") {
                                             crate::command::vector_search::ft_dropindex(&mut *store, ts_m3, Some(&mut *guard), d_args)
                                         } else if d_cmd.eq_ignore_ascii_case(b"FT.INFO") {
