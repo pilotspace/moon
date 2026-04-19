@@ -105,9 +105,12 @@ pub fn dispatch_graph_command(store: &mut GraphStore, command: &Frame) -> Frame 
     };
 
     // GRAPH.QUERY needs special handling: route through write-aware handler
-    // that auto-detects read-only vs write queries.
+    // that auto-detects read-only vs write queries. Cross-shard / SPSC
+    // dispatch has no CrossStoreTxn context, so write intents are discarded
+    // here; connection-scoped intent capture lives in the handler paths.
     if cmd.eq_ignore_ascii_case(b"GRAPH.QUERY") {
-        return graph_query_or_write(store, args);
+        let (resp, _intents) = graph_query_or_write(store, args);
+        return resp;
     }
 
     if is_graph_write_cmd(cmd) {
@@ -123,9 +126,11 @@ pub fn dispatch_graph_command(store: &mut GraphStore, command: &Frame) -> Frame 
 /// that already have the command bytes and argument slice separated.
 pub fn dispatch_graph_cmd_args(store: &mut GraphStore, cmd: &[u8], args: &[Frame]) -> Frame {
     // GRAPH.QUERY needs special handling: route through write-aware handler
-    // that auto-detects read-only vs write queries.
+    // that auto-detects read-only vs write queries. handler_single has no
+    // CrossStoreTxn plumbing; intents are dropped here.
     if cmd.eq_ignore_ascii_case(b"GRAPH.QUERY") {
-        return graph_query_or_write(store, args);
+        let (resp, _intents) = graph_query_or_write(store, args);
+        return resp;
     }
 
     if is_graph_write_cmd(cmd) {

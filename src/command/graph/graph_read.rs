@@ -460,21 +460,43 @@ pub fn graph_query_write(store: &mut GraphStore, args: &[Frame]) -> Frame {
 ///
 /// Parses the Cypher query once, then dispatches to the read or write path
 /// based on whether the query contains write clauses.
-pub fn graph_query_or_write(store: &mut GraphStore, args: &[Frame]) -> Frame {
+///
+/// Returns `(Frame, Vec<GraphWriteIntent>)`. Read-only queries and failed
+/// write queries return an empty intent vector. Phase 167 (CYP-01/02) —
+/// handlers forward intents into `CrossStoreTxn::record_graph` so TXN.ABORT
+/// can roll back CREATE/MERGE-created entities via
+/// [`crate::transaction::abort::abort_cross_store_txn`].
+pub fn graph_query_or_write(
+    store: &mut GraphStore,
+    args: &[Frame],
+) -> (Frame, Vec<cypher::executor::GraphWriteIntent>) {
     if args.len() < 2 {
-        return Frame::Error(Bytes::from_static(
-            b"ERR wrong number of arguments for 'GRAPH.QUERY' command",
-        ));
+        return (
+            Frame::Error(Bytes::from_static(
+                b"ERR wrong number of arguments for 'GRAPH.QUERY' command",
+            )),
+            Vec::new(),
+        );
     }
 
     let graph_name = match extract_bulk(&args[0]) {
         Some(b) => b,
-        None => return Frame::Error(Bytes::from_static(b"ERR invalid graph name")),
+        None => {
+            return (
+                Frame::Error(Bytes::from_static(b"ERR invalid graph name")),
+                Vec::new(),
+            );
+        }
     };
 
     let cypher_bytes = match extract_bulk(&args[1]) {
         Some(b) => b,
-        None => return Frame::Error(Bytes::from_static(b"ERR invalid Cypher query")),
+        None => {
+            return (
+                Frame::Error(Bytes::from_static(b"ERR invalid Cypher query")),
+                Vec::new(),
+            );
+        }
     };
 
     // Parse once — no double-parse overhead.
@@ -482,7 +504,7 @@ pub fn graph_query_or_write(store: &mut GraphStore, args: &[Frame]) -> Frame {
         Ok(q) => q,
         Err(e) => {
             let msg = format!("ERR Cypher parse error: {e}");
-            return Frame::Error(Bytes::from(msg));
+            return (Frame::Error(Bytes::from(msg)), Vec::new());
         }
     };
 
@@ -490,7 +512,12 @@ pub fn graph_query_or_write(store: &mut GraphStore, args: &[Frame]) -> Frame {
         // Read path: compile plan (with cache), execute read-only.
         let graph = match store.get_graph(graph_name) {
             Some(g) => g,
-            None => return Frame::Error(Bytes::from_static(b"ERR graph not found")),
+            None => {
+                return (
+                    Frame::Error(Bytes::from_static(b"ERR graph not found")),
+                    Vec::new(),
+                );
+            }
         };
 
         let query_hash = cypher::planner::hash_query(cypher_bytes);
@@ -505,7 +532,7 @@ pub fn graph_query_or_write(store: &mut GraphStore, args: &[Frame]) -> Frame {
                 Ok(p) => std::sync::Arc::new(p),
                 Err(e) => {
                     let msg = format!("ERR Cypher plan error: {e}");
-                    return Frame::Error(Bytes::from(msg));
+                    return (Frame::Error(Bytes::from(msg)), Vec::new());
                 }
             };
             graph.plan_cache.lock().insert(query_hash, p.clone());
@@ -522,18 +549,18 @@ pub fn graph_query_or_write(store: &mut GraphStore, args: &[Frame]) -> Frame {
             Ok(r) => r,
             Err(e) => {
                 let msg = format!("ERR Cypher execution error: {e}");
-                return Frame::Error(Bytes::from(msg));
+                return (Frame::Error(Bytes::from(msg)), Vec::new());
             }
         };
 
-        exec_result_to_frame(&result)
+        (exec_result_to_frame(&result), Vec::new())
     } else {
         // Write path: compile plan (no cache for writes), execute with mutations.
         let plan = match cypher::planner::compile(&query) {
             Ok(p) => p,
             Err(e) => {
                 let msg = format!("ERR Cypher plan error: {e}");
-                return Frame::Error(Bytes::from(msg));
+                return (Frame::Error(Bytes::from(msg)), Vec::new());
             }
         };
 
@@ -542,7 +569,12 @@ pub fn graph_query_or_write(store: &mut GraphStore, args: &[Frame]) -> Frame {
         let result = {
             let graph = match store.get_graph_mut(graph_name) {
                 Some(g) => g,
-                None => return Frame::Error(Bytes::from_static(b"ERR graph not found")),
+                None => {
+                    return (
+                        Frame::Error(Bytes::from_static(b"ERR graph not found")),
+                        Vec::new(),
+                    );
+                }
             };
 
             let params = std::collections::HashMap::new();
@@ -550,10 +582,17 @@ pub fn graph_query_or_write(store: &mut GraphStore, args: &[Frame]) -> Frame {
                 Ok(r) => r,
                 Err(e) => {
                     let msg = format!("ERR Cypher execution error: {e}");
-                    return Frame::Error(Bytes::from(msg));
+                    return (Frame::Error(Bytes::from(msg)), Vec::new());
                 }
             }
         };
+
+        // Phase 167: collect write intents for CrossStoreTxn rollback. Every
+        // CreateNode/CreateEdge mutation (from CreatePattern and the Merge
+        // create-branch) becomes an intent; MERGE match-branches produce no
+        // mutation and therefore no intent (idempotent rollback).
+        let mut intents: Vec<cypher::executor::GraphWriteIntent> =
+            Vec::with_capacity(result.mutations.len());
 
         // Generate WAL records for mutations.
         for mutation in &result.mutations {
@@ -564,6 +603,10 @@ pub fn graph_query_or_write(store: &mut GraphStore, args: &[Frame]) -> Frame {
                     properties,
                     embedding,
                 } => {
+                    intents.push(cypher::executor::GraphWriteIntent {
+                        entity_id: *node_id,
+                        is_node: true,
+                    });
                     store
                         .wal_pending
                         .push(crate::graph::wal::serialize_add_node(
@@ -582,6 +625,10 @@ pub fn graph_query_or_write(store: &mut GraphStore, args: &[Frame]) -> Frame {
                     weight,
                     properties,
                 } => {
+                    intents.push(cypher::executor::GraphWriteIntent {
+                        entity_id: *edge_id,
+                        is_node: false,
+                    });
                     store
                         .wal_pending
                         .push(crate::graph::wal::serialize_add_edge(
@@ -597,7 +644,7 @@ pub fn graph_query_or_write(store: &mut GraphStore, args: &[Frame]) -> Frame {
             }
         }
 
-        exec_result_to_frame(&result)
+        (exec_result_to_frame(&result), intents)
     }
 }
 

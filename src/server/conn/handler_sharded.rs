@@ -2837,34 +2837,33 @@ pub(crate) async fn handle_connection_sharded_inner<
                     // --- GRAPH.* graph commands ---
                     #[cfg(feature = "graph")]
                     if cmd.len() > 6 && cmd[..6].eq_ignore_ascii_case(b"GRAPH.") {
-                        let (response, wal_records) = if crate::command::graph::is_graph_write_cmd(cmd)
+                        let (response, wal_records, cypher_intents) = if crate::command::graph::is_graph_write_cmd(cmd)
                             || (cmd.eq_ignore_ascii_case(b"GRAPH.QUERY")
                                 && crate::command::graph::is_cypher_write_query(cmd_args))
                         {
                             let mut gs = ctx.shard_databases.graph_store_write(ctx.shard_id);
-                            let resp = if cmd.eq_ignore_ascii_case(b"GRAPH.QUERY") {
-                                // TODO(ACID-08 follow-up, per ROADMAP Phase 166 SC-1):
-                                // Cypher-write intent capture for GRAPH.QUERY CREATE/MERGE —
-                                // deferred. GRAPH.QUERY writes return result-set Frames (not
-                                // Frame::Integer(id)), so per-entity intent capture requires
-                                // plumbing the created NodeKey/EdgeKey list out of
-                                // graph_query_or_write.
+                            let (resp, cypher_intents) = if cmd.eq_ignore_ascii_case(b"GRAPH.QUERY") {
+                                // Phase 167 (CYP-01/02): capture Cypher-created
+                                // nodes/edges so TXN.ABORT can roll them back via
+                                // CrossStoreTxn::record_graph.
                                 crate::command::graph::graph_query_or_write(&mut gs, cmd_args)
                             } else {
-                                crate::command::graph::dispatch_graph_write(&mut gs, cmd, cmd_args)
+                                (
+                                    crate::command::graph::dispatch_graph_write(&mut gs, cmd, cmd_args),
+                                    Vec::new(),
+                                )
                             };
                             let records = gs.drain_wal();
-                            (resp, records)
+                            (resp, records, cypher_intents)
                         } else {
                             let gs = ctx.shard_databases.graph_store_read(ctx.shard_id);
                             let resp = crate::command::graph::dispatch_graph_read(&gs, cmd, cmd_args);
-                            (resp, Vec::new())
+                            (resp, Vec::new(), Vec::new())
                         };
                         // Phase 166: record graph intent for TXN rollback.
-                        // Only capture explicit ADDNODE/ADDEDGE — Cypher-write paths
-                        // (GRAPH.QUERY with CREATE/MERGE) do not uniformly return
-                        // Frame::Integer and are deferred per the TODO above and
-                        // ROADMAP Phase 166 SC-1 scope note.
+                        // Captures explicit ADDNODE/ADDEDGE by response id plus
+                        // Phase 167 Cypher CREATE/MERGE via intents returned from
+                        // graph_query_or_write.
                         if let Some(txn) = conn.active_cross_txn.as_mut() {
                             let is_node = cmd.eq_ignore_ascii_case(b"GRAPH.ADDNODE");
                             let is_edge = cmd.eq_ignore_ascii_case(b"GRAPH.ADDEDGE");
@@ -2872,6 +2871,13 @@ pub(crate) async fn handle_connection_sharded_inner<
                                 if let Frame::Integer(id) = &response {
                                     if let Some(Frame::BulkString(gname)) = cmd_args.first() {
                                         txn.record_graph(*id as u64, is_node, gname.clone());
+                                    }
+                                }
+                            }
+                            if !cypher_intents.is_empty() {
+                                if let Some(Frame::BulkString(gname)) = cmd_args.first() {
+                                    for intent in &cypher_intents {
+                                        txn.record_graph(intent.entity_id, intent.is_node, gname.clone());
                                     }
                                 }
                             }

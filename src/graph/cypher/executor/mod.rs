@@ -97,6 +97,21 @@ pub enum MutationRecord {
     },
 }
 
+/// Intent describing a Cypher-created entity that must be rolled back on
+/// `TXN.ABORT`. Produced by [`graph_query_or_write`] (Phase 167, CYP-01/02)
+/// for every `PhysicalOp::CreatePattern` node/edge and every `PhysicalOp::Merge`
+/// create-branch node/edge. Idempotent MERGE match-branches produce no intent.
+///
+/// `entity_id` is the `NodeKey` or `EdgeKey` encoded via `slotmap::KeyData::as_ffi()`,
+/// matching the format consumed by [`crate::transaction::abort::abort_cross_store_txn`].
+#[derive(Debug, Clone, Copy)]
+pub struct GraphWriteIntent {
+    /// `NodeKey::data().as_ffi()` or `EdgeKey::data().as_ffi()`.
+    pub entity_id: u64,
+    /// `true` for a node, `false` for an edge.
+    pub is_node: bool,
+}
+
 /// Execute result: column headers + data rows + statistics.
 pub struct ExecResult {
     pub columns: Vec<String>,
