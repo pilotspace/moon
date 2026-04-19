@@ -75,7 +75,7 @@
 //! Run:
 //!   cargo test --test lunaris_cypher_temporal --no-default-features \
 //!        --features runtime-tokio,jemalloc -- --test-threads=1 --nocapture
-#![cfg(feature = "runtime-tokio")]
+#![cfg(all(feature = "runtime-tokio", feature = "graph"))]
 
 use moon::config::ServerConfig;
 use moon::runtime::cancel::CancellationToken;
