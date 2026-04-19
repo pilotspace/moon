@@ -384,14 +384,15 @@ fn rows_count(v: &redis::Value) -> usize {
 /// diagnostic `{neighbor.name}` extraction.
 fn rows_flat_strings(v: &redis::Value) -> Vec<String> {
     let mut out = Vec::new();
-    if let redis::Value::Array(items) = v {
-        if let Some(redis::Value::Array(rows)) = items.get(1) {
-            for row in rows {
-                if let redis::Value::Array(cells) = row {
-                    for cell in cells {
-                        match cell {
-                            redis::Value::BulkString(b) => {
-                                if let Ok(s) = std::str::from_utf8(b) {
+    if let redis::Value::Array(items) = v
+        && let Some(redis::Value::Array(rows)) = items.get(1)
+    {
+        for row in rows {
+            if let redis::Value::Array(cells) = row {
+                for cell in cells {
+                    match cell {
+                        redis::Value::BulkString(b) => {
+                            if let Ok(s) = std::str::from_utf8(b) {
                                     out.push(s.to_string());
                                 }
                             }
@@ -402,7 +403,6 @@ fn rows_flat_strings(v: &redis::Value) -> Vec<String> {
                 }
             }
         }
-    }
     out
 }
 

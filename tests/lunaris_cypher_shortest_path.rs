@@ -358,13 +358,13 @@ fn rows_count(v: &redis::Value) -> usize {
 /// Used for diagnostic printing AND for sub-probe C's Null-detection.
 fn rows_flat_values(v: &redis::Value) -> Vec<String> {
     let mut out = Vec::new();
-    if let redis::Value::Array(items) = v {
-        if let Some(redis::Value::Array(rows)) = items.get(1) {
-            for row in rows {
-                if let redis::Value::Array(cells) = row {
-                    for cell in cells {
-                        out.push(format!("{cell:?}"));
-                    }
+    if let redis::Value::Array(items) = v
+        && let Some(redis::Value::Array(rows)) = items.get(1)
+    {
+        for row in rows {
+            if let redis::Value::Array(cells) = row {
+                for cell in cells {
+                    out.push(format!("{cell:?}"));
                 }
             }
         }
@@ -458,8 +458,10 @@ async fn cypher_shortest_path_is_unsupported_or_null() {
         redis::Value::Array(outer) if outer.len() >= 2 => match &outer[1] {
             redis::Value::Array(rows) => {
                 for row in rows {
-                    if let redis::Value::Array(cells) = row {
-                        if let Some(redis::Value::Array(path_nodes)) = cells.first() {
+                    if let redis::Value::Array(cells) = row
+                        && let Some(redis::Value::Array(path_nodes)) = cells.first()
+                    {
+                        {
                             let hops = path_nodes.len().saturating_sub(1);
                             println!(
                                 "[V3 primary] path has {} nodes, {} hops",

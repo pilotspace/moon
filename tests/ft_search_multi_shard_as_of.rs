@@ -13,14 +13,14 @@
 //! responder executed with `as_of_lsn = 0` (no temporal filter).
 //!
 //! Two tests:
-//!   1. `ft_search_multi_shard_as_of_honours_snapshot`
-//!      — 4 shards, no hash tags, keys distribute naturally. HSET pre-snapshot,
-//!        `TEMPORAL.SNAPSHOT_AT`, HSET post-snapshot. `AS_OF <wall_ms>` must
-//!        return only pre-snapshot keys.
-//!   2. `ft_search_single_shard_as_of_parity_guard`
-//!      — 1-shard regression: same seeding + assertions still produce the
-//!        single-shard counts that Phase 165 already delivered. Guards against
-//!        SCAT-01 accidentally breaking the single-shard AS_OF path.
+//! 1. `ft_search_multi_shard_as_of_honours_snapshot` — 4 shards, no hash
+//!    tags, keys distribute naturally. HSET pre-snapshot,
+//!    `TEMPORAL.SNAPSHOT_AT`, HSET post-snapshot. `AS_OF <wall_ms>` must
+//!    return only pre-snapshot keys.
+//! 2. `ft_search_single_shard_as_of_parity_guard` — 1-shard regression:
+//!    same seeding + assertions still produce the single-shard counts
+//!    that Phase 165 already delivered. Guards against SCAT-01
+//!    accidentally breaking the single-shard AS_OF path.
 //!
 //! Run:
 //!   cargo test --no-default-features --features runtime-tokio,jemalloc,text-index,graph \

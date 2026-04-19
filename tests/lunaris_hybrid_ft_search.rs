@@ -335,12 +335,11 @@ fn parse_search_keys(v: &redis::Value) -> (i64, Vec<String>) {
     };
     let mut keys = Vec::new();
     for item in items.iter().skip(1) {
-        if let redis::Value::BulkString(b) = item {
-            if let Ok(s) = std::str::from_utf8(b) {
-                if s.starts_with("doc:") {
-                    keys.push(s.to_string());
-                }
-            }
+        if let redis::Value::BulkString(b) = item
+            && let Ok(s) = std::str::from_utf8(b)
+            && s.starts_with("doc:")
+        {
+            keys.push(s.to_string());
         }
     }
     (count, keys)
