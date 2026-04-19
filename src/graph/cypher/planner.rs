@@ -28,9 +28,17 @@ pub enum PhysicalOp {
         label: Option<String>,
     },
     /// Expand along edges from a source variable.
+    ///
+    /// `edge_variable`: when `Some(name)`, the executor binds the traversed
+    /// edge into the row under `name` as `Value::Edge(EdgeKey)` for the
+    /// single-hop case (min_hops == max_hops == 1). This enables
+    /// edge-property predicates such as `WHERE r.valid_to >= $asof` — see
+    /// Lunaris V1 gap closure (CYP-06). Multi-hop edge-var binding (as a
+    /// path / edge-list value) is deferred to v0.2.
     Expand {
         source: String,
         target: String,
+        edge_variable: Option<String>,
         edge_types: Vec<String>,
         direction: EdgeDirection,
         min_hops: u32,
@@ -366,6 +374,7 @@ fn compile_match(m: &MatchClause, ops: &mut Vec<PhysicalOp>) {
                     .variable
                     .clone()
                     .unwrap_or_else(|| format!("_anon_{}", i + 1)),
+                edge_variable: edge.variable.clone(),
                 edge_types: edge.edge_types.clone(),
                 direction: edge.direction,
                 min_hops,

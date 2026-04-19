@@ -301,10 +301,23 @@ pub fn execute_hybrid_search_local(
     vector_store: &mut VectorStore,
     text_store: &TextStore,
     query: &HybridQuery,
+    as_of_lsn: u64,
 ) -> Frame {
     let k_per_stream = query.effective_k_per_stream();
 
+    // v0.1.9 HYB-01: snapshot the committed treemap BEFORE get_index_mut so the
+    // dense stream honors AS_OF via MVCC filtering. Non-TXN readers must see
+    // entries whose owning txn has committed (matches search_local_raw pattern).
+    let committed = vector_store.txn_manager().committed_treemap().clone();
+
     // ── Stream 1: BM25 (per D-10 — direct use of existing BM25 ranker) ────────
+    //
+    // NOTE (v0.1.9 HYB-03): BM25 path does NOT yet honor `as_of_lsn`. Text index
+    // MVCC filtering (pre-snapshot doc_id exclusion) is deferred to a v0.2
+    // text-index-mvcc work item. For now the dense branch honors AS_OF correctly;
+    // the BM25 branch may leak post-snapshot docs. Lunaris workaround: keep
+    // client-side RRF fallback per LUNARIS-CYPHER-GAPS.md §V2 for text-leaking
+    // workloads until text MVCC lands.
     let text_index = match text_store.get_index(query.index_name.as_ref()) {
         Some(ix) => ix,
         None => return Frame::Error(Bytes::from_static(b"ERR unknown index")),
@@ -341,11 +354,17 @@ pub fn execute_hybrid_search_local(
         Some(ix) => ix,
         None => return Frame::Error(Bytes::from_static(b"ERR unknown index")),
     };
-    let (dense_results, key_hash_to_key) =
-        match run_dense_knn(idx, &query.dense_field, &query.dense_blob, k_per_stream) {
-            Ok(v) => v,
-            Err(frame) => return frame,
-        };
+    let (dense_results, key_hash_to_key) = match run_dense_knn(
+        idx,
+        &query.dense_field,
+        &query.dense_blob,
+        k_per_stream,
+        as_of_lsn,
+        &committed,
+    ) {
+        Ok(v) => v,
+        Err(frame) => return frame,
+    };
 
     // ── Stream 3: Sparse (optional, per D-12 + D-16) ──────────────────────────
     let sparse_results: Vec<SearchResult> = if let Some((sf, sblob)) = &query.sparse {
@@ -398,6 +417,8 @@ pub(super) fn run_dense_knn(
     field_name: &Bytes,
     blob: &Bytes,
     k: usize,
+    as_of_lsn: u64,
+    committed: &roaring::RoaringTreemap,
 ) -> Result<(Vec<SearchResult>, std::collections::HashMap<u64, Bytes>), Frame> {
     let field_opt = if field_name.is_empty() {
         None
@@ -462,13 +483,15 @@ pub(super) fn run_dense_knn(
         (base * dim_factor / 2).clamp(200, 1000)
     };
 
-    let empty_committed = roaring::RoaringTreemap::new();
-
+    // v0.1.9 HYB-01/02: thread the resolved snapshot_lsn + committed treemap
+    // through the MvccContext so pre-snapshot dense rows are filtered. When
+    // `as_of_lsn == 0` the MVCC layer treats this as "no temporal filtering"
+    // preserving pre-v0.1.9 behavior for non-AS_OF queries.
     let results = if use_default_field {
         let mvcc_ctx = crate::vector::segment::holder::MvccContext {
-            snapshot_lsn: 0,
+            snapshot_lsn: as_of_lsn,
             my_txn_id: 0,
-            committed: &empty_committed,
+            committed,
             dirty_set: &[],
             dimension: dim as u32,
         };
@@ -487,9 +510,9 @@ pub(super) fn run_dense_knn(
             )));
         };
         let mvcc_ctx = crate::vector::segment::holder::MvccContext {
-            snapshot_lsn: 0,
+            snapshot_lsn: as_of_lsn,
             my_txn_id: 0,
-            committed: &empty_committed,
+            committed,
             dirty_set: &[],
             dimension: dim as u32,
         };
@@ -1062,7 +1085,7 @@ mod tests {
             offset: 0,
             count: 10,
         };
-        let result = execute_hybrid_search_local(&mut vs, &ts, &query);
+        let result = execute_hybrid_search_local(&mut vs, &ts, &query, 0);
         match result {
             Frame::Error(msg) => {
                 let s = std::str::from_utf8(&msg).unwrap();

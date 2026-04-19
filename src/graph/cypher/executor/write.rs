@@ -45,6 +45,8 @@ pub fn execute_mut(
             PhysicalOp::Expand {
                 source,
                 target,
+                edge_variable: _, // write-path Expand is used for MATCH-before-SET;
+                                  // edge-var binding is a read-side concern (CYP-06).
                 edge_types,
                 direction,
                 min_hops,

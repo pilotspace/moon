@@ -206,6 +206,18 @@ pub(crate) fn eval_expr(
                         Value::Null
                     }
                 }
+                "coalesce" => {
+                    // Return first non-null argument. Null if all null or no args.
+                    // Enables Lunaris GraphFirstRetriever edge-property temporal
+                    // filter: `coalesce(r.valid_to, 9999999999) >= asof`.
+                    for arg in args {
+                        let v = eval_expr(arg, row, memgraph, params);
+                        if !matches!(v, Value::Null) {
+                            return v;
+                        }
+                    }
+                    Value::Null
+                }
                 _ => Value::Null,
             }
         }

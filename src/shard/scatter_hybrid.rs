@@ -72,7 +72,13 @@ pub async fn scatter_hybrid_search(
         return {
             let mut vs = shard_databases.vector_store(my_shard);
             let ts = shard_databases.text_store(my_shard);
-            crate::command::vector_search::hybrid::execute_hybrid_search_local(&mut vs, &ts, &query)
+            // v0.1.9 HYB-02 partial: single-shard path threads as_of_lsn=0 here;
+            // the FT.SEARCH dispatcher at ft_search/dispatch.rs already routes
+            // HYBRID through the direct call with the resolved LSN. This arm is
+            // a fallback for multi-shard coordinators that chose the single-
+            // shard fast path. Full multi-shard AS_OF scatter ships under
+            // SCAT-01 (ShardMessage::VectorSearch LSN threading).
+            crate::command::vector_search::hybrid::execute_hybrid_search_local(&mut vs, &ts, &query, 0)
             // guards drop at end of this block
         };
     }

@@ -60,6 +60,7 @@ pub fn execute(
             PhysicalOp::Expand {
                 source,
                 target,
+                edge_variable,
                 edge_types,
                 direction,
                 min_hops,
@@ -121,6 +122,11 @@ pub fn execute(
                             }
                             let mut new_row = row.clone();
                             new_row.insert(target.clone(), Value::Node(merged.node));
+                            // v0.1.9 CYP-06: bind edge variable for single-hop
+                            // expansion so WHERE r.valid_to >= $asof works.
+                            if let Some(evar) = edge_variable {
+                                new_row.insert(evar.clone(), Value::Edge(merged.edge));
+                            }
                             new_rows.push(new_row);
                         }
                     } else {
@@ -449,6 +455,7 @@ pub fn execute_profile(
             PhysicalOp::Expand {
                 source,
                 target,
+                edge_variable,
                 edge_types,
                 direction,
                 min_hops,
@@ -496,6 +503,11 @@ pub fn execute_profile(
                             }
                             let mut new_row = row.clone();
                             new_row.insert(target.clone(), Value::Node(neighbor_key));
+                            // v0.1.9 CYP-06: bind edge variable in execute_profile
+                            // single-hop path (parity with main executor).
+                            if let Some(evar) = edge_variable {
+                                new_row.insert(evar.clone(), Value::Edge(edge_key));
+                            }
                             new_rows.push(new_row);
                         }
                     } else {

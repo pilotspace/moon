@@ -99,8 +99,11 @@ pub fn ft_search(
                 count: limit_count,
             };
             crate::vector::metrics::increment_search();
+            // v0.1.9 HYB-02: thread the resolved AS_OF LSN through the hybrid
+            // path (closes Lunaris V2 gap). The dense branch honors the snapshot;
+            // BM25 filtering by AS_OF is deferred to v0.2 text-index-mvcc.
             return crate::command::vector_search::hybrid::execute_hybrid_search_local(
-                store, ts, &hq,
+                store, ts, &hq, as_of_lsn,
             );
         }
         Ok(None) => { /* fall through to existing path */ }

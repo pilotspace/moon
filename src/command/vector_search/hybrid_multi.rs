@@ -103,8 +103,16 @@ pub fn execute_hybrid_search_local_raw_streams(
         Some(ix) => ix,
         None => return Frame::Error(Bytes::from_static(b"ERR unknown index")),
     };
+    // v0.1.9 HYB-02 partial: multi-shard raw-streams path does not yet carry
+    // as_of_lsn — this path is invoked by the scatter coordinator from
+    // spsc_handler, and ShardMessage::VectorSearch / FtHybrid do not yet have
+    // as_of_lsn fields (SCAT-01). Until SCAT-01 lands, multi-shard hybrid
+    // skips AS_OF filtering (matching the non-hybrid multi-shard gap).
+    // Single-shard hybrid (the Lunaris default workspace model) already
+    // honors AS_OF via ft_search/dispatch.rs.
+    let empty_committed = roaring::RoaringTreemap::new();
     let (dense_results, key_hash_to_key) =
-        match run_dense_knn(idx, dense_field, dense_blob, k_per_stream) {
+        match run_dense_knn(idx, dense_field, dense_blob, k_per_stream, 0, &empty_committed) {
             Ok(v) => v,
             Err(frame) => return frame,
         };

@@ -456,13 +456,19 @@ async fn cypher_edge_property_temporal_filter_in_nested_match() {
          (alice -> bob, alice -> carol); got {baseline_rows} rows, values={baseline_flat:?}"
     );
 
-    // ── Sub-probe B: primary form with `coalesce` (Branch B — silent swallow) ─
+    // ── Sub-probe B: primary form with `coalesce` — POST-v0.1.9 CYP-03 ─────────
     //
-    // `coalesce` is not in the function registry at
-    // `src/graph/cypher/executor/eval.rs:110-210`. Unknown functions fall
-    // through to `_ => Value::Null`. The predicate `Null >= 1000` is not
-    // `Value::Bool(true)`, so the Filter op drops every row. No ERR frame —
-    // silent 0-row return.
+    // v0.1.9 CYP-03 added `coalesce()` to the eval registry
+    // (`src/graph/cypher/executor/eval.rs:209`). For variable-length
+    // expansion `r*1..2` the edge variable is still unbound (CYP-06
+    // variable-length case deferred to v0.2), so `r.valid_to` resolves
+    // to Null for every row. `coalesce(Null, 9999999999)` now correctly
+    // returns `9999999999`, and the predicate `9999999999 >= 1000` is
+    // `true`, so every row passes — matching the baseline count.
+    //
+    // When v0.2 lands multi-hop edge-var binding as `Value::Path`,
+    // this assertion flips again (rows become the temporally-filtered
+    // subset).
     let primary: redis::Value = redis::cmd("GRAPH.QUERY")
         .arg("g")
         .arg(
@@ -477,12 +483,13 @@ async fn cypher_edge_property_temporal_filter_in_nested_match() {
             "Moon must accept the coalesce() Cypher as a well-formed query (parses as FunctionCall)",
         );
     let primary_rows = rows_count(&primary);
-    println!("[V1 coalesce] rows={primary_rows}");
+    println!("[V1 coalesce post-v0.1.9] rows={primary_rows}");
     assert_eq!(
-        primary_rows, 0,
-        "Branch B lock-in: `coalesce(r.valid_to, ...)` is unknown -> Null -> predicate false; \
-         Moon must return 0 rows (silent swallow). Any other count indicates that coalesce() \
-         was added OR the Null-propagation semantics changed — update this test AND the gap doc."
+        primary_rows, baseline_rows,
+        "v0.1.9 CYP-03 lock-in: coalesce() is now present, so coalesce(Null, 9999999999) \
+         = 9999999999 >= 1000 = true for every row (variable-length edge-var still \
+         unbound per CYP-06 v0.2 scope). Any other count means v0.2 multi-hop \
+         edge-var binding landed or coalesce changed — update this test and the gap doc."
     );
 
     // ── Sub-probe C: fallback form (`IS NULL OR`) — VACUOUSLY TRUE, no filtering ─
