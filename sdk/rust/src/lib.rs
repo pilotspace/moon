@@ -1,6 +1,6 @@
 //! # moon-client
 //!
-//! Async Rust client for the [Moon](https://github.com/tind/moon) server — a
+//! Async Rust client for the [Moon](https://github.com/pilotspace/moon) server — a
 //! high-performance Redis-compatible database with built-in vector search, graph
 //! engine, full-text search, semantic caching, workspaces, and message queues.
 //!

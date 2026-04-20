@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.85"
 description = "Rust client SDK for Moon — high-performance Redis-compatible server with vector search and graph engine"
 license = "MIT"
-repository = "https://github.com/tind/moon"
+repository = "https://github.com/pilotspace/moon"
 keywords = ["redis", "vector-search", "graph", "database", "async"]
 categories = ["database", "asynchronous", "network-programming"]
 
