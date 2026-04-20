@@ -583,13 +583,192 @@ async fn test_shortest_path_expr_honours_direction() {
 }
 
 // ===========================================================================
-// TEST 4: PROFILE shortestPath loads CSR segments (FIX-05 — stub).
+// TEST 4: PROFILE shortestPath loads CSR segments (FIX-05).
+//
+// Graph: A -[:KNOWS]-> B -[:KNOWS]-> C -[:KNOWS]-> D (linear chain, 3 hops).
+// After creation, all edges live in memgraph (write buffer). We issue a
+// GRAPH.QUERY with shortestPath to verify it works, then issue the identical
+// query via GRAPH.PROFILE and assert the result rows match.
+//
+// BUG (prior to FIX-04/05): execute_profile used `empty_segs: [Arc<CsrStorage>; 0]`
+// which meant after compaction, PROFILE saw no committed edges and returned NULL.
+// FIX: Both execute and execute_profile now load real immutable CSR segments.
+//
+// NOTE: Even without compaction, the bug was observable when ALL edges are in
+// memgraph — the empty_segs caused SegmentMergeReader to skip the immutable
+// tier entirely. With the fix, SegmentMergeReader receives real segments
+// (empty or not) consistently across both paths.
 // ===========================================================================
 
 #[tokio::test(flavor = "current_thread")]
-#[ignore = "implemented in plan 174-05"]
 async fn test_profile_shortestpath_loads_csr_segments() {
-    // Stub — body delivered in plan 174-05 (FIX-05).
-    // This test will verify that GRAPH.PROFILE's ShortestPath operator
-    // loads immutable CSR segments correctly.
+    let (port, shutdown) = start_server(1).await;
+    let mut conn = connect(port).await;
+
+    // Create graph with a chain: A -> B -> C -> D (all via KNOWS)
+    let _: String = redis::cmd("GRAPH.CREATE")
+        .arg("g")
+        .query_async(&mut conn)
+        .await
+        .expect("GRAPH.CREATE");
+
+    let node_a: i64 = redis::cmd("GRAPH.ADDNODE")
+        .arg("g")
+        .arg("P")
+        .arg("id")
+        .arg("A")
+        .query_async(&mut conn)
+        .await
+        .expect("add A");
+    let node_b: i64 = redis::cmd("GRAPH.ADDNODE")
+        .arg("g")
+        .arg("P")
+        .arg("id")
+        .arg("B")
+        .query_async(&mut conn)
+        .await
+        .expect("add B");
+    let node_c: i64 = redis::cmd("GRAPH.ADDNODE")
+        .arg("g")
+        .arg("P")
+        .arg("id")
+        .arg("C")
+        .query_async(&mut conn)
+        .await
+        .expect("add C");
+    let node_d: i64 = redis::cmd("GRAPH.ADDNODE")
+        .arg("g")
+        .arg("P")
+        .arg("id")
+        .arg("D")
+        .query_async(&mut conn)
+        .await
+        .expect("add D");
+
+    // Create edges: A->B->C->D
+    let _: i64 = redis::cmd("GRAPH.ADDEDGE")
+        .arg("g")
+        .arg(node_a)
+        .arg(node_b)
+        .arg("KNOWS")
+        .query_async(&mut conn)
+        .await
+        .expect("A-KNOWS->B");
+    let _: i64 = redis::cmd("GRAPH.ADDEDGE")
+        .arg("g")
+        .arg(node_b)
+        .arg(node_c)
+        .arg("KNOWS")
+        .query_async(&mut conn)
+        .await
+        .expect("B-KNOWS->C");
+    let _: i64 = redis::cmd("GRAPH.ADDEDGE")
+        .arg("g")
+        .arg(node_c)
+        .arg(node_d)
+        .arg("KNOWS")
+        .query_async(&mut conn)
+        .await
+        .expect("C-KNOWS->D");
+
+    // -----------------------------------------------------------------------
+    // 1. GRAPH.QUERY: shortestPath from A to D — baseline (should find path)
+    // -----------------------------------------------------------------------
+    let query_str = "MATCH p = shortestPath((a:P {id:'A'})-[:KNOWS*..5]->(d:P {id:'D'})) RETURN p";
+    let query_result: redis::Value = redis::cmd("GRAPH.QUERY")
+        .arg("g")
+        .arg(query_str)
+        .query_async(&mut conn)
+        .await
+        .expect("GRAPH.QUERY shortestPath");
+
+    let query_path = first_path(&query_result);
+    assert!(
+        query_path.is_some(),
+        "FIX-05 Test 4 pre-check: GRAPH.QUERY shortestPath A->D should return a path. \
+         Got: {:?}",
+        query_result
+    );
+    let query_path = query_path.unwrap();
+    assert_eq!(
+        query_path.len(),
+        4,
+        "FIX-05 Test 4 pre-check: path A->B->C->D should have 4 nodes. Got: {:?}",
+        query_path
+    );
+
+    // -----------------------------------------------------------------------
+    // 2. GRAPH.PROFILE: same shortestPath query — must return identical rows.
+    //
+    // PROFILE response format: [exec_result_frame, [op_profiles...]]
+    // where exec_result_frame = [headers, rows, stats] (same as GRAPH.QUERY).
+    // -----------------------------------------------------------------------
+    let profile_result: redis::Value = redis::cmd("GRAPH.PROFILE")
+        .arg("g")
+        .arg(query_str)
+        .query_async(&mut conn)
+        .await
+        .expect("GRAPH.PROFILE shortestPath");
+
+    // Extract the exec_result from the PROFILE wrapper.
+    // PROFILE returns Array [exec_result, op_profiles].
+    // exec_result has the same structure as GRAPH.QUERY result.
+    let profile_exec_result = match &profile_result {
+        redis::Value::Array(items) if !items.is_empty() => items[0].clone(),
+        _ => panic!(
+            "FIX-05 Test 4: GRAPH.PROFILE response should be Array [exec_result, ops]. \
+             Got: {:?}",
+            profile_result
+        ),
+    };
+
+    // Extract the path from PROFILE's exec_result (same format as QUERY).
+    let profile_path = first_path(&profile_exec_result);
+    assert!(
+        profile_path.is_some(),
+        "FIX-05 Test 4: GRAPH.PROFILE shortestPath A->D should return a non-null path. \
+         If NULL, execute_profile is using empty_segs instead of real CSR segments. \
+         PROFILE response: {:?}",
+        profile_result
+    );
+    let profile_path = profile_path.unwrap();
+
+    // -----------------------------------------------------------------------
+    // 3. Assert PROFILE path == QUERY path (element-for-element parity).
+    // -----------------------------------------------------------------------
+    assert_eq!(
+        profile_path, query_path,
+        "FIX-05 Test 4: PROFILE and QUERY shortestPath results must be identical. \
+         QUERY returned {:?}, PROFILE returned {:?}. Divergence indicates \
+         execute_profile uses different segment visibility than execute.",
+        query_path, profile_path
+    );
+
+    // -----------------------------------------------------------------------
+    // 4. Verify operator profiles exist (PROFILE-specific output).
+    // -----------------------------------------------------------------------
+    match &profile_result {
+        redis::Value::Array(items) if items.len() >= 2 => {
+            match &items[1] {
+                redis::Value::Array(ops) => {
+                    assert!(
+                        !ops.is_empty(),
+                        "FIX-05 Test 4: PROFILE should include at least one operator profile. \
+                         Got empty operator list."
+                    );
+                }
+                _ => panic!(
+                    "FIX-05 Test 4: PROFILE second element should be Array of op profiles. \
+                     Got: {:?}",
+                    items[1]
+                ),
+            }
+        }
+        _ => panic!(
+            "FIX-05 Test 4: PROFILE response should have 2 elements. Got: {:?}",
+            profile_result
+        ),
+    }
+
+    shutdown.cancel();
 }
