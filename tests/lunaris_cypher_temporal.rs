@@ -370,6 +370,9 @@ async fn seed_graph(conn: &mut redis::aio::MultiplexedConnection) -> (i64, i64, 
 
 /// A GRAPH.QUERY response is `Array[ headers_array, rows_array, stats_bulk ]`.
 /// Return the row count (len of `rows_array`).
+/// NOTE: Unused post-FIX-07 (CYP-06 rejects all three sub-probes at plan time).
+/// Retained for Phase 179 when Value::Path lands and sub-probes flip back to row-counting.
+#[allow(dead_code)]
 fn rows_count(v: &redis::Value) -> usize {
     match v {
         redis::Value::Array(items) if items.len() >= 2 => match &items[1] {
@@ -382,6 +385,8 @@ fn rows_count(v: &redis::Value) -> usize {
 
 /// Collect the stringified values from each row (flattened). Used for
 /// diagnostic `{neighbor.name}` extraction.
+/// NOTE: Unused post-FIX-07 — retained for Phase 179 restoration.
+#[allow(dead_code)]
 fn rows_flat_strings(v: &redis::Value) -> Vec<String> {
     let mut out = Vec::new();
     if let redis::Value::Array(items) = v
@@ -433,8 +438,16 @@ async fn cypher_edge_property_temporal_filter_in_nested_match() {
 
     let (_alice, _bob, _carol) = seed_graph(&mut conn).await;
 
-    // ── Sub-probe A: baseline traversal (no WHERE) locks the shape ──────────
-    let baseline: redis::Value = redis::cmd("GRAPH.QUERY")
+    // ── Sub-probe A: baseline traversal (no WHERE) — now CYP-06 reject ──────
+    //
+    // POST-v0.1.10 FIX-07: `MATCH (e)-[r*1..2]-(neighbor)` combines a
+    // variable-length edge (`*1..2`) with an edge variable (`r`). The planner
+    // now rejects this at plan time with CYP-06 because the BFS executor
+    // branch never binds `r` into the output row — causing silent wrong
+    // results. Phase 179 (MVCC-02) will implement `Value::Path` binding and
+    // remove this gate. Until then, all three sub-probes must return the
+    // typed CYP-06 error.
+    let baseline: Result<redis::Value, redis::RedisError> = redis::cmd("GRAPH.QUERY")
         .arg("g")
         .arg(
             "MATCH (e:Entity {name:'alice'}) \
@@ -442,34 +455,20 @@ async fn cypher_edge_property_temporal_filter_in_nested_match() {
              RETURN e.name, neighbor.name",
         )
         .query_async(&mut conn)
-        .await
-        .expect("baseline GRAPH.QUERY must succeed");
-    let baseline_rows = rows_count(&baseline);
-    let baseline_flat = rows_flat_strings(&baseline);
-    println!(
-        "[V1 baseline] rows={} values={:?}",
-        baseline_rows, baseline_flat
-    );
+        .await;
+    let baseline_err_msg = format!("{baseline:?}").to_lowercase();
     assert!(
-        baseline_rows >= 2,
-        "baseline MATCH (e)-[r*1..2]-(neighbor) must return at least 2 rows \
-         (alice -> bob, alice -> carol); got {baseline_rows} rows, values={baseline_flat:?}"
+        baseline_err_msg.contains("cyp-06") || baseline_err_msg.contains("multi-hop edge variable"),
+        "Sub-probe A: expected CYP-06 plan-time reject for -[r*1..2]-, got: {baseline:?}"
     );
+    println!("[V1 baseline] correctly rejected with CYP-06");
 
-    // ── Sub-probe B: primary form with `coalesce` — POST-v0.1.9 CYP-03 ─────────
+    // ── Sub-probe B: primary form with `coalesce` — also CYP-06 ─────────────
     //
-    // v0.1.9 CYP-03 added `coalesce()` to the eval registry
-    // (`src/graph/cypher/executor/eval.rs:209`). For variable-length
-    // expansion `r*1..2` the edge variable is still unbound (CYP-06
-    // variable-length case deferred to v0.2), so `r.valid_to` resolves
-    // to Null for every row. `coalesce(Null, 9999999999)` now correctly
-    // returns `9999999999`, and the predicate `9999999999 >= 1000` is
-    // `true`, so every row passes — matching the baseline count.
-    //
-    // When v0.2 lands multi-hop edge-var binding as `Value::Path`,
-    // this assertion flips again (rows become the temporally-filtered
-    // subset).
-    let primary: redis::Value = redis::cmd("GRAPH.QUERY")
+    // The CYP-06 reject fires at plan time (before WHERE evaluation), so
+    // the coalesce predicate never executes. This is correct — the previous
+    // behaviour (silent Null → wrong results) was the bug.
+    let primary: Result<redis::Value, redis::RedisError> = redis::cmd("GRAPH.QUERY")
         .arg("g")
         .arg(
             "MATCH (e:Entity {name:'alice'}) \
@@ -478,38 +477,19 @@ async fn cypher_edge_property_temporal_filter_in_nested_match() {
              RETURN e.name, neighbor.name",
         )
         .query_async(&mut conn)
-        .await
-        .expect(
-            "Moon must accept the coalesce() Cypher as a well-formed query (parses as FunctionCall)",
-        );
-    let primary_rows = rows_count(&primary);
-    println!("[V1 coalesce post-v0.1.9] rows={primary_rows}");
-    assert_eq!(
-        primary_rows, baseline_rows,
-        "v0.1.9 CYP-03 lock-in: coalesce() is now present, so coalesce(Null, 9999999999) \
-         = 9999999999 >= 1000 = true for every row (variable-length edge-var still \
-         unbound per CYP-06 v0.2 scope). Any other count means v0.2 multi-hop \
-         edge-var binding landed or coalesce changed — update this test and the gap doc."
+        .await;
+    let primary_err_msg = format!("{primary:?}").to_lowercase();
+    assert!(
+        primary_err_msg.contains("cyp-06") || primary_err_msg.contains("multi-hop edge variable"),
+        "Sub-probe B: expected CYP-06 plan-time reject for -[r*1..2]-, got: {primary:?}"
     );
+    println!("[V1 coalesce] correctly rejected with CYP-06");
 
-    // ── Sub-probe C: fallback form (`IS NULL OR`) — VACUOUSLY TRUE, no filtering ─
+    // ── Sub-probe C: fallback form — also CYP-06 ────────────────────────────
     //
-    // Edge variable `r` is not bound by variable-length Expand (see
-    // `src/graph/cypher/executor/read.rs:126-168`; only the target node is
-    // inserted into the row). `r.valid_to` therefore evaluates to Null for
-    // every row. The evaluator at `src/graph/cypher/executor/eval.rs:90-94`
-    // returns `Bool(true)` for `Null IS NULL`, so the OR short-circuits to
-    // true for EVERY row. Net result: the fallback form passes the same
-    // number of rows as the baseline (no actual temporal filtering occurs).
-    //
-    // This is the second dangerous failure mode documented in the gap doc:
-    // the fallback "succeeds" with plausible-shape results, but temporal
-    // semantics are completely absent.
-    //
-    // To lock the shape in an apples-to-apples way we reuse the same
-    // two-MATCH pattern as the baseline (single-MATCH collapses paths
-    // differently inside the planner).
-    let fallback: redis::Value = redis::cmd("GRAPH.QUERY")
+    // Same plan-time reject — the `r` edge variable in `[r*1..2]` triggers
+    // CYP-06 regardless of the WHERE clause shape.
+    let fallback: Result<redis::Value, redis::RedisError> = redis::cmd("GRAPH.QUERY")
         .arg("g")
         .arg(
             "MATCH (e:Entity {name:'alice'}) \
@@ -518,19 +498,13 @@ async fn cypher_edge_property_temporal_filter_in_nested_match() {
              RETURN e.name, neighbor.name",
         )
         .query_async(&mut conn)
-        .await
-        .expect("fallback GRAPH.QUERY (no coalesce) must parse and execute");
-    let fallback_rows = rows_count(&fallback);
-    println!("[V1 fallback] rows={fallback_rows}");
-    assert_eq!(
-        fallback_rows, baseline_rows,
-        "Branch B lock-in (fallback is vacuously true): the fallback predicate \
-         MUST pass every row the baseline produces, because `r.valid_to` is always \
-         Null (edge var unbound in variable-length expansion) so `r.valid_to IS NULL` \
-         is Bool(true) and the OR short-circuits to true. Any other count means \
-         Moon now binds edge vars in Expand OR changed IS NULL semantics — update \
-         this test AND the gap doc."
+        .await;
+    let fallback_err_msg = format!("{fallback:?}").to_lowercase();
+    assert!(
+        fallback_err_msg.contains("cyp-06") || fallback_err_msg.contains("multi-hop edge variable"),
+        "Sub-probe C: expected CYP-06 plan-time reject for -[r*1..2]-, got: {fallback:?}"
     );
+    println!("[V1 fallback] correctly rejected with CYP-06");
 
     shutdown.cancel();
 }

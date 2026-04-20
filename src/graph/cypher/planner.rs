@@ -276,7 +276,7 @@ pub fn compile(query: &CypherQuery) -> Result<PhysicalPlan, PlanError> {
     for clause in &query.clauses {
         match clause {
             Clause::Match(m) => {
-                compile_match(m, &mut ops);
+                compile_match(m, &mut ops)?;
             }
             Clause::ShortestPathMatch(sp) => {
                 compile_shortest_path_match(sp, &mut ops);
@@ -356,7 +356,14 @@ pub fn compile(query: &CypherQuery) -> Result<PhysicalPlan, PlanError> {
 }
 
 /// Compile a MATCH clause into scan + expand operators.
-fn compile_match(m: &MatchClause, ops: &mut Vec<PhysicalOp>) {
+///
+/// Returns `Err(PlanError::Unsupported)` if a variable-length edge pattern
+/// also binds an edge variable (e.g. `[r*2..5]`). The BFS executor branch
+/// does not insert the edge variable into the output row, so downstream
+/// predicates silently evaluate against Null — producing wrong results.
+/// This gate is temporary: Phase 179 (MVCC-02) will implement `Value::Path`
+/// binding and remove this restriction.
+fn compile_match(m: &MatchClause, ops: &mut Vec<PhysicalOp>) -> Result<(), PlanError> {
     for pattern in &m.patterns {
         if pattern.nodes.is_empty() {
             continue;
@@ -374,6 +381,18 @@ fn compile_match(m: &MatchClause, ops: &mut Vec<PhysicalOp>) {
 
         // Subsequent node+edge pairs become expands.
         for (i, edge) in pattern.edges.iter().enumerate() {
+            // CYP-06: reject multi-hop edge variable binding until Phase 179
+            // (MVCC-02) implements Value::Path. The BFS branch never inserts
+            // the edge variable into the output row, causing silent wrong results.
+            if edge.var_length.is_some() && edge.variable.is_some() {
+                let var_name = edge.variable.as_deref().unwrap_or("?");
+                return Err(PlanError::Unsupported(format!(
+                    "CYP-06: Multi-hop edge variable binding -[{var_name}*m..n]- is not yet \
+                     supported. Remove the edge variable '{var_name}' or use a single-hop \
+                     pattern. Tracked: MVCC-02 (Phase 179)."
+                )));
+            }
+
             let source_node = &pattern.nodes[i];
             let target = &pattern.nodes[i + 1];
             let (min_hops, max_hops) = edge.var_length.unwrap_or((1, 1));
@@ -397,6 +416,7 @@ fn compile_match(m: &MatchClause, ops: &mut Vec<PhysicalOp>) {
             });
         }
     }
+    Ok(())
 }
 
 /// Compile a `MATCH p = shortestPath((a)-[*..N]-(b))` clause.
