@@ -312,33 +312,48 @@ pub fn execute(
             }
 
             PhysicalOp::CreatePattern { .. } => {
-                return Err(ExecError::Unsupported(
-                    "write operations require GRAPH.QUERY with write lock".into(),
-                ));
+                return Err(ExecError {
+                    kind: ExecErrorKind::Unsupported(
+                        "write operations require GRAPH.QUERY with write lock".into(),
+                    ),
+                    partial_mutations: Vec::new(),
+                });
             }
 
             PhysicalOp::DeleteEntities { .. } => {
-                return Err(ExecError::Unsupported(
-                    "write operations require GRAPH.QUERY with write lock".into(),
-                ));
+                return Err(ExecError {
+                    kind: ExecErrorKind::Unsupported(
+                        "write operations require GRAPH.QUERY with write lock".into(),
+                    ),
+                    partial_mutations: Vec::new(),
+                });
             }
 
             PhysicalOp::SetProperties { .. } => {
-                return Err(ExecError::Unsupported(
-                    "write operations require GRAPH.QUERY with write lock".into(),
-                ));
+                return Err(ExecError {
+                    kind: ExecErrorKind::Unsupported(
+                        "write operations require GRAPH.QUERY with write lock".into(),
+                    ),
+                    partial_mutations: Vec::new(),
+                });
             }
 
             PhysicalOp::ProcedureCall { .. } => {
-                return Err(ExecError::Unsupported(
-                    "procedure calls not yet implemented in executor".into(),
-                ));
+                return Err(ExecError {
+                    kind: ExecErrorKind::Unsupported(
+                        "procedure calls not yet implemented in executor".into(),
+                    ),
+                    partial_mutations: Vec::new(),
+                });
             }
 
             PhysicalOp::Merge { .. } => {
-                return Err(ExecError::Unsupported(
-                    "write operations require GRAPH.QUERY with write lock".into(),
-                ));
+                return Err(ExecError {
+                    kind: ExecErrorKind::Unsupported(
+                        "write operations require GRAPH.QUERY with write lock".into(),
+                    ),
+                    partial_mutations: Vec::new(),
+                });
             }
 
             PhysicalOp::ShortestPath {
@@ -755,33 +770,48 @@ pub fn execute_profile(
             }
 
             PhysicalOp::CreatePattern { .. } => {
-                return Err(ExecError::Unsupported(
-                    "write operations require GRAPH.QUERY with write lock".into(),
-                ));
+                return Err(ExecError {
+                    kind: ExecErrorKind::Unsupported(
+                        "write operations require GRAPH.QUERY with write lock".into(),
+                    ),
+                    partial_mutations: Vec::new(),
+                });
             }
 
             PhysicalOp::DeleteEntities { .. } => {
-                return Err(ExecError::Unsupported(
-                    "write operations require GRAPH.QUERY with write lock".into(),
-                ));
+                return Err(ExecError {
+                    kind: ExecErrorKind::Unsupported(
+                        "write operations require GRAPH.QUERY with write lock".into(),
+                    ),
+                    partial_mutations: Vec::new(),
+                });
             }
 
             PhysicalOp::SetProperties { .. } => {
-                return Err(ExecError::Unsupported(
-                    "write operations require GRAPH.QUERY with write lock".into(),
-                ));
+                return Err(ExecError {
+                    kind: ExecErrorKind::Unsupported(
+                        "write operations require GRAPH.QUERY with write lock".into(),
+                    ),
+                    partial_mutations: Vec::new(),
+                });
             }
 
             PhysicalOp::ProcedureCall { .. } => {
-                return Err(ExecError::Unsupported(
-                    "procedure calls not yet implemented in executor".into(),
-                ));
+                return Err(ExecError {
+                    kind: ExecErrorKind::Unsupported(
+                        "procedure calls not yet implemented in executor".into(),
+                    ),
+                    partial_mutations: Vec::new(),
+                });
             }
 
             PhysicalOp::Merge { .. } => {
-                return Err(ExecError::Unsupported(
-                    "write operations require GRAPH.QUERY with write lock".into(),
-                ));
+                return Err(ExecError {
+                    kind: ExecErrorKind::Unsupported(
+                        "write operations require GRAPH.QUERY with write lock".into(),
+                    ),
+                    partial_mutations: Vec::new(),
+                });
             }
 
             PhysicalOp::ShortestPath {

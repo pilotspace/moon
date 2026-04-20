@@ -732,9 +732,14 @@ pub fn execute_mut(
             }
 
             PhysicalOp::ProcedureCall { .. } => {
-                return Err(ExecError::Unsupported(
-                    "procedure calls not yet implemented in executor".into(),
-                ));
+                // Phase 174 FIX-02: surface partial mutations accumulated
+                // before the unsupported op so TXN.ABORT can roll them back.
+                return Err(ExecError {
+                    kind: ExecErrorKind::Unsupported(
+                        "procedure calls not yet implemented in executor".into(),
+                    ),
+                    partial_mutations: mutations,
+                });
             }
 
             PhysicalOp::ShortestPath { .. } => {
@@ -742,9 +747,15 @@ pub fn execute_mut(
                 // operator. It is not meaningful inside a CREATE/SET/DELETE
                 // write-path. Reject here and route users to GRAPH.RO_QUERY
                 // or GRAPH.QUERY for reads.
-                return Err(ExecError::Unsupported(
-                    "shortestPath() requires a read-only Cypher query".into(),
-                ));
+                //
+                // Phase 174 FIX-02: surface partial mutations accumulated
+                // before the unsupported op so TXN.ABORT can roll them back.
+                return Err(ExecError {
+                    kind: ExecErrorKind::Unsupported(
+                        "shortestPath() requires a read-only Cypher query".into(),
+                    ),
+                    partial_mutations: mutations,
+                });
             }
         }
     }

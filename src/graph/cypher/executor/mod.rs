@@ -46,8 +46,21 @@ pub enum Value {
 pub type Row = HashMap<String, Value>;
 
 /// Execution error.
+///
+/// Phase 174 FIX-02: carries `partial_mutations` so that even on Err, any
+/// mutations accumulated before the failure can be surfaced for TXN.ABORT
+/// rollback. Without this, the Err path discards partial writes silently.
 #[derive(Debug)]
-pub enum ExecError {
+pub struct ExecError {
+    pub kind: ExecErrorKind,
+    /// Mutations that were accumulated before the error occurred. Empty for
+    /// pure-parse errors (GraphNotFound, etc.) where no write ops ran.
+    pub partial_mutations: Vec<MutationRecord>,
+}
+
+/// The kind of execution error (separated from partial_mutations payload).
+#[derive(Debug)]
+pub enum ExecErrorKind {
     GraphNotFound,
     NodeNotFound,
     TypeError(String),
@@ -56,11 +69,11 @@ pub enum ExecError {
 
 impl core::fmt::Display for ExecError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::GraphNotFound => write!(f, "graph not found"),
-            Self::NodeNotFound => write!(f, "node not found"),
-            Self::TypeError(msg) => write!(f, "type error: {msg}"),
-            Self::Unsupported(msg) => write!(f, "unsupported: {msg}"),
+        match &self.kind {
+            ExecErrorKind::GraphNotFound => write!(f, "graph not found"),
+            ExecErrorKind::NodeNotFound => write!(f, "node not found"),
+            ExecErrorKind::TypeError(msg) => write!(f, "type error: {msg}"),
+            ExecErrorKind::Unsupported(msg) => write!(f, "unsupported: {msg}"),
         }
     }
 }

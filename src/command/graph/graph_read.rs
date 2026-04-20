@@ -578,7 +578,9 @@ pub fn graph_query_or_write(
 
         let lsn = store.allocate_lsn();
 
-        let result = {
+        // Phase 174 FIX-02: extract mutations regardless of Ok/Err so that
+        // partial writes from before the error are visible to TXN.ABORT.
+        let (result_or_err, mutations) = {
             let graph = match store.get_graph_mut(graph_name) {
                 Some(g) => g,
                 None => {
@@ -592,10 +594,24 @@ pub fn graph_query_or_write(
 
             let params = std::collections::HashMap::new();
             match cypher::executor::execute_mut(graph, &plan, &params, lsn) {
-                Ok(r) => r,
+                Ok(r) => {
+                    let muts = r.mutations;
+                    (
+                        Ok(cypher::executor::ExecResult {
+                            columns: r.columns,
+                            rows: r.rows,
+                            nodes_created: r.nodes_created,
+                            nodes_deleted: r.nodes_deleted,
+                            properties_set: r.properties_set,
+                            execution_time_us: r.execution_time_us,
+                            mutations: Vec::new(), // moved out above
+                        }),
+                        muts,
+                    )
+                }
                 Err(e) => {
                     let msg = format!("ERR Cypher execution error: {e}");
-                    return (Frame::Error(Bytes::from(msg)), Vec::new(), Vec::new());
+                    (Err(msg), e.partial_mutations)
                 }
             }
         };
@@ -605,14 +621,14 @@ pub fn graph_query_or_write(
         // create-branch) becomes an intent; MERGE match-branches produce no
         // mutation and therefore no intent (idempotent rollback).
         let mut intents: Vec<cypher::executor::GraphWriteIntent> =
-            Vec::with_capacity(result.mutations.len());
+            Vec::with_capacity(mutations.len());
 
         // Phase 174 FIX-01: collect undo ops for SET/DELETE/MERGE rollback.
         let gname_bytes = Bytes::copy_from_slice(graph_name);
         let mut undo_ops: Vec<crate::transaction::GraphUndoOp> = Vec::new();
 
         // Generate WAL records for mutations + collect intents/undo ops.
-        for mutation in &result.mutations {
+        for mutation in &mutations {
             match mutation {
                 cypher::executor::MutationRecord::CreateNode {
                     node_id,
@@ -689,7 +705,12 @@ pub fn graph_query_or_write(
             }
         }
 
-        (exec_result_to_frame(&result), intents, undo_ops)
+        // Phase 174 FIX-02: return intents/undo_ops on BOTH Ok and Err paths
+        // so TXN.ABORT can roll back partial writes from before the error.
+        match result_or_err {
+            Ok(ref result) => (exec_result_to_frame(result), intents, undo_ops),
+            Err(msg) => (Frame::Error(Bytes::from(msg)), intents, undo_ops),
+        }
     }
 }
 
