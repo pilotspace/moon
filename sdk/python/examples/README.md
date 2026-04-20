@@ -136,6 +136,51 @@ RediSearch-compatible servers.
   (`client.__dict__["_probe_tag_cached"]`) so the capability check
   happens at most once per client lifetime.
 
+## `validate.py` — Live SDK validator
+
+End-to-end validator that connects to a live Moon server and exercises every
+SDK sub-client. Each check prints `PASS`, `FAIL`, or `SKIP` with details.
+Sections requiring the `text-index` feature are auto-detected and skipped when
+not compiled in.
+
+### Run
+
+```bash
+# Default: connects to 127.0.0.1:6399
+uv run python examples/validate.py
+
+# Custom URL
+MOON_TEST_URL=redis://my-server:6399 uv run python examples/validate.py
+```
+
+### Sections covered
+
+| Section | Commands exercised |
+|---|---|
+| PING | `PING` |
+| Strings | `SET`, `GET`, `DEL`, `EXISTS`, `EXPIRE`, `TTL` |
+| Counter | `INCR`, `INCRBY`, `DECR` |
+| Hash | `HSET`, `HGET`, `HGETALL`, `HLEN`, `HDEL`, `HEXISTS` |
+| List | `RPUSH`, `LLEN`, `LRANGE`, `LPOP` |
+| Set | `SADD`, `SCARD`, `SISMEMBER`, `SREM` |
+| Sorted set | `ZADD`, `ZCARD`, `ZSCORE`, `ZRANK`, `ZRANGE` |
+| Vector | `FT.CREATE`, `FT._LIST`, `FT.INFO`, `FT.SEARCH`, `FT.COMPACT`, `FT.DROPINDEX DD` |
+| Graph | `GRAPH.CREATE`, `ADDNODE`, `ADDEDGE`, `QUERY`, `RO_QUERY`, `NEIGHBORS`, `EXPLAIN`, `PROFILE`, `INFO`, `LIST`, `DELETE` |
+| Session | `FT.SEARCH SESSION`, session history, session reset |
+| Cache | `FT.CACHESEARCH`, cache store, invalidate |
+| Text *(text-index)* | `FT.CREATE TEXT`, BM25 search, `FT.AGGREGATE`, hybrid RRF search |
+| Server info | `INFO`, `DBSIZE` |
+
+### Expected output (text-index build)
+
+```
+==================================================
+  Total: 114  PASS: 114  FAIL: 0  SKIP: 0
+==================================================
+```
+
+Exit code `0` = all checks passed; `1` = one or more FAILs.
+
 ## Related
 
 - `moondb.TextCommands` — full-text command surface (`create_text_index`,

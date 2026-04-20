@@ -247,6 +247,29 @@ plugins = []
 strict = true
 ```
 
+## Live Validation
+
+Run the end-to-end validator against a live Moon server:
+
+```bash
+# Start Moon (text-index is default since v0.1.10)
+cargo build --release && ./target/release/moon --port 6399 --shards 1
+
+# From sdk/python/
+uv run python examples/validate.py
+```
+
+Expected result with a `text-index`-enabled build:
+
+```
+==================================================
+  Total: 114  PASS: 114  FAIL: 0  SKIP: 0
+==================================================
+```
+
+Covers all 13 sub-client sections. Text sections auto-skip when the server
+was built without `--features text-index`.
+
 ## Development
 
 ```bash

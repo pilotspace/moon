@@ -6,6 +6,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`text-index` is now a default feature.** BM25 full-text search (`FT.SEARCH` BM25 mode), `FT.AGGREGATE`, and three-way RRF hybrid fusion are included in all standard builds. No longer requires `--features text-index`. To exclude it (e.g. minimal embedded builds): `--no-default-features --features runtime-monoio,jemalloc,graph`.
+
+### Added — SDK Validation
+
+- **Python SDK `sdk/python/examples/validate.py`**: End-to-end live validator for all SDK sub-clients: ping, strings, counter, hash, list, set, zset, vector index lifecycle, graph engine, session search, semantic cache, text search (BM25 + aggregate + hybrid), and server info. Result against Moon with `text-index`: **114 PASS / 0 FAIL / 0 SKIP**. Gracefully skips text sections when server built without `text-index`.
+- **Rust SDK `sdk/rust/examples/validate.rs`**: Re-validated against `text-index` build — **85 PASS / 0 FAIL**.
+
+### Fixed — Python SDK
+
+- **`moondb.graph._parse_neighbors`**: Server returns alternating `[edge_map, node_map, ...]` as flat key-value arrays (`b'id'`, `int`, `b'src'`, `int`, `b'dst'`, `int`, …). Previous parser expected positional `[node_id, label, props]` — caused `int() on b'id'` crash. Now correctly identifies node entries by `labels` key and parses them from the flat kv format.
+
 ## [0.1.8] — 2026-04-18
 
 ### Added — Cross-Store ACID Transactions (Phases 157, 161-163)
