@@ -8,7 +8,7 @@
 
 <p align="center">
   <a href="https://github.com/pilotspace/moon/releases/tag/v0.1.10"><img src="https://img.shields.io/badge/version-v0.1.10-blue" alt="Version"></a>
-  <a href="https://crates.io/crates/moon-client"><img src="https://img.shields.io/crates/v/moon-client?label=moon-client" alt="Rust SDK"></a>
+  <a href="https://crates.io/crates/moondb"><img src="https://img.shields.io/crates/v/moondb?label=moondb" alt="Rust SDK"></a>
   <a href="https://pypi.org/project/moondb/"><img src="https://img.shields.io/pypi/v/moondb?label=moondb" alt="Python SDK"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="License"></a>
   <img src="https://img.shields.io/badge/status-experimental-orange" alt="Status">
@@ -150,11 +150,11 @@ See [docs/quickstart.mdx](docs/quickstart.mdx) for alternative build configs, TL
 pip install moondb
 ```
 
-**Rust** — [`moon-client`](https://crates.io/crates/moon-client) on crates.io:
+**Rust** — [`moondb`](https://crates.io/crates/moondb) on crates.io:
 
 ```toml
 [dependencies]
-moon-client = "0.1"
+moondb = "0.1"
 tokio = { version = "1", features = ["full"] }
 ```
 

@@ -1,9 +1,9 @@
-# moon-client
+# moondb
 
 <p>
-  <a href="https://crates.io/crates/moon-client"><img src="https://img.shields.io/crates/v/moon-client" alt="crates.io"></a>
-  <a href="https://docs.rs/moon-client"><img src="https://img.shields.io/docsrs/moon-client" alt="docs.rs"></a>
-  <a href="https://crates.io/crates/moon-client"><img src="https://img.shields.io/crates/d/moon-client" alt="downloads"></a>
+  <a href="https://crates.io/crates/moondb"><img src="https://img.shields.io/crates/v/moondb" alt="crates.io"></a>
+  <a href="https://docs.rs/moondb"><img src="https://img.shields.io/docsrs/moondb" alt="docs.rs"></a>
+  <a href="https://crates.io/crates/moondb"><img src="https://img.shields.io/crates/d/moondb" alt="downloads"></a>
   <img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT">
   <img src="https://img.shields.io/badge/rust-1.85%2B-orange" alt="MSRV">
 </p>
@@ -14,14 +14,14 @@ Async Rust client for [Moon](https://github.com/pilotspace/moon) — a high-perf
 
 ```toml
 [dependencies]
-moon = "0.1"
+moondb = "0.1"
 tokio = { version = "1", features = ["full"] }
 ```
 
 ## Quick Start
 
 ```rust
-use moon::{MoonClient, Result, VectorIndexOptions, DistanceMetric};
+use moondb::{MoonClient, Result, VectorIndexOptions, DistanceMetric};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -63,8 +63,8 @@ async fn main() -> Result<()> {
 ### Vector Search (FT.*)
 
 ```rust
-use moon::{VectorIndexOptions, DistanceMetric};
-use moon::types::encode_vector;
+use moondb::{VectorIndexOptions, DistanceMetric};
+use moondb::types::encode_vector;
 
 let mut v = client.vector();
 
@@ -109,7 +109,7 @@ v.drop_index("docs", true).await?;
 ### Graph Engine (GRAPH.*)
 
 ```rust
-use moon::NeighborDirection;
+use moondb::NeighborDirection;
 
 let mut g = client.graph();
 g.create("knowledge").await?;
@@ -185,7 +185,7 @@ client.txn_rollback().await?;
 > Requires Moon built with `text-index` (default since v0.1.10).
 
 ```rust
-use moon::types::SchemaField;
+use moondb::types::SchemaField;
 
 let mut text = client.text();
 
@@ -204,7 +204,7 @@ for h in &hits {
 }
 
 // Facet aggregation
-use moon::types::{Reducer, AggregateRow};
+use moondb::types::{Reducer, AggregateRow};
 let rows: Vec<AggregateRow> = text.aggregate(
     "articles",
     "*",
@@ -283,7 +283,7 @@ session.reset("session:user1").await?;
 
 ```toml
 # TLS with rustls
-moon-client = { version = "0.1", features = ["tls-rustls"] }
+moondb = { version = "0.1", features = ["tls-rustls"] }
 ```
 
 ## Live Validation

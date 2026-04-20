@@ -8,7 +8,7 @@ use crate::util::{parse_query_result, value_to_i64};
 ///
 /// # Example
 /// ```no_run
-/// use moon::MoonClient;
+/// use moondb::MoonClient;
 ///
 /// #[tokio::main]
 /// async fn main() -> moon::Result<()> {

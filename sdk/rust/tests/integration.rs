@@ -8,7 +8,7 @@
 //! MOON_TEST_URL=redis://127.0.0.1:6399 cargo test --test integration
 //! ```
 
-use moon::{
+use moondb::{
     DistanceMetric, MoonClient, NeighborDirection, VectorIndexOptions, types::encode_vector,
 };
 

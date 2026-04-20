@@ -5,7 +5,7 @@
 //!   cargo run --example validate
 //!   MOON_TEST_URL=redis://127.0.0.1:6399 cargo run --example validate
 
-use moon::{
+use moondb::{
     DistanceMetric, MoonClient, NeighborDirection, Result, VectorIndexOptions, types::encode_vector,
 };
 

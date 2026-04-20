@@ -8,7 +8,7 @@ use crate::util::{parse_cache_search_results, parse_index_info, parse_search_res
 ///
 /// # Example
 /// ```no_run
-/// use moon::{MoonClient, types::{VectorIndexOptions, DistanceMetric}};
+/// use moondb::{MoonClient, types::{VectorIndexOptions, DistanceMetric}};
 ///
 /// #[tokio::main]
 /// async fn main() -> moon::Result<()> {

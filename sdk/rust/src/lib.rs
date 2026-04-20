@@ -1,4 +1,4 @@
-//! # moon-client
+//! # moondb
 //!
 //! Async Rust client for the [Moon](https://github.com/pilotspace/moon) server — a
 //! high-performance Redis-compatible database with built-in vector search, graph
@@ -7,8 +7,8 @@
 //! ## Quick start
 //!
 //! ```no_run
-//! use moon::{MoonClient, Result};
-//! use moon::types::{VectorIndexOptions, DistanceMetric};
+//! use moondb::{MoonClient, Result};
+//! use moondb::types::{VectorIndexOptions, DistanceMetric};
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<()> {

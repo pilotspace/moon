@@ -27,7 +27,7 @@ macro_rules! cmd {
 ///
 /// # Example
 /// ```no_run
-/// use moon::MoonClient;
+/// use moondb::MoonClient;
 ///
 /// #[tokio::main]
 /// async fn main() -> moon::Result<()> {
