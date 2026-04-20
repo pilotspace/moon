@@ -7,11 +7,17 @@ use super::*;
 // ---------------------------------------------------------------------------
 
 /// Evaluate an expression in the context of a row.
+///
+/// `immutable_segs` and `snapshot_lsn` are threaded through for
+/// `Expr::ShortestPathCall` which needs access to CSR segments
+/// (Phase 174 FIX-04).
 pub(crate) fn eval_expr(
     expr: &Expr,
     row: &Row,
     memgraph: &crate::graph::memgraph::MemGraph,
     params: &HashMap<String, Value>,
+    immutable_segs: &[std::sync::Arc<crate::graph::csr::CsrStorage>],
+    snapshot_lsn: u64,
 ) -> Value {
     match expr {
         Expr::Integer(n) => Value::Int(*n),
@@ -25,7 +31,7 @@ pub(crate) fn eval_expr(
         Expr::Parameter(name) => params.get(name).cloned().unwrap_or(Value::Null),
 
         Expr::PropertyAccess { object, property } => {
-            let obj = eval_expr(object, row, memgraph, params);
+            let obj = eval_expr(object, row, memgraph, params, immutable_segs, snapshot_lsn);
             match obj {
                 Value::Node(key) => {
                     if let Some(node) = memgraph.get_node(key) {
@@ -64,13 +70,13 @@ pub(crate) fn eval_expr(
         }
 
         Expr::BinaryOp { left, op, right } => {
-            let lv = eval_expr(left, row, memgraph, params);
-            let rv = eval_expr(right, row, memgraph, params);
+            let lv = eval_expr(left, row, memgraph, params, immutable_segs, snapshot_lsn);
+            let rv = eval_expr(right, row, memgraph, params, immutable_segs, snapshot_lsn);
             eval_binary_op(&lv, *op, &rv)
         }
 
         Expr::Not(inner) => {
-            let v = eval_expr(inner, row, memgraph, params);
+            let v = eval_expr(inner, row, memgraph, params, immutable_segs, snapshot_lsn);
             match v {
                 Value::Bool(b) => Value::Bool(!b),
                 Value::Null => Value::Null,
@@ -79,7 +85,7 @@ pub(crate) fn eval_expr(
         }
 
         Expr::Negate(inner) => {
-            let v = eval_expr(inner, row, memgraph, params);
+            let v = eval_expr(inner, row, memgraph, params, immutable_segs, snapshot_lsn);
             match v {
                 Value::Int(n) => Value::Int(-n),
                 Value::Float(f) => Value::Float(-f),
@@ -88,14 +94,14 @@ pub(crate) fn eval_expr(
         }
 
         Expr::IsNull { expr, negated } => {
-            let v = eval_expr(expr, row, memgraph, params);
+            let v = eval_expr(expr, row, memgraph, params, immutable_segs, snapshot_lsn);
             let is_null = matches!(v, Value::Null);
             Value::Bool(if *negated { !is_null } else { is_null })
         }
 
         Expr::InList { expr, list } => {
-            let val = eval_expr(expr, row, memgraph, params);
-            let list_val = eval_expr(list, row, memgraph, params);
+            let val = eval_expr(expr, row, memgraph, params, immutable_segs, snapshot_lsn);
+            let list_val = eval_expr(list, row, memgraph, params, immutable_segs, snapshot_lsn);
             match list_val {
                 Value::List(items) => {
                     let found = items.iter().any(|item| {
@@ -112,7 +118,7 @@ pub(crate) fn eval_expr(
             match lower_name.as_str() {
                 "id" => {
                     if let Some(arg) = args.first() {
-                        let v = eval_expr(arg, row, memgraph, params);
+                        let v = eval_expr(arg, row, memgraph, params, immutable_segs, snapshot_lsn);
                         match v {
                             Value::Node(k) => Value::Int(k.data().as_ffi() as i64),
                             Value::Edge(k) => Value::Int(k.data().as_ffi() as i64),
@@ -124,7 +130,7 @@ pub(crate) fn eval_expr(
                 }
                 "labels" => {
                     if let Some(arg) = args.first() {
-                        let v = eval_expr(arg, row, memgraph, params);
+                        let v = eval_expr(arg, row, memgraph, params, immutable_segs, snapshot_lsn);
                         if let Value::Node(k) = v {
                             if let Some(node) = memgraph.get_node(k) {
                                 let labels: Vec<Value> =
@@ -139,7 +145,7 @@ pub(crate) fn eval_expr(
                 }
                 "type" => {
                     if let Some(arg) = args.first() {
-                        let v = eval_expr(arg, row, memgraph, params);
+                        let v = eval_expr(arg, row, memgraph, params, immutable_segs, snapshot_lsn);
                         if let Value::Edge(k) = v {
                             if let Some(edge) = memgraph.get_edge(k) {
                                 return Value::Int(edge.edge_type as i64);
@@ -152,7 +158,7 @@ pub(crate) fn eval_expr(
                 }
                 "size" => {
                     if let Some(arg) = args.first() {
-                        let v = eval_expr(arg, row, memgraph, params);
+                        let v = eval_expr(arg, row, memgraph, params, immutable_segs, snapshot_lsn);
                         match v {
                             Value::List(items) => Value::Int(items.len() as i64),
                             Value::String(s) => Value::Int(s.len() as i64),
@@ -164,7 +170,7 @@ pub(crate) fn eval_expr(
                 }
                 "tointeger" | "toint" => {
                     if let Some(arg) = args.first() {
-                        let v = eval_expr(arg, row, memgraph, params);
+                        let v = eval_expr(arg, row, memgraph, params, immutable_segs, snapshot_lsn);
                         match v {
                             Value::Int(n) => Value::Int(n),
                             Value::Float(f) => Value::Int(f as i64),
@@ -177,7 +183,7 @@ pub(crate) fn eval_expr(
                 }
                 "tofloat" => {
                     if let Some(arg) = args.first() {
-                        let v = eval_expr(arg, row, memgraph, params);
+                        let v = eval_expr(arg, row, memgraph, params, immutable_segs, snapshot_lsn);
                         match v {
                             Value::Float(f) => Value::Float(f),
                             Value::Int(n) => Value::Float(n as f64),
@@ -190,7 +196,7 @@ pub(crate) fn eval_expr(
                 }
                 "tostring" => {
                     if let Some(arg) = args.first() {
-                        let v = eval_expr(arg, row, memgraph, params);
+                        let v = eval_expr(arg, row, memgraph, params, immutable_segs, snapshot_lsn);
                         Value::String(value_to_string(&v))
                     } else {
                         Value::Null
@@ -201,7 +207,7 @@ pub(crate) fn eval_expr(
                     // the Project phase as a future enhancement. For now,
                     // return the value or null for count.
                     if let Some(arg) = args.first() {
-                        eval_expr(arg, row, memgraph, params)
+                        eval_expr(arg, row, memgraph, params, immutable_segs, snapshot_lsn)
                     } else {
                         Value::Null
                     }
@@ -211,7 +217,7 @@ pub(crate) fn eval_expr(
                     // Enables Lunaris GraphFirstRetriever edge-property temporal
                     // filter: `coalesce(r.valid_to, 9999999999) >= asof`.
                     for arg in args {
-                        let v = eval_expr(arg, row, memgraph, params);
+                        let v = eval_expr(arg, row, memgraph, params, immutable_segs, snapshot_lsn);
                         if !matches!(v, Value::Null) {
                             return v;
                         }
@@ -225,7 +231,7 @@ pub(crate) fn eval_expr(
         Expr::List(items) => {
             let values: Vec<Value> = items
                 .iter()
-                .map(|item| eval_expr(item, row, memgraph, params))
+                .map(|item| eval_expr(item, row, memgraph, params, immutable_segs, snapshot_lsn))
                 .collect();
             Value::List(values)
         }
@@ -233,7 +239,7 @@ pub(crate) fn eval_expr(
         Expr::MapLit(entries) => {
             let map: Vec<(String, Value)> = entries
                 .iter()
-                .map(|(k, v)| (k.clone(), eval_expr(v, row, memgraph, params)))
+                .map(|(k, v)| (k.clone(), eval_expr(v, row, memgraph, params, immutable_segs, snapshot_lsn)))
                 .collect();
             Value::Map(map)
         }
@@ -247,12 +253,15 @@ pub(crate) fn eval_expr(
         // v0.1.9 CYP-05: RETURN shortestPath(...) expression form. The
         // endpoints' variable names must already be bound in the row via a
         // prior MATCH; we do not re-scan the graph from an expression.
+        //
+        // Phase 174 FIX-04: delegates to shared run_shortest_path helper with
+        // real edge_types, direction, max_hops cap, and immutable CSR segments.
         Expr::ShortestPathCall {
             src,
             dst,
             max_hops,
-            edge_types: _,
-            direction: _,
+            edge_types,
+            direction,
         } => {
             let src_key = match src.variable.as_deref().and_then(|v| row.get(v)) {
                 Some(Value::Node(k)) => *k,
@@ -262,22 +271,18 @@ pub(crate) fn eval_expr(
                 Some(Value::Node(k)) => *k,
                 _ => return Value::Null,
             };
-            // Build a SegmentMergeReader restricted to MemGraph only
-            // (expression context does not have access to immutable
-            // segments; those arrive through the ShortestPath physical op).
-            let empty_segs: [std::sync::Arc<crate::graph::csr::CsrStorage>; 0] = [];
-            let reader = crate::graph::traversal::SegmentMergeReader::new(
-                Some(memgraph),
-                &empty_segs,
-                crate::graph::types::Direction::Both,
-                u64::MAX,
-                None,
-            );
-            let cost_fn = crate::graph::scoring::WeightedCostFn::new(0.0, 1.0, 0);
-            let dijkstra = crate::graph::traversal::DijkstraTraversal::new(cost_fn, *max_hops);
-            match dijkstra.shortest_path(&reader, src_key, dst_key) {
-                Ok(Some(result)) => Value::Path(result.path),
-                _ => Value::Null,
+            match super::shortest_path::run_shortest_path(
+                memgraph,
+                immutable_segs,
+                snapshot_lsn,
+                src_key,
+                dst_key,
+                edge_types,
+                *direction,
+                *max_hops,
+            ) {
+                Some(path) => Value::Path(path),
+                None => Value::Null,
             }
         }
     }

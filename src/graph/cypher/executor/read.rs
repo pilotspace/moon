@@ -178,7 +178,7 @@ pub fn execute(
 
             PhysicalOp::Filter { expr } => {
                 rows.retain(|row| {
-                    matches!(eval_expr(expr, row, memgraph, params), Value::Bool(true))
+                    matches!(eval_expr(expr, row, memgraph, params, csr_segs, ctx.snapshot_lsn), Value::Bool(true))
                 });
             }
 
@@ -205,7 +205,7 @@ pub fn execute(
                                         row.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
                                     Value::Map(entries)
                                 } else {
-                                    eval_expr(&item.expr, row, memgraph, params)
+                                    eval_expr(&item.expr, row, memgraph, params, csr_segs, ctx.snapshot_lsn)
                                 }
                             })
                             .collect()
@@ -253,8 +253,8 @@ pub fn execute(
                 } else {
                     rows.sort_by(|a, b| {
                         for (expr, ascending) in items {
-                            let va = eval_expr(expr, a, memgraph, params);
-                            let vb = eval_expr(expr, b, memgraph, params);
+                            let va = eval_expr(expr, a, memgraph, params, csr_segs, ctx.snapshot_lsn);
+                            let vb = eval_expr(expr, b, memgraph, params, csr_segs, ctx.snapshot_lsn);
                             let ord = compare_values(&va, &vb);
                             let ord = if *ascending { ord } else { ord.reverse() };
                             if ord != std::cmp::Ordering::Equal {
@@ -267,7 +267,7 @@ pub fn execute(
             }
 
             PhysicalOp::Limit { count } => {
-                let n = match eval_expr(count, &HashMap::new(), memgraph, params) {
+                let n = match eval_expr(count, &HashMap::new(), memgraph, params, csr_segs, ctx.snapshot_lsn) {
                     Value::Int(n) if n >= 0 => n as usize,
                     _ => 0,
                 };
@@ -279,7 +279,7 @@ pub fn execute(
             }
 
             PhysicalOp::Skip { count } => {
-                let n = match eval_expr(count, &HashMap::new(), memgraph, params) {
+                let n = match eval_expr(count, &HashMap::new(), memgraph, params, csr_segs, ctx.snapshot_lsn) {
                     Value::Int(n) if n >= 0 => n as usize,
                     _ => 0,
                 };
@@ -299,7 +299,7 @@ pub fn execute(
             PhysicalOp::Unwind { expr, alias } => {
                 let mut new_rows = Vec::new();
                 for row in &rows {
-                    let val = eval_expr(expr, row, memgraph, params);
+                    let val = eval_expr(expr, row, memgraph, params, csr_segs, ctx.snapshot_lsn);
                     if let Value::List(items) = val {
                         for item in items {
                             let mut new_row = row.clone();
@@ -364,36 +364,7 @@ pub fn execute(
                 edge_types,
                 direction,
             } => {
-                let type_ids: Vec<u16> = edge_types
-                    .iter()
-                    .map(|t| label_to_id(t.as_bytes()))
-                    .collect();
-                let dir = match direction {
-                    EdgeDirection::Right => Direction::Outgoing,
-                    EdgeDirection::Left => Direction::Incoming,
-                    EdgeDirection::Both => Direction::Both,
-                };
-                let edge_type_filter = if type_ids.len() == 1 {
-                    Some(type_ids[0])
-                } else {
-                    None
-                };
-                let snapshot_lsn = if ctx.snapshot_lsn == 0 {
-                    u64::MAX
-                } else {
-                    ctx.snapshot_lsn
-                };
-                let sp_reader = SegmentMergeReader::new(
-                    Some(memgraph),
-                    csr_segs,
-                    dir,
-                    snapshot_lsn,
-                    edge_type_filter,
-                );
-                let cost_fn = crate::graph::scoring::WeightedCostFn::new(0.0, 1.0, 0);
-                let dijkstra =
-                    crate::graph::traversal::DijkstraTraversal::new(cost_fn, (*max_hops).min(32));
-
+                // Phase 174 FIX-04: delegates to shared run_shortest_path helper.
                 let mut new_rows = Vec::new();
                 for row in &rows {
                     let src_key = match row.get(source) {
@@ -404,9 +375,18 @@ pub fn execute(
                         Some(Value::Node(k)) => *k,
                         _ => continue,
                     };
-                    if let Ok(Some(result)) = dijkstra.shortest_path(&sp_reader, src_key, dst_key) {
+                    if let Some(path) = super::shortest_path::run_shortest_path(
+                        memgraph,
+                        csr_segs,
+                        ctx.snapshot_lsn,
+                        src_key,
+                        dst_key,
+                        edge_types,
+                        *direction,
+                        *max_hops,
+                    ) {
                         let mut new_row = row.clone();
-                        new_row.insert(path_var.clone(), Value::Path(result.path));
+                        new_row.insert(path_var.clone(), Value::Path(path));
                         new_rows.push(new_row);
                     }
                 }
@@ -491,6 +471,11 @@ pub fn execute_profile(
     let mut profiles = Vec::with_capacity(plan.operators.len());
 
     let memgraph = &graph.write_buf;
+
+    // Phase 174 FIX-04/05: load immutable CSR segments for ShortestPath
+    // and eval_expr (expression-form shortestPath needs real segments).
+    let segments_guard = graph.segments.load();
+    let csr_segs = &segments_guard.immutable;
 
     for op in &plan.operators {
         let op_start = std::time::Instant::now();
@@ -638,7 +623,7 @@ pub fn execute_profile(
 
             PhysicalOp::Filter { expr } => {
                 rows.retain(|row| {
-                    matches!(eval_expr(expr, row, memgraph, params), Value::Bool(true))
+                    matches!(eval_expr(expr, row, memgraph, params, csr_segs, ctx.snapshot_lsn), Value::Bool(true))
                 });
             }
 
@@ -665,7 +650,7 @@ pub fn execute_profile(
                                         row.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
                                     Value::Map(entries)
                                 } else {
-                                    eval_expr(&item.expr, row, memgraph, params)
+                                    eval_expr(&item.expr, row, memgraph, params, csr_segs, ctx.snapshot_lsn)
                                 }
                             })
                             .collect()
@@ -711,8 +696,8 @@ pub fn execute_profile(
                 } else {
                     rows.sort_by(|a, b| {
                         for (expr, ascending) in items {
-                            let va = eval_expr(expr, a, memgraph, params);
-                            let vb = eval_expr(expr, b, memgraph, params);
+                            let va = eval_expr(expr, a, memgraph, params, csr_segs, ctx.snapshot_lsn);
+                            let vb = eval_expr(expr, b, memgraph, params, csr_segs, ctx.snapshot_lsn);
                             let ord = compare_values(&va, &vb);
                             let ord = if *ascending { ord } else { ord.reverse() };
                             if ord != std::cmp::Ordering::Equal {
@@ -725,7 +710,7 @@ pub fn execute_profile(
             }
 
             PhysicalOp::Limit { count } => {
-                let n = match eval_expr(count, &HashMap::new(), memgraph, params) {
+                let n = match eval_expr(count, &HashMap::new(), memgraph, params, csr_segs, ctx.snapshot_lsn) {
                     Value::Int(n) if n >= 0 => n as usize,
                     _ => 0,
                 };
@@ -737,7 +722,7 @@ pub fn execute_profile(
             }
 
             PhysicalOp::Skip { count } => {
-                let n = match eval_expr(count, &HashMap::new(), memgraph, params) {
+                let n = match eval_expr(count, &HashMap::new(), memgraph, params, csr_segs, ctx.snapshot_lsn) {
                     Value::Int(n) if n >= 0 => n as usize,
                     _ => 0,
                 };
@@ -757,7 +742,7 @@ pub fn execute_profile(
             PhysicalOp::Unwind { expr, alias } => {
                 let mut new_rows = Vec::new();
                 for row in &rows {
-                    let val = eval_expr(expr, row, memgraph, params);
+                    let val = eval_expr(expr, row, memgraph, params, csr_segs, ctx.snapshot_lsn);
                     if let Value::List(items) = val {
                         for item in items {
                             let mut new_row = row.clone();
@@ -822,37 +807,8 @@ pub fn execute_profile(
                 edge_types,
                 direction,
             } => {
-                let type_ids: Vec<u16> = edge_types
-                    .iter()
-                    .map(|t| label_to_id(t.as_bytes()))
-                    .collect();
-                let dir = match direction {
-                    EdgeDirection::Right => Direction::Outgoing,
-                    EdgeDirection::Left => Direction::Incoming,
-                    EdgeDirection::Both => Direction::Both,
-                };
-                let edge_type_filter = if type_ids.len() == 1 {
-                    Some(type_ids[0])
-                } else {
-                    None
-                };
-                let snapshot_lsn = if ctx.snapshot_lsn == 0 {
-                    u64::MAX
-                } else {
-                    ctx.snapshot_lsn
-                };
-                let empty_segs: [std::sync::Arc<crate::graph::csr::CsrStorage>; 0] = [];
-                let sp_reader = SegmentMergeReader::new(
-                    Some(memgraph),
-                    &empty_segs,
-                    dir,
-                    snapshot_lsn,
-                    edge_type_filter,
-                );
-                let cost_fn = crate::graph::scoring::WeightedCostFn::new(0.0, 1.0, 0);
-                let dijkstra =
-                    crate::graph::traversal::DijkstraTraversal::new(cost_fn, (*max_hops).min(32));
-
+                // Phase 174 FIX-04/05: delegates to shared run_shortest_path
+                // helper with real csr_segs (fixes the empty_segs bug in PROFILE).
                 let mut new_rows = Vec::new();
                 for row in &rows {
                     let src_key = match row.get(source) {
@@ -863,9 +819,18 @@ pub fn execute_profile(
                         Some(Value::Node(k)) => *k,
                         _ => continue,
                     };
-                    if let Ok(Some(result)) = dijkstra.shortest_path(&sp_reader, src_key, dst_key) {
+                    if let Some(path) = super::shortest_path::run_shortest_path(
+                        memgraph,
+                        csr_segs,
+                        ctx.snapshot_lsn,
+                        src_key,
+                        dst_key,
+                        edge_types,
+                        *direction,
+                        *max_hops,
+                    ) {
                         let mut new_row = row.clone();
-                        new_row.insert(path_var.clone(), Value::Path(result.path));
+                        new_row.insert(path_var.clone(), Value::Path(path));
                         new_rows.push(new_row);
                     }
                 }

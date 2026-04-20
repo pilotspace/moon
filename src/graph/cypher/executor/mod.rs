@@ -6,6 +6,7 @@
 
 mod eval;
 mod read;
+pub(crate) mod shortest_path;
 mod write;
 
 pub(crate) use eval::*;
