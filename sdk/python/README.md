@@ -1,6 +1,13 @@
 # moondb
 
-Python SDK for [MoonDB](https://github.com/tindang/moon) -- a Redis-compatible server with native vector search, graph engine, session-aware retrieval, and semantic caching.
+<p>
+  <a href="https://pypi.org/project/moondb/"><img src="https://img.shields.io/pypi/v/moondb" alt="PyPI"></a>
+  <a href="https://pypi.org/project/moondb/"><img src="https://img.shields.io/pypi/dm/moondb" alt="downloads"></a>
+  <img src="https://img.shields.io/pypi/pyversions/moondb" alt="Python versions">
+  <img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT">
+</p>
+
+Python SDK for [MoonDB](https://github.com/pilotspace/moon) — a Redis-compatible server with native vector search, graph engine, session-aware retrieval, and semantic caching.
 
 ## Install
 

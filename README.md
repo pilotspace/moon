@@ -7,7 +7,9 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/pilotspace/moon/releases/tag/v0.1.8"><img src="https://img.shields.io/badge/version-v0.1.8-blue" alt="Version"></a>
+  <a href="https://github.com/pilotspace/moon/releases/tag/v0.1.10"><img src="https://img.shields.io/badge/version-v0.1.10-blue" alt="Version"></a>
+  <a href="https://crates.io/crates/moon-client"><img src="https://img.shields.io/crates/v/moon-client?label=moon-client" alt="Rust SDK"></a>
+  <a href="https://pypi.org/project/moondb/"><img src="https://img.shields.io/pypi/v/moondb?label=moondb" alt="Python SDK"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="License"></a>
   <img src="https://img.shields.io/badge/status-experimental-orange" alt="Status">
   <img src="https://img.shields.io/badge/rust-edition%202024-orange" alt="Rust">
@@ -139,6 +141,22 @@ docker run -d -p 6379:6379 -v moon-data:/data moon \
 ```
 
 See [docs/quickstart.mdx](docs/quickstart.mdx) for alternative build configs, TLS setup, and Docker Compose.
+
+### Client SDKs
+
+**Python** — [`moondb`](https://pypi.org/project/moondb/) on PyPI:
+
+```bash
+pip install moondb
+```
+
+**Rust** — [`moon-client`](https://crates.io/crates/moon-client) on crates.io:
+
+```toml
+[dependencies]
+moon-client = "0.1"
+tokio = { version = "1", features = ["full"] }
+```
 
 ### Python SDK (10 lines to vector search)
 
