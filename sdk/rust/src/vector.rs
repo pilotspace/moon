@@ -113,6 +113,66 @@ impl VectorClient {
         self.search_opts(index, query_vec, k, "vec", None, None).await
     }
 
+    /// Upsert a vector record at `id` with `embedding_bytes` (LE-f32 encoded) and
+    /// `metadata_json` via `FT.UPSERT`.
+    ///
+    /// Lunaris-shaped helper: callers that already have an LE-f32 byte buffer
+    /// (because they encoded it themselves at the trait boundary) can use this
+    /// directly without re-decoding. Use [`encode_vector`] to produce the bytes
+    /// from a `&[f32]`.
+    pub async fn upsert(
+        &mut self,
+        index: &str,
+        id: &[u8],
+        embedding_bytes: &[u8],
+        metadata_json: &str,
+    ) -> Result<()> {
+        redis::cmd("FT.UPSERT")
+            .arg(index)
+            .arg(id)
+            .arg(embedding_bytes)
+            .arg(metadata_json)
+            .query_async::<()>(&mut self.conn)
+            .await?;
+        Ok(())
+    }
+
+    /// Lower-level `FT.SEARCH` invocation that exposes the full Lunaris-shaped
+    /// query: a custom filter expression (built by the caller from its own
+    /// filter algebra), a raw `query_bytes` blob, and a rerank flag.
+    ///
+    /// Returns the raw `redis::Value` so callers with their own parser
+    /// (e.g., the Lunaris bi-temporal parser that extracts `__score` and
+    /// `__metadata`) can keep using it.
+    ///
+    /// # Wire shape
+    ///
+    /// `FT.SEARCH <index> <filter_expr> PARAMS 2 query <query_bytes>
+    /// {RERANK|NORERANK} LIMIT 0 <k>`
+    pub async fn search_raw(
+        &mut self,
+        index: &str,
+        filter_expr: &str,
+        query_bytes: &[u8],
+        k: usize,
+        rerank: bool,
+    ) -> Result<redis::Value> {
+        let rerank_arg = if rerank { "RERANK" } else { "NORERANK" };
+        Ok(redis::cmd("FT.SEARCH")
+            .arg(index)
+            .arg(filter_expr)
+            .arg("PARAMS")
+            .arg(2)
+            .arg("query")
+            .arg(query_bytes)
+            .arg(rerank_arg)
+            .arg("LIMIT")
+            .arg(0)
+            .arg(k)
+            .query_async(&mut self.conn)
+            .await?)
+    }
+
     /// Full-featured KNN search with optional `field_name`, `return_fields`, and `as_of`.
     pub async fn search_opts(
         &mut self,

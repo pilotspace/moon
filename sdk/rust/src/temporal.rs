@@ -23,6 +23,41 @@ impl TemporalClient {
         Ok(())
     }
 
+    /// Take a temporal snapshot at the explicitly-provided packed HLC value.
+    ///
+    /// Bi-temporal databases (e.g., Lunaris) need to pin AS_OF reads to a
+    /// historical timestamp, not "now". The packed HLC layout is
+    /// `(wall_ms as u128) << 32 | (counter as u128)`; Moon parses the
+    /// stringified value via BIGNUM.
+    ///
+    /// After this command, reads on this connection see the state of the world
+    /// at `packed_hlc`. Pair with [`release_snapshot`](Self::release_snapshot)
+    /// when done so the connection can be returned to live mode.
+    pub async fn snapshot_at_packed(&mut self, packed_hlc: u128) -> Result<()> {
+        redis::cmd("TEMPORAL.SNAPSHOT_AT")
+            .arg(packed_hlc.to_string())
+            .query_async::<()>(&mut self.conn)
+            .await?;
+        Ok(())
+    }
+
+    /// Release the current snapshot pin via `TEMPORAL.INVALIDATE` (no args).
+    ///
+    /// After a [`snapshot_at`](Self::snapshot_at) /
+    /// [`snapshot_at_packed`](Self::snapshot_at_packed) call, the connection
+    /// is pinned to that snapshot view. This call returns the connection to
+    /// live mode so subsequent reads see current data.
+    ///
+    /// Best-effort: callers typically discard errors here because the connection
+    /// may already be in an error state and the pin will eventually time out
+    /// server-side.
+    pub async fn release_snapshot(&mut self) -> Result<()> {
+        redis::cmd("TEMPORAL.INVALIDATE")
+            .query_async::<()>(&mut self.conn)
+            .await?;
+        Ok(())
+    }
+
     /// Invalidate (logically delete) a graph entity at the current wall-clock time.
     ///
     /// The entity remains queryable via historical snapshots but is excluded from

@@ -138,6 +138,45 @@ impl GraphClient {
         Ok(parse_query_result(raw))
     }
 
+    /// Execute a read-write Cypher query with a JSON `--params` payload.
+    ///
+    /// Lunaris-shaped helper: when callers want to bind variables in their
+    /// Cypher (`MERGE (n {id: $id})`), they pass a JSON object as a string
+    /// here. Returns the raw `redis::Value` so callers with their own parser
+    /// (e.g., the Lunaris parser that emits per-cell `serde_json::Value`)
+    /// can keep using it.
+    pub async fn query_with_params(
+        &mut self,
+        graph: &str,
+        cypher: &str,
+        params_json: &str,
+    ) -> Result<redis::Value> {
+        Ok(redis::cmd("GRAPH.QUERY")
+            .arg(graph)
+            .arg(cypher)
+            .arg("--params")
+            .arg(params_json)
+            .query_async(&mut self.conn)
+            .await?)
+    }
+
+    /// Read-only variant of `query` that returns the raw `redis::Value`.
+    ///
+    /// Useful when callers want to apply their own parser (e.g., Lunaris's
+    /// bi-temporal-aware parser) without paying for the `parse_query_result`
+    /// pass.
+    pub async fn query_raw(
+        &mut self,
+        graph: &str,
+        cypher: &str,
+    ) -> Result<redis::Value> {
+        Ok(redis::cmd("GRAPH.QUERY")
+            .arg(graph)
+            .arg(cypher)
+            .query_async(&mut self.conn)
+            .await?)
+    }
+
     /// Execute a read-only Cypher query (`GRAPH.RO_QUERY`).
     pub async fn ro_query(&mut self, graph: &str, cypher: &str) -> Result<QueryResult> {
         let raw: redis::Value = redis::cmd("GRAPH.RO_QUERY")

@@ -36,6 +36,53 @@ impl MqClient {
             .query_async(&mut self.conn).await?)
     }
 
+    /// Push a message onto a partitioned topic (`MQ.PUSH <topic> <partition> <payload>`).
+    ///
+    /// Lunaris-shaped helper: Lunaris models queues as `(topic, partition)` pairs
+    /// (matching Kafka semantics) and expects a numeric offset back rather than
+    /// a Redis-stream entry ID. Returns the broker-assigned monotonic offset
+    /// within `(topic, partition)`.
+    pub async fn push_partitioned(
+        &mut self,
+        topic: &str,
+        partition: u16,
+        payload: &[u8],
+    ) -> Result<u64> {
+        Ok(redis::cmd("MQ.PUSH")
+            .arg(topic)
+            .arg(partition)
+            .arg(payload)
+            .query_async(&mut self.conn)
+            .await?)
+    }
+
+    /// Long-poll pop one message from a partitioned topic, blocking up to
+    /// `block_ms` milliseconds (`MQ.POP <group> <topic> <partition> COUNT 1
+    /// BLOCK <ms>`).
+    ///
+    /// Lunaris-shaped helper. Returns the raw `redis::Value` so callers can
+    /// distinguish `Value::Nil` (no message in the poll window) from
+    /// `Value::Array` (at least one message ready) without paying for a typed
+    /// parse pass that would lose the Nil signal.
+    pub async fn pop_partitioned(
+        &mut self,
+        group: &str,
+        topic: &str,
+        partition: u16,
+        block_ms: u64,
+    ) -> Result<redis::Value> {
+        Ok(redis::cmd("MQ.POP")
+            .arg(group)
+            .arg(topic)
+            .arg(partition)
+            .arg("COUNT")
+            .arg(1)
+            .arg("BLOCK")
+            .arg(block_ms)
+            .query_async(&mut self.conn)
+            .await?)
+    }
+
     /// Pop up to `count` messages from the queue.
     ///
     /// Returns consumed messages. Callers must [`ack`](MqClient::ack) each message
