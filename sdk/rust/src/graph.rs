@@ -1,7 +1,6 @@
-use std::collections::HashMap;
 use crate::error::Result;
-use crate::types::{GraphEdge, GraphNode, QueryResult};
-use crate::util::{parse_query_result, value_to_i64, value_to_string};
+use crate::types::QueryResult;
+use crate::util::{parse_query_result, value_to_i64};
 
 /// Graph engine sub-client (`GRAPH.*` commands).
 ///
@@ -42,7 +41,7 @@ impl GraphClient {
         Ok(())
     }
 
-    /// Drop a graph and all its data (`GRAPH.DELETE` or `GRAPH.DROP`).
+    /// Drop a graph and all its data (`GRAPH.DELETE`).
     pub async fn delete(&mut self, name: &str) -> Result<()> {
         redis::cmd("GRAPH.DELETE")
             .arg(name)
@@ -81,29 +80,12 @@ impl GraphClient {
         Ok(value_to_i64(&raw).unwrap_or(0))
     }
 
-    /// Retrieve a node by ID (`GRAPH.GETNODE`). Returns `None` if not found.
-    pub async fn get_node(&mut self, graph: &str, node_id: i64) -> Result<Option<GraphNode>> {
-        let raw: redis::Value = redis::cmd("GRAPH.GETNODE")
-            .arg(graph)
-            .arg(node_id)
-            .query_async(&mut self.conn)
-            .await?;
-        Ok(parse_node_value(raw))
-    }
-
-    /// Delete a node by ID (`GRAPH.DELNODE`).
-    pub async fn del_node(&mut self, graph: &str, node_id: i64) -> Result<()> {
-        redis::cmd("GRAPH.DELNODE")
-            .arg(graph)
-            .arg(node_id)
-            .query_async::<()>(&mut self.conn)
-            .await?;
-        Ok(())
-    }
-
     // ── Edges ────────────────────────────────────────────────────────────────
 
     /// Add a directed edge between two nodes (`GRAPH.ADDEDGE`).
+    ///
+    /// `weight` is sent as the `WEIGHT <w>` keyword pair. `properties` is a
+    /// slice of `(field_name, field_value)` pairs appended after the weight.
     pub async fn add_edge(
         &mut self,
         graph: &str,
@@ -122,55 +104,26 @@ impl GraphClient {
         Ok(())
     }
 
-    /// Retrieve an edge by source and destination IDs (`GRAPH.GETEDGE`).
-    pub async fn get_edge(&mut self, graph: &str, src_id: i64, dst_id: i64) -> Result<Option<GraphEdge>> {
-        let raw: redis::Value = redis::cmd("GRAPH.GETEDGE")
-            .arg(graph)
-            .arg(src_id)
-            .arg(dst_id)
-            .query_async(&mut self.conn)
-            .await?;
-        Ok(parse_edge_value(raw))
-    }
-
-    /// Delete an edge (`GRAPH.DELEDGE`).
-    pub async fn del_edge(&mut self, graph: &str, src_id: i64, dst_id: i64) -> Result<()> {
-        redis::cmd("GRAPH.DELEDGE")
-            .arg(graph)
-            .arg(src_id)
-            .arg(dst_id)
-            .query_async::<()>(&mut self.conn)
-            .await?;
-        Ok(())
-    }
-
     // ── Traversal ────────────────────────────────────────────────────────────
 
     /// Get neighbors of a node (`GRAPH.NEIGHBORS`).
     ///
     /// Returns a list of `(src_id, dst_id, edge_type, weight)` tuples.
+    /// The `direction` parameter is accepted for API forwards-compatibility
+    /// but is not currently enforced by the server.
     pub async fn neighbors(
         &mut self,
         graph: &str,
         node_id: i64,
         direction: NeighborDirection,
     ) -> Result<Vec<(i64, i64, String, f64)>> {
-        let _ = direction; // server does not filter by direction; kept for API forwards-compat
+        let _ = direction;
         let raw: redis::Value = redis::cmd("GRAPH.NEIGHBORS")
             .arg(graph)
             .arg(node_id)
             .query_async(&mut self.conn)
             .await?;
         Ok(crate::util::parse_neighbors(raw))
-    }
-
-    /// Get degree of a node (`GRAPH.DEGREE`).
-    pub async fn degree(&mut self, graph: &str, node_id: i64) -> Result<i64> {
-        Ok(redis::cmd("GRAPH.DEGREE")
-            .arg(graph)
-            .arg(node_id)
-            .query_async(&mut self.conn)
-            .await?)
     }
 
     // ── Cypher queries ───────────────────────────────────────────────────────
@@ -195,7 +148,7 @@ impl GraphClient {
         Ok(parse_query_result(raw))
     }
 
-    /// Temporal Cypher query at a specific wall-clock timestamp (`GRAPH.QUERY ... VALID_AT <ms>`).
+    /// Temporal Cypher query at a specific wall-clock timestamp (`GRAPH.QUERY … VALID_AT <ms>`).
     pub async fn query_at(&mut self, graph: &str, cypher: &str, valid_at_ms: i64) -> Result<QueryResult> {
         let raw: redis::Value = redis::cmd("GRAPH.QUERY")
             .arg(graph)
@@ -249,67 +202,7 @@ impl GraphClient {
     }
 }
 
-// ── Edge/node response parsers ───────────────────────────────────────────────
-
-fn parse_node_value(raw: redis::Value) -> Option<GraphNode> {
-    let arr = match raw {
-        redis::Value::Array(a) => a,
-        redis::Value::Nil => return None,
-        _ => return None,
-    };
-    if arr.is_empty() {
-        return None;
-    }
-    let kv = flat_kv(&arr);
-    let node_id = kv.get("node_id")?.parse().ok()?;
-    let label = kv.get("label").cloned().unwrap_or_default();
-    let mut properties = HashMap::new();
-    for (k, v) in kv {
-        if !matches!(k.as_str(), "node_id" | "label") {
-            properties.insert(k, v);
-        }
-    }
-    Some(GraphNode { node_id, label, properties })
-}
-
-fn parse_edge_value(raw: redis::Value) -> Option<GraphEdge> {
-    let arr = match raw {
-        redis::Value::Array(a) => a,
-        redis::Value::Nil => return None,
-        _ => return None,
-    };
-    if arr.is_empty() {
-        return None;
-    }
-    let kv = flat_kv(&arr);
-    let src_id = kv.get("src_id")?.parse().ok()?;
-    let dst_id = kv.get("dst_id")?.parse().ok()?;
-    let edge_type = kv.get("edge_type").cloned().unwrap_or_default();
-    let weight: f64 = kv.get("weight").and_then(|v| v.parse().ok()).unwrap_or(1.0);
-    let mut properties = HashMap::new();
-    for (k, v) in kv {
-        if !matches!(k.as_str(), "src_id" | "dst_id" | "edge_type" | "weight") {
-            properties.insert(k, v);
-        }
-    }
-    Some(GraphEdge { src_id, dst_id, edge_type, weight, properties })
-}
-
-fn flat_kv(arr: &[redis::Value]) -> HashMap<String, String> {
-    let mut m = HashMap::new();
-    let mut i = 0;
-    while i + 1 < arr.len() {
-        let k = value_to_string(&arr[i]);
-        let v = value_to_string(&arr[i + 1]);
-        if !k.is_empty() {
-            m.insert(k, v);
-        }
-        i += 2;
-    }
-    m
-}
-
-/// Direction filter for `GRAPH.NEIGHBORS`.
+/// Direction hint for `GRAPH.NEIGHBORS` (kept for API forwards-compatibility).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NeighborDirection {
     Both,
@@ -336,11 +229,5 @@ mod tests {
         assert_eq!(NeighborDirection::Both.as_str(), "BOTH");
         assert_eq!(NeighborDirection::Out.as_str(), "OUT");
         assert_eq!(NeighborDirection::In.as_str(), "IN");
-    }
-
-    #[test]
-    fn parse_empty_node_value() {
-        assert!(parse_node_value(redis::Value::Nil).is_none());
-        assert!(parse_node_value(redis::Value::Array(vec![])).is_none());
     }
 }

@@ -266,13 +266,6 @@ async fn main() -> Result<()> {
             g.add_edge("val_graph", alice, bob, "KNOWS", 1.0, &[]).await
         );
 
-        let node = check!("GRAPH.GETNODE alice", g.get_node("val_graph", alice).await);
-        if node.is_none() {
-            println!("  FAIL  GRAPH.GETNODE returned None");
-            return Ok(());
-        }
-        println!("  PASS  GRAPH.GETNODE returned node");
-
         let result = check!(
             "GRAPH.QUERY",
             g.query("val_graph", "MATCH (p:Person) RETURN p.name ORDER BY p.name").await
@@ -288,9 +281,6 @@ async fn main() -> Result<()> {
             g.neighbors("val_graph", alice, NeighborDirection::Both).await
         );
         assert_eq_or_fail!("NEIGHBORS count=1", neighbors.len(), 1);
-
-        let deg = check!("GRAPH.DEGREE", g.degree("val_graph", alice).await);
-        assert_eq_or_fail!("DEGREE=1", deg, 1i64);
 
         let plan = check!(
             "GRAPH.EXPLAIN",

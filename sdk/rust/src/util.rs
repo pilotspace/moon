@@ -213,19 +213,36 @@ pub fn parse_neighbors(raw: Value) -> Vec<(i64, i64, String, f64)> {
         Value::Array(a) => a,
         _ => return vec![],
     };
-    arr.into_iter()
-        .filter_map(|item| {
-            if let Value::Array(fields) = item {
-                let src = value_to_i64(fields.first()?)?;
-                let dst = value_to_i64(fields.get(1)?)?;
-                let etype = value_to_string(fields.get(2)?);
-                let weight = value_to_f64(fields.get(3)?).unwrap_or(1.0);
-                Some((src, dst, etype, weight))
-            } else {
-                None
+    // Server returns alternating [edge_map, node_map, ...].
+    // Edge maps have "src"/"dst" keys; node maps have "label". We collect edges only.
+    let mut results = Vec::new();
+    for item in arr {
+        let pairs: Vec<(String, &Value)> = match &item {
+            Value::Map(m) => m.iter().map(|(k, v)| (value_to_string(k), v)).collect(),
+            Value::Array(f) if f.len() % 2 == 0 => f
+                .chunks_exact(2)
+                .map(|c| (value_to_string(&c[0]), &c[1]))
+                .collect(),
+            _ => continue,
+        };
+        // Use item references via temporary; re-derive from item itself.
+        let get = |key: &str| -> Option<Value> {
+            match &item {
+                Value::Map(m) => m.iter().find(|(k, _)| value_to_string(k) == key).map(|(_, v)| v.clone()),
+                Value::Array(f) => f.chunks_exact(2).find(|c| value_to_string(&c[0]) == key).map(|c| c[1].clone()),
+                _ => None,
             }
-        })
-        .collect()
+        };
+        let _ = pairs; // used for detection above
+        let Some(src_v) = get("src") else { continue };
+        let Some(dst_v) = get("dst") else { continue };
+        let Some(src) = value_to_i64(&src_v) else { continue };
+        let Some(dst) = value_to_i64(&dst_v) else { continue };
+        let edge_type = get("type").as_ref().map(value_to_string).unwrap_or_default();
+        let weight = get("weight").as_ref().and_then(value_to_f64).unwrap_or(1.0);
+        results.push((src, dst, edge_type, weight));
+    }
+    results
 }
 
 // ── FT.AGGREGATE response ────────────────────────────────────────────────────

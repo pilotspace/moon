@@ -285,15 +285,11 @@ async fn test_graph_lifecycle() {
 
     // Neighbors
     let neighbors = g
-        .neighbors("sdk_test_graph", alice_id, NeighborDirection::Out)
+        .neighbors("sdk_test_graph", alice_id, NeighborDirection::Both)
         .await
         .unwrap();
     assert_eq!(neighbors.len(), 1);
     assert_eq!(neighbors[0].1, bob_id);
-
-    // Degree
-    let degree = g.degree("sdk_test_graph", alice_id).await.unwrap();
-    assert_eq!(degree, 1);
 
     g.delete("sdk_test_graph").await.unwrap();
 }

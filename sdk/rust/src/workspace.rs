@@ -43,8 +43,21 @@ impl WorkspaceClient {
     }
 
     /// List all workspace IDs.
+    ///
+    /// The server returns `[[id, name, created_at], ...]`; this extracts just the IDs.
     pub async fn list(&mut self) -> Result<Vec<String>> {
-        Ok(redis::cmd("WS").arg("LIST").query_async(&mut self.conn).await?)
+        let raw: redis::Value = redis::cmd("WS").arg("LIST").query_async(&mut self.conn).await?;
+        let entries = match raw {
+            redis::Value::Array(a) => a,
+            _ => return Ok(vec![]),
+        };
+        Ok(entries
+            .into_iter()
+            .filter_map(|entry| match entry {
+                redis::Value::Array(fields) => fields.first().map(crate::util::value_to_string),
+                _ => None,
+            })
+            .collect())
     }
 }
 
