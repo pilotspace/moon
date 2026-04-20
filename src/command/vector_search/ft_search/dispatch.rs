@@ -99,9 +99,10 @@ pub fn ft_search(
                 count: limit_count,
             };
             crate::vector::metrics::increment_search();
-            // v0.1.9 HYB-02: thread the resolved AS_OF LSN through the hybrid
-            // path (closes Lunaris V2 gap). The dense branch honors the snapshot;
-            // BM25 filtering by AS_OF is deferred to v0.2 text-index-mvcc.
+            // BM25 AS_OF threaded through execute_query_on_index_as_of per Phase 170
+            // / v0.1.10 G-1. Both dense and BM25 streams honor the snapshot via
+            // TextIndex::is_doc_visible_at. Text-index MVCC upsert-chain remains a
+            // Phase 178 (MVCC-01) follow-up.
             return crate::command::vector_search::hybrid::execute_hybrid_search_local(
                 store, ts, &hq, as_of_lsn,
             );

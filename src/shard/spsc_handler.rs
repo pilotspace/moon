@@ -1231,7 +1231,8 @@ pub(crate) fn handle_shard_message_shared(
                 // Phase 171 HYB-02 / SCAT-02: forward the coordinator-resolved
                 // AS_OF LSN into the raw-streams executor so the dense branch
                 // applies MVCC filtering consistently across shards. BM25
-                // remains AS_OF-unaware until text-index MVCC ships (v0.2).
+                // AS_OF coherent post-G-1 (v0.1.10); text-index MVCC upsert-chain
+                // pending Phase 178 (MVCC-01).
                 crate::command::vector_search::hybrid_multi::execute_hybrid_search_local_raw_streams(
                     vector_store,
                     &text_guard,
