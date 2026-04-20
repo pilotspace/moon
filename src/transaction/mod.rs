@@ -17,6 +17,43 @@ pub use undo_log::{UndoLog, UndoRecord};
 use bytes::Bytes;
 use smallvec::SmallVec;
 
+// Phase 174 FIX-01: Graph undo operations for SET/DELETE/MERGE rollback.
+#[cfg(feature = "graph")]
+use crate::graph::types::PropertyValue;
+
+/// Phase 174 FIX-01: Graph undo operation — reverses a Cypher SET, DELETE, or
+/// MERGE ON MATCH SET that was applied to write_buf during execute_mut.
+///
+/// Processed by `abort_cross_store_txn` in LIFO order (after existing
+/// `graph_intents` which handle CreateNode/CreateEdge removal).
+#[cfg(feature = "graph")]
+#[derive(Debug, Clone)]
+pub enum GraphUndoOp {
+    /// Restore a property to its pre-SET value. `old_value = None` means the
+    /// property did not exist before SET and should be removed on rollback.
+    RestoreProperty {
+        graph_name: Bytes,
+        entity_id: u64,
+        is_node: bool,
+        prop_key: u16,
+        old_value: Option<PropertyValue>,
+    },
+    /// Un-soft-delete a node (set `deleted_lsn = u64::MAX`) and restore live
+    /// count. The `delete_lsn` field records the LSN used for the soft-delete
+    /// so we can also un-soft-delete incident edges deleted at the same LSN.
+    UndeleteNode {
+        graph_name: Bytes,
+        node_id: u64,
+        delete_lsn: u64,
+    },
+    /// Un-soft-delete an edge (set `deleted_lsn = u64::MAX`) and restore live
+    /// count.
+    UndeleteEdge {
+        graph_name: Bytes,
+        edge_id: u64,
+    },
+}
+
 /// Type alias for unified LSN across all stores.
 pub type UnifiedLsn = u64;
 
@@ -69,6 +106,10 @@ pub struct CrossStoreTxn {
     pub vector_intents: SmallVec<[VectorIntent; 8]>,
     /// Graph entity_ids modified in this transaction.
     pub graph_intents: SmallVec<[GraphIntent; 8]>,
+    /// Phase 174 FIX-01: Graph undo operations for SET/DELETE/MERGE rollback.
+    /// Processed in LIFO order by abort_cross_store_txn AFTER graph_intents.
+    #[cfg(feature = "graph")]
+    pub graph_undo: Vec<GraphUndoOp>,
     /// MQ messages to enqueue on commit.
     pub mq_intents: SmallVec<[MqIntent; 4]>,
 }
@@ -83,6 +124,8 @@ impl CrossStoreTxn {
             kv_undo: UndoLog::new(),
             vector_intents: SmallVec::new(),
             graph_intents: SmallVec::new(),
+            #[cfg(feature = "graph")]
+            graph_undo: Vec::new(),
             mq_intents: SmallVec::new(),
         }
     }
@@ -129,6 +172,14 @@ impl CrossStoreTxn {
         });
     }
 
+    /// Phase 174 FIX-01: Record a graph undo operation for SET/DELETE/MERGE
+    /// rollback. Processed in LIFO order by `abort_cross_store_txn`.
+    #[cfg(feature = "graph")]
+    #[inline]
+    pub fn record_graph_undo(&mut self, op: GraphUndoOp) {
+        self.graph_undo.push(op);
+    }
+
     /// Record an MQ publish intent (MQ.PUBLISH inside TXN).
     #[inline]
     pub fn record_mq(&mut self, queue_key: Bytes, fields: Vec<(Bytes, Bytes)>) {
@@ -141,6 +192,12 @@ impl CrossStoreTxn {
         !self.kv_undo.is_empty()
             || !self.vector_intents.is_empty()
             || !self.graph_intents.is_empty()
+            || {
+                #[cfg(feature = "graph")]
+                { !self.graph_undo.is_empty() }
+                #[cfg(not(feature = "graph"))]
+                { false }
+            }
             || !self.mq_intents.is_empty()
     }
 

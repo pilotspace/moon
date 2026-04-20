@@ -254,6 +254,43 @@ impl MemGraph {
         self.live_edge_count
     }
 
+    /// Phase 174 FIX-01: Increment live node count (used by TXN.ABORT
+    /// un-soft-delete to restore the count decremented by `remove_node`).
+    #[inline]
+    pub fn inc_live_node_count(&mut self) {
+        self.live_node_count += 1;
+    }
+
+    /// Phase 174 FIX-01: Increment live edge count (used by TXN.ABORT
+    /// un-soft-delete to restore the count decremented by `remove_edge`).
+    #[inline]
+    pub fn inc_live_edge_count(&mut self) {
+        self.live_edge_count += 1;
+    }
+
+    /// Phase 174 FIX-01: Un-soft-delete all incident edges of `node` that
+    /// were cascade-deleted at `lsn` by `remove_node`. Restores `deleted_lsn`
+    /// to `u64::MAX` and increments `live_edge_count` for each restored edge.
+    pub fn undelete_edges_at_lsn(&mut self, node: NodeKey, lsn: u64) {
+        let Some(n) = self.nodes.get(node) else {
+            return;
+        };
+        let edge_keys: SmallVec<[EdgeKey; 16]> = n
+            .outgoing
+            .iter()
+            .chain(n.incoming.iter())
+            .copied()
+            .collect();
+        for ek in edge_keys {
+            if let Some(edge) = self.edges.get_mut(ek) {
+                if edge.deleted_lsn == lsn {
+                    edge.deleted_lsn = u64::MAX;
+                    self.live_edge_count += 1;
+                }
+            }
+        }
+    }
+
     /// Whether the MemGraph should be frozen (threshold reached).
     pub fn should_freeze(&self) -> bool {
         self.live_edge_count >= self.edge_threshold && !self.frozen

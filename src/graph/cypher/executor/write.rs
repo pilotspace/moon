@@ -45,8 +45,7 @@ pub fn execute_mut(
             PhysicalOp::Expand {
                 source,
                 target,
-                edge_variable: _, // write-path Expand is used for MATCH-before-SET;
-                // edge-var binding is a read-side concern (CYP-06).
+                edge_variable,
                 edge_types,
                 direction,
                 min_hops,
@@ -83,6 +82,12 @@ pub fn execute_mut(
                             }
                             let mut new_row = row.clone();
                             new_row.insert(target.clone(), Value::Node(neighbor_key));
+                            // Phase 174 FIX-01: bind edge variable so DELETE r
+                            // can reference it. Previously ignored (`_`), which
+                            // made `DELETE r` a silent no-op.
+                            if let Some(evar) = edge_variable {
+                                new_row.insert(evar.clone(), Value::Edge(edge_key));
+                            }
                             new_rows.push(new_row);
                         }
                     } else {
@@ -360,6 +365,20 @@ pub fn execute_mut(
                                     if let Some(pv) = value_to_property_value(&val) {
                                         let pid = label_to_id(property.as_bytes());
                                         if let Some(node) = graph.write_buf.get_node_mut(*nk) {
+                                            // Phase 174 FIX-01: snapshot old value BEFORE
+                                            // mutating so TXN.ABORT can restore it.
+                                            let old_value = node
+                                                .properties
+                                                .iter()
+                                                .find(|(k, _)| *k == pid)
+                                                .map(|(_, v)| v.clone());
+                                            mutations.push(MutationRecord::SetProperty {
+                                                entity_id: nk.data().as_ffi(),
+                                                is_node: true,
+                                                key: pid,
+                                                old_value,
+                                            });
+
                                             // Update existing or append.
                                             let mut found = false;
                                             for entry in node.properties.iter_mut() {
@@ -399,10 +418,36 @@ pub fn execute_mut(
                         let val = eval_expr(expr, row, &graph.write_buf, params);
                         match val {
                             Value::Node(nk) => {
+                                // Phase 174 FIX-01: snapshot node state BEFORE
+                                // soft-delete so TXN.ABORT can un-delete.
+                                if let Some(node) = graph.write_buf.get_node(nk) {
+                                    if node.deleted_lsn == u64::MAX {
+                                        mutations.push(MutationRecord::DeleteNode {
+                                            node_id: nk.data().as_ffi(),
+                                            labels: node.labels.clone(),
+                                            properties: node.properties.clone(),
+                                            embedding: node.embedding.clone(),
+                                        });
+                                    }
+                                }
                                 graph.write_buf.remove_node(nk, lsn);
                                 nodes_deleted += 1;
                             }
                             Value::Edge(ek) => {
+                                // Phase 174 FIX-01: snapshot edge state BEFORE
+                                // soft-delete so TXN.ABORT can un-delete.
+                                if let Some(edge) = graph.write_buf.get_edge(ek) {
+                                    if edge.deleted_lsn == u64::MAX {
+                                        mutations.push(MutationRecord::DeleteEdge {
+                                            edge_id: ek.data().as_ffi(),
+                                            src_id: edge.src.data().as_ffi(),
+                                            dst_id: edge.dst.data().as_ffi(),
+                                            edge_type: edge.edge_type,
+                                            weight: edge.weight,
+                                            properties: edge.properties.clone(),
+                                        });
+                                    }
+                                }
                                 graph.write_buf.remove_edge(ek, lsn);
                             }
                             _ => {}
@@ -477,6 +522,7 @@ pub fn execute_mut(
                                 &mut graph.write_buf,
                                 params,
                                 &mut properties_set,
+                                Some(&mut mutations),
                             );
                         } else {
                             // CREATE path: create node.
@@ -500,6 +546,7 @@ pub fn execute_mut(
                                 &mut graph.write_buf,
                                 params,
                                 &mut properties_set,
+                                None,
                             );
                         }
                     } else if !pattern.edges.is_empty() && pattern.nodes.len() >= 2 {
@@ -548,6 +595,7 @@ pub fn execute_mut(
                                         &mut graph.write_buf,
                                         params,
                                         &mut properties_set,
+                                        Some(&mut mutations),
                                     );
                                 } else {
                                     // Create edge.
@@ -580,6 +628,7 @@ pub fn execute_mut(
                                         &mut graph.write_buf,
                                         params,
                                         &mut properties_set,
+                                        None,
                                     );
                                 }
                             }
@@ -671,6 +720,7 @@ pub fn execute_mut(
                                     &mut graph.write_buf,
                                     params,
                                     &mut properties_set,
+                                    None,
                                 );
                             }
                         }
@@ -729,12 +779,18 @@ pub fn execute_mut(
 }
 
 /// Apply SET items (ON CREATE SET / ON MATCH SET) to a node in the row.
+///
+/// Phase 174 FIX-01: accepts an optional `mutations` vec to emit
+/// `MutationRecord::SetProperty` records for MERGE ON MATCH SET rollback.
+/// Pass `None` for ON CREATE SET paths (no rollback needed for freshly
+/// created nodes — they are removed entirely by the CreateNode intent).
 pub(crate) fn apply_set_items(
     items: &[SetItem],
     row: &Row,
     memgraph: &mut crate::graph::memgraph::MemGraph,
     params: &HashMap<String, Value>,
     properties_set: &mut u64,
+    mut mutations: Option<&mut Vec<MutationRecord>>,
 ) {
     for item in items {
         match item {
@@ -748,6 +804,21 @@ pub(crate) fn apply_set_items(
                     if let Some(pv) = value_to_property_value(&val) {
                         let pid = label_to_id(property.as_bytes());
                         if let Some(node) = memgraph.get_node_mut(*nk) {
+                            // Phase 174 FIX-01: snapshot old value for rollback.
+                            if let Some(muts) = mutations.as_mut() {
+                                let old_value = node
+                                    .properties
+                                    .iter()
+                                    .find(|(k, _)| *k == pid)
+                                    .map(|(_, v)| v.clone());
+                                muts.push(MutationRecord::SetProperty {
+                                    entity_id: nk.data().as_ffi(),
+                                    is_node: true,
+                                    key: pid,
+                                    old_value,
+                                });
+                            }
+
                             let mut found = false;
                             for entry in node.properties.iter_mut() {
                                 if entry.0 == pid {

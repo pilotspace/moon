@@ -2849,12 +2849,12 @@ pub(crate) async fn handle_connection_sharded_inner<
                     // --- GRAPH.* graph commands ---
                     #[cfg(feature = "graph")]
                     if cmd.len() > 6 && cmd[..6].eq_ignore_ascii_case(b"GRAPH.") {
-                        let (response, wal_records, cypher_intents) = if crate::command::graph::is_graph_write_cmd(cmd)
+                        let (response, wal_records, cypher_intents, cypher_undo_ops) = if crate::command::graph::is_graph_write_cmd(cmd)
                             || (cmd.eq_ignore_ascii_case(b"GRAPH.QUERY")
                                 && crate::command::graph::is_cypher_write_query(cmd_args))
                         {
                             let mut gs = ctx.shard_databases.graph_store_write(ctx.shard_id);
-                            let (resp, cypher_intents) = if cmd.eq_ignore_ascii_case(b"GRAPH.QUERY") {
+                            let (resp, cypher_intents, undo_ops) = if cmd.eq_ignore_ascii_case(b"GRAPH.QUERY") {
                                 // Phase 167 (CYP-01/02): capture Cypher-created
                                 // nodes/edges so TXN.ABORT can roll them back via
                                 // CrossStoreTxn::record_graph.
@@ -2863,14 +2863,15 @@ pub(crate) async fn handle_connection_sharded_inner<
                                 (
                                     crate::command::graph::dispatch_graph_write(&mut gs, cmd, cmd_args),
                                     Vec::new(),
+                                    Vec::new(),
                                 )
                             };
                             let records = gs.drain_wal();
-                            (resp, records, cypher_intents)
+                            (resp, records, cypher_intents, undo_ops)
                         } else {
                             let gs = ctx.shard_databases.graph_store_read(ctx.shard_id);
                             let resp = crate::command::graph::dispatch_graph_read(&gs, cmd, cmd_args);
-                            (resp, Vec::new(), Vec::new())
+                            (resp, Vec::new(), Vec::new(), Vec::new())
                         };
                         // Phase 166: record graph intent for TXN rollback.
                         // Captures explicit ADDNODE/ADDEDGE by response id plus
@@ -2892,6 +2893,10 @@ pub(crate) async fn handle_connection_sharded_inner<
                                         txn.record_graph(intent.entity_id, intent.is_node, gname.clone());
                                     }
                                 }
+                            }
+                            // Phase 174 FIX-01: push undo ops for SET/DELETE/MERGE rollback.
+                            for undo_op in cypher_undo_ops {
+                                txn.record_graph_undo(undo_op);
                             }
                         }
                         for record in wal_records {

@@ -450,6 +450,13 @@ pub fn graph_query_write(store: &mut GraphStore, args: &[Frame]) -> Frame {
                         properties.as_ref(),
                     ));
             }
+            // Phase 174 FIX-01: SET/DELETE/MERGE records are only relevant
+            // for TXN rollback (handled in graph_query_or_write). The non-txn
+            // path here does not need WAL records for these — the write_buf
+            // mutation is already durable via the forward WAL.
+            cypher::executor::MutationRecord::SetProperty { .. }
+            | cypher::executor::MutationRecord::DeleteNode { .. }
+            | cypher::executor::MutationRecord::DeleteEdge { .. } => {}
         }
     }
 
@@ -461,20 +468,22 @@ pub fn graph_query_write(store: &mut GraphStore, args: &[Frame]) -> Frame {
 /// Parses the Cypher query once, then dispatches to the read or write path
 /// based on whether the query contains write clauses.
 ///
-/// Returns `(Frame, Vec<GraphWriteIntent>)`. Read-only queries and failed
-/// write queries return an empty intent vector. Phase 167 (CYP-01/02) —
-/// handlers forward intents into `CrossStoreTxn::record_graph` so TXN.ABORT
-/// can roll back CREATE/MERGE-created entities via
-/// [`crate::transaction::abort::abort_cross_store_txn`].
+/// Returns `(Frame, Vec<GraphWriteIntent>, Vec<GraphUndoOp>)`. Read-only
+/// queries and failed write queries return empty vectors. Phase 167
+/// (CYP-01/02) — handlers forward intents into `CrossStoreTxn::record_graph`
+/// so TXN.ABORT can roll back CREATE/MERGE-created entities via
+/// [`crate::transaction::abort::abort_cross_store_txn`]. Phase 174 FIX-01
+/// adds `GraphUndoOp`s for SET/DELETE/MERGE rollback.
 pub fn graph_query_or_write(
     store: &mut GraphStore,
     args: &[Frame],
-) -> (Frame, Vec<cypher::executor::GraphWriteIntent>) {
+) -> (Frame, Vec<cypher::executor::GraphWriteIntent>, Vec<crate::transaction::GraphUndoOp>) {
     if args.len() < 2 {
         return (
             Frame::Error(Bytes::from_static(
                 b"ERR wrong number of arguments for 'GRAPH.QUERY' command",
             )),
+            Vec::new(),
             Vec::new(),
         );
     }
@@ -484,6 +493,7 @@ pub fn graph_query_or_write(
         None => {
             return (
                 Frame::Error(Bytes::from_static(b"ERR invalid graph name")),
+                Vec::new(),
                 Vec::new(),
             );
         }
@@ -495,6 +505,7 @@ pub fn graph_query_or_write(
             return (
                 Frame::Error(Bytes::from_static(b"ERR invalid Cypher query")),
                 Vec::new(),
+                Vec::new(),
             );
         }
     };
@@ -504,7 +515,7 @@ pub fn graph_query_or_write(
         Ok(q) => q,
         Err(e) => {
             let msg = format!("ERR Cypher parse error: {e}");
-            return (Frame::Error(Bytes::from(msg)), Vec::new());
+            return (Frame::Error(Bytes::from(msg)), Vec::new(), Vec::new());
         }
     };
 
@@ -515,6 +526,7 @@ pub fn graph_query_or_write(
             None => {
                 return (
                     Frame::Error(Bytes::from_static(b"ERR graph not found")),
+                    Vec::new(),
                     Vec::new(),
                 );
             }
@@ -532,7 +544,7 @@ pub fn graph_query_or_write(
                 Ok(p) => std::sync::Arc::new(p),
                 Err(e) => {
                     let msg = format!("ERR Cypher plan error: {e}");
-                    return (Frame::Error(Bytes::from(msg)), Vec::new());
+                    return (Frame::Error(Bytes::from(msg)), Vec::new(), Vec::new());
                 }
             };
             graph.plan_cache.lock().insert(query_hash, p.clone());
@@ -549,18 +561,18 @@ pub fn graph_query_or_write(
             Ok(r) => r,
             Err(e) => {
                 let msg = format!("ERR Cypher execution error: {e}");
-                return (Frame::Error(Bytes::from(msg)), Vec::new());
+                return (Frame::Error(Bytes::from(msg)), Vec::new(), Vec::new());
             }
         };
 
-        (exec_result_to_frame(&result), Vec::new())
+        (exec_result_to_frame(&result), Vec::new(), Vec::new())
     } else {
         // Write path: compile plan (no cache for writes), execute with mutations.
         let plan = match cypher::planner::compile(&query) {
             Ok(p) => p,
             Err(e) => {
                 let msg = format!("ERR Cypher plan error: {e}");
-                return (Frame::Error(Bytes::from(msg)), Vec::new());
+                return (Frame::Error(Bytes::from(msg)), Vec::new(), Vec::new());
             }
         };
 
@@ -573,6 +585,7 @@ pub fn graph_query_or_write(
                     return (
                         Frame::Error(Bytes::from_static(b"ERR graph not found")),
                         Vec::new(),
+                        Vec::new(),
                     );
                 }
             };
@@ -582,7 +595,7 @@ pub fn graph_query_or_write(
                 Ok(r) => r,
                 Err(e) => {
                     let msg = format!("ERR Cypher execution error: {e}");
-                    return (Frame::Error(Bytes::from(msg)), Vec::new());
+                    return (Frame::Error(Bytes::from(msg)), Vec::new(), Vec::new());
                 }
             }
         };
@@ -594,7 +607,11 @@ pub fn graph_query_or_write(
         let mut intents: Vec<cypher::executor::GraphWriteIntent> =
             Vec::with_capacity(result.mutations.len());
 
-        // Generate WAL records for mutations.
+        // Phase 174 FIX-01: collect undo ops for SET/DELETE/MERGE rollback.
+        let gname_bytes = Bytes::copy_from_slice(graph_name);
+        let mut undo_ops: Vec<crate::transaction::GraphUndoOp> = Vec::new();
+
+        // Generate WAL records for mutations + collect intents/undo ops.
         for mutation in &result.mutations {
             match mutation {
                 cypher::executor::MutationRecord::CreateNode {
@@ -641,10 +658,38 @@ pub fn graph_query_or_write(
                             properties.as_ref(),
                         ));
                 }
+                // Phase 174 FIX-01: new variants for SET/DELETE/MERGE rollback.
+                cypher::executor::MutationRecord::SetProperty {
+                    entity_id,
+                    is_node,
+                    key,
+                    old_value,
+                } => {
+                    undo_ops.push(crate::transaction::GraphUndoOp::RestoreProperty {
+                        graph_name: gname_bytes.clone(),
+                        entity_id: *entity_id,
+                        is_node: *is_node,
+                        prop_key: *key,
+                        old_value: old_value.clone(),
+                    });
+                }
+                cypher::executor::MutationRecord::DeleteNode { node_id, .. } => {
+                    undo_ops.push(crate::transaction::GraphUndoOp::UndeleteNode {
+                        graph_name: gname_bytes.clone(),
+                        node_id: *node_id,
+                        delete_lsn: lsn,
+                    });
+                }
+                cypher::executor::MutationRecord::DeleteEdge { edge_id, .. } => {
+                    undo_ops.push(crate::transaction::GraphUndoOp::UndeleteEdge {
+                        graph_name: gname_bytes.clone(),
+                        edge_id: *edge_id,
+                    });
+                }
             }
         }
 
-        (exec_result_to_frame(&result), intents)
+        (exec_result_to_frame(&result), intents, undo_ops)
     }
 }
 

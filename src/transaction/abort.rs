@@ -123,11 +123,138 @@ pub fn abort_cross_store_txn(
     }
 
     // ------------------------------------------------------------------
-    // 2. Graph rollback — iterate intents in REVERSE (LIFO) so edges are
-    //    removed before their endpoint nodes. Gated on the `graph`
-    //    feature: the `graph_intents` field exists unconditionally on
-    //    `CrossStoreTxn`, but the MemGraph types and GraphStore accessor
-    //    only compile with `--features graph`.
+    // 2a. Phase 174 FIX-01: Graph undo — reverse SET/DELETE/MERGE mutations
+    //     in LIFO order BEFORE removing created entities (section 2b). This
+    //     ensures property restores on existing nodes happen before any
+    //     newly-created nodes are removed.
+    // ------------------------------------------------------------------
+    #[cfg(feature = "graph")]
+    {
+        if !txn.graph_undo.is_empty() {
+            let mut gs = shard_databases.graph_store_write(shard_id);
+            for undo_op in txn.graph_undo.iter().rev() {
+                match undo_op {
+                    crate::transaction::GraphUndoOp::RestoreProperty {
+                        graph_name,
+                        entity_id,
+                        is_node,
+                        prop_key,
+                        old_value,
+                    } => {
+                        let Some(graph) = gs.get_graph_mut(graph_name) else {
+                            tracing::warn!(
+                                txn_id,
+                                graph_name = ?graph_name,
+                                "txn abort: graph missing for RestoreProperty undo, skipping",
+                            );
+                            continue;
+                        };
+                        if *is_node {
+                            let nk = NodeKey::from(slotmap::KeyData::from_ffi(*entity_id));
+                            if let Some(node) = graph.write_buf.get_node_mut(nk) {
+                                match old_value {
+                                    Some(val) => {
+                                        // Restore old value.
+                                        let mut found = false;
+                                        for entry in node.properties.iter_mut() {
+                                            if entry.0 == *prop_key {
+                                                entry.1 = val.clone();
+                                                found = true;
+                                                break;
+                                            }
+                                        }
+                                        if !found {
+                                            node.properties.push((*prop_key, val.clone()));
+                                        }
+                                    }
+                                    None => {
+                                        // Property did not exist before SET — remove it.
+                                        node.properties.retain(|(k, _)| *k != *prop_key);
+                                    }
+                                }
+                            }
+                        } else {
+                            let ek = EdgeKey::from(slotmap::KeyData::from_ffi(*entity_id));
+                            if let Some(edge) = graph.write_buf.get_edge_mut(ek) {
+                                if let Some(ref mut props) = edge.properties {
+                                    match old_value {
+                                        Some(val) => {
+                                            let mut found = false;
+                                            for entry in props.iter_mut() {
+                                                if entry.0 == *prop_key {
+                                                    entry.1 = val.clone();
+                                                    found = true;
+                                                    break;
+                                                }
+                                            }
+                                            if !found {
+                                                props.push((*prop_key, val.clone()));
+                                            }
+                                        }
+                                        None => {
+                                            props.retain(|(k, _)| *k != *prop_key);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    crate::transaction::GraphUndoOp::UndeleteNode {
+                        graph_name,
+                        node_id,
+                        delete_lsn,
+                    } => {
+                        let Some(graph) = gs.get_graph_mut(graph_name) else {
+                            tracing::warn!(
+                                txn_id,
+                                graph_name = ?graph_name,
+                                "txn abort: graph missing for UndeleteNode undo, skipping",
+                            );
+                            continue;
+                        };
+                        let nk = NodeKey::from(slotmap::KeyData::from_ffi(*node_id));
+                        if let Some(node) = graph.write_buf.get_node_mut(nk) {
+                            if node.deleted_lsn == *delete_lsn {
+                                node.deleted_lsn = u64::MAX;
+                                graph.write_buf.inc_live_node_count();
+                            }
+                        }
+                        // Un-soft-delete incident edges that were cascade-deleted
+                        // at the same LSN by remove_node.
+                        graph.write_buf.undelete_edges_at_lsn(nk, *delete_lsn);
+                    }
+                    crate::transaction::GraphUndoOp::UndeleteEdge {
+                        graph_name,
+                        edge_id,
+                    } => {
+                        let Some(graph) = gs.get_graph_mut(graph_name) else {
+                            tracing::warn!(
+                                txn_id,
+                                graph_name = ?graph_name,
+                                "txn abort: graph missing for UndeleteEdge undo, skipping",
+                            );
+                            continue;
+                        };
+                        let ek = EdgeKey::from(slotmap::KeyData::from_ffi(*edge_id));
+                        if let Some(edge) = graph.write_buf.get_edge_mut(ek) {
+                            if edge.deleted_lsn != u64::MAX {
+                                edge.deleted_lsn = u64::MAX;
+                                graph.write_buf.inc_live_edge_count();
+                            }
+                        }
+                    }
+                }
+            }
+            // gs guard drops — release graph_store_write before section 2b.
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // 2b. Graph rollback — iterate intents in REVERSE (LIFO) so edges are
+    //     removed before their endpoint nodes. Gated on the `graph`
+    //     feature: the `graph_intents` field exists unconditionally on
+    //     `CrossStoreTxn`, but the MemGraph types and GraphStore accessor
+    //     only compile with `--features graph`.
     // ------------------------------------------------------------------
     #[cfg(feature = "graph")]
     {

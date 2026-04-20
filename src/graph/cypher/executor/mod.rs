@@ -78,7 +78,8 @@ pub struct ProfileResult {
     pub operator_profiles: Vec<OpProfile>,
 }
 
-/// Record of a mutation performed during execute_mut, used for WAL generation.
+/// Record of a mutation performed during execute_mut, used for WAL generation
+/// and TXN.ABORT rollback (Phase 174 FIX-01).
 #[derive(Debug)]
 pub enum MutationRecord {
     CreateNode {
@@ -88,6 +89,35 @@ pub enum MutationRecord {
         embedding: Option<Vec<f32>>,
     },
     CreateEdge {
+        edge_id: u64,
+        src_id: u64,
+        dst_id: u64,
+        edge_type: u16,
+        weight: f64,
+        properties: Option<PropertyMap>,
+    },
+    // --- Phase 174 FIX-01: SET / DELETE / MERGE rollback records ---
+    /// Property was changed by Cypher SET. `old_value` is the pre-SET value
+    /// (None = property did not exist before SET and should be removed on
+    /// rollback).
+    SetProperty {
+        entity_id: u64,
+        is_node: bool,
+        key: u16,
+        old_value: Option<PropertyValue>,
+    },
+    /// Node was soft-deleted by Cypher DETACH DELETE. Snapshot captures the
+    /// full node state so rollback can un-soft-delete the node and its
+    /// incident edges.
+    DeleteNode {
+        node_id: u64,
+        labels: SmallVec<[u16; 4]>,
+        properties: PropertyMap,
+        embedding: Option<Vec<f32>>,
+    },
+    /// Edge was soft-deleted by Cypher DELETE r. Snapshot captures the full
+    /// edge state so rollback can un-soft-delete the edge.
+    DeleteEdge {
         edge_id: u64,
         src_id: u64,
         dst_id: u64,
