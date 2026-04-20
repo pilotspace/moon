@@ -483,23 +483,42 @@ def _to_str(val: Any) -> str:
 def _parse_neighbors(raw: Any) -> List[GraphNode]:
     """Parse GRAPH.NEIGHBORS response.
 
-    Expects a list of [node_id, label, [prop_key, prop_val, ...], ...]
+    Server returns alternating [edge_map, node_map, ...] as flat key-value arrays.
+    Edge maps have b'src'/b'dst' keys; node maps have b'labels' key.
+    We return the neighbor node entries.
     """
     if not isinstance(raw, list):
         return []
 
+    def _flat_kv(item: list) -> Dict[str, Any]:
+        kv: Dict[str, Any] = {}
+        i = 0
+        while i + 1 < len(item):
+            k = _to_str(item[i])
+            kv[k] = item[i + 1]
+            i += 2
+        return kv
+
     nodes: List[GraphNode] = []
     for item in raw:
-        if isinstance(item, list) and len(item) >= 2:
-            node_id = int(item[0])
-            label = _to_str(item[1])
-            props: Dict[str, str] = {}
-            if len(item) > 2 and isinstance(item[2], list):
-                j = 0
-                while j + 1 < len(item[2]):
-                    props[_to_str(item[2][j])] = _to_str(item[2][j + 1])
-                    j += 2
-            nodes.append(GraphNode(node_id=node_id, label=label, properties=props))
+        if not isinstance(item, list) or len(item) < 2:
+            continue
+        kv = _flat_kv(item)
+        # Node entries have 'labels' key; edge entries have 'src'/'dst'
+        if "labels" not in kv:
+            continue
+        try:
+            node_id = int(kv.get("id", 0))
+        except (TypeError, ValueError):
+            continue
+        props: Dict[str, str] = {}
+        props_raw = kv.get("properties", [])
+        if isinstance(props_raw, list):
+            j = 0
+            while j + 1 < len(props_raw):
+                props[_to_str(props_raw[j])] = _to_str(props_raw[j + 1])
+                j += 2
+        nodes.append(GraphNode(node_id=node_id, label="", properties=props))
 
     return nodes
 
