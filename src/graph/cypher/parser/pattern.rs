@@ -228,11 +228,19 @@ impl<'a> Parser<'a> {
         self.expect_token_match(|t| matches!(t, Token::RParen), ")")?;
 
         // The edge MUST be variable-length for shortestPath.
+        // FIX-06: reject min_hops > 1 (Phase 179 will plumb it through Dijkstra).
         let max_hops = match edge.var_length {
-            Some((_, max)) => max,
+            Some((min, max)) if min <= 1 => max,
+            Some((_min, _max)) => {
+                return Err(CypherError::UnsupportedFeature {
+                    offset: tok.span.start,
+                    feature: "shortestPath() with min_hops > 1",
+                    tracked: "Phase 179 MVCC-02 — full min_hops plumb-through",
+                });
+            }
             None => {
                 return Err(CypherError::UnexpectedToken {
-                    offset: 0,
+                    offset: tok.span.start,
                     expected: "variable-length edge (e.g. -[*..6]-)",
                     found: "fixed-length edge".to_string(),
                 });

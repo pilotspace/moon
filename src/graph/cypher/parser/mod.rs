@@ -28,6 +28,12 @@ pub enum CypherError {
     NestingDepthExceeded { limit: u32 },
     /// Invalid numeric literal.
     InvalidNumber { offset: usize, value: String },
+    /// Feature recognized but not yet implemented (CYP-06).
+    UnsupportedFeature {
+        offset: usize,
+        feature: &'static str,
+        tracked: &'static str,
+    },
     /// Empty query.
     EmptyQuery,
 }
@@ -51,6 +57,16 @@ impl core::fmt::Display for CypherError {
             }
             Self::InvalidNumber { offset, value } => {
                 write!(f, "invalid number at {offset}: '{value}'")
+            }
+            Self::UnsupportedFeature {
+                offset,
+                feature,
+                tracked,
+            } => {
+                write!(
+                    f,
+                    "unsupported feature at {offset}: {feature}. Tracked: {tracked}"
+                )
             }
             Self::EmptyQuery => write!(f, "empty query"),
         }
