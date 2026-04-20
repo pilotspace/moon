@@ -8,7 +8,7 @@
 //! MOON_TEST_URL=redis://127.0.0.1:6399 cargo test --test integration
 //! ```
 
-use moon_client::{
+use moon::{
     DistanceMetric, MoonClient, NeighborDirection, VectorIndexOptions, types::encode_vector,
 };
 
@@ -331,7 +331,7 @@ async fn test_graph_explain() {
 fn vector_encode_decode_roundtrip() {
     let original = vec![0.1_f32, -0.5, 1.23456, f32::MIN_POSITIVE];
     let encoded = encode_vector(&original);
-    let decoded = moon_client::decode_vector(&encoded).unwrap();
+    let decoded = moon::decode_vector(&encoded).unwrap();
     for (a, b) in original.iter().zip(decoded.iter()) {
         assert!((a - b).abs() < 1e-7, "mismatch: {a} vs {b}");
     }
@@ -340,5 +340,5 @@ fn vector_encode_decode_roundtrip() {
 #[test]
 fn vector_decode_invalid_length() {
     let bad = vec![0u8, 1, 2]; // 3 bytes — not a multiple of 4
-    assert!(moon_client::decode_vector(&bad).is_err());
+    assert!(moon::decode_vector(&bad).is_err());
 }

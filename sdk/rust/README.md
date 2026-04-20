@@ -14,14 +14,14 @@ Async Rust client for [Moon](https://github.com/pilotspace/moon) — a high-perf
 
 ```toml
 [dependencies]
-moon-client = "0.1"
+moon = "0.1"
 tokio = { version = "1", features = ["full"] }
 ```
 
 ## Quick Start
 
 ```rust
-use moon_client::{MoonClient, Result, VectorIndexOptions, DistanceMetric};
+use moon::{MoonClient, Result, VectorIndexOptions, DistanceMetric};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -63,8 +63,8 @@ async fn main() -> Result<()> {
 ### Vector Search (FT.*)
 
 ```rust
-use moon_client::{VectorIndexOptions, DistanceMetric};
-use moon_client::types::encode_vector;
+use moon::{VectorIndexOptions, DistanceMetric};
+use moon::types::encode_vector;
 
 let mut v = client.vector();
 
@@ -109,7 +109,7 @@ v.drop_index("docs", true).await?;
 ### Graph Engine (GRAPH.*)
 
 ```rust
-use moon_client::NeighborDirection;
+use moon::NeighborDirection;
 
 let mut g = client.graph();
 g.create("knowledge").await?;
@@ -185,7 +185,7 @@ client.txn_rollback().await?;
 > Requires Moon built with `text-index` (default since v0.1.10).
 
 ```rust
-use moon_client::types::SchemaField;
+use moon::types::SchemaField;
 
 let mut text = client.text();
 
@@ -204,7 +204,7 @@ for h in &hits {
 }
 
 // Facet aggregation
-use moon_client::types::{Reducer, AggregateRow};
+use moon::types::{Reducer, AggregateRow};
 let rows: Vec<AggregateRow> = text.aggregate(
     "articles",
     "*",

@@ -27,10 +27,10 @@ macro_rules! cmd {
 ///
 /// # Example
 /// ```no_run
-/// use moon_client::MoonClient;
+/// use moon::MoonClient;
 ///
 /// #[tokio::main]
-/// async fn main() -> moon_client::Result<()> {
+/// async fn main() -> moon::Result<()> {
 ///     let mut client = MoonClient::connect("redis://127.0.0.1:6399").await?;
 ///     client.set("hello", "world").await?;
 ///     let v: String = client.get("hello").await?;

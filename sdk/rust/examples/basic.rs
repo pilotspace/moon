@@ -2,7 +2,7 @@
 //!
 //! Run: `cargo run --example basic`
 
-use moon_client::{MoonClient, Result};
+use moon::{MoonClient, Result};
 
 #[tokio::main]
 async fn main() -> Result<()> {

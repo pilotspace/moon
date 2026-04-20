@@ -8,10 +8,10 @@ use crate::util::{parse_cache_search_results, parse_index_info, parse_search_res
 ///
 /// # Example
 /// ```no_run
-/// use moon_client::{MoonClient, types::{VectorIndexOptions, DistanceMetric}};
+/// use moon::{MoonClient, types::{VectorIndexOptions, DistanceMetric}};
 ///
 /// #[tokio::main]
-/// async fn main() -> moon_client::Result<()> {
+/// async fn main() -> moon::Result<()> {
 ///     let client = MoonClient::connect("redis://127.0.0.1:6399").await?;
 ///     let mut v = client.vector();
 ///     v.create_index("idx", VectorIndexOptions::new(384, DistanceMetric::Cosine)).await?;

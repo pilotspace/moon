@@ -7,8 +7,8 @@
 //! ## Quick start
 //!
 //! ```no_run
-//! use moon_client::{MoonClient, Result};
-//! use moon_client::types::{VectorIndexOptions, DistanceMetric};
+//! use moon::{MoonClient, Result};
+//! use moon::types::{VectorIndexOptions, DistanceMetric};
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<()> {

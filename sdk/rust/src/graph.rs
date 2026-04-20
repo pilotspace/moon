@@ -8,10 +8,10 @@ use crate::util::{parse_query_result, value_to_i64};
 ///
 /// # Example
 /// ```no_run
-/// use moon_client::MoonClient;
+/// use moon::MoonClient;
 ///
 /// #[tokio::main]
-/// async fn main() -> moon_client::Result<()> {
+/// async fn main() -> moon::Result<()> {
 ///     let client = MoonClient::connect("redis://127.0.0.1:6399").await?;
 ///     let mut g = client.graph();
 ///     g.create("social").await?;

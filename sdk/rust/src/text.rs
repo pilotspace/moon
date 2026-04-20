@@ -82,7 +82,7 @@ impl TextClient {
     ///
     /// # Example
     /// ```no_run
-    /// use moon_client::types::Reducer;
+    /// use moon::types::Reducer;
     /// let rows = client.text().aggregate(
     ///     "docs",
     ///     "*",

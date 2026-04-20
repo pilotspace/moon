@@ -2,7 +2,7 @@
 //!
 //! Run: `cargo run --example vector_search`
 
-use moon_client::{
+use moon::{
     DistanceMetric, MoonClient, Result, SchemaField, VectorIndexOptions, encode_vector,
 };
 
