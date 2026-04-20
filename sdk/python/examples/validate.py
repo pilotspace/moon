@@ -430,9 +430,10 @@ def validate_text(c: MoonClient) -> None:
     if hits is not None:
         _pass("text_search returned", f"count={len(hits)}")
 
-    hits_all = check("text_search match-all", lambda: c.text.text_search(idx, "*"))
+    # BM25 does not support bare '*' — use a prefix wildcard that matches all tokens
+    hits_all = check("text_search prefix wildcard", lambda: c.text.text_search(idx, "moon*"))
     if hits_all is not None:
-        _pass("text_search match-all", f"count={len(hits_all)}")
+        _pass("text_search prefix wildcard", f"count={len(hits_all)}")
 
     agg_rows = check(
         "FT.AGGREGATE",
@@ -456,15 +457,16 @@ def validate_text(c: MoonClient) -> None:
     except Exception:
         pass
 
+    # Hybrid index: use vector.create_index with extra_schema to add TEXT field before VECTOR
     check(
         "FT.CREATE hybrid index",
-        lambda: c.text.create_text_index(
+        lambda: c.vector.create_index(
             hidx,
-            [
-                ("title", "TEXT", {}),
-                ("vec", "VECTOR", {}),
-            ],
             prefix="hdoc:",
+            dim=4,
+            metric="COSINE",
+            compact_threshold=100,
+            extra_schema=["title", "TEXT"],
         ),
     )
 

@@ -95,7 +95,7 @@ levenshtein_automata = { version = "0.2", features = ["fst_automaton"], optional
 #   cargo build                                                    # Monoio on Linux/macOS
 #   cargo build --no-default-features --features runtime-tokio,jemalloc   # force Tokio
 #   cargo build --no-default-features --features runtime-monoio,jemalloc  # force Monoio
-default = ["runtime-monoio", "jemalloc", "graph"]
+default = ["runtime-monoio", "jemalloc", "graph", "text-index"]
 jemalloc = ["dep:tikv-jemallocator"]
 runtime-tokio = ["tokio/rt-multi-thread", "tokio/io-util", "tokio/signal", "tokio/time", "tokio/fs", "tokio/process", "dep:tokio-util", "dep:tokio-rustls", "dep:aws-lc-rs", "dep:rustls", "rustls/aws_lc_rs", "dep:rustls-pemfile"]
 runtime-monoio = ["dep:monoio", "dep:monoio-rustls", "dep:aws-lc-rs", "dep:rustls", "rustls/aws_lc_rs", "dep:rustls-pemfile"]
