@@ -1,5 +1,5 @@
-use std::collections::HashMap;
 use crate::error::{MoonError, Result};
+use std::collections::HashMap;
 
 // ── Vector encoding ─────────────────────────────────────────────────────────
 
@@ -227,7 +227,12 @@ impl Reducer {
             Self::Min(f) => vec!["REDUCE".into(), "MIN".into(), "1".into(), f.clone()],
             Self::Max(f) => vec!["REDUCE".into(), "MAX".into(), "1".into(), f.clone()],
             Self::CountDistinct(f) => {
-                vec!["REDUCE".into(), "COUNT_DISTINCT".into(), "1".into(), f.clone()]
+                vec![
+                    "REDUCE".into(),
+                    "COUNT_DISTINCT".into(),
+                    "1".into(),
+                    f.clone(),
+                ]
             }
         }
     }

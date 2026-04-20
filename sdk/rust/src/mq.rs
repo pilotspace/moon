@@ -16,11 +16,7 @@ impl MqClient {
     /// Create a message queue at `key`.
     ///
     /// - `max_delivery` — redelivery limit before moving to DLQ (default 3)
-    pub async fn create(
-        &mut self,
-        key: &str,
-        max_delivery: Option<usize>,
-    ) -> Result<()> {
+    pub async fn create(&mut self, key: &str, max_delivery: Option<usize>) -> Result<()> {
         let mut cmd = redis::cmd("MQ");
         cmd.arg("CREATE").arg(key);
         if let Some(n) = max_delivery {
@@ -32,8 +28,13 @@ impl MqClient {
 
     /// Push a message onto the queue. Returns the stream entry ID.
     pub async fn push(&mut self, key: &str, data: &[u8]) -> Result<String> {
-        Ok(redis::cmd("MQ").arg("PUSH").arg(key).arg("body").arg(data)
-            .query_async(&mut self.conn).await?)
+        Ok(redis::cmd("MQ")
+            .arg("PUSH")
+            .arg(key)
+            .arg("body")
+            .arg(data)
+            .query_async(&mut self.conn)
+            .await?)
     }
 
     /// Push a message onto a partitioned topic (`MQ.PUSH <topic> <partition> <payload>`).
@@ -89,22 +90,33 @@ impl MqClient {
     /// after successful processing to prevent redelivery.
     pub async fn pop(&mut self, key: &str, count: usize) -> Result<Vec<MqMessage>> {
         let raw: redis::Value = redis::cmd("MQ")
-            .arg("POP").arg(key).arg("COUNT").arg(count)
-            .query_async(&mut self.conn).await?;
+            .arg("POP")
+            .arg(key)
+            .arg("COUNT")
+            .arg(count)
+            .query_async(&mut self.conn)
+            .await?;
         Ok(parse_mq_messages(raw))
     }
 
     /// Acknowledge a message by its stream entry ID, removing it from the pending list.
     pub async fn ack(&mut self, key: &str, id: &str) -> Result<()> {
-        redis::cmd("MQ").arg("ACK").arg(key).arg(id)
-            .query_async::<()>(&mut self.conn).await?;
+        redis::cmd("MQ")
+            .arg("ACK")
+            .arg(key)
+            .arg(id)
+            .query_async::<()>(&mut self.conn)
+            .await?;
         Ok(())
     }
 
     /// Get the number of messages in the dead-letter queue for `key`.
     pub async fn dlq_len(&mut self, key: &str) -> Result<i64> {
-        Ok(redis::cmd("MQ").arg("DLQLEN").arg(key)
-            .query_async(&mut self.conn).await?)
+        Ok(redis::cmd("MQ")
+            .arg("DLQLEN")
+            .arg(key)
+            .query_async(&mut self.conn)
+            .await?)
     }
 
     /// Register a debounced trigger. When a message arrives at `key`, Moon
@@ -127,8 +139,13 @@ impl MqClient {
     /// Transactional publish — enqueues a message inside an open `TXN` block.
     /// Must be called between [`MoonClient::txn_begin`] and [`MoonClient::txn_commit`].
     pub async fn publish_txn(&mut self, key: &str, data: &[u8]) -> Result<()> {
-        redis::cmd("MQ").arg("PUBLISH").arg(key).arg("body").arg(data)
-            .query_async::<()>(&mut self.conn).await?;
+        redis::cmd("MQ")
+            .arg("PUBLISH")
+            .arg(key)
+            .arg("body")
+            .arg(data)
+            .query_async::<()>(&mut self.conn)
+            .await?;
         Ok(())
     }
 }
@@ -162,7 +179,11 @@ fn parse_mq_messages(raw: redis::Value) -> Vec<MqMessage> {
                     Some(redis::Value::BulkString(b)) => bytes::Bytes::from(b.clone()),
                     _ => bytes::Bytes::new(),
                 };
-                Some(MqMessage { id, data, delivery_count: 1 })
+                Some(MqMessage {
+                    id,
+                    data,
+                    delivery_count: 1,
+                })
             } else {
                 None
             }

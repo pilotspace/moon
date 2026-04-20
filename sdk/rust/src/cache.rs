@@ -33,9 +33,15 @@ impl CacheClient {
             .arg(index)
             .arg(cache_prefix)
             .arg(&query)
-            .arg("PARAMS").arg("2").arg("query_vec").arg(&blob)
-            .arg("THRESHOLD").arg(threshold)
-            .arg("FALLBACK").arg("KNN").arg(fallback_k)
+            .arg("PARAMS")
+            .arg("2")
+            .arg("query_vec")
+            .arg(&blob)
+            .arg("THRESHOLD")
+            .arg(threshold)
+            .arg("FALLBACK")
+            .arg("KNN")
+            .arg(fallback_k)
             .query_async(&mut self.conn)
             .await?;
         Ok(parse_cache_search_results(raw))
@@ -84,15 +90,13 @@ impl CacheClient {
     /// Scan for all cache entries matching a prefix pattern.
     ///
     /// Returns matching keys (not the full documents). Use `get_entry` for details.
-    pub async fn scan_keys(
-        &mut self,
-        pattern: &str,
-        count: usize,
-    ) -> Result<Vec<String>> {
+    pub async fn scan_keys(&mut self, pattern: &str, count: usize) -> Result<Vec<String>> {
         let (_, keys): (u64, Vec<String>) = redis::cmd("SCAN")
             .arg(0u64)
-            .arg("MATCH").arg(pattern)
-            .arg("COUNT").arg(count)
+            .arg("MATCH")
+            .arg(pattern)
+            .arg("COUNT")
+            .arg(count)
             .query_async(&mut self.conn)
             .await?;
         Ok(keys)

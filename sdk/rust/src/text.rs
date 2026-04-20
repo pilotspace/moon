@@ -98,19 +98,24 @@ impl TextClient {
         query: &str,
         group_by: &str,
         reducers: &[Reducer],
-        sort_by: Option<(&str, bool)>,  // (field, ascending)
+        sort_by: Option<(&str, bool)>, // (field, ascending)
         limit: Option<usize>,
     ) -> Result<Vec<AggregateRow>> {
         let mut cmd = redis::cmd("FT.AGGREGATE");
-        cmd.arg(index).arg(query)
-            .arg("GROUPBY").arg("1").arg(format!("@{group_by}"));
+        cmd.arg(index)
+            .arg(query)
+            .arg("GROUPBY")
+            .arg("1")
+            .arg(format!("@{group_by}"));
         for reducer in reducers {
             for arg in reducer.to_args() {
                 cmd.arg(arg);
             }
         }
         if let Some((field, asc)) = sort_by {
-            cmd.arg("SORTBY").arg("2").arg(format!("@{field}"))
+            cmd.arg("SORTBY")
+                .arg("2")
+                .arg(format!("@{field}"))
                 .arg(if asc { "ASC" } else { "DESC" });
         }
         if let Some(n) = limit {

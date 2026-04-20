@@ -59,7 +59,10 @@ async fn main() -> Result<()> {
 
     // Index info
     let info = v.index_info("example_idx").await?;
-    println!("\nIndex info: num_docs={} dim={}", info.num_docs, info.dimension);
+    println!(
+        "\nIndex info: num_docs={} dim={}",
+        info.num_docs, info.dimension
+    );
 
     // Compact the index
     let _ = v.compact("example_idx").await;

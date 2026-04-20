@@ -1,6 +1,9 @@
-use std::collections::HashMap;
+use crate::types::{
+    AggregateRow, CacheSearchResult, GraphEdge, GraphNode, IndexInfo, QueryResult, SearchResult,
+    TextSearchHit,
+};
 use redis::Value;
-use crate::types::{AggregateRow, CacheSearchResult, GraphEdge, GraphNode, IndexInfo, QueryResult, SearchResult, TextSearchHit};
+use std::collections::HashMap;
 
 // ── Value helpers ────────────────────────────────────────────────────────────
 
@@ -125,7 +128,13 @@ pub fn parse_search_results(raw: Value) -> Vec<SearchResult> {
             j += 2;
         }
 
-        results.push(SearchResult { key, score, fields, graph_hops, cache_hit });
+        results.push(SearchResult {
+            key,
+            score,
+            fields,
+            graph_hops,
+            cache_hit,
+        });
     }
     results
 }
@@ -142,7 +151,12 @@ pub fn parse_cache_search_results(raw: Value) -> CacheSearchResult {
 pub fn parse_index_info(name: String, raw: Value) -> IndexInfo {
     let arr = match raw {
         Value::Array(a) => a,
-        _ => return IndexInfo { name, ..Default::default() },
+        _ => {
+            return IndexInfo {
+                name,
+                ..Default::default()
+            };
+        }
     };
 
     let kv = parse_flat_kv(&arr);
@@ -155,12 +169,22 @@ pub fn parse_index_info(name: String, raw: Value) -> IndexInfo {
     let distance_metric = kv.get("distance_metric").cloned().unwrap_or_default();
     let mut extra = HashMap::new();
     for (k, v) in &kv {
-        if !matches!(k.as_str(), "num_docs" | "dimension" | "dim" | "distance_metric") {
+        if !matches!(
+            k.as_str(),
+            "num_docs" | "dimension" | "dim" | "distance_metric"
+        ) {
             extra.insert(k.clone(), v.clone());
         }
     }
 
-    IndexInfo { name, num_docs, dimension, distance_metric, fields: vec![], extra }
+    IndexInfo {
+        name,
+        num_docs,
+        dimension,
+        distance_metric,
+        fields: vec![],
+        extra,
+    }
 }
 
 // ── GRAPH.QUERY response ─────────────────────────────────────────────────────
@@ -169,18 +193,36 @@ pub fn parse_index_info(name: String, raw: Value) -> IndexInfo {
 pub fn parse_query_result(raw: Value) -> QueryResult {
     let outer = match raw {
         Value::Array(a) => a,
-        _ => return QueryResult { headers: vec![], rows: vec![], stats: vec![] },
+        _ => {
+            return QueryResult {
+                headers: vec![],
+                rows: vec![],
+                stats: vec![],
+            };
+        }
     };
 
     let headers = outer
         .first()
-        .and_then(|v| if let Value::Array(a) = v { Some(a) } else { None })
+        .and_then(|v| {
+            if let Value::Array(a) = v {
+                Some(a)
+            } else {
+                None
+            }
+        })
         .map(|a| a.iter().map(value_to_string).collect())
         .unwrap_or_default();
 
     let rows = outer
         .get(1)
-        .and_then(|v| if let Value::Array(a) = v { Some(a) } else { None })
+        .and_then(|v| {
+            if let Value::Array(a) = v {
+                Some(a)
+            } else {
+                None
+            }
+        })
         .map(|rows| {
             rows.iter()
                 .filter_map(|row| {
@@ -203,7 +245,11 @@ pub fn parse_query_result(raw: Value) -> QueryResult {
         })
         .unwrap_or_default();
 
-    QueryResult { headers, rows, stats }
+    QueryResult {
+        headers,
+        rows,
+        stats,
+    }
 }
 
 // ── GRAPH.NEIGHBORS response ─────────────────────────────────────────────────
@@ -228,17 +274,30 @@ pub fn parse_neighbors(raw: Value) -> Vec<(i64, i64, String, f64)> {
         // Use item references via temporary; re-derive from item itself.
         let get = |key: &str| -> Option<Value> {
             match &item {
-                Value::Map(m) => m.iter().find(|(k, _)| value_to_string(k) == key).map(|(_, v)| v.clone()),
-                Value::Array(f) => f.chunks_exact(2).find(|c| value_to_string(&c[0]) == key).map(|c| c[1].clone()),
+                Value::Map(m) => m
+                    .iter()
+                    .find(|(k, _)| value_to_string(k) == key)
+                    .map(|(_, v)| v.clone()),
+                Value::Array(f) => f
+                    .chunks_exact(2)
+                    .find(|c| value_to_string(&c[0]) == key)
+                    .map(|c| c[1].clone()),
                 _ => None,
             }
         };
         let _ = pairs; // used for detection above
         let Some(src_v) = get("src") else { continue };
         let Some(dst_v) = get("dst") else { continue };
-        let Some(src) = value_to_i64(&src_v) else { continue };
-        let Some(dst) = value_to_i64(&dst_v) else { continue };
-        let edge_type = get("type").as_ref().map(value_to_string).unwrap_or_default();
+        let Some(src) = value_to_i64(&src_v) else {
+            continue;
+        };
+        let Some(dst) = value_to_i64(&dst_v) else {
+            continue;
+        };
+        let edge_type = get("type")
+            .as_ref()
+            .map(value_to_string)
+            .unwrap_or_default();
         let weight = get("weight").as_ref().and_then(value_to_f64).unwrap_or(1.0);
         results.push((src, dst, edge_type, weight));
     }
@@ -271,7 +330,11 @@ pub fn parse_aggregate_rows(raw: Value) -> Vec<AggregateRow> {
 pub fn parse_text_search_hits(raw: Value) -> Vec<TextSearchHit> {
     parse_search_results(raw)
         .into_iter()
-        .map(|r| TextSearchHit { key: r.key, score: r.score, fields: r.fields })
+        .map(|r| TextSearchHit {
+            key: r.key,
+            score: r.score,
+            fields: r.fields,
+        })
         .collect()
 }
 
@@ -292,7 +355,11 @@ pub fn parse_graph_node(raw: Value) -> Option<GraphNode> {
             properties.insert(k, v);
         }
     }
-    Some(GraphNode { node_id, label, properties })
+    Some(GraphNode {
+        node_id,
+        label,
+        properties,
+    })
 }
 
 #[allow(dead_code)]
@@ -312,5 +379,11 @@ pub fn parse_graph_edge(raw: Value) -> Option<GraphEdge> {
             properties.insert(k, v);
         }
     }
-    Some(GraphEdge { src_id, dst_id, edge_type, weight, properties })
+    Some(GraphEdge {
+        src_id,
+        dst_id,
+        edge_type,
+        weight,
+        properties,
+    })
 }

@@ -9,8 +9,7 @@
 //! ```
 
 use moon_client::{
-    DistanceMetric, MoonClient, NeighborDirection, VectorIndexOptions,
-    types::encode_vector,
+    DistanceMetric, MoonClient, NeighborDirection, VectorIndexOptions, types::encode_vector,
 };
 
 fn test_url() -> String {
@@ -229,7 +228,12 @@ async fn test_vector_index_lifecycle() {
     // Insert a document
     let vec_bytes = encode_vector(&[0.1, 0.2, 0.3, 0.4]);
     let mut c = client.clone();
-    c.hset_multiple("sdkdoc:1", &[("vec", vec_bytes.as_slice()), ("title", b"test doc")]).await.unwrap();
+    c.hset_multiple(
+        "sdkdoc:1",
+        &[("vec", vec_bytes.as_slice()), ("title", b"test doc")],
+    )
+    .await
+    .unwrap();
 
     // Search
     let query = [0.1_f32, 0.2, 0.3, 0.4];
@@ -264,7 +268,11 @@ async fn test_graph_lifecycle() {
     g.create("sdk_test_graph").await.unwrap();
 
     let alice_id = g
-        .add_node("sdk_test_graph", "Person", &[("name", "Alice"), ("age", "30")])
+        .add_node(
+            "sdk_test_graph",
+            "Person",
+            &[("name", "Alice"), ("age", "30")],
+        )
         .await
         .unwrap();
     let bob_id = g
@@ -278,7 +286,10 @@ async fn test_graph_lifecycle() {
 
     // Cypher query
     let result = g
-        .query("sdk_test_graph", "MATCH (p:Person) RETURN p.name ORDER BY p.name")
+        .query(
+            "sdk_test_graph",
+            "MATCH (p:Person) RETURN p.name ORDER BY p.name",
+        )
         .await
         .unwrap();
     assert!(!result.headers.is_empty());

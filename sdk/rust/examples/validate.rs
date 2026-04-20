@@ -6,8 +6,7 @@
 //!   MOON_TEST_URL=redis://127.0.0.1:6399 cargo run --example validate
 
 use moon_client::{
-    DistanceMetric, MoonClient, NeighborDirection, Result, VectorIndexOptions,
-    types::encode_vector,
+    DistanceMetric, MoonClient, NeighborDirection, Result, VectorIndexOptions, types::encode_vector,
 };
 
 const URL_ENV: &str = "MOON_TEST_URL";
@@ -129,7 +128,11 @@ async fn main() -> Result<()> {
         let len = check!("LLEN", client.llen("lst").await);
         assert_eq_or_fail!("LLEN=3", len, 3i64);
         let range: Vec<String> = check!("LRANGE 0 -1", client.lrange("lst", 0, -1).await);
-        assert_eq_or_fail!("LRANGE", range, vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+        assert_eq_or_fail!(
+            "LRANGE",
+            range,
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
         let popped: Option<String> = check!("LPOP", client.lpop("lst", None).await);
         assert_eq_or_fail!("LPOP=a", popped.as_deref(), Some("a"));
         client.del("lst").await.ok();
@@ -220,13 +223,18 @@ async fn main() -> Result<()> {
         let blob = encode_vector(&[0.1_f32, 0.2, 0.3, 0.4]);
         check!(
             "HSET vdoc:1",
-            client.hset_multiple("vdoc:1", &[("vec", blob.as_slice()), ("title", b"test")]).await
+            client
+                .hset_multiple("vdoc:1", &[("vec", blob.as_slice()), ("title", b"test")])
+                .await
         );
 
         let info = check!("FT.INFO", v.index_info("val_idx").await);
         assert_eq_or_fail!("FT.INFO name", info.name, "val_idx".to_string());
 
-        check!("FT.SEARCH", v.search("val_idx", &[0.1_f32, 0.2, 0.3, 0.4], 5).await);
+        check!(
+            "FT.SEARCH",
+            v.search("val_idx", &[0.1_f32, 0.2, 0.3, 0.4], 5).await
+        );
 
         v.compact("val_idx").await.ok();
         println!("  PASS  FT.COMPACT (no-error)");
@@ -254,7 +262,8 @@ async fn main() -> Result<()> {
 
         let alice = check!(
             "GRAPH.ADDNODE alice",
-            g.add_node("val_graph", "Person", &[("name", "Alice"), ("age", "30")]).await
+            g.add_node("val_graph", "Person", &[("name", "Alice"), ("age", "30")])
+                .await
         );
         let bob = check!(
             "GRAPH.ADDNODE bob",
@@ -268,7 +277,11 @@ async fn main() -> Result<()> {
 
         let result = check!(
             "GRAPH.QUERY",
-            g.query("val_graph", "MATCH (p:Person) RETURN p.name ORDER BY p.name").await
+            g.query(
+                "val_graph",
+                "MATCH (p:Person) RETURN p.name ORDER BY p.name"
+            )
+            .await
         );
         if result.headers.is_empty() {
             println!("  FAIL  GRAPH.QUERY returned no headers");
@@ -278,7 +291,8 @@ async fn main() -> Result<()> {
 
         let neighbors = check!(
             "GRAPH.NEIGHBORS",
-            g.neighbors("val_graph", alice, NeighborDirection::Both).await
+            g.neighbors("val_graph", alice, NeighborDirection::Both)
+                .await
         );
         assert_eq_or_fail!("NEIGHBORS count=1", neighbors.len(), 1);
 
@@ -337,7 +351,11 @@ async fn main() -> Result<()> {
             return Ok(());
         }
         let msg = &msgs[0];
-        println!("  PASS  MQ POP id={} body={:?}", msg.id, std::str::from_utf8(&msg.data).unwrap_or("(binary)"));
+        println!(
+            "  PASS  MQ POP id={} body={:?}",
+            msg.id,
+            std::str::from_utf8(&msg.data).unwrap_or("(binary)")
+        );
 
         check!("MQ ACK", mq.ack("mq:validate", &msg.id).await);
 
@@ -356,8 +374,14 @@ async fn main() -> Result<()> {
             println!("  FAIL  INFO returned empty string");
             return Ok(());
         }
-        let version_line = info.lines().find(|l| l.contains("version") || l.contains("moon"));
-        println!("  PASS  INFO returned {} bytes; version hint: {:?}", info.len(), version_line);
+        let version_line = info
+            .lines()
+            .find(|l| l.contains("version") || l.contains("moon"));
+        println!(
+            "  PASS  INFO returned {} bytes; version hint: {:?}",
+            info.len(),
+            version_line
+        );
 
         let db_size = check!("DBSIZE", client.dbsize().await);
         println!("  PASS  DBSIZE={db_size}");

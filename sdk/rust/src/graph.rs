@@ -57,7 +57,10 @@ impl GraphClient {
 
     /// Get graph statistics (`GRAPH.INFO`).
     pub async fn info(&mut self, name: &str) -> Result<redis::Value> {
-        Ok(redis::cmd("GRAPH.INFO").arg(name).query_async(&mut self.conn).await?)
+        Ok(redis::cmd("GRAPH.INFO")
+            .arg(name)
+            .query_async(&mut self.conn)
+            .await?)
     }
 
     // ── Nodes ────────────────────────────────────────────────────────────────
@@ -96,7 +99,12 @@ impl GraphClient {
         properties: &[(&str, &str)],
     ) -> Result<()> {
         let mut cmd = redis::cmd("GRAPH.ADDEDGE");
-        cmd.arg(graph).arg(src_id).arg(dst_id).arg(edge_type).arg("WEIGHT").arg(weight);
+        cmd.arg(graph)
+            .arg(src_id)
+            .arg(dst_id)
+            .arg(edge_type)
+            .arg("WEIGHT")
+            .arg(weight);
         for (k, v) in properties {
             cmd.arg(*k).arg(*v);
         }
@@ -165,11 +173,7 @@ impl GraphClient {
     /// Useful when callers want to apply their own parser (e.g., Lunaris's
     /// bi-temporal-aware parser) without paying for the `parse_query_result`
     /// pass.
-    pub async fn query_raw(
-        &mut self,
-        graph: &str,
-        cypher: &str,
-    ) -> Result<redis::Value> {
+    pub async fn query_raw(&mut self, graph: &str, cypher: &str) -> Result<redis::Value> {
         Ok(redis::cmd("GRAPH.QUERY")
             .arg(graph)
             .arg(cypher)
@@ -188,7 +192,12 @@ impl GraphClient {
     }
 
     /// Temporal Cypher query at a specific wall-clock timestamp (`GRAPH.QUERY … VALID_AT <ms>`).
-    pub async fn query_at(&mut self, graph: &str, cypher: &str, valid_at_ms: i64) -> Result<QueryResult> {
+    pub async fn query_at(
+        &mut self,
+        graph: &str,
+        cypher: &str,
+        valid_at_ms: i64,
+    ) -> Result<QueryResult> {
         let raw: redis::Value = redis::cmd("GRAPH.QUERY")
             .arg(graph)
             .arg(cypher)

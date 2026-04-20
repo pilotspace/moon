@@ -66,8 +66,14 @@ async fn main() -> Result<()> {
     println!("Server → {}", version_line.unwrap_or("(version not found)"));
 
     // Cleanup
-    for key in &["example:name", "example:user:1", "example:counter",
-                  "example:leaderboard", "txn:a", "txn:b"] {
+    for key in &[
+        "example:name",
+        "example:user:1",
+        "example:counter",
+        "example:leaderboard",
+        "txn:a",
+        "txn:b",
+    ] {
         client.del(*key).await?;
     }
     println!("Done — all example keys cleaned up.");

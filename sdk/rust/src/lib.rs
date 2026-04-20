@@ -62,10 +62,10 @@ pub mod workspace;
 
 pub use client::MoonClient;
 pub use error::{MoonError, Result};
+pub use graph::NeighborDirection;
+pub use temporal::EntityType;
 pub use types::{
     AggregateRow, CacheSearchResult, DistanceMetric, GraphEdge, GraphNode, IndexAlgorithm,
     IndexInfo, MqMessage, PubSubMessage, QueryResult, Reducer, SchemaField, SearchResult,
     TextSearchHit, VectorIndexOptions, WorkspaceInfo, decode_vector, encode_vector,
 };
-pub use graph::NeighborDirection;
-pub use temporal::EntityType;

@@ -28,8 +28,11 @@ impl VectorClient {
     pub async fn create_index(&mut self, name: &str, opts: VectorIndexOptions) -> Result<String> {
         let mut cmd = redis::cmd("FT.CREATE");
         cmd.arg(name)
-            .arg("ON").arg("HASH")
-            .arg("PREFIX").arg("1").arg(&opts.prefix)
+            .arg("ON")
+            .arg("HASH")
+            .arg("PREFIX")
+            .arg("1")
+            .arg(&opts.prefix)
             .arg("SCHEMA");
 
         // Extra non-vector schema fields first
@@ -44,17 +47,26 @@ impl VectorClient {
         // Each optional HNSW param adds 2 more.
         let param_count: usize = 10
             + if opts.ef_runtime.is_some() { 2 } else { 0 }
-            + if opts.compact_threshold.is_some() { 2 } else { 0 };
+            + if opts.compact_threshold.is_some() {
+                2
+            } else {
+                0
+            };
 
         cmd.arg(&opts.field_name)
             .arg("VECTOR")
             .arg("HNSW")
             .arg(param_count)
-            .arg("TYPE").arg(&opts.dtype)
-            .arg("DIM").arg(opts.dim)
-            .arg("DISTANCE_METRIC").arg(opts.metric.as_str())
-            .arg("M").arg(opts.m)
-            .arg("EF_CONSTRUCTION").arg(opts.ef_construction);
+            .arg("TYPE")
+            .arg(&opts.dtype)
+            .arg("DIM")
+            .arg(opts.dim)
+            .arg("DISTANCE_METRIC")
+            .arg(opts.metric.as_str())
+            .arg("M")
+            .arg(opts.m)
+            .arg("EF_CONSTRUCTION")
+            .arg(opts.ef_construction);
 
         if let Some(ef) = opts.ef_runtime {
             cmd.arg("EF_RUNTIME").arg(ef);
@@ -80,7 +92,10 @@ impl VectorClient {
 
     /// Retrieve metadata about an index via `FT.INFO`.
     pub async fn index_info(&mut self, name: &str) -> Result<IndexInfo> {
-        let raw: redis::Value = redis::cmd("FT.INFO").arg(name).query_async(&mut self.conn).await?;
+        let raw: redis::Value = redis::cmd("FT.INFO")
+            .arg(name)
+            .query_async(&mut self.conn)
+            .await?;
         Ok(parse_index_info(name.to_string(), raw))
     }
 
@@ -92,7 +107,10 @@ impl VectorClient {
 
     /// Trigger a compaction of the mutable segment into an immutable HNSW graph.
     pub async fn compact(&mut self, name: &str) -> Result<String> {
-        let v: String = redis::cmd("FT.COMPACT").arg(name).query_async(&mut self.conn).await?;
+        let v: String = redis::cmd("FT.COMPACT")
+            .arg(name)
+            .query_async(&mut self.conn)
+            .await?;
         Ok(v)
     }
 
@@ -110,7 +128,8 @@ impl VectorClient {
         query_vec: &[f32],
         k: usize,
     ) -> Result<Vec<SearchResult>> {
-        self.search_opts(index, query_vec, k, "vec", None, None).await
+        self.search_opts(index, query_vec, k, "vec", None, None)
+            .await
     }
 
     /// Upsert a vector record at `id` with `embedding_bytes` (LE-f32 encoded) and
@@ -186,8 +205,12 @@ impl VectorClient {
         let blob = encode_vector(query_vec);
         let query = format!("*=>[KNN {k} @{field_name} $query_vec]");
         let mut cmd = redis::cmd("FT.SEARCH");
-        cmd.arg(index).arg(&query)
-            .arg("PARAMS").arg("2").arg("query_vec").arg(&blob);
+        cmd.arg(index)
+            .arg(&query)
+            .arg("PARAMS")
+            .arg("2")
+            .arg("query_vec")
+            .arg(&blob);
         if let Some(fields) = return_fields {
             cmd.arg("RETURN").arg(fields.len());
             for f in fields {
@@ -222,9 +245,15 @@ impl VectorClient {
             .arg(index)
             .arg(cache_prefix)
             .arg(&query)
-            .arg("PARAMS").arg("2").arg("query_vec").arg(&blob)
-            .arg("THRESHOLD").arg(threshold)
-            .arg("FALLBACK").arg("KNN").arg(fallback_k)
+            .arg("PARAMS")
+            .arg("2")
+            .arg("query_vec")
+            .arg(&blob)
+            .arg("THRESHOLD")
+            .arg(threshold)
+            .arg("FALLBACK")
+            .arg("KNN")
+            .arg(fallback_k)
             .query_async(&mut self.conn)
             .await?;
         Ok(parse_cache_search_results(raw))
@@ -275,9 +304,14 @@ impl VectorClient {
         let raw: redis::Value = redis::cmd("FT.NAVIGATE")
             .arg(index)
             .arg(&query)
-            .arg("HOPS").arg(hops)
-            .arg("HOP_PENALTY").arg(hop_penalty)
-            .arg("PARAMS").arg("2").arg("vec_param").arg(&blob)
+            .arg("HOPS")
+            .arg(hops)
+            .arg("HOP_PENALTY")
+            .arg(hop_penalty)
+            .arg("PARAMS")
+            .arg("2")
+            .arg("vec_param")
+            .arg(&blob)
             .query_async(&mut self.conn)
             .await?;
         Ok(parse_search_results(raw))
