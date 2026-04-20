@@ -424,7 +424,7 @@ mod tests {
 
     #[test]
     fn test_ranked_candidates_sort() {
-        let mut candidates = vec![
+        let mut candidates = [
             RankedCandidate {
                 key: Bytes::from_static(b"b"),
                 vec_score: 0.5,

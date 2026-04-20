@@ -48,10 +48,7 @@ pub enum GraphUndoOp {
     },
     /// Un-soft-delete an edge (set `deleted_lsn = u64::MAX`) and restore live
     /// count.
-    UndeleteEdge {
-        graph_name: Bytes,
-        edge_id: u64,
-    },
+    UndeleteEdge { graph_name: Bytes, edge_id: u64 },
 }
 
 /// Type alias for unified LSN across all stores.
@@ -194,9 +191,13 @@ impl CrossStoreTxn {
             || !self.graph_intents.is_empty()
             || {
                 #[cfg(feature = "graph")]
-                { !self.graph_undo.is_empty() }
+                {
+                    !self.graph_undo.is_empty()
+                }
                 #[cfg(not(feature = "graph"))]
-                { false }
+                {
+                    false
+                }
             }
             || !self.mq_intents.is_empty()
     }
@@ -272,7 +273,7 @@ mod tests {
             .collect();
         assert_eq!(reversed, vec![3, 2, 1]);
         // Spot-check the first reverse element matches the last push.
-        assert_eq!(txn.graph_intents.iter().rev().next().unwrap().entity_id, 3);
+        assert_eq!(txn.graph_intents.iter().next_back().unwrap().entity_id, 3);
     }
 
     #[test]

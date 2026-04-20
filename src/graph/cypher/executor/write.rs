@@ -296,7 +296,8 @@ pub fn execute_mut(
                                 .properties
                                 .iter()
                                 .filter_map(|(name, expr)| {
-                                    let val = eval_expr(expr, &new_row, &graph.write_buf, params, &[], 0);
+                                    let val =
+                                        eval_expr(expr, &new_row, &graph.write_buf, params, &[], 0);
                                     value_to_property_value(&val)
                                         .map(|pv| (label_to_id(name.as_bytes()), pv))
                                 })
@@ -361,7 +362,8 @@ pub fn execute_mut(
                                 value,
                             } => {
                                 if let Some(Value::Node(nk)) = row.get(variable) {
-                                    let val = eval_expr(value, row, &graph.write_buf, params, &[], 0);
+                                    let val =
+                                        eval_expr(value, row, &graph.write_buf, params, &[], 0);
                                     if let Some(pv) = value_to_property_value(&val) {
                                         let pid = label_to_id(property.as_bytes());
                                         if let Some(node) = graph.write_buf.get_node_mut(*nk) {
@@ -480,7 +482,8 @@ pub fn execute_mut(
                             .properties
                             .iter()
                             .filter_map(|(name, expr)| {
-                                let val = eval_expr(expr, &new_row, &graph.write_buf, params, &[], 0);
+                                let val =
+                                    eval_expr(expr, &new_row, &graph.write_buf, params, &[], 0);
                                 value_to_property_value(&val)
                                     .map(|pv| (label_to_id(name.as_bytes()), pv))
                             })
@@ -646,8 +649,14 @@ pub fn execute_mut(
                                         .properties
                                         .iter()
                                         .filter_map(|(name, expr)| {
-                                            let val =
-                                                eval_expr(expr, &new_row, &graph.write_buf, params, &[], 0);
+                                            let val = eval_expr(
+                                                expr,
+                                                &new_row,
+                                                &graph.write_buf,
+                                                params,
+                                                &[],
+                                                0,
+                                            );
                                             value_to_property_value(&val)
                                                 .map(|pv| (label_to_id(name.as_bytes()), pv))
                                         })
@@ -676,8 +685,14 @@ pub fn execute_mut(
                                         .properties
                                         .iter()
                                         .filter_map(|(name, expr)| {
-                                            let val =
-                                                eval_expr(expr, &new_row, &graph.write_buf, params, &[], 0);
+                                            let val = eval_expr(
+                                                expr,
+                                                &new_row,
+                                                &graph.write_buf,
+                                                params,
+                                                &[],
+                                                0,
+                                            );
                                             value_to_property_value(&val)
                                                 .map(|pv| (label_to_id(name.as_bytes()), pv))
                                         })

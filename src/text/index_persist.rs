@@ -381,7 +381,7 @@ mod tests {
     #[test]
     fn test_roundtrip_single() {
         let meta = make_meta("idx", "doc:", &[("title", 2.0, 0), ("body", 1.0, 0)]);
-        let data = serialize_text_index_metas(&[meta.clone()]);
+        let data = serialize_text_index_metas(std::slice::from_ref(&meta));
         let result = deserialize_text_index_metas(&data).expect("deserialize");
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].name, "idx");

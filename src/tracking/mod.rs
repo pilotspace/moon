@@ -278,7 +278,7 @@ mod tests {
         let senders = table.invalidate_key(&key, 99);
         assert_eq!(senders.len(), 1);
         // Send a test frame through the returned sender
-        let push = invalidation::invalidation_push(&[key.clone()]);
+        let push = invalidation::invalidation_push(std::slice::from_ref(&key));
         senders[0].try_send(push.clone()).unwrap();
         let received = rx2.try_recv().unwrap();
         assert_eq!(received, push);

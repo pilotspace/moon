@@ -178,7 +178,10 @@ pub fn execute(
 
             PhysicalOp::Filter { expr } => {
                 rows.retain(|row| {
-                    matches!(eval_expr(expr, row, memgraph, params, csr_segs, ctx.snapshot_lsn), Value::Bool(true))
+                    matches!(
+                        eval_expr(expr, row, memgraph, params, csr_segs, ctx.snapshot_lsn),
+                        Value::Bool(true)
+                    )
                 });
             }
 
@@ -205,7 +208,14 @@ pub fn execute(
                                         row.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
                                     Value::Map(entries)
                                 } else {
-                                    eval_expr(&item.expr, row, memgraph, params, csr_segs, ctx.snapshot_lsn)
+                                    eval_expr(
+                                        &item.expr,
+                                        row,
+                                        memgraph,
+                                        params,
+                                        csr_segs,
+                                        ctx.snapshot_lsn,
+                                    )
                                 }
                             })
                             .collect()
@@ -253,8 +263,10 @@ pub fn execute(
                 } else {
                     rows.sort_by(|a, b| {
                         for (expr, ascending) in items {
-                            let va = eval_expr(expr, a, memgraph, params, csr_segs, ctx.snapshot_lsn);
-                            let vb = eval_expr(expr, b, memgraph, params, csr_segs, ctx.snapshot_lsn);
+                            let va =
+                                eval_expr(expr, a, memgraph, params, csr_segs, ctx.snapshot_lsn);
+                            let vb =
+                                eval_expr(expr, b, memgraph, params, csr_segs, ctx.snapshot_lsn);
                             let ord = compare_values(&va, &vb);
                             let ord = if *ascending { ord } else { ord.reverse() };
                             if ord != std::cmp::Ordering::Equal {
@@ -267,7 +279,14 @@ pub fn execute(
             }
 
             PhysicalOp::Limit { count } => {
-                let n = match eval_expr(count, &HashMap::new(), memgraph, params, csr_segs, ctx.snapshot_lsn) {
+                let n = match eval_expr(
+                    count,
+                    &HashMap::new(),
+                    memgraph,
+                    params,
+                    csr_segs,
+                    ctx.snapshot_lsn,
+                ) {
                     Value::Int(n) if n >= 0 => n as usize,
                     _ => 0,
                 };
@@ -279,7 +298,14 @@ pub fn execute(
             }
 
             PhysicalOp::Skip { count } => {
-                let n = match eval_expr(count, &HashMap::new(), memgraph, params, csr_segs, ctx.snapshot_lsn) {
+                let n = match eval_expr(
+                    count,
+                    &HashMap::new(),
+                    memgraph,
+                    params,
+                    csr_segs,
+                    ctx.snapshot_lsn,
+                ) {
                     Value::Int(n) if n >= 0 => n as usize,
                     _ => 0,
                 };
@@ -623,7 +649,10 @@ pub fn execute_profile(
 
             PhysicalOp::Filter { expr } => {
                 rows.retain(|row| {
-                    matches!(eval_expr(expr, row, memgraph, params, csr_segs, ctx.snapshot_lsn), Value::Bool(true))
+                    matches!(
+                        eval_expr(expr, row, memgraph, params, csr_segs, ctx.snapshot_lsn),
+                        Value::Bool(true)
+                    )
                 });
             }
 
@@ -650,7 +679,14 @@ pub fn execute_profile(
                                         row.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
                                     Value::Map(entries)
                                 } else {
-                                    eval_expr(&item.expr, row, memgraph, params, csr_segs, ctx.snapshot_lsn)
+                                    eval_expr(
+                                        &item.expr,
+                                        row,
+                                        memgraph,
+                                        params,
+                                        csr_segs,
+                                        ctx.snapshot_lsn,
+                                    )
                                 }
                             })
                             .collect()
@@ -696,8 +732,10 @@ pub fn execute_profile(
                 } else {
                     rows.sort_by(|a, b| {
                         for (expr, ascending) in items {
-                            let va = eval_expr(expr, a, memgraph, params, csr_segs, ctx.snapshot_lsn);
-                            let vb = eval_expr(expr, b, memgraph, params, csr_segs, ctx.snapshot_lsn);
+                            let va =
+                                eval_expr(expr, a, memgraph, params, csr_segs, ctx.snapshot_lsn);
+                            let vb =
+                                eval_expr(expr, b, memgraph, params, csr_segs, ctx.snapshot_lsn);
                             let ord = compare_values(&va, &vb);
                             let ord = if *ascending { ord } else { ord.reverse() };
                             if ord != std::cmp::Ordering::Equal {
@@ -710,7 +748,14 @@ pub fn execute_profile(
             }
 
             PhysicalOp::Limit { count } => {
-                let n = match eval_expr(count, &HashMap::new(), memgraph, params, csr_segs, ctx.snapshot_lsn) {
+                let n = match eval_expr(
+                    count,
+                    &HashMap::new(),
+                    memgraph,
+                    params,
+                    csr_segs,
+                    ctx.snapshot_lsn,
+                ) {
                     Value::Int(n) if n >= 0 => n as usize,
                     _ => 0,
                 };
@@ -722,7 +767,14 @@ pub fn execute_profile(
             }
 
             PhysicalOp::Skip { count } => {
-                let n = match eval_expr(count, &HashMap::new(), memgraph, params, csr_segs, ctx.snapshot_lsn) {
+                let n = match eval_expr(
+                    count,
+                    &HashMap::new(),
+                    memgraph,
+                    params,
+                    csr_segs,
+                    ctx.snapshot_lsn,
+                ) {
                     Value::Int(n) if n >= 0 => n as usize,
                     _ => 0,
                 };

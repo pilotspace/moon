@@ -113,6 +113,7 @@ fn crash_test(
     let before = get_dbsize(&addr);
     if before < key_count as i64 {
         let _ = server.kill();
+        let _ = server.wait();
         return Err(format!(
             "{}: only {} of {} keys written before crash",
             mode, before, key_count

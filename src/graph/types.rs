@@ -183,12 +183,16 @@ mod tests {
     #[test]
     fn test_property_value_variants() {
         let int = PropertyValue::Int(42);
+        #[allow(clippy::approx_constant)]
         let float = PropertyValue::Float(3.14);
         let string = PropertyValue::String(Bytes::from_static(b"hello"));
         let boolean = PropertyValue::Bool(true);
         let blob = PropertyValue::Bytes(Bytes::from_static(b"\x00\x01"));
         assert_eq!(int, PropertyValue::Int(42));
-        assert_eq!(float, PropertyValue::Float(3.14));
+        #[allow(clippy::approx_constant)]
+        {
+            assert_eq!(float, PropertyValue::Float(3.14));
+        }
         assert_eq!(string, PropertyValue::String(Bytes::from_static(b"hello")));
         assert_eq!(boolean, PropertyValue::Bool(true));
         assert_eq!(blob, PropertyValue::Bytes(Bytes::from_static(b"\x00\x01")));

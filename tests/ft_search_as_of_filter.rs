@@ -7,6 +7,7 @@
 //! `FT.SEARCH AS_OF <T> FILTER @score==10` should:
 //!   - Honour the temporal bound (excludes doc:b, post-snapshot).
 //!   - Apply the filter (doc:a has score=10 so it passes).
+//!
 //! Result must be exactly count=1 (doc:a).
 //!
 //! A separate non-temporal filter query confirms both docs exist at latest and

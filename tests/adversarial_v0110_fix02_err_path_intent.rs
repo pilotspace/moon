@@ -235,7 +235,9 @@ async fn connect(port: u16) -> redis::aio::MultiplexedConnection {
 
 /// Number of rows in a GRAPH.QUERY response (Array[headers, rows, stats]).
 fn row_count(v: &redis::Value) -> usize {
-    let redis::Value::Array(items) = v else { return 0 };
+    let redis::Value::Array(items) = v else {
+        return 0;
+    };
     if items.len() < 2 {
         return 0;
     }

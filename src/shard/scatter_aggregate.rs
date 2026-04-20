@@ -301,8 +301,7 @@ mod tests {
         let d1 = decode_shard_partial(&f1).expect("decode s1");
 
         // Same merge path `scatter_text_aggregate` uses.
-        let mut gb_fields_v: Vec<Bytes> = Vec::new();
-        gb_fields_v.push(Bytes::from_static(b"@status"));
+        let gb_fields_v: Vec<Bytes> = vec![Bytes::from_static(b"@status")];
         let reducers = vec![ReducerSpec {
             fn_name: ReducerFn::Count,
             field: None,
@@ -359,8 +358,7 @@ mod tests {
         let p0 = mk_partial(&[(b"open", 2), (b"closed", 1)]);
         let p1 = mk_partial(&[(b"open", 1), (b"closed", 3)]);
 
-        let mut gb_fields_v: Vec<Bytes> = Vec::new();
-        gb_fields_v.push(Bytes::from_static(b"@status"));
+        let gb_fields_v: Vec<Bytes> = vec![Bytes::from_static(b"@status")];
         let reducers = vec![ReducerSpec {
             fn_name: ReducerFn::Count,
             field: None,

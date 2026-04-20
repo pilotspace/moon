@@ -708,8 +708,8 @@ mod tests {
     fn test_segment_insert_and_get() {
         let mut seg: Segment<Vec<u8>, String> = Segment::new(0);
 
-        let keys = vec![b"key1".to_vec(), b"key2".to_vec(), b"key3".to_vec()];
-        let vals = vec!["val1".to_string(), "val2".to_string(), "val3".to_string()];
+        let keys = [b"key1".to_vec(), b"key2".to_vec(), b"key3".to_vec()];
+        let vals = ["val1".to_string(), "val2".to_string(), "val3".to_string()];
 
         for (k, v) in keys.iter().zip(vals.iter()) {
             let hash = simple_hash(k);

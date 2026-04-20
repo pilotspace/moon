@@ -2,9 +2,7 @@
 //!
 //! Run: `cargo run --example vector_search`
 
-use moondb::{
-    DistanceMetric, MoonClient, Result, SchemaField, VectorIndexOptions, encode_vector,
-};
+use moondb::{DistanceMetric, MoonClient, Result, SchemaField, VectorIndexOptions, encode_vector};
 
 const DIM: usize = 4; // toy dimensionality for the example
 

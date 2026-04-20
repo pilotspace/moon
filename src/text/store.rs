@@ -277,20 +277,12 @@ impl TextIndex {
         if as_of_lsn == 0 {
             return true;
         }
-        let insert_lsn = self
-            .doc_id_to_insert_lsn
-            .get(&doc_id)
-            .copied()
-            .unwrap_or(0);
+        let insert_lsn = self.doc_id_to_insert_lsn.get(&doc_id).copied().unwrap_or(0);
         // Pre-MVCC docs (insert_lsn == 0) are always visible in historical snapshots.
         if insert_lsn != 0 && insert_lsn > as_of_lsn {
             return false;
         }
-        let delete_lsn = self
-            .doc_id_to_delete_lsn
-            .get(&doc_id)
-            .copied()
-            .unwrap_or(0);
+        let delete_lsn = self.doc_id_to_delete_lsn.get(&doc_id).copied().unwrap_or(0);
         delete_lsn == 0 || delete_lsn > as_of_lsn
     }
 
@@ -1005,13 +997,7 @@ impl TextIndex {
         as_of_lsn: u64,
     ) -> Vec<TextSearchResult> {
         if as_of_lsn == 0 {
-            return self.search_field_or(
-                field_idx,
-                expanded_term_ids,
-                global_df,
-                global_n,
-                top_k,
-            );
+            return self.search_field_or(field_idx, expanded_term_ids, global_df, global_n, top_k);
         }
         let oversample = (self.next_doc_id as usize).max(top_k).max(16);
         let raw = self.search_field_or(
@@ -1801,11 +1787,8 @@ mod tests {
     /// search_field_as_of with as_of_lsn=0 passes through unchanged (regression guard).
     #[test]
     fn test_search_field_as_of_zero_lsn_passthrough() {
-        let idx = make_index_with_docs(&[
-            ("doc:0", "alpha"),
-            ("doc:1", "alpha"),
-            ("doc:2", "alpha"),
-        ]);
+        let idx =
+            make_index_with_docs(&[("doc:0", "alpha"), ("doc:1", "alpha"), ("doc:2", "alpha")]);
         let terms = vec!["alpha".to_string()];
         let baseline = idx.search_field(0, &terms, None, None, 10);
         let as_of = idx.search_field_as_of(0, &terms, None, None, 10, 0);

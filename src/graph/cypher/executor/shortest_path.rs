@@ -46,7 +46,11 @@ pub(crate) fn run_shortest_path(
         None
     };
 
-    let effective_lsn = if snapshot_lsn == 0 { u64::MAX } else { snapshot_lsn };
+    let effective_lsn = if snapshot_lsn == 0 {
+        u64::MAX
+    } else {
+        snapshot_lsn
+    };
 
     let reader = SegmentMergeReader::new(
         Some(memgraph),

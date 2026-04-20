@@ -267,9 +267,15 @@ fn rows_count(v: &redis::Value) -> usize {
 
 /// Extract first row, first column as string.
 fn first_string(v: &redis::Value) -> Option<String> {
-    let redis::Value::Array(items) = v else { return None };
-    let redis::Value::Array(rows) = items.get(1)? else { return None };
-    let redis::Value::Array(cells) = rows.first()? else { return None };
+    let redis::Value::Array(items) = v else {
+        return None;
+    };
+    let redis::Value::Array(rows) = items.get(1)? else {
+        return None;
+    };
+    let redis::Value::Array(cells) = rows.first()? else {
+        return None;
+    };
     match cells.first()? {
         redis::Value::BulkString(b) => std::str::from_utf8(b).ok().map(|s| s.to_string()),
         redis::Value::SimpleString(s) => Some(s.clone()),
@@ -384,8 +390,8 @@ async fn test_multihop_edge_var_rejected_at_plan_time() {
     );
 
     // Verify error references Phase 179 / MVCC-02 for tracking.
-    let references_tracking = is_error_containing(&result, "MVCC-02")
-        || is_error_containing(&result, "Phase 179");
+    let references_tracking =
+        is_error_containing(&result, "MVCC-02") || is_error_containing(&result, "Phase 179");
     assert!(
         references_tracking,
         "Error must reference MVCC-02 or Phase 179 tracking ticket. Got: {result:?}"

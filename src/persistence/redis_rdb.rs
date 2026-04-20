@@ -759,11 +759,9 @@ mod tests {
     fn test_write_rdb_hash_entry() {
         let mut db = Database::new();
         let mut entry = Entry::new_hash();
-        if let Some(rv) = entry.redis_value_mut() {
-            if let RedisValue::Hash(map) = rv {
-                map.insert(Bytes::from_static(b"f1"), Bytes::from_static(b"v1"));
-                map.insert(Bytes::from_static(b"f2"), Bytes::from_static(b"v2"));
-            }
+        if let Some(RedisValue::Hash(map)) = entry.redis_value_mut() {
+            map.insert(Bytes::from_static(b"f1"), Bytes::from_static(b"v1"));
+            map.insert(Bytes::from_static(b"f2"), Bytes::from_static(b"v2"));
         }
         db.set(Bytes::from_static(b"myhash"), entry);
         let databases = vec![db];
@@ -778,12 +776,10 @@ mod tests {
     fn test_write_rdb_list_entry() {
         let mut db = Database::new();
         let mut entry = Entry::new_list();
-        if let Some(rv) = entry.redis_value_mut() {
-            if let RedisValue::List(list) = rv {
-                list.push_back(Bytes::from_static(b"a"));
-                list.push_back(Bytes::from_static(b"b"));
-                list.push_back(Bytes::from_static(b"c"));
-            }
+        if let Some(RedisValue::List(list)) = entry.redis_value_mut() {
+            list.push_back(Bytes::from_static(b"a"));
+            list.push_back(Bytes::from_static(b"b"));
+            list.push_back(Bytes::from_static(b"c"));
         }
         db.set(Bytes::from_static(b"mylist"), entry);
         let databases = vec![db];
@@ -797,11 +793,9 @@ mod tests {
     fn test_write_rdb_set_entry() {
         let mut db = Database::new();
         let mut entry = Entry::new_set();
-        if let Some(rv) = entry.redis_value_mut() {
-            if let RedisValue::Set(set) = rv {
-                set.insert(Bytes::from_static(b"m1"));
-                set.insert(Bytes::from_static(b"m2"));
-            }
+        if let Some(RedisValue::Set(set)) = entry.redis_value_mut() {
+            set.insert(Bytes::from_static(b"m1"));
+            set.insert(Bytes::from_static(b"m2"));
         }
         db.set(Bytes::from_static(b"myset"), entry);
         let databases = vec![db];
@@ -815,13 +809,11 @@ mod tests {
     fn test_write_rdb_sorted_set_entry() {
         let mut db = Database::new();
         let mut entry = Entry::new_sorted_set();
-        if let Some(rv) = entry.redis_value_mut() {
-            if let RedisValue::SortedSet { members, scores } = rv {
-                members.insert(Bytes::from_static(b"alice"), 1.5);
-                scores.insert((OrderedFloat(1.5), Bytes::from_static(b"alice")), ());
-                members.insert(Bytes::from_static(b"bob"), 2.5);
-                scores.insert((OrderedFloat(2.5), Bytes::from_static(b"bob")), ());
-            }
+        if let Some(RedisValue::SortedSet { members, scores }) = entry.redis_value_mut() {
+            members.insert(Bytes::from_static(b"alice"), 1.5);
+            scores.insert((OrderedFloat(1.5), Bytes::from_static(b"alice")), ());
+            members.insert(Bytes::from_static(b"bob"), 2.5);
+            scores.insert((OrderedFloat(2.5), Bytes::from_static(b"bob")), ());
         }
         db.set(Bytes::from_static(b"myzset"), entry);
         let databases = vec![db];
@@ -890,11 +882,9 @@ mod tests {
     fn test_roundtrip_hash() {
         let mut db = Database::new();
         let mut entry = Entry::new_hash();
-        if let Some(rv) = entry.redis_value_mut() {
-            if let RedisValue::Hash(map) = rv {
-                map.insert(Bytes::from_static(b"field1"), Bytes::from_static(b"val1"));
-                map.insert(Bytes::from_static(b"field2"), Bytes::from_static(b"val2"));
-            }
+        if let Some(RedisValue::Hash(map)) = entry.redis_value_mut() {
+            map.insert(Bytes::from_static(b"field1"), Bytes::from_static(b"val1"));
+            map.insert(Bytes::from_static(b"field2"), Bytes::from_static(b"val2"));
         }
         db.set(Bytes::from_static(b"h1"), entry);
         let databases = vec![db];
@@ -927,12 +917,10 @@ mod tests {
     fn test_roundtrip_list() {
         let mut db = Database::new();
         let mut entry = Entry::new_list();
-        if let Some(rv) = entry.redis_value_mut() {
-            if let RedisValue::List(list) = rv {
-                list.push_back(Bytes::from_static(b"a"));
-                list.push_back(Bytes::from_static(b"b"));
-                list.push_back(Bytes::from_static(b"c"));
-            }
+        if let Some(RedisValue::List(list)) = entry.redis_value_mut() {
+            list.push_back(Bytes::from_static(b"a"));
+            list.push_back(Bytes::from_static(b"b"));
+            list.push_back(Bytes::from_static(b"c"));
         }
         db.set(Bytes::from_static(b"l1"), entry);
         let databases = vec![db];
@@ -960,11 +948,9 @@ mod tests {
     fn test_roundtrip_set() {
         let mut db = Database::new();
         let mut entry = Entry::new_set();
-        if let Some(rv) = entry.redis_value_mut() {
-            if let RedisValue::Set(set) = rv {
-                set.insert(Bytes::from_static(b"x"));
-                set.insert(Bytes::from_static(b"y"));
-            }
+        if let Some(RedisValue::Set(set)) = entry.redis_value_mut() {
+            set.insert(Bytes::from_static(b"x"));
+            set.insert(Bytes::from_static(b"y"));
         }
         db.set(Bytes::from_static(b"s1"), entry);
         let databases = vec![db];
@@ -991,13 +977,11 @@ mod tests {
     fn test_roundtrip_sorted_set() {
         let mut db = Database::new();
         let mut entry = Entry::new_sorted_set();
-        if let Some(rv) = entry.redis_value_mut() {
-            if let RedisValue::SortedSet { members, scores } = rv {
-                members.insert(Bytes::from_static(b"alice"), 1.5);
-                scores.insert((OrderedFloat(1.5), Bytes::from_static(b"alice")), ());
-                members.insert(Bytes::from_static(b"bob"), 2.5);
-                scores.insert((OrderedFloat(2.5), Bytes::from_static(b"bob")), ());
-            }
+        if let Some(RedisValue::SortedSet { members, scores }) = entry.redis_value_mut() {
+            members.insert(Bytes::from_static(b"alice"), 1.5);
+            scores.insert((OrderedFloat(1.5), Bytes::from_static(b"alice")), ());
+            members.insert(Bytes::from_static(b"bob"), 2.5);
+            scores.insert((OrderedFloat(2.5), Bytes::from_static(b"bob")), ());
         }
         db.set(Bytes::from_static(b"z1"), entry);
         let databases = vec![db];
@@ -1041,39 +1025,32 @@ mod tests {
 
         // Hash
         let mut hash_entry = Entry::new_hash();
-        if let Some(rv) = hash_entry.redis_value_mut() {
-            if let RedisValue::Hash(map) = rv {
-                map.insert(Bytes::from_static(b"f1"), Bytes::from_static(b"v1"));
-            }
+        if let Some(RedisValue::Hash(map)) = hash_entry.redis_value_mut() {
+            map.insert(Bytes::from_static(b"f1"), Bytes::from_static(b"v1"));
         }
         db.set(Bytes::from_static(b"hash"), hash_entry);
 
         // List
         let mut list_entry = Entry::new_list();
-        if let Some(rv) = list_entry.redis_value_mut() {
-            if let RedisValue::List(list) = rv {
-                list.push_back(Bytes::from_static(b"item1"));
-                list.push_back(Bytes::from_static(b"item2"));
-            }
+        if let Some(RedisValue::List(list)) = list_entry.redis_value_mut() {
+            list.push_back(Bytes::from_static(b"item1"));
+            list.push_back(Bytes::from_static(b"item2"));
         }
         db.set(Bytes::from_static(b"list"), list_entry);
 
         // Set
         let mut set_entry = Entry::new_set();
-        if let Some(rv) = set_entry.redis_value_mut() {
-            if let RedisValue::Set(set) = rv {
-                set.insert(Bytes::from_static(b"member1"));
-            }
+        if let Some(RedisValue::Set(set)) = set_entry.redis_value_mut() {
+            set.insert(Bytes::from_static(b"member1"));
         }
         db.set(Bytes::from_static(b"set"), set_entry);
 
         // Sorted set
         let mut zset_entry = Entry::new_sorted_set();
-        if let Some(rv) = zset_entry.redis_value_mut() {
-            if let RedisValue::SortedSet { members, scores } = rv {
-                members.insert(Bytes::from_static(b"z1"), 3.14);
-                scores.insert((OrderedFloat(3.14), Bytes::from_static(b"z1")), ());
-            }
+        #[allow(clippy::approx_constant)]
+        if let Some(RedisValue::SortedSet { members, scores }) = zset_entry.redis_value_mut() {
+            members.insert(Bytes::from_static(b"z1"), 3.14);
+            scores.insert((OrderedFloat(3.14), Bytes::from_static(b"z1")), ());
         }
         db.set(Bytes::from_static(b"zset"), zset_entry);
 

@@ -685,7 +685,7 @@ mod tests {
         let mut fpi_payload = Vec::new();
         fpi_payload.extend_from_slice(&1u64.to_le_bytes()); // file_id = 1
         fpi_payload.extend_from_slice(&0u64.to_le_bytes()); // page_offset = 0
-        fpi_payload.extend_from_slice(&vec![0xABu8; 128]); // page_data
+        fpi_payload.extend_from_slice(&[0xABu8; 128]); // page_data
         write_wal_v3_record(&mut data, 2, WalRecordType::FullPageImage, &fpi_payload);
         std::fs::write(wal_dir.join("000000000001.wal"), &data).unwrap();
 
@@ -816,7 +816,7 @@ mod tests {
         // Create the segment directory with codes.mpf
         let seg_dir = shard_dir.join("vectors").join("segment-42");
         std::fs::create_dir_all(&seg_dir).unwrap();
-        std::fs::write(seg_dir.join("codes.mpf"), &[0u8; 64]).unwrap();
+        std::fs::write(seg_dir.join("codes.mpf"), [0u8; 64]).unwrap();
 
         let mut databases = vec![Database::new()];
         let engine = crate::persistence::replay::DispatchReplayEngine::new();
@@ -940,7 +940,7 @@ mod tests {
         // Create the cold segment directory with vamana.mpf
         let seg_dir = shard_dir.join("vectors").join("segment-50-diskann");
         std::fs::create_dir_all(&seg_dir).unwrap();
-        std::fs::write(seg_dir.join("vamana.mpf"), &[0u8; 128]).unwrap();
+        std::fs::write(seg_dir.join("vamana.mpf"), [0u8; 128]).unwrap();
 
         let mut databases = vec![Database::new()];
         let engine = crate::persistence::replay::DispatchReplayEngine::new();

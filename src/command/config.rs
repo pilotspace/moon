@@ -429,10 +429,12 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("moon-test-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
 
-        let mut rt = RuntimeConfig::default();
-        rt.maxmemory = 1_073_741_824; // 1GB
-        rt.maxmemory_policy = "allkeys-lru".to_string();
-        rt.dir = tmp.to_string_lossy().to_string();
+        let rt = RuntimeConfig {
+            maxmemory: 1_073_741_824, // 1GB
+            maxmemory_policy: "allkeys-lru".to_string(),
+            dir: tmp.to_string_lossy().to_string(),
+            ..Default::default()
+        };
 
         let sc = default_server_config();
         let result = config_rewrite(&rt, &sc);

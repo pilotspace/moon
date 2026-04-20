@@ -1090,10 +1090,14 @@ mod tests {
     #[test]
     fn test_get_score() {
         let mut tree = BPTree::new();
-        tree.insert(OrderedFloat(3.14), Bytes::from("pi"));
-        tree.insert(OrderedFloat(2.72), Bytes::from("e"));
-        assert_eq!(tree.get_score(b"pi"), Some(OrderedFloat(3.14)));
-        assert_eq!(tree.get_score(b"e"), Some(OrderedFloat(2.72)));
+        #[allow(clippy::approx_constant)]
+        let pi = 3.14;
+        #[allow(clippy::approx_constant)]
+        let e = 2.72;
+        tree.insert(OrderedFloat(pi), Bytes::from("pi"));
+        tree.insert(OrderedFloat(e), Bytes::from("e"));
+        assert_eq!(tree.get_score(b"pi"), Some(OrderedFloat(pi)));
+        assert_eq!(tree.get_score(b"e"), Some(OrderedFloat(e)));
         assert_eq!(tree.get_score(b"missing"), None);
     }
 

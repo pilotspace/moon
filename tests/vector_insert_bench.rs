@@ -133,7 +133,7 @@ fn bench_full_insert_pipeline_128d() {
     let mut store = VectorStore::new();
     let meta = moon::vector::store::IndexMeta {
         name: bytes::Bytes::from_static(b"idx"),
-        dimension: dim as u32,
+        dimension: dim,
         padded_dimension: padded_dimension(dim),
         metric: DistanceMetric::L2,
         hnsw_m: 16,
@@ -171,8 +171,7 @@ fn bench_full_insert_pipeline_128d() {
 
     // Measure: decode + quantize + append (simulating auto_index_hset core path)
     let start = Instant::now();
-    for i in 0..n {
-        let blob = &blobs[i];
+    for (i, blob) in blobs.iter().enumerate().take(n) {
         // Decode f32
         let mut f32_vec = Vec::with_capacity(dim as usize);
         for chunk in blob.chunks_exact(4) {
@@ -212,7 +211,7 @@ fn bench_full_insert_pipeline_768d() {
     let mut store = VectorStore::new();
     let meta = moon::vector::store::IndexMeta {
         name: bytes::Bytes::from_static(b"idx"),
-        dimension: dim as u32,
+        dimension: dim,
         padded_dimension: padded_dimension(dim),
         metric: DistanceMetric::L2,
         hnsw_m: 16,
@@ -248,8 +247,7 @@ fn bench_full_insert_pipeline_768d() {
     }
 
     let start = Instant::now();
-    for i in 0..n {
-        let blob = &blobs[i];
+    for (i, blob) in blobs.iter().enumerate().take(n) {
         let mut f32_vec = Vec::with_capacity(dim as usize);
         for chunk in blob.chunks_exact(4) {
             f32_vec.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));

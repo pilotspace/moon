@@ -90,7 +90,7 @@ async fn brpop_wakes_on_rpush() {
     cleanup_keys(&mut conn, &["wake_key"]).await;
 
     // Client A: start blocking BRPOP via redis-cli
-    let mut child = tokio::process::Command::new("redis-cli")
+    let child = tokio::process::Command::new("redis-cli")
         .args(["-p", &MOON_PORT.to_string(), "BRPOP", "wake_key", "5"])
         .stdout(std::process::Stdio::piped())
         .spawn()

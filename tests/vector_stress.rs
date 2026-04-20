@@ -165,9 +165,7 @@ fn test_stress_10k_interleaved_operations() {
     // Final search should not panic and should return valid results
     if !inserted_ids.is_empty() {
         query_f32.clear();
-        for _ in 0..DIM {
-            query_f32.push(0.0f32);
-        }
+        query_f32.extend(std::iter::repeat_n(0.0f32, DIM));
         let final_results = mutable.brute_force_search(&query_f32, None, 10);
         // At minimum we should get some results (there are live vectors)
         // Could be fewer than 10 if many were deleted

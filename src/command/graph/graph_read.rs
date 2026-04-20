@@ -477,7 +477,11 @@ pub fn graph_query_write(store: &mut GraphStore, args: &[Frame]) -> Frame {
 pub fn graph_query_or_write(
     store: &mut GraphStore,
     args: &[Frame],
-) -> (Frame, Vec<cypher::executor::GraphWriteIntent>, Vec<crate::transaction::GraphUndoOp>) {
+) -> (
+    Frame,
+    Vec<cypher::executor::GraphWriteIntent>,
+    Vec<crate::transaction::GraphUndoOp>,
+) {
     if args.len() < 2 {
         return (
             Frame::Error(Bytes::from_static(

@@ -15,7 +15,7 @@ use std::time::Duration;
 fn start_moon(port: u16, dir: &str, extra: &[&str]) -> std::process::Child {
     Command::new("./target/release/moon")
         .args(
-            &[
+            [
                 &["--port", &port.to_string(), "--shards", "1", "--dir", dir][..],
                 extra,
             ]
@@ -53,8 +53,8 @@ fn send_cmd(addr: &str, cmd: &str) -> String {
                     break;
                 }
                 // Bulk string: $N header — read N bytes + CRLF
-                if trimmed.starts_with('$') {
-                    let len: i64 = trimmed[1..].trim().parse().unwrap_or(-1);
+                if let Some(after_dollar) = trimmed.strip_prefix('$') {
+                    let len: i64 = after_dollar.trim().parse().unwrap_or(-1);
                     if len < 0 {
                         break; // $-1 = nil
                     }

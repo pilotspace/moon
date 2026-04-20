@@ -18,7 +18,7 @@ mod tests {
     #[test]
     fn test_invalidation_push_single_key() {
         let key = Bytes::from_static(b"foo");
-        let frame = invalidation_push(&[key.clone()]);
+        let frame = invalidation_push(std::slice::from_ref(&key));
         assert_eq!(
             frame,
             Frame::Push(framevec![

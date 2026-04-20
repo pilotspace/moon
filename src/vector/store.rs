@@ -1312,7 +1312,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let seg_dir = tmp.path().join("segment-10-diskann");
         std::fs::create_dir_all(&seg_dir).unwrap();
-        std::fs::write(seg_dir.join("vamana.mpf"), &[0u8; 64]).unwrap();
+        std::fs::write(seg_dir.join("vamana.mpf"), [0u8; 64]).unwrap();
 
         // Should discover the segment without panicking
         store.register_cold_segments(vec![(10, seg_dir)]);

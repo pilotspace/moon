@@ -355,6 +355,7 @@ mod tests {
 
     #[test]
     fn test_serialize_add_edge_with_props() {
+        #[allow(clippy::approx_constant)]
         let props: PropertyMap = smallvec![(0, PropertyValue::Float(3.14))];
         let data = serialize_add_edge(b"g", 1, 2, 3, 0, 1.0, Some(&props));
         let elems = parse_resp_array(&data);

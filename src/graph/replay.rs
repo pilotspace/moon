@@ -808,10 +808,13 @@ mod tests {
             parse_property_value(b"i", b"42"),
             Some(PropertyValue::Int(42))
         );
-        assert_eq!(
-            parse_property_value(b"f", b"3.14"),
-            Some(PropertyValue::Float(3.14))
-        );
+        #[allow(clippy::approx_constant)]
+        {
+            assert_eq!(
+                parse_property_value(b"f", b"3.14"),
+                Some(PropertyValue::Float(3.14))
+            );
+        }
         assert_eq!(
             parse_property_value(b"s", b"hello"),
             Some(PropertyValue::String(Bytes::from_static(b"hello")))

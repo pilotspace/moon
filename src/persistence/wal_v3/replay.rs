@@ -443,12 +443,7 @@ mod tests {
         let mut data = make_v3_header(0);
         // 1 command + 1 FPI
         write_wal_v3_record(&mut data, 1, WalRecordType::Command, b"SET a 1");
-        write_wal_v3_record(
-            &mut data,
-            2,
-            WalRecordType::FullPageImage,
-            &vec![0xABu8; 128],
-        );
+        write_wal_v3_record(&mut data, 2, WalRecordType::FullPageImage, &[0xABu8; 128]);
         std::fs::write(&seg_path, &data).unwrap();
 
         let mut fpi_count = 0usize;

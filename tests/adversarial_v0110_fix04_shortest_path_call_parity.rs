@@ -226,13 +226,19 @@ async fn connect(port: u16) -> redis::aio::MultiplexedConnection {
 /// Extract the first row's first column as a list of integers (a Path).
 /// Returns None if absent / wrong shape / nil.
 fn first_path(v: &redis::Value) -> Option<Vec<i64>> {
-    let redis::Value::Array(items) = v else { return None };
+    let redis::Value::Array(items) = v else {
+        return None;
+    };
     if items.len() < 2 {
         return None;
     }
-    let redis::Value::Array(rows) = &items[1] else { return None };
+    let redis::Value::Array(rows) = &items[1] else {
+        return None;
+    };
     let first_row = rows.first()?;
-    let redis::Value::Array(cells) = first_row else { return None };
+    let redis::Value::Array(cells) = first_row else {
+        return None;
+    };
     let first_cell = cells.first()?;
     match first_cell {
         redis::Value::Array(arr) => {
@@ -258,14 +264,24 @@ fn first_path(v: &redis::Value) -> Option<Vec<i64>> {
 
 /// Check if the first row's first cell is Null (nil).
 fn first_is_null(v: &redis::Value) -> bool {
-    let redis::Value::Array(items) = v else { return true };
+    let redis::Value::Array(items) = v else {
+        return true;
+    };
     if items.len() < 2 {
         return true;
     }
-    let redis::Value::Array(rows) = &items[1] else { return true };
-    let Some(first_row) = rows.first() else { return true };
-    let redis::Value::Array(cells) = first_row else { return true };
-    let Some(first_cell) = cells.first() else { return true };
+    let redis::Value::Array(rows) = &items[1] else {
+        return true;
+    };
+    let Some(first_row) = rows.first() else {
+        return true;
+    };
+    let redis::Value::Array(cells) = first_row else {
+        return true;
+    };
+    let Some(first_cell) = cells.first() else {
+        return true;
+    };
     matches!(first_cell, redis::Value::Nil)
 }
 
@@ -748,22 +764,20 @@ async fn test_profile_shortestpath_loads_csr_segments() {
     // 4. Verify operator profiles exist (PROFILE-specific output).
     // -----------------------------------------------------------------------
     match &profile_result {
-        redis::Value::Array(items) if items.len() >= 2 => {
-            match &items[1] {
-                redis::Value::Array(ops) => {
-                    assert!(
-                        !ops.is_empty(),
-                        "FIX-05 Test 4: PROFILE should include at least one operator profile. \
+        redis::Value::Array(items) if items.len() >= 2 => match &items[1] {
+            redis::Value::Array(ops) => {
+                assert!(
+                    !ops.is_empty(),
+                    "FIX-05 Test 4: PROFILE should include at least one operator profile. \
                          Got empty operator list."
-                    );
-                }
-                _ => panic!(
-                    "FIX-05 Test 4: PROFILE second element should be Array of op profiles. \
-                     Got: {:?}",
-                    items[1]
-                ),
+                );
             }
-        }
+            _ => panic!(
+                "FIX-05 Test 4: PROFILE second element should be Array of op profiles. \
+                     Got: {:?}",
+                items[1]
+            ),
+        },
         _ => panic!(
             "FIX-05 Test 4: PROFILE response should have 2 elements. Got: {:?}",
             profile_result

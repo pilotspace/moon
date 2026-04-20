@@ -4,7 +4,8 @@
 //! vs Redis's ~50ns per GET.
 
 use bytes::Bytes;
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
+use std::hint::black_box;
 
 use moon::protocol::{self, Frame, ParseConfig};
 use moon::storage::Database;
@@ -155,11 +156,8 @@ fn bench_get_hotpath(c: &mut Criterion) {
 
             // Serialize response
             buf.clear();
-            match result {
-                moon::command::DispatchResult::Response(f) => {
-                    protocol::serialize(&f, &mut buf);
-                }
-                _ => {}
+            if let moon::command::DispatchResult::Response(f) = result {
+                protocol::serialize(&f, &mut buf);
             }
             black_box(&buf);
         })

@@ -158,6 +158,6 @@ mod tests {
         };
         let r2 = r.clone();
         assert_eq!(r2.graph_hops, 2);
-        assert_eq!(format!("{:?}", r2).contains("doc:1"), true);
+        assert!(format!("{:?}", r2).contains("doc:1"));
     }
 }

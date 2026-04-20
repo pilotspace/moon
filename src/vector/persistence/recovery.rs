@@ -405,7 +405,7 @@ mod tests {
         }];
         let (mutables, _) = replay_vector_wal(&records);
         // No collection created because no upserts
-        assert!(mutables.is_empty() || mutables.get(&1).map_or(true, |s| s.len() == 0));
+        assert!(mutables.is_empty() || mutables.get(&1).map_or(true, |s| s.is_empty()));
     }
 
     #[test]

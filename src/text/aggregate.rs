@@ -1488,9 +1488,7 @@ mod tests {
     fn test_merge_partial_states_preserves_group_field_names() {
         // Two GroupBy fields + one reducer alias — output must have all three
         // columns in declared order: @f1, @f2, then cnt.
-        let mut fields: Vec<Bytes> = Vec::new();
-        fields.push(Bytes::from_static(b"@f1"));
-        fields.push(Bytes::from_static(b"@f2"));
+        let fields: Vec<Bytes> = vec![Bytes::from_static(b"@f1"), Bytes::from_static(b"@f2")];
         let reducers = count_reducer(b"cnt");
 
         let key = group_key(&[b"x", b"y"]);

@@ -5,8 +5,6 @@
 //! segment file mid-record, then verifying replay recovers all complete records
 //! and cleanly truncates at the corruption point.
 
-use std::io::Write;
-
 /// Write a valid WAL v3 record to a buffer.
 fn write_test_record(buf: &mut Vec<u8>, lsn: u64, payload: &[u8]) {
     // Record format (little-endian):

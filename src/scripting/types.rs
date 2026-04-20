@@ -265,6 +265,7 @@ mod tests {
     #[test]
     fn test_frame_double_to_lua() {
         let lua = Lua::new();
+        #[allow(clippy::approx_constant)]
         let val = frame_to_lua_value(&lua, &Frame::Double(3.14)).unwrap();
         assert!(matches!(val, LuaValue::Integer(3)));
     }

@@ -3,9 +3,10 @@
 //! Measures creation throughput, as_bytes() access, hashing, equality comparison,
 //! and cloning for both SSO-inline and heap-allocated key paths.
 
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::hint::black_box;
 
 use moon::storage::compact_key::CompactKey;
 
@@ -59,7 +60,7 @@ fn bench_compact_key(c: &mut Criterion) {
     c.bench_function("compact_key/create_mixed_50_50", |b| {
         let mut i = 0u64;
         b.iter(|| {
-            let k = if i % 2 == 0 {
+            let k = if i.is_multiple_of(2) {
                 make_inline_key(i)
             } else {
                 make_heap_key(i)

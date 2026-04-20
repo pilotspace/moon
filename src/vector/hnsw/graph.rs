@@ -627,6 +627,7 @@ mod tests {
     #[test]
     fn test_tq_norm_reads_last_4_bytes() {
         let bytes_per_code: u32 = 8;
+        #[allow(clippy::approx_constant)]
         let norm_val: f32 = 3.14;
         let norm_bytes = norm_val.to_le_bytes();
         let mut vectors_tq = vec![0u8; 8];

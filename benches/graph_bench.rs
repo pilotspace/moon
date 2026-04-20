@@ -174,7 +174,7 @@ fn bench_edge_insert(c: &mut Criterion) {
     c.bench_function("graph_edge_insert", |b| {
         b.iter_custom(|iters| {
             let batch = iters.min(500_000) as usize;
-            let rounds = (iters as usize + batch - 1) / batch;
+            let rounds = (iters as usize).div_ceil(batch);
             let mut total = std::time::Duration::ZERO;
             for _ in 0..rounds {
                 let mut g = MemGraph::new(batch + 10);
@@ -233,7 +233,7 @@ fn bench_addnode_command(c: &mut Criterion) {
         b.iter_custom(|iters| {
             // Cap per-batch to avoid OOM on multi-billion iteration runs.
             let batch = iters.min(500_000) as usize;
-            let rounds = (iters as usize + batch - 1) / batch;
+            let rounds = (iters as usize).div_ceil(batch);
             let mut total = std::time::Duration::ZERO;
             for _ in 0..rounds {
                 let mut g = MemGraph::new(batch + 1);
@@ -258,7 +258,7 @@ fn bench_addedge_command(c: &mut Criterion) {
     c.bench_function("graph_addedge_command", |b| {
         b.iter_custom(|iters| {
             let batch = iters.min(500_000) as usize;
-            let rounds = (iters as usize + batch - 1) / batch;
+            let rounds = (iters as usize).div_ceil(batch);
             let mut total = std::time::Duration::ZERO;
             for _ in 0..rounds {
                 let n = batch + 2;

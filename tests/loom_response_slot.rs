@@ -7,6 +7,8 @@
 //! Run with: cargo test --test loom_response_slot -- --nocapture
 //! Note: loom exhaustive exploration can take 10-60s depending on depth.
 
+#![allow(unexpected_cfgs)]
+
 #[cfg(not(loom))]
 mod non_loom {
     //! When not running under loom, we use std atomics and test the

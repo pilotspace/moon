@@ -312,11 +312,8 @@ async fn test_simplestring_graph_name_captures_intent() {
     let (port, shutdown) = start_txn_server(1).await;
 
     // Use a single raw TCP connection for the entire flow (TXN is per-connection).
-    let mut stream =
-        TcpStream::connect(format!("127.0.0.1:{}", port)).expect("connect to moon");
-    stream
-        .set_nodelay(true)
-        .expect("set nodelay");
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).expect("connect to moon");
+    stream.set_nodelay(true).expect("set nodelay");
 
     // 1. GRAPH.CREATE g (normal BulkString args)
     send_bulk_array(&mut stream, &[b"GRAPH.CREATE", b"g"]);
@@ -338,11 +335,7 @@ async fn test_simplestring_graph_name_captures_intent() {
 
     // 3. GRAPH.QUERY with SimpleString graph name: +g\r\n
     // This is the critical frame — intent capture must handle it.
-    send_graph_query_with_simplestring_name(
-        &mut stream,
-        b"g",
-        b"CREATE (:Person {name:'Eve'})",
-    );
+    send_graph_query_with_simplestring_name(&mut stream, b"g", b"CREATE (:Person {name:'Eve'})");
     let resp = read_response(&mut stream);
     // The query itself should succeed (CREATE returns stats array).
     assert!(
@@ -364,7 +357,11 @@ async fn test_simplestring_graph_name_captures_intent() {
     // Use normal BulkString framing for the verification query.
     send_bulk_array(
         &mut stream,
-        &[b"GRAPH.QUERY", b"g", b"MATCH (n:Person {name:'Eve'}) RETURN n.name"],
+        &[
+            b"GRAPH.QUERY",
+            b"g",
+            b"MATCH (n:Person {name:'Eve'}) RETURN n.name",
+        ],
     );
     let resp = read_response(&mut stream);
     let resp_str = String::from_utf8_lossy(&resp);

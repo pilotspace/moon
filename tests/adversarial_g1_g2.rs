@@ -65,7 +65,9 @@ fn g1_as_of_top_k_oversample_rescues_low_ranked_visible_doc() {
         keys
     );
     assert!(
-        !keys.iter().any(|k| std::str::from_utf8(k).unwrap().starts_with("doc:noisy:")),
+        !keys
+            .iter()
+            .any(|k| std::str::from_utf8(k).unwrap().starts_with("doc:noisy:")),
         "post-snapshot docs must be filtered; got {:?}",
         keys
     );
@@ -200,8 +202,14 @@ fn g1_mixed_pre_mvcc_and_mvcc_docs_both_visible() {
     let terms = vec!["alpha".to_string()];
     let results = idx.search_field_as_of(0, &terms, None, None, 10, 50);
     let keys: std::collections::HashSet<&[u8]> = results.iter().map(|r| r.key.as_ref()).collect();
-    assert!(keys.contains(b"doc:pre_mvcc".as_ref()), "pre-MVCC grandfathered");
-    assert!(keys.contains(b"doc:mvcc20".as_ref()), "pre-snapshot MVCC visible");
+    assert!(
+        keys.contains(b"doc:pre_mvcc".as_ref()),
+        "pre-MVCC grandfathered"
+    );
+    assert!(
+        keys.contains(b"doc:mvcc20".as_ref()),
+        "pre-snapshot MVCC visible"
+    );
     assert!(
         !keys.contains(b"doc:mvcc100".as_ref()),
         "post-snapshot MVCC filtered"
@@ -226,7 +234,10 @@ async fn g2_pure_resp3_population_delivers_push_only() {
     let count = registry.publish(&Bytes::from_static(b"evt"), &Bytes::from_static(b"x"));
     assert_eq!(count, 1);
     let raw = rx.try_recv().expect("got msg");
-    assert!(raw.starts_with(b">"), "RESP3-only delivers Push; got {raw:?}");
+    assert!(
+        raw.starts_with(b">"),
+        "RESP3-only delivers Push; got {raw:?}"
+    );
 }
 
 /// Defect class: PUBLISH to channel with only RESP2 subs must produce Array
@@ -242,7 +253,10 @@ async fn g2_pure_resp2_population_delivers_array_only() {
     );
     registry.publish(&Bytes::from_static(b"evt"), &Bytes::from_static(b"x"));
     let raw = rx.try_recv().expect("got msg");
-    assert!(raw.starts_with(b"*"), "RESP2-only delivers Array; got {raw:?}");
+    assert!(
+        raw.starts_with(b"*"),
+        "RESP2-only delivers Array; got {raw:?}"
+    );
 }
 
 /// Defect class: pattern `news.*` matches channel `news.tech` AND delivers

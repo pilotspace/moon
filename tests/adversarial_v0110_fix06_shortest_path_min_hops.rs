@@ -230,13 +230,19 @@ async fn connect(port: u16) -> redis::aio::MultiplexedConnection {
 
 /// Extract the first row's first column as i64.
 fn first_i64(v: &redis::Value) -> Option<i64> {
-    let redis::Value::Array(items) = v else { return None };
+    let redis::Value::Array(items) = v else {
+        return None;
+    };
     if items.len() < 2 {
         return None;
     }
-    let redis::Value::Array(rows) = &items[1] else { return None };
+    let redis::Value::Array(rows) = &items[1] else {
+        return None;
+    };
     let first_row = rows.first()?;
-    let redis::Value::Array(cells) = first_row else { return None };
+    let redis::Value::Array(cells) = first_row else {
+        return None;
+    };
     let first_cell = cells.first()?;
     match first_cell {
         redis::Value::Int(n) => Some(*n),
@@ -382,9 +388,8 @@ async fn test_shortest_path_fixed_length_error_offset_nonzero() {
         .await;
 
     // Must be an error about variable-length requirement.
-    let err = result.expect_err(
-        "FIX-06: shortestPath with fixed-length edge must return a parse error",
-    );
+    let err =
+        result.expect_err("FIX-06: shortestPath with fixed-length edge must return a parse error");
     let err_msg = format!("{}", err);
     assert!(
         err_msg.to_lowercase().contains("variable-length")
@@ -415,7 +420,10 @@ async fn test_shortest_path_fixed_length_error_offset_nonzero() {
         err_msg
     );
     let after_at = &err_msg[at_pos.unwrap() + 3..];
-    let offset_str: String = after_at.chars().take_while(|c| c.is_ascii_digit()).collect();
+    let offset_str: String = after_at
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
     let offset_val: usize = offset_str.parse().unwrap_or(0);
     assert!(
         offset_val > 0,

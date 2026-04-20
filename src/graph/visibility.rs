@@ -137,10 +137,9 @@ fn is_entity_visible(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bytes::Bytes;
     use smallvec::{SmallVec, smallvec};
 
-    use crate::graph::types::{MutableEdge, MutableNode, NodeKey, PropertyMap};
+    use crate::graph::types::{MutableEdge, MutableNode};
 
     fn empty_committed() -> RoaringBitmap {
         RoaringBitmap::new()

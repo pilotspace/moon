@@ -674,10 +674,12 @@ mod tests {
         interleave_block(&codes, n, dim_half, &mut out);
 
         // First 5 positions should have data, rest should be 0
+        #[allow(clippy::identity_op, clippy::erasing_op)]
         for v in 0..n {
             assert_eq!(out[0 * BLOCK_SIZE + v], (v * 10) as u8);
             assert_eq!(out[1 * BLOCK_SIZE + v], (v * 10 + 1) as u8);
         }
+        #[allow(clippy::identity_op, clippy::erasing_op)]
         for v in n..BLOCK_SIZE {
             assert_eq!(out[0 * BLOCK_SIZE + v], 0, "not zero-padded at d=0 v={v}");
             assert_eq!(out[1 * BLOCK_SIZE + v], 0, "not zero-padded at d=1 v={v}");
@@ -743,7 +745,10 @@ mod tests {
                 );
             }
             // Centroid 7 and 8 are near zero, should have smallest distances
-            assert!(lut[coord * 16 + 7] <= lut[coord * 16 + 0]);
+            #[allow(clippy::identity_op)]
+            {
+                assert!(lut[coord * 16 + 7] <= lut[coord * 16 + 0]);
+            }
             assert!(lut[coord * 16 + 8] <= lut[coord * 16 + 15]);
         }
     }
@@ -1018,7 +1023,7 @@ mod tests {
         let norms = vec![1.0f32; 8];
         let pl = interleave_posting_list(&codes, &ids, &norms);
 
-        let centroids_data = vec![0.0f32; 1 * dim];
+        let centroids_data = vec![0.0f32; dim];
 
         let mut sf_buf = AlignedBuffer::new(pdim);
         sf_buf.as_mut_slice().copy_from_slice(&signs);

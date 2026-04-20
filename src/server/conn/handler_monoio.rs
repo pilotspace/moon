@@ -3444,7 +3444,9 @@ pub(crate) async fn handle_connection_sharded_monoio<
                             && crate::command::graph::is_cypher_write_query(cmd_args))
                     {
                         let mut gs = ctx.shard_databases.graph_store_write(ctx.shard_id);
-                        let (resp, cypher_intents, undo_ops) = if cmd.eq_ignore_ascii_case(b"GRAPH.QUERY") {
+                        let (resp, cypher_intents, undo_ops) = if cmd
+                            .eq_ignore_ascii_case(b"GRAPH.QUERY")
+                        {
                             // Phase 167 (CYP-01/02): capture Cypher-created
                             // nodes/edges so TXN.ABORT can roll them back via
                             // CrossStoreTxn::record_graph.

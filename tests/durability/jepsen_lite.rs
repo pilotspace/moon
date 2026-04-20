@@ -67,8 +67,8 @@ fn send_cmd(addr: &str, cmd: &str) -> String {
                     break;
                 }
                 // Bulk string: $N header — read N bytes + CRLF
-                if trimmed.starts_with('$') {
-                    let len: i64 = trimmed[1..].trim().parse().unwrap_or(-1);
+                if let Some(stripped) = trimmed.strip_prefix('$') {
+                    let len: i64 = stripped.trim().parse().unwrap_or(-1);
                     if len < 0 {
                         break; // $-1 = nil
                     }

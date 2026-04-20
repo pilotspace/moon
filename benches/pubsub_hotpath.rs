@@ -7,7 +7,8 @@
 //! 4. Full publish cycle
 
 use bytes::Bytes;
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{Criterion, criterion_group, criterion_main};
+use std::hint::black_box;
 
 use moon::pubsub::PubSubRegistry;
 use moon::pubsub::subscriber::Subscriber;

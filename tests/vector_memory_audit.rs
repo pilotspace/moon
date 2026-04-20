@@ -99,7 +99,7 @@ fn test_memory_budget_1m_768d_tq4() {
     println!("  CollectionMetadata: {} KB", collection_meta / 1024);
 
     // 8. BitVec for visited: negligible, reused
-    let bitvec_total = ((n + 63) / 64) * 8;
+    let bitvec_total = n.div_ceil(64) * 8;
     println!("  BitVec (visited): {} KB", bitvec_total / 1024);
 
     // Total

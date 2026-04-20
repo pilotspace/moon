@@ -239,13 +239,19 @@ async fn connect(port: u16) -> redis::aio::MultiplexedConnection {
 /// Extract the first row's first column as i64. Returns None if absent / wrong
 /// shape / not an integer.
 fn first_i64(v: &redis::Value) -> Option<i64> {
-    let redis::Value::Array(items) = v else { return None };
+    let redis::Value::Array(items) = v else {
+        return None;
+    };
     if items.len() < 2 {
         return None;
     }
-    let redis::Value::Array(rows) = &items[1] else { return None };
+    let redis::Value::Array(rows) = &items[1] else {
+        return None;
+    };
     let first_row = rows.first()?;
-    let redis::Value::Array(cells) = first_row else { return None };
+    let redis::Value::Array(cells) = first_row else {
+        return None;
+    };
     let first_cell = cells.first()?;
     match first_cell {
         redis::Value::Int(n) => Some(*n),
@@ -257,7 +263,9 @@ fn first_i64(v: &redis::Value) -> Option<i64> {
 
 /// Number of rows in a GRAPH.QUERY response (Array[headers, rows, stats]).
 fn row_count(v: &redis::Value) -> usize {
-    let redis::Value::Array(items) = v else { return 0 };
+    let redis::Value::Array(items) = v else {
+        return 0;
+    };
     if items.len() < 2 {
         return 0;
     }
@@ -444,17 +452,11 @@ async fn test_txn_abort_rolls_back_cypher_delete_edge() {
     // Pre-state: the KNOWS edge exists.
     let pre: redis::Value = redis::cmd("GRAPH.QUERY")
         .arg("g")
-        .arg(
-            "MATCH (a:Person {name:'Alice'})-[r:KNOWS]->(b:Person {name:'Bob'}) RETURN a.name",
-        )
+        .arg("MATCH (a:Person {name:'Alice'})-[r:KNOWS]->(b:Person {name:'Bob'}) RETURN a.name")
         .query_async(&mut conn)
         .await
         .expect("pre-check edge");
-    assert_eq!(
-        row_count(&pre),
-        1,
-        "edge must exist pre-txn. Resp={pre:?}"
-    );
+    assert_eq!(row_count(&pre), 1, "edge must exist pre-txn. Resp={pre:?}");
 
     // Txn: delete the edge.
     let _: String = redis::cmd("TXN")
@@ -480,9 +482,7 @@ async fn test_txn_abort_rolls_back_cypher_delete_edge() {
     //        Checked post-ABORT below.
     let mid: redis::Value = redis::cmd("GRAPH.QUERY")
         .arg("g")
-        .arg(
-            "MATCH (a:Person {name:'Alice'})-[r:KNOWS]->(b:Person {name:'Bob'}) RETURN a.name",
-        )
+        .arg("MATCH (a:Person {name:'Alice'})-[r:KNOWS]->(b:Person {name:'Bob'}) RETURN a.name")
         .query_async(&mut conn)
         .await
         .expect("mid-txn edge check");
@@ -502,9 +502,7 @@ async fn test_txn_abort_rolls_back_cypher_delete_edge() {
     // Post-abort: the KNOWS edge must be restored.
     let post: redis::Value = redis::cmd("GRAPH.QUERY")
         .arg("g")
-        .arg(
-            "MATCH (a:Person {name:'Alice'})-[r:KNOWS]->(b:Person {name:'Bob'}) RETURN a.name",
-        )
+        .arg("MATCH (a:Person {name:'Alice'})-[r:KNOWS]->(b:Person {name:'Bob'}) RETURN a.name")
         .query_async(&mut conn)
         .await
         .expect("post-abort edge check");

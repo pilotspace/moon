@@ -391,7 +391,7 @@ mod tests {
 
     #[test]
     fn test_format_float_no_trailing_zeros() {
-        assert_eq!(format_float(3.14), "3.14");
+        assert_eq!(format_float(3.15), "3.15");
         assert_eq!(format_float(3.0), "3");
         assert_eq!(format_float(3.1), "3.1");
         assert_eq!(format_float(10.0), "10");

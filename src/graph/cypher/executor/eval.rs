@@ -239,7 +239,12 @@ pub(crate) fn eval_expr(
         Expr::MapLit(entries) => {
             let map: Vec<(String, Value)> = entries
                 .iter()
-                .map(|(k, v)| (k.clone(), eval_expr(v, row, memgraph, params, immutable_segs, snapshot_lsn)))
+                .map(|(k, v)| {
+                    (
+                        k.clone(),
+                        eval_expr(v, row, memgraph, params, immutable_segs, snapshot_lsn),
+                    )
+                })
                 .collect();
             Value::Map(map)
         }

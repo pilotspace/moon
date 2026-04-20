@@ -322,15 +322,19 @@ mod tests {
 
         // LUT for coord 0: [0, 10, 20, 30, ...] (dist = k * 10)
         // LUT for coord 1: [0, 5, 10, 15, ...]  (dist = k * 5)
+        #[allow(clippy::identity_op, clippy::erasing_op)]
         for k in 0..16 {
             lut[0 * 16 + k] = (k * 10).min(255) as u8; // coord 0
             lut[1 * 16 + k] = (k * 5).min(255) as u8; // coord 1
         }
 
         // Vector 0: lo_idx=2, hi_idx=3 -> byte = 0x32
-        codes[0 * BLOCK_SIZE + 0] = 0x32;
-        // Vector 1: lo_idx=0, hi_idx=1 -> byte = 0x10
-        codes[0 * BLOCK_SIZE + 1] = 0x10;
+        #[allow(clippy::identity_op, clippy::erasing_op)]
+        {
+            codes[0 * BLOCK_SIZE + 0] = 0x32;
+            // Vector 1: lo_idx=0, hi_idx=1 -> byte = 0x10
+            codes[0 * BLOCK_SIZE + 1] = 0x10;
+        }
 
         let mut results = [0u16; 32];
         fastscan_block_scalar(&codes, &lut, dim_half, &mut results);
@@ -365,7 +369,7 @@ mod tests {
         let n = 10;
 
         // Build interleaved codes for 10 vectors.
-        let mut codes = vec![0u8; 1 * dim_half * BLOCK_SIZE]; // 1 block
+        let mut codes = vec![0u8; dim_half * BLOCK_SIZE]; // 1 block
         let mut lut = vec![0u8; padded_dim * 16];
 
         // Simple LUT: lut[coord * 16 + k] = k.
