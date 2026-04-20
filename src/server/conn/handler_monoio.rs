@@ -3472,13 +3472,13 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     let is_edge = cmd.eq_ignore_ascii_case(b"GRAPH.ADDEDGE");
                     if is_node || is_edge {
                         if let Frame::Integer(id) = &response {
-                            if let Some(Frame::BulkString(gname)) = cmd_args.first() {
-                                txn.record_graph(*id as u64, is_node, gname.clone());
+                            if let Some(gname) = cmd_args.first().and_then(|f| extract_bytes(f)) {
+                                txn.record_graph(*id as u64, is_node, gname);
                             }
                         }
                     }
                     if !cypher_intents.is_empty() {
-                        if let Some(Frame::BulkString(gname)) = cmd_args.first() {
+                        if let Some(gname) = cmd_args.first().and_then(|f| extract_bytes(f)) {
                             for intent in &cypher_intents {
                                 txn.record_graph(intent.entity_id, intent.is_node, gname.clone());
                             }
