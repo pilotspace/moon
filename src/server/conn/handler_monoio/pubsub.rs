@@ -99,6 +99,130 @@ pub(super) fn try_handle_unsubscribe(cmd: &[u8], responses: &mut Vec<Frame>) -> 
     false
 }
 
+/// Result of SUBSCRIBE/PSUBSCRIBE dispatch in normal mode.
+pub(super) enum SubscribeResult {
+    /// Not a SUBSCRIBE/PSUBSCRIBE command.
+    NotSubscribe,
+    /// Argument validation failed; error pushed to responses. Caller should `continue`.
+    ArgError,
+    /// Subscription registered, responses encoded into write_buf.
+    /// Caller must flush write_buf and `break` the frame loop.
+    Subscribed,
+    /// Write error during flush. Caller should return Done.
+    WriteError,
+}
+
+/// Handle SUBSCRIBE / PSUBSCRIBE entry in normal (non-subscriber) mode.
+///
+/// Allocates pubsub channel if needed, registers subscriptions, encodes responses
+/// into write_buf, and flushes. Returns `SubscribeResult` to tell the caller
+/// whether to break or continue.
+pub(super) async fn try_handle_subscribe_entry<S: monoio::io::AsyncWriteRent>(
+    cmd: &[u8],
+    cmd_args: &[Frame],
+    conn: &mut super::super::core::ConnectionState,
+    ctx: &super::super::core::ConnectionContext,
+    peer_addr: &str,
+    responses: &mut Vec<Frame>,
+    codec: &mut crate::server::codec::RespCodec,
+    write_buf: &mut bytes::BytesMut,
+    stream: &mut S,
+) -> SubscribeResult {
+    if !cmd.eq_ignore_ascii_case(b"SUBSCRIBE") && !cmd.eq_ignore_ascii_case(b"PSUBSCRIBE") {
+        return SubscribeResult::NotSubscribe;
+    }
+    let is_pattern = cmd.eq_ignore_ascii_case(b"PSUBSCRIBE");
+    if cmd_args.is_empty() {
+        let cmd_name = if is_pattern {
+            "psubscribe"
+        } else {
+            "subscribe"
+        };
+        let err = Frame::Error(Bytes::from(format!(
+            "ERR wrong number of arguments for '{}' command",
+            cmd_name
+        )));
+        responses.push(err);
+        return SubscribeResult::ArgError;
+    }
+    // Allocate pubsub channel if not yet created
+    if conn.pubsub_tx.is_none() {
+        let (tx, rx) = crate::runtime::channel::mpsc_bounded::<bytes::Bytes>(256);
+        conn.pubsub_tx = Some(tx);
+        conn.pubsub_rx = Some(rx);
+    }
+    if conn.subscriber_id == 0 {
+        conn.subscriber_id = crate::pubsub::next_subscriber_id();
+    }
+    // Flush accumulated responses before entering subscriber mode
+    for resp in &*responses {
+        codec.encode_frame(resp, write_buf);
+    }
+    for arg in cmd_args {
+        if let Some(ch) = extract_bytes(arg) {
+            // ACL channel permission check
+            {
+                #[allow(clippy::unwrap_used)]
+                // std RwLock: poison = prior panic = unrecoverable
+                let acl_guard = ctx.acl_table.read().unwrap();
+                if let Some(deny_reason) =
+                    acl_guard.check_channel_permission(&conn.current_user, ch.as_ref())
+                {
+                    drop(acl_guard);
+                    let err = Frame::Error(Bytes::from(format!("NOPERM {}", deny_reason)));
+                    codec.encode_frame(&err, write_buf);
+                    continue;
+                }
+            }
+            #[allow(clippy::unwrap_used)]
+            // conn.pubsub_tx is set to Some just above before this loop
+            let sub = crate::pubsub::subscriber::Subscriber::with_protocol(
+                conn.pubsub_tx.clone().unwrap(),
+                conn.subscriber_id,
+                conn.protocol_version >= 3,
+            );
+            if is_pattern {
+                ctx.pubsub_registry.write().psubscribe(ch.clone(), sub);
+            } else {
+                ctx.pubsub_registry.write().subscribe(ch.clone(), sub);
+            }
+            super::propagate_subscription(
+                &ctx.all_remote_sub_maps,
+                &ch,
+                ctx.shard_id,
+                ctx.num_shards,
+                is_pattern,
+            );
+            conn.subscription_count += 1;
+            // Register pub/sub affinity for this client IP
+            if conn.subscription_count == 1 {
+                if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
+                    ctx.pubsub_affinity
+                        .write()
+                        .register(addr.ip(), ctx.shard_id);
+                }
+            }
+            let resp = if is_pattern {
+                crate::pubsub::psubscribe_response(&ch, conn.subscription_count)
+            } else {
+                crate::pubsub::subscribe_response(&ch, conn.subscription_count)
+            };
+            codec.encode_frame(&resp, write_buf);
+        }
+    }
+    // Flush responses and re-enter loop (next iteration enters subscriber mode)
+    if !write_buf.is_empty() {
+        use monoio::io::AsyncWriteRentExt;
+        let data = write_buf.split().freeze();
+        let (result, _): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(data).await;
+        if result.is_err() {
+            return SubscribeResult::WriteError;
+        }
+    }
+    responses.clear();
+    SubscribeResult::Subscribed
+}
+
 /// Handle PUBSUB introspection subcommands (CHANNELS, NUMSUB, NUMPAT).
 /// Returns `true` if the command was consumed.
 pub(super) fn try_handle_pubsub_introspection(

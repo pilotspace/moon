@@ -32,6 +32,7 @@ pub(crate) use shared::{SharedDatabases, execute_transaction};
 pub(crate) use shared::{
     execute_transaction_sharded, extract_primary_key, handle_config, is_multi_key_command,
 };
+#[allow(unused_imports)]
 pub(crate) use util::{
     apply_resp3_conversion, extract_bytes, extract_command, propagate_subscription,
     restore_migrated_state, unpropagate_subscription,

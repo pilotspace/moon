@@ -17,34 +17,15 @@ use ringbuf::traits::Producer;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::Arc;
 
-use crate::command::connection as conn_cmd;
 use crate::command::metadata;
-use crate::command::mq::{
-    ERR_MQ_NOT_DURABLE, ERR_MQ_UNKNOWN_SUB, parse_mq_subcommand, validate_mq_ack,
-    validate_mq_create, validate_mq_dlqlen, validate_mq_pop, validate_mq_publish, validate_mq_push,
-    validate_mq_trigger,
-};
-use crate::command::transaction::ERR_MULTI_TXN_CONFLICT;
-use crate::command::workspace::{
-    ERR_WS_ALREADY_BOUND, ERR_WS_NOT_FOUND, ERR_WS_UNKNOWN_SUB, parse_workspace_id_from_bytes,
-    parse_ws_subcommand, validate_ws_auth, validate_ws_create, validate_ws_drop, validate_ws_info,
-    validate_ws_list,
-};
 use crate::command::{DispatchResult, dispatch, dispatch_read, is_dispatch_read_supported};
-use crate::mq::is_mq_command;
 use crate::persistence::aof::{self, AofMessage};
 use crate::protocol::Frame;
-use crate::pubsub::subscriber::Subscriber;
-use crate::shard::dispatch::{ShardMessage, key_to_shard};
+use crate::shard::dispatch::key_to_shard;
 use crate::shard::mesh::ChannelMesh;
 use crate::storage::eviction::{try_evict_if_needed, try_evict_if_needed_async_spill};
-use crate::storage::stream::StreamId;
-use crate::tracking::TrackingState;
-use crate::workspace::{
-    WorkspaceId, is_ws_command, strip_workspace_prefix_from_response, workspace_rewrite_args,
-};
+use crate::workspace::{strip_workspace_prefix_from_response, workspace_rewrite_args};
 
 use super::affinity::MigratedConnectionState;
 use super::{
@@ -54,7 +35,9 @@ use super::{
     unpropagate_subscription,
 };
 use crate::framevec;
+use crate::pubsub::subscriber::Subscriber;
 use crate::server::codec::RespCodec;
+use crate::shard::dispatch::ShardMessage;
 // ResponseSlotPool NOT used on monoio — its AtomicWaker doesn't cross
 // monoio's single-threaded (!Send) executor boundary. Use oneshot channels.
 
@@ -74,18 +57,7 @@ pub enum MonoioHandlerResult {
 }
 
 /// Monoio connection handler using ownership-based I/O (AsyncReadRent/AsyncWriteRent).
-///
-/// Reads RESP frames from the TCP stream, dispatches commands through the same
-/// `crate::command::dispatch()` path as the tokio handler, and writes responses back.
-///
-/// MVP scope: SET/GET/PING/QUIT/SELECT/DEL/COMMAND and all other commands supported
-/// by `dispatch()`. Skips pub/sub, blocking, tracking, cluster, replication, and ACL
-/// enforcement -- those parameters are accepted but unused for future wiring.
-///
-/// Key difference from tokio path: monoio's `stream.read(buf)` takes ownership of the
-/// buffer and returns `(Result<usize>, buf)`. We use a `Vec<u8>` intermediate for the
-/// read since monoio's IoBufMut is implemented for Vec<u8>, then copy into BytesMut
-/// for codec parsing.
+/// Dispatches commands through `crate::command::dispatch()` with monoio's ownership I/O model.
 #[cfg(feature = "runtime-monoio")]
 #[tracing::instrument(skip_all, level = "debug")]
 pub(crate) async fn handle_connection_sharded_monoio<
@@ -479,30 +451,11 @@ pub(crate) async fn handle_connection_sharded_monoio<
             }
         }
 
-        // Inline dispatch: handle GET/SET directly from raw bytes without Frame
-        // construction or dispatch table lookup. For multi-shard, only local keys
-        // are inlined; remote keys fall through to normal cross-shard dispatch.
-        // Skip inline dispatch when not conn.authenticated — AUTH must go through normal path.
-        // Skip inline dispatch for workspace-bound connections: workspace key prefix
-        // injection happens in the normal dispatch path (line 2356+) and the inline
-        // path has no equivalent, so GET/SET would use the raw (un-prefixed) key,
-        // causing GET to return nil even after SET succeeds (LVAL-01 bug).
+        // Inline dispatch: GET/SET directly from raw bytes, skipping Frame construction.
+        // Skip when unauthenticated or workspace-bound (prefix injection in normal path only).
         if conn.authenticated && conn.workspace_id.is_none() {
-            // Inline writes are only safe when every side-effect handled by
-            // the normal dispatch path is either covered by the inline path
-            // or provably unnecessary:
-            //   - `cached_acl_unrestricted`: ACL check can be skipped
-            //   - `!in_multi`: writes must be queued into the transaction
-            //   - `!tracking_enabled`: CLIENT TRACKING invalidation required
-            //   - `!is_replica`: replica rejects writes with READONLY
-            //   - `spill_sender.is_none()`: tiered storage needs async spill
-            //     eviction, not the synchronous delete path.
-            //
-            // The replica check does a non-blocking `try_read` on the shared
-            // `RwLock<ReplicationState>`. If the lock is momentarily held for
-            // write (role change in progress), fail safe by disabling inline
-            // writes for this batch — the normal dispatch path will do the
-            // full check next iteration.
+            // Inline writes safe only when: ACL unrestricted, !in_multi, !tracking,
+            // !is_replica, no spill_sender. Replica check is non-blocking try_read.
             let is_replica = ctx.repl_state.as_ref().is_some_and(|rs| {
                 rs.try_read().is_ok_and(|g| {
                     matches!(
@@ -569,16 +522,10 @@ pub(crate) async fn handle_connection_sharded_monoio<
             monoio::time::sleep(remaining).await;
         }
 
-        // Process frames with shard routing, cross-shard dispatch, and AOF logging
-        // Note: do NOT clear write_buf -- it may contain responses from inline dispatch.
-        // The inline path appends directly; the normal path appends via encode_frame below.
-        // write_buf is cleared via .split().freeze() at the flush point each iteration.
+        // Process frames (do NOT clear write_buf -- may have inline dispatch responses).
         let mut should_quit = false;
-
-        // Pipeline batch optimization: reuse pre-allocated containers (clear, not re-create).
         responses.clear();
         remote_groups.clear();
-        // Accumulate cross-shard PUBLISH pairs per target shard for batch dispatch
         let mut publish_batches: std::collections::HashMap<usize, Vec<(usize, Bytes, Bytes)>> =
             std::collections::HashMap::new();
 
@@ -592,79 +539,27 @@ pub(crate) async fn handle_connection_sharded_monoio<
 
         for frame in frames.drain(..) {
             // --- AUTH gate ---
-            if !conn.authenticated {
-                match extract_command(&frame) {
-                    Some((cmd, cmd_args)) if cmd.eq_ignore_ascii_case(b"AUTH") => {
-                        let (response, opt_user) = conn_cmd::auth_acl(cmd_args, &ctx.acl_table);
-                        if let Some(uname) = opt_user {
-                            conn.authenticated = true;
-                            conn.current_user = uname;
-                            conn.refresh_acl_cache(&ctx.acl_table);
-                            if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
-                                crate::auth_ratelimit::record_success(addr.ip());
-                            }
-                        } else {
-                            if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
-                                auth_delay_ms += crate::auth_ratelimit::record_failure(addr.ip());
-                            }
-                            conn.acl_log.push(crate::acl::AclLogEntry {
-                                reason: "auth".to_string(),
-                                object: "AUTH".to_string(),
-                                username: conn.current_user.clone(),
-                                client_addr: peer_addr.clone(),
-                                timestamp_ms: std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .unwrap_or_default()
-                                    .as_millis()
-                                    as u64,
-                            });
-                        }
-                        responses.push(response);
-                        continue;
-                    }
-                    Some((cmd, cmd_args)) if cmd.eq_ignore_ascii_case(b"HELLO") => {
-                        let (response, new_proto, new_name, opt_user) = conn_cmd::hello_acl(
-                            cmd_args,
-                            conn.protocol_version,
-                            client_id,
-                            &ctx.acl_table,
-                            &mut conn.authenticated,
-                        );
-                        if !matches!(&response, Frame::Error(_)) {
-                            conn.protocol_version = new_proto;
-                        }
-                        if let Some(name) = new_name {
-                            conn.client_name = Some(name);
-                        }
-                        if let Some(ref uname) = opt_user {
-                            conn.current_user = uname.clone();
-                            conn.refresh_acl_cache(&ctx.acl_table);
-                        }
-                        // HELLO AUTH rate limiting
-                        if matches!(&response, Frame::Error(_)) {
-                            if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
-                                auth_delay_ms += crate::auth_ratelimit::record_failure(addr.ip());
-                            }
-                        } else if opt_user.is_some() {
-                            if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
-                                crate::auth_ratelimit::record_success(addr.ip());
-                            }
-                        }
-                        responses.push(response);
-                        continue;
-                    }
-                    Some((cmd, _)) if cmd.eq_ignore_ascii_case(b"QUIT") => {
-                        responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
-                        should_quit = true;
-                        break;
-                    }
-                    _ => {
-                        responses.push(Frame::Error(Bytes::from_static(
-                            b"NOAUTH Authentication required.",
-                        )));
-                        continue;
-                    }
+            match dispatch::check_auth_gate(
+                &frame,
+                &mut conn,
+                ctx,
+                &peer_addr,
+                client_id,
+                &mut responses,
+                &mut auth_delay_ms,
+            ) {
+                dispatch::AuthGateResult::Consumed => continue,
+                dispatch::AuthGateResult::Quit => {
+                    should_quit = true;
+                    break;
                 }
+                dispatch::AuthGateResult::NotAuth => {
+                    responses.push(Frame::Error(Bytes::from_static(
+                        b"NOAUTH Authentication required.",
+                    )));
+                    continue;
+                }
+                dispatch::AuthGateResult::Authenticated => {}
             }
 
             let (cmd, cmd_args) = match extract_command(&frame) {
@@ -683,749 +578,135 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 should_quit = true;
                 break;
             }
-
-            // --- ASKING: set per-connection flag for next command ---
+            // --- ASKING ---
             if cmd.eq_ignore_ascii_case(b"ASKING") {
                 conn.asking = true;
                 responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
                 continue;
             }
-
-            // --- CLUSTER subcommands ---
-            if cmd.eq_ignore_ascii_case(b"CLUSTER") {
-                if let Some(ref cs) = ctx.cluster_state {
-                    #[allow(clippy::unwrap_used)] // Fallback "127.0.0.1:6379" is a valid literal
-                    let self_addr: std::net::SocketAddr = format!("127.0.0.1:{}", ctx.config_port)
-                        .parse()
-                        .unwrap_or_else(|_| "127.0.0.1:6379".parse().unwrap());
-                    let resp =
-                        crate::cluster::command::handle_cluster_command(cmd_args, cs, self_addr);
-                    responses.push(resp);
-                } else {
-                    responses.push(Frame::Error(Bytes::from_static(
-                        b"ERR This instance has cluster support disabled",
-                    )));
-                }
+            // --- Connection-level commands (dispatched to dispatch.rs) ---
+            if dispatch::try_handle_cluster(cmd, cmd_args, ctx, &mut responses) {
                 continue;
             }
-
-            // --- Lua scripting: EVALSHA ---
-            if cmd.eq_ignore_ascii_case(b"EVALSHA") {
-                let response = {
-                    let mut guard = ctx.shard_databases.write_db(ctx.shard_id, conn.selected_db);
-                    let db_count = ctx.shard_databases.db_count();
-                    let db = &mut guard;
-                    crate::scripting::handle_evalsha(
-                        &ctx.lua,
-                        &ctx.script_cache,
-                        cmd_args,
-                        db,
-                        ctx.shard_id,
-                        ctx.num_shards,
-                        conn.selected_db,
-                        db_count,
-                    )
-                };
-                responses.push(response);
+            if dispatch::try_handle_evalsha(cmd, cmd_args, &conn, ctx, &mut responses) {
                 continue;
             }
-
-            // --- Lua scripting: EVAL ---
-            if cmd.eq_ignore_ascii_case(b"EVAL") {
-                let response = {
-                    let mut guard = ctx.shard_databases.write_db(ctx.shard_id, conn.selected_db);
-                    let db_count = ctx.shard_databases.db_count();
-                    let db = &mut guard;
-                    crate::scripting::handle_eval(
-                        &ctx.lua,
-                        &ctx.script_cache,
-                        cmd_args,
-                        db,
-                        ctx.shard_id,
-                        ctx.num_shards,
-                        conn.selected_db,
-                        db_count,
-                    )
-                };
-                responses.push(response);
+            if dispatch::try_handle_eval(cmd, cmd_args, &conn, ctx, &mut responses) {
                 continue;
             }
-
-            // --- SCRIPT subcommands: LOAD, EXISTS, FLUSH ---
-            if cmd.eq_ignore_ascii_case(b"SCRIPT") {
-                let (response, fanout) =
-                    crate::scripting::handle_script_subcommand(&ctx.script_cache, cmd_args);
-                if let Some((sha1, script_bytes)) = fanout {
-                    let mut producers = ctx.dispatch_tx.borrow_mut();
-                    for target in 0..ctx.num_shards {
-                        if target == ctx.shard_id {
-                            continue;
-                        }
-                        let idx = ChannelMesh::target_index(ctx.shard_id, target);
-                        let msg = ShardMessage::ScriptLoad {
-                            sha1: sha1.clone(),
-                            script: script_bytes.clone(),
-                        };
-                        if producers[idx].try_push(msg).is_ok() {
-                            ctx.spsc_notifiers[target].notify_one();
-                        }
-                    }
-                    drop(producers);
-                }
-                responses.push(response);
+            if dispatch::try_handle_script(cmd, cmd_args, ctx, &mut responses) {
                 continue;
             }
-
-            // --- Cluster slot routing (pre-dispatch) ---
-            if crate::cluster::cluster_enabled() {
-                if let Some(ref cs) = ctx.cluster_state {
-                    let was_asking = conn.asking;
-                    conn.asking = false;
-
-                    let maybe_key = extract_primary_key(cmd, cmd_args);
-                    if let Some(key) = maybe_key {
-                        let slot = crate::cluster::slots::slot_for_key(key);
-                        #[allow(clippy::unwrap_used)]
-                        // std RwLock: poison = prior panic = unrecoverable
-                        let route = cs.read().unwrap().route_slot(slot, was_asking);
-                        match route {
-                            crate::cluster::SlotRoute::Local => {} // proceed
-                            other => {
-                                let err_frame = other.into_error_frame(slot);
-                                responses.push(err_frame);
-                                continue;
-                            }
-                        }
-
-                        // CROSSSLOT check for multi-key commands
-                        if is_multi_key_command(cmd, cmd_args) {
-                            let first_slot = slot;
-                            let mut cross_slot = false;
-                            for arg in cmd_args.iter().skip(1) {
-                                if let Some(k) = match arg {
-                                    Frame::BulkString(b) => Some(b.as_ref()),
-                                    _ => None,
-                                } {
-                                    if crate::cluster::slots::slot_for_key(k) != first_slot {
-                                        cross_slot = true;
-                                        break;
-                                    }
-                                }
-                            }
-                            if cross_slot {
-                                responses.push(Frame::Error(Bytes::from_static(
-                                    b"CROSSSLOT Keys in request don't hash to the same slot",
-                                )));
-                                continue;
-                            }
-                        }
-                    }
-                }
-            }
-
-            // --- AUTH (already conn.authenticated) ---
-            if cmd.eq_ignore_ascii_case(b"AUTH") {
-                let (response, opt_user) = conn_cmd::auth_acl(cmd_args, &ctx.acl_table);
-                if let Some(uname) = opt_user {
-                    conn.current_user = uname;
-                    conn.refresh_acl_cache(&ctx.acl_table);
-                    if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
-                        crate::auth_ratelimit::record_success(addr.ip());
-                    }
-                } else if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
-                    auth_delay_ms += crate::auth_ratelimit::record_failure(addr.ip());
-                }
-                responses.push(response);
+            if dispatch::try_handle_cluster_routing(cmd, cmd_args, &mut conn, ctx, &mut responses) {
                 continue;
             }
-
-            // --- HELLO (protocol negotiation, ACL-aware) ---
-            if cmd.eq_ignore_ascii_case(b"HELLO") {
-                let (response, new_proto, new_name, opt_user) = conn_cmd::hello_acl(
-                    cmd_args,
-                    conn.protocol_version,
-                    client_id,
-                    &ctx.acl_table,
-                    &mut conn.authenticated,
-                );
-                if !matches!(&response, Frame::Error(_)) {
-                    conn.protocol_version = new_proto;
-                }
-                if let Some(name) = new_name {
-                    conn.client_name = Some(name);
-                }
-                if let Some(ref uname) = opt_user {
-                    conn.current_user = uname.clone();
-                    conn.refresh_acl_cache(&ctx.acl_table);
-                }
-                if matches!(&response, Frame::Error(_)) {
-                    if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
-                        auth_delay_ms += crate::auth_ratelimit::record_failure(addr.ip());
-                    }
-                } else if opt_user.is_some() {
-                    if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
-                        crate::auth_ratelimit::record_success(addr.ip());
-                    }
-                }
-                responses.push(response);
+            if dispatch::try_handle_auth(
+                cmd,
+                cmd_args,
+                &mut conn,
+                ctx,
+                &peer_addr,
+                &mut auth_delay_ms,
+                &mut responses,
+            ) {
                 continue;
             }
-
-            // --- ACL command (intercepted at connection level) ---
-            if cmd.eq_ignore_ascii_case(b"ACL") {
-                let response = crate::command::acl::handle_acl(
-                    cmd_args,
-                    &ctx.acl_table,
-                    &mut conn.acl_log,
-                    &conn.current_user,
-                    &peer_addr,
-                    &ctx.runtime_config,
-                );
-                responses.push(response);
+            if dispatch::try_handle_hello(
+                cmd,
+                cmd_args,
+                &mut conn,
+                ctx,
+                client_id,
+                &peer_addr,
+                &mut auth_delay_ms,
+                &mut responses,
+            ) {
                 continue;
             }
-
-            // --- CONFIG GET/SET ---
-            if cmd.eq_ignore_ascii_case(b"CONFIG") {
-                responses.push(handle_config(cmd_args, &ctx.runtime_config, &ctx.config));
+            if dispatch::try_handle_acl(cmd, cmd_args, &mut conn, ctx, &peer_addr, &mut responses) {
                 continue;
             }
-
-            // --- REPLICAOF / SLAVEOF ---
-            if cmd.eq_ignore_ascii_case(b"REPLICAOF") || cmd.eq_ignore_ascii_case(b"SLAVEOF") {
-                use crate::command::connection::{ReplicaofAction, replicaof};
-                let (resp, action) = replicaof(cmd_args);
-                if let Some(action) = action {
-                    if let Some(ref rs) = ctx.repl_state {
-                        match action {
-                            ReplicaofAction::StartReplication { host, port } => {
-                                if let Ok(mut rs_guard) = rs.write() {
-                                    rs_guard.role = crate::replication::state::ReplicationRole::Replica {
-                                        host: host.clone(),
-                                        port,
-                                        state: crate::replication::handshake::ReplicaHandshakeState::PingPending,
-                                    };
-                                }
-                                let rs_clone = Arc::clone(rs);
-                                let cfg = crate::replication::replica::ReplicaTaskConfig {
-                                    master_host: host,
-                                    master_port: port,
-                                    repl_state: rs_clone,
-                                    num_shards: ctx.num_shards,
-                                    persistence_dir: None,
-                                    listening_port: 0,
-                                };
-                                monoio::spawn(crate::replication::replica::run_replica_task(cfg));
-                            }
-                            ReplicaofAction::PromoteToMaster => {
-                                use crate::replication::state::generate_repl_id;
-                                if let Ok(mut rs_guard) = rs.write() {
-                                    rs_guard.repl_id2 = rs_guard.repl_id.clone();
-                                    rs_guard.repl_id = generate_repl_id();
-                                    rs_guard.role =
-                                        crate::replication::state::ReplicationRole::Master;
-                                }
-                            }
-                            ReplicaofAction::NoOp => {}
-                        }
-                    }
-                }
-                responses.push(resp);
+            if dispatch::try_handle_config(cmd, cmd_args, ctx, &mut responses) {
                 continue;
             }
-
-            // --- REPLCONF ---
-            if cmd.eq_ignore_ascii_case(b"REPLCONF") {
-                let resp = crate::command::connection::replconf(cmd_args);
-                responses.push(resp);
+            if dispatch::try_handle_replicaof(cmd, cmd_args, ctx, &mut responses) {
                 continue;
             }
-
-            // --- INFO (with replication section) ---
-            if cmd.eq_ignore_ascii_case(b"INFO") {
-                let guard = ctx.shard_databases.read_db(ctx.shard_id, conn.selected_db);
-                let response_text = {
-                    let resp_frame = conn_cmd::info_readonly(&guard, cmd_args);
-                    match resp_frame {
-                        Frame::BulkString(b) => String::from_utf8_lossy(&b).to_string(),
-                        _ => String::new(),
-                    }
-                };
-                drop(guard);
-                let mut response_text = response_text;
-                if let Some(ref rs) = ctx.repl_state {
-                    if let Ok(rs_guard) = rs.try_read() {
-                        response_text.push_str(
-                            &crate::replication::handshake::build_info_replication(&rs_guard),
-                        );
-                    }
-                }
-                responses.push(Frame::BulkString(Bytes::from(response_text)));
+            if dispatch::try_handle_replconf(cmd, cmd_args, &mut responses) {
                 continue;
             }
-
-            // --- READONLY enforcement: reject writes on replicas ---
-            if let Some(ref rs) = ctx.repl_state {
-                if let Ok(rs_guard) = rs.try_read() {
-                    if matches!(
-                        rs_guard.role,
-                        crate::replication::state::ReplicationRole::Replica { .. }
-                    ) {
-                        if metadata::is_write(cmd) {
-                            responses.push(Frame::Error(Bytes::from_static(
-                                b"READONLY You can't write against a read only replica.",
-                            )));
-                            continue;
-                        }
-                    }
-                }
-            }
-
-            // --- CLIENT subcommands (ID, SETNAME, GETNAME, TRACKING) ---
-            if cmd.eq_ignore_ascii_case(b"CLIENT") {
-                if let Some(sub) = cmd_args.first() {
-                    if let Some(sub_bytes) = extract_bytes(sub) {
-                        if sub_bytes.eq_ignore_ascii_case(b"ID") {
-                            responses.push(conn_cmd::client_id(client_id));
-                            continue;
-                        }
-                        if sub_bytes.eq_ignore_ascii_case(b"SETNAME") {
-                            if cmd_args.len() != 2 {
-                                responses.push(Frame::Error(Bytes::from_static(
-                                    b"ERR wrong number of arguments for 'CLIENT SETNAME' command",
-                                )));
-                            } else {
-                                conn.client_name = extract_bytes(&cmd_args[1]);
-                                let name_str = conn
-                                    .client_name
-                                    .as_ref()
-                                    .map(|b| String::from_utf8_lossy(b).to_string());
-                                crate::client_registry::update(client_id, |e| {
-                                    e.name = name_str;
-                                });
-                                responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
-                            }
-                            continue;
-                        }
-                        if sub_bytes.eq_ignore_ascii_case(b"GETNAME") {
-                            responses.push(match &conn.client_name {
-                                Some(name) => Frame::BulkString(name.clone()),
-                                None => Frame::Null,
-                            });
-                            continue;
-                        }
-                        if sub_bytes.eq_ignore_ascii_case(b"TRACKING") {
-                            match crate::command::client::parse_tracking_args(cmd_args) {
-                                Ok(config_parsed) => {
-                                    if config_parsed.enable {
-                                        conn.tracking_state.enabled = true;
-                                        conn.tracking_state.bcast = config_parsed.bcast;
-                                        conn.tracking_state.noloop = config_parsed.noloop;
-                                        conn.tracking_state.optin = config_parsed.optin;
-                                        conn.tracking_state.optout = config_parsed.optout;
-
-                                        if conn.tracking_rx.is_none() {
-                                            let (tx, rx) = channel::mpsc_bounded::<Frame>(256);
-                                            conn.tracking_state.invalidation_tx = Some(tx.clone());
-                                            conn.tracking_rx = Some(rx);
-
-                                            let mut table = ctx.tracking_table.borrow_mut();
-                                            table.register_client(client_id, tx);
-                                            if let Some(target) = config_parsed.redirect {
-                                                table.set_redirect(client_id, target);
-                                            }
-                                            for prefix in &config_parsed.prefixes {
-                                                table.register_prefix(
-                                                    client_id,
-                                                    prefix.clone(),
-                                                    config_parsed.noloop,
-                                                );
-                                            }
-                                        }
-                                        responses
-                                            .push(Frame::SimpleString(Bytes::from_static(b"OK")));
-                                    } else {
-                                        conn.tracking_state = TrackingState::default();
-                                        ctx.tracking_table.borrow_mut().untrack_all(client_id);
-                                        conn.tracking_rx = None;
-                                        responses
-                                            .push(Frame::SimpleString(Bytes::from_static(b"OK")));
-                                    }
-                                    continue;
-                                }
-                                Err(err_frame) => {
-                                    responses.push(err_frame);
-                                    continue;
-                                }
-                            }
-                        }
-                        // Admin CLIENT subcommands (LIST, INFO, KILL, PAUSE, UNPAUSE,
-                        // NO-EVICT, NO-TOUCH) fall through to the ACL gate below.
-                    }
-                }
-                // Fall through — admin subcommands handled after ACL check.
-            }
-
-            // --- PUBLISH: local delivery + cross-shard fan-out ---
-            if pubsub::try_handle_publish(cmd, cmd_args, &conn, ctx, &mut responses, &mut publish_batches) {
+            if dispatch::try_handle_info(cmd, cmd_args, &conn, ctx, &mut responses) {
                 continue;
             }
-
-            // --- SUBSCRIBE / PSUBSCRIBE ---
-            if cmd.eq_ignore_ascii_case(b"SUBSCRIBE") || cmd.eq_ignore_ascii_case(b"PSUBSCRIBE") {
-                let is_pattern = cmd.eq_ignore_ascii_case(b"PSUBSCRIBE");
-                if cmd_args.is_empty() {
-                    let cmd_name = if is_pattern {
-                        "psubscribe"
-                    } else {
-                        "subscribe"
-                    };
-                    let err = Frame::Error(Bytes::from(format!(
-                        "ERR wrong number of arguments for '{}' command",
-                        cmd_name
-                    )));
-                    responses.push(err);
-                    continue;
-                }
-                // Allocate pubsub channel if not yet created
-                if conn.pubsub_tx.is_none() {
-                    let (tx, rx) = channel::mpsc_bounded::<bytes::Bytes>(256);
-                    conn.pubsub_tx = Some(tx);
-                    conn.pubsub_rx = Some(rx);
-                }
-                if conn.subscriber_id == 0 {
-                    conn.subscriber_id = crate::pubsub::next_subscriber_id();
-                }
-                // Flush accumulated responses before entering subscriber mode
-                for resp in &responses {
-                    codec.encode_frame(resp, &mut write_buf);
-                }
-                for arg in cmd_args {
-                    if let Some(ch) = extract_bytes(arg) {
-                        // ACL channel permission check
-                        {
-                            #[allow(clippy::unwrap_used)]
-                            // std RwLock: poison = prior panic = unrecoverable
-                            let acl_guard = ctx.acl_table.read().unwrap();
-                            if let Some(deny_reason) =
-                                acl_guard.check_channel_permission(&conn.current_user, ch.as_ref())
-                            {
-                                drop(acl_guard);
-                                let err =
-                                    Frame::Error(Bytes::from(format!("NOPERM {}", deny_reason)));
-                                codec.encode_frame(&err, &mut write_buf);
-                                continue;
-                            }
-                        }
-                        #[allow(clippy::unwrap_used)]
-                        // conn.pubsub_tx is set to Some just above before this loop
-                        let sub = Subscriber::with_protocol(
-                            conn.pubsub_tx.clone().unwrap(),
-                            conn.subscriber_id,
-                            conn.protocol_version >= 3,
-                        );
-                        if is_pattern {
-                            ctx.pubsub_registry.write().psubscribe(ch.clone(), sub);
-                        } else {
-                            ctx.pubsub_registry.write().subscribe(ch.clone(), sub);
-                        }
-                        propagate_subscription(
-                            &ctx.all_remote_sub_maps,
-                            &ch,
-                            ctx.shard_id,
-                            ctx.num_shards,
-                            is_pattern,
-                        );
-                        conn.subscription_count += 1;
-                        // Register pub/sub affinity for this client IP
-                        if conn.subscription_count == 1 {
-                            if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
-                                ctx.pubsub_affinity
-                                    .write()
-                                    .register(addr.ip(), ctx.shard_id);
-                            }
-                        }
-                        let resp = if is_pattern {
-                            crate::pubsub::psubscribe_response(&ch, conn.subscription_count)
-                        } else {
-                            crate::pubsub::subscribe_response(&ch, conn.subscription_count)
-                        };
-                        codec.encode_frame(&resp, &mut write_buf);
-                    }
-                }
-                // Flush responses and re-enter loop (next iteration enters subscriber mode)
-                if !write_buf.is_empty() {
-                    let data = write_buf.split().freeze();
-                    let (result, _): (std::io::Result<usize>, bytes::Bytes) =
-                        stream.write_all(data).await;
-                    if result.is_err() {
-                        return (MonoioHandlerResult::Done, None);
-                    }
-                }
-                responses.clear();
-                break; // break out of frame loop to re-enter main loop in subscriber mode
+            if dispatch::try_enforce_readonly(cmd, ctx, &mut responses) {
+                continue;
             }
-
-            // --- UNSUBSCRIBE / PUNSUBSCRIBE (in normal mode, no-op if not subscribed) ---
+            // CLIENT early (ID, SETNAME, GETNAME, TRACKING) -- admin subcmds fall through to ACL gate
+            if dispatch::try_handle_client_early(
+                cmd,
+                cmd_args,
+                client_id,
+                &mut conn,
+                ctx,
+                &mut responses,
+            ) {
+                continue;
+            }
+            // --- Pub/sub commands ---
+            if pubsub::try_handle_publish(
+                cmd,
+                cmd_args,
+                &conn,
+                ctx,
+                &mut responses,
+                &mut publish_batches,
+            ) {
+                continue;
+            }
+            match pubsub::try_handle_subscribe_entry(
+                cmd,
+                cmd_args,
+                &mut conn,
+                ctx,
+                &peer_addr,
+                &mut responses,
+                &mut codec,
+                &mut write_buf,
+                &mut stream,
+            )
+            .await
+            {
+                pubsub::SubscribeResult::NotSubscribe => {}
+                pubsub::SubscribeResult::ArgError => continue,
+                pubsub::SubscribeResult::Subscribed => break,
+                pubsub::SubscribeResult::WriteError => return (MonoioHandlerResult::Done, None),
+            }
             if pubsub::try_handle_unsubscribe(cmd, &mut responses) {
                 continue;
             }
-
-            // --- PUBSUB introspection (zero-SPSC: direct shared-read) ---
             if pubsub::try_handle_pubsub_introspection(cmd, cmd_args, ctx, &mut responses) {
                 continue;
             }
-
-            // --- BGSAVE: trigger per-shard cooperative snapshot ---
-            if cmd.eq_ignore_ascii_case(b"BGSAVE") {
-                let response = crate::command::persistence::bgsave_start_sharded(
-                    &ctx.snapshot_trigger_tx,
-                    ctx.num_shards,
-                );
-                responses.push(response);
+            // --- Persistence + ACL gate + CLIENT admin + Functions ---
+            if dispatch::try_handle_persistence(cmd, ctx, &mut responses) {
                 continue;
             }
-            // SAVE -- not supported in sharded mode
-            if cmd.eq_ignore_ascii_case(b"SAVE") {
-                responses.push(Frame::Error(Bytes::from_static(
-                    b"ERR SAVE not supported in sharded mode, use BGSAVE",
-                )));
+            if dispatch::try_enforce_acl(cmd, cmd_args, &mut conn, ctx, &peer_addr, &mut responses)
+            {
                 continue;
             }
-            // LASTSAVE -- return timestamp of last successful save
-            if cmd.eq_ignore_ascii_case(b"LASTSAVE") {
-                responses.push(crate::command::persistence::handle_lastsave());
+            if dispatch::try_handle_client_admin(cmd, cmd_args, client_id, &conn, &mut responses) {
                 continue;
             }
-            // BGREWRITEAOF -- multi-part AOF rewrite
-            if cmd.eq_ignore_ascii_case(b"BGREWRITEAOF") {
-                if let Some(ref tx) = ctx.aof_tx {
-                    responses.push(crate::command::persistence::bgrewriteaof_start_sharded(
-                        tx,
-                        ctx.shard_databases.clone(),
-                    ));
-                } else {
-                    responses.push(Frame::Error(Bytes::from_static(b"ERR AOF is not enabled")));
-                }
+            if dispatch::try_handle_functions(
+                cmd,
+                cmd_args,
+                &conn,
+                ctx,
+                &func_registry,
+                &mut responses,
+            ) {
                 continue;
-            }
-
-            // === ACL permission check (NOPERM gate) ===
-            // Exempt commands (AUTH, HELLO, QUIT, ACL) already handled above.
-            // Fast path: skip RwLock + HashMap probe for unrestricted users
-            // whose per-connection cache is still fresh (no ACL mutation has
-            // occurred since the cache was populated).  A stale cache MUST
-            // NOT bypass this check — see `ConnectionState::acl_skip_allowed`.
-            if !conn.acl_skip_allowed() {
-                #[allow(clippy::unwrap_used)] // std RwLock: poison = prior panic = unrecoverable
-                let acl_guard = ctx.acl_table.read().unwrap();
-                if let Some(deny_reason) =
-                    acl_guard.check_command_permission(&conn.current_user, cmd, cmd_args)
-                {
-                    drop(acl_guard);
-                    conn.acl_log.push(crate::acl::AclLogEntry {
-                        reason: "command".to_string(),
-                        object: String::from_utf8_lossy(cmd).to_ascii_lowercase(),
-                        username: conn.current_user.clone(),
-                        client_addr: peer_addr.clone(),
-                        timestamp_ms: std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_millis() as u64,
-                    });
-                    responses.push(Frame::Error(Bytes::from(format!("NOPERM {}", deny_reason))));
-                    continue;
-                }
-
-                // === ACL key pattern check (same lock guard) ===
-                let is_write_for_acl = metadata::is_write(cmd);
-                if let Some(deny_reason) = acl_guard.check_key_permission(
-                    &conn.current_user,
-                    cmd,
-                    cmd_args,
-                    is_write_for_acl,
-                ) {
-                    drop(acl_guard);
-                    conn.acl_log.push(crate::acl::AclLogEntry {
-                        reason: "command".to_string(),
-                        object: String::from_utf8_lossy(cmd).to_ascii_lowercase(),
-                        username: conn.current_user.clone(),
-                        client_addr: peer_addr.clone(),
-                        timestamp_ms: std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_millis() as u64,
-                    });
-                    responses.push(Frame::Error(Bytes::from(format!("NOPERM {}", deny_reason))));
-                    continue;
-                }
-            } // !cached_acl_unrestricted
-
-            // --- CLIENT admin subcommands (LIST, INFO, KILL, PAUSE, UNPAUSE) ---
-            // Placed AFTER ACL check so restricted users cannot access admin ops.
-            if cmd.eq_ignore_ascii_case(b"CLIENT") {
-                if let Some(sub) = cmd_args.first() {
-                    if let Some(sub_bytes) = extract_bytes(sub) {
-                        if sub_bytes.eq_ignore_ascii_case(b"LIST") {
-                            crate::client_registry::update(client_id, |e| {
-                                e.db = conn.selected_db;
-                                e.last_cmd_at = std::time::Instant::now();
-                                e.flags = crate::client_registry::ClientFlags {
-                                    subscriber: conn.subscription_count > 0,
-                                    in_multi: conn.in_multi,
-                                    blocked: false,
-                                };
-                            });
-                            let list = crate::client_registry::client_list();
-                            responses.push(Frame::BulkString(Bytes::from(list)));
-                            continue;
-                        }
-                        if sub_bytes.eq_ignore_ascii_case(b"INFO") {
-                            crate::client_registry::update(client_id, |e| {
-                                e.db = conn.selected_db;
-                                e.last_cmd_at = std::time::Instant::now();
-                            });
-                            let info =
-                                crate::client_registry::client_info(client_id).unwrap_or_default();
-                            responses.push(Frame::BulkString(Bytes::from(info)));
-                            continue;
-                        }
-                        if sub_bytes.eq_ignore_ascii_case(b"KILL") {
-                            let raw_args: Vec<&[u8]> = cmd_args[1..]
-                                .iter()
-                                .filter_map(|f| match f {
-                                    Frame::BulkString(b) => Some(b.as_ref()),
-                                    Frame::SimpleString(b) => Some(b.as_ref()),
-                                    _ => None,
-                                })
-                                .collect();
-                            match crate::client_registry::parse_kill_args(&raw_args) {
-                                Some(filter) => {
-                                    let count = crate::client_registry::kill_clients(&filter);
-                                    responses.push(Frame::Integer(count as i64));
-                                }
-                                None => {
-                                    responses.push(Frame::Error(Bytes::from_static(
-                                        b"ERR syntax error. Usage: CLIENT KILL [ID id] [ADDR addr] [USER user]",
-                                    )));
-                                }
-                            }
-                            continue;
-                        }
-                        if sub_bytes.eq_ignore_ascii_case(b"PAUSE") {
-                            if cmd_args.len() < 2 {
-                                responses.push(Frame::Error(Bytes::from_static(
-                                    b"ERR wrong number of arguments for 'CLIENT PAUSE' command",
-                                )));
-                            } else {
-                                let timeout_bytes = match &cmd_args[1] {
-                                    Frame::BulkString(b) => Some(b.as_ref()),
-                                    Frame::SimpleString(b) => Some(b.as_ref()),
-                                    _ => None,
-                                };
-                                match timeout_bytes
-                                    .and_then(|b| std::str::from_utf8(b).ok())
-                                    .and_then(|s| s.parse::<u64>().ok())
-                                {
-                                    Some(ms) => {
-                                        let mode = if cmd_args.len() > 2 {
-                                            match &cmd_args[2] {
-                                                Frame::BulkString(b) | Frame::SimpleString(b)
-                                                    if b.eq_ignore_ascii_case(b"WRITE") =>
-                                                {
-                                                    crate::client_pause::PauseMode::Write
-                                                }
-                                                _ => crate::client_pause::PauseMode::All,
-                                            }
-                                        } else {
-                                            crate::client_pause::PauseMode::All
-                                        };
-                                        crate::client_pause::pause(ms, mode);
-                                        responses
-                                            .push(Frame::SimpleString(Bytes::from_static(b"OK")));
-                                    }
-                                    None => {
-                                        responses.push(Frame::Error(Bytes::from_static(
-                                            b"ERR timeout is not a valid integer or out of range",
-                                        )));
-                                    }
-                                }
-                            }
-                            continue;
-                        }
-                        if sub_bytes.eq_ignore_ascii_case(b"UNPAUSE") {
-                            crate::client_pause::unpause();
-                            responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
-                            continue;
-                        }
-                        if sub_bytes.eq_ignore_ascii_case(b"NO-EVICT")
-                            || sub_bytes.eq_ignore_ascii_case(b"NO-TOUCH")
-                        {
-                            responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
-                            continue;
-                        }
-                        // Unknown CLIENT subcommand
-                        responses.push(Frame::Error(Bytes::from(format!(
-                            "ERR unknown subcommand '{}'",
-                            String::from_utf8_lossy(&sub_bytes)
-                        ))));
-                        continue;
-                    }
-                }
-                responses.push(Frame::Error(Bytes::from_static(
-                    b"ERR wrong number of arguments for 'client' command",
-                )));
-                continue;
-            }
-
-            // --- Functions API: FUNCTION/FCALL/FCALL_RO ---
-            // Placed AFTER ACL check. Respects MULTI queue — if conn.in_multi,
-            // fall through to the MULTI queue gate instead of executing.
-            if !conn.in_multi {
-                if cmd.eq_ignore_ascii_case(b"FUNCTION") {
-                    let response = crate::command::functions::handle_function(
-                        &mut func_registry.borrow_mut(),
-                        cmd_args,
-                    );
-                    responses.push(response);
-                    continue;
-                }
-                if cmd.eq_ignore_ascii_case(b"FCALL") {
-                    let response = {
-                        let mut guard =
-                            ctx.shard_databases.write_db(ctx.shard_id, conn.selected_db);
-                        let db_count = ctx.shard_databases.db_count();
-                        crate::command::functions::handle_fcall(
-                            &func_registry.borrow(),
-                            cmd_args,
-                            &mut guard,
-                            ctx.shard_id,
-                            ctx.num_shards,
-                            conn.selected_db,
-                            db_count,
-                        )
-                    };
-                    responses.push(response);
-                    continue;
-                }
-                if cmd.eq_ignore_ascii_case(b"FCALL_RO") {
-                    let response = {
-                        let mut guard =
-                            ctx.shard_databases.write_db(ctx.shard_id, conn.selected_db);
-                        let db_count = ctx.shard_databases.db_count();
-                        crate::command::functions::handle_fcall_ro(
-                            &func_registry.borrow(),
-                            cmd_args,
-                            &mut guard,
-                            ctx.shard_id,
-                            ctx.num_shards,
-                            conn.selected_db,
-                            db_count,
-                        )
-                    };
-                    responses.push(response);
-                    continue;
-                }
             }
 
             // --- TXN.BEGIN / TXN.COMMIT / TXN.ABORT ---
@@ -1448,674 +729,17 @@ pub(crate) async fn handle_connection_sharded_monoio<
             }
 
             // --- WS.* ---
-            if is_ws_command(cmd) {
-                let sub = match parse_ws_subcommand(cmd_args) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        responses.push(e);
-                        continue;
-                    }
-                };
-
-                if sub.eq_ignore_ascii_case(b"CREATE") {
-                    match validate_ws_create(cmd_args) {
-                        Ok(ws_name) => {
-                            let ws_id = WorkspaceId::new_v7();
-                            let created_at = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .unwrap_or_default()
-                                .as_millis() as i64;
-                            let meta = crate::workspace::WorkspaceMetadata {
-                                id: ws_id,
-                                name: ws_name.clone(),
-                                created_at,
-                            };
-                            {
-                                let mut guard =
-                                    ctx.shard_databases.workspace_registry(ctx.shard_id);
-                                let reg = guard.get_or_insert_with(|| {
-                                    Box::new(crate::workspace::WorkspaceRegistry::new())
-                                });
-                                reg.insert(ws_id, meta);
-                            }
-                            // WAL: WorkspaceCreate record
-                            let payload = crate::workspace::wal::encode_workspace_create(
-                                ws_id.as_bytes(),
-                                &ws_name,
-                            );
-                            let mut wal_buf = Vec::new();
-                            crate::persistence::wal_v3::record::write_wal_v3_record(
-                                &mut wal_buf,
-                                0,
-                                crate::persistence::wal_v3::record::WalRecordType::WorkspaceCreate,
-                                &payload,
-                            );
-                            ctx.shard_databases
-                                .wal_append(ctx.shard_id, Bytes::from(wal_buf));
-                            responses.push(Frame::BulkString(Bytes::from(ws_id.to_string())));
-                        }
-                        Err(e) => responses.push(e),
-                    }
-                    continue;
-                }
-
-                if sub.eq_ignore_ascii_case(b"DROP") {
-                    match validate_ws_drop(cmd_args) {
-                        Ok(ws_id_raw) => {
-                            match parse_workspace_id_from_bytes(&ws_id_raw) {
-                                Some(ws_id) => {
-                                    let removed = {
-                                        let mut guard =
-                                            ctx.shard_databases.workspace_registry(ctx.shard_id);
-                                        match guard.as_mut() {
-                                            Some(reg) => reg.remove(&ws_id).is_some(),
-                                            None => false,
-                                        }
-                                    };
-                                    if removed {
-                                        // WAL: WorkspaceDrop record
-                                        let payload = crate::workspace::wal::encode_workspace_drop(
-                                            ws_id.as_bytes(),
-                                        );
-                                        let mut wal_buf = Vec::new();
-                                        crate::persistence::wal_v3::record::write_wal_v3_record(
-                                            &mut wal_buf, 0,
-                                            crate::persistence::wal_v3::record::WalRecordType::WorkspaceDrop,
-                                            &payload,
-                                        );
-                                        ctx.shard_databases
-                                            .wal_append(ctx.shard_id, Bytes::from(wal_buf));
-                                        // Best-effort cleanup: delete all KV keys with ws prefix (WS-03).
-                                        {
-                                            let prefix = format!("{{{}}}:", ws_id.as_hex());
-                                            let mut db_guard =
-                                                ctx.shard_databases.write_db(ctx.shard_id, 0);
-                                            let keys_to_delete: Vec<Vec<u8>> = db_guard
-                                                .keys()
-                                                .filter(|k| {
-                                                    k.as_bytes().starts_with(prefix.as_bytes())
-                                                })
-                                                .map(|k| k.as_bytes().to_vec())
-                                                .collect();
-                                            for key in &keys_to_delete {
-                                                db_guard.remove(key);
-                                            }
-                                        }
-                                        responses
-                                            .push(Frame::SimpleString(Bytes::from_static(b"OK")));
-                                    } else {
-                                        responses.push(Frame::Error(Bytes::from_static(
-                                            ERR_WS_NOT_FOUND,
-                                        )));
-                                    }
-                                }
-                                None => responses.push(Frame::Error(Bytes::from_static(
-                                    crate::command::workspace::ERR_WS_INVALID_ID,
-                                ))),
-                            }
-                        }
-                        Err(e) => responses.push(e),
-                    }
-                    continue;
-                }
-
-                if sub.eq_ignore_ascii_case(b"LIST") {
-                    match validate_ws_list(cmd_args) {
-                        Ok(()) => {
-                            let guard = ctx.shard_databases.workspace_registry(ctx.shard_id);
-                            let entries: Vec<Frame> = match guard.as_ref() {
-                                Some(reg) => reg
-                                    .iter()
-                                    .map(|(id, meta)| {
-                                        Frame::Array(
-                                            vec![
-                                                Frame::BulkString(Bytes::from(id.to_string())),
-                                                Frame::BulkString(meta.name.clone()),
-                                                Frame::Integer(meta.created_at),
-                                            ]
-                                            .into(),
-                                        )
-                                    })
-                                    .collect(),
-                                None => vec![],
-                            };
-                            responses.push(Frame::Array(entries.into()));
-                        }
-                        Err(e) => responses.push(e),
-                    }
-                    continue;
-                }
-
-                if sub.eq_ignore_ascii_case(b"INFO") {
-                    match validate_ws_info(cmd_args) {
-                        Ok(ws_id_raw) => match parse_workspace_id_from_bytes(&ws_id_raw) {
-                            Some(ws_id) => {
-                                let guard = ctx.shard_databases.workspace_registry(ctx.shard_id);
-                                let found = guard.as_ref().and_then(|reg| reg.get(&ws_id));
-                                match found {
-                                    Some(meta) => {
-                                        responses.push(Frame::Array(
-                                            vec![
-                                                Frame::BulkString(Bytes::from_static(b"id")),
-                                                Frame::BulkString(Bytes::from(meta.id.to_string())),
-                                                Frame::BulkString(Bytes::from_static(b"name")),
-                                                Frame::BulkString(meta.name.clone()),
-                                                Frame::BulkString(Bytes::from_static(
-                                                    b"created_at",
-                                                )),
-                                                Frame::Integer(meta.created_at),
-                                            ]
-                                            .into(),
-                                        ));
-                                    }
-                                    None => responses
-                                        .push(Frame::Error(Bytes::from_static(ERR_WS_NOT_FOUND))),
-                                }
-                            }
-                            None => responses.push(Frame::Error(Bytes::from_static(
-                                crate::command::workspace::ERR_WS_INVALID_ID,
-                            ))),
-                        },
-                        Err(e) => responses.push(e),
-                    }
-                    continue;
-                }
-
-                if sub.eq_ignore_ascii_case(b"AUTH") {
-                    match validate_ws_auth(cmd_args) {
-                        Ok(ws_id_raw) => {
-                            if conn.workspace_id.is_some() {
-                                responses
-                                    .push(Frame::Error(Bytes::from_static(ERR_WS_ALREADY_BOUND)));
-                            } else {
-                                match parse_workspace_id_from_bytes(&ws_id_raw) {
-                                    Some(ws_id) => {
-                                        let found = {
-                                            let guard = ctx
-                                                .shard_databases
-                                                .workspace_registry(ctx.shard_id);
-                                            guard
-                                                .as_ref()
-                                                .map_or(false, |reg| reg.get(&ws_id).is_some())
-                                        };
-                                        if found {
-                                            conn.workspace_id = Some(ws_id);
-                                            responses.push(Frame::SimpleString(
-                                                Bytes::from_static(b"OK"),
-                                            ));
-                                        } else {
-                                            responses.push(Frame::Error(Bytes::from_static(
-                                                ERR_WS_NOT_FOUND,
-                                            )));
-                                        }
-                                    }
-                                    None => responses.push(Frame::Error(Bytes::from_static(
-                                        crate::command::workspace::ERR_WS_INVALID_ID,
-                                    ))),
-                                }
-                            }
-                        }
-                        Err(e) => responses.push(e),
-                    }
-                    continue;
-                }
-
-                // Unknown WS subcommand
-                responses.push(Frame::Error(Bytes::from_static(ERR_WS_UNKNOWN_SUB)));
+            if write::try_handle_ws_command(cmd, cmd_args, &mut conn, ctx, &mut responses) {
                 continue;
             }
 
             // --- MQ.* ---
-            if is_mq_command(cmd) {
-                let sub = match parse_mq_subcommand(cmd_args) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        responses.push(e);
-                        continue;
-                    }
-                };
-
-                if sub.eq_ignore_ascii_case(b"CREATE") {
-                    match validate_mq_create(cmd_args) {
-                        Ok((queue_key, max_delivery_count, _debounce_ms)) => {
-                            let effective_key = crate::workspace::workspace_key(
-                                conn.workspace_id.as_ref(),
-                                &queue_key,
-                            );
-                            // Create or get Stream in db
-                            let mut db_guard =
-                                ctx.shard_databases.write_db(ctx.shard_id, conn.selected_db);
-                            match db_guard.get_or_create_stream(&effective_key) {
-                                Ok(stream) => {
-                                    stream.durable = true;
-                                    stream.max_delivery_count = max_delivery_count;
-                                    // Auto-create __mq_consumers consumer group if not exists
-                                    let group_name = Bytes::from_static(b"__mq_consumers");
-                                    let _ = stream.create_group(group_name, StreamId::ZERO);
-                                }
-                                Err(e) => {
-                                    responses.push(e);
-                                    continue;
-                                }
-                            }
-                            drop(db_guard);
-
-                            // Store config in per-shard registry
-                            let config = crate::mq::DurableStreamConfig::new(
-                                effective_key.clone(),
-                                max_delivery_count,
-                            );
-                            {
-                                let mut guard =
-                                    ctx.shard_databases.durable_queue_registry(ctx.shard_id);
-                                let reg = guard.get_or_insert_with(|| {
-                                    Box::new(crate::mq::DurableQueueRegistry::new())
-                                });
-                                reg.insert(effective_key.clone(), config);
-                            }
-
-                            // WAL: MqCreate record
-                            let payload = crate::mq::wal::encode_mq_create(
-                                &effective_key,
-                                max_delivery_count,
-                            );
-                            let mut wal_buf = Vec::new();
-                            crate::persistence::wal_v3::record::write_wal_v3_record(
-                                &mut wal_buf,
-                                0,
-                                crate::persistence::wal_v3::record::WalRecordType::MqCreate,
-                                &payload,
-                            );
-                            ctx.shard_databases
-                                .wal_append(ctx.shard_id, Bytes::from(wal_buf));
-                            responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
-                        }
-                        Err(e) => responses.push(e),
-                    }
-                    continue;
-                }
-
-                if sub.eq_ignore_ascii_case(b"PUSH") {
-                    match validate_mq_push(cmd_args) {
-                        Ok((queue_key, fields)) => {
-                            let effective_key = crate::workspace::workspace_key(
-                                conn.workspace_id.as_ref(),
-                                &queue_key,
-                            );
-                            let mut db_guard =
-                                ctx.shard_databases.write_db(ctx.shard_id, conn.selected_db);
-                            match db_guard.get_stream_mut(&effective_key) {
-                                Ok(Some(stream)) => {
-                                    if !stream.durable {
-                                        responses.push(Frame::Error(Bytes::from_static(
-                                            ERR_MQ_NOT_DURABLE,
-                                        )));
-                                    } else {
-                                        let msg_id = stream.next_auto_id();
-                                        let msg_id = stream.add(msg_id, fields);
-                                        drop(db_guard);
-                                        // Mark pending for any registered triggers
-                                        {
-                                            let mut trig_guard =
-                                                ctx.shard_databases.trigger_registry(ctx.shard_id);
-                                            if let Some(reg) = trig_guard.as_mut() {
-                                                let trig_key = if let Some(ws_id) =
-                                                    conn.workspace_id.as_ref()
-                                                {
-                                                    let ws_hex = ws_id.as_hex();
-                                                    let mut k = Vec::with_capacity(
-                                                        ws_hex.len() + 1 + queue_key.len(),
-                                                    );
-                                                    k.extend_from_slice(ws_hex.as_bytes());
-                                                    k.push(b':');
-                                                    k.extend_from_slice(&queue_key);
-                                                    Bytes::from(k)
-                                                } else {
-                                                    queue_key.clone()
-                                                };
-                                                if let Some(trig_entry) = reg.get_mut(&trig_key) {
-                                                    if trig_entry.pending_fire_ms == 0 {
-                                                        let fire_at = ctx.cached_clock.ms()
-                                                            + trig_entry.debounce_ms;
-                                                        trig_entry.pending_fire_ms = fire_at;
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        responses.push(Frame::BulkString(Bytes::from(format!(
-                                            "{}-{}",
-                                            msg_id.ms, msg_id.seq
-                                        ))));
-                                    }
-                                }
-                                Ok(None) => {
-                                    responses
-                                        .push(Frame::Error(Bytes::from_static(ERR_MQ_NOT_DURABLE)));
-                                }
-                                Err(e) => responses.push(e),
-                            }
-                        }
-                        Err(e) => responses.push(e),
-                    }
-                    continue;
-                }
-
-                if sub.eq_ignore_ascii_case(b"POP") {
-                    match validate_mq_pop(cmd_args) {
-                        Ok((queue_key, count)) => {
-                            let effective_key = crate::workspace::workspace_key(
-                                conn.workspace_id.as_ref(),
-                                &queue_key,
-                            );
-                            let group_name = Bytes::from_static(b"__mq_consumers");
-                            let consumer_name = Bytes::from_static(b"__mq_default");
-                            let mut db_guard =
-                                ctx.shard_databases.write_db(ctx.shard_id, conn.selected_db);
-
-                            // Read max_delivery_count before mutating
-                            let mdc = match db_guard.get_stream_mut(&effective_key) {
-                                Ok(Some(stream)) => {
-                                    if !stream.durable {
-                                        responses.push(Frame::Error(Bytes::from_static(
-                                            ERR_MQ_NOT_DURABLE,
-                                        )));
-                                        continue;
-                                    }
-                                    stream.max_delivery_count
-                                }
-                                Ok(None) => {
-                                    responses
-                                        .push(Frame::Error(Bytes::from_static(ERR_MQ_NOT_DURABLE)));
-                                    continue;
-                                }
-                                Err(e) => {
-                                    responses.push(e);
-                                    continue;
-                                }
-                            };
-
-                            // Request more than count to account for DLQ routing
-                            let request_count = count + (mdc as usize);
-                            let stream = match db_guard.get_stream_mut(&effective_key) {
-                                Ok(Some(s)) => s,
-                                _ => {
-                                    responses
-                                        .push(Frame::Error(Bytes::from_static(ERR_MQ_NOT_DURABLE)));
-                                    continue;
-                                }
-                            };
-                            let claimed = match stream.read_group_new(
-                                &group_name,
-                                &consumer_name,
-                                Some(request_count),
-                                false,
-                            ) {
-                                Ok(entries) => entries,
-                                Err(_) => {
-                                    responses.push(Frame::Array(vec![].into()));
-                                    continue;
-                                }
-                            };
-
-                            // Filter: check PEL delivery_count for DLQ routing
-                            let mut results = Vec::new();
-                            let mut dlq_entries: Vec<(StreamId, Vec<(Bytes, Bytes)>)> = Vec::new();
-                            let mut dlq_ack_ids: Vec<StreamId> = Vec::new();
-                            for (id, fields) in &claimed {
-                                // Check delivery_count from PEL
-                                let delivery_count = stream
-                                    .groups
-                                    .get(group_name.as_ref())
-                                    .and_then(|g| g.pel.get(id))
-                                    .map(|pe| pe.delivery_count)
-                                    .unwrap_or(1);
-                                if mdc > 0 && delivery_count >= mdc as u64 {
-                                    // Route to DLQ
-                                    dlq_entries.push((*id, fields.clone()));
-                                    dlq_ack_ids.push(*id);
-                                } else if results.len() < count {
-                                    results.push((*id, fields.clone()));
-                                }
-                            }
-
-                            // XACK DLQ entries from __mq_consumers group
-                            if !dlq_ack_ids.is_empty() {
-                                let _ = stream.xack(&group_name, &dlq_ack_ids);
-                            }
-
-                            // Move DLQ entries to DLQ stream
-                            if !dlq_entries.is_empty() {
-                                let dlq_key = {
-                                    let mut buf = Vec::with_capacity(effective_key.len() + 8);
-                                    buf.extend_from_slice(&effective_key);
-                                    buf.extend_from_slice(b"::mq:dlq");
-                                    Bytes::from(buf)
-                                };
-                                match db_guard.get_or_create_stream(&dlq_key) {
-                                    Ok(dlq_stream) => {
-                                        for (_id, fields) in dlq_entries {
-                                            let dlq_id = dlq_stream.next_auto_id();
-                                            dlq_stream.add(dlq_id, fields);
-                                        }
-                                    }
-                                    Err(_) => {} // DLQ creation failed -- skip silently
-                                }
-                            }
-
-                            // Format results as array of arrays (XREADGROUP format)
-                            let result_frames: Vec<Frame> = results
-                                .iter()
-                                .map(|(id, fields)| {
-                                    let mut entry_frames = Vec::with_capacity(2);
-                                    entry_frames.push(Frame::BulkString(Bytes::from(format!(
-                                        "{}-{}",
-                                        id.ms, id.seq
-                                    ))));
-                                    let field_frames: Vec<Frame> = fields
-                                        .iter()
-                                        .flat_map(|(f, v)| {
-                                            vec![
-                                                Frame::BulkString(f.clone()),
-                                                Frame::BulkString(v.clone()),
-                                            ]
-                                        })
-                                        .collect();
-                                    entry_frames.push(Frame::Array(field_frames.into()));
-                                    Frame::Array(entry_frames.into())
-                                })
-                                .collect();
-                            responses.push(Frame::Array(result_frames.into()));
-                        }
-                        Err(e) => responses.push(e),
-                    }
-                    continue;
-                }
-
-                if sub.eq_ignore_ascii_case(b"ACK") {
-                    match validate_mq_ack(cmd_args) {
-                        Ok((queue_key, msg_ids)) => {
-                            let effective_key = crate::workspace::workspace_key(
-                                conn.workspace_id.as_ref(),
-                                &queue_key,
-                            );
-                            let ids: Vec<StreamId> = msg_ids
-                                .iter()
-                                .map(|(ms, seq)| StreamId { ms: *ms, seq: *seq })
-                                .collect();
-                            let mut db_guard =
-                                ctx.shard_databases.write_db(ctx.shard_id, conn.selected_db);
-                            match db_guard.get_stream_mut(&effective_key) {
-                                Ok(Some(stream)) => {
-                                    let group_name = Bytes::from_static(b"__mq_consumers");
-                                    match stream.xack(&group_name, &ids) {
-                                        Ok(acked_count) => {
-                                            drop(db_guard);
-                                            // Emit MqAck WAL record for each acked ID
-                                            for (ms, seq) in &msg_ids {
-                                                let payload = crate::mq::wal::encode_mq_ack(
-                                                    &effective_key,
-                                                    *ms,
-                                                    *seq,
-                                                );
-                                                let mut wal_buf = Vec::new();
-                                                crate::persistence::wal_v3::record::write_wal_v3_record(
-                                                    &mut wal_buf, 0,
-                                                    crate::persistence::wal_v3::record::WalRecordType::MqAck,
-                                                    &payload,
-                                                );
-                                                ctx.shard_databases
-                                                    .wal_append(ctx.shard_id, Bytes::from(wal_buf));
-                                            }
-                                            responses.push(Frame::Integer(acked_count as i64));
-                                        }
-                                        Err(_) => responses.push(Frame::Integer(0)),
-                                    }
-                                }
-                                Ok(None) => responses.push(Frame::Integer(0)),
-                                Err(_) => responses.push(Frame::Integer(0)),
-                            }
-                        }
-                        Err(e) => responses.push(e),
-                    }
-                    continue;
-                }
-
-                if sub.eq_ignore_ascii_case(b"DLQLEN") {
-                    match validate_mq_dlqlen(cmd_args) {
-                        Ok(queue_key) => {
-                            let effective_key = crate::workspace::workspace_key(
-                                conn.workspace_id.as_ref(),
-                                &queue_key,
-                            );
-                            let dlq_key = {
-                                let mut buf = Vec::with_capacity(effective_key.len() + 8);
-                                buf.extend_from_slice(&effective_key);
-                                buf.extend_from_slice(b"::mq:dlq");
-                                Bytes::from(buf)
-                            };
-                            let mut db_guard =
-                                ctx.shard_databases.write_db(ctx.shard_id, conn.selected_db);
-                            let len = match db_guard.get_stream_mut(&dlq_key) {
-                                Ok(Some(stream)) => stream.length as i64,
-                                _ => 0i64,
-                            };
-                            responses.push(Frame::Integer(len));
-                        }
-                        Err(e) => responses.push(e),
-                    }
-                    continue;
-                }
-
-                if sub.eq_ignore_ascii_case(b"TRIGGER") {
-                    match validate_mq_trigger(cmd_args) {
-                        Ok((queue_key, callback_cmd, debounce_ms)) => {
-                            let effective_key = crate::workspace::workspace_key(
-                                conn.workspace_id.as_ref(),
-                                &queue_key,
-                            );
-                            let trig_key = if let Some(ws_id) = conn.workspace_id.as_ref() {
-                                let ws_hex = ws_id.as_hex();
-                                let mut k = Vec::with_capacity(ws_hex.len() + 1 + queue_key.len());
-                                k.extend_from_slice(ws_hex.as_bytes());
-                                k.push(b':');
-                                k.extend_from_slice(&queue_key);
-                                Bytes::from(k)
-                            } else {
-                                queue_key.clone()
-                            };
-                            let entry = crate::mq::TriggerEntry {
-                                queue_key: effective_key,
-                                callback_cmd,
-                                debounce_ms,
-                                last_fire_ms: 0,
-                                pending_fire_ms: 0,
-                            };
-                            {
-                                let mut guard = ctx.shard_databases.trigger_registry(ctx.shard_id);
-                                let reg = guard.get_or_insert_with(|| {
-                                    Box::new(crate::mq::TriggerRegistry::new())
-                                });
-                                reg.register(trig_key, entry);
-                            }
-                            responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
-                        }
-                        Err(e) => responses.push(e),
-                    }
-                    continue;
-                }
-
-                if sub.eq_ignore_ascii_case(b"PUBLISH") {
-                    match validate_mq_publish(cmd_args) {
-                        Ok((queue_key, fields)) => {
-                            let effective_key = crate::workspace::workspace_key(
-                                conn.workspace_id.as_ref(),
-                                &queue_key,
-                            );
-                            if let Some(ref mut txn) = conn.active_cross_txn {
-                                txn.record_mq(effective_key, fields);
-                                responses.push(Frame::SimpleString(Bytes::from_static(b"QUEUED")));
-                            } else {
-                                responses.push(Frame::Error(Bytes::from_static(
-                                    b"ERR MQ PUBLISH requires an active transaction (use TXN BEGIN first)",
-                                )));
-                            }
-                        }
-                        Err(e) => responses.push(e),
-                    }
-                    continue;
-                }
-
-                // Unknown MQ subcommand
-                responses.push(Frame::Error(Bytes::from_static(ERR_MQ_UNKNOWN_SUB)));
+            if write::try_handle_mq_command(cmd, cmd_args, &mut conn, ctx, &mut responses) {
                 continue;
             }
 
-            // --- MULTI ---
-            if cmd.eq_ignore_ascii_case(b"MULTI") {
-                if conn.in_cross_txn() {
-                    responses.push(Frame::Error(Bytes::from_static(ERR_MULTI_TXN_CONFLICT)));
-                } else if conn.in_multi {
-                    responses.push(Frame::Error(Bytes::from_static(
-                        b"ERR MULTI calls can not be nested",
-                    )));
-                } else {
-                    conn.in_multi = true;
-                    conn.command_queue.clear();
-                    responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
-                }
-                continue;
-            }
-
-            // --- EXEC ---
-            if cmd.eq_ignore_ascii_case(b"EXEC") {
-                if !conn.in_multi {
-                    responses.push(Frame::Error(Bytes::from_static(b"ERR EXEC without MULTI")));
-                } else {
-                    conn.in_multi = false;
-                    let result = execute_transaction_sharded(
-                        &ctx.shard_databases,
-                        ctx.shard_id,
-                        &conn.command_queue,
-                        conn.selected_db,
-                        &ctx.cached_clock,
-                    );
-                    conn.command_queue.clear();
-                    responses.push(result);
-                }
-                continue;
-            }
-
-            // --- DISCARD ---
-            if cmd.eq_ignore_ascii_case(b"DISCARD") {
-                if !conn.in_multi {
-                    responses.push(Frame::Error(Bytes::from_static(
-                        b"ERR DISCARD without MULTI",
-                    )));
-                } else {
-                    conn.in_multi = false;
-                    conn.command_queue.clear();
-                    responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
-                }
+            // --- MULTI / EXEC / DISCARD ---
+            if write::try_handle_multi_exec(cmd, &mut conn, ctx, &mut responses) {
                 continue;
             }
 
@@ -2130,54 +754,23 @@ pub(crate) async fn handle_connection_sharded_monoio<
             let cmd_args: &[Frame] = rewritten.as_deref().unwrap_or(cmd_args);
 
             // --- BLOCKING COMMANDS ---
-            if cmd.eq_ignore_ascii_case(b"BLPOP")
-                || cmd.eq_ignore_ascii_case(b"BRPOP")
-                || cmd.eq_ignore_ascii_case(b"BLMOVE")
-                || cmd.eq_ignore_ascii_case(b"BZPOPMIN")
-                || cmd.eq_ignore_ascii_case(b"BZPOPMAX")
-                || cmd.eq_ignore_ascii_case(b"BLMPOP")
-                || cmd.eq_ignore_ascii_case(b"BRPOPLPUSH")
-                || cmd.eq_ignore_ascii_case(b"BZMPOP")
+            match dispatch::try_handle_blocking(
+                cmd,
+                cmd_args,
+                &mut conn,
+                ctx,
+                &mut responses,
+                &mut codec,
+                &mut write_buf,
+                &mut stream,
+                &shutdown,
+            )
+            .await
             {
-                // Inside MULTI: queue as non-blocking variant
-                if conn.in_multi {
-                    let nb_frame = convert_blocking_to_nonblocking(cmd, cmd_args);
-                    conn.command_queue.push(nb_frame);
-                    responses.push(Frame::SimpleString(Bytes::from_static(b"QUEUED")));
-                    continue;
-                }
-
-                // Flush accumulated responses before blocking
-                for resp in &responses {
-                    codec.encode_frame(resp, &mut write_buf);
-                }
-                if !write_buf.is_empty() {
-                    let data = write_buf.split().freeze();
-                    let (result, _): (std::io::Result<usize>, bytes::Bytes) =
-                        stream.write_all(data).await;
-                    if result.is_err() {
-                        return (MonoioHandlerResult::Done, None);
-                    }
-                }
-
-                let blocking_response = handle_blocking_command_monoio(
-                    cmd,
-                    cmd_args,
-                    conn.selected_db,
-                    &ctx.shard_databases,
-                    &ctx.blocking_registry,
-                    ctx.shard_id,
-                    ctx.num_shards,
-                    &ctx.dispatch_tx,
-                    &shutdown,
-                    &ctx.spsc_notifiers,
-                )
-                .await;
-
-                // Encode blocking response directly
-                codec.encode_frame(&blocking_response, &mut write_buf);
-                responses.clear();
-                break; // Blocking command ends the pipeline batch
+                dispatch::BlockingResult::NotBlocking => {}
+                dispatch::BlockingResult::Queued => continue,
+                dispatch::BlockingResult::Handled => break,
+                dispatch::BlockingResult::WriteError => return (MonoioHandlerResult::Done, None),
             }
 
             // --- MULTI queue mode: queue commands when in transaction ---
@@ -2187,79 +780,11 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 continue;
             }
 
-            // --- Cross-shard aggregation commands: KEYS, SCAN, DBSIZE ---
-            if ctx.num_shards > 1 {
-                if cmd.eq_ignore_ascii_case(b"KEYS") {
-                    let mut response = crate::shard::coordinator::coordinate_keys(
-                        cmd_args,
-                        ctx.shard_id,
-                        ctx.num_shards,
-                        conn.selected_db,
-                        &ctx.shard_databases,
-                        &ctx.dispatch_tx,
-                        &ctx.spsc_notifiers,
-                        &ctx.cached_clock,
-                        &(), // monoio: coordinator uses oneshot, not response_pool
-                    )
-                    .await;
-                    if let Some(ws_id) = conn.workspace_id.as_ref() {
-                        strip_workspace_prefix_from_response(ws_id, cmd, &mut response);
-                    }
-                    responses.push(response);
-                    continue;
-                }
-                if cmd.eq_ignore_ascii_case(b"SCAN") {
-                    let mut response = crate::shard::coordinator::coordinate_scan(
-                        cmd_args,
-                        ctx.shard_id,
-                        ctx.num_shards,
-                        conn.selected_db,
-                        &ctx.shard_databases,
-                        &ctx.dispatch_tx,
-                        &ctx.spsc_notifiers,
-                        &ctx.cached_clock,
-                        &(), // monoio: coordinator uses oneshot, not response_pool
-                    )
-                    .await;
-                    if let Some(ws_id) = conn.workspace_id.as_ref() {
-                        strip_workspace_prefix_from_response(ws_id, cmd, &mut response);
-                    }
-                    responses.push(response);
-                    continue;
-                }
-                if cmd.eq_ignore_ascii_case(b"DBSIZE") {
-                    let response = crate::shard::coordinator::coordinate_dbsize(
-                        ctx.shard_id,
-                        ctx.num_shards,
-                        conn.selected_db,
-                        &ctx.shard_databases,
-                        &ctx.dispatch_tx,
-                        &ctx.spsc_notifiers,
-                        &(), // monoio: coordinator uses oneshot, not response_pool
-                    )
-                    .await;
-                    responses.push(response);
-                    continue;
-                }
-
-                // --- Multi-key commands: MGET, MSET, DEL, UNLINK, EXISTS ---
-                if is_multi_key_command(cmd, cmd_args) {
-                    let response = crate::shard::coordinator::coordinate_multi_key(
-                        cmd,
-                        cmd_args,
-                        ctx.shard_id,
-                        ctx.num_shards,
-                        conn.selected_db,
-                        &ctx.shard_databases,
-                        &ctx.dispatch_tx,
-                        &ctx.spsc_notifiers,
-                        &ctx.cached_clock,
-                        &(), // monoio: coordinator uses oneshot, not response_pool
-                    )
-                    .await;
-                    responses.push(response);
-                    continue;
-                }
+            // --- Cross-shard aggregation commands: KEYS, SCAN, DBSIZE + multi-key ---
+            if dispatch::try_handle_cross_shard_commands(cmd, cmd_args, &conn, ctx, &mut responses)
+                .await
+            {
+                continue;
             }
 
             // --- FT.* vector search commands ---
@@ -2269,69 +794,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
 
             // --- GRAPH.* graph commands ---
             #[cfg(feature = "graph")]
-            if cmd.len() > 6 && cmd[..6].eq_ignore_ascii_case(b"GRAPH.") {
-                let (response, wal_records, cypher_intents, cypher_undo_ops) =
-                    if crate::command::graph::is_graph_write_cmd(cmd)
-                        || (cmd.eq_ignore_ascii_case(b"GRAPH.QUERY")
-                            && crate::command::graph::is_cypher_write_query(cmd_args))
-                    {
-                        let mut gs = ctx.shard_databases.graph_store_write(ctx.shard_id);
-                        let (resp, cypher_intents, undo_ops) = if cmd
-                            .eq_ignore_ascii_case(b"GRAPH.QUERY")
-                        {
-                            // Phase 167 (CYP-01/02): capture Cypher-created
-                            // nodes/edges so TXN.ABORT can roll them back via
-                            // CrossStoreTxn::record_graph.
-                            crate::command::graph::graph_query_or_write(&mut gs, cmd_args)
-                        } else {
-                            (
-                                crate::command::graph::dispatch_graph_write(&mut gs, cmd, cmd_args),
-                                Vec::new(),
-                                Vec::new(),
-                            )
-                        };
-                        let records = gs.drain_wal();
-                        (resp, records, cypher_intents, undo_ops)
-                    } else {
-                        let gs = ctx.shard_databases.graph_store_read(ctx.shard_id);
-                        let resp = crate::command::graph::dispatch_graph_read(&gs, cmd, cmd_args);
-                        (resp, Vec::new(), Vec::new(), Vec::new())
-                    };
-                // Phase 166: record graph intent for TXN rollback.
-                // Captures explicit ADDNODE/ADDEDGE by response id plus
-                // Phase 167 Cypher CREATE/MERGE via intents returned from
-                // graph_query_or_write.
-                if let Some(txn) = conn.active_cross_txn.as_mut() {
-                    let is_node = cmd.eq_ignore_ascii_case(b"GRAPH.ADDNODE");
-                    let is_edge = cmd.eq_ignore_ascii_case(b"GRAPH.ADDEDGE");
-                    if is_node || is_edge {
-                        if let Frame::Integer(id) = &response {
-                            if let Some(gname) = cmd_args.first().and_then(|f| extract_bytes(f)) {
-                                txn.record_graph(*id as u64, is_node, gname);
-                            }
-                        }
-                    }
-                    if !cypher_intents.is_empty() {
-                        if let Some(gname) = cmd_args.first().and_then(|f| extract_bytes(f)) {
-                            for intent in &cypher_intents {
-                                txn.record_graph(intent.entity_id, intent.is_node, gname.clone());
-                            }
-                        }
-                    }
-                    // Phase 174 FIX-01: push undo ops for SET/DELETE/MERGE rollback.
-                    for undo_op in cypher_undo_ops {
-                        txn.record_graph_undo(undo_op);
-                    }
-                }
-                for record in wal_records {
-                    ctx.shard_databases
-                        .wal_append(ctx.shard_id, bytes::Bytes::from(record));
-                }
-                let mut response = response;
-                if let Some(ws_id) = conn.workspace_id.as_ref() {
-                    strip_workspace_prefix_from_response(ws_id, cmd, &mut response);
-                }
-                responses.push(response);
+            if write::try_handle_graph_command(cmd, cmd_args, &mut conn, ctx, &mut responses) {
                 continue;
             }
 
@@ -2366,13 +829,8 @@ pub(crate) async fn handle_connection_sharded_monoio<
             };
 
             if is_local {
-                // LOCAL PATH: split into read/write to avoid exclusive lock on reads.
-                // Using read_db for local reads eliminates RwLock contention with
-                // cross-shard shared reads from other shard threads.
                 if metadata::is_write(cmd) {
                     // WRITE PATH: eviction + dispatch under write lock.
-                    // When disk offload is enabled, use async spill: evicted keys
-                    // are sent to SpillThread for background pwrite to NVMe.
                     let rt = ctx.runtime_config.read();
                     let mut guard = ctx.shard_databases.write_db(ctx.shard_id, conn.selected_db);
                     let evict_result = if let Some(ref sender) = ctx.spill_sender {
@@ -2644,24 +1102,15 @@ pub(crate) async fn handle_connection_sharded_monoio<
 
             // (tracking and response push handled inside read/write branches above)
             } else if let Some(target) = target_shard {
-                // TXN cross-shard guard: cross-shard writes bypass the undo log and
-                // cannot be rolled back on TXN.ABORT. Return an explicit error instead
-                // of silently permitting writes that resist rollback.
+                // TXN cross-shard guard: reject cross-shard writes in active TXN (no undo log).
                 if conn.in_cross_txn() && metadata::is_write(cmd) {
                     responses.push(Frame::Error(bytes::Bytes::from_static(
                         crate::command::transaction::ERR_TXN_CROSS_SHARD,
                     )));
                     continue;
                 }
-                // SHARED-READ FAST PATH: cross-shard reads bypass SPSC dispatch entirely.
-                // By this point conn.in_multi is false (MULTI queuing happens earlier with `continue`).
-                // Read commands execute directly on the target shard's database via RwLock read guard,
-                // avoiding ~88us of two async scheduling hops through the SPSC channel.
-                //
-                // Guard: if there are already pending writes for this target shard in the
-                // current pipeline batch, we must NOT take the fast path -- the read would
-                // execute before the deferred writes, violating command ordering. Fall through
-                // to SPSC dispatch to preserve pipeline semantics.
+                // SHARED-READ FAST PATH: bypass SPSC for cross-shard reads.
+                // Guard: skip if pending writes exist for this target (pipeline ordering).
                 if !metadata::is_write(cmd)
                     && !remote_groups.contains_key(&target)
                     && is_dispatch_read_supported(cmd)
