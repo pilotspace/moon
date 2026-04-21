@@ -30,6 +30,57 @@ fn parse_valid_at(args: &[Frame]) -> Option<i64> {
     None
 }
 
+/// Parse `--params <json_object>` from GRAPH.QUERY args into executor `Value` map.
+///
+/// Scans args for `--params` keyword followed by a JSON string. The JSON must be
+/// an object (`{...}`); each top-level key becomes a parameter name, each value
+/// is converted to the executor's `Value` enum. Returns empty map if `--params`
+/// is absent or the JSON is malformed (graceful degradation — matches pre-fix
+/// behavior where params were always empty).
+fn parse_params(args: &[Frame]) -> std::collections::HashMap<String, cypher::executor::Value> {
+    for i in 0..args.len().saturating_sub(1) {
+        if let Frame::BulkString(ref bs) = args[i] {
+            if bs.as_ref() == b"--params" {
+                if let Frame::BulkString(ref val) = args[i + 1] {
+                    if let Ok(s) = std::str::from_utf8(val) {
+                        if let Ok(serde_json::Value::Object(map)) = serde_json::from_str(s) {
+                            let mut out = std::collections::HashMap::with_capacity(map.len());
+                            for (k, v) in map {
+                                out.insert(k, json_to_graph_value(&v));
+                            }
+                            return out;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    std::collections::HashMap::new()
+}
+
+fn json_to_graph_value(v: &serde_json::Value) -> cypher::executor::Value {
+    match v {
+        serde_json::Value::Null => cypher::executor::Value::Null,
+        serde_json::Value::Bool(b) => cypher::executor::Value::Bool(*b),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                cypher::executor::Value::Int(i)
+            } else {
+                cypher::executor::Value::Float(n.as_f64().unwrap_or(0.0))
+            }
+        }
+        serde_json::Value::String(s) => cypher::executor::Value::String(s.clone()),
+        serde_json::Value::Array(arr) => {
+            cypher::executor::Value::List(arr.iter().map(json_to_graph_value).collect())
+        }
+        serde_json::Value::Object(map) => {
+            cypher::executor::Value::Map(
+                map.iter().map(|(k, v)| (k.clone(), json_to_graph_value(v))).collect()
+            )
+        }
+    }
+}
+
 /// GRAPH.NEIGHBORS <graph> <node_id> [TYPE <type>] [DEPTH <n>]
 ///
 /// Returns an array of neighbor nodes/edges as RESP3 Maps.
@@ -338,7 +389,7 @@ pub fn graph_query(store: &GraphStore, args: &[Frame]) -> Frame {
         p
     };
 
-    let params = std::collections::HashMap::new();
+    let params = parse_params(args);
     let valid_at = parse_valid_at(args);
     let ctx = cypher::executor::ExecutionContext {
         valid_time_as_of: valid_at,
@@ -401,7 +452,7 @@ pub fn graph_query_write(store: &mut GraphStore, args: &[Frame]) -> Frame {
             None => return Frame::Error(Bytes::from_static(b"ERR graph not found")),
         };
 
-        let params = std::collections::HashMap::new();
+        let params = parse_params(args);
         match cypher::executor::execute_mut(graph, &plan, &params, lsn) {
             Ok(r) => r,
             Err(e) => {
@@ -555,7 +606,7 @@ pub fn graph_query_or_write(
             p
         };
 
-        let params = std::collections::HashMap::new();
+        let params = parse_params(args);
         let valid_at = parse_valid_at(args);
         let ctx = cypher::executor::ExecutionContext {
             valid_time_as_of: valid_at,
@@ -596,7 +647,7 @@ pub fn graph_query_or_write(
                 }
             };
 
-            let params = std::collections::HashMap::new();
+            let params = parse_params(args);
             match cypher::executor::execute_mut(graph, &plan, &params, lsn) {
                 Ok(r) => {
                     let muts = r.mutations;

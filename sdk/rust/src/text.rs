@@ -32,18 +32,28 @@ impl TextClient {
         Ok(parse_text_search_hits(raw))
     }
 
-    /// Hybrid search combining sparse BM25 and dense vector similarity via RRF.
+    /// Hybrid search combining BM25 + dense vector similarity (and optionally
+    /// sparse) via RRF in a single server round trip.
     ///
-    /// `weights` is `[bm25_weight, vector_weight]`. Both must be positive and finite.
-    /// Uses `FT.SEARCH` with `HYBRID VECTOR … SPARSE … FUSION RRF`.
+    /// `weights` is `[bm25_weight, dense_weight, sparse_weight]`. All must be
+    /// non-negative and finite. When `sparse_field` is `None` the wire format
+    /// omits the SPARSE clause entirely so indexes without a SPARSE-typed
+    /// field (e.g. plain TEXT + VECTOR schema) still complete the query —
+    /// per the Moon server's two-way fusion fallback documented in
+    /// `src/command/vector_search/hybrid.rs` (`HybridQuery::sparse: Option`).
+    /// `weights[2]` is ignored in two-way mode.
+    ///
+    /// Wire format (full): `HYBRID VECTOR @vec_field $qv SPARSE @sparse_field $sq FUSION RRF WEIGHTS w1 w2 w3 PARAMS 4 ...`
+    /// Wire format (no sparse): `HYBRID VECTOR @vec_field $qv FUSION RRF WEIGHTS w1 w2 w3 PARAMS 2 query_vec <blob>`
     pub async fn hybrid_search(
         &mut self,
         index: &str,
         text_query: &str,
         query_vec: &[f32],
         vec_field: &str,
+        sparse_field: Option<&str>,
         k: usize,
-        weights: [f64; 2],
+        weights: [f64; 3],
     ) -> Result<Vec<TextSearchHit>> {
         for (i, &w) in weights.iter().enumerate() {
             if !w.is_finite() || w < 0.0 {
@@ -62,18 +72,30 @@ impl TextClient {
             .arg(text_query)
             .arg("HYBRID")
             .arg("VECTOR")
-            .arg(vec_field)
-            .arg(&blob)
-            .arg("SPARSE")
-            .arg(text_query)
-            .arg("FUSION")
+            .arg(format!("@{vec_field}"))
+            .arg("$query_vec");
+        if let Some(sf) = sparse_field {
+            cmd.arg("SPARSE").arg(format!("@{sf}")).arg("$sparse_query");
+        }
+        cmd.arg("FUSION")
             .arg("RRF")
             .arg("WEIGHTS")
             .arg(weights[0])
             .arg(weights[1])
+            .arg(weights[2])
             .arg("LIMIT")
             .arg("0")
             .arg(k);
+        if sparse_field.is_some() {
+            cmd.arg("PARAMS")
+                .arg(4)
+                .arg("query_vec")
+                .arg(&blob)
+                .arg("sparse_query")
+                .arg(text_query);
+        } else {
+            cmd.arg("PARAMS").arg(2).arg("query_vec").arg(&blob);
+        }
         let raw: redis::Value = cmd.query_async(&mut self.conn).await?;
         Ok(parse_text_search_hits(raw))
     }

@@ -56,6 +56,22 @@ impl MoonClient {
         Ok(Self { conn })
     }
 
+    /// Open a connection with a custom per-command response timeout.
+    ///
+    /// Useful for bulk-write workloads where the default timeout (typically ~60s
+    /// from the redis crate) may fire during large batch operations.
+    pub async fn connect_with_timeout(
+        url: impl redis::IntoConnectionInfo,
+        response_timeout: std::time::Duration,
+    ) -> Result<Self> {
+        let client = redis::Client::open(url)?;
+        let config = redis::AsyncConnectionConfig::new().set_response_timeout(Some(response_timeout));
+        let conn = client
+            .get_multiplexed_async_connection_with_config(&config)
+            .await?;
+        Ok(Self { conn })
+    }
+
     /// Access the raw underlying multiplexed connection for operations not covered
     /// by the typed API.
     pub fn inner_mut(&mut self) -> &mut redis::aio::MultiplexedConnection {
