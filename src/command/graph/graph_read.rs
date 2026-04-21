@@ -73,11 +73,11 @@ fn json_to_graph_value(v: &serde_json::Value) -> cypher::executor::Value {
         serde_json::Value::Array(arr) => {
             cypher::executor::Value::List(arr.iter().map(json_to_graph_value).collect())
         }
-        serde_json::Value::Object(map) => {
-            cypher::executor::Value::Map(
-                map.iter().map(|(k, v)| (k.clone(), json_to_graph_value(v))).collect()
-            )
-        }
+        serde_json::Value::Object(map) => cypher::executor::Value::Map(
+            map.iter()
+                .map(|(k, v)| (k.clone(), json_to_graph_value(v)))
+                .collect(),
+        ),
     }
 }
 
