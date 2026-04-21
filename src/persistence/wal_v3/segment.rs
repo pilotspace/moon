@@ -131,22 +131,21 @@ impl WalWriterV3 {
         lsn
     }
 
-    /// Flush the in-memory buffer to disk and fsync.
+    /// Write the in-memory buffer to the OS page cache (no fsync).
     ///
-    /// After this returns, all appended records are durable on stable storage.
-    pub fn flush_sync(&mut self) -> std::io::Result<()> {
+    /// Data reaches the kernel but is NOT guaranteed durable until
+    /// `sync_data()` is called (typically on the 1s timer or shutdown).
+    fn flush_write(&mut self) -> std::io::Result<()> {
         if self.buf.is_empty() {
             return Ok(());
         }
 
-        // Check if rotation is needed before writing
         if self.write_offset + self.buf.len() as u64 > self.segment_size {
             self.rotate_segment()?;
         }
 
         if let Some(ref mut file) = self.current_file {
             file.write_all(&self.buf)?;
-            file.sync_data()?;
             self.write_offset += self.buf.len() as u64;
             self.buf.clear();
         }
@@ -154,13 +153,36 @@ impl WalWriterV3 {
         Ok(())
     }
 
-    /// Flush if buffer exceeds a threshold (matches v2 pattern).
+    /// Flush the in-memory buffer to disk and fsync.
+    ///
+    /// After this returns, all appended records are durable on stable storage.
+    pub fn flush_sync(&mut self) -> std::io::Result<()> {
+        self.flush_write()?;
+        if let Some(ref mut file) = self.current_file {
+            file.sync_data()?;
+        }
+        Ok(())
+    }
+
+    /// Flush if buffer exceeds a threshold — write only, no fsync.
+    ///
+    /// Matches WAL v2 pattern: frequent writes to OS page cache,
+    /// durable sync deferred to the 1s timer (`sync_data`).
     pub fn flush_if_needed(&mut self) -> std::io::Result<()> {
         if self.buf.len() >= 4096 {
-            self.flush_sync()
+            self.flush_write()
         } else {
             Ok(())
         }
+    }
+
+    /// Fsync without writing — call after `flush_write` / `flush_if_needed`
+    /// to make all previously written records durable.
+    pub fn sync_data(&mut self) -> std::io::Result<()> {
+        if let Some(ref mut file) = self.current_file {
+            file.sync_data()?;
+        }
+        Ok(())
     }
 
     /// Return the current (next-to-be-assigned) LSN.

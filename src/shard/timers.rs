@@ -140,7 +140,9 @@ pub(crate) fn fire_pending_mq_triggers(
 
 /// WAL v3 fsync on 1-second interval (mirrors v2 everysec pattern).
 ///
-/// Calls `flush_sync()` which writes buffered data and fsyncs the segment file.
+/// Flush any buffered WAL v3 data and fsync to stable storage.
+///
+/// Called on the 1s timer. Writes remaining buffer contents then fsyncs.
 /// Only active when disk-offload is enabled and WalWriterV3 was successfully initialized.
 pub(crate) fn sync_wal_v3(wal_v3: &mut Option<crate::persistence::wal_v3::segment::WalWriterV3>) {
     if let Some(wal) = wal_v3 {
