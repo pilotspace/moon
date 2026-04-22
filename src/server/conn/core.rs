@@ -66,6 +66,11 @@ pub(crate) struct ConnectionContext {
     pub all_pubsub_registries: Vec<Arc<parking_lot::RwLock<PubSubRegistry>>>,
     pub all_remote_sub_maps:
         Vec<Arc<parking_lot::RwLock<crate::shard::remote_subscriber_map::RemoteSubscriberMap>>>,
+    /// Listener-side IP hint table. Stores BOTH key-access and pub/sub hints
+    /// per client IP; the listener prefers the key-access hint (storage
+    /// locality) and falls back to pub/sub (fan-out locality). Populated by
+    /// pub/sub `SUBSCRIBE` and by per-connection `AffinityTracker` migration
+    /// decisions when a connection converges ≥10/16 ops on a remote shard.
     pub pubsub_affinity: Arc<parking_lot::RwLock<crate::shard::affinity::AffinityTracker>>,
     #[allow(dead_code)] // Only used by monoio handler (tiered storage)
     pub spill_sender: Option<flume::Sender<crate::storage::tiered::spill_thread::SpillRequest>>,

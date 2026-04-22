@@ -813,6 +813,13 @@ pub(crate) async fn handle_connection_sharded_monoio<
             // Migration is deferred until AFTER the current batch is fully processed.
             if let (Some(tracker), Some(target)) = (&mut conn.affinity_tracker, target_shard) {
                 if let Some(migrate_to) = tracker.record(target) {
+                    // IP-level hint: future connections from the same IP skip the
+                    // 16-sample warm-up and land directly on the data shard.
+                    if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
+                        ctx.pubsub_affinity
+                            .write()
+                            .register_key(addr.ip(), migrate_to);
+                    }
                     if !conn.in_multi
                         && conn.subscription_count == 0
                         && !conn.tracking_state.enabled
@@ -1505,9 +1512,10 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 true,
             );
         }
-        // Remove affinity on disconnect (no subscriptions remain)
+        // Clear pub/sub affinity on disconnect (no subscriptions remain).
+        // Preserves any key-access hint — storage locality outlives the subscription.
         if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
-            ctx.pubsub_affinity.write().remove(&addr.ip());
+            ctx.pubsub_affinity.write().remove_pubsub(&addr.ip());
         }
     }
 
