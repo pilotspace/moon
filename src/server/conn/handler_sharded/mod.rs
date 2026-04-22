@@ -919,6 +919,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                         // LOCAL PATH: split into read/write to avoid exclusive lock on reads.
                         // Using read_db for local reads eliminates RwLock contention with
                         // cross-shard shared reads from other shard threads.
+                        crate::admin::metrics_setup::record_dispatch_local();
                         if metadata::is_write(cmd) {
                             // WRITE PATH: single lock acquisition for eviction + dispatch
                             let rt = ctx.runtime_config.read();
@@ -1154,6 +1155,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                         // execute before the deferred writes, violating command ordering. Fall through
                         // to SPSC dispatch to preserve pipeline semantics.
                         if !metadata::is_write(cmd) && !remote_groups.contains_key(&target) {
+                            crate::admin::metrics_setup::record_dispatch_cross_read_fastpath();
                             let guard = ctx.shard_databases.read_db(target, conn.selected_db);
                             let now_ms = ctx.cached_clock.ms();
                             let db_count = ctx.shard_databases.db_count();
@@ -1200,6 +1202,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                             Bytes::new()
                         };
                         remote_groups.entry(target).or_default().push((resp_idx, std::sync::Arc::new(dispatch_frame), aof_bytes, cmd_bytes, conn.selected_db));
+                        crate::admin::metrics_setup::record_dispatch_cross_spsc();
                     }
                 }
 

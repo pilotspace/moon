@@ -829,6 +829,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
             };
 
             if is_local {
+                crate::admin::metrics_setup::record_dispatch_local();
                 if metadata::is_write(cmd) {
                     // WRITE PATH: eviction + dispatch under write lock.
                     let rt = ctx.runtime_config.read();
@@ -1115,6 +1116,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     && !remote_groups.contains_key(&target)
                     && is_dispatch_read_supported(cmd)
                 {
+                    crate::admin::metrics_setup::record_dispatch_cross_read_fastpath();
                     let guard = ctx.shard_databases.read_db(target, conn.selected_db);
                     let now_ms = ctx.cached_clock.ms();
                     let result = dispatch_read(
@@ -1180,6 +1182,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     aof_bytes,
                     cmd_bytes,
                 ));
+                crate::admin::metrics_setup::record_dispatch_cross_spsc();
             }
         }
 

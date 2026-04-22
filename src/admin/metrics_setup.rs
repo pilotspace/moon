@@ -490,6 +490,43 @@ pub fn record_spsc_drain(shard_id: usize, count: u64) {
     histogram!("moon_spsc_drain_batch_size", "shard" => shard).record(count as f64);
 }
 
+// ── Dispatch routing counters (Phase 177, Step 6) ───────────────────────
+// Three-way split of the connection hot path so we can quantify what
+// fraction of traffic is hitting the expensive cross-shard SPSC dispatch
+// vs. the free local / shared-read fast paths. Ratio of these counters
+// is the ground-truth signal for validating dispatch-layer optimizations
+// (HotShardMessage split, outbox batching, waker relay fusion).
+
+/// Command executed on the connection's own shard (no cross-thread hop).
+#[inline]
+pub fn record_dispatch_local() {
+    if !METRICS_INITIALIZED.load(Ordering::Relaxed) {
+        return;
+    }
+    counter!("moon_dispatch_path_total", "path" => "local").increment(1);
+}
+
+/// Command executed on a remote shard via the shared-read fast path
+/// (RwLock read on the target shard's database, no SPSC message).
+#[inline]
+pub fn record_dispatch_cross_read_fastpath() {
+    if !METRICS_INITIALIZED.load(Ordering::Relaxed) {
+        return;
+    }
+    counter!("moon_dispatch_path_total", "path" => "cross_read_fast").increment(1);
+}
+
+/// Command deferred to cross-shard SPSC dispatch (the slow path).
+/// Recorded when a command is enqueued into a `remote_groups` bucket that
+/// will be flushed as a `PipelineBatchSlotted` message.
+#[inline]
+pub fn record_dispatch_cross_spsc() {
+    if !METRICS_INITIALIZED.load(Ordering::Relaxed) {
+        return;
+    }
+    counter!("moon_dispatch_path_total", "path" => "cross_spsc").increment(1);
+}
+
 // ── Vector search metrics (v0.1.6) ─────────────────────────────────────
 
 /// Record a cache hit for FT.CACHESEARCH.
@@ -858,4 +895,28 @@ pub fn spawn_metrics_publisher() {
             let _ = sender.send(event);
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Smoke tests for the dispatch-path counters added in Phase 177, Step 6.
+    // A full assertion on the prometheus state would require initialising a
+    // recorder and a scraping harness — out of scope here. These tests just
+    // pin the contract that the helpers are safe to call on the hot path
+    // before `init_metrics` has run and therefore never panic or allocate
+    // unexpectedly when the exporter is disabled (admin_port = 0).
+
+    #[test]
+    fn dispatch_path_counters_no_op_before_init() {
+        // METRICS_INITIALIZED starts false; all three helpers must early-return.
+        // We just assert they do not panic. The absence of a global recorder
+        // means counter!() would otherwise be a no-op, but the guard is what
+        // we actually care about: no string allocation, no label churn.
+        assert!(!METRICS_INITIALIZED.load(Ordering::Relaxed));
+        record_dispatch_local();
+        record_dispatch_cross_read_fastpath();
+        record_dispatch_cross_spsc();
+    }
 }

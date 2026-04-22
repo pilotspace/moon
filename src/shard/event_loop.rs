@@ -390,7 +390,10 @@ impl super::Shard {
                 }
             }
             (Some(_), true) => {
-                info!("Shard {}: WAL v2 skipped (disk-offload active, WAL v3 supersedes)", shard_id);
+                info!(
+                    "Shard {}: WAL v2 skipped (disk-offload active, WAL v3 supersedes)",
+                    shard_id
+                );
                 None
             }
             (Some(_), false) => {
