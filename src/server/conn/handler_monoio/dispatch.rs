@@ -120,6 +120,11 @@ pub(super) fn check_auth_gate(
 }
 
 /// Handle CLUSTER subcommands. Returns `true` if consumed.
+///
+/// `#[inline]` so the "cmd != CLUSTER" early-return (the hot path for every
+/// non-CLUSTER command in a pipeline batch) compiles to a single length + byte
+/// compare inline at the call site, avoiding per-command call/ret overhead.
+#[inline]
 pub(super) fn try_handle_cluster(
     cmd: &[u8],
     cmd_args: &[Frame],
@@ -145,6 +150,10 @@ pub(super) fn try_handle_cluster(
 }
 
 /// Handle EVALSHA command. Returns `true` if consumed.
+///
+/// `#[inline]`: see `try_handle_cluster` rationale — name check inlines to the
+/// caller so non-EVALSHA commands cost only a length + byte compare.
+#[inline]
 pub(super) fn try_handle_evalsha(
     cmd: &[u8],
     cmd_args: &[Frame],
@@ -174,7 +183,11 @@ pub(super) fn try_handle_evalsha(
     true
 }
 
-/// Handle EVAL command. Returns `true` if consumed.
+/// Handle the Redis EVAL command. Returns `true` if consumed.
+///
+/// `#[inline]`: see `try_handle_cluster` rationale — name check inlines so
+/// non-matching commands cost only a length + byte compare.
+#[inline]
 pub(super) fn try_handle_eval(
     cmd: &[u8],
     cmd_args: &[Frame],
@@ -205,6 +218,9 @@ pub(super) fn try_handle_eval(
 }
 
 /// Handle SCRIPT subcommands (LOAD, EXISTS, FLUSH). Returns `true` if consumed.
+///
+/// `#[inline]`: see `try_handle_cluster` rationale.
+#[inline]
 pub(super) fn try_handle_script(
     cmd: &[u8],
     cmd_args: &[Frame],
@@ -239,6 +255,7 @@ pub(super) fn try_handle_script(
 
 /// Handle cluster slot routing (pre-dispatch).
 /// Returns `true` if the command was redirected (MOVED/ASK/CROSSSLOT) and should be skipped.
+#[inline]
 pub(super) fn try_handle_cluster_routing(
     cmd: &[u8],
     cmd_args: &[Frame],
@@ -297,6 +314,7 @@ pub(super) fn try_handle_cluster_routing(
 }
 
 /// Handle AUTH command (when already authenticated). Returns `true` if consumed.
+#[inline]
 pub(super) fn try_handle_auth(
     cmd: &[u8],
     cmd_args: &[Frame],
@@ -324,6 +342,7 @@ pub(super) fn try_handle_auth(
 }
 
 /// Handle HELLO command (protocol negotiation, ACL-aware). Returns `true` if consumed.
+#[inline]
 pub(super) fn try_handle_hello(
     cmd: &[u8],
     cmd_args: &[Frame],
@@ -368,6 +387,7 @@ pub(super) fn try_handle_hello(
 }
 
 /// Handle ACL command (intercepted at connection level). Returns `true` if consumed.
+#[inline]
 pub(super) fn try_handle_acl(
     cmd: &[u8],
     cmd_args: &[Frame],
@@ -392,6 +412,7 @@ pub(super) fn try_handle_acl(
 }
 
 /// Handle CONFIG GET/SET. Returns `true` if consumed.
+#[inline]
 pub(super) fn try_handle_config(
     cmd: &[u8],
     cmd_args: &[Frame],
@@ -406,6 +427,7 @@ pub(super) fn try_handle_config(
 }
 
 /// Handle REPLICAOF / SLAVEOF. Returns `true` if consumed.
+#[inline]
 pub(super) fn try_handle_replicaof(
     cmd: &[u8],
     cmd_args: &[Frame],
@@ -457,6 +479,7 @@ pub(super) fn try_handle_replicaof(
 }
 
 /// Handle REPLCONF command. Returns `true` if consumed.
+#[inline]
 pub(super) fn try_handle_replconf(
     cmd: &[u8],
     cmd_args: &[Frame],
@@ -470,6 +493,7 @@ pub(super) fn try_handle_replconf(
 }
 
 /// Handle INFO command. Returns `true` if consumed.
+#[inline]
 pub(super) fn try_handle_info(
     cmd: &[u8],
     cmd_args: &[Frame],
@@ -503,6 +527,7 @@ pub(super) fn try_handle_info(
 
 /// Handle READONLY enforcement: reject writes on replicas.
 /// Returns `true` if the command was blocked.
+#[inline]
 pub(super) fn try_enforce_readonly(
     cmd: &[u8],
     ctx: &ConnectionContext,
@@ -531,6 +556,7 @@ pub(super) fn try_enforce_readonly(
 /// Returns `true` if a subcommand was consumed (caller should `continue`).
 /// Returns `false` for admin subcommands (LIST, INFO, KILL, PAUSE, UNPAUSE, NO-EVICT, NO-TOUCH)
 /// which must pass through the ACL gate first.
+#[inline]
 pub(super) fn try_handle_client_early(
     cmd: &[u8],
     cmd_args: &[Frame],
@@ -627,6 +653,7 @@ pub(super) fn try_handle_client_early(
 /// Handle CLIENT admin subcommands (LIST, INFO, KILL, PAUSE, UNPAUSE, NO-EVICT, NO-TOUCH).
 /// Placed AFTER ACL check so restricted users cannot access admin ops.
 /// Returns `true` if consumed.
+#[inline]
 pub(super) fn try_handle_client_admin(
     cmd: &[u8],
     cmd_args: &[Frame],
@@ -751,6 +778,7 @@ pub(super) fn try_handle_client_admin(
 
 /// Handle persistence commands (BGSAVE, SAVE, LASTSAVE, BGREWRITEAOF).
 /// Returns `true` if consumed.
+#[inline]
 pub(super) fn try_handle_persistence(
     cmd: &[u8],
     ctx: &ConnectionContext,
@@ -789,6 +817,7 @@ pub(super) fn try_handle_persistence(
 
 /// Handle ACL permission check (NOPERM gate).
 /// Returns `true` if the command was denied (caller should `continue`).
+#[inline]
 pub(super) fn try_enforce_acl(
     cmd: &[u8],
     cmd_args: &[Frame],
@@ -843,6 +872,7 @@ pub(super) fn try_enforce_acl(
 
 /// Handle FUNCTION/FCALL/FCALL_RO commands. Returns `true` if consumed.
 /// Placed AFTER ACL check. Skipped when conn.in_multi (fall through to MULTI queue).
+#[inline]
 pub(super) fn try_handle_functions(
     cmd: &[u8],
     cmd_args: &[Frame],

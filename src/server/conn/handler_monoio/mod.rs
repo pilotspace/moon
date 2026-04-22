@@ -586,71 +586,97 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 continue;
             }
             // --- Connection-level commands (dispatched to dispatch.rs) ---
-            if dispatch::try_handle_cluster(cmd, cmd_args, ctx, &mut responses) {
+            //
+            // Length-gated dispatch: each `try_handle_*` starts with a
+            // `cmd.eq_ignore_ascii_case(b"NAME")` early-return whose body is
+            // too large for rustc to inline. By pre-checking `cmd_len` at the
+            // call site we avoid the function call + prologue for the common
+            // case where a pipelined SET/GET length does not match any of the
+            // connection-level command names. Cut per-command dispatch cost
+            // from ~14 non-matching function calls to ~1 on SET/GET workloads.
+            let cmd_len = cmd.len();
+            if cmd_len == 7 && dispatch::try_handle_cluster(cmd, cmd_args, ctx, &mut responses) {
                 continue;
             }
-            if dispatch::try_handle_evalsha(cmd, cmd_args, &conn, ctx, &mut responses) {
+            if cmd_len == 7
+                && dispatch::try_handle_evalsha(cmd, cmd_args, &conn, ctx, &mut responses)
+            {
                 continue;
             }
-            if dispatch::try_handle_eval(cmd, cmd_args, &conn, ctx, &mut responses) {
+            if cmd_len == 4
+                && dispatch::try_handle_eval(cmd, cmd_args, &conn, ctx, &mut responses)
+            {
                 continue;
             }
-            if dispatch::try_handle_script(cmd, cmd_args, ctx, &mut responses) {
+            if cmd_len == 6 && dispatch::try_handle_script(cmd, cmd_args, ctx, &mut responses) {
                 continue;
             }
             if dispatch::try_handle_cluster_routing(cmd, cmd_args, &mut conn, ctx, &mut responses) {
                 continue;
             }
-            if dispatch::try_handle_auth(
-                cmd,
-                cmd_args,
-                &mut conn,
-                ctx,
-                &peer_addr,
-                &mut auth_delay_ms,
-                &mut responses,
-            ) {
+            if cmd_len == 4
+                && dispatch::try_handle_auth(
+                    cmd,
+                    cmd_args,
+                    &mut conn,
+                    ctx,
+                    &peer_addr,
+                    &mut auth_delay_ms,
+                    &mut responses,
+                )
+            {
                 continue;
             }
-            if dispatch::try_handle_hello(
-                cmd,
-                cmd_args,
-                &mut conn,
-                ctx,
-                client_id,
-                &peer_addr,
-                &mut auth_delay_ms,
-                &mut responses,
-            ) {
+            if cmd_len == 5
+                && dispatch::try_handle_hello(
+                    cmd,
+                    cmd_args,
+                    &mut conn,
+                    ctx,
+                    client_id,
+                    &peer_addr,
+                    &mut auth_delay_ms,
+                    &mut responses,
+                )
+            {
                 continue;
             }
-            if dispatch::try_handle_acl(cmd, cmd_args, &mut conn, ctx, &peer_addr, &mut responses) {
+            if cmd_len == 3
+                && dispatch::try_handle_acl(cmd, cmd_args, &mut conn, ctx, &peer_addr, &mut responses)
+            {
                 continue;
             }
-            if dispatch::try_handle_config(cmd, cmd_args, ctx, &mut responses) {
+            if cmd_len == 6 && dispatch::try_handle_config(cmd, cmd_args, ctx, &mut responses) {
                 continue;
             }
-            if dispatch::try_handle_replicaof(cmd, cmd_args, ctx, &mut responses) {
+            // REPLICAOF (9) or SLAVEOF (7)
+            if (cmd_len == 9 || cmd_len == 7)
+                && dispatch::try_handle_replicaof(cmd, cmd_args, ctx, &mut responses)
+            {
                 continue;
             }
-            if dispatch::try_handle_replconf(cmd, cmd_args, &mut responses) {
+            if cmd_len == 8 && dispatch::try_handle_replconf(cmd, cmd_args, &mut responses) {
                 continue;
             }
-            if dispatch::try_handle_info(cmd, cmd_args, &conn, ctx, &mut responses) {
+            if cmd_len == 4
+                && dispatch::try_handle_info(cmd, cmd_args, &conn, ctx, &mut responses)
+            {
                 continue;
             }
             if dispatch::try_enforce_readonly(cmd, ctx, &mut responses) {
                 continue;
             }
             // CLIENT early (ID, SETNAME, GETNAME, TRACKING) -- admin subcmds fall through to ACL gate
-            if dispatch::try_handle_client_early(
-                cmd,
-                cmd_args,
-                client_id,
-                &mut conn,
-                ctx,
-                &mut responses,
-            ) {
+            if cmd_len == 6
+                && dispatch::try_handle_client_early(
+                    cmd,
+                    cmd_args,
+                    client_id,
+                    &mut conn,
+                    ctx,
+                    &mut responses,
+                )
+            {
                 continue;
             }
             // --- Pub/sub commands ---
