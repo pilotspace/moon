@@ -986,7 +986,11 @@ pub(crate) async fn handle_connection_sharded_inner<
                             if let Ok(cmd_str) = std::str::from_utf8(cmd) {
                                 if let Some(start) = dispatch_start {
                                     let elapsed_us = start.elapsed().as_micros() as u64;
-                                    crate::admin::metrics_setup::record_command(cmd_str, elapsed_us);
+                                    crate::admin::metrics_setup::record_command_cached(
+                                        cmd_str,
+                                        elapsed_us,
+                                        &mut conn.cached_metrics,
+                                    );
                                     if let Frame::Array(ref args) = frame {
                                         crate::admin::metrics_setup::global_slowlog().maybe_record(
                                             elapsed_us,
@@ -996,7 +1000,10 @@ pub(crate) async fn handle_connection_sharded_inner<
                                         );
                                     }
                                 } else {
-                                    crate::admin::metrics_setup::record_command_no_latency(cmd_str);
+                                    crate::admin::metrics_setup::record_command_no_latency_cached(
+                                        cmd_str,
+                                        &mut conn.cached_metrics,
+                                    );
                                 }
                             }
                             let response = match result {
@@ -1005,7 +1012,10 @@ pub(crate) async fn handle_connection_sharded_inner<
                             };
                             if matches!(response, Frame::Error(_)) {
                                 if let Ok(cmd_str) = std::str::from_utf8(cmd) {
-                                    crate::admin::metrics_setup::record_command_error(cmd_str);
+                                    crate::admin::metrics_setup::record_command_error_cached(
+                                        cmd_str,
+                                        &mut conn.cached_metrics,
+                                    );
                                 }
                             } else {
                                 let needs_wake = cmd.eq_ignore_ascii_case(b"LPUSH") || cmd.eq_ignore_ascii_case(b"RPUSH")
@@ -1127,7 +1137,11 @@ pub(crate) async fn handle_connection_sharded_inner<
                             if let Ok(cmd_str) = std::str::from_utf8(cmd) {
                                 if let Some(start) = dispatch_start {
                                     let elapsed_us = start.elapsed().as_micros() as u64;
-                                    crate::admin::metrics_setup::record_command(cmd_str, elapsed_us);
+                                    crate::admin::metrics_setup::record_command_cached(
+                                        cmd_str,
+                                        elapsed_us,
+                                        &mut conn.cached_metrics,
+                                    );
                                     if let Frame::Array(ref args) = frame {
                                         crate::admin::metrics_setup::global_slowlog().maybe_record(
                                             elapsed_us,
@@ -1137,7 +1151,10 @@ pub(crate) async fn handle_connection_sharded_inner<
                                         );
                                     }
                                 } else {
-                                    crate::admin::metrics_setup::record_command_no_latency(cmd_str);
+                                    crate::admin::metrics_setup::record_command_no_latency_cached(
+                                        cmd_str,
+                                        &mut conn.cached_metrics,
+                                    );
                                 }
                             }
                             drop(guard);
@@ -1147,7 +1164,10 @@ pub(crate) async fn handle_connection_sharded_inner<
                             };
                             if matches!(response, Frame::Error(_)) {
                                 if let Ok(cmd_str) = std::str::from_utf8(cmd) {
-                                    crate::admin::metrics_setup::record_command_error(cmd_str);
+                                    crate::admin::metrics_setup::record_command_error_cached(
+                                        cmd_str,
+                                        &mut conn.cached_metrics,
+                                    );
                                 }
                             }
                             if conn.tracking_state.enabled && !conn.tracking_state.bcast {
@@ -1193,7 +1213,10 @@ pub(crate) async fn handle_connection_sharded_inner<
                             };
                             if matches!(response, Frame::Error(_)) {
                                 if let Ok(cmd_str) = std::str::from_utf8(cmd) {
-                                    crate::admin::metrics_setup::record_command_error(cmd_str);
+                                    crate::admin::metrics_setup::record_command_error_cached(
+                                        cmd_str,
+                                        &mut conn.cached_metrics,
+                                    );
                                 }
                             }
                             // Client tracking for cross-shard reads

@@ -378,6 +378,103 @@ pub fn record_command_error(cmd: &str) {
     counter!("moon_command_errors_total", "cmd" => sanitize_cmd_label(cmd)).increment(1);
 }
 
+/// Per-connection cached Prometheus metric handles.
+///
+/// The `metrics!` macros call `with_recorder(|rec| rec.register_counter(...))`
+/// on every invocation, which for `metrics-exporter-prometheus` resolves to a
+/// DashMap lookup keyed on `(name, labels)`. Under a steady single-command
+/// workload (e.g. redis-benchmark -t set) the label is constant, so the lookup
+/// is pure overhead. The flamegraph attributes ~6% of shard CPU to the
+/// recorder backend on SET p=64.
+///
+/// This struct caches the last-seen command's counter / histogram / error
+/// counter handles, keyed on the raw command bytes. Cache hit avoids both
+/// `sanitize_cmd_label` and the registry lookup — the hot path collapses to
+/// one atomic fetch + two atomic handle operations.
+///
+/// Held by `ConnectionState` (`!Send` because the handler is thread-pinned),
+/// so there is no cross-thread synchronisation.
+pub struct CachedMetricsHandles {
+    /// Raw command bytes of the most recent call. Empty on init.
+    last_cmd: smallvec::SmallVec<[u8; 20]>,
+    counter: metrics::Counter,
+    histogram: metrics::Histogram,
+    error_counter: metrics::Counter,
+}
+
+impl Default for CachedMetricsHandles {
+    fn default() -> Self {
+        Self {
+            last_cmd: smallvec::SmallVec::new(),
+            counter: metrics::Counter::noop(),
+            histogram: metrics::Histogram::noop(),
+            error_counter: metrics::Counter::noop(),
+        }
+    }
+}
+
+impl CachedMetricsHandles {
+    #[inline]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Ensure the cached handles refer to `cmd`. No-op when the previous
+    /// call used the same bytes (cache hit).
+    #[inline]
+    fn ensure(&mut self, cmd: &[u8]) {
+        if self.last_cmd.as_slice() == cmd {
+            return;
+        }
+        let cmd_str = std::str::from_utf8(cmd).unwrap_or("unknown");
+        let label = sanitize_cmd_label(cmd_str);
+        self.last_cmd.clear();
+        self.last_cmd.extend_from_slice(cmd);
+        self.counter = counter!("moon_commands_total", "cmd" => label);
+        self.histogram = histogram!("moon_command_duration_microseconds", "cmd" => label);
+        self.error_counter = counter!("moon_command_errors_total", "cmd" => label);
+    }
+}
+
+/// Record a command execution with latency using a per-connection handle
+/// cache. Functionally identical to [`record_command`] but avoids the
+/// recorder-backend DashMap lookup on cache hit.
+#[inline]
+pub fn record_command_cached(cmd: &str, latency_us: u64, cache: &mut CachedMetricsHandles) {
+    TOTAL_COMMANDS.fetch_add(1, Ordering::Relaxed);
+    if !METRICS_INITIALIZED.load(Ordering::Relaxed) {
+        return;
+    }
+    cache.ensure(cmd.as_bytes());
+    cache.counter.increment(1);
+    cache.histogram.record(latency_us as f64);
+}
+
+/// Record a command execution without latency using a per-connection handle
+/// cache. Functionally identical to [`record_command_no_latency`] but avoids
+/// the recorder-backend DashMap lookup on cache hit.
+#[inline]
+pub fn record_command_no_latency_cached(cmd: &str, cache: &mut CachedMetricsHandles) {
+    TOTAL_COMMANDS.fetch_add(1, Ordering::Relaxed);
+    if !METRICS_INITIALIZED.load(Ordering::Relaxed) {
+        return;
+    }
+    cache.ensure(cmd.as_bytes());
+    cache.counter.increment(1);
+}
+
+/// Record a command error using a per-connection handle cache.
+/// Functionally identical to [`record_command_error`] but avoids the
+/// recorder-backend DashMap lookup on cache hit.
+#[inline]
+pub fn record_command_error_cached(cmd: &str, cache: &mut CachedMetricsHandles) {
+    if !METRICS_INITIALIZED.load(Ordering::Relaxed) {
+        return;
+    }
+    cache.ensure(cmd.as_bytes());
+    cache.error_counter.increment(1);
+}
+
 // ── Connection metrics ──────────────────────────────────────────────────
 
 /// Record a new client connection.
@@ -980,5 +1077,39 @@ mod tests {
         record_dispatch_cross_spsc();
         record_dispatch_local_inline(0); // count == 0 must short-circuit even when init
         record_dispatch_local_inline(7);
+    }
+
+    #[test]
+    fn cached_metrics_skips_rebuild_on_same_cmd() {
+        let mut cache = CachedMetricsHandles::new();
+        assert!(cache.last_cmd.is_empty(), "fresh cache starts empty");
+
+        cache.ensure(b"SET");
+        assert_eq!(cache.last_cmd.as_slice(), b"SET", "first call populates");
+
+        // Repeated SET: cache hit. We cannot observe the skip directly without a
+        // mock recorder, but the stored bytes must remain and not churn.
+        cache.ensure(b"SET");
+        assert_eq!(cache.last_cmd.as_slice(), b"SET");
+
+        // Different command: must rebuild and swap the buffer contents.
+        cache.ensure(b"GET");
+        assert_eq!(cache.last_cmd.as_slice(), b"GET");
+
+        // Mixed case is treated as a distinct raw input; sanitize_cmd_label
+        // will still normalise to "set" for the Prometheus label, but the
+        // cache key is the raw bytes (pointer to the last call's payload).
+        cache.ensure(b"set");
+        assert_eq!(cache.last_cmd.as_slice(), b"set");
+    }
+
+    #[test]
+    fn record_command_cached_no_op_before_init() {
+        assert!(!METRICS_INITIALIZED.load(Ordering::Relaxed));
+        let mut cache = CachedMetricsHandles::new();
+        record_command_cached("set", 1, &mut cache);
+        record_command_no_latency_cached("set", &mut cache);
+        record_command_error_cached("set", &mut cache);
+        // Must not panic, must not churn the cache on the hot path.
     }
 }

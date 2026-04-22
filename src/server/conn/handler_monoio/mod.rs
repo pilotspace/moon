@@ -914,7 +914,11 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     if let Ok(cmd_str) = std::str::from_utf8(cmd) {
                         if let Some(start) = dispatch_start {
                             let elapsed_us = start.elapsed().as_micros() as u64;
-                            crate::admin::metrics_setup::record_command(cmd_str, elapsed_us);
+                            crate::admin::metrics_setup::record_command_cached(
+                                cmd_str,
+                                elapsed_us,
+                                &mut conn.cached_metrics,
+                            );
                             if let Frame::Array(ref args) = frame {
                                 crate::admin::metrics_setup::global_slowlog().maybe_record(
                                     elapsed_us,
@@ -926,7 +930,10 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                 );
                             }
                         } else {
-                            crate::admin::metrics_setup::record_command_no_latency(cmd_str);
+                            crate::admin::metrics_setup::record_command_no_latency_cached(
+                                cmd_str,
+                                &mut conn.cached_metrics,
+                            );
                         }
                     }
 
@@ -1076,7 +1083,11 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     if let Ok(cmd_str) = std::str::from_utf8(cmd) {
                         if let Some(start) = dispatch_start {
                             let elapsed_us = start.elapsed().as_micros() as u64;
-                            crate::admin::metrics_setup::record_command(cmd_str, elapsed_us);
+                            crate::admin::metrics_setup::record_command_cached(
+                                cmd_str,
+                                elapsed_us,
+                                &mut conn.cached_metrics,
+                            );
                             if let Frame::Array(ref args) = frame {
                                 crate::admin::metrics_setup::global_slowlog().maybe_record(
                                     elapsed_us,
@@ -1088,7 +1099,10 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                 );
                             }
                         } else {
-                            crate::admin::metrics_setup::record_command_no_latency(cmd_str);
+                            crate::admin::metrics_setup::record_command_no_latency_cached(
+                                cmd_str,
+                                &mut conn.cached_metrics,
+                            );
                         }
                     }
                     drop(guard);

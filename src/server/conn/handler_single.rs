@@ -743,7 +743,11 @@ pub async fn handle_connection(
                                     let result = dispatch(&mut *guard, d_cmd, d_args, &mut conn.selected_db, db_count);
                                     let elapsed_us = dispatch_start.elapsed().as_micros() as u64;
                                     if let Ok(cmd_str) = std::str::from_utf8(d_cmd) {
-                                        crate::admin::metrics_setup::record_command(cmd_str, elapsed_us);
+                                        crate::admin::metrics_setup::record_command_cached(
+                                            cmd_str,
+                                            elapsed_us,
+                                            &mut conn.cached_metrics,
+                                        );
                                     }
                                     if let Frame::Array(ref args) = disp_frame {
                                         crate::admin::metrics_setup::global_slowlog().maybe_record(
@@ -1615,7 +1619,11 @@ pub async fn handle_connection(
                                 let result = dispatch_read(&*guard, d_cmd, d_args, now_ms, &mut conn.selected_db, db_count);
                                 let elapsed_us = dispatch_start.elapsed().as_micros() as u64;
                                 if let Ok(cmd_str) = std::str::from_utf8(d_cmd) {
-                                    crate::admin::metrics_setup::record_command(cmd_str, elapsed_us);
+                                    crate::admin::metrics_setup::record_command_cached(
+                                        cmd_str,
+                                        elapsed_us,
+                                        &mut conn.cached_metrics,
+                                    );
                                 }
                                 if let Frame::Array(ref args) = *disp_frame {
                                     crate::admin::metrics_setup::global_slowlog().maybe_record(
@@ -1769,7 +1777,11 @@ pub async fn handle_connection(
                                 let result = dispatch(&mut *guard, d_cmd, d_args, &mut conn.selected_db, db_count);
                                 let elapsed_us = dispatch_start.elapsed().as_micros() as u64;
                                 if let Ok(cmd_str) = std::str::from_utf8(d_cmd) {
-                                    crate::admin::metrics_setup::record_command(cmd_str, elapsed_us);
+                                    crate::admin::metrics_setup::record_command_cached(
+                                        cmd_str,
+                                        elapsed_us,
+                                        &mut conn.cached_metrics,
+                                    );
                                 }
                                 if let Frame::Array(ref args) = *disp_frame {
                                     crate::admin::metrics_setup::global_slowlog().maybe_record(

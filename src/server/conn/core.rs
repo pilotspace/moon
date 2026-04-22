@@ -220,6 +220,11 @@ pub(crate) struct ConnectionState {
     /// only matters when threshold <~ expected per-op latency; default 10 ms
     /// threshold effectively never fires on pipelined workloads regardless.
     pub cmd_counter: u32,
+
+    /// Cached Prometheus metric handles for the most recently executed
+    /// command on this connection. A cache hit skips the recorder backend's
+    /// DashMap lookup (~6% of shard CPU on SET p=64 per flamegraph).
+    pub cached_metrics: crate::admin::metrics_setup::CachedMetricsHandles,
 }
 
 impl ConnectionState {
@@ -265,6 +270,7 @@ impl ConnectionState {
             },
             migration_target: None,
             cmd_counter: 0,
+            cached_metrics: crate::admin::metrics_setup::CachedMetricsHandles::new(),
             cached_acl_unrestricted: false,
             cached_acl_version: 0,
             // Placeholder handle — `refresh_acl_cache` replaces this with
