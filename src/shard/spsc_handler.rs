@@ -1846,16 +1846,15 @@ pub(crate) fn wal_append_and_fanout(
     repl_state: &Option<Arc<RwLock<ReplicationState>>>,
     shard_id: usize,
 ) {
-    // 1a. WAL v2 append (disk durability, legacy path)
-    if let Some(w) = wal_writer {
-        w.append(data);
-    }
-    // 1b. WAL v3 append (disk-offload mode: per-record LSN, CRC32C)
+    // WAL v3 supersedes v2 — skip v2 append when v3 is active to avoid
+    // double-write overhead (2 write syscalls per SPSC drain batch).
     if let Some(w3) = wal_v3_writer {
         w3.append(
             crate::persistence::wal_v3::record::WalRecordType::Command,
             data,
         );
+    } else if let Some(w) = wal_writer {
+        w.append(data);
     }
     // 2. Replication backlog (in-memory circular buffer for partial resync)
     if let Some(backlog) = repl_backlog {

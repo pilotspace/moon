@@ -371,19 +371,28 @@ impl super::Shard {
         let mut snapshot_state: Option<SnapshotState> = None;
         let mut snapshot_reply_tx: Option<channel::OneshotSender<Result<(), String>>> = None;
 
-        // Per-shard WAL writer (created only when persistence is actually enabled).
+        // Per-shard WAL v2 writer — created only when persistence is enabled AND
+        // disk-offload is disabled. When disk-offload is on, WAL v3 supersedes v2
+        // (stronger guarantees: per-record LSN + CRC32C), so v2 is skipped entirely
+        // to avoid double-write overhead.
         let appendonly_enabled = runtime_config.read().appendonly != "no";
         let mut wal_writer: Option<WalWriter> = match (&persistence_dir, appendonly_enabled) {
-            (Some(dir), true) => match WalWriter::new(shard_id, std::path::Path::new(dir)) {
-                Ok(w) => {
-                    info!("Shard {}: WAL writer initialized", shard_id);
-                    Some(w)
+            (Some(dir), true) if !server_config.disk_offload_enabled() => {
+                match WalWriter::new(shard_id, std::path::Path::new(dir)) {
+                    Ok(w) => {
+                        info!("Shard {}: WAL writer initialized", shard_id);
+                        Some(w)
+                    }
+                    Err(e) => {
+                        tracing::warn!("Shard {}: WAL init failed: {}", shard_id, e);
+                        None
+                    }
                 }
-                Err(e) => {
-                    tracing::warn!("Shard {}: WAL init failed: {}", shard_id, e);
-                    None
-                }
-            },
+            }
+            (Some(_), true) => {
+                info!("Shard {}: WAL v2 skipped (disk-offload active, WAL v3 supersedes)", shard_id);
+                None
+            }
             (Some(_), false) => {
                 info!("Shard {}: WAL skipped (appendonly=no)", shard_id);
                 None
