@@ -162,6 +162,9 @@ pub(super) async fn try_handle_ft_command(
                         return true;
                     }
                 };
+                // `is_text` was computed as `query_bytes.as_ref().map_or(false, ...)` (line ~65),
+                // so reaching `if is_text { ... }` guarantees `query_bytes.is_some()`.
+                #[allow(clippy::unwrap_used)]
                 let query_str = query_bytes.unwrap();
 
                 // B-01 SITE 2 FIX (Plan 152-06): FieldFilter short-circuit BEFORE

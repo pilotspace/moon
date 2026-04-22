@@ -758,6 +758,8 @@ pub fn apply_post_processing(
 
             // SUMMARIZE first (extracts passage), then HIGHLIGHT (wraps terms).
             let processed = if do_summarize {
+                // Safe: `do_summarize = summarize_opts.map_or(false, ..)` so do_summarize=true ⇒ Some.
+                #[allow(clippy::unwrap_used)]
                 let opts = summarize_opts.unwrap();
                 let summarized = summarize_field(
                     original_text,
@@ -768,6 +770,8 @@ pub fn apply_post_processing(
                     &opts.separator,
                 );
                 if do_highlight {
+                    // Safe: `do_highlight = highlight_opts.map_or(false, ..)` so do_highlight=true ⇒ Some.
+                    #[allow(clippy::unwrap_used)]
                     let hopts = highlight_opts.unwrap();
                     highlight_field(
                         &summarized,
@@ -781,6 +785,9 @@ pub fn apply_post_processing(
                     summarized
                 }
             } else {
+                // Safe: reached only when do_summarize=false but the `!do_highlight && !do_summarize`
+                // guard above ensured at least one was true, so do_highlight=true ⇒ Some.
+                #[allow(clippy::unwrap_used)]
                 let hopts = highlight_opts.unwrap();
                 highlight_field(
                     original_text,

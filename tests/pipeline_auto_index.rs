@@ -21,7 +21,7 @@
 //!   cargo test --no-default-features \
 //!     --features runtime-tokio,jemalloc,text-index,graph \
 //!     --test pipeline_auto_index
-#![cfg(feature = "runtime-tokio")]
+#![cfg(all(feature = "runtime-tokio", feature = "text-index"))]
 
 use moon::config::ServerConfig;
 use moon::runtime::cancel::CancellationToken;
