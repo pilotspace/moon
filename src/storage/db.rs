@@ -41,6 +41,17 @@ pub struct Database {
     /// Set once at database creation time and never changed, ensuring
     /// TTL deltas remain stable across the database lifetime.
     base_timestamp: u32,
+    /// Monotonic flag: true once an entry with has_expiry() has been inserted
+    /// (via set / set_expiry / insert_for_load). Reset to false only when the
+    /// active-expiry scan confirms zero expiring keys remain. Used by the
+    /// active-expiry tick to short-circuit the O(N) `keys_with_expiry()` scan
+    /// when no key has a TTL — the common case for cache workloads that never
+    /// call EXPIRE / SETEX. Safe under-reporting scenarios: flag stays true
+    /// longer than necessary (harmless: one extra scan); never flips false
+    /// while an expiring key is live (enforced by the three setters + the
+    /// self-reset gate in `expire_cycle`). The scan-based reset costs O(N)
+    /// but happens at most once per "expiring key drained" transition.
+    maybe_has_expiring_keys: bool,
     /// Cold index for disk-offloaded KV entries (None when disk-offload disabled).
     pub cold_index: Option<crate::storage::tiered::cold_index::ColdIndex>,
     /// Shard directory for cold reads (None when disk-offload disabled).
@@ -56,9 +67,27 @@ impl Database {
             cached_now: current_secs(),
             cached_now_ms: current_time_ms(),
             base_timestamp: current_secs(),
+            maybe_has_expiring_keys: false,
             cold_index: None,
             cold_shard_dir: None,
         }
+    }
+
+    /// Fast-path predicate for the active-expiry tick. Returns `false` only
+    /// when the database is known to have zero entries with a TTL. Callers
+    /// MUST treat `true` as "maybe has expiring keys" — the precise answer
+    /// requires `keys_with_expiry()`.
+    #[inline]
+    pub fn maybe_has_expiring_keys(&self) -> bool {
+        self.maybe_has_expiring_keys
+    }
+
+    /// Latch the flag to `false`. Called by `expire_cycle` once its
+    /// `keys_with_expiry()` scan returns empty — proof that zero expiring
+    /// keys remain, so the next tick can skip the scan.
+    #[inline]
+    pub fn clear_maybe_has_expiring_keys(&mut self) {
+        self.maybe_has_expiring_keys = false;
     }
 
     /// Update the cached timestamp from a shared [`CachedClock`].
@@ -195,6 +224,9 @@ impl Database {
                 .saturating_sub(entry_overhead(&key, old_entry));
         }
         self.used_memory += entry_overhead(&key, &entry);
+        if entry.has_expiry() {
+            self.maybe_has_expiring_keys = true;
+        }
         self.data.insert(CompactKey::from(key), entry);
     }
 
@@ -207,6 +239,7 @@ impl Database {
     pub fn clear(&mut self) {
         self.data = DashTable::new();
         self.used_memory = 0;
+        self.maybe_has_expiring_keys = false;
     }
 
     /// Bulk-load insert: skip duplicate check, version tracking, and per-key memory accounting.
@@ -215,16 +248,24 @@ impl Database {
     /// we recalculate `used_memory` once after the entire load completes.
     #[inline]
     pub fn insert_for_load(&mut self, key: Bytes, entry: Entry) {
+        if entry.has_expiry() {
+            self.maybe_has_expiring_keys = true;
+        }
         self.data.insert(CompactKey::from(key), entry);
     }
 
     /// Recalculate `used_memory` by scanning all entries. Call once after bulk load.
     pub fn recalculate_memory(&mut self) {
         let mut total = 0usize;
+        let mut any_expiring = false;
         for (key, entry) in self.data.iter() {
             total += entry_overhead(key.as_bytes(), entry);
+            if entry.has_expiry() {
+                any_expiring = true;
+            }
         }
         self.used_memory = total;
+        self.maybe_has_expiring_keys = any_expiring;
     }
 
     /// Pre-size the internal hash table for an expected key count.
@@ -245,6 +286,7 @@ impl Database {
         if additional > self.data.len() {
             let new_table = DashTable::with_capacity(additional);
             self.data = new_table;
+            self.maybe_has_expiring_keys = false;
         }
     }
 
@@ -327,6 +369,13 @@ impl Database {
         match self.data.get_mut(key) {
             Some(entry) => {
                 entry.set_expires_at_ms(base_ts, expires_at_ms);
+                // Latch the fast-path flag once a TTL is set. Persist (0) may
+                // clear the per-entry bit but we don't flip the DB-level flag
+                // down — the active-expiry scan's self-reset gate is the only
+                // authoritative downgrade path (avoids racy decrement logic).
+                if expires_at_ms != 0 {
+                    self.maybe_has_expiring_keys = true;
+                }
                 true
             }
             None => false,
