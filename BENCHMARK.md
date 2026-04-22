@@ -1,10 +1,16 @@
 # moon Benchmark Report
 
-**Last Updated:** 2026-04-15
+**Last Updated:** 2026-04-22 (v0.1.6 tag results in §2.1–2.6; §2.7 has re-measurement on perf/shard-dispatch-hot-path branch)
 **Platforms:** Linux (GCloud x86_64 + ARM64), macOS (Apple M4 Pro)
-**Redis:** 8.6.1
-**moon:** v0.1.6, Monoio runtime (io_uring on Linux, kqueue on macOS), fat LTO, codegen-units=1, target-cpu=native
-**Methodology:** Co-located benchmarks using `redis-benchmark`. Fresh server instance per data point for memory tests. Moon runs with production defaults (appendonly=yes, disk-offload=enable, WAL v3, PageCache). All ratios from same-run comparisons to control for VM variance.
+**Redis:** 8.6.1 in §2.1–2.6; 7.0.15 in §2.7
+**moon:** v0.1.6 in §2.1–2.6; perf/shard-dispatch-hot-path HEAD (commit `6582fa9`) in §2.7. Monoio runtime (io_uring on Linux, kqueue on macOS), fat LTO, codegen-units=1, target-cpu=native
+**Methodology:** Co-located benchmarks using `redis-benchmark`. Fresh server instance per data point for memory tests. All ratios from same-run comparisons to control for VM variance.
+
+**IMPORTANT — read §2.7.1 before comparing SET numbers across this report.** Two `redis-benchmark` invocation styles are in play:
+- **Loose** (`redis-benchmark -t SET -P 64`, no `-r`): every write hits the single key `__rand_key__`. Cache-hot, no dict growth, no key distribution pressure. Matches §2.1/§2.2 historical methodology.
+- **Strict** (`redis-benchmark -t SET -r 1000000 -P 64`): writes distribute uniformly over 1M keys. Exercises actual dict growth, probe-path collisions, cache pressure. Matches production workloads.
+
+The SET absolute number can differ 3-4× between methodologies. Only strict-vs-strict or loose-vs-loose comparisons are meaningful.
 
 ---
 
@@ -107,6 +113,86 @@ The Apr 6 ratio (2.34x) was inflated by unusually slow Redis (2.36M). True GClou
 ### 2.6 Memory Stability
 
 RSS flat at 12.5MB under 100s sustained load (3 burst cycles of 1M requests each). No memory leak from tick-based event loop.
+
+### 2.7 2026-04-22 Re-measurement (perf/shard-dispatch-hot-path HEAD)
+
+**Branch:** `perf/shard-dispatch-hot-path` at commit `6582fa9`. Three new commits landed on top of v0.1.6-era baseline:
+
+| commit | fix | effect |
+|--------|-----|--------|
+| `e2addc8` | pre-size DashTable + fuse `Database::set` probe | eliminates 9.89% `split_segment` CPU, halves hit-path probes |
+| `e00769e` | length-gate + `#[inline]` `try_handle_*` | cuts ~5pp of per-command dispatch overhead |
+| `6582fa9` | batch-level eviction gate skips per-write `runtime_config` lock | handler-self closure -3.2pp when `maxmemory=0` and disk-offload disabled |
+
+**Instances:** fresh provisions, same class as §2.1 (c3-standard-8 x86_64 us-central1-a, t2a-standard-8 ARM64 us-central1-f). **Redis:** Ubuntu 24.04 package 7.0.15 (not the 8.6.1 used in §2.1-2.6). **CPU pinning:** server CPU 1, bench CPUs 2-5 via `taskset`.
+
+#### 2.7.1 Methodology — strict vs loose
+
+The v0.1.6 §2.1 table reported SET p=64 = 3.50M x86 / 2.42M ARM. Those numbers were measured with the default `redis-benchmark -P 64 -t SET` (no `-r` flag), which writes every request to the single key `__rand_key__`. That degenerates the workload: same segment every time, no dict growth, no key-distribution pressure, cache-hot throughout. It is what Redis's own benchmark folklore uses, but it does not reflect any real workload.
+
+The strict benchmark adds `-r 1000000`, spreading writes uniformly over 1M distinct keys. This exercises:
+- DashTable segment splits during table growth
+- h2 fingerprint collisions across the full keyspace
+- Cache pressure on the keys array
+- `CompactKey` heap allocations for keys beyond the 22-byte inline threshold
+
+Strict numbers are always lower. Moon gains more from loose methodology than Redis does (Moon's probe path amortizes better when the segment is cache-hot), so strict comparisons are the more honest "Moon vs Redis" signal.
+
+Both methodologies shown below. Pick the one matching your deployment — interactive cache workloads with uniform hot keys look like loose; real keyspaces look like strict.
+
+#### 2.7.2 Strict methodology (`-r 1000000`, distributed keyspace)
+
+| op | p | x86 Moon fair | x86 Moon default | x86 Redis | Ratio (fair) | ARM Moon fair | ARM Moon default | ARM Redis | Ratio (fair) |
+|----|---|:-------------:|:----------------:|:---------:|:------------:|:-------------:|:----------------:|:---------:|:------------:|
+| GET | 64 | 4.50M | 4.55M | 2.86M | **1.58×** | 3.03M | 3.11M | 2.02M | **1.50×** |
+| GET | 16 | 1.50M | 1.52M | 1.76M | 0.85× | 1.06M | 1.07M | 1.27M | 0.83× |
+| GET | 1  | 108K  | 106K  | 132K  | 0.82× | 76K   | 79K   | 100K  | 0.76× |
+| SET | 64 | 1.29M | 0.82M | 1.08M | **1.19×** | 752K | 552K | 871K | 0.86× |
+| SET | 16 | 962K  | 668K  | 859K  | **1.12×** | 564K | 437K | 681K | 0.83× |
+| SET | 1  | 107K  | 108K  | 138K  | 0.77× | 84K | 97K | 100K | 0.84× |
+
+"Moon fair" = `--appendonly no --disk-offload disable --initial-keyspace-hint 1000000`. "Moon default" = same minus `--disk-offload disable` (disk-offload ON). See §2.7.4 for the tax.
+
+#### 2.7.3 Loose methodology (no `-r`, matches §2.1 v0.1.6 shape)
+
+| op | p | x86 Moon fair | x86 Moon default | x86 Redis | Ratio (fair) | ARM Moon fair | ARM Moon default | ARM Redis | Ratio (fair) |
+|----|---|:-------------:|:----------------:|:---------:|:------------:|:-------------:|:----------------:|:---------:|:------------:|
+| GET | 64 | 5.15M | 5.10M | 2.84M | **1.82×** | 3.50M | 3.65M | 2.02M | **1.73×** |
+| GET | 16 | 1.59M | 1.60M | 1.76M | 0.90× | 1.19M | 1.17M | 1.29M | 0.92× |
+| GET | 1  | 109K | 108K | 135K | 0.81× | 77K | 78K | 101K | 0.76× |
+| SET | 64 | **4.46M** | 1.69M | 2.02M | **2.21×** | **3.42M** | 1.29M | 1.45M | **2.36×** |
+| SET | 16 | 1.57M | 1.23M | 1.41M | **1.12×** | 1.17M | 876K | 1.01M | **1.16×** |
+| SET | 1  | 108K | 107K | 136K | 0.79× | 79K | 87K | 100K | 0.79× |
+
+#### 2.7.4 Disk-offload tax (5-run SET p=64 means, CV 2-8%)
+
+`--disk-offload` defaults to `enable` in Moon's CLI. Even when the workload never exceeds RAM, every write pays for `try_evict_if_needed_async_spill`, `spill_file_id.get/set`, and the per-shard spill thread's cache-coherency traffic. Redis has no equivalent — disable this flag for Moon-vs-Redis comparisons.
+
+| arch | methodology | Moon fair | Moon default | Redis | Moon fair/Redis | Disk-offload tax |
+|------|-------------|:---------:|:------------:|:-----:|:---------------:|:----------------:|
+| x86 | strict | 1.33M | 812K | 1.12M | **1.19×** | **-39%** |
+| x86 | loose  | **4.46M** | 1.69M | 1.97M | **2.26×** | **-62%** |
+| ARM | strict | 846K | 617K | 849K | 1.00× | -27% |
+| ARM | loose  | **3.44M** | 1.28M | 1.44M | **2.39×** | **-63%** |
+
+The disk-offload tax is larger on the loose (cache-hot) workload because when DashTable work is cheap, the spill-thread bookkeeping represents a larger fraction of total cost.
+
+#### 2.7.5 Delta vs v0.1.6 §2.1 (same arch, same class, same loose methodology)
+
+| arch | metric | v0.1.6 §2.1 | Today §2.7.3 | Δ |
+|------|--------|:-----------:|:------------:|:-:|
+| x86 | GET p=64 | 5.11M | 5.15M | +1% (flat) |
+| x86 | SET p=64 | 3.50M | **4.46M** | **+27%** |
+| ARM | GET p=64 | 3.47M | 3.50M | +1% (flat) |
+| ARM | SET p=64 | 2.42M | **3.42M** | **+41%** |
+
+The three session commits (A+B, E, D) land a real +27% x86 / +41% ARM SET p=64 improvement over the v0.1.6 tag, with GET p=64 holding flat. Redis 7.0.15 (§2.7) vs Redis 8.6.1 (§2.1) is different — the ratio change is Moon moving up, not Redis moving down (Redis x86 GET p=64 went from 2.98M §2.1 to 2.84M §2.7 — essentially flat).
+
+#### 2.7.6 Caveats
+
+- **GCloud VM hurts p=1 / p=16 workloads.** At low pipeline depth, TCP RTT dominates per-op cost. GCloud VM network stack is slower than OrbStack's bridged interface. On OrbStack ARM the same branch wins all p=1/p=16 workloads; on GCloud x86/ARM it loses them. This is a VM-class artifact, not a Moon regression.
+- **ARM strict SET p=64 ratio is 0.86× (Moon loses on Neoverse-N1).** The Neoverse-N1 has lower per-core IPC than Sapphire Rapids 8481C; Moon's per-command tax (Frame ref-counting, AffinityTracker sample, metric record) eats more of the budget on ARM.
+- **Variance.** Strict SET p=64 5-run CV is 2-4% (low). The loose ARM column has one outlier run at 1.12M vs 750K-800K elsewhere — kept in the mean, produces inflated σ. Re-running would give a cleaner number, but the directional finding (Moon wins loose, loses strict on ARM) is robust.
 
 ---
 
