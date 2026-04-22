@@ -540,13 +540,14 @@ const _: () = {
     // following the `TextAggregatePayload` pattern.
     // Phase 177 hot-path split: after boxing TextSearch / VectorSearch /
     // BlockRegister / MigrateConnection / PubSubPublish / GraphTraverse, the
-    // enum size is driven by the unboxed slotted variants (MultiExecuteSlotted,
-    // PipelineBatchSlotted) plus the SnapshotBegin payload. The assertion is
-    // deliberately aggressive — 128 bytes = 2 cache lines — so any future
-    // variant that regresses this target forces an explicit boxing decision.
+    // actual measured enum size on aarch64 / x86_64 is 64 bytes — exactly
+    // one cache line. The assertion is tightened to that measured ceiling
+    // so any future variant that regresses cache-line residency forces an
+    // explicit boxing decision at review time. See
+    // `print_shard_message_sizes` for layout diagnostics.
     assert!(
-        std::mem::size_of::<ShardMessage>() <= 128,
-        "ShardMessage exceeded the 128-byte (2 cache-line) cap -- box the largest variant",
+        std::mem::size_of::<ShardMessage>() <= 64,
+        "ShardMessage exceeded the 64-byte (1 cache-line) cap -- box the largest variant",
     );
 };
 
@@ -556,6 +557,26 @@ mod tests {
     use std::collections::HashSet;
     #[cfg(feature = "runtime-tokio")]
     use std::sync::Arc;
+
+    /// Diagnostic: print ShardMessage total size + representative payload sizes
+    /// so we can see which variants cap the enum and target them for hot/cold split.
+    #[test]
+    fn print_shard_message_sizes() {
+        use std::mem::size_of;
+        eprintln!("== ShardMessage layout ==");
+        eprintln!("ShardMessage total           = {}", size_of::<ShardMessage>());
+        eprintln!("  TcpStream                  = {}", size_of::<crate::runtime::TcpStream>());
+        eprintln!("  Arc<Frame>                 = {}", size_of::<std::sync::Arc<Frame>>());
+        eprintln!("  OneshotSender<Frame>       = {}", size_of::<channel::OneshotSender<Frame>>());
+        eprintln!("  ResponseSlotPtr            = {}", size_of::<ResponseSlotPtr>());
+        eprintln!("  Bytes                      = {}", size_of::<Bytes>());
+        eprintln!("  PathBuf                    = {}", size_of::<std::path::PathBuf>());
+        eprintln!("  Vec<(Bytes, Frame)>        = {}", size_of::<Vec<(Bytes, Frame)>>());
+        eprintln!("  Vec<Arc<Frame>>            = {}", size_of::<Vec<std::sync::Arc<Frame>>>());
+        eprintln!("  Vec<(Option<usize>, Vec<String>)> = {}", size_of::<Vec<(Option<usize>, Vec<String>)>>());
+        eprintln!("  Vec<(Bytes, Bytes)>        = {}", size_of::<Vec<(Bytes, Bytes)>>());
+        eprintln!("  Vec<u16>                   = {}", size_of::<Vec<u16>>());
+    }
 
     #[test]
     fn test_key_to_shard_deterministic() {

@@ -522,6 +522,19 @@ pub fn record_dispatch_local() {
     counter!("moon_dispatch_path_total", "path" => "local").increment(1);
 }
 
+/// Batched variant of `record_dispatch_local`: one atomic increment per
+/// caller instead of N. Used on the per-batch hot loop in the sharded and
+/// monoio handlers to avoid per-command global-atomic cache-line bouncing
+/// on `moon_dispatch_path_total{path="local"}`. Short-circuits on
+/// `count == 0` so empty batches pay nothing.
+#[inline]
+pub fn record_dispatch_local_batch(count: u64) {
+    if count == 0 || !METRICS_INITIALIZED.load(Ordering::Relaxed) {
+        return;
+    }
+    counter!("moon_dispatch_path_total", "path" => "local").increment(count);
+}
+
 /// Command executed on a remote shard via the shared-read fast path
 /// (RwLock read on the target shard's database, no SPSC message).
 #[inline]
@@ -530,6 +543,15 @@ pub fn record_dispatch_cross_read_fastpath() {
         return;
     }
     counter!("moon_dispatch_path_total", "path" => "cross_read_fast").increment(1);
+}
+
+/// Batched variant of `record_dispatch_cross_read_fastpath`.
+#[inline]
+pub fn record_dispatch_cross_read_fastpath_batch(count: u64) {
+    if count == 0 || !METRICS_INITIALIZED.load(Ordering::Relaxed) {
+        return;
+    }
+    counter!("moon_dispatch_path_total", "path" => "cross_read_fast").increment(count);
 }
 
 /// Command deferred to cross-shard SPSC dispatch (the slow path).
@@ -541,6 +563,15 @@ pub fn record_dispatch_cross_spsc() {
         return;
     }
     counter!("moon_dispatch_path_total", "path" => "cross_spsc").increment(1);
+}
+
+/// Batched variant of `record_dispatch_cross_spsc`.
+#[inline]
+pub fn record_dispatch_cross_spsc_batch(count: u64) {
+    if count == 0 || !METRICS_INITIALIZED.load(Ordering::Relaxed) {
+        return;
+    }
+    counter!("moon_dispatch_path_total", "path" => "cross_spsc").increment(count);
 }
 
 /// Command handled by the inline GET/SET fast path
