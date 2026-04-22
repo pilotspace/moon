@@ -591,7 +591,12 @@ pub(crate) fn spawn_monoio_connection(
                         if dup_fd < 0 {
                             tracing::warn!("Shard {}: migration dup() failed: {}", shard_id, std::io::Error::last_os_error());
                         } else {
-                            let msg = ShardMessage::MigrateConnection { fd: dup_fd, state };
+                            let msg = ShardMessage::MigrateConnection(Box::new(
+                                crate::shard::dispatch::MigrateConnectionPayload {
+                                    fd: dup_fd,
+                                    state,
+                                },
+                            ));
                             let target_idx = ChannelMesh::target_index(shard_id, target_shard);
                             let push_result = {
                                 let mut producers = dtx2.borrow_mut();
@@ -607,10 +612,12 @@ pub(crate) fn spawn_monoio_connection(
                                     );
                                 }
                                 Err(returned_msg) => {
-                                    if let ShardMessage::MigrateConnection { fd, .. } = returned_msg {
+                                    if let ShardMessage::MigrateConnection(payload) = returned_msg {
                                         // SAFETY: fd is a valid dup'd socket from libc::dup above.
                                         // SPSC push failed, so ownership returns to us for cleanup.
-                                        drop(unsafe { std::os::unix::io::OwnedFd::from_raw_fd(fd) });
+                                        drop(unsafe {
+                                            std::os::unix::io::OwnedFd::from_raw_fd(payload.fd)
+                                        });
                                     }
                                     tracing::warn!(
                                         "Shard {}: migration SPSC full, connection {} lost (monoio)",

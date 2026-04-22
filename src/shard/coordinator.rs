@@ -714,13 +714,15 @@ pub async fn scatter_vector_search(
             ));
         } else {
             let (reply_tx, reply_rx) = channel::oneshot();
-            let msg = ShardMessage::VectorSearch {
-                index_name: index_name.clone(),
-                query_blob: query_blob.clone(),
-                k,
-                as_of_lsn,
-                reply_tx,
-            };
+            let msg = ShardMessage::VectorSearch(Box::new(
+                crate::shard::dispatch::VectorSearchPayload {
+                    index_name: index_name.clone(),
+                    query_blob: query_blob.clone(),
+                    k,
+                    as_of_lsn,
+                    reply_tx,
+                },
+            ));
             spsc_send(dispatch_tx, my_shard, shard_id, msg, spsc_notifiers).await;
             receivers.push(reply_rx);
         }
@@ -791,13 +793,15 @@ pub async fn scatter_vector_search_remote(
             continue;
         }
         let (reply_tx, reply_rx) = channel::oneshot();
-        let msg = ShardMessage::VectorSearch {
-            index_name: index_name.clone(),
-            query_blob: query_blob.clone(),
-            k,
-            as_of_lsn,
-            reply_tx,
-        };
+        let msg = ShardMessage::VectorSearch(Box::new(
+            crate::shard::dispatch::VectorSearchPayload {
+                index_name: index_name.clone(),
+                query_blob: query_blob.clone(),
+                k,
+                as_of_lsn,
+                reply_tx,
+            },
+        ));
         spsc_send(dispatch_tx, my_shard, shard_id, msg, spsc_notifiers).await;
         receivers.push(reply_rx);
     }
@@ -1073,21 +1077,23 @@ pub async fn scatter_text_search(
             local_search = Some(response);
         } else {
             let (reply_tx, reply_rx) = channel::oneshot();
-            let msg = ShardMessage::TextSearch {
-                index_name: index_name.clone(),
-                field_idx,
-                // Send full QueryTerm so remote shard applies the same expansion.
-                query_terms: query_terms.clone(),
-                global_df: global_df.clone(),
-                global_n,
-                top_k,
-                offset: 0, // each shard returns top_k; coordinator applies final offset+count
-                count: top_k,
-                // Pass opts to each remote shard — each applies post-processing locally.
-                highlight_opts: highlight_opts.clone(),
-                summarize_opts: summarize_opts.clone(),
-                reply_tx,
-            };
+            let msg = ShardMessage::TextSearch(Box::new(
+                crate::shard::dispatch::TextSearchPayload {
+                    index_name: index_name.clone(),
+                    field_idx,
+                    // Send full QueryTerm so remote shard applies the same expansion.
+                    query_terms: query_terms.clone(),
+                    global_df: global_df.clone(),
+                    global_n,
+                    top_k,
+                    offset: 0, // each shard returns top_k; coordinator applies final offset+count
+                    count: top_k,
+                    // Pass opts to each remote shard — each applies post-processing locally.
+                    highlight_opts: highlight_opts.clone(),
+                    summarize_opts: summarize_opts.clone(),
+                    reply_tx,
+                },
+            ));
             spsc_send(dispatch_tx, my_shard, shard_id, msg, spsc_notifiers).await;
             search_receivers.push(reply_rx);
         }

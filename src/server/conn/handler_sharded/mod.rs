@@ -114,7 +114,9 @@ pub(crate) async fn handle_connection_sharded(
         match stream.into_std() {
             Ok(std_stream) => {
                 let raw_fd = std_stream.into_raw_fd();
-                let msg = ShardMessage::MigrateConnection { fd: raw_fd, state };
+                let msg = ShardMessage::MigrateConnection(Box::new(
+                    crate::shard::dispatch::MigrateConnectionPayload { fd: raw_fd, state },
+                ));
                 let target_idx = ChannelMesh::target_index(ctx.shard_id, target_shard);
                 let push_result = {
                     let mut producers = ctx.dispatch_tx.borrow_mut();
@@ -156,11 +158,13 @@ pub(crate) async fn handle_connection_sharded(
                                 Err(msg) => pending = Some(msg),
                             }
                         }
-                        if let Some(ShardMessage::MigrateConnection { fd, .. }) = pending {
+                        if let Some(ShardMessage::MigrateConnection(payload)) = pending {
                             use std::os::unix::io::FromRawFd;
                             // SAFETY: fd is a valid, uniquely-owned file descriptor obtained
                             // from TcpStream::into_raw_fd() above. OwnedFd closes it on drop.
-                            drop(unsafe { std::os::unix::io::OwnedFd::from_raw_fd(fd) });
+                            drop(unsafe {
+                                std::os::unix::io::OwnedFd::from_raw_fd(payload.fd)
+                            });
                         }
                         tracing::warn!(
                             "Shard {}: migration SPSC full, connection {} lost",

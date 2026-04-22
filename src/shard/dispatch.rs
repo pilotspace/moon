@@ -239,6 +239,86 @@ pub struct FtHybridPayload {
     pub reply_tx: channel::OneshotSender<Frame>,
 }
 
+/// Boxed payload for `ShardMessage::TextSearch` (Phase 177, hot-path split).
+///
+/// Before boxing, `TextSearch` packed `HashMap<String, u32>` + `Vec<QueryTerm>`
+/// + smallvec fields inline at ~280 bytes, driving the entire `ShardMessage`
+/// enum past 288 B and fragmenting every SPSC ring slot across 5 cache lines.
+/// Boxing moves the payload to the heap and collapses the variant to a single
+/// pointer (16 B incl. discriminant) so the ring slot stays within 2 cache
+/// lines when the hot slotted variants are enqueued.
+pub struct TextSearchPayload {
+    pub index_name: Bytes,
+    pub field_idx: Option<usize>,
+    pub query_terms: Vec<crate::command::vector_search::ft_text_search::QueryTerm>,
+    pub global_df: std::collections::HashMap<String, u32>,
+    pub global_n: u32,
+    pub top_k: usize,
+    pub offset: usize,
+    pub count: usize,
+    pub highlight_opts: Option<crate::command::vector_search::ft_text_search::HighlightOpts>,
+    pub summarize_opts: Option<crate::command::vector_search::ft_text_search::SummarizeOpts>,
+    pub reply_tx: channel::OneshotSender<Frame>,
+}
+
+/// Boxed payload for `ShardMessage::VectorSearch` (Phase 177, hot-path split).
+///
+/// The inline variant carried two `Bytes` (32 B each), two `usize`, and a
+/// oneshot sender — ~88 B. Boxing reduces its enum slot to 16 B so the
+/// hot slotted variants pay no cache-line tax from its presence.
+pub struct VectorSearchPayload {
+    pub index_name: Bytes,
+    pub query_blob: Bytes,
+    pub k: usize,
+    pub as_of_lsn: u64,
+    pub reply_tx: channel::OneshotSender<Frame>,
+}
+
+/// Boxed payload for `ShardMessage::BlockRegister` (Phase 177, hot-path split).
+///
+/// `BlockedCommand::XReadGroup` carries Vec + two Bytes + count options, pushing
+/// the inline variant past 160 B. Boxing collapses it to a pointer.
+pub struct BlockRegisterPayload {
+    pub db_index: usize,
+    pub key: Bytes,
+    pub wait_id: u64,
+    pub cmd: crate::blocking::BlockedCommand,
+    pub reply_tx: channel::OneshotSender<Option<crate::protocol::Frame>>,
+}
+
+/// Boxed payload for `ShardMessage::MigrateConnection` (Phase 177, hot-path split).
+///
+/// `MigratedConnectionState` already holds heap-backed strings/bytes but still
+/// exceeds 120 B inline. Moving it behind a Box keeps the enum slot in the
+/// cache-line budget set by the slotted variants.
+pub struct MigrateConnectionPayload {
+    pub fd: std::os::unix::io::RawFd,
+    pub state: crate::server::conn::affinity::MigratedConnectionState,
+}
+
+/// Boxed payload for `ShardMessage::PubSubPublish` (Phase 177, hot-path split).
+///
+/// Two `Bytes` (~64 B) plus an Arc'd slot — worth boxing to keep the enum
+/// slot size driven by the slotted variants rather than fan-out traffic.
+pub struct PubSubPublishPayload {
+    pub channel: Bytes,
+    pub message: Bytes,
+    pub slot: std::sync::Arc<PubSubResponseSlot>,
+}
+
+/// Boxed payload for `ShardMessage::GraphTraverse` (Phase 177, hot-path split).
+///
+/// Six fields including a Vec<u64> and Bytes — inline variant was ~80 B.
+#[cfg(feature = "graph")]
+pub struct GraphTraversePayload {
+    pub graph_name: Bytes,
+    pub node_ids: Vec<u64>,
+    pub remaining_hops: u32,
+    pub edge_type_filter: Option<u16>,
+    pub snapshot_lsn: u64,
+    pub reply_tx: channel::OneshotSender<Frame>,
+}
+
 /// Messages sent to a shard via SPSC channels from the connection layer
 /// or from other shards for cross-shard operations.
 pub enum ShardMessage {
@@ -275,13 +355,10 @@ pub enum ShardMessage {
         reply_tx: channel::OneshotSender<Result<(), String>>,
     },
     /// Register a blocked client waiting for data on a key (cross-shard).
-    BlockRegister {
-        db_index: usize,
-        key: Bytes,
-        wait_id: u64,
-        cmd: crate::blocking::BlockedCommand,
-        reply_tx: channel::OneshotSender<Option<crate::protocol::Frame>>,
-    },
+    ///
+    /// Boxed (Phase 177) — `BlockedCommand::XReadGroup` pushes the inline variant
+    /// past 160 B.
+    BlockRegister(Box<BlockRegisterPayload>),
     /// Cancel a blocked client registration (woken by another shard or timed out).
     BlockCancel { wait_id: u64 },
     /// Register a connected replica's per-shard sender channel with this shard.
@@ -312,10 +389,9 @@ pub enum ShardMessage {
     /// Migrate a connection's file descriptor to this shard.
     /// The source shard has deregistered the FD and extracted connection state.
     /// This shard must reconstruct the TCP stream and spawn a new handler.
-    MigrateConnection {
-        fd: std::os::unix::io::RawFd,
-        state: crate::server::conn::affinity::MigratedConnectionState,
-    },
+    ///
+    /// Boxed (Phase 177) — `MigratedConnectionState` exceeds 120 B.
+    MigrateConnection(Box<MigrateConnectionPayload>),
     /// Execute a single command with pre-allocated response slot (zero allocation).
     /// Used instead of Execute for cross-shard write dispatch.
     ExecuteSlotted {
@@ -345,13 +421,9 @@ pub enum ShardMessage {
     /// (Phase 171, SCAT-01). `0` means "no temporal filtering" (default
     /// behavior for non-AS_OF callers); non-zero values are the LSN boundary
     /// applied by `search_local_raw` for MVCC filtering on the responder.
-    VectorSearch {
-        index_name: Bytes,
-        query_blob: Bytes,
-        k: usize,
-        as_of_lsn: u64,
-        reply_tx: channel::OneshotSender<Frame>,
-    },
+    ///
+    /// Boxed (Phase 177) — inline variant was ~88 B.
+    VectorSearch(Box<VectorSearchPayload>),
     /// DFS Phase 1: collect per-term document frequency from this shard.
     ///
     /// Returns `Frame::Array` with interleaved `[term1, df1, term2, df2, ..., "N", total_docs]`
@@ -370,23 +442,10 @@ pub enum ShardMessage {
     ///
     /// `highlight_opts` and `summarize_opts` are passed through for Plan 03
     /// post-processing. In this plan (150-02) they are always `None`.
-    TextSearch {
-        index_name: Bytes,
-        field_idx: Option<usize>,
-        /// Query terms with per-term expansion modifiers (Exact/Fuzzy/Prefix).
-        /// Carries full QueryTerm so remote shards can apply the same OR-union expansion.
-        query_terms: Vec<crate::command::vector_search::ft_text_search::QueryTerm>,
-        global_df: std::collections::HashMap<String, u32>,
-        global_n: u32,
-        top_k: usize,
-        offset: usize,
-        count: usize,
-        /// Placeholder for Plan 03 HIGHLIGHT post-processing (always None here).
-        highlight_opts: Option<crate::command::vector_search::ft_text_search::HighlightOpts>,
-        /// Placeholder for Plan 03 SUMMARIZE post-processing (always None here).
-        summarize_opts: Option<crate::command::vector_search::ft_text_search::SummarizeOpts>,
-        reply_tx: channel::OneshotSender<Frame>,
-    },
+    ///
+    /// Boxed (Phase 177) — the payload's HashMap + Vec<QueryTerm> pushed this
+    /// variant past 280 B inline.
+    TextSearch(Box<TextSearchPayload>),
     /// Execute an FT.* command on this shard's VectorStore.
     /// For FT.CREATE, FT.DROPINDEX, FT.INFO -- operations that modify/read
     /// VectorStore state rather than search.
@@ -444,27 +503,14 @@ pub enum ShardMessage {
     },
     /// Cross-shard graph traversal: expand the given nodes locally and return neighbors.
     /// Used by scatter-gather coordinator for multi-shard BFS expansion.
+    ///
+    /// Boxed (Phase 177) — Vec<u64> + Bytes + oneshot pushed this past 80 B inline.
     #[cfg(feature = "graph")]
-    GraphTraverse {
-        /// Name of the graph to traverse.
-        graph_name: Bytes,
-        /// Node IDs to expand on this shard (external IDs, hashed to this shard).
-        node_ids: Vec<u64>,
-        /// Remaining cross-shard hops allowed (decremented per hop).
-        remaining_hops: u32,
-        /// Optional edge-type filter (only expand edges of this type).
-        edge_type_filter: Option<u16>,
-        /// MVCC snapshot LSN for consistent reads across shards.
-        snapshot_lsn: u64,
-        /// Reply channel for traversal results.
-        reply_tx: channel::OneshotSender<Frame>,
-    },
+    GraphTraverse(Box<GraphTraversePayload>),
     /// Cross-shard PUBLISH with shared atomic response slot for subscriber count accumulation.
-    PubSubPublish {
-        channel: Bytes,
-        message: Bytes,
-        slot: std::sync::Arc<PubSubResponseSlot>,
-    },
+    ///
+    /// Boxed (Phase 177) — two Bytes + Arc was 72 B inline.
+    PubSubPublish(Box<PubSubPublishPayload>),
     /// Batched cross-shard PUBLISH for pipeline efficiency.
     /// Multiple (channel, message) pairs destined for the same shard, sharing one ResponseSlot.
     /// Each pair's subscriber count is accumulated into the slot's `counts` field, and the
@@ -492,9 +538,15 @@ const _: () = {
     //
     // If a new variant is added that would push size past this cap, box it
     // following the `TextAggregatePayload` pattern.
+    // Phase 177 hot-path split: after boxing TextSearch / VectorSearch /
+    // BlockRegister / MigrateConnection / PubSubPublish / GraphTraverse, the
+    // enum size is driven by the unboxed slotted variants (MultiExecuteSlotted,
+    // PipelineBatchSlotted) plus the SnapshotBegin payload. The assertion is
+    // deliberately aggressive — 128 bytes = 2 cache lines — so any future
+    // variant that regresses this target forces an explicit boxing decision.
     assert!(
-        std::mem::size_of::<ShardMessage>() <= 512,
-        "ShardMessage grew past the 512-byte cap -- box the largest variant",
+        std::mem::size_of::<ShardMessage>() <= 128,
+        "ShardMessage exceeded the 128-byte (2 cache-line) cap -- box the largest variant",
     );
 };
 

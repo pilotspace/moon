@@ -156,13 +156,15 @@ pub(crate) async fn handle_blocking_command(
                 // Remote registration via SPSC
                 let mut producers = dispatch_tx.borrow_mut();
                 let target_idx = ChannelMesh::target_index(shard_id, target);
-                let msg = ShardMessage::BlockRegister {
-                    db_index: selected_db,
-                    key: keys[0].clone(),
-                    wait_id,
-                    cmd: blocked_cmd_factory(),
-                    reply_tx,
-                };
+                let msg = ShardMessage::BlockRegister(Box::new(
+                    crate::shard::dispatch::BlockRegisterPayload {
+                        db_index: selected_db,
+                        key: keys[0].clone(),
+                        wait_id,
+                        cmd: blocked_cmd_factory(),
+                        reply_tx,
+                    },
+                ));
                 let _ = producers[target_idx].try_push(msg);
             }
             wait_id
@@ -238,13 +240,15 @@ pub(crate) async fn handle_blocking_command(
             } else {
                 // Remote registration via SPSC
                 let target_idx = ChannelMesh::target_index(shard_id, target);
-                let msg = ShardMessage::BlockRegister {
-                    db_index: selected_db,
-                    key: key.clone(),
-                    wait_id,
-                    cmd: blocked_cmd_factory(),
-                    reply_tx: tx,
-                };
+                let msg = ShardMessage::BlockRegister(Box::new(
+                    crate::shard::dispatch::BlockRegisterPayload {
+                        db_index: selected_db,
+                        key: key.clone(),
+                        wait_id,
+                        cmd: blocked_cmd_factory(),
+                        reply_tx: tx,
+                    },
+                ));
                 let _ = producers[target_idx].try_push(msg);
                 if !registered_remote_shards.contains(&target) {
                     registered_remote_shards.push(target);
@@ -386,13 +390,15 @@ pub(crate) async fn handle_blocking_command_monoio(
                 drop(reg);
                 let mut producers = dispatch_tx.borrow_mut();
                 let target_idx = ChannelMesh::target_index(shard_id, target);
-                let msg = ShardMessage::BlockRegister {
-                    db_index: selected_db,
-                    key: keys[0].clone(),
-                    wait_id,
-                    cmd: blocked_cmd_factory(),
-                    reply_tx,
-                };
+                let msg = ShardMessage::BlockRegister(Box::new(
+                    crate::shard::dispatch::BlockRegisterPayload {
+                        db_index: selected_db,
+                        key: keys[0].clone(),
+                        wait_id,
+                        cmd: blocked_cmd_factory(),
+                        reply_tx,
+                    },
+                ));
                 let mut msg_pending = msg;
                 loop {
                     match producers[target_idx].try_push(msg_pending) {
@@ -481,13 +487,15 @@ pub(crate) async fn handle_blocking_command_monoio(
             } else {
                 // Remote registration via SPSC
                 let target_idx = ChannelMesh::target_index(shard_id, target);
-                let msg = ShardMessage::BlockRegister {
-                    db_index: selected_db,
-                    key: key.clone(),
-                    wait_id,
-                    cmd: blocked_cmd_factory(),
-                    reply_tx: tx,
-                };
+                let msg = ShardMessage::BlockRegister(Box::new(
+                    crate::shard::dispatch::BlockRegisterPayload {
+                        db_index: selected_db,
+                        key: key.clone(),
+                        wait_id,
+                        cmd: blocked_cmd_factory(),
+                        reply_tx: tx,
+                    },
+                ));
                 // SPSC push with backpressure retry (monoio pattern)
                 let mut msg_pending = msg;
                 loop {

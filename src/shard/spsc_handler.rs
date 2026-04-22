@@ -92,10 +92,10 @@ pub(crate) fn drain_spsc_shared(
                         | ShardMessage::ExecuteSlotted { .. }
                         | ShardMessage::PipelineBatchSlotted { .. }
                         | ShardMessage::MultiExecuteSlotted { .. }
-                        | ShardMessage::VectorSearch { .. }
+                        | ShardMessage::VectorSearch(_)
                         | ShardMessage::VectorCommand { .. }
                         | ShardMessage::DocFreq { .. }
-                        | ShardMessage::TextSearch { .. } => {
+                        | ShardMessage::TextSearch(_) => {
                             execute_batch.push(msg);
                         }
                         #[cfg(feature = "text-index")]
@@ -115,11 +115,11 @@ pub(crate) fn drain_spsc_shared(
                             execute_batch.push(msg);
                         }
                         #[cfg(feature = "graph")]
-                        ShardMessage::GraphTraverse { .. } => {
+                        ShardMessage::GraphTraverse(_) => {
                             execute_batch.push(msg);
                         }
-                        ShardMessage::MigrateConnection { fd, state } => {
-                            pending_migrations.push((fd, state));
+                        ShardMessage::MigrateConnection(payload) => {
+                            pending_migrations.push((payload.fd, payload.state));
                         }
                         _ => other_messages.push(msg),
                     }
@@ -865,13 +865,9 @@ pub(crate) fn handle_shard_message_shared(
             let slot = unsafe { &*response_slot.0 };
             slot.fill(results);
         }
-        ShardMessage::PubSubPublish {
-            channel,
-            message,
-            slot,
-        } => {
-            let count = pubsub_registry.publish(&channel, &message);
-            slot.add(count);
+        ShardMessage::PubSubPublish(payload) => {
+            let count = pubsub_registry.publish(&payload.channel, &payload.message);
+            payload.slot.add(count);
         }
         ShardMessage::PubSubPublishBatch { pairs, slot } => {
             let mut batch_total: i64 = 0;
@@ -899,13 +895,14 @@ pub(crate) fn handle_shard_message_shared(
             // Defer to main event loop where we have mutable access to snapshot_state
             *pending_snapshot = Some((epoch, snapshot_dir, reply_tx));
         }
-        ShardMessage::BlockRegister {
-            db_index,
-            key,
-            wait_id,
-            cmd,
-            reply_tx,
-        } => {
+        ShardMessage::BlockRegister(payload) => {
+            let crate::shard::dispatch::BlockRegisterPayload {
+                db_index,
+                key,
+                wait_id,
+                cmd,
+                reply_tx,
+            } = *payload;
             let entry = crate::blocking::WaitEntry {
                 wait_id,
                 cmd,
@@ -949,13 +946,14 @@ pub(crate) fn handle_shard_message_shared(
         } => {
             // Slot ownership is tracked in ClusterState, not per-shard.
         }
-        ShardMessage::VectorSearch {
-            index_name,
-            query_blob,
-            k,
-            as_of_lsn,
-            reply_tx,
-        } => {
+        ShardMessage::VectorSearch(payload) => {
+            let crate::shard::dispatch::VectorSearchPayload {
+                index_name,
+                query_blob,
+                k,
+                as_of_lsn,
+                reply_tx,
+            } = *payload;
             // Phase 171 SCAT-01: honor coordinator-resolved AS_OF / TXN LSN
             // for multi-shard FT.SEARCH. When `as_of_lsn == 0` the filter is a
             // no-op and behavior matches the pre-171 path. Route through
@@ -1007,19 +1005,20 @@ pub(crate) fn handle_shard_message_shared(
             drop(text_guard);
             let _ = reply_tx.send(response);
         }
-        ShardMessage::TextSearch {
-            index_name,
-            field_idx,
-            query_terms,
-            global_df,
-            global_n,
-            top_k,
-            offset,
-            count,
-            highlight_opts,
-            summarize_opts,
-            reply_tx,
-        } => {
+        ShardMessage::TextSearch(payload) => {
+            let crate::shard::dispatch::TextSearchPayload {
+                index_name,
+                field_idx,
+                query_terms,
+                global_df,
+                global_n,
+                top_k,
+                offset,
+                count,
+                highlight_opts,
+                summarize_opts,
+                reply_tx,
+            } = *payload;
             // DFS Phase 2: execute BM25 text search with global IDF injected by coordinator.
             // After scoring, apply HIGHLIGHT/SUMMARIZE post-processing if requested.
             // Each shard applies post-processing to its own results using its local hash store
@@ -1114,14 +1113,15 @@ pub(crate) fn handle_shard_message_shared(
             let _ = reply_tx.send(response);
         }
         #[cfg(feature = "graph")]
-        ShardMessage::GraphTraverse {
-            graph_name,
-            node_ids,
-            remaining_hops: _,
-            edge_type_filter,
-            snapshot_lsn,
-            reply_tx,
-        } => {
+        ShardMessage::GraphTraverse(payload) => {
+            let crate::shard::dispatch::GraphTraversePayload {
+                graph_name,
+                node_ids,
+                remaining_hops: _,
+                edge_type_filter,
+                snapshot_lsn,
+                reply_tx,
+            } = *payload;
             let response = crate::graph::cross_shard::handle_graph_traverse(
                 &shard_databases.graph_store_read(shard_id),
                 &graph_name,
@@ -1265,7 +1265,7 @@ pub(crate) fn handle_shard_message_shared(
         ShardMessage::UnregisterReplica { replica_id } => {
             replica_txs.retain(|(id, _)| *id != replica_id);
         }
-        ShardMessage::MigrateConnection { .. } => {
+        ShardMessage::MigrateConnection(_) => {
             // MigrateConnection is collected by drain_spsc_shared into pending_migrations,
             // not dispatched through handle_shard_message_shared.
             // If we reach here, it's a logic error — log and drop.
