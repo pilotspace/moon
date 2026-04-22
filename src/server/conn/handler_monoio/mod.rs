@@ -481,6 +481,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 can_inline_writes,
                 &ctx.runtime_config,
             );
+            crate::admin::metrics_setup::record_dispatch_local_inline(inlined as u64);
             if inlined > 0 && read_buf.is_empty() {
                 // All commands were inlined -- flush write_buf and continue
                 if !write_buf.is_empty() {

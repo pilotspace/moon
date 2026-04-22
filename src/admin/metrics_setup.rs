@@ -527,6 +527,19 @@ pub fn record_dispatch_cross_spsc() {
     counter!("moon_dispatch_path_total", "path" => "cross_spsc").increment(1);
 }
 
+/// Command handled by the inline GET/SET fast path
+/// (`try_inline_dispatch_loop` in `server/conn/blocking.rs`) — the hottest
+/// local branch, which bypasses the standard frame-by-frame routing and
+/// therefore the three counters above. Recorded in a single batch increment
+/// per dispatch loop to keep the call site out of the per-command hot path.
+#[inline]
+pub fn record_dispatch_local_inline(count: u64) {
+    if count == 0 || !METRICS_INITIALIZED.load(Ordering::Relaxed) {
+        return;
+    }
+    counter!("moon_dispatch_path_total", "path" => "local_inline").increment(count);
+}
+
 // ── Vector search metrics (v0.1.6) ─────────────────────────────────────
 
 /// Record a cache hit for FT.CACHESEARCH.
@@ -918,5 +931,7 @@ mod tests {
         record_dispatch_local();
         record_dispatch_cross_read_fastpath();
         record_dispatch_cross_spsc();
+        record_dispatch_local_inline(0); // count == 0 must short-circuit even when init
+        record_dispatch_local_inline(7);
     }
 }
