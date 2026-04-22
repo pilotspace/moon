@@ -111,13 +111,26 @@ pub fn build_info_replication(repl_state: &ReplicationState) -> String {
                 ));
             }
         }
-        ReplicationRole::Replica { host, port, .. } => {
+        ReplicationRole::Replica { host, port, state } => {
             s.push_str("role:slave\r\n");
             s.push_str(&format!("master_host:{}\r\n", host));
             s.push_str(&format!("master_port:{}\r\n", port));
-            s.push_str("master_link_status:up\r\n");
+            // Link status reflects the actual handshake state machine, not TCP-connected.
+            // Anything below `Streaming` means we have not completed the PSYNC handshake
+            // and are not receiving writes — reporting "up" here would mask bugs like
+            // a master that does not implement PSYNC (PSYNC → -ERR unknown command),
+            // which leaves the replica reconnecting forever while INFO claims success.
+            let link_status = match state {
+                ReplicaHandshakeState::Streaming => "up",
+                _ => "down",
+            };
+            s.push_str(&format!("master_link_status:{}\r\n", link_status));
+            let sync_in_progress = matches!(state, ReplicaHandshakeState::FullResyncLoading { .. });
             s.push_str("master_last_io_seconds_ago:0\r\n");
-            s.push_str("master_sync_in_progress:0\r\n");
+            s.push_str(&format!(
+                "master_sync_in_progress:{}\r\n",
+                if sync_in_progress { 1 } else { 0 }
+            ));
             let offset = repl_state.master_repl_offset.load(Ordering::Relaxed);
             s.push_str(&format!("slave_repl_offset:{}\r\n", offset));
             s.push_str("slave_priority:100\r\n");
@@ -251,6 +264,37 @@ mod tests {
         assert!(info.contains("role:slave\r\n"));
         assert!(info.contains("master_host:127.0.0.1\r\n"));
         assert!(info.contains("master_port:6379\r\n"));
+        assert!(info.contains("master_link_status:up\r\n"));
+        assert!(info.contains("master_sync_in_progress:0\r\n"));
         assert!(info.contains(&format!("master_replid:{}\r\n", "c".repeat(40))));
+    }
+
+    #[test]
+    fn test_build_info_replication_replica_handshake_pending_reports_down() {
+        // Regression: before this fix `master_link_status` was hard-coded "up"
+        // even when the PSYNC handshake had not succeeded, which masked a
+        // master that does not wire PSYNC.
+        let mut state = ReplicationState::new(1, "e".repeat(40), "f".repeat(40));
+        state.role = ReplicationRole::Replica {
+            host: "127.0.0.1".to_string(),
+            port: 6379,
+            state: ReplicaHandshakeState::PingPending,
+        };
+        let info = build_info_replication(&state);
+        assert!(info.contains("master_link_status:down\r\n"));
+        assert!(info.contains("master_sync_in_progress:0\r\n"));
+    }
+
+    #[test]
+    fn test_build_info_replication_replica_full_resync_reports_syncing() {
+        let mut state = ReplicationState::new(1, "g".repeat(40), "h".repeat(40));
+        state.role = ReplicationRole::Replica {
+            host: "127.0.0.1".to_string(),
+            port: 6379,
+            state: ReplicaHandshakeState::FullResyncLoading { shards_remaining: 2 },
+        };
+        let info = build_info_replication(&state);
+        assert!(info.contains("master_link_status:down\r\n"));
+        assert!(info.contains("master_sync_in_progress:1\r\n"));
     }
 }

@@ -644,15 +644,49 @@ pub fn replicaof(args: &[Frame]) -> (Frame, Option<ReplicaofAction>) {
 }
 
 /// REPLCONF -- replication configuration handshake.
-/// Responds OK to: listening-port <port>, capa eof, capa psync2, getack *.
-/// Used during the PSYNC2 handshake sequence.
+///
+/// Recognises the Redis 7 subcommand set. Unknown subcommands return an error
+/// instead of silently OK-ing so that client/replica mistakes surface during
+/// handshake rather than at the (much later) PSYNC step. State is not yet
+/// persisted — that lives in `replication::state::ReplicaInfo` and will be
+/// wired once master-side PSYNC is connected.
 pub fn replconf(args: &[Frame]) -> Frame {
     if args.is_empty() {
         return Frame::Error(Bytes::from_static(
             b"ERR wrong number of arguments for 'REPLCONF' command",
         ));
     }
-    // Accept all known REPLCONF subcommands with OK.
+    // REPLCONF takes key/value pairs. Walk them; reject if any unknown.
+    let mut i = 0;
+    while i < args.len() {
+        let Some(key) = extract_bytes_ref(&args[i]) else {
+            return Frame::Error(Bytes::from_static(
+                b"ERR syntax error in 'REPLCONF' command",
+            ));
+        };
+        let known_pair_key = key.eq_ignore_ascii_case(b"listening-port")
+            || key.eq_ignore_ascii_case(b"ip-address")
+            || key.eq_ignore_ascii_case(b"capa")
+            || key.eq_ignore_ascii_case(b"ack")
+            || key.eq_ignore_ascii_case(b"getack")
+            || key.eq_ignore_ascii_case(b"rdb-only")
+            || key.eq_ignore_ascii_case(b"rdb-filter-only")
+            || key.eq_ignore_ascii_case(b"version");
+        if !known_pair_key {
+            return Frame::Error(Bytes::from(format!(
+                "ERR Unrecognized REPLCONF option: {}",
+                String::from_utf8_lossy(key)
+            )));
+        }
+        // Each known option takes one value argument.
+        if i + 1 >= args.len() {
+            return Frame::Error(Bytes::from(format!(
+                "ERR missing value for REPLCONF {}",
+                String::from_utf8_lossy(key)
+            )));
+        }
+        i += 2;
+    }
     Frame::SimpleString(Bytes::from_static(b"OK"))
 }
 
@@ -1159,6 +1193,51 @@ mod tests {
     #[test]
     fn test_replconf_empty_args() {
         let resp = replconf(&[]);
+        assert!(matches!(resp, Frame::Error(_)));
+    }
+
+    #[test]
+    fn test_replconf_multi_pair_capa_handshake() {
+        // This is the exact shape the replica sends during PSYNC2 handshake.
+        let resp = replconf(&[
+            Frame::BulkString(Bytes::from_static(b"capa")),
+            Frame::BulkString(Bytes::from_static(b"eof")),
+            Frame::BulkString(Bytes::from_static(b"capa")),
+            Frame::BulkString(Bytes::from_static(b"psync2")),
+        ]);
+        assert_eq!(resp, Frame::SimpleString(Bytes::from_static(b"OK")));
+    }
+
+    #[test]
+    fn test_replconf_ack_offset() {
+        let resp = replconf(&[
+            Frame::BulkString(Bytes::from_static(b"ACK")),
+            Frame::BulkString(Bytes::from_static(b"12345")),
+        ]);
+        assert_eq!(resp, Frame::SimpleString(Bytes::from_static(b"OK")));
+    }
+
+    #[test]
+    fn test_replconf_rejects_unknown_subcommand() {
+        let resp = replconf(&[
+            Frame::BulkString(Bytes::from_static(b"made-up")),
+            Frame::BulkString(Bytes::from_static(b"value")),
+        ]);
+        match resp {
+            Frame::Error(msg) => {
+                assert!(
+                    msg.as_ref().starts_with(b"ERR Unrecognized REPLCONF option"),
+                    "got: {}",
+                    String::from_utf8_lossy(&msg)
+                );
+            }
+            other => panic!("expected error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_replconf_missing_value_errors() {
+        let resp = replconf(&[Frame::BulkString(Bytes::from_static(b"listening-port"))]);
         assert!(matches!(resp, Frame::Error(_)));
     }
 
