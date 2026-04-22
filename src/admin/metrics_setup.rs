@@ -353,6 +353,22 @@ pub fn record_command(cmd: &str, latency_us: u64) {
     histogram!("moon_command_duration_microseconds", "cmd" => label).record(latency_us as f64);
 }
 
+/// Record a command execution **without** latency sampling.
+///
+/// Hot-path variant for the 15/16 of commands that skip the `Instant::now()`
+/// measurement under 1-in-16 sampling. Keeps `TOTAL_COMMANDS` + per-cmd
+/// counter accurate (used by INFO) while avoiding the histogram record that
+/// would otherwise bias the distribution with a zero value.
+#[inline]
+pub fn record_command_no_latency(cmd: &str) {
+    TOTAL_COMMANDS.fetch_add(1, Ordering::Relaxed);
+    if !METRICS_INITIALIZED.load(Ordering::Relaxed) {
+        return;
+    }
+    let label = sanitize_cmd_label(cmd);
+    counter!("moon_commands_total", "cmd" => label).increment(1);
+}
+
 /// Record a command error.
 #[inline]
 pub fn record_command_error(cmd: &str) {

@@ -212,6 +212,14 @@ pub(crate) struct ConnectionState {
     // Connection affinity (migration)
     pub affinity_tracker: Option<AffinityTracker>,
     pub migration_target: Option<usize>,
+
+    /// Per-connection command counter used for 1-in-N latency sampling on the
+    /// hot dispatch path. Wraps on overflow. Sampling avoids the ~30–40 ns
+    /// `Instant::now()` tax per command while still producing statistically
+    /// accurate latency histograms. Slowlog coverage degrades to 1/16 but
+    /// only matters when threshold <~ expected per-op latency; default 10 ms
+    /// threshold effectively never fires on pipelined workloads regardless.
+    pub cmd_counter: u32,
 }
 
 impl ConnectionState {
@@ -256,6 +264,7 @@ impl ConnectionState {
                 None
             },
             migration_target: None,
+            cmd_counter: 0,
             cached_acl_unrestricted: false,
             cached_acl_version: 0,
             // Placeholder handle — `refresh_acl_cache` replaces this with

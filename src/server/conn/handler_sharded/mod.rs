@@ -969,19 +969,29 @@ pub(crate) async fn handle_connection_sharded_inner<
 
                             let db_count = ctx.shard_databases.db_count();
                             guard.refresh_now_from_cache(&ctx.cached_clock);
-                            let dispatch_start = std::time::Instant::now();
+                            // 1-in-16 latency sampling: skips ~30-40ns `Instant::now()`
+                            // on 15/16 of writes while keeping histogram + counter
+                            // statistically accurate. Slowlog at default 10ms threshold
+                            // never fires on pipelined GET/SET anyway.
+                            conn.cmd_counter = conn.cmd_counter.wrapping_add(1);
+                            let sample_latency = (conn.cmd_counter & 0xF) == 0;
+                            let dispatch_start = sample_latency.then(std::time::Instant::now);
                             let result = dispatch(&mut guard, cmd, cmd_args, &mut conn.selected_db, db_count);
-                            let elapsed_us = dispatch_start.elapsed().as_micros() as u64;
                             if let Ok(cmd_str) = std::str::from_utf8(cmd) {
-                                crate::admin::metrics_setup::record_command(cmd_str, elapsed_us);
-                            }
-                            if let Frame::Array(ref args) = frame {
-                                crate::admin::metrics_setup::global_slowlog().maybe_record(
-                                    elapsed_us,
-                                    args.as_slice(),
-                                    peer_addr.as_bytes(),
-                                    conn.client_name.as_ref().map_or(b"" as &[u8], |n| n.as_ref()),
-                                );
+                                if let Some(start) = dispatch_start {
+                                    let elapsed_us = start.elapsed().as_micros() as u64;
+                                    crate::admin::metrics_setup::record_command(cmd_str, elapsed_us);
+                                    if let Frame::Array(ref args) = frame {
+                                        crate::admin::metrics_setup::global_slowlog().maybe_record(
+                                            elapsed_us,
+                                            args.as_slice(),
+                                            peer_addr.as_bytes(),
+                                            conn.client_name.as_ref().map_or(b"" as &[u8], |n| n.as_ref()),
+                                        );
+                                    }
+                                } else {
+                                    crate::admin::metrics_setup::record_command_no_latency(cmd_str);
+                                }
                             }
                             let response = match result {
                                 DispatchResult::Response(f) => f,
@@ -1104,19 +1114,25 @@ pub(crate) async fn handle_connection_sharded_inner<
                             let guard = ctx.shard_databases.read_db(ctx.shard_id, conn.selected_db);
                             let now_ms = ctx.cached_clock.ms();
                             let db_count = ctx.shard_databases.db_count();
-                            let dispatch_start = std::time::Instant::now();
+                            conn.cmd_counter = conn.cmd_counter.wrapping_add(1);
+                            let sample_latency = (conn.cmd_counter & 0xF) == 0;
+                            let dispatch_start = sample_latency.then(std::time::Instant::now);
                             let result = dispatch_read(&guard, cmd, cmd_args, now_ms, &mut conn.selected_db, db_count);
-                            let elapsed_us = dispatch_start.elapsed().as_micros() as u64;
                             if let Ok(cmd_str) = std::str::from_utf8(cmd) {
-                                crate::admin::metrics_setup::record_command(cmd_str, elapsed_us);
-                            }
-                            if let Frame::Array(ref args) = frame {
-                                crate::admin::metrics_setup::global_slowlog().maybe_record(
-                                    elapsed_us,
-                                    args.as_slice(),
-                                    peer_addr.as_bytes(),
-                                    conn.client_name.as_ref().map_or(b"" as &[u8], |n| n.as_ref()),
-                                );
+                                if let Some(start) = dispatch_start {
+                                    let elapsed_us = start.elapsed().as_micros() as u64;
+                                    crate::admin::metrics_setup::record_command(cmd_str, elapsed_us);
+                                    if let Frame::Array(ref args) = frame {
+                                        crate::admin::metrics_setup::global_slowlog().maybe_record(
+                                            elapsed_us,
+                                            args.as_slice(),
+                                            peer_addr.as_bytes(),
+                                            conn.client_name.as_ref().map_or(b"" as &[u8], |n| n.as_ref()),
+                                        );
+                                    }
+                                } else {
+                                    crate::admin::metrics_setup::record_command_no_latency(cmd_str);
+                                }
                             }
                             drop(guard);
                             let response = match result {
