@@ -356,8 +356,13 @@ fn main() -> anyhow::Result<()> {
     };
     let mut shards: Vec<Shard> = (0..num_shards)
         .map(|id| {
-            let mut shard =
-                Shard::new(id, num_shards, config.databases, config.to_runtime_config());
+            let mut shard = Shard::with_initial_keyspace_hint(
+                id,
+                num_shards,
+                config.databases,
+                config.initial_keyspace_hint,
+                config.to_runtime_config(),
+            );
             if let Some(ref dir) = persistence_dir {
                 shard.restore_from_persistence(dir, disk_offload_base.as_deref());
             }

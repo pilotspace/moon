@@ -112,6 +112,19 @@ pub struct ServerConfig {
     #[arg(long, default_value_t = 0)]
     pub shards: usize,
 
+    /// Initial keyspace size hint (total entries across all shards, 0 = disabled).
+    ///
+    /// When non-zero, pre-sizes the default database (DB 0) on each shard to
+    /// hold approximately `hint / shards` entries without triggering segment
+    /// splits. Trades ~340 KB per shard of startup RSS per 60 K hinted entries
+    /// for elimination of the 10 % `split_segment` CPU cost on write-heavy
+    /// workloads that stay within the hint.
+    ///
+    /// Safe default is 0 (no pre-sizing). Typical values: 1_000_000 for a
+    /// 1 M-key benchmark; `maxmemory / 128` for bounded deployments.
+    #[arg(long = "initial-keyspace-hint", default_value_t = 0)]
+    pub initial_keyspace_hint: usize,
+
     /// Path to ACL file (Redis-compatible format)
     #[arg(long)]
     pub aclfile: Option<String>,

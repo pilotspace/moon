@@ -73,6 +73,29 @@ impl Database {
         }
     }
 
+    /// Create a new empty database with the internal DashTable pre-sized for
+    /// approximately `cap` entries. Eliminates segment-split cost for
+    /// workloads whose key count does not exceed `cap`.
+    ///
+    /// `cap == 0` is equivalent to `Database::new()` (no pre-sizing).
+    pub fn with_capacity(cap: usize) -> Self {
+        let data = if cap == 0 {
+            DashTable::new()
+        } else {
+            DashTable::with_capacity(cap)
+        };
+        Database {
+            data,
+            used_memory: 0,
+            cached_now: current_secs(),
+            cached_now_ms: current_time_ms(),
+            base_timestamp: current_secs(),
+            maybe_has_expiring_keys: false,
+            cold_index: None,
+            cold_shard_dir: None,
+        }
+    }
+
     /// Fast-path predicate for the active-expiry tick. Returns `false` only
     /// when the database is known to have zero entries with a TTL. Callers
     /// MUST treat `true` as "maybe has expiring keys" — the precise answer
@@ -214,17 +237,30 @@ impl Database {
     }
 
     /// Insert or replace an entry, tracking memory and version.
+    ///
+    /// Fast path (key exists): one `get_mut` probe, mutate in place. No
+    /// separate `insert` call — the Swiss-table SIMD lookup runs once instead
+    /// of twice. Retains the old `CompactKey` slot, which avoids re-allocating
+    /// an identical heap key.
+    ///
+    /// Slow path (new key): one `get_mut` miss + one `insert`. Miss is a cheap
+    /// SIMD match-mask scan that finds nothing and returns.
     pub fn set(&mut self, key: Bytes, mut entry: Entry) {
-        // If key exists, carry forward version+1 and subtract old memory
-        if let Some(old_entry) = self.data.get(key.as_ref()) {
+        let new_cost = entry_overhead(&key, &entry);
+        let has_expiry = entry.has_expiry();
+        if let Some(old_entry) = self.data.get_mut(key.as_ref()) {
+            let old_cost = entry_overhead(&key, old_entry);
             let new_version = old_entry.version() + 1;
             entry.set_version(new_version);
-            self.used_memory = self
-                .used_memory
-                .saturating_sub(entry_overhead(&key, old_entry));
+            self.used_memory = self.used_memory.saturating_sub(old_cost) + new_cost;
+            if has_expiry {
+                self.maybe_has_expiring_keys = true;
+            }
+            *old_entry = entry;
+            return;
         }
-        self.used_memory += entry_overhead(&key, &entry);
-        if entry.has_expiry() {
+        self.used_memory += new_cost;
+        if has_expiry {
             self.maybe_has_expiring_keys = true;
         }
         self.data.insert(CompactKey::from(key), entry);

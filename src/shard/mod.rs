@@ -52,7 +52,40 @@ pub struct Shard {
 impl Shard {
     /// Create a new shard with `num_databases` empty databases.
     pub fn new(id: usize, num_shards: usize, num_databases: usize, config: RuntimeConfig) -> Self {
-        let databases = (0..num_databases).map(|_| Database::new()).collect();
+        Self::with_initial_keyspace_hint(id, num_shards, num_databases, 0, config)
+    }
+
+    /// Create a new shard with `num_databases` empty databases, pre-sizing DB 0
+    /// (the default SELECTed database) to hold approximately
+    /// `initial_keyspace_hint` entries without segment splits.
+    ///
+    /// Only DB 0 is pre-sized because it is the only database most workloads
+    /// touch; pre-sizing all 16 per shard would multiply the startup RSS by
+    /// 16× for zero benefit on the default deployment path.
+    ///
+    /// `initial_keyspace_hint == 0` is equivalent to `Shard::new` (no pre-sizing).
+    pub fn with_initial_keyspace_hint(
+        id: usize,
+        num_shards: usize,
+        num_databases: usize,
+        initial_keyspace_hint: usize,
+        config: RuntimeConfig,
+    ) -> Self {
+        // Split the hint across shards: each shard holds ~1/num_shards of keys.
+        let per_shard_hint = if initial_keyspace_hint == 0 || num_shards == 0 {
+            0
+        } else {
+            initial_keyspace_hint / num_shards.max(1)
+        };
+        let databases: Vec<Database> = (0..num_databases)
+            .map(|i| {
+                if i == 0 {
+                    Database::with_capacity(per_shard_hint)
+                } else {
+                    Database::new()
+                }
+            })
+            .collect();
         Shard {
             id,
             databases,
