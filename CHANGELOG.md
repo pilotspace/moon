@@ -6,6 +6,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Dispatch Observability (Phase 177)
+
+- **`moon_dispatch_path_total{path=...}` Prometheus counter**: four-way classification of every command by shard-routing decision — `local_inline` (SIMD fast path), `local` (standard local branch), `cross_read_fast` (RwLock shared-read bypass of SPSC), `cross_spsc` (deferred cross-shard write via `PipelineBatchSlotted`). Ratio `cross_spsc / Σ` is the ground-truth signal for dispatch-layer optimization work. Zero-allocation hot-path overhead (`&'static str` labels, `#[inline]` with early-return on `!METRICS_INITIALIZED`). Verified on macOS + Linux: counter sums close exactly to driven traffic, no overcount.
+
+### Fixed — CI Hygiene
+
+- **`tests/pipeline_auto_index.rs`**: tighten outer cfg from `runtime-tokio` to `all(runtime-tokio, text-index)` so the file compiles to zero tests when text-index is disabled. Previously the file compiled but the FT.SEARCH text fast path was `#[cfg]`-ed out, causing `@name:corpus` queries to fall through to the KNN-only parser and panic with "invalid KNN query syntax".
+- **4 FT unwraps**: add inline `#[allow(clippy::unwrap_used)]` with invariant justifications in `vector_search/ft_text_search.rs` (3 sites inside `apply_post_processing` where `do_summarize` / `do_highlight` implies the Option is Some) and `handler_monoio/ft.rs:165` (`is_text` was derived from `query_bytes.as_ref().map_or(false, _)`). Restores the audit-unwrap baseline to 0.
+
 ### Changed
 
 - **`text-index` is now a default feature.** BM25 full-text search (`FT.SEARCH` BM25 mode), `FT.AGGREGATE`, and three-way RRF hybrid fusion are included in all standard builds. No longer requires `--features text-index`. To exclude it (e.g. minimal embedded builds): `--no-default-features --features runtime-monoio,jemalloc,graph`.
