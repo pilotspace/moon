@@ -536,6 +536,19 @@ pub(crate) async fn handle_connection_sharded_monoio<
             guard.refresh_now_from_cache(&ctx.cached_clock);
         }
 
+        // Batch-level eviction gate: snapshot `maxmemory != 0` once per batch
+        // (and cache the spill-sender presence check). When neither is set —
+        // the common non-memory-bound benchmark path — the per-command write
+        // branch can skip the `runtime_config.read()` lock acquire + the
+        // `try_evict_if_needed` call entirely. Saves a small RwLock lock
+        // pair per write command in a pipelined batch.
+        //
+        // Safety: `maxmemory` changes via `CONFIG SET maxmemory N` are picked
+        // up on the NEXT batch. A batch spans sub-millisecond; operators do
+        // not observe this granularity.
+        let batch_eviction_active =
+            ctx.spill_sender.is_some() || ctx.runtime_config.read().maxmemory != 0;
+
         let mut auth_delay_ms: u64 = 0;
 
         for frame in frames.drain(..) {
@@ -866,34 +879,42 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 crate::admin::metrics_setup::record_dispatch_local();
                 if metadata::is_write(cmd) {
                     // WRITE PATH: eviction + dispatch under write lock.
-                    let rt = ctx.runtime_config.read();
+                    //
+                    // Fast path: when neither maxmemory nor disk-offload is
+                    // configured (default deployment + default bench), skip
+                    // the `runtime_config.read()` acquire and the eviction
+                    // call entirely — both are no-ops. Saves one RwLock
+                    // lock pair per pipelined write.
                     let mut guard = ctx.shard_databases.write_db(ctx.shard_id, conn.selected_db);
-                    let evict_result = if let Some(ref sender) = ctx.spill_sender {
-                        let mut fid = ctx.spill_file_id.get();
-                        let dir = ctx
-                            .disk_offload_dir
-                            .as_deref()
-                            .unwrap_or(std::path::Path::new("."));
-                        let res = try_evict_if_needed_async_spill(
-                            &mut guard,
-                            &rt,
-                            sender,
-                            dir,
-                            &mut fid,
-                            conn.selected_db,
-                        );
-                        ctx.spill_file_id.set(fid);
-                        res
-                    } else {
-                        try_evict_if_needed(&mut guard, &rt)
-                    };
-                    if let Err(oom_frame) = evict_result {
-                        drop(guard);
+                    if batch_eviction_active {
+                        let rt = ctx.runtime_config.read();
+                        let evict_result = if let Some(ref sender) = ctx.spill_sender {
+                            let mut fid = ctx.spill_file_id.get();
+                            let dir = ctx
+                                .disk_offload_dir
+                                .as_deref()
+                                .unwrap_or(std::path::Path::new("."));
+                            let res = try_evict_if_needed_async_spill(
+                                &mut guard,
+                                &rt,
+                                sender,
+                                dir,
+                                &mut fid,
+                                conn.selected_db,
+                            );
+                            ctx.spill_file_id.set(fid);
+                            res
+                        } else {
+                            try_evict_if_needed(&mut guard, &rt)
+                        };
+                        if let Err(oom_frame) = evict_result {
+                            drop(guard);
+                            drop(rt);
+                            responses.push(oom_frame);
+                            continue;
+                        }
                         drop(rt);
-                        responses.push(oom_frame);
-                        continue;
                     }
-                    drop(rt);
 
                     // KV undo-log capture for active cross-store transactions.
                     // MUST happen BEFORE dispatch() overwrites the database entry.

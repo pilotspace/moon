@@ -89,6 +89,12 @@ const _: () = {
 ///
 /// On x86_64: uses `_mm_prefetch` with `_MM_HINT_T0` (all cache levels).
 /// On other architectures (aarch64/macOS): no-op.
+///
+/// NOTE: An aarch64 `prfm pldl1keep` variant was measured and found to
+/// INCREASE `Segment::find` self-time by ~3pp on ARM (tight LSU
+/// back-pressure in the hot probe loop). Kept as a no-op on aarch64
+/// until a smarter placement (only prefetching slots that are likely
+/// to need a full memcmp) is implemented.
 #[cfg(target_arch = "x86_64")]
 #[inline]
 unsafe fn prefetch_ptr(ptr: *const u8) {
