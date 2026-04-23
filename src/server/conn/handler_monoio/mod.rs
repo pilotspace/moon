@@ -54,6 +54,14 @@ pub enum MonoioHandlerResult {
         state: MigratedConnectionState,
         target_shard: usize,
     },
+    /// PSYNC arrived on this connection. Caller must hand the underlying
+    /// `monoio::net::TcpStream` to `crate::replication::master::handle_psync_on_master`
+    /// for snapshot transfer + live streaming.
+    HijackForPsync {
+        client_repl_id: String,
+        client_offset: i64,
+        peer_addr: String,
+    },
 }
 
 /// Monoio connection handler using ownership-based I/O (AsyncReadRent/AsyncWriteRent).
@@ -668,8 +676,43 @@ pub(crate) async fn handle_connection_sharded_monoio<
             {
                 continue;
             }
-            if cmd_len == 8 && dispatch::try_handle_replconf(cmd, cmd_args, &mut responses) {
+            if cmd_len == 8 && dispatch::try_handle_replconf(cmd, cmd_args, ctx, &mut responses) {
                 continue;
+            }
+            // PSYNC: arrives only on a master, hijacks the connection. Encode
+            // any pending responses, flush, then return the stream so the
+            // caller can drive the resync handshake.
+            if cmd_len == 5 {
+                if let Some((repl_id, offset)) =
+                    dispatch::try_handle_psync(cmd, cmd_args, ctx, &mut responses)
+                {
+                    for resp in &responses {
+                        codec.encode_frame(resp, &mut write_buf);
+                    }
+                    if !write_buf.is_empty() {
+                        let data = write_buf.split().freeze();
+                        let (wr, _): (std::io::Result<usize>, bytes::Bytes) =
+                            stream.write_all(data).await;
+                        if wr.is_err() {
+                            return (MonoioHandlerResult::Done, None);
+                        }
+                    }
+                    return (
+                        MonoioHandlerResult::HijackForPsync {
+                            client_repl_id: repl_id,
+                            client_offset: offset,
+                            peer_addr: peer_addr.clone(),
+                        },
+                        Some(stream),
+                    );
+                }
+                // try_handle_psync may have pushed an error response (multi-shard,
+                // bad args, etc.); fall through so it gets flushed normally.
+                if !responses.is_empty()
+                    && cmd.eq_ignore_ascii_case(b"PSYNC")
+                {
+                    continue;
+                }
             }
             if cmd_len == 4
                 && dispatch::try_handle_info(cmd, cmd_args, &conn, ctx, &mut responses)

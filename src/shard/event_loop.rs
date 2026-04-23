@@ -20,7 +20,6 @@ use crate::persistence::snapshot::SnapshotState;
 use crate::persistence::wal::WalWriter;
 use crate::persistence::wal_v3::segment::WalWriterV3;
 use crate::pubsub::PubSubRegistry;
-use crate::replication::backlog::ReplicationBacklog;
 use crate::replication::state::ReplicationState;
 use crate::runtime::cancel::CancellationToken;
 use crate::runtime::channel;
@@ -582,8 +581,22 @@ impl super::Shard {
         // Tokio path doesn't take these into the spawn signatures; suppress warnings.
         let (_, _, _) = (&spill_sender, &spill_file_id, &disk_offload_dir);
 
-        // Per-shard replication backlog (lazy: allocated on first RegisterReplica).
-        let mut repl_backlog: Option<ReplicationBacklog> = None;
+        // Per-shard replication backlog (lazy: allocated on first REPLCONF or
+        // RegisterReplica). Shared with PSYNC handlers via Arc<Mutex<Option<...>>>
+        // on ReplicationState. We hold a clone of this shard's slot so the write
+        // path doesn't need to traverse ReplicationState's outer RwLock per write.
+        let repl_backlog: crate::replication::backlog::SharedBacklog = match repl_state_ext.as_ref()
+        {
+            Some(rs) => match rs.read() {
+                Ok(g) => g
+                    .per_shard_backlogs
+                    .get(self.id)
+                    .cloned()
+                    .unwrap_or_else(|| std::sync::Arc::new(parking_lot::Mutex::new(None))),
+                Err(_) => std::sync::Arc::new(parking_lot::Mutex::new(None)),
+            },
+            None => std::sync::Arc::new(parking_lot::Mutex::new(None)),
+        };
         let mut replica_txs: Vec<(u64, channel::MpscSender<bytes::Bytes>)> = Vec::new();
         let repl_state: Option<Arc<std::sync::RwLock<ReplicationState>>> = repl_state_ext;
 
@@ -944,7 +957,7 @@ impl super::Shard {
                     spsc_handler::drain_spsc_shared(
                         &shard_databases, &mut consumers, &mut *pubsub_arc.write(),
                         &blocking_rc, &mut pending_snapshot, &mut snapshot_state,
-                        &mut wal_writer, &mut wal_v3_writer, &mut repl_backlog, &mut replica_txs,
+                        &mut wal_writer, &mut wal_v3_writer, &repl_backlog, &mut replica_txs,
                         &repl_state, shard_id, &script_cache_rc, &cached_clock,
                         &mut pending_migrations, &mut *shard_databases.vector_store(shard_id),
                     );
@@ -997,7 +1010,7 @@ impl super::Shard {
                     spsc_handler::drain_spsc_shared(
                         &shard_databases, &mut consumers, &mut *pubsub_arc.write(),
                         &blocking_rc, &mut pending_snapshot, &mut snapshot_state,
-                        &mut wal_writer, &mut wal_v3_writer, &mut repl_backlog, &mut replica_txs,
+                        &mut wal_writer, &mut wal_v3_writer, &repl_backlog, &mut replica_txs,
                         &repl_state, shard_id, &script_cache_rc, &cached_clock,
                         &mut pending_migrations, &mut *shard_databases.vector_store(shard_id),
                     );
@@ -1394,7 +1407,7 @@ impl super::Shard {
                     &mut snapshot_state,
                     &mut wal_writer,
                     &mut wal_v3_writer,
-                    &mut repl_backlog,
+                    &repl_backlog,
                     &mut replica_txs,
                     &repl_state,
                     shard_id,

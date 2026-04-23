@@ -1,8 +1,11 @@
 use bytes::Bytes;
 use rand::RngExt;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub use crate::replication::handshake::ReplicaHandshakeState;
+
+use crate::replication::backlog::SharedBacklog;
 
 pub struct ReplicationState {
     pub role: ReplicationRole,
@@ -17,6 +20,12 @@ pub struct ReplicationState {
     pub master_repl_offset: AtomicU64,
     /// Connected replicas (master mode). Guarded by Arc<RwLock<ReplicationState>> callers.
     pub replicas: Vec<ReplicaInfo>,
+    /// Per-shard replication backlogs, shared between the shard event loop
+    /// (writer) and PSYNC handlers (reader). Wrapped in `Mutex<Option<...>>`
+    /// so allocation is lazy: stays `None` until the first replica handshake
+    /// arrives (REPLCONF). When `None`, write-path append is a single branch
+    /// with no lock acquisition.
+    pub per_shard_backlogs: Vec<SharedBacklog>,
 }
 
 pub enum ReplicationRole {
@@ -48,6 +57,24 @@ impl ReplicationState {
             shard_offsets: (0..num_shards).map(|_| AtomicU64::new(0)).collect(),
             master_repl_offset: AtomicU64::new(0),
             replicas: Vec::new(),
+            per_shard_backlogs: (0..num_shards)
+                .map(|_| Arc::new(parking_lot::Mutex::new(None)))
+                .collect(),
+        }
+    }
+
+    /// Allocate the per-shard backlog if not already allocated. Idempotent.
+    /// Called when a replica handshake begins (REPLCONF or PSYNC arrival) so
+    /// subsequent writes on the shard's event loop start being captured for
+    /// partial resync. Capacity defaults to 1 MiB per shard.
+    pub fn ensure_backlogs_allocated(&self, capacity: usize) {
+        for slot in &self.per_shard_backlogs {
+            let mut guard = slot.lock();
+            if guard.is_none() {
+                *guard = Some(crate::replication::backlog::ReplicationBacklog::new(
+                    capacity,
+                ));
+            }
         }
     }
 

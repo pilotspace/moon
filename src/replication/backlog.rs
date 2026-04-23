@@ -1,3 +1,11 @@
+/// Shared, lazily-initialized per-shard backlog.
+///
+/// `Mutex<Option<...>>`: `None` until the first replica handshake arrives,
+/// after which a single allocation is performed. The shard event loop is the
+/// only writer (uncontended lock acquire on the write path); PSYNC handlers
+/// briefly take the lock to read backlog bytes during resync.
+pub type SharedBacklog = std::sync::Arc<parking_lot::Mutex<Option<ReplicationBacklog>>>;
+
 /// Per-shard circular replication backlog.
 ///
 /// Captures WAL bytes as they flow. Replicas use this for partial resync.

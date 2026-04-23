@@ -50,7 +50,7 @@ pub(crate) fn drain_spsc_shared(
     snapshot_state: &mut Option<SnapshotState>,
     wal_writer: &mut Option<WalWriter>,
     wal_v3_writer: &mut Option<WalWriterV3>,
-    repl_backlog: &mut Option<ReplicationBacklog>,
+    repl_backlog: &crate::replication::backlog::SharedBacklog,
     replica_txs: &mut Vec<(u64, channel::MpscSender<bytes::Bytes>)>,
     repl_state: &Option<Arc<RwLock<ReplicationState>>>,
     shard_id: usize,
@@ -198,7 +198,7 @@ pub(crate) fn handle_shard_message_shared(
     snapshot_state: &mut Option<SnapshotState>,
     wal_writer: &mut Option<WalWriter>,
     wal_v3_writer: &mut Option<WalWriterV3>,
-    repl_backlog: &mut Option<ReplicationBacklog>,
+    repl_backlog: &crate::replication::backlog::SharedBacklog,
     replica_txs: &mut Vec<(u64, channel::MpscSender<bytes::Bytes>)>,
     repl_state: &Option<Arc<RwLock<ReplicationState>>>,
     shard_id: usize,
@@ -1256,10 +1256,15 @@ pub(crate) fn handle_shard_message_shared(
             info!("Received shutdown via SPSC");
         }
         ShardMessage::RegisterReplica { replica_id, tx } => {
-            // Lazy-init replication backlog on first replica registration (saves 1MB/shard)
-            if repl_backlog.is_none() {
-                *repl_backlog = Some(ReplicationBacklog::new(1024 * 1024));
+            // Lazy-init replication backlog on first replica registration (saves 1MB/shard).
+            // The backlog is shared with PSYNC handlers via Arc<Mutex<Option<...>>> on
+            // ReplicationState — see ReplicationState::ensure_backlogs_allocated for the
+            // earlier allocation point triggered by REPLCONF.
+            let mut guard = repl_backlog.lock();
+            if guard.is_none() {
+                *guard = Some(ReplicationBacklog::new(1024 * 1024));
             }
+            drop(guard);
             replica_txs.push((replica_id, tx));
         }
         ShardMessage::UnregisterReplica { replica_id } => {
@@ -1841,7 +1846,7 @@ pub(crate) fn wal_append_and_fanout(
     data: &[u8],
     wal_writer: &mut Option<WalWriter>,
     wal_v3_writer: &mut Option<WalWriterV3>,
-    repl_backlog: &mut Option<ReplicationBacklog>,
+    repl_backlog: &crate::replication::backlog::SharedBacklog,
     replica_txs: &[(u64, channel::MpscSender<bytes::Bytes>)],
     repl_state: &Option<Arc<RwLock<ReplicationState>>>,
     shard_id: usize,
@@ -1856,10 +1861,18 @@ pub(crate) fn wal_append_and_fanout(
     } else if let Some(w) = wal_writer {
         w.append(data);
     }
-    // 2. Replication backlog (in-memory circular buffer for partial resync)
-    if let Some(backlog) = repl_backlog {
+    // 2. Replication backlog (in-memory circular buffer for partial resync).
+    //
+    // The backlog is shared via Arc<Mutex<Option<...>>> with PSYNC handlers.
+    // Cost on the write path:
+    //   - When `None` (no replica ever connected): one branch, no lock acquire.
+    //   - When `Some` (replication active): one uncontended parking_lot::Mutex
+    //     acquire per WAL flush (typically once per 1ms tick batch, NOT per write).
+    let mut guard = repl_backlog.lock();
+    if let Some(backlog) = guard.as_mut() {
         backlog.append(data);
     }
+    drop(guard);
     // 3. Advance monotonic replication offset (NEVER resets on WAL truncation)
     if let Some(rs) = repl_state {
         match rs.read() {

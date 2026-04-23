@@ -573,12 +573,57 @@ pub(crate) fn spawn_monoio_connection(
                     )
                     .await;
 
+                    // PSYNC hijack: master takes over the stream and drives the replica.
+                    // We split the result into outcome + stream so we can route on the
+                    // outcome variant before falling through to the migration path.
+                    let _result_outcome = _result.0;
+                    let _result_stream = _result.1;
+                    let mut _hijacked_psync = false;
+                    if let crate::server::conn::handler_monoio::MonoioHandlerResult::HijackForPsync {
+                        client_repl_id,
+                        client_offset,
+                        peer_addr: hp_peer,
+                    } = &_result_outcome {
+                        if let Some(stream) = _result_stream {
+                            _hijacked_psync = true;
+                            let repl_state_clone = conn_ctx.repl_state.clone();
+                            let shard_databases_clone = conn_ctx.shard_databases.clone();
+                            let dispatch_tx_clone = conn_ctx.dispatch_tx.clone();
+                            let parsed_addr: std::net::SocketAddr = hp_peer
+                                .parse()
+                                .unwrap_or_else(|_| std::net::SocketAddr::from(([0, 0, 0, 0], 0)));
+                            let client_repl_id_owned = client_repl_id.clone();
+                            let client_offset_v = *client_offset;
+                            monoio::spawn(async move {
+                                if let Some(rs) = repl_state_clone {
+                                    if let Err(e) = crate::replication::master::handle_psync_inline_single_shard(
+                                        &client_repl_id_owned,
+                                        client_offset_v,
+                                        stream,
+                                        rs,
+                                        shard_databases_clone,
+                                        dispatch_tx_clone,
+                                        parsed_addr,
+                                    ).await {
+                                        tracing::warn!("PSYNC handler exited: {}", e);
+                                    }
+                                } else {
+                                    tracing::warn!("PSYNC hijack but repl_state is missing");
+                                }
+                                crate::admin::metrics_setup::record_connection_closed();
+                            });
+                            // Skip the connection-closed metric below — the spawned task owns it.
+                            return;
+                        }
+                    }
+                    let _ = _hijacked_psync;
+                    let _result = (_result_outcome, _result_stream);
                     // Handle migration result: extract FD via dup() and send via SPSC.
                     // libc::dup is only available on Linux (target-specific dependency).
                     #[cfg(target_os = "linux")]
                     let mut _migrated = false;
                     #[cfg(target_os = "linux")]
-                    if let (crate::server::conn::handler_monoio::MonoioHandlerResult::MigrateConnection { state, target_shard }, Some(stream)) = (_result.0, _result.1) {
+                    if let (crate::server::conn::handler_monoio::MonoioHandlerResult::MigrateConnection { state, target_shard }, Some(stream)) = _result {
                         use std::os::unix::io::{AsRawFd, FromRawFd};
                         use ringbuf::traits::Producer;
                         use crate::shard::mesh::ChannelMesh;

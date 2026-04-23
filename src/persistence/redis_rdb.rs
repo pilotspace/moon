@@ -363,6 +363,14 @@ fn write_rdb_entry(buf: &mut Vec<u8>, key: &[u8], entry: &Entry, base_ts: u32) {
 /// Produces valid REDIS0010 with AUX fields, per-DB SELECTDB/RESIZEDB,
 /// entries, EOF marker, and CRC64 checksum.
 pub fn write_rdb(databases: &[Database], buf: &mut Vec<u8>) {
+    let refs: Vec<&Database> = databases.iter().collect();
+    write_rdb_refs(&refs, buf);
+}
+
+/// Reference-based variant: writes RDB from borrowed database references,
+/// avoiding `Database: Clone` requirements. Used by PSYNC full-resync where
+/// databases are held behind `RwLockReadGuard`s and cannot be cloned or moved.
+pub fn write_rdb_refs(databases: &[&Database], buf: &mut Vec<u8>) {
     write_rdb_header(buf);
 
     let now_ms = current_time_ms();

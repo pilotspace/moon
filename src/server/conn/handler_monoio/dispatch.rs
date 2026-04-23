@@ -479,17 +479,124 @@ pub(super) fn try_handle_replicaof(
 }
 
 /// Handle REPLCONF command. Returns `true` if consumed.
+///
+/// Side effect: when REPLCONF is observed on a master, eagerly allocate the
+/// per-shard replication backlogs so that subsequent writes between now and
+/// PSYNC arrival are captured for partial resync. This fixes the
+/// chicken-and-egg gap where the original code only allocated on
+/// `RegisterReplica` (after PSYNC), causing the master to buffer zero bytes
+/// during the handshake window.
 #[inline]
 pub(super) fn try_handle_replconf(
     cmd: &[u8],
     cmd_args: &[Frame],
+    ctx: &ConnectionContext,
     responses: &mut Vec<Frame>,
 ) -> bool {
     if !cmd.eq_ignore_ascii_case(b"REPLCONF") {
         return false;
     }
+    if let Some(ref rs) = ctx.repl_state {
+        if let Ok(g) = rs.read() {
+            if matches!(g.role, crate::replication::state::ReplicationRole::Master) {
+                g.ensure_backlogs_allocated(1024 * 1024);
+            }
+        }
+    }
     responses.push(crate::command::connection::replconf(cmd_args));
     true
+}
+
+/// Handle PSYNC command. Returns `Some((repl_id, offset))` when this PSYNC
+/// arrival should hijack the connection. The caller breaks out of the dispatch
+/// loop and returns the stream so the master replication driver can take over.
+///
+/// Returns `None` for non-PSYNC commands.
+/// Returns `Some((..))` only when num_shards == 1 (the supported topology).
+/// For multi-shard topologies, pushes a clear error and returns `None`
+/// (consumed via `responses`); the caller treats it like any other command
+/// reply and continues — the replica will see the error and give up.
+pub(super) fn try_handle_psync(
+    cmd: &[u8],
+    cmd_args: &[Frame],
+    ctx: &ConnectionContext,
+    responses: &mut Vec<Frame>,
+) -> Option<(String, i64)> {
+    if !cmd.eq_ignore_ascii_case(b"PSYNC") {
+        return None;
+    }
+    if cmd_args.len() != 2 {
+        responses.push(Frame::Error(Bytes::from_static(
+            b"ERR wrong number of arguments for 'psync' command",
+        )));
+        return None;
+    }
+    if ctx.num_shards != 1 {
+        responses.push(Frame::Error(Bytes::from_static(
+            b"ERR PSYNC across multiple shards is not yet supported (use --shards 1 on the master)",
+        )));
+        return None;
+    }
+    let Some(ref rs) = ctx.repl_state else {
+        responses.push(Frame::Error(Bytes::from_static(
+            b"ERR replication is not enabled on this server",
+        )));
+        return None;
+    };
+    {
+        let g = rs.read().ok();
+        let is_master = g.as_ref().map(|g| {
+            matches!(g.role, crate::replication::state::ReplicationRole::Master)
+        }).unwrap_or(false);
+        if !is_master {
+            responses.push(Frame::Error(Bytes::from_static(
+                b"ERR PSYNC is only valid on a master",
+            )));
+            return None;
+        }
+        if let Some(g) = g {
+            g.ensure_backlogs_allocated(1024 * 1024);
+        }
+    }
+    let repl_id = match &cmd_args[0] {
+        Frame::BulkString(b) | Frame::SimpleString(b) => {
+            String::from_utf8_lossy(b).into_owned()
+        }
+        _ => {
+            responses.push(Frame::Error(Bytes::from_static(
+                b"ERR PSYNC: invalid replid",
+            )));
+            return None;
+        }
+    };
+    let offset_bytes = match &cmd_args[1] {
+        Frame::BulkString(b) | Frame::SimpleString(b) => b.as_ref(),
+        _ => {
+            responses.push(Frame::Error(Bytes::from_static(
+                b"ERR PSYNC: invalid offset",
+            )));
+            return None;
+        }
+    };
+    let offset_str = match std::str::from_utf8(offset_bytes) {
+        Ok(s) => s,
+        Err(_) => {
+            responses.push(Frame::Error(Bytes::from_static(
+                b"ERR PSYNC: offset must be an integer",
+            )));
+            return None;
+        }
+    };
+    let offset: i64 = match offset_str.parse() {
+        Ok(n) => n,
+        Err(_) => {
+            responses.push(Frame::Error(Bytes::from_static(
+                b"ERR PSYNC: offset must be an integer",
+            )));
+            return None;
+        }
+    };
+    Some((repl_id, offset))
 }
 
 /// Handle INFO command. Returns `true` if consumed.

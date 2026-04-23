@@ -265,7 +265,7 @@ GRAPH.QUERY social "MATCH (a:Person)-[:FOLLOWS]->(b) RETURN a.name, b.name"
 | **Data types** | Strings, lists, hashes, sets, sorted sets, streams, HyperLogLog, bitmaps, vectors |
 | **Persistence** | Forkless RDB, per-shard AOF (`always`/`everysec`/`no`), WAL v2 framing, tiered disk offload |
 | **Networking** | RESP2/RESP3, HELLO negotiation, TLS 1.3 (rustls + aws-lc-rs), mTLS, pipelining, client-side caching |
-| **Clustering** | 16,384 hash slots, gossip, MOVED/ASK, live slot migration, PSYNC2 replication, majority-vote failover |
+| **Clustering** | 16,384 hash slots, gossip, MOVED/ASK, live slot migration, PSYNC2 replication (v0.1.x: `--shards 1` master only — see [clustering guide](docs/guides/clustering.mdx#replication)), majority-vote failover |
 | **Scripting & security** | Lua 5.4 (EVAL/EVALSHA), ACL users/keys/channels/commands, protected mode |
 | **Vector search** | `FT.CREATE`/`FT.SEARCH`/`FT.AGGREGATE`, HNSW + TurboQuant 4-bit, auto-indexing on `HSET`, hybrid dense+sparse+BM25 |
 | **Full-text search** | BM25 inverted index, typo tolerance (Levenshtein), TAG and NUMERIC fields, HIGHLIGHT/SUMMARIZE, three-way RRF fusion |
