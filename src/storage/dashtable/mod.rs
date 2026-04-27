@@ -245,11 +245,9 @@ impl<V> DashTable<CompactKey, V> {
     /// O(1): `segment_count * size_of::<Segment>() + directory.len() * 8 + index_map overhead`.
     #[inline]
     pub fn resident_bytes(&self) -> usize {
-        let seg_bytes =
-            self.segments.len() * std::mem::size_of::<Segment<CompactKey, V>>();
+        let seg_bytes = self.segments.len() * std::mem::size_of::<Segment<CompactKey, V>>();
         let dir_bytes = self.directory.len() * std::mem::size_of::<usize>();
-        let idx_bytes =
-            self.segments.len() * std::mem::size_of::<(u32, u32)>();
+        let idx_bytes = self.segments.len() * std::mem::size_of::<(u32, u32)>();
         seg_bytes + dir_bytes + idx_bytes
     }
 

@@ -126,11 +126,9 @@ impl ConnectionContext {
         // try_enforce_readonly can avoid taking the RwLock per command.
         // The Arc is cloned out under the read-lock once at connection setup;
         // ReplicationState::set_role() updates the same AtomicBool thereafter.
-        let is_replica_mirror = repl_state.as_ref().and_then(|rs| {
-            rs.read()
-                .ok()
-                .map(|guard| guard.is_replica_mirror.clone())
-        });
+        let is_replica_mirror = repl_state
+            .as_ref()
+            .and_then(|rs| rs.read().ok().map(|guard| guard.is_replica_mirror.clone()));
         Self {
             shard_databases,
             shard_id,

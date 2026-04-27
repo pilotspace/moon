@@ -354,7 +354,8 @@ fn memory_doctor() -> Frame {
     let (allocator_name, arena_count) = allocator_info();
 
     // ── Computed overhead ────────────────────────────────────────────────
-    let tracked_sum = dashtable_bytes + hnsw_bytes + csr_bytes + wal_bytes + sealed_bytes + repl_bytes;
+    let tracked_sum =
+        dashtable_bytes + hnsw_bytes + csr_bytes + wal_bytes + sealed_bytes + repl_bytes;
     let allocator_overhead = rss.saturating_sub(tracked_sum);
 
     // ── VSZ ratio recommendation ─────────────────────────────────────────
@@ -392,13 +393,48 @@ fn memory_doctor() -> Frame {
     let _ = writeln!(out, "  Arenas:                 {arena_count}");
     let _ = writeln!(out);
     let _ = writeln!(out, "Per-subsystem (resident):");
-    let _ = writeln!(out, "  DashTable + entries:    {}  ({:.1}%)", humanize_bytes(dashtable_bytes), pct(dashtable_bytes, rss));
-    let _ = writeln!(out, "  HNSW (vector):          {}  ({:.1}%)", humanize_bytes(hnsw_bytes), pct(hnsw_bytes, rss));
-    let _ = writeln!(out, "  CSR (graph):            {}  ({:.1}%)", humanize_bytes(csr_bytes), pct(csr_bytes, rss));
-    let _ = writeln!(out, "  WAL writers:            {}  ({:.1}%)", humanize_bytes(wal_bytes), pct(wal_bytes, rss));
-    let _ = writeln!(out, "  Sealed segments:        {}  ({:.1}%)", humanize_bytes(sealed_bytes), pct(sealed_bytes, rss));
-    let _ = writeln!(out, "  Replication backlog:    {}  ({:.1}%)", humanize_bytes(repl_bytes), pct(repl_bytes, rss));
-    let _ = writeln!(out, "  Allocator overhead:     {}  ({:.1}%)", humanize_bytes(allocator_overhead), pct(allocator_overhead, rss));
+    let _ = writeln!(
+        out,
+        "  DashTable + entries:    {}  ({:.1}%)",
+        humanize_bytes(dashtable_bytes),
+        pct(dashtable_bytes, rss)
+    );
+    let _ = writeln!(
+        out,
+        "  HNSW (vector):          {}  ({:.1}%)",
+        humanize_bytes(hnsw_bytes),
+        pct(hnsw_bytes, rss)
+    );
+    let _ = writeln!(
+        out,
+        "  CSR (graph):            {}  ({:.1}%)",
+        humanize_bytes(csr_bytes),
+        pct(csr_bytes, rss)
+    );
+    let _ = writeln!(
+        out,
+        "  WAL writers:            {}  ({:.1}%)",
+        humanize_bytes(wal_bytes),
+        pct(wal_bytes, rss)
+    );
+    let _ = writeln!(
+        out,
+        "  Sealed segments:        {}  ({:.1}%)",
+        humanize_bytes(sealed_bytes),
+        pct(sealed_bytes, rss)
+    );
+    let _ = writeln!(
+        out,
+        "  Replication backlog:    {}  ({:.1}%)",
+        humanize_bytes(repl_bytes),
+        pct(repl_bytes, rss)
+    );
+    let _ = writeln!(
+        out,
+        "  Allocator overhead:     {}  ({:.1}%)",
+        humanize_bytes(allocator_overhead),
+        pct(allocator_overhead, rss)
+    );
     let _ = writeln!(out);
     let _ = writeln!(out, "Mapped regions:");
     let _ = writeln!(out, "  File-backed mmap:       n/a");

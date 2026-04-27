@@ -5,7 +5,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use metrics::{counter, describe_gauge, gauge, histogram, Unit};
+use metrics::{Unit, counter, describe_gauge, gauge, histogram};
 
 static METRICS_INITIALIZED: AtomicBool = AtomicBool::new(false);
 static SERVER_READY: AtomicBool = AtomicBool::new(false);
@@ -1014,9 +1014,8 @@ pub fn set_global_repl_state(
 
 /// Get the raw global replication state Arc (for MEMORY DOCTOR backlog query).
 /// Returns None before replication is initialized.
-pub fn get_global_repl_state_arc(
-) -> Option<&'static std::sync::Arc<std::sync::RwLock<crate::replication::state::ReplicationState>>>
-{
+pub fn get_global_repl_state_arc()
+-> Option<&'static std::sync::Arc<std::sync::RwLock<crate::replication::state::ReplicationState>>> {
     GLOBAL_REPL_STATE.get()
 }
 
@@ -1071,8 +1070,8 @@ pub fn set_global_shard_databases(
 
 /// Get the global ShardDatabases handle (returns None before server init
 /// or after shutdown when the Arc has been dropped).
-pub fn get_global_shard_databases(
-) -> Option<std::sync::Arc<crate::shard::shared_databases::ShardDatabases>> {
+pub fn get_global_shard_databases()
+-> Option<std::sync::Arc<crate::shard::shared_databases::ShardDatabases>> {
     GLOBAL_SHARD_DBS.get().and_then(|w| w.upgrade())
 }
 

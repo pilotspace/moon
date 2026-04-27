@@ -624,8 +624,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
             {
                 continue;
             }
-            if cmd_len == 4
-                && dispatch::try_handle_eval(cmd, cmd_args, &conn, ctx, &mut responses)
+            if cmd_len == 4 && dispatch::try_handle_eval(cmd, cmd_args, &conn, ctx, &mut responses)
             {
                 continue;
             }
@@ -663,7 +662,14 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 continue;
             }
             if cmd_len == 3
-                && dispatch::try_handle_acl(cmd, cmd_args, &mut conn, ctx, &peer_addr, &mut responses)
+                && dispatch::try_handle_acl(
+                    cmd,
+                    cmd_args,
+                    &mut conn,
+                    ctx,
+                    &peer_addr,
+                    &mut responses,
+                )
             {
                 continue;
             }
@@ -708,14 +714,11 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 }
                 // try_handle_psync may have pushed an error response (multi-shard,
                 // bad args, etc.); fall through so it gets flushed normally.
-                if !responses.is_empty()
-                    && cmd.eq_ignore_ascii_case(b"PSYNC")
-                {
+                if !responses.is_empty() && cmd.eq_ignore_ascii_case(b"PSYNC") {
                     continue;
                 }
             }
-            if cmd_len == 4
-                && dispatch::try_handle_info(cmd, cmd_args, &conn, ctx, &mut responses)
+            if cmd_len == 4 && dispatch::try_handle_info(cmd, cmd_args, &conn, ctx, &mut responses)
             {
                 continue;
             }

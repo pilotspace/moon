@@ -185,11 +185,7 @@ fn memory_doctor_returns_documented_schema() {
         .lines()
         .find(|l| l.contains("Allocator:"))
         .expect("Allocator line not found");
-    let allocator_value = allocator_line
-        .split("Allocator:")
-        .nth(1)
-        .unwrap()
-        .trim();
+    let allocator_value = allocator_line.split("Allocator:").nth(1).unwrap().trim();
     assert!(
         allocator_value.starts_with("jemalloc")
             || allocator_value.starts_with("mimalloc")
@@ -202,11 +198,7 @@ fn memory_doctor_returns_documented_schema() {
         .lines()
         .find(|l| l.contains("RSS:"))
         .expect("RSS line not found");
-    let rss_value_str = rss_line
-        .split("RSS:")
-        .nth(1)
-        .unwrap()
-        .trim();
+    let rss_value_str = rss_line.split("RSS:").nth(1).unwrap().trim();
     let rss_bytes = parse_human_bytes(rss_value_str)
         .unwrap_or_else(|| panic!("Cannot parse RSS value: '{rss_value_str}'"));
     assert!(rss_bytes > 0, "RSS should be > 0");

@@ -79,7 +79,10 @@ fn wal_writer_resident_bytes_after_append() {
     );
 
     // Append a record and verify bytes are still tracked.
-    writer.append(WalRecordType::Command, b"*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n");
+    writer.append(
+        WalRecordType::Command,
+        b"*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$5\r\nvalue\r\n",
+    );
     let after = writer.resident_bytes();
     assert!(
         after >= before,

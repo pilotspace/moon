@@ -294,10 +294,8 @@ impl MemGraph {
     /// Resident bytes used by the in-memory adjacency lists (nodes + edges
     /// slot maps). Approximation based on slot-map capacity and struct sizes.
     pub fn resident_bytes(&self) -> usize {
-        let node_bytes =
-            self.nodes.capacity() * std::mem::size_of::<MutableNode>();
-        let edge_bytes =
-            self.edges.capacity() * std::mem::size_of::<MutableEdge>();
+        let node_bytes = self.nodes.capacity() * std::mem::size_of::<MutableNode>();
+        let edge_bytes = self.edges.capacity() * std::mem::size_of::<MutableEdge>();
         node_bytes + edge_bytes
     }
 

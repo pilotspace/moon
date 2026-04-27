@@ -162,9 +162,7 @@ pub(crate) async fn handle_connection_sharded(
                             use std::os::unix::io::FromRawFd;
                             // SAFETY: fd is a valid, uniquely-owned file descriptor obtained
                             // from TcpStream::into_raw_fd() above. OwnedFd closes it on drop.
-                            drop(unsafe {
-                                std::os::unix::io::OwnedFd::from_raw_fd(payload.fd)
-                            });
+                            drop(unsafe { std::os::unix::io::OwnedFd::from_raw_fd(payload.fd) });
                         }
                         tracing::warn!(
                             "Shard {}: migration SPSC full, connection {} lost",

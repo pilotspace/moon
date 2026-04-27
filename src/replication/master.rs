@@ -574,9 +574,7 @@ pub async fn handle_psync_inline_single_shard(
     mut stream: monoio::net::TcpStream,
     repl_state: Arc<RwLock<ReplicationState>>,
     shard_databases: Arc<crate::shard::shared_databases::ShardDatabases>,
-    dispatch_tx: Rc<
-        RefCell<Vec<ringbuf::HeapProd<crate::shard::dispatch::ShardMessage>>>,
-    >,
+    dispatch_tx: Rc<RefCell<Vec<ringbuf::HeapProd<crate::shard::dispatch::ShardMessage>>>>,
     replica_addr: std::net::SocketAddr,
 ) -> anyhow::Result<()> {
     use monoio::io::AsyncWriteRentExt;
@@ -631,8 +629,7 @@ pub async fn handle_psync_inline_single_shard(
                 for db_idx in 0..db_count {
                     guards.push(shard_databases.read_db(0, db_idx));
                 }
-                let refs: Vec<&crate::storage::Database> =
-                    guards.iter().map(|g| &**g).collect();
+                let refs: Vec<&crate::storage::Database> = guards.iter().map(|g| &**g).collect();
                 crate::persistence::redis_rdb::write_rdb_refs(&refs, &mut rdb_buf);
             }
             let header = format!("${}\r\n", rdb_buf.len());
@@ -652,13 +649,8 @@ pub async fn handle_psync_inline_single_shard(
                 }
             }
 
-            register_replica_inline_single_shard(
-                replica_addr,
-                stream,
-                repl_state,
-                dispatch_tx,
-            )
-            .await?;
+            register_replica_inline_single_shard(replica_addr, stream, repl_state, dispatch_tx)
+                .await?;
         }
         PsyncDecision::PartialResync { from_offset } => {
             let response = format!("+CONTINUE {}\r\n", repl_id);
@@ -671,13 +663,8 @@ pub async fn handle_psync_inline_single_shard(
                     wr.map_err(|e| anyhow::anyhow!(e))?;
                 }
             }
-            register_replica_inline_single_shard(
-                replica_addr,
-                stream,
-                repl_state,
-                dispatch_tx,
-            )
-            .await?;
+            register_replica_inline_single_shard(replica_addr, stream, repl_state, dispatch_tx)
+                .await?;
         }
     }
     Ok(())
@@ -696,9 +683,7 @@ async fn register_replica_inline_single_shard(
     addr: std::net::SocketAddr,
     stream: monoio::net::TcpStream,
     repl_state: Arc<RwLock<ReplicationState>>,
-    dispatch_tx: Rc<
-        RefCell<Vec<ringbuf::HeapProd<crate::shard::dispatch::ShardMessage>>>,
-    >,
+    dispatch_tx: Rc<RefCell<Vec<ringbuf::HeapProd<crate::shard::dispatch::ShardMessage>>>>,
 ) -> anyhow::Result<()> {
     use monoio::io::AsyncWriteRentExt;
     use ringbuf::traits::Producer;
@@ -763,9 +748,8 @@ async fn register_replica_inline_single_shard(
     {
         let mut prods = dispatch_tx.borrow_mut();
         if let Some(prod) = prods.get_mut(0) {
-            let _ = prod.try_push(
-                crate::shard::dispatch::ShardMessage::UnregisterReplica { replica_id },
-            );
+            let _ = prod
+                .try_push(crate::shard::dispatch::ShardMessage::UnregisterReplica { replica_id });
         }
     }
     Ok(())

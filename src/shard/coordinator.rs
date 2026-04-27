@@ -714,15 +714,14 @@ pub async fn scatter_vector_search(
             ));
         } else {
             let (reply_tx, reply_rx) = channel::oneshot();
-            let msg = ShardMessage::VectorSearch(Box::new(
-                crate::shard::dispatch::VectorSearchPayload {
+            let msg =
+                ShardMessage::VectorSearch(Box::new(crate::shard::dispatch::VectorSearchPayload {
                     index_name: index_name.clone(),
                     query_blob: query_blob.clone(),
                     k,
                     as_of_lsn,
                     reply_tx,
-                },
-            ));
+                }));
             spsc_send(dispatch_tx, my_shard, shard_id, msg, spsc_notifiers).await;
             receivers.push(reply_rx);
         }
@@ -793,15 +792,14 @@ pub async fn scatter_vector_search_remote(
             continue;
         }
         let (reply_tx, reply_rx) = channel::oneshot();
-        let msg = ShardMessage::VectorSearch(Box::new(
-            crate::shard::dispatch::VectorSearchPayload {
+        let msg =
+            ShardMessage::VectorSearch(Box::new(crate::shard::dispatch::VectorSearchPayload {
                 index_name: index_name.clone(),
                 query_blob: query_blob.clone(),
                 k,
                 as_of_lsn,
                 reply_tx,
-            },
-        ));
+            }));
         spsc_send(dispatch_tx, my_shard, shard_id, msg, spsc_notifiers).await;
         receivers.push(reply_rx);
     }
@@ -1077,8 +1075,8 @@ pub async fn scatter_text_search(
             local_search = Some(response);
         } else {
             let (reply_tx, reply_rx) = channel::oneshot();
-            let msg = ShardMessage::TextSearch(Box::new(
-                crate::shard::dispatch::TextSearchPayload {
+            let msg =
+                ShardMessage::TextSearch(Box::new(crate::shard::dispatch::TextSearchPayload {
                     index_name: index_name.clone(),
                     field_idx,
                     // Send full QueryTerm so remote shard applies the same expansion.
@@ -1092,8 +1090,7 @@ pub async fn scatter_text_search(
                     highlight_opts: highlight_opts.clone(),
                     summarize_opts: summarize_opts.clone(),
                     reply_tx,
-                },
-            ));
+                }));
             spsc_send(dispatch_tx, my_shard, shard_id, msg, spsc_notifiers).await;
             search_receivers.push(reply_rx);
         }

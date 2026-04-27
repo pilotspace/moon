@@ -180,9 +180,9 @@ impl HnswGraph {
     pub fn resident_bytes(&self) -> usize {
         let l0 = self.layer0_neighbors.len() * std::mem::size_of::<u32>();
         let bfs = (self.bfs_order.len() + self.bfs_inverse.len()) * std::mem::size_of::<u32>();
-        let upper = (self.upper_index.len() + self.upper_offsets.len()
-            + self.upper_neighbors.len())
-            * std::mem::size_of::<u32>();
+        let upper =
+            (self.upper_index.len() + self.upper_offsets.len() + self.upper_neighbors.len())
+                * std::mem::size_of::<u32>();
         let lvl = self.levels.len();
         l0 + bfs + upper + lvl
     }

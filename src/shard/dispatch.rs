@@ -564,17 +564,47 @@ mod tests {
     fn print_shard_message_sizes() {
         use std::mem::size_of;
         eprintln!("== ShardMessage layout ==");
-        eprintln!("ShardMessage total           = {}", size_of::<ShardMessage>());
-        eprintln!("  TcpStream                  = {}", size_of::<crate::runtime::TcpStream>());
-        eprintln!("  Arc<Frame>                 = {}", size_of::<std::sync::Arc<Frame>>());
-        eprintln!("  OneshotSender<Frame>       = {}", size_of::<channel::OneshotSender<Frame>>());
-        eprintln!("  ResponseSlotPtr            = {}", size_of::<ResponseSlotPtr>());
+        eprintln!(
+            "ShardMessage total           = {}",
+            size_of::<ShardMessage>()
+        );
+        eprintln!(
+            "  TcpStream                  = {}",
+            size_of::<crate::runtime::TcpStream>()
+        );
+        eprintln!(
+            "  Arc<Frame>                 = {}",
+            size_of::<std::sync::Arc<Frame>>()
+        );
+        eprintln!(
+            "  OneshotSender<Frame>       = {}",
+            size_of::<channel::OneshotSender<Frame>>()
+        );
+        eprintln!(
+            "  ResponseSlotPtr            = {}",
+            size_of::<ResponseSlotPtr>()
+        );
         eprintln!("  Bytes                      = {}", size_of::<Bytes>());
-        eprintln!("  PathBuf                    = {}", size_of::<std::path::PathBuf>());
-        eprintln!("  Vec<(Bytes, Frame)>        = {}", size_of::<Vec<(Bytes, Frame)>>());
-        eprintln!("  Vec<Arc<Frame>>            = {}", size_of::<Vec<std::sync::Arc<Frame>>>());
-        eprintln!("  Vec<(Option<usize>, Vec<String>)> = {}", size_of::<Vec<(Option<usize>, Vec<String>)>>());
-        eprintln!("  Vec<(Bytes, Bytes)>        = {}", size_of::<Vec<(Bytes, Bytes)>>());
+        eprintln!(
+            "  PathBuf                    = {}",
+            size_of::<std::path::PathBuf>()
+        );
+        eprintln!(
+            "  Vec<(Bytes, Frame)>        = {}",
+            size_of::<Vec<(Bytes, Frame)>>()
+        );
+        eprintln!(
+            "  Vec<Arc<Frame>>            = {}",
+            size_of::<Vec<std::sync::Arc<Frame>>>()
+        );
+        eprintln!(
+            "  Vec<(Option<usize>, Vec<String>)> = {}",
+            size_of::<Vec<(Option<usize>, Vec<String>)>>()
+        );
+        eprintln!(
+            "  Vec<(Bytes, Bytes)>        = {}",
+            size_of::<Vec<(Bytes, Bytes)>>()
+        );
         eprintln!("  Vec<u16>                   = {}", size_of::<Vec<u16>>());
     }
 

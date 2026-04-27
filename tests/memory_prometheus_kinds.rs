@@ -122,15 +122,12 @@ fn redis_cli(port: u16, args: &[&str]) -> Option<String> {
 /// Scrape the `/metrics` endpoint via raw HTTP/1.1 over TCP.
 /// Returns the body (after HTTP headers) or None on connection failure.
 fn scrape_metrics(admin_port: u16) -> Option<String> {
-    let mut stream =
-        std::net::TcpStream::connect_timeout(
-            &format!("127.0.0.1:{admin_port}").parse().unwrap(),
-            Duration::from_secs(2),
-        )
-        .ok()?;
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .ok()?;
+    let mut stream = std::net::TcpStream::connect_timeout(
+        &format!("127.0.0.1:{admin_port}").parse().unwrap(),
+        Duration::from_secs(2),
+    )
+    .ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
     stream
         .write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
         .ok()?;

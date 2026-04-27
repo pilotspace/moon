@@ -545,9 +545,10 @@ pub(super) fn try_handle_psync(
     };
     {
         let g = rs.read().ok();
-        let is_master = g.as_ref().map(|g| {
-            matches!(g.role, crate::replication::state::ReplicationRole::Master)
-        }).unwrap_or(false);
+        let is_master = g
+            .as_ref()
+            .map(|g| matches!(g.role, crate::replication::state::ReplicationRole::Master))
+            .unwrap_or(false);
         if !is_master {
             responses.push(Frame::Error(Bytes::from_static(
                 b"ERR PSYNC is only valid on a master",
@@ -559,9 +560,7 @@ pub(super) fn try_handle_psync(
         }
     }
     let repl_id = match &cmd_args[0] {
-        Frame::BulkString(b) | Frame::SimpleString(b) => {
-            String::from_utf8_lossy(b).into_owned()
-        }
+        Frame::BulkString(b) | Frame::SimpleString(b) => String::from_utf8_lossy(b).into_owned(),
         _ => {
             responses.push(Frame::Error(Bytes::from_static(
                 b"ERR PSYNC: invalid replid",

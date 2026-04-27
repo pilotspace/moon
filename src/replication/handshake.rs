@@ -291,7 +291,9 @@ mod tests {
         state.set_role(ReplicationRole::Replica {
             host: "127.0.0.1".to_string(),
             port: 6379,
-            state: ReplicaHandshakeState::FullResyncLoading { shards_remaining: 2 },
+            state: ReplicaHandshakeState::FullResyncLoading {
+                shards_remaining: 2,
+            },
         });
         let info = build_info_replication(&state);
         assert!(info.contains("master_link_status:down\r\n"));
