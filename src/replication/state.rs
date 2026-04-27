@@ -96,6 +96,20 @@ impl ReplicationState {
         }
     }
 
+    /// Total resident bytes across all per-shard replication backlogs.
+    /// Returns 0 if no backlogs have been allocated (lazy init).
+    /// O(num_shards) -- one lock acquire per shard (uncontended on metrics scrape).
+    pub fn backlog_resident_bytes(&self) -> usize {
+        let mut total: usize = 0;
+        for slot in &self.per_shard_backlogs {
+            let guard = slot.lock();
+            if let Some(ref backlog) = *guard {
+                total += backlog.resident_bytes();
+            }
+        }
+        total
+    }
+
     /// Increment the offset for the given shard by delta bytes.
     /// Also adds delta to master_repl_offset.
     pub fn increment_shard_offset(&self, shard_id: usize, delta: u64) {

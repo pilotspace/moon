@@ -66,6 +66,14 @@ impl ReplicationBacklog {
     pub fn end_offset(&self) -> u64 {
         self.end_offset
     }
+
+    /// Resident bytes used by the backlog ring buffer.
+    /// Returns the allocated capacity of the VecDeque (not current length).
+    /// O(1), zero allocation.
+    #[inline]
+    pub fn resident_bytes(&self) -> usize {
+        self.buf.capacity()
+    }
 }
 
 #[cfg(test)]

@@ -203,6 +203,13 @@ impl WalWriterV3 {
         &self.wal_dir
     }
 
+    /// Resident bytes used by in-memory WAL buffers (NOT on-disk segment files).
+    /// Returns the capacity of the write buffer. O(1), zero allocation.
+    #[inline]
+    pub fn resident_bytes(&self) -> usize {
+        self.buf.capacity()
+    }
+
     /// Configure minimum and maximum WAL size bounds for recycling.
     ///
     /// - `min_bytes`: recycling stops when remaining WAL would drop below this.

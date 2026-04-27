@@ -127,11 +127,10 @@ impl CsrStorage {
     /// For Heap: row_offsets + col_indices + edge_meta + node_meta Vec allocations.
     /// For Mmap: the mmap region length (kernel page-cache resident).
     pub fn resident_bytes(&self) -> usize {
-        let rows = self.row_offsets().len() * std::mem::size_of::<u32>();
-        let cols = self.col_indices().len() * std::mem::size_of::<u32>();
-        let edges = self.edge_meta().len() * std::mem::size_of::<EdgeMeta>();
-        let nodes = self.node_meta().len() * std::mem::size_of::<NodeMeta>();
-        rows + cols + edges + nodes
+        std::mem::size_of_val(self.row_offsets())
+            + std::mem::size_of_val(self.col_indices())
+            + std::mem::size_of_val(self.edge_meta())
+            + std::mem::size_of_val(self.node_meta())
     }
 
     /// Created LSN for this segment.
