@@ -238,6 +238,21 @@ impl<V> DashTable<CompactKey, V> {
         self.segments.len()
     }
 
+    /// Resident bytes used by the DashTable structural overhead (segments +
+    /// directory + index map). Does NOT include per-entry key/value data --
+    /// that is tracked separately by `Database::used_memory`.
+    ///
+    /// O(1): `segment_count * size_of::<Segment>() + directory.len() * 8 + index_map overhead`.
+    #[inline]
+    pub fn resident_bytes(&self) -> usize {
+        let seg_bytes =
+            self.segments.len() * std::mem::size_of::<Segment<CompactKey, V>>();
+        let dir_bytes = self.directory.len() * std::mem::size_of::<usize>();
+        let idx_bytes =
+            self.segments.len() * std::mem::size_of::<(u32, u32)>();
+        seg_bytes + dir_bytes + idx_bytes
+    }
+
     /// Return an immutable reference to a segment by storage index.
     ///
     /// # Panics

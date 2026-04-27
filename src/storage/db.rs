@@ -157,6 +157,14 @@ impl Database {
         self.used_memory
     }
 
+    /// Resident bytes attributed to this database (alias for `estimated_memory`,
+    /// kept distinct so observability call sites use the canonical name).
+    /// O(1), zero allocation -- reads the per-shard `used_memory` accumulator.
+    #[inline]
+    pub fn resident_bytes(&self) -> usize {
+        self.used_memory
+    }
+
     /// Get an entry by key, performing lazy expiration.
     ///
     /// Returns `None` if the key does not exist or has expired.
