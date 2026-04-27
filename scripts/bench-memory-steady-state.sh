@@ -111,7 +111,9 @@ start_server() {
         --port "$PORT" \
         --admin-port "$ADMIN_PORT" \
         --shards "$SHARDS" \
-        --disk-offload disable &>/dev/null &
+        --disk-offload disable \
+        --appendonly no \
+        --protected-mode no &>/dev/null &
     SERVER_PID=$!
 
     wait_for_server
@@ -127,32 +129,58 @@ populate_workload() {
         -c 50 -P 16 -q &>/dev/null
 
     log "Creating vector index (HNSW, dim=$VEC_DIM, FLOAT32, L2)..."
-    redis-cli -p "$PORT" FT.CREATE memidx SCHEMA v VECTOR HNSW 6 \
+    redis-cli -p "$PORT" FT.CREATE memidx ON HASH PREFIX 1 vec: SCHEMA v VECTOR HNSW 6 \
         TYPE FLOAT32 DIM "$VEC_DIM" DISTANCE_METRIC L2 >/dev/null
 
-    # Generate a fixed 16-dim float32 blob (64 bytes hex) for all vectors.
-    # We care about memory accounting, not vector entropy.
-    local blob
-    blob=$(python3 -c "
-import struct
-vals = [float(i) / 100.0 for i in range($VEC_DIM)]
-print(''.join(struct.pack('<f', v).hex() for v in vals))
-")
-
-    log "Populating $NUM_VECTORS vector docs via redis-cli pipe..."
-    # Pipe commands into single redis-cli to avoid 10K forks.
+    log "Populating $NUM_VECTORS vector docs + $NUM_GRAPH_NODES graph nodes via python3..."
+    # Use python3 with raw socket to send proper binary vector data.
+    # redis-cli cannot send raw binary blobs from stdin easily.
     # Individual HSET (not pipelined) so auto-indexing fires per doc.
-    { for i in $(seq 1 "$NUM_VECTORS"); do
-        echo "HSET vec:$i v $blob"
-    done; } | redis-cli -p "$PORT" --pipe-mode >/dev/null 2>&1 || \
-    { for i in $(seq 1 "$NUM_VECTORS"); do
-        echo "HSET vec:$i v $blob"
-    done; } | redis-cli -p "$PORT" >/dev/null 2>&1
+    local py_script="/tmp/moon-bench-populate.py"
+    cat > "$py_script" << 'PYEOF'
+import socket, struct, sys
 
-    log "Populating $NUM_GRAPH_NODES graph nodes..."
-    { for i in $(seq 1 "$NUM_GRAPH_NODES"); do
-        echo "GRAPH.QUERY memg \"CREATE (a:N {id:$i})\""
-    done; } | redis-cli -p "$PORT" >/dev/null 2>&1
+def send_resp(sock, parts):
+    """Send a RESP command with mixed str/bytes args and read response."""
+    msg = ("*%d\r\n" % len(parts)).encode()
+    for p in parts:
+        if isinstance(p, bytes):
+            msg += ("$%d\r\n" % len(p)).encode() + p + b"\r\n"
+        else:
+            s = str(p)
+            msg += ("$%d\r\n%s\r\n" % (len(s), s)).encode()
+    sock.sendall(msg)
+    resp = b""
+    while b"\r\n" not in resp:
+        resp += sock.recv(4096)
+
+port = int(sys.argv[1])
+num_vectors = int(sys.argv[2])
+vec_dim = int(sys.argv[3])
+num_graph = int(sys.argv[4])
+
+sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+sock.connect(("127.0.0.1", port))
+sock.settimeout(30)
+
+# Insert vectors: float32 binary blobs
+blob = struct.pack("<" + "f" * vec_dim, *[float(i) / 100.0 for i in range(vec_dim)])
+
+for i in range(1, num_vectors + 1):
+    send_resp(sock, ["HSET", "vec:%d" % i, "v", blob])
+    if i % 2000 == 0:
+        print("  vectors: %d/%d" % (i, num_vectors), file=sys.stderr)
+
+# Insert graph nodes: GRAPH.CREATE first, then GRAPH.ADDNODE
+send_resp(sock, ["GRAPH.CREATE", "memg"])
+for i in range(1, num_graph + 1):
+    send_resp(sock, ["GRAPH.ADDNODE", "memg", ":N"])
+
+sock.close()
+print("Done: %d vectors + %d graph nodes" % (num_vectors, num_graph), file=sys.stderr)
+PYEOF
+    python3 "$py_script" "$PORT" "$NUM_VECTORS" "$VEC_DIM" "$NUM_GRAPH_NODES" 2>&1 | \
+        while read -r line; do log "  $line"; done
 
     log "Workload populated. Waiting ${STEADY_STATE_WAIT}s for steady state..."
     sleep "$STEADY_STATE_WAIT"
@@ -188,45 +216,79 @@ capture_snapshot() {
     log "RSS = $rss_bytes bytes"
 
     # --- Parse MEMORY DOCTOR ---
-    # Lines look like: "  DashTable + entries:    12345  (12.3%)"
-    # Map display names to JSON keys
-    local -A doctor_values
-    doctor_values[dashtable]=$(grep -i "DashTable" "$doctor_file" | grep -oE '[0-9]+ +\(' | grep -oE '[0-9]+' | head -1 || echo 0)
-    doctor_values[hnsw]=$(grep -i "HNSW" "$doctor_file" | grep -oE '[0-9]+ +\(' | grep -oE '[0-9]+' | head -1 || echo 0)
-    doctor_values[csr]=$(grep -i "CSR" "$doctor_file" | grep -oE '[0-9]+ +\(' | grep -oE '[0-9]+' | head -1 || echo 0)
-    doctor_values[wal]=$(grep -i "WAL" "$doctor_file" | grep -oE '[0-9]+ +\(' | grep -oE '[0-9]+' | head -1 || echo 0)
-    doctor_values[sealed]=$(grep -i "Sealed" "$doctor_file" | grep -oE '[0-9]+ +\(' | grep -oE '[0-9]+' | head -1 || echo 0)
-    doctor_values[replication_backlog]=$(grep -i "Replication" "$doctor_file" | grep -oE '[0-9]+ +\(' | grep -oE '[0-9]+' | head -1 || echo 0)
-    doctor_values[allocator_overhead]=$(grep -i "Allocator" "$doctor_file" | grep -oE '[0-9]+ +\(' | grep -oE '[0-9]+' | head -1 || echo 0)
+    # Lines look like: "  DashTable + entries:    24.74 KB  (0.3%)"
+    # or "  WAL writers:            0 B  (0.0%)"
+    # We parse the humanized byte value and convert back to bytes.
+    parse_doctor_bytes() {
+        local pattern="$1"
+        local line
+        line=$(grep -i "$pattern" "$doctor_file" | head -1 || echo "")
+        if [[ -z "$line" ]]; then
+            echo 0
+            return
+        fi
+        # Extract the value + unit before the parenthesized percentage
+        # Format: "  Label:    12.34 KB  (0.3%)" or "  Label:    0 B  (0.0%)"
+        python3 -c "
+import re
+line = '''$line'''
+# Match number (possibly float) followed by unit before '('
+m = re.search(r'([\d.]+)\s+(B|KB|MB|GB|TB)\s+\(', line)
+if not m:
+    print(0)
+else:
+    val = float(m.group(1))
+    unit = m.group(2)
+    multipliers = {'B': 1, 'KB': 1024, 'MB': 1048576, 'GB': 1073741824, 'TB': 1099511627776}
+    print(int(val * multipliers.get(unit, 1)))
+"
+    }
+
+    local doc_dashtable doc_hnsw doc_csr doc_wal doc_sealed doc_repl doc_alloc
+    doc_dashtable=$(parse_doctor_bytes "DashTable")
+    doc_hnsw=$(parse_doctor_bytes "HNSW")
+    doc_csr=$(parse_doctor_bytes "CSR")
+    doc_wal=$(parse_doctor_bytes "WAL")
+    doc_sealed=$(parse_doctor_bytes "Sealed")
+    doc_repl=$(parse_doctor_bytes "Replication")
+    doc_alloc=$(parse_doctor_bytes "Allocator overhead")
 
     # --- Parse Prometheus /metrics ---
     # Lines: moon_memory_bytes{kind="dashtable"} 1234.0
-    local -A prom_values
-    for kind in dashtable hnsw csr wal sealed replication_backlog allocator_overhead; do
+    parse_prom_bytes() {
+        local kind="$1"
         local val
         val=$(grep "kind=\"${kind}\"" "$metrics_file" | awk '{print $2}' | head -1 || echo "0")
-        # Prometheus may emit float; truncate to integer
-        prom_values[$kind]=$(python3 -c "print(int(float('${val:-0}')))")
-    done
+        python3 -c "print(int(float('${val:-0}')))"
+    }
+
+    local prom_dashtable prom_hnsw prom_csr prom_wal prom_sealed prom_repl prom_alloc
+    prom_dashtable=$(parse_prom_bytes "dashtable")
+    prom_hnsw=$(parse_prom_bytes "hnsw")
+    prom_csr=$(parse_prom_bytes "csr")
+    prom_wal=$(parse_prom_bytes "wal")
+    prom_sealed=$(parse_prom_bytes "sealed")
+    prom_repl=$(parse_prom_bytes "replication_backlog")
+    prom_alloc=$(parse_prom_bytes "allocator_overhead")
 
     # --- Build JSON ---
     local snapshot
     snapshot=$(jq -n \
         --argjson rss "$rss_bytes" \
-        --argjson dt_d "${doctor_values[dashtable]:-0}" \
-        --argjson dt_p "${prom_values[dashtable]:-0}" \
-        --argjson hnsw_d "${doctor_values[hnsw]:-0}" \
-        --argjson hnsw_p "${prom_values[hnsw]:-0}" \
-        --argjson csr_d "${doctor_values[csr]:-0}" \
-        --argjson csr_p "${prom_values[csr]:-0}" \
-        --argjson wal_d "${doctor_values[wal]:-0}" \
-        --argjson wal_p "${prom_values[wal]:-0}" \
-        --argjson sealed_d "${doctor_values[sealed]:-0}" \
-        --argjson sealed_p "${prom_values[sealed]:-0}" \
-        --argjson rb_d "${doctor_values[replication_backlog]:-0}" \
-        --argjson rb_p "${prom_values[replication_backlog]:-0}" \
-        --argjson ao_d "${doctor_values[allocator_overhead]:-0}" \
-        --argjson ao_p "${prom_values[allocator_overhead]:-0}" \
+        --argjson dt_d "${doc_dashtable}" \
+        --argjson dt_p "${prom_dashtable}" \
+        --argjson hnsw_d "${doc_hnsw}" \
+        --argjson hnsw_p "${prom_hnsw}" \
+        --argjson csr_d "${doc_csr}" \
+        --argjson csr_p "${prom_csr}" \
+        --argjson wal_d "${doc_wal}" \
+        --argjson wal_p "${prom_wal}" \
+        --argjson sealed_d "${doc_sealed}" \
+        --argjson sealed_p "${prom_sealed}" \
+        --argjson rb_d "${doc_repl}" \
+        --argjson rb_p "${prom_repl}" \
+        --argjson ao_d "${doc_alloc}" \
+        --argjson ao_p "${prom_alloc}" \
         '{
             rss: $rss,
             kinds: {
