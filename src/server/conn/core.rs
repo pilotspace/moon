@@ -50,6 +50,12 @@ pub(crate) struct ConnectionContext {
     pub aof_tx: Option<channel::MpscSender<AofMessage>>,
     pub tracking_table: Rc<RefCell<TrackingTable>>,
     pub repl_state: Option<Arc<StdRwLock<crate::replication::state::ReplicationState>>>,
+    /// Lock-free mirror of `repl_state.role == Replica { .. }`.
+    /// Populated once in `new()` (from `repl_state.read()`), kept in sync
+    /// thereafter by `ReplicationState::set_role()`. Read on every command
+    /// dispatch by `try_enforce_readonly` to avoid the per-command RwLock CAS.
+    /// `None` when replication is disabled entirely.
+    pub is_replica_mirror: Option<Arc<std::sync::atomic::AtomicBool>>,
     pub cluster_state: Option<Arc<StdRwLock<crate::cluster::ClusterState>>>,
     pub lua: Rc<mlua::Lua>,
     pub script_cache: Rc<RefCell<crate::scripting::ScriptCache>>,
@@ -116,6 +122,15 @@ impl ConnectionContext {
         spill_file_id: Rc<std::cell::Cell<u64>>,
         disk_offload_dir: Option<std::path::PathBuf>,
     ) -> Self {
+        // Snapshot the lock-free is_replica mirror from ReplicationState so
+        // try_enforce_readonly can avoid taking the RwLock per command.
+        // The Arc is cloned out under the read-lock once at connection setup;
+        // ReplicationState::set_role() updates the same AtomicBool thereafter.
+        let is_replica_mirror = repl_state.as_ref().and_then(|rs| {
+            rs.read()
+                .ok()
+                .map(|guard| guard.is_replica_mirror.clone())
+        });
         Self {
             shard_databases,
             shard_id,
@@ -126,6 +141,7 @@ impl ConnectionContext {
             aof_tx,
             tracking_table,
             repl_state,
+            is_replica_mirror,
             cluster_state,
             lua,
             script_cache,

@@ -1851,6 +1851,16 @@ pub(crate) fn wal_append_and_fanout(
     repl_state: &Option<Arc<RwLock<ReplicationState>>>,
     shard_id: usize,
 ) {
+    // S3.5b (2026-04-27): hot-path bypass when nothing actually has work.
+    // ARM perf annotate showed `repl_backlog.lock()` (caslb/casab) and
+    // `repl_state.read()` (RwLock CAS) were ~21% of CPU on 8-shard SET p=64
+    // even with `--appendonly no` and zero replicas connected. The criterion
+    // is fully derivable from the inputs — no flags or shared state needed.
+    // Skipping leaves shard_offset un-advanced; that is fine since with no
+    // WAL and no replicas the offsets are dead bytes (no consumer exists).
+    if wal_writer.is_none() && wal_v3_writer.is_none() && replica_txs.is_empty() {
+        return;
+    }
     // WAL v3 supersedes v2 — skip v2 append when v3 is active to avoid
     // double-write overhead (2 write syscalls per SPSC drain batch).
     if let Some(w3) = wal_v3_writer {
@@ -1903,5 +1913,66 @@ pub(crate) fn extract_command_static(
             Some((name, &args[1..]))
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod wal_append_tests {
+    use super::*;
+    use crate::replication::backlog::{ReplicationBacklog, SharedBacklog};
+
+    /// S3.5b: when there is no WAL writer and no connected replica, the
+    /// function must skip the backlog `Mutex::lock()` and the `repl_state`
+    /// `RwLock::read()` entirely. We assert this indirectly by allocating
+    /// the backlog and checking that its end_offset stays at 0 — the bypass
+    /// returns before the backlog append.
+    #[test]
+    fn test_wal_append_bypass_when_no_writers_no_replicas() {
+        let backlog: SharedBacklog =
+            std::sync::Arc::new(parking_lot::Mutex::new(Some(ReplicationBacklog::new(1024))));
+        let initial_end = backlog.lock().as_ref().unwrap().end_offset();
+
+        wal_append_and_fanout(
+            b"hello",
+            &mut None, // no v2 writer
+            &mut None, // no v3 writer
+            &backlog,
+            &[],   // no replicas
+            &None, // no repl_state
+            0,
+        );
+
+        let final_end = backlog.lock().as_ref().unwrap().end_offset();
+        assert_eq!(
+            final_end, initial_end,
+            "bypass must skip backlog append when no writers and no replicas"
+        );
+    }
+
+    /// S3.5b: when a replica is connected (replica_txs non-empty), the
+    /// bypass must NOT trigger — the backlog must still receive bytes so
+    /// partial resync continues to work after this optimization.
+    #[test]
+    fn test_wal_append_writes_backlog_when_replicas_present() {
+        let backlog: SharedBacklog =
+            std::sync::Arc::new(parking_lot::Mutex::new(Some(ReplicationBacklog::new(1024))));
+        let (tx, _rx) = crate::runtime::channel::mpsc_unbounded::<bytes::Bytes>();
+        let replica_txs = vec![(1u64, tx)];
+
+        wal_append_and_fanout(
+            b"hello",
+            &mut None,
+            &mut None,
+            &backlog,
+            &replica_txs,
+            &None,
+            0,
+        );
+
+        let end = backlog.lock().as_ref().unwrap().end_offset();
+        assert_eq!(
+            end, 5,
+            "backlog must receive 5 bytes when at least one replica is connected"
+        );
     }
 }

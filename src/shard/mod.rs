@@ -371,6 +371,7 @@ mod tests {
         let script_cache = Rc::new(RefCell::new(crate::scripting::ScriptCache::new()));
         let clock = CachedClock::new();
         let mut vs = crate::vector::store::VectorStore::new();
+        let backlog = std::sync::Arc::new(parking_lot::Mutex::new(None));
         spsc_handler::drain_spsc_shared(
             &shard_databases,
             &mut [cons],
@@ -380,7 +381,7 @@ mod tests {
             &mut snap_state,
             &mut wal_w,
             &mut None, // wal_v3_writer
-            &mut None,
+            &backlog,
             &mut Vec::new(),
             &None,
             0,
@@ -425,6 +426,7 @@ mod tests {
         let script_cache = Rc::new(RefCell::new(crate::scripting::ScriptCache::new()));
         let clock = CachedClock::new();
         let mut vs = crate::vector::store::VectorStore::new();
+        let backlog = std::sync::Arc::new(parking_lot::Mutex::new(None));
         spsc_handler::drain_spsc_shared(
             &shard_databases,
             &mut [cons],
@@ -434,7 +436,7 @@ mod tests {
             &mut snap_state,
             &mut wal_w,
             &mut None, // wal_v3_writer
-            &mut None,
+            &backlog,
             &mut Vec::new(),
             &None,
             0,

@@ -243,10 +243,10 @@ pub struct FtHybridPayload {
 ///
 /// Before boxing, `TextSearch` packed `HashMap<String, u32>` + `Vec<QueryTerm>`
 /// + smallvec fields inline at ~280 bytes, driving the entire `ShardMessage`
-/// enum past 288 B and fragmenting every SPSC ring slot across 5 cache lines.
-/// Boxing moves the payload to the heap and collapses the variant to a single
-/// pointer (16 B incl. discriminant) so the ring slot stays within 2 cache
-/// lines when the hot slotted variants are enqueued.
+///   enum past 288 B and fragmenting every SPSC ring slot across 5 cache lines.
+///   Boxing moves the payload to the heap and collapses the variant to a single
+///   pointer (16 B incl. discriminant) so the ring slot stays within 2 cache
+///   lines when the hot slotted variants are enqueued.
 pub struct TextSearchPayload {
     pub index_name: Bytes,
     pub field_idx: Option<usize>,
