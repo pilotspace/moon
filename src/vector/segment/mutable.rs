@@ -575,6 +575,14 @@ impl MutableSegment {
         self.inner.read().entries.is_empty()
     }
 
+    /// Resident bytes used by in-memory buffers (TQ codes, QJL signs,
+    /// residual norms, raw f32 vectors, sub-centroid signs, entries).
+    /// O(1) -- reads the running `byte_size` counter.
+    #[inline]
+    pub fn resident_bytes(&self) -> usize {
+        self.inner.read().byte_size
+    }
+
     /// Iterate live (non-deleted) entries, calling `f(key_hash, f32_vector, norm)` for each.
     /// Used by `force_compact` to merge multiple segments into one.
     /// Requires the mutable segment to retain `raw_f32` (BuildMode::Light or higher).

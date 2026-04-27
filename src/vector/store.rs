@@ -589,6 +589,29 @@ impl VectorStore {
         &mut self.txn_manager
     }
 
+    /// Resident bytes split into `(mutable_bytes, immutable_bytes)` across
+    /// all vector indexes on this shard.
+    ///
+    /// Mutable = brute-force buffers (TQ codes + raw f32 + entries).
+    /// Immutable = HNSW graphs + TQ codes + QJL + norms + MVCC headers.
+    /// O(index_count * segment_count) -- acceptable for metrics scrape cadence.
+    pub fn resident_bytes(&self) -> (usize, usize) {
+        let mut total_mutable: usize = 0;
+        let mut total_immutable: usize = 0;
+        for idx in self.indexes.values() {
+            let (m, i) = idx.segments.resident_bytes();
+            total_mutable += m;
+            total_immutable += i;
+            // Additional named fields beyond the default field.
+            for fs in idx.field_segments.values() {
+                let (m2, i2) = fs.segments.resident_bytes();
+                total_mutable += m2;
+                total_immutable += i2;
+            }
+        }
+        (total_mutable, total_immutable)
+    }
+
     /// Attach recovered segments from persistence. Called by shard restore.
     ///
     /// Stores recovered collections in pending_segments, keyed by collection_id.

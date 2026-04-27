@@ -174,6 +174,19 @@ impl HnswGraph {
         self.bytes_per_code
     }
 
+    /// Resident bytes used by the HNSW graph structure (layer-0 neighbors,
+    /// BFS order/inverse, upper-layer CSR, levels). Does NOT include TQ
+    /// vector data -- that is tracked separately by the owning segment.
+    pub fn resident_bytes(&self) -> usize {
+        let l0 = self.layer0_neighbors.len() * std::mem::size_of::<u32>();
+        let bfs = (self.bfs_order.len() + self.bfs_inverse.len()) * std::mem::size_of::<u32>();
+        let upper = (self.upper_index.len() + self.upper_offsets.len()
+            + self.upper_neighbors.len())
+            * std::mem::size_of::<u32>();
+        let lvl = self.levels.len();
+        l0 + bfs + upper + lvl
+    }
+
     /// Get layer-0 neighbors for a BFS-reordered node position.
     /// Returns a slice of m0 u32s (may contain SENTINEL for unfilled slots).
     #[inline]

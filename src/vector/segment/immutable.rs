@@ -394,6 +394,18 @@ impl ImmutableSegment {
         self.total_count
     }
 
+    /// Resident bytes used by this immutable segment: HNSW graph structure +
+    /// TQ vector codes + QJL signs + residual norms + sub-centroid signs + MVCC headers.
+    pub fn resident_bytes(&self) -> usize {
+        let graph = self.graph.resident_bytes();
+        let tq = self.vectors_tq.len() * std::mem::size_of::<u8>();
+        let qjl = self.qjl_signs.len();
+        let norms = self.residual_norms.len() * std::mem::size_of::<f32>();
+        let sub = self.sub_centroid_signs.len();
+        let mvcc = self.mvcc.len() * std::mem::size_of::<MvccHeader>();
+        graph + tq + qjl + norms + sub + mvcc
+    }
+
     /// Fraction of dead entries: (total - live) / total.
     pub fn dead_fraction(&self) -> f32 {
         if self.total_count == 0 {
