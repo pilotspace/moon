@@ -93,6 +93,7 @@ async fn start_txn_server(num_shards: usize) -> (u16, CancellationToken) {
         slowlog_log_slower_than: 10000,
         slowlog_max_len: 128,
         check_config: false,
+        initial_keyspace_hint: 0,
         maxclients: 10000,
         timeout: 0,
         tcp_keepalive: 300,

@@ -87,6 +87,7 @@ fn build_config(port: u16, num_shards: usize) -> ServerConfig {
         slowlog_log_slower_than: 10000,
         slowlog_max_len: 128,
         check_config: false,
+        initial_keyspace_hint: 0,
         maxclients: 10000,
         timeout: 0,
         tcp_keepalive: 300,
