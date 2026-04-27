@@ -5,7 +5,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use metrics::{counter, gauge, histogram};
+use metrics::{counter, describe_gauge, gauge, histogram, Unit};
 
 static METRICS_INITIALIZED: AtomicBool = AtomicBool::new(false);
 static SERVER_READY: AtomicBool = AtomicBool::new(false);
@@ -88,9 +88,40 @@ pub fn init_metrics(
             #[cfg(feature = "console")]
             rate_limit_burst,
         );
+        // Register per-subsystem memory gauge and prime all 7 labels so
+        // disabled subsystems still surface a zero-valued series.
+        describe_gauge!(
+            "moon_memory_bytes",
+            Unit::Bytes,
+            "Resident bytes per subsystem; sum approximates RSS"
+        );
+        prime_moon_memory_bytes();
+
         Some(ready)
     } else {
         None
+    }
+}
+
+/// Prime all 7 `moon_memory_bytes{kind=...}` series with `0.0` so they
+/// appear in `/metrics` output from the first scrape, even when subsystems
+/// are feature-gated off or not yet initialized.
+///
+/// NOTE: This scrape path intentionally does NOT call `mallctl("epoch")`.
+/// See the documented jemalloc leak at the `get_rss_bytes()` doc-comment
+/// (~1 MB / 20 s growth). `allocator_overhead` is computed as
+/// `max(0, RSS − sum(other 6))` — the same formula MEMORY DOCTOR uses.
+fn prime_moon_memory_bytes() {
+    for kind in [
+        "dashtable",
+        "hnsw",
+        "csr",
+        "wal",
+        "sealed",
+        "replication_backlog",
+        "allocator_overhead",
+    ] {
+        gauge!("moon_memory_bytes", "kind" => kind).set(0.0);
     }
 }
 
