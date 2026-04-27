@@ -653,6 +653,7 @@ if should_run "connection"; then
     assert_moon_ok "DBSIZE"            DBSIZE
     assert_moon_ok "COMMAND"           COMMAND
     assert_moon_ok "COMMAND COUNT"     COMMAND COUNT
+    assert_moon_contains "MEMORY DOCTOR" "Per-subsystem (resident):" MEMORY DOCTOR
 fi
 
 # ===========================================================================

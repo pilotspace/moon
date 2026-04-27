@@ -1264,6 +1264,9 @@ else
     echo "    12-shard: $MQ_DLQ_RESULT_12"
 fi
 
+# MEMORY DOCTOR: Moon-specific schema, not parity-tested against Redis.
+# Coverage: integration test tests/memory_doctor_response.rs + test-commands.sh.
+
 # Restart moon with the originally-requested shard count so summary works.
 start_moon_with_shards "$SHARDS" || true
 
