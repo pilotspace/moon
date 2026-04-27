@@ -513,6 +513,8 @@ fn main() -> anyhow::Result<()> {
 
     // All shards recovered — mark server as ready for /readyz.
     moon::admin::metrics_setup::set_server_ready();
+    // Register global ShardDatabases for MEMORY DOCTOR + Prometheus per-kind gauges.
+    moon::admin::metrics_setup::set_global_shard_databases(&shard_databases);
     if let Some(ref flag) = readiness_flag {
         flag.store(true, std::sync::atomic::Ordering::Relaxed);
         tracing::info!("All shards ready — /readyz returning 200");
