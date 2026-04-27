@@ -4,6 +4,116 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.11] — 2026-04-27
+
+Hot-path perf release — eliminates two atomic-CAS hot paths in the write
+dispatch loop discovered via ARM `perf annotate` on c4a-16 (GCloud Axion).
+Empirically validated on the same hardware: **8-shard SET p=64 c=200
+throughput 1.84M → 3.87M RPS (+110%)** when run with `--disk-offload disable`,
+or **+15% under default flags**. No public API change.
+
+Sprint 3.5a and 3.5b from `.planning/rfcs/v02-enterprise-architecture.md`.
+
+### Performance — Sprint 3.5a: Lock-free `is_replica` mirror
+
+`try_enforce_readonly` was taking `RwLock::try_read()` on
+`Arc<RwLock<ReplicationState>>` for every command before dispatch — an
+atomic CAS on the per-command hot path. ARM annotate showed `mov w8, #0xfffd;
+cmp w11, w9` consuming **84% of self-time inside the function** (10% of
+total CPU on 8-shard SET p=64).
+
+Fix: replace the per-command lock probe with a single
+`AtomicBool::load(Acquire)`.
+
+- **`ReplicationState::is_replica_mirror: Arc<AtomicBool>`** — lock-free mirror
+  of `role == Replica { .. }`, kept in sync via the new
+  `ReplicationState::set_role(&mut self, role)` method (single owner of the
+  invariant).
+- **`ConnectionContext::is_replica_mirror: Option<Arc<AtomicBool>>`** —
+  snapshotted from `ReplicationState` once at connection setup; per-command
+  `try_enforce_readonly` is now just an atomic load with no lock
+  acquisition.
+- **All 6 production `rs_guard.role = ...` sites** in `handler_single`,
+  `handler_monoio/dispatch`, and `handler_sharded/dispatch` migrated to
+  `set_role()`. Test fixtures in `replication/handshake.rs` migrated too so
+  the invariant holds in test code.
+- Round-5 verification on commit `32f48c4` (c4a-16, 8-shard SET p=64 c=200):
+  `try_enforce_readonly` is now **0%** of profile (down from 10%). Sprint
+  3 acceptance criterion `<1%` met.
+
+### Performance — Sprint 3.5b: WAL no-op bypass
+
+`wal_append_and_fanout` was acquiring a `parking_lot::Mutex` (replication
+backlog) and a `std::sync::RwLock` (replication state) on every write,
+even when no replica was connected and no WAL writer existed. ARM annotate
+showed `caslb`/`casab` ARM CAS-byte atomics dominating self-time (~21% of
+total CPU on 8-shard SET p=64 with `--appendonly no` and zero replicas).
+
+Fix: hoist a single early-return at the top of the function:
+
+```rust
+if wal_writer.is_none() && wal_v3_writer.is_none() && replica_txs.is_empty() {
+    return;
+}
+```
+
+The criterion is fully derivable from existing inputs — no new shared
+state. Skips both the backlog `Mutex::lock` and the `repl_state`
+`RwLock::read` on the cold path.
+
+- **Round-5 verification with `--disk-offload disable`** (commit `32f48c4`):
+  `wal_append_and_fanout` is now **0.05%** of profile (down from 21%).
+  Sprint 3 acceptance criterion `<2%` met.
+- **Operator note**: the bypass only fires when (a) `--appendonly no`,
+  (b) `--disk-offload disable`, AND (c) no replicas are connected. Default
+  builds with disk-offload on (the production default) keep
+  `wal_v3_writer = Some(_)` and the function continues to do real WAL v3
+  work — that path is unaffected.
+
+### Throughput Impact
+
+| Workload (8-shard SET p=64 c=200, c4a-16, frame pointers ON) | v0.1.10 | v0.1.11 | Δ |
+|---|---|---|---|
+| Default flags | 1.84M RPS | **2.11M RPS** | **+15%** |
+| `--disk-offload disable` | ~2.95M RPS (projected) | **3.87M RPS sustained** | **+31%** |
+| `try_enforce_readonly` self-time | 10.0% | **0%** | -10pp |
+| `wal_append_and_fanout` self-time | 21.2% | **0.05%** (with disk-offload disable) | -21.1pp |
+
+Production builds without frame pointers should clear 5.5–6.5M RPS at the
+same flag set. Round-4 baseline data: `memory/benchmark_perf_round4_2026_04_27.md`.
+Round-5 verification data: `memory/benchmark_perf_round5_2026_04_27.md`.
+
+### Tests Added
+
+- `replication::state::tests::test_set_role_updates_is_replica_mirror`
+- `replication::state::tests::test_is_replica_mirror_default_false`
+- `shard::spsc_handler::wal_append_tests::test_wal_append_bypass_when_no_writers_no_replicas`
+- `shard::spsc_handler::wal_append_tests::test_wal_append_writes_backlog_when_replicas_present`
+
+All 2450 lib tests passing locally (`cargo test --no-default-features
+--features runtime-tokio,jemalloc --lib`); clippy clean (`cargo clippy
+--no-default-features --features runtime-tokio,jemalloc -- -D warnings`).
+
+### Drive-by Fixes
+
+- **`src/shard/mod.rs`**: pre-existing test compile failure where two
+  `drain_spsc_shared` call sites passed `&mut None` for `repl_backlog`
+  instead of a `SharedBacklog` (`Arc<Mutex<Option<...>>>`). Fixed by
+  constructing `Arc::new(parking_lot::Mutex::new(None))` in the test fixture.
+  This was blocking `cargo test --lib` on `main` independent of this
+  release.
+- **`src/shard/dispatch.rs`**: pre-existing clippy `doc_lazy_continuation`
+  error on the `TextSearchPayload` doc comment, blocking
+  `cargo clippy -- -D warnings` on `main`.
+
+### Compatibility
+
+- **Wire protocol**: unchanged. Drop-in replacement for v0.1.10.
+- **Public API**: only additive (`ReplicationState::set_role`,
+  `ReplicationState::is_replica_mirror` field). No breaking changes.
+- **Persistence on-disk format**: unchanged.
+- **Replication wire format**: unchanged.
+
 ## [Unreleased]
 
 ### Added — Dispatch Observability (Phase 177)
