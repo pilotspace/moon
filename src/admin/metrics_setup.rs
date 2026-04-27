@@ -1147,6 +1147,102 @@ pub fn spawn_metrics_publisher() {
     });
 }
 
+// ── Per-subsystem memory gauge publisher ─────────────────────────────
+
+/// Spawn a background task that updates the `moon_memory_bytes{kind=...}`
+/// gauge every 15 seconds from the `resident_bytes()` accessors added in
+/// Phase 190-01.
+///
+/// Must be called from within a tokio runtime context (the admin-http
+/// thread). Requires `set_global_shard_databases()` to have been called
+/// first — the function tolerates a missing handle by emitting 0 for all
+/// subsystem kinds until the global is registered.
+///
+/// NOTE: This loop does NOT call `mallctl("epoch")` — see the documented
+/// jemalloc leak at `get_rss_bytes()` (~1 MB / 20 s). `allocator_overhead`
+/// is computed as `max(0, RSS − sum(other 6))`, the same formula MEMORY
+/// DOCTOR uses.
+pub fn spawn_moon_memory_publisher() {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
+
+        loop {
+            interval.tick().await;
+
+            if !METRICS_INITIALIZED.load(Ordering::Relaxed) {
+                continue;
+            }
+
+            update_moon_memory_bytes();
+        }
+    });
+}
+
+/// Collect per-subsystem resident bytes and emit all 7
+/// `moon_memory_bytes{kind=...}` series plus `moon_rss_bytes`.
+///
+/// Called every 15 s by `spawn_moon_memory_publisher`. Allocation-free in
+/// the steady state — all label values are `&'static str`.
+fn update_moon_memory_bytes() {
+    let rss = get_rss_bytes() as usize;
+
+    let mut dashtable: usize = 0;
+    let mut hnsw: usize = 0;
+    let mut sealed: usize = 0;
+    #[cfg_attr(not(feature = "graph"), allow(unused_mut))]
+    let mut csr: usize = 0;
+    let wal: usize = 0; // WalWriterV3 is stack-owned; not reachable here
+    let mut backlog: usize = 0;
+
+    if let Some(shard_dbs) = get_global_shard_databases() {
+        let num_shards = shard_dbs.num_shards();
+        for shard_id in 0..num_shards {
+            // Database + DashTable (DB 0 — the hot database)
+            let db_guard = shard_dbs.read_db(shard_id, 0);
+            dashtable += db_guard.resident_bytes();
+            dashtable += db_guard.data().resident_bytes();
+            drop(db_guard);
+
+            // VectorStore: (mutable/hnsw, immutable/sealed)
+            let vs = shard_dbs.vector_store(shard_id);
+            let (m, i) = vs.resident_bytes();
+            hnsw += m;
+            sealed += i;
+            drop(vs);
+
+            // GraphStore (CSR)
+            #[cfg(feature = "graph")]
+            {
+                let gs = shard_dbs.graph_store_read(shard_id);
+                csr += gs.resident_bytes();
+            }
+        }
+    }
+
+    // Replication backlog via global state.
+    if let Some(state) = get_global_repl_state_arc() {
+        if let Ok(guard) = state.read() {
+            backlog = guard.backlog_resident_bytes();
+        }
+    }
+
+    let other_sum = dashtable + hnsw + csr + wal + sealed + backlog;
+    let alloc_overhead = rss.saturating_sub(other_sum);
+
+    gauge!("moon_memory_bytes", "kind" => "dashtable").set(dashtable as f64);
+    gauge!("moon_memory_bytes", "kind" => "hnsw").set(hnsw as f64);
+    gauge!("moon_memory_bytes", "kind" => "csr").set(csr as f64);
+    gauge!("moon_memory_bytes", "kind" => "wal").set(wal as f64);
+    gauge!("moon_memory_bytes", "kind" => "sealed").set(sealed as f64);
+    gauge!("moon_memory_bytes", "kind" => "replication_backlog").set(backlog as f64);
+    gauge!("moon_memory_bytes", "kind" => "allocator_overhead").set(alloc_overhead as f64);
+
+    // Update the existing RSS gauge in the same snapshot so the integration
+    // test can compare moon_memory_bytes sum against moon_rss_bytes from the
+    // same scrape (no drift between separate reads).
+    update_rss_bytes(rss as u64);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

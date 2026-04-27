@@ -789,6 +789,10 @@ pub fn spawn_admin_server(
                     crate::admin::metrics_setup::spawn_metrics_publisher();
                 }
 
+                // Per-subsystem memory gauge publisher (15 s tick).
+                // Not console-gated — always active when admin port is enabled.
+                crate::admin::metrics_setup::spawn_moon_memory_publisher();
+
                 loop {
                     let (stream, peer) = match listener.accept().await {
                         Ok(c) => c,
