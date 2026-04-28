@@ -59,6 +59,22 @@ pub enum InsertResult<K, V> {
     NeedsSplit(K, V),
 }
 
+/// Result of `Segment::insert_or_update_at`. The DashTable layer translates
+/// this to `InsertOrUpdate<V>` after the slot lookup is borrow-checker-safe.
+///
+/// Generic over `F` and `G` so that on `NeedsSplit` the unconsumed closures
+/// are returned to the caller for retry after splitting.
+pub enum SegmentInsertOrUpdate<F, G> {
+    /// New entry written at this slot.
+    Inserted { slot: usize },
+    /// Existing entry at this slot was passed to the update closure.
+    Updated { slot: usize },
+    /// Segment is at LOAD_THRESHOLD and the key is new — caller must split & retry.
+    /// The unconsumed closures are returned so the caller can retry without
+    /// re-constructing them.
+    NeedsSplit { update: F, make: G },
+}
+
 /// A segment holding up to 60 key-value pairs with Swiss Table control bytes.
 ///
 /// Memory layout (cache-line optimized):
@@ -75,6 +91,9 @@ pub struct Segment<K, V> {
     // --- Cache line 1+: metadata ---
     count: u32,
     depth: u32,
+    /// Cumulative SIMD probe count for perf instrumentation (test-only).
+    #[cfg(test)]
+    probe_count: u32,
     // --- Remaining cache lines: key/value data (accessed only on H2 hit) ---
     keys: [MaybeUninit<K>; TOTAL_SLOTS],
     values: [MaybeUninit<V>; TOTAL_SLOTS],
@@ -128,6 +147,8 @@ impl<K, V> Segment<K, V> {
             ctrl,
             count: 0,
             depth,
+            #[cfg(test)]
+            probe_count: 0,
             keys,
             values,
         }
@@ -528,6 +549,251 @@ impl<K, V> Segment<K, V> {
         self.keys[slot] = MaybeUninit::new(key);
         self.values[slot] = MaybeUninit::new(value);
         self.count += 1;
+    }
+
+    /// Return the cumulative SIMD probe count (test-only instrumentation).
+    #[cfg(test)]
+    pub fn probe_count(&self) -> u32 {
+        self.probe_count
+    }
+
+    /// Increment the probe counter (test-only instrumentation).
+    #[cfg(test)]
+    #[inline]
+    fn bump_probe_count(&mut self) {
+        self.probe_count += 1;
+    }
+
+    /// No-op in non-test builds.
+    #[cfg(not(test))]
+    #[inline(always)]
+    fn bump_probe_count(&mut self) {}
+
+    /// Single-probe find OR insert. Fuses the `find` + `insert` paths into a
+    /// single pass over the control byte groups, eliminating the redundant second
+    /// probe that `get_mut` + `insert` would perform on a miss.
+    ///
+    /// On hit: invokes `update(&mut existing_value)` in place.
+    /// On miss + room: calls `make()` to produce `(K, V)`, writes to a free slot.
+    /// On miss + full: returns `NeedsSplit` with the unconsumed closures.
+    ///
+    /// Hot path: one `match_h2` + one `match_empty_or_deleted` per group scanned.
+    #[allow(unused_unsafe)] // prefetch_ptr is unsafe on x86_64 but safe on aarch64
+    pub fn insert_or_update_at<Q: ?Sized, F, G>(
+        &mut self,
+        h2: u8,
+        key_lookup: &Q,
+        bucket_a: usize,
+        bucket_b: usize,
+        update: F,
+        make: G,
+    ) -> SegmentInsertOrUpdate<F, G>
+    where
+        K: Borrow<Q> + Eq,
+        Q: Eq,
+        F: FnOnce(&mut V),
+        G: FnOnce() -> (K, V),
+    {
+        // Track the first free slot found during our scan so we can reuse it on miss.
+        let mut first_free: Option<usize> = None;
+
+        // --- Group A: the home group for bucket_a ---
+        let group_a = bucket_a / 16;
+        let base_a = group_a * 16;
+
+        // SAFETY: group_a < NUM_GROUPS (bucket_a < REGULAR_SLOTS, 16 per group).
+        // SSE2 is baseline on x86_64; Group is 16-byte aligned and initialized.
+        #[cfg(target_arch = "x86_64")]
+        let mask_a = unsafe { self.ctrl[group_a].match_h2(h2) };
+        #[cfg(not(target_arch = "x86_64"))]
+        let mask_a = self.ctrl[group_a].match_h2(h2);
+        self.bump_probe_count();
+
+        // Prefetch key data for first h2 match
+        if let Some(first_pos) = mask_a.lowest_set_bit() {
+            let prefetch_slot = base_a + first_pos;
+            if prefetch_slot < TOTAL_SLOTS {
+                // SAFETY: prefetch_slot < TOTAL_SLOTS, so keys[prefetch_slot] is in bounds.
+                // Prefetch is a hint — no memory safety requirement on the data being initialized.
+                unsafe { prefetch_ptr(self.keys[prefetch_slot].as_ptr() as *const u8); }
+            }
+        }
+
+        for pos in mask_a {
+            let slot = base_a + pos;
+            if slot < TOTAL_SLOTS {
+                // SAFETY: ctrl byte matches h2 (a FULL value), so the slot is initialized.
+                // Mirrors find at segment.rs:277.
+                let k = unsafe { self.keys[slot].assume_init_ref() };
+                if k.borrow() == key_lookup {
+                    // SAFETY: ctrl byte matches h2 and key compares equal (mirrors find at
+                    // segment.rs:277), so values[slot] is initialized.
+                    let v = unsafe { self.values[slot].assume_init_mut() };
+                    update(v);
+                    return SegmentInsertOrUpdate::Updated { slot };
+                }
+            }
+        }
+
+        // SAFETY: group_a < NUM_GROUPS. SSE2 is baseline on x86_64.
+        // Group is 16-byte aligned and initialized at segment creation.
+        #[cfg(target_arch = "x86_64")]
+        let free_mask_a = unsafe { self.ctrl[group_a].match_empty_or_deleted() };
+        #[cfg(not(target_arch = "x86_64"))]
+        let free_mask_a = self.ctrl[group_a].match_empty_or_deleted();
+        self.bump_probe_count();
+
+        if let Some(pos) = free_mask_a.lowest_set_bit() {
+            let slot = base_a + pos;
+            if slot < TOTAL_SLOTS && first_free.is_none() {
+                first_free = Some(slot);
+            }
+        }
+
+        // --- Group B: the home group for bucket_b (if different) ---
+        let group_b = bucket_b / 16;
+        if group_b != group_a {
+            let base_b = group_b * 16;
+
+            // SAFETY: group_b < NUM_GROUPS (bucket_b < REGULAR_SLOTS).
+            // SSE2 is baseline on x86_64; Group is 16-byte aligned and initialized.
+            #[cfg(target_arch = "x86_64")]
+            let mask_b = unsafe { self.ctrl[group_b].match_h2(h2) };
+            #[cfg(not(target_arch = "x86_64"))]
+            let mask_b = self.ctrl[group_b].match_h2(h2);
+            self.bump_probe_count();
+
+            if let Some(first_pos) = mask_b.lowest_set_bit() {
+                let prefetch_slot = base_b + first_pos;
+                if prefetch_slot < TOTAL_SLOTS {
+                    // SAFETY: prefetch_slot < TOTAL_SLOTS, so keys[prefetch_slot] is in bounds.
+                    // Prefetch is a hint — no memory safety requirement on the data being initialized.
+                    unsafe { prefetch_ptr(self.keys[prefetch_slot].as_ptr() as *const u8); }
+                }
+            }
+
+            for pos in mask_b {
+                let slot = base_b + pos;
+                if slot < TOTAL_SLOTS {
+                    // SAFETY: ctrl byte matches h2 (mirrors find at segment.rs:277).
+                    let k = unsafe { self.keys[slot].assume_init_ref() };
+                    if k.borrow() == key_lookup {
+                        // SAFETY: key match confirmed (mirrors find at segment.rs:277).
+                        let v = unsafe { self.values[slot].assume_init_mut() };
+                        update(v);
+                        return SegmentInsertOrUpdate::Updated { slot };
+                    }
+                }
+            }
+
+            // SAFETY: group_b < NUM_GROUPS. SSE2 is baseline on x86_64.
+            // Group is 16-byte aligned and initialized at segment creation.
+            #[cfg(target_arch = "x86_64")]
+            let free_mask_b = unsafe { self.ctrl[group_b].match_empty_or_deleted() };
+            #[cfg(not(target_arch = "x86_64"))]
+            let free_mask_b = self.ctrl[group_b].match_empty_or_deleted();
+            self.bump_probe_count();
+
+            if first_free.is_none() {
+                if let Some(pos) = free_mask_b.lowest_set_bit() {
+                    let slot = base_b + pos;
+                    if slot < TOTAL_SLOTS {
+                        first_free = Some(slot);
+                    }
+                }
+            }
+        }
+
+        // --- Stash slots (56..60): linear scan for h2 matches ---
+        for slot in REGULAR_SLOTS..TOTAL_SLOTS {
+            let ctrl = self.ctrl_byte(slot);
+            if ctrl == h2 {
+                // SAFETY: ctrl byte matches h2 (mirrors find at segment.rs:277).
+                let k = unsafe { self.keys[slot].assume_init_ref() };
+                if k.borrow() == key_lookup {
+                    // SAFETY: key match confirmed (mirrors find at segment.rs:277).
+                    let v = unsafe { self.values[slot].assume_init_mut() };
+                    update(v);
+                    return SegmentInsertOrUpdate::Updated { slot };
+                }
+            } else if (ctrl == EMPTY || ctrl == DELETED) && first_free.is_none() {
+                first_free = Some(slot);
+            }
+        }
+
+        // --- Fallback: scan remaining groups for h2 matches (rare overflow path) ---
+        // This handles keys placed in non-home groups during high occupancy or
+        // split redistribution (mirrors find at segment.rs:333-361).
+        for g in 0..NUM_GROUPS {
+            if g == group_a || g == group_b {
+                continue;
+            }
+            let base = g * 16;
+
+            // SAFETY: g is bounded by NUM_GROUPS. SSE2 is baseline on x86_64.
+            // Group is 16-byte aligned and initialized at segment creation.
+            #[cfg(target_arch = "x86_64")]
+            let mask = unsafe { self.ctrl[g].match_h2(h2) };
+            #[cfg(not(target_arch = "x86_64"))]
+            let mask = self.ctrl[g].match_h2(h2);
+            self.bump_probe_count();
+
+            for pos in mask {
+                let slot = base + pos;
+                if slot < REGULAR_SLOTS {
+                    // SAFETY: ctrl byte matches h2 -> slot is initialized
+                    // (mirrors find at segment.rs:277).
+                    let k = unsafe { self.keys[slot].assume_init_ref() };
+                    if k.borrow() == key_lookup {
+                        // SAFETY: key match confirmed (mirrors find at segment.rs:277).
+                        let v = unsafe { self.values[slot].assume_init_mut() };
+                        update(v);
+                        return SegmentInsertOrUpdate::Updated { slot };
+                    }
+                }
+            }
+
+            // Also check for free slots in fallback groups
+            if first_free.is_none() {
+                // SAFETY: g is bounded by NUM_GROUPS. SSE2 is baseline on x86_64.
+                // Group is 16-byte aligned and initialized at segment creation.
+                #[cfg(target_arch = "x86_64")]
+                let free_mask = unsafe { self.ctrl[g].match_empty_or_deleted() };
+                #[cfg(not(target_arch = "x86_64"))]
+                let free_mask = self.ctrl[g].match_empty_or_deleted();
+                self.bump_probe_count();
+
+                if let Some(pos) = free_mask.lowest_set_bit() {
+                    let slot = base + pos;
+                    if slot < TOTAL_SLOTS {
+                        first_free = Some(slot);
+                    }
+                }
+            }
+        }
+
+        // --- Key not found: decide insert vs NeedsSplit ---
+        if self.is_full() {
+            return SegmentInsertOrUpdate::NeedsSplit { update, make };
+        }
+
+        // We have room. Use the first free slot found, or do a linear scan.
+        let free_slot = first_free.unwrap_or_else(|| {
+            // Last resort: linear scan for any free slot (should rarely happen
+            // since we scanned all groups above, but handles edge cases).
+            for slot in 0..TOTAL_SLOTS {
+                let ctrl = self.ctrl_byte(slot);
+                if ctrl == EMPTY || ctrl == DELETED {
+                    return slot;
+                }
+            }
+            // Should never reach here since !is_full() guarantees a free slot.
+            unreachable!("Segment not full but no free slot found")
+        });
+
+        let (k, v) = make();
+        self.write_slot(free_slot, h2, k, v);
+        SegmentInsertOrUpdate::Inserted { slot: free_slot }
     }
 
     /// Remove a key from the segment.
@@ -977,5 +1243,160 @@ mod tests {
             InsertResult::Replaced(_) => "Replaced",
             InsertResult::NeedsSplit(_, _) => "NeedsSplit",
         }
+    }
+
+    #[test]
+    fn test_segment_insert_or_update_at_inserts_new_key() {
+        let mut seg: Segment<Vec<u8>, String> = Segment::new(0);
+        let k = b"new_key".to_vec();
+        let hash = simple_hash(&k);
+        let h2_val = h2(hash);
+        let (ba, bb) = home_buckets(hash);
+
+        let mut update_called = false;
+        let result = seg.insert_or_update_at(
+            h2_val,
+            k.as_slice(),
+            ba,
+            bb,
+            |_v: &mut String| {
+                update_called = true;
+            },
+            || (k.clone(), "new_value".to_string()),
+        );
+        assert!(matches!(result, SegmentInsertOrUpdate::Inserted { .. }));
+        assert!(!update_called, "update closure must NOT run on miss");
+        assert_eq!(seg.count(), 1);
+        assert_eq!(
+            seg.get(h2_val, k.as_slice(), ba, bb),
+            Some(&"new_value".to_string())
+        );
+    }
+
+    #[test]
+    fn test_segment_insert_or_update_at_updates_existing_key() {
+        let mut seg: Segment<Vec<u8>, String> = Segment::new(0);
+        let k = b"existing".to_vec();
+        let hash = simple_hash(&k);
+        let h2_val = h2(hash);
+        let (ba, bb) = home_buckets(hash);
+        seg.insert(h2_val, k.clone(), "old".to_string(), ba, bb);
+
+        let mut make_called = false;
+        let result = seg.insert_or_update_at(
+            h2_val,
+            k.as_slice(),
+            ba,
+            bb,
+            |v: &mut String| *v = format!("{}_updated", v),
+            || {
+                make_called = true;
+                (k.clone(), "should_not_be_used".to_string())
+            },
+        );
+        assert!(matches!(result, SegmentInsertOrUpdate::Updated { .. }));
+        assert!(!make_called, "make closure must NOT run on hit");
+        assert_eq!(seg.count(), 1, "Updated must NOT grow count");
+        assert_eq!(
+            seg.get(h2_val, k.as_slice(), ba, bb),
+            Some(&"old_updated".to_string())
+        );
+    }
+
+    #[test]
+    fn test_segment_insert_or_update_at_returns_needs_split_on_full() {
+        let mut seg: Segment<Vec<u8>, u32> = Segment::new(0);
+        let mut inserted = 0u32;
+        for i in 0..LOAD_THRESHOLD as u32 {
+            let k = format!("k_{:04}", i).into_bytes();
+            let hash = simple_hash(&k);
+            let h2_val = h2(hash);
+            let (ba, bb) = home_buckets(hash);
+            match seg.insert(h2_val, k, i, ba, bb) {
+                InsertResult::Inserted => inserted += 1,
+                _ => break,
+            }
+        }
+        assert!(inserted >= 1);
+
+        // New key on a full segment must return NeedsSplit, NOT Inserted.
+        let new_k = b"trigger_split".to_vec();
+        let hash = simple_hash(&new_k);
+        let h2_val = h2(hash);
+        let (ba, bb) = home_buckets(hash);
+        let result = seg.insert_or_update_at(
+            h2_val,
+            new_k.as_slice(),
+            ba,
+            bb,
+            |_| panic!("update on miss-into-full"),
+            || (new_k.clone(), 999u32),
+        );
+        assert!(
+            matches!(result, SegmentInsertOrUpdate::NeedsSplit { .. }),
+            "Expected NeedsSplit on full segment with new key"
+        );
+    }
+
+    #[test]
+    fn test_segment_insert_or_update_at_updates_existing_on_full() {
+        // Even when the segment is at LOAD_THRESHOLD, updating an existing
+        // key must return Updated (NOT NeedsSplit).
+        let mut seg: Segment<Vec<u8>, u32> = Segment::new(0);
+        let target_key = b"update_me".to_vec();
+        let target_hash = simple_hash(&target_key);
+        let target_h2 = h2(target_hash);
+        let (target_ba, target_bb) = home_buckets(target_hash);
+        seg.insert(target_h2, target_key.clone(), 42, target_ba, target_bb);
+
+        // Fill the rest up to LOAD_THRESHOLD
+        let mut i = 0u32;
+        while (seg.count() as usize) < LOAD_THRESHOLD {
+            let k = format!("fill_{:06}", i).into_bytes();
+            let hash = simple_hash(&k);
+            let h2_val = h2(hash);
+            let (ba, bb) = home_buckets(hash);
+            seg.insert(h2_val, k, i, ba, bb);
+            i += 1;
+        }
+        assert!(seg.is_full());
+
+        // Update the existing key — must work even though segment is full
+        let result = seg.insert_or_update_at(
+            target_h2,
+            target_key.as_slice(),
+            target_ba,
+            target_bb,
+            |v| *v = 99,
+            || panic!("make should not be called on update"),
+        );
+        assert!(matches!(result, SegmentInsertOrUpdate::Updated { .. }));
+        assert_eq!(
+            seg.get(target_h2, target_key.as_slice(), target_ba, target_bb),
+            Some(&99)
+        );
+    }
+
+    #[test]
+    fn test_segment_insert_or_update_at_probes_at_most_two_groups_on_miss() {
+        // On an empty segment, insert_or_update_at should scan at most 2 groups
+        // for h2 + 2 for empty = 4 SIMD probes. With fallback groups it can go
+        // up to 6. Assert ≤ 6.
+        let mut seg: Segment<Vec<u8>, u32> = Segment::new(0);
+        let probes_before = seg.probe_count();
+        let k = b"probe_test".to_vec();
+        let hash = simple_hash(&k);
+        let h2_val = h2(hash);
+        let (ba, bb) = home_buckets(hash);
+        let _ = seg.insert_or_update_at(h2_val, k.as_slice(), ba, bb, |_| {}, || {
+            (k.clone(), 1u32)
+        });
+        let probes_after = seg.probe_count();
+        let delta = probes_after - probes_before;
+        assert!(
+            delta <= 6,
+            "insert_or_update_at on empty segment did {} SIMD probes; expected <= 6",
+            delta
+        );
     }
 }
