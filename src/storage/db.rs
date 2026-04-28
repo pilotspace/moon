@@ -6,7 +6,7 @@ pub use super::db_read::{HashRef, ListRef, SetRef, SortedSetRef};
 use super::bptree::BPTree;
 use super::compact_key::CompactKey;
 use super::compact_value::{CompactValue, RedisValueRef};
-use super::dashtable::DashTable;
+use super::dashtable::{DashTable, InsertOrUpdate};
 use super::entry::{CachedClock, Entry, RedisValue, current_secs, current_time_ms};
 use super::intset::Intset;
 use super::stream::Stream as StreamData;
@@ -246,32 +246,46 @@ impl Database {
 
     /// Insert or replace an entry, tracking memory and version.
     ///
-    /// Fast path (key exists): one `get_mut` probe, mutate in place. No
-    /// separate `insert` call — the Swiss-table SIMD lookup runs once instead
-    /// of twice. Retains the old `CompactKey` slot, which avoids re-allocating
-    /// an identical heap key.
-    ///
-    /// Slow path (new key): one `get_mut` miss + one `insert`. Miss is a cheap
-    /// SIMD match-mask scan that finds nothing and returns.
-    pub fn set(&mut self, key: Bytes, mut entry: Entry) {
+    /// Uses `DashTable::insert_or_update` for a single SIMD probe on both hit
+    /// and miss paths. The old `get_mut` + `insert` pattern ran two probes on
+    /// miss (PERF-08).
+    pub fn set(&mut self, key: Bytes, entry: Entry) {
         let new_cost = entry_overhead(&key, &entry);
         let has_expiry = entry.has_expiry();
-        if let Some(old_entry) = self.data.get_mut(key.as_ref()) {
-            let old_cost = entry_overhead(&key, old_entry);
-            let new_version = old_entry.version() + 1;
-            entry.set_version(new_version);
-            self.used_memory = self.used_memory.saturating_sub(old_cost) + new_cost;
-            if has_expiry {
-                self.maybe_has_expiring_keys = true;
+        let mut old_cost: usize = 0;
+
+        // Cell enables interior mutability through shared references, allowing
+        // both closures to capture &entry_cell without conflicting &mut borrows.
+        // Exactly one closure runs (FnOnce), so the take() is safe.
+        let entry_cell = std::cell::Cell::new(Some(entry));
+
+        let result = self.data.insert_or_update(
+            CompactKey::from(key.clone()), // Bytes::clone is a refcount bump, not deep copy
+            |existing: &mut Entry| {
+                // Hit path: replace existing entry, bump version.
+                let new_entry = entry_cell.take().expect("update closure called once");
+                old_cost = entry_overhead(&key, existing);
+                let new_version = existing.version() + 1;
+                *existing = new_entry;
+                existing.set_version(new_version);
+            },
+            || {
+                // Miss path: insert entry as-is (version defaults to 0).
+                entry_cell.take().expect("make closure called once on miss")
+            },
+        );
+
+        match result {
+            InsertOrUpdate::Updated(_) => {
+                self.used_memory = self.used_memory.saturating_sub(old_cost) + new_cost;
             }
-            *old_entry = entry;
-            return;
+            InsertOrUpdate::Inserted(_) => {
+                self.used_memory += new_cost;
+            }
         }
-        self.used_memory += new_cost;
         if has_expiry {
             self.maybe_has_expiring_keys = true;
         }
-        self.data.insert(CompactKey::from(key), entry);
     }
 
     /// Clear all entries and reset memory accounting.

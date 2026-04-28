@@ -26,7 +26,15 @@ pub mod simd;
 use super::compact_key::CompactKey;
 
 use iter::{Iter, IterMut, Keys, Values};
-use segment::{InsertResult, Segment, h2, home_buckets};
+use segment::{InsertResult, Segment, SegmentInsertOrUpdate, h2, home_buckets};
+
+/// Outcome of [`DashTable::insert_or_update`].
+pub enum InsertOrUpdate<'a, V> {
+    /// Key was new and has just been inserted.
+    Inserted(&'a mut V),
+    /// Key existed; the user-supplied closure was invoked.
+    Updated(&'a mut V),
+}
 
 /// Compute the xxh64 hash of a byte slice.
 #[inline]
@@ -358,6 +366,108 @@ impl<V> DashTable<CompactKey, V> {
                 // Split the segment, then retry insert
                 self.split_segment(dir_idx);
                 self.insert(key, value)
+            }
+        }
+    }
+
+    /// Find OR insert in a single SIMD probe (vs two for `get_mut` + `insert`).
+    ///
+    /// On hit: `update(&mut existing)` runs in place; returns `Updated`.
+    /// On miss: `make_value()` produces the new value, then it's inserted at the
+    /// already-located free slot in the segment that was just probed.
+    ///
+    /// On `NeedsSplit`: split the segment, then retry. The segment helper returns
+    /// the unconsumed closures so we can reuse them after the split.
+    pub fn insert_or_update<F, G>(
+        &mut self,
+        key: CompactKey,
+        update: F,
+        make_value: G,
+    ) -> InsertOrUpdate<'_, V>
+    where
+        F: FnOnce(&mut V),
+        G: FnOnce() -> V,
+    {
+        let hash = hash_key(key.as_ref());
+        let dir_idx = segment_index(hash, self.depth);
+        let seg_idx = self.directory[dir_idx];
+
+        // Prefetch segment data while computing h2/home buckets
+        prefetch_segment(self.segments.get(seg_idx));
+
+        let h2_val = h2(hash);
+        let (ba, bb) = home_buckets(hash);
+
+        // The key_ref borrow must not overlap with the move into `make`.
+        // We pass key_lookup as &[u8] to the segment helper, and wrap `key`
+        // into the `make` closure so it's only consumed on miss.
+        // key.as_ref() returns &[u8] — we need to hold the borrow before
+        // moving key into the closure. Use a raw pointer to break the overlap.
+        let key_ptr = key.as_ref().as_ptr();
+        let key_len = key.as_ref().len();
+
+        let segment = self.segments.get_mut(seg_idx);
+        // SAFETY: key_ptr/key_len from key.as_ref() are valid for key's lifetime.
+        // key moves into `make` closure which runs AFTER the scan completes.
+        let key_lookup = unsafe { std::slice::from_raw_parts(key_ptr, key_len) };
+
+        let outcome = segment.insert_or_update_at(
+            h2_val,
+            key_lookup,
+            ba,
+            bb,
+            update,
+            move || (key, make_value()),
+        );
+
+        match outcome {
+            SegmentInsertOrUpdate::Inserted { slot } => {
+                self.len += 1;
+                // SAFETY: just-inserted slot has a FULL ctrl byte and an initialized
+                // value (mirrors find at segment.rs:277 — FULL ctrl => values[slot]
+                // initialized).
+                InsertOrUpdate::Inserted(unsafe { self.segments.get_mut(seg_idx).value_mut(slot) })
+            }
+            SegmentInsertOrUpdate::Updated { slot } => {
+                // SAFETY: matched-and-updated slot has a FULL ctrl byte
+                // (mirrors find at segment.rs:277).
+                InsertOrUpdate::Updated(unsafe { self.segments.get_mut(seg_idx).value_mut(slot) })
+            }
+            SegmentInsertOrUpdate::NeedsSplit { update, make } => {
+                // Split the segment, then retry via the normal insert path.
+                // The closures were not consumed by the segment helper.
+                self.split_segment(dir_idx);
+
+                // After split, the directory may have doubled and the key now
+                // routes to a different segment. Recompute.
+                let new_dir_idx = segment_index(hash, self.depth);
+                let new_seg_idx = self.directory[new_dir_idx];
+                let new_segment = self.segments.get_mut(new_seg_idx);
+
+                let retry = new_segment.insert_or_update_at(
+                    h2_val, key_lookup, ba, bb, update, make,
+                );
+
+                match retry {
+                    SegmentInsertOrUpdate::Inserted { slot } => {
+                        self.len += 1;
+                        // SAFETY: just-inserted (mirrors find at segment.rs:277).
+                        InsertOrUpdate::Inserted(unsafe {
+                            self.segments.get_mut(new_seg_idx).value_mut(slot)
+                        })
+                    }
+                    SegmentInsertOrUpdate::Updated { slot } => {
+                        // SAFETY: matched-and-updated (mirrors find at segment.rs:277).
+                        InsertOrUpdate::Updated(unsafe {
+                            self.segments.get_mut(new_seg_idx).value_mut(slot)
+                        })
+                    }
+                    SegmentInsertOrUpdate::NeedsSplit { .. } => {
+                        // A single split guarantees room (LOAD_THRESHOLD < TOTAL_SLOTS
+                        // and split halves the load). This path should be unreachable.
+                        unreachable!("double NeedsSplit after split_segment")
+                    }
+                }
             }
         }
     }
