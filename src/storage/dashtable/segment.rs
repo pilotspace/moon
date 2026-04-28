@@ -715,7 +715,9 @@ impl<K, V> Segment<K, V> {
             if prefetch_slot < TOTAL_SLOTS {
                 // SAFETY: prefetch_slot < TOTAL_SLOTS, so keys[prefetch_slot] is in bounds.
                 // Prefetch is a hint — no memory safety requirement on the data being initialized.
-                unsafe { prefetch_ptr(self.keys[prefetch_slot].as_ptr() as *const u8); }
+                unsafe {
+                    prefetch_ptr(self.keys[prefetch_slot].as_ptr() as *const u8);
+                }
             }
         }
 
@@ -768,7 +770,9 @@ impl<K, V> Segment<K, V> {
                 if prefetch_slot < TOTAL_SLOTS {
                     // SAFETY: prefetch_slot < TOTAL_SLOTS, so keys[prefetch_slot] is in bounds.
                     // Prefetch is a hint — no memory safety requirement on the data being initialized.
-                    unsafe { prefetch_ptr(self.keys[prefetch_slot].as_ptr() as *const u8); }
+                    unsafe {
+                        prefetch_ptr(self.keys[prefetch_slot].as_ptr() as *const u8);
+                    }
                 }
             }
 
@@ -829,53 +833,53 @@ impl<K, V> Segment<K, V> {
         // non-home group, so the scan cannot find a match. Still need to find a
         // free slot for insertion below, but the home groups already provided one.
         if self.has_non_home_keys {
-        for g in 0..NUM_GROUPS {
-            if g == group_a || g == group_b {
-                continue;
-            }
-            let base = g * 16;
-
-            // SAFETY: g is bounded by NUM_GROUPS. SSE2 is baseline on x86_64.
-            // Group is 16-byte aligned and initialized at segment creation.
-            #[cfg(target_arch = "x86_64")]
-            let mask = unsafe { self.ctrl[g].match_h2(h2) };
-            #[cfg(not(target_arch = "x86_64"))]
-            let mask = self.ctrl[g].match_h2(h2);
-            self.bump_probe_count();
-
-            for pos in mask {
-                let slot = base + pos;
-                if slot < REGULAR_SLOTS {
-                    // SAFETY: ctrl byte matches h2 -> slot is initialized
-                    // (mirrors find at segment.rs:277).
-                    let k = unsafe { self.keys[slot].assume_init_ref() };
-                    if k.borrow() == key_lookup {
-                        // SAFETY: key match confirmed (mirrors find at segment.rs:277).
-                        let v = unsafe { self.values[slot].assume_init_mut() };
-                        update(v);
-                        return SegmentInsertOrUpdate::Updated { slot };
-                    }
+            for g in 0..NUM_GROUPS {
+                if g == group_a || g == group_b {
+                    continue;
                 }
-            }
+                let base = g * 16;
 
-            // Also check for free slots in fallback groups
-            if first_free.is_none() {
                 // SAFETY: g is bounded by NUM_GROUPS. SSE2 is baseline on x86_64.
                 // Group is 16-byte aligned and initialized at segment creation.
                 #[cfg(target_arch = "x86_64")]
-                let free_mask = unsafe { self.ctrl[g].match_empty_or_deleted() };
+                let mask = unsafe { self.ctrl[g].match_h2(h2) };
                 #[cfg(not(target_arch = "x86_64"))]
-                let free_mask = self.ctrl[g].match_empty_or_deleted();
+                let mask = self.ctrl[g].match_h2(h2);
                 self.bump_probe_count();
 
-                if let Some(pos) = free_mask.lowest_set_bit() {
+                for pos in mask {
                     let slot = base + pos;
-                    if slot < TOTAL_SLOTS {
-                        first_free = Some(slot);
+                    if slot < REGULAR_SLOTS {
+                        // SAFETY: ctrl byte matches h2 -> slot is initialized
+                        // (mirrors find at segment.rs:277).
+                        let k = unsafe { self.keys[slot].assume_init_ref() };
+                        if k.borrow() == key_lookup {
+                            // SAFETY: key match confirmed (mirrors find at segment.rs:277).
+                            let v = unsafe { self.values[slot].assume_init_mut() };
+                            update(v);
+                            return SegmentInsertOrUpdate::Updated { slot };
+                        }
+                    }
+                }
+
+                // Also check for free slots in fallback groups
+                if first_free.is_none() {
+                    // SAFETY: g is bounded by NUM_GROUPS. SSE2 is baseline on x86_64.
+                    // Group is 16-byte aligned and initialized at segment creation.
+                    #[cfg(target_arch = "x86_64")]
+                    let free_mask = unsafe { self.ctrl[g].match_empty_or_deleted() };
+                    #[cfg(not(target_arch = "x86_64"))]
+                    let free_mask = self.ctrl[g].match_empty_or_deleted();
+                    self.bump_probe_count();
+
+                    if let Some(pos) = free_mask.lowest_set_bit() {
+                        let slot = base + pos;
+                        if slot < TOTAL_SLOTS {
+                            first_free = Some(slot);
+                        }
                     }
                 }
             }
-        }
         } // end PERF-09 has_non_home_keys guard
 
         // --- Key not found: decide insert vs NeedsSplit ---
@@ -1498,9 +1502,7 @@ mod tests {
         let hash = simple_hash(&k);
         let h2_val = h2(hash);
         let (ba, bb) = home_buckets(hash);
-        let _ = seg.insert_or_update_at(h2_val, k.as_slice(), ba, bb, |_| {}, || {
-            (k.clone(), 1u32)
-        });
+        let _ = seg.insert_or_update_at(h2_val, k.as_slice(), ba, bb, |_| {}, || (k.clone(), 1u32));
         let probes_after = seg.probe_count();
         let delta = probes_after - probes_before;
         assert!(

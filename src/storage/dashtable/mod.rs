@@ -411,14 +411,9 @@ impl<V> DashTable<CompactKey, V> {
         // key moves into `make` closure which runs AFTER the scan completes.
         let key_lookup = unsafe { std::slice::from_raw_parts(key_ptr, key_len) };
 
-        let outcome = segment.insert_or_update_at(
-            h2_val,
-            key_lookup,
-            ba,
-            bb,
-            update,
-            move || (key, make_value()),
-        );
+        let outcome = segment.insert_or_update_at(h2_val, key_lookup, ba, bb, update, move || {
+            (key, make_value())
+        });
 
         match outcome {
             SegmentInsertOrUpdate::Inserted { slot } => {
@@ -444,9 +439,8 @@ impl<V> DashTable<CompactKey, V> {
                 let new_seg_idx = self.directory[new_dir_idx];
                 let new_segment = self.segments.get_mut(new_seg_idx);
 
-                let retry = new_segment.insert_or_update_at(
-                    h2_val, key_lookup, ba, bb, update, make,
-                );
+                let retry =
+                    new_segment.insert_or_update_at(h2_val, key_lookup, ba, bb, update, make);
 
                 match retry {
                     SegmentInsertOrUpdate::Inserted { slot } => {

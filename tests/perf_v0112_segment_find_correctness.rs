@@ -72,10 +72,7 @@ fn test_segment_find_1m_random_no_false_positives() {
     let mut table: DashTable<CompactKey, u32> = DashTable::with_capacity(N);
 
     for (i, k) in keys.iter().enumerate() {
-        table.insert(
-            CompactKey::from(Bytes::copy_from_slice(k)),
-            i as u32,
-        );
+        table.insert(CompactKey::from(Bytes::copy_from_slice(k)), i as u32);
     }
 
     // Lookup with disjoint keys must return None

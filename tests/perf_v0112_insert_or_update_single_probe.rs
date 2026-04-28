@@ -72,9 +72,7 @@ fn test_database_set_semantic_parity() {
 #[test]
 fn test_insert_or_update_at_least_faster_on_50_50() {
     // Pre-build keys so timing measures only the hash-table path.
-    let pre: Vec<Bytes> = (0..N)
-        .map(|i| Bytes::from(format!("t_{:08}", i)))
-        .collect();
+    let pre: Vec<Bytes> = (0..N).map(|i| Bytes::from(format!("t_{:08}", i))).collect();
 
     // -- Control: get_mut + insert on DashTable --
     let mut dt_control: DashTable<CompactKey, u64> = DashTable::with_capacity(N);
@@ -102,11 +100,7 @@ fn test_insert_or_update_at_least_faster_on_50_50() {
         } else {
             pre[i / 2].clone()
         };
-        dt_test.insert_or_update(
-            CompactKey::from(lookup_key),
-            |v| *v = i as u64,
-            || i as u64,
-        );
+        dt_test.insert_or_update(CompactKey::from(lookup_key), |v| *v = i as u64, || i as u64);
     }
     let test_ns = t1.elapsed().as_nanos();
 
