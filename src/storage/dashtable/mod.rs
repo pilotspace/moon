@@ -200,16 +200,32 @@ impl<V> DashTable<CompactKey, V> {
     }
 
     /// Create a DashTable pre-sized for approximately `cap` entries.
+    ///
+    /// Allocates one extra depth level (2x segments) beyond the strict
+    /// `cap / LOAD_THRESHOLD` formula to absorb birthday-paradox hash
+    /// distribution variance. Without headroom, the most-loaded segment
+    /// can exceed `LOAD_THRESHOLD` under real xxh64 distribution at ~98%
+    /// fill, defeating the zero-split guarantee that pre-sizing exists
+    /// to provide.
     pub fn with_capacity(cap: usize) -> Self {
         if cap == 0 {
             return Self::new();
         }
         let num_segments = (cap + segment::LOAD_THRESHOLD - 1) / segment::LOAD_THRESHOLD;
-        let depth = if num_segments <= 1 {
+        let base_depth = if num_segments <= 1 {
             0
         } else {
             (num_segments as f64).log2().ceil() as u32
         };
+        // Add +1 depth level (2x segments) to absorb birthday-paradox tail:
+        // with N segments and M keys, the most-loaded segment has approximately
+        // M/N + sqrt(2 * M/N * ln(N)) entries. At base_depth the average load
+        // is close to LOAD_THRESHOLD, so the tail easily exceeds it. One extra
+        // depth level halves the average load, keeping the max well below the
+        // split threshold for production keyspace sizes (100K-10M keys).
+        // Cost: ~2x structural overhead (~22 KB per 1M hint), negligible vs
+        // the data itself and recouped by eliminating all split_segment CPU cost.
+        let depth = base_depth + 1;
         let dir_size = 1usize << depth;
         let mut segments = SegmentSlab::new();
         let mut directory = Vec::with_capacity(dir_size);
