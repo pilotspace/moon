@@ -1,3 +1,18 @@
+// -- Global allocator selection -----------------------------------------
+// Three states:
+//   1. feature = "jemalloc"        -> tikv_jemallocator (production default)
+//   2. feature = "mimalloc-alt"    -> mimalloc (opt-in A/B; PERF-11)
+//   3. neither                     -> mimalloc (default fallback for builds
+//                                    that disable the production allocator)
+//
+// Enabling BOTH `jemalloc` and `mimalloc-alt` is a compile-time error.
+
+#[cfg(all(feature = "jemalloc", feature = "mimalloc-alt"))]
+compile_error!(
+    "Features `jemalloc` and `mimalloc-alt` are mutually exclusive. \
+     Disable one -- typically: cargo build --no-default-features --features runtime-monoio,mimalloc-alt,graph,text-index"
+);
+
 #[cfg(not(feature = "jemalloc"))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
