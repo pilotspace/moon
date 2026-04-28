@@ -39,6 +39,13 @@ Moon speaks the Redis wire protocol (RESP2/RESP3) and implements 230+ commands. 
 - **Forkless persistence.** RDB snapshots iterate DashTable segments incrementally — no fork(), no COW memory spike. AOF is a per-shard WAL with batched fsync; the advantage over Redis grows with pipeline depth.
 - **Tiered disk offload.** Keys evicted under `maxmemory` spill to NVMe instead of being deleted, with async write and read-through. 100% crash recovery across all tiers.
 - **Memory-optimized types.** `CompactKey` (23-byte SSO), `CompactValue` (16-byte SSO with inline TTL), `HeapString`, B+ tree sorted sets, and per-request bumpalo arenas — **27–35% less RSS** than Redis at 1 KB+ values.
+
+> **Operator note:** Moon's resident memory (RSS) is what you bill for; virtual
+> memory (VSZ) reserved by the allocator is not. See
+> [docs/OPERATOR-GUIDE.md#memory-accounting](docs/OPERATOR-GUIDE.md#memory-accounting)
+> for the full VSZ-vs-RSS guide, `MEMORY DOCTOR` interpretation, and
+> `--memory-arenas-cap` / `mimalloc-alt` tuning knobs.
+
 - **In-process vector search.** `FT.CREATE` / `FT.SEARCH` with HNSW + TurboQuant 4/8-bit quantization. **12.7K search QPS** at 384d COSINE on GCloud x86_64.
 - **BM25 full-text search.** `FT.AGGREGATE` with GROUPBY/REDUCE, typo tolerance (Levenshtein fuzzy), TAG and NUMERIC field types, HIGHLIGHT/SUMMARIZE, and three-way RRF hybrid fusion (BM25 + dense + sparse).
 - **Property graph engine.** 14 `GRAPH.*` commands with Cypher subset, hybrid graph+vector queries, SIMD-accelerated traversal, and memory-mapped CSR segments. **23× FalkorDB insert, 2.4× Cypher QPS.**
