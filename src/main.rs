@@ -8,7 +8,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 #[cfg(feature = "jemalloc")]
 #[unsafe(export_name = "malloc_conf")]
-pub static JEMALLOC_CONF: &[u8] = b"background_thread:true,metadata_thp:auto,dirty_decay_ms:1000,muzzy_decay_ms:5000,abort_conf:true\0";
+pub static JEMALLOC_CONF: &[u8] = b"narenas:8,background_thread:true,metadata_thp:auto,dirty_decay_ms:1000,muzzy_decay_ms:5000,abort_conf:true\0";
 
 use std::path::PathBuf;
 
@@ -25,6 +25,12 @@ use moon::shard::shared_databases::ShardDatabases;
 use tracing::info;
 
 fn main() -> anyhow::Result<()> {
+    // Re-spawn self with MALLOC_CONF if --memory-arenas-cap differs from the
+    // baked-in default (8). Sentinel env var prevents infinite recursion.
+    // Must run BEFORE tracing init and clap parse — jemalloc reads MALLOC_CONF
+    // at process start, so the env var must be set before exec.
+    maybe_respawn_with_arena_override()?;
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -33,6 +39,15 @@ fn main() -> anyhow::Result<()> {
         .init();
 
     let config = ServerConfig::parse();
+
+    // Non-jemalloc builds: warn if operator explicitly set --memory-arenas-cap
+    #[cfg(not(feature = "jemalloc"))]
+    if config.memory_arenas_cap != 8 {
+        tracing::warn!(
+            "--memory-arenas-cap={} is a no-op for non-jemalloc builds",
+            config.memory_arenas_cap
+        );
+    }
 
     // Protected mode startup warning
     if config.protected_mode == "yes" && config.requirepass.is_none() && config.aclfile.is_none() {
@@ -766,5 +781,81 @@ fn main() -> anyhow::Result<()> {
     }
 
     info!("Server shut down");
+    Ok(())
+}
+
+/// Re-spawn the current process with `MALLOC_CONF=narenas:N` when the operator
+/// passes `--memory-arenas-cap N` and N differs from the baked-in default (8).
+///
+/// jemalloc reads `opt.narenas` exactly once at init from the `malloc_conf`
+/// symbol **or** the `MALLOC_CONF` env var (env wins). Calling `mallctl`
+/// after init is a documented no-op. Re-spawning via `execve` is the only
+/// correct path for a CLI override.
+///
+/// Sentinel `MOON_ARENAS_CAP_APPLIED=1` prevents infinite re-spawn.
+#[cfg(all(feature = "jemalloc", unix))]
+fn maybe_respawn_with_arena_override() -> anyhow::Result<()> {
+    use std::env;
+    use std::os::unix::process::CommandExt;
+    const SENTINEL: &str = "MOON_ARENAS_CAP_APPLIED";
+
+    if env::var_os(SENTINEL).is_some() {
+        return Ok(());
+    }
+
+    // Lightweight scan of argv for --memory-arenas-cap N or --memory-arenas-cap=N.
+    // We can't use clap here because clap::parse() requires the full struct, and
+    // we need to inject env vars BEFORE jemalloc reads MALLOC_CONF.
+    let args: Vec<String> = env::args().collect();
+    let mut requested: Option<u32> = None;
+    let mut i = 1;
+    while i < args.len() {
+        let a = &args[i];
+        if let Some(rest) = a.strip_prefix("--memory-arenas-cap=") {
+            requested = rest.parse().ok();
+            break;
+        }
+        if a == "--memory-arenas-cap" && i + 1 < args.len() {
+            requested = args[i + 1].parse().ok();
+            break;
+        }
+        i += 1;
+    }
+
+    // No flag passed -> static JEMALLOC_CONF (narenas:8) is already in effect.
+    let Some(n) = requested else {
+        return Ok(());
+    };
+    if n == 8 {
+        return Ok(()); // matches default; no override required.
+    }
+
+    if env::var_os("MALLOC_CONF").is_some() {
+        // Operator-controlled MALLOC_CONF wins; do not clobber.
+        eprintln!("WARN: --memory-arenas-cap ignored because MALLOC_CONF is already set");
+        return Ok(());
+    }
+
+    // Rebuild the full MALLOC_CONF with the requested narenas override.
+    let malloc_conf = format!(
+        "narenas:{},background_thread:true,metadata_thp:auto,dirty_decay_ms:1000,muzzy_decay_ms:5000,abort_conf:true",
+        n,
+    );
+
+    let exe = env::current_exe()?;
+    // unix-only: replaces current process image via execve; never returns on success.
+    let err = std::process::Command::new(&exe)
+        .args(args.iter().skip(1))
+        .env("MALLOC_CONF", &malloc_conf)
+        .env(SENTINEL, "1")
+        .exec();
+    Err(anyhow::anyhow!(
+        "re-spawn for --memory-arenas-cap failed: {}",
+        err
+    ))
+}
+
+#[cfg(not(all(feature = "jemalloc", unix)))]
+fn maybe_respawn_with_arena_override() -> anyhow::Result<()> {
     Ok(())
 }

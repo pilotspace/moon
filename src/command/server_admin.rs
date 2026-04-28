@@ -527,9 +527,10 @@ fn replication_backlog_bytes() -> usize {
 fn allocator_info() -> (String, String) {
     #[cfg(feature = "jemalloc")]
     {
-        // tikv-jemallocator is the allocator, but tikv-jemalloc-ctl is NOT
-        // in dependencies. Hardcode the name; arenas not readable without ctl.
-        ("jemalloc".to_string(), "n/a".to_string())
+        let arena_count = tikv_jemalloc_ctl::arenas::narenas::read()
+            .map(|n| n.to_string())
+            .unwrap_or_else(|_| "n/a".to_string());
+        ("jemalloc".to_string(), arena_count)
     }
     #[cfg(not(feature = "jemalloc"))]
     {

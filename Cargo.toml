@@ -67,6 +67,7 @@ hyper-util = { version = "0.1", features = ["tokio", "http1", "http2", "server-a
 http-body-util = "0.1"
 
 tikv-jemallocator = { version = "0.6", optional = true }
+tikv-jemalloc-ctl = { version = "0.6", optional = true }
 monoio = { version = "0.2", optional = true, features = ["sync", "bytes"] }
 cudarc = { version = "0.19", optional = true, default-features = false, features = ["cuda-version-from-build-system"] }
 slotmap = "1"
@@ -96,7 +97,7 @@ levenshtein_automata = { version = "0.2", features = ["fst_automaton"], optional
 #   cargo build --no-default-features --features runtime-tokio,jemalloc   # force Tokio
 #   cargo build --no-default-features --features runtime-monoio,jemalloc  # force Monoio
 default = ["runtime-monoio", "jemalloc", "graph", "text-index"]
-jemalloc = ["dep:tikv-jemallocator"]
+jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl"]
 runtime-tokio = ["tokio/rt-multi-thread", "tokio/io-util", "tokio/signal", "tokio/time", "tokio/fs", "tokio/process", "dep:tokio-util", "dep:tokio-rustls", "dep:aws-lc-rs", "dep:rustls", "rustls/aws_lc_rs", "dep:rustls-pemfile"]
 runtime-monoio = ["dep:monoio", "dep:monoio-rustls", "dep:aws-lc-rs", "dep:rustls", "rustls/aws_lc_rs", "dep:rustls-pemfile"]
 gpu-cuda = ["dep:cudarc"]

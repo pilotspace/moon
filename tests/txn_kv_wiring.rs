@@ -90,6 +90,7 @@ async fn start_txn_server(num_shards: usize, persistence_dir: &str) -> (u16, Can
         slowlog_max_len: 128,
         check_config: false,
         initial_keyspace_hint: 0,
+        memory_arenas_cap: 8,
         maxclients: 10000,
         timeout: 0,
         tcp_keepalive: 300,
