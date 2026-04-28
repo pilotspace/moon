@@ -7,8 +7,22 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 #[cfg(feature = "jemalloc")]
-#[unsafe(export_name = "malloc_conf")]
-pub static JEMALLOC_CONF: &[u8] = b"narenas:8,background_thread:true,metadata_thp:auto,dirty_decay_ms:1000,muzzy_decay_ms:5000,abort_conf:true\0";
+#[allow(non_upper_case_globals)]
+#[unsafe(export_name = "_rjem_malloc_conf")]
+pub static malloc_conf: Option<&'static libc::c_char> = {
+    // SAFETY: The byte string is null-terminated and valid ASCII; reinterpreting
+    // the first byte's address as *const c_char is safe (same layout).
+    union U {
+        x: &'static u8,
+        y: &'static libc::c_char,
+    }
+    Some(unsafe {
+        U {
+            x: &b"narenas:8,background_thread:true,metadata_thp:auto,dirty_decay_ms:1000,muzzy_decay_ms:5000,abort_conf:true\0"[0],
+        }
+        .y
+    })
+};
 
 use std::path::PathBuf;
 
@@ -784,13 +798,16 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Re-spawn the current process with `MALLOC_CONF=narenas:N` when the operator
-/// passes `--memory-arenas-cap N` and N differs from the baked-in default (8).
+/// Re-spawn the current process with `_RJEM_MALLOC_CONF=narenas:N` when the
+/// operator passes `--memory-arenas-cap N` and N differs from the baked-in
+/// default (8).
 ///
-/// jemalloc reads `opt.narenas` exactly once at init from the `malloc_conf`
-/// symbol **or** the `MALLOC_CONF` env var (env wins). Calling `mallctl`
-/// after init is a documented no-op. Re-spawning via `execve` is the only
-/// correct path for a CLI override.
+/// tikv-jemallocator uses prefixed symbols (`_rjem_malloc_conf`), so the env
+/// var that overrides the config is `_RJEM_MALLOC_CONF` (with `JEMALLOC_CPREFIX`
+/// = `_rjem_`). jemalloc reads `opt.narenas` exactly once at init from the
+/// symbol **or** the env var (env wins). Calling `mallctl` after init is a
+/// documented no-op. Re-spawning via `execve` is the only correct path for a
+/// CLI override.
 ///
 /// Sentinel `MOON_ARENAS_CAP_APPLIED=1` prevents infinite re-spawn.
 #[cfg(all(feature = "jemalloc", unix))]
@@ -798,6 +815,8 @@ fn maybe_respawn_with_arena_override() -> anyhow::Result<()> {
     use std::env;
     use std::os::unix::process::CommandExt;
     const SENTINEL: &str = "MOON_ARENAS_CAP_APPLIED";
+    // tikv-jemalloc-sys builds with prefix "_rjem_", so the env var is prefixed.
+    const MALLOC_CONF_ENV: &str = "_RJEM_MALLOC_CONF";
 
     if env::var_os(SENTINEL).is_some() {
         return Ok(());
@@ -805,7 +824,7 @@ fn maybe_respawn_with_arena_override() -> anyhow::Result<()> {
 
     // Lightweight scan of argv for --memory-arenas-cap N or --memory-arenas-cap=N.
     // We can't use clap here because clap::parse() requires the full struct, and
-    // we need to inject env vars BEFORE jemalloc reads MALLOC_CONF.
+    // we need to inject env vars BEFORE jemalloc reads the config.
     let args: Vec<String> = env::args().collect();
     let mut requested: Option<u32> = None;
     let mut i = 1;
@@ -822,7 +841,7 @@ fn maybe_respawn_with_arena_override() -> anyhow::Result<()> {
         i += 1;
     }
 
-    // No flag passed -> static JEMALLOC_CONF (narenas:8) is already in effect.
+    // No flag passed -> static _rjem_malloc_conf (narenas:8) is already in effect.
     let Some(n) = requested else {
         return Ok(());
     };
@@ -830,14 +849,17 @@ fn maybe_respawn_with_arena_override() -> anyhow::Result<()> {
         return Ok(()); // matches default; no override required.
     }
 
-    if env::var_os("MALLOC_CONF").is_some() {
-        // Operator-controlled MALLOC_CONF wins; do not clobber.
-        eprintln!("WARN: --memory-arenas-cap ignored because MALLOC_CONF is already set");
+    if env::var_os(MALLOC_CONF_ENV).is_some() {
+        // Operator-controlled env var wins; do not clobber.
+        eprintln!(
+            "WARN: --memory-arenas-cap ignored because {} is already set",
+            MALLOC_CONF_ENV
+        );
         return Ok(());
     }
 
-    // Rebuild the full MALLOC_CONF with the requested narenas override.
-    let malloc_conf = format!(
+    // Rebuild the full config with the requested narenas override.
+    let conf_val = format!(
         "narenas:{},background_thread:true,metadata_thp:auto,dirty_decay_ms:1000,muzzy_decay_ms:5000,abort_conf:true",
         n,
     );
@@ -846,7 +868,7 @@ fn maybe_respawn_with_arena_override() -> anyhow::Result<()> {
     // unix-only: replaces current process image via execve; never returns on success.
     let err = std::process::Command::new(&exe)
         .args(args.iter().skip(1))
-        .env("MALLOC_CONF", &malloc_conf)
+        .env(MALLOC_CONF_ENV, &conf_val)
         .env(SENTINEL, "1")
         .exec();
     Err(anyhow::anyhow!(

@@ -527,7 +527,10 @@ fn replication_backlog_bytes() -> usize {
 fn allocator_info() -> (String, String) {
     #[cfg(feature = "jemalloc")]
     {
-        let arena_count = tikv_jemalloc_ctl::arenas::narenas::read()
+        // opt.narenas = configured cap (what we set via malloc_conf / MALLOC_CONF).
+        // arenas.narenas = actual created count (can exceed opt.narenas).
+        // Operators care about the configured limit, not the runtime count.
+        let arena_count = tikv_jemalloc_ctl::opt::narenas::read()
             .map(|n| n.to_string())
             .unwrap_or_else(|_| "n/a".to_string());
         ("jemalloc".to_string(), arena_count)
