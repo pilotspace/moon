@@ -569,6 +569,81 @@ impl<K, V> Segment<K, V> {
     #[inline(always)]
     fn bump_probe_count(&mut self) {}
 
+    /// Check if a key was placed in a non-home group (test-only perf attribution).
+    ///
+    /// Returns `Some(true)` if the key is found in a group that is NOT group_a,
+    /// group_b, or the stash — meaning `find` would need the fallback scan to
+    /// locate it. Returns `Some(false)` if found in a home group or stash,
+    /// `None` if the key is not found at all.
+    #[cfg(test)]
+    pub fn is_in_non_home_group<Q: ?Sized>(
+        &self,
+        h2: u8,
+        key: &Q,
+        bucket_a: usize,
+        bucket_b: usize,
+    ) -> Option<bool>
+    where
+        K: Borrow<Q>,
+        Q: Eq,
+    {
+        let group_a = bucket_a / 16;
+        let group_b = bucket_b / 16;
+
+        // Check group_a
+        let base_a = group_a * 16;
+        for slot in base_a..(base_a + 16).min(TOTAL_SLOTS) {
+            if self.ctrl_byte(slot) == h2 {
+                // SAFETY: ctrl byte matches h2 (FULL), so key is initialized.
+                let k = unsafe { self.keys[slot].assume_init_ref() };
+                if k.borrow() == key {
+                    return Some(false); // found in home group
+                }
+            }
+        }
+
+        // Check group_b
+        if group_b != group_a {
+            let base_b = group_b * 16;
+            for slot in base_b..(base_b + 16).min(TOTAL_SLOTS) {
+                if self.ctrl_byte(slot) == h2 {
+                    let k = unsafe { self.keys[slot].assume_init_ref() };
+                    if k.borrow() == key {
+                        return Some(false); // found in home group
+                    }
+                }
+            }
+        }
+
+        // Check stash
+        for slot in REGULAR_SLOTS..TOTAL_SLOTS {
+            if self.ctrl_byte(slot) == h2 {
+                let k = unsafe { self.keys[slot].assume_init_ref() };
+                if k.borrow() == key {
+                    return Some(false); // found in stash (not fallback)
+                }
+            }
+        }
+
+        // Check remaining groups (fallback path)
+        for g in 0..NUM_GROUPS {
+            if g == group_a || g == group_b {
+                continue;
+            }
+            let base = g * 16;
+            for slot in base..(base + 16).min(REGULAR_SLOTS) {
+                if self.ctrl_byte(slot) == h2 {
+                    let k = unsafe { self.keys[slot].assume_init_ref() };
+                    if k.borrow() == key {
+                        return Some(true); // found in NON-home group (fallback required)
+                    }
+                }
+            }
+        }
+
+        None // not found
+    }
+
     /// Single-probe find OR insert. Fuses the `find` + `insert` paths into a
     /// single pass over the control byte groups, eliminating the redundant second
     /// probe that `get_mut` + `insert` would perform on a miss.
@@ -1398,5 +1473,52 @@ mod tests {
             "insert_or_update_at on empty segment did {} SIMD probes; expected <= 6",
             delta
         );
+    }
+
+    #[test]
+    fn test_fallback_placement_ratio() {
+        // PERF-09 attribution: measure how many keys land in non-home groups
+        // (which require the expensive fallback scan in find).
+        // We fill a single segment to near LOAD_THRESHOLD and check each key.
+        let mut seg: Segment<Vec<u8>, u32> = Segment::new(0);
+        let mut keys_and_hashes: Vec<(Vec<u8>, u64)> = Vec::new();
+
+        for i in 0..LOAD_THRESHOLD {
+            let k = format!("fb_{:06}", i).into_bytes();
+            let hash = simple_hash(&k);
+            let h2_val = h2(hash);
+            let (ba, bb) = home_buckets(hash);
+            match seg.insert(h2_val, k.clone(), i as u32, ba, bb) {
+                InsertResult::Inserted => {
+                    keys_and_hashes.push((k, hash));
+                }
+                _ => break,
+            }
+        }
+
+        let total = keys_and_hashes.len();
+        let mut in_fallback = 0usize;
+        for (k, hash) in &keys_and_hashes {
+            let h2_val = h2(*hash);
+            let (ba, bb) = home_buckets(*hash);
+            if let Some(true) = seg.is_in_non_home_group(h2_val, k.as_slice(), ba, bb) {
+                in_fallback += 1;
+            }
+        }
+
+        let ratio = if total > 0 {
+            in_fallback as f64 / total as f64
+        } else {
+            0.0
+        };
+        eprintln!(
+            "[PERF-09 attribution] total={}, in_fallback={}, ratio={:.4} ({:.2}%)",
+            total,
+            in_fallback,
+            ratio,
+            ratio * 100.0
+        );
+        // This test is observational — it measures but does not assert a threshold.
+        // The ratio drives the fix selection in 189-03-INVESTIGATION.md.
     }
 }
