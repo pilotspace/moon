@@ -179,6 +179,10 @@ pub struct DashTable<K, V> {
     depth: u32,
     /// Total entry count across all segments.
     len: usize,
+    /// Cumulative number of `split_segment` invocations since construction.
+    /// Used by perf-regression tests and `MEMORY DOCTOR` to verify pre-sizing
+    /// successfully eliminated split cost on production keyspaces.
+    split_count: u64,
 }
 
 impl<V> DashTable<CompactKey, V> {
@@ -191,6 +195,7 @@ impl<V> DashTable<CompactKey, V> {
             directory: vec![0],
             depth: 0,
             len: 0,
+            split_count: 0,
         }
     }
 
@@ -217,6 +222,7 @@ impl<V> DashTable<CompactKey, V> {
             directory,
             depth,
             len: 0,
+            split_count: 0,
         }
     }
 
@@ -236,6 +242,14 @@ impl<V> DashTable<CompactKey, V> {
     #[inline]
     pub fn segment_count(&self) -> usize {
         self.segments.len()
+    }
+
+    /// Total number of `split_segment` invocations since construction.
+    /// Used by perf-regression tests and `MEMORY DOCTOR` to verify pre-sizing
+    /// successfully eliminated split cost on production keyspaces.
+    #[inline]
+    pub fn split_count(&self) -> u64 {
+        self.split_count
     }
 
     /// Resident bytes used by the DashTable structural overhead (segments +
@@ -405,6 +419,7 @@ impl<V> DashTable<CompactKey, V> {
     /// 2. If new segment's depth > global depth, double the directory
     /// 3. Update directory entries to point to the new segment
     fn split_segment(&mut self, dir_idx: usize) {
+        self.split_count += 1;
         let seg_store_idx = self.directory[dir_idx];
         let hasher = |k: &CompactKey| hash_key(k.as_ref());
         let new_seg = self.segments.get_mut(seg_store_idx).split(&hasher);
@@ -671,6 +686,39 @@ mod tests {
         let table: DashTable<CompactKey, String> = DashTable::with_capacity(1000);
         assert_eq!(table.len(), 0);
         assert!(table.is_empty());
+    }
+
+    #[test]
+    fn test_split_count_starts_at_zero() {
+        let table: DashTable<CompactKey, String> = DashTable::new();
+        assert_eq!(table.split_count(), 0);
+    }
+
+    #[test]
+    fn test_split_count_with_capacity_starts_at_zero() {
+        // Pre-sized allocation must NOT count as splits.
+        let table: DashTable<CompactKey, String> = DashTable::with_capacity(1_000_000);
+        assert_eq!(table.split_count(), 0);
+        assert!(
+            table.segment_count() > 1,
+            "with_capacity must allocate >1 segment for 1M hint"
+        );
+    }
+
+    #[test]
+    fn test_split_count_grows_under_load_without_capacity() {
+        let mut table: DashTable<CompactKey, String> = DashTable::new();
+        for i in 0..2000 {
+            table.insert(
+                CompactKey::from(format!("split_count_{:06}", i)),
+                format!("v_{}", i),
+            );
+        }
+        assert!(
+            table.split_count() > 0,
+            "Expected splits after 2000 inserts on a default-sized table; got {}",
+            table.split_count()
+        );
     }
 
     #[test]
