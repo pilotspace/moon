@@ -56,7 +56,7 @@ impl Group {
     ///
     /// NEON is mandatory on all AArch64 CPUs (ARMv8-A baseline).
     #[cfg(target_arch = "aarch64")]
-    #[inline]
+    #[inline(always)]
     pub fn match_h2(&self, h2: u8) -> BitMask {
         // SAFETY: `self.0.as_ptr()` valid for 16 bytes; NEON mandatory on AArch64;
         // `vld1q_u8` has no alignment requirement (unlike SSE2 `_mm_load_si128`).
@@ -75,7 +75,7 @@ impl Group {
     /// `[1,2,4,8,16,32,64,128]` for each 8-byte half, then horizontal-add each
     /// half into a single byte.  The two bytes form the 16-bit mask.
     #[cfg(target_arch = "aarch64")]
-    #[inline]
+    #[inline(always)]
     fn neon_bitmask_from_cmp(cmp: core::arch::aarch64::uint8x16_t) -> BitMask {
         // SAFETY: NEON intrinsics on register-width vectors (no raw ptrs);
         // POWERS `.as_ptr()` valid for 16 bytes; NEON mandatory on AArch64.
@@ -92,7 +92,7 @@ impl Group {
 
     /// Scalar fallback for platforms without SIMD (neither x86_64 nor aarch64).
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-    #[inline]
+    #[inline(always)]
     pub fn match_h2(&self, h2: u8) -> BitMask {
         let mut mask = 0u16;
         for i in 0..16 {
@@ -140,7 +140,7 @@ impl Group {
     /// all FULL H2 values are in 0x00..0x7F (bit 7 clear).
     /// We shift right by 7 to isolate bit 7, then compare with 1.
     #[cfg(target_arch = "aarch64")]
-    #[inline]
+    #[inline(always)]
     pub fn match_empty_or_deleted(&self) -> BitMask {
         // SAFETY: `self.0.as_ptr()` valid for 16 bytes; `vld1q_u8` no alignment
         // requirement; NEON mandatory on AArch64 (ARMv8-A baseline).
@@ -156,7 +156,7 @@ impl Group {
 
     /// Scalar fallback: find empty or deleted slots.
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-    #[inline]
+    #[inline(always)]
     pub fn match_empty_or_deleted(&self) -> BitMask {
         let mut mask = 0u16;
         for i in 0..16 {

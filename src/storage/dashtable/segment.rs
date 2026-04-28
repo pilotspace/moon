@@ -91,6 +91,10 @@ pub struct Segment<K, V> {
     // --- Cache line 1+: metadata ---
     count: u32,
     depth: u32,
+    /// True if any key was placed via the "any free slot" fallback path
+    /// during insert or split. When false, `find` can skip the expensive
+    /// fallback scan of non-home groups (PERF-09 optimization).
+    has_non_home_keys: bool,
     /// Cumulative SIMD probe count for perf instrumentation (test-only).
     #[cfg(test)]
     probe_count: u32,
@@ -147,6 +151,7 @@ impl<K, V> Segment<K, V> {
             ctrl,
             count: 0,
             depth,
+            has_non_home_keys: false,
             #[cfg(test)]
             probe_count: 0,
             keys,
@@ -170,6 +175,14 @@ impl<K, V> Segment<K, V> {
     #[inline]
     pub fn is_full(&self) -> bool {
         self.count as usize >= LOAD_THRESHOLD
+    }
+
+    /// True if any key in this segment was placed in a non-home group via the
+    /// "any free slot" fallback path. When false, `find` can skip the fallback
+    /// scan of non-home groups entirely.
+    #[inline]
+    pub fn has_non_home_keys(&self) -> bool {
+        self.has_non_home_keys
     }
 
     /// Read the control byte at the given slot index.
@@ -356,6 +369,13 @@ impl<K, V> Segment<K, V> {
         // that is neither group_a nor group_b (overflow during high-occupancy
         // or split redistribution). Without this, get/get_mut would fail to
         // find a key that was legitimately inserted.
+        //
+        // PERF-09: Skip the fallback when has_non_home_keys is false — no key
+        // was ever placed in a non-home group, so the scan is guaranteed to
+        // find nothing. This eliminates 2 wasted SIMD probes on every miss.
+        if !self.has_non_home_keys {
+            return None;
+        }
         for g in 0..NUM_GROUPS {
             if g == group_a || g == group_b {
                 continue; // already checked above
@@ -511,9 +531,11 @@ impl<K, V> Segment<K, V> {
         // All slots examined, none free -- should not happen if count < LOAD_THRESHOLD
         // but possible if home groups and stash are all full while other groups have space.
         // Fall back: linear scan all slots for any free one.
+        // Mark that a key was placed in a non-home group so find() knows to scan all groups.
         for slot in 0..TOTAL_SLOTS {
             let ctrl = self.ctrl_byte(slot);
             if ctrl == EMPTY || ctrl == DELETED {
+                self.has_non_home_keys = true;
                 self.write_slot(slot, h2, key, value);
                 return InsertResult::Inserted;
             }
@@ -607,6 +629,7 @@ impl<K, V> Segment<K, V> {
             let base_b = group_b * 16;
             for slot in base_b..(base_b + 16).min(TOTAL_SLOTS) {
                 if self.ctrl_byte(slot) == h2 {
+                    // SAFETY: ctrl byte matches h2 (a FULL value), so the slot is initialized.
                     let k = unsafe { self.keys[slot].assume_init_ref() };
                     if k.borrow() == key {
                         return Some(false); // found in home group
@@ -618,6 +641,7 @@ impl<K, V> Segment<K, V> {
         // Check stash
         for slot in REGULAR_SLOTS..TOTAL_SLOTS {
             if self.ctrl_byte(slot) == h2 {
+                // SAFETY: ctrl byte matches h2 (a FULL value), so the slot is initialized.
                 let k = unsafe { self.keys[slot].assume_init_ref() };
                 if k.borrow() == key {
                     return Some(false); // found in stash (not fallback)
@@ -633,6 +657,7 @@ impl<K, V> Segment<K, V> {
             let base = g * 16;
             for slot in base..(base + 16).min(REGULAR_SLOTS) {
                 if self.ctrl_byte(slot) == h2 {
+                    // SAFETY: ctrl byte matches h2 (a FULL value), so the slot is initialized.
                     let k = unsafe { self.keys[slot].assume_init_ref() };
                     if k.borrow() == key {
                         return Some(true); // found in NON-home group (fallback required)
@@ -799,6 +824,11 @@ impl<K, V> Segment<K, V> {
         // --- Fallback: scan remaining groups for h2 matches (rare overflow path) ---
         // This handles keys placed in non-home groups during high occupancy or
         // split redistribution (mirrors find at segment.rs:333-361).
+        //
+        // PERF-09: Skip when has_non_home_keys is false — no key was placed in a
+        // non-home group, so the scan cannot find a match. Still need to find a
+        // free slot for insertion below, but the home groups already provided one.
+        if self.has_non_home_keys {
         for g in 0..NUM_GROUPS {
             if g == group_a || g == group_b {
                 continue;
@@ -846,6 +876,7 @@ impl<K, V> Segment<K, V> {
                 }
             }
         }
+        } // end PERF-09 has_non_home_keys guard
 
         // --- Key not found: decide insert vs NeedsSplit ---
         if self.is_full() {
@@ -932,6 +963,8 @@ impl<K, V> Segment<K, V> {
             }
         }
         self.count = 0;
+        // Reset non-home-keys flag; insert_during_split will set it if needed.
+        self.has_non_home_keys = false;
 
         // Reset all control bytes to EMPTY for clean re-insertion
         for g in 0..NUM_GROUPS {
@@ -984,9 +1017,11 @@ impl<K, V> Segment<K, V> {
             }
         }
 
-        // Last resort: any free slot
+        // Last resort: any free slot (non-home placement)
+        // Mark the flag so find() knows it must scan all groups.
         for slot in 0..TOTAL_SLOTS {
             if self.ctrl_byte(slot) == EMPTY {
+                self.has_non_home_keys = true;
                 self.write_slot(slot, h2, key, value);
                 return;
             }
@@ -1520,5 +1555,31 @@ mod tests {
         );
         // This test is observational — it measures but does not assert a threshold.
         // The ratio drives the fix selection in 189-03-INVESTIGATION.md.
+    }
+
+    #[test]
+    fn test_has_non_home_keys_starts_false() {
+        let seg: Segment<Vec<u8>, u32> = Segment::new(0);
+        assert!(
+            !seg.has_non_home_keys(),
+            "new segment must not have non-home keys"
+        );
+    }
+
+    #[test]
+    fn test_has_non_home_keys_stays_false_under_normal_insert() {
+        // Normal inserts at low load should never trigger the "any free slot" fallback.
+        let mut seg: Segment<Vec<u8>, u32> = Segment::new(0);
+        for i in 0..30u32 {
+            let k = format!("nhk_{:04}", i).into_bytes();
+            let hash = simple_hash(&k);
+            let h2_val = h2(hash);
+            let (ba, bb) = home_buckets(hash);
+            seg.insert(h2_val, k, i, ba, bb);
+        }
+        assert!(
+            !seg.has_non_home_keys(),
+            "30 inserts into 60-slot segment should not trigger non-home placement"
+        );
     }
 }
