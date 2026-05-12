@@ -4,6 +4,65 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0-alpha] — Unreleased
+
+First slice of the v0.2 "Option C" beachhead: **Point-in-Time Recovery (PITR)**
+and **Change Data Capture (CDC)**, built additively on top of the existing
+per-shard WAL v3 + dual-root manifest. No changes to the KV hot path, MVCC,
+page format, or transaction layer.
+
+### Added — Point-in-Time Recovery (PITR)
+
+- **P0** `ac3aa92` — `WalWriterV3::new()` now scans existing `.wal` segments on
+  open and resumes `next_lsn` from `max_observed_lsn + 1`. Fixes a latent
+  durability bug where LSN reset to 1 on every restart and blocked both PITR
+  and CDC.
+- **P1** `e1e9bda` — `FileEntry` extended with `last_modified_lsn` (offset
+  48..56, struct size 48 → 56). Manifest `format_version` bumped to v2;
+  backward-compat reader synthesizes `last_modified_lsn = created_lsn` for v1
+  entries. New CLI flags `--recovery-target-lsn` and `--recovery-target-time`.
+- **P2** `25ece4b` — Snapshot header bumped to `SHARD_RDB_VERSION = 2`,
+  embedding `last_lsn` and `created_at_unix_ms`. v1 snapshots load with
+  `last_lsn = 0` and are conservatively skipped by PITR. Adds
+  `read_snapshot_metadata` peek API.
+- **P3a** `048a883` — `replay_wal_v3_dir_until(stop_at_lsn)` and
+  `resolve_target_time_to_lsn()` (scans `TemporalUpsert` / `GraphTemporal`
+  records for `system_from` anchors).
+- **P3b** `a496413` — `recover_shard_v3_pitr()` honors `target_lsn`: skips
+  snapshots whose `last_lsn` is unknown or past the target, then stops replay
+  at the cutoff without advancing `wal_flush_lsn`.
+
+See `docs/guides/pitr.md` for operator usage.
+
+### Added — Change Data Capture (CDC)
+
+- **C1** `b271e21` — `WalTailReader` with resumable `TailCursor { segment_seq,
+  byte_offset, last_lsn }`. Re-stats segment metadata on each call for
+  torn-write safety, auto-advances on segment rotation.
+- **C2** `e97b80d` — New `src/cdc/` module with typed `CdcEvent` enum,
+  `decode_wal_record()` translator, and hand-rolled
+  Debezium-compatible JSON envelope serializer
+  (`encode_debezium`). Non-UTF-8 keys fall back to `{"_b64":"..."}`.
+- **C3 v1** `bf4230b` — `CDC.READ <wal_dir> <from_lsn> [LIMIT N]` polling
+  command. Returns RESP array `[next_lsn, env1, env2, ...]`; default LIMIT
+  256, hard ceiling 10 000. Idle response is `[from_lsn]` (length 1) — stable
+  no-new-data signal.
+
+See `docs/guides/cdc.md` for consumer integration.
+
+### Deferred to v0.2 follow-ups
+
+- **P3c** — wire `SnapshotState::set_last_lsn(wal_flush_lsn)` into the live
+  persistence tick so freshly-written snapshots embed their LSN (currently
+  PITR falls back to full WAL replay when only v1-shaped snapshots exist).
+- **C3b** — push-based `CDC.SUBSCRIBE` over RESP3 Push frames, per-shard
+  subscriber registry hooked into `wal_append_and_fanout`, slow-consumer
+  disconnect policy. Envelope format unchanged.
+- Integration suites (`tests/pitr_integration.rs`,
+  `tests/cdc_integration.rs`), `scripts/test-pitr-cdc.sh` end-to-end smoke,
+  and the benchmark gates (PITR restart ±10%, CDC ≥100K events/s/shard,
+  write p99 ±5%).
+
 ## [0.1.11] — 2026-04-27
 
 Hot-path perf release — eliminates two atomic-CAS hot paths in the write
