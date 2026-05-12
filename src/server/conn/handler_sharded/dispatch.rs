@@ -227,6 +227,25 @@ pub(super) fn try_handle_config(
 }
 
 /// Handle REPLICAOF / SLAVEOF. Returns `true` if consumed.
+/// CDC.READ — polling-based change data capture (C3 v1).
+///
+/// Dispatches `CDC.READ <wal_dir> <from_lsn> [LIMIT N]` to
+/// `crate::command::cdc::cdc_read`. Stateless / synchronous — no shard
+/// state involved, just reads WAL files from disk and decodes them into
+/// Debezium JSON envelopes. The push-based CDC.SUBSCRIBE variant (C3b)
+/// will live alongside this.
+pub(super) fn try_handle_cdc_read(
+    cmd: &[u8],
+    cmd_args: &[Frame],
+    responses: &mut Vec<Frame>,
+) -> bool {
+    if !cmd.eq_ignore_ascii_case(b"CDC.READ") {
+        return false;
+    }
+    responses.push(crate::command::cdc::cdc_read(cmd_args));
+    true
+}
+
 pub(super) fn try_handle_replicaof(
     cmd: &[u8],
     cmd_args: &[Frame],
