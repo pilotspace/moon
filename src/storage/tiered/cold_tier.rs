@@ -201,6 +201,7 @@ pub fn transition_to_cold(
         created_lsn: 0,
         min_key_hash: 0,
         max_key_hash: u64::MAX,
+        last_modified_lsn: 0,
     };
     manifest.add_file(cold_entry);
     manifest.commit()?;
@@ -438,6 +439,7 @@ mod tests {
             created_lsn: 0,
             min_key_hash: 0,
             max_key_hash: u64::MAX,
+            last_modified_lsn: 0,
         };
         manifest.add_file(warm_entry);
         manifest.commit().unwrap();
@@ -457,6 +459,7 @@ mod tests {
             created_lsn: 0,
             min_key_hash: 0,
             max_key_hash: u64::MAX,
+            last_modified_lsn: 0,
         };
         manifest.add_file(cold_entry);
         manifest.commit().unwrap();

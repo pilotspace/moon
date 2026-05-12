@@ -73,7 +73,13 @@ impl StorageTier {
     }
 }
 
-/// Fixed-size 48-byte file entry in the shard manifest.
+/// Fixed-size 56-byte file entry in the shard manifest (format_version=2).
+///
+/// **v0.2 — PITR/CDC support.** Adds `last_modified_lsn` so recovery can
+/// pick the right files for a `--recovery-target-lsn`. Legacy 48-byte (v1)
+/// entries are decoded with `last_modified_lsn = created_lsn` (lossless
+/// fallback — the file's only known LSN reference point is when it was
+/// created).
 ///
 /// Byte layout (all little-endian):
 /// ```text
@@ -88,6 +94,7 @@ impl StorageTier {
 /// 24..32  8     created_lsn (u64 LE)
 /// 32..40  8     min_key_hash (u64 LE)
 /// 40..48  8     max_key_hash (u64 LE)
+/// 48..56  8     last_modified_lsn (u64 LE)  -- v2 only
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileEntry {
@@ -101,17 +108,24 @@ pub struct FileEntry {
     pub created_lsn: u64,
     pub min_key_hash: u64,
     pub max_key_hash: u64,
+    /// LSN of the last mutation to this file (v2). For files imported from
+    /// a v1 manifest this is set equal to `created_lsn`. Used by PITR to
+    /// select the file set valid at `--recovery-target-lsn`.
+    pub last_modified_lsn: u64,
 }
 
 impl FileEntry {
-    /// On-disk size of a single FileEntry.
-    pub const SIZE: usize = 48;
+    /// On-disk size of a v2 FileEntry (with `last_modified_lsn`).
+    pub const SIZE: usize = 56;
 
-    /// Serialize this entry into `buf` (must be >= 48 bytes).
+    /// On-disk size of a legacy v1 FileEntry (without `last_modified_lsn`).
+    pub const SIZE_V1: usize = 48;
+
+    /// Serialize this entry as v2 (56 bytes) into `buf` (must be >= 56 bytes).
     ///
     /// # Panics
     ///
-    /// Panics if `buf.len() < 48`.
+    /// Panics if `buf.len() < 56`.
     pub fn write_to(&self, buf: &mut [u8]) {
         assert!(
             buf.len() >= Self::SIZE,
@@ -130,13 +144,30 @@ impl FileEntry {
         buf[24..32].copy_from_slice(&self.created_lsn.to_le_bytes());
         buf[32..40].copy_from_slice(&self.min_key_hash.to_le_bytes());
         buf[40..48].copy_from_slice(&self.max_key_hash.to_le_bytes());
+        buf[48..56].copy_from_slice(&self.last_modified_lsn.to_le_bytes());
     }
 
-    /// Deserialize a FileEntry from `buf`.
+    /// Deserialize a v2 FileEntry (56 bytes) from `buf`.
     ///
-    /// Returns `None` if `buf.len() < 48`.
+    /// Returns `None` if `buf.len() < 56`.
     pub fn read_from(buf: &[u8]) -> Option<Self> {
         if buf.len() < Self::SIZE {
+            return None;
+        }
+
+        let mut entry = Self::read_v1(buf)?;
+        entry.last_modified_lsn = u64::from_le_bytes([
+            buf[48], buf[49], buf[50], buf[51], buf[52], buf[53], buf[54], buf[55],
+        ]);
+        Some(entry)
+    }
+
+    /// Deserialize a legacy v1 FileEntry (48 bytes) from `buf`.
+    ///
+    /// `last_modified_lsn` is synthesized as `created_lsn` — the only known
+    /// LSN reference point for files written under the v1 schema.
+    pub fn read_v1(buf: &[u8]) -> Option<Self> {
+        if buf.len() < Self::SIZE_V1 {
             return None;
         }
 
@@ -172,6 +203,9 @@ impl FileEntry {
             created_lsn,
             min_key_hash,
             max_key_hash,
+            // v1 fallback — synthesize from created_lsn so existing manifests
+            // remain readable and PITR target_lsn comparisons stay sane.
+            last_modified_lsn: created_lsn,
         })
     }
 }
@@ -185,11 +219,17 @@ const ROOT_B_OFFSET: u64 = PAGE_4K as u64;
 /// Payload starts after 64-byte MoonPageHeader.
 /// Layout per §4.2: epoch(8) + redo_lsn(8) + wal_flush_lsn(8) + file_count(4) +
 /// entry_page_count(4) + snapshot_lsn(8) + created_at(8) + shard_uuid(16) = 64 bytes,
-/// then file_count * 48 bytes of FileEntry records.
+/// then file_count * FileEntry::SIZE bytes of FileEntry records.
 const ROOT_META_SIZE: usize = 64;
 
-/// Maximum inline FileEntry records per root page.
-/// (4096 - 64 header - 64 meta) / 48 = 82.
+/// Manifest format version embedded in `MoonPageHeader.format_version`.
+/// - 1 = legacy 48-byte FileEntry layout (read-only fallback).
+/// - 2 = current 56-byte layout with `last_modified_lsn` for PITR.
+pub const MANIFEST_FORMAT_V1: u8 = 1;
+pub const MANIFEST_FORMAT_V2: u8 = 2;
+
+/// Maximum inline FileEntry records per root page (v2 layout).
+/// (4096 - 64 header - 64 meta) / 56 = 70.
 pub const MAX_INLINE_ENTRIES: usize =
     (PAGE_4K - MOONPAGE_HEADER_SIZE - ROOT_META_SIZE) / FileEntry::SIZE;
 
@@ -414,21 +454,23 @@ impl ShardManifest {
         &self.path
     }
 
-    /// Serialize a ManifestRoot into a 4KB page buffer.
+    /// Serialize a ManifestRoot into a 4KB page buffer (always v2 format).
     ///
     /// Layout per §4.2: epoch(8) + redo_lsn(8) + wal_flush_lsn(8) + file_count(4) +
-    /// entry_page_count(4) + snapshot_lsn(8) + created_at(8) + shard_uuid(16) = 64 bytes.
+    /// entry_page_count(4) + snapshot_lsn(8) + created_at(8) + shard_uuid(16) = 64 bytes,
+    /// then file_count * 56-byte FileEntry records.
     fn serialize_root(root: &ManifestRoot, page: &mut [u8]) {
         assert!(page.len() >= PAGE_4K);
 
         // Zero the page
         page[..PAGE_4K].fill(0);
 
-        // Payload: 64 bytes meta + file_count * 48 bytes entries
+        // Payload: 64 bytes meta + file_count * 56 bytes entries (v2)
         let payload_bytes = ROOT_META_SIZE + root.entries.len() * FileEntry::SIZE;
 
-        // Header
+        // Header — stamp v2 format so readers know to expect 56-byte entries.
         let mut hdr = MoonPageHeader::new(PageType::ManifestRoot, 0, 0);
+        hdr.format_version = MANIFEST_FORMAT_V2;
         hdr.payload_bytes = payload_bytes as u32;
         hdr.entry_count = root.entries.len() as u32;
         hdr.write_to(page);
@@ -457,7 +499,11 @@ impl ShardManifest {
 
     /// Try to parse a root page from a 4KB buffer.
     ///
-    /// Returns `None` if magic/type mismatch or CRC32C fails.
+    /// Returns `None` if magic/type mismatch or CRC32C fails. Recognizes both
+    /// v1 (48-byte entries, format_version=1) and v2 (56-byte entries,
+    /// format_version=2). v1 entries are upgraded in-memory with
+    /// `last_modified_lsn = created_lsn` so the rest of the system sees a
+    /// uniform v2 view.
     fn try_parse_root(page: &[u8]) -> Option<ManifestRoot> {
         if page.len() < PAGE_4K {
             return None;
@@ -474,6 +520,15 @@ impl ShardManifest {
             return None;
         }
 
+        // Pick the entry size based on the on-disk format_version.
+        // Unknown versions are rejected (defensive — better to fail loudly
+        // than misinterpret a future format).
+        let entry_size = match hdr.format_version {
+            MANIFEST_FORMAT_V1 => FileEntry::SIZE_V1,
+            MANIFEST_FORMAT_V2 => FileEntry::SIZE,
+            _ => return None,
+        };
+
         // Parse metadata (64 bytes)
         let p = MOONPAGE_HEADER_SIZE;
         let epoch = u64::from_le_bytes(page[p..p + 8].try_into().ok()?);
@@ -486,7 +541,7 @@ impl ShardManifest {
         // the authenticated payload_bytes and entry_count in the header. This
         // prevents reading unchecked trailing bytes on a corrupted root page.
         let expected_payload =
-            ROOT_META_SIZE.checked_add((file_count as usize).checked_mul(FileEntry::SIZE)?)?;
+            ROOT_META_SIZE.checked_add((file_count as usize).checked_mul(entry_size)?)?;
         if hdr.payload_bytes as usize != expected_payload {
             return None;
         }
@@ -498,12 +553,18 @@ impl ShardManifest {
         let mut shard_uuid = [0u8; 16];
         shard_uuid.copy_from_slice(&page[p + 48..p + 64]);
 
-        // Parse entries
+        // Parse entries. Use the size dictated by format_version so v1
+        // manifests remain readable; FileEntry::read_v1 synthesizes
+        // `last_modified_lsn = created_lsn` for the upgraded in-memory view.
         let entries_start = p + ROOT_META_SIZE;
         let mut entries = Vec::with_capacity(file_count as usize);
         for i in 0..file_count as usize {
-            let offset = entries_start + i * FileEntry::SIZE;
-            let entry = FileEntry::read_from(&page[offset..])?;
+            let offset = entries_start + i * entry_size;
+            let entry = if entry_size == FileEntry::SIZE_V1 {
+                FileEntry::read_v1(&page[offset..])?
+            } else {
+                FileEntry::read_from(&page[offset..])?
+            };
             entries.push(entry);
         }
 
@@ -538,9 +599,10 @@ mod tests {
             created_lsn: 42,
             min_key_hash: 0x1111_2222_3333_4444,
             max_key_hash: 0xAAAA_BBBB_CCCC_DDDD,
+            last_modified_lsn: 4242,
         };
 
-        let mut buf = [0u8; 48];
+        let mut buf = [0u8; FileEntry::SIZE];
         entry.write_to(&mut buf);
 
         let parsed = FileEntry::read_from(&buf).expect("should parse");
@@ -548,7 +610,7 @@ mod tests {
     }
 
     #[test]
-    fn file_entry_exactly_48_bytes() {
+    fn file_entry_exactly_56_bytes() {
         let entry = FileEntry {
             file_id: 1,
             file_type: PageType::VecCodes as u8,
@@ -560,13 +622,66 @@ mod tests {
             created_lsn: 100,
             min_key_hash: 0,
             max_key_hash: u64::MAX,
+            last_modified_lsn: 200,
         };
 
         let mut buf = [0xFFu8; 64];
         entry.write_to(&mut buf);
 
-        // Only first 48 bytes should be written; bytes 48..64 should remain 0xFF
-        assert_eq!(buf[48..64], [0xFF; 16]);
+        // First 56 bytes get written (v2 layout); bytes 56..64 must stay 0xFF.
+        assert_eq!(FileEntry::SIZE, 56);
+        assert_eq!(buf[56..64], [0xFF; 8]);
+    }
+
+    /// P1 — last_modified_lsn must roundtrip independently of created_lsn.
+    #[test]
+    fn file_entry_last_modified_lsn_independent_of_created() {
+        let entry = FileEntry {
+            file_id: 7,
+            file_type: PageType::KvLeaf as u8,
+            status: FileStatus::Active,
+            tier: StorageTier::Warm,
+            page_size_log2: 12,
+            page_count: 10,
+            byte_size: 40960,
+            created_lsn: 1,
+            min_key_hash: 0,
+            max_key_hash: 0,
+            last_modified_lsn: 99_999,
+        };
+
+        let mut buf = [0u8; FileEntry::SIZE];
+        entry.write_to(&mut buf);
+        let parsed = FileEntry::read_from(&buf).expect("should parse v2");
+        assert_eq!(parsed.created_lsn, 1);
+        assert_eq!(parsed.last_modified_lsn, 99_999);
+    }
+
+    /// P1 — legacy v1 (48-byte) entries must decode with
+    /// `last_modified_lsn = created_lsn` as a lossless fallback. This is the
+    /// contract that lets existing on-disk manifests survive the upgrade.
+    #[test]
+    fn file_entry_v1_decodes_with_synthesized_last_modified() {
+        // Build a 48-byte v1 entry by hand (no last_modified_lsn trailer).
+        let mut buf = [0u8; FileEntry::SIZE_V1];
+        buf[0..8].copy_from_slice(&123u64.to_le_bytes()); // file_id
+        buf[8] = PageType::KvLeaf as u8;
+        buf[9] = FileStatus::Active as u8;
+        buf[10] = StorageTier::Hot as u8;
+        buf[11] = 12;
+        buf[12..16].copy_from_slice(&50u32.to_le_bytes()); // page_count
+        buf[16..24].copy_from_slice(&(50u64 * 4096).to_le_bytes()); // byte_size
+        buf[24..32].copy_from_slice(&777u64.to_le_bytes()); // created_lsn
+        buf[32..40].copy_from_slice(&0u64.to_le_bytes());
+        buf[40..48].copy_from_slice(&u64::MAX.to_le_bytes());
+
+        let parsed = FileEntry::read_v1(&buf).expect("v1 decode");
+        assert_eq!(parsed.file_id, 123);
+        assert_eq!(parsed.created_lsn, 777);
+        assert_eq!(
+            parsed.last_modified_lsn, 777,
+            "v1 fallback must synthesize last_modified_lsn = created_lsn",
+        );
     }
 
     #[test]
@@ -607,8 +722,9 @@ mod tests {
             created_lsn: 1,
             min_key_hash: 0,
             max_key_hash: 0,
+            last_modified_lsn: 1,
         };
-        let mut buf = [0u8; 48];
+        let mut buf = [0u8; FileEntry::SIZE];
         entry_4k.write_to(&mut buf);
         let parsed = FileEntry::read_from(&buf).unwrap();
         assert_eq!(parsed.page_size_log2, 12);
@@ -626,8 +742,12 @@ mod tests {
 
     #[test]
     fn file_entry_read_from_short_buffer() {
-        let buf = [0u8; 47];
+        // v2 read needs >= 56 bytes
+        let buf = [0u8; 55];
         assert!(FileEntry::read_from(&buf).is_none());
+        // v1 read needs >= 48 bytes
+        let buf = [0u8; 47];
+        assert!(FileEntry::read_v1(&buf).is_none());
     }
 
     // --- ShardManifest tests ---
@@ -644,6 +764,7 @@ mod tests {
             created_lsn: id,
             min_key_hash: 0,
             max_key_hash: u64::MAX,
+            last_modified_lsn: id,
         }
     }
 
@@ -777,30 +898,125 @@ mod tests {
 
     #[test]
     fn test_manifest_max_inline_entries() {
-        // (4096 - 64 header - 64 meta) / 48 = 82
-        assert_eq!(MAX_INLINE_ENTRIES, 82);
+        // v2: (4096 - 64 header - 64 meta) / 56 = 70.
+        // Capacity drops from 82 (v1) → 70 (v2) as the price of adding
+        // last_modified_lsn for PITR. Overflow pages (entry_page_count) are
+        // the long-term answer beyond this ceiling.
+        assert_eq!(MAX_INLINE_ENTRIES, 70);
 
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("shard-0.manifest");
 
         let mut m = ShardManifest::create(&path).unwrap();
 
-        // Add exactly 82 entries
-        for i in 0..82u64 {
+        // Add exactly 70 entries
+        for i in 0..70u64 {
             m.add_file(make_entry(i + 1));
         }
         m.commit().unwrap();
 
         // Verify recovery
         let m2 = ShardManifest::open(&path).unwrap();
-        assert_eq!(m2.files().len(), 82);
+        assert_eq!(m2.files().len(), 70);
 
         // Adding one more should fail on commit
         drop(m2);
         let mut m3 = ShardManifest::open(&path).unwrap();
-        m3.add_file(make_entry(83));
+        m3.add_file(make_entry(71));
         let result = m3.commit();
         assert!(result.is_err());
+    }
+
+    /// P1 — manifest written today must always stamp format_version = 2.
+    /// This is the contract that lets future readers know to expect 56-byte
+    /// FileEntry records.
+    #[test]
+    fn test_manifest_writes_v2_format_version() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("shard-0.manifest");
+
+        let mut m = ShardManifest::create(&path).unwrap();
+        m.add_file(make_entry(1));
+        m.commit().unwrap();
+        drop(m);
+
+        let buf = std::fs::read(&path).unwrap();
+        // After the create + one commit, the active root has the latest data.
+        // Either Root A or Root B should carry format_version = 2 — just
+        // assert that at least one slot is stamped v2 (the active one).
+        let v2_at_a = buf[4] == MANIFEST_FORMAT_V2;
+        let v2_at_b = buf[PAGE_4K + 4] == MANIFEST_FORMAT_V2;
+        assert!(
+            v2_at_a || v2_at_b,
+            "expected v2 format_version on at least one root; got A={} B={}",
+            buf[4],
+            buf[PAGE_4K + 4],
+        );
+    }
+
+    /// P1 — a hand-crafted v1 manifest page (48-byte entries, format_version=1)
+    /// must be readable by the current code, with `last_modified_lsn`
+    /// synthesized from `created_lsn`. This guards the upgrade path for any
+    /// pre-existing on-disk manifests.
+    #[test]
+    fn test_manifest_v1_format_compat() {
+        use crate::persistence::page::{MoonPageHeader, PageType};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("shard-0.manifest");
+
+        // Build an 8KB buffer with a v1 Root A and an empty Root B.
+        let mut buf = vec![0u8; 2 * PAGE_4K];
+
+        // --- Root A (v1) ---
+        // 3 v1 entries of 48 bytes each.
+        let entry_size_v1 = FileEntry::SIZE_V1;
+        let n_entries = 3usize;
+        let payload_bytes = ROOT_META_SIZE + n_entries * entry_size_v1;
+        let mut hdr = MoonPageHeader::new(PageType::ManifestRoot, 0, 0);
+        hdr.format_version = MANIFEST_FORMAT_V1;
+        hdr.payload_bytes = payload_bytes as u32;
+        hdr.entry_count = n_entries as u32;
+        hdr.write_to(&mut buf[..PAGE_4K]);
+
+        // Manifest meta: epoch=1, everything else zero.
+        let p = MOONPAGE_HEADER_SIZE;
+        buf[p..p + 8].copy_from_slice(&1u64.to_le_bytes()); // epoch
+        buf[p + 24..p + 28].copy_from_slice(&(n_entries as u32).to_le_bytes()); // file_count
+
+        // Three v1 entries with distinct created_lsn values.
+        let entries_start = p + ROOT_META_SIZE;
+        for i in 0..n_entries {
+            let off = entries_start + i * entry_size_v1;
+            let created_lsn = 100u64 + i as u64;
+            buf[off..off + 8].copy_from_slice(&((i as u64) + 1).to_le_bytes());
+            buf[off + 8] = PageType::KvLeaf as u8;
+            buf[off + 9] = FileStatus::Active as u8;
+            buf[off + 10] = StorageTier::Hot as u8;
+            buf[off + 11] = 12;
+            buf[off + 12..off + 16].copy_from_slice(&10u32.to_le_bytes());
+            buf[off + 16..off + 24].copy_from_slice(&40960u64.to_le_bytes());
+            buf[off + 24..off + 32].copy_from_slice(&created_lsn.to_le_bytes());
+            buf[off + 32..off + 40].copy_from_slice(&0u64.to_le_bytes());
+            buf[off + 40..off + 48].copy_from_slice(&u64::MAX.to_le_bytes());
+        }
+        MoonPageHeader::compute_checksum(&mut buf[..PAGE_4K]);
+        // Root B stays zeroed → invalid on parse, will be ignored.
+
+        std::fs::write(&path, &buf).unwrap();
+
+        // Now open with the current (v2) code and verify v1 compat.
+        let m = ShardManifest::open(&path).unwrap();
+        assert_eq!(m.epoch(), 1);
+        assert_eq!(m.files().len(), n_entries);
+        for (i, entry) in m.files().iter().enumerate() {
+            assert_eq!(entry.created_lsn, 100 + i as u64);
+            assert_eq!(
+                entry.last_modified_lsn,
+                entry.created_lsn,
+                "v1 entry must synthesize last_modified_lsn = created_lsn",
+            );
+        }
     }
 
     #[test]

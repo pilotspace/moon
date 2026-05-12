@@ -268,6 +268,20 @@ pub struct ServerConfig {
     /// Not yet consumed — reserved for the DiskANN cache layer.
     #[arg(long = "vec-diskann-cache-levels", default_value_t = 3)]
     pub vec_diskann_cache_levels: u32,
+
+    // ── MoonStore v2: Point-in-time recovery (PITR) ────────────────
+    /// Stop WAL replay at this LSN during recovery. Records with LSN > target
+    /// are skipped. Mutually exclusive with --recovery-target-time; if both
+    /// are set the LSN takes precedence. Wired by P3 in recovery.rs.
+    #[arg(long = "recovery-target-lsn", value_name = "LSN")]
+    pub recovery_target_lsn: Option<u64>,
+
+    /// Stop WAL replay at the first record whose timestamp exceeds this
+    /// RFC3339 instant (e.g. "2026-05-12T08:30:00Z"). The recovery scanner
+    /// resolves it to an LSN during P3. Mutually exclusive with
+    /// --recovery-target-lsn (LSN wins if both are set).
+    #[arg(long = "recovery-target-time", value_name = "RFC3339")]
+    pub recovery_target_time: Option<String>,
 }
 
 impl ServerConfig {

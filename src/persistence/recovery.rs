@@ -797,6 +797,7 @@ mod tests {
             created_lsn: 1,
             min_key_hash: 0,
             max_key_hash: u64::MAX,
+            last_modified_lsn: 1,
         });
         manifest.add_file(FileEntry {
             file_id: 99,
@@ -809,6 +810,7 @@ mod tests {
             created_lsn: 2,
             min_key_hash: 0,
             max_key_hash: u64::MAX,
+            last_modified_lsn: 2,
         });
         manifest.commit().unwrap();
         drop(manifest);
@@ -852,6 +854,7 @@ mod tests {
             created_lsn: 1,
             min_key_hash: 0,
             max_key_hash: u64::MAX,
+            last_modified_lsn: 1,
         });
         manifest.commit().unwrap();
         drop(manifest);
@@ -920,6 +923,7 @@ mod tests {
             created_lsn: 10,
             min_key_hash: 0,
             max_key_hash: u64::MAX,
+            last_modified_lsn: 10,
         });
         // Also add a non-cold entry that should be ignored
         manifest.add_file(FileEntry {
@@ -933,6 +937,7 @@ mod tests {
             created_lsn: 11,
             min_key_hash: 0,
             max_key_hash: u64::MAX,
+            last_modified_lsn: 11,
         });
         manifest.commit().unwrap();
         drop(manifest);
