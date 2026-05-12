@@ -1820,7 +1820,7 @@ dependencies = [
 
 [[package]]
 name = "moon"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "anyhow",
  "arc-swap",
