@@ -12,7 +12,9 @@
 
 use std::path::Path;
 
-use super::record::{WalRecord, WalRecordType, read_wal_v3_record};
+use super::record::{
+    WalRecord, WalRecordType, decode_graph_temporal, decode_temporal_upsert, read_wal_v3_record,
+};
 use super::segment::{WAL_V3_HEADER_SIZE, WAL_V3_MAGIC, WAL_V3_VERSION};
 
 /// Result of a WAL v3 replay operation.
@@ -160,6 +162,23 @@ pub fn replay_wal_v3_dir(
     on_command: &mut dyn FnMut(&WalRecord),
     on_fpi: &mut dyn FnMut(&WalRecord),
 ) -> std::io::Result<WalV3ReplayResult> {
+    replay_wal_v3_dir_until(wal_dir, redo_lsn, None, on_command, on_fpi)
+}
+
+/// PITR variant of `replay_wal_v3_dir`: stop replaying once a record with
+/// `lsn > stop_at_lsn` is observed. `stop_at_lsn = None` reproduces the
+/// classic "replay everything past redo_lsn" behavior.
+///
+/// Used by recovery when `--recovery-target-lsn` is set. Returns the same
+/// `WalV3ReplayResult` shape; `last_lsn` reflects the highest LSN actually
+/// applied (which is `<= stop_at_lsn`).
+pub fn replay_wal_v3_dir_until(
+    wal_dir: &Path,
+    redo_lsn: u64,
+    stop_at_lsn: Option<u64>,
+    on_command: &mut dyn FnMut(&WalRecord),
+    on_fpi: &mut dyn FnMut(&WalRecord),
+) -> std::io::Result<WalV3ReplayResult> {
     let mut segments: Vec<_> = std::fs::read_dir(wal_dir)?
         .filter_map(|e| e.ok())
         .filter(|e| e.file_name().to_str().is_some_and(|n| n.ends_with(".wal")))
@@ -171,11 +190,19 @@ pub fn replay_wal_v3_dir(
 
     let mut combined = WalV3ReplayResult::default();
     for seg_path in &segments {
-        let result = replay_wal_v3_file(seg_path, redo_lsn, on_command, on_fpi)?;
+        let result =
+            replay_wal_v3_file_until(seg_path, redo_lsn, stop_at_lsn, on_command, on_fpi)?;
         combined.commands_replayed += result.commands_replayed;
         combined.fpi_applied += result.fpi_applied;
         if result.last_lsn > combined.last_lsn {
             combined.last_lsn = result.last_lsn;
+        }
+        // Early exit: once a segment indicates we crossed the stop boundary,
+        // later segments only contain higher LSNs (segments are monotonic).
+        if let Some(target) = stop_at_lsn {
+            if combined.last_lsn >= target {
+                break;
+            }
         }
     }
     Ok(combined)
@@ -193,6 +220,18 @@ pub fn replay_wal_v3_dir(
 pub fn replay_wal_v3_file(
     path: &Path,
     redo_lsn: u64,
+    on_command: &mut dyn FnMut(&WalRecord),
+    on_fpi: &mut dyn FnMut(&WalRecord),
+) -> std::io::Result<WalV3ReplayResult> {
+    replay_wal_v3_file_until(path, redo_lsn, None, on_command, on_fpi)
+}
+
+/// PITR variant of `replay_wal_v3_file`: stops once `record.lsn > stop_at_lsn`.
+/// See `replay_wal_v3_dir_until` for the dir-level entry point.
+pub fn replay_wal_v3_file_until(
+    path: &Path,
+    redo_lsn: u64,
+    stop_at_lsn: Option<u64>,
     on_command: &mut dyn FnMut(&WalRecord),
     on_fpi: &mut dyn FnMut(&WalRecord),
 ) -> std::io::Result<WalV3ReplayResult> {
@@ -240,6 +279,16 @@ pub fn replay_wal_v3_file(
         ]) as usize;
         offset += record_len;
 
+        // PITR stop: once a record's LSN exceeds the target, halt without
+        // applying it. We do NOT bump `last_lsn` past the cutoff -- callers
+        // use `last_lsn` as "highest applied LSN" for restoring control file
+        // state, and bumping it would falsely advance wal_flush_lsn.
+        if let Some(target) = stop_at_lsn {
+            if record.lsn > target {
+                break;
+            }
+        }
+
         // Track last LSN seen
         if record.lsn > result.last_lsn {
             result.last_lsn = record.lsn;
@@ -283,6 +332,89 @@ pub fn replay_wal_v3_file(
     }
 
     Ok(result)
+}
+
+/// Resolve a wall-clock instant to the LSN at which to stop WAL replay.
+///
+/// Walks all segments in `wal_dir` newest-LSN-last, examining only records
+/// that carry a timestamp:
+///   * `TemporalUpsert` -> uses `system_from` (decoded from payload)
+///   * `GraphTemporal`  -> uses `system_from` (decoded from payload)
+///
+/// Returns the highest LSN whose timestamp is `<= target_unix_ms`. If no
+/// timestamped record exists (or all are after `target_unix_ms`), returns
+/// `None`. Callers should fall back to `--recovery-target-lsn` with an
+/// operator-supplied value when this resolver yields `None`.
+///
+/// **Coverage limitation.** Today only temporal commands stamp `system_from`
+/// into the WAL. Workloads without temporal ops have no time anchors and
+/// must use `--recovery-target-lsn` directly. A future commit can add a
+/// periodic `TimestampMarker` record to give every WAL implicit time
+/// anchors; for v0.2 this honest limitation is acceptable.
+pub fn resolve_target_time_to_lsn(
+    wal_dir: &Path,
+    target_unix_ms: i64,
+) -> std::io::Result<Option<u64>> {
+    let mut segments: Vec<_> = std::fs::read_dir(wal_dir)?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_str().is_some_and(|n| n.ends_with(".wal")))
+        .map(|e| e.path())
+        .collect();
+    segments.sort();
+
+    let mut best: Option<u64> = None;
+
+    for seg_path in &segments {
+        let data = std::fs::read(seg_path)?;
+        if data.len() < WAL_V3_HEADER_SIZE {
+            continue;
+        }
+        if &data[..6] != WAL_V3_MAGIC || data[6] != WAL_V3_VERSION {
+            // Non-v3 segment — skip rather than fail; the caller may be
+            // mid-format-migration and we should not block PITR on that.
+            continue;
+        }
+
+        let mut offset = WAL_V3_HEADER_SIZE;
+        while offset + 4 <= data.len() {
+            let record_len = u32::from_le_bytes([
+                data[offset],
+                data[offset + 1],
+                data[offset + 2],
+                data[offset + 3],
+            ]) as usize;
+            if record_len == 0 || offset + record_len > data.len() {
+                break;
+            }
+            let record = match read_wal_v3_record(&data[offset..offset + record_len]) {
+                Some(r) => r,
+                None => break,
+            };
+            offset += record_len;
+
+            let ts: Option<i64> = match record.record_type {
+                WalRecordType::TemporalUpsert => decode_temporal_upsert(&record.payload)
+                    .map(|(_, _, system_from, _)| system_from),
+                WalRecordType::GraphTemporal => decode_graph_temporal(&record.payload)
+                    .map(|(_, _, _, system_from)| system_from),
+                _ => None,
+            };
+            if let Some(t) = ts {
+                if t <= target_unix_ms {
+                    // Record is at or before the target — eligible.
+                    if best.map(|b| record.lsn > b).unwrap_or(true) {
+                        best = Some(record.lsn);
+                    }
+                } else {
+                    // First timestamp past the target -> no later record in
+                    // this or subsequent segments can be earlier (WAL is
+                    // append-only and monotonic per shard). Stop scanning.
+                    return Ok(best);
+                }
+            }
+        }
+    }
+    Ok(best)
 }
 
 /// Replay a cross-store transaction commit record.
@@ -559,6 +691,137 @@ mod tests {
         assert_eq!(result.fpi_applied, 0);
         assert_eq!(fpi_count, 0);
         assert_eq!(result.last_lsn, 3);
+    }
+
+    /// P3 — replay must stop at `stop_at_lsn`: records strictly above the
+    /// target are not dispatched, and `last_lsn` reflects only the records
+    /// actually applied. This is the core PITR primitive.
+    #[test]
+    fn test_v3_replay_stops_at_target_lsn() {
+        let tmp = tempfile::tempdir().unwrap();
+        let seg_path = tmp.path().join("000000000001.wal");
+
+        // 10 command records, LSN 1..=10.
+        let mut data = make_v3_header(0);
+        for i in 1..=10u64 {
+            write_wal_v3_record(&mut data, i, WalRecordType::Command, b"SET k v");
+        }
+        std::fs::write(&seg_path, &data).unwrap();
+
+        let mut applied: Vec<u64> = Vec::new();
+        let result = replay_wal_v3_file_until(
+            &seg_path,
+            0,
+            Some(5),
+            &mut |r| applied.push(r.lsn),
+            &mut |_| {},
+        )
+        .unwrap();
+
+        assert_eq!(result.commands_replayed, 5, "should apply LSN 1..=5 only");
+        assert_eq!(applied, vec![1, 2, 3, 4, 5]);
+        assert_eq!(
+            result.last_lsn, 5,
+            "last_lsn must not advance past the target (used to restore wal_flush_lsn)",
+        );
+    }
+
+    /// P3 — multi-segment replay must stop at the cutoff even when the
+    /// target LSN lives mid-segment.
+    #[test]
+    fn test_v3_replay_dir_stops_at_target_lsn() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_dir = tmp.path().join("wal");
+        std::fs::create_dir_all(&wal_dir).unwrap();
+
+        // Segment 1: LSNs 1..=3
+        let mut data1 = make_v3_header(0);
+        for i in 1..=3u64 {
+            write_wal_v3_record(&mut data1, i, WalRecordType::Command, b"SET a 1");
+        }
+        std::fs::write(wal_dir.join("000000000001.wal"), &data1).unwrap();
+        // Segment 2: LSNs 4..=8
+        let mut data2 = make_v3_header(0);
+        for i in 4..=8u64 {
+            write_wal_v3_record(&mut data2, i, WalRecordType::Command, b"SET b 2");
+        }
+        std::fs::write(wal_dir.join("000000000002.wal"), &data2).unwrap();
+
+        let mut cmd_count = 0usize;
+        let result = replay_wal_v3_dir_until(
+            &wal_dir,
+            0,
+            Some(5),
+            &mut |_| cmd_count += 1,
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(
+            result.commands_replayed, 5,
+            "should apply LSN 1..=5 across both segments"
+        );
+        assert_eq!(cmd_count, 5);
+        assert_eq!(result.last_lsn, 5);
+    }
+
+    /// P3 — `stop_at_lsn = None` must reproduce the classic replay behavior
+    /// so the new code path doesn't regress existing recovery callers.
+    #[test]
+    fn test_v3_replay_no_stop_matches_classic() {
+        let tmp = tempfile::tempdir().unwrap();
+        let seg_path = tmp.path().join("000000000001.wal");
+        let mut data = make_v3_header(0);
+        for i in 1..=4u64 {
+            write_wal_v3_record(&mut data, i, WalRecordType::Command, b"SET k v");
+        }
+        std::fs::write(&seg_path, &data).unwrap();
+
+        let classic = replay_wal_v3_file(&seg_path, 0, &mut |_| {}, &mut |_| {}).unwrap();
+        let same =
+            replay_wal_v3_file_until(&seg_path, 0, None, &mut |_| {}, &mut |_| {}).unwrap();
+        assert_eq!(classic.commands_replayed, same.commands_replayed);
+        assert_eq!(classic.last_lsn, same.last_lsn);
+        assert_eq!(classic.fpi_applied, same.fpi_applied);
+    }
+
+    /// P3 — `resolve_target_time_to_lsn` walks TemporalUpsert + GraphTemporal
+    /// records and returns the highest LSN whose timestamp is <= target.
+    #[test]
+    fn test_resolve_target_time_to_lsn() {
+        use super::super::record::{encode_graph_temporal, encode_temporal_upsert};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_dir = tmp.path().join("wal");
+        std::fs::create_dir_all(&wal_dir).unwrap();
+
+        // Build one segment with mixed records, each carrying explicit system_from.
+        let mut data = make_v3_header(0);
+        // LSN 1: TemporalUpsert at ts=100
+        let p1 = encode_temporal_upsert(b"k1", 100, 100, b"v1");
+        write_wal_v3_record(&mut data, 1, WalRecordType::TemporalUpsert, &p1);
+        // LSN 2: GraphTemporal at ts=200
+        let p2 = encode_graph_temporal(42, true, i64::MAX, 200);
+        write_wal_v3_record(&mut data, 2, WalRecordType::GraphTemporal, &p2);
+        // LSN 3: plain Command — has no timestamp, ignored by the resolver
+        write_wal_v3_record(&mut data, 3, WalRecordType::Command, b"SET a 1");
+        // LSN 4: TemporalUpsert at ts=400
+        let p4 = encode_temporal_upsert(b"k4", 400, 400, b"v4");
+        write_wal_v3_record(&mut data, 4, WalRecordType::TemporalUpsert, &p4);
+        std::fs::write(wal_dir.join("000000000001.wal"), &data).unwrap();
+
+        // Target ts=250 should land on LSN 2 (the GraphTemporal with ts=200);
+        // LSN 4 (ts=400) is past the target.
+        let lsn = resolve_target_time_to_lsn(&wal_dir, 250).unwrap();
+        assert_eq!(lsn, Some(2));
+
+        // Target ts=500 covers everything that has a timestamp -> LSN 4.
+        let lsn = resolve_target_time_to_lsn(&wal_dir, 500).unwrap();
+        assert_eq!(lsn, Some(4));
+
+        // Target ts=50 has nothing eligible -> None (caller falls back to
+        // --recovery-target-lsn).
+        let lsn = resolve_target_time_to_lsn(&wal_dir, 50).unwrap();
+        assert_eq!(lsn, None);
     }
 
     #[test]
