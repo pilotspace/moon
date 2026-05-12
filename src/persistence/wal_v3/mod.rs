@@ -3,6 +3,7 @@
 pub mod record;
 pub mod replay;
 pub mod segment;
+pub mod tail;
 
 pub use record::{WalRecord, WalRecordType, read_wal_v3_record, write_wal_v3_record};
 pub use replay::{
@@ -10,3 +11,4 @@ pub use replay::{
     replay_wal_v3_file, replay_wal_v3_file_until, resolve_target_time_to_lsn,
 };
 pub use segment::{WalSegment, WalWriterV3};
+pub use tail::{TailCursor, WalTailReader};
