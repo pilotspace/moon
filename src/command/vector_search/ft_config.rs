@@ -114,7 +114,11 @@ fn ft_config_set(
             .and_then(|s| s.parse::<f32>().ok())
         {
             Some(v) => v,
-            None => return Frame::Error(Bytes::from_static(b"ERR COMPACTION_WEIGHT must be a number")),
+            None => {
+                return Frame::Error(Bytes::from_static(
+                    b"ERR COMPACTION_WEIGHT must be a number",
+                ));
+            }
         };
         // Scoped block: set weight, ending borrow of `store` via `idx` before
         // we call `store.save_index_meta_sidecar()`.

@@ -80,7 +80,8 @@ fn serialize_index_metas_v1(metas: &[&IndexMeta]) -> Vec<u8> {
 /// `vector_fields` array.
 pub fn serialize_index_metas(metas: &[&IndexMeta]) -> Vec<u8> {
     // Wrap with default weight=1.0 and delegate to v3 serializer.
-    let pairs: Vec<(&IndexMeta, f32)> = metas.iter().map(|&m| (m, DEFAULT_WEIGHT_ON_LOAD)).collect();
+    let pairs: Vec<(&IndexMeta, f32)> =
+        metas.iter().map(|&m| (m, DEFAULT_WEIGHT_ON_LOAD)).collect();
     serialize_index_metas_v3(&pairs)
 }
 
@@ -358,7 +359,8 @@ fn decode_build_mode(v: u8) -> BuildMode {
 /// IndexMeta before VectorIndex is created). Prefer `save_index_metadata_v3` when
 /// `VectorIndex` weights are available.
 pub fn save_index_metadata(shard_dir: &Path, metas: &[&IndexMeta]) -> io::Result<()> {
-    let pairs: Vec<(&IndexMeta, f32)> = metas.iter().map(|&m| (m, DEFAULT_WEIGHT_ON_LOAD)).collect();
+    let pairs: Vec<(&IndexMeta, f32)> =
+        metas.iter().map(|&m| (m, DEFAULT_WEIGHT_ON_LOAD)).collect();
     save_index_metadata_v3(shard_dir, &pairs)
 }
 
@@ -711,7 +713,10 @@ mod tests {
 
         let result = deserialize_index_metas_with_weights(&data).unwrap();
         assert_eq!(result.len(), 1);
-        assert!((result[0].1 - 7.5f32).abs() < 1e-6, "weight must round-trip");
+        assert!(
+            (result[0].1 - 7.5f32).abs() < 1e-6,
+            "weight must round-trip"
+        );
     }
 
     #[test]
@@ -770,6 +775,9 @@ mod tests {
         let loaded = load_index_metadata_with_weights(tmp.path()).unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].0.name, "weighted_idx");
-        assert!((loaded[0].1 - 42.0f32).abs() < 1e-6, "weight must survive file round-trip");
+        assert!(
+            (loaded[0].1 - 42.0f32).abs() < 1e-6,
+            "weight must survive file round-trip"
+        );
     }
 }

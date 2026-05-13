@@ -105,7 +105,8 @@ impl MmapBudget {
             // Delta update: adjust totals by the difference only.
             let old_bytes = old.resident_bytes;
             if old_bytes != resident_bytes {
-                self.total_resident_bytes = self.total_resident_bytes
+                self.total_resident_bytes = self
+                    .total_resident_bytes
                     .saturating_sub(old_bytes)
                     .saturating_add(resident_bytes);
                 if resident_bytes >= old_bytes {
@@ -118,9 +119,9 @@ impl MmapBudget {
             // When size is unchanged, nothing to do (no atomic churn).
         } else {
             // New entry.
-            self.entries.insert(segment_id, SegmentEntry { resident_bytes });
-            self.total_resident_bytes =
-                self.total_resident_bytes.saturating_add(resident_bytes);
+            self.entries
+                .insert(segment_id, SegmentEntry { resident_bytes });
+            self.total_resident_bytes = self.total_resident_bytes.saturating_add(resident_bytes);
             crate::admin::recl_atomics::add_warm_resident(resident_bytes);
         }
     }
@@ -138,8 +139,9 @@ impl MmapBudget {
     /// handles orphan removal, but explicit calls ensure immediate cleanup.
     pub fn remove_segment(&mut self, segment_id: u64) {
         if let Some(entry) = self.entries.remove(&segment_id) {
-            self.total_resident_bytes =
-                self.total_resident_bytes.saturating_sub(entry.resident_bytes);
+            self.total_resident_bytes = self
+                .total_resident_bytes
+                .saturating_sub(entry.resident_bytes);
             crate::admin::recl_atomics::sub_warm_resident(entry.resident_bytes);
         }
     }
@@ -168,9 +170,7 @@ impl MmapBudget {
     ///
     /// Returns statistics for logging and the INFO output.
     pub fn enforce_budget(&mut self, segment_list: &mut SegmentList) -> EnforceStats {
-        if self.max_resident_bytes == 0
-            || self.total_resident_bytes <= self.max_resident_bytes
-        {
+        if self.max_resident_bytes == 0 || self.total_resident_bytes <= self.max_resident_bytes {
             return EnforceStats {
                 segments_evicted: 0,
                 bytes_freed: 0,
@@ -237,13 +237,16 @@ impl MmapBudget {
         // Remove evicted segments from segment_list.warm.
         // Arc drop triggers SegmentHandle refcount decrement; directory removal
         // only occurs if the handle is tombstoned AND refcount hits zero.
-        segment_list.warm.retain(|arc| !evict_ids.contains(&arc.segment_id()));
+        segment_list
+            .warm
+            .retain(|arc| !evict_ids.contains(&arc.segment_id()));
 
         // Update the tracker.
         for seg_id in &evict_ids {
             if let Some(entry) = self.entries.remove(seg_id) {
-                self.total_resident_bytes =
-                    self.total_resident_bytes.saturating_sub(entry.resident_bytes);
+                self.total_resident_bytes = self
+                    .total_resident_bytes
+                    .saturating_sub(entry.resident_bytes);
                 crate::admin::recl_atomics::sub_warm_resident(entry.resident_bytes);
             }
         }
@@ -283,7 +286,9 @@ mod tests {
     use crate::vector::distance;
     use crate::vector::hnsw::graph::HnswGraph;
     use crate::vector::persistence::warm_search::WarmSearchSegment;
-    use crate::vector::persistence::warm_segment::{write_codes_mpf, write_graph_mpf, write_mvcc_mpf};
+    use crate::vector::persistence::warm_segment::{
+        write_codes_mpf, write_graph_mpf, write_mvcc_mpf,
+    };
     use crate::vector::segment::SegmentList;
     use crate::vector::segment::mutable::MutableSegment;
     use crate::vector::turbo_quant::collection::{CollectionMetadata, QuantizationConfig};
@@ -325,14 +330,8 @@ mod tests {
         let seg_dir = tmp.join(format!("seg-{seg_id}"));
         write_minimal_segment(&seg_dir, seg_id);
         let handle = SegmentHandle::new(seg_id, seg_dir.clone());
-        let ws = WarmSearchSegment::from_files(
-            &seg_dir,
-            seg_id,
-            make_collection(),
-            handle,
-            false,
-        )
-        .unwrap();
+        let ws = WarmSearchSegment::from_files(&seg_dir, seg_id, make_collection(), handle, false)
+            .unwrap();
         Arc::new(ws)
     }
 
@@ -362,7 +361,11 @@ mod tests {
         let stats = budget.enforce_budget(&mut list);
 
         assert_eq!(stats.segments_evicted, 0);
-        assert_eq!(list.warm.len(), 1, "no segment should be evicted when budget=0");
+        assert_eq!(
+            list.warm.len(),
+            1,
+            "no segment should be evicted when budget=0"
+        );
     }
 
     /// Budget above total → nothing evicted.
@@ -430,7 +433,8 @@ mod tests {
         // The warm list must have shrunk.
         assert!(
             list.warm.len() < 5,
-            "warm list should have shrunk; len={}", list.warm.len()
+            "warm list should have shrunk; len={}",
+            list.warm.len()
         );
     }
 
@@ -467,7 +471,10 @@ mod tests {
         let stats = budget.enforce_budget(&mut list);
 
         // At least one was evicted.
-        assert!(stats.segments_evicted > 0, "expected eviction; stats={stats:?}");
+        assert!(
+            stats.segments_evicted > 0,
+            "expected eviction; stats={stats:?}"
+        );
 
         // Segment 30 (most recently searched) must still be in the list.
         let remaining_ids: Vec<u64> = list.warm.iter().map(|w| w.segment_id()).collect();

@@ -1657,7 +1657,7 @@ pub fn vacuum_vector(
         _ => {
             return Frame::Error(Bytes::from_static(
                 b"ERR usage: VACUUM VECTOR <index_name> [WEIGHT <n>]",
-            ))
+            ));
         }
     };
 
@@ -1671,7 +1671,7 @@ pub fn vacuum_vector(
                     _ => {
                         return Frame::Error(Bytes::from_static(
                             b"ERR WEIGHT requires a numeric value",
-                        ))
+                        ));
                     }
                 };
                 let parsed: f32 = match std::str::from_utf8(val_bytes)
@@ -1680,18 +1680,14 @@ pub fn vacuum_vector(
                 {
                     Some(v) => v,
                     None => {
-                        return Frame::Error(Bytes::from_static(
-                            b"ERR WEIGHT must be a number",
-                        ))
+                        return Frame::Error(Bytes::from_static(b"ERR WEIGHT must be a number"));
                     }
                 };
                 let set_result = {
                     let idx = match vector_store.get_index_mut(name.as_ref()) {
                         Some(i) => i,
                         None => {
-                            return Frame::Error(Bytes::from_static(
-                                b"ERR unknown vector index",
-                            ))
+                            return Frame::Error(Bytes::from_static(b"ERR unknown vector index"));
                         }
                     };
                     idx.try_set_compaction_weight(parsed)

@@ -195,22 +195,19 @@ pub(crate) fn run_cold_orphan_sweep(
         }
 
         // Phase 2: delete files + update cold_index (mutable borrow; db not borrowed).
-        let stats = guard
-            .cold_index
-            .as_mut()
-            .and_then(|ci| {
-                ci.sweep_known_orphans(orphan_keys, shard_dir, manifest.as_deref_mut())
-                    .map_err(|e| {
-                        tracing::error!(
-                            shard = shard_id,
-                            db = db_idx,
-                            err = %e,
-                            "cold_orphan_sweep: manifest commit error",
-                        );
-                        e
-                    })
-                    .ok()
-            });
+        let stats = guard.cold_index.as_mut().and_then(|ci| {
+            ci.sweep_known_orphans(orphan_keys, shard_dir, manifest.as_deref_mut())
+                .map_err(|e| {
+                    tracing::error!(
+                        shard = shard_id,
+                        db = db_idx,
+                        err = %e,
+                        "cold_orphan_sweep: manifest commit error",
+                    );
+                    e
+                })
+                .ok()
+        });
 
         if let Some(s) = stats {
             total.entries_reclaimed += s.entries_reclaimed;

@@ -37,9 +37,7 @@ use std::time::{Duration, Instant};
 fn test_weight_multiplies_priority() {
     let starvation_cap = Duration::from_secs(3600); // never fires in this test
 
-    let base = Instant::now()
-        .checked_sub(Duration::from_secs(1))
-        .unwrap();
+    let base = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
 
     let mut scheduler = CompactionScheduler::new(starvation_cap);
     // Both have identical dead_bytes (1000) and identical elapsed (1s).
@@ -176,9 +174,7 @@ fn test_weight_zero_does_not_prevent_starvation() {
 #[test]
 fn test_weight_default_is_one() {
     let starvation_cap = Duration::from_secs(3600);
-    let base = Instant::now()
-        .checked_sub(Duration::from_secs(1))
-        .unwrap();
+    let base = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
 
     let mut scheduler = CompactionScheduler::new(starvation_cap);
     // A has higher bytes_dead, B has lower. With weight=1.0 (default), A wins.
@@ -210,9 +206,7 @@ fn test_weight_default_is_one() {
 #[test]
 fn test_weight_high_cold_beats_low_hot() {
     let starvation_cap = Duration::from_secs(3600);
-    let base = Instant::now()
-        .checked_sub(Duration::from_secs(1))
-        .unwrap();
+    let base = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
 
     let mut scheduler = CompactionScheduler::new(starvation_cap);
     // hot_low: 1000 bytes/s × weight=1 → 1000 effective

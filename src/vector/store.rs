@@ -625,8 +625,7 @@ impl VectorStore {
     pub fn save_index_meta_sidecar(&self) {
         if let Some(ref dir) = self.persist_dir {
             let meta_weights = self.collect_index_metas_with_weights();
-            if let Err(e) =
-                crate::vector::index_persist::save_index_metadata_v3(dir, &meta_weights)
+            if let Err(e) = crate::vector::index_persist::save_index_metadata_v3(dir, &meta_weights)
             {
                 tracing::warn!("Failed to save vector index metadata: {}", e);
             }

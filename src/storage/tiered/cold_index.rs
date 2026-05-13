@@ -198,9 +198,7 @@ impl ColdIndex {
             let file_path = data_dir.join(format!("heap-{:06}.mpf", loc.file_id));
 
             // Determine file size before deletion for byte accounting.
-            let file_bytes = std::fs::metadata(&file_path)
-                .map(|m| m.len())
-                .unwrap_or(0);
+            let file_bytes = std::fs::metadata(&file_path).map(|m| m.len()).unwrap_or(0);
 
             // Delete the DataFile (idempotent — missing = already gone).
             match std::fs::remove_file(&file_path) {

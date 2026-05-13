@@ -43,17 +43,23 @@ fn test_orphan_sweep_removes_hot_shadowed_key() {
     // 2. Hot DB contains K1 (simulates a SET that overwritten the cold entry)
     let mut db = Database::new();
     db.set(Bytes::from_static(b"k1"), make_string_entry("hot_value"));
-    assert!(
-        db.is_hot(b"k1"),
-        "K1 should be hot after set"
-    );
+    assert!(db.is_hot(b"k1"), "K1 should be hot after set");
 
     // 3. Run orphan sweep — K1 is hot, so cold entry is orphan
-    let stats = cold_index.orphan_sweep(&db, shard_dir, Some(&mut manifest)).unwrap();
+    let stats = cold_index
+        .orphan_sweep(&db, shard_dir, Some(&mut manifest))
+        .unwrap();
 
-    assert_eq!(stats.entries_reclaimed, 1, "one orphan entry should be reclaimed");
+    assert_eq!(
+        stats.entries_reclaimed, 1,
+        "one orphan entry should be reclaimed"
+    );
     assert!(stats.bytes_reclaimed > 0, "bytes reclaimed should be > 0");
-    assert_eq!(cold_index.len(), 0, "cold index should be empty after sweep");
+    assert_eq!(
+        cold_index.len(),
+        0,
+        "cold index should be empty after sweep"
+    );
     assert!(
         !cold_file.exists(),
         "cold file should be deleted after orphan sweep"
@@ -89,9 +95,14 @@ fn test_orphan_sweep_preserves_cold_only_key() {
     assert!(!db.is_hot(b"k2"), "K2 should not be hot");
 
     // Sweep must preserve K2
-    let stats = cold_index.orphan_sweep(&db, shard_dir, Some(&mut manifest)).unwrap();
+    let stats = cold_index
+        .orphan_sweep(&db, shard_dir, Some(&mut manifest))
+        .unwrap();
 
-    assert_eq!(stats.entries_reclaimed, 0, "cold-only entry must not be reclaimed");
+    assert_eq!(
+        stats.entries_reclaimed, 0,
+        "cold-only entry must not be reclaimed"
+    );
     assert_eq!(stats.bytes_reclaimed, 0);
     assert_eq!(cold_index.len(), 1, "cold index must still contain K2");
     assert!(cold_file.exists(), "cold file for K2 must survive sweep");
@@ -133,7 +144,9 @@ fn test_orphan_sweep_mixed_hot_and_cold_only() {
     let mut db = Database::new();
     db.set(Bytes::from_static(b"k1"), make_string_entry("v1_hot"));
 
-    let stats = cold_index.orphan_sweep(&db, shard_dir, Some(&mut manifest)).unwrap();
+    let stats = cold_index
+        .orphan_sweep(&db, shard_dir, Some(&mut manifest))
+        .unwrap();
 
     assert_eq!(stats.entries_reclaimed, 1);
     assert_eq!(cold_index.len(), 1, "only K2 should remain in cold index");
@@ -152,7 +165,9 @@ fn test_orphan_sweep_empty_cold_index() {
     let mut cold_index = ColdIndex::new();
     let db = Database::new();
 
-    let stats = cold_index.orphan_sweep(&db, shard_dir, Some(&mut manifest)).unwrap();
+    let stats = cold_index
+        .orphan_sweep(&db, shard_dir, Some(&mut manifest))
+        .unwrap();
     assert_eq!(stats.entries_reclaimed, 0);
     assert_eq!(stats.bytes_reclaimed, 0);
 }
@@ -178,13 +193,18 @@ fn test_orphan_sweep_manifests_tombstone() {
 
     // Confirm manifest has the active entry
     let before = manifest.files().iter().find(|f| f.file_id == 20).unwrap();
-    assert_eq!(before.status, moon::persistence::manifest::FileStatus::Active);
+    assert_eq!(
+        before.status,
+        moon::persistence::manifest::FileStatus::Active
+    );
 
     // Hot overwrite
     let mut db = Database::new();
     db.set(Bytes::from_static(b"kx"), make_string_entry("hot"));
 
-    cold_index.orphan_sweep(&db, shard_dir, Some(&mut manifest)).unwrap();
+    cold_index
+        .orphan_sweep(&db, shard_dir, Some(&mut manifest))
+        .unwrap();
 
     // Manifest entry should now be Tombstone
     let after = manifest.files().iter().find(|f| f.file_id == 20).unwrap();

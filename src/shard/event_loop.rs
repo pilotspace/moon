@@ -837,8 +837,9 @@ impl super::Shard {
                     for (key, entry) in guard.data().iter() {
                         let key_bytes = key.as_bytes();
                         let matches_vector = metas.as_ref().is_some_and(|ms| {
-                            ms.iter()
-                                .any(|(m, _w)| m.key_prefixes.iter().any(|p| key_bytes.starts_with(p)))
+                            ms.iter().any(|(m, _w)| {
+                                m.key_prefixes.iter().any(|p| key_bytes.starts_with(p))
+                            })
                         });
                         let matches_text = text_metas.as_ref().is_some_and(|ms| {
                             ms.iter()

@@ -37,9 +37,11 @@ pub fn add_warm_resident(delta: u64) {
 #[inline]
 pub fn sub_warm_resident(delta: u64) {
     // Saturating subtract: counter must never wrap below zero.
-    RECL_MMAP_WARM_BYTES.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
-        Some(cur.saturating_sub(delta))
-    }).ok();
+    RECL_MMAP_WARM_BYTES
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+            Some(cur.saturating_sub(delta))
+        })
+        .ok();
 }
 
 /// Increment the eviction counter by `count`.
