@@ -43,6 +43,14 @@ use crate::storage::entry::Entry;
 type ShardManifest = crate::persistence::manifest::ShardManifest;
 type WalWriterV3 = crate::persistence::wal_v3::segment::WalWriterV3;
 
+/// Default MVCC committed-prune margin used when VACUUM is dispatched through
+/// a connection handler that does not have access to `ServerConfig`.
+/// Matches the `mvcc_committed_prune_margin` config default (1000).
+///
+/// Used by handler_single, handler_sharded, and handler_monoio. The spsc_handler
+/// path reads the real value from `server_config.mvcc_committed_prune_margin`.
+pub const DEFAULT_VACUUM_PRUNE_MARGIN: u64 = 1000;
+
 // ---------------------------------------------------------------------------
 // FLUSHDB / FLUSHALL
 // ---------------------------------------------------------------------------
@@ -915,6 +923,27 @@ fn run_vacuum_passes(
 ///
 /// ## Returns
 /// Array of alternating `[label, count]` bulk strings (12 elements).
+///
+/// ## Dispatch-path contract
+///
+/// VACUUM always runs the MVCC passes (prune_committed, sweep_zombies,
+/// mark_old_snapshots_killed) regardless of dispatch path. The manifest GC
+/// and WAL recycle passes require the shard manifest and WAL writer, which
+/// only exist in the shard event loop:
+///
+/// - **SPSC path** (console gateway, admin console): Full pass — manifest,
+///   MVCC, and WAL. `manifest_pruned` and `wal_segments_recycled` reflect
+///   real work when resources are available.
+///
+/// - **Direct dispatch path** (main-port connections via handler_single,
+///   handler_sharded, handler_monoio): MVCC passes only. `manifest_pruned`
+///   and `wal_segments_recycled` always return 0 because the manifest lives
+///   only in the shard event loop (architecture constraint). The persistence
+///   tick already handles manifest GC automatically; manual VACUUM on the main
+///   port delivers the MVCC reclamation operators need most urgently.
+///
+/// For manifest/WAL reclamation via `VACUUM`, use the admin console, which
+/// dispatches through the console-gateway SPSC path where manifest is in scope.
 ///
 /// ## Edge cases
 /// - No persistence_dir: manifest and WAL counts return 0.

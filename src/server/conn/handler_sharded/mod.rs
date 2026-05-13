@@ -922,7 +922,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                             None, // manifest — not available in connection handler
                             None, // wal_v3 — not available in connection handler
                             cmd_args,
-                            1000, // default mvcc_prune_margin
+                            crate::command::server_admin::DEFAULT_VACUUM_PRUNE_MARGIN, // see server_admin.rs
                         );
                         drop(vs);
                         responses.push(response);

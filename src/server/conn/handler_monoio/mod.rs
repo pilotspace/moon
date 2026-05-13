@@ -902,9 +902,11 @@ pub(crate) async fn handle_connection_sharded_monoio<
             if cmd.eq_ignore_ascii_case(b"VACUUM") {
                 let mut vs = ctx.shard_databases.vector_store(ctx.shard_id);
                 let response = crate::command::server_admin::vacuum(
-                    &mut vs, None, // manifest — not available in connection handler
+                    &mut vs,
+                    None, // manifest — not available in connection handler
                     None, // wal_v3 — not available in connection handler
-                    cmd_args, 1000, // default mvcc_prune_margin
+                    cmd_args,
+                    crate::command::server_admin::DEFAULT_VACUUM_PRUNE_MARGIN, // see server_admin.rs
                 );
                 drop(vs);
                 responses.push(response);

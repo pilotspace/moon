@@ -1645,7 +1645,7 @@ pub async fn handle_connection(
                                             None, // manifest — not available here
                                             None, // wal_v3 — not available here
                                             d_args,
-                                            1000, // default mvcc_prune_margin
+                                            crate::command::server_admin::DEFAULT_VACUUM_PRUNE_MARGIN, // see server_admin.rs
                                         );
                                         drop(vs_guard);
                                         responses[resp_idx] = response;
@@ -1867,7 +1867,7 @@ pub async fn handle_connection(
                                             None, // manifest — not available here
                                             None, // wal_v3 — not available here
                                             d_args,
-                                            1000, // default mvcc_prune_margin
+                                            crate::command::server_admin::DEFAULT_VACUUM_PRUNE_MARGIN, // see server_admin.rs
                                         );
                                         drop(vs_guard);
                                         responses[resp_idx] = response;
