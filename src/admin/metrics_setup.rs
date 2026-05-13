@@ -27,6 +27,14 @@ static TOTAL_COMMANDS: AtomicU64 = AtomicU64::new(0);
 static TOTAL_CONNECTIONS: AtomicU64 = AtomicU64::new(0);
 static CONNECTED_CLIENTS: AtomicU64 = AtomicU64::new(0);
 
+// ── P6: WAL aggressive reclamation counters (read by P10 INFO emitter) ───
+// Incremented by WalWriterV3::recycle_aggressive(). P10 reads these via the
+// public getters below to populate the `# Reclamation` INFO section.
+// Using relaxed ordering: these are monotonic event counters for monitoring,
+// not synchronisation primitives.
+static WAL_AGGRESSIVE_RECYCLE_SEGMENTS_TOTAL: AtomicU64 = AtomicU64::new(0);
+static WAL_AGGRESSIVE_RECYCLE_BYTES_TOTAL: AtomicU64 = AtomicU64::new(0);
+
 /// Initialize the Prometheus metrics exporter and admin HTTP server.
 ///
 /// Must be called once before any metrics recording. Spawns a custom admin
@@ -620,6 +628,38 @@ pub fn record_wal_rotation() {
         return;
     }
     counter!("moon_wal_rotations_total").increment(1);
+}
+
+/// Record segments and bytes freed by P6 aggressive WAL recycle.
+///
+/// Called from [`WalWriterV3::recycle_aggressive`] after each successful
+/// segment deletion. The increments are also reflected in the Prometheus
+/// counter `moon_wal_aggressive_recycle_segments_total` when the exporter
+/// is enabled; the atomics are always updated so P10 INFO works without
+/// Prometheus.
+#[inline]
+pub fn record_wal_aggressive_recycle(segments: u64, bytes: u64) {
+    WAL_AGGRESSIVE_RECYCLE_SEGMENTS_TOTAL.fetch_add(segments, Ordering::Relaxed);
+    WAL_AGGRESSIVE_RECYCLE_BYTES_TOTAL.fetch_add(bytes, Ordering::Relaxed);
+    if !METRICS_INITIALIZED.load(Ordering::Relaxed) {
+        return;
+    }
+    counter!("moon_wal_aggressive_recycle_segments_total").increment(segments);
+    counter!("moon_wal_aggressive_recycle_bytes_total").increment(bytes);
+}
+
+/// Return the total number of WAL segments freed by aggressive recycle since
+/// process start. Used by P10 for the `reclamation_wal_segments` INFO field.
+#[inline]
+pub fn wal_aggressive_recycle_segments_total() -> u64 {
+    WAL_AGGRESSIVE_RECYCLE_SEGMENTS_TOTAL.load(Ordering::Relaxed)
+}
+
+/// Return the total bytes freed by aggressive WAL recycle since process start.
+/// Used by P10 for the `reclamation_wal_bytes` INFO field.
+#[inline]
+pub fn wal_aggressive_recycle_bytes_total() -> u64 {
+    WAL_AGGRESSIVE_RECYCLE_BYTES_TOTAL.load(Ordering::Relaxed)
 }
 
 // ── Shard metrics ───────────────────────────────────────────────────────
