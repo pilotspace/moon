@@ -415,6 +415,38 @@ pub struct ServerConfig {
     /// Default: 30 s. Reduce to 1 s for testing.
     #[arg(long = "autovacuum-interval-secs", default_value_t = 30)]
     pub autovacuum_interval_secs: u64,
+
+    // ── P7: Graph segment auto-merge ──────────────────────────────────────
+    /// Maximum number of immutable CSR segments per graph before the autovacuum
+    /// daemon triggers a merge pass (Pass E).
+    ///
+    /// When `immutable.len() > graph_merge_max_segments`, all immutable segments
+    /// are merged into one via Rabbit Order compaction.
+    ///
+    /// Default: 8.
+    #[arg(long = "graph-merge-max-segments", default_value_t = 8)]
+    pub graph_merge_max_segments: usize,
+
+    /// Dead-edge fraction threshold that triggers a graph segment merge.
+    ///
+    /// When `dead_edges / total_edges > graph_dead_edge_trigger` across all
+    /// immutable segments for a graph, a merge is triggered even if the segment
+    /// count is below `--graph-merge-max-segments`.
+    ///
+    /// Range: 0.0 (disabled) – 1.0. Default: 0.20 (20 % dead edges).
+    #[arg(long = "graph-dead-edge-trigger", default_value_t = 0.20)]
+    pub graph_dead_edge_trigger: f64,
+
+    // ── MA4: Weighted compaction scheduling ───────────────────────────────
+    /// Minimum seconds before a stale entity is forced to be scheduled by the
+    /// autovacuum daemon regardless of its compaction weight (anti-starvation cap).
+    ///
+    /// Prevents hot indexes from starving cold ones indefinitely.
+    /// Set to 0 to disable anti-starvation (pure priority-queue ordering).
+    ///
+    /// Default: 300 s (5 minutes).
+    #[arg(long = "autovacuum-starvation-cap-secs", default_value_t = 300)]
+    pub autovacuum_starvation_cap_secs: u64,
 }
 
 impl ServerConfig {

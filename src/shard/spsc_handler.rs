@@ -66,6 +66,9 @@ pub(crate) fn drain_spsc_shared(
     shard_manifest: &mut Option<crate::persistence::manifest::ShardManifest>,
     // P8: MVCC committed-prune margin from server config (default 1000).
     mvcc_prune_margin: u64,
+    // P7: graph segment merge thresholds for VACUUM GRAPH.
+    graph_merge_max_segments: usize,
+    graph_dead_edge_trigger: f64,
 ) {
     const MAX_DRAIN_PER_CYCLE: usize = 256;
     let mut drained = 0;
@@ -167,6 +170,8 @@ pub(crate) fn drain_spsc_shared(
                 vector_store,
                 shard_manifest,
                 mvcc_prune_margin,
+                graph_merge_max_segments,
+                graph_dead_edge_trigger,
             );
         }
     }
@@ -195,6 +200,8 @@ pub(crate) fn drain_spsc_shared(
             vector_store,
             shard_manifest,
             mvcc_prune_margin,
+            graph_merge_max_segments,
+            graph_dead_edge_trigger,
         );
     }
 }
@@ -227,6 +234,9 @@ pub(crate) fn handle_shard_message_shared(
     shard_manifest: &mut Option<crate::persistence::manifest::ShardManifest>,
     // P8: MVCC committed-prune margin from server config (default 1000).
     mvcc_prune_margin: u64,
+    // P7: graph segment merge thresholds for VACUUM GRAPH.
+    graph_merge_max_segments: usize,
+    graph_dead_edge_trigger: f64,
 ) {
     match msg {
         ShardMessage::Execute {
@@ -290,6 +300,7 @@ pub(crate) fn handle_shard_message_shared(
 
                 // VACUUM VECTOR <idx> — P2 segment merge. Intercept before main dispatch
                 // because it needs mutable VectorStore access (not available in cmd_dispatch).
+                // VACUUM GRAPH <name> — P7 graph segment merge, same reason.
                 if cmd.eq_ignore_ascii_case(b"VACUUM") {
                     if let Some(crate::protocol::Frame::BulkString(sub)) = args.first() {
                         if sub.eq_ignore_ascii_case(b"VECTOR") {
@@ -299,8 +310,23 @@ pub(crate) fn handle_shard_message_shared(
                             let _ = reply_tx.send(frame);
                             return;
                         }
+                        #[cfg(feature = "graph")]
+                        if sub.eq_ignore_ascii_case(b"GRAPH") {
+                            let graph_args = &args[1..];
+                            let frame = {
+                                let mut gs = shard_databases.graph_store_write(shard_id);
+                                crate::command::server_admin::vacuum_graph(
+                                    &mut gs,
+                                    graph_args,
+                                    graph_merge_max_segments,
+                                    graph_dead_edge_trigger,
+                                )
+                            };
+                            let _ = reply_tx.send(frame);
+                            return;
+                        }
                     }
-                    // Fall through for VACUUM without VECTOR subcommand (future).
+                    // Fall through for VACUUM without VECTOR/GRAPH subcommand.
                 }
 
                 // GRAPH.* commands route to GraphStore.

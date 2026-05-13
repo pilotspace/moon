@@ -218,13 +218,15 @@ impl AutovacuumDaemon {
     pub fn run_tick(
         &mut self,
         vector_store: &mut crate::vector::store::VectorStore,
-        #[cfg(feature = "graph")] _graph_store: &mut crate::graph::store::GraphStore,
+        #[cfg(feature = "graph")] graph_store: &mut crate::graph::store::GraphStore,
         manifest: Option<&mut crate::persistence::manifest::ShardManifest>,
         wal_v3: Option<&mut crate::persistence::wal_v3::segment::WalWriterV3>,
         max_wal_bytes: u64,
         manifest_retain_epochs: u64,
         manifest_retain_secs: u64,
         max_immutable_segments: usize,
+        graph_merge_max_segments: usize,
+        graph_dead_edge_trigger: f64,
         shutdown_requested: bool,
     ) -> AutovacuumStats {
         // --- Disabled or shutdown → complete no-op ----------------------
@@ -394,10 +396,36 @@ impl AutovacuumDaemon {
         }
 
         // ----------------------------------------------------------------
-        // Pass E — Graph compact (TODO(P7): wire graph auto-merge)
+        // Pass E — Graph compact (P7: graph segment auto-merge)
         // ----------------------------------------------------------------
-        // TODO(P7): call graph_store.compact_if_needed() when P7 lands.
-        tracing::debug!("autovacuum: pass E (graph compact) no-op — wired by P7");
+        #[cfg(feature = "graph")]
+        {
+            let pass_start = Instant::now();
+            let mut graph_segs_reclaimed: u64 = 0;
+            for name in graph_store.list_graphs().into_iter().cloned().collect::<Vec<_>>() {
+                let compact_stats = crate::graph::compaction::run_graph_vacuum_pass(
+                    graph_store,
+                    &name,
+                    graph_merge_max_segments,
+                    graph_dead_edge_trigger,
+                );
+                graph_segs_reclaimed += compact_stats.segments_reclaimed;
+            }
+            let pass_ms = pass_start.elapsed().as_millis() as u64;
+            cumulative_ms += pass_ms;
+            if graph_segs_reclaimed > 0 {
+                stats.segments_compacted += graph_segs_reclaimed;
+                tracing::debug!(
+                    graph_segs_reclaimed,
+                    pass_ms,
+                    "autovacuum: pass E (graph compact) merged segments"
+                );
+            } else {
+                tracing::debug!("autovacuum: pass E (graph compact) — no merge needed");
+            }
+        }
+        #[cfg(not(feature = "graph"))]
+        tracing::debug!("autovacuum: pass E (graph compact) skipped — graph feature disabled");
 
         self.finalize_tick(&mut stats, tick_start, now);
         stats

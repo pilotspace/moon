@@ -398,7 +398,9 @@ mod tests {
             &mut vs,
             &mut Vec::new(),
             &mut None, // shard_manifest — None in tests (no persistence_dir)
-            1000,      // mvcc_prune_margin default
+            1000, // mvcc_prune_margin default
+            8,    // graph_merge_max_segments default
+            0.20, // graph_dead_edge_trigger default
         );
 
         // Subscriber now receives pre-serialized RESP bytes
@@ -456,7 +458,9 @@ mod tests {
             &mut vs,
             &mut Vec::new(),
             &mut None, // shard_manifest — None in tests (no persistence_dir)
-            1000,      // mvcc_prune_margin default
+            1000, // mvcc_prune_margin default
+            8,    // graph_merge_max_segments default
+            0.20, // graph_dead_edge_trigger default
         );
     }
 

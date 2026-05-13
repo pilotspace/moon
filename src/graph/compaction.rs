@@ -4,6 +4,19 @@
 //! Rabbit Order (Arai et al., IEEE IPDPS 2016): simplified single-pass
 //! community-based reordering that assigns contiguous IDs to nodes in the same
 //! community, reducing cache misses by ~38%.
+//!
+//! ## P7 — Auto-merge entry point
+//!
+//! [`run_graph_vacuum_pass`] is the P7 autovacuum hook. It evaluates two triggers:
+//!
+//! 1. **Segment-count trigger**: `immutable.len() > max_segments`
+//! 2. **Dead-edge trigger**: across all immutable segments,
+//!    `dead_edges / total_edges > dead_edge_trigger`
+//!
+//! When triggered, all immutable segments are merged into one via
+//! [`compact_segments`], and the result is atomically swapped via
+//! [`GraphSegmentHolder::replace_immutable`] (ArcSwap — existing query
+//! `Guard`s hold the old `Arc` until they drop; no use-after-free).
 
 use std::sync::Arc;
 
@@ -11,7 +24,163 @@ use roaring::RoaringBitmap;
 
 use crate::graph::csr::{CsrError, CsrSegment, CsrStorage};
 use crate::graph::index::{EdgeTypeIndex, LabelIndex, MphNodeIndex};
+use crate::graph::store::GraphStore;
 use crate::graph::types::{EdgeMeta, GraphSegmentHeader, NodeMeta};
+
+// ---------------------------------------------------------------------------
+// GraphCompactStats — returned by run_graph_vacuum_pass
+// ---------------------------------------------------------------------------
+
+/// Statistics returned by [`run_graph_vacuum_pass`].
+#[derive(Debug, Default, Clone, Copy)]
+pub struct GraphCompactStats {
+    /// Number of immutable segments that were merged away (input count - 1).
+    /// Zero when no merge occurred.
+    pub segments_reclaimed: u64,
+    /// Total live edges in the merged output segment. Zero when no merge.
+    pub live_edges: u64,
+    /// Total dead edges dropped during merge. Zero when no merge.
+    pub dead_edges_dropped: u64,
+}
+
+// ---------------------------------------------------------------------------
+// P7 — Auto-merge entry point
+// ---------------------------------------------------------------------------
+
+/// Run one graph vacuum pass for a named graph.
+///
+/// Called from:
+/// - [`crate::shard::autovacuum::AutovacuumDaemon::run_tick`] Pass E.
+/// - `VACUUM GRAPH <name>` operator command.
+///
+/// ## Trigger conditions
+///
+/// The merge runs when **either** condition is true:
+/// - `immutable.len() > max_segments` (segment-count trigger)
+/// - across all immutable segments, `dead_edges / total_edges > dead_edge_trigger`
+///   (dead-edge trigger; skipped when total_edges == 0)
+///
+/// ## Safety
+///
+/// The ArcSwap swap is atomic. Existing query guards hold their old
+/// `Arc<GraphSegmentList>` until they drop; the old segments are freed only
+/// when all guards release. No existing reference is invalidated.
+pub fn run_graph_vacuum_pass(
+    store: &mut GraphStore,
+    graph_name: &[u8],
+    max_segments: usize,
+    dead_edge_trigger: f64,
+) -> GraphCompactStats {
+    let Some(graph) = store.get_graph_mut(graph_name) else {
+        return GraphCompactStats::default();
+    };
+
+    let snap = graph.segments.load();
+    let immutable = &snap.immutable;
+
+    if immutable.is_empty() {
+        return GraphCompactStats::default();
+    }
+
+    // --- Evaluate trigger conditions ---
+    let segment_count = immutable.len();
+
+    // Dead-edge fraction across all immutable segments.
+    let (total_edges, live_edges_count) = immutable.iter().fold((0u64, 0u64), |(tot, live), s| {
+        let ec = s.edge_count() as u64;
+        let valid = s.validity().len() as u64; // RoaringBitmap::len = cardinality
+        (tot + ec, live + valid)
+    });
+    let dead_edge_fraction = if total_edges > 0 {
+        (total_edges - live_edges_count) as f64 / total_edges as f64
+    } else {
+        0.0
+    };
+
+    let count_trigger = segment_count > max_segments;
+    let dead_trigger = dead_edge_trigger > 0.0 && dead_edge_fraction > dead_edge_trigger;
+
+    if !count_trigger && !dead_trigger {
+        return GraphCompactStats::default();
+    }
+
+    tracing::debug!(
+        graph = %String::from_utf8_lossy(graph_name),
+        segment_count,
+        dead_edge_fraction,
+        count_trigger,
+        dead_trigger,
+        "graph vacuum: merge triggered"
+    );
+
+    // --- Merge ---
+    // Collect LSNs of segments being replaced.
+    let old_lsns: Vec<u64> = immutable.iter().map(|s| s.created_lsn()).collect();
+    let segs: Vec<Arc<CsrStorage>> = immutable.to_vec();
+
+    // Release the guard before calling compact (which needs no exclusive lock,
+    // but we must not hold the Guard across the replace_immutable store()).
+    drop(snap);
+
+    let config = CompactionConfig {
+        min_segments: 1, // vacuum always merges regardless of min_segments
+        max_segment_edges: usize::MAX,
+    };
+
+    match compact_segments(&segs, &config) {
+        Ok(merged_csr) => {
+            let live_edges = merged_csr.edge_count() as u64;
+            let dead_edges_dropped = total_edges.saturating_sub(live_edges_count);
+
+            // Atomically replace all old segments with the merged one.
+            graph.segments.replace_immutable(&old_lsns, merged_csr);
+
+            let segments_reclaimed = (segs.len() as u64).saturating_sub(1);
+
+            tracing::debug!(
+                graph = %String::from_utf8_lossy(graph_name),
+                segments_reclaimed,
+                live_edges,
+                dead_edges_dropped,
+                "graph vacuum: merge complete"
+            );
+
+            GraphCompactStats {
+                segments_reclaimed,
+                live_edges,
+                dead_edges_dropped,
+            }
+        }
+        Err(CompactionError::EmptyResult) => {
+            // All edges were tombstoned — remove all segments, produce empty state.
+            let graph2 = store.get_graph_mut(graph_name).expect("graph still exists");
+            let snap2 = graph2.segments.load();
+            let mutable = snap2.mutable.clone();
+            drop(snap2);
+            graph2.segments.swap(crate::graph::segment::GraphSegmentList {
+                mutable,
+                immutable: Vec::new(),
+            });
+            GraphCompactStats {
+                segments_reclaimed: segs.len() as u64,
+                live_edges: 0,
+                dead_edges_dropped: total_edges,
+            }
+        }
+        Err(CompactionError::TooFewSegments) => {
+            // Should not happen (we set min_segments=1), but handle gracefully.
+            GraphCompactStats::default()
+        }
+        Err(CompactionError::CsrBuild(e)) => {
+            tracing::warn!(
+                graph = %String::from_utf8_lossy(graph_name),
+                error = ?e,
+                "graph vacuum: compact_segments failed — skipping merge"
+            );
+            GraphCompactStats::default()
+        }
+    }
+}
 
 /// Compaction configuration.
 #[derive(Debug, Clone)]

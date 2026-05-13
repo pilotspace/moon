@@ -987,6 +987,8 @@ impl super::Shard {
                         &mut pending_cdc_subscribes,
                         &mut shard_manifest,
                         server_config.mvcc_committed_prune_margin,
+                        server_config.graph_merge_max_segments,
+                        server_config.graph_dead_edge_trigger,
                     );
                     if !pending_cdc_subscribes.is_empty() {
                         let wal_dir = wal_v3_writer.as_ref().map(|w| w.wal_dir());
@@ -1050,6 +1052,8 @@ impl super::Shard {
                         &mut pending_cdc_subscribes,
                         &mut shard_manifest,
                         server_config.mvcc_committed_prune_margin,
+                        server_config.graph_merge_max_segments,
+                        server_config.graph_dead_edge_trigger,
                     );
                     if !pending_cdc_subscribes.is_empty() {
                         let wal_dir = wal_v3_writer.as_ref().map(|w| w.wal_dir());
@@ -1317,6 +1321,8 @@ impl super::Shard {
                         server_config.manifest_tombstone_retain_epochs,
                         server_config.manifest_tombstone_retain_secs,
                         server_config.max_unflushed_immutable_segments as usize,
+                        server_config.graph_merge_max_segments,
+                        server_config.graph_dead_edge_trigger,
                         false,
                     );
                 }
@@ -1524,6 +1530,8 @@ impl super::Shard {
                     &mut pending_cdc_subscribes,
                     &mut shard_manifest,
                     server_config.mvcc_committed_prune_margin,
+                    server_config.graph_merge_max_segments,
+                    server_config.graph_dead_edge_trigger,
                 );
                 if !pending_cdc_subscribes.is_empty() {
                     let wal_dir = wal_v3_writer.as_ref().map(|w| w.wal_dir());
@@ -1831,6 +1839,8 @@ impl super::Shard {
                         server_config.manifest_tombstone_retain_epochs,
                         server_config.manifest_tombstone_retain_secs,
                         server_config.max_unflushed_immutable_segments as usize,
+                        server_config.graph_merge_max_segments,
+                        server_config.graph_dead_edge_trigger,
                         false,
                     );
                 }

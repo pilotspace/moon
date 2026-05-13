@@ -1697,3 +1697,63 @@ pub fn vacuum_vector(
         Err(_) => Frame::Error(Bytes::from_static(b"ERR merge failed (check logs)")),
     }
 }
+
+// ---------------------------------------------------------------------------
+// VACUUM GRAPH <name> — P7 graph segment auto-merge
+// ---------------------------------------------------------------------------
+
+/// `VACUUM GRAPH <name>`
+///
+/// Manually trigger a graph segment merge pass for a named graph.
+///
+/// Intercepted in `spsc_handler` before main dispatch because it needs
+/// mutable `GraphStore` access (not available in `cmd_dispatch`).
+///
+/// ## Returns
+/// - `+OK no merge needed (segments=N)` when no merge was triggered.
+/// - `+Merged N segments into 1 (live_edges=E, dead_dropped=D)` on success.
+/// - `-ERR unknown graph '<name>'` when the graph does not exist.
+#[cfg(feature = "graph")]
+pub fn vacuum_graph(
+    graph_store: &mut crate::graph::store::GraphStore,
+    args: &[Frame],
+    graph_merge_max_segments: usize,
+    graph_dead_edge_trigger: f64,
+) -> Frame {
+    let name = match args.first() {
+        Some(Frame::BulkString(b)) => b.clone(),
+        _ => return Frame::Error(Bytes::from_static(b"ERR usage: VACUUM GRAPH <graph_name>")),
+    };
+
+    if graph_store.get_graph(name.as_ref()).is_none() {
+        return Frame::Error(Bytes::from(
+            format!("ERR unknown graph '{}'", String::from_utf8_lossy(&name)).into_bytes(),
+        ));
+    }
+
+    // Check current segment count before merge.
+    let seg_count_before = graph_store
+        .get_graph(name.as_ref())
+        .map(|g| g.segments.load().immutable.len())
+        .unwrap_or(0);
+
+    let stats = crate::graph::compaction::run_graph_vacuum_pass(
+        graph_store,
+        &name,
+        graph_merge_max_segments,
+        graph_dead_edge_trigger,
+    );
+
+    if stats.segments_reclaimed == 0 {
+        let msg = format!("OK no merge needed (segments={seg_count_before})");
+        Frame::SimpleString(Bytes::from(msg))
+    } else {
+        let msg = format!(
+            "Merged {} segments into 1 (live_edges={}, dead_dropped={})",
+            stats.segments_reclaimed + 1,
+            stats.live_edges,
+            stats.dead_edges_dropped
+        );
+        Frame::SimpleString(Bytes::from(msg))
+    }
+}
