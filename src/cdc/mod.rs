@@ -26,7 +26,9 @@
 pub mod debezium;
 pub mod decode;
 pub mod event;
+pub mod fanout;
 
 pub use debezium::{DebeziumEnvelope, encode_debezium};
 pub use decode::decode_wal_record;
 pub use event::{CdcEvent, CdcOp};
+pub use fanout::{CdcSubscriber, CdcSubscriberRegistry};
