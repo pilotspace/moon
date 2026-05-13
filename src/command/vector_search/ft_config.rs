@@ -107,6 +107,8 @@ fn ft_config_set(
         }
     } else if param.eq_ignore_ascii_case(b"COMPACTION_WEIGHT") {
         // W3-deep: per-index autovacuum priority multiplier.
+        // Parse + validate before taking the mutable borrow so we can flush the
+        // sidecar after the borrow is released.
         let parsed: f32 = match std::str::from_utf8(value)
             .ok()
             .and_then(|s| s.parse::<f32>().ok())
@@ -114,8 +116,15 @@ fn ft_config_set(
             Some(v) => v,
             None => return Frame::Error(Bytes::from_static(b"ERR COMPACTION_WEIGHT must be a number")),
         };
-        match idx.try_set_compaction_weight(parsed) {
-            Ok(()) => Frame::SimpleString(Bytes::from_static(b"OK")),
+        // Scoped block: set weight, ending borrow of `store` via `idx` before
+        // we call `store.save_index_meta_sidecar()`.
+        let set_result = { idx.try_set_compaction_weight(parsed) };
+        match set_result {
+            Ok(()) => {
+                // Persist the new weight so it survives a server restart.
+                store.save_index_meta_sidecar();
+                Frame::SimpleString(Bytes::from_static(b"OK"))
+            }
             Err(e) => Frame::Error(Bytes::from(format!("ERR {e}").into_bytes())),
         }
     } else {

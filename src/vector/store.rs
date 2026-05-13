@@ -621,7 +621,8 @@ impl VectorStore {
 
     /// Persist current index metadata (including compaction weights) to the sidecar file.
     /// No-op if persist_dir is not set (disk-offload disabled).
-    fn save_index_meta_sidecar(&self) {
+    /// Called after any mutation that changes compaction_weight or index registration.
+    pub fn save_index_meta_sidecar(&self) {
         if let Some(ref dir) = self.persist_dir {
             let meta_weights = self.collect_index_metas_with_weights();
             if let Err(e) =

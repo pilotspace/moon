@@ -1685,14 +1685,22 @@ pub fn vacuum_vector(
                         ))
                     }
                 };
-                let idx = match vector_store.get_index_mut(name.as_ref()) {
-                    Some(i) => i,
-                    None => {
-                        return Frame::Error(Bytes::from_static(b"ERR unknown vector index"))
-                    }
+                let set_result = {
+                    let idx = match vector_store.get_index_mut(name.as_ref()) {
+                        Some(i) => i,
+                        None => {
+                            return Frame::Error(Bytes::from_static(
+                                b"ERR unknown vector index",
+                            ))
+                        }
+                    };
+                    idx.try_set_compaction_weight(parsed)
+                    // `idx` borrow released here
                 };
-                return match idx.try_set_compaction_weight(parsed) {
+                return match set_result {
                     Ok(()) => {
+                        // Persist the new weight so it survives a server restart.
+                        vector_store.save_index_meta_sidecar();
                         let msg =
                             format!("OK weight set to {parsed} for index {:?}", name.as_ref());
                         Frame::SimpleString(Bytes::from(msg))

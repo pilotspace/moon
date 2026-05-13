@@ -308,6 +308,68 @@ fn test_ft_config_weight_roundtrip() {
 // 6. VACUUM VECTOR <idx> WEIGHT <n> sets weight on VectorIndex (unit)
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// 7. Persistence roundtrip: weight set via API survives a VectorStore reload
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_compaction_weight_persists_across_reload() {
+    use bytes::Bytes;
+    use moon::vector::index_persist::load_index_metadata_with_weights;
+    use moon::vector::store::{IndexMeta, VectorStore};
+    use moon::vector::turbo_quant::collection::{BuildMode, QuantizationConfig};
+    use moon::vector::types::DistanceMetric;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let persist_path = dir.path().to_path_buf();
+
+    // Build and configure a store with persist_dir set.
+    let mut store = VectorStore::new();
+    store.set_persist_dir(persist_path.clone());
+
+    let meta = IndexMeta {
+        name: Bytes::from_static(b"persist_idx"),
+        dimension: 64,
+        padded_dimension: 64,
+        metric: DistanceMetric::L2,
+        hnsw_m: 16,
+        hnsw_ef_construction: 200,
+        hnsw_ef_runtime: 0,
+        compact_threshold: 1000,
+        source_field: Bytes::from_static(b"vec"),
+        key_prefixes: vec![Bytes::from_static(b"doc:")],
+        quantization: QuantizationConfig::TurboQuant4,
+        build_mode: BuildMode::Light,
+        vector_fields: Vec::new(),
+        schema_fields: Vec::new(),
+        merge_mode: moon::vector::segment::compaction::MergeMode::GraphUnion,
+        keep_raw: false,
+    };
+    store.create_index(meta.clone()).unwrap();
+
+    // Set a non-default weight and flush sidecar.
+    {
+        let idx = store.get_index_mut(b"persist_idx").unwrap();
+        idx.try_set_compaction_weight(42.0)
+            .expect("42.0 is in range");
+    }
+    store.save_index_meta_sidecar();
+
+    // Reload: read the sidecar file from disk and verify the weight is present.
+    let loaded = load_index_metadata_with_weights(&persist_path)
+        .expect("sidecar must be readable after save");
+
+    let (_, loaded_weight) = loaded
+        .iter()
+        .find(|(m, _)| m.name == Bytes::from_static(b"persist_idx"))
+        .expect("persist_idx must be in the sidecar");
+
+    assert!(
+        (*loaded_weight - 42.0f32).abs() < 1e-5,
+        "compaction_weight must survive a sidecar roundtrip, got {loaded_weight}"
+    );
+}
+
 #[test]
 fn test_vacuum_vector_weight_sets_and_reads() {
     use bytes::Bytes;
