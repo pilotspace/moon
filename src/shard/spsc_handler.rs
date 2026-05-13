@@ -67,8 +67,8 @@ pub(crate) fn drain_spsc_shared(
     // P8: MVCC committed-prune margin from server config (default 1000).
     mvcc_prune_margin: u64,
     // P7: graph segment merge thresholds for VACUUM GRAPH.
-    graph_merge_max_segments: usize,
-    graph_dead_edge_trigger: f64,
+    #[cfg_attr(not(feature = "graph"), allow(unused_variables))] graph_merge_max_segments: usize,
+    #[cfg_attr(not(feature = "graph"), allow(unused_variables))] graph_dead_edge_trigger: f64,
     // MA5: autovacuum daemon reference for RECLAMATION SCHEDULE commands.
     autovacuum_daemon: &mut crate::shard::autovacuum::AutovacuumDaemon,
 ) {
@@ -239,8 +239,8 @@ pub(crate) fn handle_shard_message_shared(
     // P8: MVCC committed-prune margin from server config (default 1000).
     mvcc_prune_margin: u64,
     // P7: graph segment merge thresholds for VACUUM GRAPH.
-    graph_merge_max_segments: usize,
-    graph_dead_edge_trigger: f64,
+    #[cfg_attr(not(feature = "graph"), allow(unused_variables))] graph_merge_max_segments: usize,
+    #[cfg_attr(not(feature = "graph"), allow(unused_variables))] graph_dead_edge_trigger: f64,
     // MA5: autovacuum daemon reference for RECLAMATION SCHEDULE commands.
     autovacuum_daemon: &mut crate::shard::autovacuum::AutovacuumDaemon,
 ) {

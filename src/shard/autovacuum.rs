@@ -228,8 +228,9 @@ impl AutovacuumDaemon {
         manifest_retain_epochs: u64,
         manifest_retain_secs: u64,
         max_immutable_segments: usize,
+        #[cfg_attr(not(feature = "graph"), allow(unused_variables))]
         graph_merge_max_segments: usize,
-        graph_dead_edge_trigger: f64,
+        #[cfg_attr(not(feature = "graph"), allow(unused_variables))] graph_dead_edge_trigger: f64,
         shutdown_requested: bool,
     ) -> AutovacuumStats {
         // --- Disabled or shutdown → complete no-op ----------------------
