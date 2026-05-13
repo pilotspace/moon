@@ -1757,3 +1757,99 @@ pub fn vacuum_graph(
         Frame::SimpleString(Bytes::from(msg))
     }
 }
+
+// ---------------------------------------------------------------------------
+// RECLAMATION SCHEDULE — MA5 maintenance-window scheduler commands
+// ---------------------------------------------------------------------------
+
+/// `RECLAMATION SCHEDULE <cron_expr> <multiplier>`
+/// `RECLAMATION SCHEDULE LIST`
+/// `RECLAMATION SCHEDULE CLEAR`
+///
+/// Manage the per-shard maintenance-window schedule that controls autovacuum
+/// budget multipliers at different times of day/week.
+///
+/// ## Subcommands
+///
+/// | Syntax | Description |
+/// |---|---|
+/// | `RECLAMATION SCHEDULE <cron> <mult>` | Add a window |
+/// | `RECLAMATION SCHEDULE LIST` | List all windows |
+/// | `RECLAMATION SCHEDULE CLEAR` | Remove all windows |
+///
+/// `cron` is a 5-field UNIX cron expression (`* * * * *` format).
+/// `mult` is a float multiplier (e.g. `2.0` for 2x budget, `0.1` for 10%).
+///
+/// ## Examples
+/// ```text
+/// RECLAMATION SCHEDULE "0 2 * * *" 2.0
+/// RECLAMATION SCHEDULE "* 9-17 * * 1-5" 0.1
+/// RECLAMATION SCHEDULE LIST
+/// RECLAMATION SCHEDULE CLEAR
+/// ```
+pub fn reclamation_schedule(
+    schedule: &mut crate::shard::maintenance_schedule::MaintenanceSchedule,
+    args: &[Frame],
+) -> Frame {
+    let sub = match args.first().and_then(|f| crate::command::helpers::extract_bytes(f)) {
+        Some(s) => s,
+        None => {
+            return Frame::Error(Bytes::from_static(
+                b"ERR usage: RECLAMATION SCHEDULE <cron> <mult> | LIST | CLEAR",
+            ));
+        }
+    };
+
+    if sub.eq_ignore_ascii_case(b"LIST") {
+        // Return array of alternating [cron, multiplier_string] pairs.
+        let windows = schedule.list();
+        let mut pairs: Vec<Frame> = Vec::with_capacity(windows.len() * 2);
+        for (expr, mult) in &windows {
+            pairs.push(Frame::BulkString(Bytes::from(expr.clone())));
+            pairs.push(Frame::BulkString(Bytes::from(format!("{mult}"))));
+        }
+        return Frame::Array(crate::protocol::FrameVec::from_vec(pairs));
+    }
+
+    if sub.eq_ignore_ascii_case(b"CLEAR") {
+        schedule.clear();
+        return Frame::SimpleString(Bytes::from_static(b"OK"));
+    }
+
+    // Add: RECLAMATION SCHEDULE <cron_expr> <multiplier>
+    // args[0] = cron expression, args[1] = multiplier
+    if args.len() < 2 {
+        return Frame::Error(Bytes::from_static(
+            b"ERR usage: RECLAMATION SCHEDULE <cron> <mult>",
+        ));
+    }
+
+    let cron_bytes = match crate::command::helpers::extract_bytes(&args[0]) {
+        Some(b) => b,
+        None => return Frame::Error(Bytes::from_static(b"ERR invalid cron expression")),
+    };
+    let mult_bytes = match crate::command::helpers::extract_bytes(&args[1]) {
+        Some(b) => b,
+        None => return Frame::Error(Bytes::from_static(b"ERR invalid multiplier")),
+    };
+
+    let cron_str = match std::str::from_utf8(cron_bytes.as_ref()) {
+        Ok(s) => s,
+        Err(_) => return Frame::Error(Bytes::from_static(b"ERR cron expression is not valid UTF-8")),
+    };
+
+    let multiplier: f32 = match std::str::from_utf8(mult_bytes.as_ref())
+        .ok()
+        .and_then(|s| s.parse::<f32>().ok())
+    {
+        Some(v) if v.is_finite() && v >= 0.0 => v,
+        _ => return Frame::Error(Bytes::from_static(b"ERR multiplier must be a non-negative finite float")),
+    };
+
+    match schedule.add(cron_str, multiplier) {
+        Ok(()) => Frame::SimpleString(Bytes::from_static(b"OK")),
+        Err(e) => Frame::Error(Bytes::from(
+            format!("ERR invalid cron expression: {e}").into_bytes(),
+        )),
+    }
+}

@@ -351,6 +351,10 @@ pub static COMMAND_META: phf::Map<&'static str, CommandMeta> = phf_map! {
     //           VACUUM VECTOR <idx> | VACUUM GRAPH <name>
     // Admin + Dangerous category (FREEZE kills all snapshots; treat all variants as dangerous).
     "VACUUM" => CommandMeta { name: "VACUUM", arity: -1, flags: A, first_key: 0, last_key: 0, step: 0, acl_categories: DNG },
+    // MA5: RECLAMATION SCHEDULE — maintenance-window scheduler for autovacuum budget multipliers.
+    // Arity -3: RECLAMATION SCHEDULE <cron> <mult> | RECLAMATION SCHEDULE LIST | RECLAMATION SCHEDULE CLEAR
+    // Admin only (no data mutation, no snapshot impact).
+    "RECLAMATION" => CommandMeta { name: "RECLAMATION", arity: -3, flags: A, first_key: 0, last_key: 0, step: 0, acl_categories: SRV },
     "MEMORY" => CommandMeta { name: "MEMORY", arity: -2, flags: R, first_key: 0, last_key: 0, step: 0, acl_categories: SRV },
     "FLUSHDB" => CommandMeta { name: "FLUSHDB", arity: -1, flags: W, first_key: 0, last_key: 0, step: 0, acl_categories: DNG },
     "FLUSHALL" => CommandMeta { name: "FLUSHALL", arity: -1, flags: W, first_key: 0, last_key: 0, step: 0, acl_categories: DNG },

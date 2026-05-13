@@ -87,6 +87,9 @@ async fn start_server() -> (u16, CancellationToken) {
         autovacuum_budget_ms_max: 200,
         autovacuum_target_p95_ms: 10,
         autovacuum_interval_secs: 30,
+        graph_merge_max_segments: 8,
+        graph_dead_edge_trigger: 0.20,
+        autovacuum_starvation_cap_secs: 300,
     };
 
     tokio::spawn(async move {

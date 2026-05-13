@@ -644,6 +644,25 @@ impl super::Shard {
         let autovacuum_cfg = crate::shard::autovacuum::config_from_server(&server_config);
         let autovacuum_interval_secs = autovacuum_cfg.interval_secs.max(1);
         let mut autovacuum_daemon = crate::shard::autovacuum::AutovacuumDaemon::new(autovacuum_cfg);
+        // MA5: Load maintenance schedule from persistence_dir on startup (if configured).
+        if let Some(ref dir) = persistence_dir {
+            let path = std::path::Path::new(dir)
+                .join(format!("shard-{shard_id}-reclamation-schedule.toml"));
+            match crate::shard::maintenance_schedule::MaintenanceSchedule::load_from_file(&path) {
+                Ok(loaded) if !loaded.list().is_empty() => {
+                    autovacuum_daemon.maintenance_schedule = loaded;
+                    tracing::info!(
+                        shard_id,
+                        "MA5: loaded maintenance schedule from {}",
+                        path.display()
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(shard_id, error = %e, "MA5: failed to load maintenance schedule");
+                }
+            }
+        }
         #[cfg(feature = "runtime-tokio")]
         let mut autovacuum_interval =
             TimerImpl::interval(Duration::from_secs(autovacuum_interval_secs));
@@ -989,7 +1008,20 @@ impl super::Shard {
                         server_config.mvcc_committed_prune_margin,
                         server_config.graph_merge_max_segments,
                         server_config.graph_dead_edge_trigger,
+                        &mut autovacuum_daemon,
                     );
+                    // MA5: persist maintenance schedule when modified by RECLAMATION SCHEDULE.
+                    if autovacuum_daemon.maintenance_schedule.is_dirty() {
+                        if let Some(ref dir) = persistence_dir {
+                            let path = std::path::Path::new(dir)
+                                .join(format!("shard-{shard_id}-reclamation-schedule.toml"));
+                            if let Err(e) = autovacuum_daemon.maintenance_schedule.save_to_file(&path) {
+                                tracing::warn!(shard_id, error = %e, "MA5: failed to persist maintenance schedule");
+                            } else {
+                                autovacuum_daemon.maintenance_schedule.mark_clean();
+                            }
+                        }
+                    }
                     if !pending_cdc_subscribes.is_empty() {
                         let wal_dir = wal_v3_writer.as_ref().map(|w| w.wal_dir());
                         cdc_registry.register_pending(
@@ -1054,7 +1086,20 @@ impl super::Shard {
                         server_config.mvcc_committed_prune_margin,
                         server_config.graph_merge_max_segments,
                         server_config.graph_dead_edge_trigger,
+                        &mut autovacuum_daemon,
                     );
+                    // MA5: persist maintenance schedule when modified by RECLAMATION SCHEDULE.
+                    if autovacuum_daemon.maintenance_schedule.is_dirty() {
+                        if let Some(ref dir) = persistence_dir {
+                            let path = std::path::Path::new(dir)
+                                .join(format!("shard-{shard_id}-reclamation-schedule.toml"));
+                            if let Err(e) = autovacuum_daemon.maintenance_schedule.save_to_file(&path) {
+                                tracing::warn!(shard_id, error = %e, "MA5: failed to persist maintenance schedule");
+                            } else {
+                                autovacuum_daemon.maintenance_schedule.mark_clean();
+                            }
+                        }
+                    }
                     if !pending_cdc_subscribes.is_empty() {
                         let wal_dir = wal_v3_writer.as_ref().map(|w| w.wal_dir());
                         cdc_registry.register_pending(
@@ -1532,6 +1577,7 @@ impl super::Shard {
                     server_config.mvcc_committed_prune_margin,
                     server_config.graph_merge_max_segments,
                     server_config.graph_dead_edge_trigger,
+                    &mut autovacuum_daemon,
                 );
                 if !pending_cdc_subscribes.is_empty() {
                     let wal_dir = wal_v3_writer.as_ref().map(|w| w.wal_dir());

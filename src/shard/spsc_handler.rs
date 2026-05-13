@@ -69,6 +69,8 @@ pub(crate) fn drain_spsc_shared(
     // P7: graph segment merge thresholds for VACUUM GRAPH.
     graph_merge_max_segments: usize,
     graph_dead_edge_trigger: f64,
+    // MA5: autovacuum daemon reference for RECLAMATION SCHEDULE commands.
+    autovacuum_daemon: &mut crate::shard::autovacuum::AutovacuumDaemon,
 ) {
     const MAX_DRAIN_PER_CYCLE: usize = 256;
     let mut drained = 0;
@@ -172,6 +174,7 @@ pub(crate) fn drain_spsc_shared(
                 mvcc_prune_margin,
                 graph_merge_max_segments,
                 graph_dead_edge_trigger,
+                autovacuum_daemon,
             );
         }
     }
@@ -202,6 +205,7 @@ pub(crate) fn drain_spsc_shared(
             mvcc_prune_margin,
             graph_merge_max_segments,
             graph_dead_edge_trigger,
+            autovacuum_daemon,
         );
     }
 }
@@ -237,6 +241,8 @@ pub(crate) fn handle_shard_message_shared(
     // P7: graph segment merge thresholds for VACUUM GRAPH.
     graph_merge_max_segments: usize,
     graph_dead_edge_trigger: f64,
+    // MA5: autovacuum daemon reference for RECLAMATION SCHEDULE commands.
+    autovacuum_daemon: &mut crate::shard::autovacuum::AutovacuumDaemon,
 ) {
     match msg {
         ShardMessage::Execute {
@@ -385,6 +391,24 @@ pub(crate) fn handle_shard_message_shared(
                         }
                     }
                     // All other DEBUG subcommands fall through to cmd_dispatch.
+                }
+
+                // MA5: RECLAMATION SCHEDULE — maintenance-window scheduler.
+                // Needs &mut AutovacuumDaemon (schedule lives there); intercept here.
+                if cmd.eq_ignore_ascii_case(b"RECLAMATION") {
+                    if let Some(sub) = args.first() {
+                        if let Some(s) = crate::command::helpers::extract_bytes(sub) {
+                            if s.eq_ignore_ascii_case(b"SCHEDULE") {
+                                let frame = crate::command::server_admin::reclamation_schedule(
+                                    &mut autovacuum_daemon.maintenance_schedule,
+                                    &args[1..],
+                                );
+                                let _ = reply_tx.send(frame);
+                                return;
+                            }
+                        }
+                    }
+                    // Other RECLAMATION subcommands fall through.
                 }
 
                 // COW intercept: capture old value before write if snapshot is active

@@ -167,6 +167,8 @@ pub struct AutovacuumDaemon {
     last_run_at: Option<Instant>,
     /// Warn-rate limiter: suppress "budget=0" spam.
     last_budget_warn_at: Option<Instant>,
+    /// MA5: maintenance-window schedule (cron-based budget multipliers).
+    pub maintenance_schedule: crate::shard::maintenance_schedule::MaintenanceSchedule,
 }
 
 impl AutovacuumDaemon {
@@ -181,6 +183,7 @@ impl AutovacuumDaemon {
             latency_window: LatencyWindow::new(),
             last_run_at: None,
             last_budget_warn_at: None,
+            maintenance_schedule: crate::shard::maintenance_schedule::MaintenanceSchedule::new(),
         }
     }
 
@@ -258,12 +261,22 @@ impl AutovacuumDaemon {
             }
         }
 
+        // --- MA5: Apply maintenance-window multiplier to effective budget -----
+        let schedule_multiplier = self
+            .maintenance_schedule
+            .current_budget_multiplier(std::time::SystemTime::now());
+        let effective_budget_ms =
+            ((self.budget_ms as f64 * schedule_multiplier as f64) as u64)
+                .clamp(self.cfg.budget_ms_min, self.cfg.budget_ms_max);
+
         let mut stats = AutovacuumStats {
             did_run: true,
             ..Default::default()
         };
         let tick_start = Instant::now();
         let mut cumulative_ms: u64 = 0;
+        // Shadow budget_ms for this tick with the schedule-adjusted effective budget.
+        let budget_ms = effective_budget_ms;
 
         // ----------------------------------------------------------------
         // Pass A — MVCC: skip since P3/run_mvcc_sweep already runs on 1 s timer.
@@ -272,7 +285,7 @@ impl AutovacuumDaemon {
         // ----------------------------------------------------------------
         tracing::debug!("autovacuum: pass A (MVCC) skipped — handled by 1s timer (run_mvcc_sweep)");
 
-        if shutdown_requested || cumulative_ms >= self.budget_ms {
+        if shutdown_requested || cumulative_ms >= budget_ms {
             self.finalize_tick(&mut stats, tick_start, now);
             return stats;
         }
@@ -306,7 +319,7 @@ impl AutovacuumDaemon {
             tracing::debug!("autovacuum: pass B (manifest GC) skipped — no persistence dir");
         }
 
-        if shutdown_requested || cumulative_ms >= self.budget_ms {
+        if shutdown_requested || cumulative_ms >= budget_ms {
             self.finalize_tick(&mut stats, tick_start, now);
             return stats;
         }
@@ -356,7 +369,7 @@ impl AutovacuumDaemon {
             tracing::debug!("autovacuum: pass C (WAL recycle) skipped — no WAL v3");
         }
 
-        if shutdown_requested || cumulative_ms >= self.budget_ms {
+        if shutdown_requested || cumulative_ms >= budget_ms {
             self.finalize_tick(&mut stats, tick_start, now);
             return stats;
         }
@@ -390,7 +403,7 @@ impl AutovacuumDaemon {
             );
         }
 
-        if shutdown_requested || cumulative_ms >= self.budget_ms {
+        if shutdown_requested || cumulative_ms >= budget_ms {
             self.finalize_tick(&mut stats, tick_start, now);
             return stats;
         }

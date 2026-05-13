@@ -1,3 +1,4 @@
+#![cfg(feature = "graph")]
 //! P7 — Graph segment auto-merge tests.
 //!
 //! Red/Green TDD: these tests were written BEFORE the implementation.
