@@ -633,6 +633,120 @@ pub(crate) fn maybe_begin_checkpoint(
     }
 }
 
+/// P6: Ceiling-trigger — force a checkpoint + aggressive WAL recycle when
+/// total on-disk WAL exceeds `max_wal_bytes` AND `max_checkpoint_lag_ms` has
+/// elapsed since the last completed checkpoint.
+///
+/// The two-condition guard prevents thrashing: if a checkpoint finished 5ms
+/// ago but WAL is still over max (e.g. very fast writers), we wait for
+/// `max_checkpoint_lag_ms` before forcing another round. This also handles
+/// the disk-full scenario: if `force_checkpoint` fails silently (manifest
+/// commit error), the lag guard ensures we retry on the next tick interval
+/// rather than spinning.
+///
+/// # Arguments
+///
+/// * `last_checkpoint_at` — `Instant` of the last completed checkpoint. The
+///   caller is responsible for updating this when a checkpoint finalises.
+/// * `max_checkpoint_lag_ms` — from `--wal-max-checkpoint-lag-ms` config.
+///
+/// Returns `true` if aggressive recycle was attempted (caller should reset
+/// `last_checkpoint_at` and `wal_bytes_since_checkpoint`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn maybe_force_checkpoint_on_wal_overflow(
+    checkpoint_mgr: &mut CheckpointManager,
+    wal: &mut WalWriterV3,
+    page_cache: &PageCache,
+    manifest: &mut ShardManifest,
+    control: &mut ShardControlFile,
+    control_path: &Path,
+    shard_id: usize,
+    last_checkpoint_at: std::time::Instant,
+    max_checkpoint_lag_ms: u64,
+) -> bool {
+    // Condition 1: total on-disk WAL exceeds the configured ceiling.
+    let total_wal = match wal.stats() {
+        Ok(s) => s.total_bytes,
+        Err(e) => {
+            tracing::warn!(
+                "Shard {}: P6 WAL stats scan failed, skipping overflow check: {}",
+                shard_id,
+                e
+            );
+            return false;
+        }
+    };
+    if total_wal <= wal.max_wal_bytes() {
+        return false;
+    }
+
+    // Condition 2: enough time has elapsed since the last checkpoint to
+    // avoid thrashing when the checkpoint just ran.
+    let elapsed_ms = last_checkpoint_at.elapsed().as_millis() as u64;
+    if elapsed_ms < max_checkpoint_lag_ms {
+        tracing::debug!(
+            "Shard {}: P6 WAL overflow ({} bytes) but lag guard active ({}/{}ms), deferring",
+            shard_id,
+            total_wal,
+            elapsed_ms,
+            max_checkpoint_lag_ms
+        );
+        return false;
+    }
+
+    tracing::warn!(
+        "Shard {}: P6 WAL ceiling trigger — {} bytes > max {} bytes, forcing checkpoint + aggressive recycle",
+        shard_id,
+        total_wal,
+        wal.max_wal_bytes()
+    );
+
+    // Force a synchronous checkpoint (drives the state machine to completion).
+    // If checkpoint is already active, force_checkpoint is a no-op — the
+    // in-progress checkpoint will advance next tick and the recycle will run
+    // in handle_checkpoint_tick's Finalize arm.
+    force_checkpoint(
+        checkpoint_mgr,
+        page_cache,
+        wal,
+        manifest,
+        control,
+        control_path,
+        shard_id,
+    );
+
+    // Aggressive recycle — bypass min_wal_bytes floor.
+    // Use current_lsn - 1 as the redo_lsn (all records before this point
+    // are checkpointed after the force_checkpoint above).
+    let redo_lsn = wal.current_lsn().saturating_sub(1);
+    match wal.recycle_aggressive(redo_lsn) {
+        Ok(stats) if stats.segments_recycled > 0 => {
+            tracing::info!(
+                "Shard {}: P6 aggressive recycle freed {} segment(s), {} bytes",
+                shard_id,
+                stats.segments_recycled,
+                stats.bytes_reclaimed,
+            );
+        }
+        Ok(_) => {
+            tracing::debug!(
+                "Shard {}: P6 aggressive recycle: no segments eligible at redo_lsn={}",
+                shard_id,
+                redo_lsn
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                "Shard {}: P6 aggressive recycle failed: {} — disk may be full",
+                shard_id,
+                e
+            );
+        }
+    }
+
+    true
+}
+
 /// Handle one checkpoint tick. Called from the event loop every 1ms when
 /// disk-offload is enabled.
 ///
