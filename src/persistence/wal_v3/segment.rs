@@ -66,6 +66,27 @@ pub const DEFAULT_MIN_WAL_BYTES: u64 = 48 * 1024 * 1024;
 /// Default maximum WAL size before aggressive recycling (256MB).
 pub const DEFAULT_MAX_WAL_BYTES: u64 = 256 * 1024 * 1024;
 
+/// Snapshot of on-disk WAL size — read by P10 INFO emitter.
+///
+/// Obtained via [`WalWriterV3::stats()`]. The scan is O(segment-count) and
+/// intended only for low-frequency INFO/monitoring calls — not the hot path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WalStats {
+    /// Number of `.wal` segment files currently on disk (including the active one).
+    pub total_segments: u64,
+    /// Sum of file sizes for all `.wal` segment files in bytes.
+    pub total_bytes: u64,
+}
+
+/// Accounting returned by [`WalWriterV3::recycle_aggressive()`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecycleStats {
+    /// Number of segment files deleted.
+    pub segments_recycled: usize,
+    /// Total bytes freed from disk.
+    pub bytes_reclaimed: u64,
+}
+
 /// WAL v3 writer with segmented files, per-record LSN, and batched fsync.
 pub struct WalWriterV3 {
     shard_id: usize,
@@ -236,6 +257,155 @@ impl WalWriterV3 {
     #[inline]
     pub fn max_wal_bytes(&self) -> u64 {
         self.max_wal_bytes
+    }
+
+    /// Scan the WAL directory and return a snapshot of on-disk WAL size.
+    ///
+    /// O(segment-count) — intended for low-frequency INFO/monitoring calls only.
+    /// Do NOT call on the hot write path.
+    pub fn stats(&self) -> std::io::Result<WalStats> {
+        let mut total_segments = 0u64;
+        let mut total_bytes = 0u64;
+
+        let entries = fs::read_dir(&self.wal_dir)?;
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if !name_str.ends_with(".wal") {
+                continue;
+            }
+            // Validate it is a numeric sequence segment (not a stray file).
+            if name_str
+                .strip_suffix(".wal")
+                .and_then(|s| s.parse::<u64>().ok())
+                .is_none()
+            {
+                continue;
+            }
+            let file_size = fs::metadata(entry.path()).map(|m| m.len()).unwrap_or(0);
+            total_segments += 1;
+            total_bytes += file_size;
+        }
+
+        Ok(WalStats {
+            total_segments,
+            total_bytes,
+        })
+    }
+
+    /// Aggressively recycle fully-checkpointed WAL segments, **ignoring** the
+    /// `min_wal_bytes` floor.
+    ///
+    /// This is the ceiling-trigger path: called when total on-disk WAL exceeds
+    /// `max_wal_bytes` to prevent unbounded growth when checkpointing stalls
+    /// (e.g. disk-full elsewhere). Unlike [`recycle_segments_before`], this
+    /// method will delete eligible segments even if doing so drops total WAL
+    /// below `min_wal_bytes`.
+    ///
+    /// # Safety of in-flight readers
+    ///
+    /// `WalTailReader` (CDC, replication) opens a fresh `File` per `read_at`
+    /// call and handles missing segments by advancing to the next available
+    /// sequence number (`find_segment_after`). Deletion under an open fd on
+    /// Linux is POSIX-safe. This method does not break in-flight readers.
+    ///
+    /// # Arguments
+    ///
+    /// * `redo_lsn` — All segments whose records are entirely before this LSN
+    ///   are eligible for recycling. Pass `wal.current_lsn()` after a
+    ///   completed checkpoint to recycle everything before the new redo point.
+    ///
+    /// Returns [`RecycleStats`] with the count and byte total of segments deleted.
+    pub fn recycle_aggressive(&self, redo_lsn: u64) -> std::io::Result<RecycleStats> {
+        use std::io::Read as _;
+
+        struct SegInfo {
+            seq: u64,
+            base_lsn: u64,
+            file_size: u64,
+            path: PathBuf,
+        }
+
+        let mut all_segments: Vec<SegInfo> = Vec::new();
+
+        let entries = fs::read_dir(&self.wal_dir)?;
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if !name_str.ends_with(".wal") {
+                continue;
+            }
+            let seq = match name_str
+                .strip_suffix(".wal")
+                .and_then(|s| s.parse::<u64>().ok())
+            {
+                Some(s) => s,
+                None => continue,
+            };
+            let path = entry.path();
+            let file_size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+
+            // Read base_lsn from header (offset 28..36).
+            let mut header = [0u8; WAL_V3_HEADER_SIZE];
+            let file = fs::File::open(&path)?;
+            let mut reader = std::io::BufReader::new(file);
+            let base_lsn = if reader.read_exact(&mut header).is_ok() {
+                u64::from_le_bytes(header[28..36].try_into().unwrap_or([0u8; 8]))
+            } else {
+                continue; // Truncated header — skip.
+            };
+
+            all_segments.push(SegInfo {
+                seq,
+                base_lsn,
+                file_size,
+                path,
+            });
+        }
+
+        // Sort oldest-first.
+        all_segments.sort_by_key(|s| s.seq);
+
+        let mut segments_recycled = 0usize;
+        let mut bytes_reclaimed = 0u64;
+
+        for i in 0..all_segments.len() {
+            let seg = &all_segments[i];
+            // Never delete the active segment.
+            if seg.seq >= self.current_sequence {
+                continue;
+            }
+            // A segment is safe to recycle when its last record lies strictly
+            // before redo_lsn. Determine the segment's end LSN by peeking the
+            // next segment's base_lsn (which equals this segment's end LSN).
+            let next_base = all_segments.get(i + 1).map(|s| s.base_lsn).unwrap_or(0);
+            if next_base == 0 || next_base > redo_lsn {
+                continue;
+            }
+            // Aggressive: skip the min_wal_bytes floor check.
+            match fs::remove_file(&seg.path) {
+                Ok(()) => {
+                    segments_recycled += 1;
+                    bytes_reclaimed += seg.file_size;
+                    // Emit reclamation metrics for P10 INFO emitter.
+                    crate::admin::metrics_setup::record_wal_aggressive_recycle(1, seg.file_size);
+                }
+                Err(e) => {
+                    // Log but continue — partial reclamation is better than none.
+                    // TODO(P6-1): surface as reclamation_wal_recycle_errors counter once P10 lands.
+                    tracing::warn!(
+                        "P6: aggressive WAL recycle failed for {:?}: {}",
+                        seg.path,
+                        e
+                    );
+                }
+            }
+        }
+
+        Ok(RecycleStats {
+            segments_recycled,
+            bytes_reclaimed,
+        })
     }
 
     /// Rotate to a new segment: flush + fsync current, open next.

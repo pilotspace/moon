@@ -10,5 +10,5 @@ pub use replay::{
     WalV3ReplayResult, replay_wal_auto, replay_wal_v3_dir, replay_wal_v3_dir_until,
     replay_wal_v3_file, replay_wal_v3_file_until, resolve_target_time_to_lsn,
 };
-pub use segment::{WalSegment, WalWriterV3};
+pub use segment::{RecycleStats, WalSegment, WalStats, WalWriterV3};
 pub use tail::{TailCursor, WalTailReader};
