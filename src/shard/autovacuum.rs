@@ -588,6 +588,148 @@ pub fn config_from_server(server: &crate::config::ServerConfig) -> AutovacuumCon
 }
 
 // ---------------------------------------------------------------------------
+// MA4 — Weighted compaction scheduler
+// ---------------------------------------------------------------------------
+
+/// One compactable entity (vector index or graph) tracked by the weighted scheduler.
+///
+/// The scheduler uses `dead_bytes_rate = bytes_dead / elapsed_secs_since_last_compaction`
+/// as the priority key. Entities with higher churn (more dead bytes accumulated
+/// per unit time) run first, preventing hot indexes from being starved by the
+/// fixed-round-robin order of the P4 daemon.
+#[derive(Debug, Clone)]
+pub struct CompactionEntity {
+    /// Stable identifier: index name or graph name.
+    pub id: String,
+    /// Estimated bytes of dead/reclaimed data in the entity (from segment stats).
+    pub bytes_dead: u64,
+    /// Instant of the last successful compaction (or entity creation time).
+    pub last_compaction: Instant,
+}
+
+impl CompactionEntity {
+    /// Compute the current dead-bytes rate: `bytes_dead / elapsed_secs`.
+    ///
+    /// Saturates to `f64::MAX` when elapsed is < 1 ms (effectively just created).
+    #[inline]
+    pub fn dead_bytes_rate(&self) -> f64 {
+        let elapsed_secs = self.last_compaction.elapsed().as_secs_f64();
+        if elapsed_secs < 0.001 {
+            // Just-created or just-compacted: treat as minimal rate so
+            // it goes to the back of the queue.
+            0.0
+        } else {
+            self.bytes_dead as f64 / elapsed_secs
+        }
+    }
+}
+
+/// Priority-queue-based compaction scheduler with anti-starvation cap.
+///
+/// ## Scheduling algorithm
+///
+/// Each call to [`CompactionScheduler::pop_next`] returns the ID of the entity
+/// with the highest `dead_bytes_rate`, UNLESS an entity has not been scheduled
+/// for `starvation_cap` seconds — in which case the oldest-starved entity is
+/// returned first, regardless of weight.
+///
+/// This matches the TiKV/FoundationDB pattern: hotspot-first, but no entity
+/// waits indefinitely.
+///
+/// ## Usage
+///
+/// 1. Call [`CompactionScheduler::upsert`] when an entity's stats change.
+/// 2. Call [`CompactionScheduler::pop_next`] each autovacuum tick to get the
+///    next entity to compact.
+/// 3. After compacting, call `upsert` again with a fresh `last_compaction = Instant::now()`
+///    and updated `bytes_dead`.
+pub struct CompactionScheduler {
+    entities: Vec<CompactionEntity>,
+    starvation_cap: Duration,
+}
+
+impl CompactionScheduler {
+    /// Create a new scheduler with the given anti-starvation cap.
+    pub fn new(starvation_cap: Duration) -> Self {
+        Self {
+            entities: Vec::new(),
+            starvation_cap,
+        }
+    }
+
+    /// Insert or update an entity. If an entity with the same `id` already
+    /// exists, it is replaced.
+    pub fn upsert(&mut self, entity: CompactionEntity) {
+        if let Some(pos) = self.entities.iter().position(|e| e.id == entity.id) {
+            self.entities[pos] = entity;
+        } else {
+            self.entities.push(entity);
+        }
+    }
+
+    /// Remove an entity by ID (e.g. when an index is dropped).
+    pub fn remove(&mut self, id: &str) {
+        self.entities.retain(|e| e.id != id);
+    }
+
+    /// Select the next entity to compact and return its ID.
+    ///
+    /// Selection priority:
+    /// 1. Any entity whose `last_compaction` elapsed ≥ `starvation_cap` →
+    ///    pick the one with the longest elapsed time (oldest starved first).
+    /// 2. Otherwise: pick the entity with the highest `dead_bytes_rate`.
+    ///
+    /// Returns `None` when no entities are registered.
+    pub fn pop_next(&mut self) -> Option<String> {
+        if self.entities.is_empty() {
+            return None;
+        }
+
+        // Check starvation cap: find entity with the longest elapsed time.
+        let starved_idx = self
+            .entities
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.last_compaction.elapsed() >= self.starvation_cap)
+            .max_by(|(_, a), (_, b)| {
+                a.last_compaction
+                    .elapsed()
+                    .partial_cmp(&b.last_compaction.elapsed())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|(i, _)| i);
+
+        if let Some(idx) = starved_idx {
+            return Some(self.entities[idx].id.clone());
+        }
+
+        // No starvation: highest dead_bytes_rate wins.
+        let best_idx = self
+            .entities
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| {
+                a.dead_bytes_rate()
+                    .partial_cmp(&b.dead_bytes_rate())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|(i, _)| i)?;
+
+        Some(self.entities[best_idx].id.clone())
+    }
+
+    /// Number of registered entities.
+    pub fn len(&self) -> usize {
+        self.entities.len()
+    }
+
+    /// True when no entities are registered.
+    pub fn is_empty(&self) -> bool {
+        self.entities.is_empty()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Unit tests (module-level; integration tests in tests/autovacuum_daemon.rs)
 // ---------------------------------------------------------------------------
 
