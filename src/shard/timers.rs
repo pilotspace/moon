@@ -160,12 +160,15 @@ pub(crate) fn sync_wal_v3(wal_v3: &mut Option<crate::persistence::wal_v3::segmen
 ///
 /// ## What this does
 ///
-/// 1. `prune_committed(margin)` — evicts `committed` entries below
+/// 1. `mark_old_snapshots_killed(now, threshold)` — MA2: kill snapshots older than
+///    `old_snapshot_threshold_secs`. Skipped when threshold == 0 (disabled).
+/// 2. `prune_committed(margin)` — evicts `committed` entries below
 ///    `oldest_snapshot - margin`, freeing RoaringTreemap memory.
-/// 2. `sweep_zombies_mut()` — removes any write intents whose owner txn_id is
+/// 3. `sweep_zombies_mut()` — removes any write intents whose owner txn_id is
 ///    neither active nor committed (leaked by dropped-future or panic paths).
-/// 3. Updates five RECL_MVCC_* atomics so `INFO` picks them up immediately.
-/// 4. MA1: samples total immutable segment count and updates `RECL_SEGMENT_STALL_ACTIVE`
+/// 4. Updates five RECL_MVCC_* atomics so `INFO` picks them up immediately,
+///    including `RECL_MVCC_OLDEST_SNAPSHOT_AGE_SECS` (wired here for MA2).
+/// 5. MA1: samples total immutable segment count and updates `RECL_SEGMENT_STALL_ACTIVE`
 ///    via `segment_stall::update_segment_stall`. Read commands continue; only
 ///    foreground writes are blocked when the threshold is exceeded.
 ///
@@ -178,22 +181,43 @@ pub(crate) fn run_mvcc_sweep(
     #[cfg(feature = "graph")] graph_store: &mut crate::graph::store::GraphStore,
     prune_margin: u64,
     max_unflushed_immutable_segments: u64,
+    old_snapshot_threshold_secs: u64,
 ) {
-    use crate::command::info_reclamation::{
-        RECL_MVCC_ACTIVE, RECL_MVCC_COMMITTED, RECL_MVCC_OLDEST_SNAPSHOT_LAG,
-        RECL_MVCC_ZOMBIES_SWEPT_TOTAL,
-    };
     use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
 
+    use crate::command::info_reclamation::{
+        RECL_MVCC_ACTIVE, RECL_MVCC_COMMITTED, RECL_MVCC_OLDEST_SNAPSHOT_AGE_SECS,
+        RECL_MVCC_OLDEST_SNAPSHOT_LAG, RECL_MVCC_ZOMBIES_SWEPT_TOTAL,
+    };
+
+    let now = Instant::now();
     let mgr = vector_store.txn_manager_mut();
 
-    // 1. Prune committed treemap.
+    // 1. MA2: mark snapshots older than threshold as killed so oldest_snapshot advances.
+    let newly_killed = if old_snapshot_threshold_secs > 0 {
+        let threshold = Duration::from_secs(old_snapshot_threshold_secs);
+        let count = mgr.mark_old_snapshots_killed(now, threshold);
+        if count > 0 {
+            tracing::warn!(
+                count,
+                threshold_secs = old_snapshot_threshold_secs,
+                "mvcc_sweep: killed {} snapshot(s) older than threshold",
+                count
+            );
+        }
+        count
+    } else {
+        0
+    };
+
+    // 2. Prune committed treemap.
     let pruned = mgr.prune_committed(prune_margin);
 
-    // 2. Sweep zombie vector write intents.
+    // 3. Sweep zombie vector write intents.
     let swept_vec = mgr.sweep_zombies_mut();
 
-    // 3. Sweep zombie graph write intents (feature-gated).
+    // 4. Sweep zombie graph write intents (feature-gated).
     #[cfg(feature = "graph")]
     let swept_graph = {
         // GraphStore owns its own LSN counter but shares the same transaction
@@ -207,34 +231,40 @@ pub(crate) fn run_mvcc_sweep(
     let total_swept = swept_vec + swept_graph;
     let _ = pruned; // used for debug; not emitted separately (merged into committed count)
 
-    // 4. Update RECL_MVCC_* atomics.
+    // 5. Update RECL_MVCC_* atomics.
     let committed_len = mgr.committed_count();
     let active_len = mgr.active_count() as u64;
     let oldest_snap = mgr.oldest_snapshot();
     let current_lsn = mgr.current_lsn();
     let lag = current_lsn.saturating_sub(oldest_snap);
 
+    // MA2: oldest_snapshot_age measures age of oldest NON-killed snapshot.
+    // Killed snapshots are excluded so the metric reflects real GC pressure.
+    let age_secs = mgr.oldest_snapshot_age(now).map_or(0, |d| d.as_secs());
+
     RECL_MVCC_COMMITTED.store(committed_len, Ordering::Relaxed);
     RECL_MVCC_ACTIVE.store(active_len, Ordering::Relaxed);
     RECL_MVCC_OLDEST_SNAPSHOT_LAG.store(lag, Ordering::Relaxed);
-    // RECL_MVCC_OLDEST_SNAPSHOT_AGE_SECS is wired by MA2 (requires Instant tracking).
+    RECL_MVCC_OLDEST_SNAPSHOT_AGE_SECS.store(age_secs, Ordering::Relaxed);
     if total_swept > 0 {
         RECL_MVCC_ZOMBIES_SWEPT_TOTAL.fetch_add(total_swept as u64, Ordering::Relaxed);
     }
 
-    // 5. MA1: update segment-stall bit based on current immutable segment count.
+    // 6. MA1: update segment-stall bit based on current immutable segment count.
     let imm_count = vector_store.total_immutable_segment_count();
     crate::shard::segment_stall::update_segment_stall(imm_count, max_unflushed_immutable_segments);
 
-    if total_swept > 0 || pruned > 0 {
+    if total_swept > 0 || pruned > 0 || newly_killed > 0 {
         tracing::debug!(
             pruned,
             swept_vec,
             swept_graph,
+            newly_killed,
             committed_remaining = committed_len,
             oldest_snapshot_lag = lag,
+            oldest_snapshot_age_secs = age_secs,
             imm_count,
-            "mvcc_sweep: pruned committed + swept zombies",
+            "mvcc_sweep: pruned committed + swept zombies + killed old snapshots",
         );
     }
 }

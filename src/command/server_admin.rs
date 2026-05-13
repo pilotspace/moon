@@ -655,6 +655,78 @@ fn memory_usage_reply(key: &[u8], entry: &Entry) -> Frame {
 }
 
 // ---------------------------------------------------------------------------
+// KILL SNAPSHOT — MA2 operator command
+// ---------------------------------------------------------------------------
+
+/// `KILL SNAPSHOT <txn_id>`
+///
+/// Forcibly marks an active MVCC snapshot as killed. The snapshot is excluded
+/// from the `oldest_snapshot` watermark immediately, unblocking `prune_committed`
+/// GC. The client that owns the snapshot will receive a
+/// `MOONERR snapshot too old: <txn_id>` error on its next transactional read.
+///
+/// ## Syntax
+/// ```text
+/// KILL SNAPSHOT <txn_id>
+/// ```
+/// - `txn_id` — decimal u64 transaction ID (from `TXN.BEGIN` response or `INFO`).
+///
+/// ## Returns
+/// - `+OK` on success.
+/// - `ERR wrong number of arguments` if syntax is wrong.
+/// - `ERR KILL subcommand '<sub>' not supported` for unknown subcommands.
+/// - `MOONERR snapshot not found: <txn_id>` if txn_id is unknown or already killed.
+pub fn kill_snapshot(
+    vector_store: &mut crate::vector::store::VectorStore,
+    args: &[Frame],
+) -> Frame {
+    // args[0] = subcommand (must be SNAPSHOT), args[1] = txn_id
+    if args.len() != 2 {
+        return Frame::Error(Bytes::from_static(
+            b"ERR wrong number of arguments for 'KILL SNAPSHOT'",
+        ));
+    }
+    let sub = match extract_bytes(&args[0]) {
+        Some(s) => s,
+        None => return Frame::Error(Bytes::from_static(b"ERR invalid argument")),
+    };
+    if !sub.eq_ignore_ascii_case(b"SNAPSHOT") {
+        return Frame::Error(Bytes::from(
+            format!(
+                "ERR KILL subcommand '{}' not supported; use KILL SNAPSHOT",
+                String::from_utf8_lossy(sub)
+            )
+            .into_bytes(),
+        ));
+    }
+    let txn_id_bytes = match extract_bytes(&args[1]) {
+        Some(b) => b,
+        None => return Frame::Error(Bytes::from_static(b"ERR invalid txn_id")),
+    };
+    let txn_id: u64 = match std::str::from_utf8(txn_id_bytes)
+        .ok()
+        .and_then(|s| s.parse().ok())
+    {
+        Some(id) => id,
+        None => {
+            return Frame::Error(Bytes::from_static(
+                b"ERR txn_id must be a non-negative integer",
+            ));
+        }
+    };
+
+    let mgr = vector_store.txn_manager_mut();
+    if mgr.kill_snapshot(txn_id) {
+        tracing::info!(txn_id, "KILL SNAPSHOT: operator killed snapshot");
+        Frame::SimpleString(Bytes::from_static(b"OK"))
+    } else {
+        Frame::Error(Bytes::from(
+            format!("MOONERR snapshot not found: {txn_id}").into_bytes(),
+        ))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -856,5 +928,61 @@ mod tests {
             Frame::Error(b) => assert!(b.starts_with(b"ERR MEMORY subcommand")),
             _ => panic!("expected ERR, got {f:?}"),
         }
+    }
+
+    // ── KILL SNAPSHOT unit tests ───────────────────────────────────────────
+
+    #[test]
+    fn kill_snapshot_unknown_txn_id_returns_error() {
+        let mut store = crate::vector::store::VectorStore::new();
+        // txn_id 9999 was never started
+        let f = kill_snapshot(&mut store, &[bulk(b"SNAPSHOT"), bulk(b"9999")]);
+        match f {
+            Frame::Error(b) => {
+                let s = std::str::from_utf8(&b).unwrap_or("");
+                assert!(
+                    s.contains("not found") || s.contains("ERR"),
+                    "must mention not found or ERR: {s:?}"
+                );
+            }
+            _ => panic!("expected ERR, got {f:?}"),
+        }
+    }
+
+    #[test]
+    fn kill_snapshot_wrong_subcommand_returns_error() {
+        let mut store = crate::vector::store::VectorStore::new();
+        let f = kill_snapshot(&mut store, &[bulk(b"PROCESS"), bulk(b"1")]);
+        match f {
+            Frame::Error(_) => {}
+            _ => panic!("expected ERR for wrong subcommand, got {f:?}"),
+        }
+    }
+
+    #[test]
+    fn kill_snapshot_missing_txn_id_returns_error() {
+        let mut store = crate::vector::store::VectorStore::new();
+        let f = kill_snapshot(&mut store, &[bulk(b"SNAPSHOT")]);
+        match f {
+            Frame::Error(_) => {}
+            _ => panic!("expected ERR for missing txn_id, got {f:?}"),
+        }
+    }
+
+    #[test]
+    fn kill_snapshot_active_txn_returns_ok() {
+        let mut store = crate::vector::store::VectorStore::new();
+        let txn = store.txn_manager_mut().begin();
+        let txn_id_str = txn.txn_id.to_string();
+        let txn_id_bytes = txn_id_str.as_bytes();
+        let f = kill_snapshot(&mut store, &[bulk(b"SNAPSHOT"), bulk(txn_id_bytes)]);
+        match f {
+            Frame::SimpleString(b) => assert_eq!(&*b, b"OK"),
+            _ => panic!("expected +OK, got {f:?}"),
+        }
+        assert!(
+            store.txn_manager().is_killed(txn.txn_id),
+            "txn must be marked killed"
+        );
     }
 }

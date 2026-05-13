@@ -888,6 +888,15 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 continue;
             }
 
+            // --- MA2: KILL SNAPSHOT <txn_id> ---
+            if cmd.eq_ignore_ascii_case(b"KILL") {
+                let mut vs = ctx.shard_databases.vector_store(ctx.shard_id);
+                let response = crate::command::server_admin::kill_snapshot(&mut vs, cmd_args);
+                drop(vs);
+                responses.push(response);
+                continue;
+            }
+
             // --- Routing: keyless, local, or remote ---
             let target_shard =
                 extract_primary_key(cmd, cmd_args).map(|key| key_to_shard(key, ctx.num_shards));

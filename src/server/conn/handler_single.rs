@@ -1615,6 +1615,26 @@ pub async fn handle_connection(
                                     }
                                 }
 
+                                // MA2: KILL SNAPSHOT is admin (not is_write) so it lands in
+                                // the read run. Intercept before dispatch_read which doesn't
+                                // know about VectorStore.
+                                if d_cmd.eq_ignore_ascii_case(b"KILL") {
+                                    if let Some(ref vs) = vector_store {
+                                        let mut vs_guard = vs.lock();
+                                        let response = crate::command::server_admin::kill_snapshot(
+                                            &mut vs_guard,
+                                            d_args,
+                                        );
+                                        drop(vs_guard);
+                                        responses[resp_idx] = response;
+                                    } else {
+                                        responses[resp_idx] = Frame::Error(
+                                            bytes::Bytes::from_static(b"ERR vector store not initialized"),
+                                        );
+                                    }
+                                    continue;
+                                }
+
                                 let dispatch_start = std::time::Instant::now();
                                 let result = dispatch_read(&*guard, d_cmd, d_args, now_ms, &mut conn.selected_db, db_count);
                                 let elapsed_us = dispatch_start.elapsed().as_micros() as u64;
@@ -1768,6 +1788,26 @@ pub async fn handle_connection(
                                         responses[resp_idx] = Frame::Error(bytes::Bytes::from_static(b"ERR vector search not initialized"));
                                         continue;
                                     }
+                                }
+
+                                // MA2: KILL SNAPSHOT <txn_id> — admin command routed to
+                                // VectorStore's TransactionManager. Must intercept before
+                                // the main dispatch() path which has no VectorStore access.
+                                if d_cmd.eq_ignore_ascii_case(b"KILL") {
+                                    if let Some(vs) = vector_store.as_ref() {
+                                        let mut vs_guard = vs.lock();
+                                        let response = crate::command::server_admin::kill_snapshot(
+                                            &mut vs_guard,
+                                            d_args,
+                                        );
+                                        drop(vs_guard);
+                                        responses[resp_idx] = response;
+                                    } else {
+                                        responses[resp_idx] = Frame::Error(
+                                            bytes::Bytes::from_static(b"ERR vector store not initialized"),
+                                        );
+                                    }
+                                    continue;
                                 }
 
                                 // HSET auto-indexing: after dispatch, check for vector index match

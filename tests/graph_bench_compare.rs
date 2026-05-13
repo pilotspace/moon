@@ -92,6 +92,7 @@ async fn start_moon() -> (u16, CancellationToken) {
         disk_free_min_pct: 5,
         mvcc_committed_prune_margin: 1000,
         max_unflushed_immutable_segments: 20,
+        mvcc_old_snapshot_threshold_secs: 600,
     };
 
     tokio::spawn(async move {

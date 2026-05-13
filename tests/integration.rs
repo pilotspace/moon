@@ -90,6 +90,7 @@ async fn start_server() -> (u16, CancellationToken) {
         disk_free_min_pct: 5,
         mvcc_committed_prune_margin: 1000,
         max_unflushed_immutable_segments: 20,
+        mvcc_old_snapshot_threshold_secs: 600,
     };
 
     tokio::spawn(async move {
@@ -177,6 +178,7 @@ async fn start_server_with_pass(password: &str) -> (u16, CancellationToken) {
         disk_free_min_pct: 5,
         mvcc_committed_prune_margin: 1000,
         max_unflushed_immutable_segments: 20,
+        mvcc_old_snapshot_threshold_secs: 600,
     };
 
     tokio::spawn(async move {
@@ -1336,6 +1338,7 @@ async fn start_server_with_persistence(
         disk_free_min_pct: 5,
         mvcc_committed_prune_margin: 1000,
         max_unflushed_immutable_segments: 20,
+        mvcc_old_snapshot_threshold_secs: 600,
     };
 
     tokio::spawn(async move {
@@ -2207,6 +2210,7 @@ async fn start_server_with_maxmemory(maxmemory: usize, policy: &str) -> (u16, Ca
         disk_free_min_pct: 5,
         mvcc_committed_prune_margin: 1000,
         max_unflushed_immutable_segments: 20,
+        mvcc_old_snapshot_threshold_secs: 600,
     };
 
     tokio::spawn(async move {
@@ -2605,6 +2609,7 @@ async fn start_sharded_server(num_shards: usize) -> (u16, CancellationToken) {
         disk_free_min_pct: 5,
         mvcc_committed_prune_margin: 1000,
         max_unflushed_immutable_segments: 20,
+        mvcc_old_snapshot_threshold_secs: 600,
     };
 
     let cancel = token.clone();
@@ -3772,6 +3777,7 @@ async fn start_cluster_server() -> (u16, CancellationToken) {
         disk_free_min_pct: 5,
         mvcc_committed_prune_margin: 1000,
         max_unflushed_immutable_segments: 20,
+        mvcc_old_snapshot_threshold_secs: 600,
     };
 
     std::thread::spawn(move || {
@@ -4421,6 +4427,7 @@ async fn start_server_with_aclfile(acl_path: &str) -> (u16, CancellationToken) {
         disk_free_min_pct: 5,
         mvcc_committed_prune_margin: 1000,
         max_unflushed_immutable_segments: 20,
+        mvcc_old_snapshot_threshold_secs: 600,
     };
 
     tokio::spawn(async move {

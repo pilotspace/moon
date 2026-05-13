@@ -343,6 +343,25 @@ pub struct ServerConfig {
     /// Default 20. Set to 0 to disable the stall guard.
     #[arg(long = "max-unflushed-immutable-segments", default_value_t = 20)]
     pub max_unflushed_immutable_segments: u64,
+
+    // ── MA2: old_snapshot_threshold — stuck-snapshot kill ─────────────────
+    /// Wall-clock age in seconds after which an active MVCC snapshot is
+    /// forcibly killed by the 1-second sweep tick.
+    ///
+    /// Analog of PostgreSQL's `old_snapshot_threshold`. When a snapshot's age
+    /// exceeds this threshold, its entry in the active map is flagged as killed.
+    /// The killed snapshot is excluded from the `oldest_snapshot` watermark so
+    /// `prune_committed` can advance past it and free the RoaringTreemap memory.
+    ///
+    /// Callers that attempt to use a killed snapshot receive:
+    ///   `MOONERR snapshot too old: <txn_id>`
+    ///
+    /// Set to 0 to disable automatic threshold killing (KILL SNAPSHOT command
+    /// still works for manual operator intervention).
+    ///
+    /// Default 600 (10 minutes). Covers most operational scan/backup windows.
+    #[arg(long = "mvcc-old-snapshot-threshold-secs", default_value_t = 600)]
+    pub mvcc_old_snapshot_threshold_secs: u64,
 }
 
 impl ServerConfig {

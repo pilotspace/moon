@@ -292,6 +292,15 @@ pub(crate) fn handle_shard_message_shared(
                     return;
                 }
 
+                // MA2: KILL SNAPSHOT <txn_id> — forcibly kill an active MVCC snapshot.
+                // Routes directly to VectorStore's TransactionManager; bypasses
+                // write-stall guards (it is an admin command, never a data write).
+                if cmd.eq_ignore_ascii_case(b"KILL") {
+                    let frame = crate::command::server_admin::kill_snapshot(vector_store, args);
+                    let _ = reply_tx.send(frame);
+                    return;
+                }
+
                 // COW intercept: capture old value before write if snapshot is active
                 let is_write = metadata::is_write(cmd);
                 if is_write {

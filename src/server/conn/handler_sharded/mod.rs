@@ -901,6 +901,18 @@ pub(crate) async fn handle_connection_sharded_inner<
                         continue;
                     }
 
+                    // --- MA2: KILL SNAPSHOT <txn_id> ---
+                    // Routes directly to VectorStore's TransactionManager on the
+                    // local shard. Bypasses write-stall guards (admin command).
+                    if cmd.eq_ignore_ascii_case(b"KILL") {
+                        let mut vs = ctx.shard_databases.vector_store(ctx.shard_id);
+                        let response =
+                            crate::command::server_admin::kill_snapshot(&mut vs, cmd_args);
+                        drop(vs);
+                        responses.push(response);
+                        continue;
+                    }
+
                     // --- Multi-key commands ---
                     if is_multi_key_command(cmd, cmd_args) {
                         let response = crate::shard::coordinator::coordinate_multi_key(cmd, cmd_args, ctx.shard_id, ctx.num_shards, conn.selected_db, &ctx.shard_databases, &ctx.dispatch_tx, &ctx.spsc_notifiers, &ctx.cached_clock, &()).await;
