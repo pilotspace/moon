@@ -4,6 +4,7 @@ pub mod client;
 pub mod config;
 pub mod connection;
 pub mod functions;
+pub mod info_reclamation;
 pub mod geo;
 #[cfg(feature = "graph")]
 pub mod graph;

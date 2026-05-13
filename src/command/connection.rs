@@ -237,6 +237,9 @@ pub fn info(db: &Database, _args: &[Frame]) -> Frame {
     );
     sections.push_str("\r\n");
 
+    // # Reclamation — observability foundation for Wave-1 production hardening (P10).
+    crate::command::info_reclamation::write_reclamation_section(&mut sections);
+
     // # Stats
     sections.push_str("# Stats\r\n");
     let _ = write!(
