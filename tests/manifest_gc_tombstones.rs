@@ -232,7 +232,10 @@ fn gc_without_commit_leaves_disk_unchanged() {
     let m2 = ShardManifest::open(&path).unwrap();
     assert_eq!(m2.files().len(), 2, "disk still has 2 entries");
     assert_eq!(
-        m2.files().iter().filter(|e| e.status == FileStatus::Tombstone).count(),
+        m2.files()
+            .iter()
+            .filter(|e| e.status == FileStatus::Tombstone)
+            .count(),
         1,
         "disk still has 1 tombstone"
     );

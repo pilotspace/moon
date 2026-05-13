@@ -282,6 +282,22 @@ pub struct ServerConfig {
     /// --recovery-target-lsn (LSN wins if both are set).
     #[arg(long = "recovery-target-time", value_name = "RFC3339")]
     pub recovery_target_time: Option<String>,
+
+    // ── P1: Manifest tombstone GC ───────────────────────────────────
+    /// Minimum manifest epoch age before a tombstoned file entry is physically
+    /// removed from the manifest. Each committed epoch is a new snapshot
+    /// generation; retain_epochs=2 means a tombstone must survive two full
+    /// manifest commits before GC can prune it. Guards readers holding old
+    /// snapshot views opened before the tombstone was written.
+    #[arg(long = "manifest-tombstone-retain-epochs", default_value_t = 2)]
+    pub manifest_tombstone_retain_epochs: u64,
+
+    /// Minimum wall-clock age in seconds before a tombstoned file entry is
+    /// physically removed from the manifest. Must be ≥ the longest expected
+    /// reader snapshot age. Default 300 s (5 min) covers most operational
+    /// scan/backup windows without accumulating unbounded tombstone bloat.
+    #[arg(long = "manifest-tombstone-retain-secs", default_value_t = 300)]
+    pub manifest_tombstone_retain_secs: u64,
 }
 
 impl ServerConfig {

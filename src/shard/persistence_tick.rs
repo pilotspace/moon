@@ -562,6 +562,7 @@ use std::path::Path;
 /// Calls `force_begin` to bypass trigger conditions, then drives the
 /// checkpoint state machine to completion in a tight loop. No-op if a
 /// checkpoint is already active.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn force_checkpoint(
     checkpoint_mgr: &mut CheckpointManager,
     page_cache: &PageCache,
@@ -570,6 +571,8 @@ pub(crate) fn force_checkpoint(
     control: &mut ShardControlFile,
     control_path: &Path,
     shard_id: usize,
+    tombstone_retain_epochs: u64,
+    tombstone_retain_secs: u64,
 ) {
     if checkpoint_mgr.is_active() {
         tracing::warn!(
@@ -593,6 +596,8 @@ pub(crate) fn force_checkpoint(
             manifest,
             control,
             control_path,
+            tombstone_retain_epochs,
+            tombstone_retain_secs,
         ) {
             break; // Finalize completed
         }
@@ -634,6 +639,12 @@ pub(crate) fn maybe_begin_checkpoint(
 /// Returns `true` if a finalize step was completed this tick.
 ///
 /// The caller provides all I/O dependencies — CheckpointManager itself is pure state.
+///
+/// After a successful manifest commit at the Finalize step, tombstone GC runs
+/// with the configured two-axis retention policy. GC is in-memory only here;
+/// the pruned state is committed on the **next** checkpoint's manifest commit.
+/// This preserves crash safety: the current commit carries tombstones, and GC
+/// results only reach disk after one additional dual-root swap.
 pub(crate) fn handle_checkpoint_tick(
     checkpoint_mgr: &mut CheckpointManager,
     page_cache: &PageCache,
@@ -641,6 +652,8 @@ pub(crate) fn handle_checkpoint_tick(
     manifest: &mut ShardManifest,
     control: &mut ShardControlFile,
     control_path: &Path,
+    tombstone_retain_epochs: u64,
+    tombstone_retain_secs: u64,
 ) -> bool {
     match checkpoint_mgr.advance_tick() {
         CheckpointAction::Nothing => false,
@@ -735,6 +748,25 @@ pub(crate) fn handle_checkpoint_tick(
             if let Err(e) = manifest.commit() {
                 tracing::error!("Checkpoint manifest commit failed: {}", e);
                 return false;
+            }
+
+            // 3b. P1 — tombstone GC: physically prune tombstones that satisfy
+            // the two-axis retention policy (epoch age + wall-clock age).
+            // GC is in-memory only here; the pruned state reaches disk on the
+            // NEXT manifest commit (safe: current root still carries tombstones).
+            {
+                let now = std::time::Instant::now();
+                let pruned =
+                    manifest.gc_tombstones(tombstone_retain_epochs, tombstone_retain_secs, now);
+                if pruned > 0 {
+                    tracing::info!(
+                        "Manifest GC: pruned {} tombstone(s) \
+                         (retain_epochs={}, retain_secs={})",
+                        pruned,
+                        tombstone_retain_epochs,
+                        tombstone_retain_secs,
+                    );
+                }
             }
 
             // 4. Update control file with new checkpoint LSN
@@ -861,6 +893,8 @@ mod tests {
                 &mut manifest,
                 &mut control,
                 &control_path,
+                2,
+                300,
             );
             tick_count += 1;
             if finalized || !checkpoint_mgr.is_active() {
@@ -945,6 +979,8 @@ mod tests {
                 &mut manifest,
                 &mut control,
                 &control_path,
+                2,
+                300,
             );
             tick_count += 1;
             if finalized || !checkpoint_mgr.is_active() {

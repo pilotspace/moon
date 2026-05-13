@@ -76,6 +76,8 @@ async fn start_server() -> (u16, CancellationToken) {
         memory_arenas_cap: 8,
         recovery_target_lsn: None,
         recovery_target_time: None,
+        manifest_tombstone_retain_epochs: 2,
+        manifest_tombstone_retain_secs: 300,
     };
 
     tokio::spawn(async move {

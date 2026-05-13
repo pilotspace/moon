@@ -110,6 +110,8 @@ fn build_config(port: u16, num_shards: usize) -> ServerConfig {
         console_rate_burst: 2000.0,
         recovery_target_lsn: None,
         recovery_target_time: None,
+        manifest_tombstone_retain_epochs: 2,
+        manifest_tombstone_retain_secs: 300,
     }
 }
 

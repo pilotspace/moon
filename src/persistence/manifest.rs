@@ -4,8 +4,10 @@
 //! A single `sync_data()` call is the atomic commit point.
 //! CRC32C checksum via MoonPageHeader ensures crash-safe recovery.
 
+use std::collections::HashMap;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use crate::persistence::page::{MOONPAGE_HEADER_SIZE, MoonPageHeader, PAGE_4K, PageType};
 
@@ -262,6 +264,18 @@ pub struct ManifestRoot {
 ///
 /// Uses LMDB-style alternating root pages: writes go to the inactive
 /// slot, and a single `sync_data()` is the atomic commit point.
+///
+/// ## Tombstone GC
+///
+/// `FileEntry` has no on-disk field for when a tombstone was created (the v2
+/// layout is frozen; P6 owns format v3). Tombstone metadata is therefore kept
+/// in an in-memory side table (`tombstone_registry`) keyed by `file_id`.
+///
+/// On `open()`, all tombstoned entries are seeded with `(current_epoch,
+/// Instant::now())` — a conservative re-clocking that is safe because a
+/// process restart implies no in-flight readers holding old snapshot views.
+/// After the configured retention period both tombstone entries are
+/// physically removed from `active_root.entries` by `gc_tombstones`.
 #[derive(Debug)]
 pub struct ShardManifest {
     /// File handle opened for read/write.
@@ -272,6 +286,13 @@ pub struct ShardManifest {
     active_root: ManifestRoot,
     /// Which slot is currently active: 0 = Root A (offset 0), 1 = Root B (offset 4096).
     active_slot: u8,
+    /// In-memory registry of tombstoned files: file_id → (tombstone_epoch, tombstoned_at).
+    ///
+    /// `tombstone_epoch` is the `active_root.epoch` at the moment `remove_file` was called
+    /// (i.e. the epoch of the root that will be committed next, which equals current + 1
+    /// after the commit flip — we record the pre-commit value so age = current - tombstone_epoch).
+    /// `tombstoned_at` is a monotonic `Instant` for wall-clock retention.
+    tombstone_registry: HashMap<u64, (u64, Instant)>,
 }
 
 impl ShardManifest {
@@ -315,6 +336,7 @@ impl ShardManifest {
             path: path.to_path_buf(),
             active_root: root,
             active_slot: 0,
+            tombstone_registry: HashMap::new(),
         })
     }
 
@@ -361,11 +383,25 @@ impl ShardManifest {
             .write(true)
             .open(path)?;
 
+        // Seed tombstone_registry for all tombstoned entries found on disk.
+        // Conservative re-clocking: use current epoch and Instant::now() so
+        // retention timers start from process restart, not original tombstone time.
+        // Safe because a restart implies no in-flight readers hold old snapshot views.
+        let now = Instant::now();
+        let current_epoch = active_root.epoch;
+        let mut tombstone_registry = HashMap::new();
+        for entry in &active_root.entries {
+            if entry.status == FileStatus::Tombstone {
+                tombstone_registry.insert(entry.file_id, (current_epoch, now));
+            }
+        }
+
         Ok(Self {
             file,
             path: path.to_path_buf(),
             active_root,
             active_slot,
+            tombstone_registry,
         })
     }
 
@@ -416,12 +452,119 @@ impl ShardManifest {
     }
 
     /// Mark a file as Tombstone by file_id (in-memory only until commit).
+    ///
+    /// Records the tombstone in the in-memory registry with the current epoch
+    /// and wall-clock instant so `gc_tombstones` can enforce two-axis retention.
+    /// The epoch recorded is the pre-commit epoch; after `commit()` the active
+    /// epoch is incremented by 1, so tombstone age in epochs = current_epoch - tombstone_epoch.
     pub fn remove_file(&mut self, file_id: u64) {
         for entry in &mut self.active_root.entries {
             if entry.file_id == file_id {
                 entry.status = FileStatus::Tombstone;
+                // Register tombstone with current epoch and monotonic clock.
+                // Use entry() to avoid overwriting an existing registry entry
+                // if remove_file is called twice for the same file_id.
+                self.tombstone_registry
+                    .entry(file_id)
+                    .or_insert_with(|| (self.active_root.epoch, Instant::now()));
             }
         }
+    }
+
+    /// Physically remove tombstoned entries that satisfy BOTH retention axes.
+    ///
+    /// ## Two-axis retention
+    ///
+    /// An entry is eligible for physical removal only when **both** conditions hold:
+    ///
+    /// - **Epoch axis**: `current_epoch - tombstone_epoch >= retain_epochs`
+    ///   Guards against pruning files that a snapshot reader opened before the
+    ///   tombstone was recorded; each committed epoch is a new snapshot generation.
+    ///
+    /// - **Time axis**: elapsed wall-clock time since tombstone >= `retain_secs`
+    ///   Guards against pruning files that a long-running reader holds open;
+    ///   `retain_secs` must be ≥ the longest expected reader snapshot age.
+    ///
+    /// ## Crash safety
+    ///
+    /// This method is in-memory only — it does **not** commit. The caller must
+    /// call `commit()` after GC to persist the pruned state through the dual-root
+    /// atomic swap. A crash before commit leaves the on-disk root untouched; GC
+    /// will re-evaluate the same tombstones on the next invocation (idempotent).
+    ///
+    /// ## Parameters
+    ///
+    /// - `retain_epochs`: minimum epoch age before a tombstone is eligible.
+    ///   Default recommendation: `2` (two manifest commit generations).
+    /// - `retain_secs`: minimum wall-clock age in seconds.
+    ///   Default recommendation: `300` (5 minutes).
+    /// - `now`: monotonic clock instant for the time axis check. Pass
+    ///   `Instant::now()` in production; inject a future instant in tests.
+    ///
+    /// ## Returns
+    ///
+    /// Count of entries physically removed from `active_root.entries`.
+    pub fn gc_tombstones(&mut self, retain_epochs: u64, retain_secs: u64, now: Instant) -> usize {
+        let current_epoch = self.active_root.epoch;
+        let mut pruned = 0usize;
+
+        self.active_root.entries.retain(|entry| {
+            if entry.status != FileStatus::Tombstone {
+                return true; // keep all non-tombstone entries
+            }
+            let Some(&(tombstone_epoch, tombstoned_at)) =
+                self.tombstone_registry.get(&entry.file_id)
+            else {
+                // No registry entry — conservatively retain (should not happen in
+                // normal operation; seeded on open() and written in remove_file()).
+                return true;
+            };
+
+            let epoch_age = current_epoch.saturating_sub(tombstone_epoch);
+            let time_age_secs = now.saturating_duration_since(tombstoned_at).as_secs();
+
+            let epoch_ok = epoch_age >= retain_epochs;
+            let time_ok = time_age_secs >= retain_secs;
+
+            if epoch_ok && time_ok {
+                pruned += 1;
+                false // remove this entry
+            } else {
+                true // retain
+            }
+        });
+
+        // Clean up registry entries for pruned tombstones.
+        if pruned > 0 {
+            let live_ids: std::collections::HashSet<u64> =
+                self.active_root.entries.iter().map(|e| e.file_id).collect();
+            self.tombstone_registry
+                .retain(|file_id, _| live_ids.contains(file_id));
+        }
+
+        pruned
+    }
+
+    /// Return the count of non-tombstone entries in the active root.
+    ///
+    /// Used by P10 to populate `reclamation_manifest_active` in INFO output.
+    pub fn active_entry_count(&self) -> usize {
+        self.active_root
+            .entries
+            .iter()
+            .filter(|e| e.status != FileStatus::Tombstone)
+            .count()
+    }
+
+    /// Return the count of tombstone entries in the active root.
+    ///
+    /// Used by P10 to populate `reclamation_manifest_tombstones` in INFO output.
+    pub fn tombstone_count(&self) -> usize {
+        self.active_root
+            .entries
+            .iter()
+            .filter(|e| e.status == FileStatus::Tombstone)
+            .count()
     }
 
     /// Update a file entry in-place (in-memory only until commit).

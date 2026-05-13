@@ -84,6 +84,8 @@ async fn start_server() -> (u16, CancellationToken) {
         console_rate_burst: 2000.0,
         recovery_target_lsn: None,
         recovery_target_time: None,
+        manifest_tombstone_retain_epochs: 2,
+        manifest_tombstone_retain_secs: 300,
     };
 
     tokio::spawn(async move {
@@ -165,6 +167,8 @@ async fn start_server_with_pass(password: &str) -> (u16, CancellationToken) {
         console_rate_burst: 2000.0,
         recovery_target_lsn: None,
         recovery_target_time: None,
+        manifest_tombstone_retain_epochs: 2,
+        manifest_tombstone_retain_secs: 300,
     };
 
     tokio::spawn(async move {
@@ -1318,6 +1322,8 @@ async fn start_server_with_persistence(
         console_rate_burst: 2000.0,
         recovery_target_lsn: None,
         recovery_target_time: None,
+        manifest_tombstone_retain_epochs: 2,
+        manifest_tombstone_retain_secs: 300,
     };
 
     tokio::spawn(async move {
@@ -2183,6 +2189,8 @@ async fn start_server_with_maxmemory(maxmemory: usize, policy: &str) -> (u16, Ca
         console_rate_burst: 2000.0,
         recovery_target_lsn: None,
         recovery_target_time: None,
+        manifest_tombstone_retain_epochs: 2,
+        manifest_tombstone_retain_secs: 300,
     };
 
     tokio::spawn(async move {
@@ -2575,6 +2583,8 @@ async fn start_sharded_server(num_shards: usize) -> (u16, CancellationToken) {
         console_rate_burst: 2000.0,
         recovery_target_lsn: None,
         recovery_target_time: None,
+        manifest_tombstone_retain_epochs: 2,
+        manifest_tombstone_retain_secs: 300,
     };
 
     let cancel = token.clone();
@@ -3736,6 +3746,8 @@ async fn start_cluster_server() -> (u16, CancellationToken) {
         console_rate_burst: 2000.0,
         recovery_target_lsn: None,
         recovery_target_time: None,
+        manifest_tombstone_retain_epochs: 2,
+        manifest_tombstone_retain_secs: 300,
     };
 
     std::thread::spawn(move || {
@@ -4379,6 +4391,8 @@ async fn start_server_with_aclfile(acl_path: &str) -> (u16, CancellationToken) {
         console_rate_burst: 2000.0,
         recovery_target_lsn: None,
         recovery_target_time: None,
+        manifest_tombstone_retain_epochs: 2,
+        manifest_tombstone_retain_secs: 300,
     };
 
     tokio::spawn(async move {
