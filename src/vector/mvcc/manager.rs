@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::collections::hash_map;
+use std::time::{Duration, Instant};
 
 use roaring::RoaringTreemap;
 
@@ -17,6 +18,22 @@ pub struct ActiveTxn {
     pub snapshot_lsn: u64,
 }
 
+/// Per-entry state for an active transaction slot.
+///
+/// Tracks snapshot LSN, wall-clock birth time (monotonic `Instant`), and the
+/// `killed` flag set by `old_snapshot_threshold` enforcement or operator
+/// `KILL SNAPSHOT` command.
+///
+/// Killed entries remain in `active` until the client explicitly commits or
+/// aborts so that `get_snapshot` can report the killed state. They are excluded
+/// from the `oldest_snapshot` watermark calculation so GC can proceed.
+#[derive(Debug, Clone)]
+struct ActiveEntry {
+    snapshot_lsn: u64,
+    started_at: Instant,
+    killed: bool,
+}
+
 /// Per-shard MVCC transaction manager.
 ///
 /// Owns: monotonic LSN counter, active txn map, write-intent map,
@@ -26,9 +43,10 @@ pub struct ActiveTxn {
 ///
 /// Uses RoaringTreemap for u64 txn_ids with no overflow risk.
 pub struct TransactionManager {
-    next_lsn: u64,
-    /// Active transactions: txn_id -> snapshot_lsn.
-    active: HashMap<u64, u64>,
+    /// Exposed for unit tests that need to inspect `next_lsn` directly.
+    pub(super) next_lsn: u64,
+    /// Active transactions: txn_id -> entry (snapshot_lsn + birth time + kill flag).
+    active: HashMap<u64, ActiveEntry>,
     /// Write intents: point_id -> owning txn_id. First-writer-wins.
     write_intents: HashMap<u64, u64>,
     /// Graph write intents: graph entity_id -> owning txn_id. First-writer-wins.
@@ -38,6 +56,7 @@ pub struct TransactionManager {
     /// Committed transaction IDs (u64-native, no overflow).
     committed: RoaringTreemap,
     /// Oldest active snapshot LSN (for zombie cleanup watermark).
+    /// Excludes killed snapshots so GC can advance past them.
     oldest_snapshot: u64,
     /// Floor below which every txn_id is globally visible (pruned from `committed`).
     ///
@@ -62,18 +81,35 @@ impl TransactionManager {
         }
     }
 
-    /// Begin a new transaction. Returns monotonically increasing txn_id
-    /// with snapshot_lsn = next_lsn - 1 (sees everything committed before this point).
+    /// Begin a new transaction stamped with `Instant::now()`.
+    ///
+    /// Returns monotonically increasing txn_id with snapshot_lsn = next_lsn - 1
+    /// (sees everything committed before this point).
     pub fn begin(&mut self) -> ActiveTxn {
+        self.begin_with_time(Instant::now())
+    }
+
+    /// Begin a new transaction with an explicit wall-clock birth time.
+    ///
+    /// Identical to `begin()` except the `started_at` field is set to the
+    /// provided `Instant`. Enables deterministic unit testing without a mock
+    /// clock: pass `Instant::now() - Duration::from_secs(N)` to simulate an
+    /// old snapshot.
+    pub fn begin_with_time(&mut self, started_at: Instant) -> ActiveTxn {
         let snapshot_lsn = self.next_lsn - 1;
         let txn_id = self.next_lsn;
         self.next_lsn += 1;
-        self.active.insert(txn_id, snapshot_lsn);
+        self.active.insert(
+            txn_id,
+            ActiveEntry {
+                snapshot_lsn,
+                started_at,
+                killed: false,
+            },
+        );
 
-        // If this is the only active txn, update oldest_snapshot
-        if self.active.len() == 1 {
-            self.oldest_snapshot = snapshot_lsn;
-        }
+        // Recalculate oldest_snapshot to include this new entry.
+        self.update_oldest_snapshot();
 
         ActiveTxn {
             txn_id,
@@ -83,7 +119,78 @@ impl TransactionManager {
 
     /// Get the snapshot LSN for an active transaction. Returns None if not active.
     pub fn get_snapshot(&self, txn_id: u64) -> Option<u64> {
-        self.active.get(&txn_id).copied()
+        self.active.get(&txn_id).map(|e| e.snapshot_lsn)
+    }
+
+    /// Returns true if the given active transaction has been killed.
+    ///
+    /// Killed snapshots are excluded from the `oldest_snapshot` watermark so
+    /// GC can proceed. Callers that care about kill state (e.g. FT.SEARCH on
+    /// an AS_OF snapshot) should check this before executing reads.
+    ///
+    /// Returns `false` for unknown or already-committed/aborted txn_ids.
+    #[inline]
+    pub fn is_killed(&self, txn_id: u64) -> bool {
+        self.active.get(&txn_id).map_or(false, |e| e.killed)
+    }
+
+    /// Manually kill a specific active snapshot by txn_id.
+    ///
+    /// Used by the `KILL SNAPSHOT <txn_id>` operator command. The snapshot
+    /// remains in `active` (so the client gets a "snapshot too old" error on
+    /// next use) but is excluded from `oldest_snapshot` so GC can advance.
+    ///
+    /// Returns `true` on success, `false` if:
+    /// - txn_id not found in active map (already committed/aborted/unknown)
+    /// - txn_id already killed (idempotent guard)
+    pub fn kill_snapshot(&mut self, txn_id: u64) -> bool {
+        match self.active.get_mut(&txn_id) {
+            Some(entry) if !entry.killed => {
+                entry.killed = true;
+                self.update_oldest_snapshot();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Mark all active snapshots older than `threshold` as killed.
+    ///
+    /// Analog of PostgreSQL's `old_snapshot_threshold`. Called on the 1s
+    /// sweep tick with `now = Instant::now()`. Snapshots whose wall-clock age
+    /// exceeds `threshold` are flagged; subsequent visibility checks against a
+    /// killed snapshot return a "snapshot too old" error to the client.
+    ///
+    /// After marking, `oldest_snapshot` is recalculated to skip killed entries,
+    /// allowing `prune_committed` to advance the GC floor.
+    ///
+    /// Returns the count of newly-killed snapshots (already-killed snapshots
+    /// are not double-counted).
+    pub fn mark_old_snapshots_killed(&mut self, now: Instant, threshold: Duration) -> usize {
+        let mut newly_killed = 0usize;
+        for entry in self.active.values_mut() {
+            if !entry.killed && now.duration_since(entry.started_at) > threshold {
+                entry.killed = true;
+                newly_killed += 1;
+            }
+        }
+        if newly_killed > 0 {
+            self.update_oldest_snapshot();
+        }
+        newly_killed
+    }
+
+    /// Returns the wall-clock age of the oldest non-killed active snapshot,
+    /// measured from `now`.
+    ///
+    /// Returns `None` when there are no active (non-killed) snapshots.
+    /// Used by the timer tick to store `RECL_MVCC_OLDEST_SNAPSHOT_AGE_SECS`.
+    pub fn oldest_snapshot_age(&self, now: Instant) -> Option<Duration> {
+        self.active
+            .values()
+            .filter(|e| !e.killed)
+            .map(|e| now.duration_since(e.started_at))
+            .max()
     }
 
     /// Acquire a write intent on a point. First-writer-wins conflict detection.
@@ -140,6 +247,18 @@ impl TransactionManager {
         self.graph_write_intents.retain(|_, owner| *owner != txn_id);
         self.update_oldest_snapshot();
         true
+    }
+
+    /// Abort a killed transaction — removes it from active and cleans up intents.
+    ///
+    /// Called when a client that holds a killed snapshot finally disconnects or
+    /// issues TXN.ABORT. Equivalent to `abort` but only operates on killed entries.
+    /// Returns false if txn is not active or not killed.
+    pub fn abort_killed(&mut self, txn_id: u64) -> bool {
+        match self.active.get(&txn_id) {
+            Some(e) if e.killed => self.abort(txn_id),
+            _ => false,
+        }
     }
 
     /// Get the current LSN value (next_lsn - 1). Used by graph operations
@@ -199,6 +318,18 @@ impl TransactionManager {
             }
         }
         zombies
+    }
+
+    /// Returns the count of active (non-killed) snapshots.
+    #[inline]
+    pub fn live_snapshot_count(&self) -> usize {
+        self.active.values().filter(|e| !e.killed).count()
+    }
+
+    /// Returns the count of killed snapshots still in the active map.
+    #[inline]
+    pub fn killed_snapshot_count(&self) -> usize {
+        self.active.values().filter(|e| e.killed).count()
     }
 
     /// Check if a transaction ID has been committed.
@@ -325,13 +456,19 @@ impl TransactionManager {
         &self.committed
     }
 
-    /// Recalculate oldest_snapshot from active transactions.
+    /// Recalculate oldest_snapshot from active non-killed transactions.
+    ///
+    /// Killed snapshots are excluded so the GC watermark can advance past them.
+    /// When all active snapshots are killed (or there are none), oldest_snapshot
+    /// advances to next_lsn, allowing prune_committed to GC everything.
     fn update_oldest_snapshot(&mut self) {
-        if self.active.is_empty() {
-            self.oldest_snapshot = self.next_lsn;
-        } else {
-            self.oldest_snapshot = self.active.values().copied().min().unwrap_or(self.next_lsn);
-        }
+        self.oldest_snapshot = self
+            .active
+            .values()
+            .filter(|e| !e.killed)
+            .map(|e| e.snapshot_lsn)
+            .min()
+            .unwrap_or(self.next_lsn);
     }
 }
 
@@ -727,5 +864,122 @@ mod tests {
         );
         // The floor is set.
         assert_eq!(mgr.pruned_below(), 1001);
+    }
+
+    // ── MA2 RED tests: old_snapshot_threshold kill + KILL SNAPSHOT ─────────
+
+    /// MA2-RED-1: `mark_old_snapshots_killed` marks snapshots older than threshold
+    /// as killed. Returns count of newly-killed snapshots.
+    #[test]
+    fn test_mark_old_snapshots_killed_returns_count() {
+        let mut mgr = TransactionManager::new();
+        let baseline = Instant::now();
+        // Begin a snapshot "700 seconds ago" by using a synthetic past Instant.
+        // We inject the started_at directly via begin_with_time.
+        let t1 = mgr.begin_with_time(baseline - Duration::from_secs(700));
+        let threshold = Duration::from_secs(600);
+        let now = baseline; // 700s after t1's start
+        let killed = mgr.mark_old_snapshots_killed(now, threshold);
+        assert_eq!(killed, 1, "one snapshot older than threshold must be killed");
+        assert!(mgr.is_killed(t1.txn_id), "t1 must be marked killed");
+    }
+
+    /// MA2-RED-2: A snapshot within the threshold is NOT killed.
+    #[test]
+    fn test_mark_old_snapshots_killed_spares_young_snapshots() {
+        let mut mgr = TransactionManager::new();
+        let baseline = Instant::now();
+        let t1 = mgr.begin_with_time(baseline - Duration::from_secs(300));
+        let threshold = Duration::from_secs(600);
+        let killed = mgr.mark_old_snapshots_killed(baseline, threshold);
+        assert_eq!(killed, 0, "young snapshot must not be killed");
+        assert!(!mgr.is_killed(t1.txn_id));
+    }
+
+    /// MA2-RED-3: After a snapshot is killed, `oldest_snapshot` advances past it
+    /// so `prune_committed` is no longer blocked.
+    #[test]
+    fn test_killed_snapshot_advances_oldest_snapshot() {
+        let mut mgr = TransactionManager::new();
+        let baseline = Instant::now();
+        // t1: old (700s), t2: young (100s)
+        let t1 = mgr.begin_with_time(baseline - Duration::from_secs(700));
+        let t2 = mgr.begin_with_time(baseline - Duration::from_secs(100));
+        let threshold = Duration::from_secs(600);
+
+        // Before kill: oldest_snapshot is t1's snapshot_lsn (0).
+        assert_eq!(mgr.oldest_snapshot(), t1.snapshot_lsn);
+
+        mgr.mark_old_snapshots_killed(baseline, threshold);
+
+        // After kill: oldest_snapshot must skip t1 and reflect t2's snapshot_lsn.
+        assert_eq!(
+            mgr.oldest_snapshot(),
+            t2.snapshot_lsn,
+            "oldest_snapshot must skip killed t1 and point to t2"
+        );
+    }
+
+    /// MA2-RED-4: `kill_snapshot(txn_id)` returns true on success and false
+    /// when the txn_id is unknown or already committed/aborted.
+    #[test]
+    fn test_kill_snapshot_by_id() {
+        let mut mgr = TransactionManager::new();
+        let t1 = mgr.begin();
+        assert!(mgr.kill_snapshot(t1.txn_id), "must return true for active txn");
+        assert!(mgr.is_killed(t1.txn_id), "must be marked killed");
+
+        // Unknown txn_id
+        assert!(!mgr.kill_snapshot(9999), "must return false for unknown txn_id");
+
+        // Already killed — idempotent false
+        assert!(
+            !mgr.kill_snapshot(t1.txn_id),
+            "must return false for already-killed txn"
+        );
+    }
+
+    /// MA2-RED-5: Killed snapshots are excluded from `oldest_snapshot` computation.
+    /// When ALL active snapshots are killed, oldest_snapshot advances to next_lsn
+    /// (no live reader).
+    #[test]
+    fn test_all_killed_advances_oldest_to_next_lsn() {
+        let mut mgr = TransactionManager::new();
+        let t1 = mgr.begin();
+        let _next_lsn_before = mgr.next_lsn;
+        assert!(mgr.kill_snapshot(t1.txn_id));
+        // No live (non-killed) active snapshots → oldest_snapshot == next_lsn.
+        assert_eq!(
+            mgr.oldest_snapshot(),
+            mgr.next_lsn,
+            "oldest_snapshot must equal next_lsn when all snapshots are killed"
+        );
+    }
+
+    /// MA2-RED-6: `oldest_snapshot_age` returns the wall-clock age of the oldest
+    /// non-killed active snapshot, or None when no snapshots are active.
+    #[test]
+    fn test_oldest_snapshot_age_no_active() {
+        let mgr = TransactionManager::new();
+        let baseline = Instant::now();
+        assert!(
+            mgr.oldest_snapshot_age(baseline).is_none(),
+            "no active snapshots → age must be None"
+        );
+    }
+
+    /// MA2-RED-7: `oldest_snapshot_age` returns approximate age of oldest
+    /// non-killed snapshot.
+    #[test]
+    fn test_oldest_snapshot_age_with_active() {
+        let mut mgr = TransactionManager::new();
+        let baseline = Instant::now();
+        let _t1 = mgr.begin_with_time(baseline - Duration::from_secs(42));
+        let age = mgr.oldest_snapshot_age(baseline).expect("age must be Some");
+        assert!(
+            age.as_secs() >= 42,
+            "age must be >= 42s; got {:?}",
+            age
+        );
     }
 }
