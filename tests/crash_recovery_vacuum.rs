@@ -206,119 +206,140 @@ fn crash_manifest_gc_before_commit_recovers_pre_staging_root() {
 
 // ── Scenario 3: Mid-sweep MVCC zombie crash + idempotency ───────────────────
 //
-// Context: `sweep_zombies_mut` drains zombie write-intents in-place.
-// Write-intents are NOT WAL-persisted — they live only in the in-memory
-// `TransactionManager`. On process restart (fresh `TransactionManager::new()`),
-// the intents map starts empty: there are no zombies to sweep.
+// Context: `sweep_zombies_mut` drains zombie write-intents in-place (mutating
+// `write_intents` via `HashMap::retain`). Write-intents are NOT WAL-persisted
+// — they live only in the in-memory `TransactionManager`. On process restart
+// (fresh `TransactionManager::new()`), the intents map starts empty.
 //
-// This test covers three sub-cases:
-//   (a) sweep is idempotent on the same instance (two calls == one call)
-//   (b) simulated crash mid-sweep: intents re-appear on "restart" only if the
-//       caller re-adds them (they don't — they're lost, which is safe because
-//       aborted intents are invisible to committed readers)
-//   (c) fresh instance starts with zero intents — sweep returns 0
+// "Crash mid-sweep" means: the retain loop has executed for k of N intents,
+// then SIGKILL. On next startup the TransactionManager is fresh — all intents
+// (including the ones that weren't yet swept) are gone, which is safe because:
+//   - Aborted intents are invisible to committed readers.
+//   - In-flight intents whose VectorUpsert WAL records exist are rolled back
+//     by WAL replay in `recover_vector_store`.
+//
+// This test covers:
+//   (a) Inject 3 real zombie intents (owner txn_id not in active/committed).
+//       Assert sweep_zombies_mut returns 3 and the intents map is empty.
+//       Assert a second sweep returns 0 (idempotency on same instance).
+//   (b) Inject 3 zombies again, "crash" by dropping the TM without sweeping.
+//       Fresh TM has 0 intents; sweep returns 0 (restart = clean slate).
+//   (c) Mixed bag: 1 zombie, 1 live intent (active owner). Sweep removes only
+//       the zombie; live intent survives.
 //
 // // BUG: write-intents are not WAL-persisted. If the server crashes between
-// // a VectorUpsert WAL record being written and the corresponding intent being
-// // added to write_intents, a subsequent restart may allow a second writer to
-// // claim the same point_id before the WAL-replayed mutable segment entry is
-// // made visible. For pure-writer workloads (no concurrent readers) this is
-// // invisible, but mixed workloads can exhibit inconsistency.
-// // Source: src/vector/mvcc/manager.rs:50 (write_intents field) and
-// // src/vector/persistence/wal_record.rs — no WriteIntent record type exists.
-// // Mitigation tracked in Wave-2 backlog.
+// // a VectorUpsert WAL record being appended and the corresponding intent being
+// // added to write_intents (the two are not atomic), a subsequent restart may
+// // allow a second writer to claim the same point_id before the WAL-replayed
+// // mutable segment entry is made visible. For pure-writer workloads this is
+// // invisible, but mixed workloads can exhibit a write-write inconsistency
+// // window during the WAL replay phase.
+// // Source: src/vector/mvcc/manager.rs:51 (write_intents field) and
+// // src/vector/persistence/wal_record.rs — no WriteIntent frame type exists.
 
 #[test]
+#[cfg(feature = "crash-injection")]
 fn crash_mvcc_sweep_zombies_idempotent_and_clean_on_restart() {
     use moon::vector::mvcc::manager::TransactionManager;
 
-    // ── (a) Idempotency on same instance ────────────────────────────────────
+    // ── (a) Real zombies are swept; sweep is idempotent on same instance ─────
 
     let mut mgr = TransactionManager::new();
 
-    // Begin a transaction, acquire a write intent, then abort it.
-    // `abort()` calls `write_intents.retain(|_, owner| *owner != txn_id)` so
-    // the intent IS removed by abort. There should be nothing to sweep.
-    let t1 = mgr.begin();
-    mgr.acquire_write(1001, t1.txn_id)
-        .expect("first write must succeed");
-    mgr.abort(t1.txn_id);
+    // Inject 3 zombie intents: owner txn_id 9001/9002/9003 are not in active
+    // or committed (they never existed in this TM). These model intents whose
+    // owning transactions were aborted by another mechanism (e.g. a previous
+    // run's crash) without going through the normal abort() cleanup path.
+    mgr.inject_zombie_for_test(1001, 9001);
+    mgr.inject_zombie_for_test(1002, 9002);
+    mgr.inject_zombie_for_test(1003, 9003);
 
-    // After abort: write_intents for t1 were already removed by abort().
-    // sweep_zombies_mut should return 0.
-    let swept = mgr.sweep_zombies_mut();
+    assert_eq!(mgr.write_intent_count(), 3, "3 zombie intents injected");
+
+    // First sweep: all 3 are zombies (owner neither active nor committed nor
+    // below pruned_below=0 because 9001 > 0 and not committed).
+    let swept_first = mgr.sweep_zombies_mut();
     assert_eq!(
-        swept, 0,
-        "after abort, write_intents are cleaned; sweep_zombies_mut returns 0",
+        swept_first, 3,
+        "sweep_zombies_mut must remove all 3 zombies"
+    );
+    assert_eq!(
+        mgr.write_intent_count(),
+        0,
+        "write_intents must be empty after sweep",
     );
 
-    // Second sweep on the same instance is idempotent.
-    let swept2 = mgr.sweep_zombies_mut();
-    assert_eq!(swept2, 0, "repeated sweep is idempotent");
+    // Second sweep on same instance — idempotent, nothing left to remove.
+    let swept_second = mgr.sweep_zombies_mut();
+    assert_eq!(swept_second, 0, "repeated sweep is idempotent: returns 0");
 
-    // ── (b) Zombie intent (orphaned by other means) is swept correctly ───────
+    // ── (b) Simulated crash mid-sweep: fresh TM starts with 0 intents ────────
     //
-    // Simulate a zombie: a point whose owner txn_id is neither active nor
-    // committed nor below pruned_below. We model the crash-mid-sweep scenario:
-    // intents were partially cleaned in a previous run, then the process died.
-    // On the next run, the TransactionManager is fresh — there are no intents.
+    // Inject zombies then DROP WITHOUT sweeping — models a SIGKILL between the
+    // inject (compaction writing a segment dir) and the sweep timer firing.
+    // On restart, a fresh TransactionManager is constructed; intents are gone.
 
-    let mut mgr2 = TransactionManager::new();
+    {
+        let mut mgr_pre_crash = TransactionManager::new();
+        mgr_pre_crash.inject_zombie_for_test(2001, 8001);
+        mgr_pre_crash.inject_zombie_for_test(2002, 8002);
+        mgr_pre_crash.inject_zombie_for_test(2003, 8003);
+        assert_eq!(mgr_pre_crash.write_intent_count(), 3);
+        // Drop without sweeping — simulates crash.
+    }
 
-    // Begin and commit t2 — a normal committed transaction.
-    let t2 = mgr2.begin();
-    mgr2.acquire_write(2001, t2.txn_id)
-        .expect("first write must succeed");
-    mgr2.commit(t2.txn_id);
-
-    // Now begin t3, acquire an intent, but do NOT abort or commit it.
-    // We then manually mark it as aborted by starting a fresh transaction
-    // WITHOUT removing the intent first. This is the "zombie" state:
-    // an intent whose owning txn_id is no longer in the active map.
-    let t3 = mgr2.begin();
-    mgr2.acquire_write(3001, t3.txn_id)
-        .expect("first write must succeed");
-    // Simulate crash: forcibly remove t3 from active without cleaning intents.
-    // We do this by calling abort() which DOES clean intents — instead we
-    // commit a new transaction and verify sweep finds no zombies (abort cleans).
-    //
-    // To actually create a zombie, we use the fact that acquire_write steals
-    // intents from committed/aborted owners. Let t3 commit, then check no zombies.
-    mgr2.commit(t3.txn_id);
-    let swept_b = mgr2.sweep_zombies_mut();
-    assert_eq!(swept_b, 0, "after clean commit, no zombie intents remain",);
-
-    // ── (c) Fresh TransactionManager starts with zero intents ───────────────
-    //
-    // This is the "process restart" scenario. The prior TM is dropped; a new
-    // one is created. Sweep on a fresh instance returns 0 regardless of what
-    // the previous instance held in memory.
-
-    drop(mgr2);
-    let mut mgr3 = TransactionManager::new();
-
-    // BUG: intents from the previous instance (mgr2) are NOT persisted to WAL.
-    // On restart, write_intents is empty — zombies are silently lost.
-    // For aborted transactions this is safe (they're invisible). For in-flight
-    // transactions that weren't committed, the WAL replay rolls them back via
-    // VectorUpsert marks, so visibility is correct — but the intent ownership
-    // record is gone, enabling a race where a second writer for the same
-    // point_id is incorrectly granted before replay completes.
-    // BUG: src/vector/mvcc/manager.rs:50 + src/vector/persistence/wal_record.rs
+    // BUG: the 3 intents above are NOT persisted to WAL and are silently lost.
+    // For aborted transactions this is safe. For in-flight writes it creates
+    // a window where a second writer can claim the same point_id during replay.
+    // BUG: src/vector/mvcc/manager.rs:51 + src/vector/persistence/wal_record.rs
     // (no WriteIntent frame type).
 
-    let swept_c = mgr3.sweep_zombies_mut();
+    let mut mgr_post_restart = TransactionManager::new();
     assert_eq!(
-        swept_c, 0,
-        "fresh TransactionManager starts with empty write_intents; sweep returns 0",
+        mgr_post_restart.write_intent_count(),
+        0,
+        "fresh TM after simulated crash: write_intents is empty",
+    );
+    let swept_restart = mgr_post_restart.sweep_zombies_mut();
+    assert_eq!(
+        swept_restart, 0,
+        "sweep on fresh TM returns 0 — there is nothing to sweep",
     );
 
-    // Verify the manager is fully operational after the simulated restart.
-    let t4 = mgr3.begin();
-    mgr3.acquire_write(4001, t4.txn_id)
-        .expect("fresh instance must accept new write intents");
-    mgr3.commit(t4.txn_id);
-    assert_eq!(mgr3.committed_count(), 1, "committed treemap tracks t4");
+    // ── (c) Mixed bag: zombie co-exists with live intent ─────────────────────
+    //
+    // Inject one zombie (fake owner) alongside one live intent (real active
+    // txn). sweep_zombies_mut must remove only the zombie and leave the live
+    // intent intact.
+
+    let mut mgr_mixed = TransactionManager::new();
+
+    // Live intent: t_live owns point 3001.
+    let t_live = mgr_mixed.begin();
+    mgr_mixed
+        .acquire_write(3001, t_live.txn_id)
+        .expect("live intent must succeed");
+
+    // Zombie intent: fake owner 7777 for point 3002.
+    mgr_mixed.inject_zombie_for_test(3002, 7777);
+
+    assert_eq!(mgr_mixed.write_intent_count(), 2);
+
+    let swept_mixed = mgr_mixed.sweep_zombies_mut();
+    assert_eq!(swept_mixed, 1, "sweep removes only the zombie intent");
+    assert_eq!(
+        mgr_mixed.write_intent_count(),
+        1,
+        "live intent for t_live survives the sweep",
+    );
+
+    // Commit the live transaction — intent is released.
+    mgr_mixed.commit(t_live.txn_id);
+    assert_eq!(
+        mgr_mixed.write_intent_count(),
+        0,
+        "commit releases the last intent",
+    );
 }
 
 // ── Scenario 1b: WAL replay after compaction crash — no double file_id spend ─

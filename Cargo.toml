@@ -109,6 +109,10 @@ simd-avx512 = []
 # OpenTelemetry exporter: reserves feature namespace for OTLP trace export.
 # When wired, will gate tracing-opentelemetry + opentelemetry-otlp dependencies.
 otel = []
+# Test-only feature: enables crash-injection hooks in production types for
+# integration tests. Never enabled in production builds or CI cargo test runs
+# without explicit --features crash-injection.
+crash-injection = []
 graph = ["dep:logos"]
 console = ["dep:hyper-tungstenite", "dep:rust-embed", "dep:mime_guess", "dep:tokio-stream", "dep:base64", "dep:hmac", "dep:subtle", "hyper/http2"]
 text-index = [

@@ -470,6 +470,29 @@ impl TransactionManager {
             .min()
             .unwrap_or(self.next_lsn);
     }
+
+    /// Insert a write intent with an arbitrary (potentially non-existent) owner.
+    ///
+    /// Used only in crash-injection tests to create zombie intents without going
+    /// through the normal `begin` + `acquire_write` + crash path. The
+    /// `fake_owner` txn_id must not be present in `active` or `committed` for
+    /// the intent to count as a zombie in `sweep_zombies_mut`.
+    ///
+    /// Enabled only when `--features crash-injection` is set. Never call from
+    /// production code paths.
+    #[cfg(feature = "crash-injection")]
+    pub fn inject_zombie_for_test(&mut self, point_id: u64, fake_owner: u64) {
+        self.write_intents.insert(point_id, fake_owner);
+    }
+
+    /// Return the number of write intents currently held.
+    ///
+    /// Used in crash-injection tests to verify intent counts directly.
+    /// Enabled only when `--features crash-injection` is set.
+    #[cfg(feature = "crash-injection")]
+    pub fn write_intent_count(&self) -> usize {
+        self.write_intents.len()
+    }
 }
 
 #[cfg(test)]
