@@ -641,6 +641,16 @@ impl super::Shard {
         };
         #[cfg(feature = "runtime-tokio")]
         let mut cold_check_interval = TimerImpl::interval(Duration::from_secs(cold_poll_secs));
+        // Cold-tier orphan sweeper: 5-minute default (P9). Disabled when interval is 0.
+        let orphan_sweep_interval_secs = server_config.cold_orphan_sweep_interval_secs;
+        #[cfg(feature = "runtime-tokio")]
+        let mut orphan_sweep_interval = if orphan_sweep_interval_secs > 0 {
+            Some(TimerImpl::interval(Duration::from_secs(
+                orphan_sweep_interval_secs,
+            )))
+        } else {
+            None
+        };
 
         // MA12: Disk free-space poll interval (5 seconds, shard 0 only).
         #[cfg(feature = "runtime-tokio")]
@@ -1323,6 +1333,26 @@ impl super::Shard {
                             );
                         }
                     }
+                }
+                // Cold-tier orphan sweeper (P9): runs every cold_orphan_sweep_interval_secs.
+                // Identifies cold index entries whose key is now in the hot DashTable
+                // (hot write shadowed the spilled copy) and deletes the stale DataFile.
+                _ = async {
+                    if let Some(ref mut sw) = orphan_sweep_interval {
+                        sw.0.tick().await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                }, if orphan_sweep_interval.is_some() && server_config.disk_offload_enabled() => {
+                    let shard_dir = server_config
+                        .effective_disk_offload_dir()
+                        .join(format!("shard-{}", shard_id));
+                    timers::run_cold_orphan_sweep(
+                        &shard_databases,
+                        shard_id,
+                        &shard_dir,
+                        shard_manifest.as_mut(),
+                    );
                 }
                 // Expire timed-out blocked clients every 10ms
                 _ = block_timeout_interval.0.tick() => {

@@ -102,6 +102,7 @@ async fn start_moon() -> (u16, CancellationToken) {
         graph_dead_edge_trigger: 0.20,
         autovacuum_starvation_cap_secs: 300,
         vec_warm_mmap_budget: "2gb".to_string(),
+        cold_orphan_sweep_interval_secs: 300,
     };
 
     tokio::spawn(async move {

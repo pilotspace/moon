@@ -138,6 +138,96 @@ pub(crate) fn fire_pending_mq_triggers(
     }
 }
 
+/// Default interval for cold-tier orphan sweep (5 minutes).
+pub const COLD_ORPHAN_SWEEP_INTERVAL_SECS: u64 = 300;
+
+/// Run a cold-tier orphan sweep across all databases for a single shard.
+///
+/// Iterates each database's cold index and removes entries whose key is now
+/// present in the hot DashTable (i.e. a hot write shadowed the spilled copy).
+/// The corresponding DataFile and manifest entry are tombstoned atomically.
+///
+/// Called from the shard event loop on a low-priority 5-minute timer (or the
+/// interval configured via `--cold-orphan-sweep-interval-secs`).
+///
+/// # Concurrency
+///
+/// Each database is locked with `write_db` for the duration of its sweep.
+/// This is safe: spill, read-promotion, and eviction all run under the same
+/// per-db write lock, preventing TOCTOU races with the sweep.
+pub(crate) fn run_cold_orphan_sweep(
+    shard_databases: &Arc<super::shared_databases::ShardDatabases>,
+    shard_id: usize,
+    shard_dir: &std::path::Path,
+    mut manifest: Option<&mut crate::persistence::manifest::ShardManifest>,
+) {
+    use crate::storage::tiered::cold_index::SweepStats;
+
+    let db_count = shard_databases.db_count();
+    let mut total = SweepStats::default();
+
+    for db_idx in 0..db_count {
+        let mut guard = shard_databases.write_db(shard_id, db_idx);
+
+        // Skip databases without a cold index (disk-offload disabled or no spills).
+        if guard.cold_index.is_none() {
+            continue;
+        }
+
+        // Two-phase sweep to sidestep the &mut cold_index / &db borrow conflict:
+        //
+        // Phase 1: collect orphan keys (immutable borrow of cold_index + db).
+        // A cold entry is an orphan when the key is also present in the hot
+        // DashTable — meaning a hot write shadowed the spilled copy.
+        let orphan_keys: Vec<bytes::Bytes> = guard
+            .cold_index
+            .as_ref()
+            .map(|ci| {
+                ci.iter()
+                    .filter(|(key, _loc)| guard.is_hot(key))
+                    .map(|(k, _)| k.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        if orphan_keys.is_empty() {
+            continue;
+        }
+
+        // Phase 2: delete files + update cold_index (mutable borrow; db not borrowed).
+        let stats = guard
+            .cold_index
+            .as_mut()
+            .and_then(|ci| {
+                ci.sweep_known_orphans(orphan_keys, shard_dir, manifest.as_deref_mut())
+                    .map_err(|e| {
+                        tracing::error!(
+                            shard = shard_id,
+                            db = db_idx,
+                            err = %e,
+                            "cold_orphan_sweep: manifest commit error",
+                        );
+                        e
+                    })
+                    .ok()
+            });
+
+        if let Some(s) = stats {
+            total.entries_reclaimed += s.entries_reclaimed;
+            total.bytes_reclaimed = total.bytes_reclaimed.saturating_add(s.bytes_reclaimed);
+        }
+    }
+
+    if total.entries_reclaimed > 0 {
+        tracing::info!(
+            shard = shard_id,
+            entries = total.entries_reclaimed,
+            bytes = total.bytes_reclaimed,
+            "cold_orphan_sweep: shard sweep complete",
+        );
+    }
+}
+
 /// WAL v3 fsync on 1-second interval (mirrors v2 everysec pattern).
 ///
 /// Flush any buffered WAL v3 data and fsync to stable storage.

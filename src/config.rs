@@ -285,6 +285,18 @@ pub struct ServerConfig {
     #[arg(long = "vec-diskann-cache-levels", default_value_t = 3)]
     pub vec_diskann_cache_levels: u32,
 
+    // ── Wave-3 P9: Cold-tier orphan sweeper ────────────────────────
+    /// Interval in seconds between cold-tier orphan sweep passes.
+    ///
+    /// The sweeper walks the cold index, identifies entries whose key is now
+    /// present in the hot in-memory DashTable (hot-shadow orphans), deletes
+    /// the on-disk DataFile, and tombstones the manifest entry.
+    ///
+    /// Set to 0 to disable the sweeper entirely.
+    /// Default: 300 (5 minutes). Recommended range: 60–3600.
+    #[arg(long = "cold-orphan-sweep-interval-secs", default_value_t = 300)]
+    pub cold_orphan_sweep_interval_secs: u64,
+
     // ── MoonStore v2: Point-in-time recovery (PITR) ────────────────
     /// Stop WAL replay at this LSN during recovery. Records with LSN > target
     /// are skipped. Mutually exclusive with --recovery-target-time; if both

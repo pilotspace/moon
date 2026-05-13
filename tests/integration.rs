@@ -100,6 +100,7 @@ async fn start_server() -> (u16, CancellationToken) {
         graph_dead_edge_trigger: 0.20,
         autovacuum_starvation_cap_secs: 300,
         vec_warm_mmap_budget: "2gb".to_string(),
+        cold_orphan_sweep_interval_secs: 300,
     };
 
     tokio::spawn(async move {
@@ -197,6 +198,7 @@ async fn start_server_with_pass(password: &str) -> (u16, CancellationToken) {
         graph_dead_edge_trigger: 0.20,
         autovacuum_starvation_cap_secs: 300,
         vec_warm_mmap_budget: "2gb".to_string(),
+        cold_orphan_sweep_interval_secs: 300,
     };
 
     tokio::spawn(async move {
@@ -1366,6 +1368,7 @@ async fn start_server_with_persistence(
         graph_dead_edge_trigger: 0.20,
         autovacuum_starvation_cap_secs: 300,
         vec_warm_mmap_budget: "2gb".to_string(),
+        cold_orphan_sweep_interval_secs: 300,
     };
 
     tokio::spawn(async move {
@@ -2247,6 +2250,7 @@ async fn start_server_with_maxmemory(maxmemory: usize, policy: &str) -> (u16, Ca
         graph_dead_edge_trigger: 0.20,
         autovacuum_starvation_cap_secs: 300,
         vec_warm_mmap_budget: "2gb".to_string(),
+        cold_orphan_sweep_interval_secs: 300,
     };
 
     tokio::spawn(async move {
@@ -2655,6 +2659,7 @@ async fn start_sharded_server(num_shards: usize) -> (u16, CancellationToken) {
         graph_dead_edge_trigger: 0.20,
         autovacuum_starvation_cap_secs: 300,
         vec_warm_mmap_budget: "2gb".to_string(),
+        cold_orphan_sweep_interval_secs: 300,
     };
 
     let cancel = token.clone();
@@ -3832,6 +3837,7 @@ async fn start_cluster_server() -> (u16, CancellationToken) {
         graph_dead_edge_trigger: 0.20,
         autovacuum_starvation_cap_secs: 300,
         vec_warm_mmap_budget: "2gb".to_string(),
+        cold_orphan_sweep_interval_secs: 300,
     };
 
     std::thread::spawn(move || {
@@ -4491,6 +4497,7 @@ async fn start_server_with_aclfile(acl_path: &str) -> (u16, CancellationToken) {
         graph_dead_edge_trigger: 0.20,
         autovacuum_starvation_cap_secs: 300,
         vec_warm_mmap_budget: "2gb".to_string(),
+        cold_orphan_sweep_interval_secs: 300,
     };
 
     tokio::spawn(async move {

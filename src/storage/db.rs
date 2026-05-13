@@ -1027,6 +1027,22 @@ impl Database {
         Some((location, shard_dir.clone()))
     }
 
+    /// Returns `true` if the key is present in the hot in-memory DashTable,
+    /// regardless of expiry status.
+    ///
+    /// Used by the cold-tier orphan sweeper to detect "hot shadow" entries:
+    /// a cold entry whose key was later overwritten by a hot `SET` is an
+    /// orphan — the hot copy shadows it and the cold file is reclaimable.
+    ///
+    /// This intentionally does NOT check expiry (an expired hot key still
+    /// shadows the cold entry; the hot expiry path will clean it up on next
+    /// access). Using the expired-included check avoids a TOCTOU race where
+    /// we decide "not hot" and then a concurrent read promotes the expired key.
+    #[inline]
+    pub fn is_hot(&self, key: &[u8]) -> bool {
+        self.data.get(key).is_some()
+    }
+
     /// Read-only existence check: returns false if expired.
     pub fn exists_if_alive(&self, key: &[u8], now_ms: u64) -> bool {
         let base_ts = self.base_timestamp;

@@ -436,3 +436,29 @@ mod tests {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// P9: Cold-tier orphan reclamation counters
+// ---------------------------------------------------------------------------
+
+/// Total cold-tier orphan index entries reclaimed since server start.
+pub static RECL_COLD_ORPHANS_RECLAIMED_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Total bytes reclaimed from cold-tier orphan files since server start.
+pub static RECL_COLD_ORPHAN_BYTES_RECLAIMED_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Increment both orphan reclamation counters atomically.
+#[inline]
+pub fn record_cold_orphan_reclaim(bytes: u64) {
+    RECL_COLD_ORPHANS_RECLAIMED_TOTAL.fetch_add(1, Ordering::Relaxed);
+    RECL_COLD_ORPHAN_BYTES_RECLAIMED_TOTAL.fetch_add(bytes, Ordering::Relaxed);
+}
+
+/// Read current totals for the VACUUM/INFO response shape.
+#[inline]
+pub fn snapshot_cold_orphan_totals() -> (u64, u64) {
+    (
+        RECL_COLD_ORPHANS_RECLAIMED_TOTAL.load(Ordering::Relaxed),
+        RECL_COLD_ORPHAN_BYTES_RECLAIMED_TOTAL.load(Ordering::Relaxed),
+    )
+}
