@@ -913,6 +913,40 @@ pub(crate) async fn handle_connection_sharded_inner<
                         continue;
                     }
 
+                    // --- P8: VACUUM — manual reclamation (MVCC passes only;
+                    //     manifest/WAL not accessible from connection handler).
+                    if cmd.eq_ignore_ascii_case(b"VACUUM") {
+                        let mut vs = ctx.shard_databases.vector_store(ctx.shard_id);
+                        let response = crate::command::server_admin::vacuum(
+                            &mut vs,
+                            None, // manifest — not available in connection handler
+                            None, // wal_v3 — not available in connection handler
+                            cmd_args,
+                            1000, // default mvcc_prune_margin
+                        );
+                        drop(vs);
+                        responses.push(response);
+                        continue;
+                    }
+
+                    // --- P8: DEBUG RECLAMATION ---
+                    if cmd.eq_ignore_ascii_case(b"DEBUG") {
+                        if let Some(sub) = cmd_args.first() {
+                            if let Some(s) = crate::command::helpers::extract_bytes(sub) {
+                                if s.eq_ignore_ascii_case(b"RECLAMATION") {
+                                    let vs = ctx.shard_databases.vector_store(ctx.shard_id);
+                                    let response = crate::command::server_admin::debug_reclamation(
+                                        &vs, None, None,
+                                    );
+                                    drop(vs);
+                                    responses.push(response);
+                                    continue;
+                                }
+                            }
+                        }
+                        // Other DEBUG subcommands fall through.
+                    }
+
                     // --- Multi-key commands ---
                     if is_multi_key_command(cmd, cmd_args) {
                         let response = crate::shard::coordinator::coordinate_multi_key(cmd, cmd_args, ctx.shard_id, ctx.num_shards, conn.selected_db, &ctx.shard_databases, &ctx.dispatch_tx, &ctx.spsc_notifiers, &ctx.cached_clock, &()).await;

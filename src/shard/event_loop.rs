@@ -977,6 +977,8 @@ impl super::Shard {
                         &repl_state, shard_id, &script_cache_rc, &cached_clock,
                         &mut pending_migrations, &mut *shard_databases.vector_store(shard_id),
                         &mut pending_cdc_subscribes,
+                        &mut shard_manifest,
+                        server_config.mvcc_committed_prune_margin,
                     );
                     if !pending_cdc_subscribes.is_empty() {
                         let wal_dir = wal_v3_writer.as_ref().map(|w| w.wal_dir());
@@ -1038,6 +1040,8 @@ impl super::Shard {
                         &repl_state, shard_id, &script_cache_rc, &cached_clock,
                         &mut pending_migrations, &mut *shard_databases.vector_store(shard_id),
                         &mut pending_cdc_subscribes,
+                        &mut shard_manifest,
+                        server_config.mvcc_committed_prune_margin,
                     );
                     if !pending_cdc_subscribes.is_empty() {
                         let wal_dir = wal_v3_writer.as_ref().map(|w| w.wal_dir());
@@ -1495,6 +1499,8 @@ impl super::Shard {
                     &mut pending_migrations,
                     &mut *shard_databases.vector_store(shard_id),
                     &mut pending_cdc_subscribes,
+                    &mut shard_manifest,
+                    server_config.mvcc_committed_prune_margin,
                 );
                 if !pending_cdc_subscribes.is_empty() {
                     let wal_dir = wal_v3_writer.as_ref().map(|w| w.wal_dir());

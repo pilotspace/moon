@@ -1635,6 +1635,52 @@ pub async fn handle_connection(
                                     continue;
                                 }
 
+                                // P8: VACUUM — admin, lands in read run.
+                                // manifest/WAL not available here; MVCC passes still run.
+                                if d_cmd.eq_ignore_ascii_case(b"VACUUM") {
+                                    if let Some(ref vs) = vector_store {
+                                        let mut vs_guard = vs.lock();
+                                        let response = crate::command::server_admin::vacuum(
+                                            &mut vs_guard,
+                                            None, // manifest — not available here
+                                            None, // wal_v3 — not available here
+                                            d_args,
+                                            1000, // default mvcc_prune_margin
+                                        );
+                                        drop(vs_guard);
+                                        responses[resp_idx] = response;
+                                    } else {
+                                        responses[resp_idx] = Frame::Error(
+                                            bytes::Bytes::from_static(b"ERR vector store not initialized"),
+                                        );
+                                    }
+                                    continue;
+                                }
+
+                                // P8: DEBUG RECLAMATION — admin, lands in read run.
+                                if d_cmd.eq_ignore_ascii_case(b"DEBUG") {
+                                    if let Some(sub) = d_args.first() {
+                                        if let Some(s) = crate::command::helpers::extract_bytes(sub) {
+                                            if s.eq_ignore_ascii_case(b"RECLAMATION") {
+                                                if let Some(ref vs) = vector_store {
+                                                    let vs_guard = vs.lock();
+                                                    let response = crate::command::server_admin::debug_reclamation(
+                                                        &vs_guard, None, None,
+                                                    );
+                                                    drop(vs_guard);
+                                                    responses[resp_idx] = response;
+                                                } else {
+                                                    responses[resp_idx] = Frame::Error(
+                                                        bytes::Bytes::from_static(b"ERR vector store not initialized"),
+                                                    );
+                                                }
+                                                continue;
+                                            }
+                                        }
+                                    }
+                                    // Other DEBUG subcommands fall through to dispatch_read.
+                                }
+
                                 let dispatch_start = std::time::Instant::now();
                                 let result = dispatch_read(&*guard, d_cmd, d_args, now_ms, &mut conn.selected_db, db_count);
                                 let elapsed_us = dispatch_start.elapsed().as_micros() as u64;
@@ -1808,6 +1854,53 @@ pub async fn handle_connection(
                                         );
                                     }
                                     continue;
+                                }
+
+                                // P8: VACUUM — write-run intercept (same as read-run;
+                                // VACUUM is admin so may land in either branch depending
+                                // on future flag changes).
+                                if d_cmd.eq_ignore_ascii_case(b"VACUUM") {
+                                    if let Some(vs) = vector_store.as_ref() {
+                                        let mut vs_guard = vs.lock();
+                                        let response = crate::command::server_admin::vacuum(
+                                            &mut vs_guard,
+                                            None, // manifest — not available here
+                                            None, // wal_v3 — not available here
+                                            d_args,
+                                            1000, // default mvcc_prune_margin
+                                        );
+                                        drop(vs_guard);
+                                        responses[resp_idx] = response;
+                                    } else {
+                                        responses[resp_idx] = Frame::Error(
+                                            bytes::Bytes::from_static(b"ERR vector store not initialized"),
+                                        );
+                                    }
+                                    continue;
+                                }
+
+                                // P8: DEBUG RECLAMATION — write-run intercept.
+                                if d_cmd.eq_ignore_ascii_case(b"DEBUG") {
+                                    if let Some(sub) = d_args.first() {
+                                        if let Some(s) = crate::command::helpers::extract_bytes(sub) {
+                                            if s.eq_ignore_ascii_case(b"RECLAMATION") {
+                                                if let Some(vs) = vector_store.as_ref() {
+                                                    let vs_guard = vs.lock();
+                                                    let response = crate::command::server_admin::debug_reclamation(
+                                                        &vs_guard, None, None,
+                                                    );
+                                                    drop(vs_guard);
+                                                    responses[resp_idx] = response;
+                                                } else {
+                                                    responses[resp_idx] = Frame::Error(
+                                                        bytes::Bytes::from_static(b"ERR vector store not initialized"),
+                                                    );
+                                                }
+                                                continue;
+                                            }
+                                        }
+                                    }
+                                    // Other DEBUG subcommands fall through to dispatch().
                                 }
 
                                 // HSET auto-indexing: after dispatch, check for vector index match

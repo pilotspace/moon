@@ -1,4 +1,5 @@
-//! Server administration commands: FLUSHALL, FLUSHDB, DEBUG, MEMORY USAGE.
+//! Server administration commands: FLUSHALL, FLUSHDB, DEBUG, MEMORY USAGE,
+//! VACUUM, and DEBUG RECLAMATION.
 //!
 //! These are routed through the main `dispatch()` function (keyless, broadcast
 //! to all shards via the console gateway). The handlers operate on the
@@ -21,6 +22,13 @@
 //! * `MEMORY USAGE <key> [SAMPLES n]` returns a conservative estimate of
 //!   bytes consumed by the entry. SAMPLES is accepted and ignored (Moon
 //!   always walks the entire value — there is no probabilistic sampling).
+//! * `VACUUM [FILES | (VERBOSE) | (FREEZE) | VECTOR <idx> | GRAPH <name>]` —
+//!   manual reclamation passes across manifest, MVCC, and WAL subsystems.
+//!   Returns counts of resources reclaimed per subsystem. Postgres-style manual
+//!   escape hatch shipped before autovacuum (Wave 2 P2/P7).
+//! * `DEBUG RECLAMATION` — verbose per-subsystem diagnostic dump.
+
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 
@@ -30,6 +38,10 @@ use crate::protocol::Frame;
 use crate::storage::Database;
 use crate::storage::compact_value::RedisValueRef;
 use crate::storage::entry::Entry;
+
+// Type aliases to avoid long paths in function signatures.
+type ShardManifest = crate::persistence::manifest::ShardManifest;
+type WalWriterV3 = crate::persistence::wal_v3::segment::WalWriterV3;
 
 // ---------------------------------------------------------------------------
 // FLUSHDB / FLUSHALL
@@ -727,6 +739,421 @@ pub fn kill_snapshot(
 }
 
 // ---------------------------------------------------------------------------
+// VACUUM — P8 manual reclamation command family
+// ---------------------------------------------------------------------------
+
+/// Counts returned by any VACUUM variant.
+#[derive(Debug, Default)]
+pub struct VacuumCounts {
+    /// Manifest tombstone entries physically removed by `gc_tombstones`.
+    pub manifest_pruned: u64,
+    /// MVCC committed-set entries pruned below the oldest-snapshot floor.
+    pub mvcc_committed_pruned: u64,
+    /// MVCC vector write-intents swept (zombie intent removal).
+    pub mvcc_zombies_swept: u64,
+    /// MVCC graph write-intents swept (zombie graph intent removal).
+    pub mvcc_graph_zombies_swept: u64,
+    /// MVCC snapshots newly flagged as killed by `mark_old_snapshots_killed`.
+    pub mvcc_snapshots_killed: u64,
+    /// WAL segments recycled by `recycle_aggressive`.
+    pub wal_segments_recycled: u64,
+}
+
+impl VacuumCounts {
+    /// Serialize into a flat RESP2 array of alternating label/value bulk strings.
+    ///
+    /// Shape (12 elements):
+    /// ```text
+    /// ["manifest_pruned", N, "mvcc_committed_pruned", N,
+    ///  "mvcc_zombies_swept", N, "mvcc_graph_zombies_swept", N,
+    ///  "mvcc_snapshots_killed", N, "wal_segments_recycled", N]
+    /// ```
+    pub fn to_frame(&self) -> Frame {
+        fn kv(k: &'static [u8], v: u64) -> [Frame; 2] {
+            [
+                Frame::BulkString(Bytes::from_static(k)),
+                Frame::Integer(v as i64),
+            ]
+        }
+        let pairs: Vec<Frame> = [
+            kv(b"manifest_pruned", self.manifest_pruned),
+            kv(b"mvcc_committed_pruned", self.mvcc_committed_pruned),
+            kv(b"mvcc_zombies_swept", self.mvcc_zombies_swept),
+            kv(b"mvcc_graph_zombies_swept", self.mvcc_graph_zombies_swept),
+            kv(b"mvcc_snapshots_killed", self.mvcc_snapshots_killed),
+            kv(b"wal_segments_recycled", self.wal_segments_recycled),
+        ]
+        .iter()
+        .flat_map(|pair| pair.iter().cloned())
+        .collect();
+        Frame::Array(crate::protocol::FrameVec::from_vec(pairs))
+    }
+
+    /// Like `to_frame` but prefixes each subsystem with a verbose diagnostic
+    /// line as a bulk string. Used by `VACUUM (VERBOSE)`.
+    pub fn to_verbose_frame(&self) -> Frame {
+        use std::fmt::Write as _;
+        let mut out: Vec<Frame> = Vec::with_capacity(20);
+
+        let mut push_section = |label: &str, count: u64| {
+            let mut s = String::with_capacity(64);
+            let _ = write!(s, "# {} reclaimed: {}", label, count);
+            out.push(Frame::BulkString(Bytes::from(s.into_bytes())));
+        };
+
+        push_section("manifest_pruned", self.manifest_pruned);
+        push_section("mvcc_committed_pruned", self.mvcc_committed_pruned);
+        push_section("mvcc_zombies_swept", self.mvcc_zombies_swept);
+        push_section("mvcc_graph_zombies_swept", self.mvcc_graph_zombies_swept);
+        push_section("mvcc_snapshots_killed", self.mvcc_snapshots_killed);
+        push_section("wal_segments_recycled", self.wal_segments_recycled);
+
+        // Append the same key/value pairs for machine-parseable consumption.
+        let kv_frame = self.to_frame();
+        if let Frame::Array(inner) = kv_frame {
+            out.extend(inner);
+        }
+        Frame::Array(crate::protocol::FrameVec::from_vec(out))
+    }
+}
+
+/// Core reclamation passes shared by `VACUUM` and `VACUUM (VERBOSE)`.
+///
+/// - `manifest`: optional manifest reference; when `None` (no persistence_dir),
+///   the manifest pass is skipped and `manifest_pruned` stays 0.
+/// - `wal`: optional WAL V3 writer; when `None`, the WAL pass is skipped.
+/// - `freeze`: when `true`, calls `mark_old_snapshots_killed` with
+///   `threshold = Duration::ZERO` (kills ALL non-system snapshots).
+/// - `mvcc_prune_margin`: `oldest_snapshot - margin` is the GC floor.
+fn run_vacuum_passes(
+    vector_store: &mut crate::vector::store::VectorStore,
+    manifest: Option<&mut ShardManifest>,
+    wal: Option<&mut WalWriterV3>,
+    freeze: bool,
+    mvcc_prune_margin: u64,
+) -> VacuumCounts {
+    let now = Instant::now();
+    let mut counts = VacuumCounts::default();
+
+    // ── 1. Manifest physical GC (P1) ────────────────────────────────────────
+    // Immediate removal: retain_epochs=0, retain_secs=0.
+    if let Some(m) = manifest {
+        counts.manifest_pruned = m.gc_tombstones(0, 0, now) as u64;
+    }
+
+    // ── 2. MVCC committed-set pruning (P3) ──────────────────────────────────
+    {
+        let mgr = vector_store.txn_manager_mut();
+        counts.mvcc_committed_pruned = mgr.prune_committed(mvcc_prune_margin);
+    }
+
+    // ── 3. MVCC zombie intent sweep (P3) ────────────────────────────────────
+    {
+        let mgr = vector_store.txn_manager_mut();
+        counts.mvcc_zombies_swept = mgr.sweep_zombies_mut() as u64;
+    }
+
+    // ── 4. MVCC graph zombie sweep (P3, graph feature) ──────────────────────
+    #[cfg(feature = "graph")]
+    {
+        let mgr = vector_store.txn_manager_mut();
+        counts.mvcc_graph_zombies_swept = mgr.sweep_graph_zombies_mut() as u64;
+    }
+
+    // ── 5. Mark old snapshots killed (MA2) ──────────────────────────────────
+    {
+        let threshold = if freeze {
+            // FREEZE: kill ALL snapshots regardless of age.
+            Duration::ZERO
+        } else {
+            // Plain VACUUM: use a very conservative threshold (24h) to
+            // avoid killing healthy short-lived snapshots. Operators who
+            // want aggressive snapshot removal should use VACUUM (FREEZE)
+            // or configure mvcc_old_snapshot_threshold_secs.
+            Duration::from_secs(86_400)
+        };
+        let mgr = vector_store.txn_manager_mut();
+        counts.mvcc_snapshots_killed = mgr.mark_old_snapshots_killed(now, threshold) as u64;
+    }
+
+    // ── 6. WAL aggressive recycle (P6) ──────────────────────────────────────
+    // Only runs when WAL is configured AND total WAL exceeds max_wal_bytes.
+    if let Some(w) = wal {
+        let should_recycle = w
+            .stats()
+            .map(|s| s.total_bytes > w.max_wal_bytes())
+            .unwrap_or(false);
+        if should_recycle {
+            let redo_lsn = w.current_lsn();
+            match w.recycle_aggressive(redo_lsn) {
+                Ok(stats) => counts.wal_segments_recycled = stats.segments_recycled as u64,
+                Err(e) => {
+                    tracing::warn!("VACUUM: WAL recycle_aggressive failed: {e}");
+                }
+            }
+        }
+    }
+
+    counts
+}
+
+/// `VACUUM [subcommand...]`
+///
+/// Manual reclamation across all Wave-1 subsystems. Postgres-style escape hatch
+/// before autovacuum lands in Wave 2.
+///
+/// ## Subcommands
+///
+/// | Syntax | Description |
+/// |---|---|
+/// | `VACUUM` | Full pass: manifest GC + MVCC prune/sweep + WAL recycle |
+/// | `VACUUM FILES` | Immediate manifest tombstone removal (gc_tombstones(0,0)) |
+/// | `VACUUM (VERBOSE)` | Same as plain VACUUM, with per-subsystem diagnostic lines |
+/// | `VACUUM (FREEZE)` | Forces `mark_old_snapshots_killed` with threshold=0 — **kills ALL client snapshots** |
+/// | `VACUUM VECTOR <idx>` | Placeholder — returns `+OK pending` until Wave-2 segment merge |
+/// | `VACUUM GRAPH <name>` | Placeholder — returns `+OK pending` until Wave-2 graph auto-merge |
+///
+/// ## Returns
+/// Array of alternating `[label, count]` bulk strings (12 elements).
+///
+/// ## Edge cases
+/// - No persistence_dir: manifest and WAL counts return 0.
+/// - Under disk-pause: runs normally (VACUUM reclaims, does not write data).
+/// - During active checkpoint: WAL recycle is idempotent (P6 `recycle_aggressive`
+///   is a no-op if no segments are over the threshold).
+///
+/// ## FREEZE warning
+/// `VACUUM (FREEZE)` forcibly kills ALL non-system MVCC snapshots on this shard,
+/// breaking any in-flight transactional reads. Clients that hold active
+/// `TXN.BEGIN` transactions will receive `MOONERR snapshot too old` on their
+/// next transactional operation. Only use in emergencies (e.g. a stuck snapshot
+/// is blocking GC from advancing for hours).
+pub fn vacuum(
+    vector_store: &mut crate::vector::store::VectorStore,
+    manifest: Option<&mut ShardManifest>,
+    wal: Option<&mut WalWriterV3>,
+    args: &[Frame],
+    mvcc_prune_margin: u64,
+) -> Frame {
+    // Parse subcommand (optional first arg).
+    let sub = args.first().and_then(|f| extract_bytes(f));
+
+    match sub {
+        // ── VACUUM FILES ────────────────────────────────────────────────────
+        Some(s) if s.eq_ignore_ascii_case(b"FILES") => {
+            if args.len() != 1 {
+                return Frame::Error(Bytes::from_static(
+                    b"ERR syntax error: VACUUM FILES takes no additional arguments",
+                ));
+            }
+            let pruned = manifest
+                .map(|m| m.gc_tombstones(0, 0, Instant::now()) as u64)
+                .unwrap_or(0);
+            let pairs = vec![
+                Frame::BulkString(Bytes::from_static(b"manifest_pruned")),
+                Frame::Integer(pruned as i64),
+            ];
+            Frame::Array(crate::protocol::FrameVec::from_vec(pairs))
+        }
+
+        // ── VACUUM (VERBOSE) ─────────────────────────────────────────────────
+        Some(s) if s.eq_ignore_ascii_case(b"(VERBOSE)") => {
+            if args.len() != 1 {
+                return Frame::Error(Bytes::from_static(
+                    b"ERR syntax error: VACUUM (VERBOSE) takes no additional arguments",
+                ));
+            }
+            let counts = run_vacuum_passes(vector_store, manifest, wal, false, mvcc_prune_margin);
+            counts.to_verbose_frame()
+        }
+
+        // ── VACUUM (FREEZE) ──────────────────────────────────────────────────
+        Some(s) if s.eq_ignore_ascii_case(b"(FREEZE)") => {
+            if args.len() != 1 {
+                return Frame::Error(Bytes::from_static(
+                    b"ERR syntax error: VACUUM (FREEZE) takes no additional arguments",
+                ));
+            }
+            tracing::warn!(
+                "VACUUM (FREEZE): forcibly killing ALL active MVCC snapshots on this shard. \
+                 In-flight TXN.BEGIN clients will receive 'snapshot too old' errors."
+            );
+            let counts = run_vacuum_passes(vector_store, manifest, wal, true, mvcc_prune_margin);
+            counts.to_frame()
+        }
+
+        // ── VACUUM VECTOR <index> ────────────────────────────────────────────
+        Some(s) if s.eq_ignore_ascii_case(b"VECTOR") => {
+            // Wave-2 P2 placeholder: segment merge not yet implemented.
+            Frame::SimpleString(Bytes::from_static(b"OK pending implementation in v0.1.14"))
+        }
+
+        // ── VACUUM GRAPH <name> ──────────────────────────────────────────────
+        Some(s) if s.eq_ignore_ascii_case(b"GRAPH") => {
+            // Wave-2 P7 placeholder: graph auto-merge not yet implemented.
+            Frame::SimpleString(Bytes::from_static(b"OK pending implementation in v0.1.14"))
+        }
+
+        // ── Plain VACUUM ─────────────────────────────────────────────────────
+        None => {
+            let counts = run_vacuum_passes(vector_store, manifest, wal, false, mvcc_prune_margin);
+            counts.to_frame()
+        }
+
+        // ── Unknown subcommand ───────────────────────────────────────────────
+        Some(unknown) => Frame::Error(Bytes::from(
+            format!(
+                "ERR unknown VACUUM subcommand '{}'; \
+                 use VACUUM, VACUUM FILES, VACUUM (VERBOSE), VACUUM (FREEZE), \
+                 VACUUM VECTOR <idx>, or VACUUM GRAPH <name>",
+                String::from_utf8_lossy(unknown)
+            )
+            .into_bytes(),
+        )),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DEBUG RECLAMATION — P8 verbose diagnostic dump
+// ---------------------------------------------------------------------------
+
+/// `DEBUG RECLAMATION`
+///
+/// Verbose per-subsystem diagnostic dump — more detailed than the `# Reclamation`
+/// INFO section. Returns INFO-style `key:value` lines as a RESP2 bulk string.
+///
+/// Covers:
+/// - Manifest: active_entry_count, tombstone_count
+/// - MVCC: committed_count, active_count, pruned_below, oldest_snapshot,
+///   oldest_snapshot_age_secs, live_snapshot_count, killed_snapshot_count
+/// - WAL: total_bytes, total_segments, max_wal_bytes, current_lsn
+/// - Atomics snapshot (RECL_* counters for a complete picture)
+pub fn debug_reclamation(
+    vector_store: &crate::vector::store::VectorStore,
+    manifest: Option<&ShardManifest>,
+    wal: Option<&WalWriterV3>,
+) -> Frame {
+    use std::fmt::Write as _;
+    use std::sync::atomic::Ordering::Relaxed;
+
+    let mut buf = String::with_capacity(1024);
+    let now = Instant::now();
+
+    // ── Manifest ─────────────────────────────────────────────────────────────
+    buf.push_str("# Manifest\r\n");
+    if let Some(m) = manifest {
+        let _ = write!(
+            buf,
+            "manifest_active_entries:{}\r\n",
+            m.active_entry_count()
+        );
+        let _ = write!(buf, "manifest_tombstones:{}\r\n", m.tombstone_count());
+    } else {
+        buf.push_str("manifest_active_entries:0\r\n");
+        buf.push_str("manifest_tombstones:0\r\n");
+        buf.push_str("manifest_note:no_persistence_dir\r\n");
+    }
+
+    // ── WAL ───────────────────────────────────────────────────────────────────
+    buf.push_str("# WAL\r\n");
+    if let Some(w) = wal {
+        let _ = write!(buf, "wal_current_lsn:{}\r\n", w.current_lsn());
+        let _ = write!(buf, "wal_max_bytes:{}\r\n", w.max_wal_bytes());
+        match w.stats() {
+            Ok(s) => {
+                let _ = write!(buf, "wal_total_bytes:{}\r\n", s.total_bytes);
+                let _ = write!(buf, "wal_total_segments:{}\r\n", s.total_segments);
+                let over = s.total_bytes > w.max_wal_bytes();
+                let _ = write!(buf, "wal_over_ceiling:{}\r\n", if over { 1 } else { 0 });
+            }
+            Err(e) => {
+                let _ = write!(buf, "wal_stats_error:{}\r\n", e);
+            }
+        }
+    } else {
+        buf.push_str("wal_current_lsn:0\r\n");
+        buf.push_str("wal_note:no_persistence_dir\r\n");
+    }
+
+    // ── MVCC ─────────────────────────────────────────────────────────────────
+    buf.push_str("# MVCC\r\n");
+    {
+        let mgr = vector_store.txn_manager();
+        let _ = write!(buf, "mvcc_committed_count:{}\r\n", mgr.committed_count());
+        let _ = write!(buf, "mvcc_active_count:{}\r\n", mgr.active_count());
+        let _ = write!(buf, "mvcc_pruned_below:{}\r\n", mgr.pruned_below());
+        let _ = write!(buf, "mvcc_oldest_snapshot:{}\r\n", mgr.oldest_snapshot());
+        let _ = write!(buf, "mvcc_live_snapshots:{}\r\n", mgr.live_snapshot_count());
+        let _ = write!(
+            buf,
+            "mvcc_killed_snapshots:{}\r\n",
+            mgr.killed_snapshot_count()
+        );
+        let age_secs = mgr
+            .oldest_snapshot_age(now)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let _ = write!(buf, "mvcc_oldest_snapshot_age_secs:{}\r\n", age_secs);
+    }
+
+    // ── Atomics snapshot (RECL_*) ─────────────────────────────────────────────
+    buf.push_str("# Atomics\r\n");
+    use crate::command::info_reclamation as R;
+    let _ = write!(
+        buf,
+        "recl_manifest_active:{}\r\n",
+        R::RECL_MANIFEST_ACTIVE.load(Relaxed)
+    );
+    let _ = write!(
+        buf,
+        "recl_manifest_tombstones:{}\r\n",
+        R::RECL_MANIFEST_TOMBSTONES.load(Relaxed)
+    );
+    let _ = write!(
+        buf,
+        "recl_wal_bytes:{}\r\n",
+        R::RECL_WAL_BYTES.load(Relaxed)
+    );
+    let _ = write!(
+        buf,
+        "recl_wal_segments:{}\r\n",
+        R::RECL_WAL_SEGMENTS.load(Relaxed)
+    );
+    let _ = write!(
+        buf,
+        "recl_mvcc_committed:{}\r\n",
+        R::RECL_MVCC_COMMITTED.load(Relaxed)
+    );
+    let _ = write!(
+        buf,
+        "recl_mvcc_active:{}\r\n",
+        R::RECL_MVCC_ACTIVE.load(Relaxed)
+    );
+    let _ = write!(
+        buf,
+        "recl_mvcc_oldest_snapshot_age_secs:{}\r\n",
+        R::RECL_MVCC_OLDEST_SNAPSHOT_AGE_SECS.load(Relaxed)
+    );
+    let _ = write!(
+        buf,
+        "recl_write_stall_active:{}\r\n",
+        R::RECL_WRITE_STALL_ACTIVE.load(Relaxed)
+    );
+    let _ = write!(
+        buf,
+        "recl_segment_stall_active:{}\r\n",
+        R::RECL_SEGMENT_STALL_ACTIVE.load(Relaxed)
+    );
+    let _ = write!(
+        buf,
+        "recl_disk_free_bytes:{}\r\n",
+        R::RECL_DISK_FREE_BYTES.load(Relaxed)
+    );
+
+    Frame::BulkString(Bytes::from(buf.into_bytes()))
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -984,5 +1411,195 @@ mod tests {
             store.txn_manager().is_killed(txn.txn_id),
             "txn must be marked killed"
         );
+    }
+
+    // ── VACUUM unit tests ───────────────────────────────────────────────────
+
+    /// P8-UNIT-1: plain VACUUM with no persistence returns zeros for
+    /// manifest_pruned and wal_segments_recycled; MVCC counts are non-negative.
+    #[test]
+    fn vacuum_no_persistence_returns_array() {
+        let mut store = crate::vector::store::VectorStore::new();
+        let f = vacuum(&mut store, None, None, &[], 1000);
+        match f {
+            Frame::Array(ref arr) => {
+                assert_eq!(arr.len(), 12, "expect 6 key/value pairs = 12 elements");
+                // First key must be manifest_pruned
+                if let Frame::BulkString(ref k) = arr[0] {
+                    assert_eq!(k.as_ref(), b"manifest_pruned");
+                } else {
+                    panic!("expected BulkString key at index 0");
+                }
+                // manifest_pruned value must be 0 (no manifest)
+                if let Frame::Integer(v) = arr[1] {
+                    assert_eq!(v, 0, "manifest_pruned must be 0 with no manifest");
+                } else {
+                    panic!("expected Integer at index 1");
+                }
+            }
+            _ => panic!("expected Array from vacuum, got {f:?}"),
+        }
+    }
+
+    /// P8-UNIT-2: VACUUM FILES with no manifest returns Array with manifest_pruned=0.
+    #[test]
+    fn vacuum_files_no_manifest_returns_zero() {
+        let mut store = crate::vector::store::VectorStore::new();
+        let f = vacuum(&mut store, None, None, &[bulk(b"FILES")], 1000);
+        match f {
+            Frame::Array(ref arr) => {
+                assert_eq!(arr.len(), 2);
+                if let Frame::BulkString(ref k) = arr[0] {
+                    assert_eq!(k.as_ref(), b"manifest_pruned");
+                }
+                if let Frame::Integer(v) = arr[1] {
+                    assert_eq!(v, 0);
+                }
+            }
+            _ => panic!("expected Array from VACUUM FILES, got {f:?}"),
+        }
+    }
+
+    /// P8-UNIT-3: VACUUM (VERBOSE) returns Array with diagnostic prefix strings.
+    #[test]
+    fn vacuum_verbose_includes_diagnostic_lines() {
+        let mut store = crate::vector::store::VectorStore::new();
+        let f = vacuum(&mut store, None, None, &[bulk(b"(VERBOSE)")], 1000);
+        match f {
+            Frame::Array(ref arr) => {
+                // Must have at least 6 diagnostic lines + 12 kv pairs
+                assert!(
+                    arr.len() >= 18,
+                    "verbose frame must have >= 18 elements, got {}",
+                    arr.len()
+                );
+                // First element must be a diagnostic line starting with '#'
+                if let Frame::BulkString(ref b) = arr[0] {
+                    assert!(
+                        b.starts_with(b"# "),
+                        "first verbose element must start with '# ', got: {:?}",
+                        std::str::from_utf8(b)
+                    );
+                } else {
+                    panic!("expected BulkString diagnostic at index 0");
+                }
+            }
+            _ => panic!("expected Array from VACUUM (VERBOSE), got {f:?}"),
+        }
+    }
+
+    /// P8-UNIT-4: VACUUM (FREEZE) returns the same shape as plain VACUUM.
+    #[test]
+    fn vacuum_freeze_returns_kv_array() {
+        let mut store = crate::vector::store::VectorStore::new();
+        let f = vacuum(&mut store, None, None, &[bulk(b"(FREEZE)")], 1000);
+        match f {
+            Frame::Array(ref arr) => {
+                assert_eq!(arr.len(), 12, "FREEZE must return 12-element kv array");
+            }
+            _ => panic!("expected Array from VACUUM (FREEZE), got {f:?}"),
+        }
+    }
+
+    /// P8-UNIT-5: VACUUM VECTOR returns +OK pending placeholder.
+    #[test]
+    fn vacuum_vector_returns_pending() {
+        let mut store = crate::vector::store::VectorStore::new();
+        let f = vacuum(
+            &mut store,
+            None,
+            None,
+            &[bulk(b"VECTOR"), bulk(b"myidx")],
+            1000,
+        );
+        match f {
+            Frame::SimpleString(ref b) => {
+                assert!(
+                    b.as_ref().starts_with(b"OK pending"),
+                    "VACUUM VECTOR must return pending: {:?}",
+                    std::str::from_utf8(b)
+                );
+            }
+            _ => panic!("expected SimpleString from VACUUM VECTOR, got {f:?}"),
+        }
+    }
+
+    /// P8-UNIT-6: VACUUM GRAPH returns +OK pending placeholder.
+    #[test]
+    fn vacuum_graph_returns_pending() {
+        let mut store = crate::vector::store::VectorStore::new();
+        let f = vacuum(&mut store, None, None, &[bulk(b"GRAPH"), bulk(b"g")], 1000);
+        match f {
+            Frame::SimpleString(ref b) => {
+                assert!(
+                    b.as_ref().starts_with(b"OK pending"),
+                    "VACUUM GRAPH must return pending: {:?}",
+                    std::str::from_utf8(b)
+                );
+            }
+            _ => panic!("expected SimpleString from VACUUM GRAPH, got {f:?}"),
+        }
+    }
+
+    /// P8-UNIT-7: VACUUM with unknown subcommand returns ERR.
+    #[test]
+    fn vacuum_unknown_subcommand_returns_error() {
+        let mut store = crate::vector::store::VectorStore::new();
+        let f = vacuum(&mut store, None, None, &[bulk(b"BOGUS")], 1000);
+        match f {
+            Frame::Error(_) => {}
+            _ => panic!("expected ERR for unknown VACUUM subcommand, got {f:?}"),
+        }
+    }
+
+    /// P8-UNIT-8: VACUUM (FREEZE) with an active snapshot kills it and reflects
+    /// in mvcc_snapshots_killed count.
+    #[test]
+    fn vacuum_freeze_kills_active_snapshots() {
+        let mut store = crate::vector::store::VectorStore::new();
+        let _txn = store.txn_manager_mut().begin();
+        let f = vacuum(&mut store, None, None, &[bulk(b"(FREEZE)")], 1000);
+        // Extract mvcc_snapshots_killed from returned array.
+        let killed = match &f {
+            Frame::Array(arr) => {
+                // Find "mvcc_snapshots_killed" key and read next Integer.
+                let mut found = None;
+                for i in (0..arr.len()).step_by(2) {
+                    if let Frame::BulkString(ref k) = arr[i] {
+                        if k.as_ref() == b"mvcc_snapshots_killed" {
+                            if let Frame::Integer(v) = arr[i + 1] {
+                                found = Some(v);
+                            }
+                        }
+                    }
+                }
+                found.expect("mvcc_snapshots_killed key missing")
+            }
+            _ => panic!("expected Array from VACUUM (FREEZE)"),
+        };
+        assert_eq!(killed, 1, "VACUUM (FREEZE) must kill the 1 active snapshot");
+    }
+
+    /// P8-UNIT-9: DEBUG RECLAMATION returns BulkString with expected sections.
+    #[test]
+    fn debug_reclamation_returns_bulk_string_with_sections() {
+        let store = crate::vector::store::VectorStore::new();
+        let f = debug_reclamation(&store, None, None);
+        match f {
+            Frame::BulkString(ref b) => {
+                let s = std::str::from_utf8(b).expect("debug output must be UTF-8");
+                assert!(s.contains("# Manifest"), "must contain Manifest section");
+                assert!(s.contains("# WAL"), "must contain WAL section");
+                assert!(s.contains("# MVCC"), "must contain MVCC section");
+                assert!(s.contains("# Atomics"), "must contain Atomics section");
+                assert!(
+                    s.contains("manifest_active_entries:"),
+                    "manifest field missing"
+                );
+                assert!(s.contains("mvcc_committed_count:"), "mvcc field missing");
+                assert!(s.contains("recl_wal_bytes:"), "atomic field missing");
+            }
+            _ => panic!("expected BulkString from DEBUG RECLAMATION, got {f:?}"),
+        }
     }
 }

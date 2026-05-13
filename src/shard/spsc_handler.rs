@@ -62,6 +62,10 @@ pub(crate) fn drain_spsc_shared(
     )>,
     vector_store: &mut VectorStore,
     pending_cdc_subscribes: &mut Vec<crate::shard::dispatch::CdcSubscribePayload>,
+    // P8: optional manifest for VACUUM manifest/WAL passes; None when no persistence_dir.
+    shard_manifest: &mut Option<crate::persistence::manifest::ShardManifest>,
+    // P8: MVCC committed-prune margin from server config (default 1000).
+    mvcc_prune_margin: u64,
 ) {
     const MAX_DRAIN_PER_CYCLE: usize = 256;
     let mut drained = 0;
@@ -161,6 +165,8 @@ pub(crate) fn drain_spsc_shared(
                 script_cache,
                 cached_clock,
                 vector_store,
+                shard_manifest,
+                mvcc_prune_margin,
             );
         }
     }
@@ -187,6 +193,8 @@ pub(crate) fn drain_spsc_shared(
             script_cache,
             cached_clock,
             vector_store,
+            shard_manifest,
+            mvcc_prune_margin,
         );
     }
 }
@@ -215,6 +223,10 @@ pub(crate) fn handle_shard_message_shared(
     script_cache: &Rc<RefCell<crate::scripting::ScriptCache>>,
     cached_clock: &CachedClock,
     vector_store: &mut VectorStore,
+    // P8: optional manifest for VACUUM manifest/WAL passes; None when no persistence_dir.
+    shard_manifest: &mut Option<crate::persistence::manifest::ShardManifest>,
+    // P8: MVCC committed-prune margin from server config (default 1000).
+    mvcc_prune_margin: u64,
 ) {
     match msg {
         ShardMessage::Execute {
@@ -299,6 +311,39 @@ pub(crate) fn handle_shard_message_shared(
                     let frame = crate::command::server_admin::kill_snapshot(vector_store, args);
                     let _ = reply_tx.send(frame);
                     return;
+                }
+
+                // P8: VACUUM — manual reclamation across manifest, MVCC, and WAL.
+                // Bypasses write-stall guards (reclaims, does not write data).
+                if cmd.eq_ignore_ascii_case(b"VACUUM") {
+                    let frame = crate::command::server_admin::vacuum(
+                        vector_store,
+                        shard_manifest.as_mut(),
+                        wal_v3_writer.as_mut(),
+                        args,
+                        mvcc_prune_margin,
+                    );
+                    let _ = reply_tx.send(frame);
+                    return;
+                }
+
+                // P8: DEBUG RECLAMATION — verbose per-subsystem diagnostic dump.
+                // Intercept here so it has access to manifest and WAL (read-only).
+                if cmd.eq_ignore_ascii_case(b"DEBUG") {
+                    if let Some(sub) = args.first() {
+                        if let Some(s) = crate::command::helpers::extract_bytes(sub) {
+                            if s.eq_ignore_ascii_case(b"RECLAMATION") {
+                                let frame = crate::command::server_admin::debug_reclamation(
+                                    vector_store,
+                                    shard_manifest.as_ref(),
+                                    wal_v3_writer.as_ref(),
+                                );
+                                let _ = reply_tx.send(frame);
+                                return;
+                            }
+                        }
+                    }
+                    // All other DEBUG subcommands fall through to cmd_dispatch.
                 }
 
                 // COW intercept: capture old value before write if snapshot is active

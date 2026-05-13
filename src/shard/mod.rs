@@ -395,6 +395,8 @@ mod tests {
             &mut Vec::new(),
             &mut vs,
             &mut Vec::new(),
+            &mut None, // shard_manifest — None in tests (no persistence_dir)
+            1000,      // mvcc_prune_margin default
         );
 
         // Subscriber now receives pre-serialized RESP bytes
@@ -451,6 +453,8 @@ mod tests {
             &mut Vec::new(),
             &mut vs,
             &mut Vec::new(),
+            &mut None, // shard_manifest — None in tests (no persistence_dir)
+            1000,      // mvcc_prune_margin default
         );
     }
 
