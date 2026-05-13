@@ -42,16 +42,19 @@ fn test_compaction_scheduler_hottest_runs_first() {
         id: "hot".to_string(),
         bytes_dead: 10_000,
         last_compaction: base,
+        weight: 1.0,
     });
     scheduler.upsert(CompactionEntity {
         id: "warm".to_string(),
         bytes_dead: 1_000,
         last_compaction: base,
+        weight: 1.0,
     });
     scheduler.upsert(CompactionEntity {
         id: "cold".to_string(),
         bytes_dead: 100,
         last_compaction: base,
+        weight: 1.0,
     });
 
     // First pop must be "hot" (highest rate).
@@ -67,6 +70,7 @@ fn test_compaction_scheduler_hottest_runs_first() {
         id: "hot".to_string(),
         bytes_dead: 10_000,
         last_compaction: Instant::now(),
+        weight: 1.0,
     });
 
     // Second pop must be "warm" (next highest).
@@ -82,6 +86,7 @@ fn test_compaction_scheduler_hottest_runs_first() {
         id: "warm".to_string(),
         bytes_dead: 1_000,
         last_compaction: Instant::now(),
+        weight: 1.0,
     });
 
     // Third pop must be "cold".
@@ -116,11 +121,13 @@ fn test_compaction_scheduler_starvation_cap() {
         id: "hot".to_string(),
         bytes_dead: 1_000_000,
         last_compaction: base_hot,
+        weight: 1.0,
     });
     scheduler.upsert(CompactionEntity {
         id: "cold".to_string(),
         bytes_dead: 1, // tiny weight
         last_compaction: base_cold,
+        weight: 1.0,
     });
 
     // Pop entities until cold gets a turn. It MUST get one within a bounded
@@ -137,6 +144,7 @@ fn test_compaction_scheduler_starvation_cap() {
                 id: "hot".to_string(),
                 bytes_dead: 1_000_000,
                 last_compaction: Instant::now(),
+                weight: 1.0,
             });
         }
     }
@@ -171,6 +179,7 @@ fn test_compaction_scheduler_single_entity() {
         id: "only".to_string(),
         bytes_dead: 500,
         last_compaction: Instant::now().checked_sub(Duration::from_secs(1)).unwrap(),
+        weight: 1.0,
     });
 
     let result = scheduler.pop_next();
@@ -194,11 +203,13 @@ fn test_compaction_scheduler_weight_calculation() {
         id: "A".to_string(),
         bytes_dead: 1000,
         last_compaction: two_secs_ago,
+        weight: 1.0,
     });
     scheduler.upsert(CompactionEntity {
         id: "B".to_string(),
         bytes_dead: 1000,
         last_compaction: one_sec_ago,
+        weight: 1.0,
     });
 
     // B has higher weight (same bytes_dead but less time = higher rate).

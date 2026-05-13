@@ -169,6 +169,18 @@ pub struct VectorIndex {
     /// Set to false via FT.CONFIG SET idx AUTOCOMPACT OFF for bulk ingestion.
     /// Manual FT.COMPACT always works regardless of this flag.
     pub autocompact_enabled: bool,
+    /// Per-index compaction priority weight for the autovacuum scheduler (W3-deep).
+    ///
+    /// Multiplies the raw `dead_bytes_rate` before comparison in `CompactionScheduler`.
+    /// Default 1.0 — identical to pre-W3 behaviour.
+    ///
+    /// - `> 1.0`: promotes this index (compacted more aggressively under load).
+    /// - `< 1.0`: demotes this index (compacted less often).
+    /// - `0.0`: never auto-compacted by weight alone; starvation cap still applies.
+    ///
+    /// Set via `FT.CONFIG SET <idx> COMPACTION_WEIGHT <n>` (n ∈ [0.0, 100.0])
+    /// or `VACUUM VECTOR <idx> WEIGHT <n>`.
+    pub compaction_weight: f32,
     /// Additional named vector fields (beyond the default field).
     /// Empty for single-field indexes. Keyed by field_name from VectorFieldMeta.
     pub field_segments: HashMap<Bytes, FieldSegments>,
@@ -181,7 +193,35 @@ pub struct VectorIndex {
 /// Overridden by IndexMeta.compact_threshold when set via FT.CREATE.
 const DEFAULT_COMPACT_THRESHOLD: usize = 1000;
 
+/// Valid range for per-index compaction weight (W3-deep).
+pub const COMPACTION_WEIGHT_MIN: f32 = 0.0;
+pub const COMPACTION_WEIGHT_MAX: f32 = 100.0;
+pub const COMPACTION_WEIGHT_DEFAULT: f32 = 1.0;
+
 impl VectorIndex {
+    /// Read the current compaction weight for this index.
+    #[inline]
+    pub fn compaction_weight(&self) -> f32 {
+        self.compaction_weight
+    }
+
+    /// Set the compaction weight unconditionally (internal use / already-validated paths).
+    #[inline]
+    pub fn set_compaction_weight(&mut self, w: f32) {
+        self.compaction_weight = w.clamp(COMPACTION_WEIGHT_MIN, COMPACTION_WEIGHT_MAX);
+    }
+
+    /// Set the compaction weight with range validation.
+    ///
+    /// Returns `Err` when `w` is outside `[0.0, 100.0]` or is NaN/infinite.
+    pub fn try_set_compaction_weight(&mut self, w: f32) -> Result<(), &'static str> {
+        if !w.is_finite() || w < COMPACTION_WEIGHT_MIN || w > COMPACTION_WEIGHT_MAX {
+            return Err("COMPACTION_WEIGHT must be a finite f32 in [0.0, 100.0]");
+        }
+        self.compaction_weight = w;
+        Ok(())
+    }
+
     /// Returns all vector field names (default + additional).
     pub fn all_field_names(&self) -> Vec<&Bytes> {
         let mut names = vec![&self.meta.vector_fields[0].field_name];
@@ -579,12 +619,14 @@ impl VectorStore {
         self.persist_dir = Some(dir);
     }
 
-    /// Persist current index metadata to the sidecar file.
+    /// Persist current index metadata (including compaction weights) to the sidecar file.
     /// No-op if persist_dir is not set (disk-offload disabled).
     fn save_index_meta_sidecar(&self) {
         if let Some(ref dir) = self.persist_dir {
-            let metas = self.collect_index_metas();
-            if let Err(e) = crate::vector::index_persist::save_index_metadata(dir, &metas) {
+            let meta_weights = self.collect_index_metas_with_weights();
+            if let Err(e) =
+                crate::vector::index_persist::save_index_metadata_v3(dir, &meta_weights)
+            {
                 tracing::warn!("Failed to save vector index metadata: {}", e);
             }
         }
@@ -732,6 +774,7 @@ impl VectorStore {
                 key_hash_to_key: std::collections::HashMap::new(),
                 key_hash_to_global_id: std::collections::HashMap::new(),
                 autocompact_enabled: true,
+                compaction_weight: COMPACTION_WEIGHT_DEFAULT,
                 field_segments: extra_fields,
                 sparse_stores: HashMap::new(),
             },
@@ -856,6 +899,14 @@ impl VectorStore {
     /// Collect references to all active IndexMeta for persistence.
     pub fn collect_index_metas(&self) -> Vec<&IndexMeta> {
         self.indexes.values().map(|idx| &idx.meta).collect()
+    }
+
+    /// Collect `(meta, compaction_weight)` pairs for v3 sidecar persistence (W3-deep).
+    pub fn collect_index_metas_with_weights(&self) -> Vec<(&IndexMeta, f32)> {
+        self.indexes
+            .values()
+            .map(|idx| (&idx.meta, idx.compaction_weight))
+            .collect()
     }
 
     /// Attempt warm transitions for ALL indexes. Called from persistence tick.

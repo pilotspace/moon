@@ -753,9 +753,11 @@ impl super::Shard {
                 drop(ts);
             }
 
-            // Try loading saved index metadata from the vector persist dir.
+            // Try loading saved index metadata (with compaction weights) from the vector persist dir.
+            // W3-deep: load_index_metadata_with_weights returns (IndexMeta, f32) pairs so that
+            // persisted COMPACTION_WEIGHT values are restored into VectorIndex on startup.
             let metas = vector_persist_dir.as_ref().and_then(|vdir| {
-                match crate::vector::index_persist::load_index_metadata(vdir) {
+                match crate::vector::index_persist::load_index_metadata_with_weights(vdir) {
                     Ok(m) if !m.is_empty() => Some(m),
                     _ => None,
                 }
@@ -776,14 +778,21 @@ impl super::Shard {
                     shard_id,
                     metas.len()
                 );
-                for meta in metas {
+                for (meta, weight) in metas {
+                    let name = meta.name.clone();
                     if let Err(e) = vs.create_index(meta.clone()) {
                         tracing::warn!(
                             "Shard {}: failed to restore index '{}': {}",
                             shard_id,
-                            String::from_utf8_lossy(&meta.name),
+                            String::from_utf8_lossy(&name),
                             e
                         );
+                    } else if *weight != 1.0 {
+                        // W3-deep: restore persisted compaction_weight (skip default to avoid
+                        // redundant write on every startup when weight=1.0).
+                        if let Some(idx) = vs.get_index_mut(&name) {
+                            idx.set_compaction_weight(*weight);
+                        }
                     }
                 }
                 drop(vs); // release VectorStore lock before scanning databases
@@ -829,7 +838,7 @@ impl super::Shard {
                         let key_bytes = key.as_bytes();
                         let matches_vector = metas.as_ref().is_some_and(|ms| {
                             ms.iter()
-                                .any(|m| m.key_prefixes.iter().any(|p| key_bytes.starts_with(p)))
+                                .any(|(m, _w)| m.key_prefixes.iter().any(|p| key_bytes.starts_with(p)))
                         });
                         let matches_text = text_metas.as_ref().is_some_and(|ms| {
                             ms.iter()

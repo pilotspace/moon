@@ -1651,11 +1651,57 @@ pub fn vacuum_vector(
     vector_store: &mut crate::vector::store::VectorStore,
     args: &[Frame],
 ) -> Frame {
-    // Args: [index_name]
+    // Args: [index_name] or [index_name WEIGHT <n>]
     let name = match args.first() {
         Some(Frame::BulkString(b)) => b.clone(),
-        _ => return Frame::Error(Bytes::from_static(b"ERR usage: VACUUM VECTOR <index_name>")),
+        _ => {
+            return Frame::Error(Bytes::from_static(
+                b"ERR usage: VACUUM VECTOR <index_name> [WEIGHT <n>]",
+            ))
+        }
     };
+
+    // W3-deep: intercept `VACUUM VECTOR <idx> WEIGHT <n>` before merge logic.
+    // args[1] = "WEIGHT", args[2] = value
+    if args.len() >= 3 {
+        if let Some(Frame::BulkString(sub)) = args.get(1) {
+            if sub.eq_ignore_ascii_case(b"WEIGHT") {
+                let val_bytes = match args.get(2) {
+                    Some(Frame::BulkString(b)) => b.as_ref(),
+                    _ => {
+                        return Frame::Error(Bytes::from_static(
+                            b"ERR WEIGHT requires a numeric value",
+                        ))
+                    }
+                };
+                let parsed: f32 = match std::str::from_utf8(val_bytes)
+                    .ok()
+                    .and_then(|s| s.parse::<f32>().ok())
+                {
+                    Some(v) => v,
+                    None => {
+                        return Frame::Error(Bytes::from_static(
+                            b"ERR WEIGHT must be a number",
+                        ))
+                    }
+                };
+                let idx = match vector_store.get_index_mut(name.as_ref()) {
+                    Some(i) => i,
+                    None => {
+                        return Frame::Error(Bytes::from_static(b"ERR unknown vector index"))
+                    }
+                };
+                return match idx.try_set_compaction_weight(parsed) {
+                    Ok(()) => {
+                        let msg =
+                            format!("OK weight set to {parsed} for index {:?}", name.as_ref());
+                        Frame::SimpleString(Bytes::from(msg))
+                    }
+                    Err(e) => Frame::Error(Bytes::from(format!("ERR {e}").into_bytes())),
+                };
+            }
+        }
+    }
 
     // Check the index exists.
     if vector_store.get_index(name.as_ref()).is_none() {

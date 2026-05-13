@@ -11,7 +11,7 @@
 //! Per index: name, dim, metric, hnsw params, source_field, prefixes
 //! ```
 //!
-//! ## Format v2 (current)
+//! ## Format v2 (read/write for compat)
 //!
 //! Same as v1 per-index fields, followed by multi-vector field array:
 //!
@@ -23,6 +23,20 @@
 //!   Per field:
 //!     [field_name_len: u16] [field_name: bytes]
 //!     [dimension: u32] [metric: u8] [quantization: u8] [build_mode: u8] [reserved: 1B]
+//! ```
+//!
+//! ## Format v3 (current — W3-deep)
+//!
+//! Extends v2 with a per-index `compaction_weight` (f32 LE) appended after the
+//! v2 vector_fields block. v1/v2 files are read with `compaction_weight = 1.0`.
+//!
+//! ```text
+//! [magic: 4B "VMIX"] [version: 3] [count: u16] [reserved: 1B]
+//! Per index:
+//!   ... (same as v2 fields) ...
+//!   [field_count: u16]
+//!   Per field: ... (same as v2) ...
+//!   [compaction_weight: f32 LE]   ← NEW in v3
 //! ```
 
 use std::io::{self, Read, Write};
@@ -37,6 +51,10 @@ use crate::vector::types::DistanceMetric;
 const MAGIC: &[u8; 4] = b"VMIX";
 const VERSION_V1: u8 = 1;
 const VERSION_V2: u8 = 2;
+const VERSION_V3: u8 = 3;
+
+/// Default compaction weight used when reading v1/v2 sidecars without a stored weight.
+const DEFAULT_WEIGHT_ON_LOAD: f32 = 1.0;
 
 /// Serialize a list of IndexMeta to bytes using v1 format (for testing v1 migration).
 #[cfg(test)]
@@ -61,18 +79,27 @@ fn serialize_index_metas_v1(metas: &[&IndexMeta]) -> Vec<u8> {
 /// from `vector_fields[0]` for backward compatibility), then appends the full
 /// `vector_fields` array.
 pub fn serialize_index_metas(metas: &[&IndexMeta]) -> Vec<u8> {
+    // Wrap with default weight=1.0 and delegate to v3 serializer.
+    let pairs: Vec<(&IndexMeta, f32)> = metas.iter().map(|&m| (m, DEFAULT_WEIGHT_ON_LOAD)).collect();
+    serialize_index_metas_v3(&pairs)
+}
+
+/// Serialize `(IndexMeta, compaction_weight)` pairs to bytes using v3 format (W3-deep).
+///
+/// v3 extends v2 with a 4-byte LE f32 `compaction_weight` per index.
+pub fn serialize_index_metas_v3(pairs: &[(&IndexMeta, f32)]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(256);
 
     buf.extend_from_slice(MAGIC);
-    buf.push(VERSION_V2);
-    buf.extend_from_slice(&(metas.len() as u16).to_le_bytes());
+    buf.push(VERSION_V3);
+    buf.extend_from_slice(&(pairs.len() as u16).to_le_bytes());
     buf.push(0); // reserved
 
-    for m in metas {
-        // Write v1-compatible top-level fields
+    for (m, weight) in pairs {
+        // v1-compatible top-level fields
         write_v1_per_index(&mut buf, m);
 
-        // Write v2 vector_fields extension
+        // v2 vector_fields extension
         buf.extend_from_slice(&(m.vector_fields.len() as u16).to_le_bytes());
         for f in &m.vector_fields {
             buf.extend_from_slice(&(f.field_name.len() as u16).to_le_bytes());
@@ -83,12 +110,15 @@ pub fn serialize_index_metas(metas: &[&IndexMeta]) -> Vec<u8> {
             buf.push(f.build_mode as u8);
             buf.push(0); // reserved
         }
+
+        // v3 extension: compaction_weight (4 bytes LE f32)
+        buf.extend_from_slice(&weight.to_le_bytes());
     }
 
     buf
 }
 
-/// Write the v1 per-index fields (shared between v1 and v2 serializers).
+/// Write the v1 per-index fields (shared between v1, v2, and v3 serializers).
 fn write_v1_per_index(buf: &mut Vec<u8>, m: &IndexMeta) {
     // name
     buf.extend_from_slice(&(m.name.len() as u16).to_le_bytes());
@@ -117,11 +147,15 @@ fn write_v1_per_index(buf: &mut Vec<u8>, m: &IndexMeta) {
     }
 }
 
-/// Deserialize IndexMeta list from bytes. Handles both v1 and v2 formats.
+/// Deserialize IndexMeta list from bytes. Handles v1, v2, and v3 formats.
 ///
-/// v1 data is auto-migrated: the single source_field is wrapped into a
-/// 1-element `vector_fields` Vec. v2 data reads the full field array.
-pub fn deserialize_index_metas(data: &[u8]) -> io::Result<Vec<IndexMeta>> {
+/// v1/v2 data is auto-migrated:
+/// - v1: single source_field wrapped into 1-element `vector_fields`.
+/// - v2: full field array; `compaction_weight` defaults to 1.0.
+/// - v3: full field array + explicit `compaction_weight` per index.
+///
+/// Returns `(IndexMeta, compaction_weight)` pairs.
+pub fn deserialize_index_metas_with_weights(data: &[u8]) -> io::Result<Vec<(IndexMeta, f32)>> {
     if data.len() < 8 {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "too short"));
     }
@@ -129,7 +163,7 @@ pub fn deserialize_index_metas(data: &[u8]) -> io::Result<Vec<IndexMeta>> {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "bad magic"));
     }
     let version = data[4];
-    if version != VERSION_V1 && version != VERSION_V2 {
+    if version != VERSION_V1 && version != VERSION_V2 && version != VERSION_V3 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!("unsupported version {version}"),
@@ -137,7 +171,7 @@ pub fn deserialize_index_metas(data: &[u8]) -> io::Result<Vec<IndexMeta>> {
     }
     let count = u16::from_le_bytes([data[5], data[6]]) as usize;
     let mut cursor = 8;
-    let mut metas = Vec::with_capacity(count);
+    let mut results = Vec::with_capacity(count);
 
     for _ in 0..count {
         let (
@@ -150,8 +184,8 @@ pub fn deserialize_index_metas(data: &[u8]) -> io::Result<Vec<IndexMeta>> {
             padded_dimension,
         ) = read_v1_per_index(data, &mut cursor)?;
 
-        let vector_fields = if version == VERSION_V2 {
-            // Read v2 vector_fields extension
+        let vector_fields = if version >= VERSION_V2 {
+            // Read v2+ vector_fields extension
             let field_count = read_u16(data, &mut cursor)? as usize;
             let mut fields = Vec::with_capacity(field_count);
             for _ in 0..field_count {
@@ -190,7 +224,15 @@ pub fn deserialize_index_metas(data: &[u8]) -> io::Result<Vec<IndexMeta>> {
             }]
         };
 
-        metas.push(IndexMeta {
+        // v3: read compaction_weight; v1/v2: default to 1.0.
+        let compaction_weight = if version >= VERSION_V3 {
+            let w_bytes = read_bytes(data, &mut cursor, 4)?;
+            f32::from_le_bytes([w_bytes[0], w_bytes[1], w_bytes[2], w_bytes[3]])
+        } else {
+            DEFAULT_WEIGHT_ON_LOAD
+        };
+
+        let meta = IndexMeta {
             name: meta_base.0,
             dimension,
             padded_dimension,
@@ -207,10 +249,22 @@ pub fn deserialize_index_metas(data: &[u8]) -> io::Result<Vec<IndexMeta>> {
             schema_fields: Vec::new(),
             merge_mode: crate::vector::segment::compaction::MergeMode::GraphUnion,
             keep_raw: false,
-        });
+        };
+        results.push((meta, compaction_weight));
     }
 
-    Ok(metas)
+    Ok(results)
+}
+
+/// Deserialize IndexMeta list from bytes (backward-compat: drops compaction weights).
+///
+/// Delegates to `deserialize_index_metas_with_weights`; callers that only need
+/// `IndexMeta` (e.g. existing unit tests) use this.
+pub fn deserialize_index_metas(data: &[u8]) -> io::Result<Vec<IndexMeta>> {
+    Ok(deserialize_index_metas_with_weights(data)?
+        .into_iter()
+        .map(|(m, _)| m)
+        .collect())
 }
 
 /// Read v1 per-index fields from the data stream.
@@ -298,15 +352,25 @@ fn decode_build_mode(v: u8) -> BuildMode {
     }
 }
 
-/// Write all active index metadata to the sidecar file.
+/// Write all active index metadata to the sidecar file (v2 compat — weight defaults to 1.0).
 ///
-/// Called after FT.CREATE and FT.DROPINDEX. Atomically replaces the file
-/// via write-to-temp + rename.
+/// Kept for callers that don't have weight state (e.g. recovery paths that reconstruct
+/// IndexMeta before VectorIndex is created). Prefer `save_index_metadata_v3` when
+/// `VectorIndex` weights are available.
 pub fn save_index_metadata(shard_dir: &Path, metas: &[&IndexMeta]) -> io::Result<()> {
+    let pairs: Vec<(&IndexMeta, f32)> = metas.iter().map(|&m| (m, DEFAULT_WEIGHT_ON_LOAD)).collect();
+    save_index_metadata_v3(shard_dir, &pairs)
+}
+
+/// Write all active index metadata **with compaction weights** to the sidecar file (v3).
+///
+/// Called after FT.CREATE / FT.DROPINDEX / FT.CONFIG SET COMPACTION_WEIGHT.
+/// Atomically replaces the file via write-to-temp + rename.
+pub fn save_index_metadata_v3(shard_dir: &Path, pairs: &[(&IndexMeta, f32)]) -> io::Result<()> {
     let path = shard_dir.join("vector-indexes.meta");
     let tmp_path = shard_dir.join(".vector-indexes.meta.tmp");
 
-    let data = serialize_index_metas(metas);
+    let data = serialize_index_metas_v3(pairs);
 
     let mut f = std::fs::File::create(&tmp_path)?;
     f.write_all(&data)?;
@@ -316,10 +380,21 @@ pub fn save_index_metadata(shard_dir: &Path, metas: &[&IndexMeta]) -> io::Result
     Ok(())
 }
 
-/// Load index metadata from the sidecar file.
+/// Load index metadata from the sidecar file (returns `IndexMeta` only, drops weights).
 ///
 /// Returns empty vec if the file doesn't exist (fresh server).
 pub fn load_index_metadata(shard_dir: &Path) -> io::Result<Vec<IndexMeta>> {
+    Ok(load_index_metadata_with_weights(shard_dir)?
+        .into_iter()
+        .map(|(m, _)| m)
+        .collect())
+}
+
+/// Load index metadata **and** compaction weights from the sidecar file.
+///
+/// Returns empty vec if the file doesn't exist (fresh server).
+/// v1/v2 files return weight=1.0 for all indexes.
+pub fn load_index_metadata_with_weights(shard_dir: &Path) -> io::Result<Vec<(IndexMeta, f32)>> {
     let path = shard_dir.join("vector-indexes.meta");
     if !path.exists() {
         return Ok(Vec::new());
@@ -329,7 +404,7 @@ pub fn load_index_metadata(shard_dir: &Path) -> io::Result<Vec<IndexMeta>> {
     let mut data = Vec::new();
     f.read_to_end(&mut data)?;
 
-    deserialize_index_metas(&data)
+    deserialize_index_metas_with_weights(&data)
 }
 
 // ── Binary read helpers ─────────────────────────────────────────────────
@@ -499,8 +574,8 @@ mod tests {
     fn test_serialize_deserialize_v2_single_field() {
         let meta = make_meta("idx", 128, "doc:", "vec");
         let data = serialize_index_metas(&[&meta]);
-        // Verify v2 version byte
-        assert_eq!(data[4], VERSION_V2);
+        // Now writes v3 (serialize_index_metas delegates to v3)
+        assert_eq!(data[4], VERSION_V3);
         let result = deserialize_index_metas(&data).unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].vector_fields.len(), 1);
@@ -624,5 +699,77 @@ mod tests {
         );
         assert_eq!(result[0].vector_fields[0].dimension, result[0].dimension);
         assert_eq!(result[0].vector_fields[0].metric, result[0].metric);
+    }
+
+    // ── W3-deep: v3 format tests ───────────────────────────────────────────
+
+    #[test]
+    fn test_v3_weight_roundtrip() {
+        let meta = make_meta("hot_idx", 128, "doc:", "vec");
+        let data = serialize_index_metas_v3(&[(&meta, 7.5)]);
+        assert_eq!(data[4], VERSION_V3, "must write v3 version byte");
+
+        let result = deserialize_index_metas_with_weights(&data).unwrap();
+        assert_eq!(result.len(), 1);
+        assert!((result[0].1 - 7.5f32).abs() < 1e-6, "weight must round-trip");
+    }
+
+    #[test]
+    fn test_v3_default_weight_from_v1() {
+        let meta = make_meta("legacy", 64, "x:", "v");
+        let v1_data = serialize_index_metas_v1(&[&meta]);
+        let result = deserialize_index_metas_with_weights(&v1_data).unwrap();
+        assert_eq!(result.len(), 1);
+        assert!(
+            (result[0].1 - 1.0f32).abs() < 1e-6,
+            "v1 files must load with default weight=1.0"
+        );
+    }
+
+    #[test]
+    fn test_v3_default_weight_from_v2_format() {
+        // serialize_index_metas used to write v2; now writes v3 — but test
+        // that weight=1.0 is the default in v3 output too.
+        let meta = make_meta("v2compat", 128, "d:", "emb");
+        let data = serialize_index_metas(&[&meta]); // delegates to v3 with weight=1.0
+        let result = deserialize_index_metas_with_weights(&data).unwrap();
+        assert!(
+            (result[0].1 - 1.0f32).abs() < 1e-6,
+            "default weight must be 1.0"
+        );
+    }
+
+    #[test]
+    fn test_v3_weight_zero_persists() {
+        let meta = make_meta("disabled", 64, "d:", "v");
+        let data = serialize_index_metas_v3(&[(&meta, 0.0)]);
+        let result = deserialize_index_metas_with_weights(&data).unwrap();
+        assert!(
+            (result[0].1 - 0.0f32).abs() < 1e-9,
+            "weight=0.0 must persist exactly"
+        );
+    }
+
+    #[test]
+    fn test_v3_weight_multiple_indexes() {
+        let m1 = make_meta("idx1", 128, "a:", "v");
+        let m2 = make_meta("idx2", 256, "b:", "v");
+        let data = serialize_index_metas_v3(&[(&m1, 3.0), (&m2, 0.5)]);
+        let result = deserialize_index_metas_with_weights(&data).unwrap();
+        assert_eq!(result.len(), 2);
+        assert!((result[0].1 - 3.0f32).abs() < 1e-6);
+        assert!((result[1].1 - 0.5f32).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_v3_save_load_file_with_weights() {
+        let tmp = tempfile::tempdir().unwrap();
+        let meta = make_meta("weighted_idx", 128, "doc:", "vec");
+        save_index_metadata_v3(tmp.path(), &[(&meta, 42.0)]).unwrap();
+
+        let loaded = load_index_metadata_with_weights(tmp.path()).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].0.name, "weighted_idx");
+        assert!((loaded[0].1 - 42.0f32).abs() < 1e-6, "weight must survive file round-trip");
     }
 }

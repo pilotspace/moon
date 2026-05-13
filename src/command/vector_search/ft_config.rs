@@ -105,6 +105,19 @@ fn ft_config_set(
                 b"ERR AUTOCOMPACT value must be ON or OFF",
             ))
         }
+    } else if param.eq_ignore_ascii_case(b"COMPACTION_WEIGHT") {
+        // W3-deep: per-index autovacuum priority multiplier.
+        let parsed: f32 = match std::str::from_utf8(value)
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+        {
+            Some(v) => v,
+            None => return Frame::Error(Bytes::from_static(b"ERR COMPACTION_WEIGHT must be a number")),
+        };
+        match idx.try_set_compaction_weight(parsed) {
+            Ok(()) => Frame::SimpleString(Bytes::from_static(b"OK")),
+            Err(e) => Frame::Error(Bytes::from(format!("ERR {e}").into_bytes())),
+        }
     } else {
         Frame::Error(Bytes::from_static(b"ERR unknown config parameter"))
     }
@@ -139,6 +152,12 @@ fn ft_config_get(
     if param.eq_ignore_ascii_case(b"AUTOCOMPACT") {
         let val = if idx.autocompact_enabled { "ON" } else { "OFF" };
         Frame::BulkString(Bytes::from(val))
+    } else if param.eq_ignore_ascii_case(b"COMPACTION_WEIGHT") {
+        // W3-deep: return current weight as a decimal string.
+        let mut buf = String::with_capacity(8);
+        use std::fmt::Write as _;
+        let _ = write!(buf, "{}", idx.compaction_weight());
+        Frame::BulkString(Bytes::from(buf))
     } else {
         Frame::Error(Bytes::from_static(b"ERR unknown config parameter"))
     }

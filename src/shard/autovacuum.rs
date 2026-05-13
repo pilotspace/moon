@@ -612,10 +612,24 @@ pub fn config_from_server(server: &crate::config::ServerConfig) -> AutovacuumCon
 
 /// One compactable entity (vector index or graph) tracked by the weighted scheduler.
 ///
-/// The scheduler uses `dead_bytes_rate = bytes_dead / elapsed_secs_since_last_compaction`
+/// The scheduler uses `weighted_rate = (bytes_dead / elapsed_secs) * weight`
 /// as the priority key. Entities with higher churn (more dead bytes accumulated
 /// per unit time) run first, preventing hot indexes from being starved by the
 /// fixed-round-robin order of the P4 daemon.
+///
+/// ## Per-index priority weight (W3-deep)
+///
+/// `weight` multiplies the raw `dead_bytes_rate` before comparison. Default is 1.0
+/// (same behaviour as MA4). Set via `FT.CONFIG SET <idx> COMPACTION_WEIGHT <n>` or
+/// `VACUUM VECTOR <idx> WEIGHT <n>`.
+///
+/// - `weight > 1.0` → promotes the index (runs more often under equal dead-byte churn).
+/// - `weight < 1.0` → demotes the index (runs less often).
+/// - `weight = 0.0` → `weighted_rate = 0` (never selected by weight alone).
+///   The starvation cap still applies: if `starvation_cap` elapses with no compaction,
+///   the entity is force-selected regardless of its weight.
+///
+/// Valid range: `[0.0, 100.0]`.
 #[derive(Debug, Clone)]
 pub struct CompactionEntity {
     /// Stable identifier: index name or graph name.
@@ -624,12 +638,18 @@ pub struct CompactionEntity {
     pub bytes_dead: u64,
     /// Instant of the last successful compaction (or entity creation time).
     pub last_compaction: Instant,
+    /// Per-index priority multiplier. Default 1.0. Range [0.0, 100.0].
+    ///
+    /// Mirrors the `compaction_weight` stored on `VectorIndex`. Set by
+    /// `FT.CONFIG SET <idx> COMPACTION_WEIGHT <n>` or
+    /// `VACUUM VECTOR <idx> WEIGHT <n>`.
+    pub weight: f32,
 }
 
 impl CompactionEntity {
-    /// Compute the current dead-bytes rate: `bytes_dead / elapsed_secs`.
+    /// Compute the raw dead-bytes rate: `bytes_dead / elapsed_secs`.
     ///
-    /// Saturates to `f64::MAX` when elapsed is < 1 ms (effectively just created).
+    /// Returns 0.0 when elapsed is < 1 ms (just-created / just-compacted).
     #[inline]
     pub fn dead_bytes_rate(&self) -> f64 {
         let elapsed_secs = self.last_compaction.elapsed().as_secs_f64();
@@ -640,6 +660,15 @@ impl CompactionEntity {
         } else {
             self.bytes_dead as f64 / elapsed_secs
         }
+    }
+
+    /// Compute the weighted rate used for scheduling: `dead_bytes_rate() * weight`.
+    ///
+    /// `weight = 0.0` → 0.0 (never selected by weight; starvation cap still applies).
+    /// `weight = 1.0` → same as MA4 (backward compatible).
+    #[inline]
+    pub fn weighted_rate(&self) -> f64 {
+        self.dead_bytes_rate() * self.weight as f64
     }
 }
 
@@ -722,14 +751,14 @@ impl CompactionScheduler {
             return Some(self.entities[idx].id.clone());
         }
 
-        // No starvation: highest dead_bytes_rate wins.
+        // No starvation: highest weighted_rate wins (W3-deep: dead_bytes_rate × weight).
         let best_idx = self
             .entities
             .iter()
             .enumerate()
             .max_by(|(_, a), (_, b)| {
-                a.dead_bytes_rate()
-                    .partial_cmp(&b.dead_bytes_rate())
+                a.weighted_rate()
+                    .partial_cmp(&b.weighted_rate())
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
             .map(|(i, _)| i)?;
