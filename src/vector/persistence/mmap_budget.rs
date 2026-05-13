@@ -55,32 +55,28 @@ pub struct EnforceStats {
     pub bytes_after: u64,
 }
 
-/// Per-segment LRU entry.
+/// Per-segment accounting entry.
 #[derive(Debug)]
 struct SegmentEntry {
     /// Estimated resident bytes for this segment.
     resident_bytes: u64,
-    /// Monotonically increasing access counter (higher = more recently used).
-    lru_stamp: u64,
 }
 
 /// Per-shard warm-segment budget tracker.
 ///
-/// Call `register_segment` when a new warm segment is added to the list.
-/// Call `record_access` on every search hit against a warm segment.
-/// Call `enforce_budget` periodically (from the shard timer) to trim LRU
-/// segments until resident bytes fall below `max_resident_bytes`.
+/// LRU ordering is taken directly from `WarmSearchSegment::last_access_micros()`
+/// which is bumped atomically on every search call. The budget struct only needs
+/// to track resident bytes; it does not maintain its own clock.
 ///
-/// `remove_segment` must be called when a segment is explicitly retired
-/// (e.g. transitioned to cold tier or dropped on index deletion).
+/// `register_segment` is called by `enforce_segment_holder_budget` on each tick
+/// for all warm segments currently in the list; it is idempotent (byte-delta
+/// only on re-registration, no global-atomic drift).
 ///
 /// This struct is `!Send` — it is owned exclusively by the shard event loop.
 /// No interior mutability or locking is needed.
 pub struct MmapBudget {
-    /// Per-segment LRU metadata, keyed by segment_id.
+    /// Per-segment byte accounting, keyed by segment_id.
     entries: HashMap<u64, SegmentEntry>,
-    /// Monotonic clock for LRU stamps. Incremented on every `record_access`.
-    clock: u64,
     /// Budget in bytes. 0 means enforcement is disabled.
     max_resident_bytes: u64,
     /// Current total of resident bytes across all tracked segments.
@@ -94,55 +90,52 @@ impl MmapBudget {
     pub fn new(max_resident_bytes: u64) -> Self {
         Self {
             entries: HashMap::new(),
-            clock: 0,
             max_resident_bytes,
             total_resident_bytes: 0,
         }
     }
 
-    /// Register a newly-created warm segment.
+    /// Register (or re-register) a warm segment's resident-byte count.
     ///
-    /// `resident_bytes` should be computed via
-    /// `WarmSearchSegment::resident_bytes()`. Calling this for a segment that
-    /// is already registered (same `segment_id`) is idempotent: the old entry
-    /// is replaced and the byte counter is updated accordingly.
+    /// On re-registration the global `RECL_MMAP_WARM_BYTES` atomic is adjusted
+    /// by the signed delta rather than unconditionally adding the full size,
+    /// preventing metric drift when this is called every tick.
     pub fn register_segment(&mut self, segment_id: u64, resident_bytes: u64) {
-        // If re-registering, first subtract old bytes.
-        if let Some(old) = self.entries.get(&segment_id) {
-            self.total_resident_bytes = self.total_resident_bytes.saturating_sub(old.resident_bytes);
+        if let Some(old) = self.entries.get_mut(&segment_id) {
+            // Delta update: adjust totals by the difference only.
+            let old_bytes = old.resident_bytes;
+            if old_bytes != resident_bytes {
+                self.total_resident_bytes = self.total_resident_bytes
+                    .saturating_sub(old_bytes)
+                    .saturating_add(resident_bytes);
+                if resident_bytes >= old_bytes {
+                    crate::admin::recl_atomics::add_warm_resident(resident_bytes - old_bytes);
+                } else {
+                    crate::admin::recl_atomics::sub_warm_resident(old_bytes - resident_bytes);
+                }
+                old.resident_bytes = resident_bytes;
+            }
+            // When size is unchanged, nothing to do (no atomic churn).
+        } else {
+            // New entry.
+            self.entries.insert(segment_id, SegmentEntry { resident_bytes });
+            self.total_resident_bytes =
+                self.total_resident_bytes.saturating_add(resident_bytes);
+            crate::admin::recl_atomics::add_warm_resident(resident_bytes);
         }
-
-        self.clock += 1;
-        self.entries.insert(
-            segment_id,
-            SegmentEntry {
-                resident_bytes,
-                lru_stamp: self.clock,
-            },
-        );
-        self.total_resident_bytes = self.total_resident_bytes.saturating_add(resident_bytes);
-
-        // Update the global RECL counter.
-        crate::admin::recl_atomics::add_warm_resident(resident_bytes);
     }
 
-    /// Record a search access against `segment_id`, bumping its LRU position.
+    /// No-op: LRU ordering is read directly from `WarmSearchSegment::last_access_micros()`.
     ///
-    /// This is a hot-path call (every warm segment search); it must be O(1).
-    /// Segments not yet registered are silently ignored (race between
-    /// register_segment and record_access is benign).
+    /// Retained for API compatibility in case callers want to override access
+    /// tracking in tests without live segments.
     #[inline]
-    pub fn record_access(&mut self, segment_id: u64) {
-        if let Some(entry) = self.entries.get_mut(&segment_id) {
-            self.clock = self.clock.saturating_add(1);
-            entry.lru_stamp = self.clock;
-        }
-    }
+    pub fn record_access(&mut self, _segment_id: u64) {}
 
     /// Remove a segment from the tracker (e.g. on cold-tier transition or drop).
     ///
-    /// Must be called whenever a `WarmSearchSegment` is permanently removed from
-    /// the segment list (not just evicted by the budget enforcer).
+    /// Self-healing reconciliation in `enforce_segment_holder_budget` also
+    /// handles orphan removal, but explicit calls ensure immediate cleanup.
     pub fn remove_segment(&mut self, segment_id: u64) {
         if let Some(entry) = self.entries.remove(&segment_id) {
             self.total_resident_bytes =
@@ -156,24 +149,24 @@ impl MmapBudget {
         self.total_resident_bytes
     }
 
+    /// Iterator over all segment IDs currently tracked by this budget.
+    ///
+    /// Used by `enforce_segment_holder_budget` for self-healing reconciliation:
+    /// tracked IDs that are no longer in the live warm list are removed.
+    pub fn tracked_ids(&self) -> impl Iterator<Item = u64> + '_ {
+        self.entries.keys().copied()
+    }
+
     /// Enforce the budget against `segment_list`.
     ///
-    /// Identifies the least-recently-accessed warm segments, removes them from
-    /// `segment_list.warm`, and updates the tracker. Returns statistics for
-    /// logging and the INFO output.
+    /// LRU order is determined by `WarmSearchSegment::last_access_micros()`
+    /// (bumped atomically on every search call). Segments with the smallest
+    /// `last_access_micros` are evicted first.
     ///
-    /// If `max_resident_bytes == 0`, returns immediately with zeroed stats.
+    /// The most-recently-accessed segment is protected from eviction when there
+    /// is more than one candidate, to avoid disrupting active load.
     ///
-    /// The caller must call `SegmentHolder::swap` with the returned (possibly
-    /// mutated) `SegmentList` to make the eviction visible to searchers.
-    ///
-    /// # Algorithm
-    ///
-    /// 1. If `total_resident_bytes <= max_resident_bytes`, nothing to do.
-    /// 2. Sort warm segments from the list by LRU stamp ascending (LRU first).
-    ///    Skip the most-recently-accessed segment to avoid evicting an active
-    ///    search.
-    /// 3. Evict from the tail (least recently accessed) until under budget.
+    /// Returns statistics for logging and the INFO output.
     pub fn enforce_budget(&mut self, segment_list: &mut SegmentList) -> EnforceStats {
         if self.max_resident_bytes == 0
             || self.total_resident_bytes <= self.max_resident_bytes
@@ -185,15 +178,18 @@ impl MmapBudget {
             };
         }
 
-        // Build a sorted list of (lru_stamp, segment_id) for warm segments only.
-        // Segments not registered in our tracker are ignored (they may have been
-        // added without going through register_segment — defensive skip).
+        // Build a list of (last_access_micros, segment_id) for all tracked warm
+        // segments. Use the segment Arc's atomic timestamp for true LRU ordering.
         let mut candidates: Vec<(u64, u64)> = segment_list
             .warm
             .iter()
             .filter_map(|arc| {
                 let id = arc.segment_id();
-                self.entries.get(&id).map(|e| (e.lru_stamp, id))
+                if self.entries.contains_key(&id) {
+                    Some((arc.last_access_micros(), id))
+                } else {
+                    None
+                }
             })
             .collect();
 
@@ -205,23 +201,18 @@ impl MmapBudget {
             };
         }
 
-        // Sort ascending by LRU stamp: index 0 is LRU (evict first).
-        candidates.sort_unstable_by_key(|(stamp, _)| *stamp);
+        // Sort ascending: index 0 is oldest access (evict first).
+        candidates.sort_unstable_by_key(|(ts, _)| *ts);
 
-        // Do not evict the most recently used segment if it is the only candidate,
-        // to avoid evicting under active load. With > 1 candidate the MRU is safe
-        // to skip; with exactly 1 we must accept the eviction to honour the budget.
-        let protect_last = candidates.len() > 1;
-        let evict_count = if protect_last {
+        // Protect the MRU segment (last in sorted order) when > 1 candidate.
+        let evict_count = if candidates.len() > 1 {
             candidates.len() - 1
         } else {
             candidates.len()
         };
 
-        // Set of segment IDs to remove from segment_list.warm.
         let mut evict_ids: std::collections::HashSet<u64> =
             std::collections::HashSet::with_capacity(evict_count);
-
         let mut bytes_freed: u64 = 0;
         let mut budget_remaining = self.total_resident_bytes;
 
@@ -443,34 +434,46 @@ mod tests {
         );
     }
 
-    /// record_access promotes a segment so it is not the first to be evicted.
+    /// The segment most recently touched by a search is protected from eviction.
+    ///
+    /// LRU ordering now comes from `WarmSearchSegment::last_access_micros()` which
+    /// is bumped by `search_filtered`. We create 3 segments, let w1/w2 get the
+    /// initial (construction-time) timestamp, then trigger a search on w3 to make
+    /// it the MRU. A short sleep ensures clock resolution separates the timestamps.
     #[test]
-    fn test_record_access_protects_mru() {
+    fn test_mru_segment_protected_after_search() {
+        distance::init();
         let tmp = tempfile::tempdir().unwrap();
 
-        // Create 3 segments with budget 1 byte (force eviction).
         let w1 = make_warm_segment(tmp.path(), 10);
         let w2 = make_warm_segment(tmp.path(), 20);
+        // Sleep briefly so w3's construction timestamp is clearly after w1/w2.
+        std::thread::sleep(std::time::Duration::from_millis(2));
         let w3 = make_warm_segment(tmp.path(), 30);
+
+        // Perform a search on w3 to ensure its last_access_micros is the newest.
+        {
+            let query = vec![0.0f32; 128];
+            let mut scratch = crate::vector::hnsw::search::SearchScratch::new(0, 128);
+            let _ = w3.search(&query, 1, 10, &mut scratch);
+        }
 
         let mut budget = MmapBudget::new(1);
         budget.register_segment(10, 1_000_000);
         budget.register_segment(20, 1_000_000);
         budget.register_segment(30, 1_000_000);
 
-        // Access segment 10 last — it should be protected.
-        budget.record_access(10);
-
-        let mut list = empty_segment_list(vec![w1, w2, w3]);
+        let mut list = empty_segment_list(vec![w1, w2, w3.clone()]);
         let stats = budget.enforce_budget(&mut list);
 
         // At least one was evicted.
-        assert!(stats.segments_evicted > 0);
-        // Segment 10 (MRU) should still be in the list.
+        assert!(stats.segments_evicted > 0, "expected eviction; stats={stats:?}");
+
+        // Segment 30 (most recently searched) must still be in the list.
         let remaining_ids: Vec<u64> = list.warm.iter().map(|w| w.segment_id()).collect();
         assert!(
-            remaining_ids.contains(&10),
-            "MRU segment 10 should not be evicted; remaining={remaining_ids:?}"
+            remaining_ids.contains(&30),
+            "MRU segment 30 should not be evicted; remaining={remaining_ids:?}"
         );
     }
 

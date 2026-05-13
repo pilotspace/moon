@@ -6,6 +6,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use roaring::RoaringBitmap;
 use smallvec::SmallVec;
@@ -49,6 +50,11 @@ pub struct WarmSearchSegment {
     _handle: SegmentHandle,
     /// Timestamp when this warm segment was created (for cold tier aging).
     created_at: std::time::Instant,
+    /// Microseconds since epoch of the last search access.
+    /// Updated atomically on every search call. Used by MmapBudget for
+    /// LRU ordering without requiring a mutable reference to the budget.
+    /// Relaxed ordering is sufficient: approximate recency is all we need.
+    last_access_micros: AtomicU64,
 }
 
 /// Extract contiguous data bytes from a mmap'd .mpf file, skipping sub-headers.
@@ -224,6 +230,12 @@ impl WarmSearchSegment {
             global_ids,
             _handle: handle,
             created_at: std::time::Instant::now(),
+            last_access_micros: AtomicU64::new(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_micros() as u64,
+            ),
         })
     }
 
@@ -250,6 +262,8 @@ impl WarmSearchSegment {
         scratch: &mut SearchScratch,
         allow_bitmap: Option<&RoaringBitmap>,
     ) -> SmallVec<[SearchResult; 32]> {
+        // Record this search so the mmap budget can make accurate LRU decisions.
+        self.touch_last_access();
         if self.total_count == 0 {
             return SmallVec::new();
         }
@@ -291,6 +305,26 @@ impl WarmSearchSegment {
     #[inline]
     pub fn age_secs(&self) -> u64 {
         self.created_at.elapsed().as_secs()
+    }
+
+    /// Microseconds since UNIX epoch of the last search access.
+    ///
+    /// Used by `MmapBudget::enforce_budget` for LRU ordering. Higher value =
+    /// more recently accessed. Read with `Relaxed` ordering — approximate
+    /// recency is sufficient for eviction decisions.
+    #[inline]
+    pub fn last_access_micros(&self) -> u64 {
+        self.last_access_micros.load(Ordering::Relaxed)
+    }
+
+    /// Bump the last-access timestamp. Called on every search.
+    #[inline]
+    fn touch_last_access(&self) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros() as u64;
+        self.last_access_micros.store(now, Ordering::Relaxed);
     }
 
     /// Estimated resident bytes for this warm segment.

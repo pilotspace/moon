@@ -1286,13 +1286,26 @@ fn enforce_segment_holder_budget(
 ) -> u64 {
     let snapshot = holder.load();
 
-    // Register any warm segments that are not yet tracked.
-    // This handles segments added since the last enforcement tick.
+    // Collect the set of IDs currently in the warm list.
+    let live_ids: std::collections::HashSet<u64> =
+        snapshot.warm.iter().map(|w| w.segment_id()).collect();
+
+    // Self-healing reconciliation: remove tracker entries for segments that
+    // are no longer in the warm list (cold-tier transition, index drop, etc.).
+    // This prevents permanently-inflated pressure from orphaned entries.
+    let stale_ids: Vec<u64> = budget
+        .tracked_ids()
+        .filter(|id| !live_ids.contains(id))
+        .collect();
+    for id in stale_ids {
+        budget.remove_segment(id);
+    }
+
+    // Register / update all currently-live warm segments.
+    // `register_segment` uses delta accounting — no global-atomic drift on
+    // repeated calls (common: every warm-check tick re-registers all segments).
     for warm in &snapshot.warm {
-        let id = warm.segment_id();
-        // `register_segment` is idempotent: re-registration updates the byte count
-        // without double-counting (old bytes are subtracted first).
-        budget.register_segment(id, warm.resident_bytes() as u64);
+        budget.register_segment(warm.segment_id(), warm.resident_bytes() as u64);
     }
 
     // Build a mutable owned SegmentList for the enforcer to trim.
