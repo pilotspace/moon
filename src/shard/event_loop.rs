@@ -640,6 +640,14 @@ impl super::Shard {
         #[cfg(feature = "runtime-tokio")]
         let mut disk_monitor_interval = TimerImpl::interval(Duration::from_secs(5));
 
+        // P4: Autovacuum daemon — per-shard background reclamation with AIMD throttle.
+        let autovacuum_cfg = crate::shard::autovacuum::config_from_server(&server_config);
+        let autovacuum_interval_secs = autovacuum_cfg.interval_secs.max(1);
+        let mut autovacuum_daemon = crate::shard::autovacuum::AutovacuumDaemon::new(autovacuum_cfg);
+        #[cfg(feature = "runtime-tokio")]
+        let mut autovacuum_interval =
+            TimerImpl::interval(Duration::from_secs(autovacuum_interval_secs));
+
         // monoio: counter-based sub-timer dispatch from 1ms periodic tick.
         // Each sub-timer fires at its native interval via modular arithmetic.
         #[cfg(feature = "runtime-monoio")]
@@ -1297,6 +1305,21 @@ impl super::Shard {
                         crate::shard::disk_monitor::poll_global();
                     }
                 }
+                // P4: Autovacuum daemon tick (default 30s interval).
+                _ = autovacuum_interval.0.tick() => {
+                    autovacuum_daemon.run_tick(
+                        &mut *shard_databases.vector_store(shard_id),
+                        #[cfg(feature = "graph")]
+                        &mut *shard_databases.graph_store_write(shard_id),
+                        shard_manifest.as_mut(),
+                        wal_v3_writer.as_mut(),
+                        server_config.max_wal_size_bytes(),
+                        server_config.manifest_tombstone_retain_epochs,
+                        server_config.manifest_tombstone_retain_secs,
+                        server_config.max_unflushed_immutable_segments as usize,
+                        false,
+                    );
+                }
                 _ = shutdown.cancelled() => {
                     info!("Shard {} shutting down", self.id);
                     persistence_tick::drain_and_shutdown_spill(
@@ -1793,6 +1816,23 @@ impl super::Shard {
                 // MA12: Disk free-space poll (every 5000 ticks = 5s, shard 0 only).
                 if shard_id == 0 && monoio_tick_counter % 5000 == 0 {
                     crate::shard::disk_monitor::poll_global();
+                }
+                // P4: Autovacuum daemon tick (every autovacuum_interval_secs * 1000 ticks).
+                if monoio_tick_counter % (autovacuum_interval_secs * 1000) == 0
+                    && monoio_tick_counter > 0
+                {
+                    autovacuum_daemon.run_tick(
+                        &mut *shard_databases.vector_store(shard_id),
+                        #[cfg(feature = "graph")]
+                        &mut *shard_databases.graph_store_write(shard_id),
+                        shard_manifest.as_mut(),
+                        wal_v3_writer.as_mut(),
+                        server_config.max_wal_size_bytes(),
+                        server_config.manifest_tombstone_retain_epochs,
+                        server_config.manifest_tombstone_retain_secs,
+                        server_config.max_unflushed_immutable_segments as usize,
+                        false,
+                    );
                 }
             }
         }

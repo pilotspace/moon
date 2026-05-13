@@ -47,7 +47,10 @@ fn test_budget_shrinks_under_high_p95() {
         initial_budget,
         daemon.current_budget_ms()
     );
-    assert!(stats.throttled_this_tick, "throttled_this_tick must be true when budget shrinks");
+    assert!(
+        stats.throttled_this_tick,
+        "throttled_this_tick must be true when budget shrinks"
+    );
 }
 
 #[test]
@@ -83,7 +86,10 @@ fn test_budget_grows_under_low_p95() {
         initial_budget,
         daemon.current_budget_ms()
     );
-    assert!(!stats.throttled_this_tick, "not throttled when budget grows");
+    assert!(
+        !stats.throttled_this_tick,
+        "not throttled when budget grows"
+    );
 }
 
 #[test]
@@ -143,10 +149,7 @@ fn test_disabled_autovacuum_is_noop() {
     let ts_before = RECL_AUTOVACUUM_LAST_RUN_TS.load(Ordering::Relaxed);
     let stats = daemon.tick_budget_only();
 
-    assert!(
-        !stats.did_run,
-        "disabled daemon must not run any passes"
-    );
+    assert!(!stats.did_run, "disabled daemon must not run any passes");
     // LAST_RUN_TS should NOT advance when disabled.
     let ts_after = RECL_AUTOVACUUM_LAST_RUN_TS.load(Ordering::Relaxed);
     assert_eq!(
@@ -178,7 +181,10 @@ fn test_autovacuum_tick_updates_last_run_ts() {
     // which runs scheduling + RECL update but zero-cost passes.
     let stats = daemon.tick_no_passes();
 
-    assert!(stats.did_run, "enabled daemon with overdue interval must run");
+    assert!(
+        stats.did_run,
+        "enabled daemon with overdue interval must run"
+    );
 
     let ts_after = RECL_AUTOVACUUM_LAST_RUN_TS.load(Ordering::Relaxed);
     assert!(

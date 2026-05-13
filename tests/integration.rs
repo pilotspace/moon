@@ -91,6 +91,11 @@ async fn start_server() -> (u16, CancellationToken) {
         mvcc_committed_prune_margin: 1000,
         max_unflushed_immutable_segments: 20,
         mvcc_old_snapshot_threshold_secs: 600,
+        autovacuum: "enable".to_string(),
+        autovacuum_budget_ms_min: 5,
+        autovacuum_budget_ms_max: 200,
+        autovacuum_target_p95_ms: 10,
+        autovacuum_interval_secs: 30,
     };
 
     tokio::spawn(async move {
@@ -179,6 +184,11 @@ async fn start_server_with_pass(password: &str) -> (u16, CancellationToken) {
         mvcc_committed_prune_margin: 1000,
         max_unflushed_immutable_segments: 20,
         mvcc_old_snapshot_threshold_secs: 600,
+        autovacuum: "enable".to_string(),
+        autovacuum_budget_ms_min: 5,
+        autovacuum_budget_ms_max: 200,
+        autovacuum_target_p95_ms: 10,
+        autovacuum_interval_secs: 30,
     };
 
     tokio::spawn(async move {
@@ -1339,6 +1349,11 @@ async fn start_server_with_persistence(
         mvcc_committed_prune_margin: 1000,
         max_unflushed_immutable_segments: 20,
         mvcc_old_snapshot_threshold_secs: 600,
+        autovacuum: "enable".to_string(),
+        autovacuum_budget_ms_min: 5,
+        autovacuum_budget_ms_max: 200,
+        autovacuum_target_p95_ms: 10,
+        autovacuum_interval_secs: 30,
     };
 
     tokio::spawn(async move {
@@ -2211,6 +2226,11 @@ async fn start_server_with_maxmemory(maxmemory: usize, policy: &str) -> (u16, Ca
         mvcc_committed_prune_margin: 1000,
         max_unflushed_immutable_segments: 20,
         mvcc_old_snapshot_threshold_secs: 600,
+        autovacuum: "enable".to_string(),
+        autovacuum_budget_ms_min: 5,
+        autovacuum_budget_ms_max: 200,
+        autovacuum_target_p95_ms: 10,
+        autovacuum_interval_secs: 30,
     };
 
     tokio::spawn(async move {
@@ -2610,6 +2630,11 @@ async fn start_sharded_server(num_shards: usize) -> (u16, CancellationToken) {
         mvcc_committed_prune_margin: 1000,
         max_unflushed_immutable_segments: 20,
         mvcc_old_snapshot_threshold_secs: 600,
+        autovacuum: "enable".to_string(),
+        autovacuum_budget_ms_min: 5,
+        autovacuum_budget_ms_max: 200,
+        autovacuum_target_p95_ms: 10,
+        autovacuum_interval_secs: 30,
     };
 
     let cancel = token.clone();
@@ -3778,6 +3803,11 @@ async fn start_cluster_server() -> (u16, CancellationToken) {
         mvcc_committed_prune_margin: 1000,
         max_unflushed_immutable_segments: 20,
         mvcc_old_snapshot_threshold_secs: 600,
+        autovacuum: "enable".to_string(),
+        autovacuum_budget_ms_min: 5,
+        autovacuum_budget_ms_max: 200,
+        autovacuum_target_p95_ms: 10,
+        autovacuum_interval_secs: 30,
     };
 
     std::thread::spawn(move || {
@@ -4428,6 +4458,11 @@ async fn start_server_with_aclfile(acl_path: &str) -> (u16, CancellationToken) {
         mvcc_committed_prune_margin: 1000,
         max_unflushed_immutable_segments: 20,
         mvcc_old_snapshot_threshold_secs: 600,
+        autovacuum: "enable".to_string(),
+        autovacuum_budget_ms_min: 5,
+        autovacuum_budget_ms_max: 200,
+        autovacuum_target_p95_ms: 10,
+        autovacuum_interval_secs: 30,
     };
 
     tokio::spawn(async move {

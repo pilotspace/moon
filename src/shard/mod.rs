@@ -1,4 +1,6 @@
 pub mod affinity;
+/// P4: per-shard autovacuum daemon with cost-based throttle.
+pub mod autovacuum;
 pub mod conn_accept;
 pub mod coordinator;
 pub mod disk_monitor;

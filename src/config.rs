@@ -362,6 +362,59 @@ pub struct ServerConfig {
     /// Default 600 (10 minutes). Covers most operational scan/backup windows.
     #[arg(long = "mvcc-old-snapshot-threshold-secs", default_value_t = 600)]
     pub mvcc_old_snapshot_threshold_secs: u64,
+
+    // ── P4: Autovacuum daemon ──────────────────────────────────────────────
+    /// Enable or disable the per-shard autovacuum daemon.
+    ///
+    /// When enabled, the daemon runs background reclamation passes (manifest
+    /// tombstone GC, WAL recycle, vector compact) on a configurable interval.
+    /// Use `disable` only for debugging or when manual VACUUM is preferred.
+    ///
+    /// Valid values: `enable` (default) | `disable`.
+    #[arg(long = "autovacuum", default_value = "enable")]
+    pub autovacuum: String,
+
+    /// Minimum autovacuum time budget per tick in milliseconds.
+    ///
+    /// The Postgres-style AIMD throttle will never shrink the budget below
+    /// this floor, even under sustained high-latency load. Setting too low
+    /// means background work may lag indefinitely under load.
+    ///
+    /// Default: 5 ms.
+    #[arg(long = "autovacuum-budget-ms-min", default_value_t = 5)]
+    pub autovacuum_budget_ms_min: u64,
+
+    /// Maximum autovacuum time budget per tick in milliseconds.
+    ///
+    /// The AIMD throttle will never grow the budget above this ceiling.
+    /// Increasing this allows more aggressive background work when the server
+    /// is idle, at the cost of occasional latency spikes on idle→busy transitions.
+    ///
+    /// Default: 200 ms.
+    #[arg(long = "autovacuum-budget-ms-max", default_value_t = 200)]
+    pub autovacuum_budget_ms_max: u64,
+
+    /// Target P95 request latency in milliseconds for the autovacuum throttle.
+    ///
+    /// When observed P95 exceeds this target, the autovacuum daemon shrinks its
+    /// time budget by 25 % (Postgres `vacuum_cost_delay` analogy). When P95
+    /// drops below `target/2`, the budget grows by 25 %.
+    ///
+    /// Set to 0 to disable adaptive throttling (budget stays at initial value).
+    ///
+    /// Default: 10 ms.
+    #[arg(long = "autovacuum-target-p95-ms", default_value_t = 10)]
+    pub autovacuum_target_p95_ms: u64,
+
+    /// Interval between autovacuum ticks in seconds.
+    ///
+    /// Each enabled shard runs one tick per interval. The tick examines all
+    /// reclamation passes and runs those whose conditions are met, within
+    /// the current time budget.
+    ///
+    /// Default: 30 s. Reduce to 1 s for testing.
+    #[arg(long = "autovacuum-interval-secs", default_value_t = 30)]
+    pub autovacuum_interval_secs: u64,
 }
 
 impl ServerConfig {

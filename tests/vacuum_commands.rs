@@ -94,6 +94,11 @@ fn base_config(port: u16) -> ServerConfig {
         mvcc_committed_prune_margin: 1000,
         max_unflushed_immutable_segments: 20,
         mvcc_old_snapshot_threshold_secs: 0,
+        autovacuum: "enable".to_string(),
+        autovacuum_budget_ms_min: 5,
+        autovacuum_budget_ms_max: 200,
+        autovacuum_target_p95_ms: 10,
+        autovacuum_interval_secs: 30,
     }
 }
 
