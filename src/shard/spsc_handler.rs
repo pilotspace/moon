@@ -288,6 +288,21 @@ pub(crate) fn handle_shard_message_shared(
                     return;
                 }
 
+                // VACUUM VECTOR <idx> — P2 segment merge. Intercept before main dispatch
+                // because it needs mutable VectorStore access (not available in cmd_dispatch).
+                if cmd.eq_ignore_ascii_case(b"VACUUM") {
+                    if let Some(crate::protocol::Frame::BulkString(sub)) = args.first() {
+                        if sub.eq_ignore_ascii_case(b"VECTOR") {
+                            let idx_args = &args[1..];
+                            let frame =
+                                crate::command::server_admin::vacuum_vector(vector_store, idx_args);
+                            let _ = reply_tx.send(frame);
+                            return;
+                        }
+                    }
+                    // Fall through for VACUUM without VECTOR subcommand (future).
+                }
+
                 // GRAPH.* commands route to GraphStore.
                 #[cfg(feature = "graph")]
                 if cmd.len() > 6 && cmd[..6].eq_ignore_ascii_case(b"GRAPH.") {

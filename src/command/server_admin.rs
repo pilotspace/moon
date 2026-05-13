@@ -1632,3 +1632,68 @@ mod tests {
         }
     }
 }
+
+// ── VACUUM VECTOR <idx> (P2) ──────────────────────────────────────────────────
+
+/// `VACUUM VECTOR <idx>` — merge immutable segments for a named vector index.
+///
+/// Forces a graph-union merge of all immutable segments in the named index.
+/// Returns a human-readable summary with segment counts and live vector counts.
+///
+/// Return format:
+///   "+Merged N segments into 1 (live_vectors=M)"  — merge ran
+///   "+OK no merge needed (segments=N)"             — below trigger threshold
+///   "+OK merge skipped (mode=none)"                — MERGE_MODE is NONE
+///   error if index not found or merge fails
+///
+/// Wire this from the dispatch path that has access to `VectorStore`.
+pub fn vacuum_vector(
+    vector_store: &mut crate::vector::store::VectorStore,
+    args: &[Frame],
+) -> Frame {
+    // Args: [index_name]
+    let name = match args.first() {
+        Some(Frame::BulkString(b)) => b.clone(),
+        _ => return Frame::Error(Bytes::from_static(b"ERR usage: VACUUM VECTOR <index_name>")),
+    };
+
+    // Check the index exists.
+    if vector_store.get_index(name.as_ref()).is_none() {
+        return Frame::Error(Bytes::from_static(b"ERR unknown vector index"));
+    }
+
+    // Check if merge mode is NONE.
+    if let Some(idx) = vector_store.get_index(name.as_ref()) {
+        if idx.meta.merge_mode == crate::vector::segment::compaction::MergeMode::None {
+            return Frame::SimpleString(Bytes::from_static(b"OK merge skipped (mode=none)"));
+        }
+    }
+
+    // Check if merge is needed.
+    let needs = vector_store.needs_merge(name.as_ref()).unwrap_or(false);
+    let seg_count = vector_store
+        .immutable_segment_count(name.as_ref())
+        .unwrap_or(0);
+
+    if !needs && seg_count < 2 {
+        let msg = format!("OK no merge needed (segments={seg_count})");
+        return Frame::SimpleString(Bytes::from(msg));
+    }
+
+    // Run merge.
+    match vector_store.force_merge_index(name.as_ref()) {
+        Ok(stats) => {
+            if stats.segments_merged == 0 {
+                let msg = format!("OK no merge needed (segments={seg_count})");
+                Frame::SimpleString(Bytes::from(msg))
+            } else {
+                let msg = format!(
+                    "Merged {} segments into 1 (live_vectors={})",
+                    stats.segments_merged, stats.live_vectors
+                );
+                Frame::SimpleString(Bytes::from(msg))
+            }
+        }
+        Err(_) => Frame::Error(Bytes::from_static(b"ERR merge failed (check logs)")),
+    }
+}

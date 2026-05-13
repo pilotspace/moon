@@ -115,6 +115,9 @@ pub fn ft_create(
     let mut first_hnsw_ef_construction: u32 = 200;
     let mut first_hnsw_ef_runtime: u32 = 0;
     let mut first_compact_threshold: u32 = 0;
+    // Merge mode and keep_raw for immutable segment consolidation (P2).
+    let mut first_merge_mode = crate::vector::segment::compaction::MergeMode::GraphUnion;
+    let mut first_keep_raw: bool = false;
 
     // Loop: parse one or more field definitions until args exhausted
     while pos < args.len() {
@@ -312,6 +315,8 @@ pub fn ft_create(
                     first_hnsw_ef_construction = parsed.hnsw_ef_construction;
                     first_hnsw_ef_runtime = parsed.hnsw_ef_runtime;
                     first_compact_threshold = parsed.compact_threshold;
+                    first_merge_mode = parsed.merge_mode;
+                    first_keep_raw = parsed.keep_raw;
                 }
 
                 vector_fields.push(VectorFieldMeta {
@@ -433,6 +438,8 @@ pub fn ft_create(
         build_mode: default_field.build_mode,
         vector_fields,
         schema_fields,
+        merge_mode: first_merge_mode,
+        keep_raw: first_keep_raw,
     };
 
     let index_name_clone = meta.name.clone();
@@ -496,6 +503,10 @@ struct ParsedVectorField {
     compact_threshold: u32,
     quantization: QuantizationConfig,
     build_mode: crate::vector::turbo_quant::collection::BuildMode,
+    /// Merge mode for immutable segment consolidation (P2).
+    merge_mode: crate::vector::segment::compaction::MergeMode,
+    /// Retain raw f32 vectors for lossless re-quantization on merge (P2).
+    keep_raw: bool,
 }
 
 /// Parse VECTOR field params: HNSW num_params [TYPE FLOAT32] [DIM n] [DISTANCE_METRIC ...]
@@ -524,6 +535,8 @@ fn parse_vector_field_params(args: &[Frame], pos: &mut usize) -> Result<ParsedVe
     let mut compact_threshold: u32 = 0;
     let mut quantization = QuantizationConfig::TurboQuant4;
     let mut build_mode = crate::vector::turbo_quant::collection::BuildMode::Light;
+    let mut merge_mode = crate::vector::segment::compaction::MergeMode::GraphUnion;
+    let mut keep_raw = false;
 
     let param_end = *pos + num_params;
     while *pos + 1 < param_end && *pos + 1 < args.len() {
@@ -662,6 +675,35 @@ fn parse_vector_field_params(args: &[Frame], pos: &mut usize) -> Result<ParsedVe
                 )));
             };
             *pos += 1;
+        } else if key.eq_ignore_ascii_case(b"MERGE_MODE") {
+            let val = match extract_bulk(&args[*pos]) {
+                Some(v) => v,
+                None => {
+                    return Err(Frame::Error(Bytes::from_static(
+                        b"ERR invalid MERGE_MODE value",
+                    )));
+                }
+            };
+            merge_mode = match crate::vector::segment::compaction::MergeMode::from_bytes(&val) {
+                Some(m) => m,
+                None => {
+                    return Err(Frame::Error(Bytes::from_static(
+                        b"ERR MERGE_MODE must be GRAPH_UNION, KEEP_RAW, or NONE",
+                    )));
+                }
+            };
+            *pos += 1;
+        } else if key.eq_ignore_ascii_case(b"KEEP_RAW") {
+            let val = match extract_bulk(&args[*pos]) {
+                Some(v) => v,
+                None => {
+                    return Err(Frame::Error(Bytes::from_static(
+                        b"ERR invalid KEEP_RAW value",
+                    )));
+                }
+            };
+            keep_raw = val.eq_ignore_ascii_case(b"ON") || val.eq_ignore_ascii_case(b"TRUE");
+            *pos += 1;
         } else {
             *pos += 1; // skip unknown param value
         }
@@ -676,5 +718,7 @@ fn parse_vector_field_params(args: &[Frame], pos: &mut usize) -> Result<ParsedVe
         compact_threshold,
         quantization,
         build_mode,
+        merge_mode,
+        keep_raw,
     })
 }

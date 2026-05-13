@@ -57,6 +57,8 @@ fn make_index_meta(name: &str, dim: u32) -> IndexMeta {
         build_mode: BuildMode::Light,
         vector_fields: Vec::new(),
         schema_fields: Vec::new(),
+        merge_mode: moon::vector::segment::compaction::MergeMode::GraphUnion,
+        keep_raw: false,
     }
 }
 

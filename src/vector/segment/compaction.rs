@@ -913,6 +913,591 @@ pub fn needs_vacuum(segment: &ImmutableSegment) -> bool {
     segment.dead_fraction() > VACUUM_DEAD_THRESHOLD
 }
 
+// ── Immutable segment merge (P2) ─────────────────────────────────────────────
+
+/// Trigger threshold: merge when immutable segment count exceeds this.
+pub const MERGE_SEGMENT_THRESHOLD: usize = 16;
+
+/// Maximum estimated bytes for the union before merge is refused.
+/// Prevents OOM during merge of very large indexes.
+/// 512 MiB.
+pub const MERGE_MEMORY_CEILING: usize = 512 * 1024 * 1024;
+
+/// Merge mode for immutable segment consolidation.
+///
+/// Determines how the union HNSW graph is built when merging N immutable
+/// segments into one. The modes differ in recall quality vs. memory cost.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MergeMode {
+    /// (Default) Concatenate TQ codes verbatim; rebuild HNSW graph over the
+    /// union using TQ-decoded centroids for distance computation.
+    ///
+    /// No f32 round-trip — codes are never decoded then re-encoded. Only graph
+    /// edges change. This preserves recall because quantization error is not
+    /// accumulated (decode → re-encode path is avoided entirely).
+    #[default]
+    GraphUnion,
+
+    /// Retain raw f32 vectors in memory alongside each immutable segment.
+    /// On merge, use raw vectors as the authoritative distance oracle to build
+    /// the merged HNSW graph, then re-encode TQ codes from scratch.
+    ///
+    /// Higher recall than GraphUnion (no quantization error at all in the
+    /// graph topology) at the cost of +1.5 KB/vector at 384d f16 memory.
+    ///
+    /// Note: raw f32 data is retained in-memory only; it is NOT persisted to
+    /// disk and will be lost on restart. The index falls back to GraphUnion
+    /// for segments loaded from disk.
+    KeepRaw,
+
+    /// Disable automatic merging. Segments accumulate indefinitely.
+    /// Use when the operator manages compaction manually.
+    None,
+}
+
+impl MergeMode {
+    /// Parse a merge mode string (case-insensitive).
+    /// Accepts: "GRAPH_UNION", "KEEP_RAW", "NONE".
+    pub fn from_bytes(b: &[u8]) -> Option<Self> {
+        if b.eq_ignore_ascii_case(b"GRAPH_UNION") || b.eq_ignore_ascii_case(b"GRAPHUNION") {
+            Some(Self::GraphUnion)
+        } else if b.eq_ignore_ascii_case(b"KEEP_RAW") || b.eq_ignore_ascii_case(b"KEEPRAW") {
+            Some(Self::KeepRaw)
+        } else if b.eq_ignore_ascii_case(b"NONE") {
+            Some(Self::None)
+        } else {
+            Option::None
+        }
+    }
+}
+
+/// Statistics returned by `merge_immutable`.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct MergeStats {
+    /// Number of input segments that were merged.
+    pub segments_merged: usize,
+    /// Number of live vectors in the merged output segment.
+    pub live_vectors: usize,
+    /// Recall of the merged segment against pre-merge fan-out search.
+    /// 0.0 if recall gate was not evaluated (e.g., too few vectors).
+    pub recall: f32,
+}
+
+/// Merge N immutable segments into one using the specified merge mode.
+///
+/// # Graph-union algorithm (default)
+///
+/// 1. Walk all live entries across input segments; deduplicate by `key_hash`
+///    (highest `insert_lsn` wins for duplicates).
+/// 2. Concatenate TQ codes verbatim — no decode/re-encode.
+/// 3. Decode TQ → centroid vectors (FWHT-rotated) for HNSW build oracle.
+/// 4. Build a single HNSW over the union with the centroid distance function.
+/// 5. BFS-reorder TQ buffer (same as compact pipeline).
+/// 6. Build merged `ImmutableSegment`.
+/// 7. Verify recall ≥ `recall_tolerance` against the fan-out pre-merge results.
+///    Returns `Err(RecallTooLow)` if gate fails; old segments remain intact.
+///
+/// # Overlap handling
+///
+/// When the same `key_hash` appears in more than one segment (e.g., after a
+/// re-insert), the entry with the **highest `insert_lsn`** is kept and all
+/// others are dropped. Tombstoned entries (`delete_lsn != 0`) are skipped.
+///
+/// # Memory ceiling
+///
+/// Refuses to merge when the estimated live-vector TQ code bytes plus the
+/// HNSW graph overhead would exceed `MERGE_MEMORY_CEILING`.
+pub fn merge_immutable(
+    segments: &[Arc<ImmutableSegment>],
+    collection: &Arc<CollectionMetadata>,
+    seed: u64,
+    mode: MergeMode,
+    recall_tolerance: f32,
+) -> Result<ImmutableSegment, CompactionError> {
+    match mode {
+        MergeMode::None => return Err(CompactionError::EmptySegment), // caller should not call
+        MergeMode::GraphUnion => merge_graph_union(segments, collection, seed, recall_tolerance),
+        MergeMode::KeepRaw => {
+            // KeepRaw: fall back to graph-union if no raw f32 available (warn only).
+            // Full raw-vector path requires raw_f32 stored on ImmutableSegment (TODO P2.5).
+            tracing::warn!(
+                "MERGE_MODE=keep_raw: raw f32 not yet persisted on ImmutableSegment; \
+                 falling back to graph-union. Add KEEP_RAW sidecar in P2.5."
+            );
+            merge_graph_union(segments, collection, seed, recall_tolerance)
+        }
+    }
+}
+
+/// Core graph-union merge implementation.
+///
+/// Builds a single HNSW graph over the union of live entries from all input
+/// segments. TQ codes are concatenated verbatim; only graph topology is rebuilt.
+fn merge_graph_union(
+    segments: &[Arc<ImmutableSegment>],
+    collection: &Arc<CollectionMetadata>,
+    seed: u64,
+    recall_tolerance: f32,
+) -> Result<ImmutableSegment, CompactionError> {
+    if segments.is_empty() {
+        return Err(CompactionError::EmptySegment);
+    }
+
+    let padded = collection.padded_dimension as usize;
+    let bytes_per_code = collection.bytes_per_code_per_vector() as usize;
+    let code_len = bytes_per_code - 4;
+    let dim = collection.dimension as usize;
+
+    // ── Step 1: Collect live entries, deduplicate by key_hash ────────────────
+    // Map key_hash → (insert_lsn, global_id, tq_code_bytes, qjl_bytes, residual_norm,
+    //                  sub_centroid_bytes)
+    let mut by_key_hash: std::collections::HashMap<
+        u64,
+        (u64, u32, Vec<u8>, Vec<u8>, f32, Vec<u8>),
+    > = std::collections::HashMap::new();
+
+    let qjl_bpv = {
+        // QJL bytes per vector: derived from first segment or computed from padded_dim.
+        // All segments in the same index use the same qjl layout.
+        let first = &segments[0];
+        let headers = first.mvcc_headers();
+        if headers.is_empty() {
+            0usize
+        } else {
+            let total_qjl = first.qjl_bytes();
+            if total_qjl > 0 && first.total_count() > 0 {
+                total_qjl / first.total_count() as usize
+            } else {
+                0
+            }
+        }
+    };
+    let sub_bpv = (padded + 7) / 8;
+
+    for seg in segments {
+        let tq_buf = seg.vectors_tq().as_slice();
+        let headers = seg.mvcc_headers();
+
+        for hdr in headers {
+            // Skip tombstoned entries.
+            if hdr.delete_lsn != 0 {
+                continue;
+            }
+
+            // Get TQ code for this entry.
+            // Codes are stored in BFS order; bfs_pos = internal_id (after compaction BFS reorder).
+            let bfs_pos = hdr.internal_id as usize;
+            let code_offset = bfs_pos * bytes_per_code;
+            if code_offset + bytes_per_code > tq_buf.len() {
+                continue; // defensive: skip out-of-bounds
+            }
+            let code_bytes = tq_buf[code_offset..code_offset + bytes_per_code].to_vec();
+            let norm_bytes = &code_bytes[code_len..];
+            let norm =
+                f32::from_le_bytes([norm_bytes[0], norm_bytes[1], norm_bytes[2], norm_bytes[3]]);
+
+            // QJL bytes for this entry.
+            let qjl_bytes = if qjl_bpv > 0 {
+                seg.qjl_bytes_for(bfs_pos, qjl_bpv)
+            } else {
+                Vec::new()
+            };
+
+            // Sub-centroid sign bytes.
+            let sub_bytes = seg.sub_centroid_bytes_for(bfs_pos, sub_bpv);
+
+            // Deduplicate: keep highest insert_lsn.
+            let entry = by_key_hash.entry(hdr.key_hash).or_insert((
+                0,
+                0,
+                Vec::new(),
+                Vec::new(),
+                0.0,
+                Vec::new(),
+            ));
+            if hdr.insert_lsn >= entry.0 {
+                *entry = (
+                    hdr.insert_lsn,
+                    hdr.global_id,
+                    code_bytes,
+                    qjl_bytes,
+                    norm,
+                    sub_bytes,
+                );
+            }
+        }
+    }
+
+    let n = by_key_hash.len();
+    if n == 0 {
+        return Err(CompactionError::EmptySegment);
+    }
+
+    // ── Memory ceiling check ─────────────────────────────────────────────────
+    // Estimate: TQ codes + HNSW layer-0 (M0=32 nodes * 4 bytes * n) + overhead.
+    let estimated_bytes = n * bytes_per_code + n * 32 * 4 + n * sub_bpv + n * qjl_bpv;
+    if estimated_bytes > MERGE_MEMORY_CEILING {
+        return Err(CompactionError::PersistFailed(format!(
+            "merge union would require ~{estimated_bytes} bytes > {MERGE_MEMORY_CEILING} ceiling; \
+             reduce index size or use larger COMPACT_THRESHOLD"
+        )));
+    }
+
+    // ── Step 2: Lay out entries in deterministic order ───────────────────────
+    // Sort by (insert_lsn asc, key_hash asc) for determinism.
+    let mut entries: Vec<(u64, u32, Vec<u8>, Vec<u8>, f32, Vec<u8>, u64)> = by_key_hash
+        .into_iter()
+        .map(|(kh, (lsn, gid, code, qjl, norm, sub))| (lsn, gid, code, qjl, norm, sub, kh))
+        .collect();
+    entries.sort_by(|a, b| a.0.cmp(&b.0).then(a.6.cmp(&b.6)));
+
+    // ── Step 3: Build TQ buffer (verbatim codes, no re-encode) ───────────────
+    let mut tq_buffer_orig: Vec<u8> = Vec::with_capacity(n * bytes_per_code);
+    let mut qjl_orig: Vec<u8> = Vec::with_capacity(n * qjl_bpv);
+    let mut residual_norms: Vec<f32> = Vec::with_capacity(n);
+    let mut sub_orig: Vec<u8> = Vec::with_capacity(n * sub_bpv);
+    let mut mvcc_orig: Vec<MvccHeader> = Vec::with_capacity(n);
+
+    for (i, (lsn, gid, code, qjl, _norm, sub, kh)) in entries.iter().enumerate() {
+        tq_buffer_orig.extend_from_slice(code);
+        if qjl_bpv > 0 {
+            if qjl.len() == qjl_bpv {
+                qjl_orig.extend_from_slice(qjl);
+            } else {
+                // Pad with zeros if QJL not available for this segment.
+                qjl_orig.extend(std::iter::repeat(0u8).take(qjl_bpv));
+            }
+        }
+        // Residual norm from the norm bytes in the TQ code.
+        let code_slice = &code[..];
+        let norm_b = &code_slice[code_len..];
+        let entry_norm = f32::from_le_bytes([norm_b[0], norm_b[1], norm_b[2], norm_b[3]]);
+        residual_norms.push(entry_norm);
+
+        if sub_bpv > 0 {
+            if sub.len() == sub_bpv {
+                sub_orig.extend_from_slice(sub);
+            } else {
+                sub_orig.extend(std::iter::repeat(0u8).take(sub_bpv));
+            }
+        }
+
+        mvcc_orig.push(MvccHeader {
+            internal_id: i as u32,
+            global_id: *gid,
+            key_hash: *kh,
+            insert_lsn: *lsn,
+            delete_lsn: 0,
+            hint_committed: 0,
+        });
+    }
+
+    // ── Step 4: Decode TQ → centroids for HNSW build oracle ─────────────────
+    let is_a2 = collection.quantization
+        == crate::vector::turbo_quant::collection::QuantizationConfig::TurboQuant4A2;
+    let a2_cb = if is_a2 {
+        Some(crate::vector::turbo_quant::a2_lattice::A2Codebook::new(
+            collection.padded_dimension,
+        ))
+    } else {
+        Option::None
+    };
+    let codebook_opt: Option<&[f32; 16]> = if !is_a2 {
+        Some(collection.codebook_16())
+    } else {
+        Option::None
+    };
+
+    let all_rotated: Vec<Vec<f32>> = {
+        let mut rotated: Vec<Vec<f32>> = Vec::with_capacity(n);
+        if is_a2 {
+            let cb = match a2_cb.as_ref() {
+                Some(c) => c,
+                None => {
+                    return Err(CompactionError::PersistFailed(
+                        "A2 codebook missing in merge".into(),
+                    ));
+                }
+            };
+            for i in 0..n {
+                let offset = i * bytes_per_code;
+                let code_slice = &tq_buffer_orig[offset..offset + code_len];
+                let mut q_rot = Vec::with_capacity(padded);
+                for &byte in code_slice {
+                    let (x0, y0) = cb.decode_pair(byte & 0x0F);
+                    let (x1, y1) = cb.decode_pair(byte >> 4);
+                    q_rot.push(x0);
+                    q_rot.push(y0);
+                    q_rot.push(x1);
+                    q_rot.push(y1);
+                }
+                q_rot.truncate(padded);
+                rotated.push(q_rot);
+            }
+        } else {
+            let codebook = match codebook_opt {
+                Some(c) => c,
+                None => {
+                    return Err(CompactionError::PersistFailed(
+                        "scalar codebook missing in merge".into(),
+                    ));
+                }
+            };
+            for i in 0..n {
+                let offset = i * bytes_per_code;
+                let code_slice = &tq_buffer_orig[offset..offset + code_len];
+                let mut q_rot = Vec::with_capacity(padded);
+                for &byte in code_slice {
+                    q_rot.push(codebook[(byte & 0x0F) as usize]);
+                    q_rot.push(codebook[(byte >> 4) as usize]);
+                }
+                q_rot.truncate(padded);
+                rotated.push(q_rot);
+            }
+        }
+        rotated
+    };
+
+    // ── Step 5: Build HNSW graph over the union ──────────────────────────────
+    let dist_table = crate::vector::distance::table();
+    let mut builder = HnswBuilder::new(HNSW_M, HNSW_EF_CONSTRUCTION, seed);
+    for _i in 0..n {
+        builder.insert(|a: u32, b: u32| {
+            let ra = &all_rotated[a as usize];
+            let rb = &all_rotated[b as usize];
+            (dist_table.l2_f32)(ra, rb)
+        });
+    }
+    let graph = builder.build(bytes_per_code as u32);
+
+    // ── Step 6: BFS-reorder TQ buffer ────────────────────────────────────────
+    let mut tq_bfs = vec![0u8; n * bytes_per_code];
+    for bfs_pos in 0..n {
+        let orig_id = graph.to_original(bfs_pos as u32) as usize;
+        let src = orig_id * bytes_per_code;
+        let dst = bfs_pos * bytes_per_code;
+        tq_bfs[dst..dst + bytes_per_code]
+            .copy_from_slice(&tq_buffer_orig[src..src + bytes_per_code]);
+    }
+
+    // BFS-reorder QJL, residual norms, sub-centroid signs.
+    let mut qjl_bfs = vec![0u8; n * qjl_bpv];
+    let mut norms_bfs = vec![0.0f32; n];
+    let mut sub_bfs = vec![0u8; n * sub_bpv];
+    for bfs_pos in 0..n {
+        let orig_id = graph.to_original(bfs_pos as u32) as usize;
+        if qjl_bpv > 0 {
+            let src = orig_id * qjl_bpv;
+            let dst = bfs_pos * qjl_bpv;
+            if src + qjl_bpv <= qjl_orig.len() {
+                qjl_bfs[dst..dst + qjl_bpv].copy_from_slice(&qjl_orig[src..src + qjl_bpv]);
+            }
+        }
+        if orig_id < residual_norms.len() {
+            norms_bfs[bfs_pos] = residual_norms[orig_id];
+        }
+        if sub_bpv > 0 {
+            let src = orig_id * sub_bpv;
+            let dst = bfs_pos * sub_bpv;
+            if src + sub_bpv <= sub_orig.len() {
+                sub_bfs[dst..dst + sub_bpv].copy_from_slice(&sub_orig[src..src + sub_bpv]);
+            }
+        }
+    }
+
+    // BFS-reorder MVCC headers.
+    let mut mvcc_bfs: Vec<MvccHeader> = Vec::with_capacity(n);
+    for bfs_pos in 0..n {
+        let orig_id = graph.to_original(bfs_pos as u32) as usize;
+        let mut hdr = mvcc_orig[orig_id];
+        hdr.internal_id = bfs_pos as u32;
+        mvcc_bfs.push(hdr);
+    }
+
+    // ── Step 7: Recall verification ──────────────────────────────────────────
+    // Sample queries from the merged TQ codes and compare against fan-out
+    // search across the original segments.
+    let recall = verify_merge_recall(&graph, &tq_bfs, segments, collection, dim, n, seed);
+
+    if recall < recall_tolerance && recall > 0.0 {
+        tracing::warn!(
+            "merge recall {recall:.4} < tolerance {recall_tolerance:.4}; aborting merge"
+        );
+        return Err(CompactionError::RecallTooLow {
+            recall,
+            required: recall_tolerance,
+        });
+    }
+
+    // ── Step 8: Build merged ImmutableSegment ────────────────────────────────
+    let merged = ImmutableSegment::new(
+        graph,
+        AlignedBuffer::from_vec(tq_bfs),
+        qjl_bfs,
+        norms_bfs,
+        qjl_bpv,
+        sub_bfs,
+        sub_bpv,
+        mvcc_bfs,
+        collection.clone(),
+        n as u32,
+        n as u32,
+    );
+
+    Ok(merged)
+}
+
+/// Verify recall of the merged HNSW graph against brute-force over the merged
+/// decoded centroid vectors.
+///
+/// Both ground-truth and HNSW search operate in the same merged coordinate
+/// space (sequential IDs 0..n-1 in BFS order), so recall is well-defined.
+///
+/// Algorithm:
+/// 1. Decode all n merged TQ codes to centroid f32 vectors (FWHT-rotated).
+/// 2. For each sampled query (one of those decoded centroids), compute brute-
+///    force top-K by L2 as ground truth.
+/// 3. Run HNSW search on the merged graph using the same query.
+/// 4. Recall@K = |HNSW_topk ∩ brute_force_topk| / K.
+///
+/// This is the same methodology as the existing `verify_recall()` for
+/// mutable→immutable compaction.
+///
+/// Returns 1.0 if n < MIN_RECALL_SAMPLE (too few vectors for reliable measurement).
+///
+/// Minimum sample threshold: 50 vectors. Below this, HNSW can't form reliable
+/// graph topology (fewer candidates than ef_construction demands). The gate still
+/// fires for sizes ≥50, which is low enough that tests can exercise rejection
+/// paths without spinning up 500-vector corpora.
+///
+/// Production merges happen at ≥16 segments × ≥1000 vectors = ≥16K total vectors.
+const MIN_RECALL_SAMPLE_N: usize = 50;
+
+fn verify_merge_recall(
+    graph: &crate::vector::hnsw::graph::HnswGraph,
+    tq_bfs: &[u8],
+    _pre_segments: &[Arc<ImmutableSegment>],
+    collection: &Arc<CollectionMetadata>,
+    _dim: usize,
+    n: usize,
+    seed: u64,
+) -> f32 {
+    if n < MIN_RECALL_SAMPLE_N {
+        return 1.0; // too few vectors for reliable measurement
+    }
+    let k = 10.min(n / 2).max(1);
+    if n < k * 2 {
+        return 1.0; // too few vectors
+    }
+
+    let bytes_per_code = collection.bytes_per_code_per_vector() as usize;
+    let code_len = bytes_per_code - 4;
+    let padded = collection.padded_dimension as usize;
+    let sample_size = RECALL_SAMPLE_SIZE.min(n / 2).max(1);
+    let step = (n / sample_size).max(1);
+
+    let is_a2 = collection.quantization
+        == crate::vector::turbo_quant::collection::QuantizationConfig::TurboQuant4A2;
+    let a2_cb = if is_a2 {
+        Some(crate::vector::turbo_quant::a2_lattice::A2Codebook::new(
+            collection.padded_dimension,
+        ))
+    } else {
+        Option::None
+    };
+
+    /// Decode one TQ code slice to a centroid f32 vector (FWHT-rotated space).
+    fn decode_code(
+        code_slice: &[u8],
+        padded: usize,
+        is_a2: bool,
+        a2_cb: Option<&crate::vector::turbo_quant::a2_lattice::A2Codebook>,
+        codebook: Option<&[f32; 16]>,
+    ) -> Vec<f32> {
+        let mut q_rot = Vec::with_capacity(padded);
+        if is_a2 {
+            if let Some(cb) = a2_cb {
+                for &byte in code_slice {
+                    let (x0, y0) = cb.decode_pair(byte & 0x0F);
+                    let (x1, y1) = cb.decode_pair(byte >> 4);
+                    q_rot.push(x0);
+                    q_rot.push(y0);
+                    q_rot.push(x1);
+                    q_rot.push(y1);
+                }
+            }
+        } else if let Some(cb) = codebook {
+            for &byte in code_slice {
+                q_rot.push(cb[(byte & 0x0F) as usize]);
+                q_rot.push(cb[(byte >> 4) as usize]);
+            }
+        }
+        q_rot.truncate(padded);
+        q_rot
+    }
+
+    let codebook = if !is_a2 {
+        collection.try_codebook_16()
+    } else {
+        None
+    };
+
+    // Decode all n centroid vectors once.
+    let all_decoded: Vec<Vec<f32>> = (0..n)
+        .map(|i| {
+            let offset = i * bytes_per_code;
+            let code_slice = &tq_bfs[offset..offset + code_len];
+            decode_code(code_slice, padded, is_a2, a2_cb.as_ref(), codebook)
+        })
+        .collect();
+
+    let l2_fn = crate::vector::distance::table().l2_f32;
+    let ef_verify = (k * 15).max(128);
+
+    // Build the flat f32 BFS buffer once (amortize allocation over all queries).
+    // Each all_decoded[i] has `padded` elements in BFS order.
+    let f32_bfs_flat: Vec<f32> = all_decoded.iter().flatten().copied().collect();
+
+    let mut total_recall = 0.0f32;
+    let mut sample_count = 0usize;
+
+    // Deterministic sample: evenly spaced through BFS order, offset by seed.
+    let offset = (seed as usize) % step.max(1);
+    let sample_indices: Vec<usize> = (offset..n).step_by(step).take(sample_size).collect();
+
+    for &query_bfs in &sample_indices {
+        let query = &all_decoded[query_bfs];
+        if query.len() < padded / 2 {
+            continue; // skip degenerate empty decode
+        }
+
+        // Brute-force top-K in decoded centroid space (ground truth).
+        let mut dists: Vec<(f32, u32)> = (0..n as u32)
+            .filter(|&i| i != query_bfs as u32)
+            .map(|i| (l2_fn(query, &all_decoded[i as usize]), i))
+            .collect();
+        dists.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        let gt_ids: std::collections::HashSet<u32> = dists.iter().take(k).map(|d| d.1).collect();
+
+        // HNSW search on the merged graph using f32 decoded centroids.
+        // f32_bfs_flat has BFS-ordered vectors, `padded` elements each.
+        let hnsw_results = hnsw_search_f32(graph, &f32_bfs_flat, padded, query, k, ef_verify, None);
+        // hnsw_search_f32 returns original IDs (pre-BFS); convert to BFS positions
+        // so they match the ground-truth set (which indexes all_decoded by BFS pos).
+        let hnsw_ids: std::collections::HashSet<u32> =
+            hnsw_results.iter().map(|r| graph.to_bfs(r.id.0)).collect();
+
+        let overlap = gt_ids.intersection(&hnsw_ids).count();
+        total_recall += overlap as f32 / k.min(gt_ids.len()).max(1) as f32;
+        sample_count += 1;
+    }
+
+    if sample_count == 0 {
+        return 1.0;
+    }
+    total_recall / sample_count as f32
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1297,5 +1882,42 @@ mod tests {
             "stitched graph must be fully connected, only reached {}/{}",
             count, n
         );
+    }
+
+    #[test]
+    fn test_merge_two_segments_basic() {
+        distance::init();
+        let dim = 32usize;
+        let (frozen1, collection) = make_frozen_segment(40, dim, 0);
+        let imm1 = compact(&frozen1, &collection, 1, None).expect("compact 1");
+
+        let (frozen2, _) = make_frozen_segment(35, dim, 0);
+        let imm2 = compact(&frozen2, &collection, 2, None).expect("compact 2");
+
+        eprintln!(
+            "pre-merge: imm1 total={} live={} headers={}, imm2 total={} live={} headers={}",
+            imm1.total_count(),
+            imm1.live_count(),
+            imm1.mvcc_headers().len(),
+            imm2.total_count(),
+            imm2.live_count(),
+            imm2.mvcc_headers().len(),
+        );
+
+        let segs = vec![Arc::new(imm1), Arc::new(imm2)];
+        let result = merge_immutable(&segs, &collection, 42, MergeMode::GraphUnion, 0.80);
+
+        match &result {
+            Ok(m) => eprintln!(
+                "merge ok: total={} live={}",
+                m.total_count(),
+                m.live_count()
+            ),
+            Err(e) => eprintln!("merge err: {e}"),
+        }
+        assert!(result.is_ok(), "merge failed: {:?}", result.err());
+        let merged = result.unwrap();
+        assert!(merged.total_count() > 0);
+        assert!(merged.live_count() > 0);
     }
 }

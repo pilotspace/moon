@@ -559,6 +559,40 @@ impl ImmutableSegment {
             }
         }
     }
+
+    // ── Merge-support accessors (P2) ─────────────────────────────────────────
+
+    /// Total QJL bytes across all entries. 0 if QJL not encoded for this segment.
+    #[inline]
+    pub fn qjl_bytes(&self) -> usize {
+        self.qjl_signs.len()
+    }
+
+    /// QJL sign bytes for a specific BFS-ordered position.
+    /// Returns an empty Vec if QJL is not available or position is out of bounds.
+    pub fn qjl_bytes_for(&self, bfs_pos: usize, qjl_bpv: usize) -> Vec<u8> {
+        if qjl_bpv == 0 || self.qjl_signs.is_empty() {
+            return Vec::new();
+        }
+        let src = bfs_pos * qjl_bpv;
+        if src + qjl_bpv > self.qjl_signs.len() {
+            return Vec::new();
+        }
+        self.qjl_signs[src..src + qjl_bpv].to_vec()
+    }
+
+    /// Sub-centroid sign bytes for a specific BFS-ordered position.
+    /// Returns an empty Vec if not available or position is out of bounds.
+    pub fn sub_centroid_bytes_for(&self, bfs_pos: usize, sub_bpv: usize) -> Vec<u8> {
+        if sub_bpv == 0 || self.sub_centroid_signs.is_empty() {
+            return Vec::new();
+        }
+        let src = bfs_pos * sub_bpv;
+        if src + sub_bpv > self.sub_centroid_signs.len() {
+            return Vec::new();
+        }
+        self.sub_centroid_signs[src..src + sub_bpv].to_vec()
+    }
 }
 
 #[cfg(test)]

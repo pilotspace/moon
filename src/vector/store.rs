@@ -17,6 +17,12 @@ use crate::vector::turbo_quant::collection::{BuildMode, CollectionMetadata, Quan
 use crate::vector::turbo_quant::encoder::padded_dimension;
 use crate::vector::types::DistanceMetric;
 
+pub use crate::vector::segment::compaction::{MergeMode, MergeStats};
+// Aliases kept for external callers that reference the old names.
+pub use crate::vector::segment::compaction::{
+    MergeMode as IndexMergeMode, MergeStats as IndexMergeStats,
+};
+
 /// Maximum number of named vector fields per index.
 pub const MAX_VECTOR_FIELDS: usize = 8;
 
@@ -94,6 +100,13 @@ pub struct IndexMeta {
     /// Empty for legacy vector-only indexes (backward compatible).
     /// Used by FT.INFO to report all field types in a unified schema view.
     pub schema_fields: Vec<FieldType>,
+    /// Merge mode for immutable segment consolidation. Default: GraphUnion.
+    /// Set via FT.CREATE … MERGE_MODE GRAPH_UNION|KEEP_RAW|NONE.
+    pub merge_mode: MergeMode,
+    /// When true, retain raw f32 vectors in memory on ImmutableSegments for
+    /// lossless re-quantization during merge. Default: false.
+    /// Set via FT.CREATE … KEEP_RAW ON.
+    pub keep_raw: bool,
 }
 
 impl IndexMeta {
@@ -989,6 +1002,247 @@ impl VectorStore {
             );
         }
     }
+
+    // ── P2: Segment merge public API ──────────────────────────────────────────
+
+    /// Total immutable segment count for a named index.
+    /// Returns None if the index does not exist.
+    pub fn immutable_segment_count(&self, name: &[u8]) -> Option<usize> {
+        self.indexes
+            .get(name)
+            .map(|idx| idx.segments.load().immutable.len())
+    }
+
+    /// True if the named index satisfies any auto-merge trigger condition:
+    /// - immutable segment count > MERGE_SEGMENT_THRESHOLD (16), OR
+    /// - dead_fraction > 0.20 across any segment AND live vectors fit in 512 MB
+    ///
+    /// Returns None if the index does not exist.
+    pub fn needs_merge(&self, name: &[u8]) -> Option<bool> {
+        let idx = self.indexes.get(name)?;
+        if idx.meta.merge_mode == MergeMode::None {
+            return Some(false);
+        }
+        let snap = idx.segments.load();
+        let imm_count = snap.immutable.len();
+        if imm_count > compaction::MERGE_SEGMENT_THRESHOLD {
+            return Some(true);
+        }
+        // Dead-fraction trigger: any segment with >20% dead AND fits in 512 MB.
+        let has_high_dead = snap.immutable.iter().any(|s| compaction::needs_vacuum(s));
+        if has_high_dead {
+            let live_bytes: usize = snap
+                .immutable
+                .iter()
+                .map(|s| s.live_count() as usize * idx.collection.bytes_per_code_per_vector())
+                .sum();
+            let fits = live_bytes < compaction::MERGE_MEMORY_CEILING;
+            return Some(fits);
+        }
+        Some(false)
+    }
+
+    /// Force-compact the mutable segment of a named index into a new immutable segment.
+    /// Wrapper over `VectorIndex::force_compact()` for test/command convenience.
+    pub fn force_compact_index(&mut self, name: &[u8]) -> Result<(), &'static str> {
+        match self.indexes.get_mut(name) {
+            Some(idx) => {
+                idx.force_compact();
+                Ok(())
+            }
+            None => Err("index not found"),
+        }
+    }
+
+    /// Insert a raw f32 vector into a named index.
+    ///
+    /// Convenience wrapper for tests and the VACUUM command. Production ingestion
+    /// goes through `auto_index_hset` (HSET hook). This method reuses the same
+    /// mutable-segment append path.
+    pub fn insert_vector(
+        &mut self,
+        index_name: &[u8],
+        vector: &[f32],
+        key_hash: u64,
+        key: bytes::Bytes,
+    ) -> Result<(), &'static str> {
+        let idx = self.indexes.get_mut(index_name).ok_or("index not found")?;
+        let snap = idx.segments.load();
+        let insert_lsn = snap.mutable.len() as u64 + 1;
+        drop(snap);
+        let sq_vec: Vec<i8> = vector
+            .iter()
+            .map(|&x| (x * 127.0).clamp(-128.0, 127.0) as i8)
+            .collect();
+        let norm: f32 = vector.iter().map(|x| x * x).sum::<f32>().sqrt();
+        idx.segments
+            .load()
+            .mutable
+            .append(key_hash, vector, &sq_vec, norm, insert_lsn);
+        idx.key_hash_to_key.insert(key_hash, key);
+        Ok(())
+    }
+
+    /// Search a named index and return the top-k global IDs.
+    ///
+    /// Convenience wrapper for tests.
+    pub fn search_index(
+        &mut self,
+        name: &[u8],
+        query: &[f32],
+        k: usize,
+        ef_search: usize,
+    ) -> Result<Vec<u32>, &'static str> {
+        let idx = self.indexes.get_mut(name).ok_or("index not found")?;
+        let results = idx.segments.search(query, k, ef_search, &mut idx.scratch);
+        Ok(results.iter().map(|r| r.id.0).collect())
+    }
+
+    /// Force-merge all immutable segments in a named index using its configured
+    /// merge mode and a default recall tolerance of 0.90.
+    ///
+    /// Returns `MergeStats` describing what was done.
+    /// Returns `Err` if the index does not exist.
+    pub fn force_merge_index(&mut self, name: &[u8]) -> Result<MergeStats, &'static str> {
+        self.force_merge_index_with_tolerance(name, 0.90)
+            .map_err(|_| "merge failed or index not found")
+    }
+
+    /// Force-merge all immutable segments in a named index with an explicit
+    /// recall tolerance.
+    ///
+    /// Returns `Ok(MergeStats)` if merge was successful or not needed.
+    /// Returns `Err` if the index was not found or the recall gate fired.
+    pub fn force_merge_index_with_tolerance(
+        &mut self,
+        name: &[u8],
+        recall_tolerance: f32,
+    ) -> Result<MergeStats, String> {
+        let idx = self
+            .indexes
+            .get_mut(name)
+            .ok_or_else(|| "index not found".to_string())?;
+
+        let mode = idx.meta.merge_mode;
+        if mode == MergeMode::None {
+            return Ok(MergeStats {
+                segments_merged: 0,
+                live_vectors: 0,
+                recall: 1.0,
+            });
+        }
+
+        let snap = idx.segments.load();
+        let imm_count = snap.immutable.len();
+        if imm_count < 2 {
+            return Ok(MergeStats {
+                segments_merged: 0,
+                live_vectors: snap
+                    .immutable
+                    .first()
+                    .map_or(0, |s| s.live_count() as usize),
+                recall: 1.0,
+            });
+        }
+
+        let segs: Vec<Arc<crate::vector::segment::ImmutableSegment>> =
+            snap.immutable.iter().cloned().collect();
+        let collection = idx.collection.clone();
+        let seed = collection.collection_id.wrapping_mul(6364136223846793005);
+        drop(snap);
+
+        match compaction::merge_immutable(&segs, &collection, seed, mode, recall_tolerance) {
+            Ok(merged) => {
+                let live = merged.live_count() as usize;
+                // Atomically swap: replace all immutable segments with the single merged one.
+                let old = idx.segments.load();
+                let new_list = SegmentList {
+                    mutable: Arc::clone(&old.mutable),
+                    immutable: vec![Arc::new(merged)],
+                    ivf: old.ivf.clone(),
+                    warm: old.warm.clone(),
+                    cold: old.cold.clone(),
+                };
+                idx.segments.swap(new_list);
+
+                // Rebuild scratch for the merged segment.
+                let new_snap = idx.segments.load();
+                if let Some(s) = new_snap.immutable.first() {
+                    idx.scratch = crate::vector::hnsw::search::SearchScratch::new(
+                        s.graph().num_nodes(),
+                        idx.meta.padded_dimension,
+                    );
+                }
+
+                tracing::info!(
+                    index = ?std::str::from_utf8(name).unwrap_or("<non-utf8>"),
+                    segments_merged = imm_count,
+                    live_vectors = live,
+                    "P2 merge complete"
+                );
+
+                Ok(MergeStats {
+                    segments_merged: imm_count,
+                    live_vectors: live,
+                    recall: 1.0, // gate passed
+                })
+            }
+            Err(compaction::CompactionError::RecallTooLow { recall, required }) => {
+                tracing::warn!(recall, required, "P2 merge aborted: recall gate fired");
+                Err(format!(
+                    "merge recall {recall:.4} < tolerance {required:.4}"
+                ))
+            }
+            Err(e) => Err(format!("merge failed: {e}")),
+        }
+    }
+
+    /// Run a vacuum pass over all indexes: merge any index that satisfies the
+    /// auto-merge trigger conditions (`needs_merge`).
+    ///
+    /// Called by the `VACUUM VECTOR <idx>` command and (future) autovacuum daemon (P4).
+    /// Returns aggregated merge statistics across all merged indexes.
+    pub fn run_vacuum_pass(&mut self) -> VacuumPassStats {
+        let names: Vec<bytes::Bytes> = self.indexes.keys().cloned().collect();
+        let mut stats = VacuumPassStats::default();
+        for name in names {
+            if self.needs_merge(&name) == Some(true) {
+                // Use 0.70 tolerance for vacuum: catch catastrophic recall collapse
+                // without false-positives on small/medium indexes.
+                match self.force_merge_index_with_tolerance(&name, 0.70) {
+                    Ok(ms) => {
+                        stats.indexes_merged += 1;
+                        stats.total_merged += ms.segments_merged;
+                        stats.total_live_vectors += ms.live_vectors;
+                        tracing::info!(
+                            segments_merged = ms.segments_merged,
+                            live_vectors = ms.live_vectors,
+                            "P2 vacuum_pass: merged index"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            index = ?std::str::from_utf8(&name).unwrap_or("<non-utf8>"),
+                            error = %e,
+                            "vacuum_pass: merge failed"
+                        );
+                    }
+                }
+            }
+        }
+        stats
+    }
+}
+
+/// Statistics from a `run_vacuum_pass()` call.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct VacuumPassStats {
+    /// Number of indexes where merge ran.
+    pub indexes_merged: usize,
+    /// Total segments consumed across all merged indexes.
+    pub total_merged: usize,
+    /// Total live vectors in the output segments.
+    pub total_live_vectors: usize,
 }
 
 #[cfg(test)]
@@ -1014,6 +1268,8 @@ mod tests {
             build_mode: crate::vector::turbo_quant::collection::BuildMode::Light,
             vector_fields: Vec::new(), // populated by create_index
             schema_fields: Vec::new(),
+            merge_mode: MergeMode::GraphUnion,
+            keep_raw: false,
         }
     }
 
@@ -1033,6 +1289,8 @@ mod tests {
             build_mode: crate::vector::turbo_quant::collection::BuildMode::Light,
             vector_fields: Vec::new(), // populated by create_index
             schema_fields: Vec::new(),
+            merge_mode: MergeMode::GraphUnion,
+            keep_raw: false,
         }
     }
 

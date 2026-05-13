@@ -205,6 +205,8 @@ pub fn deserialize_index_metas(data: &[u8]) -> io::Result<Vec<IndexMeta>> {
             build_mode,
             vector_fields,
             schema_fields: Vec::new(),
+            merge_mode: crate::vector::segment::compaction::MergeMode::GraphUnion,
+            keep_raw: false,
         });
     }
 
@@ -405,6 +407,8 @@ mod tests {
                 build_mode: BuildMode::Light,
             }],
             schema_fields: Vec::new(),
+            merge_mode: crate::vector::segment::compaction::MergeMode::GraphUnion,
+            keep_raw: false,
         }
     }
 

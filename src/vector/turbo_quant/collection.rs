@@ -361,6 +361,25 @@ impl CollectionMetadata {
         }
     }
 
+    /// Bytes per TQ code including the 4-byte norm suffix.
+    /// = code_bytes_per_vector() + 4.
+    #[inline]
+    pub fn bytes_per_code_per_vector(&self) -> usize {
+        self.code_bytes_per_vector() + 4
+    }
+
+    /// Try to return the codebook as a `&[f32; 16]`, returning None for non-4-bit configs.
+    ///
+    /// Unlike `codebook_16()` (which panics/logs-and-fallbacks on wrong size), this
+    /// method is safe to call from code that may be running against any quantization config.
+    pub fn try_codebook_16(&self) -> Option<&[f32; 16]> {
+        if self.codebook.len() == 16 {
+            self.codebook.as_slice().try_into().ok()
+        } else {
+            None
+        }
+    }
+
     /// Verify metadata integrity. Returns Err if checksum mismatch.
     pub fn verify_checksum(&self) -> Result<(), CollectionMetadataError> {
         let computed = self.compute_checksum();
