@@ -1015,7 +1015,7 @@ pub fn merge_immutable(
     recall_tolerance: f32,
 ) -> Result<ImmutableSegment, CompactionError> {
     match mode {
-        MergeMode::None => return Err(CompactionError::EmptySegment), // caller should not call
+        MergeMode::None => Err(CompactionError::EmptySegment), // caller should not call
         MergeMode::GraphUnion => merge_graph_union(segments, collection, seed, recall_tolerance),
         MergeMode::KeepRaw => {
             // KeepRaw: fall back to graph-union if no raw f32 available (warn only).
@@ -1165,7 +1165,7 @@ fn merge_graph_union(
                 qjl_orig.extend_from_slice(qjl);
             } else {
                 // Pad with zeros if QJL not available for this segment.
-                qjl_orig.extend(std::iter::repeat(0u8).take(qjl_bpv));
+                qjl_orig.extend(std::iter::repeat_n(0u8, qjl_bpv));
             }
         }
         // Residual norm from the norm bytes in the TQ code.
@@ -1178,7 +1178,7 @@ fn merge_graph_union(
             if sub.len() == sub_bpv {
                 sub_orig.extend_from_slice(sub);
             } else {
-                sub_orig.extend(std::iter::repeat(0u8).take(sub_bpv));
+                sub_orig.extend(std::iter::repeat_n(0u8, sub_bpv));
             }
         }
 

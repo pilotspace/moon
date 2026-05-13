@@ -269,9 +269,7 @@ fn test_recall_gate_rejects_impossible_tolerance() {
             .insert_vector(b"idx3a", &v, key_hash, key)
             .expect("insert failed");
         if i == 99 {
-            store
-                .force_compact_index(b"idx3a")
-                .expect("compact mid");
+            store.force_compact_index(b"idx3a").expect("compact mid");
         }
     }
     store.force_compact_index(b"idx3a").expect("compact end");
@@ -327,9 +325,7 @@ fn test_recall_gate_passes_realistic_tolerance() {
             .insert_vector(b"idx3b", &v, key_hash, key)
             .expect("insert failed");
         if i == 99 {
-            store
-                .force_compact_index(b"idx3b")
-                .expect("compact mid");
+            store.force_compact_index(b"idx3b").expect("compact mid");
         }
     }
     store.force_compact_index(b"idx3b").expect("compact end");

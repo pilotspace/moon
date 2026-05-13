@@ -1145,8 +1145,7 @@ impl VectorStore {
             });
         }
 
-        let segs: Vec<Arc<crate::vector::segment::ImmutableSegment>> =
-            snap.immutable.iter().cloned().collect();
+        let segs: Vec<Arc<crate::vector::segment::ImmutableSegment>> = snap.immutable.to_vec();
         let collection = idx.collection.clone();
         let seed = collection.collection_id.wrapping_mul(6364136223846793005);
         drop(snap);
