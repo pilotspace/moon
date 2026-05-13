@@ -101,6 +101,7 @@ fn build_config(port: u16, num_shards: usize) -> ServerConfig {
         graph_merge_max_segments: 8,
         graph_dead_edge_trigger: 0.20,
         autovacuum_starvation_cap_secs: 300,
+        vec_warm_mmap_budget: "2gb".to_string(),
     }
 }
 

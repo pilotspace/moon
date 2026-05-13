@@ -247,6 +247,15 @@ pub struct ServerConfig {
     #[arg(long = "vec-codes-mlock", default_value = "enable")]
     pub vec_codes_mlock: String,
 
+    /// Maximum resident bytes allowed across all warm-tier vector segments on
+    /// this shard (e.g. "2gb", "512mb", "0"). When the total exceeds this
+    /// limit the budget enforcer drops LRU warm segments from memory; they
+    /// are reloaded from disk on next access. Set to "0" to disable.
+    ///
+    /// Default: "2gb". Tune down for cgroup-constrained containers.
+    #[arg(long = "vec-warm-mmap-budget", default_value = "2gb")]
+    pub vec_warm_mmap_budget: String,
+
     // ── Cold-tier / DiskANN config stubs (not yet consumed) ─────────
     /// Seconds after last access before a WARM segment is promoted to COLD.
     /// Not yet consumed — reserved for the WARM->COLD transition timer.
@@ -463,6 +472,15 @@ impl ServerConfig {
     /// Returns true when vector codes pages should be mlocked.
     pub fn vec_codes_mlock_enabled(&self) -> bool {
         self.vec_codes_mlock == "enable"
+    }
+
+    /// Returns the warm-segment mmap budget in bytes.
+    ///
+    /// Parses `--vec-warm-mmap-budget` using [`Self::parse_size`].
+    /// Returns `0` if the string is `"0"` or unparseable (disabling enforcement).
+    /// Default is 2 GiB.
+    pub fn vec_warm_mmap_budget_bytes(&self) -> u64 {
+        Self::parse_size(&self.vec_warm_mmap_budget).unwrap_or(2 * 1024 * 1024 * 1024)
     }
 
     /// Returns the effective disk offload directory, falling back to --dir.

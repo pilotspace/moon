@@ -967,6 +967,32 @@ impl VectorStore {
         }
     }
 
+    /// Enforce the warm-segment mmap budget across all indexes.
+    ///
+    /// For each `VectorIndex` (default field + named fields), loads the current
+    /// `SegmentList`, calls `budget.enforce_budget`, and atomically swaps the
+    /// (possibly trimmed) list back. Newly added warm segments (from recent warm
+    /// transitions) are registered into the budget before enforcement.
+    ///
+    /// Returns the total number of segments evicted across all indexes.
+    pub fn enforce_mmap_budget_all(
+        &self,
+        budget: &mut crate::vector::persistence::mmap_budget::MmapBudget,
+    ) -> u64 {
+        let mut total_evicted: u64 = 0;
+
+        for idx in self.indexes.values() {
+            // Default field
+            total_evicted += enforce_segment_holder_budget(&idx.segments, budget);
+            // Named fields (multi-vector indexes)
+            for fs in idx.field_segments.values() {
+                total_evicted += enforce_segment_holder_budget(&fs.segments, budget);
+            }
+        }
+
+        total_evicted
+    }
+
     /// Register cold DiskANN segments recovered from disk into the appropriate indexes.
     ///
     /// Called during shard restore after v3 recovery identifies cold-tier segments
@@ -1242,6 +1268,60 @@ pub struct VacuumPassStats {
     pub total_merged: usize,
     /// Total live vectors in the output segments.
     pub total_live_vectors: usize,
+}
+
+// ── Budget enforcement helper (module-level, not a method) ───────────────────
+
+/// Enforce the mmap budget for a single `SegmentHolder`.
+///
+/// 1. Loads the current `SegmentList` snapshot (lock-free).
+/// 2. Registers any warm segments not yet known to `budget`.
+/// 3. Calls `budget.enforce_budget` on a mutable clone of the list.
+/// 4. If any segments were evicted, atomically swaps the trimmed list back.
+///
+/// Returns the count of segments evicted.
+fn enforce_segment_holder_budget(
+    holder: &SegmentHolder,
+    budget: &mut crate::vector::persistence::mmap_budget::MmapBudget,
+) -> u64 {
+    let snapshot = holder.load();
+
+    // Register any warm segments that are not yet tracked.
+    // This handles segments added since the last enforcement tick.
+    for warm in &snapshot.warm {
+        let id = warm.segment_id();
+        // `register_segment` is idempotent: re-registration updates the byte count
+        // without double-counting (old bytes are subtracted first).
+        budget.register_segment(id, warm.resident_bytes() as u64);
+    }
+
+    // Build a mutable owned SegmentList for the enforcer to trim.
+    let mut list = SegmentList {
+        mutable: Arc::clone(&snapshot.mutable),
+        immutable: snapshot.immutable.clone(),
+        ivf: snapshot.ivf.clone(),
+        warm: snapshot.warm.clone(),
+        cold: snapshot.cold.clone(),
+    };
+
+    let stats = budget.enforce_budget(&mut list);
+
+    if stats.segments_evicted > 0 {
+        // Atomically swap in the trimmed list. In-flight queries that already
+        // loaded the old snapshot will finish normally (Arc keeps them alive).
+        holder.swap(list);
+        tracing::info!(
+            evicted = stats.segments_evicted,
+            freed = stats.bytes_freed,
+            remaining = stats.bytes_after,
+            "warm mmap budget: evicted {} segment(s), freed {} B, {} B remaining",
+            stats.segments_evicted,
+            stats.bytes_freed,
+            stats.bytes_after,
+        );
+    }
+
+    stats.segments_evicted
 }
 
 #[cfg(test)]

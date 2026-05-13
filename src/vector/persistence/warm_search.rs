@@ -293,6 +293,17 @@ impl WarmSearchSegment {
         self.created_at.elapsed().as_secs()
     }
 
+    /// Estimated resident bytes for this warm segment.
+    ///
+    /// Accounts for the owned `codes_data` buffer, the HNSW graph heap, and
+    /// the `global_ids` vec. This is the figure tracked by [`crate::vector::persistence::mmap_budget::MmapBudget`].
+    #[inline]
+    pub fn resident_bytes(&self) -> usize {
+        self.codes_data.len()
+            + self.graph.resident_bytes()
+            + self.global_ids.len() * std::mem::size_of::<u32>()
+    }
+
     /// Read-only access to the raw TQ codes (for PQ training during cold transition).
     #[inline]
     pub fn codes_data(&self) -> &[u8] {

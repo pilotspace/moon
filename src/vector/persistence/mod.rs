@@ -1,3 +1,4 @@
+pub mod mmap_budget;
 pub mod recovery;
 pub mod sealed_mmap;
 pub mod segment_io;

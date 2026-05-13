@@ -39,6 +39,60 @@ use std::path::Path;
 
 use memmap2::Mmap;
 
+// ── MADV_DONTNEED helper ──────────────────────────────────────────────────────
+
+/// Advise the kernel that pages in the sealed mmap region are no longer needed.
+///
+/// This is the low-level primitive for the warm-tier budget enforcer.
+/// Calling this releases physical pages backing the mapped region back to the
+/// OS page cache while keeping the virtual mapping alive. The kernel will
+/// page-fault the data back from the file on the next read, so no data is
+/// lost and the `&[u8]` slice remains valid.
+///
+/// # Platform semantics
+///
+/// - **Linux**: `MADV_DONTNEED` frees the pages immediately and zeroes them on
+///   re-fault (anonymous mappings) or re-reads from the file (file-backed
+///   mappings). File-backed sealed mmaps always re-read from disk — correct.
+/// - **macOS**: `MADV_FREE_REUSABLE` / `MADV_DONTNEED` are advisory only; the
+///   kernel may ignore them. Pages may not be freed. This is acceptable — the
+///   call is a best-effort hint and silent no-ops are safe.
+///
+/// # Safety
+///
+/// `MADV_DONTNEED` on a sealed read-only file-backed mapping is sound:
+/// - The file contents do not change after the rename (seal contract).
+/// - The kernel re-reads unchanged file bytes on the next page-fault.
+/// - No writes go through this mapping, so no dirty data is discarded.
+/// - `mmap` remains valid for the lifetime of the `Mmap` guard; the virtual
+///   range is still allocated and future reads succeed.
+///
+/// This function is `#[cfg(unix)]`; on non-Unix targets it is a no-op stub.
+#[cfg(unix)]
+pub fn advise_dontneed(mmap: &Mmap) {
+    // SAFETY: mmap is a valid, live read-only file-backed mapping produced by
+    // map_sealed / map_sealed_file. MADV_DONTNEED on a read-only file-backed
+    // region is sound: the kernel pages data back from the unchanged sealed
+    // file on the next access. No writes exist through this mapping, so no
+    // dirty data is discarded.
+    unsafe {
+        libc::madvise(
+            mmap.as_ptr() as *mut libc::c_void,
+            mmap.len(),
+            libc::MADV_DONTNEED,
+        );
+    }
+}
+
+/// No-op stub on non-Unix platforms (Windows, WASM).
+#[cfg(not(unix))]
+#[inline]
+pub fn advise_dontneed(_mmap: &Mmap) {}
+
+// Make libc available in this module for the unix cfg above.
+#[cfg(unix)]
+use libc;
+
 /// Open `path` read-only and return a read-only mmap of the full file.
 ///
 /// The returned [`Mmap`] is sound to read for as long as the file adheres to

@@ -5,6 +5,7 @@
 
 pub mod http_server;
 pub mod metrics_setup;
+pub mod recl_atomics;
 pub mod slowlog;
 
 #[cfg(feature = "console")]

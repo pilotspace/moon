@@ -583,6 +583,12 @@ impl super::Shard {
             std::rc::Rc::new(std::cell::Cell::new(1));
         let mut next_file_id: u64 = 1;
         let disk_offload_dir: Option<std::path::PathBuf> = disk_offload_base.clone();
+
+        // Per-shard warm-segment mmap budget enforcer.
+        // Owned exclusively by this event-loop task; no locking needed.
+        let mut warm_mmap_budget = crate::vector::persistence::mmap_budget::MmapBudget::new(
+            server_config.vec_warm_mmap_budget_bytes(),
+        );
         // Tokio path doesn't take these into the spawn signatures; suppress warnings.
         let (_, _, _) = (&spill_sender, &spill_file_id, &disk_offload_dir);
 
@@ -1292,6 +1298,14 @@ impl super::Shard {
                             );
                         }
                     }
+                    // Budget enforcement runs on every warm-check tick regardless of
+                    // disk-offload state: warm segments can accumulate from in-memory
+                    // compaction even without disk-offload enabled.
+                    persistence_tick::enforce_warm_mmap_budget(
+                        &*shard_databases.vector_store(shard_id),
+                        &mut warm_mmap_budget,
+                        shard_id,
+                    );
                 }
                 // Cold tier transition check (60s, disk-offload only)
                 _ = cold_check_interval.0.tick() => {
@@ -1847,6 +1861,12 @@ impl super::Shard {
                             );
                         }
                     }
+                    // Budget enforcement: runs on every warm-check tick.
+                    persistence_tick::enforce_warm_mmap_budget(
+                        &*shard_databases.vector_store(shard_id),
+                        &mut warm_mmap_budget,
+                        shard_id,
+                    );
                 }
                 // Cold tier check: every cold_poll_secs * 1000 ticks
                 if monoio_tick_counter % (cold_poll_secs as u64 * 1000) == 0 {

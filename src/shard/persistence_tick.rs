@@ -267,6 +267,37 @@ pub(crate) fn check_cold_transitions(
 }
 
 // ---------------------------------------------------------------------------
+// Warm-segment mmap budget enforcement
+// ---------------------------------------------------------------------------
+
+/// Enforce the warm-segment resident-bytes budget across all vector indexes.
+///
+/// Called from the event loop on the warm-check timer (same 10s cadence as
+/// `check_warm_transitions`). Registers any newly-added warm segments into
+/// `budget`, then evicts LRU segments until resident bytes fall below the
+/// configured limit.
+///
+/// The budget is per-shard and owned by the event loop; no locking is needed.
+/// Eviction drops the `WarmSearchSegment` Arc from `SegmentList.warm` — the
+/// on-disk .mpf files are preserved and the segment is reloaded transparently
+/// on the next search.
+pub(crate) fn enforce_warm_mmap_budget(
+    vector_store: &crate::vector::store::VectorStore,
+    budget: &mut crate::vector::persistence::mmap_budget::MmapBudget,
+    shard_id: usize,
+) {
+    let total_evicted = vector_store.enforce_mmap_budget_all(budget);
+    if total_evicted > 0 {
+        info!(
+            "Shard {}: mmap budget enforcer evicted {} warm segment(s) ({} B remaining)",
+            shard_id,
+            total_evicted,
+            budget.current_resident_bytes(),
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Async spill completion polling (background pwrite thread)
 // ---------------------------------------------------------------------------
 
