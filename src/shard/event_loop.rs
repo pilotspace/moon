@@ -642,6 +642,7 @@ impl super::Shard {
         #[cfg(feature = "runtime-tokio")]
         let mut cold_check_interval = TimerImpl::interval(Duration::from_secs(cold_poll_secs));
         // Cold-tier orphan sweeper: 5-minute default (P9). Disabled when interval is 0.
+        // Shared by both tokio (select! branch) and monoio (counter-based dispatch).
         let orphan_sweep_interval_secs = server_config.cold_orphan_sweep_interval_secs;
         #[cfg(feature = "runtime-tokio")]
         let mut orphan_sweep_interval = if orphan_sweep_interval_secs > 0 {
@@ -651,6 +652,11 @@ impl super::Shard {
         } else {
             None
         };
+        // monoio uses the raw seconds value for counter arithmetic below;
+        // the `#[cfg(runtime-tokio)]` interval above is unused on monoio so
+        // we suppress the variable warning via the shared binding above.
+        #[cfg(not(feature = "runtime-tokio"))]
+        let _ = orphan_sweep_interval_secs; // consumed in monoio counter block below
 
         // MA12: Disk free-space poll interval (5 seconds, shard 0 only).
         #[cfg(feature = "runtime-tokio")]
@@ -1938,6 +1944,22 @@ impl super::Shard {
                         server_config.graph_merge_max_segments,
                         server_config.graph_dead_edge_trigger,
                         false,
+                    );
+                }
+                // Cold-tier orphan sweep (P9): every orphan_sweep_interval_secs * 1000 ticks.
+                // Matches the tokio select! branch above. Disabled when interval is 0.
+                if orphan_sweep_interval_secs > 0
+                    && monoio_tick_counter % (orphan_sweep_interval_secs * 1000) == 0
+                    && server_config.disk_offload_enabled()
+                {
+                    let shard_dir = server_config
+                        .effective_disk_offload_dir()
+                        .join(format!("shard-{}", shard_id));
+                    timers::run_cold_orphan_sweep(
+                        &shard_databases,
+                        shard_id,
+                        &shard_dir,
+                        shard_manifest.as_mut(),
                     );
                 }
             }
