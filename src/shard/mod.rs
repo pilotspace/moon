@@ -1,6 +1,7 @@
 pub mod affinity;
 pub mod conn_accept;
 pub mod coordinator;
+pub mod disk_monitor;
 pub mod dispatch;
 pub mod event_loop;
 pub mod mesh;
@@ -15,6 +16,8 @@ pub mod shared_databases;
 pub mod spsc_handler;
 pub mod timers;
 pub mod uring_handler;
+
+pub use disk_monitor::DiskMonitor;
 
 #[cfg(feature = "text-index")]
 pub use scatter_aggregate::scatter_text_aggregate;
