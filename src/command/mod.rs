@@ -4,13 +4,13 @@ pub mod client;
 pub mod config;
 pub mod connection;
 pub mod functions;
-pub mod info_reclamation;
 pub mod geo;
 #[cfg(feature = "graph")]
 pub mod graph;
 pub mod hash;
 pub mod helpers;
 pub mod hll;
+pub mod info_reclamation;
 pub mod key;
 pub mod key_extra;
 pub mod list;

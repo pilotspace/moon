@@ -15,7 +15,8 @@
 //! `crate::vector::metrics`. The INFO path reads them; subsystem event loops
 //! write them. No lock required.
 
-use std::sync::atomic::{AtomicI64, AtomicU64};
+use std::fmt::Write as _;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 
 // ---------------------------------------------------------------------------
 // Public atomics — Wave-2 agents write these; INFO reads them.
@@ -143,15 +144,165 @@ pub static RECL_PLAN_CACHE_EVICTIONS_TOTAL: AtomicU64 = AtomicU64::new(0);
 pub static RECL_DELETE_PENDING_VISIBLE_LSN: AtomicI64 = AtomicI64::new(-1);
 
 // ---------------------------------------------------------------------------
-// Section writer — stub (RED state).
-// Tests will fail until the full implementation is added in the GREEN commit.
+// Section writer — zero-alloc, writes directly into caller's pre-sized buffer.
 // ---------------------------------------------------------------------------
 
 /// Append the `# Reclamation` INFO section to `buf`.
 ///
-/// Stub: writes only the section header. The GREEN commit fills all 29 fields.
+/// Reads all 29 fields from the module-level atomics above using `Relaxed`
+/// ordering — same pattern as `crate::vector::metrics`. No allocation beyond
+/// the caller's pre-sized `String`.
+///
+/// Sentinels for Wave-1:
+/// - Unknown counters emit `0`.
+/// - `delete_pending_visible_lsn` emits `-1` (no WAL or no pending deletes).
+/// - Ratios stored as integer milliunits to avoid `f64` formatting overhead.
 pub fn write_reclamation_section(buf: &mut String) {
     buf.push_str("# Reclamation\r\n");
+
+    // -- Disk --
+    let _ = write!(
+        buf,
+        "reclamation_disk_free_bytes:{}\r\n",
+        RECL_DISK_FREE_BYTES.load(Ordering::Relaxed)
+    );
+
+    // -- WAL --
+    let _ = write!(
+        buf,
+        "reclamation_wal_bytes:{}\r\n\
+         reclamation_wal_segments:{}\r\n",
+        RECL_WAL_BYTES.load(Ordering::Relaxed),
+        RECL_WAL_SEGMENTS.load(Ordering::Relaxed)
+    );
+
+    // -- Write stall --
+    let stall_active = RECL_WRITE_STALL_ACTIVE.load(Ordering::Relaxed);
+    // Threshold stored as tenths-of-percent (e.g. 950 → "95.0")
+    let threshold_x10 = RECL_WRITE_STALL_THRESHOLD_PCT_X10.load(Ordering::Relaxed);
+    let _ = write!(
+        buf,
+        "reclamation_write_stall_active:{}\r\n\
+         reclamation_write_stall_threshold_pct:{}.{}\r\n",
+        if stall_active != 0 { "true" } else { "false" },
+        threshold_x10 / 10,
+        threshold_x10 % 10,
+    );
+
+    // -- Compaction --
+    let _ = write!(
+        buf,
+        "reclamation_compaction_pending_bytes:{}\r\n\
+         reclamation_compaction_throughput_bps:{}\r\n",
+        RECL_COMPACTION_PENDING_BYTES.load(Ordering::Relaxed),
+        RECL_COMPACTION_THROUGHPUT_BPS.load(Ordering::Relaxed)
+    );
+
+    // -- Segment fanout / read amplification --
+    let _ = write!(
+        buf,
+        "reclamation_segment_fanout_p50:{}\r\n\
+         reclamation_segment_fanout_p99:{}\r\n\
+         reclamation_read_amp_p99:{}\r\n",
+        RECL_SEGMENT_FANOUT_P50.load(Ordering::Relaxed),
+        RECL_SEGMENT_FANOUT_P99.load(Ordering::Relaxed),
+        RECL_READ_AMP_P99.load(Ordering::Relaxed)
+    );
+
+    // -- Dead fraction: stored as integer millipercent (0–1000 = 0.000–1.000) --
+    let dead_x1000 = RECL_DEAD_FRACTION_MAX_X1000.load(Ordering::Relaxed);
+    let _ = write!(
+        buf,
+        "reclamation_dead_fraction_max:{}.{:03}\r\n",
+        dead_x1000 / 1000,
+        dead_x1000 % 1000,
+    );
+
+    // -- Vector segment tiers --
+    let _ = write!(
+        buf,
+        "reclamation_immutable_segments:{}\r\n\
+         reclamation_warm_segments:{}\r\n\
+         reclamation_cold_segments:{}\r\n",
+        RECL_IMMUTABLE_SEGMENTS.load(Ordering::Relaxed),
+        RECL_WARM_SEGMENTS.load(Ordering::Relaxed),
+        RECL_COLD_SEGMENTS.load(Ordering::Relaxed)
+    );
+
+    // -- Graph segments --
+    let _ = write!(
+        buf,
+        "reclamation_graph_segments:{}\r\n",
+        RECL_GRAPH_SEGMENTS.load(Ordering::Relaxed)
+    );
+
+    // -- Manifest --
+    let _ = write!(
+        buf,
+        "reclamation_manifest_active:{}\r\n\
+         reclamation_manifest_tombstones:{}\r\n",
+        RECL_MANIFEST_ACTIVE.load(Ordering::Relaxed),
+        RECL_MANIFEST_TOMBSTONES.load(Ordering::Relaxed)
+    );
+
+    // -- Mmap warm bytes --
+    let _ = write!(
+        buf,
+        "reclamation_mmap_warm_bytes:{}\r\n",
+        RECL_MMAP_WARM_BYTES.load(Ordering::Relaxed)
+    );
+
+    // -- MVCC --
+    let _ = write!(
+        buf,
+        "reclamation_mvcc_committed:{}\r\n\
+         reclamation_mvcc_active:{}\r\n\
+         reclamation_mvcc_oldest_snapshot_lag:{}\r\n\
+         reclamation_mvcc_oldest_snapshot_age_secs:{}\r\n\
+         reclamation_mvcc_zombies_swept_total:{}\r\n",
+        RECL_MVCC_COMMITTED.load(Ordering::Relaxed),
+        RECL_MVCC_ACTIVE.load(Ordering::Relaxed),
+        RECL_MVCC_OLDEST_SNAPSHOT_LAG.load(Ordering::Relaxed),
+        RECL_MVCC_OLDEST_SNAPSHOT_AGE_SECS.load(Ordering::Relaxed),
+        RECL_MVCC_ZOMBIES_SWEPT_TOTAL.load(Ordering::Relaxed)
+    );
+
+    // -- Autovacuum --
+    let _ = write!(
+        buf,
+        "reclamation_autovacuum_last_run_ts:{}\r\n\
+         reclamation_autovacuum_segments_compacted_total:{}\r\n\
+         reclamation_autovacuum_throttled_due_to_load:{}\r\n",
+        RECL_AUTOVACUUM_LAST_RUN_TS.load(Ordering::Relaxed),
+        RECL_AUTOVACUUM_SEGMENTS_COMPACTED_TOTAL.load(Ordering::Relaxed),
+        RECL_AUTOVACUUM_THROTTLED_DUE_TO_LOAD.load(Ordering::Relaxed)
+    );
+
+    // -- Graph plan cache: ratio stored as integer milliunits (0–1000) --
+    let hits = RECL_PLAN_CACHE_HITS.load(Ordering::Relaxed);
+    let misses = RECL_PLAN_CACHE_MISSES.load(Ordering::Relaxed);
+    let total = hits + misses;
+    let hit_ratio_x1000 = if total == 0 {
+        0u64
+    } else {
+        (hits * 1000) / total
+    };
+    let _ = write!(
+        buf,
+        "reclamation_plan_cache_hit_ratio:{}.{:03}\r\n\
+         reclamation_plan_cache_evictions_total:{}\r\n",
+        hit_ratio_x1000 / 1000,
+        hit_ratio_x1000 % 1000,
+        RECL_PLAN_CACHE_EVICTIONS_TOTAL.load(Ordering::Relaxed)
+    );
+
+    // -- Delete pending LSN (-1 = not yet wired) --
+    let _ = write!(
+        buf,
+        "reclamation_delete_pending_visible_lsn:{}\r\n",
+        RECL_DELETE_PENDING_VISIBLE_LSN.load(Ordering::Relaxed)
+    );
+
     buf.push_str("\r\n");
 }
 
@@ -162,7 +313,6 @@ pub fn write_reclamation_section(buf: &mut String) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::Ordering;
 
     /// All 29 required field keys must appear in the reclamation section output.
     ///
