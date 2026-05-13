@@ -61,6 +61,7 @@ pub(crate) fn drain_spsc_shared(
         crate::server::conn::affinity::MigratedConnectionState,
     )>,
     vector_store: &mut VectorStore,
+    pending_cdc_subscribes: &mut Vec<crate::shard::dispatch::CdcSubscribePayload>,
 ) {
     const MAX_DRAIN_PER_CYCLE: usize = 256;
     let mut drained = 0;
@@ -120,6 +121,15 @@ pub(crate) fn drain_spsc_shared(
                         }
                         ShardMessage::MigrateConnection(payload) => {
                             pending_migrations.push((payload.fd, payload.state));
+                        }
+                        ShardMessage::CdcSubscribe(payload) => {
+                            // C3b-2 — captured here and handed to event_loop,
+                            // which owns the CdcSubscriberRegistry. We don't
+                            // touch the registry through handle_shard_message
+                            // because the registry's WalTailReader needs the
+                            // shard's wal_dir, which the event loop already
+                            // has from wal_v3_writer.wal_dir().
+                            pending_cdc_subscribes.push(*payload);
                         }
                         _ => other_messages.push(msg),
                     }
@@ -1281,6 +1291,15 @@ pub(crate) fn handle_shard_message_shared(
         }
         ShardMessage::NewConnection(_) => {
             // NewConnection is handled via conn_rx, not SPSC
+        }
+        ShardMessage::CdcSubscribe(_) => {
+            // CdcSubscribe is collected by drain_spsc_shared into
+            // pending_cdc_subscribes, not dispatched through
+            // handle_shard_message_shared. Reaching here is a logic error.
+            tracing::warn!(
+                "Shard {}: CdcSubscribe reached handle_shard_message_shared unexpectedly",
+                shard_id
+            );
         }
     }
 }

@@ -102,6 +102,27 @@ impl CdcSubscriberRegistry {
         self.subscribers.push(sub);
     }
 
+    /// Drain `pending` and register each as a subscriber tailing `wal_dir`.
+    ///
+    /// If `wal_dir` is `None` (shard has no WAL v3 writer — e.g. running
+    /// without `--disk-offload`), the sender ends are dropped, which the
+    /// caller observes as a closed receiver. CDC is a v3-only feature in
+    /// v0.2; the closed channel is the well-defined error signal.
+    pub fn register_pending<I>(&mut self, pending: I, wal_dir: Option<&std::path::Path>)
+    where
+        I: IntoIterator<Item = crate::shard::dispatch::CdcSubscribePayload>,
+    {
+        if let Some(dir) = wal_dir {
+            for p in pending {
+                self.subscribers
+                    .push(CdcSubscriber::from_parts(p.tx, dir, p.from_lsn));
+            }
+        } else {
+            // Drop pending senders — receivers will observe disconnect.
+            for _ in pending {}
+        }
+    }
+
     /// Drain freshly-flushed WAL records and fan-out Debezium envelopes
     /// to every subscriber. Subscribers whose bounded channel is full or
     /// closed are removed (slow-consumer disconnect).
@@ -261,5 +282,50 @@ mod tests {
         let mut reg = CdcSubscriberRegistry::new(0);
         assert_eq!(reg.fanout_tick(0), 0);
         assert!(reg.is_empty());
+    }
+
+    /// C3b-2 — `register_pending` accepts an iterator of
+    /// `CdcSubscribePayload` items (the shape that arrives from the
+    /// SPSC drain) and turns them into subscribers tailing `wal_dir`.
+    /// Verifies the full plumbing path: a payload struct in →
+    /// envelopes out the receiver after one tick.
+    #[test]
+    fn test_register_pending_creates_working_subscriber() {
+        use crate::shard::dispatch::CdcSubscribePayload;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_dir = tmp.path().join("wal");
+        write_kv_records(&wal_dir, 3);
+
+        let (tx, rx) = flume::bounded::<Bytes>(8);
+        let payload = CdcSubscribePayload { tx, from_lsn: 1 };
+
+        let mut reg = CdcSubscriberRegistry::new(0);
+        reg.register_pending(std::iter::once(payload), Some(wal_dir.as_path()));
+        assert_eq!(reg.len(), 1);
+
+        let delivered = reg.fanout_tick(0);
+        assert_eq!(delivered, 3);
+        assert_eq!(rx.len(), 3);
+    }
+
+    /// C3b-2 — `register_pending(_, None)` drops sender ends (CDC is a
+    /// WAL v3 feature; without a writer the receiver gets a clean close).
+    #[test]
+    fn test_register_pending_drops_when_no_wal_dir() {
+        use crate::shard::dispatch::CdcSubscribePayload;
+
+        let (tx, rx) = flume::bounded::<Bytes>(1);
+        let payload = CdcSubscribePayload { tx, from_lsn: 1 };
+
+        let mut reg = CdcSubscriberRegistry::new(0);
+        reg.register_pending(std::iter::once(payload), None);
+
+        assert_eq!(reg.len(), 0);
+        // Sender was dropped — receiver sees Disconnected.
+        assert!(matches!(
+            rx.try_recv(),
+            Err(flume::TryRecvError::Disconnected)
+        ));
     }
 }

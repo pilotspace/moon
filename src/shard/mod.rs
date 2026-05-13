@@ -389,6 +389,7 @@ mod tests {
             &clock,
             &mut Vec::new(),
             &mut vs,
+            &mut Vec::new(),
         );
 
         // Subscriber now receives pre-serialized RESP bytes
@@ -444,6 +445,7 @@ mod tests {
             &clock,
             &mut Vec::new(),
             &mut vs,
+            &mut Vec::new(),
         );
     }
 
