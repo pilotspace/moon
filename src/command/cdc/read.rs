@@ -60,10 +60,7 @@ pub fn cdc_read(args: &[Frame]) -> Frame {
             }
             Ok(None) => break,
             Err(e) => {
-                return Frame::Error(Bytes::from(format!(
-                    "ERR CDC.READ tail error: {}",
-                    e
-                )));
+                return Frame::Error(Bytes::from(format!("ERR CDC.READ tail error: {}", e)));
             }
         }
     }
@@ -190,10 +187,7 @@ mod tests {
         let wal_dir = tmp.path().join("wal");
         write_test_wal(&wal_dir, 10);
 
-        let resp = cdc_read(&[
-            bulk(wal_dir.to_str().unwrap()),
-            bulk("6"),
-        ]);
+        let resp = cdc_read(&[bulk(wal_dir.to_str().unwrap()), bulk("6")]);
         match resp {
             Frame::Array(arr) => {
                 // next_lsn = 11, plus envelopes for LSN 6..=10 (five of them).
@@ -212,10 +206,7 @@ mod tests {
         let wal_dir = tmp.path().join("wal");
         std::fs::create_dir_all(&wal_dir).unwrap();
 
-        let resp = cdc_read(&[
-            bulk(wal_dir.to_str().unwrap()),
-            bulk("42"),
-        ]);
+        let resp = cdc_read(&[bulk(wal_dir.to_str().unwrap()), bulk("42")]);
         match resp {
             Frame::Array(arr) => {
                 assert_eq!(arr.len(), 1);
@@ -257,12 +248,7 @@ mod tests {
             _ => panic!("expected Error"),
         }
 
-        let bad_limit_kw = cdc_read(&[
-            bulk("/tmp"),
-            bulk("1"),
-            bulk("BOGUS"),
-            bulk("5"),
-        ]);
+        let bad_limit_kw = cdc_read(&[bulk("/tmp"), bulk("1"), bulk("BOGUS"), bulk("5")]);
         match bad_limit_kw {
             Frame::Error(b) => {
                 let s = std::str::from_utf8(&b).unwrap();

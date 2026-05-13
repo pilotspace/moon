@@ -176,14 +176,13 @@ fn classify_command(verb: Option<&[u8]>) -> CdcOp {
         // Deletes
         b"DEL" | b"UNLINK" | b"HDEL" | b"SREM" | b"ZREM" | b"LREM" | b"XDEL" => CdcOp::Delete,
         // Upserts (the common KV / collection mutations)
-        b"SET" | b"SETNX" | b"SETEX" | b"PSETEX" | b"MSET" | b"MSETNX" | b"APPEND"
-        | b"GETSET" | b"INCR" | b"INCRBY" | b"INCRBYFLOAT" | b"DECR" | b"DECRBY"
-        | b"HSET" | b"HMSET" | b"HSETNX" | b"HINCRBY" | b"HINCRBYFLOAT"
-        | b"LPUSH" | b"LPUSHX" | b"RPUSH" | b"RPUSHX" | b"LSET"
-        | b"SADD" | b"ZADD" | b"ZINCRBY"
-        | b"XADD"
-        | b"COPY" | b"RENAME" | b"RENAMENX"
-        | b"PEXPIRE" | b"EXPIRE" | b"EXPIREAT" | b"PEXPIREAT" | b"PERSIST" => CdcOp::Upsert,
+        b"SET" | b"SETNX" | b"SETEX" | b"PSETEX" | b"MSET" | b"MSETNX" | b"APPEND" | b"GETSET"
+        | b"INCR" | b"INCRBY" | b"INCRBYFLOAT" | b"DECR" | b"DECRBY" | b"HSET" | b"HMSET"
+        | b"HSETNX" | b"HINCRBY" | b"HINCRBYFLOAT" | b"LPUSH" | b"LPUSHX" | b"RPUSH"
+        | b"RPUSHX" | b"LSET" | b"SADD" | b"ZADD" | b"ZINCRBY" | b"XADD" | b"COPY" | b"RENAME"
+        | b"RENAMENX" | b"PEXPIRE" | b"EXPIRE" | b"EXPIREAT" | b"PEXPIREAT" | b"PERSIST" => {
+            CdcOp::Upsert
+        }
         _ => CdcOp::Other,
     }
 }
@@ -234,7 +233,9 @@ mod tests {
         let rec = mk_command(resp, 9);
         let event = decode_wal_record(&rec, 0);
         match event {
-            CdcEvent::KvCommand { op, command, key, .. } => {
+            CdcEvent::KvCommand {
+                op, command, key, ..
+            } => {
                 assert_eq!(op, CdcOp::Delete);
                 assert_eq!(command.as_deref(), Some(b"DEL" as &[u8]));
                 assert_eq!(key.as_deref(), Some(b"foo" as &[u8]));
@@ -251,7 +252,12 @@ mod tests {
         let rec = mk_command(resp, 1);
         let event = decode_wal_record(&rec, 0);
         match event {
-            CdcEvent::KvCommand { op, command, raw_resp, .. } => {
+            CdcEvent::KvCommand {
+                op,
+                command,
+                raw_resp,
+                ..
+            } => {
                 assert_eq!(op, CdcOp::Other);
                 assert_eq!(command.as_deref(), Some(b"PING" as &[u8]));
                 assert_eq!(raw_resp.as_ref(), resp);
@@ -304,7 +310,11 @@ mod tests {
         };
         let event = decode_wal_record(&rec, 2);
         match event {
-            CdcEvent::Checkpoint { redo_lsn, lsn, shard } => {
+            CdcEvent::Checkpoint {
+                redo_lsn,
+                lsn,
+                shard,
+            } => {
                 assert_eq!(redo_lsn, 123_456);
                 assert_eq!(lsn, 99);
                 assert_eq!(shard, 2);

@@ -190,8 +190,7 @@ pub fn replay_wal_v3_dir_until(
 
     let mut combined = WalV3ReplayResult::default();
     for seg_path in &segments {
-        let result =
-            replay_wal_v3_file_until(seg_path, redo_lsn, stop_at_lsn, on_command, on_fpi)?;
+        let result = replay_wal_v3_file_until(seg_path, redo_lsn, stop_at_lsn, on_command, on_fpi)?;
         combined.commands_replayed += result.commands_replayed;
         combined.fpi_applied += result.fpi_applied;
         if result.last_lsn > combined.last_lsn {
@@ -395,8 +394,9 @@ pub fn resolve_target_time_to_lsn(
             let ts: Option<i64> = match record.record_type {
                 WalRecordType::TemporalUpsert => decode_temporal_upsert(&record.payload)
                     .map(|(_, _, system_from, _)| system_from),
-                WalRecordType::GraphTemporal => decode_graph_temporal(&record.payload)
-                    .map(|(_, _, _, system_from)| system_from),
+                WalRecordType::GraphTemporal => {
+                    decode_graph_temporal(&record.payload).map(|(_, _, _, system_from)| system_from)
+                }
                 _ => None,
             };
             if let Some(t) = ts {
@@ -748,14 +748,9 @@ mod tests {
         std::fs::write(wal_dir.join("000000000002.wal"), &data2).unwrap();
 
         let mut cmd_count = 0usize;
-        let result = replay_wal_v3_dir_until(
-            &wal_dir,
-            0,
-            Some(5),
-            &mut |_| cmd_count += 1,
-            &mut |_| {},
-        )
-        .unwrap();
+        let result =
+            replay_wal_v3_dir_until(&wal_dir, 0, Some(5), &mut |_| cmd_count += 1, &mut |_| {})
+                .unwrap();
         assert_eq!(
             result.commands_replayed, 5,
             "should apply LSN 1..=5 across both segments"
@@ -777,8 +772,7 @@ mod tests {
         std::fs::write(&seg_path, &data).unwrap();
 
         let classic = replay_wal_v3_file(&seg_path, 0, &mut |_| {}, &mut |_| {}).unwrap();
-        let same =
-            replay_wal_v3_file_until(&seg_path, 0, None, &mut |_| {}, &mut |_| {}).unwrap();
+        let same = replay_wal_v3_file_until(&seg_path, 0, None, &mut |_| {}, &mut |_| {}).unwrap();
         assert_eq!(classic.commands_replayed, same.commands_replayed);
         assert_eq!(classic.last_lsn, same.last_lsn);
         assert_eq!(classic.fpi_applied, same.fpi_applied);

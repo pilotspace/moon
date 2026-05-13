@@ -964,6 +964,7 @@ impl super::Shard {
                     persistence_tick::handle_pending_snapshot(
                         pending_snapshot, &mut snapshot_state, &mut snapshot_reply_tx,
                         &shard_databases, disk_offload_base.as_deref(), shard_id,
+                        wal_v3_writer.as_ref().map(|w| w.current_lsn().saturating_sub(1)).unwrap_or(0),
                     );
                     for (fd, state) in pending_migrations.drain(..) {
                         tracing::info!(
@@ -1017,6 +1018,7 @@ impl super::Shard {
                     persistence_tick::handle_pending_snapshot(
                         pending_snapshot, &mut snapshot_state, &mut snapshot_reply_tx,
                         &shard_databases, disk_offload_base.as_deref(), shard_id,
+                        wal_v3_writer.as_ref().map(|w| w.current_lsn().saturating_sub(1)).unwrap_or(0),
                     );
                     for (fd, state) in pending_migrations.drain(..) {
                         tracing::info!(
@@ -1057,6 +1059,7 @@ impl super::Shard {
                         &snapshot_trigger_rx, &mut last_snapshot_epoch,
                         &mut snapshot_state, &shard_databases, &persistence_dir,
                         disk_offload_base.as_deref(), shard_id,
+                        wal_v3_writer.as_ref().map(|w| w.current_lsn().saturating_sub(1)).unwrap_or(0),
                     );
 
                     // Advance snapshot one segment per tick (cooperative)
@@ -1426,6 +1429,10 @@ impl super::Shard {
                     &shard_databases,
                     disk_offload_base.as_deref(),
                     shard_id,
+                    wal_v3_writer
+                        .as_ref()
+                        .map(|w| w.current_lsn().saturating_sub(1))
+                        .unwrap_or(0),
                 );
                 for (fd, state) in pending_migrations.drain(..) {
                     tracing::info!(
@@ -1477,6 +1484,10 @@ impl super::Shard {
                     &persistence_dir,
                     disk_offload_base.as_deref(),
                     shard_id,
+                    wal_v3_writer
+                        .as_ref()
+                        .map(|w| w.current_lsn().saturating_sub(1))
+                        .unwrap_or(0),
                 );
 
                 if persistence_tick::advance_snapshot_segment(

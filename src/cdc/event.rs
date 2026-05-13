@@ -79,11 +79,7 @@ pub enum CdcEvent {
 
     /// Checkpoint marker. Useful to consumers that want to know when WAL
     /// recycling occurred. Payload carries the new `redo_lsn`.
-    Checkpoint {
-        redo_lsn: u64,
-        lsn: u64,
-        shard: u16,
-    },
+    Checkpoint { redo_lsn: u64, lsn: u64, shard: u16 },
 
     /// Catch-all for record types CDC doesn't expand yet (vector ops,
     /// file lifecycle events, workspace ops, etc.). Consumers can still

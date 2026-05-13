@@ -711,10 +711,7 @@ pub fn shard_snapshot_load(databases: &mut [Database], path: &Path) -> Result<us
                 path: path.to_path_buf(),
                 source: e,
             })?;
-        (
-            u64::from_le_bytes(lsn_buf),
-            u64::from_le_bytes(ts_buf),
-        )
+        (u64::from_le_bytes(lsn_buf), u64::from_le_bytes(ts_buf))
     } else {
         (0u64, 0u64)
     };

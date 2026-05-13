@@ -243,9 +243,9 @@ fn read_at(path: &Path, offset: u64, buf: &mut [u8]) -> std::io::Result<usize> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::record::{WalRecordType, write_wal_v3_record};
     use super::super::segment::{DEFAULT_SEGMENT_SIZE, WalWriterV3};
+    use super::*;
 
     /// C1 — happy path: write 10 records, tail must yield all 10 in LSN order.
     #[test]
@@ -254,8 +254,7 @@ mod tests {
         let wal_dir = tmp.path().join("wal");
 
         {
-            let mut writer =
-                WalWriterV3::new(0, &wal_dir, DEFAULT_SEGMENT_SIZE).unwrap();
+            let mut writer = WalWriterV3::new(0, &wal_dir, DEFAULT_SEGMENT_SIZE).unwrap();
             for _ in 0..10 {
                 writer.append(WalRecordType::Command, b"SET k v");
             }
@@ -318,8 +317,7 @@ mod tests {
         let wal_dir = tmp.path().join("wal");
 
         {
-            let mut writer =
-                WalWriterV3::new(0, &wal_dir, DEFAULT_SEGMENT_SIZE).unwrap();
+            let mut writer = WalWriterV3::new(0, &wal_dir, DEFAULT_SEGMENT_SIZE).unwrap();
             for _ in 0..20 {
                 writer.append(WalRecordType::Command, b"SET k v");
             }

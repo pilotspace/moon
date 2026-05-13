@@ -1012,8 +1012,7 @@ mod tests {
         for (i, entry) in m.files().iter().enumerate() {
             assert_eq!(entry.created_lsn, 100 + i as u64);
             assert_eq!(
-                entry.last_modified_lsn,
-                entry.created_lsn,
+                entry.last_modified_lsn, entry.created_lsn,
                 "v1 entry must synthesize last_modified_lsn = created_lsn",
             );
         }

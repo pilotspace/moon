@@ -103,6 +103,8 @@ async fn start_txn_server(num_shards: usize) -> (u16, CancellationToken) {
         console_cors_origin: vec![],
         console_rate_limit: 1000.0,
         console_rate_burst: 2000.0,
+        recovery_target_lsn: None,
+        recovery_target_time: None,
     };
 
     let cancel = token.clone();

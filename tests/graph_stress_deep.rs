@@ -74,6 +74,8 @@ async fn start_server() -> (u16, CancellationToken) {
         check_config: false,
         initial_keyspace_hint: 0,
         memory_arenas_cap: 8,
+        recovery_target_lsn: None,
+        recovery_target_time: None,
     };
 
     tokio::spawn(async move {

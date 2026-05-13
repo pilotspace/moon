@@ -531,13 +531,7 @@ pub fn recover_shard_v3_pitr(
                 "Shard {}: PITR replay with stop_at_lsn={}",
                 shard_id, target
             );
-            replay_wal_v3_dir_until(
-                &wal_dir,
-                redo_lsn,
-                Some(target),
-                on_command,
-                on_fpi,
-            )
+            replay_wal_v3_dir_until(&wal_dir, redo_lsn, Some(target), on_command, on_fpi)
         } else {
             replay_wal_v3_dir(&wal_dir, redo_lsn, on_command, on_fpi)
         };
@@ -786,8 +780,7 @@ mod tests {
         let mut databases = vec![Database::new()];
         let engine = crate::persistence::replay::DispatchReplayEngine::new();
         let result =
-            recover_shard_v3_pitr(&mut databases, 0, &shard_dir, &engine, None, Some(5))
-                .unwrap();
+            recover_shard_v3_pitr(&mut databases, 0, &shard_dir, &engine, None, Some(5)).unwrap();
 
         assert_eq!(
             result.commands_replayed, 5,
@@ -800,8 +793,7 @@ mod tests {
 
         // Control file must be written with the truncated last_lsn so a
         // subsequent restart (without target) doesn't re-apply records 6..10.
-        let ctl = ShardControlFile::read(&ShardControlFile::control_path(&shard_dir, 0))
-            .unwrap();
+        let ctl = ShardControlFile::read(&ShardControlFile::control_path(&shard_dir, 0)).unwrap();
         assert_eq!(ctl.wal_flush_lsn, 5);
     }
 
@@ -829,23 +821,15 @@ mod tests {
         let mut dbs_classic = vec![Database::new()];
         let engine = crate::persistence::replay::DispatchReplayEngine::new();
 
-        let pitr = recover_shard_v3_pitr(
-            &mut dbs_pitr,
-            0,
-            &shard_dir,
-            &engine,
-            None,
-            None,
-        )
-        .unwrap();
+        let pitr =
+            recover_shard_v3_pitr(&mut dbs_pitr, 0, &shard_dir, &engine, None, None).unwrap();
         // Use a fresh shard dir for the classic side so its control file
         // doesn't reflect the PITR side's state.
         let shard_dir2 = tmp.path().join("shard-0-classic");
         let wal_dir2 = shard_dir2.join("wal-v3");
         std::fs::create_dir_all(&wal_dir2).unwrap();
         std::fs::write(wal_dir2.join("000000000001.wal"), &data).unwrap();
-        let classic =
-            recover_shard_v3(&mut dbs_classic, 0, &shard_dir2, &engine).unwrap();
+        let classic = recover_shard_v3(&mut dbs_classic, 0, &shard_dir2, &engine).unwrap();
 
         assert_eq!(pitr.commands_replayed, classic.commands_replayed);
         assert_eq!(pitr.last_lsn, classic.last_lsn);

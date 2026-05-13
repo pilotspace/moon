@@ -241,8 +241,7 @@ fn write_json_string(out: &mut String, value: &[u8]) {
 /// inline rather than via a dependency — we encode short payloads and
 /// don't need SIMD.
 fn base64_encode(out: &mut String, input: &[u8]) {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut i = 0;
     while i + 3 <= input.len() {
         let b = ((input[i] as u32) << 16) | ((input[i + 1] as u32) << 8) | (input[i + 2] as u32);
@@ -293,16 +292,16 @@ mod tests {
             "\"op\":\"u\",",
             "\"ts_ms\":1700000000000,",
             "\"source\":{",
-                "\"version\":\"moon-0.2\",",
-                "\"shard\":0,",
-                "\"lsn\":42,",
-                "\"record_type\":\"kv\"",
+            "\"version\":\"moon-0.2\",",
+            "\"shard\":0,",
+            "\"lsn\":42,",
+            "\"record_type\":\"kv\"",
             "},",
             "\"before\":null,",
             "\"after\":{",
-                "\"command\":\"SET\",",
-                "\"key\":\"hello\",",
-                "\"raw_resp\":\"KjMNCiQzDQpTRVQNCiQ1DQpoZWxsbw0KJDUNCndvcmxkDQo=\"",
+            "\"command\":\"SET\",",
+            "\"key\":\"hello\",",
+            "\"raw_resp\":\"KjMNCiQzDQpTRVQNCiQ1DQpoZWxsbw0KJDUNCndvcmxkDQo=\"",
             "}",
             "}",
         );

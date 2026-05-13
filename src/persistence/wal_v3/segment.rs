@@ -777,7 +777,11 @@ mod tests {
                 writer.append(WalRecordType::Command, b"SET k v");
             }
             writer.flush_sync().unwrap();
-            assert_eq!(writer.current_lsn(), 51, "next LSN should be 51 after 50 appends");
+            assert_eq!(
+                writer.current_lsn(),
+                51,
+                "next LSN should be 51 after 50 appends"
+            );
         }
 
         // Second writer: open the same dir, the very next append must be LSN 51.
