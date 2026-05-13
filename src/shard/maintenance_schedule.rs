@@ -89,7 +89,12 @@ impl CronField {
 
 /// Parse one cron field from text. `field_name` is used in error messages.
 /// Allowed value range: `[min_val, max_val]` (inclusive).
-fn parse_field(text: &str, field_name: &'static str, min_val: u32, max_val: u32) -> Result<CronField, ParseError> {
+fn parse_field(
+    text: &str,
+    field_name: &'static str,
+    min_val: u32,
+    max_val: u32,
+) -> Result<CronField, ParseError> {
     let text = text.trim();
     if text == "*" {
         return Ok(CronField::Any);
@@ -104,23 +109,39 @@ fn parse_field(text: &str, field_name: &'static str, min_val: u32, max_val: u32)
             let lo_str = iter.next().unwrap_or("");
             let hi_str = iter.next().unwrap_or("");
             let lo = lo_str.parse::<u32>().map_err(|_| {
-                ParseError::InvalidField(format!("non-numeric value '{lo_str}' in field {field_name}"))
+                ParseError::InvalidField(format!(
+                    "non-numeric value '{lo_str}' in field {field_name}"
+                ))
             })?;
             let hi = hi_str.parse::<u32>().map_err(|_| {
-                ParseError::InvalidField(format!("non-numeric value '{hi_str}' in field {field_name}"))
+                ParseError::InvalidField(format!(
+                    "non-numeric value '{hi_str}' in field {field_name}"
+                ))
             })?;
             if lo < min_val || hi > max_val || lo > hi {
-                return Err(ParseError::OutOfRange { field: field_name, value: lo.max(hi), min: min_val, max: max_val });
+                return Err(ParseError::OutOfRange {
+                    field: field_name,
+                    value: lo.max(hi),
+                    min: min_val,
+                    max: max_val,
+                });
             }
             for v in lo..=hi {
                 values.push(v);
             }
         } else {
             let v = part.parse::<u32>().map_err(|_| {
-                ParseError::InvalidField(format!("non-numeric value '{part}' in field {field_name}"))
+                ParseError::InvalidField(format!(
+                    "non-numeric value '{part}' in field {field_name}"
+                ))
             })?;
             if v < min_val || v > max_val {
-                return Err(ParseError::OutOfRange { field: field_name, value: v, min: min_val, max: max_val });
+                return Err(ParseError::OutOfRange {
+                    field: field_name,
+                    value: v,
+                    min: min_val,
+                    max: max_val,
+                });
             }
             values.push(v);
         }
@@ -159,10 +180,10 @@ impl CronExpression {
         Ok(Self {
             raw: expr.to_string(),
             minute: parse_field(fields[0], "minute", 0, 59)?,
-            hour:   parse_field(fields[1], "hour",   0, 23)?,
-            dom:    parse_field(fields[2], "dom",    1, 31)?,
-            month:  parse_field(fields[3], "month",  1, 12)?,
-            dow:    parse_field(fields[4], "dow",    0, 7)?,
+            hour: parse_field(fields[1], "hour", 0, 23)?,
+            dom: parse_field(fields[2], "dom", 1, 31)?,
+            month: parse_field(fields[3], "month", 1, 12)?,
+            dow: parse_field(fields[4], "dow", 0, 7)?,
         })
     }
 
@@ -191,10 +212,10 @@ impl CronExpression {
 
 /// Decompose Unix epoch seconds to (year, month 1-12, day 1-31, hour, min, dow 0-6 Sun=0).
 fn epoch_to_utc(secs: u64) -> (u32, u32, u32, u32, u32, u32) {
-    let min  = (secs / 60) % 60;
+    let min = (secs / 60) % 60;
     let hour = (secs / 3600) % 24;
     // Day of week: 1970-01-01 was Thursday (4). 0=Sun.
-    let dow  = ((secs / 86400 + 4) % 7) as u32;
+    let dow = ((secs / 86400 + 4) % 7) as u32;
 
     let mut days = (secs / 86400) as i64;
     let mut year = 1970i32;
@@ -246,31 +267,11 @@ pub struct MaintenanceWindow {
     /// Raw cron expression string (stored for serialization).
     pub expression: String,
     /// Budget multiplier when this window is active.
-    /// > 1.0 → allow more background work (e.g. 2.0x at night).
-    /// < 1.0 → throttle background work (e.g. 0.1x during business hours).
+    /// Values above 1.0 allow more background work (e.g. 2.0x at night).
+    /// Values below 1.0 throttle background work (e.g. 0.1x during business hours).
     pub multiplier: f32,
     #[serde(skip)]
     parsed: Option<CronExpression>,
-}
-
-impl MaintenanceWindow {
-    fn ensure_parsed(&mut self) -> Result<(), ParseError> {
-        if self.parsed.is_none() {
-            self.parsed = Some(CronExpression::parse(&self.expression)?);
-        }
-        Ok(())
-    }
-
-    fn matches(&mut self, t: SystemTime) -> bool {
-        if self.parsed.is_none() {
-            if let Ok(expr) = CronExpression::parse(&self.expression) {
-                self.parsed = Some(expr);
-            } else {
-                return false;
-            }
-        }
-        self.parsed.as_ref().map_or(false, |e| e.matches(t))
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -314,7 +315,10 @@ pub struct MaintenanceSchedule {
 impl MaintenanceSchedule {
     /// Create an empty schedule (multiplier = 1.0 always).
     pub fn new() -> Self {
-        Self { windows: Vec::new(), dirty: false }
+        Self {
+            windows: Vec::new(),
+            dirty: false,
+        }
     }
 
     /// Returns true if the schedule has been modified since the last save.
@@ -387,10 +391,14 @@ impl MaintenanceSchedule {
     /// Persist the schedule to a TOML file.
     pub fn save_to_file(&self, path: &Path) -> std::io::Result<()> {
         let file = MaintenanceScheduleFile {
-            windows: self.windows.iter().map(|w| MaintenanceWindowRecord {
-                expression: w.expression.clone(),
-                multiplier: w.multiplier,
-            }).collect(),
+            windows: self
+                .windows
+                .iter()
+                .map(|w| MaintenanceWindowRecord {
+                    expression: w.expression.clone(),
+                    multiplier: w.multiplier,
+                })
+                .collect(),
         };
         let toml = toml_serialize(&file);
         std::fs::write(path, toml.as_bytes())
@@ -454,7 +462,10 @@ fn toml_deserialize(s: &str) -> Result<MaintenanceScheduleFile, String> {
         if line == "[[windows]]" {
             // Flush previous entry if complete.
             if let (Some(expr), Some(mult)) = (current_expr.take(), current_mult.take()) {
-                windows.push(MaintenanceWindowRecord { expression: expr, multiplier: mult });
+                windows.push(MaintenanceWindowRecord {
+                    expression: expr,
+                    multiplier: mult,
+                });
             }
             continue;
         }
@@ -464,13 +475,13 @@ fn toml_deserialize(s: &str) -> Result<MaintenanceScheduleFile, String> {
             match key {
                 "expression" => {
                     // Strip surrounding quotes.
-                    let unquoted = val
-                        .trim_matches('"')
-                        .to_string();
+                    let unquoted = val.trim_matches('"').to_string();
                     current_expr = Some(unquoted);
                 }
                 "multiplier" => {
-                    let m: f32 = val.parse().map_err(|e| format!("invalid multiplier '{val}': {e}"))?;
+                    let m: f32 = val
+                        .parse()
+                        .map_err(|e| format!("invalid multiplier '{val}': {e}"))?;
                     current_mult = Some(m);
                 }
                 _ => {}
@@ -479,7 +490,10 @@ fn toml_deserialize(s: &str) -> Result<MaintenanceScheduleFile, String> {
     }
     // Flush last entry.
     if let (Some(expr), Some(mult)) = (current_expr, current_mult) {
-        windows.push(MaintenanceWindowRecord { expression: expr, multiplier: mult });
+        windows.push(MaintenanceWindowRecord {
+            expression: expr,
+            multiplier: mult,
+        });
     }
 
     Ok(MaintenanceScheduleFile { windows })
@@ -545,6 +559,9 @@ mod tests {
         // 1970-01-01 02:00 UTC — wildcard (0.5) and hour-2 (2.0) both match.
         let t = UNIX_EPOCH + Duration::from_secs(2 * 3600);
         let mul = sched.current_budget_multiplier(t);
-        assert!((mul - 2.0).abs() < 1e-6, "highest multiplier must win, got {mul}");
+        assert!(
+            (mul - 2.0).abs() < 1e-6,
+            "highest multiplier must win, got {mul}"
+        );
     }
 }

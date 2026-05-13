@@ -265,9 +265,8 @@ impl AutovacuumDaemon {
         let schedule_multiplier = self
             .maintenance_schedule
             .current_budget_multiplier(std::time::SystemTime::now());
-        let effective_budget_ms =
-            ((self.budget_ms as f64 * schedule_multiplier as f64) as u64)
-                .clamp(self.cfg.budget_ms_min, self.cfg.budget_ms_max);
+        let effective_budget_ms = ((self.budget_ms as f64 * schedule_multiplier as f64) as u64)
+            .clamp(self.cfg.budget_ms_min, self.cfg.budget_ms_max);
 
         let mut stats = AutovacuumStats {
             did_run: true,
@@ -415,7 +414,12 @@ impl AutovacuumDaemon {
         {
             let pass_start = Instant::now();
             let mut graph_segs_reclaimed: u64 = 0;
-            for name in graph_store.list_graphs().into_iter().cloned().collect::<Vec<_>>() {
+            for name in graph_store
+                .list_graphs()
+                .into_iter()
+                .cloned()
+                .collect::<Vec<_>>()
+            {
                 let compact_stats = crate::graph::compaction::run_graph_vacuum_pass(
                     graph_store,
                     &name,
@@ -425,7 +429,8 @@ impl AutovacuumDaemon {
                 graph_segs_reclaimed += compact_stats.segments_reclaimed;
             }
             let pass_ms = pass_start.elapsed().as_millis() as u64;
-            cumulative_ms += pass_ms;
+            // Pass E is the last pass; cumulative_ms not checked after this.
+            let _ = cumulative_ms + pass_ms;
             if graph_segs_reclaimed > 0 {
                 stats.segments_compacted += graph_segs_reclaimed;
                 tracing::debug!(

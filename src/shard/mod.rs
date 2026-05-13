@@ -2,12 +2,12 @@ pub mod affinity;
 /// P4: per-shard autovacuum daemon with cost-based throttle.
 pub mod autovacuum;
 pub mod conn_accept;
-/// MA5: maintenance-window scheduler (cron-style budget multipliers).
-pub mod maintenance_schedule;
 pub mod coordinator;
 pub mod disk_monitor;
 pub mod dispatch;
 pub mod event_loop;
+/// MA5: maintenance-window scheduler (cron-style budget multipliers).
+pub mod maintenance_schedule;
 pub mod mesh;
 pub mod numa;
 pub mod persistence_tick;
@@ -400,9 +400,9 @@ mod tests {
             &mut vs,
             &mut Vec::new(),
             &mut None, // shard_manifest — None in tests (no persistence_dir)
-            1000, // mvcc_prune_margin default
-            8,    // graph_merge_max_segments default
-            0.20, // graph_dead_edge_trigger default
+            1000,      // mvcc_prune_margin default
+            8,         // graph_merge_max_segments default
+            0.20,      // graph_dead_edge_trigger default
             &mut crate::shard::autovacuum::AutovacuumDaemon::new(
                 crate::shard::autovacuum::AutovacuumConfig::default(),
             ),
@@ -463,9 +463,9 @@ mod tests {
             &mut vs,
             &mut Vec::new(),
             &mut None, // shard_manifest — None in tests (no persistence_dir)
-            1000, // mvcc_prune_margin default
-            8,    // graph_merge_max_segments default
-            0.20, // graph_dead_edge_trigger default
+            1000,      // mvcc_prune_margin default
+            8,         // graph_merge_max_segments default
+            0.20,      // graph_dead_edge_trigger default
             &mut crate::shard::autovacuum::AutovacuumDaemon::new(
                 crate::shard::autovacuum::AutovacuumConfig::default(),
             ),

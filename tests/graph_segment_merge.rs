@@ -14,9 +14,9 @@
 //!  4. `test_vacuum_graph_returns_reclaimed_count` — VACUUM GRAPH returns the count of
 //!     segments that were merged away.
 
+use bytes::Bytes;
 use moon::graph::compaction::run_graph_vacuum_pass;
 use moon::graph::store::GraphStore;
-use bytes::Bytes;
 use smallvec::smallvec;
 
 // Helper: create a NamedGraph with `n_segments` immutable CSR segments.
@@ -63,9 +63,7 @@ fn test_run_graph_vacuum_pass_merges_segments() {
 
     // Run the vacuum pass with threshold = 8 (10 > 8, should trigger).
     let stats = run_graph_vacuum_pass(
-        &mut store,
-        b"test",
-        8,  // max_segments threshold
+        &mut store, b"test", 8,    // max_segments threshold
         0.20, // dead_edge_trigger
     );
 

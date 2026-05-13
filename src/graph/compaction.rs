@@ -157,10 +157,12 @@ pub fn run_graph_vacuum_pass(
             let snap2 = graph2.segments.load();
             let mutable = snap2.mutable.clone();
             drop(snap2);
-            graph2.segments.swap(crate::graph::segment::GraphSegmentList {
-                mutable,
-                immutable: Vec::new(),
-            });
+            graph2
+                .segments
+                .swap(crate::graph::segment::GraphSegmentList {
+                    mutable,
+                    immutable: Vec::new(),
+                });
             GraphCompactStats {
                 segments_reclaimed: segs.len() as u64,
                 live_edges: 0,

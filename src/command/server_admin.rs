@@ -1791,7 +1791,10 @@ pub fn reclamation_schedule(
     schedule: &mut crate::shard::maintenance_schedule::MaintenanceSchedule,
     args: &[Frame],
 ) -> Frame {
-    let sub = match args.first().and_then(|f| crate::command::helpers::extract_bytes(f)) {
+    let sub = match args
+        .first()
+        .and_then(|f| crate::command::helpers::extract_bytes(f))
+    {
         Some(s) => s,
         None => {
             return Frame::Error(Bytes::from_static(
@@ -1835,7 +1838,11 @@ pub fn reclamation_schedule(
 
     let cron_str = match std::str::from_utf8(cron_bytes.as_ref()) {
         Ok(s) => s,
-        Err(_) => return Frame::Error(Bytes::from_static(b"ERR cron expression is not valid UTF-8")),
+        Err(_) => {
+            return Frame::Error(Bytes::from_static(
+                b"ERR cron expression is not valid UTF-8",
+            ));
+        }
     };
 
     let multiplier: f32 = match std::str::from_utf8(mult_bytes.as_ref())
@@ -1843,7 +1850,11 @@ pub fn reclamation_schedule(
         .and_then(|s| s.parse::<f32>().ok())
     {
         Some(v) if v.is_finite() && v >= 0.0 => v,
-        _ => return Frame::Error(Bytes::from_static(b"ERR multiplier must be a non-negative finite float")),
+        _ => {
+            return Frame::Error(Bytes::from_static(
+                b"ERR multiplier must be a non-negative finite float",
+            ));
+        }
     };
 
     match schedule.add(cron_str, multiplier) {

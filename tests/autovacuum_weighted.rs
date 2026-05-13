@@ -38,27 +38,59 @@ fn test_compaction_scheduler_hottest_runs_first() {
     // After each pop, re-insert with Instant::now() so the popped entity
     // has rate ≈ 0 and the remaining entities are compared correctly.
     let mut scheduler = CompactionScheduler::new(starvation_cap);
-    scheduler.upsert(CompactionEntity { id: "hot".to_string(),  bytes_dead: 10_000, last_compaction: base });
-    scheduler.upsert(CompactionEntity { id: "warm".to_string(), bytes_dead:  1_000, last_compaction: base });
-    scheduler.upsert(CompactionEntity { id: "cold".to_string(), bytes_dead:    100, last_compaction: base });
+    scheduler.upsert(CompactionEntity {
+        id: "hot".to_string(),
+        bytes_dead: 10_000,
+        last_compaction: base,
+    });
+    scheduler.upsert(CompactionEntity {
+        id: "warm".to_string(),
+        bytes_dead: 1_000,
+        last_compaction: base,
+    });
+    scheduler.upsert(CompactionEntity {
+        id: "cold".to_string(),
+        bytes_dead: 100,
+        last_compaction: base,
+    });
 
     // First pop must be "hot" (highest rate).
     let first = scheduler.pop_next();
-    assert_eq!(first.as_deref(), Some("hot"), "first pop must be hottest entity");
+    assert_eq!(
+        first.as_deref(),
+        Some("hot"),
+        "first pop must be hottest entity"
+    );
 
     // Mark hot as freshly compacted (rate drops to ≈ 0).
-    scheduler.upsert(CompactionEntity { id: "hot".to_string(), bytes_dead: 10_000, last_compaction: Instant::now() });
+    scheduler.upsert(CompactionEntity {
+        id: "hot".to_string(),
+        bytes_dead: 10_000,
+        last_compaction: Instant::now(),
+    });
 
     // Second pop must be "warm" (next highest).
     let second = scheduler.pop_next();
-    assert_eq!(second.as_deref(), Some("warm"), "second pop must be warm entity");
+    assert_eq!(
+        second.as_deref(),
+        Some("warm"),
+        "second pop must be warm entity"
+    );
 
     // Mark warm as freshly compacted.
-    scheduler.upsert(CompactionEntity { id: "warm".to_string(), bytes_dead: 1_000, last_compaction: Instant::now() });
+    scheduler.upsert(CompactionEntity {
+        id: "warm".to_string(),
+        bytes_dead: 1_000,
+        last_compaction: Instant::now(),
+    });
 
     // Third pop must be "cold".
     let third = scheduler.pop_next();
-    assert_eq!(third.as_deref(), Some("cold"), "third pop must be cold entity");
+    assert_eq!(
+        third.as_deref(),
+        Some("cold"),
+        "third pop must be cold entity"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -73,7 +105,9 @@ fn test_compaction_scheduler_starvation_cap() {
     let mut scheduler = CompactionScheduler::new(starvation_cap);
 
     // hot entity: massive dead_bytes_rate so it always wins on weight alone.
-    let base_hot = Instant::now().checked_sub(Duration::from_millis(1)).unwrap();
+    let base_hot = Instant::now()
+        .checked_sub(Duration::from_millis(1))
+        .unwrap();
     let base_cold = Instant::now()
         .checked_sub(Duration::from_millis(600))
         .unwrap(); // > starvation_cap
@@ -152,13 +186,9 @@ fn test_compaction_scheduler_weight_calculation() {
     let mut scheduler = CompactionScheduler::new(Duration::from_secs(300));
 
     // Entity A: 1000 bytes dead, compacted 2s ago → weight ≈ 500/s
-    let two_secs_ago = Instant::now()
-        .checked_sub(Duration::from_secs(2))
-        .unwrap();
+    let two_secs_ago = Instant::now().checked_sub(Duration::from_secs(2)).unwrap();
     // Entity B: 1000 bytes dead, compacted 1s ago → weight ≈ 1000/s
-    let one_sec_ago = Instant::now()
-        .checked_sub(Duration::from_secs(1))
-        .unwrap();
+    let one_sec_ago = Instant::now().checked_sub(Duration::from_secs(1)).unwrap();
 
     scheduler.upsert(CompactionEntity {
         id: "A".to_string(),

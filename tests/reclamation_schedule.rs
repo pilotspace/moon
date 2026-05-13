@@ -95,10 +95,7 @@ fn test_schedule_hour_window() {
 
     // 02:30 → matches.
     let mul = sched.current_budget_multiplier(wed_2am());
-    assert!(
-        (mul - 2.0).abs() < 1e-6,
-        "should match at 02:30, got {mul}"
-    );
+    assert!((mul - 2.0).abs() < 1e-6, "should match at 02:30, got {mul}");
 
     // 09:00 → no match.
     let mul2 = sched.current_budget_multiplier(wed_9am());
@@ -239,9 +236,16 @@ fn test_schedule_persistence_roundtrip() {
     sched.save_to_file(&path).expect("save ok");
 
     let loaded = MaintenanceSchedule::load_from_file(&path).expect("load ok");
-    assert_eq!(loaded.list().len(), 2, "loaded schedule must have 2 windows");
+    assert_eq!(
+        loaded.list().len(),
+        2,
+        "loaded schedule must have 2 windows"
+    );
 
     // Verify semantics preserved.
     let mul = loaded.current_budget_multiplier(wed_2am());
-    assert!((mul - 2.0).abs() < 1e-6, "hour-2 window preserved after reload");
+    assert!(
+        (mul - 2.0).abs() < 1e-6,
+        "hour-2 window preserved after reload"
+    );
 }
