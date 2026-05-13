@@ -12,6 +12,8 @@ pub mod remote_subscriber_map;
 pub mod scatter_aggregate;
 #[cfg(feature = "text-index")]
 pub mod scatter_hybrid;
+/// MA1: write-stall on immutable segment backlog.
+pub mod segment_stall;
 pub mod shared_databases;
 pub mod spsc_handler;
 pub mod timers;

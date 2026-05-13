@@ -165,6 +165,9 @@ pub(crate) fn sync_wal_v3(wal_v3: &mut Option<crate::persistence::wal_v3::segmen
 /// 2. `sweep_zombies_mut()` — removes any write intents whose owner txn_id is
 ///    neither active nor committed (leaked by dropped-future or panic paths).
 /// 3. Updates five RECL_MVCC_* atomics so `INFO` picks them up immediately.
+/// 4. MA1: samples total immutable segment count and updates `RECL_SEGMENT_STALL_ACTIVE`
+///    via `segment_stall::update_segment_stall`. Read commands continue; only
+///    foreground writes are blocked when the threshold is exceeded.
 ///
 /// ## Safety
 ///
@@ -174,14 +177,13 @@ pub(crate) fn run_mvcc_sweep(
     vector_store: &mut crate::vector::store::VectorStore,
     #[cfg(feature = "graph")] graph_store: &mut crate::graph::store::GraphStore,
     prune_margin: u64,
+    max_unflushed_immutable_segments: u64,
 ) {
-    use std::sync::atomic::Ordering;
     use crate::command::info_reclamation::{
-        RECL_MVCC_ACTIVE,
-        RECL_MVCC_COMMITTED,
-        RECL_MVCC_OLDEST_SNAPSHOT_LAG,
+        RECL_MVCC_ACTIVE, RECL_MVCC_COMMITTED, RECL_MVCC_OLDEST_SNAPSHOT_LAG,
         RECL_MVCC_ZOMBIES_SWEPT_TOTAL,
     };
+    use std::sync::atomic::Ordering;
 
     let mgr = vector_store.txn_manager_mut();
 
@@ -205,7 +207,7 @@ pub(crate) fn run_mvcc_sweep(
     let total_swept = swept_vec + swept_graph;
     let _ = pruned; // used for debug; not emitted separately (merged into committed count)
 
-    // 4. Update RECL_* atomics.
+    // 4. Update RECL_MVCC_* atomics.
     let committed_len = mgr.committed_count();
     let active_len = mgr.active_count() as u64;
     let oldest_snap = mgr.oldest_snapshot();
@@ -220,6 +222,10 @@ pub(crate) fn run_mvcc_sweep(
         RECL_MVCC_ZOMBIES_SWEPT_TOTAL.fetch_add(total_swept as u64, Ordering::Relaxed);
     }
 
+    // 5. MA1: update segment-stall bit based on current immutable segment count.
+    let imm_count = vector_store.total_immutable_segment_count();
+    crate::shard::segment_stall::update_segment_stall(imm_count, max_unflushed_immutable_segments);
+
     if total_swept > 0 || pruned > 0 {
         tracing::debug!(
             pruned,
@@ -227,6 +233,7 @@ pub(crate) fn run_mvcc_sweep(
             swept_graph,
             committed_remaining = committed_len,
             oldest_snapshot_lag = lag,
+            imm_count,
             "mvcc_sweep: pruned committed + swept zombies",
         );
     }

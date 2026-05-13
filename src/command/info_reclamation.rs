@@ -35,8 +35,13 @@ pub static RECL_WAL_BYTES: AtomicU64 = AtomicU64::new(0);
 pub static RECL_WAL_SEGMENTS: AtomicU64 = AtomicU64::new(0);
 
 /// 1 when the server is in a write-stall condition, 0 otherwise.
-/// TODO(P10→Wave2): wire from disk-pressure monitor (MA12).
+/// MA12 owns the disk-pressure bit. MA1 owns the segment-backlog bit.
+/// The INFO emitter ORs both: `RECL_WRITE_STALL_ACTIVE | RECL_SEGMENT_STALL_ACTIVE`.
 pub static RECL_WRITE_STALL_ACTIVE: AtomicU64 = AtomicU64::new(0);
+
+/// 1 when immutable segment count exceeds --max-unflushed-immutable-segments, 0 otherwise.
+/// MA1 sets this; the INFO `write_stall_active` field reflects its OR with RECL_WRITE_STALL_ACTIVE.
+pub static RECL_SEGMENT_STALL_ACTIVE: AtomicU64 = AtomicU64::new(0);
 
 /// Write-stall threshold stored as tenths-of-percent (e.g. 950 = 95.0%).
 /// TODO(P10→Wave2): wire from config flag --disk-free-min-pct (MA12).
@@ -176,8 +181,9 @@ pub fn write_reclamation_section(buf: &mut String) {
         RECL_WAL_SEGMENTS.load(Ordering::Relaxed)
     );
 
-    // -- Write stall --
-    let stall_active = RECL_WRITE_STALL_ACTIVE.load(Ordering::Relaxed);
+    // -- Write stall: OR of disk-pressure (MA12) and segment-backlog (MA1) bits --
+    let stall_active = RECL_WRITE_STALL_ACTIVE.load(Ordering::Relaxed)
+        | RECL_SEGMENT_STALL_ACTIVE.load(Ordering::Relaxed);
     // Threshold stored as tenths-of-percent (e.g. 950 → "95.0")
     let threshold_x10 = RECL_WRITE_STALL_THRESHOLD_PCT_X10.load(Ordering::Relaxed);
     let _ = write!(

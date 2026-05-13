@@ -1183,12 +1183,13 @@ impl super::Shard {
                 _ = wal_sync_interval.0.tick() => {
                     timers::sync_wal(&mut wal_writer);
                     timers::sync_wal_v3(&mut wal_v3_writer);
-                    // P3: prune committed treemap + sweep zombie intents + update RECL_MVCC_*.
+                    // P3+MA1: prune committed + sweep zombies + update RECL_MVCC_* + segment-stall.
                     timers::run_mvcc_sweep(
                         &mut *shard_databases.vector_store(shard_id),
                         #[cfg(feature = "graph")]
                         &mut *shard_databases.graph_store_write(shard_id),
                         server_config.mvcc_committed_prune_margin,
+                        server_config.max_unflushed_immutable_segments,
                     );
                     // P6: ceiling-trigger — runs at 1s cadence to avoid the
                     // read_dir syscall overhead of wal.stats() on every 1ms tick.
@@ -1702,12 +1703,13 @@ impl super::Shard {
                 if monoio_tick_counter % 1000 == 0 {
                     timers::sync_wal(&mut wal_writer);
                     timers::sync_wal_v3(&mut wal_v3_writer);
-                    // P3: MVCC committed prune + zombie sweep + RECL_MVCC_* update.
+                    // P3+MA1: MVCC committed prune + zombie sweep + RECL_* + segment-stall.
                     timers::run_mvcc_sweep(
                         &mut *shard_databases.vector_store(shard_id),
                         #[cfg(feature = "graph")]
                         &mut *shard_databases.graph_store_write(shard_id),
                         server_config.mvcc_committed_prune_margin,
+                        server_config.max_unflushed_immutable_segments,
                     );
                     if let (
                         Some(ckpt_mgr),

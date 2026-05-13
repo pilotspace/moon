@@ -612,6 +612,23 @@ impl VectorStore {
         (total_mutable, total_immutable)
     }
 
+    /// Total count of immutable (sealed HNSW) segments across all indexes and fields.
+    ///
+    /// Used by the MA1 write-stall guard to detect segment backlog.
+    /// O(index_count * field_count) — cheap enough for the 1s sweep tick.
+    pub fn total_immutable_segment_count(&self) -> usize {
+        let mut count = 0usize;
+        for idx in self.indexes.values() {
+            let snap = idx.segments.load();
+            count += snap.immutable.len();
+            for fs in idx.field_segments.values() {
+                let fs_snap = fs.segments.load();
+                count += fs_snap.immutable.len();
+            }
+        }
+        count
+    }
+
     /// Attach recovered segments from persistence. Called by shard restore.
     ///
     /// Stores recovered collections in pending_segments, keyed by collection_id.
