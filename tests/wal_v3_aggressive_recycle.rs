@@ -7,11 +7,7 @@
 //! Test design: deterministic — no real sleeps. We drive the writer and
 //! recycler directly without a running server.
 
-use moon::persistence::wal_v3::{
-    WalStats, WalWriterV3,
-    record::WalRecordType,
-    segment::{DEFAULT_SEGMENT_SIZE, WAL_V3_HEADER_SIZE},
-};
+use moon::persistence::wal_v3::{WalStats, WalWriterV3, record::WalRecordType};
 use std::fs;
 
 // ---------------------------------------------------------------------------
@@ -75,10 +71,8 @@ fn test_aggressive_recycle_bypasses_min_floor() {
     );
 
     // Active segment must survive.
-    let active_path = moon::persistence::wal_v3::segment::WalSegment::segment_path(
-        &wal_dir,
-        active_seq,
-    );
+    let active_path =
+        moon::persistence::wal_v3::segment::WalSegment::segment_path(&wal_dir, active_seq);
     assert!(active_path.exists(), "active segment must not be recycled");
 }
 
@@ -141,7 +135,10 @@ fn test_aggressive_recycle_stats_accounting() {
     writer.flush_sync().unwrap();
 
     let stats_before = writer.stats().unwrap();
-    assert!(stats_before.total_segments >= 3, "need 3+ segments for meaningful test");
+    assert!(
+        stats_before.total_segments >= 3,
+        "need 3+ segments for meaningful test"
+    );
 
     // Recycle with high redo_lsn — aggressive (no min floor).
     let recycled = writer.recycle_aggressive(u64::MAX).unwrap();
@@ -169,31 +166,32 @@ fn test_aggressive_recycle_stats_accounting() {
 }
 
 // ---------------------------------------------------------------------------
-// T4: Ceiling trigger — total_wal_bytes exceeds max_wal_bytes.
+// T4: recycle_aggressive with a post-ceiling-trigger redo_lsn.
 //
-// Verifies that after calling the ceiling-trigger path
-// (persistence_tick::maybe_force_checkpoint_on_wal_overflow), WAL is brought
-// down to ≤ 2× max_wal_bytes without sleeping.
-//
-// This test drives everything synchronously without a running server.
+// Verifies that when total WAL on disk exceeds max_wal_bytes,
+// recycle_aggressive(redo_lsn) brings total WAL down to ≤ 2× max_wal_bytes.
+// The redo_lsn here is u64::MAX — representing a completed checkpoint that
+// cleared all segments (equivalent to control.last_checkpoint_lsn after
+// force_checkpoint completes). This is the scenario that the
+// maybe_force_checkpoint_on_wal_overflow path exercises at runtime; the
+// end-to-end wiring of that function (CheckpointManager + PageCache +
+// ShardControlFile) requires a running shard and is covered by integration
+// tests, not this unit-level suite.
 // ---------------------------------------------------------------------------
 #[test]
 fn test_ceiling_trigger_reduces_wal_below_two_x_max() {
-    use moon::persistence::checkpoint::{CheckpointManager, CheckpointTrigger};
-    use moon::persistence::wal_v3::segment::WalWriterV3;
-
     let tmp = tempfile::tempdir().unwrap();
     let shard_dir = tmp.path().join("shard-0");
     let wal_dir = shard_dir.join("wal-v3");
     std::fs::create_dir_all(&shard_dir).unwrap();
 
-    // 64KB max WAL — easy to exceed with many tiny segments.
-    let max_wal: u64 = 64 * 1024;
-    // Use 512-byte segments so we get many files quickly.
+    // Use 512-byte segments and write 300 records (~40 bytes each = ~12KB
+    // on disk after rotation). Set max_wal to 4KB so we clearly exceed it.
+    let max_wal: u64 = 4 * 1024;
     let mut writer = WalWriterV3::new(0, &wal_dir, 512).unwrap();
     writer.set_wal_bounds(0, max_wal);
 
-    // Write enough to clearly exceed max_wal.
+    // Write 300 records, flushing every 5 to force segment rotation.
     for i in 0..300 {
         writer.append(WalRecordType::Command, b"SET ceiling test");
         if (i + 1) % 5 == 0 {
