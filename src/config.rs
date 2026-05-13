@@ -235,6 +235,13 @@ pub struct ServerConfig {
     #[arg(long = "wal-segment-size", default_value = "16mb")]
     pub wal_segment_size: String,
 
+    /// P6: minimum milliseconds since last checkpoint before the WAL
+    /// ceiling-trigger is allowed to force another checkpoint + aggressive
+    /// recycle. Prevents thrashing when WAL is over max but a checkpoint
+    /// just completed moments ago. Default: 10 000ms (10 seconds).
+    #[arg(long = "wal-max-checkpoint-lag-ms", default_value_t = 10_000)]
+    pub wal_max_checkpoint_lag_ms: u64,
+
     // ── MoonStore v2: Vector Warm Tier ──────────────────────────────
     /// mlock vector codes pages into RAM
     #[arg(long = "vec-codes-mlock", default_value = "enable")]
