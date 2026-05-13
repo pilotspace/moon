@@ -666,7 +666,13 @@ pub(crate) fn maybe_force_checkpoint_on_wal_overflow(
 ) -> bool {
     // Condition 1: total on-disk WAL exceeds the configured ceiling.
     let total_wal = match wal.stats() {
-        Ok(s) => s.total_bytes,
+        Ok(s) => {
+            // Wire P10 INFO metrics (P6 → RECL_WAL_*).
+            use std::sync::atomic::Ordering::Relaxed;
+            crate::command::info_reclamation::RECL_WAL_BYTES.store(s.total_bytes, Relaxed);
+            crate::command::info_reclamation::RECL_WAL_SEGMENTS.store(s.total_segments, Relaxed);
+            s.total_bytes
+        }
         Err(e) => {
             tracing::warn!(
                 "Shard {}: P6 WAL stats scan failed, skipping overflow check: {}",
@@ -884,6 +890,12 @@ pub(crate) fn handle_checkpoint_tick(
                         tombstone_retain_secs,
                     );
                 }
+                // Wire P10 INFO metrics (P1 → RECL_MANIFEST_*).
+                use std::sync::atomic::Ordering::Relaxed;
+                crate::command::info_reclamation::RECL_MANIFEST_ACTIVE
+                    .store(manifest.active_entry_count() as u64, Relaxed);
+                crate::command::info_reclamation::RECL_MANIFEST_TOMBSTONES
+                    .store(manifest.tombstone_count() as u64, Relaxed);
             }
 
             // 4. Update control file with new checkpoint LSN

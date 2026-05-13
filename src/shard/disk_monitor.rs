@@ -103,6 +103,17 @@ impl DiskMonitor {
             Some((free, total)) => {
                 self.free_bytes.store(free, Ordering::Relaxed);
                 self.update_paused(free, total);
+                // Wire P10 INFO metrics (MA12 → RECL_*).
+                crate::command::info_reclamation::RECL_DISK_FREE_BYTES
+                    .store(free, Ordering::Relaxed);
+                crate::command::info_reclamation::RECL_WRITE_STALL_ACTIVE.store(
+                    if self.paused.load(Ordering::Relaxed) {
+                        1
+                    } else {
+                        0
+                    },
+                    Ordering::Relaxed,
+                );
             }
             None => {
                 // Cannot read filesystem info — leave previous state unchanged
