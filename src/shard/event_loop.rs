@@ -496,6 +496,11 @@ impl super::Shard {
         // Track WAL bytes since last checkpoint for trigger logic.
         let mut wal_bytes_since_checkpoint: u64 = 0;
 
+        // P6: Track time of last completed checkpoint for the ceiling-trigger
+        // lag guard. Initialised to process start so the first tick is not
+        // suppressed by a stale timestamp.
+        let mut last_checkpoint_completed_at = std::time::Instant::now();
+
         // Flag: BGSAVE snapshot completed, request a forced checkpoint on next tick.
         let mut bgsave_checkpoint_requested = false;
 
@@ -1151,6 +1156,23 @@ impl super::Shard {
                         persistence_tick::maybe_begin_checkpoint(ckpt_mgr, wal_v3, page_cache_inst, wal_bytes_since_checkpoint);
                         if persistence_tick::handle_checkpoint_tick(ckpt_mgr, page_cache_inst, wal_v3, manifest, ctrl, ctrl_path, server_config.manifest_tombstone_retain_epochs, server_config.manifest_tombstone_retain_secs) {
                             wal_bytes_since_checkpoint = 0;
+                            last_checkpoint_completed_at = std::time::Instant::now();
+                        }
+                        // P6: ceiling-trigger — force checkpoint + aggressive recycle when
+                        // total WAL exceeds max_wal_bytes and lag guard allows it.
+                        if persistence_tick::maybe_force_checkpoint_on_wal_overflow(
+                            ckpt_mgr,
+                            wal_v3,
+                            page_cache_inst,
+                            manifest,
+                            ctrl,
+                            ctrl_path,
+                            shard_id,
+                            last_checkpoint_completed_at,
+                            server_config.wal_max_checkpoint_lag_ms,
+                        ) {
+                            wal_bytes_since_checkpoint = 0;
+                            last_checkpoint_completed_at = std::time::Instant::now();
                         }
                     }
 
@@ -1621,6 +1643,23 @@ impl super::Shard {
                         server_config.manifest_tombstone_retain_secs,
                     ) {
                         wal_bytes_since_checkpoint = 0;
+                        last_checkpoint_completed_at = std::time::Instant::now();
+                    }
+                    // P6: ceiling-trigger — force checkpoint + aggressive recycle when
+                    // total WAL exceeds max_wal_bytes and lag guard allows it.
+                    if persistence_tick::maybe_force_checkpoint_on_wal_overflow(
+                        ckpt_mgr,
+                        wal_v3,
+                        page_cache_inst,
+                        manifest,
+                        ctrl,
+                        ctrl_path,
+                        shard_id,
+                        last_checkpoint_completed_at,
+                        server_config.wal_max_checkpoint_lag_ms,
+                    ) {
+                        wal_bytes_since_checkpoint = 0;
+                        last_checkpoint_completed_at = std::time::Instant::now();
                     }
                 }
 
