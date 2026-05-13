@@ -1158,22 +1158,6 @@ impl super::Shard {
                             wal_bytes_since_checkpoint = 0;
                             last_checkpoint_completed_at = std::time::Instant::now();
                         }
-                        // P6: ceiling-trigger — force checkpoint + aggressive recycle when
-                        // total WAL exceeds max_wal_bytes and lag guard allows it.
-                        if persistence_tick::maybe_force_checkpoint_on_wal_overflow(
-                            ckpt_mgr,
-                            wal_v3,
-                            page_cache_inst,
-                            manifest,
-                            ctrl,
-                            ctrl_path,
-                            shard_id,
-                            last_checkpoint_completed_at,
-                            server_config.wal_max_checkpoint_lag_ms,
-                        ) {
-                            wal_bytes_since_checkpoint = 0;
-                            last_checkpoint_completed_at = std::time::Instant::now();
-                        }
                     }
 
                     // Also poll io_uring in the timer tick as a fallback.
@@ -1195,6 +1179,26 @@ impl super::Shard {
                 _ = wal_sync_interval.0.tick() => {
                     timers::sync_wal(&mut wal_writer);
                     timers::sync_wal_v3(&mut wal_v3_writer);
+                    // P6: ceiling-trigger — runs at 1s cadence to avoid the
+                    // read_dir syscall overhead of wal.stats() on every 1ms tick.
+                    if let (Some(ckpt_mgr), Some(page_cache_inst), Some(wal_v3), Some(manifest), Some(ctrl), Some(ctrl_path)) =
+                        (&mut checkpoint_manager, &page_cache, &mut wal_v3_writer, &mut shard_manifest, &mut control_file, &control_file_path)
+                    {
+                        if persistence_tick::maybe_force_checkpoint_on_wal_overflow(
+                            ckpt_mgr,
+                            wal_v3,
+                            page_cache_inst,
+                            manifest,
+                            ctrl,
+                            ctrl_path,
+                            shard_id,
+                            last_checkpoint_completed_at,
+                            server_config.wal_max_checkpoint_lag_ms,
+                        ) {
+                            wal_bytes_since_checkpoint = 0;
+                            last_checkpoint_completed_at = std::time::Instant::now();
+                        }
+                    }
                 }
                 // Warm tier transition check (10s interval, disk-offload only)
                 _ = warm_check_interval.0.tick() => {
@@ -1645,22 +1649,6 @@ impl super::Shard {
                         wal_bytes_since_checkpoint = 0;
                         last_checkpoint_completed_at = std::time::Instant::now();
                     }
-                    // P6: ceiling-trigger — force checkpoint + aggressive recycle when
-                    // total WAL exceeds max_wal_bytes and lag guard allows it.
-                    if persistence_tick::maybe_force_checkpoint_on_wal_overflow(
-                        ckpt_mgr,
-                        wal_v3,
-                        page_cache_inst,
-                        manifest,
-                        ctrl,
-                        ctrl_path,
-                        shard_id,
-                        last_checkpoint_completed_at,
-                        server_config.wal_max_checkpoint_lag_ms,
-                    ) {
-                        wal_bytes_since_checkpoint = 0;
-                        last_checkpoint_completed_at = std::time::Instant::now();
-                    }
                 }
 
                 // --- Counter-based sub-timer dispatch ---
@@ -1691,10 +1679,42 @@ impl super::Shard {
                         &pubsub_arc,
                     );
                 }
-                // WAL fsync: every 1s (1000 ticks)
+                // WAL fsync + P6 ceiling-trigger: every 1s (1000 ticks).
+                // P6 is gated here (not per-1ms tick) to avoid the read_dir
+                // syscall overhead of wal.stats() on the hot path.
                 if monoio_tick_counter % 1000 == 0 {
                     timers::sync_wal(&mut wal_writer);
                     timers::sync_wal_v3(&mut wal_v3_writer);
+                    if let (
+                        Some(ckpt_mgr),
+                        Some(page_cache_inst),
+                        Some(wal_v3),
+                        Some(manifest),
+                        Some(ctrl),
+                        Some(ctrl_path),
+                    ) = (
+                        &mut checkpoint_manager,
+                        &page_cache,
+                        &mut wal_v3_writer,
+                        &mut shard_manifest,
+                        &mut control_file,
+                        &control_file_path,
+                    ) {
+                        if persistence_tick::maybe_force_checkpoint_on_wal_overflow(
+                            ckpt_mgr,
+                            wal_v3,
+                            page_cache_inst,
+                            manifest,
+                            ctrl,
+                            ctrl_path,
+                            shard_id,
+                            last_checkpoint_completed_at,
+                            server_config.wal_max_checkpoint_lag_ms,
+                        ) {
+                            wal_bytes_since_checkpoint = 0;
+                            last_checkpoint_completed_at = std::time::Instant::now();
+                        }
+                    }
                 }
                 // Warm tier check: every warm_poll_ms ticks
                 if monoio_tick_counter % (warm_poll_ms as u64) == 0 {

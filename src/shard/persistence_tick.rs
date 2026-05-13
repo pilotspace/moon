@@ -716,9 +716,12 @@ pub(crate) fn maybe_force_checkpoint_on_wal_overflow(
     );
 
     // Aggressive recycle — bypass min_wal_bytes floor.
-    // Use current_lsn - 1 as the redo_lsn (all records before this point
-    // are checkpointed after the force_checkpoint above).
-    let redo_lsn = wal.current_lsn().saturating_sub(1);
+    // Use control.last_checkpoint_lsn (the LSN of the last *completed*
+    // checkpoint) rather than wal.current_lsn()-1. If force_checkpoint above
+    // was a no-op (checkpoint already active) or failed silently, using the
+    // current WAL head would be unsafe — we would recycle segments whose dirty
+    // pages have not been flushed to data files yet.
+    let redo_lsn = control.last_checkpoint_lsn;
     match wal.recycle_aggressive(redo_lsn) {
         Ok(stats) if stats.segments_recycled > 0 => {
             tracing::info!(
