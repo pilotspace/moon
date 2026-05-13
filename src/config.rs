@@ -317,6 +317,32 @@ pub struct ServerConfig {
     /// Set to 0 to disable the monitor entirely.
     #[arg(long = "disk-free-min-pct", default_value_t = 5, value_parser = clap::value_parser!(u8).range(0..=95))]
     pub disk_free_min_pct: u8,
+
+    // ── P3: MVCC committed-set prune margin ────────────────────────────────
+    /// Number of LSN units to keep in the MVCC committed treemap above the
+    /// oldest active snapshot watermark before pruning entries below.
+    ///
+    /// At the 1-second sweep tick, entries with txn_id < (oldest_snapshot - margin)
+    /// are removed from the RoaringTreemap. Any txn_id below the resulting floor
+    /// is considered globally committed (short-circuit in `is_committed`).
+    ///
+    /// Default 1000: at 100K commits/s, this retains ~10ms of history — more
+    /// than enough for any in-flight snapshot to resolve its visibility window.
+    ///
+    /// Set to 0 to disable pruning (not recommended for long-running deployments).
+    #[arg(long = "mvcc-committed-prune-margin", default_value_t = 1000)]
+    pub mvcc_committed_prune_margin: u64,
+
+    // ── MA1: Write-stall on immutable segment backlog ──────────────────────
+    /// Maximum number of unflushed immutable vector/graph segments before
+    /// foreground writes are stalled with `MOONERR busy: compaction backlog`.
+    ///
+    /// This is Moon's analog of RocksDB's `level0_stop_writes_trigger`.
+    /// Background compaction (FT.COMPACT, GRAPH.COMPACT) is NOT affected.
+    ///
+    /// Default 20. Set to 0 to disable the stall guard.
+    #[arg(long = "max-unflushed-immutable-segments", default_value_t = 20)]
+    pub max_unflushed_immutable_segments: u64,
 }
 
 impl ServerConfig {

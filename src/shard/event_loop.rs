@@ -1179,10 +1179,17 @@ impl super::Shard {
                         }
                     }
                 }
-                // WAL fsync on 1-second interval
+                // WAL fsync + MVCC sweep on 1-second interval
                 _ = wal_sync_interval.0.tick() => {
                     timers::sync_wal(&mut wal_writer);
                     timers::sync_wal_v3(&mut wal_v3_writer);
+                    // P3: prune committed treemap + sweep zombie intents + update RECL_MVCC_*.
+                    timers::run_mvcc_sweep(
+                        &mut *shard_databases.vector_store(shard_id),
+                        #[cfg(feature = "graph")]
+                        &mut *shard_databases.graph_store_write(shard_id),
+                        server_config.mvcc_committed_prune_margin,
+                    );
                     // P6: ceiling-trigger — runs at 1s cadence to avoid the
                     // read_dir syscall overhead of wal.stats() on every 1ms tick.
                     if let (Some(ckpt_mgr), Some(page_cache_inst), Some(wal_v3), Some(manifest), Some(ctrl), Some(ctrl_path)) =
@@ -1689,12 +1696,19 @@ impl super::Shard {
                         &pubsub_arc,
                     );
                 }
-                // WAL fsync + P6 ceiling-trigger: every 1s (1000 ticks).
+                // WAL fsync + P6 ceiling-trigger + MVCC sweep: every 1s (1000 ticks).
                 // P6 is gated here (not per-1ms tick) to avoid the read_dir
                 // syscall overhead of wal.stats() on the hot path.
                 if monoio_tick_counter % 1000 == 0 {
                     timers::sync_wal(&mut wal_writer);
                     timers::sync_wal_v3(&mut wal_v3_writer);
+                    // P3: MVCC committed prune + zombie sweep + RECL_MVCC_* update.
+                    timers::run_mvcc_sweep(
+                        &mut *shard_databases.vector_store(shard_id),
+                        #[cfg(feature = "graph")]
+                        &mut *shard_databases.graph_store_write(shard_id),
+                        server_config.mvcc_committed_prune_margin,
+                    );
                     if let (
                         Some(ckpt_mgr),
                         Some(page_cache_inst),

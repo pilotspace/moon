@@ -88,6 +88,8 @@ async fn start_server() -> (u16, CancellationToken) {
         manifest_tombstone_retain_epochs: 2,
         manifest_tombstone_retain_secs: 300,
         disk_free_min_pct: 5,
+        mvcc_committed_prune_margin: 1000,
+        max_unflushed_immutable_segments: 20,
     };
 
     tokio::spawn(async move {
@@ -173,6 +175,8 @@ async fn start_server_with_pass(password: &str) -> (u16, CancellationToken) {
         manifest_tombstone_retain_epochs: 2,
         manifest_tombstone_retain_secs: 300,
         disk_free_min_pct: 5,
+        mvcc_committed_prune_margin: 1000,
+        max_unflushed_immutable_segments: 20,
     };
 
     tokio::spawn(async move {
@@ -1330,6 +1334,8 @@ async fn start_server_with_persistence(
         manifest_tombstone_retain_epochs: 2,
         manifest_tombstone_retain_secs: 300,
         disk_free_min_pct: 5,
+        mvcc_committed_prune_margin: 1000,
+        max_unflushed_immutable_segments: 20,
     };
 
     tokio::spawn(async move {
@@ -2199,6 +2205,8 @@ async fn start_server_with_maxmemory(maxmemory: usize, policy: &str) -> (u16, Ca
         manifest_tombstone_retain_epochs: 2,
         manifest_tombstone_retain_secs: 300,
         disk_free_min_pct: 5,
+        mvcc_committed_prune_margin: 1000,
+        max_unflushed_immutable_segments: 20,
     };
 
     tokio::spawn(async move {
@@ -2595,6 +2603,8 @@ async fn start_sharded_server(num_shards: usize) -> (u16, CancellationToken) {
         manifest_tombstone_retain_epochs: 2,
         manifest_tombstone_retain_secs: 300,
         disk_free_min_pct: 5,
+        mvcc_committed_prune_margin: 1000,
+        max_unflushed_immutable_segments: 20,
     };
 
     let cancel = token.clone();
@@ -3760,6 +3770,8 @@ async fn start_cluster_server() -> (u16, CancellationToken) {
         manifest_tombstone_retain_epochs: 2,
         manifest_tombstone_retain_secs: 300,
         disk_free_min_pct: 5,
+        mvcc_committed_prune_margin: 1000,
+        max_unflushed_immutable_segments: 20,
     };
 
     std::thread::spawn(move || {
@@ -4407,6 +4419,8 @@ async fn start_server_with_aclfile(acl_path: &str) -> (u16, CancellationToken) {
         manifest_tombstone_retain_epochs: 2,
         manifest_tombstone_retain_secs: 300,
         disk_free_min_pct: 5,
+        mvcc_committed_prune_margin: 1000,
+        max_unflushed_immutable_segments: 20,
     };
 
     tokio::spawn(async move {

@@ -105,6 +105,8 @@ async fn start_txn_server(num_shards: usize) -> (u16, CancellationToken) {
         manifest_tombstone_retain_epochs: 2,
         manifest_tombstone_retain_secs: 300,
         disk_free_min_pct: 5,
+        mvcc_committed_prune_margin: 1000,
+        max_unflushed_immutable_segments: 20,
     };
 
     let cancel = token.clone();

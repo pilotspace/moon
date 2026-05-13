@@ -151,3 +151,83 @@ pub(crate) fn sync_wal_v3(wal_v3: &mut Option<crate::persistence::wal_v3::segmen
         }
     }
 }
+
+/// MVCC sweep tick: prune committed treemap + sweep zombie intents + update RECL_* metrics.
+///
+/// Called on the 1s timer (same cadence as WAL fsync). Takes mutable access to the
+/// per-shard VectorStore so it can reach the `TransactionManager` and, when the `graph`
+/// feature is enabled, the `GraphStore` for graph intent cleanup.
+///
+/// ## What this does
+///
+/// 1. `prune_committed(margin)` — evicts `committed` entries below
+///    `oldest_snapshot - margin`, freeing RoaringTreemap memory.
+/// 2. `sweep_zombies_mut()` — removes any write intents whose owner txn_id is
+///    neither active nor committed (leaked by dropped-future or panic paths).
+/// 3. Updates five RECL_MVCC_* atomics so `INFO` picks them up immediately.
+///
+/// ## Safety
+///
+/// Must be called from the shard thread only. `VectorStore` is `!Send`; no lock
+/// is held across this call.
+pub(crate) fn run_mvcc_sweep(
+    vector_store: &mut crate::vector::store::VectorStore,
+    #[cfg(feature = "graph")] graph_store: &mut crate::graph::store::GraphStore,
+    prune_margin: u64,
+) {
+    use std::sync::atomic::Ordering;
+    use crate::command::info_reclamation::{
+        RECL_MVCC_ACTIVE,
+        RECL_MVCC_COMMITTED,
+        RECL_MVCC_OLDEST_SNAPSHOT_LAG,
+        RECL_MVCC_ZOMBIES_SWEPT_TOTAL,
+    };
+
+    let mgr = vector_store.txn_manager_mut();
+
+    // 1. Prune committed treemap.
+    let pruned = mgr.prune_committed(prune_margin);
+
+    // 2. Sweep zombie vector write intents.
+    let swept_vec = mgr.sweep_zombies_mut();
+
+    // 3. Sweep zombie graph write intents (feature-gated).
+    #[cfg(feature = "graph")]
+    let swept_graph = {
+        // GraphStore owns its own LSN counter but shares the same transaction
+        // lifecycle model. Sweep the graph intents via the MVCC manager.
+        let _ = graph_store; // referenced for future graph-txn sweep wiring
+        mgr.sweep_graph_zombies_mut()
+    };
+    #[cfg(not(feature = "graph"))]
+    let swept_graph = 0usize;
+
+    let total_swept = swept_vec + swept_graph;
+    let _ = pruned; // used for debug; not emitted separately (merged into committed count)
+
+    // 4. Update RECL_* atomics.
+    let committed_len = mgr.committed_count();
+    let active_len = mgr.active_count() as u64;
+    let oldest_snap = mgr.oldest_snapshot();
+    let current_lsn = mgr.current_lsn();
+    let lag = current_lsn.saturating_sub(oldest_snap);
+
+    RECL_MVCC_COMMITTED.store(committed_len, Ordering::Relaxed);
+    RECL_MVCC_ACTIVE.store(active_len, Ordering::Relaxed);
+    RECL_MVCC_OLDEST_SNAPSHOT_LAG.store(lag, Ordering::Relaxed);
+    // RECL_MVCC_OLDEST_SNAPSHOT_AGE_SECS is wired by MA2 (requires Instant tracking).
+    if total_swept > 0 {
+        RECL_MVCC_ZOMBIES_SWEPT_TOTAL.fetch_add(total_swept as u64, Ordering::Relaxed);
+    }
+
+    if total_swept > 0 || pruned > 0 {
+        tracing::debug!(
+            pruned,
+            swept_vec,
+            swept_graph,
+            committed_remaining = committed_len,
+            oldest_snapshot_lag = lag,
+            "mvcc_sweep: pruned committed + swept zombies",
+        );
+    }
+}
