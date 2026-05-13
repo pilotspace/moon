@@ -636,6 +636,10 @@ impl super::Shard {
         #[cfg(feature = "runtime-tokio")]
         let mut cold_check_interval = TimerImpl::interval(Duration::from_secs(cold_poll_secs));
 
+        // MA12: Disk free-space poll interval (5 seconds, shard 0 only).
+        #[cfg(feature = "runtime-tokio")]
+        let mut disk_monitor_interval = TimerImpl::interval(Duration::from_secs(5));
+
         // monoio: counter-based sub-timer dispatch from 1ms periodic tick.
         // Each sub-timer fires at its native interval via modular arithmetic.
         #[cfg(feature = "runtime-monoio")]
@@ -1273,6 +1277,12 @@ impl super::Shard {
                         let _reaped = driver.reap_idle_connections(5000);
                     }
                 }
+                // MA12: Disk free-space poll (5s interval, shard 0 only).
+                _ = disk_monitor_interval.0.tick() => {
+                    if shard_id == 0 {
+                        crate::shard::disk_monitor::poll_global();
+                    }
+                }
                 _ = shutdown.cancelled() => {
                     info!("Shard {} shutting down", self.id);
                     persistence_tick::drain_and_shutdown_spill(
@@ -1753,6 +1763,10 @@ impl super::Shard {
                             );
                         }
                     }
+                }
+                // MA12: Disk free-space poll (every 5000 ticks = 5s, shard 0 only).
+                if shard_id == 0 && monoio_tick_counter % 5000 == 0 {
+                    crate::shard::disk_monitor::poll_global();
                 }
             }
         }

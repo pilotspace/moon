@@ -305,6 +305,18 @@ pub struct ServerConfig {
     /// scan/backup windows without accumulating unbounded tombstone bloat.
     #[arg(long = "manifest-tombstone-retain-secs", default_value_t = 300)]
     pub manifest_tombstone_retain_secs: u64,
+
+    // ── MA12: Disk free-space monitor ───────────────────────────────────────
+    /// Pause writes when filesystem free space drops below this percentage.
+    ///
+    /// The disk monitor samples the WAL/data volume every 5 seconds.
+    /// When free % < `disk_free_min_pct`, all write commands return
+    /// `MOONERR diskfull: writes paused` until space recovers.
+    /// Writes resume when free % > `disk_free_min_pct + 5` (hysteresis).
+    ///
+    /// Set to 0 to disable the monitor entirely.
+    #[arg(long = "disk-free-min-pct", default_value_t = 5, value_parser = clap::value_parser!(u8).range(0..=95))]
+    pub disk_free_min_pct: u8,
 }
 
 impl ServerConfig {

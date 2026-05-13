@@ -725,6 +725,10 @@ pub(crate) async fn handle_connection_sharded_monoio<
             if dispatch::try_enforce_readonly(cmd, ctx, &mut responses) {
                 continue;
             }
+            // MA12: Disk full enforcement
+            if dispatch::try_enforce_disk_full(cmd, &mut responses) {
+                continue;
+            }
             // CLIENT early (ID, SETNAME, GETNAME, TRACKING) -- admin subcmds fall through to ACL gate
             if cmd_len == 6
                 && dispatch::try_handle_client_early(

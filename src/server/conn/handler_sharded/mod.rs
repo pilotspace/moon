@@ -761,6 +761,11 @@ pub(crate) async fn handle_connection_sharded_inner<
                         continue;
                     }
 
+                    // --- MA12: Disk full enforcement ---
+                    if dispatch::try_enforce_disk_full(cmd, &mut responses) {
+                        continue;
+                    }
+
                     // --- CLIENT subcommands ---
                     if dispatch::try_handle_client_command(cmd, cmd_args, client_id, &mut conn, ctx, &mut responses) {
                         continue;

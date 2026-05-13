@@ -661,6 +661,23 @@ pub(super) fn try_enforce_readonly(
     false
 }
 
+/// MA12: Refuse write commands when the disk free-space monitor signals a stall.
+///
+/// Returns `true` if the command was blocked (caller should `continue`).
+///
+/// Hot path: single `AtomicBool::load(Relaxed)` — no allocation, no lock.
+/// Read-only commands pass through unaffected. Background compaction is exempt.
+#[inline]
+pub(super) fn try_enforce_disk_full(cmd: &[u8], responses: &mut Vec<Frame>) -> bool {
+    if crate::shard::disk_monitor::is_write_paused() && metadata::is_write(cmd) {
+        responses.push(Frame::Error(Bytes::from_static(
+            b"MOONERR diskfull: writes paused until free space recovers",
+        )));
+        return true;
+    }
+    false
+}
+
 /// Handle CLIENT subcommands that are checked BEFORE the ACL gate:
 /// ID, SETNAME, GETNAME, TRACKING.
 /// Returns `true` if a subcommand was consumed (caller should `continue`).

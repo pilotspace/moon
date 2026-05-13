@@ -345,6 +345,14 @@ fn main() -> anyhow::Result<()> {
     let server_config_shared: std::sync::Arc<moon::config::ServerConfig> =
         { std::sync::Arc::new(config.clone()) };
 
+    // MA12: Initialise disk free-space monitor.
+    // Monitors the WAL/persistence volume. When disk_free_min_pct == 0, the
+    // monitor is inactive (poll_global is a no-op, is_write_paused always false).
+    {
+        let monitor_path = persistence_dir.as_deref().unwrap_or(&config.dir);
+        moon::shard::disk_monitor::init_global(config.disk_free_min_pct, monitor_path);
+    }
+
     // Collect all notifiers before spawning shard threads
     let all_notifiers = mesh.all_notifiers();
 
