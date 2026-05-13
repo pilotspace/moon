@@ -87,6 +87,7 @@ async fn start_server() -> (u16, CancellationToken) {
         recovery_target_time: None,
         manifest_tombstone_retain_epochs: 2,
         manifest_tombstone_retain_secs: 300,
+        disk_free_min_pct: 5,
     };
 
     tokio::spawn(async move {
@@ -171,6 +172,7 @@ async fn start_server_with_pass(password: &str) -> (u16, CancellationToken) {
         recovery_target_time: None,
         manifest_tombstone_retain_epochs: 2,
         manifest_tombstone_retain_secs: 300,
+        disk_free_min_pct: 5,
     };
 
     tokio::spawn(async move {
@@ -1327,6 +1329,7 @@ async fn start_server_with_persistence(
         recovery_target_time: None,
         manifest_tombstone_retain_epochs: 2,
         manifest_tombstone_retain_secs: 300,
+        disk_free_min_pct: 5,
     };
 
     tokio::spawn(async move {
@@ -2195,6 +2198,7 @@ async fn start_server_with_maxmemory(maxmemory: usize, policy: &str) -> (u16, Ca
         recovery_target_time: None,
         manifest_tombstone_retain_epochs: 2,
         manifest_tombstone_retain_secs: 300,
+        disk_free_min_pct: 5,
     };
 
     tokio::spawn(async move {
@@ -2590,6 +2594,7 @@ async fn start_sharded_server(num_shards: usize) -> (u16, CancellationToken) {
         recovery_target_time: None,
         manifest_tombstone_retain_epochs: 2,
         manifest_tombstone_retain_secs: 300,
+        disk_free_min_pct: 5,
     };
 
     let cancel = token.clone();
@@ -3754,6 +3759,7 @@ async fn start_cluster_server() -> (u16, CancellationToken) {
         recovery_target_time: None,
         manifest_tombstone_retain_epochs: 2,
         manifest_tombstone_retain_secs: 300,
+        disk_free_min_pct: 5,
     };
 
     std::thread::spawn(move || {
@@ -4400,6 +4406,7 @@ async fn start_server_with_aclfile(acl_path: &str) -> (u16, CancellationToken) {
         recovery_target_time: None,
         manifest_tombstone_retain_epochs: 2,
         manifest_tombstone_retain_secs: 300,
+        disk_free_min_pct: 5,
     };
 
     tokio::spawn(async move {

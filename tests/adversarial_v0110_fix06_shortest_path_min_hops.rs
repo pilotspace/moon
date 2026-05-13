@@ -98,6 +98,7 @@ async fn start_server(num_shards: usize) -> (u16, CancellationToken) {
         recovery_target_time: None,
         manifest_tombstone_retain_epochs: 2,
         manifest_tombstone_retain_secs: 300,
+        disk_free_min_pct: 5,
     };
 
     let cancel = token.clone();
