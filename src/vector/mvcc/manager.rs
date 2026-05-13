@@ -767,7 +767,10 @@ mod tests {
             mgr.committed_count()
         );
         // pruned_below must have advanced.
-        assert!(mgr.pruned_below() > 0, "pruned_below must be set after prune");
+        assert!(
+            mgr.pruned_below() > 0,
+            "pruned_below must be set after prune"
+        );
     }
 
     /// P3-RED-2: `is_committed` must return `true` for pruned txn IDs
@@ -814,7 +817,10 @@ mod tests {
         // floor = 500.saturating_sub(1000) = 0.
         // No pruning should happen (floor = 0, all entries are >= 0).
         let pruned = mgr.prune_committed(1000);
-        assert_eq!(pruned, 0, "must not prune when floor == 0 (reader holds old snapshot)");
+        assert_eq!(
+            pruned, 0,
+            "must not prune when floor == 0 (reader holds old snapshot)"
+        );
         // Cleanup
         mgr.abort(reader.txn_id);
     }
@@ -855,7 +861,10 @@ mod tests {
         assert_eq!(mgr.active_count(), 0);
         // next_lsn = 2001, oldest_snapshot = 2001, floor = 2001 - 1000 = 1001.
         let pruned = mgr.prune_committed(1000);
-        assert!(pruned >= 1000, "must prune at least margin entries; got {pruned}");
+        assert!(
+            pruned >= 1000,
+            "must prune at least margin entries; got {pruned}"
+        );
         // Everything below 1001 should be gone from the treemap.
         assert!(
             mgr.committed_count() <= 1001,
@@ -880,7 +889,10 @@ mod tests {
         let threshold = Duration::from_secs(600);
         let now = baseline; // 700s after t1's start
         let killed = mgr.mark_old_snapshots_killed(now, threshold);
-        assert_eq!(killed, 1, "one snapshot older than threshold must be killed");
+        assert_eq!(
+            killed, 1,
+            "one snapshot older than threshold must be killed"
+        );
         assert!(mgr.is_killed(t1.txn_id), "t1 must be marked killed");
     }
 
@@ -926,11 +938,17 @@ mod tests {
     fn test_kill_snapshot_by_id() {
         let mut mgr = TransactionManager::new();
         let t1 = mgr.begin();
-        assert!(mgr.kill_snapshot(t1.txn_id), "must return true for active txn");
+        assert!(
+            mgr.kill_snapshot(t1.txn_id),
+            "must return true for active txn"
+        );
         assert!(mgr.is_killed(t1.txn_id), "must be marked killed");
 
         // Unknown txn_id
-        assert!(!mgr.kill_snapshot(9999), "must return false for unknown txn_id");
+        assert!(
+            !mgr.kill_snapshot(9999),
+            "must return false for unknown txn_id"
+        );
 
         // Already killed — idempotent false
         assert!(
@@ -976,10 +994,6 @@ mod tests {
         let baseline = Instant::now();
         let _t1 = mgr.begin_with_time(baseline - Duration::from_secs(42));
         let age = mgr.oldest_snapshot_age(baseline).expect("age must be Some");
-        assert!(
-            age.as_secs() >= 42,
-            "age must be >= 42s; got {:?}",
-            age
-        );
+        assert!(age.as_secs() >= 42, "age must be >= 42s; got {:?}", age);
     }
 }

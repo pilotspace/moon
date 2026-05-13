@@ -57,7 +57,25 @@ pub(super) fn try_handle_txn_commit(
     match txn_commit_validate(conn.in_cross_txn()) {
         Ok(()) => {
             if let Some(txn) = conn.active_cross_txn.take() {
+                // MA2: reject commit if the snapshot was killed (by operator KILL SNAPSHOT
+                // or by the automatic old_snapshot_threshold sweep). A killed snapshot may
+                // have been excluded from oldest_snapshot, allowing prune_committed to
+                // advance past its LSN. Committing with a stale read set is undefined
+                // behaviour — force the client to restart the transaction.
                 let mut vector_store = ctx.shard_databases.vector_store(ctx.shard_id);
+                if vector_store.txn_manager().is_killed(txn.txn_id) {
+                    vector_store.txn_manager_mut().abort_killed(txn.txn_id);
+                    drop(vector_store);
+                    tracing::warn!(
+                        txn_id = txn.txn_id,
+                        "TXN.COMMIT rejected: snapshot was killed (snapshot too old)"
+                    );
+                    let mut msg = bytes::BytesMut::new();
+                    use std::fmt::Write as _;
+                    let _ = write!(msg, "MOONERR snapshot too old: {}", txn.txn_id);
+                    responses.push(Frame::Error(msg.freeze()));
+                    return true;
+                }
                 vector_store.txn_manager_mut().commit(txn.txn_id);
                 drop(vector_store);
 
