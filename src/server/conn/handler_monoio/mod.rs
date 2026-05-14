@@ -539,7 +539,12 @@ pub(crate) async fn handle_connection_sharded_monoio<
             std::collections::HashMap::new();
 
         // Refresh time once per batch — sub-millisecond accuracy not needed per-command.
-        {
+        // Phase 2a: gate on is_initialized(); new path uses ShardSlice directly.
+        if crate::shard::slice::is_initialized() {
+            crate::shard::slice::with_shard_db(conn.selected_db, |db| {
+                db.refresh_now_from_cache(&ctx.cached_clock);
+            });
+        } else {
             let mut guard = ctx.shard_databases.write_db(ctx.shard_id, conn.selected_db);
             guard.refresh_now_from_cache(&ctx.cached_clock);
         }
@@ -890,9 +895,17 @@ pub(crate) async fn handle_connection_sharded_monoio<
 
             // --- MA2: KILL SNAPSHOT <txn_id> ---
             if cmd.eq_ignore_ascii_case(b"KILL") {
-                let mut vs = ctx.shard_databases.vector_store(ctx.shard_id);
-                let response = crate::command::server_admin::kill_snapshot(&mut vs, cmd_args);
-                drop(vs);
+                // Phase 2a: gate on is_initialized(); new path uses ShardSlice directly.
+                let response = if crate::shard::slice::is_initialized() {
+                    crate::shard::slice::with_shard(|s| {
+                        crate::command::server_admin::kill_snapshot(&mut s.vector_store, cmd_args)
+                    })
+                } else {
+                    let mut vs = ctx.shard_databases.vector_store(ctx.shard_id);
+                    let response = crate::command::server_admin::kill_snapshot(&mut vs, cmd_args);
+                    drop(vs);
+                    response
+                };
                 responses.push(response);
                 continue;
             }
@@ -908,39 +921,80 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 if let Some(sub_frame) = cmd_args.first() {
                     if let Some(sub) = crate::command::helpers::extract_bytes(sub_frame) {
                         if sub.eq_ignore_ascii_case(b"VECTOR") {
-                            let mut vs = ctx.shard_databases.vector_store(ctx.shard_id);
-                            let response = crate::command::server_admin::vacuum_vector(
-                                &mut vs,
-                                &cmd_args[1..],
-                            );
-                            drop(vs);
+                            // Phase 2a: gate on is_initialized()
+                            let response = if crate::shard::slice::is_initialized() {
+                                crate::shard::slice::with_shard(|s| {
+                                    crate::command::server_admin::vacuum_vector(
+                                        &mut s.vector_store,
+                                        &cmd_args[1..],
+                                    )
+                                })
+                            } else {
+                                let mut vs = ctx.shard_databases.vector_store(ctx.shard_id);
+                                let r = crate::command::server_admin::vacuum_vector(
+                                    &mut vs,
+                                    &cmd_args[1..],
+                                );
+                                drop(vs);
+                                r
+                            };
                             responses.push(response);
                             continue;
                         }
                         #[cfg(feature = "graph")]
                         if sub.eq_ignore_ascii_case(b"GRAPH") {
-                            let mut gs = ctx.shard_databases.graph_store_write(ctx.shard_id);
-                            let response = crate::command::server_admin::vacuum_graph(
-                                &mut gs,
-                                &cmd_args[1..],
-                                ctx.config.graph_merge_max_segments,
-                                ctx.config.graph_dead_edge_trigger,
-                            );
-                            drop(gs);
+                            // Phase 2a: gate on is_initialized()
+                            let response = if crate::shard::slice::is_initialized() {
+                                let graph_merge_max = ctx.config.graph_merge_max_segments;
+                                let graph_dead = ctx.config.graph_dead_edge_trigger;
+                                crate::shard::slice::with_shard(|s| {
+                                    crate::command::server_admin::vacuum_graph(
+                                        &mut s.graph_store,
+                                        &cmd_args[1..],
+                                        graph_merge_max,
+                                        graph_dead,
+                                    )
+                                })
+                            } else {
+                                let mut gs =
+                                    ctx.shard_databases.graph_store_write(ctx.shard_id);
+                                let r = crate::command::server_admin::vacuum_graph(
+                                    &mut gs,
+                                    &cmd_args[1..],
+                                    ctx.config.graph_merge_max_segments,
+                                    ctx.config.graph_dead_edge_trigger,
+                                );
+                                drop(gs);
+                                r
+                            };
                             responses.push(response);
                             continue;
                         }
                     }
                 }
-                let mut vs = ctx.shard_databases.vector_store(ctx.shard_id);
-                let response = crate::command::server_admin::vacuum(
-                    &mut vs,
-                    None, // manifest — not available in connection handler
-                    None, // wal_v3 — not available in connection handler
-                    cmd_args,
-                    crate::command::server_admin::DEFAULT_VACUUM_PRUNE_MARGIN, // see server_admin.rs
-                );
-                drop(vs);
+                // Phase 2a: gate on is_initialized() for generic VACUUM
+                let response = if crate::shard::slice::is_initialized() {
+                    crate::shard::slice::with_shard(|s| {
+                        crate::command::server_admin::vacuum(
+                            &mut s.vector_store,
+                            None,
+                            None,
+                            cmd_args,
+                            crate::command::server_admin::DEFAULT_VACUUM_PRUNE_MARGIN,
+                        )
+                    })
+                } else {
+                    let mut vs = ctx.shard_databases.vector_store(ctx.shard_id);
+                    let r = crate::command::server_admin::vacuum(
+                        &mut vs,
+                        None, // manifest — not available in connection handler
+                        None, // wal_v3 — not available in connection handler
+                        cmd_args,
+                        crate::command::server_admin::DEFAULT_VACUUM_PRUNE_MARGIN,
+                    );
+                    drop(vs);
+                    r
+                };
                 responses.push(response);
                 continue;
             }
@@ -950,10 +1004,23 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 if let Some(sub) = cmd_args.first() {
                     if let Some(s) = crate::command::helpers::extract_bytes(sub) {
                         if s.eq_ignore_ascii_case(b"RECLAMATION") {
-                            let vs = ctx.shard_databases.vector_store(ctx.shard_id);
-                            let response =
-                                crate::command::server_admin::debug_reclamation(&vs, None, None);
-                            drop(vs);
+                            // Phase 2a: gate on is_initialized()
+                            let response = if crate::shard::slice::is_initialized() {
+                                crate::shard::slice::with_shard(|s| {
+                                    crate::command::server_admin::debug_reclamation(
+                                        &s.vector_store,
+                                        None,
+                                        None,
+                                    )
+                                })
+                            } else {
+                                let vs = ctx.shard_databases.vector_store(ctx.shard_id);
+                                let r = crate::command::server_admin::debug_reclamation(
+                                    &vs, None, None,
+                                );
+                                drop(vs);
+                                r
+                            };
                             responses.push(response);
                             continue;
                         }
@@ -1004,91 +1071,325 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 if metadata::is_write(cmd) {
                     // WRITE PATH: eviction + dispatch under write lock.
                     //
+                    // Phase 2a: Option A gating — when is_initialized() the new path
+                    // uses ShardSlice directly (dead code until Phase 4 wires init_shard).
+                    // The old path (else branch) is the current live path.
+                    //
                     // Fast path: when neither maxmemory nor disk-offload is
                     // configured (default deployment + default bench), skip
                     // the `runtime_config.read()` acquire and the eviction
                     // call entirely — both are no-ops. Saves one RwLock
                     // lock pair per pipelined write.
-                    let mut guard = ctx.shard_databases.write_db(ctx.shard_id, conn.selected_db);
-                    if batch_eviction_active {
-                        let rt = ctx.runtime_config.read();
-                        let evict_result = if let Some(ref sender) = ctx.spill_sender {
-                            let mut fid = ctx.spill_file_id.get();
-                            let dir = ctx
-                                .disk_offload_dir
-                                .as_deref()
-                                .unwrap_or(std::path::Path::new("."));
-                            let res = try_evict_if_needed_async_spill(
-                                &mut guard,
-                                &rt,
-                                sender,
-                                dir,
-                                &mut fid,
-                                conn.selected_db,
-                            );
-                            ctx.spill_file_id.set(fid);
-                            res
+                    //
+                    // Returns Ok((result, new_selected_db, hset_inserts)) on success
+                    // or Err(oom_frame) when OOM eviction fails (caller pushes + continues).
+                    let write_result: Result<(DispatchResult, usize, smallvec::SmallVec<[(bytes::Bytes, u64); 4]>), Frame> =
+                        'write_path: {
+                        if crate::shard::slice::is_initialized() {
+                            crate::shard::slice::with_shard(|s| {
+                                let sel_db = conn.selected_db;
+                                let db = &mut s.databases[sel_db];
+
+                                // Eviction under the new path
+                                if batch_eviction_active {
+                                    let rt = ctx.runtime_config.read();
+                                    let evict_result = if let Some(ref sender) = ctx.spill_sender {
+                                        let mut fid = ctx.spill_file_id.get();
+                                        let dir = ctx
+                                            .disk_offload_dir
+                                            .as_deref()
+                                            .unwrap_or(std::path::Path::new("."));
+                                        let res = try_evict_if_needed_async_spill(
+                                            db,
+                                            &rt,
+                                            sender,
+                                            dir,
+                                            &mut fid,
+                                            sel_db,
+                                        );
+                                        ctx.spill_file_id.set(fid);
+                                        res
+                                    } else {
+                                        try_evict_if_needed(db, &rt)
+                                    };
+                                    evict_result?;
+                                }
+
+                                // KV undo-log capture (MUST precede dispatch)
+                                if let Some(ref mut txn) = conn.active_cross_txn {
+                                    if cmd.eq_ignore_ascii_case(b"DEL")
+                                        || cmd.eq_ignore_ascii_case(b"UNLINK")
+                                    {
+                                        for arg in cmd_args.iter() {
+                                            if let Frame::BulkString(key_bytes) = arg {
+                                                if let Some(old_entry) =
+                                                    db.get(key_bytes.as_ref()).cloned()
+                                                {
+                                                    txn.kv_undo
+                                                        .record_delete(key_bytes.clone(), old_entry);
+                                                    let lsn = txn.snapshot_lsn;
+                                                    let tid = txn.txn_id;
+                                                    ctx.shard_databases
+                                                        .kv_intents(ctx.shard_id)
+                                                        .record_write(key_bytes.clone(), lsn, tid);
+                                                }
+                                            }
+                                        }
+                                    } else if let Some(key) =
+                                        crate::server::conn::shared::extract_primary_key(
+                                            cmd, cmd_args,
+                                        )
+                                    {
+                                        let old_entry = db.get(key.as_ref()).cloned();
+                                        let lsn = txn.snapshot_lsn;
+                                        let tid = txn.txn_id;
+                                        match old_entry {
+                                            None => txn.kv_undo.record_insert(key.clone()),
+                                            Some(entry) => {
+                                                txn.kv_undo.record_update(key.clone(), entry)
+                                            }
+                                        }
+                                        ctx.shard_databases
+                                            .kv_intents(ctx.shard_id)
+                                            .record_write(key.clone(), lsn, tid);
+                                    }
+                                }
+
+                                // Dispatch
+                                let mut new_sel_db = sel_db;
+                                let result =
+                                    dispatch(db, cmd, cmd_args, &mut new_sel_db, db_count);
+                                let response_frame = match &result {
+                                    DispatchResult::Response(f) | DispatchResult::Quit(f) => {
+                                        f.clone()
+                                    }
+                                };
+                                let is_error = matches!(response_frame, Frame::Error(_));
+
+                                // HSET auto-index: disjoint field borrows (NLL)
+                                // &mut s.vector_store + &mut s.text_store are separate
+                                // from s.databases[sel_db] already borrowed above as `db`.
+                                // Re-borrow db after dispatch since `db` was moved into dispatch.
+                                let hset_inserts = if !is_error
+                                    && cmd.eq_ignore_ascii_case(b"HSET")
+                                {
+                                    if let Some(key) =
+                                        cmd_args.first().and_then(|f| extract_bytes(f))
+                                    {
+                                        crate::shard::spsc_handler::auto_index_hset_public(
+                                            &mut s.vector_store,
+                                            &mut s.text_store,
+                                            key.as_ref(),
+                                            cmd_args,
+                                        )
+                                    } else {
+                                        smallvec::SmallVec::new()
+                                    }
+                                } else {
+                                    smallvec::SmallVec::new()
+                                };
+
+                                // Blocking wakeup: re-borrow db by index (NLL)
+                                if !is_error {
+                                    let needs_wake = cmd.eq_ignore_ascii_case(b"LPUSH")
+                                        || cmd.eq_ignore_ascii_case(b"RPUSH")
+                                        || cmd.eq_ignore_ascii_case(b"LMOVE")
+                                        || cmd.eq_ignore_ascii_case(b"ZADD");
+                                    if needs_wake {
+                                        if let Some(key) =
+                                            cmd_args.first().and_then(|f| extract_bytes(f))
+                                        {
+                                            let mut reg = ctx.blocking_registry.borrow_mut();
+                                            let wake_db = &mut s.databases[new_sel_db];
+                                            if cmd.eq_ignore_ascii_case(b"LPUSH")
+                                                || cmd.eq_ignore_ascii_case(b"RPUSH")
+                                                || cmd.eq_ignore_ascii_case(b"LMOVE")
+                                            {
+                                                crate::blocking::wakeup::try_wake_list_waiter(
+                                                    &mut reg,
+                                                    wake_db,
+                                                    new_sel_db,
+                                                    &key,
+                                                );
+                                            } else {
+                                                crate::blocking::wakeup::try_wake_zset_waiter(
+                                                    &mut reg,
+                                                    wake_db,
+                                                    new_sel_db,
+                                                    &key,
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+
+                                Ok((result, new_sel_db, hset_inserts))
+                            })
                         } else {
-                            try_evict_if_needed(&mut guard, &rt)
-                        };
-                        if let Err(oom_frame) = evict_result {
+                            let mut guard =
+                                ctx.shard_databases.write_db(ctx.shard_id, conn.selected_db);
+                            if batch_eviction_active {
+                                let rt = ctx.runtime_config.read();
+                                let evict_result = if let Some(ref sender) = ctx.spill_sender {
+                                    let mut fid = ctx.spill_file_id.get();
+                                    let dir = ctx
+                                        .disk_offload_dir
+                                        .as_deref()
+                                        .unwrap_or(std::path::Path::new("."));
+                                    let res = try_evict_if_needed_async_spill(
+                                        &mut guard,
+                                        &rt,
+                                        sender,
+                                        dir,
+                                        &mut fid,
+                                        conn.selected_db,
+                                    );
+                                    ctx.spill_file_id.set(fid);
+                                    res
+                                } else {
+                                    try_evict_if_needed(&mut guard, &rt)
+                                };
+                                if let Err(oom_frame) = evict_result {
+                                    drop(guard);
+                                    drop(rt);
+                                    break 'write_path Err(oom_frame);
+                                }
+                                drop(rt);
+                            }
+
+                            if let Some(ref mut txn) = conn.active_cross_txn {
+                                if cmd.eq_ignore_ascii_case(b"DEL")
+                                    || cmd.eq_ignore_ascii_case(b"UNLINK")
+                                {
+                                    for arg in cmd_args.iter() {
+                                        if let Frame::BulkString(key_bytes) = arg {
+                                            if let Some(old_entry) =
+                                                guard.get(key_bytes.as_ref()).cloned()
+                                            {
+                                                txn.kv_undo
+                                                    .record_delete(key_bytes.clone(), old_entry);
+                                                let lsn = txn.snapshot_lsn;
+                                                let tid = txn.txn_id;
+                                                ctx.shard_databases
+                                                    .kv_intents(ctx.shard_id)
+                                                    .record_write(key_bytes.clone(), lsn, tid);
+                                            }
+                                        }
+                                    }
+                                } else if let Some(key) =
+                                    crate::server::conn::shared::extract_primary_key(cmd, cmd_args)
+                                {
+                                    let old_entry = guard.get(key.as_ref()).cloned();
+                                    let lsn = txn.snapshot_lsn;
+                                    let tid = txn.txn_id;
+                                    match old_entry {
+                                        None => txn.kv_undo.record_insert(key.clone()),
+                                        Some(entry) => {
+                                            txn.kv_undo.record_update(key.clone(), entry)
+                                        }
+                                    }
+                                    ctx.shard_databases
+                                        .kv_intents(ctx.shard_id)
+                                        .record_write(key.clone(), lsn, tid);
+                                }
+                            }
+
+                            let result = dispatch(
+                                &mut guard,
+                                cmd,
+                                cmd_args,
+                                &mut conn.selected_db,
+                                db_count,
+                            );
+                            let new_sel_db = conn.selected_db;
+                            let is_error = matches!(
+                                result,
+                                DispatchResult::Response(Frame::Error(_))
+                                    | DispatchResult::Quit(Frame::Error(_))
+                            );
+
+                            let hset_inserts =
+                                if !is_error && cmd.eq_ignore_ascii_case(b"HSET") {
+                                    if let Some(key) =
+                                        cmd_args.first().and_then(|f| extract_bytes(f))
+                                    {
+                                        let mut vs =
+                                            ctx.shard_databases.vector_store(ctx.shard_id);
+                                        let mut ts =
+                                            ctx.shard_databases.text_store(ctx.shard_id);
+                                        crate::shard::spsc_handler::auto_index_hset_public(
+                                            &mut vs,
+                                            &mut *ts,
+                                            key.as_ref(),
+                                            cmd_args,
+                                        )
+                                    } else {
+                                        smallvec::SmallVec::new()
+                                    }
+                                } else {
+                                    smallvec::SmallVec::new()
+                                };
+
+                            if !is_error {
+                                let needs_wake = cmd.eq_ignore_ascii_case(b"LPUSH")
+                                    || cmd.eq_ignore_ascii_case(b"RPUSH")
+                                    || cmd.eq_ignore_ascii_case(b"LMOVE")
+                                    || cmd.eq_ignore_ascii_case(b"ZADD");
+                                if needs_wake {
+                                    if let Some(key) =
+                                        cmd_args.first().and_then(|f| extract_bytes(f))
+                                    {
+                                        let mut reg = ctx.blocking_registry.borrow_mut();
+                                        if cmd.eq_ignore_ascii_case(b"LPUSH")
+                                            || cmd.eq_ignore_ascii_case(b"RPUSH")
+                                            || cmd.eq_ignore_ascii_case(b"LMOVE")
+                                        {
+                                            crate::blocking::wakeup::try_wake_list_waiter(
+                                                &mut reg,
+                                                &mut guard,
+                                                new_sel_db,
+                                                &key,
+                                            );
+                                        } else {
+                                            crate::blocking::wakeup::try_wake_zset_waiter(
+                                                &mut reg,
+                                                &mut guard,
+                                                new_sel_db,
+                                                &key,
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+
                             drop(guard);
-                            drop(rt);
+                            Ok((result, new_sel_db, hset_inserts))
+                        } // end else branch
+                        }; // end 'write_path labeled block
+
+                    // Unpack write result — OOM causes immediate continue
+                    let (result, new_selected_db, hset_inserts) = match write_result {
+                        Ok(t) => t,
+                        Err(oom_frame) => {
                             responses.push(oom_frame);
                             continue;
                         }
-                        drop(rt);
-                    }
+                    };
+                    conn.selected_db = new_selected_db;
 
-                    // KV undo-log capture for active cross-store transactions.
-                    // MUST happen BEFORE dispatch() overwrites the database entry.
-                    if let Some(ref mut txn) = conn.active_cross_txn {
-                        if cmd.eq_ignore_ascii_case(b"DEL") || cmd.eq_ignore_ascii_case(b"UNLINK") {
-                            // Multi-key DEL: iterate all args for undo capture
-                            for arg in cmd_args.iter() {
-                                if let Frame::BulkString(key_bytes) = arg {
-                                    if let Some(old_entry) = guard.get(key_bytes.as_ref()).cloned()
-                                    {
-                                        txn.kv_undo.record_delete(key_bytes.clone(), old_entry);
-                                        let lsn = txn.snapshot_lsn;
-                                        let tid = txn.txn_id;
-                                        ctx.shard_databases.kv_intents(ctx.shard_id).record_write(
-                                            key_bytes.clone(),
-                                            lsn,
-                                            tid,
-                                        );
-                                    }
-                                    // Key not found: nothing to undo, no intent registered
-                                }
-                            }
-                        } else if let Some(key) =
-                            crate::server::conn::shared::extract_primary_key(cmd, cmd_args)
-                        {
-                            // SET / HSET / INCR / etc. — single primary key
-                            let old_entry = guard.get(key.as_ref()).cloned();
-                            let lsn = txn.snapshot_lsn;
-                            let tid = txn.txn_id;
-                            match old_entry {
-                                None => txn.kv_undo.record_insert(key.clone()),
-                                Some(entry) => txn.kv_undo.record_update(key.clone(), entry),
-                            }
-                            ctx.shard_databases.kv_intents(ctx.shard_id).record_write(
-                                key.clone(),
-                                lsn,
-                                tid,
-                            );
-                        }
-                    }
-
-                    // 1-in-16 latency sampling: skips ~30-40ns `Instant::now()`
-                    // on 15/16 of writes while keeping histogram + counter
-                    // statistically accurate. Slowlog at default 10 ms threshold
-                    // never fires on pipelined GET/SET regardless.
+                    // 1-in-16 latency sampling (outside closure — needs conn.cached_metrics)
                     conn.cmd_counter = conn.cmd_counter.wrapping_add(1);
                     let sample_latency = (conn.cmd_counter & 0xF) == 0;
                     let dispatch_start = sample_latency.then(std::time::Instant::now);
-                    let result =
-                        dispatch(&mut guard, cmd, cmd_args, &mut conn.selected_db, db_count);
+
+                    let response = match result {
+                        DispatchResult::Response(f) => f,
+                        DispatchResult::Quit(f) => {
+                            should_quit = true;
+                            f
+                        }
+                    };
+
                     if let Ok(cmd_str) = std::str::from_utf8(cmd) {
                         if let Some(start) = dispatch_start {
                             let elapsed_us = start.elapsed().as_micros() as u64;
@@ -1115,14 +1416,6 @@ pub(crate) async fn handle_connection_sharded_monoio<
                         }
                     }
 
-                    let response = match result {
-                        DispatchResult::Response(f) => f,
-                        DispatchResult::Quit(f) => {
-                            should_quit = true;
-                            f
-                        }
-                    };
-
                     // AOF logging for successful local writes
                     if !matches!(response, Frame::Error(_)) && is_write {
                         if let Some(ref tx) = ctx.aof_tx {
@@ -1131,65 +1424,15 @@ pub(crate) async fn handle_connection_sharded_monoio<
                         }
                     }
 
-                    // Auto-index HSET into vector/text stores (if key matches index prefix)
-                    if !matches!(response, Frame::Error(_)) && cmd.eq_ignore_ascii_case(b"HSET") {
-                        if let Some(key) = cmd_args.first().and_then(|f| extract_bytes(f)) {
-                            let inserted = {
-                                let mut vs = ctx.shard_databases.vector_store(ctx.shard_id);
-                                let mut ts = ctx.shard_databases.text_store(ctx.shard_id);
-                                crate::shard::spsc_handler::auto_index_hset_public(
-                                    &mut vs,
-                                    &mut *ts,
-                                    key.as_ref(),
-                                    cmd_args,
-                                )
-                            };
-                            // Phase 166 (Plan 02): if inside an active cross-store
-                            // TXN, push one VectorIntent per (index_name, key_hash)
-                            // so TXN.ABORT (Plan 166-03) can tombstone via
-                            // MutableSegment::mark_deleted_by_key_hash. Non-TXN
-                            // paths discard the tuples — auto_index_hset already
-                            // performed the append.
-                            if let Some(txn) = conn.active_cross_txn.as_mut() {
-                                for (index_name, key_hash) in inserted {
-                                    txn.record_vector(key_hash, index_name);
-                                }
+                    // Phase 166 (Plan 02): record VectorIntents from HSET auto-index
+                    // into active cross-store TXN so TXN.ABORT can tombstone them.
+                    if !matches!(response, Frame::Error(_)) && !hset_inserts.is_empty() {
+                        if let Some(txn) = conn.active_cross_txn.as_mut() {
+                            for (index_name, key_hash) in hset_inserts {
+                                txn.record_vector(key_hash, index_name);
                             }
                         }
                     }
-
-                    // Post-dispatch wakeup hooks for producer commands
-                    if !matches!(response, Frame::Error(_)) {
-                        let needs_wake = cmd.eq_ignore_ascii_case(b"LPUSH")
-                            || cmd.eq_ignore_ascii_case(b"RPUSH")
-                            || cmd.eq_ignore_ascii_case(b"LMOVE")
-                            || cmd.eq_ignore_ascii_case(b"ZADD");
-                        if needs_wake {
-                            if let Some(key) = cmd_args.first().and_then(|f| extract_bytes(f)) {
-                                let mut reg = ctx.blocking_registry.borrow_mut();
-                                if cmd.eq_ignore_ascii_case(b"LPUSH")
-                                    || cmd.eq_ignore_ascii_case(b"RPUSH")
-                                    || cmd.eq_ignore_ascii_case(b"LMOVE")
-                                {
-                                    crate::blocking::wakeup::try_wake_list_waiter(
-                                        &mut reg,
-                                        &mut guard,
-                                        conn.selected_db,
-                                        &key,
-                                    );
-                                } else {
-                                    crate::blocking::wakeup::try_wake_zset_waiter(
-                                        &mut reg,
-                                        &mut guard,
-                                        conn.selected_db,
-                                        &key,
-                                    );
-                                }
-                            }
-                        }
-                    }
-
-                    drop(guard);
 
                     // Track key on write / invalidate tracked keys
                     if conn.tracking_state.enabled && !matches!(response, Frame::Error(_)) {
@@ -1223,7 +1466,11 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                 let my_txn_id = txn.txn_id;
                                 // Clone committed treemap to release vector_store lock
                                 // before acquiring kv_intents lock (lock ordering).
-                                let committed = {
+                                let committed = if crate::shard::slice::is_initialized() {
+                                    crate::shard::slice::with_shard(|s| {
+                                        s.vector_store.txn_manager().committed_treemap().clone()
+                                    })
+                                } else {
                                     let vs = ctx.shard_databases.vector_store(ctx.shard_id);
                                     vs.txn_manager().committed_treemap().clone()
                                 };
@@ -1245,19 +1492,36 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     }
 
                     // READ PATH: shared lock — no contention with other shards' reads
-                    let guard = ctx.shard_databases.read_db(ctx.shard_id, conn.selected_db);
                     let now_ms = ctx.cached_clock.ms();
                     conn.cmd_counter = conn.cmd_counter.wrapping_add(1);
                     let sample_latency = (conn.cmd_counter & 0xF) == 0;
                     let dispatch_start = sample_latency.then(std::time::Instant::now);
-                    let result = dispatch_read(
-                        &guard,
-                        cmd,
-                        cmd_args,
-                        now_ms,
-                        &mut conn.selected_db,
-                        db_count,
-                    );
+                    let (result, new_read_selected_db) =
+                        if crate::shard::slice::is_initialized() {
+                            let mut sel_db = conn.selected_db;
+                            let result = crate::shard::slice::with_shard_db(
+                                conn.selected_db,
+                                |db| {
+                                    dispatch_read(db, cmd, cmd_args, now_ms, &mut sel_db, db_count)
+                                },
+                            );
+                            (result, sel_db)
+                        } else {
+                            let guard =
+                                ctx.shard_databases.read_db(ctx.shard_id, conn.selected_db);
+                            let result = dispatch_read(
+                                &guard,
+                                cmd,
+                                cmd_args,
+                                now_ms,
+                                &mut conn.selected_db,
+                                db_count,
+                            );
+                            let sel = conn.selected_db;
+                            drop(guard);
+                            (result, sel)
+                        };
+                    conn.selected_db = new_read_selected_db;
                     if let Ok(cmd_str) = std::str::from_utf8(cmd) {
                         if let Some(start) = dispatch_start {
                             let elapsed_us = start.elapsed().as_micros() as u64;
@@ -1283,7 +1547,6 @@ pub(crate) async fn handle_connection_sharded_monoio<
                             );
                         }
                     }
-                    drop(guard);
 
                     let response = match result {
                         DispatchResult::Response(f) => f,
