@@ -714,8 +714,14 @@ pub async fn coordinate_dbsize(
 
     // Local shard
     {
-        let guard = shard_databases.read_db(my_shard, db_index);
-        total += guard.len() as i64;
+        // Phase 2c: gate on is_initialized(); new path uses ShardSlice directly.
+        let local_len = if crate::shard::slice::is_initialized() {
+            crate::shard::slice::with_shard_db(db_index, |db| db.len()) as i64
+        } else {
+            let guard = shard_databases.read_db(my_shard, db_index);
+            guard.len() as i64
+        };
+        total += local_len;
     }
 
     // Remote shards
@@ -1025,16 +1031,30 @@ pub async fn scatter_text_search(
             // Apply post-processing if requested — guards held, no .await below.
             if highlight_opts.is_some() || summarize_opts.is_some() {
                 if let Some(text_index) = ts.get_index(&index_name) {
-                    let db_guard = shard_databases.read_db(my_shard, 0);
-                    crate::command::vector_search::ft_text_search::apply_post_processing(
-                        &mut r,
-                        &term_strings,
-                        text_index,
-                        &*db_guard,
-                        highlight_opts.as_ref(),
-                        summarize_opts.as_ref(),
-                    );
-                    // db_guard drops here.
+                    // Phase 2c: gate on is_initialized(); new path uses ShardSlice.
+                    if crate::shard::slice::is_initialized() {
+                        crate::shard::slice::with_shard_db(0, |db| {
+                            crate::command::vector_search::ft_text_search::apply_post_processing(
+                                &mut r,
+                                &term_strings,
+                                text_index,
+                                db,
+                                highlight_opts.as_ref(),
+                                summarize_opts.as_ref(),
+                            );
+                        });
+                    } else {
+                        let db_guard = shard_databases.read_db(my_shard, 0);
+                        crate::command::vector_search::ft_text_search::apply_post_processing(
+                            &mut r,
+                            &term_strings,
+                            text_index,
+                            &*db_guard,
+                            highlight_opts.as_ref(),
+                            summarize_opts.as_ref(),
+                        );
+                        // db_guard drops here.
+                    }
                 }
             }
             r
@@ -1131,16 +1151,30 @@ pub async fn scatter_text_search(
                             );
                         // Apply HIGHLIGHT/SUMMARIZE while guards are held — sync, no .await.
                         if highlight_opts.is_some() || summarize_opts.is_some() {
-                            let db_guard = shard_databases.read_db(shard_id, 0);
-                            crate::command::vector_search::ft_text_search::apply_post_processing(
-                                &mut r,
-                                &term_strings,
-                                text_index,
-                                &*db_guard,
-                                highlight_opts.as_ref(),
-                                summarize_opts.as_ref(),
-                            );
-                            // db_guard drops here.
+                            // Phase 2c: gate on is_initialized(); shard_id == my_shard here.
+                            if crate::shard::slice::is_initialized() {
+                                crate::shard::slice::with_shard_db(0, |db| {
+                                    crate::command::vector_search::ft_text_search::apply_post_processing(
+                                        &mut r,
+                                        &term_strings,
+                                        text_index,
+                                        db,
+                                        highlight_opts.as_ref(),
+                                        summarize_opts.as_ref(),
+                                    );
+                                });
+                            } else {
+                                let db_guard = shard_databases.read_db(shard_id, 0);
+                                crate::command::vector_search::ft_text_search::apply_post_processing(
+                                    &mut r,
+                                    &term_strings,
+                                    text_index,
+                                    &*db_guard,
+                                    highlight_opts.as_ref(),
+                                    summarize_opts.as_ref(),
+                                );
+                                // db_guard drops here.
+                            }
                         }
                         r
                     }
