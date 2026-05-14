@@ -120,8 +120,15 @@ pub(crate) fn advance_snapshot_segment(
         let current_db = snap.current_db_index();
         let db_count = shard_databases.db_count();
         if current_db < db_count {
-            let guard = shard_databases.read_db(shard_id, current_db);
-            snap.advance_one_segment_db(&guard)
+            // Phase 2d: gate on is_initialized(); new path uses ShardSlice directly.
+            if crate::shard::slice::is_initialized() {
+                crate::shard::slice::with_shard_db(current_db, |db| {
+                    snap.advance_one_segment_db(db)
+                })
+            } else {
+                let guard = shard_databases.read_db(shard_id, current_db);
+                snap.advance_one_segment_db(&guard)
+            }
         } else {
             // All databases serialized, return true to trigger finalization
             true
@@ -401,15 +408,30 @@ pub(crate) fn apply_spill_completions(
         }
 
         // Update ColdIndex in the originating logical DB.
-        let mut guard = shard_databases.write_db(shard_id, c.db_index);
-        if let Some(ref mut ci) = guard.cold_index {
-            ci.insert(
-                c.key,
-                crate::storage::tiered::cold_index::ColdLocation {
-                    file_id: c.file_id,
-                    slot_idx: c.slot_idx,
-                },
-            );
+        // Phase 2d: gate on is_initialized(); new path uses ShardSlice directly.
+        if crate::shard::slice::is_initialized() {
+            crate::shard::slice::with_shard_db(c.db_index, |db| {
+                if let Some(ref mut ci) = db.cold_index {
+                    ci.insert(
+                        c.key,
+                        crate::storage::tiered::cold_index::ColdLocation {
+                            file_id: c.file_id,
+                            slot_idx: c.slot_idx,
+                        },
+                    );
+                }
+            });
+        } else {
+            let mut guard = shard_databases.write_db(shard_id, c.db_index);
+            if let Some(ref mut ci) = guard.cold_index {
+                ci.insert(
+                    c.key,
+                    crate::storage::tiered::cold_index::ColdLocation {
+                        file_id: c.file_id,
+                        slot_idx: c.slot_idx,
+                    },
+                );
+            }
         }
     }
 }
@@ -479,14 +501,27 @@ pub(crate) fn handle_memory_pressure(
         let shard_dir = server_config
             .effective_disk_offload_dir()
             .join(format!("shard-{}", shard_id));
-        let vs = shard_databases.vector_store(shard_id);
-        let count = vs.try_warm_transitions_all(
-            &shard_dir,
-            manifest,
-            aggressive_threshold,
-            next_file_id,
-            wal_v3,
-        );
+        // Phase 2d: gate on is_initialized(); new path uses ShardSlice directly.
+        let count = if crate::shard::slice::is_initialized() {
+            crate::shard::slice::with_shard(|s| {
+                s.vector_store.try_warm_transitions_all(
+                    &shard_dir,
+                    manifest,
+                    aggressive_threshold,
+                    next_file_id,
+                    wal_v3,
+                )
+            })
+        } else {
+            let vs = shard_databases.vector_store(shard_id);
+            vs.try_warm_transitions_all(
+                &shard_dir,
+                manifest,
+                aggressive_threshold,
+                next_file_id,
+                wal_v3,
+            )
+        };
         if count > 0 {
             tracing::info!(
                 "Shard {}: memory pressure step 2 -- force-demoted {} segment(s) HOT->WARM",
@@ -515,13 +550,27 @@ pub(crate) fn handle_memory_pressure(
                     .effective_disk_offload_dir()
                     .join(format!("shard-{}", shard_id));
 
+                // Phase 2d: gate on is_initialized(); new path uses ShardSlice directly.
+                let use_slice = crate::shard::slice::is_initialized();
                 if let Some(spill_t) = spill_thread {
                     // Async spill path: background thread does pwrite
                     let sender = spill_t.sender();
                     for i in 0..db_count {
-                        let mut guard = shard_databases.write_db(shard_id, i);
-                        let _ =
-                            crate::storage::eviction::try_evict_if_needed_async_spill_with_total(
+                        if use_slice {
+                            crate::shard::slice::with_shard_db(i, |db| {
+                                let _ = crate::storage::eviction::try_evict_if_needed_async_spill_with_total(
+                                    db,
+                                    &rt,
+                                    &sender,
+                                    &shard_dir,
+                                    next_file_id,
+                                    total_mem,
+                                    i,
+                                );
+                            });
+                        } else {
+                            let mut guard = shard_databases.write_db(shard_id, i);
+                            let _ = crate::storage::eviction::try_evict_if_needed_async_spill_with_total(
                                 &mut guard,
                                 &rt,
                                 &sender,
@@ -530,31 +579,52 @@ pub(crate) fn handle_memory_pressure(
                                 total_mem,
                                 i,
                             );
+                        }
                     }
                     // Drop sender clone immediately to avoid shutdown deadlock
                     drop(sender);
                 } else {
                     // Sync spill fallback
                     for i in 0..db_count {
-                        let mut guard = shard_databases.write_db(shard_id, i);
-                        if let Some(ref mut manifest) = *shard_manifest {
-                            let mut ctx = crate::storage::eviction::SpillContext {
-                                shard_dir: &shard_dir,
-                                manifest,
-                                next_file_id,
-                            };
-                            let _ =
-                                crate::storage::eviction::try_evict_if_needed_with_spill_and_total(
+                        if use_slice {
+                            crate::shard::slice::with_shard_db(i, |db| {
+                                if let Some(ref mut manifest) = *shard_manifest {
+                                    let mut ctx = crate::storage::eviction::SpillContext {
+                                        shard_dir: &shard_dir,
+                                        manifest,
+                                        next_file_id,
+                                    };
+                                    let _ = crate::storage::eviction::try_evict_if_needed_with_spill_and_total(
+                                        db,
+                                        &rt,
+                                        Some(&mut ctx),
+                                        total_mem,
+                                    );
+                                } else {
+                                    let _ = crate::storage::eviction::try_evict_if_needed_with_spill_and_total(
+                                        db, &rt, None, total_mem,
+                                    );
+                                }
+                            });
+                        } else {
+                            let mut guard = shard_databases.write_db(shard_id, i);
+                            if let Some(ref mut manifest) = *shard_manifest {
+                                let mut ctx = crate::storage::eviction::SpillContext {
+                                    shard_dir: &shard_dir,
+                                    manifest,
+                                    next_file_id,
+                                };
+                                let _ = crate::storage::eviction::try_evict_if_needed_with_spill_and_total(
                                     &mut guard,
                                     &rt,
                                     Some(&mut ctx),
                                     total_mem,
                                 );
-                        } else {
-                            let _ =
-                                crate::storage::eviction::try_evict_if_needed_with_spill_and_total(
+                            } else {
+                                let _ = crate::storage::eviction::try_evict_if_needed_with_spill_and_total(
                                     &mut guard, &rt, None, total_mem,
                                 );
+                            }
                         }
                     }
                 }
