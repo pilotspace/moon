@@ -68,12 +68,35 @@ impl AofManifest {
     /// already contain state (e.g. first upgrade from legacy single-file AOF
     /// or per-shard WAL) — otherwise subsequent boots cannot reconstruct that
     /// state because there is no base RDB for `replay_multi_part` to load.
+    ///
+    /// B4 fix: even on fresh install (no prior state), materialize an EMPTY
+    /// base RDB so the `(base + incr)` invariant always holds. Without this,
+    /// the recovery path refuses to replay incr-only state and the server
+    /// fails to restart after a graceful shutdown that only wrote incr.
     pub fn initialize(dir: &Path) -> std::io::Result<Self> {
         let manifest = Self {
             dir: dir.to_path_buf(),
             seq: 1,
         };
         std::fs::create_dir_all(manifest.aof_dir())?;
+
+        // Serialize an empty database vector to an empty base RDB so the
+        // (base + incr) invariant holds from the first boot.
+        let empty_dbs: [crate::storage::Database; 0] = [];
+        let empty_rdb = crate::persistence::rdb::save_to_bytes(&empty_dbs)
+            .map_err(|e| std::io::Error::other(format!("empty RDB serialize: {e}")))?;
+        let base_path = manifest.base_path();
+        let tmp_path = base_path.with_extension("rdb.tmp");
+        {
+            let mut f = std::fs::File::create(&tmp_path)?;
+            f.write_all(&empty_rdb)?;
+            f.sync_data()?;
+        }
+        std::fs::rename(&tmp_path, &base_path)?;
+
+        // Create the empty incr file so the writer has a target.
+        std::fs::File::create(manifest.incr_path())?;
+
         manifest.write_manifest()?;
         Ok(manifest)
     }

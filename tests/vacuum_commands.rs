@@ -102,6 +102,8 @@ fn base_config(port: u16) -> ServerConfig {
         graph_merge_max_segments: 8,
         graph_dead_edge_trigger: 0.20,
         autovacuum_starvation_cap_secs: 300,
+        cold_orphan_sweep_interval_secs: 300,
+        vec_warm_mmap_budget: "2gb".to_string(),
     }
 }
 
@@ -250,9 +252,11 @@ async fn test_vacuum_freeze_returns_kv_array() {
     );
 }
 
-/// P8-NET-5: VACUUM VECTOR returns +OK pending placeholder.
+/// P8-NET-5: VACUUM VECTOR is routed to the dedicated `vacuum_vector` entry
+/// point (B1 fix). With an unknown index name the call must return an
+/// `ERR unknown vector index` instead of the legacy stub.
 #[tokio::test]
-async fn test_vacuum_vector_returns_pending() {
+async fn test_vacuum_vector_routes_to_dedicated_handler() {
     let (port, _token) = start_server().await;
     let client = redis::Client::open(format!("redis://127.0.0.1:{port}")).unwrap();
     let mut con = client.get_multiplexed_async_connection().await.unwrap();
@@ -263,32 +267,40 @@ async fn test_vacuum_vector_returns_pending() {
         .query_async(&mut con)
         .await;
 
-    assert!(result.is_ok(), "VACUUM VECTOR must succeed: {:?}", result);
-    let s = result.unwrap();
+    let err = result.expect_err("VACUUM VECTOR on unknown index must error");
+    let msg = err.to_string();
     assert!(
-        s.starts_with("OK pending"),
-        "VACUUM VECTOR must return 'OK pending...', got: {s}"
+        msg.contains("unknown vector index"),
+        "expected 'unknown vector index', got: {msg}"
     );
 }
 
-/// P8-NET-6: VACUUM GRAPH returns +OK pending placeholder.
+/// P8-NET-6: VACUUM GRAPH is routed to the dedicated `vacuum_graph` entry
+/// point (B1 fix). With an unknown graph name the call must error.
 #[tokio::test]
-async fn test_vacuum_graph_returns_pending() {
+#[cfg(feature = "graph")]
+async fn test_vacuum_graph_routes_to_dedicated_handler() {
     let (port, _token) = start_server().await;
     let client = redis::Client::open(format!("redis://127.0.0.1:{port}")).unwrap();
     let mut con = client.get_multiplexed_async_connection().await.unwrap();
 
     let result: redis::RedisResult<String> = redis::cmd("VACUUM")
         .arg("GRAPH")
-        .arg("g")
+        .arg("nonexistent_graph")
         .query_async(&mut con)
         .await;
 
-    assert!(result.is_ok(), "VACUUM GRAPH must succeed: {:?}", result);
-    let s = result.unwrap();
+    // Real handler may return OK with zero stats or an ERR — both prove
+    // routing reached the dedicated path. The old stub returned a static
+    // SimpleString "OK pending implementation in v0.1.14"; ensure we no
+    // longer get that exact string.
+    let observed = match result {
+        Ok(s) => s,
+        Err(e) => e.to_string(),
+    };
     assert!(
-        s.starts_with("OK pending"),
-        "VACUUM GRAPH must return 'OK pending...', got: {s}"
+        !observed.contains("pending implementation"),
+        "VACUUM GRAPH should no longer hit the v0.1.14 stub; got: {observed}"
     );
 }
 

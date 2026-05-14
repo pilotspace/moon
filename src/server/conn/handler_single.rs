@@ -1637,22 +1637,71 @@ pub async fn handle_connection(
 
                                 // P8: VACUUM — admin, lands in read run.
                                 // manifest/WAL not available here; MVCC passes still run.
+                                //
+                                // B1 fix: route VECTOR/GRAPH to dedicated entry points;
+                                // parent `vacuum()` still stubs them.
                                 if d_cmd.eq_ignore_ascii_case(b"VACUUM") {
-                                    if let Some(ref vs) = vector_store {
-                                        let mut vs_guard = vs.lock();
-                                        let response = crate::command::server_admin::vacuum(
-                                            &mut vs_guard,
-                                            None, // manifest — not available here
-                                            None, // wal_v3 — not available here
-                                            d_args,
-                                            crate::command::server_admin::DEFAULT_VACUUM_PRUNE_MARGIN, // see server_admin.rs
-                                        );
-                                        drop(vs_guard);
-                                        responses[resp_idx] = response;
-                                    } else {
-                                        responses[resp_idx] = Frame::Error(
-                                            bytes::Bytes::from_static(b"ERR vector store not initialized"),
-                                        );
+                                    let mut routed_subcommand = false;
+                                    if let Some(sub_frame) = d_args.first() {
+                                        if let Some(sub) =
+                                            crate::command::helpers::extract_bytes(sub_frame)
+                                        {
+                                            if sub.eq_ignore_ascii_case(b"VECTOR") {
+                                                if let Some(ref vs) = vector_store {
+                                                    let mut vs_guard = vs.lock();
+                                                    let response =
+                                                        crate::command::server_admin::vacuum_vector(
+                                                            &mut vs_guard,
+                                                            &d_args[1..],
+                                                        );
+                                                    drop(vs_guard);
+                                                    responses[resp_idx] = response;
+                                                } else {
+                                                    responses[resp_idx] = Frame::Error(
+                                                        bytes::Bytes::from_static(b"ERR vector store not initialized"),
+                                                    );
+                                                }
+                                                routed_subcommand = true;
+                                            }
+                                            #[cfg(feature = "graph")]
+                                            if sub.eq_ignore_ascii_case(b"GRAPH") {
+                                                if let Some(ref gs) = graph_store {
+                                                    let mut gs_guard = gs.lock();
+                                                    let response =
+                                                        crate::command::server_admin::vacuum_graph(
+                                                            &mut gs_guard,
+                                                            &d_args[1..],
+                                                            config.graph_merge_max_segments,
+                                                            config.graph_dead_edge_trigger,
+                                                        );
+                                                    drop(gs_guard);
+                                                    responses[resp_idx] = response;
+                                                } else {
+                                                    responses[resp_idx] = Frame::Error(
+                                                        bytes::Bytes::from_static(b"ERR graph store not initialized"),
+                                                    );
+                                                }
+                                                routed_subcommand = true;
+                                            }
+                                        }
+                                    }
+                                    if !routed_subcommand {
+                                        if let Some(ref vs) = vector_store {
+                                            let mut vs_guard = vs.lock();
+                                            let response = crate::command::server_admin::vacuum(
+                                                &mut vs_guard,
+                                                None, // manifest — not available here
+                                                None, // wal_v3 — not available here
+                                                d_args,
+                                                crate::command::server_admin::DEFAULT_VACUUM_PRUNE_MARGIN, // see server_admin.rs
+                                            );
+                                            drop(vs_guard);
+                                            responses[resp_idx] = response;
+                                        } else {
+                                            responses[resp_idx] = Frame::Error(
+                                                bytes::Bytes::from_static(b"ERR vector store not initialized"),
+                                            );
+                                        }
                                     }
                                     continue;
                                 }
@@ -1859,22 +1908,70 @@ pub async fn handle_connection(
                                 // P8: VACUUM — write-run intercept (same as read-run;
                                 // VACUUM is admin so may land in either branch depending
                                 // on future flag changes).
+                                //
+                                // B1 fix: route VECTOR/GRAPH to dedicated entry points.
                                 if d_cmd.eq_ignore_ascii_case(b"VACUUM") {
-                                    if let Some(vs) = vector_store.as_ref() {
-                                        let mut vs_guard = vs.lock();
-                                        let response = crate::command::server_admin::vacuum(
-                                            &mut vs_guard,
-                                            None, // manifest — not available here
-                                            None, // wal_v3 — not available here
-                                            d_args,
-                                            crate::command::server_admin::DEFAULT_VACUUM_PRUNE_MARGIN, // see server_admin.rs
-                                        );
-                                        drop(vs_guard);
-                                        responses[resp_idx] = response;
-                                    } else {
-                                        responses[resp_idx] = Frame::Error(
-                                            bytes::Bytes::from_static(b"ERR vector store not initialized"),
-                                        );
+                                    let mut routed_subcommand = false;
+                                    if let Some(sub_frame) = d_args.first() {
+                                        if let Some(sub) =
+                                            crate::command::helpers::extract_bytes(sub_frame)
+                                        {
+                                            if sub.eq_ignore_ascii_case(b"VECTOR") {
+                                                if let Some(vs) = vector_store.as_ref() {
+                                                    let mut vs_guard = vs.lock();
+                                                    let response =
+                                                        crate::command::server_admin::vacuum_vector(
+                                                            &mut vs_guard,
+                                                            &d_args[1..],
+                                                        );
+                                                    drop(vs_guard);
+                                                    responses[resp_idx] = response;
+                                                } else {
+                                                    responses[resp_idx] = Frame::Error(
+                                                        bytes::Bytes::from_static(b"ERR vector store not initialized"),
+                                                    );
+                                                }
+                                                routed_subcommand = true;
+                                            }
+                                            #[cfg(feature = "graph")]
+                                            if sub.eq_ignore_ascii_case(b"GRAPH") {
+                                                if let Some(ref gs) = graph_store {
+                                                    let mut gs_guard = gs.lock();
+                                                    let response =
+                                                        crate::command::server_admin::vacuum_graph(
+                                                            &mut gs_guard,
+                                                            &d_args[1..],
+                                                            config.graph_merge_max_segments,
+                                                            config.graph_dead_edge_trigger,
+                                                        );
+                                                    drop(gs_guard);
+                                                    responses[resp_idx] = response;
+                                                } else {
+                                                    responses[resp_idx] = Frame::Error(
+                                                        bytes::Bytes::from_static(b"ERR graph store not initialized"),
+                                                    );
+                                                }
+                                                routed_subcommand = true;
+                                            }
+                                        }
+                                    }
+                                    if !routed_subcommand {
+                                        if let Some(vs) = vector_store.as_ref() {
+                                            let mut vs_guard = vs.lock();
+                                            let response = crate::command::server_admin::vacuum(
+                                                &mut vs_guard,
+                                                None, // manifest — not available here
+                                                None, // wal_v3 — not available here
+                                                d_args,
+                                                crate::command::server_admin::DEFAULT_VACUUM_PRUNE_MARGIN, // see server_admin.rs
+                                            );
+                                            drop(vs_guard);
+                                            responses[resp_idx] = response;
+                                        } else {
+                                            responses[resp_idx] = Frame::Error(
+                                                bytes::Bytes::from_static(b"ERR vector store not initialized"),
+                                            );
+                                        }
                                     }
                                     continue;
                                 }

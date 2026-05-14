@@ -48,11 +48,18 @@ pub(crate) fn parse_knn_query(query: &[u8]) -> Option<(usize, Option<Bytes>, Byt
     };
 
     // Parse $param_name
+    //
+    // B3 fix: RediSearch DIALECT 2 allows an `AS <alias>` clause after the
+    // param (e.g. `$vec AS score`). The closing `]` may also be glued onto
+    // the alias rather than the param. Take only the first whitespace-bounded
+    // token, then strip a trailing `]`.
     let param_str = param_start.trim().trim_end_matches(']');
-    if !param_str.starts_with('$') {
+    let param_token = param_str.split_whitespace().next().unwrap_or("");
+    let param_token = param_token.trim_end_matches(']');
+    if !param_token.starts_with('$') {
         return None;
     }
-    let param_name = &param_str[1..];
+    let param_name = &param_token[1..];
     Some((k, field_name, Bytes::from(param_name.to_owned())))
 }
 

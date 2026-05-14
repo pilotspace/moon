@@ -915,7 +915,44 @@ pub(crate) async fn handle_connection_sharded_inner<
 
                     // --- P8: VACUUM — manual reclamation (MVCC passes only;
                     //     manifest/WAL not accessible from connection handler).
+                    //
+                    // B1 fix: route VECTOR/GRAPH subcommands to the dedicated
+                    // entry points; the parent `vacuum()` still stubs them.
                     if cmd.eq_ignore_ascii_case(b"VACUUM") {
+                        if let Some(sub_frame) = cmd_args.first() {
+                            if let Some(sub) =
+                                crate::command::helpers::extract_bytes(sub_frame)
+                            {
+                                if sub.eq_ignore_ascii_case(b"VECTOR") {
+                                    let mut vs =
+                                        ctx.shard_databases.vector_store(ctx.shard_id);
+                                    let response =
+                                        crate::command::server_admin::vacuum_vector(
+                                            &mut vs,
+                                            &cmd_args[1..],
+                                        );
+                                    drop(vs);
+                                    responses.push(response);
+                                    continue;
+                                }
+                                #[cfg(feature = "graph")]
+                                if sub.eq_ignore_ascii_case(b"GRAPH") {
+                                    let mut gs = ctx
+                                        .shard_databases
+                                        .graph_store_write(ctx.shard_id);
+                                    let response =
+                                        crate::command::server_admin::vacuum_graph(
+                                            &mut gs,
+                                            &cmd_args[1..],
+                                            ctx.config.graph_merge_max_segments,
+                                            ctx.config.graph_dead_edge_trigger,
+                                        );
+                                    drop(gs);
+                                    responses.push(response);
+                                    continue;
+                                }
+                            }
+                        }
                         let mut vs = ctx.shard_databases.vector_store(ctx.shard_id);
                         let response = crate::command::server_admin::vacuum(
                             &mut vs,

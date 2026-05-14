@@ -309,6 +309,15 @@ pub fn write_reclamation_section(buf: &mut String) {
         RECL_DELETE_PENDING_VISIBLE_LSN.load(Ordering::Relaxed)
     );
 
+    // -- Cold-tier orphan reclamation (P9) --
+    let _ = write!(
+        buf,
+        "reclamation_cold_orphans_reclaimed_total:{}\r\n\
+         reclamation_cold_orphan_bytes_reclaimed_total:{}\r\n",
+        RECL_COLD_ORPHANS_RECLAIMED_TOTAL.load(Ordering::Relaxed),
+        RECL_COLD_ORPHAN_BYTES_RECLAIMED_TOTAL.load(Ordering::Relaxed),
+    );
+
     buf.push_str("\r\n");
 }
 

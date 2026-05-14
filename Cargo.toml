@@ -155,6 +155,15 @@ inherits = "release"
 debug = true
 strip = false
 
+# Fast-iteration release profile: production opt-level (3), thin LTO + parallel codegen.
+# Compiles ~3-5x faster than `release` (fat LTO + codegen-units=1).
+# Runtime cost ~5-10% vs fat LTO — acceptable for scenario testing, NOT for published benchmarks.
+[profile.release-fast]
+inherits = "release"
+lto = "thin"
+codegen-units = 16
+strip = false
+
 [[bin]]
 name = "moon-bench"
 path = "src/bin/moon-bench.rs"
