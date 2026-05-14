@@ -19,11 +19,16 @@ pub mod scatter_hybrid;
 /// MA1: write-stall on immutable segment backlog.
 pub mod segment_stall;
 pub mod shared_databases;
+pub mod slice;
 pub mod spsc_handler;
 pub mod timers;
 pub mod uring_handler;
 
 pub use disk_monitor::DiskMonitor;
+pub use slice::{
+    ShardSlice, ShardSliceInit, init_shard, is_initialized, try_with_shard, with_shard,
+    with_shard_db,
+};
 
 #[cfg(feature = "text-index")]
 pub use scatter_aggregate::scatter_text_aggregate;
