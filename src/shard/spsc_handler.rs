@@ -267,39 +267,66 @@ pub(crate) fn handle_shard_message_shared(
                 // Intercept before cmd_dispatch so the console gateway's
                 // ShardMessage::Execute path reaches the vector handlers.
                 if cmd.len() > 3 && cmd[..3].eq_ignore_ascii_case(b"FT.") {
-                    #[cfg(feature = "graph")]
-                    let graph_guard = shard_databases.graph_store_read(shard_id);
-
-                    // SESSION clause needs Database access for sorted set storage.
-                    // Only acquire write lock when SESSION keyword is present.
-                    // FT.NAVIGATE internally calls ft_search which may use SESSION.
-                    // FT.RECOMMEND always needs Database access (reads hash keys).
-                    // FT.AGGREGATE materialises rows from the hash store (Phase 152,
-                    // Plan 02 — reads @field values per doc).
-                    // FT.DROPINDEX with DD flag needs Database to delete indexed docs.
-                    let needs_db = cmd.eq_ignore_ascii_case(b"FT.RECOMMEND")
-                        || cmd.eq_ignore_ascii_case(b"FT.AGGREGATE")
-                        || cmd.eq_ignore_ascii_case(b"FT.DROPINDEX")
-                        || ((cmd.eq_ignore_ascii_case(b"FT.SEARCH")
-                            || cmd.eq_ignore_ascii_case(b"FT.NAVIGATE"))
-                            && has_session_keyword(&command));
-                    let mut db_guard;
-                    let db_opt = if needs_db {
-                        db_guard = shard_databases.write_db(shard_id, 0);
-                        Some(&mut *db_guard)
+                    // Phase 2b: gate on is_initialized(); new path uses ShardSlice.
+                    // graph_store, write_db(0), and text_store acquired in one closure
+                    // to avoid re-entrant with_shard calls (multi-resource arm).
+                    let frame = if crate::shard::slice::is_initialized() {
+                        crate::shard::slice::with_shard(|s| {
+                            // SESSION clause needs Database access for sorted set storage.
+                            // Only acquire write lock when SESSION keyword is present.
+                            // FT.NAVIGATE internally calls ft_search which may use SESSION.
+                            // FT.RECOMMEND always needs Database access (reads hash keys).
+                            // FT.AGGREGATE materialises rows from the hash store (Phase 152,
+                            // Plan 02 — reads @field values per doc).
+                            // FT.DROPINDEX with DD flag needs Database to delete indexed docs.
+                            let needs_db = cmd.eq_ignore_ascii_case(b"FT.RECOMMEND")
+                                || cmd.eq_ignore_ascii_case(b"FT.AGGREGATE")
+                                || cmd.eq_ignore_ascii_case(b"FT.DROPINDEX")
+                                || ((cmd.eq_ignore_ascii_case(b"FT.SEARCH")
+                                    || cmd.eq_ignore_ascii_case(b"FT.NAVIGATE"))
+                                    && has_session_keyword(&command));
+                            let db_opt: Option<&mut crate::storage::db::Database> = if needs_db {
+                                Some(&mut s.databases[0])
+                            } else {
+                                None
+                            };
+                            dispatch_vector_command(
+                                vector_store,
+                                &mut s.text_store,
+                                #[cfg(feature = "graph")]
+                                Some(&s.graph_store),
+                                &command,
+                                db_opt,
+                            )
+                        })
                     } else {
-                        None
-                    };
-
-                    let mut text_guard = shard_databases.text_store(shard_id);
-                    let frame = dispatch_vector_command(
-                        vector_store,
-                        &mut *text_guard,
                         #[cfg(feature = "graph")]
-                        Some(&graph_guard),
-                        &command,
-                        db_opt,
-                    );
+                        let graph_guard = shard_databases.graph_store_read(shard_id);
+
+                        let needs_db = cmd.eq_ignore_ascii_case(b"FT.RECOMMEND")
+                            || cmd.eq_ignore_ascii_case(b"FT.AGGREGATE")
+                            || cmd.eq_ignore_ascii_case(b"FT.DROPINDEX")
+                            || ((cmd.eq_ignore_ascii_case(b"FT.SEARCH")
+                                || cmd.eq_ignore_ascii_case(b"FT.NAVIGATE"))
+                                && has_session_keyword(&command));
+                        let mut db_guard;
+                        let db_opt = if needs_db {
+                            db_guard = shard_databases.write_db(shard_id, 0);
+                            Some(&mut *db_guard)
+                        } else {
+                            None
+                        };
+
+                        let mut text_guard = shard_databases.text_store(shard_id);
+                        dispatch_vector_command(
+                            vector_store,
+                            &mut *text_guard,
+                            #[cfg(feature = "graph")]
+                            Some(&graph_guard),
+                            &command,
+                            db_opt,
+                        )
+                    };
                     let _ = reply_tx.send(frame);
                     return;
                 }
@@ -319,7 +346,17 @@ pub(crate) fn handle_shard_message_shared(
                         #[cfg(feature = "graph")]
                         if sub.eq_ignore_ascii_case(b"GRAPH") {
                             let graph_args = &args[1..];
-                            let frame = {
+                            // Phase 2b: gate on is_initialized(); new path uses ShardSlice.
+                            let frame = if crate::shard::slice::is_initialized() {
+                                crate::shard::slice::with_shard(|s| {
+                                    crate::command::server_admin::vacuum_graph(
+                                        &mut s.graph_store,
+                                        graph_args,
+                                        graph_merge_max_segments,
+                                        graph_dead_edge_trigger,
+                                    )
+                                })
+                            } else {
                                 let mut gs = shard_databases.graph_store_write(shard_id);
                                 crate::command::server_admin::vacuum_graph(
                                     &mut gs,
@@ -338,7 +375,15 @@ pub(crate) fn handle_shard_message_shared(
                 // GRAPH.* commands route to GraphStore.
                 #[cfg(feature = "graph")]
                 if cmd.len() > 6 && cmd[..6].eq_ignore_ascii_case(b"GRAPH.") {
-                    let (frame, wal_records) = {
+                    // Phase 2b: gate on is_initialized(); new path uses ShardSlice.
+                    let (frame, wal_records) = if crate::shard::slice::is_initialized() {
+                        crate::shard::slice::with_shard(|s| {
+                            let resp =
+                                crate::command::graph::dispatch_graph_command(&mut s.graph_store, &command);
+                            let records = s.graph_store.drain_wal();
+                            (resp, records)
+                        })
+                    } else {
                         let mut gs = shard_databases.graph_store_write(shard_id);
                         let resp = crate::command::graph::dispatch_graph_command(&mut gs, &command);
                         let records = gs.drain_wal();
@@ -413,93 +458,204 @@ pub(crate) fn handle_shard_message_shared(
 
                 // COW intercept: capture old value before write if snapshot is active
                 let is_write = metadata::is_write(cmd);
-                if is_write {
-                    let db_guard = shard_databases.read_db(shard_id, db_idx);
-                    cow_intercept(snapshot_state, &db_guard, db_idx, &command);
-                    drop(db_guard);
-                }
-
-                let mut guard = shard_databases.write_db(shard_id, db_idx);
-                guard.refresh_now_from_cache(cached_clock);
-                let mut selected = db_idx;
-                let result = cmd_dispatch(&mut guard, cmd, args, &mut selected, db_count);
-                let frame = match result {
-                    DispatchResult::Response(f) => f,
-                    DispatchResult::Quit(f) => f,
-                };
-
-                // WAL append + replication fan-out for successful write commands
-                if is_write && !matches!(frame, crate::protocol::Frame::Error(_)) {
-                    let serialized = aof::serialize_command(&command);
-                    wal_append_and_fanout(
-                        &serialized,
-                        wal_writer,
-                        wal_v3_writer,
-                        repl_backlog,
-                        replica_txs,
-                        repl_state,
-                        shard_id,
-                    );
-                }
-
-                // Post-dispatch wakeup hooks for producer commands (cross-shard blocking)
-                if !matches!(frame, crate::protocol::Frame::Error(_)) {
-                    let needs_wake = cmd.eq_ignore_ascii_case(b"LPUSH")
-                        || cmd.eq_ignore_ascii_case(b"RPUSH")
-                        || cmd.eq_ignore_ascii_case(b"LMOVE")
-                        || cmd.eq_ignore_ascii_case(b"ZADD")
-                        || cmd.eq_ignore_ascii_case(b"XADD");
-                    if needs_wake {
-                        // For LMOVE, wake waiters on the destination key (args[1]),
-                        // not the source key (args[0]).
-                        let wake_key = if cmd.eq_ignore_ascii_case(b"LMOVE") {
-                            args.get(1)
-                                .and_then(|f| crate::server::connection::extract_bytes(f))
-                        } else {
-                            args.first()
-                                .and_then(|f| crate::server::connection::extract_bytes(f))
+                // Phase 2b: gate on is_initialized(); new path uses ShardSlice.
+                // write_db and text_store (HSET auto-index) accessed in one with_shard
+                // closure to avoid re-entrant borrow (multi-resource arm).
+                let frame = if crate::shard::slice::is_initialized() {
+                    if is_write {
+                        crate::shard::slice::with_shard_db(db_idx, |db| {
+                            cow_intercept(snapshot_state, db, db_idx, &command);
+                        });
+                    }
+                    crate::shard::slice::with_shard(|s| {
+                        let db = &mut s.databases[db_idx];
+                        db.refresh_now_from_cache(cached_clock);
+                        let mut selected = db_idx;
+                        let result = cmd_dispatch(db, cmd, args, &mut selected, db_count);
+                        let frame = match result {
+                            DispatchResult::Response(f) => f,
+                            DispatchResult::Quit(f) => f,
                         };
-                        if let Some(key) = wake_key {
-                            let mut reg = blocking_registry.borrow_mut();
-                            if cmd.eq_ignore_ascii_case(b"LPUSH")
+
+                        // WAL append + replication fan-out for successful write commands
+                        if is_write && !matches!(frame, crate::protocol::Frame::Error(_)) {
+                            let serialized = aof::serialize_command(&command);
+                            wal_append_and_fanout(
+                                &serialized,
+                                wal_writer,
+                                wal_v3_writer,
+                                repl_backlog,
+                                replica_txs,
+                                repl_state,
+                                shard_id,
+                            );
+                        }
+
+                        // Post-dispatch wakeup hooks for producer commands (cross-shard blocking)
+                        if !matches!(frame, crate::protocol::Frame::Error(_)) {
+                            let needs_wake = cmd.eq_ignore_ascii_case(b"LPUSH")
                                 || cmd.eq_ignore_ascii_case(b"RPUSH")
                                 || cmd.eq_ignore_ascii_case(b"LMOVE")
+                                || cmd.eq_ignore_ascii_case(b"ZADD")
+                                || cmd.eq_ignore_ascii_case(b"XADD");
+                            if needs_wake {
+                                let wake_key = if cmd.eq_ignore_ascii_case(b"LMOVE") {
+                                    args.get(1)
+                                        .and_then(|f| crate::server::connection::extract_bytes(f))
+                                } else {
+                                    args.first()
+                                        .and_then(|f| crate::server::connection::extract_bytes(f))
+                                };
+                                if let Some(key) = wake_key {
+                                    let mut reg = blocking_registry.borrow_mut();
+                                    if cmd.eq_ignore_ascii_case(b"LPUSH")
+                                        || cmd.eq_ignore_ascii_case(b"RPUSH")
+                                        || cmd.eq_ignore_ascii_case(b"LMOVE")
+                                    {
+                                        crate::blocking::wakeup::try_wake_list_waiter(
+                                            &mut reg, db, db_idx, &key,
+                                        );
+                                    } else if cmd.eq_ignore_ascii_case(b"ZADD") {
+                                        crate::blocking::wakeup::try_wake_zset_waiter(
+                                            &mut reg, db, db_idx, &key,
+                                        );
+                                    } else {
+                                        crate::blocking::wakeup::try_wake_stream_waiter(
+                                            &mut reg, db, db_idx, &key,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+
+                        // Auto-index: if HSET succeeded and key matches a vector index prefix,
+                        // extract the vector field and append to mutable segment.
+                        // text_store accessed here (same with_shard closure) to avoid re-entrancy.
+                        if cmd.eq_ignore_ascii_case(b"HSET")
+                            && !matches!(frame, crate::protocol::Frame::Error(_))
+                        {
+                            if let Some(crate::protocol::Frame::BulkString(key_bytes)) =
+                                args.first()
                             {
-                                crate::blocking::wakeup::try_wake_list_waiter(
-                                    &mut reg, &mut guard, db_idx, &key,
-                                );
-                            } else if cmd.eq_ignore_ascii_case(b"ZADD") {
-                                crate::blocking::wakeup::try_wake_zset_waiter(
-                                    &mut reg, &mut guard, db_idx, &key,
-                                );
-                            } else {
-                                crate::blocking::wakeup::try_wake_stream_waiter(
-                                    &mut reg, &mut guard, db_idx, &key,
+                                // Plan 166-01: return value (index_name, key_hash)
+                                // tuples will be consumed by Plan 166-02 to record
+                                // VectorIntents on the active CrossStoreTxn. Discarded
+                                // here because this path is not txn-aware yet.
+                                let _ = auto_index_hset(
+                                    vector_store,
+                                    &mut s.text_store,
+                                    key_bytes,
+                                    args,
+                                    0,
                                 );
                             }
                         }
-                    }
-                }
 
-                // Auto-index: if HSET succeeded and key matches a vector index prefix,
-                // extract the vector field and append to mutable segment.
-                if cmd.eq_ignore_ascii_case(b"HSET")
-                    && !matches!(frame, crate::protocol::Frame::Error(_))
-                {
-                    if let Some(crate::protocol::Frame::BulkString(key_bytes)) = args.first() {
-                        let mut ts = shard_databases.text_store(shard_id);
-                        // Plan 166-01: return value (index_name, key_hash)
-                        // tuples will be consumed by Plan 166-02 to record
-                        // VectorIntents on the active CrossStoreTxn. Discarded
-                        // here because this path is not txn-aware yet.
-                        let _ = auto_index_hset(vector_store, &mut *ts, key_bytes, args, 0);
+                        frame
+                    })
+                } else {
+                    if is_write {
+                        let db_guard = shard_databases.read_db(shard_id, db_idx);
+                        cow_intercept(snapshot_state, &db_guard, db_idx, &command);
+                        drop(db_guard);
                     }
-                }
 
-                // Auto-delete: if DEL/UNLINK succeeded and key matches a vector
-                // index prefix, mark stale vectors as deleted in matching indexes.
-                // Note: HDEL removes fields, not keys — it should NOT trigger vector
-                // deletion unless the entire key is removed.
+                    let mut guard = shard_databases.write_db(shard_id, db_idx);
+                    guard.refresh_now_from_cache(cached_clock);
+                    let mut selected = db_idx;
+                    let result = cmd_dispatch(&mut guard, cmd, args, &mut selected, db_count);
+                    let frame = match result {
+                        DispatchResult::Response(f) => f,
+                        DispatchResult::Quit(f) => f,
+                    };
+
+                    // WAL append + replication fan-out for successful write commands
+                    if is_write && !matches!(frame, crate::protocol::Frame::Error(_)) {
+                        let serialized = aof::serialize_command(&command);
+                        wal_append_and_fanout(
+                            &serialized,
+                            wal_writer,
+                            wal_v3_writer,
+                            repl_backlog,
+                            replica_txs,
+                            repl_state,
+                            shard_id,
+                        );
+                    }
+
+                    // Post-dispatch wakeup hooks for producer commands (cross-shard blocking)
+                    if !matches!(frame, crate::protocol::Frame::Error(_)) {
+                        let needs_wake = cmd.eq_ignore_ascii_case(b"LPUSH")
+                            || cmd.eq_ignore_ascii_case(b"RPUSH")
+                            || cmd.eq_ignore_ascii_case(b"LMOVE")
+                            || cmd.eq_ignore_ascii_case(b"ZADD")
+                            || cmd.eq_ignore_ascii_case(b"XADD");
+                        if needs_wake {
+                            // For LMOVE, wake waiters on the destination key (args[1]),
+                            // not the source key (args[0]).
+                            let wake_key = if cmd.eq_ignore_ascii_case(b"LMOVE") {
+                                args.get(1)
+                                    .and_then(|f| crate::server::connection::extract_bytes(f))
+                            } else {
+                                args.first()
+                                    .and_then(|f| crate::server::connection::extract_bytes(f))
+                            };
+                            if let Some(key) = wake_key {
+                                let mut reg = blocking_registry.borrow_mut();
+                                if cmd.eq_ignore_ascii_case(b"LPUSH")
+                                    || cmd.eq_ignore_ascii_case(b"RPUSH")
+                                    || cmd.eq_ignore_ascii_case(b"LMOVE")
+                                {
+                                    crate::blocking::wakeup::try_wake_list_waiter(
+                                        &mut reg, &mut guard, db_idx, &key,
+                                    );
+                                } else if cmd.eq_ignore_ascii_case(b"ZADD") {
+                                    crate::blocking::wakeup::try_wake_zset_waiter(
+                                        &mut reg, &mut guard, db_idx, &key,
+                                    );
+                                } else {
+                                    crate::blocking::wakeup::try_wake_stream_waiter(
+                                        &mut reg, &mut guard, db_idx, &key,
+                                    );
+                                }
+                            }
+                        }
+                    }
+
+                    // Auto-index: if HSET succeeded and key matches a vector index prefix,
+                    // extract the vector field and append to mutable segment.
+                    if cmd.eq_ignore_ascii_case(b"HSET")
+                        && !matches!(frame, crate::protocol::Frame::Error(_))
+                    {
+                        if let Some(crate::protocol::Frame::BulkString(key_bytes)) = args.first() {
+                            let mut ts = shard_databases.text_store(shard_id);
+                            // Plan 166-01: return value (index_name, key_hash)
+                            // tuples will be consumed by Plan 166-02 to record
+                            // VectorIntents on the active CrossStoreTxn. Discarded
+                            // here because this path is not txn-aware yet.
+                            let _ = auto_index_hset(vector_store, &mut *ts, key_bytes, args, 0);
+                        }
+                    }
+
+                    // Auto-delete: if DEL/UNLINK succeeded and key matches a vector
+                    // index prefix, mark stale vectors as deleted in matching indexes.
+                    // Note: HDEL removes fields, not keys — it should NOT trigger vector
+                    // deletion unless the entire key is removed.
+                    if (cmd.eq_ignore_ascii_case(b"DEL") || cmd.eq_ignore_ascii_case(b"UNLINK"))
+                        && !matches!(frame, crate::protocol::Frame::Error(_))
+                    {
+                        for arg in args {
+                            if let crate::protocol::Frame::BulkString(key_bytes) = arg {
+                                vector_store.mark_deleted_for_key(key_bytes);
+                            }
+                        }
+                    }
+
+                    drop(guard);
+                    frame
+                };
+
+                // Auto-delete is a vector_store-only operation; runs outside the gate.
                 if (cmd.eq_ignore_ascii_case(b"DEL") || cmd.eq_ignore_ascii_case(b"UNLINK"))
                     && !matches!(frame, crate::protocol::Frame::Error(_))
                 {
@@ -510,7 +666,6 @@ pub(crate) fn handle_shard_message_shared(
                     }
                 }
 
-                drop(guard);
                 frame
             };
             let _ = reply_tx.send(response);
@@ -523,6 +678,85 @@ pub(crate) fn handle_shard_message_shared(
             let mut results = Vec::with_capacity(commands.len());
             let db_count = shard_databases.db_count();
             let db_idx = db_index.min(db_count.saturating_sub(1));
+            // Phase 2b: gate on is_initialized(); new path uses ShardSlice.
+            if crate::shard::slice::is_initialized() {
+                crate::shard::slice::with_shard_db(db_idx, |guard| {
+                    guard.refresh_now_from_cache(cached_clock);
+                    for (_key, cmd_frame) in &commands {
+                        let (cmd, args) = match extract_command_static(cmd_frame) {
+                            Some(pair) => pair,
+                            None => {
+                                results.push(crate::protocol::Frame::Error(
+                                    bytes::Bytes::from_static(b"ERR invalid command format"),
+                                ));
+                                continue;
+                            }
+                        };
+
+                        let is_write = metadata::is_write(cmd);
+                        if is_write {
+                            cow_intercept(snapshot_state, guard, db_idx, cmd_frame);
+                        }
+
+                        let mut selected = db_idx;
+                        let result = cmd_dispatch(guard, cmd, args, &mut selected, db_count);
+                        let frame = match result {
+                            DispatchResult::Response(f) => f,
+                            DispatchResult::Quit(f) => f,
+                        };
+
+                        if is_write && !matches!(frame, crate::protocol::Frame::Error(_)) {
+                            let serialized = aof::serialize_command(cmd_frame);
+                            wal_append_and_fanout(
+                                &serialized,
+                                wal_writer,
+                                wal_v3_writer,
+                                repl_backlog,
+                                replica_txs,
+                                repl_state,
+                                shard_id,
+                            );
+
+                            let needs_wake = cmd.eq_ignore_ascii_case(b"LPUSH")
+                                || cmd.eq_ignore_ascii_case(b"RPUSH")
+                                || cmd.eq_ignore_ascii_case(b"LMOVE")
+                                || cmd.eq_ignore_ascii_case(b"ZADD")
+                                || cmd.eq_ignore_ascii_case(b"XADD");
+                            if needs_wake {
+                                let wake_key = if cmd.eq_ignore_ascii_case(b"LMOVE") {
+                                    args.get(1)
+                                        .and_then(|f| crate::server::connection::extract_bytes(f))
+                                } else {
+                                    args.first()
+                                        .and_then(|f| crate::server::connection::extract_bytes(f))
+                                };
+                                if let Some(key) = wake_key {
+                                    let mut reg = blocking_registry.borrow_mut();
+                                    if cmd.eq_ignore_ascii_case(b"LPUSH")
+                                        || cmd.eq_ignore_ascii_case(b"RPUSH")
+                                        || cmd.eq_ignore_ascii_case(b"LMOVE")
+                                    {
+                                        crate::blocking::wakeup::try_wake_list_waiter(
+                                            &mut reg, guard, db_idx, &key,
+                                        );
+                                    } else if cmd.eq_ignore_ascii_case(b"ZADD") {
+                                        crate::blocking::wakeup::try_wake_zset_waiter(
+                                            &mut reg, guard, db_idx, &key,
+                                        );
+                                    } else {
+                                        crate::blocking::wakeup::try_wake_stream_waiter(
+                                            &mut reg, guard, db_idx, &key,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+
+                        results.push(frame);
+                    }
+                });
+                let _ = reply_tx.send(results);
+            } else {
             let mut guard = shard_databases.write_db(shard_id, db_idx);
             guard.refresh_now_from_cache(cached_clock);
             for (_key, cmd_frame) in &commands {
@@ -602,6 +836,7 @@ pub(crate) fn handle_shard_message_shared(
             }
             drop(guard);
             let _ = reply_tx.send(results);
+            } // else branch end (is_initialized gate)
         }
         ShardMessage::PipelineBatch {
             db_index,
@@ -611,197 +846,373 @@ pub(crate) fn handle_shard_message_shared(
             let mut results = Vec::with_capacity(commands.len());
             let db_count = shard_databases.db_count();
             let db_idx = db_index.min(db_count.saturating_sub(1));
-            let mut guard = shard_databases.write_db(shard_id, db_idx);
-            guard.refresh_now_from_cache(cached_clock);
-            for cmd_frame in &commands {
-                let (cmd, args) = match extract_command_static(cmd_frame) {
-                    Some(pair) => pair,
-                    None => {
-                        results.push(crate::protocol::Frame::Error(bytes::Bytes::from_static(
-                            b"ERR invalid command format",
-                        )));
-                        continue;
-                    }
-                };
-
-                // COW intercept for each write command in the batch
-                let is_write = metadata::is_write(cmd);
-                if is_write {
-                    cow_intercept(snapshot_state, &guard, db_idx, cmd_frame);
-                }
-
-                let mut selected = db_idx;
-                let result = cmd_dispatch(&mut guard, cmd, args, &mut selected, db_count);
-                let frame = match result {
-                    DispatchResult::Response(f) => f,
-                    DispatchResult::Quit(f) => f,
-                };
-
-                // WAL append + replication fan-out for successful write commands
-                if is_write && !matches!(frame, crate::protocol::Frame::Error(_)) {
-                    let serialized = aof::serialize_command(cmd_frame);
-                    wal_append_and_fanout(
-                        &serialized,
-                        wal_writer,
-                        wal_v3_writer,
-                        repl_backlog,
-                        replica_txs,
-                        repl_state,
-                        shard_id,
-                    );
-                }
-
-                // Auto-index: if HSET succeeded, check for vector index match
-                if cmd.eq_ignore_ascii_case(b"HSET")
-                    && !matches!(frame, crate::protocol::Frame::Error(_))
-                {
-                    if let Some(crate::protocol::Frame::BulkString(key_bytes)) = args.first() {
-                        // Use the `vector_store` parameter (already locked by caller),
-                        // NOT shard_databases.vector_store() which would deadlock
-                        // (parking_lot::Mutex is non-reentrant).
-                        let mut ts = shard_databases.text_store(shard_id);
-                        // Plan 166-01: Vec<(idx, key_hash)> return discarded
-                        // here; Plan 166-02 threads it into CrossStoreTxn.
-                        let _ = auto_index_hset(vector_store, &mut *ts, key_bytes, args, 0);
-                    }
-                }
-
-                // Post-dispatch wakeup hooks for producer commands (cross-shard blocking)
-                if !matches!(frame, crate::protocol::Frame::Error(_)) {
-                    let needs_wake = cmd.eq_ignore_ascii_case(b"LPUSH")
-                        || cmd.eq_ignore_ascii_case(b"RPUSH")
-                        || cmd.eq_ignore_ascii_case(b"LMOVE")
-                        || cmd.eq_ignore_ascii_case(b"ZADD")
-                        || cmd.eq_ignore_ascii_case(b"XADD");
-                    if needs_wake {
-                        // For LMOVE, wake waiters on the destination key (args[1]),
-                        // not the source key (args[0]).
-                        let wake_key = if cmd.eq_ignore_ascii_case(b"LMOVE") {
-                            args.get(1)
-                                .and_then(|f| crate::server::connection::extract_bytes(f))
-                        } else {
-                            args.first()
-                                .and_then(|f| crate::server::connection::extract_bytes(f))
+            // Phase 2b: gate on is_initialized(); new path uses ShardSlice.
+            // write_db and text_store (HSET auto-index) accessed in one with_shard
+            // closure to avoid re-entrant borrow (multi-resource arm).
+            if crate::shard::slice::is_initialized() {
+                crate::shard::slice::with_shard(|s| {
+                    let guard = &mut s.databases[db_idx];
+                    guard.refresh_now_from_cache(cached_clock);
+                    for cmd_frame in &commands {
+                        let (cmd, args) = match extract_command_static(cmd_frame) {
+                            Some(pair) => pair,
+                            None => {
+                                results.push(crate::protocol::Frame::Error(
+                                    bytes::Bytes::from_static(b"ERR invalid command format"),
+                                ));
+                                continue;
+                            }
                         };
-                        if let Some(key) = wake_key {
-                            let mut reg = blocking_registry.borrow_mut();
-                            if cmd.eq_ignore_ascii_case(b"LPUSH")
-                                || cmd.eq_ignore_ascii_case(b"RPUSH")
-                                || cmd.eq_ignore_ascii_case(b"LMOVE")
+
+                        let is_write = metadata::is_write(cmd);
+                        if is_write {
+                            cow_intercept(snapshot_state, guard, db_idx, cmd_frame);
+                        }
+
+                        let mut selected = db_idx;
+                        let result = cmd_dispatch(guard, cmd, args, &mut selected, db_count);
+                        let frame = match result {
+                            DispatchResult::Response(f) => f,
+                            DispatchResult::Quit(f) => f,
+                        };
+
+                        if is_write && !matches!(frame, crate::protocol::Frame::Error(_)) {
+                            let serialized = aof::serialize_command(cmd_frame);
+                            wal_append_and_fanout(
+                                &serialized,
+                                wal_writer,
+                                wal_v3_writer,
+                                repl_backlog,
+                                replica_txs,
+                                repl_state,
+                                shard_id,
+                            );
+                        }
+
+                        // Auto-index: if HSET succeeded, check for vector index match.
+                        // text_store accessed here (same with_shard closure) to avoid re-entrancy.
+                        if cmd.eq_ignore_ascii_case(b"HSET")
+                            && !matches!(frame, crate::protocol::Frame::Error(_))
+                        {
+                            if let Some(crate::protocol::Frame::BulkString(key_bytes)) =
+                                args.first()
                             {
-                                crate::blocking::wakeup::try_wake_list_waiter(
-                                    &mut reg, &mut guard, db_idx, &key,
-                                );
-                            } else if cmd.eq_ignore_ascii_case(b"ZADD") {
-                                crate::blocking::wakeup::try_wake_zset_waiter(
-                                    &mut reg, &mut guard, db_idx, &key,
-                                );
-                            } else {
-                                crate::blocking::wakeup::try_wake_stream_waiter(
-                                    &mut reg, &mut guard, db_idx, &key,
+                                // Plan 166-01: Vec<(idx, key_hash)> return discarded
+                                // here; Plan 166-02 threads it into CrossStoreTxn.
+                                let _ = auto_index_hset(
+                                    vector_store,
+                                    &mut s.text_store,
+                                    key_bytes,
+                                    args,
+                                    0,
                                 );
                             }
                         }
-                    }
-                }
 
-                results.push(frame);
-            }
-            drop(guard);
-            let _ = reply_tx.send(results);
+                        // Post-dispatch wakeup hooks for producer commands (cross-shard blocking)
+                        if !matches!(frame, crate::protocol::Frame::Error(_)) {
+                            let needs_wake = cmd.eq_ignore_ascii_case(b"LPUSH")
+                                || cmd.eq_ignore_ascii_case(b"RPUSH")
+                                || cmd.eq_ignore_ascii_case(b"LMOVE")
+                                || cmd.eq_ignore_ascii_case(b"ZADD")
+                                || cmd.eq_ignore_ascii_case(b"XADD");
+                            if needs_wake {
+                                let wake_key = if cmd.eq_ignore_ascii_case(b"LMOVE") {
+                                    args.get(1)
+                                        .and_then(|f| crate::server::connection::extract_bytes(f))
+                                } else {
+                                    args.first()
+                                        .and_then(|f| crate::server::connection::extract_bytes(f))
+                                };
+                                if let Some(key) = wake_key {
+                                    let mut reg = blocking_registry.borrow_mut();
+                                    if cmd.eq_ignore_ascii_case(b"LPUSH")
+                                        || cmd.eq_ignore_ascii_case(b"RPUSH")
+                                        || cmd.eq_ignore_ascii_case(b"LMOVE")
+                                    {
+                                        crate::blocking::wakeup::try_wake_list_waiter(
+                                            &mut reg, guard, db_idx, &key,
+                                        );
+                                    } else if cmd.eq_ignore_ascii_case(b"ZADD") {
+                                        crate::blocking::wakeup::try_wake_zset_waiter(
+                                            &mut reg, guard, db_idx, &key,
+                                        );
+                                    } else {
+                                        crate::blocking::wakeup::try_wake_stream_waiter(
+                                            &mut reg, guard, db_idx, &key,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+
+                        results.push(frame);
+                    }
+                });
+                let _ = reply_tx.send(results);
+            } else {
+                let mut guard = shard_databases.write_db(shard_id, db_idx);
+                guard.refresh_now_from_cache(cached_clock);
+                for cmd_frame in &commands {
+                    let (cmd, args) = match extract_command_static(cmd_frame) {
+                        Some(pair) => pair,
+                        None => {
+                            results.push(crate::protocol::Frame::Error(
+                                bytes::Bytes::from_static(b"ERR invalid command format"),
+                            ));
+                            continue;
+                        }
+                    };
+
+                    // COW intercept for each write command in the batch
+                    let is_write = metadata::is_write(cmd);
+                    if is_write {
+                        cow_intercept(snapshot_state, &guard, db_idx, cmd_frame);
+                    }
+
+                    let mut selected = db_idx;
+                    let result = cmd_dispatch(&mut guard, cmd, args, &mut selected, db_count);
+                    let frame = match result {
+                        DispatchResult::Response(f) => f,
+                        DispatchResult::Quit(f) => f,
+                    };
+
+                    // WAL append + replication fan-out for successful write commands
+                    if is_write && !matches!(frame, crate::protocol::Frame::Error(_)) {
+                        let serialized = aof::serialize_command(cmd_frame);
+                        wal_append_and_fanout(
+                            &serialized,
+                            wal_writer,
+                            wal_v3_writer,
+                            repl_backlog,
+                            replica_txs,
+                            repl_state,
+                            shard_id,
+                        );
+                    }
+
+                    // Auto-index: if HSET succeeded, check for vector index match
+                    if cmd.eq_ignore_ascii_case(b"HSET")
+                        && !matches!(frame, crate::protocol::Frame::Error(_))
+                    {
+                        if let Some(crate::protocol::Frame::BulkString(key_bytes)) = args.first() {
+                            // Use the `vector_store` parameter (already locked by caller),
+                            // NOT shard_databases.vector_store() which would deadlock
+                            // (parking_lot::Mutex is non-reentrant).
+                            let mut ts = shard_databases.text_store(shard_id);
+                            // Plan 166-01: Vec<(idx, key_hash)> return discarded
+                            // here; Plan 166-02 threads it into CrossStoreTxn.
+                            let _ = auto_index_hset(vector_store, &mut *ts, key_bytes, args, 0);
+                        }
+                    }
+
+                    // Post-dispatch wakeup hooks for producer commands (cross-shard blocking)
+                    if !matches!(frame, crate::protocol::Frame::Error(_)) {
+                        let needs_wake = cmd.eq_ignore_ascii_case(b"LPUSH")
+                            || cmd.eq_ignore_ascii_case(b"RPUSH")
+                            || cmd.eq_ignore_ascii_case(b"LMOVE")
+                            || cmd.eq_ignore_ascii_case(b"ZADD")
+                            || cmd.eq_ignore_ascii_case(b"XADD");
+                        if needs_wake {
+                            // For LMOVE, wake waiters on the destination key (args[1]),
+                            // not the source key (args[0]).
+                            let wake_key = if cmd.eq_ignore_ascii_case(b"LMOVE") {
+                                args.get(1)
+                                    .and_then(|f| crate::server::connection::extract_bytes(f))
+                            } else {
+                                args.first()
+                                    .and_then(|f| crate::server::connection::extract_bytes(f))
+                            };
+                            if let Some(key) = wake_key {
+                                let mut reg = blocking_registry.borrow_mut();
+                                if cmd.eq_ignore_ascii_case(b"LPUSH")
+                                    || cmd.eq_ignore_ascii_case(b"RPUSH")
+                                    || cmd.eq_ignore_ascii_case(b"LMOVE")
+                                {
+                                    crate::blocking::wakeup::try_wake_list_waiter(
+                                        &mut reg, &mut guard, db_idx, &key,
+                                    );
+                                } else if cmd.eq_ignore_ascii_case(b"ZADD") {
+                                    crate::blocking::wakeup::try_wake_zset_waiter(
+                                        &mut reg, &mut guard, db_idx, &key,
+                                    );
+                                } else {
+                                    crate::blocking::wakeup::try_wake_stream_waiter(
+                                        &mut reg, &mut guard, db_idx, &key,
+                                    );
+                                }
+                            }
+                        }
+                    }
+
+                    results.push(frame);
+                }
+                drop(guard);
+                let _ = reply_tx.send(results);
+            } // else branch end (is_initialized gate)
         }
         ShardMessage::ExecuteSlotted {
             db_index,
             command,
             response_slot,
         } => {
-            let response = {
-                let db_count = shard_databases.db_count();
-                let db_idx = db_index.min(db_count.saturating_sub(1));
-                let (cmd, args) = match extract_command_static(&command) {
-                    Some(pair) => pair,
-                    None => {
-                        // SAFETY: response_slot points to a valid ResponseSlot owned by the
-                        // connection's ResponseSlotPool, which outlives all dispatched messages.
-                        let slot = unsafe { &*response_slot.0 };
-                        slot.fill(vec![crate::protocol::Frame::Error(
-                            bytes::Bytes::from_static(b"ERR invalid command format"),
-                        )]);
-                        return;
-                    }
-                };
+            let db_count = shard_databases.db_count();
+            let db_idx = db_index.min(db_count.saturating_sub(1));
+            let (cmd, args) = match extract_command_static(&command) {
+                Some(pair) => pair,
+                None => {
+                    // SAFETY: response_slot points to a valid ResponseSlot owned by the
+                    // connection's ResponseSlotPool, which outlives all dispatched messages.
+                    let slot = unsafe { &*response_slot.0 };
+                    slot.fill(vec![crate::protocol::Frame::Error(
+                        bytes::Bytes::from_static(b"ERR invalid command format"),
+                    )]);
+                    return;
+                }
+            };
 
+            {
                 let is_write = metadata::is_write(cmd);
-                if is_write {
-                    let db_guard = shard_databases.read_db(shard_id, db_idx);
-                    cow_intercept(snapshot_state, &db_guard, db_idx, &command);
-                    drop(db_guard);
-                }
-
-                let mut guard = shard_databases.write_db(shard_id, db_idx);
-                guard.refresh_now_from_cache(cached_clock);
-                let mut selected = db_idx;
-                let result = cmd_dispatch(&mut guard, cmd, args, &mut selected, db_count);
-                let frame = match result {
-                    DispatchResult::Response(f) => f,
-                    DispatchResult::Quit(f) => f,
-                };
-
-                if is_write && !matches!(frame, crate::protocol::Frame::Error(_)) {
-                    let serialized = aof::serialize_command(&command);
-                    wal_append_and_fanout(
-                        &serialized,
-                        wal_writer,
-                        wal_v3_writer,
-                        repl_backlog,
-                        replica_txs,
-                        repl_state,
-                        shard_id,
-                    );
-                }
-
-                if !matches!(frame, crate::protocol::Frame::Error(_)) {
-                    let needs_wake = cmd.eq_ignore_ascii_case(b"LPUSH")
-                        || cmd.eq_ignore_ascii_case(b"RPUSH")
-                        || cmd.eq_ignore_ascii_case(b"LMOVE")
-                        || cmd.eq_ignore_ascii_case(b"ZADD")
-                        || cmd.eq_ignore_ascii_case(b"XADD");
-                    if needs_wake {
-                        let wake_key = if cmd.eq_ignore_ascii_case(b"LMOVE") {
-                            args.get(1)
-                                .and_then(|f| crate::server::connection::extract_bytes(f))
-                        } else {
-                            args.first()
-                                .and_then(|f| crate::server::connection::extract_bytes(f))
+                // Phase 2b: gate on is_initialized(); new path uses ShardSlice.
+                let frame = if crate::shard::slice::is_initialized() {
+                    if is_write {
+                        crate::shard::slice::with_shard_db(db_idx, |db| {
+                            cow_intercept(snapshot_state, db, db_idx, &command);
+                        });
+                    }
+                    crate::shard::slice::with_shard(|s| {
+                        let db = &mut s.databases[db_idx];
+                        db.refresh_now_from_cache(cached_clock);
+                        let mut selected = db_idx;
+                        let result = cmd_dispatch(db, cmd, args, &mut selected, db_count);
+                        let frame = match result {
+                            DispatchResult::Response(f) => f,
+                            DispatchResult::Quit(f) => f,
                         };
-                        if let Some(key) = wake_key {
-                            let mut reg = blocking_registry.borrow_mut();
-                            if cmd.eq_ignore_ascii_case(b"LPUSH")
+
+                        if is_write && !matches!(frame, crate::protocol::Frame::Error(_)) {
+                            let serialized = aof::serialize_command(&command);
+                            wal_append_and_fanout(
+                                &serialized,
+                                wal_writer,
+                                wal_v3_writer,
+                                repl_backlog,
+                                replica_txs,
+                                repl_state,
+                                shard_id,
+                            );
+                        }
+
+                        if !matches!(frame, crate::protocol::Frame::Error(_)) {
+                            let needs_wake = cmd.eq_ignore_ascii_case(b"LPUSH")
                                 || cmd.eq_ignore_ascii_case(b"RPUSH")
                                 || cmd.eq_ignore_ascii_case(b"LMOVE")
-                            {
-                                crate::blocking::wakeup::try_wake_list_waiter(
-                                    &mut reg, &mut guard, db_idx, &key,
-                                );
-                            } else if cmd.eq_ignore_ascii_case(b"ZADD") {
-                                crate::blocking::wakeup::try_wake_zset_waiter(
-                                    &mut reg, &mut guard, db_idx, &key,
-                                );
+                                || cmd.eq_ignore_ascii_case(b"ZADD")
+                                || cmd.eq_ignore_ascii_case(b"XADD");
+                            if needs_wake {
+                                let wake_key = if cmd.eq_ignore_ascii_case(b"LMOVE") {
+                                    args.get(1)
+                                        .and_then(|f| crate::server::connection::extract_bytes(f))
+                                } else {
+                                    args.first()
+                                        .and_then(|f| crate::server::connection::extract_bytes(f))
+                                };
+                                if let Some(key) = wake_key {
+                                    let mut reg = blocking_registry.borrow_mut();
+                                    if cmd.eq_ignore_ascii_case(b"LPUSH")
+                                        || cmd.eq_ignore_ascii_case(b"RPUSH")
+                                        || cmd.eq_ignore_ascii_case(b"LMOVE")
+                                    {
+                                        crate::blocking::wakeup::try_wake_list_waiter(
+                                            &mut reg, db, db_idx, &key,
+                                        );
+                                    } else if cmd.eq_ignore_ascii_case(b"ZADD") {
+                                        crate::blocking::wakeup::try_wake_zset_waiter(
+                                            &mut reg, db, db_idx, &key,
+                                        );
+                                    } else {
+                                        crate::blocking::wakeup::try_wake_stream_waiter(
+                                            &mut reg, db, db_idx, &key,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+
+                        frame
+                    })
+                } else {
+                    if is_write {
+                        let db_guard = shard_databases.read_db(shard_id, db_idx);
+                        cow_intercept(snapshot_state, &db_guard, db_idx, &command);
+                        drop(db_guard);
+                    }
+
+                    let mut guard = shard_databases.write_db(shard_id, db_idx);
+                    guard.refresh_now_from_cache(cached_clock);
+                    let mut selected = db_idx;
+                    let result = cmd_dispatch(&mut guard, cmd, args, &mut selected, db_count);
+                    let frame = match result {
+                        DispatchResult::Response(f) => f,
+                        DispatchResult::Quit(f) => f,
+                    };
+
+                    if is_write && !matches!(frame, crate::protocol::Frame::Error(_)) {
+                        let serialized = aof::serialize_command(&command);
+                        wal_append_and_fanout(
+                            &serialized,
+                            wal_writer,
+                            wal_v3_writer,
+                            repl_backlog,
+                            replica_txs,
+                            repl_state,
+                            shard_id,
+                        );
+                    }
+
+                    if !matches!(frame, crate::protocol::Frame::Error(_)) {
+                        let needs_wake = cmd.eq_ignore_ascii_case(b"LPUSH")
+                            || cmd.eq_ignore_ascii_case(b"RPUSH")
+                            || cmd.eq_ignore_ascii_case(b"LMOVE")
+                            || cmd.eq_ignore_ascii_case(b"ZADD")
+                            || cmd.eq_ignore_ascii_case(b"XADD");
+                        if needs_wake {
+                            let wake_key = if cmd.eq_ignore_ascii_case(b"LMOVE") {
+                                args.get(1)
+                                    .and_then(|f| crate::server::connection::extract_bytes(f))
                             } else {
-                                crate::blocking::wakeup::try_wake_stream_waiter(
-                                    &mut reg, &mut guard, db_idx, &key,
-                                );
+                                args.first()
+                                    .and_then(|f| crate::server::connection::extract_bytes(f))
+                            };
+                            if let Some(key) = wake_key {
+                                let mut reg = blocking_registry.borrow_mut();
+                                if cmd.eq_ignore_ascii_case(b"LPUSH")
+                                    || cmd.eq_ignore_ascii_case(b"RPUSH")
+                                    || cmd.eq_ignore_ascii_case(b"LMOVE")
+                                {
+                                    crate::blocking::wakeup::try_wake_list_waiter(
+                                        &mut reg, &mut guard, db_idx, &key,
+                                    );
+                                } else if cmd.eq_ignore_ascii_case(b"ZADD") {
+                                    crate::blocking::wakeup::try_wake_zset_waiter(
+                                        &mut reg, &mut guard, db_idx, &key,
+                                    );
+                                } else {
+                                    crate::blocking::wakeup::try_wake_stream_waiter(
+                                        &mut reg, &mut guard, db_idx, &key,
+                                    );
+                                }
                             }
                         }
                     }
-                }
 
-                drop(guard);
-                frame
-            };
-            // SAFETY: response_slot points to a valid ResponseSlot (see above).
-            let slot = unsafe { &*response_slot.0 };
-            slot.fill(vec![response]);
+                    drop(guard);
+                    frame
+                };
+                // SAFETY: response_slot points to a valid ResponseSlot (see above).
+                let slot = unsafe { &*response_slot.0 };
+                slot.fill(vec![frame]);
+            }
         }
         ShardMessage::MultiExecuteSlotted {
             db_index,
@@ -811,81 +1222,160 @@ pub(crate) fn handle_shard_message_shared(
             let mut results = Vec::with_capacity(commands.len());
             let db_count = shard_databases.db_count();
             let db_idx = db_index.min(db_count.saturating_sub(1));
-            let mut guard = shard_databases.write_db(shard_id, db_idx);
-            guard.refresh_now_from_cache(cached_clock);
-            for (_key, cmd_frame) in &commands {
-                let (cmd, args) = match extract_command_static(cmd_frame) {
-                    Some(pair) => pair,
-                    None => {
-                        results.push(crate::protocol::Frame::Error(bytes::Bytes::from_static(
-                            b"ERR invalid command format",
-                        )));
-                        continue;
-                    }
-                };
-
-                let is_write = metadata::is_write(cmd);
-                if is_write {
-                    cow_intercept(snapshot_state, &guard, db_idx, cmd_frame);
-                }
-
-                let mut selected = db_idx;
-                let result = cmd_dispatch(&mut guard, cmd, args, &mut selected, db_count);
-                let frame = match result {
-                    DispatchResult::Response(f) => f,
-                    DispatchResult::Quit(f) => f,
-                };
-
-                if is_write && !matches!(frame, crate::protocol::Frame::Error(_)) {
-                    let serialized = aof::serialize_command(cmd_frame);
-                    wal_append_and_fanout(
-                        &serialized,
-                        wal_writer,
-                        wal_v3_writer,
-                        repl_backlog,
-                        replica_txs,
-                        repl_state,
-                        shard_id,
-                    );
-
-                    let needs_wake = cmd.eq_ignore_ascii_case(b"LPUSH")
-                        || cmd.eq_ignore_ascii_case(b"RPUSH")
-                        || cmd.eq_ignore_ascii_case(b"LMOVE")
-                        || cmd.eq_ignore_ascii_case(b"ZADD")
-                        || cmd.eq_ignore_ascii_case(b"XADD");
-                    if needs_wake {
-                        let wake_key = if cmd.eq_ignore_ascii_case(b"LMOVE") {
-                            args.get(1)
-                                .and_then(|f| crate::server::connection::extract_bytes(f))
-                        } else {
-                            args.first()
-                                .and_then(|f| crate::server::connection::extract_bytes(f))
+            // Phase 2b: gate on is_initialized(); new path uses ShardSlice.
+            if crate::shard::slice::is_initialized() {
+                crate::shard::slice::with_shard_db(db_idx, |guard| {
+                    guard.refresh_now_from_cache(cached_clock);
+                    for (_key, cmd_frame) in &commands {
+                        let (cmd, args) = match extract_command_static(cmd_frame) {
+                            Some(pair) => pair,
+                            None => {
+                                results.push(crate::protocol::Frame::Error(
+                                    bytes::Bytes::from_static(b"ERR invalid command format"),
+                                ));
+                                continue;
+                            }
                         };
-                        if let Some(key) = wake_key {
-                            let mut reg = blocking_registry.borrow_mut();
-                            if cmd.eq_ignore_ascii_case(b"LPUSH")
+
+                        let is_write = metadata::is_write(cmd);
+                        if is_write {
+                            cow_intercept(snapshot_state, guard, db_idx, cmd_frame);
+                        }
+
+                        let mut selected = db_idx;
+                        let result = cmd_dispatch(guard, cmd, args, &mut selected, db_count);
+                        let frame = match result {
+                            DispatchResult::Response(f) => f,
+                            DispatchResult::Quit(f) => f,
+                        };
+
+                        if is_write && !matches!(frame, crate::protocol::Frame::Error(_)) {
+                            let serialized = aof::serialize_command(cmd_frame);
+                            wal_append_and_fanout(
+                                &serialized,
+                                wal_writer,
+                                wal_v3_writer,
+                                repl_backlog,
+                                replica_txs,
+                                repl_state,
+                                shard_id,
+                            );
+
+                            let needs_wake = cmd.eq_ignore_ascii_case(b"LPUSH")
                                 || cmd.eq_ignore_ascii_case(b"RPUSH")
                                 || cmd.eq_ignore_ascii_case(b"LMOVE")
-                            {
-                                crate::blocking::wakeup::try_wake_list_waiter(
-                                    &mut reg, &mut guard, db_idx, &key,
-                                );
-                            } else if cmd.eq_ignore_ascii_case(b"ZADD") {
-                                crate::blocking::wakeup::try_wake_zset_waiter(
-                                    &mut reg, &mut guard, db_idx, &key,
-                                );
+                                || cmd.eq_ignore_ascii_case(b"ZADD")
+                                || cmd.eq_ignore_ascii_case(b"XADD");
+                            if needs_wake {
+                                let wake_key = if cmd.eq_ignore_ascii_case(b"LMOVE") {
+                                    args.get(1)
+                                        .and_then(|f| crate::server::connection::extract_bytes(f))
+                                } else {
+                                    args.first()
+                                        .and_then(|f| crate::server::connection::extract_bytes(f))
+                                };
+                                if let Some(key) = wake_key {
+                                    let mut reg = blocking_registry.borrow_mut();
+                                    if cmd.eq_ignore_ascii_case(b"LPUSH")
+                                        || cmd.eq_ignore_ascii_case(b"RPUSH")
+                                        || cmd.eq_ignore_ascii_case(b"LMOVE")
+                                    {
+                                        crate::blocking::wakeup::try_wake_list_waiter(
+                                            &mut reg, guard, db_idx, &key,
+                                        );
+                                    } else if cmd.eq_ignore_ascii_case(b"ZADD") {
+                                        crate::blocking::wakeup::try_wake_zset_waiter(
+                                            &mut reg, guard, db_idx, &key,
+                                        );
+                                    } else {
+                                        crate::blocking::wakeup::try_wake_stream_waiter(
+                                            &mut reg, guard, db_idx, &key,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+
+                        results.push(frame);
+                    }
+                });
+            } else {
+                let mut guard = shard_databases.write_db(shard_id, db_idx);
+                guard.refresh_now_from_cache(cached_clock);
+                for (_key, cmd_frame) in &commands {
+                    let (cmd, args) = match extract_command_static(cmd_frame) {
+                        Some(pair) => pair,
+                        None => {
+                            results.push(crate::protocol::Frame::Error(
+                                bytes::Bytes::from_static(b"ERR invalid command format"),
+                            ));
+                            continue;
+                        }
+                    };
+
+                    let is_write = metadata::is_write(cmd);
+                    if is_write {
+                        cow_intercept(snapshot_state, &guard, db_idx, cmd_frame);
+                    }
+
+                    let mut selected = db_idx;
+                    let result = cmd_dispatch(&mut guard, cmd, args, &mut selected, db_count);
+                    let frame = match result {
+                        DispatchResult::Response(f) => f,
+                        DispatchResult::Quit(f) => f,
+                    };
+
+                    if is_write && !matches!(frame, crate::protocol::Frame::Error(_)) {
+                        let serialized = aof::serialize_command(cmd_frame);
+                        wal_append_and_fanout(
+                            &serialized,
+                            wal_writer,
+                            wal_v3_writer,
+                            repl_backlog,
+                            replica_txs,
+                            repl_state,
+                            shard_id,
+                        );
+
+                        let needs_wake = cmd.eq_ignore_ascii_case(b"LPUSH")
+                            || cmd.eq_ignore_ascii_case(b"RPUSH")
+                            || cmd.eq_ignore_ascii_case(b"LMOVE")
+                            || cmd.eq_ignore_ascii_case(b"ZADD")
+                            || cmd.eq_ignore_ascii_case(b"XADD");
+                        if needs_wake {
+                            let wake_key = if cmd.eq_ignore_ascii_case(b"LMOVE") {
+                                args.get(1)
+                                    .and_then(|f| crate::server::connection::extract_bytes(f))
                             } else {
-                                crate::blocking::wakeup::try_wake_stream_waiter(
-                                    &mut reg, &mut guard, db_idx, &key,
-                                );
+                                args.first()
+                                    .and_then(|f| crate::server::connection::extract_bytes(f))
+                            };
+                            if let Some(key) = wake_key {
+                                let mut reg = blocking_registry.borrow_mut();
+                                if cmd.eq_ignore_ascii_case(b"LPUSH")
+                                    || cmd.eq_ignore_ascii_case(b"RPUSH")
+                                    || cmd.eq_ignore_ascii_case(b"LMOVE")
+                                {
+                                    crate::blocking::wakeup::try_wake_list_waiter(
+                                        &mut reg, &mut guard, db_idx, &key,
+                                    );
+                                } else if cmd.eq_ignore_ascii_case(b"ZADD") {
+                                    crate::blocking::wakeup::try_wake_zset_waiter(
+                                        &mut reg, &mut guard, db_idx, &key,
+                                    );
+                                } else {
+                                    crate::blocking::wakeup::try_wake_stream_waiter(
+                                        &mut reg, &mut guard, db_idx, &key,
+                                    );
+                                }
                             }
                         }
                     }
-                }
 
-                results.push(frame);
-            }
-            drop(guard);
+                    results.push(frame);
+                }
+                drop(guard);
+            } // else branch end (is_initialized gate)
             // SAFETY: response_slot points to a valid ResponseSlot (see ExecuteSlotted).
             let slot = unsafe { &*response_slot.0 };
             slot.fill(results);
@@ -898,98 +1388,201 @@ pub(crate) fn handle_shard_message_shared(
             let mut results = Vec::with_capacity(commands.len());
             let db_count = shard_databases.db_count();
             let db_idx = db_index.min(db_count.saturating_sub(1));
-            let mut guard = shard_databases.write_db(shard_id, db_idx);
-            guard.refresh_now_from_cache(cached_clock);
-            for cmd_frame in &commands {
-                let (cmd, args) = match extract_command_static(cmd_frame) {
-                    Some(pair) => pair,
-                    None => {
-                        results.push(crate::protocol::Frame::Error(bytes::Bytes::from_static(
-                            b"ERR invalid command format",
-                        )));
-                        continue;
-                    }
-                };
-
-                let is_write = metadata::is_write(cmd);
-                if is_write {
-                    cow_intercept(snapshot_state, &guard, db_idx, cmd_frame);
-                }
-
-                let mut selected = db_idx;
-                let result = cmd_dispatch(&mut guard, cmd, args, &mut selected, db_count);
-                let frame = match result {
-                    DispatchResult::Response(f) => f,
-                    DispatchResult::Quit(f) => f,
-                };
-
-                if is_write && !matches!(frame, crate::protocol::Frame::Error(_)) {
-                    let serialized = aof::serialize_command(cmd_frame);
-                    wal_append_and_fanout(
-                        &serialized,
-                        wal_writer,
-                        wal_v3_writer,
-                        repl_backlog,
-                        replica_txs,
-                        repl_state,
-                        shard_id,
-                    );
-                }
-
-                // Auto-index: if HSET succeeded, check for vector index match
-                if cmd.eq_ignore_ascii_case(b"HSET")
-                    && !matches!(frame, crate::protocol::Frame::Error(_))
-                {
-                    if let Some(crate::protocol::Frame::BulkString(key_bytes)) = args.first() {
-                        // Use the `vector_store` parameter (already locked by caller),
-                        // NOT shard_databases.vector_store() which would deadlock
-                        // (parking_lot::Mutex is non-reentrant).
-                        let mut ts = shard_databases.text_store(shard_id);
-                        // Plan 166-01: Vec<(idx, key_hash)> return discarded
-                        // here; Plan 166-02 threads it into CrossStoreTxn.
-                        let _ = auto_index_hset(vector_store, &mut *ts, key_bytes, args, 0);
-                    }
-                }
-
-                if !matches!(frame, crate::protocol::Frame::Error(_)) {
-                    let needs_wake = cmd.eq_ignore_ascii_case(b"LPUSH")
-                        || cmd.eq_ignore_ascii_case(b"RPUSH")
-                        || cmd.eq_ignore_ascii_case(b"LMOVE")
-                        || cmd.eq_ignore_ascii_case(b"ZADD")
-                        || cmd.eq_ignore_ascii_case(b"XADD");
-                    if needs_wake {
-                        let wake_key = if cmd.eq_ignore_ascii_case(b"LMOVE") {
-                            args.get(1)
-                                .and_then(|f| crate::server::connection::extract_bytes(f))
-                        } else {
-                            args.first()
-                                .and_then(|f| crate::server::connection::extract_bytes(f))
+            // Phase 2b: gate on is_initialized(); new path uses ShardSlice.
+            // write_db and text_store (HSET auto-index) in one with_shard closure.
+            if crate::shard::slice::is_initialized() {
+                crate::shard::slice::with_shard(|s| {
+                    let guard = &mut s.databases[db_idx];
+                    guard.refresh_now_from_cache(cached_clock);
+                    for cmd_frame in &commands {
+                        let (cmd, args) = match extract_command_static(cmd_frame) {
+                            Some(pair) => pair,
+                            None => {
+                                results.push(crate::protocol::Frame::Error(
+                                    bytes::Bytes::from_static(b"ERR invalid command format"),
+                                ));
+                                continue;
+                            }
                         };
-                        if let Some(key) = wake_key {
-                            let mut reg = blocking_registry.borrow_mut();
-                            if cmd.eq_ignore_ascii_case(b"LPUSH")
-                                || cmd.eq_ignore_ascii_case(b"RPUSH")
-                                || cmd.eq_ignore_ascii_case(b"LMOVE")
+
+                        let is_write = metadata::is_write(cmd);
+                        if is_write {
+                            cow_intercept(snapshot_state, guard, db_idx, cmd_frame);
+                        }
+
+                        let mut selected = db_idx;
+                        let result = cmd_dispatch(guard, cmd, args, &mut selected, db_count);
+                        let frame = match result {
+                            DispatchResult::Response(f) => f,
+                            DispatchResult::Quit(f) => f,
+                        };
+
+                        if is_write && !matches!(frame, crate::protocol::Frame::Error(_)) {
+                            let serialized = aof::serialize_command(cmd_frame);
+                            wal_append_and_fanout(
+                                &serialized,
+                                wal_writer,
+                                wal_v3_writer,
+                                repl_backlog,
+                                replica_txs,
+                                repl_state,
+                                shard_id,
+                            );
+                        }
+
+                        // Auto-index: if HSET succeeded, check for vector index match.
+                        // text_store in same with_shard closure to avoid re-entrancy.
+                        if cmd.eq_ignore_ascii_case(b"HSET")
+                            && !matches!(frame, crate::protocol::Frame::Error(_))
+                        {
+                            if let Some(crate::protocol::Frame::BulkString(key_bytes)) =
+                                args.first()
                             {
-                                crate::blocking::wakeup::try_wake_list_waiter(
-                                    &mut reg, &mut guard, db_idx, &key,
-                                );
-                            } else if cmd.eq_ignore_ascii_case(b"ZADD") {
-                                crate::blocking::wakeup::try_wake_zset_waiter(
-                                    &mut reg, &mut guard, db_idx, &key,
-                                );
-                            } else {
-                                crate::blocking::wakeup::try_wake_stream_waiter(
-                                    &mut reg, &mut guard, db_idx, &key,
+                                // Plan 166-01: Vec<(idx, key_hash)> return discarded
+                                // here; Plan 166-02 threads it into CrossStoreTxn.
+                                let _ = auto_index_hset(
+                                    vector_store,
+                                    &mut s.text_store,
+                                    key_bytes,
+                                    args,
+                                    0,
                                 );
                             }
                         }
-                    }
-                }
 
-                results.push(frame);
-            }
-            drop(guard);
+                        if !matches!(frame, crate::protocol::Frame::Error(_)) {
+                            let needs_wake = cmd.eq_ignore_ascii_case(b"LPUSH")
+                                || cmd.eq_ignore_ascii_case(b"RPUSH")
+                                || cmd.eq_ignore_ascii_case(b"LMOVE")
+                                || cmd.eq_ignore_ascii_case(b"ZADD")
+                                || cmd.eq_ignore_ascii_case(b"XADD");
+                            if needs_wake {
+                                let wake_key = if cmd.eq_ignore_ascii_case(b"LMOVE") {
+                                    args.get(1)
+                                        .and_then(|f| crate::server::connection::extract_bytes(f))
+                                } else {
+                                    args.first()
+                                        .and_then(|f| crate::server::connection::extract_bytes(f))
+                                };
+                                if let Some(key) = wake_key {
+                                    let mut reg = blocking_registry.borrow_mut();
+                                    if cmd.eq_ignore_ascii_case(b"LPUSH")
+                                        || cmd.eq_ignore_ascii_case(b"RPUSH")
+                                        || cmd.eq_ignore_ascii_case(b"LMOVE")
+                                    {
+                                        crate::blocking::wakeup::try_wake_list_waiter(
+                                            &mut reg, guard, db_idx, &key,
+                                        );
+                                    } else if cmd.eq_ignore_ascii_case(b"ZADD") {
+                                        crate::blocking::wakeup::try_wake_zset_waiter(
+                                            &mut reg, guard, db_idx, &key,
+                                        );
+                                    } else {
+                                        crate::blocking::wakeup::try_wake_stream_waiter(
+                                            &mut reg, guard, db_idx, &key,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+
+                        results.push(frame);
+                    }
+                });
+            } else {
+                let mut guard = shard_databases.write_db(shard_id, db_idx);
+                guard.refresh_now_from_cache(cached_clock);
+                for cmd_frame in &commands {
+                    let (cmd, args) = match extract_command_static(cmd_frame) {
+                        Some(pair) => pair,
+                        None => {
+                            results.push(crate::protocol::Frame::Error(
+                                bytes::Bytes::from_static(b"ERR invalid command format"),
+                            ));
+                            continue;
+                        }
+                    };
+
+                    let is_write = metadata::is_write(cmd);
+                    if is_write {
+                        cow_intercept(snapshot_state, &guard, db_idx, cmd_frame);
+                    }
+
+                    let mut selected = db_idx;
+                    let result = cmd_dispatch(&mut guard, cmd, args, &mut selected, db_count);
+                    let frame = match result {
+                        DispatchResult::Response(f) => f,
+                        DispatchResult::Quit(f) => f,
+                    };
+
+                    if is_write && !matches!(frame, crate::protocol::Frame::Error(_)) {
+                        let serialized = aof::serialize_command(cmd_frame);
+                        wal_append_and_fanout(
+                            &serialized,
+                            wal_writer,
+                            wal_v3_writer,
+                            repl_backlog,
+                            replica_txs,
+                            repl_state,
+                            shard_id,
+                        );
+                    }
+
+                    // Auto-index: if HSET succeeded, check for vector index match
+                    if cmd.eq_ignore_ascii_case(b"HSET")
+                        && !matches!(frame, crate::protocol::Frame::Error(_))
+                    {
+                        if let Some(crate::protocol::Frame::BulkString(key_bytes)) = args.first() {
+                            // Use the `vector_store` parameter (already locked by caller),
+                            // NOT shard_databases.vector_store() which would deadlock
+                            // (parking_lot::Mutex is non-reentrant).
+                            let mut ts = shard_databases.text_store(shard_id);
+                            // Plan 166-01: Vec<(idx, key_hash)> return discarded
+                            // here; Plan 166-02 threads it into CrossStoreTxn.
+                            let _ = auto_index_hset(vector_store, &mut *ts, key_bytes, args, 0);
+                        }
+                    }
+
+                    if !matches!(frame, crate::protocol::Frame::Error(_)) {
+                        let needs_wake = cmd.eq_ignore_ascii_case(b"LPUSH")
+                            || cmd.eq_ignore_ascii_case(b"RPUSH")
+                            || cmd.eq_ignore_ascii_case(b"LMOVE")
+                            || cmd.eq_ignore_ascii_case(b"ZADD")
+                            || cmd.eq_ignore_ascii_case(b"XADD");
+                        if needs_wake {
+                            let wake_key = if cmd.eq_ignore_ascii_case(b"LMOVE") {
+                                args.get(1)
+                                    .and_then(|f| crate::server::connection::extract_bytes(f))
+                            } else {
+                                args.first()
+                                    .and_then(|f| crate::server::connection::extract_bytes(f))
+                            };
+                            if let Some(key) = wake_key {
+                                let mut reg = blocking_registry.borrow_mut();
+                                if cmd.eq_ignore_ascii_case(b"LPUSH")
+                                    || cmd.eq_ignore_ascii_case(b"RPUSH")
+                                    || cmd.eq_ignore_ascii_case(b"LMOVE")
+                                {
+                                    crate::blocking::wakeup::try_wake_list_waiter(
+                                        &mut reg, &mut guard, db_idx, &key,
+                                    );
+                                } else if cmd.eq_ignore_ascii_case(b"ZADD") {
+                                    crate::blocking::wakeup::try_wake_zset_waiter(
+                                        &mut reg, &mut guard, db_idx, &key,
+                                    );
+                                } else {
+                                    crate::blocking::wakeup::try_wake_stream_waiter(
+                                        &mut reg, &mut guard, db_idx, &key,
+                                    );
+                                }
+                            }
+                        }
+                    }
+
+                    results.push(frame);
+                }
+                drop(guard);
+            } // else branch end (is_initialized gate)
             // SAFETY: response_slot points to a valid ResponseSlot (see ExecuteSlotted).
             let slot = unsafe { &*response_slot.0 };
             slot.fill(results);
@@ -1041,13 +1634,34 @@ pub(crate) fn handle_shard_message_shared(
             let mut reg = blocking_registry.borrow_mut();
             reg.register(db_index, key.clone(), entry);
             // Check if data is already available (race: data arrived before registration).
-            let mut guard = shard_databases.write_db(shard_id, db_index);
-            if guard.exists(&key) {
-                crate::blocking::wakeup::try_wake_list_waiter(&mut reg, &mut guard, db_index, &key);
-                crate::blocking::wakeup::try_wake_zset_waiter(&mut reg, &mut guard, db_index, &key);
-                crate::blocking::wakeup::try_wake_stream_waiter(
-                    &mut reg, &mut guard, db_index, &key,
-                );
+            // Phase 2b: gate on is_initialized(); new path uses ShardSlice.
+            if crate::shard::slice::is_initialized() {
+                crate::shard::slice::with_shard_db(db_index, |guard| {
+                    if guard.exists(&key) {
+                        crate::blocking::wakeup::try_wake_list_waiter(
+                            &mut reg, guard, db_index, &key,
+                        );
+                        crate::blocking::wakeup::try_wake_zset_waiter(
+                            &mut reg, guard, db_index, &key,
+                        );
+                        crate::blocking::wakeup::try_wake_stream_waiter(
+                            &mut reg, guard, db_index, &key,
+                        );
+                    }
+                });
+            } else {
+                let mut guard = shard_databases.write_db(shard_id, db_index);
+                if guard.exists(&key) {
+                    crate::blocking::wakeup::try_wake_list_waiter(
+                        &mut reg, &mut guard, db_index, &key,
+                    );
+                    crate::blocking::wakeup::try_wake_zset_waiter(
+                        &mut reg, &mut guard, db_index, &key,
+                    );
+                    crate::blocking::wakeup::try_wake_stream_waiter(
+                        &mut reg, &mut guard, db_index, &key,
+                    );
+                }
             }
         }
         ShardMessage::BlockCancel { wait_id } => {
@@ -1059,14 +1673,27 @@ pub(crate) fn handle_shard_message_shared(
             count,
             reply_tx,
         } => {
-            let db_guard = shard_databases.read_db(shard_id, db_index);
-            let keys = crate::cluster::migration::handle_get_keys_in_slot(
-                std::slice::from_ref(&*db_guard),
-                0,
-                slot,
-                count,
-            );
-            drop(db_guard);
+            // Phase 2b: gate on is_initialized(); new path uses ShardSlice.
+            let keys = if crate::shard::slice::is_initialized() {
+                crate::shard::slice::with_shard_db(db_index, |db| {
+                    crate::cluster::migration::handle_get_keys_in_slot(
+                        std::slice::from_ref(db),
+                        0,
+                        slot,
+                        count,
+                    )
+                })
+            } else {
+                let db_guard = shard_databases.read_db(shard_id, db_index);
+                let keys = crate::cluster::migration::handle_get_keys_in_slot(
+                    std::slice::from_ref(&*db_guard),
+                    0,
+                    slot,
+                    count,
+                );
+                drop(db_guard);
+                keys
+            };
             let _ = reply_tx.send(keys);
         }
         ShardMessage::SlotOwnershipUpdate {
@@ -1108,6 +1735,34 @@ pub(crate) fn handle_shard_message_shared(
         } => {
             // DFS Phase 1: collect per-term df + total N from this shard's TextIndex.
             // Returns crate::protocol::Frame::Array with interleaved [term, df, ..., "N", n] per field_query.
+            // Phase 2b: gate on is_initialized(); new path uses ShardSlice.
+            let response = if crate::shard::slice::is_initialized() {
+                crate::shard::slice::with_shard(|s| {
+                    match s.text_store.get_index(&index_name) {
+                        Some(text_index) => {
+                            let mut items: Vec<crate::protocol::Frame> = Vec::new();
+                            for (field_idx_opt, terms) in &field_queries {
+                                let fidx = field_idx_opt.unwrap_or(0);
+                                let (term_dfs, n) = text_index.doc_freq_for_terms(fidx, terms);
+                                for (term, df) in term_dfs {
+                                    items.push(crate::protocol::Frame::BulkString(
+                                        bytes::Bytes::from(term),
+                                    ));
+                                    items.push(crate::protocol::Frame::Integer(i64::from(df)));
+                                }
+                                items.push(crate::protocol::Frame::BulkString(
+                                    bytes::Bytes::from_static(b"N"),
+                                ));
+                                items.push(crate::protocol::Frame::Integer(i64::from(n)));
+                            }
+                            crate::protocol::Frame::Array(items.into())
+                        }
+                        None => crate::protocol::Frame::Error(bytes::Bytes::from_static(
+                            b"ERR unknown index",
+                        )),
+                    }
+                })
+            } else {
             let text_guard = shard_databases.text_store(shard_id);
             let response = match text_guard.get_index(&index_name) {
                 Some(text_index) => {
@@ -1132,6 +1787,8 @@ pub(crate) fn handle_shard_message_shared(
                 }
             };
             drop(text_guard);
+            response
+            }; // else branch end (is_initialized gate)
             let _ = reply_tx.send(response);
         }
         ShardMessage::TextSearch(payload) => {
@@ -1156,9 +1813,44 @@ pub(crate) fn handle_shard_message_shared(
             // query_terms is Vec<QueryTerm> — fuzzy/prefix terms use the OR-union expansion path.
             // Extract plain strings for HIGHLIGHT/SUMMARIZE (needs analyzed term text only).
             let term_strings: Vec<String> = query_terms.iter().map(|qt| qt.text.clone()).collect();
-            let response = {
+            // Phase 2b: gate on is_initialized(); new path uses ShardSlice.
+            // text_store and read_db(0) accessed in one with_shard closure (multi-resource).
+            let response = if crate::shard::slice::is_initialized() {
+                crate::shard::slice::with_shard(|s| {
+                    match s.text_store.get_index(&index_name) {
+                        Some(text_index) => {
+                            let mut result =
+                                crate::command::vector_search::ft_text_search::execute_text_search_with_global_idf(
+                                    text_index,
+                                    field_idx,
+                                    &query_terms,
+                                    &global_df,
+                                    global_n,
+                                    top_k,
+                                    offset,
+                                    count,
+                                );
+                            if highlight_opts.is_some() || summarize_opts.is_some() {
+                                let db = &s.databases[0];
+                                crate::command::vector_search::ft_text_search::apply_post_processing(
+                                    &mut result,
+                                    &term_strings,
+                                    text_index,
+                                    db,
+                                    highlight_opts.as_ref(),
+                                    summarize_opts.as_ref(),
+                                );
+                            }
+                            result
+                        }
+                        None => crate::protocol::Frame::Error(bytes::Bytes::from_static(
+                            b"ERR unknown index",
+                        )),
+                    }
+                })
+            } else {
                 let text_guard = shard_databases.text_store(shard_id);
-                match text_guard.get_index(&index_name) {
+                let r = match text_guard.get_index(&index_name) {
                     Some(text_index) => {
                         let mut result =
                             crate::command::vector_search::ft_text_search::execute_text_search_with_global_idf(
@@ -1191,46 +1883,82 @@ pub(crate) fn handle_shard_message_shared(
                     None => crate::protocol::Frame::Error(bytes::Bytes::from_static(
                         b"ERR unknown index",
                     )),
-                }
+                };
                 // text_guard drops here (end of block).
+                r
             };
             let _ = reply_tx.send(response);
         }
         ShardMessage::VectorCommand { command, reply_tx } => {
-            #[cfg(feature = "graph")]
-            let graph_guard = shard_databases.graph_store_read(shard_id);
-
-            // SESSION clause needs Database access for sorted set storage.
-            // FT.DROPINDEX with DD flag needs Database to delete indexed docs.
-            let cmd_bytes = extract_command_static(&command).map(|(c, _)| c);
-            let is_dropindex = cmd_bytes
-                .map(|c| c.eq_ignore_ascii_case(b"FT.DROPINDEX"))
-                .unwrap_or(false);
-            let has_session = has_session_keyword(&command);
-            let mut db_guard;
-            let db_opt = if has_session || is_dropindex {
-                db_guard = shard_databases.write_db(shard_id, 0);
-                Some(&mut *db_guard)
+            // Phase 2b: gate on is_initialized(); new path uses ShardSlice.
+            // graph_store, write_db(0), and text_store acquired in one closure
+            // to avoid re-entrant with_shard calls (multi-resource arm).
+            let response = if crate::shard::slice::is_initialized() {
+                crate::shard::slice::with_shard(|s| {
+                    let cmd_bytes = extract_command_static(&command).map(|(c, _)| c);
+                    let is_dropindex = cmd_bytes
+                        .map(|c| c.eq_ignore_ascii_case(b"FT.DROPINDEX"))
+                        .unwrap_or(false);
+                    let has_session = has_session_keyword(&command);
+                    let db_opt: Option<&mut crate::storage::db::Database> =
+                        if has_session || is_dropindex {
+                            Some(&mut s.databases[0])
+                        } else {
+                            None
+                        };
+                    dispatch_vector_command(
+                        vector_store,
+                        &mut s.text_store,
+                        #[cfg(feature = "graph")]
+                        Some(&s.graph_store),
+                        &command,
+                        db_opt,
+                    )
+                })
             } else {
-                None
-            };
-
-            let mut text_guard = shard_databases.text_store(shard_id);
-            let response = dispatch_vector_command(
-                vector_store,
-                &mut *text_guard,
                 #[cfg(feature = "graph")]
-                Some(&graph_guard),
-                &command,
-                db_opt,
-            );
+                let graph_guard = shard_databases.graph_store_read(shard_id);
+
+                // SESSION clause needs Database access for sorted set storage.
+                // FT.DROPINDEX with DD flag needs Database to delete indexed docs.
+                let cmd_bytes = extract_command_static(&command).map(|(c, _)| c);
+                let is_dropindex = cmd_bytes
+                    .map(|c| c.eq_ignore_ascii_case(b"FT.DROPINDEX"))
+                    .unwrap_or(false);
+                let has_session = has_session_keyword(&command);
+                let mut db_guard;
+                let db_opt = if has_session || is_dropindex {
+                    db_guard = shard_databases.write_db(shard_id, 0);
+                    Some(&mut *db_guard)
+                } else {
+                    None
+                };
+
+                let mut text_guard = shard_databases.text_store(shard_id);
+                dispatch_vector_command(
+                    vector_store,
+                    &mut *text_guard,
+                    #[cfg(feature = "graph")]
+                    Some(&graph_guard),
+                    &command,
+                    db_opt,
+                )
+            };
             let _ = reply_tx.send(response);
         }
         #[cfg(feature = "graph")]
         ShardMessage::GraphCommand { command, reply_tx } => {
             // GraphCommand is dispatched via connection handlers using ShardDatabases,
             // not through SPSC. If we receive one here, dispatch it locally.
-            let (response, wal_records) = {
+            // Phase 2b: gate on is_initialized(); new path uses ShardSlice.
+            let (response, wal_records) = if crate::shard::slice::is_initialized() {
+                crate::shard::slice::with_shard(|s| {
+                    let resp =
+                        crate::command::graph::dispatch_graph_command(&mut s.graph_store, &command);
+                    let records = s.graph_store.drain_wal();
+                    (resp, records)
+                })
+            } else {
                 let mut gs = shard_databases.graph_store_write(shard_id);
                 let resp = crate::command::graph::dispatch_graph_command(&mut gs, &command);
                 let records = gs.drain_wal();
@@ -1251,13 +1979,26 @@ pub(crate) fn handle_shard_message_shared(
                 snapshot_lsn,
                 reply_tx,
             } = *payload;
-            let response = crate::graph::cross_shard::handle_graph_traverse(
-                &shard_databases.graph_store_read(shard_id),
-                &graph_name,
-                &node_ids,
-                edge_type_filter,
-                snapshot_lsn,
-            );
+            // Phase 2b: gate on is_initialized(); new path uses ShardSlice.
+            let response = if crate::shard::slice::is_initialized() {
+                crate::shard::slice::with_shard(|s| {
+                    crate::graph::cross_shard::handle_graph_traverse(
+                        &s.graph_store,
+                        &graph_name,
+                        &node_ids,
+                        edge_type_filter,
+                        snapshot_lsn,
+                    )
+                })
+            } else {
+                crate::graph::cross_shard::handle_graph_traverse(
+                    &shard_databases.graph_store_read(shard_id),
+                    &graph_name,
+                    &node_ids,
+                    edge_type_filter,
+                    snapshot_lsn,
+                )
+            };
             let _ = reply_tx.send(response);
         }
         #[cfg(feature = "text-index")]
@@ -1274,9 +2015,32 @@ pub(crate) fn handle_shard_message_shared(
                 count,
                 reply_tx,
             } = *payload;
-            let response = {
+            // Phase 2b: gate on is_initialized(); new path uses ShardSlice.
+            let response = if crate::shard::slice::is_initialized() {
+                crate::shard::slice::with_shard(|s| {
+                    match s.text_store.get_index(&index_name) {
+                        Some(text_index) => {
+                            let clause =
+                                crate::command::vector_search::ft_text_search::TextQueryClause {
+                                    field_name: None,
+                                    terms: Vec::new(),
+                                    filter: Some(filter),
+                                };
+                            let results = crate::command::vector_search::ft_text_search::execute_query_on_index(
+                                text_index, &clause, None, None, top_k,
+                            );
+                            crate::command::vector_search::ft_text_search::build_text_response(
+                                &results, offset, count,
+                            )
+                        }
+                        None => crate::protocol::Frame::Error(bytes::Bytes::from_static(
+                            b"ERR no such index",
+                        )),
+                    }
+                })
+            } else {
                 let text_guard = shard_databases.text_store(shard_id);
-                match text_guard.get_index(&index_name) {
+                let r = match text_guard.get_index(&index_name) {
                     Some(text_index) => {
                         let clause =
                             crate::command::vector_search::ft_text_search::TextQueryClause {
@@ -1297,8 +2061,9 @@ pub(crate) fn handle_shard_message_shared(
                     None => crate::protocol::Frame::Error(bytes::Bytes::from_static(
                         b"ERR no such index",
                     )),
-                }
+                };
                 // text_guard dropped here
+                r
             };
             let _ = reply_tx.send(response);
         }
@@ -1315,17 +2080,30 @@ pub(crate) fn handle_shard_message_shared(
                 pipeline,
                 reply_tx,
             } = *payload;
-            let response = {
+            // Phase 2b: gate on is_initialized(); new path uses ShardSlice.
+            // text_store and read_db(0) accessed in one with_shard closure (multi-resource).
+            let response = if crate::shard::slice::is_initialized() {
+                crate::shard::slice::with_shard(|s| {
+                    crate::command::vector_search::ft_aggregate::execute_local_partial(
+                        &s.text_store,
+                        &index_name,
+                        &query,
+                        &pipeline,
+                        &s.databases[0],
+                    )
+                })
+            } else {
                 let text_guard = shard_databases.text_store(shard_id);
                 let db_guard = shard_databases.read_db(shard_id, 0);
-                crate::command::vector_search::ft_aggregate::execute_local_partial(
+                let r = crate::command::vector_search::ft_aggregate::execute_local_partial(
                     &text_guard,
                     &index_name,
                     &query,
                     &pipeline,
                     &db_guard,
-                )
-                // guards dropped here at end of block
+                );
+                // guards dropped here
+                r
             };
             let _ = reply_tx.send(response);
         }
@@ -1351,7 +2129,33 @@ pub(crate) fn handle_shard_message_shared(
                 as_of_lsn,
                 reply_tx,
             } = *payload;
-            let response = {
+            // Phase 2b: gate on is_initialized(); new path uses ShardSlice.
+            let response = if crate::shard::slice::is_initialized() {
+                crate::shard::slice::with_shard(|s| {
+                    let sparse_pair = match (sparse_field.as_ref(), sparse_blob.as_ref()) {
+                        (Some(f), Some(b)) => Some((f, b)),
+                        _ => None,
+                    };
+                    // Phase 171 HYB-02 / SCAT-02: forward the coordinator-resolved
+                    // AS_OF LSN into the raw-streams executor so the dense branch
+                    // applies MVCC filtering consistently across shards.
+                    crate::command::vector_search::hybrid_multi::execute_hybrid_search_local_raw_streams(
+                        vector_store,
+                        &s.text_store,
+                        &index_name,
+                        &query_terms,
+                        &dense_field,
+                        &dense_blob,
+                        sparse_pair,
+                        weights,
+                        k_per_stream,
+                        top_k,
+                        &global_df,
+                        global_n,
+                        as_of_lsn,
+                    )
+                })
+            } else {
                 let text_guard = shard_databases.text_store(shard_id);
                 let sparse_pair = match (sparse_field.as_ref(), sparse_blob.as_ref()) {
                     (Some(f), Some(b)) => Some((f, b)),
@@ -1362,7 +2166,7 @@ pub(crate) fn handle_shard_message_shared(
                 // applies MVCC filtering consistently across shards. BM25
                 // AS_OF coherent post-G-1 (v0.1.10); text-index MVCC upsert-chain
                 // pending Phase 178 (MVCC-01).
-                crate::command::vector_search::hybrid_multi::execute_hybrid_search_local_raw_streams(
+                let r = crate::command::vector_search::hybrid_multi::execute_hybrid_search_local_raw_streams(
                     vector_store,
                     &text_guard,
                     &index_name,
@@ -1376,8 +2180,9 @@ pub(crate) fn handle_shard_message_shared(
                     &global_df,
                     global_n,
                     as_of_lsn,
-                )
-                // text_guard drops here (end of block)
+                );
+                // text_guard drops here
+                r
             };
             let _ = reply_tx.send(response);
         }
