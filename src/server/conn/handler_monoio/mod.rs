@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use crate::command::metadata;
-use crate::command::{DispatchResult, dispatch, dispatch_read, is_dispatch_read_supported};
+use crate::command::{DispatchResult, dispatch, dispatch_read};
 use crate::persistence::aof::{self, AofMessage};
 use crate::protocol::Frame;
 use crate::shard::dispatch::key_to_shard;
@@ -1582,67 +1582,13 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     )));
                     continue;
                 }
-                // SHARED-READ FAST PATH: bypass SPSC for cross-shard reads.
-                // Guard: skip if pending writes exist for this target (pipeline ordering).
-                // The fast path can be disabled via --cross-shard-fast-path=off to route
-                // all foreign-shard reads through SPSC (eliminates RwLock contention at
-                // the cost of one extra channel round-trip per read command).
-                // See docs/production-guide.md §Cross-shard fast path.
-                if !metadata::is_write(cmd)
-                    && !remote_groups.contains_key(&target)
-                    && is_dispatch_read_supported(cmd)
-                    && ctx.config.cross_shard_fast_path_enabled()
-                {
-                    crate::admin::metrics_setup::record_dispatch_cross_read_fastpath();
-                    // Time the RwLock acquisition to surface contention under load.
-                    // Overhead when metrics are disabled: one Relaxed atomic load (≈ 1 ns).
-                    let t0 = if crate::admin::metrics_setup::is_metrics_enabled() {
-                        Some(std::time::Instant::now())
-                    } else {
-                        None
-                    };
-                    let guard = ctx.shard_databases.read_db(target, conn.selected_db);
-                    if let Some(t0) = t0 {
-                        let ns = t0.elapsed().as_nanos() as u64;
-                        crate::admin::metrics_setup::record_dispatch_cross_read_fastpath_timed(
-                            target, ns,
-                        );
-                    }
-                    let now_ms = ctx.cached_clock.ms();
-                    let result = dispatch_read(
-                        &guard,
-                        cmd,
-                        cmd_args,
-                        now_ms,
-                        &mut conn.selected_db,
-                        db_count,
-                    );
-                    drop(guard);
-                    let response = match result {
-                        DispatchResult::Response(f) => f,
-                        DispatchResult::Quit(f) => {
-                            should_quit = true;
-                            f
-                        }
-                    };
-                    // Client tracking for cross-shard reads
-                    if conn.tracking_state.enabled && !conn.tracking_state.bcast {
-                        if let Some(key) = cmd_args.first().and_then(|f| extract_bytes(f)) {
-                            ctx.tracking_table.borrow_mut().track_key(
-                                client_id,
-                                &key,
-                                conn.tracking_state.noloop,
-                            );
-                        }
-                    }
-                    let mut response = apply_resp3_conversion(cmd, response, conn.protocol_version);
-                    if let Some(ws_id) = conn.workspace_id.as_ref() {
-                        strip_workspace_prefix_from_response(ws_id, cmd, &mut response);
-                    }
-                    responses.push(response);
-                    continue;
-                }
-                // Cross-shard write: deferred SPSC dispatch.
+                // Phase 3.1: SHARED-READ FAST PATH deleted. All cross-shard
+                // commands (reads and writes alike) dispatch via SPSC. This
+                // removes the only remaining `read_db(target, ...)` cross-thread
+                // RwLock acquisition on the hot path and is a prerequisite for
+                // Phase 4 (stripping RwLock<Database> entirely).
+                //
+                // Cross-shard SPSC dispatch (deferred):
                 // When workspace rewriting occurred, rebuild the frame with
                 // prefixed args so the target shard stores the correct key.
                 let dispatch_frame = if rewritten.is_some() {

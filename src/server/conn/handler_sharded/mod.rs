@@ -356,7 +356,9 @@ pub(crate) async fn handle_connection_sharded_inner<
                 // Per-batch dispatch-path accumulators — flushed once at end of
                 // batch so we pay one global atomic per path instead of N.
                 let mut local_dispatches: u32 = 0;
-                let mut cross_read_fast_dispatches: u32 = 0;
+                // Phase 3.1: cross_read_fast_dispatches counter removed
+                // alongside the SHARED-READ FAST PATH; all cross-shard reads
+                // are now counted under cross_spsc_dispatches.
                 let mut cross_spsc_dispatches: u32 = 0;
 
                 for frame in batch {
@@ -1445,48 +1447,11 @@ pub(crate) async fn handle_connection_sharded_inner<
                             )));
                             continue;
                         }
-                        // SHARED-READ FAST PATH: cross-shard reads bypass SPSC dispatch entirely.
-                        // By this point conn.in_multi is false (MULTI queuing happens earlier with `continue`).
-                        // Read commands execute directly on the target shard's database via RwLock read guard,
-                        // avoiding ~88us of two async scheduling hops through the SPSC channel.
+                        // Phase 3.1: SHARED-READ FAST PATH deleted. Cross-shard
+                        // reads and writes both dispatch via SPSC below. This is
+                        // a prerequisite for Phase 4 (stripping RwLock<Database>).
                         //
-                        // Guard: if there are already pending writes for this target shard in the
-                        // current pipeline batch, we must NOT take the fast path -- the read would
-                        // execute before the deferred writes, violating command ordering. Fall through
-                        // to SPSC dispatch to preserve pipeline semantics.
-                        if !metadata::is_write(cmd) && !remote_groups.contains_key(&target) {
-                            cross_read_fast_dispatches = cross_read_fast_dispatches.saturating_add(1);
-                            let guard = ctx.shard_databases.read_db(target, conn.selected_db);
-                            let now_ms = ctx.cached_clock.ms();
-                            let db_count = ctx.shard_databases.db_count();
-                            let result = dispatch_read(&guard, cmd, cmd_args, now_ms, &mut conn.selected_db, db_count);
-                            drop(guard);
-                            let response = match result {
-                                DispatchResult::Response(f) => f,
-                                DispatchResult::Quit(f) => { should_quit = true; f }
-                            };
-                            if matches!(response, Frame::Error(_)) {
-                                if let Ok(cmd_str) = std::str::from_utf8(cmd) {
-                                    crate::admin::metrics_setup::record_command_error_cached(
-                                        cmd_str,
-                                        &mut conn.cached_metrics,
-                                    );
-                                }
-                            }
-                            // Client tracking for cross-shard reads
-                            if conn.tracking_state.enabled && !conn.tracking_state.bcast {
-                                if let Some(key) = cmd_args.first().and_then(|f| extract_bytes(f)) {
-                                    ctx.tracking_table.borrow_mut().track_key(client_id, &key, conn.tracking_state.noloop);
-                                }
-                            }
-                            let mut response = apply_resp3_conversion(cmd, response, conn.protocol_version);
-                            if let Some(ws_id) = conn.workspace_id.as_ref() {
-                                strip_workspace_prefix_from_response(ws_id, cmd, &mut response);
-                            }
-                            responses.push(response);
-                            continue;
-                        }
-                        // Cross-shard write: deferred SPSC dispatch.
+                        // Cross-shard SPSC dispatch (deferred):
                         // When workspace rewriting occurred, rebuild the frame with
                         // prefixed args so the target shard stores the correct key.
                         let dispatch_frame = if rewritten.is_some() {
@@ -1512,7 +1477,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                 // Flush per-batch dispatch-path counters — one global atomic
                 // per path instead of N per batch. Short-circuits on 0.
                 crate::admin::metrics_setup::record_dispatch_local_batch(local_dispatches as u64);
-                crate::admin::metrics_setup::record_dispatch_cross_read_fastpath_batch(cross_read_fast_dispatches as u64);
+                // Phase 3.1: cross_read_fastpath metric removed (fast path deleted).
                 crate::admin::metrics_setup::record_dispatch_cross_spsc_batch(cross_spsc_dispatches as u64);
 
                 // Phase 2: Dispatch deferred remote commands (zero-allocation via ResponseSlotPool)
