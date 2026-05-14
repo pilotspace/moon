@@ -164,7 +164,21 @@ pub(super) fn try_handle_evalsha(
     if !cmd.eq_ignore_ascii_case(b"EVALSHA") {
         return false;
     }
-    let response = {
+    let response = if crate::shard::slice::is_initialized() {
+        crate::shard::slice::with_shard(|s| {
+            let db_count = s.databases.len();
+            crate::scripting::handle_evalsha(
+                &ctx.lua,
+                &ctx.script_cache,
+                cmd_args,
+                &mut s.databases[conn.selected_db],
+                ctx.shard_id,
+                ctx.num_shards,
+                conn.selected_db,
+                db_count,
+            )
+        })
+    } else {
         let mut guard = ctx.shard_databases.write_db(ctx.shard_id, conn.selected_db);
         let db_count = ctx.shard_databases.db_count();
         let db = &mut guard;
@@ -198,7 +212,23 @@ pub(super) fn try_handle_eval(
     if !cmd.eq_ignore_ascii_case(b"EVAL") {
         return false;
     }
-    let response = {
+    // Phase 2a: gate on is_initialized(); new path uses ShardSlice directly.
+    let response = if crate::shard::slice::is_initialized() {
+        crate::shard::slice::with_shard(|s| {
+            let db_count = s.databases.len();
+            let db = &mut s.databases[conn.selected_db];
+            crate::scripting::handle_eval(
+                &ctx.lua,
+                &ctx.script_cache,
+                cmd_args,
+                db,
+                ctx.shard_id,
+                ctx.num_shards,
+                conn.selected_db,
+                db_count,
+            )
+        })
+    } else {
         let mut guard = ctx.shard_databases.write_db(ctx.shard_id, conn.selected_db);
         let db_count = ctx.shard_databases.db_count();
         let db = &mut guard;
@@ -610,15 +640,27 @@ pub(super) fn try_handle_info(
     if !cmd.eq_ignore_ascii_case(b"INFO") {
         return false;
     }
-    let guard = ctx.shard_databases.read_db(ctx.shard_id, conn.selected_db);
-    let response_text = {
-        let resp_frame = conn_cmd::info_readonly(&guard, cmd_args);
-        match resp_frame {
-            Frame::BulkString(b) => String::from_utf8_lossy(&b).to_string(),
-            _ => String::new(),
-        }
+    // Phase 2a: gate on is_initialized(); new path uses ShardSlice directly.
+    let response_text = if crate::shard::slice::is_initialized() {
+        crate::shard::slice::with_shard_db(conn.selected_db, |db| {
+            let resp_frame = conn_cmd::info_readonly(db, cmd_args);
+            match resp_frame {
+                Frame::BulkString(b) => String::from_utf8_lossy(&b).to_string(),
+                _ => String::new(),
+            }
+        })
+    } else {
+        let guard = ctx.shard_databases.read_db(ctx.shard_id, conn.selected_db);
+        let text = {
+            let resp_frame = conn_cmd::info_readonly(&guard, cmd_args);
+            match resp_frame {
+                Frame::BulkString(b) => String::from_utf8_lossy(&b).to_string(),
+                _ => String::new(),
+            }
+        };
+        drop(guard);
+        text
     };
-    drop(guard);
     let mut response_text = response_text;
     if let Some(ref rs) = ctx.repl_state {
         if let Ok(rs_guard) = rs.try_read() {
@@ -1025,7 +1067,21 @@ pub(super) fn try_handle_functions(
         return true;
     }
     if cmd.eq_ignore_ascii_case(b"FCALL") {
-        let response = {
+        // Phase 2a: gate on is_initialized(); new path uses ShardSlice directly.
+        let response = if crate::shard::slice::is_initialized() {
+            crate::shard::slice::with_shard(|s| {
+                let db_count = s.databases.len();
+                crate::command::functions::handle_fcall(
+                    &func_registry.borrow(),
+                    cmd_args,
+                    &mut s.databases[conn.selected_db],
+                    ctx.shard_id,
+                    ctx.num_shards,
+                    conn.selected_db,
+                    db_count,
+                )
+            })
+        } else {
             let mut guard = ctx.shard_databases.write_db(ctx.shard_id, conn.selected_db);
             let db_count = ctx.shard_databases.db_count();
             crate::command::functions::handle_fcall(
@@ -1042,7 +1098,21 @@ pub(super) fn try_handle_functions(
         return true;
     }
     if cmd.eq_ignore_ascii_case(b"FCALL_RO") {
-        let response = {
+        // Phase 2a: gate on is_initialized(); new path uses ShardSlice directly.
+        let response = if crate::shard::slice::is_initialized() {
+            crate::shard::slice::with_shard(|s| {
+                let db_count = s.databases.len();
+                crate::command::functions::handle_fcall_ro(
+                    &func_registry.borrow(),
+                    cmd_args,
+                    &mut s.databases[conn.selected_db],
+                    ctx.shard_id,
+                    ctx.num_shards,
+                    conn.selected_db,
+                    db_count,
+                )
+            })
+        } else {
             let mut guard = ctx.shard_databases.write_db(ctx.shard_id, conn.selected_db);
             let db_count = ctx.shard_databases.db_count();
             crate::command::functions::handle_fcall_ro(
