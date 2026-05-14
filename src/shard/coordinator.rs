@@ -165,6 +165,13 @@ async fn coordinate_mget(
 
     // Fast path: all keys on local shard -- use mget directly
     if groups.len() == 1 && groups.contains_key(&my_shard) {
+        // Phase 2c: gate on is_initialized(); new path uses ShardSlice directly.
+        if crate::shard::slice::is_initialized() {
+            return crate::shard::slice::with_shard_db(db_index, |db| {
+                db.refresh_now_from_cache(cached_clock);
+                crate::command::string::mget(db, args)
+            });
+        }
         let mut guard = shard_databases.write_db(my_shard, db_index);
         guard.refresh_now_from_cache(cached_clock);
         return crate::command::string::mget(&mut guard, args);
@@ -180,18 +187,36 @@ async fn coordinate_mget(
 
         if *shard_id == my_shard {
             // Local execution: GET each key directly
-            let mut guard = shard_databases.write_db(my_shard, db_index);
-            guard.refresh_now_from_cache(cached_clock);
-            for (orig_idx, key) in indexed_keys {
-                let entry = guard.get(key);
-                let frame = match entry {
-                    Some(e) => match e.value.as_bytes() {
-                        Some(v) => Frame::BulkString(Bytes::copy_from_slice(v)),
+            // Phase 2c: gate on is_initialized(); new path uses ShardSlice directly.
+            if crate::shard::slice::is_initialized() {
+                crate::shard::slice::with_shard_db(db_index, |db| {
+                    db.refresh_now_from_cache(cached_clock);
+                    for (orig_idx, key) in indexed_keys {
+                        let entry = db.get(key);
+                        let frame = match entry {
+                            Some(e) => match e.value.as_bytes() {
+                                Some(v) => Frame::BulkString(Bytes::copy_from_slice(v)),
+                                None => Frame::Null,
+                            },
+                            None => Frame::Null,
+                        };
+                        results[*orig_idx] = Some(frame);
+                    }
+                });
+            } else {
+                let mut guard = shard_databases.write_db(my_shard, db_index);
+                guard.refresh_now_from_cache(cached_clock);
+                for (orig_idx, key) in indexed_keys {
+                    let entry = guard.get(key);
+                    let frame = match entry {
+                        Some(e) => match e.value.as_bytes() {
+                            Some(v) => Frame::BulkString(Bytes::copy_from_slice(v)),
+                            None => Frame::Null,
+                        },
                         None => Frame::Null,
-                    },
-                    None => Frame::Null,
-                };
-                results[*orig_idx] = Some(frame);
+                    };
+                    results[*orig_idx] = Some(frame);
+                }
             }
         } else {
             // Remote dispatch: batch of GET commands via MultiExecuteSlotted
@@ -290,6 +315,13 @@ async fn coordinate_mset(
 
     // Fast path: all keys on local shard
     if groups.len() == 1 && groups.contains_key(&my_shard) {
+        // Phase 2c: gate on is_initialized(); new path uses ShardSlice directly.
+        if crate::shard::slice::is_initialized() {
+            return crate::shard::slice::with_shard_db(db_index, |db| {
+                db.refresh_now_from_cache(cached_clock);
+                crate::command::string::mset(db, args)
+            });
+        }
         let mut guard = shard_databases.write_db(my_shard, db_index);
         guard.refresh_now_from_cache(cached_clock);
         return crate::command::string::mset(&mut guard, args);
@@ -299,10 +331,20 @@ async fn coordinate_mset(
 
     for (shard_id, kv_pairs) in &groups {
         if *shard_id == my_shard {
-            let mut guard = shard_databases.write_db(my_shard, db_index);
-            guard.refresh_now_from_cache(cached_clock);
-            for (key, value) in kv_pairs {
-                guard.set_string(key.clone(), value.clone());
+            // Phase 2c: gate on is_initialized(); new path uses ShardSlice directly.
+            if crate::shard::slice::is_initialized() {
+                crate::shard::slice::with_shard_db(db_index, |db| {
+                    db.refresh_now_from_cache(cached_clock);
+                    for (key, value) in kv_pairs {
+                        db.set_string(key.clone(), value.clone());
+                    }
+                });
+            } else {
+                let mut guard = shard_databases.write_db(my_shard, db_index);
+                guard.refresh_now_from_cache(cached_clock);
+                for (key, value) in kv_pairs {
+                    guard.set_string(key.clone(), value.clone());
+                }
             }
         } else {
             let (reply_tx, reply_rx) = channel::oneshot();
@@ -361,13 +403,23 @@ async fn coordinate_multi_del_or_exists(
         }
     }
 
+    // db_count() lives on ShardDatabases — read once, share across both branches.
+    let db_count = shard_databases.db_count();
+
     // Fast path: all keys on local shard
     if groups.len() == 1 && groups.contains_key(&my_shard) {
-        let mut guard = shard_databases.write_db(my_shard, db_index);
-        guard.refresh_now_from_cache(cached_clock);
         let mut selected = db_index;
-        let db_count = shard_databases.db_count();
-        let result = cmd_dispatch(&mut guard, cmd, args, &mut selected, db_count);
+        // Phase 2c: gate on is_initialized(); new path uses ShardSlice directly.
+        let result = if crate::shard::slice::is_initialized() {
+            crate::shard::slice::with_shard_db(db_index, |db| {
+                db.refresh_now_from_cache(cached_clock);
+                cmd_dispatch(db, cmd, args, &mut selected, db_count)
+            })
+        } else {
+            let mut guard = shard_databases.write_db(my_shard, db_index);
+            guard.refresh_now_from_cache(cached_clock);
+            cmd_dispatch(&mut guard, cmd, args, &mut selected, db_count)
+        };
         return match result {
             DispatchResult::Response(f) => f,
             DispatchResult::Quit(f) => f,
@@ -379,11 +431,18 @@ async fn coordinate_multi_del_or_exists(
 
     for (shard_id, key_args) in &groups {
         if *shard_id == my_shard {
-            let mut guard = shard_databases.write_db(my_shard, db_index);
-            guard.refresh_now_from_cache(cached_clock);
-            let db_count = shard_databases.db_count();
             let mut selected = db_index;
-            let result = cmd_dispatch(&mut guard, cmd, key_args, &mut selected, db_count);
+            // Phase 2c: gate on is_initialized(); new path uses ShardSlice directly.
+            let result = if crate::shard::slice::is_initialized() {
+                crate::shard::slice::with_shard_db(db_index, |db| {
+                    db.refresh_now_from_cache(cached_clock);
+                    cmd_dispatch(db, cmd, key_args, &mut selected, db_count)
+                })
+            } else {
+                let mut guard = shard_databases.write_db(my_shard, db_index);
+                guard.refresh_now_from_cache(cached_clock);
+                cmd_dispatch(&mut guard, cmd, key_args, &mut selected, db_count)
+            };
             if let DispatchResult::Response(Frame::Integer(n)) = result {
                 total_count += n;
             }
@@ -457,11 +516,19 @@ pub async fn coordinate_keys(
 
     // Execute locally on this shard
     {
-        let mut guard = shard_databases.write_db(my_shard, db_index);
-        guard.refresh_now_from_cache(cached_clock);
         let db_count = shard_databases.db_count();
         let mut selected = db_index;
-        let result = cmd_dispatch(&mut guard, b"KEYS", args, &mut selected, db_count);
+        // Phase 2c: gate on is_initialized(); new path uses ShardSlice directly.
+        let result = if crate::shard::slice::is_initialized() {
+            crate::shard::slice::with_shard_db(db_index, |db| {
+                db.refresh_now_from_cache(cached_clock);
+                cmd_dispatch(db, b"KEYS", args, &mut selected, db_count)
+            })
+        } else {
+            let mut guard = shard_databases.write_db(my_shard, db_index);
+            guard.refresh_now_from_cache(cached_clock);
+            cmd_dispatch(&mut guard, b"KEYS", args, &mut selected, db_count)
+        };
         if let DispatchResult::Response(Frame::Array(keys)) = result {
             all_keys.extend(keys);
         }
@@ -553,11 +620,19 @@ pub async fn coordinate_scan(
 
     // Execute SCAN on the target shard
     let scan_result = if target_shard_id == my_shard {
-        let mut guard = shard_databases.write_db(my_shard, db_index);
-        guard.refresh_now_from_cache(cached_clock);
         let db_count = shard_databases.db_count();
         let mut selected = db_index;
-        let result = cmd_dispatch(&mut guard, b"SCAN", &scan_args, &mut selected, db_count);
+        // Phase 2c: gate on is_initialized(); new path uses ShardSlice directly.
+        let result = if crate::shard::slice::is_initialized() {
+            crate::shard::slice::with_shard_db(db_index, |db| {
+                db.refresh_now_from_cache(cached_clock);
+                cmd_dispatch(db, b"SCAN", &scan_args, &mut selected, db_count)
+            })
+        } else {
+            let mut guard = shard_databases.write_db(my_shard, db_index);
+            guard.refresh_now_from_cache(cached_clock);
+            cmd_dispatch(&mut guard, b"SCAN", &scan_args, &mut selected, db_count)
+        };
         match result {
             DispatchResult::Response(f) => f,
             DispatchResult::Quit(f) => f,
