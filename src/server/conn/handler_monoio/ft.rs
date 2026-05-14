@@ -367,7 +367,11 @@ pub(super) async fn try_handle_ft_command(
             return true;
         }
         if cmd.eq_ignore_ascii_case(b"FT.INFO") {
-            let response = {
+            let response = if crate::shard::slice::is_initialized() {
+                crate::shard::slice::with_shard(|s| {
+                    crate::command::vector_search::ft_info(&s.vector_store, &s.text_store, cmd_args)
+                })
+            } else {
                 let vs = ctx.shard_databases.vector_store(ctx.shard_id);
                 let ts = ctx.shard_databases.text_store(ctx.shard_id);
                 crate::command::vector_search::ft_info(&vs, &ts, cmd_args)
@@ -376,7 +380,11 @@ pub(super) async fn try_handle_ft_command(
             return true;
         }
         if cmd.eq_ignore_ascii_case(b"FT._LIST") {
-            let response = {
+            let response = if crate::shard::slice::is_initialized() {
+                crate::shard::slice::with_shard(|s| {
+                    crate::command::vector_search::ft_list(&s.vector_store)
+                })
+            } else {
                 let vs = ctx.shard_databases.vector_store(ctx.shard_id);
                 crate::command::vector_search::ft_list(&vs)
             };
@@ -384,7 +392,15 @@ pub(super) async fn try_handle_ft_command(
             return true;
         }
         if cmd.eq_ignore_ascii_case(b"FT.COMPACT") {
-            let response = {
+            let response = if crate::shard::slice::is_initialized() {
+                crate::shard::slice::with_shard(|s| {
+                    crate::command::vector_search::ft_compact(
+                        &mut s.vector_store,
+                        &mut s.text_store,
+                        cmd_args,
+                    )
+                })
+            } else {
                 let mut vs = ctx.shard_databases.vector_store(ctx.shard_id);
                 let mut ts = ctx.shard_databases.text_store(ctx.shard_id);
                 crate::command::vector_search::ft_compact(&mut vs, &mut ts, cmd_args)
@@ -393,7 +409,14 @@ pub(super) async fn try_handle_ft_command(
             return true;
         }
         if cmd.eq_ignore_ascii_case(b"FT.CACHESEARCH") {
-            let response = {
+            let response = if crate::shard::slice::is_initialized() {
+                crate::shard::slice::with_shard(|s| {
+                    crate::command::vector_search::cache_search::ft_cachesearch(
+                        &mut s.vector_store,
+                        cmd_args,
+                    )
+                })
+            } else {
                 let mut vs = ctx.shard_databases.vector_store(ctx.shard_id);
                 crate::command::vector_search::cache_search::ft_cachesearch(&mut vs, cmd_args)
             };
@@ -401,7 +424,15 @@ pub(super) async fn try_handle_ft_command(
             return true;
         }
         if cmd.eq_ignore_ascii_case(b"FT.CONFIG") {
-            let response = {
+            let response = if crate::shard::slice::is_initialized() {
+                crate::shard::slice::with_shard(|s| {
+                    crate::command::vector_search::ft_config(
+                        &mut s.vector_store,
+                        &mut s.text_store,
+                        cmd_args,
+                    )
+                })
+            } else {
                 let mut vs = ctx.shard_databases.vector_store(ctx.shard_id);
                 let mut ts = ctx.shard_databases.text_store(ctx.shard_id);
                 crate::command::vector_search::ft_config(&mut vs, &mut ts, cmd_args)
@@ -414,7 +445,45 @@ pub(super) async fn try_handle_ft_command(
             || cmd.eq_ignore_ascii_case(b"FT.NAVIGATE")
             || cmd.eq_ignore_ascii_case(b"FT.EXPAND")
         {
-            let response = {
+            let response = if crate::shard::slice::is_initialized() {
+                crate::shard::slice::with_shard(|s| {
+                    if cmd.eq_ignore_ascii_case(b"FT.RECOMMEND") {
+                        crate::command::vector_search::recommend::ft_recommend(
+                            &mut s.vector_store,
+                            cmd_args,
+                            Some(&mut s.databases[0]),
+                        )
+                    } else if cmd.eq_ignore_ascii_case(b"FT.NAVIGATE") {
+                        #[cfg(feature = "graph")]
+                        {
+                            crate::command::vector_search::navigate::ft_navigate(
+                                &mut s.vector_store,
+                                Some(&s.graph_store),
+                                cmd_args,
+                                None,
+                            )
+                        }
+                        #[cfg(not(feature = "graph"))]
+                        {
+                            Frame::Error(Bytes::from_static(
+                                b"ERR FT.NAVIGATE requires graph feature",
+                            ))
+                        }
+                    } else {
+                        // FT.EXPAND
+                        #[cfg(feature = "graph")]
+                        {
+                            crate::command::vector_search::ft_expand(&s.graph_store, cmd_args)
+                        }
+                        #[cfg(not(feature = "graph"))]
+                        {
+                            Frame::Error(Bytes::from_static(
+                                b"ERR FT.EXPAND requires graph feature",
+                            ))
+                        }
+                    }
+                })
+            } else {
                 let sdb = &ctx.shard_databases;
                 let mut vs = sdb.vector_store(ctx.shard_id);
                 if cmd.eq_ignore_ascii_case(b"FT.RECOMMEND") {
@@ -450,7 +519,9 @@ pub(super) async fn try_handle_ft_command(
                     }
                     #[cfg(not(feature = "graph"))]
                     {
-                        Frame::Error(Bytes::from_static(b"ERR FT.EXPAND requires graph feature"))
+                        Frame::Error(Bytes::from_static(
+                            b"ERR FT.EXPAND requires graph feature",
+                        ))
                     }
                 }
             };
@@ -545,21 +616,39 @@ pub(super) async fn try_handle_ft_command(
                                             offset.saturating_add(count)
                                         }
                                         .max(1);
-                                        let ts_guard = ctx.shard_databases.text_store(ctx.shard_id);
-                                        let response = match ts_guard.get_index(&index_name) {
-                                            None => Frame::Error(Bytes::from_static(
-                                                b"ERR no such index",
-                                            )),
-                                            Some(text_index) => {
-                                                let results = crate::command::vector_search::ft_text_search::execute_query_on_index(
-                                                    text_index, &clause, None, None, top_k,
-                                                );
-                                                crate::command::vector_search::ft_text_search::build_text_response(
-                                                    &results, offset, count,
-                                                )
-                                            }
+                                        let response = if crate::shard::slice::is_initialized() {
+                                            crate::shard::slice::with_shard(|s| {
+                                                match s.text_store.get_index(&index_name) {
+                                                    None => Frame::Error(Bytes::from_static(
+                                                        b"ERR no such index",
+                                                    )),
+                                                    Some(text_index) => {
+                                                        let results = crate::command::vector_search::ft_text_search::execute_query_on_index(
+                                                            text_index, &clause, None, None, top_k,
+                                                        );
+                                                        crate::command::vector_search::ft_text_search::build_text_response(
+                                                            &results, offset, count,
+                                                        )
+                                                    }
+                                                }
+                                            })
+                                        } else {
+                                            let ts_guard = ctx.shard_databases.text_store(ctx.shard_id);
+                                            let r = match ts_guard.get_index(&index_name) {
+                                                None => Frame::Error(Bytes::from_static(
+                                                    b"ERR no such index",
+                                                )),
+                                                Some(text_index) => {
+                                                    let results = crate::command::vector_search::ft_text_search::execute_query_on_index(
+                                                        text_index, &clause, None, None, top_k,
+                                                    );
+                                                    crate::command::vector_search::ft_text_search::build_text_response(
+                                                        &results, offset, count,
+                                                    )
+                                                }
+                                            };
+                                            r
                                         };
-                                        drop(ts_guard);
                                         let mut response = response;
                                         if let Some(ws_id) = conn.workspace_id.as_ref() {
                                             strip_workspace_prefix_from_response(
@@ -579,74 +668,6 @@ pub(super) async fn try_handle_ft_command(
                                     return true;
                                 }
                             }
-                            // Step 2: acquire ts guard (single-shard monoio).
-                            let ts_guard = ctx.shard_databases.text_store(ctx.shard_id);
-                            // Step 3: resolve index.
-                            let text_index = match ts_guard.get_index(&index_name) {
-                                Some(idx) => idx,
-                                None => {
-                                    drop(ts_guard);
-                                    responses.push(Frame::Error(Bytes::from_static(
-                                        b"ERR no such index",
-                                    )));
-                                    return true;
-                                }
-                            };
-                            // Step 4: ensure at least one TEXT field.
-                            if text_index.text_fields.is_empty() {
-                                drop(ts_guard);
-                                responses.push(Frame::Error(Bytes::from_static(
-                                    b"ERR index has no TEXT fields",
-                                )));
-                                return true;
-                            }
-                            // Step 5: parse the query via the index's first analyzer.
-                            let analyzer = match text_index.field_analyzers.first() {
-                                Some(a) => a,
-                                None => {
-                                    drop(ts_guard);
-                                    responses.push(Frame::Error(Bytes::from_static(
-                                        b"ERR index has no TEXT fields",
-                                    )));
-                                    return true;
-                                }
-                            };
-                            let clause = match crate::command::vector_search::parse_text_query(
-                                query_bytes.as_ref(),
-                                analyzer,
-                            ) {
-                                Ok(c) => c,
-                                Err(msg) => {
-                                    drop(ts_guard);
-                                    responses
-                                        .push(Frame::Error(Bytes::copy_from_slice(msg.as_bytes())));
-                                    return true;
-                                }
-                            };
-                            // Step 5b: resolve field_idx.
-                            let field_idx = match &clause.field_name {
-                                None => None,
-                                Some(field_name) => {
-                                    match text_index.text_fields.iter().position(|f| {
-                                        f.field_name
-                                            .as_ref()
-                                            .eq_ignore_ascii_case(field_name.as_ref())
-                                    }) {
-                                        Some(idx) => Some(idx),
-                                        None => {
-                                            let bad_name = field_name.clone();
-                                            drop(ts_guard);
-                                            responses.push(Frame::Error(Bytes::from(format!(
-                                                "ERR unknown field '{}'",
-                                                String::from_utf8_lossy(&bad_name)
-                                            ))));
-                                            return true;
-                                        }
-                                    }
-                                }
-                            };
-                            // Step 6: extract query_terms.
-                            let query_terms = clause.terms;
                             // Step 7: LIMIT parsing + top_k cap (T-151-03-02).
                             let (offset, count) =
                                 crate::command::vector_search::parse_limit_clause(cmd_args);
@@ -661,40 +682,205 @@ pub(super) async fn try_handle_ft_command(
                                 crate::command::vector_search::parse_highlight_clause(cmd_args);
                             let summarize_opts =
                                 crate::command::vector_search::parse_summarize_clause(cmd_args);
-                            // Step 9: acquire DB read guard iff post-processing is needed.
-                            let db_guard_opt =
-                                if highlight_opts.is_some() || summarize_opts.is_some() {
-                                    Some(ctx.shard_databases.read_db(ctx.shard_id, 0))
+                            let needs_db = highlight_opts.is_some() || summarize_opts.is_some();
+                            // Steps 2-10: acquire stores and execute. Result<Frame, Frame>
+                            // where Ok = response to push, Err = error frame with early-return.
+                            // Phase 2a: gate on is_initialized(); new path uses ShardSlice directly.
+                            let text_search_result: Result<Frame, Frame> =
+                                if crate::shard::slice::is_initialized() {
+                                    crate::shard::slice::with_shard(|s| {
+                                        // Step 2-3: resolve index from text_store.
+                                        let text_index =
+                                            match s.text_store.get_index(&index_name) {
+                                                Some(idx) => idx,
+                                                None => return Err(Frame::Error(
+                                                    Bytes::from_static(b"ERR no such index"),
+                                                )),
+                                            };
+                                        // Step 4: ensure TEXT fields.
+                                        if text_index.text_fields.is_empty() {
+                                            return Err(Frame::Error(Bytes::from_static(
+                                                b"ERR index has no TEXT fields",
+                                            )));
+                                        }
+                                        // Step 5: parse query.
+                                        let analyzer =
+                                            match text_index.field_analyzers.first() {
+                                                Some(a) => a,
+                                                None => return Err(Frame::Error(
+                                                    Bytes::from_static(
+                                                        b"ERR index has no TEXT fields",
+                                                    ),
+                                                )),
+                                            };
+                                        let clause = match crate::command::vector_search::parse_text_query(
+                                            query_bytes.as_ref(),
+                                            analyzer,
+                                        ) {
+                                            Ok(c) => c,
+                                            Err(msg) => return Err(Frame::Error(
+                                                Bytes::copy_from_slice(msg.as_bytes()),
+                                            )),
+                                        };
+                                        // Step 5b: resolve field_idx.
+                                        let field_idx = match &clause.field_name {
+                                            None => None,
+                                            Some(field_name) => {
+                                                match text_index.text_fields.iter().position(|f| {
+                                                    f.field_name
+                                                        .as_ref()
+                                                        .eq_ignore_ascii_case(field_name.as_ref())
+                                                }) {
+                                                    Some(idx) => Some(idx),
+                                                    None => {
+                                                        let bad = field_name.clone();
+                                                        return Err(Frame::Error(Bytes::from(
+                                                            format!(
+                                                                "ERR unknown field '{}'",
+                                                                String::from_utf8_lossy(&bad)
+                                                            ),
+                                                        )));
+                                                    }
+                                                }
+                                            }
+                                        };
+                                        let query_terms = clause.terms;
+                                        // Step 10: execute.
+                                        let mut response =
+                                            crate::command::vector_search::execute_text_search_local(
+                                                &s.text_store,
+                                                &index_name,
+                                                field_idx,
+                                                &query_terms,
+                                                top_k,
+                                                offset,
+                                                count,
+                                            );
+                                        // Step 9+10b: optional post-processing with db access.
+                                        if needs_db {
+                                            let db = &s.databases[0];
+                                            let term_strings: Vec<String> =
+                                                query_terms.iter().map(|qt| qt.text.clone()).collect();
+                                            crate::command::vector_search::apply_post_processing(
+                                                &mut response,
+                                                &term_strings,
+                                                text_index,
+                                                db,
+                                                highlight_opts.as_ref(),
+                                                summarize_opts.as_ref(),
+                                            );
+                                        }
+                                        Ok(response)
+                                    })
                                 } else {
-                                    None
+                                    // Step 2: acquire ts guard (single-shard monoio).
+                                    let ts_guard =
+                                        ctx.shard_databases.text_store(ctx.shard_id);
+                                    // Step 3: resolve index.
+                                    let text_index = match ts_guard.get_index(&index_name) {
+                                        Some(idx) => idx,
+                                        None => {
+                                            return {
+                                                responses.push(Frame::Error(Bytes::from_static(
+                                                    b"ERR no such index",
+                                                )));
+                                                true
+                                            };
+                                        }
+                                    };
+                                    // Step 4: ensure at least one TEXT field.
+                                    if text_index.text_fields.is_empty() {
+                                        responses.push(Frame::Error(Bytes::from_static(
+                                            b"ERR index has no TEXT fields",
+                                        )));
+                                        return true;
+                                    }
+                                    // Step 5: parse the query via the index's first analyzer.
+                                    let analyzer = match text_index.field_analyzers.first() {
+                                        Some(a) => a,
+                                        None => {
+                                            responses.push(Frame::Error(Bytes::from_static(
+                                                b"ERR index has no TEXT fields",
+                                            )));
+                                            return true;
+                                        }
+                                    };
+                                    let clause = match crate::command::vector_search::parse_text_query(
+                                        query_bytes.as_ref(),
+                                        analyzer,
+                                    ) {
+                                        Ok(c) => c,
+                                        Err(msg) => {
+                                            responses.push(Frame::Error(
+                                                Bytes::copy_from_slice(msg.as_bytes()),
+                                            ));
+                                            return true;
+                                        }
+                                    };
+                                    // Step 5b: resolve field_idx.
+                                    let field_idx = match &clause.field_name {
+                                        None => None,
+                                        Some(field_name) => {
+                                            match text_index.text_fields.iter().position(|f| {
+                                                f.field_name
+                                                    .as_ref()
+                                                    .eq_ignore_ascii_case(field_name.as_ref())
+                                            }) {
+                                                Some(idx) => Some(idx),
+                                                None => {
+                                                    let bad_name = field_name.clone();
+                                                    responses.push(Frame::Error(Bytes::from(
+                                                        format!(
+                                                            "ERR unknown field '{}'",
+                                                            String::from_utf8_lossy(&bad_name)
+                                                        ),
+                                                    )));
+                                                    return true;
+                                                }
+                                            }
+                                        }
+                                    };
+                                    let query_terms = clause.terms;
+                                    // Step 9: acquire DB read guard iff post-processing needed.
+                                    let db_guard_opt = if needs_db {
+                                        Some(ctx.shard_databases.read_db(ctx.shard_id, 0))
+                                    } else {
+                                        None
+                                    };
+                                    // Step 10: execute + optional post-processing.
+                                    let mut response =
+                                        crate::command::vector_search::execute_text_search_local(
+                                            &ts_guard,
+                                            &index_name,
+                                            field_idx,
+                                            &query_terms,
+                                            top_k,
+                                            offset,
+                                            count,
+                                        );
+                                    if let Some(ref db_guard) = db_guard_opt {
+                                        let term_strings: Vec<String> =
+                                            query_terms.iter().map(|qt| qt.text.clone()).collect();
+                                        crate::command::vector_search::apply_post_processing(
+                                            &mut response,
+                                            &term_strings,
+                                            text_index,
+                                            db_guard,
+                                            highlight_opts.as_ref(),
+                                            summarize_opts.as_ref(),
+                                        );
+                                    }
+                                    drop(db_guard_opt);
+                                    drop(ts_guard);
+                                    Ok(response)
                                 };
-                            // Step 10: execute + optional post-processing.
-                            let mut response =
-                                crate::command::vector_search::execute_text_search_local(
-                                    &ts_guard,
-                                    &index_name,
-                                    field_idx,
-                                    &query_terms,
-                                    top_k,
-                                    offset,
-                                    count,
-                                );
-                            if let Some(ref db_guard) = db_guard_opt {
-                                let term_strings: Vec<String> =
-                                    query_terms.iter().map(|qt| qt.text.clone()).collect();
-                                crate::command::vector_search::apply_post_processing(
-                                    &mut response,
-                                    &term_strings,
-                                    text_index,
-                                    db_guard,
-                                    highlight_opts.as_ref(),
-                                    summarize_opts.as_ref(),
-                                );
-                            }
-                            // Explicit drop order: inner db_guard first, outer ts_guard last.
-                            drop(db_guard_opt);
-                            drop(ts_guard);
-                            let mut response = response;
+                            let mut response = match text_search_result {
+                                Ok(r) => r,
+                                Err(e) => {
+                                    responses.push(e);
+                                    return true;
+                                }
+                            };
                             if let Some(ws_id) = conn.workspace_id.as_ref() {
                                 strip_workspace_prefix_from_response(ws_id, cmd, &mut response);
                             }
@@ -705,7 +891,135 @@ pub(super) async fn try_handle_ft_command(
                 }
             }
         }
-        let response = {
+        // Phase 2a: Option A — gate on is_initialized(). New path uses ShardSlice
+        // directly (no RwLock); old path uses ctx.shard_databases guards. Dead code
+        // until Phase 4 wires init_shard() at shard startup.
+        //
+        // FT.SEARCH AS_OF needs shard_databases for vector_store LSN resolution;
+        // in the new path we resolve it inside the closure via s.vector_store.
+        let response = if crate::shard::slice::is_initialized() {
+            // Phase 2a: AS_OF temporal resolution still uses ctx.shard_databases
+            // (temporal_registry is migrated in Phase 2b, not here). This is
+            // intentional — both paths share the same AS_OF resolution logic.
+            let as_of_lsn_result = if cmd.eq_ignore_ascii_case(b"FT.SEARCH") {
+                resolve_ft_search_as_of_lsn(
+                    cmd_args,
+                    Some(&ctx.shard_databases),
+                    ctx.shard_id,
+                    conn.active_cross_txn.as_ref(),
+                )
+            } else {
+                Ok(0u64)
+            };
+            let as_of_lsn = match as_of_lsn_result {
+                Ok(lsn) => lsn,
+                Err(err_frame) => {
+                    responses.push(err_frame);
+                    return true;
+                }
+            };
+            crate::shard::slice::with_shard(|s| {
+                if cmd.eq_ignore_ascii_case(b"FT.CREATE") {
+                    crate::command::vector_search::ft_create(
+                        &mut s.vector_store,
+                        &mut s.text_store,
+                        cmd_args,
+                    )
+                } else if cmd.eq_ignore_ascii_case(b"FT.SEARCH") {
+                    let has_session = cmd_args.iter().any(|a| {
+                        if let Frame::BulkString(b) = a {
+                            b.eq_ignore_ascii_case(b"SESSION")
+                        } else {
+                            false
+                        }
+                    });
+                    if has_session {
+                        crate::command::vector_search::ft_search(
+                            &mut s.vector_store,
+                            cmd_args,
+                            Some(&mut s.databases[0]),
+                            Some(&s.text_store),
+                            as_of_lsn,
+                        )
+                    } else {
+                        crate::command::vector_search::ft_search(
+                            &mut s.vector_store,
+                            cmd_args,
+                            None,
+                            Some(&s.text_store),
+                            as_of_lsn,
+                        )
+                    }
+                } else if cmd.eq_ignore_ascii_case(b"FT.DROPINDEX") {
+                    crate::command::vector_search::ft_dropindex(
+                        &mut s.vector_store,
+                        &mut s.text_store,
+                        Some(&mut s.databases[0]),
+                        cmd_args,
+                    )
+                } else if cmd.eq_ignore_ascii_case(b"FT.INFO") {
+                    crate::command::vector_search::ft_info(
+                        &s.vector_store,
+                        &s.text_store,
+                        cmd_args,
+                    )
+                } else if cmd.eq_ignore_ascii_case(b"FT._LIST") {
+                    crate::command::vector_search::ft_list(&s.vector_store)
+                } else if cmd.eq_ignore_ascii_case(b"FT.COMPACT") {
+                    crate::command::vector_search::ft_compact(
+                        &mut s.vector_store,
+                        &mut s.text_store,
+                        cmd_args,
+                    )
+                } else if cmd.eq_ignore_ascii_case(b"FT.CACHESEARCH") {
+                    crate::command::vector_search::cache_search::ft_cachesearch(
+                        &mut s.vector_store,
+                        cmd_args,
+                    )
+                } else if cmd.eq_ignore_ascii_case(b"FT.CONFIG") {
+                    crate::command::vector_search::ft_config(
+                        &mut s.vector_store,
+                        &mut s.text_store,
+                        cmd_args,
+                    )
+                } else if cmd.eq_ignore_ascii_case(b"FT.RECOMMEND") {
+                    crate::command::vector_search::recommend::ft_recommend(
+                        &mut s.vector_store,
+                        cmd_args,
+                        Some(&mut s.databases[0]),
+                    )
+                } else if cmd.eq_ignore_ascii_case(b"FT.NAVIGATE") {
+                    #[cfg(feature = "graph")]
+                    {
+                        crate::command::vector_search::navigate::ft_navigate(
+                            &mut s.vector_store,
+                            Some(&s.graph_store),
+                            cmd_args,
+                            None,
+                        )
+                    }
+                    #[cfg(not(feature = "graph"))]
+                    {
+                        Frame::Error(Bytes::from_static(
+                            b"ERR FT.NAVIGATE requires graph feature",
+                        ))
+                    }
+                } else if cmd.eq_ignore_ascii_case(b"FT.EXPAND") {
+                    #[cfg(feature = "graph")]
+                    {
+                        crate::command::vector_search::ft_expand(&s.graph_store, cmd_args)
+                    }
+                    #[cfg(not(feature = "graph"))]
+                    {
+                        Frame::Error(Bytes::from_static(
+                            b"ERR FT.EXPAND requires graph feature",
+                        ))
+                    }
+                } else {
+                    Frame::Error(Bytes::from_static(b"ERR unknown FT.* command"))
+                }
+            })
+        } else {
             let shard_databases_ref = &ctx.shard_databases;
             let mut vs = shard_databases_ref.vector_store(ctx.shard_id);
             let mut ts = shard_databases_ref.text_store(ctx.shard_id);
