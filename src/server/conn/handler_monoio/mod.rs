@@ -1321,12 +1321,30 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 }
                 // SHARED-READ FAST PATH: bypass SPSC for cross-shard reads.
                 // Guard: skip if pending writes exist for this target (pipeline ordering).
+                // The fast path can be disabled via --cross-shard-fast-path=off to route
+                // all foreign-shard reads through SPSC (eliminates RwLock contention at
+                // the cost of one extra channel round-trip per read command).
+                // See docs/production-guide.md §Cross-shard fast path.
                 if !metadata::is_write(cmd)
                     && !remote_groups.contains_key(&target)
                     && is_dispatch_read_supported(cmd)
+                    && ctx.config.cross_shard_fast_path_enabled()
                 {
                     crate::admin::metrics_setup::record_dispatch_cross_read_fastpath();
+                    // Time the RwLock acquisition to surface contention under load.
+                    // Overhead when metrics are disabled: one Relaxed atomic load (≈ 1 ns).
+                    let t0 = if crate::admin::metrics_setup::is_metrics_enabled() {
+                        Some(std::time::Instant::now())
+                    } else {
+                        None
+                    };
                     let guard = ctx.shard_databases.read_db(target, conn.selected_db);
+                    if let Some(t0) = t0 {
+                        let ns = t0.elapsed().as_nanos() as u64;
+                        crate::admin::metrics_setup::record_dispatch_cross_read_fastpath_timed(
+                            target, ns,
+                        );
+                    }
                     let now_ms = ctx.cached_clock.ms();
                     let result = dispatch_read(
                         &guard,

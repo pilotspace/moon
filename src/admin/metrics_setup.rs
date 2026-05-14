@@ -722,6 +722,52 @@ pub fn record_dispatch_cross_read_fastpath_batch(count: u64) {
     counter!("moon_dispatch_path_total", "path" => "cross_read_fast").increment(count);
 }
 
+/// Record latency and optional lock-contention for a single cross-shard fast-path read.
+///
+/// Called at `handler_monoio/mod.rs` after `read_db(target, …)` returns.
+///
+/// - `target_shard`: foreign shard index (used as a low-cardinality label; bounded by
+///   `num_shards`, so label space is always ≤ 64 series).
+/// - `lock_acquire_ns`: nanoseconds from `Instant::now()` before the `read_db()` call
+///   to the moment the guard was obtained. Values > 1 000 ns (1 µs) are counted as
+///   contention events in `moon_cross_shard_lock_contention_total`.
+///
+/// Uses a static per-shard label array (no heap allocation on the hot path).
+/// The shard index is clamped to MAX_SHARD_LABEL_IDX (63) for safety.
+#[inline]
+pub fn record_dispatch_cross_read_fastpath_timed(target_shard: usize, lock_acquire_ns: u64) {
+    if !METRICS_INITIALIZED.load(Ordering::Relaxed) {
+        return;
+    }
+    // Shard label: static array avoids per-call heap allocation.
+    // Cardinality is bounded by num_shards (≤ 64 in practice).
+    static SHARD_LABELS: &[&str] = &[
+        "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16",
+        "17", "18", "19", "20", "21", "22", "23", "24", "25", "26", "27", "28", "29", "30", "31",
+        "32", "33", "34", "35", "36", "37", "38", "39", "40", "41", "42", "43", "44", "45", "46",
+        "47", "48", "49", "50", "51", "52", "53", "54", "55", "56", "57", "58", "59", "60", "61",
+        "62", "63",
+    ];
+    let shard_label = SHARD_LABELS.get(target_shard).copied().unwrap_or("unknown");
+
+    // Latency histogram: records µs for observability dashboards.
+    let latency_us = lock_acquire_ns as f64 / 1_000.0;
+    histogram!(
+        "moon_dispatch_cross_read_fastpath_latency_us",
+        "target_shard" => shard_label
+    )
+    .record(latency_us);
+
+    // Contention counter: threshold 1 µs (1 000 ns) — safely above syscall noise.
+    if lock_acquire_ns > 1_000 {
+        counter!(
+            "moon_cross_shard_lock_contention_total",
+            "target_shard" => shard_label
+        )
+        .increment(1);
+    }
+}
+
 /// Command deferred to cross-shard SPSC dispatch (the slow path).
 /// Recorded when a command is enqueued into a `remote_groups` bucket that
 /// will be flushed as a `PipelineBatchSlotted` message.
