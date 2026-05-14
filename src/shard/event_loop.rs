@@ -743,14 +743,22 @@ impl super::Shard {
 
             if let Some(ref vdir) = vector_persist_dir {
                 let _ = std::fs::create_dir_all(vdir);
-                let mut vs = shard_databases.vector_store(shard_id);
-                vs.set_persist_dir(vdir.clone());
-                drop(vs);
+                // Phase 2d: gate on is_initialized(); new path uses ShardSlice directly.
+                if crate::shard::slice::is_initialized() {
+                    crate::shard::slice::with_shard(|s| {
+                        s.vector_store.set_persist_dir(vdir.clone());
+                        s.text_store.set_persist_dir(vdir.clone());
+                    });
+                } else {
+                    let mut vs = shard_databases.vector_store(shard_id);
+                    vs.set_persist_dir(vdir.clone());
+                    drop(vs);
 
-                // Text indexes share the same shard directory (different filename).
-                let mut ts = shard_databases.text_store(shard_id);
-                ts.set_persist_dir(vdir.clone());
-                drop(ts);
+                    // Text indexes share the same shard directory (different filename).
+                    let mut ts = shard_databases.text_store(shard_id);
+                    ts.set_persist_dir(vdir.clone());
+                    drop(ts);
+                }
             }
 
             // Try loading saved index metadata (with compaction weights) from the vector persist dir.
@@ -772,58 +780,113 @@ impl super::Shard {
             });
 
             if let Some(ref metas) = metas {
-                let mut vs = shard_databases.vector_store(shard_id);
-                info!(
-                    "Shard {}: restoring {} vector index(es) from sidecar",
-                    shard_id,
-                    metas.len()
-                );
-                for (meta, weight) in metas {
-                    let name = meta.name.clone();
-                    if let Err(e) = vs.create_index(meta.clone()) {
-                        tracing::warn!(
-                            "Shard {}: failed to restore index '{}': {}",
+                // Phase 2d: gate on is_initialized(); new path uses ShardSlice directly.
+                if crate::shard::slice::is_initialized() {
+                    crate::shard::slice::with_shard(|s| {
+                        info!(
+                            "Shard {}: restoring {} vector index(es) from sidecar",
                             shard_id,
-                            String::from_utf8_lossy(&name),
-                            e
+                            metas.len()
                         );
-                    } else if *weight != 1.0 {
-                        // W3-deep: restore persisted compaction_weight (skip default to avoid
-                        // redundant write on every startup when weight=1.0).
-                        if let Some(idx) = vs.get_index_mut(&name) {
-                            idx.set_compaction_weight(*weight);
+                        for (meta, weight) in metas {
+                            let name = meta.name.clone();
+                            if let Err(e) = s.vector_store.create_index(meta.clone()) {
+                                tracing::warn!(
+                                    "Shard {}: failed to restore index '{}': {}",
+                                    shard_id,
+                                    String::from_utf8_lossy(&name),
+                                    e
+                                );
+                            } else if *weight != 1.0 {
+                                if let Some(idx) = s.vector_store.get_index_mut(&name) {
+                                    idx.set_compaction_weight(*weight);
+                                }
+                            }
+                        }
+                    });
+                } else {
+                    let mut vs = shard_databases.vector_store(shard_id);
+                    info!(
+                        "Shard {}: restoring {} vector index(es) from sidecar",
+                        shard_id,
+                        metas.len()
+                    );
+                    for (meta, weight) in metas {
+                        let name = meta.name.clone();
+                        if let Err(e) = vs.create_index(meta.clone()) {
+                            tracing::warn!(
+                                "Shard {}: failed to restore index '{}': {}",
+                                shard_id,
+                                String::from_utf8_lossy(&name),
+                                e
+                            );
+                        } else if *weight != 1.0 {
+                            // W3-deep: restore persisted compaction_weight (skip default to avoid
+                            // redundant write on every startup when weight=1.0).
+                            if let Some(idx) = vs.get_index_mut(&name) {
+                                idx.set_compaction_weight(*weight);
+                            }
                         }
                     }
+                    drop(vs); // release VectorStore lock before scanning databases
                 }
-                drop(vs); // release VectorStore lock before scanning databases
             }
 
             // Restore text indexes from sidecar metadata.
             #[cfg(feature = "text-index")]
             if let Some(ref text_metas) = text_metas {
-                let mut ts = shard_databases.text_store(shard_id);
-                info!(
-                    "Shard {}: restoring {} text index(es) from sidecar",
-                    shard_id,
-                    text_metas.len()
-                );
-                for meta in text_metas {
-                    let text_index = crate::text::store::TextIndex::new(
-                        meta.name.clone(),
-                        meta.key_prefixes.clone(),
-                        meta.text_fields.clone(),
-                        meta.bm25_config,
-                    );
-                    if let Err(e) = ts.create_index(meta.name.clone(), text_index) {
-                        tracing::warn!(
-                            "Shard {}: failed to restore text index '{}': {}",
+                // Phase 2d: gate on is_initialized(); new path uses ShardSlice directly.
+                if crate::shard::slice::is_initialized() {
+                    crate::shard::slice::with_shard(|s| {
+                        info!(
+                            "Shard {}: restoring {} text index(es) from sidecar",
                             shard_id,
-                            String::from_utf8_lossy(&meta.name),
-                            e
+                            text_metas.len()
                         );
+                        for meta in text_metas {
+                            let text_index = crate::text::store::TextIndex::new(
+                                meta.name.clone(),
+                                meta.key_prefixes.clone(),
+                                meta.text_fields.clone(),
+                                meta.bm25_config,
+                            );
+                            if let Err(e) =
+                                s.text_store.create_index(meta.name.clone(), text_index)
+                            {
+                                tracing::warn!(
+                                    "Shard {}: failed to restore text index '{}': {}",
+                                    shard_id,
+                                    String::from_utf8_lossy(&meta.name),
+                                    e
+                                );
+                            }
+                        }
+                    });
+                } else {
+                    let mut ts = shard_databases.text_store(shard_id);
+                    info!(
+                        "Shard {}: restoring {} text index(es) from sidecar",
+                        shard_id,
+                        text_metas.len()
+                    );
+                    for meta in text_metas {
+                        let text_index = crate::text::store::TextIndex::new(
+                            meta.name.clone(),
+                            meta.key_prefixes.clone(),
+                            meta.text_fields.clone(),
+                            meta.bm25_config,
+                        );
+                        if let Err(e) = ts.create_index(meta.name.clone(), text_index) {
+                            tracing::warn!(
+                                "Shard {}: failed to restore text index '{}': {}",
+                                shard_id,
+                                String::from_utf8_lossy(&meta.name),
+                                e
+                            );
+                        }
                     }
+                    drop(ts);
                 }
-                drop(ts);
             }
 
             // Auto-reindex existing HASH keys that match vector or text index prefixes.
@@ -832,68 +895,92 @@ impl super::Shard {
                 let db_count = shard_databases.db_count();
                 let mut reindexed = 0usize;
                 for db_idx in 0..db_count {
-                    let guard = shard_databases.read_db(shard_id, db_idx);
-                    let mut matching: Vec<(Vec<u8>, Vec<crate::protocol::Frame>)> = Vec::new();
-                    for (key, entry) in guard.data().iter() {
-                        let key_bytes = key.as_bytes();
-                        let matches_vector = metas.as_ref().is_some_and(|ms| {
-                            ms.iter().any(|(m, _w)| {
-                                m.key_prefixes.iter().any(|p| key_bytes.starts_with(p))
-                            })
-                        });
-                        let matches_text = text_metas.as_ref().is_some_and(|ms| {
-                            ms.iter()
-                                .any(|m| m.key_prefixes.iter().any(|p| key_bytes.starts_with(p)))
-                        });
-                        if !matches_vector && !matches_text {
-                            continue;
-                        }
-                        let mut args = Vec::new();
-                        args.push(crate::protocol::Frame::BulkString(
-                            bytes::Bytes::copy_from_slice(key_bytes),
-                        ));
-                        match entry.as_redis_value() {
-                            crate::storage::compact_value::RedisValueRef::Hash(map) => {
-                                for (field, value) in map.iter() {
-                                    args.push(crate::protocol::Frame::BulkString(
-                                        bytes::Bytes::copy_from_slice(field),
-                                    ));
-                                    args.push(crate::protocol::Frame::BulkString(
-                                        bytes::Bytes::copy_from_slice(value),
-                                    ));
-                                }
+                    // Phase 2d: gate read on is_initialized(); new path uses ShardSlice directly.
+                    let collect_matching = |db: &crate::storage::Database| -> Vec<(Vec<u8>, Vec<crate::protocol::Frame>)> {
+                        let mut matching: Vec<(Vec<u8>, Vec<crate::protocol::Frame>)> = Vec::new();
+                        for (key, entry) in db.data().iter() {
+                            let key_bytes = key.as_bytes();
+                            let matches_vector = metas.as_ref().is_some_and(|ms| {
+                                ms.iter().any(|(m, _w)| {
+                                    m.key_prefixes.iter().any(|p| key_bytes.starts_with(p))
+                                })
+                            });
+                            let matches_text = text_metas.as_ref().is_some_and(|ms| {
+                                ms.iter().any(|m| {
+                                    m.key_prefixes.iter().any(|p| key_bytes.starts_with(p))
+                                })
+                            });
+                            if !matches_vector && !matches_text {
+                                continue;
                             }
-                            crate::storage::compact_value::RedisValueRef::HashListpack(lp) => {
-                                let entries: Vec<_> = lp.iter().collect();
-                                let mut j = 0;
-                                while j + 1 < entries.len() {
-                                    args.push(crate::protocol::Frame::BulkString(
-                                        bytes::Bytes::from(entries[j].as_bytes()),
-                                    ));
-                                    args.push(crate::protocol::Frame::BulkString(
-                                        bytes::Bytes::from(entries[j + 1].as_bytes()),
-                                    ));
-                                    j += 2;
+                            let mut args = Vec::new();
+                            args.push(crate::protocol::Frame::BulkString(
+                                bytes::Bytes::copy_from_slice(key_bytes),
+                            ));
+                            match entry.as_redis_value() {
+                                crate::storage::compact_value::RedisValueRef::Hash(map) => {
+                                    for (field, value) in map.iter() {
+                                        args.push(crate::protocol::Frame::BulkString(
+                                            bytes::Bytes::copy_from_slice(field),
+                                        ));
+                                        args.push(crate::protocol::Frame::BulkString(
+                                            bytes::Bytes::copy_from_slice(value),
+                                        ));
+                                    }
                                 }
+                                crate::storage::compact_value::RedisValueRef::HashListpack(lp) => {
+                                    let entries: Vec<_> = lp.iter().collect();
+                                    let mut j = 0;
+                                    while j + 1 < entries.len() {
+                                        args.push(crate::protocol::Frame::BulkString(
+                                            bytes::Bytes::from(entries[j].as_bytes()),
+                                        ));
+                                        args.push(crate::protocol::Frame::BulkString(
+                                            bytes::Bytes::from(entries[j + 1].as_bytes()),
+                                        ));
+                                        j += 2;
+                                    }
+                                }
+                                _ => continue,
                             }
-                            _ => continue,
+                            if args.len() > 1 {
+                                matching.push((key_bytes.to_vec(), args));
+                            }
                         }
-                        if args.len() > 1 {
-                            matching.push((key_bytes.to_vec(), args));
-                        }
-                    }
-                    drop(guard);
+                        matching
+                    };
+                    let matching = if crate::shard::slice::is_initialized() {
+                        crate::shard::slice::with_shard_db(db_idx, |db| collect_matching(db))
+                    } else {
+                        let guard = shard_databases.read_db(shard_id, db_idx);
+                        collect_matching(&guard)
+                    };
 
                     if !matching.is_empty() {
-                        let mut vs = shard_databases.vector_store(shard_id);
-                        let mut ts = shard_databases.text_store(shard_id);
-                        for (key, args) in &matching {
-                            // Plan 166-01: return discarded — this is a
-                            // reindex path, not a txn write path.
-                            let _ = crate::shard::spsc_handler::auto_index_hset_public(
-                                &mut vs, &mut *ts, key, args,
-                            );
-                            reindexed += 1;
+                        // Phase 2d: gate write on is_initialized().
+                        if crate::shard::slice::is_initialized() {
+                            crate::shard::slice::with_shard(|s| {
+                                for (key, args) in &matching {
+                                    let _ = crate::shard::spsc_handler::auto_index_hset_public(
+                                        &mut s.vector_store,
+                                        &mut s.text_store,
+                                        key,
+                                        args,
+                                    );
+                                    reindexed += 1;
+                                }
+                            });
+                        } else {
+                            let mut vs = shard_databases.vector_store(shard_id);
+                            let mut ts = shard_databases.text_store(shard_id);
+                            for (key, args) in &matching {
+                                // Plan 166-01: return discarded — this is a
+                                // reindex path, not a txn write path.
+                                let _ = crate::shard::spsc_handler::auto_index_hset_public(
+                                    &mut vs, &mut *ts, key, args,
+                                );
+                                reindexed += 1;
+                            }
                         }
                     }
                 }
