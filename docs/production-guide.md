@@ -641,3 +641,103 @@ docker build --build-arg FEATURES=runtime-tokio,jemalloc -t moon:tokio .
 ### Container OOM killed
 
 Set `--maxmemory` to 75-80% of the container memory limit. Moon's eviction policies will keep memory in bounds. Without maxmemory, the dataset grows until the container is killed.
+
+---
+
+## Multi-Shard Scaling: When It Wins and When It Hurts
+
+Moon shards the keyspace across N independent per-shard event loops, each with its own
+`SO_REUSEPORT` listener, DashTable, and WAL writer. This section documents the empirically
+validated operating envelope for multi-shard configurations.
+
+### When multi-shard wins
+
+| Scenario | Recommended shards | Reason |
+|---|---|---|
+| Pipeline depth ≥ 16, `c ≥ 25 × shards` | 4–8 | Parallel WAL, parallel DashTable, no contention |
+| AOF enabled, write-heavy | 4–8 | Per-shard WAL eliminates the global lock Redis's single AOF file imposes |
+| Hash-tagged key workloads (`{tag}:...`) | N (any) | Tagged keys co-locate on one shard; zero cross-shard dispatch |
+| `c ≥ 200` clients, mixed read/write | 4–8 | RwLock contention becomes invisible at high client counts |
+
+### When multi-shard hurts
+
+| Scenario | Use instead | Reason |
+|---|---|---|
+| Non-pipelined (p=1), small client counts | `--shards 1` | SPSC dispatch overhead dominates local lookup |
+| `c < 25 × shards` | Reduce shard count or increase clients | Benchmark artifact: each shard sees fewer than 25 clients, causing measurable sub-linear scaling |
+| Random keyspace, p=1, c=50 | `--shards 1` | Observed 14× SET throughput collapse at c=50 (benchmark artifact, vanishes at c=200) |
+| Per-key memory comparison with Redis | `--shards 1` | Fair apples-to-apples comparison requires a single shard |
+
+### The c ≥ 25 × shards rule
+
+Empirically validated 2026-04-22 through 2026-04-26 (GCloud c4a Axion):
+
+- At `c=50` with 8 shards (6 clients/shard), SET p=1 collapsed 14× vs single-shard.
+- At `c=200` with 8 shards (25 clients/shard), the collapse **vanished** — throughput was flat
+  across 1/4/8 shards.
+- Root cause: at `c < 25 × shards`, each shard is statistically under-subscribed and the
+  SPSC dispatch round-trip dominates.
+
+**Rule:** ensure `clients ≥ 25 × shards` in production. For 8 shards, that means at least
+200 concurrent connections. Use `redis-benchmark -c 200` or higher for fair multi-shard
+benchmarks.
+
+### Cross-shard fast path
+
+For read commands directed at a foreign shard (e.g. GET where the key hashes to shard 3
+but the connection is pinned to shard 0), Moon has two dispatch modes:
+
+| Mode | Behavior |
+|---|---|
+| `auto` / `on` (default) | Acquire a short-lived `RwLock` read guard on the target shard's database directly, bypassing SPSC. Lower latency, but adds `RwLock` contention on the target shard. |
+| `off` | Route the read through the SPSC channel (same as a write). Eliminates `RwLock` contention at the cost of one extra channel round-trip (~2–5 µs). |
+
+#### When to use `--cross-shard-fast-path=off`
+
+Switch to `off` when you observe `moon_cross_shard_lock_contention_total` climbing in
+Prometheus, specifically when:
+
+- `c < 25 × shards` (low-concurrency / over-sharded deployment)
+- Write-heavy workloads where the target shard's `RwLock` is frequently held by a writer
+- You see `moon_dispatch_cross_read_fastpath_latency_us` p99 > 50 µs
+
+At `c ≥ 200` and typical shard counts (4–8), the fast path's `RwLock` contention is
+invisible in production profiling and the default `auto` mode is recommended.
+
+#### Observability
+
+Two Prometheus metrics expose fast-path health:
+
+- `moon_dispatch_cross_read_fastpath_latency_us{target_shard=N}` — histogram of lock
+  acquisition time per target shard. Alert when p99 > 50 µs.
+- `moon_cross_shard_lock_contention_total{target_shard=N}` — incremented whenever lock
+  acquisition takes > 1 µs. A rising rate under low client counts indicates the fast path
+  is adding contention.
+- `moon_dispatch_path_total{path="cross_read_fast"}` — total fast-path dispatches (existing
+  counter, unchanged).
+
+#### Benchmarking the trade-off
+
+Use `scripts/bench-cross-shard-fastpath.sh` to run the full matrix on `moon-dev`:
+
+```bash
+orb run -m moon-dev bash -c '
+  source ~/.cargo/env &&
+  cd /Users/tindang/workspaces/tind-repo/moon &&
+  bash scripts/bench-cross-shard-fastpath.sh
+'
+```
+
+Results are written to `docs/benchmarks/cross-shard-fastpath-<date>.md`.
+
+### Future: shared-nothing architecture (Phase 4)
+
+The `--cross-shard-fast-path` flag is a Phase 0 observability and safety valve for the
+5-phase shared-nothing migration documented in
+`.planning/shared-nothing-migration/PLAN.md`.
+
+In Phase 3, the fast path will be deleted and all cross-shard reads will route through
+SPSC. In Phase 4, `RwLock<Database>` is replaced with per-thread owned state (`ShardSlice`
++ `thread_local!`), eliminating lock contention entirely. The `--cross-shard-fast-path=off`
+flag previews that future behavior and can be used to validate SPSC-only routing in
+staging today.
