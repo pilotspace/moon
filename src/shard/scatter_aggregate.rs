@@ -59,7 +59,7 @@ pub async fn scatter_text_aggregate(
             crate::shard::slice::with_shard(|s| {
                 let db = s
                     .databases
-                    .get(0)
+                    .first()
                     .expect("shard slice must have at least db 0");
                 crate::command::vector_search::ft_aggregate::execute_local_full(
                     &mut s.vector_store,
@@ -105,7 +105,7 @@ pub async fn scatter_text_aggregate(
                 crate::shard::slice::with_shard(|s| {
                     let db = s
                         .databases
-                        .get(0)
+                        .first()
                         .expect("shard slice must have at least db 0");
                     crate::command::vector_search::ft_aggregate::execute_local_partial(
                         &s.text_store,
