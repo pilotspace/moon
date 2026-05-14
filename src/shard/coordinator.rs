@@ -851,7 +851,22 @@ pub async fn scatter_vector_search_remote(
     // Phase 171 SCAT-01: honor AS_OF on the coordinator's own shard by
     // routing through `search_local_filtered` with the resolved LSN rather
     // than the AS_OF-unaware `search_local` helper.
-    let local_result = {
+    // Phase 2c: gate on is_initialized(); new path uses ShardSlice directly.
+    let local_result = if crate::shard::slice::is_initialized() {
+        crate::shard::slice::with_shard(|s| {
+            crate::command::vector_search::search_local_filtered(
+                &mut s.vector_store,
+                &index_name,
+                &query_blob,
+                k,
+                None,
+                0,
+                usize::MAX,
+                None,
+                as_of_lsn,
+            )
+        })
+    } else {
         let mut vs = shard_databases.vector_store(my_shard);
         crate::command::vector_search::search_local_filtered(
             &mut vs,
@@ -956,7 +971,42 @@ pub async fn broadcast_vector_command(
         _ => false,
     };
 
-    let local_result = {
+    // Phase 2c: gate on is_initialized(); new path uses ShardSlice with
+    // disjoint borrows of vector_store / text_store / graph_store / databases[0].
+    let local_result = if crate::shard::slice::is_initialized() {
+        crate::shard::slice::with_shard(|s| {
+            // Split borrows so rustc sees `&mut s.vector_store`,
+            // `&mut s.text_store`, `&s.graph_store`, and optional
+            // `&mut s.databases[0]` as four disjoint fields.
+            let (db_slice, vs, ts);
+            #[cfg(feature = "graph")]
+            let graph_ref;
+            // Reborrow each field through `&mut *s` so the compiler
+            // tracks them independently.
+            {
+                vs = &mut s.vector_store;
+                ts = &mut s.text_store;
+                #[cfg(feature = "graph")]
+                {
+                    graph_ref = &s.graph_store;
+                }
+                db_slice = &mut s.databases;
+            }
+            let db_opt = if is_dropindex {
+                db_slice.get_mut(0)
+            } else {
+                None
+            };
+            crate::shard::spsc_handler::dispatch_vector_command(
+                vs,
+                ts,
+                #[cfg(feature = "graph")]
+                Some(graph_ref),
+                &command,
+                db_opt,
+            )
+        })
+    } else {
         let mut vs = shard_databases.vector_store(my_shard);
         let mut ts = shard_databases.text_store(my_shard);
         #[cfg(feature = "graph")]
@@ -1017,7 +1067,42 @@ pub async fn scatter_text_search(
     if num_shards == 1 {
         // Local IDF is globally accurate with one shard — skip DFS pre-pass.
         // Apply HIGHLIGHT/SUMMARIZE post-processing after local search.
-        let result = {
+        //
+        // Phase 2c: gate on is_initialized(); new path holds text_store +
+        // databases[0] simultaneously via a single `with_shard` call to avoid
+        // a reentrant `with_shard*` panic.
+        let result = if crate::shard::slice::is_initialized() {
+            crate::shard::slice::with_shard(|s| {
+                let ts = &s.text_store;
+                let mut r =
+                    crate::command::vector_search::ft_text_search::execute_text_search_local(
+                        ts,
+                        &index_name,
+                        field_idx,
+                        &query_terms,
+                        top_k,
+                        offset,
+                        count,
+                    );
+                if highlight_opts.is_some() || summarize_opts.is_some() {
+                    // Get the text_index reference, then borrow databases[0]
+                    // disjointly. Both fields are tracked independently by rustc.
+                    if let Some(text_index) = ts.get_index(&index_name) {
+                        if let Some(db) = s.databases.get_mut(0) {
+                            crate::command::vector_search::ft_text_search::apply_post_processing(
+                                &mut r,
+                                &term_strings,
+                                text_index,
+                                db,
+                                highlight_opts.as_ref(),
+                                summarize_opts.as_ref(),
+                            );
+                        }
+                    }
+                }
+                r
+            })
+        } else {
             let ts = shard_databases.text_store(my_shard);
             let mut r = crate::command::vector_search::ft_text_search::execute_text_search_local(
                 &ts,
@@ -1031,34 +1116,21 @@ pub async fn scatter_text_search(
             // Apply post-processing if requested — guards held, no .await below.
             if highlight_opts.is_some() || summarize_opts.is_some() {
                 if let Some(text_index) = ts.get_index(&index_name) {
-                    // Phase 2c: gate on is_initialized(); new path uses ShardSlice.
-                    if crate::shard::slice::is_initialized() {
-                        crate::shard::slice::with_shard_db(0, |db| {
-                            crate::command::vector_search::ft_text_search::apply_post_processing(
-                                &mut r,
-                                &term_strings,
-                                text_index,
-                                db,
-                                highlight_opts.as_ref(),
-                                summarize_opts.as_ref(),
-                            );
-                        });
-                    } else {
-                        let db_guard = shard_databases.read_db(my_shard, 0);
-                        crate::command::vector_search::ft_text_search::apply_post_processing(
-                            &mut r,
-                            &term_strings,
-                            text_index,
-                            &*db_guard,
-                            highlight_opts.as_ref(),
-                            summarize_opts.as_ref(),
-                        );
-                        // db_guard drops here.
-                    }
+                    let db_guard = shard_databases.read_db(my_shard, 0);
+                    crate::command::vector_search::ft_text_search::apply_post_processing(
+                        &mut r,
+                        &term_strings,
+                        text_index,
+                        &*db_guard,
+                        highlight_opts.as_ref(),
+                        summarize_opts.as_ref(),
+                    );
+                    // db_guard drops here.
                 }
             }
             r
-        }; // MutexGuard dropped here — no .await held
+            // MutexGuard dropped here — no .await held
+        };
         return result;
     }
 
@@ -1074,7 +1146,29 @@ pub async fn scatter_text_search(
         if shard_id == my_shard {
             // Local: extract df/N directly — no SPSC overhead.
             // CRITICAL: block scope drops MutexGuard before any .await (RESEARCH Pitfall 2).
-            let response = {
+            // Phase 2c: gate on is_initialized(); new path uses ShardSlice directly.
+            let response = if crate::shard::slice::is_initialized() {
+                crate::shard::slice::with_shard(|s| {
+                    match s.text_store.get_index(&index_name) {
+                        Some(text_index) => {
+                            let mut items: Vec<Frame> = Vec::new();
+                            for (field_idx_opt, terms) in &field_queries {
+                                let fidx = field_idx_opt.unwrap_or(0);
+                                let (term_dfs, n) =
+                                    text_index.doc_freq_for_terms(fidx, terms);
+                                for (term, df) in term_dfs {
+                                    items.push(Frame::BulkString(Bytes::from(term)));
+                                    items.push(Frame::Integer(i64::from(df)));
+                                }
+                                items.push(Frame::BulkString(Bytes::from_static(b"N")));
+                                items.push(Frame::Integer(i64::from(n)));
+                            }
+                            Frame::Array(items.into())
+                        }
+                        None => Frame::Error(Bytes::from_static(b"ERR unknown index")),
+                    }
+                })
+            } else {
                 let ts = shard_databases.text_store(shard_id);
                 match ts.get_index(&index_name) {
                     Some(text_index) => {
@@ -1093,7 +1187,8 @@ pub async fn scatter_text_search(
                     }
                     None => Frame::Error(Bytes::from_static(b"ERR unknown index")),
                 }
-            }; // MutexGuard dropped here, before .await below
+                // MutexGuard dropped here, before .await below
+            };
             local_doc_freq = Some(response);
         } else {
             let (reply_tx, reply_rx) = channel::oneshot();
@@ -1134,7 +1229,41 @@ pub async fn scatter_text_search(
         if shard_id == my_shard {
             // Local: execute with global IDF directly — block scope drops guard.
             // CRITICAL: guard dropped before any .await (RESEARCH Pitfall 2).
-            let response = {
+            // Phase 2c: gate on is_initialized(); fold text_store + databases[0]
+            // into a single `with_shard` to avoid reentrant `with_shard*` panic.
+            let response = if crate::shard::slice::is_initialized() {
+                crate::shard::slice::with_shard(|s| {
+                    match s.text_store.get_index(&index_name) {
+                        Some(text_index) => {
+                            let mut r =
+                                crate::command::vector_search::ft_text_search::execute_text_search_with_global_idf(
+                                    text_index,
+                                    field_idx,
+                                    &query_terms,
+                                    &global_df,
+                                    global_n,
+                                    top_k,
+                                    0,      // each shard returns top_k; coordinator applies final offset
+                                    top_k,
+                                );
+                            if highlight_opts.is_some() || summarize_opts.is_some() {
+                                if let Some(db) = s.databases.get_mut(0) {
+                                    crate::command::vector_search::ft_text_search::apply_post_processing(
+                                        &mut r,
+                                        &term_strings,
+                                        text_index,
+                                        db,
+                                        highlight_opts.as_ref(),
+                                        summarize_opts.as_ref(),
+                                    );
+                                }
+                            }
+                            r
+                        }
+                        None => Frame::Error(Bytes::from_static(b"ERR unknown index")),
+                    }
+                })
+            } else {
                 let ts = shard_databases.text_store(shard_id);
                 match ts.get_index(&index_name) {
                     Some(text_index) => {
@@ -1151,36 +1280,23 @@ pub async fn scatter_text_search(
                             );
                         // Apply HIGHLIGHT/SUMMARIZE while guards are held — sync, no .await.
                         if highlight_opts.is_some() || summarize_opts.is_some() {
-                            // Phase 2c: gate on is_initialized(); shard_id == my_shard here.
-                            if crate::shard::slice::is_initialized() {
-                                crate::shard::slice::with_shard_db(0, |db| {
-                                    crate::command::vector_search::ft_text_search::apply_post_processing(
-                                        &mut r,
-                                        &term_strings,
-                                        text_index,
-                                        db,
-                                        highlight_opts.as_ref(),
-                                        summarize_opts.as_ref(),
-                                    );
-                                });
-                            } else {
-                                let db_guard = shard_databases.read_db(shard_id, 0);
-                                crate::command::vector_search::ft_text_search::apply_post_processing(
-                                    &mut r,
-                                    &term_strings,
-                                    text_index,
-                                    &*db_guard,
-                                    highlight_opts.as_ref(),
-                                    summarize_opts.as_ref(),
-                                );
-                                // db_guard drops here.
-                            }
+                            let db_guard = shard_databases.read_db(shard_id, 0);
+                            crate::command::vector_search::ft_text_search::apply_post_processing(
+                                &mut r,
+                                &term_strings,
+                                text_index,
+                                &*db_guard,
+                                highlight_opts.as_ref(),
+                                summarize_opts.as_ref(),
+                            );
+                            // db_guard drops here.
                         }
                         r
                     }
                     None => Frame::Error(Bytes::from_static(b"ERR unknown index")),
                 }
-            }; // MutexGuard dropped here, before .await below
+                // MutexGuard dropped here, before .await below
+            };
             local_search = Some(response);
         } else {
             let (reply_tx, reply_rx) = channel::oneshot();
@@ -1256,7 +1372,27 @@ pub async fn scatter_text_search_filter(
 ) -> Frame {
     // ── Single-shard fast path ────────────────────────────────────────────────
     if num_shards == 1 {
-        let response = {
+        // Phase 2c: gate on is_initialized(); new path uses ShardSlice directly.
+        let response = if crate::shard::slice::is_initialized() {
+            crate::shard::slice::with_shard(|s| match s.text_store.get_index(&index_name) {
+                None => Frame::Error(Bytes::from_static(b"ERR no such index")),
+                Some(text_index) => {
+                    let clause =
+                        crate::command::vector_search::ft_text_search::TextQueryClause {
+                            field_name: None,
+                            terms: Vec::new(),
+                            filter: Some(filter),
+                        };
+                    let results =
+                        crate::command::vector_search::ft_text_search::execute_query_on_index(
+                            text_index, &clause, None, None, top_k,
+                        );
+                    crate::command::vector_search::ft_text_search::build_text_response(
+                        &results, offset, count,
+                    )
+                }
+            })
+        } else {
             let ts = shard_databases.text_store(my_shard);
             match ts.get_index(&index_name) {
                 None => Frame::Error(Bytes::from_static(b"ERR no such index")),
@@ -1287,7 +1423,27 @@ pub async fn scatter_text_search_filter(
 
     for shard_id in 0..num_shards {
         if shard_id == my_shard {
-            let response = {
+            // Phase 2c: gate on is_initialized(); new path uses ShardSlice directly.
+            let response = if crate::shard::slice::is_initialized() {
+                crate::shard::slice::with_shard(|s| match s.text_store.get_index(&index_name) {
+                    None => Frame::Error(Bytes::from_static(b"ERR no such index")),
+                    Some(text_index) => {
+                        let clause =
+                            crate::command::vector_search::ft_text_search::TextQueryClause {
+                                field_name: None,
+                                terms: Vec::new(),
+                                filter: Some(filter.clone()),
+                            };
+                        let results =
+                            crate::command::vector_search::ft_text_search::execute_query_on_index(
+                                text_index, &clause, None, None, top_k,
+                            );
+                        crate::command::vector_search::ft_text_search::build_text_response(
+                            &results, 0, top_k,
+                        )
+                    }
+                })
+            } else {
                 let ts = shard_databases.text_store(my_shard);
                 match ts.get_index(&index_name) {
                     None => Frame::Error(Bytes::from_static(b"ERR no such index")),
