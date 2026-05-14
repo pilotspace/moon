@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use parking_lot::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
@@ -55,6 +56,17 @@ pub struct ShardDatabases {
     deferred_hnsw_inserts: Vec<Mutex<DeferredHnswInserts>>,
     num_shards: usize,
     db_count: usize,
+    /// Per-shard memory publishers for lock-free cross-shard reads.
+    ///
+    /// Each shard's event loop will call `memory_publisher(shard_id)` once at
+    /// startup to clone an `Arc` into `ShardSlice.estimated_memory`. The shard
+    /// then atomically publishes its estimated memory after write operations
+    /// (Phase 2). Cross-shard readers — maxmemory eviction
+    /// (`persistence_tick.rs:436,511`) and metrics scrape
+    /// (`metrics_setup.rs:1238`) — call `read_memory_sum()` for a lock-free
+    /// sum (Phase 3). Coexists with the existing `aggregate_memory()` path
+    /// until Phase 3 switches the eviction tick.
+    memory_per_shard: Vec<Arc<AtomicUsize>>,
 }
 
 impl ShardDatabases {
@@ -88,6 +100,9 @@ impl ShardDatabases {
         let deferred_hnsw_inserts = (0..num_shards)
             .map(|_| Mutex::new(DeferredHnswInserts::new()))
             .collect();
+        let memory_per_shard = (0..num_shards)
+            .map(|_| Arc::new(AtomicUsize::new(0)))
+            .collect();
         Arc::new(Self {
             shards,
             vector_stores,
@@ -104,6 +119,7 @@ impl ShardDatabases {
             deferred_hnsw_inserts,
             num_shards,
             db_count,
+            memory_per_shard,
         })
     }
 
@@ -704,6 +720,9 @@ impl ShardDatabases {
     ///
     /// Acquires read locks briefly on each DB. Used for maxmemory eviction
     /// decisions (Redis maxmemory is a server-wide limit, not per-DB).
+    ///
+    /// Phase 3 will replace call sites with `read_memory_sum()` to eliminate
+    /// these lock acquisitions. Both methods coexist during the transition.
     pub fn aggregate_memory(&self, shard_id: usize) -> usize {
         let mut total = 0usize;
         for db_idx in 0..self.db_count {
@@ -711,6 +730,38 @@ impl ShardDatabases {
             total += guard.estimated_memory();
         }
         total
+    }
+
+    /// Get the per-shard memory publisher `Arc`.
+    ///
+    /// Called once per shard at startup when constructing the `ShardSlice`.
+    /// The returned `Arc` is cloned into `ShardSlice.estimated_memory`; the
+    /// master copy lives here in `memory_per_shard[shard_id]`.
+    ///
+    /// Phase 2 write paths will store into this atomic after mutations.
+    /// Phase 3 eviction and metrics paths will read via `read_memory_sum()`.
+    #[inline]
+    pub fn memory_publisher(&self, shard_id: usize) -> Arc<AtomicUsize> {
+        self.memory_per_shard[shard_id].clone()
+    }
+
+    /// Sum all per-shard memory publishers with `Relaxed` loads. Lock-free.
+    ///
+    /// Returns a best-effort estimate of total server memory across all shards.
+    /// `Relaxed` ordering is intentional: the eviction tick and metrics scrape
+    /// do not require cross-thread synchronization with write operations — they
+    /// only need a recent-enough value for threshold decisions. The error
+    /// introduced by stale atomics is far smaller than the headroom kept below
+    /// `maxmemory`.
+    ///
+    /// Phase 3 will switch `persistence_tick.rs:436,511` and
+    /// `metrics_setup.rs:1238` from `aggregate_memory()` to this method.
+    #[inline]
+    pub fn read_memory_sum(&self) -> usize {
+        self.memory_per_shard
+            .iter()
+            .map(|a| a.load(Ordering::Relaxed))
+            .sum()
     }
 
     /// Collect snapshot metadata (segment counts, base timestamps) for a shard.
