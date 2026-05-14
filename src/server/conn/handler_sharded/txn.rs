@@ -32,9 +32,14 @@ pub(super) fn try_handle_txn_begin(
     }
     match txn_begin_validate(conn.in_multi, conn.in_cross_txn()) {
         Ok(()) => {
-            // Get next txn_id and snapshot_lsn from vector store's transaction manager
-            let mut vector_store = ctx.shard_databases.vector_store(ctx.shard_id);
-            let active = vector_store.txn_manager_mut().begin();
+            // Get next txn_id and snapshot_lsn from vector store's transaction manager.
+            // Phase 2f: gate on is_initialized(); new path uses ShardSlice directly.
+            let active = if crate::shard::slice::is_initialized() {
+                crate::shard::slice::with_shard(|s| s.vector_store.txn_manager_mut().begin())
+            } else {
+                let mut vector_store = ctx.shard_databases.vector_store(ctx.shard_id);
+                vector_store.txn_manager_mut().begin()
+            };
             conn.active_cross_txn = Some(CrossStoreTxn::new(active.txn_id, active.snapshot_lsn));
             responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
         }
@@ -62,10 +67,32 @@ pub(super) fn try_handle_txn_commit(
                 // have been excluded from oldest_snapshot, allowing prune_committed to
                 // advance past its LSN. Committing with a stale read set is undefined
                 // behaviour — force the client to restart the transaction.
-                let mut vector_store = ctx.shard_databases.vector_store(ctx.shard_id);
-                if vector_store.txn_manager().is_killed(txn.txn_id) {
-                    vector_store.txn_manager_mut().abort_killed(txn.txn_id);
+                // Phase 2f: gate on is_initialized(); new path uses ShardSlice directly.
+                // Closure returns true iff the snapshot was killed (caller emits MOONERR
+                // and short-circuits the commit path).
+                let was_killed = if crate::shard::slice::is_initialized() {
+                    crate::shard::slice::with_shard(|s| {
+                        if s.vector_store.txn_manager().is_killed(txn.txn_id) {
+                            s.vector_store.txn_manager_mut().abort_killed(txn.txn_id);
+                            true
+                        } else {
+                            s.vector_store.txn_manager_mut().commit(txn.txn_id);
+                            false
+                        }
+                    })
+                } else {
+                    let mut vector_store = ctx.shard_databases.vector_store(ctx.shard_id);
+                    let killed = if vector_store.txn_manager().is_killed(txn.txn_id) {
+                        vector_store.txn_manager_mut().abort_killed(txn.txn_id);
+                        true
+                    } else {
+                        vector_store.txn_manager_mut().commit(txn.txn_id);
+                        false
+                    };
                     drop(vector_store);
+                    killed
+                };
+                if was_killed {
                     tracing::warn!(
                         txn_id = txn.txn_id,
                         "TXN.COMMIT rejected: snapshot was killed (snapshot too old)"
@@ -76,19 +103,31 @@ pub(super) fn try_handle_txn_commit(
                     responses.push(Frame::Error(msg.freeze()));
                     return true;
                 }
-                vector_store.txn_manager_mut().commit(txn.txn_id);
-                drop(vector_store);
 
                 // Write XactCommit WAL record with committed KV state
                 let txn_id = txn.txn_id;
                 if !txn.kv_undo.is_empty() {
-                    let db_guard = ctx.shard_databases.read_db(ctx.shard_id, conn.selected_db);
-                    let payload = crate::persistence::wal_v3::record::encode_xact_commit_payload(
-                        txn_id,
-                        txn.kv_undo.records(),
-                        &*db_guard,
-                    );
-                    drop(db_guard);
+                    // Phase 2f: gate on is_initialized(); new path uses ShardSlice directly.
+                    let payload = if crate::shard::slice::is_initialized() {
+                        crate::shard::slice::with_shard_db(conn.selected_db, |db| {
+                            crate::persistence::wal_v3::record::encode_xact_commit_payload(
+                                txn_id,
+                                txn.kv_undo.records(),
+                                db,
+                            )
+                        })
+                    } else {
+                        let db_guard =
+                            ctx.shard_databases.read_db(ctx.shard_id, conn.selected_db);
+                        let payload =
+                            crate::persistence::wal_v3::record::encode_xact_commit_payload(
+                                txn_id,
+                                txn.kv_undo.records(),
+                                &*db_guard,
+                            );
+                        drop(db_guard);
+                        payload
+                    };
                     let mut wal_buf = Vec::new();
                     crate::persistence::wal_v3::record::write_wal_v3_record(
                         &mut wal_buf,
@@ -118,16 +157,25 @@ pub(super) fn try_handle_txn_commit(
                     tracing::debug!(txn_id, count = drain_count, "Drained deferred HNSW inserts");
                 }
 
-                // Materialize MQ intents: enqueue deferred MQ.PUBLISH messages
+                // Materialize MQ intents: enqueue deferred MQ.PUBLISH messages.
+                // Phase 2f: gate on is_initialized(); new path uses ShardSlice directly.
                 if !txn.mq_intents.is_empty() {
-                    let mut db_guard = ctx.shard_databases.write_db(ctx.shard_id, conn.selected_db);
-                    for intent in &txn.mq_intents {
-                        if let Ok(Some(stream)) = db_guard.get_stream_mut(&intent.queue_key) {
-                            if stream.durable {
-                                let msg_id = stream.next_auto_id();
-                                stream.add(msg_id, intent.fields.clone());
+                    let materialize = |db: &mut crate::storage::db::Database| {
+                        for intent in &txn.mq_intents {
+                            if let Ok(Some(stream)) = db.get_stream_mut(&intent.queue_key) {
+                                if stream.durable {
+                                    let msg_id = stream.next_auto_id();
+                                    stream.add(msg_id, intent.fields.clone());
+                                }
                             }
                         }
+                    };
+                    if crate::shard::slice::is_initialized() {
+                        crate::shard::slice::with_shard_db(conn.selected_db, materialize);
+                    } else {
+                        let mut db_guard =
+                            ctx.shard_databases.write_db(ctx.shard_id, conn.selected_db);
+                        materialize(&mut *db_guard);
                     }
                 }
 
@@ -188,7 +236,10 @@ pub(super) fn try_handle_temporal_snapshot_at(
     match validate_snapshot_at(cmd_args) {
         Ok(()) => {
             let wall_ms = capture_wall_ms();
-            let lsn = {
+            // Phase 2f: gate on is_initialized(); new path uses ShardSlice directly.
+            let lsn = if crate::shard::slice::is_initialized() {
+                crate::shard::slice::with_shard(|s| s.vector_store.txn_manager().current_lsn())
+            } else {
                 let vector_store = ctx.shard_databases.vector_store(ctx.shard_id);
                 vector_store.txn_manager().current_lsn()
             };
@@ -220,8 +271,14 @@ pub(super) fn try_handle_temporal_invalidate(
             let wall_ms = capture_wall_ms();
             #[cfg(feature = "graph")]
             {
-                let mut gs = ctx.shard_databases.graph_store_write(ctx.shard_id);
-                if let Some(named_graph) = gs.get_graph_mut(&graph_name) {
+                // Phase 2f: gate on is_initialized(); new path uses ShardSlice directly.
+                // Closure outcome:
+                //   Some(Some(wal_records)) — entity found, mutated; emit OK and append WAL.
+                //   Some(None)              — entity not found in graph; emit ERR_ENTITY_NOT_FOUND.
+                //   None                    — graph not found; emit ERR_GRAPH_NOT_FOUND.
+                let invalidate_body = |gs: &mut crate::graph::store::GraphStore|
+                    -> Option<Option<Vec<Vec<u8>>>> {
+                    let named_graph = gs.get_graph_mut(&graph_name)?;
                     let mutated = if is_node {
                         let node_key: crate::graph::types::NodeKey =
                             slotmap::KeyData::from_ffi(entity_id).into();
@@ -246,20 +303,33 @@ pub(super) fn try_handle_temporal_invalidate(
                             entity_id, is_node, wall_ms, wall_ms,
                         );
                         gs.wal_pending.push(payload);
-                        let wal_records = gs.drain_wal();
-                        drop(gs);
+                        Some(Some(gs.drain_wal()))
+                    } else {
+                        Some(None)
+                    }
+                };
+                let outcome = if crate::shard::slice::is_initialized() {
+                    crate::shard::slice::with_shard(|s| invalidate_body(&mut s.graph_store))
+                } else {
+                    let mut gs = ctx.shard_databases.graph_store_write(ctx.shard_id);
+                    let r = invalidate_body(&mut gs);
+                    drop(gs);
+                    r
+                };
+                match outcome {
+                    Some(Some(wal_records)) => {
                         for record in wal_records {
                             ctx.shard_databases
                                 .wal_append(ctx.shard_id, Bytes::from(record));
                         }
                         responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
-                    } else {
-                        drop(gs);
+                    }
+                    Some(None) => {
                         responses.push(Frame::Error(Bytes::from_static(ERR_ENTITY_NOT_FOUND)));
                     }
-                } else {
-                    drop(gs);
-                    responses.push(Frame::Error(Bytes::from_static(ERR_GRAPH_NOT_FOUND)));
+                    None => {
+                        responses.push(Frame::Error(Bytes::from_static(ERR_GRAPH_NOT_FOUND)));
+                    }
                 }
             }
             #[cfg(not(feature = "graph"))]
