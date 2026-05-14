@@ -165,6 +165,16 @@ lto = "thin"
 codegen-units = 16
 strip = false
 
+# Profiling: lightweight symbols for `perf record` without the binary-size + compile-time hit
+# of full DWARF (`release-with-debug`). `line-tables-only` is enough to resolve symbol names
+# and file:line in `perf report` / flamegraph; it skips full type info that DWARF carries.
+# Use `cargo build --profile profiling` when sampling hot-paths. Per SET-PROFILE-2026-05-14
+# the default `release` profile strips symbols, which makes `perf` blind to Moon's call graph.
+[profile.profiling]
+inherits = "release"
+debug = "line-tables-only"
+strip = false
+
 [[bin]]
 name = "moon-bench"
 path = "src/bin/moon-bench.rs"
