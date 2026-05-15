@@ -507,11 +507,6 @@ impl Database {
         }
     }
 
-    /// Mutable access to the data map (for eviction to remove keys directly).
-    pub fn data_mut(&mut self) -> &mut DashTable<CompactKey, Entry> {
-        &mut self.data
-    }
-
     /// Get or create a hash entry. Returns mutable ref to inner HashMap.
     /// Returns Err(WRONGTYPE) if key exists with wrong type.
     ///
@@ -1596,13 +1591,6 @@ mod tests {
         assert_eq!(db.get_version(b"key"), 1);
         // non-existent key is a no-op
         db.increment_version(b"missing");
-    }
-
-    #[test]
-    fn test_data_mut() {
-        let mut db = Database::new();
-        db.set_string(Bytes::from_static(b"k"), Bytes::from_static(b"v"));
-        assert_eq!(db.data_mut().len(), 1);
     }
 
     #[test]
