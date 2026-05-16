@@ -34,7 +34,6 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
 
 use anyhow::Context;
 use parking_lot::RwLock;
@@ -104,12 +103,18 @@ pub async fn run_embedded(
     let all_notifiers = mesh.all_notifiers();
 
     // AOF writer: dedicated std::thread (matches main.rs lifetime model).
-    let aof_tx: Option<channel::MpscSender<AofMessage>> = if config.appendonly == "yes" {
+    // We retain the JoinHandle so shutdown can wait for the writer to finish
+    // flushing — dropping it would race the process exit and risk losing the
+    // final fsync (CodeRabbit #1).
+    let (aof_tx, aof_join): (
+        Option<channel::MpscSender<AofMessage>>,
+        Option<std::thread::JoinHandle<()>>,
+    ) = if config.appendonly == "yes" {
         let (tx, rx) = channel::mpsc_bounded::<AofMessage>(10_000);
         let aof_token = cancel.child_token();
         let fsync = FsyncPolicy::from_str(&config.appendfsync);
         let aof_file_path = PathBuf::from(&config.dir).join(&config.appendfilename);
-        std::thread::Builder::new()
+        let handle = std::thread::Builder::new()
             .name("embedded-moon-aof".to_string())
             .spawn(move || {
                 RuntimeFactoryImpl::block_on_local(
@@ -119,9 +124,9 @@ pub async fn run_embedded(
             })
             .context("embedded moon: failed to spawn AOF writer thread")?;
         info!("embedded moon: AOF enabled (fsync: {:?})", fsync);
-        Some(tx)
+        (Some(tx), Some(handle))
     } else {
-        None
+        (None, None)
     };
 
     let bind_addr = format!("{}:{}", config.bind, config.port);
@@ -203,78 +208,20 @@ pub async fn run_embedded(
         })
         .collect();
 
-    // Multi-part AOF replay (single-shard only; matches main.rs constraint).
-    if config.appendonly == "yes" && let Some(ref dir) = persistence_dir {
-        use crate::persistence::aof_manifest::AofManifest;
-        use crate::persistence::replay::DispatchReplayEngine;
-        let base_dir = std::path::PathBuf::from(dir);
-        let manifest_opt = AofManifest::load(&base_dir).with_context(|| {
-            format!(
-                "embedded moon: AOF manifest at {}/appendonlydir/ is corrupt; refusing to start to avoid data loss",
-                base_dir.display()
-            )
-        })?;
-        if let Some(ref manifest) = manifest_opt {
-            if num_shards == 1 {
-                for db in shards[0].databases.iter_mut() {
-                    db.clear();
-                }
-                let loaded = crate::persistence::aof_manifest::replay_multi_part(
-                    &mut shards[0].databases,
-                    manifest,
-                    &DispatchReplayEngine::new(),
-                )
-                .context("embedded moon: multi-part AOF replay failed")?;
-                info!(
-                    "embedded moon: AOF multi-part loaded (seq {}): {} entries",
-                    manifest.seq, loaded
-                );
-                let legacy = base_dir.join("appendonly.aof");
-                if legacy.exists() {
-                    let retired = base_dir.join("appendonly.aof.legacy");
-                    if let Err(e) = std::fs::rename(&legacy, &retired) {
-                        tracing::warn!(
-                            "embedded moon: failed to retire legacy AOF {}: {}",
-                            legacy.display(),
-                            e
-                        );
-                    }
-                }
-            } else {
-                tracing::warn!(
-                    "embedded moon: multi-part AOF skipped in multi-shard mode (not yet supported)"
-                );
-            }
-        } else {
-            // No manifest. If restore_from_persistence already loaded state,
-            // snapshot it as the seq-1 base RDB to avoid losing it on next boot.
-            let has_state = num_shards == 1 && shards[0].databases.iter().any(|db| db.len() > 0);
-            if has_state {
-                let rdb_bytes = crate::persistence::rdb::save_to_bytes(&shards[0].databases)
-                    .context("embedded moon: failed to serialize legacy state for AOF base")?;
-                AofManifest::initialize_with_base(&base_dir, &rdb_bytes)
-                    .context("embedded moon: failed to initialize AOF manifest with base")?;
-                info!(
-                    "embedded moon: first-upgrade captured legacy state as AOF base seq 1 ({} bytes)",
-                    rdb_bytes.len()
-                );
-                let legacy = base_dir.join("appendonly.aof");
-                if legacy.exists() {
-                    let retired = base_dir.join("appendonly.aof.legacy");
-                    if let Err(e) = std::fs::rename(&legacy, &retired) {
-                        tracing::warn!(
-                            "embedded moon: failed to retire legacy AOF {}: {}",
-                            legacy.display(),
-                            e
-                        );
-                    }
-                }
-            } else {
-                AofManifest::initialize(&base_dir)
-                    .context("embedded moon: failed to initialize AOF manifest")?;
-            }
-        }
-    }
+    // NOTE: multi-part AOF (appendonlydir/ manifest) is intentionally NOT used here.
+    //
+    // Under `runtime-tokio` the AOF writer (`aof::aof_writer_task`) opens a single
+    // file at `<dir>/<appendfilename>` and appends RESP frames directly — it never
+    // reads `AofManifest` nor advances the `incr` file (that path is `runtime-monoio`
+    // only; see `src/persistence/aof.rs` cfg gates). If we replayed `base+incr` here
+    // and then started the tokio writer, persisted writes would land in the legacy
+    // single-file AOF while the next boot would replay the stale manifest pair —
+    // silently dropping data (Qodo bug #3).
+    //
+    // Embedded recovery therefore relies on the per-shard baseline restore performed
+    // above (`Shard::restore_from_persistence` → RDB + per-shard WAL) plus the
+    // auxiliary WAL replay below. When multi-part AOF gains a tokio writer, wire it
+    // through the manifest's `incr_path()` and re-enable this block.
 
     // Pull databases out into the shared registry for cross-shard reads.
     let all_dbs: Vec<Vec<crate::storage::Database>> = shards
@@ -364,23 +311,23 @@ pub async fn run_embedded(
         shard_handles.push(handle);
     }
 
-    // Auto-save timer (no-op when save rules unset).
-    let change_counter = Arc::new(AtomicU64::new(0));
+    // Auto-save (change-count rules) is intentionally NOT spawned in embedded mode.
+    //
+    // `run_auto_save_sharded` only fires when its `change_counter` crosses the
+    // configured threshold, but the sharded ConnectionContext / write paths do
+    // not currently take an `Arc<AtomicU64>` we can wire it through (see
+    // `src/server/conn/core.rs` and `src/persistence/auto_save.rs`). Spawning
+    // the task with a counter that no writer can increment would silently
+    // promise persistence the daemon can never deliver (Qodo bug #5 /
+    // CodeRabbit autosave finding). Embedders that need periodic snapshots
+    // should call `BGSAVE` on their own cadence until the sharded write path
+    // exposes a dirty-tracking hook.
     if config.save.is_some() {
-        let rules = crate::persistence::auto_save::parse_save_rules(&config.save);
-        if !rules.is_empty() {
-            let auto_save_token = cancel.child_token();
-            let auto_save_counter = change_counter.clone();
-            let auto_save_snap_tx = snap_tx.clone();
-            tokio::spawn(crate::persistence::auto_save::run_auto_save_sharded(
-                rules,
-                auto_save_counter,
-                auto_save_token,
-                auto_save_snap_tx,
-            ));
-            info!("embedded moon: auto-save timer started");
-        }
+        tracing::warn!(
+            "embedded moon: `save` rules configured but change-count auto-save is not wired in embedded mode; ignoring"
+        );
     }
+    let _ = snap_tx; // keep the watch sender alive for the shard's snap_rx clones
 
     // Run the sharded listener until cancelled.
     let per_shard_accept = cfg!(target_os = "linux");
@@ -397,17 +344,27 @@ pub async fn run_embedded(
         tracing::error!("embedded moon: listener error: {}", e);
     }
 
-    // Listener exited (cancel fired or fatal error). Flush AOF and cancel
-    // any remaining shard work.
-    if let Some(ref tx) = aof_tx {
-        let _ = tx.send(AofMessage::Shutdown);
-    }
+    // Listener exited (cancel fired or fatal error). Cancel producers first so
+    // they stop enqueueing AOF appends, then flush the writer with an async
+    // shutdown send (Qodo bug #4 — the bounded flume channel's `send` is
+    // blocking and would stall the runtime thread if the queue is full).
     cancel.cancel();
+    if let Some(tx) = aof_tx {
+        if let Err(e) = tx.send_async(AofMessage::Shutdown).await {
+            tracing::warn!("embedded moon: AOF shutdown send failed: {}", e);
+        }
+    }
 
-    // Join shard threads on a blocking task — these are std::thread handles
-    // owning current-thread runtimes and cannot be joined from async.
+    // Join shard threads first, then the AOF writer thread. Shards must drain
+    // before the writer exits so their final WAL/AOF appends are observed.
+    // These are std::thread handles owning current-thread runtimes and cannot
+    // be joined from async (CodeRabbit #1 — without joining the writer the
+    // final fsync can race process exit).
     let join_result = tokio::task::spawn_blocking(move || {
         for handle in shard_handles {
+            let _ = handle.join();
+        }
+        if let Some(handle) = aof_join {
             let _ = handle.join();
         }
     })
