@@ -306,9 +306,289 @@ fn memory_stats(used: usize) -> Frame {
 }
 
 fn memory_doctor() -> Frame {
-    Frame::BulkString(Bytes::from_static(
-        b"Sam, I detected no issues in this Moon instance. Keep calm and carry on.\n",
-    ))
+    use std::fmt::Write;
+
+    let rss = crate::admin::metrics_setup::get_rss_bytes() as usize;
+    let vsz = get_vsz_bytes();
+
+    // ── Gather per-subsystem resident bytes ──────────────────────────────
+    let mut dashtable_bytes: usize = 0;
+    let mut hnsw_bytes: usize = 0;
+    let mut sealed_bytes: usize = 0;
+    #[cfg_attr(not(feature = "graph"), allow(unused_mut))]
+    let mut csr_bytes: usize = 0;
+    let wal_bytes: usize = 0;
+
+    if let Some(shard_dbs) = crate::admin::metrics_setup::get_global_shard_databases() {
+        let num_shards = shard_dbs.num_shards();
+        for shard_id in 0..num_shards {
+            // Database + DashTable (DB 0 only — the hot database)
+            let db_guard = shard_dbs.read_db(shard_id, 0);
+            dashtable_bytes += db_guard.resident_bytes();
+            dashtable_bytes += db_guard.data().resident_bytes();
+            drop(db_guard);
+
+            // VectorStore: (mutable/hnsw, immutable/sealed)
+            let vs = shard_dbs.vector_store(shard_id);
+            let (mutable, immutable) = vs.resident_bytes();
+            hnsw_bytes += mutable;
+            sealed_bytes += immutable;
+            drop(vs);
+
+            // GraphStore (CSR)
+            #[cfg(feature = "graph")]
+            {
+                let gs = shard_dbs.graph_store_read(shard_id);
+                csr_bytes += gs.resident_bytes();
+            }
+        }
+    }
+
+    // Replication backlog via global state (same pattern as INFO replication).
+    let repl_bytes = replication_backlog_bytes();
+
+    // WAL writers live on event-loop stacks, not accessible from command path.
+    // Report 0 with stable label — operators see the label exists.
+
+    // ── Allocator metadata ───────────────────────────────────────────────
+    let (allocator_name, arena_count) = allocator_info();
+
+    // ── Computed overhead ────────────────────────────────────────────────
+    let tracked_sum =
+        dashtable_bytes + hnsw_bytes + csr_bytes + wal_bytes + sealed_bytes + repl_bytes;
+    let allocator_overhead = rss.saturating_sub(tracked_sum);
+
+    // ── VSZ ratio recommendation ─────────────────────────────────────────
+    let vsz_ratio = if rss > 0 { vsz / rss } else { 0 };
+    let vsz_recommendation = if vsz_ratio > 100 {
+        format!("VSZ-vs-RSS ratio is {vsz_ratio}x (high -- consider --memory-arenas-cap 8)")
+    } else {
+        format!("VSZ-vs-RSS ratio is {vsz_ratio}x (normal)")
+    };
+
+    // Check if any single kind exceeds 50% of RSS.
+    let half_rss = rss / 2;
+    let resident_recommendation = if dashtable_bytes > half_rss {
+        "DashTable dominates RSS (>50%). Consider increasing --initial-keyspace-hint to reduce segment splits."
+    } else if hnsw_bytes > half_rss {
+        "HNSW (vector) dominates RSS (>50%). Consider compacting (FT.COMPACT) or reducing ef_construction."
+    } else if csr_bytes > half_rss {
+        "CSR (graph) dominates RSS (>50%). Review graph index sizes."
+    } else if allocator_overhead > half_rss {
+        "Allocator overhead dominates RSS (>50%). Possible fragmentation -- consider MEMORY PURGE or restart."
+    } else {
+        "No issues detected in resident memory."
+    };
+
+    // ── Format output ────────────────────────────────────────────────────
+    let now = chrono_iso8601_now();
+    let mut out = String::with_capacity(1024);
+
+    let _ = writeln!(out, "Sample of Moon memory usage at {now}");
+    let _ = writeln!(out);
+    let _ = writeln!(out, "Process:");
+    let _ = writeln!(out, "  RSS:                    {}", humanize_bytes(rss));
+    let _ = writeln!(out, "  VSZ:                    {}", humanize_bytes(vsz));
+    let _ = writeln!(out, "  Allocator:              {allocator_name}");
+    let _ = writeln!(out, "  Arenas:                 {arena_count}");
+    let _ = writeln!(out);
+    let _ = writeln!(out, "Per-subsystem (resident):");
+    let _ = writeln!(
+        out,
+        "  DashTable + entries:    {}  ({:.1}%)",
+        humanize_bytes(dashtable_bytes),
+        pct(dashtable_bytes, rss)
+    );
+    let _ = writeln!(
+        out,
+        "  HNSW (vector):          {}  ({:.1}%)",
+        humanize_bytes(hnsw_bytes),
+        pct(hnsw_bytes, rss)
+    );
+    let _ = writeln!(
+        out,
+        "  CSR (graph):            {}  ({:.1}%)",
+        humanize_bytes(csr_bytes),
+        pct(csr_bytes, rss)
+    );
+    let _ = writeln!(
+        out,
+        "  WAL writers:            {}  ({:.1}%)",
+        humanize_bytes(wal_bytes),
+        pct(wal_bytes, rss)
+    );
+    let _ = writeln!(
+        out,
+        "  Sealed segments:        {}  ({:.1}%)",
+        humanize_bytes(sealed_bytes),
+        pct(sealed_bytes, rss)
+    );
+    let _ = writeln!(
+        out,
+        "  Replication backlog:    {}  ({:.1}%)",
+        humanize_bytes(repl_bytes),
+        pct(repl_bytes, rss)
+    );
+    let _ = writeln!(
+        out,
+        "  Allocator overhead:     {}  ({:.1}%)",
+        humanize_bytes(allocator_overhead),
+        pct(allocator_overhead, rss)
+    );
+    let _ = writeln!(out);
+    let _ = writeln!(out, "Mapped regions:");
+    let _ = writeln!(out, "  File-backed mmap:       n/a");
+    let _ = writeln!(out, "  Anonymous mmap:         n/a");
+    let _ = writeln!(out);
+    let _ = writeln!(out, "Recommendations:");
+    let _ = writeln!(out, "  - {vsz_recommendation}");
+    let _ = write!(out, "  - {resident_recommendation}");
+
+    Frame::BulkString(Bytes::from(out))
+}
+
+/// Human-readable byte formatting (cold path — allocation OK).
+fn humanize_bytes(bytes: usize) -> String {
+    const KB: usize = 1024;
+    const MB: usize = 1024 * 1024;
+    const GB: usize = 1024 * 1024 * 1024;
+    const TB: usize = 1024 * 1024 * 1024 * 1024;
+
+    if bytes >= TB {
+        format!("{:.2} TB", bytes as f64 / TB as f64)
+    } else if bytes >= GB {
+        format!("{:.2} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.2} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.2} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+/// Percentage with divide-by-zero guard.
+fn pct(part: usize, whole: usize) -> f64 {
+    if whole == 0 {
+        0.0
+    } else {
+        (part as f64 / whole as f64) * 100.0
+    }
+}
+
+/// Simple ISO-8601 timestamp without external crate dependency.
+fn chrono_iso8601_now() -> String {
+    use std::time::SystemTime;
+    match SystemTime::now().duration_since(SystemTime::UNIX_EPOCH) {
+        Ok(d) => {
+            let secs = d.as_secs();
+            // Simple UTC formatting: YYYY-MM-DDTHH:MM:SSZ
+            let days = secs / 86400;
+            let time_of_day = secs % 86400;
+            let hours = time_of_day / 3600;
+            let minutes = (time_of_day % 3600) / 60;
+            let seconds = time_of_day % 60;
+
+            // Compute year/month/day from days since epoch (1970-01-01).
+            let (year, month, day) = days_to_ymd(days);
+            format!("{year:04}-{month:02}-{day:02}T{hours:02}:{minutes:02}:{seconds:02}Z")
+        }
+        Err(_) => "1970-01-01T00:00:00Z".to_string(),
+    }
+}
+
+/// Convert days since Unix epoch to (year, month, day).
+fn days_to_ymd(days: u64) -> (u64, u64, u64) {
+    // Algorithm from Howard Hinnant's chrono-compatible date library.
+    let z = days + 719468;
+    let era = z / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
+}
+
+/// Read replication backlog resident bytes via the global state.
+fn replication_backlog_bytes() -> usize {
+    if let Some(state) = crate::admin::metrics_setup::get_global_repl_state_arc() {
+        if let Ok(guard) = state.read() {
+            return guard.backlog_resident_bytes();
+        }
+    }
+    0
+}
+
+/// Read allocator name and arena count. Cold path — single mallctl OK.
+fn allocator_info() -> (String, String) {
+    #[cfg(feature = "jemalloc")]
+    {
+        // opt.narenas = configured cap (what we set via malloc_conf / MALLOC_CONF).
+        // arenas.narenas = actual created count (can exceed opt.narenas).
+        // Operators care about the configured limit, not the runtime count.
+        let arena_count = tikv_jemalloc_ctl::opt::narenas::read()
+            .map(|n| n.to_string())
+            .unwrap_or_else(|_| "n/a".to_string());
+        ("jemalloc".to_string(), arena_count)
+    }
+    #[cfg(not(feature = "jemalloc"))]
+    {
+        ("system".to_string(), "n/a".to_string())
+    }
+}
+
+/// Read VSZ (virtual memory size) for the current process.
+#[cfg(target_os = "linux")]
+fn get_vsz_bytes() -> usize {
+    // /proc/self/statm field 0 is size in pages.
+    // SAFETY: same pattern as get_rss_bytes in metrics_setup.rs.
+    let fd = unsafe { libc::open(c"/proc/self/statm".as_ptr(), libc::O_RDONLY) };
+    if fd < 0 {
+        return 0;
+    }
+    let mut buf = [0u8; 128];
+    // SAFETY: `fd` is a valid open file descriptor (checked >= 0 above); `buf` is
+    // a stack array of `buf.len()` initialized bytes, so the kernel may write up
+    // to that many bytes into it.
+    let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len()) };
+    // SAFETY: `fd` is a valid open file descriptor that has not yet been closed.
+    unsafe { libc::close(fd) };
+    if n <= 0 {
+        return 0;
+    }
+    let s = &buf[..n as usize];
+    // Field 0 = size (VSZ in pages).
+    if let Some(size_field) = s.split(|&b| b == b' ').next() {
+        let mut pages: u64 = 0;
+        for &b in size_field {
+            if b.is_ascii_digit() {
+                pages = pages * 10 + (b - b'0') as u64;
+            }
+        }
+        // Use the same page_size approach as get_rss_bytes.
+        // SAFETY: `sysconf` with `_SC_PAGESIZE` is a thread-safe POSIX query
+        // with no preconditions; it returns -1 on failure (handled by the cast).
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+        return (pages * page_size) as usize;
+    }
+    0
+}
+
+#[cfg(target_os = "macos")]
+fn get_vsz_bytes() -> usize {
+    // Reuse the shared macOS task_info helper that handles MACH_TASK_BASIC_INFO
+    // with TASK_VM_INFO fallback (flavor 20 returns KERN_INVALID_ARGUMENT on
+    // macOS 15+ / kernel 24.x).
+    crate::admin::metrics_setup::macos_task_memory_info().0 as usize
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn get_vsz_bytes() -> usize {
+    0
 }
 
 fn memory_help() -> Frame {
