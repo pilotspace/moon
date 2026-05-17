@@ -50,6 +50,33 @@ See `docs/guides/pitr.md` for operator usage.
 
 See `docs/guides/cdc.md` for consumer integration.
 
+### Added — Embedded sharded server
+
+- **PR #95** — `server::embedded::run_embedded(config, cancel)` exposes the
+  full sharded handler (with TXN.* cross-store transactions) to in-process
+  embedders such as `helios moon-daemon`. The existing `run_with_shutdown`
+  drives `handler_single`, which deliberately does not implement TXN.
+  Embedded mode skips TLS, console, cluster bus, admin port, and multi-part
+  AOF manifest replay; it does include per-shard RDB + WAL recovery,
+  graph/temporal/workspace/MQ WAL replay, SO_REUSEPORT, NUMA pinning, and
+  cancel-driven graceful shutdown.
+
+### Fixed — PR #95 review hardening
+
+- `main.rs` `malloc_conf` symbol: replaced the union-based unsafe pun with
+  a `#[repr(transparent)]` `Sync` wrapper around a `c"..."` literal.
+- `command/server_admin.rs` `get_vsz_bytes`: replaced four `unsafe`
+  libc::{open,read,close,sysconf} blocks with safe `/proc/self/status`
+  parsing on the cold MEMORY DOCTOR path.
+- `main.rs` arena scan now uses `env::args_os()` so non-UTF-8 argv no
+  longer panics before clap reports the error.
+- `server/embedded.rs` shutdown sequence: cancel → join shard threads →
+  drop the outer `aof_tx` → join the AOF thread, so the writer never
+  exits while shards are still queuing appends. Thread join panics are
+  now propagated through the function result.
+- `storage/db.rs` annotated two `.expect()` calls in `Database::set`'s
+  `insert_or_update` closures for the hot-path unwrap ratchet.
+
 ### Deferred to v0.2 follow-ups
 
 - **P3c** — wire `SnapshotState::set_last_lsn(wal_flush_lsn)` into the live

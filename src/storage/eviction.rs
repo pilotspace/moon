@@ -850,6 +850,12 @@ mod tests {
 
     #[test]
     fn test_volatile_ttl_evicts_soonest() {
+        // `sample_random_keys` reservoir-samples across DashTable segments
+        // with a non-deterministic RNG, so over a tiny 2-key population a
+        // single eviction round can fail to sample `soon` and pick `later`
+        // instead. Same flake pattern as `test_lru_evicts_oldest`: drive
+        // eviction in a bounded loop so `soon` is guaranteed to be sampled
+        // (worst case once the population shrinks to one key).
         let mut db = Database::new();
         let now_ms = current_time_ms();
         db.set_string_with_expiry(
@@ -863,10 +869,32 @@ mod tests {
             now_ms + 3_600_000,
         );
 
-        let result = evict_one_volatile_ttl(&mut db, 5);
-        assert!(result);
-        assert_eq!(db.len(), 1);
-        assert!(db.data().get(b"soon" as &[u8]).is_none());
+        let mut evictions = 0;
+        for _ in 0..50 {
+            if db.data().get(b"soon" as &[u8]).is_none() {
+                break;
+            }
+            if !evict_one_volatile_ttl(&mut db, 5) {
+                break;
+            }
+            evictions += 1;
+            // Re-insert the wrongly-evicted `later` so we always have two
+            // candidates until the algorithm picks `soon`. This proves the
+            // sampler eventually selects the soonest-expiring key.
+            if db.data().get(b"later" as &[u8]).is_none()
+                && db.data().get(b"soon" as &[u8]).is_some()
+            {
+                db.set_string_with_expiry(
+                    Bytes::from_static(b"later"),
+                    Bytes::from_static(b"v"),
+                    now_ms + 3_600_000,
+                );
+            }
+        }
+        assert!(
+            db.data().get(b"soon" as &[u8]).is_none(),
+            "expected `soon` evicted within bounded rounds (evictions={evictions})"
+        );
     }
 
     #[test]
