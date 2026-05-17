@@ -373,6 +373,6 @@ pub async fn run_embedded(
         tracing::warn!("embedded moon: shard-join task failed: {}", e);
     }
 
-    info!("embedded moon: shut down");
+    info!("embedded moon: shut down cleanly");
     listener_result
 }
