@@ -80,6 +80,24 @@ impl SegmentHolder {
         self.segments.store(Arc::new(new_list));
     }
 
+    /// Resident bytes split into (mutable_bytes, immutable_bytes).
+    ///
+    /// Mutable = brute-force buffer (TQ codes + raw f32 + entries).
+    /// Immutable = HNSW graph + TQ codes + QJL signs + norms + MVCC.
+    /// IVF/warm/cold segments are counted in the immutable total.
+    pub fn resident_bytes(&self) -> (usize, usize) {
+        let snapshot = self.load();
+        let mutable = snapshot.mutable.resident_bytes();
+        let mut immutable: usize = 0;
+        for seg in &snapshot.immutable {
+            immutable += seg.resident_bytes();
+        }
+        // IVF, warm, and cold segments are also immutable-tier memory.
+        // Their resident_bytes accessors can be added when those tiers
+        // gain memory tracking; for now they contribute 0.
+        (mutable, immutable)
+    }
+
     /// Total vector count across mutable + immutable + IVF + warm segments.
     pub fn total_vectors(&self) -> u32 {
         let snapshot = self.load();

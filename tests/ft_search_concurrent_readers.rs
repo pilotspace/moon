@@ -75,6 +75,8 @@ fn build_config(port: u16, num_shards: usize) -> ServerConfig {
         slowlog_log_slower_than: 10000,
         slowlog_max_len: 128,
         check_config: false,
+        initial_keyspace_hint: 0,
+        memory_arenas_cap: 8,
         maxclients: 10000,
         timeout: 0,
         tcp_keepalive: 300,
@@ -83,6 +85,8 @@ fn build_config(port: u16, num_shards: usize) -> ServerConfig {
         console_cors_origin: vec![],
         console_rate_limit: 1000.0,
         console_rate_burst: 2000.0,
+        recovery_target_lsn: None,
+        recovery_target_time: None,
     }
 }
 

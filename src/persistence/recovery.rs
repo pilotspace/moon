@@ -21,7 +21,7 @@ use crate::persistence::kv_page::{ValueType, read_datafile};
 use crate::persistence::manifest::{FileStatus, ShardManifest, StorageTier};
 use crate::persistence::page::PageType;
 use crate::persistence::wal_v3::record::{WalRecord, WalRecordType};
-use crate::persistence::wal_v3::replay::replay_wal_v3_dir;
+use crate::persistence::wal_v3::replay::{replay_wal_v3_dir, replay_wal_v3_dir_until};
 
 /// Result of a v3 recovery operation.
 #[derive(Debug, Default)]
@@ -83,6 +83,38 @@ pub fn recover_shard_v3_with_fallback(
     engine: &dyn crate::persistence::replay::CommandReplayEngine,
     v2_persistence_dir: Option<&Path>,
 ) -> Result<RecoveryResult, crate::error::MoonError> {
+    recover_shard_v3_pitr(
+        databases,
+        shard_id,
+        shard_dir,
+        engine,
+        v2_persistence_dir,
+        None,
+    )
+}
+
+/// PITR-aware recovery entry point (P3b).
+///
+/// When `recovery_target_lsn = Some(target)` is provided:
+/// 1. The on-disk snapshot is loaded only if its `last_lsn <= target`.
+///    Snapshots taken after the target are skipped -- they contain state
+///    from after the desired restore point.
+/// 2. WAL replay stops at the first record with `lsn > target`. The
+///    recovery's `last_lsn` reflects only records actually applied.
+/// 3. Snapshots with `last_lsn == 0` (legacy v1 or unstamped v2) are
+///    treated conservatively: skipped when a target is set, because we
+///    cannot prove they're safe to load relative to the target.
+///
+/// `recovery_target_lsn = None` reproduces the classic crash-recovery
+/// behavior (load snapshot, replay all WAL past redo_lsn).
+pub fn recover_shard_v3_pitr(
+    databases: &mut [crate::storage::Database],
+    shard_id: usize,
+    shard_dir: &Path,
+    engine: &dyn crate::persistence::replay::CommandReplayEngine,
+    v2_persistence_dir: Option<&Path>,
+    recovery_target_lsn: Option<u64>,
+) -> Result<RecoveryResult, crate::error::MoonError> {
     let mut result = RecoveryResult::default();
 
     // ── Phase 1: ENTRY POINT ──────────────────────────────────────────
@@ -137,15 +169,59 @@ pub fn recover_shard_v3_with_fallback(
     }
 
     // ── Phase 3: DATA LOAD ────────────────────────────────────────────
-    // Load per-shard snapshot (reuses existing v2 snapshot format)
+    // Load per-shard snapshot (reuses existing v2 snapshot format).
+    // PITR: when recovery_target_lsn is set we must skip snapshots that
+    // were taken AFTER the target (their state includes records we want
+    // to undo), and also skip snapshots whose last_lsn is unknown (== 0
+    // for legacy v1 or unstamped v2 files). Skipping forces full WAL
+    // replay up to the target -- slower but correct.
     let snap_path = shard_dir.join(format!("shard-{}.rrdshard", shard_id));
     if snap_path.exists() {
-        match crate::persistence::snapshot::shard_snapshot_load(databases, &snap_path) {
-            Ok(n) => {
-                info!("Shard {}: loaded {} keys from snapshot", shard_id, n);
+        let snapshot_ok = if let Some(target) = recovery_target_lsn {
+            match crate::persistence::snapshot::read_snapshot_metadata(&snap_path) {
+                Ok(meta) => {
+                    if meta.last_lsn == 0 {
+                        tracing::warn!(
+                            "Shard {}: PITR target_lsn={} set but snapshot has no \
+                             stamped LSN; skipping snapshot to force full WAL replay",
+                            shard_id,
+                            target
+                        );
+                        false
+                    } else if meta.last_lsn > target {
+                        tracing::warn!(
+                            "Shard {}: PITR target_lsn={} is before snapshot \
+                             last_lsn={}; skipping snapshot",
+                            shard_id,
+                            target,
+                            meta.last_lsn
+                        );
+                        false
+                    } else {
+                        true
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Shard {}: PITR could not peek snapshot metadata ({}); skipping",
+                        shard_id,
+                        e
+                    );
+                    false
+                }
             }
-            Err(e) => {
-                tracing::error!("Shard {}: snapshot load failed: {}", shard_id, e);
+        } else {
+            true
+        };
+
+        if snapshot_ok {
+            match crate::persistence::snapshot::shard_snapshot_load(databases, &snap_path) {
+                Ok(n) => {
+                    info!("Shard {}: loaded {} keys from snapshot", shard_id, n);
+                }
+                Err(e) => {
+                    tracing::error!("Shard {}: snapshot load failed: {}", shard_id, e);
+                }
             }
         }
     }
@@ -447,7 +523,20 @@ pub fn recover_shard_v3_with_fallback(
             result.fpi_applied += 1;
         };
 
-        match replay_wal_v3_dir(&wal_dir, redo_lsn, on_command, on_fpi) {
+        // PITR: when recovery_target_lsn is set, stop WAL replay at the
+        // target. Otherwise call the classic replay_wal_v3_dir for
+        // bit-identical behavior with crash recovery.
+        let replay_outcome = if let Some(target) = recovery_target_lsn {
+            info!(
+                "Shard {}: PITR replay with stop_at_lsn={}",
+                shard_id, target
+            );
+            replay_wal_v3_dir_until(&wal_dir, redo_lsn, Some(target), on_command, on_fpi)
+        } else {
+            replay_wal_v3_dir(&wal_dir, redo_lsn, on_command, on_fpi)
+        };
+
+        match replay_outcome {
             Ok(replay_result) => {
                 result.last_lsn = replay_result.last_lsn;
                 info!(
@@ -667,6 +756,86 @@ mod tests {
         assert_eq!(ctl.wal_flush_lsn, 3);
     }
 
+    /// P3b — PITR end-to-end: write 10 WAL commands, recover with
+    /// target_lsn = 5, assert only 5 records were applied and the
+    /// recovery's last_lsn reflects exactly the cutoff.
+    #[test]
+    fn test_recover_shard_v3_pitr_stops_at_target_lsn() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shard_dir = tmp.path().join("shard-0");
+        let wal_dir = shard_dir.join("wal-v3");
+        std::fs::create_dir_all(&wal_dir).unwrap();
+
+        let mut data = make_v3_header(0);
+        for i in 1..=10u64 {
+            write_wal_v3_record(
+                &mut data,
+                i,
+                WalRecordType::Command,
+                b"*1\r\n$4\r\nPING\r\n",
+            );
+        }
+        std::fs::write(wal_dir.join("000000000001.wal"), &data).unwrap();
+
+        let mut databases = vec![Database::new()];
+        let engine = crate::persistence::replay::DispatchReplayEngine::new();
+        let result =
+            recover_shard_v3_pitr(&mut databases, 0, &shard_dir, &engine, None, Some(5)).unwrap();
+
+        assert_eq!(
+            result.commands_replayed, 5,
+            "PITR target=5 should apply LSN 1..=5 only"
+        );
+        assert_eq!(
+            result.last_lsn, 5,
+            "control file's wal_flush_lsn must reflect the PITR cutoff"
+        );
+
+        // Control file must be written with the truncated last_lsn so a
+        // subsequent restart (without target) doesn't re-apply records 6..10.
+        let ctl = ShardControlFile::read(&ShardControlFile::control_path(&shard_dir, 0)).unwrap();
+        assert_eq!(ctl.wal_flush_lsn, 5);
+    }
+
+    /// P3b — PITR with target_lsn = None must reproduce the classic
+    /// recovery path bit-for-bit.
+    #[test]
+    fn test_recover_shard_v3_pitr_none_matches_classic() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shard_dir = tmp.path().join("shard-0");
+        let wal_dir = shard_dir.join("wal-v3");
+        std::fs::create_dir_all(&wal_dir).unwrap();
+
+        let mut data = make_v3_header(0);
+        for i in 1..=4u64 {
+            write_wal_v3_record(
+                &mut data,
+                i,
+                WalRecordType::Command,
+                b"*1\r\n$4\r\nPING\r\n",
+            );
+        }
+        std::fs::write(wal_dir.join("000000000001.wal"), &data).unwrap();
+
+        let mut dbs_pitr = vec![Database::new()];
+        let mut dbs_classic = vec![Database::new()];
+        let engine = crate::persistence::replay::DispatchReplayEngine::new();
+
+        let pitr =
+            recover_shard_v3_pitr(&mut dbs_pitr, 0, &shard_dir, &engine, None, None).unwrap();
+        // Use a fresh shard dir for the classic side so its control file
+        // doesn't reflect the PITR side's state.
+        let shard_dir2 = tmp.path().join("shard-0-classic");
+        let wal_dir2 = shard_dir2.join("wal-v3");
+        std::fs::create_dir_all(&wal_dir2).unwrap();
+        std::fs::write(wal_dir2.join("000000000001.wal"), &data).unwrap();
+        let classic = recover_shard_v3(&mut dbs_classic, 0, &shard_dir2, &engine).unwrap();
+
+        assert_eq!(pitr.commands_replayed, classic.commands_replayed);
+        assert_eq!(pitr.last_lsn, classic.last_lsn);
+        assert_eq!(pitr.fpi_applied, classic.fpi_applied);
+    }
+
     #[test]
     fn test_recover_shard_v3_fpi_counted() {
         let tmp = tempfile::tempdir().unwrap();
@@ -797,6 +966,7 @@ mod tests {
             created_lsn: 1,
             min_key_hash: 0,
             max_key_hash: u64::MAX,
+            last_modified_lsn: 1,
         });
         manifest.add_file(FileEntry {
             file_id: 99,
@@ -809,6 +979,7 @@ mod tests {
             created_lsn: 2,
             min_key_hash: 0,
             max_key_hash: u64::MAX,
+            last_modified_lsn: 2,
         });
         manifest.commit().unwrap();
         drop(manifest);
@@ -852,6 +1023,7 @@ mod tests {
             created_lsn: 1,
             min_key_hash: 0,
             max_key_hash: u64::MAX,
+            last_modified_lsn: 1,
         });
         manifest.commit().unwrap();
         drop(manifest);
@@ -920,6 +1092,7 @@ mod tests {
             created_lsn: 10,
             min_key_hash: 0,
             max_key_hash: u64::MAX,
+            last_modified_lsn: 10,
         });
         // Also add a non-cold entry that should be ignored
         manifest.add_file(FileEntry {
@@ -933,6 +1106,7 @@ mod tests {
             created_lsn: 11,
             min_key_hash: 0,
             max_key_hash: u64::MAX,
+            last_modified_lsn: 11,
         });
         manifest.commit().unwrap();
         drop(manifest);

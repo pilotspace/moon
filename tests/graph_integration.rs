@@ -69,6 +69,10 @@ async fn start_graph_server() -> (u16, CancellationToken) {
         slowlog_log_slower_than: 10000,
         slowlog_max_len: 128,
         check_config: false,
+        initial_keyspace_hint: 0,
+        memory_arenas_cap: 8,
+        recovery_target_lsn: None,
+        recovery_target_time: None,
     };
 
     tokio::spawn(async move {

@@ -101,6 +101,7 @@ pub fn transition_to_warm(
         created_lsn: 0,
         min_key_hash: 0,
         max_key_hash: u64::MAX,
+        last_modified_lsn: 0,
     };
 
     // Step 4a: Write FileCreate WAL record before manifest commit

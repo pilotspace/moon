@@ -377,6 +377,9 @@ pub static COMMAND_META: phf::Map<&'static str, CommandMeta> = phf_map! {
     "WATCH" => CommandMeta { name: "WATCH", arity: -2, flags: RF, first_key: 1, last_key: -1, step: 1, acl_categories: TXN },
     "UNWATCH" => CommandMeta { name: "UNWATCH", arity: 1, flags: RF, first_key: 0, last_key: 0, step: 0, acl_categories: TXN },
 
+    // ---- Change Data Capture (CDC) ----
+    "CDC.READ" => CommandMeta { name: "CDC.READ", arity: -3, flags: A, first_key: 0, last_key: 0, step: 0, acl_categories: SRV },
+
     // ---- Replication commands ----
     "REPLICAOF" => CommandMeta { name: "REPLICAOF", arity: 3, flags: A, first_key: 0, last_key: 0, step: 0, acl_categories: SRV },
     "SLAVEOF" => CommandMeta { name: "SLAVEOF", arity: 3, flags: A, first_key: 0, last_key: 0, step: 0, acl_categories: SRV },

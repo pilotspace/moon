@@ -444,12 +444,12 @@ pub(super) fn try_handle_replicaof(
             match action {
                 ReplicaofAction::StartReplication { host, port } => {
                     if let Ok(mut rs_guard) = rs.write() {
-                        rs_guard.role = crate::replication::state::ReplicationRole::Replica {
+                        rs_guard.set_role(crate::replication::state::ReplicationRole::Replica {
                             host: host.clone(),
                             port,
                             state:
                                 crate::replication::handshake::ReplicaHandshakeState::PingPending,
-                        };
+                        });
                     }
                     let rs_clone = Arc::clone(rs);
                     let cfg = crate::replication::replica::ReplicaTaskConfig {
@@ -467,7 +467,7 @@ pub(super) fn try_handle_replicaof(
                     if let Ok(mut rs_guard) = rs.write() {
                         rs_guard.repl_id2 = rs_guard.repl_id.clone();
                         rs_guard.repl_id = generate_repl_id();
-                        rs_guard.role = crate::replication::state::ReplicationRole::Master;
+                        rs_guard.set_role(crate::replication::state::ReplicationRole::Master);
                     }
                 }
                 ReplicaofAction::NoOp => {}
@@ -545,9 +545,10 @@ pub(super) fn try_handle_psync(
     };
     {
         let g = rs.read().ok();
-        let is_master = g.as_ref().map(|g| {
-            matches!(g.role, crate::replication::state::ReplicationRole::Master)
-        }).unwrap_or(false);
+        let is_master = g
+            .as_ref()
+            .map(|g| matches!(g.role, crate::replication::state::ReplicationRole::Master))
+            .unwrap_or(false);
         if !is_master {
             responses.push(Frame::Error(Bytes::from_static(
                 b"ERR PSYNC is only valid on a master",
@@ -559,9 +560,7 @@ pub(super) fn try_handle_psync(
         }
     }
     let repl_id = match &cmd_args[0] {
-        Frame::BulkString(b) | Frame::SimpleString(b) => {
-            String::from_utf8_lossy(b).into_owned()
-        }
+        Frame::BulkString(b) | Frame::SimpleString(b) => String::from_utf8_lossy(b).into_owned(),
         _ => {
             responses.push(Frame::Error(Bytes::from_static(
                 b"ERR PSYNC: invalid replid",
@@ -634,26 +633,30 @@ pub(super) fn try_handle_info(
 
 /// Handle READONLY enforcement: reject writes on replicas.
 /// Returns `true` if the command was blocked.
+///
+/// S3.5a (2026-04-27): hot path now reads `ctx.is_replica_mirror` (a single
+/// `AtomicBool::load(Acquire)`) instead of taking `ctx.repl_state.try_read()`
+/// per command. ARM perf annotate showed `RwLock::try_read` was a CAS
+/// (`mov w8, #0xfffd; cmp w11, w9` = ~84% self-time inside this fn) — the
+/// mirror eliminates it. `ReplicationState::set_role()` is the single owner
+/// of the mirror invariant.
 #[inline]
 pub(super) fn try_enforce_readonly(
     cmd: &[u8],
     ctx: &ConnectionContext,
     responses: &mut Vec<Frame>,
 ) -> bool {
-    if let Some(ref rs) = ctx.repl_state {
-        if let Ok(rs_guard) = rs.try_read() {
-            if matches!(
-                rs_guard.role,
-                crate::replication::state::ReplicationRole::Replica { .. }
-            ) {
-                if metadata::is_write(cmd) {
-                    responses.push(Frame::Error(Bytes::from_static(
-                        b"READONLY You can't write against a read only replica.",
-                    )));
-                    return true;
-                }
-            }
-        }
+    let Some(ref mirror) = ctx.is_replica_mirror else {
+        return false;
+    };
+    if !mirror.load(std::sync::atomic::Ordering::Acquire) {
+        return false;
+    }
+    if metadata::is_write(cmd) {
+        responses.push(Frame::Error(Bytes::from_static(
+            b"READONLY You can't write against a read only replica.",
+        )));
+        return true;
     }
     false
 }

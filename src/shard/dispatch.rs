@@ -243,10 +243,10 @@ pub struct FtHybridPayload {
 ///
 /// Before boxing, `TextSearch` packed `HashMap<String, u32>` + `Vec<QueryTerm>`
 /// + smallvec fields inline at ~280 bytes, driving the entire `ShardMessage`
-/// enum past 288 B and fragmenting every SPSC ring slot across 5 cache lines.
-/// Boxing moves the payload to the heap and collapses the variant to a single
-/// pointer (16 B incl. discriminant) so the ring slot stays within 2 cache
-/// lines when the hot slotted variants are enqueued.
+///   enum past 288 B and fragmenting every SPSC ring slot across 5 cache lines.
+///   Boxing moves the payload to the heap and collapses the variant to a single
+///   pointer (16 B incl. discriminant) so the ring slot stays within 2 cache
+///   lines when the hot slotted variants are enqueued.
 pub struct TextSearchPayload {
     pub index_name: Bytes,
     pub field_idx: Option<usize>,
@@ -319,6 +319,21 @@ pub struct GraphTraversePayload {
     pub reply_tx: channel::OneshotSender<Frame>,
 }
 
+/// Boxed payload for `ShardMessage::CdcSubscribe` (C3b-2).
+///
+/// Carries the per-subscriber sink and replay start point to the shard
+/// fan-out registry. The shard side wires the `tx` into a
+/// `CdcSubscriber` whose tail reader uses the shard's own `wal_dir`,
+/// so the dispatch layer never has to know that path.
+pub struct CdcSubscribePayload {
+    /// Bounded channel into which the shard pushes Debezium envelopes.
+    /// Backpressure is non-blocking: `try_send` returning `Full` evicts
+    /// the subscriber from the registry (slow-consumer disconnect).
+    pub tx: channel::MpscSender<bytes::Bytes>,
+    /// Inclusive LSN floor — records with `lsn < from_lsn` are skipped.
+    pub from_lsn: u64,
+}
+
 /// Messages sent to a shard via SPSC channels from the connection layer
 /// or from other shards for cross-shard operations.
 pub enum ShardMessage {
@@ -371,6 +386,18 @@ pub enum ShardMessage {
     /// Remove a replica's sender channel from this shard's fan-out list.
     /// Called when a replica disconnects or REPLICAOF NO ONE is executed.
     UnregisterReplica { replica_id: u64 },
+    /// Register a CDC subscriber with this shard's fan-out registry (C3b-2).
+    ///
+    /// The connection handler creates a bounded channel, ships the sender
+    /// here, and keeps the receiver for its own write-loop. The shard's
+    /// 1ms periodic tick drives `CdcSubscriberRegistry::fanout_tick`,
+    /// pumping freshly-flushed WAL records through the channel as
+    /// Debezium JSON envelopes.
+    ///
+    /// Boxed because the payload (sender + u64) plus enum discriminant
+    /// stays clear of the 64-byte cap, but boxing is the cheaper choice
+    /// when the variant is rare relative to per-write traffic.
+    CdcSubscribe(Box<CdcSubscribePayload>),
     /// Return keys in a specific hash slot (for CLUSTER GETKEYSINSLOT).
     GetKeysInSlot {
         db_index: usize,
@@ -564,17 +591,47 @@ mod tests {
     fn print_shard_message_sizes() {
         use std::mem::size_of;
         eprintln!("== ShardMessage layout ==");
-        eprintln!("ShardMessage total           = {}", size_of::<ShardMessage>());
-        eprintln!("  TcpStream                  = {}", size_of::<crate::runtime::TcpStream>());
-        eprintln!("  Arc<Frame>                 = {}", size_of::<std::sync::Arc<Frame>>());
-        eprintln!("  OneshotSender<Frame>       = {}", size_of::<channel::OneshotSender<Frame>>());
-        eprintln!("  ResponseSlotPtr            = {}", size_of::<ResponseSlotPtr>());
+        eprintln!(
+            "ShardMessage total           = {}",
+            size_of::<ShardMessage>()
+        );
+        eprintln!(
+            "  TcpStream                  = {}",
+            size_of::<crate::runtime::TcpStream>()
+        );
+        eprintln!(
+            "  Arc<Frame>                 = {}",
+            size_of::<std::sync::Arc<Frame>>()
+        );
+        eprintln!(
+            "  OneshotSender<Frame>       = {}",
+            size_of::<channel::OneshotSender<Frame>>()
+        );
+        eprintln!(
+            "  ResponseSlotPtr            = {}",
+            size_of::<ResponseSlotPtr>()
+        );
         eprintln!("  Bytes                      = {}", size_of::<Bytes>());
-        eprintln!("  PathBuf                    = {}", size_of::<std::path::PathBuf>());
-        eprintln!("  Vec<(Bytes, Frame)>        = {}", size_of::<Vec<(Bytes, Frame)>>());
-        eprintln!("  Vec<Arc<Frame>>            = {}", size_of::<Vec<std::sync::Arc<Frame>>>());
-        eprintln!("  Vec<(Option<usize>, Vec<String>)> = {}", size_of::<Vec<(Option<usize>, Vec<String>)>>());
-        eprintln!("  Vec<(Bytes, Bytes)>        = {}", size_of::<Vec<(Bytes, Bytes)>>());
+        eprintln!(
+            "  PathBuf                    = {}",
+            size_of::<std::path::PathBuf>()
+        );
+        eprintln!(
+            "  Vec<(Bytes, Frame)>        = {}",
+            size_of::<Vec<(Bytes, Frame)>>()
+        );
+        eprintln!(
+            "  Vec<Arc<Frame>>            = {}",
+            size_of::<Vec<std::sync::Arc<Frame>>>()
+        );
+        eprintln!(
+            "  Vec<(Option<usize>, Vec<String>)> = {}",
+            size_of::<Vec<(Option<usize>, Vec<String>)>>()
+        );
+        eprintln!(
+            "  Vec<(Bytes, Bytes)>        = {}",
+            size_of::<Vec<(Bytes, Bytes)>>()
+        );
         eprintln!("  Vec<u16>                   = {}", size_of::<Vec<u16>>());
     }
 

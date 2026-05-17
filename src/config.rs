@@ -251,6 +251,14 @@ pub struct ServerConfig {
     #[arg(long = "segment-cold-min-qps", default_value_t = 0.1)]
     pub segment_cold_min_qps: f64,
 
+    // ── Allocator tuning (PERF-10) ────────────────────────────────
+    /// Override jemalloc narenas cap (default 8). Range 1-256.
+    /// Reduces VSZ on multi-core hosts (4*ncpus default -> 8). No-op for
+    /// non-jemalloc builds. Implemented via MALLOC_CONF env-var injection
+    /// at process start (re-spawn before jemalloc init).
+    #[arg(long = "memory-arenas-cap", value_name = "N", default_value_t = 8, value_parser = clap::value_parser!(u32).range(1..=256))]
+    pub memory_arenas_cap: u32,
+
     /// DiskANN beam width for disk-resident vector search.
     /// Not yet consumed — reserved for the DiskANN search implementation.
     #[arg(long = "vec-diskann-beam-width", default_value_t = 8)]
@@ -260,6 +268,20 @@ pub struct ServerConfig {
     /// Not yet consumed — reserved for the DiskANN cache layer.
     #[arg(long = "vec-diskann-cache-levels", default_value_t = 3)]
     pub vec_diskann_cache_levels: u32,
+
+    // ── MoonStore v2: Point-in-time recovery (PITR) ────────────────
+    /// Stop WAL replay at this LSN during recovery. Records with LSN > target
+    /// are skipped. Mutually exclusive with --recovery-target-time; if both
+    /// are set the LSN takes precedence. Wired by P3 in recovery.rs.
+    #[arg(long = "recovery-target-lsn", value_name = "LSN")]
+    pub recovery_target_lsn: Option<u64>,
+
+    /// Stop WAL replay at the first record whose timestamp exceeds this
+    /// RFC3339 instant (e.g. "2026-05-12T08:30:00Z"). The recovery scanner
+    /// resolves it to an LSN during P3. Mutually exclusive with
+    /// --recovery-target-lsn (LSN wins if both are set).
+    #[arg(long = "recovery-target-time", value_name = "RFC3339")]
+    pub recovery_target_time: Option<String>,
 }
 
 impl ServerConfig {

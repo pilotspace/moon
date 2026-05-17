@@ -255,11 +255,11 @@ mod tests {
     #[test]
     fn test_build_info_replication_replica() {
         let mut state = ReplicationState::new(1, "c".repeat(40), "d".repeat(40));
-        state.role = ReplicationRole::Replica {
+        state.set_role(ReplicationRole::Replica {
             host: "127.0.0.1".to_string(),
             port: 6379,
             state: ReplicaHandshakeState::Streaming,
-        };
+        });
         let info = build_info_replication(&state);
         assert!(info.contains("role:slave\r\n"));
         assert!(info.contains("master_host:127.0.0.1\r\n"));
@@ -275,11 +275,11 @@ mod tests {
         // even when the PSYNC handshake had not succeeded, which masked a
         // master that does not wire PSYNC.
         let mut state = ReplicationState::new(1, "e".repeat(40), "f".repeat(40));
-        state.role = ReplicationRole::Replica {
+        state.set_role(ReplicationRole::Replica {
             host: "127.0.0.1".to_string(),
             port: 6379,
             state: ReplicaHandshakeState::PingPending,
-        };
+        });
         let info = build_info_replication(&state);
         assert!(info.contains("master_link_status:down\r\n"));
         assert!(info.contains("master_sync_in_progress:0\r\n"));
@@ -288,11 +288,13 @@ mod tests {
     #[test]
     fn test_build_info_replication_replica_full_resync_reports_syncing() {
         let mut state = ReplicationState::new(1, "g".repeat(40), "h".repeat(40));
-        state.role = ReplicationRole::Replica {
+        state.set_role(ReplicationRole::Replica {
             host: "127.0.0.1".to_string(),
             port: 6379,
-            state: ReplicaHandshakeState::FullResyncLoading { shards_remaining: 2 },
-        };
+            state: ReplicaHandshakeState::FullResyncLoading {
+                shards_remaining: 2,
+            },
+        });
         let info = build_info_replication(&state);
         assert!(info.contains("master_link_status:down\r\n"));
         assert!(info.contains("master_sync_in_progress:1\r\n"));

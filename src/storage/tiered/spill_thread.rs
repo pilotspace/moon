@@ -173,6 +173,7 @@ impl SpillThread {
                         created_lsn: 0,
                         min_key_hash: 0,
                         max_key_hash: 0,
+                        last_modified_lsn: 0,
                     };
                     (true, entry)
                 }
@@ -194,6 +195,7 @@ impl SpillThread {
                         created_lsn: 0,
                         min_key_hash: 0,
                         max_key_hash: 0,
+                        last_modified_lsn: 0,
                     };
                     (false, entry)
                 }

@@ -1,6 +1,6 @@
 [package]
 name = "moon"
-version = "0.1.0"
+version = "0.1.12"
 edition = "2024"
 rust-version = "1.94"
 description = "A high-performance Redis-compatible server written in Rust"
@@ -67,8 +67,9 @@ hyper-util = { version = "0.1", features = ["tokio", "http1", "http2", "server-a
 http-body-util = "0.1"
 
 tikv-jemallocator = { version = "0.6", optional = true }
+tikv-jemalloc-ctl = { version = "0.6", optional = true }
 monoio = { version = "0.2", optional = true, features = ["sync", "bytes"] }
-cudarc = { version = "0.12", optional = true, default-features = false, features = ["cuda-version-from-build-system"] }
+cudarc = { version = "0.19", optional = true, default-features = false, features = ["cuda-version-from-build-system"] }
 slotmap = "1"
 boomphf = "0.6"
 logos = { version = "0.14", optional = true }
@@ -96,7 +97,11 @@ levenshtein_automata = { version = "0.2", features = ["fst_automaton"], optional
 #   cargo build --no-default-features --features runtime-tokio,jemalloc   # force Tokio
 #   cargo build --no-default-features --features runtime-monoio,jemalloc  # force Monoio
 default = ["runtime-monoio", "jemalloc", "graph", "text-index"]
-jemalloc = ["dep:tikv-jemallocator"]
+jemalloc = ["dep:tikv-jemallocator", "dep:tikv-jemalloc-ctl"]
+# Opt-in alternate allocator. Mutually exclusive with `jemalloc`.
+# Usage:
+#   cargo build --no-default-features --features runtime-monoio,mimalloc-alt,graph,text-index
+mimalloc-alt = []
 runtime-tokio = ["tokio/rt-multi-thread", "tokio/io-util", "tokio/signal", "tokio/time", "tokio/fs", "tokio/process", "dep:tokio-util", "dep:tokio-rustls", "dep:aws-lc-rs", "dep:rustls", "rustls/aws_lc_rs", "dep:rustls-pemfile"]
 runtime-monoio = ["dep:monoio", "dep:monoio-rustls", "dep:aws-lc-rs", "dep:rustls", "rustls/aws_lc_rs", "dep:rustls-pemfile"]
 gpu-cuda = ["dep:cudarc"]
@@ -128,7 +133,7 @@ redis = { version = "1.1", features = ["tokio-comp"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "time", "io-util"] }
 tempfile = "3"
 loom = "0.7"
-ureq = "2"
+ureq = "3"
 hmac = "0.13"
 
 [profile.release]

@@ -42,6 +42,7 @@ pub mod acl;
 pub mod admin;
 pub mod auth_ratelimit;
 pub mod blocking;
+pub mod cdc;
 pub mod client_pause;
 pub mod client_registry;
 pub mod cluster;

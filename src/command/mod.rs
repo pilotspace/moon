@@ -1,4 +1,5 @@
 pub mod acl;
+pub mod cdc;
 pub mod client;
 pub mod config;
 pub mod connection;

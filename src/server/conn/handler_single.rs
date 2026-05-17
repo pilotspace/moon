@@ -633,11 +633,11 @@ pub async fn handle_connection(
                                     match action {
                                         ReplicaofAction::StartReplication { host, port } => {
                                             if let Ok(mut rs_guard) = rs.write() {
-                                                rs_guard.role = crate::replication::state::ReplicationRole::Replica {
+                                                rs_guard.set_role(crate::replication::state::ReplicationRole::Replica {
                                                     host: host.clone(),
                                                     port,
                                                     state: crate::replication::handshake::ReplicaHandshakeState::PingPending,
-                                                };
+                                                });
                                             }
                                         }
                                         ReplicaofAction::PromoteToMaster => {
@@ -645,7 +645,7 @@ pub async fn handle_connection(
                                             if let Ok(mut rs_guard) = rs.write() {
                                                 rs_guard.repl_id2 = rs_guard.repl_id.clone();
                                                 rs_guard.repl_id = generate_repl_id();
-                                                rs_guard.role = crate::replication::state::ReplicationRole::Master;
+                                                rs_guard.set_role(crate::replication::state::ReplicationRole::Master);
                                             }
                                         }
                                         ReplicaofAction::NoOp => {}

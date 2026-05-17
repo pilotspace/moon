@@ -1,0 +1,33 @@
+{
+  "rss": 83034112,
+  "kinds": {
+    "dashtable": {
+      "doctor": 144661544,
+      "prom": 144657903
+    },
+    "hnsw": {
+      "doctor": 600002,
+      "prom": 600000
+    },
+    "csr": {
+      "doctor": 54865,
+      "prom": 54864
+    },
+    "wal": {
+      "doctor": 0,
+      "prom": 0
+    },
+    "sealed": {
+      "doctor": 0,
+      "prom": 0
+    },
+    "replication_backlog": {
+      "doctor": 0,
+      "prom": 0
+    },
+    "allocator_overhead": {
+      "doctor": 0,
+      "prom": 0
+    }
+  }
+}

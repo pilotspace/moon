@@ -112,3 +112,30 @@ jobs:
         with:
           shared-key: msrv-${{ hashFiles('Cargo.lock') }}
       - run: cargo build --no-default-features --features runtime-tokio
+
+  # ── Memory steady-state gate (~4 min) ──────────────────────────────
+  # Boots Moon, loads a fixed workload, compares per-kind memory
+  # against tests/fixtures/memory-baseline.json within +/-5%.
+  # Self-test injects +6% to prove the gate catches regressions.
+  memory-steady-state:
+    name: Memory steady-state gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.94.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: memory-gate-${{ hashFiles('Cargo.lock') }}
+      - name: Install redis tools
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq redis-tools jq
+      - name: Build moon
+        run: cargo build --no-default-features --features runtime-tokio,jemalloc,graph,text-index
+      - name: Run memory steady-state gate (with self-test)
+        run: bash scripts/bench-memory-steady-state.sh --self-test --skip-build
+      - name: Upload report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: memory-steady-state-report
+          path: /tmp/moon-*.txt

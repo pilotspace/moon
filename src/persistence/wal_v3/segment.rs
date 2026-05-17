@@ -23,7 +23,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use super::record::{WalRecordType, write_wal_v3_record};
+use super::record::{WalRecordType, read_wal_v3_record, write_wal_v3_record};
 
 /// WAL v3 magic bytes (shared with v2 for detection).
 pub const WAL_V3_MAGIC: &[u8; 6] = b"RRDWAL";
@@ -101,6 +101,13 @@ impl WalWriterV3 {
         let max_seq = Self::scan_max_sequence(wal_dir);
         let next_seq = if max_seq > 0 { max_seq + 1 } else { 1 };
 
+        // P0 — LSN durability: resume next_lsn from the highest LSN observed
+        // across existing segments. Without this, every restart resets LSN to 1
+        // which breaks PITR (target_lsn becomes ambiguous) and CDC (consumer
+        // cursors can rewind silently).
+        let resumed_lsn = Self::scan_max_lsn(wal_dir);
+        let next_lsn = resumed_lsn + 1;
+
         let mut writer = Self {
             shard_id,
             wal_dir: wal_dir.to_path_buf(),
@@ -109,7 +116,7 @@ impl WalWriterV3 {
             current_file: None,
             buf: Vec::with_capacity(8192),
             write_offset: 0,
-            next_lsn: 1,
+            next_lsn,
             base_lsn: 0,
             epoch: 0,
             min_wal_bytes: DEFAULT_MIN_WAL_BYTES,
@@ -201,6 +208,13 @@ impl WalWriterV3 {
     #[inline]
     pub fn wal_dir(&self) -> &Path {
         &self.wal_dir
+    }
+
+    /// Resident bytes used by in-memory WAL buffers (NOT on-disk segment files).
+    /// Returns the capacity of the write buffer. O(1), zero allocation.
+    #[inline]
+    pub fn resident_bytes(&self) -> usize {
+        self.buf.capacity()
     }
 
     /// Configure minimum and maximum WAL size bounds for recycling.
@@ -408,6 +422,81 @@ impl WalWriterV3 {
             }
         }
         max_seq
+    }
+
+    /// Scan existing WAL segments for the highest LSN observed.
+    ///
+    /// Walks segment files newest → oldest. For each segment with payload
+    /// (file_size > 64-byte header), iterates records and tracks the max LSN.
+    /// Stops at the first segment that yields at least one record — LSNs are
+    /// monotonic across segments (each rotation carries the counter forward),
+    /// so the newest non-empty segment holds the global max.
+    ///
+    /// Returns 0 if no records are found (fresh dir or only header-sized
+    /// segments). The caller should set `next_lsn = scan_max_lsn(..) + 1`.
+    ///
+    /// Defensive: corrupt or truncated tails stop the scan for that segment
+    /// without panicking — `read_wal_v3_record` returns `None` on malformed
+    /// input, matching the replay-side contract.
+    fn scan_max_lsn(wal_dir: &Path) -> u64 {
+        // Collect (sequence, path) for every .wal segment.
+        let mut segments: Vec<(u64, PathBuf)> = Vec::new();
+        let entries = match fs::read_dir(wal_dir) {
+            Ok(e) => e,
+            Err(_) => return 0,
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if let Some(stem) = name_str.strip_suffix(".wal") {
+                if let Ok(seq) = stem.parse::<u64>() {
+                    segments.push((seq, entry.path()));
+                }
+            }
+        }
+        if segments.is_empty() {
+            return 0;
+        }
+        // Newest first.
+        segments.sort_by(|a, b| b.0.cmp(&a.0));
+
+        for (_seq, path) in &segments {
+            let data = match fs::read(path) {
+                Ok(d) => d,
+                Err(_) => continue,
+            };
+            if data.len() <= WAL_V3_HEADER_SIZE {
+                // Header-only segment, no records — try older one.
+                continue;
+            }
+            let mut offset = WAL_V3_HEADER_SIZE;
+            let mut max_lsn = 0u64;
+            while offset + 4 <= data.len() {
+                let record_len = u32::from_le_bytes([
+                    data[offset],
+                    data[offset + 1],
+                    data[offset + 2],
+                    data[offset + 3],
+                ]) as usize;
+                if record_len == 0 || offset + record_len > data.len() {
+                    // Torn or zero-padded tail — stop iterating this segment.
+                    break;
+                }
+                match read_wal_v3_record(&data[offset..offset + record_len]) {
+                    Some(rec) => {
+                        if rec.lsn > max_lsn {
+                            max_lsn = rec.lsn;
+                        }
+                    }
+                    None => break, // Corrupt record, stop scan for this segment.
+                }
+                offset += record_len;
+            }
+            if max_lsn > 0 {
+                return max_lsn;
+            }
+        }
+        0
     }
 }
 
@@ -672,5 +761,87 @@ mod tests {
         writer.set_wal_bounds(100, 200);
         assert_eq!(writer.min_wal_bytes(), 100);
         assert_eq!(writer.max_wal_bytes(), 200);
+    }
+
+    /// P0 — LSN durability: writer must resume `next_lsn` after restart by
+    /// scanning existing segments, otherwise PITR and CDC cannot work.
+    #[test]
+    fn test_writer_resumes_lsn_across_restart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_dir = tmp.path().join("wal");
+
+        // First writer: append 50 records, flush, drop.
+        {
+            let mut writer = WalWriterV3::new(0, &wal_dir, DEFAULT_SEGMENT_SIZE).unwrap();
+            for _ in 0..50 {
+                writer.append(WalRecordType::Command, b"SET k v");
+            }
+            writer.flush_sync().unwrap();
+            assert_eq!(
+                writer.current_lsn(),
+                51,
+                "next LSN should be 51 after 50 appends"
+            );
+        }
+
+        // Second writer: open the same dir, the very next append must be LSN 51.
+        let mut writer2 = WalWriterV3::new(0, &wal_dir, DEFAULT_SEGMENT_SIZE).unwrap();
+        let next_lsn = writer2.append(WalRecordType::Command, b"SET k v");
+        assert_eq!(
+            next_lsn, 51,
+            "writer must resume next_lsn from existing segments; got {} expected 51",
+            next_lsn
+        );
+    }
+
+    /// P0 — LSN durability: when records span multiple rotated segments,
+    /// resume from the max LSN observed across all of them.
+    #[test]
+    fn test_writer_resumes_across_segments() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_dir = tmp.path().join("wal");
+
+        // Small segment size to force rotation.
+        let last_lsn_first_run: u64;
+        {
+            let mut writer = WalWriterV3::new(0, &wal_dir, 512).unwrap();
+            let mut last_lsn = 0;
+            // Each Command record with 7-byte payload is ~31 bytes, so 30 records
+            // and periodic flushes will force at least 2 rotations.
+            for i in 0..60 {
+                last_lsn = writer.append(WalRecordType::Command, b"SET k v");
+                if (i + 1) % 3 == 0 {
+                    writer.flush_sync().unwrap();
+                }
+            }
+            writer.flush_sync().unwrap();
+            assert!(
+                writer.current_segment_sequence() >= 2,
+                "expected segment rotation, got seq {}",
+                writer.current_segment_sequence()
+            );
+            last_lsn_first_run = last_lsn;
+        }
+
+        // Reopen: next append must be last_lsn + 1.
+        let mut writer2 = WalWriterV3::new(0, &wal_dir, 512).unwrap();
+        let resumed_lsn = writer2.append(WalRecordType::Command, b"x");
+        assert_eq!(
+            resumed_lsn,
+            last_lsn_first_run + 1,
+            "writer must resume LSN across rotated segments; got {} expected {}",
+            resumed_lsn,
+            last_lsn_first_run + 1
+        );
+    }
+
+    /// P0 — Edge case: empty WAL dir or dir with only header-sized (zero-record)
+    /// segments must initialize next_lsn = 1.
+    #[test]
+    fn test_writer_empty_dir_starts_at_lsn_1() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_dir = tmp.path().join("wal");
+        let mut writer = WalWriterV3::new(0, &wal_dir, DEFAULT_SEGMENT_SIZE).unwrap();
+        assert_eq!(writer.append(WalRecordType::Command, b"x"), 1);
     }
 }

@@ -1226,7 +1226,8 @@ mod tests {
         match resp {
             Frame::Error(msg) => {
                 assert!(
-                    msg.as_ref().starts_with(b"ERR Unrecognized REPLCONF option"),
+                    msg.as_ref()
+                        .starts_with(b"ERR Unrecognized REPLCONF option"),
                     "got: {}",
                     String::from_utf8_lossy(&msg)
                 );

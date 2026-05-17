@@ -26,9 +26,17 @@
 //! - SIGHUP TLS reload thread
 //! - `--check-config` short-circuit (caller already validated)
 //!
-//! What IS included: AOF replay (single-shard manifest path), graph/temporal/
-//! workspace/MQ WAL replay, auto-save timer, per-shard SO_REUSEPORT on Linux,
+//! What IS included: per-shard RDB + WAL recovery (`Shard::restore_from_persistence`),
+//! graph/temporal/workspace/MQ WAL replay, per-shard SO_REUSEPORT on Linux,
 //! NUMA pinning, and graceful cancel-driven shutdown.
+//!
+//! What is NOT included even though the operator may have configured it:
+//! - Multi-part AOF manifest replay (legacy `appendonlydir/`). The tokio AOF
+//!   writer only knows the single-file path; see the in-body comment near the
+//!   `restore_from_persistence` loop for the rationale.
+//! - `save` change-count rules: the auto-save task needs a hook into the
+//!   sharded write path that does not yet exist, so embedded mode logs a
+//!   warning and skips the timer instead of silently promising snapshots.
 
 #![cfg(feature = "runtime-tokio")]
 
@@ -344,35 +352,93 @@ pub async fn run_embedded(
         tracing::error!("embedded moon: listener error: {}", e);
     }
 
-    // Listener exited (cancel fired or fatal error). Cancel producers first so
-    // they stop enqueueing AOF appends, then flush the writer with an async
-    // shutdown send (Qodo bug #4 — the bounded flume channel's `send` is
-    // blocking and would stall the runtime thread if the queue is full).
+    // Listener exited (cancel fired or fatal error). Shutdown ordering:
+    //   1. cancel.cancel() — stops shard accept loops + producers.
+    //   2. Join shard threads — drops every shard-held `aof_tx` clone.
+    //   3. Drop our outer `aof_tx` — last sender goes away, the AOF writer's
+    //      `recv_async()` returns `Err(_)` and the task flushes + fsyncs
+    //      before exiting (see `aof::aof_writer_task` Err arm).
+    //   4. Join the AOF thread.
+    //
+    // This sequencing fixes Qodo bug #5: sending `AofMessage::Shutdown` before
+    // shards exit lets the writer terminate while shards still `try_send`
+    // appends, dropping the final writes. Relying on channel-close instead of
+    // an explicit Shutdown also avoids the blocking-send hazard (Qodo bug #4).
     cancel.cancel();
-    if let Some(tx) = aof_tx {
-        if let Err(e) = tx.send_async(AofMessage::Shutdown).await {
-            tracing::warn!("embedded moon: AOF shutdown send failed: {}", e);
-        }
-    }
 
-    // Join shard threads first, then the AOF writer thread. Shards must drain
-    // before the writer exits so their final WAL/AOF appends are observed.
-    // These are std::thread handles owning current-thread runtimes and cannot
-    // be joined from async (CodeRabbit #1 — without joining the writer the
-    // final fsync can race process exit).
-    let join_result = tokio::task::spawn_blocking(move || {
+    // Shard + AOF thread joins must run on a blocking thread because they own
+    // current-thread runtimes (CodeRabbit #1 — without joining, the final
+    // fsync can race process exit).
+    let join_outcome = tokio::task::spawn_blocking(move || {
+        let mut shard_panics: usize = 0;
         for handle in shard_handles {
-            let _ = handle.join();
+            if let Err(payload) = handle.join() {
+                shard_panics += 1;
+                tracing::error!(
+                    "embedded moon: shard thread panicked: {}",
+                    panic_message(&payload)
+                );
+            }
         }
-        if let Some(handle) = aof_join {
-            let _ = handle.join();
-        }
+
+        // Drop the last AOF sender so the writer's recv loop sees channel close.
+        drop(aof_tx);
+
+        let aof_panic = if let Some(handle) = aof_join {
+            match handle.join() {
+                Ok(()) => false,
+                Err(payload) => {
+                    tracing::error!(
+                        "embedded moon: AOF writer thread panicked: {}",
+                        panic_message(&payload)
+                    );
+                    true
+                }
+            }
+        } else {
+            false
+        };
+
+        (shard_panics, aof_panic)
     })
     .await;
-    if let Err(e) = join_result {
-        tracing::warn!("embedded moon: shard-join task failed: {}", e);
-    }
 
-    info!("embedded moon: shut down cleanly");
-    listener_result
+    let result = match (join_outcome, listener_result) {
+        (Err(e), listener) => {
+            tracing::warn!("embedded moon: shard-join task failed: {}", e);
+            listener
+        }
+        (Ok((shard_panics, aof_panic)), listener) => {
+            if shard_panics > 0 || aof_panic {
+                // Promote panics to a typed shutdown error. We still surface
+                // the listener result if it was an error; otherwise return a
+                // synthetic error so callers know shutdown was incomplete.
+                listener.and_then(|()| {
+                    Err(std::io::Error::other(format!(
+                        "embedded moon: shutdown incomplete ({} shard panic(s), aof_panic={})",
+                        shard_panics, aof_panic
+                    ))
+                    .into())
+                })
+            } else {
+                listener
+            }
+        }
+    };
+
+    if result.is_ok() {
+        info!("embedded moon: shut down cleanly");
+    }
+    result
+}
+
+/// Best-effort stringification of a `JoinHandle::join()` panic payload.
+fn panic_message<'a>(payload: &'a Box<dyn std::any::Any + Send + 'static>) -> &'a str {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        s
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.as_str()
+    } else {
+        "<non-string panic payload>"
+    }
 }

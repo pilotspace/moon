@@ -26,7 +26,15 @@ pub mod simd;
 use super::compact_key::CompactKey;
 
 use iter::{Iter, IterMut, Keys, Values};
-use segment::{InsertResult, Segment, h2, home_buckets};
+use segment::{InsertResult, Segment, SegmentInsertOrUpdate, h2, home_buckets};
+
+/// Outcome of [`DashTable::insert_or_update`].
+pub enum InsertOrUpdate<'a, V> {
+    /// Key was new and has just been inserted.
+    Inserted(&'a mut V),
+    /// Key existed; the user-supplied closure was invoked.
+    Updated(&'a mut V),
+}
 
 /// Compute the xxh64 hash of a byte slice.
 #[inline]
@@ -179,6 +187,10 @@ pub struct DashTable<K, V> {
     depth: u32,
     /// Total entry count across all segments.
     len: usize,
+    /// Cumulative number of `split_segment` invocations since construction.
+    /// Used by perf-regression tests and `MEMORY DOCTOR` to verify pre-sizing
+    /// successfully eliminated split cost on production keyspaces.
+    split_count: u64,
 }
 
 impl<V> DashTable<CompactKey, V> {
@@ -191,20 +203,37 @@ impl<V> DashTable<CompactKey, V> {
             directory: vec![0],
             depth: 0,
             len: 0,
+            split_count: 0,
         }
     }
 
     /// Create a DashTable pre-sized for approximately `cap` entries.
+    ///
+    /// Allocates one extra depth level (2x segments) beyond the strict
+    /// `cap / LOAD_THRESHOLD` formula to absorb birthday-paradox hash
+    /// distribution variance. Without headroom, the most-loaded segment
+    /// can exceed `LOAD_THRESHOLD` under real xxh64 distribution at ~98%
+    /// fill, defeating the zero-split guarantee that pre-sizing exists
+    /// to provide.
     pub fn with_capacity(cap: usize) -> Self {
         if cap == 0 {
             return Self::new();
         }
         let num_segments = (cap + segment::LOAD_THRESHOLD - 1) / segment::LOAD_THRESHOLD;
-        let depth = if num_segments <= 1 {
+        let base_depth = if num_segments <= 1 {
             0
         } else {
             (num_segments as f64).log2().ceil() as u32
         };
+        // Add +1 depth level (2x segments) to absorb birthday-paradox tail:
+        // with N segments and M keys, the most-loaded segment has approximately
+        // M/N + sqrt(2 * M/N * ln(N)) entries. At base_depth the average load
+        // is close to LOAD_THRESHOLD, so the tail easily exceeds it. One extra
+        // depth level halves the average load, keeping the max well below the
+        // split threshold for production keyspace sizes (100K-10M keys).
+        // Cost: ~2x structural overhead (~22 KB per 1M hint), negligible vs
+        // the data itself and recouped by eliminating all split_segment CPU cost.
+        let depth = base_depth + 1;
         let dir_size = 1usize << depth;
         let mut segments = SegmentSlab::new();
         let mut directory = Vec::with_capacity(dir_size);
@@ -217,6 +246,7 @@ impl<V> DashTable<CompactKey, V> {
             directory,
             depth,
             len: 0,
+            split_count: 0,
         }
     }
 
@@ -236,6 +266,27 @@ impl<V> DashTable<CompactKey, V> {
     #[inline]
     pub fn segment_count(&self) -> usize {
         self.segments.len()
+    }
+
+    /// Total number of `split_segment` invocations since construction.
+    /// Used by perf-regression tests and `MEMORY DOCTOR` to verify pre-sizing
+    /// successfully eliminated split cost on production keyspaces.
+    #[inline]
+    pub fn split_count(&self) -> u64 {
+        self.split_count
+    }
+
+    /// Resident bytes used by the DashTable structural overhead (segments +
+    /// directory + index map). Does NOT include per-entry key/value data --
+    /// that is tracked separately by `Database::used_memory`.
+    ///
+    /// O(1): `segment_count * size_of::<Segment>() + directory.len() * 8 + index_map overhead`.
+    #[inline]
+    pub fn resident_bytes(&self) -> usize {
+        let seg_bytes = self.segments.len() * std::mem::size_of::<Segment<CompactKey, V>>();
+        let dir_bytes = self.directory.len() * std::mem::size_of::<usize>();
+        let idx_bytes = self.segments.len() * std::mem::size_of::<(u32, u32)>();
+        seg_bytes + dir_bytes + idx_bytes
     }
 
     /// Return an immutable reference to a segment by storage index.
@@ -319,6 +370,102 @@ impl<V> DashTable<CompactKey, V> {
         }
     }
 
+    /// Find OR insert in a single SIMD probe (vs two for `get_mut` + `insert`).
+    ///
+    /// On hit: `update(&mut existing)` runs in place; returns `Updated`.
+    /// On miss: `make_value()` produces the new value, then it's inserted at the
+    /// already-located free slot in the segment that was just probed.
+    ///
+    /// On `NeedsSplit`: split the segment, then retry. The segment helper returns
+    /// the unconsumed closures so we can reuse them after the split.
+    pub fn insert_or_update<F, G>(
+        &mut self,
+        key: CompactKey,
+        update: F,
+        make_value: G,
+    ) -> InsertOrUpdate<'_, V>
+    where
+        F: FnOnce(&mut V),
+        G: FnOnce() -> V,
+    {
+        let hash = hash_key(key.as_ref());
+        let dir_idx = segment_index(hash, self.depth);
+        let seg_idx = self.directory[dir_idx];
+
+        // Prefetch segment data while computing h2/home buckets
+        prefetch_segment(self.segments.get(seg_idx));
+
+        let h2_val = h2(hash);
+        let (ba, bb) = home_buckets(hash);
+
+        // The key_ref borrow must not overlap with the move into `make`.
+        // We pass key_lookup as &[u8] to the segment helper, and wrap `key`
+        // into the `make` closure so it's only consumed on miss.
+        // key.as_ref() returns &[u8] — we need to hold the borrow before
+        // moving key into the closure. Use a raw pointer to break the overlap.
+        let key_ptr = key.as_ref().as_ptr();
+        let key_len = key.as_ref().len();
+
+        let segment = self.segments.get_mut(seg_idx);
+        // SAFETY: key_ptr/key_len from key.as_ref() are valid for key's lifetime.
+        // key moves into `make` closure which runs AFTER the scan completes.
+        let key_lookup = unsafe { std::slice::from_raw_parts(key_ptr, key_len) };
+
+        let outcome = segment.insert_or_update_at(h2_val, key_lookup, ba, bb, update, move || {
+            (key, make_value())
+        });
+
+        match outcome {
+            SegmentInsertOrUpdate::Inserted { slot } => {
+                self.len += 1;
+                // SAFETY: just-inserted slot has a FULL ctrl byte and an initialized
+                // value (mirrors find at segment.rs:277 — FULL ctrl => values[slot]
+                // initialized).
+                InsertOrUpdate::Inserted(unsafe { self.segments.get_mut(seg_idx).value_mut(slot) })
+            }
+            SegmentInsertOrUpdate::Updated { slot } => {
+                // SAFETY: matched-and-updated slot has a FULL ctrl byte
+                // (mirrors find at segment.rs:277).
+                InsertOrUpdate::Updated(unsafe { self.segments.get_mut(seg_idx).value_mut(slot) })
+            }
+            SegmentInsertOrUpdate::NeedsSplit { update, make } => {
+                // Split the segment, then retry via the normal insert path.
+                // The closures were not consumed by the segment helper.
+                self.split_segment(dir_idx);
+
+                // After split, the directory may have doubled and the key now
+                // routes to a different segment. Recompute.
+                let new_dir_idx = segment_index(hash, self.depth);
+                let new_seg_idx = self.directory[new_dir_idx];
+                let new_segment = self.segments.get_mut(new_seg_idx);
+
+                let retry =
+                    new_segment.insert_or_update_at(h2_val, key_lookup, ba, bb, update, make);
+
+                match retry {
+                    SegmentInsertOrUpdate::Inserted { slot } => {
+                        self.len += 1;
+                        // SAFETY: just-inserted (mirrors find at segment.rs:277).
+                        InsertOrUpdate::Inserted(unsafe {
+                            self.segments.get_mut(new_seg_idx).value_mut(slot)
+                        })
+                    }
+                    SegmentInsertOrUpdate::Updated { slot } => {
+                        // SAFETY: matched-and-updated (mirrors find at segment.rs:277).
+                        InsertOrUpdate::Updated(unsafe {
+                            self.segments.get_mut(new_seg_idx).value_mut(slot)
+                        })
+                    }
+                    SegmentInsertOrUpdate::NeedsSplit { .. } => {
+                        // A single split guarantees room (LOAD_THRESHOLD < TOTAL_SLOTS
+                        // and split halves the load). This path should be unreachable.
+                        unreachable!("double NeedsSplit after split_segment")
+                    }
+                }
+            }
+        }
+    }
+
     /// Remove a key from the table. Returns `Some(value)` if the key existed.
     ///
     /// Matches HashMap's `remove` semantics: returns only the value, dropping the key.
@@ -392,6 +539,7 @@ impl<V> DashTable<CompactKey, V> {
     /// 2. If new segment's depth > global depth, double the directory
     /// 3. Update directory entries to point to the new segment
     fn split_segment(&mut self, dir_idx: usize) {
+        self.split_count += 1;
         let seg_store_idx = self.directory[dir_idx];
         let hasher = |k: &CompactKey| hash_key(k.as_ref());
         let new_seg = self.segments.get_mut(seg_store_idx).split(&hasher);
@@ -658,6 +806,39 @@ mod tests {
         let table: DashTable<CompactKey, String> = DashTable::with_capacity(1000);
         assert_eq!(table.len(), 0);
         assert!(table.is_empty());
+    }
+
+    #[test]
+    fn test_split_count_starts_at_zero() {
+        let table: DashTable<CompactKey, String> = DashTable::new();
+        assert_eq!(table.split_count(), 0);
+    }
+
+    #[test]
+    fn test_split_count_with_capacity_starts_at_zero() {
+        // Pre-sized allocation must NOT count as splits.
+        let table: DashTable<CompactKey, String> = DashTable::with_capacity(1_000_000);
+        assert_eq!(table.split_count(), 0);
+        assert!(
+            table.segment_count() > 1,
+            "with_capacity must allocate >1 segment for 1M hint"
+        );
+    }
+
+    #[test]
+    fn test_split_count_grows_under_load_without_capacity() {
+        let mut table: DashTable<CompactKey, String> = DashTable::new();
+        for i in 0..2000 {
+            table.insert(
+                CompactKey::from(format!("split_count_{:06}", i)),
+                format!("v_{}", i),
+            );
+        }
+        assert!(
+            table.split_count() > 0,
+            "Expected splits after 2000 inserts on a default-sized table; got {}",
+            table.split_count()
+        );
     }
 
     #[test]

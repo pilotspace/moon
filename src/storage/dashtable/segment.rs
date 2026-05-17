@@ -59,6 +59,22 @@ pub enum InsertResult<K, V> {
     NeedsSplit(K, V),
 }
 
+/// Result of `Segment::insert_or_update_at`. The DashTable layer translates
+/// this to `InsertOrUpdate<V>` after the slot lookup is borrow-checker-safe.
+///
+/// Generic over `F` and `G` so that on `NeedsSplit` the unconsumed closures
+/// are returned to the caller for retry after splitting.
+pub enum SegmentInsertOrUpdate<F, G> {
+    /// New entry written at this slot.
+    Inserted { slot: usize },
+    /// Existing entry at this slot was passed to the update closure.
+    Updated { slot: usize },
+    /// Segment is at LOAD_THRESHOLD and the key is new — caller must split & retry.
+    /// The unconsumed closures are returned so the caller can retry without
+    /// re-constructing them.
+    NeedsSplit { update: F, make: G },
+}
+
 /// A segment holding up to 60 key-value pairs with Swiss Table control bytes.
 ///
 /// Memory layout (cache-line optimized):
@@ -75,6 +91,13 @@ pub struct Segment<K, V> {
     // --- Cache line 1+: metadata ---
     count: u32,
     depth: u32,
+    /// True if any key was placed via the "any free slot" fallback path
+    /// during insert or split. When false, `find` can skip the expensive
+    /// fallback scan of non-home groups (PERF-09 optimization).
+    has_non_home_keys: bool,
+    /// Cumulative SIMD probe count for perf instrumentation (test-only).
+    #[cfg(test)]
+    probe_count: u32,
     // --- Remaining cache lines: key/value data (accessed only on H2 hit) ---
     keys: [MaybeUninit<K>; TOTAL_SLOTS],
     values: [MaybeUninit<V>; TOTAL_SLOTS],
@@ -128,6 +151,9 @@ impl<K, V> Segment<K, V> {
             ctrl,
             count: 0,
             depth,
+            has_non_home_keys: false,
+            #[cfg(test)]
+            probe_count: 0,
             keys,
             values,
         }
@@ -149,6 +175,14 @@ impl<K, V> Segment<K, V> {
     #[inline]
     pub fn is_full(&self) -> bool {
         self.count as usize >= LOAD_THRESHOLD
+    }
+
+    /// True if any key in this segment was placed in a non-home group via the
+    /// "any free slot" fallback path. When false, `find` can skip the fallback
+    /// scan of non-home groups entirely.
+    #[inline]
+    pub fn has_non_home_keys(&self) -> bool {
+        self.has_non_home_keys
     }
 
     /// Read the control byte at the given slot index.
@@ -335,6 +369,13 @@ impl<K, V> Segment<K, V> {
         // that is neither group_a nor group_b (overflow during high-occupancy
         // or split redistribution). Without this, get/get_mut would fail to
         // find a key that was legitimately inserted.
+        //
+        // PERF-09: Skip the fallback when has_non_home_keys is false — no key
+        // was ever placed in a non-home group, so the scan is guaranteed to
+        // find nothing. This eliminates 2 wasted SIMD probes on every miss.
+        if !self.has_non_home_keys {
+            return None;
+        }
         for g in 0..NUM_GROUPS {
             if g == group_a || g == group_b {
                 continue; // already checked above
@@ -490,9 +531,11 @@ impl<K, V> Segment<K, V> {
         // All slots examined, none free -- should not happen if count < LOAD_THRESHOLD
         // but possible if home groups and stash are all full while other groups have space.
         // Fall back: linear scan all slots for any free one.
+        // Mark that a key was placed in a non-home group so find() knows to scan all groups.
         for slot in 0..TOTAL_SLOTS {
             let ctrl = self.ctrl_byte(slot);
             if ctrl == EMPTY || ctrl == DELETED {
+                self.has_non_home_keys = true;
                 self.write_slot(slot, h2, key, value);
                 return InsertResult::Inserted;
             }
@@ -528,6 +571,339 @@ impl<K, V> Segment<K, V> {
         self.keys[slot] = MaybeUninit::new(key);
         self.values[slot] = MaybeUninit::new(value);
         self.count += 1;
+    }
+
+    /// Return the cumulative SIMD probe count (test-only instrumentation).
+    #[cfg(test)]
+    pub fn probe_count(&self) -> u32 {
+        self.probe_count
+    }
+
+    /// Increment the probe counter (test-only instrumentation).
+    #[cfg(test)]
+    #[inline]
+    fn bump_probe_count(&mut self) {
+        self.probe_count += 1;
+    }
+
+    /// No-op in non-test builds.
+    #[cfg(not(test))]
+    #[inline(always)]
+    fn bump_probe_count(&mut self) {}
+
+    /// Check if a key was placed in a non-home group (test-only perf attribution).
+    ///
+    /// Returns `Some(true)` if the key is found in a group that is NOT group_a,
+    /// group_b, or the stash — meaning `find` would need the fallback scan to
+    /// locate it. Returns `Some(false)` if found in a home group or stash,
+    /// `None` if the key is not found at all.
+    #[cfg(test)]
+    pub fn is_in_non_home_group<Q: ?Sized>(
+        &self,
+        h2: u8,
+        key: &Q,
+        bucket_a: usize,
+        bucket_b: usize,
+    ) -> Option<bool>
+    where
+        K: Borrow<Q>,
+        Q: Eq,
+    {
+        let group_a = bucket_a / 16;
+        let group_b = bucket_b / 16;
+
+        // Check group_a
+        let base_a = group_a * 16;
+        for slot in base_a..(base_a + 16).min(TOTAL_SLOTS) {
+            if self.ctrl_byte(slot) == h2 {
+                // SAFETY: ctrl byte matches h2 (FULL), so key is initialized.
+                let k = unsafe { self.keys[slot].assume_init_ref() };
+                if k.borrow() == key {
+                    return Some(false); // found in home group
+                }
+            }
+        }
+
+        // Check group_b
+        if group_b != group_a {
+            let base_b = group_b * 16;
+            for slot in base_b..(base_b + 16).min(TOTAL_SLOTS) {
+                if self.ctrl_byte(slot) == h2 {
+                    // SAFETY: ctrl byte matches h2 (a FULL value), so the slot is initialized.
+                    let k = unsafe { self.keys[slot].assume_init_ref() };
+                    if k.borrow() == key {
+                        return Some(false); // found in home group
+                    }
+                }
+            }
+        }
+
+        // Check stash
+        for slot in REGULAR_SLOTS..TOTAL_SLOTS {
+            if self.ctrl_byte(slot) == h2 {
+                // SAFETY: ctrl byte matches h2 (a FULL value), so the slot is initialized.
+                let k = unsafe { self.keys[slot].assume_init_ref() };
+                if k.borrow() == key {
+                    return Some(false); // found in stash (not fallback)
+                }
+            }
+        }
+
+        // Check remaining groups (fallback path)
+        for g in 0..NUM_GROUPS {
+            if g == group_a || g == group_b {
+                continue;
+            }
+            let base = g * 16;
+            for slot in base..(base + 16).min(REGULAR_SLOTS) {
+                if self.ctrl_byte(slot) == h2 {
+                    // SAFETY: ctrl byte matches h2 (a FULL value), so the slot is initialized.
+                    let k = unsafe { self.keys[slot].assume_init_ref() };
+                    if k.borrow() == key {
+                        return Some(true); // found in NON-home group (fallback required)
+                    }
+                }
+            }
+        }
+
+        None // not found
+    }
+
+    /// Single-probe find OR insert. Fuses the `find` + `insert` paths into a
+    /// single pass over the control byte groups, eliminating the redundant second
+    /// probe that `get_mut` + `insert` would perform on a miss.
+    ///
+    /// On hit: invokes `update(&mut existing_value)` in place.
+    /// On miss + room: calls `make()` to produce `(K, V)`, writes to a free slot.
+    /// On miss + full: returns `NeedsSplit` with the unconsumed closures.
+    ///
+    /// Hot path: one `match_h2` + one `match_empty_or_deleted` per group scanned.
+    #[allow(unused_unsafe)] // prefetch_ptr is unsafe on x86_64 but safe on aarch64
+    pub fn insert_or_update_at<Q: ?Sized, F, G>(
+        &mut self,
+        h2: u8,
+        key_lookup: &Q,
+        bucket_a: usize,
+        bucket_b: usize,
+        update: F,
+        make: G,
+    ) -> SegmentInsertOrUpdate<F, G>
+    where
+        K: Borrow<Q> + Eq,
+        Q: Eq,
+        F: FnOnce(&mut V),
+        G: FnOnce() -> (K, V),
+    {
+        // Track the first free slot found during our scan so we can reuse it on miss.
+        let mut first_free: Option<usize> = None;
+
+        // --- Group A: the home group for bucket_a ---
+        let group_a = bucket_a / 16;
+        let base_a = group_a * 16;
+
+        // SAFETY: group_a < NUM_GROUPS (bucket_a < REGULAR_SLOTS, 16 per group).
+        // SSE2 is baseline on x86_64; Group is 16-byte aligned and initialized.
+        #[cfg(target_arch = "x86_64")]
+        let mask_a = unsafe { self.ctrl[group_a].match_h2(h2) };
+        #[cfg(not(target_arch = "x86_64"))]
+        let mask_a = self.ctrl[group_a].match_h2(h2);
+        self.bump_probe_count();
+
+        // Prefetch key data for first h2 match
+        if let Some(first_pos) = mask_a.lowest_set_bit() {
+            let prefetch_slot = base_a + first_pos;
+            if prefetch_slot < TOTAL_SLOTS {
+                // SAFETY: prefetch_slot < TOTAL_SLOTS, so keys[prefetch_slot] is in bounds.
+                // Prefetch is a hint — no memory safety requirement on the data being initialized.
+                unsafe {
+                    prefetch_ptr(self.keys[prefetch_slot].as_ptr() as *const u8);
+                }
+            }
+        }
+
+        for pos in mask_a {
+            let slot = base_a + pos;
+            if slot < TOTAL_SLOTS {
+                // SAFETY: ctrl byte matches h2 (a FULL value), so the slot is initialized.
+                // Mirrors find at segment.rs:277.
+                let k = unsafe { self.keys[slot].assume_init_ref() };
+                if k.borrow() == key_lookup {
+                    // SAFETY: ctrl byte matches h2 and key compares equal (mirrors find at
+                    // segment.rs:277), so values[slot] is initialized.
+                    let v = unsafe { self.values[slot].assume_init_mut() };
+                    update(v);
+                    return SegmentInsertOrUpdate::Updated { slot };
+                }
+            }
+        }
+
+        // SAFETY: group_a < NUM_GROUPS. SSE2 is baseline on x86_64.
+        // Group is 16-byte aligned and initialized at segment creation.
+        #[cfg(target_arch = "x86_64")]
+        let free_mask_a = unsafe { self.ctrl[group_a].match_empty_or_deleted() };
+        #[cfg(not(target_arch = "x86_64"))]
+        let free_mask_a = self.ctrl[group_a].match_empty_or_deleted();
+        self.bump_probe_count();
+
+        if let Some(pos) = free_mask_a.lowest_set_bit() {
+            let slot = base_a + pos;
+            if slot < TOTAL_SLOTS && first_free.is_none() {
+                first_free = Some(slot);
+            }
+        }
+
+        // --- Group B: the home group for bucket_b (if different) ---
+        let group_b = bucket_b / 16;
+        if group_b != group_a {
+            let base_b = group_b * 16;
+
+            // SAFETY: group_b < NUM_GROUPS (bucket_b < REGULAR_SLOTS).
+            // SSE2 is baseline on x86_64; Group is 16-byte aligned and initialized.
+            #[cfg(target_arch = "x86_64")]
+            let mask_b = unsafe { self.ctrl[group_b].match_h2(h2) };
+            #[cfg(not(target_arch = "x86_64"))]
+            let mask_b = self.ctrl[group_b].match_h2(h2);
+            self.bump_probe_count();
+
+            if let Some(first_pos) = mask_b.lowest_set_bit() {
+                let prefetch_slot = base_b + first_pos;
+                if prefetch_slot < TOTAL_SLOTS {
+                    // SAFETY: prefetch_slot < TOTAL_SLOTS, so keys[prefetch_slot] is in bounds.
+                    // Prefetch is a hint — no memory safety requirement on the data being initialized.
+                    unsafe {
+                        prefetch_ptr(self.keys[prefetch_slot].as_ptr() as *const u8);
+                    }
+                }
+            }
+
+            for pos in mask_b {
+                let slot = base_b + pos;
+                if slot < TOTAL_SLOTS {
+                    // SAFETY: ctrl byte matches h2 (mirrors find at segment.rs:277).
+                    let k = unsafe { self.keys[slot].assume_init_ref() };
+                    if k.borrow() == key_lookup {
+                        // SAFETY: key match confirmed (mirrors find at segment.rs:277).
+                        let v = unsafe { self.values[slot].assume_init_mut() };
+                        update(v);
+                        return SegmentInsertOrUpdate::Updated { slot };
+                    }
+                }
+            }
+
+            // SAFETY: group_b < NUM_GROUPS. SSE2 is baseline on x86_64.
+            // Group is 16-byte aligned and initialized at segment creation.
+            #[cfg(target_arch = "x86_64")]
+            let free_mask_b = unsafe { self.ctrl[group_b].match_empty_or_deleted() };
+            #[cfg(not(target_arch = "x86_64"))]
+            let free_mask_b = self.ctrl[group_b].match_empty_or_deleted();
+            self.bump_probe_count();
+
+            if first_free.is_none() {
+                if let Some(pos) = free_mask_b.lowest_set_bit() {
+                    let slot = base_b + pos;
+                    if slot < TOTAL_SLOTS {
+                        first_free = Some(slot);
+                    }
+                }
+            }
+        }
+
+        // --- Stash slots (56..60): linear scan for h2 matches ---
+        for slot in REGULAR_SLOTS..TOTAL_SLOTS {
+            let ctrl = self.ctrl_byte(slot);
+            if ctrl == h2 {
+                // SAFETY: ctrl byte matches h2 (mirrors find at segment.rs:277).
+                let k = unsafe { self.keys[slot].assume_init_ref() };
+                if k.borrow() == key_lookup {
+                    // SAFETY: key match confirmed (mirrors find at segment.rs:277).
+                    let v = unsafe { self.values[slot].assume_init_mut() };
+                    update(v);
+                    return SegmentInsertOrUpdate::Updated { slot };
+                }
+            } else if (ctrl == EMPTY || ctrl == DELETED) && first_free.is_none() {
+                first_free = Some(slot);
+            }
+        }
+
+        // --- Fallback: scan remaining groups for h2 matches (rare overflow path) ---
+        // This handles keys placed in non-home groups during high occupancy or
+        // split redistribution (mirrors find at segment.rs:333-361).
+        //
+        // PERF-09: Skip when has_non_home_keys is false — no key was placed in a
+        // non-home group, so the scan cannot find a match. Still need to find a
+        // free slot for insertion below, but the home groups already provided one.
+        if self.has_non_home_keys {
+            for g in 0..NUM_GROUPS {
+                if g == group_a || g == group_b {
+                    continue;
+                }
+                let base = g * 16;
+
+                // SAFETY: g is bounded by NUM_GROUPS. SSE2 is baseline on x86_64.
+                // Group is 16-byte aligned and initialized at segment creation.
+                #[cfg(target_arch = "x86_64")]
+                let mask = unsafe { self.ctrl[g].match_h2(h2) };
+                #[cfg(not(target_arch = "x86_64"))]
+                let mask = self.ctrl[g].match_h2(h2);
+                self.bump_probe_count();
+
+                for pos in mask {
+                    let slot = base + pos;
+                    if slot < REGULAR_SLOTS {
+                        // SAFETY: ctrl byte matches h2 -> slot is initialized
+                        // (mirrors find at segment.rs:277).
+                        let k = unsafe { self.keys[slot].assume_init_ref() };
+                        if k.borrow() == key_lookup {
+                            // SAFETY: key match confirmed (mirrors find at segment.rs:277).
+                            let v = unsafe { self.values[slot].assume_init_mut() };
+                            update(v);
+                            return SegmentInsertOrUpdate::Updated { slot };
+                        }
+                    }
+                }
+
+                // Also check for free slots in fallback groups
+                if first_free.is_none() {
+                    // SAFETY: g is bounded by NUM_GROUPS. SSE2 is baseline on x86_64.
+                    // Group is 16-byte aligned and initialized at segment creation.
+                    #[cfg(target_arch = "x86_64")]
+                    let free_mask = unsafe { self.ctrl[g].match_empty_or_deleted() };
+                    #[cfg(not(target_arch = "x86_64"))]
+                    let free_mask = self.ctrl[g].match_empty_or_deleted();
+                    self.bump_probe_count();
+
+                    if let Some(pos) = free_mask.lowest_set_bit() {
+                        let slot = base + pos;
+                        if slot < TOTAL_SLOTS {
+                            first_free = Some(slot);
+                        }
+                    }
+                }
+            }
+        } // end PERF-09 has_non_home_keys guard
+
+        // --- Key not found: decide insert vs NeedsSplit ---
+        if self.is_full() {
+            return SegmentInsertOrUpdate::NeedsSplit { update, make };
+        }
+
+        // We have room. Use the first free slot found, or do a linear scan.
+        let free_slot = first_free.unwrap_or_else(|| {
+            // Last resort: linear scan for any free slot (should rarely happen
+            // since we scanned all groups above, but handles edge cases).
+            for slot in 0..TOTAL_SLOTS {
+                let ctrl = self.ctrl_byte(slot);
+                if ctrl == EMPTY || ctrl == DELETED {
+                    return slot;
+                }
+            }
+            // Should never reach here since !is_full() guarantees a free slot.
+            unreachable!("Segment not full but no free slot found")
+        });
+
+        let (k, v) = make();
+        self.write_slot(free_slot, h2, k, v);
+        SegmentInsertOrUpdate::Inserted { slot: free_slot }
     }
 
     /// Remove a key from the segment.
@@ -591,6 +967,8 @@ impl<K, V> Segment<K, V> {
             }
         }
         self.count = 0;
+        // Reset non-home-keys flag; insert_during_split will set it if needed.
+        self.has_non_home_keys = false;
 
         // Reset all control bytes to EMPTY for clean re-insertion
         for g in 0..NUM_GROUPS {
@@ -643,9 +1021,11 @@ impl<K, V> Segment<K, V> {
             }
         }
 
-        // Last resort: any free slot
+        // Last resort: any free slot (non-home placement)
+        // Mark the flag so find() knows it must scan all groups.
         for slot in 0..TOTAL_SLOTS {
             if self.ctrl_byte(slot) == EMPTY {
+                self.has_non_home_keys = true;
                 self.write_slot(slot, h2, key, value);
                 return;
             }
@@ -977,5 +1357,231 @@ mod tests {
             InsertResult::Replaced(_) => "Replaced",
             InsertResult::NeedsSplit(_, _) => "NeedsSplit",
         }
+    }
+
+    #[test]
+    fn test_segment_insert_or_update_at_inserts_new_key() {
+        let mut seg: Segment<Vec<u8>, String> = Segment::new(0);
+        let k = b"new_key".to_vec();
+        let hash = simple_hash(&k);
+        let h2_val = h2(hash);
+        let (ba, bb) = home_buckets(hash);
+
+        let mut update_called = false;
+        let result = seg.insert_or_update_at(
+            h2_val,
+            k.as_slice(),
+            ba,
+            bb,
+            |_v: &mut String| {
+                update_called = true;
+            },
+            || (k.clone(), "new_value".to_string()),
+        );
+        assert!(matches!(result, SegmentInsertOrUpdate::Inserted { .. }));
+        assert!(!update_called, "update closure must NOT run on miss");
+        assert_eq!(seg.count(), 1);
+        assert_eq!(
+            seg.get(h2_val, k.as_slice(), ba, bb),
+            Some(&"new_value".to_string())
+        );
+    }
+
+    #[test]
+    fn test_segment_insert_or_update_at_updates_existing_key() {
+        let mut seg: Segment<Vec<u8>, String> = Segment::new(0);
+        let k = b"existing".to_vec();
+        let hash = simple_hash(&k);
+        let h2_val = h2(hash);
+        let (ba, bb) = home_buckets(hash);
+        seg.insert(h2_val, k.clone(), "old".to_string(), ba, bb);
+
+        let mut make_called = false;
+        let result = seg.insert_or_update_at(
+            h2_val,
+            k.as_slice(),
+            ba,
+            bb,
+            |v: &mut String| *v = format!("{}_updated", v),
+            || {
+                make_called = true;
+                (k.clone(), "should_not_be_used".to_string())
+            },
+        );
+        assert!(matches!(result, SegmentInsertOrUpdate::Updated { .. }));
+        assert!(!make_called, "make closure must NOT run on hit");
+        assert_eq!(seg.count(), 1, "Updated must NOT grow count");
+        assert_eq!(
+            seg.get(h2_val, k.as_slice(), ba, bb),
+            Some(&"old_updated".to_string())
+        );
+    }
+
+    #[test]
+    fn test_segment_insert_or_update_at_returns_needs_split_on_full() {
+        let mut seg: Segment<Vec<u8>, u32> = Segment::new(0);
+        let mut inserted = 0u32;
+        for i in 0..LOAD_THRESHOLD as u32 {
+            let k = format!("k_{:04}", i).into_bytes();
+            let hash = simple_hash(&k);
+            let h2_val = h2(hash);
+            let (ba, bb) = home_buckets(hash);
+            match seg.insert(h2_val, k, i, ba, bb) {
+                InsertResult::Inserted => inserted += 1,
+                _ => break,
+            }
+        }
+        assert!(inserted >= 1);
+
+        // New key on a full segment must return NeedsSplit, NOT Inserted.
+        let new_k = b"trigger_split".to_vec();
+        let hash = simple_hash(&new_k);
+        let h2_val = h2(hash);
+        let (ba, bb) = home_buckets(hash);
+        let result = seg.insert_or_update_at(
+            h2_val,
+            new_k.as_slice(),
+            ba,
+            bb,
+            |_| panic!("update on miss-into-full"),
+            || (new_k.clone(), 999u32),
+        );
+        assert!(
+            matches!(result, SegmentInsertOrUpdate::NeedsSplit { .. }),
+            "Expected NeedsSplit on full segment with new key"
+        );
+    }
+
+    #[test]
+    fn test_segment_insert_or_update_at_updates_existing_on_full() {
+        // Even when the segment is at LOAD_THRESHOLD, updating an existing
+        // key must return Updated (NOT NeedsSplit).
+        let mut seg: Segment<Vec<u8>, u32> = Segment::new(0);
+        let target_key = b"update_me".to_vec();
+        let target_hash = simple_hash(&target_key);
+        let target_h2 = h2(target_hash);
+        let (target_ba, target_bb) = home_buckets(target_hash);
+        seg.insert(target_h2, target_key.clone(), 42, target_ba, target_bb);
+
+        // Fill the rest up to LOAD_THRESHOLD
+        let mut i = 0u32;
+        while (seg.count() as usize) < LOAD_THRESHOLD {
+            let k = format!("fill_{:06}", i).into_bytes();
+            let hash = simple_hash(&k);
+            let h2_val = h2(hash);
+            let (ba, bb) = home_buckets(hash);
+            seg.insert(h2_val, k, i, ba, bb);
+            i += 1;
+        }
+        assert!(seg.is_full());
+
+        // Update the existing key — must work even though segment is full
+        let result = seg.insert_or_update_at(
+            target_h2,
+            target_key.as_slice(),
+            target_ba,
+            target_bb,
+            |v| *v = 99,
+            || panic!("make should not be called on update"),
+        );
+        assert!(matches!(result, SegmentInsertOrUpdate::Updated { .. }));
+        assert_eq!(
+            seg.get(target_h2, target_key.as_slice(), target_ba, target_bb),
+            Some(&99)
+        );
+    }
+
+    #[test]
+    fn test_segment_insert_or_update_at_probes_at_most_two_groups_on_miss() {
+        // On an empty segment, insert_or_update_at should scan at most 2 groups
+        // for h2 + 2 for empty = 4 SIMD probes. With fallback groups it can go
+        // up to 6. Assert ≤ 6.
+        let mut seg: Segment<Vec<u8>, u32> = Segment::new(0);
+        let probes_before = seg.probe_count();
+        let k = b"probe_test".to_vec();
+        let hash = simple_hash(&k);
+        let h2_val = h2(hash);
+        let (ba, bb) = home_buckets(hash);
+        let _ = seg.insert_or_update_at(h2_val, k.as_slice(), ba, bb, |_| {}, || (k.clone(), 1u32));
+        let probes_after = seg.probe_count();
+        let delta = probes_after - probes_before;
+        assert!(
+            delta <= 6,
+            "insert_or_update_at on empty segment did {} SIMD probes; expected <= 6",
+            delta
+        );
+    }
+
+    #[test]
+    fn test_fallback_placement_ratio() {
+        // PERF-09 attribution: measure how many keys land in non-home groups
+        // (which require the expensive fallback scan in find).
+        // We fill a single segment to near LOAD_THRESHOLD and check each key.
+        let mut seg: Segment<Vec<u8>, u32> = Segment::new(0);
+        let mut keys_and_hashes: Vec<(Vec<u8>, u64)> = Vec::new();
+
+        for i in 0..LOAD_THRESHOLD {
+            let k = format!("fb_{:06}", i).into_bytes();
+            let hash = simple_hash(&k);
+            let h2_val = h2(hash);
+            let (ba, bb) = home_buckets(hash);
+            match seg.insert(h2_val, k.clone(), i as u32, ba, bb) {
+                InsertResult::Inserted => {
+                    keys_and_hashes.push((k, hash));
+                }
+                _ => break,
+            }
+        }
+
+        let total = keys_and_hashes.len();
+        let mut in_fallback = 0usize;
+        for (k, hash) in &keys_and_hashes {
+            let h2_val = h2(*hash);
+            let (ba, bb) = home_buckets(*hash);
+            if let Some(true) = seg.is_in_non_home_group(h2_val, k.as_slice(), ba, bb) {
+                in_fallback += 1;
+            }
+        }
+
+        let ratio = if total > 0 {
+            in_fallback as f64 / total as f64
+        } else {
+            0.0
+        };
+        eprintln!(
+            "[PERF-09 attribution] total={}, in_fallback={}, ratio={:.4} ({:.2}%)",
+            total,
+            in_fallback,
+            ratio,
+            ratio * 100.0
+        );
+        // This test is observational — it measures but does not assert a threshold.
+        // The ratio drives the fix selection in 189-03-INVESTIGATION.md.
+    }
+
+    #[test]
+    fn test_has_non_home_keys_starts_false() {
+        let seg: Segment<Vec<u8>, u32> = Segment::new(0);
+        assert!(
+            !seg.has_non_home_keys(),
+            "new segment must not have non-home keys"
+        );
+    }
+
+    #[test]
+    fn test_has_non_home_keys_stays_false_under_normal_insert() {
+        // Normal inserts at low load should never trigger the "any free slot" fallback.
+        let mut seg: Segment<Vec<u8>, u32> = Segment::new(0);
+        for i in 0..30u32 {
+            let k = format!("nhk_{:04}", i).into_bytes();
+            let hash = simple_hash(&k);
+            let h2_val = h2(hash);
+            let (ba, bb) = home_buckets(hash);
+            seg.insert(h2_val, k, i, ba, bb);
+        }
+        assert!(
+            !seg.has_non_home_keys(),
+            "30 inserts into 60-slot segment should not trigger non-home placement"
+        );
     }
 }

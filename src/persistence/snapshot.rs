@@ -27,10 +27,39 @@ use crate::storage::entry::{Entry, current_secs, current_time_ms};
 
 // Per-shard snapshot format constants
 const SHARD_RDB_MAGIC: &[u8] = b"RRDSHARD";
-const SHARD_RDB_VERSION: u8 = 1;
+
+/// Legacy format: magic(8) + version(1) + shard_id(2) + epoch(8) = 19 bytes preamble
+/// (plus eof(1) + global_crc(4) = 24 byte minimum file).
+const SHARD_RDB_VERSION_V1: u8 = 1;
+
+/// v0.2 PITR format: adds last_lsn(8) + created_at_unix_ms(8) after epoch.
+/// Preamble grows to 35 bytes (minimum file = 40 bytes with eof + crc).
+const SHARD_RDB_VERSION_V2: u8 = 2;
+
+/// Current write version. Bumping this changes on-disk format; the loader
+/// branches on the byte to remain backward-compatible with v1 snapshots.
+const SHARD_RDB_VERSION: u8 = SHARD_RDB_VERSION_V2;
+
 const EOF_MARKER: u8 = 0xFF;
 const SEGMENT_BLOCK_MARKER: u8 = 0xFD;
 const DB_SELECTOR: u8 = 0xFE;
+
+/// Snapshot header metadata, peekable without fully loading the file.
+///
+/// Used by P3 recovery to pick the snapshot whose `last_lsn <= target_lsn`
+/// without paying the cost of a full snapshot load.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnapshotMeta {
+    pub version: u8,
+    pub shard_id: u16,
+    pub epoch: u64,
+    /// LSN at which the snapshot was taken. 0 for legacy v1 snapshots
+    /// (forces full WAL replay — safe fallback).
+    pub last_lsn: u64,
+    /// Wall-clock when the snapshot finished, milliseconds since epoch.
+    /// 0 for legacy v1 snapshots.
+    pub created_at_unix_ms: u64,
+}
 
 /// State machine for cooperative segment-by-segment snapshot.
 ///
@@ -67,6 +96,12 @@ pub struct SnapshotState {
     header_written: bool,
     /// Whether we need to write a DB selector for the current database.
     db_selector_written: Vec<bool>,
+    /// WAL LSN at which this snapshot was taken (v0.2 PITR field).
+    /// 0 means "unknown — recovery should replay all WAL from origin".
+    /// Set via `set_last_lsn` before the first segment is serialized.
+    last_lsn: u64,
+    /// Wall-clock at snapshot construction, milliseconds since unix epoch (v0.2).
+    created_at_unix_ms: u64,
 }
 
 impl SnapshotState {
@@ -120,7 +155,36 @@ impl SnapshotState {
             file_path,
             header_written: false,
             db_selector_written: vec![false; num_databases],
+            last_lsn: 0,
+            created_at_unix_ms: current_time_ms() as u64,
         }
+    }
+
+    /// Stamp the WAL LSN at which this snapshot was taken.
+    ///
+    /// Called by the shard event loop before serialization starts, using
+    /// `ShardControlFile.wal_flush_lsn` as the source. Must be called before
+    /// `write_header_if_needed` (i.e. before any `advance_one_segment` call).
+    /// If not set, the header records `last_lsn = 0`, which downstream
+    /// recovery interprets as "replay all WAL from origin" — the safe fallback.
+    pub fn set_last_lsn(&mut self, lsn: u64) {
+        debug_assert!(
+            !self.header_written,
+            "set_last_lsn must be called before the snapshot header is written",
+        );
+        self.last_lsn = lsn;
+    }
+
+    /// Return the stamped LSN (0 if never set).
+    #[inline]
+    pub fn last_lsn(&self) -> u64 {
+        self.last_lsn
+    }
+
+    /// Return the snapshot's wall-clock creation time (unix ms).
+    #[inline]
+    pub fn created_at_unix_ms(&self) -> u64 {
+        self.created_at_unix_ms
     }
 
     /// Get the current database index being serialized.
@@ -186,11 +250,18 @@ impl SnapshotState {
 
     fn write_header_if_needed(&mut self) {
         if !self.header_written {
+            // Layout (v2):
+            //   magic(8) + version(1=v2) + shard_id(2) + epoch(8)
+            //   + last_lsn(8) + created_at_unix_ms(8) = 35 bytes preamble
             self.output_buf.extend_from_slice(SHARD_RDB_MAGIC);
             self.output_buf.push(SHARD_RDB_VERSION);
             self.output_buf
                 .extend_from_slice(&self.shard_id.to_le_bytes());
             self.output_buf.extend_from_slice(&self.epoch.to_le_bytes());
+            self.output_buf
+                .extend_from_slice(&self.last_lsn.to_le_bytes());
+            self.output_buf
+                .extend_from_slice(&self.created_at_unix_ms.to_le_bytes());
             self.header_written = true;
         }
     }
@@ -418,6 +489,95 @@ pub fn shard_snapshot_save(
     state.finalize()
 }
 
+/// Synchronous snapshot save that stamps a WAL LSN into the header.
+///
+/// This is the PITR-aware variant: pass `wal_flush_lsn` from the shard's
+/// control file so recovery can pick this snapshot for any target_lsn
+/// >= last_lsn. Equivalent to `shard_snapshot_save` for last_lsn = 0.
+pub fn shard_snapshot_save_with_lsn(
+    shard_id: u16,
+    epoch: u64,
+    last_lsn: u64,
+    databases: &[Database],
+    path: &Path,
+) -> Result<(), MoonError> {
+    let mut state = SnapshotState::new(shard_id, epoch, databases, path.to_path_buf());
+    state.set_last_lsn(last_lsn);
+    while !state.advance_one_segment(databases) {}
+    state.finalize()
+}
+
+/// Peek at a snapshot file's header without fully loading it.
+///
+/// Returns the version, shard_id, epoch, last_lsn, and created_at_unix_ms.
+/// Used by P3 recovery to enumerate available snapshots and pick the one
+/// with the highest `last_lsn` that is still `<= target_lsn`.
+///
+/// Does NOT verify the global CRC32 — that's only meaningful when the full
+/// payload is being loaded. Header bytes are integrity-checked by the magic
+/// + version validation; corrupt headers return `Corrupted` errors.
+pub fn read_snapshot_metadata(path: &Path) -> Result<SnapshotMeta, MoonError> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).map_err(|e| SnapshotError::Io {
+        path: path.to_path_buf(),
+        source: e,
+    })?;
+    // v2 preamble is 35 bytes — read up to that.
+    let mut buf = [0u8; 35];
+    let n = file.read(&mut buf).map_err(|e| SnapshotError::Io {
+        path: path.to_path_buf(),
+        source: e,
+    })?;
+    if n < 19 {
+        return Err(SnapshotError::Corrupted {
+            detail: format!("snapshot header truncated: {} bytes", n),
+        }
+        .into());
+    }
+    if &buf[0..8] != SHARD_RDB_MAGIC {
+        return Err(SnapshotError::Corrupted {
+            detail: "invalid RRDSHARD magic header".into(),
+        }
+        .into());
+    }
+    let version = buf[8];
+    if version != SHARD_RDB_VERSION_V1 && version != SHARD_RDB_VERSION_V2 {
+        return Err(SnapshotError::VersionMismatch {
+            expected: SHARD_RDB_VERSION as u32,
+            actual: version as u32,
+        }
+        .into());
+    }
+    let shard_id = u16::from_le_bytes([buf[9], buf[10]]);
+    let epoch = u64::from_le_bytes([
+        buf[11], buf[12], buf[13], buf[14], buf[15], buf[16], buf[17], buf[18],
+    ]);
+    let (last_lsn, created_at_unix_ms) = if version == SHARD_RDB_VERSION_V2 {
+        if n < 35 {
+            return Err(SnapshotError::Corrupted {
+                detail: format!("v2 snapshot header truncated: {} bytes", n),
+            }
+            .into());
+        }
+        let lsn = u64::from_le_bytes([
+            buf[19], buf[20], buf[21], buf[22], buf[23], buf[24], buf[25], buf[26],
+        ]);
+        let ts = u64::from_le_bytes([
+            buf[27], buf[28], buf[29], buf[30], buf[31], buf[32], buf[33], buf[34],
+        ]);
+        (lsn, ts)
+    } else {
+        (0u64, 0u64)
+    };
+    Ok(SnapshotMeta {
+        version,
+        shard_id,
+        epoch,
+        last_lsn,
+        created_at_unix_ms,
+    })
+}
+
 /// Load a per-shard snapshot file and populate databases. Returns total keys loaded.
 ///
 /// Reads RRDSHARD format with per-segment CRC32 verification.
@@ -431,7 +591,10 @@ pub fn shard_snapshot_load(databases: &mut [Database], path: &Path) -> Result<us
         source: e,
     })?;
 
-    // Minimum size: magic(8) + version(1) + shard_id(2) + epoch(8) + eof(1) + global_crc(4) = 24
+    // Minimum size depends on version, but every valid file is at least 24 bytes:
+    //   v1 preamble(19) + eof(1) + global_crc(4) = 24
+    //   v2 preamble(35) + eof(1) + global_crc(4) = 40
+    // We re-check the precise bound after reading the version byte below.
     if data.len() < 24 {
         return Err(SnapshotError::Corrupted {
             detail: "snapshot file too small".into(),
@@ -477,7 +640,7 @@ pub fn shard_snapshot_load(databases: &mut [Database], path: &Path) -> Result<us
         .into());
     }
 
-    // Verify version
+    // Verify version (accept both v1 and v2 — branch later).
     let mut version = [0u8; 1];
     cursor
         .read_exact(&mut version)
@@ -485,10 +648,28 @@ pub fn shard_snapshot_load(databases: &mut [Database], path: &Path) -> Result<us
             path: path.to_path_buf(),
             source: e,
         })?;
-    if version[0] != SHARD_RDB_VERSION {
+    let on_disk_version = version[0];
+    if on_disk_version != SHARD_RDB_VERSION_V1 && on_disk_version != SHARD_RDB_VERSION_V2 {
         return Err(SnapshotError::VersionMismatch {
             expected: SHARD_RDB_VERSION as u32,
-            actual: version[0] as u32,
+            actual: on_disk_version as u32,
+        }
+        .into());
+    }
+    // Enforce the per-version minimum file size now that we know the version.
+    let min_file_size = match on_disk_version {
+        SHARD_RDB_VERSION_V1 => 24, // 19 preamble + 1 eof + 4 crc
+        SHARD_RDB_VERSION_V2 => 40, // 35 preamble + 1 eof + 4 crc
+        _ => 24,
+    };
+    if data.len() < min_file_size {
+        return Err(SnapshotError::Corrupted {
+            detail: format!(
+                "snapshot file too small for v{}: {} bytes < {}",
+                on_disk_version,
+                data.len(),
+                min_file_size
+            ),
         }
         .into());
     }
@@ -511,6 +692,29 @@ pub fn shard_snapshot_load(databases: &mut [Database], path: &Path) -> Result<us
             source: e,
         })?;
     let _epoch = u64::from_le_bytes(epoch_buf);
+
+    // v2 extra fields: last_lsn + created_at_unix_ms. v1 snapshots leave these
+    // implicit zeros — recovery treats `last_lsn = 0` as "replay all WAL from
+    // origin", which is the lossless fallback for legacy files.
+    let (_last_lsn, _created_at_unix_ms) = if on_disk_version == SHARD_RDB_VERSION_V2 {
+        let mut lsn_buf = [0u8; 8];
+        cursor
+            .read_exact(&mut lsn_buf)
+            .map_err(|e| SnapshotError::Io {
+                path: path.to_path_buf(),
+                source: e,
+            })?;
+        let mut ts_buf = [0u8; 8];
+        cursor
+            .read_exact(&mut ts_buf)
+            .map_err(|e| SnapshotError::Io {
+                path: path.to_path_buf(),
+                source: e,
+            })?;
+        (u64::from_le_bytes(lsn_buf), u64::from_le_bytes(ts_buf))
+    } else {
+        (0u64, 0u64)
+    };
 
     let now_ms = current_time_ms();
     let mut total_keys = 0usize;
@@ -666,6 +870,88 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("dump.rrdshard");
         (dir, path)
+    }
+
+    /// P2 — v2 snapshot header round-trip: stamp last_lsn + created_at,
+    /// reload via the metadata peek API, and verify the fields survive.
+    #[test]
+    fn test_snapshot_v2_header_roundtrip() {
+        let (_dir, path) = snap_path();
+        let dbs = vec![Database::new()];
+
+        // Save with last_lsn = 12345 stamped in.
+        shard_snapshot_save_with_lsn(7, 42, 12345, &dbs, &path).unwrap();
+
+        // Peek metadata only — must report v2 and the stamped LSN.
+        let meta = read_snapshot_metadata(&path).expect("metadata read");
+        assert_eq!(meta.version, SHARD_RDB_VERSION_V2);
+        assert_eq!(meta.shard_id, 7);
+        assert_eq!(meta.epoch, 42);
+        assert_eq!(meta.last_lsn, 12345);
+        assert!(
+            meta.created_at_unix_ms > 0,
+            "v2 must stamp a non-zero created_at_unix_ms",
+        );
+
+        // Full load must still work.
+        let mut loaded = vec![Database::new()];
+        let _ = shard_snapshot_load(&mut loaded, &path).unwrap();
+    }
+
+    /// P2 — v1 backward compat: hand-build a v1 (24-byte minimum) snapshot
+    /// file and confirm both the loader and metadata-peek API accept it,
+    /// reporting last_lsn = 0 as the lossless fallback.
+    #[test]
+    fn test_v1_snapshot_loads_with_zero_lsn() {
+        use crc32fast::Hasher;
+        let (_dir, path) = snap_path();
+
+        // Build the minimum-valid v1 file: preamble + eof + global_crc.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(SHARD_RDB_MAGIC);
+        buf.push(SHARD_RDB_VERSION_V1);
+        buf.extend_from_slice(&3u16.to_le_bytes()); // shard_id
+        buf.extend_from_slice(&99u64.to_le_bytes()); // epoch
+        buf.push(EOF_MARKER);
+        let mut hasher = Hasher::new();
+        hasher.update(&buf);
+        let crc = hasher.finalize();
+        buf.extend_from_slice(&crc.to_le_bytes());
+        std::fs::write(&path, &buf).unwrap();
+
+        // Metadata peek must succeed and synthesize last_lsn = 0.
+        let meta = read_snapshot_metadata(&path).expect("v1 metadata read");
+        assert_eq!(meta.version, SHARD_RDB_VERSION_V1);
+        assert_eq!(meta.shard_id, 3);
+        assert_eq!(meta.epoch, 99);
+        assert_eq!(
+            meta.last_lsn, 0,
+            "v1 fallback must report last_lsn = 0 (forces full WAL replay)",
+        );
+        assert_eq!(meta.created_at_unix_ms, 0);
+
+        // Full load on a (degenerate) v1 file must also succeed without error.
+        let mut loaded = vec![Database::new()];
+        let count = shard_snapshot_load(&mut loaded, &path).unwrap();
+        assert_eq!(count, 0);
+    }
+
+    /// P2 — `set_last_lsn` must be observable via `last_lsn()` and reflected
+    /// in the on-disk header so P3 recovery can read it back without loading
+    /// the full payload.
+    #[test]
+    fn test_set_last_lsn_persists_in_header() {
+        let (_dir, path) = snap_path();
+        let dbs = vec![Database::new()];
+
+        let mut state = SnapshotState::new(2, 1, &dbs, path.clone());
+        state.set_last_lsn(987_654);
+        assert_eq!(state.last_lsn(), 987_654);
+        while !state.advance_one_segment(&dbs) {}
+        state.finalize().unwrap();
+
+        let meta = read_snapshot_metadata(&path).unwrap();
+        assert_eq!(meta.last_lsn, 987_654);
     }
 
     #[test]

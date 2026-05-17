@@ -5,7 +5,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use metrics::{counter, gauge, histogram};
+use metrics::{Unit, counter, describe_gauge, gauge, histogram};
 
 static METRICS_INITIALIZED: AtomicBool = AtomicBool::new(false);
 static SERVER_READY: AtomicBool = AtomicBool::new(false);
@@ -88,9 +88,40 @@ pub fn init_metrics(
             #[cfg(feature = "console")]
             rate_limit_burst,
         );
+        // Register per-subsystem memory gauge and prime all 7 labels so
+        // disabled subsystems still surface a zero-valued series.
+        describe_gauge!(
+            "moon_memory_bytes",
+            Unit::Bytes,
+            "Resident bytes per subsystem; sum approximates RSS"
+        );
+        prime_moon_memory_bytes();
+
         Some(ready)
     } else {
         None
+    }
+}
+
+/// Prime all 7 `moon_memory_bytes{kind=...}` series with `0.0` so they
+/// appear in `/metrics` output from the first scrape, even when subsystems
+/// are feature-gated off or not yet initialized.
+///
+/// NOTE: This scrape path intentionally does NOT call `mallctl("epoch")`.
+/// See the documented jemalloc leak at the `get_rss_bytes()` doc-comment
+/// (~1 MB / 20 s growth). `allocator_overhead` is computed as
+/// `max(0, RSS − sum(other 6))` — the same formula MEMORY DOCTOR uses.
+fn prime_moon_memory_bytes() {
+    for kind in [
+        "dashtable",
+        "hnsw",
+        "csr",
+        "wal",
+        "sealed",
+        "replication_backlog",
+        "allocator_overhead",
+    ] {
+        gauge!("moon_memory_bytes", "kind" => kind).set(0.0);
     }
 }
 
@@ -854,23 +885,33 @@ fn page_size_cached() -> u64 {
 /// Returns bytes, or 0 on failure.
 #[cfg(target_os = "macos")]
 pub fn get_rss_bytes() -> u64 {
+    macos_task_memory_info().1
+}
+
+/// Returns (virtual_size, resident_size) for the current process on macOS.
+///
+/// Tries `MACH_TASK_BASIC_INFO` (flavor 20) first; falls back to
+/// `TASK_VM_INFO` (flavor 22) which is available on macOS 10.9+ and works
+/// on all tested kernel versions including 24.x (Sequoia).
+#[cfg(target_os = "macos")]
+pub fn macos_task_memory_info() -> (u64, u64) {
     // Mach kernel API types and functions for querying task memory info.
     // SAFETY: These are stable Mach kernel ABI functions available on all macOS versions.
     unsafe extern "C" {
         fn mach_task_self() -> u32;
         fn task_info(target: u32, flavor: u32, info: *mut u8, count: *mut u32) -> i32;
     }
-    // MACH_TASK_BASIC_INFO flavor returns mach_task_basic_info_data_t.
-    // Layout (aarch64/x86_64): policy(i32), pad(i32), virtual_size(u64),
-    //   resident_size(u64), ... Total size = 10 natural_t (40 bytes).
+
+    // ── Try MACH_TASK_BASIC_INFO (flavor 20) ─────────────────────────────
+    // Layout: policy(i32), pad(i32), virtual_size(u64), resident_size(u64), ...
+    // Total = 10 natural_t (40 bytes).
     const MACH_TASK_BASIC_INFO: u32 = 20;
     const MACH_TASK_BASIC_INFO_COUNT: u32 = 10;
 
-    let mut info = [0u8; 40]; // 10 × sizeof(natural_t) = 40 bytes
+    let mut info = [0u8; 40];
     let mut count = MACH_TASK_BASIC_INFO_COUNT;
-    // SAFETY: mach_task_self() always returns the current task port.
-    // task_info writes at most `count` natural_t values into `info`.
-    // info is 40 bytes = exactly MACH_TASK_BASIC_INFO_COUNT × 4.
+    // SAFETY: mach_task_self() returns current task port. info is 40 bytes,
+    // task_info writes at most `count` natural_t values.
     let kr = unsafe {
         task_info(
             mach_task_self(),
@@ -880,12 +921,35 @@ pub fn get_rss_bytes() -> u64 {
         )
     };
     if kr == 0 {
-        // KERN_SUCCESS: resident_size is at byte offset 16 (u64).
-        // SAFETY: info is 40 bytes, reading 8 bytes at offset 16 is in bounds.
-        u64::from_ne_bytes(info[16..24].try_into().unwrap_or([0; 8]))
-    } else {
-        0
+        let vsz = u64::from_ne_bytes(info[8..16].try_into().unwrap_or([0; 8]));
+        let rss = u64::from_ne_bytes(info[16..24].try_into().unwrap_or([0; 8]));
+        return (vsz, rss);
     }
+
+    // ── Fallback: TASK_VM_INFO (flavor 22) ───────────────────────────────
+    // Available macOS 10.9+. Layout: virtual_size(u64) at offset 0,
+    // phys_footprint(u64) at offset 16. Count = 68 natural_t (272 bytes).
+    const TASK_VM_INFO: u32 = 22;
+    const TASK_VM_INFO_COUNT: u32 = 68;
+
+    let mut vm_info = [0u8; 272];
+    let mut vm_count = TASK_VM_INFO_COUNT;
+    // SAFETY: vm_info is 272 bytes = TASK_VM_INFO_COUNT × 4.
+    let kr2 = unsafe {
+        task_info(
+            mach_task_self(),
+            TASK_VM_INFO,
+            vm_info.as_mut_ptr(),
+            &mut vm_count,
+        )
+    };
+    if kr2 == 0 {
+        let vsz = u64::from_ne_bytes(vm_info[0..8].try_into().unwrap_or([0; 8]));
+        let rss = u64::from_ne_bytes(vm_info[16..24].try_into().unwrap_or([0; 8]));
+        return (vsz, rss);
+    }
+
+    (0, 0)
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -948,6 +1012,13 @@ pub fn set_global_repl_state(
     let _ = GLOBAL_REPL_STATE.set(state);
 }
 
+/// Get the raw global replication state Arc (for MEMORY DOCTOR backlog query).
+/// Returns None before replication is initialized.
+pub fn get_global_repl_state_arc()
+-> Option<&'static std::sync::Arc<std::sync::RwLock<crate::replication::state::ReplicationState>>> {
+    GLOBAL_REPL_STATE.get()
+}
+
 /// Get replication info for INFO command: (role, connected_slaves, master_repl_offset, repl_id).
 /// Also updates the Prometheus replication lag gauge as a side-effect.
 pub fn get_replication_info() -> (&'static str, usize, u64, String) {
@@ -981,6 +1052,27 @@ pub fn get_replication_info() -> (&'static str, usize, u64, String) {
         }
     }
     ("master", 0, 0, "0".repeat(40))
+}
+
+// ── Global ShardDatabases (for MEMORY DOCTOR / Prometheus per-kind) ───
+
+static GLOBAL_SHARD_DBS: once_cell::sync::OnceCell<
+    std::sync::Weak<crate::shard::shared_databases::ShardDatabases>,
+> = once_cell::sync::OnceCell::new();
+
+/// Register the global ShardDatabases handle for admin commands.
+/// Called once from main after ShardDatabases::new().
+pub fn set_global_shard_databases(
+    dbs: &std::sync::Arc<crate::shard::shared_databases::ShardDatabases>,
+) {
+    let _ = GLOBAL_SHARD_DBS.set(std::sync::Arc::downgrade(dbs));
+}
+
+/// Get the global ShardDatabases handle (returns None before server init
+/// or after shutdown when the Arc has been dropped).
+pub fn get_global_shard_databases()
+-> Option<std::sync::Arc<crate::shard::shared_databases::ShardDatabases>> {
+    GLOBAL_SHARD_DBS.get().and_then(|w| w.upgrade())
 }
 
 // ── Global SLOWLOG ─────────────────────────────────────────────────────
@@ -1052,6 +1144,102 @@ pub fn spawn_metrics_publisher() {
             let _ = sender.send(event);
         }
     });
+}
+
+// ── Per-subsystem memory gauge publisher ─────────────────────────────
+
+/// Spawn a background task that updates the `moon_memory_bytes{kind=...}`
+/// gauge every 15 seconds from the `resident_bytes()` accessors added in
+/// Phase 190-01.
+///
+/// Must be called from within a tokio runtime context (the admin-http
+/// thread). Requires `set_global_shard_databases()` to have been called
+/// first — the function tolerates a missing handle by emitting 0 for all
+/// subsystem kinds until the global is registered.
+///
+/// NOTE: This loop does NOT call `mallctl("epoch")` — see the documented
+/// jemalloc leak at `get_rss_bytes()` (~1 MB / 20 s). `allocator_overhead`
+/// is computed as `max(0, RSS − sum(other 6))`, the same formula MEMORY
+/// DOCTOR uses.
+pub fn spawn_moon_memory_publisher() {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
+
+        loop {
+            interval.tick().await;
+
+            if !METRICS_INITIALIZED.load(Ordering::Relaxed) {
+                continue;
+            }
+
+            update_moon_memory_bytes();
+        }
+    });
+}
+
+/// Collect per-subsystem resident bytes and emit all 7
+/// `moon_memory_bytes{kind=...}` series plus `moon_rss_bytes`.
+///
+/// Called every 15 s by `spawn_moon_memory_publisher`. Allocation-free in
+/// the steady state — all label values are `&'static str`.
+fn update_moon_memory_bytes() {
+    let rss = get_rss_bytes() as usize;
+
+    let mut dashtable: usize = 0;
+    let mut hnsw: usize = 0;
+    let mut sealed: usize = 0;
+    #[cfg_attr(not(feature = "graph"), allow(unused_mut))]
+    let mut csr: usize = 0;
+    let wal: usize = 0; // WalWriterV3 is stack-owned; not reachable here
+    let mut backlog: usize = 0;
+
+    if let Some(shard_dbs) = get_global_shard_databases() {
+        let num_shards = shard_dbs.num_shards();
+        for shard_id in 0..num_shards {
+            // Database + DashTable (DB 0 — the hot database)
+            let db_guard = shard_dbs.read_db(shard_id, 0);
+            dashtable += db_guard.resident_bytes();
+            dashtable += db_guard.data().resident_bytes();
+            drop(db_guard);
+
+            // VectorStore: (mutable/hnsw, immutable/sealed)
+            let vs = shard_dbs.vector_store(shard_id);
+            let (m, i) = vs.resident_bytes();
+            hnsw += m;
+            sealed += i;
+            drop(vs);
+
+            // GraphStore (CSR)
+            #[cfg(feature = "graph")]
+            {
+                let gs = shard_dbs.graph_store_read(shard_id);
+                csr += gs.resident_bytes();
+            }
+        }
+    }
+
+    // Replication backlog via global state.
+    if let Some(state) = get_global_repl_state_arc() {
+        if let Ok(guard) = state.read() {
+            backlog = guard.backlog_resident_bytes();
+        }
+    }
+
+    let other_sum = dashtable + hnsw + csr + wal + sealed + backlog;
+    let alloc_overhead = rss.saturating_sub(other_sum);
+
+    gauge!("moon_memory_bytes", "kind" => "dashtable").set(dashtable as f64);
+    gauge!("moon_memory_bytes", "kind" => "hnsw").set(hnsw as f64);
+    gauge!("moon_memory_bytes", "kind" => "csr").set(csr as f64);
+    gauge!("moon_memory_bytes", "kind" => "wal").set(wal as f64);
+    gauge!("moon_memory_bytes", "kind" => "sealed").set(sealed as f64);
+    gauge!("moon_memory_bytes", "kind" => "replication_backlog").set(backlog as f64);
+    gauge!("moon_memory_bytes", "kind" => "allocator_overhead").set(alloc_overhead as f64);
+
+    // Update the existing RSS gauge in the same snapshot so the integration
+    // test can compare moon_memory_bytes sum against moon_rss_bytes from the
+    // same scrape (no drift between separate reads).
+    update_rss_bytes(rss as u64);
 }
 
 #[cfg(test)]

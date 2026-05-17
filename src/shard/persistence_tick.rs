@@ -28,6 +28,7 @@ pub(crate) fn handle_pending_snapshot(
     shard_databases: &Arc<ShardDatabases>,
     disk_offload_dir: Option<&std::path::Path>,
     shard_id: usize,
+    wal_last_lsn: u64,
 ) {
     if let Some((epoch, snap_dir, reply_tx)) = pending {
         if snapshot_state.is_some() {
@@ -42,14 +43,21 @@ pub(crate) fn handle_pending_snapshot(
             };
             let (segment_counts, base_timestamps) = shard_databases.snapshot_metadata(shard_id);
             let db_count = shard_databases.db_count();
-            *snapshot_state = Some(SnapshotState::new_from_metadata(
+            let mut state = SnapshotState::new_from_metadata(
                 shard_id as u16,
                 epoch,
                 db_count,
                 segment_counts,
                 base_timestamps,
                 snap_path,
-            ));
+            );
+            // P3c — stamp the WAL LSN so PITR can pick this snapshot as a
+            // valid replay base. 0 means "no WAL writer active" (e.g. pure
+            // RDB mode) — header records 0, recovery falls back to full replay.
+            if wal_last_lsn > 0 {
+                state.set_last_lsn(wal_last_lsn);
+            }
+            *snapshot_state = Some(state);
             *snapshot_reply_tx = Some(reply_tx);
         }
     }
@@ -66,6 +74,7 @@ pub(crate) fn check_auto_save_trigger(
     persistence_dir: &Option<String>,
     disk_offload_dir: Option<&std::path::Path>,
     shard_id: usize,
+    wal_last_lsn: u64,
 ) {
     let new_epoch = snapshot_trigger_rx.borrow();
     if new_epoch > *last_snapshot_epoch && snapshot_state.is_none() {
@@ -82,14 +91,19 @@ pub(crate) fn check_auto_save_trigger(
             };
             let (segment_counts, base_timestamps) = shard_databases.snapshot_metadata(shard_id);
             let db_count = shard_databases.db_count();
-            *snapshot_state = Some(SnapshotState::new_from_metadata(
+            let mut state = SnapshotState::new_from_metadata(
                 shard_id as u16,
                 new_epoch,
                 db_count,
                 segment_counts,
                 base_timestamps,
                 snap_path,
-            ));
+            );
+            // P3c — stamp the WAL LSN before the header is written.
+            if wal_last_lsn > 0 {
+                state.set_last_lsn(wal_last_lsn);
+            }
+            *snapshot_state = Some(state);
         }
     }
 }
@@ -961,5 +975,98 @@ mod tests {
             0,
             "All dirty pages should be flushed even without FPI"
         );
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // P3c — snapshot LSN stamping
+    // ──────────────────────────────────────────────────────────────────
+
+    use crate::runtime::channel;
+    use crate::shard::shared_databases::ShardDatabases;
+    use crate::storage::Database;
+
+    /// P3c — pending BGSAVE captures the WAL LSN into the new SnapshotState.
+    #[test]
+    fn test_handle_pending_snapshot_stamps_wal_lsn() {
+        let tmp = tempfile::tempdir().unwrap();
+        let snap_dir = tmp.path().to_path_buf();
+        let dbs = vec![vec![Database::new()]];
+        let shared = ShardDatabases::new(dbs);
+
+        let (tx, _rx) = channel::oneshot::<Result<(), String>>();
+        let mut snapshot_state: Option<SnapshotState> = None;
+        let mut reply_tx: Option<channel::OneshotSender<Result<(), String>>> = None;
+
+        handle_pending_snapshot(
+            Some((7, snap_dir.clone(), tx)),
+            &mut snapshot_state,
+            &mut reply_tx,
+            &shared,
+            None,
+            0,
+            12_345,
+        );
+
+        let s = snapshot_state.as_ref().expect("snapshot state created");
+        assert_eq!(s.last_lsn(), 12_345);
+        assert_eq!(s.epoch, 7);
+    }
+
+    /// P3c — wal_last_lsn == 0 (no WAL writer) leaves last_lsn at 0 — the
+    /// "unknown provenance" sentinel PITR conservatively skips.
+    #[test]
+    fn test_handle_pending_snapshot_zero_lsn_is_unknown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dbs = vec![vec![Database::new()]];
+        let shared = ShardDatabases::new(dbs);
+
+        let (tx, _rx) = channel::oneshot::<Result<(), String>>();
+        let mut snapshot_state: Option<SnapshotState> = None;
+        let mut reply_tx: Option<channel::OneshotSender<Result<(), String>>> = None;
+
+        handle_pending_snapshot(
+            Some((1, tmp.path().to_path_buf(), tx)),
+            &mut snapshot_state,
+            &mut reply_tx,
+            &shared,
+            None,
+            0,
+            0,
+        );
+
+        assert_eq!(snapshot_state.as_ref().unwrap().last_lsn(), 0);
+    }
+
+    /// P3c — auto-save trigger fires snapshot creation with stamped LSN.
+    #[test]
+    fn test_check_auto_save_trigger_stamps_wal_lsn() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_string_lossy().to_string();
+        let dbs = vec![vec![Database::new()]];
+        let shared = ShardDatabases::new(dbs);
+
+        // Trigger goes from epoch 0 → 5; helper observes 5 > last(0) and
+        // creates a snapshot state.
+        let (trigger_tx, trigger_rx) = channel::watch::<u64>(0);
+        let _ = trigger_tx.send(5);
+
+        let mut last_epoch: u64 = 0;
+        let mut snapshot_state: Option<SnapshotState> = None;
+
+        check_auto_save_trigger(
+            &trigger_rx,
+            &mut last_epoch,
+            &mut snapshot_state,
+            &shared,
+            &Some(dir),
+            None,
+            0,
+            999,
+        );
+
+        let s = snapshot_state.as_ref().expect("auto-save created state");
+        assert_eq!(s.last_lsn(), 999);
+        assert_eq!(s.epoch, 5);
+        assert_eq!(last_epoch, 5);
     }
 }

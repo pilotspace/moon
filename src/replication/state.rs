@@ -1,7 +1,7 @@
 use bytes::Bytes;
 use rand::RngExt;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 pub use crate::replication::handshake::ReplicaHandshakeState;
 
@@ -26,6 +26,10 @@ pub struct ReplicationState {
     /// arrives (REPLCONF). When `None`, write-path append is a single branch
     /// with no lock acquisition.
     pub per_shard_backlogs: Vec<SharedBacklog>,
+    /// Lock-free mirror of `role == Replica { .. }` so per-command
+    /// `try_enforce_readonly` can avoid taking the surrounding RwLock.
+    /// Invariant: written by `set_role()` whenever `role` changes.
+    pub is_replica_mirror: Arc<AtomicBool>,
 }
 
 pub enum ReplicationRole {
@@ -60,7 +64,21 @@ impl ReplicationState {
             per_shard_backlogs: (0..num_shards)
                 .map(|_| Arc::new(parking_lot::Mutex::new(None)))
                 .collect(),
+            is_replica_mirror: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Set `role` and update the lock-free `is_replica_mirror` atomically.
+    ///
+    /// Single owner of the invariant that the mirror tracks `role`. All
+    /// production sites that transition between Master and Replica MUST go
+    /// through this method; otherwise the mirror drifts and
+    /// `try_enforce_readonly` will allow writes against a replica.
+    #[inline]
+    pub fn set_role(&mut self, new_role: ReplicationRole) {
+        let is_replica = matches!(new_role, ReplicationRole::Replica { .. });
+        self.role = new_role;
+        self.is_replica_mirror.store(is_replica, Ordering::Release);
     }
 
     /// Allocate the per-shard backlog if not already allocated. Idempotent.
@@ -76,6 +94,20 @@ impl ReplicationState {
                 ));
             }
         }
+    }
+
+    /// Total resident bytes across all per-shard replication backlogs.
+    /// Returns 0 if no backlogs have been allocated (lazy init).
+    /// O(num_shards) -- one lock acquire per shard (uncontended on metrics scrape).
+    pub fn backlog_resident_bytes(&self) -> usize {
+        let mut total: usize = 0;
+        for slot in &self.per_shard_backlogs {
+            let guard = slot.lock();
+            if let Some(ref backlog) = *guard {
+                total += backlog.resident_bytes();
+            }
+        }
+        total
     }
 
     /// Increment the offset for the given shard by delta bytes.
@@ -217,6 +249,37 @@ mod tests {
         let (id1b, id2b) = load_replication_state(dir.path());
         assert_eq!(id1b, id1, "reloading should return same ID");
         assert_eq!(id2b, id2);
+    }
+
+    #[test]
+    fn test_set_role_updates_is_replica_mirror() {
+        // S3.5a: mirror must track role transitions so try_enforce_readonly
+        // can read it lock-free on the hot path.
+        let mut state = ReplicationState::new(2, generate_repl_id(), ZEROED_ID.to_string());
+        let mirror = state.is_replica_mirror.clone();
+
+        // Fresh state starts as Master => mirror false.
+        assert!(!mirror.load(Ordering::Acquire));
+
+        // Promote to replica => mirror flips true.
+        state.set_role(ReplicationRole::Replica {
+            host: "127.0.0.1".to_string(),
+            port: 6379,
+            state: ReplicaHandshakeState::PingPending,
+        });
+        assert!(mirror.load(Ordering::Acquire));
+        assert!(matches!(state.role, ReplicationRole::Replica { .. }));
+
+        // REPLICAOF NO ONE: back to master => mirror flips false.
+        state.set_role(ReplicationRole::Master);
+        assert!(!mirror.load(Ordering::Acquire));
+        assert!(matches!(state.role, ReplicationRole::Master));
+    }
+
+    #[test]
+    fn test_is_replica_mirror_default_false() {
+        let state = ReplicationState::new(1, generate_repl_id(), ZEROED_ID.to_string());
+        assert!(!state.is_replica_mirror.load(Ordering::Acquire));
     }
 
     #[test]

@@ -542,40 +542,22 @@ fn allocator_info() -> (String, String) {
 }
 
 /// Read VSZ (virtual memory size) for the current process.
+///
+/// Uses safe `/proc/self/status` parsing — `VmSize:` line is the canonical
+/// virtual size in KiB. Cold admin path, allocation is fine.
 #[cfg(target_os = "linux")]
 fn get_vsz_bytes() -> usize {
-    // /proc/self/statm field 0 is size in pages.
-    // SAFETY: same pattern as get_rss_bytes in metrics_setup.rs.
-    let fd = unsafe { libc::open(c"/proc/self/statm".as_ptr(), libc::O_RDONLY) };
-    if fd < 0 {
+    let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
         return 0;
-    }
-    let mut buf = [0u8; 128];
-    // SAFETY: `fd` is a valid open file descriptor (checked >= 0 above); `buf` is
-    // a stack array of `buf.len()` initialized bytes, so the kernel may write up
-    // to that many bytes into it.
-    let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len()) };
-    // SAFETY: `fd` is a valid open file descriptor that has not yet been closed.
-    unsafe { libc::close(fd) };
-    if n <= 0 {
-        return 0;
-    }
-    let s = &buf[..n as usize];
-    // Field 0 = size (VSZ in pages).
-    if let Some(size_field) = s.split(|&b| b == b' ').next() {
-        let mut pages: u64 = 0;
-        for &b in size_field {
-            if b.is_ascii_digit() {
-                pages = pages * 10 + (b - b'0') as u64;
-            }
-        }
-        // Use the same page_size approach as get_rss_bytes.
-        // SAFETY: `sysconf` with `_SC_PAGESIZE` is a thread-safe POSIX query
-        // with no preconditions; it returns -1 on failure (handled by the cast).
-        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
-        return (pages * page_size) as usize;
-    }
-    0
+    };
+    status
+        .lines()
+        .find_map(|line| {
+            let rest = line.strip_prefix("VmSize:")?;
+            let kib = rest.split_whitespace().next()?.parse::<usize>().ok()?;
+            kib.checked_mul(1024)
+        })
+        .unwrap_or(0)
 }
 
 #[cfg(target_os = "macos")]

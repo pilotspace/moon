@@ -213,6 +213,28 @@ impl GraphStore {
         }
     }
 
+    /// Resident bytes across all named graphs on this shard.
+    ///
+    /// Sums mutable write-buffer (MemGraph slot maps) + immutable CSR segments
+    /// (row_offsets + col_indices + edge/node metadata). O(graph_count * segment_count).
+    pub fn resident_bytes(&self) -> usize {
+        let map = match &self.graphs {
+            Some(m) => m,
+            None => return 0,
+        };
+        let mut total: usize = 0;
+        for graph in map.values() {
+            // Mutable write buffer.
+            total += graph.write_buf.resident_bytes();
+            // Immutable CSR segments.
+            let snapshot = graph.segments.load();
+            for csr in &snapshot.immutable {
+                total += csr.resident_bytes();
+            }
+        }
+        total
+    }
+
     /// Serialize graph metadata (names, thresholds, LSNs) to a JSON file.
     ///
     /// This captures enough information to recreate the GraphStore structure

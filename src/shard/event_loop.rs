@@ -649,6 +649,13 @@ impl super::Shard {
             crate::server::conn::affinity::MigratedConnectionState,
         )> = Vec::new();
 
+        // C3b-2 — Per-shard CDC fan-out. The registry holds zero subscribers
+        // (and consumes no CPU on `fanout_tick`) until the first
+        // `ShardMessage::CdcSubscribe` lands.
+        let mut cdc_registry = crate::cdc::CdcSubscriberRegistry::new(shard_id as u16);
+        let mut pending_cdc_subscribes: Vec<crate::shard::dispatch::CdcSubscribePayload> =
+            Vec::new();
+
         // Per-shard VectorStore: use the SHARED instance from ShardDatabases.
         // This ensures handler_sharded FT.* commands and SPSC auto-indexing
         // (triggered by HSET) operate on the SAME VectorStore.
@@ -960,10 +967,18 @@ impl super::Shard {
                         &mut wal_writer, &mut wal_v3_writer, &repl_backlog, &mut replica_txs,
                         &repl_state, shard_id, &script_cache_rc, &cached_clock,
                         &mut pending_migrations, &mut *shard_databases.vector_store(shard_id),
+                        &mut pending_cdc_subscribes,
                     );
+                    if !pending_cdc_subscribes.is_empty() {
+                        let wal_dir = wal_v3_writer.as_ref().map(|w| w.wal_dir());
+                        cdc_registry.register_pending(
+                            pending_cdc_subscribes.drain(..), wal_dir,
+                        );
+                    }
                     persistence_tick::handle_pending_snapshot(
                         pending_snapshot, &mut snapshot_state, &mut snapshot_reply_tx,
                         &shard_databases, disk_offload_base.as_deref(), shard_id,
+                        wal_v3_writer.as_ref().map(|w| w.current_lsn().saturating_sub(1)).unwrap_or(0),
                     );
                     for (fd, state) in pending_migrations.drain(..) {
                         tracing::info!(
@@ -1013,10 +1028,18 @@ impl super::Shard {
                         &mut wal_writer, &mut wal_v3_writer, &repl_backlog, &mut replica_txs,
                         &repl_state, shard_id, &script_cache_rc, &cached_clock,
                         &mut pending_migrations, &mut *shard_databases.vector_store(shard_id),
+                        &mut pending_cdc_subscribes,
                     );
+                    if !pending_cdc_subscribes.is_empty() {
+                        let wal_dir = wal_v3_writer.as_ref().map(|w| w.wal_dir());
+                        cdc_registry.register_pending(
+                            pending_cdc_subscribes.drain(..), wal_dir,
+                        );
+                    }
                     persistence_tick::handle_pending_snapshot(
                         pending_snapshot, &mut snapshot_state, &mut snapshot_reply_tx,
                         &shard_databases, disk_offload_base.as_deref(), shard_id,
+                        wal_v3_writer.as_ref().map(|w| w.current_lsn().saturating_sub(1)).unwrap_or(0),
                     );
                     for (fd, state) in pending_migrations.drain(..) {
                         tracing::info!(
@@ -1057,6 +1080,7 @@ impl super::Shard {
                         &snapshot_trigger_rx, &mut last_snapshot_epoch,
                         &mut snapshot_state, &shard_databases, &persistence_dir,
                         disk_offload_base.as_deref(), shard_id,
+                        wal_v3_writer.as_ref().map(|w| w.current_lsn().saturating_sub(1)).unwrap_or(0),
                     );
 
                     // Advance snapshot one segment per tick (cooperative)
@@ -1096,6 +1120,13 @@ impl super::Shard {
 
                     persistence_tick::flush_wal_if_needed(&mut wal_writer);
                     persistence_tick::flush_wal_v3_if_needed(&mut wal_v3_writer);
+
+                    // C3b-2 — Drive CDC fan-out AFTER flush_if_needed so the
+                    // tail reader sees the bytes just handed to the page
+                    // cache. Zero CPU when no subscribers are attached.
+                    if !cdc_registry.is_empty() {
+                        cdc_registry.fanout_tick(cached_clock.ms() as i64);
+                    }
 
                     // appendfsync=always: fsync WAL v3 after every SPSC drain batch
                     if server_config.appendfsync == "always" {
@@ -1415,7 +1446,12 @@ impl super::Shard {
                     &cached_clock,
                     &mut pending_migrations,
                     &mut *shard_databases.vector_store(shard_id),
+                    &mut pending_cdc_subscribes,
                 );
+                if !pending_cdc_subscribes.is_empty() {
+                    let wal_dir = wal_v3_writer.as_ref().map(|w| w.wal_dir());
+                    cdc_registry.register_pending(pending_cdc_subscribes.drain(..), wal_dir);
+                }
                 for waker in pending_wakers.borrow_mut().drain(..) {
                     waker.wake();
                 }
@@ -1426,6 +1462,10 @@ impl super::Shard {
                     &shard_databases,
                     disk_offload_base.as_deref(),
                     shard_id,
+                    wal_v3_writer
+                        .as_ref()
+                        .map(|w| w.current_lsn().saturating_sub(1))
+                        .unwrap_or(0),
                 );
                 for (fd, state) in pending_migrations.drain(..) {
                     tracing::info!(
@@ -1477,6 +1517,10 @@ impl super::Shard {
                     &persistence_dir,
                     disk_offload_base.as_deref(),
                     shard_id,
+                    wal_v3_writer
+                        .as_ref()
+                        .map(|w| w.current_lsn().saturating_sub(1))
+                        .unwrap_or(0),
                 );
 
                 if persistence_tick::advance_snapshot_segment(
@@ -1521,6 +1565,12 @@ impl super::Shard {
 
                 persistence_tick::flush_wal_if_needed(&mut wal_writer);
                 persistence_tick::flush_wal_v3_if_needed(&mut wal_v3_writer);
+
+                // C3b-2 — Drive CDC fan-out on the same monoio tick body
+                // as the tokio branch above. Zero CPU when no subscribers.
+                if !cdc_registry.is_empty() {
+                    cdc_registry.fanout_tick(cached_clock.ms() as i64);
+                }
 
                 if server_config.appendfsync == "always" {
                     if let Some(ref mut wal) = wal_v3_writer {
