@@ -861,8 +861,13 @@ fn wait_for_server(port: u16, timeout: std::time::Duration) -> bool {
 fn connect_with_retry(client: &redis::Client, ctx: &str) -> redis::Connection {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
     let mut last_err: Option<redis::RedisError> = None;
+    // Per-attempt connect timeout so a half-ready server (TCP accept but no
+    // RESP handshake) does NOT block this thread until the OS keepalive
+    // fires. Without it, `get_connection()` can hang for minutes on CI when
+    // moon's listener binds before the shard accept loop is wired.
+    let per_attempt_timeout = std::time::Duration::from_secs(2);
     loop {
-        match client.get_connection() {
+        match client.get_connection_with_timeout(per_attempt_timeout) {
             Ok(conn) => return conn,
             Err(e) => {
                 last_err = Some(e);
