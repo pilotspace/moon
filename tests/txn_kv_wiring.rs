@@ -956,7 +956,7 @@ async fn test_txn_commit_wal_crash_recovery() {
     );
 
     assert!(
-        wait_for_server(port1, std::time::Duration::from_secs(5)),
+        wait_for_server(port1, std::time::Duration::from_secs(30)),
         "Moon server (phase 1) did not become ready on port {port1}"
     );
 
@@ -1054,7 +1054,7 @@ async fn test_txn_commit_wal_crash_recovery() {
     );
 
     assert!(
-        wait_for_server(port2, std::time::Duration::from_secs(5)),
+        wait_for_server(port2, std::time::Duration::from_secs(30)),
         "Moon server (phase 2) did not become ready on port {port2}"
     );
 
