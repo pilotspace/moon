@@ -839,33 +839,42 @@ impl Drop for DirGuard {
 /// Retries for up to `timeout` with 50ms sleep between attempts.
 /// Returns `true` if the server is ready, `false` on timeout.
 fn wait_for_server(port: u16, timeout: std::time::Duration) -> bool {
-    use std::io::{Read, Write};
-
     let deadline = std::time::Instant::now() + timeout;
     loop {
-        // TCP connect alone is not enough — Moon's listener binds before the
-        // shard accept loop is fully wired, so the first connection after
-        // bind can be reset by the kernel (observed flaky on macOS CI).
-        // Drive a real RESP PING round-trip; only return true once we
-        // observe a PONG, which proves the dispatch path is live.
-        if let Ok(mut sock) = std::net::TcpStream::connect(format!("127.0.0.1:{port}")) {
-            let _ = sock.set_read_timeout(Some(std::time::Duration::from_millis(500)));
-            let _ = sock.set_write_timeout(Some(std::time::Duration::from_millis(500)));
-            if sock.write_all(b"*1\r\n$4\r\nPING\r\n").is_ok() {
-                let mut buf = [0u8; 64];
-                if let Ok(n) = sock.read(&mut buf) {
-                    // Accept either "+PONG\r\n" (RESP2) or "$4\r\nPONG\r\n".
-                    let resp = &buf[..n];
-                    if resp.starts_with(b"+PONG") || resp.windows(4).any(|w| w == b"PONG") {
-                        return true;
-                    }
-                }
-            }
+        if std::net::TcpStream::connect(format!("127.0.0.1:{port}")).is_ok() {
+            return true;
         }
         if std::time::Instant::now() >= deadline {
             return false;
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// Wrap `redis::Client::get_connection` in a bounded retry loop.
+///
+/// Moon's listener binds before the shard accept loops are fully wired, so
+/// the first redis-cli `connect()` after `wait_for_server` returns can hit
+/// "Connection reset by peer" on macOS CI runners (observed flaky). Retry
+/// for up to 15 s so the test rides out the bind-before-ready window
+/// without changing the more-stable TCP-connect probe in `wait_for_server`.
+fn connect_with_retry(client: &redis::Client, ctx: &str) -> redis::Connection {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let mut last_err: Option<redis::RedisError> = None;
+    loop {
+        match client.get_connection() {
+            Ok(conn) => return conn,
+            Err(e) => {
+                last_err = Some(e);
+                if std::time::Instant::now() >= deadline {
+                    panic!(
+                        "{ctx}: get_connection failed after retries: {:?}",
+                        last_err.unwrap()
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
     }
 }
 
@@ -962,7 +971,7 @@ async fn test_txn_commit_wal_crash_recovery() {
 
     // Connect with sync redis client to avoid holding an async runtime across process boundaries.
     let client1 = redis::Client::open(format!("redis://127.0.0.1:{port1}")).unwrap();
-    let mut sync_conn1 = client1.get_connection().expect("connect to phase-1 server");
+    let mut sync_conn1 = connect_with_retry(&client1, "phase-1 server");
 
     // Non-TXN baseline (verifies plain AOF replay too)
     let _: String = redis::cmd("SET")
@@ -1059,7 +1068,7 @@ async fn test_txn_commit_wal_crash_recovery() {
     );
 
     let client2 = redis::Client::open(format!("redis://127.0.0.1:{port2}")).unwrap();
-    let mut sync_conn2 = client2.get_connection().expect("connect to phase-2 server");
+    let mut sync_conn2 = connect_with_retry(&client2, "phase-2 server");
 
     // Verify TXN committed value survived server restart via WAL replay.
     let recovered: Option<String> = redis::cmd("GET")
