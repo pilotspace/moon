@@ -851,38 +851,6 @@ fn wait_for_server(port: u16, timeout: std::time::Duration) -> bool {
     }
 }
 
-/// Wrap `redis::Client::get_connection` in a bounded retry loop.
-///
-/// Moon's listener binds before the shard accept loops are fully wired, so
-/// the first redis-cli `connect()` after `wait_for_server` returns can hit
-/// "Connection reset by peer" on macOS CI runners (observed flaky). Retry
-/// for up to 15 s so the test rides out the bind-before-ready window
-/// without changing the more-stable TCP-connect probe in `wait_for_server`.
-fn connect_with_retry(client: &redis::Client, ctx: &str) -> redis::Connection {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-    let mut last_err: Option<redis::RedisError> = None;
-    // Per-attempt connect timeout so a half-ready server (TCP accept but no
-    // RESP handshake) does NOT block this thread until the OS keepalive
-    // fires. Without it, `get_connection()` can hang for minutes on CI when
-    // moon's listener binds before the shard accept loop is wired.
-    let per_attempt_timeout = std::time::Duration::from_secs(2);
-    loop {
-        match client.get_connection_with_timeout(per_attempt_timeout) {
-            Ok(conn) => return conn,
-            Err(e) => {
-                last_err = Some(e);
-                if std::time::Instant::now() >= deadline {
-                    panic!(
-                        "{ctx}: get_connection failed after retries: {:?}",
-                        last_err.unwrap()
-                    );
-                }
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
-        }
-    }
-}
-
 /// Find the Moon binary path, preferring release over debug.
 ///
 /// Resolution order:
@@ -970,13 +938,13 @@ async fn test_txn_commit_wal_crash_recovery() {
     );
 
     assert!(
-        wait_for_server(port1, std::time::Duration::from_secs(30)),
+        wait_for_server(port1, std::time::Duration::from_secs(5)),
         "Moon server (phase 1) did not become ready on port {port1}"
     );
 
     // Connect with sync redis client to avoid holding an async runtime across process boundaries.
     let client1 = redis::Client::open(format!("redis://127.0.0.1:{port1}")).unwrap();
-    let mut sync_conn1 = connect_with_retry(&client1, "phase-1 server");
+    let mut sync_conn1 = client1.get_connection().expect("connect to phase-1 server");
 
     // Non-TXN baseline (verifies plain AOF replay too)
     let _: String = redis::cmd("SET")
@@ -1068,12 +1036,12 @@ async fn test_txn_commit_wal_crash_recovery() {
     );
 
     assert!(
-        wait_for_server(port2, std::time::Duration::from_secs(30)),
+        wait_for_server(port2, std::time::Duration::from_secs(5)),
         "Moon server (phase 2) did not become ready on port {port2}"
     );
 
     let client2 = redis::Client::open(format!("redis://127.0.0.1:{port2}")).unwrap();
-    let mut sync_conn2 = connect_with_retry(&client2, "phase-2 server");
+    let mut sync_conn2 = client2.get_connection().expect("connect to phase-2 server");
 
     // Verify TXN committed value survived server restart via WAL replay.
     let recovered: Option<String> = redis::cmd("GET")
