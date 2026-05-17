@@ -259,6 +259,10 @@ impl Database {
         // Exactly one closure runs (FnOnce), so the take() is safe.
         let entry_cell = std::cell::Cell::new(Some(entry));
 
+        // `insert_or_update` invariant: exactly one of the two closures fires
+        // exactly once per call, so the `Cell::take()` below cannot observe
+        // a None value. Annotated for the hot-path unwrap ratchet.
+        #[allow(clippy::expect_used)]
         let result = self.data.insert_or_update(
             CompactKey::from(key.clone()), // Bytes::clone is a refcount bump, not deep copy
             |existing: &mut Entry| {
