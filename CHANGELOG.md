@@ -61,6 +61,20 @@ See `docs/guides/cdc.md` for consumer integration.
   graph/temporal/workspace/MQ WAL replay, SO_REUSEPORT, NUMA pinning, and
   cancel-driven graceful shutdown.
 
+### Fixed — PR #96 test deflake + tokio AOF replay
+
+- `main.rs` AOF recovery: gated the multi-part AOF manifest replay block to
+  `#[cfg(feature = "runtime-monoio")]`. Under tokio, the legacy single-file
+  `appendonly.aof` is loaded via the v2 recovery chain; the multi-part loader
+  no longer creates an empty manifest at first boot that wiped v2-loaded
+  state on the next restart (every tokio SET was lost on restart).
+- `tests/txn_kv_wiring.rs`: made `test_txn_commit_wal_crash_recovery`
+  runtime-agnostic by polling for either the monoio multi-part `.base.rdb`
+  artifact or the tokio single-file `appendonly.aof`. Added
+  `connect_redis_with_retry` helper to bound and retry the post-bind RESP
+  handshake (was racing the shard accept loop, surfacing as EAGAIN on Linux
+  and ECONNRESET on macOS CI).
+
 ### Fixed — PR #95 review hardening
 
 - `main.rs` `malloc_conf` symbol: replaced the union-based unsafe pun with

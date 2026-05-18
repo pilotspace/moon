@@ -431,6 +431,14 @@ fn main() -> anyhow::Result<()> {
     //
     // A corrupt manifest is FATAL: overwriting it silently destroys the reference
     // to the real base RDB and loses all persisted data.
+    //
+    // Gated to runtime-monoio: BGREWRITEAOF under runtime-tokio writes a
+    // single-file appendonly.aof with RDB preamble (legacy v2 format) and
+    // never advances the manifest. Engaging this block under tokio creates an
+    // empty manifest at first boot, then on the next boot wipes v2-loaded
+    // state because the multi-part replay finds no base RDB. This caused the
+    // tokio TXN replay regression that surfaced via test_txn_commit_wal_crash_recovery.
+    #[cfg(feature = "runtime-monoio")]
     if config.appendonly == "yes"
         && let Some(ref dir) = persistence_dir
     {
@@ -520,6 +528,25 @@ fn main() -> anyhow::Result<()> {
                 AofManifest::initialize(&base_dir)
                     .with_context(|| "failed to initialize AOF manifest")?;
             }
+        }
+    }
+
+    // Under tokio, multi-part AOF is not supported. If a manifest exists, the
+    // operator likely switched from monoio — warn so they don't think their
+    // data is silently corrupted. v2 recovery (single-file appendonly.aof)
+    // remains active.
+    #[cfg(not(feature = "runtime-monoio"))]
+    if config.appendonly == "yes"
+        && let Some(ref dir) = persistence_dir
+    {
+        let manifest_path = std::path::PathBuf::from(dir).join("appendonlydir/moon.aof.manifest");
+        if manifest_path.exists() {
+            tracing::warn!(
+                "multi-part AOF manifest found at {} but runtime is tokio; ignoring. \
+                 Switch to monoio (cargo run --no-default-features --features runtime-monoio,jemalloc) \
+                 to load multi-part AOF data.",
+                manifest_path.display()
+            );
         }
     }
 
