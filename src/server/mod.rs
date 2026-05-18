@@ -1,6 +1,8 @@
 pub mod codec;
 pub mod conn;
 pub mod conn_state;
+#[cfg(feature = "runtime-tokio")]
+pub mod embedded;
 pub mod expiration;
 pub mod listener;
 pub mod response_slot;

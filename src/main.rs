@@ -21,23 +21,24 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
+/// `#[repr(transparent)]` wrapper around `*const c_char` so we can declare a
+/// `Sync` static that exposes the exact `const char *` ABI jemalloc expects
+/// for the `_rjem_malloc_conf` symbol.
+#[cfg(feature = "jemalloc")]
+#[repr(transparent)]
+pub struct MallocConfPtr(*const libc::c_char);
+
+// SAFETY: The pointer is a `'static` C-string literal — immutable for the
+// lifetime of the program. jemalloc reads it exactly once during init.
+#[cfg(feature = "jemalloc")]
+unsafe impl Sync for MallocConfPtr {}
+
 #[cfg(feature = "jemalloc")]
 #[allow(non_upper_case_globals)]
 #[unsafe(export_name = "_rjem_malloc_conf")]
-pub static malloc_conf: Option<&'static libc::c_char> = {
-    // SAFETY: The byte string is null-terminated and valid ASCII; reinterpreting
-    // the first byte's address as *const c_char is safe (same layout).
-    union U {
-        x: &'static u8,
-        y: &'static libc::c_char,
-    }
-    Some(unsafe {
-        U {
-            x: &b"narenas:8,background_thread:true,metadata_thp:auto,dirty_decay_ms:1000,muzzy_decay_ms:5000,abort_conf:true\0"[0],
-        }
-        .y
-    })
-};
+pub static malloc_conf: MallocConfPtr = MallocConfPtr(
+    c"narenas:8,background_thread:true,metadata_thp:auto,dirty_decay_ms:1000,muzzy_decay_ms:5000,abort_conf:true".as_ptr(),
+);
 
 use std::path::PathBuf;
 
@@ -840,17 +841,24 @@ fn maybe_respawn_with_arena_override() -> anyhow::Result<()> {
     // Lightweight scan of argv for --memory-arenas-cap N or --memory-arenas-cap=N.
     // We can't use clap here because clap::parse() requires the full struct, and
     // we need to inject env vars BEFORE jemalloc reads the config.
-    let args: Vec<String> = env::args().collect();
+    // Use args_os() to avoid panicking on non-UTF-8 argv and to preserve the
+    // original OsString argv for the re-spawn below (CodeRabbit).
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStrExt;
+    let args: Vec<OsString> = env::args_os().collect();
     let mut requested: Option<u32> = None;
     let mut i = 1;
     while i < args.len() {
-        let a = &args[i];
-        if let Some(rest) = a.strip_prefix("--memory-arenas-cap=") {
-            requested = rest.parse().ok();
+        let a = args[i].as_os_str().as_bytes();
+        if let Some(rest) = a.strip_prefix(b"--memory-arenas-cap=") {
+            requested = std::str::from_utf8(rest).ok().and_then(|s| s.parse().ok());
             break;
         }
-        if a == "--memory-arenas-cap" && i + 1 < args.len() {
-            requested = args[i + 1].parse().ok();
+        if a == b"--memory-arenas-cap" && i + 1 < args.len() {
+            requested = args[i + 1]
+                .as_os_str()
+                .to_str()
+                .and_then(|s| s.parse().ok());
             break;
         }
         i += 1;
