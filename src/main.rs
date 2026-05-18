@@ -539,8 +539,7 @@ fn main() -> anyhow::Result<()> {
     if config.appendonly == "yes"
         && let Some(ref dir) = persistence_dir
     {
-        let manifest_path =
-            std::path::PathBuf::from(dir).join("appendonlydir/moon.aof.manifest");
+        let manifest_path = std::path::PathBuf::from(dir).join("appendonlydir/moon.aof.manifest");
         if manifest_path.exists() {
             tracing::warn!(
                 "multi-part AOF manifest found at {} but runtime is tokio; ignoring. \
