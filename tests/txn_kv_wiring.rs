@@ -878,6 +878,34 @@ fn find_moon_binary() -> Option<std::path::PathBuf> {
     None
 }
 
+/// Open a redis-rs sync connection, retrying through the post-bind handshake race.
+///
+/// `wait_for_server` only proves TCP bind. The shard accept loop and RESP handler
+/// can lag the bind by a small window, during which the first RESP exchange may
+/// fail with EAGAIN (Linux) or ECONNRESET (macOS). Retry with short backoff
+/// instead of letting a single fast attempt panic.
+fn connect_redis_with_retry(client: &redis::Client, label: &str) -> redis::Connection {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    #[allow(unused_assignments)]
+    let mut last_err: Option<redis::RedisError> = None;
+    loop {
+        match client.get_connection_with_timeout(std::time::Duration::from_secs(1)) {
+            Ok(conn) => return conn,
+            Err(e) => last_err = Some(e),
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!(
+                "connect to {label} server failed after 15s: {}",
+                last_err
+                    .as_ref()
+                    .map(|e| e.to_string())
+                    .unwrap_or_else(|| "no error captured".into())
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+}
+
 /// Bind a free OS port, drop the listener, and return the port number.
 fn free_port() -> u16 {
     // SAFETY: bind + drop releases the port; the server will re-bind it.
@@ -944,13 +972,7 @@ async fn test_txn_commit_wal_crash_recovery() {
 
     // Connect with sync redis client to avoid holding an async runtime across process boundaries.
     let client1 = redis::Client::open(format!("redis://127.0.0.1:{port1}")).unwrap();
-    // Bound the RESP handshake: wait_for_server only proves TCP bind. The
-    // shard accept loop can lag the bind by a small window, and a bare
-    // get_connection() blocks indefinitely on macOS CI when the first
-    // RESP exchange races the bind ("Connection reset by peer").
-    let mut sync_conn1 = client1
-        .get_connection_with_timeout(std::time::Duration::from_secs(10))
-        .expect("connect to phase-1 server");
+    let mut sync_conn1 = connect_redis_with_retry(&client1, "phase-1");
 
     // Non-TXN baseline (verifies plain AOF replay too)
     let _: String = redis::cmd("SET")
@@ -1058,9 +1080,7 @@ async fn test_txn_commit_wal_crash_recovery() {
     );
 
     let client2 = redis::Client::open(format!("redis://127.0.0.1:{port2}")).unwrap();
-    let mut sync_conn2 = client2
-        .get_connection_with_timeout(std::time::Duration::from_secs(10))
-        .expect("connect to phase-2 server");
+    let mut sync_conn2 = connect_redis_with_retry(&client2, "phase-2");
 
     // Verify TXN committed value survived server restart via WAL replay.
     let recovered: Option<String> = redis::cmd("GET")
