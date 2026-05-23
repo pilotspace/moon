@@ -2791,8 +2791,19 @@ async fn start_sharded_server(num_shards: usize) -> (u16, CancellationToken) {
         }
     });
 
-    // Give the server a moment to bind and start shards
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    // Give the server time to bind, spawn shards, and start the accept loop.
+    // The previous value (100ms) flaked on shared CI runners under load —
+    // both test_sharded_concurrent_clients and test_txn_commit_wal_crash_recovery
+    // hit EAGAIN/ECONNREFUSED before the listener was draining.
+    //
+    // A naive PING-based readiness probe via the test process opens a TCP
+    // connection that interferes with subsequent test connections (the
+    // listener's per-connection shard affinity ends up biased), so we keep
+    // a fixed sleep but lengthen it. 1s is well above the observed shard-
+    // boot variance even with 10 parallel cargo-test workers competing for
+    // CPU. Local repro: 5x100 runs of test_sharded_concurrent_clients +
+    // test_sharded_transaction_same_shard all green at 1s.
+    tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
 
     (port, token)
 }
