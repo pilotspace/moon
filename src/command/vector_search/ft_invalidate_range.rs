@@ -409,8 +409,8 @@ mod tests {
             bulk(b"node_id"),
             bulk(b"node:1"),
             bulk(b"hlc_wall"),
-            bulk(b"10"),  // lo
-            bulk(b"5"),   // hi < lo
+            bulk(b"10"), // lo
+            bulk(b"5"),  // hi < lo
         ];
         let result = ft_invalidate_range(&mut ts, &args);
         match result {

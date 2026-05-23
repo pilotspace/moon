@@ -16,8 +16,8 @@
 
 #[cfg(test)]
 mod version_token_tests {
-    use bytes::Bytes;
     use crate::protocol::Frame;
+    use bytes::Bytes;
 
     // -----------------------------------------------------------------------
     // Helpers
@@ -41,7 +41,11 @@ mod version_token_tests {
     #[test]
     fn vector_store_version_token_starts_at_zero() {
         let store = crate::vector::store::VectorStore::new();
-        assert_eq!(store.version_token(), 0, "VectorStore token must start at 0");
+        assert_eq!(
+            store.version_token(),
+            0,
+            "VectorStore token must start at 0"
+        );
     }
 
     #[test]
@@ -66,13 +70,22 @@ mod version_token_tests {
         // Build a minimal IndexMeta; non-critical fields use defaults.
         let args: Vec<Frame> = [
             b"idx".as_ref(),
-            b"ON", b"HASH",
-            b"PREFIX", b"1", b"doc:",
+            b"ON",
+            b"HASH",
+            b"PREFIX",
+            b"1",
+            b"doc:",
             b"SCHEMA",
-            b"vec", b"VECTOR", b"HNSW", b"6",
-            b"TYPE", b"FLOAT32",
-            b"DIM", b"4",
-            b"DISTANCE_METRIC", b"L2",
+            b"vec",
+            b"VECTOR",
+            b"HNSW",
+            b"6",
+            b"TYPE",
+            b"FLOAT32",
+            b"DIM",
+            b"4",
+            b"DISTANCE_METRIC",
+            b"L2",
         ]
         .iter()
         .map(|s| bulk(s))
@@ -105,13 +118,22 @@ mod version_token_tests {
         let mut store = VectorStore::new();
         let create_args: Vec<Frame> = [
             b"idx2".as_ref(),
-            b"ON", b"HASH",
-            b"PREFIX", b"1", b"doc:",
+            b"ON",
+            b"HASH",
+            b"PREFIX",
+            b"1",
+            b"doc:",
             b"SCHEMA",
-            b"vec", b"VECTOR", b"HNSW", b"6",
-            b"TYPE", b"FLOAT32",
-            b"DIM", b"4",
-            b"DISTANCE_METRIC", b"L2",
+            b"vec",
+            b"VECTOR",
+            b"HNSW",
+            b"6",
+            b"TYPE",
+            b"FLOAT32",
+            b"DIM",
+            b"4",
+            b"DISTANCE_METRIC",
+            b"L2",
         ]
         .iter()
         .map(|s| bulk(s))
@@ -142,13 +164,22 @@ mod version_token_tests {
         let mut store = VectorStore::new();
         let create_args: Vec<Frame> = [
             b"dup".as_ref(),
-            b"ON", b"HASH",
-            b"PREFIX", b"1", b"x:",
+            b"ON",
+            b"HASH",
+            b"PREFIX",
+            b"1",
+            b"x:",
             b"SCHEMA",
-            b"vec", b"VECTOR", b"HNSW", b"6",
-            b"TYPE", b"FLOAT32",
-            b"DIM", b"4",
-            b"DISTANCE_METRIC", b"L2",
+            b"vec",
+            b"VECTOR",
+            b"HNSW",
+            b"6",
+            b"TYPE",
+            b"FLOAT32",
+            b"DIM",
+            b"4",
+            b"DISTANCE_METRIC",
+            b"L2",
         ]
         .iter()
         .map(|s| bulk(s))
@@ -387,10 +418,7 @@ mod version_token_tests {
         let mut store = GraphStore::new();
         let before = store.version_token();
 
-        let resp = dispatch_graph_command(
-            &mut store,
-            &make_graph_cmd(&[b"GRAPH.CREATE", b"g1"]),
-        );
+        let resp = dispatch_graph_command(&mut store, &make_graph_cmd(&[b"GRAPH.CREATE", b"g1"]));
         assert!(
             matches!(resp, Frame::SimpleString(_)),
             "GRAPH.CREATE must return OK, got {resp:?}"
@@ -442,10 +470,8 @@ mod version_token_tests {
         dispatch_graph_command(&mut store, &make_graph_cmd(&[b"GRAPH.CREATE", b"dup_g"]));
         let after_first = store.version_token();
 
-        let resp = dispatch_graph_command(
-            &mut store,
-            &make_graph_cmd(&[b"GRAPH.CREATE", b"dup_g"]),
-        );
+        let resp =
+            dispatch_graph_command(&mut store, &make_graph_cmd(&[b"GRAPH.CREATE", b"dup_g"]));
         assert!(
             matches!(resp, Frame::Error(_)),
             "duplicate GRAPH.CREATE must return error"
@@ -507,18 +533,16 @@ mod version_token_tests {
         let mut store = GraphStore::new();
         dispatch_graph_command(&mut store, &make_graph_cmd(&[b"GRAPH.CREATE", b"mygraph"]));
 
-        let resp = dispatch_graph_command(
-            &mut store,
-            &make_graph_cmd(&[b"GRAPH.INFO", b"mygraph"]),
-        );
+        let resp =
+            dispatch_graph_command(&mut store, &make_graph_cmd(&[b"GRAPH.INFO", b"mygraph"]));
 
         let Frame::Map(pairs) = resp else {
             panic!("GRAPH.INFO must return Frame::Map, got {resp:?}");
         };
 
-        let token_entry = pairs.iter().find(|(k, _)| {
-            matches!(k, Frame::SimpleString(b) if b.as_ref() == b"version_token")
-        });
+        let token_entry = pairs
+            .iter()
+            .find(|(k, _)| matches!(k, Frame::SimpleString(b) if b.as_ref() == b"version_token"));
         assert!(
             token_entry.is_some(),
             "GRAPH.INFO response must include 'version_token' field"
@@ -546,20 +570,32 @@ mod version_token_tests {
 
         let create_args: Vec<Frame> = [
             b"vidx".as_ref(),
-            b"ON", b"HASH",
-            b"PREFIX", b"1", b"doc:",
+            b"ON",
+            b"HASH",
+            b"PREFIX",
+            b"1",
+            b"doc:",
             b"SCHEMA",
-            b"vec", b"VECTOR", b"HNSW", b"6",
-            b"TYPE", b"FLOAT32",
-            b"DIM", b"4",
-            b"DISTANCE_METRIC", b"L2",
+            b"vec",
+            b"VECTOR",
+            b"HNSW",
+            b"6",
+            b"TYPE",
+            b"FLOAT32",
+            b"DIM",
+            b"4",
+            b"DISTANCE_METRIC",
+            b"L2",
         ]
         .iter()
         .map(|s| bulk(s))
         .collect();
 
         let r = ft_create(&mut vs, &mut ts, &create_args);
-        assert!(matches!(r, Frame::SimpleString(_)), "ft_create must return OK");
+        assert!(
+            matches!(r, Frame::SimpleString(_)),
+            "ft_create must return OK"
+        );
 
         let info_args: Vec<Frame> = vec![bulk(b"vidx")];
         let resp = ft_info(&vs, &ts, &info_args);
@@ -619,10 +655,14 @@ mod version_token_tests {
         // TEXT-only FT.CREATE (no VECTOR field)
         let create_args: Vec<Frame> = [
             b"tidx".as_ref(),
-            b"ON", b"HASH",
-            b"PREFIX", b"1", b"post:",
+            b"ON",
+            b"HASH",
+            b"PREFIX",
+            b"1",
+            b"post:",
             b"SCHEMA",
-            b"body", b"TEXT",
+            b"body",
+            b"TEXT",
         ]
         .iter()
         .map(|s| bulk(s))

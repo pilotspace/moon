@@ -850,8 +850,7 @@ impl super::Shard {
                                 meta.text_fields.clone(),
                                 meta.bm25_config,
                             );
-                            if let Err(e) =
-                                s.text_store.create_index(meta.name.clone(), text_index)
+                            if let Err(e) = s.text_store.create_index(meta.name.clone(), text_index)
                             {
                                 tracing::warn!(
                                     "Shard {}: failed to restore text index '{}': {}",

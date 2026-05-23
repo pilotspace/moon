@@ -956,8 +956,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                     )
                                 })
                             } else {
-                                let mut gs =
-                                    ctx.shard_databases.graph_store_write(ctx.shard_id);
+                                let mut gs = ctx.shard_databases.graph_store_write(ctx.shard_id);
                                 let r = crate::command::server_admin::vacuum_graph(
                                     &mut gs,
                                     &cmd_args[1..],
@@ -1083,8 +1082,14 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     //
                     // Returns Ok((result, new_selected_db, hset_inserts)) on success
                     // or Err(oom_frame) when OOM eviction fails (caller pushes + continues).
-                    let write_result: Result<(DispatchResult, usize, smallvec::SmallVec<[(bytes::Bytes, u64); 4]>), Frame> =
-                        'write_path: {
+                    let write_result: Result<
+                        (
+                            DispatchResult,
+                            usize,
+                            smallvec::SmallVec<[(bytes::Bytes, u64); 4]>,
+                        ),
+                        Frame,
+                    > = 'write_path: {
                         if crate::shard::slice::is_initialized() {
                             crate::shard::slice::with_shard(|s| {
                                 let sel_db = conn.selected_db;
@@ -1100,12 +1105,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                             .as_deref()
                                             .unwrap_or(std::path::Path::new("."));
                                         let res = try_evict_if_needed_async_spill(
-                                            db,
-                                            &rt,
-                                            sender,
-                                            dir,
-                                            &mut fid,
-                                            sel_db,
+                                            db, &rt, sender, dir, &mut fid, sel_db,
                                         );
                                         ctx.spill_file_id.set(fid);
                                         res
@@ -1125,8 +1125,10 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                                 if let Some(old_entry) =
                                                     db.get(key_bytes.as_ref()).cloned()
                                                 {
-                                                    txn.kv_undo
-                                                        .record_delete(key_bytes.clone(), old_entry);
+                                                    txn.kv_undo.record_delete(
+                                                        key_bytes.clone(),
+                                                        old_entry,
+                                                    );
                                                     let lsn = txn.snapshot_lsn;
                                                     let tid = txn.txn_id;
                                                     ctx.shard_databases
@@ -1149,16 +1151,17 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                                 txn.kv_undo.record_update(key.clone(), entry)
                                             }
                                         }
-                                        ctx.shard_databases
-                                            .kv_intents(ctx.shard_id)
-                                            .record_write(key.clone(), lsn, tid);
+                                        ctx.shard_databases.kv_intents(ctx.shard_id).record_write(
+                                            key.clone(),
+                                            lsn,
+                                            tid,
+                                        );
                                     }
                                 }
 
                                 // Dispatch
                                 let mut new_sel_db = sel_db;
-                                let result =
-                                    dispatch(db, cmd, cmd_args, &mut new_sel_db, db_count);
+                                let result = dispatch(db, cmd, cmd_args, &mut new_sel_db, db_count);
                                 let response_frame = match &result {
                                     DispatchResult::Response(f) | DispatchResult::Quit(f) => {
                                         f.clone()
@@ -1170,8 +1173,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                 // &mut s.vector_store + &mut s.text_store are separate
                                 // from s.databases[sel_db] already borrowed above as `db`.
                                 // Re-borrow db after dispatch since `db` was moved into dispatch.
-                                let hset_inserts = if !is_error
-                                    && cmd.eq_ignore_ascii_case(b"HSET")
+                                let hset_inserts = if !is_error && cmd.eq_ignore_ascii_case(b"HSET")
                                 {
                                     if let Some(key) =
                                         cmd_args.first().and_then(|f| extract_bytes(f))
@@ -1206,17 +1208,11 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                                 || cmd.eq_ignore_ascii_case(b"LMOVE")
                                             {
                                                 crate::blocking::wakeup::try_wake_list_waiter(
-                                                    &mut reg,
-                                                    wake_db,
-                                                    new_sel_db,
-                                                    &key,
+                                                    &mut reg, wake_db, new_sel_db, &key,
                                                 );
                                             } else {
                                                 crate::blocking::wakeup::try_wake_zset_waiter(
-                                                    &mut reg,
-                                                    wake_db,
-                                                    new_sel_db,
-                                                    &key,
+                                                    &mut reg, wake_db, new_sel_db, &key,
                                                 );
                                             }
                                         }
@@ -1288,9 +1284,11 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                             txn.kv_undo.record_update(key.clone(), entry)
                                         }
                                     }
-                                    ctx.shard_databases
-                                        .kv_intents(ctx.shard_id)
-                                        .record_write(key.clone(), lsn, tid);
+                                    ctx.shard_databases.kv_intents(ctx.shard_id).record_write(
+                                        key.clone(),
+                                        lsn,
+                                        tid,
+                                    );
                                 }
                             }
 
@@ -1308,27 +1306,22 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                     | DispatchResult::Quit(Frame::Error(_))
                             );
 
-                            let hset_inserts =
-                                if !is_error && cmd.eq_ignore_ascii_case(b"HSET") {
-                                    if let Some(key) =
-                                        cmd_args.first().and_then(|f| extract_bytes(f))
-                                    {
-                                        let mut vs =
-                                            ctx.shard_databases.vector_store(ctx.shard_id);
-                                        let mut ts =
-                                            ctx.shard_databases.text_store(ctx.shard_id);
-                                        crate::shard::spsc_handler::auto_index_hset_public(
-                                            &mut vs,
-                                            &mut *ts,
-                                            key.as_ref(),
-                                            cmd_args,
-                                        )
-                                    } else {
-                                        smallvec::SmallVec::new()
-                                    }
+                            let hset_inserts = if !is_error && cmd.eq_ignore_ascii_case(b"HSET") {
+                                if let Some(key) = cmd_args.first().and_then(|f| extract_bytes(f)) {
+                                    let mut vs = ctx.shard_databases.vector_store(ctx.shard_id);
+                                    let mut ts = ctx.shard_databases.text_store(ctx.shard_id);
+                                    crate::shard::spsc_handler::auto_index_hset_public(
+                                        &mut vs,
+                                        &mut *ts,
+                                        key.as_ref(),
+                                        cmd_args,
+                                    )
                                 } else {
                                     smallvec::SmallVec::new()
-                                };
+                                }
+                            } else {
+                                smallvec::SmallVec::new()
+                            };
 
                             if !is_error {
                                 let needs_wake = cmd.eq_ignore_ascii_case(b"LPUSH")
@@ -1345,17 +1338,11 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                             || cmd.eq_ignore_ascii_case(b"LMOVE")
                                         {
                                             crate::blocking::wakeup::try_wake_list_waiter(
-                                                &mut reg,
-                                                &mut guard,
-                                                new_sel_db,
-                                                &key,
+                                                &mut reg, &mut guard, new_sel_db, &key,
                                             );
                                         } else {
                                             crate::blocking::wakeup::try_wake_zset_waiter(
-                                                &mut reg,
-                                                &mut guard,
-                                                new_sel_db,
-                                                &key,
+                                                &mut reg, &mut guard, new_sel_db, &key,
                                             );
                                         }
                                     }
@@ -1365,7 +1352,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                             drop(guard);
                             Ok((result, new_sel_db, hset_inserts))
                         } // end else branch
-                        }; // end 'write_path labeled block
+                    }; // end 'write_path labeled block
 
                     // Unpack write result — OOM causes immediate continue
                     let (result, new_selected_db, hset_inserts) = match write_result {
@@ -1496,31 +1483,26 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     conn.cmd_counter = conn.cmd_counter.wrapping_add(1);
                     let sample_latency = (conn.cmd_counter & 0xF) == 0;
                     let dispatch_start = sample_latency.then(std::time::Instant::now);
-                    let (result, new_read_selected_db) =
-                        if crate::shard::slice::is_initialized() {
-                            let mut sel_db = conn.selected_db;
-                            let result = crate::shard::slice::with_shard_db(
-                                conn.selected_db,
-                                |db| {
-                                    dispatch_read(db, cmd, cmd_args, now_ms, &mut sel_db, db_count)
-                                },
-                            );
-                            (result, sel_db)
-                        } else {
-                            let guard =
-                                ctx.shard_databases.read_db(ctx.shard_id, conn.selected_db);
-                            let result = dispatch_read(
-                                &guard,
-                                cmd,
-                                cmd_args,
-                                now_ms,
-                                &mut conn.selected_db,
-                                db_count,
-                            );
-                            let sel = conn.selected_db;
-                            drop(guard);
-                            (result, sel)
-                        };
+                    let (result, new_read_selected_db) = if crate::shard::slice::is_initialized() {
+                        let mut sel_db = conn.selected_db;
+                        let result = crate::shard::slice::with_shard_db(conn.selected_db, |db| {
+                            dispatch_read(db, cmd, cmd_args, now_ms, &mut sel_db, db_count)
+                        });
+                        (result, sel_db)
+                    } else {
+                        let guard = ctx.shard_databases.read_db(ctx.shard_id, conn.selected_db);
+                        let result = dispatch_read(
+                            &guard,
+                            cmd,
+                            cmd_args,
+                            now_ms,
+                            &mut conn.selected_db,
+                            db_count,
+                        );
+                        let sel = conn.selected_db;
+                        drop(guard);
+                        (result, sel)
+                    };
                     conn.selected_db = new_read_selected_db;
                     if let Ok(cmd_str) = std::str::from_utf8(cmd) {
                         if let Some(start) = dispatch_start {

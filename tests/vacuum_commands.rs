@@ -19,7 +19,7 @@
 
 use std::time::Duration;
 
-use moon::config::ServerConfig;
+use moon::config::{CrossShardFastPath, ServerConfig};
 use moon::runtime::cancel::CancellationToken;
 use moon::server::listener;
 use tokio::net::TcpListener;
@@ -90,6 +90,7 @@ fn base_config(port: u16) -> ServerConfig {
         recovery_target_time: None,
         manifest_tombstone_retain_epochs: 2,
         manifest_tombstone_retain_secs: 300,
+        cross_shard_fast_path: CrossShardFastPath::Auto,
         disk_free_min_pct: 5,
         mvcc_committed_prune_margin: 1000,
         max_unflushed_immutable_segments: 20,

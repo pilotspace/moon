@@ -141,7 +141,9 @@ pub fn ft_info(
     // Starts at 0 on boot; NOT restored from WAL (freshness hint only).
     // Bumped after every successful vector insert, create_index, drop_index,
     // or mark_deleted_for_key. Use to detect stale query-cache entries.
-    items.push(Frame::BulkString(Bytes::from_static(b"vector_version_token")));
+    items.push(Frame::BulkString(Bytes::from_static(
+        b"vector_version_token",
+    )));
     items.push(Frame::Integer(store.version_token() as i64));
 
     // Hybrid index: append text field stats if this index also has a TextIndex

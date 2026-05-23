@@ -468,23 +468,26 @@ pub(super) async fn try_handle_ft_command(
                                     }
                                     .max(1);
                                     // Phase 2f: gate on is_initialized(); new path uses ShardSlice directly.
-                                    let lookup_body = |ts: &crate::text::store::TextStore| -> Frame {
-                                        match ts.get_index(&index_name) {
-                                            None => {
-                                                Frame::Error(Bytes::from_static(b"ERR no such index"))
-                                            }
-                                            Some(text_index) => {
-                                                let results = crate::command::vector_search::ft_text_search::execute_query_on_index(
+                                    let lookup_body =
+                                        |ts: &crate::text::store::TextStore| -> Frame {
+                                            match ts.get_index(&index_name) {
+                                                None => Frame::Error(Bytes::from_static(
+                                                    b"ERR no such index",
+                                                )),
+                                                Some(text_index) => {
+                                                    let results = crate::command::vector_search::ft_text_search::execute_query_on_index(
                                                     text_index, &clause, None, None, top_k,
                                                 );
-                                                crate::command::vector_search::ft_text_search::build_text_response(
+                                                    crate::command::vector_search::ft_text_search::build_text_response(
                                                     &results, offset, count,
                                                 )
+                                                }
                                             }
-                                        }
-                                    };
+                                        };
                                     let response = if crate::shard::slice::is_initialized() {
-                                        crate::shard::slice::with_shard(|s| lookup_body(&s.text_store))
+                                        crate::shard::slice::with_shard(|s| {
+                                            lookup_body(&s.text_store)
+                                        })
                                     } else {
                                         let ts_guard = ctx.shard_databases.text_store(ctx.shard_id);
                                         let r = lookup_body(&ts_guard);
@@ -562,30 +565,33 @@ pub(super) async fn try_handle_ft_command(
                             };
                             let field_idx = match &clause.field_name {
                                 None => None,
-                                Some(field_name) => match text_index.text_fields.iter().position(|f| {
-                                    f.field_name
-                                        .as_ref()
-                                        .eq_ignore_ascii_case(field_name.as_ref())
-                                }) {
-                                    Some(idx) => Some(idx),
-                                    None => {
-                                        return Frame::Error(Bytes::from(format!(
-                                            "ERR unknown field '{}'",
-                                            String::from_utf8_lossy(field_name)
-                                        )));
+                                Some(field_name) => {
+                                    match text_index.text_fields.iter().position(|f| {
+                                        f.field_name
+                                            .as_ref()
+                                            .eq_ignore_ascii_case(field_name.as_ref())
+                                    }) {
+                                        Some(idx) => Some(idx),
+                                        None => {
+                                            return Frame::Error(Bytes::from(format!(
+                                                "ERR unknown field '{}'",
+                                                String::from_utf8_lossy(field_name)
+                                            )));
+                                        }
                                     }
-                                },
+                                }
                             };
                             let query_terms = clause.terms;
-                            let mut response = crate::command::vector_search::execute_text_search_local(
-                                ts,
-                                &index_name,
-                                field_idx,
-                                &query_terms,
-                                top_k,
-                                offset,
-                                count,
-                            );
+                            let mut response =
+                                crate::command::vector_search::execute_text_search_local(
+                                    ts,
+                                    &index_name,
+                                    field_idx,
+                                    &query_terms,
+                                    top_k,
+                                    offset,
+                                    count,
+                                );
                             if let Some(db) = db_opt {
                                 let term_strings: Vec<String> =
                                     query_terms.iter().map(|qt| qt.text.clone()).collect();
@@ -603,11 +609,8 @@ pub(super) async fn try_handle_ft_command(
 
                         let response = if crate::shard::slice::is_initialized() {
                             crate::shard::slice::with_shard(|s| {
-                                let db_opt: Option<&crate::storage::db::Database> = if need_db {
-                                    Some(&s.databases[0])
-                                } else {
-                                    None
-                                };
+                                let db_opt: Option<&crate::storage::db::Database> =
+                                    if need_db { Some(&s.databases[0]) } else { None };
                                 text_search_body(&s.text_store, db_opt)
                             })
                         } else {
@@ -617,10 +620,7 @@ pub(super) async fn try_handle_ft_command(
                             } else {
                                 None
                             };
-                            let response = text_search_body(
-                                &ts_guard,
-                                db_guard_opt.as_deref(),
-                            );
+                            let response = text_search_body(&ts_guard, db_guard_opt.as_deref());
                             drop(db_guard_opt);
                             drop(ts_guard);
                             response
@@ -658,7 +658,11 @@ pub(super) async fn try_handle_ft_command(
     let response = if crate::shard::slice::is_initialized() {
         crate::shard::slice::with_shard(|s| {
             if cmd.eq_ignore_ascii_case(b"FT.CREATE") {
-                crate::command::vector_search::ft_create(&mut s.vector_store, &mut s.text_store, cmd_args)
+                crate::command::vector_search::ft_create(
+                    &mut s.vector_store,
+                    &mut s.text_store,
+                    cmd_args,
+                )
             } else if cmd.eq_ignore_ascii_case(b"FT.SEARCH") {
                 #[allow(clippy::unwrap_used)] // as_of_lsn_opt is Some when cmd == FT.SEARCH
                 match as_of_lsn_opt.unwrap() {
@@ -673,11 +677,8 @@ pub(super) async fn try_handle_ft_command(
                         });
                         if has_session {
                             // Borrow databases[0] disjointly from vector_store/text_store.
-                            let (vs, ts, dbs) = (
-                                &mut s.vector_store,
-                                &s.text_store,
-                                &mut s.databases,
-                            );
+                            let (vs, ts, dbs) =
+                                (&mut s.vector_store, &s.text_store, &mut s.databases);
                             crate::command::vector_search::ft_search(
                                 vs,
                                 cmd_args,
@@ -697,27 +698,29 @@ pub(super) async fn try_handle_ft_command(
                     }
                 }
             } else if cmd.eq_ignore_ascii_case(b"FT.DROPINDEX") {
-                let (vs, ts, dbs) = (
-                    &mut s.vector_store,
-                    &mut s.text_store,
-                    &mut s.databases,
-                );
-                crate::command::vector_search::ft_dropindex(
-                    vs,
-                    ts,
-                    Some(&mut dbs[0]),
-                    cmd_args,
-                )
+                let (vs, ts, dbs) = (&mut s.vector_store, &mut s.text_store, &mut s.databases);
+                crate::command::vector_search::ft_dropindex(vs, ts, Some(&mut dbs[0]), cmd_args)
             } else if cmd.eq_ignore_ascii_case(b"FT.INFO") {
                 crate::command::vector_search::ft_info(&s.vector_store, &s.text_store, cmd_args)
             } else if cmd.eq_ignore_ascii_case(b"FT._LIST") {
                 crate::command::vector_search::ft_list(&s.vector_store)
             } else if cmd.eq_ignore_ascii_case(b"FT.COMPACT") {
-                crate::command::vector_search::ft_compact(&mut s.vector_store, &mut s.text_store, cmd_args)
+                crate::command::vector_search::ft_compact(
+                    &mut s.vector_store,
+                    &mut s.text_store,
+                    cmd_args,
+                )
             } else if cmd.eq_ignore_ascii_case(b"FT.CACHESEARCH") {
-                crate::command::vector_search::cache_search::ft_cachesearch(&mut s.vector_store, cmd_args)
+                crate::command::vector_search::cache_search::ft_cachesearch(
+                    &mut s.vector_store,
+                    cmd_args,
+                )
             } else if cmd.eq_ignore_ascii_case(b"FT.CONFIG") {
-                crate::command::vector_search::ft_config(&mut s.vector_store, &mut s.text_store, cmd_args)
+                crate::command::vector_search::ft_config(
+                    &mut s.vector_store,
+                    &mut s.text_store,
+                    cmd_args,
+                )
             } else if cmd.eq_ignore_ascii_case(b"FT.RECOMMEND") {
                 let (vs, dbs) = (&mut s.vector_store, &mut s.databases);
                 crate::command::vector_search::recommend::ft_recommend(

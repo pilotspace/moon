@@ -519,9 +519,7 @@ pub(super) async fn try_handle_ft_command(
                     }
                     #[cfg(not(feature = "graph"))]
                     {
-                        Frame::Error(Bytes::from_static(
-                            b"ERR FT.EXPAND requires graph feature",
-                        ))
+                        Frame::Error(Bytes::from_static(b"ERR FT.EXPAND requires graph feature"))
                     }
                 }
             };
@@ -654,7 +652,8 @@ pub(super) async fn try_handle_ft_command(
                                                 }
                                             })
                                         } else {
-                                            let ts_guard = ctx.shard_databases.text_store(ctx.shard_id);
+                                            let ts_guard =
+                                                ctx.shard_databases.text_store(ctx.shard_id);
                                             let r = match ts_guard.get_index(&index_name) {
                                                 None => Frame::Error(Bytes::from_static(
                                                     b"ERR no such index",
@@ -711,13 +710,14 @@ pub(super) async fn try_handle_ft_command(
                                 if crate::shard::slice::is_initialized() {
                                     crate::shard::slice::with_shard(|s| {
                                         // Step 2-3: resolve index from text_store.
-                                        let text_index =
-                                            match s.text_store.get_index(&index_name) {
-                                                Some(idx) => idx,
-                                                None => return Err(Frame::Error(
-                                                    Bytes::from_static(b"ERR no such index"),
-                                                )),
-                                            };
+                                        let text_index = match s.text_store.get_index(&index_name) {
+                                            Some(idx) => idx,
+                                            None => {
+                                                return Err(Frame::Error(Bytes::from_static(
+                                                    b"ERR no such index",
+                                                )));
+                                            }
+                                        };
                                         // Step 4: ensure TEXT fields.
                                         if text_index.text_fields.is_empty() {
                                             return Err(Frame::Error(Bytes::from_static(
@@ -725,24 +725,26 @@ pub(super) async fn try_handle_ft_command(
                                             )));
                                         }
                                         // Step 5: parse query.
-                                        let analyzer =
-                                            match text_index.field_analyzers.first() {
-                                                Some(a) => a,
-                                                None => return Err(Frame::Error(
-                                                    Bytes::from_static(
-                                                        b"ERR index has no TEXT fields",
-                                                    ),
-                                                )),
-                                            };
-                                        let clause = match crate::command::vector_search::parse_text_query(
-                                            query_bytes.as_ref(),
-                                            analyzer,
-                                        ) {
-                                            Ok(c) => c,
-                                            Err(msg) => return Err(Frame::Error(
-                                                Bytes::copy_from_slice(msg.as_bytes()),
-                                            )),
+                                        let analyzer = match text_index.field_analyzers.first() {
+                                            Some(a) => a,
+                                            None => {
+                                                return Err(Frame::Error(Bytes::from_static(
+                                                    b"ERR index has no TEXT fields",
+                                                )));
+                                            }
                                         };
+                                        let clause =
+                                            match crate::command::vector_search::parse_text_query(
+                                                query_bytes.as_ref(),
+                                                analyzer,
+                                            ) {
+                                                Ok(c) => c,
+                                                Err(msg) => {
+                                                    return Err(Frame::Error(
+                                                        Bytes::copy_from_slice(msg.as_bytes()),
+                                                    ));
+                                                }
+                                            };
                                         // Step 5b: resolve field_idx.
                                         let field_idx = match &clause.field_name {
                                             None => None,
@@ -780,8 +782,10 @@ pub(super) async fn try_handle_ft_command(
                                         // Step 9+10b: optional post-processing with db access.
                                         if needs_db {
                                             let db = &s.databases[0];
-                                            let term_strings: Vec<String> =
-                                                query_terms.iter().map(|qt| qt.text.clone()).collect();
+                                            let term_strings: Vec<String> = query_terms
+                                                .iter()
+                                                .map(|qt| qt.text.clone())
+                                                .collect();
                                             crate::command::vector_search::apply_post_processing(
                                                 &mut response,
                                                 &term_strings,
@@ -795,8 +799,7 @@ pub(super) async fn try_handle_ft_command(
                                     })
                                 } else {
                                     // Step 2: acquire ts guard (single-shard monoio).
-                                    let ts_guard =
-                                        ctx.shard_databases.text_store(ctx.shard_id);
+                                    let ts_guard = ctx.shard_databases.text_store(ctx.shard_id);
                                     // Step 3: resolve index.
                                     let text_index = match ts_guard.get_index(&index_name) {
                                         Some(idx) => idx,
@@ -826,18 +829,19 @@ pub(super) async fn try_handle_ft_command(
                                             return true;
                                         }
                                     };
-                                    let clause = match crate::command::vector_search::parse_text_query(
-                                        query_bytes.as_ref(),
-                                        analyzer,
-                                    ) {
-                                        Ok(c) => c,
-                                        Err(msg) => {
-                                            responses.push(Frame::Error(
-                                                Bytes::copy_from_slice(msg.as_bytes()),
-                                            ));
-                                            return true;
-                                        }
-                                    };
+                                    let clause =
+                                        match crate::command::vector_search::parse_text_query(
+                                            query_bytes.as_ref(),
+                                            analyzer,
+                                        ) {
+                                            Ok(c) => c,
+                                            Err(msg) => {
+                                                responses.push(Frame::Error(
+                                                    Bytes::copy_from_slice(msg.as_bytes()),
+                                                ));
+                                                return true;
+                                            }
+                                        };
                                     // Step 5b: resolve field_idx.
                                     let field_idx = match &clause.field_name {
                                         None => None,
@@ -979,11 +983,7 @@ pub(super) async fn try_handle_ft_command(
                         cmd_args,
                     )
                 } else if cmd.eq_ignore_ascii_case(b"FT.INFO") {
-                    crate::command::vector_search::ft_info(
-                        &s.vector_store,
-                        &s.text_store,
-                        cmd_args,
-                    )
+                    crate::command::vector_search::ft_info(&s.vector_store, &s.text_store, cmd_args)
                 } else if cmd.eq_ignore_ascii_case(b"FT._LIST") {
                     crate::command::vector_search::ft_list(&s.vector_store)
                 } else if cmd.eq_ignore_ascii_case(b"FT.COMPACT") {
@@ -1032,9 +1032,7 @@ pub(super) async fn try_handle_ft_command(
                     }
                     #[cfg(not(feature = "graph"))]
                     {
-                        Frame::Error(Bytes::from_static(
-                            b"ERR FT.EXPAND requires graph feature",
-                        ))
+                        Frame::Error(Bytes::from_static(b"ERR FT.EXPAND requires graph feature"))
                     }
                 } else if cmd.eq_ignore_ascii_case(b"FT.INVALIDATE_RANGE") {
                     #[cfg(feature = "text-index")]

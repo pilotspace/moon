@@ -1242,25 +1242,22 @@ pub async fn scatter_text_search(
             // CRITICAL: block scope drops MutexGuard before any .await (RESEARCH Pitfall 2).
             // Phase 2c: gate on is_initialized(); new path uses ShardSlice directly.
             let response = if crate::shard::slice::is_initialized() {
-                crate::shard::slice::with_shard(|s| {
-                    match s.text_store.get_index(&index_name) {
-                        Some(text_index) => {
-                            let mut items: Vec<Frame> = Vec::new();
-                            for (field_idx_opt, terms) in &field_queries {
-                                let fidx = field_idx_opt.unwrap_or(0);
-                                let (term_dfs, n) =
-                                    text_index.doc_freq_for_terms(fidx, terms);
-                                for (term, df) in term_dfs {
-                                    items.push(Frame::BulkString(Bytes::from(term)));
-                                    items.push(Frame::Integer(i64::from(df)));
-                                }
-                                items.push(Frame::BulkString(Bytes::from_static(b"N")));
-                                items.push(Frame::Integer(i64::from(n)));
+                crate::shard::slice::with_shard(|s| match s.text_store.get_index(&index_name) {
+                    Some(text_index) => {
+                        let mut items: Vec<Frame> = Vec::new();
+                        for (field_idx_opt, terms) in &field_queries {
+                            let fidx = field_idx_opt.unwrap_or(0);
+                            let (term_dfs, n) = text_index.doc_freq_for_terms(fidx, terms);
+                            for (term, df) in term_dfs {
+                                items.push(Frame::BulkString(Bytes::from(term)));
+                                items.push(Frame::Integer(i64::from(df)));
                             }
-                            Frame::Array(items.into())
+                            items.push(Frame::BulkString(Bytes::from_static(b"N")));
+                            items.push(Frame::Integer(i64::from(n)));
                         }
-                        None => Frame::Error(Bytes::from_static(b"ERR unknown index")),
+                        Frame::Array(items.into())
                     }
+                    None => Frame::Error(Bytes::from_static(b"ERR unknown index")),
                 })
             } else {
                 let ts = shard_databases.text_store(shard_id);
@@ -1471,12 +1468,11 @@ pub async fn scatter_text_search_filter(
             crate::shard::slice::with_shard(|s| match s.text_store.get_index(&index_name) {
                 None => Frame::Error(Bytes::from_static(b"ERR no such index")),
                 Some(text_index) => {
-                    let clause =
-                        crate::command::vector_search::ft_text_search::TextQueryClause {
-                            field_name: None,
-                            terms: Vec::new(),
-                            filter: Some(filter),
-                        };
+                    let clause = crate::command::vector_search::ft_text_search::TextQueryClause {
+                        field_name: None,
+                        terms: Vec::new(),
+                        filter: Some(filter),
+                    };
                     let results =
                         crate::command::vector_search::ft_text_search::execute_query_on_index(
                             text_index, &clause, None, None, top_k,

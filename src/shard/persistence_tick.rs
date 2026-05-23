@@ -122,9 +122,7 @@ pub(crate) fn advance_snapshot_segment(
         if current_db < db_count {
             // Phase 2d: gate on is_initialized(); new path uses ShardSlice directly.
             if crate::shard::slice::is_initialized() {
-                crate::shard::slice::with_shard_db(current_db, |db| {
-                    snap.advance_one_segment_db(db)
-                })
+                crate::shard::slice::with_shard_db(current_db, |db| snap.advance_one_segment_db(db))
             } else {
                 let guard = shard_databases.read_db(shard_id, current_db);
                 snap.advance_one_segment_db(&guard)

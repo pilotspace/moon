@@ -83,14 +83,13 @@ pub(super) fn try_handle_txn_commit(
                 let txn_id = txn.txn_id;
                 if !txn.kv_undo.is_empty() {
                     let payload = if crate::shard::slice::is_initialized() {
-                        crate::shard::slice::with_shard_db(
-                            conn.selected_db as usize,
-                            |db| crate::persistence::wal_v3::record::encode_xact_commit_payload(
+                        crate::shard::slice::with_shard_db(conn.selected_db as usize, |db| {
+                            crate::persistence::wal_v3::record::encode_xact_commit_payload(
                                 txn_id,
                                 txn.kv_undo.records(),
                                 db,
-                            ),
-                        )
+                            )
+                        })
                     } else {
                         let db_guard = ctx.shard_databases.read_db(ctx.shard_id, conn.selected_db);
                         let p = crate::persistence::wal_v3::record::encode_xact_commit_payload(
@@ -132,19 +131,16 @@ pub(super) fn try_handle_txn_commit(
                 // Materialize MQ intents: enqueue deferred MQ.PUBLISH messages
                 if !txn.mq_intents.is_empty() {
                     if crate::shard::slice::is_initialized() {
-                        crate::shard::slice::with_shard_db(
-                            conn.selected_db as usize,
-                            |db| {
-                                for intent in &txn.mq_intents {
-                                    if let Ok(Some(stream)) = db.get_stream_mut(&intent.queue_key) {
-                                        if stream.durable {
-                                            let msg_id = stream.next_auto_id();
-                                            stream.add(msg_id, intent.fields.clone());
-                                        }
+                        crate::shard::slice::with_shard_db(conn.selected_db as usize, |db| {
+                            for intent in &txn.mq_intents {
+                                if let Ok(Some(stream)) = db.get_stream_mut(&intent.queue_key) {
+                                    if stream.durable {
+                                        let msg_id = stream.next_auto_id();
+                                        stream.add(msg_id, intent.fields.clone());
                                     }
                                 }
-                            },
-                        );
+                            }
+                        });
                     } else {
                         let mut db_guard =
                             ctx.shard_databases.write_db(ctx.shard_id, conn.selected_db);
@@ -251,47 +247,10 @@ pub(super) fn try_handle_temporal_invalidate(
                 // Phase 2a: gate on is_initialized(); new path is dead code until Phase 4
                 // wires init_shard() at shard startup. Both branches are semantically
                 // identical; the new path uses ShardSlice::graph_store directly (no lock).
-                let (mutated_ok, wal_records, err_frame) =
-                    if crate::shard::slice::is_initialized() {
-                        crate::shard::slice::with_shard(|s| {
-                            let gs = &mut s.graph_store;
-                            if let Some(named_graph) = gs.get_graph_mut(&graph_name) {
-                                let mutated = if is_node {
-                                    let node_key: crate::graph::types::NodeKey =
-                                        slotmap::KeyData::from_ffi(entity_id).into();
-                                    if let Some(node) = named_graph.write_buf.get_node_mut(node_key) {
-                                        node.valid_to = wall_ms;
-                                        true
-                                    } else {
-                                        false
-                                    }
-                                } else {
-                                    let edge_key: crate::graph::types::EdgeKey =
-                                        slotmap::KeyData::from_ffi(entity_id).into();
-                                    if let Some(edge) = named_graph.write_buf.get_edge_mut(edge_key) {
-                                        edge.valid_to = wall_ms;
-                                        true
-                                    } else {
-                                        false
-                                    }
-                                };
-                                if mutated {
-                                    let payload =
-                                        crate::persistence::wal_v3::record::encode_graph_temporal(
-                                            entity_id, is_node, wall_ms, wall_ms,
-                                        );
-                                    gs.wal_pending.push(payload);
-                                    let recs = gs.drain_wal();
-                                    (true, recs, None)
-                                } else {
-                                    (false, Vec::new(), Some(ERR_ENTITY_NOT_FOUND))
-                                }
-                            } else {
-                                (false, Vec::new(), Some(ERR_GRAPH_NOT_FOUND))
-                            }
-                        })
-                    } else {
-                        let mut gs = ctx.shard_databases.graph_store_write(ctx.shard_id);
+                let (mutated_ok, wal_records, err_frame) = if crate::shard::slice::is_initialized()
+                {
+                    crate::shard::slice::with_shard(|s| {
+                        let gs = &mut s.graph_store;
                         if let Some(named_graph) = gs.get_graph_mut(&graph_name) {
                             let mutated = if is_node {
                                 let node_key: crate::graph::types::NodeKey =
@@ -326,7 +285,43 @@ pub(super) fn try_handle_temporal_invalidate(
                         } else {
                             (false, Vec::new(), Some(ERR_GRAPH_NOT_FOUND))
                         }
-                    };
+                    })
+                } else {
+                    let mut gs = ctx.shard_databases.graph_store_write(ctx.shard_id);
+                    if let Some(named_graph) = gs.get_graph_mut(&graph_name) {
+                        let mutated = if is_node {
+                            let node_key: crate::graph::types::NodeKey =
+                                slotmap::KeyData::from_ffi(entity_id).into();
+                            if let Some(node) = named_graph.write_buf.get_node_mut(node_key) {
+                                node.valid_to = wall_ms;
+                                true
+                            } else {
+                                false
+                            }
+                        } else {
+                            let edge_key: crate::graph::types::EdgeKey =
+                                slotmap::KeyData::from_ffi(entity_id).into();
+                            if let Some(edge) = named_graph.write_buf.get_edge_mut(edge_key) {
+                                edge.valid_to = wall_ms;
+                                true
+                            } else {
+                                false
+                            }
+                        };
+                        if mutated {
+                            let payload = crate::persistence::wal_v3::record::encode_graph_temporal(
+                                entity_id, is_node, wall_ms, wall_ms,
+                            );
+                            gs.wal_pending.push(payload);
+                            let recs = gs.drain_wal();
+                            (true, recs, None)
+                        } else {
+                            (false, Vec::new(), Some(ERR_ENTITY_NOT_FOUND))
+                        }
+                    } else {
+                        (false, Vec::new(), Some(ERR_GRAPH_NOT_FOUND))
+                    }
+                };
                 if mutated_ok {
                     for record in wal_records {
                         ctx.shard_databases

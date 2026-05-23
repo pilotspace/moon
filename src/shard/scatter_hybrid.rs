@@ -109,28 +109,30 @@ pub async fn scatter_hybrid_search(
     // owned text_store. Both branches return a fully-owned ParseOutcome so
     // no borrows of the shard slice escape.
     let parse_outcome: ParseOutcome = if crate::shard::slice::is_initialized() {
-        crate::shard::slice::with_shard(|s| match s.text_store.get_index(query.index_name.as_ref())
-        {
-            None => Err(Frame::Error(Bytes::from_static(b"ERR unknown index"))),
-            Some(text_index) => match text_index.field_analyzers.first() {
-                None => Err(Frame::Error(Bytes::from_static(
-                    b"ERR index has no TEXT fields",
-                ))),
-                Some(analyzer) => {
-                    match crate::command::vector_search::parse_text_query(text_bytes, analyzer) {
-                        Ok(clause) => {
-                            let strings: Vec<String> =
-                                clause.terms.iter().map(|qt| qt.text.clone()).collect();
-                            Ok((clause.terms, strings))
-                        }
-                        Err(e) => {
-                            let mut msg = b"ERR ".to_vec();
-                            msg.extend_from_slice(e.as_bytes());
-                            Err(Frame::Error(Bytes::from(msg)))
+        crate::shard::slice::with_shard(|s| {
+            match s.text_store.get_index(query.index_name.as_ref()) {
+                None => Err(Frame::Error(Bytes::from_static(b"ERR unknown index"))),
+                Some(text_index) => match text_index.field_analyzers.first() {
+                    None => Err(Frame::Error(Bytes::from_static(
+                        b"ERR index has no TEXT fields",
+                    ))),
+                    Some(analyzer) => {
+                        match crate::command::vector_search::parse_text_query(text_bytes, analyzer)
+                        {
+                            Ok(clause) => {
+                                let strings: Vec<String> =
+                                    clause.terms.iter().map(|qt| qt.text.clone()).collect();
+                                Ok((clause.terms, strings))
+                            }
+                            Err(e) => {
+                                let mut msg = b"ERR ".to_vec();
+                                msg.extend_from_slice(e.as_bytes());
+                                Err(Frame::Error(Bytes::from(msg)))
+                            }
                         }
                     }
-                }
-            },
+                },
+            }
         })
     } else {
         let ts = shard_databases.text_store(my_shard);

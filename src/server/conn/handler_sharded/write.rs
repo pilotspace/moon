@@ -285,8 +285,7 @@ pub(super) fn try_handle_mq_command(
                         }
                     })
                 } else {
-                    let mut db_guard =
-                        ctx.shard_databases.write_db(ctx.shard_id, conn.selected_db);
+                    let mut db_guard = ctx.shard_databases.write_db(ctx.shard_id, conn.selected_db);
                     let r = match db_guard.get_or_create_stream(&effective_key) {
                         Ok(stream) => {
                             stream.durable = true;
@@ -356,8 +355,7 @@ pub(super) fn try_handle_mq_command(
                         }
                     })
                 } else {
-                    let mut db_guard =
-                        ctx.shard_databases.write_db(ctx.shard_id, conn.selected_db);
+                    let mut db_guard = ctx.shard_databases.write_db(ctx.shard_id, conn.selected_db);
                     let r = match db_guard.get_stream_mut(&effective_key) {
                         Ok(Some(stream)) => {
                             if !stream.durable {
@@ -377,8 +375,7 @@ pub(super) fn try_handle_mq_command(
                 match push_outcome {
                     Ok(Some(msg_id)) => {
                         {
-                            let mut trig_guard =
-                                ctx.shard_databases.trigger_registry(ctx.shard_id);
+                            let mut trig_guard = ctx.shard_databases.trigger_registry(ctx.shard_id);
                             if let Some(reg) = trig_guard.as_mut() {
                                 let trig_key = if let Some(ws_id) = conn.workspace_id.as_ref() {
                                     let ws_hex = ws_id.as_hex();
@@ -510,10 +507,7 @@ pub(super) fn try_handle_mq_command(
                             let field_frames: Vec<Frame> = fields
                                 .iter()
                                 .flat_map(|(f, v)| {
-                                    vec![
-                                        Frame::BulkString(f.clone()),
-                                        Frame::BulkString(v.clone()),
-                                    ]
+                                    vec![Frame::BulkString(f.clone()), Frame::BulkString(v.clone())]
                                 })
                                 .collect();
                             entry_frames.push(Frame::Array(field_frames.into()));
@@ -526,8 +520,7 @@ pub(super) fn try_handle_mq_command(
                 let response = if crate::shard::slice::is_initialized() {
                     crate::shard::slice::with_shard_db(conn.selected_db, pop_body)
                 } else {
-                    let mut db_guard =
-                        ctx.shard_databases.write_db(ctx.shard_id, conn.selected_db);
+                    let mut db_guard = ctx.shard_databases.write_db(ctx.shard_id, conn.selected_db);
                     let r = pop_body(&mut *db_guard);
                     drop(db_guard);
                     r
@@ -566,8 +559,7 @@ pub(super) fn try_handle_mq_command(
                 let acked = if crate::shard::slice::is_initialized() {
                     crate::shard::slice::with_shard_db(conn.selected_db, ack_body)
                 } else {
-                    let mut db_guard =
-                        ctx.shard_databases.write_db(ctx.shard_id, conn.selected_db);
+                    let mut db_guard = ctx.shard_databases.write_db(ctx.shard_id, conn.selected_db);
                     let r = ack_body(&mut *db_guard);
                     drop(db_guard);
                     r
@@ -575,8 +567,7 @@ pub(super) fn try_handle_mq_command(
                 match acked {
                     Some(acked_count) => {
                         for (ms, seq) in &msg_ids {
-                            let payload =
-                                crate::mq::wal::encode_mq_ack(&effective_key, *ms, *seq);
+                            let payload = crate::mq::wal::encode_mq_ack(&effective_key, *ms, *seq);
                             let mut wal_buf = Vec::new();
                             crate::persistence::wal_v3::record::write_wal_v3_record(
                                 &mut wal_buf,
@@ -618,8 +609,7 @@ pub(super) fn try_handle_mq_command(
                 let len = if crate::shard::slice::is_initialized() {
                     crate::shard::slice::with_shard_db(conn.selected_db, dlq_body)
                 } else {
-                    let mut db_guard =
-                        ctx.shard_databases.write_db(ctx.shard_id, conn.selected_db);
+                    let mut db_guard = ctx.shard_databases.write_db(ctx.shard_id, conn.selected_db);
                     let r = dlq_body(&mut *db_guard);
                     drop(db_guard);
                     r
@@ -765,11 +755,13 @@ pub(super) fn try_handle_graph_command(
         || (cmd.eq_ignore_ascii_case(b"GRAPH.QUERY")
             && crate::command::graph::is_cypher_write_query(cmd_args));
     // Phase 2f: gate on is_initialized(); new path uses ShardSlice directly.
-    let (response, wal_records, cypher_intents, cypher_undo_ops) = if crate::shard::slice::is_initialized() {
-        crate::shard::slice::with_shard(|s| {
-            if is_write {
-                let (resp, cypher_intents, undo_ops) =
-                    if cmd.eq_ignore_ascii_case(b"GRAPH.QUERY") {
+    let (response, wal_records, cypher_intents, cypher_undo_ops) =
+        if crate::shard::slice::is_initialized() {
+            crate::shard::slice::with_shard(|s| {
+                if is_write {
+                    let (resp, cypher_intents, undo_ops) = if cmd
+                        .eq_ignore_ascii_case(b"GRAPH.QUERY")
+                    {
                         crate::command::graph::graph_query_or_write(&mut s.graph_store, cmd_args)
                     } else {
                         (
@@ -782,32 +774,32 @@ pub(super) fn try_handle_graph_command(
                             Vec::new(),
                         )
                     };
-                let records = s.graph_store.drain_wal();
-                (resp, records, cypher_intents, undo_ops)
+                    let records = s.graph_store.drain_wal();
+                    (resp, records, cypher_intents, undo_ops)
+                } else {
+                    let resp =
+                        crate::command::graph::dispatch_graph_read(&s.graph_store, cmd, cmd_args);
+                    (resp, Vec::new(), Vec::new(), Vec::new())
+                }
+            })
+        } else if is_write {
+            let mut gs = ctx.shard_databases.graph_store_write(ctx.shard_id);
+            let (resp, cypher_intents, undo_ops) = if cmd.eq_ignore_ascii_case(b"GRAPH.QUERY") {
+                crate::command::graph::graph_query_or_write(&mut gs, cmd_args)
             } else {
-                let resp =
-                    crate::command::graph::dispatch_graph_read(&s.graph_store, cmd, cmd_args);
-                (resp, Vec::new(), Vec::new(), Vec::new())
-            }
-        })
-    } else if is_write {
-        let mut gs = ctx.shard_databases.graph_store_write(ctx.shard_id);
-        let (resp, cypher_intents, undo_ops) = if cmd.eq_ignore_ascii_case(b"GRAPH.QUERY") {
-            crate::command::graph::graph_query_or_write(&mut gs, cmd_args)
+                (
+                    crate::command::graph::dispatch_graph_write(&mut gs, cmd, cmd_args),
+                    Vec::new(),
+                    Vec::new(),
+                )
+            };
+            let records = gs.drain_wal();
+            (resp, records, cypher_intents, undo_ops)
         } else {
-            (
-                crate::command::graph::dispatch_graph_write(&mut gs, cmd, cmd_args),
-                Vec::new(),
-                Vec::new(),
-            )
+            let gs = ctx.shard_databases.graph_store_read(ctx.shard_id);
+            let resp = crate::command::graph::dispatch_graph_read(&gs, cmd, cmd_args);
+            (resp, Vec::new(), Vec::new(), Vec::new())
         };
-        let records = gs.drain_wal();
-        (resp, records, cypher_intents, undo_ops)
-    } else {
-        let gs = ctx.shard_databases.graph_store_read(ctx.shard_id);
-        let resp = crate::command::graph::dispatch_graph_read(&gs, cmd, cmd_args);
-        (resp, Vec::new(), Vec::new(), Vec::new())
-    };
     // Phase 166: record graph intent for TXN rollback.
     if let Some(txn) = conn.active_cross_txn.as_mut() {
         let is_node = cmd.eq_ignore_ascii_case(b"GRAPH.ADDNODE");

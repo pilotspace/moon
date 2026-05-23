@@ -117,8 +117,7 @@ pub(super) fn try_handle_txn_commit(
                             )
                         })
                     } else {
-                        let db_guard =
-                            ctx.shard_databases.read_db(ctx.shard_id, conn.selected_db);
+                        let db_guard = ctx.shard_databases.read_db(ctx.shard_id, conn.selected_db);
                         let payload =
                             crate::persistence::wal_v3::record::encode_xact_commit_payload(
                                 txn_id,
@@ -276,38 +275,38 @@ pub(super) fn try_handle_temporal_invalidate(
                 //   Some(Some(wal_records)) — entity found, mutated; emit OK and append WAL.
                 //   Some(None)              — entity not found in graph; emit ERR_ENTITY_NOT_FOUND.
                 //   None                    — graph not found; emit ERR_GRAPH_NOT_FOUND.
-                let invalidate_body = |gs: &mut crate::graph::store::GraphStore|
-                    -> Option<Option<Vec<Vec<u8>>>> {
-                    let named_graph = gs.get_graph_mut(&graph_name)?;
-                    let mutated = if is_node {
-                        let node_key: crate::graph::types::NodeKey =
-                            slotmap::KeyData::from_ffi(entity_id).into();
-                        if let Some(node) = named_graph.write_buf.get_node_mut(node_key) {
-                            node.valid_to = wall_ms;
-                            true
+                let invalidate_body =
+                    |gs: &mut crate::graph::store::GraphStore| -> Option<Option<Vec<Vec<u8>>>> {
+                        let named_graph = gs.get_graph_mut(&graph_name)?;
+                        let mutated = if is_node {
+                            let node_key: crate::graph::types::NodeKey =
+                                slotmap::KeyData::from_ffi(entity_id).into();
+                            if let Some(node) = named_graph.write_buf.get_node_mut(node_key) {
+                                node.valid_to = wall_ms;
+                                true
+                            } else {
+                                false
+                            }
                         } else {
-                            false
-                        }
-                    } else {
-                        let edge_key: crate::graph::types::EdgeKey =
-                            slotmap::KeyData::from_ffi(entity_id).into();
-                        if let Some(edge) = named_graph.write_buf.get_edge_mut(edge_key) {
-                            edge.valid_to = wall_ms;
-                            true
+                            let edge_key: crate::graph::types::EdgeKey =
+                                slotmap::KeyData::from_ffi(entity_id).into();
+                            if let Some(edge) = named_graph.write_buf.get_edge_mut(edge_key) {
+                                edge.valid_to = wall_ms;
+                                true
+                            } else {
+                                false
+                            }
+                        };
+                        if mutated {
+                            let payload = crate::persistence::wal_v3::record::encode_graph_temporal(
+                                entity_id, is_node, wall_ms, wall_ms,
+                            );
+                            gs.wal_pending.push(payload);
+                            Some(Some(gs.drain_wal()))
                         } else {
-                            false
+                            Some(None)
                         }
                     };
-                    if mutated {
-                        let payload = crate::persistence::wal_v3::record::encode_graph_temporal(
-                            entity_id, is_node, wall_ms, wall_ms,
-                        );
-                        gs.wal_pending.push(payload);
-                        Some(Some(gs.drain_wal()))
-                    } else {
-                        Some(None)
-                    }
-                };
                 let outcome = if crate::shard::slice::is_initialized() {
                     crate::shard::slice::with_shard(|s| invalidate_body(&mut s.graph_store))
                 } else {
