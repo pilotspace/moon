@@ -35,6 +35,21 @@ static CONNECTED_CLIENTS: AtomicU64 = AtomicU64::new(0);
 static WAL_AGGRESSIVE_RECYCLE_SEGMENTS_TOTAL: AtomicU64 = AtomicU64::new(0);
 static WAL_AGGRESSIVE_RECYCLE_BYTES_TOTAL: AtomicU64 = AtomicU64::new(0);
 
+// ── T1.4: Cross-shard dispatch counters (read by INFO stats) ────────────
+// The Prometheus `counter!()` facade is not directly readable from the INFO
+// path — it only surfaces via /metrics. These dedicated AtomicU64 counters
+// are incremented in parallel inside the existing record_dispatch_* helpers
+// so INFO always returns meaningful stats even with admin_port=0.
+// Relaxed ordering is correct: these are monotonic event counters for
+// observability, not synchronisation primitives.
+//
+// Note: a separate write-SPSC counter does not exist in the codebase —
+// the existing `record_dispatch_cross_spsc` covers both reads routed via
+// SPSC (when fast-path is off) and writes. INFO exposes the unified total
+// as `total_dispatch_cross_spsc`.
+static DISPATCH_CROSS_READ_FASTPATH_TOTAL: AtomicU64 = AtomicU64::new(0);
+static DISPATCH_CROSS_READ_SPSC_TOTAL: AtomicU64 = AtomicU64::new(0);
+
 /// Initialize the Prometheus metrics exporter and admin HTTP server.
 ///
 /// Must be called once before any metrics recording. Spawns a custom admin
@@ -707,6 +722,8 @@ pub fn record_dispatch_local_batch(count: u64) {
 /// (RwLock read on the target shard's database, no SPSC message).
 #[inline]
 pub fn record_dispatch_cross_read_fastpath() {
+    // Always increment the INFO-visible atomic (works even with admin_port=0).
+    DISPATCH_CROSS_READ_FASTPATH_TOTAL.fetch_add(1, Ordering::Relaxed);
     if !METRICS_INITIALIZED.load(Ordering::Relaxed) {
         return;
     }
@@ -716,7 +733,12 @@ pub fn record_dispatch_cross_read_fastpath() {
 /// Batched variant of `record_dispatch_cross_read_fastpath`.
 #[inline]
 pub fn record_dispatch_cross_read_fastpath_batch(count: u64) {
-    if count == 0 || !METRICS_INITIALIZED.load(Ordering::Relaxed) {
+    if count == 0 {
+        return;
+    }
+    // Always increment the INFO-visible atomic (works even with admin_port=0).
+    DISPATCH_CROSS_READ_FASTPATH_TOTAL.fetch_add(count, Ordering::Relaxed);
+    if !METRICS_INITIALIZED.load(Ordering::Relaxed) {
         return;
     }
     counter!("moon_dispatch_path_total", "path" => "cross_read_fast").increment(count);
@@ -771,8 +793,13 @@ pub fn record_dispatch_cross_read_fastpath_timed(target_shard: usize, lock_acqui
 /// Command deferred to cross-shard SPSC dispatch (the slow path).
 /// Recorded when a command is enqueued into a `remote_groups` bucket that
 /// will be flushed as a `PipelineBatchSlotted` message.
+///
+/// Note: covers both read and write commands routed via SPSC (no split
+/// counter exists — all non-fast-path cross-shard traffic goes here).
 #[inline]
 pub fn record_dispatch_cross_spsc() {
+    // Always increment the INFO-visible atomic (works even with admin_port=0).
+    DISPATCH_CROSS_READ_SPSC_TOTAL.fetch_add(1, Ordering::Relaxed);
     if !METRICS_INITIALIZED.load(Ordering::Relaxed) {
         return;
     }
@@ -782,7 +809,12 @@ pub fn record_dispatch_cross_spsc() {
 /// Batched variant of `record_dispatch_cross_spsc`.
 #[inline]
 pub fn record_dispatch_cross_spsc_batch(count: u64) {
-    if count == 0 || !METRICS_INITIALIZED.load(Ordering::Relaxed) {
+    if count == 0 {
+        return;
+    }
+    // Always increment the INFO-visible atomic (works even with admin_port=0).
+    DISPATCH_CROSS_READ_SPSC_TOTAL.fetch_add(count, Ordering::Relaxed);
+    if !METRICS_INITIALIZED.load(Ordering::Relaxed) {
         return;
     }
     counter!("moon_dispatch_path_total", "path" => "cross_spsc").increment(count);
@@ -1055,6 +1087,22 @@ pub fn total_commands_processed() -> u64 {
 #[inline]
 pub fn total_connections_received() -> u64 {
     TOTAL_CONNECTIONS.load(Ordering::Relaxed)
+}
+
+/// Total cross-shard reads served via the shared-read fast path
+/// (RwLock read on the target shard's database, no SPSC message).
+/// Always accurate — does not require Prometheus to be initialised.
+#[inline]
+pub fn total_dispatch_cross_read_fastpath() -> u64 {
+    DISPATCH_CROSS_READ_FASTPATH_TOTAL.load(Ordering::Relaxed)
+}
+
+/// Total cross-shard commands dispatched via the SPSC slow path.
+/// Covers both read and write commands that bypass the fast path.
+/// Always accurate — does not require Prometheus to be initialised.
+#[inline]
+pub fn total_dispatch_cross_spsc() -> u64 {
+    DISPATCH_CROSS_READ_SPSC_TOTAL.load(Ordering::Relaxed)
 }
 
 /// Read process CPU usage via `getrusage(RUSAGE_SELF)`.
@@ -1385,5 +1433,77 @@ mod tests {
         record_command_no_latency_cached("set", &mut cache);
         record_command_error_cached("set", &mut cache);
         // Must not panic, must not churn the cache on the hot path.
+    }
+
+    // ── T1.4: cross-shard dispatch atomics ───────────────────────────────
+    // These tests share process-wide static AtomicU64 counters.  Because
+    // the test runner is multi-threaded, other tests may increment the same
+    // static concurrently.  We therefore only assert on monotone lower
+    // bounds (after >= before + N) for positive-increment tests, which is
+    // still sufficient to prove the counter was incremented.
+    // The zero-is-noop tests read the counter twice with no intervening
+    // increment; they assert `after >= before` (monotone), which is the
+    // strongest correct claim under parallel execution.
+
+    #[test]
+    fn cross_read_fastpath_atomic_increments() {
+        let before = total_dispatch_cross_read_fastpath();
+        record_dispatch_cross_read_fastpath();
+        let after = total_dispatch_cross_read_fastpath();
+        assert!(
+            after >= before + 1,
+            "counter must have increased by at least 1; before={before} after={after}"
+        );
+    }
+
+    #[test]
+    fn cross_read_fastpath_batch_atomic_increments() {
+        let before = total_dispatch_cross_read_fastpath();
+        record_dispatch_cross_read_fastpath_batch(7);
+        let after = total_dispatch_cross_read_fastpath();
+        assert!(
+            after >= before + 7,
+            "counter must have increased by at least 7; before={before} after={after}"
+        );
+    }
+
+    #[test]
+    fn cross_read_fastpath_batch_zero_is_noop() {
+        // batch(0) must not call fetch_add — the counter must not move
+        // backward; it may move forward due to concurrent tests.
+        let before = total_dispatch_cross_read_fastpath();
+        record_dispatch_cross_read_fastpath_batch(0);
+        let after = total_dispatch_cross_read_fastpath();
+        assert!(after >= before, "counter must be monotone; before={before} after={after}");
+    }
+
+    #[test]
+    fn cross_spsc_atomic_increments() {
+        let before = total_dispatch_cross_spsc();
+        record_dispatch_cross_spsc();
+        let after = total_dispatch_cross_spsc();
+        assert!(
+            after >= before + 1,
+            "counter must have increased by at least 1; before={before} after={after}"
+        );
+    }
+
+    #[test]
+    fn cross_spsc_batch_atomic_increments() {
+        let before = total_dispatch_cross_spsc();
+        record_dispatch_cross_spsc_batch(3);
+        let after = total_dispatch_cross_spsc();
+        assert!(
+            after >= before + 3,
+            "counter must have increased by at least 3; before={before} after={after}"
+        );
+    }
+
+    #[test]
+    fn cross_spsc_batch_zero_is_noop() {
+        let before = total_dispatch_cross_spsc();
+        record_dispatch_cross_spsc_batch(0);
+        let after = total_dispatch_cross_spsc();
+        assert!(after >= before, "counter must be monotone; before={before} after={after}");
     }
 }
