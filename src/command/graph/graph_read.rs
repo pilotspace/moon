@@ -316,6 +316,14 @@ pub fn graph_info(store: &GraphStore, args: &[Frame]) -> Frame {
             Frame::SimpleString(Bytes::from_static(b"degree_stats")),
             degree_stats,
         ),
+        (
+            // Monotonic freshness counter for this shard's GRAPH engine.
+            // Starts at 0 on boot; NOT restored from WAL (hint only).
+            // Bumped after every successful node/edge/property mutation and
+            // GRAPH.CREATE/DROP. Callers use this to detect stale query cache.
+            Frame::SimpleString(Bytes::from_static(b"version_token")),
+            Frame::Integer(store.version_token() as i64),
+        ),
     ])
 }
 
@@ -509,6 +517,11 @@ pub fn graph_query_write(store: &mut GraphStore, args: &[Frame]) -> Frame {
             | cypher::executor::MutationRecord::DeleteNode { .. }
             | cypher::executor::MutationRecord::DeleteEdge { .. } => {}
         }
+    }
+
+    // Bump version if any mutations were executed (Cypher write query).
+    if !result.mutations.is_empty() {
+        store.bump_version();
     }
 
     exec_result_to_frame(&result)

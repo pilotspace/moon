@@ -202,6 +202,8 @@ pub fn graph_addnode(store: &mut GraphStore, args: &[Frame]) -> Frame {
         }
     }
 
+    // Bump version AFTER successful node insert.
+    store.bump_version();
     Frame::Integer(external_id as i64)
 }
 
@@ -356,6 +358,8 @@ pub fn graph_addedge(store: &mut GraphStore, args: &[Frame]) -> Frame {
                 }
             }
 
+            // Bump version AFTER successful edge insert.
+            store.bump_version();
             Frame::Integer(external_id as i64)
         }
         Err(crate::graph::memgraph::GraphError::NodeNotFound) => Frame::Error(Bytes::from_static(

@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
@@ -114,6 +115,19 @@ pub struct GraphStore {
     /// Pending WAL records produced by write handlers. Connection handlers
     /// drain this after dispatch and send bytes via `shard_databases.wal_append()`.
     pub(crate) wal_pending: Vec<Vec<u8>>,
+    /// Monotonic freshness counter for the GRAPH engine on this shard.
+    ///
+    /// Bumped (Release) after every successful mutating operation: `create_graph`,
+    /// `drop_graph`, and all graph mutations via `allocate_lsn` (the choke-point
+    /// for every node/edge/property write). Exposed by `GRAPH.INFO` under
+    /// `version_token`.
+    ///
+    /// Semantics:
+    /// - Starts at 0 on shard boot; NOT restored from WAL (freshness hint only).
+    /// - Monotonic within a single shard; no cross-shard atomicity.
+    /// - Counter never wraps in practice (u64::MAX ≈ 1.8 × 10¹⁹ writes).
+    /// - Failed writes do NOT bump the counter.
+    version_token: AtomicU64,
 }
 
 impl GraphStore {
@@ -123,10 +137,34 @@ impl GraphStore {
             graphs: None,
             next_lsn: 0,
             wal_pending: Vec::new(),
+            version_token: AtomicU64::new(0),
         }
     }
 
+    /// Return the current GRAPH engine version token for this shard.
+    ///
+    /// Uses `Acquire` ordering so the caller observes all writes that preceded
+    /// the most recent `bump_version` call on this shard.
+    #[inline]
+    pub fn version_token(&self) -> u64 {
+        self.version_token.load(Ordering::Acquire)
+    }
+
+    /// Bump the GRAPH version token by 1 after a successful write.
+    ///
+    /// Uses `Release` ordering so that any subsequent `Acquire` load on any
+    /// thread observes the completed write. Returns the new value.
+    #[inline]
+    pub fn bump_version(&self) -> u64 {
+        self.version_token.fetch_add(1, Ordering::Release) + 1
+    }
+
     /// Allocate the next monotonic LSN for a graph mutation.
+    ///
+    /// Pure counter increment — does NOT bump the version token. Callers are
+    /// responsible for calling `bump_version()` after a successful write so that
+    /// failed operations (e.g. duplicate GRAPH.CREATE before the actual insert)
+    /// do not advance the freshness counter.
     pub fn allocate_lsn(&mut self) -> u64 {
         let lsn = self.next_lsn;
         self.next_lsn = self.next_lsn.saturating_add(1);
@@ -165,6 +203,10 @@ impl GraphStore {
                 key_to_node: HashMap::new(),
             },
         );
+        // Bump version AFTER successful graph creation (monotonicity-on-success
+        // contract). The caller allocates an LSN first, but that is a pure
+        // counter increment — the version bump only fires here, on success.
+        self.bump_version();
         Ok(())
     }
 
@@ -179,6 +221,8 @@ impl GraphStore {
         if map.is_empty() {
             self.graphs = None;
         }
+        // Bump version AFTER successful graph drop.
+        self.bump_version();
         Ok(())
     }
 

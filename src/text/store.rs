@@ -7,6 +7,7 @@
 
 use bytes::Bytes;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::text::analyzer::AnalyzerPipeline;
 use crate::text::bm25::{FieldStats, bm25_score};
@@ -1334,6 +1335,19 @@ pub struct TextStore {
     /// Shard directory for persisting text index metadata sidecar.
     /// Set once during event loop init when persistence is enabled.
     persist_dir: Option<std::path::PathBuf>,
+    /// Monotonic freshness counter for the FT text engine on this shard.
+    ///
+    /// Bumped (Release) after every successful mutating operation: `create_index`,
+    /// `drop_index`, and document indexing via `index_document_with_lsn`,
+    /// `tag_index_document`, `numeric_index_document`. Exposed by `FT.INFO`
+    /// under `text_version_token`.
+    ///
+    /// Semantics:
+    /// - Starts at 0 on shard boot; NOT restored from WAL (freshness hint only).
+    /// - Monotonic within a single shard; no cross-shard atomicity.
+    /// - Counter never wraps in practice (u64::MAX ≈ 1.8 × 10¹⁹ writes).
+    /// - Failed writes do NOT bump the counter.
+    version_token: AtomicU64,
 }
 
 impl TextStore {
@@ -1342,7 +1356,26 @@ impl TextStore {
         Self {
             indexes: HashMap::new(),
             persist_dir: None,
+            version_token: AtomicU64::new(0),
         }
+    }
+
+    /// Return the current FT text engine version token for this shard.
+    ///
+    /// Uses `Acquire` ordering so the caller observes all writes that preceded
+    /// the most recent `bump_version` call on this shard.
+    #[inline]
+    pub fn version_token(&self) -> u64 {
+        self.version_token.load(Ordering::Acquire)
+    }
+
+    /// Bump the FT text version token by 1 after a successful write.
+    ///
+    /// Uses `Release` ordering so that any subsequent `Acquire` load on any
+    /// thread observes the completed write. Returns the new value.
+    #[inline]
+    pub fn bump_version(&self) -> u64 {
+        self.version_token.fetch_add(1, Ordering::Release) + 1
     }
 
     /// Set the shard directory for index metadata persistence.
@@ -1382,6 +1415,8 @@ impl TextStore {
         }
         self.indexes.insert(name, index);
         self.save_index_meta_sidecar();
+        // Bump version AFTER successful create (monotonicity-on-success contract).
+        self.bump_version();
         Ok(())
     }
 
@@ -1390,6 +1425,8 @@ impl TextStore {
         let removed = self.indexes.remove(name).is_some();
         if removed {
             self.save_index_meta_sidecar();
+            // Bump version AFTER successful drop (monotonicity-on-success contract).
+            self.bump_version();
         }
         removed
     }

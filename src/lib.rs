@@ -70,4 +70,5 @@ pub mod tls;
 pub mod tracking;
 pub mod transaction;
 pub mod vector;
+pub mod version_token_tests;
 pub mod workspace;
