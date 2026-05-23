@@ -160,6 +160,11 @@ impl GraphStore {
     }
 
     /// Allocate the next monotonic LSN for a graph mutation.
+    ///
+    /// Pure counter increment — does NOT bump the version token. Callers are
+    /// responsible for calling `bump_version()` after a successful write so that
+    /// failed operations (e.g. duplicate GRAPH.CREATE before the actual insert)
+    /// do not advance the freshness counter.
     pub fn allocate_lsn(&mut self) -> u64 {
         let lsn = self.next_lsn;
         self.next_lsn = self.next_lsn.saturating_add(1);
@@ -198,6 +203,10 @@ impl GraphStore {
                 key_to_node: HashMap::new(),
             },
         );
+        // Bump version AFTER successful graph creation (monotonicity-on-success
+        // contract). The caller allocates an LSN first, but that is a pure
+        // counter increment — the version bump only fires here, on success.
+        self.bump_version();
         Ok(())
     }
 
@@ -212,6 +221,8 @@ impl GraphStore {
         if map.is_empty() {
             self.graphs = None;
         }
+        // Bump version AFTER successful graph drop.
+        self.bump_version();
         Ok(())
     }
 

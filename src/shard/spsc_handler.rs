@@ -2506,6 +2506,7 @@ fn auto_index_hset(
     // deferral). Pre-MVCC callers (tests, non-HSET paths) leave `insert_lsn`
     // at 0 and the visibility filter treats such docs as always-visible.
     let text_args = if args.is_empty() { args } else { &args[1..] };
+    let mut any_text_indexed = false;
     for idx_name in text_matching {
         if let Some(idx) = text_store.get_index_mut(&idx_name) {
             let key_hash = xxhash_rust::xxh64::xxh64(key, 0);
@@ -2520,7 +2521,18 @@ fn auto_index_hset(
             // numeric_fields).
             #[cfg(feature = "text-index")]
             idx.numeric_index_document(key_hash, key, text_args);
+            any_text_indexed = true;
         }
+    }
+
+    // Bump version tokens AFTER successful writes (monotonicity-on-success
+    // contract). Vector and text bumps are independent — each engine's
+    // downstream consumer checks its own token.
+    if !inserted.is_empty() {
+        vector_store.bump_version();
+    }
+    if any_text_indexed {
+        text_store.bump_version();
     }
 
     inserted

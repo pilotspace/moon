@@ -31,7 +31,7 @@ pub fn ft_info(
         None => {
             // Check TextStore for TEXT-only indexes
             if let Some(text_idx) = text_store.get_index(&name) {
-                return ft_info_text_only(text_idx);
+                return ft_info_text_only(text_idx, text_store);
             }
             return Frame::Error(Bytes::from_static(b"Unknown Index name"));
         }
@@ -137,6 +137,13 @@ pub fn ft_info(
     items.push(Frame::BulkString(Bytes::from_static(b"vector_fields")));
     items.push(Frame::Array(field_entries.into()));
 
+    // Monotonic freshness counter for this shard's VSEARCH engine.
+    // Starts at 0 on boot; NOT restored from WAL (freshness hint only).
+    // Bumped after every successful vector insert, create_index, drop_index,
+    // or mark_deleted_for_key. Use to detect stale query-cache entries.
+    items.push(Frame::BulkString(Bytes::from_static(b"vector_version_token")));
+    items.push(Frame::Integer(store.version_token() as i64));
+
     // Hybrid index: append text field stats if this index also has a TextIndex
     if let Some(text_idx) = text_store.get_index(&name) {
         let mut text_field_entries: Vec<Frame> = Vec::with_capacity(text_idx.text_fields.len());
@@ -172,6 +179,10 @@ pub fn ft_info(
             b"total_inverted_index_size",
         )));
         items.push(Frame::Integer(text_idx.total_posting_bytes() as i64));
+        // Monotonic freshness counter for this shard's FT text engine.
+        // Independent from vector_version_token — hybrid-index callers check both.
+        items.push(Frame::BulkString(Bytes::from_static(b"text_version_token")));
+        items.push(Frame::Integer(text_store.version_token() as i64));
     }
 
     Frame::Array(items.into())
@@ -180,8 +191,12 @@ pub fn ft_info(
 /// Full FT.INFO response for TEXT-only indexes.
 ///
 /// Returns index_name, num_docs, num_terms, per-field stats (num_docs,
-/// avg_doc_len, weight, nostem), BM25 config, and memory estimates.
-fn ft_info_text_only(idx: &crate::text::store::TextIndex) -> Frame {
+/// avg_doc_len, weight, nostem), BM25 config, memory estimates, and
+/// `text_version_token` (monotonic freshness counter for the FT text engine).
+fn ft_info_text_only(
+    idx: &crate::text::store::TextIndex,
+    text_store: &crate::text::store::TextStore,
+) -> Frame {
     let mut items = vec![
         Frame::BulkString(Bytes::from_static(b"index_name")),
         Frame::BulkString(idx.name.clone()),
@@ -258,6 +273,13 @@ fn ft_info_text_only(idx: &crate::text::store::TextIndex) -> Frame {
         b"total_inverted_index_size",
     )));
     items.push(Frame::Integer(total_postings as i64));
+
+    // Monotonic freshness counter for this shard's FT text engine.
+    // Starts at 0 on boot; NOT restored from WAL (freshness hint only).
+    // Bumped after every successful text document index, create_index, or
+    // drop_index. Use to detect stale query-cache entries.
+    items.push(Frame::BulkString(Bytes::from_static(b"text_version_token")));
+    items.push(Frame::Integer(text_store.version_token() as i64));
 
     Frame::Array(items.into())
 }

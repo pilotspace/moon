@@ -835,6 +835,9 @@ impl VectorStore {
             }
         }
 
+        // Bump version AFTER successful write (monotonicity-on-success contract).
+        self.bump_version();
+
         Ok(())
     }
 
@@ -851,6 +854,8 @@ impl VectorStore {
             }
             // Persist index metadata sidecar
             self.save_index_meta_sidecar();
+            // Bump version AFTER successful drop (monotonicity-on-success contract).
+            self.bump_version();
             true
         } else {
             false
@@ -910,11 +915,17 @@ impl VectorStore {
             return;
         }
         let key_hash = xxhash_rust::xxh64::xxh64(key, 0);
+        let mut any_deleted = false;
         for idx_name in matching_names {
             if let Some(idx) = self.indexes.get(&idx_name) {
                 let snap = idx.segments.load();
                 snap.mutable.mark_deleted_by_key_hash(key_hash, 1);
+                any_deleted = true;
             }
+        }
+        // Bump version AFTER any successful deletion mark.
+        if any_deleted {
+            self.bump_version();
         }
     }
 

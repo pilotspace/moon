@@ -1415,6 +1415,8 @@ impl TextStore {
         }
         self.indexes.insert(name, index);
         self.save_index_meta_sidecar();
+        // Bump version AFTER successful create (monotonicity-on-success contract).
+        self.bump_version();
         Ok(())
     }
 
@@ -1423,6 +1425,8 @@ impl TextStore {
         let removed = self.indexes.remove(name).is_some();
         if removed {
             self.save_index_meta_sidecar();
+            // Bump version AFTER successful drop (monotonicity-on-success contract).
+            self.bump_version();
         }
         removed
     }
