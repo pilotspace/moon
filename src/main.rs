@@ -272,10 +272,10 @@ fn main() -> anyhow::Result<()> {
 
     // T1.1: warn when maxclients < 25 × shards (undersubscription footgun).
     // Suppressed by MOON_NO_UNDERSUBSCRIPTION_WARN=1.
-    if std::env::var_os("MOON_NO_UNDERSUBSCRIPTION_WARN").is_none() {
-        if let Some(msg) = should_warn_undersubscription(config.maxclients, num_shards) {
-            tracing::warn!("{}", msg);
-        }
+    if let Some(msg) = should_warn_undersubscription(config.maxclients, num_shards)
+        && std::env::var_os("MOON_NO_UNDERSUBSCRIPTION_WARN").is_none()
+    {
+        tracing::warn!("{msg}");
     }
 
     // Create channel mesh for inter-shard communication

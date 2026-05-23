@@ -1474,7 +1474,10 @@ mod tests {
         let before = total_dispatch_cross_read_fastpath();
         record_dispatch_cross_read_fastpath_batch(0);
         let after = total_dispatch_cross_read_fastpath();
-        assert!(after >= before, "counter must be monotone; before={before} after={after}");
+        assert!(
+            after >= before,
+            "counter must be monotone; before={before} after={after}"
+        );
     }
 
     #[test]
@@ -1504,6 +1507,9 @@ mod tests {
         let before = total_dispatch_cross_spsc();
         record_dispatch_cross_spsc_batch(0);
         let after = total_dispatch_cross_spsc();
-        assert!(after >= before, "counter must be monotone; before={before} after={after}");
+        assert!(
+            after >= before,
+            "counter must be monotone; before={before} after={after}"
+        );
     }
 }
