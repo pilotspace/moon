@@ -15,7 +15,7 @@
 //! - Graph tests: `#[cfg(feature = "graph")]`.
 
 #[cfg(test)]
-mod version_token_tests {
+mod tests {
     use crate::protocol::Frame;
     use bytes::Bytes;
 

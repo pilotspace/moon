@@ -1049,7 +1049,13 @@ pub async fn scatter_invalidate_range(
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
     spsc_notifiers: &[Arc<channel::Notify>],
 ) -> Frame {
-    // Send to all remote shards first.
+    // PARTIAL-STATE: sends fire to all remotes in parallel, then we collect
+    // sequentially. If any remote returns an error after others already
+    // applied their deletes, this call returns Frame::Error but the
+    // successful remotes have already advanced their text_version_token
+    // and removed matching docs — there is no cross-shard rollback.
+    // Lunaris must treat error replies as "retry the whole invalidation"
+    // rather than "no work was done."
     let mut receivers = Vec::with_capacity(num_shards.saturating_sub(1));
     for target in 0..num_shards {
         if target == my_shard {
@@ -1064,7 +1070,7 @@ pub async fn scatter_invalidate_range(
         receivers.push(reply_rx);
     }
 
-    // Collect remote counts — fail on any error.
+    // Collect remote counts — fail on any error (see PARTIAL-STATE above).
     let mut total: i64 = 0;
     for rx in receivers {
         match rx.recv().await {

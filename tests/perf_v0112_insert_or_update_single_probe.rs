@@ -1,63 +1,18 @@
 //! PERF-08 RED test: prove single-probe insert_or_update is faster
-//! than the legacy get_mut + insert pattern, AND preserves Database::set
-//! semantics bit-for-bit.
+//! than the legacy get_mut + insert pattern.
+//!
+//! The original semantic-parity test against `Database::data_mut()` was
+//! removed when `data_mut()` was deleted in e2ce03b (its only callers
+//! were tests; the legacy path is now unreachable from the public API).
+//! The timing comparison below still exercises the optimisation directly
+//! on `DashTable`, which is the authoritative regression net.
 
 use bytes::Bytes;
 use moon::storage::compact_key::CompactKey;
 use moon::storage::dashtable::DashTable;
-use moon::storage::db::Database;
-use moon::storage::entry::Entry;
 use std::time::Instant;
 
 const N: usize = 1_000_000;
-
-/// Functional parity: 1000 SETs (mix of new & repeat keys) leave the DB in
-/// the same state via `Database::set` as a hand-rolled `get_mut + insert`.
-#[test]
-fn test_database_set_semantic_parity() {
-    let mut db_via_new = Database::new();
-    let mut db_via_legacy = Database::new();
-
-    for i in 0..1000 {
-        let k_idx = i % 700; // 30% are repeat keys -> exercises both paths
-        let key = Bytes::from(format!("p_{:04}", k_idx));
-        let entry = Entry::new_string(Bytes::from(format!("v{}", i)));
-
-        db_via_new.set(key.clone(), entry.clone());
-
-        // Hand-rolled legacy path on the control DB
-        if let Some(old) = db_via_legacy.data_mut().get_mut(key.as_ref()) {
-            let mut e = entry.clone();
-            e.set_version(old.version() + 1);
-            *old = e;
-        } else {
-            db_via_legacy
-                .data_mut()
-                .insert(CompactKey::from(key), entry);
-        }
-    }
-
-    assert_eq!(
-        db_via_new.data().len(),
-        db_via_legacy.data().len(),
-        "len mismatch"
-    );
-
-    // Compare every key's version
-    for i in 0..700 {
-        let key = format!("p_{:04}", i);
-        let v_new = db_via_new.data().get(key.as_bytes()).map(|e| e.version());
-        let v_legacy = db_via_legacy
-            .data()
-            .get(key.as_bytes())
-            .map(|e| e.version());
-        assert_eq!(
-            v_new, v_legacy,
-            "Version mismatch at key {}: {:?} vs {:?}",
-            key, v_new, v_legacy
-        );
-    }
-}
 
 /// Timing: DashTable::insert_or_update vs DashTable::get_mut + insert on 50%/50%.
 ///
