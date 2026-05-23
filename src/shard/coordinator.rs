@@ -1030,6 +1030,100 @@ pub async fn broadcast_vector_command(
     local_result
 }
 
+/// Scatter `FT.INVALIDATE_RANGE` to all shards and return the summed deleted-document count.
+///
+/// Unlike `broadcast_vector_command` (which returns the first non-error response),
+/// this helper sends the command to every shard, collects each shard's `Frame::Integer`
+/// count, and returns `Frame::Integer(sum)`.  If any shard returns an error the error
+/// is propagated immediately (same early-exit semantics as `broadcast_vector_command`).
+///
+/// # Lock safety
+/// All per-shard local execution is synchronous (no `.await` inside the local block),
+/// so no `MutexGuard` is held across an `.await` point.
+#[cfg(feature = "text-index")]
+pub async fn scatter_invalidate_range(
+    command: std::sync::Arc<Frame>,
+    my_shard: usize,
+    num_shards: usize,
+    shard_databases: &Arc<crate::shard::shared_databases::ShardDatabases>,
+    dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
+    spsc_notifiers: &[Arc<channel::Notify>],
+) -> Frame {
+    // Send to all remote shards first.
+    let mut receivers = Vec::with_capacity(num_shards.saturating_sub(1));
+    for target in 0..num_shards {
+        if target == my_shard {
+            continue;
+        }
+        let (reply_tx, reply_rx) = channel::oneshot();
+        let msg = ShardMessage::VectorCommand {
+            command: command.clone(),
+            reply_tx,
+        };
+        spsc_send(dispatch_tx, my_shard, target, msg, spsc_notifiers).await;
+        receivers.push(reply_rx);
+    }
+
+    // Collect remote counts — fail on any error.
+    let mut total: i64 = 0;
+    for rx in receivers {
+        match rx.recv().await {
+            Ok(Frame::Integer(n)) => total = total.saturating_add(n),
+            Ok(Frame::Error(e)) => return Frame::Error(e),
+            Err(_) => {
+                return Frame::Error(Bytes::from_static(
+                    b"ERR FT.INVALIDATE_RANGE: cross-shard reply channel closed",
+                ));
+            }
+            Ok(other) => {
+                // Unexpected response type — surface for debugging.
+                let _ = other;
+                return Frame::Error(Bytes::from_static(
+                    b"ERR FT.INVALIDATE_RANGE: unexpected response from remote shard",
+                ));
+            }
+        }
+    }
+
+    // Execute locally and add to total.
+    let local = if crate::shard::slice::is_initialized() {
+        crate::shard::slice::with_shard(|s| {
+            crate::shard::spsc_handler::dispatch_vector_command(
+                &mut s.vector_store,
+                &mut s.text_store,
+                #[cfg(feature = "graph")]
+                Some(&s.graph_store),
+                &command,
+                None,
+            )
+        })
+    } else {
+        let mut vs = shard_databases.vector_store(my_shard);
+        let mut ts = shard_databases.text_store(my_shard);
+        #[cfg(feature = "graph")]
+        let graph_guard = shard_databases.graph_store_read(my_shard);
+        crate::shard::spsc_handler::dispatch_vector_command(
+            &mut vs,
+            &mut *ts,
+            #[cfg(feature = "graph")]
+            Some(&graph_guard),
+            &command,
+            None,
+        )
+    };
+
+    match local {
+        Frame::Integer(n) => Frame::Integer(total.saturating_add(n)),
+        Frame::Error(e) => Frame::Error(e),
+        other => {
+            let _ = other;
+            Frame::Error(Bytes::from_static(
+                b"ERR FT.INVALIDATE_RANGE: unexpected local response",
+            ))
+        }
+    }
+}
+
 /// Two-phase DFS scatter-gather for globally accurate BM25 text search (per D-04).
 ///
 /// **Phase 1** — DocFreq scatter: collect (term, df) + total N from every shard,

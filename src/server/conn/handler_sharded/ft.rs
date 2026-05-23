@@ -358,6 +358,27 @@ pub(super) async fn try_handle_ft_command(
             responses.push(response);
             return true;
         }
+        #[cfg(feature = "text-index")]
+        if cmd.eq_ignore_ascii_case(b"FT.INVALIDATE_RANGE") {
+            let response = crate::shard::coordinator::scatter_invalidate_range(
+                std::sync::Arc::new(frame.clone()),
+                ctx.shard_id,
+                ctx.num_shards,
+                &ctx.shard_databases,
+                &ctx.dispatch_tx,
+                &ctx.spsc_notifiers,
+            )
+            .await;
+            responses.push(response);
+            return true;
+        }
+        #[cfg(not(feature = "text-index"))]
+        if cmd.eq_ignore_ascii_case(b"FT.INVALIDATE_RANGE") {
+            responses.push(Frame::Error(Bytes::from_static(
+                b"ERR FT.INVALIDATE_RANGE requires text-index feature",
+            )));
+            return true;
+        }
         let response = crate::shard::coordinator::broadcast_vector_command(
             std::sync::Arc::new(frame.clone()),
             ctx.shard_id,
