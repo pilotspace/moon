@@ -37,6 +37,7 @@ Returns: `(integer)` count of deleted documents.
 | `9042ab7` | `chore(moon): merge feat/version-token-readside for W2-M2 base` |
 | `228e1f4` | `test(moon): W2-M2 RED — FT.INVALIDATE_RANGE failing tests` |
 | `ecd2bac` | `feat(moon): W2-M2 GREEN — FT.INVALIDATE_RANGE delete-by-query` |
+| `90670e8` | `feat(moon): W2-M2 MULTI-SHARD — FT.INVALIDATE_RANGE scatter-sum across shards` |
 
 ---
 
@@ -48,8 +49,9 @@ Returns: `(integer)` count of deleted documents.
 | `src/command/vector_search/ft_invalidate_range.rs` | New handler + unit tests |
 | `src/command/vector_search/mod.rs` | Module declaration + re-export |
 | `src/shard/spsc_handler.rs` | `dispatch_vector_command` registration |
-| `src/server/conn/handler_monoio/ft.rs` | Slice + non-slice paths |
-| `src/server/conn/handler_sharded/ft.rs` | Single-shard path |
+| `src/shard/coordinator.rs` | Added `scatter_invalidate_range` — fan-out to all shards, sum `Frame::Integer` counts |
+| `src/server/conn/handler_monoio/ft.rs` | Slice + non-slice single-shard paths; multi-shard scatter-sum path |
+| `src/server/conn/handler_sharded/ft.rs` | Single-shard path; multi-shard scatter-sum path |
 
 ---
 
@@ -125,7 +127,8 @@ not caused by W2-M2.
 - [x] `cargo clippy -- -D warnings` clean on touched crates
 - [x] All 6 new tests pass
 - [x] Command registered in dispatcher (`dispatch_vector_command`) and both
-      handler ft.rs files (monoio slice + non-slice paths; sharded path)
+      handler ft.rs files (monoio slice + non-slice + multi-shard paths; sharded single + multi-shard paths)
+- [x] Multi-shard scatter-sum (`scatter_invalidate_range` in coordinator.rs) — all N shards contacted, counts summed
 - [x] `version_token` bumps verifiable (exactly +1 per successful invocation)
 - [x] File LOC ≤700 on new files (`ft_invalidate_range.rs` = ~350 LOC)
 - [x] No modifications outside this Moon worktree
