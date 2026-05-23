@@ -820,6 +820,8 @@ pub(crate) fn maybe_force_checkpoint_on_wal_overflow(
         control,
         control_path,
         shard_id,
+        0, // tombstone_retain_epochs: no retention on emergency checkpoint
+        0, // tombstone_retain_secs: no retention on emergency checkpoint
     );
 
     // Aggressive recycle — bypass min_wal_bytes floor.

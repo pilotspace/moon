@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 
@@ -600,6 +601,18 @@ pub struct VectorStore {
     /// Shard directory for persisting index metadata sidecar.
     /// Set once during event loop init when disk-offload is enabled.
     persist_dir: Option<std::path::PathBuf>,
+    /// Monotonic freshness counter for the VSEARCH engine on this shard.
+    ///
+    /// Bumped (Release) after every successful mutating operation: `create_index`,
+    /// `drop_index`, `mark_deleted_for_key`, and vector-document inserts via the
+    /// auto-index path. Exposed by `FT.INFO` under `vector_version_token`.
+    ///
+    /// Semantics:
+    /// - Starts at 0 on shard boot; NOT restored from WAL (freshness hint only).
+    /// - Monotonic within a single shard; no cross-shard atomicity.
+    /// - Counter never wraps in practice (u64::MAX ≈ 1.8 × 10¹⁹ writes).
+    /// - Failed writes (index-not-found, parse errors) do NOT bump the counter.
+    version_token: AtomicU64,
 }
 
 impl VectorStore {
@@ -610,7 +623,26 @@ impl VectorStore {
             txn_manager: TransactionManager::new(),
             pending_segments: HashMap::new(),
             persist_dir: None,
+            version_token: AtomicU64::new(0),
         }
+    }
+
+    /// Return the current VSEARCH engine version token for this shard.
+    ///
+    /// Uses `Acquire` ordering so the caller observes all writes that preceded
+    /// the most recent `bump_version` call on this shard.
+    #[inline]
+    pub fn version_token(&self) -> u64 {
+        self.version_token.load(Ordering::Acquire)
+    }
+
+    /// Bump the VSEARCH version token by 1 after a successful write.
+    ///
+    /// Uses `Release` ordering so that any subsequent `Acquire` load on any
+    /// thread observes the completed write. Returns the new value.
+    #[inline]
+    pub fn bump_version(&self) -> u64 {
+        self.version_token.fetch_add(1, Ordering::Release) + 1
     }
 
     /// Set the shard directory for index metadata persistence.
