@@ -16,6 +16,7 @@
 //! ### Field-type preconditions
 //! - `<node_id_field>` MUST be declared as `TAG` in the `FT.CREATE` schema.
 //! - `<hlc_wall_field>` MUST be declared as `NUMERIC` in the `FT.CREATE` schema.
+//!
 //! Without correct schema declarations, the bitmap intersect returns empty and 0 is returned.
 //!
 //! ### Deletion semantics
@@ -53,7 +54,148 @@ use crate::text::store::TextStore;
 /// See module-level documentation for the Lunaris integration contract.
 #[cfg(feature = "text-index")]
 pub fn ft_invalidate_range(text_store: &mut TextStore, args: &[Frame]) -> Frame {
-    todo!("W2-M2 GREEN not yet implemented")
+    // ── Argument parsing ──────────────────────────────────────────────────────
+    // Expected: <index> <node_id_field> <node_id_value> <hlc_wall_field> <hlc_wall_lo> <hlc_wall_hi>
+    if args.len() != 6 {
+        return Frame::Error(Bytes::from_static(
+            b"SYNTAX wrong number of arguments for 'FT.INVALIDATE_RANGE' command: \
+              expected FT.INVALIDATE_RANGE <index> <node_id_field> <node_id_value> \
+              <hlc_wall_field> <hlc_wall_lo> <hlc_wall_hi>",
+        ));
+    }
+
+    let index_name = match extract_bulk(&args[0]) {
+        Some(b) => b,
+        None => {
+            return Frame::Error(Bytes::from_static(b"SYNTAX invalid index name"));
+        }
+    };
+    let node_id_field = match extract_bulk(&args[1]) {
+        Some(b) => b,
+        None => {
+            return Frame::Error(Bytes::from_static(b"SYNTAX invalid node_id_field"));
+        }
+    };
+    let node_id_value = match extract_bulk(&args[2]) {
+        Some(b) => b,
+        None => {
+            return Frame::Error(Bytes::from_static(b"SYNTAX invalid node_id_value"));
+        }
+    };
+    let hlc_wall_field = match extract_bulk(&args[3]) {
+        Some(b) => b,
+        None => {
+            return Frame::Error(Bytes::from_static(b"SYNTAX invalid hlc_wall_field"));
+        }
+    };
+
+    // Parse lo / hi as f64 (HLC wall-clock values fit comfortably in f64 for
+    // range queries; the NUMERIC index stores them as OrderedFloat<f64>).
+    let hlc_lo = match parse_f64(&args[4]) {
+        Some(v) => v,
+        None => {
+            return Frame::Error(Bytes::from_static(
+                b"SYNTAX hlc_wall_lo must be a valid number",
+            ));
+        }
+    };
+    let hlc_hi = match parse_f64(&args[5]) {
+        Some(v) => v,
+        None => {
+            return Frame::Error(Bytes::from_static(
+                b"SYNTAX hlc_wall_hi must be a valid number",
+            ));
+        }
+    };
+
+    // Guard: lo > hi is a caller error.
+    if hlc_lo > hlc_hi {
+        return Frame::Error(Bytes::from_static(
+            b"RANGE hlc_wall_lo must be <= hlc_wall_hi",
+        ));
+    }
+
+    // ── Index lookup ──────────────────────────────────────────────────────────
+    // Verify the index exists before attempting any mutation.
+    if text_store.get_index(index_name.as_ref()).is_none() {
+        return Frame::Error(Bytes::from_static(
+            b"WRONGTYPE no such index; FT.INVALIDATE_RANGE requires an existing text index",
+        ));
+    }
+
+    // ── Bitmap intersection: TAG ∩ NUMERIC range ──────────────────────────────
+    // Both searches are O(1) tag lookup + O(log N + k) range scan — no full scan.
+    //
+    // We read the bitmaps immutably first, collect matching doc_ids, then remove
+    // them in a second pass with &mut self. This avoids borrowing text_store
+    // both mutably and immutably at the same time.
+    let matching_doc_ids: Vec<u32> = {
+        let idx = text_store
+            .get_index(index_name.as_ref())
+            .expect("existence checked above");
+
+        // TAG filter: all doc_ids where node_id_field == node_id_value.
+        let tag_hits: Vec<u32> = idx.search_tag(&node_id_field, &node_id_value);
+
+        if tag_hits.is_empty() {
+            Vec::new()
+        } else {
+            // NUMERIC range filter: [hlc_lo, hlc_hi] inclusive on both ends.
+            let numeric_hits: Vec<u32> =
+                idx.search_numeric_range(&hlc_wall_field, hlc_lo, hlc_hi, false, false);
+
+            if numeric_hits.is_empty() {
+                Vec::new()
+            } else {
+                // Intersection: docs that satisfy BOTH filters.
+                // Use a sorted set approach: sort both vecs, walk two pointers.
+                let mut tag_sorted = tag_hits;
+                tag_sorted.sort_unstable();
+                let mut num_sorted = numeric_hits;
+                num_sorted.sort_unstable();
+
+                let mut result = Vec::new();
+                let (mut i, mut j) = (0, 0);
+                while i < tag_sorted.len() && j < num_sorted.len() {
+                    match tag_sorted[i].cmp(&num_sorted[j]) {
+                        std::cmp::Ordering::Equal => {
+                            result.push(tag_sorted[i]);
+                            i += 1;
+                            j += 1;
+                        }
+                        std::cmp::Ordering::Less => i += 1,
+                        std::cmp::Ordering::Greater => j += 1,
+                    }
+                }
+                result
+            }
+        }
+    };
+
+    // ── Hard-delete matching documents ────────────────────────────────────────
+    let count = matching_doc_ids.len() as i64;
+    if let Some(idx) = text_store.get_index_mut(index_name.as_ref()) {
+        for doc_id in matching_doc_ids {
+            idx.remove_doc_by_doc_id(doc_id);
+        }
+    }
+
+    // ── Bump version token (always, including zero-match) ─────────────────────
+    // Lunaris polls text_version_token to detect any state change. A force-push
+    // that touches no indexed documents still advances wall-clock state, so
+    // consumers need to re-poll. Only parse/range/index errors skip the bump.
+    text_store.bump_version();
+
+    Frame::Integer(count)
+}
+
+/// Parse a `Frame::BulkString` as an `f64`.
+fn parse_f64(frame: &Frame) -> Option<f64> {
+    match frame {
+        Frame::BulkString(b) => std::str::from_utf8(b).ok()?.parse().ok(),
+        Frame::Integer(n) => Some(*n as f64),
+        _ => None,
+    }
 }
 
 // ── Unit tests ───────────────────────────────────────────────────────────────
@@ -64,7 +206,7 @@ mod tests {
     use bytes::Bytes;
 
     use crate::command::vector_search::ft_create::ft_create;
-    use crate::protocol::{Frame, FrameVec};
+    use crate::protocol::Frame;
     use crate::text::store::TextStore;
     use crate::vector::store::VectorStore;
 
