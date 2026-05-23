@@ -39,9 +39,8 @@ pub fn copy(db: &mut Database, args: &[Frame]) -> Frame {
         if arg.eq_ignore_ascii_case(b"REPLACE") {
             replace = true;
         } else if arg.eq_ignore_ascii_case(b"DB") {
-            // Cross-DB copy requires shard_databases context not available here
             return Frame::Error(Bytes::from_static(
-                b"ERR COPY with DB option is not supported yet",
+                b"ERR COPY DB option not implemented (tracked in T2.3)",
             ));
         } else {
             return Frame::Error(Bytes::from_static(b"ERR syntax error"));
@@ -460,10 +459,24 @@ mod tests {
     }
 
     #[test]
-    fn test_copy_db_option_errors() {
+    fn test_copy_db_option_not_implemented() {
+        // T1.3: COPY ... DB n returns the "not implemented (tracked in T2.3)" error.
         let mut db = setup_db_with_key(b"src", b"hello");
         let result = copy(&mut db, &[bs(b"src"), bs(b"dst"), bs(b"DB")]);
-        assert!(matches!(result, Frame::Error(_)));
+        match result {
+            Frame::Error(msg) => {
+                let text = std::str::from_utf8(&msg).unwrap();
+                assert!(
+                    text.contains("T2.3"),
+                    "expected T2.3 tracking ref in error, got: {text}"
+                );
+                assert!(
+                    text.contains("not implemented"),
+                    "expected 'not implemented' in error, got: {text}"
+                );
+            }
+            other => panic!("expected Error frame, got {other:?}"),
+        }
     }
 
     // --- SORT tests ---
