@@ -12,6 +12,8 @@ pub mod ft_aggregate;
 pub mod ft_config;
 pub mod ft_create;
 pub mod ft_info;
+#[cfg(feature = "text-index")]
+pub mod ft_invalidate_range;
 pub mod ft_search;
 pub mod ft_text_search;
 #[cfg(feature = "graph")]
@@ -29,6 +31,8 @@ pub mod session;
 pub use ft_admin::{ft_compact, ft_dropindex, ft_list};
 #[cfg(feature = "text-index")]
 pub use ft_aggregate::ft_aggregate;
+#[cfg(feature = "text-index")]
+pub use ft_invalidate_range::ft_invalidate_range;
 pub use ft_config::ft_config;
 pub use ft_create::ft_create;
 pub use ft_info::ft_info;

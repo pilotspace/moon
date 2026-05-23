@@ -528,6 +528,27 @@ pub(super) async fn try_handle_ft_command(
             responses.push(response);
             return true;
         }
+        #[cfg(feature = "text-index")]
+        if cmd.eq_ignore_ascii_case(b"FT.INVALIDATE_RANGE") {
+            let response = crate::shard::coordinator::scatter_invalidate_range(
+                std::sync::Arc::new(frame.clone()),
+                ctx.shard_id,
+                ctx.num_shards,
+                &ctx.shard_databases,
+                &ctx.dispatch_tx,
+                &ctx.spsc_notifiers,
+            )
+            .await;
+            responses.push(response);
+            return true;
+        }
+        #[cfg(not(feature = "text-index"))]
+        if cmd.eq_ignore_ascii_case(b"FT.INVALIDATE_RANGE") {
+            responses.push(Frame::Error(Bytes::from_static(
+                b"ERR FT.INVALIDATE_RANGE requires text-index feature",
+            )));
+            return true;
+        }
         responses.push(Frame::Error(Bytes::from_static(b"ERR unknown FT command")));
         return true;
     } else {
@@ -1015,6 +1036,20 @@ pub(super) async fn try_handle_ft_command(
                             b"ERR FT.EXPAND requires graph feature",
                         ))
                     }
+                } else if cmd.eq_ignore_ascii_case(b"FT.INVALIDATE_RANGE") {
+                    #[cfg(feature = "text-index")]
+                    {
+                        crate::command::vector_search::ft_invalidate_range(
+                            &mut s.text_store,
+                            cmd_args,
+                        )
+                    }
+                    #[cfg(not(feature = "text-index"))]
+                    {
+                        Frame::Error(Bytes::from_static(
+                            b"ERR FT.INVALIDATE_RANGE requires text-index feature",
+                        ))
+                    }
                 } else {
                     Frame::Error(Bytes::from_static(b"ERR unknown FT.* command"))
                 }
@@ -1116,6 +1151,17 @@ pub(super) async fn try_handle_ft_command(
                 #[cfg(not(feature = "graph"))]
                 {
                     Frame::Error(Bytes::from_static(b"ERR FT.EXPAND requires graph feature"))
+                }
+            } else if cmd.eq_ignore_ascii_case(b"FT.INVALIDATE_RANGE") {
+                #[cfg(feature = "text-index")]
+                {
+                    crate::command::vector_search::ft_invalidate_range(&mut ts, cmd_args)
+                }
+                #[cfg(not(feature = "text-index"))]
+                {
+                    Frame::Error(Bytes::from_static(
+                        b"ERR FT.INVALIDATE_RANGE requires text-index feature",
+                    ))
                 }
             } else {
                 Frame::Error(Bytes::from_static(b"ERR unknown FT.* command"))

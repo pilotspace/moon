@@ -2341,6 +2341,19 @@ pub(crate) fn dispatch_vector_command(
         }
     } else if cmd.eq_ignore_ascii_case(b"FT.RECOMMEND") {
         vector_search::recommend::ft_recommend(vector_store, args, db)
+    } else if cmd.eq_ignore_ascii_case(b"FT.INVALIDATE_RANGE") {
+        // FT.INVALIDATE_RANGE: bulk-delete by (TAG ∩ NUMERIC range); bumps text_version_token.
+        // Requires text-index feature for TAG + NUMERIC bitmap indexes.
+        #[cfg(feature = "text-index")]
+        {
+            vector_search::ft_invalidate_range(text_store, args)
+        }
+        #[cfg(not(feature = "text-index"))]
+        {
+            crate::protocol::Frame::Error(bytes::Bytes::from_static(
+                b"ERR FT.INVALIDATE_RANGE requires text-index feature",
+            ))
+        }
     } else {
         crate::protocol::Frame::Error(bytes::Bytes::from_static(b"ERR unknown FT command"))
     }

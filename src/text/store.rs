@@ -1265,6 +1265,88 @@ impl TextIndex {
             .map(|p| p.estimated_bytes())
             .sum()
     }
+
+    /// Hard-delete a document identified by `doc_id` from all inverted indexes.
+    ///
+    /// Removes:
+    /// - BM25 posting entries for all TEXT fields.
+    /// - Field-length accounting (num_docs, total_field_length) for all TEXT fields.
+    /// - TAG bitmap entries (via `doc_tag_entries`).
+    /// - NUMERIC BTreeMap entries (via `doc_numeric_entries`).
+    /// - `doc_field_lengths`, `doc_id_to_key`, `key_hash_to_doc_id`.
+    /// - MVCC LSN records (`doc_id_to_insert_lsn`, `doc_id_to_delete_lsn`).
+    ///
+    /// Does nothing if `doc_id` is not present in `doc_id_to_key` (idempotent).
+    ///
+    /// This is the building block used by `FT.INVALIDATE_RANGE` for force-push
+    /// bulk-invalidation of stale recall (see INTEGRATION-PLAN.md §3.3).
+    pub fn remove_doc_by_doc_id(&mut self, doc_id: u32) {
+        // Guard: nothing to do if doc isn't tracked.
+        if !self.doc_id_to_key.contains_key(&doc_id) {
+            return;
+        }
+
+        // ── TEXT field removal ────────────────────────────────────────────────
+        for field_idx in 0..self.text_fields.len() {
+            if self.text_fields[field_idx].noindex {
+                continue;
+            }
+            // Subtract field length from stats before clearing postings.
+            if let Some(lengths) = self.doc_field_lengths.get(&doc_id) {
+                if let Some(&len) = lengths.get(field_idx) {
+                    let len64 = len as u64;
+                    self.field_stats[field_idx].total_field_length = self.field_stats[field_idx]
+                        .total_field_length
+                        .saturating_sub(len64);
+                    if len64 > 0 {
+                        self.field_stats[field_idx].num_docs =
+                            self.field_stats[field_idx].num_docs.saturating_sub(1);
+                    }
+                }
+            }
+            self.field_postings[field_idx].remove_doc(doc_id);
+        }
+
+        // ── TAG field removal ─────────────────────────────────────────────────
+        #[cfg(feature = "text-index")]
+        if let Some(entries) = self.doc_tag_entries.remove(&doc_id) {
+            for (field, value) in entries {
+                if let Some(field_map) = self.tag_indexes.get_mut(&field) {
+                    if let Some(bm) = field_map.get_mut(&value) {
+                        bm.remove(doc_id);
+                        if bm.is_empty() {
+                            field_map.remove(&value);
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── NUMERIC field removal ─────────────────────────────────────────────
+        #[cfg(feature = "text-index")]
+        if let Some(entries) = self.doc_numeric_entries.remove(&doc_id) {
+            for (field, value) in entries {
+                if let Some(btree) = self.numeric_indexes.get_mut(&field) {
+                    if let Some(bm) = btree.get_mut(&value) {
+                        bm.remove(doc_id);
+                        if bm.is_empty() {
+                            btree.remove(&value);
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── Metadata cleanup ──────────────────────────────────────────────────
+        self.doc_field_lengths.remove(&doc_id);
+        // Remove from key_hash -> doc_id map (need to find the key_hash).
+        if let Some(key) = self.doc_id_to_key.remove(&doc_id) {
+            let key_hash = xxhash_rust::xxh64::xxh64(&key, 0);
+            self.key_hash_to_doc_id.remove(&key_hash);
+        }
+        self.doc_id_to_insert_lsn.remove(&doc_id);
+        self.doc_id_to_delete_lsn.remove(&doc_id);
+    }
 }
 
 #[cfg(feature = "text-index")]
