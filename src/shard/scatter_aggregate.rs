@@ -57,6 +57,9 @@ pub async fn scatter_text_aggregate(
         // call to avoid a reentrant `with_shard*` panic (RefCell double-borrow).
         let result = if crate::shard::slice::is_initialized() {
             crate::shard::slice::with_shard(|s| {
+                // Every shard slice is constructed with at least one database
+                // (db 0); see Shard::new in src/shard/mod.rs.
+                #[allow(clippy::expect_used)]
                 let db = s
                     .databases
                     .first()
@@ -103,6 +106,8 @@ pub async fn scatter_text_aggregate(
             // avoid a reentrant `with_shard*` panic.
             let response = if crate::shard::slice::is_initialized() {
                 crate::shard::slice::with_shard(|s| {
+                    // See note on previous expect — db 0 is constructor-guaranteed.
+                    #[allow(clippy::expect_used)]
                     let db = s
                         .databases
                         .first()
