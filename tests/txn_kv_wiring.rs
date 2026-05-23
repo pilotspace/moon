@@ -896,28 +896,38 @@ fn find_moon_binary() -> Option<std::path::PathBuf> {
     None
 }
 
-/// Open a redis-rs sync connection, retrying through the post-bind handshake race.
+/// Open a redis-rs sync connection AND verify the server can answer PING.
 ///
-/// `wait_for_server` only proves TCP bind. The shard accept loop and RESP handler
-/// can lag the bind by a small window, during which the first RESP exchange may
-/// fail with EAGAIN (Linux) or ECONNRESET (macOS). Retry with short backoff
-/// instead of letting a single fast attempt panic.
+/// `wait_for_server` only proves TCP bind. The shard accept loop and RESP
+/// handler can lag the bind by a small window, during which:
+/// - `get_connection` may fail with EAGAIN (Linux) / ECONNREFUSED (macOS), or
+/// - succeed but the first command times out (handler not draining yet).
+///
+/// We retry both the TCP connect AND a PING round-trip until both succeed.
+/// Deadline is 60s — generous, but the binary spawn + WAL replay + accept-loop
+/// boot can take >15s on shared CI runners under load (the previous 15s
+/// deadline flaked test_txn_commit_wal_crash_recovery).
 fn connect_redis_with_retry(client: &redis::Client, label: &str) -> redis::Connection {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     #[allow(unused_assignments)]
-    let mut last_err: Option<redis::RedisError> = None;
+    let mut last_err: Option<String> = None;
     loop {
-        match client.get_connection_with_timeout(std::time::Duration::from_secs(1)) {
-            Ok(conn) => return conn,
-            Err(e) => last_err = Some(e),
+        match client.get_connection_with_timeout(std::time::Duration::from_secs(2)) {
+            Ok(mut conn) => {
+                // Verify the connection is actually serving RESP, not just bound.
+                let ping: redis::RedisResult<String> = redis::cmd("PING").query(&mut conn);
+                match ping {
+                    Ok(ref pong) if pong == "PONG" => return conn,
+                    Ok(other) => last_err = Some(format!("ping returned {other:?}")),
+                    Err(e) => last_err = Some(format!("ping failed: {e}")),
+                }
+            }
+            Err(e) => last_err = Some(format!("connect failed: {e}")),
         }
         if std::time::Instant::now() >= deadline {
             panic!(
-                "connect to {label} server failed after 15s: {}",
-                last_err
-                    .as_ref()
-                    .map(|e| e.to_string())
-                    .unwrap_or_else(|| "no error captured".into())
+                "connect to {label} server failed after 60s: {}",
+                last_err.unwrap_or_else(|| "no error captured".into())
             );
         }
         std::thread::sleep(std::time::Duration::from_millis(200));

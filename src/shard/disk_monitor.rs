@@ -250,11 +250,12 @@ fn query_free_bytes(path: &Path) -> Option<(u64, u64)> {
     // — treat them as unreadable.
     let c_path = CString::new(path.as_os_str().as_encoded_bytes()).ok()?;
 
-    // SAFETY: `statvfs` is a POSIX C function. We pass a properly terminated C
-    // string and a properly sized output buffer. `MaybeUninit` avoids reading
-    // uninitialised memory before the syscall writes to it. The return value is
-    // checked before the struct is accessed.
+    // `statvfs` is a POSIX C function. We pass a properly terminated C string
+    // and a properly sized output buffer. `MaybeUninit` avoids reading
+    // uninitialised memory before the syscall writes to it. The return value
+    // is checked before the struct is accessed.
     let mut stat: MaybeUninit<libc::statvfs> = MaybeUninit::uninit();
+    // SAFETY: POSIX statvfs with valid C-string and MaybeUninit out-pointer.
     let rc = unsafe { libc::statvfs(c_path.as_ptr(), stat.as_mut_ptr()) };
     if rc != 0 {
         return None;

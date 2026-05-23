@@ -130,6 +130,10 @@ pub fn ft_invalidate_range(text_store: &mut TextStore, args: &[Frame]) -> Frame 
     // them in a second pass with &mut self. This avoids borrowing text_store
     // both mutably and immutably at the same time.
     let matching_doc_ids: Vec<u32> = {
+        // SAFETY-NOTE: get_index(...).is_none() is checked above on the same
+        // &text_store; no mutation can happen between the check and this read
+        // because the borrow is held synchronously on a single shard thread.
+        #[allow(clippy::expect_used)]
         let idx = text_store
             .get_index(index_name.as_ref())
             .expect("existence checked above");
@@ -200,7 +204,8 @@ fn parse_f64(frame: &Frame) -> Option<f64> {
 
 // ── Unit tests ───────────────────────────────────────────────────────────────
 
-#[cfg(all(test, feature = "text-index"))]
+#[cfg(test)]
+#[cfg(feature = "text-index")]
 mod tests {
     use super::*;
     use bytes::Bytes;

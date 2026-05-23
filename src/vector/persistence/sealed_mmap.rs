@@ -70,11 +70,11 @@ use memmap2::Mmap;
 /// This function is `#[cfg(unix)]`; on non-Unix targets it is a no-op stub.
 #[cfg(unix)]
 pub fn advise_dontneed(mmap: &Mmap) {
-    // SAFETY: mmap is a valid, live read-only file-backed mapping produced by
+    // mmap is a valid, live read-only file-backed mapping produced by
     // map_sealed / map_sealed_file. MADV_DONTNEED on a read-only file-backed
     // region is sound: the kernel pages data back from the unchanged sealed
-    // file on the next access. No writes exist through this mapping, so no
-    // dirty data is discarded.
+    // file on the next access.
+    // SAFETY: read-only file-backed mapping; no writes lost on DONTNEED.
     unsafe {
         libc::madvise(
             mmap.as_ptr() as *mut libc::c_void,
