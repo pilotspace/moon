@@ -245,9 +245,13 @@ pub fn info(db: &Database, _args: &[Frame]) -> Frame {
     let _ = write!(
         sections,
         "total_commands_processed:{}\r\n\
-         total_connections_received:{}\r\n",
+         total_connections_received:{}\r\n\
+         total_dispatch_cross_read_fastpath:{}\r\n\
+         total_dispatch_cross_spsc:{}\r\n",
         crate::admin::metrics_setup::total_commands_processed(),
         crate::admin::metrics_setup::total_connections_received(),
+        crate::admin::metrics_setup::total_dispatch_cross_read_fastpath(),
+        crate::admin::metrics_setup::total_dispatch_cross_spsc(),
     );
     sections.push_str("\r\n");
 

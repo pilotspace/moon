@@ -178,12 +178,17 @@ fn dispatch_inner(
             }
         }
         (4, b'm') => {
-            // MGET MSET
+            // MGET MSET MOVE
             if cmd.eq_ignore_ascii_case(b"MGET") {
                 return resp(string::mget(db, args));
             }
             if cmd.eq_ignore_ascii_case(b"MSET") {
                 return resp(string::mset(db, args));
+            }
+            if cmd.eq_ignore_ascii_case(b"MOVE") {
+                return resp(Frame::Error(Bytes::from_static(
+                    b"ERR MOVE not implemented (tracked in T2.2)",
+                )));
             }
         }
         (4, b'p') => {
@@ -536,9 +541,8 @@ fn dispatch_inner(
                 }
                 b'w' => {
                     if cmd.eq_ignore_ascii_case(b"SWAPDB") {
-                        // SWAPDB requires cross-database access not available in dispatch
                         return resp(Frame::Error(Bytes::from_static(
-                            b"ERR SWAPDB is not supported in sharded mode",
+                            b"ERR SWAPDB not implemented (tracked in T2.1)",
                         )));
                     }
                 }
@@ -1779,6 +1783,48 @@ mod tests {
             // dispatch_read returns Frame — should not panic, even without args.
             let mut selected = 0usize;
             let _result = dispatch_read(&db, cmd, &[], now_ms, &mut selected, 16);
+        }
+    }
+
+    // ── T1.3: reframed "not implemented" errors ───────────────────────────
+
+    fn dispatch_resp(cmd: &[u8], args: &[&[u8]]) -> Frame {
+        let mut db = Database::new();
+        let mut selected = 0usize;
+        let frame_args = make_args(args);
+        match dispatch(&mut db, cmd, &frame_args, &mut selected, 1) {
+            DispatchResult::Response(f) => f,
+            DispatchResult::Quit(_) => panic!("unexpected Quit result"),
+        }
+    }
+
+    #[test]
+    fn swapdb_error_is_not_implemented() {
+        let frame = dispatch_resp(b"SWAPDB", &[b"0", b"1"]);
+        match frame {
+            Frame::Error(msg) => {
+                let text = std::str::from_utf8(&msg).unwrap();
+                assert!(text.contains("not implemented"), "got: {text}");
+                assert!(text.contains("T2.1"), "expected T2.1 ref, got: {text}");
+                assert!(
+                    !text.contains("sharded mode"),
+                    "old text must be gone, got: {text}"
+                );
+            }
+            other => panic!("expected Error frame, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn move_error_is_not_implemented() {
+        let frame = dispatch_resp(b"MOVE", &[b"mykey", b"1"]);
+        match frame {
+            Frame::Error(msg) => {
+                let text = std::str::from_utf8(&msg).unwrap();
+                assert!(text.contains("not implemented"), "got: {text}");
+                assert!(text.contains("T2.2"), "expected T2.2 ref, got: {text}");
+            }
+            other => panic!("expected Error frame, got {other:?}"),
         }
     }
 }

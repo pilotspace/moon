@@ -242,15 +242,41 @@ fn main() -> anyhow::Result<()> {
     moon::vector::distance::init();
 
     // Determine number of shards
+    // T1.2: when --shards 0 (auto-detect), optionally cap at the empirical
+    // sweet-spot of min(2, vCPU) via MOON_AUTO_SHARDS_CONSERVATIVE=1.
+    // Default behaviour is unchanged: full available_parallelism().
     let num_shards = if config.shards == 0 {
-        std::thread::available_parallelism()
+        let parallelism = std::thread::available_parallelism()
             .map(|n| n.get())
-            .unwrap_or(4)
+            .unwrap_or(4);
+        let conservative = std::env::var_os("MOON_AUTO_SHARDS_CONSERVATIVE").is_some();
+        let resolved = compute_auto_shards(parallelism, conservative);
+        if conservative {
+            info!(
+                "auto-detected shards={resolved} \
+                 (capped at 2 via MOON_AUTO_SHARDS_CONSERVATIVE; \
+                 unset to use full vCPU count of {parallelism})"
+            );
+        } else {
+            info!(
+                "auto-detected shards={resolved} \
+                 (set MOON_AUTO_SHARDS_CONSERVATIVE=1 to cap at 2)"
+            );
+        }
+        resolved
     } else {
         config.shards
     };
 
     info!("Starting with {} shards", num_shards);
+
+    // T1.1: warn when maxclients < 25 × shards (undersubscription footgun).
+    // Suppressed by MOON_NO_UNDERSUBSCRIPTION_WARN=1.
+    if let Some(msg) = should_warn_undersubscription(config.maxclients, num_shards)
+        && std::env::var_os("MOON_NO_UNDERSUBSCRIPTION_WARN").is_none()
+    {
+        tracing::warn!("{msg}");
+    }
 
     // Create channel mesh for inter-shard communication
     let mut mesh = ChannelMesh::new(num_shards, CHANNEL_BUFFER_SIZE);
@@ -935,7 +961,116 @@ fn maybe_respawn_with_arena_override() -> anyhow::Result<()> {
     ))
 }
 
+/// Resolve the automatic shard count, optionally capped to the empirical
+/// knee of 2 when `MOON_AUTO_SHARDS_CONSERVATIVE=1` is set.
+///
+/// * `parallelism` — value from `available_parallelism()` (or fallback).
+/// * `conservative` — when `true`, clamps the result to `min(parallelism, 2)`.
+///
+/// The cap is intentionally opt-IN: the default `--shards 0` continues to
+/// resolve to the full CPU count. Operators on high-core hosts who observe
+/// sub-linear multi-shard scaling can set the env var to stay in the
+/// `s≤2` sweet spot without changing the startup flag.
+pub fn compute_auto_shards(parallelism: usize, conservative: bool) -> usize {
+    if conservative {
+        parallelism.min(2)
+    } else {
+        parallelism
+    }
+}
+
+/// Returns a warning message when the server is configured with too few
+/// client slots for the number of shards, or `None` when no warning is
+/// needed.
+///
+/// # Arguments
+/// * `maxclients` — configured `--maxclients` value (0 = unlimited; no
+///   warning is emitted in that case since there is no per-shard ceiling).
+/// * `num_shards` — resolved shard count after auto-detect.
+///
+/// The empirical threshold is **25 clients per shard**: below this the
+/// per-shard SPSC channels are chronically under-subscribed and throughput
+/// collapses (documented in `benchmark_scaling_concurrency_2026_04_26`).
+///
+/// Suppressed entirely when `num_shards == 1` (single-shard has no
+/// cross-shard dispatch) or when `maxclients == 0` (unlimited).
+pub fn should_warn_undersubscription(maxclients: usize, num_shards: usize) -> Option<String> {
+    if num_shards <= 1 || maxclients == 0 {
+        return None;
+    }
+    let threshold = num_shards.saturating_mul(25);
+    if maxclients < threshold {
+        Some(format!(
+            "multi-shard mode with shards={num_shards} expects \
+             \u{2265}{threshold} concurrent clients; current \
+             maxclients={maxclients} may cause throughput collapse — \
+             see CLAUDE.md Gotchas or set MOON_NO_UNDERSUBSCRIPTION_WARN=1 \
+             to suppress this warning"
+        ))
+    } else {
+        None
+    }
+}
+
 #[cfg(not(all(feature = "jemalloc", unix)))]
 fn maybe_respawn_with_arena_override() -> anyhow::Result<()> {
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_warn_undersubscription;
+
+    #[test]
+    fn no_warn_single_shard() {
+        assert!(should_warn_undersubscription(100, 1).is_none());
+    }
+
+    #[test]
+    fn no_warn_unlimited_clients() {
+        assert!(should_warn_undersubscription(0, 8).is_none());
+    }
+
+    #[test]
+    fn no_warn_sufficient_clients() {
+        // 8 shards × 25 = 200 → exactly 200 is sufficient
+        assert!(should_warn_undersubscription(200, 8).is_none());
+    }
+
+    #[test]
+    fn warns_below_threshold() {
+        // 8 shards × 25 = 200 → 199 is insufficient
+        let msg = should_warn_undersubscription(199, 8).expect("should warn");
+        assert!(msg.contains("shards=8"), "got: {msg}");
+        assert!(msg.contains("maxclients=199"), "got: {msg}");
+    }
+
+    #[test]
+    fn warns_default_maxclients_low_shards() {
+        // 4 shards × 25 = 100 → default maxclients=10000 is fine
+        assert!(should_warn_undersubscription(10000, 4).is_none());
+    }
+
+    #[test]
+    fn warns_high_shard_count() {
+        // 32 shards × 25 = 800 → 50 is way below threshold
+        let msg = should_warn_undersubscription(50, 32).expect("should warn");
+        assert!(msg.contains("shards=32"), "got: {msg}");
+    }
+
+    #[test]
+    fn threshold_is_inclusive() {
+        // exactly at threshold: no warn
+        assert!(should_warn_undersubscription(25, 1).is_none()); // single shard
+        assert!(should_warn_undersubscription(50, 2).is_none()); // 2×25 = 50
+    }
+
+    #[test]
+    fn auto_shards_conservative_cap() {
+        // verify compute_auto_shards pure function
+        assert_eq!(super::compute_auto_shards(16, true), 2);
+        assert_eq!(super::compute_auto_shards(16, false), 16);
+        assert_eq!(super::compute_auto_shards(1, true), 1);
+        assert_eq!(super::compute_auto_shards(4, true), 2);
+    }
 }
