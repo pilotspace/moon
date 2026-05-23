@@ -242,10 +242,28 @@ fn main() -> anyhow::Result<()> {
     moon::vector::distance::init();
 
     // Determine number of shards
+    // T1.2: when --shards 0 (auto-detect), optionally cap at the empirical
+    // sweet-spot of min(2, vCPU) via MOON_AUTO_SHARDS_CONSERVATIVE=1.
+    // Default behaviour is unchanged: full available_parallelism().
     let num_shards = if config.shards == 0 {
-        std::thread::available_parallelism()
+        let parallelism = std::thread::available_parallelism()
             .map(|n| n.get())
-            .unwrap_or(4)
+            .unwrap_or(4);
+        let conservative = std::env::var_os("MOON_AUTO_SHARDS_CONSERVATIVE").is_some();
+        let resolved = compute_auto_shards(parallelism, conservative);
+        if conservative {
+            info!(
+                "auto-detected shards={resolved} \
+                 (capped at 2 via MOON_AUTO_SHARDS_CONSERVATIVE; \
+                 unset to use full vCPU count of {parallelism})"
+            );
+        } else {
+            info!(
+                "auto-detected shards={resolved} \
+                 (set MOON_AUTO_SHARDS_CONSERVATIVE=1 to cap at 2)"
+            );
+        }
+        resolved
     } else {
         config.shards
     };
