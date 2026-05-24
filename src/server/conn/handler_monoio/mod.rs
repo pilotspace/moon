@@ -1071,6 +1071,50 @@ pub(crate) async fn handle_connection_sharded_monoio<
 
             if is_local {
                 crate::admin::metrics_setup::record_dispatch_local();
+
+                // T2.2 MOVE — intercept before write-path (needs two dbs).
+                // Requires two databases simultaneously; intercept before normal write path.
+                if metadata::is_write(cmd) {
+                    if cmd.eq_ignore_ascii_case(b"MOVE") {
+                        use crate::command::keyspace::move_cmd as ksmv;
+                        let src_db = conn.selected_db;
+                        let db_count = ctx.shard_databases.db_count();
+                        let response = match ksmv::parse_move_args(cmd_args, db_count) {
+                            Err(e) => e,
+                            Ok((_key, dst_db)) if dst_db == src_db => Frame::Integer(0),
+                            Ok((key, dst_db)) => {
+                                if crate::shard::slice::is_initialized() {
+                                    crate::shard::slice::with_shard(|s| {
+                                        ksmv::with_two_slice_dbs(
+                                            &mut s.databases,
+                                            src_db,
+                                            dst_db,
+                                            |src, dst| ksmv::move_core(src, dst, &key),
+                                        )
+                                    })
+                                } else {
+                                    // Lock ordering (lower index first) prevents deadlock with
+                                    // concurrent reverse MOVE from another connection.
+                                    ksmv::with_two_dbs_locked(
+                                        &ctx.shard_databases.all_shard_dbs()[ctx.shard_id],
+                                        src_db,
+                                        dst_db,
+                                        |src, dst| ksmv::move_core(src, dst, &key),
+                                    )
+                                }
+                            }
+                        };
+                        if !matches!(response, Frame::Error(_)) {
+                            if let Some(ref tx) = ctx.aof_tx {
+                                let serialized = aof::serialize_command(&frame);
+                                let _ = tx.try_send(AofMessage::Append(serialized));
+                            }
+                        }
+                        responses.push(response);
+                        continue;
+                    }
+                }
+
                 if metadata::is_write(cmd) {
                     // WRITE PATH: eviction + dispatch under write lock.
                     //

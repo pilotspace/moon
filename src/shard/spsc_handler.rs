@@ -458,6 +458,55 @@ pub(crate) fn handle_shard_message_shared(
                     // Other RECLAMATION subcommands fall through.
                 }
 
+                // T2.2 MOVE — atomically moves a key between two dbs on the same shard.
+                // Requires two databases simultaneously; intercept before cmd_dispatch.
+                if cmd.eq_ignore_ascii_case(b"MOVE") {
+                    use crate::command::keyspace::move_cmd as ksmv;
+                    let response = match ksmv::parse_move_args(args, db_count) {
+                        Err(e) => e,
+                        Ok((_key, dst_db)) if dst_db == db_idx => {
+                            crate::protocol::Frame::Integer(0)
+                        }
+                        Ok((key, dst_db)) => {
+                            // SPSC runs single-threaded per shard; no concurrent MOVE can
+                            // deadlock. slice path uses split_at_mut (no locking needed).
+                            if crate::shard::slice::is_initialized() {
+                                crate::shard::slice::with_shard(|s| {
+                                    ksmv::with_two_slice_dbs(
+                                        &mut s.databases,
+                                        db_idx,
+                                        dst_db,
+                                        |src, dst| ksmv::move_core(src, dst, &key),
+                                    )
+                                })
+                            } else {
+                                // Lock ordering (lower index first) prevents deadlock with
+                                // handler_monoio/sharded connections on the same shard.
+                                ksmv::with_two_dbs_locked(
+                                    &shard_databases.all_shard_dbs()[shard_id],
+                                    db_idx,
+                                    dst_db,
+                                    |src, dst| ksmv::move_core(src, dst, &key),
+                                )
+                            }
+                        }
+                    };
+                    if matches!(response, crate::protocol::Frame::Integer(1)) {
+                        let serialized = aof::serialize_command(&command);
+                        wal_append_and_fanout(
+                            &serialized,
+                            wal_writer,
+                            wal_v3_writer,
+                            repl_backlog,
+                            replica_txs,
+                            repl_state,
+                            shard_id,
+                        );
+                    }
+                    let _ = reply_tx.send(response);
+                    return;
+                }
+
                 // COW intercept: capture old value before write if snapshot is active
                 let is_write = metadata::is_write(cmd);
                 // Phase 2b: gate on is_initialized(); new path uses ShardSlice.

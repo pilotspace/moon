@@ -2069,6 +2069,36 @@ pub async fn handle_connection(
                                     // Other DEBUG subcommands fall through to dispatch().
                                 }
 
+                                // T2.2 MOVE — needs two databases simultaneously.
+                                // dispatch() only receives one &mut Database; intercept here.
+                                if d_cmd.eq_ignore_ascii_case(b"MOVE") {
+                                    let src_db = conn.selected_db;
+                                    let response = match crate::command::keyspace::move_cmd::parse_move_args(d_args, db_count) {
+                                        Err(e) => e,
+                                        Ok((_key, dst_db)) if dst_db == src_db => Frame::Integer(0),
+                                        Ok((key, dst_db)) => {
+                                            // Release single-db guard before acquiring two-db locks
+                                            drop(guard);
+                                            let r = crate::command::keyspace::move_cmd::with_two_dbs_locked(
+                                                db.as_slice(), src_db, dst_db,
+                                                |src, dst| crate::command::keyspace::move_cmd::move_core(src, dst, &key),
+                                            );
+                                            // Restore loop invariant: re-acquire guard
+                                            current_db = conn.selected_db;
+                                            guard = db[current_db].write();
+                                            guard.refresh_now();
+                                            r
+                                        }
+                                    };
+                                    if matches!(response, Frame::Integer(1)) {
+                                        if let Some(bytes) = &aof_bytes {
+                                            aof_entries.push(bytes.clone());
+                                        }
+                                    }
+                                    responses[resp_idx] = response;
+                                    continue;
+                                }
+
                                 // HSET auto-indexing: after dispatch, check for vector index match
                                 let is_hset = d_cmd.eq_ignore_ascii_case(b"HSET");
 
