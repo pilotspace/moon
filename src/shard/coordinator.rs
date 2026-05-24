@@ -1657,6 +1657,83 @@ pub(crate) fn aggregate_doc_freq(
     (global_df, global_n)
 }
 
+/// Broadcast SWAPDB to all shards and await acknowledgement from each.
+///
+/// # Flow
+///
+/// - Local shard: inline swap under ascending-index write locks (no SPSC round-trip).
+/// - Remote shards: send `ShardMessage::SwapDb` and collect oneshot replies.
+///
+/// All-shard acks are awaited before returning `+OK`.  Between the first and
+/// last ack a brief window exists where a cross-shard GET may observe the
+/// pre-swap state on one shard and post-swap on another.  This matches Redis
+/// cluster relaxed semantics and is documented as the "brief-skew" acceptance.
+///
+/// # Consistency note
+///
+/// WAL is emitted by each shard's SPSC handler *before* performing the swap,
+/// so crash-recovery replay applies them in the correct order.
+pub async fn coordinate_swapdb(
+    a: usize,
+    b: usize,
+    my_shard: usize,
+    num_shards: usize,
+    shard_databases: &Arc<ShardDatabases>,
+    dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
+    spsc_notifiers: &[Arc<channel::Notify>],
+) -> Frame {
+    // ChannelMesh has no self-send slot (target_index panics when my_id == target_id).
+    // Skip self in the SPSC loop; handle the local shard inline below.
+    let remote_count = num_shards.saturating_sub(1);
+    let mut receivers: Vec<channel::OneshotReceiver<()>> = Vec::with_capacity(remote_count);
+
+    for target in 0..num_shards {
+        if target == my_shard {
+            continue; // handled inline below
+        }
+        let (reply_tx, reply_rx) = channel::oneshot();
+        let msg = ShardMessage::SwapDb { a, b, reply_tx };
+        spsc_send(dispatch_tx, my_shard, target, msg, spsc_notifiers).await;
+        receivers.push(reply_rx);
+    }
+
+    // Local shard: emit WAL via the per-shard append channel, then swap databases.
+    // This mirrors the spsc_handler SwapDb arm — WAL record BEFORE the swap.
+    // SWAPDB has no command-level rollback; if persistence is configured and
+    // the WAL channel rejects the enqueue (full / closed), we MUST NOT perform
+    // the local swap, otherwise the cluster state diverges from the on-disk log.
+    {
+        let mut a_buf = itoa::Buffer::new();
+        let mut b_buf = itoa::Buffer::new();
+        let wal_frame = Frame::Array(framevec![
+            Frame::BulkString(Bytes::from_static(b"SWAPDB")),
+            Frame::BulkString(Bytes::copy_from_slice(a_buf.format(a).as_bytes())),
+            Frame::BulkString(Bytes::copy_from_slice(b_buf.format(b).as_bytes())),
+        ]);
+        let serialized = crate::persistence::aof::serialize_command(&wal_frame);
+        if !shard_databases.try_wal_append_required(my_shard, serialized) {
+            return Frame::Error(bytes::Bytes::from_static(
+                b"ERR SWAPDB aborted: WAL enqueue failed (persistence backpressure)",
+            ));
+        }
+        shard_databases.swap_dbs(my_shard, a, b);
+    }
+
+    // Await all-remote-shard acks before returning +OK.
+    for rx in receivers {
+        match rx.recv().await {
+            Ok(()) => {}
+            Err(_) => {
+                return Frame::Error(bytes::Bytes::from_static(
+                    b"ERR cross-shard reply channel closed during SWAPDB",
+                ));
+            }
+        }
+    }
+
+    Frame::SimpleString(bytes::Bytes::from_static(b"OK"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

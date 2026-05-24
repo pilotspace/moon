@@ -916,6 +916,11 @@ pub(crate) async fn handle_connection_sharded_inner<
                         continue;
                     }
 
+                    // --- SWAPDB: handler-layer intercept (needs async + multi-db access) ---
+                    if dispatch::try_handle_swapdb(cmd, cmd_args, &conn, ctx, &mut responses).await {
+                        continue;
+                    }
+
                     // --- Cross-shard aggregation: KEYS, SCAN, DBSIZE ---
                     if dispatch::try_handle_cross_shard_scan(cmd, cmd_args, &conn, ctx, &mut responses).await {
                         continue;
@@ -1122,6 +1127,104 @@ pub(crate) async fn handle_connection_sharded_inner<
                         // Using read_db for local reads eliminates RwLock contention with
                         // cross-shard shared reads from other shard threads.
                         local_dispatches = local_dispatches.saturating_add(1);
+
+                        // T2.2 MOVE / T2.3 COPY ... DB n — intercept before write-path
+                        // (needs two dbs). Direct name checks below subsume the outer
+                        // metadata::is_write() gate — both names are write commands and
+                        // hot-path SETs/GETs would pay a redundant PHF lookup if we kept
+                        // the wrapper.
+                        if cmd.eq_ignore_ascii_case(b"MOVE") {
+                            // TXN guard: MOVE mutates two DBs and bypasses the regular
+                            // write-path undo/intents bookkeeping. Reject during an
+                            // active cross-store TXN so TXN.ABORT can still roll back
+                            // cleanly. (Same policy as cross-shard writes.)
+                            if conn.in_cross_txn() {
+                                responses.push(Frame::Error(bytes::Bytes::from_static(
+                                    crate::command::transaction::ERR_TXN_CROSS_SHARD,
+                                )));
+                                continue;
+                            }
+                            use crate::command::keyspace::move_cmd as ksmv;
+                            let src_db = conn.selected_db;
+                            let db_count = ctx.shard_databases.db_count();
+                            let response = match ksmv::parse_move_args(cmd_args, db_count) {
+                                Err(e) => e,
+                                Ok((_key, dst_db)) if dst_db == src_db => Frame::Integer(0),
+                                Ok((key, dst_db)) => {
+                                    if crate::shard::slice::is_initialized() {
+                                        crate::shard::slice::with_shard(|s| {
+                                            ksmv::with_two_slice_dbs(&mut s.databases, src_db, dst_db, |src, dst| {
+                                                ksmv::move_core(src, dst, &key)
+                                            })
+                                        })
+                                    } else {
+                                        // Lock ordering (lower index first) prevents deadlock
+                                        // with concurrent reverse MOVE from another connection.
+                                        ksmv::with_two_dbs_locked(
+                                            &ctx.shard_databases.all_shard_dbs()[ctx.shard_id],
+                                            src_db, dst_db,
+                                            |src, dst| ksmv::move_core(src, dst, &key),
+                                        )
+                                    }
+                                }
+                            };
+                            // AOF only on actual success (:1). Matches handler_single
+                            // — `:0` (key absent) is a no-op and must not log.
+                            if matches!(response, Frame::Integer(1)) {
+                                if let Some(ref bytes) = aof_bytes {
+                                    if let Some(ref tx) = ctx.aof_tx { let _ = tx.try_send(AofMessage::Append(bytes.clone())); }
+                                }
+                            }
+                            responses.push(response);
+                            continue;
+                        }
+
+                        if cmd.eq_ignore_ascii_case(b"COPY") {
+                            use crate::command::keyspace::move_cmd as ksmv;
+                            let src_db = conn.selected_db;
+                            let db_count = ctx.shard_databases.db_count();
+                            if let Some(copy_result) = ksmv::parse_copy_db_args(cmd_args, src_db, db_count) {
+                                // TXN guard: COPY ... DB n bypasses undo bookkeeping.
+                                // Only reject when DB clause is present (cross-DB) —
+                                // same-DB COPY falls through to the normal write path
+                                // which already participates in TXN.
+                                if conn.in_cross_txn() {
+                                    responses.push(Frame::Error(bytes::Bytes::from_static(
+                                        crate::command::transaction::ERR_TXN_CROSS_SHARD,
+                                    )));
+                                    continue;
+                                }
+                                let response = match copy_result {
+                                    Err(e) => e,
+                                    Ok(ca) => {
+                                        if crate::shard::slice::is_initialized() {
+                                            crate::shard::slice::with_shard(|s| {
+                                                ksmv::with_two_slice_dbs(&mut s.databases, src_db, ca.dst_db, |src, dst| {
+                                                    ksmv::copy_core(src, dst, &ca.src_key, &ca.dst_key, ca.replace)
+                                                })
+                                            })
+                                        } else {
+                                            ksmv::with_two_dbs_locked(
+                                                &ctx.shard_databases.all_shard_dbs()[ctx.shard_id],
+                                                src_db, ca.dst_db,
+                                                |src, dst| ksmv::copy_core(src, dst, &ca.src_key, &ca.dst_key, ca.replace),
+                                            )
+                                        }
+                                    }
+                                };
+                                // AOF only on actual success (:1). Matches handler_single
+                                // — `:0` (key absent / dst exists w/o REPLACE) is a no-op.
+                                if matches!(response, Frame::Integer(1)) {
+                                    if let Some(ref bytes) = aof_bytes {
+                                        if let Some(ref tx) = ctx.aof_tx { let _ = tx.try_send(AofMessage::Append(bytes.clone())); }
+                                    }
+                                }
+                                responses.push(response);
+                                continue;
+                            }
+                            // No DB clause or same-db: fall through to normal write path
+                        }
+
                         if metadata::is_write(cmd) {
                             // WRITE PATH: single lock acquisition for eviction + dispatch.
                             //

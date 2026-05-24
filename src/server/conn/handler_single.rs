@@ -616,6 +616,92 @@ pub async fn handle_connection(
                             responses.push(response);
                             continue;
                         }
+                        // SWAPDB — atomically exchange two databases (single-shard path).
+                        if cmd.eq_ignore_ascii_case(b"SWAPDB") {
+                            if cmd_args.len() != 2 {
+                                responses.push(Frame::Error(Bytes::from_static(
+                                    b"ERR wrong number of arguments for 'swapdb' command",
+                                )));
+                                continue;
+                            }
+                            let parse_idx = |f: &Frame| -> Option<usize> {
+                                match f {
+                                    Frame::BulkString(b) => {
+                                        std::str::from_utf8(b).ok()?.parse::<usize>().ok()
+                                    }
+                                    Frame::Integer(n) => usize::try_from(*n).ok(),
+                                    _ => None,
+                                }
+                            };
+                            let idx_a = cmd_args.first().and_then(parse_idx);
+                            let idx_b = cmd_args.get(1).and_then(parse_idx);
+                            let resp = match (idx_a, idx_b) {
+                                (Some(a), Some(b)) => {
+                                    let db_count = db.len();
+                                    if a >= db_count || b >= db_count {
+                                        Frame::Error(Bytes::from_static(
+                                            b"ERR DB index is out of range",
+                                        ))
+                                    } else if a == b {
+                                        // Same-index: no-op, return OK.
+                                        Frame::SimpleString(Bytes::from_static(b"OK"))
+                                    } else if crate::command::persistence::AOF_REWRITE_IN_PROGRESS
+                                        .load(std::sync::atomic::Ordering::SeqCst)
+                                    {
+                                        Frame::Error(Bytes::from_static(
+                                            b"ERR cannot SWAPDB during BGREWRITEAOF",
+                                        ))
+                                    } else {
+                                        // WAL must be durable BEFORE the swap (no rollback
+                                        // path for SWAPDB). Try-send first; on failure return
+                                        // an error and leave both DBs untouched.
+                                        let wal_ok = if let Some(ref tx) = aof_tx {
+                                            let mut a_buf = itoa::Buffer::new();
+                                            let mut b_buf = itoa::Buffer::new();
+                                            let wal_frame = Frame::Array(crate::framevec![
+                                                Frame::BulkString(Bytes::from_static(b"SWAPDB")),
+                                                Frame::BulkString(Bytes::copy_from_slice(
+                                                    a_buf.format(a).as_bytes()
+                                                )),
+                                                Frame::BulkString(Bytes::copy_from_slice(
+                                                    b_buf.format(b).as_bytes()
+                                                )),
+                                            ]);
+                                            let serialized =
+                                                crate::persistence::aof::serialize_command(
+                                                    &wal_frame,
+                                                );
+                                            tx.try_send(
+                                                crate::persistence::aof::AofMessage::Append(
+                                                    serialized,
+                                                ),
+                                            )
+                                            .is_ok()
+                                        } else {
+                                            true // persistence disabled — no durability requirement
+                                        };
+                                        if !wal_ok {
+                                            Frame::Error(Bytes::from_static(
+                                                b"ERR SWAPDB aborted: WAL enqueue failed (persistence backpressure)",
+                                            ))
+                                        } else {
+                                            let (lo, hi) =
+                                                if a < b { (a, b) } else { (b, a) };
+                                            // Acquire in ascending index order (deadlock prevention).
+                                            let mut guard_lo = db[lo].write();
+                                            let mut guard_hi = db[hi].write();
+                                            std::mem::swap(&mut *guard_lo, &mut *guard_hi);
+                                            Frame::SimpleString(Bytes::from_static(b"OK"))
+                                        }
+                                    }
+                                }
+                                _ => Frame::Error(Bytes::from_static(
+                                    b"ERR value is not an integer or out of range",
+                                )),
+                            };
+                            responses.push(resp);
+                            continue;
+                        }
                         // CONFIG
                         if cmd.eq_ignore_ascii_case(b"CONFIG") {
                             responses.push(handle_config(cmd_args, &runtime_config, &config));
@@ -1998,6 +2084,67 @@ pub async fn handle_connection(
                                         }
                                     }
                                     // Other DEBUG subcommands fall through to dispatch().
+                                }
+
+                                // T2.2 MOVE — needs two databases simultaneously.
+                                // dispatch() only receives one &mut Database; intercept here.
+                                if d_cmd.eq_ignore_ascii_case(b"MOVE") {
+                                    let src_db = conn.selected_db;
+                                    let response = match crate::command::keyspace::move_cmd::parse_move_args(d_args, db_count) {
+                                        Err(e) => e,
+                                        Ok((_key, dst_db)) if dst_db == src_db => Frame::Integer(0),
+                                        Ok((key, dst_db)) => {
+                                            // Release single-db guard before acquiring two-db locks
+                                            drop(guard);
+                                            let r = crate::command::keyspace::move_cmd::with_two_dbs_locked(
+                                                db.as_slice(), src_db, dst_db,
+                                                |src, dst| crate::command::keyspace::move_cmd::move_core(src, dst, &key),
+                                            );
+                                            // Restore loop invariant: re-acquire guard
+                                            current_db = conn.selected_db;
+                                            guard = db[current_db].write();
+                                            guard.refresh_now();
+                                            r
+                                        }
+                                    };
+                                    if matches!(response, Frame::Integer(1)) {
+                                        if let Some(bytes) = &aof_bytes {
+                                            aof_entries.push(bytes.clone());
+                                        }
+                                    }
+                                    responses[resp_idx] = response;
+                                    continue;
+                                }
+
+                                // T2.3 COPY DB n — cross-db copy needs two databases.
+                                // parse_copy_db_args returns None when no DB clause or same db
+                                // (falls through to key_extra::copy for the single-db case).
+                                if d_cmd.eq_ignore_ascii_case(b"COPY") {
+                                    let src_db = conn.selected_db;
+                                    if let Some(copy_result) = crate::command::keyspace::move_cmd::parse_copy_db_args(d_args, src_db, db_count) {
+                                        let response = match copy_result {
+                                            Err(e) => e,
+                                            Ok(ca) => {
+                                                drop(guard);
+                                                let r = crate::command::keyspace::move_cmd::with_two_dbs_locked(
+                                                    db.as_slice(), src_db, ca.dst_db,
+                                                    |src, dst| crate::command::keyspace::move_cmd::copy_core(src, dst, &ca.src_key, &ca.dst_key, ca.replace),
+                                                );
+                                                current_db = conn.selected_db;
+                                                guard = db[current_db].write();
+                                                guard.refresh_now();
+                                                r
+                                            }
+                                        };
+                                        if matches!(response, Frame::Integer(1)) {
+                                            if let Some(bytes) = &aof_bytes {
+                                                aof_entries.push(bytes.clone());
+                                            }
+                                        }
+                                        responses[resp_idx] = response;
+                                        continue;
+                                    }
+                                    // No DB clause or same-db: fall through to dispatch() → key_extra::copy
                                 }
 
                                 // HSET auto-indexing: after dispatch, check for vector index match

@@ -540,6 +540,44 @@ both SET edge:touch "val"
 assert_both "TOUCH" TOUCH edge:touch
 assert_both "TOUCH missing" TOUCH edge:nomiss
 
+# ===========================================================================
+# SWAPDB consistency
+# ===========================================================================
+log "=== SWAPDB ==="
+
+# Seed: db0 has swapkey=hello, db1 is empty
+both SELECT 0
+both SET swapkey hello
+both SELECT 1
+both DEL swapkey
+
+# SWAPDB 0 1 — swaps databases 0 and 1
+assert_both "SWAPDB 0 1" SWAPDB 0 1
+
+# After swap: db0 should be empty (swapkey gone), db1 should have swapkey=hello
+redis_after_swap=$(redis-cli -p "$PORT_REDIS" -n 1 GET swapkey 2>&1) || true
+rust_after_swap=$(redis-cli -p "$PORT_RUST" -n 1 GET swapkey 2>&1) || true
+assert_eq "SWAPDB: key moved to db1" "$redis_after_swap" "$rust_after_swap"
+
+redis_db0_gone=$(redis-cli -p "$PORT_REDIS" -n 0 GET swapkey 2>&1) || true
+rust_db0_gone=$(redis-cli -p "$PORT_RUST" -n 0 GET swapkey 2>&1) || true
+assert_eq "SWAPDB: key absent from db0" "$redis_db0_gone" "$rust_db0_gone"
+
+# Same-index SWAPDB is a no-op; must return OK (not error)
+assert_both "SWAPDB 0 0 (same-index no-op)" SWAPDB 0 0
+
+# Out-of-range indices must return ERR (not panic)
+redis_oor=$(redis-cli -p "$PORT_REDIS" SWAPDB 0 9999 2>&1) || true
+rust_oor=$(redis-cli -p "$PORT_RUST" SWAPDB 0 9999 2>&1) || true
+if echo "$rust_oor" | grep -qi "ERR"; then
+    PASS=$((PASS + 1))
+else
+    FAIL=$((FAIL + 1)); echo "  FAIL: SWAPDB out-of-range should return ERR, got: $rust_oor"
+fi
+
+# Swap back to restore state for remaining tests
+both SWAPDB 0 1
+
 # FLUSHDB (run last — clears all keys)
 assert_both "FLUSHDB" FLUSHDB
 

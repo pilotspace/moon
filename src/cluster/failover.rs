@@ -132,7 +132,10 @@ fn now_ms() -> u64 {
 }
 
 /// Default node timeout for stale pfail_report cleanup (30 seconds).
-const DEFAULT_NODE_TIMEOUT_MS: u64 = 30_000;
+///
+/// Exported so `CLUSTER COUNT-FAILURE-REPORTS` can apply the same 2× window
+/// without diverging from `try_mark_fail_with_consensus`.
+pub(crate) const DEFAULT_NODE_TIMEOUT_MS: u64 = 30_000;
 
 /// Check if majority of masters agree that `node_id` is PFAIL, and if so
 /// transition it to FAIL. Returns true if the PFAIL->FAIL transition occurred.

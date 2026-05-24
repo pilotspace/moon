@@ -13,6 +13,7 @@ pub mod hll;
 pub mod info_reclamation;
 pub mod key;
 pub mod key_extra;
+pub mod keyspace;
 pub mod list;
 pub mod metadata;
 pub mod mq;
@@ -186,8 +187,13 @@ fn dispatch_inner(
                 return resp(string::mset(db, args));
             }
             if cmd.eq_ignore_ascii_case(b"MOVE") {
+                // MOVE is intercepted in every handler before dispatch() is called.
+                // This branch is a defensive fallback for the single-db dispatch path
+                // (e.g., direct unit-test calls that bypass handler interception).
+                // Handler-level interception in handler_single/monoio/sharded/spsc
+                // provides the real implementation.
                 return resp(Frame::Error(Bytes::from_static(
-                    b"ERR MOVE not implemented (tracked in T2.2)",
+                    b"ERR MOVE requires handler-level dispatch (cross-db operation)",
                 )));
             }
         }
@@ -541,8 +547,13 @@ fn dispatch_inner(
                 }
                 b'w' => {
                     if cmd.eq_ignore_ascii_case(b"SWAPDB") {
+                        // SWAPDB is intercepted at the handler layer (handler_monoio,
+                        // handler_sharded, handler_single) before reaching dispatch().
+                        // WAL replay intercepts it in persistence::replay::replay_command.
+                        // If execution reaches here, the caller bypassed those layers —
+                        // return an informative error rather than a stale "not implemented".
                         return resp(Frame::Error(Bytes::from_static(
-                            b"ERR SWAPDB not implemented (tracked in T2.1)",
+                            b"ERR SWAPDB must be issued at the connection handler level",
                         )));
                     }
                 }
@@ -1798,17 +1809,19 @@ mod tests {
         }
     }
 
+    /// SWAPDB reaching `cmd_dispatch()` directly means the caller bypassed the
+    /// handler layer — the stub returns an informative error rather than silently
+    /// succeeding or panicking.  Real SWAPDB is implemented at the handler layer
+    /// (handler_monoio, handler_sharded, handler_single).
     #[test]
-    fn swapdb_error_is_not_implemented() {
+    fn swapdb_dispatch_stub_returns_error() {
         let frame = dispatch_resp(b"SWAPDB", &[b"0", b"1"]);
         match frame {
             Frame::Error(msg) => {
                 let text = std::str::from_utf8(&msg).unwrap();
-                assert!(text.contains("not implemented"), "got: {text}");
-                assert!(text.contains("T2.1"), "expected T2.1 ref, got: {text}");
                 assert!(
-                    !text.contains("sharded mode"),
-                    "old text must be gone, got: {text}"
+                    text.contains("handler level"),
+                    "stub should mention handler layer, got: {text}"
                 );
             }
             other => panic!("expected Error frame, got {other:?}"),
@@ -1816,15 +1829,15 @@ mod tests {
     }
 
     #[test]
-    fn move_error_is_not_implemented() {
+    fn move_dispatch_fallback_returns_error() {
+        // MOVE is intercepted by handler-level code before dispatch() is called in
+        // production. This test verifies the defensive fallback still returns an
+        // error frame (not a panic or "unknown command") when MOVE reaches dispatch()
+        // directly (e.g., via unit-test bypassing handler interception).
         let frame = dispatch_resp(b"MOVE", &[b"mykey", b"1"]);
-        match frame {
-            Frame::Error(msg) => {
-                let text = std::str::from_utf8(&msg).unwrap();
-                assert!(text.contains("not implemented"), "got: {text}");
-                assert!(text.contains("T2.2"), "expected T2.2 ref, got: {text}");
-            }
-            other => panic!("expected Error frame, got {other:?}"),
-        }
+        assert!(
+            matches!(frame, Frame::Error(_)),
+            "MOVE fallback in dispatch() must return Frame::Error, got {frame:?}"
+        );
     }
 }

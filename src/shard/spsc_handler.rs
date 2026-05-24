@@ -458,6 +458,134 @@ pub(crate) fn handle_shard_message_shared(
                     // Other RECLAMATION subcommands fall through.
                 }
 
+                // T2.2 MOVE — atomically moves a key between two dbs on the same shard.
+                // T2.3 COPY DB n — copies a key to a different db on the same shard.
+                // Both require two databases simultaneously; intercept before cmd_dispatch.
+                if cmd.eq_ignore_ascii_case(b"MOVE") {
+                    use crate::command::keyspace::move_cmd as ksmv;
+                    let response = match ksmv::parse_move_args(args, db_count) {
+                        Err(e) => e,
+                        Ok((_key, dst_db)) if dst_db == db_idx => {
+                            crate::protocol::Frame::Integer(0)
+                        }
+                        Ok((key, dst_db)) => {
+                            // SPSC runs single-threaded per shard; no concurrent MOVE can
+                            // deadlock. slice path uses split_at_mut (no locking needed).
+                            // Refresh expiry clock on BOTH databases before the move so
+                            // an expired source key behaves as "not found" and an expired
+                            // destination key doesn't shadow the insert (mirrors the
+                            // single-DB write path at line 583).
+                            if crate::shard::slice::is_initialized() {
+                                crate::shard::slice::with_shard(|s| {
+                                    ksmv::with_two_slice_dbs(
+                                        &mut s.databases,
+                                        db_idx,
+                                        dst_db,
+                                        |src, dst| {
+                                            src.refresh_now_from_cache(cached_clock);
+                                            dst.refresh_now_from_cache(cached_clock);
+                                            ksmv::move_core(src, dst, &key)
+                                        },
+                                    )
+                                })
+                            } else {
+                                // Lock ordering (lower index first) prevents deadlock with
+                                // handler_monoio/sharded connections on the same shard.
+                                ksmv::with_two_dbs_locked(
+                                    &shard_databases.all_shard_dbs()[shard_id],
+                                    db_idx,
+                                    dst_db,
+                                    |src, dst| {
+                                        src.refresh_now_from_cache(cached_clock);
+                                        dst.refresh_now_from_cache(cached_clock);
+                                        ksmv::move_core(src, dst, &key)
+                                    },
+                                )
+                            }
+                        }
+                    };
+                    if matches!(response, crate::protocol::Frame::Integer(1)) {
+                        let serialized = aof::serialize_command(&command);
+                        wal_append_and_fanout(
+                            &serialized,
+                            wal_writer,
+                            wal_v3_writer,
+                            repl_backlog,
+                            replica_txs,
+                            repl_state,
+                            shard_id,
+                        );
+                    }
+                    let _ = reply_tx.send(response);
+                    return;
+                }
+
+                if cmd.eq_ignore_ascii_case(b"COPY") {
+                    use crate::command::keyspace::move_cmd as ksmv;
+                    if let Some(copy_result) = ksmv::parse_copy_db_args(args, db_idx, db_count) {
+                        let response = match copy_result {
+                            Err(e) => e,
+                            Ok(ca) => {
+                                // Refresh expiry clock on BOTH dbs to mirror the
+                                // single-DB write path: expired src/dst keys must
+                                // resolve correctly before copy_core inspects them.
+                                if crate::shard::slice::is_initialized() {
+                                    crate::shard::slice::with_shard(|s| {
+                                        ksmv::with_two_slice_dbs(
+                                            &mut s.databases,
+                                            db_idx,
+                                            ca.dst_db,
+                                            |src, dst| {
+                                                src.refresh_now_from_cache(cached_clock);
+                                                dst.refresh_now_from_cache(cached_clock);
+                                                ksmv::copy_core(
+                                                    src,
+                                                    dst,
+                                                    &ca.src_key,
+                                                    &ca.dst_key,
+                                                    ca.replace,
+                                                )
+                                            },
+                                        )
+                                    })
+                                } else {
+                                    ksmv::with_two_dbs_locked(
+                                        &shard_databases.all_shard_dbs()[shard_id],
+                                        db_idx,
+                                        ca.dst_db,
+                                        |src, dst| {
+                                            src.refresh_now_from_cache(cached_clock);
+                                            dst.refresh_now_from_cache(cached_clock);
+                                            ksmv::copy_core(
+                                                src,
+                                                dst,
+                                                &ca.src_key,
+                                                &ca.dst_key,
+                                                ca.replace,
+                                            )
+                                        },
+                                    )
+                                }
+                            }
+                        };
+                        if matches!(response, crate::protocol::Frame::Integer(1)) {
+                            let serialized = aof::serialize_command(&command);
+                            wal_append_and_fanout(
+                                &serialized,
+                                wal_writer,
+                                wal_v3_writer,
+                                repl_backlog,
+                                replica_txs,
+                                repl_state,
+                                shard_id,
+                            );
+                        }
+                        let _ = reply_tx.send(response);
+                        return;
+                    }
+                    // No DB clause or same-db: fall through to cmd_dispatch → key_extra::copy
+                }
+
                 // COW intercept: capture old value before write if snapshot is active
                 let is_write = metadata::is_write(cmd);
                 // Phase 2b: gate on is_initialized(); new path uses ShardSlice.
@@ -2183,6 +2311,40 @@ pub(crate) fn handle_shard_message_shared(
                 r
             };
             let _ = reply_tx.send(response);
+        }
+        ShardMessage::SwapDb { a, b, reply_tx } => {
+            // WAL-before-swap: emit the SWAPDB record so that crash-recovery
+            // replay can re-apply the swap in the correct order.  The record
+            // is written even when wal_writer/wal_v3_writer are None (the
+            // fast-path in wal_append_and_fanout will skip it cheaply).
+            //
+            // Serialise "SWAPDB <a> <b>" without heap allocation on the number
+            // formatting (itoa writes into a stack buffer).
+            let mut a_buf = itoa::Buffer::new();
+            let mut b_buf = itoa::Buffer::new();
+            let a_str = a_buf.format(a);
+            let b_str = b_buf.format(b);
+            let wal_frame = crate::protocol::Frame::Array(crate::framevec![
+                crate::protocol::Frame::BulkString(bytes::Bytes::from_static(b"SWAPDB")),
+                crate::protocol::Frame::BulkString(bytes::Bytes::copy_from_slice(a_str.as_bytes())),
+                crate::protocol::Frame::BulkString(bytes::Bytes::copy_from_slice(b_str.as_bytes())),
+            ]);
+            let serialized = aof::serialize_command(&wal_frame);
+            wal_append_and_fanout(
+                &serialized,
+                wal_writer,
+                wal_v3_writer,
+                repl_backlog,
+                replica_txs,
+                repl_state,
+                shard_id,
+            );
+
+            // Perform the in-place swap under ascending-index write locks.
+            shard_databases.swap_dbs(shard_id, a, b);
+
+            // Notify the coordinator that this shard completed its swap.
+            let _ = reply_tx.send(());
         }
         ShardMessage::Shutdown => {
             info!("Received shutdown via SPSC");

@@ -150,6 +150,21 @@ impl ShardDatabases {
         }
     }
 
+    /// Strict variant of [`wal_append`]: returns `true` if the message was
+    /// either accepted by the WAL channel **or** persistence is disabled
+    /// (no durability requirement). Returns `false` only when persistence is
+    /// configured but the channel rejected the send — in that case the caller
+    /// must NOT proceed with a state mutation that depends on this WAL
+    /// record's durability (e.g. SWAPDB has no command-level rollback).
+    #[inline]
+    #[must_use = "callers must check the result and skip the mutation on WAL failure"]
+    pub fn try_wal_append_required(&self, shard_id: usize, data: bytes::Bytes) -> bool {
+        match *self.wal_append_txs[shard_id].lock() {
+            Some(ref tx) => tx.try_send(data).is_ok(),
+            None => true, // persistence disabled — no durability requirement
+        }
+    }
+
     /// Acquire exclusive access to a shard's VectorStore.
     #[inline]
     pub fn vector_store(&self, shard_id: usize) -> MutexGuard<'_, VectorStore> {
@@ -778,6 +793,36 @@ impl ShardDatabases {
         }
         (segment_counts, base_timestamps)
     }
+
+    /// Atomically swap two databases within a single shard.
+    ///
+    /// Acquires write locks in ascending index order (lower index first) to
+    /// prevent deadlock if two concurrent SWAPDB calls swap the same pair from
+    /// opposite directions.  `std::mem::swap` exchanges the `Database` values
+    /// in-place while both locks are held.
+    ///
+    /// # Panics
+    ///
+    /// Panics (debug_assert) if `shard_id`, `a`, or `b` are out of bounds.
+    /// Callers must validate indices before calling.
+    pub fn swap_dbs(&self, shard_id: usize, a: usize, b: usize) {
+        debug_assert!(shard_id < self.shards.len(), "shard_id out of bounds");
+        debug_assert!(a < self.db_count, "db index a out of bounds");
+        debug_assert!(b < self.db_count, "db index b out of bounds");
+        // Same-index swap is a no-op; short-circuit in release builds to
+        // avoid self-deadlocking on the second write() acquire (parking_lot
+        // RwLock is not reentrant). Callers normally short-circuit earlier,
+        // but defending here is cheap and prevents a stall on the SPSC path.
+        if a == b {
+            return;
+        }
+
+        let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+        // Acquire in ascending index order to prevent deadlock.
+        let mut guard_lo = self.shards[shard_id][lo].write();
+        let mut guard_hi = self.shards[shard_id][hi].write();
+        std::mem::swap(&mut *guard_lo, &mut *guard_hi);
+    }
 }
 
 #[cfg(test)]
@@ -836,5 +881,104 @@ mod tests {
         let shared = ShardDatabases::new(dbs);
         assert_eq!(shared.num_shards(), 0);
         assert_eq!(shared.db_count(), 0);
+    }
+
+    // ── T2.1 SWAPDB: swap_dbs unit tests ─────────────────────────────────────
+
+    /// Insert a string key into a Database via cmd_dispatch so we don't need
+    /// to know internal storage layout.
+    fn db_set_key(db: &mut Database, key: &[u8], value: &[u8]) {
+        use crate::protocol::Frame;
+        let mut selected = 0usize;
+        let args = crate::framevec![
+            Frame::BulkString(bytes::Bytes::copy_from_slice(key)),
+            Frame::BulkString(bytes::Bytes::copy_from_slice(value)),
+        ];
+        let _ = crate::command::dispatch(db, b"SET", &args, &mut selected, 16);
+    }
+
+    #[test]
+    fn test_swap_dbs_exchanges_contents() {
+        // Shard 0 has 2 databases.  Put "key_a" in db-0 and "key_b" in db-1.
+        let mut db0 = Database::new();
+        let db1 = Database::new();
+        db_set_key(&mut db0, b"key_a", b"val_a");
+
+        // Put key_b in db-1 using a temporary binding.
+        let mut db1_tmp = db1;
+        db_set_key(&mut db1_tmp, b"key_b", b"val_b");
+
+        let shared = ShardDatabases::new(vec![vec![db0, db1_tmp]]);
+        assert_eq!(
+            shared.read_db(0, 0).len(),
+            1,
+            "db-0 should have 1 key before swap"
+        );
+        assert_eq!(
+            shared.read_db(0, 1).len(),
+            1,
+            "db-1 should have 1 key before swap"
+        );
+
+        shared.swap_dbs(0, 0, 1);
+
+        // After swap: db-0 should have key_b, db-1 should have key_a.
+        assert_eq!(
+            shared.read_db(0, 0).len(),
+            1,
+            "db-0 should still have 1 key after swap"
+        );
+        assert_eq!(
+            shared.read_db(0, 1).len(),
+            1,
+            "db-1 should still have 1 key after swap"
+        );
+
+        // Verify key moved: db-0 now has the key from the former db-1.
+        let mut dummy_selected = 0usize;
+        let get_args = crate::framevec![crate::protocol::Frame::BulkString(
+            bytes::Bytes::from_static(b"key_b")
+        )];
+        {
+            let mut guard = shared.write_db(0, 0);
+            let result =
+                crate::command::dispatch(&mut *guard, b"GET", &get_args, &mut dummy_selected, 16);
+            match result {
+                crate::command::DispatchResult::Response(crate::protocol::Frame::BulkString(v)) => {
+                    assert_eq!(v.as_ref(), b"val_b", "db-0 should have val_b after swap");
+                }
+                crate::command::DispatchResult::Response(_) => {
+                    panic!("expected BulkString(val_b) for key_b in db-0 after swap");
+                }
+                crate::command::DispatchResult::Quit(_) => {
+                    panic!("unexpected Quit result");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_swap_dbs_reverse_order_same_result() {
+        // Swapping (1, 0) should produce the same result as (0, 1).
+        let mut db0 = Database::new();
+        let db1 = Database::new();
+        db_set_key(&mut db0, b"alpha", b"a");
+
+        let shared = ShardDatabases::new(vec![vec![db0, db1]]);
+        assert_eq!(shared.read_db(0, 0).len(), 1);
+        assert_eq!(shared.read_db(0, 1).len(), 0);
+
+        shared.swap_dbs(0, 1, 0); // reversed argument order
+
+        assert_eq!(
+            shared.read_db(0, 0).len(),
+            0,
+            "db-0 should be empty after swap"
+        );
+        assert_eq!(
+            shared.read_db(0, 1).len(),
+            1,
+            "db-1 should have 1 key after swap"
+        );
     }
 }
