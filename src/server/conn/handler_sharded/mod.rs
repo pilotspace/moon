@@ -1134,6 +1134,16 @@ pub(crate) async fn handle_connection_sharded_inner<
                         // hot-path SETs/GETs would pay a redundant PHF lookup if we kept
                         // the wrapper.
                         if cmd.eq_ignore_ascii_case(b"MOVE") {
+                            // TXN guard: MOVE mutates two DBs and bypasses the regular
+                            // write-path undo/intents bookkeeping. Reject during an
+                            // active cross-store TXN so TXN.ABORT can still roll back
+                            // cleanly. (Same policy as cross-shard writes.)
+                            if conn.in_cross_txn() {
+                                responses.push(Frame::Error(bytes::Bytes::from_static(
+                                    crate::command::transaction::ERR_TXN_CROSS_SHARD,
+                                )));
+                                continue;
+                            }
                             use crate::command::keyspace::move_cmd as ksmv;
                             let src_db = conn.selected_db;
                             let db_count = ctx.shard_databases.db_count();
@@ -1158,7 +1168,9 @@ pub(crate) async fn handle_connection_sharded_inner<
                                     }
                                 }
                             };
-                            if !matches!(response, Frame::Error(_)) {
+                            // AOF only on actual success (:1). Matches handler_single
+                            // — `:0` (key absent) is a no-op and must not log.
+                            if matches!(response, Frame::Integer(1)) {
                                 if let Some(ref bytes) = aof_bytes {
                                     if let Some(ref tx) = ctx.aof_tx { let _ = tx.try_send(AofMessage::Append(bytes.clone())); }
                                 }
@@ -1172,6 +1184,16 @@ pub(crate) async fn handle_connection_sharded_inner<
                             let src_db = conn.selected_db;
                             let db_count = ctx.shard_databases.db_count();
                             if let Some(copy_result) = ksmv::parse_copy_db_args(cmd_args, src_db, db_count) {
+                                // TXN guard: COPY ... DB n bypasses undo bookkeeping.
+                                // Only reject when DB clause is present (cross-DB) —
+                                // same-DB COPY falls through to the normal write path
+                                // which already participates in TXN.
+                                if conn.in_cross_txn() {
+                                    responses.push(Frame::Error(bytes::Bytes::from_static(
+                                        crate::command::transaction::ERR_TXN_CROSS_SHARD,
+                                    )));
+                                    continue;
+                                }
                                 let response = match copy_result {
                                     Err(e) => e,
                                     Ok(ca) => {
@@ -1190,7 +1212,9 @@ pub(crate) async fn handle_connection_sharded_inner<
                                         }
                                     }
                                 };
-                                if !matches!(response, Frame::Error(_)) {
+                                // AOF only on actual success (:1). Matches handler_single
+                                // — `:0` (key absent / dst exists w/o REPLACE) is a no-op.
+                                if matches!(response, Frame::Integer(1)) {
                                     if let Some(ref bytes) = aof_bytes {
                                         if let Some(ref tx) = ctx.aof_tx { let _ = tx.try_send(AofMessage::Append(bytes.clone())); }
                                     }

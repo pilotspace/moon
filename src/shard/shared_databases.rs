@@ -150,6 +150,21 @@ impl ShardDatabases {
         }
     }
 
+    /// Strict variant of [`wal_append`]: returns `true` if the message was
+    /// either accepted by the WAL channel **or** persistence is disabled
+    /// (no durability requirement). Returns `false` only when persistence is
+    /// configured but the channel rejected the send — in that case the caller
+    /// must NOT proceed with a state mutation that depends on this WAL
+    /// record's durability (e.g. SWAPDB has no command-level rollback).
+    #[inline]
+    #[must_use = "callers must check the result and skip the mutation on WAL failure"]
+    pub fn try_wal_append_required(&self, shard_id: usize, data: bytes::Bytes) -> bool {
+        match *self.wal_append_txs[shard_id].lock() {
+            Some(ref tx) => tx.try_send(data).is_ok(),
+            None => true, // persistence disabled — no durability requirement
+        }
+    }
+
     /// Acquire exclusive access to a shard's VectorStore.
     #[inline]
     pub fn vector_store(&self, shard_id: usize) -> MutexGuard<'_, VectorStore> {
@@ -794,10 +809,13 @@ impl ShardDatabases {
         debug_assert!(shard_id < self.shards.len(), "shard_id out of bounds");
         debug_assert!(a < self.db_count, "db index a out of bounds");
         debug_assert!(b < self.db_count, "db index b out of bounds");
-        debug_assert_ne!(
-            a, b,
-            "swap_dbs called with equal indices — caller should short-circuit"
-        );
+        // Same-index swap is a no-op; short-circuit in release builds to
+        // avoid self-deadlocking on the second write() acquire (parking_lot
+        // RwLock is not reentrant). Callers normally short-circuit earlier,
+        // but defending here is cheap and prevents a stall on the SPSC path.
+        if a == b {
+            return;
+        }
 
         let (lo, hi) = if a < b { (a, b) } else { (b, a) };
         // Acquire in ascending index order to prevent deadlock.

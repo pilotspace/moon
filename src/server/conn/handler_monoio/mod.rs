@@ -786,12 +786,15 @@ pub(crate) async fn handle_connection_sharded_monoio<
             if dispatch::try_handle_persistence(cmd, ctx, &mut responses) {
                 continue;
             }
-            // --- SWAPDB: handler-layer intercept (needs async + multi-db access) ---
-            if dispatch::try_handle_swapdb(cmd, cmd_args, &conn, ctx, &mut responses).await {
-                continue;
-            }
+            // ACL gate MUST run before any privileged intercept (SWAPDB included)
+            // — otherwise unauthenticated clients can mutate cross-DB state.
+            // handler_sharded already enforces this ordering; this matches it.
             if dispatch::try_enforce_acl(cmd, cmd_args, &mut conn, ctx, &peer_addr, &mut responses)
             {
+                continue;
+            }
+            // --- SWAPDB: handler-layer intercept (needs async + multi-db access) ---
+            if dispatch::try_handle_swapdb(cmd, cmd_args, &conn, ctx, &mut responses).await {
                 continue;
             }
             if dispatch::try_handle_client_admin(cmd, cmd_args, client_id, &conn, &mut responses) {
@@ -1079,6 +1082,15 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 // the wrapper. Branch predictor learns "false" for both checks
                 // under typical workloads.
                 if cmd.eq_ignore_ascii_case(b"MOVE") {
+                    // TXN guard: MOVE mutates two DBs and bypasses undo/intents.
+                    // Reject during an active cross-store TXN so TXN.ABORT can
+                    // still roll back cleanly (matches handler_sharded policy).
+                    if conn.in_cross_txn() {
+                        responses.push(Frame::Error(bytes::Bytes::from_static(
+                            crate::command::transaction::ERR_TXN_CROSS_SHARD,
+                        )));
+                        continue;
+                    }
                     use crate::command::keyspace::move_cmd as ksmv;
                     let src_db = conn.selected_db;
                     let db_count = ctx.shard_databases.db_count();
@@ -1107,7 +1119,8 @@ pub(crate) async fn handle_connection_sharded_monoio<
                             }
                         }
                     };
-                    if !matches!(response, Frame::Error(_)) {
+                    // AOF only on actual success (:1). Matches handler_single.
+                    if matches!(response, Frame::Integer(1)) {
                         if let Some(ref tx) = ctx.aof_tx {
                             let serialized = aof::serialize_command(&frame);
                             let _ = tx.try_send(AofMessage::Append(serialized));
@@ -1123,6 +1136,15 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     let db_count = ctx.shard_databases.db_count();
                     if let Some(copy_result) = ksmv::parse_copy_db_args(cmd_args, src_db, db_count)
                     {
+                        // TXN guard: COPY ... DB n bypasses undo bookkeeping.
+                        // Reject only when DB clause is present (cross-DB);
+                        // same-DB COPY falls through to the normal write path.
+                        if conn.in_cross_txn() {
+                            responses.push(Frame::Error(bytes::Bytes::from_static(
+                                crate::command::transaction::ERR_TXN_CROSS_SHARD,
+                            )));
+                            continue;
+                        }
                         let response = match copy_result {
                             Err(e) => e,
                             Ok(ca) => {
@@ -1161,7 +1183,9 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                 }
                             }
                         };
-                        if !matches!(response, Frame::Error(_)) {
+                        // AOF only on actual success (:1). Matches handler_single
+                        // — `:0` (key absent / dst exists w/o REPLACE) is a no-op.
+                        if matches!(response, Frame::Integer(1)) {
                             if let Some(ref tx) = ctx.aof_tx {
                                 let serialized = aof::serialize_command(&frame);
                                 let _ = tx.try_send(AofMessage::Append(serialized));

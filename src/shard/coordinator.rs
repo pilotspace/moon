@@ -1699,6 +1699,9 @@ pub async fn coordinate_swapdb(
 
     // Local shard: emit WAL via the per-shard append channel, then swap databases.
     // This mirrors the spsc_handler SwapDb arm — WAL record BEFORE the swap.
+    // SWAPDB has no command-level rollback; if persistence is configured and
+    // the WAL channel rejects the enqueue (full / closed), we MUST NOT perform
+    // the local swap, otherwise the cluster state diverges from the on-disk log.
     {
         let mut a_buf = itoa::Buffer::new();
         let mut b_buf = itoa::Buffer::new();
@@ -1708,7 +1711,11 @@ pub async fn coordinate_swapdb(
             Frame::BulkString(Bytes::copy_from_slice(b_buf.format(b).as_bytes())),
         ]);
         let serialized = crate::persistence::aof::serialize_command(&wal_frame);
-        shard_databases.wal_append(my_shard, serialized);
+        if !shard_databases.try_wal_append_required(my_shard, serialized) {
+            return Frame::Error(bytes::Bytes::from_static(
+                b"ERR SWAPDB aborted: WAL enqueue failed (persistence backpressure)",
+            ));
+        }
         shard_databases.swap_dbs(my_shard, a, b);
     }
 

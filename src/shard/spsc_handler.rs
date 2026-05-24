@@ -471,13 +471,21 @@ pub(crate) fn handle_shard_message_shared(
                         Ok((key, dst_db)) => {
                             // SPSC runs single-threaded per shard; no concurrent MOVE can
                             // deadlock. slice path uses split_at_mut (no locking needed).
+                            // Refresh expiry clock on BOTH databases before the move so
+                            // an expired source key behaves as "not found" and an expired
+                            // destination key doesn't shadow the insert (mirrors the
+                            // single-DB write path at line 583).
                             if crate::shard::slice::is_initialized() {
                                 crate::shard::slice::with_shard(|s| {
                                     ksmv::with_two_slice_dbs(
                                         &mut s.databases,
                                         db_idx,
                                         dst_db,
-                                        |src, dst| ksmv::move_core(src, dst, &key),
+                                        |src, dst| {
+                                            src.refresh_now_from_cache(cached_clock);
+                                            dst.refresh_now_from_cache(cached_clock);
+                                            ksmv::move_core(src, dst, &key)
+                                        },
                                     )
                                 })
                             } else {
@@ -487,7 +495,11 @@ pub(crate) fn handle_shard_message_shared(
                                     &shard_databases.all_shard_dbs()[shard_id],
                                     db_idx,
                                     dst_db,
-                                    |src, dst| ksmv::move_core(src, dst, &key),
+                                    |src, dst| {
+                                        src.refresh_now_from_cache(cached_clock);
+                                        dst.refresh_now_from_cache(cached_clock);
+                                        ksmv::move_core(src, dst, &key)
+                                    },
                                 )
                             }
                         }
@@ -514,6 +526,9 @@ pub(crate) fn handle_shard_message_shared(
                         let response = match copy_result {
                             Err(e) => e,
                             Ok(ca) => {
+                                // Refresh expiry clock on BOTH dbs to mirror the
+                                // single-DB write path: expired src/dst keys must
+                                // resolve correctly before copy_core inspects them.
                                 if crate::shard::slice::is_initialized() {
                                     crate::shard::slice::with_shard(|s| {
                                         ksmv::with_two_slice_dbs(
@@ -521,6 +536,8 @@ pub(crate) fn handle_shard_message_shared(
                                             db_idx,
                                             ca.dst_db,
                                             |src, dst| {
+                                                src.refresh_now_from_cache(cached_clock);
+                                                dst.refresh_now_from_cache(cached_clock);
                                                 ksmv::copy_core(
                                                     src,
                                                     dst,
@@ -537,6 +554,8 @@ pub(crate) fn handle_shard_message_shared(
                                         db_idx,
                                         ca.dst_db,
                                         |src, dst| {
+                                            src.refresh_now_from_cache(cached_clock);
+                                            dst.refresh_now_from_cache(cached_clock);
                                             ksmv::copy_core(
                                                 src,
                                                 dst,

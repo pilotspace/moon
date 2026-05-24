@@ -251,13 +251,19 @@ pub fn with_two_dbs_locked<R>(
         "dst_idx {dst_idx} out of range ({} dbs)",
         dbs.len()
     );
+    // Same index would self-deadlock on the second write() — parking_lot
+    // RwLock is not reentrant. Callers (MOVE/COPY DB n) short-circuit
+    // src == dst to :0 before reaching here; hard-assert in release.
+    assert_ne!(
+        src_idx, dst_idx,
+        "with_two_dbs_locked called with src_idx == dst_idx; caller must short-circuit"
+    );
 
     if src_idx < dst_idx {
         let mut lo = dbs[src_idx].write();
         let mut hi = dbs[dst_idx].write();
         f(&mut lo, &mut hi)
     } else {
-        // dst_idx < src_idx (equality rejected by caller: src == dst → :0)
         let mut lo = dbs[dst_idx].write();
         let mut hi = dbs[src_idx].write();
         f(&mut hi, &mut lo)

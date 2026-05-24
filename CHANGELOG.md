@@ -11,6 +11,51 @@ and **Change Data Capture (CDC)**, built additively on top of the existing
 per-shard WAL v3 + dual-root manifest. No changes to the KV hot path, MVCC,
 page format, or transaction layer.
 
+### Added — Tier 2 Lane A (PR #100)
+
+- **T2.1** `c381b31` — `SWAPDB` cross-shard atomic swap via `ShardMessage::SwapDb`;
+  WAL-durable; BGREWRITEAOF concurrency guard; restart-replay test.
+- **T2.2** `4958dc9` — `MOVE key db` with `with_two_dbs_locked` (lower-index-first
+  lock ordering); WAL-durable; intercept in all four handler paths.
+- **T2.3** `bbc6117` — `COPY ... DB n` cross-database; reuses `with_two_dbs_locked`;
+  WAL-durable.
+- **T2.4** `f538589` — `CLUSTER REPLICAS` / `CLUSTER SLAVES`; shared
+  `format_node_line(node, self_node_id)` helper extracted from `CLUSTER NODES`.
+- **T2.5** `ebd240a` — `CLUSTER COUNT-FAILURE-REPORTS`; counts non-stale
+  `pfail_reports`; exposes `DEFAULT_NODE_TIMEOUT_MS` as `pub(crate)`.
+
+### Fixed
+
+- **PERF** `608e2d1` — collapse duplicate `is_write` PHF gate on MOVE/COPY hot
+  path; restores s=1 SET p=1 throughput (−9.5 % → +0.9 % vs. merge base).
+- **CR** _(this PR)_ — SWAPDB now runs **after** the ACL gate in `handler_monoio`,
+  closing a runtime-specific authorization bypass.
+- **CR** _(this PR)_ — `with_two_dbs_locked` and `ShardDatabases::swap_dbs` now
+  hard-assert non-equal indices in release builds, preventing same-index
+  self-deadlock.
+- **CR** _(this PR)_ — `SWAPDB` strict arity (exactly two args) across all three
+  handlers; rejects `SWAPDB 0 1 extra` with the canonical wrong-arity error.
+- **CR** _(this PR)_ — `DashTable::Segment::insert_or_update_at` now sets
+  `has_non_home_keys = true` whenever the chosen free slot is in a non-home
+  group; fixes a latent miss where `find()` could not locate a fallback-placed
+  key on subsequent lookups.
+- **CR** _(this PR)_ — Local `MOVE` / `COPY` AOF append is gated on
+  `Frame::Integer(1)` (success) rather than `!Error`, matching the
+  `handler_single` behavior and suppressing no-op `:0` log entries.
+- **CR** _(this PR)_ — `MOVE`, `COPY ... DB n`, and `SWAPDB` are rejected with
+  `ERR_TXN_CROSS_SHARD` while an `active_cross_txn` is in flight; previously the
+  intercepts bypassed undo/intents bookkeeping and escaped `TXN.ABORT` rollback.
+- **CR** _(this PR)_ — `spsc_handler` `MOVE`/`COPY` arms call
+  `refresh_now_from_cache` on both source and destination DBs before
+  `move_core`/`copy_core`; fixes expired-key visibility skew on the local-write
+  path.
+
+### Refactor
+
+- `e429b2b` — `src/storage/dashtable/segment.rs` (1587 LOC) split into
+  `segment/{mod,find,insert,ops}.rs`; mechanical refactor, zero semantic change,
+  brings all files under the 1500-LOC limit ahead of future hot-path additions.
+
 ### Added — Point-in-Time Recovery (PITR)
 
 - **P0** `ac3aa92` — `WalWriterV3::new()` now scans existing `.wal` segments on

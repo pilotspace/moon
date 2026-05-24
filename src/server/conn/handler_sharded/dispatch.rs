@@ -452,6 +452,23 @@ pub(super) async fn try_handle_swapdb(
         return true;
     }
 
+    // TXN guard: SWAPDB rewrites entire DB contents and has no undo path —
+    // reject during an active cross-store TXN so TXN.ABORT remains coherent.
+    if conn.in_cross_txn() {
+        responses.push(Frame::Error(Bytes::from_static(
+            crate::command::transaction::ERR_TXN_CROSS_SHARD,
+        )));
+        return true;
+    }
+
+    // Exact arity check first — Redis returns the wrong-arity error for
+    // anything other than SWAPDB <db1> <db2>.
+    if cmd_args.len() != 2 {
+        responses.push(Frame::Error(Bytes::from_static(
+            b"ERR wrong number of arguments for 'swapdb' command",
+        )));
+        return true;
+    }
     let parse_db_index = |f: &Frame| -> Option<usize> {
         match f {
             Frame::BulkString(b) => std::str::from_utf8(b).ok()?.parse::<usize>().ok(),

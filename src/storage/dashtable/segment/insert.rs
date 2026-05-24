@@ -360,6 +360,18 @@ impl<K, V> Segment<K, V> {
             unreachable!("Segment not full but no free slot found")
         });
 
+        // If the chosen slot is in a regular (non-stash) group that is neither
+        // home group, mark `has_non_home_keys` so the `find()` fallback scan is
+        // re-enabled. Otherwise subsequent lookups for this key would miss —
+        // they're gated on the flag (PERF-09). Mirrors the equivalent guard in
+        // `insert()` (lines 72-79).
+        if free_slot < REGULAR_SLOTS {
+            let slot_group = free_slot / 16;
+            if slot_group != group_a && slot_group != group_b {
+                self.has_non_home_keys = true;
+            }
+        }
+
         let (k, v) = make();
         self.write_slot(free_slot, h2, k, v);
         SegmentInsertOrUpdate::Inserted { slot: free_slot }

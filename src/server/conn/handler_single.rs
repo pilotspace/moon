@@ -618,6 +618,12 @@ pub async fn handle_connection(
                         }
                         // SWAPDB — atomically exchange two databases (single-shard path).
                         if cmd.eq_ignore_ascii_case(b"SWAPDB") {
+                            if cmd_args.len() != 2 {
+                                responses.push(Frame::Error(Bytes::from_static(
+                                    b"ERR wrong number of arguments for 'swapdb' command",
+                                )));
+                                continue;
+                            }
                             let parse_idx = |f: &Frame| -> Option<usize> {
                                 match f {
                                     Frame::BulkString(b) => {
@@ -646,14 +652,10 @@ pub async fn handle_connection(
                                             b"ERR cannot SWAPDB during BGREWRITEAOF",
                                         ))
                                     } else {
-                                        let (lo, hi) = if a < b { (a, b) } else { (b, a) };
-                                        // Acquire in ascending index order (deadlock prevention).
-                                        let mut guard_lo = db[lo].write();
-                                        let mut guard_hi = db[hi].write();
-                                        std::mem::swap(&mut *guard_lo, &mut *guard_hi);
-                                        // WAL: emit the SWAPDB record so crash-recovery
-                                        // replay can re-apply the swap.
-                                        if let Some(ref tx) = aof_tx {
+                                        // WAL must be durable BEFORE the swap (no rollback
+                                        // path for SWAPDB). Try-send first; on failure return
+                                        // an error and leave both DBs untouched.
+                                        let wal_ok = if let Some(ref tx) = aof_tx {
                                             let mut a_buf = itoa::Buffer::new();
                                             let mut b_buf = itoa::Buffer::new();
                                             let wal_frame = Frame::Array(crate::framevec![
@@ -669,13 +671,28 @@ pub async fn handle_connection(
                                                 crate::persistence::aof::serialize_command(
                                                     &wal_frame,
                                                 );
-                                            let _ = tx.try_send(
+                                            tx.try_send(
                                                 crate::persistence::aof::AofMessage::Append(
                                                     serialized,
                                                 ),
-                                            );
+                                            )
+                                            .is_ok()
+                                        } else {
+                                            true // persistence disabled — no durability requirement
+                                        };
+                                        if !wal_ok {
+                                            Frame::Error(Bytes::from_static(
+                                                b"ERR SWAPDB aborted: WAL enqueue failed (persistence backpressure)",
+                                            ))
+                                        } else {
+                                            let (lo, hi) =
+                                                if a < b { (a, b) } else { (b, a) };
+                                            // Acquire in ascending index order (deadlock prevention).
+                                            let mut guard_lo = db[lo].write();
+                                            let mut guard_hi = db[hi].write();
+                                            std::mem::swap(&mut *guard_lo, &mut *guard_hi);
+                                            Frame::SimpleString(Bytes::from_static(b"OK"))
                                         }
-                                        Frame::SimpleString(Bytes::from_static(b"OK"))
                                     }
                                 }
                                 _ => Frame::Error(Bytes::from_static(
