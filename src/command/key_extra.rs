@@ -39,9 +39,14 @@ pub fn copy(db: &mut Database, args: &[Frame]) -> Frame {
         if arg.eq_ignore_ascii_case(b"REPLACE") {
             replace = true;
         } else if arg.eq_ignore_ascii_case(b"DB") {
-            return Frame::Error(Bytes::from_static(
-                b"ERR COPY DB option not implemented (tracked in T2.3)",
-            ));
+            // Cross-db COPY is intercepted by handler-level code before dispatch().
+            // When this branch is reached, the DB index has already been validated
+            // as the same database (parse_copy_db_args returned None → same-db path).
+            // Consume the DB index argument and continue as a same-db copy.
+            i += 1; // skip the db-index token
+            if i >= args.len() {
+                return Frame::Error(Bytes::from_static(b"ERR syntax error"));
+            }
         } else {
             return Frame::Error(Bytes::from_static(b"ERR syntax error"));
         }
@@ -459,24 +464,30 @@ mod tests {
     }
 
     #[test]
-    fn test_copy_db_option_not_implemented() {
-        // T1.3: COPY ... DB n returns the "not implemented (tracked in T2.3)" error.
+    fn test_copy_db_missing_index_returns_error() {
+        // COPY src dst DB — DB keyword with no following index is a syntax error.
+        // Cross-db COPY is intercepted by handler-level code before copy() is called;
+        // when copy() sees DB it expects the db-index token to follow.
         let mut db = setup_db_with_key(b"src", b"hello");
         let result = copy(&mut db, &[bs(b"src"), bs(b"dst"), bs(b"DB")]);
-        match result {
-            Frame::Error(msg) => {
-                let text = std::str::from_utf8(&msg).unwrap();
-                assert!(
-                    text.contains("T2.3"),
-                    "expected T2.3 tracking ref in error, got: {text}"
-                );
-                assert!(
-                    text.contains("not implemented"),
-                    "expected 'not implemented' in error, got: {text}"
-                );
-            }
-            other => panic!("expected Error frame, got {other:?}"),
-        }
+        assert!(
+            matches!(result, Frame::Error(_)),
+            "COPY src dst DB (missing index) must return error, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_copy_db_same_db_fallthrough() {
+        // COPY src dst DB 0 with current_db=0 — parse_copy_db_args returns None
+        // so the command falls through to copy() which must treat it as same-db copy.
+        let mut db = setup_db_with_key(b"src", b"hello");
+        // DB token + "0" index: copy() skips them and performs a same-db copy
+        let result = copy(&mut db, &[bs(b"src"), bs(b"dst"), bs(b"DB"), bs(b"0")]);
+        // Result is either :1 (success) or :0 (collision) — NOT an error
+        assert!(
+            matches!(result, Frame::Integer(_)),
+            "COPY src dst DB 0 same-db fallthrough must return integer, got {result:?}"
+        );
     }
 
     // --- SORT tests ---

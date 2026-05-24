@@ -2099,6 +2099,37 @@ pub async fn handle_connection(
                                     continue;
                                 }
 
+                                // T2.3 COPY DB n — cross-db copy needs two databases.
+                                // parse_copy_db_args returns None when no DB clause or same db
+                                // (falls through to key_extra::copy for the single-db case).
+                                if d_cmd.eq_ignore_ascii_case(b"COPY") {
+                                    let src_db = conn.selected_db;
+                                    if let Some(copy_result) = crate::command::keyspace::move_cmd::parse_copy_db_args(d_args, src_db, db_count) {
+                                        let response = match copy_result {
+                                            Err(e) => e,
+                                            Ok(ca) => {
+                                                drop(guard);
+                                                let r = crate::command::keyspace::move_cmd::with_two_dbs_locked(
+                                                    db.as_slice(), src_db, ca.dst_db,
+                                                    |src, dst| crate::command::keyspace::move_cmd::copy_core(src, dst, &ca.src_key, &ca.dst_key, ca.replace),
+                                                );
+                                                current_db = conn.selected_db;
+                                                guard = db[current_db].write();
+                                                guard.refresh_now();
+                                                r
+                                            }
+                                        };
+                                        if matches!(response, Frame::Integer(1)) {
+                                            if let Some(bytes) = &aof_bytes {
+                                                aof_entries.push(bytes.clone());
+                                            }
+                                        }
+                                        responses[resp_idx] = response;
+                                        continue;
+                                    }
+                                    // No DB clause or same-db: fall through to dispatch() → key_extra::copy
+                                }
+
                                 // HSET auto-indexing: after dispatch, check for vector index match
                                 let is_hset = d_cmd.eq_ignore_ascii_case(b"HSET");
 

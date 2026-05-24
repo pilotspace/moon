@@ -1113,6 +1113,63 @@ pub(crate) async fn handle_connection_sharded_monoio<
                         responses.push(response);
                         continue;
                     }
+
+                    if cmd.eq_ignore_ascii_case(b"COPY") {
+                        use crate::command::keyspace::move_cmd as ksmv;
+                        let src_db = conn.selected_db;
+                        let db_count = ctx.shard_databases.db_count();
+                        if let Some(copy_result) =
+                            ksmv::parse_copy_db_args(cmd_args, src_db, db_count)
+                        {
+                            let response = match copy_result {
+                                Err(e) => e,
+                                Ok(ca) => {
+                                    if crate::shard::slice::is_initialized() {
+                                        crate::shard::slice::with_shard(|s| {
+                                            ksmv::with_two_slice_dbs(
+                                                &mut s.databases,
+                                                src_db,
+                                                ca.dst_db,
+                                                |src, dst| {
+                                                    ksmv::copy_core(
+                                                        src,
+                                                        dst,
+                                                        &ca.src_key,
+                                                        &ca.dst_key,
+                                                        ca.replace,
+                                                    )
+                                                },
+                                            )
+                                        })
+                                    } else {
+                                        ksmv::with_two_dbs_locked(
+                                            &ctx.shard_databases.all_shard_dbs()[ctx.shard_id],
+                                            src_db,
+                                            ca.dst_db,
+                                            |src, dst| {
+                                                ksmv::copy_core(
+                                                    src,
+                                                    dst,
+                                                    &ca.src_key,
+                                                    &ca.dst_key,
+                                                    ca.replace,
+                                                )
+                                            },
+                                        )
+                                    }
+                                }
+                            };
+                            if !matches!(response, Frame::Error(_)) {
+                                if let Some(ref tx) = ctx.aof_tx {
+                                    let serialized = aof::serialize_command(&frame);
+                                    let _ = tx.try_send(AofMessage::Append(serialized));
+                                }
+                            }
+                            responses.push(response);
+                            continue;
+                        }
+                        // No DB clause or same-db: fall through to normal write path
+                    }
                 }
 
                 if metadata::is_write(cmd) {

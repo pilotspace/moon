@@ -1,8 +1,8 @@
-//! Implementation of `MOVE key db` (T2.2).
+//! Implementation of `MOVE key db` (T2.2) and `COPY ... DB n` (T2.3).
 //!
-//! `MOVE` operates on two databases simultaneously and cannot go through
+//! Both commands operate on two databases simultaneously and cannot go through
 //! the central `dispatch()` function which only receives one `&mut Database`.
-//! Each handler intercepts the command before reaching `dispatch()`.
+//! Each handler intercepts these commands before reaching `dispatch()`.
 //!
 //! # MOVE semantics
 //! `MOVE key db` moves a key from the connection's currently-selected database
@@ -11,9 +11,13 @@
 //!
 //! Returns `:1` on success, `:0` if key is missing or target has the key.
 //!
+//! # COPY DB n semantics
+//! `COPY src dst DB n [REPLACE]` copies a key to a different database.
+//! Returns `:1` on success, `:0` on collision without REPLACE.
+//!
 //! # Lock ordering
 //! Lower database index is always locked first to prevent deadlocks with
-//! concurrent reverse MOVE operations.
+//! concurrent reverse MOVE/COPY-DB operations.
 
 use bytes::Bytes;
 use parking_lot::RwLock;
@@ -47,6 +51,44 @@ pub fn move_core(src: &mut Database, dst: &mut Database, key: &[u8]) -> Frame {
 
     // Move: insert into dst, TTL is carried inside the Entry value
     dst.set(Bytes::copy_from_slice(key), entry);
+    Frame::Integer(1)
+}
+
+// ── COPY core logic ────────────────────────────────────────────────────────────
+
+/// Copy `src_key` from database `src` to `dst_key` in database `dst`.
+/// Pure data-plane logic — no locking, no WAL.
+///
+/// Returns `:1` on success, `:0` on collision when `replace` is false.
+///
+/// # Preconditions
+/// - `src` and `dst` are two **distinct** databases from the same shard
+/// - The caller holds exclusive (write) access to both
+pub fn copy_core(
+    src: &mut Database,
+    dst: &mut Database,
+    src_key: &[u8],
+    dst_key: &[u8],
+    replace: bool,
+) -> Frame {
+    // Source must exist
+    let entry = match src.get(src_key) {
+        Some(e) => e.clone(),
+        None => return Frame::Integer(0),
+    };
+
+    // Same src and dst key in different dbs is allowed; same key same db is
+    // rejected by parse_copy_db_args. Nothing special needed here.
+
+    // Collision in dst
+    if dst.exists(dst_key) {
+        if !replace {
+            return Frame::Integer(0);
+        }
+        // REPLACE: overwrite dst
+    }
+
+    dst.set(Bytes::copy_from_slice(dst_key), entry);
     Frame::Integer(1)
 }
 
@@ -94,6 +136,94 @@ pub fn parse_move_args(args: &[Frame], db_count: usize) -> Result<(Bytes, usize)
         )));
     }
     Ok((key, db_index))
+}
+
+/// Parsed result for COPY when it includes a `DB n` clause targeting a different database.
+#[derive(Debug)]
+pub struct CopyDbArgs {
+    pub src_key: Bytes,
+    pub dst_key: Bytes,
+    pub dst_db: usize,
+    pub replace: bool,
+}
+
+/// Parse `COPY src dst [DB n] [REPLACE]` args for the cross-db case.
+///
+/// Returns `Some(Ok(CopyDbArgs))` when a `DB n` clause is present and `n`
+/// differs from `current_db` (cross-db operation — must be intercepted).
+///
+/// Returns `Some(Err(frame))` when the `DB n` clause is present but invalid.
+///
+/// Returns `None` when no `DB n` clause is present — caller falls through
+/// to the existing `key_extra::copy()` single-db path.
+///
+/// When `n == current_db`, returns `None` so the call falls through to the
+/// single-db path (same-db COPY is fully handled by `key_extra::copy`).
+pub fn parse_copy_db_args(
+    args: &[Frame],
+    current_db: usize,
+    db_count: usize,
+) -> Option<Result<CopyDbArgs, Frame>> {
+    if args.len() < 2 {
+        return None; // wrong arity — let key_extra::copy produce the error
+    }
+    let src_key = extract_bytes(&args[0])?;
+    let dst_key = extract_bytes(&args[1])?;
+
+    let mut replace = false;
+    let mut dst_db_opt: Option<usize> = None;
+    let mut i = 2;
+    while i < args.len() {
+        let tok = match extract_bytes(&args[i]) {
+            Some(t) => t,
+            None => return Some(Err(Frame::Error(Bytes::from_static(b"ERR syntax error")))),
+        };
+        if tok.eq_ignore_ascii_case(b"REPLACE") {
+            replace = true;
+            i += 1;
+        } else if tok.eq_ignore_ascii_case(b"DB") {
+            i += 1;
+            let db_tok = match args.get(i).and_then(|f| extract_bytes(f)) {
+                Some(t) => t,
+                None => return Some(Err(Frame::Error(Bytes::from_static(b"ERR syntax error")))),
+            };
+            let n: usize = match std::str::from_utf8(db_tok)
+                .ok()
+                .and_then(|s| s.parse::<i64>().ok())
+            {
+                Some(v) if v >= 0 => v as usize,
+                _ => {
+                    return Some(Err(Frame::Error(Bytes::from_static(
+                        b"ERR value is not an integer or out of range",
+                    ))));
+                }
+            };
+            if n >= db_count {
+                return Some(Err(Frame::Error(Bytes::from_static(
+                    b"ERR invalid DB index",
+                ))));
+            }
+            dst_db_opt = Some(n);
+            i += 1;
+        } else {
+            return Some(Err(Frame::Error(Bytes::from_static(b"ERR syntax error"))));
+        }
+    }
+
+    // None here means no DB clause was present — fall through to key_extra::copy.
+    let dst_db = dst_db_opt?;
+
+    if dst_db == current_db {
+        // Same db: fall through to key_extra::copy (which handles same-db correctly)
+        return None;
+    }
+
+    Some(Ok(CopyDbArgs {
+        src_key: Bytes::copy_from_slice(src_key),
+        dst_key: Bytes::copy_from_slice(dst_key),
+        dst_db,
+        replace,
+    }))
 }
 
 // ── RwLock-based two-db helper (handler_single path) ──────────────────────────
@@ -225,6 +355,51 @@ mod tests {
         assert!(dst.exists(b"k"), "dst key must survive");
     }
 
+    // ── copy_core ───────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_copy_core_success() {
+        let mut src = make_db();
+        let mut dst = make_db();
+        set_str(&mut src, "src", "hello");
+
+        let frame = copy_core(&mut src, &mut dst, b"src", b"dst", false);
+        assert_eq!(frame, Frame::Integer(1));
+        assert!(src.exists(b"src"), "src must still exist after copy");
+        assert!(dst.exists(b"dst"), "dst must have the copied value");
+    }
+
+    #[test]
+    fn test_copy_core_missing_src() {
+        let mut src = make_db();
+        let mut dst = make_db();
+        let frame = copy_core(&mut src, &mut dst, b"missing", b"dst", false);
+        assert_eq!(frame, Frame::Integer(0));
+    }
+
+    #[test]
+    fn test_copy_core_collision_no_replace() {
+        let mut src = make_db();
+        let mut dst = make_db();
+        set_str(&mut src, "src", "new");
+        set_str(&mut dst, "dst", "old");
+
+        let frame = copy_core(&mut src, &mut dst, b"src", b"dst", false);
+        assert_eq!(frame, Frame::Integer(0));
+    }
+
+    #[test]
+    fn test_copy_core_collision_replace() {
+        let mut src = make_db();
+        let mut dst = make_db();
+        set_str(&mut src, "src", "new");
+        set_str(&mut dst, "dst", "old");
+
+        let frame = copy_core(&mut src, &mut dst, b"src", b"dst", true);
+        assert_eq!(frame, Frame::Integer(1));
+        assert!(dst.exists(b"dst"));
+    }
+
     // ── parse_move_args ─────────────────────────────────────────────────────────
 
     #[test]
@@ -270,6 +445,70 @@ mod tests {
             Frame::BulkString(Bytes::from_static(b"abc")),
         ];
         assert!(parse_move_args(&args, 16).is_err());
+    }
+
+    // ── parse_copy_db_args ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_copy_db_args_no_db_clause() {
+        let args = vec![
+            Frame::BulkString(Bytes::from_static(b"src")),
+            Frame::BulkString(Bytes::from_static(b"dst")),
+        ];
+        // No DB clause → returns None (fall through to key_extra::copy)
+        assert!(parse_copy_db_args(&args, 0, 16).is_none());
+    }
+
+    #[test]
+    fn test_parse_copy_db_args_same_db() {
+        let args = vec![
+            Frame::BulkString(Bytes::from_static(b"src")),
+            Frame::BulkString(Bytes::from_static(b"dst")),
+            Frame::BulkString(Bytes::from_static(b"DB")),
+            Frame::BulkString(Bytes::from_static(b"0")),
+        ];
+        // DB 0 == current_db 0 → None (same-db, fall through)
+        assert!(parse_copy_db_args(&args, 0, 16).is_none());
+    }
+
+    #[test]
+    fn test_parse_copy_db_args_cross_db() {
+        let args = vec![
+            Frame::BulkString(Bytes::from_static(b"src")),
+            Frame::BulkString(Bytes::from_static(b"dst")),
+            Frame::BulkString(Bytes::from_static(b"DB")),
+            Frame::BulkString(Bytes::from_static(b"3")),
+        ];
+        let result = parse_copy_db_args(&args, 0, 16).unwrap().unwrap();
+        assert_eq!(&result.src_key[..], b"src");
+        assert_eq!(&result.dst_key[..], b"dst");
+        assert_eq!(result.dst_db, 3);
+        assert!(!result.replace);
+    }
+
+    #[test]
+    fn test_parse_copy_db_args_with_replace() {
+        let args = vec![
+            Frame::BulkString(Bytes::from_static(b"src")),
+            Frame::BulkString(Bytes::from_static(b"dst")),
+            Frame::BulkString(Bytes::from_static(b"DB")),
+            Frame::BulkString(Bytes::from_static(b"3")),
+            Frame::BulkString(Bytes::from_static(b"REPLACE")),
+        ];
+        let result = parse_copy_db_args(&args, 0, 16).unwrap().unwrap();
+        assert!(result.replace);
+    }
+
+    #[test]
+    fn test_parse_copy_db_args_invalid_db() {
+        let args = vec![
+            Frame::BulkString(Bytes::from_static(b"src")),
+            Frame::BulkString(Bytes::from_static(b"dst")),
+            Frame::BulkString(Bytes::from_static(b"DB")),
+            Frame::BulkString(Bytes::from_static(b"99")),
+        ];
+        let err = parse_copy_db_args(&args, 0, 16).unwrap().unwrap_err();
+        assert!(matches!(err, Frame::Error(_)));
     }
 
     // ── with_two_dbs_locked ─────────────────────────────────────────────────────

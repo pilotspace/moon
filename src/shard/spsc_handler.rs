@@ -459,7 +459,8 @@ pub(crate) fn handle_shard_message_shared(
                 }
 
                 // T2.2 MOVE — atomically moves a key between two dbs on the same shard.
-                // Requires two databases simultaneously; intercept before cmd_dispatch.
+                // T2.3 COPY DB n — copies a key to a different db on the same shard.
+                // Both require two databases simultaneously; intercept before cmd_dispatch.
                 if cmd.eq_ignore_ascii_case(b"MOVE") {
                     use crate::command::keyspace::move_cmd as ksmv;
                     let response = match ksmv::parse_move_args(args, db_count) {
@@ -505,6 +506,65 @@ pub(crate) fn handle_shard_message_shared(
                     }
                     let _ = reply_tx.send(response);
                     return;
+                }
+
+                if cmd.eq_ignore_ascii_case(b"COPY") {
+                    use crate::command::keyspace::move_cmd as ksmv;
+                    if let Some(copy_result) = ksmv::parse_copy_db_args(args, db_idx, db_count) {
+                        let response = match copy_result {
+                            Err(e) => e,
+                            Ok(ca) => {
+                                if crate::shard::slice::is_initialized() {
+                                    crate::shard::slice::with_shard(|s| {
+                                        ksmv::with_two_slice_dbs(
+                                            &mut s.databases,
+                                            db_idx,
+                                            ca.dst_db,
+                                            |src, dst| {
+                                                ksmv::copy_core(
+                                                    src,
+                                                    dst,
+                                                    &ca.src_key,
+                                                    &ca.dst_key,
+                                                    ca.replace,
+                                                )
+                                            },
+                                        )
+                                    })
+                                } else {
+                                    ksmv::with_two_dbs_locked(
+                                        &shard_databases.all_shard_dbs()[shard_id],
+                                        db_idx,
+                                        ca.dst_db,
+                                        |src, dst| {
+                                            ksmv::copy_core(
+                                                src,
+                                                dst,
+                                                &ca.src_key,
+                                                &ca.dst_key,
+                                                ca.replace,
+                                            )
+                                        },
+                                    )
+                                }
+                            }
+                        };
+                        if matches!(response, crate::protocol::Frame::Integer(1)) {
+                            let serialized = aof::serialize_command(&command);
+                            wal_append_and_fanout(
+                                &serialized,
+                                wal_writer,
+                                wal_v3_writer,
+                                repl_backlog,
+                                replica_txs,
+                                repl_state,
+                                shard_id,
+                            );
+                        }
+                        let _ = reply_tx.send(response);
+                        return;
+                    }
+                    // No DB clause or same-db: fall through to cmd_dispatch → key_extra::copy
                 }
 
                 // COW intercept: capture old value before write if snapshot is active
