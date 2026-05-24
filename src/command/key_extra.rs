@@ -39,13 +39,33 @@ pub fn copy(db: &mut Database, args: &[Frame]) -> Frame {
         if arg.eq_ignore_ascii_case(b"REPLACE") {
             replace = true;
         } else if arg.eq_ignore_ascii_case(b"DB") {
-            // Cross-db COPY is intercepted by handler-level code before dispatch().
-            // When this branch is reached, the DB index has already been validated
-            // as the same database (parse_copy_db_args returned None → same-db path).
-            // Consume the DB index argument and continue as a same-db copy.
-            i += 1; // skip the db-index token
+            // Cross-db COPY is intercepted by handler-level code before
+            // dispatch(). When this branch is reached, the DB index has
+            // already been validated as the same database (parse_copy_db_args
+            // returned None → same-db path). Even so, defensively validate
+            // the consumed token so a malformed value like `COPY src dst DB
+            // abc` is rejected rather than silently accepted in any path
+            // that bypasses the handler-level intercept (e.g. future
+            // callers, dispatch paths that don't go through parse_copy_db_args).
+            i += 1;
             if i >= args.len() {
                 return Frame::Error(Bytes::from_static(b"ERR syntax error"));
+            }
+            let db_tok = match extract_key(&args[i]) {
+                Some(k) => k,
+                None => {
+                    return Frame::Error(Bytes::from_static(
+                        b"ERR value is not an integer or out of range",
+                    ));
+                }
+            };
+            let parsed: Option<usize> = std::str::from_utf8(db_tok)
+                .ok()
+                .and_then(|s| s.parse::<usize>().ok());
+            if parsed.is_none() {
+                return Frame::Error(Bytes::from_static(
+                    b"ERR value is not an integer or out of range",
+                ));
             }
         } else {
             return Frame::Error(Bytes::from_static(b"ERR syntax error"));
