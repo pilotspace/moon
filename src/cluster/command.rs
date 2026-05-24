@@ -8,11 +8,11 @@ use std::sync::{Arc, RwLock};
 
 use bytes::Bytes;
 
+use crate::cluster::failover::DEFAULT_NODE_TIMEOUT_MS;
 use crate::cluster::slots::slot_for_key;
 use crate::cluster::{ClusterNode, ClusterState, ClusterStatus, NodeFlags};
 use crate::framevec;
 use crate::protocol::Frame;
-
 /// Entry point: dispatch CLUSTER <subcommand> [args...] to the correct handler.
 ///
 /// Returns a Frame response, or Frame::Error if the subcommand is unknown or args invalid.
@@ -46,6 +46,7 @@ pub fn handle_cluster_command(
         b"REPLICATE" => handle_cluster_replicate(&args[1..], cluster_state),
         b"FAILOVER" => handle_cluster_failover(&args[1..], cluster_state),
         b"REPLICAS" | b"SLAVES" => handle_cluster_replicas(&args[1..], cluster_state),
+        b"COUNT-FAILURE-REPORTS" => handle_cluster_count_failure_reports(&args[1..], cluster_state),
         _ => Frame::Error(Bytes::from(format!(
             "ERR unknown subcommand '{}' for CLUSTER",
             String::from_utf8_lossy(&subcmd_upper)
@@ -399,12 +400,7 @@ pub fn handle_cluster_reset(
     cs: &Arc<RwLock<ClusterState>>,
     _self_addr: SocketAddr,
 ) -> Frame {
-    let hard = args
-        .first()
-        .map(|a| {
-            matches!(a, Frame::BulkString(b) | Frame::SimpleString(b) if b.eq_ignore_ascii_case(b"hard"))
-        })
-        .unwrap_or(false);
+    let hard = args.first().map(|a| matches!(a, Frame::BulkString(b) | Frame::SimpleString(b) if b.eq_ignore_ascii_case(b"hard"))).unwrap_or(false);
     let mut state = cs.write().unwrap();
     let my_id = state.node_id.clone();
     // Clear slots on my node
@@ -505,6 +501,38 @@ fn handle_cluster_failover(args: &[Frame], cs: &Arc<RwLock<ClusterState>>) -> Fr
             Frame::SimpleString(Bytes::from_static(b"OK"))
         }
     }
+}
+
+/// CLUSTER COUNT-FAILURE-REPORTS <node-id>
+///
+/// Returns the number of active (non-stale) PFAIL reports for the given node-id.
+/// A report is stale when `(now_ms - reported_at) >= DEFAULT_NODE_TIMEOUT_MS * 2`.
+///
+/// Returns `:0` for an unknown node-id (matches real Redis behaviour).
+pub fn handle_cluster_count_failure_reports(
+    args: &[Frame],
+    cs: &Arc<RwLock<ClusterState>>,
+) -> Frame {
+    if args.is_empty() {
+        return Frame::Error(Bytes::from_static(
+            b"ERR wrong number of arguments for CLUSTER COUNT-FAILURE-REPORTS",
+        ));
+    }
+    let target_id = extract_string(&args[0]);
+    let now = now_ms();
+    // A report is active when its age is strictly less than 2 * timeout.
+    let stale_cutoff = now.saturating_sub(2 * DEFAULT_NODE_TIMEOUT_MS);
+
+    let state = cs.read().unwrap();
+    let count = match state.nodes.get(&target_id) {
+        None => 0i64,
+        Some(node) => node
+            .pfail_reports
+            .values()
+            .filter(|&&ts| ts > stale_cutoff)
+            .count() as i64,
+    };
+    Frame::Integer(count)
 }
 
 // --- Helpers ---------------------------------------------------------------------
@@ -845,7 +873,8 @@ mod tests {
     // T2.4: CLUSTER REPLICAS / SLAVES
     // -------------------------------------------------------------------------
 
-    /// Build a ClusterState with one master ("a"×40, self) and two replicas of it.
+    /// Build a ClusterState with one master (master_id) and two replicas of it.
+    /// The self-node ("a"×40) is master; "c"×40 and "d"×40 are its replicas.
     fn make_cs_with_replicas() -> (Arc<RwLock<ClusterState>>, String, String, String) {
         let master_id = "a".repeat(40);
         let replica1_id = "c".repeat(40);
@@ -893,7 +922,7 @@ mod tests {
         }
     }
 
-    /// T2.4-b: Array with one BulkString per replica, each containing ≥9 fields, no trailing newline.
+    /// T2.4-b: Array with one BulkString per replica, each containing ≥9 fields.
     #[test]
     fn cluster_replicas_lists_replicas() {
         let (cs, master_id, replica1_id, replica2_id) = make_cs_with_replicas();
@@ -902,12 +931,14 @@ mod tests {
         match result {
             Frame::Array(items) => {
                 assert_eq!(items.len(), 2, "expected 2 replicas");
+                // Gather node-ids from the returned lines
                 let mut seen_ids = std::collections::HashSet::new();
                 for item in &*items {
                     let line = match item {
                         Frame::BulkString(b) => String::from_utf8(b.to_vec()).unwrap(),
                         other => panic!("expected BulkString element, got {:?}", other),
                     };
+                    // Must not have trailing newline
                     assert!(
                         !line.ends_with('\n'),
                         "line must not end with newline: {:?}",
@@ -950,10 +981,13 @@ mod tests {
         }
     }
 
-    /// T2.4-d: SLAVES is an alias for REPLICAS (same length result via dispatch).
+    /// T2.4-d: SLAVES is an alias for REPLICAS.
     #[test]
     fn cluster_slaves_is_alias_for_replicas() {
         let (cs, master_id, _, _) = make_cs_with_replicas();
+        let args_replicas = vec![Frame::BulkString(bytes::Bytes::from(master_id.clone()))];
+        let args_slaves = vec![Frame::BulkString(bytes::Bytes::from(master_id.clone()))];
+
         let replicas_result = handle_cluster_command(
             &[
                 Frame::BulkString(bytes::Bytes::from_static(b"REPLICAS")),
@@ -970,6 +1004,8 @@ mod tests {
             &cs,
             "127.0.0.1:6379".parse().unwrap(),
         );
+
+        // Both must return arrays of the same length
         let replicas_len = match &replicas_result {
             Frame::Array(v) => v.len(),
             other => panic!("REPLICAS: expected Array, got {:?}", other),
@@ -982,9 +1018,11 @@ mod tests {
             replicas_len, slaves_len,
             "REPLICAS and SLAVES must return same number of elements"
         );
+        drop(args_replicas);
+        drop(args_slaves);
     }
 
-    /// T2.4-e: Self appears with "myself," prefix when self is one of the replicas.
+    /// T2.4-e: Self appears with "myself," prefix when this node is one of the replicas.
     #[test]
     fn cluster_replicas_includes_myself_marker_when_self_is_replica() {
         let master_id = "b".repeat(40);
@@ -993,9 +1031,11 @@ mod tests {
         let cs = Arc::new(RwLock::new(ClusterState::new(my_id.clone(), addr)));
         {
             let mut state = cs.write().unwrap();
+            // Make self a replica of master_id
             state.my_node_mut().flags = NodeFlags::Replica {
                 master_id: master_id.clone(),
             };
+            // Add the master node
             let master = ClusterNode::new(
                 master_id.clone(),
                 SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 6380),
@@ -1021,5 +1061,75 @@ mod tests {
             }
             other => panic!("expected Array, got {:?}", other),
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // T2.5: CLUSTER COUNT-FAILURE-REPORTS
+    // -------------------------------------------------------------------------
+
+    /// T2.5-a: Returns :0 for an unknown node-id (matches Redis behaviour).
+    #[test]
+    fn cluster_count_failure_reports_returns_zero_for_unknown_node() {
+        let cs = make_cs();
+        let unknown = "f".repeat(40);
+        let args = vec![Frame::BulkString(bytes::Bytes::from(unknown))];
+        let result = handle_cluster_count_failure_reports(&args, &cs);
+        assert_eq!(result, Frame::Integer(0));
+    }
+
+    /// T2.5-b: Returns :0 for a healthy node with an empty pfail_reports map.
+    #[test]
+    fn cluster_count_failure_reports_returns_zero_for_healthy_node() {
+        let cs = make_cs();
+        let my_id = cs.read().unwrap().node_id.clone();
+        let args = vec![Frame::BulkString(bytes::Bytes::from(my_id))];
+        let result = handle_cluster_count_failure_reports(&args, &cs);
+        assert_eq!(result, Frame::Integer(0));
+    }
+
+    /// T2.5-c: Counts active (non-stale) pfail_reports.
+    #[test]
+    fn cluster_count_failure_reports_counts_active_reports() {
+        let cs = make_cs();
+        let my_id = cs.read().unwrap().node_id.clone();
+        let now = now_ms();
+        {
+            let mut state = cs.write().unwrap();
+            let node = state.nodes.get_mut(&my_id).unwrap();
+            // Two very recent reports
+            node.pfail_reports.insert("reporter1".to_string(), now);
+            node.pfail_reports.insert("reporter2".to_string(), now);
+        }
+        let args = vec![Frame::BulkString(bytes::Bytes::from(my_id))];
+        let result = handle_cluster_count_failure_reports(&args, &cs);
+        assert_eq!(result, Frame::Integer(2));
+    }
+
+    /// T2.5-d: Stale reports (age >= 2 * DEFAULT_NODE_TIMEOUT_MS) are excluded.
+    #[test]
+    fn cluster_count_failure_reports_excludes_stale_reports() {
+        let cs = make_cs();
+        let my_id = cs.read().unwrap().node_id.clone();
+        // Use absolute timestamps that are unambiguously on each side of any
+        // reasonable stale_cutoff, so the test is not sensitive to clock skew
+        // between when we insert and when the handler calls now_ms().
+        //
+        // stale_ts = 0 (Unix epoch): age is enormous → always excluded.
+        // active_ts = u64::MAX / 2: far-future ms → stale_cutoff (now - 60_000)
+        //   is orders of magnitude smaller → always counted.
+        let stale_ts: u64 = 0;
+        let active_ts: u64 = u64::MAX / 2;
+        {
+            let mut state = cs.write().unwrap();
+            let node = state.nodes.get_mut(&my_id).unwrap();
+            node.pfail_reports
+                .insert("stale_reporter".to_string(), stale_ts);
+            node.pfail_reports
+                .insert("active_reporter".to_string(), active_ts);
+        }
+        let args = vec![Frame::BulkString(bytes::Bytes::from(my_id))];
+        let result = handle_cluster_count_failure_reports(&args, &cs);
+        // Only the active_reporter (ts = u64::MAX/2) should be counted.
+        assert_eq!(result, Frame::Integer(1));
     }
 }
