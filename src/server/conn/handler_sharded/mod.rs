@@ -1128,30 +1128,64 @@ pub(crate) async fn handle_connection_sharded_inner<
                         // cross-shard shared reads from other shard threads.
                         local_dispatches = local_dispatches.saturating_add(1);
 
-                        // T2.2 MOVE — intercept before write-path (needs two dbs).
-                        // T2.3 COPY DB n — same reason.
-                        if metadata::is_write(cmd) {
-                            let db_count_for_mv = ctx.shard_databases.db_count();
-                            if cmd.eq_ignore_ascii_case(b"MOVE") {
-                                use crate::command::keyspace::move_cmd as ksmv;
-                                let src_db = conn.selected_db;
-                                let response = match ksmv::parse_move_args(cmd_args, db_count_for_mv) {
+                        // T2.2 MOVE / T2.3 COPY ... DB n — intercept before write-path
+                        // (needs two dbs). Direct name checks below subsume the outer
+                        // metadata::is_write() gate — both names are write commands and
+                        // hot-path SETs/GETs would pay a redundant PHF lookup if we kept
+                        // the wrapper.
+                        if cmd.eq_ignore_ascii_case(b"MOVE") {
+                            use crate::command::keyspace::move_cmd as ksmv;
+                            let src_db = conn.selected_db;
+                            let db_count = ctx.shard_databases.db_count();
+                            let response = match ksmv::parse_move_args(cmd_args, db_count) {
+                                Err(e) => e,
+                                Ok((_key, dst_db)) if dst_db == src_db => Frame::Integer(0),
+                                Ok((key, dst_db)) => {
+                                    if crate::shard::slice::is_initialized() {
+                                        crate::shard::slice::with_shard(|s| {
+                                            ksmv::with_two_slice_dbs(&mut s.databases, src_db, dst_db, |src, dst| {
+                                                ksmv::move_core(src, dst, &key)
+                                            })
+                                        })
+                                    } else {
+                                        // Lock ordering (lower index first) prevents deadlock
+                                        // with concurrent reverse MOVE from another connection.
+                                        ksmv::with_two_dbs_locked(
+                                            &ctx.shard_databases.all_shard_dbs()[ctx.shard_id],
+                                            src_db, dst_db,
+                                            |src, dst| ksmv::move_core(src, dst, &key),
+                                        )
+                                    }
+                                }
+                            };
+                            if !matches!(response, Frame::Error(_)) {
+                                if let Some(ref bytes) = aof_bytes {
+                                    if let Some(ref tx) = ctx.aof_tx { let _ = tx.try_send(AofMessage::Append(bytes.clone())); }
+                                }
+                            }
+                            responses.push(response);
+                            continue;
+                        }
+
+                        if cmd.eq_ignore_ascii_case(b"COPY") {
+                            use crate::command::keyspace::move_cmd as ksmv;
+                            let src_db = conn.selected_db;
+                            let db_count = ctx.shard_databases.db_count();
+                            if let Some(copy_result) = ksmv::parse_copy_db_args(cmd_args, src_db, db_count) {
+                                let response = match copy_result {
                                     Err(e) => e,
-                                    Ok((_key, dst_db)) if dst_db == src_db => Frame::Integer(0),
-                                    Ok((key, dst_db)) => {
+                                    Ok(ca) => {
                                         if crate::shard::slice::is_initialized() {
                                             crate::shard::slice::with_shard(|s| {
-                                                ksmv::with_two_slice_dbs(&mut s.databases, src_db, dst_db, |src, dst| {
-                                                    ksmv::move_core(src, dst, &key)
+                                                ksmv::with_two_slice_dbs(&mut s.databases, src_db, ca.dst_db, |src, dst| {
+                                                    ksmv::copy_core(src, dst, &ca.src_key, &ca.dst_key, ca.replace)
                                                 })
                                             })
                                         } else {
-                                            // Lock ordering (lower index first) prevents deadlock
-                                            // with concurrent reverse MOVE from another connection.
                                             ksmv::with_two_dbs_locked(
                                                 &ctx.shard_databases.all_shard_dbs()[ctx.shard_id],
-                                                src_db, dst_db,
-                                                |src, dst| ksmv::move_core(src, dst, &key),
+                                                src_db, ca.dst_db,
+                                                |src, dst| ksmv::copy_core(src, dst, &ca.src_key, &ca.dst_key, ca.replace),
                                             )
                                         }
                                     }
@@ -1164,39 +1198,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                                 responses.push(response);
                                 continue;
                             }
-
-                            if cmd.eq_ignore_ascii_case(b"COPY") {
-                                use crate::command::keyspace::move_cmd as ksmv;
-                                let src_db = conn.selected_db;
-                                if let Some(copy_result) = ksmv::parse_copy_db_args(cmd_args, src_db, db_count_for_mv) {
-                                    let response = match copy_result {
-                                        Err(e) => e,
-                                        Ok(ca) => {
-                                            if crate::shard::slice::is_initialized() {
-                                                crate::shard::slice::with_shard(|s| {
-                                                    ksmv::with_two_slice_dbs(&mut s.databases, src_db, ca.dst_db, |src, dst| {
-                                                        ksmv::copy_core(src, dst, &ca.src_key, &ca.dst_key, ca.replace)
-                                                    })
-                                                })
-                                            } else {
-                                                ksmv::with_two_dbs_locked(
-                                                    &ctx.shard_databases.all_shard_dbs()[ctx.shard_id],
-                                                    src_db, ca.dst_db,
-                                                    |src, dst| ksmv::copy_core(src, dst, &ca.src_key, &ca.dst_key, ca.replace),
-                                                )
-                                            }
-                                        }
-                                    };
-                                    if !matches!(response, Frame::Error(_)) {
-                                        if let Some(ref bytes) = aof_bytes {
-                                            if let Some(ref tx) = ctx.aof_tx { let _ = tx.try_send(AofMessage::Append(bytes.clone())); }
-                                        }
-                                    }
-                                    responses.push(response);
-                                    continue;
-                                }
-                                // No DB clause or same-db: fall through to normal write path
-                            }
+                            // No DB clause or same-db: fall through to normal write path
                         }
 
                         if metadata::is_write(cmd) {
