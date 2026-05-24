@@ -546,6 +546,20 @@ pub enum ShardMessage {
         pairs: Vec<(Bytes, Bytes)>,
         slot: std::sync::Arc<PubSubResponseSlot>,
     },
+    /// Swap two databases within this shard (SWAPDB implementation).
+    ///
+    /// The SPSC handler emits a per-shard WAL record before performing the swap,
+    /// then calls `ShardDatabases::swap_dbs(shard_id, a, b)`.  On completion it
+    /// sends `()` on `reply_tx` so the coordinator can await all-shard acks before
+    /// returning `+OK` to the client.
+    ///
+    /// Indices `a` and `b` are pre-validated (0..db_count, a != b) by the
+    /// coordinator; the handler may assert rather than re-validate.
+    SwapDb {
+        a: usize,
+        b: usize,
+        reply_tx: channel::OneshotSender<()>,
+    },
     /// Graceful shutdown signal.
     Shutdown,
 }

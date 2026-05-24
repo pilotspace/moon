@@ -2184,6 +2184,40 @@ pub(crate) fn handle_shard_message_shared(
             };
             let _ = reply_tx.send(response);
         }
+        ShardMessage::SwapDb { a, b, reply_tx } => {
+            // WAL-before-swap: emit the SWAPDB record so that crash-recovery
+            // replay can re-apply the swap in the correct order.  The record
+            // is written even when wal_writer/wal_v3_writer are None (the
+            // fast-path in wal_append_and_fanout will skip it cheaply).
+            //
+            // Serialise "SWAPDB <a> <b>" without heap allocation on the number
+            // formatting (itoa writes into a stack buffer).
+            let mut a_buf = itoa::Buffer::new();
+            let mut b_buf = itoa::Buffer::new();
+            let a_str = a_buf.format(a);
+            let b_str = b_buf.format(b);
+            let wal_frame = crate::protocol::Frame::Array(crate::framevec![
+                crate::protocol::Frame::BulkString(bytes::Bytes::from_static(b"SWAPDB")),
+                crate::protocol::Frame::BulkString(bytes::Bytes::copy_from_slice(a_str.as_bytes())),
+                crate::protocol::Frame::BulkString(bytes::Bytes::copy_from_slice(b_str.as_bytes())),
+            ]);
+            let serialized = aof::serialize_command(&wal_frame);
+            wal_append_and_fanout(
+                &serialized,
+                wal_writer,
+                wal_v3_writer,
+                repl_backlog,
+                replica_txs,
+                repl_state,
+                shard_id,
+            );
+
+            // Perform the in-place swap under ascending-index write locks.
+            shard_databases.swap_dbs(shard_id, a, b);
+
+            // Notify the coordinator that this shard completed its swap.
+            let _ = reply_tx.send(());
+        }
         ShardMessage::Shutdown => {
             info!("Received shutdown via SPSC");
         }

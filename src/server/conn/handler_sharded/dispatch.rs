@@ -430,6 +430,83 @@ pub(super) async fn try_handle_cross_shard_scan(
     false
 }
 
+/// Handle SWAPDB — atomically exchange two databases across all shards.
+///
+/// Validates arguments, enforces the BGREWRITEAOF guard, handles the same-index
+/// no-op, then delegates to `coordinate_swapdb` for multi-shard broadcast.
+/// Returns `true` if consumed (caller should `continue`).
+pub(super) async fn try_handle_swapdb(
+    cmd: &[u8],
+    cmd_args: &[Frame],
+    conn: &ConnectionState,
+    ctx: &ConnectionContext,
+    responses: &mut Vec<Frame>,
+) -> bool {
+    if !cmd.eq_ignore_ascii_case(b"SWAPDB") {
+        return false;
+    }
+
+    // Reject inside MULTI/EXEC queue.
+    if conn.in_multi {
+        responses.push(Frame::SimpleString(Bytes::from_static(b"QUEUED")));
+        return true;
+    }
+
+    let parse_db_index = |f: &Frame| -> Option<usize> {
+        match f {
+            Frame::BulkString(b) => std::str::from_utf8(b).ok()?.parse::<usize>().ok(),
+            Frame::Integer(n) => usize::try_from(*n).ok(),
+            _ => None,
+        }
+    };
+    let a = cmd_args.first().and_then(parse_db_index);
+    let b = cmd_args.get(1).and_then(parse_db_index);
+    let (a, b) = match (a, b) {
+        (Some(a), Some(b)) => (a, b),
+        _ => {
+            responses.push(Frame::Error(Bytes::from_static(
+                b"ERR value is not an integer or out of range",
+            )));
+            return true;
+        }
+    };
+
+    let db_count = ctx.shard_databases.db_count();
+    if a >= db_count || b >= db_count {
+        responses.push(Frame::Error(Bytes::from_static(
+            b"ERR DB index is out of range",
+        )));
+        return true;
+    }
+
+    if a == b {
+        responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
+        return true;
+    }
+
+    if crate::command::persistence::AOF_REWRITE_IN_PROGRESS
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        responses.push(Frame::Error(Bytes::from_static(
+            b"ERR cannot SWAPDB during BGREWRITEAOF",
+        )));
+        return true;
+    }
+
+    let response = crate::shard::coordinator::coordinate_swapdb(
+        a,
+        b,
+        ctx.shard_id,
+        ctx.num_shards,
+        &ctx.shard_databases,
+        &ctx.dispatch_tx,
+        &ctx.spsc_notifiers,
+    )
+    .await;
+    responses.push(response);
+    true
+}
+
 /// Handle READONLY enforcement for replicas.
 /// Returns `true` if the command was blocked (caller should `continue`).
 ///

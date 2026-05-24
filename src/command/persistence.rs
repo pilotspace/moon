@@ -33,6 +33,17 @@ pub static BGSAVE_SHARDS_REMAINING: AtomicU64 = AtomicU64::new(0);
 /// Whether the last BGSAVE completed successfully.
 pub static BGSAVE_LAST_STATUS: AtomicBool = AtomicBool::new(true);
 
+/// Global flag indicating whether a BGREWRITEAOF rewrite is currently in progress.
+///
+/// Set to `true` when `bgrewriteaof_start` or `bgrewriteaof_start_sharded` dispatches
+/// a rewrite request to the AOF writer task.  Cleared by the AOF writer task itself
+/// (in `src/persistence/aof.rs`) after `do_rewrite_single` / `do_rewrite_sharded` /
+/// `rewrite_aof` returns (success or failure).
+///
+/// Used by SWAPDB to reject concurrent rewrite: the AOF writer snapshots the
+/// databases at rewrite-start; a SWAPDB mid-rewrite would corrupt the snapshot.
+pub static AOF_REWRITE_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+
 /// Start a background RDB save (BGSAVE command).
 ///
 /// Clones all database entries under the lock, then spawns a blocking task
@@ -201,29 +212,63 @@ pub fn bgsave_shard_done(success: bool) {
 ///
 /// Sends a Rewrite message to the AOF writer task, which will generate
 /// synthetic commands from current database state and replace the AOF file.
+///
+/// Uses CAS to set `AOF_REWRITE_IN_PROGRESS`: if a rewrite is already running,
+/// returns an error immediately without corrupting the in-flight rewrite state.
 pub fn bgrewriteaof_start(aof_tx: &channel::MpscSender<AofMessage>, db: SharedDatabases) -> Frame {
+    // CAS: only proceed if currently false; prevents a second caller from
+    // clearing the flag while the first rewrite is still in progress.
+    if AOF_REWRITE_IN_PROGRESS
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return Frame::Error(Bytes::from_static(
+            b"ERR Background AOF rewrite already in progress",
+        ));
+    }
     match aof_tx.try_send(AofMessage::Rewrite(db)) {
         Ok(()) => Frame::SimpleString(Bytes::from_static(
             b"Background append only file rewriting started",
         )),
-        Err(_) => Frame::Error(Bytes::from_static(
-            b"ERR Background AOF rewrite failed to start",
-        )),
+        Err(_) => {
+            // Channel send failed — rewrite never started; we set the flag so we clear it.
+            AOF_REWRITE_IN_PROGRESS.store(false, Ordering::SeqCst);
+            Frame::Error(Bytes::from_static(
+                b"ERR Background AOF rewrite failed to start",
+            ))
+        }
     }
 }
 
 /// Start BGREWRITEAOF in sharded mode using ShardDatabases.
+///
+/// Uses CAS to set `AOF_REWRITE_IN_PROGRESS`: if a rewrite is already running,
+/// returns an error immediately without corrupting the in-flight rewrite state.
 pub fn bgrewriteaof_start_sharded(
     aof_tx: &channel::MpscSender<AofMessage>,
     shard_databases: std::sync::Arc<crate::shard::shared_databases::ShardDatabases>,
 ) -> Frame {
+    // CAS: only proceed if currently false; prevents a second caller from
+    // clearing the flag while the first rewrite is still in progress.
+    if AOF_REWRITE_IN_PROGRESS
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return Frame::Error(Bytes::from_static(
+            b"ERR Background AOF rewrite already in progress",
+        ));
+    }
     match aof_tx.try_send(AofMessage::RewriteSharded(shard_databases)) {
         Ok(()) => Frame::SimpleString(Bytes::from_static(
             b"Background append only file rewriting started",
         )),
-        Err(_) => Frame::Error(Bytes::from_static(
-            b"ERR Background AOF rewrite failed to start",
-        )),
+        Err(_) => {
+            // Channel send failed — rewrite never started; we set the flag so we clear it.
+            AOF_REWRITE_IN_PROGRESS.store(false, Ordering::SeqCst);
+            Frame::Error(Bytes::from_static(
+                b"ERR Background AOF rewrite failed to start",
+            ))
+        }
     }
 }
 

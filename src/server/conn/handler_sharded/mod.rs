@@ -916,6 +916,11 @@ pub(crate) async fn handle_connection_sharded_inner<
                         continue;
                     }
 
+                    // --- SWAPDB: handler-layer intercept (needs async + multi-db access) ---
+                    if dispatch::try_handle_swapdb(cmd, cmd_args, &conn, ctx, &mut responses).await {
+                        continue;
+                    }
+
                     // --- Cross-shard aggregation: KEYS, SCAN, DBSIZE ---
                     if dispatch::try_handle_cross_shard_scan(cmd, cmd_args, &conn, ctx, &mut responses).await {
                         continue;

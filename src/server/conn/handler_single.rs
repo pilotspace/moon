@@ -616,6 +616,75 @@ pub async fn handle_connection(
                             responses.push(response);
                             continue;
                         }
+                        // SWAPDB — atomically exchange two databases (single-shard path).
+                        if cmd.eq_ignore_ascii_case(b"SWAPDB") {
+                            let parse_idx = |f: &Frame| -> Option<usize> {
+                                match f {
+                                    Frame::BulkString(b) => {
+                                        std::str::from_utf8(b).ok()?.parse::<usize>().ok()
+                                    }
+                                    Frame::Integer(n) => usize::try_from(*n).ok(),
+                                    _ => None,
+                                }
+                            };
+                            let idx_a = cmd_args.first().and_then(parse_idx);
+                            let idx_b = cmd_args.get(1).and_then(parse_idx);
+                            let resp = match (idx_a, idx_b) {
+                                (Some(a), Some(b)) => {
+                                    let db_count = db.len();
+                                    if a >= db_count || b >= db_count {
+                                        Frame::Error(Bytes::from_static(
+                                            b"ERR DB index is out of range",
+                                        ))
+                                    } else if a == b {
+                                        // Same-index: no-op, return OK.
+                                        Frame::SimpleString(Bytes::from_static(b"OK"))
+                                    } else if crate::command::persistence::AOF_REWRITE_IN_PROGRESS
+                                        .load(std::sync::atomic::Ordering::SeqCst)
+                                    {
+                                        Frame::Error(Bytes::from_static(
+                                            b"ERR cannot SWAPDB during BGREWRITEAOF",
+                                        ))
+                                    } else {
+                                        let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+                                        // Acquire in ascending index order (deadlock prevention).
+                                        let mut guard_lo = db[lo].write();
+                                        let mut guard_hi = db[hi].write();
+                                        std::mem::swap(&mut *guard_lo, &mut *guard_hi);
+                                        // WAL: emit the SWAPDB record so crash-recovery
+                                        // replay can re-apply the swap.
+                                        if let Some(ref tx) = aof_tx {
+                                            let mut a_buf = itoa::Buffer::new();
+                                            let mut b_buf = itoa::Buffer::new();
+                                            let wal_frame = Frame::Array(crate::framevec![
+                                                Frame::BulkString(Bytes::from_static(b"SWAPDB")),
+                                                Frame::BulkString(Bytes::copy_from_slice(
+                                                    a_buf.format(a).as_bytes()
+                                                )),
+                                                Frame::BulkString(Bytes::copy_from_slice(
+                                                    b_buf.format(b).as_bytes()
+                                                )),
+                                            ]);
+                                            let serialized =
+                                                crate::persistence::aof::serialize_command(
+                                                    &wal_frame,
+                                                );
+                                            let _ = tx.try_send(
+                                                crate::persistence::aof::AofMessage::Append(
+                                                    serialized,
+                                                ),
+                                            );
+                                        }
+                                        Frame::SimpleString(Bytes::from_static(b"OK"))
+                                    }
+                                }
+                                _ => Frame::Error(Bytes::from_static(
+                                    b"ERR value is not an integer or out of range",
+                                )),
+                            };
+                            responses.push(resp);
+                            continue;
+                        }
                         // CONFIG
                         if cmd.eq_ignore_ascii_case(b"CONFIG") {
                             responses.push(handle_config(cmd_args, &runtime_config, &config));

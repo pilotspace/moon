@@ -786,6 +786,10 @@ pub(crate) async fn handle_connection_sharded_monoio<
             if dispatch::try_handle_persistence(cmd, ctx, &mut responses) {
                 continue;
             }
+            // --- SWAPDB: handler-layer intercept (needs async + multi-db access) ---
+            if dispatch::try_handle_swapdb(cmd, cmd_args, &conn, ctx, &mut responses).await {
+                continue;
+            }
             if dispatch::try_enforce_acl(cmd, cmd_args, &mut conn, ctx, &peer_addr, &mut responses)
             {
                 continue;

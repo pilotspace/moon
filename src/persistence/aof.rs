@@ -259,6 +259,8 @@ pub async fn aof_writer_task(
                         }
                         Err(e) => error!("AOF rewrite failed (seq {}): {}", manifest.seq, e),
                     }
+                    crate::command::persistence::AOF_REWRITE_IN_PROGRESS
+                        .store(false, std::sync::atomic::Ordering::SeqCst);
                 }
                 Ok(AofMessage::RewriteSharded(shard_dbs)) => {
                     if !write_error {
@@ -272,6 +274,8 @@ pub async fn aof_writer_task(
                         }
                         Err(e) => error!("AOF rewrite failed (seq {}): {}", manifest.seq, e),
                     }
+                    crate::command::persistence::AOF_REWRITE_IN_PROGRESS
+                        .store(false, std::sync::atomic::Ordering::SeqCst);
                 }
             }
         }
@@ -306,6 +310,8 @@ pub async fn aof_writer_task(
                         if let Err(e) = rewrite_aof(db, &aof_path).await {
                             error!("AOF rewrite failed: {}", e);
                         }
+                        crate::command::persistence::AOF_REWRITE_IN_PROGRESS
+                            .store(false, std::sync::atomic::Ordering::SeqCst);
 
                         // Reopen file after rewrite (it was replaced)
                         let reopen_result: Result<tokio::fs::File, _> = tokio::fs::OpenOptions::new()
@@ -329,6 +335,8 @@ pub async fn aof_writer_task(
                         if let Err(e) = rewrite_aof_sharded_sync(&shard_dbs, &aof_path) {
                             error!("AOF rewrite (sharded) failed: {}", e);
                         }
+                        crate::command::persistence::AOF_REWRITE_IN_PROGRESS
+                            .store(false, std::sync::atomic::Ordering::SeqCst);
                         let reopen_result: Result<tokio::fs::File, _> = tokio::fs::OpenOptions::new()
                             .create(true).append(true).open(&aof_path).await;
                         match reopen_result {

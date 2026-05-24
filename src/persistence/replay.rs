@@ -1,6 +1,100 @@
 use crate::protocol::Frame;
 use crate::storage::Database;
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::command::DispatchResult;
+    use crate::framevec;
+
+    fn make_db_with_key(key: &[u8], value: &[u8]) -> Database {
+        let mut db = Database::new();
+        let mut selected = 0usize;
+        let args = framevec![
+            Frame::BulkString(bytes::Bytes::copy_from_slice(key)),
+            Frame::BulkString(bytes::Bytes::copy_from_slice(value)),
+        ];
+        let _ = crate::command::dispatch(&mut db, b"SET", &args, &mut selected, 16);
+        db
+    }
+
+    fn get_key(db: &mut Database, key: &[u8]) -> Option<bytes::Bytes> {
+        let mut selected = 0usize;
+        let args = framevec![Frame::BulkString(bytes::Bytes::copy_from_slice(key))];
+        match crate::command::dispatch(db, b"GET", &args, &mut selected, 16) {
+            DispatchResult::Response(Frame::BulkString(v)) => Some(v),
+            _ => None,
+        }
+    }
+
+    // ── SWAPDB replay intercept ───────────────────────────────────────────────
+
+    /// SWAPDB during WAL replay must exchange the two databases.
+    #[test]
+    fn replay_swapdb_exchanges_databases() {
+        let engine = DispatchReplayEngine::new();
+        let mut databases = vec![
+            make_db_with_key(b"key_a", b"val_a"), // db-0
+            make_db_with_key(b"key_b", b"val_b"), // db-1
+        ];
+        let mut selected = 0usize;
+        let args = framevec![
+            Frame::BulkString(bytes::Bytes::from_static(b"0")),
+            Frame::BulkString(bytes::Bytes::from_static(b"1")),
+        ];
+        engine.replay_command(&mut databases, b"SWAPDB", &args, &mut selected);
+
+        // After swap: db-0 has key_b, db-1 has key_a.
+        assert_eq!(
+            get_key(&mut databases[0], b"key_b").as_deref(),
+            Some(b"val_b".as_ref()),
+            "db-0 should have key_b after SWAPDB replay"
+        );
+        assert_eq!(
+            get_key(&mut databases[1], b"key_a").as_deref(),
+            Some(b"val_a".as_ref()),
+            "db-1 should have key_a after SWAPDB replay"
+        );
+    }
+
+    /// Same-index SWAPDB is a no-op during replay.
+    #[test]
+    fn replay_swapdb_same_index_noop() {
+        let engine = DispatchReplayEngine::new();
+        let mut databases = vec![make_db_with_key(b"mykey", b"myval"), Database::new()];
+        let mut selected = 0usize;
+        let args = framevec![
+            Frame::BulkString(bytes::Bytes::from_static(b"0")),
+            Frame::BulkString(bytes::Bytes::from_static(b"0")),
+        ];
+        engine.replay_command(&mut databases, b"SWAPDB", &args, &mut selected);
+        assert_eq!(
+            get_key(&mut databases[0], b"mykey").as_deref(),
+            Some(b"myval".as_ref()),
+            "db-0 should be unchanged after same-index SWAPDB replay"
+        );
+    }
+
+    /// Out-of-range SWAPDB silently skips during replay (no panic).
+    #[test]
+    fn replay_swapdb_out_of_range_skips() {
+        let engine = DispatchReplayEngine::new();
+        let mut databases = vec![make_db_with_key(b"mykey", b"myval"), Database::new()];
+        let mut selected = 0usize;
+        let args = framevec![
+            Frame::BulkString(bytes::Bytes::from_static(b"0")),
+            Frame::BulkString(bytes::Bytes::from_static(b"99")),
+        ];
+        // Must not panic.
+        engine.replay_command(&mut databases, b"SWAPDB", &args, &mut selected);
+        assert_eq!(
+            get_key(&mut databases[0], b"mykey").as_deref(),
+            Some(b"myval".as_ref()),
+            "db-0 should be unchanged after out-of-range SWAPDB replay"
+        );
+    }
+}
+
 /// Trait that abstracts command dispatch for AOF/WAL replay.
 ///
 /// This decouples persistence replay from `command::dispatch`, allowing
@@ -114,6 +208,33 @@ impl CommandReplayEngine for DispatchReplayEngine {
                 }
                 return;
             }
+        }
+
+        // SWAPDB requires access to the full database slice — intercept before
+        // calling `command::dispatch` which only sees a single `&mut Database`.
+        if cmd.eq_ignore_ascii_case(b"SWAPDB") {
+            let a = args.first().and_then(|f| match f {
+                Frame::BulkString(b) => std::str::from_utf8(b).ok()?.parse::<usize>().ok(),
+                Frame::Integer(n) => usize::try_from(*n).ok(),
+                _ => None,
+            });
+            let b_idx = args.get(1).and_then(|f| match f {
+                Frame::BulkString(b) => std::str::from_utf8(b).ok()?.parse::<usize>().ok(),
+                Frame::Integer(n) => usize::try_from(*n).ok(),
+                _ => None,
+            });
+            match (a, b_idx) {
+                (Some(a), Some(b)) if a != b && a < databases.len() && b < databases.len() => {
+                    let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+                    // Split the slice to get two non-overlapping mutable references.
+                    let (left, right) = databases.split_at_mut(lo + 1);
+                    std::mem::swap(&mut left[lo], &mut right[hi - lo - 1]);
+                }
+                _ => {
+                    // Out-of-range or same-index — silently skip (same as Redis).
+                }
+            }
+            return;
         }
 
         let db_count = databases.len();
