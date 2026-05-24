@@ -12,6 +12,7 @@ use crate::cluster::slots::slot_for_key;
 use crate::cluster::{ClusterNode, ClusterState, ClusterStatus, NodeFlags};
 use crate::framevec;
 use crate::protocol::Frame;
+
 /// Entry point: dispatch CLUSTER <subcommand> [args...] to the correct handler.
 ///
 /// Returns a Frame response, or Frame::Error if the subcommand is unknown or args invalid.
@@ -44,6 +45,7 @@ pub fn handle_cluster_command(
         b"RESET" => handle_cluster_reset(&args[1..], cluster_state, self_addr),
         b"REPLICATE" => handle_cluster_replicate(&args[1..], cluster_state),
         b"FAILOVER" => handle_cluster_failover(&args[1..], cluster_state),
+        b"REPLICAS" | b"SLAVES" => handle_cluster_replicas(&args[1..], cluster_state),
         _ => Frame::Error(Bytes::from(format!(
             "ERR unknown subcommand '{}' for CLUSTER",
             String::from_utf8_lossy(&subcmd_upper)
@@ -90,58 +92,101 @@ pub fn handle_cluster_myid(cs: &Arc<RwLock<ClusterState>>) -> Frame {
     Frame::BulkString(Bytes::from(state.node_id.clone()))
 }
 
+/// Format a single node description line in Redis CLUSTER NODES wire format.
+///
+/// Format: `<node-id> <ip>:<port>@<bus-port> <flags> <master-id> <ping-sent> <pong-recv> <epoch> <link-state> <slot-ranges>`
+///
+/// No trailing newline — callers add `\n` for CLUSTER NODES (bulk-string concat) or
+/// wrap in `Frame::BulkString` directly for CLUSTER REPLICAS (array of strings).
+fn format_node_line(node: &ClusterNode, self_node_id: &str) -> String {
+    let flags_str = if node.node_id == self_node_id {
+        // self: prepend "myself,"
+        match &node.flags {
+            NodeFlags::Master => "myself,master".to_string(),
+            NodeFlags::Replica { master_id } => format!("myself,slave {}", master_id),
+            NodeFlags::Pfail => "myself,pfail".to_string(),
+            NodeFlags::Fail => "myself,fail".to_string(),
+        }
+    } else {
+        match &node.flags {
+            NodeFlags::Master => "master".to_string(),
+            NodeFlags::Replica { master_id } => format!("slave {}", master_id),
+            NodeFlags::Pfail => "pfail".to_string(),
+            NodeFlags::Fail => "fail".to_string(),
+        }
+    };
+
+    let master_id_field = match &node.flags {
+        NodeFlags::Replica { master_id } => master_id.clone(),
+        _ => "-".to_string(),
+    };
+
+    let slot_ranges = bitmap_to_ranges(&node.slots);
+    let link_state = if matches!(node.flags, NodeFlags::Fail) {
+        "disconnected"
+    } else {
+        "connected"
+    };
+
+    format!(
+        "{} {}:{}@{} {} {} {} {} {} {} {}",
+        node.node_id,
+        node.addr.ip(),
+        node.addr.port(),
+        node.bus_port,
+        flags_str,
+        master_id_field,
+        node.ping_sent_ms,
+        node.pong_recv_ms,
+        node.epoch,
+        link_state,
+        slot_ranges
+    )
+}
+
 /// CLUSTER NODES -- one line per known node in nodes.conf format:
 /// `<node-id> <ip>:<port>@<bus-port> <flags> <master-id> <ping-sent> <pong-recv> <epoch> <link-state> <slot-ranges>`
 pub fn handle_cluster_nodes(cs: &Arc<RwLock<ClusterState>>, _self_addr: SocketAddr) -> Frame {
     let state = cs.read().unwrap();
     let mut output = String::new();
     for node in state.nodes.values() {
-        let flags_str = if node.node_id == state.node_id {
-            // self: prepend "myself,"
-            match &node.flags {
-                NodeFlags::Master => "myself,master".to_string(),
-                NodeFlags::Replica { master_id } => format!("myself,slave {}", master_id),
-                NodeFlags::Pfail => "myself,pfail".to_string(),
-                NodeFlags::Fail => "myself,fail".to_string(),
-            }
-        } else {
-            match &node.flags {
-                NodeFlags::Master => "master".to_string(),
-                NodeFlags::Replica { master_id } => format!("slave {}", master_id),
-                NodeFlags::Pfail => "pfail".to_string(),
-                NodeFlags::Fail => "fail".to_string(),
-            }
-        };
-
-        let master_id_field = match &node.flags {
-            NodeFlags::Replica { master_id } => master_id.clone(),
-            _ => "-".to_string(),
-        };
-
-        // Build slot ranges from bitmap
-        let slot_ranges = bitmap_to_ranges(&node.slots);
-        let link_state = if matches!(node.flags, NodeFlags::Fail) {
-            "disconnected"
-        } else {
-            "connected"
-        };
-
-        output.push_str(&format!(
-            "{} {}:{}@{} {} {} {} {} {} {} {}\n",
-            node.node_id,
-            node.addr.ip(),
-            node.addr.port(),
-            node.bus_port,
-            flags_str,
-            master_id_field,
-            node.ping_sent_ms,
-            node.pong_recv_ms,
-            node.epoch,
-            link_state,
-            slot_ranges
-        ));
+        output.push_str(&format_node_line(node, &state.node_id));
+        output.push('\n');
     }
     Frame::BulkString(Bytes::from(output))
+}
+
+/// CLUSTER REPLICAS <node-id> / CLUSTER SLAVES <node-id>
+///
+/// Returns an array of CLUSTER NODES-format lines, one per replica of the given master.
+/// Empty array if the master has no replicas.
+/// `ERR Unknown node <id>` if the node-id is not known to this cluster.
+///
+/// SLAVES is the deprecated alias; both subcommands dispatch here.
+pub fn handle_cluster_replicas(args: &[Frame], cs: &Arc<RwLock<ClusterState>>) -> Frame {
+    if args.is_empty() {
+        return Frame::Error(Bytes::from_static(
+            b"ERR wrong number of arguments for CLUSTER REPLICAS",
+        ));
+    }
+    let target_id = extract_string(&args[0]);
+
+    let state = cs.read().unwrap();
+
+    // ERR if the requested node-id is not in the cluster.
+    if !state.nodes.contains_key(&target_id) {
+        return Frame::Error(Bytes::from(format!("ERR Unknown node {}", target_id)));
+    }
+
+    // Collect all nodes whose flags mark them as replicas of target_id.
+    let lines: Vec<Frame> = state
+        .nodes
+        .values()
+        .filter(|n| matches!(&n.flags, NodeFlags::Replica { master_id } if master_id == &target_id))
+        .map(|n| Frame::BulkString(Bytes::from(format_node_line(n, &state.node_id))))
+        .collect();
+
+    Frame::Array(lines.into())
 }
 
 /// CLUSTER SLOTS -- return nested array: [start, end, [master-ip, master-port, master-id], [replica...]]
@@ -354,7 +399,12 @@ pub fn handle_cluster_reset(
     cs: &Arc<RwLock<ClusterState>>,
     _self_addr: SocketAddr,
 ) -> Frame {
-    let hard = args.first().map(|a| matches!(a, Frame::BulkString(b) | Frame::SimpleString(b) if b.eq_ignore_ascii_case(b"hard"))).unwrap_or(false);
+    let hard = args
+        .first()
+        .map(|a| {
+            matches!(a, Frame::BulkString(b) | Frame::SimpleString(b) if b.eq_ignore_ascii_case(b"hard"))
+        })
+        .unwrap_or(false);
     let mut state = cs.write().unwrap();
     let my_id = state.node_id.clone();
     // Clear slots on my node
@@ -789,5 +839,187 @@ mod tests {
             "expected WaitingDelay state, got {:?}",
             state.failover_state
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // T2.4: CLUSTER REPLICAS / SLAVES
+    // -------------------------------------------------------------------------
+
+    /// Build a ClusterState with one master ("a"×40, self) and two replicas of it.
+    fn make_cs_with_replicas() -> (Arc<RwLock<ClusterState>>, String, String, String) {
+        let master_id = "a".repeat(40);
+        let replica1_id = "c".repeat(40);
+        let replica2_id = "d".repeat(40);
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 6379);
+        let cs = Arc::new(RwLock::new(ClusterState::new(master_id.clone(), addr)));
+        {
+            let mut state = cs.write().unwrap();
+            let r1 = ClusterNode::new(
+                replica1_id.clone(),
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 6380),
+                NodeFlags::Replica {
+                    master_id: master_id.clone(),
+                },
+                0,
+            );
+            let r2 = ClusterNode::new(
+                replica2_id.clone(),
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 6381),
+                NodeFlags::Replica {
+                    master_id: master_id.clone(),
+                },
+                0,
+            );
+            state.nodes.insert(replica1_id.clone(), r1);
+            state.nodes.insert(replica2_id.clone(), r2);
+        }
+        (cs, master_id, replica1_id, replica2_id)
+    }
+
+    /// T2.4-a: Empty array when master has no replicas.
+    #[test]
+    fn cluster_replicas_returns_empty_for_master_with_no_replicas() {
+        let cs = make_cs(); // single-node, no replicas
+        let my_id = cs.read().unwrap().node_id.clone();
+        let args = vec![Frame::BulkString(bytes::Bytes::from(my_id))];
+        let result = handle_cluster_replicas(&args, &cs);
+        match result {
+            Frame::Array(items) => assert!(
+                items.is_empty(),
+                "expected empty array, got {} items",
+                items.len()
+            ),
+            other => panic!("expected Array, got {:?}", other),
+        }
+    }
+
+    /// T2.4-b: Array with one BulkString per replica, each containing ≥9 fields, no trailing newline.
+    #[test]
+    fn cluster_replicas_lists_replicas() {
+        let (cs, master_id, replica1_id, replica2_id) = make_cs_with_replicas();
+        let args = vec![Frame::BulkString(bytes::Bytes::from(master_id))];
+        let result = handle_cluster_replicas(&args, &cs);
+        match result {
+            Frame::Array(items) => {
+                assert_eq!(items.len(), 2, "expected 2 replicas");
+                let mut seen_ids = std::collections::HashSet::new();
+                for item in &*items {
+                    let line = match item {
+                        Frame::BulkString(b) => String::from_utf8(b.to_vec()).unwrap(),
+                        other => panic!("expected BulkString element, got {:?}", other),
+                    };
+                    assert!(
+                        !line.ends_with('\n'),
+                        "line must not end with newline: {:?}",
+                        line
+                    );
+                    let fields: Vec<&str> = line.split_whitespace().collect();
+                    assert!(
+                        fields.len() >= 9,
+                        "expected >= 9 fields, got {}: {}",
+                        fields.len(),
+                        line
+                    );
+                    seen_ids.insert(fields[0].to_string());
+                }
+                assert!(seen_ids.contains(&replica1_id), "replica1 not in result");
+                assert!(seen_ids.contains(&replica2_id), "replica2 not in result");
+            }
+            other => panic!("expected Array, got {:?}", other),
+        }
+    }
+
+    /// T2.4-c: ERR Unknown node for non-existent master-id.
+    #[test]
+    fn cluster_replicas_rejects_unknown_node_id() {
+        let cs = make_cs();
+        let unknown = "f".repeat(40);
+        let args = vec![Frame::BulkString(bytes::Bytes::from(unknown.clone()))];
+        let result = handle_cluster_replicas(&args, &cs);
+        match result {
+            Frame::Error(msg) => {
+                let s = String::from_utf8_lossy(&msg);
+                assert!(
+                    s.contains("Unknown node"),
+                    "expected 'Unknown node' in error, got: {}",
+                    s
+                );
+                assert!(s.contains(&unknown), "error should include the node id");
+            }
+            other => panic!("expected Error, got {:?}", other),
+        }
+    }
+
+    /// T2.4-d: SLAVES is an alias for REPLICAS (same length result via dispatch).
+    #[test]
+    fn cluster_slaves_is_alias_for_replicas() {
+        let (cs, master_id, _, _) = make_cs_with_replicas();
+        let replicas_result = handle_cluster_command(
+            &[
+                Frame::BulkString(bytes::Bytes::from_static(b"REPLICAS")),
+                Frame::BulkString(bytes::Bytes::from(master_id.clone())),
+            ],
+            &cs,
+            "127.0.0.1:6379".parse().unwrap(),
+        );
+        let slaves_result = handle_cluster_command(
+            &[
+                Frame::BulkString(bytes::Bytes::from_static(b"SLAVES")),
+                Frame::BulkString(bytes::Bytes::from(master_id.clone())),
+            ],
+            &cs,
+            "127.0.0.1:6379".parse().unwrap(),
+        );
+        let replicas_len = match &replicas_result {
+            Frame::Array(v) => v.len(),
+            other => panic!("REPLICAS: expected Array, got {:?}", other),
+        };
+        let slaves_len = match &slaves_result {
+            Frame::Array(v) => v.len(),
+            other => panic!("SLAVES: expected Array, got {:?}", other),
+        };
+        assert_eq!(
+            replicas_len, slaves_len,
+            "REPLICAS and SLAVES must return same number of elements"
+        );
+    }
+
+    /// T2.4-e: Self appears with "myself," prefix when self is one of the replicas.
+    #[test]
+    fn cluster_replicas_includes_myself_marker_when_self_is_replica() {
+        let master_id = "b".repeat(40);
+        let my_id = "a".repeat(40);
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 6379);
+        let cs = Arc::new(RwLock::new(ClusterState::new(my_id.clone(), addr)));
+        {
+            let mut state = cs.write().unwrap();
+            state.my_node_mut().flags = NodeFlags::Replica {
+                master_id: master_id.clone(),
+            };
+            let master = ClusterNode::new(
+                master_id.clone(),
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 6380),
+                NodeFlags::Master,
+                1,
+            );
+            state.nodes.insert(master_id.clone(), master);
+        }
+        let args = vec![Frame::BulkString(bytes::Bytes::from(master_id))];
+        let result = handle_cluster_replicas(&args, &cs);
+        match result {
+            Frame::Array(items) => {
+                assert_eq!(items.len(), 1, "expected exactly 1 replica (self)");
+                let line = match &items[0] {
+                    Frame::BulkString(b) => String::from_utf8(b.to_vec()).unwrap(),
+                    other => panic!("expected BulkString, got {:?}", other),
+                };
+                assert!(
+                    line.contains("myself,"),
+                    "expected 'myself,' prefix in line: {}",
+                    line
+                );
+            }
+            other => panic!("expected Array, got {:?}", other),
+        }
     }
 }
