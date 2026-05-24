@@ -545,11 +545,14 @@ assert_both "TOUCH missing" TOUCH edge:nomiss
 # ===========================================================================
 log "=== SWAPDB ==="
 
-# Seed: db0 has swapkey=hello, db1 is empty
-both SELECT 0
-both SET swapkey hello
-both SELECT 1
-both DEL swapkey
+# Seed: db0 has swapkey=hello, db1 is empty.
+# Use explicit `-n <db>` per invocation — `redis-cli SELECT` does NOT persist
+# across separate process invocations, so the previous `both SELECT 1; both
+# DEL swapkey` deleted from db0 (the just-seeded key) instead of db1.
+redis-cli -p "$PORT_REDIS" -n 0 SET swapkey hello >/dev/null
+redis-cli -p "$PORT_RUST"  -n 0 SET swapkey hello >/dev/null
+redis-cli -p "$PORT_REDIS" -n 1 DEL swapkey >/dev/null
+redis-cli -p "$PORT_RUST"  -n 1 DEL swapkey >/dev/null
 
 # SWAPDB 0 1 — swaps databases 0 and 1
 assert_both "SWAPDB 0 1" SWAPDB 0 1
@@ -566,13 +569,19 @@ assert_eq "SWAPDB: key absent from db0" "$redis_db0_gone" "$rust_db0_gone"
 # Same-index SWAPDB is a no-op; must return OK (not error)
 assert_both "SWAPDB 0 0 (same-index no-op)" SWAPDB 0 0
 
-# Out-of-range indices must return ERR (not panic)
+# Out-of-range indices must return ERR (not panic) — assert parity with Redis,
+# not just that moon emits *some* ERR. The previous check ignored $redis_oor,
+# so a divergence (e.g. moon ERR + Redis OK, or different error wording class)
+# would silently pass.
 redis_oor=$(redis-cli -p "$PORT_REDIS" SWAPDB 0 9999 2>&1) || true
 rust_oor=$(redis-cli -p "$PORT_RUST" SWAPDB 0 9999 2>&1) || true
-if echo "$rust_oor" | grep -qi "ERR"; then
+if echo "$redis_oor" | grep -qi "ERR" && echo "$rust_oor" | grep -qi "ERR"; then
     PASS=$((PASS + 1))
 else
-    FAIL=$((FAIL + 1)); echo "  FAIL: SWAPDB out-of-range should return ERR, got: $rust_oor"
+    FAIL=$((FAIL + 1))
+    echo "  FAIL: SWAPDB out-of-range parity"
+    echo "    redis: $redis_oor"
+    echo "    rust:  $rust_oor"
 fi
 
 # Swap back to restore state for remaining tests

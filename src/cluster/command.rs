@@ -100,20 +100,25 @@ pub fn handle_cluster_myid(cs: &Arc<RwLock<ClusterState>>) -> Frame {
 /// No trailing newline — callers add `\n` for CLUSTER NODES (bulk-string concat) or
 /// wrap in `Frame::BulkString` directly for CLUSTER REPLICAS (array of strings).
 fn format_node_line(node: &ClusterNode, self_node_id: &str) -> String {
+    // CLUSTER NODES flags field is a comma-separated keyword list — never
+    // includes the master-id (that goes in its own column below). Including
+    // master_id here previously produced a malformed line with master_id
+    // appearing twice (once inside flags, once in the dedicated column),
+    // which broke whitespace-tokenized parsers (e.g. redis-cli's own line
+    // splitter). Reference: Redis CLUSTER NODES format spec.
     let flags_str = if node.node_id == self_node_id {
-        // self: prepend "myself,"
         match &node.flags {
-            NodeFlags::Master => "myself,master".to_string(),
-            NodeFlags::Replica { master_id } => format!("myself,slave {}", master_id),
-            NodeFlags::Pfail => "myself,pfail".to_string(),
-            NodeFlags::Fail => "myself,fail".to_string(),
+            NodeFlags::Master => "myself,master",
+            NodeFlags::Replica { .. } => "myself,slave",
+            NodeFlags::Pfail => "myself,pfail",
+            NodeFlags::Fail => "myself,fail",
         }
     } else {
         match &node.flags {
-            NodeFlags::Master => "master".to_string(),
-            NodeFlags::Replica { master_id } => format!("slave {}", master_id),
-            NodeFlags::Pfail => "pfail".to_string(),
-            NodeFlags::Fail => "fail".to_string(),
+            NodeFlags::Master => "master",
+            NodeFlags::Replica { .. } => "slave",
+            NodeFlags::Pfail => "pfail",
+            NodeFlags::Fail => "fail",
         }
     };
 
@@ -922,34 +927,84 @@ mod tests {
         }
     }
 
-    /// T2.4-b: Array with one BulkString per replica, each containing ≥9 fields.
+    /// T2.4-b: Array with one BulkString per replica, each containing exactly
+    /// 9 fields and the correct replica-row layout.
+    ///
+    /// Pinned columns (whitespace-tokenized):
+    ///   [0] node-id            (40 hex chars)
+    ///   [1] ip:port@bus
+    ///   [2] flags              (== "slave" for non-self replica)
+    ///   [3] master-id          (40 hex chars, the master being replicated)
+    ///   [4] ping-sent
+    ///   [5] pong-recv
+    ///   [6] epoch
+    ///   [7] link-state
+    ///   [8] slot-ranges        ("-" for replicas, never empty)
+    ///
+    /// This guards against the previous bug where `format_node_line` embedded
+    /// the master-id inside the flags field, producing "slave <master_id>" and
+    /// shifting every subsequent column right by one.
     #[test]
     fn cluster_replicas_lists_replicas() {
         let (cs, master_id, replica1_id, replica2_id) = make_cs_with_replicas();
-        let args = vec![Frame::BulkString(bytes::Bytes::from(master_id))];
+        let args = vec![Frame::BulkString(bytes::Bytes::from(master_id.clone()))];
         let result = handle_cluster_replicas(&args, &cs);
         match result {
             Frame::Array(items) => {
                 assert_eq!(items.len(), 2, "expected 2 replicas");
-                // Gather node-ids from the returned lines
                 let mut seen_ids = std::collections::HashSet::new();
                 for item in &*items {
                     let line = match item {
                         Frame::BulkString(b) => String::from_utf8(b.to_vec()).unwrap(),
                         other => panic!("expected BulkString element, got {:?}", other),
                     };
-                    // Must not have trailing newline
                     assert!(
                         !line.ends_with('\n'),
                         "line must not end with newline: {:?}",
                         line
                     );
                     let fields: Vec<&str> = line.split_whitespace().collect();
-                    assert!(
-                        fields.len() >= 9,
-                        "expected >= 9 fields, got {}: {}",
+                    // Exactly the pinned columns above; slot-ranges renders
+                    // as "-" for replicas (no slot ownership), so we expect
+                    // exactly 9 whitespace-separated tokens. If
+                    // `format_node_line` ever re-embeds master_id inside the
+                    // flags column, this would become 10 — which is the
+                    // signal we want to lock down.
+                    assert_eq!(
                         fields.len(),
+                        9,
+                        "wrong column count (would silently regress if flags \
+                         re-embed master_id): {:?}",
                         line
+                    );
+                    // flags column must be exactly "slave" — NOT "slave <hex40>".
+                    assert_eq!(
+                        fields[2], "slave",
+                        "flags column must be 'slave', got '{}': {:?}",
+                        fields[2], line
+                    );
+                    // master-id column must be the 40-char master id of the
+                    // node being replicated, NOT empty and NOT a copy of any
+                    // other field.
+                    assert_eq!(
+                        fields[3].len(),
+                        40,
+                        "master-id column must be 40 hex chars: {:?}",
+                        line
+                    );
+                    assert_eq!(
+                        fields[3], master_id,
+                        "master-id column must match the master being queried: {:?}",
+                        line
+                    );
+                    // master-id must appear exactly once on the line (the bug
+                    // duplicated it: once in flags, once in its own column).
+                    let occurrences = line.matches(master_id.as_str()).count();
+                    assert_eq!(
+                        occurrences, 1,
+                        "master-id must appear exactly once on the line, found \
+                         {} occurrences: {:?}",
+                        occurrences, line
                     );
                     seen_ids.insert(fields[0].to_string());
                 }
