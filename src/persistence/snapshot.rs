@@ -566,25 +566,24 @@ pub fn read_snapshot_metadata(path: &Path) -> Result<SnapshotMeta, MoonError> {
         buf[11], buf[12], buf[13], buf[14], buf[15], buf[16], buf[17], buf[18],
     ]);
     // V2 and V3 share the same preamble layout (LSN + timestamp after epoch).
-    let (last_lsn, created_at_unix_ms) = if version == SHARD_RDB_VERSION_V2
-        || version == SHARD_RDB_VERSION_V3
-    {
-        if n < 35 {
-            return Err(SnapshotError::Corrupted {
-                detail: format!("v2 snapshot header truncated: {} bytes", n),
+    let (last_lsn, created_at_unix_ms) =
+        if version == SHARD_RDB_VERSION_V2 || version == SHARD_RDB_VERSION_V3 {
+            if n < 35 {
+                return Err(SnapshotError::Corrupted {
+                    detail: format!("v2 snapshot header truncated: {} bytes", n),
+                }
+                .into());
             }
-            .into());
-        }
-        let lsn = u64::from_le_bytes([
-            buf[19], buf[20], buf[21], buf[22], buf[23], buf[24], buf[25], buf[26],
-        ]);
-        let ts = u64::from_le_bytes([
-            buf[27], buf[28], buf[29], buf[30], buf[31], buf[32], buf[33], buf[34],
-        ]);
-        (lsn, ts)
-    } else {
-        (0u64, 0u64)
-    };
+            let lsn = u64::from_le_bytes([
+                buf[19], buf[20], buf[21], buf[22], buf[23], buf[24], buf[25], buf[26],
+            ]);
+            let ts = u64::from_le_bytes([
+                buf[27], buf[28], buf[29], buf[30], buf[31], buf[32], buf[33], buf[34],
+            ]);
+            (lsn, ts)
+        } else {
+            (0u64, 0u64)
+        };
     Ok(SnapshotMeta {
         version,
         shard_id,
@@ -716,27 +715,26 @@ pub fn shard_snapshot_load(databases: &mut [Database], path: &Path) -> Result<us
     // v2 extra fields: last_lsn + created_at_unix_ms. v1 snapshots leave these
     // implicit zeros — recovery treats `last_lsn = 0` as "replay all WAL from
     // origin", which is the lossless fallback for legacy files.
-    let (_last_lsn, _created_at_unix_ms) = if on_disk_version == SHARD_RDB_VERSION_V2
-        || on_disk_version == SHARD_RDB_VERSION_V3
-    {
-        let mut lsn_buf = [0u8; 8];
-        cursor
-            .read_exact(&mut lsn_buf)
-            .map_err(|e| SnapshotError::Io {
-                path: path.to_path_buf(),
-                source: e,
-            })?;
-        let mut ts_buf = [0u8; 8];
-        cursor
-            .read_exact(&mut ts_buf)
-            .map_err(|e| SnapshotError::Io {
-                path: path.to_path_buf(),
-                source: e,
-            })?;
-        (u64::from_le_bytes(lsn_buf), u64::from_le_bytes(ts_buf))
-    } else {
-        (0u64, 0u64)
-    };
+    let (_last_lsn, _created_at_unix_ms) =
+        if on_disk_version == SHARD_RDB_VERSION_V2 || on_disk_version == SHARD_RDB_VERSION_V3 {
+            let mut lsn_buf = [0u8; 8];
+            cursor
+                .read_exact(&mut lsn_buf)
+                .map_err(|e| SnapshotError::Io {
+                    path: path.to_path_buf(),
+                    source: e,
+                })?;
+            let mut ts_buf = [0u8; 8];
+            cursor
+                .read_exact(&mut ts_buf)
+                .map_err(|e| SnapshotError::Io {
+                    path: path.to_path_buf(),
+                    source: e,
+                })?;
+            (u64::from_le_bytes(lsn_buf), u64::from_le_bytes(ts_buf))
+        } else {
+            (0u64, 0u64)
+        };
 
     let now_ms = current_time_ms();
     let mut total_keys = 0usize;

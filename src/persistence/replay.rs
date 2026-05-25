@@ -75,11 +75,7 @@ fn replay_expiry_to_abs_ms(kind: &[u8], when: u64, now_ms: u64) -> u64 {
 /// command verb. The optional NX/XX/GT/LT token is ignored on replay — the
 /// recorded TTL value is the authority (the writer already evaluated the
 /// gate before recording the entry).
-fn replay_hexpire_family(
-    db: &mut Database,
-    cmd: &[u8],
-    args: &[Frame],
-) -> Option<()> {
+fn replay_hexpire_family(db: &mut Database, cmd: &[u8], args: &[Frame]) -> Option<()> {
     let key = frame_as_bytes(args.first()?)?;
     let when = frame_as_u64(args.get(1)?)?;
 

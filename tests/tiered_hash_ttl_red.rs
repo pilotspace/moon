@@ -78,7 +78,7 @@ fn test_tiered_serde_partial_ttls_in_hash() {
             assert_eq!(fields.len(), 2);
             assert_eq!(ttls.len(), 1);
             assert_eq!(ttls.get(b"hot".as_ref()), Some(&1_700_000_000_000u64));
-            assert!(ttls.get(b"cold".as_ref()).is_none());
+            assert!(!ttls.contains_key(b"cold".as_ref()));
         }
         other => panic!("expected HashWithTtl, got {:?}", other.encoding_name()),
     }

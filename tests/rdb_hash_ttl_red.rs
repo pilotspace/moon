@@ -35,8 +35,10 @@ fn test_rdb_save_and_load_preserves_field_ttls() {
 
     let exp1 = db.now_ms() + 60_000;
     let exp2 = db.now_ms() + 120_000;
-    db.hash_set_field_ttl(b"h1", b"f1", exp1, HashTtlCond::Always).unwrap();
-    db.hash_set_field_ttl(b"h1", b"f2", exp2, HashTtlCond::Always).unwrap();
+    db.hash_set_field_ttl(b"h1", b"f1", exp1, HashTtlCond::Always)
+        .unwrap();
+    db.hash_set_field_ttl(b"h1", b"f2", exp2, HashTtlCond::Always)
+        .unwrap();
 
     // Save → bytes
     let dbs = vec![db];
@@ -58,7 +60,8 @@ fn test_rdb_roundtrip_preserves_field_values_alongside_ttls() {
     let mut db = Database::new();
     make_hash_key(&mut db, b"h", &[(b"k1", b"hello"), (b"k2", b"world")]);
     let exp = db.now_ms() + 5_000;
-    db.hash_set_field_ttl(b"h", b"k1", exp, HashTtlCond::Always).unwrap();
+    db.hash_set_field_ttl(b"h", b"k1", exp, HashTtlCond::Always)
+        .unwrap();
 
     let dbs = vec![db];
     let buf = save_to_bytes(&dbs).unwrap();
@@ -70,10 +73,19 @@ fn test_rdb_roundtrip_preserves_field_values_alongside_ttls() {
     let entry = data.get(b"h".as_ref()).expect("key h present");
     match entry.value.as_redis_value() {
         moon::storage::compact_value::RedisValueRef::HashWithTtl { fields, .. } => {
-            assert_eq!(fields.get(b"k1".as_ref()).map(|v| v.as_ref()), Some(b"hello".as_ref()));
-            assert_eq!(fields.get(b"k2".as_ref()).map(|v| v.as_ref()), Some(b"world".as_ref()));
+            assert_eq!(
+                fields.get(b"k1".as_ref()).map(|v| v.as_ref()),
+                Some(b"hello".as_ref())
+            );
+            assert_eq!(
+                fields.get(b"k2".as_ref()).map(|v| v.as_ref()),
+                Some(b"world".as_ref())
+            );
         }
-        other => panic!("expected HashWithTtl after roundtrip, got {:?}", other.encoding_name()),
+        other => panic!(
+            "expected HashWithTtl after roundtrip, got {:?}",
+            other.encoding_name()
+        ),
     }
 }
 
@@ -95,9 +107,14 @@ fn test_rdb_plain_hash_roundtrips_without_ttls() {
 #[test]
 fn test_rdb_mixed_ttl_and_no_ttl_fields_in_same_hash() {
     let mut db = Database::new();
-    make_hash_key(&mut db, b"mix", &[(b"hot", b"1"), (b"cold", b"2"), (b"warm", b"3")]);
+    make_hash_key(
+        &mut db,
+        b"mix",
+        &[(b"hot", b"1"), (b"cold", b"2"), (b"warm", b"3")],
+    );
     let exp = db.now_ms() + 30_000;
-    db.hash_set_field_ttl(b"mix", b"hot", exp, HashTtlCond::Always).unwrap();
+    db.hash_set_field_ttl(b"mix", b"hot", exp, HashTtlCond::Always)
+        .unwrap();
     // `cold` and `warm` remain TTL-less.
 
     let dbs = vec![db];
@@ -117,8 +134,10 @@ fn test_rdb_multiple_hashes_each_keep_own_ttl_map() {
     make_hash_key(&mut db, b"h_b", &[(b"f", b"b")]);
     let exp_a = db.now_ms() + 1_000;
     let exp_b = db.now_ms() + 999_000;
-    db.hash_set_field_ttl(b"h_a", b"f", exp_a, HashTtlCond::Always).unwrap();
-    db.hash_set_field_ttl(b"h_b", b"f", exp_b, HashTtlCond::Always).unwrap();
+    db.hash_set_field_ttl(b"h_a", b"f", exp_a, HashTtlCond::Always)
+        .unwrap();
+    db.hash_set_field_ttl(b"h_b", b"f", exp_b, HashTtlCond::Always)
+        .unwrap();
 
     let dbs = vec![db];
     let buf = save_to_bytes(&dbs).unwrap();

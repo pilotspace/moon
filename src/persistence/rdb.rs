@@ -330,20 +330,21 @@ pub fn load(databases: &mut [Database], path: &Path) -> Result<usize, MoonError>
                     .into());
                 }
             }
-            type_tag => match read_entry_zero_copy(&mut cursor, type_tag, now_secs, has_hash_ttl_trailer) {
-                Ok((key, entry)) => {
-                    if entry.has_expiry() && entry.is_expired_at(now_secs, now_ms) {
-                        continue;
+            type_tag => {
+                match read_entry_zero_copy(&mut cursor, type_tag, now_secs, has_hash_ttl_trailer) {
+                    Ok((key, entry)) => {
+                        if entry.has_expiry() && entry.is_expired_at(now_secs, now_ms) {
+                            continue;
+                        }
+                        if current_db < db_count {
+                            temp_dbs[current_db].insert_for_load(key, entry);
+                            total_keys += 1;
+                        }
                     }
-                    if current_db < db_count {
-                        temp_dbs[current_db].insert_for_load(key, entry);
-                        total_keys += 1;
-                    }
-                }
-                Err(e) => {
-                    // Do NOT swap partially-loaded temp_dbs into live databases.
-                    // A corrupted-but-checksummed RDB must not commit partial state.
-                    return Err(RdbError::Corrupted {
+                    Err(e) => {
+                        // Do NOT swap partially-loaded temp_dbs into live databases.
+                        // A corrupted-but-checksummed RDB must not commit partial state.
+                        return Err(RdbError::Corrupted {
                         detail: format!(
                             "RDB load: corrupted entry at offset {}: {}. {} keys loaded before failure.",
                             cursor.position(),
@@ -352,8 +353,9 @@ pub fn load(databases: &mut [Database], path: &Path) -> Result<usize, MoonError>
                         ),
                     }
                     .into());
+                    }
                 }
-            },
+            }
         }
     }
 
@@ -926,18 +928,19 @@ pub fn load_from_bytes(
                     .into());
                 }
             }
-            type_tag => match read_entry_zero_copy(&mut cursor, type_tag, now_secs, has_hash_ttl_trailer) {
-                Ok((key, entry)) => {
-                    if entry.has_expiry() && entry.is_expired_at(now_secs, now_ms) {
-                        continue;
+            type_tag => {
+                match read_entry_zero_copy(&mut cursor, type_tag, now_secs, has_hash_ttl_trailer) {
+                    Ok((key, entry)) => {
+                        if entry.has_expiry() && entry.is_expired_at(now_secs, now_ms) {
+                            continue;
+                        }
+                        if current_db < db_count {
+                            temp_dbs[current_db].insert_for_load(key, entry);
+                            total_keys += 1;
+                        }
                     }
-                    if current_db < db_count {
-                        temp_dbs[current_db].insert_for_load(key, entry);
-                        total_keys += 1;
-                    }
-                }
-                Err(e) => {
-                    return Err(RdbError::Corrupted {
+                    Err(e) => {
+                        return Err(RdbError::Corrupted {
                         detail: format!(
                             "RDB preamble: corrupted entry at offset {}: {}. {} keys loaded before failure.",
                             cursor.position(),
@@ -946,8 +949,9 @@ pub fn load_from_bytes(
                         ),
                     }
                     .into());
+                    }
                 }
-            },
+            }
         }
     }
 
