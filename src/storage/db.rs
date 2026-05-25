@@ -377,6 +377,109 @@ impl Database {
         had_ttl
     }
 
+    /// Clear the TTL sidecar entries for every field in `fields`. For plain
+    /// `Hash` and `HashListpack` this is a no-op (they carry no TTLs).
+    /// For `HashWithTtl`, removes the sidecar entry for each field; downgrades
+    /// to plain `Hash` when the last TTL is removed.
+    ///
+    /// Called by HSET / HMSET when they overwrite a field: the new write
+    /// unconditionally persists the field (Valkey semantics — HSET clears TTL).
+    pub fn hash_clear_field_ttls<F>(&mut self, key: &[u8], fields: &[F])
+    where
+        F: AsRef<[u8]>,
+    {
+        let Some(entry) = self.data.get_mut(key) else {
+            return;
+        };
+        let Some(rv) = entry.value.as_redis_value_mut() else {
+            return;
+        };
+        let RedisValue::HashWithTtl { fields: _, ttls } = rv else {
+            // Plain Hash or HashListpack carries no per-field TTLs.
+            return;
+        };
+        for f in fields {
+            ttls.remove(f.as_ref());
+        }
+        if ttls.is_empty() {
+            // Downgrade: borrow ends, then re-borrow to swap variant.
+            let Some(rv2) = entry.value.as_redis_value_mut() else {
+                return;
+            };
+            if let RedisValue::HashWithTtl { fields: fmap, .. } = rv2 {
+                let m = std::mem::take(fmap);
+                *rv2 = RedisValue::Hash(m);
+            }
+        }
+    }
+
+    /// Remove a single field from a hash, cleaning up the TTL sidecar when
+    /// present.  Returns `(removed, hash_now_empty)`:
+    /// - `removed = true` if the field existed and was deleted.
+    /// - `hash_now_empty = true` if the hash has no more fields after deletion.
+    ///
+    /// Returns `Err(wrongtype_error())` if the key is not a hash.
+    /// Returns `Ok((false, false))` for a missing key.
+    pub fn hash_delete_field(&mut self, key: &[u8], field: &[u8]) -> Result<(bool, bool), Frame> {
+        let Some(entry) = self.data.get_mut(key) else {
+            return Ok((false, false));
+        };
+        let Some(rv) = entry.value.as_redis_value_mut() else {
+            return Err(Self::wrongtype_error());
+        };
+        match rv {
+            RedisValue::Hash(map) => {
+                let removed = map.remove(field).is_some();
+                let empty = map.is_empty();
+                Ok((removed, empty))
+            }
+            RedisValue::HashListpack(lp) => {
+                // Locate field among pairs, remove both field + value entries.
+                let mut found_idx: Option<usize> = None;
+                for (i, (f, _)) in lp.iter_pairs().enumerate() {
+                    if f.as_bytes() == field {
+                        found_idx = Some(i);
+                        break;
+                    }
+                }
+                if let Some(i) = found_idx {
+                    // Each pair occupies two listpack slots: field at 2*i, value at 2*i+1.
+                    // Remove value first (higher index) then field to keep indices stable.
+                    lp.remove_at(i * 2 + 1);
+                    lp.remove_at(i * 2);
+                    let empty = lp.is_empty();
+                    Ok((true, empty))
+                } else {
+                    Ok((false, false))
+                }
+            }
+            RedisValue::HashWithTtl { fields, ttls } => {
+                let removed = fields.remove(field).is_some();
+                if removed {
+                    ttls.remove(field);
+                    if ttls.is_empty() && !fields.is_empty() {
+                        // All TTLs gone but fields remain — downgrade to plain Hash.
+                        let m = std::mem::take(fields);
+                        *rv = RedisValue::Hash(m);
+                        return Ok((true, false));
+                    } else if ttls.is_empty() && fields.is_empty() {
+                        // Both maps empty — signal caller to delete the key.
+                        // We leave the (now-empty) HashWithTtl in place; the
+                        // caller will call db.remove() to drop the key.
+                        let m = std::mem::take(fields);
+                        *rv = RedisValue::Hash(m);
+                        return Ok((true, true));
+                    }
+                    let empty = fields.is_empty();
+                    Ok((true, empty))
+                } else {
+                    Ok((false, false))
+                }
+            }
+            _ => Err(Self::wrongtype_error()),
+        }
+    }
+
     /// Estimated memory usage of all entries in this database.
     pub fn estimated_memory(&self) -> usize {
         self.used_memory
@@ -782,6 +885,10 @@ impl Database {
         }
         match entry.value.as_redis_value_mut() {
             Some(RedisValue::Hash(map)) => Ok(map),
+            // HashWithTtl: the fields sub-map is a plain HashMap<Bytes, Bytes>.
+            // HSET/HMSET/HINCRBY must be able to mutate it directly; they never
+            // touch the ttls sidecar, which is managed by the HEXPIRE family.
+            Some(RedisValue::HashWithTtl { fields, .. }) => Ok(fields),
             _ => Err(Self::wrongtype_error()),
         }
     }
@@ -808,6 +915,11 @@ impl Database {
             None => Ok(None),
             Some(entry) => match entry.value.as_redis_value() {
                 RedisValueRef::Hash(map) => Ok(Some(map)),
+                // HashWithTtl: expose the fields sub-map for reads.  Callers
+                // (HGET, HMGET, HKEYS, HVALS, HGETALL, etc.) see the HashMap
+                // directly; expired-field filtering happens in hash_field_state
+                // or via the active-expiry tick, not on every read.
+                RedisValueRef::HashWithTtl { fields, .. } => Ok(Some(fields)),
                 _ => Err(Self::wrongtype_error()),
             },
         }
@@ -1010,7 +1122,9 @@ impl Database {
         let entry = self.data.get_mut(key).unwrap();
         match entry.value.as_redis_value_mut() {
             Some(RedisValue::HashListpack(lp)) => Ok(Some(lp)),
-            Some(RedisValue::Hash(_)) => Ok(None),
+            // Plain HashMap or TTL-extended hash: caller falls through to the
+            // HashMap path.  TTL'd hashes never compact back to listpack.
+            Some(RedisValue::Hash(_)) | Some(RedisValue::HashWithTtl { .. }) => Ok(None),
             _ => Err(Self::wrongtype_error()),
         }
     }

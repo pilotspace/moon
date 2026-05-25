@@ -472,4 +472,386 @@ mod tests {
         let result = hgetall(&mut db, &args);
         assert!(matches!(result, Frame::Error(ref e) if e.starts_with(b"WRONGTYPE")));
     }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // Phase 196 — HEXPIRE / HPEXPIRE / HEXPIREAT / HPEXPIREAT write commands.
+    // RED tests; will go GREEN once handlers + HashWithTtl-aware HSET land.
+    // ──────────────────────────────────────────────────────────────────────────
+
+    fn seed_hash(db: &mut Database, key: &[u8], pairs: &[(&[u8], &[u8])]) {
+        let mut args: Vec<&[u8]> = vec![key];
+        for (f, v) in pairs {
+            args.push(f);
+            args.push(v);
+        }
+        let frames = make_args(&args);
+        let r = hset(db, &frames);
+        assert!(matches!(r, Frame::Integer(_)), "seed hset must succeed");
+    }
+
+    #[test]
+    fn test_hexpire_sets_ttl_on_existing_field() {
+        let mut db = Database::new();
+        seed_hash(&mut db, b"h", &[(b"f", b"v")]);
+        let args = make_args(&[b"h", b"3600", b"FIELDS", b"1", b"f"]);
+        let r = hexpire(&mut db, &args);
+        assert_eq!(r, Frame::Array(framevec![Frame::Integer(1)]));
+        assert!(db.hash_get_field_ttl_ms(b"h", b"f").is_some());
+    }
+
+    #[test]
+    fn test_hexpire_returns_zero_on_missing_field() {
+        let mut db = Database::new();
+        seed_hash(&mut db, b"h", &[(b"f", b"v")]);
+        let args = make_args(&[b"h", b"60", b"FIELDS", b"1", b"nope"]);
+        let r = hexpire(&mut db, &args);
+        assert_eq!(r, Frame::Array(framevec![Frame::Integer(0)]));
+    }
+
+    #[test]
+    fn test_hexpire_returns_neg2_when_nx_and_ttl_exists() {
+        let mut db = Database::new();
+        seed_hash(&mut db, b"h", &[(b"f", b"v")]);
+        let args = make_args(&[b"h", b"60", b"FIELDS", b"1", b"f"]);
+        assert_eq!(
+            hexpire(&mut db, &args),
+            Frame::Array(framevec![Frame::Integer(1)])
+        );
+
+        let args = make_args(&[b"h", b"120", b"NX", b"FIELDS", b"1", b"f"]);
+        let r = hexpire(&mut db, &args);
+        assert_eq!(r, Frame::Array(framevec![Frame::Integer(-2)]));
+    }
+
+    #[test]
+    fn test_hexpire_returns_neg2_when_xx_and_no_ttl() {
+        let mut db = Database::new();
+        seed_hash(&mut db, b"h", &[(b"f", b"v")]);
+        let args = make_args(&[b"h", b"60", b"XX", b"FIELDS", b"1", b"f"]);
+        let r = hexpire(&mut db, &args);
+        assert_eq!(r, Frame::Array(framevec![Frame::Integer(-2)]));
+    }
+
+    #[test]
+    fn test_hexpire_returns_neg2_when_gt_and_new_lt_current() {
+        let mut db = Database::new();
+        seed_hash(&mut db, b"h", &[(b"f", b"v")]);
+        // Seed a 1-hour TTL.
+        let args = make_args(&[b"h", b"3600", b"FIELDS", b"1", b"f"]);
+        assert_eq!(
+            hexpire(&mut db, &args),
+            Frame::Array(framevec![Frame::Integer(1)])
+        );
+        // GT with a smaller TTL should be rejected.
+        let args = make_args(&[b"h", b"60", b"GT", b"FIELDS", b"1", b"f"]);
+        let r = hexpire(&mut db, &args);
+        assert_eq!(r, Frame::Array(framevec![Frame::Integer(-2)]));
+    }
+
+    #[test]
+    fn test_hexpire_returns_neg2_when_lt_and_new_gt_current() {
+        let mut db = Database::new();
+        seed_hash(&mut db, b"h", &[(b"f", b"v")]);
+        let args = make_args(&[b"h", b"60", b"FIELDS", b"1", b"f"]);
+        assert_eq!(
+            hexpire(&mut db, &args),
+            Frame::Array(framevec![Frame::Integer(1)])
+        );
+        let args = make_args(&[b"h", b"3600", b"LT", b"FIELDS", b"1", b"f"]);
+        let r = hexpire(&mut db, &args);
+        assert_eq!(r, Frame::Array(framevec![Frame::Integer(-2)]));
+    }
+
+    #[test]
+    fn test_hexpireat_returns_two_when_expiry_in_past() {
+        let mut db = Database::new();
+        seed_hash(&mut db, b"h", &[(b"f", b"v")]);
+        // 1970-01-01T00:00:01 — guaranteed in the past.
+        let args = make_args(&[b"h", b"1", b"FIELDS", b"1", b"f"]);
+        let r = hexpireat(&mut db, &args);
+        assert_eq!(r, Frame::Array(framevec![Frame::Integer(2)]));
+        // Field must be gone.
+        let r = hget(&mut db, &make_args(&[b"h", b"f"]));
+        assert_eq!(r, Frame::Null);
+    }
+
+    #[test]
+    fn test_hexpire_wrong_type_returns_wrongtype() {
+        let mut db = Database::new();
+        db.set_string(Bytes::from_static(b"s"), Bytes::from_static(b"x"));
+        let args = make_args(&[b"s", b"60", b"FIELDS", b"1", b"f"]);
+        let r = hexpire(&mut db, &args);
+        assert!(matches!(r, Frame::Error(ref e) if e.starts_with(b"WRONGTYPE")));
+    }
+
+    #[test]
+    fn test_hexpire_missing_key_returns_zero_per_field() {
+        let mut db = Database::new();
+        let args = make_args(&[b"nokey", b"60", b"FIELDS", b"2", b"a", b"b"]);
+        let r = hexpire(&mut db, &args);
+        assert_eq!(
+            r,
+            Frame::Array(framevec![Frame::Integer(0), Frame::Integer(0)])
+        );
+    }
+
+    #[test]
+    fn test_hexpire_numfields_mismatch_returns_error() {
+        let mut db = Database::new();
+        seed_hash(&mut db, b"h", &[(b"f", b"v")]);
+        // numfields says 2 but only 1 field name follows.
+        let args = make_args(&[b"h", b"60", b"FIELDS", b"2", b"f"]);
+        let r = hexpire(&mut db, &args);
+        assert!(matches!(r, Frame::Error(_)), "got {:?}", r);
+    }
+
+    #[test]
+    fn test_hexpire_nx_xx_conflict_returns_error() {
+        let mut db = Database::new();
+        seed_hash(&mut db, b"h", &[(b"f", b"v")]);
+        let args = make_args(&[b"h", b"60", b"NX", b"XX", b"FIELDS", b"1", b"f"]);
+        let r = hexpire(&mut db, &args);
+        assert!(matches!(r, Frame::Error(_)), "got {:?}", r);
+    }
+
+    #[test]
+    fn test_hexpire_numfields_zero_returns_error() {
+        let mut db = Database::new();
+        seed_hash(&mut db, b"h", &[(b"f", b"v")]);
+        let args = make_args(&[b"h", b"60", b"FIELDS", b"0"]);
+        let r = hexpire(&mut db, &args);
+        assert!(matches!(r, Frame::Error(_)), "got {:?}", r);
+    }
+
+    #[test]
+    fn test_hpexpire_millisecond_precision() {
+        let mut db = Database::new();
+        seed_hash(&mut db, b"h", &[(b"f", b"v")]);
+        let now = db.now_ms();
+        let args = make_args(&[b"h", b"123456", b"FIELDS", b"1", b"f"]);
+        let r = hpexpire(&mut db, &args);
+        assert_eq!(r, Frame::Array(framevec![Frame::Integer(1)]));
+        let got = db.hash_get_field_ttl_ms(b"h", b"f").expect("ttl set");
+        // Should be approximately now + 123456 ms.
+        assert!(
+            (got as i128 - (now as i128 + 123456)).abs() < 100,
+            "expected ~{} got {}",
+            now + 123456,
+            got
+        );
+    }
+
+    #[test]
+    fn test_hexpireat_absolute_seconds() {
+        let mut db = Database::new();
+        seed_hash(&mut db, b"h", &[(b"f", b"v")]);
+        // Far future: 2099-01-01 ≈ 4_070_908_800 seconds.
+        let args = make_args(&[b"h", b"4070908800", b"FIELDS", b"1", b"f"]);
+        let r = hexpireat(&mut db, &args);
+        assert_eq!(r, Frame::Array(framevec![Frame::Integer(1)]));
+        assert_eq!(
+            db.hash_get_field_ttl_ms(b"h", b"f"),
+            Some(4_070_908_800_u64 * 1000)
+        );
+    }
+
+    #[test]
+    fn test_hpexpireat_absolute_millis() {
+        let mut db = Database::new();
+        seed_hash(&mut db, b"h", &[(b"f", b"v")]);
+        let abs_ms = 4_070_908_800_000_u64;
+        let s = abs_ms.to_string();
+        let args = make_args(&[b"h", s.as_bytes(), b"FIELDS", b"1", b"f"]);
+        let r = hpexpireat(&mut db, &args);
+        assert_eq!(r, Frame::Array(framevec![Frame::Integer(1)]));
+        assert_eq!(db.hash_get_field_ttl_ms(b"h", b"f"), Some(abs_ms));
+    }
+
+    // ── HSET / HSETNX / HMSET / HDEL / HINCRBY on HashWithTtl ────────────────
+
+    #[test]
+    fn test_hset_works_on_ttl_encoded_hash() {
+        let mut db = Database::new();
+        seed_hash(&mut db, b"h", &[(b"a", b"1")]);
+        // Promote to HashWithTtl via HEXPIRE.
+        let args = make_args(&[b"h", b"60", b"FIELDS", b"1", b"a"]);
+        assert_eq!(
+            hexpire(&mut db, &args),
+            Frame::Array(framevec![Frame::Integer(1)])
+        );
+        // HSET on a different field should work — currently regresses to WRONGTYPE pre-fix.
+        let r = hset(&mut db, &make_args(&[b"h", b"b", b"2"]));
+        assert_eq!(r, Frame::Integer(1));
+        assert_eq!(
+            hget(&mut db, &make_args(&[b"h", b"b"])),
+            Frame::BulkString(Bytes::from_static(b"2"))
+        );
+    }
+
+    #[test]
+    fn test_hset_clears_ttl_on_overwrite() {
+        let mut db = Database::new();
+        seed_hash(&mut db, b"h", &[(b"a", b"1"), (b"b", b"2")]);
+        // Set TTLs on both fields.
+        assert_eq!(
+            hexpire(
+                &mut db,
+                &make_args(&[b"h", b"60", b"FIELDS", b"2", b"a", b"b"])
+            ),
+            Frame::Array(framevec![Frame::Integer(1), Frame::Integer(1)])
+        );
+        // Overwrite 'a' via HSET → its TTL must be cleared.
+        let r = hset(&mut db, &make_args(&[b"h", b"a", b"NEW"]));
+        assert_eq!(r, Frame::Integer(0));
+        assert_eq!(db.hash_get_field_ttl_ms(b"h", b"a"), None);
+        // 'b' TTL must still be intact.
+        assert!(db.hash_get_field_ttl_ms(b"h", b"b").is_some());
+    }
+
+    #[test]
+    fn test_hset_clears_ttl_downgrades_when_last() {
+        let mut db = Database::new();
+        seed_hash(&mut db, b"h", &[(b"a", b"1")]);
+        assert_eq!(
+            hexpire(&mut db, &make_args(&[b"h", b"60", b"FIELDS", b"1", b"a"])),
+            Frame::Array(framevec![Frame::Integer(1)])
+        );
+        // Overwrite the only TTL'd field; storage should downgrade to plain Hash.
+        hset(&mut db, &make_args(&[b"h", b"a", b"NEW"]));
+        // No TTL anywhere. HEXPIRE with XX must return -2 (no current TTL).
+        let r = hexpire(
+            &mut db,
+            &make_args(&[b"h", b"60", b"XX", b"FIELDS", b"1", b"a"]),
+        );
+        assert_eq!(r, Frame::Array(framevec![Frame::Integer(-2)]));
+    }
+
+    #[test]
+    fn test_hsetnx_works_on_ttl_encoded_hash() {
+        let mut db = Database::new();
+        seed_hash(&mut db, b"h", &[(b"a", b"1")]);
+        assert_eq!(
+            hexpire(&mut db, &make_args(&[b"h", b"60", b"FIELDS", b"1", b"a"])),
+            Frame::Array(framevec![Frame::Integer(1)])
+        );
+        // HSETNX a new field should succeed without WRONGTYPE.
+        let r = hsetnx(&mut db, &make_args(&[b"h", b"b", b"2"]));
+        assert_eq!(r, Frame::Integer(1));
+    }
+
+    #[test]
+    fn test_hsetnx_does_not_clear_ttl_when_field_exists() {
+        let mut db = Database::new();
+        seed_hash(&mut db, b"h", &[(b"a", b"1")]);
+        assert_eq!(
+            hexpire(&mut db, &make_args(&[b"h", b"60", b"FIELDS", b"1", b"a"])),
+            Frame::Array(framevec![Frame::Integer(1)])
+        );
+        // HSETNX on existing field — must NOT overwrite, must NOT clear TTL.
+        let r = hsetnx(&mut db, &make_args(&[b"h", b"a", b"NEW"]));
+        assert_eq!(r, Frame::Integer(0));
+        assert!(db.hash_get_field_ttl_ms(b"h", b"a").is_some());
+    }
+
+    #[test]
+    fn test_hmset_works_on_ttl_encoded_hash() {
+        let mut db = Database::new();
+        seed_hash(&mut db, b"h", &[(b"a", b"1")]);
+        assert_eq!(
+            hexpire(&mut db, &make_args(&[b"h", b"60", b"FIELDS", b"1", b"a"])),
+            Frame::Array(framevec![Frame::Integer(1)])
+        );
+        // HMSET should not WRONGTYPE.
+        let r = hmset(&mut db, &make_args(&[b"h", b"b", b"2", b"c", b"3"]));
+        assert!(matches!(r, Frame::SimpleString(ref s) if s.as_ref() == b"OK"));
+    }
+
+    #[test]
+    fn test_hmset_clears_ttl_on_overwrite() {
+        let mut db = Database::new();
+        seed_hash(&mut db, b"h", &[(b"a", b"1")]);
+        assert_eq!(
+            hexpire(&mut db, &make_args(&[b"h", b"60", b"FIELDS", b"1", b"a"])),
+            Frame::Array(framevec![Frame::Integer(1)])
+        );
+        hmset(&mut db, &make_args(&[b"h", b"a", b"NEW"]));
+        assert_eq!(db.hash_get_field_ttl_ms(b"h", b"a"), None);
+    }
+
+    #[test]
+    fn test_hdel_works_on_ttl_encoded_hash() {
+        let mut db = Database::new();
+        seed_hash(&mut db, b"h", &[(b"a", b"1"), (b"b", b"2")]);
+        assert_eq!(
+            hexpire(&mut db, &make_args(&[b"h", b"60", b"FIELDS", b"1", b"a"])),
+            Frame::Array(framevec![Frame::Integer(1)])
+        );
+        // HDEL on non-TTL'd field must work, not WRONGTYPE.
+        let r = hdel(&mut db, &make_args(&[b"h", b"b"]));
+        assert_eq!(r, Frame::Integer(1));
+    }
+
+    #[test]
+    fn test_hdel_removes_ttl_sidecar_entry() {
+        let mut db = Database::new();
+        seed_hash(&mut db, b"h", &[(b"a", b"1"), (b"b", b"2")]);
+        assert_eq!(
+            hexpire(
+                &mut db,
+                &make_args(&[b"h", b"60", b"FIELDS", b"2", b"a", b"b"])
+            ),
+            Frame::Array(framevec![Frame::Integer(1), Frame::Integer(1)])
+        );
+        // Delete 'a' — its TTL entry must also be removed.
+        hdel(&mut db, &make_args(&[b"h", b"a"]));
+        assert_eq!(db.hash_get_field_ttl_ms(b"h", b"a"), None);
+        // 'b' TTL still present.
+        assert!(db.hash_get_field_ttl_ms(b"h", b"b").is_some());
+    }
+
+    #[test]
+    fn test_hdel_downgrades_when_last_ttl_removed() {
+        let mut db = Database::new();
+        seed_hash(&mut db, b"h", &[(b"a", b"1"), (b"b", b"2")]);
+        assert_eq!(
+            hexpire(&mut db, &make_args(&[b"h", b"60", b"FIELDS", b"1", b"a"])),
+            Frame::Array(framevec![Frame::Integer(1)])
+        );
+        hdel(&mut db, &make_args(&[b"h", b"a"]));
+        // No TTLs left — encoding should downgrade to plain Hash. Indirect check:
+        // HEXPIRE with XX on the surviving field must return -2 (no TTL).
+        let r = hexpire(
+            &mut db,
+            &make_args(&[b"h", b"60", b"XX", b"FIELDS", b"1", b"b"]),
+        );
+        assert_eq!(r, Frame::Array(framevec![Frame::Integer(-2)]));
+    }
+
+    #[test]
+    fn test_hincrby_preserves_ttl() {
+        let mut db = Database::new();
+        seed_hash(&mut db, b"h", &[(b"c", b"10")]);
+        assert_eq!(
+            hexpire(&mut db, &make_args(&[b"h", b"60", b"FIELDS", b"1", b"c"])),
+            Frame::Array(framevec![Frame::Integer(1)])
+        );
+        let ttl_before = db.hash_get_field_ttl_ms(b"h", b"c");
+        let r = hincrby(&mut db, &make_args(&[b"h", b"c", b"5"]));
+        assert_eq!(r, Frame::Integer(15));
+        assert_eq!(db.hash_get_field_ttl_ms(b"h", b"c"), ttl_before);
+    }
+
+    #[test]
+    fn test_hincrbyfloat_preserves_ttl() {
+        let mut db = Database::new();
+        seed_hash(&mut db, b"h", &[(b"c", b"10.5")]);
+        assert_eq!(
+            hexpire(&mut db, &make_args(&[b"h", b"60", b"FIELDS", b"1", b"c"])),
+            Frame::Array(framevec![Frame::Integer(1)])
+        );
+        let ttl_before = db.hash_get_field_ttl_ms(b"h", b"c");
+        let r = hincrbyfloat(&mut db, &make_args(&[b"h", b"c", b"1.5"]));
+        assert!(matches!(r, Frame::BulkString(_)));
+        assert_eq!(db.hash_get_field_ttl_ms(b"h", b"c"), ttl_before);
+    }
 }
