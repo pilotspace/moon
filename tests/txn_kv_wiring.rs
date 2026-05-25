@@ -834,12 +834,66 @@ async fn test_txn_abort_multi_key_rollback() {
 // ---------------------------------------------------------------------------
 
 /// A Drop guard that kills and waits for a child process on drop (even on panic).
-struct ChildGuard(std::process::Child);
+/// Also carries a path to the captured stdout/stderr log file so panics can
+/// dump server output for diagnosis (silenced stdio is what made
+/// `test_txn_commit_wal_crash_recovery` an undiagnosable CI flake).
+struct ChildGuard {
+    child: std::process::Child,
+    log: std::path::PathBuf,
+    label: &'static str,
+}
+
+impl ChildGuard {
+    /// Spawn the moon binary with stdout+stderr redirected to a log file in
+    /// `tmp_dir`. Returns a `ChildGuard` that owns the child + the log path.
+    /// `label` distinguishes phase-1 from phase-2 in diagnostic output.
+    fn spawn(
+        binary: &std::path::Path,
+        args: &[&str],
+        tmp_dir: &std::path::Path,
+        label: &'static str,
+    ) -> Self {
+        let log = tmp_dir.join(format!("moon-{label}.log"));
+        let log_file = std::fs::File::create(&log)
+            .unwrap_or_else(|e| panic!("create {label} log file at {log:?}: {e}"));
+        let err_file = log_file
+            .try_clone()
+            .unwrap_or_else(|e| panic!("clone {label} log file handle: {e}"));
+        let child = std::process::Command::new(binary)
+            .args(args)
+            .stdout(std::process::Stdio::from(log_file))
+            .stderr(std::process::Stdio::from(err_file))
+            .spawn()
+            .unwrap_or_else(|e| panic!("spawn moon server ({label}): {e}"));
+        Self { child, log, label }
+    }
+
+    /// Dump the captured server log to test stderr, prefixed with the label.
+    /// No-op if the log file is missing.
+    fn dump_log(&self) {
+        match std::fs::read_to_string(&self.log) {
+            Ok(s) if !s.is_empty() => {
+                eprintln!(
+                    "\n──── moon server log ({}) ────\n{}\n──── end log ────",
+                    self.label, s
+                );
+            }
+            Ok(_) => eprintln!("(moon server log for {} is empty)", self.label),
+            Err(e) => eprintln!("(failed to read moon server log for {}: {})", self.label, e),
+        }
+    }
+
+    /// Best-effort check: has the child process already exited?
+    /// Returns the exit status if so, otherwise `None`.
+    fn poll_exit(&mut self) -> Option<std::process::ExitStatus> {
+        self.child.try_wait().ok().flatten()
+    }
+}
 
 impl Drop for ChildGuard {
     fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 
@@ -907,11 +961,23 @@ fn find_moon_binary() -> Option<std::path::PathBuf> {
 /// Deadline is 60s — generous, but the binary spawn + WAL replay + accept-loop
 /// boot can take >15s on shared CI runners under load (the previous 15s
 /// deadline flaked test_txn_commit_wal_crash_recovery).
-fn connect_redis_with_retry(client: &redis::Client, label: &str) -> redis::Connection {
+fn connect_redis_with_retry(client: &redis::Client, child: &mut ChildGuard) -> redis::Connection {
+    let label = child.label;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     #[allow(unused_assignments)]
     let mut last_err: Option<String> = None;
     loop {
+        // Bail fast if the moon binary exited — no point retrying for 60s when
+        // the server crashed in the first second. Dumps captured stdout/stderr
+        // so the CI log records the actual cause instead of "Connection refused".
+        if let Some(status) = child.poll_exit() {
+            child.dump_log();
+            panic!(
+                "moon server ({label}) exited before accepting RESP traffic: status={status:?}; \
+                 last error: {}",
+                last_err.unwrap_or_else(|| "n/a".into())
+            );
+        }
         match client.get_connection_with_timeout(std::time::Duration::from_secs(2)) {
             Ok(mut conn) => {
                 // Verify the connection is actually serving RESP, not just bound.
@@ -925,6 +991,7 @@ fn connect_redis_with_retry(client: &redis::Client, label: &str) -> redis::Conne
             Err(e) => last_err = Some(format!("connect failed: {e}")),
         }
         if std::time::Instant::now() >= deadline {
+            child.dump_log();
             panic!(
                 "connect to {label} server failed after 60s: {}",
                 last_err.unwrap_or_else(|| "no error captured".into())
@@ -975,32 +1042,35 @@ async fn test_txn_commit_wal_crash_recovery() {
 
     // ---- Phase 1: start server, commit a TXN ----
     let port1 = free_port();
-    let child1 = ChildGuard(
-        std::process::Command::new(&binary)
-            .args([
-                "--port",
-                &port1.to_string(),
-                "--shards",
-                "1",
-                "--dir",
-                tmp_dir.to_str().unwrap(),
-                "--appendonly",
-                "yes",
-            ])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("spawn moon server (phase 1)"),
+    let port1_s = port1.to_string();
+    let tmp_dir_s = tmp_dir.to_str().unwrap().to_string();
+    let mut child1 = ChildGuard::spawn(
+        &binary,
+        &[
+            "--port",
+            &port1_s,
+            "--shards",
+            "1",
+            "--dir",
+            &tmp_dir_s,
+            "--appendonly",
+            "yes",
+        ],
+        &tmp_dir,
+        "phase-1",
     );
 
-    assert!(
-        wait_for_server(port1, std::time::Duration::from_secs(5)),
-        "Moon server (phase 1) did not become ready on port {port1}"
-    );
+    // 15s tolerates a slow CI runner's binary spawn + WAL boot. Server log is
+    // captured in tmp_dir/moon-phase-1.log; `connect_redis_with_retry` dumps
+    // it on timeout, so a hang here turns into a diagnosable failure.
+    if !wait_for_server(port1, std::time::Duration::from_secs(15)) {
+        child1.dump_log();
+        panic!("Moon server (phase 1) did not bind port {port1} within 15s");
+    }
 
     // Connect with sync redis client to avoid holding an async runtime across process boundaries.
     let client1 = redis::Client::open(format!("redis://127.0.0.1:{port1}")).unwrap();
-    let mut sync_conn1 = connect_redis_with_retry(&client1, "phase-1");
+    let mut sync_conn1 = connect_redis_with_retry(&client1, &mut child1);
 
     // Non-TXN baseline (verifies plain AOF replay too)
     let _: String = redis::cmd("SET")
@@ -1084,31 +1154,32 @@ async fn test_txn_commit_wal_crash_recovery() {
 
     // ---- Phase 2: restart server from same persistence dir, verify replay ----
     let port2 = free_port();
-    let _child2 = ChildGuard(
-        std::process::Command::new(&binary)
-            .args([
-                "--port",
-                &port2.to_string(),
-                "--shards",
-                "1",
-                "--dir",
-                tmp_dir.to_str().unwrap(),
-                "--appendonly",
-                "yes",
-            ])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .expect("spawn moon server (phase 2)"),
+    let port2_s = port2.to_string();
+    let mut child2 = ChildGuard::spawn(
+        &binary,
+        &[
+            "--port",
+            &port2_s,
+            "--shards",
+            "1",
+            "--dir",
+            &tmp_dir_s,
+            "--appendonly",
+            "yes",
+        ],
+        &tmp_dir,
+        "phase-2",
     );
 
-    assert!(
-        wait_for_server(port2, std::time::Duration::from_secs(5)),
-        "Moon server (phase 2) did not become ready on port {port2}"
-    );
+    // Replay-on-restart adds variable boot latency on top of the spawn — keep
+    // the 15s tolerance and dump the captured log on timeout.
+    if !wait_for_server(port2, std::time::Duration::from_secs(15)) {
+        child2.dump_log();
+        panic!("Moon server (phase 2) did not bind port {port2} within 15s");
+    }
 
     let client2 = redis::Client::open(format!("redis://127.0.0.1:{port2}")).unwrap();
-    let mut sync_conn2 = connect_redis_with_retry(&client2, "phase-2");
+    let mut sync_conn2 = connect_redis_with_retry(&client2, &mut child2);
 
     // Verify TXN committed value survived server restart via WAL replay.
     let recovered: Option<String> = redis::cmd("GET")
@@ -1131,7 +1202,8 @@ async fn test_txn_commit_wal_crash_recovery() {
         Some("baseline_val"),
         "Non-transactional writes must also survive server restart via AOF replay"
     );
-    // _child2 dropped here — ChildGuard kills server 2.
+    // child2 dropped here — ChildGuard kills server 2.
+    drop(child2);
     // _tmp_guard dropped here — removes temp dir.
 }
 

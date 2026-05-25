@@ -11,6 +11,25 @@ and **Change Data Capture (CDC)**, built additively on top of the existing
 per-shard WAL v3 + dual-root manifest. No changes to the KV hot path, MVCC,
 page format, or transaction layer.
 
+### Fixed — Test infra: txn_kv_wiring flake diagnosis
+
+- `test_txn_commit_wal_crash_recovery` previously masked moon-server crashes
+  as "Connection refused (os error 61) after 60s" because the spawned moon
+  binary's stdout / stderr were piped to `Stdio::null()`. Hardened the
+  child-process harness:
+  - `ChildGuard::spawn` now redirects child stdout/stderr to
+    `moon-phase-{1,2}.log` inside the per-test temp dir.
+  - `ChildGuard::poll_exit` checks `try_wait()` inside the connection retry
+    loop — if the child exited, the test fails immediately with the exit
+    status instead of timing out for a useless 60 s.
+  - `ChildGuard::dump_log` is called on every failure path
+    (`wait_for_server` timeout, `connect_redis_with_retry` timeout,
+    child crash), so the CI log records the actual server output.
+  - `wait_for_server` deadline widened from 5 s → 15 s, matching the
+    realistic CI-runner spawn + WAL boot envelope.
+- No semantic change for the happy path. Future flakes become diagnosable
+  instead of silently retrying for 60 s.
+
 ### Added — Tier 2 Lane A (PR #100)
 
 - **T2.1** `c381b31` — `SWAPDB` cross-shard atomic swap via `ShardMessage::SwapDb`;
