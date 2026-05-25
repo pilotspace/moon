@@ -9,6 +9,7 @@ use crate::command::helpers::{err_wrong_args, extract_bytes};
 /// HGET key field
 ///
 /// Returns the value associated with field in the hash at key, or Null.
+/// Skips fields whose per-field TTL has expired (lazy expiry via `HashRef::WithTtl`).
 pub fn hget(db: &mut Database, args: &[Frame]) -> Frame {
     if args.len() != 2 {
         return err_wrong_args("HGET");
@@ -21,9 +22,10 @@ pub fn hget(db: &mut Database, args: &[Frame]) -> Frame {
         Some(f) => f,
         None => return err_wrong_args("HGET"),
     };
-    match db.get_hash(key) {
-        Ok(Some(map)) => match map.get(field) {
-            Some(v) => Frame::BulkString(v.clone()),
+    let now_ms = db.now_ms();
+    match db.get_hash_ref_if_alive(key, now_ms) {
+        Ok(Some(href)) => match href.get_field(field) {
+            Some(v) => Frame::BulkString(v),
             None => Frame::Null,
         },
         Ok(None) => Frame::Null,
@@ -33,7 +35,7 @@ pub fn hget(db: &mut Database, args: &[Frame]) -> Frame {
 
 /// HMGET key field [field ...]
 ///
-/// Returns values for multiple fields. Null for missing fields.
+/// Returns values for multiple fields. Null for missing or expired fields.
 pub fn hmget(db: &mut Database, args: &[Frame]) -> Frame {
     if args.len() < 2 {
         return err_wrong_args("HMGET");
@@ -42,7 +44,8 @@ pub fn hmget(db: &mut Database, args: &[Frame]) -> Frame {
         Some(k) => k.as_ref(),
         None => return err_wrong_args("HMGET"),
     };
-    let map_opt = match db.get_hash(key) {
+    let now_ms = db.now_ms();
+    let href_opt = match db.get_hash_ref_if_alive(key, now_ms) {
         Ok(m) => m,
         Err(e) => return e,
     };
@@ -55,9 +58,9 @@ pub fn hmget(db: &mut Database, args: &[Frame]) -> Frame {
                 continue;
             }
         };
-        match &map_opt {
-            Some(map) => match map.get(field) {
-                Some(v) => results.push(Frame::BulkString(v.clone())),
+        match &href_opt {
+            Some(href) => match href.get_field(field) {
+                Some(v) => results.push(Frame::BulkString(v)),
                 None => results.push(Frame::Null),
             },
             None => results.push(Frame::Null),
@@ -68,7 +71,8 @@ pub fn hmget(db: &mut Database, args: &[Frame]) -> Frame {
 
 /// HGETALL key
 ///
-/// Returns all field-value pairs as alternating elements in an array.
+/// Returns all live field-value pairs as alternating elements in an array.
+/// Expired fields are omitted.
 pub fn hgetall(db: &mut Database, args: &[Frame]) -> Frame {
     if args.len() != 1 {
         return err_wrong_args("HGETALL");
@@ -77,12 +81,14 @@ pub fn hgetall(db: &mut Database, args: &[Frame]) -> Frame {
         Some(k) => k.as_ref(),
         None => return err_wrong_args("HGETALL"),
     };
-    match db.get_hash(key) {
-        Ok(Some(map)) => {
-            let mut result = Vec::with_capacity(map.len() * 2);
-            for (field, value) in map {
-                result.push(Frame::BulkString(field.clone()));
-                result.push(Frame::BulkString(value.clone()));
+    let now_ms = db.now_ms();
+    match db.get_hash_ref_if_alive(key, now_ms) {
+        Ok(Some(href)) => {
+            let entries = href.entries();
+            let mut result = Vec::with_capacity(entries.len() * 2);
+            for (field, value) in entries {
+                result.push(Frame::BulkString(field));
+                result.push(Frame::BulkString(value));
             }
             Frame::Array(result.into())
         }
@@ -93,7 +99,7 @@ pub fn hgetall(db: &mut Database, args: &[Frame]) -> Frame {
 
 /// HEXISTS key field
 ///
-/// Returns 1 if field exists in hash, 0 otherwise.
+/// Returns 1 if field exists and has not expired, 0 otherwise.
 pub fn hexists(db: &mut Database, args: &[Frame]) -> Frame {
     if args.len() != 2 {
         return err_wrong_args("HEXISTS");
@@ -106,9 +112,10 @@ pub fn hexists(db: &mut Database, args: &[Frame]) -> Frame {
         Some(f) => f,
         None => return err_wrong_args("HEXISTS"),
     };
-    match db.get_hash(key) {
-        Ok(Some(map)) => {
-            if map.contains_key(field) {
+    let now_ms = db.now_ms();
+    match db.get_hash_ref_if_alive(key, now_ms) {
+        Ok(Some(href)) => {
+            if href.get_field(field).is_some() {
                 Frame::Integer(1)
             } else {
                 Frame::Integer(0)
@@ -121,7 +128,10 @@ pub fn hexists(db: &mut Database, args: &[Frame]) -> Frame {
 
 /// HLEN key
 ///
-/// Returns the number of fields in the hash, or 0 if key missing.
+/// Returns the number of live fields in the hash, or 0 if key missing.
+///
+/// O(1) for plain `Hash` and `HashListpack`.
+/// O(N) for `HashWithTtl` (filters expired fields on each call).
 pub fn hlen(db: &mut Database, args: &[Frame]) -> Frame {
     if args.len() != 1 {
         return err_wrong_args("HLEN");
@@ -130,8 +140,9 @@ pub fn hlen(db: &mut Database, args: &[Frame]) -> Frame {
         Some(k) => k.as_ref(),
         None => return err_wrong_args("HLEN"),
     };
-    match db.get_hash(key) {
-        Ok(Some(map)) => Frame::Integer(map.len() as i64),
+    let now_ms = db.now_ms();
+    match db.get_hash_ref_if_alive(key, now_ms) {
+        Ok(Some(href)) => Frame::Integer(href.len() as i64),
         Ok(None) => Frame::Integer(0),
         Err(e) => e,
     }
@@ -139,7 +150,7 @@ pub fn hlen(db: &mut Database, args: &[Frame]) -> Frame {
 
 /// HKEYS key
 ///
-/// Returns all field names in the hash.
+/// Returns all live field names in the hash. Expired fields are omitted.
 pub fn hkeys(db: &mut Database, args: &[Frame]) -> Frame {
     if args.len() != 1 {
         return err_wrong_args("HKEYS");
@@ -148,9 +159,14 @@ pub fn hkeys(db: &mut Database, args: &[Frame]) -> Frame {
         Some(k) => k.as_ref(),
         None => return err_wrong_args("HKEYS"),
     };
-    match db.get_hash(key) {
-        Ok(Some(map)) => {
-            let fields: Vec<Frame> = map.keys().map(|k| Frame::BulkString(k.clone())).collect();
+    let now_ms = db.now_ms();
+    match db.get_hash_ref_if_alive(key, now_ms) {
+        Ok(Some(href)) => {
+            let fields: Vec<Frame> = href
+                .entries()
+                .into_iter()
+                .map(|(k, _)| Frame::BulkString(k))
+                .collect();
             Frame::Array(fields.into())
         }
         Ok(None) => Frame::Array(framevec![]),
@@ -160,7 +176,7 @@ pub fn hkeys(db: &mut Database, args: &[Frame]) -> Frame {
 
 /// HVALS key
 ///
-/// Returns all values in the hash.
+/// Returns all live values in the hash. Values of expired fields are omitted.
 pub fn hvals(db: &mut Database, args: &[Frame]) -> Frame {
     if args.len() != 1 {
         return err_wrong_args("HVALS");
@@ -169,9 +185,14 @@ pub fn hvals(db: &mut Database, args: &[Frame]) -> Frame {
         Some(k) => k.as_ref(),
         None => return err_wrong_args("HVALS"),
     };
-    match db.get_hash(key) {
-        Ok(Some(map)) => {
-            let values: Vec<Frame> = map.values().map(|v| Frame::BulkString(v.clone())).collect();
+    let now_ms = db.now_ms();
+    match db.get_hash_ref_if_alive(key, now_ms) {
+        Ok(Some(href)) => {
+            let values: Vec<Frame> = href
+                .entries()
+                .into_iter()
+                .map(|(_, v)| Frame::BulkString(v))
+                .collect();
             Frame::Array(values.into())
         }
         Ok(None) => Frame::Array(framevec![]),
@@ -181,7 +202,7 @@ pub fn hvals(db: &mut Database, args: &[Frame]) -> Frame {
 
 /// HSCAN key cursor [MATCH pattern] [COUNT count]
 ///
-/// Incrementally iterates hash fields using a cursor.
+/// Incrementally iterates hash fields using a cursor. Expired fields are omitted.
 pub fn hscan(db: &mut Database, args: &[Frame]) -> Frame {
     if args.len() < 2 {
         return err_wrong_args("HSCAN");
@@ -236,11 +257,15 @@ pub fn hscan(db: &mut Database, args: &[Frame]) -> Frame {
         i += 1;
     }
 
-    // Get hash fields (read-only first to collect field names)
-    let map = match db.get_hash(key) {
-        Ok(Some(m)) => m,
+    // Collect live (field, value) pairs; HashRef::entries() filters expired fields.
+    let now_ms = db.now_ms();
+    let entries = match db.get_hash_ref_if_alive(key, now_ms) {
+        Ok(Some(href)) => {
+            let mut e = href.entries();
+            e.sort_by(|a, b| a.0.cmp(&b.0));
+            e
+        }
         Ok(None) => {
-            // Key missing -- return cursor 0 with empty array
             return Frame::Array(framevec![
                 Frame::BulkString(Bytes::from_static(b"0")),
                 Frame::Array(framevec![]),
@@ -249,17 +274,13 @@ pub fn hscan(db: &mut Database, args: &[Frame]) -> Frame {
         Err(e) => return e,
     };
 
-    // Sort fields for deterministic iteration
-    let mut fields: Vec<(&Bytes, &Bytes)> = map.iter().collect();
-    fields.sort_by(|a, b| a.0.cmp(b.0));
-
-    let total = fields.len();
+    let total = entries.len();
     let mut results = Vec::with_capacity(count * 2);
     let mut pos = cursor;
     let mut checked = 0;
 
     while pos < total && checked < count {
-        let (field, value) = fields[pos];
+        let (ref field, ref value) = entries[pos];
         pos += 1;
         checked += 1;
 
@@ -555,6 +576,8 @@ pub fn hscan_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
 // ---------------------------------------------------------------------------
 
 /// HRANDFIELD key [count [WITHVALUES]]
+///
+/// Returns random fields from the hash. Expired fields are never returned.
 pub fn hrandfield(db: &mut Database, args: &[Frame]) -> Frame {
     use rand::seq::IndexedRandom;
     if args.is_empty() || args.len() > 3 {
@@ -564,8 +587,10 @@ pub fn hrandfield(db: &mut Database, args: &[Frame]) -> Frame {
         Some(k) => k.as_ref(),
         None => return err_wrong_args("HRANDFIELD"),
     };
-    let map = match db.get_hash(key) {
-        Ok(Some(m)) => m,
+    // Collect only live (non-expired) entries via HashRef::entries().
+    let now_ms = db.now_ms();
+    let entries = match db.get_hash_ref_if_alive(key, now_ms) {
+        Ok(Some(href)) => href.entries(),
         Ok(None) => {
             return if args.len() == 1 {
                 Frame::Null
@@ -575,20 +600,20 @@ pub fn hrandfield(db: &mut Database, args: &[Frame]) -> Frame {
         }
         Err(e) => return e,
     };
-    if map.is_empty() {
+    if entries.is_empty() {
         return if args.len() == 1 {
             Frame::Null
         } else {
             Frame::Array(framevec![])
         };
     }
-    let fields: Vec<(&Bytes, &Bytes)> = map.iter().collect();
     let mut rng = rand::rng();
     if args.len() == 1 {
-        if let Some((field, _)) = fields.choose(&mut rng) {
-            return Frame::BulkString((*field).clone());
-        }
-        return Frame::Null;
+        return if let Some((field, _)) = entries.choose(&mut rng) {
+            Frame::BulkString(field.clone())
+        } else {
+            Frame::Null
+        };
     }
     let count_bytes = match extract_bytes(&args[1]) {
         Some(b) => b,
@@ -622,40 +647,40 @@ pub fn hrandfield(db: &mut Database, args: &[Frame]) -> Frame {
         return Frame::Array(framevec![]);
     }
     if count > 0 {
-        let n = std::cmp::min(count as usize, fields.len());
-        let indices: Vec<usize> = (0..fields.len()).collect();
+        let n = std::cmp::min(count as usize, entries.len());
+        let indices: Vec<usize> = (0..entries.len()).collect();
         let chosen: Vec<usize> = indices.as_slice().sample(&mut rng, n).copied().collect();
         if with_values {
             let mut result = Vec::with_capacity(n * 2);
             for &idx in &chosen {
-                result.push(Frame::BulkString(fields[idx].0.clone()));
-                result.push(Frame::BulkString(fields[idx].1.clone()));
+                result.push(Frame::BulkString(entries[idx].0.clone()));
+                result.push(Frame::BulkString(entries[idx].1.clone()));
             }
             Frame::Array(result.into())
         } else {
             let result: Vec<Frame> = chosen
                 .iter()
-                .map(|&idx| Frame::BulkString(fields[idx].0.clone()))
+                .map(|&idx| Frame::BulkString(entries[idx].0.clone()))
                 .collect();
             Frame::Array(result.into())
         }
     } else {
-        // Negative count: allow duplicates. Cap to fields.len() to prevent OOM on i64::MIN.
-        let n = std::cmp::min(count.unsigned_abs() as usize, fields.len() * 10);
+        // Negative count: allow duplicates. Cap to entries.len() to prevent OOM on i64::MIN.
+        let n = std::cmp::min(count.unsigned_abs() as usize, entries.len() * 10);
         if with_values {
             let mut result = Vec::with_capacity(n * 2);
             for _ in 0..n {
-                if let Some((field, value)) = fields.choose(&mut rng) {
-                    result.push(Frame::BulkString((*field).clone()));
-                    result.push(Frame::BulkString((*value).clone()));
+                if let Some((field, value)) = entries.choose(&mut rng) {
+                    result.push(Frame::BulkString(field.clone()));
+                    result.push(Frame::BulkString(value.clone()));
                 }
             }
             Frame::Array(result.into())
         } else {
             let mut result = Vec::with_capacity(n);
             for _ in 0..n {
-                if let Some((field, _)) = fields.choose(&mut rng) {
-                    result.push(Frame::BulkString((*field).clone()));
+                if let Some((field, _)) = entries.choose(&mut rng) {
+                    result.push(Frame::BulkString(field.clone()));
                 }
             }
             Frame::Array(result.into())

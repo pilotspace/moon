@@ -10,14 +10,25 @@ use super::listpack::Listpack;
 // Read-only Ref enums for immutable access to compact and full encodings
 // ---------------------------------------------------------------------------
 
-/// Read-only reference to a hash (full HashMap or compact Listpack).
+/// Read-only reference to a hash (full HashMap, compact Listpack, or TTL-enabled HashMap).
+///
+/// The `WithTtl` variant carries `now_ms` so that `get_field`, `len`, and
+/// `entries` can filter expired fields without requiring `&mut Database`.
 pub enum HashRef<'a> {
     Map(&'a HashMap<Bytes, Bytes>),
     Listpack(&'a Listpack),
+    /// Live-filtered view of a `HashWithTtl` entry.  Fields absent from `ttls`
+    /// are immortal; fields present in `ttls` are expired when `ttl <= now_ms`.
+    WithTtl {
+        fields: &'a HashMap<Bytes, Bytes>,
+        ttls: &'a BTreeMap<Bytes, u64>,
+        now_ms: u64,
+    },
 }
 
 impl<'a> HashRef<'a> {
-    /// Look up a single field. Linear scan for listpack, O(1) for HashMap.
+    /// Look up a single field, respecting per-field TTLs.
+    /// Linear scan for Listpack, O(1) for Map/WithTtl.
     pub fn get_field(&self, field: &[u8]) -> Option<Bytes> {
         match self {
             HashRef::Map(map) => map.get(field).cloned(),
@@ -29,24 +40,57 @@ impl<'a> HashRef<'a> {
                 }
                 None
             }
+            HashRef::WithTtl {
+                fields,
+                ttls,
+                now_ms,
+            } => {
+                // Field is expired when its absolute expiry ≤ now_ms.
+                let expired = ttls.get(field).is_some_and(|&t| t <= *now_ms);
+                if expired {
+                    None
+                } else {
+                    fields.get(field).cloned()
+                }
+            }
         }
     }
 
-    /// Number of fields in the hash.
+    /// Number of live fields in the hash.
+    ///
+    /// O(1) for `Map` and `Listpack`.  O(N) for `WithTtl` — acceptable since
+    /// TTL-enabled hashes are rare and HLEN is documented as O(N) for them.
     pub fn len(&self) -> usize {
         match self {
             HashRef::Map(map) => map.len(),
             HashRef::Listpack(lp) => lp.len() / 2,
+            HashRef::WithTtl {
+                fields,
+                ttls,
+                now_ms,
+            } => fields
+                .keys()
+                .filter(|f| ttls.get(*f).map_or(true, |&t| t > *now_ms))
+                .count(),
         }
     }
 
-    /// Return all (field, value) pairs.
+    /// Return all live (field, value) pairs.
     pub fn entries(&self) -> Vec<(Bytes, Bytes)> {
         match self {
             HashRef::Map(map) => map.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
             HashRef::Listpack(lp) => lp
                 .iter_pairs()
                 .map(|(f, v)| (f.to_bytes(), v.to_bytes()))
+                .collect(),
+            HashRef::WithTtl {
+                fields,
+                ttls,
+                now_ms,
+            } => fields
+                .iter()
+                .filter(|(f, _)| ttls.get(*f).map_or(true, |&t| t > *now_ms))
+                .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
         }
     }

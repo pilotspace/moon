@@ -854,4 +854,272 @@ mod tests {
         assert!(matches!(r, Frame::BulkString(_)));
         assert_eq!(db.hash_get_field_ttl_ms(b"h", b"c"), ttl_before);
     }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // Phase 197 — Lazy + active expiration for hash fields with per-field TTL.
+    // RED tests: must FAIL until the helpers + read-command refactor land.
+    // ──────────────────────────────────────────────────────────────────────────
+
+    /// Set an absolute-ms expiry on `field` inside hash at `key`.
+    fn expire_field_at(db: &mut Database, key: &[u8], field: &[u8], abs_ms: u64) {
+        let s = abs_ms.to_string();
+        let r = hpexpireat(db, &make_args(&[key, s.as_bytes(), b"FIELDS", b"1", field]));
+        assert_eq!(
+            r,
+            Frame::Array(framevec![Frame::Integer(1)]),
+            "hpexpireat must succeed for test setup"
+        );
+    }
+
+    #[test]
+    fn test_hget_skips_expired_field() {
+        let mut db = Database::new();
+        seed_hash(&mut db, b"h", &[(b"f", b"v"), (b"alive", b"yes")]);
+        let exp = db.now_ms() + 1_000;
+        expire_field_at(&mut db, b"h", b"f", exp);
+        db.set_cached_now_ms_for_test(exp + 1);
+        assert_eq!(hget(&mut db, &make_args(&[b"h", b"f"])), Frame::Null);
+        assert_eq!(
+            hget(&mut db, &make_args(&[b"h", b"alive"])),
+            Frame::BulkString(Bytes::copy_from_slice(b"yes"))
+        );
+    }
+
+    #[test]
+    fn test_hgetall_omits_expired_fields() {
+        let mut db = Database::new();
+        seed_hash(&mut db, b"h", &[(b"f", b"v"), (b"g", b"w")]);
+        let exp = db.now_ms() + 1_000;
+        expire_field_at(&mut db, b"h", b"f", exp);
+        db.set_cached_now_ms_for_test(exp + 1);
+        let result = hgetall(&mut db, &make_args(&[b"h"]));
+        match result {
+            Frame::Array(ref items) => {
+                let keys: Vec<&[u8]> = items
+                    .iter()
+                    .step_by(2)
+                    .filter_map(|fr| {
+                        if let Frame::BulkString(b) = fr {
+                            Some(b.as_ref())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                assert!(
+                    !keys.iter().any(|s| *s == b"f"),
+                    "expired field must be absent"
+                );
+                assert!(
+                    keys.iter().any(|s| *s == b"g"),
+                    "live field must be present"
+                );
+            }
+            _ => panic!("expected Array from HGETALL"),
+        }
+    }
+
+    #[test]
+    fn test_hexists_returns_zero_for_expired_field() {
+        let mut db = Database::new();
+        seed_hash(&mut db, b"h", &[(b"f", b"v")]);
+        let exp = db.now_ms() + 1_000;
+        expire_field_at(&mut db, b"h", b"f", exp);
+        db.set_cached_now_ms_for_test(exp + 1);
+        assert_eq!(
+            hexists(&mut db, &make_args(&[b"h", b"f"])),
+            Frame::Integer(0)
+        );
+    }
+
+    #[test]
+    fn test_hlen_excludes_expired_fields() {
+        let mut db = Database::new();
+        seed_hash(&mut db, b"h", &[(b"f", b"v"), (b"g", b"w")]);
+        let exp = db.now_ms() + 1_000;
+        expire_field_at(&mut db, b"h", b"f", exp);
+        db.set_cached_now_ms_for_test(exp + 1);
+        assert_eq!(hlen(&mut db, &make_args(&[b"h"])), Frame::Integer(1));
+    }
+
+    #[test]
+    fn test_hmget_returns_nil_for_expired_field() {
+        let mut db = Database::new();
+        seed_hash(&mut db, b"h", &[(b"f", b"v"), (b"g", b"w")]);
+        let exp = db.now_ms() + 1_000;
+        expire_field_at(&mut db, b"h", b"f", exp);
+        db.set_cached_now_ms_for_test(exp + 1);
+        let result = hmget(&mut db, &make_args(&[b"h", b"f", b"g"]));
+        assert_eq!(
+            result,
+            Frame::Array(
+                vec![Frame::Null, Frame::BulkString(Bytes::copy_from_slice(b"w")),].into()
+            )
+        );
+    }
+
+    #[test]
+    fn test_hkeys_omits_expired_fields() {
+        let mut db = Database::new();
+        seed_hash(&mut db, b"h", &[(b"f", b"v"), (b"g", b"w")]);
+        let exp = db.now_ms() + 1_000;
+        expire_field_at(&mut db, b"h", b"f", exp);
+        db.set_cached_now_ms_for_test(exp + 1);
+        let result = hkeys(&mut db, &make_args(&[b"h"]));
+        match result {
+            Frame::Array(ref items) => {
+                let found: Vec<&[u8]> = items
+                    .iter()
+                    .filter_map(|fr| {
+                        if let Frame::BulkString(b) = fr {
+                            Some(b.as_ref())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                assert!(!found.iter().any(|s| *s == b"f"));
+                assert!(found.iter().any(|s| *s == b"g"));
+            }
+            _ => panic!("expected Array from HKEYS"),
+        }
+    }
+
+    #[test]
+    fn test_hvals_omits_expired_fields() {
+        let mut db = Database::new();
+        seed_hash(&mut db, b"h", &[(b"f", b"v"), (b"g", b"w")]);
+        let exp = db.now_ms() + 1_000;
+        expire_field_at(&mut db, b"h", b"f", exp);
+        db.set_cached_now_ms_for_test(exp + 1);
+        let result = hvals(&mut db, &make_args(&[b"h"]));
+        match result {
+            Frame::Array(ref items) => {
+                let vals: Vec<&[u8]> = items
+                    .iter()
+                    .filter_map(|fr| {
+                        if let Frame::BulkString(b) = fr {
+                            Some(b.as_ref())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                assert!(
+                    !vals.iter().any(|s| *s == b"v"),
+                    "expired value must be absent"
+                );
+                assert!(
+                    vals.iter().any(|s| *s == b"w"),
+                    "live value must be present"
+                );
+            }
+            _ => panic!("expected Array from HVALS"),
+        }
+    }
+
+    #[test]
+    fn test_hscan_omits_expired_fields() {
+        let mut db = Database::new();
+        seed_hash(&mut db, b"h", &[(b"f", b"v"), (b"g", b"w")]);
+        let exp = db.now_ms() + 1_000;
+        expire_field_at(&mut db, b"h", b"f", exp);
+        db.set_cached_now_ms_for_test(exp + 1);
+        let result = hscan(&mut db, &make_args(&[b"h", b"0"]));
+        if let Frame::Array(ref outer) = result {
+            if let Frame::Array(ref inner) = outer[1] {
+                let keys: Vec<&[u8]> = inner
+                    .iter()
+                    .step_by(2)
+                    .filter_map(|fr| {
+                        if let Frame::BulkString(b) = fr {
+                            Some(b.as_ref())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                assert!(
+                    !keys.iter().any(|s| *s == b"f"),
+                    "expired field must not appear"
+                );
+                assert!(keys.iter().any(|s| *s == b"g"), "live field must appear");
+                return;
+            }
+        }
+        panic!("unexpected HSCAN return shape: {:?}", result);
+    }
+
+    #[test]
+    fn test_hrandfield_never_returns_expired_field() {
+        let mut db = Database::new();
+        seed_hash(&mut db, b"h", &[(b"f", b"v")]);
+        let exp = db.now_ms() + 1_000;
+        expire_field_at(&mut db, b"h", b"f", exp);
+        db.set_cached_now_ms_for_test(exp + 1);
+        assert_eq!(hrandfield(&mut db, &make_args(&[b"h"])), Frame::Null);
+        assert_eq!(
+            hrandfield(&mut db, &make_args(&[b"h", b"1"])),
+            Frame::Array(framevec![])
+        );
+    }
+
+    #[test]
+    fn test_active_tick_reaps_expired_fields() {
+        use crate::server::expiration::expire_cycle_direct;
+        let mut db = Database::new();
+        seed_hash(&mut db, b"h", &[(b"f", b"v"), (b"g", b"w")]);
+        let exp = db.now_ms() + 1_000;
+        expire_field_at(&mut db, b"h", b"f", exp);
+        db.set_cached_now_ms_for_test(exp + 1);
+        expire_cycle_direct(&mut db);
+        assert_eq!(hget(&mut db, &make_args(&[b"h", b"f"])), Frame::Null);
+        assert_eq!(hlen(&mut db, &make_args(&[b"h"])), Frame::Integer(1));
+        assert_eq!(
+            hget(&mut db, &make_args(&[b"h", b"g"])),
+            Frame::BulkString(Bytes::copy_from_slice(b"w"))
+        );
+    }
+
+    #[test]
+    fn test_active_tick_downgrades_hash_when_last_ttl_drained() {
+        use crate::server::expiration::expire_cycle_direct;
+        let mut db = Database::new();
+        seed_hash(&mut db, b"h", &[(b"f", b"v"), (b"g", b"w")]);
+        let exp = db.now_ms() + 1_000;
+        expire_field_at(&mut db, b"h", b"f", exp);
+        db.set_cached_now_ms_for_test(exp + 1);
+        expire_cycle_direct(&mut db);
+        // After reaping the only TTL'd field, encoding must downgrade to plain Hash.
+        // HEXPIRE XX on the surviving field must return -2 (no TTL).
+        let r = hexpire(
+            &mut db,
+            &make_args(&[b"h", b"60", b"XX", b"FIELDS", b"1", b"g"]),
+        );
+        assert_eq!(r, Frame::Array(framevec![Frame::Integer(-2)]));
+    }
+
+    #[test]
+    fn test_active_tick_deletes_hash_when_all_fields_expired() {
+        use crate::server::expiration::expire_cycle_direct;
+        let mut db = Database::new();
+        seed_hash(&mut db, b"h", &[(b"f", b"v")]);
+        let exp = db.now_ms() + 1_000;
+        expire_field_at(&mut db, b"h", b"f", exp);
+        db.set_cached_now_ms_for_test(exp + 1);
+        expire_cycle_direct(&mut db);
+        assert_eq!(
+            hgetall(&mut db, &make_args(&[b"h"])),
+            Frame::Array(framevec![])
+        );
+        assert_eq!(db.len(), 0);
+    }
+
+    #[test]
+    fn test_hlen_o1_for_plain_hash_unchanged_complexity() {
+        // Plain Hash (no TTL sidecar): HLEN must remain O(1) via HashMap::len().
+        let mut db = Database::new();
+        seed_hash(&mut db, b"h", &[(b"a", b"1"), (b"b", b"2"), (b"c", b"3")]);
+        assert_eq!(hlen(&mut db, &make_args(&[b"h"])), Frame::Integer(3));
+    }
 }
