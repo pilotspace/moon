@@ -1,8 +1,9 @@
 use bytes::Bytes;
+use smallvec::SmallVec;
 
-use crate::protocol::Frame;
+use crate::protocol::{Frame, FrameVec};
 use crate::storage::Database;
-use crate::storage::db::{LISTPACK_MAX_ELEMENT_SIZE, LISTPACK_MAX_ENTRIES};
+use crate::storage::db::{HashTtlCond, LISTPACK_MAX_ELEMENT_SIZE, LISTPACK_MAX_ENTRIES};
 
 use crate::command::helpers::{err_wrong_args, extract_bytes, ok};
 
@@ -28,7 +29,10 @@ pub fn hset(db: &mut Database, args: &[Frame]) -> Frame {
     });
 
     if !has_large_element {
-        // Try listpack path for small hashes
+        // Try listpack path for small hashes. HashWithTtl returns Ok(None) here
+        // (get_or_create_hash_listpack is now HashWithTtl-aware), so it falls
+        // through to the full HashMap path — correct, because TTL'd hashes never
+        // compact back to listpack.
         match db.get_or_create_hash_listpack(key) {
             Ok(Some(lp)) => {
                 let mut count = 0i64;
@@ -68,13 +72,24 @@ pub fn hset(db: &mut Database, args: &[Frame]) -> Frame {
                 return Frame::Integer(count);
             }
             Ok(None) => {
-                // Already a full HashMap -- fall through to standard path
+                // Already a full HashMap or HashWithTtl -- fall through to standard path
             }
             Err(e) => return e,
         }
     }
 
-    // Full HashMap path (large elements or already upgraded)
+    // Full HashMap path (large elements, already upgraded, or HashWithTtl).
+    // Collect touched field byte-slices before the mutable borrow of `db`.
+    // SmallVec avoids heap allocation for the common ≤8-field case.
+    let mut touched: SmallVec<[&[u8]; 8]> = SmallVec::new();
+    let mut i = 1;
+    while i < args.len() {
+        if let Some(f) = extract_bytes(&args[i]) {
+            touched.push(f.as_ref());
+        }
+        i += 2;
+    }
+
     let map = match db.get_or_create_hash(key) {
         Ok(m) => m,
         Err(e) => return e,
@@ -95,6 +110,9 @@ pub fn hset(db: &mut Database, args: &[Frame]) -> Frame {
         }
         i += 2;
     }
+    // Clear TTL sidecar entries for all touched fields (Valkey: HSET unconditionally
+    // persists the field).  No-op for plain Hash; cheap enum-match on HashWithTtl.
+    db.hash_clear_field_ttls(key, &touched);
     Frame::Integer(new_count)
 }
 
@@ -110,20 +128,23 @@ pub fn hdel(db: &mut Database, args: &[Frame]) -> Frame {
         Some(k) => k.clone(),
         None => return err_wrong_args("HDEL"),
     };
-    let map = match db.get_or_create_hash(&key) {
-        Ok(m) => m,
-        Err(e) => return e,
-    };
     let mut count: i64 = 0;
+    let mut last_was_empty = false;
     for arg in &args[1..] {
         if let Some(field) = extract_bytes(arg) {
-            if map.remove(field).is_some() {
-                count += 1;
+            match db.hash_delete_field(&key, field) {
+                Ok((removed, empty)) => {
+                    if removed {
+                        count += 1;
+                    }
+                    last_was_empty = empty;
+                }
+                Err(e) => return e,
             }
         }
     }
-    // Remove key if hash is now empty
-    if map.is_empty() {
+    // If the last deletion left the hash empty, remove the key.
+    if last_was_empty {
         db.remove(&key);
     }
     Frame::Integer(count)
@@ -149,6 +170,7 @@ pub fn hmset(db: &mut Database, args: &[Frame]) -> Frame {
     });
 
     if !has_large_element {
+        // HashWithTtl returns Ok(None), falling through — same as HSET.
         match db.get_or_create_hash_listpack(key) {
             Ok(Some(lp)) => {
                 let mut i = 1;
@@ -187,6 +209,16 @@ pub fn hmset(db: &mut Database, args: &[Frame]) -> Frame {
         }
     }
 
+    // Full HashMap path — collect touched fields before the mutable borrow.
+    let mut touched: SmallVec<[&[u8]; 8]> = SmallVec::new();
+    let mut i = 1;
+    while i < args.len() {
+        if let Some(f) = extract_bytes(&args[i]) {
+            touched.push(f.as_ref());
+        }
+        i += 2;
+    }
+
     let map = match db.get_or_create_hash(key) {
         Ok(m) => m,
         Err(e) => return e,
@@ -204,12 +236,17 @@ pub fn hmset(db: &mut Database, args: &[Frame]) -> Frame {
         map.insert(field, value);
         i += 2;
     }
+    // Valkey: HMSET clears TTL for every overwritten field.
+    db.hash_clear_field_ttls(key, &touched);
     ok()
 }
 
 /// HINCRBY key field increment
 ///
 /// Increments the integer value of a hash field by the given number.
+/// The TTL on the field (if any) is preserved — `get_or_create_hash` now
+/// returns the fields sub-map for HashWithTtl, so the increment lands there
+/// without touching the ttls sidecar.
 pub fn hincrby(db: &mut Database, args: &[Frame]) -> Frame {
     if args.len() != 3 {
         return err_wrong_args("HINCRBY");
@@ -260,6 +297,7 @@ pub fn hincrby(db: &mut Database, args: &[Frame]) -> Frame {
 ///
 /// Increments the float value of a hash field by the given amount.
 /// Returns the new value as a bulk string.
+/// The TTL on the field (if any) is preserved — same reasoning as HINCRBY.
 pub fn hincrbyfloat(db: &mut Database, args: &[Frame]) -> Frame {
     if args.len() != 3 {
         return err_wrong_args("HINCRBYFLOAT");
@@ -320,6 +358,7 @@ pub(super) fn format_float(v: f64) -> String {
 /// HSETNX key field value
 ///
 /// Sets field only if it does not already exist. Returns 1 if set, 0 if not.
+/// Does NOT clear TTL when the field already exists (no write happened).
 pub fn hsetnx(db: &mut Database, args: &[Frame]) -> Frame {
     if args.len() != 3 {
         return err_wrong_args("HSETNX");
@@ -336,6 +375,7 @@ pub fn hsetnx(db: &mut Database, args: &[Frame]) -> Frame {
         Some(v) => v.clone(),
         None => return err_wrong_args("HSETNX"),
     };
+    // get_or_create_hash is now HashWithTtl-aware: returns fields sub-map.
     let map = match db.get_or_create_hash(key) {
         Ok(m) => m,
         Err(e) => return e,
@@ -346,4 +386,235 @@ pub fn hsetnx(db: &mut Database, args: &[Frame]) -> Frame {
         map.insert(field, value);
         Frame::Integer(1)
     }
+}
+
+// ── HEXPIRE-family — Valkey 9.0 per-field TTL write commands ─────────────────
+
+/// Parsed arguments for the HEXPIRE family.
+struct HexpireArgs<'a> {
+    key: &'a [u8],
+    /// Absolute deadline in unix-milliseconds (already converted from the
+    /// wire format).
+    abs_ms: u64,
+    cond: HashTtlCond,
+    /// Field names to operate on.
+    fields: SmallVec<[&'a [u8]; 4]>,
+}
+
+/// Parse the wire format shared by HEXPIRE / HPEXPIRE / HEXPIREAT / HPEXPIREAT:
+///
+/// ```text
+/// HEXPIRE key seconds [NX|XX|GT|LT] FIELDS numfields field [field ...]
+/// ```
+///
+/// `expects_ms`  — when `true` the `when` argument is already in milliseconds
+///                 (HPEXPIRE / HPEXPIREAT).
+/// `expects_abs` — when `true` the `when` argument is an absolute unix
+///                 timestamp (HEXPIREAT / HPEXPIREAT); otherwise it is a
+///                 relative offset from `now_ms`.
+fn parse_hexpire_args<'a>(
+    args: &'a [Frame],
+    now_ms: u64,
+    expects_ms: bool,
+    expects_abs: bool,
+) -> Result<HexpireArgs<'a>, Frame> {
+    // Minimum wire layout (no condition flag):
+    //   args[0] key  args[1] when  args[2] FIELDS  args[3] numfields  args[4+] fields
+    if args.len() < 5 {
+        return Err(Frame::Error(Bytes::from_static(
+            b"ERR wrong number of arguments for 'HEXPIRE' command",
+        )));
+    }
+
+    let key = match extract_bytes(&args[0]) {
+        Some(k) => k.as_ref(),
+        None => {
+            return Err(Frame::Error(Bytes::from_static(
+                b"ERR invalid key argument",
+            )));
+        }
+    };
+
+    // Parse `when` as i64 (negative values → past expiry → code 2).
+    let when_val: i64 = match extract_bytes(&args[1]) {
+        Some(b) => match std::str::from_utf8(b).ok().and_then(|s| s.parse().ok()) {
+            Some(n) => n,
+            None => {
+                return Err(Frame::Error(Bytes::from_static(
+                    b"ERR value is not an integer or out of range",
+                )));
+            }
+        },
+        None => {
+            return Err(Frame::Error(Bytes::from_static(
+                b"ERR value is not an integer or out of range",
+            )));
+        }
+    };
+
+    // Compute abs_ms using saturating i128 arithmetic to avoid overflow on
+    // extreme values before clamping to u64.
+    let when_ms_i128: i128 = if expects_ms {
+        when_val as i128
+    } else {
+        (when_val as i128).saturating_mul(1000)
+    };
+    let abs_ms_i128: i128 = if expects_abs {
+        when_ms_i128
+    } else {
+        (now_ms as i128).saturating_add(when_ms_i128)
+    };
+    let abs_ms: u64 = abs_ms_i128.clamp(0, u64::MAX as i128) as u64;
+
+    // Scan args[2..] for an optional condition flag then FIELDS keyword.
+    // Valid layouts:
+    //   [FIELDS numfields field...]          — no condition
+    //   [NX|XX|GT|LT FIELDS numfields field...] — one condition
+    //   [NX XX ...] — mutual-exclusion error
+    let mut cond = HashTtlCond::Always;
+    let mut cond_count = 0u8;
+    let mut fields_keyword_pos: Option<usize> = None; // index into args
+
+    for pos in 2..args.len() {
+        if let Some(tok) = extract_bytes(&args[pos]) {
+            if tok.eq_ignore_ascii_case(b"FIELDS") {
+                fields_keyword_pos = Some(pos);
+                break;
+            }
+            // Must be a condition flag.
+            let c = if tok.eq_ignore_ascii_case(b"NX") {
+                HashTtlCond::Nx
+            } else if tok.eq_ignore_ascii_case(b"XX") {
+                HashTtlCond::Xx
+            } else if tok.eq_ignore_ascii_case(b"GT") {
+                HashTtlCond::Gt
+            } else if tok.eq_ignore_ascii_case(b"LT") {
+                HashTtlCond::Lt
+            } else {
+                return Err(Frame::Error(Bytes::from(format!(
+                    "ERR unsupported option '{}'",
+                    String::from_utf8_lossy(tok)
+                ))));
+            };
+            cond_count += 1;
+            if cond_count > 1 {
+                return Err(Frame::Error(Bytes::from_static(
+                    b"ERR NX, XX, GT, and LT options at the same time are not compatible",
+                )));
+            }
+            cond = c;
+        }
+    }
+
+    let fkw_pos = match fields_keyword_pos {
+        Some(p) => p,
+        None => {
+            return Err(Frame::Error(Bytes::from_static(
+                b"ERR syntax error, FIELDS keyword not found",
+            )));
+        }
+    };
+
+    // args[fkw_pos+1] = numfields
+    let numfields_pos = fkw_pos + 1;
+    if numfields_pos >= args.len() {
+        return Err(Frame::Error(Bytes::from_static(
+            b"ERR wrong number of arguments for 'HEXPIRE' command",
+        )));
+    }
+    let numfields: usize = match extract_bytes(&args[numfields_pos]) {
+        Some(b) => match std::str::from_utf8(b)
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+        {
+            Some(n) => n,
+            None => {
+                return Err(Frame::Error(Bytes::from_static(
+                    b"ERR value is not an integer or out of range",
+                )));
+            }
+        },
+        None => {
+            return Err(Frame::Error(Bytes::from_static(
+                b"ERR value is not an integer or out of range",
+            )));
+        }
+    };
+
+    if numfields == 0 {
+        return Err(Frame::Error(Bytes::from_static(
+            b"ERR Parameter `numFields` should be greater than 0",
+        )));
+    }
+
+    let first_field_pos = numfields_pos + 1;
+    let actual_fields = args.len().saturating_sub(first_field_pos);
+    if actual_fields < numfields {
+        return Err(Frame::Error(Bytes::from_static(
+            b"ERR Parameter `numFields` is more than number of arguments",
+        )));
+    }
+
+    let mut fields: SmallVec<[&'a [u8]; 4]> = SmallVec::new();
+    for i in first_field_pos..first_field_pos + numfields {
+        match extract_bytes(&args[i]) {
+            Some(f) => fields.push(f.as_ref()),
+            None => {
+                return Err(Frame::Error(Bytes::from_static(b"ERR invalid field name")));
+            }
+        }
+    }
+
+    Ok(HexpireArgs {
+        key,
+        abs_ms,
+        cond,
+        fields,
+    })
+}
+
+/// Core executor for HEXPIRE / HPEXPIRE / HEXPIREAT / HPEXPIREAT.
+///
+/// Calls `hash_set_field_ttl` for each field in order, collects result codes
+/// into a RESP Array of integers.  On WRONGTYPE returns the error immediately.
+fn do_hexpire(db: &mut Database, args: &[Frame], expects_ms: bool, expects_abs: bool) -> Frame {
+    let now_ms = db.now_ms();
+    let parsed = match parse_hexpire_args(args, now_ms, expects_ms, expects_abs) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+
+    let mut codes: Vec<Frame> = Vec::with_capacity(parsed.fields.len());
+    for field in &parsed.fields {
+        match db.hash_set_field_ttl(parsed.key, field, parsed.abs_ms, parsed.cond) {
+            Ok(code) => codes.push(Frame::Integer(code)),
+            Err(_wrong_type) => {
+                return Frame::Error(Bytes::from_static(
+                    b"WRONGTYPE Operation against a key holding the wrong kind of value",
+                ));
+            }
+        }
+    }
+
+    Frame::Array(FrameVec::from_vec(codes))
+}
+
+/// HEXPIRE key seconds [NX|XX|GT|LT] FIELDS numfields field [field ...]
+pub fn hexpire(db: &mut Database, args: &[Frame]) -> Frame {
+    do_hexpire(db, args, false, false)
+}
+
+/// HPEXPIRE key milliseconds [NX|XX|GT|LT] FIELDS numfields field [field ...]
+pub fn hpexpire(db: &mut Database, args: &[Frame]) -> Frame {
+    do_hexpire(db, args, true, false)
+}
+
+/// HEXPIREAT key unix-time-seconds [NX|XX|GT|LT] FIELDS numfields field [field ...]
+pub fn hexpireat(db: &mut Database, args: &[Frame]) -> Frame {
+    do_hexpire(db, args, false, true)
+}
+
+/// HPEXPIREAT key unix-time-milliseconds [NX|XX|GT|LT] FIELDS numfields field [field ...]
+pub fn hpexpireat(db: &mut Database, args: &[Frame]) -> Frame {
+    do_hexpire(db, args, true, true)
 }

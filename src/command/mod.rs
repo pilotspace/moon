@@ -622,7 +622,7 @@ fn dispatch_inner(
             }
         }
         (7, b'h') => {
-            // HEALTHZ HGETALL HEXISTS HINCRBY
+            // HEALTHZ HGETALL HEXISTS HINCRBY HEXPIRE
             if cmd.eq_ignore_ascii_case(b"HEALTHZ") {
                 return resp(connection::healthz());
             }
@@ -634,6 +634,9 @@ fn dispatch_inner(
             }
             if cmd.eq_ignore_ascii_case(b"HINCRBY") {
                 return resp(hash::hincrby(db, args));
+            }
+            if cmd.eq_ignore_ascii_case(b"HEXPIRE") {
+                return resp(hash::hexpire(db, args));
             }
         }
         (7, b'l') => {
@@ -730,6 +733,12 @@ fn dispatch_inner(
                 return resp(string::setrange(db, args));
             }
         }
+        (8, b'h') => {
+            // HPEXPIRE
+            if cmd.eq_ignore_ascii_case(b"HPEXPIRE") {
+                return resp(hash::hpexpire(db, args));
+            }
+        }
         (8, b'x') => {
             // XPENDING
             if cmd.eq_ignore_ascii_case(b"XPENDING") {
@@ -743,6 +752,12 @@ fn dispatch_inner(
             }
         }
         // 9-letter commands
+        (9, b'h') => {
+            // HEXPIREAT
+            if cmd.eq_ignore_ascii_case(b"HEXPIREAT") {
+                return resp(hash::hexpireat(db, args));
+            }
+        }
         (9, b'g') => {
             // GEOSEARCH GEORADIUS
             if cmd.eq_ignore_ascii_case(b"GEOSEARCH") {
@@ -787,9 +802,12 @@ fn dispatch_inner(
         }
         // 10-letter commands
         (10, b'h') => {
-            // HRANDFIELD
+            // HRANDFIELD HPEXPIREAT
             if cmd.eq_ignore_ascii_case(b"HRANDFIELD") {
                 return resp(hash::hrandfield(db, args));
+            }
+            if cmd.eq_ignore_ascii_case(b"HPEXPIREAT") {
+                return resp(hash::hpexpireat(db, args));
             }
         }
         (10, b'e') => {
