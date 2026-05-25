@@ -84,16 +84,21 @@ pub fn serialize_collection(value: &RedisValueRef<'_>) -> Option<Vec<u8>> {
                 write_len_bytes(&mut buf, field);
                 write_len_bytes(&mut buf, val);
             }
+            // Hash-field TTL trailer: ttl_count=0 for plain Hash.
+            // Same layout as the RDB v2 trailer (see src/persistence/rdb.rs).
+            buf.write_all(&0u32.to_le_bytes()).ok()?;
         }
-        // TODO(phase-200): tiered disk-offload persistence of per-field TTLs.
-        // For now serialize fields only — TTLs lost on spill-and-rehydrate.
-        // Same safety property: HEXPIRE handlers (phase 196) must not land
-        // before phase 200 closes this gap.
-        RedisValueRef::HashWithTtl { fields, .. } => {
+        RedisValueRef::HashWithTtl { fields, ttls } => {
             buf.write_all(&(fields.len() as u32).to_le_bytes()).ok()?;
             for (field, val) in fields.iter() {
                 write_len_bytes(&mut buf, field);
                 write_len_bytes(&mut buf, val);
+            }
+            // Hash-field TTL trailer: ttl_count + [field, ttl_ms u64]*.
+            buf.write_all(&(ttls.len() as u32).to_le_bytes()).ok()?;
+            for (field, ttl_ms) in ttls.iter() {
+                write_len_bytes(&mut buf, field);
+                buf.write_all(&ttl_ms.to_le_bytes()).ok()?;
             }
         }
         RedisValueRef::HashListpack(lp) => {
@@ -103,6 +108,8 @@ pub fn serialize_collection(value: &RedisValueRef<'_>) -> Option<Vec<u8>> {
                 write_len_bytes(&mut buf, field);
                 write_len_bytes(&mut buf, val);
             }
+            // Listpack hashes can never carry per-field TTLs.
+            buf.write_all(&0u32.to_le_bytes()).ok()?;
         }
         RedisValueRef::List(list) => {
             buf.write_all(&(list.len() as u32).to_le_bytes()).ok()?;
@@ -236,7 +243,22 @@ pub fn deserialize_collection(data: &[u8], value_type: ValueType) -> Option<Redi
                 let val = read_len_bytes(&mut cursor).ok()?;
                 map.insert(field, val);
             }
-            Some(RedisValue::Hash(map))
+            // Per-field TTL trailer (phase 200). ttl_count = 0 → plain Hash.
+            // Pre-trailer blobs (old in-process spill) lack the count and
+            // EOF here — treat as plain Hash for graceful migration.
+            match read_u32_le(&mut cursor) {
+                Ok(0) => Some(RedisValue::Hash(map)),
+                Ok(ttl_count) => {
+                    let mut ttls = BTreeMap::new();
+                    for _ in 0..ttl_count as usize {
+                        let field = read_len_bytes(&mut cursor).ok()?;
+                        let ttl_ms = read_u64_le(&mut cursor).ok()?;
+                        ttls.insert(field, ttl_ms);
+                    }
+                    Some(RedisValue::HashWithTtl { fields: map, ttls })
+                }
+                Err(_) => Some(RedisValue::Hash(map)),
+            }
         }
         ValueType::List => {
             let count = read_u32_le(&mut cursor).ok()? as usize;

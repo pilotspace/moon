@@ -28,7 +28,14 @@ use crate::storage::stream::{Stream as StreamData, StreamId};
 
 // Format constants
 const RDB_MAGIC: &[u8] = b"MOON";
-const RDB_VERSION: u8 = 1;
+/// RDB file format version.
+///
+/// v1: original format — hash entries had no per-field TTL trailer.
+/// v2: appends `[ttl_count u32][field, ttl_ms u64]*` after every hash body
+///     (count is 0 for non-TTL hashes). New writers emit v2; readers accept
+///     both v1 and v2.
+const RDB_VERSION: u8 = 2;
+const RDB_VERSION_V1: u8 = 1;
 
 // Type tags
 pub(crate) const TYPE_STRING: u8 = 0;
@@ -263,12 +270,14 @@ pub fn load(databases: &mut [Database], path: &Path) -> Result<usize, MoonError>
         path: path.to_path_buf(),
         source: e,
     })?;
-    if version[0] != RDB_VERSION {
+    let file_version = version[0];
+    if file_version != RDB_VERSION && file_version != RDB_VERSION_V1 {
         return Err(RdbError::UnsupportedVersion {
-            version: version[0] as u32,
+            version: file_version as u32,
         }
         .into());
     }
+    let has_hash_ttl_trailer = file_version >= RDB_VERSION;
 
     // Cache timestamps once (Fix #4: avoid syscall per entry)
     let now_ms = current_time_ms();
@@ -282,7 +291,7 @@ pub fn load(databases: &mut [Database], path: &Path) -> Result<usize, MoonError>
     let mut temp_dbs: Vec<Database> = (0..db_count).map(|_| Database::new()).collect();
 
     // First pass: count entries per database for pre-sizing
-    let entry_counts = count_entries_per_db(&cursor, db_count);
+    let entry_counts = count_entries_per_db(&cursor, db_count, has_hash_ttl_trailer);
     for (db_idx, &count) in entry_counts.iter().enumerate() {
         if count > 0 && db_idx < db_count {
             temp_dbs[db_idx].reserve(count);
@@ -321,20 +330,21 @@ pub fn load(databases: &mut [Database], path: &Path) -> Result<usize, MoonError>
                     .into());
                 }
             }
-            type_tag => match read_entry_zero_copy(&mut cursor, type_tag, now_secs) {
-                Ok((key, entry)) => {
-                    if entry.has_expiry() && entry.is_expired_at(now_secs, now_ms) {
-                        continue;
+            type_tag => {
+                match read_entry_zero_copy(&mut cursor, type_tag, now_secs, has_hash_ttl_trailer) {
+                    Ok((key, entry)) => {
+                        if entry.has_expiry() && entry.is_expired_at(now_secs, now_ms) {
+                            continue;
+                        }
+                        if current_db < db_count {
+                            temp_dbs[current_db].insert_for_load(key, entry);
+                            total_keys += 1;
+                        }
                     }
-                    if current_db < db_count {
-                        temp_dbs[current_db].insert_for_load(key, entry);
-                        total_keys += 1;
-                    }
-                }
-                Err(e) => {
-                    // Do NOT swap partially-loaded temp_dbs into live databases.
-                    // A corrupted-but-checksummed RDB must not commit partial state.
-                    return Err(RdbError::Corrupted {
+                    Err(e) => {
+                        // Do NOT swap partially-loaded temp_dbs into live databases.
+                        // A corrupted-but-checksummed RDB must not commit partial state.
+                        return Err(RdbError::Corrupted {
                         detail: format!(
                             "RDB load: corrupted entry at offset {}: {}. {} keys loaded before failure.",
                             cursor.position(),
@@ -343,8 +353,9 @@ pub fn load(databases: &mut [Database], path: &Path) -> Result<usize, MoonError>
                         ),
                     }
                     .into());
+                    }
                 }
-            },
+            }
         }
     }
 
@@ -360,7 +371,11 @@ pub fn load(databases: &mut [Database], path: &Path) -> Result<usize, MoonError>
 
 /// Fast first-pass: count entries per database without parsing values.
 /// Scans type tags and skips over entry payloads to count keys per db_idx.
-fn count_entries_per_db(cursor: &Cursor<&[u8]>, db_count: usize) -> Vec<usize> {
+fn count_entries_per_db(
+    cursor: &Cursor<&[u8]>,
+    db_count: usize,
+    has_hash_ttl_trailer: bool,
+) -> Vec<usize> {
     let mut counts = vec![0usize; db_count];
     let data = cursor.get_ref();
     let mut pos = cursor.position() as usize;
@@ -385,7 +400,7 @@ fn count_entries_per_db(cursor: &Cursor<&[u8]>, db_count: usize) -> Vec<usize> {
                     counts[current_db] += 1;
                 }
                 // Skip over the entry payload without parsing
-                if let Some(new_pos) = skip_entry(data, pos, tag) {
+                if let Some(new_pos) = skip_entry(data, pos, tag, has_hash_ttl_trailer) {
                     pos = new_pos;
                 } else {
                     break;
@@ -400,7 +415,12 @@ fn count_entries_per_db(cursor: &Cursor<&[u8]>, db_count: usize) -> Vec<usize> {
 
 /// Skip over an RDB entry's bytes without allocating or parsing values.
 /// Returns the new position after the entry, or None if data is truncated.
-fn skip_entry(data: &[u8], mut pos: usize, type_tag: u8) -> Option<usize> {
+fn skip_entry(
+    data: &[u8],
+    mut pos: usize,
+    type_tag: u8,
+    has_hash_ttl_trailer: bool,
+) -> Option<usize> {
     // Skip key
     pos = skip_bytes_field(data, pos)?;
     // Skip TTL (8 bytes)
@@ -419,6 +439,20 @@ fn skip_entry(data: &[u8], mut pos: usize, type_tag: u8) -> Option<usize> {
             for _ in 0..count {
                 pos = skip_bytes_field(data, pos)?; // field
                 pos = skip_bytes_field(data, pos)?; // value
+            }
+            // v2 RDB: per-field TTL trailer follows every hash body.
+            //   [ttl_count u32][field, ttl_ms u64]*
+            // v1 files skip this entirely.
+            if has_hash_ttl_trailer {
+                let ttl_count = read_u32_raw(data, pos)?;
+                pos += 4;
+                for _ in 0..ttl_count {
+                    pos = skip_bytes_field(data, pos)?; // field name
+                    pos = pos.checked_add(8)?; // ttl_ms u64
+                    if pos > data.len() {
+                        return None;
+                    }
+                }
             }
         }
         TYPE_LIST | TYPE_SET => {
@@ -539,6 +573,7 @@ fn read_entry_zero_copy(
     cursor: &mut Cursor<&[u8]>,
     type_tag: u8,
     cached_secs: u32,
+    has_hash_ttl_trailer: bool,
 ) -> Result<(Bytes, Entry), MoonError> {
     let key = read_bytes(cursor)?;
 
@@ -578,7 +613,27 @@ fn read_entry_zero_copy(
                 let val = read_bytes(cursor)?;
                 map.insert(field, val);
             }
-            RedisValue::Hash(map)
+            // v2 RDB trailer: per-field TTL sidecar (ttl_count u32 + pairs).
+            // v1 files have no trailer — treat as plain Hash (0 TTLs).
+            if has_hash_ttl_trailer {
+                let ttl_count = read_u32(cursor)? as usize;
+                validate_count(cursor, ttl_count, 12, "hash_ttls")?;
+                if ttl_count > 0 {
+                    let mut ttls = BTreeMap::new();
+                    for _ in 0..ttl_count {
+                        let field = read_bytes(cursor)?;
+                        let mut ttl_buf = [0u8; 8];
+                        cursor.read_exact(&mut ttl_buf)?;
+                        let ttl_ms = u64::from_le_bytes(ttl_buf);
+                        ttls.insert(field, ttl_ms);
+                    }
+                    RedisValue::HashWithTtl { fields: map, ttls }
+                } else {
+                    RedisValue::Hash(map)
+                }
+            } else {
+                RedisValue::Hash(map)
+            }
         }
         TYPE_LIST => {
             let count = read_u32(cursor)? as usize;
@@ -819,12 +874,14 @@ pub fn load_from_bytes(
         path: std::path::PathBuf::from("<aof-preamble>"),
         source: e,
     })?;
-    if version[0] != RDB_VERSION {
+    let file_version = version[0];
+    if file_version != RDB_VERSION && file_version != RDB_VERSION_V1 {
         return Err(RdbError::UnsupportedVersion {
-            version: version[0] as u32,
+            version: file_version as u32,
         }
         .into());
     }
+    let has_hash_ttl_trailer = file_version >= RDB_VERSION;
 
     let now_ms = current_time_ms();
     let now_secs = (now_ms / 1000) as u32;
@@ -840,7 +897,7 @@ pub fn load_from_bytes(
     let mut temp_dbs: Vec<Database> = (0..db_count).map(|_| Database::new()).collect();
 
     // Pre-size DashTables on the temporary databases
-    let entry_counts = count_entries_per_db(&cursor, db_count);
+    let entry_counts = count_entries_per_db(&cursor, db_count, has_hash_ttl_trailer);
     for (db_idx, &count) in entry_counts.iter().enumerate() {
         if count > 0 && db_idx < db_count {
             temp_dbs[db_idx].reserve(count);
@@ -871,18 +928,19 @@ pub fn load_from_bytes(
                     .into());
                 }
             }
-            type_tag => match read_entry_zero_copy(&mut cursor, type_tag, now_secs) {
-                Ok((key, entry)) => {
-                    if entry.has_expiry() && entry.is_expired_at(now_secs, now_ms) {
-                        continue;
+            type_tag => {
+                match read_entry_zero_copy(&mut cursor, type_tag, now_secs, has_hash_ttl_trailer) {
+                    Ok((key, entry)) => {
+                        if entry.has_expiry() && entry.is_expired_at(now_secs, now_ms) {
+                            continue;
+                        }
+                        if current_db < db_count {
+                            temp_dbs[current_db].insert_for_load(key, entry);
+                            total_keys += 1;
+                        }
                     }
-                    if current_db < db_count {
-                        temp_dbs[current_db].insert_for_load(key, entry);
-                        total_keys += 1;
-                    }
-                }
-                Err(e) => {
-                    return Err(RdbError::Corrupted {
+                    Err(e) => {
+                        return Err(RdbError::Corrupted {
                         detail: format!(
                             "RDB preamble: corrupted entry at offset {}: {}. {} keys loaded before failure.",
                             cursor.position(),
@@ -891,8 +949,9 @@ pub fn load_from_bytes(
                         ),
                     }
                     .into());
+                    }
                 }
-            },
+            }
         }
     }
 
@@ -1001,15 +1060,20 @@ pub(crate) fn write_entry(
                 write_bytes(buf, field)?;
                 write_bytes(buf, val)?;
             }
+            // v2 trailer: no per-field TTLs for plain Hash. Emit ttl_count=0.
+            buf.write_all(&0u32.to_le_bytes())?;
         }
-        // TODO(phase-200 / issue #111): extend RDB v2 with a per-field TTL
-        // sidecar. For now serialize fields without TTLs — safe because
-        // phase 196 must not land before phase 200 (see AOF comment).
-        RedisValueRef::HashWithTtl { fields, .. } => {
+        RedisValueRef::HashWithTtl { fields, ttls } => {
             buf.write_all(&(fields.len() as u32).to_le_bytes())?;
             for (field, val) in fields.iter() {
                 write_bytes(buf, field)?;
                 write_bytes(buf, val)?;
+            }
+            // v2 trailer: per-field TTL sidecar.
+            buf.write_all(&(ttls.len() as u32).to_le_bytes())?;
+            for (field, ttl_ms) in ttls.iter() {
+                write_bytes(buf, field)?;
+                buf.write_all(&ttl_ms.to_le_bytes())?;
             }
         }
         RedisValueRef::HashListpack(lp) => {
@@ -1019,6 +1083,8 @@ pub(crate) fn write_entry(
                 write_bytes(buf, field)?;
                 write_bytes(buf, val)?;
             }
+            // v2 trailer: listpack-encoded hashes never carry TTLs.
+            buf.write_all(&0u32.to_le_bytes())?;
         }
         RedisValueRef::List(list) => {
             buf.write_all(&(list.len() as u32).to_le_bytes())?;
@@ -1134,6 +1200,7 @@ pub(crate) fn write_entry(
 pub(crate) fn read_entry(
     cursor: &mut Cursor<&[u8]>,
     type_tag: u8,
+    has_hash_ttl_trailer: bool,
 ) -> Result<(Bytes, Entry), MoonError> {
     // Key
     let key = read_bytes(cursor)?;
@@ -1161,7 +1228,25 @@ pub(crate) fn read_entry(
                 let val = read_bytes(cursor)?;
                 map.insert(field, val);
             }
-            RedisValue::Hash(map)
+            if has_hash_ttl_trailer {
+                let ttl_count = read_u32(cursor)? as usize;
+                validate_count(cursor, ttl_count, 12, "hash_ttls")?;
+                if ttl_count > 0 {
+                    let mut ttls = BTreeMap::new();
+                    for _ in 0..ttl_count {
+                        let field = read_bytes(cursor)?;
+                        let mut ttl_buf = [0u8; 8];
+                        cursor.read_exact(&mut ttl_buf)?;
+                        let ttl_ms = u64::from_le_bytes(ttl_buf);
+                        ttls.insert(field, ttl_ms);
+                    }
+                    RedisValue::HashWithTtl { fields: map, ttls }
+                } else {
+                    RedisValue::Hash(map)
+                }
+            } else {
+                RedisValue::Hash(map)
+            }
         }
         TYPE_LIST => {
             let count = read_u32(cursor)? as usize;
