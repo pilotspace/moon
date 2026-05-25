@@ -30,6 +30,17 @@ page format, or transaction layer.
 - No semantic change for the happy path. Future flakes become diagnosable
   instead of silently retrying for 60 s.
 
+### Docs — Storage Format v1 commitment (phase 192, PR #115)
+
+- `docs/STORAGE-FORMAT-V1.md` — public on-disk format contract for v0.2.x.
+  Documents the WAL v3 / RDB v2 / AOF multi-part sub-formats as a single
+  "storage format v1" umbrella with explicit forward-read, reverse-read,
+  crash-recovery, and migration guarantees through ≥18 months of LTS.
+  Adds cross-reference doc-comments to `src/persistence/aof_manifest.rs`,
+  `snapshot.rs`, and `wal_v3/segment.rs` pointing readers at the canonical
+  on-disk markers. Reserves a `--storage-format <v1>` CLI flag for the
+  follow-up code PR closing issue #103's second checkbox.
+
 ### Added — Tier 2 Lane A (PR #100)
 
 - **T2.1** `c381b31` — `SWAPDB` cross-shard atomic swap via `ShardMessage::SwapDb`;
