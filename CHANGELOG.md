@@ -11,6 +11,35 @@ and **Change Data Capture (CDC)**, built additively on top of the existing
 per-shard WAL v3 + dual-root manifest. No changes to the KV hot path, MVCC,
 page format, or transaction layer.
 
+### Added — Hash-field active expiration (phase 197, issue #108)
+
+All 9 hash read commands (`HGET`, `HMGET`, `HGETALL`, `HEXISTS`, `HLEN`,
+`HKEYS`, `HVALS`, `HSCAN`, `HRANDFIELD`) now respect per-field TTLs set by
+the `HEXPIRE` family. Expired fields are invisible to callers without
+requiring the active-expiry tick to have run first (lazy expiry).
+
+**Lazy expiry** (read path, `&Database`): `HashRef` gains a third variant
+`WithTtl { fields, ttls, now_ms }` that filters expired fields on every
+field-level operation. The `get_hash_ref_if_alive` accessor now returns this
+variant for `HashWithTtl` entries instead of falling through to `WRONGTYPE`.
+All 9 mutable read commands now call `get_hash_ref_if_alive` instead of the
+unfiltered `get_hash`, so expired fields are never returned.
+
+**Active expiry** (tick path, `&mut Database`): the per-shard `expire_cycle`
+gains a second sweep via `Database::hashes_with_field_expiry()` and
+`Database::reap_expired_fields_one_hash()`. The reaper removes expired
+fields from the `fields` and `ttls` maps, downgrades the hash back to plain
+`Hash` when the last TTL sidecar entry is drained, and signals `KeyDeleted`
+when all fields expire (the key is then removed by the caller).
+
+The `maybe_has_expiring_keys` fast-path flag is now cleared only when
+**both** the whole-key sweep and the hash-field sweep return empty, preventing
+premature flag-clearing that would have silenced future field reaping.
+
+**Complexity change**: `HLEN` is now O(N) for `HashWithTtl` hashes (counts
+only live fields). Plain `Hash` and `HashListpack` remain O(1) / O(N)
+respectively — no regression.
+
 ### Added — HEXPIRE-family write commands (phase 196, issue #107)
 
 - `HEXPIRE key seconds [NX|XX|GT|LT] FIELDS numfields field [field ...]`
