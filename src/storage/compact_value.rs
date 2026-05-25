@@ -49,6 +49,13 @@ struct HeapString(Vec<u8>);
 pub enum RedisValueRef<'a> {
     String(&'a [u8]),
     Hash(&'a HashMap<Bytes, Bytes>),
+    /// Hash with per-field TTL sidecar (phase 195 / issue #106).
+    /// Mirrors `RedisValue::HashWithTtl`. Readers must filter `fields` by
+    /// `ttls` against the current shard clock to skip expired fields.
+    HashWithTtl {
+        fields: &'a HashMap<Bytes, Bytes>,
+        ttls: &'a BTreeMap<Bytes, u64>,
+    },
     List(&'a VecDeque<Bytes>),
     Set(&'a HashSet<Bytes>),
     SortedSet {
@@ -85,6 +92,7 @@ impl<'a> RedisValueRef<'a> {
                 }
             }
             RedisValueRef::Hash(_) => "hashtable",
+            RedisValueRef::HashWithTtl { .. } => "hashtable",
             RedisValueRef::HashListpack(_) => "listpack",
             RedisValueRef::List(_) => "linkedlist",
             RedisValueRef::ListListpack(_) => "listpack",
@@ -150,7 +158,9 @@ impl CompactValue {
 
         // Collection heap path: store as Box<RedisValue>
         let heap_tag = match &value {
-            RedisValue::Hash(_) | RedisValue::HashListpack(_) => HEAP_TAG_HASH,
+            RedisValue::Hash(_) | RedisValue::HashListpack(_) | RedisValue::HashWithTtl { .. } => {
+                HEAP_TAG_HASH
+            }
             RedisValue::List(_) | RedisValue::ListListpack(_) => HEAP_TAG_LIST,
             RedisValue::Set(_) | RedisValue::SetListpack(_) | RedisValue::SetIntset(_) => {
                 HEAP_TAG_SET
@@ -282,6 +292,9 @@ impl CompactValue {
             let rv = unsafe { &*self.heap_collection_ptr() };
             match rv {
                 RedisValue::Hash(map) => RedisValueRef::Hash(map),
+                RedisValue::HashWithTtl { fields, ttls } => {
+                    RedisValueRef::HashWithTtl { fields, ttls }
+                }
                 RedisValue::List(list) => RedisValueRef::List(list),
                 RedisValue::Set(set) => RedisValueRef::Set(set),
                 RedisValue::SortedSet { members, scores } => {

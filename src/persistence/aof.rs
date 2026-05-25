@@ -551,6 +551,26 @@ pub fn generate_rewrite_commands(databases: &[Database]) -> BytesMut {
                     }
                     serialize::serialize(&Frame::Array(args.into()), &mut buf);
                 }
+                // TODO(phase-200 / issue #111): emit HPEXPIREAT for each
+                // TTL'd field. For now AOF rewrite serializes the hash as
+                // plain HSET — per-field TTLs are not yet persisted across
+                // BGREWRITEAOF until phase 200 wires the encoding. This is
+                // safe because phase 196 (HEXPIRE handlers, which construct
+                // HashWithTtl values) MUST not land before phase 200.
+                RedisValueRef::HashWithTtl { fields, .. } => {
+                    if fields.is_empty() {
+                        continue;
+                    }
+                    let mut args = vec![
+                        Frame::BulkString(Bytes::from_static(b"HSET")),
+                        Frame::BulkString(key.to_bytes()),
+                    ];
+                    for (field, val) in fields.iter() {
+                        args.push(Frame::BulkString(field.clone()));
+                        args.push(Frame::BulkString(val.clone()));
+                    }
+                    serialize::serialize(&Frame::Array(args.into()), &mut buf);
+                }
                 RedisValueRef::HashListpack(lp) => {
                     let map = lp.to_hash_map();
                     if map.is_empty() {

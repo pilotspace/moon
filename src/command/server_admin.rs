@@ -240,6 +240,11 @@ fn estimate_serialized_length(entry: &Entry) -> usize {
     match entry.as_redis_value() {
         RedisValueRef::String(s) => s.len(),
         RedisValueRef::Hash(h) => h.iter().map(|(k, v)| k.len() + v.len() + 2).sum(),
+        RedisValueRef::HashWithTtl { fields, ttls } => {
+            let f: usize = fields.iter().map(|(k, v)| k.len() + v.len() + 2).sum();
+            let t: usize = ttls.iter().map(|(k, _)| k.len() + 8).sum();
+            f + t
+        }
         RedisValueRef::HashListpack(lp) => lp.total_bytes(),
         RedisValueRef::List(lst) => lst.iter().map(|e| e.len() + 1).sum(),
         RedisValueRef::ListListpack(lp) => lp.total_bytes(),

@@ -25,6 +25,70 @@ fn entry_overhead(key: &[u8], entry: &Entry) -> usize {
     key.len() + entry.value.estimate_memory() + 128
 }
 
+// ---------------------------------------------------------------------------
+// HEXPIRE family — public type surface (phase 195 / issue #106).
+// ---------------------------------------------------------------------------
+
+/// Conditional gate for `Database::hash_set_field_ttl`.
+/// Mirrors Valkey 9.0 HEXPIRE NX/XX/GT/LT semantics.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HashTtlCond {
+    /// Always set the TTL (no condition).
+    Always,
+    /// Only set if no current TTL on the field.
+    Nx,
+    /// Only set if a TTL is already present.
+    Xx,
+    /// Only set if the new TTL is greater than current.
+    Gt,
+    /// Only set if the new TTL is less than current.
+    Lt,
+}
+
+/// Tri-state field lookup result for HTTL / HEXPIRETIME / HPERSIST.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FieldState {
+    /// Field does not exist in the hash (HTTL → -2).
+    Missing,
+    /// Field exists but has no TTL (HTTL → -1).
+    NoTtl,
+    /// Field exists with the given absolute expiry (unix-ms).
+    Ttl(u64),
+}
+
+/// Returned by hash-mutation primitives when the key exists but is not a hash.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WrongType;
+
+/// Convert a `RedisValue::Hash` or `RedisValue::HashListpack` in-place into a
+/// `RedisValue::HashWithTtl` carrying an empty `ttls` sidecar. No-op when the
+/// value is already `HashWithTtl`. Panics for non-hash variants — callers must
+/// type-check first.
+fn promote_to_hash_with_ttl(rv: &mut RedisValue) {
+    match rv {
+        RedisValue::HashWithTtl { .. } => {}
+        RedisValue::Hash(_) => {
+            let placeholder = RedisValue::Hash(HashMap::new());
+            let owned = std::mem::replace(rv, placeholder);
+            let RedisValue::Hash(fields) = owned else {
+                unreachable!("matched Hash above");
+            };
+            *rv = RedisValue::HashWithTtl {
+                fields,
+                ttls: std::collections::BTreeMap::new(),
+            };
+        }
+        RedisValue::HashListpack(lp) => {
+            let fields = lp.to_hash_map();
+            *rv = RedisValue::HashWithTtl {
+                fields,
+                ttls: std::collections::BTreeMap::new(),
+            };
+        }
+        _ => panic!("promote_to_hash_with_ttl called on non-hash variant"),
+    }
+}
+
 /// An in-memory key-value database with lazy expiration.
 ///
 /// Keys are `Bytes` (binary-safe). Values are `Entry` structs containing
@@ -150,6 +214,167 @@ impl Database {
     #[inline]
     pub fn now_ms(&self) -> u64 {
         self.cached_now_ms
+    }
+
+    // -- HEXPIRE family (phase 195 / issue #106) ------------------------------
+    //
+    // Storage primitives for Valkey 9.0 HEXPIRE-family parity. Consumed by
+    // phases 196 (write commands), 198 (read commands), 199 (atomic compound).
+    //
+    // Storage strategy: auto-promote to `RedisValue::HashWithTtl` on first
+    // per-field TTL touch. Downgrade back to plain `Hash` when the last TTL
+    // is removed via `hash_persist_field`. No promotion of HashListpack
+    // happens unless an actual TTL is being set — pure reads stay cheap.
+
+    /// Set per-field TTL (absolute unix-ms). Returns the per-field result code:
+    /// `0` = no such field, `1` = TTL set, `2` = expired during this call,
+    /// `-2` = NX/XX/GT/LT condition not met. `Err(WrongType)` if key exists and
+    /// is not a hash.
+    pub fn hash_set_field_ttl(
+        &mut self,
+        key: &[u8],
+        field: &[u8],
+        ts_ms: u64,
+        cond: HashTtlCond,
+    ) -> Result<i64, WrongType> {
+        // 1. Key existence + type check.
+        let Some(entry) = self.data.get_mut(key) else {
+            return Ok(0);
+        };
+        let Some(rv) = entry.value.as_redis_value_mut() else {
+            // Inline string or heap string — wrong type.
+            return Err(WrongType);
+        };
+        match rv {
+            RedisValue::Hash(_) | RedisValue::HashListpack(_) | RedisValue::HashWithTtl { .. } => {}
+            _ => return Err(WrongType),
+        }
+
+        // 2. Field-existence pre-check (avoids unnecessary promotion).
+        let field_exists = match rv {
+            RedisValue::Hash(map) => map.contains_key(field),
+            RedisValue::HashListpack(lp) => lp.iter_pairs().any(|(f, _)| f.as_bytes() == field),
+            RedisValue::HashWithTtl { fields, .. } => fields.contains_key(field),
+            _ => unreachable!("type-checked above"),
+        };
+        if !field_exists {
+            return Ok(0);
+        }
+
+        // 3. Past-expiry short-circuit: delete the field, return code 2.
+        if ts_ms <= self.cached_now_ms {
+            match rv {
+                RedisValue::Hash(map) => {
+                    map.remove(field);
+                }
+                RedisValue::HashListpack(lp) => {
+                    // Promote to Hash to delete (listpack delete-by-key is awkward).
+                    let mut map = lp.to_hash_map();
+                    map.remove(field);
+                    *rv = RedisValue::Hash(map);
+                }
+                RedisValue::HashWithTtl { fields, ttls } => {
+                    fields.remove(field);
+                    ttls.remove(field);
+                    if ttls.is_empty() {
+                        let m = std::mem::take(fields);
+                        *rv = RedisValue::Hash(m);
+                    }
+                }
+                _ => unreachable!(),
+            }
+            return Ok(2);
+        }
+
+        // 4. Promote to HashWithTtl if needed.
+        promote_to_hash_with_ttl(rv);
+        let RedisValue::HashWithTtl { ttls, .. } = rv else {
+            unreachable!("just promoted")
+        };
+
+        // 5. Apply NX/XX/GT/LT conditional gate.
+        // Valkey semantics: a non-volatile field is treated as +∞ for GT/LT.
+        let current = ttls.get(field).copied();
+        let pass = match cond {
+            HashTtlCond::Always => true,
+            HashTtlCond::Nx => current.is_none(),
+            HashTtlCond::Xx => current.is_some(),
+            HashTtlCond::Gt => current.is_some_and(|c| ts_ms > c),
+            HashTtlCond::Lt => current.is_some_and(|c| ts_ms < c) || current.is_none(),
+        };
+        if !pass {
+            return Ok(-2);
+        }
+
+        // 6. Set the TTL.
+        ttls.insert(Bytes::copy_from_slice(field), ts_ms);
+        self.maybe_has_expiring_keys = true;
+        Ok(1)
+    }
+
+    /// Read absolute expiry ms for a field. `None` for missing field or no TTL.
+    pub fn hash_get_field_ttl_ms(&self, key: &[u8], field: &[u8]) -> Option<u64> {
+        let entry = self.data.get(key)?;
+        match entry.value.as_redis_value() {
+            RedisValueRef::HashWithTtl { ttls, .. } => ttls.get(field).copied(),
+            _ => None,
+        }
+    }
+
+    /// Tri-state field-existence + TTL state lookup used by HTTL / HEXPIRETIME
+    /// and the HEXPIRE conditional gates.
+    pub fn hash_field_state(&self, key: &[u8], field: &[u8], _now_ms: u64) -> FieldState {
+        let Some(entry) = self.data.get(key) else {
+            return FieldState::Missing;
+        };
+        match entry.value.as_redis_value() {
+            RedisValueRef::Hash(map) => {
+                if map.contains_key(field) {
+                    FieldState::NoTtl
+                } else {
+                    FieldState::Missing
+                }
+            }
+            RedisValueRef::HashListpack(lp) => {
+                if lp.iter_pairs().any(|(f, _)| f.as_bytes() == field) {
+                    FieldState::NoTtl
+                } else {
+                    FieldState::Missing
+                }
+            }
+            RedisValueRef::HashWithTtl { fields, ttls } => {
+                if !fields.contains_key(field) {
+                    FieldState::Missing
+                } else if let Some(&ms) = ttls.get(field) {
+                    FieldState::Ttl(ms)
+                } else {
+                    FieldState::NoTtl
+                }
+            }
+            _ => FieldState::Missing,
+        }
+    }
+
+    /// Remove the TTL from a field. Returns `true` if the field had a TTL
+    /// (and it was removed); `false` if the field was missing or had no TTL.
+    /// Downgrades `HashWithTtl` back to plain `Hash` when the last TTL is
+    /// removed.
+    pub fn hash_persist_field(&mut self, key: &[u8], field: &[u8]) -> bool {
+        let Some(entry) = self.data.get_mut(key) else {
+            return false;
+        };
+        let Some(rv) = entry.value.as_redis_value_mut() else {
+            return false;
+        };
+        let RedisValue::HashWithTtl { fields, ttls } = rv else {
+            return false;
+        };
+        let had_ttl = ttls.remove(field).is_some();
+        if had_ttl && ttls.is_empty() {
+            let m = std::mem::take(fields);
+            *rv = RedisValue::Hash(m);
+        }
+        had_ttl
     }
 
     /// Estimated memory usage of all entries in this database.
