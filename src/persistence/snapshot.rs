@@ -904,9 +904,11 @@ mod tests {
         // Save with last_lsn = 12345 stamped in.
         shard_snapshot_save_with_lsn(7, 42, 12345, &dbs, &path).unwrap();
 
-        // Peek metadata only — must report v2 and the stamped LSN.
+        // Peek metadata only — must report the current write version (V3 since
+        // phase 200 — adds the hash-field TTL trailer; preamble is unchanged
+        // from V2) and the stamped LSN.
         let meta = read_snapshot_metadata(&path).expect("metadata read");
-        assert_eq!(meta.version, SHARD_RDB_VERSION_V2);
+        assert_eq!(meta.version, SHARD_RDB_VERSION);
         assert_eq!(meta.shard_id, 7);
         assert_eq!(meta.epoch, 42);
         assert_eq!(meta.last_lsn, 12345);
