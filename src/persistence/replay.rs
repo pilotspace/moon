@@ -1,3 +1,23 @@
+//! Command replay for AOF / WAL recovery.
+//!
+//! ## HEXPIRE-family replay clock semantics
+//!
+//! Relative-form expiries (`HEXPIRE` seconds-from-now, `HPEXPIRE`
+//! millis-from-now) re-base to the **replay-time clock**, not the original
+//! wall-clock at write time. An `HEXPIRE k 60 FIELDS 1 f` segment written
+//! at T0 and replayed at T0+10min sets the field TTL to (T0+10min) + 60s,
+//! not T0+60s.
+//!
+//! This matches Valkey / Redis `EXPIRE` replay semantics — relative TTLs
+//! are intentionally re-based so a stale AOF doesn't immediately re-expire
+//! everything on restart. In practice it only affects un-rewritten AOF
+//! streams: `BGREWRITEAOF` always emits the absolute `HPEXPIREAT` form
+//! (see `aof::generate_rewrite_commands`), which carries the original
+//! absolute expiry verbatim and has zero drift.
+//!
+//! Do not "fix" the relative-form drift without coordinating with the
+//! main expiration path — they share the same trade-off by design.
+
 use crate::protocol::Frame;
 use crate::storage::Database;
 use crate::storage::db::HashTtlCond;

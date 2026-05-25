@@ -65,6 +65,38 @@ page format, or transaction layer.
   TTL-stripping placeholders so HEXPIRE handlers (phase 196) cannot be
   merged ahead of the persistence wiring.
 
+### Added — Hash-Field TTL persistence wiring (phase 200, PR #117)
+
+- **RDB v2** — bumped `RDB_VERSION 1 → 2`. New per-hash trailer
+  `[ttl_count u32][field, ttl_ms u64]*` follows every `TYPE_HASH` body
+  (count=0 for non-TTL hashes). Reader accepts both v1 and v2 files;
+  `count_entries_per_db` / `skip_entry` / `read_entry_zero_copy` /
+  `read_entry` all plumb a `has_hash_ttl_trailer` flag so the format
+  is parsed correctly on both code paths (file load + in-memory bytes).
+- **Shard RDB V3** — `SHARD_RDB_VERSION 2 → 3` with the same trailer
+  plumbed through `rdb::read_entry`. V1 (legacy) / V2 (PITR LSN+ts) /
+  V3 (TTL trailer) all load via per-version preamble + min-file-size
+  branching.
+- **Tiered KV serde** — per-hash trailer on disk-offload blobs. Plain
+  Hash + HashListpack serializers now append `ttl_count = 0`;
+  HashWithTtl serializer writes the real trailer. Deserializer treats
+  a truncated trailer as zero TTLs for graceful migration from
+  pre-trailer in-process spill blobs.
+- **BGREWRITEAOF** — `RedisValueRef::HashWithTtl` arm emits
+  `HSET key f1 v1 f2 v2 ...` followed by per-field
+  `HPEXPIREAT key abs_ms FIELDS 1 field`, one per TTL'd field. Per-
+  field framing keeps the replay shim simple (single-field parse).
+- **Replay shim** — `CommandReplayEngine::replay_command` intercepts
+  `HEXPIRE` / `HPEXPIRE` / `HEXPIREAT` / `HPEXPIREAT` / `HPERSIST`
+  (case-insensitive) **before** `command::dispatch` and routes
+  directly to `Database::hash_set_field_ttl` / `hash_persist_field`.
+  This bypasses the phase-196 command handlers (which do not yet
+  exist) so crash-restart restores per-field TTLs from any AOF stream
+  emitted by either user-typed HEXPIRE or BGREWRITEAOF.
+- **Redis-compat RDB** — emits `tracing::warn!` when dropping per-field
+  TTLs on Redis-compat export. Redis 7.4 hash-field-TTL opcode
+  emission deferred to a future cross-vendor compat phase.
+
 ### Added — Tier 2 Lane A (PR #100)
 
 - **T2.1** `c381b31` — `SWAPDB` cross-shard atomic swap via `ShardMessage::SwapDb`;
