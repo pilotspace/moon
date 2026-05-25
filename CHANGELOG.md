@@ -41,6 +41,30 @@ page format, or transaction layer.
   on-disk markers. Reserves a `--storage-format <v1>` CLI flag for the
   follow-up code PR closing issue #103's second checkbox.
 
+### Added — Hash-Field TTL primitive (phase 195, PR #116)
+
+- `RedisValue::HashWithTtl { fields, ttls }` storage variant + borrowed
+  `RedisValueRef::HashWithTtl` view. Per-field TTL sidecar (`BTreeMap<Bytes, u64>`)
+  carries absolute unix-ms expiry alongside an unchanged `HashMap<Bytes, Bytes>`
+  field map. `OBJECT ENCODING` reports `hashtable`.
+- `Database::hash_set_field_ttl(key, field, abs_ms, cond)` — Valkey 9.0 parity
+  result codes (0 missing / 1 set / 2 deleted-on-set / -2 cond not met).
+  NX / XX / GT / LT semantics matching Valkey (non-volatile is +∞ for GT/LT).
+  Auto-promotes `Hash` / `HashListpack` → `HashWithTtl` on first per-field TTL;
+  past-expiry short-circuits to in-place delete with code 2.
+- `Database::hash_persist_field(key, field)` — clears one field's TTL;
+  downgrades back to plain `Hash` when the last TTL is removed.
+- `Database::hash_get_field_ttl_ms` + `Database::hash_field_state` — read
+  helpers returning the tri-state `FieldState::{Missing, NoTtl, Ttl(u64)}`
+  consumed by phase-198 HTTL / HEXPIRETIME / HPTTL / HPEXPIRETIME read commands.
+- Additive `HashWithTtl` match arms in `command::key::should_async_drop`,
+  `server_admin::estimate_serialized_length`, `eviction::evict_one_async_spill`,
+  `tiered::kv_spill`, `tiered::kv_serde`, `persistence::rdb::write_entry`,
+  `persistence::redis_rdb`, and `persistence::aof::generate_rewrite_commands`.
+  Persistence-side TTL payload lands in PR #117 (phase 200); arms here are
+  TTL-stripping placeholders so HEXPIRE handlers (phase 196) cannot be
+  merged ahead of the persistence wiring.
+
 ### Added — Tier 2 Lane A (PR #100)
 
 - **T2.1** `c381b31` — `SWAPDB` cross-shard atomic swap via `ShardMessage::SwapDb`;
