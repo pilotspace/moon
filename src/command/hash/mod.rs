@@ -513,7 +513,10 @@ mod tests {
         let mut db = Database::new();
         seed_hash(&mut db, b"h", &[(b"f", b"v")]);
         let args = make_args(&[b"h", b"60", b"FIELDS", b"1", b"f"]);
-        assert_eq!(hexpire(&mut db, &args), Frame::Array(framevec![Frame::Integer(1)]));
+        assert_eq!(
+            hexpire(&mut db, &args),
+            Frame::Array(framevec![Frame::Integer(1)])
+        );
 
         let args = make_args(&[b"h", b"120", b"NX", b"FIELDS", b"1", b"f"]);
         let r = hexpire(&mut db, &args);
@@ -535,7 +538,10 @@ mod tests {
         seed_hash(&mut db, b"h", &[(b"f", b"v")]);
         // Seed a 1-hour TTL.
         let args = make_args(&[b"h", b"3600", b"FIELDS", b"1", b"f"]);
-        assert_eq!(hexpire(&mut db, &args), Frame::Array(framevec![Frame::Integer(1)]));
+        assert_eq!(
+            hexpire(&mut db, &args),
+            Frame::Array(framevec![Frame::Integer(1)])
+        );
         // GT with a smaller TTL should be rejected.
         let args = make_args(&[b"h", b"60", b"GT", b"FIELDS", b"1", b"f"]);
         let r = hexpire(&mut db, &args);
@@ -547,7 +553,10 @@ mod tests {
         let mut db = Database::new();
         seed_hash(&mut db, b"h", &[(b"f", b"v")]);
         let args = make_args(&[b"h", b"60", b"FIELDS", b"1", b"f"]);
-        assert_eq!(hexpire(&mut db, &args), Frame::Array(framevec![Frame::Integer(1)]));
+        assert_eq!(
+            hexpire(&mut db, &args),
+            Frame::Array(framevec![Frame::Integer(1)])
+        );
         let args = make_args(&[b"h", b"3600", b"LT", b"FIELDS", b"1", b"f"]);
         let r = hexpire(&mut db, &args);
         assert_eq!(r, Frame::Array(framevec![Frame::Integer(-2)]));
@@ -569,10 +578,7 @@ mod tests {
     #[test]
     fn test_hexpire_wrong_type_returns_wrongtype() {
         let mut db = Database::new();
-        db.set_string(
-            Bytes::from_static(b"s"),
-            Bytes::from_static(b"x"),
-        );
+        db.set_string(Bytes::from_static(b"s"), Bytes::from_static(b"x"));
         let args = make_args(&[b"s", b"60", b"FIELDS", b"1", b"f"]);
         let r = hexpire(&mut db, &args);
         assert!(matches!(r, Frame::Error(ref e) if e.starts_with(b"WRONGTYPE")));
@@ -629,7 +635,9 @@ mod tests {
         // Should be approximately now + 123456 ms.
         assert!(
             (got as i128 - (now as i128 + 123456)).abs() < 100,
-            "expected ~{} got {}", now + 123456, got
+            "expected ~{} got {}",
+            now + 123456,
+            got
         );
     }
 
@@ -667,7 +675,10 @@ mod tests {
         seed_hash(&mut db, b"h", &[(b"a", b"1")]);
         // Promote to HashWithTtl via HEXPIRE.
         let args = make_args(&[b"h", b"60", b"FIELDS", b"1", b"a"]);
-        assert_eq!(hexpire(&mut db, &args), Frame::Array(framevec![Frame::Integer(1)]));
+        assert_eq!(
+            hexpire(&mut db, &args),
+            Frame::Array(framevec![Frame::Integer(1)])
+        );
         // HSET on a different field should work — currently regresses to WRONGTYPE pre-fix.
         let r = hset(&mut db, &make_args(&[b"h", b"b", b"2"]));
         assert_eq!(r, Frame::Integer(1));
@@ -683,7 +694,10 @@ mod tests {
         seed_hash(&mut db, b"h", &[(b"a", b"1"), (b"b", b"2")]);
         // Set TTLs on both fields.
         assert_eq!(
-            hexpire(&mut db, &make_args(&[b"h", b"60", b"FIELDS", b"2", b"a", b"b"])),
+            hexpire(
+                &mut db,
+                &make_args(&[b"h", b"60", b"FIELDS", b"2", b"a", b"b"])
+            ),
             Frame::Array(framevec![Frame::Integer(1), Frame::Integer(1)])
         );
         // Overwrite 'a' via HSET → its TTL must be cleared.
@@ -705,7 +719,10 @@ mod tests {
         // Overwrite the only TTL'd field; storage should downgrade to plain Hash.
         hset(&mut db, &make_args(&[b"h", b"a", b"NEW"]));
         // No TTL anywhere. HEXPIRE with XX must return -2 (no current TTL).
-        let r = hexpire(&mut db, &make_args(&[b"h", b"60", b"XX", b"FIELDS", b"1", b"a"]));
+        let r = hexpire(
+            &mut db,
+            &make_args(&[b"h", b"60", b"XX", b"FIELDS", b"1", b"a"]),
+        );
         assert_eq!(r, Frame::Array(framevec![Frame::Integer(-2)]));
     }
 
@@ -803,7 +820,10 @@ mod tests {
         hdel(&mut db, &make_args(&[b"h", b"a"]));
         // No TTLs left — encoding should downgrade to plain Hash. Indirect check:
         // HEXPIRE with XX on the surviving field must return -2 (no TTL).
-        let r = hexpire(&mut db, &make_args(&[b"h", b"60", b"XX", b"FIELDS", b"1", b"b"]));
+        let r = hexpire(
+            &mut db,
+            &make_args(&[b"h", b"60", b"XX", b"FIELDS", b"1", b"b"]),
+        );
         assert_eq!(r, Frame::Array(framevec![Frame::Integer(-2)]));
     }
 

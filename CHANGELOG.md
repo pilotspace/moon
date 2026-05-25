@@ -11,6 +11,32 @@ and **Change Data Capture (CDC)**, built additively on top of the existing
 per-shard WAL v3 + dual-root manifest. No changes to the KV hot path, MVCC,
 page format, or transaction layer.
 
+### Added — HEXPIRE-family write commands (phase 196, issue #107)
+
+- `HEXPIRE key seconds [NX|XX|GT|LT] FIELDS numfields field [field ...]`
+- `HPEXPIRE key milliseconds [NX|XX|GT|LT] FIELDS numfields field [...]`
+- `HEXPIREAT key unix-seconds [NX|XX|GT|LT] FIELDS numfields field [...]`
+- `HPEXPIREAT key unix-ms [NX|XX|GT|LT] FIELDS numfields field [...]`
+
+Per-field return codes match Valkey 9.0: `0` (no such field), `1` (TTL set or
+updated), `2` (field expired during this call and was deleted), `-2` (NX / XX /
+GT / LT condition not met). Wrong-type key returns `WRONGTYPE`; missing key
+returns one `0` per requested field. PHF + dispatch routes the four commands
+to `hash::{hexpire,hpexpire,hexpireat,hpexpireat}`; AOF replay already handled
+by the phase-200 intercepts.
+
+Side fix — HashWithTtl-aware hash-write path: `HSET`, `HMSET`, `HSETNX`,
+`HDEL`, `HINCRBY`, and `HINCRBYFLOAT` previously returned `WRONGTYPE` once
+`HEXPIRE` had promoted a hash to the `HashWithTtl` encoding. Extended
+`Database::get_or_create_hash` / `get_or_create_hash_listpack` to handle
+`HashWithTtl` (returning the inner `fields` map / `Ok(None)` respectively).
+Added `Database::hash_clear_field_ttls` (called by HSET/HMSET on overwrite,
+no-op on plain `Hash`) and `Database::hash_delete_field` (used by HDEL —
+removes from both the fields map and the per-field TTL sidecar, downgrades
+back to plain `Hash` when the last TTL is dropped). HSETNX correctly leaves
+existing TTLs intact; HINCRBY / HINCRBYFLOAT preserve TTL on the incremented
+field.
+
 ### Fixed — Test infra: txn_kv_wiring flake diagnosis
 
 - `test_txn_commit_wal_crash_recovery` previously masked moon-server crashes
