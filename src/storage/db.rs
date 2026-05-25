@@ -246,17 +246,14 @@ impl Database {
             return Err(WrongType);
         };
         match rv {
-            RedisValue::Hash(_) | RedisValue::HashListpack(_) | RedisValue::HashWithTtl { .. } => {
-            }
+            RedisValue::Hash(_) | RedisValue::HashListpack(_) | RedisValue::HashWithTtl { .. } => {}
             _ => return Err(WrongType),
         }
 
         // 2. Field-existence pre-check (avoids unnecessary promotion).
         let field_exists = match rv {
             RedisValue::Hash(map) => map.contains_key(field),
-            RedisValue::HashListpack(lp) => {
-                lp.iter_pairs().any(|(f, _)| f.as_bytes() == field)
-            }
+            RedisValue::HashListpack(lp) => lp.iter_pairs().any(|(f, _)| f.as_bytes() == field),
             RedisValue::HashWithTtl { fields, .. } => fields.contains_key(field),
             _ => unreachable!("type-checked above"),
         };

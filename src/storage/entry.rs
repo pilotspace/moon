@@ -176,9 +176,9 @@ impl RedisValue {
     pub fn type_name(&self) -> &'static str {
         match self {
             RedisValue::String(_) => "string",
-            RedisValue::Hash(_)
-            | RedisValue::HashListpack(_)
-            | RedisValue::HashWithTtl { .. } => "hash",
+            RedisValue::Hash(_) | RedisValue::HashListpack(_) | RedisValue::HashWithTtl { .. } => {
+                "hash"
+            }
             RedisValue::List(_) | RedisValue::ListListpack(_) => "list",
             RedisValue::Set(_) | RedisValue::SetListpack(_) | RedisValue::SetIntset(_) => "set",
             RedisValue::SortedSet { .. }

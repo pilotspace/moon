@@ -200,10 +200,7 @@ fn test_hpersist_returns_false_when_no_ttl() {
     let mut db = Database::new();
     make_hash_key(&mut db, b"h", &[(b"f1", b"v1")]);
 
-    assert!(
-        !db.hash_persist_field(b"h", b"f1"),
-        "no-ttl yields false"
-    );
+    assert!(!db.hash_persist_field(b"h", b"f1"), "no-ttl yields false");
 }
 
 #[test]
@@ -214,8 +211,10 @@ fn test_hpersist_downgrades_when_last_ttl_removed() {
     make_hash_key(&mut db, b"h", &[(b"f1", b"v1"), (b"f2", b"v2")]);
 
     let now = db.now_ms();
-    db.hash_set_field_ttl(b"h", b"f1", now + 60_000, HashTtlCond::Always).unwrap();
-    db.hash_set_field_ttl(b"h", b"f2", now + 60_000, HashTtlCond::Always).unwrap();
+    db.hash_set_field_ttl(b"h", b"f1", now + 60_000, HashTtlCond::Always)
+        .unwrap();
+    db.hash_set_field_ttl(b"h", b"f2", now + 60_000, HashTtlCond::Always)
+        .unwrap();
 
     // Drop one — should remain HashWithTtl.
     assert!(db.hash_persist_field(b"h", b"f1"));
@@ -266,6 +265,9 @@ fn test_object_encoding_promotes_to_hashtable_after_hexpire() {
 
     // After HEXPIRE on a listpack/Hash, encoding must be `hashtable`.
     // This requires the stub to actually mutate — RED today.
-    let enc = db.data().get(b"h").map(|e| e.value.as_redis_value().encoding_name());
+    let enc = db
+        .data()
+        .get(b"h")
+        .map(|e| e.value.as_redis_value().encoding_name());
     assert_eq!(enc, Some("hashtable"));
 }

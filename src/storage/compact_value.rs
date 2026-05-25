@@ -158,9 +158,9 @@ impl CompactValue {
 
         // Collection heap path: store as Box<RedisValue>
         let heap_tag = match &value {
-            RedisValue::Hash(_)
-            | RedisValue::HashListpack(_)
-            | RedisValue::HashWithTtl { .. } => HEAP_TAG_HASH,
+            RedisValue::Hash(_) | RedisValue::HashListpack(_) | RedisValue::HashWithTtl { .. } => {
+                HEAP_TAG_HASH
+            }
             RedisValue::List(_) | RedisValue::ListListpack(_) => HEAP_TAG_LIST,
             RedisValue::Set(_) | RedisValue::SetListpack(_) | RedisValue::SetIntset(_) => {
                 HEAP_TAG_SET
