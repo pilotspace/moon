@@ -207,6 +207,51 @@ fn test_hpersist_returns_false_when_no_ttl() {
 }
 
 #[test]
+fn test_hpersist_downgrades_when_last_ttl_removed() {
+    // After the last TTL is dropped via HPERSIST, the encoding must
+    // observably return to plain Hash (variant downgrade contract).
+    let mut db = Database::new();
+    make_hash_key(&mut db, b"h", &[(b"f1", b"v1"), (b"f2", b"v2")]);
+
+    let now = db.now_ms();
+    db.hash_set_field_ttl(b"h", b"f1", now + 60_000, HashTtlCond::Always).unwrap();
+    db.hash_set_field_ttl(b"h", b"f2", now + 60_000, HashTtlCond::Always).unwrap();
+
+    // Drop one — should remain HashWithTtl.
+    assert!(db.hash_persist_field(b"h", b"f1"));
+    assert_eq!(db.hash_get_field_ttl_ms(b"h", b"f2"), Some(now + 60_000));
+
+    // Drop the last — should downgrade.
+    assert!(db.hash_persist_field(b"h", b"f2"));
+    assert_eq!(db.hash_get_field_ttl_ms(b"h", b"f2"), None);
+    // Both fields still present (only TTLs removed).
+    let st = db.hash_field_state(b"h", b"f1", db.now_ms());
+    assert_eq!(st, FieldState::NoTtl);
+}
+
+#[test]
+fn test_hexpire_lt_passes_when_no_current_ttl() {
+    // Valkey treats a non-volatile field as +∞ for LT — new < ∞ → allow.
+    let mut db = Database::new();
+    make_hash_key(&mut db, b"h", &[(b"f1", b"v1")]);
+    let r = db
+        .hash_set_field_ttl(b"h", b"f1", db.now_ms() + 60_000, HashTtlCond::Lt)
+        .unwrap();
+    assert_eq!(r, 1, "LT with no current TTL must allow (no-TTL = +∞)");
+}
+
+#[test]
+fn test_hexpire_gt_refuses_when_no_current_ttl() {
+    // Symmetric: new > ∞ → refuse.
+    let mut db = Database::new();
+    make_hash_key(&mut db, b"h", &[(b"f1", b"v1")]);
+    let r = db
+        .hash_set_field_ttl(b"h", b"f1", db.now_ms() + 60_000, HashTtlCond::Gt)
+        .unwrap();
+    assert_eq!(r, -2, "GT with no current TTL must refuse (no-TTL = +∞)");
+}
+
+#[test]
 fn test_object_encoding_promotes_to_hashtable_after_hexpire() {
     // OBJECT ENCODING semantics — phase 195 commits HashWithTtl reports as
     // `hashtable` (already wired in `RedisValue::encoding_name`). This test
