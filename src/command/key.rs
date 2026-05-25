@@ -744,6 +744,7 @@ fn should_async_drop(entry: &crate::storage::entry::Entry) -> bool {
     use crate::storage::compact_value::RedisValueRef;
     match entry.value.as_redis_value() {
         RedisValueRef::Hash(m) => m.len() > 64,
+        RedisValueRef::HashWithTtl { fields, .. } => fields.len() > 64,
         RedisValueRef::List(l) => l.len() > 64,
         RedisValueRef::Set(s) => s.len() > 64,
         RedisValueRef::SortedSet { members, .. } => members.len() > 64,

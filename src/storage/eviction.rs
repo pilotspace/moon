@@ -406,7 +406,9 @@ fn evict_one_async_spill(
             RedisValueRef::String(s) => (ValueType::String, s),
             ref other => {
                 let vt = match other {
-                    RedisValueRef::Hash(_) | RedisValueRef::HashListpack(_) => ValueType::Hash,
+                    RedisValueRef::Hash(_)
+                    | RedisValueRef::HashListpack(_)
+                    | RedisValueRef::HashWithTtl { .. } => ValueType::Hash,
                     RedisValueRef::List(_) | RedisValueRef::ListListpack(_) => ValueType::List,
                     RedisValueRef::Set(_)
                     | RedisValueRef::SetListpack(_)

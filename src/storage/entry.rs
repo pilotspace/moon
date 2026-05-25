@@ -141,6 +141,17 @@ pub enum RedisValue {
     String(Bytes),
     // Full-size variants (existing)
     Hash(HashMap<Bytes, Bytes>),
+    /// Hash with per-field TTL sidecar (phase 195 / issue #106).
+    ///
+    /// `fields` holds the field → value map (same as `Hash`); `ttls` is a
+    /// sparse field → absolute-expiry-ms map. A field present in `fields` but
+    /// absent in `ttls` has no expiration. Auto-promoted from `HashListpack`
+    /// or `Hash` on first `HEXPIRE` / `HPEXPIRE` / `HEXPIREAT` / `HPEXPIREAT`
+    /// call; auto-downgrades back to `Hash` when the last TTL is removed.
+    HashWithTtl {
+        fields: HashMap<Bytes, Bytes>,
+        ttls: BTreeMap<Bytes, u64>,
+    },
     List(VecDeque<Bytes>),
     Set(HashSet<Bytes>),
     SortedSet {
@@ -165,7 +176,9 @@ impl RedisValue {
     pub fn type_name(&self) -> &'static str {
         match self {
             RedisValue::String(_) => "string",
-            RedisValue::Hash(_) | RedisValue::HashListpack(_) => "hash",
+            RedisValue::Hash(_)
+            | RedisValue::HashListpack(_)
+            | RedisValue::HashWithTtl { .. } => "hash",
             RedisValue::List(_) | RedisValue::ListListpack(_) => "list",
             RedisValue::Set(_) | RedisValue::SetListpack(_) | RedisValue::SetIntset(_) => "set",
             RedisValue::SortedSet { .. }
@@ -191,6 +204,9 @@ impl RedisValue {
                 }
             }
             RedisValue::Hash(_) => "hashtable",
+            // HashWithTtl reports as `hashtable` — auto-promoted from listpack
+            // or Hash on first HEXPIRE; matches Valkey OBJECT ENCODING.
+            RedisValue::HashWithTtl { .. } => "hashtable",
             RedisValue::HashListpack(_) => "listpack",
             RedisValue::List(_) => "linkedlist",
             RedisValue::ListListpack(_) => "listpack",
@@ -209,6 +225,12 @@ impl RedisValue {
         match self {
             RedisValue::String(b) => b.len(),
             RedisValue::Hash(map) => map.iter().map(|(k, v)| k.len() + v.len() + 64).sum(),
+            // 64B/entry baseline + 48B per TTL'd field (BTreeMap node overhead).
+            RedisValue::HashWithTtl { fields, ttls } => {
+                let f: usize = fields.iter().map(|(k, v)| k.len() + v.len() + 64).sum();
+                let t: usize = ttls.iter().map(|(k, _)| k.len() + 8 + 48).sum();
+                f + t
+            }
             RedisValue::List(list) => list.iter().map(|elem| elem.len() + 24).sum(),
             RedisValue::Set(set) => set.iter().map(|member| member.len() + 24).sum(),
             RedisValue::SortedSet { members, .. } => {

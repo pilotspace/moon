@@ -85,6 +85,17 @@ pub fn serialize_collection(value: &RedisValueRef<'_>) -> Option<Vec<u8>> {
                 write_len_bytes(&mut buf, val);
             }
         }
+        // TODO(phase-200): tiered disk-offload persistence of per-field TTLs.
+        // For now serialize fields only — TTLs lost on spill-and-rehydrate.
+        // Same safety property: HEXPIRE handlers (phase 196) must not land
+        // before phase 200 closes this gap.
+        RedisValueRef::HashWithTtl { fields, .. } => {
+            buf.write_all(&(fields.len() as u32).to_le_bytes()).ok()?;
+            for (field, val) in fields.iter() {
+                write_len_bytes(&mut buf, field);
+                write_len_bytes(&mut buf, val);
+            }
+        }
         RedisValueRef::HashListpack(lp) => {
             let map = lp.to_hash_map();
             buf.write_all(&(map.len() as u32).to_le_bytes()).ok()?;

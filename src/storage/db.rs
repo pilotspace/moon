@@ -25,6 +25,41 @@ fn entry_overhead(key: &[u8], entry: &Entry) -> usize {
     key.len() + entry.value.estimate_memory() + 128
 }
 
+// ---------------------------------------------------------------------------
+// HEXPIRE family — public type surface (phase 195 / issue #106).
+// ---------------------------------------------------------------------------
+
+/// Conditional gate for `Database::hash_set_field_ttl`.
+/// Mirrors Valkey 9.0 HEXPIRE NX/XX/GT/LT semantics.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HashTtlCond {
+    /// Always set the TTL (no condition).
+    Always,
+    /// Only set if no current TTL on the field.
+    Nx,
+    /// Only set if a TTL is already present.
+    Xx,
+    /// Only set if the new TTL is greater than current.
+    Gt,
+    /// Only set if the new TTL is less than current.
+    Lt,
+}
+
+/// Tri-state field lookup result for HTTL / HEXPIRETIME / HPERSIST.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FieldState {
+    /// Field does not exist in the hash (HTTL → -2).
+    Missing,
+    /// Field exists but has no TTL (HTTL → -1).
+    NoTtl,
+    /// Field exists with the given absolute expiry (unix-ms).
+    Ttl(u64),
+}
+
+/// Returned by hash-mutation primitives when the key exists but is not a hash.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WrongType;
+
 /// An in-memory key-value database with lazy expiration.
 ///
 /// Keys are `Bytes` (binary-safe). Values are `Entry` structs containing
@@ -150,6 +185,50 @@ impl Database {
     #[inline]
     pub fn now_ms(&self) -> u64 {
         self.cached_now_ms
+    }
+
+    // -- HEXPIRE family (phase 195 / issue #106) ------------------------------
+    //
+    // Stub surface. Real implementations land in subsequent commits of phase
+    // 195 (promotion logic, BTreeMap maintenance, downgrade-on-empty). Stubs
+    // return the wrong-type / no-such-field sentinels so the RED tests below
+    // fail with clear assertion messages.
+
+    /// Set per-field TTL (absolute unix-ms). Returns the per-field result code:
+    /// `0` = no such field, `1` = TTL set, `2` = expired during this call,
+    /// `-2` = NX/XX/GT/LT condition not met. `Err(WrongType)` if key exists and
+    /// is not a hash.
+    pub fn hash_set_field_ttl(
+        &mut self,
+        _key: &[u8],
+        _field: &[u8],
+        _ts_ms: u64,
+        _cond: HashTtlCond,
+    ) -> Result<i64, WrongType> {
+        // STUB — real impl lands in phase-195 step 2.
+        Ok(0)
+    }
+
+    /// Read absolute expiry ms for a field. `None` for missing field or no TTL.
+    pub fn hash_get_field_ttl_ms(&self, _key: &[u8], _field: &[u8]) -> Option<u64> {
+        // STUB
+        None
+    }
+
+    /// Tri-state field-existence + TTL state lookup used by HTTL / HEXPIRETIME
+    /// and the HEXPIRE conditional gates.
+    pub fn hash_field_state(&self, _key: &[u8], _field: &[u8], _now_ms: u64) -> FieldState {
+        // STUB
+        FieldState::Missing
+    }
+
+    /// Remove the TTL from a field. Returns `true` if the field had a TTL
+    /// (and it was removed); `false` if the field was missing or had no TTL.
+    /// Downgrades `HashWithTtl` back to plain `Hash` when the last TTL is
+    /// removed.
+    pub fn hash_persist_field(&mut self, _key: &[u8], _field: &[u8]) -> bool {
+        // STUB
+        false
     }
 
     /// Estimated memory usage of all entries in this database.

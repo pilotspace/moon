@@ -254,6 +254,18 @@ fn write_rdb_entry(buf: &mut Vec<u8>, key: &[u8], entry: &Entry, base_ts: u32) {
                 write_redis_string(buf, value);
             }
         }
+        // TODO(phase-200): per-field TTL persistence. Redis-compat RDB output
+        // is used for replication-stream + cross-vendor migration; field TTLs
+        // would need a Redis 7.4+ hash-field-TTL opcode. For now drop TTLs.
+        RedisValueRef::HashWithTtl { fields, .. } => {
+            buf.push(RDB_TYPE_HASH);
+            write_redis_string(buf, key);
+            write_length(buf, fields.len() as u64);
+            for (field, value) in fields.iter() {
+                write_redis_string(buf, field);
+                write_redis_string(buf, value);
+            }
+        }
         RedisValueRef::HashListpack(lp) => {
             buf.push(RDB_TYPE_HASH);
             write_redis_string(buf, key);

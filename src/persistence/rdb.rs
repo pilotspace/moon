@@ -965,7 +965,9 @@ pub(crate) fn write_entry(
     // Type tag -- compact variants serialize as the same type as their full-size counterparts
     let type_tag = match entry.value.as_redis_value() {
         RedisValueRef::String(_) => TYPE_STRING,
-        RedisValueRef::Hash(_) | RedisValueRef::HashListpack(_) => TYPE_HASH,
+        RedisValueRef::Hash(_)
+        | RedisValueRef::HashListpack(_)
+        | RedisValueRef::HashWithTtl { .. } => TYPE_HASH,
         RedisValueRef::List(_) | RedisValueRef::ListListpack(_) => TYPE_LIST,
         RedisValueRef::Set(_) | RedisValueRef::SetListpack(_) | RedisValueRef::SetIntset(_) => {
             TYPE_SET
@@ -996,6 +998,16 @@ pub(crate) fn write_entry(
         RedisValueRef::Hash(map) => {
             buf.write_all(&(map.len() as u32).to_le_bytes())?;
             for (field, val) in map.iter() {
+                write_bytes(buf, field)?;
+                write_bytes(buf, val)?;
+            }
+        }
+        // TODO(phase-200 / issue #111): extend RDB v2 with a per-field TTL
+        // sidecar. For now serialize fields without TTLs — safe because
+        // phase 196 must not land before phase 200 (see AOF comment).
+        RedisValueRef::HashWithTtl { fields, .. } => {
+            buf.write_all(&(fields.len() as u32).to_le_bytes())?;
+            for (field, val) in fields.iter() {
                 write_bytes(buf, field)?;
                 write_bytes(buf, val)?;
             }
