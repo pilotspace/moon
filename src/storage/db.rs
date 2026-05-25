@@ -1305,6 +1305,24 @@ impl Database {
             .collect()
     }
 
+    /// Collect keys whose value is a `HashWithTtl` (hash with per-field TTLs).
+    ///
+    /// Used by the active-expiry tick to find hashes that may have expired
+    /// fields ready for reaping.  Returns an owned `Vec` so the caller can
+    /// iterate and mutate via `get_mut` without holding a borrow on `self.data`.
+    pub fn hashes_with_field_expiry(&self) -> Vec<CompactKey> {
+        self.data
+            .iter()
+            .filter(|(_, e)| {
+                matches!(
+                    e.value.as_redis_value(),
+                    super::compact_value::RedisValueRef::HashWithTtl { .. }
+                )
+            })
+            .map(|(k, _)| k.clone())
+            .collect()
+    }
+
     /// Check if a key exists and its expiry is in the past.
     pub fn is_key_expired(&self, key: &[u8]) -> bool {
         let now_ms = current_time_ms();
@@ -1479,7 +1497,12 @@ impl Database {
 
     // ---- Enum-based readonly accessors that handle compact encodings ----
 
-    /// Read-only hash access via HashRef enum. Handles both HashMap and Listpack.
+    /// Read-only hash access via HashRef enum.
+    ///
+    /// Handles `Hash` (HashMap), `HashListpack` (compact Listpack), and
+    /// `HashWithTtl` (HashMap with per-field TTL sidecar).  For `HashWithTtl`
+    /// returns a `HashRef::WithTtl` that filters expired fields on every
+    /// field-level operation without mutating the database (lazy expiry).
     pub fn get_hash_ref_if_alive(
         &self,
         key: &[u8],
@@ -1492,6 +1515,9 @@ impl Database {
             Some(entry) => match entry.value.as_redis_value() {
                 RedisValueRef::Hash(map) => Ok(Some(HashRef::Map(map))),
                 RedisValueRef::HashListpack(lp) => Ok(Some(HashRef::Listpack(lp))),
+                RedisValueRef::HashWithTtl { fields, ttls } => {
+                    Ok(Some(HashRef::WithTtl { fields, ttls, now_ms }))
+                }
                 _ => Err(Self::wrongtype_error()),
             },
         }
