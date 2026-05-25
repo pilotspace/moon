@@ -187,6 +187,17 @@ impl Database {
         self.cached_now_ms = clock.ms();
     }
 
+    /// Override the cached millisecond timestamp for unit tests only.
+    ///
+    /// Simulates the "expired but not yet reaped" transient state where a
+    /// field's absolute expiry has already passed but the active-expiry tick
+    /// has not yet run.  Without this, tests would need to wait for real wall
+    /// time to advance, making them slow and flaky.
+    #[cfg(test)]
+    pub fn set_cached_now_ms_for_test(&mut self, ms: u64) {
+        self.cached_now_ms = ms;
+    }
+
     /// Fallback: update the cached timestamp via `SystemTime::now()` syscall.
     ///
     /// Kept for callers that do not yet have a `CachedClock` reference (e.g. the
