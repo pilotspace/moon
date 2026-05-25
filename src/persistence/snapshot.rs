@@ -40,9 +40,15 @@ const SHARD_RDB_VERSION_V1: u8 = 1;
 /// Preamble grows to 35 bytes (minimum file = 40 bytes with eof + crc).
 const SHARD_RDB_VERSION_V2: u8 = 2;
 
+/// v0.2 hash-field TTL: same preamble as V2, but every hash entry's body is
+/// followed by a `[ttl_count u32][field, ttl_ms u64]*` trailer (count is 0
+/// for non-TTL hashes). V1/V2 readers skip the trailer because they don't
+/// know to read it; V3 readers handle all three versions.
+const SHARD_RDB_VERSION_V3: u8 = 3;
+
 /// Current write version. Bumping this changes on-disk format; the loader
-/// branches on the byte to remain backward-compatible with v1 snapshots.
-const SHARD_RDB_VERSION: u8 = SHARD_RDB_VERSION_V2;
+/// branches on the byte to remain backward-compatible with v1/v2 snapshots.
+const SHARD_RDB_VERSION: u8 = SHARD_RDB_VERSION_V3;
 
 const EOF_MARKER: u8 = 0xFF;
 const SEGMENT_BLOCK_MARKER: u8 = 0xFD;
@@ -545,7 +551,10 @@ pub fn read_snapshot_metadata(path: &Path) -> Result<SnapshotMeta, MoonError> {
         .into());
     }
     let version = buf[8];
-    if version != SHARD_RDB_VERSION_V1 && version != SHARD_RDB_VERSION_V2 {
+    if version != SHARD_RDB_VERSION_V1
+        && version != SHARD_RDB_VERSION_V2
+        && version != SHARD_RDB_VERSION_V3
+    {
         return Err(SnapshotError::VersionMismatch {
             expected: SHARD_RDB_VERSION as u32,
             actual: version as u32,
@@ -556,7 +565,10 @@ pub fn read_snapshot_metadata(path: &Path) -> Result<SnapshotMeta, MoonError> {
     let epoch = u64::from_le_bytes([
         buf[11], buf[12], buf[13], buf[14], buf[15], buf[16], buf[17], buf[18],
     ]);
-    let (last_lsn, created_at_unix_ms) = if version == SHARD_RDB_VERSION_V2 {
+    // V2 and V3 share the same preamble layout (LSN + timestamp after epoch).
+    let (last_lsn, created_at_unix_ms) = if version == SHARD_RDB_VERSION_V2
+        || version == SHARD_RDB_VERSION_V3
+    {
         if n < 35 {
             return Err(SnapshotError::Corrupted {
                 detail: format!("v2 snapshot header truncated: {} bytes", n),
@@ -653,17 +665,21 @@ pub fn shard_snapshot_load(databases: &mut [Database], path: &Path) -> Result<us
             source: e,
         })?;
     let on_disk_version = version[0];
-    if on_disk_version != SHARD_RDB_VERSION_V1 && on_disk_version != SHARD_RDB_VERSION_V2 {
+    if on_disk_version != SHARD_RDB_VERSION_V1
+        && on_disk_version != SHARD_RDB_VERSION_V2
+        && on_disk_version != SHARD_RDB_VERSION_V3
+    {
         return Err(SnapshotError::VersionMismatch {
             expected: SHARD_RDB_VERSION as u32,
             actual: on_disk_version as u32,
         }
         .into());
     }
+    let has_hash_ttl_trailer = on_disk_version >= SHARD_RDB_VERSION_V3;
     // Enforce the per-version minimum file size now that we know the version.
     let min_file_size = match on_disk_version {
         SHARD_RDB_VERSION_V1 => 24, // 19 preamble + 1 eof + 4 crc
-        SHARD_RDB_VERSION_V2 => 40, // 35 preamble + 1 eof + 4 crc
+        SHARD_RDB_VERSION_V2 | SHARD_RDB_VERSION_V3 => 40, // 35 preamble + 1 eof + 4 crc
         _ => 24,
     };
     if data.len() < min_file_size {
@@ -700,7 +716,9 @@ pub fn shard_snapshot_load(databases: &mut [Database], path: &Path) -> Result<us
     // v2 extra fields: last_lsn + created_at_unix_ms. v1 snapshots leave these
     // implicit zeros — recovery treats `last_lsn = 0` as "replay all WAL from
     // origin", which is the lossless fallback for legacy files.
-    let (_last_lsn, _created_at_unix_ms) = if on_disk_version == SHARD_RDB_VERSION_V2 {
+    let (_last_lsn, _created_at_unix_ms) = if on_disk_version == SHARD_RDB_VERSION_V2
+        || on_disk_version == SHARD_RDB_VERSION_V3
+    {
         let mut lsn_buf = [0u8; 8];
         cursor
             .read_exact(&mut lsn_buf)
@@ -775,7 +793,7 @@ pub fn shard_snapshot_load(databases: &mut [Database], path: &Path) -> Result<us
                         segment_parse_failed = true;
                         break;
                     }
-                    match rdb::read_entry(&mut cursor, type_tag[0]) {
+                    match rdb::read_entry(&mut cursor, type_tag[0], has_hash_ttl_trailer) {
                         Ok((key, entry)) => entries.push((key, entry)),
                         Err(e) => {
                             tracing::warn!(
