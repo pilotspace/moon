@@ -1515,9 +1515,11 @@ impl Database {
             Some(entry) => match entry.value.as_redis_value() {
                 RedisValueRef::Hash(map) => Ok(Some(HashRef::Map(map))),
                 RedisValueRef::HashListpack(lp) => Ok(Some(HashRef::Listpack(lp))),
-                RedisValueRef::HashWithTtl { fields, ttls } => {
-                    Ok(Some(HashRef::WithTtl { fields, ttls, now_ms }))
-                }
+                RedisValueRef::HashWithTtl { fields, ttls } => Ok(Some(HashRef::WithTtl {
+                    fields,
+                    ttls,
+                    now_ms,
+                })),
                 _ => Err(Self::wrongtype_error()),
             },
         }

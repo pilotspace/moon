@@ -40,7 +40,11 @@ impl<'a> HashRef<'a> {
                 }
                 None
             }
-            HashRef::WithTtl { fields, ttls, now_ms } => {
+            HashRef::WithTtl {
+                fields,
+                ttls,
+                now_ms,
+            } => {
                 // Field is expired when its absolute expiry ≤ now_ms.
                 let expired = ttls.get(field).is_some_and(|&t| t <= *now_ms);
                 if expired {
@@ -60,7 +64,11 @@ impl<'a> HashRef<'a> {
         match self {
             HashRef::Map(map) => map.len(),
             HashRef::Listpack(lp) => lp.len() / 2,
-            HashRef::WithTtl { fields, ttls, now_ms } => fields
+            HashRef::WithTtl {
+                fields,
+                ttls,
+                now_ms,
+            } => fields
                 .keys()
                 .filter(|f| ttls.get(*f).map_or(true, |&t| t > *now_ms))
                 .count(),
@@ -75,7 +83,11 @@ impl<'a> HashRef<'a> {
                 .iter_pairs()
                 .map(|(f, v)| (f.to_bytes(), v.to_bytes()))
                 .collect(),
-            HashRef::WithTtl { fields, ttls, now_ms } => fields
+            HashRef::WithTtl {
+                fields,
+                ttls,
+                now_ms,
+            } => fields
                 .iter()
                 .filter(|(f, _)| ttls.get(*f).map_or(true, |&t| t > *now_ms))
                 .map(|(k, v)| (k.clone(), v.clone()))

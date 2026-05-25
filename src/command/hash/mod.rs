@@ -863,10 +863,7 @@ mod tests {
     /// Set an absolute-ms expiry on `field` inside hash at `key`.
     fn expire_field_at(db: &mut Database, key: &[u8], field: &[u8], abs_ms: u64) {
         let s = abs_ms.to_string();
-        let r = hpexpireat(
-            db,
-            &make_args(&[key, s.as_bytes(), b"FIELDS", b"1", field]),
-        );
+        let r = hpexpireat(db, &make_args(&[key, s.as_bytes(), b"FIELDS", b"1", field]));
         assert_eq!(
             r,
             Frame::Array(framevec![Frame::Integer(1)]),
@@ -902,11 +899,21 @@ mod tests {
                     .iter()
                     .step_by(2)
                     .filter_map(|fr| {
-                        if let Frame::BulkString(b) = fr { Some(b.as_ref()) } else { None }
+                        if let Frame::BulkString(b) = fr {
+                            Some(b.as_ref())
+                        } else {
+                            None
+                        }
                     })
                     .collect();
-                assert!(!keys.iter().any(|s| *s == b"f"), "expired field must be absent");
-                assert!(keys.iter().any(|s| *s == b"g"), "live field must be present");
+                assert!(
+                    !keys.iter().any(|s| *s == b"f"),
+                    "expired field must be absent"
+                );
+                assert!(
+                    keys.iter().any(|s| *s == b"g"),
+                    "live field must be present"
+                );
             }
             _ => panic!("expected Array from HGETALL"),
         }
@@ -919,7 +926,10 @@ mod tests {
         let exp = db.now_ms() + 1_000;
         expire_field_at(&mut db, b"h", b"f", exp);
         db.set_cached_now_ms_for_test(exp + 1);
-        assert_eq!(hexists(&mut db, &make_args(&[b"h", b"f"])), Frame::Integer(0));
+        assert_eq!(
+            hexists(&mut db, &make_args(&[b"h", b"f"])),
+            Frame::Integer(0)
+        );
     }
 
     #[test]
@@ -943,11 +953,7 @@ mod tests {
         assert_eq!(
             result,
             Frame::Array(
-                vec![
-                    Frame::Null,
-                    Frame::BulkString(Bytes::copy_from_slice(b"w")),
-                ]
-                .into()
+                vec![Frame::Null, Frame::BulkString(Bytes::copy_from_slice(b"w")),].into()
             )
         );
     }
@@ -965,7 +971,11 @@ mod tests {
                 let found: Vec<&[u8]> = items
                     .iter()
                     .filter_map(|fr| {
-                        if let Frame::BulkString(b) = fr { Some(b.as_ref()) } else { None }
+                        if let Frame::BulkString(b) = fr {
+                            Some(b.as_ref())
+                        } else {
+                            None
+                        }
                     })
                     .collect();
                 assert!(!found.iter().any(|s| *s == b"f"));
@@ -988,11 +998,21 @@ mod tests {
                 let vals: Vec<&[u8]> = items
                     .iter()
                     .filter_map(|fr| {
-                        if let Frame::BulkString(b) = fr { Some(b.as_ref()) } else { None }
+                        if let Frame::BulkString(b) = fr {
+                            Some(b.as_ref())
+                        } else {
+                            None
+                        }
                     })
                     .collect();
-                assert!(!vals.iter().any(|s| *s == b"v"), "expired value must be absent");
-                assert!(vals.iter().any(|s| *s == b"w"), "live value must be present");
+                assert!(
+                    !vals.iter().any(|s| *s == b"v"),
+                    "expired value must be absent"
+                );
+                assert!(
+                    vals.iter().any(|s| *s == b"w"),
+                    "live value must be present"
+                );
             }
             _ => panic!("expected Array from HVALS"),
         }
@@ -1012,10 +1032,17 @@ mod tests {
                     .iter()
                     .step_by(2)
                     .filter_map(|fr| {
-                        if let Frame::BulkString(b) = fr { Some(b.as_ref()) } else { None }
+                        if let Frame::BulkString(b) = fr {
+                            Some(b.as_ref())
+                        } else {
+                            None
+                        }
                     })
                     .collect();
-                assert!(!keys.iter().any(|s| *s == b"f"), "expired field must not appear");
+                assert!(
+                    !keys.iter().any(|s| *s == b"f"),
+                    "expired field must not appear"
+                );
                 assert!(keys.iter().any(|s| *s == b"g"), "live field must appear");
                 return;
             }
@@ -1081,7 +1108,10 @@ mod tests {
         expire_field_at(&mut db, b"h", b"f", exp);
         db.set_cached_now_ms_for_test(exp + 1);
         expire_cycle_direct(&mut db);
-        assert_eq!(hgetall(&mut db, &make_args(&[b"h"])), Frame::Array(framevec![]));
+        assert_eq!(
+            hgetall(&mut db, &make_args(&[b"h"])),
+            Frame::Array(framevec![])
+        );
         assert_eq!(db.len(), 0);
     }
 
@@ -1089,11 +1119,7 @@ mod tests {
     fn test_hlen_o1_for_plain_hash_unchanged_complexity() {
         // Plain Hash (no TTL sidecar): HLEN must remain O(1) via HashMap::len().
         let mut db = Database::new();
-        seed_hash(
-            &mut db,
-            b"h",
-            &[(b"a", b"1"), (b"b", b"2"), (b"c", b"3")],
-        );
+        seed_hash(&mut db, b"h", &[(b"a", b"1"), (b"b", b"2"), (b"c", b"3")]);
         assert_eq!(hlen(&mut db, &make_args(&[b"h"])), Frame::Integer(3));
     }
 }
