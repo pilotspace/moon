@@ -1,5 +1,9 @@
 //! Forkless compartmentalized snapshot engine.
 //!
+//! Produces per-shard **RDB v2** snapshots (`RRDSHARD` magic, version byte
+//! `2`) — part of the **storage format v1** umbrella commitment, see
+//! [`docs/STORAGE-FORMAT-V1.md`](../../../docs/STORAGE-FORMAT-V1.md).
+//!
 //! Serializes DashTable segments one at a time as a cooperative task within the
 //! shard event loop. Keys modified in not-yet-serialized segments have their old
 //! values captured in a per-snapshot overflow buffer (segment-level COW).

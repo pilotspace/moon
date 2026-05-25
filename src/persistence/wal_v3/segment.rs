@@ -1,5 +1,11 @@
 //! WAL v3 segment file management — 16MB segments with 64-byte headers.
 //!
+//! Part of the **storage format v1** umbrella commitment — see
+//! [`docs/STORAGE-FORMAT-V1.md`](../../../../docs/STORAGE-FORMAT-V1.md). The
+//! `RRDWAL` magic + `version = 3` byte are the canonical on-disk markers;
+//! the human-readable "v1" umbrella covers this sub-format together with
+//! RDB v2 and the AOF multi-part manifest.
+//!
 //! Each segment file is named with a 12-digit zero-padded sequence number
 //! (e.g., `000000000001.wal`). The writer creates new segments when the
 //! current one exceeds `segment_size` bytes.

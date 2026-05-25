@@ -1,5 +1,10 @@
 //! Multi-part AOF manifest: tracks base (RDB) and incremental (RESP) files.
 //!
+//! Part of the **storage format v1** umbrella commitment — see
+//! [`docs/STORAGE-FORMAT-V1.md`](../../../docs/STORAGE-FORMAT-V1.md). The
+//! manifest framing is the canonical on-disk marker; the human-readable
+//! "v1" umbrella also covers WAL v3 and RDB v2 sub-formats.
+//!
 //! Implements the same directory-based AOF format as Redis 7+:
 //! ```text
 //! appendonlydir/
