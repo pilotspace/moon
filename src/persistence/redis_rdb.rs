@@ -254,10 +254,26 @@ fn write_rdb_entry(buf: &mut Vec<u8>, key: &[u8], entry: &Entry, base_ts: u32) {
                 write_redis_string(buf, value);
             }
         }
-        // TODO(phase-200): per-field TTL persistence. Redis-compat RDB output
-        // is used for replication-stream + cross-vendor migration; field TTLs
-        // would need a Redis 7.4+ hash-field-TTL opcode. For now drop TTLs.
-        RedisValueRef::HashWithTtl { fields, .. } => {
+        // Redis-compat RDB output (used for replication-stream + cross-vendor
+        // migration) currently drops per-field TTLs. The Redis 7.4 wire opcode
+        // for hash-field-TTL is documented but not yet implemented here —
+        // emitting it requires a wider compat-mode flag that distinguishes
+        // Redis ≥7.4 receivers from Redis ≤7.2 receivers without falling out
+        // of the existing RDB parser. Deferred to a follow-up cross-vendor
+        // phase. For now we warn (once per call site) so operators piping
+        // Moon → external Redis know TTLs will not survive the hop, and emit
+        // the hash body as a plain RDB_TYPE_HASH (forward-compatible — Redis
+        // receivers reconstruct it as a TTL-less hash, identical to Moon's
+        // own v1 RDB reader behavior).
+        RedisValueRef::HashWithTtl { fields, ttls } => {
+            if !ttls.is_empty() {
+                tracing::warn!(
+                    key = %String::from_utf8_lossy(key),
+                    ttls = ttls.len(),
+                    "Redis-compat RDB drops per-field TTLs; cross-vendor migration loses HEXPIRE state. \
+                     Use Moon-native RDB v2 or AOF (HPEXPIREAT emitted) to preserve TTLs."
+                );
+            }
             buf.push(RDB_TYPE_HASH);
             write_redis_string(buf, key);
             write_length(buf, fields.len() as u64);

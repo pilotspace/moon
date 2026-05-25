@@ -551,13 +551,13 @@ pub fn generate_rewrite_commands(databases: &[Database]) -> BytesMut {
                     }
                     serialize::serialize(&Frame::Array(args.into()), &mut buf);
                 }
-                // TODO(phase-200 / issue #111): emit HPEXPIREAT for each
-                // TTL'd field. For now AOF rewrite serializes the hash as
-                // plain HSET — per-field TTLs are not yet persisted across
-                // BGREWRITEAOF until phase 200 wires the encoding. This is
-                // safe because phase 196 (HEXPIRE handlers, which construct
-                // HashWithTtl values) MUST not land before phase 200.
-                RedisValueRef::HashWithTtl { fields, .. } => {
+                // Phase 200: for HashWithTtl we emit two RESP frames per key.
+                //   1. `HSET key f1 v1 f2 v2 ...` rebuilds the hash body.
+                //   2. `HPEXPIREAT key abs_ms FIELDS 1 field` for every entry
+                //      in the TTL sidecar — one per TTL'd field for clarity
+                //      (BGREWRITEAOF is rare; per-field framing keeps the
+                //      replay shim simple, see `persistence::replay`).
+                RedisValueRef::HashWithTtl { fields, ttls } => {
                     if fields.is_empty() {
                         continue;
                     }
@@ -570,6 +570,21 @@ pub fn generate_rewrite_commands(databases: &[Database]) -> BytesMut {
                         args.push(Frame::BulkString(val.clone()));
                     }
                     serialize::serialize(&Frame::Array(args.into()), &mut buf);
+
+                    for (field, ttl_ms) in ttls.iter() {
+                        let mut ttl_args = vec![
+                            Frame::BulkString(Bytes::from_static(b"HPEXPIREAT")),
+                            Frame::BulkString(key.to_bytes()),
+                            Frame::BulkString(Bytes::copy_from_slice(
+                                ttl_ms.to_string().as_bytes(),
+                            )),
+                            Frame::BulkString(Bytes::from_static(b"FIELDS")),
+                            Frame::BulkString(Bytes::from_static(b"1")),
+                            Frame::BulkString(field.clone()),
+                        ];
+                        ttl_args.shrink_to_fit();
+                        serialize::serialize(&Frame::Array(ttl_args.into()), &mut buf);
+                    }
                 }
                 RedisValueRef::HashListpack(lp) => {
                     let map = lp.to_hash_map();
