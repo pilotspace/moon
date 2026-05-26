@@ -6,7 +6,7 @@
 //! `ValueType`). Phase 200 extends every hash body with a
 //! `[ttl_count u32][field, ttl_ms u64]*` trailer, mirroring the RDB v2 format.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 
 use bytes::Bytes;
 use moon::persistence::kv_page::ValueType;
@@ -20,19 +20,21 @@ fn test_tiered_serde_roundtrip_preserves_hash_field_ttls() {
     fields.insert(Bytes::from_static(b"f1"), Bytes::from_static(b"v1"));
     fields.insert(Bytes::from_static(b"f2"), Bytes::from_static(b"v2"));
 
-    let mut ttls = BTreeMap::new();
+    let mut ttls = HashMap::new();
     ttls.insert(Bytes::from_static(b"f1"), 1_700_000_000_000u64);
     ttls.insert(Bytes::from_static(b"f2"), 1_700_000_999_000u64);
+    let min_expiry_ms = ttls.values().copied().min().unwrap_or(u64::MAX);
 
     let view = RedisValueRef::HashWithTtl {
         fields: &fields,
         ttls: &ttls,
+        min_expiry_ms,
     };
     let bytes = serialize_collection(&view).expect("serialize HashWithTtl");
 
     let decoded = deserialize_collection(&bytes, ValueType::Hash).expect("decode");
     match decoded {
-        RedisValue::HashWithTtl { fields, ttls } => {
+        RedisValue::HashWithTtl { fields, ttls, .. } => {
             assert_eq!(fields.len(), 2);
             assert_eq!(fields.get(b"f1".as_ref()), Some(&Bytes::from_static(b"v1")));
             assert_eq!(fields.get(b"f2".as_ref()), Some(&Bytes::from_static(b"v2")));
@@ -64,17 +66,19 @@ fn test_tiered_serde_partial_ttls_in_hash() {
     let mut fields = HashMap::new();
     fields.insert(Bytes::from_static(b"hot"), Bytes::from_static(b"1"));
     fields.insert(Bytes::from_static(b"cold"), Bytes::from_static(b"2"));
-    let mut ttls = BTreeMap::new();
+    let mut ttls = HashMap::new();
     ttls.insert(Bytes::from_static(b"hot"), 1_700_000_000_000u64);
+    let min_expiry_ms = ttls.values().copied().min().unwrap_or(u64::MAX);
     let view = RedisValueRef::HashWithTtl {
         fields: &fields,
         ttls: &ttls,
+        min_expiry_ms,
     };
 
     let bytes = serialize_collection(&view).expect("serialize partial");
     let decoded = deserialize_collection(&bytes, ValueType::Hash).expect("decode");
     match decoded {
-        RedisValue::HashWithTtl { fields, ttls } => {
+        RedisValue::HashWithTtl { fields, ttls, .. } => {
             assert_eq!(fields.len(), 2);
             assert_eq!(ttls.len(), 1);
             assert_eq!(ttls.get(b"hot".as_ref()), Some(&1_700_000_000_000u64));

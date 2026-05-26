@@ -619,7 +619,7 @@ fn read_entry_zero_copy(
                 let ttl_count = read_u32(cursor)? as usize;
                 validate_count(cursor, ttl_count, 12, "hash_ttls")?;
                 if ttl_count > 0 {
-                    let mut ttls = BTreeMap::new();
+                    let mut ttls = HashMap::with_capacity(ttl_count);
                     for _ in 0..ttl_count {
                         let field = read_bytes(cursor)?;
                         let mut ttl_buf = [0u8; 8];
@@ -627,7 +627,14 @@ fn read_entry_zero_copy(
                         let ttl_ms = u64::from_le_bytes(ttl_buf);
                         ttls.insert(field, ttl_ms);
                     }
-                    RedisValue::HashWithTtl { fields: map, ttls }
+                    // min_expiry_ms is purely in-memory; recompute from the
+                    // decoded ttls map (not stored in the RDB file).
+                    let min_expiry_ms = ttls.values().copied().min().unwrap_or(u64::MAX);
+                    RedisValue::HashWithTtl {
+                        fields: map,
+                        ttls,
+                        min_expiry_ms,
+                    }
                 } else {
                     RedisValue::Hash(map)
                 }
@@ -1063,7 +1070,7 @@ pub(crate) fn write_entry(
             // v2 trailer: no per-field TTLs for plain Hash. Emit ttl_count=0.
             buf.write_all(&0u32.to_le_bytes())?;
         }
-        RedisValueRef::HashWithTtl { fields, ttls } => {
+        RedisValueRef::HashWithTtl { fields, ttls, .. } => {
             buf.write_all(&(fields.len() as u32).to_le_bytes())?;
             for (field, val) in fields.iter() {
                 write_bytes(buf, field)?;
@@ -1232,7 +1239,7 @@ pub(crate) fn read_entry(
                 let ttl_count = read_u32(cursor)? as usize;
                 validate_count(cursor, ttl_count, 12, "hash_ttls")?;
                 if ttl_count > 0 {
-                    let mut ttls = BTreeMap::new();
+                    let mut ttls = HashMap::with_capacity(ttl_count);
                     for _ in 0..ttl_count {
                         let field = read_bytes(cursor)?;
                         let mut ttl_buf = [0u8; 8];
@@ -1240,7 +1247,14 @@ pub(crate) fn read_entry(
                         let ttl_ms = u64::from_le_bytes(ttl_buf);
                         ttls.insert(field, ttl_ms);
                     }
-                    RedisValue::HashWithTtl { fields: map, ttls }
+                    // min_expiry_ms is purely in-memory; recompute from the
+                    // decoded ttls map (not stored in the RDB file).
+                    let min_expiry_ms = ttls.values().copied().min().unwrap_or(u64::MAX);
+                    RedisValue::HashWithTtl {
+                        fields: map,
+                        ttls,
+                        min_expiry_ms,
+                    }
                 } else {
                     RedisValue::Hash(map)
                 }
