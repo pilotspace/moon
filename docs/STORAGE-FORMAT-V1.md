@@ -70,6 +70,12 @@ Authoritative source: `src/persistence/snapshot.rs`.
 
 - **Preamble (35 bytes):** `RRDSHARD` magic + version=2 + shard_id (u16 LE) + epoch (u64 LE) + last_lsn (u64 LE) + created_at_unix_ms (u64 LE).
 - **Body:** value-encoded keys + entries (custom RDB-style, supports listpack / intset / hashtable / sorted-set / stream encodings).
+- **Per-field hash TTL trailer (v2-only):** every `TYPE_HASH` body is followed by
+  `[ttl_count u32][field_len varint | field_bytes | ttl_ms u64]*`. `ttl_count = 0`
+  for plain hashes (no per-field TTL). v1 readers stop after the hash body and
+  reconstruct a plain `Hash`; v2 readers consume the trailer to rebuild
+  `HashWithTtl`. Authoritative encoder/decoder: `src/persistence/rdb.rs` —
+  search for `has_hash_ttl_trailer`.
 - **Trailer:** `0xFF` EOF byte + CRC32 over the whole file.
 - **PITR:** the embedded `last_lsn` ties each snapshot to the WAL position it shadows; replay resumes at `last_lsn + 1`.
 - **Forkless:** snapshots are produced by cooperative segment iteration with per-snapshot overflow buffers — no `fork()`, no COW RSS spike.
