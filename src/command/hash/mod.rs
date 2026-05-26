@@ -1122,4 +1122,190 @@ mod tests {
         seed_hash(&mut db, b"h", &[(b"a", b"1"), (b"b", b"2"), (b"c", b"3")]);
         assert_eq!(hlen(&mut db, &make_args(&[b"h"])), Frame::Integer(3));
     }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // Phase 198 — HEXPIRETIME / HPEXPIRETIME / HTTL / HPTTL / HPERSIST
+    //
+    // Return-code semantics (Valkey 9.0):
+    //   -2  field does not exist in the hash (or key is missing)
+    //   -1  field exists but has no TTL
+    //   ≥0  actual value (absolute unix time or remaining ms/s)
+    //    1  TTL removed (HPERSIST only)
+    // ──────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_hexpiretime_returns_neg2_for_missing_field() {
+        let mut db = Database::new();
+        seed_hash(&mut db, b"h", &[(b"f", b"v")]);
+        let r = hexpiretime(&db, &make_args(&[b"h", b"FIELDS", b"1", b"nope"]));
+        assert_eq!(r, Frame::Array(framevec![Frame::Integer(-2)]));
+    }
+
+    #[test]
+    fn test_hexpiretime_returns_neg1_for_no_ttl() {
+        let mut db = Database::new();
+        seed_hash(&mut db, b"h", &[(b"f", b"v")]);
+        let r = hexpiretime(&db, &make_args(&[b"h", b"FIELDS", b"1", b"f"]));
+        assert_eq!(r, Frame::Array(framevec![Frame::Integer(-1)]));
+    }
+
+    #[test]
+    fn test_hexpiretime_returns_absolute_seconds() {
+        let mut db = Database::new();
+        seed_hash(&mut db, b"h", &[(b"f", b"v")]);
+        let abs_ms: u64 = 1_800_000_000_000; // fixed absolute ms
+        expire_field_at(&mut db, b"h", b"f", abs_ms);
+        let r = hexpiretime(&db, &make_args(&[b"h", b"FIELDS", b"1", b"f"]));
+        assert_eq!(
+            r,
+            Frame::Array(framevec![Frame::Integer((abs_ms / 1000) as i64)])
+        );
+    }
+
+    #[test]
+    fn test_hpexpiretime_returns_absolute_ms() {
+        let mut db = Database::new();
+        seed_hash(&mut db, b"h", &[(b"f", b"v")]);
+        let abs_ms: u64 = 1_800_000_000_000;
+        expire_field_at(&mut db, b"h", b"f", abs_ms);
+        let r = hpexpiretime(&db, &make_args(&[b"h", b"FIELDS", b"1", b"f"]));
+        assert_eq!(
+            r,
+            Frame::Array(framevec![Frame::Integer(abs_ms as i64)])
+        );
+    }
+
+    #[test]
+    fn test_httl_returns_remaining_seconds() {
+        let mut db = Database::new();
+        seed_hash(&mut db, b"h", &[(b"f", b"v")]);
+        let now_ms = db.now_ms();
+        let abs_ms = now_ms + 60_000; // 60 seconds from now
+        expire_field_at(&mut db, b"h", b"f", abs_ms);
+        let r = httl(&db, &make_args(&[b"h", b"FIELDS", b"1", b"f"]));
+        // Should be ~60 (floor division, may be 59 depending on timing)
+        match r {
+            Frame::Array(ref items) => match &items[0] {
+                Frame::Integer(n) => assert!(*n >= 59 && *n <= 60, "expected ~60s, got {}", n),
+                other => panic!("expected Integer, got {:?}", other),
+            },
+            other => panic!("expected Array, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_httl_returns_zero_for_already_expired() {
+        // Simulate "expired but not yet reaped": push cached_now_ms past the TTL.
+        let mut db = Database::new();
+        seed_hash(&mut db, b"h", &[(b"f", b"v")]);
+        let abs_ms = db.now_ms() + 1_000;
+        expire_field_at(&mut db, b"h", b"f", abs_ms);
+        // Advance time past expiry without running the reaper.
+        db.set_cached_now_ms_for_test(abs_ms + 1);
+        let r = httl(&db, &make_args(&[b"h", b"FIELDS", b"1", b"f"]));
+        // Valkey returns 0 for already-expired-but-not-reaped fields.
+        assert_eq!(r, Frame::Array(framevec![Frame::Integer(0)]));
+    }
+
+    #[test]
+    fn test_hpttl_returns_remaining_ms() {
+        let mut db = Database::new();
+        seed_hash(&mut db, b"h", &[(b"f", b"v")]);
+        let now_ms = db.now_ms();
+        let abs_ms = now_ms + 60_000;
+        expire_field_at(&mut db, b"h", b"f", abs_ms);
+        let r = hpttl(&db, &make_args(&[b"h", b"FIELDS", b"1", b"f"]));
+        match r {
+            Frame::Array(ref items) => match &items[0] {
+                Frame::Integer(n) => {
+                    assert!(*n >= 59_000 && *n <= 60_000, "expected ~60000ms, got {}", n)
+                }
+                other => panic!("expected Integer, got {:?}", other),
+            },
+            other => panic!("expected Array, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_hpersist_removes_ttl_returns_one() {
+        let mut db = Database::new();
+        seed_hash(&mut db, b"h", &[(b"f", b"v")]);
+        let abs_ms = db.now_ms() + 60_000;
+        expire_field_at(&mut db, b"h", b"f", abs_ms);
+        let r = hpersist(&mut db, &make_args(&[b"h", b"FIELDS", b"1", b"f"]));
+        assert_eq!(r, Frame::Array(framevec![Frame::Integer(1)]));
+        // TTL must be gone now.
+        assert_eq!(db.hash_get_field_ttl_ms(b"h", b"f"), None);
+    }
+
+    #[test]
+    fn test_hpersist_returns_neg1_when_no_ttl() {
+        let mut db = Database::new();
+        seed_hash(&mut db, b"h", &[(b"f", b"v")]);
+        let r = hpersist(&mut db, &make_args(&[b"h", b"FIELDS", b"1", b"f"]));
+        assert_eq!(r, Frame::Array(framevec![Frame::Integer(-1)]));
+    }
+
+    #[test]
+    fn test_hpersist_returns_neg2_for_missing_field() {
+        let mut db = Database::new();
+        seed_hash(&mut db, b"h", &[(b"f", b"v")]);
+        let r = hpersist(&mut db, &make_args(&[b"h", b"FIELDS", b"1", b"nope"]));
+        assert_eq!(r, Frame::Array(framevec![Frame::Integer(-2)]));
+    }
+
+    #[test]
+    fn test_hpersist_downgrades_when_last_ttl_removed() {
+        let mut db = Database::new();
+        seed_hash(&mut db, b"h", &[(b"f", b"v"), (b"g", b"w")]);
+        let abs_ms = db.now_ms() + 60_000;
+        // Only field "f" gets a TTL.
+        expire_field_at(&mut db, b"h", b"f", abs_ms);
+        let r = hpersist(&mut db, &make_args(&[b"h", b"FIELDS", b"1", b"f"]));
+        assert_eq!(r, Frame::Array(framevec![Frame::Integer(1)]));
+        // After removing the last TTL, hash must downgrade to plain Hash.
+        // HEXPIRE with XX on "g" must return -2 (no TTL, confirming plain Hash encoding).
+        let check = hexpire(
+            &mut db,
+            &make_args(&[b"h", b"60", b"XX", b"FIELDS", b"1", b"g"]),
+        );
+        assert_eq!(check, Frame::Array(framevec![Frame::Integer(-2)]));
+    }
+
+    #[test]
+    fn test_hexpire_family_read_wrongtype_for_string_value() {
+        // HTTL on a key holding a plain string must return WRONGTYPE.
+        let mut db = Database::new();
+        let set_args = make_args(&[b"mystr", b"hello"]);
+        let _ = crate::command::string::set(&mut db, &set_args);
+        let r = httl(&db, &make_args(&[b"mystr", b"FIELDS", b"1", b"f"]));
+        assert!(
+            matches!(&r, Frame::Error(e) if e.starts_with(b"WRONGTYPE")),
+            "expected WRONGTYPE, got {:?}",
+            r
+        );
+    }
+
+    #[test]
+    fn test_hexpire_family_read_missing_key_returns_neg2_per_field() {
+        // Missing key: all requested fields return -2 (not an error).
+        let db = Database::new();
+        let r = httl(&db, &make_args(&[b"nokey", b"FIELDS", b"2", b"a", b"b"]));
+        assert_eq!(
+            r,
+            Frame::Array(framevec![Frame::Integer(-2), Frame::Integer(-2)])
+        );
+    }
+
+    #[test]
+    fn test_hexpire_family_read_numfields_zero_returns_error() {
+        // numfields=0 must return ERR, consistent with HEXPIRE phase 196.
+        let db = Database::new();
+        let r = httl(&db, &make_args(&[b"h", b"FIELDS", b"0"]));
+        assert!(
+            matches!(&r, Frame::Error(_)),
+            "expected ERR for numfields=0, got {:?}",
+            r
+        );
+    }
 }
