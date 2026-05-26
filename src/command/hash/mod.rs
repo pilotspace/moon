@@ -1305,4 +1305,336 @@ mod tests {
             r
         );
     }
+
+    // ──────────────────────────────────────────────────────────────────────────
+    // Phase 199 — HGETDEL / HGETEX atomic compound commands (issue #110).
+    // RED tests: fail until handlers land in commit 3 and 4.
+    // ──────────────────────────────────────────────────────────────────────────
+
+    // ── HGETDEL tests ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_hgetdel_returns_values_and_deletes() {
+        let mut db = Database::new();
+        seed_hash(&mut db, b"h", &[(b"f1", b"v1"), (b"f2", b"v2")]);
+        let r = hgetdel(&mut db, &make_args(&[b"h", b"FIELDS", b"2", b"f1", b"f2"]));
+        assert_eq!(
+            r,
+            Frame::Array(framevec![
+                Frame::BulkString(Bytes::copy_from_slice(b"v1")),
+                Frame::BulkString(Bytes::copy_from_slice(b"v2"))
+            ])
+        );
+        // Both fields gone — key must have been removed.
+        assert!(
+            !db.exists(b"h"),
+            "key must be deleted when last fields removed"
+        );
+    }
+
+    #[test]
+    fn test_hgetdel_returns_nil_for_missing_field() {
+        let mut db = Database::new();
+        seed_hash(&mut db, b"h", &[(b"f1", b"v1")]);
+        let r = hgetdel(
+            &mut db,
+            &make_args(&[b"h", b"FIELDS", b"2", b"f1", b"nope"]),
+        );
+        assert_eq!(
+            r,
+            Frame::Array(framevec![
+                Frame::BulkString(Bytes::copy_from_slice(b"v1")),
+                Frame::Null
+            ])
+        );
+    }
+
+    #[test]
+    fn test_hgetdel_deletes_key_when_last_field() {
+        let mut db = Database::new();
+        seed_hash(&mut db, b"h", &[(b"only", b"one")]);
+        let r = hgetdel(&mut db, &make_args(&[b"h", b"FIELDS", b"1", b"only"]));
+        assert_eq!(
+            r,
+            Frame::Array(framevec![Frame::BulkString(Bytes::copy_from_slice(b"one"))])
+        );
+        assert!(
+            !db.exists(b"h"),
+            "key must be deleted when hash becomes empty"
+        );
+    }
+
+    #[test]
+    fn test_hgetdel_on_listpack_encoded_hash() {
+        // A freshly seeded small hash stays in listpack encoding.
+        // HGETDEL must work on it without WRONGTYPE.
+        let mut db = Database::new();
+        seed_hash(&mut db, b"lp", &[(b"a", b"alpha"), (b"b", b"beta")]);
+        let r = hgetdel(&mut db, &make_args(&[b"lp", b"FIELDS", b"1", b"a"]));
+        assert_eq!(
+            r,
+            Frame::Array(framevec![Frame::BulkString(Bytes::copy_from_slice(
+                b"alpha"
+            ))])
+        );
+        // The other field must still be retrievable.
+        let remaining = hget(&mut db, &make_args(&[b"lp", b"b"]));
+        assert_eq!(
+            remaining,
+            Frame::BulkString(Bytes::copy_from_slice(b"beta"))
+        );
+    }
+
+    #[test]
+    fn test_hgetdel_on_hash_with_ttl_removes_ttl_sidecar() {
+        // Promote to HashWithTtl via HEXPIRE, then HGETDEL the TTL'd field.
+        let mut db = Database::new();
+        seed_hash(&mut db, b"h", &[(b"f", b"val"), (b"g", b"other")]);
+        let abs_ms = db.now_ms() + 60_000;
+        expire_field_at(&mut db, b"h", b"f", abs_ms);
+        // Field "f" now has a TTL — HGETDEL must return its value AND remove the
+        // TTL sidecar entry.
+        let r = hgetdel(&mut db, &make_args(&[b"h", b"FIELDS", b"1", b"f"]));
+        assert_eq!(
+            r,
+            Frame::Array(framevec![Frame::BulkString(Bytes::copy_from_slice(b"val"))])
+        );
+        // TTL sidecar entry must be gone.
+        assert_eq!(
+            db.hash_get_field_ttl_ms(b"h", b"f"),
+            None,
+            "TTL sidecar must be removed with the field"
+        );
+    }
+
+    #[test]
+    fn test_hgetdel_downgrades_when_last_ttl_removed() {
+        // Seed hash with two fields; give only "f" a TTL.
+        // Delete "f" via HGETDEL — the TTL sidecar is now empty.
+        // Remaining field "g" must survive; HEXPIRE XX on "g" → -2 (no TTL),
+        // confirming the encoding was downgraded to plain Hash.
+        let mut db = Database::new();
+        seed_hash(&mut db, b"h", &[(b"f", b"v1"), (b"g", b"v2")]);
+        let abs_ms = db.now_ms() + 60_000;
+        expire_field_at(&mut db, b"h", b"f", abs_ms);
+        let r = hgetdel(&mut db, &make_args(&[b"h", b"FIELDS", b"1", b"f"]));
+        assert_eq!(
+            r,
+            Frame::Array(framevec![Frame::BulkString(Bytes::copy_from_slice(b"v1"))])
+        );
+        // After removing the last TTL field the encoding must downgrade.
+        // HEXPIRE XX on "g" returns -2 (no TTL → plain Hash confirms downgrade).
+        let check = hexpire(
+            &mut db,
+            &make_args(&[b"h", b"60", b"XX", b"FIELDS", b"1", b"g"]),
+        );
+        assert_eq!(
+            check,
+            Frame::Array(framevec![Frame::Integer(-2)]),
+            "encoding must downgrade to plain Hash after last TTL removed"
+        );
+    }
+
+    #[test]
+    fn test_hgetdel_wrongtype_error() {
+        let mut db = Database::new();
+        db.set_string(Bytes::from_static(b"s"), Bytes::from_static(b"not_a_hash"));
+        let r = hgetdel(&mut db, &make_args(&[b"s", b"FIELDS", b"1", b"f"]));
+        assert!(
+            matches!(&r, Frame::Error(e) if e.starts_with(b"WRONGTYPE")),
+            "expected WRONGTYPE, got {:?}",
+            r
+        );
+    }
+
+    #[test]
+    fn test_hgetdel_numfields_zero_returns_error() {
+        let mut db = Database::new();
+        seed_hash(&mut db, b"h", &[(b"f", b"v")]);
+        let r = hgetdel(&mut db, &make_args(&[b"h", b"FIELDS", b"0"]));
+        assert!(
+            matches!(&r, Frame::Error(_)),
+            "numfields=0 must be rejected, got {:?}",
+            r
+        );
+    }
+
+    // ── HGETEX tests ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_hgetex_with_ex_updates_ttl() {
+        let mut db = Database::new();
+        seed_hash(&mut db, b"h", &[(b"f", b"val")]);
+        let now = db.now_ms();
+        let r = hgetex(
+            &mut db,
+            &make_args(&[b"h", b"EX", b"60", b"FIELDS", b"1", b"f"]),
+        );
+        assert_eq!(
+            r,
+            Frame::Array(framevec![Frame::BulkString(Bytes::copy_from_slice(b"val"))])
+        );
+        let ttl_ms = db
+            .hash_get_field_ttl_ms(b"h", b"f")
+            .expect("EX must set a TTL");
+        // Should be approximately now + 60_000 ms (allow ±100 ms for test jitter).
+        let expected = now + 60_000;
+        assert!(
+            (ttl_ms as i128 - expected as i128).abs() < 100,
+            "expected TTL ~{} got {}",
+            expected,
+            ttl_ms
+        );
+    }
+
+    #[test]
+    fn test_hgetex_with_px_updates_ttl_in_ms() {
+        let mut db = Database::new();
+        seed_hash(&mut db, b"h", &[(b"f", b"val")]);
+        let now = db.now_ms();
+        let r = hgetex(
+            &mut db,
+            &make_args(&[b"h", b"PX", b"5000", b"FIELDS", b"1", b"f"]),
+        );
+        assert_eq!(
+            r,
+            Frame::Array(framevec![Frame::BulkString(Bytes::copy_from_slice(b"val"))])
+        );
+        let ttl_ms = db
+            .hash_get_field_ttl_ms(b"h", b"f")
+            .expect("PX must set a TTL");
+        let expected = now + 5_000;
+        assert!(
+            (ttl_ms as i128 - expected as i128).abs() < 100,
+            "expected TTL ~{} got {}",
+            expected,
+            ttl_ms
+        );
+    }
+
+    #[test]
+    fn test_hgetex_with_exat_sets_absolute_ttl() {
+        let mut db = Database::new();
+        seed_hash(&mut db, b"h", &[(b"f", b"val")]);
+        // Far future: 2099-01-01 ≈ 4_070_908_800 seconds.
+        let r = hgetex(
+            &mut db,
+            &make_args(&[b"h", b"EXAT", b"4070908800", b"FIELDS", b"1", b"f"]),
+        );
+        assert_eq!(
+            r,
+            Frame::Array(framevec![Frame::BulkString(Bytes::copy_from_slice(b"val"))])
+        );
+        assert_eq!(
+            db.hash_get_field_ttl_ms(b"h", b"f"),
+            Some(4_070_908_800_u64 * 1_000),
+            "EXAT must store absolute ms"
+        );
+    }
+
+    #[test]
+    fn test_hgetex_with_pxat_sets_absolute_ms() {
+        let mut db = Database::new();
+        seed_hash(&mut db, b"h", &[(b"f", b"val")]);
+        let abs_ms = 4_070_908_800_000_u64;
+        let s = abs_ms.to_string();
+        let r = hgetex(
+            &mut db,
+            &make_args(&[b"h", b"PXAT", s.as_bytes(), b"FIELDS", b"1", b"f"]),
+        );
+        assert_eq!(
+            r,
+            Frame::Array(framevec![Frame::BulkString(Bytes::copy_from_slice(b"val"))])
+        );
+        assert_eq!(
+            db.hash_get_field_ttl_ms(b"h", b"f"),
+            Some(abs_ms),
+            "PXAT must store the exact ms value"
+        );
+    }
+
+    #[test]
+    fn test_hgetex_with_persist_removes_ttl() {
+        let mut db = Database::new();
+        seed_hash(&mut db, b"h", &[(b"f", b"val")]);
+        // Seed a TTL first.
+        let abs_ms = db.now_ms() + 60_000;
+        expire_field_at(&mut db, b"h", b"f", abs_ms);
+        assert!(
+            db.hash_get_field_ttl_ms(b"h", b"f").is_some(),
+            "pre-condition"
+        );
+        // HGETEX PERSIST must return the value and clear the TTL.
+        let r = hgetex(
+            &mut db,
+            &make_args(&[b"h", b"PERSIST", b"FIELDS", b"1", b"f"]),
+        );
+        assert_eq!(
+            r,
+            Frame::Array(framevec![Frame::BulkString(Bytes::copy_from_slice(b"val"))])
+        );
+        assert_eq!(
+            db.hash_get_field_ttl_ms(b"h", b"f"),
+            None,
+            "PERSIST must clear the TTL"
+        );
+    }
+
+    #[test]
+    fn test_hgetex_without_mode_returns_values_unchanged_ttl() {
+        // No TTL token — read only. Existing TTL must be preserved.
+        let mut db = Database::new();
+        seed_hash(&mut db, b"h", &[(b"f", b"val")]);
+        let abs_ms = db.now_ms() + 60_000;
+        expire_field_at(&mut db, b"h", b"f", abs_ms);
+        let r = hgetex(&mut db, &make_args(&[b"h", b"FIELDS", b"1", b"f"]));
+        assert_eq!(
+            r,
+            Frame::Array(framevec![Frame::BulkString(Bytes::copy_from_slice(b"val"))])
+        );
+        // TTL unchanged.
+        assert_eq!(
+            db.hash_get_field_ttl_ms(b"h", b"f"),
+            Some(abs_ms),
+            "no-mode HGETEX must not alter the TTL"
+        );
+    }
+
+    #[test]
+    fn test_hgetex_returns_nil_for_missing_field() {
+        let mut db = Database::new();
+        seed_hash(&mut db, b"h", &[(b"f", b"val")]);
+        let r = hgetex(&mut db, &make_args(&[b"h", b"FIELDS", b"1", b"nope"]));
+        assert_eq!(r, Frame::Array(framevec![Frame::Null]));
+    }
+
+    #[test]
+    fn test_hgetex_mutually_exclusive_modes_return_error() {
+        let mut db = Database::new();
+        seed_hash(&mut db, b"h", &[(b"f", b"v")]);
+        let r = hgetex(
+            &mut db,
+            &make_args(&[b"h", b"EX", b"60", b"PX", b"1000", b"FIELDS", b"1", b"f"]),
+        );
+        assert!(
+            matches!(&r, Frame::Error(_)),
+            "EX + PX together must be rejected, got {:?}",
+            r
+        );
+    }
+
+    #[test]
+    fn test_hgetex_wrongtype_error() {
+        let mut db = Database::new();
+        db.set_string(Bytes::from_static(b"s"), Bytes::from_static(b"not_a_hash"));
+        let r = hgetex(
+            &mut db,
+            &make_args(&[b"s", b"EX", b"60", b"FIELDS", b"1", b"f"]),
+        );
+        assert!(
+            matches!(&r, Frame::Error(e) if e.starts_with(b"WRONGTYPE")),
+            "expected WRONGTYPE, got {:?}",
+            r
+        );
+    }
 }

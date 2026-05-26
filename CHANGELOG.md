@@ -11,6 +11,48 @@ and **Change Data Capture (CDC)**, built additively on top of the existing
 per-shard WAL v3 + dual-root manifest. No changes to the KV hot path, MVCC,
 page format, or transaction layer.
 
+### Added — HGETDEL / HGETEX atomic compound hash commands (phase 199, issue #110)
+
+Two new Valkey 9.1 atomic compound hash commands:
+
+- `HGETDEL key FIELDS numfields field [field ...]` — returns the values of
+  the specified fields and deletes them from the hash atomically. Returns a
+  RESP Array with one `BulkString(value)` per found field and `Null` for
+  missing fields. If the hash becomes empty after all deletes the key is
+  removed entirely (auto-cleanup).
+
+- `HGETEX key [EX s | PX ms | EXAT unix-s | PXAT unix-ms | PERSIST] FIELDS numfields field [field ...]`
+  — returns the values of the specified fields and optionally updates (or
+  removes) their per-field TTLs atomically. TTL modes:
+  - `EX s`         — set relative expiry in **seconds** from now.
+  - `PX ms`        — set relative expiry in **milliseconds** from now.
+  - `EXAT unix-s`  — set absolute expiry as unix **seconds**.
+  - `PXAT unix-ms` — set absolute expiry as unix **milliseconds**.
+  - `PERSIST`      — remove any existing per-field TTL.
+  - (no mode)      — pure read; no TTL change (fast path, zero DB mutation).
+  TTL changes apply only to live (non-expired) fields. Missing / expired
+  fields return `Null` and leave TTLs untouched.
+
+Atomicity: per-shard single-threaded execution gives atomicity for free
+across the entire field list — no client can observe a partial state between
+reads and deletes/TTL-updates within a single call.
+
+Implementation:
+- Two new `Database` primitives in `src/storage/db.rs`:
+  - `hash_get_and_delete_field` — atomically reads and removes a single
+    field; handles Hash, HashListpack, and HashWithTtl (also removes TTL
+    sidecar). Downgrades HashWithTtl → Hash when the last TTL is removed.
+  - `cleanup_empty_hash` — removes the key when its hash has become empty;
+    called once after a HGETDEL/HGETEX field loop.
+- `HGETDEL` handler uses `parse_key_and_fields` (phase-198 shared parser)
+  plus a single `cleanup_empty_hash` call after the field loop.
+- `HGETEX` parser (`parse_hgetex_args`) scans the optional mode token(s)
+  before `FIELDS` with mutual-exclusion enforcement; uses saturating i128
+  arithmetic + u64 clamp for safe overflow handling (mirrors phase 196).
+- Both commands dispatch as writes (WF flags, `&mut Database`); neither is
+  added to `is_dispatch_read_supported`.
+- 17 new unit tests: 8 for HGETDEL, 9 for HGETEX.
+
 ### Added — Hash-field TTL read + persist (phase 198, issue #109)
 
 Five new Valkey 9.0 hash-field TTL commands:
