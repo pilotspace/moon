@@ -727,6 +727,56 @@ pub fn hpexpireat(db: &mut Database, args: &[Frame]) -> Frame {
     do_hexpire(db, args, true, true)
 }
 
+/// HGETDEL key FIELDS numfields field [field ...]
+///
+/// Atomically returns the value(s) of the specified fields and deletes them
+/// from the hash in a single operation. Returns a RESP Array with one entry
+/// per requested field: `BulkString(value)` when the field existed, or
+/// `Null` when the key or field was absent.
+///
+/// If the hash becomes empty after all deletes the key is removed entirely.
+///
+/// # Atomicity
+/// Guaranteed by per-shard single-threaded execution — no explicit locking
+/// is needed. No client can observe the partial state between reads and
+/// deletes within this call.
+pub fn hgetdel(db: &mut Database, args: &[Frame]) -> Frame {
+    let parsed = match parse_key_and_fields(args, "HGETDEL") {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+
+    // Upfront WRONGTYPE check: attempt to read the hash before any mutation.
+    // Avoids partially processing fields before surfacing the type error.
+    {
+        let now_ms = db.now_ms();
+        match db.get_hash_ref_if_alive(parsed.key, now_ms) {
+            Ok(_) => {}
+            Err(e) => return e,
+        }
+    }
+
+    let mut results: Vec<Frame> = Vec::with_capacity(parsed.fields.len());
+    for field in &parsed.fields {
+        match db.hash_get_and_delete_field(parsed.key, field) {
+            Ok(Some(v)) => results.push(Frame::BulkString(v)),
+            Ok(None) => results.push(Frame::Null),
+            Err(_wrong_type) => {
+                // Should not be reachable after the upfront check, but keep
+                // the error path for safety.
+                return Frame::Error(Bytes::from_static(
+                    b"WRONGTYPE Operation against a key holding the wrong kind of value",
+                ));
+            }
+        }
+    }
+
+    // Remove the key if the hash has become empty after all deletes.
+    db.cleanup_empty_hash(parsed.key);
+
+    Frame::Array(results.into())
+}
+
 /// HPERSIST key FIELDS numfields field [field ...]
 ///
 /// Removes the per-field TTL from each named field.  Returns a RESP Array
