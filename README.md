@@ -98,6 +98,21 @@ Measured vs Redis 8.6.1, co-located client and server, pipeline depth tuned per 
 | Native API QPS     | **19×**  | N/A     |
 | Bulk insert        | **23×**  | 1×      |
 
+### Hash-field TTL — Valkey 9.0/9.1 parity (OrbStack moon-dev, n=200K c=50, median of 3)
+
+Three-way comparison on the per-field TTL surface added in v0.2.0. Full methodology + 26 scenarios in [docs/perf/2026-05-27-hash-ttl-3way-bench.md](docs/perf/2026-05-27-hash-ttl-3way-bench.md); reproducible via [scripts/bench-hash-ttl-3way.sh](scripts/bench-hash-ttl-3way.sh).
+
+| Command          | Pipeline | Moon  | Redis 8.0.2 | Valkey 9.1.0 |
+|------------------|----------|------:|------------:|-------------:|
+| `HGET` plain     | p=16     | 2.11M | 2.08M       | 2.11M        |
+| `HSET` plain     | p=16     | 1.56M | 1.89M       | 1.77M        |
+| `HEXPIRE`        | p=16     | 1.53M | N/A         | 1.64M        |
+| `HTTL`           | p=16     | 1.57M | N/A         | 1.75M        |
+| `HGETEX EX`      | p=1      | 250K  | N/A         | 251K         |
+| `HGETEX` no-mode | p=1      | 250K  | N/A         | 253K         |
+
+Plain Hash HGET p=16 ties Redis (1.01×) and Valkey (1.00×). HEXPIRE-family Moon vs Valkey: 0.90–0.99× across the surface (Valkey leads HEXPIRE p=16 by 7%, HTTL p=16 by 10%; HGETEX hits 0.99× parity). Redis 8.x has no HEXPIRE-family — Moon is the only Redis-compatible alternative aside from Valkey. The internal `HashWithTtl` HGET / HLEN paths use a cached `min_expiry_ms` for an O(1) fast path that brings them to 1.03× of plain `Hash` (was 80× slower pre-fix; see PR #126).
+
 ## Quick start
 
 ### Prerequisites
@@ -133,6 +148,10 @@ OK
 "world"
 127.0.0.1:6379> HSET user:1 name Alice age 30
 (integer) 2
+127.0.0.1:6379> HEXPIRE user:1 3600 FIELDS 1 age   # Valkey 9.0 per-field TTL
+1) (integer) 1
+127.0.0.1:6379> HTTL user:1 FIELDS 1 age
+1) (integer) 3600
 127.0.0.1:6379> FT.CREATE idx ON HASH PREFIX 1 doc: SCHEMA emb VECTOR HNSW 6 DIM 384 TYPE FLOAT32 DISTANCE_METRIC COSINE
 OK
 ```

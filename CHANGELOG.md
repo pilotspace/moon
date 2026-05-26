@@ -11,6 +11,61 @@ and **Change Data Capture (CDC)**, built additively on top of the existing
 per-shard WAL v3 + dual-root manifest. No changes to the KV hot path, MVCC,
 page format, or transaction layer.
 
+### Docs — Hash-field TTL three-way benchmark suite (PR #127)
+
+- `scripts/bench-hash-ttl.sh` (2-way harness) + `scripts/bench-hash-ttl-3way.sh`
+  (3-way harness with Valkey 9.1.0). Both use `redis-benchmark` against
+  concurrent Moon / Redis / Valkey servers on distinct ports with trap-based
+  cleanup, FLUSHALL + re-seed between scenarios, and median-of-3 RPS reporting.
+- `docs/perf/2026-05-26-hash-ttl-bench.md` — pre-fix 2-way baseline that
+  surfaced the two HashWithTtl perf issues fixed in PR #126.
+- `docs/perf/2026-05-27-hash-ttl-3way-bench.md` — headline Moon vs Redis 8.0.2
+  vs Valkey 9.1.0 comparison across 26 scenarios. Plain HGET p=16 ties both
+  competitors (1.00–1.01×). HEXPIRE-family Moon vs Valkey: 0.90–0.99× across
+  the surface; HGETEX hits parity at 0.99×. Redis 8.x has no HEXPIRE-family —
+  Moon is the only Redis-compatible alternative aside from Valkey.
+
+### Performance — HashWithTtl HGET + HLEN O(1) fast path (PR #126)
+
+Resolves the two HashWithTtl perf issues surfaced by the 2026-05-26 bench:
+
+- `HGET` on `HashWithTtl` was 39.9% slower than plain `Hash` at p=16; now
+  **+4% faster** (within VM measurement noise — effective parity).
+- `HLEN` on `HashWithTtl` was 80.5× slower than plain `Hash` at 1000 fields;
+  now **1.00–1.03× parity** (the O(N) live-count scan is fully eliminated when
+  no field has expired).
+
+Two changes shipped together (variant layout forces both at once):
+
+- **`HashWithTtl.ttls` BTreeMap → HashMap.** Per-field TTL probe becomes O(1)
+  HashMap lookup instead of O(log N) BTreeMap descent. Active-expire iteration
+  doesn't require ordered keys.
+- **`HashWithTtl.min_expiry_ms: u64` cached minimum.** Tracks the smallest
+  expiry across all per-field TTLs. Invariant: `min_expiry_ms = min(ttls.values())`.
+  When `cached_now_ms < min_expiry_ms`, no field can be expired, so `HGET`
+  skips the `ttls` probe and `HLEN` returns `fields.len()` directly. The hot
+  path is a single `u64 < u64` compare. Invariant maintenance is amortized
+  O(1) (one `min(min, ts_ms)` per `HEXPIRE`; conditional recompute on
+  `HPERSIST` / overwrite / active reap when the removed TTL equalled the min).
+
+No on-disk format change. `min_expiry_ms` is recomputed at load time from the
+existing v2 RDB per-field TTL trailer. 6 new invariant tests cover HEXPIRE /
+HPERSIST / HSET-overwrite / active-reap / persistence-decode paths.
+
+### Docs — Hash-field TTL audit follow-up (PR #123)
+
+- `docs/commands.mdx` — Hashes section bumped from "(14)" → "(25)" and now
+  lists all 11 new Valkey 9.0/9.1 commands plus a paragraph on the per-field
+  return convention and the active-expiry downgrade behaviour.
+- `docs/STORAGE-FORMAT-V1.md` §3.2 — added the per-field hash TTL trailer
+  format: every `TYPE_HASH` body is followed by
+  `[ttl_count u32][field_len varint | field_bytes | ttl_ms u64]*` in v2 RDB
+  files; v1 readers stop after the hash body.
+- `src/command/metadata.rs` — `HEXPIRETIME` / `HPEXPIRETIME` / `HTTL` /
+  `HPTTL` PHF flags flipped from `R` (READONLY) to `RF` (READONLY|FAST) —
+  per-field TTL lookup is O(1) thanks to the PR #126 fast path. Cosmetic;
+  no behavioural impact.
+
 ### Added — HGETDEL / HGETEX atomic compound hash commands (phase 199, issue #110)
 
 Two new Valkey 9.1 atomic compound hash commands:
