@@ -54,7 +54,8 @@ pub enum RedisValueRef<'a> {
     /// `ttls` against the current shard clock to skip expired fields.
     HashWithTtl {
         fields: &'a HashMap<Bytes, Bytes>,
-        ttls: &'a BTreeMap<Bytes, u64>,
+        ttls: &'a HashMap<Bytes, u64>,
+        min_expiry_ms: u64,
     },
     List(&'a VecDeque<Bytes>),
     Set(&'a HashSet<Bytes>),
@@ -292,9 +293,15 @@ impl CompactValue {
             let rv = unsafe { &*self.heap_collection_ptr() };
             match rv {
                 RedisValue::Hash(map) => RedisValueRef::Hash(map),
-                RedisValue::HashWithTtl { fields, ttls } => {
-                    RedisValueRef::HashWithTtl { fields, ttls }
-                }
+                RedisValue::HashWithTtl {
+                    fields,
+                    ttls,
+                    min_expiry_ms,
+                } => RedisValueRef::HashWithTtl {
+                    fields,
+                    ttls,
+                    min_expiry_ms: *min_expiry_ms,
+                },
                 RedisValue::List(list) => RedisValueRef::List(list),
                 RedisValue::Set(set) => RedisValueRef::Set(set),
                 RedisValue::SortedSet { members, scores } => {

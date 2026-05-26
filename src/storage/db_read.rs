@@ -19,10 +19,15 @@ pub enum HashRef<'a> {
     Listpack(&'a Listpack),
     /// Live-filtered view of a `HashWithTtl` entry.  Fields absent from `ttls`
     /// are immortal; fields present in `ttls` are expired when `ttl <= now_ms`.
+    ///
+    /// `min_expiry_ms` is the cached minimum across all TTL values.  When
+    /// `now_ms < min_expiry_ms` no field has expired, so all three methods can
+    /// take the O(1) fast path and skip per-field TTL probes entirely.
     WithTtl {
         fields: &'a HashMap<Bytes, Bytes>,
-        ttls: &'a BTreeMap<Bytes, u64>,
+        ttls: &'a HashMap<Bytes, u64>,
         now_ms: u64,
+        min_expiry_ms: u64,
     },
 }
 
@@ -44,8 +49,15 @@ impl<'a> HashRef<'a> {
                 fields,
                 ttls,
                 now_ms,
+                min_expiry_ms,
             } => {
-                // Field is expired when its absolute expiry ≤ now_ms.
+                // Fast path: if now_ms < min_expiry_ms, no field has expired.
+                // Invariant: min_expiry_ms = min(ttls.values()), so every
+                // individual TTL is also > now_ms.  Skip the HashMap probe.
+                if *now_ms < *min_expiry_ms {
+                    return fields.get(field).cloned();
+                }
+                // Slow path: at least one field may have expired.
                 let expired = ttls.get(field).is_some_and(|&t| t <= *now_ms);
                 if expired {
                     None
@@ -68,10 +80,18 @@ impl<'a> HashRef<'a> {
                 fields,
                 ttls,
                 now_ms,
-            } => fields
-                .keys()
-                .filter(|f| ttls.get(*f).map_or(true, |&t| t > *now_ms))
-                .count(),
+                min_expiry_ms,
+            } => {
+                // Fast path: no fields have expired → return length directly.
+                if *now_ms < *min_expiry_ms {
+                    return fields.len();
+                }
+                // Slow path: at least one field may have expired; scan all.
+                fields
+                    .keys()
+                    .filter(|f| ttls.get(*f).map_or(true, |&t| t > *now_ms))
+                    .count()
+            }
         }
     }
 
@@ -87,11 +107,19 @@ impl<'a> HashRef<'a> {
                 fields,
                 ttls,
                 now_ms,
-            } => fields
-                .iter()
-                .filter(|(f, _)| ttls.get(*f).map_or(true, |&t| t > *now_ms))
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect(),
+                min_expiry_ms,
+            } => {
+                // Fast path: no fields have expired → collect all entries.
+                if *now_ms < *min_expiry_ms {
+                    return fields.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                }
+                // Slow path: filter expired entries individually.
+                fields
+                    .iter()
+                    .filter(|(f, _)| ttls.get(*f).map_or(true, |&t| t > *now_ms))
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect()
+            }
         }
     }
 }

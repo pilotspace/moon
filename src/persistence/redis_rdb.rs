@@ -265,7 +265,7 @@ fn write_rdb_entry(buf: &mut Vec<u8>, key: &[u8], entry: &Entry, base_ts: u32) {
         // the hash body as a plain RDB_TYPE_HASH (forward-compatible — Redis
         // receivers reconstruct it as a TTL-less hash, identical to Moon's
         // own v1 RDB reader behavior).
-        RedisValueRef::HashWithTtl { fields, ttls } => {
+        RedisValueRef::HashWithTtl { fields, ttls, .. } => {
             if !ttls.is_empty() {
                 tracing::warn!(
                     key = %String::from_utf8_lossy(key),

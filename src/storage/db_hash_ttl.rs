@@ -89,7 +89,11 @@ impl Database {
         }
 
         let action = match rv {
-            RedisValue::HashWithTtl { fields, ttls } => {
+            RedisValue::HashWithTtl {
+                fields,
+                ttls,
+                min_expiry_ms,
+            } => {
                 for f in &to_remove {
                     fields.remove(f.as_ref());
                     ttls.remove(f.as_ref());
@@ -99,6 +103,10 @@ impl Database {
                 } else if ttls.is_empty() {
                     PostReap::NeedDowngrade(std::mem::take(fields))
                 } else {
+                    // All reaped TTLs were <= now_ms, so the old min is gone.
+                    // Recompute unconditionally — we cannot know which TTL was
+                    // the minimum without scanning.
+                    *min_expiry_ms = ttls.values().copied().min().unwrap_or(u64::MAX);
                     PostReap::FieldsRemoved
                 }
             }

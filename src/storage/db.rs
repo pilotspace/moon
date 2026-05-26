@@ -73,16 +73,20 @@ fn promote_to_hash_with_ttl(rv: &mut RedisValue) {
             let RedisValue::Hash(fields) = owned else {
                 unreachable!("matched Hash above");
             };
+            // ttls starts empty; min_expiry_ms = u64::MAX (sentinel: "no TTLs
+            // yet").  hash_set_field_ttl will update min on the first insert.
             *rv = RedisValue::HashWithTtl {
                 fields,
-                ttls: std::collections::BTreeMap::new(),
+                ttls: HashMap::new(),
+                min_expiry_ms: u64::MAX,
             };
         }
         RedisValue::HashListpack(lp) => {
             let fields = lp.to_hash_map();
             *rv = RedisValue::HashWithTtl {
                 fields,
-                ttls: std::collections::BTreeMap::new(),
+                ttls: HashMap::new(),
+                min_expiry_ms: u64::MAX,
             };
         }
         _ => panic!("promote_to_hash_with_ttl called on non-hash variant"),
@@ -198,6 +202,21 @@ impl Database {
         self.cached_now_ms = ms;
     }
 
+    /// Return the cached `min_expiry_ms` for the `HashWithTtl` at `key`.
+    ///
+    /// Used by unit tests to assert that the fast-path invariant is maintained
+    /// after HEXPIRE, HPERSIST, HSET overwrite, and active-reap operations.
+    /// Returns `None` if the key does not exist or is not a `HashWithTtl`.
+    #[cfg(test)]
+    pub fn hash_min_expiry_ms_for_test(&self, key: &[u8]) -> Option<u64> {
+        use super::compact_value::RedisValueRef;
+        let entry = self.data.get(key)?;
+        match entry.value.as_redis_value() {
+            RedisValueRef::HashWithTtl { min_expiry_ms, .. } => Some(min_expiry_ms),
+            _ => None,
+        }
+    }
+
     /// Fallback: update the cached timestamp via `SystemTime::now()` syscall.
     ///
     /// Kept for callers that do not yet have a `CachedClock` reference (e.g. the
@@ -284,12 +303,19 @@ impl Database {
                     map.remove(field);
                     *rv = RedisValue::Hash(map);
                 }
-                RedisValue::HashWithTtl { fields, ttls } => {
+                RedisValue::HashWithTtl {
+                    fields,
+                    ttls,
+                    min_expiry_ms,
+                } => {
+                    let old_ttl = ttls.remove(field);
                     fields.remove(field);
-                    ttls.remove(field);
                     if ttls.is_empty() {
                         let m = std::mem::take(fields);
                         *rv = RedisValue::Hash(m);
+                    } else if old_ttl == Some(*min_expiry_ms) {
+                        // The removed field held the min; recompute.
+                        *min_expiry_ms = ttls.values().copied().min().unwrap_or(u64::MAX);
                     }
                 }
                 _ => unreachable!(),
@@ -299,7 +325,12 @@ impl Database {
 
         // 4. Promote to HashWithTtl if needed.
         promote_to_hash_with_ttl(rv);
-        let RedisValue::HashWithTtl { ttls, .. } = rv else {
+        let RedisValue::HashWithTtl {
+            ttls,
+            min_expiry_ms,
+            ..
+        } = rv
+        else {
             unreachable!("just promoted")
         };
 
@@ -317,8 +348,11 @@ impl Database {
             return Ok(-2);
         }
 
-        // 6. Set the TTL.
+        // 6. Set the TTL and maintain the cached minimum.
         ttls.insert(Bytes::copy_from_slice(field), ts_ms);
+        if ts_ms < *min_expiry_ms {
+            *min_expiry_ms = ts_ms;
+        }
         self.maybe_has_expiring_keys = true;
         Ok(1)
     }
@@ -353,7 +387,7 @@ impl Database {
                     FieldState::Missing
                 }
             }
-            RedisValueRef::HashWithTtl { fields, ttls } => {
+            RedisValueRef::HashWithTtl { fields, ttls, .. } => {
                 if !fields.contains_key(field) {
                     FieldState::Missing
                 } else if let Some(&ms) = ttls.get(field) {
@@ -377,13 +411,24 @@ impl Database {
         let Some(rv) = entry.value.as_redis_value_mut() else {
             return false;
         };
-        let RedisValue::HashWithTtl { fields, ttls } = rv else {
+        let RedisValue::HashWithTtl {
+            fields,
+            ttls,
+            min_expiry_ms,
+        } = rv
+        else {
             return false;
         };
-        let had_ttl = ttls.remove(field).is_some();
-        if had_ttl && ttls.is_empty() {
-            let m = std::mem::take(fields);
-            *rv = RedisValue::Hash(m);
+        let removed = ttls.remove(field);
+        let had_ttl = removed.is_some();
+        if had_ttl {
+            if ttls.is_empty() {
+                let m = std::mem::take(fields);
+                *rv = RedisValue::Hash(m);
+            } else if removed == Some(*min_expiry_ms) {
+                // Removed field held the minimum; recompute from remaining entries.
+                *min_expiry_ms = ttls.values().copied().min().unwrap_or(u64::MAX);
+            }
         }
         had_ttl
     }
@@ -405,12 +450,24 @@ impl Database {
         let Some(rv) = entry.value.as_redis_value_mut() else {
             return;
         };
-        let RedisValue::HashWithTtl { fields: _, ttls } = rv else {
+        let RedisValue::HashWithTtl {
+            fields: _,
+            ttls,
+            min_expiry_ms,
+        } = rv
+        else {
             // Plain Hash or HashListpack carries no per-field TTLs.
             return;
         };
+        // Track whether any removed TTL equaled the cached minimum.
+        // If so, recompute after all removals rather than re-scanning per step.
+        let mut min_invalidated = false;
         for f in fields {
-            ttls.remove(f.as_ref());
+            if let Some(t) = ttls.remove(f.as_ref()) {
+                if t == *min_expiry_ms {
+                    min_invalidated = true;
+                }
+            }
         }
         if ttls.is_empty() {
             // Downgrade: borrow ends, then re-borrow to swap variant.
@@ -421,6 +478,8 @@ impl Database {
                 let m = std::mem::take(fmap);
                 *rv2 = RedisValue::Hash(m);
             }
+        } else if min_invalidated {
+            *min_expiry_ms = ttls.values().copied().min().unwrap_or(u64::MAX);
         }
     }
 
@@ -464,10 +523,14 @@ impl Database {
                     Ok((false, false))
                 }
             }
-            RedisValue::HashWithTtl { fields, ttls } => {
+            RedisValue::HashWithTtl {
+                fields,
+                ttls,
+                min_expiry_ms,
+            } => {
                 let removed = fields.remove(field).is_some();
                 if removed {
-                    ttls.remove(field);
+                    let old_ttl = ttls.remove(field);
                     if ttls.is_empty() && !fields.is_empty() {
                         // All TTLs gone but fields remain — downgrade to plain Hash.
                         let m = std::mem::take(fields);
@@ -480,6 +543,10 @@ impl Database {
                         let m = std::mem::take(fields);
                         *rv = RedisValue::Hash(m);
                         return Ok((true, true));
+                    }
+                    // TTLs remain; recompute min if the removed field held it.
+                    if old_ttl == Some(*min_expiry_ms) {
+                        *min_expiry_ms = ttls.values().copied().min().unwrap_or(u64::MAX);
                     }
                     let empty = fields.is_empty();
                     Ok((true, empty))
@@ -541,10 +608,14 @@ impl Database {
                     Ok(None)
                 }
             }
-            RedisValue::HashWithTtl { fields, ttls } => {
+            RedisValue::HashWithTtl {
+                fields,
+                ttls,
+                min_expiry_ms,
+            } => {
                 let v = fields.remove(field);
                 if v.is_some() {
-                    ttls.remove(field);
+                    let old_ttl = ttls.remove(field);
                     if ttls.is_empty() && !fields.is_empty() {
                         // All TTLs gone, live fields remain — downgrade to Hash.
                         let m = std::mem::take(fields);
@@ -553,6 +624,9 @@ impl Database {
                         // Both maps empty — leave an empty Hash shell; caller
                         // must call cleanup_empty_hash to remove the key.
                         *rv = RedisValue::Hash(HashMap::new());
+                    } else if old_ttl == Some(*min_expiry_ms) {
+                        // Removed field held the minimum; recompute.
+                        *min_expiry_ms = ttls.values().copied().min().unwrap_or(u64::MAX);
                     }
                 }
                 Ok(v)
@@ -1607,10 +1681,15 @@ impl Database {
             Some(entry) => match entry.value.as_redis_value() {
                 RedisValueRef::Hash(map) => Ok(Some(HashRef::Map(map))),
                 RedisValueRef::HashListpack(lp) => Ok(Some(HashRef::Listpack(lp))),
-                RedisValueRef::HashWithTtl { fields, ttls } => Ok(Some(HashRef::WithTtl {
+                RedisValueRef::HashWithTtl {
+                    fields,
+                    ttls,
+                    min_expiry_ms,
+                } => Ok(Some(HashRef::WithTtl {
                     fields,
                     ttls,
                     now_ms,
+                    min_expiry_ms,
                 })),
                 _ => Err(Self::wrongtype_error()),
             },

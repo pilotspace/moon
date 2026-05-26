@@ -150,7 +150,24 @@ pub enum RedisValue {
     /// call; auto-downgrades back to `Hash` when the last TTL is removed.
     HashWithTtl {
         fields: HashMap<Bytes, Bytes>,
-        ttls: BTreeMap<Bytes, u64>,
+        /// Sparse field → absolute-expiry-ms map.  Changed from `BTreeMap` to
+        /// `HashMap` (O(1) lookup vs O(log N)) in perf/hash-with-ttl-fast-path.
+        /// Ordered iteration is not a requirement — active-expiry sweeps all
+        /// entries regardless, and the BTreeMap overhead showed up in profiles.
+        ttls: HashMap<Bytes, u64>,
+        /// Cached minimum expiry across all entries in `ttls`.
+        ///
+        /// Invariant: `min_expiry_ms == ttls.values().copied().min().unwrap_or(u64::MAX)`.
+        ///
+        /// When `cached_now_ms < min_expiry_ms` **no** field has expired, so
+        /// read commands (HGET, HLEN, HGETALL, …) can skip the per-field TTL
+        /// probe entirely and return results directly.  This is a pure
+        /// in-memory optimisation — not persisted to RDB/AOF; recomputed from
+        /// the `ttls` map on every decode.
+        ///
+        /// Use `u64::MAX` as the "no TTLs" sentinel so the hot-path compare
+        /// `now_ms < min_expiry_ms` works without an Option unwrap.
+        min_expiry_ms: u64,
     },
     List(VecDeque<Bytes>),
     Set(HashSet<Bytes>),
@@ -225,10 +242,10 @@ impl RedisValue {
         match self {
             RedisValue::String(b) => b.len(),
             RedisValue::Hash(map) => map.iter().map(|(k, v)| k.len() + v.len() + 64).sum(),
-            // 64B/entry baseline + 48B per TTL'd field (BTreeMap node overhead).
-            RedisValue::HashWithTtl { fields, ttls } => {
+            // 64B/entry baseline + 32B per TTL'd field (HashMap entry overhead).
+            RedisValue::HashWithTtl { fields, ttls, .. } => {
                 let f: usize = fields.iter().map(|(k, v)| k.len() + v.len() + 64).sum();
-                let t: usize = ttls.iter().map(|(k, _)| k.len() + 8 + 48).sum();
+                let t: usize = ttls.iter().map(|(k, _)| k.len() + 8 + 32).sum();
                 f + t
             }
             RedisValue::List(list) => list.iter().map(|elem| elem.len() + 24).sum(),

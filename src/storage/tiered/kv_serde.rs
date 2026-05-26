@@ -88,7 +88,7 @@ pub fn serialize_collection(value: &RedisValueRef<'_>) -> Option<Vec<u8>> {
             // Same layout as the RDB v2 trailer (see src/persistence/rdb.rs).
             buf.write_all(&0u32.to_le_bytes()).ok()?;
         }
-        RedisValueRef::HashWithTtl { fields, ttls } => {
+        RedisValueRef::HashWithTtl { fields, ttls, .. } => {
             buf.write_all(&(fields.len() as u32).to_le_bytes()).ok()?;
             for (field, val) in fields.iter() {
                 write_len_bytes(&mut buf, field);
@@ -249,13 +249,19 @@ pub fn deserialize_collection(data: &[u8], value_type: ValueType) -> Option<Redi
             match read_u32_le(&mut cursor) {
                 Ok(0) => Some(RedisValue::Hash(map)),
                 Ok(ttl_count) => {
-                    let mut ttls = BTreeMap::new();
+                    let mut ttls = HashMap::with_capacity(ttl_count as usize);
                     for _ in 0..ttl_count as usize {
                         let field = read_len_bytes(&mut cursor).ok()?;
                         let ttl_ms = read_u64_le(&mut cursor).ok()?;
                         ttls.insert(field, ttl_ms);
                     }
-                    Some(RedisValue::HashWithTtl { fields: map, ttls })
+                    // min_expiry_ms is purely in-memory; recompute after decode.
+                    let min_expiry_ms = ttls.values().copied().min().unwrap_or(u64::MAX);
+                    Some(RedisValue::HashWithTtl {
+                        fields: map,
+                        ttls,
+                        min_expiry_ms,
+                    })
                 }
                 Err(_) => Some(RedisValue::Hash(map)),
             }

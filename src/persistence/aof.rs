@@ -557,7 +557,7 @@ pub fn generate_rewrite_commands(databases: &[Database]) -> BytesMut {
                 //      in the TTL sidecar — one per TTL'd field for clarity
                 //      (BGREWRITEAOF is rare; per-field framing keeps the
                 //      replay shim simple, see `persistence::replay`).
-                RedisValueRef::HashWithTtl { fields, ttls } => {
+                RedisValueRef::HashWithTtl { fields, ttls, .. } => {
                     if fields.is_empty() {
                         continue;
                     }
