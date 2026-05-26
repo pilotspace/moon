@@ -491,6 +491,97 @@ impl Database {
         }
     }
 
+    // -- HGETDEL / HGETEX family (phase 199 / issue #110) ----------------------
+    //
+    // Atomic compound get-and-mutate primitives for the two Valkey 9.1 commands.
+    // Atomicity is guaranteed by the per-shard single-threaded execution model —
+    // no explicit locking is required.
+
+    /// Atomically read and remove a single field from a hash.
+    ///
+    /// Returns `Ok(Some(value))` when the field existed and was removed.
+    /// Returns `Ok(None)` when the key is missing or the field does not exist.
+    /// Returns `Err(WrongType)` when the key exists but is not a hash.
+    ///
+    /// For `HashWithTtl` the TTL sidecar entry is removed together with the
+    /// field. When the last TTL sidecar entry is removed the encoding is
+    /// downgraded back to a plain `Hash` (mirrors `hash_delete_field`).
+    ///
+    /// Callers **must** call [`Database::cleanup_empty_hash`] after processing
+    /// all fields — this method intentionally does NOT delete the key when the
+    /// hash becomes empty, so that the caller can accumulate results first.
+    pub fn hash_get_and_delete_field(
+        &mut self,
+        key: &[u8],
+        field: &[u8],
+    ) -> Result<Option<Bytes>, WrongType> {
+        let Some(entry) = self.data.get_mut(key) else {
+            return Ok(None);
+        };
+        let Some(rv) = entry.value.as_redis_value_mut() else {
+            return Err(WrongType);
+        };
+        match rv {
+            RedisValue::Hash(map) => Ok(map.remove(field)),
+            RedisValue::HashListpack(lp) => {
+                // Locate the field-value pair by linear scan then remove both
+                // listpack slots (value first so the field index stays valid).
+                let mut found: Option<(usize, Bytes)> = None;
+                for (i, (f, v)) in lp.iter_pairs().enumerate() {
+                    if f.as_bytes() == field {
+                        found = Some((i, v.to_bytes()));
+                        break;
+                    }
+                }
+                if let Some((i, v)) = found {
+                    lp.remove_at(i * 2 + 1); // value first (higher index)
+                    lp.remove_at(i * 2);     // then field
+                    Ok(Some(v))
+                } else {
+                    Ok(None)
+                }
+            }
+            RedisValue::HashWithTtl { fields, ttls } => {
+                let v = fields.remove(field);
+                if v.is_some() {
+                    ttls.remove(field);
+                    if ttls.is_empty() && !fields.is_empty() {
+                        // All TTLs gone, live fields remain — downgrade to Hash.
+                        let m = std::mem::take(fields);
+                        *rv = RedisValue::Hash(m);
+                    } else if ttls.is_empty() && fields.is_empty() {
+                        // Both maps empty — leave an empty Hash shell; caller
+                        // must call cleanup_empty_hash to remove the key.
+                        *rv = RedisValue::Hash(HashMap::new());
+                    }
+                }
+                Ok(v)
+            }
+            _ => Err(WrongType),
+        }
+    }
+
+    /// Remove the key when its hash value has become empty.
+    ///
+    /// No-op if the key is absent, is not a hash, or still has live fields.
+    /// Intended to be called after a series of `hash_get_and_delete_field`
+    /// calls to clean up the key when all fields were consumed.
+    pub fn cleanup_empty_hash(&mut self, key: &[u8]) {
+        let should_delete = self.data.get(key).is_some_and(|e| {
+            match e.value.as_redis_value() {
+                super::compact_value::RedisValueRef::Hash(m) => m.is_empty(),
+                super::compact_value::RedisValueRef::HashListpack(lp) => lp.is_empty(),
+                super::compact_value::RedisValueRef::HashWithTtl { fields, .. } => {
+                    fields.is_empty()
+                }
+                _ => false,
+            }
+        });
+        if should_delete {
+            self.data.remove(key);
+        }
+    }
+
     /// Estimated memory usage of all entries in this database.
     pub fn estimated_memory(&self) -> usize {
         self.used_memory
