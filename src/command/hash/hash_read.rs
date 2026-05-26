@@ -816,9 +816,9 @@ pub fn hrandfield_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame 
 //   2. WRONGTYPE probe via `get_hash_ref_if_alive` (immutable read, no side effects).
 //   3. Per-field loop: map `FieldState` → integer via `map_ttl` closure.
 
-use crate::storage::db::FieldState;
-use crate::protocol::FrameVec;
 use super::hash_write::parse_key_and_fields;
+use crate::protocol::FrameVec;
+use crate::storage::db::FieldState;
 
 /// Core driver for HEXPIRETIME / HPEXPIRETIME / HTTL / HPTTL.
 ///
@@ -879,9 +879,7 @@ pub fn hexpiretime(db: &Database, args: &[Frame]) -> Frame {
 /// Returns the absolute TTL of each field as a unix timestamp in **milliseconds**.
 /// `-2` = field missing, `-1` = no TTL, `≥0` = absolute unix-ms.
 pub fn hpexpiretime(db: &Database, args: &[Frame]) -> Frame {
-    do_hexpiretime_read(db, args, "HPEXPIRETIME", |abs_ms, _now_ms| {
-        abs_ms as i64
-    })
+    do_hexpiretime_read(db, args, "HPEXPIRETIME", |abs_ms, _now_ms| abs_ms as i64)
 }
 
 /// HTTL key FIELDS numfields field [field ...]

@@ -11,6 +11,46 @@ and **Change Data Capture (CDC)**, built additively on top of the existing
 per-shard WAL v3 + dual-root manifest. No changes to the KV hot path, MVCC,
 page format, or transaction layer.
 
+### Added — Hash-field TTL read + persist (phase 198, issue #109)
+
+Five new Valkey 9.0 hash-field TTL commands:
+
+- `HEXPIRETIME key FIELDS numfields field [field ...]` — absolute expiry
+  per field as a unix timestamp in **seconds**.
+- `HPEXPIRETIME key FIELDS numfields field [field ...]` — absolute expiry
+  per field as a unix timestamp in **milliseconds**.
+- `HTTL key FIELDS numfields field [field ...]` — remaining TTL per field
+  in **seconds**; already-expired-but-not-reaped fields return `0`.
+- `HPTTL key FIELDS numfields field [field ...]` — remaining TTL per field
+  in **milliseconds**; same `0` edge-case for expired-but-not-reaped.
+- `HPERSIST key FIELDS numfields field [field ...]` — removes the per-field
+  TTL; downgrades `HashWithTtl` back to plain `Hash` when the last TTL is
+  removed (handled by the phase-195 `hash_persist_field` primitive).
+
+Per-field return codes (Valkey 9.0):
+- `-2` — field does not exist (or key is missing — **not** a WRONGTYPE error)
+- `-1` — field exists but has no TTL
+- `≥0` — absolute unix time or remaining duration (HEXPIRETIME/HPEXPIRETIME)
+- `1` — TTL successfully removed (HPERSIST only)
+
+WRONGTYPE is returned immediately (before field iteration) when the key
+holds a non-hash value.
+
+Implementation:
+- `FieldState` tri-state enum and `hash_field_state` helper (pre-landed in
+  phase 197) provide the zero-allocation field-state read used by all five
+  commands.
+- `parse_key_and_fields` shared parser (`hash_write.rs`) extracts
+  `key FIELDS numfields field [field ...]`; reuses `SmallVec<[&[u8]; 4]>`
+  to avoid heap allocation for the common ≤4-field case.
+- Four read handlers (`HEXPIRETIME`, `HPEXPIRETIME`, `HTTL`, `HPTTL`) take
+  `&Database`; `HPERSIST` takes `&mut Database`.
+- All five commands routed in both `dispatch()` (mutable path) and
+  `dispatch_read_inner()` / `is_dispatch_read_supported()` (shared-read
+  path) for the four read commands.
+- 14 unit tests cover all return-code variants, the already-expired edge
+  case, WRONGTYPE, missing key, numfields=0, and encoding downgrade.
+
 ### Added — Hash-field active expiration (phase 197, issue #108)
 
 All 9 hash read commands (`HGET`, `HMGET`, `HGETALL`, `HEXISTS`, `HLEN`,

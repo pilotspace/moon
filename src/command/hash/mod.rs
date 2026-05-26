@@ -1169,10 +1169,7 @@ mod tests {
         let abs_ms: u64 = 1_800_000_000_000;
         expire_field_at(&mut db, b"h", b"f", abs_ms);
         let r = hpexpiretime(&db, &make_args(&[b"h", b"FIELDS", b"1", b"f"]));
-        assert_eq!(
-            r,
-            Frame::Array(framevec![Frame::Integer(abs_ms as i64)])
-        );
+        assert_eq!(r, Frame::Array(framevec![Frame::Integer(abs_ms as i64)]));
     }
 
     #[test]

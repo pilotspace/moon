@@ -763,11 +763,7 @@ pub fn hpersist(db: &mut Database, args: &[Frame]) -> Frame {
 
     // Missing key: all fields are -2.
     let Some(_href) = href_check else {
-        let codes: Vec<Frame> = parsed
-            .fields
-            .iter()
-            .map(|_| Frame::Integer(-2))
-            .collect();
+        let codes: Vec<Frame> = parsed.fields.iter().map(|_| Frame::Integer(-2)).collect();
         return Frame::Array(FrameVec::from_vec(codes));
     };
 
