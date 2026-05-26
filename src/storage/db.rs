@@ -202,6 +202,21 @@ impl Database {
         self.cached_now_ms = ms;
     }
 
+    /// Return the cached `min_expiry_ms` for the `HashWithTtl` at `key`.
+    ///
+    /// Used by unit tests to assert that the fast-path invariant is maintained
+    /// after HEXPIRE, HPERSIST, HSET overwrite, and active-reap operations.
+    /// Returns `None` if the key does not exist or is not a `HashWithTtl`.
+    #[cfg(test)]
+    pub fn hash_min_expiry_ms_for_test(&self, key: &[u8]) -> Option<u64> {
+        use super::compact_value::RedisValueRef;
+        let entry = self.data.get(key)?;
+        match entry.value.as_redis_value() {
+            RedisValueRef::HashWithTtl { min_expiry_ms, .. } => Some(min_expiry_ms),
+            _ => None,
+        }
+    }
+
     /// Fallback: update the cached timestamp via `SystemTime::now()` syscall.
     ///
     /// Kept for callers that do not yet have a `CachedClock` reference (e.g. the

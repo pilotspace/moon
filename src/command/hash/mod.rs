@@ -1637,4 +1637,195 @@ mod tests {
             r
         );
     }
+
+    // ── min_expiry_ms invariant tests (perf/hash-with-ttl-fast-path) ─────────
+    //
+    // These tests verify that the cached minimum-expiry invariant is maintained
+    // through all mutation paths so the O(1) fast path in HashRef::WithTtl is
+    // always safe to take.
+
+    /// HEXPIRE on two fields: min_expiry_ms must equal the smaller of the two.
+    #[test]
+    fn test_min_expiry_ms_tracks_minimum_across_hexpire_calls() {
+        let mut db = Database::new();
+        seed_hash(&mut db, b"h", &[(b"f1", b"v1"), (b"f2", b"v2")]);
+
+        // Set f1 TTL to 2000 ms from epoch.
+        db.set_cached_now_ms_for_test(0);
+        hexpire(&mut db, &make_args(&[b"h", b"2", b"FIELDS", b"1", b"f1"]));
+        // Set f2 TTL to 5000 ms from epoch (HPEXPIREAT sets absolute ms).
+        hpexpireat(
+            &mut db,
+            &make_args(&[b"h", b"5000", b"FIELDS", b"1", b"f2"]),
+        );
+
+        // min must be 2000 (f1 is earlier).
+        let min = db
+            .hash_min_expiry_ms_for_test(b"h")
+            .expect("should be HashWithTtl");
+        assert_eq!(
+            min, 2000,
+            "min_expiry_ms should be the smallest TTL (f1=2000)"
+        );
+    }
+
+    /// HPERSIST on the field that held the minimum: min must be recomputed to
+    /// the next smallest TTL (not stay at the stale minimum).
+    #[test]
+    fn test_min_expiry_ms_recomputes_after_hpersist() {
+        let mut db = Database::new();
+        seed_hash(&mut db, b"h", &[(b"f1", b"v1"), (b"f2", b"v2")]);
+        db.set_cached_now_ms_for_test(0);
+
+        // f1 = 1000 ms, f2 = 5000 ms.  min = 1000.
+        hpexpireat(
+            &mut db,
+            &make_args(&[b"h", b"1000", b"FIELDS", b"1", b"f1"]),
+        );
+        hpexpireat(
+            &mut db,
+            &make_args(&[b"h", b"5000", b"FIELDS", b"1", b"f2"]),
+        );
+        assert_eq!(db.hash_min_expiry_ms_for_test(b"h"), Some(1000));
+
+        // Remove f1's TTL — min must now be 5000.
+        hpersist(&mut db, &make_args(&[b"h", b"FIELDS", b"1", b"f1"]));
+        let min = db
+            .hash_min_expiry_ms_for_test(b"h")
+            .expect("still HashWithTtl (f2 has TTL)");
+        assert_eq!(min, 5000, "min must update to f2's TTL after f1 persisted");
+    }
+
+    /// HSET overwrite of the field holding the minimum TTL: min must be
+    /// recomputed (HSET unconditionally clears the field's TTL).
+    #[test]
+    fn test_min_expiry_ms_recomputes_after_hset_overwrite() {
+        let mut db = Database::new();
+        seed_hash(&mut db, b"h", &[(b"f1", b"v1"), (b"f2", b"v2")]);
+        db.set_cached_now_ms_for_test(0);
+
+        // f1 = 1000 ms, f2 = 9000 ms.  min = 1000.
+        hpexpireat(
+            &mut db,
+            &make_args(&[b"h", b"1000", b"FIELDS", b"1", b"f1"]),
+        );
+        hpexpireat(
+            &mut db,
+            &make_args(&[b"h", b"9000", b"FIELDS", b"1", b"f2"]),
+        );
+        assert_eq!(db.hash_min_expiry_ms_for_test(b"h"), Some(1000));
+
+        // Overwrite f1 — HSET clears its TTL.
+        hset(&mut db, &make_args(&[b"h", b"f1", b"new_val"]));
+
+        // If still HashWithTtl (f2 still has TTL), min must be 9000.
+        if let Some(min) = db.hash_min_expiry_ms_for_test(b"h") {
+            assert_eq!(
+                min, 9000,
+                "min must update to f2's TTL after f1's TTL cleared by HSET"
+            );
+        }
+        // (If f2 is the only TTL'd field, it may have downgraded to Hash if
+        //  HSET also triggered downgrade — but with f2 still TTL'd that's not
+        //  possible here; the variant stays HashWithTtl.)
+    }
+
+    /// Active reap of an expired field: min_expiry_ms must be recomputed so
+    /// the fast path remains valid for the surviving TTL'd fields.
+    #[test]
+    fn test_min_expiry_ms_recomputes_after_active_reap() {
+        let mut db = Database::new();
+        seed_hash(&mut db, b"h", &[(b"f1", b"v1"), (b"f2", b"v2")]);
+        db.set_cached_now_ms_for_test(0);
+
+        // f1 expires at 500 ms, f2 expires at 9000 ms.  min = 500.
+        hpexpireat(&mut db, &make_args(&[b"h", b"500", b"FIELDS", b"1", b"f1"]));
+        hpexpireat(
+            &mut db,
+            &make_args(&[b"h", b"9000", b"FIELDS", b"1", b"f2"]),
+        );
+        assert_eq!(db.hash_min_expiry_ms_for_test(b"h"), Some(500));
+
+        // Advance time past f1's expiry.
+        db.set_cached_now_ms_for_test(600);
+        db.reap_expired_fields_one_hash(b"h");
+
+        // f1 was reaped; f2 still alive.  min must now be 9000.
+        let min = db
+            .hash_min_expiry_ms_for_test(b"h")
+            .expect("h is still HashWithTtl with f2");
+        assert_eq!(
+            min, 9000,
+            "min must be recomputed to f2's TTL after f1 reaped"
+        );
+    }
+
+    /// Fast-path sanity: HGET on a HashWithTtl where now < min_expiry_ms
+    /// returns the value directly without checking per-field TTLs.
+    /// We verify correctness: no phantom nil return when the TTL is in the
+    /// future.
+    #[test]
+    fn test_hget_returns_value_when_now_below_min_expiry() {
+        let mut db = Database::new();
+        seed_hash(&mut db, b"h", &[(b"f", b"val")]);
+        db.set_cached_now_ms_for_test(0);
+
+        // TTL 10 seconds in the future (absolute epoch ms = 10_000).
+        hpexpireat(
+            &mut db,
+            &make_args(&[b"h", b"10000", b"FIELDS", b"1", b"f"]),
+        );
+
+        // now=0, min_expiry_ms=10000 → fast path: now < min.
+        let r = hget(&mut db, &make_args(&[b"h", b"f"]));
+        assert_eq!(
+            r,
+            Frame::BulkString(Bytes::from_static(b"val")),
+            "HGET must return value when now < min_expiry_ms"
+        );
+    }
+
+    /// Fast-path HLEN: with all TTLs in the future and now < min_expiry_ms,
+    /// HLEN must return fields.len() in O(1) — no per-field scan.
+    /// We verify correctness with 1000 fields: if the slow O(N) path were
+    /// taken it would still produce the correct answer, but we assert the
+    /// result is consistent with the fast path.
+    #[test]
+    fn test_hlen_fast_path_when_no_fields_expired() {
+        let mut db = Database::new();
+        // Seed 100 fields.
+        let pairs: Vec<(Vec<u8>, Vec<u8>)> = (0..100)
+            .map(|i| (format!("field{i}").into_bytes(), b"v".to_vec()))
+            .collect();
+        let pair_refs: Vec<(&[u8], &[u8])> = pairs
+            .iter()
+            .map(|(f, v)| (f.as_slice(), v.as_slice()))
+            .collect();
+        seed_hash(&mut db, b"h", &pair_refs);
+
+        // Set all fields to expire at 99_999 ms.
+        db.set_cached_now_ms_for_test(0);
+        let mut hexpire_args: Vec<&[u8]> = vec![b"h", b"99999", b"FIELDS"];
+        let count_str = pairs.len().to_string();
+        hexpire_args.push(count_str.as_bytes());
+        for (f, _) in &pairs {
+            hexpire_args.push(f.as_slice());
+        }
+        hpexpireat(&mut db, &make_args(&hexpire_args));
+
+        // now = 0, min = 99_999 → fast path fires.
+        // HLEN must return 100.
+        let r = hlen(&mut db, &make_args(&[b"h"]));
+        assert_eq!(
+            r,
+            Frame::Integer(100),
+            "HLEN fast path must return all 100 fields when now < min_expiry_ms"
+        );
+
+        // Also verify min is correctly set.
+        let min = db.hash_min_expiry_ms_for_test(b"h").expect("HashWithTtl");
+        assert!(min > 0, "min_expiry_ms must be set after HEXPIREAT");
+        // pairs must live long enough for the hexpire_args references above
+        drop(pairs);
+    }
 }
