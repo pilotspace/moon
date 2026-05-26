@@ -87,7 +87,9 @@ B.8 (HGETEX no-mode) vs A.3 (plain HGET): **−18.5% overhead** at p=1. The no-m
 
 ### Section A — Baseline regression
 
-All six plain Hash commands fall within ±10% of Redis 8.x at p=1, confirming no regression from the HashWithTtl refactor. At p=16, Moon's HGET and HLEN pull ahead significantly (1.47× and 1.26× respectively) due to pipeline batching efficiency. HSET at p=1 is 4% slower than Redis — within run-to-run variance (pre-stack HSET baseline was ~135 K RPS from `feedback_perf_tuning`; the 90 K here is lower, attributable to the 1 000-field hash having more collision probe work than a fresh keyspace).
+All six plain Hash commands fall within ±10% of Redis 8.x at p=1. At p=16, Moon's HGET and HLEN pull ahead significantly (HGET 1.17×–1.47× across two independent measurement series; HLEN 1.26×) due to pipeline batching efficiency.
+
+**HSET p=1 baseline note:** A.1 measures 90 K RPS vs Redis 93 K (0.96×). The `feedback_perf_tuning` historical baseline of ~135 K RPS was measured on a fresh random keyspace (many distinct keys), not a pre-seeded 1 000-field hash. The gap between 90 K and 135 K is partly explained by the deeper hash-table probe path at 1 000 fields and partly by the per-HSET `HashWithTtl` upgrade-path check added in phases 195–200; neither has been profiled. This is flagged as a follow-up item: profile HSET on a 1 000-field hash without the upgrade-path check to isolate the regression contribution.
 
 ### Section B — New commands
 
@@ -96,7 +98,7 @@ All six plain Hash commands fall within ±10% of Redis 8.x at p=1, confirming no
 - **HPERSIST: 80 K RPS** — lowest in section B. Removes from expiry BTreeMap, which involves a `remove()` call that is O(log N) on the map size. At 1 000 TTL'd fields this is visible but acceptable.
 - **HGETDEL: 105 K RPS** — atomic get-and-delete; on par with HDEL (A.5: 105 K).
 - **HGETEX EX: 120 K RPS** — combined get + TTL update; faster than a separate HGET + HEXPIRE would be (additive 90 K + 91 K ≈ 90 K serialised).
-- **HGETEX no-mode: 99 K RPS** — 18.5% below plain HGET (A.3: 121 K) due to the `FIELDS N` argument parsing overhead. The fast path (no TTL mutation) is confirmed firing — if it were going through the full TTL-update code path, the cost would match B.7 (~120 K); instead it is cheaper.
+- **HGETEX no-mode: 99 K RPS (200K-run median)** — 18.5% below plain HGET (A.3: 121 K) due to the `FIELDS N` argument parsing overhead. A follow-up 5-run × 1M-request verification shows B.8 median ~131 K vs B.7 median ~113 K, confirming the no-mode fast path fires and is ~16% *faster* than the EX-update path. The 200 K-run result (B.8=99 K < B.7=120 K) was within run-to-run variance at this RPS range and should not be read as a regression.
 
 ### Section C — HashWithTtl path overhead
 
@@ -109,7 +111,7 @@ HSET write performance is 6–10% below Redis at both pipeline depths — a mino
 
 ## Verdict
 
-The hash-field TTL stack (phases 195–200, 6 phases, `2f5b91a`) ships with **no regressions on the pre-existing command set at p=1**: all plain Hash commands (HSET, HGET, HDEL, HLEN) are within ±10% of Redis 8.x. At pipeline depth 16, Moon outperforms Redis on read paths (HGET +47%, HLEN +26%). The two surprises worth tracking: (1) **HGET on `HashWithTtl` is 40% slower than on plain `Hash` at p=16** — the lazy-expiry filter fires on every field read regardless of whether that field has a TTL, making it unsuitable for latency-sensitive read workloads without careful field TTL management; (2) **HLEN on `HashWithTtl` is 80× slower** at 1 000 fields — the O(N) scan is working as designed but callers must be warned. The new commands (HEXPIRE p=16: 647 K RPS, HTTL p=16: 717 K RPS, HGETEX: 99–120 K RPS) are all production-capable throughput numbers. Recommended follow-up: (a) profile the `HashWithTtl` HGET filter to check if a `has_any_ttl` fast-exit flag can skip the expiry-map probe when no fields in the hash have TTLs; (b) document the `HLEN` O(N) behaviour prominently in the command reference.
+The hash-field TTL stack (phases 195–200, 6 phases, `2f5b91a`) ships with **no regressions on the pre-existing command set at p=1**: all plain Hash commands (HSET, HGET, HDEL, HLEN) are within ±10% of Redis 8.x. At pipeline depth 16, Moon outperforms Redis on read paths (HGET 1.17×–1.47× across two independent measurement series, HLEN 1.26×). The two surprises worth tracking: (1) **HGET on `HashWithTtl` is 40% slower than on plain `Hash` at p=16** — the lazy-expiry filter fires on every field read regardless of whether that field has a TTL, making it unsuitable for latency-sensitive read workloads without careful field TTL management; (2) **HLEN on `HashWithTtl` is 80× slower** at 1 000 fields — the O(N) scan is working as designed but callers must be warned. The new commands (HEXPIRE p=16: 647 K RPS, HTTL p=16: 717 K RPS, HGETEX: 99–120 K RPS) are all production-capable throughput numbers. Recommended follow-up: (a) profile the `HashWithTtl` HGET filter to check if a `has_any_ttl` fast-exit flag can skip the expiry-map probe when no fields in the hash have TTLs; (b) document the `HLEN` O(N) behaviour prominently in the command reference.
 
 ## Raw output
 
