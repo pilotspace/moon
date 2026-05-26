@@ -777,6 +777,312 @@ pub fn hgetdel(db: &mut Database, args: &[Frame]) -> Frame {
     Frame::Array(results.into())
 }
 
+// ── HGETEX — Valkey 9.1 atomic get-with-TTL-update command ───────────────────
+
+/// TTL-update mode for `HGETEX`.
+///
+/// Parsed once before the per-field loop so the match is lifted out of the
+/// hot path.  `None` is the fast path (no TTL mutation).
+#[derive(Debug, Clone, Copy)]
+enum HgetexMode {
+    /// No TTL change — pure read.
+    NoOp,
+    /// Relative seconds from now.
+    Ex(i64),
+    /// Relative milliseconds from now.
+    Px(i64),
+    /// Absolute unix-seconds.
+    ExAt(i64),
+    /// Absolute unix-milliseconds.
+    PxAt(i64),
+    /// Remove any existing TTL on the field.
+    Persist,
+}
+
+/// Parse `key [EX s | PX ms | EXAT us | PXAT ums | PERSIST] FIELDS numfields field [...]`.
+///
+/// Returns `(key, mode, fields)` or a `Frame::Error` on any parse failure.
+/// Mode tokens are mutually exclusive — duplicate or conflicting tokens return
+/// `ERR syntax error`.
+fn parse_hgetex_args<'a>(
+    args: &'a [Frame],
+) -> Result<HgetexParsed<'a>, Frame> {
+    // Minimum: key + FIELDS + numfields + ≥1 field = 4 elements.
+    if args.is_empty() {
+        return Err(Frame::Error(Bytes::from_static(
+            b"ERR wrong number of arguments for 'HGETEX' command",
+        )));
+    }
+
+    let key = match extract_bytes(&args[0]) {
+        Some(k) => k.as_ref(),
+        None => {
+            return Err(Frame::Error(Bytes::from_static(
+                b"ERR wrong number of arguments for 'HGETEX' command",
+            )));
+        }
+    };
+
+    // Scan args[1..] for optional mode token(s) then FIELDS keyword.
+    // Valid layouts:
+    //   key FIELDS numfields field ...
+    //   key EX s FIELDS numfields field ...
+    //   key PX ms FIELDS numfields field ...
+    //   key EXAT us FIELDS numfields field ...
+    //   key PXAT ums FIELDS numfields field ...
+    //   key PERSIST FIELDS numfields field ...
+    let mut mode = HgetexMode::NoOp;
+    let mut mode_count = 0u8;
+    let mut fields_keyword_pos: Option<usize> = None;
+
+    let mut i = 1usize;
+    while i < args.len() {
+        let tok = match extract_bytes(&args[i]) {
+            Some(t) => t,
+            None => {
+                return Err(Frame::Error(Bytes::from_static(b"ERR syntax error")));
+            }
+        };
+
+        if tok.eq_ignore_ascii_case(b"FIELDS") {
+            fields_keyword_pos = Some(i);
+            break;
+        }
+
+        if tok.eq_ignore_ascii_case(b"PERSIST") {
+            mode_count += 1;
+            if mode_count > 1 {
+                return Err(Frame::Error(Bytes::from_static(b"ERR syntax error")));
+            }
+            mode = HgetexMode::Persist;
+            i += 1;
+            continue;
+        }
+
+        // EX / PX / EXAT / PXAT all expect a numeric argument next.
+        let next_mode = if tok.eq_ignore_ascii_case(b"EX") {
+            Some(HgetexMode::Ex(0))
+        } else if tok.eq_ignore_ascii_case(b"PX") {
+            Some(HgetexMode::Px(0))
+        } else if tok.eq_ignore_ascii_case(b"EXAT") {
+            Some(HgetexMode::ExAt(0))
+        } else if tok.eq_ignore_ascii_case(b"PXAT") {
+            Some(HgetexMode::PxAt(0))
+        } else {
+            return Err(Frame::Error(Bytes::from_static(b"ERR syntax error")));
+        };
+
+        mode_count += 1;
+        if mode_count > 1 {
+            return Err(Frame::Error(Bytes::from_static(b"ERR syntax error")));
+        }
+
+        // Consume the numeric argument.
+        i += 1;
+        if i >= args.len() {
+            return Err(Frame::Error(Bytes::from_static(b"ERR syntax error")));
+        }
+        let num_tok = match extract_bytes(&args[i]) {
+            Some(t) => t,
+            None => {
+                return Err(Frame::Error(Bytes::from_static(
+                    b"ERR value is not an integer or out of range",
+                )));
+            }
+        };
+        let n: i64 = match std::str::from_utf8(num_tok)
+            .ok()
+            .and_then(|s| s.parse().ok())
+        {
+            Some(v) => v,
+            None => {
+                return Err(Frame::Error(Bytes::from_static(
+                    b"ERR value is not an integer or out of range",
+                )));
+            }
+        };
+        mode = match next_mode {
+            Some(HgetexMode::Ex(_)) => HgetexMode::Ex(n),
+            Some(HgetexMode::Px(_)) => HgetexMode::Px(n),
+            Some(HgetexMode::ExAt(_)) => HgetexMode::ExAt(n),
+            Some(HgetexMode::PxAt(_)) => HgetexMode::PxAt(n),
+            _ => unreachable!(),
+        };
+        i += 1;
+    }
+
+    let fkw_pos = match fields_keyword_pos {
+        Some(p) => p,
+        None => {
+            return Err(Frame::Error(Bytes::from_static(
+                b"ERR syntax error, FIELDS keyword not found",
+            )));
+        }
+    };
+
+    // args[fkw_pos+1] = numfields
+    let numfields_pos = fkw_pos + 1;
+    if numfields_pos >= args.len() {
+        return Err(Frame::Error(Bytes::from_static(
+            b"ERR wrong number of arguments for 'HGETEX' command",
+        )));
+    }
+    let numfields: usize = match extract_bytes(&args[numfields_pos]) {
+        Some(b) => match std::str::from_utf8(b)
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+        {
+            Some(n) => n,
+            None => {
+                return Err(Frame::Error(Bytes::from_static(
+                    b"ERR value is not an integer or out of range",
+                )));
+            }
+        },
+        None => {
+            return Err(Frame::Error(Bytes::from_static(
+                b"ERR value is not an integer or out of range",
+            )));
+        }
+    };
+
+    if numfields == 0 {
+        return Err(Frame::Error(Bytes::from_static(
+            b"ERR Parameter `numFields` should be greater than 0",
+        )));
+    }
+
+    let first_field_pos = numfields_pos + 1;
+    let actual_fields = args.len().saturating_sub(first_field_pos);
+    if actual_fields < numfields {
+        return Err(Frame::Error(Bytes::from_static(
+            b"ERR Parameter `numFields` is more than number of arguments",
+        )));
+    }
+
+    let mut fields: SmallVec<[&'a [u8]; 4]> = SmallVec::new();
+    for j in first_field_pos..first_field_pos + numfields {
+        match extract_bytes(&args[j]) {
+            Some(f) => fields.push(f.as_ref()),
+            None => {
+                return Err(Frame::Error(Bytes::from_static(b"ERR invalid field name")));
+            }
+        }
+    }
+
+    Ok(HgetexParsed { key, mode, fields })
+}
+
+/// Parsed HGETEX arguments.
+struct HgetexParsed<'a> {
+    key: &'a [u8],
+    mode: HgetexMode,
+    fields: SmallVec<[&'a [u8]; 4]>,
+}
+
+/// HGETEX key [EX s | PX ms | EXAT unix-s | PXAT unix-ms | PERSIST] FIELDS numfields field [...]
+///
+/// Atomically returns the value(s) of the specified fields and optionally
+/// updates (or removes) their per-field TTLs in a single operation.
+///
+/// Returns a RESP Array with one entry per requested field:
+/// - `BulkString(value)` when the field exists and is not expired.
+/// - `Null` when the key, field is absent or already expired.
+///
+/// TTL mode semantics (only applied when the field is found and live):
+/// - `EX s`        — set relative expiry in seconds from now.
+/// - `PX ms`       — set relative expiry in milliseconds from now.
+/// - `EXAT unix-s` — set absolute expiry as unix-seconds.
+/// - `PXAT unix-ms`— set absolute expiry as unix-milliseconds.
+/// - `PERSIST`     — remove any existing per-field TTL.
+/// - (none)        — pure read; no TTL change.
+///
+/// # Atomicity
+/// Guaranteed by per-shard single-threaded execution — no explicit locking
+/// is needed. The read and optional TTL-update are a single atomic unit.
+pub fn hgetex(db: &mut Database, args: &[Frame]) -> Frame {
+    let parsed = match parse_hgetex_args(args) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+
+    // Upfront WRONGTYPE check via immutable borrow before any mutation.
+    let now_ms = db.now_ms();
+    match db.get_hash_ref_if_alive(parsed.key, now_ms) {
+        Ok(_) => {}
+        Err(e) => return e,
+    }
+
+    // Compute the absolute expiry deadline once (outside the per-field loop)
+    // for the EX/PX/EXAT/PXAT modes.  Use saturating i128 arithmetic to
+    // avoid overflow on extreme values, then clamp to u64 — mirrors the
+    // parse_hexpire_args approach from phase 196.
+    let abs_ms_opt: Option<u64> = match parsed.mode {
+        HgetexMode::NoOp | HgetexMode::Persist => None,
+        HgetexMode::Ex(s) => {
+            let ms = (now_ms as i128).saturating_add((s as i128).saturating_mul(1_000));
+            Some(ms.clamp(0, u64::MAX as i128) as u64)
+        }
+        HgetexMode::Px(ms) => {
+            let abs = (now_ms as i128).saturating_add(ms as i128);
+            Some(abs.clamp(0, u64::MAX as i128) as u64)
+        }
+        HgetexMode::ExAt(s) => {
+            let ms = (s as i128).saturating_mul(1_000);
+            Some(ms.clamp(0, u64::MAX as i128) as u64)
+        }
+        HgetexMode::PxAt(ms) => {
+            Some((ms as i128).clamp(0, u64::MAX as i128) as u64)
+        }
+    };
+
+    let mut results: Vec<Frame> = Vec::with_capacity(parsed.fields.len());
+    for field in &parsed.fields {
+        // Read the live value first via the read-only path (respects lazy TTL
+        // filtering for HashWithTtl without triggering a mutable borrow).
+        let value = {
+            // Re-borrow immutably each iteration — the previous iteration's
+            // mutable TTL write (if any) has already dropped.
+            match db.get_hash_ref_if_alive(parsed.key, now_ms) {
+                Ok(Some(href)) => href.get_field(field),
+                Ok(None) => None,
+                Err(_) => None, // type-checked above; unreachable in practice
+            }
+        };
+
+        match value {
+            None => {
+                // Field missing or expired — push Null; do NOT touch TTL.
+                results.push(Frame::Null);
+            }
+            Some(v) => {
+                // Apply TTL mutation only for live fields.
+                match parsed.mode {
+                    HgetexMode::NoOp => {}
+                    HgetexMode::Persist => {
+                        db.hash_persist_field(parsed.key, field);
+                    }
+                    _ => {
+                        // All TTL-setting modes share the same path via abs_ms_opt.
+                        if let Some(abs_ms) = abs_ms_opt {
+                            // Ignore result code — field existence already confirmed.
+                            let _ = db.hash_set_field_ttl(
+                                parsed.key,
+                                field,
+                                abs_ms,
+                                HashTtlCond::Always,
+                            );
+                        }
+                    }
+                }
+                results.push(Frame::BulkString(v));
+            }
+        }
+    }
+
+    Frame::Array(results.into())
+}
+
 /// HPERSIST key FIELDS numfields field [field ...]
 ///
 /// Removes the per-field TTL from each named field.  Returns a RESP Array
