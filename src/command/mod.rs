@@ -131,7 +131,7 @@ fn dispatch_inner(
             }
         }
         (4, b'h') => {
-            // HSET HGET HDEL HLEN
+            // HSET HGET HDEL HLEN HTTL
             if cmd.eq_ignore_ascii_case(b"HSET") {
                 return resp(hash::hset(db, args));
             }
@@ -143,6 +143,9 @@ fn dispatch_inner(
             }
             if cmd.eq_ignore_ascii_case(b"HLEN") {
                 return resp(hash::hlen(db, args));
+            }
+            if cmd.eq_ignore_ascii_case(b"HTTL") {
+                return resp(hash::httl(db, args));
             }
         }
         (4, b'i') => {
@@ -289,7 +292,7 @@ fn dispatch_inner(
             }
         }
         (5, b'h') => {
-            // HMSET HMGET HKEYS HVALS HSCAN
+            // HMSET HMGET HKEYS HVALS HSCAN HPTTL
             if cmd.eq_ignore_ascii_case(b"HMSET") {
                 return resp(hash::hmset(db, args));
             }
@@ -304,6 +307,9 @@ fn dispatch_inner(
             }
             if cmd.eq_ignore_ascii_case(b"HSCAN") {
                 return resp(hash::hscan(db, args));
+            }
+            if cmd.eq_ignore_ascii_case(b"HPTTL") {
+                return resp(hash::hpttl(db, args));
             }
         }
         (5, b'l') => {
@@ -734,9 +740,12 @@ fn dispatch_inner(
             }
         }
         (8, b'h') => {
-            // HPEXPIRE
+            // HPEXPIRE HPERSIST
             if cmd.eq_ignore_ascii_case(b"HPEXPIRE") {
                 return resp(hash::hpexpire(db, args));
+            }
+            if cmd.eq_ignore_ascii_case(b"HPERSIST") {
+                return resp(hash::hpersist(db, args));
             }
         }
         (8, b'x') => {
@@ -883,11 +892,21 @@ fn dispatch_inner(
                 return resp(sorted_set::zrandmember(db, args));
             }
         }
+        // 11-letter commands (hash)
+        (11, b'h') => {
+            // HEXPIRETIME
+            if cmd.eq_ignore_ascii_case(b"HEXPIRETIME") {
+                return resp(hash::hexpiretime(db, args));
+            }
+        }
         // 12-letter commands
         (12, b'h') => {
-            // HINCRBYFLOAT
+            // HINCRBYFLOAT HPEXPIRETIME
             if cmd.eq_ignore_ascii_case(b"HINCRBYFLOAT") {
                 return resp(hash::hincrbyfloat(db, args));
+            }
+            if cmd.eq_ignore_ascii_case(b"HPEXPIRETIME") {
+                return resp(hash::hpexpiretime(db, args));
             }
         }
         // 13-letter commands
@@ -959,7 +978,7 @@ pub fn is_dispatch_read_supported(cmd: &[u8]) -> bool {
         (3, b'g')  // GET
         | (3, b't')  // TTL
         | (4, b'e')  // ECHO
-        | (4, b'h')  // HGET, HLEN
+        | (4, b'h')  // HGET, HLEN, HTTL
         | (4, b'i')  // INFO
         | (4, b'k')  // KEYS
         | (4, b'l')  // LLEN, LPOS
@@ -968,7 +987,7 @@ pub fn is_dispatch_read_supported(cmd: &[u8]) -> bool {
         | (4, b's')  // SCAN
         | (4, b't')  // TYPE
         | (5, b'd')  // DEBUG (OBJECT/SLEEP/HELP — read-only on the data plane)
-        | (5, b'h')  // HMGET, HKEYS, HVALS, HSCAN
+        | (5, b'h')  // HMGET, HKEYS, HVALS, HSCAN, HPTTL
         | (5, b's')  // SCARD, SDIFF, SSCAN
         | (5, b'z')  // ZCARD, ZRANK, ZSCAN
         | (6, b'b')  // BITPOS
@@ -990,7 +1009,9 @@ pub fn is_dispatch_read_supported(cmd: &[u8]) -> bool {
         | (9, b'z')  // ZREVRANGE, ZLEXCOUNT
         | (10, b'h') // HRANDFIELD
         | (10, b's') // SMISMEMBER, SINTERCARD
+        | (11, b'h') // HEXPIRETIME
         | (11, b's') // SRANDMEMBER
+        | (12, b'h') // HPEXPIRETIME
         | (13, b'z') // ZRANGEBYSCORE
         | (16, b'z') // ZREVRANGEBYSCORE
     )
@@ -1040,12 +1061,15 @@ fn dispatch_read_inner(db: &Database, cmd: &[u8], args: &[Frame], now_ms: u64) -
             }
         }
         (4, b'h') => {
-            // HGET HLEN
+            // HGET HLEN HTTL
             if cmd.eq_ignore_ascii_case(b"HGET") {
                 return resp(hash::hget_readonly(db, args, now_ms));
             }
             if cmd.eq_ignore_ascii_case(b"HLEN") {
                 return resp(hash::hlen_readonly(db, args, now_ms));
+            }
+            if cmd.eq_ignore_ascii_case(b"HTTL") {
+                return resp(hash::httl(db, args));
             }
         }
         (4, b'i') => {
@@ -1103,7 +1127,7 @@ fn dispatch_read_inner(db: &Database, cmd: &[u8], args: &[Frame], now_ms: u64) -
             }
         }
         (5, b'h') => {
-            // HMGET HKEYS HVALS HSCAN
+            // HMGET HKEYS HVALS HSCAN HPTTL
             if cmd.eq_ignore_ascii_case(b"HMGET") {
                 return resp(hash::hmget_readonly(db, args, now_ms));
             }
@@ -1115,6 +1139,9 @@ fn dispatch_read_inner(db: &Database, cmd: &[u8], args: &[Frame], now_ms: u64) -
             }
             if cmd.eq_ignore_ascii_case(b"HSCAN") {
                 return resp(hash::hscan_readonly(db, args, now_ms));
+            }
+            if cmd.eq_ignore_ascii_case(b"HPTTL") {
+                return resp(hash::hpttl(db, args));
             }
         }
         (5, b's') => {
@@ -1282,10 +1309,22 @@ fn dispatch_read_inner(db: &Database, cmd: &[u8], args: &[Frame], now_ms: u64) -
                 return resp(set::sintercard_readonly(db, args, now_ms));
             }
         }
+        (11, b'h') => {
+            // HEXPIRETIME
+            if cmd.eq_ignore_ascii_case(b"HEXPIRETIME") {
+                return resp(hash::hexpiretime(db, args));
+            }
+        }
         (11, b's') => {
             // SRANDMEMBER
             if cmd.eq_ignore_ascii_case(b"SRANDMEMBER") {
                 return resp(set::srandmember_readonly(db, args, now_ms));
+            }
+        }
+        (12, b'h') => {
+            // HPEXPIRETIME
+            if cmd.eq_ignore_ascii_case(b"HPEXPIRETIME") {
+                return resp(hash::hpexpiretime(db, args));
             }
         }
         (13, b'z') => {
