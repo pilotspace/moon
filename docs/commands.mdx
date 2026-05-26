@@ -23,9 +23,19 @@ SET supports `EX`, `PX`, `NX`, `XX`, and `KEEPTTL` options, matching Redis 7+ be
 
 `DEL`, `EXISTS`, `EXPIRE`, `PEXPIRE`, `EXPIREAT`, `PEXPIREAT`, `TTL`, `PTTL`, `PERSIST`, `TYPE`, `UNLINK`, `SCAN`, `KEYS`, `RENAME`, `RENAMENX`
 
-## Hashes (14)
+## Hashes (25)
 
-`HSET`, `HGET`, `HDEL`, `HMSET`, `HMGET`, `HGETALL`, `HEXISTS`, `HLEN`, `HKEYS`, `HVALS`, `HINCRBY`, `HINCRBYFLOAT`, `HSETNX`, `HSCAN`
+`HSET`, `HGET`, `HDEL`, `HMSET`, `HMGET`, `HGETALL`, `HEXISTS`, `HLEN`, `HKEYS`, `HVALS`, `HINCRBY`, `HINCRBYFLOAT`, `HSETNX`, `HSCAN`, `HRANDFIELD`
+
+**Per-field TTL (Valkey 9.0 / 9.1 parity):**
+
+`HEXPIRE`, `HPEXPIRE`, `HEXPIREAT`, `HPEXPIREAT` — set per-field TTL with optional `NX | XX | GT | LT` gate.
+`HEXPIRETIME`, `HPEXPIRETIME`, `HTTL`, `HPTTL` — read per-field expiry / remaining time.
+`HPERSIST` — remove per-field TTL.
+`HGETDEL` — atomic get-and-delete.
+`HGETEX key [EX | PX | EXAT | PXAT | PERSIST] FIELDS …` — atomic get with TTL update.
+
+Per-field return code on the TTL commands: `-2` = no such field, `-1` = no TTL, `>=0` = absolute/remaining time or `1`/`2` outcome. `HSET` / `HMSET` clear per-field TTLs on overwrite; `HDEL` cleans up the TTL sidecar. The active-expiry tick reaps expired fields and auto-downgrades a TTL'd hash back to a plain hash once the last TTL is removed.
 
 ## Lists (16)
 

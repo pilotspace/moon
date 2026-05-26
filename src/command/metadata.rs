@@ -181,10 +181,10 @@ pub static COMMAND_META: phf::Map<&'static str, CommandMeta> = phf_map! {
     "HEXPIREAT" => CommandMeta { name: "HEXPIREAT", arity: -6, flags: WF, first_key: 1, last_key: 1, step: 1, acl_categories: HSH },
     "HPEXPIREAT" => CommandMeta { name: "HPEXPIREAT", arity: -6, flags: WF, first_key: 1, last_key: 1, step: 1, acl_categories: HSH },
     // HEXPIRE-family read + HPERSIST: min 5 args = CMD key FIELDS numfields field
-    "HEXPIRETIME" => CommandMeta { name: "HEXPIRETIME", arity: -5, flags: R, first_key: 1, last_key: 1, step: 1, acl_categories: HSH },
-    "HPEXPIRETIME" => CommandMeta { name: "HPEXPIRETIME", arity: -5, flags: R, first_key: 1, last_key: 1, step: 1, acl_categories: HSH },
-    "HTTL" => CommandMeta { name: "HTTL", arity: -5, flags: R, first_key: 1, last_key: 1, step: 1, acl_categories: HSH },
-    "HPTTL" => CommandMeta { name: "HPTTL", arity: -5, flags: R, first_key: 1, last_key: 1, step: 1, acl_categories: HSH },
+    "HEXPIRETIME" => CommandMeta { name: "HEXPIRETIME", arity: -5, flags: RF, first_key: 1, last_key: 1, step: 1, acl_categories: HSH },
+    "HPEXPIRETIME" => CommandMeta { name: "HPEXPIRETIME", arity: -5, flags: RF, first_key: 1, last_key: 1, step: 1, acl_categories: HSH },
+    "HTTL" => CommandMeta { name: "HTTL", arity: -5, flags: RF, first_key: 1, last_key: 1, step: 1, acl_categories: HSH },
+    "HPTTL" => CommandMeta { name: "HPTTL", arity: -5, flags: RF, first_key: 1, last_key: 1, step: 1, acl_categories: HSH },
     "HPERSIST" => CommandMeta { name: "HPERSIST", arity: -5, flags: WF, first_key: 1, last_key: 1, step: 1, acl_categories: HSH },
     // HGETDEL / HGETEX: Valkey 9.1 atomic compound commands (phase 199 / issue #110).
     // min 5 args = CMD key FIELDS numfields field; HGETEX may have an extra mode+arg.
