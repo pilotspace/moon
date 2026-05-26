@@ -465,9 +465,12 @@ fn dispatch_inner(
             }
         }
         (6, b'h') => {
-            // HSETNX
+            // HSETNX HGETEX
             if cmd.eq_ignore_ascii_case(b"HSETNX") {
                 return resp(hash::hsetnx(db, args));
+            }
+            if cmd.eq_ignore_ascii_case(b"HGETEX") {
+                return resp(hash::hgetex(db, args));
             }
         }
         (6, b'i') => {
@@ -628,7 +631,7 @@ fn dispatch_inner(
             }
         }
         (7, b'h') => {
-            // HEALTHZ HGETALL HEXISTS HINCRBY HEXPIRE
+            // HEALTHZ HGETALL HEXISTS HINCRBY HEXPIRE HGETDEL
             if cmd.eq_ignore_ascii_case(b"HEALTHZ") {
                 return resp(connection::healthz());
             }
@@ -643,6 +646,9 @@ fn dispatch_inner(
             }
             if cmd.eq_ignore_ascii_case(b"HEXPIRE") {
                 return resp(hash::hexpire(db, args));
+            }
+            if cmd.eq_ignore_ascii_case(b"HGETDEL") {
+                return resp(hash::hgetdel(db, args));
             }
         }
         (7, b'l') => {
