@@ -797,3 +797,110 @@ pub fn hrandfield_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame 
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Phase 198 — HEXPIRETIME / HPEXPIRETIME / HTTL / HPTTL (read-only)
+// ---------------------------------------------------------------------------
+//
+// Per-field return codes (Valkey 9.0):
+//   -2  field does not exist in the hash (or key is missing); note that a
+//       missing key is NOT a WRONGTYPE error — it returns -2 per field.
+//   -1  field exists but carries no TTL
+//   ≥0  HEXPIRETIME/HPEXPIRETIME: absolute unix time (seconds or ms)
+//       HTTL/HPTTL: remaining TTL (seconds or ms).
+//       An already-expired but not-yet-reaped field yields 0 (Valkey
+//       semantics), never -1 or -2.
+//
+// All four handlers share one core helper:
+//   1. Parse key + FIELDS clause via `parse_key_and_fields`.
+//   2. WRONGTYPE probe via `get_hash_ref_if_alive` (immutable read, no side effects).
+//   3. Per-field loop: map `FieldState` → integer via `map_ttl` closure.
+
+use super::hash_write::parse_key_and_fields;
+use crate::protocol::FrameVec;
+use crate::storage::db::FieldState;
+
+/// Core driver for HEXPIRETIME / HPEXPIRETIME / HTTL / HPTTL.
+///
+/// `map_ttl(abs_ms, now_ms) -> i64` converts an absolute expiry timestamp
+/// (unix-ms) and the current cached time into the command-specific integer.
+/// It is called only for `FieldState::Ttl(_)` arms; `-2` and `-1` are
+/// returned unconditionally for `Missing` and `NoTtl`.
+fn do_hexpiretime_read(
+    db: &Database,
+    args: &[Frame],
+    cmd: &'static str,
+    map_ttl: impl Fn(u64, u64) -> i64,
+) -> Frame {
+    let parsed = match parse_key_and_fields(args, cmd) {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+
+    let now_ms = db.now_ms();
+
+    // WRONGTYPE probe — one immutable DashTable lookup.
+    // Ok(None)  → key missing; valid — all fields return -2 below.
+    // Ok(Some) → hash variant; proceed.
+    // Err(f)   → WRONGTYPE; propagate immediately.
+    match db.get_hash_ref_if_alive(parsed.key, now_ms) {
+        Ok(_) => {}
+        Err(e) => return e,
+    }
+
+    let mut codes: Vec<Frame> = Vec::with_capacity(parsed.fields.len());
+    for field in &parsed.fields {
+        let state = db.hash_field_state(parsed.key, field, now_ms);
+        let code: i64 = match state {
+            FieldState::Missing => -2,
+            FieldState::NoTtl => -1,
+            // already-expired-but-not-reaped: saturating_sub → 0 for remaining,
+            // verbatim abs_ms for absolute-time commands (past timestamp is correct).
+            FieldState::Ttl(abs_ms) => map_ttl(abs_ms, now_ms),
+        };
+        codes.push(Frame::Integer(code));
+    }
+
+    Frame::Array(FrameVec::from_vec(codes))
+}
+
+/// HEXPIRETIME key FIELDS numfields field [field ...]
+///
+/// Returns the absolute TTL of each field as a unix timestamp in **seconds**.
+/// `-2` = field missing, `-1` = no TTL, `≥0` = absolute unix-seconds.
+pub fn hexpiretime(db: &Database, args: &[Frame]) -> Frame {
+    do_hexpiretime_read(db, args, "HEXPIRETIME", |abs_ms, _now_ms| {
+        (abs_ms / 1000) as i64
+    })
+}
+
+/// HPEXPIRETIME key FIELDS numfields field [field ...]
+///
+/// Returns the absolute TTL of each field as a unix timestamp in **milliseconds**.
+/// `-2` = field missing, `-1` = no TTL, `≥0` = absolute unix-ms.
+pub fn hpexpiretime(db: &Database, args: &[Frame]) -> Frame {
+    do_hexpiretime_read(db, args, "HPEXPIRETIME", |abs_ms, _now_ms| abs_ms as i64)
+}
+
+/// HTTL key FIELDS numfields field [field ...]
+///
+/// Returns the remaining TTL of each field in **seconds**.
+/// `-2` = field missing, `-1` = no TTL, `0` = already expired (not yet reaped),
+/// `>0` = remaining seconds (floor division).
+pub fn httl(db: &Database, args: &[Frame]) -> Frame {
+    do_hexpiretime_read(db, args, "HTTL", |abs_ms, now_ms| {
+        // saturating_sub prevents negative values: already-expired → 0.
+        (abs_ms.saturating_sub(now_ms) / 1000) as i64
+    })
+}
+
+/// HPTTL key FIELDS numfields field [field ...]
+///
+/// Returns the remaining TTL of each field in **milliseconds**.
+/// `-2` = field missing, `-1` = no TTL, `0` = already expired (not yet reaped),
+/// `>0` = remaining ms.
+pub fn hpttl(db: &Database, args: &[Frame]) -> Frame {
+    do_hexpiretime_read(db, args, "HPTTL", |abs_ms, now_ms| {
+        abs_ms.saturating_sub(now_ms) as i64
+    })
+}

@@ -401,6 +401,114 @@ struct HexpireArgs<'a> {
     fields: SmallVec<[&'a [u8]; 4]>,
 }
 
+// ---------------------------------------------------------------------------
+// Shared parse helper for HTTL / HPTTL / HEXPIRETIME / HPEXPIRETIME / HPERSIST
+// ---------------------------------------------------------------------------
+
+/// Parsed result of the `key FIELDS numfields field [field ...]` wire layout
+/// used by all five phase-198 commands (no condition flag, no time argument).
+pub(super) struct KeyAndFields<'a> {
+    /// The hash key.
+    pub key: &'a [u8],
+    /// Field names in the order given on the wire.
+    pub fields: SmallVec<[&'a [u8]; 4]>,
+}
+
+/// Parse `key FIELDS numfields field [field ...]` from `args`.
+///
+/// `cmd` is the command name used in error messages (e.g. `"HTTL"`).
+///
+/// # Wire layout
+/// ```text
+/// CMD key FIELDS numfields field [field ...]
+/// ^-- already consumed; args starts at 'key'
+/// ```
+///
+/// Returns `Err(Frame::Error(_))` on any parse or validation failure.
+pub(super) fn parse_key_and_fields<'a>(
+    args: &'a [Frame],
+    cmd: &'static str,
+) -> Result<KeyAndFields<'a>, Frame> {
+    // Minimum: key + FIELDS + numfields + ≥1 field = 4 elements.
+    if args.len() < 4 {
+        return Err(Frame::Error(Bytes::from(format!(
+            "ERR wrong number of arguments for '{}' command",
+            cmd
+        ))));
+    }
+
+    let key = match extract_bytes(&args[0]) {
+        Some(k) => k.as_ref(),
+        None => {
+            return Err(Frame::Error(Bytes::from(format!(
+                "ERR wrong number of arguments for '{}' command",
+                cmd
+            ))));
+        }
+    };
+
+    // args[1] must be "FIELDS" (case-insensitive).
+    let fields_kw = match extract_bytes(&args[1]) {
+        Some(t) => t,
+        None => {
+            return Err(Frame::Error(Bytes::from_static(
+                b"ERR syntax error, FIELDS keyword not found",
+            )));
+        }
+    };
+    if !fields_kw.eq_ignore_ascii_case(b"FIELDS") {
+        return Err(Frame::Error(Bytes::from_static(
+            b"ERR syntax error, FIELDS keyword not found",
+        )));
+    }
+
+    // args[2] = numfields
+    let numfields: usize = match extract_bytes(&args[2]) {
+        Some(b) => match std::str::from_utf8(b)
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+        {
+            Some(n) => n,
+            None => {
+                return Err(Frame::Error(Bytes::from_static(
+                    b"ERR value is not an integer or out of range",
+                )));
+            }
+        },
+        None => {
+            return Err(Frame::Error(Bytes::from_static(
+                b"ERR value is not an integer or out of range",
+            )));
+        }
+    };
+
+    if numfields == 0 {
+        return Err(Frame::Error(Bytes::from_static(
+            b"ERR Parameter `numFields` should be greater than 0",
+        )));
+    }
+
+    let first_field_pos = 3; // args[3..3+numfields]
+    let actual_fields = args.len().saturating_sub(first_field_pos);
+    if actual_fields < numfields {
+        return Err(Frame::Error(Bytes::from_static(
+            b"ERR Parameter `numFields` is more than number of arguments",
+        )));
+    }
+
+    let mut fields: SmallVec<[&'a [u8]; 4]> = SmallVec::new();
+    for i in first_field_pos..first_field_pos + numfields {
+        match extract_bytes(&args[i]) {
+            Some(f) => fields.push(f.as_ref()),
+            None => {
+                return Err(Frame::Error(Bytes::from_static(b"ERR invalid field name")));
+            }
+        }
+    }
+
+    Ok(KeyAndFields { key, fields })
+}
+
 /// Parse the wire format shared by HEXPIRE / HPEXPIRE / HEXPIREAT / HPEXPIREAT:
 ///
 /// ```text
@@ -617,4 +725,65 @@ pub fn hexpireat(db: &mut Database, args: &[Frame]) -> Frame {
 /// HPEXPIREAT key unix-time-milliseconds [NX|XX|GT|LT] FIELDS numfields field [field ...]
 pub fn hpexpireat(db: &mut Database, args: &[Frame]) -> Frame {
     do_hexpire(db, args, true, true)
+}
+
+/// HPERSIST key FIELDS numfields field [field ...]
+///
+/// Removes the per-field TTL from each named field.  Returns a RESP Array
+/// with one integer per field using Valkey 9.0 semantics:
+/// - `-2` — field does not exist in the hash (or key does not exist)
+/// - `-1` — field exists but has no TTL
+/// -  `1` — TTL was present and has been removed
+///
+/// **Downgrade behaviour**: when the last per-field TTL is removed, the
+/// encoding is automatically downgraded from `HashWithTtl` back to plain
+/// `Hash` by `hash_persist_field` (implemented in phase 195 — no reimplementation
+/// needed here).
+///
+/// **Short-circuit optimisation**: if the key is missing or is a plain `Hash`
+/// / `HashListpack` (i.e. no TTL sidecar at all), every field unconditionally
+/// maps to `-2` (missing) or `-1` (no TTL), so we skip the per-field
+/// `hash_persist_field` call entirely.
+pub fn hpersist(db: &mut Database, args: &[Frame]) -> Frame {
+    let parsed = match parse_key_and_fields(args, "HPERSIST") {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+
+    // WRONGTYPE probe: borrow as read-only to check the key type before
+    // any mutation.  `get_hash_ref_if_alive` returns:
+    //   Ok(None)   — key missing or whole-key TTL expired → all -2
+    //   Ok(Some(_)) — hash variant (Hash, HashListpack, HashWithTtl)
+    //   Err(frame) — wrong type → propagate
+    let now_ms = db.now_ms();
+    let href_check = match db.get_hash_ref_if_alive(parsed.key, now_ms) {
+        Ok(h) => h,
+        Err(e) => return e,
+    };
+
+    // Missing key: all fields are -2.
+    let Some(_href) = href_check else {
+        let codes: Vec<Frame> = parsed.fields.iter().map(|_| Frame::Integer(-2)).collect();
+        return Frame::Array(FrameVec::from_vec(codes));
+    };
+
+    // For each field, determine state then call hash_persist_field when needed.
+    let mut codes: Vec<Frame> = Vec::with_capacity(parsed.fields.len());
+    for field in &parsed.fields {
+        // Re-read field state after each mutation so that the downgrade is
+        // visible to subsequent fields in the same call.
+        use crate::storage::db::FieldState;
+        let state = db.hash_field_state(parsed.key, field, now_ms);
+        let code = match state {
+            FieldState::Missing => -2i64,
+            FieldState::NoTtl => -1i64,
+            FieldState::Ttl(_) => {
+                db.hash_persist_field(parsed.key, field);
+                1i64
+            }
+        };
+        codes.push(Frame::Integer(code));
+    }
+
+    Frame::Array(FrameVec::from_vec(codes))
 }

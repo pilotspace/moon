@@ -175,11 +175,17 @@ pub static COMMAND_META: phf::Map<&'static str, CommandMeta> = phf_map! {
     "HINCRBY" => CommandMeta { name: "HINCRBY", arity: 4, flags: WF, first_key: 1, last_key: 1, step: 1, acl_categories: HSH },
     "HINCRBYFLOAT" => CommandMeta { name: "HINCRBYFLOAT", arity: 4, flags: WF, first_key: 1, last_key: 1, step: 1, acl_categories: HSH },
     "HRANDFIELD" => CommandMeta { name: "HRANDFIELD", arity: -2, flags: R, first_key: 1, last_key: 1, step: 1, acl_categories: HSH },
-    // HEXPIRE-family: min 6 args = CMD key when FIELDS numfields field
+    // HEXPIRE-family write: min 6 args = CMD key when FIELDS numfields field
     "HEXPIRE" => CommandMeta { name: "HEXPIRE", arity: -6, flags: WF, first_key: 1, last_key: 1, step: 1, acl_categories: HSH },
     "HPEXPIRE" => CommandMeta { name: "HPEXPIRE", arity: -6, flags: WF, first_key: 1, last_key: 1, step: 1, acl_categories: HSH },
     "HEXPIREAT" => CommandMeta { name: "HEXPIREAT", arity: -6, flags: WF, first_key: 1, last_key: 1, step: 1, acl_categories: HSH },
     "HPEXPIREAT" => CommandMeta { name: "HPEXPIREAT", arity: -6, flags: WF, first_key: 1, last_key: 1, step: 1, acl_categories: HSH },
+    // HEXPIRE-family read + HPERSIST: min 5 args = CMD key FIELDS numfields field
+    "HEXPIRETIME" => CommandMeta { name: "HEXPIRETIME", arity: -5, flags: R, first_key: 1, last_key: 1, step: 1, acl_categories: HSH },
+    "HPEXPIRETIME" => CommandMeta { name: "HPEXPIRETIME", arity: -5, flags: R, first_key: 1, last_key: 1, step: 1, acl_categories: HSH },
+    "HTTL" => CommandMeta { name: "HTTL", arity: -5, flags: R, first_key: 1, last_key: 1, step: 1, acl_categories: HSH },
+    "HPTTL" => CommandMeta { name: "HPTTL", arity: -5, flags: R, first_key: 1, last_key: 1, step: 1, acl_categories: HSH },
+    "HPERSIST" => CommandMeta { name: "HPERSIST", arity: -5, flags: WF, first_key: 1, last_key: 1, step: 1, acl_categories: HSH },
 
     // ---- List commands ----
     "LPUSH" => CommandMeta { name: "LPUSH", arity: -3, flags: WF, first_key: 1, last_key: 1, step: 1, acl_categories: LST },
