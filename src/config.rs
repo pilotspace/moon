@@ -102,6 +102,17 @@ pub struct ServerConfig {
     #[arg(long, default_value = "yes")]
     pub appendonly: String,
 
+    /// Acknowledge the known multi-shard AOF durability bug and start
+    /// anyway.  Verified 2026-05-26 on HEAD `6e49050`:
+    /// `--shards >= 2 + --appendonly yes` loses ~50 % of writes on SIGKILL
+    /// regardless of `--appendfsync` or `--disk-offload` settings.  Until
+    /// the v2.0 multi-shard AOF replay lands, Moon refuses this config at
+    /// startup; pass this flag to override (e.g. cache-only deployments
+    /// where the loss is acceptable).  See
+    /// `docs/runbooks/multi-shard-aof-rewrite.md`.
+    #[arg(long, default_value_t = false)]
+    pub unsafe_multishard_aof: bool,
+
     /// AOF fsync policy (always/everysec/no)
     #[arg(long, default_value = "everysec")]
     pub appendfsync: String,

@@ -33,6 +33,21 @@ pub static BGSAVE_SHARDS_REMAINING: AtomicU64 = AtomicU64::new(0);
 /// Whether the last BGSAVE completed successfully.
 pub static BGSAVE_LAST_STATUS: AtomicBool = AtomicBool::new(true);
 
+/// Process-wide gate set at startup when the configuration combination
+/// `shards >= 2 + --disk-offload enable + --appendonly yes` is selected.
+///
+/// `BGREWRITEAOF` under this combination silently truncates the WAL of every
+/// shard except the rewriter's own shard while the consolidated multi-part AOF
+/// base RDB written by the rewrite is **not** consumed on restart (verified
+/// 2026-05-26 against HEAD `6e49050`: 38 % data loss reproducible). Until the
+/// v2.0 multi-part AOF replay walks every shard's segment manifest, the only
+/// safe behavior is to refuse the command in this config and point operators
+/// at the runbook.
+///
+/// Set once in `main.rs` after CLI parsing; never cleared. Checked by
+/// `bgrewriteaof_start_sharded` before dispatching the rewrite message.
+pub static MULTI_SHARD_AOF_REWRITE_UNSAFE: AtomicBool = AtomicBool::new(false);
+
 /// Global flag indicating whether a BGREWRITEAOF rewrite is currently in progress.
 ///
 /// Set to `true` when `bgrewriteaof_start` or `bgrewriteaof_start_sharded` dispatches
@@ -248,6 +263,15 @@ pub fn bgrewriteaof_start_sharded(
     aof_tx: &channel::MpscSender<AofMessage>,
     shard_databases: std::sync::Arc<crate::shard::shared_databases::ShardDatabases>,
 ) -> Frame {
+    // Refuse the rewrite under the known-unsafe config combo (see the
+    // MULTI_SHARD_AOF_REWRITE_UNSAFE doc comment).  This is the
+    // single-node v1.0-rc1 gate; the v2.0 multi-part AOF replay fix lifts
+    // it.
+    if MULTI_SHARD_AOF_REWRITE_UNSAFE.load(Ordering::Relaxed) {
+        return Frame::Error(Bytes::from_static(
+            b"ERR BGREWRITEAOF is unsafe with --shards >= 2 + --disk-offload enable + --appendonly yes (known data-loss bug; see docs/runbooks/multi-shard-aof-rewrite.md). Use --shards 1, set --disk-offload disable, or wait for v2.0 multi-part AOF replay.",
+        ));
+    }
     // CAS: only proceed if currently false; prevents a second caller from
     // clearing the flag while the first rewrite is still in progress.
     if AOF_REWRITE_IN_PROGRESS
@@ -357,5 +381,65 @@ mod tests {
         // BGSAVE_LAST_STATUS starts as true (no failure has occurred)
         // Note: verify the static exists and is accessible
         let _ = BGSAVE_LAST_STATUS.load(Ordering::Relaxed);
+    }
+
+    // Serialize the multi-shard gate test against any other test mutating
+    // the gate or AOF_REWRITE_IN_PROGRESS (parallel test runner otherwise
+    // races on the process-wide AtomicBools).
+    static GATE_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+    #[test]
+    fn test_bgrewriteaof_sharded_refuses_under_unsafe_config() {
+        let _guard = GATE_TEST_LOCK.lock();
+        // Use a small bounded channel so the test does not need an AOF
+        // writer task; the gate must fire BEFORE try_send is reached.
+        let (tx, _rx) = crate::runtime::channel::mpsc_bounded::<AofMessage>(1);
+        let shard_dbs = crate::shard::shared_databases::ShardDatabases::new(
+            vec![vec![crate::storage::Database::new()]],
+        );
+
+        // Snapshot prior state so the test is order-independent.
+        let prior = MULTI_SHARD_AOF_REWRITE_UNSAFE.load(Ordering::Relaxed);
+        let prior_in_progress = AOF_REWRITE_IN_PROGRESS.load(Ordering::SeqCst);
+        AOF_REWRITE_IN_PROGRESS.store(false, Ordering::SeqCst);
+
+        // Gate ON → must refuse with the documented ERR (and must NOT flip
+        // AOF_REWRITE_IN_PROGRESS, otherwise a normal rewrite gets blocked).
+        MULTI_SHARD_AOF_REWRITE_UNSAFE.store(true, Ordering::Relaxed);
+        let frame = bgrewriteaof_start_sharded(&tx, shard_dbs.clone());
+        match frame {
+            Frame::Error(msg) => {
+                let s = std::str::from_utf8(&msg).unwrap();
+                assert!(
+                    s.contains("BGREWRITEAOF is unsafe")
+                        && s.contains("multi-shard-aof-rewrite.md"),
+                    "unexpected error: {s}"
+                );
+            }
+            other => panic!("expected Frame::Error, got {other:?}"),
+        }
+        assert!(
+            !AOF_REWRITE_IN_PROGRESS.load(Ordering::SeqCst),
+            "gate must not set AOF_REWRITE_IN_PROGRESS"
+        );
+
+        // Gate OFF → the gate error must NOT fire. (Without an AOF writer
+        // task draining the channel, the second call may succeed or return
+        // "failed to start" depending on buffer state; the contract under
+        // test here is only that the gate error is gone.)
+        MULTI_SHARD_AOF_REWRITE_UNSAFE.store(false, Ordering::Relaxed);
+        AOF_REWRITE_IN_PROGRESS.store(false, Ordering::SeqCst);
+        let frame2 = bgrewriteaof_start_sharded(&tx, shard_dbs);
+        if let Frame::Error(msg) = &frame2 {
+            let s = std::str::from_utf8(msg).unwrap();
+            assert!(
+                !s.contains("BGREWRITEAOF is unsafe"),
+                "gate error fired with gate off: {s}"
+            );
+        }
+
+        // Restore prior state.
+        AOF_REWRITE_IN_PROGRESS.store(prior_in_progress, Ordering::SeqCst);
+        MULTI_SHARD_AOF_REWRITE_UNSAFE.store(prior, Ordering::Relaxed);
     }
 }

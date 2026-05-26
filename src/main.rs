@@ -270,6 +270,24 @@ fn main() -> anyhow::Result<()> {
 
     info!("Starting with {} shards", num_shards);
 
+    // P0-FIX-01b: refuse to start under the known durability bug
+    // (`shards >= 2 + appendonly yes` loses ~50 % of writes on SIGKILL,
+    //  verified 2026-05-26 on HEAD `6e49050`; reproducer in
+    //  `tmp/p0-no-rewrite.sh` and `tmp/p0-always.sh`).  The bug is
+    // independent of `--appendfsync` and `--disk-offload` settings.  An
+    // operator can override via `--unsafe-multishard-aof` if the
+    // deployment is cache-only and the loss window is acceptable.
+    if num_shards >= 2 && config.appendonly == "yes" && !config.unsafe_multishard_aof {
+        eprintln!(
+            "REFUSING TO START: --shards {num_shards} + --appendonly yes has a known data-loss \
+             bug on SIGKILL (~50 % loss verified 2026-05-26). Fix: use --shards 1, or pass \
+             --appendonly no for cache-only deployments, or pass --unsafe-multishard-aof to \
+             acknowledge the risk and start anyway. See \
+             docs/runbooks/multi-shard-aof-rewrite.md."
+        );
+        std::process::exit(2);
+    }
+
     // T1.1: warn when maxclients < 25 × shards (undersubscription footgun).
     // Suppressed by MOON_NO_UNDERSUBSCRIPTION_WARN=1.
     if let Some(msg) = should_warn_undersubscription(config.maxclients, num_shards)
@@ -317,6 +335,23 @@ fn main() -> anyhow::Result<()> {
 
     // Compute bind address for SO_REUSEPORT per-shard listeners (Linux io_uring path).
     let bind_addr = format!("{}:{}", config.bind, config.port);
+
+    // P0-FIX-01: gate BGREWRITEAOF under the known data-loss config combo
+    // (multi-shard + disk-offload enabled + appendonly).  Verified 2026-05-26:
+    // the rewrite truncates non-rewriter shards' WALs and the consolidated
+    // multi-part AOF base RDB is not consumed on restart, losing ~38 % of
+    // keys.  v2.0 multi-part AOF replay lifts this; until then we refuse the
+    // command at dispatch time.  See docs/runbooks/multi-shard-aof-rewrite.md.
+    if num_shards >= 2 && config.disk_offload_enabled() && config.appendonly == "yes" {
+        moon::command::persistence::MULTI_SHARD_AOF_REWRITE_UNSAFE
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        tracing::warn!(
+            shards = num_shards,
+            disk_offload = %config.disk_offload,
+            appendonly = %config.appendonly,
+            "BGREWRITEAOF gated for this config (known data-loss path; see docs/runbooks/multi-shard-aof-rewrite.md). Use --shards 1 or --disk-offload disable to re-enable rewrite."
+        );
+    }
 
     // Create watch channel for snapshot triggers (auto-save and BGSAVE)
     let (snapshot_trigger_tx, snapshot_trigger_rx) = moon::runtime::channel::watch(0u64);
