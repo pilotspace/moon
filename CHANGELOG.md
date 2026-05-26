@@ -6,10 +6,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.2.0-alpha] — Unreleased
 
-First slice of the v0.2 "Option C" beachhead: **Point-in-Time Recovery (PITR)**
-and **Change Data Capture (CDC)**, built additively on top of the existing
-per-shard WAL v3 + dual-root manifest. No changes to the KV hot path, MVCC,
-page format, or transaction layer.
+The v0.2 enterprise beachhead. Built additively on per-shard WAL v3 + the
+dual-root manifest; no changes to the KV hot path, MVCC, page format, or
+transaction layer.
+
+**Headline capabilities landed in alpha:**
+
+- **Point-in-Time Recovery (PITR)** — `--recovery-target-lsn` /
+  `--recovery-target-time` restore to any LSN or wall-clock boundary
+  inside the WAL retention window.
+- **Change Data Capture (CDC)** — `CDC.READ` polling command with
+  Debezium-compatible JSON envelopes, resumable cursors, segment-rotation
+  safety.
+- **Hash-field TTL** — full Valkey 9.0 / 9.1 surface (`HEXPIRE` /
+  `HPEXPIRE` / `HEXPIREAT` / `HPEXPIREAT` / `HEXPIRETIME` / `HPEXPIRETIME`
+  / `HTTL` / `HPTTL` / `HPERSIST` / `HGETDEL` / `HGETEX`) with O(1) HGET +
+  HLEN fast path. Three-way benchmark vs Redis 8.0.2 / Valkey 9.1.0
+  ships in `docs/perf/2026-05-27-hash-ttl-3way-bench.md`.
+- **Tier 2 Lane A** — `SWAPDB`, `MOVE`, `COPY ... DB n`,
+  `CLUSTER REPLICAS` / `SLAVES`, `CLUSTER COUNT-FAILURE-REPORTS`. All
+  WAL-durable with cross-shard atomic semantics.
+- **Storage format v1 commitment** — RDB v2 + WAL v3 + multi-part AOF
+  manifest grouped under a single `--storage-format v1` umbrella with
+  ≥18-month LTS forward-read guarantees.
+- **Embedded sharded server** — `server::embedded::run_embedded(config,
+  cancel)` exposes the full sharded handler (with `TXN.*`) to in-process
+  embedders.
+
+**What is not yet in alpha:** PITR live-snapshot LSN wiring (P3c),
+`CDC.SUBSCRIBE` push channel (C3b), and the multi-shard master PSYNC
+deferred from v0.1.10. Tracked in `.planning/rfcs/v02-enterprise-architecture.md`.
 
 ### Docs — Hash-field TTL three-way benchmark suite (PR #127)
 
@@ -427,6 +453,96 @@ See `docs/guides/cdc.md` for consumer integration.
   and the benchmark gates (PITR restart ±10%, CDC ≥100K events/s/shard,
   write p99 ±5%).
 
+## [0.1.12] — 2026-05-12
+
+Performance & memory observability release. 50 commits since v0.1.11, no
+public API breaks, no on-disk format change. Validated on OrbStack `moon-dev`
+(2026-05-12) and locally green for both `runtime-monoio` and
+`runtime-tokio,jemalloc`.
+
+### Performance — DashTable hot-path (Phase 189, PERF-07 + PERF-09)
+
+- **Pre-sized DashTable.** `DashTable::with_capacity()` plus the new
+  `--initial-keyspace-hint <N>` flag size the segment array up front so
+  steady-state operation hits zero `split_segment` calls. Pre-size
+  invariant test confirms zero splits at 1 M keys. The 27 % CPU spent
+  in `split_segment` during SET p=16 (PERF-07) is fully eliminated.
+- **`Database::set` rewrite.** New `DashTable::insert_or_update` /
+  `Segment::insert_or_update_at` single-probe helpers replace the
+  previous `find + remove + insert` triple-probe pattern.
+- **`Segment::find` fallback elimination + force-inlined SIMD.** The
+  cold "key spilled to non-home group" fallback path is removed once
+  `has_non_home_keys` is invariant-tracked on insert (the
+  `insert_or_update_at` change above already maintains the flag);
+  the SIMD probe helpers are `#[inline(always)]`. PERF-09
+  attributed 12.65 % of `Segment::find` self-time to the fallback;
+  remaining cost is the irreducible per-hit `memcmp` confirm
+  (threshold amended to <3 %). 1 M-key correctness gate validates
+  zero false positives/negatives.
+
+### Performance — Memory observability (Phase 190)
+
+- **`moon_memory_bytes{kind=…}` Prometheus gauge.** Seven subsystem
+  labels — `dashtable`, `hnsw`, `csr`, `wal`, `sealed_replication_backlog`,
+  `allocator_overhead`, and the rolled-up `total`. Updated every
+  scrape via a single hook so the sum reconciles to `RSS` within the
+  CI tolerance window.
+- **`MEMORY DOCTOR` full schema.** Multi-line RESP response covering
+  every subsystem, the rolled-up total, and a derived `allocator_overhead`
+  pseudo-kind (RSS − Σ subsystems). Adds operator triage signal beyond
+  the legacy single-line summary.
+- **`resident_bytes()` trait** implemented across `Database`,
+  `DashTable`, `VectorStore` (HNSW + IVF), `GraphStore` (CSR + SlotMap),
+  `WalWriter`, `ReplicationBacklog` (sealed-segment side), and
+  `AllocatorOverhead`. Zero-allocation, on-demand poll.
+- **Memory steady-state CI job.** `scripts/bench-memory-steady-state.sh`
+  + baseline fixture; gate widened to `±10 %` on RSS / Σ ratio after a
+  Linux-CI tolerance pass.
+
+### Changed — Allocator UX (Phase 191)
+
+- **jemalloc `narenas:8` cap** with `--memory-arenas-cap <N>` CLI
+  override. Caps the per-CPU arena explosion that inflates VSZ on
+  high-core hosts; mostly a cosmetic fix on Linux containers but
+  produces a meaningfully tighter `top`/`ps` reading for operators.
+- **Tri-state allocator selection.** New `mimalloc-alt` cargo
+  feature alongside the existing `jemalloc` / `mimalloc` (fallback)
+  paths; mutually exclusive at compile time. A/B benchmark script
+  `scripts/bench-allocator-ab.sh` ships with the release.
+- **`docs/OPERATOR-GUIDE.md` — Memory Accounting section.** Documents
+  the VSZ-vs-RSS distinction, MEMORY DOCTOR field-by-field, and the
+  `--memory-arenas-cap` / `mimalloc-alt` tuning knobs.
+
+### Added — Dispatch Observability (Phase 177)
+
+- **`moon_dispatch_path_total{path=...}` Prometheus counter**: four-way classification of every command by shard-routing decision — `local_inline` (SIMD fast path), `local` (standard local branch), `cross_read_fast` (RwLock shared-read bypass of SPSC), `cross_spsc` (deferred cross-shard write via `PipelineBatchSlotted`). Ratio `cross_spsc / Σ` is the ground-truth signal for dispatch-layer optimization work. Zero-allocation hot-path overhead (`&'static str` labels, `#[inline]` with early-return on `!METRICS_INITIALIZED`). Verified on macOS + Linux: counter sums close exactly to driven traffic, no overcount.
+
+### Changed
+
+- **`text-index` is now a default feature.** BM25 full-text search (`FT.SEARCH` BM25 mode), `FT.AGGREGATE`, and three-way RRF hybrid fusion are included in all standard builds. No longer requires `--features text-index`. To exclude it (e.g. minimal embedded builds): `--no-default-features --features runtime-monoio,jemalloc,graph`.
+
+### Added — SDK Validation
+
+- **Python SDK `sdk/python/examples/validate.py`**: End-to-end live validator for all SDK sub-clients: ping, strings, counter, hash, list, set, zset, vector index lifecycle, graph engine, session search, semantic cache, text search (BM25 + aggregate + hybrid), and server info. Result against Moon with `text-index`: **114 PASS / 0 FAIL / 0 SKIP**. Gracefully skips text sections when server built without `text-index`.
+- **Rust SDK `sdk/rust/examples/validate.rs`**: Re-validated against `text-index` build — **85 PASS / 0 FAIL**.
+
+### Fixed — Python SDK
+
+- **`moondb.graph._parse_neighbors`**: server returns alternating `[edge_map, node_map, ...]` as flat key-value arrays (`b'id'`, `int`, `b'src'`, `int`, `b'dst'`, `int`, …). Previous parser expected positional `[node_id, label, props]` — caused `int() on b'id'` crash. Now correctly identifies node entries by `labels` key and parses them from the flat kv format.
+
+### Fixed — CI Hygiene
+
+- **`tests/pipeline_auto_index.rs`**: tighten outer cfg from `runtime-tokio` to `all(runtime-tokio, text-index)` so the file compiles to zero tests when text-index is disabled. Previously the file compiled but the FT.SEARCH text fast path was `#[cfg]`-ed out, causing `@name:corpus` queries to fall through to the KNN-only parser and panic with "invalid KNN query syntax".
+- **4 FT unwraps**: add inline `#[allow(clippy::unwrap_used)]` with invariant justifications in `vector_search/ft_text_search.rs` (3 sites inside `apply_post_processing` where `do_summarize` / `do_highlight` implies the Option is Some) and `handler_monoio/ft.rs:165` (`is_text` was derived from `query_bytes.as_ref().map_or(false, _)`). Restores the audit-unwrap baseline to 0.
+
+### Compatibility
+
+- **Wire protocol**: unchanged. Drop-in replacement for v0.1.11.
+- **Persistence on-disk format**: unchanged.
+- **Default feature set**: `text-index` is now on by default. Minimal
+  embedded builds need an explicit `--no-default-features --features
+  runtime-monoio,jemalloc,graph`.
+
 ## [0.1.11] — 2026-04-27
 
 Hot-path perf release — eliminates two atomic-CAS hot paths in the write
@@ -537,29 +653,47 @@ All 2450 lib tests passing locally (`cargo test --no-default-features
 - **Persistence on-disk format**: unchanged.
 - **Replication wire format**: unchanged.
 
-## [Unreleased]
+## [0.1.10] — 2026-04-23
 
-### Added — Dispatch Observability (Phase 177)
+Stable replication marker. **Single-shard PSYNC2 wired end-to-end and
+production-ready** for `--shards 1` master with any `--shards N` replica
+topology. Multi-shard master PSYNC is scheduled for v0.2 (see
+`.planning/rfcs/multi-shard-replication-design.md`).
 
-- **`moon_dispatch_path_total{path=...}` Prometheus counter**: four-way classification of every command by shard-routing decision — `local_inline` (SIMD fast path), `local` (standard local branch), `cross_read_fast` (RwLock shared-read bypass of SPSC), `cross_spsc` (deferred cross-shard write via `PipelineBatchSlotted`). Ratio `cross_spsc / Σ` is the ground-truth signal for dispatch-layer optimization work. Zero-allocation hot-path overhead (`&'static str` labels, `#[inline]` with early-return on `!METRICS_INITIALIZED`). Verified on macOS + Linux: counter sums close exactly to driven traffic, no overcount.
+- **Replication** (`081c43b`): single-shard master PSYNC2 end-to-end wired,
+  REPLCONF validated, `master_link_status` reports the actual handshake
+  state instead of the legacy `up` stub.
+- **Performance**: batch-level eviction gate; `try_handle_*` paths
+  `#[inline]`-ed; DashTable carries through the v0.1.10 pre-size
+  groundwork (capacity hint + headroom).
+- **Docs**: BENCHMARK.md §2.7 updated with the 2026-04-22 GCloud
+  re-measurement; v0.1.x replication scope documented under
+  `docs/guides/clustering.mdx#replication`.
 
-### Fixed — CI Hygiene
+## [0.1.9] — 2026-04-19
 
-- **`tests/pipeline_auto_index.rs`**: tighten outer cfg from `runtime-tokio` to `all(runtime-tokio, text-index)` so the file compiles to zero tests when text-index is disabled. Previously the file compiled but the FT.SEARCH text fast path was `#[cfg]`-ed out, causing `@name:corpus` queries to fall through to the KNN-only parser and panic with "invalid KNN query syntax".
-- **4 FT unwraps**: add inline `#[allow(clippy::unwrap_used)]` with invariant justifications in `vector_search/ft_text_search.rs` (3 sites inside `apply_post_processing` where `do_summarize` / `do_highlight` implies the Option is Some) and `handler_monoio/ft.rs:165` (`is_text` was derived from `query_bytes.as_ref().map_or(false, _)`). Restores the audit-unwrap baseline to 0.
+**Lunaris Retriever Gap Closure.** Every v0.1.8 client-side fallback in
+the Lunaris SDK is now closed so `HybridRRFRetriever` (dense path),
+`GraphFirstRetriever`, and `PathReasoningRetriever` run Moon-native.
 
-### Changed
+- **Phase 167 CYP-01/02**: Cypher `CREATE` / `MERGE` writes participate
+  in `CrossStoreTxn` via `record_graph()`; `TXN.ABORT` rolls them back.
+- **Phase 168 CYP-03/06**: `coalesce()` built-in + single-hop edge-var
+  binding in variable-length `EXPAND`.
+- **Phase 169 CYP-04/05**: `shortestPath()` parser + Dijkstra executor
+  bridge with path-variable binding.
+- **Phase 170 HYB-01/02/04**: `FT.SEARCH HYBRID` dense stream honours
+  `as_of_lsn`.
+- **Phase 171 SCAT-01/02/03**: `ShardMessage::VectorSearch` +
+  `FtHybridPayload` carry `as_of_lsn` for multi-shard `AS_OF` correctness.
+- **Phase 172 PIPE-01/02/03**: pipeline-aware HSET auto-indexing
+  regression guard (3-test suite).
 
-- **`text-index` is now a default feature.** BM25 full-text search (`FT.SEARCH` BM25 mode), `FT.AGGREGATE`, and three-way RRF hybrid fusion are included in all standard builds. No longer requires `--features text-index`. To exclude it (e.g. minimal embedded builds): `--no-default-features --features runtime-monoio,jemalloc,graph`.
+Audit status: **PASSED_WITH_DOCUMENTED_DEFERRALS**. 15 / 20 requirements
+fully satisfied; HYB-03 BM25 MVCC deferred and closed in v0.1.10
+follow-up (G-1); Phase 173 hygiene HYG-02 handler split RFC'd.
 
-### Added — SDK Validation
-
-- **Python SDK `sdk/python/examples/validate.py`**: End-to-end live validator for all SDK sub-clients: ping, strings, counter, hash, list, set, zset, vector index lifecycle, graph engine, session search, semantic cache, text search (BM25 + aggregate + hybrid), and server info. Result against Moon with `text-index`: **114 PASS / 0 FAIL / 0 SKIP**. Gracefully skips text sections when server built without `text-index`.
-- **Rust SDK `sdk/rust/examples/validate.rs`**: Re-validated against `text-index` build — **85 PASS / 0 FAIL**.
-
-### Fixed — Python SDK
-
-- **`moondb.graph._parse_neighbors`**: Server returns alternating `[edge_map, node_map, ...]` as flat key-value arrays (`b'id'`, `int`, `b'src'`, `int`, `b'dst'`, `int`, …). Previous parser expected positional `[node_id, label, props]` — caused `int() on b'id'` crash. Now correctly identifies node entries by `labels` key and parses them from the flat kv format.
+Stats: 6 phases shipped, 17 plans, 27 files changed, +2924 / −376 LOC.
 
 ## [0.1.8] — 2026-04-18
 
@@ -837,7 +971,14 @@ All 2450 lib tests passing locally (`cargo test --no-default-features
 - **Security hardening:** `deny.toml` (cargo-deny), `SECURITY.md`, `docs/THREAT-MODEL.md`, `docs/security/lua-sandbox.md`, TLS cipher suite freeze
 - **Release engineering:** `docs/versioning.md`, 6 operator runbooks, CHANGELOG CI gate, user docs (getting-started, configuration, monitoring), release pipeline SHA256 checksums + SBOM + cosign
 
-## [Earlier Unreleased] - Dispatch Hot-Path Recovery (2026-04-08)
+## [0.1.3] — 2026-04-10
+
+Production-readiness foundation: dispatch hot-path recovery, vector-search
+4× QPS + correctness fixes, and the tiered disk-offload landing with 100 %
+crash recovery across 7 persistence configurations. Bundles three work
+streams originally tracked as separate Unreleased blocks (Apr 7–8).
+
+### Dispatch Hot-Path Recovery (2026-04-08)
 
 **Pipelined SET +37%, pipelined GET +68% at p=16 after PR #43 regression recovery.**
 
@@ -934,9 +1075,7 @@ captured as todo in `.planning/todos/pending/`.
 
 ---
 
-## [Unreleased] - Vector Search 4x QPS + Correctness
-
-### Vector Search Performance & Correctness (2026-04-07)
+### Vector Search 4× QPS + Correctness (2026-04-07)
 
 **4x search QPS, 4.1x lower latency, 2.56x faster than Qdrant on real MiniLM data.**
 
@@ -991,9 +1130,9 @@ embeddings (clustered) achieve 0.92-0.97 recall with the same code.
 
 ---
 
-## [Earlier Unreleased] - Disk Offload & x86_64 Performance
+### Disk Offload & x86_64 Performance (2026-04-06)
 
-Tiered storage, crash recovery, and 2x Redis on x86_64 (Intel Xeon, io_uring).
+Tiered storage, crash recovery, and 2× Redis on x86_64 (Intel Xeon, io_uring).
 
 ### Added
 
