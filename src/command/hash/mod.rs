@@ -1326,14 +1326,20 @@ mod tests {
             ])
         );
         // Both fields gone — key must have been removed.
-        assert!(!db.exists(b"h"), "key must be deleted when last fields removed");
+        assert!(
+            !db.exists(b"h"),
+            "key must be deleted when last fields removed"
+        );
     }
 
     #[test]
     fn test_hgetdel_returns_nil_for_missing_field() {
         let mut db = Database::new();
         seed_hash(&mut db, b"h", &[(b"f1", b"v1")]);
-        let r = hgetdel(&mut db, &make_args(&[b"h", b"FIELDS", b"2", b"f1", b"nope"]));
+        let r = hgetdel(
+            &mut db,
+            &make_args(&[b"h", b"FIELDS", b"2", b"f1", b"nope"]),
+        );
         assert_eq!(
             r,
             Frame::Array(framevec![
@@ -1352,7 +1358,10 @@ mod tests {
             r,
             Frame::Array(framevec![Frame::BulkString(Bytes::copy_from_slice(b"one"))])
         );
-        assert!(!db.exists(b"h"), "key must be deleted when hash becomes empty");
+        assert!(
+            !db.exists(b"h"),
+            "key must be deleted when hash becomes empty"
+        );
     }
 
     #[test]
@@ -1364,7 +1373,9 @@ mod tests {
         let r = hgetdel(&mut db, &make_args(&[b"lp", b"FIELDS", b"1", b"a"]));
         assert_eq!(
             r,
-            Frame::Array(framevec![Frame::BulkString(Bytes::copy_from_slice(b"alpha"))])
+            Frame::Array(framevec![Frame::BulkString(Bytes::copy_from_slice(
+                b"alpha"
+            ))])
         );
         // The other field must still be retrievable.
         let remaining = hget(&mut db, &make_args(&[b"lp", b"b"]));
@@ -1427,10 +1438,7 @@ mod tests {
     #[test]
     fn test_hgetdel_wrongtype_error() {
         let mut db = Database::new();
-        db.set_string(
-            Bytes::from_static(b"s"),
-            Bytes::from_static(b"not_a_hash"),
-        );
+        db.set_string(Bytes::from_static(b"s"), Bytes::from_static(b"not_a_hash"));
         let r = hgetdel(&mut db, &make_args(&[b"s", b"FIELDS", b"1", b"f"]));
         assert!(
             matches!(&r, Frame::Error(e) if e.starts_with(b"WRONGTYPE")),
@@ -1458,7 +1466,10 @@ mod tests {
         let mut db = Database::new();
         seed_hash(&mut db, b"h", &[(b"f", b"val")]);
         let now = db.now_ms();
-        let r = hgetex(&mut db, &make_args(&[b"h", b"EX", b"60", b"FIELDS", b"1", b"f"]));
+        let r = hgetex(
+            &mut db,
+            &make_args(&[b"h", b"EX", b"60", b"FIELDS", b"1", b"f"]),
+        );
         assert_eq!(
             r,
             Frame::Array(framevec![Frame::BulkString(Bytes::copy_from_slice(b"val"))])
@@ -1549,7 +1560,10 @@ mod tests {
         // Seed a TTL first.
         let abs_ms = db.now_ms() + 60_000;
         expire_field_at(&mut db, b"h", b"f", abs_ms);
-        assert!(db.hash_get_field_ttl_ms(b"h", b"f").is_some(), "pre-condition");
+        assert!(
+            db.hash_get_field_ttl_ms(b"h", b"f").is_some(),
+            "pre-condition"
+        );
         // HGETEX PERSIST must return the value and clear the TTL.
         let r = hgetex(
             &mut db,
@@ -1612,10 +1626,7 @@ mod tests {
     #[test]
     fn test_hgetex_wrongtype_error() {
         let mut db = Database::new();
-        db.set_string(
-            Bytes::from_static(b"s"),
-            Bytes::from_static(b"not_a_hash"),
-        );
+        db.set_string(Bytes::from_static(b"s"), Bytes::from_static(b"not_a_hash"));
         let r = hgetex(
             &mut db,
             &make_args(&[b"s", b"EX", b"60", b"FIELDS", b"1", b"f"]),

@@ -804,9 +804,7 @@ enum HgetexMode {
 /// Returns `(key, mode, fields)` or a `Frame::Error` on any parse failure.
 /// Mode tokens are mutually exclusive — duplicate or conflicting tokens return
 /// `ERR syntax error`.
-fn parse_hgetex_args<'a>(
-    args: &'a [Frame],
-) -> Result<HgetexParsed<'a>, Frame> {
+fn parse_hgetex_args<'a>(args: &'a [Frame]) -> Result<HgetexParsed<'a>, Frame> {
     // Minimum: key + FIELDS + numfields + ≥1 field = 4 elements.
     if args.is_empty() {
         return Err(Frame::Error(Bytes::from_static(
@@ -1031,9 +1029,7 @@ pub fn hgetex(db: &mut Database, args: &[Frame]) -> Frame {
             let ms = (s as i128).saturating_mul(1_000);
             Some(ms.clamp(0, u64::MAX as i128) as u64)
         }
-        HgetexMode::PxAt(ms) => {
-            Some((ms as i128).clamp(0, u64::MAX as i128) as u64)
-        }
+        HgetexMode::PxAt(ms) => Some((ms as i128).clamp(0, u64::MAX as i128) as u64),
     };
 
     let mut results: Vec<Frame> = Vec::with_capacity(parsed.fields.len());

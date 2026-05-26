@@ -535,7 +535,7 @@ impl Database {
                 }
                 if let Some((i, v)) = found {
                     lp.remove_at(i * 2 + 1); // value first (higher index)
-                    lp.remove_at(i * 2);     // then field
+                    lp.remove_at(i * 2); // then field
                     Ok(Some(v))
                 } else {
                     Ok(None)
@@ -567,16 +567,17 @@ impl Database {
     /// Intended to be called after a series of `hash_get_and_delete_field`
     /// calls to clean up the key when all fields were consumed.
     pub fn cleanup_empty_hash(&mut self, key: &[u8]) {
-        let should_delete = self.data.get(key).is_some_and(|e| {
-            match e.value.as_redis_value() {
+        let should_delete = self
+            .data
+            .get(key)
+            .is_some_and(|e| match e.value.as_redis_value() {
                 super::compact_value::RedisValueRef::Hash(m) => m.is_empty(),
                 super::compact_value::RedisValueRef::HashListpack(lp) => lp.is_empty(),
                 super::compact_value::RedisValueRef::HashWithTtl { fields, .. } => {
                     fields.is_empty()
                 }
                 _ => false,
-            }
-        });
+            });
         if should_delete {
             self.data.remove(key);
         }
