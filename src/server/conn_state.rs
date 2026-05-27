@@ -8,7 +8,7 @@ use ringbuf::HeapProd;
 use crate::blocking::BlockingRegistry;
 use crate::cluster::ClusterState;
 use crate::config::{RuntimeConfig, ServerConfig};
-use crate::persistence::aof::{AofMessage, AofWriterPool};
+use crate::persistence::aof::AofWriterPool;
 use crate::protocol::Frame;
 use crate::pubsub::PubSubRegistry;
 use crate::replication::state::ReplicationState;
@@ -38,14 +38,11 @@ pub struct ConnectionContext {
     pub blocking_registry: Rc<RefCell<BlockingRegistry>>,
     pub shutdown: CancellationToken,
     pub requirepass: Option<String>,
-    pub aof_tx: Option<channel::MpscSender<AofMessage>>,
-    /// Per-shard AOF writer pool. **Step 2c compat alias** — populated
-    /// alongside `aof_tx` so call sites can be migrated incrementally in
-    /// steps 2d/2e. In step 2c the spawn sites wrap the single existing
-    /// writer in `AofWriterPool::top_level(tx)`, so this is `Some` exactly
-    /// when `aof_tx` is `Some` and both refer to the same writer task.
-    /// Step 2f replaces the wrapper with `AofWriterPool::per_shard(...)`
-    /// when the manifest layout is `PerShard`.
+    /// Per-shard AOF writer pool. **Sole AOF interface** after the
+    /// 2d/2e migration sequence. Built by spawn sites in `shard/conn_accept.rs`
+    /// from the manifest layout — TopLevel wraps a single sender,
+    /// PerShard owns one sender per shard. Step 2f flips spawn sites
+    /// to construct PerShard pools when the on-disk manifest demands it.
     pub aof_pool: Option<Arc<AofWriterPool>>,
     pub tracking_table: Rc<RefCell<TrackingTable>>,
     pub repl_state: Option<Arc<RwLock<ReplicationState>>>,

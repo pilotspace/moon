@@ -20,7 +20,7 @@ use std::sync::Arc;
 use crate::acl::{AclLog, AclTable};
 use crate::blocking::BlockingRegistry;
 use crate::config::{RuntimeConfig, ServerConfig};
-use crate::persistence::aof::{AofMessage, AofWriterPool};
+use crate::persistence::aof::AofWriterPool;
 use crate::protocol::Frame;
 use crate::pubsub::PubSubRegistry;
 use crate::runtime::channel;
@@ -47,22 +47,12 @@ pub(crate) struct ConnectionContext {
     pub pubsub_registry: Arc<parking_lot::RwLock<PubSubRegistry>>,
     pub blocking_registry: Rc<RefCell<BlockingRegistry>>,
     pub requirepass: Option<String>,
-    /// Legacy single-writer AOF sender. **Removed in step 2e-δ.**
-    /// All consumers migrated to `aof_pool` in 2d/2e-α/β/γ; this field
-    /// is now write-only (populated by `ConnectionContext::new` for the
-    /// final commit's parameter-drop, then deleted along with the
-    /// constructor parameter). Kept for two commits to preserve bisect
-    /// shape across the constructor signature change.
-    #[allow(dead_code)]
-    pub aof_tx: Option<channel::MpscSender<AofMessage>>,
-    /// Per-shard AOF writer pool. **Step 2c compat alias** — populated
-    /// alongside `aof_tx` so call sites can migrate incrementally in steps
-    /// 2d/2e. In step 2c the spawn sites wrap the single existing writer in
-    /// `AofWriterPool::top_level(tx)`, so `aof_pool.is_some()` exactly when
-    /// `aof_tx.is_some()` and both refer to the same writer task. Step 2f
-    /// replaces the wrapper with `AofWriterPool::per_shard(...)` when the
-    /// manifest layout is `PerShard`.
-    #[allow(dead_code)] // Step 2c stages this field; readers land in 2d/2e.
+    /// AOF writer pool — the **sole AOF interface** after the 2d/2e migration
+    /// sequence. Built by spawn sites in `shard/conn_accept.rs` from the
+    /// on-disk manifest layout: TopLevel wraps a single shared writer,
+    /// PerShard owns one sender per shard. `try_send_append(shard_id, bytes)`
+    /// routes to the owning shard; `try_send_rewrite(msg)` rejects under
+    /// PerShard until per-shard rewrite ships (step 6 of the RFC).
     pub aof_pool: Option<Arc<AofWriterPool>>,
     pub tracking_table: Rc<RefCell<TrackingTable>>,
     pub repl_state: Option<Arc<StdRwLock<crate::replication::state::ReplicationState>>>,
@@ -112,7 +102,6 @@ impl ConnectionContext {
         pubsub_registry: Arc<parking_lot::RwLock<PubSubRegistry>>,
         blocking_registry: Rc<RefCell<BlockingRegistry>>,
         requirepass: Option<String>,
-        aof_tx: Option<channel::MpscSender<AofMessage>>,
         aof_pool: Option<Arc<AofWriterPool>>,
         tracking_table: Rc<RefCell<TrackingTable>>,
         repl_state: Option<Arc<StdRwLock<crate::replication::state::ReplicationState>>>,
@@ -153,7 +142,6 @@ impl ConnectionContext {
             pubsub_registry,
             blocking_registry,
             requirepass,
-            aof_tx,
             aof_pool,
             tracking_table,
             repl_state,
