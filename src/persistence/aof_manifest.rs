@@ -5,17 +5,34 @@
 //! manifest framing is the canonical on-disk marker; the human-readable
 //! "v1" umbrella also covers WAL v3 and RDB v2 sub-formats.
 //!
-//! Implements the same directory-based AOF format as Redis 7+:
+//! Two on-disk layouts coexist (selected at manifest creation time, never mixed
+//! within one directory):
+//!
+//! **TopLevel (manifest v1, single-shard / legacy):**
 //! ```text
 //! appendonlydir/
 //!   moon.aof.1.base.rdb     # RDB snapshot base
 //!   moon.aof.1.incr.aof     # Incremental RESP since base
-//!   moon.aof.manifest        # This file
+//!   moon.aof.manifest       # v1 text format
 //! ```
 //!
-//! The manifest is a simple text file listing the active base and incremental
-//! files with their sequence numbers. On BGREWRITEAOF, the sequence increments,
-//! a new base + incr pair is created, and old files are deleted.
+//! **PerShard (manifest v2, multi-shard durability):**
+//! ```text
+//! appendonlydir/
+//!   moon.aof.manifest       # v2 text format (carries shard count + max_lsn)
+//!   shard-0/
+//!     moon.aof.1.base.rdb
+//!     moon.aof.1.incr.aof
+//!   shard-1/
+//!     moon.aof.1.base.rdb
+//!     moon.aof.1.incr.aof
+//!   …
+//! ```
+//!
+//! The manifest text format is line-prefix based. v1 manifests have no
+//! `version` line; v2 manifests begin with `version 2`. On BGREWRITEAOF the
+//! sequence increments, a new base + incr pair is created per shard (PerShard)
+//! or at top level (TopLevel), and old files are deleted.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -25,13 +42,44 @@ use tracing::{error, info, warn};
 const MANIFEST_NAME: &str = "moon.aof.manifest";
 const AOF_DIR_NAME: &str = "appendonlydir";
 
+/// On-disk layout discriminator.
+///
+/// `TopLevel` is the legacy single-shard layout from manifest v1. `PerShard`
+/// is the multi-shard layout introduced with manifest v2 — used whenever
+/// `num_shards >= 2`. A `--shards 1` deployment with an existing v1 manifest
+/// stays TopLevel until explicitly migrated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AofLayout {
+    /// Legacy single-shard layout: `appendonlydir/moon.aof.{seq}.{base|incr}.*`.
+    TopLevel,
+    /// Per-shard layout: `appendonlydir/shard-{N}/moon.aof.{seq}.{base|incr}.*`.
+    PerShard,
+}
+
+/// Per-shard manifest entry. One per shard in `PerShard` layout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShardManifest {
+    /// Shard ID (0..num_shards).
+    pub shard_id: u16,
+    /// Max LSN persisted to this shard's incr file so far. Semantics defined
+    /// by step 3 (LSN tagging) of the per-shard AOF RFC — until then this is
+    /// 0 and recovery does not use it. Once step 3 ships, recovery seeds
+    /// `master_repl_offset = max(shards[*].max_lsn)` before accepting writes.
+    pub max_lsn: u64,
+}
+
 /// Active AOF file set tracked by the manifest.
 #[derive(Debug, Clone)]
 pub struct AofManifest {
     /// Base directory (parent of `appendonlydir/`)
     pub dir: PathBuf,
-    /// Current sequence number (incremented on each rewrite)
+    /// Current sequence number (incremented on each rewrite).
     pub seq: u64,
+    /// On-disk layout. Determines path computation for base/incr files.
+    pub layout: AofLayout,
+    /// Per-shard metadata. Length is 1 for `TopLevel`, `num_shards` for
+    /// `PerShard`. Indexed by `shard_id`.
+    pub shards: Vec<ShardManifest>,
 }
 
 impl AofManifest {
@@ -82,6 +130,11 @@ impl AofManifest {
         let manifest = Self {
             dir: dir.to_path_buf(),
             seq: 1,
+            layout: AofLayout::TopLevel,
+            shards: vec![ShardManifest {
+                shard_id: 0,
+                max_lsn: 0,
+            }],
         };
         std::fs::create_dir_all(manifest.aof_dir())?;
 
@@ -119,6 +172,11 @@ impl AofManifest {
         let manifest = Self {
             dir: dir.to_path_buf(),
             seq: 1,
+            layout: AofLayout::TopLevel,
+            shards: vec![ShardManifest {
+                shard_id: 0,
+                max_lsn: 0,
+            }],
         };
         std::fs::create_dir_all(manifest.aof_dir())?;
 
@@ -157,6 +215,53 @@ impl AofManifest {
 
         let content = std::fs::read_to_string(&manifest_path)?;
 
+        // Detect format version. v1 manifests have no `version` line and use
+        // line prefixes `seq`/`base`/`incr`. v2 manifests start with `version 2`
+        // and carry per-shard records.
+        let mut format_version: u8 = 1;
+        for line in content.lines() {
+            let line = line.trim();
+            if let Some(val) = line.strip_prefix("version ") {
+                if let Ok(v) = val.parse::<u8>() {
+                    format_version = v;
+                }
+                break;
+            }
+            if !line.is_empty() {
+                // First non-blank line is not a version header → v1.
+                break;
+            }
+        }
+
+        let manifest = match format_version {
+            1 => Self::parse_v1(&content, dir, &manifest_path)?,
+            2 => Self::parse_v2(&content, dir, &manifest_path)?,
+            other => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "AOF manifest at {} has unsupported format version {} (max supported: 2)",
+                        manifest_path.display(),
+                        other,
+                    ),
+                ));
+            }
+        };
+
+        // Best-effort orphan cleanup: delete stray base/incr files from aborted
+        // rewrites. A crash between advance() steps 1-3 leaves a new base RDB on
+        // disk that the active manifest never references. Without this sweep,
+        // repeated crashes during rewrite can fill the disk with zombie files.
+        //
+        // Safe to call here: parse_* verified the manifest has all required
+        // records, so cleanup_orphans won't delete the active files.
+        manifest.cleanup_orphans();
+
+        Ok(Some(manifest))
+    }
+
+    /// Parse a v1 (TopLevel, single-shard) manifest.
+    fn parse_v1(content: &str, dir: &Path, manifest_path: &Path) -> std::io::Result<Self> {
         let mut seq = 0u64;
         let mut has_base_record = false;
         let mut has_incr_record = false;
@@ -183,10 +288,6 @@ impl AofManifest {
             ));
         }
 
-        // A valid manifest must have all three records (seq, base, incr).
-        // A truncated manifest with only "seq N" but no base/incr lines could
-        // trigger orphan cleanup that deletes the real base RDB referenced by
-        // the previous valid manifest. Require all records before proceeding.
         if !has_base_record || !has_incr_record {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -200,21 +301,182 @@ impl AofManifest {
             ));
         }
 
-        let manifest = Self {
+        Ok(Self {
             dir: dir.to_path_buf(),
             seq,
-        };
+            layout: AofLayout::TopLevel,
+            shards: vec![ShardManifest {
+                shard_id: 0,
+                max_lsn: 0,
+            }],
+        })
+    }
 
-        // Best-effort orphan cleanup: delete stray base/incr files from aborted
-        // rewrites. A crash between advance() steps 1-3 leaves a new base RDB on
-        // disk that the active manifest never references. Without this sweep,
-        // repeated crashes during rewrite can fill the disk with zombie files.
-        //
-        // Safe to call here: we verified the manifest has all three records
-        // (seq, base, incr), so cleanup_orphans won't delete the active files.
-        manifest.cleanup_orphans();
+    /// Parse a v2 (PerShard, multi-shard) manifest.
+    ///
+    /// Expected line format:
+    /// ```text
+    /// version 2
+    /// seq N
+    /// shards K
+    /// shard 0 max_lsn LSN0
+    /// shard 1 max_lsn LSN1
+    /// ...
+    /// ```
+    ///
+    /// Per-shard `base`/`incr` paths are derived from `shard-{N}/moon.aof.{seq}.*`
+    /// rather than stored explicitly — the layout is canonical, so storing
+    /// paths invites drift between the stored value and the computed one.
+    fn parse_v2(content: &str, dir: &Path, manifest_path: &Path) -> std::io::Result<Self> {
+        let mut seq = 0u64;
+        let mut num_shards: Option<u16> = None;
+        let mut shards: Vec<ShardManifest> = Vec::new();
 
-        Ok(Some(manifest))
+        for line in content.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if line == "version 2" {
+                continue;
+            } else if let Some(val) = line.strip_prefix("seq ") {
+                seq = val.parse::<u64>().map_err(|e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "AOF manifest at {} has invalid seq line `{}`: {}",
+                            manifest_path.display(),
+                            line,
+                            e,
+                        ),
+                    )
+                })?;
+            } else if let Some(val) = line.strip_prefix("shards ") {
+                num_shards = Some(val.parse::<u16>().map_err(|e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "AOF manifest at {} has invalid shards line `{}`: {}",
+                            manifest_path.display(),
+                            line,
+                            e,
+                        ),
+                    )
+                })?);
+            } else if let Some(rest) = line.strip_prefix("shard ") {
+                // Format: `shard <id> max_lsn <lsn>`
+                let mut it = rest.split_whitespace();
+                let id_str = it.next().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "AOF manifest at {} has shard line missing id: `{}`",
+                            manifest_path.display(),
+                            line,
+                        ),
+                    )
+                })?;
+                let id: u16 = id_str.parse().map_err(|e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "AOF manifest at {} has shard line invalid id `{}`: {}",
+                            manifest_path.display(),
+                            id_str,
+                            e,
+                        ),
+                    )
+                })?;
+                // Expect `max_lsn <lsn>`.
+                let label = it.next().unwrap_or("");
+                let val_str = it.next().unwrap_or("0");
+                if label != "max_lsn" {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "AOF manifest at {} shard {} expected `max_lsn`, got `{}`",
+                            manifest_path.display(),
+                            id,
+                            label,
+                        ),
+                    ));
+                }
+                let max_lsn: u64 = val_str.parse().map_err(|e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "AOF manifest at {} shard {} invalid max_lsn `{}`: {}",
+                            manifest_path.display(),
+                            id,
+                            val_str,
+                            e,
+                        ),
+                    )
+                })?;
+                shards.push(ShardManifest {
+                    shard_id: id,
+                    max_lsn,
+                });
+            }
+            // Unknown lines are tolerated (forward-compat). Strict parsers can
+            // be added at v3 if needed.
+        }
+
+        if seq == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "AOF manifest at {} has no valid sequence number",
+                    manifest_path.display()
+                ),
+            ));
+        }
+
+        let expected = num_shards.ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "AOF manifest at {} is missing required `shards N` line",
+                    manifest_path.display()
+                ),
+            )
+        })?;
+
+        if shards.len() != expected as usize {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "AOF manifest at {} declares shards={} but has {} shard records",
+                    manifest_path.display(),
+                    expected,
+                    shards.len(),
+                ),
+            ));
+        }
+
+        // Sort by shard_id and verify contiguous range [0, expected).
+        shards.sort_by_key(|s| s.shard_id);
+        for (i, s) in shards.iter().enumerate() {
+            if s.shard_id as usize != i {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "AOF manifest at {} has non-contiguous shard ids (expected {} at position {}, got {})",
+                        manifest_path.display(),
+                        i,
+                        i,
+                        s.shard_id,
+                    ),
+                ));
+            }
+        }
+
+        Ok(Self {
+            dir: dir.to_path_buf(),
+            seq,
+            layout: AofLayout::PerShard,
+            shards,
+        })
     }
 
     /// Delete any base/incr files in `appendonlydir/` that do not match the
@@ -258,20 +520,259 @@ impl AofManifest {
     }
 
     /// Write the manifest file atomically (write tmp + rename).
+    ///
+    /// Emits v1 format for `TopLevel` and v2 for `PerShard`. The format is
+    /// selected by `self.layout`, never by callers — preserving the invariant
+    /// that one directory holds one layout.
     pub fn write_manifest(&self) -> std::io::Result<()> {
         let manifest_path = self.manifest_path();
         let tmp_path = manifest_path.with_extension("tmp");
 
-        let content = format!(
-            "seq {}\nbase moon.aof.{}.base.rdb\nincr moon.aof.{}.incr.aof\n",
-            self.seq, self.seq, self.seq
-        );
+        let content = match self.layout {
+            AofLayout::TopLevel => format!(
+                "seq {}\nbase moon.aof.{}.base.rdb\nincr moon.aof.{}.incr.aof\n",
+                self.seq, self.seq, self.seq
+            ),
+            AofLayout::PerShard => {
+                let mut s = String::with_capacity(64 + self.shards.len() * 40);
+                s.push_str("version 2\n");
+                s.push_str(&format!("seq {}\n", self.seq));
+                s.push_str(&format!("shards {}\n", self.shards.len()));
+                for shard in &self.shards {
+                    s.push_str(&format!(
+                        "shard {} max_lsn {}\n",
+                        shard.shard_id, shard.max_lsn
+                    ));
+                }
+                s
+            }
+        };
 
         let mut f = std::fs::File::create(&tmp_path)?;
         f.write_all(content.as_bytes())?;
         f.sync_data()?;
         std::fs::rename(&tmp_path, &manifest_path)?;
         Ok(())
+    }
+
+    // ------------------------------------------------------------------
+    // Per-shard layout helpers
+    // ------------------------------------------------------------------
+
+    /// Directory holding a shard's AOF files.
+    ///
+    /// - `TopLevel`: `appendonlydir/` (the shard_id argument is asserted to be 0).
+    /// - `PerShard`: `appendonlydir/shard-{shard_id}/`.
+    pub fn shard_dir(&self, shard_id: u16) -> PathBuf {
+        match self.layout {
+            AofLayout::TopLevel => {
+                debug_assert_eq!(shard_id, 0, "TopLevel layout only has shard 0");
+                self.aof_dir()
+            }
+            AofLayout::PerShard => self.aof_dir().join(format!("shard-{}", shard_id)),
+        }
+    }
+
+    /// Path to a shard's base RDB file for the current sequence.
+    pub fn shard_base_path(&self, shard_id: u16) -> PathBuf {
+        self.shard_dir(shard_id)
+            .join(format!("moon.aof.{}.base.rdb", self.seq))
+    }
+
+    /// Path to a shard's incremental RESP file for the current sequence.
+    pub fn shard_incr_path(&self, shard_id: u16) -> PathBuf {
+        self.shard_dir(shard_id)
+            .join(format!("moon.aof.{}.incr.aof", self.seq))
+    }
+
+    /// Path to a shard's base RDB file for a given sequence.
+    pub fn shard_base_path_seq(&self, shard_id: u16, seq: u64) -> PathBuf {
+        self.shard_dir(shard_id)
+            .join(format!("moon.aof.{}.base.rdb", seq))
+    }
+
+    /// Path to a shard's incremental RESP file for a given sequence.
+    pub fn shard_incr_path_seq(&self, shard_id: u16, seq: u64) -> PathBuf {
+        self.shard_dir(shard_id)
+            .join(format!("moon.aof.{}.incr.aof", seq))
+    }
+
+    /// Maximum LSN persisted across all shards.
+    ///
+    /// Computed (not stored) so the stored value can never drift from
+    /// the per-shard records. Returns 0 if `shards` is empty (defensive;
+    /// constructors guarantee at least one shard).
+    pub fn global_max_lsn(&self) -> u64 {
+        self.shards.iter().map(|s| s.max_lsn).max().unwrap_or(0)
+    }
+
+    /// Verify that the manifest matches the runtime shard count.
+    ///
+    /// Returns the verbatim error from RFC § 3 if the shard count differs,
+    /// for operator-facing consistency. Callers (typically `main.rs` boot)
+    /// should treat this as fatal: continuing with a mismatched shard count
+    /// silently drops data from shards that no longer exist or replays a
+    /// shard's data into the wrong DashTable.
+    pub fn verify_shard_count(&self, expected: u16) -> Result<(), String> {
+        let actual = self.shards.len() as u16;
+        if actual != expected {
+            return Err(format!(
+                "ERR shard count changed (manifest={}, config={}); refusing to start to avoid data loss. See docs/runbooks/shard-count-change.md",
+                actual, expected
+            ));
+        }
+        Ok(())
+    }
+
+    /// Returns true if the on-disk layout under `appendonlydir/` matches the
+    /// legacy TopLevel format (files at top level, no `shard-N/` subdirs).
+    ///
+    /// Used by callers to detect when a v1 single-shard deployment is being
+    /// upgraded to v2 multi-shard and needs explicit migration. Does NOT
+    /// migrate — separate from `migrate_top_level_to_per_shard` so the side
+    /// effect is opt-in, not hidden in a load path.
+    pub fn is_legacy_top_level_layout(dir: &Path) -> bool {
+        let aof_dir = dir.join(AOF_DIR_NAME);
+        if !aof_dir.exists() {
+            return false;
+        }
+        let entries = match std::fs::read_dir(&aof_dir) {
+            Ok(e) => e,
+            Err(_) => return false,
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name_str) = name.to_str() else {
+                continue;
+            };
+            if name_str.starts_with("moon.aof.")
+                && (name_str.ends_with(".base.rdb") || name_str.ends_with(".incr.aof"))
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Migrate a single-shard TopLevel layout in place to a single-shard
+    /// PerShard layout.
+    ///
+    /// Moves `appendonlydir/moon.aof.{seq}.{base.rdb,incr.aof}` into
+    /// `appendonlydir/shard-0/`, then rewrites the manifest as v2 with
+    /// `shards 1`. Idempotent: a second call on an already-PerShard manifest
+    /// returns Ok with no filesystem changes.
+    ///
+    /// This is the RFC § 5 case 1 migration — zero data movement (rename only),
+    /// safe to run on first boot after upgrading from v0.1.x. Multi-shard
+    /// migrations from legacy AOF (case 2) use the `moon migrate-aof`
+    /// subcommand and are NOT handled here.
+    pub fn migrate_top_level_to_per_shard(&mut self) -> std::io::Result<()> {
+        if self.layout == AofLayout::PerShard {
+            return Ok(());
+        }
+        if self.shards.len() != 1 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "migrate_top_level_to_per_shard called with {} shards; \
+                     only single-shard TopLevel can be migrated in place",
+                    self.shards.len()
+                ),
+            ));
+        }
+
+        // Compute old paths (TopLevel) and new paths (PerShard shard-0).
+        let old_base = self.aof_dir().join(format!("moon.aof.{}.base.rdb", self.seq));
+        let old_incr = self.aof_dir().join(format!("moon.aof.{}.incr.aof", self.seq));
+
+        // Switch layout so shard_*_path_seq computes the new location.
+        self.layout = AofLayout::PerShard;
+        let new_dir = self.shard_dir(0);
+        std::fs::create_dir_all(&new_dir)?;
+        let new_base = self.shard_base_path_seq(0, self.seq);
+        let new_incr = self.shard_incr_path_seq(0, self.seq);
+
+        // Rename (in-FS move) the active files. If either is missing, that's
+        // a corrupt source state and we must not silently mask it.
+        if !old_base.exists() {
+            // Revert layout flag so caller sees consistent state on error.
+            self.layout = AofLayout::TopLevel;
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!(
+                    "TopLevel→PerShard migration: source base {} not found",
+                    old_base.display()
+                ),
+            ));
+        }
+        std::fs::rename(&old_base, &new_base)?;
+        if old_incr.exists() {
+            std::fs::rename(&old_incr, &new_incr)?;
+        } else {
+            // incr can legitimately be empty after a fresh init; recreate.
+            std::fs::File::create(&new_incr)?;
+        }
+
+        // Rewrite manifest in v2 format.
+        self.write_manifest()?;
+
+        info!(
+            "AOF migrated: TopLevel → PerShard (single shard) at {}",
+            self.aof_dir().display()
+        );
+        Ok(())
+    }
+
+    /// Create the `appendonlydir/` and write an initial v2 manifest for the
+    /// given shard count.
+    ///
+    /// Each shard gets its own `shard-{N}/` subdirectory with an empty base
+    /// RDB and an empty incr file. Mirrors `initialize()` semantics: the
+    /// `(base + incr)` invariant holds from the first boot, so recovery can
+    /// replay incr-only state without complaint.
+    pub fn initialize_multi(dir: &Path, num_shards: u16) -> std::io::Result<Self> {
+        if num_shards == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "initialize_multi requires num_shards >= 1",
+            ));
+        }
+        let manifest = Self {
+            dir: dir.to_path_buf(),
+            seq: 1,
+            layout: AofLayout::PerShard,
+            shards: (0..num_shards)
+                .map(|id| ShardManifest {
+                    shard_id: id,
+                    max_lsn: 0,
+                })
+                .collect(),
+        };
+        std::fs::create_dir_all(manifest.aof_dir())?;
+
+        // Per-shard empty RDB. Single Database::default() inside a 1-element
+        // slice matches `initialize()`'s empty-RDB shape for each shard.
+        let empty_dbs: [crate::storage::Database; 0] = [];
+        let empty_rdb = crate::persistence::rdb::save_to_bytes(&empty_dbs)
+            .map_err(|e| std::io::Error::other(format!("empty RDB serialize: {e}")))?;
+
+        for shard_id in 0..num_shards {
+            let shard_dir = manifest.shard_dir(shard_id);
+            std::fs::create_dir_all(&shard_dir)?;
+
+            let base_path = manifest.shard_base_path(shard_id);
+            let tmp_path = base_path.with_extension("rdb.tmp");
+            {
+                let mut f = std::fs::File::create(&tmp_path)?;
+                f.write_all(&empty_rdb)?;
+                f.sync_data()?;
+            }
+            std::fs::rename(&tmp_path, &base_path)?;
+            std::fs::File::create(manifest.shard_incr_path(shard_id))?;
+        }
+
+        manifest.write_manifest()?;
+        Ok(manifest)
     }
 
     /// Advance to the next sequence: write new base RDB, create new incr file,
@@ -516,4 +1017,217 @@ fn replay_incr_resp(
     }
 
     Ok(count)
+}
+
+#[cfg(test)]
+mod tests_v2 {
+    //! Unit tests for the v2 (PerShard) manifest format.
+    //!
+    //! Covers the Step 1 deliverable of the per-shard AOF RFC:
+    //! - v1 manifests continue to load as TopLevel (single-shard, shard_id=0)
+    //! - v2 round-trip: write → load → equivalent struct shape
+    //! - shard count mismatch produces the verbatim RFC § 3 error
+    //! - migrate_top_level_to_per_shard performs in-place rename and rewrites
+    //!   the manifest as v2
+    //! - global_max_lsn computes max across shards
+    //! - is_legacy_top_level_layout detects top-level files
+
+    use super::*;
+    use std::fs;
+
+    fn temp_dir() -> PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "moon-aof-manifest-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(&d).expect("temp dir create");
+        d
+    }
+
+    #[test]
+    fn v1_manifest_loads_as_top_level_single_shard() {
+        let dir = temp_dir();
+        let m = AofManifest::initialize(&dir).expect("initialize v1");
+
+        assert_eq!(m.layout, AofLayout::TopLevel);
+        assert_eq!(m.shards.len(), 1);
+        assert_eq!(m.shards[0].shard_id, 0);
+        assert_eq!(m.shards[0].max_lsn, 0);
+
+        // Reload from disk
+        let reloaded = AofManifest::load(&dir).expect("load").expect("present");
+        assert_eq!(reloaded.layout, AofLayout::TopLevel);
+        assert_eq!(reloaded.shards.len(), 1);
+        assert_eq!(reloaded.seq, m.seq);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn v2_manifest_round_trips() {
+        let dir = temp_dir();
+        let m = AofManifest::initialize_multi(&dir, 4).expect("initialize_multi");
+
+        assert_eq!(m.layout, AofLayout::PerShard);
+        assert_eq!(m.shards.len(), 4);
+        for (i, s) in m.shards.iter().enumerate() {
+            assert_eq!(s.shard_id, i as u16);
+            assert_eq!(s.max_lsn, 0);
+        }
+
+        // Per-shard subdirs were created with empty base + incr.
+        for i in 0..4u16 {
+            assert!(m.shard_dir(i).exists(), "shard-{} dir exists", i);
+            assert!(m.shard_base_path(i).exists(), "shard-{} base exists", i);
+            assert!(m.shard_incr_path(i).exists(), "shard-{} incr exists", i);
+        }
+
+        let reloaded = AofManifest::load(&dir).expect("load").expect("present");
+        assert_eq!(reloaded.layout, AofLayout::PerShard);
+        assert_eq!(reloaded.shards.len(), 4);
+        assert_eq!(reloaded.seq, m.seq);
+        for (i, s) in reloaded.shards.iter().enumerate() {
+            assert_eq!(s.shard_id, i as u16);
+        }
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn verify_shard_count_emits_rfc_error_verbatim() {
+        let m = AofManifest {
+            dir: PathBuf::from("/tmp/nowhere"),
+            seq: 1,
+            layout: AofLayout::PerShard,
+            shards: vec![
+                ShardManifest { shard_id: 0, max_lsn: 0 },
+                ShardManifest { shard_id: 1, max_lsn: 0 },
+            ],
+        };
+        let err = m.verify_shard_count(4).expect_err("should mismatch");
+        assert_eq!(
+            err,
+            "ERR shard count changed (manifest=2, config=4); refusing to start to avoid data loss. See docs/runbooks/shard-count-change.md"
+        );
+
+        // Matching count succeeds.
+        m.verify_shard_count(2).expect("match");
+    }
+
+    #[test]
+    fn migrate_top_level_to_per_shard_moves_files_and_rewrites_manifest() {
+        let dir = temp_dir();
+        let mut m = AofManifest::initialize(&dir).expect("initialize v1");
+
+        // Write a marker into the incr file so we can prove the contents
+        // survive the rename.
+        let original_incr = m.aof_dir().join(format!("moon.aof.{}.incr.aof", m.seq));
+        fs::write(&original_incr, b"MARKER").expect("write incr marker");
+
+        m.migrate_top_level_to_per_shard().expect("migrate");
+
+        assert_eq!(m.layout, AofLayout::PerShard);
+        assert!(!original_incr.exists(), "old incr removed by rename");
+        let new_incr = m.shard_incr_path(0);
+        assert!(new_incr.exists(), "new shard-0 incr exists");
+        let contents = fs::read(&new_incr).expect("read new incr");
+        assert_eq!(contents, b"MARKER", "incr contents preserved");
+
+        // Reloaded manifest is v2.
+        let reloaded = AofManifest::load(&dir).expect("load").expect("present");
+        assert_eq!(reloaded.layout, AofLayout::PerShard);
+        assert_eq!(reloaded.shards.len(), 1);
+
+        // Idempotency: second call is a no-op.
+        m.migrate_top_level_to_per_shard().expect("idempotent");
+        assert_eq!(m.layout, AofLayout::PerShard);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn global_max_lsn_returns_max_across_shards() {
+        let m = AofManifest {
+            dir: PathBuf::from("/tmp/nowhere"),
+            seq: 1,
+            layout: AofLayout::PerShard,
+            shards: vec![
+                ShardManifest { shard_id: 0, max_lsn: 100 },
+                ShardManifest { shard_id: 1, max_lsn: 500 },
+                ShardManifest { shard_id: 2, max_lsn: 250 },
+            ],
+        };
+        assert_eq!(m.global_max_lsn(), 500);
+    }
+
+    #[test]
+    fn is_legacy_top_level_layout_detects_v1_files() {
+        let dir = temp_dir();
+        // No appendonlydir yet → false.
+        assert!(!AofManifest::is_legacy_top_level_layout(&dir));
+
+        // After v1 initialize, top-level files present → true.
+        let _m = AofManifest::initialize(&dir).expect("init v1");
+        assert!(AofManifest::is_legacy_top_level_layout(&dir));
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn is_legacy_top_level_layout_returns_false_for_v2() {
+        let dir = temp_dir();
+        let _m = AofManifest::initialize_multi(&dir, 2).expect("init v2");
+        assert!(
+            !AofManifest::is_legacy_top_level_layout(&dir),
+            "v2 layout has no top-level moon.aof.* files"
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn parse_v2_rejects_shard_count_mismatch_in_file() {
+        let dir = temp_dir();
+        let aof = dir.join(AOF_DIR_NAME);
+        fs::create_dir_all(&aof).unwrap();
+        // Manifest claims shards 3 but only declares two shard records.
+        fs::write(
+            aof.join(MANIFEST_NAME),
+            "version 2\nseq 1\nshards 3\nshard 0 max_lsn 0\nshard 1 max_lsn 0\n",
+        )
+        .unwrap();
+
+        let err = AofManifest::load(&dir).expect_err("should reject");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("declares shards=3 but has 2 shard records"),
+            "got: {}",
+            msg
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn parse_v2_rejects_non_contiguous_shard_ids() {
+        let dir = temp_dir();
+        let aof = dir.join(AOF_DIR_NAME);
+        fs::create_dir_all(&aof).unwrap();
+        // shards=2 but ids are {0, 2} not {0, 1}.
+        fs::write(
+            aof.join(MANIFEST_NAME),
+            "version 2\nseq 1\nshards 2\nshard 0 max_lsn 0\nshard 2 max_lsn 0\n",
+        )
+        .unwrap();
+
+        let err = AofManifest::load(&dir).expect_err("should reject");
+        let msg = err.to_string();
+        assert!(msg.contains("non-contiguous shard ids"), "got: {}", msg);
+
+        fs::remove_dir_all(&dir).ok();
+    }
 }
