@@ -20,7 +20,7 @@ use std::rc::Rc;
 
 use crate::command::metadata;
 use crate::command::{DispatchResult, dispatch, dispatch_read, is_dispatch_read_supported};
-use crate::persistence::aof::{self, AofMessage};
+use crate::persistence::aof;
 use crate::protocol::Frame;
 use crate::shard::dispatch::key_to_shard;
 use crate::shard::mesh::ChannelMesh;
@@ -1066,7 +1066,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
             }
 
             // Pre-classify write commands for AOF + tracking
-            let is_write = if ctx.aof_tx.is_some() || conn.tracking_state.enabled {
+            let is_write = if ctx.aof_pool.is_some() || conn.tracking_state.enabled {
                 metadata::is_write(cmd)
             } else {
                 false
@@ -1121,9 +1121,9 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     };
                     // AOF only on actual success (:1). Matches handler_single.
                     if matches!(response, Frame::Integer(1)) {
-                        if let Some(ref tx) = ctx.aof_tx {
+                        if let Some(ref pool) = ctx.aof_pool {
                             let serialized = aof::serialize_command(&frame);
-                            let _ = tx.try_send(AofMessage::Append(serialized));
+                            pool.try_send_append(ctx.shard_id, serialized);
                         }
                     }
                     responses.push(response);
@@ -1186,9 +1186,9 @@ pub(crate) async fn handle_connection_sharded_monoio<
                         // AOF only on actual success (:1). Matches handler_single
                         // — `:0` (key absent / dst exists w/o REPLACE) is a no-op.
                         if matches!(response, Frame::Integer(1)) {
-                            if let Some(ref tx) = ctx.aof_tx {
+                            if let Some(ref pool) = ctx.aof_pool {
                                 let serialized = aof::serialize_command(&frame);
-                                let _ = tx.try_send(AofMessage::Append(serialized));
+                                pool.try_send_append(ctx.shard_id, serialized);
                             }
                         }
                         responses.push(response);
@@ -1535,9 +1535,9 @@ pub(crate) async fn handle_connection_sharded_monoio<
 
                     // AOF logging for successful local writes
                     if !matches!(response, Frame::Error(_)) && is_write {
-                        if let Some(ref tx) = ctx.aof_tx {
+                        if let Some(ref pool) = ctx.aof_pool {
                             let serialized = aof::serialize_command(&frame);
-                            let _ = tx.try_send(AofMessage::Append(serialized));
+                            pool.try_send_append(ctx.shard_id, serialized);
                         }
                     }
 
@@ -1768,7 +1768,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 let resp_idx = responses.len();
                 responses.push(Frame::Null); // placeholder, filled after batch dispatch
                 // Pre-compute AOF bytes before moving frame into Arc
-                let aof_bytes = if ctx.aof_tx.is_some() && metadata::is_write(cmd) {
+                let aof_bytes = if ctx.aof_pool.is_some() && metadata::is_write(cmd) {
                     Some(aof::serialize_command(&dispatch_frame))
                 } else {
                     None
@@ -1837,7 +1837,11 @@ pub(crate) async fn handle_connection_sharded_monoio<
         if !remote_groups.is_empty() {
             reply_futures.clear();
 
+            // Capture `target` per batch so the cross-shard AOF write at the bottom
+            // of the loop can route to the owning shard's pool (not ctx.shard_id —
+            // mirrors the load-bearing fix at handler_sharded/mod.rs:1651).
             let mut oneshot_futures: Vec<(
+                usize, // target shard — owner for AOF append
                 Vec<(usize, Option<Bytes>, Bytes)>,
                 channel::OneshotReceiver<Vec<Frame>>,
             )> = Vec::new();
@@ -1881,7 +1885,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                         }
                     }
                 }
-                oneshot_futures.push((meta, reply_rx));
+                oneshot_futures.push((target, meta, reply_rx));
             }
 
             // Poll all shard responses via pending_wakers relay (monoio cross-thread waker fix).
@@ -1889,7 +1893,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
             // Instead, the connection task registers its waker in pending_wakers; the event
             // loop drains and wakes them after every SPSC cycle (~1ms). On wake, try_recv()
             // checks if the response arrived; if not, re-register and yield again.
-            for (meta, reply_rx) in oneshot_futures.drain(..) {
+            for (target, meta, reply_rx) in oneshot_futures.drain(..) {
                 tracing::trace!(
                     "Shard {}: awaiting cross-shard response via pending_wakers",
                     ctx.shard_id
@@ -1931,11 +1935,15 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 };
                 for ((resp_idx, aof_bytes, cmd_name), resp) in meta.into_iter().zip(shard_responses)
                 {
-                    // AOF logging for successful remote writes
+                    // AOF logging for successful remote writes.
+                    // Owner shard is `target` (NOT ctx.shard_id) — under PerShard
+                    // layout the write must land in the target shard's AOF file
+                    // since that shard owns the mutated data. Mirrors the
+                    // load-bearing fix at handler_sharded/mod.rs:1651.
                     if let Some(bytes) = aof_bytes {
                         if !matches!(resp, Frame::Error(_)) {
-                            if let Some(ref tx) = ctx.aof_tx {
-                                let _ = tx.try_send(AofMessage::Append(bytes));
+                            if let Some(ref pool) = ctx.aof_pool {
+                                pool.try_send_append(target, bytes);
                             }
                         }
                     }
