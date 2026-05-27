@@ -305,19 +305,103 @@ fn main() -> anyhow::Result<()> {
     // Collect connection senders for the listener before spawning shard threads
     let conn_txs: Vec<_> = (0..num_shards).map(|i| mesh.conn_tx(i)).collect();
 
-    // Set up AOF writer channel + wrap the sender as a TopLevel `AofWriterPool`.
-    // Step 2f-α: spawn sites now own pool construction. Step 2f-β will switch
-    // this to a layout-aware constructor that fans out to N writer threads
-    // when the manifest's `AofLayout::PerShard` is on disk.
-    let aof_pool: Option<std::sync::Arc<AofWriterPool>> =
-        if config.appendonly == "yes" {
+    // Set up AOF writer channel(s) + `AofWriterPool` (step 2f-β: layout-aware).
+    //
+    // Logic:
+    //   1. If `appendonly == "yes"` and an existing on-disk manifest is found,
+    //      verify its shard count matches `--shards` (RFC § 3 refusal — a
+    //      mismatch silently maps shards to the wrong AOF files and is fatal).
+    //   2. If the manifest's layout is `PerShard` AND `num_shards >= 2`,
+    //      spawn one writer per shard (`aof-writer-{N}` threads) and emit a
+    //      `AofWriterPool::per_shard(senders)`.
+    //   3. Otherwise spawn the single legacy writer and emit
+    //      `AofWriterPool::top_level(tx)`. This includes:
+    //        - no manifest yet (fresh install — `initialize()` only writes
+    //          TopLevel today; fresh-install PerShard creation lands later
+    //          in the RFC sequence)
+    //        - existing TopLevel manifest (legacy v1 or single-shard v2)
+    //        - `num_shards == 1` (always TopLevel; per-shard fan-out has no
+    //          meaning when there is one shard)
+    //
+    // A *corrupt* manifest is fatal — `AofManifest::load` returning `Err(_)`
+    // must NOT silently fall back to TopLevel, because the next write would
+    // create a fresh manifest overwriting the reference to the real base RDB
+    // and lose data. This mirrors the replay block at L514–526.
+    //
+    // Note: nothing today constructs a `layout == PerShard` manifest on disk
+    // (initialize() hardcodes TopLevel, migrate_top_level_to_per_shard is not
+    // yet wired into boot). The PerShard branch is reachable only by a
+    // hand-crafted manifest until step 9 lifts the multi-shard gate. Runtime
+    // behavior under default configurations stays byte-identical to step 2f-α.
+    use moon::persistence::aof_manifest::{AofLayout, AofManifest};
+    let existing_manifest: Option<AofManifest> = if config.appendonly == "yes" {
+        let base_dir = PathBuf::from(&config.dir);
+        match AofManifest::load(&base_dir) {
+            Ok(opt) => opt,
+            Err(e) => {
+                eprintln!(
+                    "REFUSING TO START: AOF manifest at {}/appendonlydir/ is corrupt: {}. \
+                     Inspect manually before deleting; overwriting silently loses data.",
+                    base_dir.display(),
+                    e
+                );
+                std::process::exit(2);
+            }
+        }
+    } else {
+        None
+    };
+    if let Some(ref m) = existing_manifest
+        && let Err(e) = m.verify_shard_count(num_shards as u16)
+    {
+        eprintln!("REFUSING TO START: {e}");
+        std::process::exit(2);
+    }
+
+    let aof_pool: Option<std::sync::Arc<AofWriterPool>> = if config.appendonly == "yes" {
+        let fsync = FsyncPolicy::from_str(&config.appendfsync);
+        let use_per_shard = matches!(
+            existing_manifest.as_ref().map(|m| m.layout),
+            Some(AofLayout::PerShard)
+        ) && num_shards >= 2;
+
+        if use_per_shard {
+            let base_dir = PathBuf::from(&config.dir);
+            let mut senders = Vec::with_capacity(num_shards);
+            for sid in 0..num_shards {
+                let (tx, rx) = channel::mpsc_bounded::<AofMessage>(10_000);
+                let aof_token = cancel_token.child_token();
+                let base_dir = base_dir.clone();
+                let thread_name = format!("aof-writer-{sid}");
+                let thread_name_inner = thread_name.clone();
+                std::thread::Builder::new()
+                    .name(thread_name)
+                    .spawn(move || {
+                        RuntimeFactoryImpl::block_on_local(
+                            thread_name_inner,
+                            aof::per_shard_aof_writer_task(
+                                rx,
+                                base_dir,
+                                sid as u16,
+                                fsync,
+                                aof_token,
+                            ),
+                        );
+                    })
+                    .expect("failed to spawn per-shard AOF writer thread");
+                senders.push(tx);
+            }
+            info!(
+                "AOF enabled (PerShard, {} writers, fsync: {:?})",
+                num_shards, fsync
+            );
+            Some(AofWriterPool::per_shard(senders))
+        } else {
             let (tx, rx) = channel::mpsc_bounded::<AofMessage>(10_000);
             let aof_token = cancel_token.child_token();
-            let fsync = FsyncPolicy::from_str(&config.appendfsync);
             let aof_file_path = PathBuf::from(&config.dir).join(&config.appendfilename);
-            // AOF writer task runs on its own thread so it's available before
-            // listener_rt is created. Each shard clones the outer `aof_pool`
-            // Arc; sender lifetime is governed by the pool's Drop.
+            // Legacy single-writer thread. Each shard clones the outer
+            // `aof_pool` Arc; sender lifetime is governed by the pool's Drop.
             std::thread::Builder::new()
                 .name("aof-writer".to_string())
                 .spawn(move || {
@@ -327,14 +411,12 @@ fn main() -> anyhow::Result<()> {
                     );
                 })
                 .expect("failed to spawn AOF writer thread");
-            info!(
-                "AOF enabled with fsync policy: {:?}",
-                FsyncPolicy::from_str(&config.appendfsync)
-            );
+            info!("AOF enabled (TopLevel, fsync: {:?})", fsync);
             Some(AofWriterPool::top_level(tx))
-        } else {
-            None
-        };
+        }
+    } else {
+        None
+    };
 
     // Compute bind address for SO_REUSEPORT per-shard listeners (Linux io_uring path).
     let bind_addr = format!("{}:{}", config.bind, config.port);
