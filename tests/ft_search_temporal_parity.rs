@@ -58,6 +58,7 @@ fn build_config(port: u16, num_shards: usize) -> ServerConfig {
         databases: 16,
         requirepass: None,
         appendonly: "no".to_string(),
+        unsafe_multishard_aof: false,
         appendfsync: "everysec".to_string(),
         save: None,
         dir: ".".to_string(),

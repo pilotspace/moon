@@ -30,6 +30,7 @@ async fn start_server() -> (u16, CancellationToken) {
         databases: 16,
         requirepass: None,
         appendonly: "no".to_string(),
+        unsafe_multishard_aof: false,
         appendfsync: "everysec".to_string(),
         save: None,
         dir: dir_path,

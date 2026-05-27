@@ -44,6 +44,7 @@ async fn start_mq_server(num_shards: usize) -> (u16, CancellationToken) {
         databases: 16,
         requirepass: None,
         appendonly: "no".to_string(),
+        unsafe_multishard_aof: false,
         appendfsync: "everysec".to_string(),
         save: None,
         dir: ".".to_string(),

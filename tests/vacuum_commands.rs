@@ -35,6 +35,7 @@ fn base_config(port: u16) -> ServerConfig {
         databases: 1,
         requirepass: None,
         appendonly: "no".to_string(),
+        unsafe_multishard_aof: false,
         appendfsync: "no".to_string(),
         save: None,
         dir: ".".to_string(),

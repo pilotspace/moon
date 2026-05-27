@@ -49,6 +49,7 @@ async fn start_txn_server(num_shards: usize, persistence_dir: &str) -> (u16, Can
         databases: 16,
         requirepass: None,
         appendonly,
+        unsafe_multishard_aof: false,
         appendfsync: "everysec".to_string(),
         save: None,
         dir,
