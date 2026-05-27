@@ -44,7 +44,7 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use moon::config::ServerConfig;
-use moon::persistence::aof::{self, AofMessage, FsyncPolicy};
+use moon::persistence::aof::{self, AofMessage, AofWriterPool, FsyncPolicy};
 use moon::runtime::cancel::CancellationToken;
 use moon::runtime::channel;
 use moon::runtime::{RuntimeFactoryImpl, traits::RuntimeFactory};
@@ -305,33 +305,36 @@ fn main() -> anyhow::Result<()> {
     // Collect connection senders for the listener before spawning shard threads
     let conn_txs: Vec<_> = (0..num_shards).map(|i| mesh.conn_tx(i)).collect();
 
-    // Set up AOF channel: single writer, all shards send to it via mpsc::Sender clones.
-    // The AOF writer task will be spawned on the listener runtime.
-    let aof_tx: Option<channel::MpscSender<AofMessage>> = if config.appendonly == "yes" {
-        let (tx, rx) = channel::mpsc_bounded::<AofMessage>(10_000);
-        let aof_token = cancel_token.child_token();
-        let fsync = FsyncPolicy::from_str(&config.appendfsync);
-        let aof_file_path = PathBuf::from(&config.dir).join(&config.appendfilename);
-        // AOF writer task will be spawned on the listener runtime (see below)
-        // We store rx to spawn later since listener_rt hasn't been created yet.
-        // Instead, spawn on a dedicated thread so it's available before listener starts.
-        std::thread::Builder::new()
-            .name("aof-writer".to_string())
-            .spawn(move || {
-                RuntimeFactoryImpl::block_on_local(
-                    "aof-writer".to_string(),
-                    aof::aof_writer_task(rx, aof_file_path, fsync, aof_token),
-                );
-            })
-            .expect("failed to spawn AOF writer thread");
-        info!(
-            "AOF enabled with fsync policy: {:?}",
-            FsyncPolicy::from_str(&config.appendfsync)
-        );
-        Some(tx)
-    } else {
-        None
-    };
+    // Set up AOF writer channel + wrap the sender as a TopLevel `AofWriterPool`.
+    // Step 2f-α: spawn sites now own pool construction. Step 2f-β will switch
+    // this to a layout-aware constructor that fans out to N writer threads
+    // when the manifest's `AofLayout::PerShard` is on disk.
+    let aof_pool: Option<std::sync::Arc<AofWriterPool>> =
+        if config.appendonly == "yes" {
+            let (tx, rx) = channel::mpsc_bounded::<AofMessage>(10_000);
+            let aof_token = cancel_token.child_token();
+            let fsync = FsyncPolicy::from_str(&config.appendfsync);
+            let aof_file_path = PathBuf::from(&config.dir).join(&config.appendfilename);
+            // AOF writer task runs on its own thread so it's available before
+            // listener_rt is created. Each shard clones the outer `aof_pool`
+            // Arc; sender lifetime is governed by the pool's Drop.
+            std::thread::Builder::new()
+                .name("aof-writer".to_string())
+                .spawn(move || {
+                    RuntimeFactoryImpl::block_on_local(
+                        "aof-writer".to_string(),
+                        aof::aof_writer_task(rx, aof_file_path, fsync, aof_token),
+                    );
+                })
+                .expect("failed to spawn AOF writer thread");
+            info!(
+                "AOF enabled with fsync policy: {:?}",
+                FsyncPolicy::from_str(&config.appendfsync)
+            );
+            Some(AofWriterPool::top_level(tx))
+        } else {
+            None
+        };
 
     // Compute bind address for SO_REUSEPORT per-shard listeners (Linux io_uring path).
     let bind_addr = format!("{}:{}", config.bind, config.port);
@@ -679,7 +682,7 @@ fn main() -> anyhow::Result<()> {
         }
         let conn_rx = mesh.take_conn_rx(id);
         let shard_cancel = cancel_token.clone();
-        let shard_aof_tx = aof_tx.clone();
+        let shard_aof_pool = aof_pool.clone();
         let shard_bind_addr = bind_addr.clone();
         let shard_persistence_dir = persistence_dir.clone();
         let shard_snap_rx = snapshot_trigger_rx.clone();
@@ -711,7 +714,7 @@ fn main() -> anyhow::Result<()> {
                             consumers,
                             producers,
                             shard_cancel,
-                            shard_aof_tx,
+                            shard_aof_pool,
                             // Only pass bind_addr for per-shard SO_REUSEPORT when tokio
                             // with io_uring is active. monoio uses central listener MPSC.
                             #[cfg(feature = "runtime-tokio")]
@@ -897,9 +900,11 @@ fn main() -> anyhow::Result<()> {
         });
     }
 
-    // After listener exits, send AOF shutdown and cancel all shards
-    if let Some(ref tx) = aof_tx {
-        let _ = tx.send(AofMessage::Shutdown);
+    // After listener exits, send AOF shutdown to every writer and cancel all shards.
+    // Under TopLevel this is one send; under PerShard (step 2f-β) this fans out to
+    // every per-shard writer thread via `broadcast_shutdown`.
+    if let Some(ref pool) = aof_pool {
+        pool.broadcast_shutdown();
     }
     cancel_token.cancel();
     for handle in shard_handles {

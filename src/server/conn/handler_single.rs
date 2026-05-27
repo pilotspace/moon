@@ -42,7 +42,10 @@ use crate::server::codec::RespCodec;
 /// When `requirepass` is set, clients must authenticate via AUTH before any other
 /// commands are accepted (except QUIT).
 ///
-/// When `aof_tx` is provided, write commands are logged to the AOF file.
+/// When `aof_pool` is provided, write commands are logged via the per-shard
+/// AOF writer pool. handler_single is single-shard mode by definition
+/// (num_shards = 1, shard_id = 0), so the pool is always a TopLevel layout
+/// wrapping a single writer sender — see `AofWriterPool::top_level`.
 /// When `change_counter` is provided, write commands increment the counter for auto-save.
 ///
 /// Supports Pub/Sub subscriber mode: when a client subscribes to channels/patterns,
@@ -61,7 +64,7 @@ pub async fn handle_connection(
     shutdown: CancellationToken,
     requirepass: Option<String>,
     config: Arc<ServerConfig>,
-    aof_tx: Option<channel::MpscSender<AofMessage>>,
+    aof_pool: Option<Arc<crate::persistence::aof::AofWriterPool>>,
     change_counter: Option<Arc<AtomicU64>>,
     pubsub_registry: Arc<Mutex<PubSubRegistry>>,
     runtime_config: Arc<parking_lot::RwLock<RuntimeConfig>>,
@@ -91,15 +94,6 @@ pub async fn handle_connection(
         None, // no migrated state
     );
     conn.refresh_acl_cache(&acl_table);
-
-    // Step 2e-γ: wrap the inbound `aof_tx` once as a TopLevel pool so
-    // internal call sites can speak the `AofWriterPool` API. handler_single
-    // is single-shard mode by definition (num_shards = 1, shard_id = 0) so
-    // the pool is always TopLevel; step 2e-δ replaces the parameter
-    // itself with `aof_pool: Option<Arc<AofWriterPool>>` from listener.rs.
-    let aof_pool: Option<std::sync::Arc<crate::persistence::aof::AofWriterPool>> = aof_tx
-        .as_ref()
-        .map(|tx| crate::persistence::aof::AofWriterPool::top_level(tx.clone()));
 
     // Per-connection arena for batch processing temporaries.
     // Primary use in Phase 8: scratch buffer during inline token assembly.

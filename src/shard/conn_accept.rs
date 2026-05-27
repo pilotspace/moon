@@ -104,7 +104,7 @@ pub(crate) fn spawn_tokio_connection(
     pubsub_arc: &Arc<parking_lot::RwLock<PubSubRegistry>>,
     blocking_rc: &Rc<RefCell<BlockingRegistry>>,
     shutdown: &CancellationToken,
-    aof_tx: &Option<channel::MpscSender<crate::persistence::aof::AofMessage>>,
+    aof_pool: &Option<Arc<crate::persistence::aof::AofWriterPool>>,
     tracking_rc: &Rc<RefCell<TrackingTable>>,
     lua_rc: &Rc<RefCell<Option<Rc<mlua::Lua>>>>,
     script_cache_rc: &Rc<RefCell<crate::scripting::ScriptCache>>,
@@ -169,13 +169,10 @@ pub(crate) fn spawn_tokio_connection(
         set_tcp_keepalive(tcp_stream.as_raw_fd(), tcp_keepalive_secs);
     }
 
-    // Construct ConnectionContext from cloned shared state.
-    // Build the AOF pool directly from `aof_tx` — step 2f will swap this
-    // for a layout-aware constructor that emits PerShard pools when the
-    // on-disk manifest demands it.
-    let aof_pool = aof_tx
-        .as_ref()
-        .map(|tx| crate::persistence::aof::AofWriterPool::top_level(tx.clone()));
+    // Construct ConnectionContext from cloned shared state. The pool is
+    // already built by the spawn site (main.rs / listener.rs / embedded.rs)
+    // and threaded through `Shard::run` — we just clone the Arc once here.
+    let pool_for_ctx = aof_pool.as_ref().map(Arc::clone);
     let conn_ctx = crate::server::conn::ConnectionContext::new(
         sdbs,
         shard_id,
@@ -183,7 +180,7 @@ pub(crate) fn spawn_tokio_connection(
         psr,
         blk,
         reqpass,
-        aof_pool,
+        pool_for_ctx,
         trk,
         rs,
         cs,
@@ -277,7 +274,7 @@ pub(crate) fn spawn_migrated_tokio_connection(
     pubsub_arc: &Arc<parking_lot::RwLock<PubSubRegistry>>,
     blocking_rc: &Rc<RefCell<BlockingRegistry>>,
     shutdown: &CancellationToken,
-    aof_tx: &Option<channel::MpscSender<crate::persistence::aof::AofMessage>>,
+    aof_pool: &Option<Arc<crate::persistence::aof::AofWriterPool>>,
     tracking_rc: &Rc<RefCell<TrackingTable>>,
     lua_rc: &Rc<RefCell<Option<Rc<mlua::Lua>>>>,
     script_cache_rc: &Rc<RefCell<crate::scripting::ScriptCache>>,
@@ -358,11 +355,8 @@ pub(crate) fn spawn_migrated_tokio_connection(
 
             let migration_buf = take_migration_read_buf(&mut state);
 
-            // See other ConnectionContext::new call sites — step 2f will
-            // swap this builder for a layout-aware constructor.
-            let aof_pool = aof_tx
-                .as_ref()
-                .map(|tx| crate::persistence::aof::AofWriterPool::top_level(tx.clone()));
+            // Pool is built by the spawn site and threaded through here.
+            let pool_for_ctx = aof_pool.as_ref().map(Arc::clone);
             let conn_ctx = crate::server::conn::ConnectionContext::new(
                 sdbs,
                 shard_id,
@@ -370,7 +364,7 @@ pub(crate) fn spawn_migrated_tokio_connection(
                 psr,
                 blk,
                 None, // requirepass: None = pre-authenticated
-                aof_pool,
+                pool_for_ctx,
                 trk,
                 rs,
                 cs,
@@ -430,7 +424,7 @@ pub(crate) fn spawn_monoio_connection(
     pubsub_arc: &Arc<parking_lot::RwLock<PubSubRegistry>>,
     blocking_rc: &Rc<RefCell<BlockingRegistry>>,
     shutdown: &CancellationToken,
-    aof_tx: &Option<channel::MpscSender<crate::persistence::aof::AofMessage>>,
+    aof_pool: &Option<Arc<crate::persistence::aof::AofWriterPool>>,
     tracking_rc: &Rc<RefCell<TrackingTable>>,
     lua_rc: &Rc<RefCell<Option<Rc<mlua::Lua>>>>,
     script_cache_rc: &Rc<RefCell<crate::scripting::ScriptCache>>,
@@ -508,17 +502,14 @@ pub(crate) fn spawn_monoio_connection(
                 .map(|a| a.to_string())
                 .unwrap_or_else(|_| "unknown".to_string());
 
-            // Construct ConnectionContext from cloned shared state.
-            // See other ConnectionContext::new call sites — step 2f will
-            // swap this builder for a layout-aware constructor.
+            // Construct ConnectionContext from cloned shared state. Pool is
+            // built by the spawn site and threaded through here.
             let reqpass = rtcfg.read().requirepass.clone();
-            let aof_pool = aof_tx
-                .as_ref()
-                .map(|tx| crate::persistence::aof::AofWriterPool::top_level(tx.clone()));
+            let pool_for_ctx = aof_pool.as_ref().map(Arc::clone);
             let conn_ctx = crate::server::conn::ConnectionContext::new(
-                sdbs, shard_id, num_shards, psr, blk, reqpass, aof_pool, trk, rs, cs, lua, sc,
-                cp, acl, rtcfg, scfg, dtx, notifiers, snap_tx, clk, rsm, all_regs, all_rsm, aff,
-                spill_tx, spill_fid, do_dir,
+                sdbs, shard_id, num_shards, psr, blk, reqpass, pool_for_ctx, trk, rs, cs, lua,
+                sc, cp, acl, rtcfg, scfg, dtx, notifiers, snap_tx, clk, rsm, all_regs, all_rsm,
+                aff, spill_tx, spill_fid, do_dir,
             );
 
             let maxclients = conn_ctx.runtime_config.read().maxclients;
@@ -726,7 +717,7 @@ pub(crate) fn spawn_migrated_monoio_connection(
     pubsub_arc: &Arc<parking_lot::RwLock<PubSubRegistry>>,
     blocking_rc: &Rc<RefCell<BlockingRegistry>>,
     shutdown: &CancellationToken,
-    aof_tx: &Option<channel::MpscSender<crate::persistence::aof::AofMessage>>,
+    aof_pool: &Option<Arc<crate::persistence::aof::AofWriterPool>>,
     tracking_rc: &Rc<RefCell<TrackingTable>>,
     lua_rc: &Rc<RefCell<Option<Rc<mlua::Lua>>>>,
     script_cache_rc: &Rc<RefCell<crate::scripting::ScriptCache>>,
@@ -814,16 +805,13 @@ pub(crate) fn spawn_migrated_monoio_connection(
 
             let migration_buf = take_migration_read_buf(&mut state);
 
-            // See other ConnectionContext::new call sites — step 2f will
-            // swap this builder for a layout-aware constructor.
-            let aof_pool = aof_tx
-                .as_ref()
-                .map(|tx| crate::persistence::aof::AofWriterPool::top_level(tx.clone()));
+            // Pool is built by the spawn site and threaded through here.
+            let pool_for_ctx = aof_pool.as_ref().map(Arc::clone);
             let conn_ctx = crate::server::conn::ConnectionContext::new(
                 sdbs, shard_id, num_shards, psr, blk,
                 None, // requirepass: None = pre-authenticated
-                aof_pool, trk, rs, cs, lua, sc, cp, acl, rtcfg, scfg, dtx, notifiers, snap_tx,
-                clk, rsm, all_regs, all_rsm, aff, spill_tx, spill_fid, do_dir,
+                pool_for_ctx, trk, rs, cs, lua, sc, cp, acl, rtcfg, scfg, dtx, notifiers,
+                snap_tx, clk, rsm, all_regs, all_rsm, aff, spill_tx, spill_fid, do_dir,
             );
 
             monoio::spawn(async move {
