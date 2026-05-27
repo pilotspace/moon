@@ -67,6 +67,222 @@ pub enum AofMessage {
     Shutdown,
 }
 
+/// Reasons a pool send may be refused without queueing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AofPoolSendError {
+    /// `Rewrite`/`RewriteSharded` sent to a `PerShard` pool. BGREWRITEAOF must
+    /// be issued per shard in the per-shard layout; the legacy single-writer
+    /// rewrite path is not applicable.
+    RewriteUnsupportedInPerShard,
+    /// Underlying channel send failed (writer task dead or channel full).
+    SendFailed,
+}
+
+/// Bundle of per-shard AOF writer senders.
+///
+/// The pool keeps the call-site API uniform regardless of layout:
+/// - **TopLevel** (legacy v1, single-shard, also used for `--shards 1` v2):
+///   exactly one writer thread; every `sender(shard_id)` returns the same
+///   sender so all shards multiplex onto one file.
+/// - **PerShard** (v2 multi-shard): one writer per shard; `sender(shard_id)`
+///   returns the writer that owns `appendonlydir/shard-{shard_id}/`.
+///
+/// Step 2a is additive — this type is defined here but no call site is wired
+/// to it yet. Step 2c performs the type plumbing in `conn_state` and
+/// `conn/core`; steps 2d/2e/2f update the call sites and spawn paths.
+#[derive(Clone)]
+pub struct AofWriterPool {
+    senders: Vec<channel::MpscSender<AofMessage>>,
+    layout: crate::persistence::aof_manifest::AofLayout,
+}
+
+impl AofWriterPool {
+    /// Build a TopLevel pool from a single existing writer sender. Used for
+    /// legacy v1 deployments and `--shards 1` v2 deployments where one writer
+    /// thread services every shard.
+    pub fn top_level(sender: channel::MpscSender<AofMessage>) -> Arc<Self> {
+        Arc::new(Self {
+            senders: vec![sender],
+            layout: crate::persistence::aof_manifest::AofLayout::TopLevel,
+        })
+    }
+
+    /// Build a PerShard pool from N senders. `senders[i]` MUST be the writer
+    /// task that owns `appendonlydir/shard-{i}/`. The vector's length is the
+    /// shard count; passing a length-1 vector here is a bug — use
+    /// [`AofWriterPool::top_level`] instead.
+    pub fn per_shard(senders: Vec<channel::MpscSender<AofMessage>>) -> Arc<Self> {
+        debug_assert!(
+            senders.len() >= 2,
+            "per_shard pool needs >=2 writers; use top_level for single-writer"
+        );
+        Arc::new(Self {
+            senders,
+            layout: crate::persistence::aof_manifest::AofLayout::PerShard,
+        })
+    }
+
+    /// Return the writer sender that owns the given shard's AOF file.
+    ///
+    /// For TopLevel pools, `shard_id` is ignored — all shards multiplex onto
+    /// the single sender. For PerShard pools, `shard_id` MUST be in range
+    /// `[0, num_writers())`; an out-of-range id is a programmer error and
+    /// panics in debug builds.
+    #[inline]
+    pub fn sender(&self, shard_id: usize) -> &channel::MpscSender<AofMessage> {
+        use crate::persistence::aof_manifest::AofLayout;
+        match self.layout {
+            AofLayout::TopLevel => &self.senders[0],
+            AofLayout::PerShard => {
+                debug_assert!(
+                    shard_id < self.senders.len(),
+                    "shard_id {} out of range for per-shard pool of size {}",
+                    shard_id,
+                    self.senders.len()
+                );
+                &self.senders[shard_id]
+            }
+        }
+    }
+
+    /// Fire-and-forget append for the given shard. Mirrors today's
+    /// `let _ = tx.try_send(AofMessage::Append(bytes))` pattern at call sites.
+    #[inline]
+    pub fn try_send_append(&self, shard_id: usize, bytes: Bytes) {
+        let _ = self.sender(shard_id).try_send(AofMessage::Append(bytes));
+    }
+
+    /// Submit a Rewrite/RewriteSharded message. Only legal for TopLevel pools;
+    /// PerShard rewrites are per-shard operations and must be initiated by
+    /// the BGREWRITEAOF code path in step 6, not via this enum variant.
+    pub fn try_send_rewrite(&self, msg: AofMessage) -> Result<(), AofPoolSendError> {
+        use crate::persistence::aof_manifest::AofLayout;
+        debug_assert!(
+            matches!(msg, AofMessage::Rewrite(_) | AofMessage::RewriteSharded(_)),
+            "try_send_rewrite called with a non-Rewrite variant",
+        );
+        if self.layout == AofLayout::PerShard {
+            return Err(AofPoolSendError::RewriteUnsupportedInPerShard);
+        }
+        self.senders[0]
+            .try_send(msg)
+            .map_err(|_| AofPoolSendError::SendFailed)
+    }
+
+    /// Broadcast `Shutdown` to every writer. Used by orchestrated shutdown
+    /// paths in `main.rs`/`embedded.rs`. Each writer drains its channel and
+    /// fsyncs before exiting.
+    pub fn broadcast_shutdown(&self) {
+        for s in &self.senders {
+            let _ = s.try_send(AofMessage::Shutdown);
+        }
+    }
+
+    /// Number of underlying writer senders. 1 for TopLevel, num_shards for
+    /// PerShard.
+    #[inline]
+    pub fn num_writers(&self) -> usize {
+        self.senders.len()
+    }
+
+    /// Reports the pool's layout. Useful for places that need to refuse
+    /// PerShard-incompatible legacy code paths with a clear error.
+    #[inline]
+    pub fn layout(&self) -> crate::persistence::aof_manifest::AofLayout {
+        self.layout
+    }
+}
+
+#[cfg(test)]
+mod pool_tests {
+    use super::*;
+    use crate::persistence::aof_manifest::AofLayout;
+    use crate::runtime::channel;
+
+    #[test]
+    fn top_level_pool_routes_all_shards_to_writer_zero() {
+        let (tx, rx) = channel::mpsc_bounded::<AofMessage>(8);
+        let pool = AofWriterPool::top_level(tx);
+        assert_eq!(pool.num_writers(), 1);
+        assert_eq!(pool.layout(), AofLayout::TopLevel);
+
+        pool.try_send_append(0, Bytes::from_static(b"a"));
+        pool.try_send_append(7, Bytes::from_static(b"b"));
+        pool.try_send_append(42, Bytes::from_static(b"c"));
+
+        let mut seen = 0;
+        while rx.try_recv().is_ok() {
+            seen += 1;
+        }
+        assert_eq!(seen, 3, "all 3 appends should land on writer 0");
+    }
+
+    #[test]
+    fn per_shard_pool_routes_each_shard_to_its_own_writer() {
+        let (tx0, rx0) = channel::mpsc_bounded::<AofMessage>(8);
+        let (tx1, rx1) = channel::mpsc_bounded::<AofMessage>(8);
+        let (tx2, rx2) = channel::mpsc_bounded::<AofMessage>(8);
+        let pool = AofWriterPool::per_shard(vec![tx0, tx1, tx2]);
+        assert_eq!(pool.num_writers(), 3);
+        assert_eq!(pool.layout(), AofLayout::PerShard);
+
+        pool.try_send_append(0, Bytes::from_static(b"shard0"));
+        pool.try_send_append(1, Bytes::from_static(b"shard1a"));
+        pool.try_send_append(1, Bytes::from_static(b"shard1b"));
+        pool.try_send_append(2, Bytes::from_static(b"shard2"));
+
+        let count = |rx: &channel::MpscReceiver<AofMessage>| -> usize {
+            let mut n = 0;
+            while rx.try_recv().is_ok() {
+                n += 1;
+            }
+            n
+        };
+        assert_eq!(count(&rx0), 1, "shard 0 writer should receive exactly 1");
+        assert_eq!(count(&rx1), 2, "shard 1 writer should receive exactly 2");
+        assert_eq!(count(&rx2), 1, "shard 2 writer should receive exactly 1");
+    }
+
+    #[test]
+    fn per_shard_pool_rejects_rewrite_with_explicit_error() {
+        let (tx0, _rx0) = channel::mpsc_bounded::<AofMessage>(8);
+        let (tx1, _rx1) = channel::mpsc_bounded::<AofMessage>(8);
+        let pool = AofWriterPool::per_shard(vec![tx0, tx1]);
+
+        let dummies: SharedDatabases = Arc::new(vec![]);
+        let err = pool.try_send_rewrite(AofMessage::Rewrite(dummies)).unwrap_err();
+        assert_eq!(err, AofPoolSendError::RewriteUnsupportedInPerShard);
+    }
+
+    #[test]
+    fn top_level_pool_accepts_rewrite() {
+        let (tx, rx) = channel::mpsc_bounded::<AofMessage>(8);
+        let pool = AofWriterPool::top_level(tx);
+
+        let dummies: SharedDatabases = Arc::new(vec![]);
+        pool.try_send_rewrite(AofMessage::Rewrite(dummies)).unwrap();
+        assert!(matches!(rx.try_recv(), Ok(AofMessage::Rewrite(_))));
+    }
+
+    #[test]
+    fn broadcast_shutdown_reaches_every_writer() {
+        let (tx0, rx0) = channel::mpsc_bounded::<AofMessage>(2);
+        let (tx1, rx1) = channel::mpsc_bounded::<AofMessage>(2);
+        let (tx2, rx2) = channel::mpsc_bounded::<AofMessage>(2);
+        let pool = AofWriterPool::per_shard(vec![tx0, tx1, tx2]);
+
+        pool.broadcast_shutdown();
+
+        for (i, rx) in [&rx0, &rx1, &rx2].iter().enumerate() {
+            assert!(
+                matches!(rx.try_recv(), Ok(AofMessage::Shutdown)),
+                "writer {} did not receive Shutdown",
+                i
+            );
+        }
+    }
+}
+
 /// Serialize a Frame into RESP wire format bytes.
 pub fn serialize_command(frame: &Frame) -> Bytes {
     let mut buf = BytesMut::with_capacity(64);
