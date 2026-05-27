@@ -609,7 +609,17 @@ pub async fn handle_connection(
                         // BGREWRITEAOF
                         if cmd.eq_ignore_ascii_case(b"BGREWRITEAOF") {
                             let response = if let Some(ref tx) = aof_tx {
-                                crate::command::persistence::bgrewriteaof_start(tx, db.clone())
+                                // handler_single runs in single-shard mode, so the
+                                // writer is always TopLevel — wrapping the local
+                                // sender as a transient pool gives the helper the
+                                // pool-shaped API without changing this fn's
+                                // parameter list (deferred to step 2e-γ). The
+                                // allocation is bounded by BGREWRITEAOF call rate
+                                // (a manual admin command, not a hot path).
+                                let pool = crate::persistence::aof::AofWriterPool::top_level(
+                                    tx.clone(),
+                                );
+                                crate::command::persistence::bgrewriteaof_start(&pool, db.clone())
                             } else {
                                 Frame::Error(Bytes::from_static(b"ERR AOF is not enabled"))
                             };
