@@ -47,13 +47,13 @@ pub(crate) struct ConnectionContext {
     pub pubsub_registry: Arc<parking_lot::RwLock<PubSubRegistry>>,
     pub blocking_registry: Rc<RefCell<BlockingRegistry>>,
     pub requirepass: Option<String>,
-    /// Legacy single-writer AOF sender. **Compat alias being removed in 2e-δ.**
-    /// Step 2e-α/β migrated handler_sharded; step 2e-γ will migrate the
-    /// monoio inline path at handler_monoio/mod.rs:486 (which still reads
-    /// this field via `try_inline_dispatch_loop`). Under tokio after 2e-β
-    /// this field has no readers — `cfg_attr(not(...))` keeps clippy quiet
-    /// without papering over future regressions on monoio.
-    #[cfg_attr(not(feature = "runtime-monoio"), allow(dead_code))]
+    /// Legacy single-writer AOF sender. **Removed in step 2e-δ.**
+    /// All consumers migrated to `aof_pool` in 2d/2e-α/β/γ; this field
+    /// is now write-only (populated by `ConnectionContext::new` for the
+    /// final commit's parameter-drop, then deleted along with the
+    /// constructor parameter). Kept for two commits to preserve bisect
+    /// shape across the constructor signature change.
+    #[allow(dead_code)]
     pub aof_tx: Option<channel::MpscSender<AofMessage>>,
     /// Per-shard AOF writer pool. **Step 2c compat alias** — populated
     /// alongside `aof_tx` so call sites can migrate incrementally in steps

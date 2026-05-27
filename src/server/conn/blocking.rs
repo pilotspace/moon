@@ -1135,7 +1135,7 @@ pub(crate) fn try_inline_dispatch(
     shard_databases: &std::sync::Arc<ShardDatabases>,
     shard_id: usize,
     selected_db: usize,
-    aof_tx: &Option<channel::MpscSender<crate::persistence::aof::AofMessage>>,
+    aof_pool: &Option<std::sync::Arc<crate::persistence::aof::AofWriterPool>>,
     now_ms: u64,
     num_shards: usize,
     can_inline_writes: bool,
@@ -1346,8 +1346,11 @@ pub(crate) fn try_inline_dispatch(
     }
 
     // AOF: reuse the frozen RESP bytes directly (Arc clone, zero-copy).
-    if let Some(tx) = aof_tx {
-        let _ = tx.try_send(crate::persistence::aof::AofMessage::Append(frozen));
+    // This path is monoio inline GET/SET — the writer for the local shard
+    // (shard_id) owns the AOF record; under PerShard layout that routes
+    // to shard_id's writer.
+    if let Some(pool) = aof_pool {
+        pool.try_send_append(shard_id, frozen);
     }
 
     write_buf.extend_from_slice(b"+OK\r\n");
@@ -1363,7 +1366,7 @@ pub(crate) fn try_inline_dispatch_loop(
     shard_databases: &std::sync::Arc<ShardDatabases>,
     shard_id: usize,
     selected_db: usize,
-    aof_tx: &Option<channel::MpscSender<crate::persistence::aof::AofMessage>>,
+    aof_pool: &Option<std::sync::Arc<crate::persistence::aof::AofWriterPool>>,
     now_ms: u64,
     num_shards: usize,
     can_inline_writes: bool,
@@ -1377,7 +1380,7 @@ pub(crate) fn try_inline_dispatch_loop(
             shard_databases,
             shard_id,
             selected_db,
-            aof_tx,
+            aof_pool,
             now_ms,
             num_shards,
             can_inline_writes,

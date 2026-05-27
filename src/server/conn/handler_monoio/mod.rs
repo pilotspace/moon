@@ -483,7 +483,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 &ctx.shard_databases,
                 ctx.shard_id,
                 conn.selected_db,
-                &ctx.aof_tx,
+                &ctx.aof_pool,
                 ctx.cached_clock.ms(),
                 ctx.num_shards,
                 can_inline_writes,

@@ -92,6 +92,15 @@ pub async fn handle_connection(
     );
     conn.refresh_acl_cache(&acl_table);
 
+    // Step 2e-γ: wrap the inbound `aof_tx` once as a TopLevel pool so
+    // internal call sites can speak the `AofWriterPool` API. handler_single
+    // is single-shard mode by definition (num_shards = 1, shard_id = 0) so
+    // the pool is always TopLevel; step 2e-δ replaces the parameter
+    // itself with `aof_pool: Option<Arc<AofWriterPool>>` from listener.rs.
+    let aof_pool: Option<std::sync::Arc<crate::persistence::aof::AofWriterPool>> = aof_tx
+        .as_ref()
+        .map(|tx| crate::persistence::aof::AofWriterPool::top_level(tx.clone()));
+
     // Per-connection arena for batch processing temporaries.
     // Primary use in Phase 8: scratch buffer during inline token assembly.
     // Phase 9+ will leverage this for per-request temporaries.
@@ -608,18 +617,8 @@ pub async fn handle_connection(
                         }
                         // BGREWRITEAOF
                         if cmd.eq_ignore_ascii_case(b"BGREWRITEAOF") {
-                            let response = if let Some(ref tx) = aof_tx {
-                                // handler_single runs in single-shard mode, so the
-                                // writer is always TopLevel — wrapping the local
-                                // sender as a transient pool gives the helper the
-                                // pool-shaped API without changing this fn's
-                                // parameter list (deferred to step 2e-γ). The
-                                // allocation is bounded by BGREWRITEAOF call rate
-                                // (a manual admin command, not a hot path).
-                                let pool = crate::persistence::aof::AofWriterPool::top_level(
-                                    tx.clone(),
-                                );
-                                crate::command::persistence::bgrewriteaof_start(&pool, db.clone())
+                            let response = if let Some(ref pool) = aof_pool {
+                                crate::command::persistence::bgrewriteaof_start(pool, db.clone())
                             } else {
                                 Frame::Error(Bytes::from_static(b"ERR AOF is not enabled"))
                             };
@@ -665,7 +664,11 @@ pub async fn handle_connection(
                                         // WAL must be durable BEFORE the swap (no rollback
                                         // path for SWAPDB). Try-send first; on failure return
                                         // an error and leave both DBs untouched.
-                                        let wal_ok = if let Some(ref tx) = aof_tx {
+                                        // Drop down to the pool sender so we can still observe
+                                        // try_send's Result (the fire-and-forget
+                                        // pool.try_send_append loses the SendFailed signal we
+                                        // need to abort the swap cleanly).
+                                        let wal_ok = if let Some(ref pool) = aof_pool {
                                             let mut a_buf = itoa::Buffer::new();
                                             let mut b_buf = itoa::Buffer::new();
                                             let wal_frame = Frame::Array(crate::framevec![
@@ -681,12 +684,14 @@ pub async fn handle_connection(
                                                 crate::persistence::aof::serialize_command(
                                                     &wal_frame,
                                                 );
-                                            tx.try_send(
-                                                crate::persistence::aof::AofMessage::Append(
-                                                    serialized,
-                                                ),
-                                            )
-                                            .is_ok()
+                                            // Single-shard mode — shard_id = 0.
+                                            pool.sender(0)
+                                                .try_send(
+                                                    crate::persistence::aof::AofMessage::Append(
+                                                        serialized,
+                                                    ),
+                                                )
+                                                .is_ok()
                                         } else {
                                             true // persistence disabled — no durability requirement
                                         };
@@ -888,8 +893,15 @@ pub async fn handle_connection(
                             }
                             // Send AOF entries accumulated so far
                             for bytes in aof_entries.drain(..) {
-                                if let Some(ref tx) = aof_tx {
-                                    let _ = tx.send_async(AofMessage::Append(bytes)).await;
+                                if let Some(ref pool) = aof_pool {
+                                    // Single-shard mode (shard_id = 0). send_async
+                                    // preserves back-pressure semantics from the
+                                    // pre-pool code; the pool's TopLevel layout
+                                    // routes to the same single writer.
+                                    let _ = pool
+                                        .sender(0)
+                                        .send_async(AofMessage::Append(bytes))
+                                        .await;
                                 }
                                 if let Some(ref counter) = change_counter {
                                     counter.fetch_add(1, Ordering::Relaxed);
@@ -1520,8 +1532,14 @@ pub async fn handle_connection(
                                         (resp, records)
                                     };
                                     for record in wal_records {
-                                        if let Some(ref tx) = aof_tx {
-                                            let _ = tx.send_async(AofMessage::Append(bytes::Bytes::from(record))).await;
+                                        if let Some(ref pool) = aof_pool {
+                                            // Single-shard mode (shard_id = 0).
+                                            let _ = pool
+                                                .sender(0)
+                                                .send_async(AofMessage::Append(
+                                                    bytes::Bytes::from(record),
+                                                ))
+                                                .await;
                                         }
                                         if let Some(ref counter) = change_counter {
                                             counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1538,7 +1556,7 @@ pub async fn handle_connection(
                             let is_write = metadata::is_write(cmd);
 
                             // Serialize for AOF before dispatch
-                            let aof_bytes = if is_write && aof_tx.is_some() {
+                            let aof_bytes = if is_write && aof_pool.is_some() {
                                 let mut buf = BytesMut::new();
                                 crate::protocol::serialize::serialize(&frame, &mut buf);
                                 Some(buf.freeze())
@@ -2242,8 +2260,13 @@ pub async fn handle_connection(
 
                 // --- Send AOF entries OUTSIDE the lock ---
                 for bytes in aof_entries {
-                    if let Some(ref tx) = aof_tx {
-                        let _ = tx.send_async(AofMessage::Append(bytes)).await;
+                    if let Some(ref pool) = aof_pool {
+                        // Single-shard mode (shard_id = 0). send_async preserves
+                        // back-pressure semantics from the pre-pool code.
+                        let _ = pool
+                            .sender(0)
+                            .send_async(AofMessage::Append(bytes))
+                            .await;
                     }
                     if let Some(ref counter) = change_counter {
                         counter.fetch_add(1, Ordering::Relaxed);
