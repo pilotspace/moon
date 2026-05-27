@@ -1136,6 +1136,9 @@ pub(crate) fn try_inline_dispatch(
     shard_id: usize,
     selected_db: usize,
     aof_pool: &Option<std::sync::Arc<crate::persistence::aof::AofWriterPool>>,
+    repl_state: &Option<
+        std::sync::Arc<std::sync::RwLock<crate::replication::state::ReplicationState>>,
+    >,
     now_ms: u64,
     num_shards: usize,
     can_inline_writes: bool,
@@ -1348,9 +1351,18 @@ pub(crate) fn try_inline_dispatch(
     // AOF: reuse the frozen RESP bytes directly (Arc clone, zero-copy).
     // This path is monoio inline GET/SET — the writer for the local shard
     // (shard_id) owns the AOF record; under PerShard layout that routes
-    // to shard_id's writer.
+    // to shard_id's writer. LSN must be sourced from `repl_state` so the
+    // inline path's writes share an LSN namespace with the non-inline path
+    // — otherwise per-shard replay merge in RFC step 5 would see two
+    // disjoint LSN streams per shard. Cost: one extra read-lock acquire
+    // (uncontended) + one atomic fetch_add per inline SET.
     if let Some(pool) = aof_pool {
-        pool.try_send_append(shard_id, frozen);
+        let lsn = crate::persistence::aof::AofWriterPool::issue_append_lsn(
+            repl_state,
+            shard_id,
+            frozen.len(),
+        );
+        pool.try_send_append(shard_id, lsn, frozen);
     }
 
     write_buf.extend_from_slice(b"+OK\r\n");
@@ -1367,6 +1379,9 @@ pub(crate) fn try_inline_dispatch_loop(
     shard_id: usize,
     selected_db: usize,
     aof_pool: &Option<std::sync::Arc<crate::persistence::aof::AofWriterPool>>,
+    repl_state: &Option<
+        std::sync::Arc<std::sync::RwLock<crate::replication::state::ReplicationState>>,
+    >,
     now_ms: u64,
     num_shards: usize,
     can_inline_writes: bool,
@@ -1381,6 +1396,7 @@ pub(crate) fn try_inline_dispatch_loop(
             shard_id,
             selected_db,
             aof_pool,
+            repl_state,
             now_ms,
             num_shards,
             can_inline_writes,

@@ -1172,7 +1172,10 @@ pub(crate) async fn handle_connection_sharded_inner<
                             // — `:0` (key absent) is a no-op and must not log.
                             if matches!(response, Frame::Integer(1)) {
                                 if let Some(ref bytes) = aof_bytes {
-                                    if let Some(ref pool) = ctx.aof_pool { pool.try_send_append(ctx.shard_id, bytes.clone()); }
+                                    if let Some(ref pool) = ctx.aof_pool {
+                                        let lsn = aof::AofWriterPool::issue_append_lsn(&ctx.repl_state, ctx.shard_id, bytes.len());
+                                        pool.try_send_append(ctx.shard_id, lsn, bytes.clone());
+                                    }
                                 }
                             }
                             responses.push(response);
@@ -1216,7 +1219,10 @@ pub(crate) async fn handle_connection_sharded_inner<
                                 // — `:0` (key absent / dst exists w/o REPLACE) is a no-op.
                                 if matches!(response, Frame::Integer(1)) {
                                     if let Some(ref bytes) = aof_bytes {
-                                        if let Some(ref pool) = ctx.aof_pool { pool.try_send_append(ctx.shard_id, bytes.clone()); }
+                                        if let Some(ref pool) = ctx.aof_pool {
+                                            let lsn = aof::AofWriterPool::issue_append_lsn(&ctx.repl_state, ctx.shard_id, bytes.len());
+                                            pool.try_send_append(ctx.shard_id, lsn, bytes.clone());
+                                        }
                                     }
                                 }
                                 responses.push(response);
@@ -1427,7 +1433,10 @@ pub(crate) async fn handle_connection_sharded_inner<
                             }
                             if let Some(bytes) = aof_bytes {
                                 if !matches!(response, Frame::Error(_)) {
-                                    if let Some(ref pool) = ctx.aof_pool { pool.try_send_append(ctx.shard_id, bytes); }
+                                    if let Some(ref pool) = ctx.aof_pool {
+                                        let lsn = aof::AofWriterPool::issue_append_lsn(&ctx.repl_state, ctx.shard_id, bytes.len());
+                                        pool.try_send_append(ctx.shard_id, lsn, bytes);
+                                    }
                                 }
                             }
                             if conn.tracking_state.enabled && !matches!(response, Frame::Error(_)) {
@@ -1655,7 +1664,11 @@ pub(crate) async fn handle_connection_sharded_inner<
                             // every cross-shard append, masking the wrong-owner write.
                             if let Some(bytes) = aof_bytes {
                                 if !matches!(resp, Frame::Error(_)) {
-                                    if let Some(ref pool) = ctx.aof_pool { pool.try_send_append(target, bytes); }
+                                    if let Some(ref pool) = ctx.aof_pool {
+                                        // Cross-shard: LSN sourced for `target`.
+                                        let lsn = aof::AofWriterPool::issue_append_lsn(&ctx.repl_state, target, bytes.len());
+                                        pool.try_send_append(target, lsn, bytes);
+                                    }
                                 }
                             }
                             responses[resp_idx] = apply_resp3_conversion(&cmd_name, resp, proto_ver);

@@ -679,11 +679,13 @@ pub async fn handle_connection(
                                                     &wal_frame,
                                                 );
                                             // Single-shard mode — shard_id = 0.
+                                            let lsn = crate::persistence::aof::AofWriterPool::issue_append_lsn(&repl_state, 0, serialized.len());
                                             pool.sender(0)
                                                 .try_send(
-                                                    crate::persistence::aof::AofMessage::Append(
-                                                        serialized,
-                                                    ),
+                                                    crate::persistence::aof::AofMessage::Append {
+                                                        lsn,
+                                                        bytes: serialized,
+                                                    },
                                                 )
                                                 .is_ok()
                                         } else {
@@ -892,9 +894,10 @@ pub async fn handle_connection(
                                     // preserves back-pressure semantics from the
                                     // pre-pool code; the pool's TopLevel layout
                                     // routes to the same single writer.
+                                    let lsn = crate::persistence::aof::AofWriterPool::issue_append_lsn(&repl_state, 0, bytes.len());
                                     let _ = pool
                                         .sender(0)
-                                        .send_async(AofMessage::Append(bytes))
+                                        .send_async(AofMessage::Append { lsn, bytes })
                                         .await;
                                 }
                                 if let Some(ref counter) = change_counter {
@@ -1528,11 +1531,11 @@ pub async fn handle_connection(
                                     for record in wal_records {
                                         if let Some(ref pool) = aof_pool {
                                             // Single-shard mode (shard_id = 0).
+                                            let bytes = bytes::Bytes::from(record);
+                                            let lsn = crate::persistence::aof::AofWriterPool::issue_append_lsn(&repl_state, 0, bytes.len());
                                             let _ = pool
                                                 .sender(0)
-                                                .send_async(AofMessage::Append(
-                                                    bytes::Bytes::from(record),
-                                                ))
+                                                .send_async(AofMessage::Append { lsn, bytes })
                                                 .await;
                                         }
                                         if let Some(ref counter) = change_counter {
@@ -2257,9 +2260,10 @@ pub async fn handle_connection(
                     if let Some(ref pool) = aof_pool {
                         // Single-shard mode (shard_id = 0). send_async preserves
                         // back-pressure semantics from the pre-pool code.
+                        let lsn = crate::persistence::aof::AofWriterPool::issue_append_lsn(&repl_state, 0, bytes.len());
                         let _ = pool
                             .sender(0)
-                            .send_async(AofMessage::Append(bytes))
+                            .send_async(AofMessage::Append { lsn, bytes })
                             .await;
                     }
                     if let Some(ref counter) = change_counter {

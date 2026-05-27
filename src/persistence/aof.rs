@@ -57,8 +57,23 @@ impl FsyncPolicy {
 
 /// Messages sent to the AOF writer task via mpsc channel.
 pub enum AofMessage {
-    /// Append serialized RESP command bytes to the AOF file.
-    Append(Bytes),
+    /// Append serialized RESP command bytes to the AOF file, tagged with the
+    /// LSN that was issued for this write (`ReplicationState::issue_lsn`).
+    ///
+    /// `lsn` semantics by writer task:
+    /// - **TopLevel** (`aof_writer_task`): `lsn` is **ignored**; the legacy
+    ///   v1 disk format is plain RESP bytes with no per-entry framing.
+    /// - **PerShard** (`per_shard_aof_writer_task`): `lsn` is **written** as
+    ///   a u64 header per RFC § 2 Rule 1. Disk format per entry:
+    ///   `[u64 lsn LE][u32 len LE][RESP bytes of length len]`.
+    ///   Recovery reads `(lsn, cmd)` pairs and merges cross-shard
+    ///   `OrderedAcrossShards` writes by LSN (RFC § 2 Rule 2).
+    ///
+    /// Construction sites that issue a real LSN call
+    /// `ReplicationState::issue_lsn(shard_id, bytes.len() as u64)` and pass
+    /// the returned value. Sites with no replication state available pass 0
+    /// (TopLevel ignores it; PerShard treats 0 as "no ordering hint").
+    Append { lsn: u64, bytes: Bytes },
     /// Trigger a full AOF rewrite (compaction) using current database state.
     Rewrite(SharedDatabases),
     /// Trigger AOF rewrite in sharded mode (all shards' databases).
@@ -145,11 +160,48 @@ impl AofWriterPool {
         }
     }
 
-    /// Fire-and-forget append for the given shard. Mirrors today's
-    /// `let _ = tx.try_send(AofMessage::Append(bytes))` pattern at call sites.
+    /// Fire-and-forget append for the given shard, tagged with the LSN that
+    /// was issued for this write (see [`AofMessage::Append`] docs for LSN
+    /// semantics per layout). Call sites must source `lsn` from
+    /// `ReplicationState::issue_lsn(shard_id, bytes.len() as u64)` for writes
+    /// that participate in replication ordering; sites without a
+    /// replication-state handle pass 0.
     #[inline]
-    pub fn try_send_append(&self, shard_id: usize, bytes: Bytes) {
-        let _ = self.sender(shard_id).try_send(AofMessage::Append(bytes));
+    pub fn try_send_append(&self, shard_id: usize, lsn: u64, bytes: Bytes) {
+        let _ = self
+            .sender(shard_id)
+            .try_send(AofMessage::Append { lsn, bytes });
+    }
+
+    /// Issue an LSN for an AOF append at every call site that has the
+    /// `Option<Arc<RwLock<ReplicationState>>>` shape. Wraps
+    /// `ReplicationState::issue_lsn` so handler call sites collapse to a
+    /// single line.
+    ///
+    /// Returns 0 when:
+    /// - `repl_state` is None (test fixtures or shutdown paths)
+    /// - the `RwLock` is poisoned (shouldn't happen in production —
+    ///   ReplicationState is only `write()`-locked under known-safe paths)
+    ///
+    /// 0 is a sentinel meaning "no replication ordering for this write".
+    /// TopLevel writers ignore the LSN entirely so 0 is harmless there;
+    /// PerShard writers treat 0 the same as any other LSN (per-shard order
+    /// is preserved by write order, not by LSN value). The LSN only matters
+    /// for the cross-shard `OrderedAcrossShards` merge in RFC step 5.
+    #[inline]
+    pub fn issue_append_lsn(
+        repl_state: &Option<Arc<std::sync::RwLock<crate::replication::state::ReplicationState>>>,
+        shard_id: usize,
+        delta: usize,
+    ) -> u64 {
+        repl_state
+            .as_ref()
+            .and_then(|rs| {
+                rs.read()
+                    .ok()
+                    .map(|g| g.issue_lsn(shard_id, delta as u64))
+            })
+            .unwrap_or(0)
     }
 
     /// Submit a Rewrite/RewriteSharded message. Only legal for TopLevel pools;
@@ -206,9 +258,9 @@ mod pool_tests {
         assert_eq!(pool.num_writers(), 1);
         assert_eq!(pool.layout(), AofLayout::TopLevel);
 
-        pool.try_send_append(0, Bytes::from_static(b"a"));
-        pool.try_send_append(7, Bytes::from_static(b"b"));
-        pool.try_send_append(42, Bytes::from_static(b"c"));
+        pool.try_send_append(0, 0, Bytes::from_static(b"a"));
+        pool.try_send_append(7, 0, Bytes::from_static(b"b"));
+        pool.try_send_append(42, 0, Bytes::from_static(b"c"));
 
         let mut seen = 0;
         while rx.try_recv().is_ok() {
@@ -226,10 +278,10 @@ mod pool_tests {
         assert_eq!(pool.num_writers(), 3);
         assert_eq!(pool.layout(), AofLayout::PerShard);
 
-        pool.try_send_append(0, Bytes::from_static(b"shard0"));
-        pool.try_send_append(1, Bytes::from_static(b"shard1a"));
-        pool.try_send_append(1, Bytes::from_static(b"shard1b"));
-        pool.try_send_append(2, Bytes::from_static(b"shard2"));
+        pool.try_send_append(0, 100, Bytes::from_static(b"shard0"));
+        pool.try_send_append(1, 200, Bytes::from_static(b"shard1a"));
+        pool.try_send_append(1, 300, Bytes::from_static(b"shard1b"));
+        pool.try_send_append(2, 400, Bytes::from_static(b"shard2"));
 
         let count = |rx: &channel::MpscReceiver<AofMessage>| -> usize {
             let mut n = 0;
@@ -262,6 +314,45 @@ mod pool_tests {
         let dummies: SharedDatabases = Arc::new(vec![]);
         pool.try_send_rewrite(AofMessage::Rewrite(dummies)).unwrap();
         assert!(matches!(rx.try_recv(), Ok(AofMessage::Rewrite(_))));
+    }
+
+    #[test]
+    fn per_shard_pool_threads_lsn_field_to_each_writer() {
+        // Step 3 wire-format contract: try_send_append carries the issued LSN
+        // through to the writer task, which writes it as the per-entry header
+        // under PerShard layout. This unit test pins the channel-side contract
+        // (the disk-side framing is covered by writer-task integration).
+        let (tx0, rx0) = channel::mpsc_bounded::<AofMessage>(4);
+        let (tx1, rx1) = channel::mpsc_bounded::<AofMessage>(4);
+        let pool = AofWriterPool::per_shard(vec![tx0, tx1]);
+
+        pool.try_send_append(0, 42, Bytes::from_static(b"set foo 1"));
+        pool.try_send_append(1, 43, Bytes::from_static(b"set bar 2"));
+        pool.try_send_append(0, 44, Bytes::from_static(b"del foo"));
+
+        // Shard 0 should see (42, "set foo 1") then (44, "del foo").
+        match rx0.try_recv() {
+            Ok(AofMessage::Append { lsn, bytes }) => {
+                assert_eq!(lsn, 42, "shard 0 first entry lsn");
+                assert_eq!(bytes.as_ref(), b"set foo 1");
+            }
+            other => panic!("shard 0 first recv expected Append, got {:?}", other.is_ok()),
+        }
+        match rx0.try_recv() {
+            Ok(AofMessage::Append { lsn, bytes }) => {
+                assert_eq!(lsn, 44, "shard 0 second entry lsn");
+                assert_eq!(bytes.as_ref(), b"del foo");
+            }
+            other => panic!("shard 0 second recv expected Append, got {:?}", other.is_ok()),
+        }
+        // Shard 1 should see (43, "set bar 2") only.
+        match rx1.try_recv() {
+            Ok(AofMessage::Append { lsn, bytes }) => {
+                assert_eq!(lsn, 43, "shard 1 entry lsn");
+                assert_eq!(bytes.as_ref(), b"set bar 2");
+            }
+            other => panic!("shard 1 recv expected Append, got {:?}", other.is_ok()),
+        }
     }
 
     #[test]
@@ -410,7 +501,10 @@ pub async fn aof_writer_task(
 
         loop {
             match rx.recv() {
-                Ok(AofMessage::Append(data)) => {
+                // TopLevel writer: legacy v1 disk format is plain RESP. The
+                // LSN is ignored — TopLevel is single-shard so per-shard merge
+                // by LSN is moot.
+                Ok(AofMessage::Append { bytes: data, lsn: _ }) => {
                     if write_error {
                         continue; // Drop appends after persistent I/O failure
                     }
@@ -503,7 +597,8 @@ pub async fn aof_writer_task(
         tokio::select! {
             msg = rx.recv_async() => {
                 match msg {
-                    Ok(AofMessage::Append(data)) => {
+                    // TopLevel writer (tokio): legacy v1 plain RESP, lsn ignored.
+                    Ok(AofMessage::Append { bytes: data, lsn: _ }) => {
                         if let Err(e) = writer.write_all(&data).await {
                             error!("AOF write error: {}", e);
                             continue;
@@ -717,7 +812,18 @@ pub async fn per_shard_aof_writer_task(
             tokio::select! {
                 msg = rx.recv_async() => {
                     match msg {
-                        Ok(AofMessage::Append(data)) => {
+                        // PerShard writer (tokio): per RFC § 2 Rule 1 the on-disk
+                        // format is `[u64 lsn LE][u32 len LE][RESP bytes]`. Header
+                        // is written sequentially with the body — both calls land
+                        // in the same BufWriter so this is one syscall under load.
+                        Ok(AofMessage::Append { lsn, bytes: data }) => {
+                            let mut header = [0u8; 12];
+                            header[..8].copy_from_slice(&lsn.to_le_bytes());
+                            header[8..].copy_from_slice(&(data.len() as u32).to_le_bytes());
+                            if let Err(e) = writer.write_all(&header).await {
+                                error!("AOF header write error shard {}: {}", shard_id, e);
+                                continue;
+                            }
                             if let Err(e) = writer.write_all(&data).await {
                                 error!("AOF write error shard {}: {}", shard_id, e);
                                 continue;
@@ -857,8 +963,21 @@ pub async fn per_shard_aof_writer_task(
 
         loop {
             match rx.recv() {
-                Ok(AofMessage::Append(data)) => {
+                // PerShard writer (monoio): framed `[u64 lsn LE][u32 len LE][RESP]`.
+                // See the tokio twin above for format rationale.
+                Ok(AofMessage::Append { lsn, bytes: data }) => {
                     if write_error {
+                        continue;
+                    }
+                    let mut header = [0u8; 12];
+                    header[..8].copy_from_slice(&lsn.to_le_bytes());
+                    header[8..].copy_from_slice(&(data.len() as u32).to_le_bytes());
+                    if let Err(e) = file.write_all(&header) {
+                        error!(
+                            "AOF header write failed shard {} (seq {}): {}. Persistence degraded.",
+                            shard_id, manifest.seq, e
+                        );
+                        write_error = true;
                         continue;
                     }
                     if let Err(e) = file.write_all(&data) {
@@ -1351,7 +1470,9 @@ fn drain_pending_appends(
     let mut outcome = DrainOutcome::default();
     while let Ok(msg) = rx.try_recv() {
         match msg {
-            AofMessage::Append(data) => {
+            // BGREWRITEAOF drain runs on the TopLevel writer (monoio) only;
+            // PerShard rewrite is RFC step 6. Legacy v1 disk format → ignore lsn.
+            AofMessage::Append { bytes: data, lsn: _ } => {
                 file.write_all(&data).map_err(|e| AofError::Io {
                     path: PathBuf::from("<aof incr drain>"),
                     source: e,

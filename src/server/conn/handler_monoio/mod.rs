@@ -484,6 +484,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 ctx.shard_id,
                 conn.selected_db,
                 &ctx.aof_pool,
+                &ctx.repl_state,
                 ctx.cached_clock.ms(),
                 ctx.num_shards,
                 can_inline_writes,
@@ -1123,7 +1124,12 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     if matches!(response, Frame::Integer(1)) {
                         if let Some(ref pool) = ctx.aof_pool {
                             let serialized = aof::serialize_command(&frame);
-                            pool.try_send_append(ctx.shard_id, serialized);
+                            let lsn = aof::AofWriterPool::issue_append_lsn(
+                                &ctx.repl_state,
+                                ctx.shard_id,
+                                serialized.len(),
+                            );
+                            pool.try_send_append(ctx.shard_id, lsn, serialized);
                         }
                     }
                     responses.push(response);
@@ -1188,7 +1194,12 @@ pub(crate) async fn handle_connection_sharded_monoio<
                         if matches!(response, Frame::Integer(1)) {
                             if let Some(ref pool) = ctx.aof_pool {
                                 let serialized = aof::serialize_command(&frame);
-                                pool.try_send_append(ctx.shard_id, serialized);
+                                let lsn = aof::AofWriterPool::issue_append_lsn(
+                                    &ctx.repl_state,
+                                    ctx.shard_id,
+                                    serialized.len(),
+                                );
+                                pool.try_send_append(ctx.shard_id, lsn, serialized);
                             }
                         }
                         responses.push(response);
@@ -1537,7 +1548,12 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     if !matches!(response, Frame::Error(_)) && is_write {
                         if let Some(ref pool) = ctx.aof_pool {
                             let serialized = aof::serialize_command(&frame);
-                            pool.try_send_append(ctx.shard_id, serialized);
+                            let lsn = aof::AofWriterPool::issue_append_lsn(
+                                &ctx.repl_state,
+                                ctx.shard_id,
+                                serialized.len(),
+                            );
+                            pool.try_send_append(ctx.shard_id, lsn, serialized);
                         }
                     }
 
@@ -1943,7 +1959,16 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     if let Some(bytes) = aof_bytes {
                         if !matches!(resp, Frame::Error(_)) {
                             if let Some(ref pool) = ctx.aof_pool {
-                                pool.try_send_append(target, bytes);
+                                // Cross-shard write: LSN must be sourced
+                                // using `target`'s shard_id so the
+                                // per-shard offset increment lands on the
+                                // shard that owns the mutated data.
+                                let lsn = aof::AofWriterPool::issue_append_lsn(
+                                    &ctx.repl_state,
+                                    target,
+                                    bytes.len(),
+                                );
+                                pool.try_send_append(target, lsn, bytes);
                             }
                         }
                     }
