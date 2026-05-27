@@ -585,6 +585,352 @@ pub async fn aof_writer_task(
     }
 }
 
+/// Background per-shard AOF writer task (Option B step 2b).
+///
+/// One instance is spawned per shard in `PerShard` layout. Each instance owns
+/// `appendonlydir/shard-{shard_id}/moon.aof.{seq}.incr.aof` exclusively — no
+/// other writer touches that file, so there is no per-file locking.
+///
+/// Differences from [`aof_writer_task`] (TopLevel):
+/// - Opens `manifest.shard_incr_path(shard_id)` instead of `manifest.incr_path()`.
+/// - `Rewrite`/`RewriteSharded` variants are rejected (logged + dropped).
+///   The legacy single-writer rewrite enum has no meaning when each shard
+///   owns its own files; per-shard BGREWRITEAOF lands in RFC step 6.
+/// - Refuses to start if the loaded manifest's layout is `TopLevel` — the
+///   spawn site (step 2f) must only invoke this task body for `PerShard`
+///   layouts. Mismatch is a programmer error.
+///
+/// Wait/timeout/corruption semantics for manifest loading match the existing
+/// `aof_writer_task` (60s bounded wait, hard fail on corrupt manifest).
+pub async fn per_shard_aof_writer_task(
+    rx: channel::MpscReceiver<AofMessage>,
+    base_dir: PathBuf,
+    shard_id: u16,
+    fsync: FsyncPolicy,
+    cancel: CancellationToken,
+) {
+    #[cfg(feature = "runtime-tokio")]
+    {
+        use crate::persistence::aof_manifest::{AofLayout, AofManifest};
+        use tokio::io::AsyncWriteExt;
+
+        // Wait for main.rs recovery to create/load the manifest.
+        let manifest_wait_start = Instant::now();
+        const MANIFEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+        let manifest = loop {
+            if cancel.is_cancelled() {
+                info!(
+                    "AOF writer shard {}: cancelled while waiting for manifest",
+                    shard_id
+                );
+                return;
+            }
+            if manifest_wait_start.elapsed() > MANIFEST_TIMEOUT {
+                error!(
+                    "AOF writer shard {}: manifest not found at {} after {:?}. Writer exiting.",
+                    shard_id,
+                    base_dir.display(),
+                    MANIFEST_TIMEOUT,
+                );
+                return;
+            }
+            match AofManifest::load(&base_dir) {
+                Ok(Some(m)) => break m,
+                Ok(None) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+                Err(e) => {
+                    error!(
+                        "AOF writer shard {}: manifest corrupt at {}: {}. Persistence disabled.",
+                        shard_id,
+                        base_dir.display(),
+                        e
+                    );
+                    return;
+                }
+            }
+        };
+
+        if manifest.layout != AofLayout::PerShard {
+            error!(
+                "AOF writer shard {}: layout is {:?}, expected PerShard. \
+                 per_shard_aof_writer_task should only be spawned for PerShard layouts. \
+                 Writer exiting.",
+                shard_id, manifest.layout
+            );
+            return;
+        }
+        if (shard_id as usize) >= manifest.shards.len() {
+            error!(
+                "AOF writer shard {}: out of range for manifest with {} shards. Writer exiting.",
+                shard_id,
+                manifest.shards.len()
+            );
+            return;
+        }
+
+        let incr_path = manifest.shard_incr_path(shard_id);
+        // Ensure shard-{N}/ exists. The manifest constructor for PerShard
+        // already creates these, but be defensive — a manual deletion or
+        // a manifest written by an older binary could leave them missing.
+        if let Some(parent) = incr_path.parent() {
+            if let Err(e) = tokio::fs::create_dir_all(parent).await {
+                error!(
+                    "AOF writer shard {}: failed to create dir {}: {}",
+                    shard_id,
+                    parent.display(),
+                    e
+                );
+                return;
+            }
+        }
+        let file: tokio::fs::File = match tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&incr_path)
+            .await
+        {
+            Ok(f) => f,
+            Err(e) => {
+                error!(
+                    "AOF writer shard {}: failed to open incr {}: {}",
+                    shard_id,
+                    incr_path.display(),
+                    e
+                );
+                return;
+            }
+        };
+        info!(
+            "AOF writer shard {}: seq {}, incr={}",
+            shard_id,
+            manifest.seq,
+            incr_path.display()
+        );
+
+        let mut writer = tokio::io::BufWriter::new(file);
+        let mut last_fsync = Instant::now();
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        interval.tick().await;
+
+        loop {
+            tokio::select! {
+                msg = rx.recv_async() => {
+                    match msg {
+                        Ok(AofMessage::Append(data)) => {
+                            if let Err(e) = writer.write_all(&data).await {
+                                error!("AOF write error shard {}: {}", shard_id, e);
+                                continue;
+                            }
+                            if matches!(fsync, FsyncPolicy::Always) {
+                                let _ = writer.flush().await;
+                                let _ = writer.get_ref().sync_data().await;
+                            }
+                        }
+                        Ok(AofMessage::Rewrite(_)) | Ok(AofMessage::RewriteSharded(_)) => {
+                            warn!(
+                                "AOF writer shard {}: received Rewrite/RewriteSharded — \
+                                 not supported in PerShard layout, dropped. \
+                                 Per-shard BGREWRITEAOF lands in RFC step 6.",
+                                shard_id
+                            );
+                        }
+                        Ok(AofMessage::Shutdown) | Err(_) => {
+                            let _ = writer.flush().await;
+                            let _ = writer.get_ref().sync_data().await;
+                            info!("AOF writer shard {} shutting down", shard_id);
+                            break;
+                        }
+                    }
+                }
+                _ = interval.tick(), if fsync == FsyncPolicy::EverySec => {
+                    if last_fsync.elapsed() >= std::time::Duration::from_secs(1) {
+                        let _ = writer.flush().await;
+                        let _ = writer.get_ref().sync_data().await;
+                        last_fsync = Instant::now();
+                    }
+                }
+                _ = cancel.cancelled() => {
+                    let _ = writer.flush().await;
+                    let _ = writer.get_ref().sync_data().await;
+                    info!("AOF writer shard {} cancelled", shard_id);
+                    break;
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "runtime-monoio")]
+    {
+        use crate::persistence::aof_manifest::{AofLayout, AofManifest};
+        use std::io::Write;
+
+        let manifest_wait_start = Instant::now();
+        const MANIFEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+        let manifest = loop {
+            if cancel.is_cancelled() {
+                info!(
+                    "AOF writer shard {}: cancelled while waiting for manifest",
+                    shard_id
+                );
+                return;
+            }
+            if manifest_wait_start.elapsed() > MANIFEST_TIMEOUT {
+                error!(
+                    "AOF writer shard {}: manifest not found at {} after {:?}. Writer exiting.",
+                    shard_id,
+                    base_dir.display(),
+                    MANIFEST_TIMEOUT,
+                );
+                return;
+            }
+            match AofManifest::load(&base_dir) {
+                Ok(Some(m)) => break m,
+                Ok(None) => {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Err(e) => {
+                    error!(
+                        "AOF writer shard {}: manifest corrupt at {}: {}. Persistence disabled.",
+                        shard_id,
+                        base_dir.display(),
+                        e
+                    );
+                    return;
+                }
+            }
+        };
+
+        if manifest.layout != AofLayout::PerShard {
+            error!(
+                "AOF writer shard {}: layout is {:?}, expected PerShard. Writer exiting.",
+                shard_id, manifest.layout
+            );
+            return;
+        }
+        if (shard_id as usize) >= manifest.shards.len() {
+            error!(
+                "AOF writer shard {}: out of range for manifest with {} shards. Writer exiting.",
+                shard_id,
+                manifest.shards.len()
+            );
+            return;
+        }
+
+        let incr_path = manifest.shard_incr_path(shard_id);
+        if let Some(parent) = incr_path.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                error!(
+                    "AOF writer shard {}: failed to create dir {}: {}",
+                    shard_id,
+                    parent.display(),
+                    e
+                );
+                return;
+            }
+        }
+        let mut file = match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&incr_path)
+        {
+            Ok(f) => f,
+            Err(e) => {
+                error!(
+                    "AOF writer shard {}: failed to open incr {}: {}",
+                    shard_id,
+                    incr_path.display(),
+                    e
+                );
+                return;
+            }
+        };
+        info!(
+            "AOF writer shard {}: seq {}, incr={}",
+            shard_id,
+            manifest.seq,
+            incr_path.display()
+        );
+
+        let mut last_fsync = Instant::now();
+        let mut write_error = false;
+
+        loop {
+            match rx.recv() {
+                Ok(AofMessage::Append(data)) => {
+                    if write_error {
+                        continue;
+                    }
+                    if let Err(e) = file.write_all(&data) {
+                        error!(
+                            "AOF write failed shard {} (seq {}): {}. Persistence degraded.",
+                            shard_id, manifest.seq, e
+                        );
+                        write_error = true;
+                        continue;
+                    }
+                    match fsync {
+                        FsyncPolicy::Always => {
+                            let t = Instant::now();
+                            if let Err(e) = file.flush().and_then(|_| file.sync_data()) {
+                                error!(
+                                    "AOF sync failed shard {} (seq {}, always): {}",
+                                    shard_id, manifest.seq, e
+                                );
+                                write_error = true;
+                            } else {
+                                crate::admin::metrics_setup::record_aof_fsync(
+                                    t.elapsed().as_micros() as u64,
+                                );
+                            }
+                        }
+                        FsyncPolicy::EverySec => {
+                            if last_fsync.elapsed() >= std::time::Duration::from_secs(1) {
+                                let t = Instant::now();
+                                if let Err(e) = file.flush().and_then(|_| file.sync_data()) {
+                                    error!(
+                                        "AOF sync failed shard {} (seq {}, everysec): {}",
+                                        shard_id, manifest.seq, e
+                                    );
+                                } else {
+                                    crate::admin::metrics_setup::record_aof_fsync(
+                                        t.elapsed().as_micros() as u64,
+                                    );
+                                    last_fsync = Instant::now();
+                                }
+                            }
+                        }
+                        FsyncPolicy::No => {}
+                    }
+                }
+                Ok(AofMessage::Rewrite(_)) | Ok(AofMessage::RewriteSharded(_)) => {
+                    warn!(
+                        "AOF writer shard {}: received Rewrite/RewriteSharded — \
+                         not supported in PerShard layout, dropped. \
+                         Per-shard BGREWRITEAOF lands in RFC step 6.",
+                        shard_id
+                    );
+                }
+                Ok(AofMessage::Shutdown) | Err(_) => {
+                    if !write_error {
+                        if let Err(e) = file.flush().and_then(|_| file.sync_data()) {
+                            error!(
+                                "AOF final sync failed shard {} (seq {}): {}",
+                                shard_id, manifest.seq, e
+                            );
+                        }
+                    }
+                    info!(
+                        "AOF writer shard {} shutting down (monoio, seq {})",
+                        shard_id, manifest.seq
+                    );
+                    break;
+                }
+            }
+        }
+    }
+}
+
 /// Replay an AOF file by parsing RESP commands and dispatching them.
 ///
 /// Returns the number of commands successfully replayed.
