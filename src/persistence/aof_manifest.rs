@@ -94,25 +94,76 @@ impl AofManifest {
     }
 
     /// Path to the base RDB file for the current sequence.
+    ///
+    /// Layout-aware: TopLevel returns `appendonlydir/moon.aof.{seq}.base.rdb`;
+    /// PerShard routes to `appendonlydir/shard-0/moon.aof.{seq}.base.rdb`.
+    /// This single-file helper is meaningful only when there is one shard
+    /// (post-migration `--shards 1`); a multi-shard PerShard manifest has N
+    /// base files and the caller must use [`Self::shard_base_path`] instead.
+    /// In debug builds, calling this on a multi-shard PerShard manifest
+    /// asserts; in release it returns the shard-0 path so production stays
+    /// recoverable rather than panicking on a stale call site.
     pub fn base_path(&self) -> PathBuf {
-        self.aof_dir()
-            .join(format!("moon.aof.{}.base.rdb", self.seq))
+        match self.layout {
+            AofLayout::TopLevel => self
+                .aof_dir()
+                .join(format!("moon.aof.{}.base.rdb", self.seq)),
+            AofLayout::PerShard => {
+                debug_assert!(
+                    self.shards.len() == 1,
+                    "base_path() called on multi-shard PerShard manifest; use shard_base_path(shard_id)",
+                );
+                self.shard_base_path_seq(0, self.seq)
+            }
+        }
     }
 
     /// Path to the incremental RESP file for the current sequence.
+    ///
+    /// Layout-aware — see [`Self::base_path`] for the same routing rules.
     pub fn incr_path(&self) -> PathBuf {
-        self.aof_dir()
-            .join(format!("moon.aof.{}.incr.aof", self.seq))
+        match self.layout {
+            AofLayout::TopLevel => self
+                .aof_dir()
+                .join(format!("moon.aof.{}.incr.aof", self.seq)),
+            AofLayout::PerShard => {
+                debug_assert!(
+                    self.shards.len() == 1,
+                    "incr_path() called on multi-shard PerShard manifest; use shard_incr_path(shard_id)",
+                );
+                self.shard_incr_path_seq(0, self.seq)
+            }
+        }
     }
 
-    /// Path to the base RDB file for a given sequence.
+    /// Path to the base RDB file for a given sequence. Layout-aware — see
+    /// [`Self::base_path`].
     pub fn base_path_seq(&self, seq: u64) -> PathBuf {
-        self.aof_dir().join(format!("moon.aof.{}.base.rdb", seq))
+        match self.layout {
+            AofLayout::TopLevel => self.aof_dir().join(format!("moon.aof.{}.base.rdb", seq)),
+            AofLayout::PerShard => {
+                debug_assert!(
+                    self.shards.len() == 1,
+                    "base_path_seq() called on multi-shard PerShard manifest; use shard_base_path_seq(shard_id, seq)",
+                );
+                self.shard_base_path_seq(0, seq)
+            }
+        }
     }
 
-    /// Path to the incremental RESP file for a given sequence.
+    /// Path to the incremental RESP file for a given sequence. Layout-aware —
+    /// see [`Self::base_path`].
     pub fn incr_path_seq(&self, seq: u64) -> PathBuf {
-        self.aof_dir().join(format!("moon.aof.{}.incr.aof", seq))
+        match self.layout {
+            AofLayout::TopLevel => self.aof_dir().join(format!("moon.aof.{}.incr.aof", seq)),
+            AofLayout::PerShard => {
+                debug_assert!(
+                    self.shards.len() == 1,
+                    "incr_path_seq() called on multi-shard PerShard manifest; use shard_incr_path_seq(shard_id, seq)",
+                );
+                self.shard_incr_path_seq(0, seq)
+            }
+        }
     }
 
     /// Create the `appendonlydir/` and write the initial manifest.
@@ -681,22 +732,18 @@ impl AofManifest {
             ));
         }
 
-        // Compute old paths (TopLevel) and new paths (PerShard shard-0).
+        // Compute paths up front. shard_dir/shard_*_path_seq for a single-
+        // shard target are pure path computations and do NOT depend on
+        // self.layout, so it is safe to derive them while layout is still
+        // TopLevel.
         let old_base = self.aof_dir().join(format!("moon.aof.{}.base.rdb", self.seq));
         let old_incr = self.aof_dir().join(format!("moon.aof.{}.incr.aof", self.seq));
+        let new_dir = self.aof_dir().join("shard-0");
+        let new_base = new_dir.join(format!("moon.aof.{}.base.rdb", self.seq));
+        let new_incr = new_dir.join(format!("moon.aof.{}.incr.aof", self.seq));
 
-        // Switch layout so shard_*_path_seq computes the new location.
-        self.layout = AofLayout::PerShard;
-        let new_dir = self.shard_dir(0);
-        std::fs::create_dir_all(&new_dir)?;
-        let new_base = self.shard_base_path_seq(0, self.seq);
-        let new_incr = self.shard_incr_path_seq(0, self.seq);
-
-        // Rename (in-FS move) the active files. If either is missing, that's
-        // a corrupt source state and we must not silently mask it.
         if !old_base.exists() {
-            // Revert layout flag so caller sees consistent state on error.
-            self.layout = AofLayout::TopLevel;
+            // Pre-flight check: nothing moved yet, no rollback needed.
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 format!(
@@ -705,16 +752,85 @@ impl AofManifest {
                 ),
             ));
         }
+        std::fs::create_dir_all(&new_dir)?;
+
+        // Move base. If this fails, no on-disk mutation happened yet — bail
+        // without rollback. Layout stays TopLevel until commit at the bottom.
         std::fs::rename(&old_base, &new_base)?;
+
+        // Base is now in shard-0/. Any subsequent error must restore it.
+        let moved_incr: bool;
+        let created_incr: bool;
         if old_incr.exists() {
-            std::fs::rename(&old_incr, &new_incr)?;
+            if let Err(e) = std::fs::rename(&old_incr, &new_incr) {
+                if let Err(re) = std::fs::rename(&new_base, &old_base) {
+                    error!(
+                        "Migration rollback: failed to restore base {} → {}: {}",
+                        new_base.display(),
+                        old_base.display(),
+                        re
+                    );
+                }
+                return Err(e);
+            }
+            moved_incr = true;
+            created_incr = false;
         } else {
-            // incr can legitimately be empty after a fresh init; recreate.
-            std::fs::File::create(&new_incr)?;
+            match std::fs::File::create(&new_incr) {
+                Ok(_) => {
+                    moved_incr = false;
+                    created_incr = true;
+                }
+                Err(e) => {
+                    if let Err(re) = std::fs::rename(&new_base, &old_base) {
+                        error!(
+                            "Migration rollback: failed to restore base {} → {}: {}",
+                            new_base.display(),
+                            old_base.display(),
+                            re
+                        );
+                    }
+                    return Err(e);
+                }
+            }
         }
 
-        // Rewrite manifest in v2 format.
-        self.write_manifest()?;
+        // Commit: flip layout, persist as v2. If write_manifest fails, undo
+        // every filesystem mutation and restore layout so the next boot still
+        // sees a valid v1 TopLevel deployment.
+        self.layout = AofLayout::PerShard;
+        if let Err(e) = self.write_manifest() {
+            self.layout = AofLayout::TopLevel;
+            if moved_incr {
+                if let Err(re) = std::fs::rename(&new_incr, &old_incr) {
+                    error!(
+                        "Migration rollback: failed to restore incr {} → {}: {}",
+                        new_incr.display(),
+                        old_incr.display(),
+                        re
+                    );
+                }
+            } else if created_incr {
+                if let Err(re) = std::fs::remove_file(&new_incr) {
+                    warn!(
+                        "Migration rollback: failed to remove freshly created incr {}: {}",
+                        new_incr.display(),
+                        re
+                    );
+                }
+            }
+            if let Err(re) = std::fs::rename(&new_base, &old_base) {
+                error!(
+                    "Migration rollback: failed to restore base {} → {}: {}. \
+                     Manifest dir {} may be in an inconsistent state.",
+                    new_base.display(),
+                    old_base.display(),
+                    re,
+                    self.dir.display()
+                );
+            }
+            return Err(e);
+        }
 
         info!(
             "AOF migrated: TopLevel → PerShard (single shard) at {}",
@@ -1227,6 +1343,91 @@ mod tests_v2 {
         let err = AofManifest::load(&dir).expect_err("should reject");
         let msg = err.to_string();
         assert!(msg.contains("non-contiguous shard ids"), "got: {}", msg);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    // ------------------------------------------------------------------
+    // Reviewer-flagged fixes: layout-aware path helpers + migration
+    // rollback. See the "Verify findings against current code" review
+    // comment on aof_manifest.rs:669-775 and :688-717.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn base_incr_paths_route_to_shard_zero_after_migration() {
+        let dir = temp_dir();
+        let mut m = AofManifest::initialize(&dir).expect("init v1");
+        // Pre-migration: TopLevel paths under appendonlydir/ directly.
+        assert_eq!(m.base_path(), m.aof_dir().join("moon.aof.1.base.rdb"));
+        assert_eq!(m.incr_path(), m.aof_dir().join("moon.aof.1.incr.aof"));
+
+        m.migrate_top_level_to_per_shard().expect("migrate");
+
+        // Post-migration: single-file helpers must route to shard-0/ so
+        // replay_multi_part and advance() find the actual files. This is
+        // the bug the reviewer flagged for aof_manifest.rs:669-775.
+        let shard0 = m.aof_dir().join("shard-0");
+        assert_eq!(m.base_path(), shard0.join("moon.aof.1.base.rdb"));
+        assert_eq!(m.incr_path(), shard0.join("moon.aof.1.incr.aof"));
+        assert_eq!(m.base_path_seq(7), shard0.join("moon.aof.7.base.rdb"));
+        assert_eq!(m.incr_path_seq(7), shard0.join("moon.aof.7.incr.aof"));
+        // The path the helper returns must be where the file actually lives.
+        assert!(m.base_path().exists(), "base file at returned path");
+        assert!(m.incr_path().exists(), "incr file at returned path");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn migrate_rolls_back_filesystem_when_incr_rename_fails() {
+        // Simulate the rename(old_incr → new_incr) failure path by making
+        // the destination already exist as a directory (rename onto a
+        // non-empty directory is an error on every supported OS).
+        let dir = temp_dir();
+        let mut m = AofManifest::initialize(&dir).expect("init v1");
+        let original_base = m.aof_dir().join("moon.aof.1.base.rdb");
+        let original_incr = m.aof_dir().join("moon.aof.1.incr.aof");
+        fs::write(&original_incr, b"INCR_MARKER").expect("seed incr");
+        let base_bytes_before = fs::read(&original_base).expect("read base");
+
+        // Pre-create shard-0/moon.aof.1.incr.aof as a DIRECTORY so the
+        // rename fails after the base rename has already succeeded.
+        let shard0 = m.aof_dir().join("shard-0");
+        fs::create_dir_all(shard0.join("moon.aof.1.incr.aof")).expect("seed blocker");
+
+        let err = m
+            .migrate_top_level_to_per_shard()
+            .expect_err("incr rename should fail");
+        let _ = err; // exact error kind depends on OS
+
+        // Rollback invariants:
+        //   1. Layout stays TopLevel in memory.
+        //   2. base file restored to its original TopLevel path.
+        //   3. base file contents unchanged.
+        //   4. on-disk manifest is still v1 (load returns layout TopLevel).
+        assert_eq!(m.layout, AofLayout::TopLevel, "in-memory layout reverted");
+        assert!(original_base.exists(), "base restored to top-level");
+        let base_bytes_after = fs::read(&original_base).expect("read base");
+        assert_eq!(base_bytes_after, base_bytes_before, "base contents intact");
+        let reloaded = AofManifest::load(&dir).expect("load").expect("present");
+        assert_eq!(reloaded.layout, AofLayout::TopLevel, "on-disk manifest v1");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn migrate_does_not_mutate_on_missing_base() {
+        let dir = temp_dir();
+        let mut m = AofManifest::initialize(&dir).expect("init v1");
+        let base = m.aof_dir().join("moon.aof.1.base.rdb");
+        fs::remove_file(&base).expect("remove base");
+
+        let err = m
+            .migrate_top_level_to_per_shard()
+            .expect_err("missing base should fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        // Layout never flipped, no rollback needed.
+        assert_eq!(m.layout, AofLayout::TopLevel);
 
         fs::remove_dir_all(&dir).ok();
     }
