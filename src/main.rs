@@ -70,6 +70,48 @@ fn main() -> anyhow::Result<()> {
 
     let config = ServerConfig::parse();
 
+    // ── AOF v1→v2 migration (FIX-W3-2): early-exit before normal boot ──
+    // When `--migrate-aof-from` is set, run the migration tool and exit.
+    // This must run BEFORE any shard/AOF initialization so the source
+    // directory is never modified and the destination is populated atomically.
+    if let Some(ref from) = config.migrate_aof_from {
+        let to = config.migrate_aof_to.as_deref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "--migrate-aof-to is required when --migrate-aof-from is set"
+            )
+        })?;
+        if config.migrate_aof_shards == 0 {
+            return Err(anyhow::anyhow!(
+                "--migrate-aof-shards must be >= 1 when --migrate-aof-from is set"
+            ));
+        }
+        info!(
+            "Running AOF migration: {} → {} ({} shards)",
+            from.display(),
+            to.display(),
+            config.migrate_aof_shards
+        );
+        // Create destination directory if absent.
+        if let Err(e) = std::fs::create_dir_all(to) {
+            return Err(anyhow::anyhow!(
+                "Failed to create migration destination directory {}: {}",
+                to.display(),
+                e
+            ));
+        }
+        let result = moon::persistence::migrate_aof::migrate_aof(
+            from,
+            to,
+            config.migrate_aof_shards,
+        )
+        .map_err(|e| anyhow::anyhow!("AOF migration failed: {}", e))?;
+        info!(
+            "AOF migration complete: {} commands read, {} written, {} skipped",
+            result.commands_read, result.commands_written, result.commands_skipped
+        );
+        return Ok(());
+    }
+
     // Non-jemalloc builds: warn if operator explicitly set --memory-arenas-cap
     #[cfg(not(feature = "jemalloc"))]
     if config.memory_arenas_cap != 8 {

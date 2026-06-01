@@ -506,6 +506,30 @@ pub struct ServerConfig {
     #[arg(long = "autovacuum-starvation-cap-secs", default_value_t = 300)]
     pub autovacuum_starvation_cap_secs: u64,
 
+    // ── AOF v1→v2 migration ────────────────────────────────────────────
+    /// Source directory containing a legacy single-file AOF (`appendonly.aof`
+    /// or TopLevel manifest layout).  When this flag is set the server runs
+    /// the migration tool, writes the v2 PerShard layout to `--migrate-aof-to`,
+    /// and exits.  Do NOT combine with normal server startup flags.
+    ///
+    /// Example:
+    ///   moon --migrate-aof-from /old/dir --migrate-aof-to /new/dir \
+    ///        --migrate-aof-shards 4
+    #[arg(long = "migrate-aof-from", value_name = "PATH")]
+    pub migrate_aof_from: Option<PathBuf>,
+
+    /// Destination directory for the v2 PerShard AOF layout produced by
+    /// `--migrate-aof-from`.  The directory is created if absent; it must be
+    /// empty (or non-existent) to prevent accidental overwrites.
+    #[arg(long = "migrate-aof-to", value_name = "PATH")]
+    pub migrate_aof_to: Option<PathBuf>,
+
+    /// Number of target shards for the migration.  Must match the `--shards`
+    /// value you will use when starting the server on the migrated data.
+    /// Defaults to 0 (invalid — must be set when `--migrate-aof-from` is used).
+    #[arg(long = "migrate-aof-shards", default_value_t = 0)]
+    pub migrate_aof_shards: u16,
+
     // ── Shared-nothing migration (Phase 0) ─────────────────────────────
     /// Control whether cross-shard reads use the shared-read fast path.
     ///
