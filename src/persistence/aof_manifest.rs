@@ -2147,4 +2147,78 @@ mod tests_v2 {
             _ => panic!("expected Append"),
         }
     }
+
+    // -----------------------------------------------------------------------
+    // FIX-W2-1: cleanup_orphans must recurse into shard-N/ subdirectories
+    // -----------------------------------------------------------------------
+
+    /// Build a minimal PerShard manifest fixture on disk at `seq` without
+    /// needing `advance_shard`. Directly creates the expected directory layout
+    /// so the test is self-contained and doesn't depend on FIX-W2-3 methods.
+    fn write_per_shard_manifest_at_seq(dir: &Path, num_shards: u16, seq: u64) -> AofManifest {
+        let aof_dir = dir.join(AOF_DIR_NAME);
+        fs::create_dir_all(&aof_dir).unwrap();
+        let empty_rdb = crate::persistence::rdb::save_to_bytes(
+            &[] as &[crate::storage::Database],
+        )
+        .expect("empty rdb");
+        let shards: Vec<ShardManifest> = (0..num_shards)
+            .map(|id| ShardManifest { shard_id: id, max_lsn: 0 })
+            .collect();
+        let manifest = AofManifest {
+            dir: dir.to_path_buf(),
+            seq,
+            layout: AofLayout::PerShard,
+            shards,
+        };
+        for shard_id in 0..num_shards {
+            let shard_dir = manifest.shard_dir(shard_id);
+            fs::create_dir_all(&shard_dir).unwrap();
+            let base = manifest.shard_base_path(shard_id);
+            let tmp = base.with_extension("rdb.tmp");
+            fs::write(&tmp, &empty_rdb).unwrap();
+            fs::rename(&tmp, &base).unwrap();
+            fs::write(manifest.shard_incr_path(shard_id), b"").unwrap();
+        }
+        manifest.write_manifest().unwrap();
+        manifest
+    }
+
+    #[test]
+    fn cleanup_orphans_removes_stale_files_in_shard_subdirs() {
+        let dir = temp_dir();
+
+        // Build a 2-shard PerShard manifest at seq=2.
+        let manifest = write_per_shard_manifest_at_seq(&dir, 2, 2);
+
+        // Inject orphan files in shard-0/ that a crashed BGREWRITEAOF would leave.
+        // seq=1 tmp (aborted write) and a seq=5 incr (future zombie).
+        let shard0_dir = manifest.shard_dir(0);
+        let orphan_tmp = shard0_dir.join("moon.aof.1.base.rdb.tmp");
+        let orphan_old_incr = shard0_dir.join("moon.aof.5.incr.aof");
+        fs::write(&orphan_tmp, b"").expect("write orphan tmp");
+        fs::write(&orphan_old_incr, b"").expect("write orphan incr");
+
+        // Active files for seq=2 must survive.
+        let active_base = manifest.shard_base_path(0);
+        let active_incr = manifest.shard_incr_path(0);
+        assert!(active_base.exists(), "active base must exist before cleanup");
+        assert!(active_incr.exists(), "active incr must exist before cleanup");
+
+        // Reload the manifest — this triggers cleanup_orphans.
+        let _reloaded = AofManifest::load(&dir).expect("load").expect("present");
+
+        assert!(
+            !orphan_tmp.exists(),
+            "orphan .rdb.tmp in shard-0/ must be deleted by cleanup_orphans"
+        );
+        assert!(
+            !orphan_old_incr.exists(),
+            "orphan old incr in shard-0/ must be deleted by cleanup_orphans"
+        );
+        assert!(active_base.exists(), "active seq=2 base must survive cleanup");
+        assert!(active_incr.exists(), "active seq=2 incr must survive cleanup");
+
+        fs::remove_dir_all(&dir).ok();
+    }
 }
