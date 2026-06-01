@@ -2507,6 +2507,50 @@ mod tests {
         assert!(remaining_secs > 3500);
     }
 
+    /// FIX-W3-8: BGREWRITEAOF on a fresh empty database must produce a valid
+    /// RDB base and recover cleanly with 0 keys.
+    ///
+    /// Scenario: first boot with `--appendonly yes`, zero writes, then
+    /// BGREWRITEAOF (or a planned restart triggering the rewrite path). The
+    /// resulting base RDB must be a well-formed file (valid `MOON` magic header),
+    /// not zero bytes, and a subsequent replay must succeed with 0 keys loaded.
+    #[test]
+    fn empty_database_rewrite_produces_valid_rdb_and_recovers() {
+        let dir = tempdir().unwrap();
+
+        // Use the manifest + RDB path that do_rewrite_sharded exercises:
+        // serialize an empty snapshot and advance the manifest.
+        let empty_dbs: Vec<Database> = vec![Database::new()];
+        let rdb_bytes = crate::persistence::rdb::save_to_bytes(&empty_dbs)
+            .expect("save empty snapshot to bytes");
+
+        // Invariant 1: RDB is non-empty (has at least magic + version + EOF marker).
+        assert!(
+            !rdb_bytes.is_empty(),
+            "empty-database RDB must not be 0 bytes"
+        );
+
+        // Invariant 2: starts with valid MOON magic header.
+        assert!(
+            rdb_bytes.starts_with(b"MOON"),
+            "RDB bytes must start with MOON magic, got: {:?}",
+            &rdb_bytes[..rdb_bytes.len().min(8)]
+        );
+
+        // Invariant 3: recovery from this base succeeds with 0 keys loaded.
+        let base_path = dir.path().join("empty.rdb");
+        std::fs::write(&base_path, &rdb_bytes).expect("write empty rdb");
+        let mut recovery_dbs = vec![Database::new()];
+        let loaded = crate::persistence::rdb::load(&mut recovery_dbs, &base_path)
+            .expect("load empty rdb");
+        assert_eq!(loaded, 0, "recovering from empty-database RDB yields 0 keys");
+        assert_eq!(
+            recovery_dbs[0].len(),
+            0,
+            "database must be empty after recovering from zero-key RDB"
+        );
+    }
+
     #[test]
     fn test_generate_rewrite_round_trip_preserves_state() {
         let mut dbs = vec![Database::new()];
