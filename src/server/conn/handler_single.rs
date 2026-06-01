@@ -655,12 +655,13 @@ pub async fn handle_connection(
                                         ))
                                     } else {
                                         // WAL must be durable BEFORE the swap (no rollback
-                                        // path for SWAPDB). Try-send first; on failure return
-                                        // an error and leave both DBs untouched.
-                                        // Drop down to the pool sender so we can still observe
-                                        // try_send's Result (the fire-and-forget
-                                        // pool.try_send_append loses the SendFailed signal we
-                                        // need to abort the swap cleanly).
+                                        // path for SWAPDB). Use try_send_append_durable so
+                                        // that the fsync policy is honoured:
+                                        //   - appendfsync=always  → await AppendSync ack
+                                        //     (rendezvous guarantees data is on disk before +OK)
+                                        //   - appendfsync=everysec/no → fire-and-forget (fast)
+                                        // On any Err the caller aborts and leaves both DBs
+                                        // untouched, preserving atomicity from the WAL's perspective.
                                         let wal_ok = if let Some(ref pool) = aof_pool {
                                             let mut a_buf = itoa::Buffer::new();
                                             let mut b_buf = itoa::Buffer::new();
@@ -679,13 +680,8 @@ pub async fn handle_connection(
                                                 );
                                             // Single-shard mode — shard_id = 0.
                                             let lsn = crate::persistence::aof::AofWriterPool::issue_append_lsn(&repl_state, 0, serialized.len());
-                                            pool.sender(0)
-                                                .try_send(
-                                                    crate::persistence::aof::AofMessage::Append {
-                                                        lsn,
-                                                        bytes: serialized,
-                                                    },
-                                                )
+                                            pool.try_send_append_durable(0, lsn, serialized)
+                                                .await
                                                 .is_ok()
                                         } else {
                                             true // persistence disabled — no durability requirement
