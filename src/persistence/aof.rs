@@ -33,6 +33,18 @@ use crate::storage::entry::{Entry, current_time_ms};
 /// Type alias for the per-database RwLock container.
 type SharedDatabases = Arc<Vec<parking_lot::RwLock<Database>>>;
 
+/// High bit of the per-entry LSN reserved for `OrderedAcrossShards`
+/// (RFC § 2 Rule 2). When set on a per-shard AOF entry, recovery treats
+/// the entry as participating in a cross-shard atomic operation and
+/// buffers it for the cross-shard merge replay after per-shard replay
+/// completes.
+///
+/// Practical LSN ceilings (even at 10 M writes/s sustained for a century)
+/// sit near 2^58, so reserving bit 63 has no observable effect on normal
+/// writes — the bit is always 0 in entries written by `try_send_append`.
+/// Only `try_send_append_ordered` sets it.
+pub const ORDERED_LSN_FLAG: u64 = 1u64 << 63;
+
 /// AOF fsync policy controlling when data is flushed to disk.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum FsyncPolicy {
@@ -171,6 +183,43 @@ impl AofWriterPool {
         let _ = self
             .sender(shard_id)
             .try_send(AofMessage::Append { lsn, bytes });
+    }
+
+    /// Fire-and-forget append for a cross-shard atomic operation (RFC § 2
+    /// Rule 2 — `OrderedAcrossShards` tagging).
+    ///
+    /// The high bit of `lsn` (`1 << 63`) is set before the entry is queued.
+    /// Recovery uses this bit to recognize cross-shard atomic entries,
+    /// buffer them per-shard, and replay them globally in LSN order after
+    /// per-shard replay completes — guaranteeing TXN/SCRIPT atomicity
+    /// survives a crash even when multiple shards participated.
+    ///
+    /// **Caller contract:** `lsn` MUST be < `1 << 63` (i.e. the high bit
+    /// MUST be clear when passed in). Practical LSN ceilings — even at
+    /// 10 M writes/s sustained for a century — sit around 2^58, so any
+    /// real LSN satisfies this. Debug builds assert; release builds mask
+    /// the input to keep the wire format well-formed rather than
+    /// corrupt-by-zero-extending.
+    ///
+    /// **Production callers today:** none. Step 5 ships the infrastructure
+    /// (writer, framing flag, recovery merge) so a future cross-shard TXN
+    /// or replicated SCRIPT command has a place to land. Until that
+    /// consumer exists, only test code emits ordered entries.
+    #[inline]
+    pub fn try_send_append_ordered(&self, shard_id: usize, lsn: u64, bytes: Bytes) {
+        debug_assert_eq!(
+            lsn & ORDERED_LSN_FLAG,
+            0,
+            "try_send_append_ordered: lsn must not have the high bit set; got {:#x}",
+            lsn,
+        );
+        let tagged_lsn = (lsn & !ORDERED_LSN_FLAG) | ORDERED_LSN_FLAG;
+        let _ = self
+            .sender(shard_id)
+            .try_send(AofMessage::Append {
+                lsn: tagged_lsn,
+                bytes,
+            });
     }
 
     /// Issue an LSN for an AOF append at every call site that has the

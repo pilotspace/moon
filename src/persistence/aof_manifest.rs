@@ -1135,12 +1135,30 @@ fn replay_incr_resp(
     Ok(count)
 }
 
+/// An entry that was tagged `OrderedAcrossShards` (RFC § 2 Rule 2) and
+/// must be merge-replayed in global LSN order after per-shard replay
+/// completes. The `shard_id` records which shard's file it came from so
+/// the merge step can dispatch each entry back to its origin shard's
+/// databases.
+#[derive(Debug, Clone)]
+pub struct OrderedEntry {
+    pub shard_id: u16,
+    pub lsn: u64,
+    pub bytes: bytes::Bytes,
+}
+
 /// Replay a framed PerShard incr file: `[u64 lsn LE][u32 len LE][RESP bytes]`.
 ///
-/// Step 3 wrote this format; step 4 reads it. Returns `(commands_replayed,
-/// max_lsn)` — the max LSN is needed so the boot path can seed
-/// `master_repl_offset` to `max(per_shard_max_lsn)` before accepting writes
-/// (RFC § 2 Rule 3).
+/// Step 3 wrote this format; step 4 reads it. Step 5 extends the LSN field:
+/// the high bit (`crate::persistence::aof::ORDERED_LSN_FLAG`) marks the
+/// entry as `OrderedAcrossShards` — those entries are NOT replayed inline,
+/// instead they are pushed into `ordered_buf` for the caller to merge-replay
+/// in global LSN order across all shards.
+///
+/// Returns `(commands_replayed, max_lsn)` — the count covers only inline
+/// (non-ordered) replays, and `max_lsn` covers both inline AND ordered
+/// entries (the high bit is masked out before max comparison, so it reflects
+/// the true issued LSN).
 ///
 /// **Truncated entries:** a header partly written at crash time is treated as
 /// EOF (parity with `replay_incr_resp` semantics). A whole header followed by
@@ -1151,9 +1169,11 @@ fn replay_incr_resp(
 /// **Corruption:** a mid-stream RESP parse error inside an otherwise-complete
 /// payload is fatal (same reasoning as `replay_incr_resp`).
 fn replay_incr_framed(
+    shard_id: u16,
     databases: &mut [crate::storage::Database],
     data: &[u8],
     engine: &dyn crate::persistence::replay::CommandReplayEngine,
+    ordered_buf: &mut Vec<OrderedEntry>,
 ) -> Result<(usize, u64), crate::error::MoonError> {
     use crate::protocol::{Frame, ParseConfig, parse};
     use bytes::BytesMut;
@@ -1176,20 +1196,41 @@ fn replay_incr_framed(
             );
             break;
         }
-        let lsn = u64::from_le_bytes(data[offset..offset + 8].try_into().expect("8 bytes"));
+        let raw_lsn =
+            u64::from_le_bytes(data[offset..offset + 8].try_into().expect("8 bytes"));
         let len = u32::from_le_bytes(data[offset + 8..offset + 12].try_into().expect("4 bytes"))
             as usize;
         let payload_start = offset + HEADER_LEN;
         let payload_end = payload_start.saturating_add(len);
         if payload_end > total_len {
             warn!(
-                "AOF incr framed truncated payload at offset {} (lsn {}, declared len {}, have {} bytes); treating as crash-time EOF",
+                "AOF incr framed truncated payload at offset {} (lsn {:#x}, declared len {}, have {} bytes); treating as crash-time EOF",
                 offset,
-                lsn,
+                raw_lsn,
                 len,
                 total_len - payload_start
             );
             break;
+        }
+
+        // Strip the OrderedAcrossShards flag to recover the true LSN.
+        let is_ordered = raw_lsn & crate::persistence::aof::ORDERED_LSN_FLAG != 0;
+        let lsn = raw_lsn & !crate::persistence::aof::ORDERED_LSN_FLAG;
+
+        // Ordered entries: buffer for cross-shard merge replay; do NOT
+        // dispatch inline.
+        if is_ordered {
+            let bytes = bytes::Bytes::copy_from_slice(&data[payload_start..payload_end]);
+            ordered_buf.push(OrderedEntry {
+                shard_id,
+                lsn,
+                bytes,
+            });
+            if lsn > max_lsn {
+                max_lsn = lsn;
+            }
+            offset = payload_end;
+            continue;
         }
 
         // Parse RESP from the payload slice. A standalone slice ensures one
@@ -1281,14 +1322,21 @@ fn replay_incr_framed(
 /// a future optimization (RFC § 1 recovery-parallelism claim) once the
 /// crash-matrix tests soak the sequential path.
 ///
-/// Returns `(total_commands_replayed, global_max_lsn)`. The caller is
-/// expected to seed `master_repl_offset = global_max_lsn` before accepting
-/// client traffic (RFC § 2 Rule 3).
+/// Returns `(total_commands_replayed, global_max_lsn, ordered_entries)`:
+///   - `total_commands_replayed` covers all inline (non-ordered) entries
+///     plus the base-RDB key count.
+///   - `global_max_lsn` is `max(per-shard max LSN)` across both inline and
+///     ordered entries; the caller is expected to call
+///     `ReplicationState::seed_master_offset(global_max_lsn)` before
+///     accepting client traffic (RFC § 2 Rule 3).
+///   - `ordered_entries` is the set of `OrderedAcrossShards`-tagged entries
+///     across ALL shards; the caller passes them to
+///     [`replay_ordered_merge`] for the cross-shard merge replay.
 pub fn replay_per_shard(
     per_shard_databases: &mut [&mut [crate::storage::Database]],
     manifest: &AofManifest,
     engine: &dyn crate::persistence::replay::CommandReplayEngine,
-) -> Result<(usize, u64), crate::error::MoonError> {
+) -> Result<(usize, u64, Vec<OrderedEntry>), crate::error::MoonError> {
     debug_assert_eq!(
         manifest.layout,
         AofLayout::PerShard,
@@ -1308,6 +1356,7 @@ pub fn replay_per_shard(
 
     let mut total: usize = 0;
     let mut global_max_lsn: u64 = 0;
+    let mut ordered_entries: Vec<OrderedEntry> = Vec::new();
 
     for shard_id in 0..manifest.shards.len() {
         let sid = shard_id as u16;
@@ -1360,7 +1409,8 @@ pub fn replay_per_shard(
         if incr_path.exists() {
             let data = std::fs::read(&incr_path)?;
             if !data.is_empty() {
-                let (count, shard_max_lsn) = replay_incr_framed(databases, &data, engine)?;
+                let (count, shard_max_lsn) =
+                    replay_incr_framed(sid, databases, &data, engine, &mut ordered_entries)?;
                 info!(
                     "AOF shard-{} incr replayed: {} commands from {} (max lsn {})",
                     sid,
@@ -1376,7 +1426,118 @@ pub fn replay_per_shard(
         }
     }
 
-    Ok((total, global_max_lsn))
+    Ok((total, global_max_lsn, ordered_entries))
+}
+
+/// Merge-replay `OrderedAcrossShards` entries collected across all shards
+/// in global LSN order (RFC § 2 Rule 2).
+///
+/// `entries` is sorted by `lsn` ascending, then each entry is dispatched
+/// against its origin shard's databases — the per-shard partition is
+/// preserved because each `OrderedEntry` carries the `shard_id` it was
+/// read from. This guarantees that a cross-shard atomic operation
+/// committed at LSN N is replayed as a coherent group (every
+/// shard's portion at LSN N is applied before any shard's LSN N+1 work).
+///
+/// **Crash-time atomicity:** if a cross-shard commit was mid-write at
+/// crash time, some shards may have the LSN-N entry while others don't.
+/// Step 5 ships the merge mechanism only; detecting partial commits and
+/// performing the corresponding rollback is left to the future cross-shard
+/// TXN consumer — `replay_ordered_merge` currently best-effort-applies
+/// whichever entries survived. A `warn!` is emitted when the entry count
+/// per LSN is uneven across shards so operators have a forensic trail.
+///
+/// **Today's emitters:** none in production code. The path is exercised
+/// by tests so the round-trip wiring is verified end-to-end and ready for
+/// future use.
+pub fn replay_ordered_merge(
+    per_shard_databases: &mut [&mut [crate::storage::Database]],
+    mut entries: Vec<OrderedEntry>,
+    engine: &dyn crate::persistence::replay::CommandReplayEngine,
+) -> Result<usize, crate::error::MoonError> {
+    use crate::protocol::{Frame, ParseConfig, parse};
+    use bytes::BytesMut;
+
+    if entries.is_empty() {
+        return Ok(0);
+    }
+
+    entries.sort_by_key(|e| e.lsn);
+
+    // Per-LSN cardinality audit: emit a warn! if the same LSN is unevenly
+    // represented across shards. That's the operator-visible footprint of
+    // a torn cross-shard commit; the entries themselves are still applied.
+    let mut counts: std::collections::BTreeMap<u64, usize> =
+        std::collections::BTreeMap::new();
+    for e in &entries {
+        *counts.entry(e.lsn).or_insert(0) += 1;
+    }
+    if counts.len() > 1 {
+        let max_count = counts.values().copied().max().unwrap_or(0);
+        for (lsn, &n) in &counts {
+            if n != max_count {
+                warn!(
+                    "OrderedAcrossShards LSN {} appears in only {} of {} shard files; possible torn cross-shard commit",
+                    lsn, n, max_count
+                );
+            }
+        }
+    }
+
+    let config = ParseConfig::default();
+    let mut replayed: usize = 0;
+
+    for entry in entries {
+        let shard_idx = entry.shard_id as usize;
+        if shard_idx >= per_shard_databases.len() {
+            return Err(crate::error::MoonError::from(
+                crate::error::AofError::RewriteFailed {
+                    detail: format!(
+                        "OrderedAcrossShards entry references shard {} but only {} shards present",
+                        entry.shard_id,
+                        per_shard_databases.len()
+                    ),
+                },
+            ));
+        }
+        let mut buf = BytesMut::from(entry.bytes.as_ref());
+        match parse::parse(&mut buf, &config) {
+            Ok(Some(Frame::Array(arr))) if !arr.is_empty() => {
+                let cmd = match &arr[0] {
+                    Frame::BulkString(s) => s.as_ref(),
+                    Frame::SimpleString(s) => s.as_ref(),
+                    _ => {
+                        return Err(crate::error::MoonError::from(
+                            crate::error::AofError::RewriteFailed {
+                                detail: format!(
+                                    "OrderedAcrossShards entry at lsn {} has non-string command frame",
+                                    entry.lsn
+                                ),
+                            },
+                        ));
+                    }
+                };
+                let mut selected_db: usize = 0;
+                let databases = &mut *per_shard_databases[shard_idx];
+                engine.replay_command(databases, cmd, &arr[1..], &mut selected_db);
+                replayed += 1;
+            }
+            other => {
+                return Err(crate::error::MoonError::from(
+                    crate::error::AofError::RewriteFailed {
+                        detail: format!(
+                            "OrderedAcrossShards entry at lsn {} on shard {} did not parse as RESP array: {:?}",
+                            entry.lsn,
+                            entry.shard_id,
+                            other.map(|_| ()).err()
+                        ),
+                    },
+                ));
+            }
+        }
+    }
+
+    Ok(replayed)
 }
 
 #[cfg(test)]
@@ -1723,8 +1884,10 @@ mod tests_v2 {
 
         let mut dbs: Vec<crate::storage::Database> = vec![crate::storage::Database::new()];
         let engine = RecordingEngine::new();
-        let (count, max_lsn) =
-            replay_incr_framed(&mut dbs, &bytes, &engine).expect("framed replay");
+        let mut ordered: Vec<OrderedEntry> = Vec::new();
+        let (count, max_lsn) = replay_incr_framed(0, &mut dbs, &bytes, &engine, &mut ordered)
+            .expect("framed replay");
+        assert!(ordered.is_empty(), "no ordered entries in this stream");
 
         assert_eq!(count, 2);
         assert_eq!(max_lsn, 11);
@@ -1742,8 +1905,10 @@ mod tests_v2 {
 
         let mut dbs: Vec<crate::storage::Database> = vec![crate::storage::Database::new()];
         let engine = RecordingEngine::new();
+        let mut ordered: Vec<OrderedEntry> = Vec::new();
         let (count, max_lsn) =
-            replay_incr_framed(&mut dbs, &bytes, &engine).expect("truncated-header is EOF");
+            replay_incr_framed(0, &mut dbs, &bytes, &engine, &mut ordered)
+                .expect("truncated-header is EOF");
 
         assert_eq!(count, 1);
         assert_eq!(max_lsn, 3);
@@ -1759,8 +1924,10 @@ mod tests_v2 {
 
         let mut dbs: Vec<crate::storage::Database> = vec![crate::storage::Database::new()];
         let engine = RecordingEngine::new();
+        let mut ordered: Vec<OrderedEntry> = Vec::new();
         let (count, max_lsn) =
-            replay_incr_framed(&mut dbs, &bytes, &engine).expect("truncated-payload is EOF");
+            replay_incr_framed(0, &mut dbs, &bytes, &engine, &mut ordered)
+                .expect("truncated-payload is EOF");
 
         assert_eq!(count, 0);
         assert_eq!(max_lsn, 0);
@@ -1777,7 +1944,8 @@ mod tests_v2 {
 
         let mut dbs: Vec<crate::storage::Database> = vec![crate::storage::Database::new()];
         let engine = RecordingEngine::new();
-        let err = replay_incr_framed(&mut dbs, &bytes, &engine)
+        let mut ordered: Vec<OrderedEntry> = Vec::new();
+        let err = replay_incr_framed(0, &mut dbs, &bytes, &engine, &mut ordered)
             .expect_err("complete-but-corrupt should error");
         let msg = format!("{err}");
         assert!(
@@ -1805,7 +1973,7 @@ mod tests_v2 {
         let mut shard0: Vec<crate::storage::Database> = vec![crate::storage::Database::new()];
         let mut shard1: Vec<crate::storage::Database> = vec![crate::storage::Database::new()];
 
-        let (total, global_max_lsn) = {
+        let (total, global_max_lsn, ordered) = {
             let mut slices: Vec<&mut [crate::storage::Database]> =
                 vec![&mut shard0, &mut shard1];
             replay_per_shard(&mut slices, &manifest, &DispatchReplayEngine::new())
@@ -1814,6 +1982,7 @@ mod tests_v2 {
 
         assert_eq!(total, 2, "two SETs replayed");
         assert_eq!(global_max_lsn, 20, "global max lsn = max(shard maxes)");
+        assert!(ordered.is_empty(), "no ordered entries in this stream");
 
         // Each shard's DB now holds its key (and only its key).
         assert!(shard0[0].len() >= 1, "shard 0 has k0");
@@ -1844,5 +2013,138 @@ mod tests_v2 {
         );
 
         fs::remove_dir_all(&dir).ok();
+    }
+
+    // -- Step 5 (OrderedAcrossShards merge) tests ------------------------
+
+    /// Frame an ordered entry: same on-disk layout as `frame_entry`, with
+    /// the high bit of LSN set.
+    fn frame_ordered(lsn: u64, resp: &[u8]) -> Vec<u8> {
+        assert_eq!(
+            lsn & crate::persistence::aof::ORDERED_LSN_FLAG,
+            0,
+            "test helper expects raw lsn without the ordered flag"
+        );
+        let tagged = lsn | crate::persistence::aof::ORDERED_LSN_FLAG;
+        let mut buf = Vec::with_capacity(12 + resp.len());
+        buf.extend_from_slice(&tagged.to_le_bytes());
+        buf.extend_from_slice(&(resp.len() as u32).to_le_bytes());
+        buf.extend_from_slice(resp);
+        buf
+    }
+
+    #[test]
+    fn replay_incr_framed_buffers_ordered_entries() {
+        // Mix: normal PING, then an ordered SET, then normal DBSIZE.
+        let mut bytes = frame_entry(5, b"*1\r\n$4\r\nPING\r\n");
+        bytes.extend_from_slice(&frame_ordered(
+            8,
+            b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n",
+        ));
+        bytes.extend_from_slice(&frame_entry(12, b"*1\r\n$6\r\nDBSIZE\r\n"));
+
+        let mut dbs: Vec<crate::storage::Database> =
+            vec![crate::storage::Database::new()];
+        let engine = RecordingEngine::new();
+        let mut ordered: Vec<OrderedEntry> = Vec::new();
+        let (count, max_lsn) =
+            replay_incr_framed(3, &mut dbs, &bytes, &engine, &mut ordered)
+                .expect("framed replay with ordered");
+
+        assert_eq!(count, 2, "two inline entries dispatched (PING, DBSIZE)");
+        assert_eq!(max_lsn, 12, "max LSN tracks both inline and ordered");
+        assert_eq!(ordered.len(), 1, "one entry buffered as ordered");
+        let buffered = &ordered[0];
+        assert_eq!(buffered.shard_id, 3, "shard_id forwarded");
+        assert_eq!(
+            buffered.lsn, 8,
+            "buffered LSN has the high bit masked off"
+        );
+        let calls = engine.calls.borrow();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0], "PING");
+        assert_eq!(calls[1], "DBSIZE", "ordered SET was NOT dispatched inline");
+    }
+
+    #[test]
+    fn replay_ordered_merge_sorts_by_lsn_across_shards() {
+        use crate::persistence::replay::DispatchReplayEngine;
+
+        // Three ordered entries across two shards, deliberately out of LSN
+        // order on the wire so the merge step has work to do.
+        let entries = vec![
+            OrderedEntry {
+                shard_id: 1,
+                lsn: 30,
+                bytes: bytes::Bytes::from_static(b"*3\r\n$3\r\nSET\r\n$2\r\nb1\r\n$1\r\n3\r\n"),
+            },
+            OrderedEntry {
+                shard_id: 0,
+                lsn: 10,
+                bytes: bytes::Bytes::from_static(b"*3\r\n$3\r\nSET\r\n$2\r\na1\r\n$1\r\n1\r\n"),
+            },
+            OrderedEntry {
+                shard_id: 0,
+                lsn: 20,
+                bytes: bytes::Bytes::from_static(b"*3\r\n$3\r\nSET\r\n$2\r\na2\r\n$1\r\n2\r\n"),
+            },
+        ];
+
+        let mut shard0: Vec<crate::storage::Database> =
+            vec![crate::storage::Database::new()];
+        let mut shard1: Vec<crate::storage::Database> =
+            vec![crate::storage::Database::new()];
+        let replayed = {
+            let mut slices: Vec<&mut [crate::storage::Database]> =
+                vec![&mut shard0, &mut shard1];
+            replay_ordered_merge(&mut slices, entries, &DispatchReplayEngine::new())
+                .expect("ordered merge replay")
+        };
+
+        assert_eq!(replayed, 3);
+        assert!(shard0[0].len() >= 2, "shard 0 received a1 + a2");
+        assert!(shard1[0].len() >= 1, "shard 1 received b1");
+    }
+
+    #[test]
+    fn replay_ordered_merge_empty_returns_zero() {
+        use crate::persistence::replay::DispatchReplayEngine;
+
+        let mut shard0: Vec<crate::storage::Database> =
+            vec![crate::storage::Database::new()];
+        let mut slices: Vec<&mut [crate::storage::Database]> = vec![&mut shard0];
+        let replayed =
+            replay_ordered_merge(&mut slices, Vec::new(), &DispatchReplayEngine::new())
+                .expect("empty merge ok");
+        assert_eq!(replayed, 0);
+    }
+
+    #[test]
+    fn ordered_entry_lsn_flag_set_via_try_send_append_ordered() {
+        use crate::persistence::aof::{AofMessage, AofWriterPool, ORDERED_LSN_FLAG};
+        use crate::runtime::channel;
+
+        let (tx0, rx0) = channel::mpsc_bounded::<AofMessage>(4);
+        let (tx1, _rx1) = channel::mpsc_bounded::<AofMessage>(4);
+        let pool = AofWriterPool::per_shard(vec![tx0, tx1]);
+
+        // Raw lsn = 42; high bit must end up set on the receive side.
+        pool.try_send_append_ordered(0, 42, bytes::Bytes::from_static(b"x"));
+        let msg = rx0.try_recv().expect("ordered append delivered");
+        match msg {
+            AofMessage::Append { lsn, .. } => {
+                assert_eq!(
+                    lsn & ORDERED_LSN_FLAG,
+                    ORDERED_LSN_FLAG,
+                    "ordered flag set on lsn"
+                );
+                assert_eq!(
+                    lsn & !ORDERED_LSN_FLAG,
+                    42,
+                    "low bits preserve the original lsn"
+                );
+            }
+            _ => panic!("expected Append"),
+        }
     }
 }

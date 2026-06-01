@@ -663,7 +663,8 @@ fn main() -> anyhow::Result<()> {
                 // `replay_per_shard`. The split_at_mut walk constructs a
                 // Vec<&mut [Database]> without aliasing, which `replay_per_shard`
                 // requires.
-                let (total, global_max_lsn) = {
+                let engine = DispatchReplayEngine::new();
+                let (total, global_max_lsn, ordered_entries) = {
                     let mut slices: Vec<&mut [moon::storage::Database]> =
                         Vec::with_capacity(shards.len());
                     let mut rest: &mut [moon::shard::Shard] = &mut shards[..];
@@ -674,17 +675,41 @@ fn main() -> anyhow::Result<()> {
                     moon::persistence::aof_manifest::replay_per_shard(
                         &mut slices,
                         manifest,
-                        &DispatchReplayEngine::new(),
+                        &engine,
                     )
                     .with_context(|| "per-shard AOF replay failed")?
                 };
 
+                // Step 5: merge-replay `OrderedAcrossShards`-tagged entries
+                // in global LSN order. Today this list is always empty
+                // (no production emitter); the path exists so the future
+                // cross-shard TXN consumer wires in without a recovery
+                // re-design.
+                let ordered_count = if !ordered_entries.is_empty() {
+                    let mut slices: Vec<&mut [moon::storage::Database]> =
+                        Vec::with_capacity(shards.len());
+                    let mut rest: &mut [moon::shard::Shard] = &mut shards[..];
+                    while let Some((head, tail)) = rest.split_first_mut() {
+                        slices.push(&mut head.databases);
+                        rest = tail;
+                    }
+                    moon::persistence::aof_manifest::replay_ordered_merge(
+                        &mut slices,
+                        ordered_entries,
+                        &engine,
+                    )
+                    .with_context(|| "per-shard AOF ordered merge replay failed")?
+                } else {
+                    0
+                };
+
                 info!(
-                    "AOF per-shard loaded (seq {}): {} entries across {} shards (global max lsn {})",
+                    "AOF per-shard loaded (seq {}): {} entries across {} shards (global max lsn {}, ordered merge {} entries)",
                     manifest.seq,
                     total,
                     manifest.shards.len(),
-                    global_max_lsn
+                    global_max_lsn,
+                    ordered_count
                 );
 
                 // RFC § 2 Rule 3 — seed master_repl_offset before accepting
