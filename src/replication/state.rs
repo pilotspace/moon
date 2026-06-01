@@ -148,6 +148,23 @@ impl ReplicationState {
         self.master_repl_offset.load(Ordering::Relaxed)
     }
 
+    /// Seed `master_repl_offset` to at least `lsn` after AOF recovery.
+    ///
+    /// Per-shard AOF RFC § 2 Rule 3: after recovery reads the per-shard AOFs,
+    /// `master_repl_offset` MUST be at least the max LSN observed across all
+    /// shards before the server accepts client traffic. Otherwise the next
+    /// write would issue an LSN already present on disk, breaking the
+    /// `lsn → entry` uniqueness invariant the backlog merge depends on.
+    ///
+    /// Uses `fetch_max` so a concurrent in-flight increment (extremely
+    /// unlikely at boot, but free to guard against) cannot regress the value.
+    /// Per-shard offsets are intentionally NOT touched here — at boot they
+    /// are still 0, and seeding shard offsets to the per-shard AOF max would
+    /// double-count once the first write advances them via `issue_lsn`.
+    pub fn seed_master_offset(&self, lsn: u64) {
+        self.master_repl_offset.fetch_max(lsn, Ordering::Relaxed);
+    }
+
     /// Returns the per-shard offset for a specific shard.
     pub fn shard_offset(&self, shard_id: usize) -> u64 {
         self.shard_offsets

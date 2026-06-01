@@ -1135,6 +1135,250 @@ fn replay_incr_resp(
     Ok(count)
 }
 
+/// Replay a framed PerShard incr file: `[u64 lsn LE][u32 len LE][RESP bytes]`.
+///
+/// Step 3 wrote this format; step 4 reads it. Returns `(commands_replayed,
+/// max_lsn)` — the max LSN is needed so the boot path can seed
+/// `master_repl_offset` to `max(per_shard_max_lsn)` before accepting writes
+/// (RFC § 2 Rule 3).
+///
+/// **Truncated entries:** a header partly written at crash time is treated as
+/// EOF (parity with `replay_incr_resp` semantics). A whole header followed by
+/// a truncated payload is also EOF — the writer's invariant is that the
+/// header is written first then the payload, and on partial write the most we
+/// can lose is the last entry's payload tail.
+///
+/// **Corruption:** a mid-stream RESP parse error inside an otherwise-complete
+/// payload is fatal (same reasoning as `replay_incr_resp`).
+fn replay_incr_framed(
+    databases: &mut [crate::storage::Database],
+    data: &[u8],
+    engine: &dyn crate::persistence::replay::CommandReplayEngine,
+) -> Result<(usize, u64), crate::error::MoonError> {
+    use crate::protocol::{Frame, ParseConfig, parse};
+    use bytes::BytesMut;
+
+    const HEADER_LEN: usize = 12; // u64 lsn LE + u32 len LE
+
+    let total_len = data.len();
+    let mut offset: usize = 0;
+    let config = ParseConfig::default();
+    let mut selected_db: usize = 0;
+    let mut count: usize = 0;
+    let mut max_lsn: u64 = 0;
+
+    while offset < total_len {
+        if total_len - offset < HEADER_LEN {
+            warn!(
+                "AOF incr framed truncated header: {} bytes at offset {} (treating as crash-time EOF)",
+                total_len - offset,
+                offset
+            );
+            break;
+        }
+        let lsn = u64::from_le_bytes(data[offset..offset + 8].try_into().expect("8 bytes"));
+        let len = u32::from_le_bytes(data[offset + 8..offset + 12].try_into().expect("4 bytes"))
+            as usize;
+        let payload_start = offset + HEADER_LEN;
+        let payload_end = payload_start.saturating_add(len);
+        if payload_end > total_len {
+            warn!(
+                "AOF incr framed truncated payload at offset {} (lsn {}, declared len {}, have {} bytes); treating as crash-time EOF",
+                offset,
+                lsn,
+                len,
+                total_len - payload_start
+            );
+            break;
+        }
+
+        // Parse RESP from the payload slice. A standalone slice ensures one
+        // header maps to exactly one command — no implicit pipelining across
+        // headers.
+        let mut buf = BytesMut::from(&data[payload_start..payload_end]);
+        match parse::parse(&mut buf, &config) {
+            Ok(Some(frame)) => {
+                let (cmd, cmd_args) = match &frame {
+                    Frame::Array(arr) if !arr.is_empty() => {
+                        let name = match &arr[0] {
+                            Frame::BulkString(s) => s.as_ref(),
+                            Frame::SimpleString(s) => s.as_ref(),
+                            other => {
+                                return Err(crate::error::MoonError::from(
+                                    crate::error::AofError::RewriteFailed {
+                                        detail: format!(
+                                            "AOF incr framed command at offset {} (lsn {}) has non-string name frame: {:?}",
+                                            offset,
+                                            lsn,
+                                            std::mem::discriminant(other)
+                                        ),
+                                    },
+                                ));
+                            }
+                        };
+                        (name as &[u8], &arr[1..])
+                    }
+                    other => {
+                        return Err(crate::error::MoonError::from(
+                            crate::error::AofError::RewriteFailed {
+                                detail: format!(
+                                    "AOF incr framed non-array frame at offset {} (lsn {}): {:?}",
+                                    offset,
+                                    lsn,
+                                    std::mem::discriminant(other)
+                                ),
+                            },
+                        ));
+                    }
+                };
+                engine.replay_command(databases, cmd, cmd_args, &mut selected_db);
+                count += 1;
+                if lsn > max_lsn {
+                    max_lsn = lsn;
+                }
+            }
+            Ok(None) => {
+                // Header said `len` bytes of RESP, but parser can't make a
+                // frame from those bytes. That's corruption inside a fully
+                // declared payload, not a truncated tail — escalate.
+                return Err(crate::error::MoonError::from(
+                    crate::error::AofError::RewriteFailed {
+                        detail: format!(
+                            "AOF incr framed payload at offset {} (lsn {}, len {}) parsed as incomplete frame; corrupt entry",
+                            offset, lsn, len
+                        ),
+                    },
+                ));
+            }
+            Err(e) => {
+                return Err(crate::error::MoonError::from(
+                    crate::error::AofError::RewriteFailed {
+                        detail: format!(
+                            "AOF incr framed parse error at offset {} (lsn {}, len {}): {:?}",
+                            offset, lsn, len, e
+                        ),
+                    },
+                ));
+            }
+        }
+
+        offset = payload_end;
+    }
+
+    Ok((count, max_lsn))
+}
+
+/// Replay a PerShard multi-part AOF into N parallel `Vec<Database>` buffers.
+///
+/// `per_shard_databases[i]` is shard `i`'s database vector. The manifest's
+/// `shards` length MUST equal `per_shard_databases.len()`; the caller is
+/// expected to have run [`AofManifest::verify_shard_count`] at boot.
+///
+/// Per-shard work is independent (different shards never touch the same
+/// DashTable), so this is parallelizable in principle. Step 4 keeps the
+/// initial implementation sequential — it's correct, simple, and the cold
+/// recovery path is not throughput-critical. Parallelizing across shards is
+/// a future optimization (RFC § 1 recovery-parallelism claim) once the
+/// crash-matrix tests soak the sequential path.
+///
+/// Returns `(total_commands_replayed, global_max_lsn)`. The caller is
+/// expected to seed `master_repl_offset = global_max_lsn` before accepting
+/// client traffic (RFC § 2 Rule 3).
+pub fn replay_per_shard(
+    per_shard_databases: &mut [&mut [crate::storage::Database]],
+    manifest: &AofManifest,
+    engine: &dyn crate::persistence::replay::CommandReplayEngine,
+) -> Result<(usize, u64), crate::error::MoonError> {
+    debug_assert_eq!(
+        manifest.layout,
+        AofLayout::PerShard,
+        "replay_per_shard called on TopLevel manifest"
+    );
+    if manifest.shards.len() != per_shard_databases.len() {
+        return Err(crate::error::MoonError::from(
+            crate::error::AofError::RewriteFailed {
+                detail: format!(
+                    "replay_per_shard shard-count mismatch: manifest has {} shards, caller passed {} database vectors",
+                    manifest.shards.len(),
+                    per_shard_databases.len()
+                ),
+            },
+        ));
+    }
+
+    let mut total: usize = 0;
+    let mut global_max_lsn: u64 = 0;
+
+    for shard_id in 0..manifest.shards.len() {
+        let sid = shard_id as u16;
+        let base_path = manifest.shard_base_path(sid);
+        let incr_path = manifest.shard_incr_path(sid);
+        let databases = &mut *per_shard_databases[shard_id];
+
+        // Load this shard's base RDB.
+        if base_path.exists() {
+            match crate::persistence::rdb::load(databases, &base_path) {
+                Ok(n) => {
+                    info!(
+                        "AOF shard-{} base RDB loaded: {} keys from {}",
+                        sid,
+                        n,
+                        base_path.display()
+                    );
+                    total += n;
+                }
+                Err(e) => {
+                    error!("AOF shard-{} base RDB load failed: {}", sid, e);
+                    return Err(e);
+                }
+            }
+        } else {
+            // Missing base is tolerable only when this shard's incr file is
+            // empty (or absent). Same invariant as `replay_multi_part`.
+            let incr_len = std::fs::metadata(&incr_path).map(|m| m.len()).unwrap_or(0);
+            if incr_len > 0 {
+                return Err(crate::error::MoonError::from(
+                    crate::error::AofError::RewriteFailed {
+                        detail: format!(
+                            "AOF shard-{} base RDB missing at {} but incr {} is {} bytes; refusing to replay incr against empty state",
+                            sid,
+                            base_path.display(),
+                            incr_path.display(),
+                            incr_len,
+                        ),
+                    },
+                ));
+            }
+            warn!(
+                "AOF shard-{} base RDB not found: {} (incr empty, treating as fresh init)",
+                sid,
+                base_path.display()
+            );
+        }
+
+        // Replay this shard's framed incr file.
+        if incr_path.exists() {
+            let data = std::fs::read(&incr_path)?;
+            if !data.is_empty() {
+                let (count, shard_max_lsn) = replay_incr_framed(databases, &data, engine)?;
+                info!(
+                    "AOF shard-{} incr replayed: {} commands from {} (max lsn {})",
+                    sid,
+                    count,
+                    incr_path.display(),
+                    shard_max_lsn
+                );
+                total += count;
+                if shard_max_lsn > global_max_lsn {
+                    global_max_lsn = shard_max_lsn;
+                }
+            }
+        }
+    }
+
+    Ok((total, global_max_lsn))
+}
+
 #[cfg(test)]
 mod tests_v2 {
     //! Unit tests for the v2 (PerShard) manifest format.
@@ -1428,6 +1672,176 @@ mod tests_v2 {
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
         // Layout never flipped, no rollback needed.
         assert_eq!(m.layout, AofLayout::TopLevel);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    // -- Step 4 (per-shard replay) tests ---------------------------------
+
+    fn frame_entry(lsn: u64, resp: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(12 + resp.len());
+        buf.extend_from_slice(&lsn.to_le_bytes());
+        buf.extend_from_slice(&(resp.len() as u32).to_le_bytes());
+        buf.extend_from_slice(resp);
+        buf
+    }
+
+    /// Minimal `CommandReplayEngine` that records (lsn-implicit-via-order, cmd
+    /// name) calls without touching real storage. Tests use this to assert
+    /// the framed parser hands the right command sequence to the engine.
+    struct RecordingEngine {
+        calls: std::cell::RefCell<Vec<String>>,
+    }
+
+    impl RecordingEngine {
+        fn new() -> Self {
+            Self {
+                calls: std::cell::RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl crate::persistence::replay::CommandReplayEngine for RecordingEngine {
+        fn replay_command(
+            &self,
+            _databases: &mut [crate::storage::Database],
+            cmd: &[u8],
+            _args: &[crate::protocol::Frame],
+            _selected_db: &mut usize,
+        ) {
+            self.calls
+                .borrow_mut()
+                .push(String::from_utf8_lossy(cmd).into_owned());
+        }
+    }
+
+    #[test]
+    fn replay_incr_framed_decodes_lsn_and_resp() {
+        // Two framed entries: PING and DBSIZE (no args, both small RESP arrays).
+        let mut bytes = frame_entry(7, b"*1\r\n$4\r\nPING\r\n");
+        bytes.extend_from_slice(&frame_entry(11, b"*1\r\n$6\r\nDBSIZE\r\n"));
+
+        let mut dbs: Vec<crate::storage::Database> = vec![crate::storage::Database::new()];
+        let engine = RecordingEngine::new();
+        let (count, max_lsn) =
+            replay_incr_framed(&mut dbs, &bytes, &engine).expect("framed replay");
+
+        assert_eq!(count, 2);
+        assert_eq!(max_lsn, 11);
+        let calls = engine.calls.borrow();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0], "PING");
+        assert_eq!(calls[1], "DBSIZE");
+    }
+
+    #[test]
+    fn replay_incr_framed_truncated_header_is_crash_eof() {
+        // One valid entry, then a partial 5-byte header (crash mid-write).
+        let mut bytes = frame_entry(3, b"*1\r\n$4\r\nPING\r\n");
+        bytes.extend_from_slice(&[0u8; 5]);
+
+        let mut dbs: Vec<crate::storage::Database> = vec![crate::storage::Database::new()];
+        let engine = RecordingEngine::new();
+        let (count, max_lsn) =
+            replay_incr_framed(&mut dbs, &bytes, &engine).expect("truncated-header is EOF");
+
+        assert_eq!(count, 1);
+        assert_eq!(max_lsn, 3);
+    }
+
+    #[test]
+    fn replay_incr_framed_truncated_payload_is_crash_eof() {
+        // Header declares 14 bytes of RESP but only 5 actually present.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&5u64.to_le_bytes());
+        bytes.extend_from_slice(&14u32.to_le_bytes());
+        bytes.extend_from_slice(b"*1\r\n$"); // 5 bytes, payload truncated
+
+        let mut dbs: Vec<crate::storage::Database> = vec![crate::storage::Database::new()];
+        let engine = RecordingEngine::new();
+        let (count, max_lsn) =
+            replay_incr_framed(&mut dbs, &bytes, &engine).expect("truncated-payload is EOF");
+
+        assert_eq!(count, 0);
+        assert_eq!(max_lsn, 0);
+    }
+
+    #[test]
+    fn replay_incr_framed_complete_but_corrupt_payload_errors() {
+        // Header declares 4 bytes, payload is 4 bytes of garbage that won't
+        // parse as a RESP frame.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&1u64.to_le_bytes());
+        bytes.extend_from_slice(&4u32.to_le_bytes());
+        bytes.extend_from_slice(b"XXXX");
+
+        let mut dbs: Vec<crate::storage::Database> = vec![crate::storage::Database::new()];
+        let engine = RecordingEngine::new();
+        let err = replay_incr_framed(&mut dbs, &bytes, &engine)
+            .expect_err("complete-but-corrupt should error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("framed"),
+            "error should mention framed context, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn replay_per_shard_round_trips_two_shards() {
+        use crate::persistence::replay::DispatchReplayEngine;
+
+        let dir = temp_dir();
+        let manifest =
+            AofManifest::initialize_multi(&dir, 2).expect("initialize_multi 2 shards");
+
+        // Hand-author framed incr files: shard-0 SETs k0/v0 at lsn=10,
+        // shard-1 SETs k1/v1 at lsn=20.
+        let set_k0 = frame_entry(10, b"*3\r\n$3\r\nSET\r\n$2\r\nk0\r\n$2\r\nv0\r\n");
+        let set_k1 = frame_entry(20, b"*3\r\n$3\r\nSET\r\n$2\r\nk1\r\n$2\r\nv1\r\n");
+        fs::write(manifest.shard_incr_path(0), &set_k0).expect("write shard-0 incr");
+        fs::write(manifest.shard_incr_path(1), &set_k1).expect("write shard-1 incr");
+
+        // Two independent shard database vectors.
+        let mut shard0: Vec<crate::storage::Database> = vec![crate::storage::Database::new()];
+        let mut shard1: Vec<crate::storage::Database> = vec![crate::storage::Database::new()];
+
+        let (total, global_max_lsn) = {
+            let mut slices: Vec<&mut [crate::storage::Database]> =
+                vec![&mut shard0, &mut shard1];
+            replay_per_shard(&mut slices, &manifest, &DispatchReplayEngine::new())
+                .expect("per-shard replay")
+        };
+
+        assert_eq!(total, 2, "two SETs replayed");
+        assert_eq!(global_max_lsn, 20, "global max lsn = max(shard maxes)");
+
+        // Each shard's DB now holds its key (and only its key).
+        assert!(shard0[0].len() >= 1, "shard 0 has k0");
+        assert!(shard1[0].len() >= 1, "shard 1 has k1");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn replay_per_shard_rejects_shard_count_mismatch() {
+        use crate::persistence::replay::DispatchReplayEngine;
+
+        let dir = temp_dir();
+        let manifest =
+            AofManifest::initialize_multi(&dir, 2).expect("initialize_multi 2 shards");
+
+        // Only one slice — manifest says 2.
+        let mut shard0: Vec<crate::storage::Database> = vec![crate::storage::Database::new()];
+        let mut slices: Vec<&mut [crate::storage::Database]> = vec![&mut shard0];
+
+        let err =
+            replay_per_shard(&mut slices, &manifest, &DispatchReplayEngine::new())
+                .expect_err("shard count mismatch must error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("shard-count mismatch"),
+            "error message should call out the mismatch, got: {msg}"
+        );
 
         fs::remove_dir_all(&dir).ok();
     }

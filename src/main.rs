@@ -644,8 +644,82 @@ fn main() -> anyhow::Result<()> {
                         );
                     }
                 }
+            } else if manifest.layout
+                == moon::persistence::aof_manifest::AofLayout::PerShard
+            {
+                // Per-shard AOF replay (RFC § 2 rules 1-3, Option B step 4).
+                //
+                // Wipe any state earlier recovery phases loaded for each shard —
+                // base RDB + framed incr together are authoritative for that
+                // shard, and non-idempotent commands in the incr stream would
+                // otherwise double-apply on top of WAL/legacy state.
+                for shard in shards.iter_mut() {
+                    for db in shard.databases.iter_mut() {
+                        db.clear();
+                    }
+                }
+
+                // Borrow each shard's `databases` mutably and route through
+                // `replay_per_shard`. The split_at_mut walk constructs a
+                // Vec<&mut [Database]> without aliasing, which `replay_per_shard`
+                // requires.
+                let (total, global_max_lsn) = {
+                    let mut slices: Vec<&mut [moon::storage::Database]> =
+                        Vec::with_capacity(shards.len());
+                    let mut rest: &mut [moon::shard::Shard] = &mut shards[..];
+                    while let Some((head, tail)) = rest.split_first_mut() {
+                        slices.push(&mut head.databases);
+                        rest = tail;
+                    }
+                    moon::persistence::aof_manifest::replay_per_shard(
+                        &mut slices,
+                        manifest,
+                        &DispatchReplayEngine::new(),
+                    )
+                    .with_context(|| "per-shard AOF replay failed")?
+                };
+
+                info!(
+                    "AOF per-shard loaded (seq {}): {} entries across {} shards (global max lsn {})",
+                    manifest.seq,
+                    total,
+                    manifest.shards.len(),
+                    global_max_lsn
+                );
+
+                // RFC § 2 Rule 3 — seed master_repl_offset before accepting
+                // client traffic so the next write doesn't reissue an LSN
+                // already on disk.
+                if global_max_lsn > 0
+                    && let Ok(state) = repl_state.read()
+                {
+                    state.seed_master_offset(global_max_lsn);
+                }
+
+                // Retire any stray legacy top-level appendonly.aof so the
+                // next boot doesn't double-replay it via v2 recovery in
+                // `restore_from_persistence`.
+                let legacy = base_dir.join("appendonly.aof");
+                if legacy.exists() {
+                    let retired = base_dir.join("appendonly.aof.legacy");
+                    if let Err(e) = std::fs::rename(&legacy, &retired) {
+                        tracing::warn!(
+                            "Failed to retire legacy AOF {}: {}",
+                            legacy.display(),
+                            e
+                        );
+                    } else {
+                        info!(
+                            "Retired legacy AOF {} → {}",
+                            legacy.display(),
+                            retired.display()
+                        );
+                    }
+                }
             } else {
-                tracing::warn!("Multi-part AOF skipped in multi-shard mode (not yet supported)");
+                tracing::warn!(
+                    "Multi-shard mode with TopLevel manifest (legacy single-file layout); skipping replay. Run migrate-aof to upgrade to per-shard layout."
+                );
             }
         } else {
             // No manifest present — first boot after upgrade from legacy
