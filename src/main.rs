@@ -753,9 +753,28 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
             } else {
-                tracing::warn!(
-                    "Multi-shard mode with TopLevel manifest (legacy single-file layout); skipping replay. Run migrate-aof to upgrade to per-shard layout."
+                // TopLevel manifest (v1 / single-file layout) combined with
+                // --shards >= 2 is an unsafe combination: replaying a single
+                // shared AOF file into multiple shards would assign all data
+                // to shard 0 while shards 1..N start empty. This silently
+                // loses data that was written to shards 1..N before the
+                // manifest was last updated.
+                //
+                // Previously a warn! + continue, which allowed the server to
+                // boot with an empty AOF state. Now a hard refusal so the
+                // operator is forced to migrate before proceeding.
+                eprintln!(
+                    "REFUSING TO START: legacy TopLevel AOF manifest at {manifest_path} \
+                     detected with --shards {num_shards} (>= 2). \
+                     This combination silently loses data for shards 1..{num_shards_minus_one}. \
+                     Run `moon migrate-aof --dir {dir_str}` to upgrade to the per-shard layout first. \
+                     See docs/runbooks/multi-shard-aof-rewrite.md for migration instructions.",
+                    manifest_path = base_dir.join("appendonlydir").join("moon.aof.manifest").display(),
+                    num_shards = num_shards,
+                    num_shards_minus_one = num_shards - 1,
+                    dir_str = base_dir.display(),
                 );
+                std::process::exit(2);
             }
         } else {
             // No manifest present — first boot after upgrade from legacy
