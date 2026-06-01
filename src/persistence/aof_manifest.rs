@@ -1464,23 +1464,36 @@ pub fn replay_ordered_merge(
 
     entries.sort_by_key(|e| e.lsn);
 
-    // Per-LSN cardinality audit: emit a warn! if the same LSN is unevenly
-    // represented across shards. That's the operator-visible footprint of
-    // a torn cross-shard commit; the entries themselves are still applied.
+    // Per-LSN cardinality audit: detect torn cross-shard commits.
+    //
+    // A "torn" commit is one where LSN N appears in fewer shard files than
+    // the maximum cardinality seen for any other LSN in this batch. Applying
+    // partial entries violates atomicity — if the write was interrupted mid-
+    // commit (e.g., crash between shard-0 and shard-1 writes), replaying only
+    // the shard-0 portion produces an inconsistent state that cannot be
+    // compensated. DROP the entire torn LSN instead of applying partial data.
+    //
+    // NOTE: "torn" detection is heuristic — it compares each LSN's count
+    // against the maximum cardinality observed. An LSN that legitimately spans
+    // fewer shards (e.g. single-shard ordered op) can only occur if the batch
+    // is heterogeneous. Production emitters (future cross-shard TXN) must
+    // guarantee uniform cardinality per LSN, so this heuristic is correct for
+    // all currently-reachable code paths.
     let mut counts: std::collections::BTreeMap<u64, usize> =
         std::collections::BTreeMap::new();
     for e in &entries {
         *counts.entry(e.lsn).or_insert(0) += 1;
     }
-    if counts.len() > 1 {
-        let max_count = counts.values().copied().max().unwrap_or(0);
-        for (lsn, &n) in &counts {
-            if n != max_count {
-                warn!(
-                    "OrderedAcrossShards LSN {} appears in only {} of {} shard files; possible torn cross-shard commit",
-                    lsn, n, max_count
-                );
-            }
+    let max_count = counts.values().copied().max().unwrap_or(0);
+    let mut torn_lsns: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+    for (&lsn, &n) in &counts {
+        if n < max_count {
+            warn!(
+                "OrderedAcrossShards LSN {} appears in only {} of {} shard files; \
+                 torn cross-shard commit detected — dropping entry for atomicity",
+                lsn, n, max_count
+            );
+            torn_lsns.insert(lsn);
         }
     }
 
@@ -1488,6 +1501,10 @@ pub fn replay_ordered_merge(
     let mut replayed: usize = 0;
 
     for entry in entries {
+        // Skip entries belonging to a torn (partially-written) commit.
+        if torn_lsns.contains(&entry.lsn) {
+            continue;
+        }
         let shard_idx = entry.shard_id as usize;
         if shard_idx >= per_shard_databases.len() {
             return Err(crate::error::MoonError::from(
