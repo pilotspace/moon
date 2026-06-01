@@ -886,7 +886,11 @@ pub async fn handle_connection(
                             if break_outer {
                                 break;
                             }
-                            // Send AOF entries accumulated so far
+                            // Send AOF entries accumulated so far.
+                            // Under appendfsync=always the response is NOT yet sent to the
+                            // client here — the subscribe response is built below. If the
+                            // AOF fsync fails we can still return WRITEFAIL instead of +OK.
+                            let mut aof_write_failed = false;
                             for bytes in aof_entries.drain(..) {
                                 if let Some(ref pool) = aof_pool {
                                     // Single-shard mode (shard_id = 0). Routes via the
@@ -895,11 +899,19 @@ pub async fn handle_connection(
                                     // fsync ack under `appendfsync=always` (H1 closure)
                                     // and is fire-and-forget for everysec/no.
                                     let lsn = crate::persistence::aof::AofWriterPool::issue_append_lsn(&repl_state, 0, bytes.len());
-                                    let _ = pool.try_send_append_durable(0, lsn, bytes).await;
+                                    if let Err(_aof_err) = pool.try_send_append_durable(0, lsn, bytes).await {
+                                        aof_write_failed = true;
+                                    }
                                 }
                                 if let Some(ref counter) = change_counter {
                                     counter.fetch_add(1, Ordering::Relaxed);
                                 }
+                            }
+                            if aof_write_failed {
+                                let _ = framed.send(Frame::Error(Bytes::from_static(
+                                    b"WRITEFAIL aof fsync failed",
+                                ))).await;
+                                break;
                             }
                             // Handle subscribe
                             if cmd_args.is_empty() {
@@ -1525,6 +1537,7 @@ pub async fn handle_connection(
                                         let records = store.drain_wal();
                                         (resp, records)
                                     };
+                                    let mut graph_aof_failed = false;
                                     for record in wal_records {
                                         if let Some(ref pool) = aof_pool {
                                             // Single-shard mode (shard_id = 0).
@@ -1534,13 +1547,21 @@ pub async fn handle_connection(
                                             // everysec/no.
                                             let bytes = bytes::Bytes::from(record);
                                             let lsn = crate::persistence::aof::AofWriterPool::issue_append_lsn(&repl_state, 0, bytes.len());
-                                            let _ = pool.try_send_append_durable(0, lsn, bytes).await;
+                                            if let Err(_aof_err) = pool.try_send_append_durable(0, lsn, bytes).await {
+                                                graph_aof_failed = true;
+                                            }
                                         }
                                         if let Some(ref counter) = change_counter {
                                             counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                         }
                                     }
-                                    responses.push(response);
+                                    if graph_aof_failed {
+                                        responses.push(Frame::Error(bytes::Bytes::from_static(
+                                            b"WRITEFAIL aof fsync failed",
+                                        )));
+                                    } else {
+                                        responses.push(response);
+                                    }
                                     continue;
                                 } else {
                                     responses.push(Frame::Error(bytes::Bytes::from_static(b"ERR graph engine not initialized")));
