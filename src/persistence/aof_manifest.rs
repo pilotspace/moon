@@ -532,14 +532,40 @@ impl AofManifest {
 
     /// Delete any base/incr files in `appendonlydir/` that do not match the
     /// current sequence. Best-effort — logs but does not propagate errors.
+    ///
+    /// For `PerShard` layout, also recurses into every `shard-N/` subdirectory
+    /// and removes stale/tmp files there. Aborted BGREWRITEAOF runs leave
+    /// `.rdb.tmp` files in the shard subdirs that otherwise accumulate forever.
     fn cleanup_orphans(&self) {
-        let aof_dir = self.aof_dir();
-        let entries = match std::fs::read_dir(&aof_dir) {
+        match self.layout {
+            AofLayout::TopLevel => {
+                self.cleanup_orphans_dir(&self.aof_dir(), self.seq);
+            }
+            AofLayout::PerShard => {
+                // Top-level appendonlydir/ holds only the manifest — no data files
+                // to clean up there. All data lives in shard-N/ subdirs.
+                for shard in &self.shards {
+                    self.cleanup_orphans_shard(shard.shard_id);
+                }
+            }
+        }
+    }
+
+    /// Scan a single shard's directory for orphan base/incr/tmp files that do
+    /// not correspond to the current manifest sequence. Best-effort.
+    fn cleanup_orphans_shard(&self, shard_id: u16) {
+        self.cleanup_orphans_dir(&self.shard_dir(shard_id), self.seq);
+    }
+
+    /// Core orphan sweep: scan `dir` and remove any `moon.aof.*` files whose
+    /// sequence is not `keep_seq`. Skips the manifest file itself.
+    fn cleanup_orphans_dir(&self, dir: &Path, keep_seq: u64) {
+        let entries = match std::fs::read_dir(dir) {
             Ok(e) => e,
             Err(_) => return,
         };
-        let current_base = format!("moon.aof.{}.base.rdb", self.seq);
-        let current_incr = format!("moon.aof.{}.incr.aof", self.seq);
+        let current_base = format!("moon.aof.{}.base.rdb", keep_seq);
+        let current_incr = format!("moon.aof.{}.incr.aof", keep_seq);
         for entry in entries.flatten() {
             let name = entry.file_name();
             let name_str = match name.to_str() {
