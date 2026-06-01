@@ -1057,6 +1057,126 @@ impl AofManifest {
 
         Ok(new_incr)
     }
+
+    /// Advance a single shard to a new sequence: write the shard's new base RDB,
+    /// create a new empty incr file, delete old shard files, then update the
+    /// shard's `max_lsn` in the in-memory manifest.
+    ///
+    /// **Caller MUST call `write_manifest()` after all shards have been advanced**
+    /// to persist the updated manifest atomically. Advancing shards one at a time
+    /// and writing the manifest per-shard would leave the manifest in an
+    /// inconsistent state between calls.
+    ///
+    /// For `TopLevel` layout, `shard_id` must be 0 and this delegates to
+    /// `advance()`. For `PerShard` layout, files are written to
+    /// `shard_dir(shard_id)/`.
+    ///
+    /// Returns the path to the new incremental file for this shard.
+    pub fn advance_shard(
+        &mut self,
+        shard_id: u16,
+        new_seq: u64,
+        rdb_bytes: &[u8],
+    ) -> Result<PathBuf, crate::error::MoonError> {
+        if self.layout == AofLayout::TopLevel {
+            debug_assert_eq!(shard_id, 0, "TopLevel layout only has shard 0");
+            return self.advance(rdb_bytes);
+        }
+
+        // Validate shard_id is known in this manifest.
+        let shard_idx = self
+            .shards
+            .iter()
+            .position(|s| s.shard_id == shard_id)
+            .ok_or_else(|| crate::error::AofError::RewriteFailed {
+                detail: format!(
+                    "advance_shard: shard_id {} not in manifest (shards: {})",
+                    shard_id,
+                    self.shards.len()
+                ),
+            })?;
+
+        let old_seq = self.seq;
+        let shard_dir = self.shard_dir(shard_id);
+        std::fs::create_dir_all(&shard_dir).map_err(|e| crate::error::AofError::Io {
+            path: shard_dir.clone(),
+            source: e,
+        })?;
+
+        // 1. Write new base RDB atomically: tmp + fsync + rename.
+        let new_base = self.shard_base_path_seq(shard_id, new_seq);
+        let tmp_base = new_base.with_extension("rdb.tmp");
+        {
+            let mut f =
+                std::fs::File::create(&tmp_base).map_err(|e| crate::error::AofError::Io {
+                    path: tmp_base.clone(),
+                    source: e,
+                })?;
+            f.write_all(rdb_bytes)
+                .map_err(|e| crate::error::AofError::Io {
+                    path: tmp_base.clone(),
+                    source: e,
+                })?;
+            f.sync_data().map_err(|e| crate::error::AofError::Io {
+                path: tmp_base.clone(),
+                source: e,
+            })?;
+        }
+        std::fs::rename(&tmp_base, &new_base).map_err(|e| {
+            crate::error::AofError::RewriteFailed {
+                detail: format!(
+                    "advance_shard {}: rename base {}: {}",
+                    shard_id,
+                    tmp_base.display(),
+                    e
+                ),
+            }
+        })?;
+
+        // 2. Create empty new incremental file.
+        let new_incr = self.shard_incr_path_seq(shard_id, new_seq);
+        std::fs::File::create(&new_incr).map_err(|e| crate::error::AofError::Io {
+            path: new_incr.clone(),
+            source: e,
+        })?;
+
+        // 3. Delete old shard files (best-effort).
+        let old_base = self.shard_base_path_seq(shard_id, old_seq);
+        let old_incr = self.shard_incr_path_seq(shard_id, old_seq);
+        if old_base.exists() {
+            if let Err(e) = std::fs::remove_file(&old_base) {
+                warn!(
+                    "advance_shard {}: failed to delete old base {}: {}",
+                    shard_id,
+                    old_base.display(),
+                    e
+                );
+            }
+        }
+        if old_incr.exists() {
+            if let Err(e) = std::fs::remove_file(&old_incr) {
+                warn!(
+                    "advance_shard {}: failed to delete old incr {}: {}",
+                    shard_id,
+                    old_incr.display(),
+                    e
+                );
+            }
+        }
+
+        // 4. Update per-shard LSN in-memory (manifest write is the caller's job).
+        self.shards[shard_idx].max_lsn = self.shards[shard_idx].max_lsn.max(new_seq);
+
+        info!(
+            "AOF shard {} advanced to seq {}: base={} bytes, incr={}",
+            shard_id,
+            new_seq,
+            rdb_bytes.len(),
+            new_incr.display()
+        );
+
+        Ok(new_incr)
+    }
 }
 
 /// Replay multi-part AOF: load base RDB then replay incremental RESP.
@@ -2354,6 +2474,62 @@ mod tests_v2 {
             count_after,
             "second call must not create or overwrite any shard files"
         );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    // -----------------------------------------------------------------------
+    // FIX-W2-3 (partial): advance_shard writes new base+incr, deletes old
+    // -----------------------------------------------------------------------
+    #[test]
+    fn advance_shard_writes_new_seq_and_deletes_old() {
+        let dir = temp_dir();
+
+        // Initialize 2-shard manifest at seq=1.
+        let mut manifest =
+            AofManifest::initialize_multi(&dir, 2).expect("initialize_multi");
+        assert_eq!(manifest.seq, 1);
+
+        let empty_rdb = crate::persistence::rdb::save_to_bytes(
+            &[] as &[crate::storage::Database],
+        )
+        .expect("empty rdb");
+
+        // Old shard-0 files at seq=1 must exist before advance.
+        let old_base_s0 = manifest.shard_base_path(0);
+        let old_incr_s0 = manifest.shard_incr_path(0);
+        assert!(old_base_s0.exists(), "seq=1 base must exist for shard 0");
+        assert!(old_incr_s0.exists(), "seq=1 incr must exist for shard 0");
+
+        // Advance shard-0 to seq=2.
+        let new_incr = manifest
+            .advance_shard(0, 2, &empty_rdb)
+            .expect("advance_shard 0 → seq=2");
+        assert!(new_incr.exists(), "new incr file must be created");
+        assert!(
+            manifest.shard_base_path_seq(0, 2).exists(),
+            "new seq=2 base must exist for shard 0"
+        );
+        assert!(
+            !old_base_s0.exists(),
+            "old seq=1 base must be deleted for shard 0"
+        );
+        assert!(
+            !old_incr_s0.exists(),
+            "old seq=1 incr must be deleted for shard 0"
+        );
+
+        // Shard-1 must be unaffected.
+        assert!(
+            manifest.shard_base_path(1).exists(),
+            "shard-1 seq=1 base must survive advance of shard-0"
+        );
+
+        // Caller must write_manifest after all shards advanced.
+        manifest.seq = 2;
+        manifest.write_manifest().expect("write manifest after advance");
+        let reloaded = AofManifest::load(&dir).expect("load").expect("present");
+        assert_eq!(reloaded.seq, 2);
 
         fs::remove_dir_all(&dir).ok();
     }
