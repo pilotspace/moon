@@ -681,7 +681,15 @@ fn main() -> anyhow::Result<()> {
                 // `replay_per_shard`. The split_at_mut walk constructs a
                 // Vec<&mut [Database]> without aliasing, which `replay_per_shard`
                 // requires.
-                let engine = DispatchReplayEngine::new();
+                //
+                // `replay_per_shard` now spawns one thread per shard via
+                // `std::thread::scope`. The factory closure produces an independent
+                // `DispatchReplayEngine` per thread, avoiding the `!Sync` `RefCell`
+                // conflict that would arise from sharing a single engine instance
+                // across threads (under the `graph` feature).
+                let engine_factory = || -> Box<dyn moon::persistence::replay::CommandReplayEngine + Send> {
+                    Box::new(DispatchReplayEngine::new())
+                };
                 let (total, global_max_lsn, ordered_entries) = {
                     let mut slices: Vec<&mut [moon::storage::Database]> =
                         Vec::with_capacity(shards.len());
@@ -693,7 +701,7 @@ fn main() -> anyhow::Result<()> {
                     moon::persistence::aof_manifest::replay_per_shard(
                         &mut slices,
                         manifest,
-                        &engine,
+                        &engine_factory,
                     )
                     .with_context(|| "per-shard AOF replay failed")?
                 };
@@ -703,6 +711,7 @@ fn main() -> anyhow::Result<()> {
                 // (no production emitter); the path exists so the future
                 // cross-shard TXN consumer wires in without a recovery
                 // re-design.
+                let ordered_engine = DispatchReplayEngine::new();
                 let ordered_count = if !ordered_entries.is_empty() {
                     let mut slices: Vec<&mut [moon::storage::Database]> =
                         Vec::with_capacity(shards.len());
@@ -714,7 +723,7 @@ fn main() -> anyhow::Result<()> {
                     moon::persistence::aof_manifest::replay_ordered_merge(
                         &mut slices,
                         ordered_entries,
-                        &engine,
+                        &ordered_engine,
                     )
                     .with_context(|| "per-shard AOF ordered merge replay failed")?
                 } else {
