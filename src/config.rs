@@ -546,6 +546,19 @@ impl ServerConfig {
         self.wal_fpi == "enable"
     }
 
+    /// Returns true when the per-shard AOF layout is active.
+    ///
+    /// Per-shard AOF is selected whenever `--shards >= 2` and
+    /// `--appendonly yes`. In this layout each shard owns its own
+    /// `appendonlydir/shard-{N}/` directory and a dedicated
+    /// `per_shard_aof_writer_task`. Operations that touch the single
+    /// consolidated `appendonly.aof` file (e.g. BGREWRITEAOF) are not
+    /// supported in this layout until the multi-part AOF rewrite ships.
+    #[inline]
+    pub fn per_shard_aof_active(&self, num_shards: usize) -> bool {
+        num_shards >= 2 && self.appendonly == "yes"
+    }
+
     /// Returns true when vector codes pages should be mlocked.
     pub fn vec_codes_mlock_enabled(&self) -> bool {
         self.vec_codes_mlock == "enable"
@@ -1039,5 +1052,60 @@ mod tests {
         assert!((config.segment_cold_min_qps - 0.5).abs() < f64::EPSILON);
         assert_eq!(config.vec_diskann_beam_width, 16);
         assert_eq!(config.vec_diskann_cache_levels, 5);
+    }
+
+    /// FIX-W1-4: per_shard_aof_active must be true only when both
+    /// num_shards >= 2 AND appendonly=yes are set, and false for every
+    /// other combination. This predicate drives the BGREWRITEAOF gate in
+    /// main.rs — a false negative silently allows the unsafe rewrite path.
+    #[test]
+    fn test_per_shard_aof_active_predicate() {
+        // Base config: appendonly=yes, shards=2 → active
+        let mut config = ServerConfig::parse_from(["moon", "--appendonly", "yes"]);
+        assert!(
+            config.per_shard_aof_active(2),
+            "must be active with shards=2 and appendonly=yes"
+        );
+        assert!(
+            config.per_shard_aof_active(4),
+            "must be active with shards=4 and appendonly=yes"
+        );
+
+        // shards=1 → not active (single-shard uses TopLevel AOF)
+        assert!(
+            !config.per_shard_aof_active(1),
+            "must be inactive with shards=1 even if appendonly=yes"
+        );
+
+        // appendonly=no → not active regardless of shard count
+        config.appendonly = "no".to_string();
+        assert!(
+            !config.per_shard_aof_active(2),
+            "must be inactive when appendonly=no"
+        );
+        assert!(
+            !config.per_shard_aof_active(4),
+            "must be inactive when appendonly=no with 4 shards"
+        );
+
+        // shards=0 (auto-detect placeholder) → not active
+        config.appendonly = "yes".to_string();
+        assert!(
+            !config.per_shard_aof_active(0),
+            "must be inactive when num_shards=0"
+        );
+
+        // disk_offload has no bearing on this predicate (FIX-W1-4 broadened
+        // the gate to not require disk_offload).
+        config.disk_offload = "enable".to_string();
+        assert!(
+            config.per_shard_aof_active(2),
+            "must remain active with disk_offload=enable (predicate is orthogonal)"
+        );
+        config.disk_offload = "disable".to_string();
+        assert!(
+            config.per_shard_aof_active(2),
+            "must remain active with disk_offload=disable"
+        );
     }
 }
