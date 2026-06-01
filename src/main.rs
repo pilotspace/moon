@@ -360,10 +360,20 @@ fn main() -> anyhow::Result<()> {
 
     let aof_pool: Option<std::sync::Arc<AofWriterPool>> = if config.appendonly == "yes" {
         let fsync = FsyncPolicy::from_str(&config.appendfsync);
-        let use_per_shard = matches!(
-            existing_manifest.as_ref().map(|m| m.layout),
-            Some(AofLayout::PerShard)
-        ) && num_shards >= 2;
+        // PerShard writers required when num_shards >= 2 AND we'll have a
+        // PerShard manifest at runtime. Two cases produce PerShard:
+        //   1. existing manifest is already PerShard, OR
+        //   2. no manifest yet (first boot) — main.rs will call
+        //      `initialize_multi(num_shards)` later in the recovery block.
+        // The legacy case (existing TopLevel manifest on a multi-shard
+        // deployment) sticks with the TopLevel writer pending the migrate-aof
+        // tool — the multi-shard replay branch already warns about this.
+        let multi_shard_no_manifest = existing_manifest.is_none() && num_shards >= 2;
+        let use_per_shard = num_shards >= 2
+            && (matches!(
+                existing_manifest.as_ref().map(|m| m.layout),
+                Some(AofLayout::PerShard)
+            ) || multi_shard_no_manifest);
 
         if use_per_shard {
             let base_dir = PathBuf::from(&config.dir);
@@ -777,6 +787,20 @@ fn main() -> anyhow::Result<()> {
                         tracing::warn!("Failed to retire legacy AOF {}: {}", legacy.display(), e);
                     }
                 }
+            } else if num_shards >= 2 {
+                // Multi-shard fresh boot: create the PerShard manifest layout
+                // (RFC § 3) instead of the legacy single-file TopLevel layout.
+                // Step 2f-β's spawn-site gate only enables PerShard writers
+                // when the loaded manifest's layout is PerShard, so without
+                // this branch a multi-shard --appendonly yes deployment would
+                // silently fall back to TopLevel and lose data on restart.
+                AofManifest::initialize_multi(&base_dir, num_shards as u16)
+                    .with_context(|| "failed to initialize PerShard AOF manifest")?;
+                info!(
+                    "Initialized PerShard AOF manifest for {} shards at {}",
+                    num_shards,
+                    base_dir.display()
+                );
             } else {
                 AofManifest::initialize(&base_dir)
                     .with_context(|| "failed to initialize AOF manifest")?;
