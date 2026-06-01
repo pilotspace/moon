@@ -746,6 +746,77 @@ mod pool_tests {
         // No AppendSync should have reached the (blocked) reader.
         drop(rx0); // drain without consuming — just verify nothing snuck through
     }
+
+    // -----------------------------------------------------------------------
+    // FIX-W2-9: try_send_append_durable must be used for SWAPDB-like mutations
+    //
+    // Red test: documents the contract that handler_single.rs SHOULD honour.
+    // When appendfsync=always, try_send_append_durable MUST return Err on
+    // writer failure so callers can abort the mutation safely.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn try_send_append_durable_always_writer_dead_returns_write_failed() {
+        // Create a pool with Always policy. The writer task is not running —
+        // we model that by draining the channel message and then dropping the
+        // ack sender, simulating a dead writer.
+        let (tx0, rx0) = channel::mpsc_bounded::<AofMessage>(4);
+        let (tx1, _rx1) = channel::mpsc_bounded::<AofMessage>(4);
+        let pool = AofWriterPool::per_shard_with_policy(
+            vec![tx0, tx1],
+            FsyncPolicy::Always,
+        );
+
+        // Spawn a thread that pulls the AppendSync off the channel but drops
+        // the ack without sending — simulating a writer crash mid-fsync.
+        let rx0_clone = rx0;
+        let handle = std::thread::spawn(move || {
+            match rx0_clone.recv() {
+                Ok(AofMessage::AppendSync { ack, .. }) => drop(ack), // writer crash
+                other => panic!("unexpected message: {:?}", other.is_ok()),
+            }
+        });
+
+        // try_send_append_durable for Always must await the ack.
+        // With the ack sender dropped, it should resolve to Err(WriteFailed).
+        let result = futures::executor::block_on(
+            pool.try_send_append_durable(0, 55, Bytes::from_static(b"SWAPDB 0 1")),
+        );
+
+        handle.join().expect("ack dropper thread");
+
+        assert!(
+            result.is_err(),
+            "try_send_append_durable with dead writer must return Err, got Ok"
+        );
+        assert_eq!(
+            result.unwrap_err(),
+            AofAck::WriteFailed,
+            "dead writer must resolve to WriteFailed"
+        );
+    }
+
+    #[test]
+    fn try_send_append_durable_everysec_is_fire_and_forget() {
+        // EverySec policy: try_send_append_durable always returns Ok — the
+        // durability policy doesn't block on fsync. handler_single.rs must
+        // use try_send_append_durable so the policy is respected.
+        let (tx0, _rx0) = channel::mpsc_bounded::<AofMessage>(4);
+        let (tx1, _rx1) = channel::mpsc_bounded::<AofMessage>(4);
+        let pool = AofWriterPool::per_shard_with_policy(
+            vec![tx0, tx1],
+            FsyncPolicy::EverySec,
+        );
+
+        let result = futures::executor::block_on(
+            pool.try_send_append_durable(0, 56, Bytes::from_static(b"SWAPDB 0 1")),
+        );
+
+        assert!(
+            result.is_ok(),
+            "EverySec policy must be fire-and-forget (Ok), got {:?}",
+            result
+        );
+    }
 }
 
 /// Serialize a Frame into RESP wire format bytes.
