@@ -2247,4 +2247,54 @@ mod tests_v2 {
 
         fs::remove_dir_all(&dir).ok();
     }
+
+    // -----------------------------------------------------------------------
+    // FIX-W2-2: initialize_multi idempotency — second call returns error
+    // -----------------------------------------------------------------------
+    #[test]
+    fn initialize_multi_second_call_returns_already_initialized_error() {
+        let dir = temp_dir();
+
+        // First call must succeed.
+        let _m = AofManifest::initialize_multi(&dir, 4).expect("first call ok");
+
+        // Count files before second call.
+        let aof_dir = dir.join(AOF_DIR_NAME);
+        let count_before: usize = (0..4u16)
+            .map(|sid| {
+                let shard_dir = aof_dir.join(format!("shard-{}", sid));
+                fs::read_dir(&shard_dir).map(|e| e.count()).unwrap_or(0)
+            })
+            .sum();
+
+        // Second call must return an error with the manifest already present.
+        let result = AofManifest::initialize_multi(&dir, 4);
+        assert!(
+            result.is_err(),
+            "second initialize_multi must fail when manifest already exists"
+        );
+        let err = result.unwrap_err();
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::AlreadyExists,
+            "error kind must be AlreadyExists; got {:?}: {}",
+            err.kind(),
+            err
+        );
+
+        // File count must be unchanged — no files were overwritten.
+        let count_after: usize = (0..4u16)
+            .map(|sid| {
+                let shard_dir = aof_dir.join(format!("shard-{}", sid));
+                fs::read_dir(&shard_dir).map(|e| e.count()).unwrap_or(0)
+            })
+            .sum();
+        assert_eq!(
+            count_before,
+            count_after,
+            "second call must not create or overwrite any shard files"
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
 }
