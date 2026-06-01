@@ -45,6 +45,25 @@ type SharedDatabases = Arc<Vec<parking_lot::RwLock<Database>>>;
 /// Only `try_send_append_ordered` sets it.
 pub const ORDERED_LSN_FLAG: u64 = 1u64 << 63;
 
+/// Outcome reported by the writer task back to an `AppendSync` caller
+/// once the rendezvous completes.
+///
+/// `Synced` is sent AFTER `sync_data()` returns successfully — the
+/// caller may safely `+OK` the client. `WriteFailed`/`FsyncFailed`
+/// surface the failure mode so the caller can return a specific error
+/// frame; either way, durability was NOT achieved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AofAck {
+    /// Bytes were written and fsynced. Durability guaranteed.
+    Synced,
+    /// `write_all()` returned an error. The entry may be partially on
+    /// disk; recovery handles partial-payload truncation as crash EOF.
+    WriteFailed,
+    /// `write_all()` succeeded but `sync_data()` returned an error. The
+    /// entry is in the kernel buffer but NOT on durable storage.
+    FsyncFailed,
+}
+
 /// AOF fsync policy controlling when data is flushed to disk.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum FsyncPolicy {
@@ -86,6 +105,29 @@ pub enum AofMessage {
     /// the returned value. Sites with no replication state available pass 0
     /// (TopLevel ignores it; PerShard treats 0 as "no ordering hint").
     Append { lsn: u64, bytes: Bytes },
+    /// Append + fsync + ack rendezvous (RFC § 4 — Fix 2 for the H1
+    /// data-loss vector exposed by `appendfsync=always`).
+    ///
+    /// Same encoding as [`AofMessage::Append`], but the writer task ALWAYS
+    /// fsyncs after writing the payload and signals `ack` ONCE the
+    /// `sync_data()` syscall returns. The caller is expected to await
+    /// `ack` before responding `+OK` to the client so the durability
+    /// contract of `appendfsync=always` is honoured end-to-end.
+    ///
+    /// Failure semantics: on write or fsync error the writer drops `ack`
+    /// without sending — the caller's `OneshotReceiver` resolves with
+    /// `RecvError`, which it must treat as a hard failure (return an
+    /// error frame to the client, do NOT silently +OK).
+    ///
+    /// Production callers: none in step 7 — this commit ships the
+    /// mechanism plus tests. Per-handler integration (which sites use
+    /// AppendSync vs Append) is wired in step 9 before lifting the
+    /// `--unsafe-multishard-aof` gate.
+    AppendSync {
+        lsn: u64,
+        bytes: Bytes,
+        ack: crate::runtime::channel::OneshotSender<AofAck>,
+    },
     /// Trigger a full AOF rewrite (compaction) using current database state.
     Rewrite(SharedDatabases),
     /// Trigger AOF rewrite in sharded mode (all shards' databases).
@@ -183,6 +225,44 @@ impl AofWriterPool {
         let _ = self
             .sender(shard_id)
             .try_send(AofMessage::Append { lsn, bytes });
+    }
+
+    /// Synchronous (fsync-before-ack) append for `appendfsync=always`
+    /// durability (RFC § 4 — Fix 2). Returns a receiver the caller MUST
+    /// await before responding to the client; `AofAck::Synced` means the
+    /// entry is on durable storage.
+    ///
+    /// **Failure handling:** if the write or fsync fails, the receiver
+    /// resolves with `AofAck::WriteFailed` / `AofAck::FsyncFailed`. If
+    /// the writer task is gone (shutdown / channel disconnect), the
+    /// receiver resolves with `Err(RecvError)`. In every failure mode the
+    /// caller MUST return an error frame to the client, NOT `+OK`.
+    ///
+    /// **Performance:** every call adds a writer round-trip plus an
+    /// fsync syscall on the critical path. This is the explicit Redis
+    /// contract for `appendfsync=always`; callers should gate on the
+    /// configured policy and prefer [`Self::try_send_append`] for
+    /// `everysec`/`no`.
+    ///
+    /// **`shard_id` semantics:** matches [`Self::try_send_append`] — for
+    /// TopLevel the parameter is ignored, for PerShard it routes to
+    /// `senders[shard_id]`.
+    pub fn try_send_append_sync(
+        &self,
+        shard_id: usize,
+        lsn: u64,
+        bytes: Bytes,
+    ) -> crate::runtime::channel::OneshotReceiver<AofAck> {
+        let (ack_tx, ack_rx) = crate::runtime::channel::oneshot::<AofAck>();
+        let _ = self.sender(shard_id).try_send(AofMessage::AppendSync {
+            lsn,
+            bytes,
+            ack: ack_tx,
+        });
+        // If `try_send` failed (channel full / writer dead), `ack_tx` was
+        // dropped without sending — the receiver will resolve with
+        // RecvError, which the caller treats as a hard failure.
+        ack_rx
     }
 
     /// Fire-and-forget append for a cross-shard atomic operation (RFC § 2
@@ -405,6 +485,93 @@ mod pool_tests {
     }
 
     #[test]
+    fn try_send_append_sync_queues_appendsync_with_ack() {
+        // Channel-level wiring contract for the H1 fix: `try_send_append_sync`
+        // queues `AofMessage::AppendSync { lsn, bytes, ack }`, and the
+        // returned receiver resolves to whatever value the (mocked) writer
+        // sends on `ack`. End-to-end durability is covered by step 8
+        // (CRASH-01-LITE); this pins the API contract.
+        let (tx0, rx0) = channel::mpsc_bounded::<AofMessage>(4);
+        let (tx1, _rx1) = channel::mpsc_bounded::<AofMessage>(4);
+        let pool = AofWriterPool::per_shard(vec![tx0, tx1]);
+
+        let recv = pool.try_send_append_sync(0, 99, Bytes::from_static(b"SET k v"));
+
+        // Drain the queue; the writer would normally do this. Capture the
+        // ack sender, do the (mock) durable write, then ack Synced.
+        let ack = match rx0.try_recv() {
+            Ok(AofMessage::AppendSync { lsn, bytes, ack }) => {
+                assert_eq!(lsn, 99, "lsn forwarded through the channel");
+                assert_eq!(bytes.as_ref(), b"SET k v", "bytes forwarded");
+                ack
+            }
+            other => panic!("expected AppendSync, got {:?}", other.is_ok()),
+        };
+
+        // Writer reports Synced — caller observes Synced.
+        let _ = ack.send(AofAck::Synced);
+        let result = recv.recv_blocking().expect("receiver resolves");
+        assert_eq!(result, AofAck::Synced);
+    }
+
+    #[test]
+    fn append_sync_writer_dropped_resolves_recv_error() {
+        // If the writer task is dead or the channel disconnects between
+        // queueing and the ack send, the receiver MUST resolve with an
+        // error rather than hang. Callers treat that as a hard failure
+        // (return an error frame, do not +OK).
+        let (tx0, rx0) = channel::mpsc_bounded::<AofMessage>(4);
+        let (tx1, _rx1) = channel::mpsc_bounded::<AofMessage>(4);
+        let pool = AofWriterPool::per_shard(vec![tx0, tx1]);
+
+        let recv = pool.try_send_append_sync(0, 7, Bytes::from_static(b"x"));
+
+        // Drain the message but DROP the ack sender without sending.
+        match rx0.try_recv() {
+            Ok(AofMessage::AppendSync { ack, .. }) => drop(ack),
+            other => panic!("expected AppendSync, got {:?}", other.is_ok()),
+        }
+
+        let err = recv.recv_blocking().expect_err("dropped ack -> RecvError");
+        // Crash-safe: we got a sentinel-style error, not a hang.
+        let _ = err;
+    }
+
+    #[test]
+    fn append_sync_writer_reports_write_failed() {
+        // Writer encountered a write_all error; recv returns WriteFailed.
+        let (tx0, rx0) = channel::mpsc_bounded::<AofMessage>(4);
+        let (tx1, _rx1) = channel::mpsc_bounded::<AofMessage>(4);
+        let pool = AofWriterPool::per_shard(vec![tx0, tx1]);
+
+        let recv = pool.try_send_append_sync(0, 1, Bytes::from_static(b"x"));
+        let ack = match rx0.try_recv() {
+            Ok(AofMessage::AppendSync { ack, .. }) => ack,
+            other => panic!("expected AppendSync, got {:?}", other.is_ok()),
+        };
+        let _ = ack.send(AofAck::WriteFailed);
+        let result = recv.recv_blocking().expect("recv resolves");
+        assert_eq!(result, AofAck::WriteFailed);
+    }
+
+    #[test]
+    fn append_sync_writer_reports_fsync_failed() {
+        // Writer wrote the payload but fsync (sync_data) returned an error.
+        let (tx0, rx0) = channel::mpsc_bounded::<AofMessage>(4);
+        let (tx1, _rx1) = channel::mpsc_bounded::<AofMessage>(4);
+        let pool = AofWriterPool::per_shard(vec![tx0, tx1]);
+
+        let recv = pool.try_send_append_sync(0, 1, Bytes::from_static(b"x"));
+        let ack = match rx0.try_recv() {
+            Ok(AofMessage::AppendSync { ack, .. }) => ack,
+            other => panic!("expected AppendSync, got {:?}", other.is_ok()),
+        };
+        let _ = ack.send(AofAck::FsyncFailed);
+        let result = recv.recv_blocking().expect("recv resolves");
+        assert_eq!(result, AofAck::FsyncFailed);
+    }
+
+    #[test]
     fn broadcast_shutdown_reaches_every_writer() {
         let (tx0, rx0) = channel::mpsc_bounded::<AofMessage>(2);
         let (tx1, rx1) = channel::mpsc_bounded::<AofMessage>(2);
@@ -597,6 +764,39 @@ pub async fn aof_writer_task(
                         FsyncPolicy::No => {}
                     }
                 }
+                // TopLevel writer (monoio): legacy v1 plain RESP, lsn ignored.
+                // AppendSync ALWAYS fsyncs and acks before returning, regardless
+                // of the configured policy — that's the durability contract the
+                // caller signed up for by choosing AppendSync.
+                Ok(AofMessage::AppendSync { bytes: data, lsn: _, ack }) => {
+                    if write_error {
+                        let _ = ack.send(AofAck::WriteFailed);
+                        continue;
+                    }
+                    if let Err(e) = file.write_all(&data) {
+                        error!(
+                            "AOF AppendSync write failed (seq {}): {}. Persistence degraded.",
+                            manifest.seq, e
+                        );
+                        write_error = true;
+                        let _ = ack.send(AofAck::WriteFailed);
+                        continue;
+                    }
+                    let t = Instant::now();
+                    if let Err(e) = file.flush().and_then(|_| file.sync_data()) {
+                        error!(
+                            "AOF AppendSync sync failed (seq {}): {}",
+                            manifest.seq, e
+                        );
+                        write_error = true;
+                        let _ = ack.send(AofAck::FsyncFailed);
+                    } else {
+                        crate::admin::metrics_setup::record_aof_fsync(
+                            t.elapsed().as_micros() as u64,
+                        );
+                        let _ = ack.send(AofAck::Synced);
+                    }
+                }
                 Ok(AofMessage::Shutdown) | Err(_) => {
                     if !write_error {
                         if let Err(e) = file.flush().and_then(|_| file.sync_data()) {
@@ -661,6 +861,25 @@ pub async fn aof_writer_task(
                                 // EverySec handled by interval tick below; No does nothing
                             }
                         }
+                    }
+                    // AppendSync: write + fsync + ack, regardless of policy.
+                    Ok(AofMessage::AppendSync { bytes: data, lsn: _, ack }) => {
+                        if let Err(e) = writer.write_all(&data).await {
+                            error!("AOF AppendSync write error: {}", e);
+                            let _ = ack.send(AofAck::WriteFailed);
+                            continue;
+                        }
+                        if let Err(e) = writer.flush().await {
+                            error!("AOF AppendSync flush error: {}", e);
+                            let _ = ack.send(AofAck::FsyncFailed);
+                            continue;
+                        }
+                        if let Err(e) = writer.get_ref().sync_data().await {
+                            error!("AOF AppendSync sync_data error: {}", e);
+                            let _ = ack.send(AofAck::FsyncFailed);
+                            continue;
+                        }
+                        let _ = ack.send(AofAck::Synced);
                     }
                     Ok(AofMessage::Rewrite(db)) => {
                         // Flush current writer before rewrite
@@ -882,6 +1101,45 @@ pub async fn per_shard_aof_writer_task(
                                 let _ = writer.get_ref().sync_data().await;
                             }
                         }
+                        // AppendSync (tokio + PerShard): framed write + fsync + ack.
+                        Ok(AofMessage::AppendSync { lsn, bytes: data, ack }) => {
+                            let mut header = [0u8; 12];
+                            header[..8].copy_from_slice(&lsn.to_le_bytes());
+                            header[8..].copy_from_slice(&(data.len() as u32).to_le_bytes());
+                            if let Err(e) = writer.write_all(&header).await {
+                                error!(
+                                    "AOF AppendSync header write error shard {}: {}",
+                                    shard_id, e
+                                );
+                                let _ = ack.send(AofAck::WriteFailed);
+                                continue;
+                            }
+                            if let Err(e) = writer.write_all(&data).await {
+                                error!(
+                                    "AOF AppendSync write error shard {}: {}",
+                                    shard_id, e
+                                );
+                                let _ = ack.send(AofAck::WriteFailed);
+                                continue;
+                            }
+                            if let Err(e) = writer.flush().await {
+                                error!(
+                                    "AOF AppendSync flush error shard {}: {}",
+                                    shard_id, e
+                                );
+                                let _ = ack.send(AofAck::FsyncFailed);
+                                continue;
+                            }
+                            if let Err(e) = writer.get_ref().sync_data().await {
+                                error!(
+                                    "AOF AppendSync sync_data error shard {}: {}",
+                                    shard_id, e
+                                );
+                                let _ = ack.send(AofAck::FsyncFailed);
+                                continue;
+                            }
+                            let _ = ack.send(AofAck::Synced);
+                        }
                         Ok(AofMessage::Rewrite(_)) | Ok(AofMessage::RewriteSharded(_)) => {
                             warn!(
                                 "AOF writer shard {}: received Rewrite/RewriteSharded — \
@@ -1012,6 +1270,48 @@ pub async fn per_shard_aof_writer_task(
 
         loop {
             match rx.recv() {
+                // AppendSync (monoio + PerShard): framed write + fsync + ack.
+                Ok(AofMessage::AppendSync { lsn, bytes: data, ack }) => {
+                    if write_error {
+                        let _ = ack.send(AofAck::WriteFailed);
+                        continue;
+                    }
+                    let mut header = [0u8; 12];
+                    header[..8].copy_from_slice(&lsn.to_le_bytes());
+                    header[8..].copy_from_slice(&(data.len() as u32).to_le_bytes());
+                    if let Err(e) = file.write_all(&header) {
+                        error!(
+                            "AOF AppendSync header write failed shard {} (seq {}): {}",
+                            shard_id, manifest.seq, e
+                        );
+                        write_error = true;
+                        let _ = ack.send(AofAck::WriteFailed);
+                        continue;
+                    }
+                    if let Err(e) = file.write_all(&data) {
+                        error!(
+                            "AOF AppendSync write failed shard {} (seq {}): {}",
+                            shard_id, manifest.seq, e
+                        );
+                        write_error = true;
+                        let _ = ack.send(AofAck::WriteFailed);
+                        continue;
+                    }
+                    let t = Instant::now();
+                    if let Err(e) = file.flush().and_then(|_| file.sync_data()) {
+                        error!(
+                            "AOF AppendSync sync failed shard {} (seq {}): {}",
+                            shard_id, manifest.seq, e
+                        );
+                        write_error = true;
+                        let _ = ack.send(AofAck::FsyncFailed);
+                    } else {
+                        crate::admin::metrics_setup::record_aof_fsync(
+                            t.elapsed().as_micros() as u64,
+                        );
+                        let _ = ack.send(AofAck::Synced);
+                    }
+                }
                 // PerShard writer (monoio): framed `[u64 lsn LE][u32 len LE][RESP]`.
                 // See the tokio twin above for format rationale.
                 Ok(AofMessage::Append { lsn, bytes: data }) => {
@@ -1527,6 +1827,19 @@ fn drain_pending_appends(
                     source: e,
                 })?;
                 outcome.drained += 1;
+            }
+            // AppendSync during a rewrite drain: bytes are written and counted;
+            // the post-drain fsync at the rewrite boundary covers durability,
+            // so we ack `Synced`. If the write itself fails the error is
+            // already propagated upward by the `?` and the ack is dropped —
+            // the caller observes `RecvError`, which it treats as failure.
+            AofMessage::AppendSync { bytes: data, lsn: _, ack } => {
+                file.write_all(&data).map_err(|e| AofError::Io {
+                    path: PathBuf::from("<aof incr drain>"),
+                    source: e,
+                })?;
+                outcome.drained += 1;
+                let _ = ack.send(AofAck::Synced);
             }
             AofMessage::Shutdown => {
                 outcome.shutdown_requested = true;
