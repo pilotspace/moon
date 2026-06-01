@@ -1727,6 +1727,34 @@ mod tests_v2 {
         fs::remove_dir_all(&dir).ok();
     }
 
+    /// FIX-W3-4: v2 manifest with stray top-level .base.rdb must return false,
+    /// not true. The filename scan is misleading when a valid v2 manifest exists.
+    ///
+    /// Scenario: operator upgraded to v2 but left a stale `moon.aof.1.base.rdb`
+    /// at the top level (e.g., copied during debugging). `is_legacy_top_level_layout`
+    /// must check the manifest first and return false when v2 is confirmed.
+    #[test]
+    fn is_legacy_top_level_layout_ignores_stray_files_when_v2_manifest_present() {
+        let dir = temp_dir();
+        // Initialize a genuine v2 (PerShard) layout.
+        let _m = AofManifest::initialize_multi(&dir, 2).expect("init v2");
+
+        // Plant a stale top-level base.rdb to simulate the stray-file scenario.
+        let stray = dir
+            .join(AOF_DIR_NAME)
+            .join("moon.aof.1.base.rdb");
+        fs::write(&stray, b"REDIS0011\xff").expect("write stray base.rdb");
+
+        // Even though the stray file matches the filename pattern, a valid v2
+        // manifest is present, so is_legacy_top_level_layout must return false.
+        assert!(
+            !AofManifest::is_legacy_top_level_layout(&dir),
+            "v2 manifest + stray top-level file must still return false"
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn parse_v2_rejects_shard_count_mismatch_in_file() {
         let dir = temp_dir();
