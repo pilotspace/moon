@@ -32,9 +32,16 @@ use std::time::Duration;
 const KEY_COUNT: usize = 200;
 
 fn unique_port() -> u16 {
-    // Pick a high port and offset by current PID to avoid clashes across
-    // parallel test runs in CI. 16700-17200 range is unused on dev hosts.
-    16700 + (std::process::id() as u16 % 500)
+    // Ask the OS to assign an available ephemeral port by binding to 0.
+    // The socket is immediately dropped after reading the port — there is a
+    // brief TOCTOU window, but it is far safer than the previous pid-modulo
+    // scheme which collides when multiple cargo test processes run in parallel
+    // (e.g., CI --test-threads > 1 across feature flag matrix jobs).
+    use std::net::TcpListener;
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind to port 0");
+    let port = listener.local_addr().expect("local addr").port();
+    drop(listener);
+    port
 }
 
 fn unique_dir(suffix: &str) -> std::path::PathBuf {
