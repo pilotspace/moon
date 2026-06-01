@@ -15,7 +15,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::runtime::cancel::CancellationToken;
 use crate::runtime::channel;
@@ -91,6 +91,25 @@ pub enum AofAck {
 /// switch to `appendfsync=everysec`.
 pub static AOF_BACKPRESSURE_DROPPED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+
+/// Result of awaiting an `AppendSync` ack under a bounded timeout (F2).
+///
+/// Distinguishes the three terminal states the `Always` durability path
+/// can reach so the caller can map each to the correct client-facing
+/// outcome:
+/// - `Ack(_)`        — the writer reported back; inspect the `AofAck`.
+/// - `Disconnected`  — the writer task is gone / channel dropped (no ack
+///   will ever arrive). Treated as `WriteFailed`.
+/// - `TimedOut`      — the fsync did not confirm within the configured
+///   bound. Durability is unconfirmed; treated as `FsyncFailed`. The
+///   entry may still reach disk later, so the caller must NOT report
+///   success but also must not assume the write was rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AckOutcome {
+    Ack(AofAck),
+    Disconnected,
+    TimedOut,
+}
 
 /// AOF fsync policy controlling when data is flushed to disk.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -187,6 +206,11 @@ pub enum AofPoolSendError {
 /// Step 2a is additive — this type is defined here but no call site is wired
 /// to it yet. Step 2c performs the type plumbing in `conn_state` and
 /// `conn/core`; steps 2d/2e/2f update the call sites and spawn paths.
+/// Default bound for the `appendfsync=always` fsync-ack await. Mirrors the
+/// `--aof-fsync-timeout-ms` config default; used by constructors that don't
+/// take an explicit timeout (non-production / test helpers).
+pub const DEFAULT_AOF_FSYNC_TIMEOUT: Duration = Duration::from_millis(2000);
+
 #[derive(Clone)]
 pub struct AofWriterPool {
     senders: Vec<channel::MpscSender<AofMessage>>,
@@ -196,6 +220,11 @@ pub struct AofWriterPool {
     /// fsync-before-ack durability (H1 fix); everything else stays on
     /// the fire-and-forget `Append` path.
     fsync_policy: FsyncPolicy,
+    /// F2: max time `try_send_append_durable` waits for the `Always` fsync
+    /// ack before failing the write. `Duration::ZERO` means unbounded
+    /// (legacy behavior). Prevents a stalled disk from parking write
+    /// connections forever (design-for-failure).
+    fsync_timeout: Duration,
 }
 
 impl AofWriterPool {
@@ -203,20 +232,24 @@ impl AofWriterPool {
     /// legacy v1 deployments and `--shards 1` v2 deployments where one writer
     /// thread services every shard.
     pub fn top_level(sender: channel::MpscSender<AofMessage>) -> Arc<Self> {
-        Self::top_level_with_policy(sender, FsyncPolicy::EverySec)
+        Self::top_level_with_policy(sender, FsyncPolicy::EverySec, DEFAULT_AOF_FSYNC_TIMEOUT)
     }
 
     /// Same as [`Self::top_level`] but with an explicit fsync policy. The
     /// policy controls whether [`Self::try_send_append_durable`] takes the
     /// fast (fire-and-forget) or rendezvous (`AppendSync`) path.
+    /// `fsync_timeout` bounds the `Always` ack await (F2); `Duration::ZERO`
+    /// = unbounded.
     pub fn top_level_with_policy(
         sender: channel::MpscSender<AofMessage>,
         fsync_policy: FsyncPolicy,
+        fsync_timeout: Duration,
     ) -> Arc<Self> {
         Arc::new(Self {
             senders: vec![sender],
             layout: crate::persistence::aof_manifest::AofLayout::TopLevel,
             fsync_policy,
+            fsync_timeout,
         })
     }
 
@@ -225,13 +258,16 @@ impl AofWriterPool {
     /// shard count; passing a length-1 vector here is a bug — use
     /// [`AofWriterPool::top_level`] instead.
     pub fn per_shard(senders: Vec<channel::MpscSender<AofMessage>>) -> Arc<Self> {
-        Self::per_shard_with_policy(senders, FsyncPolicy::EverySec)
+        Self::per_shard_with_policy(senders, FsyncPolicy::EverySec, DEFAULT_AOF_FSYNC_TIMEOUT)
     }
 
     /// Same as [`Self::per_shard`] but with an explicit fsync policy.
+    /// `fsync_timeout` bounds the `Always` ack await (F2); `Duration::ZERO`
+    /// = unbounded.
     pub fn per_shard_with_policy(
         senders: Vec<channel::MpscSender<AofMessage>>,
         fsync_policy: FsyncPolicy,
+        fsync_timeout: Duration,
     ) -> Arc<Self> {
         debug_assert!(
             senders.len() >= 2,
@@ -241,6 +277,7 @@ impl AofWriterPool {
             senders,
             layout: crate::persistence::aof_manifest::AofLayout::PerShard,
             fsync_policy,
+            fsync_timeout,
         })
     }
 
@@ -278,17 +315,66 @@ impl AofWriterPool {
         match self.fsync_policy {
             FsyncPolicy::Always => {
                 let rx = self.try_send_append_sync(shard_id, lsn, bytes);
-                match rx.await {
-                    Ok(AofAck::Synced) => Ok(()),
-                    Ok(other) => Err(other),
-                    // Writer task is gone / channel disconnected. Caller
-                    // treats this as a hard failure.
-                    Err(_) => Err(AofAck::WriteFailed),
+                // F2 (design-for-failure): bound the wait so a stalled disk
+                // can't park this connection forever. On elapse the write is
+                // failed — the entry may still land on disk later, but
+                // durability is NOT confirmed, so the caller must not report
+                // success. `Duration::ZERO` keeps the legacy unbounded await.
+                match Self::await_ack(rx, self.fsync_timeout).await {
+                    AckOutcome::Ack(AofAck::Synced) => Ok(()),
+                    AckOutcome::Ack(other) => Err(other),
+                    // Writer task gone / channel disconnected.
+                    AckOutcome::Disconnected => Err(AofAck::WriteFailed),
+                    // Fsync did not confirm within the bound.
+                    AckOutcome::TimedOut => Err(AofAck::FsyncFailed),
                 }
             }
             FsyncPolicy::EverySec | FsyncPolicy::No => {
                 self.try_send_append(shard_id, lsn, bytes);
                 Ok(())
+            }
+        }
+    }
+
+    /// Await an `AppendSync` ack receiver under a bounded timeout (F2).
+    ///
+    /// `timeout == Duration::ZERO` preserves the legacy unbounded await
+    /// (used when the operator explicitly opts out via
+    /// `--aof-fsync-timeout-ms 0`). Otherwise the await is capped by the
+    /// runtime-appropriate timer; on elapse the in-flight fsync is
+    /// abandoned (the receiver is dropped) and `TimedOut` is returned.
+    ///
+    /// Runtime-agnostic: monoio uses `select! { rx, sleep }` (matching the
+    /// established `cluster::failover` pattern — monoio 0.2 has no
+    /// `time::timeout`); tokio uses `tokio::time::timeout`. Both resolve the
+    /// ack first if it arrives within the bound, otherwise `TimedOut`.
+    async fn await_ack(
+        rx: crate::runtime::channel::OneshotReceiver<AofAck>,
+        timeout: Duration,
+    ) -> AckOutcome {
+        if timeout.is_zero() {
+            return match rx.await {
+                Ok(ack) => AckOutcome::Ack(ack),
+                Err(_) => AckOutcome::Disconnected,
+            };
+        }
+
+        #[cfg(feature = "runtime-monoio")]
+        {
+            monoio::select! {
+                res = rx => match res {
+                    Ok(ack) => AckOutcome::Ack(ack),
+                    Err(_) => AckOutcome::Disconnected,
+                },
+                _ = monoio::time::sleep(timeout) => AckOutcome::TimedOut,
+            }
+        }
+        #[cfg(all(feature = "runtime-tokio", not(feature = "runtime-monoio")))]
+        {
+            match tokio::time::timeout(timeout, rx).await {
+                Ok(Ok(ack)) => AckOutcome::Ack(ack),
+                Ok(Err(_)) => AckOutcome::Disconnected,
+                Err(_) => AckOutcome::TimedOut,
             }
         }
     }
@@ -704,6 +790,71 @@ mod pool_tests {
         assert_eq!(result, AofAck::FsyncFailed);
     }
 
+    // F2 (design-for-failure): `appendfsync=always` must bound its fsync-ack
+    // await. A stalled writer must surface a hard error within the budget,
+    // never park the connection forever. Tokio-gated because it drives the
+    // runtime timer; the monoio path shares the proven `select! + sleep`
+    // shape from `cluster::failover`, exercised end-to-end by the crash tests.
+    #[cfg(feature = "runtime-tokio")]
+    #[tokio::test]
+    async fn always_fsync_times_out_when_writer_never_acks() {
+        // Writer channel is held (kept open) but never drained → the
+        // AppendSync sits buffered with its ack sender alive, so the receiver
+        // never resolves. The bounded await MUST elapse and report failure.
+        let (tx0, _rx0) = channel::mpsc_bounded::<AofMessage>(4);
+        let (tx1, _rx1) = channel::mpsc_bounded::<AofMessage>(4);
+        let pool = AofWriterPool::per_shard_with_policy(
+            vec![tx0, tx1],
+            FsyncPolicy::Always,
+            Duration::from_millis(50),
+        );
+
+        let start = Instant::now();
+        let res = pool
+            .try_send_append_durable(0, 1, Bytes::from_static(b"x"))
+            .await;
+        let elapsed = start.elapsed();
+
+        assert_eq!(
+            res,
+            Err(AofAck::FsyncFailed),
+            "timed-out fsync must map to FsyncFailed (durability unconfirmed)"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "must fail within the bound, not hang (took {:?})",
+            elapsed
+        );
+        // Keep the receivers alive until here so the message stays buffered.
+        drop((_rx0, _rx1));
+    }
+
+    #[cfg(feature = "runtime-tokio")]
+    #[tokio::test]
+    async fn always_fsync_succeeds_when_writer_acks_in_time() {
+        // Happy path: a writer drains the AppendSync and acks `Synced` well
+        // within the bound → the durable append returns Ok(()).
+        let (tx0, rx0) = channel::mpsc_bounded::<AofMessage>(4);
+        let (tx1, _rx1) = channel::mpsc_bounded::<AofMessage>(4);
+        let pool = AofWriterPool::per_shard_with_policy(
+            vec![tx0, tx1],
+            FsyncPolicy::Always,
+            Duration::from_millis(500),
+        );
+
+        tokio::spawn(async move {
+            if let Ok(AofMessage::AppendSync { ack, .. }) = rx0.recv_async().await {
+                let _ = ack.send(AofAck::Synced);
+            }
+        });
+
+        let res = pool
+            .try_send_append_durable(0, 1, Bytes::from_static(b"x"))
+            .await;
+        assert_eq!(res, Ok(()), "ack within the bound must succeed");
+        drop(_rx1);
+    }
+
     #[test]
     fn broadcast_shutdown_reaches_every_writer() {
         let (tx0, rx0) = channel::mpsc_bounded::<AofMessage>(2);
@@ -736,6 +887,7 @@ mod pool_tests {
         let pool = std::sync::Arc::new(AofWriterPool::per_shard_with_policy(
             vec![tx0, tx1],
             FsyncPolicy::Always,
+            Duration::ZERO, // legacy unbounded await — disconnect/ack resolves it
         ));
 
         // Spawn a mock writer that drains AppendSync and responds with FsyncFailed.
@@ -870,7 +1022,11 @@ mod pool_tests {
         // ack sender, simulating a dead writer.
         let (tx0, rx0) = channel::mpsc_bounded::<AofMessage>(4);
         let (tx1, _rx1) = channel::mpsc_bounded::<AofMessage>(4);
-        let pool = AofWriterPool::per_shard_with_policy(vec![tx0, tx1], FsyncPolicy::Always);
+        let pool = AofWriterPool::per_shard_with_policy(
+            vec![tx0, tx1],
+            FsyncPolicy::Always,
+            Duration::ZERO, // legacy unbounded await — disconnect resolves it
+        );
 
         // Spawn a thread that pulls the AppendSync off the channel but drops
         // the ack without sending — simulating a writer crash mid-fsync.
@@ -910,7 +1066,8 @@ mod pool_tests {
         // use try_send_append_durable so the policy is respected.
         let (tx0, _rx0) = channel::mpsc_bounded::<AofMessage>(4);
         let (tx1, _rx1) = channel::mpsc_bounded::<AofMessage>(4);
-        let pool = AofWriterPool::per_shard_with_policy(vec![tx0, tx1], FsyncPolicy::EverySec);
+        let pool =
+            AofWriterPool::per_shard_with_policy(vec![tx0, tx1], FsyncPolicy::EverySec, Duration::ZERO);
 
         let result = futures::executor::block_on(pool.try_send_append_durable(
             0,

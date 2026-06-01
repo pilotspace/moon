@@ -125,7 +125,11 @@ pub async fn run_with_shutdown(
         let aof_file_path = PathBuf::from(&config.dir).join(&config.appendfilename);
         tokio::spawn(aof::aof_writer_task(rx, aof_file_path, fsync, aof_token));
         info!("AOF enabled with fsync policy: {:?}", fsync);
-        Some(AofWriterPool::top_level_with_policy(tx, fsync))
+        Some(AofWriterPool::top_level_with_policy(
+            tx,
+            fsync,
+            std::time::Duration::from_millis(config.aof_fsync_timeout_ms),
+        ))
     } else {
         None
     };

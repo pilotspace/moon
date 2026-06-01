@@ -3184,7 +3184,11 @@ mod wal_append_tests {
 
         // Build a pool backed by a real channel so we can observe what arrives.
         let (tx, rx) = mpsc_bounded::<AofMessage>(16);
-        let pool = AofWriterPool::top_level_with_policy(tx, FsyncPolicy::EverySec);
+        let pool = AofWriterPool::top_level_with_policy(
+            tx,
+            FsyncPolicy::EverySec,
+            std::time::Duration::ZERO,
+        );
 
         wal_append_and_fanout(
             b"world",
@@ -3240,7 +3244,11 @@ mod wal_append_tests {
         // Build a 2-shard pool so per_shard_with_policy's debug_assert passes.
         let (tx0, rx0) = mpsc_bounded::<AofMessage>(16);
         let (tx1, rx1) = mpsc_bounded::<AofMessage>(16);
-        let pool = AofWriterPool::per_shard_with_policy(vec![tx0, tx1], FsyncPolicy::EverySec);
+        let pool = AofWriterPool::per_shard_with_policy(
+            vec![tx0, tx1],
+            FsyncPolicy::EverySec,
+            std::time::Duration::ZERO,
+        );
 
         // ── PipelineBatch path: caller passes None ──
         // Pre-fix this was `aof_pool` (Some), which caused the double-write.

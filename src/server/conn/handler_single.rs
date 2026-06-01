@@ -2508,7 +2508,11 @@ mod tests {
     async fn flush_with_aof_ack_ack_precedes_response() {
         // Build an Always-policy pool backed by a real bounded channel.
         let (tx, rx) = channel::mpsc_bounded::<AofMessage>(4);
-        let pool = AofWriterPool::top_level_with_policy(tx, FsyncPolicy::Always);
+        let pool = AofWriterPool::top_level_with_policy(
+            tx,
+            FsyncPolicy::Always,
+            std::time::Duration::ZERO,
+        );
 
         // Mock writer: receives one AppendSync, sleeps 60ms to simulate fsync,
         // then sends Synced.  Runs on a blocking thread because flume's

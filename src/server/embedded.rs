@@ -140,7 +140,11 @@ pub async fn run_embedded(
             .context("embedded moon: failed to spawn AOF writer thread")?;
         info!("embedded moon: AOF enabled (fsync: {:?})", fsync);
         (
-            Some(AofWriterPool::top_level_with_policy(tx, fsync)),
+            Some(AofWriterPool::top_level_with_policy(
+                tx,
+                fsync,
+                std::time::Duration::from_millis(config.aof_fsync_timeout_ms),
+            )),
             Some(handle),
         )
     } else {

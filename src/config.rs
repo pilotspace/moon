@@ -121,6 +121,14 @@ pub struct ServerConfig {
     #[arg(long, default_value = "everysec")]
     pub appendfsync: String,
 
+    /// Max time (ms) a write may block awaiting the `appendfsync=always`
+    /// fsync ack before the write is failed instead of parking the
+    /// connection forever. Design-for-failure bound: a stalled disk must
+    /// not turn write connections into zombies holding their buffers.
+    /// 0 disables the bound (legacy unbounded await). Default 2000ms.
+    #[arg(long = "aof-fsync-timeout-ms", default_value_t = 2000)]
+    pub aof_fsync_timeout_ms: u64,
+
     /// RDB auto-save rules (e.g., "3600 1 300 100")
     #[arg(long)]
     pub save: Option<String>,
