@@ -270,6 +270,13 @@ fn main() -> anyhow::Result<()> {
 
     info!("Starting with {} shards", num_shards);
 
+    // Checked cast: --shards is bounded by clap's value_parser, but `as u16`
+    // would silently wrap for values > 65535. Fail loudly instead.
+    // ALLOW: panic is appropriate here — this is `main`, not library code.
+    #[allow(clippy::expect_used)]
+    let shard_count_u16: u16 =
+        u16::try_from(num_shards).expect("--shards must be <= 65535");
+
     // P0-FIX-01b LIFTED (Option B step 9, 2026-06-01): the per-shard AOF
     // pipeline (RFC steps 1-8) makes `--shards >= 2 + --appendonly yes`
     // crash-safe. CRASH-01-LITE confirms 200/200 keys recover after
@@ -353,7 +360,7 @@ fn main() -> anyhow::Result<()> {
         None
     };
     if let Some(ref m) = existing_manifest
-        && let Err(e) = m.verify_shard_count(num_shards as u16)
+        && let Err(e) = m.verify_shard_count(shard_count_u16)
     {
         eprintln!("REFUSING TO START: {e}");
         std::process::exit(2);
@@ -795,7 +802,7 @@ fn main() -> anyhow::Result<()> {
                 // when the loaded manifest's layout is PerShard, so without
                 // this branch a multi-shard --appendonly yes deployment would
                 // silently fall back to TopLevel and lose data on restart.
-                AofManifest::initialize_multi(&base_dir, num_shards as u16)
+                AofManifest::initialize_multi(&base_dir, shard_count_u16)
                     .with_context(|| "failed to initialize PerShard AOF manifest")?;
                 info!(
                     "Initialized PerShard AOF manifest for {} shards at {}",
