@@ -872,6 +872,16 @@ impl AofManifest {
     /// RDB and an empty incr file. Mirrors `initialize()` semantics: the
     /// `(base + incr)` invariant holds from the first boot, so recovery can
     /// replay incr-only state without complaint.
+    ///
+    /// **Idempotency pre-flight:** if `appendonlydir/moon.aof.manifest` already
+    /// exists, returns `Err(AlreadyExists)` without modifying any files. A
+    /// mid-loop crash followed by a retry would otherwise overwrite the already-
+    /// written shard-0 base RDB with an empty RDB, losing state. Callers that
+    /// want resume-or-skip semantics should use [`Self::try_initialize_multi`].
+    ///
+    /// **Rollback on partial failure:** if the per-shard loop fails mid-way (e.g.
+    /// shard-1 write fails after shard-0 succeeded), all already-created shard
+    /// base RDB files are deleted before returning the error.
     pub fn initialize_multi(dir: &Path, num_shards: u16) -> std::io::Result<Self> {
         if num_shards == 0 {
             return Err(std::io::Error::new(
@@ -892,29 +902,79 @@ impl AofManifest {
         };
         std::fs::create_dir_all(manifest.aof_dir())?;
 
+        // Pre-flight: refuse if manifest already exists to avoid overwriting
+        // already-written shard base RDB files (idempotency guard).
+        let manifest_path = manifest.manifest_path();
+        if manifest_path.exists() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!(
+                    "initialize_multi: manifest already exists at {}; \
+                     use try_initialize_multi() for idempotent initialization",
+                    manifest_path.display()
+                ),
+            ));
+        }
+
         // Per-shard empty RDB. Single Database::default() inside a 1-element
         // slice matches `initialize()`'s empty-RDB shape for each shard.
         let empty_dbs: [crate::storage::Database; 0] = [];
         let empty_rdb = crate::persistence::rdb::save_to_bytes(&empty_dbs)
             .map_err(|e| std::io::Error::other(format!("empty RDB serialize: {e}")))?;
 
-        for shard_id in 0..num_shards {
-            let shard_dir = manifest.shard_dir(shard_id);
-            std::fs::create_dir_all(&shard_dir)?;
+        // Track which shard directories were successfully created so we can
+        // roll them back on partial failure.
+        let mut created_shards: Vec<u16> = Vec::with_capacity(num_shards as usize);
 
-            let base_path = manifest.shard_base_path(shard_id);
-            let tmp_path = base_path.with_extension("rdb.tmp");
-            {
-                let mut f = std::fs::File::create(&tmp_path)?;
-                f.write_all(&empty_rdb)?;
-                f.sync_data()?;
+        let loop_result = (|| -> std::io::Result<()> {
+            for shard_id in 0..num_shards {
+                let shard_dir = manifest.shard_dir(shard_id);
+                std::fs::create_dir_all(&shard_dir)?;
+
+                let base_path = manifest.shard_base_path(shard_id);
+                let tmp_path = base_path.with_extension("rdb.tmp");
+                {
+                    let mut f = std::fs::File::create(&tmp_path)?;
+                    f.write_all(&empty_rdb)?;
+                    f.sync_data()?;
+                }
+                std::fs::rename(&tmp_path, &base_path)?;
+                std::fs::File::create(manifest.shard_incr_path(shard_id))?;
+                created_shards.push(shard_id);
             }
-            std::fs::rename(&tmp_path, &base_path)?;
-            std::fs::File::create(manifest.shard_incr_path(shard_id))?;
+            Ok(())
+        })();
+
+        if let Err(e) = loop_result {
+            // Rollback: remove base RDB files for all successfully-created shards.
+            for sid in created_shards {
+                let base = manifest.shard_base_path(sid);
+                if let Err(re) = std::fs::remove_file(&base) {
+                    warn!(
+                        "initialize_multi rollback: failed to remove {}: {}",
+                        base.display(),
+                        re
+                    );
+                }
+            }
+            return Err(e);
         }
 
         manifest.write_manifest()?;
         Ok(manifest)
+    }
+
+    /// Initialize a v2 multi-shard manifest only if one does not already exist.
+    ///
+    /// Returns `Ok(Some(manifest))` on successful creation, or `Ok(None)` if the
+    /// manifest file already existed (already initialized — no files modified).
+    /// Returns `Err(_)` only on actual I/O failures.
+    pub fn try_initialize_multi(dir: &Path, num_shards: u16) -> std::io::Result<Option<Self>> {
+        match Self::initialize_multi(dir, num_shards) {
+            Ok(m) => Ok(Some(m)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 
     /// Advance to the next sequence: write new base RDB, create new incr file,
