@@ -687,6 +687,19 @@ impl AofManifest {
         if !aof_dir.exists() {
             return false;
         }
+
+        // Check manifest version first. If a valid v2 (PerShard) manifest exists,
+        // return false regardless of stray top-level files. Operators occasionally
+        // leave old base.rdb / incr.aof files at the top level during debugging
+        // or failed upgrades; scanning filenames without reading the manifest would
+        // produce a misleading "legacy detected" result and trigger unwanted
+        // migration on an already-upgraded deployment.
+        if let Ok(Some(m)) = Self::load(dir) {
+            if m.layout == AofLayout::PerShard {
+                return false;
+            }
+        }
+
         let entries = match std::fs::read_dir(&aof_dir) {
             Ok(e) => e,
             Err(_) => return false,
