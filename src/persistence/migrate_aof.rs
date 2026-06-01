@@ -474,4 +474,81 @@ mod tests {
             .expect("present");
         assert_eq!(manifest.shards.len(), 2);
     }
+
+    /// Round-trip test: migrate N keys, then replay with `replay_per_shard` and
+    /// assert every key is recoverable from the correct shard's database.
+    ///
+    /// This test discriminates framing correctness, base-RDB presence, and
+    /// routing determinism all at once.
+    #[test]
+    fn migrate_aof_round_trips_through_replay_per_shard() {
+        use crate::persistence::aof_manifest::replay_per_shard;
+        use crate::persistence::replay::DispatchReplayEngine;
+        use crate::storage::Database;
+
+        let src_dir = tempfile::tempdir().unwrap();
+        let dst_dir = tempfile::tempdir().unwrap();
+        const N_SHARDS: u16 = 4;
+
+        // Write 12 keys using hash-tags so we know exactly which shard each goes to.
+        // {0} → shard A, {1} → shard B (may differ). We don't care which specific
+        // shard — we just need to verify the total replayed key count.
+        let mut aof_data: Vec<u8> = Vec::new();
+        let keys: Vec<String> = (0..12u32).map(|i| format!("key:{i}")).collect();
+        for key in &keys {
+            aof_data.extend(set_resp(key, "val"));
+        }
+        std::fs::write(src_dir.path().join("appendonly.aof"), &aof_data)
+            .expect("write source aof");
+
+        let result = migrate_aof(src_dir.path(), dst_dir.path(), N_SHARDS)
+            .expect("migration succeeds");
+        assert_eq!(result.commands_read, 12);
+        assert_eq!(result.commands_written, 12);
+
+        let manifest = AofManifest::load(dst_dir.path())
+            .expect("load ok")
+            .expect("manifest present");
+
+        // Allocate per-shard database vectors (1 logical DB each).
+        let mut shard_dbs: Vec<Vec<Database>> = (0..N_SHARDS)
+            .map(|_| vec![Database::new()])
+            .collect();
+        let mut slices: Vec<&mut [Database]> =
+            shard_dbs.iter_mut().map(|v| v.as_mut_slice()).collect();
+
+        let (total_replayed, _max_lsn, ordered) = replay_per_shard(
+            &mut slices,
+            &manifest,
+            &(|| {
+                Box::new(DispatchReplayEngine::new())
+                    as Box<dyn crate::persistence::replay::CommandReplayEngine + Send>
+            }),
+        )
+        .expect("replay_per_shard must succeed on migrated layout");
+
+        // Every command written must be replayed.
+        assert_eq!(
+            total_replayed, 12,
+            "all 12 commands must be recovered by replay_per_shard"
+        );
+        assert!(
+            ordered.is_empty(),
+            "non-ordered commands must not appear in ordered buffer"
+        );
+
+        // Verify each key is present in the shard it was routed to.
+        let mut total_found = 0usize;
+        for key in &keys {
+            let shard_idx = crate::shard::dispatch::key_to_shard(key.as_bytes(), N_SHARDS as usize);
+            let db = &mut shard_dbs[shard_idx][0];
+            if db.get(key.as_bytes()).is_some() {
+                total_found += 1;
+            }
+        }
+        assert_eq!(
+            total_found, 12,
+            "all 12 keys must be retrievable from their routing shard after replay"
+        );
+    }
 }
