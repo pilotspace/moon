@@ -42,6 +42,48 @@ use tracing::{error, info, warn};
 const MANIFEST_NAME: &str = "moon.aof.manifest";
 const AOF_DIR_NAME: &str = "appendonlydir";
 
+/// Fsync the parent directory of `path` to make a preceding `rename()` durable.
+///
+/// POSIX guarantees atomicity of `rename()` but does NOT guarantee that the
+/// directory entry update is durable after a crash. On ext4 and XFS without
+/// `data=ordered`, a crash between the rename and a directory fsync can leave
+/// the old file name visible on the next boot even though the rename completed
+/// in memory. Calling this after every manifest-visible rename closes that gap.
+///
+/// Best-effort: logs on failure but does not propagate the error. A failed
+/// dir fsync means the rename may not survive a crash — the worst case is
+/// that recovery falls back to the previous manifest state, which is still
+/// consistent (the atomic rename guarantees the file is either fully old or
+/// fully new). Propagating the error would require callers to handle the case
+/// where the write succeeded but the dir fsync failed, which is typically not
+/// actionable at runtime.
+fn fsync_parent(path: &Path) {
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => return, // root or no parent — nothing to fsync
+    };
+    match std::fs::File::open(parent) {
+        Ok(dir) => {
+            if let Err(e) = dir.sync_all() {
+                warn!(
+                    "fsync_parent: failed to fsync dir {} after rename of {}: {}",
+                    parent.display(),
+                    path.display(),
+                    e
+                );
+            }
+        }
+        Err(e) => {
+            warn!(
+                "fsync_parent: failed to open dir {} for fsync (rename of {}): {}",
+                parent.display(),
+                path.display(),
+                e
+            );
+        }
+    }
+}
+
 /// On-disk layout discriminator.
 ///
 /// `TopLevel` is the legacy single-shard layout from manifest v1. `PerShard`
@@ -202,6 +244,7 @@ impl AofManifest {
             f.sync_data()?;
         }
         std::fs::rename(&tmp_path, &base_path)?;
+        fsync_parent(&base_path);
 
         // Create the empty incr file so the writer has a target.
         std::fs::File::create(manifest.incr_path())?;
@@ -240,6 +283,7 @@ impl AofManifest {
             f.sync_data()?;
         }
         std::fs::rename(&tmp_path, &base_path)?;
+        fsync_parent(&base_path);
 
         // Create empty incr file so the writer has something to append to.
         std::fs::File::create(manifest.incr_path())?;
@@ -629,6 +673,7 @@ impl AofManifest {
         f.write_all(content.as_bytes())?;
         f.sync_data()?;
         std::fs::rename(&tmp_path, &manifest_path)?;
+        fsync_parent(&manifest_path);
         Ok(())
     }
 
@@ -939,6 +984,7 @@ impl AofManifest {
                     f.sync_data()?;
                 }
                 std::fs::rename(&tmp_path, &base_path)?;
+                fsync_parent(&base_path);
                 std::fs::File::create(manifest.shard_incr_path(shard_id))?;
                 created_shards.push(shard_id);
             }
@@ -1018,6 +1064,7 @@ impl AofManifest {
                 detail: format!("rename base: {}", e),
             }
         })?;
+        fsync_parent(&new_base);
 
         // 2. Create empty new incremental file
         let new_incr = self.incr_path_seq(new_seq);
@@ -1132,6 +1179,7 @@ impl AofManifest {
                 ),
             }
         })?;
+        fsync_parent(&new_base);
 
         // 2. Create empty new incremental file.
         let new_incr = self.shard_incr_path_seq(shard_id, new_seq);
