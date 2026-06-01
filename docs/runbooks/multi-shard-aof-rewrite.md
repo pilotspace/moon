@@ -1,97 +1,152 @@
-# Runbook — multi-shard + AOF refused at startup
+# Runbook — multi-shard AOF (per-shard layout)
 
-**Status:** active (Moon ≥ v0.1.13). Lifted in v2.0 once multi-shard
-AOF replay walks every shard's segment manifest on recovery.
+**Status:** Resolved. The startup refusal gate introduced in v0.1.13 was lifted
+in v0.1.13-patch (PR #129) once the per-shard AOF replay path was shipped and
+verified (CRASH-01-LITE: 200/200 SIGKILL recovery, 0 data loss).
 
-## What you saw
+---
 
-### At startup
+## Background (historical context)
 
-```
-REFUSING TO START: --shards 2 + --appendonly yes has a known data-loss
-bug on SIGKILL (~50 % loss verified 2026-05-26). Fix: use --shards 1,
-or pass --appendonly no for cache-only deployments, or pass
---unsafe-multishard-aof to acknowledge the risk and start anyway. See
-docs/runbooks/multi-shard-aof-rewrite.md.
-```
+Prior to PR #129, Moon refused to start with `--shards >= 2 + --appendonly yes`
+because the single-writer AOF implementation lost ~50 % of writes on SIGKILL
+in that configuration. The fix was a full per-shard AOF architecture (Option B):
+each shard owns its own writer task and recovery walks every shard's segment
+manifest independently.
 
-### Or at command time (defence-in-depth, fires under any escape-hatch)
+If you are running Moon ≤ v0.1.13 and hit the old startup error, see the
+**Upgrading** section below.
 
-```
-> BGREWRITEAOF
-(error) ERR BGREWRITEAOF is unsafe with --shards >= 2 + --disk-offload enable
-        + --appendonly yes (known data-loss bug; see
-        docs/runbooks/multi-shard-aof-rewrite.md). Use --shards 1, set
-        --disk-offload disable, or wait for v2.0 multi-part AOF replay.
-```
+---
 
-## Why this gate exists
+## Current architecture (v0.1.13-patch / PR #129 and later)
 
-Verified on `main` at commit `6e49050` (2026-05-26), reproducers in
-[`tmp/p0-no-rewrite.sh`](../../tmp/p0-no-rewrite.sh),
-[`tmp/p0-always.sh`](../../tmp/p0-always.sh),
-[`tmp/p0-multishard-no-offload.sh`](../../tmp/p0-multishard-no-offload.sh):
-
-| Configuration                                                              | Result                       |
-|----------------------------------------------------------------------------|------------------------------|
-| `--shards 1 --appendonly yes --appendfsync always` (control)               | ✅ Recovers 5000 / 5000       |
-| `--shards 1 --disk-offload enable --appendonly yes` (control)              | ✅ Recovers 12 714 / 12 714   |
-| `--shards 2 --disk-offload enable --appendonly yes --appendfsync everysec` | ❌ Loses 38 % (12 662 → 7 892) |
-| `--shards 2 --disk-offload enable --appendonly yes --appendfsync always`   | ❌ Loses 50 % (5000 → 2474)   |
-| `--shards 2 --disk-offload disable --appendonly yes --appendfsync always`  | ❌ Loses 50 % (5000 → 2453)   |
-
-**The bug is in the multi-shard AOF durability path itself**, not the
-rewrite path and not the disk-offload tier. `--appendfsync always` and
-`--disk-offload disable` do not save you — only `--shards 1` does.
-
-The rewrite-specific gate (the `BGREWRITEAOF` error above) is still
-shipped as defence-in-depth for anyone who passes
-`--unsafe-multishard-aof`.
-
-## How to recover from a triggered loss (if you hit this on < v0.1.13)
-
-1. If a recent RDB snapshot exists in `--dir`, stop the server, move
-   `appendonlydir/` aside, and let recovery rebuild from RDB +
-   surviving per-shard WAL only. RPO equals the time since the RDB
-   snapshot.
-2. If replication was running, promote a non-affected replica
-   (`REPLICAOF NO ONE`) and re-sync the affected node.
-3. If neither: data is lost. File a `P0` with the AOF manifest
-   contents (`appendonlydir/moon.aof.manifest`) and per-shard WAL
-   sizes.
-
-## How to avoid the gate
-
-Pick whichever matches your deployment:
-
-| Option                                             | Trade-off                                                                                |
-|----------------------------------------------------|------------------------------------------------------------------------------------------|
-| `--shards 1`                                       | **Recommended.** Best throughput on non-pipelined workloads; gives up multi-shard fan-out |
-| `--appendonly no`                                  | Cache-only deployments; durability falls back to `save` rules + RDB recovery             |
-| `--unsafe-multishard-aof`                          | **Discouraged.** Acknowledges ~50 % loss on crash; suitable only for ephemeral caches    |
-
-The first option also clears the `BGREWRITEAOF` defence-in-depth gate.
-
-## When will this be removed?
-
-v2.0 ships multi-shard AOF replay that walks every shard's segment
-manifest on recovery. Both gates (startup refusal + `BGREWRITEAOF`
-error) are removed at the same time. Track progress at
-[`tmp/SHIP-PLAN-v1.0-rc1-single-node.md`](../../tmp/SHIP-PLAN-v1.0-rc1-single-node.md)
-§ Track B.
-
-## Telemetry
-
-When `--unsafe-multishard-aof` is passed AND the suspect config is set,
-the BGREWRITEAOF-specific gate also logs at startup at `WARN`:
+### Per-shard AOF layout
 
 ```
-BGREWRITEAOF gated for this config (known data-loss path; see
-docs/runbooks/multi-shard-aof-rewrite.md). Use --shards 1 or
---disk-offload disable to re-enable rewrite.
+<persistence_dir>/
+  appendonlydir/
+    moon.aof.manifest          ← top-level manifest (layout: PerShard)
+    shard-0/
+      moon.aof.1.base.rdb      ← base snapshot for shard 0
+      moon.aof.1.incr.aof      ← incremental log for shard 0
+    shard-1/
+      moon.aof.1.base.rdb
+      moon.aof.1.incr.aof
+    shard-N/
+      ...
 ```
 
-Each gated `BGREWRITEAOF` invocation also returns the documented `ERR`
-line at the wire, so any operator dashboard tailing `slowlog` or
-client-side error counters will surface the refusal immediately. A
-dedicated Prometheus gauge for both gates is on the v1.0-rc1 backlog.
+Each shard's writer task appends to its own `.incr.aof` file. On restart, Moon
+opens the manifest, discovers all shard directories, and replays each shard's
+log independently. Shard replay is parallel — recovery time does not grow
+linearly with shard count.
+
+### Durability invariants
+
+| appendfsync         | Guarantee                                                              |
+|---------------------|------------------------------------------------------------------------|
+| `always`            | Write is on durable storage before +OK (AppendSync rendezvous)         |
+| `everysec` (default)| Fsync runs every second; at most ~1 s of writes at risk on crash        |
+| `no`                | OS decides when to flush; fastest but weakest guarantee                |
+
+### BGREWRITEAOF in per-shard mode
+
+`BGREWRITEAOF` fans out to every shard's writer task. Each shard compacts its
+own log independently. All N acks are awaited before returning `+Background
+append only file rewriting started`.
+
+---
+
+## Upgrading from v0.1.13 (old TopLevel AOF) to per-shard layout
+
+If you have an existing deployment with a **TopLevel** AOF manifest (single
+writer, `layout: TopLevel`) and want to migrate to per-shard layout:
+
+### Option A — cold migration (recommended, zero-risk)
+
+1. Stop the server.
+2. Run `BGSAVE` on the last healthy instance, or copy `dump.rdb` from
+   `--dir`.
+3. Remove `appendonlydir/` entirely.
+4. Restart with `--shards N --appendonly yes`. Moon creates a fresh per-shard
+   manifest. Recovery loads from RDB; the incremental AOF starts empty.
+
+### Option B — in-place migration (future tooling)
+
+A `moon migrate-aof --from-top-level` CLI subcommand is planned for v0.2. Until
+then, use Option A.
+
+### Safety guard — TopLevel manifest with multi-shard startup
+
+If Moon detects an existing **TopLevel** AOF manifest at startup with
+`--shards >= 2`, it refuses to start and prints:
+
+```
+REFUSING TO START: legacy TopLevel AOF manifest at <path> detected with
+--shards N (>= 2). A TopLevel (single-writer) AOF cannot safely serve
+as the persistence log for a multi-shard instance. Options:
+  1. Use --shards 1 (single-shard, fully compatible with TopLevel layout).
+  2. Remove appendonlydir/ and restart to create a fresh per-shard manifest.
+  3. Run: moon migrate-aof --from-top-level  (planned for v0.2).
+```
+
+This is intentional — a TopLevel log does not capture per-shard ordering, so
+replaying it on a multi-shard instance would produce incorrect key routing.
+
+---
+
+## Deprecated flag: --unsafe-multishard-aof
+
+The `--unsafe-multishard-aof` flag was introduced in v0.1.13 as an escape hatch
+to acknowledge the known ~50 % data-loss risk. It is now **deprecated** and will
+be removed in v0.2:
+
+- The underlying bug is fixed — the flag no longer suppresses any safety gate.
+- Passing it emits a `[DEPRECATED]` warning at startup.
+- If you have scripts or systemd units that pass `--unsafe-multishard-aof`,
+  remove that flag — it is a no-op.
+
+---
+
+## Monitoring and telemetry
+
+### INFO Persistence fields added in PR #129
+
+```
+aof_backpressure_dropped:<N>   ← count of writes dropped due to full AOF channel
+```
+
+A non-zero value indicates the AOF writer is falling behind write throughput.
+Investigate disk I/O or increase `aof-rewrite-min-size`.
+
+### Prometheus / alerting
+
+A dedicated gauge for `aof_backpressure_dropped` is planned for v0.2. Until
+then, monitor via `INFO persistence` polling.
+
+---
+
+## Crash recovery verification
+
+Run the CRASH-01-LITE suite to verify your configuration recovers cleanly:
+
+```bash
+# From the moon-dev OrbStack VM:
+cargo test --release crash_01_lite 2>&1 | tail -20
+```
+
+Expected: 200/200 entries recovered across all shards after SIGKILL.
+
+---
+
+## Escalation
+
+If you observe data loss after a crash on v0.1.13-patch or later, collect:
+
+1. `appendonlydir/moon.aof.manifest` contents
+2. `appendonlydir/shard-*/` file sizes and modification times
+3. Server log from the crashed process (look for AOF writer task exit reason)
+4. `INFO persistence` output from the recovered instance
+
+File a P0 with these artifacts attached.
