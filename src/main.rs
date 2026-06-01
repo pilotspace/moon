@@ -68,7 +68,7 @@ fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let config = ServerConfig::parse();
+    let mut config = ServerConfig::parse();
 
     // ── AOF v1→v2 migration (FIX-W3-2): early-exit before normal boot ──
     // When `--migrate-aof-from` is set, run the migration tool and exit.
@@ -127,6 +127,11 @@ fn main() -> anyhow::Result<()> {
              Use --requirepass or --protected-mode no to change this."
         );
     }
+
+    // G1 memory guardrail: resolve --maxmemory before any RuntimeConfig is
+    // built so an unset cap is auto-populated (cgroup-aware) and the startup
+    // notice prints exactly once.
+    moon::config::log_memory_guardrail(config.apply_memory_guardrail());
 
     // Build TLS configuration if tls_port is set.
     // Uses ArcSwap for SIGHUP-based certificate hot-reload.

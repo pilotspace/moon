@@ -137,9 +137,21 @@ pub struct ServerConfig {
     #[arg(long, default_value = "appendonly.aof")]
     pub appendfilename: String,
 
-    /// Maximum memory in bytes (0 = unlimited)
-    #[arg(long, default_value_t = 0)]
-    pub maxmemory: usize,
+    /// Maximum memory in bytes.
+    ///
+    /// G1 memory guardrail (design-for-failure against unbounded keyspace
+    /// growth → OOM kill):
+    /// - **flag omitted** (`None`) → Moon auto-caps at ~80% of the detected
+    ///   memory limit (cgroup-aware on Linux, host RAM otherwise) and switches
+    ///   a `noeviction` policy to `allkeys-lru`, logging a startup notice.
+    /// - `--maxmemory 0` → explicitly UNLIMITED (Redis-compatible escape hatch).
+    /// - `--maxmemory N` → exact cap in bytes (honored verbatim).
+    ///
+    /// Resolved once at startup by [`ServerConfig::apply_memory_guardrail`];
+    /// downstream code reads the resolved `usize` from `RuntimeConfig`
+    /// (`0 = unlimited`).
+    #[arg(long)]
+    pub maxmemory: Option<usize>,
 
     /// Eviction policy when maxmemory is reached
     #[arg(long, default_value = "noeviction")]
@@ -652,10 +664,49 @@ impl ServerConfig {
             .unwrap_or(maxmemory / 4)
     }
 
+    /// Resolve the G1 memory guardrail, mutating `self` in place, and return
+    /// the [`GuardrailOutcome`] for the caller to log as a startup notice.
+    ///
+    /// MUST be called once at startup, after parsing and before
+    /// [`Self::to_runtime_config`]. Idempotent in effect: once `maxmemory` is
+    /// `Some`, re-calling returns `Explicit` and changes nothing.
+    pub fn apply_memory_guardrail(&mut self) -> GuardrailOutcome {
+        let detected = detect_memory_limit_bytes();
+        let outcome = resolve_memory_guardrail(
+            self.maxmemory,
+            &self.maxmemory_policy,
+            detected,
+            MAXMEMORY_GUARDRAIL_PERCENT,
+        );
+        match &outcome {
+            GuardrailOutcome::Applied {
+                cap_bytes,
+                policy_changed_to,
+                ..
+            } => {
+                self.maxmemory = Some(*cap_bytes);
+                if let Some(p) = policy_changed_to {
+                    self.maxmemory_policy = p.clone();
+                }
+            }
+            GuardrailOutcome::Explicit(_) => { /* operator set it; honor verbatim */ }
+            GuardrailOutcome::Skipped => {
+                // Omitted but no limit detectable → leave UNLIMITED but make it
+                // concrete so downstream sees the `0` sentinel, not `None`.
+                self.maxmemory = Some(0);
+            }
+        }
+        outcome
+    }
+
     /// Create a RuntimeConfig from this server config, copying mutable parameters.
+    ///
+    /// `maxmemory` resolves `None`/`Some(0)` → `0` (the downstream "unlimited"
+    /// sentinel). Call [`Self::apply_memory_guardrail`] BEFORE this if the G1
+    /// auto-guardrail should populate an unset `--maxmemory`.
     pub fn to_runtime_config(&self) -> RuntimeConfig {
         RuntimeConfig {
-            maxmemory: self.maxmemory,
+            maxmemory: self.maxmemory.unwrap_or(0),
             maxmemory_policy: self.maxmemory_policy.clone(),
             maxmemory_samples: self.maxmemory_samples,
             lfu_log_factor: 10,
@@ -675,6 +726,157 @@ impl ServerConfig {
             timeout: self.timeout,
             tcp_keepalive: self.tcp_keepalive,
         }
+    }
+}
+
+/// Fraction (percent) of the detected memory limit used as the G1 auto
+/// guardrail cap when `--maxmemory` is omitted. 80% leaves headroom for
+/// allocator fragmentation, page cache, and non-keyspace overhead.
+pub const MAXMEMORY_GUARDRAIL_PERCENT: u64 = 80;
+
+/// Result of resolving the G1 memory guardrail — drives the startup notice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GuardrailOutcome {
+    /// Operator set `--maxmemory` explicitly (including `0` = unlimited).
+    /// The value is honored verbatim; no guardrail applied.
+    Explicit(usize),
+    /// `--maxmemory` was omitted and a memory limit was detected: Moon
+    /// auto-capped at `cap_bytes` (`~PERCENT%` of `detected_limit_bytes`).
+    /// `policy_changed_to` is `Some` when a `noeviction` policy was switched
+    /// to an evicting one so the cap actually sheds memory instead of OOM-ing.
+    Applied {
+        cap_bytes: usize,
+        detected_limit_bytes: usize,
+        policy_changed_to: Option<String>,
+    },
+    /// `--maxmemory` was omitted but no memory limit could be detected (e.g.
+    /// non-Linux dev host, or `/proc`/`/sys` unreadable). Left UNLIMITED — the
+    /// caller warns the operator to set `--maxmemory` explicitly.
+    Skipped,
+}
+
+/// Parse the `MemTotal:` line of `/proc/meminfo` contents into bytes.
+/// Format: `MemTotal:       16384256 kB`. Pure for testability.
+///
+/// Only compiled where used: the Linux detector and the unit tests (avoids a
+/// dead-code warning on non-Linux non-test builds).
+#[cfg(any(target_os = "linux", test))]
+fn parse_meminfo_memtotal(contents: &str) -> Option<usize> {
+    for line in contents.lines() {
+        if let Some(rest) = line.strip_prefix("MemTotal:") {
+            let kb: usize = rest.split_whitespace().next()?.parse().ok()?;
+            return kb.checked_mul(1024);
+        }
+    }
+    None
+}
+
+/// Parse a cgroup memory-limit file's contents into a byte cap.
+///
+/// Handles cgroup v2 (`memory.max`: a number or the literal `max`) and v1
+/// (`memory.limit_in_bytes`: a number, with a near-`i64::MAX` "no limit"
+/// sentinel). Returns `None` for "unlimited". Pure for testability.
+#[cfg(any(target_os = "linux", test))]
+fn parse_cgroup_mem_max(contents: &str) -> Option<usize> {
+    let t = contents.trim();
+    if t.is_empty() || t == "max" {
+        return None;
+    }
+    let v: usize = t.parse().ok()?;
+    // cgroup v1 uses a huge page-rounded value (~i64::MAX) to mean "no limit".
+    if v >= (1usize << 62) {
+        return None;
+    }
+    Some(v)
+}
+
+/// Detect the effective memory limit in bytes: the minimum of the cgroup limit
+/// (v2 then v1) and host RAM. Linux-only; returns `None` elsewhere or when
+/// nothing is readable (the guardrail then fails open with a warning).
+#[cfg(target_os = "linux")]
+fn detect_memory_limit_bytes() -> Option<usize> {
+    let host = std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|c| parse_meminfo_memtotal(&c));
+    let cgroup = std::fs::read_to_string("/sys/fs/cgroup/memory.max")
+        .ok()
+        .and_then(|c| parse_cgroup_mem_max(&c))
+        .or_else(|| {
+            std::fs::read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes")
+                .ok()
+                .and_then(|c| parse_cgroup_mem_max(&c))
+        });
+    match (host, cgroup) {
+        (Some(h), Some(c)) => Some(h.min(c)),
+        (Some(h), None) => Some(h),
+        (None, Some(c)) => Some(c),
+        (None, None) => None,
+    }
+}
+
+/// Non-Linux: no portable, dependency-free memory-limit probe. The guardrail
+/// is skipped (operator sets `--maxmemory` explicitly on dev hosts). Production
+/// targets Linux per the platform policy.
+#[cfg(not(target_os = "linux"))]
+fn detect_memory_limit_bytes() -> Option<usize> {
+    None
+}
+
+/// Pure resolution of the guardrail decision (no I/O) for unit testing.
+fn resolve_memory_guardrail(
+    maxmemory: Option<usize>,
+    policy: &str,
+    detected_limit: Option<usize>,
+    percent: u64,
+) -> GuardrailOutcome {
+    if let Some(explicit) = maxmemory {
+        return GuardrailOutcome::Explicit(explicit);
+    }
+    match detected_limit {
+        Some(limit) if limit > 0 => {
+            // u128 intermediate avoids overflow on large-RAM hosts.
+            let cap = ((limit as u128 * percent as u128) / 100) as usize;
+            let policy_changed_to = (policy == "noeviction").then(|| "allkeys-lru".to_string());
+            GuardrailOutcome::Applied {
+                cap_bytes: cap,
+                detected_limit_bytes: limit,
+                policy_changed_to,
+            }
+        }
+        _ => GuardrailOutcome::Skipped,
+    }
+}
+
+/// Emit the G1 startup notice for a resolved guardrail outcome. Shared by the
+/// binary entry (`main`) and the embedded entry so the message is identical.
+pub fn log_memory_guardrail(outcome: GuardrailOutcome) {
+    match outcome {
+        GuardrailOutcome::Applied {
+            cap_bytes,
+            detected_limit_bytes,
+            policy_changed_to,
+        } => {
+            let policy_note = policy_changed_to
+                .map(|p| format!("; eviction policy set to '{p}'"))
+                .unwrap_or_default();
+            tracing::warn!(
+                "Memory guardrail: --maxmemory not set; auto-capping at {} bytes \
+                 (~{}% of detected {} bytes){}. Override with --maxmemory <bytes>, \
+                 or --maxmemory 0 for unlimited.",
+                cap_bytes,
+                MAXMEMORY_GUARDRAIL_PERCENT,
+                detected_limit_bytes,
+                policy_note
+            );
+        }
+        GuardrailOutcome::Skipped => {
+            tracing::warn!(
+                "Memory guardrail: --maxmemory not set and no memory limit could be \
+                 detected on this platform; running UNLIMITED. Set --maxmemory <bytes> \
+                 to bound keyspace growth and avoid OOM termination."
+            );
+        }
+        GuardrailOutcome::Explicit(_) => { /* operator chose; stay silent */ }
     }
 }
 
@@ -826,7 +1028,9 @@ mod tests {
     #[test]
     fn test_maxmemory_defaults() {
         let config = ServerConfig::parse_from::<[&str; 0], &str>([]);
-        assert_eq!(config.maxmemory, 0);
+        // G1: omitted flag parses to None (the auto-guardrail sentinel),
+        // distinct from an explicit `--maxmemory 0` (= unlimited).
+        assert_eq!(config.maxmemory, None);
         assert_eq!(config.maxmemory_policy, "noeviction");
         assert_eq!(config.maxmemory_samples, 5);
     }
@@ -842,9 +1046,102 @@ mod tests {
             "--maxmemory-samples",
             "10",
         ]);
-        assert_eq!(config.maxmemory, 1048576);
+        assert_eq!(config.maxmemory, Some(1048576));
         assert_eq!(config.maxmemory_policy, "allkeys-lru");
         assert_eq!(config.maxmemory_samples, 10);
+    }
+
+    #[test]
+    fn test_maxmemory_explicit_zero_is_unlimited() {
+        // The Redis escape hatch: explicit `--maxmemory 0` must stay unlimited
+        // and NOT trigger the guardrail.
+        let mut config = ServerConfig::parse_from(["moon", "--maxmemory", "0"]);
+        assert_eq!(config.maxmemory, Some(0));
+        let outcome = config.apply_memory_guardrail();
+        assert_eq!(outcome, GuardrailOutcome::Explicit(0));
+        assert_eq!(config.maxmemory, Some(0));
+        assert_eq!(config.to_runtime_config().maxmemory, 0);
+    }
+
+    // ── G1 pure resolution + parsing ──
+
+    #[test]
+    fn guardrail_applies_percent_and_flips_noeviction() {
+        let out = resolve_memory_guardrail(None, "noeviction", Some(1000), 80);
+        assert_eq!(
+            out,
+            GuardrailOutcome::Applied {
+                cap_bytes: 800,
+                detected_limit_bytes: 1000,
+                policy_changed_to: Some("allkeys-lru".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn guardrail_keeps_existing_evicting_policy() {
+        // Operator already chose an evicting policy → don't override it.
+        let out = resolve_memory_guardrail(None, "allkeys-lfu", Some(2000), 80);
+        assert_eq!(
+            out,
+            GuardrailOutcome::Applied {
+                cap_bytes: 1600,
+                detected_limit_bytes: 2000,
+                policy_changed_to: None,
+            }
+        );
+    }
+
+    #[test]
+    fn guardrail_explicit_value_is_honored() {
+        assert_eq!(
+            resolve_memory_guardrail(Some(4096), "noeviction", Some(1 << 30), 80),
+            GuardrailOutcome::Explicit(4096)
+        );
+    }
+
+    #[test]
+    fn guardrail_skipped_when_no_limit_detected() {
+        assert_eq!(
+            resolve_memory_guardrail(None, "noeviction", None, 80),
+            GuardrailOutcome::Skipped
+        );
+        // Zero/invalid detection also skips (fail open, never cap at 0-by-math).
+        assert_eq!(
+            resolve_memory_guardrail(None, "noeviction", Some(0), 80),
+            GuardrailOutcome::Skipped
+        );
+    }
+
+    #[test]
+    fn guardrail_skipped_outcome_leaves_unlimited() {
+        let mut config = ServerConfig::parse_from::<[&str; 0], &str>([]);
+        // Force the Skipped branch deterministically by resolving against a
+        // None detection (mirrors non-Linux / unreadable /proc).
+        let out = resolve_memory_guardrail(config.maxmemory, &config.maxmemory_policy, None, 80);
+        assert_eq!(out, GuardrailOutcome::Skipped);
+        // apply_* on Skipped must concretize to Some(0) = unlimited.
+        if let GuardrailOutcome::Skipped = out {
+            config.maxmemory = Some(0);
+        }
+        assert_eq!(config.to_runtime_config().maxmemory, 0);
+    }
+
+    #[test]
+    fn parse_meminfo_extracts_memtotal_bytes() {
+        let sample = "MemTotal:       16384256 kB\nMemFree:    1000 kB\n";
+        assert_eq!(parse_meminfo_memtotal(sample), Some(16_384_256 * 1024));
+        assert_eq!(parse_meminfo_memtotal("MemFree: 10 kB\n"), None);
+        assert_eq!(parse_meminfo_memtotal(""), None);
+    }
+
+    #[test]
+    fn parse_cgroup_max_handles_v1_v2_sentinels() {
+        assert_eq!(parse_cgroup_mem_max("2147483648\n"), Some(2_147_483_648));
+        assert_eq!(parse_cgroup_mem_max("max\n"), None); // v2 unlimited
+        assert_eq!(parse_cgroup_mem_max(""), None);
+        // v1 near-i64::MAX "no limit" sentinel.
+        assert_eq!(parse_cgroup_mem_max("9223372036854771712"), None);
     }
 
     #[test]

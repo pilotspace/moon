@@ -445,7 +445,8 @@ impl super::Shard {
         let page_cache: Option<PageCache> = if server_config.disk_offload_enabled() {
             // Default: pagecache_size_bytes returns configured size or maxmemory/4.
             // Split: 75% for 4KB frames, 25% for 64KB frames.
-            let budget = server_config.pagecache_size_bytes(server_config.maxmemory as u64);
+            let budget =
+                server_config.pagecache_size_bytes(server_config.maxmemory.unwrap_or(0) as u64);
             let num_4k = ((budget * 3 / 4) / 4096) as usize;
             let num_64k = ((budget / 4) / 65536) as usize;
             let num_4k = num_4k.max(64); // minimum 64 frames

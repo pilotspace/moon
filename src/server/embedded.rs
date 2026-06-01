@@ -84,6 +84,10 @@ pub async fn run_embedded(
         )
     })?;
 
+    // G1 memory guardrail: resolve --maxmemory before RuntimeConfig is built
+    // (matches the binary entry in main.rs).
+    crate::config::log_memory_guardrail(config.apply_memory_guardrail());
+
     // Resolve shard count (`0` => auto-detect core count, matches main.rs).
     if config.shards == 0 {
         config.shards = std::thread::available_parallelism()
