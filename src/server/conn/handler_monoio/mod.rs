@@ -1121,6 +1121,9 @@ pub(crate) async fn handle_connection_sharded_monoio<
                         }
                     };
                     // AOF only on actual success (:1). Matches handler_single.
+                    // H1 fix: durable path under `appendfsync=always`
+                    // awaits the writer's fsync ack before responding to
+                    // the client.
                     if matches!(response, Frame::Integer(1)) {
                         if let Some(ref pool) = ctx.aof_pool {
                             let serialized = aof::serialize_command(&frame);
@@ -1129,7 +1132,16 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                 ctx.shard_id,
                                 serialized.len(),
                             );
-                            pool.try_send_append(ctx.shard_id, lsn, serialized);
+                            if pool
+                                .try_send_append_durable(ctx.shard_id, lsn, serialized)
+                                .await
+                                .is_err()
+                            {
+                                responses.push(Frame::Error(bytes::Bytes::from_static(
+                                    b"ERR AOF fsync failed; write not durable",
+                                )));
+                                continue;
+                            }
                         }
                     }
                     responses.push(response);
@@ -1191,6 +1203,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                         };
                         // AOF only on actual success (:1). Matches handler_single
                         // — `:0` (key absent / dst exists w/o REPLACE) is a no-op.
+                        // H1: durable path awaits fsync under appendfsync=always.
                         if matches!(response, Frame::Integer(1)) {
                             if let Some(ref pool) = ctx.aof_pool {
                                 let serialized = aof::serialize_command(&frame);
@@ -1199,7 +1212,16 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                     ctx.shard_id,
                                     serialized.len(),
                                 );
-                                pool.try_send_append(ctx.shard_id, lsn, serialized);
+                                if pool
+                                    .try_send_append_durable(ctx.shard_id, lsn, serialized)
+                                    .await
+                                    .is_err()
+                                {
+                                    responses.push(Frame::Error(bytes::Bytes::from_static(
+                                        b"ERR AOF fsync failed; write not durable",
+                                    )));
+                                    continue;
+                                }
                             }
                         }
                         responses.push(response);
@@ -1510,7 +1532,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     let sample_latency = (conn.cmd_counter & 0xF) == 0;
                     let dispatch_start = sample_latency.then(std::time::Instant::now);
 
-                    let response = match result {
+                    let mut response = match result {
                         DispatchResult::Response(f) => f,
                         DispatchResult::Quit(f) => {
                             should_quit = true;
@@ -1544,7 +1566,13 @@ pub(crate) async fn handle_connection_sharded_monoio<
                         }
                     }
 
-                    // AOF logging for successful local writes
+                    // AOF logging for successful local writes.
+                    // H1: durable path awaits fsync under appendfsync=always.
+                    // On AOF failure we override `response` to an error
+                    // frame and skip downstream side-effects (tracking
+                    // invalidation, etc.) below — the client must see
+                    // the failure, not a silent inconsistency.
+                    let mut aof_failed = false;
                     if !matches!(response, Frame::Error(_)) && is_write {
                         if let Some(ref pool) = ctx.aof_pool {
                             let serialized = aof::serialize_command(&frame);
@@ -1553,8 +1581,23 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                 ctx.shard_id,
                                 serialized.len(),
                             );
-                            pool.try_send_append(ctx.shard_id, lsn, serialized);
+                            if pool
+                                .try_send_append_durable(ctx.shard_id, lsn, serialized)
+                                .await
+                                .is_err()
+                            {
+                                response = Frame::Error(bytes::Bytes::from_static(
+                                    b"ERR AOF fsync failed; write not durable",
+                                ));
+                                aof_failed = true;
+                            }
                         }
+                    }
+                    // Suppress downstream effects on AOF failure — the
+                    // client sees the error frame, no tracking churn.
+                    if aof_failed {
+                        responses.push(response);
+                        continue;
                     }
 
                     // Phase 166 (Plan 02): record VectorIntents from HSET auto-index
@@ -1968,7 +2011,23 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                     target,
                                     bytes.len(),
                                 );
-                                pool.try_send_append(target, lsn, bytes);
+                                // H1: durable path under appendfsync=always.
+                                if pool
+                                    .try_send_append_durable(target, lsn, bytes)
+                                    .await
+                                    .is_err()
+                                {
+                                    let err = Frame::Error(Bytes::from_static(
+                                        b"ERR AOF fsync failed; write not durable",
+                                    ));
+                                    let err = apply_resp3_conversion(
+                                        &cmd_name,
+                                        err,
+                                        conn.protocol_version,
+                                    );
+                                    responses[resp_idx] = err;
+                                    continue;
+                                }
                             }
                         }
                     }

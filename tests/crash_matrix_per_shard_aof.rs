@@ -13,6 +13,8 @@
 //! BGREWRITEAOF interleaving to step 9 + future steps):
 //!   - `--shards 2 --appendonly yes --appendfsync everysec` + SIGKILL
 //!     → ≥99% recover (everysec fsync window allows ≤1s loss).
+//!   - `--shards 2 --appendonly yes --appendfsync always` + SIGKILL
+//!     → 100% recover (every +OK must observe an fsync; H1 closure).
 //!
 //! Run with:
 //!   cargo build --release --features runtime-monoio,jemalloc
@@ -49,6 +51,10 @@ fn unique_dir(suffix: &str) -> std::path::PathBuf {
 }
 
 fn start_moon(port: u16, dir: &std::path::Path) -> Child {
+    start_moon_with_fsync(port, dir, "everysec")
+}
+
+fn start_moon_with_fsync(port: u16, dir: &std::path::Path, fsync: &str) -> Child {
     Command::new("./target/release/moon")
         .args([
             "--port",
@@ -58,7 +64,7 @@ fn start_moon(port: u16, dir: &std::path::Path) -> Child {
             "--appendonly",
             "yes",
             "--appendfsync",
-            "everysec",
+            fsync,
             // No `--unsafe-multishard-aof` — step 9 lifted the gate; this
             // test now validates that the default `--shards 2 --appendonly
             // yes` launch is crash-safe out of the box.
@@ -207,5 +213,75 @@ fn crash_01_lite_per_shard_aof_recovers_after_sigkill() {
     );
 
     // Successful run — clean up the temp dir.
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// CRASH-01-LITE-ALWAYS: H1 (in-flight loss) closure.
+///
+/// Under `appendfsync=always` the writer must fsync before the +OK is
+/// observable by the client. The integration plumbs `AppendSync` through
+/// the handlers (handler_monoio / handler_sharded) via
+/// `AofWriterPool::try_send_append_durable`, which awaits the writer's
+/// ack and converts AOF failure into `Frame::Error` so the client never
+/// sees +OK for an entry that was not durable.
+///
+/// This test SIGKILLs the server **without** any quiescing sleep — every
+/// +OK observed by the client must therefore be backed by an fsync on
+/// disk. Any data loss here proves the handler→writer ack handshake is
+/// broken.
+#[test]
+#[ignore] // Requires built release binary + redis-cli; run explicitly.
+fn crash_01_lite_always_per_shard_aof_recovers_after_sigkill() {
+    // Offset port so this test never collides with the everysec test
+    // when both run on the same dev host.
+    let port = unique_port().saturating_add(1);
+    let dir = unique_dir("crash01-always");
+    std::fs::create_dir_all(&dir).expect("create test dir");
+
+    // -- Round 1 --------------------------------------------------------
+    let mut child = start_moon_with_fsync(port, &dir, "always");
+    wait_for_port(port);
+
+    let mut expected: std::collections::HashMap<String, String> =
+        std::collections::HashMap::with_capacity(KEY_COUNT);
+    for i in 0..KEY_COUNT {
+        let tag = if i % 2 == 0 { "a" } else { "b" };
+        let key = format!("crash:{{{}}}:{}", tag, i);
+        let value = format!("v-{}", i);
+        // SET only returns +OK after the writer fsyncs under Always.
+        redis_set(port, &key, &value);
+        expected.insert(key, value);
+    }
+
+    // NO quiescing sleep — H1 contract is that each +OK already saw fsync.
+    sigkill(&mut child);
+
+    // -- Round 2 (recovery) ---------------------------------------------
+    let mut child2 = start_moon_with_fsync(port, &dir, "always");
+    wait_for_port(port);
+
+    let mut missing: Vec<String> = Vec::new();
+    let mut mismatched: Vec<String> = Vec::new();
+    for (key, want) in &expected {
+        match redis_get(port, key) {
+            None => missing.push(key.clone()),
+            Some(got) if got != *want => {
+                mismatched.push(format!("{}: want={} got={}", key, want, got))
+            }
+            Some(_) => {}
+        }
+    }
+
+    sigkill(&mut child2);
+
+    assert!(
+        missing.is_empty() && mismatched.is_empty(),
+        "CRASH-01-LITE-ALWAYS: {} missing, {} mismatched. Sample missing: {:?}, sample mismatched: {:?}",
+        missing.len(),
+        mismatched.len(),
+        missing.iter().take(5).collect::<Vec<_>>(),
+        mismatched.iter().take(5).collect::<Vec<_>>(),
+    );
+
     let _ = std::fs::remove_dir_all(&dir);
 }

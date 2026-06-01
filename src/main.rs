@@ -406,7 +406,7 @@ fn main() -> anyhow::Result<()> {
                 "AOF enabled (PerShard, {} writers, fsync: {:?})",
                 num_shards, fsync
             );
-            Some(AofWriterPool::per_shard(senders))
+            Some(AofWriterPool::per_shard_with_policy(senders, fsync))
         } else {
             let (tx, rx) = channel::mpsc_bounded::<AofMessage>(10_000);
             let aof_token = cancel_token.child_token();
@@ -423,7 +423,7 @@ fn main() -> anyhow::Result<()> {
                 })
                 .expect("failed to spawn AOF writer thread");
             info!("AOF enabled (TopLevel, fsync: {:?})", fsync);
-            Some(AofWriterPool::top_level(tx))
+            Some(AofWriterPool::top_level_with_policy(tx, fsync))
         }
     } else {
         None

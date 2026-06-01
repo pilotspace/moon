@@ -1152,6 +1152,21 @@ pub(crate) fn try_inline_dispatch(
         return 0;
     }
 
+    // H1: under `appendfsync=always` we MUST fsync before +OK. The inline
+    // SET path is synchronous and cannot await the writer's ack, so
+    // refuse to inline writes when Always is in effect. GETs and other
+    // read-only commands are fine to inline. The non-inline dispatch
+    // path (handler_monoio/handler_sharded) uses
+    // `AofWriterPool::try_send_append_durable` and awaits the ack.
+    if let Some(pool) = aof_pool {
+        if pool.fsync_policy() == crate::persistence::aof::FsyncPolicy::Always
+            && buf[1] == b'3'
+        // SET shape (*3 ...); GETs (*2) are still safe to inline.
+        {
+            return 0;
+        }
+    }
+
     // Parse array count: only *2 (GET) and *3 (SET plain) are inlined.
     let argc = buf[1];
     if buf[2] != b'\r' || buf[3] != b'\n' {

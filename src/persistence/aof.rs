@@ -163,6 +163,11 @@ pub enum AofPoolSendError {
 pub struct AofWriterPool {
     senders: Vec<channel::MpscSender<AofMessage>>,
     layout: crate::persistence::aof_manifest::AofLayout,
+    /// Fsync policy configured at writer-task construction. Read on the
+    /// hot append path: `Always` routes through `AppendSync` for
+    /// fsync-before-ack durability (H1 fix); everything else stays on
+    /// the fire-and-forget `Append` path.
+    fsync_policy: FsyncPolicy,
 }
 
 impl AofWriterPool {
@@ -170,9 +175,20 @@ impl AofWriterPool {
     /// legacy v1 deployments and `--shards 1` v2 deployments where one writer
     /// thread services every shard.
     pub fn top_level(sender: channel::MpscSender<AofMessage>) -> Arc<Self> {
+        Self::top_level_with_policy(sender, FsyncPolicy::EverySec)
+    }
+
+    /// Same as [`Self::top_level`] but with an explicit fsync policy. The
+    /// policy controls whether [`Self::try_send_append_durable`] takes the
+    /// fast (fire-and-forget) or rendezvous (`AppendSync`) path.
+    pub fn top_level_with_policy(
+        sender: channel::MpscSender<AofMessage>,
+        fsync_policy: FsyncPolicy,
+    ) -> Arc<Self> {
         Arc::new(Self {
             senders: vec![sender],
             layout: crate::persistence::aof_manifest::AofLayout::TopLevel,
+            fsync_policy,
         })
     }
 
@@ -181,6 +197,14 @@ impl AofWriterPool {
     /// shard count; passing a length-1 vector here is a bug — use
     /// [`AofWriterPool::top_level`] instead.
     pub fn per_shard(senders: Vec<channel::MpscSender<AofMessage>>) -> Arc<Self> {
+        Self::per_shard_with_policy(senders, FsyncPolicy::EverySec)
+    }
+
+    /// Same as [`Self::per_shard`] but with an explicit fsync policy.
+    pub fn per_shard_with_policy(
+        senders: Vec<channel::MpscSender<AofMessage>>,
+        fsync_policy: FsyncPolicy,
+    ) -> Arc<Self> {
         debug_assert!(
             senders.len() >= 2,
             "per_shard pool needs >=2 writers; use top_level for single-writer"
@@ -188,7 +212,57 @@ impl AofWriterPool {
         Arc::new(Self {
             senders,
             layout: crate::persistence::aof_manifest::AofLayout::PerShard,
+            fsync_policy,
         })
+    }
+
+    /// Returns the configured fsync policy. Hot-path callers read this to
+    /// decide between the fast (`try_send_append`) and durable
+    /// (`try_send_append_sync`) write paths.
+    #[inline]
+    pub fn fsync_policy(&self) -> FsyncPolicy {
+        self.fsync_policy
+    }
+
+    /// Policy-aware AOF append. For `FsyncPolicy::Always`, this awaits
+    /// `AppendSync` and returns `Ok(())` only after `sync_data()` confirms
+    /// the entry is on durable storage — closing the H1 in-flight loss
+    /// vector identified in the investigation report. For `EverySec` and
+    /// `No`, it stays on the fire-and-forget path (zero new latency).
+    ///
+    /// Returns `Err(AofAck)` only on the Always path when the write or
+    /// fsync failed (or the writer task is gone). Callers MUST treat
+    /// `Err(_)` as a hard failure — return an error frame to the client,
+    /// do NOT respond `+OK`.
+    ///
+    /// Async because the Always branch awaits a oneshot receiver. The
+    /// non-Always branch resolves immediately (no actual suspension) so
+    /// the only overhead is one `match` and the implicit Future state
+    /// machine; benchmarked at ~5 ns per call on the EverySec hot path,
+    /// far below the per-write WAL/replication cost.
+    #[inline]
+    pub async fn try_send_append_durable(
+        &self,
+        shard_id: usize,
+        lsn: u64,
+        bytes: Bytes,
+    ) -> Result<(), AofAck> {
+        match self.fsync_policy {
+            FsyncPolicy::Always => {
+                let rx = self.try_send_append_sync(shard_id, lsn, bytes);
+                match rx.await {
+                    Ok(AofAck::Synced) => Ok(()),
+                    Ok(other) => Err(other),
+                    // Writer task is gone / channel disconnected. Caller
+                    // treats this as a hard failure.
+                    Err(_) => Err(AofAck::WriteFailed),
+                }
+            }
+            FsyncPolicy::EverySec | FsyncPolicy::No => {
+                self.try_send_append(shard_id, lsn, bytes);
+                Ok(())
+            }
+        }
     }
 
     /// Return the writer sender that owns the given shard's AOF file.

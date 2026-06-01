@@ -19,7 +19,6 @@ use crate::command::connection as conn_cmd;
 use crate::command::metadata;
 use crate::command::{DispatchResult, dispatch, dispatch_read};
 use crate::config::{RuntimeConfig, ServerConfig};
-use crate::persistence::aof::AofMessage;
 use crate::protocol::Frame;
 use crate::pubsub::subscriber::Subscriber;
 use crate::pubsub::{self, PubSubRegistry};
@@ -890,15 +889,13 @@ pub async fn handle_connection(
                             // Send AOF entries accumulated so far
                             for bytes in aof_entries.drain(..) {
                                 if let Some(ref pool) = aof_pool {
-                                    // Single-shard mode (shard_id = 0). send_async
-                                    // preserves back-pressure semantics from the
-                                    // pre-pool code; the pool's TopLevel layout
-                                    // routes to the same single writer.
+                                    // Single-shard mode (shard_id = 0). Routes via the
+                                    // pool's TopLevel layout to the same single writer.
+                                    // `try_send_append_durable` awaits the writer's
+                                    // fsync ack under `appendfsync=always` (H1 closure)
+                                    // and is fire-and-forget for everysec/no.
                                     let lsn = crate::persistence::aof::AofWriterPool::issue_append_lsn(&repl_state, 0, bytes.len());
-                                    let _ = pool
-                                        .sender(0)
-                                        .send_async(AofMessage::Append { lsn, bytes })
-                                        .await;
+                                    let _ = pool.try_send_append_durable(0, lsn, bytes).await;
                                 }
                                 if let Some(ref counter) = change_counter {
                                     counter.fetch_add(1, Ordering::Relaxed);
@@ -1531,12 +1528,13 @@ pub async fn handle_connection(
                                     for record in wal_records {
                                         if let Some(ref pool) = aof_pool {
                                             // Single-shard mode (shard_id = 0).
+                                            // `try_send_append_durable` awaits writer
+                                            // ack under `appendfsync=always` (H1
+                                            // closure) and is fire-and-forget for
+                                            // everysec/no.
                                             let bytes = bytes::Bytes::from(record);
                                             let lsn = crate::persistence::aof::AofWriterPool::issue_append_lsn(&repl_state, 0, bytes.len());
-                                            let _ = pool
-                                                .sender(0)
-                                                .send_async(AofMessage::Append { lsn, bytes })
-                                                .await;
+                                            let _ = pool.try_send_append_durable(0, lsn, bytes).await;
                                         }
                                         if let Some(ref counter) = change_counter {
                                             counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2256,15 +2254,18 @@ pub async fn handle_connection(
                 }
 
                 // --- Send AOF entries OUTSIDE the lock ---
+                // `try_send_append_durable` awaits the writer's fsync ack under
+                // `appendfsync=always` (H1 closure) and is fire-and-forget for
+                // everysec/no. NOTE: single-shard handler still flushes
+                // responses BEFORE AOF (see line ~2250), so Always semantics
+                // are partial here — full pre-response durability for the
+                // single-shard path is tracked as a follow-up; multi-shard
+                // (handler_monoio / handler_sharded) does enforce the
+                // pre-response ack.
                 for bytes in aof_entries {
                     if let Some(ref pool) = aof_pool {
-                        // Single-shard mode (shard_id = 0). send_async preserves
-                        // back-pressure semantics from the pre-pool code.
                         let lsn = crate::persistence::aof::AofWriterPool::issue_append_lsn(&repl_state, 0, bytes.len());
-                        let _ = pool
-                            .sender(0)
-                            .send_async(AofMessage::Append { lsn, bytes })
-                            .await;
+                        let _ = pool.try_send_append_durable(0, lsn, bytes).await;
                     }
                     if let Some(ref counter) = change_counter {
                         counter.fetch_add(1, Ordering::Relaxed);

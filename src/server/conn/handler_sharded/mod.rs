@@ -1170,11 +1170,21 @@ pub(crate) async fn handle_connection_sharded_inner<
                             };
                             // AOF only on actual success (:1). Matches handler_single
                             // — `:0` (key absent) is a no-op and must not log.
+                            // H1: durable path awaits fsync under appendfsync=always.
                             if matches!(response, Frame::Integer(1)) {
                                 if let Some(ref bytes) = aof_bytes {
                                     if let Some(ref pool) = ctx.aof_pool {
                                         let lsn = aof::AofWriterPool::issue_append_lsn(&ctx.repl_state, ctx.shard_id, bytes.len());
-                                        pool.try_send_append(ctx.shard_id, lsn, bytes.clone());
+                                        if pool
+                                            .try_send_append_durable(ctx.shard_id, lsn, bytes.clone())
+                                            .await
+                                            .is_err()
+                                        {
+                                            responses.push(Frame::Error(Bytes::from_static(
+                                                b"ERR AOF fsync failed; write not durable",
+                                            )));
+                                            continue;
+                                        }
                                     }
                                 }
                             }
@@ -1217,11 +1227,21 @@ pub(crate) async fn handle_connection_sharded_inner<
                                 };
                                 // AOF only on actual success (:1). Matches handler_single
                                 // — `:0` (key absent / dst exists w/o REPLACE) is a no-op.
+                                // H1: durable path awaits fsync under appendfsync=always.
                                 if matches!(response, Frame::Integer(1)) {
                                     if let Some(ref bytes) = aof_bytes {
                                         if let Some(ref pool) = ctx.aof_pool {
                                             let lsn = aof::AofWriterPool::issue_append_lsn(&ctx.repl_state, ctx.shard_id, bytes.len());
-                                            pool.try_send_append(ctx.shard_id, lsn, bytes.clone());
+                                            if pool
+                                                .try_send_append_durable(ctx.shard_id, lsn, bytes.clone())
+                                                .await
+                                                .is_err()
+                                            {
+                                                responses.push(Frame::Error(Bytes::from_static(
+                                                    b"ERR AOF fsync failed; write not durable",
+                                                )));
+                                                continue;
+                                            }
                                         }
                                     }
                                 }
@@ -1321,7 +1341,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                                 r
                             };
 
-                            let (response, _sample_latency, dispatch_start): (Frame, bool, Option<std::time::Instant>) =
+                            let (mut response, _sample_latency, dispatch_start): (Frame, bool, Option<std::time::Instant>) =
                                 match write_outcome {
                                     Ok(t) => t,
                                     Err(oom_frame) => {
@@ -1431,13 +1451,28 @@ pub(crate) async fn handle_connection_sharded_inner<
                                     }
                                 }
                             }
+                            // H1: durable path under appendfsync=always.
+                            let mut aof_failed = false;
                             if let Some(bytes) = aof_bytes {
                                 if !matches!(response, Frame::Error(_)) {
                                     if let Some(ref pool) = ctx.aof_pool {
                                         let lsn = aof::AofWriterPool::issue_append_lsn(&ctx.repl_state, ctx.shard_id, bytes.len());
-                                        pool.try_send_append(ctx.shard_id, lsn, bytes);
+                                        if pool
+                                            .try_send_append_durable(ctx.shard_id, lsn, bytes)
+                                            .await
+                                            .is_err()
+                                        {
+                                            response = Frame::Error(Bytes::from_static(
+                                                b"ERR AOF fsync failed; write not durable",
+                                            ));
+                                            aof_failed = true;
+                                        }
                                     }
                                 }
+                            }
+                            if aof_failed {
+                                responses.push(response);
+                                continue;
                             }
                             if conn.tracking_state.enabled && !matches!(response, Frame::Error(_)) {
                                 if let Some(key) = cmd_args.first().and_then(|f| extract_bytes(f)) {
@@ -1662,16 +1697,26 @@ pub(crate) async fn handle_connection_sharded_inner<
                             // pre-existing routing bug that motivated the per-shard AOF
                             // RFC (Option B): under TopLevel a single writer absorbed
                             // every cross-shard append, masking the wrong-owner write.
+                            let mut resp_final = resp;
                             if let Some(bytes) = aof_bytes {
-                                if !matches!(resp, Frame::Error(_)) {
+                                if !matches!(resp_final, Frame::Error(_)) {
                                     if let Some(ref pool) = ctx.aof_pool {
                                         // Cross-shard: LSN sourced for `target`.
                                         let lsn = aof::AofWriterPool::issue_append_lsn(&ctx.repl_state, target, bytes.len());
-                                        pool.try_send_append(target, lsn, bytes);
+                                        // H1: durable path under appendfsync=always.
+                                        if pool
+                                            .try_send_append_durable(target, lsn, bytes)
+                                            .await
+                                            .is_err()
+                                        {
+                                            resp_final = Frame::Error(Bytes::from_static(
+                                                b"ERR AOF fsync failed; write not durable",
+                                            ));
+                                        }
                                     }
                                 }
                             }
-                            responses[resp_idx] = apply_resp3_conversion(&cmd_name, resp, proto_ver);
+                            responses[resp_idx] = apply_resp3_conversion(&cmd_name, resp_final, proto_ver);
                         }
                     }
                 }
