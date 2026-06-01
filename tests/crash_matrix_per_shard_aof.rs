@@ -17,14 +17,15 @@
 //!     → 100% recover (every +OK must observe an fsync; H1 closure).
 //!
 //! Run with:
-//!   cargo build --release --features runtime-monoio,jemalloc
-//!   cargo test --release --features runtime-monoio,jemalloc \
+//!   cargo build --release --no-default-features --features runtime-tokio,jemalloc
+//!   cargo test --release --no-default-features --features runtime-tokio,jemalloc \
 //!     --test crash_matrix_per_shard_aof -- --ignored
 //!
-//! Requires: built release binary, `redis-cli` on PATH, monoio runtime
-//! (PerShard AOF currently only ships on monoio).
+//! Requires: built release binary, `redis-cli` on PATH.
+//! Both runtime-tokio and runtime-monoio binaries support PerShard AOF
+//! (per_shard_aof_writer_task has implementations for both runtimes).
 
-#![cfg(feature = "runtime-monoio")]
+#![cfg(any(feature = "runtime-monoio", feature = "runtime-tokio"))]
 
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
