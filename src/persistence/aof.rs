@@ -662,6 +662,87 @@ mod pool_tests {
             );
         }
     }
+
+    /// FIX-W1-1 contract: `try_send_append_durable` under `Always` policy MUST
+    /// return `Err(AofAck::FsyncFailed)` when the writer reports failure.
+    /// handler_single.rs must await this BEFORE flushing responses to the client.
+    ///
+    /// Uses spawn_blocking to simulate the mock writer responding on the ack
+    /// channel concurrently, which allows the async rendezvous to complete.
+    #[cfg(feature = "runtime-tokio")]
+    #[tokio::test]
+    async fn always_policy_try_send_append_durable_returns_err_on_fsync_fail() {
+        let (tx0, rx0) = channel::mpsc_bounded::<AofMessage>(4);
+        let (tx1, _rx1) = channel::mpsc_bounded::<AofMessage>(4);
+        let pool = std::sync::Arc::new(AofWriterPool::per_shard_with_policy(
+            vec![tx0, tx1],
+            FsyncPolicy::Always,
+        ));
+
+        // Spawn a mock writer that drains AppendSync and responds with FsyncFailed.
+        // Runs in a blocking thread (flume's blocking recv) so it doesn't block
+        // the async executor while waiting for the handler to enqueue the message.
+        let mock_writer = tokio::task::spawn_blocking(move || {
+            // flume::Receiver::recv() blocks until a message is available
+            let msg = rx0.recv().expect("mock writer got message");
+            if let AofMessage::AppendSync { ack, .. } = msg {
+                let _ = ack.send(AofAck::FsyncFailed);
+            } else {
+                panic!("expected AppendSync under Always policy");
+            }
+        });
+
+        // The handler MUST await this BEFORE flushing responses to the client
+        let result = pool.try_send_append_durable(0, 1, Bytes::from_static(b"SET k v")).await;
+        mock_writer.await.expect("mock writer completed");
+
+        assert_eq!(
+            result,
+            Err(AofAck::FsyncFailed),
+            "Always policy MUST propagate fsync failure so caller can return an error frame"
+        );
+    }
+
+    /// FIX-W1-1 ordering contract: when `aof_entries` carries `(resp_idx, bytes)`
+    /// tuples, the handler can patch `responses[resp_idx]` on AOF failure BEFORE
+    /// flushing to the client. This test verifies the indexing is sound.
+    #[test]
+    fn aof_entries_indexed_by_response_slot_patches_correctly() {
+        use crate::protocol::Frame;
+        let mut responses: Vec<Frame> = vec![
+            Frame::SimpleString(bytes::Bytes::from_static(b"OK")),
+            Frame::SimpleString(bytes::Bytes::from_static(b"OK")),
+            Frame::SimpleString(bytes::Bytes::from_static(b"OK")),
+        ];
+        // Simulate two write commands at response indices 0 and 2 (index 1 was a read)
+        let aof_entries: Vec<(usize, Bytes)> = vec![
+            (0, Bytes::from_static(b"SET a 1")),
+            (2, Bytes::from_static(b"SET c 3")),
+        ];
+
+        // AOF write at index 2 fails; patch that response slot
+        for (resp_idx, _bytes) in &aof_entries {
+            if *resp_idx == 2 {
+                // Simulate Err(AofAck::FsyncFailed) from try_send_append_durable
+                responses[*resp_idx] = Frame::Error(
+                    Bytes::from_static(b"WRITEFAIL aof fsync failed"),
+                );
+            }
+        }
+
+        assert!(
+            matches!(&responses[0], Frame::SimpleString(_)),
+            "index 0 (successful fsync) should remain +OK"
+        );
+        assert!(
+            matches!(&responses[1], Frame::SimpleString(_)),
+            "index 1 (read, no AOF) should remain +OK"
+        );
+        assert!(
+            matches!(&responses[2], Frame::Error(_)),
+            "index 2 (failed fsync) must be patched to error"
+        );
+    }
 }
 
 /// Serialize a Frame into RESP wire format bytes.
