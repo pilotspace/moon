@@ -2119,6 +2119,68 @@ mod tests_v2 {
         assert_eq!(replayed, 0);
     }
 
+    /// FIX-W3-3: torn cross-shard commit must be DROPPED entirely, not partially applied.
+    ///
+    /// Synthesize a 2-shard AOF where LSN 100 appears on shard 0 only (N=1
+    /// of K=2 expected). After replay, shard 0 must NOT have the key written
+    /// by the LSN-100 entry (it was dropped for atomicity).
+    #[test]
+    fn replay_ordered_merge_drops_torn_commit() {
+        use crate::persistence::replay::DispatchReplayEngine;
+
+        // Two shards, two complete entries at LSN 10 (one per shard) — these
+        // should succeed. LSN 100 appears only on shard 0 (torn) — must be dropped.
+        let entries = vec![
+            // Complete pair: LSN 10 on both shards
+            OrderedEntry {
+                shard_id: 0,
+                lsn: 10,
+                bytes: bytes::Bytes::from_static(
+                    b"*3\r\n$3\r\nSET\r\n$2\r\nc0\r\n$1\r\n1\r\n",
+                ),
+            },
+            OrderedEntry {
+                shard_id: 1,
+                lsn: 10,
+                bytes: bytes::Bytes::from_static(
+                    b"*3\r\n$3\r\nSET\r\n$2\r\nc1\r\n$1\r\n1\r\n",
+                ),
+            },
+            // Torn entry: LSN 100 only on shard 0, not shard 1
+            OrderedEntry {
+                shard_id: 0,
+                lsn: 100,
+                bytes: bytes::Bytes::from_static(
+                    b"*3\r\n$3\r\nSET\r\n$5\r\ntorn0\r\n$1\r\nv\r\n",
+                ),
+            },
+        ];
+
+        let mut shard0: Vec<crate::storage::Database> =
+            vec![crate::storage::Database::new()];
+        let mut shard1: Vec<crate::storage::Database> =
+            vec![crate::storage::Database::new()];
+        let replayed = {
+            let mut slices: Vec<&mut [crate::storage::Database]> =
+                vec![&mut shard0, &mut shard1];
+            replay_ordered_merge(&mut slices, entries, &DispatchReplayEngine::new())
+                .expect("ordered merge replay")
+        };
+
+        // The torn LSN-100 entry must NOT be applied (dropped for atomicity).
+        assert_eq!(replayed, 2, "only the complete LSN-10 pair is replayed");
+        assert_eq!(
+            shard0[0].len(),
+            1,
+            "shard-0 only has the complete LSN-10 key; torn LSN-100 entry must not be applied"
+        );
+        // Verify the torn key is absent
+        assert!(
+            shard0[0].get(b"torn0").is_none(),
+            "torn shard-0 entry (LSN 100) must NOT be applied"
+        );
+    }
+
     #[test]
     fn ordered_entry_lsn_flag_set_via_try_send_append_ordered() {
         use crate::persistence::aof::{AofMessage, AofWriterPool, ORDERED_LSN_FLAG};
