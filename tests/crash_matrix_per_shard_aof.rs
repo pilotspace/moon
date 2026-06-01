@@ -59,7 +59,9 @@ fn start_moon(port: u16, dir: &std::path::Path) -> Child {
             "yes",
             "--appendfsync",
             "everysec",
-            "--unsafe-multishard-aof",
+            // No `--unsafe-multishard-aof` — step 9 lifted the gate; this
+            // test now validates that the default `--shards 2 --appendonly
+            // yes` launch is crash-safe out of the box.
             "--dir",
         ])
         .arg(dir)

@@ -270,22 +270,23 @@ fn main() -> anyhow::Result<()> {
 
     info!("Starting with {} shards", num_shards);
 
-    // P0-FIX-01b: refuse to start under the known durability bug
-    // (`shards >= 2 + appendonly yes` loses ~50 % of writes on SIGKILL,
-    //  verified 2026-05-26 on HEAD `6e49050`; reproducer in
-    //  `tmp/p0-no-rewrite.sh` and `tmp/p0-always.sh`).  The bug is
-    // independent of `--appendfsync` and `--disk-offload` settings.  An
-    // operator can override via `--unsafe-multishard-aof` if the
-    // deployment is cache-only and the loss window is acceptable.
-    if num_shards >= 2 && config.appendonly == "yes" && !config.unsafe_multishard_aof {
-        eprintln!(
-            "REFUSING TO START: --shards {num_shards} + --appendonly yes has a known data-loss \
-             bug on SIGKILL (~50 % loss verified 2026-05-26). Fix: use --shards 1, or pass \
-             --appendonly no for cache-only deployments, or pass --unsafe-multishard-aof to \
-             acknowledge the risk and start anyway. See \
-             docs/runbooks/multi-shard-aof-rewrite.md."
+    // P0-FIX-01b LIFTED (Option B step 9, 2026-06-01): the per-shard AOF
+    // pipeline (RFC steps 1-8) makes `--shards >= 2 + --appendonly yes`
+    // crash-safe. CRASH-01-LITE confirms 200/200 keys recover after
+    // SIGKILL on a 2-shard everysec config; manual disk inspection shows
+    // framed `[u64 lsn LE][u32 len LE][RESP]` entries in each shard's
+    // file. The startup refusal is no longer needed.
+    //
+    // `--unsafe-multishard-aof` is preserved as a no-op flag so existing
+    // operator runbooks and CI command lines do not break — the flag
+    // emits a one-line info notice if explicitly set, then proceeds as
+    // if it were not. Removing the flag entirely is a future cleanup
+    // once dependents have been audited.
+    if num_shards >= 2 && config.appendonly == "yes" && config.unsafe_multishard_aof {
+        info!(
+            "--unsafe-multishard-aof is now a no-op (per-shard AOF is crash-safe as of v0.1.12; \
+             CRASH-01-LITE green). You can remove the flag from your launch command."
         );
-        std::process::exit(2);
     }
 
     // T1.1: warn when maxclients < 25 × shards (undersubscription footgun).
