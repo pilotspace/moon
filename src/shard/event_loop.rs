@@ -1130,6 +1130,7 @@ impl super::Shard {
                                 server_config.graph_merge_max_segments,
                                 server_config.graph_dead_edge_trigger,
                                 &mut autovacuum_daemon,
+                                aof_pool.as_ref(),  // FIX-W1-2
                             );
                         });
                     } else {
@@ -1145,6 +1146,7 @@ impl super::Shard {
                             server_config.graph_merge_max_segments,
                             server_config.graph_dead_edge_trigger,
                             &mut autovacuum_daemon,
+                            aof_pool.as_ref(),  // FIX-W1-2
                         );
                     }
                     // MA5: persist maintenance schedule when modified by RECLAMATION SCHEDULE.
@@ -1227,6 +1229,7 @@ impl super::Shard {
                                 server_config.graph_merge_max_segments,
                                 server_config.graph_dead_edge_trigger,
                                 &mut autovacuum_daemon,
+                                aof_pool.as_ref(),  // FIX-W1-2
                             );
                         });
                     } else {
@@ -1242,6 +1245,7 @@ impl super::Shard {
                             server_config.graph_merge_max_segments,
                             server_config.graph_dead_edge_trigger,
                             &mut autovacuum_daemon,
+                            aof_pool.as_ref(),  // FIX-W1-2
                         );
                     }
                     // MA5: persist maintenance schedule when modified by RECLAMATION SCHEDULE.
@@ -1858,6 +1862,7 @@ impl super::Shard {
                             server_config.graph_merge_max_segments,
                             server_config.graph_dead_edge_trigger,
                             &mut autovacuum_daemon,
+                            aof_pool.as_ref(),  // FIX-W1-2
                         );
                     });
                 } else {
@@ -1884,6 +1889,7 @@ impl super::Shard {
                         server_config.graph_merge_max_segments,
                         server_config.graph_dead_edge_trigger,
                         &mut autovacuum_daemon,
+                        aof_pool.as_ref(),  // FIX-W1-2
                     );
                 }
                 if !pending_cdc_subscribes.is_empty() {
