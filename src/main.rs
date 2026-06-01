@@ -282,10 +282,11 @@ fn main() -> anyhow::Result<()> {
     // emits a one-line info notice if explicitly set, then proceeds as
     // if it were not. Removing the flag entirely is a future cleanup
     // once dependents have been audited.
-    if num_shards >= 2 && config.appendonly == "yes" && config.unsafe_multishard_aof {
-        info!(
-            "--unsafe-multishard-aof is now a no-op (per-shard AOF is crash-safe as of v0.1.12; \
-             CRASH-01-LITE green). You can remove the flag from your launch command."
+    if config.unsafe_multishard_aof {
+        tracing::warn!(
+            "[DEPRECATED] --unsafe-multishard-aof is a no-op and will be removed in v0.2. \
+             Per-shard AOF is crash-safe as of PR #129 (CRASH-01-LITE: 200/200). \
+             Remove this flag from your launch command or systemd unit."
         );
     }
 
