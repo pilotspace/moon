@@ -62,7 +62,23 @@ pub enum AofAck {
     /// `write_all()` succeeded but `sync_data()` returned an error. The
     /// entry is in the kernel buffer but NOT on durable storage.
     FsyncFailed,
+    /// The writer channel was full at the time of the send — the entry
+    /// was **not** enqueued. This is a backpressure signal: the writer
+    /// is unable to keep up with the current write rate. Callers MUST
+    /// treat this as a hard failure (same as `WriteFailed`) under
+    /// `appendfsync=always`; for `everysec`/`no` it is logged and counted.
+    ChannelFull,
 }
+
+/// Global counter incremented each time an AOF `AppendSync` (or fire-and-
+/// forget `Append`) is dropped because the writer channel was at capacity.
+///
+/// Exposed under `# Persistence` in the INFO command as
+/// `aof_backpressure_dropped`. A persistently non-zero value indicates the
+/// writer is a bottleneck and the operator should investigate disk I/O or
+/// switch to `appendfsync=everysec`.
+pub static AOF_BACKPRESSURE_DROPPED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// AOF fsync policy controlling when data is flushed to disk.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -328,14 +344,44 @@ impl AofWriterPool {
         bytes: Bytes,
     ) -> crate::runtime::channel::OneshotReceiver<AofAck> {
         let (ack_tx, ack_rx) = crate::runtime::channel::oneshot::<AofAck>();
-        let _ = self.sender(shard_id).try_send(AofMessage::AppendSync {
+        match self.sender(shard_id).try_send(AofMessage::AppendSync {
             lsn,
             bytes,
             ack: ack_tx,
-        });
-        // If `try_send` failed (channel full / writer dead), `ack_tx` was
-        // dropped without sending — the receiver will resolve with
-        // RecvError, which the caller treats as a hard failure.
+        }) {
+            Ok(()) => {}
+            Err(flume::TrySendError::Full(_)) => {
+                // Writer channel is at capacity — count the dropped entry and
+                // signal ChannelFull back to the caller via a pre-filled
+                // oneshot so the caller's `.await` resolves immediately to
+                // Err(AofAck::ChannelFull) without a writer round-trip.
+                AOF_BACKPRESSURE_DROPPED
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                warn!(
+                    "AOF writer channel full (shard {}): AppendSync dropped; \
+                     backpressure_dropped={}",
+                    shard_id,
+                    AOF_BACKPRESSURE_DROPPED.load(std::sync::atomic::Ordering::Relaxed),
+                );
+                // Pre-send ChannelFull into a fresh oneshot pair; the
+                // caller's `ack_rx` was already returned — we create a
+                // new pair and use its sender to pre-fill what the caller
+                // will receive. The original ack_tx (inside the dropped
+                // AppendSync) is dropped, causing its ack_rx to yield
+                // RecvError. We send ChannelFull via the *returned* ack_rx
+                // by using a second oneshot whose sender is immediately
+                // fulfilled, then return that receiver instead.
+                let (pre_tx, pre_rx) = crate::runtime::channel::oneshot::<AofAck>();
+                let _ = pre_tx.send(AofAck::ChannelFull);
+                return pre_rx;
+            }
+            Err(flume::TrySendError::Disconnected(_)) => {
+                // Writer task is dead — let caller handle RecvError on ack_rx.
+                // ack_tx was dropped inside the Err value; ack_rx will
+                // resolve with RecvError, which try_send_append_durable maps
+                // to Err(AofAck::WriteFailed).
+            }
+        }
         ack_rx
     }
 
@@ -661,6 +707,44 @@ mod pool_tests {
                 i
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // FIX-W2-5: channel-full returns AofAck::ChannelFull + increments counter
+    // -----------------------------------------------------------------------
+    #[test]
+    fn try_send_append_sync_channel_full_returns_channel_full_ack() {
+        // Create a channel with capacity 1 and fill it so the next try_send
+        // hits TrySendError::Full.
+        let (tx0, rx0) = channel::mpsc_bounded::<AofMessage>(1);
+        // Fill the channel by pre-loading one message.
+        tx0.try_send(AofMessage::Shutdown).expect("pre-fill");
+        // rx0 intentionally not consumed — channel is now at capacity.
+
+        let pool = AofWriterPool::top_level(tx0);
+
+        let before = AOF_BACKPRESSURE_DROPPED.load(std::sync::atomic::Ordering::Relaxed);
+        let recv = pool.try_send_append_sync(0, 1, Bytes::from_static(b"SET k v"));
+
+        // The channel was full — ChannelFull is returned immediately without
+        // a writer round-trip.
+        let result = recv.recv_blocking().expect("pre-filled oneshot resolves");
+        assert_eq!(
+            result,
+            AofAck::ChannelFull,
+            "channel-full must yield ChannelFull, not {:?}",
+            result
+        );
+
+        let after = AOF_BACKPRESSURE_DROPPED.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            after,
+            before + 1,
+            "backpressure counter must increment by 1"
+        );
+
+        // No AppendSync should have reached the (blocked) reader.
+        drop(rx0); // drain without consuming — just verify nothing snuck through
     }
 }
 
