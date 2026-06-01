@@ -1674,17 +1674,51 @@ pub(crate) async fn handle_connection_sharded_inner<
                             entries.into_iter().map(|(idx, arc_frame, aof, cmd, _db)| ((idx, aof, cmd), arc_frame)).unzip();
                         let msg = ShardMessage::PipelineBatchSlotted { db_index: batch_db, commands, response_slot: crate::shard::dispatch::ResponseSlotPtr(slot_ptr) };
                         let target_idx = ChannelMesh::target_index(ctx.shard_id, target);
-                        {
-                            let mut pending = msg;
-                            loop {
-                                let push_result = { let mut producers = ctx.dispatch_tx.borrow_mut(); producers[target_idx].try_push(pending) };
-                                match push_result {
-                                    Ok(()) => { ctx.spsc_notifiers[target].notify_one(); break; }
-                                    Err(val) => { pending = val; tokio::task::yield_now().await; }
+                        // F3: bounded backpressure retry (shared helper). The
+                        // closure retains the message on a full ring; the helper
+                        // checks `shutdown` before each backoff so a wedged peer
+                        // can't park this connection forever. On give-up the
+                        // batch was NEVER sent — `slot_ptr` has no side effect, so
+                        // simply skip `future_for` (no accounting leak) and error
+                        // the entries directly.
+                        let mut pending = Some(msg);
+                        let outcome = crate::shard::dispatch::push_with_backpressure(
+                            &shutdown,
+                            crate::shard::dispatch::CROSS_SHARD_PUSH_MAX_RETRIES,
+                            crate::shard::dispatch::CROSS_SHARD_PUSH_BACKOFF,
+                            || match pending.take() {
+                                None => true,
+                                Some(m) => {
+                                    let mut producers = ctx.dispatch_tx.borrow_mut();
+                                    match producers[target_idx].try_push(m) {
+                                        Ok(()) => true,
+                                        Err(back) => {
+                                            pending = Some(back);
+                                            false
+                                        }
+                                    }
+                                }
+                            },
+                        )
+                        .await;
+                        match outcome {
+                            crate::shard::dispatch::PushOutcome::Pushed => {
+                                ctx.spsc_notifiers[target].notify_one();
+                                reply_futures.push((meta, target));
+                            }
+                            crate::shard::dispatch::PushOutcome::Backpressure
+                            | crate::shard::dispatch::PushOutcome::Cancelled => {
+                                tracing::warn!(
+                                    "Shard {}: cross-shard push to shard {} gave up ({:?}); rejecting batch",
+                                    ctx.shard_id, target, outcome
+                                );
+                                for (resp_idx, _, _) in &meta {
+                                    responses[*resp_idx] = Frame::Error(Bytes::from_static(
+                                        b"ERR cross-shard dispatch backpressure",
+                                    ));
                                 }
                             }
                         }
-                        reply_futures.push((meta, target));
                     }
                     let proto_ver = conn.protocol_version;
                     for (meta, target) in reply_futures {
