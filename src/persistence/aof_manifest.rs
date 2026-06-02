@@ -1496,7 +1496,12 @@ fn replay_incr_framed(
             );
             break;
         }
+        // SAFETY: line 1491 guarantees `total_len - offset >= HEADER_LEN` (=12),
+        // so the [offset..offset+8] and [offset+8..offset+12] slices are valid
+        // and `try_into()` to a fixed-size array cannot fail (length-matched).
+        #[allow(clippy::unwrap_used)] // bounds-checked above; try_into is statically length-matched
         let raw_lsn = u64::from_le_bytes(data[offset..offset + 8].try_into().expect("8 bytes"));
+        #[allow(clippy::unwrap_used)] // same bounds-check guarantee
         let len =
             u32::from_le_bytes(data[offset + 8..offset + 12].try_into().expect("4 bytes")) as usize;
         let payload_start = offset + HEADER_LEN;
