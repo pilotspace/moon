@@ -1030,7 +1030,13 @@ pub(crate) fn handle_shard_message_shared(
                                 replica_txs,
                                 repl_state,
                                 shard_id,
-                            aof_pool, // FIX-W1-2
+                            // FIX-W1-2 r2: PipelineBatch AOF is written by the
+                            // connection handler coordinator AFTER collecting the
+                            // shard response (handler_monoio/mod.rs:2004,
+                            // handler_sharded/mod.rs:1703). Passing aof_pool here
+                            // would cause a second write to the same shard's AOF
+                            // file, doubling every cross-shard pipeline entry.
+                            None,
         );
                         }
 
@@ -1133,7 +1139,12 @@ pub(crate) fn handle_shard_message_shared(
                             replica_txs,
                             repl_state,
                             shard_id,
-                        aof_pool, // FIX-W1-2
+                        // FIX-W1-2 r2: PipelineBatch AOF is handled by the
+                        // connection-handler coordinator after collecting the
+                        // shard response (handler_monoio/mod.rs:2004). Passing
+                        // aof_pool here would produce a duplicate AOF entry for
+                        // every cross-shard pipeline command.
+                        None,
         );
                     }
 
@@ -1577,7 +1588,12 @@ pub(crate) fn handle_shard_message_shared(
                                 replica_txs,
                                 repl_state,
                                 shard_id,
-                            aof_pool, // FIX-W1-2
+                            // FIX-W1-2 r2: PipelineBatchSlotted AOF is written by the
+                            // connection-handler coordinator after collecting the shard
+                            // response (handler_sharded/mod.rs:1703). Passing aof_pool
+                            // here produces a duplicate AOF entry for every cross-shard
+                            // pipeline command (double-write P0 bug).
+                            None,
         );
                         }
 
@@ -1676,7 +1692,10 @@ pub(crate) fn handle_shard_message_shared(
                             replica_txs,
                             repl_state,
                             shard_id,
-                        aof_pool, // FIX-W1-2
+                        // FIX-W1-2 r2: PipelineBatchSlotted AOF (else branch — pre-
+                        // ShardSlice path) is handled by handler_sharded/mod.rs:1703.
+                        // Passing aof_pool here duplicates the AOF entry.
+                        None,
         );
                     }
 
@@ -3189,5 +3208,78 @@ mod wal_append_tests {
             AofMessage::RewriteSharded(_) => panic!("expected Append, got RewriteSharded"),
             AofMessage::Shutdown => panic!("expected Append, got Shutdown"),
         }
+    }
+
+    /// FIX-W1-2 r2: PipelineBatch/PipelineBatchSlotted arms MUST NOT forward
+    /// writes to the AofWriterPool. The connection-handler coordinator already
+    /// appends AOF for these arms after collecting the shard response
+    /// (handler_monoio/mod.rs:2004, handler_sharded/mod.rs:1703).
+    ///
+    /// Verify the invariant directly: `wal_append_and_fanout` called with
+    /// `None` (the PipelineBatch fix) must produce zero messages in the pool
+    /// channel, while the same call with `Some(&pool)` (the MultiExecute path)
+    /// must produce exactly one message.
+    ///
+    /// Red state (pre-fix): the PipelineBatch arms passed `aof_pool` instead
+    /// of `None`, so calling this test function using the arm's actual argument
+    /// would have produced 1 message instead of 0 — the double-write.
+    #[test]
+    fn pipeline_batch_arm_passes_none_to_prevent_double_write() {
+        use crate::persistence::aof::{AofMessage, AofWriterPool, FsyncPolicy};
+        use crate::runtime::channel::mpsc_bounded;
+
+        let backlog: SharedBacklog = std::sync::Arc::new(parking_lot::Mutex::new(Some(
+            ReplicationBacklog::new(1024),
+        )));
+
+        // Build a 2-shard pool so per_shard_with_policy's debug_assert passes.
+        let (tx0, rx0) = mpsc_bounded::<AofMessage>(16);
+        let (tx1, rx1) = mpsc_bounded::<AofMessage>(16);
+        let pool =
+            AofWriterPool::per_shard_with_policy(vec![tx0, tx1], FsyncPolicy::EverySec);
+
+        // ── PipelineBatch path: caller passes None ──
+        // Pre-fix this was `aof_pool` (Some), which caused the double-write.
+        wal_append_and_fanout(
+            b"*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n",
+            &mut None,  // no v2 writer
+            &mut None,  // no v3 writer
+            &backlog,
+            &[],        // no replicas
+            &None,      // no repl_state
+            0,          // shard_id
+            None,       // PipelineBatch fix: None prevents double-write
+        );
+        assert!(
+            rx0.try_recv().is_err(),
+            "PipelineBatch must NOT forward to aof_pool (coordinator handles it); \
+             a message here means the double-write P0 bug is still present"
+        );
+        assert!(
+            rx1.try_recv().is_err(),
+            "shard-1 pool must also be empty for PipelineBatch arm"
+        );
+
+        // ── MultiExecute path: caller passes Some(&pool) ──
+        // This arm has no coordinator-side AOF write, so the pool MUST receive
+        // the entry (otherwise the per-shard AOF would be silently empty for
+        // cross-shard MSET/DEL/EXISTS commands).
+        wal_append_and_fanout(
+            b"*3\r\n$4\r\nMSET\r\n$1\r\nb\r\n$1\r\n2\r\n",
+            &mut None,
+            &mut None,
+            &backlog,
+            &[],
+            &None,
+            0,
+            Some(&pool), // MultiExecute: pool must receive this entry
+        );
+        let msg = rx0
+            .try_recv()
+            .expect("MultiExecute MUST forward to aof_pool; pool is empty — AOF silent drop");
+        assert!(
+            matches!(msg, AofMessage::Append { .. }),
+            "expected AofMessage::Append from MultiExecute arm, got unexpected variant",
+        );
     }
 }
