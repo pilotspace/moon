@@ -38,12 +38,8 @@ jobs:
     if: github.event_name == 'push' || contains(github.event.pull_request.labels.*.name, 'ci-full')
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    env:
-      # Disable io_uring in containers/CI — monoio falls back to epoll.
-      # The per-shard AOF manifest initialization path is gated to runtime-monoio
-      # (the tokio path does not initialize the PerShard AOF manifest on fresh boot
-      # and cannot pass crash-recovery validation). Default features = runtime-monoio.
-      MOON_NO_URING: "1"
+    # MOON_NO_URING is already set globally at the workflow level (line 16).
+    # No job-level env override needed — monoio falls back to epoll automatically.
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@1.94.1

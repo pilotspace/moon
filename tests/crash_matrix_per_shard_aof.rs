@@ -16,14 +16,15 @@
 //!   - `--shards 2 --appendonly yes --appendfsync always` + SIGKILL
 //!     → 100% recover (every +OK must observe an fsync; H1 closure).
 //!
-//! Run with:
-//!   cargo build --release --no-default-features --features runtime-tokio,jemalloc
-//!   cargo test --release --no-default-features --features runtime-tokio,jemalloc \
-//!     --test crash_matrix_per_shard_aof -- --ignored
+//! Run with (monoio default — matches CI):
+//!   cargo build --release
+//!   cargo test --release --test crash_matrix_per_shard_aof -- --ignored
 //!
-//! Requires: built release binary, `redis-cli` on PATH.
-//! Both runtime-tokio and runtime-monoio binaries support PerShard AOF
-//! (per_shard_aof_writer_task has implementations for both runtimes).
+//! Requires: built release binary (default features = runtime-monoio), `redis-cli` on PATH.
+//! Crash-recovery is validated on runtime-monoio only. The PerShard AOF manifest
+//! initialisation path (initialize_multi) is monoio-gated in main.rs:609; the
+//! runtime-tokio binary does not initialise the PerShard manifest on fresh boot
+//! and cannot pass crash-recovery validation.
 
 #![cfg(any(feature = "runtime-monoio", feature = "runtime-tokio"))]
 
@@ -84,7 +85,7 @@ fn start_moon_with_fsync(port: u16, dir: &std::path::Path, fsync: &str) -> Child
                 .expect("create moon stderr log"),
         )
         .spawn()
-        .expect("spawn moon (build --release --features runtime-monoio,jemalloc first)")
+        .expect("spawn moon (run `cargo build --release` with default features first)")
 }
 
 fn wait_for_port(port: u16) {
