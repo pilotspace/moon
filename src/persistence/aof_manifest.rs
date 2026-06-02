@@ -1456,9 +1456,13 @@ pub struct OrderedEntry {
 /// in global LSN order across all shards.
 ///
 /// Returns `(commands_replayed, max_lsn)` — the count covers only inline
-/// (non-ordered) replays, and `max_lsn` covers both inline AND ordered
-/// entries (the high bit is masked out before max comparison, so it reflects
-/// the true issued LSN).
+/// (non-ordered) replays. `max_lsn` is the NEXT-FREE replication offset:
+/// `max(entry.lsn + entry.len)` across both inline AND ordered entries (the
+/// high bit is masked out before the computation). It is the offset AFTER the
+/// last byte on disk, NOT the start LSN of the last entry — because
+/// `ReplicationState::issue_lsn` returns the offset BEFORE adding the entry
+/// length, seeding `master_repl_offset` with a start LSN would reissue the
+/// last on-disk LSN and break the lsn->entry uniqueness invariant (F5).
 ///
 /// **Truncated entries:** a header partly written at crash time is treated as
 /// EOF (parity with `replay_incr_resp` semantics). A whole header followed by
@@ -1530,8 +1534,12 @@ fn replay_incr_framed(
                 lsn,
                 bytes,
             });
-            if lsn > max_lsn {
-                max_lsn = lsn;
+            // F5: track the next-free replication offset (entry end), not the
+            // start LSN — `issue_lsn` returns the offset BEFORE adding the
+            // entry length, so the seed must clear every byte already on disk.
+            let entry_end = lsn + len as u64;
+            if entry_end > max_lsn {
+                max_lsn = entry_end;
             }
             offset = payload_end;
             continue;
@@ -1578,8 +1586,10 @@ fn replay_incr_framed(
                 };
                 engine.replay_command(databases, cmd, cmd_args, &mut selected_db);
                 count += 1;
-                if lsn > max_lsn {
-                    max_lsn = lsn;
+                // F5: next-free offset = entry start LSN + RESP byte length.
+                let entry_end = lsn + len as u64;
+                if entry_end > max_lsn {
+                    max_lsn = entry_end;
                 }
             }
             Ok(None) => {
@@ -2316,11 +2326,41 @@ mod tests_v2 {
         assert!(ordered.is_empty(), "no ordered entries in this stream");
 
         assert_eq!(count, 2);
-        assert_eq!(max_lsn, 11);
+        // F5: max_lsn is the NEXT-FREE offset = max(lsn + len) = max(7+14, 11+16) = 27.
+        assert_eq!(max_lsn, 27);
         let calls = engine.calls.borrow();
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0], "PING");
         assert_eq!(calls[1], "DBSIZE");
+    }
+
+    #[test]
+    fn replay_incr_framed_max_lsn_is_next_free_offset() {
+        // F5: replay must return the next-free replication offset (entry end =
+        // start LSN + RESP byte length), not the START LSN of the last entry.
+        // `issue_lsn` hands out the offset BEFORE adding the entry's length, so
+        // seeding `master_repl_offset` with a start LSN reissues the last
+        // pre-crash entry's LSN — breaking lsn->entry uniqueness (RFC § 2 Rule 3).
+        let ping = b"*1\r\n$4\r\nPING\r\n"; // 14 bytes
+        let dbsize = b"*1\r\n$6\r\nDBSIZE\r\n"; // 16 bytes
+        // Cumulative LSNs as the writer issues them: each entry starts at the
+        // previous entry's end.
+        let mut bytes = frame_entry(100, ping);
+        bytes.extend_from_slice(&frame_entry(100 + ping.len() as u64, dbsize));
+
+        let mut dbs: Vec<crate::storage::Database> = vec![crate::storage::Database::new()];
+        let engine = RecordingEngine::new();
+        let mut ordered: Vec<OrderedEntry> = Vec::new();
+        let (_count, max_lsn) =
+            replay_incr_framed(0, &mut dbs, &bytes, &engine, &mut ordered).expect("framed replay");
+
+        // Last entry: start 114 + len 16 = 130. The next write MUST get >= 130.
+        let expected_next_free = 100 + ping.len() as u64 + dbsize.len() as u64;
+        assert_eq!(expected_next_free, 130);
+        assert_eq!(
+            max_lsn, expected_next_free,
+            "max_lsn must be the next-free offset (entry end), not the last start LSN"
+        );
     }
 
     #[test]
@@ -2336,7 +2376,8 @@ mod tests_v2 {
             .expect("truncated-header is EOF");
 
         assert_eq!(count, 1);
-        assert_eq!(max_lsn, 3);
+        // F5: next-free offset = PING entry start 3 + RESP len 14 = 17.
+        assert_eq!(max_lsn, 17);
     }
 
     #[test]
@@ -2408,7 +2449,12 @@ mod tests_v2 {
         };
 
         assert_eq!(total, 2, "two SETs replayed");
-        assert_eq!(global_max_lsn, 20, "global max lsn = max(shard maxes)");
+        // F5: global_max_lsn = max next-free offset across shards. shard-1 SET
+        // is 29 RESP bytes at lsn 20 → next-free 49 (> shard-0's 10+29=39).
+        assert_eq!(
+            global_max_lsn, 49,
+            "global max lsn = max(shard next-free offsets)"
+        );
         assert!(ordered.is_empty(), "no ordered entries in this stream");
 
         // Each shard's DB now holds its key (and only its key).
@@ -2487,10 +2533,13 @@ mod tests_v2 {
         };
 
         assert_eq!(total, n_shards as usize, "one SET per shard = N total");
+        // F5: global_max_lsn = highest shard's NEXT-FREE offset. The highest
+        // shard (sid=N-1) SETs at lsn N*10 with a 29-byte RESP → next-free
+        // N*10 + 29 (here 40 + 29 = 69), not the bare start LSN.
         assert_eq!(
             global_max_lsn,
-            n_shards as u64 * 10,
-            "global max lsn = highest shard lsn"
+            n_shards as u64 * 10 + 29,
+            "global max lsn = highest shard next-free offset"
         );
         assert!(ordered.is_empty(), "no ordered entries");
 
@@ -2542,7 +2591,13 @@ mod tests_v2 {
             .expect("framed replay with ordered");
 
         assert_eq!(count, 2, "two inline entries dispatched (PING, DBSIZE)");
-        assert_eq!(max_lsn, 12, "max LSN tracks both inline and ordered");
+        // F5: max_lsn is the next-free offset across inline AND ordered. The
+        // ordered SET (27 RESP bytes) at lsn 8 → next-free 35, exceeding the
+        // PING (5+14=19) and DBSIZE (12+16=28) ends.
+        assert_eq!(
+            max_lsn, 35,
+            "max LSN = next-free offset across inline and ordered"
+        );
         assert_eq!(ordered.len(), 1, "one entry buffered as ordered");
         let buffered = &ordered[0];
         assert_eq!(buffered.shard_id, 3, "shard_id forwarded");
