@@ -582,7 +582,6 @@ impl super::Shard {
         > = spill_thread.as_ref().map(|st| st.sender());
         let spill_file_id: std::rc::Rc<std::cell::Cell<u64>> =
             std::rc::Rc::new(std::cell::Cell::new(1));
-        let mut next_file_id: u64 = 1;
         // Per-shard spill directory for the write-path eviction (handler_monoio).
         // MUST match the reader's `cold_shard_dir` (main.rs / shard::mod) and the
         // persistence-tick cascade, which both use `<offload>/shard-{id}`. Using the
@@ -591,6 +590,22 @@ impl super::Shard {
         let disk_offload_dir: Option<std::path::PathBuf> = disk_offload_base
             .clone()
             .map(|base| base.join(format!("shard-{}", shard_id)));
+
+        // B-2: resume the spill file_id counter ABOVE every recovered
+        // `heap-*.mpf`. Without this the counter restarts at 1 each boot and
+        // post-restart re-eviction overwrites cold files the rebuilt cold_index
+        // still points at, silently corrupting post-crash cold read-through.
+        // Fresh server / disk-offload off → seed 1 (unchanged from before).
+        let spill_seed =
+            crate::storage::eviction::next_spill_file_id_seed(disk_offload_dir.as_deref());
+        spill_file_id.set(spill_seed);
+        let mut next_file_id: u64 = spill_seed;
+        if spill_seed > 1 {
+            info!(
+                "Shard {}: spill file_id counter seeded at {} from recovered cold files",
+                shard_id, spill_seed
+            );
+        }
 
         // Per-shard warm-segment mmap budget enforcer.
         // Owned exclusively by this event-loop task; no locking needed.

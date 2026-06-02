@@ -237,6 +237,65 @@ pub fn try_evict_if_needed_with_spill_and_total(
 ///
 /// Callers must poll `SpillThread::drain_completions()` to apply manifest
 /// and ColdIndex updates from completed spills.
+/// Seed value for a shard's spill `file_id` counter after recovery.
+///
+/// On restart, AOF/RDB replay re-populates the hot tier and the persistence
+/// cascade re-evicts the excess. If the counter restarted at 1 it would mint
+/// `heap-000001.mpf`, `heap-000257.mpf`, … — the *same names* recovery just
+/// loaded — and atomically overwrite cold files the rebuilt `cold_index` still
+/// references, silently corrupting cold read-through (the B-2 bug).
+///
+/// Scanning the on-disk `<shard_dir>/data/heap-NNNNNN.mpf` files (rather than
+/// the manifest) is deliberate: a spill that wrote its `.mpf` but crashed
+/// before the manifest commit leaves an orphan the manifest doesn't know about,
+/// yet it still occupies a filename that must not be clobbered. The physical
+/// files are the authority on what can be overwritten.
+///
+/// Returns `max(existing file_id) + 1`. Because each batch file is named after
+/// its first request's `file_id` (gaps are harmless — recovery iterates
+/// manifest entries, see `spill_thread`), any seed strictly above the current
+/// max guarantees every future filename is new. Returns `1` when disk-offload
+/// is off, the directory is absent, or it holds no heap files — identical to
+/// the historical default, so a fresh server and the live hot path are
+/// unchanged by this seeding.
+#[must_use]
+pub fn next_spill_file_id_seed(shard_dir: Option<&Path>) -> u64 {
+    let Some(dir) = shard_dir else { return 1 };
+    let data_dir = dir.join("data");
+    let entries = match std::fs::read_dir(&data_dir) {
+        Ok(e) => e,
+        Err(e) => {
+            // NotFound is the normal fresh-server case (data/ not created yet).
+            // Anything else (permissions, I/O) is anomalous: fail safe to the
+            // legacy default but surface it so a misseed can't hide silently.
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(
+                    dir = %data_dir.display(),
+                    error = %e,
+                    "spill file_id seed: could not scan cold dir; defaulting to 1"
+                );
+            }
+            return 1;
+        }
+    };
+    let mut max_id: Option<u64> = None;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if let Some(id) = name
+            .to_str()
+            .and_then(|n| n.strip_prefix("heap-"))
+            .and_then(|r| r.strip_suffix(".mpf"))
+            .and_then(|s| s.parse::<u64>().ok())
+        {
+            max_id = Some(max_id.map_or(id, |m| m.max(id)));
+        }
+    }
+    match max_id {
+        Some(m) => m + 1,
+        None => 1,
+    }
+}
+
 pub fn try_evict_if_needed_async_spill(
     db: &mut Database,
     config: &RuntimeConfig,
@@ -999,5 +1058,46 @@ mod tests {
         let result = try_evict_if_needed_with_spill(&mut db, &config, None);
         assert!(result.is_ok());
         assert_eq!(db.len(), 0);
+    }
+
+    // ── B-2: post-crash cold-spill file_id seeding ──────────────────────────
+    // The spill file_id counter must resume ABOVE every recovered `heap-*.mpf`
+    // so post-restart re-eviction never overwrites a cold file the rebuilt
+    // cold_index still points at (which silently corrupts cold read-through).
+
+    /// `None` dir (disk-offload off) → seed 1 (historical default, no change).
+    #[test]
+    fn test_spill_seed_none_dir_is_one() {
+        assert_eq!(next_spill_file_id_seed(None), 1);
+    }
+
+    /// Fresh server (dir absent / empty) → seed 1 == legacy behaviour, so the
+    /// live read-through hot path cannot regress from this change.
+    #[test]
+    fn test_spill_seed_fresh_server_is_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        // data/ does not exist yet
+        assert_eq!(next_spill_file_id_seed(Some(tmp.path())), 1);
+        // data/ exists but empty
+        std::fs::create_dir_all(tmp.path().join("data")).unwrap();
+        assert_eq!(next_spill_file_id_seed(Some(tmp.path())), 1);
+    }
+
+    /// With recovered heap files, seed = max(file_id) + 1 so the next batch's
+    /// filename is strictly greater than any existing one (filenames are the
+    /// first request id of each batch; gaps are harmless).
+    #[test]
+    fn test_spill_seed_resumes_above_max_recovered() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        for id in [1u64, 257, 513] {
+            std::fs::write(data.join(format!("heap-{id:06}.mpf")), b"x").unwrap();
+        }
+        // non-heap files and bad names must be ignored
+        std::fs::write(data.join("manifest.bin"), b"x").unwrap();
+        std::fs::write(data.join("heap-notanum.mpf"), b"x").unwrap();
+        std::fs::write(data.join("base-000999.rdb"), b"x").unwrap();
+        assert_eq!(next_spill_file_id_seed(Some(tmp.path())), 514);
     }
 }

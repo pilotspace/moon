@@ -725,6 +725,44 @@ fn main() -> anyhow::Result<()> {
     // no rewritten base RDB, and wipes the v2-loaded state — the
     // test_txn_commit_wal_crash_recovery regression. Each single-shard branch
     // below is therefore #[cfg(runtime-monoio)] with a tokio warn fallback.
+    //
+    // ── B-2: preserve cold-tier wiring across AOF/RDB recovery ──────────────
+    // The multi-part AOF replay below invokes `rdb::load`, which loads the base
+    // RDB into fresh `Database::new()` temporaries and swaps them wholesale into
+    // the live databases (`*live = temp`). That swap silently drops
+    // `cold_shard_dir` and the rebuilt `cold_index`: both are live-tier topology,
+    // NOT part of the RDB hot snapshot, so a 0-key base RDB still wipes them.
+    // Capture them here — after `restore_from_persistence` rebuilt the index and
+    // the map wired the dir, before replay clobbers — and re-attach after the
+    // replay block so disk-offload read-through survives a restart.
+    //
+    // The fix lives here (recovery path), NOT in the generic `rdb::load`, on
+    // purpose: `rdb::load` also serves replica full-sync and DEBUG RELOAD, which
+    // load a *foreign* dataset whose values do NOT live in this node's cold
+    // files — preserving the local index there would surface stale reads. Here
+    // the loaded base + replayed incrs are this node's own data, so the rebuilt
+    // index is authoritative. Pairs with the spill file_id seed
+    // (eviction.rs::next_spill_file_id_seed): the seed keeps recovered cold
+    // files immutable so these preserved entries stay valid until the
+    // steady-state cascade refreshes them.
+    let preserved_cold_wiring: Vec<
+        Vec<(
+            Option<std::path::PathBuf>,
+            Option<moon::storage::tiered::cold_index::ColdIndex>,
+        )>,
+    > = if disk_offload_base.is_some() {
+        shards
+            .iter_mut()
+            .map(|s| {
+                s.databases
+                    .iter_mut()
+                    .map(|db| (db.cold_shard_dir.take(), db.cold_index.take()))
+                    .collect()
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
     if config.appendonly == "yes"
         && let Some(ref dir) = persistence_dir
     {
@@ -1002,6 +1040,20 @@ fn main() -> anyhow::Result<()> {
     // (The former standalone tokio "multi-part AOF ignored" warn block was
     // removed: multi-shard PerShard AOF is now loaded on tokio too, and the
     // single-shard tokio warn is emitted inline above.)
+
+    // ── B-2: re-attach cold-tier wiring dropped by the rdb::load swap ───────
+    // Restore the `cold_shard_dir` + rebuilt `cold_index` captured before the
+    // AOF replay block. Without this, the handler reads a database with
+    // `cold_shard_dir = None`, so every read-through of a re-evicted key misses
+    // and disk-offload silently loses data across a restart.
+    if !preserved_cold_wiring.is_empty() {
+        for (shard, dbs) in shards.iter_mut().zip(preserved_cold_wiring) {
+            for (db, (cold_shard_dir, cold_index)) in shard.databases.iter_mut().zip(dbs) {
+                db.cold_shard_dir = cold_shard_dir;
+                db.cold_index = cold_index;
+            }
+        }
+    }
 
     // Extract databases from all shards and wrap in ShardDatabases
     let all_dbs: Vec<Vec<moon::storage::Database>> = shards
