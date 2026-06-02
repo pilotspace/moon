@@ -33,6 +33,71 @@ use super::{
 use crate::framevec;
 use crate::server::codec::RespCodec;
 
+/// Flush AOF entries and responses under the `appendfsync=always` ordering contract (H1).
+///
+/// **Invariant (H1):** awaits ALL fsync acks BEFORE sending ANY response to the
+/// client.  The client must never receive `+OK` before the entry is durable on
+/// disk when `appendfsync=always` is configured.
+///
+/// Returns `true` when the connection loop should break (sink send failed).
+///
+/// Making the sink generic (`S: futures::Sink<Frame> + Unpin`) lets unit tests
+/// supply a lightweight recording sink instead of a real TcpStream, while the
+/// production call site passes `&mut framed` (`Framed<TcpStream, RespCodec>`)
+/// unchanged — both satisfy the bound.
+///
+/// # Arguments
+///
+/// - `sink` — frame sink; production passes `Framed<TcpStream, RespCodec>`,
+///   tests pass any `Sink<Frame>` mock.
+/// - `responses` — per-command response slots; fsync failures patch the
+///   corresponding slot to `Frame::Error`.
+/// - `aof_entries` — `(resp_idx, bytes)`: bytes to fsync, slot to patch on failure.
+/// - `pool` — AOF writer pool (caller must ensure Always policy).
+/// - `repl_state` — replication state for LSN issuance (`&None` in tests).
+/// - `change_counter` — auto-save dirty counter (`&None` if not configured).
+pub(crate) async fn flush_with_aof_ack<S>(
+    sink: &mut S,
+    mut responses: Vec<Frame>,
+    aof_entries: Vec<(usize, Bytes)>,
+    pool: &crate::persistence::aof::AofWriterPool,
+    repl_state: &Option<Arc<RwLock<crate::replication::state::ReplicationState>>>,
+    change_counter: &Option<Arc<AtomicU64>>,
+) -> bool
+where
+    S: futures::Sink<Frame> + Unpin,
+{
+    // Phase 1 — await every fsync ack; patch failed slots.
+    for (resp_idx, bytes) in aof_entries {
+        let lsn = crate::persistence::aof::AofWriterPool::issue_append_lsn(
+            repl_state,
+            0,
+            bytes.len(),
+        );
+        if pool
+            .try_send_append_durable(0, lsn, bytes)
+            .await
+            .is_err()
+            && resp_idx < responses.len()
+        {
+            responses[resp_idx] =
+                Frame::Error(Bytes::from_static(b"WRITEFAIL aof fsync failed"));
+        }
+        if let Some(counter) = change_counter {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    // Phase 2 — all acks received; flush responses to client.
+    let mut break_outer = false;
+    for response in responses {
+        if SinkExt::send(sink, response).await.is_err() {
+            break_outer = true;
+            break;
+        }
+    }
+    break_outer
+}
+
 /// Handle a single client connection.
 ///
 /// Reads frames from the TCP stream, dispatches commands, and writes responses.
@@ -2260,7 +2325,9 @@ pub async fn handle_connection(
                 // FIX-W1-1: appendfsync=always ordering — H1 close for the single-shard
                 // tokio path. Under Always policy: await all AOF fsync acks FIRST, patch
                 // any failed response slots with WRITEFAIL, THEN flush responses to the
-                // client. Under EverySec/No: keep existing fire-and-forget ordering (flush
+                // client (delegated to `flush_with_aof_ack` so tests can call the real
+                // production path rather than reproducing it inline).
+                // Under EverySec/No: keep existing fire-and-forget ordering (flush
                 // responses first, then enqueue AOF in the background — no latency impact).
                 let use_always_ordering = aof_pool
                     .as_ref()
@@ -2268,30 +2335,17 @@ pub async fn handle_connection(
                     .unwrap_or(false);
 
                 if use_always_ordering {
-                    // Always policy: await every ack before sending any response.
-                    for (resp_idx, bytes) in aof_entries {
-                        if let Some(ref pool) = aof_pool {
-                            let lsn = crate::persistence::aof::AofWriterPool::issue_append_lsn(&repl_state, 0, bytes.len());
-                            if pool.try_send_append_durable(0, lsn, bytes).await.is_err() {
-                                // fsync failed — replace the placeholder with an error
-                                // frame so the client knows durability was NOT achieved.
-                                if resp_idx < responses.len() {
-                                    responses[resp_idx] = Frame::Error(
-                                        Bytes::from_static(b"WRITEFAIL aof fsync failed"),
-                                    );
-                                }
-                            }
-                        }
-                        if let Some(ref counter) = change_counter {
-                            counter.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
-                    // All acks received — now safe to flush responses to client.
-                    for response in responses {
-                        if framed.send(response).await.is_err() {
-                            break_outer = true;
-                            break;
-                        }
+                    // `use_always_ordering` is only true when aof_pool is Some + Always.
+                    if let Some(ref pool) = aof_pool {
+                        break_outer = flush_with_aof_ack(
+                            &mut framed,
+                            responses,
+                            aof_entries,
+                            pool,
+                            &repl_state,
+                            &change_counter,
+                        )
+                        .await;
                     }
                 } else {
                     // EverySec / No policy: flush responses first (zero added latency),
@@ -2354,4 +2408,125 @@ pub async fn handle_connection(
         tracking_table.lock().untrack_all(client_id);
     }
     crate::admin::metrics_setup::record_connection_closed();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::persistence::aof::{AofAck, AofMessage, AofWriterPool, FsyncPolicy};
+    use crate::runtime::channel;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use std::time::{Duration, Instant};
+
+    // ── Minimal recording sink ──────────────────────────────────────────────
+    //
+    // Implements `futures::Sink<Frame>` so `flush_with_aof_ack` can be called
+    // directly in unit tests without a real TcpStream.  Each successful
+    // `start_send` appends `(frame, Instant::now())` to the internal log.
+    struct RecordingSink {
+        log: Vec<(Frame, Instant)>,
+    }
+
+    impl RecordingSink {
+        fn new() -> Self {
+            Self { log: Vec::new() }
+        }
+        fn first_send_instant(&self) -> Option<Instant> {
+            self.log.first().map(|(_, t)| *t)
+        }
+    }
+
+    impl futures::Sink<Frame> for RecordingSink {
+        type Error = ();
+
+        fn poll_ready(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), ()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn start_send(mut self: Pin<&mut Self>, item: Frame) -> Result<(), ()> {
+            self.log.push((item, Instant::now()));
+            Ok(())
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), ()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), ()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// FIX-W1-1 r3: discriminating ordering test for `flush_with_aof_ack`.
+    ///
+    /// This test calls the **real** `flush_with_aof_ack` function that the
+    /// production handler uses — not an inline copy.  The H1 contract is:
+    ///
+    ///   All AOF fsync acks MUST be awaited BEFORE any response is sent.
+    ///
+    /// Red state (broken ordering — send-before-ack):
+    ///   If the fn were to flush responses BEFORE awaiting acks, the mock
+    ///   60ms fsync delay would NOT gate the first response, so
+    ///   `elapsed_ms < 55` → test fails.
+    ///
+    /// Green state (ack-before-send — current production code):
+    ///   `flush_with_aof_ack` awaits the 60ms ack BEFORE any `start_send`,
+    ///   so `elapsed_ms >= 55` → test passes.
+    ///
+    /// Red verification was performed by temporarily inverting the fn body
+    /// (Phase 2 before Phase 1) and confirming `elapsed_ms ≈ 0ms` → FAIL.
+    /// The fn was then restored and the test passes consistently.
+    #[tokio::test]
+    async fn flush_with_aof_ack_ack_precedes_response() {
+        // Build an Always-policy pool backed by a real bounded channel.
+        let (tx, rx) = channel::mpsc_bounded::<AofMessage>(4);
+        let pool = AofWriterPool::top_level_with_policy(tx, FsyncPolicy::Always);
+
+        // Mock writer: receives one AppendSync, sleeps 60ms to simulate fsync,
+        // then sends Synced.  Runs on a blocking thread because flume's
+        // `Receiver::recv()` is synchronous.
+        let mock_writer = tokio::task::spawn_blocking(move || {
+            let msg = rx.recv().expect("mock writer: message received");
+            if let AofMessage::AppendSync { ack, .. } = msg {
+                std::thread::sleep(Duration::from_millis(60));
+                let _ = ack.send(AofAck::Synced);
+            } else {
+                panic!("Always policy MUST send AppendSync; got non-AppendSync variant");
+            }
+        });
+
+        let start = Instant::now();
+
+        let responses = vec![Frame::SimpleString(bytes::Bytes::from_static(b"OK"))];
+        let aof_entries = vec![(0usize, bytes::Bytes::from_static(b"SET k v\r\n"))];
+        let mut sink = RecordingSink::new();
+
+        let broke = flush_with_aof_ack(
+            &mut sink,
+            responses,
+            aof_entries,
+            &pool,
+            &None, // no replication state
+            &None, // no change counter
+        )
+        .await;
+
+        mock_writer.await.expect("mock writer completed cleanly");
+
+        assert!(!broke, "sink send must not have failed");
+        assert_eq!(sink.log.len(), 1, "exactly one response must be sent");
+
+        let first_send = sink
+            .first_send_instant()
+            .expect("RecordingSink recorded at least one send");
+        let elapsed_ms = first_send.duration_since(start).as_millis();
+
+        assert!(
+            elapsed_ms >= 55,
+            "H1 violation: first response sent {elapsed_ms}ms after start — \
+             expected >= 55ms (mock fsync delay is 60ms). \
+             This means +OK was flushed before the AOF ack."
+        );
+    }
 }
