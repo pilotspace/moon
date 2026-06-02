@@ -32,7 +32,7 @@ pub static BGSAVE_SHARDS_REMAINING: AtomicU64 = AtomicU64::new(0);
 pub static BGSAVE_LAST_STATUS: AtomicBool = AtomicBool::new(true);
 
 /// Process-wide gate set at startup when the configuration combination
-/// `shards >= 2 + --disk-offload enable + --appendonly yes` is selected.
+/// `--shards >= 2 + --appendonly yes` is selected (see `Config::per_shard_aof_active`).
 ///
 /// `BGREWRITEAOF` under this combination silently truncates the WAL of every
 /// shard except the rewriter's own shard while the consolidated multi-part AOF
@@ -41,6 +41,10 @@ pub static BGSAVE_LAST_STATUS: AtomicBool = AtomicBool::new(true);
 /// v2.0 multi-part AOF replay walks every shard's segment manifest, the only
 /// safe behavior is to refuse the command in this config and point operators
 /// at the runbook.
+///
+/// Note: `--disk-offload` is NOT part of the gate condition. The unsafe flag
+/// fires for any `--shards >= 2 + --appendonly yes` combination regardless of
+/// disk-offload state.
 ///
 /// Set once in `main.rs` after CLI parsing; never cleared. Checked by
 /// `bgrewriteaof_start_sharded` before dispatching the rewrite message.
@@ -283,7 +287,7 @@ pub fn bgrewriteaof_start_sharded(
     // it.
     if MULTI_SHARD_AOF_REWRITE_UNSAFE.load(Ordering::Relaxed) {
         return Frame::Error(Bytes::from_static(
-            b"ERR BGREWRITEAOF is unsafe with --shards >= 2 + --disk-offload enable + --appendonly yes (known data-loss bug; see docs/runbooks/multi-shard-aof-rewrite.md). Use --shards 1, set --disk-offload disable, or wait for v2.0 multi-part AOF replay.",
+            b"ERR BGREWRITEAOF is not yet supported for --shards >= 2 + --appendonly yes. Options: (1) use --shards 1, (2) set --appendonly no, or (3) wait for per-shard BGREWRITEAOF in v0.2. See docs/runbooks/multi-shard-aof-rewrite.md.",
         ));
     }
     // CAS: only proceed if currently false; prevents a second caller from
@@ -426,7 +430,7 @@ mod tests {
             Frame::Error(msg) => {
                 let s = std::str::from_utf8(&msg).unwrap();
                 assert!(
-                    s.contains("BGREWRITEAOF is unsafe")
+                    s.contains("BGREWRITEAOF is not yet supported")
                         && s.contains("multi-shard-aof-rewrite.md"),
                     "unexpected error: {s}"
                 );
@@ -448,7 +452,7 @@ mod tests {
         if let Frame::Error(msg) = &frame2 {
             let s = std::str::from_utf8(msg).unwrap();
             assert!(
-                !s.contains("BGREWRITEAOF is unsafe"),
+                !s.contains("BGREWRITEAOF is not yet supported"),
                 "gate error fired with gate off: {s}"
             );
         }
@@ -456,5 +460,58 @@ mod tests {
         // Restore prior state.
         AOF_REWRITE_IN_PROGRESS.store(prior_in_progress, Ordering::SeqCst);
         MULTI_SHARD_AOF_REWRITE_UNSAFE.store(prior, Ordering::Relaxed);
+    }
+
+    /// FIX-W1-4 r2: gate error message must NOT mention disk-offload (the gate
+    /// fires for ANY `--shards >= 2 + --appendonly yes` config, regardless of
+    /// disk-offload setting) and MUST end with the runbook reference.
+    ///
+    /// Red state (pre-fix, 881f8b8^): error contained "disk-offload enable"
+    /// and recommended "set --disk-offload disable" — stale from the narrower
+    /// original gate condition.
+    ///
+    /// Green (post-fix): message updated to accurate condition, no disk-offload
+    /// mention, ends with "multi-shard-aof-rewrite.md."
+    #[test]
+    fn test_bgrewriteaof_gate_error_no_disk_offload_mention() {
+        let _guard = GATE_TEST_LOCK.lock();
+        let (tx, _rx) = crate::runtime::channel::mpsc_bounded::<AofMessage>(1);
+        let pool = AofWriterPool::top_level(tx);
+        let shard_dbs = crate::shard::shared_databases::ShardDatabases::new(
+            vec![vec![crate::storage::Database::new()]],
+        );
+
+        let prior = MULTI_SHARD_AOF_REWRITE_UNSAFE.load(Ordering::Relaxed);
+        let prior_in_progress = AOF_REWRITE_IN_PROGRESS.load(Ordering::SeqCst);
+        AOF_REWRITE_IN_PROGRESS.store(false, Ordering::SeqCst);
+        MULTI_SHARD_AOF_REWRITE_UNSAFE.store(true, Ordering::Relaxed);
+
+        let frame = bgrewriteaof_start_sharded(&pool, shard_dbs);
+
+        MULTI_SHARD_AOF_REWRITE_UNSAFE.store(prior, Ordering::Relaxed);
+        AOF_REWRITE_IN_PROGRESS.store(prior_in_progress, Ordering::SeqCst);
+
+        match frame {
+            Frame::Error(msg) => {
+                let s = std::str::from_utf8(&msg).unwrap();
+                assert!(
+                    !s.contains("disk-offload"),
+                    "gate error must NOT mention disk-offload \
+                     (gate fires for --shards>=2 + --appendonly yes regardless \
+                     of disk-offload state): {s}"
+                );
+                assert!(
+                    s.ends_with("multi-shard-aof-rewrite.md."),
+                    "gate error MUST end with the runbook reference \
+                     'multi-shard-aof-rewrite.md.' for operator guidance: {s}"
+                );
+                assert!(
+                    s.contains("--shards 1") && s.contains("--appendonly no"),
+                    "gate error must offer actionable alternatives \
+                     (--shards 1 and --appendonly no): {s}"
+                );
+            }
+            other => panic!("expected Frame::Error when gate is ON, got {other:?}"),
+        }
     }
 }
