@@ -2783,6 +2783,31 @@ fn drain_pending_appends_framed(
 ///
 /// Until step 7's commit, the on-disk manifest still resolves to the old seq,
 /// so a crash anywhere in steps 1-6 recovers the intact old generation.
+///
+/// # Cross-thread exactly-once invariant (load-bearing)
+///
+/// This fold runs on the per-shard *writer* thread, which is distinct from the
+/// shard event-loop thread that applies commands. Exactly-once across the
+/// rewrite boundary depends on a single ordering fact: the live write path
+/// enqueues each command's AOF append **inside** the same `RwLock<Database>`
+/// write guard under which it mutated the db (see `spsc_handler.rs`:
+/// `wal_append_and_fanout` is called before `drop(guard)`). Phase 2 here
+/// acquires those *same* locks (`all_shard_dbs()[sidx]` is
+/// `ShardDatabases::shards[sidx]`, the exact `RwLock`s `write_db` locks), so
+/// RwLock mutual exclusion forces the order
+/// `enqueue → guard-release → fold-acquire → mid-drain(phase 3)`. Hence every
+/// INCR whose mutation lands in the phase-4 snapshot had its append drained
+/// into the OLD incr (then pruned at commit) — never replayed on top of the
+/// new base. Were the append enqueued *after* the guard drop, a snapshot would
+/// capture the mutation while its append still raced toward the NEW incr →
+/// double-apply. The in-guard append is therefore the invariant; do not move it.
+///
+/// This also assumes the `RwLock`-backed `ShardDatabases` is the *live* store.
+/// It is, because the thread-local `ShardSlice` fast path is dead code until
+/// Phase 4 wires `init_shard` (`is_initialized()` is always false today). A
+/// future Phase 4 that makes ShardSlice live MUST revisit this fold: the writer
+/// thread cannot lock another thread's `!Send` `Rc<RefCell<Shard>>`, so the
+/// per-shard rewrite would need a different snapshot-coordination mechanism.
 #[cfg(feature = "runtime-monoio")]
 fn do_rewrite_per_shard(
     shard_id: u16,
