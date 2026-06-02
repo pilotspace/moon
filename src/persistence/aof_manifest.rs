@@ -39,10 +39,12 @@ use std::path::{Path, PathBuf};
 
 use tracing::{error, info, warn};
 
+use crate::persistence::fsync::fsync_directory;
+
 const MANIFEST_NAME: &str = "moon.aof.manifest";
 const AOF_DIR_NAME: &str = "appendonlydir";
 
-/// Fsync the parent directory of `path` to make a preceding `rename()` durable.
+/// Fsync the parent directory of `path` (best-effort).
 ///
 /// POSIX guarantees atomicity of `rename()` but does NOT guarantee that the
 /// directory entry update is durable after a crash. On ext4 and XFS without
@@ -54,33 +56,20 @@ const AOF_DIR_NAME: &str = "appendonlydir";
 /// dir fsync means the rename may not survive a crash — the worst case is
 /// that recovery falls back to the previous manifest state, which is still
 /// consistent (the atomic rename guarantees the file is either fully old or
-/// fully new). Propagating the error would require callers to handle the case
-/// where the write succeeded but the dir fsync failed, which is typically not
-/// actionable at runtime.
-fn fsync_parent(path: &Path) {
+/// fully new). Call sites that CAN propagate (i.e., are in a fallible fn that
+/// returns `std::io::Result`) should call `fsync_directory(parent)?` directly.
+fn fsync_parent_best_effort(path: &Path) {
     let parent = match path.parent() {
         Some(p) if !p.as_os_str().is_empty() => p,
         _ => return, // root or no parent — nothing to fsync
     };
-    match std::fs::File::open(parent) {
-        Ok(dir) => {
-            if let Err(e) = dir.sync_all() {
-                warn!(
-                    "fsync_parent: failed to fsync dir {} after rename of {}: {}",
-                    parent.display(),
-                    path.display(),
-                    e
-                );
-            }
-        }
-        Err(e) => {
-            warn!(
-                "fsync_parent: failed to open dir {} for fsync (rename of {}): {}",
-                parent.display(),
-                path.display(),
-                e
-            );
-        }
+    if let Err(e) = fsync_directory(parent) {
+        warn!(
+            "fsync_parent_best_effort: failed to fsync dir {} after rename of {}: {}",
+            parent.display(),
+            path.display(),
+            e
+        );
     }
 }
 
@@ -244,7 +233,7 @@ impl AofManifest {
             f.sync_data()?;
         }
         std::fs::rename(&tmp_path, &base_path)?;
-        fsync_parent(&base_path);
+        fsync_parent_best_effort(&base_path);
 
         // Create the empty incr file so the writer has a target.
         std::fs::File::create(manifest.incr_path())?;
@@ -283,7 +272,7 @@ impl AofManifest {
             f.sync_data()?;
         }
         std::fs::rename(&tmp_path, &base_path)?;
-        fsync_parent(&base_path);
+        fsync_parent_best_effort(&base_path);
 
         // Create empty incr file so the writer has something to append to.
         std::fs::File::create(manifest.incr_path())?;
@@ -673,7 +662,7 @@ impl AofManifest {
         f.write_all(content.as_bytes())?;
         f.sync_data()?;
         std::fs::rename(&tmp_path, &manifest_path)?;
-        fsync_parent(&manifest_path);
+        fsync_parent_best_effort(&manifest_path);
         Ok(())
     }
 
@@ -828,6 +817,11 @@ impl AofManifest {
         // Move base. If this fails, no on-disk mutation happened yet — bail
         // without rollback. Layout stays TopLevel until commit at the bottom.
         std::fs::rename(&old_base, &new_base)?;
+        // Fsync the target directory so the rename is durable before we
+        // proceed. A crash after rename but before dir-fsync could leave
+        // the old file name visible on the next boot. This function returns
+        // std::io::Result, so we propagate with `?`.
+        fsync_directory(&new_dir)?;
 
         // Base is now in shard-0/. Any subsequent error must restore it.
         let moved_incr: bool;
@@ -844,6 +838,8 @@ impl AofManifest {
                 }
                 return Err(e);
             }
+            // Fsync the shard directory to make the incr rename durable.
+            fsync_directory(&new_dir)?;
             moved_incr = true;
             created_incr = false;
         } else {
@@ -984,7 +980,7 @@ impl AofManifest {
                     f.sync_data()?;
                 }
                 std::fs::rename(&tmp_path, &base_path)?;
-                fsync_parent(&base_path);
+                fsync_parent_best_effort(&base_path);
                 std::fs::File::create(manifest.shard_incr_path(shard_id))?;
                 created_shards.push(shard_id);
             }
@@ -1064,7 +1060,7 @@ impl AofManifest {
                 detail: format!("rename base: {}", e),
             }
         })?;
-        fsync_parent(&new_base);
+        fsync_parent_best_effort(&new_base);
 
         // 2. Create empty new incremental file
         let new_incr = self.incr_path_seq(new_seq);
@@ -1179,7 +1175,7 @@ impl AofManifest {
                 ),
             }
         })?;
-        fsync_parent(&new_base);
+        fsync_parent_best_effort(&new_base);
 
         // 2. Create empty new incremental file.
         let new_incr = self.shard_incr_path_seq(shard_id, new_seq);
@@ -2580,5 +2576,35 @@ mod tests_v2 {
         assert_eq!(reloaded.seq, 2);
 
         fs::remove_dir_all(&dir).ok();
+    }
+
+    // -----------------------------------------------------------------------
+    // FIX-W2-7: smoke test — fsync helper consolidation did not break
+    // initialize_multi. Confirms the helper swap compiles and runs correctly.
+    // (No assertion that fsync was called — a failed fsync on a tmpfs would
+    // produce a false negative on most CI hosts.)
+    // -----------------------------------------------------------------------
+    #[test]
+    fn initialize_multi_smoke_after_fsync_consolidation() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path();
+        let n = 2;
+        let result = AofManifest::initialize_multi(dir, n);
+        assert!(
+            result.is_ok(),
+            "initialize_multi({n} shards) must succeed: {:?}",
+            result.err()
+        );
+        let manifest = result.unwrap();
+        for shard_id in 0..n {
+            assert!(
+                manifest.shard_base_path(shard_id).exists(),
+                "shard-{shard_id} base RDB must exist"
+            );
+            assert!(
+                manifest.shard_incr_path(shard_id).exists(),
+                "shard-{shard_id} incr file must exist"
+            );
+        }
     }
 }
