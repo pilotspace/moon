@@ -305,32 +305,25 @@ pub fn bgrewriteaof_start_sharded(
     // single manifest commit across all writers). TopLevel multi-DB pools keep
     // the legacy single-writer RewriteSharded path.
     if pool.layout() == crate::persistence::aof_manifest::AofLayout::PerShard {
-        // The per-shard fold is monoio-only for now (synchronous std::fs IO);
-        // refuse under tokio so the in-progress flag is not left dangling by a
-        // no-op writer arm. Tracked as the tokio enablement follow-up.
-        #[cfg(feature = "runtime-tokio")]
-        {
-            AOF_REWRITE_IN_PROGRESS.store(false, Ordering::SeqCst);
-            return Frame::Error(Bytes::from_static(
-                b"ERR per-shard BGREWRITEAOF is not yet supported on the tokio runtime build. Use the monoio (default) build, or --shards 1.",
-            ));
-        }
-        #[cfg(not(feature = "runtime-tokio"))]
-        {
-            // try_send_rewrite_per_shard loads the manifest, builds the shared
-            // coordinator, and reliably fans out to every writer. The
-            // in-progress flag is cleared by the coordinator's final commit
-            // (PerShardRewriteCoord::shard_done), not here.
-            match pool.try_send_rewrite_per_shard(shard_databases) {
-                Ok(()) => {
-                    return Frame::SimpleString(Bytes::from_static(
-                        b"Background append only file rewriting started",
-                    ));
-                }
-                Err(e) => {
-                    AOF_REWRITE_IN_PROGRESS.store(false, Ordering::SeqCst);
-                    return rewrite_pool_error_frame(e);
-                }
+        // Per-shard fan-out for BOTH runtimes. The fold is synchronous std::fs
+        // IO; on monoio the writer runs it inline, on tokio the writer converts
+        // its `tokio::fs` handle to `std::fs` for the fold's duration (both run
+        // on a dedicated block_on_local thread, so blocking is safe). The fold
+        // body — and therefore the exactly-once invariant — is identical.
+        //
+        // try_send_rewrite_per_shard loads the manifest, builds the shared
+        // coordinator, and reliably fans out to every writer. The in-progress
+        // flag is cleared by the coordinator's final commit
+        // (PerShardRewriteCoord::shard_done), not here.
+        match pool.try_send_rewrite_per_shard(shard_databases) {
+            Ok(()) => {
+                return Frame::SimpleString(Bytes::from_static(
+                    b"Background append only file rewriting started",
+                ));
+            }
+            Err(e) => {
+                AOF_REWRITE_IN_PROGRESS.store(false, Ordering::SeqCst);
+                return rewrite_pool_error_frame(e);
             }
         }
     }

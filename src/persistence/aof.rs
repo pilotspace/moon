@@ -1940,19 +1940,48 @@ pub async fn per_shard_aof_writer_task(
                                 shard_id
                             );
                         }
-                        // [F6] Per-shard rewrite is monoio-only for now (the
-                        // fold uses synchronous std::fs IO). The command handler
-                        // refuses per-shard BGREWRITEAOF under runtime-tokio, so
-                        // this arm is unreachable in practice; it self-aborts
-                        // (clears the in-progress flag) if ever reached.
-                        Ok(AofMessage::RewritePerShard { coord, .. }) => {
-                            warn!(
-                                "AOF writer shard {}: per-shard BGREWRITEAOF not yet \
-                                 supported on the tokio runtime; aborting (no-op).",
-                                shard_id
-                            );
-                            coord.mark_failed();
-                            coord.shard_done();
+                        // [F6] Per-shard rewrite (tokio): reuse the proven
+                        // synchronous fold (`do_rewrite_per_shard`) verbatim, so
+                        // the exactly-once invariant carries over unchanged. This
+                        // writer runs on a DEDICATED std::thread (block_on_local,
+                        // main.rs) — not a shared tokio worker — so executing the
+                        // blocking fold here cannot starve the runtime. We flush
+                        // the BufWriter (its `into_inner` does NOT flush) so any
+                        // buffered appends are durable in the OLD incr, convert
+                        // `tokio::fs::File` -> `std::fs::File` for the sync fold,
+                        // then wrap the (reopened) file back into the BufWriter.
+                        Ok(AofMessage::RewritePerShard { shard_dbs, coord }) => {
+                            if let Err(e) = writer.flush().await {
+                                error!(
+                                    "F6 tokio per-shard rewrite: shard {} pre-fold flush \
+                                     failed: {}. Aborting; old generation stays authoritative.",
+                                    shard_id, e
+                                );
+                                coord.mark_failed();
+                                coord.shard_done();
+                            } else {
+                                // `into_std().await` waits for in-flight ops and is
+                                // infallible; the buffer is already flushed above.
+                                let mut sf = writer.into_inner().into_std().await;
+                                let res = do_rewrite_per_shard(
+                                    shard_id, &shard_dbs, &mut sf, &rx, &coord,
+                                );
+                                // On success `sf` points at the NEW incr (the fold
+                                // reopened it + already called `shard_done()`); on
+                                // error it is still the OLD incr (pre-reopen). Wrap
+                                // it back either way so the writer stays valid.
+                                writer =
+                                    tokio::io::BufWriter::new(tokio::fs::File::from_std(sf));
+                                if let Err(e) = res {
+                                    error!(
+                                        "F6 tokio per-shard rewrite: shard {} fold failed: {}. \
+                                         Aborting commit; old generation stays authoritative.",
+                                        shard_id, e
+                                    );
+                                    coord.mark_failed();
+                                    coord.shard_done();
+                                }
+                            }
                         }
                         Ok(AofMessage::Shutdown) | Err(_) => {
                             let _ = writer.flush().await;
@@ -2645,7 +2674,7 @@ fn snapshot_and_generate(db: &SharedDatabases) -> BytesMut {
 /// are dropped silently (duplicate rewrites while a rewrite is in progress) or
 /// returned via the flag for Shutdown (caller is responsible for honoring it
 /// after the rewrite completes).
-#[cfg(feature = "runtime-monoio")]
+#[cfg(any(feature = "runtime-monoio", feature = "runtime-tokio"))]
 #[derive(Default)]
 struct DrainOutcome {
     drained: usize,
@@ -2711,7 +2740,7 @@ fn drain_pending_appends(
 /// legacy TopLevel raw-RESP format). Correctness depends on the framing
 /// matching `replay_per_shard`'s reader — an unframed write here would make the
 /// drained appends unparseable on restart.
-#[cfg(feature = "runtime-monoio")]
+#[cfg(any(feature = "runtime-monoio", feature = "runtime-tokio"))]
 fn drain_pending_appends_framed(
     rx: &channel::MpscReceiver<AofMessage>,
     file: &mut std::fs::File,
@@ -2827,7 +2856,7 @@ fn drain_pending_appends_framed(
 /// known limitation (F6 is behind `--experimental-per-shard-rewrite`); the fix
 /// (keep draining during phase 6, or block-on-full for the rewrite's duration)
 /// is a separate scoped task. See `tmp/F6-known-limitations.md`.
-#[cfg(feature = "runtime-monoio")]
+#[cfg(any(feature = "runtime-monoio", feature = "runtime-tokio"))]
 fn do_rewrite_per_shard(
     shard_id: u16,
     shard_dbs: &crate::shard::shared_databases::ShardDatabases,

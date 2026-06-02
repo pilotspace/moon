@@ -707,20 +707,24 @@ fn main() -> anyhow::Result<()> {
         })
         .collect();
 
-    // Multi-part AOF replay layered on top of v2/v3 recovery.
+    // Multi-part AOF replay/init layered on top of v2/v3 recovery.
     // Priority: if appendonlydir/ manifest exists → load multi-part (skip legacy v2 fallback).
     // Otherwise v2 already handled legacy appendonly.aof during restore_from_persistence.
     //
-    // A corrupt manifest is FATAL: overwriting it silently destroys the reference
-    // to the real base RDB and loses all persisted data.
+    // A corrupt manifest is FATAL on BOTH runtimes (previously warn+continue
+    // under tokio): overwriting it silently destroys the reference to the real
+    // base RDB and loses all persisted data.
     //
-    // Gated to runtime-monoio: BGREWRITEAOF under runtime-tokio writes a
-    // single-file appendonly.aof with RDB preamble (legacy v2 format) and
-    // never advances the manifest. Engaging this block under tokio creates an
-    // empty manifest at first boot, then on the next boot wipes v2-loaded
-    // state because the multi-part replay finds no base RDB. This caused the
-    // tokio TXN replay regression that surfaced via test_txn_commit_wal_crash_recovery.
-    #[cfg(feature = "runtime-monoio")]
+    // Runtime split (the regression boundary): the multi-shard PerShard paths
+    // (initialize_multi + replay_per_shard) run under BOTH runtimes — the tokio
+    // per_shard_aof_writer_task writes the identical framed incr format
+    // (`[u64 lsn LE][u32 len LE][RESP]`) and replay_per_shard is
+    // runtime-agnostic. The SINGLE-shard multi-part paths stay monoio-only:
+    // tokio --shards 1 uses legacy single-file appendonly.aof (v2) + in-place
+    // BGREWRITEAOF, so engaging multi-part replay there finds an empty manifest,
+    // no rewritten base RDB, and wipes the v2-loaded state — the
+    // test_txn_commit_wal_crash_recovery regression. Each single-shard branch
+    // below is therefore #[cfg(runtime-monoio)] with a tokio warn fallback.
     if config.appendonly == "yes"
         && let Some(ref dir) = persistence_dir
     {
@@ -736,41 +740,66 @@ fn main() -> anyhow::Result<()> {
             })?;
         if let Some(ref manifest) = manifest_opt {
             if num_shards == 1 {
-                // Multi-part AOF is authoritative. Wipe any state that earlier
-                // recovery phases (per-shard WAL replay, legacy appendonly.aof
-                // fallback inside restore_from_persistence) may have loaded —
-                // otherwise non-idempotent commands from the incr log would
-                // double-apply on top of that pre-existing state.
-                for db in shards[0].databases.iter_mut() {
-                    db.clear();
-                }
-                let loaded = moon::persistence::aof_manifest::replay_multi_part(
-                    &mut shards[0].databases,
-                    manifest,
-                    &DispatchReplayEngine::new(),
-                )
-                .with_context(|| "multi-part AOF replay failed")?;
-                info!(
-                    "AOF multi-part loaded (seq {}): {} entries",
-                    manifest.seq, loaded
-                );
-
-                // Retire legacy appendonly.aof so future boots don't double-
-                // replay it via restore_from_persistence's fallback path.
-                // Rename (not delete) so an operator can recover if something
-                // went wrong.
-                let legacy = base_dir.join("appendonly.aof");
-                if legacy.exists() {
-                    let retired = base_dir.join("appendonly.aof.legacy");
-                    if let Err(e) = std::fs::rename(&legacy, &retired) {
-                        tracing::warn!("Failed to retire legacy AOF {}: {}", legacy.display(), e);
-                    } else {
-                        info!(
-                            "Retired legacy AOF {} → {}",
-                            legacy.display(),
-                            retired.display()
-                        );
+                // Single-shard multi-part replay is monoio-only (the regression
+                // boundary). Under tokio, --shards 1 uses legacy v2 single-file
+                // recovery; engaging multi-part replay here wipes v2 state.
+                #[cfg(feature = "runtime-monoio")]
+                {
+                    // Multi-part AOF is authoritative. Wipe any state that earlier
+                    // recovery phases (per-shard WAL replay, legacy appendonly.aof
+                    // fallback inside restore_from_persistence) may have loaded —
+                    // otherwise non-idempotent commands from the incr log would
+                    // double-apply on top of that pre-existing state.
+                    for db in shards[0].databases.iter_mut() {
+                        db.clear();
                     }
+                    let loaded = moon::persistence::aof_manifest::replay_multi_part(
+                        &mut shards[0].databases,
+                        manifest,
+                        &DispatchReplayEngine::new(),
+                    )
+                    .with_context(|| "multi-part AOF replay failed")?;
+                    info!(
+                        "AOF multi-part loaded (seq {}): {} entries",
+                        manifest.seq, loaded
+                    );
+
+                    // Retire legacy appendonly.aof so future boots don't double-
+                    // replay it via restore_from_persistence's fallback path.
+                    // Rename (not delete) so an operator can recover if something
+                    // went wrong.
+                    let legacy = base_dir.join("appendonly.aof");
+                    if legacy.exists() {
+                        let retired = base_dir.join("appendonly.aof.legacy");
+                        if let Err(e) = std::fs::rename(&legacy, &retired) {
+                            tracing::warn!(
+                                "Failed to retire legacy AOF {}: {}",
+                                legacy.display(),
+                                e
+                            );
+                        } else {
+                            info!(
+                                "Retired legacy AOF {} → {}",
+                                legacy.display(),
+                                retired.display()
+                            );
+                        }
+                    }
+                }
+                #[cfg(not(feature = "runtime-monoio"))]
+                {
+                    // tokio + --shards 1: single-shard multi-part replay is
+                    // monoio-only. Legacy v2 (appendonly.aof) recovery already
+                    // ran in restore_from_persistence; warn so an operator who
+                    // switched from monoio knows multi-part data isn't loaded by
+                    // this build.
+                    tracing::warn!(
+                        "multi-part AOF manifest at {}/appendonlydir/ found but runtime is \
+                         tokio with --shards 1; single-shard multi-part replay is monoio-only. \
+                         Legacy v2 (appendonly.aof) recovery active. Switch to monoio to load \
+                         multi-part single-shard data.",
+                        base_dir.display()
+                    );
                 }
             } else if manifest.layout == moon::persistence::aof_manifest::AofLayout::PerShard {
                 // Per-shard AOF replay (RFC § 2 rules 1-3, Option B step 4).
@@ -915,22 +944,33 @@ fn main() -> anyhow::Result<()> {
             // mode the multi-part path currently supports).
             let has_state = num_shards == 1 && shards[0].databases.iter().any(|db| db.len() > 0);
             if has_state {
-                let rdb_bytes = moon::persistence::rdb::save_to_bytes(&shards[0].databases)
-                    .with_context(|| "failed to serialize legacy state for AOF base")?;
-                AofManifest::initialize_with_base(&base_dir, &rdb_bytes)
-                    .with_context(|| "failed to initialize AOF manifest with base")?;
-                info!(
-                    "First-upgrade: captured legacy state as AOF base seq 1 ({} bytes)",
-                    rdb_bytes.len()
-                );
-                // Retire legacy appendonly.aof — its contents are now in
-                // the base RDB, and leaving it would cause v2 recovery on
-                // the next boot to double-replay it.
-                let legacy = base_dir.join("appendonly.aof");
-                if legacy.exists() {
-                    let retired = base_dir.join("appendonly.aof.legacy");
-                    if let Err(e) = std::fs::rename(&legacy, &retired) {
-                        tracing::warn!("Failed to retire legacy AOF {}: {}", legacy.display(), e);
+                // Single-shard legacy-upgrade capture is monoio-only. Under
+                // tokio, --shards 1 keeps v2 single-file recovery (no manifest);
+                // creating a seq-1 base here would trigger the empty-manifest
+                // replay regression on the next boot.
+                #[cfg(feature = "runtime-monoio")]
+                {
+                    let rdb_bytes = moon::persistence::rdb::save_to_bytes(&shards[0].databases)
+                        .with_context(|| "failed to serialize legacy state for AOF base")?;
+                    AofManifest::initialize_with_base(&base_dir, &rdb_bytes)
+                        .with_context(|| "failed to initialize AOF manifest with base")?;
+                    info!(
+                        "First-upgrade: captured legacy state as AOF base seq 1 ({} bytes)",
+                        rdb_bytes.len()
+                    );
+                    // Retire legacy appendonly.aof — its contents are now in
+                    // the base RDB, and leaving it would cause v2 recovery on
+                    // the next boot to double-replay it.
+                    let legacy = base_dir.join("appendonly.aof");
+                    if legacy.exists() {
+                        let retired = base_dir.join("appendonly.aof.legacy");
+                        if let Err(e) = std::fs::rename(&legacy, &retired) {
+                            tracing::warn!(
+                                "Failed to retire legacy AOF {}: {}",
+                                legacy.display(),
+                                e
+                            );
+                        }
                     }
                 }
             } else if num_shards >= 2 {
@@ -948,30 +988,20 @@ fn main() -> anyhow::Result<()> {
                     base_dir.display()
                 );
             } else {
+                // Single-shard fresh boot.
+                #[cfg(feature = "runtime-monoio")]
                 AofManifest::initialize(&base_dir)
                     .with_context(|| "failed to initialize AOF manifest")?;
+                // tokio --shards 1 fresh: no manifest (v2 single-file recovery
+                // owns single-shard durability). Creating one here would trigger
+                // the empty-manifest replay regression.
             }
         }
     }
 
-    // Under tokio, multi-part AOF is not supported. If a manifest exists, the
-    // operator likely switched from monoio — warn so they don't think their
-    // data is silently corrupted. v2 recovery (single-file appendonly.aof)
-    // remains active.
-    #[cfg(not(feature = "runtime-monoio"))]
-    if config.appendonly == "yes"
-        && let Some(ref dir) = persistence_dir
-    {
-        let manifest_path = std::path::PathBuf::from(dir).join("appendonlydir/moon.aof.manifest");
-        if manifest_path.exists() {
-            tracing::warn!(
-                "multi-part AOF manifest found at {} but runtime is tokio; ignoring. \
-                 Switch to monoio (cargo run --no-default-features --features runtime-monoio,jemalloc) \
-                 to load multi-part AOF data.",
-                manifest_path.display()
-            );
-        }
-    }
+    // (The former standalone tokio "multi-part AOF ignored" warn block was
+    // removed: multi-shard PerShard AOF is now loaded on tokio too, and the
+    // single-shard tokio warn is emitted inline above.)
 
     // Extract databases from all shards and wrap in ShardDatabases
     let all_dbs: Vec<Vec<moon::storage::Database>> = shards
