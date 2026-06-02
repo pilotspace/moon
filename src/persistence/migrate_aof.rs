@@ -20,9 +20,11 @@
 //!    which is where the bulk of the data lives after `BGREWRITEAOF`.
 //! 2. Read the RESP tail from the source AOF. For each command, extract the first
 //!    key argument and route to a shard via `key_to_shard(key, num_shards)`.
-//!    Commands without a key argument (SELECT, PING, DBSIZE, FLUSHDB, FLUSHALL)
-//!    are routed to shard 0 (conservative — FLUSHDB/FLUSHALL affect all shards
-//!    but the migration path leaves the operator to verify).
+//!    Commands without a key argument (PING, DBSIZE, FLUSHDB, FLUSHALL) are
+//!    routed to shard 0 (conservative — FLUSHDB/FLUSHALL affect all shards but
+//!    the migration path leaves the operator to verify). SELECT 0 is skipped as
+//!    a no-op; SELECT N (N>0) causes an immediate `Err` — multi-DB AOF cannot
+//!    be safely migrated (see Limitations).
 //! 3. Write each RESP command to the target shard's incr file in v2 framing format:
 //!    `[u64 lsn LE][u32 len LE][RESP bytes]`. LSNs are sequential per-shard
 //!    counters starting at 1. One corrupt command stops the remainder of the incr
@@ -31,10 +33,11 @@
 //!
 //! # Limitations
 //!
-//! - Multi-db AOF (SELECT + commands in db > 0) routes commands to their elected
-//!   shard. SELECT itself is silently dropped from the output (the per-shard
-//!   replay engine's own SELECT handling resets db to 0 per command, so sharded
-//!   multi-db is not supported).
+//! - Multi-db AOF (SELECT N where N>0): migration returns `Err` immediately.
+//!   Per-shard replay runs each shard independently and cannot preserve the
+//!   logical database across commands — silently dropping SELECT would corrupt
+//!   data. SELECT 0 is treated as a no-op and skipped. Operators must flush
+//!   non-default databases before migrating.
 //! - MULTI/EXEC blocks are not treated atomically — each command in the block
 //!   is routed independently.
 //! - Keyless commands (FLUSHDB, FLUSHALL) in the RESP tail go to shard 0 only;
@@ -403,7 +406,6 @@ fn append_resp_to_shards(
     let mut shard_files: Vec<std::fs::File> = (0..num_shards)
         .map(|sid| {
             std::fs::OpenOptions::new()
-                .write(true)
                 .append(true)
                 .open(manifest.shard_incr_path(sid))
                 .map_err(|e| {
