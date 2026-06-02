@@ -2808,6 +2808,25 @@ fn drain_pending_appends_framed(
 /// future Phase 4 that makes ShardSlice live MUST revisit this fold: the writer
 /// thread cannot lock another thread's `!Send` `Rc<RefCell<Shard>>`, so the
 /// per-shard rewrite would need a different snapshot-coordination mechanism.
+///
+/// # Known limitation — channel saturation during the fold
+///
+/// Exactly-once holds *absent append-channel saturation during the fold*. While
+/// this function runs (phases 2-6, including the base-RDB serialize + write +
+/// fsync of phase 6, which is hundreds of ms on a large shard) the writer is
+/// NOT in its recv loop, so it is not draining the bounded
+/// `mpsc_bounded::<AofMessage>(10_000)` append channel. Post-snapshot appends
+/// queue there for the new incr; the event loop enqueues them with
+/// `try_send_append` (drop-on-full, return ignored — `spsc_handler.rs`). Under
+/// *sustained concurrent* writes on a large dataset, > 10_000 appends can pile
+/// up during the window and the overflow is silently dropped — lost even on a
+/// clean restart (worse than the everysec contract, which only loses on crash).
+/// The single-client crash matrix cannot surface this (serialized `redis-cli`
+/// never pressures the channel). This window is *pre-existing*: the shipped
+/// `do_rewrite_sharded` has the identical non-draining gap. Tracked as a
+/// known limitation (F6 is behind `--experimental-per-shard-rewrite`); the fix
+/// (keep draining during phase 6, or block-on-full for the rewrite's duration)
+/// is a separate scoped task. See `tmp/F6-known-limitations.md`.
 #[cfg(feature = "runtime-monoio")]
 fn do_rewrite_per_shard(
     shard_id: u16,
