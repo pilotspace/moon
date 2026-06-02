@@ -123,6 +123,14 @@ pub(crate) fn spawn_tokio_connection(
     shard_id: usize,
     num_shards: usize,
     config_port: u16,
+    // Disk-offload spill context (mirrors spawn_monoio_connection). The
+    // per-shard event loop owns the SpillThread; threading its sender + the
+    // shared file-id counter + the <offload>/shard-{id} dir into the ConnCtx
+    // lets handler_sharded spill evicted KVs to the cold tier instead of
+    // deleting them. All None/empty when disk-offload is disabled.
+    spill_sender: &Option<flume::Sender<crate::storage::tiered::spill_thread::SpillRequest>>,
+    spill_file_id: &Rc<std::cell::Cell<u64>>,
+    disk_offload_dir: &Option<std::path::PathBuf>,
 ) {
     use crate::server::connection::handle_connection_sharded;
     use crate::server::connection::handle_connection_sharded_inner;
@@ -198,9 +206,9 @@ pub(crate) fn spawn_tokio_connection(
         all_regs,
         all_rsm,
         aff,
-        None, // spill_sender (tokio handler doesn't use tiered storage)
-        Rc::new(std::cell::Cell::new(0)), // spill_file_id placeholder
-        None, // disk_offload_dir
+        spill_sender.clone(),
+        spill_file_id.clone(),
+        disk_offload_dir.clone(),
     );
 
     if let (true, Some(tls_swap)) = (is_tls, tls_config.as_ref()) {

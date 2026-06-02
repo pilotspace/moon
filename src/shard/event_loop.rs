@@ -1061,6 +1061,7 @@ impl super::Shard {
                                 &cached_clock, &remote_sub_map_arc, &all_pubsub_registries,
                                 &all_remote_sub_maps, &affinity_tracker,
                                 shard_id, num_shards, config_port,
+                                &spill_sender, &spill_file_id, &disk_offload_dir,
                             );
                         }
                         Err(e) => {
@@ -1112,6 +1113,7 @@ impl super::Shard {
                                 &all_remote_sub_maps,
                                 &affinity_tracker,
                                 shard_id, num_shards, config_port,
+                                &spill_sender, &spill_file_id, &disk_offload_dir,
                             );
                         }
                         Err(_) => {
