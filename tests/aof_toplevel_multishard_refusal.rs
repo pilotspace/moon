@@ -40,8 +40,13 @@ fn setup_toplevel_dir(suffix: &str) -> PathBuf {
     fs::create_dir_all(&aof_dir).expect("create appendonlydir");
 
     // Minimal v1 manifest content (no `version` line = TopLevel layout).
-    // The manifest parser treats absence of `version 2` as TopLevel.
-    let manifest_content = "file moon.aof.1.base.rdb\nfile moon.aof.1.incr.aof\n";
+    // parse_v1 expects lines with prefixes `seq N`, `base <file>`, `incr <file>`.
+    // The `file` prefix is NOT a valid v1 keyword — parse_v1 would reject it
+    // with "no valid sequence number". The correct format is:
+    //   seq 1
+    //   base moon.aof.1.base.rdb
+    //   incr moon.aof.1.incr.aof
+    let manifest_content = "seq 1\nbase moon.aof.1.base.rdb\nincr moon.aof.1.incr.aof\n";
     fs::write(aof_dir.join("moon.aof.manifest"), manifest_content)
         .expect("write manifest");
 

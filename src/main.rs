@@ -353,7 +353,16 @@ fn main() -> anyhow::Result<()> {
     } else {
         None
     };
+    // Shard-count mismatch guard. The TopLevel + multi-shard combination is
+    // intentionally excluded here: a v1 TopLevel manifest always has shards=1
+    // in its record, but when restarted with --shards >= 2 the correct
+    // response is the actionable migration refusal at the AOF recovery block
+    // below (line ~767), NOT the generic "shard count changed" message from
+    // verify_shard_count. Letting verify_shard_count fire first would hide
+    // that specific refusal behind a less actionable error, making it
+    // unreachable dead code.
     if let Some(ref m) = existing_manifest
+        && !(m.layout == AofLayout::TopLevel && num_shards >= 2)
         && let Err(e) = m.verify_shard_count(num_shards as u16)
     {
         eprintln!("REFUSING TO START: {e}");
