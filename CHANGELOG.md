@@ -10,6 +10,46 @@ The v0.2 enterprise beachhead. Built additively on per-shard WAL v3 + the
 dual-root manifest; no changes to the KV hot path, MVCC, page format, or
 transaction layer.
 
+### Persistence — Per-shard AOF migration complete (PR #129)
+
+Closes the P0 multi-shard AOF data-loss bug (~50% loss on SIGKILL with
+`--shards >= 2 + --appendonly yes`) by shipping the full per-shard AOF
+architecture (Option B of `tmp/rfc-per-shard-aof-v02.md`).
+
+- **H2 closed** — `src/main.rs` no longer skips multi-shard AOF replay.
+  Each shard owns its own writer task; recovery walks every shard's segment
+  manifest independently. Shard replay is parallel (recovery time does
+  not grow linearly with shard count).
+- **H1 closed** — new `AppendSync { bytes, ack }` rendezvous variant
+  ensures `+OK` is on the wire only after fsync ack under
+  `appendfsync=always`. `try_send` (`everysec`/`no`) paths unchanged.
+- **`--unsafe-multishard-aof` deprecated** — was the v0.1.13 escape hatch
+  acknowledging the ~50% loss risk. The flag is now a no-op that prints
+  `[DEPRECATED]` at startup; will be removed in v0.2.0-rc.
+- **CRASH-01-LITE matrix** — 200/200 SIGKILL recoveries across
+  `--shards 1/2/4/8` × `appendfsync always/everysec`. Gated in
+  `.github/workflows/integration-tests.yml`; run locally with
+  `cargo test --release crash_01_lite` on the moon-dev OrbStack VM.
+- **TopLevel-manifest safety guard** — Moon refuses to start (exit 2) when
+  it finds an existing v0.1.13-style TopLevel manifest with `--shards >= 2`,
+  to prevent silent data loss from replaying a non-routed log. Migration
+  via `docs/runbooks/multi-shard-aof-rewrite.md` Option A.
+- **`INFO persistence`** — new field `aof_backpressure_dropped:<N>` exposes
+  per-shard writer drop counts; non-zero indicates the AOF writer is
+  falling behind write throughput.
+- **Per-shard layout on disk:** `appendonlydir/shard-{N}/moon.aof.{seq}.base.rdb`
+  + `moon.aof.{seq}.incr.aof` mirrors the per-shard WAL v3 design.
+
+Architectural follow-ups parked for v0.2.0:
+
+- Rule 3 (LSN ordering invariant) under per-shard topology — issue #131
+- Always-fsync handler-layer integration audit — issue #132
+- `OrderedAcrossShards` merge-replay correctness on large transcripts — issue #133
+
+Per-shard `BGREWRITEAOF` (step 6 of the migration RFC) is **not yet in
+this PR**; rewriting a per-shard AOF returns `ERR BGREWRITEAOF is not yet
+supported under per-shard AOF layout`. Tracked for v0.2.0.
+
 **Headline capabilities landed in alpha:**
 
 - **Point-in-Time Recovery (PITR)** — `--recovery-target-lsn` /

@@ -168,7 +168,7 @@ traced to source).
 | Threading model                      | Thread-per-core, shared-nothing | Single main thread + ≤9 I/O threads | Single-threaded core (+ I/O threads) |
 | I/O driver (Linux)                   | io_uring (`monoio`)            | epoll only                  | epoll only                |
 | Snapshot                             | **Forkless** (segment-level COW) | `fork()` + COW              | `fork()` + COW            |
-| AOF / WAL                            | Per-shard WAL v3 + multi-part AOF | Single global AOF         | Single global AOF         |
+| AOF / WAL                            | Per-shard WAL v3 + **per-shard AOF** | Single global AOF         | Single global AOF         |
 | Tiered NVMe disk offload             | **Yes** (under `maxmemory`)    | No (OSS)                    | No (OSS — Redis Flash is Enterprise) |
 | Vector search                        | **In-core** HNSW + TurboQuant 1-8 bit | `valkey-search` module, FP32 only | RediSearch module |
 | Full-text BM25                       | **In-core**                    | `valkey-search` module      | RediSearch module         |
