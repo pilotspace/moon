@@ -814,16 +814,30 @@ impl AofManifest {
         }
         std::fs::create_dir_all(&new_dir)?;
 
-        // Move base. If this fails, no on-disk mutation happened yet — bail
-        // without rollback. Layout stays TopLevel until commit at the bottom.
+        // Move base. If the rename itself fails, no on-disk mutation has
+        // happened yet — bail without rollback. Layout stays TopLevel until
+        // commit at the bottom.
         std::fs::rename(&old_base, &new_base)?;
-        // Fsync the target directory so the rename is durable before we
-        // proceed. A crash after rename but before dir-fsync could leave
-        // the old file name visible on the next boot. This function returns
-        // std::io::Result, so we propagate with `?`.
-        fsync_directory(&new_dir)?;
 
-        // Base is now in shard-0/. Any subsequent error must restore it.
+        // Fsync the target directory so the base rename is durable before we
+        // proceed. A crash after rename but before dir-fsync could leave the
+        // old filename visible on the next boot.
+        //
+        // NOTE: if this fsync fails, old_base has already moved to new_base —
+        // rollback the rename before returning so the manifest stays consistent.
+        if let Err(e) = fsync_directory(&new_dir) {
+            if let Err(re) = std::fs::rename(&new_base, &old_base) {
+                error!(
+                    "Migration rollback: failed to restore base {} → {} after fsync_directory failure: {}",
+                    new_base.display(),
+                    old_base.display(),
+                    re
+                );
+            }
+            return Err(e);
+        }
+
+        // Base is now durably in shard-0/. Any subsequent error must restore it.
         let moved_incr: bool;
         let created_incr: bool;
         if old_incr.exists() {
@@ -839,7 +853,26 @@ impl AofManifest {
                 return Err(e);
             }
             // Fsync the shard directory to make the incr rename durable.
-            fsync_directory(&new_dir)?;
+            // If this fails, roll back both incr and base renames.
+            if let Err(e) = fsync_directory(&new_dir) {
+                if let Err(re) = std::fs::rename(&new_incr, &old_incr) {
+                    error!(
+                        "Migration rollback: failed to restore incr {} → {} after fsync_directory failure: {}",
+                        new_incr.display(),
+                        old_incr.display(),
+                        re
+                    );
+                }
+                if let Err(re) = std::fs::rename(&new_base, &old_base) {
+                    error!(
+                        "Migration rollback: failed to restore base {} → {} after fsync_directory failure: {}",
+                        new_base.display(),
+                        old_base.display(),
+                        re
+                    );
+                }
+                return Err(e);
+            }
             moved_incr = true;
             created_incr = false;
         } else {
@@ -2580,15 +2613,16 @@ mod tests_v2 {
 
     // -----------------------------------------------------------------------
     // FIX-W2-7: smoke test — fsync helper consolidation did not break
-    // initialize_multi. Confirms the helper swap compiles and runs correctly.
-    // (No assertion that fsync was called — a failed fsync on a tmpfs would
-    // produce a false negative on most CI hosts.)
+    // initialize_multi. Checks that the post-consolidation manifest has the
+    // correct PerShard layout, the expected shard count, and per-shard
+    // base/incr files. This is discriminating: a regression that produces a
+    // TopLevel manifest or wrong shard count will be caught here.
     // -----------------------------------------------------------------------
     #[test]
     fn initialize_multi_smoke_after_fsync_consolidation() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let dir = tmp.path();
-        let n = 2;
+        let n: u16 = 2;
         let result = AofManifest::initialize_multi(dir, n);
         assert!(
             result.is_ok(),
@@ -2596,15 +2630,42 @@ mod tests_v2 {
             result.err()
         );
         let manifest = result.unwrap();
+
+        // Discriminating: layout must be PerShard, not TopLevel.
+        assert_eq!(
+            manifest.layout,
+            AofLayout::PerShard,
+            "initialize_multi must produce a PerShard manifest"
+        );
+        // Discriminating: shard count must match the requested count.
+        assert_eq!(
+            manifest.shards.len() as u16,
+            n,
+            "manifest must record exactly {n} shards, got {}",
+            manifest.shards.len()
+        );
+        // Discriminating: per-shard base RDB and incr files must exist on disk.
         for shard_id in 0..n {
             assert!(
                 manifest.shard_base_path(shard_id).exists(),
-                "shard-{shard_id} base RDB must exist"
+                "shard-{shard_id} base RDB must exist at {}",
+                manifest.shard_base_path(shard_id).display()
             );
             assert!(
                 manifest.shard_incr_path(shard_id).exists(),
-                "shard-{shard_id} incr file must exist"
+                "shard-{shard_id} incr file must exist at {}",
+                manifest.shard_incr_path(shard_id).display()
             );
         }
+        // Discriminating: the on-disk manifest file must contain `version 2`
+        // (PerShard v2 header), not be a bare v1 file.
+        let manifest_path = dir.join(AOF_DIR_NAME).join("moon.aof.manifest");
+        let content = std::fs::read_to_string(&manifest_path)
+            .expect("manifest file must be readable");
+        assert!(
+            content.contains("version 2"),
+            "manifest file must contain 'version 2' (PerShard v2 header); got:\n{}",
+            content
+        );
     }
 }
