@@ -305,8 +305,9 @@ fn test_inline_set_with_aof_falls_through_when_writes_disabled() {
     // SET falls through when can_inline_writes=false even with AOF.
     let dbs = make_dbs();
     let (aof_sender, _aof_receiver) = channel::mpsc_bounded::<AofMessage>(16);
-    let aof_pool: Option<std::sync::Arc<crate::persistence::aof::AofWriterPool>> =
-        Some(crate::persistence::aof::AofWriterPool::top_level(aof_sender));
+    let aof_pool: Option<std::sync::Arc<crate::persistence::aof::AofWriterPool>> = Some(
+        crate::persistence::aof::AofWriterPool::top_level(aof_sender),
+    );
     let cmd = b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n";
     let mut read_buf = BytesMut::from(&cmd[..]);
     let original_len = read_buf.len();

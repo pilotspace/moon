@@ -522,8 +522,8 @@ pub(crate) fn handle_shard_message_shared(
                             replica_txs,
                             repl_state,
                             shard_id,
-                        aof_pool, // FIX-W1-2
-        );
+                            aof_pool, // FIX-W1-2
+                        );
                     }
                     let _ = reply_tx.send(response);
                     return;
@@ -587,8 +587,8 @@ pub(crate) fn handle_shard_message_shared(
                                 replica_txs,
                                 repl_state,
                                 shard_id,
-                            aof_pool, // FIX-W1-2
-        );
+                                aof_pool, // FIX-W1-2
+                            );
                         }
                         let _ = reply_tx.send(response);
                         return;
@@ -628,8 +628,8 @@ pub(crate) fn handle_shard_message_shared(
                                 replica_txs,
                                 repl_state,
                                 shard_id,
-                            aof_pool, // FIX-W1-2
-        );
+                                aof_pool, // FIX-W1-2
+                            );
                         }
 
                         // Post-dispatch wakeup hooks for producer commands (cross-shard blocking)
@@ -721,8 +721,8 @@ pub(crate) fn handle_shard_message_shared(
                             replica_txs,
                             repl_state,
                             shard_id,
-                        aof_pool, // FIX-W1-2
-        );
+                            aof_pool, // FIX-W1-2
+                        );
                     }
 
                     // Post-dispatch wakeup hooks for producer commands (cross-shard blocking)
@@ -857,8 +857,8 @@ pub(crate) fn handle_shard_message_shared(
                                 replica_txs,
                                 repl_state,
                                 shard_id,
-                            aof_pool, // FIX-W1-2
-        );
+                                aof_pool, // FIX-W1-2
+                            );
 
                             let needs_wake = cmd.eq_ignore_ascii_case(b"LPUSH")
                                 || cmd.eq_ignore_ascii_case(b"RPUSH")
@@ -937,8 +937,8 @@ pub(crate) fn handle_shard_message_shared(
                             replica_txs,
                             repl_state,
                             shard_id,
-                        aof_pool, // FIX-W1-2
-        );
+                            aof_pool, // FIX-W1-2
+                        );
 
                         // Wake blocked waiters for producer commands (same as Execute path)
                         let needs_wake = cmd.eq_ignore_ascii_case(b"LPUSH")
@@ -1030,14 +1030,14 @@ pub(crate) fn handle_shard_message_shared(
                                 replica_txs,
                                 repl_state,
                                 shard_id,
-                            // FIX-W1-2 r2: PipelineBatch AOF is written by the
-                            // connection handler coordinator AFTER collecting the
-                            // shard response (handler_monoio/mod.rs:2004,
-                            // handler_sharded/mod.rs:1703). Passing aof_pool here
-                            // would cause a second write to the same shard's AOF
-                            // file, doubling every cross-shard pipeline entry.
-                            None,
-        );
+                                // FIX-W1-2 r2: PipelineBatch AOF is written by the
+                                // connection handler coordinator AFTER collecting the
+                                // shard response (handler_monoio/mod.rs:2004,
+                                // handler_sharded/mod.rs:1703). Passing aof_pool here
+                                // would cause a second write to the same shard's AOF
+                                // file, doubling every cross-shard pipeline entry.
+                                None,
+                            );
                         }
 
                         // Auto-index: if HSET succeeded, check for vector index match.
@@ -1139,13 +1139,13 @@ pub(crate) fn handle_shard_message_shared(
                             replica_txs,
                             repl_state,
                             shard_id,
-                        // FIX-W1-2 r2: PipelineBatch AOF is handled by the
-                        // connection-handler coordinator after collecting the
-                        // shard response (handler_monoio/mod.rs:2004). Passing
-                        // aof_pool here would produce a duplicate AOF entry for
-                        // every cross-shard pipeline command.
-                        None,
-        );
+                            // FIX-W1-2 r2: PipelineBatch AOF is handled by the
+                            // connection-handler coordinator after collecting the
+                            // shard response (handler_monoio/mod.rs:2004). Passing
+                            // aof_pool here would produce a duplicate AOF entry for
+                            // every cross-shard pipeline command.
+                            None,
+                        );
                     }
 
                     // Auto-index: if HSET succeeded, check for vector index match
@@ -1257,8 +1257,8 @@ pub(crate) fn handle_shard_message_shared(
                                 replica_txs,
                                 repl_state,
                                 shard_id,
-                            aof_pool, // FIX-W1-2
-        );
+                                aof_pool, // FIX-W1-2
+                            );
                         }
 
                         if !matches!(frame, crate::protocol::Frame::Error(_)) {
@@ -1325,8 +1325,8 @@ pub(crate) fn handle_shard_message_shared(
                             replica_txs,
                             repl_state,
                             shard_id,
-                        aof_pool, // FIX-W1-2
-        );
+                            aof_pool, // FIX-W1-2
+                        );
                     }
 
                     if !matches!(frame, crate::protocol::Frame::Error(_)) {
@@ -1418,8 +1418,8 @@ pub(crate) fn handle_shard_message_shared(
                                 replica_txs,
                                 repl_state,
                                 shard_id,
-                            aof_pool, // FIX-W1-2
-        );
+                                aof_pool, // FIX-W1-2
+                            );
 
                             let needs_wake = cmd.eq_ignore_ascii_case(b"LPUSH")
                                 || cmd.eq_ignore_ascii_case(b"RPUSH")
@@ -1495,8 +1495,8 @@ pub(crate) fn handle_shard_message_shared(
                             replica_txs,
                             repl_state,
                             shard_id,
-                        aof_pool, // FIX-W1-2
-        );
+                            aof_pool, // FIX-W1-2
+                        );
 
                         let needs_wake = cmd.eq_ignore_ascii_case(b"LPUSH")
                             || cmd.eq_ignore_ascii_case(b"RPUSH")
@@ -1588,13 +1588,13 @@ pub(crate) fn handle_shard_message_shared(
                                 replica_txs,
                                 repl_state,
                                 shard_id,
-                            // FIX-W1-2 r2: PipelineBatchSlotted AOF is written by the
-                            // connection-handler coordinator after collecting the shard
-                            // response (handler_sharded/mod.rs:1703). Passing aof_pool
-                            // here produces a duplicate AOF entry for every cross-shard
-                            // pipeline command (double-write P0 bug).
-                            None,
-        );
+                                // FIX-W1-2 r2: PipelineBatchSlotted AOF is written by the
+                                // connection-handler coordinator after collecting the shard
+                                // response (handler_sharded/mod.rs:1703). Passing aof_pool
+                                // here produces a duplicate AOF entry for every cross-shard
+                                // pipeline command (double-write P0 bug).
+                                None,
+                            );
                         }
 
                         // Auto-index: if HSET succeeded, check for vector index match.
@@ -1692,11 +1692,11 @@ pub(crate) fn handle_shard_message_shared(
                             replica_txs,
                             repl_state,
                             shard_id,
-                        // FIX-W1-2 r2: PipelineBatchSlotted AOF (else branch — pre-
-                        // ShardSlice path) is handled by handler_sharded/mod.rs:1703.
-                        // Passing aof_pool here duplicates the AOF entry.
-                        None,
-        );
+                            // FIX-W1-2 r2: PipelineBatchSlotted AOF (else branch — pre-
+                            // ShardSlice path) is handled by handler_sharded/mod.rs:1703.
+                            // Passing aof_pool here duplicates the AOF entry.
+                            None,
+                        );
                     }
 
                     // Auto-index: if HSET succeeded, check for vector index match
@@ -2379,8 +2379,8 @@ pub(crate) fn handle_shard_message_shared(
                 replica_txs,
                 repl_state,
                 shard_id,
-            aof_pool, // FIX-W1-2
-        );
+                aof_pool, // FIX-W1-2
+            );
 
             // Perform the in-place swap under ascending-index write locks.
             shard_databases.swap_dbs(shard_id, a, b);
@@ -3188,8 +3188,8 @@ mod wal_append_tests {
 
         wal_append_and_fanout(
             b"world",
-            &mut None,  // no v2 writer
-            &mut None,  // no v3 writer
+            &mut None, // no v2 writer
+            &mut None, // no v3 writer
             &backlog,
             &[],         // no replicas — S3.5b bypass triggered without pool guard
             &None,       // no repl_state
@@ -3198,10 +3198,16 @@ mod wal_append_tests {
         );
 
         // The pool should have received exactly one message.
-        let msg = rx.try_recv().expect("pool must have received an AOF append");
+        let msg = rx
+            .try_recv()
+            .expect("pool must have received an AOF append");
         match msg {
             AofMessage::Append { bytes, .. } => {
-                assert_eq!(bytes.as_ref(), b"world", "pool must receive the correct bytes");
+                assert_eq!(
+                    bytes.as_ref(),
+                    b"world",
+                    "pool must receive the correct bytes"
+                );
             }
             AofMessage::AppendSync { .. } => panic!("expected Append, got AppendSync"),
             AofMessage::Rewrite(_) => panic!("expected Append, got Rewrite"),
@@ -3228,27 +3234,25 @@ mod wal_append_tests {
         use crate::persistence::aof::{AofMessage, AofWriterPool, FsyncPolicy};
         use crate::runtime::channel::mpsc_bounded;
 
-        let backlog: SharedBacklog = std::sync::Arc::new(parking_lot::Mutex::new(Some(
-            ReplicationBacklog::new(1024),
-        )));
+        let backlog: SharedBacklog =
+            std::sync::Arc::new(parking_lot::Mutex::new(Some(ReplicationBacklog::new(1024))));
 
         // Build a 2-shard pool so per_shard_with_policy's debug_assert passes.
         let (tx0, rx0) = mpsc_bounded::<AofMessage>(16);
         let (tx1, rx1) = mpsc_bounded::<AofMessage>(16);
-        let pool =
-            AofWriterPool::per_shard_with_policy(vec![tx0, tx1], FsyncPolicy::EverySec);
+        let pool = AofWriterPool::per_shard_with_policy(vec![tx0, tx1], FsyncPolicy::EverySec);
 
         // ── PipelineBatch path: caller passes None ──
         // Pre-fix this was `aof_pool` (Some), which caused the double-write.
         wal_append_and_fanout(
             b"*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n",
-            &mut None,  // no v2 writer
-            &mut None,  // no v3 writer
+            &mut None, // no v2 writer
+            &mut None, // no v3 writer
             &backlog,
-            &[],        // no replicas
-            &None,      // no repl_state
-            0,          // shard_id
-            None,       // PipelineBatch fix: None prevents double-write
+            &[],   // no replicas
+            &None, // no repl_state
+            0,     // shard_id
+            None,  // PipelineBatch fix: None prevents double-write
         );
         assert!(
             rx0.try_recv().is_err(),

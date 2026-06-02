@@ -47,8 +47,7 @@ fn setup_toplevel_dir(suffix: &str) -> PathBuf {
     //   base moon.aof.1.base.rdb
     //   incr moon.aof.1.incr.aof
     let manifest_content = "seq 1\nbase moon.aof.1.base.rdb\nincr moon.aof.1.incr.aof\n";
-    fs::write(aof_dir.join("moon.aof.manifest"), manifest_content)
-        .expect("write manifest");
+    fs::write(aof_dir.join("moon.aof.manifest"), manifest_content).expect("write manifest");
 
     // Create stub base and incr files so the manifest path check passes.
     fs::write(aof_dir.join("moon.aof.1.base.rdb"), b"").expect("write stub base");
@@ -82,12 +81,8 @@ fn toplevel_manifest_with_multishard_exits_2_and_prints_refusing_to_start() {
             "--dir",
         ])
         .arg(&dir)
-        .stdout(
-            fs::File::create(&stdout_log).expect("create stdout log"),
-        )
-        .stderr(
-            fs::File::create(&stderr_log).expect("create stderr log"),
-        )
+        .stdout(fs::File::create(&stdout_log).expect("create stdout log"))
+        .stderr(fs::File::create(&stderr_log).expect("create stderr log"))
         .spawn()
         .expect("spawn moon (run `cargo build --release` first)");
 
@@ -185,7 +180,8 @@ fn toplevel_manifest_with_single_shard_is_allowed() {
                 let code = status.code().unwrap_or(-1);
                 // If it exited with code 2 it incorrectly refused a single-shard TopLevel boot.
                 assert_ne!(
-                    code, 2,
+                    code,
+                    2,
                     "Moon must NOT refuse single-shard + TopLevel manifest; got exit 2. \
                      stderr: {}",
                     fs::read_to_string(&stderr_log).unwrap_or_default()

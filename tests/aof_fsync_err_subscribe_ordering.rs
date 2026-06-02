@@ -89,7 +89,9 @@ fn send_resp(stream: &mut TcpStream, args: &[&str]) {
     for arg in args {
         buf.push_str(&format!("${}\r\n{}\r\n", arg.len(), arg));
     }
-    stream.write_all(buf.as_bytes()).expect("write RESP command");
+    stream
+        .write_all(buf.as_bytes())
+        .expect("write RESP command");
 }
 
 /// Read one complete RESP response (simple, error, or bulk) from the stream.
@@ -114,9 +116,7 @@ fn assert_aof_fsync_err_before_subscribe_ok(port: u16, shards: u16) {
 
     let result = std::panic::catch_unwind(|| {
         let stream = TcpStream::connect(("127.0.0.1", port)).expect("connect");
-        stream
-            .set_read_timeout(Some(Duration::from_secs(3)))
-            .ok();
+        stream.set_read_timeout(Some(Duration::from_secs(3))).ok();
         let stream_clone = stream.try_clone().expect("clone stream");
         let mut reader = BufReader::new(stream_clone);
         let mut writer = stream;

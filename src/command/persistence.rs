@@ -413,9 +413,9 @@ mod tests {
         // Wrap as a TopLevel pool to match the post-2e-β helper signature.
         let (tx, _rx) = crate::runtime::channel::mpsc_bounded::<AofMessage>(1);
         let pool = AofWriterPool::top_level(tx);
-        let shard_dbs = crate::shard::shared_databases::ShardDatabases::new(
-            vec![vec![crate::storage::Database::new()]],
-        );
+        let shard_dbs = crate::shard::shared_databases::ShardDatabases::new(vec![vec![
+            crate::storage::Database::new(),
+        ]]);
 
         // Snapshot prior state so the test is order-independent.
         let prior = MULTI_SHARD_AOF_REWRITE_UNSAFE.load(Ordering::Relaxed);
@@ -477,9 +477,9 @@ mod tests {
         let _guard = GATE_TEST_LOCK.lock();
         let (tx, _rx) = crate::runtime::channel::mpsc_bounded::<AofMessage>(1);
         let pool = AofWriterPool::top_level(tx);
-        let shard_dbs = crate::shard::shared_databases::ShardDatabases::new(
-            vec![vec![crate::storage::Database::new()]],
-        );
+        let shard_dbs = crate::shard::shared_databases::ShardDatabases::new(vec![vec![
+            crate::storage::Database::new(),
+        ]]);
 
         let prior = MULTI_SHARD_AOF_REWRITE_UNSAFE.load(Ordering::Relaxed);
         let prior_in_progress = AOF_REWRITE_IN_PROGRESS.load(Ordering::SeqCst);

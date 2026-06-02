@@ -1159,8 +1159,7 @@ pub(crate) fn try_inline_dispatch(
     // path (handler_monoio/handler_sharded) uses
     // `AofWriterPool::try_send_append_durable` and awaits the ack.
     if let Some(pool) = aof_pool {
-        if pool.fsync_policy() == crate::persistence::aof::FsyncPolicy::Always
-            && buf[1] == b'3'
+        if pool.fsync_policy() == crate::persistence::aof::FsyncPolicy::Always && buf[1] == b'3'
         // SET shape (*3 ...); GETs (*2) are still safe to inline.
         {
             return 0;

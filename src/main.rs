@@ -76,9 +76,7 @@ fn main() -> anyhow::Result<()> {
     // directory is never modified and the destination is populated atomically.
     if let Some(ref from) = config.migrate_aof_from {
         let to = config.migrate_aof_to.as_deref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "--migrate-aof-to is required when --migrate-aof-from is set"
-            )
+            anyhow::anyhow!("--migrate-aof-to is required when --migrate-aof-from is set")
         })?;
         if config.migrate_aof_shards == 0 {
             return Err(anyhow::anyhow!(
@@ -99,15 +97,15 @@ fn main() -> anyhow::Result<()> {
                 e
             ));
         }
-        let result = moon::persistence::migrate_aof::migrate_aof(
-            from,
-            to,
-            config.migrate_aof_shards,
-        )
-        .map_err(|e| anyhow::anyhow!("AOF migration failed: {}", e))?;
+        let result =
+            moon::persistence::migrate_aof::migrate_aof(from, to, config.migrate_aof_shards)
+                .map_err(|e| anyhow::anyhow!("AOF migration failed: {}", e))?;
         info!(
             "AOF migration complete: {} RDB keys migrated, {} commands read, {} written, {} skipped",
-            result.rdb_keys_migrated, result.commands_read, result.commands_written, result.commands_skipped
+            result.rdb_keys_migrated,
+            result.commands_read,
+            result.commands_written,
+            result.commands_skipped
         );
         return Ok(());
     }
@@ -316,8 +314,7 @@ fn main() -> anyhow::Result<()> {
     // would silently wrap for values > 65535. Fail loudly instead.
     // ALLOW: panic is appropriate here — this is `main`, not library code.
     #[allow(clippy::expect_used)]
-    let shard_count_u16: u16 =
-        u16::try_from(num_shards).expect("--shards must be <= 65535");
+    let shard_count_u16: u16 = u16::try_from(num_shards).expect("--shards must be <= 65535");
 
     // P0-FIX-01b LIFTED (Option B step 9, 2026-06-01): the per-shard AOF
     // pipeline (RFC steps 1-8) makes `--shards >= 2 + --appendonly yes`
@@ -474,11 +471,7 @@ fn main() -> anyhow::Result<()> {
                         RuntimeFactoryImpl::block_on_local(
                             thread_name_inner,
                             aof::per_shard_aof_writer_task(
-                                rx,
-                                base_dir,
-                                sid as u16,
-                                fsync,
-                                aof_token,
+                                rx, base_dir, sid as u16, fsync, aof_token,
                             ),
                         );
                     })
@@ -741,9 +734,7 @@ fn main() -> anyhow::Result<()> {
                         );
                     }
                 }
-            } else if manifest.layout
-                == moon::persistence::aof_manifest::AofLayout::PerShard
-            {
+            } else if manifest.layout == moon::persistence::aof_manifest::AofLayout::PerShard {
                 // Per-shard AOF replay (RFC § 2 rules 1-3, Option B step 4).
                 //
                 // Wipe any state earlier recovery phases loaded for each shard —
@@ -766,9 +757,10 @@ fn main() -> anyhow::Result<()> {
                 // `DispatchReplayEngine` per thread, avoiding the `!Sync` `RefCell`
                 // conflict that would arise from sharing a single engine instance
                 // across threads (under the `graph` feature).
-                let engine_factory = || -> Box<dyn moon::persistence::replay::CommandReplayEngine + Send> {
-                    Box::new(DispatchReplayEngine::new())
-                };
+                let engine_factory =
+                    || -> Box<dyn moon::persistence::replay::CommandReplayEngine + Send> {
+                        Box::new(DispatchReplayEngine::new())
+                    };
                 let (total, global_max_lsn, ordered_entries) = {
                     let mut slices: Vec<&mut [moon::storage::Database]> =
                         Vec::with_capacity(shards.len());
@@ -834,11 +826,7 @@ fn main() -> anyhow::Result<()> {
                 if legacy.exists() {
                     let retired = base_dir.join("appendonly.aof.legacy");
                     if let Err(e) = std::fs::rename(&legacy, &retired) {
-                        tracing::warn!(
-                            "Failed to retire legacy AOF {}: {}",
-                            legacy.display(),
-                            e
-                        );
+                        tracing::warn!("Failed to retire legacy AOF {}: {}", legacy.display(), e);
                     } else {
                         info!(
                             "Retired legacy AOF {} → {}",
@@ -866,7 +854,10 @@ fn main() -> anyhow::Result<()> {
                      --shards {num_shards} --appendonly yes (Moon creates a fresh per-shard \
                      manifest; load prior state from dump.rdb first if needed). \
                      See docs/runbooks/multi-shard-aof-rewrite.md for full migration instructions.",
-                    manifest_path = base_dir.join("appendonlydir").join("moon.aof.manifest").display(),
+                    manifest_path = base_dir
+                        .join("appendonlydir")
+                        .join("moon.aof.manifest")
+                        .display(),
                     num_shards = num_shards,
                     num_shards_minus_one = num_shards - 1,
                     aof_dir = base_dir.join("appendonlydir").display(),

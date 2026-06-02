@@ -507,9 +507,33 @@ pub(crate) fn spawn_monoio_connection(
             let reqpass = rtcfg.read().requirepass.clone();
             let pool_for_ctx = aof_pool.as_ref().map(Arc::clone);
             let conn_ctx = crate::server::conn::ConnectionContext::new(
-                sdbs, shard_id, num_shards, psr, blk, reqpass, pool_for_ctx, trk, rs, cs, lua,
-                sc, cp, acl, rtcfg, scfg, dtx, notifiers, snap_tx, clk, rsm, all_regs, all_rsm,
-                aff, spill_tx, spill_fid, do_dir,
+                sdbs,
+                shard_id,
+                num_shards,
+                psr,
+                blk,
+                reqpass,
+                pool_for_ctx,
+                trk,
+                rs,
+                cs,
+                lua,
+                sc,
+                cp,
+                acl,
+                rtcfg,
+                scfg,
+                dtx,
+                notifiers,
+                snap_tx,
+                clk,
+                rsm,
+                all_regs,
+                all_rsm,
+                aff,
+                spill_tx,
+                spill_fid,
+                do_dir,
             );
 
             let maxclients = conn_ctx.runtime_config.read().maxclients;
@@ -808,10 +832,33 @@ pub(crate) fn spawn_migrated_monoio_connection(
             // Pool is built by the spawn site and threaded through here.
             let pool_for_ctx = aof_pool.as_ref().map(Arc::clone);
             let conn_ctx = crate::server::conn::ConnectionContext::new(
-                sdbs, shard_id, num_shards, psr, blk,
+                sdbs,
+                shard_id,
+                num_shards,
+                psr,
+                blk,
                 None, // requirepass: None = pre-authenticated
-                pool_for_ctx, trk, rs, cs, lua, sc, cp, acl, rtcfg, scfg, dtx, notifiers,
-                snap_tx, clk, rsm, all_regs, all_rsm, aff, spill_tx, spill_fid, do_dir,
+                pool_for_ctx,
+                trk,
+                rs,
+                cs,
+                lua,
+                sc,
+                cp,
+                acl,
+                rtcfg,
+                scfg,
+                dtx,
+                notifiers,
+                snap_tx,
+                clk,
+                rsm,
+                all_regs,
+                all_rsm,
+                aff,
+                spill_tx,
+                spill_fid,
+                do_dir,
             );
 
             monoio::spawn(async move {

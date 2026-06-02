@@ -69,19 +69,11 @@ where
 {
     // Phase 1 — await every fsync ack; patch failed slots.
     for (resp_idx, bytes) in aof_entries {
-        let lsn = crate::persistence::aof::AofWriterPool::issue_append_lsn(
-            repl_state,
-            0,
-            bytes.len(),
-        );
-        if pool
-            .try_send_append_durable(0, lsn, bytes)
-            .await
-            .is_err()
-            && resp_idx < responses.len()
+        let lsn =
+            crate::persistence::aof::AofWriterPool::issue_append_lsn(repl_state, 0, bytes.len());
+        if pool.try_send_append_durable(0, lsn, bytes).await.is_err() && resp_idx < responses.len()
         {
-            responses[resp_idx] =
-                Frame::Error(Bytes::from_static(b"WRITEFAIL aof fsync failed"));
+            responses[resp_idx] = Frame::Error(Bytes::from_static(b"WRITEFAIL aof fsync failed"));
         }
         if let Some(counter) = change_counter {
             counter.fetch_add(1, Ordering::Relaxed);

@@ -411,7 +411,7 @@ mod tests {
             &mut crate::shard::autovacuum::AutovacuumDaemon::new(
                 crate::shard::autovacuum::AutovacuumConfig::default(),
             ),
-            None,      // aof_pool — None in tests
+            None, // aof_pool — None in tests
         );
 
         // Subscriber now receives pre-serialized RESP bytes
@@ -475,7 +475,7 @@ mod tests {
             &mut crate::shard::autovacuum::AutovacuumDaemon::new(
                 crate::shard::autovacuum::AutovacuumConfig::default(),
             ),
-            None,      // aof_pool — None in tests
+            None, // aof_pool — None in tests
         );
     }
 

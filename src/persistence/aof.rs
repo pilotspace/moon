@@ -367,8 +367,7 @@ impl AofWriterPool {
                 // signal ChannelFull back to the caller via a pre-filled
                 // oneshot so the caller's `.await` resolves immediately to
                 // Err(AofAck::ChannelFull) without a writer round-trip.
-                AOF_BACKPRESSURE_DROPPED
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                AOF_BACKPRESSURE_DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 warn!(
                     "AOF writer channel full (shard {}): AppendSync dropped; \
                      backpressure_dropped={}",
@@ -426,12 +425,10 @@ impl AofWriterPool {
             lsn,
         );
         let tagged_lsn = (lsn & !ORDERED_LSN_FLAG) | ORDERED_LSN_FLAG;
-        let _ = self
-            .sender(shard_id)
-            .try_send(AofMessage::Append {
-                lsn: tagged_lsn,
-                bytes,
-            });
+        let _ = self.sender(shard_id).try_send(AofMessage::Append {
+            lsn: tagged_lsn,
+            bytes,
+        });
     }
 
     /// Issue an LSN for an AOF append at every call site that has the
@@ -457,11 +454,7 @@ impl AofWriterPool {
     ) -> u64 {
         repl_state
             .as_ref()
-            .and_then(|rs| {
-                rs.read()
-                    .ok()
-                    .map(|g| g.issue_lsn(shard_id, delta as u64))
-            })
+            .and_then(|rs| rs.read().ok().map(|g| g.issue_lsn(shard_id, delta as u64)))
             .unwrap_or(0)
     }
 
@@ -563,7 +556,9 @@ mod pool_tests {
         let pool = AofWriterPool::per_shard(vec![tx0, tx1]);
 
         let dummies: SharedDatabases = Arc::new(vec![]);
-        let err = pool.try_send_rewrite(AofMessage::Rewrite(dummies)).unwrap_err();
+        let err = pool
+            .try_send_rewrite(AofMessage::Rewrite(dummies))
+            .unwrap_err();
         assert_eq!(err, AofPoolSendError::RewriteUnsupportedInPerShard);
     }
 
@@ -597,14 +592,20 @@ mod pool_tests {
                 assert_eq!(lsn, 42, "shard 0 first entry lsn");
                 assert_eq!(bytes.as_ref(), b"set foo 1");
             }
-            other => panic!("shard 0 first recv expected Append, got {:?}", other.is_ok()),
+            other => panic!(
+                "shard 0 first recv expected Append, got {:?}",
+                other.is_ok()
+            ),
         }
         match rx0.try_recv() {
             Ok(AofMessage::Append { lsn, bytes }) => {
                 assert_eq!(lsn, 44, "shard 0 second entry lsn");
                 assert_eq!(bytes.as_ref(), b"del foo");
             }
-            other => panic!("shard 0 second recv expected Append, got {:?}", other.is_ok()),
+            other => panic!(
+                "shard 0 second recv expected Append, got {:?}",
+                other.is_ok()
+            ),
         }
         // Shard 1 should see (43, "set bar 2") only.
         match rx1.try_recv() {
@@ -751,7 +752,9 @@ mod pool_tests {
         });
 
         // The handler MUST await this BEFORE flushing responses to the client
-        let result = pool.try_send_append_durable(0, 1, Bytes::from_static(b"SET k v")).await;
+        let result = pool
+            .try_send_append_durable(0, 1, Bytes::from_static(b"SET k v"))
+            .await;
         mock_writer.await.expect("mock writer completed");
 
         assert_eq!(
@@ -782,9 +785,8 @@ mod pool_tests {
         for (resp_idx, _bytes) in &aof_entries {
             if *resp_idx == 2 {
                 // Simulate Err(AofAck::FsyncFailed) from try_send_append_durable
-                responses[*resp_idx] = Frame::Error(
-                    Bytes::from_static(b"WRITEFAIL aof fsync failed"),
-                );
+                responses[*resp_idx] =
+                    Frame::Error(Bytes::from_static(b"WRITEFAIL aof fsync failed"));
             }
         }
 
@@ -868,10 +870,7 @@ mod pool_tests {
         // ack sender, simulating a dead writer.
         let (tx0, rx0) = channel::mpsc_bounded::<AofMessage>(4);
         let (tx1, _rx1) = channel::mpsc_bounded::<AofMessage>(4);
-        let pool = AofWriterPool::per_shard_with_policy(
-            vec![tx0, tx1],
-            FsyncPolicy::Always,
-        );
+        let pool = AofWriterPool::per_shard_with_policy(vec![tx0, tx1], FsyncPolicy::Always);
 
         // Spawn a thread that pulls the AppendSync off the channel but drops
         // the ack without sending — simulating a writer crash mid-fsync.
@@ -885,9 +884,11 @@ mod pool_tests {
 
         // try_send_append_durable for Always must await the ack.
         // With the ack sender dropped, it should resolve to Err(WriteFailed).
-        let result = futures::executor::block_on(
-            pool.try_send_append_durable(0, 55, Bytes::from_static(b"SWAPDB 0 1")),
-        );
+        let result = futures::executor::block_on(pool.try_send_append_durable(
+            0,
+            55,
+            Bytes::from_static(b"SWAPDB 0 1"),
+        ));
 
         handle.join().expect("ack dropper thread");
 
@@ -909,14 +910,13 @@ mod pool_tests {
         // use try_send_append_durable so the policy is respected.
         let (tx0, _rx0) = channel::mpsc_bounded::<AofMessage>(4);
         let (tx1, _rx1) = channel::mpsc_bounded::<AofMessage>(4);
-        let pool = AofWriterPool::per_shard_with_policy(
-            vec![tx0, tx1],
-            FsyncPolicy::EverySec,
-        );
+        let pool = AofWriterPool::per_shard_with_policy(vec![tx0, tx1], FsyncPolicy::EverySec);
 
-        let result = futures::executor::block_on(
-            pool.try_send_append_durable(0, 56, Bytes::from_static(b"SWAPDB 0 1")),
-        );
+        let result = futures::executor::block_on(pool.try_send_append_durable(
+            0,
+            56,
+            Bytes::from_static(b"SWAPDB 0 1"),
+        ));
 
         assert!(
             result.is_ok(),
@@ -1053,15 +1053,17 @@ pub async fn aof_writer_task(
 
         // Test-only fault injection: same env var as the PerShard writer.
         // Read once at task startup; zero cost in production (var absent).
-        let fail_fsync_for_test =
-            std::env::var("MOON_TEST_AOF_FSYNC_FAIL").as_deref() == Ok("1");
+        let fail_fsync_for_test = std::env::var("MOON_TEST_AOF_FSYNC_FAIL").as_deref() == Ok("1");
 
         loop {
             match rx.recv() {
                 // TopLevel writer: legacy v1 disk format is plain RESP. The
                 // LSN is ignored — TopLevel is single-shard so per-shard merge
                 // by LSN is moot.
-                Ok(AofMessage::Append { bytes: data, lsn: _ }) => {
+                Ok(AofMessage::Append {
+                    bytes: data,
+                    lsn: _,
+                }) => {
                     if write_error {
                         continue; // Drop appends after persistent I/O failure
                     }
@@ -1109,7 +1111,11 @@ pub async fn aof_writer_task(
                 // AppendSync ALWAYS fsyncs and acks before returning, regardless
                 // of the configured policy — that's the durability contract the
                 // caller signed up for by choosing AppendSync.
-                Ok(AofMessage::AppendSync { bytes: data, lsn: _, ack }) => {
+                Ok(AofMessage::AppendSync {
+                    bytes: data,
+                    lsn: _,
+                    ack,
+                }) => {
                     if write_error {
                         let _ = ack.send(AofAck::WriteFailed);
                         continue;
@@ -1130,15 +1136,12 @@ pub async fn aof_writer_task(
                     }
                     let t = Instant::now();
                     if let Err(e) = file.flush().and_then(|_| file.sync_data()) {
-                        error!(
-                            "AOF AppendSync sync failed (seq {}): {}",
-                            manifest.seq, e
-                        );
+                        error!("AOF AppendSync sync failed (seq {}): {}", manifest.seq, e);
                         write_error = true;
                         let _ = ack.send(AofAck::FsyncFailed);
                     } else {
                         crate::admin::metrics_setup::record_aof_fsync(
-                            t.elapsed().as_micros() as u64,
+                            t.elapsed().as_micros() as u64
                         );
                         let _ = ack.send(AofAck::Synced);
                     }
@@ -1428,8 +1431,7 @@ pub async fn per_shard_aof_writer_task(
         // the AOF_FSYNC_ERR response path without requiring a real disk error.
         // The env var is read once here (not per-message) so it costs zero on the
         // hot path in production deployments where the var is absent.
-        let fail_fsync_for_test =
-            std::env::var("MOON_TEST_AOF_FSYNC_FAIL").as_deref() == Ok("1");
+        let fail_fsync_for_test = std::env::var("MOON_TEST_AOF_FSYNC_FAIL").as_deref() == Ok("1");
 
         loop {
             tokio::select! {
@@ -1632,13 +1634,16 @@ pub async fn per_shard_aof_writer_task(
         // the environment at writer task startup, every AppendSync ack resolves
         // as FsyncFailed instead of Synced. Read once before the loop so there
         // is zero cost in production deployments where the var is absent.
-        let fail_fsync_for_test =
-            std::env::var("MOON_TEST_AOF_FSYNC_FAIL").as_deref() == Ok("1");
+        let fail_fsync_for_test = std::env::var("MOON_TEST_AOF_FSYNC_FAIL").as_deref() == Ok("1");
 
         loop {
             match rx.recv() {
                 // AppendSync (monoio + PerShard): framed write + fsync + ack.
-                Ok(AofMessage::AppendSync { lsn, bytes: data, ack }) => {
+                Ok(AofMessage::AppendSync {
+                    lsn,
+                    bytes: data,
+                    ack,
+                }) => {
                     if write_error {
                         let _ = ack.send(AofAck::WriteFailed);
                         continue;
@@ -1680,7 +1685,7 @@ pub async fn per_shard_aof_writer_task(
                         let _ = ack.send(AofAck::FsyncFailed);
                     } else {
                         crate::admin::metrics_setup::record_aof_fsync(
-                            t.elapsed().as_micros() as u64,
+                            t.elapsed().as_micros() as u64
                         );
                         let _ = ack.send(AofAck::Synced);
                     }
@@ -2194,7 +2199,10 @@ fn drain_pending_appends(
         match msg {
             // BGREWRITEAOF drain runs on the TopLevel writer (monoio) only;
             // PerShard rewrite is RFC step 6. Legacy v1 disk format → ignore lsn.
-            AofMessage::Append { bytes: data, lsn: _ } => {
+            AofMessage::Append {
+                bytes: data,
+                lsn: _,
+            } => {
                 file.write_all(&data).map_err(|e| AofError::Io {
                     path: PathBuf::from("<aof incr drain>"),
                     source: e,
@@ -2206,7 +2214,11 @@ fn drain_pending_appends(
             // so we ack `Synced`. If the write itself fails the error is
             // already propagated upward by the `?` and the ack is dropped —
             // the caller observes `RecvError`, which it treats as failure.
-            AofMessage::AppendSync { bytes: data, lsn: _, ack } => {
+            AofMessage::AppendSync {
+                bytes: data,
+                lsn: _,
+                ack,
+            } => {
                 file.write_all(&data).map_err(|e| AofError::Io {
                     path: PathBuf::from("<aof incr drain>"),
                     source: e,
@@ -2811,8 +2823,13 @@ mod tests {
     /// tests exercise the exact same production path.
     fn db_slice_to_snapshot(
         dbs: &[Database],
-    ) -> Vec<(Vec<(crate::storage::compact_key::CompactKey, crate::storage::entry::Entry)>, u32)>
-    {
+    ) -> Vec<(
+        Vec<(
+            crate::storage::compact_key::CompactKey,
+            crate::storage::entry::Entry,
+        )>,
+        u32,
+    )> {
         let now_ms = crate::storage::entry::current_time_ms();
         dbs.iter()
             .map(|db| {
@@ -2863,9 +2880,12 @@ mod tests {
         let base_path = dir.path().join("empty.rdb");
         std::fs::write(&base_path, &rdb_bytes).expect("write empty rdb");
         let mut recovery_dbs = vec![Database::new()];
-        let loaded = crate::persistence::rdb::load(&mut recovery_dbs, &base_path)
-            .expect("load empty rdb");
-        assert_eq!(loaded, 0, "recovering from empty-database RDB yields 0 keys");
+        let loaded =
+            crate::persistence::rdb::load(&mut recovery_dbs, &base_path).expect("load empty rdb");
+        assert_eq!(
+            loaded, 0,
+            "recovering from empty-database RDB yields 0 keys"
+        );
         assert_eq!(
             recovery_dbs[0].len(),
             0,
@@ -2968,8 +2988,7 @@ mod tests {
         // fsync under appendfsync=always fails. Must match what
         // handler_monoio/mod.rs and handler_sharded/mod.rs use.
         assert_eq!(
-            AOF_FSYNC_ERR,
-            b"ERR AOF fsync failed; write not durable",
+            AOF_FSYNC_ERR, b"ERR AOF fsync failed; write not durable",
             "AOF_FSYNC_ERR must equal the canonical ERR-prefixed string"
         );
     }

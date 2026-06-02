@@ -211,28 +211,24 @@ fn load_source(from_dir: &Path) -> Result<(Bytes, Bytes), crate::error::MoonErro
 
         let rdb_bytes = if base_path.exists() {
             info!("migrate_aof: reading base RDB from {}", base_path.display());
-            std::fs::read(&base_path)
-                .map(Bytes::from)
-                .map_err(|e| {
-                    crate::error::MoonError::from(crate::error::AofError::Io {
-                        path: base_path.clone(),
-                        source: e,
-                    })
-                })?
+            std::fs::read(&base_path).map(Bytes::from).map_err(|e| {
+                crate::error::MoonError::from(crate::error::AofError::Io {
+                    path: base_path.clone(),
+                    source: e,
+                })
+            })?
         } else {
             Bytes::new()
         };
 
         let resp_bytes = if incr_path.exists() {
             info!("migrate_aof: reading incr from {}", incr_path.display());
-            std::fs::read(&incr_path)
-                .map(Bytes::from)
-                .map_err(|e| {
-                    crate::error::MoonError::from(crate::error::AofError::Io {
-                        path: incr_path.clone(),
-                        source: e,
-                    })
-                })?
+            std::fs::read(&incr_path).map(Bytes::from).map_err(|e| {
+                crate::error::MoonError::from(crate::error::AofError::Io {
+                    path: incr_path.clone(),
+                    source: e,
+                })
+            })?
         } else {
             Bytes::new()
         };
@@ -279,12 +275,8 @@ fn split_rdb_preamble(bytes: Bytes) -> (Bytes, Bytes) {
         running_hasher.update(&bytes[i..i + 1]);
         if bytes[i] == EOF_MARKER {
             // Candidate EOF: check CRC of bytes[0..=i] matches bytes[i+1..i+5]
-            let stored = u32::from_le_bytes([
-                bytes[i + 1],
-                bytes[i + 2],
-                bytes[i + 3],
-                bytes[i + 4],
-            ]);
+            let stored =
+                u32::from_le_bytes([bytes[i + 1], bytes[i + 2], bytes[i + 3], bytes[i + 4]]);
             // Clone the hasher to avoid consuming state (running_hasher must
             // continue in case this candidate is a false positive).
             let check = running_hasher.clone();
@@ -319,7 +311,8 @@ fn partition_rdb_into_shards(
     let mut scratch: Vec<Database> = (0..MAX_DBS).map(|_| Database::new()).collect();
 
     // Load the RDB into scratch databases.
-    let (keys_loaded, _consumed) = crate::persistence::rdb::load_from_bytes(&mut scratch, rdb_bytes)?;
+    let (keys_loaded, _consumed) =
+        crate::persistence::rdb::load_from_bytes(&mut scratch, rdb_bytes)?;
 
     if keys_loaded == 0 {
         info!("migrate_aof: RDB preamble/base contains 0 live keys; skipping partitioning");
@@ -471,9 +464,7 @@ fn append_resp_to_shards(
                         Frame::SimpleString(s) => std::str::from_utf8(s.as_ref()).ok(),
                         _ => None,
                     });
-                    let db_num: i64 = db_arg
-                        .and_then(|s| s.trim().parse().ok())
-                        .unwrap_or(0);
+                    let db_num: i64 = db_arg.and_then(|s| s.trim().parse().ok()).unwrap_or(0);
                     if db_num != 0 {
                         return Err(crate::error::MoonError::from(
                             crate::error::AofError::RewriteFailed {
@@ -532,7 +523,12 @@ fn append_resp_to_shards(
                 shard_lsn[shard_idx] += 1;
                 let lsn = shard_lsn[shard_idx];
                 let file = &mut shard_files[shard_idx];
-                write_framed(file, lsn, &resp_bytes_out, manifest.shard_incr_path(shard_idx as u16))?;
+                write_framed(
+                    file,
+                    lsn,
+                    &resp_bytes_out,
+                    manifest.shard_incr_path(shard_idx as u16),
+                )?;
                 commands_written += 1;
             }
             Ok(None) => {
@@ -582,13 +578,22 @@ fn write_framed(
 ) -> Result<(), crate::error::MoonError> {
     let len = resp.len() as u32;
     file.write_all(&lsn.to_le_bytes()).map_err(|e| {
-        crate::error::MoonError::from(crate::error::AofError::Io { path: path.clone(), source: e })
+        crate::error::MoonError::from(crate::error::AofError::Io {
+            path: path.clone(),
+            source: e,
+        })
     })?;
     file.write_all(&len.to_le_bytes()).map_err(|e| {
-        crate::error::MoonError::from(crate::error::AofError::Io { path: path.clone(), source: e })
+        crate::error::MoonError::from(crate::error::AofError::Io {
+            path: path.clone(),
+            source: e,
+        })
     })?;
     file.write_all(resp).map_err(|e| {
-        crate::error::MoonError::from(crate::error::AofError::Io { path: path.clone(), source: e })
+        crate::error::MoonError::from(crate::error::AofError::Io {
+            path: path.clone(),
+            source: e,
+        })
     })?;
     Ok(())
 }
@@ -625,8 +630,7 @@ mod tests {
         aof_data.extend(cmd_resp(&["SET", "a", "v"]));
         aof_data.extend(cmd_resp(&["SELECT", "1"]));
         aof_data.extend(cmd_resp(&["SET", "b", "v"]));
-        std::fs::write(src_dir.path().join("appendonly.aof"), &aof_data)
-            .expect("write source aof");
+        std::fs::write(src_dir.path().join("appendonly.aof"), &aof_data).expect("write source aof");
 
         let result = migrate_aof(src_dir.path(), dst_dir.path(), 2);
         assert!(
@@ -670,8 +674,7 @@ mod tests {
         std::fs::write(src_dir.path().join("appendonly.aof"), b"").unwrap();
 
         // Pre-populate to_dir with a PerShard manifest.
-        AofManifest::initialize_multi(dst_dir.path(), 2)
-            .expect("first initialize_multi succeeds");
+        AofManifest::initialize_multi(dst_dir.path(), 2).expect("first initialize_multi succeeds");
 
         let result = migrate_aof(src_dir.path(), dst_dir.path(), 2);
         assert!(
@@ -710,8 +713,7 @@ mod tests {
             aof_data.extend(set_resp(&format!("key{i}"), "value"));
         }
 
-        std::fs::write(src_dir.path().join("appendonly.aof"), &aof_data)
-            .expect("write source aof");
+        std::fs::write(src_dir.path().join("appendonly.aof"), &aof_data).expect("write source aof");
 
         let result = migrate_aof(src_dir.path(), dst_dir.path(), 4).expect("migration succeeds");
 
@@ -751,11 +753,9 @@ mod tests {
         for i in 0..4u32 {
             aof_data.extend(set_resp(&format!("{{0}}:key{i}"), "value"));
         }
-        std::fs::write(src_dir.path().join("appendonly.aof"), &aof_data)
-            .expect("write source aof");
+        std::fs::write(src_dir.path().join("appendonly.aof"), &aof_data).expect("write source aof");
 
-        let result =
-            migrate_aof(src_dir.path(), dst_dir.path(), 4).expect("migration succeeds");
+        let result = migrate_aof(src_dir.path(), dst_dir.path(), 4).expect("migration succeeds");
         assert_eq!(result.commands_written, 4);
 
         let manifest = AofManifest::load(dst_dir.path())
@@ -782,11 +782,10 @@ mod tests {
         let src_dir = tempfile::tempdir().unwrap();
         let dst_dir = tempfile::tempdir().unwrap();
 
-        std::fs::write(src_dir.path().join("appendonly.aof"), b"")
-            .expect("write empty source aof");
+        std::fs::write(src_dir.path().join("appendonly.aof"), b"").expect("write empty source aof");
 
-        let result =
-            migrate_aof(src_dir.path(), dst_dir.path(), 2).expect("migration of empty aof succeeds");
+        let result = migrate_aof(src_dir.path(), dst_dir.path(), 2)
+            .expect("migration of empty aof succeeds");
         assert_eq!(result.commands_read, 0);
         assert_eq!(result.commands_written, 0);
         assert_eq!(result.rdb_keys_migrated, 0);
@@ -813,8 +812,7 @@ mod tests {
         for key in &keys {
             aof_data.extend(set_resp(key, "val"));
         }
-        std::fs::write(src_dir.path().join("appendonly.aof"), &aof_data)
-            .expect("write source aof");
+        std::fs::write(src_dir.path().join("appendonly.aof"), &aof_data).expect("write source aof");
 
         let result =
             migrate_aof(src_dir.path(), dst_dir.path(), N_SHARDS).expect("migration succeeds");
@@ -825,9 +823,8 @@ mod tests {
             .expect("load ok")
             .expect("manifest present");
 
-        let mut shard_dbs: Vec<Vec<Database>> = (0..N_SHARDS)
-            .map(|_| vec![Database::new()])
-            .collect();
+        let mut shard_dbs: Vec<Vec<Database>> =
+            (0..N_SHARDS).map(|_| vec![Database::new()]).collect();
         let mut slices: Vec<&mut [Database]> =
             shard_dbs.iter_mut().map(|v| v.as_mut_slice()).collect();
 
@@ -845,12 +842,14 @@ mod tests {
             total_replayed, 12,
             "all 12 commands must be recovered by replay_per_shard"
         );
-        assert!(ordered.is_empty(), "non-ordered commands must not appear in ordered buffer");
+        assert!(
+            ordered.is_empty(),
+            "non-ordered commands must not appear in ordered buffer"
+        );
 
         let mut total_found = 0usize;
         for key in &keys {
-            let shard_idx =
-                crate::shard::dispatch::key_to_shard(key.as_bytes(), N_SHARDS as usize);
+            let shard_idx = crate::shard::dispatch::key_to_shard(key.as_bytes(), N_SHARDS as usize);
             let db = &mut shard_dbs[shard_idx][0];
             if db.get(key.as_bytes()).is_some() {
                 total_found += 1;
@@ -883,15 +882,13 @@ mod tests {
         let mut source_db: Vec<Database> = vec![Database::new()];
         let keys: Vec<String> = (0..N_KEYS).map(|i| format!("rdb_key:{i}")).collect();
         for key in &keys {
-            let entry = Entry::new_string(
-                Bytes::copy_from_slice(format!("val_{key}").as_bytes()),
-            );
+            let entry = Entry::new_string(Bytes::copy_from_slice(format!("val_{key}").as_bytes()));
             source_db[0].set(Bytes::copy_from_slice(key.as_bytes()), entry);
         }
 
         // Serialize to RDB preamble bytes, then write as appendonly.aof.
-        let rdb_bytes = crate::persistence::rdb::save_to_bytes(&source_db)
-            .expect("RDB serialize succeeds");
+        let rdb_bytes =
+            crate::persistence::rdb::save_to_bytes(&source_db).expect("RDB serialize succeeds");
         // No RESP tail — this simulates a fully-compacted AOF.
         std::fs::write(src_dir.path().join("appendonly.aof"), &rdb_bytes)
             .expect("write source aof with RDB preamble");
@@ -908,9 +905,8 @@ mod tests {
             .expect("load ok")
             .expect("manifest present");
 
-        let mut shard_dbs: Vec<Vec<Database>> = (0..N_SHARDS)
-            .map(|_| vec![Database::new()])
-            .collect();
+        let mut shard_dbs: Vec<Vec<Database>> =
+            (0..N_SHARDS).map(|_| vec![Database::new()]).collect();
         let mut slices: Vec<&mut [Database]> =
             shard_dbs.iter_mut().map(|v| v.as_mut_slice()).collect();
 
@@ -934,8 +930,7 @@ mod tests {
         // Verify each key is in the correct shard.
         let mut total_found = 0usize;
         for key in &keys {
-            let shard_idx =
-                crate::shard::dispatch::key_to_shard(key.as_bytes(), N_SHARDS as usize);
+            let shard_idx = crate::shard::dispatch::key_to_shard(key.as_bytes(), N_SHARDS as usize);
             let db = &mut shard_dbs[shard_idx][0];
             if db.get(key.as_bytes()).is_some() {
                 total_found += 1;

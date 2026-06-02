@@ -83,14 +83,8 @@ fn start_moon_with_fsync(port: u16, dir: &std::path::Path, fsync: &str) -> Child
         // Captured to a log file so a CI flake produces a real diagnostic
         // rather than the silent "connection refused" symptom the project
         // already paid for once (see feedback_silenced_child_stdio_flake).
-        .stdout(
-            std::fs::File::create(dir.join("moon.stdout.log"))
-                .expect("create moon stdout log"),
-        )
-        .stderr(
-            std::fs::File::create(dir.join("moon.stderr.log"))
-                .expect("create moon stderr log"),
-        )
+        .stdout(std::fs::File::create(dir.join("moon.stdout.log")).expect("create moon stdout log"))
+        .stderr(std::fs::File::create(dir.join("moon.stderr.log")).expect("create moon stderr log"))
         .spawn()
         .expect("spawn moon (run `cargo build --release` with default features first)")
 }
@@ -146,9 +140,7 @@ fn pipeline_rpush(port: u16, key: &str, n: usize) {
 
     let mut stream =
         std::net::TcpStream::connect(format!("127.0.0.1:{}", port)).expect("connect for pipeline");
-    stream
-        .set_read_timeout(Some(Duration::from_secs(10)))
-        .ok();
+    stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
 
     // Build one TCP segment with N RPUSH commands (pipeline).
     let mut buf: Vec<u8> = Vec::with_capacity(n * 64);

@@ -809,8 +809,12 @@ impl AofManifest {
         // shard target are pure path computations and do NOT depend on
         // self.layout, so it is safe to derive them while layout is still
         // TopLevel.
-        let old_base = self.aof_dir().join(format!("moon.aof.{}.base.rdb", self.seq));
-        let old_incr = self.aof_dir().join(format!("moon.aof.{}.incr.aof", self.seq));
+        let old_base = self
+            .aof_dir()
+            .join(format!("moon.aof.{}.base.rdb", self.seq));
+        let old_incr = self
+            .aof_dir()
+            .join(format!("moon.aof.{}.incr.aof", self.seq));
         let new_dir = self.aof_dir().join("shard-0");
         let new_base = new_dir.join(format!("moon.aof.{}.base.rdb", self.seq));
         let new_incr = new_dir.join(format!("moon.aof.{}.incr.aof", self.seq));
@@ -1492,10 +1496,9 @@ fn replay_incr_framed(
             );
             break;
         }
-        let raw_lsn =
-            u64::from_le_bytes(data[offset..offset + 8].try_into().expect("8 bytes"));
-        let len = u32::from_le_bytes(data[offset + 8..offset + 12].try_into().expect("4 bytes"))
-            as usize;
+        let raw_lsn = u64::from_le_bytes(data[offset..offset + 8].try_into().expect("8 bytes"));
+        let len =
+            u32::from_le_bytes(data[offset + 8..offset + 12].try_into().expect("4 bytes")) as usize;
         let payload_start = offset + HEADER_LEN;
         let payload_end = payload_start.saturating_add(len);
         if payload_end > total_len {
@@ -1638,8 +1641,9 @@ fn replay_incr_framed(
 pub fn replay_per_shard(
     per_shard_databases: &mut [&mut [crate::storage::Database]],
     manifest: &AofManifest,
-    engine_factory: &(dyn Fn() -> Box<dyn crate::persistence::replay::CommandReplayEngine + Send>
-          + Sync),
+    engine_factory: &(
+         dyn Fn() -> Box<dyn crate::persistence::replay::CommandReplayEngine + Send> + Sync
+     ),
 ) -> Result<(usize, u64, Vec<OrderedEntry>), crate::error::MoonError> {
     debug_assert_eq!(
         manifest.layout,
@@ -1758,13 +1762,15 @@ pub fn replay_per_shard(
         // Collect results in shard order.
         handles
             .into_iter()
-            .map(|h| h.join().unwrap_or_else(|_| {
-                Err(crate::error::MoonError::from(
-                    crate::error::AofError::RewriteFailed {
-                        detail: "replay_per_shard worker thread panicked".to_owned(),
-                    },
-                ))
-            }))
+            .map(|h| {
+                h.join().unwrap_or_else(|_| {
+                    Err(crate::error::MoonError::from(
+                        crate::error::AofError::RewriteFailed {
+                            detail: "replay_per_shard worker thread panicked".to_owned(),
+                        },
+                    ))
+                })
+            })
             .collect()
     });
 
@@ -1835,8 +1841,7 @@ pub fn replay_ordered_merge(
     // is heterogeneous. Production emitters (future cross-shard TXN) must
     // guarantee uniform cardinality per LSN, so this heuristic is correct for
     // all currently-reachable code paths.
-    let mut counts: std::collections::BTreeMap<u64, usize> =
-        std::collections::BTreeMap::new();
+    let mut counts: std::collections::BTreeMap<u64, usize> = std::collections::BTreeMap::new();
     for e in &entries {
         *counts.entry(e.lsn).or_insert(0) += 1;
     }
@@ -1933,8 +1938,7 @@ mod tests_v2 {
         // Use a global atomic counter so parallel test threads (cargo test runs
         // unit tests in parallel) never produce the same directory name even
         // when PID and nanosecond clock resolution are the same for two threads.
-        static COUNTER: std::sync::atomic::AtomicU64 =
-            std::sync::atomic::AtomicU64::new(0);
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let d = std::env::temp_dir().join(format!(
             "moon-aof-manifest-test-{}-{}",
@@ -2001,8 +2005,14 @@ mod tests_v2 {
             seq: 1,
             layout: AofLayout::PerShard,
             shards: vec![
-                ShardManifest { shard_id: 0, max_lsn: 0 },
-                ShardManifest { shard_id: 1, max_lsn: 0 },
+                ShardManifest {
+                    shard_id: 0,
+                    max_lsn: 0,
+                },
+                ShardManifest {
+                    shard_id: 1,
+                    max_lsn: 0,
+                },
             ],
         };
         let err = m.verify_shard_count(4).expect_err("should mismatch");
@@ -2053,9 +2063,18 @@ mod tests_v2 {
             seq: 1,
             layout: AofLayout::PerShard,
             shards: vec![
-                ShardManifest { shard_id: 0, max_lsn: 100 },
-                ShardManifest { shard_id: 1, max_lsn: 500 },
-                ShardManifest { shard_id: 2, max_lsn: 250 },
+                ShardManifest {
+                    shard_id: 0,
+                    max_lsn: 100,
+                },
+                ShardManifest {
+                    shard_id: 1,
+                    max_lsn: 500,
+                },
+                ShardManifest {
+                    shard_id: 2,
+                    max_lsn: 250,
+                },
             ],
         };
         assert_eq!(m.global_max_lsn(), 500);
@@ -2099,9 +2118,7 @@ mod tests_v2 {
         let _m = AofManifest::initialize_multi(&dir, 2).expect("init v2");
 
         // Plant a stale top-level base.rdb to simulate the stray-file scenario.
-        let stray = dir
-            .join(AOF_DIR_NAME)
-            .join("moon.aof.1.base.rdb");
+        let stray = dir.join(AOF_DIR_NAME).join("moon.aof.1.base.rdb");
         fs::write(&stray, b"REDIS0011\xff").expect("write stray base.rdb");
 
         // Even though the stray file matches the filename pattern, a valid v2
@@ -2289,8 +2306,8 @@ mod tests_v2 {
         let mut dbs: Vec<crate::storage::Database> = vec![crate::storage::Database::new()];
         let engine = RecordingEngine::new();
         let mut ordered: Vec<OrderedEntry> = Vec::new();
-        let (count, max_lsn) = replay_incr_framed(0, &mut dbs, &bytes, &engine, &mut ordered)
-            .expect("framed replay");
+        let (count, max_lsn) =
+            replay_incr_framed(0, &mut dbs, &bytes, &engine, &mut ordered).expect("framed replay");
         assert!(ordered.is_empty(), "no ordered entries in this stream");
 
         assert_eq!(count, 2);
@@ -2310,9 +2327,8 @@ mod tests_v2 {
         let mut dbs: Vec<crate::storage::Database> = vec![crate::storage::Database::new()];
         let engine = RecordingEngine::new();
         let mut ordered: Vec<OrderedEntry> = Vec::new();
-        let (count, max_lsn) =
-            replay_incr_framed(0, &mut dbs, &bytes, &engine, &mut ordered)
-                .expect("truncated-header is EOF");
+        let (count, max_lsn) = replay_incr_framed(0, &mut dbs, &bytes, &engine, &mut ordered)
+            .expect("truncated-header is EOF");
 
         assert_eq!(count, 1);
         assert_eq!(max_lsn, 3);
@@ -2329,9 +2345,8 @@ mod tests_v2 {
         let mut dbs: Vec<crate::storage::Database> = vec![crate::storage::Database::new()];
         let engine = RecordingEngine::new();
         let mut ordered: Vec<OrderedEntry> = Vec::new();
-        let (count, max_lsn) =
-            replay_incr_framed(0, &mut dbs, &bytes, &engine, &mut ordered)
-                .expect("truncated-payload is EOF");
+        let (count, max_lsn) = replay_incr_framed(0, &mut dbs, &bytes, &engine, &mut ordered)
+            .expect("truncated-payload is EOF");
 
         assert_eq!(count, 0);
         assert_eq!(max_lsn, 0);
@@ -2361,8 +2376,7 @@ mod tests_v2 {
     #[test]
     fn replay_per_shard_round_trips_two_shards() {
         let dir = temp_dir();
-        let manifest =
-            AofManifest::initialize_multi(&dir, 2).expect("initialize_multi 2 shards");
+        let manifest = AofManifest::initialize_multi(&dir, 2).expect("initialize_multi 2 shards");
 
         // Hand-author framed incr files: shard-0 SETs k0/v0 at lsn=10,
         // shard-1 SETs k1/v1 at lsn=20.
@@ -2376,8 +2390,7 @@ mod tests_v2 {
         let mut shard1: Vec<crate::storage::Database> = vec![crate::storage::Database::new()];
 
         let (total, global_max_lsn, ordered) = {
-            let mut slices: Vec<&mut [crate::storage::Database]> =
-                vec![&mut shard0, &mut shard1];
+            let mut slices: Vec<&mut [crate::storage::Database]> = vec![&mut shard0, &mut shard1];
             replay_per_shard(
                 &mut slices,
                 &manifest,
@@ -2403,8 +2416,7 @@ mod tests_v2 {
     #[test]
     fn replay_per_shard_rejects_shard_count_mismatch() {
         let dir = temp_dir();
-        let manifest =
-            AofManifest::initialize_multi(&dir, 2).expect("initialize_multi 2 shards");
+        let manifest = AofManifest::initialize_multi(&dir, 2).expect("initialize_multi 2 shards");
 
         // Only one slice — manifest says 2.
         let mut shard0: Vec<crate::storage::Database> = vec![crate::storage::Database::new()];
@@ -2437,8 +2449,8 @@ mod tests_v2 {
     fn replay_per_shard_parallel_matches_sequential() {
         let dir = temp_dir();
         let n_shards: u16 = 4;
-        let manifest = AofManifest::initialize_multi(&dir, n_shards)
-            .expect("initialize_multi 4 shards");
+        let manifest =
+            AofManifest::initialize_multi(&dir, n_shards).expect("initialize_multi 4 shards");
 
         // Each shard gets one SET at lsn = shard_id * 10 + 10.
         for sid in 0..n_shards {
@@ -2451,14 +2463,12 @@ mod tests_v2 {
                 vlen = val.len(),
             );
             let entry = frame_entry(lsn, resp.as_bytes());
-            fs::write(manifest.shard_incr_path(sid), &entry)
-                .expect("write shard incr");
+            fs::write(manifest.shard_incr_path(sid), &entry).expect("write shard incr");
         }
 
-        let mut shards: Vec<Vec<crate::storage::Database>> =
-            (0..n_shards as usize)
-                .map(|_| vec![crate::storage::Database::new()])
-                .collect();
+        let mut shards: Vec<Vec<crate::storage::Database>> = (0..n_shards as usize)
+            .map(|_| vec![crate::storage::Database::new()])
+            .collect();
 
         let engine_factory = || {
             Box::new(crate::persistence::replay::DispatchReplayEngine::new())
@@ -2520,23 +2530,18 @@ mod tests_v2 {
         ));
         bytes.extend_from_slice(&frame_entry(12, b"*1\r\n$6\r\nDBSIZE\r\n"));
 
-        let mut dbs: Vec<crate::storage::Database> =
-            vec![crate::storage::Database::new()];
+        let mut dbs: Vec<crate::storage::Database> = vec![crate::storage::Database::new()];
         let engine = RecordingEngine::new();
         let mut ordered: Vec<OrderedEntry> = Vec::new();
-        let (count, max_lsn) =
-            replay_incr_framed(3, &mut dbs, &bytes, &engine, &mut ordered)
-                .expect("framed replay with ordered");
+        let (count, max_lsn) = replay_incr_framed(3, &mut dbs, &bytes, &engine, &mut ordered)
+            .expect("framed replay with ordered");
 
         assert_eq!(count, 2, "two inline entries dispatched (PING, DBSIZE)");
         assert_eq!(max_lsn, 12, "max LSN tracks both inline and ordered");
         assert_eq!(ordered.len(), 1, "one entry buffered as ordered");
         let buffered = &ordered[0];
         assert_eq!(buffered.shard_id, 3, "shard_id forwarded");
-        assert_eq!(
-            buffered.lsn, 8,
-            "buffered LSN has the high bit masked off"
-        );
+        assert_eq!(buffered.lsn, 8, "buffered LSN has the high bit masked off");
         let calls = engine.calls.borrow();
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0], "PING");
@@ -2567,13 +2572,10 @@ mod tests_v2 {
             },
         ];
 
-        let mut shard0: Vec<crate::storage::Database> =
-            vec![crate::storage::Database::new()];
-        let mut shard1: Vec<crate::storage::Database> =
-            vec![crate::storage::Database::new()];
+        let mut shard0: Vec<crate::storage::Database> = vec![crate::storage::Database::new()];
+        let mut shard1: Vec<crate::storage::Database> = vec![crate::storage::Database::new()];
         let replayed = {
-            let mut slices: Vec<&mut [crate::storage::Database]> =
-                vec![&mut shard0, &mut shard1];
+            let mut slices: Vec<&mut [crate::storage::Database]> = vec![&mut shard0, &mut shard1];
             replay_ordered_merge(&mut slices, entries, &DispatchReplayEngine::new())
                 .expect("ordered merge replay")
         };
@@ -2587,12 +2589,10 @@ mod tests_v2 {
     fn replay_ordered_merge_empty_returns_zero() {
         use crate::persistence::replay::DispatchReplayEngine;
 
-        let mut shard0: Vec<crate::storage::Database> =
-            vec![crate::storage::Database::new()];
+        let mut shard0: Vec<crate::storage::Database> = vec![crate::storage::Database::new()];
         let mut slices: Vec<&mut [crate::storage::Database]> = vec![&mut shard0];
-        let replayed =
-            replay_ordered_merge(&mut slices, Vec::new(), &DispatchReplayEngine::new())
-                .expect("empty merge ok");
+        let replayed = replay_ordered_merge(&mut slices, Vec::new(), &DispatchReplayEngine::new())
+            .expect("empty merge ok");
         assert_eq!(replayed, 0);
     }
 
@@ -2612,34 +2612,25 @@ mod tests_v2 {
             OrderedEntry {
                 shard_id: 0,
                 lsn: 10,
-                bytes: bytes::Bytes::from_static(
-                    b"*3\r\n$3\r\nSET\r\n$2\r\nc0\r\n$1\r\n1\r\n",
-                ),
+                bytes: bytes::Bytes::from_static(b"*3\r\n$3\r\nSET\r\n$2\r\nc0\r\n$1\r\n1\r\n"),
             },
             OrderedEntry {
                 shard_id: 1,
                 lsn: 10,
-                bytes: bytes::Bytes::from_static(
-                    b"*3\r\n$3\r\nSET\r\n$2\r\nc1\r\n$1\r\n1\r\n",
-                ),
+                bytes: bytes::Bytes::from_static(b"*3\r\n$3\r\nSET\r\n$2\r\nc1\r\n$1\r\n1\r\n"),
             },
             // Torn entry: LSN 100 only on shard 0, not shard 1
             OrderedEntry {
                 shard_id: 0,
                 lsn: 100,
-                bytes: bytes::Bytes::from_static(
-                    b"*3\r\n$3\r\nSET\r\n$5\r\ntorn0\r\n$1\r\nv\r\n",
-                ),
+                bytes: bytes::Bytes::from_static(b"*3\r\n$3\r\nSET\r\n$5\r\ntorn0\r\n$1\r\nv\r\n"),
             },
         ];
 
-        let mut shard0: Vec<crate::storage::Database> =
-            vec![crate::storage::Database::new()];
-        let mut shard1: Vec<crate::storage::Database> =
-            vec![crate::storage::Database::new()];
+        let mut shard0: Vec<crate::storage::Database> = vec![crate::storage::Database::new()];
+        let mut shard1: Vec<crate::storage::Database> = vec![crate::storage::Database::new()];
         let replayed = {
-            let mut slices: Vec<&mut [crate::storage::Database]> =
-                vec![&mut shard0, &mut shard1];
+            let mut slices: Vec<&mut [crate::storage::Database]> = vec![&mut shard0, &mut shard1];
             replay_ordered_merge(&mut slices, entries, &DispatchReplayEngine::new())
                 .expect("ordered merge replay")
         };
@@ -2697,12 +2688,13 @@ mod tests_v2 {
     fn write_per_shard_manifest_at_seq(dir: &Path, num_shards: u16, seq: u64) -> AofManifest {
         let aof_dir = dir.join(AOF_DIR_NAME);
         fs::create_dir_all(&aof_dir).unwrap();
-        let empty_rdb = crate::persistence::rdb::save_to_bytes(
-            &[] as &[crate::storage::Database],
-        )
-        .expect("empty rdb");
+        let empty_rdb = crate::persistence::rdb::save_to_bytes(&[] as &[crate::storage::Database])
+            .expect("empty rdb");
         let shards: Vec<ShardManifest> = (0..num_shards)
-            .map(|id| ShardManifest { shard_id: id, max_lsn: 0 })
+            .map(|id| ShardManifest {
+                shard_id: id,
+                max_lsn: 0,
+            })
             .collect();
         let manifest = AofManifest {
             dir: dir.to_path_buf(),
@@ -2741,8 +2733,14 @@ mod tests_v2 {
         // Active files for seq=2 must survive.
         let active_base = manifest.shard_base_path(0);
         let active_incr = manifest.shard_incr_path(0);
-        assert!(active_base.exists(), "active base must exist before cleanup");
-        assert!(active_incr.exists(), "active incr must exist before cleanup");
+        assert!(
+            active_base.exists(),
+            "active base must exist before cleanup"
+        );
+        assert!(
+            active_incr.exists(),
+            "active incr must exist before cleanup"
+        );
 
         // Reload the manifest — this triggers cleanup_orphans.
         let _reloaded = AofManifest::load(&dir).expect("load").expect("present");
@@ -2755,8 +2753,14 @@ mod tests_v2 {
             !orphan_old_incr.exists(),
             "orphan old incr in shard-0/ must be deleted by cleanup_orphans"
         );
-        assert!(active_base.exists(), "active seq=2 base must survive cleanup");
-        assert!(active_incr.exists(), "active seq=2 incr must survive cleanup");
+        assert!(
+            active_base.exists(),
+            "active seq=2 base must survive cleanup"
+        );
+        assert!(
+            active_incr.exists(),
+            "active seq=2 incr must survive cleanup"
+        );
 
         fs::remove_dir_all(&dir).ok();
     }
@@ -2803,8 +2807,7 @@ mod tests_v2 {
             })
             .sum();
         assert_eq!(
-            count_before,
-            count_after,
+            count_before, count_after,
             "second call must not create or overwrite any shard files"
         );
 
@@ -2819,14 +2822,11 @@ mod tests_v2 {
         let dir = temp_dir();
 
         // Initialize 2-shard manifest at seq=1.
-        let mut manifest =
-            AofManifest::initialize_multi(&dir, 2).expect("initialize_multi");
+        let mut manifest = AofManifest::initialize_multi(&dir, 2).expect("initialize_multi");
         assert_eq!(manifest.seq, 1);
 
-        let empty_rdb = crate::persistence::rdb::save_to_bytes(
-            &[] as &[crate::storage::Database],
-        )
-        .expect("empty rdb");
+        let empty_rdb = crate::persistence::rdb::save_to_bytes(&[] as &[crate::storage::Database])
+            .expect("empty rdb");
 
         // Old shard-0 files at seq=1 must exist before advance.
         let old_base_s0 = manifest.shard_base_path(0);
@@ -2860,7 +2860,9 @@ mod tests_v2 {
 
         // Caller must write_manifest after all shards advanced.
         manifest.seq = 2;
-        manifest.write_manifest().expect("write manifest after advance");
+        manifest
+            .write_manifest()
+            .expect("write manifest after advance");
         let reloaded = AofManifest::load(&dir).expect("load").expect("present");
         assert_eq!(reloaded.seq, 2);
 
@@ -2916,8 +2918,8 @@ mod tests_v2 {
         // Discriminating: the on-disk manifest file must contain `version 2`
         // (PerShard v2 header), not be a bare v1 file.
         let manifest_path = dir.join(AOF_DIR_NAME).join("moon.aof.manifest");
-        let content = std::fs::read_to_string(&manifest_path)
-            .expect("manifest file must be readable");
+        let content =
+            std::fs::read_to_string(&manifest_path).expect("manifest file must be readable");
         assert!(
             content.contains("version 2"),
             "manifest file must contain 'version 2' (PerShard v2 header); got:\n{}",

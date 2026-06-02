@@ -1586,9 +1586,8 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                 .await
                                 .is_err()
                             {
-                                response = Frame::Error(bytes::Bytes::from_static(
-                                    aof::AOF_FSYNC_ERR,
-                                ));
+                                response =
+                                    Frame::Error(bytes::Bytes::from_static(aof::AOF_FSYNC_ERR));
                                 aof_failed = true;
                             }
                         }
@@ -2017,9 +2016,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                     .await
                                     .is_err()
                                 {
-                                    let err = Frame::Error(Bytes::from_static(
-                                        aof::AOF_FSYNC_ERR,
-                                    ));
+                                    let err = Frame::Error(Bytes::from_static(aof::AOF_FSYNC_ERR));
                                     let err = apply_resp3_conversion(
                                         &cmd_name,
                                         err,
