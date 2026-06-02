@@ -583,6 +583,11 @@ fn main() -> anyhow::Result<()> {
     // Build shared runtime config for sharded handlers
     let runtime_config_shared: std::sync::Arc<parking_lot::RwLock<moon::config::RuntimeConfig>> =
         { std::sync::Arc::new(parking_lot::RwLock::new(config.to_runtime_config())) };
+    // Publish the resolved shard count so eviction enforces maxmemory as a
+    // whole-instance cap (per-shard budget = maxmemory / num_shards). Without
+    // this, each shard would tolerate the full maxmemory → ~N× aggregate RSS.
+    runtime_config_shared.write().num_shards = num_shards;
+    moon::config::log_maxmemory_sharding(runtime_config_shared.read().maxmemory, num_shards);
     let server_config_shared: std::sync::Arc<moon::config::ServerConfig> =
         { std::sync::Arc::new(config.clone()) };
 

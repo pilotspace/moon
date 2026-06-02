@@ -233,6 +233,14 @@ cargo build --release
   --maxmemory 8g --maxmemory-policy allkeys-lfu
 ```
 
+> **`--maxmemory` is a whole-instance cap.** With `--shards M`, each
+> shard enforces eviction against `maxmemory / M`, so total RSS converges
+> on the value you set regardless of shard count. `CONFIG GET maxmemory`
+> and `INFO` report the whole-instance value (Redis-compatible); a startup
+> log line shows the resolved per-shard budget. If `--maxmemory` is omitted,
+> Moon auto-caps at ~80% of detected RAM with `allkeys-lru` (pass
+> `--maxmemory 0` for unlimited).
+
 ### Connect with any Redis client
 
 ```bash

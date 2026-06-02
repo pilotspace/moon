@@ -77,6 +77,29 @@ supported under per-shard AOF layout`. Tracked for v0.2.0.
 `CDC.SUBSCRIBE` push channel (C3b), and the multi-shard master PSYNC
 deferred from v0.1.10. Tracked in `.planning/rfcs/v02-enterprise-architecture.md`.
 
+### Fixed — `maxmemory` is now a whole-instance cap across shards (G2)
+
+**Behavior change for multishard deployments.** Previously each shard
+enforced eviction against the *full* `maxmemory`, so an N-shard server
+tolerated ~N× the configured cap before evicting (a 4-shard server at
+`--maxmemory 100mb` retained ~307 MB / 768K keys vs a 1-shard server's
+124 MB / 322K — the "RAM keeps growing in multishard mode" report).
+
+`maxmemory` is now a true **whole-instance** cap. Each shard enforces
+eviction against `maxmemory / num_shards`, so aggregate RSS converges on
+the configured value regardless of shard count.
+
+- **`CONFIG GET maxmemory` / INFO are unchanged** — they report the
+  whole-instance value verbatim (Redis-compatible). Division happens only
+  at enforcement.
+- **Operators running explicit `--maxmemory N --shards M (M>1)`** now get
+  an effective ceiling of `N` (not `N×M`). A startup log line states the
+  resolved per-shard budget so the change is visible:
+  `maxmemory <N> bytes is a whole-instance cap; each of <M> shards enforces
+  eviction against a per-shard budget of <N/M> bytes`.
+- Single-shard servers are byte-for-byte unaffected (`num_shards == 1` ⇒
+  no division).
+
 ### Docs — Hash-field TTL three-way benchmark suite (PR #127)
 
 - `scripts/bench-hash-ttl.sh` (2-way harness) + `scripts/bench-hash-ttl-3way.sh`

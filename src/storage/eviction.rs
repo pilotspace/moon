@@ -206,10 +206,13 @@ pub fn try_evict_if_needed_with_spill_and_total(
 
     let policy = EvictionPolicy::from_str(&config.maxmemory_policy);
 
-    // Check aggregate memory (server-wide maxmemory limit per Redis semantics).
-    // Evict from this DB until total memory drops below limit.
+    // Compare against the PER-SHARD budget, not the whole-instance maxmemory.
+    // `maxmemory` is a whole-instance cap; each shard enforces independently, so
+    // the threshold is `maxmemory / num_shards` (single shard ⇒ unchanged). This
+    // is what bounds aggregate RSS in multishard mode.
+    let budget = config.maxmemory_per_shard();
     let mut current_total = total_memory;
-    while current_total > config.maxmemory {
+    while current_total > budget {
         if policy == EvictionPolicy::NoEviction {
             return Err(oom_error());
         }
@@ -269,8 +272,10 @@ pub fn try_evict_if_needed_async_spill_with_total(
 
     let policy = EvictionPolicy::from_str(&config.maxmemory_policy);
 
+    // Per-shard budget (see `try_evict_if_needed_with_spill_and_total`).
+    let budget = config.maxmemory_per_shard();
     let mut current_total = total_memory;
-    while current_total > config.maxmemory {
+    while current_total > budget {
         if policy == EvictionPolicy::NoEviction {
             return Err(oom_error());
         }
@@ -307,8 +312,10 @@ pub fn try_evict_deferred(
         return Ok(smallvec::SmallVec::new());
     }
 
+    // Per-shard budget (see `try_evict_if_needed_with_spill_and_total`).
+    let budget = config.maxmemory_per_shard();
     let total_memory = db.estimated_memory();
-    if total_memory <= config.maxmemory {
+    if total_memory <= budget {
         return Ok(smallvec::SmallVec::new());
     }
 
@@ -316,7 +323,7 @@ pub fn try_evict_deferred(
     let mut evicted = smallvec::SmallVec::new();
     let mut current_total = total_memory;
 
-    while current_total > config.maxmemory {
+    while current_total > budget {
         if policy == EvictionPolicy::NoEviction {
             return Err(oom_error());
         }
@@ -695,7 +702,49 @@ mod tests {
             maxclients: 10000,
             timeout: 0,
             tcp_keepalive: 300,
+            num_shards: 1,
         }
+    }
+
+    #[test]
+    fn per_shard_budget_divides_maxmemory_at_enforcement() {
+        // Regression for the multishard "zombie RAM" bug: maxmemory is a
+        // whole-instance cap, but each shard enforces eviction independently.
+        // Without per-shard division an N-shard server tolerates ~N×maxmemory.
+        let mut db = Database::new();
+        db.set_string(Bytes::from_static(b"k1"), Bytes::from_static(b"v1"));
+        db.set_string(Bytes::from_static(b"k2"), Bytes::from_static(b"v2"));
+        db.set_string(Bytes::from_static(b"k3"), Bytes::from_static(b"v3"));
+        db.set_string(Bytes::from_static(b"k4"), Bytes::from_static(b"v4"));
+        let total = db.estimated_memory();
+        assert!(total > 0);
+
+        // Whole-instance cap == current memory, single shard: per-shard budget
+        // equals `total`, so nothing is evicted.
+        let mut cfg1 = make_config(total, "allkeys-lru");
+        cfg1.num_shards = 1;
+        assert!(try_evict_if_needed(&mut db, &cfg1).is_ok());
+        assert_eq!(
+            db.len(),
+            4,
+            "single shard: nothing evicted at budget == total"
+        );
+
+        // SAME whole-instance cap, 4 shards: per-shard budget = ceil(total/4) <<
+        // total, so this shard MUST shed keys until it is under the per-shard
+        // budget. Pre-fix (comparison vs raw maxmemory) this evicted nothing.
+        let mut cfg4 = make_config(total, "allkeys-lru");
+        cfg4.num_shards = 4;
+        assert!(try_evict_if_needed(&mut db, &cfg4).is_ok());
+        assert!(
+            db.len() < 4,
+            "4 shards: per-shard budget must force eviction (got len {})",
+            db.len()
+        );
+        assert!(
+            db.estimated_memory() <= cfg4.maxmemory_per_shard(),
+            "evicted below the per-shard budget"
+        );
     }
 
     #[test]

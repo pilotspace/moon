@@ -725,6 +725,11 @@ impl ServerConfig {
             maxclients: self.maxclients,
             timeout: self.timeout,
             tcp_keepalive: self.tcp_keepalive,
+            // Default to single-shard (no division). The server overwrites this
+            // on the shared RuntimeConfig with the resolved shard count once it
+            // is known (main.rs / embedded.rs), so the per-shard eviction budget
+            // bounds aggregate RSS. Tests that call this directly run 1 shard.
+            num_shards: 1,
         }
     }
 }
@@ -880,6 +885,30 @@ pub fn log_memory_guardrail(outcome: GuardrailOutcome) {
     }
 }
 
+/// Emit a one-line startup notice when `maxmemory` is split across multiple shards.
+///
+/// `maxmemory` is a whole-instance cap, but each shard enforces eviction
+/// independently against `maxmemory / num_shards` (see
+/// [`RuntimeConfig::maxmemory_per_shard`]). Without this notice an operator
+/// running e.g. `--maxmemory 8gb --shards 4` would silently get an 8 GB
+/// (not 32 GB) effective ceiling and see "surprise" evictions with nothing
+/// in the logs explaining why. Only fires when the division actually changes
+/// the effective budget (`num_shards > 1` and a finite cap).
+pub fn log_maxmemory_sharding(maxmemory: usize, num_shards: usize) {
+    if maxmemory == 0 || num_shards <= 1 {
+        return;
+    }
+    let per_shard = maxmemory.div_ceil(num_shards);
+    tracing::info!(
+        "maxmemory {} bytes is a whole-instance cap; each of {} shards enforces \
+         eviction against a per-shard budget of {} bytes (maxmemory / shards). \
+         CONFIG GET / INFO continue to report the whole-instance value.",
+        maxmemory,
+        num_shards,
+        per_shard
+    );
+}
+
 /// Runtime-mutable configuration parameters.
 ///
 /// These can be changed via CONFIG SET without server restart.
@@ -924,6 +953,38 @@ pub struct RuntimeConfig {
     pub timeout: u64,
     /// TCP keepalive interval in seconds (0 = disabled).
     pub tcp_keepalive: u64,
+    /// Resolved shard count — used only to derive the per-shard eviction budget.
+    ///
+    /// `maxmemory` is a whole-instance cap (Redis-compatible: `CONFIG GET` /
+    /// INFO report it verbatim). But each shard is shared-nothing and enforces
+    /// eviction independently, so without dividing, an N-shard server would
+    /// tolerate ~N×`maxmemory` before evicting. The per-shard threshold is
+    /// therefore `maxmemory / num_shards` (see [`RuntimeConfig::maxmemory_per_shard`]).
+    /// Defaults to `1` (single shard ⇒ no division, preserving prior behavior);
+    /// the server overwrites it on the shared instance at startup with the
+    /// resolved shard count.
+    pub num_shards: usize,
+}
+
+impl RuntimeConfig {
+    /// Per-shard eviction budget in bytes.
+    ///
+    /// `maxmemory` is a whole-instance cap. Because each shard enforces eviction
+    /// independently (shared-nothing), the effective per-shard threshold is
+    /// `maxmemory / num_shards`, so the aggregate across all shards converges on
+    /// the configured whole-instance cap instead of overshooting it ~N×.
+    ///
+    /// Uses `div_ceil` so the summed per-shard budgets never undershoot the cap,
+    /// and `max(1)` on the divisor guards against a mis-set `num_shards`. Returns
+    /// `0` (unlimited) iff `maxmemory == 0`.
+    #[inline]
+    #[must_use]
+    pub fn maxmemory_per_shard(&self) -> usize {
+        if self.maxmemory == 0 {
+            return 0;
+        }
+        self.maxmemory.div_ceil(self.num_shards.max(1))
+    }
 }
 
 impl Default for RuntimeConfig {
@@ -948,6 +1009,7 @@ impl Default for RuntimeConfig {
             maxclients: 10000,
             timeout: 0,
             tcp_keepalive: 300,
+            num_shards: 1,
         }
     }
 }
@@ -1159,6 +1221,59 @@ mod tests {
         assert_eq!(rt.maxmemory_samples, 5);
         assert_eq!(rt.lfu_log_factor, 10);
         assert_eq!(rt.lfu_decay_time, 1);
+        // to_runtime_config defaults num_shards to 1 (no per-shard division until
+        // the server sets the resolved count on the shared instance).
+        assert_eq!(rt.num_shards, 1);
+        assert_eq!(rt.maxmemory_per_shard(), 1024);
+    }
+
+    #[test]
+    fn maxmemory_per_shard_unlimited_stays_zero() {
+        let mut rt = RuntimeConfig::default();
+        rt.maxmemory = 0;
+        for n in [1, 2, 4, 16] {
+            rt.num_shards = n;
+            assert_eq!(
+                rt.maxmemory_per_shard(),
+                0,
+                "unlimited (0) must stay 0 regardless of shard count"
+            );
+        }
+    }
+
+    #[test]
+    fn maxmemory_per_shard_single_shard_is_whole_instance() {
+        let mut rt = RuntimeConfig::default();
+        rt.maxmemory = 1_000;
+        rt.num_shards = 1;
+        assert_eq!(rt.maxmemory_per_shard(), 1_000);
+    }
+
+    #[test]
+    fn maxmemory_per_shard_divides_by_shard_count() {
+        let mut rt = RuntimeConfig::default();
+        rt.maxmemory = 400;
+        rt.num_shards = 4;
+        assert_eq!(rt.maxmemory_per_shard(), 100);
+    }
+
+    #[test]
+    fn maxmemory_per_shard_div_ceil_never_undershoots() {
+        // 10 / 3 = 3.33 -> ceil 4 so the summed per-shard budgets (12) >= cap (10).
+        let mut rt = RuntimeConfig::default();
+        rt.maxmemory = 10;
+        rt.num_shards = 3;
+        assert_eq!(rt.maxmemory_per_shard(), 4);
+        assert!(rt.maxmemory_per_shard() * rt.num_shards >= rt.maxmemory);
+    }
+
+    #[test]
+    fn maxmemory_per_shard_guards_zero_shard_count() {
+        // A mis-set num_shards == 0 must not divide-by-zero; treat as 1 shard.
+        let mut rt = RuntimeConfig::default();
+        rt.maxmemory = 500;
+        rt.num_shards = 0;
+        assert_eq!(rt.maxmemory_per_shard(), 500);
     }
 
     #[test]

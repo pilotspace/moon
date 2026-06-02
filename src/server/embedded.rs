@@ -176,6 +176,10 @@ pub async fn run_embedded(
     // Shared runtime + server configs.
     let runtime_config_shared: Arc<RwLock<crate::config::RuntimeConfig>> =
         Arc::new(RwLock::new(config.to_runtime_config()));
+    // Publish the resolved shard count so maxmemory is enforced as a
+    // whole-instance cap (per-shard budget = maxmemory / num_shards).
+    runtime_config_shared.write().num_shards = num_shards;
+    crate::config::log_maxmemory_sharding(runtime_config_shared.read().maxmemory, num_shards);
     let server_config_shared: Arc<ServerConfig> = Arc::new(config.clone());
 
     // Per-shard pubsub + remote-subscriber registries.

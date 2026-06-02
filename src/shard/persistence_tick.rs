@@ -452,7 +452,11 @@ pub(crate) fn should_run_pressure_cascade(
     if rt.maxmemory == 0 {
         return false; // No memory limit set -- no pressure possible
     }
-    let threshold = (rt.maxmemory as f64 * server_config.disk_offload_threshold) as usize;
+    // `used` is this shard's aggregate (across its DBs); compare against the
+    // PER-SHARD budget so the cascade fires at maxmemory/num_shards per shard,
+    // bounding aggregate RSS instead of the whole-instance cap per shard.
+    let threshold =
+        (rt.maxmemory_per_shard() as f64 * server_config.disk_offload_threshold) as usize;
     let used = shard_databases.aggregate_memory(shard_id);
     used > threshold
 }
@@ -532,7 +536,9 @@ pub(crate) fn handle_memory_pressure(
 
     // Step 3: KV eviction -- run existing LRU/LFU eviction, with spill-to-disk
     // when disk-offload is enabled (evicted entries written to KvLeaf DataFiles).
-    // Use aggregate memory (server-wide) to match Redis maxmemory semantics.
+    // Compare this shard's aggregate (across its DBs) against the PER-SHARD
+    // budget (maxmemory/num_shards) so the summed eviction across shards bounds
+    // aggregate RSS at the whole-instance maxmemory.
     //
     // When a SpillThread is available, use the async path: entries are removed
     // from DashTable immediately (freeing RAM) and pwrite is deferred to the
@@ -542,7 +548,7 @@ pub(crate) fn handle_memory_pressure(
         if rt.maxmemory > 0 {
             // Compute aggregate BEFORE acquiring write locks (same pattern as handler_sharded).
             let total_mem = shard_databases.aggregate_memory(shard_id);
-            if total_mem > rt.maxmemory {
+            if total_mem > rt.maxmemory_per_shard() {
                 let db_count = shard_databases.db_count();
                 let shard_dir = server_config
                     .effective_disk_offload_dir()
