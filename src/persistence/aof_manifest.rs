@@ -1152,17 +1152,27 @@ impl AofManifest {
     }
 
     /// Advance a single shard to a new sequence: write the shard's new base RDB,
-    /// create a new empty incr file, delete old shard files, then update the
-    /// shard's `max_lsn` in the in-memory manifest.
+    /// create a new empty incr file, then update the shard's `max_lsn` in the
+    /// in-memory manifest.
+    ///
+    /// **Does NOT delete the old generation's files.** Deletion is deferred to
+    /// the coordinator via [`prune_shard_files`](Self::prune_shard_files),
+    /// called only AFTER `write_manifest()` durably commits the new seq.
+    /// Deleting before the commit would leave a crash window where the
+    /// persisted (old) seq points at files that are already gone — recovery
+    /// resolves base/incr by `self.seq`, so a crash mid-fan-out would lose data
+    /// for any shard that had already advanced. This matches the post-commit
+    /// deletion ordering in [`advance`](Self::advance) (TopLevel layout).
     ///
     /// **Caller MUST call `write_manifest()` after all shards have been advanced**
-    /// to persist the updated manifest atomically. Advancing shards one at a time
-    /// and writing the manifest per-shard would leave the manifest in an
-    /// inconsistent state between calls.
+    /// (and set `self.seq` to the new seq) to persist the updated manifest
+    /// atomically — this is the single durable commit point for the rewrite.
+    /// Advancing shards one at a time and writing the manifest per-shard would
+    /// leave the manifest in an inconsistent state between calls.
     ///
     /// For `TopLevel` layout, `shard_id` must be 0 and this delegates to
-    /// `advance()`. For `PerShard` layout, files are written to
-    /// `shard_dir(shard_id)/`.
+    /// `advance()` (which deletes post-commit internally). For `PerShard`
+    /// layout, files are written to `shard_dir(shard_id)/`.
     ///
     /// Returns the path to the new incremental file for this shard.
     pub fn advance_shard(
@@ -1189,7 +1199,6 @@ impl AofManifest {
                 ),
             })?;
 
-        let old_seq = self.seq;
         let shard_dir = self.shard_dir(shard_id);
         std::fs::create_dir_all(&shard_dir).map_err(|e| crate::error::AofError::Io {
             path: shard_dir.clone(),
@@ -1234,31 +1243,11 @@ impl AofManifest {
             source: e,
         })?;
 
-        // 3. Delete old shard files (best-effort).
-        let old_base = self.shard_base_path_seq(shard_id, old_seq);
-        let old_incr = self.shard_incr_path_seq(shard_id, old_seq);
-        if old_base.exists() {
-            if let Err(e) = std::fs::remove_file(&old_base) {
-                warn!(
-                    "advance_shard {}: failed to delete old base {}: {}",
-                    shard_id,
-                    old_base.display(),
-                    e
-                );
-            }
-        }
-        if old_incr.exists() {
-            if let Err(e) = std::fs::remove_file(&old_incr) {
-                warn!(
-                    "advance_shard {}: failed to delete old incr {}: {}",
-                    shard_id,
-                    old_incr.display(),
-                    e
-                );
-            }
-        }
-
-        // 4. Update per-shard LSN in-memory (manifest write is the caller's job).
+        // 3. Update per-shard LSN in-memory (manifest write is the caller's job).
+        //    Old-generation files are intentionally NOT deleted here — the
+        //    coordinator prunes them via `prune_shard_files` only after
+        //    `write_manifest()` durably commits the new seq (see the fn doc;
+        //    delete-before-commit would lose data on a mid-fan-out crash).
         self.shards[shard_idx].max_lsn = self.shards[shard_idx].max_lsn.max(new_seq);
 
         info!(
@@ -1270,6 +1259,40 @@ impl AofManifest {
         );
 
         Ok(new_incr)
+    }
+
+    /// Delete a shard's base + incr files for a specific `seq`. Best-effort.
+    ///
+    /// **Crash-safety contract:** the rewrite coordinator MUST call this only
+    /// AFTER `write_manifest()` has durably committed the new seq. Deleting an
+    /// old generation's files before the manifest flips would orphan the
+    /// persisted (old) seq whose files are already gone — recovery resolves
+    /// base/incr by `self.seq`, so it would read a missing base and lose data
+    /// for any shard that completed before the crash. This mirrors the
+    /// post-commit deletion ordering in `advance()` (TopLevel layout).
+    pub fn prune_shard_files(&self, shard_id: u16, seq: u64) {
+        let base = self.shard_base_path_seq(shard_id, seq);
+        let incr = self.shard_incr_path_seq(shard_id, seq);
+        if base.exists() {
+            if let Err(e) = std::fs::remove_file(&base) {
+                warn!(
+                    "prune_shard_files {}: failed to delete old base {}: {}",
+                    shard_id,
+                    base.display(),
+                    e
+                );
+            }
+        }
+        if incr.exists() {
+            if let Err(e) = std::fs::remove_file(&incr) {
+                warn!(
+                    "prune_shard_files {}: failed to delete old incr {}: {}",
+                    shard_id,
+                    incr.display(),
+                    e
+                );
+            }
+        }
     }
 }
 
@@ -2875,10 +2898,16 @@ mod tests_v2 {
     }
 
     // -----------------------------------------------------------------------
-    // FIX-W2-3 (partial): advance_shard writes new base+incr, deletes old
+    // F6 crash-safety ordering: advance_shard writes new base+incr but MUST
+    // NOT delete old files. Deleting before the manifest durably commits the
+    // new seq leaves a window where a crash orphans the persisted (old) seq
+    // whose files are already gone → recovery reads a missing base → data
+    // loss for completed shards. Deletion is the coordinator's job, AFTER
+    // write_manifest(), via prune_shard_files(). This mirrors the proven
+    // ordering in advance() (TopLevel), which deletes only post-commit.
     // -----------------------------------------------------------------------
     #[test]
-    fn advance_shard_writes_new_seq_and_deletes_old() {
+    fn advance_shard_defers_delete_until_after_commit() {
         let dir = temp_dir();
 
         // Initialize 2-shard manifest at seq=1.
@@ -2888,41 +2917,69 @@ mod tests_v2 {
         let empty_rdb = crate::persistence::rdb::save_to_bytes(&[] as &[crate::storage::Database])
             .expect("empty rdb");
 
-        // Old shard-0 files at seq=1 must exist before advance.
-        let old_base_s0 = manifest.shard_base_path(0);
-        let old_incr_s0 = manifest.shard_incr_path(0);
+        // Old shard files at seq=1 must exist before advance.
+        let old_base_s0 = manifest.shard_base_path_seq(0, 1);
+        let old_incr_s0 = manifest.shard_incr_path_seq(0, 1);
+        let old_base_s1 = manifest.shard_base_path_seq(1, 1);
+        let old_incr_s1 = manifest.shard_incr_path_seq(1, 1);
         assert!(old_base_s0.exists(), "seq=1 base must exist for shard 0");
         assert!(old_incr_s0.exists(), "seq=1 incr must exist for shard 0");
 
-        // Advance shard-0 to seq=2.
-        let new_incr = manifest
+        // Fan out: coordinator picks new_seq=2 once and advances every shard
+        // to it. No manifest write, no deletion, happens inside the fan-out.
+        let new_incr_s0 = manifest
             .advance_shard(0, 2, &empty_rdb)
             .expect("advance_shard 0 → seq=2");
-        assert!(new_incr.exists(), "new incr file must be created");
+        let new_incr_s1 = manifest
+            .advance_shard(1, 2, &empty_rdb)
+            .expect("advance_shard 1 → seq=2");
+        assert!(new_incr_s0.exists(), "new incr file must be created (s0)");
+        assert!(new_incr_s1.exists(), "new incr file must be created (s1)");
+
+        // PRE-COMMIT INVARIANT: new files written, OLD files NOT yet deleted.
+        // This is the regression guard against delete-before-commit.
         assert!(
             manifest.shard_base_path_seq(0, 2).exists(),
             "new seq=2 base must exist for shard 0"
         );
         assert!(
-            !old_base_s0.exists(),
-            "old seq=1 base must be deleted for shard 0"
+            manifest.shard_base_path_seq(1, 2).exists(),
+            "new seq=2 base must exist for shard 1"
         );
         assert!(
-            !old_incr_s0.exists(),
-            "old seq=1 incr must be deleted for shard 0"
+            old_base_s0.exists(),
+            "old seq=1 base (s0) MUST survive until the manifest commits"
         );
-
-        // Shard-1 must be unaffected.
         assert!(
-            manifest.shard_base_path(1).exists(),
-            "shard-1 seq=1 base must survive advance of shard-0"
+            old_incr_s0.exists(),
+            "old seq=1 incr (s0) MUST survive until the manifest commits"
+        );
+        assert!(
+            old_base_s1.exists(),
+            "old seq=1 base (s1) MUST survive until the manifest commits"
         );
 
-        // Caller must write_manifest after all shards advanced.
+        // COMMIT: coordinator bumps seq and persists the manifest atomically.
+        // This is the single durable commit point for the whole rewrite.
         manifest.seq = 2;
         manifest
             .write_manifest()
             .expect("write manifest after advance");
+
+        // POST-COMMIT: coordinator prunes old files — safe now that recovery
+        // resolves base/incr by the durably-committed new seq.
+        manifest.prune_shard_files(0, 1);
+        manifest.prune_shard_files(1, 1);
+        assert!(!old_base_s0.exists(), "old seq=1 base (s0) pruned post-commit");
+        assert!(!old_incr_s0.exists(), "old seq=1 incr (s0) pruned post-commit");
+        assert!(!old_base_s1.exists(), "old seq=1 base (s1) pruned post-commit");
+        assert!(!old_incr_s1.exists(), "old seq=1 incr (s1) pruned post-commit");
+        assert!(
+            manifest.shard_base_path_seq(0, 2).exists(),
+            "new seq=2 base (s0) must remain after prune"
+        );
+
+        // Recovery reads base by manifest.seq — must resolve to the new seq.
         let reloaded = AofManifest::load(&dir).expect("load").expect("present");
         assert_eq!(reloaded.seq, 2);
 
