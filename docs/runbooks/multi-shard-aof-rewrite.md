@@ -52,9 +52,15 @@ linearly with shard count.
 
 ### BGREWRITEAOF in per-shard mode
 
-`BGREWRITEAOF` fans out to every shard's writer task. Each shard compacts its
-own log independently. All N acks are awaited before returning `+Background
-append only file rewriting started`.
+`BGREWRITEAOF` is **not yet supported** for PerShard layouts. Issuing it on a
+PerShard instance returns the following error immediately:
+
+```
+ERR BGREWRITEAOF is not yet supported under per-shard AOF layout; per-shard rewrite ships in step 6 of the per-shard AOF migration
+```
+
+Per-shard BGREWRITEAOF (each shard compacts its own log independently, with
+all N acks awaited before returning confirmation) is tracked for v0.2.
 
 ---
 
@@ -74,25 +80,28 @@ writer, `layout: TopLevel`) and want to migrate to per-shard layout:
 
 ### Option B — in-place migration (future tooling)
 
-A `moon migrate-aof --from-top-level` CLI subcommand is planned for v0.2. Until
-then, use Option A.
+An offline migration CLI subcommand is planned for v0.2. Until then, use
+Option A.
 
 ### Safety guard — TopLevel manifest with multi-shard startup
 
 If Moon detects an existing **TopLevel** AOF manifest at startup with
-`--shards >= 2`, it refuses to start and prints:
+`--shards >= 2`, it refuses to start with exit code 2 and prints the following
+to stderr:
 
 ```
 REFUSING TO START: legacy TopLevel AOF manifest at <path> detected with
---shards N (>= 2). A TopLevel (single-writer) AOF cannot safely serve
-as the persistence log for a multi-shard instance. Options:
-  1. Use --shards 1 (single-shard, fully compatible with TopLevel layout).
-  2. Remove appendonlydir/ and restart to create a fresh per-shard manifest.
-  3. Run: moon migrate-aof --from-top-level  (planned for v0.2).
+--shards N (>= 2). This combination silently loses data for shards 1..N-1.
+See docs/runbooks/multi-shard-aof-rewrite.md for migration instructions.
 ```
+
+(Exact text may include additional context such as the manifest path and shard
+count substituted in; the key phrase to match in alerting is `REFUSING TO START`.)
 
 This is intentional — a TopLevel log does not capture per-shard ordering, so
 replaying it on a multi-shard instance would produce incorrect key routing.
+
+**Resolution:** Follow Option A above (remove `appendonlydir/` and restart).
 
 ---
 
