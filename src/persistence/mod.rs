@@ -2,6 +2,7 @@ pub mod aof;
 pub mod aof_manifest;
 pub mod auto_save;
 pub mod checkpoint;
+pub mod migrate_aof;
 pub mod clog;
 pub mod compression;
 pub mod control;

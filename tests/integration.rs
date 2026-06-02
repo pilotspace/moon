@@ -103,6 +103,9 @@ async fn start_server() -> (u16, CancellationToken) {
         autovacuum_starvation_cap_secs: 300,
         vec_warm_mmap_budget: "2gb".to_string(),
         cold_orphan_sweep_interval_secs: 300,
+        migrate_aof_from: None,
+        migrate_aof_to: None,
+        migrate_aof_shards: 0,
     };
 
     tokio::spawn(async move {
@@ -203,6 +206,9 @@ async fn start_server_with_pass(password: &str) -> (u16, CancellationToken) {
         autovacuum_starvation_cap_secs: 300,
         vec_warm_mmap_budget: "2gb".to_string(),
         cold_orphan_sweep_interval_secs: 300,
+        migrate_aof_from: None,
+        migrate_aof_to: None,
+        migrate_aof_shards: 0,
     };
 
     tokio::spawn(async move {
@@ -1375,6 +1381,9 @@ async fn start_server_with_persistence(
         autovacuum_starvation_cap_secs: 300,
         vec_warm_mmap_budget: "2gb".to_string(),
         cold_orphan_sweep_interval_secs: 300,
+        migrate_aof_from: None,
+        migrate_aof_to: None,
+        migrate_aof_shards: 0,
     };
 
     tokio::spawn(async move {
@@ -2259,6 +2268,9 @@ async fn start_server_with_maxmemory(maxmemory: usize, policy: &str) -> (u16, Ca
         autovacuum_starvation_cap_secs: 300,
         vec_warm_mmap_budget: "2gb".to_string(),
         cold_orphan_sweep_interval_secs: 300,
+        migrate_aof_from: None,
+        migrate_aof_to: None,
+        migrate_aof_shards: 0,
     };
 
     tokio::spawn(async move {
@@ -2670,6 +2682,9 @@ async fn start_sharded_server(num_shards: usize) -> (u16, CancellationToken) {
         autovacuum_starvation_cap_secs: 300,
         vec_warm_mmap_budget: "2gb".to_string(),
         cold_orphan_sweep_interval_secs: 300,
+        migrate_aof_from: None,
+        migrate_aof_to: None,
+        migrate_aof_shards: 0,
     };
 
     let cancel = token.clone();
@@ -3861,6 +3876,9 @@ async fn start_cluster_server() -> (u16, CancellationToken) {
         autovacuum_starvation_cap_secs: 300,
         vec_warm_mmap_budget: "2gb".to_string(),
         cold_orphan_sweep_interval_secs: 300,
+        migrate_aof_from: None,
+        migrate_aof_to: None,
+        migrate_aof_shards: 0,
     };
 
     std::thread::spawn(move || {
@@ -4523,6 +4541,9 @@ async fn start_server_with_aclfile(acl_path: &str) -> (u16, CancellationToken) {
         autovacuum_starvation_cap_secs: 300,
         vec_warm_mmap_budget: "2gb".to_string(),
         cold_orphan_sweep_interval_secs: 300,
+        migrate_aof_from: None,
+        migrate_aof_to: None,
+        migrate_aof_shards: 0,
     };
 
     tokio::spawn(async move {

@@ -92,6 +92,9 @@ async fn start_server() -> (u16, CancellationToken) {
         autovacuum_starvation_cap_secs: 300,
         vec_warm_mmap_budget: "2gb".to_string(),
         cold_orphan_sweep_interval_secs: 300,
+        migrate_aof_from: None,
+        migrate_aof_to: None,
+        migrate_aof_shards: 0,
     };
 
     tokio::spawn(async move {

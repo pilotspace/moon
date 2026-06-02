@@ -747,6 +747,19 @@ impl AofManifest {
         if !aof_dir.exists() {
             return false;
         }
+
+        // Check manifest version first. If a valid v2 (PerShard) manifest exists,
+        // return false regardless of stray top-level files. Operators occasionally
+        // leave old base.rdb / incr.aof files at the top level during debugging
+        // or failed upgrades; scanning filenames without reading the manifest would
+        // produce a misleading "legacy detected" result and trigger unwanted
+        // migration on an already-upgraded deployment.
+        if let Ok(Some(m)) = Self::load(dir) {
+            if m.layout == AofLayout::PerShard {
+                return false;
+            }
+        }
+
         let entries = match std::fs::read_dir(&aof_dir) {
             Ok(e) => e,
             Err(_) => return false,
@@ -1598,12 +1611,19 @@ fn replay_incr_framed(
 /// `shards` length MUST equal `per_shard_databases.len()`; the caller is
 /// expected to have run [`AofManifest::verify_shard_count`] at boot.
 ///
-/// Per-shard work is independent (different shards never touch the same
-/// DashTable), so this is parallelizable in principle. Step 4 keeps the
-/// initial implementation sequential — it's correct, simple, and the cold
-/// recovery path is not throughput-critical. Parallelizing across shards is
-/// a future optimization (RFC § 1 recovery-parallelism claim) once the
-/// crash-matrix tests soak the sequential path.
+/// Per-shard replay is fully parallel: each shard's base RDB load and incr
+/// replay run in a separate OS thread via `std::thread::scope`. Shards are
+/// independent (different `DashTable` instances, no shared mutable state), so
+/// this is safe and correct. Parallelism delivers the RFC § 1 benefit on
+/// multi-shard deployments with large AOF files.
+///
+/// The `engine_factory` closure is called once per shard thread to produce an
+/// independent replay engine. This is required because `CommandReplayEngine`
+/// implementations (e.g., `DispatchReplayEngine` under the `graph` feature)
+/// may contain non-`Sync` state (`RefCell`) that cannot be safely shared across
+/// threads. Each thread owns its own engine; results (total count, max LSN,
+/// ordered entries) are collected and merged in the caller thread after all
+/// shard threads complete.
 ///
 /// Returns `(total_commands_replayed, global_max_lsn, ordered_entries)`:
 ///   - `total_commands_replayed` covers all inline (non-ordered) entries
@@ -1618,7 +1638,8 @@ fn replay_incr_framed(
 pub fn replay_per_shard(
     per_shard_databases: &mut [&mut [crate::storage::Database]],
     manifest: &AofManifest,
-    engine: &dyn crate::persistence::replay::CommandReplayEngine,
+    engine_factory: &(dyn Fn() -> Box<dyn crate::persistence::replay::CommandReplayEngine + Send>
+          + Sync),
 ) -> Result<(usize, u64, Vec<OrderedEntry>), crate::error::MoonError> {
     debug_assert_eq!(
         manifest.layout,
@@ -1637,76 +1658,128 @@ pub fn replay_per_shard(
         ));
     }
 
+    // Per-shard type alias for the thread result.
+    type ShardResult = Result<(usize, u64, Vec<OrderedEntry>), crate::error::MoonError>;
+
+    // Use std::thread::scope so each shard thread borrows its databases slice
+    // without a 'static lifetime requirement. All threads complete before scope
+    // exits, which satisfies the borrow checker. Errors are propagated via
+    // a Vec<ShardResult> collected after join.
+    let shard_results: Vec<ShardResult> = std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(per_shard_databases.len());
+
+        for (shard_id, databases) in per_shard_databases.iter_mut().enumerate() {
+            let sid = shard_id as u16;
+            let base_path = manifest.shard_base_path(sid);
+            let incr_path = manifest.shard_incr_path(sid);
+            let engine = engine_factory();
+
+            handles.push(scope.spawn(move || -> ShardResult {
+                let mut shard_total: usize = 0;
+                let mut shard_max_lsn: u64 = 0;
+                let mut shard_ordered: Vec<OrderedEntry> = Vec::new();
+
+                // Load this shard's base RDB.
+                if base_path.exists() {
+                    match crate::persistence::rdb::load(*databases, &base_path) {
+                        Ok(n) => {
+                            info!(
+                                "AOF shard-{} base RDB loaded: {} keys from {}",
+                                sid,
+                                n,
+                                base_path.display()
+                            );
+                            shard_total += n;
+                        }
+                        Err(e) => {
+                            error!("AOF shard-{} base RDB load failed: {}", sid, e);
+                            return Err(e);
+                        }
+                    }
+                } else {
+                    // Missing base is tolerable only when this shard's incr file is
+                    // empty (or absent). Same invariant as `replay_multi_part`.
+                    let incr_len =
+                        std::fs::metadata(&incr_path).map(|m| m.len()).unwrap_or(0);
+                    if incr_len > 0 {
+                        return Err(crate::error::MoonError::from(
+                            crate::error::AofError::RewriteFailed {
+                                detail: format!(
+                                    "AOF shard-{} base RDB missing at {} but incr {} is {} bytes; refusing to replay incr against empty state",
+                                    sid,
+                                    base_path.display(),
+                                    incr_path.display(),
+                                    incr_len,
+                                ),
+                            },
+                        ));
+                    }
+                    warn!(
+                        "AOF shard-{} base RDB not found: {} (incr empty, treating as fresh init)",
+                        sid,
+                        base_path.display()
+                    );
+                }
+
+                // Replay this shard's framed incr file.
+                if incr_path.exists() {
+                    let data = std::fs::read(&incr_path).map_err(|e| {
+                        crate::error::MoonError::from(crate::error::AofError::Io {
+                            path: incr_path.clone(),
+                            source: e,
+                        })
+                    })?;
+                    if !data.is_empty() {
+                        let (count, max_lsn) = replay_incr_framed(
+                            sid,
+                            *databases,
+                            &data,
+                            engine.as_ref(),
+                            &mut shard_ordered,
+                        )?;
+                        info!(
+                            "AOF shard-{} incr replayed: {} commands from {} (max lsn {})",
+                            sid,
+                            count,
+                            incr_path.display(),
+                            max_lsn
+                        );
+                        shard_total += count;
+                        if max_lsn > shard_max_lsn {
+                            shard_max_lsn = max_lsn;
+                        }
+                    }
+                }
+
+                Ok((shard_total, shard_max_lsn, shard_ordered))
+            }));
+        }
+
+        // Collect results in shard order.
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap_or_else(|_| {
+                Err(crate::error::MoonError::from(
+                    crate::error::AofError::RewriteFailed {
+                        detail: "replay_per_shard worker thread panicked".to_owned(),
+                    },
+                ))
+            }))
+            .collect()
+    });
+
+    // Merge per-shard results.
     let mut total: usize = 0;
     let mut global_max_lsn: u64 = 0;
     let mut ordered_entries: Vec<OrderedEntry> = Vec::new();
 
-    for shard_id in 0..manifest.shards.len() {
-        let sid = shard_id as u16;
-        let base_path = manifest.shard_base_path(sid);
-        let incr_path = manifest.shard_incr_path(sid);
-        let databases = &mut *per_shard_databases[shard_id];
-
-        // Load this shard's base RDB.
-        if base_path.exists() {
-            match crate::persistence::rdb::load(databases, &base_path) {
-                Ok(n) => {
-                    info!(
-                        "AOF shard-{} base RDB loaded: {} keys from {}",
-                        sid,
-                        n,
-                        base_path.display()
-                    );
-                    total += n;
-                }
-                Err(e) => {
-                    error!("AOF shard-{} base RDB load failed: {}", sid, e);
-                    return Err(e);
-                }
-            }
-        } else {
-            // Missing base is tolerable only when this shard's incr file is
-            // empty (or absent). Same invariant as `replay_multi_part`.
-            let incr_len = std::fs::metadata(&incr_path).map(|m| m.len()).unwrap_or(0);
-            if incr_len > 0 {
-                return Err(crate::error::MoonError::from(
-                    crate::error::AofError::RewriteFailed {
-                        detail: format!(
-                            "AOF shard-{} base RDB missing at {} but incr {} is {} bytes; refusing to replay incr against empty state",
-                            sid,
-                            base_path.display(),
-                            incr_path.display(),
-                            incr_len,
-                        ),
-                    },
-                ));
-            }
-            warn!(
-                "AOF shard-{} base RDB not found: {} (incr empty, treating as fresh init)",
-                sid,
-                base_path.display()
-            );
+    for result in shard_results {
+        let (shard_total, shard_max_lsn, shard_ordered) = result?;
+        total += shard_total;
+        if shard_max_lsn > global_max_lsn {
+            global_max_lsn = shard_max_lsn;
         }
-
-        // Replay this shard's framed incr file.
-        if incr_path.exists() {
-            let data = std::fs::read(&incr_path)?;
-            if !data.is_empty() {
-                let (count, shard_max_lsn) =
-                    replay_incr_framed(sid, databases, &data, engine, &mut ordered_entries)?;
-                info!(
-                    "AOF shard-{} incr replayed: {} commands from {} (max lsn {})",
-                    sid,
-                    count,
-                    incr_path.display(),
-                    shard_max_lsn
-                );
-                total += count;
-                if shard_max_lsn > global_max_lsn {
-                    global_max_lsn = shard_max_lsn;
-                }
-            }
-        }
+        ordered_entries.extend(shard_ordered);
     }
 
     Ok((total, global_max_lsn, ordered_entries))
@@ -1747,23 +1820,36 @@ pub fn replay_ordered_merge(
 
     entries.sort_by_key(|e| e.lsn);
 
-    // Per-LSN cardinality audit: emit a warn! if the same LSN is unevenly
-    // represented across shards. That's the operator-visible footprint of
-    // a torn cross-shard commit; the entries themselves are still applied.
+    // Per-LSN cardinality audit: detect torn cross-shard commits.
+    //
+    // A "torn" commit is one where LSN N appears in fewer shard files than
+    // the maximum cardinality seen for any other LSN in this batch. Applying
+    // partial entries violates atomicity — if the write was interrupted mid-
+    // commit (e.g., crash between shard-0 and shard-1 writes), replaying only
+    // the shard-0 portion produces an inconsistent state that cannot be
+    // compensated. DROP the entire torn LSN instead of applying partial data.
+    //
+    // NOTE: "torn" detection is heuristic — it compares each LSN's count
+    // against the maximum cardinality observed. An LSN that legitimately spans
+    // fewer shards (e.g. single-shard ordered op) can only occur if the batch
+    // is heterogeneous. Production emitters (future cross-shard TXN) must
+    // guarantee uniform cardinality per LSN, so this heuristic is correct for
+    // all currently-reachable code paths.
     let mut counts: std::collections::BTreeMap<u64, usize> =
         std::collections::BTreeMap::new();
     for e in &entries {
         *counts.entry(e.lsn).or_insert(0) += 1;
     }
-    if counts.len() > 1 {
-        let max_count = counts.values().copied().max().unwrap_or(0);
-        for (lsn, &n) in &counts {
-            if n != max_count {
-                warn!(
-                    "OrderedAcrossShards LSN {} appears in only {} of {} shard files; possible torn cross-shard commit",
-                    lsn, n, max_count
-                );
-            }
+    let max_count = counts.values().copied().max().unwrap_or(0);
+    let mut torn_lsns: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+    for (&lsn, &n) in &counts {
+        if n < max_count {
+            warn!(
+                "OrderedAcrossShards LSN {} appears in only {} of {} shard files; \
+                 torn cross-shard commit detected — dropping entry for atomicity",
+                lsn, n, max_count
+            );
+            torn_lsns.insert(lsn);
         }
     }
 
@@ -1771,6 +1857,10 @@ pub fn replay_ordered_merge(
     let mut replayed: usize = 0;
 
     for entry in entries {
+        // Skip entries belonging to a torn (partially-written) commit.
+        if torn_lsns.contains(&entry.lsn) {
+            continue;
+        }
         let shard_idx = entry.shard_id as usize;
         if shard_idx >= per_shard_databases.len() {
             return Err(crate::error::MoonError::from(
@@ -1840,13 +1930,16 @@ mod tests_v2 {
     use std::fs;
 
     fn temp_dir() -> PathBuf {
+        // Use a global atomic counter so parallel test threads (cargo test runs
+        // unit tests in parallel) never produce the same directory name even
+        // when PID and nanosecond clock resolution are the same for two threads.
+        static COUNTER: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let d = std::env::temp_dir().join(format!(
             "moon-aof-manifest-test-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
+            n,
         ));
         fs::create_dir_all(&d).expect("temp dir create");
         d
@@ -1988,6 +2081,34 @@ mod tests_v2 {
         assert!(
             !AofManifest::is_legacy_top_level_layout(&dir),
             "v2 layout has no top-level moon.aof.* files"
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// FIX-W3-4: v2 manifest with stray top-level .base.rdb must return false,
+    /// not true. The filename scan is misleading when a valid v2 manifest exists.
+    ///
+    /// Scenario: operator upgraded to v2 but left a stale `moon.aof.1.base.rdb`
+    /// at the top level (e.g., copied during debugging). `is_legacy_top_level_layout`
+    /// must check the manifest first and return false when v2 is confirmed.
+    #[test]
+    fn is_legacy_top_level_layout_ignores_stray_files_when_v2_manifest_present() {
+        let dir = temp_dir();
+        // Initialize a genuine v2 (PerShard) layout.
+        let _m = AofManifest::initialize_multi(&dir, 2).expect("init v2");
+
+        // Plant a stale top-level base.rdb to simulate the stray-file scenario.
+        let stray = dir
+            .join(AOF_DIR_NAME)
+            .join("moon.aof.1.base.rdb");
+        fs::write(&stray, b"REDIS0011\xff").expect("write stray base.rdb");
+
+        // Even though the stray file matches the filename pattern, a valid v2
+        // manifest is present, so is_legacy_top_level_layout must return false.
+        assert!(
+            !AofManifest::is_legacy_top_level_layout(&dir),
+            "v2 manifest + stray top-level file must still return false"
         );
 
         fs::remove_dir_all(&dir).ok();
@@ -2239,8 +2360,6 @@ mod tests_v2 {
 
     #[test]
     fn replay_per_shard_round_trips_two_shards() {
-        use crate::persistence::replay::DispatchReplayEngine;
-
         let dir = temp_dir();
         let manifest =
             AofManifest::initialize_multi(&dir, 2).expect("initialize_multi 2 shards");
@@ -2259,8 +2378,15 @@ mod tests_v2 {
         let (total, global_max_lsn, ordered) = {
             let mut slices: Vec<&mut [crate::storage::Database]> =
                 vec![&mut shard0, &mut shard1];
-            replay_per_shard(&mut slices, &manifest, &DispatchReplayEngine::new())
-                .expect("per-shard replay")
+            replay_per_shard(
+                &mut slices,
+                &manifest,
+                &(|| {
+                    Box::new(crate::persistence::replay::DispatchReplayEngine::new())
+                        as Box<dyn crate::persistence::replay::CommandReplayEngine + Send>
+                }),
+            )
+            .expect("per-shard replay")
         };
 
         assert_eq!(total, 2, "two SETs replayed");
@@ -2276,8 +2402,6 @@ mod tests_v2 {
 
     #[test]
     fn replay_per_shard_rejects_shard_count_mismatch() {
-        use crate::persistence::replay::DispatchReplayEngine;
-
         let dir = temp_dir();
         let manifest =
             AofManifest::initialize_multi(&dir, 2).expect("initialize_multi 2 shards");
@@ -2286,14 +2410,84 @@ mod tests_v2 {
         let mut shard0: Vec<crate::storage::Database> = vec![crate::storage::Database::new()];
         let mut slices: Vec<&mut [crate::storage::Database]> = vec![&mut shard0];
 
-        let err =
-            replay_per_shard(&mut slices, &manifest, &DispatchReplayEngine::new())
-                .expect_err("shard count mismatch must error");
+        let err = replay_per_shard(
+            &mut slices,
+            &manifest,
+            &(|| {
+                Box::new(crate::persistence::replay::DispatchReplayEngine::new())
+                    as Box<dyn crate::persistence::replay::CommandReplayEngine + Send>
+            }),
+        )
+        .expect_err("shard count mismatch must error");
         let msg = format!("{err}");
         assert!(
             msg.contains("shard-count mismatch"),
             "error message should call out the mismatch, got: {msg}"
         );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// FIX-W3-1: parallel per-shard replay must produce identical results to
+    /// sequential replay. N=4 shards, one key per shard.
+    ///
+    /// Test gate: correctness (same total/max_lsn/key distribution as sequential).
+    /// Wall-time comparison is flaky in CI and omitted.
+    #[test]
+    fn replay_per_shard_parallel_matches_sequential() {
+        let dir = temp_dir();
+        let n_shards: u16 = 4;
+        let manifest = AofManifest::initialize_multi(&dir, n_shards)
+            .expect("initialize_multi 4 shards");
+
+        // Each shard gets one SET at lsn = shard_id * 10 + 10.
+        for sid in 0..n_shards {
+            let lsn = (sid as u64 + 1) * 10;
+            let key = format!("k{sid}");
+            let val = format!("v{sid}");
+            let resp = format!(
+                "*3\r\n$3\r\nSET\r\n${klen}\r\n{key}\r\n${vlen}\r\n{val}\r\n",
+                klen = key.len(),
+                vlen = val.len(),
+            );
+            let entry = frame_entry(lsn, resp.as_bytes());
+            fs::write(manifest.shard_incr_path(sid), &entry)
+                .expect("write shard incr");
+        }
+
+        let mut shards: Vec<Vec<crate::storage::Database>> =
+            (0..n_shards as usize)
+                .map(|_| vec![crate::storage::Database::new()])
+                .collect();
+
+        let engine_factory = || {
+            Box::new(crate::persistence::replay::DispatchReplayEngine::new())
+                as Box<dyn crate::persistence::replay::CommandReplayEngine + Send>
+        };
+        let (total, global_max_lsn, ordered) = {
+            let mut slices: Vec<&mut [crate::storage::Database]> =
+                shards.iter_mut().map(|s| s.as_mut_slice()).collect();
+            replay_per_shard(&mut slices, &manifest, &engine_factory)
+                .expect("parallel per-shard replay")
+        };
+
+        assert_eq!(total, n_shards as usize, "one SET per shard = N total");
+        assert_eq!(
+            global_max_lsn,
+            n_shards as u64 * 10,
+            "global max lsn = highest shard lsn"
+        );
+        assert!(ordered.is_empty(), "no ordered entries");
+
+        // Each shard must have exactly one key.
+        for (sid, shard) in shards.iter().enumerate() {
+            assert_eq!(
+                shard[0].len(),
+                1,
+                "shard {} must have exactly 1 key after parallel replay",
+                sid
+            );
+        }
 
         fs::remove_dir_all(&dir).ok();
     }
@@ -2400,6 +2594,68 @@ mod tests_v2 {
             replay_ordered_merge(&mut slices, Vec::new(), &DispatchReplayEngine::new())
                 .expect("empty merge ok");
         assert_eq!(replayed, 0);
+    }
+
+    /// FIX-W3-3: torn cross-shard commit must be DROPPED entirely, not partially applied.
+    ///
+    /// Synthesize a 2-shard AOF where LSN 100 appears on shard 0 only (N=1
+    /// of K=2 expected). After replay, shard 0 must NOT have the key written
+    /// by the LSN-100 entry (it was dropped for atomicity).
+    #[test]
+    fn replay_ordered_merge_drops_torn_commit() {
+        use crate::persistence::replay::DispatchReplayEngine;
+
+        // Two shards, two complete entries at LSN 10 (one per shard) — these
+        // should succeed. LSN 100 appears only on shard 0 (torn) — must be dropped.
+        let entries = vec![
+            // Complete pair: LSN 10 on both shards
+            OrderedEntry {
+                shard_id: 0,
+                lsn: 10,
+                bytes: bytes::Bytes::from_static(
+                    b"*3\r\n$3\r\nSET\r\n$2\r\nc0\r\n$1\r\n1\r\n",
+                ),
+            },
+            OrderedEntry {
+                shard_id: 1,
+                lsn: 10,
+                bytes: bytes::Bytes::from_static(
+                    b"*3\r\n$3\r\nSET\r\n$2\r\nc1\r\n$1\r\n1\r\n",
+                ),
+            },
+            // Torn entry: LSN 100 only on shard 0, not shard 1
+            OrderedEntry {
+                shard_id: 0,
+                lsn: 100,
+                bytes: bytes::Bytes::from_static(
+                    b"*3\r\n$3\r\nSET\r\n$5\r\ntorn0\r\n$1\r\nv\r\n",
+                ),
+            },
+        ];
+
+        let mut shard0: Vec<crate::storage::Database> =
+            vec![crate::storage::Database::new()];
+        let mut shard1: Vec<crate::storage::Database> =
+            vec![crate::storage::Database::new()];
+        let replayed = {
+            let mut slices: Vec<&mut [crate::storage::Database]> =
+                vec![&mut shard0, &mut shard1];
+            replay_ordered_merge(&mut slices, entries, &DispatchReplayEngine::new())
+                .expect("ordered merge replay")
+        };
+
+        // The torn LSN-100 entry must NOT be applied (dropped for atomicity).
+        assert_eq!(replayed, 2, "only the complete LSN-10 pair is replayed");
+        assert_eq!(
+            shard0[0].len(),
+            1,
+            "shard-0 only has the complete LSN-10 key; torn LSN-100 entry must not be applied"
+        );
+        // Verify the torn key is absent
+        assert!(
+            shard0[0].get(b"torn0").is_none(),
+            "torn shard-0 entry (LSN 100) must NOT be applied"
+        );
     }
 
     #[test]

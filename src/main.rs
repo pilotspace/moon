@@ -70,6 +70,48 @@ fn main() -> anyhow::Result<()> {
 
     let config = ServerConfig::parse();
 
+    // ── AOF v1→v2 migration (FIX-W3-2): early-exit before normal boot ──
+    // When `--migrate-aof-from` is set, run the migration tool and exit.
+    // This must run BEFORE any shard/AOF initialization so the source
+    // directory is never modified and the destination is populated atomically.
+    if let Some(ref from) = config.migrate_aof_from {
+        let to = config.migrate_aof_to.as_deref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "--migrate-aof-to is required when --migrate-aof-from is set"
+            )
+        })?;
+        if config.migrate_aof_shards == 0 {
+            return Err(anyhow::anyhow!(
+                "--migrate-aof-shards must be >= 1 when --migrate-aof-from is set"
+            ));
+        }
+        info!(
+            "Running AOF migration: {} → {} ({} shards)",
+            from.display(),
+            to.display(),
+            config.migrate_aof_shards
+        );
+        // Create destination directory if absent.
+        if let Err(e) = std::fs::create_dir_all(to) {
+            return Err(anyhow::anyhow!(
+                "Failed to create migration destination directory {}: {}",
+                to.display(),
+                e
+            ));
+        }
+        let result = moon::persistence::migrate_aof::migrate_aof(
+            from,
+            to,
+            config.migrate_aof_shards,
+        )
+        .map_err(|e| anyhow::anyhow!("AOF migration failed: {}", e))?;
+        info!(
+            "AOF migration complete: {} RDB keys migrated, {} commands read, {} written, {} skipped",
+            result.rdb_keys_migrated, result.commands_read, result.commands_written, result.commands_skipped
+        );
+        return Ok(());
+    }
+
     // Non-jemalloc builds: warn if operator explicitly set --memory-arenas-cap
     #[cfg(not(feature = "jemalloc"))]
     if config.memory_arenas_cap != 8 {
@@ -270,6 +312,13 @@ fn main() -> anyhow::Result<()> {
 
     info!("Starting with {} shards", num_shards);
 
+    // Checked cast: --shards is bounded by clap's value_parser, but `as u16`
+    // would silently wrap for values > 65535. Fail loudly instead.
+    // ALLOW: panic is appropriate here — this is `main`, not library code.
+    #[allow(clippy::expect_used)]
+    let shard_count_u16: u16 =
+        u16::try_from(num_shards).expect("--shards must be <= 65535");
+
     // P0-FIX-01b LIFTED (Option B step 9, 2026-06-01): the per-shard AOF
     // pipeline (RFC steps 1-8) makes `--shards >= 2 + --appendonly yes`
     // crash-safe. CRASH-01-LITE confirms 200/200 keys recover after
@@ -387,7 +436,7 @@ fn main() -> anyhow::Result<()> {
     // with a different shard count than currently configured). A v1 TopLevel
     // manifest always records shards=1; that case is already handled above.
     if let Some(ref m) = existing_manifest
-        && let Err(e) = m.verify_shard_count(num_shards as u16)
+        && let Err(e) = m.verify_shard_count(shard_count_u16)
     {
         eprintln!("REFUSING TO START: {e}");
         std::process::exit(2);
@@ -711,7 +760,15 @@ fn main() -> anyhow::Result<()> {
                 // `replay_per_shard`. The split_at_mut walk constructs a
                 // Vec<&mut [Database]> without aliasing, which `replay_per_shard`
                 // requires.
-                let engine = DispatchReplayEngine::new();
+                //
+                // `replay_per_shard` now spawns one thread per shard via
+                // `std::thread::scope`. The factory closure produces an independent
+                // `DispatchReplayEngine` per thread, avoiding the `!Sync` `RefCell`
+                // conflict that would arise from sharing a single engine instance
+                // across threads (under the `graph` feature).
+                let engine_factory = || -> Box<dyn moon::persistence::replay::CommandReplayEngine + Send> {
+                    Box::new(DispatchReplayEngine::new())
+                };
                 let (total, global_max_lsn, ordered_entries) = {
                     let mut slices: Vec<&mut [moon::storage::Database]> =
                         Vec::with_capacity(shards.len());
@@ -723,7 +780,7 @@ fn main() -> anyhow::Result<()> {
                     moon::persistence::aof_manifest::replay_per_shard(
                         &mut slices,
                         manifest,
-                        &engine,
+                        &engine_factory,
                     )
                     .with_context(|| "per-shard AOF replay failed")?
                 };
@@ -733,6 +790,7 @@ fn main() -> anyhow::Result<()> {
                 // (no production emitter); the path exists so the future
                 // cross-shard TXN consumer wires in without a recovery
                 // re-design.
+                let ordered_engine = DispatchReplayEngine::new();
                 let ordered_count = if !ordered_entries.is_empty() {
                     let mut slices: Vec<&mut [moon::storage::Database]> =
                         Vec::with_capacity(shards.len());
@@ -744,7 +802,7 @@ fn main() -> anyhow::Result<()> {
                     moon::persistence::aof_manifest::replay_ordered_merge(
                         &mut slices,
                         ordered_entries,
-                        &engine,
+                        &ordered_engine,
                     )
                     .with_context(|| "per-shard AOF ordered merge replay failed")?
                 } else {
@@ -853,7 +911,7 @@ fn main() -> anyhow::Result<()> {
                 // when the loaded manifest's layout is PerShard, so without
                 // this branch a multi-shard --appendonly yes deployment would
                 // silently fall back to TopLevel and lose data on restart.
-                AofManifest::initialize_multi(&base_dir, num_shards as u16)
+                AofManifest::initialize_multi(&base_dir, shard_count_u16)
                     .with_context(|| "failed to initialize PerShard AOF manifest")?;
                 info!(
                     "Initialized PerShard AOF manifest for {} shards at {}",
