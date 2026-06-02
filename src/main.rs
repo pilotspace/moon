@@ -432,20 +432,23 @@ fn main() -> anyhow::Result<()> {
     // Compute bind address for SO_REUSEPORT per-shard listeners (Linux io_uring path).
     let bind_addr = format!("{}:{}", config.bind, config.port);
 
-    // P0-FIX-01: gate BGREWRITEAOF under the known data-loss config combo
-    // (multi-shard + disk-offload enabled + appendonly).  Verified 2026-05-26:
-    // the rewrite truncates non-rewriter shards' WALs and the consolidated
-    // multi-part AOF base RDB is not consumed on restart, losing ~38 % of
-    // keys.  v2.0 multi-part AOF replay lifts this; until then we refuse the
-    // command at dispatch time.  See docs/runbooks/multi-shard-aof-rewrite.md.
-    if num_shards >= 2 && config.disk_offload_enabled() && config.appendonly == "yes" {
+    // FIX-W1-4: gate BGREWRITEAOF whenever per-shard AOF is active
+    // (num_shards >= 2 + appendonly=yes). The original gate was too narrow:
+    // it required disk_offload to be enabled, missing the plain AOF case.
+    // Per-shard rewrite is not yet implemented (AofPoolSendError::
+    // RewriteUnsupportedInPerShard); the pool already refuses the message,
+    // but this early gate provides a stable, documented error to operators
+    // BEFORE the channel send so no in-progress flag is flipped.
+    // Verified 2026-05-26: multi-shard BGREWRITEAOF loses ~38% of keys on
+    // restart. Gate lifted only when multi-part AOF replay ships (v2.0+).
+    // See docs/runbooks/multi-shard-aof-rewrite.md.
+    if config.per_shard_aof_active(num_shards) {
         moon::command::persistence::MULTI_SHARD_AOF_REWRITE_UNSAFE
             .store(true, std::sync::atomic::Ordering::Relaxed);
         tracing::warn!(
             shards = num_shards,
-            disk_offload = %config.disk_offload,
             appendonly = %config.appendonly,
-            "BGREWRITEAOF gated for this config (known data-loss path; see docs/runbooks/multi-shard-aof-rewrite.md). Use --shards 1 or --disk-offload disable to re-enable rewrite."
+            "BGREWRITEAOF gated: per-shard AOF layout active (see docs/runbooks/multi-shard-aof-rewrite.md). Use --shards 1 to re-enable rewrite."
         );
     }
 

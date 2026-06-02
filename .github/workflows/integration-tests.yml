@@ -33,6 +33,27 @@ jobs:
         run: cargo test --release --no-default-features --features runtime-tokio,jemalloc --test jepsen_lite
         timeout-minutes: 10
 
+  crash-matrix-per-shard:
+    name: Crash Matrix (per-shard AOF)
+    if: github.event_name == 'push' || contains(github.event.pull_request.labels.*.name, 'ci-full')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # MOON_NO_URING is already set globally at the workflow level (line 16).
+    # No job-level env override needed — monoio falls back to epoll automatically.
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.94.1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: integration-${{ hashFiles('Cargo.lock') }}
+      - name: Install redis-tools
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq redis-tools
+      - name: Build Moon (release, monoio default)
+        run: cargo build --release
+      - name: Run per-shard AOF crash matrix
+        run: cargo test --release --test crash_matrix_per_shard_aof -- --ignored
+        timeout-minutes: 10
+
   replication:
     name: Replication Tests
     if: github.event_name == 'push' || contains(github.event.pull_request.labels.*.name, 'ci-full')
