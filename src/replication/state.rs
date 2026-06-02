@@ -113,15 +113,56 @@ impl ReplicationState {
     /// Increment the offset for the given shard by delta bytes.
     /// Also adds delta to master_repl_offset.
     pub fn increment_shard_offset(&self, shard_id: usize, delta: u64) {
-        if shard_id < self.shard_offsets.len() {
-            self.shard_offsets[shard_id].fetch_add(delta, Ordering::Relaxed);
-            self.master_repl_offset.fetch_add(delta, Ordering::Relaxed);
+        let _ = self.issue_lsn(shard_id, delta);
+    }
+
+    /// Atomically issue an LSN for a write and advance per-shard +
+    /// master replication offsets by `delta`.
+    ///
+    /// Returns the LSN that uniquely identifies this write — equal to the
+    /// value of `master_repl_offset` BEFORE the increment, mirroring Redis's
+    /// `+ delta - delta` semantics. The same LSN MUST tag the corresponding
+    /// `AofMessage::Append` entry and the replication backlog entry for that
+    /// write so per-shard AOF replay can rebuild a globally consistent log
+    /// (per-shard AOF RFC § 2 Rule 3).
+    ///
+    /// Atomicity caveat: the per-shard offset advance and the master offset
+    /// advance are TWO separate `fetch_add`s, not one composite op. Concurrent
+    /// callers across shards observe a brief window where the master sum
+    /// disagrees with the sum of shard offsets. Acceptable today because the
+    /// only `total_offset()` consumer is INFO replication, which tolerates
+    /// transient skew. Do not promote to a hard invariant without redesign.
+    ///
+    /// Returns 0 if `shard_id` is out of range (defensive; production callers
+    /// must pass a valid id).
+    pub fn issue_lsn(&self, shard_id: usize, delta: u64) -> u64 {
+        if shard_id >= self.shard_offsets.len() {
+            return 0;
         }
+        self.shard_offsets[shard_id].fetch_add(delta, Ordering::Relaxed);
+        self.master_repl_offset.fetch_add(delta, Ordering::Relaxed)
     }
 
     /// Returns sum of all per-shard offsets.
     pub fn total_offset(&self) -> u64 {
         self.master_repl_offset.load(Ordering::Relaxed)
+    }
+
+    /// Seed `master_repl_offset` to at least `lsn` after AOF recovery.
+    ///
+    /// Per-shard AOF RFC § 2 Rule 3: after recovery reads the per-shard AOFs,
+    /// `master_repl_offset` MUST be at least the max LSN observed across all
+    /// shards before the server accepts client traffic. Otherwise the next
+    /// write would issue an LSN already present on disk, breaking the
+    /// `lsn → entry` uniqueness invariant the backlog merge depends on.
+    ///
+    /// Uses `fetch_max` so a concurrent in-flight increment (extremely
+    /// unlikely at boot, but free to guard against) cannot regress the value.
+    /// Per-shard offsets are intentionally NOT touched here — at boot they
+    /// are still 0, and seeding shard offsets to the per-shard AOF max would
+    /// double-count once the first write advances them via `issue_lsn`.
+    pub fn seed_master_offset(&self, lsn: u64) {
+        self.master_repl_offset.fetch_max(lsn, Ordering::Relaxed);
     }
 
     /// Returns the per-shard offset for a specific shard.

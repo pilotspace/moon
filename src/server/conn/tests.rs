@@ -31,7 +31,7 @@ fn test_inline_get_hit() {
     }
     let mut read_buf = BytesMut::from(&b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n"[..]);
     let mut write_buf = BytesMut::new();
-    let aof_tx: Option<channel::MpscSender<AofMessage>> = None;
+    let aof_pool: Option<std::sync::Arc<crate::persistence::aof::AofWriterPool>> = None;
     let rt_config = make_rt_config();
 
     let result = try_inline_dispatch(
@@ -40,7 +40,8 @@ fn test_inline_get_hit() {
         &dbs,
         0,
         0,
-        &aof_tx,
+        &aof_pool,
+        &None,
         0,
         1,
         false,
@@ -56,7 +57,7 @@ fn test_inline_get_miss() {
     let dbs = make_dbs();
     let mut read_buf = BytesMut::from(&b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n"[..]);
     let mut write_buf = BytesMut::new();
-    let aof_tx: Option<channel::MpscSender<AofMessage>> = None;
+    let aof_pool: Option<std::sync::Arc<crate::persistence::aof::AofWriterPool>> = None;
     let rt_config = make_rt_config();
 
     let result = try_inline_dispatch(
@@ -65,7 +66,8 @@ fn test_inline_get_miss() {
         &dbs,
         0,
         0,
-        &aof_tx,
+        &aof_pool,
+        &None,
         0,
         1,
         false,
@@ -84,7 +86,7 @@ fn test_inline_set_falls_through_when_writes_disabled() {
     let mut read_buf = BytesMut::from(&cmd[..]);
     let original_len = read_buf.len();
     let mut write_buf = BytesMut::new();
-    let aof_tx: Option<channel::MpscSender<AofMessage>> = None;
+    let aof_pool: Option<std::sync::Arc<crate::persistence::aof::AofWriterPool>> = None;
     let rt_config = make_rt_config();
 
     let result = try_inline_dispatch(
@@ -93,7 +95,8 @@ fn test_inline_set_falls_through_when_writes_disabled() {
         &dbs,
         0,
         0,
-        &aof_tx,
+        &aof_pool,
+        &None,
         0,
         1,
         false,
@@ -111,7 +114,7 @@ fn test_inline_set_executes_when_writes_enabled() {
     let cmd = b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n";
     let mut read_buf = BytesMut::from(&cmd[..]);
     let mut write_buf = BytesMut::new();
-    let aof_tx: Option<channel::MpscSender<AofMessage>> = None;
+    let aof_pool: Option<std::sync::Arc<crate::persistence::aof::AofWriterPool>> = None;
     let rt_config = make_rt_config();
 
     let result = try_inline_dispatch(
@@ -120,7 +123,8 @@ fn test_inline_set_executes_when_writes_enabled() {
         &dbs,
         0,
         0,
-        &aof_tx,
+        &aof_pool,
+        &None,
         0,
         1,
         true,
@@ -150,7 +154,7 @@ fn test_inline_set_with_options_falls_through() {
     let mut read_buf = BytesMut::from(&cmd[..]);
     let original_len = read_buf.len();
     let mut write_buf = BytesMut::new();
-    let aof_tx: Option<channel::MpscSender<AofMessage>> = None;
+    let aof_pool: Option<std::sync::Arc<crate::persistence::aof::AofWriterPool>> = None;
     let rt_config = make_rt_config();
 
     let result = try_inline_dispatch(
@@ -159,7 +163,8 @@ fn test_inline_set_with_options_falls_through() {
         &dbs,
         0,
         0,
-        &aof_tx,
+        &aof_pool,
+        &None,
         0,
         1,
         true,
@@ -176,7 +181,7 @@ fn test_inline_fallthrough() {
     let mut read_buf = BytesMut::from(&ping_cmd[..]);
     let original_len = read_buf.len();
     let mut write_buf = BytesMut::new();
-    let aof_tx: Option<channel::MpscSender<AofMessage>> = None;
+    let aof_pool: Option<std::sync::Arc<crate::persistence::aof::AofWriterPool>> = None;
     let rt_config = make_rt_config();
 
     let result = try_inline_dispatch(
@@ -185,7 +190,8 @@ fn test_inline_fallthrough() {
         &dbs,
         0,
         0,
-        &aof_tx,
+        &aof_pool,
+        &None,
         0,
         1,
         false,
@@ -211,7 +217,7 @@ fn test_inline_mixed_batch() {
     read_buf.extend_from_slice(b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n");
     read_buf.extend_from_slice(b"*1\r\n$4\r\nPING\r\n");
     let mut write_buf = BytesMut::new();
-    let aof_tx: Option<channel::MpscSender<AofMessage>> = None;
+    let aof_pool: Option<std::sync::Arc<crate::persistence::aof::AofWriterPool>> = None;
     let rt_config = make_rt_config();
 
     // Inline loop should process GET but leave PING
@@ -221,7 +227,8 @@ fn test_inline_mixed_batch() {
         &dbs,
         0,
         0,
-        &aof_tx,
+        &aof_pool,
+        &None,
         0,
         1,
         false,
@@ -244,7 +251,7 @@ fn test_inline_case_insensitive() {
     }
     let mut read_buf = BytesMut::from(&b"*2\r\n$3\r\nget\r\n$3\r\nfoo\r\n"[..]);
     let mut write_buf = BytesMut::new();
-    let aof_tx: Option<channel::MpscSender<AofMessage>> = None;
+    let aof_pool: Option<std::sync::Arc<crate::persistence::aof::AofWriterPool>> = None;
     let rt_config = make_rt_config();
 
     let result = try_inline_dispatch(
@@ -253,7 +260,8 @@ fn test_inline_case_insensitive() {
         &dbs,
         0,
         0,
-        &aof_tx,
+        &aof_pool,
+        &None,
         0,
         1,
         false,
@@ -271,7 +279,7 @@ fn test_inline_partial() {
     let mut read_buf = BytesMut::from(&b"*2\r\n$3\r\nGET\r\n$3\r\n"[..]);
     let original_len = read_buf.len();
     let mut write_buf = BytesMut::new();
-    let aof_tx: Option<channel::MpscSender<AofMessage>> = None;
+    let aof_pool: Option<std::sync::Arc<crate::persistence::aof::AofWriterPool>> = None;
     let rt_config = make_rt_config();
 
     let result = try_inline_dispatch(
@@ -280,7 +288,8 @@ fn test_inline_partial() {
         &dbs,
         0,
         0,
-        &aof_tx,
+        &aof_pool,
+        &None,
         0,
         1,
         false,
@@ -296,7 +305,9 @@ fn test_inline_set_with_aof_falls_through_when_writes_disabled() {
     // SET falls through when can_inline_writes=false even with AOF.
     let dbs = make_dbs();
     let (aof_sender, _aof_receiver) = channel::mpsc_bounded::<AofMessage>(16);
-    let aof_tx: Option<channel::MpscSender<AofMessage>> = Some(aof_sender);
+    let aof_pool: Option<std::sync::Arc<crate::persistence::aof::AofWriterPool>> = Some(
+        crate::persistence::aof::AofWriterPool::top_level(aof_sender),
+    );
     let cmd = b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n";
     let mut read_buf = BytesMut::from(&cmd[..]);
     let original_len = read_buf.len();
@@ -310,7 +321,8 @@ fn test_inline_set_with_aof_falls_through_when_writes_disabled() {
         &dbs,
         0,
         0,
-        &aof_tx,
+        &aof_pool,
+        &None,
         0,
         1,
         false,
@@ -342,7 +354,7 @@ fn test_inline_multiple_gets() {
     read_buf.extend_from_slice(b"*2\r\n$3\r\nGET\r\n$1\r\na\r\n");
     read_buf.extend_from_slice(b"*2\r\n$3\r\nGET\r\n$1\r\nb\r\n");
     let mut write_buf = BytesMut::new();
-    let aof_tx: Option<channel::MpscSender<AofMessage>> = None;
+    let aof_pool: Option<std::sync::Arc<crate::persistence::aof::AofWriterPool>> = None;
     let rt_config = make_rt_config();
 
     let total = try_inline_dispatch_loop(
@@ -351,7 +363,8 @@ fn test_inline_multiple_gets() {
         &dbs,
         0,
         0,
-        &aof_tx,
+        &aof_pool,
+        &None,
         0,
         1,
         false,

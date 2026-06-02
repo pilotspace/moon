@@ -37,6 +37,7 @@ async fn start_workspace_server(num_shards: usize) -> (u16, CancellationToken) {
         databases: 16,
         requirepass: None,
         appendonly: "no".to_string(),
+        unsafe_multishard_aof: false,
         appendfsync: "everysec".to_string(),
         save: None,
         dir: ".".to_string(),
@@ -107,6 +108,9 @@ async fn start_workspace_server(num_shards: usize) -> (u16, CancellationToken) {
         autovacuum_starvation_cap_secs: 300,
         vec_warm_mmap_budget: "2gb".to_string(),
         cold_orphan_sweep_interval_secs: 300,
+        migrate_aof_from: None,
+        migrate_aof_to: None,
+        migrate_aof_shards: 0,
     };
 
     let cancel = token.clone();
@@ -254,6 +258,7 @@ async fn start_workspace_server_with_auth(
         databases: 16,
         requirepass: Some(password),
         appendonly: "no".to_string(),
+        unsafe_multishard_aof: false,
         appendfsync: "everysec".to_string(),
         save: None,
         dir: ".".to_string(),
@@ -324,6 +329,9 @@ async fn start_workspace_server_with_auth(
         autovacuum_starvation_cap_secs: 300,
         vec_warm_mmap_budget: "2gb".to_string(),
         cold_orphan_sweep_interval_secs: 300,
+        migrate_aof_from: None,
+        migrate_aof_to: None,
+        migrate_aof_shards: 0,
     };
 
     let cancel = token.clone();

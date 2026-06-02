@@ -1135,7 +1135,10 @@ pub(crate) fn try_inline_dispatch(
     shard_databases: &std::sync::Arc<ShardDatabases>,
     shard_id: usize,
     selected_db: usize,
-    aof_tx: &Option<channel::MpscSender<crate::persistence::aof::AofMessage>>,
+    aof_pool: &Option<std::sync::Arc<crate::persistence::aof::AofWriterPool>>,
+    repl_state: &Option<
+        std::sync::Arc<std::sync::RwLock<crate::replication::state::ReplicationState>>,
+    >,
     now_ms: u64,
     num_shards: usize,
     can_inline_writes: bool,
@@ -1147,6 +1150,20 @@ pub(crate) fn try_inline_dispatch(
     // Minimum valid command: *2\r\n$3\r\nGET\r\n$1\r\nX\r\n = 20 bytes
     if len < 20 || buf[0] != b'*' {
         return 0;
+    }
+
+    // H1: under `appendfsync=always` we MUST fsync before +OK. The inline
+    // SET path is synchronous and cannot await the writer's ack, so
+    // refuse to inline writes when Always is in effect. GETs and other
+    // read-only commands are fine to inline. The non-inline dispatch
+    // path (handler_monoio/handler_sharded) uses
+    // `AofWriterPool::try_send_append_durable` and awaits the ack.
+    if let Some(pool) = aof_pool {
+        if pool.fsync_policy() == crate::persistence::aof::FsyncPolicy::Always && buf[1] == b'3'
+        // SET shape (*3 ...); GETs (*2) are still safe to inline.
+        {
+            return 0;
+        }
     }
 
     // Parse array count: only *2 (GET) and *3 (SET plain) are inlined.
@@ -1346,8 +1363,20 @@ pub(crate) fn try_inline_dispatch(
     }
 
     // AOF: reuse the frozen RESP bytes directly (Arc clone, zero-copy).
-    if let Some(tx) = aof_tx {
-        let _ = tx.try_send(crate::persistence::aof::AofMessage::Append(frozen));
+    // This path is monoio inline GET/SET — the writer for the local shard
+    // (shard_id) owns the AOF record; under PerShard layout that routes
+    // to shard_id's writer. LSN must be sourced from `repl_state` so the
+    // inline path's writes share an LSN namespace with the non-inline path
+    // — otherwise per-shard replay merge in RFC step 5 would see two
+    // disjoint LSN streams per shard. Cost: one extra read-lock acquire
+    // (uncontended) + one atomic fetch_add per inline SET.
+    if let Some(pool) = aof_pool {
+        let lsn = crate::persistence::aof::AofWriterPool::issue_append_lsn(
+            repl_state,
+            shard_id,
+            frozen.len(),
+        );
+        pool.try_send_append(shard_id, lsn, frozen);
     }
 
     write_buf.extend_from_slice(b"+OK\r\n");
@@ -1363,7 +1392,10 @@ pub(crate) fn try_inline_dispatch_loop(
     shard_databases: &std::sync::Arc<ShardDatabases>,
     shard_id: usize,
     selected_db: usize,
-    aof_tx: &Option<channel::MpscSender<crate::persistence::aof::AofMessage>>,
+    aof_pool: &Option<std::sync::Arc<crate::persistence::aof::AofWriterPool>>,
+    repl_state: &Option<
+        std::sync::Arc<std::sync::RwLock<crate::replication::state::ReplicationState>>,
+    >,
     now_ms: u64,
     num_shards: usize,
     can_inline_writes: bool,
@@ -1377,7 +1409,8 @@ pub(crate) fn try_inline_dispatch_loop(
             shard_databases,
             shard_id,
             selected_db,
-            aof_tx,
+            aof_pool,
+            repl_state,
             now_ms,
             num_shards,
             can_inline_writes,

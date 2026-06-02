@@ -48,7 +48,7 @@ use parking_lot::RwLock;
 use tracing::info;
 
 use crate::config::ServerConfig;
-use crate::persistence::aof::{self, AofMessage, FsyncPolicy};
+use crate::persistence::aof::{self, AofMessage, AofWriterPool, FsyncPolicy};
 use crate::runtime::cancel::CancellationToken;
 use crate::runtime::channel;
 use crate::runtime::{RuntimeFactoryImpl, traits::RuntimeFactory};
@@ -113,9 +113,12 @@ pub async fn run_embedded(
     // AOF writer: dedicated std::thread (matches main.rs lifetime model).
     // We retain the JoinHandle so shutdown can wait for the writer to finish
     // flushing — dropping it would race the process exit and risk losing the
-    // final fsync (CodeRabbit #1).
-    let (aof_tx, aof_join): (
-        Option<channel::MpscSender<AofMessage>>,
+    // final fsync (CodeRabbit #1). Step 2f-α: wrap the sender in a TopLevel
+    // `AofWriterPool` so every shard receives an Arc clone with a uniform
+    // API. Channel close still drives writer termination — dropping the last
+    // Arc drops the pool, which drops the underlying senders.
+    let (aof_pool, aof_join): (
+        Option<Arc<AofWriterPool>>,
         Option<std::thread::JoinHandle<()>>,
     ) = if config.appendonly == "yes" {
         let (tx, rx) = channel::mpsc_bounded::<AofMessage>(10_000);
@@ -132,7 +135,10 @@ pub async fn run_embedded(
             })
             .context("embedded moon: failed to spawn AOF writer thread")?;
         info!("embedded moon: AOF enabled (fsync: {:?})", fsync);
-        (Some(tx), Some(handle))
+        (
+            Some(AofWriterPool::top_level_with_policy(tx, fsync)),
+            Some(handle),
+        )
     } else {
         (None, None)
     };
@@ -263,7 +269,7 @@ pub async fn run_embedded(
         let consumers = mesh.take_consumers(id);
         let conn_rx = mesh.take_conn_rx(id);
         let shard_cancel = cancel.clone();
-        let shard_aof_tx = aof_tx.clone();
+        let shard_aof_pool = aof_pool.clone();
         let shard_bind_addr = bind_addr.clone();
         let shard_persistence_dir = persistence_dir.clone();
         let shard_snap_rx = snap_rx.clone();
@@ -293,7 +299,7 @@ pub async fn run_embedded(
                                 consumers,
                                 producers,
                                 shard_cancel,
-                                shard_aof_tx,
+                                shard_aof_pool,
                                 Some(shard_bind_addr),
                                 shard_persistence_dir,
                                 shard_snap_rx,
@@ -354,10 +360,12 @@ pub async fn run_embedded(
 
     // Listener exited (cancel fired or fatal error). Shutdown ordering:
     //   1. cancel.cancel() — stops shard accept loops + producers.
-    //   2. Join shard threads — drops every shard-held `aof_tx` clone.
-    //   3. Drop our outer `aof_tx` — last sender goes away, the AOF writer's
-    //      `recv_async()` returns `Err(_)` and the task flushes + fsyncs
-    //      before exiting (see `aof::aof_writer_task` Err arm).
+    //   2. Join shard threads — drops every shard-held `Arc<AofWriterPool>`
+    //      clone (each `ConnectionContext` and each `shard_aof_pool` capture).
+    //   3. Drop our outer `aof_pool` Arc — the last reference goes away, the
+    //      pool's `Drop` runs, dropping the underlying `Vec<MpscSender>`. The
+    //      AOF writer's `recv_async()` returns `Err(_)` and the task flushes
+    //      + fsyncs before exiting (see `aof::aof_writer_task` Err arm).
     //   4. Join the AOF thread.
     //
     // This sequencing fixes Qodo bug #5: sending `AofMessage::Shutdown` before
@@ -381,8 +389,9 @@ pub async fn run_embedded(
             }
         }
 
-        // Drop the last AOF sender so the writer's recv loop sees channel close.
-        drop(aof_tx);
+        // Drop the last `Arc<AofWriterPool>` so the underlying senders close,
+        // triggering the writer's recv loop to drain + fsync + exit.
+        drop(aof_pool);
 
         let aof_panic = if let Some(handle) = aof_join {
             match handle.join() {

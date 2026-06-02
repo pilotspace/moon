@@ -19,7 +19,6 @@ use crate::command::connection as conn_cmd;
 use crate::command::metadata;
 use crate::command::{DispatchResult, dispatch, dispatch_read};
 use crate::config::{RuntimeConfig, ServerConfig};
-use crate::persistence::aof::AofMessage;
 use crate::protocol::Frame;
 use crate::pubsub::subscriber::Subscriber;
 use crate::pubsub::{self, PubSubRegistry};
@@ -34,6 +33,63 @@ use super::{
 use crate::framevec;
 use crate::server::codec::RespCodec;
 
+/// Flush AOF entries and responses under the `appendfsync=always` ordering contract (H1).
+///
+/// **Invariant (H1):** awaits ALL fsync acks BEFORE sending ANY response to the
+/// client.  The client must never receive `+OK` before the entry is durable on
+/// disk when `appendfsync=always` is configured.
+///
+/// Returns `true` when the connection loop should break (sink send failed).
+///
+/// Making the sink generic (`S: futures::Sink<Frame> + Unpin`) lets unit tests
+/// supply a lightweight recording sink instead of a real TcpStream, while the
+/// production call site passes `&mut framed` (`Framed<TcpStream, RespCodec>`)
+/// unchanged — both satisfy the bound.
+///
+/// # Arguments
+///
+/// - `sink` — frame sink; production passes `Framed<TcpStream, RespCodec>`,
+///   tests pass any `Sink<Frame>` mock.
+/// - `responses` — per-command response slots; fsync failures patch the
+///   corresponding slot to `Frame::Error`.
+/// - `aof_entries` — `(resp_idx, bytes)`: bytes to fsync, slot to patch on failure.
+/// - `pool` — AOF writer pool (caller must ensure Always policy).
+/// - `repl_state` — replication state for LSN issuance (`&None` in tests).
+/// - `change_counter` — auto-save dirty counter (`&None` if not configured).
+pub(crate) async fn flush_with_aof_ack<S>(
+    sink: &mut S,
+    mut responses: Vec<Frame>,
+    aof_entries: Vec<(usize, Bytes)>,
+    pool: &crate::persistence::aof::AofWriterPool,
+    repl_state: &Option<Arc<RwLock<crate::replication::state::ReplicationState>>>,
+    change_counter: &Option<Arc<AtomicU64>>,
+) -> bool
+where
+    S: futures::Sink<Frame> + Unpin,
+{
+    // Phase 1 — await every fsync ack; patch failed slots.
+    for (resp_idx, bytes) in aof_entries {
+        let lsn =
+            crate::persistence::aof::AofWriterPool::issue_append_lsn(repl_state, 0, bytes.len());
+        if pool.try_send_append_durable(0, lsn, bytes).await.is_err() && resp_idx < responses.len()
+        {
+            responses[resp_idx] = Frame::Error(Bytes::from_static(b"WRITEFAIL aof fsync failed"));
+        }
+        if let Some(counter) = change_counter {
+            counter.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    // Phase 2 — all acks received; flush responses to client.
+    let mut break_outer = false;
+    for response in responses {
+        if SinkExt::send(sink, response).await.is_err() {
+            break_outer = true;
+            break;
+        }
+    }
+    break_outer
+}
+
 /// Handle a single client connection.
 ///
 /// Reads frames from the TCP stream, dispatches commands, and writes responses.
@@ -42,7 +98,10 @@ use crate::server::codec::RespCodec;
 /// When `requirepass` is set, clients must authenticate via AUTH before any other
 /// commands are accepted (except QUIT).
 ///
-/// When `aof_tx` is provided, write commands are logged to the AOF file.
+/// When `aof_pool` is provided, write commands are logged via the per-shard
+/// AOF writer pool. handler_single is single-shard mode by definition
+/// (num_shards = 1, shard_id = 0), so the pool is always a TopLevel layout
+/// wrapping a single writer sender — see `AofWriterPool::top_level`.
 /// When `change_counter` is provided, write commands increment the counter for auto-save.
 ///
 /// Supports Pub/Sub subscriber mode: when a client subscribes to channels/patterns,
@@ -61,7 +120,7 @@ pub async fn handle_connection(
     shutdown: CancellationToken,
     requirepass: Option<String>,
     config: Arc<ServerConfig>,
-    aof_tx: Option<channel::MpscSender<AofMessage>>,
+    aof_pool: Option<Arc<crate::persistence::aof::AofWriterPool>>,
     change_counter: Option<Arc<AtomicU64>>,
     pubsub_registry: Arc<Mutex<PubSubRegistry>>,
     runtime_config: Arc<parking_lot::RwLock<RuntimeConfig>>,
@@ -332,7 +391,10 @@ pub async fn handle_connection(
                 // Phase 1: Handle connection-level intercepts, collect dispatchable frames
                 // Phase 2: Acquire ONE write lock, execute ALL dispatchable frames
                 let mut responses: Vec<Frame> = Vec::with_capacity(batch.len());
-                let mut aof_entries: Vec<Bytes> = Vec::new();
+                // Each entry carries (resp_idx, bytes) so the Always-policy flush path
+                // can patch responses[resp_idx] with WRITEFAIL when fsync fails,
+                // before any response is sent to the client (H1 fix — FIX-W1-1).
+                let mut aof_entries: Vec<(usize, Bytes)> = Vec::new();
                 let mut should_quit = false;
                 let mut break_outer = false;
 
@@ -608,8 +670,8 @@ pub async fn handle_connection(
                         }
                         // BGREWRITEAOF
                         if cmd.eq_ignore_ascii_case(b"BGREWRITEAOF") {
-                            let response = if let Some(ref tx) = aof_tx {
-                                crate::command::persistence::bgrewriteaof_start(tx, db.clone())
+                            let response = if let Some(ref pool) = aof_pool {
+                                crate::command::persistence::bgrewriteaof_start(pool, db.clone())
                             } else {
                                 Frame::Error(Bytes::from_static(b"ERR AOF is not enabled"))
                             };
@@ -653,9 +715,14 @@ pub async fn handle_connection(
                                         ))
                                     } else {
                                         // WAL must be durable BEFORE the swap (no rollback
-                                        // path for SWAPDB). Try-send first; on failure return
-                                        // an error and leave both DBs untouched.
-                                        let wal_ok = if let Some(ref tx) = aof_tx {
+                                        // path for SWAPDB). Use try_send_append_durable so
+                                        // that the fsync policy is honoured:
+                                        //   - appendfsync=always  → await AppendSync ack
+                                        //     (rendezvous guarantees data is on disk before +OK)
+                                        //   - appendfsync=everysec/no → fire-and-forget (fast)
+                                        // On any Err the caller aborts and leaves both DBs
+                                        // untouched, preserving atomicity from the WAL's perspective.
+                                        let wal_ok = if let Some(ref pool) = aof_pool {
                                             let mut a_buf = itoa::Buffer::new();
                                             let mut b_buf = itoa::Buffer::new();
                                             let wal_frame = Frame::Array(crate::framevec![
@@ -671,12 +738,11 @@ pub async fn handle_connection(
                                                 crate::persistence::aof::serialize_command(
                                                     &wal_frame,
                                                 );
-                                            tx.try_send(
-                                                crate::persistence::aof::AofMessage::Append(
-                                                    serialized,
-                                                ),
-                                            )
-                                            .is_ok()
+                                            // Single-shard mode — shard_id = 0.
+                                            let lsn = crate::persistence::aof::AofWriterPool::issue_append_lsn(&repl_state, 0, serialized.len());
+                                            pool.try_send_append_durable(0, lsn, serialized)
+                                                .await
+                                                .is_ok()
                                         } else {
                                             true // persistence disabled — no durability requirement
                                         };
@@ -849,7 +915,9 @@ pub async fn handle_connection(
                                     };
                                     if let Some(bytes) = aof_bytes {
                                         if !matches!(&response, Frame::Error(_)) {
-                                            aof_entries.push(bytes);
+                                            // Carry resp_idx so the Always-policy flush can
+                                            // patch responses[resp_idx] on fsync failure.
+                                            aof_entries.push((resp_idx, bytes));
                                         }
                                     }
                                     // Apply RESP3 response conversion if needed
@@ -866,7 +934,52 @@ pub async fn handle_connection(
                                 break;
                             }
 
-                            // Flush accumulated responses first
+                            // FIX-W1-1 + FIX-W2-4: Await AOF fsync ack for prior write
+                            // commands BEFORE flushing their +OK responses. Ordering:
+                            // (a) Under appendfsync=always: WRITEFAIL replaces +OK if
+                            //     fsync fails — no +OK is ever sent for a non-durable
+                            //     write.
+                            // (b) The WRITEFAIL frame lands before the SUBSCRIBE
+                            //     response slot, not inside it (prior code flushed
+                            //     +OK first, then checked AOF, causing WRITEFAIL to
+                            //     be mistaken for the SUBSCRIBE ack by the client).
+                            //
+                            // For everysec/no policies, try_send_append_durable is
+                            // fire-and-forget (returns Ok immediately) so no latency
+                            // penalty.
+                            //
+                            // Note: aof_entries carries (resp_idx, bytes) from FIX-W1-1
+                            // — resp_idx is unused here because the all-or-nothing
+                            // failure mode discards the entire response buffer; future
+                            // per-slot patching could use it.
+                            let mut aof_write_failed = false;
+                            for (_resp_idx, bytes) in aof_entries.drain(..) {
+                                if let Some(ref pool) = aof_pool {
+                                    let lsn = crate::persistence::aof::AofWriterPool::issue_append_lsn(&repl_state, 0, bytes.len());
+                                    if let Err(_aof_err) = pool.try_send_append_durable(0, lsn, bytes).await {
+                                        aof_write_failed = true;
+                                    }
+                                }
+                                if let Some(ref counter) = change_counter {
+                                    counter.fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
+                            if aof_write_failed {
+                                // Discard buffered +OK responses — the writes are not
+                                // durable. Log at warn level so operators can correlate
+                                // with disk I/O errors.
+                                responses.clear();
+                                tracing::warn!(
+                                    "AOF fsync failed for prior write batch; returning error \
+                                     to client and closing connection"
+                                );
+                                let _ = framed.send(Frame::Error(Bytes::from_static(
+                                    crate::persistence::aof::AOF_FSYNC_ERR,
+                                ))).await;
+                                break;
+                            }
+                            // Flush accumulated +OK responses now that AOF durability
+                            // has been confirmed (or is fire-and-forget).
                             for resp in responses.drain(..) {
                                 if framed.send(resp).await.is_err() {
                                     break_outer = true;
@@ -875,15 +988,6 @@ pub async fn handle_connection(
                             }
                             if break_outer {
                                 break;
-                            }
-                            // Send AOF entries accumulated so far
-                            for bytes in aof_entries.drain(..) {
-                                if let Some(ref tx) = aof_tx {
-                                    let _ = tx.send_async(AofMessage::Append(bytes)).await;
-                                }
-                                if let Some(ref counter) = change_counter {
-                                    counter.fetch_add(1, Ordering::Relaxed);
-                                }
                             }
                             // Handle subscribe
                             if cmd_args.is_empty() {
@@ -1041,8 +1145,15 @@ pub async fn handle_connection(
                                 }
                                 conn.command_queue.clear();
                                 conn.watched_keys.clear();
+                                // The EXEC response occupies responses[exec_resp_idx].
+                                // All txn AOF entries map to this same slot so that
+                                // the Always-policy flush can patch the EXEC frame if
+                                // any command's fsync fails.
+                                let exec_resp_idx = responses.len();
                                 responses.push(result);
-                                aof_entries.extend(txn_aof_entries);
+                                aof_entries.extend(
+                                    txn_aof_entries.into_iter().map(|b| (exec_resp_idx, b)),
+                                );
                             }
                             continue;
                         }
@@ -1509,15 +1620,31 @@ pub async fn handle_connection(
                                         let records = store.drain_wal();
                                         (resp, records)
                                     };
+                                    let mut graph_aof_failed = false;
                                     for record in wal_records {
-                                        if let Some(ref tx) = aof_tx {
-                                            let _ = tx.send_async(AofMessage::Append(bytes::Bytes::from(record))).await;
+                                        if let Some(ref pool) = aof_pool {
+                                            // Single-shard mode (shard_id = 0).
+                                            // `try_send_append_durable` awaits writer
+                                            // ack under `appendfsync=always` (H1
+                                            // closure) and is fire-and-forget for
+                                            // everysec/no.
+                                            let bytes = bytes::Bytes::from(record);
+                                            let lsn = crate::persistence::aof::AofWriterPool::issue_append_lsn(&repl_state, 0, bytes.len());
+                                            if let Err(_aof_err) = pool.try_send_append_durable(0, lsn, bytes).await {
+                                                graph_aof_failed = true;
+                                            }
                                         }
                                         if let Some(ref counter) = change_counter {
                                             counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                         }
                                     }
-                                    responses.push(response);
+                                    if graph_aof_failed {
+                                        responses.push(Frame::Error(bytes::Bytes::from_static(
+                                            crate::persistence::aof::AOF_FSYNC_ERR,
+                                        )));
+                                    } else {
+                                        responses.push(response);
+                                    }
                                     continue;
                                 } else {
                                     responses.push(Frame::Error(bytes::Bytes::from_static(b"ERR graph engine not initialized")));
@@ -1528,7 +1655,7 @@ pub async fn handle_connection(
                             let is_write = metadata::is_write(cmd);
 
                             // Serialize for AOF before dispatch
-                            let aof_bytes = if is_write && aof_tx.is_some() {
+                            let aof_bytes = if is_write && aof_pool.is_some() {
                                 let mut buf = BytesMut::new();
                                 crate::protocol::serialize::serialize(&frame, &mut buf);
                                 Some(buf.freeze())
@@ -2109,7 +2236,7 @@ pub async fn handle_connection(
                                     };
                                     if matches!(response, Frame::Integer(1)) {
                                         if let Some(bytes) = &aof_bytes {
-                                            aof_entries.push(bytes.clone());
+                                            aof_entries.push((resp_idx, bytes.clone()));
                                         }
                                     }
                                     responses[resp_idx] = response;
@@ -2138,7 +2265,7 @@ pub async fn handle_connection(
                                         };
                                         if matches!(response, Frame::Integer(1)) {
                                             if let Some(bytes) = &aof_bytes {
-                                                aof_entries.push(bytes.clone());
+                                                aof_entries.push((resp_idx, bytes.clone()));
                                             }
                                         }
                                         responses[resp_idx] = response;
@@ -2202,7 +2329,7 @@ pub async fn handle_connection(
                                         }
                                     }
                                     if let Some(bytes) = aof_bytes {
-                                        aof_entries.push(bytes.clone());
+                                        aof_entries.push((resp_idx, bytes.clone()));
                                     }
                                 }
                                 // Apply RESP3 response conversion if needed
@@ -2222,21 +2349,48 @@ pub async fn handle_connection(
                     }
                 } // all locks dropped here -- BEFORE any await
 
-                // --- Write all responses OUTSIDE the lock ---
-                for response in responses {
-                    if framed.send(response).await.is_err() {
-                        break_outer = true;
-                        break;
-                    }
-                }
+                // FIX-W1-1: appendfsync=always ordering — H1 close for the single-shard
+                // tokio path. Under Always policy: await all AOF fsync acks FIRST, patch
+                // any failed response slots with WRITEFAIL, THEN flush responses to the
+                // client (delegated to `flush_with_aof_ack` so tests can call the real
+                // production path rather than reproducing it inline).
+                // Under EverySec/No: keep existing fire-and-forget ordering (flush
+                // responses first, then enqueue AOF in the background — no latency impact).
+                let use_always_ordering = aof_pool
+                    .as_ref()
+                    .map(|p| p.fsync_policy() == crate::persistence::aof::FsyncPolicy::Always)
+                    .unwrap_or(false);
 
-                // --- Send AOF entries OUTSIDE the lock ---
-                for bytes in aof_entries {
-                    if let Some(ref tx) = aof_tx {
-                        let _ = tx.send_async(AofMessage::Append(bytes)).await;
+                if use_always_ordering {
+                    // `use_always_ordering` is only true when aof_pool is Some + Always.
+                    if let Some(ref pool) = aof_pool {
+                        break_outer = flush_with_aof_ack(
+                            &mut framed,
+                            responses,
+                            aof_entries,
+                            pool,
+                            &repl_state,
+                            &change_counter,
+                        )
+                        .await;
                     }
-                    if let Some(ref counter) = change_counter {
-                        counter.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    // EverySec / No policy: flush responses first (zero added latency),
+                    // then fire-and-forget AOF enqueue.
+                    for response in responses {
+                        if framed.send(response).await.is_err() {
+                            break_outer = true;
+                            break;
+                        }
+                    }
+                    for (_, bytes) in aof_entries {
+                        if let Some(ref pool) = aof_pool {
+                            let lsn = crate::persistence::aof::AofWriterPool::issue_append_lsn(&repl_state, 0, bytes.len());
+                            let _ = pool.try_send_append_durable(0, lsn, bytes).await;
+                        }
+                        if let Some(ref counter) = change_counter {
+                            counter.fetch_add(1, Ordering::Relaxed);
+                        }
                     }
                 }
 
@@ -2281,4 +2435,125 @@ pub async fn handle_connection(
         tracking_table.lock().untrack_all(client_id);
     }
     crate::admin::metrics_setup::record_connection_closed();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::persistence::aof::{AofAck, AofMessage, AofWriterPool, FsyncPolicy};
+    use crate::runtime::channel;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use std::time::{Duration, Instant};
+
+    // ── Minimal recording sink ──────────────────────────────────────────────
+    //
+    // Implements `futures::Sink<Frame>` so `flush_with_aof_ack` can be called
+    // directly in unit tests without a real TcpStream.  Each successful
+    // `start_send` appends `(frame, Instant::now())` to the internal log.
+    struct RecordingSink {
+        log: Vec<(Frame, Instant)>,
+    }
+
+    impl RecordingSink {
+        fn new() -> Self {
+            Self { log: Vec::new() }
+        }
+        fn first_send_instant(&self) -> Option<Instant> {
+            self.log.first().map(|(_, t)| *t)
+        }
+    }
+
+    impl futures::Sink<Frame> for RecordingSink {
+        type Error = ();
+
+        fn poll_ready(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), ()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn start_send(mut self: Pin<&mut Self>, item: Frame) -> Result<(), ()> {
+            self.log.push((item, Instant::now()));
+            Ok(())
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), ()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), ()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// FIX-W1-1 r3: discriminating ordering test for `flush_with_aof_ack`.
+    ///
+    /// This test calls the **real** `flush_with_aof_ack` function that the
+    /// production handler uses — not an inline copy.  The H1 contract is:
+    ///
+    ///   All AOF fsync acks MUST be awaited BEFORE any response is sent.
+    ///
+    /// Red state (broken ordering — send-before-ack):
+    ///   If the fn were to flush responses BEFORE awaiting acks, the mock
+    ///   60ms fsync delay would NOT gate the first response, so
+    ///   `elapsed_ms < 55` → test fails.
+    ///
+    /// Green state (ack-before-send — current production code):
+    ///   `flush_with_aof_ack` awaits the 60ms ack BEFORE any `start_send`,
+    ///   so `elapsed_ms >= 55` → test passes.
+    ///
+    /// Red verification was performed by temporarily inverting the fn body
+    /// (Phase 2 before Phase 1) and confirming `elapsed_ms ≈ 0ms` → FAIL.
+    /// The fn was then restored and the test passes consistently.
+    #[tokio::test]
+    async fn flush_with_aof_ack_ack_precedes_response() {
+        // Build an Always-policy pool backed by a real bounded channel.
+        let (tx, rx) = channel::mpsc_bounded::<AofMessage>(4);
+        let pool = AofWriterPool::top_level_with_policy(tx, FsyncPolicy::Always);
+
+        // Mock writer: receives one AppendSync, sleeps 60ms to simulate fsync,
+        // then sends Synced.  Runs on a blocking thread because flume's
+        // `Receiver::recv()` is synchronous.
+        let mock_writer = tokio::task::spawn_blocking(move || {
+            let msg = rx.recv().expect("mock writer: message received");
+            if let AofMessage::AppendSync { ack, .. } = msg {
+                std::thread::sleep(Duration::from_millis(60));
+                let _ = ack.send(AofAck::Synced);
+            } else {
+                panic!("Always policy MUST send AppendSync; got non-AppendSync variant");
+            }
+        });
+
+        let start = Instant::now();
+
+        let responses = vec![Frame::SimpleString(bytes::Bytes::from_static(b"OK"))];
+        let aof_entries = vec![(0usize, bytes::Bytes::from_static(b"SET k v\r\n"))];
+        let mut sink = RecordingSink::new();
+
+        let broke = flush_with_aof_ack(
+            &mut sink,
+            responses,
+            aof_entries,
+            &pool,
+            &None, // no replication state
+            &None, // no change counter
+        )
+        .await;
+
+        mock_writer.await.expect("mock writer completed cleanly");
+
+        assert!(!broke, "sink send must not have failed");
+        assert_eq!(sink.log.len(), 1, "exactly one response must be sent");
+
+        let first_send = sink
+            .first_send_instant()
+            .expect("RecordingSink recorded at least one send");
+        let elapsed_ms = first_send.duration_since(start).as_millis();
+
+        assert!(
+            elapsed_ms >= 55,
+            "H1 violation: first response sent {elapsed_ms}ms after start — \
+             expected >= 55ms (mock fsync delay is 60ms). \
+             This means +OK was flushed before the AOF ack."
+        );
+    }
 }

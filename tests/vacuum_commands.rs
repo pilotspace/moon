@@ -35,6 +35,7 @@ fn base_config(port: u16) -> ServerConfig {
         databases: 1,
         requirepass: None,
         appendonly: "no".to_string(),
+        unsafe_multishard_aof: false,
         appendfsync: "no".to_string(),
         save: None,
         dir: ".".to_string(),
@@ -104,6 +105,9 @@ fn base_config(port: u16) -> ServerConfig {
         graph_dead_edge_trigger: 0.20,
         autovacuum_starvation_cap_secs: 300,
         cold_orphan_sweep_interval_secs: 300,
+        migrate_aof_from: None,
+        migrate_aof_to: None,
+        migrate_aof_shards: 0,
         vec_warm_mmap_budget: "2gb".to_string(),
     }
 }

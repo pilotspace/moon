@@ -56,7 +56,7 @@ impl super::Shard {
         mut consumers: Vec<HeapCons<ShardMessage>>,
         producers: Vec<HeapProd<ShardMessage>>,
         shutdown: CancellationToken,
-        aof_tx: Option<channel::MpscSender<crate::persistence::aof::AofMessage>>,
+        aof_pool: Option<Arc<crate::persistence::aof::AofWriterPool>>,
         bind_addr: Option<String>,
         persistence_dir: Option<String>,
         snapshot_trigger_rx: channel::WatchReceiver<u64>,
@@ -1047,7 +1047,7 @@ impl super::Shard {
                             conn_accept::spawn_tokio_connection(
                                 tcp_stream, false, &tls_config,
                                 &shard_databases, &dispatch_tx, &pubsub_arc, &blocking_rc,
-                                &shutdown, &aof_tx, &tracking_rc, &lua_rc, &script_cache_rc,
+                                &shutdown, &aof_pool, &tracking_rc, &lua_rc, &script_cache_rc,
                                 &acl_table, &runtime_config, &server_config, &all_notifiers,
                                 &snapshot_trigger_tx, &repl_state, &cluster_state,
                                 &cached_clock, &remote_sub_map_arc, &all_pubsub_registries,
@@ -1097,7 +1097,7 @@ impl super::Shard {
                             conn_accept::spawn_tokio_connection(
                                 tcp_stream, is_tls, &tls_config,
                                 &shard_databases, &dispatch_tx, &pubsub_arc, &blocking_rc,
-                                &shutdown, &aof_tx, &tracking_rc, &lua_rc, &script_cache_rc,
+                                &shutdown, &aof_pool, &tracking_rc, &lua_rc, &script_cache_rc,
                                 &acl_table, &runtime_config, &server_config, &all_notifiers,
                                 &snapshot_trigger_tx, &repl_state, &cluster_state,
                                 &cached_clock, &remote_sub_map_arc, &all_pubsub_registries,
@@ -1130,6 +1130,7 @@ impl super::Shard {
                                 server_config.graph_merge_max_segments,
                                 server_config.graph_dead_edge_trigger,
                                 &mut autovacuum_daemon,
+                                aof_pool.as_ref(),  // FIX-W1-2
                             );
                         });
                     } else {
@@ -1145,6 +1146,7 @@ impl super::Shard {
                             server_config.graph_merge_max_segments,
                             server_config.graph_dead_edge_trigger,
                             &mut autovacuum_daemon,
+                            aof_pool.as_ref(),  // FIX-W1-2
                         );
                     }
                     // MA5: persist maintenance schedule when modified by RECLAMATION SCHEDULE.
@@ -1180,7 +1182,7 @@ impl super::Shard {
                             conn_accept::spawn_migrated_tokio_connection(
                                 fd, state,
                                 &shard_databases, &dispatch_tx, &pubsub_arc, &blocking_rc,
-                                &shutdown, &aof_tx, &tracking_rc, &lua_rc, &script_cache_rc,
+                                &shutdown, &aof_pool, &tracking_rc, &lua_rc, &script_cache_rc,
                                 &acl_table, &runtime_config, &server_config, &all_notifiers,
                                 &snapshot_trigger_tx, &repl_state, &cluster_state,
                                 &cached_clock, &remote_sub_map_arc, &all_pubsub_registries,
@@ -1193,7 +1195,7 @@ impl super::Shard {
                             conn_accept::spawn_migrated_monoio_connection(
                                 fd, state,
                                 &shard_databases, &dispatch_tx, &pubsub_arc, &blocking_rc,
-                                &shutdown, &aof_tx, &tracking_rc, &lua_rc, &script_cache_rc,
+                                &shutdown, &aof_pool, &tracking_rc, &lua_rc, &script_cache_rc,
                                 &acl_table, &runtime_config, &server_config, &all_notifiers,
                                 &snapshot_trigger_tx, &repl_state, &cluster_state,
                                 &cached_clock, &remote_sub_map_arc, &all_pubsub_registries,
@@ -1227,6 +1229,7 @@ impl super::Shard {
                                 server_config.graph_merge_max_segments,
                                 server_config.graph_dead_edge_trigger,
                                 &mut autovacuum_daemon,
+                                aof_pool.as_ref(),  // FIX-W1-2
                             );
                         });
                     } else {
@@ -1242,6 +1245,7 @@ impl super::Shard {
                             server_config.graph_merge_max_segments,
                             server_config.graph_dead_edge_trigger,
                             &mut autovacuum_daemon,
+                            aof_pool.as_ref(),  // FIX-W1-2
                         );
                     }
                     // MA5: persist maintenance schedule when modified by RECLAMATION SCHEDULE.
@@ -1277,7 +1281,7 @@ impl super::Shard {
                             conn_accept::spawn_migrated_tokio_connection(
                                 fd, state,
                                 &shard_databases, &dispatch_tx, &pubsub_arc, &blocking_rc,
-                                &shutdown, &aof_tx, &tracking_rc, &lua_rc, &script_cache_rc,
+                                &shutdown, &aof_pool, &tracking_rc, &lua_rc, &script_cache_rc,
                                 &acl_table, &runtime_config, &server_config, &all_notifiers,
                                 &snapshot_trigger_tx, &repl_state, &cluster_state,
                                 &cached_clock, &remote_sub_map_arc, &all_pubsub_registries,
@@ -1290,7 +1294,7 @@ impl super::Shard {
                             conn_accept::spawn_migrated_monoio_connection(
                                 fd, state,
                                 &shard_databases, &dispatch_tx, &pubsub_arc, &blocking_rc,
-                                &shutdown, &aof_tx, &tracking_rc, &lua_rc, &script_cache_rc,
+                                &shutdown, &aof_pool, &tracking_rc, &lua_rc, &script_cache_rc,
                                 &acl_table, &runtime_config, &server_config, &all_notifiers,
                                 &snapshot_trigger_tx, &repl_state, &cluster_state,
                                 &cached_clock, &remote_sub_map_arc, &all_pubsub_registries,
@@ -1697,7 +1701,7 @@ impl super::Shard {
                         &pubsub_arc,
                         &blocking_rc,
                         &shutdown,
-                        &aof_tx,
+                        &aof_pool,
                         &tracking_rc,
                         &lua_rc,
                         &script_cache_rc,
@@ -1739,7 +1743,7 @@ impl super::Shard {
                     &pubsub_arc,
                     &blocking_rc,
                     &shutdown,
-                    &aof_tx,
+                    &aof_pool,
                     &tracking_rc,
                     &lua_rc,
                     &script_cache_rc,
@@ -1858,6 +1862,7 @@ impl super::Shard {
                             server_config.graph_merge_max_segments,
                             server_config.graph_dead_edge_trigger,
                             &mut autovacuum_daemon,
+                            aof_pool.as_ref(), // FIX-W1-2
                         );
                     });
                 } else {
@@ -1884,6 +1889,7 @@ impl super::Shard {
                         server_config.graph_merge_max_segments,
                         server_config.graph_dead_edge_trigger,
                         &mut autovacuum_daemon,
+                        aof_pool.as_ref(), // FIX-W1-2
                     );
                 }
                 if !pending_cdc_subscribes.is_empty() {
@@ -1921,7 +1927,7 @@ impl super::Shard {
                         &pubsub_arc,
                         &blocking_rc,
                         &shutdown,
-                        &aof_tx,
+                        &aof_pool,
                         &tracking_rc,
                         &lua_rc,
                         &script_cache_rc,

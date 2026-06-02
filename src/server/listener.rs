@@ -13,7 +13,7 @@ use tracing::{debug, error, info};
 use crate::command::connection as conn_cmd;
 use crate::config::ServerConfig;
 #[cfg(feature = "runtime-tokio")]
-use crate::persistence::aof::{self, AofMessage, FsyncPolicy};
+use crate::persistence::aof::{self, AofMessage, AofWriterPool, FsyncPolicy};
 #[cfg(feature = "runtime-tokio")]
 use crate::persistence::rdb;
 #[cfg(feature = "runtime-tokio")]
@@ -115,15 +115,17 @@ pub async fn run_with_shutdown(
 
     let config = Arc::new(config);
 
-    // Set up AOF writer task if appendonly is enabled
-    let aof_tx: Option<channel::MpscSender<AofMessage>> = if config.appendonly == "yes" {
+    // Set up AOF writer task + wrap the sender as a TopLevel `AofWriterPool`
+    // (step 2f-α). Single-shard tokio path: `handler_single` receives the pool
+    // directly; per-shard layout is unreachable from this listener.
+    let aof_pool: Option<Arc<AofWriterPool>> = if config.appendonly == "yes" {
         let (tx, rx) = channel::mpsc_bounded::<AofMessage>(10_000);
         let aof_token = token.child_token();
         let fsync = FsyncPolicy::from_str(&config.appendfsync);
         let aof_file_path = PathBuf::from(&config.dir).join(&config.appendfilename);
         tokio::spawn(aof::aof_writer_task(rx, aof_file_path, fsync, aof_token));
         info!("AOF enabled with fsync policy: {:?}", fsync);
-        Some(tx)
+        Some(AofWriterPool::top_level_with_policy(tx, fsync))
     } else {
         None
     };
@@ -235,7 +237,7 @@ pub async fn run_with_shutdown(
                         let conn_token = token.child_token();
                         let requirepass = config.requirepass.clone();
                         let config = config.clone();
-                        let aof_tx = aof_tx.clone();
+                        let aof_pool_conn = aof_pool.clone();
                         let change_counter = Some(change_counter.clone());
                         let pubsub = pubsub_registry.clone();
                         let rt_config = runtime_config.clone();
@@ -249,7 +251,7 @@ pub async fn run_with_shutdown(
                         let gs = graph_store.clone();
                         tokio::spawn(connection::handle_connection(
                             stream, db, conn_token, requirepass, config,
-                            aof_tx, change_counter, pubsub, rt_config,
+                            aof_pool_conn, change_counter, pubsub, rt_config,
                             tracking, cid, Some(rs), acl, Some(vs),
                             Some(ts),
                             #[cfg(feature = "graph")]
@@ -263,9 +265,12 @@ pub async fn run_with_shutdown(
             }
             _ = token.cancelled() => {
                 info!("Server shutting down");
-                // Send shutdown to AOF writer
-                if let Some(ref tx) = aof_tx {
-                    let _ = tx.send_async(AofMessage::Shutdown).await;
+                // Fan out shutdown to every AOF writer (single writer under TopLevel,
+                // one-per-shard under PerShard — step 2f-β). `broadcast_shutdown`
+                // is `try_send`-based so the writer must be draining; under tokio
+                // listener it always is.
+                if let Some(ref pool) = aof_pool {
+                    pool.broadcast_shutdown();
                 }
                 break;
             }

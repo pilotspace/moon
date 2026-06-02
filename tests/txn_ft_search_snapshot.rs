@@ -46,6 +46,7 @@ fn build_config(port: u16, num_shards: usize) -> ServerConfig {
         databases: 16,
         requirepass: None,
         appendonly: "no".to_string(),
+        unsafe_multishard_aof: false,
         appendfsync: "everysec".to_string(),
         save: None,
         dir: ".".to_string(),
@@ -116,6 +117,9 @@ fn build_config(port: u16, num_shards: usize) -> ServerConfig {
         autovacuum_starvation_cap_secs: 300,
         vec_warm_mmap_budget: "2gb".to_string(),
         cold_orphan_sweep_interval_secs: 300,
+        migrate_aof_from: None,
+        migrate_aof_to: None,
+        migrate_aof_shards: 0,
     }
 }
 

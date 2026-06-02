@@ -978,9 +978,9 @@ pub(super) fn try_handle_persistence(
         return true;
     }
     if cmd.eq_ignore_ascii_case(b"BGREWRITEAOF") {
-        if let Some(ref tx) = ctx.aof_tx {
+        if let Some(ref pool) = ctx.aof_pool {
             responses.push(crate::command::persistence::bgrewriteaof_start_sharded(
-                tx,
+                pool,
                 ctx.shard_databases.clone(),
             ));
         } else {

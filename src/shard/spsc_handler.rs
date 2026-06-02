@@ -71,6 +71,9 @@ pub(crate) fn drain_spsc_shared(
     #[cfg_attr(not(feature = "graph"), allow(unused_variables))] graph_dead_edge_trigger: f64,
     // MA5: autovacuum daemon reference for RECLAMATION SCHEDULE commands.
     autovacuum_daemon: &mut crate::shard::autovacuum::AutovacuumDaemon,
+    // FIX-W1-2: per-shard AOF writer pool. Passed through to handle_shard_message_shared
+    // so cross-shard writes (MSET/MultiExecute) also land in the per-shard AOF files.
+    aof_pool: Option<&std::sync::Arc<crate::persistence::aof::AofWriterPool>>,
 ) {
     const MAX_DRAIN_PER_CYCLE: usize = 256;
     let mut drained = 0;
@@ -175,6 +178,7 @@ pub(crate) fn drain_spsc_shared(
                 graph_merge_max_segments,
                 graph_dead_edge_trigger,
                 autovacuum_daemon,
+                aof_pool, // FIX-W1-2: thread AOF pool through SPSC drain
             );
         }
     }
@@ -206,6 +210,7 @@ pub(crate) fn drain_spsc_shared(
             graph_merge_max_segments,
             graph_dead_edge_trigger,
             autovacuum_daemon,
+            aof_pool, // FIX-W1-2: thread AOF pool through SPSC drain
         );
     }
 }
@@ -243,6 +248,9 @@ pub(crate) fn handle_shard_message_shared(
     #[cfg_attr(not(feature = "graph"), allow(unused_variables))] graph_dead_edge_trigger: f64,
     // MA5: autovacuum daemon reference for RECLAMATION SCHEDULE commands.
     autovacuum_daemon: &mut crate::shard::autovacuum::AutovacuumDaemon,
+    // FIX-W1-2: per-shard AOF writer pool. When Some, each successful write command
+    // is also routed to the owning shard's AOF file via fire-and-forget try_send_append.
+    aof_pool: Option<&std::sync::Arc<crate::persistence::aof::AofWriterPool>>,
 ) {
     match msg {
         ShardMessage::Execute {
@@ -514,6 +522,7 @@ pub(crate) fn handle_shard_message_shared(
                             replica_txs,
                             repl_state,
                             shard_id,
+                            aof_pool, // FIX-W1-2
                         );
                     }
                     let _ = reply_tx.send(response);
@@ -578,6 +587,7 @@ pub(crate) fn handle_shard_message_shared(
                                 replica_txs,
                                 repl_state,
                                 shard_id,
+                                aof_pool, // FIX-W1-2
                             );
                         }
                         let _ = reply_tx.send(response);
@@ -618,6 +628,7 @@ pub(crate) fn handle_shard_message_shared(
                                 replica_txs,
                                 repl_state,
                                 shard_id,
+                                aof_pool, // FIX-W1-2
                             );
                         }
 
@@ -710,6 +721,7 @@ pub(crate) fn handle_shard_message_shared(
                             replica_txs,
                             repl_state,
                             shard_id,
+                            aof_pool, // FIX-W1-2
                         );
                     }
 
@@ -845,6 +857,7 @@ pub(crate) fn handle_shard_message_shared(
                                 replica_txs,
                                 repl_state,
                                 shard_id,
+                                aof_pool, // FIX-W1-2
                             );
 
                             let needs_wake = cmd.eq_ignore_ascii_case(b"LPUSH")
@@ -924,6 +937,7 @@ pub(crate) fn handle_shard_message_shared(
                             replica_txs,
                             repl_state,
                             shard_id,
+                            aof_pool, // FIX-W1-2
                         );
 
                         // Wake blocked waiters for producer commands (same as Execute path)
@@ -1016,6 +1030,13 @@ pub(crate) fn handle_shard_message_shared(
                                 replica_txs,
                                 repl_state,
                                 shard_id,
+                                // FIX-W1-2 r2: PipelineBatch AOF is written by the
+                                // connection handler coordinator AFTER collecting the
+                                // shard response (handler_monoio/mod.rs:2004,
+                                // handler_sharded/mod.rs:1703). Passing aof_pool here
+                                // would cause a second write to the same shard's AOF
+                                // file, doubling every cross-shard pipeline entry.
+                                None,
                             );
                         }
 
@@ -1118,6 +1139,12 @@ pub(crate) fn handle_shard_message_shared(
                             replica_txs,
                             repl_state,
                             shard_id,
+                            // FIX-W1-2 r2: PipelineBatch AOF is handled by the
+                            // connection-handler coordinator after collecting the
+                            // shard response (handler_monoio/mod.rs:2004). Passing
+                            // aof_pool here would produce a duplicate AOF entry for
+                            // every cross-shard pipeline command.
+                            None,
                         );
                     }
 
@@ -1230,6 +1257,7 @@ pub(crate) fn handle_shard_message_shared(
                                 replica_txs,
                                 repl_state,
                                 shard_id,
+                                aof_pool, // FIX-W1-2
                             );
                         }
 
@@ -1297,6 +1325,7 @@ pub(crate) fn handle_shard_message_shared(
                             replica_txs,
                             repl_state,
                             shard_id,
+                            aof_pool, // FIX-W1-2
                         );
                     }
 
@@ -1389,6 +1418,7 @@ pub(crate) fn handle_shard_message_shared(
                                 replica_txs,
                                 repl_state,
                                 shard_id,
+                                aof_pool, // FIX-W1-2
                             );
 
                             let needs_wake = cmd.eq_ignore_ascii_case(b"LPUSH")
@@ -1465,6 +1495,7 @@ pub(crate) fn handle_shard_message_shared(
                             replica_txs,
                             repl_state,
                             shard_id,
+                            aof_pool, // FIX-W1-2
                         );
 
                         let needs_wake = cmd.eq_ignore_ascii_case(b"LPUSH")
@@ -1557,6 +1588,12 @@ pub(crate) fn handle_shard_message_shared(
                                 replica_txs,
                                 repl_state,
                                 shard_id,
+                                // FIX-W1-2 r2: PipelineBatchSlotted AOF is written by the
+                                // connection-handler coordinator after collecting the shard
+                                // response (handler_sharded/mod.rs:1703). Passing aof_pool
+                                // here produces a duplicate AOF entry for every cross-shard
+                                // pipeline command (double-write P0 bug).
+                                None,
                             );
                         }
 
@@ -1655,6 +1692,10 @@ pub(crate) fn handle_shard_message_shared(
                             replica_txs,
                             repl_state,
                             shard_id,
+                            // FIX-W1-2 r2: PipelineBatchSlotted AOF (else branch — pre-
+                            // ShardSlice path) is handled by handler_sharded/mod.rs:1703.
+                            // Passing aof_pool here duplicates the AOF entry.
+                            None,
                         );
                     }
 
@@ -2338,6 +2379,7 @@ pub(crate) fn handle_shard_message_shared(
                 replica_txs,
                 repl_state,
                 shard_id,
+                aof_pool, // FIX-W1-2
             );
 
             // Perform the in-place swap under ascending-index write locks.
@@ -2966,10 +3008,16 @@ pub(crate) fn cow_intercept(
 }
 
 /// Append WAL bytes, update the replication backlog, advance the monotonic shard offset,
-/// and fan-out to all connected replica sender channels (non-blocking try_send).
+/// fan-out to all connected replica sender channels (non-blocking try_send), and route
+/// the entry to the per-shard AOF writer pool when AOF is enabled.
 ///
 /// CRITICAL: shard_offset in ReplicationState is SEPARATE from WalWriter::bytes_written.
 /// WalWriter::bytes_written resets on snapshot truncation; shard_offset NEVER resets.
+///
+/// FIX-W1-2: `aof_pool` was added to route MSET/coordinator cross-shard writes
+/// through the per-shard AOF pool. The SPSC drain is synchronous so we use
+/// `try_send_append` (fire-and-forget). The `appendfsync=always` rendezvous is
+/// handled by the connection handler (async context), not here.
 pub(crate) fn wal_append_and_fanout(
     data: &[u8],
     wal_writer: &mut Option<WalWriter>,
@@ -2978,6 +3026,7 @@ pub(crate) fn wal_append_and_fanout(
     replica_txs: &[(u64, channel::MpscSender<bytes::Bytes>)],
     repl_state: &Option<Arc<RwLock<ReplicationState>>>,
     shard_id: usize,
+    aof_pool: Option<&std::sync::Arc<crate::persistence::aof::AofWriterPool>>,
 ) {
     // S3.5b (2026-04-27): hot-path bypass when nothing actually has work.
     // ARM perf annotate showed `repl_backlog.lock()` (caslb/casab) and
@@ -2986,7 +3035,14 @@ pub(crate) fn wal_append_and_fanout(
     // is fully derivable from the inputs — no flags or shared state needed.
     // Skipping leaves shard_offset un-advanced; that is fine since with no
     // WAL and no replicas the offsets are dead bytes (no consumer exists).
-    if wal_writer.is_none() && wal_v3_writer.is_none() && replica_txs.is_empty() {
+    //
+    // FIX-W1-2: also require `aof_pool.is_none()` so that per-shard AOF
+    // entries are not skipped when WAL/replication are off but AOF is on.
+    if wal_writer.is_none()
+        && wal_v3_writer.is_none()
+        && replica_txs.is_empty()
+        && aof_pool.is_none()
+    {
         return;
     }
     // WAL v3 supersedes v2 — skip v2 append when v3 is active to avoid
@@ -3024,6 +3080,15 @@ pub(crate) fn wal_append_and_fanout(
         for (_id, tx) in replica_txs {
             let _ = tx.try_send(bytes.clone());
         }
+    }
+    // 5. Per-shard AOF pool (FIX-W1-2): route to the owning shard's writer.
+    // Uses fire-and-forget (`try_send_append`) because this function is sync
+    // and cannot await the fsync rendezvous. The `appendfsync=always` ack is
+    // handled by the async connection handler (handler_sharded / handler_single).
+    // LSN=0 is safe here: per-shard order is preserved by write order; the LSN
+    // is only meaningful for cross-shard TXN merge (RFC step 5, not yet wired).
+    if let Some(pool) = aof_pool {
+        pool.try_send_append(shard_id, 0, bytes::Bytes::copy_from_slice(data));
     }
 }
 
@@ -3068,6 +3133,7 @@ mod wal_append_tests {
             &[],   // no replicas
             &None, // no repl_state
             0,
+            None, // no aof_pool
         );
 
         let final_end = backlog.lock().as_ref().unwrap().end_offset();
@@ -3095,12 +3161,129 @@ mod wal_append_tests {
             &replica_txs,
             &None,
             0,
+            None, // no aof_pool
         );
 
         let end = backlog.lock().as_ref().unwrap().end_offset();
         assert_eq!(
             end, 5,
             "backlog must receive 5 bytes when at least one replica is connected"
+        );
+    }
+
+    /// FIX-W1-2: When an AofWriterPool is provided, wal_append_and_fanout must
+    /// route bytes to the pool even when there is no WAL writer and no replicas
+    /// (S3.5b bypass must NOT trigger when aof_pool is Some).
+    #[test]
+    fn test_wal_append_routes_to_aof_pool_when_provided() {
+        use crate::persistence::aof::{AofMessage, AofWriterPool, FsyncPolicy};
+        use crate::runtime::channel::mpsc_bounded;
+
+        let backlog: SharedBacklog =
+            std::sync::Arc::new(parking_lot::Mutex::new(Some(ReplicationBacklog::new(1024))));
+
+        // Build a pool backed by a real channel so we can observe what arrives.
+        let (tx, rx) = mpsc_bounded::<AofMessage>(16);
+        let pool = AofWriterPool::top_level_with_policy(tx, FsyncPolicy::EverySec);
+
+        wal_append_and_fanout(
+            b"world",
+            &mut None, // no v2 writer
+            &mut None, // no v3 writer
+            &backlog,
+            &[],         // no replicas — S3.5b bypass triggered without pool guard
+            &None,       // no repl_state
+            0,           // shard_id
+            Some(&pool), // aof_pool provided — bypass must NOT fire
+        );
+
+        // The pool should have received exactly one message.
+        let msg = rx
+            .try_recv()
+            .expect("pool must have received an AOF append");
+        match msg {
+            AofMessage::Append { bytes, .. } => {
+                assert_eq!(
+                    bytes.as_ref(),
+                    b"world",
+                    "pool must receive the correct bytes"
+                );
+            }
+            AofMessage::AppendSync { .. } => panic!("expected Append, got AppendSync"),
+            AofMessage::Rewrite(_) => panic!("expected Append, got Rewrite"),
+            AofMessage::RewriteSharded(_) => panic!("expected Append, got RewriteSharded"),
+            AofMessage::Shutdown => panic!("expected Append, got Shutdown"),
+        }
+    }
+
+    /// FIX-W1-2 r2: PipelineBatch/PipelineBatchSlotted arms MUST NOT forward
+    /// writes to the AofWriterPool. The connection-handler coordinator already
+    /// appends AOF for these arms after collecting the shard response
+    /// (handler_monoio/mod.rs:2004, handler_sharded/mod.rs:1703).
+    ///
+    /// Verify the invariant directly: `wal_append_and_fanout` called with
+    /// `None` (the PipelineBatch fix) must produce zero messages in the pool
+    /// channel, while the same call with `Some(&pool)` (the MultiExecute path)
+    /// must produce exactly one message.
+    ///
+    /// Red state (pre-fix): the PipelineBatch arms passed `aof_pool` instead
+    /// of `None`, so calling this test function using the arm's actual argument
+    /// would have produced 1 message instead of 0 — the double-write.
+    #[test]
+    fn pipeline_batch_arm_passes_none_to_prevent_double_write() {
+        use crate::persistence::aof::{AofMessage, AofWriterPool, FsyncPolicy};
+        use crate::runtime::channel::mpsc_bounded;
+
+        let backlog: SharedBacklog =
+            std::sync::Arc::new(parking_lot::Mutex::new(Some(ReplicationBacklog::new(1024))));
+
+        // Build a 2-shard pool so per_shard_with_policy's debug_assert passes.
+        let (tx0, rx0) = mpsc_bounded::<AofMessage>(16);
+        let (tx1, rx1) = mpsc_bounded::<AofMessage>(16);
+        let pool = AofWriterPool::per_shard_with_policy(vec![tx0, tx1], FsyncPolicy::EverySec);
+
+        // ── PipelineBatch path: caller passes None ──
+        // Pre-fix this was `aof_pool` (Some), which caused the double-write.
+        wal_append_and_fanout(
+            b"*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n",
+            &mut None, // no v2 writer
+            &mut None, // no v3 writer
+            &backlog,
+            &[],   // no replicas
+            &None, // no repl_state
+            0,     // shard_id
+            None,  // PipelineBatch fix: None prevents double-write
+        );
+        assert!(
+            rx0.try_recv().is_err(),
+            "PipelineBatch must NOT forward to aof_pool (coordinator handles it); \
+             a message here means the double-write P0 bug is still present"
+        );
+        assert!(
+            rx1.try_recv().is_err(),
+            "shard-1 pool must also be empty for PipelineBatch arm"
+        );
+
+        // ── MultiExecute path: caller passes Some(&pool) ──
+        // This arm has no coordinator-side AOF write, so the pool MUST receive
+        // the entry (otherwise the per-shard AOF would be silently empty for
+        // cross-shard MSET/DEL/EXISTS commands).
+        wal_append_and_fanout(
+            b"*3\r\n$4\r\nMSET\r\n$1\r\nb\r\n$1\r\n2\r\n",
+            &mut None,
+            &mut None,
+            &backlog,
+            &[],
+            &None,
+            0,
+            Some(&pool), // MultiExecute: pool must receive this entry
+        );
+        let msg = rx0
+            .try_recv()
+            .expect("MultiExecute MUST forward to aof_pool; pool is empty — AOF silent drop");
+        assert!(
+            matches!(msg, AofMessage::Append { .. }),
+            "expected AofMessage::Append from MultiExecute arm, got unexpected variant",
         );
     }
 }

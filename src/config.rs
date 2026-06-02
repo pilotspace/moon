@@ -102,6 +102,21 @@ pub struct ServerConfig {
     #[arg(long, default_value = "yes")]
     pub appendonly: String,
 
+    /// [DEPRECATED — will be removed in v0.2] This flag is now a no-op.
+    ///
+    /// Historically, `--shards >= 2 + --appendonly yes` lost ~50 % of
+    /// writes on SIGKILL (verified 2026-05-26, HEAD `6e49050`). The flag
+    /// was an escape hatch to acknowledge the risk.
+    ///
+    /// As of PR #129 the per-shard AOF architecture is fully crash-safe
+    /// (CRASH-01-LITE: 200/200 SIGKILL recovery). The startup refusal gate
+    /// has been lifted. Passing this flag now only emits a `[DEPRECATED]`
+    /// warning at startup and has no other effect. Remove it from your
+    /// launch command or systemd unit. See
+    /// `docs/runbooks/multi-shard-aof-rewrite.md`.
+    #[arg(long, default_value_t = false)]
+    pub unsafe_multishard_aof: bool,
+
     /// AOF fsync policy (always/everysec/no)
     #[arg(long, default_value = "everysec")]
     pub appendfsync: String,
@@ -495,6 +510,30 @@ pub struct ServerConfig {
     #[arg(long = "autovacuum-starvation-cap-secs", default_value_t = 300)]
     pub autovacuum_starvation_cap_secs: u64,
 
+    // ── AOF v1→v2 migration ────────────────────────────────────────────
+    /// Source directory containing a legacy single-file AOF (`appendonly.aof`
+    /// or TopLevel manifest layout).  When this flag is set the server runs
+    /// the migration tool, writes the v2 PerShard layout to `--migrate-aof-to`,
+    /// and exits.  Do NOT combine with normal server startup flags.
+    ///
+    /// Example:
+    ///   moon --migrate-aof-from /old/dir --migrate-aof-to /new/dir \
+    ///        --migrate-aof-shards 4
+    #[arg(long = "migrate-aof-from", value_name = "PATH")]
+    pub migrate_aof_from: Option<PathBuf>,
+
+    /// Destination directory for the v2 PerShard AOF layout produced by
+    /// `--migrate-aof-from`.  The directory is created if absent; it must be
+    /// empty (or non-existent) to prevent accidental overwrites.
+    #[arg(long = "migrate-aof-to", value_name = "PATH")]
+    pub migrate_aof_to: Option<PathBuf>,
+
+    /// Number of target shards for the migration.  Must match the `--shards`
+    /// value you will use when starting the server on the migrated data.
+    /// Defaults to 0 (invalid — must be set when `--migrate-aof-from` is used).
+    #[arg(long = "migrate-aof-shards", default_value_t = 0)]
+    pub migrate_aof_shards: u16,
+
     // ── Shared-nothing migration (Phase 0) ─────────────────────────────
     /// Control whether cross-shard reads use the shared-read fast path.
     ///
@@ -533,6 +572,19 @@ impl ServerConfig {
     /// Returns true when WAL Full Page Images are enabled.
     pub fn wal_fpi_enabled(&self) -> bool {
         self.wal_fpi == "enable"
+    }
+
+    /// Returns true when the per-shard AOF layout is active.
+    ///
+    /// Per-shard AOF is selected whenever `--shards >= 2` and
+    /// `--appendonly yes`. In this layout each shard owns its own
+    /// `appendonlydir/shard-{N}/` directory and a dedicated
+    /// `per_shard_aof_writer_task`. Operations that touch the single
+    /// consolidated `appendonly.aof` file (e.g. BGREWRITEAOF) are not
+    /// supported in this layout until the multi-part AOF rewrite ships.
+    #[inline]
+    pub fn per_shard_aof_active(&self, num_shards: usize) -> bool {
+        num_shards >= 2 && self.appendonly == "yes"
     }
 
     /// Returns true when vector codes pages should be mlocked.
@@ -1028,5 +1080,60 @@ mod tests {
         assert!((config.segment_cold_min_qps - 0.5).abs() < f64::EPSILON);
         assert_eq!(config.vec_diskann_beam_width, 16);
         assert_eq!(config.vec_diskann_cache_levels, 5);
+    }
+
+    /// FIX-W1-4: per_shard_aof_active must be true only when both
+    /// num_shards >= 2 AND appendonly=yes are set, and false for every
+    /// other combination. This predicate drives the BGREWRITEAOF gate in
+    /// main.rs — a false negative silently allows the unsafe rewrite path.
+    #[test]
+    fn test_per_shard_aof_active_predicate() {
+        // Base config: appendonly=yes, shards=2 → active
+        let mut config = ServerConfig::parse_from(["moon", "--appendonly", "yes"]);
+        assert!(
+            config.per_shard_aof_active(2),
+            "must be active with shards=2 and appendonly=yes"
+        );
+        assert!(
+            config.per_shard_aof_active(4),
+            "must be active with shards=4 and appendonly=yes"
+        );
+
+        // shards=1 → not active (single-shard uses TopLevel AOF)
+        assert!(
+            !config.per_shard_aof_active(1),
+            "must be inactive with shards=1 even if appendonly=yes"
+        );
+
+        // appendonly=no → not active regardless of shard count
+        config.appendonly = "no".to_string();
+        assert!(
+            !config.per_shard_aof_active(2),
+            "must be inactive when appendonly=no"
+        );
+        assert!(
+            !config.per_shard_aof_active(4),
+            "must be inactive when appendonly=no with 4 shards"
+        );
+
+        // shards=0 (auto-detect placeholder) → not active
+        config.appendonly = "yes".to_string();
+        assert!(
+            !config.per_shard_aof_active(0),
+            "must be inactive when num_shards=0"
+        );
+
+        // disk_offload has no bearing on this predicate (FIX-W1-4 broadened
+        // the gate to not require disk_offload).
+        config.disk_offload = "enable".to_string();
+        assert!(
+            config.per_shard_aof_active(2),
+            "must remain active with disk_offload=enable (predicate is orthogonal)"
+        );
+        config.disk_offload = "disable".to_string();
+        assert!(
+            config.per_shard_aof_active(2),
+            "must remain active with disk_offload=disable"
+        );
     }
 }
