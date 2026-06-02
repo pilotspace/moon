@@ -1181,7 +1181,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                                             .is_err()
                                         {
                                             responses.push(Frame::Error(Bytes::from_static(
-                                                b"ERR AOF fsync failed; write not durable",
+                                                aof::AOF_FSYNC_ERR,
                                             )));
                                             continue;
                                         }
@@ -1238,7 +1238,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                                                 .is_err()
                                             {
                                                 responses.push(Frame::Error(Bytes::from_static(
-                                                    b"ERR AOF fsync failed; write not durable",
+                                                    aof::AOF_FSYNC_ERR,
                                                 )));
                                                 continue;
                                             }
@@ -1463,7 +1463,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                                             .is_err()
                                         {
                                             response = Frame::Error(Bytes::from_static(
-                                                b"ERR AOF fsync failed; write not durable",
+                                                aof::AOF_FSYNC_ERR,
                                             ));
                                             aof_failed = true;
                                         }
@@ -1710,7 +1710,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                                             .is_err()
                                         {
                                             resp_final = Frame::Error(Bytes::from_static(
-                                                b"ERR AOF fsync failed; write not durable",
+                                                aof::AOF_FSYNC_ERR,
                                             ));
                                         }
                                     }

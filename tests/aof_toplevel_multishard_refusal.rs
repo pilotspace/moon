@@ -16,7 +16,7 @@
 use std::fs;
 use std::io::Read as _;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::time::Duration;
 
 /// Create a temp dir with a v1 TopLevel AOF manifest (layout: TopLevel).

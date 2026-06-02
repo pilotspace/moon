@@ -956,6 +956,11 @@ pub async fn aof_writer_task(
 
         let mut write_error = false;
 
+        // Test-only fault injection: same env var as the PerShard writer.
+        // Read once at task startup; zero cost in production (var absent).
+        let fail_fsync_for_test =
+            std::env::var("MOON_TEST_AOF_FSYNC_FAIL").as_deref() == Ok("1");
+
         loop {
             match rx.recv() {
                 // TopLevel writer: legacy v1 disk format is plain RESP. The
@@ -1012,6 +1017,11 @@ pub async fn aof_writer_task(
                 Ok(AofMessage::AppendSync { bytes: data, lsn: _, ack }) => {
                     if write_error {
                         let _ = ack.send(AofAck::WriteFailed);
+                        continue;
+                    }
+                    // Test-only: return FsyncFailed immediately without touching disk.
+                    if fail_fsync_for_test {
+                        let _ = ack.send(AofAck::FsyncFailed);
                         continue;
                     }
                     if let Err(e) = file.write_all(&data) {
@@ -1317,6 +1327,15 @@ pub async fn per_shard_aof_writer_task(
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
         interval.tick().await;
 
+        // Test-only fault injection: if MOON_TEST_AOF_FSYNC_FAIL=1 is set in
+        // the environment at writer task startup, every AppendSync ack resolves
+        // as FsyncFailed instead of Synced. This lets integration tests exercise
+        // the AOF_FSYNC_ERR response path without requiring a real disk error.
+        // The env var is read once here (not per-message) so it costs zero on the
+        // hot path in production deployments where the var is absent.
+        let fail_fsync_for_test =
+            std::env::var("MOON_TEST_AOF_FSYNC_FAIL").as_deref() == Ok("1");
+
         loop {
             tokio::select! {
                 msg = rx.recv_async() => {
@@ -1361,6 +1380,12 @@ pub async fn per_shard_aof_writer_task(
                                     shard_id, e
                                 );
                                 let _ = ack.send(AofAck::WriteFailed);
+                                continue;
+                            }
+                            // Test-only: skip real fsync and return FsyncFailed
+                            // immediately when the fault-injection env var is set.
+                            if fail_fsync_for_test {
+                                let _ = ack.send(AofAck::FsyncFailed);
                                 continue;
                             }
                             if let Err(e) = writer.flush().await {
