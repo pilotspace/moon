@@ -2970,10 +2970,22 @@ mod tests_v2 {
         // resolves base/incr by the durably-committed new seq.
         manifest.prune_shard_files(0, 1);
         manifest.prune_shard_files(1, 1);
-        assert!(!old_base_s0.exists(), "old seq=1 base (s0) pruned post-commit");
-        assert!(!old_incr_s0.exists(), "old seq=1 incr (s0) pruned post-commit");
-        assert!(!old_base_s1.exists(), "old seq=1 base (s1) pruned post-commit");
-        assert!(!old_incr_s1.exists(), "old seq=1 incr (s1) pruned post-commit");
+        assert!(
+            !old_base_s0.exists(),
+            "old seq=1 base (s0) pruned post-commit"
+        );
+        assert!(
+            !old_incr_s0.exists(),
+            "old seq=1 incr (s0) pruned post-commit"
+        );
+        assert!(
+            !old_base_s1.exists(),
+            "old seq=1 base (s1) pruned post-commit"
+        );
+        assert!(
+            !old_incr_s1.exists(),
+            "old seq=1 incr (s1) pruned post-commit"
+        );
         assert!(
             manifest.shard_base_path_seq(0, 2).exists(),
             "new seq=2 base (s0) must remain after prune"

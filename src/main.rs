@@ -487,10 +487,14 @@ fn main() -> anyhow::Result<()> {
                 "AOF enabled (PerShard, {} writers, fsync: {:?})",
                 num_shards, fsync
             );
-            Some(AofWriterPool::per_shard_with_policy(
+            // [F6] per_shard_with_base_dir records the persistence base dir so a
+            // per-shard BGREWRITEAOF can load the authoritative manifest fresh
+            // at rewrite time (try_send_rewrite_per_shard).
+            Some(AofWriterPool::per_shard_with_base_dir(
                 senders,
                 fsync,
                 std::time::Duration::from_millis(config.aof_fsync_timeout_ms),
+                base_dir.clone(),
             ))
         } else {
             let (tx, rx) = channel::mpsc_bounded::<AofMessage>(10_000);
@@ -531,14 +535,30 @@ fn main() -> anyhow::Result<()> {
     // Verified 2026-05-26: multi-shard BGREWRITEAOF loses ~38% of keys on
     // restart. Gate lifted only when multi-part AOF replay ships (v2.0+).
     // See docs/runbooks/multi-shard-aof-rewrite.md.
+    // [F6] When `--experimental-per-shard-rewrite` is set, leave the gate OPEN
+    // so BGREWRITEAOF routes to the per-shard fan-out coordinator
+    // (try_send_rewrite_per_shard): synchronized seq bump + single manifest
+    // commit across all per-shard writers, validated by
+    // tests/crash_matrix_per_shard_bgrewriteaof.rs. Default (flag off) keeps
+    // the gate closed — the shipped, crash-safe "no in-place compaction"
+    // behavior that avoided the historical ~38%-key-loss-on-restart.
     if config.per_shard_aof_active(num_shards) {
-        moon::command::persistence::MULTI_SHARD_AOF_REWRITE_UNSAFE
-            .store(true, std::sync::atomic::Ordering::Relaxed);
-        tracing::warn!(
-            shards = num_shards,
-            appendonly = %config.appendonly,
-            "BGREWRITEAOF gated: per-shard AOF layout active (see docs/runbooks/multi-shard-aof-rewrite.md). Use --shards 1 to re-enable rewrite."
-        );
+        if config.experimental_per_shard_rewrite {
+            tracing::warn!(
+                shards = num_shards,
+                appendonly = %config.appendonly,
+                "BGREWRITEAOF per-shard rewrite ENABLED (--experimental-per-shard-rewrite). \
+                 Per-shard fan-out compaction is active; this path is experimental."
+            );
+        } else {
+            moon::command::persistence::MULTI_SHARD_AOF_REWRITE_UNSAFE
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+            tracing::warn!(
+                shards = num_shards,
+                appendonly = %config.appendonly,
+                "BGREWRITEAOF gated: per-shard AOF layout active (see docs/runbooks/multi-shard-aof-rewrite.md). Use --shards 1, or --experimental-per-shard-rewrite to enable per-shard compaction."
+            );
+        }
     }
 
     // Create watch channel for snapshot triggers (auto-save and BGSAVE)

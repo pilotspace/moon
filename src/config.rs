@@ -117,6 +117,22 @@ pub struct ServerConfig {
     #[arg(long, default_value_t = false)]
     pub unsafe_multishard_aof: bool,
 
+    /// [EXPERIMENTAL] Enable per-shard BGREWRITEAOF (compaction) for the
+    /// `--shards >= 2 + --appendonly yes` PerShard layout.
+    ///
+    /// Default `false`: BGREWRITEAOF stays gated in PerShard mode (the
+    /// shipped, crash-safe "append-only, no in-place compaction" behavior).
+    /// When `true`, BGREWRITEAOF fans the rewrite out to every per-shard
+    /// writer (synchronized seq bump + single manifest commit). This path is
+    /// validated by `tests/crash_matrix_per_shard_bgrewriteaof.rs` and is
+    /// opt-in until the both-runtime crash matrix is green by default.
+    ///
+    /// The flag only takes effect alongside `per_shard_aof_active`; it is a
+    /// no-op for `--shards 1` (TopLevel rewrite already works) and for
+    /// `--appendonly no`.
+    #[arg(long, default_value_t = false)]
+    pub experimental_per_shard_rewrite: bool,
+
     /// AOF fsync policy (always/everysec/no)
     #[arg(long, default_value = "everysec")]
     pub appendfsync: String,
