@@ -2693,4 +2693,42 @@ mod tests {
         assert_eq!(list[1].as_ref(), b"y");
         assert_eq!(list[2].as_ref(), b"z");
     }
+
+    // -----------------------------------------------------------------------
+    // FIX-W2-4 r2: canonical AOF fsync error string
+    //
+    // Red criterion: AOF_FSYNC_ERR constant must exist and equal the canonical
+    // Redis-style ERR-prefixed string used by handler_monoio and handler_sharded.
+    // handler_single.rs previously used "WRITEFAIL aof fsync failed" which is
+    // both non-canonical (no ERR prefix, different verb) and inconsistent with
+    // the other two handlers.
+    //
+    // These tests compile-fail on the prior commit (constant absent) and pass
+    // once AOF_FSYNC_ERR is declared in this module with the correct value.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn aof_fsync_err_constant_is_canonical() {
+        // The canonical error frame bytes sent to the client when an AOF
+        // fsync under appendfsync=always fails. Must match what
+        // handler_monoio/mod.rs and handler_sharded/mod.rs use.
+        assert_eq!(
+            AOF_FSYNC_ERR,
+            b"ERR AOF fsync failed; write not durable",
+            "AOF_FSYNC_ERR must equal the canonical ERR-prefixed string"
+        );
+    }
+
+    #[test]
+    fn aof_fsync_err_has_err_prefix() {
+        // Redis convention: protocol-level errors must start with a word
+        // followed by a space, using `ERR` for generic errors. `WRITEFAIL`
+        // is not a standard Redis error prefix and confuses clients that
+        // pattern-match on error codes.
+        assert!(
+            AOF_FSYNC_ERR.starts_with(b"ERR "),
+            "AOF_FSYNC_ERR must start with 'ERR ' (got {:?})",
+            std::str::from_utf8(AOF_FSYNC_ERR).unwrap_or("<non-utf8>")
+        );
+    }
 }
