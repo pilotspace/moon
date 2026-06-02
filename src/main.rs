@@ -767,13 +767,15 @@ fn main() -> anyhow::Result<()> {
                 eprintln!(
                     "REFUSING TO START: legacy TopLevel AOF manifest at {manifest_path} \
                      detected with --shards {num_shards} (>= 2). \
-                     This combination silently loses data for shards 1..{num_shards_minus_one}. \
-                     Run `moon migrate-aof --dir {dir_str}` to upgrade to the per-shard layout first. \
-                     See docs/runbooks/multi-shard-aof-rewrite.md for migration instructions.",
+                     This combination silently loses data for shards 1..={num_shards_minus_one}. \
+                     To migrate: stop the server, remove {aof_dir}, then restart with \
+                     --shards {num_shards} --appendonly yes (Moon creates a fresh per-shard \
+                     manifest; load prior state from dump.rdb first if needed). \
+                     See docs/runbooks/multi-shard-aof-rewrite.md for full migration instructions.",
                     manifest_path = base_dir.join("appendonlydir").join("moon.aof.manifest").display(),
                     num_shards = num_shards,
                     num_shards_minus_one = num_shards - 1,
-                    dir_str = base_dir.display(),
+                    aof_dir = base_dir.join("appendonlydir").display(),
                 );
                 std::process::exit(2);
             }
