@@ -96,6 +96,40 @@ pub fn migrate_aof(
         ));
     }
 
+    // ── Guard: from_dir == to_dir ────────────────────────────────────────────
+    // Migrating into the same directory would clobber the source layout.
+    if from_dir == to_dir {
+        return Err(crate::error::MoonError::from(
+            crate::error::AofError::RewriteFailed {
+                detail: format!(
+                    "migrate_aof: from_dir and to_dir must differ (both are {}). \
+                     Specify a separate empty directory for --migrate-aof-to.",
+                    from_dir.display()
+                ),
+            },
+        ));
+    }
+
+    // ── Guard: to_dir must not already contain AOF data ─────────────────────
+    // A PerShard manifest in to_dir means a previous migration ran (or the
+    // operator is reusing a live data directory). Refuse to avoid partial
+    // overwrites — use a fresh --migrate-aof-to.
+    match AofManifest::load(to_dir) {
+        Ok(Some(_)) => {
+            return Err(crate::error::MoonError::from(
+                crate::error::AofError::RewriteFailed {
+                    detail: format!(
+                        "migrate_aof: to_dir ({}) already contains an AOF manifest. \
+                         Use a fresh, non-existent or empty directory for --migrate-aof-to.",
+                        to_dir.display()
+                    ),
+                },
+            ));
+        }
+        Ok(None) => {} // expected: to_dir is empty or non-existent
+        Err(_) => {}   // I/O errors from a non-existent dir are fine; proceed
+    }
+
     // ── Step 1: Load source data ─────────────────────────────────────────────
     // Returns the RDB base bytes (if any) and the pure-RESP tail bytes.
     let (rdb_base_bytes, resp_tail) = load_source(from_dir)?;
@@ -421,10 +455,38 @@ fn append_resp_to_shards(
                     }
                 };
 
-                // SELECT changes the logical database — drop it from the output
-                // (per-shard replay doesn't persist SELECT across commands).
+                // SELECT: allow only SELECT 0 (no-op); refuse SELECT N (N>0).
+                // Per-shard replay runs each shard independently and does not
+                // persist the logical database across commands. A multi-DB
+                // legacy AOF (SELECT 1 + commands in db 1) cannot be safely
+                // migrated — commands after SELECT N would land in db 0 of
+                // their elected shard, silently corrupting data.
                 let cmd_upper = cmd_name.to_ascii_uppercase();
                 if cmd_upper.as_slice() == b"SELECT" {
+                    // Parse the db argument (if present).
+                    let db_arg = arr.get(1).and_then(|f| match f {
+                        Frame::BulkString(b) => std::str::from_utf8(b.as_ref()).ok(),
+                        Frame::SimpleString(s) => std::str::from_utf8(s.as_ref()).ok(),
+                        _ => None,
+                    });
+                    let db_num: i64 = db_arg
+                        .and_then(|s| s.trim().parse().ok())
+                        .unwrap_or(0);
+                    if db_num != 0 {
+                        return Err(crate::error::MoonError::from(
+                            crate::error::AofError::RewriteFailed {
+                                detail: format!(
+                                    "migrate_aof: multi-DB legacy AOF detected (SELECT {db_num} \
+                                     at command {commands_read}). Per-shard replay cannot \
+                                     correctly route commands from non-default databases. \
+                                     Manually re-route or flush the non-default database \
+                                     before migrating. Use a fresh --migrate-aof-to directory \
+                                     after fixing the source AOF."
+                                ),
+                            },
+                        ));
+                    }
+                    // SELECT 0 is a no-op — skip it silently.
                     commands_skipped += 1;
                     continue;
                 }
@@ -467,10 +529,8 @@ fn append_resp_to_shards(
                 // Write framed entry: [u64 lsn LE][u32 len LE][RESP bytes].
                 shard_lsn[shard_idx] += 1;
                 let lsn = shard_lsn[shard_idx];
-                let len = resp_bytes_out.len() as u32;
                 let file = &mut shard_files[shard_idx];
                 write_framed(file, lsn, &resp_bytes_out, manifest.shard_incr_path(shard_idx as u16))?;
-                let _ = len; // silence unused-variable warning after refactor
                 commands_written += 1;
             }
             Ok(None) => {
@@ -529,11 +589,6 @@ fn write_framed(
         crate::error::MoonError::from(crate::error::AofError::Io { path: path.clone(), source: e })
     })?;
     Ok(())
-}
-
-/// Build a canonical AOF dir path — exported for CLI use.
-pub fn aof_dir_for(dir: &Path) -> PathBuf {
-    dir.to_path_buf()
 }
 
 #[cfg(test)]

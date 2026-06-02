@@ -106,8 +106,8 @@ fn main() -> anyhow::Result<()> {
         )
         .map_err(|e| anyhow::anyhow!("AOF migration failed: {}", e))?;
         info!(
-            "AOF migration complete: {} commands read, {} written, {} skipped",
-            result.commands_read, result.commands_written, result.commands_skipped
+            "AOF migration complete: {} RDB keys migrated, {} commands read, {} written, {} skipped",
+            result.rdb_keys_migrated, result.commands_read, result.commands_written, result.commands_skipped
         );
         return Ok(());
     }
