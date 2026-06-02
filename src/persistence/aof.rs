@@ -1852,8 +1852,11 @@ pub async fn per_shard_aof_writer_task(
 
         let mut writer = tokio::io::BufWriter::new(file);
         let mut last_fsync = Instant::now();
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
-        interval.tick().await;
+        // (No `interval` here: the EverySec flush deadline is enforced by the
+        // timeout-bounded recv in the loop below, which wakes at least every
+        // 200ms regardless of message traffic. A long-lived `interval.tick()`
+        // select arm is fairness-starvable under sustained writes and proved
+        // unreliable when idle on this dedicated current-thread writer runtime.)
 
         // Test-only fault injection: if MOON_TEST_AOF_FSYNC_FAIL=1 is set in
         // the environment at writer task startup, every AppendSync ack resolves
@@ -1865,7 +1868,18 @@ pub async fn per_shard_aof_writer_task(
 
         loop {
             tokio::select! {
-                msg = rx.recv_async() => {
+                // Bounded recv (EverySec durability): wake at least every 200ms
+                // even when idle so the flush deadline after this select! is
+                // honored within its 1s bound. flume's recv future is drop-safe
+                // on the Elapsed branch (no message consumed on timeout); the
+                // Ok(Ok(msg)) path below captures the message with no loss.
+                r = tokio::time::timeout(
+                    std::time::Duration::from_millis(200),
+                    rx.recv_async(),
+                ) => {
+                    // On Elapsed (timeout) `r` is Err: skip the match and fall
+                    // through to the EverySec deadline check after this select!.
+                    if let Ok(msg) = r {
                     match msg {
                         // PerShard writer (tokio): per RFC § 2 Rule 1 the on-disk
                         // format is `[u64 lsn LE][u32 len LE][RESP bytes]`. Header
@@ -1990,12 +2004,6 @@ pub async fn per_shard_aof_writer_task(
                             break;
                         }
                     }
-                }
-                _ = interval.tick(), if fsync == FsyncPolicy::EverySec => {
-                    if last_fsync.elapsed() >= std::time::Duration::from_secs(1) {
-                        let _ = writer.flush().await;
-                        let _ = writer.get_ref().sync_data().await;
-                        last_fsync = Instant::now();
                     }
                 }
                 _ = cancel.cancelled() => {
@@ -2004,6 +2012,19 @@ pub async fn per_shard_aof_writer_task(
                     info!("AOF writer shard {} cancelled", shard_id);
                     break;
                 }
+            }
+            // EverySec deadline — checked after EVERY wake (message OR timeout),
+            // so it is NOT subject to select! fairness and holds the 1s bound
+            // under sustained writes as well as when idle. (The old long-lived
+            // `interval.tick()` arm could be starved by the always-ready recv
+            // arm under load, leaving >1s of writes buffered in the BufWriter
+            // and lost on SIGKILL — the COMPOSE crash-matrix failure.)
+            if fsync == FsyncPolicy::EverySec
+                && last_fsync.elapsed() >= std::time::Duration::from_secs(1)
+            {
+                let _ = writer.flush().await;
+                let _ = writer.get_ref().sync_data().await;
+                last_fsync = Instant::now();
             }
         }
     }

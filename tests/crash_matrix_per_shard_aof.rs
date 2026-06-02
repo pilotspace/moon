@@ -20,11 +20,16 @@
 //!   cargo build --release
 //!   cargo test --release --test crash_matrix_per_shard_aof -- --ignored
 //!
-//! Requires: built release binary (default features = runtime-monoio), `redis-cli` on PATH.
-//! Crash-recovery is validated on runtime-monoio only. The PerShard AOF manifest
-//! initialisation path (initialize_multi) is monoio-gated in main.rs:609; the
-//! runtime-tokio binary does not initialise the PerShard manifest on fresh boot
-//! and cannot pass crash-recovery validation.
+//! Requires: built release binary, `redis-cli` on PATH.
+//! Crash-recovery is now validated on BOTH runtimes. The PerShard AOF manifest
+//! init (initialize_multi) + replay_per_shard run under runtime-monoio AND
+//! runtime-tokio as of the tokio multi-part enablement; the tokio per-shard
+//! writer writes the byte-identical framed incr format. To validate tokio:
+//!   cargo build --release --no-default-features \
+//!     --features runtime-tokio,jemalloc,graph,text-index
+//!   cargo test --release --no-default-features \
+//!     --features runtime-tokio,jemalloc,graph,text-index \
+//!     --test crash_matrix_per_shard_aof -- --ignored
 
 #![cfg(any(feature = "runtime-monoio", feature = "runtime-tokio"))]
 
