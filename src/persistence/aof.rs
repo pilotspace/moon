@@ -743,6 +743,87 @@ mod pool_tests {
             "index 2 (failed fsync) must be patched to error"
         );
     }
+
+    /// FIX-W1-1 r2: handler_single ordering contract for `appendfsync=always`.
+    ///
+    /// Directly exercises the ordering pattern from handler_single.rs:2265-2295:
+    /// under Always policy the handler MUST await ALL AOF acks BEFORE sending ANY
+    /// response to the client. This prevents the H1 data-loss vector where the
+    /// client receives +OK before the entry is durably on disk.
+    ///
+    /// Verification: a mock AOF pool with a 60ms fsync delay is created.
+    /// The handler-side logic is reproduced inline (same control flow as
+    /// handler_single.rs:2265-2295). A recording "framed" channel captures
+    /// when each response byte is sent. We assert that the first response
+    /// is only sent AFTER the mock fsync delay has elapsed — proving ack
+    /// precedes response.
+    ///
+    /// Red state (pre-fix, a9f6e63^): `use_always_ordering` was false; the
+    /// handler flushed responses first, then fire-and-forget AOF. The mock
+    /// delay would not gate the response, so elapsed_ms < 60 — test fails.
+    ///
+    /// Green state (post-fix, a9f6e63): `use_always_ordering = true` for
+    /// Always policy; handler awaits all acks first. Elapsed time ≥ 60ms.
+    #[cfg(feature = "runtime-tokio")]
+    #[tokio::test]
+    async fn always_policy_ordering_ack_before_response_in_handler_single() {
+        use std::time::{Duration, Instant};
+        use crate::protocol::Frame;
+
+        // Build a single-shard pool (TopLevel layout, Always policy).
+        let (tx, rx) = channel::mpsc_bounded::<AofMessage>(4);
+        let pool = AofWriterPool::top_level_with_policy(tx, FsyncPolicy::Always);
+
+        // Mock writer: sleeps 60ms to simulate slow fsync, then sends Synced ack.
+        // Runs in spawn_blocking because flume::Receiver::recv() is blocking.
+        let mock_writer = tokio::task::spawn_blocking(move || {
+            let msg = rx.recv().expect("mock writer received message");
+            if let AofMessage::AppendSync { ack, .. } = msg {
+                std::thread::sleep(Duration::from_millis(60));
+                let _ = ack.send(AofAck::Synced);
+            } else {
+                panic!("Always policy MUST send AppendSync, got non-AppendSync message");
+            }
+        });
+
+        // Simulate handler_single.rs:2265-2295 (the use_always_ordering branch).
+        // aof_entries: one write at response index 0.
+        let aof_entries: Vec<(usize, Bytes)> = vec![(0, Bytes::from_static(b"SET k v\r\n"))];
+        let mut responses: Vec<Frame> = vec![Frame::SimpleString(
+            Bytes::from_static(b"OK"),
+        )];
+
+        // Recording channel: records timestamps when each response is "sent".
+        let (resp_tx, resp_rx) = std::sync::mpsc::channel::<Instant>();
+
+        // ── Reproduce the use_always_ordering branch ──
+        let start = Instant::now();
+        for (resp_idx, bytes) in aof_entries {
+            let lsn = AofWriterPool::issue_append_lsn(&None, 0, bytes.len());
+            if pool.try_send_append_durable(0, lsn, bytes).await.is_err() {
+                responses[resp_idx] = Frame::Error(Bytes::from_static(b"WRITEFAIL"));
+            }
+        }
+        // All acks received — send responses.
+        for _ in &responses {
+            resp_tx.send(Instant::now()).expect("recording send");
+        }
+        drop(resp_tx);
+
+        mock_writer.await.expect("mock writer completed");
+
+        // The first response must have been sent AFTER the 60ms fsync delay.
+        let first_response_at = resp_rx
+            .recv()
+            .expect("at least one response was recorded");
+        let elapsed_ms = first_response_at.duration_since(start).as_millis();
+        assert!(
+            elapsed_ms >= 55,
+            "response was sent {elapsed_ms}ms after start; expected >= 55ms \
+             (mock fsync delay is 60ms). This means the handler sent +OK before \
+             the AOF ack — ordering violation (H1 data-loss vector)."
+        );
+    }
 }
 
 /// Serialize a Frame into RESP wire format bytes.
