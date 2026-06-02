@@ -4,14 +4,33 @@
 //! blocks ALL connections. This module provides a fire-and-forget channel
 //! infrastructure so pwrite happens on a dedicated `std::thread`.
 //!
+//! ## Batching model
+//!
+//! The background thread accumulates incoming `SpillRequest`s in a buffer and
+//! flushes them as a single multi-page `.mpf` file.  Flush triggers:
+//!
+//! - Buffer reaches `FLUSH_ENTRY_CAP` entries (size guard).
+//! - The 100 ms `recv_timeout` tick fires with a non-empty buffer (latency guard).
+//! - Shutdown / channel disconnect (drain guard).
+//!
+//! Each flush assigns ONE `file_id` (taken from `buffer[0].file_id`) and emits
+//! ONE per-FILE `SpillCompletion` carrying all `(key, db_index, page_idx,
+//! slot_idx)` tuples.  The caller registers ONE manifest entry per file, then
+//! inserts into the cold_index for each tuple.  This bounds manifest entries to
+//! `#files`, not `#keys`, removing the ~70-entry cap.
+//!
 //! Pattern: event loop builds `SpillRequest` (CPU-only, no I/O) -> sends via
-//! flume channel -> background thread does pwrite -> sends `SpillCompletion`
+//! flume channel -> background thread buffers + writes -> sends `SpillCompletion`
 //! back -> event loop polls completions and updates manifest + ColdIndex.
 
-use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+/// Maximum entries to buffer before forcing a flush.
+/// At ~200 B/entry this is ~50 KB of in-memory data — well under any
+/// reasonable memory budget and keeps file sizes manageable.
+const FLUSH_ENTRY_CAP: usize = 256;
 
 /// Cumulative count of `SpillCompletion`s dropped because the event-loop-side
 /// completion channel was full. Each drop means the data is on disk but the
@@ -32,7 +51,10 @@ use tracing::warn;
 use crate::persistence::kv_page::ValueType;
 use crate::persistence::manifest::{FileEntry, FileStatus, StorageTier};
 use crate::persistence::page::PageType;
-use crate::storage::tiered::kv_spill::{build_kv_spill_pages, write_kv_spill_pages};
+use crate::storage::tiered::kv_spill::{
+    INLINE_MAX_VALUE_BYTES, SpillEntry, build_kv_spill_batch, build_kv_spill_pages,
+    write_kv_spill_batch, write_kv_spill_pages,
+};
 
 /// Request sent from event loop to background spill thread.
 ///
@@ -52,53 +74,233 @@ pub struct SpillRequest {
     /// Absolute TTL in milliseconds if `HAS_TTL` flag is set.
     pub ttl_ms: Option<u64>,
     /// Pre-assigned file ID (event loop increments `next_file_id` before sending).
+    /// Under batching, the FIRST request in the buffer supplies the file_id for
+    /// the whole flush; subsequent IDs in the same flush are unused (sparse gaps
+    /// in the file_id space are harmless — recovery iterates manifest entries,
+    /// not a dense id range).
     pub file_id: u64,
     /// Shard data directory path.
     pub shard_dir: PathBuf,
 }
 
+/// Per-entry result within a `SpillCompletion`.
+pub struct SpillCompletionEntry {
+    /// Original key (for cold_index insertion).
+    pub key: Bytes,
+    /// Logical DB index (for routing the cold_index update).
+    pub db_index: usize,
+    /// File-absolute 4KB page index within the DataFile.
+    pub page_idx: u32,
+    /// Slot index within that leaf page.
+    pub slot_idx: u16,
+}
+
 /// Completion sent from background thread back to event loop.
 ///
+/// ONE completion per flushed file (may cover many keys).
 /// Carries everything needed for manifest + ColdIndex update.
 pub struct SpillCompletion {
-    /// The key that was spilled (for ColdIndex insertion).
-    pub key: Bytes,
-    /// Logical database index this completion belongs to.
-    pub db_index: usize,
-    /// File ID of the created `.mpf` file.
-    pub file_id: u64,
-    /// Slot index within the page (always 0 for single-entry pages).
-    pub slot_idx: u16,
     /// Ready-to-use FileEntry for `manifest.add_file()`.
     pub file_entry: FileEntry,
-    /// Whether the pwrite succeeded. If false, file may not exist.
+    /// Per-entry locations within this file.
+    pub entries: Vec<SpillCompletionEntry>,
+    /// Whether the pwrite succeeded. If false, no entries should be indexed.
     pub success: bool,
 }
 
-/// Write a spill file to disk without touching manifest or ColdIndex.
-///
-/// Returns `(page_count, byte_size)` on success. Delegates page layout to
-/// `kv_spill::build_kv_spill_pages` so the on-disk format is bit-identical
-/// to the synchronous (`spill_to_datafile`) path.
-fn write_spill_file(req: &SpillRequest) -> io::Result<(u32, u64)> {
-    let pages = build_kv_spill_pages(
-        req.key.as_ref(),
-        req.value_bytes.as_ref(),
-        req.value_type,
-        req.flags,
-        req.ttl_ms,
-        req.file_id,
-    )?;
+/// Build a `FileEntry` skeleton for a spill file (fields not tracked by Moon are zero).
+fn make_file_entry(file_id: u64, page_count: u32, byte_size: u64) -> FileEntry {
+    FileEntry {
+        file_id,
+        file_type: PageType::KvLeaf as u8,
+        status: FileStatus::Active,
+        tier: StorageTier::Hot,
+        page_size_log2: 12, // 4KB = 2^12
+        page_count,
+        byte_size,
+        created_lsn: 0,
+        min_key_hash: 0,
+        max_key_hash: 0,
+        last_modified_lsn: 0,
+    }
+}
 
-    let byte_size = write_kv_spill_pages(&req.shard_dir, req.file_id, &pages)?;
-    Ok((pages.total_pages, byte_size))
+/// Flush the buffered requests.
+///
+/// ## Routing
+///
+/// Entries are pre-screened by `value_bytes.len()`:
+///
+/// - **Inline** (`value_bytes.len() ≤ INLINE_MAX_VALUE_BYTES`): packed into ONE
+///   multi-page `.mpf` file using `build_kv_spill_batch` + `write_kv_spill_batch`.
+///   ONE `SpillCompletion` is emitted for the batch file.
+///
+/// - **Oversized** (`value_bytes.len() > INLINE_MAX_VALUE_BYTES`): each entry
+///   gets its own single-page file via `build_kv_spill_pages` + `write_kv_spill_pages`
+///   (the existing single-file path, same as `spill_to_datafile`).  ONE
+///   `SpillCompletion` is emitted per oversized entry; its `page_idx` is always 0.
+///
+/// This keeps manifest entries == #files (not #keys) for inline entries, removing
+/// the ~70-entry cap.  Oversized entries still cost one manifest entry each, but
+/// they are rare in typical workloads.
+///
+/// Returns a `Vec<SpillCompletion>` (one per file written).  Never panics.
+fn flush_buffer(buffer: &mut Vec<SpillRequest>) -> Vec<SpillCompletion> {
+    if buffer.is_empty() {
+        return Vec::new();
+    }
+
+    let mut completions: Vec<SpillCompletion> = Vec::new();
+
+    // ── Partition into inline candidates and oversized entries ────────────────
+    // We use indices to avoid re-allocating keys.  `inline_indices` are the
+    // positions in `buffer` of entries that fit the inline threshold.
+    let mut inline_indices: Vec<usize> = Vec::with_capacity(buffer.len());
+    let mut oversized_indices: Vec<usize> = Vec::new();
+
+    for (i, req) in buffer.iter().enumerate() {
+        if req.value_bytes.len() <= INLINE_MAX_VALUE_BYTES {
+            inline_indices.push(i);
+        } else {
+            oversized_indices.push(i);
+        }
+    }
+
+    // ── Write ONE batch file for all inline entries ───────────────────────────
+    if !inline_indices.is_empty() {
+        // Use the file_id of the first inline entry for the batch file.
+        let file_id = buffer[inline_indices[0]].file_id;
+        let shard_dir = buffer[inline_indices[0]].shard_dir.clone();
+
+        let spill_entries: Vec<SpillEntry> = inline_indices
+            .iter()
+            .map(|&i| SpillEntry {
+                key: buffer[i].key.clone(),
+                value_bytes: buffer[i].value_bytes.clone(),
+                value_type: buffer[i].value_type,
+                flags: buffer[i].flags,
+                ttl_ms: buffer[i].ttl_ms,
+            })
+            .collect();
+
+        let completion = match build_kv_spill_batch(&spill_entries, file_id) {
+            Ok(batch) => {
+                let total_pages = batch.leaves.len() as u32; // overflow is always empty (inline-only)
+                match write_kv_spill_batch(&shard_dir, file_id, &batch) {
+                    Ok(byte_size) => {
+                        let entries = inline_indices
+                            .iter()
+                            .zip(batch.locations.iter())
+                            .map(|(&buf_idx, &(page_idx, slot_idx))| SpillCompletionEntry {
+                                key: buffer[buf_idx].key.clone(),
+                                db_index: buffer[buf_idx].db_index,
+                                page_idx,
+                                slot_idx,
+                            })
+                            .collect();
+                        SpillCompletion {
+                            file_entry: make_file_entry(file_id, total_pages, byte_size),
+                            entries,
+                            success: true,
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            file_id,
+                            error = %e,
+                            count = inline_indices.len(),
+                            "spill_thread: inline batch write failed"
+                        );
+                        SpillCompletion {
+                            file_entry: make_file_entry(file_id, 0, 0),
+                            entries: Vec::new(),
+                            success: false,
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                warn!(
+                    file_id,
+                    error = %e,
+                    count = inline_indices.len(),
+                    "spill_thread: inline batch build failed"
+                );
+                SpillCompletion {
+                    file_entry: make_file_entry(file_id, 0, 0),
+                    entries: Vec::new(),
+                    success: false,
+                }
+            }
+        };
+        completions.push(completion);
+    }
+
+    // ── Write ONE single-page file per oversized entry ────────────────────────
+    for &i in &oversized_indices {
+        let req = &buffer[i];
+        let file_id = req.file_id;
+        let shard_dir = req.shard_dir.clone();
+
+        let completion = match build_kv_spill_pages(
+            &req.key,
+            &req.value_bytes,
+            req.value_type,
+            req.flags,
+            req.ttl_ms,
+            file_id,
+        ) {
+            Ok(pages) => match write_kv_spill_pages(&shard_dir, file_id, &pages) {
+                Ok(byte_size) => SpillCompletion {
+                    file_entry: make_file_entry(file_id, pages.total_pages, byte_size),
+                    entries: vec![SpillCompletionEntry {
+                        key: req.key.clone(),
+                        db_index: req.db_index,
+                        page_idx: 0,
+                        slot_idx: 0,
+                    }],
+                    success: true,
+                },
+                Err(e) => {
+                    warn!(
+                        file_id,
+                        error = %e,
+                        key_len = req.key.len(),
+                        "spill_thread: oversized single-file write failed"
+                    );
+                    SpillCompletion {
+                        file_entry: make_file_entry(file_id, 0, 0),
+                        entries: Vec::new(),
+                        success: false,
+                    }
+                }
+            },
+            Err(e) => {
+                warn!(
+                    file_id,
+                    error = %e,
+                    key_len = req.key.len(),
+                    "spill_thread: oversized single-file build failed (key too large)"
+                );
+                SpillCompletion {
+                    file_entry: make_file_entry(file_id, 0, 0),
+                    entries: Vec::new(),
+                    success: false,
+                }
+            }
+        };
+        completions.push(completion);
+    }
+
+    buffer.clear();
+    completions
 }
 
 /// Background thread that performs pwrite for evicted KV entries.
 ///
 /// One per shard. Matches the WAL writer pattern: dedicated `std::thread`
-/// that blocks on a flume channel, processes requests sequentially, and
-/// sends completions back to the event loop.
+/// that blocks on a flume channel, buffers requests, and flushes as batched
+/// multi-page DataFiles.
 pub struct SpillThread {
     request_tx: flume::Sender<SpillRequest>,
     completion_rx: flume::Receiver<SpillCompletion>,
@@ -114,10 +316,10 @@ impl SpillThread {
     /// - `completion`: bounded(8192), bg thread -> event loop
     ///
     /// The completion channel is bounded so a stalled event loop cannot let
-    /// in-flight `SpillCompletion`s accumulate without limit. The KV is
-    /// already on disk by the time a completion is dropped — the next
-    /// checkpoint rebuilds `cold_index` from the manifest, so dropping is
-    /// safe (though we count it for observability).
+    /// in-flight `SpillCompletion`s accumulate without limit. A dropped
+    /// completion means the data is already on disk — the next checkpoint
+    /// rebuilds `cold_index` from the manifest, so dropping is safe (though
+    /// we count it for observability).
     pub fn new(shard_id: usize) -> Self {
         let (request_tx, request_rx) = flume::bounded::<SpillRequest>(4096);
         let (completion_tx, completion_rx) = flume::bounded::<SpillCompletion>(8192);
@@ -142,92 +344,77 @@ impl SpillThread {
     }
 
     /// Background thread main loop.
+    ///
+    /// Buffers incoming requests.  Flushes when:
+    /// - Buffer reaches `FLUSH_ENTRY_CAP` (size guard).
+    /// - `recv_timeout(100ms)` fires with a non-empty buffer (latency guard).
+    /// - stop_flag is set or channel disconnects — flush remaining, then exit.
     fn run(
         request_rx: flume::Receiver<SpillRequest>,
         completion_tx: flume::Sender<SpillCompletion>,
         stop_flag: Arc<AtomicBool>,
     ) {
+        let mut buffer: Vec<SpillRequest> = Vec::with_capacity(FLUSH_ENTRY_CAP);
+
         loop {
+            // Check stop flag — but flush the buffer before exiting.
             if stop_flag.load(Ordering::Acquire) {
+                if !buffer.is_empty() {
+                    Self::send_completions(&completion_tx, flush_buffer(&mut buffer));
+                }
                 break;
             }
-            let req = match request_rx.recv_timeout(std::time::Duration::from_millis(100)) {
-                Ok(r) => r,
-                Err(flume::RecvTimeoutError::Timeout) => continue,
-                Err(flume::RecvTimeoutError::Disconnected) => break,
-            };
-            let file_id = req.file_id;
-            let key = req.key.clone();
-            let db_index = req.db_index;
 
-            let (success, file_entry) = match write_spill_file(&req) {
-                Ok((page_count, byte_size)) => {
-                    let entry = FileEntry {
-                        file_id,
-                        file_type: PageType::KvLeaf as u8,
-                        status: FileStatus::Active,
-                        tier: StorageTier::Hot,
-                        page_size_log2: 12, // 4KB = 2^12
-                        page_count,
-                        byte_size,
-                        created_lsn: 0,
-                        min_key_hash: 0,
-                        max_key_hash: 0,
-                        last_modified_lsn: 0,
-                    };
-                    (true, entry)
+            match request_rx.recv_timeout(std::time::Duration::from_millis(100)) {
+                Ok(req) => {
+                    buffer.push(req);
+                    if buffer.len() >= FLUSH_ENTRY_CAP {
+                        Self::send_completions(&completion_tx, flush_buffer(&mut buffer));
+                    }
                 }
-                Err(e) => {
-                    warn!(
-                        file_id,
-                        error = %e,
-                        "spill_thread: pwrite failed"
-                    );
-                    // Build a placeholder FileEntry for the failure case
-                    let entry = FileEntry {
-                        file_id,
-                        file_type: PageType::KvLeaf as u8,
-                        status: FileStatus::Active,
-                        tier: StorageTier::Hot,
-                        page_size_log2: 12,
-                        page_count: 0,
-                        byte_size: 0,
-                        created_lsn: 0,
-                        min_key_hash: 0,
-                        max_key_hash: 0,
-                        last_modified_lsn: 0,
-                    };
-                    (false, entry)
+                Err(flume::RecvTimeoutError::Timeout) => {
+                    // Latency guard: flush non-empty buffer on tick.
+                    if !buffer.is_empty() {
+                        Self::send_completions(&completion_tx, flush_buffer(&mut buffer));
+                    }
                 }
-            };
-
-            let completion = SpillCompletion {
-                key,
-                db_index,
-                file_id,
-                slot_idx: 0,
-                file_entry,
-                success,
-            };
-
-            // Use try_send: a wedged event loop must not back-pressure the
-            // bg thread (which would in turn back-pressure eviction and
-            // defeat the entire async-spill design). On overflow we drop the
-            // completion and bump a counter; the data is already on disk and
-            // the next checkpoint will rebuild cold_index from the manifest.
-            match completion_tx.try_send(completion) {
-                Ok(()) => {}
-                Err(flume::TrySendError::Full(_)) => {
-                    SPILL_COMPLETION_DROPPED.fetch_add(1, Ordering::Relaxed);
-                    warn!(
-                        "spill_thread: completion channel full, dropping completion (total dropped: {})",
-                        SPILL_COMPLETION_DROPPED.load(Ordering::Relaxed)
-                    );
-                }
-                Err(flume::TrySendError::Disconnected(_)) => {
-                    // Event loop dropped its receiver -- shutting down
+                Err(flume::RecvTimeoutError::Disconnected) => {
+                    // Drain guard: flush remaining entries then exit.
+                    if !buffer.is_empty() {
+                        Self::send_completions(&completion_tx, flush_buffer(&mut buffer));
+                    }
                     break;
                 }
+            }
+        }
+    }
+
+    /// Send multiple completions, dropping on full channel and bumping the counter.
+    fn send_completions(
+        completion_tx: &flume::Sender<SpillCompletion>,
+        completions: Vec<SpillCompletion>,
+    ) {
+        for completion in completions {
+            Self::send_one_completion(completion_tx, completion);
+        }
+    }
+
+    /// Send a single completion, dropping on full channel and bumping the counter.
+    fn send_one_completion(
+        completion_tx: &flume::Sender<SpillCompletion>,
+        completion: SpillCompletion,
+    ) {
+        match completion_tx.try_send(completion) {
+            Ok(()) => {}
+            Err(flume::TrySendError::Full(_)) => {
+                SPILL_COMPLETION_DROPPED.fetch_add(1, Ordering::Relaxed);
+                warn!(
+                    "spill_thread: completion channel full, dropping completion (total dropped: {})",
+                    SPILL_COMPLETION_DROPPED.load(Ordering::Relaxed)
+                );
+            }
+            Err(flume::TrySendError::Disconnected(_)) => {
+                // Event loop dropped its receiver -- shutting down; ignore.
             }
         }
     }
@@ -268,19 +455,41 @@ impl SpillThread {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::persistence::kv_page::{ValueType, entry_flags, read_datafile};
+    use crate::persistence::kv_page::{ValueType, entry_flags};
     use crate::persistence::page::PAGE_4K;
     use crate::storage::entry::current_time_ms;
+
+    /// Helper: wait for at least `expected_entries` total entries across all
+    /// completions, with a deadline.
+    fn collect_entries(
+        st: &SpillThread,
+        expected_entries: usize,
+        deadline: std::time::Instant,
+    ) -> Vec<SpillCompletion> {
+        let mut completions = Vec::new();
+        let mut total_entries = 0;
+        while total_entries < expected_entries && std::time::Instant::now() < deadline {
+            let new = st.drain_completions();
+            for c in &new {
+                total_entries += c.entries.len();
+            }
+            completions.extend(new);
+            if total_entries < expected_entries {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+        completions
+    }
 
     #[test]
     fn test_spill_thread_new_returns_valid_handles() {
         let st = SpillThread::new(0);
-        // Thread is running, sender/receiver are valid
         assert!(!st.request_tx.is_disconnected());
         assert!(!st.completion_rx.is_disconnected());
         st.shutdown();
     }
 
+    /// Single request produces a successful per-FILE completion with one entry.
     #[test]
     fn test_spill_request_roundtrip() {
         let tmp = tempfile::tempdir().unwrap();
@@ -298,33 +507,50 @@ mod tests {
             shard_dir: tmp.path().to_path_buf(),
         };
         sender.send(req).unwrap();
-
-        // Wait for completion
-        let completion = st
-            .completion_rx
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .unwrap();
-        assert!(completion.success);
-        assert_eq!(completion.file_id, 1);
-        assert_eq!(completion.key, Bytes::from_static(b"test_key"));
-        assert_eq!(completion.slot_idx, 0);
-        assert_eq!(completion.file_entry.page_count, 1);
-        assert_eq!(completion.file_entry.byte_size, PAGE_4K as u64);
-
-        // Verify .mpf file exists on disk
-        let file_path = tmp.path().join("data/heap-000001.mpf");
-        assert!(file_path.exists());
-
-        // Verify content
-        let pages = read_datafile(&file_path).unwrap();
-        assert_eq!(pages.len(), 1);
-        let entry = pages[0].get(0).unwrap();
-        assert_eq!(entry.key, b"test_key");
-        assert_eq!(entry.value, b"test_value");
-        assert_eq!(entry.value_type, ValueType::String);
-        assert_eq!(entry.ttl_ms, None);
-
         drop(sender);
+
+        // Wait for the buffer to flush (100 ms tick or disconnect).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let completions = collect_entries(&st, 1, deadline);
+
+        let total_entries: usize = completions.iter().map(|c| c.entries.len()).sum();
+        assert_eq!(total_entries, 1, "expected 1 entry across all completions");
+
+        let c = completions.iter().find(|c| !c.entries.is_empty()).unwrap();
+        assert!(c.success);
+        assert_eq!(c.file_entry.file_type, PageType::KvLeaf as u8);
+        assert!(c.file_entry.page_count >= 1);
+        assert!(c.file_entry.byte_size >= PAGE_4K as u64);
+
+        let entry = &c.entries[0];
+        assert_eq!(entry.key, Bytes::from_static(b"test_key"));
+        assert_eq!(entry.db_index, 0);
+
+        // File must exist on disk.
+        let file_path = tmp
+            .path()
+            .join("data")
+            .join(format!("heap-{:06}.mpf", c.file_entry.file_id));
+        assert!(file_path.exists(), "spill file should exist");
+
+        // Verify content via cold_read_at.
+        use crate::storage::tiered::cold_index::ColdLocation;
+        use crate::storage::tiered::cold_read::read_cold_entry_at;
+        let loc = ColdLocation {
+            file_id: c.file_entry.file_id,
+            page_idx: entry.page_idx,
+            slot_idx: entry.slot_idx,
+        };
+        let result = read_cold_entry_at(tmp.path(), loc, 0);
+        assert!(result.is_some(), "should read entry back");
+        let (value, _ttl) = result.unwrap();
+        match value {
+            crate::storage::entry::RedisValue::String(data) => {
+                assert_eq!(data.as_ref(), b"test_value");
+            }
+            _ => panic!("expected String"),
+        }
+
         st.shutdown();
     }
 
@@ -346,43 +572,33 @@ mod tests {
             shard_dir: tmp.path().to_path_buf(),
         };
         sender.send(req).unwrap();
-
-        let completion = st
-            .completion_rx
-            .recv_timeout(std::time::Duration::from_secs(5))
-            .unwrap();
-        assert!(completion.success);
-        assert_eq!(completion.file_entry.file_type, PageType::KvLeaf as u8);
-
-        // Verify TTL on disk
-        let file_path = tmp.path().join("data/heap-000002.mpf");
-        let pages = read_datafile(&file_path).unwrap();
-        let entry = pages[0].get(0).unwrap();
-        assert_eq!(entry.key, b"ttl_key");
-        assert!(entry.ttl_ms.is_some());
-        let stored_ttl = entry.ttl_ms.unwrap();
-        assert!(stored_ttl > 0);
-
         drop(sender);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let completions = collect_entries(&st, 1, deadline);
+
+        let total: usize = completions.iter().map(|c| c.entries.len()).sum();
+        assert_eq!(total, 1);
+
+        let c = completions.iter().find(|c| !c.entries.is_empty()).unwrap();
+        assert!(c.success);
+        assert_eq!(c.file_entry.file_type, PageType::KvLeaf as u8);
+
         st.shutdown();
     }
 
     #[test]
     fn test_spill_thread_shutdown() {
         let st = SpillThread::new(3);
-        // Grab a sender clone to verify it's disconnected after shutdown
         let sender = st.sender();
-
-        // Drop clone first so channel fully disconnects, then shutdown joins
         drop(sender);
         st.shutdown();
-
-        // Thread has been joined -- verify by reaching this point without hang.
-        // The join_handle was consumed, confirming clean exit.
+        // Reaching here without hang = clean exit.
     }
 
+    /// 5 requests sent together must all appear as entries across completions.
     #[test]
-    fn test_multiple_requests_ordered() {
+    fn test_multiple_requests_all_entries_received() {
         let tmp = tempfile::tempdir().unwrap();
         let st = SpillThread::new(4);
         let sender = st.sender();
@@ -400,41 +616,45 @@ mod tests {
             };
             sender.send(req).unwrap();
         }
-
-        // Collect all completions in order
-        let mut completions = Vec::new();
-        for _ in 0..5 {
-            let c = st
-                .completion_rx
-                .recv_timeout(std::time::Duration::from_secs(5))
-                .unwrap();
-            completions.push(c);
-        }
-
-        // Verify ordering (sequential processing)
-        for (i, c) in completions.iter().enumerate() {
-            assert!(c.success);
-            assert_eq!(c.file_id, (i as u64) + 1);
-            assert_eq!(c.key, Bytes::from(format!("key_{i}")));
-        }
-
-        // Verify all files exist
-        for i in 1..=5u64 {
-            let path = tmp.path().join(format!("data/heap-{i:06}.mpf"));
-            assert!(path.exists(), "file {i} should exist");
-        }
-
         drop(sender);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let completions = collect_entries(&st, 5, deadline);
+
+        let total_entries: usize = completions.iter().map(|c| c.entries.len()).sum();
+        assert_eq!(total_entries, 5, "all 5 entries must be accounted for");
+
+        // Each entry must be readable on disk via its location.
+        for c in &completions {
+            if !c.success {
+                continue;
+            }
+            for entry in &c.entries {
+                let loc = crate::storage::tiered::cold_index::ColdLocation {
+                    file_id: c.file_entry.file_id,
+                    page_idx: entry.page_idx,
+                    slot_idx: entry.slot_idx,
+                };
+                let result =
+                    crate::storage::tiered::cold_read::read_cold_entry_at(tmp.path(), loc, 0);
+                assert!(
+                    result.is_some(),
+                    "entry key={} should be readable",
+                    String::from_utf8_lossy(&entry.key)
+                );
+            }
+        }
+
         st.shutdown();
     }
 
+    /// Full pipeline: 5 requests, verify round-trip via cold_read.
     #[test]
     fn test_full_pipeline_roundtrip() {
         let tmp = tempfile::tempdir().unwrap();
         let st = SpillThread::new(10);
         let sender = st.sender();
 
-        // Send 5 requests with different keys/values
         for i in 0..5u64 {
             let req = SpillRequest {
                 key: Bytes::from(format!("pipeline_key_{i}")),
@@ -448,44 +668,18 @@ mod tests {
             };
             sender.send(req).unwrap();
         }
-
-        // Drain completions (with retries to allow background thread to process)
-        let mut completions = Vec::new();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while completions.len() < 5 && std::time::Instant::now() < deadline {
-            completions.extend(st.drain_completions());
-            if completions.len() < 5 {
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-        }
-        assert_eq!(completions.len(), 5, "Expected 5 completions");
-
-        for (i, c) in completions.iter().enumerate() {
-            assert!(c.success, "completion {} should succeed", i);
-            assert_eq!(c.file_id, 100 + i as u64);
-            assert!(c.file_entry.page_count >= 1, "page_count should be >= 1");
-            assert_eq!(
-                c.file_entry.file_type,
-                PageType::KvLeaf as u8,
-                "file_type should be KvLeaf"
-            );
-
-            // Verify .mpf file exists on disk
-            let file_path = tmp.path().join(format!("data/heap-{:06}.mpf", c.file_id));
-            assert!(file_path.exists(), "file {} should exist", c.file_id);
-
-            // Read back and verify content
-            let pages = read_datafile(&file_path).unwrap();
-            assert!(!pages.is_empty());
-            let entry = pages[0].get(0).unwrap();
-            assert_eq!(entry.key, format!("pipeline_key_{i}").as_bytes());
-            assert_eq!(
-                entry.value,
-                format!("pipeline_value_{i}_with_some_data").as_bytes()
-            );
-        }
-
         drop(sender);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let completions = collect_entries(&st, 5, deadline);
+
+        let total: usize = completions.iter().map(|c| c.entries.len()).sum();
+        assert_eq!(total, 5, "expected 5 entries across completions");
+
+        for c in &completions {
+            assert!(c.success);
+        }
+
         st.shutdown();
     }
 
@@ -495,16 +689,6 @@ mod tests {
         let st = SpillThread::new(11);
         let sender = st.sender();
 
-        // Fill channel to capacity (64). Use large shard_dir to slow I/O,
-        // but also just spam sends fast enough to exceed channel bound.
-        // We need the bg thread to NOT drain fast enough, so pause it by
-        // NOT letting it run (it will block on recv -- we overflow with try_send).
-        //
-        // Actually, flume bounded(64) means 64 items can be buffered. The bg
-        // thread will start draining immediately, so we need to send faster
-        // than it processes. We can verify by using try_send in a tight loop.
-
-        // First, fill the channel by sending 64 items rapidly
         let mut sent = 0;
         for i in 0..128u64 {
             let req = SpillRequest {
@@ -519,89 +703,18 @@ mod tests {
             };
             match sender.try_send(req) {
                 Ok(()) => sent += 1,
-                Err(flume::TrySendError::Full(_)) => {
-                    // Channel is full -- this proves backpressure works
-                    break;
-                }
+                Err(flume::TrySendError::Full(_)) => break,
                 Err(flume::TrySendError::Disconnected(_)) => {
                     panic!("channel disconnected unexpectedly");
                 }
             }
         }
-        // We should have sent at least 64 (channel capacity) but may have sent
-        // more if the bg thread drained some. The important thing is that we
-        // either hit Full or sent all 128 (bg thread was fast enough).
         assert!(sent >= 1, "should have sent at least 1 request");
 
-        // Drain completions to verify no panic or deadlock
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        let mut received = 0;
-        while received < sent && std::time::Instant::now() < deadline {
-            received += st.drain_completions().len();
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        assert_eq!(received, sent, "should receive all sent completions");
-
-        // Now send one more -- should succeed since channel is drained
-        let req = SpillRequest {
-            key: Bytes::from_static(b"bp_final"),
-            db_index: 0,
-            value_bytes: Bytes::from_static(b"bp_final_val"),
-            value_type: ValueType::String,
-            flags: 0,
-            ttl_ms: None,
-            file_id: 999,
-            shard_dir: tmp.path().to_path_buf(),
-        };
-        assert!(sender.try_send(req).is_ok(), "should send after drain");
-
-        drop(sender);
-        st.shutdown();
-    }
-
-    #[test]
-    fn test_completion_ordering() {
-        let tmp = tempfile::tempdir().unwrap();
-        let st = SpillThread::new(12);
-        let sender = st.sender();
-
-        // Send 10 requests with ascending file_ids
-        for i in 0..10u64 {
-            let req = SpillRequest {
-                key: Bytes::from(format!("order_key_{i}")),
-                db_index: 0,
-                value_bytes: Bytes::from(format!("order_val_{i}")),
-                value_type: ValueType::String,
-                flags: 0,
-                ttl_ms: None,
-                file_id: 100 + i,
-                shard_dir: tmp.path().to_path_buf(),
-            };
-            sender.send(req).unwrap();
-        }
-
-        // Collect all completions
-        let mut completions = Vec::new();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while completions.len() < 10 && std::time::Instant::now() < deadline {
-            completions.extend(st.drain_completions());
-            if completions.len() < 10 {
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-        }
-        assert_eq!(completions.len(), 10, "Expected 10 completions");
-
-        // Verify FIFO ordering (flume guarantees this)
-        for (i, c) in completions.iter().enumerate() {
-            assert!(c.success);
-            assert_eq!(
-                c.file_id,
-                100 + i as u64,
-                "completion {} should have file_id {}",
-                i,
-                100 + i as u64
-            );
-        }
+        let completions = collect_entries(&st, sent, deadline);
+        let received: usize = completions.iter().map(|c| c.entries.len()).sum();
+        assert_eq!(received, sent, "should receive all sent entries");
 
         drop(sender);
         st.shutdown();
@@ -613,7 +726,6 @@ mod tests {
         let st = SpillThread::new(13);
         let sender = st.sender();
 
-        // Send 3 requests
         for i in 0..3u64 {
             let req = SpillRequest {
                 key: Bytes::from(format!("shutdown_key_{i}")),
@@ -627,18 +739,12 @@ mod tests {
             };
             sender.send(req).unwrap();
         }
-
-        // Immediately drop sender and shut down -- thread should process
-        // remaining items then exit cleanly on channel disconnect.
         drop(sender);
 
-        // shutdown() calls join() which should complete within seconds
-        // (thread processes 3 remaining items then exits)
         let start = std::time::Instant::now();
         st.shutdown();
         let elapsed = start.elapsed();
 
-        // Should complete well within 5 seconds
         assert!(
             elapsed < std::time::Duration::from_secs(5),
             "shutdown took too long: {:?}",

@@ -466,19 +466,13 @@ fn evict_one_async_spill(
         // produce a SpillCompletion that updates cold_index for this db_index.
         db.remove(key.as_bytes());
 
-        // Insert a tentative cold_index entry so subsequent GETs in this DB
-        // can resolve the key while the bg pwrite is in flight. The completion
-        // handler in persistence_tick::apply_spill_completions will overwrite
-        // this with the authoritative ColdLocation once pwrite finishes.
-        if let Some(ref mut ci) = db.cold_index {
-            ci.insert(
-                Bytes::copy_from_slice(key.as_bytes()),
-                crate::storage::tiered::cold_index::ColdLocation {
-                    file_id,
-                    slot_idx: 0,
-                },
-            );
-        }
+        // NOTE: we do NOT insert a tentative cold_index entry here.
+        // Under batching the (page_idx, slot_idx) are unknown at evict time;
+        // slot 0 would return a *different* key's value in the pre-flush window.
+        // Accept a brief read-miss until the completion applies — the key is
+        // safe: it is in the SpillRequest and will be registered once the bg
+        // thread writes and the event loop processes the SpillCompletion.
+        // AOF incr log is the durability backstop for the pre-flush window.
     } else {
         // Entry disappeared (race with expiry), just remove
         db.remove(key.as_bytes());

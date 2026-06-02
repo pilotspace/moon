@@ -374,8 +374,12 @@ pub(crate) fn drain_and_shutdown_spill(
     }
 }
 
-/// For each successful completion: update manifest and ColdIndex.
-/// Called on each eviction tick from the event loop.
+/// For each successful completion: update manifest (ONE add_file+commit per
+/// file) and ColdIndex (one insert per entry within that file).
+///
+/// Under the batching model each `SpillCompletion` covers ONE DataFile that
+/// may contain many KV entries.  This makes manifest entries == #files, not
+/// #keys, removing the ~70-entry inline-root cap.
 pub(crate) fn apply_spill_completions(
     spill_thread: &crate::storage::tiered::spill_thread::SpillThread,
     shard_manifest: &mut Option<crate::persistence::manifest::ShardManifest>,
@@ -390,45 +394,46 @@ pub(crate) fn apply_spill_completions(
     for c in completions {
         if !c.success {
             tracing::warn!(
-                key = %String::from_utf8_lossy(&c.key),
-                file_id = c.file_id,
+                file_id = c.file_entry.file_id,
                 "Spill pwrite failed on background thread"
             );
             continue;
         }
 
-        // Update manifest
+        let file_id = c.file_entry.file_id;
+
+        // ONE manifest add_file + commit per flushed file.
         if let Some(ref mut manifest) = *shard_manifest {
             manifest.add_file(c.file_entry);
             if let Err(e) = manifest.commit() {
-                tracing::warn!(file_id = c.file_id, error = %e, "Manifest commit failed for spill completion");
+                tracing::warn!(
+                    file_id,
+                    error = %e,
+                    "Manifest commit failed for spill completion"
+                );
             }
         }
 
-        // Update ColdIndex in the originating logical DB.
-        // Phase 2d: gate on is_initialized(); new path uses ShardSlice directly.
-        if crate::shard::slice::is_initialized() {
-            crate::shard::slice::with_shard_db(c.db_index, |db| {
-                if let Some(ref mut ci) = db.cold_index {
-                    ci.insert(
-                        c.key,
-                        crate::storage::tiered::cold_index::ColdLocation {
-                            file_id: c.file_id,
-                            slot_idx: c.slot_idx,
-                        },
-                    );
+        // Insert one ColdIndex entry per KV within this file.
+        for entry in c.entries {
+            let location = crate::storage::tiered::cold_index::ColdLocation {
+                file_id,
+                page_idx: entry.page_idx,
+                slot_idx: entry.slot_idx,
+            };
+
+            // Phase 2d: gate on is_initialized(); new path uses ShardSlice directly.
+            if crate::shard::slice::is_initialized() {
+                crate::shard::slice::with_shard_db(entry.db_index, |db| {
+                    if let Some(ref mut ci) = db.cold_index {
+                        ci.insert(entry.key.clone(), location);
+                    }
+                });
+            } else {
+                let mut guard = shard_databases.write_db(shard_id, entry.db_index);
+                if let Some(ref mut ci) = guard.cold_index {
+                    ci.insert(entry.key, location);
                 }
-            });
-        } else {
-            let mut guard = shard_databases.write_db(shard_id, c.db_index);
-            if let Some(ref mut ci) = guard.cold_index {
-                ci.insert(
-                    c.key,
-                    crate::storage::tiered::cold_index::ColdLocation {
-                        file_id: c.file_id,
-                        slot_idx: c.slot_idx,
-                    },
-                );
             }
         }
     }

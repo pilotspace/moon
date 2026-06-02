@@ -583,7 +583,14 @@ impl super::Shard {
         let spill_file_id: std::rc::Rc<std::cell::Cell<u64>> =
             std::rc::Rc::new(std::cell::Cell::new(1));
         let mut next_file_id: u64 = 1;
-        let disk_offload_dir: Option<std::path::PathBuf> = disk_offload_base.clone();
+        // Per-shard spill directory for the write-path eviction (handler_monoio).
+        // MUST match the reader's `cold_shard_dir` (main.rs / shard::mod) and the
+        // persistence-tick cascade, which both use `<offload>/shard-{id}`. Using the
+        // bare base here wrote cold files to `<offload>/data` while reads looked in
+        // `<offload>/shard-{id}/data`, so spilled values were never read back.
+        let disk_offload_dir: Option<std::path::PathBuf> = disk_offload_base
+            .clone()
+            .map(|base| base.join(format!("shard-{}", shard_id)));
 
         // Per-shard warm-segment mmap budget enforcer.
         // Owned exclusively by this event-loop task; no locking needed.

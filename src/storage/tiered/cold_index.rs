@@ -21,11 +21,18 @@ pub struct SweepStats {
 }
 
 /// Location of a cold KV entry on disk.
+///
+/// Multi-page spill files store many KV entries across several KvLeafPages.
+/// `page_idx` is the FILE-ABSOLUTE 4 KB chunk index (0-based); `slot_idx`
+/// is the slot within that page.  For the legacy single-page path, both are
+/// always 0.
 #[derive(Debug, Clone, Copy)]
 pub struct ColdLocation {
     /// Manifest file_id of the heap DataFile.
     pub file_id: u64,
-    /// Slot index within the KvLeafPage (currently single-page files).
+    /// File-absolute 4KB page index within the DataFile (0 = first page).
+    pub page_idx: u32,
+    /// Slot index within the KvLeafPage at `page_idx`.
     pub slot_idx: u16,
 }
 
@@ -263,7 +270,7 @@ impl ColdIndex {
         manifest: &crate::persistence::manifest::ShardManifest,
     ) -> Self {
         use crate::persistence::manifest::FileStatus;
-        use crate::persistence::page::PageType;
+        use crate::persistence::page::{PAGE_4K, PageType};
 
         let mut index = Self::new();
         let data_dir = shard_dir.join("data");
@@ -271,14 +278,25 @@ impl ColdIndex {
         for entry in manifest.files() {
             if entry.status == FileStatus::Active && entry.file_type == PageType::KvLeaf as u8 {
                 let heap_path = data_dir.join(format!("heap-{:06}.mpf", entry.file_id));
-                if let Ok(pages) = crate::persistence::kv_page::read_datafile(&heap_path) {
-                    for page in &pages {
+                // Read raw bytes and iterate by absolute chunk index.
+                // `read_datafile` skips overflow pages (returns only KvLeaf pages),
+                // so its enumerate index ≠ file-absolute page index in multi-page files.
+                // We must use the raw chunk index to produce a correct `page_idx`.
+                let raw = match std::fs::read(&heap_path) {
+                    Ok(b) => b,
+                    Err(_) => continue,
+                };
+                for (page_idx, chunk) in raw.chunks_exact(PAGE_4K).enumerate() {
+                    let mut buf = [0u8; PAGE_4K];
+                    buf.copy_from_slice(chunk);
+                    if let Some(page) = crate::persistence::kv_page::KvLeafPage::from_bytes(buf) {
                         for slot_idx in 0..page.slot_count() {
                             if let Some(kv) = page.get(slot_idx) {
                                 index.insert(
                                     Bytes::from(kv.key),
                                     ColdLocation {
                                         file_id: entry.file_id,
+                                        page_idx: page_idx as u32,
                                         slot_idx,
                                     },
                                 );
@@ -301,12 +319,14 @@ mod tests {
         let mut idx = ColdIndex::new();
         let loc = ColdLocation {
             file_id: 1,
+            page_idx: 0,
             slot_idx: 0,
         };
         idx.insert(Bytes::from_static(b"key1"), loc);
         assert_eq!(idx.len(), 1);
         let found = idx.lookup(b"key1").unwrap();
         assert_eq!(found.file_id, 1);
+        assert_eq!(found.page_idx, 0);
         assert_eq!(found.slot_idx, 0);
         idx.remove(b"key1");
         assert!(idx.lookup(b"key1").is_none());
