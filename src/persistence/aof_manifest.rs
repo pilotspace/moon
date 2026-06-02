@@ -39,8 +39,39 @@ use std::path::{Path, PathBuf};
 
 use tracing::{error, info, warn};
 
+use crate::persistence::fsync::fsync_directory;
+
 const MANIFEST_NAME: &str = "moon.aof.manifest";
 const AOF_DIR_NAME: &str = "appendonlydir";
+
+/// Fsync the parent directory of `path` (best-effort).
+///
+/// POSIX guarantees atomicity of `rename()` but does NOT guarantee that the
+/// directory entry update is durable after a crash. On ext4 and XFS without
+/// `data=ordered`, a crash between the rename and a directory fsync can leave
+/// the old file name visible on the next boot even though the rename completed
+/// in memory. Calling this after every manifest-visible rename closes that gap.
+///
+/// Best-effort: logs on failure but does not propagate the error. A failed
+/// dir fsync means the rename may not survive a crash — the worst case is
+/// that recovery falls back to the previous manifest state, which is still
+/// consistent (the atomic rename guarantees the file is either fully old or
+/// fully new). Call sites that CAN propagate (i.e., are in a fallible fn that
+/// returns `std::io::Result`) should call `fsync_directory(parent)?` directly.
+fn fsync_parent_best_effort(path: &Path) {
+    let parent = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => return, // root or no parent — nothing to fsync
+    };
+    if let Err(e) = fsync_directory(parent) {
+        warn!(
+            "fsync_parent_best_effort: failed to fsync dir {} after rename of {}: {}",
+            parent.display(),
+            path.display(),
+            e
+        );
+    }
+}
 
 /// On-disk layout discriminator.
 ///
@@ -202,6 +233,7 @@ impl AofManifest {
             f.sync_data()?;
         }
         std::fs::rename(&tmp_path, &base_path)?;
+        fsync_parent_best_effort(&base_path);
 
         // Create the empty incr file so the writer has a target.
         std::fs::File::create(manifest.incr_path())?;
@@ -240,6 +272,7 @@ impl AofManifest {
             f.sync_data()?;
         }
         std::fs::rename(&tmp_path, &base_path)?;
+        fsync_parent_best_effort(&base_path);
 
         // Create empty incr file so the writer has something to append to.
         std::fs::File::create(manifest.incr_path())?;
@@ -532,14 +565,40 @@ impl AofManifest {
 
     /// Delete any base/incr files in `appendonlydir/` that do not match the
     /// current sequence. Best-effort — logs but does not propagate errors.
+    ///
+    /// For `PerShard` layout, also recurses into every `shard-N/` subdirectory
+    /// and removes stale/tmp files there. Aborted BGREWRITEAOF runs leave
+    /// `.rdb.tmp` files in the shard subdirs that otherwise accumulate forever.
     fn cleanup_orphans(&self) {
-        let aof_dir = self.aof_dir();
-        let entries = match std::fs::read_dir(&aof_dir) {
+        match self.layout {
+            AofLayout::TopLevel => {
+                self.cleanup_orphans_dir(&self.aof_dir(), self.seq);
+            }
+            AofLayout::PerShard => {
+                // Top-level appendonlydir/ holds only the manifest — no data files
+                // to clean up there. All data lives in shard-N/ subdirs.
+                for shard in &self.shards {
+                    self.cleanup_orphans_shard(shard.shard_id);
+                }
+            }
+        }
+    }
+
+    /// Scan a single shard's directory for orphan base/incr/tmp files that do
+    /// not correspond to the current manifest sequence. Best-effort.
+    fn cleanup_orphans_shard(&self, shard_id: u16) {
+        self.cleanup_orphans_dir(&self.shard_dir(shard_id), self.seq);
+    }
+
+    /// Core orphan sweep: scan `dir` and remove any `moon.aof.*` files whose
+    /// sequence is not `keep_seq`. Skips the manifest file itself.
+    fn cleanup_orphans_dir(&self, dir: &Path, keep_seq: u64) {
+        let entries = match std::fs::read_dir(dir) {
             Ok(e) => e,
             Err(_) => return,
         };
-        let current_base = format!("moon.aof.{}.base.rdb", self.seq);
-        let current_incr = format!("moon.aof.{}.incr.aof", self.seq);
+        let current_base = format!("moon.aof.{}.base.rdb", keep_seq);
+        let current_incr = format!("moon.aof.{}.incr.aof", keep_seq);
         for entry in entries.flatten() {
             let name = entry.file_name();
             let name_str = match name.to_str() {
@@ -603,6 +662,7 @@ impl AofManifest {
         f.write_all(content.as_bytes())?;
         f.sync_data()?;
         std::fs::rename(&tmp_path, &manifest_path)?;
+        fsync_parent_best_effort(&manifest_path);
         Ok(())
     }
 
@@ -754,11 +814,30 @@ impl AofManifest {
         }
         std::fs::create_dir_all(&new_dir)?;
 
-        // Move base. If this fails, no on-disk mutation happened yet — bail
-        // without rollback. Layout stays TopLevel until commit at the bottom.
+        // Move base. If the rename itself fails, no on-disk mutation has
+        // happened yet — bail without rollback. Layout stays TopLevel until
+        // commit at the bottom.
         std::fs::rename(&old_base, &new_base)?;
 
-        // Base is now in shard-0/. Any subsequent error must restore it.
+        // Fsync the target directory so the base rename is durable before we
+        // proceed. A crash after rename but before dir-fsync could leave the
+        // old filename visible on the next boot.
+        //
+        // NOTE: if this fsync fails, old_base has already moved to new_base —
+        // rollback the rename before returning so the manifest stays consistent.
+        if let Err(e) = fsync_directory(&new_dir) {
+            if let Err(re) = std::fs::rename(&new_base, &old_base) {
+                error!(
+                    "Migration rollback: failed to restore base {} → {} after fsync_directory failure: {}",
+                    new_base.display(),
+                    old_base.display(),
+                    re
+                );
+            }
+            return Err(e);
+        }
+
+        // Base is now durably in shard-0/. Any subsequent error must restore it.
         let moved_incr: bool;
         let created_incr: bool;
         if old_incr.exists() {
@@ -766,6 +845,27 @@ impl AofManifest {
                 if let Err(re) = std::fs::rename(&new_base, &old_base) {
                     error!(
                         "Migration rollback: failed to restore base {} → {}: {}",
+                        new_base.display(),
+                        old_base.display(),
+                        re
+                    );
+                }
+                return Err(e);
+            }
+            // Fsync the shard directory to make the incr rename durable.
+            // If this fails, roll back both incr and base renames.
+            if let Err(e) = fsync_directory(&new_dir) {
+                if let Err(re) = std::fs::rename(&new_incr, &old_incr) {
+                    error!(
+                        "Migration rollback: failed to restore incr {} → {} after fsync_directory failure: {}",
+                        new_incr.display(),
+                        old_incr.display(),
+                        re
+                    );
+                }
+                if let Err(re) = std::fs::rename(&new_base, &old_base) {
+                    error!(
+                        "Migration rollback: failed to restore base {} → {} after fsync_directory failure: {}",
                         new_base.display(),
                         old_base.display(),
                         re
@@ -846,6 +946,16 @@ impl AofManifest {
     /// RDB and an empty incr file. Mirrors `initialize()` semantics: the
     /// `(base + incr)` invariant holds from the first boot, so recovery can
     /// replay incr-only state without complaint.
+    ///
+    /// **Idempotency pre-flight:** if `appendonlydir/moon.aof.manifest` already
+    /// exists, returns `Err(AlreadyExists)` without modifying any files. A
+    /// mid-loop crash followed by a retry would otherwise overwrite the already-
+    /// written shard-0 base RDB with an empty RDB, losing state. Callers that
+    /// want resume-or-skip semantics should use [`Self::try_initialize_multi`].
+    ///
+    /// **Rollback on partial failure:** if the per-shard loop fails mid-way (e.g.
+    /// shard-1 write fails after shard-0 succeeded), all already-created shard
+    /// base RDB files are deleted before returning the error.
     pub fn initialize_multi(dir: &Path, num_shards: u16) -> std::io::Result<Self> {
         if num_shards == 0 {
             return Err(std::io::Error::new(
@@ -866,29 +976,80 @@ impl AofManifest {
         };
         std::fs::create_dir_all(manifest.aof_dir())?;
 
+        // Pre-flight: refuse if manifest already exists to avoid overwriting
+        // already-written shard base RDB files (idempotency guard).
+        let manifest_path = manifest.manifest_path();
+        if manifest_path.exists() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!(
+                    "initialize_multi: manifest already exists at {}; \
+                     use try_initialize_multi() for idempotent initialization",
+                    manifest_path.display()
+                ),
+            ));
+        }
+
         // Per-shard empty RDB. Single Database::default() inside a 1-element
         // slice matches `initialize()`'s empty-RDB shape for each shard.
         let empty_dbs: [crate::storage::Database; 0] = [];
         let empty_rdb = crate::persistence::rdb::save_to_bytes(&empty_dbs)
             .map_err(|e| std::io::Error::other(format!("empty RDB serialize: {e}")))?;
 
-        for shard_id in 0..num_shards {
-            let shard_dir = manifest.shard_dir(shard_id);
-            std::fs::create_dir_all(&shard_dir)?;
+        // Track which shard directories were successfully created so we can
+        // roll them back on partial failure.
+        let mut created_shards: Vec<u16> = Vec::with_capacity(num_shards as usize);
 
-            let base_path = manifest.shard_base_path(shard_id);
-            let tmp_path = base_path.with_extension("rdb.tmp");
-            {
-                let mut f = std::fs::File::create(&tmp_path)?;
-                f.write_all(&empty_rdb)?;
-                f.sync_data()?;
+        let loop_result = (|| -> std::io::Result<()> {
+            for shard_id in 0..num_shards {
+                let shard_dir = manifest.shard_dir(shard_id);
+                std::fs::create_dir_all(&shard_dir)?;
+
+                let base_path = manifest.shard_base_path(shard_id);
+                let tmp_path = base_path.with_extension("rdb.tmp");
+                {
+                    let mut f = std::fs::File::create(&tmp_path)?;
+                    f.write_all(&empty_rdb)?;
+                    f.sync_data()?;
+                }
+                std::fs::rename(&tmp_path, &base_path)?;
+                fsync_parent_best_effort(&base_path);
+                std::fs::File::create(manifest.shard_incr_path(shard_id))?;
+                created_shards.push(shard_id);
             }
-            std::fs::rename(&tmp_path, &base_path)?;
-            std::fs::File::create(manifest.shard_incr_path(shard_id))?;
+            Ok(())
+        })();
+
+        if let Err(e) = loop_result {
+            // Rollback: remove base RDB files for all successfully-created shards.
+            for sid in created_shards {
+                let base = manifest.shard_base_path(sid);
+                if let Err(re) = std::fs::remove_file(&base) {
+                    warn!(
+                        "initialize_multi rollback: failed to remove {}: {}",
+                        base.display(),
+                        re
+                    );
+                }
+            }
+            return Err(e);
         }
 
         manifest.write_manifest()?;
         Ok(manifest)
+    }
+
+    /// Initialize a v2 multi-shard manifest only if one does not already exist.
+    ///
+    /// Returns `Ok(Some(manifest))` on successful creation, or `Ok(None)` if the
+    /// manifest file already existed (already initialized — no files modified).
+    /// Returns `Err(_)` only on actual I/O failures.
+    pub fn try_initialize_multi(dir: &Path, num_shards: u16) -> std::io::Result<Option<Self>> {
+        match Self::initialize_multi(dir, num_shards) {
+            Ok(m) => Ok(Some(m)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 
     /// Advance to the next sequence: write new base RDB, create new incr file,
@@ -932,6 +1093,7 @@ impl AofManifest {
                 detail: format!("rename base: {}", e),
             }
         })?;
+        fsync_parent_best_effort(&new_base);
 
         // 2. Create empty new incremental file
         let new_incr = self.incr_path_seq(new_seq);
@@ -964,6 +1126,127 @@ impl AofManifest {
 
         info!(
             "AOF advanced to seq {}: base={} bytes, incr={}",
+            new_seq,
+            rdb_bytes.len(),
+            new_incr.display()
+        );
+
+        Ok(new_incr)
+    }
+
+    /// Advance a single shard to a new sequence: write the shard's new base RDB,
+    /// create a new empty incr file, delete old shard files, then update the
+    /// shard's `max_lsn` in the in-memory manifest.
+    ///
+    /// **Caller MUST call `write_manifest()` after all shards have been advanced**
+    /// to persist the updated manifest atomically. Advancing shards one at a time
+    /// and writing the manifest per-shard would leave the manifest in an
+    /// inconsistent state between calls.
+    ///
+    /// For `TopLevel` layout, `shard_id` must be 0 and this delegates to
+    /// `advance()`. For `PerShard` layout, files are written to
+    /// `shard_dir(shard_id)/`.
+    ///
+    /// Returns the path to the new incremental file for this shard.
+    pub fn advance_shard(
+        &mut self,
+        shard_id: u16,
+        new_seq: u64,
+        rdb_bytes: &[u8],
+    ) -> Result<PathBuf, crate::error::MoonError> {
+        if self.layout == AofLayout::TopLevel {
+            debug_assert_eq!(shard_id, 0, "TopLevel layout only has shard 0");
+            return self.advance(rdb_bytes);
+        }
+
+        // Validate shard_id is known in this manifest.
+        let shard_idx = self
+            .shards
+            .iter()
+            .position(|s| s.shard_id == shard_id)
+            .ok_or_else(|| crate::error::AofError::RewriteFailed {
+                detail: format!(
+                    "advance_shard: shard_id {} not in manifest (shards: {})",
+                    shard_id,
+                    self.shards.len()
+                ),
+            })?;
+
+        let old_seq = self.seq;
+        let shard_dir = self.shard_dir(shard_id);
+        std::fs::create_dir_all(&shard_dir).map_err(|e| crate::error::AofError::Io {
+            path: shard_dir.clone(),
+            source: e,
+        })?;
+
+        // 1. Write new base RDB atomically: tmp + fsync + rename.
+        let new_base = self.shard_base_path_seq(shard_id, new_seq);
+        let tmp_base = new_base.with_extension("rdb.tmp");
+        {
+            let mut f =
+                std::fs::File::create(&tmp_base).map_err(|e| crate::error::AofError::Io {
+                    path: tmp_base.clone(),
+                    source: e,
+                })?;
+            f.write_all(rdb_bytes)
+                .map_err(|e| crate::error::AofError::Io {
+                    path: tmp_base.clone(),
+                    source: e,
+                })?;
+            f.sync_data().map_err(|e| crate::error::AofError::Io {
+                path: tmp_base.clone(),
+                source: e,
+            })?;
+        }
+        std::fs::rename(&tmp_base, &new_base).map_err(|e| {
+            crate::error::AofError::RewriteFailed {
+                detail: format!(
+                    "advance_shard {}: rename base {}: {}",
+                    shard_id,
+                    tmp_base.display(),
+                    e
+                ),
+            }
+        })?;
+        fsync_parent_best_effort(&new_base);
+
+        // 2. Create empty new incremental file.
+        let new_incr = self.shard_incr_path_seq(shard_id, new_seq);
+        std::fs::File::create(&new_incr).map_err(|e| crate::error::AofError::Io {
+            path: new_incr.clone(),
+            source: e,
+        })?;
+
+        // 3. Delete old shard files (best-effort).
+        let old_base = self.shard_base_path_seq(shard_id, old_seq);
+        let old_incr = self.shard_incr_path_seq(shard_id, old_seq);
+        if old_base.exists() {
+            if let Err(e) = std::fs::remove_file(&old_base) {
+                warn!(
+                    "advance_shard {}: failed to delete old base {}: {}",
+                    shard_id,
+                    old_base.display(),
+                    e
+                );
+            }
+        }
+        if old_incr.exists() {
+            if let Err(e) = std::fs::remove_file(&old_incr) {
+                warn!(
+                    "advance_shard {}: failed to delete old incr {}: {}",
+                    shard_id,
+                    old_incr.display(),
+                    e
+                );
+            }
+        }
+
+        // 4. Update per-shard LSN in-memory (manifest write is the caller's job).
+        self.shards[shard_idx].max_lsn = self.shards[shard_idx].max_lsn.max(new_seq);
+
+        info!(
+            "AOF shard {} advanced to seq {}: base={} bytes, incr={}",
+            shard_id,
             new_seq,
             rdb_bytes.len(),
             new_incr.display()
@@ -2146,5 +2429,243 @@ mod tests_v2 {
             }
             _ => panic!("expected Append"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // FIX-W2-1: cleanup_orphans must recurse into shard-N/ subdirectories
+    // -----------------------------------------------------------------------
+
+    /// Build a minimal PerShard manifest fixture on disk at `seq` without
+    /// needing `advance_shard`. Directly creates the expected directory layout
+    /// so the test is self-contained and doesn't depend on FIX-W2-3 methods.
+    fn write_per_shard_manifest_at_seq(dir: &Path, num_shards: u16, seq: u64) -> AofManifest {
+        let aof_dir = dir.join(AOF_DIR_NAME);
+        fs::create_dir_all(&aof_dir).unwrap();
+        let empty_rdb = crate::persistence::rdb::save_to_bytes(
+            &[] as &[crate::storage::Database],
+        )
+        .expect("empty rdb");
+        let shards: Vec<ShardManifest> = (0..num_shards)
+            .map(|id| ShardManifest { shard_id: id, max_lsn: 0 })
+            .collect();
+        let manifest = AofManifest {
+            dir: dir.to_path_buf(),
+            seq,
+            layout: AofLayout::PerShard,
+            shards,
+        };
+        for shard_id in 0..num_shards {
+            let shard_dir = manifest.shard_dir(shard_id);
+            fs::create_dir_all(&shard_dir).unwrap();
+            let base = manifest.shard_base_path(shard_id);
+            let tmp = base.with_extension("rdb.tmp");
+            fs::write(&tmp, &empty_rdb).unwrap();
+            fs::rename(&tmp, &base).unwrap();
+            fs::write(manifest.shard_incr_path(shard_id), b"").unwrap();
+        }
+        manifest.write_manifest().unwrap();
+        manifest
+    }
+
+    #[test]
+    fn cleanup_orphans_removes_stale_files_in_shard_subdirs() {
+        let dir = temp_dir();
+
+        // Build a 2-shard PerShard manifest at seq=2.
+        let manifest = write_per_shard_manifest_at_seq(&dir, 2, 2);
+
+        // Inject orphan files in shard-0/ that a crashed BGREWRITEAOF would leave.
+        // seq=1 tmp (aborted write) and a seq=5 incr (future zombie).
+        let shard0_dir = manifest.shard_dir(0);
+        let orphan_tmp = shard0_dir.join("moon.aof.1.base.rdb.tmp");
+        let orphan_old_incr = shard0_dir.join("moon.aof.5.incr.aof");
+        fs::write(&orphan_tmp, b"").expect("write orphan tmp");
+        fs::write(&orphan_old_incr, b"").expect("write orphan incr");
+
+        // Active files for seq=2 must survive.
+        let active_base = manifest.shard_base_path(0);
+        let active_incr = manifest.shard_incr_path(0);
+        assert!(active_base.exists(), "active base must exist before cleanup");
+        assert!(active_incr.exists(), "active incr must exist before cleanup");
+
+        // Reload the manifest — this triggers cleanup_orphans.
+        let _reloaded = AofManifest::load(&dir).expect("load").expect("present");
+
+        assert!(
+            !orphan_tmp.exists(),
+            "orphan .rdb.tmp in shard-0/ must be deleted by cleanup_orphans"
+        );
+        assert!(
+            !orphan_old_incr.exists(),
+            "orphan old incr in shard-0/ must be deleted by cleanup_orphans"
+        );
+        assert!(active_base.exists(), "active seq=2 base must survive cleanup");
+        assert!(active_incr.exists(), "active seq=2 incr must survive cleanup");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    // -----------------------------------------------------------------------
+    // FIX-W2-2: initialize_multi idempotency — second call returns error
+    // -----------------------------------------------------------------------
+    #[test]
+    fn initialize_multi_second_call_returns_already_initialized_error() {
+        let dir = temp_dir();
+
+        // First call must succeed.
+        let _m = AofManifest::initialize_multi(&dir, 4).expect("first call ok");
+
+        // Count files before second call.
+        let aof_dir = dir.join(AOF_DIR_NAME);
+        let count_before: usize = (0..4u16)
+            .map(|sid| {
+                let shard_dir = aof_dir.join(format!("shard-{}", sid));
+                fs::read_dir(&shard_dir).map(|e| e.count()).unwrap_or(0)
+            })
+            .sum();
+
+        // Second call must return an error with the manifest already present.
+        let result = AofManifest::initialize_multi(&dir, 4);
+        assert!(
+            result.is_err(),
+            "second initialize_multi must fail when manifest already exists"
+        );
+        let err = result.unwrap_err();
+        assert_eq!(
+            err.kind(),
+            std::io::ErrorKind::AlreadyExists,
+            "error kind must be AlreadyExists; got {:?}: {}",
+            err.kind(),
+            err
+        );
+
+        // File count must be unchanged — no files were overwritten.
+        let count_after: usize = (0..4u16)
+            .map(|sid| {
+                let shard_dir = aof_dir.join(format!("shard-{}", sid));
+                fs::read_dir(&shard_dir).map(|e| e.count()).unwrap_or(0)
+            })
+            .sum();
+        assert_eq!(
+            count_before,
+            count_after,
+            "second call must not create or overwrite any shard files"
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    // -----------------------------------------------------------------------
+    // FIX-W2-3 (partial): advance_shard writes new base+incr, deletes old
+    // -----------------------------------------------------------------------
+    #[test]
+    fn advance_shard_writes_new_seq_and_deletes_old() {
+        let dir = temp_dir();
+
+        // Initialize 2-shard manifest at seq=1.
+        let mut manifest =
+            AofManifest::initialize_multi(&dir, 2).expect("initialize_multi");
+        assert_eq!(manifest.seq, 1);
+
+        let empty_rdb = crate::persistence::rdb::save_to_bytes(
+            &[] as &[crate::storage::Database],
+        )
+        .expect("empty rdb");
+
+        // Old shard-0 files at seq=1 must exist before advance.
+        let old_base_s0 = manifest.shard_base_path(0);
+        let old_incr_s0 = manifest.shard_incr_path(0);
+        assert!(old_base_s0.exists(), "seq=1 base must exist for shard 0");
+        assert!(old_incr_s0.exists(), "seq=1 incr must exist for shard 0");
+
+        // Advance shard-0 to seq=2.
+        let new_incr = manifest
+            .advance_shard(0, 2, &empty_rdb)
+            .expect("advance_shard 0 → seq=2");
+        assert!(new_incr.exists(), "new incr file must be created");
+        assert!(
+            manifest.shard_base_path_seq(0, 2).exists(),
+            "new seq=2 base must exist for shard 0"
+        );
+        assert!(
+            !old_base_s0.exists(),
+            "old seq=1 base must be deleted for shard 0"
+        );
+        assert!(
+            !old_incr_s0.exists(),
+            "old seq=1 incr must be deleted for shard 0"
+        );
+
+        // Shard-1 must be unaffected.
+        assert!(
+            manifest.shard_base_path(1).exists(),
+            "shard-1 seq=1 base must survive advance of shard-0"
+        );
+
+        // Caller must write_manifest after all shards advanced.
+        manifest.seq = 2;
+        manifest.write_manifest().expect("write manifest after advance");
+        let reloaded = AofManifest::load(&dir).expect("load").expect("present");
+        assert_eq!(reloaded.seq, 2);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    // -----------------------------------------------------------------------
+    // FIX-W2-7: smoke test — fsync helper consolidation did not break
+    // initialize_multi. Checks that the post-consolidation manifest has the
+    // correct PerShard layout, the expected shard count, and per-shard
+    // base/incr files. This is discriminating: a regression that produces a
+    // TopLevel manifest or wrong shard count will be caught here.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn initialize_multi_smoke_after_fsync_consolidation() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path();
+        let n: u16 = 2;
+        let result = AofManifest::initialize_multi(dir, n);
+        assert!(
+            result.is_ok(),
+            "initialize_multi({n} shards) must succeed: {:?}",
+            result.err()
+        );
+        let manifest = result.unwrap();
+
+        // Discriminating: layout must be PerShard, not TopLevel.
+        assert_eq!(
+            manifest.layout,
+            AofLayout::PerShard,
+            "initialize_multi must produce a PerShard manifest"
+        );
+        // Discriminating: shard count must match the requested count.
+        assert_eq!(
+            manifest.shards.len() as u16,
+            n,
+            "manifest must record exactly {n} shards, got {}",
+            manifest.shards.len()
+        );
+        // Discriminating: per-shard base RDB and incr files must exist on disk.
+        for shard_id in 0..n {
+            assert!(
+                manifest.shard_base_path(shard_id).exists(),
+                "shard-{shard_id} base RDB must exist at {}",
+                manifest.shard_base_path(shard_id).display()
+            );
+            assert!(
+                manifest.shard_incr_path(shard_id).exists(),
+                "shard-{shard_id} incr file must exist at {}",
+                manifest.shard_incr_path(shard_id).display()
+            );
+        }
+        // Discriminating: the on-disk manifest file must contain `version 2`
+        // (PerShard v2 header), not be a bare v1 file.
+        let manifest_path = dir.join(AOF_DIR_NAME).join("moon.aof.manifest");
+        let content = std::fs::read_to_string(&manifest_path)
+            .expect("manifest file must be readable");
+        assert!(
+            content.contains("version 2"),
+            "manifest file must contain 'version 2' (PerShard v2 header); got:\n{}",
+            content
+        );
     }
 }

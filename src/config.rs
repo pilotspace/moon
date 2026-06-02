@@ -102,13 +102,17 @@ pub struct ServerConfig {
     #[arg(long, default_value = "yes")]
     pub appendonly: String,
 
-    /// Acknowledge the known multi-shard AOF durability bug and start
-    /// anyway.  Verified 2026-05-26 on HEAD `6e49050`:
-    /// `--shards >= 2 + --appendonly yes` loses ~50 % of writes on SIGKILL
-    /// regardless of `--appendfsync` or `--disk-offload` settings.  Until
-    /// the v2.0 multi-shard AOF replay lands, Moon refuses this config at
-    /// startup; pass this flag to override (e.g. cache-only deployments
-    /// where the loss is acceptable).  See
+    /// [DEPRECATED — will be removed in v0.2] This flag is now a no-op.
+    ///
+    /// Historically, `--shards >= 2 + --appendonly yes` lost ~50 % of
+    /// writes on SIGKILL (verified 2026-05-26, HEAD `6e49050`). The flag
+    /// was an escape hatch to acknowledge the risk.
+    ///
+    /// As of PR #129 the per-shard AOF architecture is fully crash-safe
+    /// (CRASH-01-LITE: 200/200 SIGKILL recovery). The startup refusal gate
+    /// has been lifted. Passing this flag now only emits a `[DEPRECATED]`
+    /// warning at startup and has no other effect. Remove it from your
+    /// launch command or systemd unit. See
     /// `docs/runbooks/multi-shard-aof-rewrite.md`.
     #[arg(long, default_value_t = false)]
     pub unsafe_multishard_aof: bool,

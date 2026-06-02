@@ -723,12 +723,13 @@ pub async fn handle_connection(
                                         ))
                                     } else {
                                         // WAL must be durable BEFORE the swap (no rollback
-                                        // path for SWAPDB). Try-send first; on failure return
-                                        // an error and leave both DBs untouched.
-                                        // Drop down to the pool sender so we can still observe
-                                        // try_send's Result (the fire-and-forget
-                                        // pool.try_send_append loses the SendFailed signal we
-                                        // need to abort the swap cleanly).
+                                        // path for SWAPDB). Use try_send_append_durable so
+                                        // that the fsync policy is honoured:
+                                        //   - appendfsync=always  → await AppendSync ack
+                                        //     (rendezvous guarantees data is on disk before +OK)
+                                        //   - appendfsync=everysec/no → fire-and-forget (fast)
+                                        // On any Err the caller aborts and leaves both DBs
+                                        // untouched, preserving atomicity from the WAL's perspective.
                                         let wal_ok = if let Some(ref pool) = aof_pool {
                                             let mut a_buf = itoa::Buffer::new();
                                             let mut b_buf = itoa::Buffer::new();
@@ -747,13 +748,8 @@ pub async fn handle_connection(
                                                 );
                                             // Single-shard mode — shard_id = 0.
                                             let lsn = crate::persistence::aof::AofWriterPool::issue_append_lsn(&repl_state, 0, serialized.len());
-                                            pool.sender(0)
-                                                .try_send(
-                                                    crate::persistence::aof::AofMessage::Append {
-                                                        lsn,
-                                                        bytes: serialized,
-                                                    },
-                                                )
+                                            pool.try_send_append_durable(0, lsn, serialized)
+                                                .await
                                                 .is_ok()
                                         } else {
                                             true // persistence disabled — no durability requirement
@@ -946,11 +942,52 @@ pub async fn handle_connection(
                                 break;
                             }
 
-                            // FIX-W1-1: For appendfsync=always, the SUBSCRIBE early-flush path
-                            // sends responses before AOF (SUBSCRIBE changes connection mode and
-                            // immediately drains; the ordering fix for Always policy applies to
-                            // the MAIN batch path at the bottom of the select! arm, not here).
-                            // Flush accumulated responses first
+                            // FIX-W1-1 + FIX-W2-4: Await AOF fsync ack for prior write
+                            // commands BEFORE flushing their +OK responses. Ordering:
+                            // (a) Under appendfsync=always: WRITEFAIL replaces +OK if
+                            //     fsync fails — no +OK is ever sent for a non-durable
+                            //     write.
+                            // (b) The WRITEFAIL frame lands before the SUBSCRIBE
+                            //     response slot, not inside it (prior code flushed
+                            //     +OK first, then checked AOF, causing WRITEFAIL to
+                            //     be mistaken for the SUBSCRIBE ack by the client).
+                            //
+                            // For everysec/no policies, try_send_append_durable is
+                            // fire-and-forget (returns Ok immediately) so no latency
+                            // penalty.
+                            //
+                            // Note: aof_entries carries (resp_idx, bytes) from FIX-W1-1
+                            // — resp_idx is unused here because the all-or-nothing
+                            // failure mode discards the entire response buffer; future
+                            // per-slot patching could use it.
+                            let mut aof_write_failed = false;
+                            for (_resp_idx, bytes) in aof_entries.drain(..) {
+                                if let Some(ref pool) = aof_pool {
+                                    let lsn = crate::persistence::aof::AofWriterPool::issue_append_lsn(&repl_state, 0, bytes.len());
+                                    if let Err(_aof_err) = pool.try_send_append_durable(0, lsn, bytes).await {
+                                        aof_write_failed = true;
+                                    }
+                                }
+                                if let Some(ref counter) = change_counter {
+                                    counter.fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
+                            if aof_write_failed {
+                                // Discard buffered +OK responses — the writes are not
+                                // durable. Log at warn level so operators can correlate
+                                // with disk I/O errors.
+                                responses.clear();
+                                tracing::warn!(
+                                    "AOF fsync failed for prior write batch; returning error \
+                                     to client and closing connection"
+                                );
+                                let _ = framed.send(Frame::Error(Bytes::from_static(
+                                    crate::persistence::aof::AOF_FSYNC_ERR,
+                                ))).await;
+                                break;
+                            }
+                            // Flush accumulated +OK responses now that AOF durability
+                            // has been confirmed (or is fire-and-forget).
                             for resp in responses.drain(..) {
                                 if framed.send(resp).await.is_err() {
                                     break_outer = true;
@@ -959,17 +996,6 @@ pub async fn handle_connection(
                             }
                             if break_outer {
                                 break;
-                            }
-                            // Send AOF entries accumulated so far (SUBSCRIBE early-flush path:
-                            // responses already sent — fire-and-forget regardless of policy)
-                            for (_, bytes) in aof_entries.drain(..) {
-                                if let Some(ref pool) = aof_pool {
-                                    let lsn = crate::persistence::aof::AofWriterPool::issue_append_lsn(&repl_state, 0, bytes.len());
-                                    let _ = pool.try_send_append_durable(0, lsn, bytes).await;
-                                }
-                                if let Some(ref counter) = change_counter {
-                                    counter.fetch_add(1, Ordering::Relaxed);
-                                }
                             }
                             // Handle subscribe
                             if cmd_args.is_empty() {
@@ -1602,6 +1628,7 @@ pub async fn handle_connection(
                                         let records = store.drain_wal();
                                         (resp, records)
                                     };
+                                    let mut graph_aof_failed = false;
                                     for record in wal_records {
                                         if let Some(ref pool) = aof_pool {
                                             // Single-shard mode (shard_id = 0).
@@ -1611,13 +1638,21 @@ pub async fn handle_connection(
                                             // everysec/no.
                                             let bytes = bytes::Bytes::from(record);
                                             let lsn = crate::persistence::aof::AofWriterPool::issue_append_lsn(&repl_state, 0, bytes.len());
-                                            let _ = pool.try_send_append_durable(0, lsn, bytes).await;
+                                            if let Err(_aof_err) = pool.try_send_append_durable(0, lsn, bytes).await {
+                                                graph_aof_failed = true;
+                                            }
                                         }
                                         if let Some(ref counter) = change_counter {
                                             counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                         }
                                     }
-                                    responses.push(response);
+                                    if graph_aof_failed {
+                                        responses.push(Frame::Error(bytes::Bytes::from_static(
+                                            crate::persistence::aof::AOF_FSYNC_ERR,
+                                        )));
+                                    } else {
+                                        responses.push(response);
+                                    }
                                     continue;
                                 } else {
                                     responses.push(Frame::Error(bytes::Bytes::from_static(b"ERR graph engine not initialized")));

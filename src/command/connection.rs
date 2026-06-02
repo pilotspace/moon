@@ -187,7 +187,8 @@ pub fn info(db: &Database, _args: &[Frame]) -> Frame {
          rdb_last_save_time:{}\r\n\
          rdb_last_bgsave_status:{}\r\n\
          aof_enabled:0\r\n\
-         aof_rewrite_in_progress:0\r\n",
+         aof_rewrite_in_progress:0\r\n\
+         aof_backpressure_dropped:{}\r\n",
         if crate::command::persistence::SAVE_IN_PROGRESS.load(std::sync::atomic::Ordering::Relaxed)
         {
             1
@@ -202,6 +203,8 @@ pub fn info(db: &Database, _args: &[Frame]) -> Frame {
         } else {
             "err"
         },
+        crate::persistence::aof::AOF_BACKPRESSURE_DROPPED
+            .load(std::sync::atomic::Ordering::Relaxed),
     ));
     sections.push_str("\r\n");
 

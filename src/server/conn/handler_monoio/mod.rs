@@ -1138,7 +1138,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                 .is_err()
                             {
                                 responses.push(Frame::Error(bytes::Bytes::from_static(
-                                    b"ERR AOF fsync failed; write not durable",
+                                    aof::AOF_FSYNC_ERR,
                                 )));
                                 continue;
                             }
@@ -1218,7 +1218,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                     .is_err()
                                 {
                                     responses.push(Frame::Error(bytes::Bytes::from_static(
-                                        b"ERR AOF fsync failed; write not durable",
+                                        aof::AOF_FSYNC_ERR,
                                     )));
                                     continue;
                                 }
@@ -1587,7 +1587,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                 .is_err()
                             {
                                 response = Frame::Error(bytes::Bytes::from_static(
-                                    b"ERR AOF fsync failed; write not durable",
+                                    aof::AOF_FSYNC_ERR,
                                 ));
                                 aof_failed = true;
                             }
@@ -2018,7 +2018,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                     .is_err()
                                 {
                                     let err = Frame::Error(Bytes::from_static(
-                                        b"ERR AOF fsync failed; write not durable",
+                                        aof::AOF_FSYNC_ERR,
                                     ));
                                     let err = apply_resp3_conversion(
                                         &cmd_name,
