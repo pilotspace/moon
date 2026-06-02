@@ -872,20 +872,19 @@ pub async fn handle_connection(
                                 break;
                             }
 
-                            // Flush accumulated responses first
-                            for resp in responses.drain(..) {
-                                if framed.send(resp).await.is_err() {
-                                    break_outer = true;
-                                    break;
-                                }
-                            }
-                            if break_outer {
-                                break;
-                            }
-                            // Send AOF entries accumulated so far.
-                            // Under appendfsync=always the response is NOT yet sent to the
-                            // client here — the subscribe response is built below. If the
-                            // AOF fsync fails we can still return WRITEFAIL instead of +OK.
+                            // Await AOF fsync ack for prior write commands BEFORE
+                            // flushing their +OK responses. This ordering ensures:
+                            // (a) Under appendfsync=always: WRITEFAIL replaces +OK if
+                            //     fsync fails — no +OK is ever sent for a non-durable
+                            //     write.
+                            // (b) The WRITEFAIL frame lands before the SUBSCRIBE
+                            //     response slot, not inside it (the prior code flushed
+                            //     +OK first, then checked AOF, causing WRITEFAIL to
+                            //     be mistaken for the SUBSCRIBE ack by the client).
+                            //
+                            // For everysec/no policies, try_send_append_durable is
+                            // fire-and-forget (returns Ok immediately) so there is no
+                            // latency penalty.
                             let mut aof_write_failed = false;
                             for bytes in aof_entries.drain(..) {
                                 if let Some(ref pool) = aof_pool {
@@ -904,9 +903,28 @@ pub async fn handle_connection(
                                 }
                             }
                             if aof_write_failed {
+                                // Discard buffered +OK responses — the writes are not
+                                // durable. Log at warn level so operators can correlate
+                                // with disk I/O errors.
+                                responses.clear();
+                                tracing::warn!(
+                                    "AOF fsync failed for prior write batch; returning error \
+                                     to client and closing connection"
+                                );
                                 let _ = framed.send(Frame::Error(Bytes::from_static(
-                                    b"WRITEFAIL aof fsync failed",
+                                    crate::persistence::aof::AOF_FSYNC_ERR,
                                 ))).await;
+                                break;
+                            }
+                            // Flush accumulated +OK responses now that AOF durability
+                            // has been confirmed (or is fire-and-forget).
+                            for resp in responses.drain(..) {
+                                if framed.send(resp).await.is_err() {
+                                    break_outer = true;
+                                    break;
+                                }
+                            }
+                            if break_outer {
                                 break;
                             }
                             // Handle subscribe
@@ -1553,7 +1571,7 @@ pub async fn handle_connection(
                                     }
                                     if graph_aof_failed {
                                         responses.push(Frame::Error(bytes::Bytes::from_static(
-                                            b"WRITEFAIL aof fsync failed",
+                                            crate::persistence::aof::AOF_FSYNC_ERR,
                                         )));
                                     } else {
                                         responses.push(response);

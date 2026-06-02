@@ -33,6 +33,18 @@ use crate::storage::entry::{Entry, current_time_ms};
 /// Type alias for the per-database RwLock container.
 type SharedDatabases = Arc<Vec<parking_lot::RwLock<Database>>>;
 
+/// Canonical AOF fsync failure error string sent to the client as a
+/// `Frame::Error` when `appendfsync=always` and the writer task does not
+/// confirm durability before the response.
+///
+/// All handler variants (handler_single, handler_monoio, handler_sharded)
+/// MUST use this constant so operators see a consistent error regardless of
+/// which connection path handles the request.
+///
+/// Redis convention: errors begin with a single-word code (`ERR` for generic
+/// failures) followed by a space and a human-readable message.
+pub const AOF_FSYNC_ERR: &[u8] = b"ERR AOF fsync failed; write not durable";
+
 /// High bit of the per-entry LSN reserved for `OrderedAcrossShards`
 /// (RFC § 2 Rule 2). When set on a per-shard AOF entry, recovery treats
 /// the entry as participating in a cross-shard atomic operation and
