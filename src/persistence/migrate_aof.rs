@@ -541,6 +541,93 @@ mod tests {
     use super::*;
     use bytes::BytesMut;
 
+    /// Helper: serialize a RESP array command.
+    fn cmd_resp(parts: &[&str]) -> Vec<u8> {
+        let mut buf = BytesMut::new();
+        let frames: Vec<Frame> = parts
+            .iter()
+            .map(|s| Frame::BulkString(Bytes::copy_from_slice(s.as_bytes())))
+            .collect();
+        let frame = Frame::Array(frames.into());
+        crate::protocol::serialize::serialize(&frame, &mut buf);
+        buf.to_vec()
+    }
+
+    // ── FIX-W3-2 red tests ──────────────────────────────────────────────────
+
+    /// SELECT N (N>0) in a RESP tail must cause migrate_aof to return Err
+    /// with a message mentioning "multi-DB". On current HEAD this test FAILS
+    /// because SELECT is silently dropped (skipped) and Ok is returned.
+    #[test]
+    fn migrate_aof_select_nonzero_db_returns_err() {
+        let src_dir = tempfile::tempdir().unwrap();
+        let dst_dir = tempfile::tempdir().unwrap();
+
+        // Build a RESP tail: SET a value, SELECT 1, SET b value.
+        let mut aof_data: Vec<u8> = Vec::new();
+        aof_data.extend(cmd_resp(&["SET", "a", "v"]));
+        aof_data.extend(cmd_resp(&["SELECT", "1"]));
+        aof_data.extend(cmd_resp(&["SET", "b", "v"]));
+        std::fs::write(src_dir.path().join("appendonly.aof"), &aof_data)
+            .expect("write source aof");
+
+        let result = migrate_aof(src_dir.path(), dst_dir.path(), 2);
+        assert!(
+            result.is_err(),
+            "migrate_aof must refuse when RESP tail contains SELECT N (N>0)"
+        );
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("multi-DB") || msg.contains("SELECT"),
+            "error message must mention multi-DB or SELECT, got: {msg}"
+        );
+    }
+
+    /// migrate_aof(same_dir, same_dir, n) must return Err with a guard message.
+    /// Without a guard, this may succeed (incidentally error on manifest load)
+    /// but would not carry a meaningful "same directory" message.
+    #[test]
+    fn migrate_aof_same_dir_returns_err() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("appendonly.aof"), b"").unwrap();
+
+        let result = migrate_aof(dir.path(), dir.path(), 2);
+        assert!(
+            result.is_err(),
+            "migrate_aof must refuse when from_dir == to_dir"
+        );
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("same") || msg.contains("from_dir") || msg.contains("to_dir"),
+            "error must identify the same-directory problem, got: {msg}"
+        );
+    }
+
+    /// migrate_aof into a to_dir that already contains a PerShard manifest
+    /// must return Err. Without the guard, initialize_multi may partially
+    /// overwrite or the run silently proceeds.
+    #[test]
+    fn migrate_aof_existing_manifest_returns_err() {
+        let src_dir = tempfile::tempdir().unwrap();
+        let dst_dir = tempfile::tempdir().unwrap();
+        std::fs::write(src_dir.path().join("appendonly.aof"), b"").unwrap();
+
+        // Pre-populate to_dir with a PerShard manifest.
+        AofManifest::initialize_multi(dst_dir.path(), 2)
+            .expect("first initialize_multi succeeds");
+
+        let result = migrate_aof(src_dir.path(), dst_dir.path(), 2);
+        assert!(
+            result.is_err(),
+            "migrate_aof must refuse when to_dir already contains AOF data"
+        );
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("already") || msg.contains("exist") || msg.contains("non-empty"),
+            "error must identify the pre-existing data problem, got: {msg}"
+        );
+    }
+
     /// Helper: serialize a SET command to RESP.
     fn set_resp(key: &str, val: &str) -> Vec<u8> {
         let mut buf = BytesMut::new();
