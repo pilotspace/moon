@@ -1533,6 +1533,12 @@ pub async fn per_shard_aof_writer_task(
 
         let mut last_fsync = Instant::now();
         let mut write_error = false;
+        // Test-only fault injection: if MOON_TEST_AOF_FSYNC_FAIL=1 is set in
+        // the environment at writer task startup, every AppendSync ack resolves
+        // as FsyncFailed instead of Synced. Read once before the loop so there
+        // is zero cost in production deployments where the var is absent.
+        let fail_fsync_for_test =
+            std::env::var("MOON_TEST_AOF_FSYNC_FAIL").as_deref() == Ok("1");
 
         loop {
             match rx.recv() {
@@ -1561,6 +1567,12 @@ pub async fn per_shard_aof_writer_task(
                         );
                         write_error = true;
                         let _ = ack.send(AofAck::WriteFailed);
+                        continue;
+                    }
+                    // Test-only: skip real fsync and return FsyncFailed
+                    // immediately when the fault-injection env var is set.
+                    if fail_fsync_for_test {
+                        let _ = ack.send(AofAck::FsyncFailed);
                         continue;
                     }
                     let t = Instant::now();

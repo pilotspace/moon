@@ -353,16 +353,40 @@ fn main() -> anyhow::Result<()> {
     } else {
         None
     };
-    // Shard-count mismatch guard. The TopLevel + multi-shard combination is
-    // intentionally excluded here: a v1 TopLevel manifest always has shards=1
-    // in its record, but when restarted with --shards >= 2 the correct
-    // response is the actionable migration refusal at the AOF recovery block
-    // below (line ~767), NOT the generic "shard count changed" message from
-    // verify_shard_count. Letting verify_shard_count fire first would hide
-    // that specific refusal behind a less actionable error, making it
-    // unreachable dead code.
+    // TopLevel + multi-shard refusal — hoisted here so it fires on both
+    // runtime-monoio and runtime-tokio. The TopLevel manifest (v1, shards=1)
+    // combined with --shards >= 2 silently loses data for shards 1..N because
+    // the single shared AOF replays everything into shard 0 while shards 1..N
+    // start empty. This check fires unconditionally on both runtimes; the
+    // duplicate check inside the runtime-monoio recovery block (further below)
+    // is now dead code but harmless — it guards operator data against future
+    // code paths that bypass this early exit.
     if let Some(ref m) = existing_manifest
-        && !(m.layout == AofLayout::TopLevel && num_shards >= 2)
+        && m.layout == AofLayout::TopLevel
+        && num_shards >= 2
+    {
+        let aof_base = std::path::Path::new(&config.dir).join("appendonlydir");
+        let manifest_path = aof_base.join("moon.aof.manifest");
+        let num_shards_minus_one = num_shards - 1;
+        eprintln!(
+            "REFUSING TO START: legacy TopLevel AOF manifest at {manifest_path} \
+             detected with --shards {num_shards} (>= 2). \
+             This combination silently loses data for shards 1..={num_shards_minus_one}. \
+             To migrate: stop the server, remove {aof_dir}, then restart with \
+             --shards {num_shards} --appendonly yes (Moon creates a fresh per-shard \
+             manifest; load prior state from dump.rdb first if needed). \
+             See docs/runbooks/multi-shard-aof-rewrite.md for full migration instructions.",
+            manifest_path = manifest_path.display(),
+            num_shards = num_shards,
+            num_shards_minus_one = num_shards_minus_one,
+            aof_dir = aof_base.display(),
+        );
+        std::process::exit(2);
+    }
+    // Shard-count mismatch guard for non-TopLevel manifests (PerShard layout
+    // with a different shard count than currently configured). A v1 TopLevel
+    // manifest always records shards=1; that case is already handled above.
+    if let Some(ref m) = existing_manifest
         && let Err(e) = m.verify_shard_count(num_shards as u16)
     {
         eprintln!("REFUSING TO START: {e}");
