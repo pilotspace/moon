@@ -298,6 +298,18 @@ pub struct ShardManifest {
     /// after the commit flip — we record the pre-commit value so age = current - tombstone_epoch).
     /// `tombstoned_at` is a monotonic `Instant` for wall-clock retention.
     tombstone_registry: HashMap<u64, (u64, Instant)>,
+    /// Set when `compact()` rewrote+renamed the manifest durably but then failed
+    /// to reopen `self.file` against the new inode. The old handle now refers to
+    /// the pre-rename (orphaned) inode, so writing through it would silently
+    /// discard every subsequent commit. While set, `commit()` reattaches to
+    /// `self.path` BEFORE writing (or fails loudly if that reopen also fails).
+    needs_reopen: bool,
+    /// Test-only fault injection: when true, `compact()` simulates the
+    /// "rename succeeded, reopen failed" race by pointing `self.file` at a
+    /// throwaway inode and returning an error, exercising the `needs_reopen`
+    /// recovery path without needing real fd/permission failures.
+    #[cfg(test)]
+    fail_compact_reopen: bool,
 }
 
 impl ShardManifest {
@@ -342,6 +354,9 @@ impl ShardManifest {
             active_root: root,
             active_slot: 0,
             tombstone_registry: HashMap::new(),
+            needs_reopen: false,
+            #[cfg(test)]
+            fail_compact_reopen: false,
         })
     }
 
@@ -410,6 +425,9 @@ impl ShardManifest {
             active_root,
             active_slot,
             tombstone_registry,
+            needs_reopen: false,
+            #[cfg(test)]
+            fail_compact_reopen: false,
         })
     }
 
@@ -420,6 +438,20 @@ impl ShardManifest {
     /// 3. `sync_data()` — this is the atomic commit point
     /// 4. Flip active_slot
     pub fn commit(&mut self) -> std::io::Result<()> {
+        // A prior compaction renamed a fresh manifest into place durably but then
+        // failed to reopen our handle, so `self.file` still points at the
+        // pre-rename (orphaned) inode. Reattach to the live file BEFORE any write;
+        // writing through the stale handle would silently discard this and every
+        // later commit. If the reopen still fails, surface the error (this commit
+        // genuinely cannot be persisted) rather than losing data silently.
+        if self.needs_reopen {
+            self.file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&self.path)?;
+            self.active_slot = 0;
+            self.needs_reopen = false;
+        }
         self.active_root.epoch += 1;
         let total = self.active_root.entries.len();
         self.active_root.file_count = total as u32;
@@ -828,12 +860,42 @@ impl ShardManifest {
         // Repoint the file handle at the freshly-rewritten manifest. Both slots
         // carry the active root at the same epoch; treat slot 0 as active so the
         // next commit writes the incremented epoch to slot 1 (the newest).
-        self.file = std::fs::OpenOptions::new()
+        //
+        // The rename above is the durability point — the compacted manifest is
+        // already safe on disk. If the reopen below fails, our `self.file` still
+        // refers to the pre-rename (orphaned) inode; do NOT keep using it (that
+        // silently discards every later commit). Mark `needs_reopen` so the next
+        // `commit()` reattaches to `self.path` first, and propagate the error.
+        #[cfg(test)]
+        if self.fail_compact_reopen {
+            // Simulate the lost-handle race: point `self.file` at a throwaway
+            // inode (the real "orphaned pre-rename fd"), mark for reopen, return.
+            let orphan = self.path.with_extension("compact.orphan.test");
+            self.file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(&orphan)?;
+            self.needs_reopen = true;
+            return Err(std::io::Error::other("simulated compact reopen failure"));
+        }
+        match std::fs::OpenOptions::new()
             .read(true)
             .write(true)
-            .open(&self.path)?;
-        self.active_slot = 0;
-        Ok(())
+            .open(&self.path)
+        {
+            Ok(f) => {
+                self.file = f;
+                self.active_slot = 0;
+                self.needs_reopen = false;
+                Ok(())
+            }
+            Err(e) => {
+                self.needs_reopen = true;
+                Err(e)
+            }
+        }
     }
 
     /// Try to parse a root page from a 4KB buffer.
@@ -1159,6 +1221,55 @@ mod tests {
         let m2 = ShardManifest::open(&path).unwrap();
         assert_eq!(m2.epoch(), 3);
         assert_eq!(m2.files().len(), 2);
+    }
+
+    // Regression (PR #136 review, BUG #1): compact() renames a fresh manifest
+    // into place durably, then reopens self.file against the new inode. If that
+    // reopen fails, the old handle refers to the pre-rename (orphaned) inode —
+    // continuing to write through it silently discards every later commit, and
+    // recovery sees only the compaction snapshot. The fix flags `needs_reopen`
+    // and makes the next commit reattach to self.path before writing.
+    #[test]
+    fn compact_reopen_failure_does_not_silently_lose_later_commits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("shard-0.manifest");
+        let mut m = ShardManifest::create(&path).unwrap();
+
+        // Seed committed state large enough to exercise inline + overflow.
+        for id in 1..=80 {
+            m.add_file(make_entry(id));
+        }
+        m.commit().unwrap();
+
+        // Simulate the race: compaction rewrote + renamed durably (data safe on
+        // disk) but then failed to reopen the handle.
+        m.fail_compact_reopen = true;
+        let err = m.compact().unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::Other);
+        assert!(
+            m.needs_reopen,
+            "compact() must flag needs_reopen when it loses the file handle"
+        );
+        m.fail_compact_reopen = false;
+
+        // The next commit MUST reattach to the real manifest first. Without the
+        // guard this write lands in the orphaned inode and is lost on recovery.
+        m.add_file(make_entry(999));
+        m.commit().unwrap();
+        assert!(
+            !m.needs_reopen,
+            "commit() must clear needs_reopen after reattaching to self.path"
+        );
+
+        // Recover from disk: the post-failure entry MUST be durable.
+        let recovered = ShardManifest::open(&path).unwrap();
+        let ids: Vec<u64> = recovered.files().iter().map(|e| e.file_id).collect();
+        assert!(
+            ids.contains(&999),
+            "an entry committed after a compact-reopen failure must survive \
+             recovery (stale-handle silent data-loss regression)"
+        );
+        assert_eq!(recovered.files().len(), 81);
     }
 
     #[test]
