@@ -190,7 +190,16 @@ pub(crate) fn run_cold_orphan_sweep(
             })
             .unwrap_or_default();
 
-        if orphan_keys.is_empty() {
+        // Skip only when there is nothing to do: no hot-shadowed orphan keys AND
+        // no zero-ref files queued for unlink. Files orphaned by re-eviction
+        // (insert overwrite) or promotion (remove) carry no hot∩cold key, so the
+        // drain must still run for them even when `orphan_keys` is empty.
+        let has_pending_unlink = guard
+            .cold_index
+            .as_ref()
+            .map(|ci| ci.has_pending_unlink())
+            .unwrap_or(false);
+        if orphan_keys.is_empty() && !has_pending_unlink {
             continue;
         }
 
