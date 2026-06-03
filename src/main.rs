@@ -690,8 +690,18 @@ fn main() -> anyhow::Result<()> {
                 config.initial_keyspace_hint,
                 config.to_runtime_config(),
             );
-            if let Some(ref dir) = persistence_dir {
-                shard.restore_from_persistence(dir, disk_offload_base.as_deref());
+            // Recover whenever there is something to recover. Disk-offload cold
+            // recovery (v3: heap reload + rebuild_from_manifest) is INDEPENDENT of
+            // AOF, but `persistence_dir` is intentionally None under appendonly=no
+            // (to avoid per-tick WAL fsync writers). Gating recovery on it alone
+            // silently dropped ALL cold data on restart under --appendonly no +
+            // disk-offload (cold read-through 0/200; "v3 recovery complete" never
+            // logged). Fire recovery when an offload base exists too; the v3 path
+            // reads the offload manifest, and the dir arg is used only by the v2
+            // fallback (a no-op when no appendonly.aof/snapshot exists).
+            if persistence_dir.is_some() || disk_offload_base.is_some() {
+                let recover_dir = persistence_dir.as_deref().unwrap_or(config.dir.as_str());
+                shard.restore_from_persistence(recover_dir, disk_offload_base.as_deref());
             }
             // Initialize cold_index + cold_shard_dir for disk offload
             if let Some(ref offload_base) = disk_offload_base {
