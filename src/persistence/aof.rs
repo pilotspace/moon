@@ -1110,6 +1110,111 @@ mod pool_tests {
         drop(_rx1);
     }
 
+    /// Parse the PerShard incr framing `[u64 lsn LE][u32 len LE][len bytes]`,
+    /// stopping at a truncated tail (the crash/torn boundary) — exactly what
+    /// `replay_incr_framed` does. Returns the cleanly-replayable prefix.
+    #[cfg(feature = "runtime-tokio")]
+    fn parse_framed(buf: &[u8]) -> Vec<(u64, Vec<u8>)> {
+        let mut out = Vec::new();
+        let mut i = 0usize;
+        while i + 12 <= buf.len() {
+            let lsn = u64::from_le_bytes(buf[i..i + 8].try_into().unwrap());
+            let len = u32::from_le_bytes(buf[i + 8..i + 12].try_into().unwrap()) as usize;
+            if i + 12 + len > buf.len() {
+                break; // truncated tail → crash boundary, stop
+            }
+            out.push((lsn, buf[i + 12..i + 12 + len].to_vec()));
+            i += 12 + len;
+        }
+        out
+    }
+
+    // Regression (PR #136 review, BUG #2): the tokio per-shard writer must carry
+    // a `write_error` latch like the single-file (~:1467) and monoio (~:2125)
+    // writers. A torn write (header lands, payload fails) must NOT be followed by
+    // more records — a lone orphaned header makes the framed replay misread the
+    // next record's bytes as the orphan's payload, corrupting everything after.
+    // The latch suppresses all writes after the tear and reports WriteFailed to
+    // AppendSync callers (so they error instead of ack'ing a corrupt write).
+    #[cfg(feature = "runtime-tokio")]
+    #[tokio::test]
+    async fn tokio_per_shard_writer_latches_after_torn_write() {
+        use crate::persistence::aof_manifest::AofManifest;
+        use std::sync::atomic::Ordering;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let base_dir = tmp.path().to_path_buf();
+        // PerShard layout, 2 shards (the per-shard pool needs >=2); drive shard 0.
+        let manifest = AofManifest::initialize_multi(&base_dir, 2).unwrap();
+        let incr = manifest.shard_incr_path(0);
+
+        // Inject: the 2nd Append tears (header written, payload "fails").
+        TEST_FAIL_WRITE_AT.store(2, Ordering::SeqCst);
+
+        let (tx, rx) = channel::mpsc_bounded::<AofMessage>(16);
+        let cancel = CancellationToken::new();
+        let writer = tokio::spawn(per_shard_aof_writer_task(
+            rx,
+            base_dir.clone(),
+            0,
+            FsyncPolicy::Always,
+            cancel.clone(),
+        ));
+
+        // 1: clean. 2: torn (header only). 3: must be suppressed by the latch.
+        tx.try_send(AofMessage::Append {
+            lsn: 1,
+            bytes: Bytes::from_static(b"AAAA"),
+        })
+        .unwrap();
+        tx.try_send(AofMessage::Append {
+            lsn: 2,
+            bytes: Bytes::from_static(b"BBBB"),
+        })
+        .unwrap();
+        tx.try_send(AofMessage::Append {
+            lsn: 3,
+            bytes: Bytes::from_static(b"CCCC"),
+        })
+        .unwrap();
+
+        // Barrier + assertion: an AppendSync after the tear MUST come back
+        // WriteFailed (latched), never Synced.
+        let (ack_tx, ack_rx) = crate::runtime::channel::oneshot::<AofAck>();
+        tx.try_send(AofMessage::AppendSync {
+            lsn: 4,
+            bytes: Bytes::from_static(b"DDDD"),
+            ack: ack_tx,
+        })
+        .unwrap();
+
+        let ack = tokio::time::timeout(std::time::Duration::from_secs(5), ack_rx)
+            .await
+            .expect("writer must answer the AppendSync within 5s")
+            .expect("ack channel must not drop");
+        assert_eq!(
+            ack,
+            AofAck::WriteFailed,
+            "after a torn write the latch must reject further writes (got {ack:?})"
+        );
+
+        cancel.cancel();
+        TEST_FAIL_WRITE_AT.store(0, Ordering::SeqCst);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), writer).await;
+
+        // On disk: exactly one replayable frame (lsn=1, "AAAA"). The orphaned
+        // lsn=2 header is a truncated tail (crash boundary); lsn 3 and 4 were
+        // never written (latch held) — no corruption.
+        let raw = std::fs::read(&incr).unwrap();
+        let frames = parse_framed(&raw);
+        assert_eq!(
+            frames,
+            vec![(1u64, b"AAAA".to_vec())],
+            "only the pre-tear record may replay; orphaned headers / suppressed \
+             records must not corrupt the stream"
+        );
+    }
+
     #[test]
     fn broadcast_shutdown_reaches_every_writer() {
         let (tx0, rx0) = channel::mpsc_bounded::<AofMessage>(2);
@@ -1744,6 +1849,15 @@ pub async fn aof_writer_task(
 ///
 /// Wait/timeout/corruption semantics for manifest loading match the existing
 /// `aof_writer_task` (60s bounded wait, hard fail on corrupt manifest).
+/// Test-only torn-write injection for `per_shard_aof_writer_task`: when set to a
+/// nonzero `N`, the `N`-th `Append` received by a tokio per-shard writer writes
+/// its header and then simulates a payload write failure, exercising the
+/// `write_error` latch. `0` disables. Atomic (not an env var) because
+/// `std::env::set_var` is `unsafe` under edition 2024. Compiled out of release.
+#[cfg(all(test, feature = "runtime-tokio"))]
+pub(crate) static TEST_FAIL_WRITE_AT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 pub async fn per_shard_aof_writer_task(
     rx: channel::MpscReceiver<AofMessage>,
     base_dir: PathBuf,
@@ -1866,6 +1980,22 @@ pub async fn per_shard_aof_writer_task(
         // hot path in production deployments where the var is absent.
         let fail_fsync_for_test = std::env::var("MOON_TEST_AOF_FSYNC_FAIL").as_deref() == Ok("1");
 
+        // Torn-write latch: once any write to this incr file fails partway
+        // (e.g. the header landed but the payload did not), we must NEVER write
+        // another record — a lone orphaned header makes the framed reader
+        // misinterpret the next record's bytes as the orphan's payload,
+        // corrupting every record after it on replay. Stay latched for the
+        // writer's lifetime; recovery replays the clean prefix and a rewrite
+        // starts a fresh file. This mirrors the single-file (line ~1467) and
+        // monoio per-shard (line ~2125) writers, which already carry the latch.
+        let mut write_error = false;
+        // Test-only fault injection (no env var: edition-2024 set_var is unsafe).
+        // When `TEST_FAIL_WRITE_AT` is the ordinal of an incoming Append, that
+        // append writes its header then simulates a payload failure, exercising
+        // the latch. Compiled out of production builds.
+        #[cfg(test)]
+        let mut test_append_ordinal: usize = 0;
+
         loop {
             tokio::select! {
                 // Bounded recv (EverySec durability): wake at least every 200ms
@@ -1886,15 +2016,45 @@ pub async fn per_shard_aof_writer_task(
                         // is written sequentially with the body — both calls land
                         // in the same BufWriter so this is one syscall under load.
                         Ok(AofMessage::Append { lsn, bytes: data }) => {
+                            // Latch: stream already torn — drop silently (Append
+                            // is fire-and-forget; no ack channel to notify).
+                            if write_error {
+                                continue;
+                            }
+                            #[cfg(test)]
+                            {
+                                test_append_ordinal += 1;
+                                let fail_at = TEST_FAIL_WRITE_AT
+                                    .load(std::sync::atomic::Ordering::Relaxed);
+                                if fail_at != 0 && fail_at == test_append_ordinal {
+                                    // Reproduce a torn write: header lands, payload
+                                    // "fails". The orphaned header is flushed so the
+                                    // on-disk effect matches the real I/O-error case.
+                                    let mut header = [0u8; 12];
+                                    header[..8].copy_from_slice(&lsn.to_le_bytes());
+                                    header[8..]
+                                        .copy_from_slice(&(data.len() as u32).to_le_bytes());
+                                    let _ = writer.write_all(&header).await;
+                                    let _ = writer.flush().await;
+                                    error!(
+                                        "AOF shard {}: injected torn write after header (test)",
+                                        shard_id
+                                    );
+                                    write_error = true;
+                                    continue;
+                                }
+                            }
                             let mut header = [0u8; 12];
                             header[..8].copy_from_slice(&lsn.to_le_bytes());
                             header[8..].copy_from_slice(&(data.len() as u32).to_le_bytes());
                             if let Err(e) = writer.write_all(&header).await {
                                 error!("AOF header write error shard {}: {}", shard_id, e);
+                                write_error = true;
                                 continue;
                             }
                             if let Err(e) = writer.write_all(&data).await {
                                 error!("AOF write error shard {}: {}", shard_id, e);
+                                write_error = true;
                                 continue;
                             }
                             if matches!(fsync, FsyncPolicy::Always) {
@@ -1904,6 +2064,13 @@ pub async fn per_shard_aof_writer_task(
                         }
                         // AppendSync (tokio + PerShard): framed write + fsync + ack.
                         Ok(AofMessage::AppendSync { lsn, bytes: data, ack }) => {
+                            // Latch: stream already torn — refuse to write more and
+                            // report failure so the caller does not hang to the F2
+                            // timeout and does not ack a write into a corrupt stream.
+                            if write_error {
+                                let _ = ack.send(AofAck::WriteFailed);
+                                continue;
+                            }
                             let mut header = [0u8; 12];
                             header[..8].copy_from_slice(&lsn.to_le_bytes());
                             header[8..].copy_from_slice(&(data.len() as u32).to_le_bytes());
@@ -1912,6 +2079,7 @@ pub async fn per_shard_aof_writer_task(
                                     "AOF AppendSync header write error shard {}: {}",
                                     shard_id, e
                                 );
+                                write_error = true;
                                 let _ = ack.send(AofAck::WriteFailed);
                                 continue;
                             }
@@ -1920,6 +2088,7 @@ pub async fn per_shard_aof_writer_task(
                                     "AOF AppendSync write error shard {}: {}",
                                     shard_id, e
                                 );
+                                write_error = true;
                                 let _ = ack.send(AofAck::WriteFailed);
                                 continue;
                             }
