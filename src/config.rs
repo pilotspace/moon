@@ -370,8 +370,15 @@ pub struct ServerConfig {
     /// the on-disk DataFile, and tombstones the manifest entry.
     ///
     /// Set to 0 to disable the sweeper entirely.
-    /// Default: 300 (5 minutes). Recommended range: 60–3600.
-    #[arg(long = "cold-orphan-sweep-interval-secs", default_value_t = 300)]
+    /// Default: 60 (1 minute). Recommended range: 60–3600.
+    ///
+    /// Lowered from 300 → 60: at 300s the sweep never fired within a typical
+    /// benchmark window, which both let cold orphans accumulate on disk for up
+    /// to 5 minutes AND masked a batch-file shared-deletion data-loss bug (fixed
+    /// by the per-file-liveness refcount in ColdIndex). 60s reclaims promptly;
+    /// the sweep's per-file unlinks run off the hot path so a shorter interval
+    /// keeps each batch small rather than churning under the shard lock.
+    #[arg(long = "cold-orphan-sweep-interval-secs", default_value_t = 60)]
     pub cold_orphan_sweep_interval_secs: u64,
 
     // ── MoonStore v2: Point-in-time recovery (PITR) ────────────────
