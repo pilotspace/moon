@@ -297,6 +297,36 @@ pub async fn run_sharded(
     affinity_tracker: Arc<parking_lot::RwLock<crate::shard::affinity::AffinityTracker>>,
 ) -> anyhow::Result<()> {
     let addr = format!("{}:{}", config.bind, config.port);
+    // Bind the central listener with SO_REUSEPORT so it COEXISTS with the
+    // per-shard SO_REUSEPORT listeners (shard/event_loop creates one per shard
+    // via the same `create_reuseport_socket` helper). A plain `TcpListener::bind`
+    // here is NOT REUSEPORT-compatible: it races the shards' REUSEPORT binds and,
+    // whenever the shards win that race, fails with EADDRINUSE — and a failure
+    // here returns Err from run_sharded, tearing down the ENTIRE server (the
+    // tokio multishard "zombie": port bound, shards parked, nothing serving).
+    // With every socket on the port set REUSEPORT, all of them coexist
+    // regardless of bind order, the kernel load-balances accepts across them,
+    // the shards accept their share directly, and this central listener accepts
+    // its share into conn_rx (also the fallback feeder for any shard that could
+    // not bind). `per_shard_accept` MUST stay false for that to hold: a
+    // bound-but-idle REUSEPORT socket black-holes the connections the kernel
+    // hashes to it at SYN time. Guarded by tests/multishard_serve_smoke.rs.
+    // On non-unix (no socket2 REUSEPORT here) fall back to the plain bind.
+    #[cfg(unix)]
+    let listener = match crate::shard::conn_accept::create_reuseport_socket(&addr) {
+        Ok(std_listener) => TcpListener::from_std(std_listener)?,
+        Err(e) => {
+            // e.g. `addr` is a hostname, not a parseable SocketAddr — keep the
+            // plain bind working (loses REUSEPORT coexistence in that case).
+            tracing::warn!(
+                "central SO_REUSEPORT bind failed ({}); falling back to plain bind on {}",
+                e,
+                addr
+            );
+            TcpListener::bind(&addr).await?
+        }
+    };
+    #[cfg(not(unix))]
     let listener = TcpListener::bind(&addr).await?;
     let num_shards = conn_txs.len();
     info!("Listening on {} ({} shards)", addr, num_shards);

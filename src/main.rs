@@ -1276,7 +1276,20 @@ fn main() -> anyhow::Result<()> {
                 info!("Cluster bus and gossip ticker started");
             }
 
-            let per_shard_accept = cfg!(target_os = "linux");
+            // The central tokio listener plain-binds the port (no SO_REUSEPORT,
+            // see listener::run_sharded), which makes EVERY per-shard SO_REUSEPORT
+            // bind fail with EADDRINUSE — both the io_uring multishot path and the
+            // non-uring per_shard_listener fall back to `conn_rx`. `conn_rx`'s only
+            // feeder is THIS central accept loop, so it MUST run. Gating it off on
+            // Linux (the old `cfg!(target_os = "linux")`) left nobody accepting: the
+            // server bound the port and kernel-accepted TCP but never dispatched a
+            // command — it hung (the "zombie eating RAM" signature). Keep the central
+            // accept loop always on for tokio: identical to the already-working macOS
+            // tokio path and to monoio's central-accept model. Per-shard SO_REUSEPORT
+            // accept on tokio/Linux additionally rides the io_uring-accept path that
+            // is known-fragile under load; central-accept + conn_rx is the proven one.
+            // Guarded by tests/multishard_serve_smoke.rs (non-ignored, both runtimes).
+            let per_shard_accept = false;
             if let Err(e) = server::listener::run_sharded(
                 config,
                 conn_txs,
