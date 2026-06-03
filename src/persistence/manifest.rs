@@ -235,6 +235,11 @@ pub const MANIFEST_FORMAT_V2: u8 = 2;
 pub const MAX_INLINE_ENTRIES: usize =
     (PAGE_4K - MOONPAGE_HEADER_SIZE - ROOT_META_SIZE) / FileEntry::SIZE;
 
+/// FileEntry records per overflow (`ManifestEntry`) page: a full 4 KB page
+/// minus the 64-byte MoonPageHeader, no per-page meta. (4096 - 64) / 56 = 72.
+/// Entries beyond `MAX_INLINE_ENTRIES` spill into append-only overflow pages.
+pub const ENTRIES_PER_OVERFLOW_PAGE: usize = (PAGE_4K - MOONPAGE_HEADER_SIZE) / FileEntry::SIZE;
+
 /// In-memory representation of one manifest root page.
 ///
 /// Fields match MOONSTORE-V2-COMPREHENSIVE-DESIGN.md §4.2.
@@ -314,7 +319,7 @@ impl ShardManifest {
             shard_uuid: [0u8; 16],
             entries: Vec::new(),
         };
-        Self::serialize_root(&root, &mut buf[..PAGE_4K]);
+        Self::serialize_root(&root, 0, &mut buf[..PAGE_4K]);
 
         // Write file
         std::fs::write(path, &buf)?;
@@ -357,8 +362,11 @@ impl ShardManifest {
             ));
         }
 
-        let root_a = Self::try_parse_root(&buf[..PAGE_4K]);
-        let root_b = Self::try_parse_root(&buf[PAGE_4K..2 * PAGE_4K]);
+        // Load each slot fully (inline root + its append-only overflow run). A
+        // slot whose overflow is torn/short/corrupt returns None so selection
+        // falls back to the other (last-good) slot — never surfacing garbage.
+        let root_a = Self::load_root(&buf, 0);
+        let root_b = Self::load_root(&buf, PAGE_4K);
 
         let (active_root, active_slot) = match (root_a, root_b) {
             (Some(a), Some(b)) => {
@@ -412,22 +420,42 @@ impl ShardManifest {
     /// 3. `sync_data()` — this is the atomic commit point
     /// 4. Flip active_slot
     pub fn commit(&mut self) -> std::io::Result<()> {
-        if self.active_root.entries.len() > MAX_INLINE_ENTRIES {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!(
-                    "too many entries for inline root page: {} > {}",
-                    self.active_root.entries.len(),
-                    MAX_INLINE_ENTRIES,
-                ),
-            ));
-        }
-
         self.active_root.epoch += 1;
-        self.active_root.file_count = self.active_root.entries.len() as u32;
+        let total = self.active_root.entries.len();
+        self.active_root.file_count = total as u32;
+
+        // Entries beyond the inline cap go into append-only overflow pages.
+        // ORDER IS THE CRASH-SAFETY INVARIANT: overflow pages are appended at
+        // EOF and `sync_data`'d BEFORE the root that references them. Because
+        // the run is appended (never overwriting the currently-active slot's
+        // older overflow), a crash before the root's atomic commit leaves the
+        // previously-committed state — its root AND its overflow run — fully
+        // intact, so `open()` falls back to it. Partial loss, never corruption.
+        let inline_count = total.min(MAX_INLINE_ENTRIES);
+        let overflow = &self.active_root.entries[inline_count..];
+        let npages = overflow.len().div_ceil(ENTRIES_PER_OVERFLOW_PAGE);
+
+        let overflow_start_page: u32 = if npages > 0 {
+            let eof = self.file.seek(SeekFrom::End(0))?;
+            // The manifest is always a whole number of 4 KB pages.
+            debug_assert_eq!(eof % PAGE_4K as u64, 0);
+            let start_page = (eof / PAGE_4K as u64) as u32;
+            let mut buf = vec![0u8; npages * PAGE_4K];
+            for (pi, chunk) in overflow.chunks(ENTRIES_PER_OVERFLOW_PAGE).enumerate() {
+                Self::serialize_overflow_page(chunk, &mut buf[pi * PAGE_4K..(pi + 1) * PAGE_4K]);
+            }
+            self.file.seek(SeekFrom::Start(eof))?;
+            self.file.write_all(&buf)?;
+            self.file.sync_data()?; // overflow durable BEFORE the root points at it
+            start_page
+        } else {
+            0
+        };
+
+        self.active_root.entry_page_count = npages as u32;
 
         let mut page = [0u8; PAGE_4K];
-        Self::serialize_root(&self.active_root, &mut page);
+        Self::serialize_root(&self.active_root, overflow_start_page, &mut page);
 
         // Write to the inactive slot
         let write_offset = if self.active_slot == 0 {
@@ -442,6 +470,21 @@ impl ShardManifest {
 
         // Flip active slot
         self.active_slot = if self.active_slot == 0 { 1 } else { 0 };
+
+        // Bound append-only growth: when the file is mostly dead overflow from
+        // superseded commits, rewrite it compactly. Best-effort — the commit is
+        // already durable, so a compaction failure must not fail the commit.
+        if npages > 0 {
+            if let Ok(file_len) = self.file.seek(SeekFrom::End(0)) {
+                let live_pages = 2 + npages as u64;
+                let live_bytes = live_pages * PAGE_4K as u64;
+                if file_len > live_bytes.saturating_mul(4) && file_len > 16 * PAGE_4K as u64 {
+                    if let Err(e) = self.compact() {
+                        tracing::warn!(error = %e, "manifest compaction failed (commit already durable)");
+                    }
+                }
+            }
+        }
 
         Ok(())
     }
@@ -597,25 +640,37 @@ impl ShardManifest {
         &self.path
     }
 
-    /// Serialize a ManifestRoot into a 4KB page buffer (always v2 format).
+    /// Serialize a ManifestRoot's INLINE portion into a 4KB root page (v2).
     ///
-    /// Layout per §4.2: epoch(8) + redo_lsn(8) + wal_flush_lsn(8) + file_count(4) +
-    /// entry_page_count(4) + snapshot_lsn(8) + created_at(8) + shard_uuid(16) = 64 bytes,
-    /// then file_count * 56-byte FileEntry records.
-    fn serialize_root(root: &ManifestRoot, page: &mut [u8]) {
+    /// Only the first `min(entries.len(), MAX_INLINE_ENTRIES)` records live in
+    /// the root page; any surplus lives in append-only overflow pages written
+    /// by `commit`. `overflow_start_page` is the file-relative page index where
+    /// this root's overflow run begins (0 when none) and is stamped into the
+    /// header `next_page` field; `entry_page_count` (root meta) records the run
+    /// length. `file_count` in the meta is the TOTAL across inline + overflow.
+    ///
+    /// Layout: epoch(8) + redo_lsn(8) + wal_flush_lsn(8) + file_count(4) +
+    /// entry_page_count(4) + snapshot_lsn(8) + created_at(8) + shard_uuid(16) =
+    /// 64 bytes, then inline_count * 56-byte FileEntry records.
+    fn serialize_root(root: &ManifestRoot, overflow_start_page: u32, page: &mut [u8]) {
         assert!(page.len() >= PAGE_4K);
 
         // Zero the page
         page[..PAGE_4K].fill(0);
 
-        // Payload: 64 bytes meta + file_count * 56 bytes entries (v2)
-        let payload_bytes = ROOT_META_SIZE + root.entries.len() * FileEntry::SIZE;
+        let total = root.entries.len();
+        let inline_count = total.min(MAX_INLINE_ENTRIES);
+
+        // Payload framing covers ONLY the inline entries — the region this
+        // page's CRC32C authenticates. Overflow pages carry their own CRC.
+        let payload_bytes = ROOT_META_SIZE + inline_count * FileEntry::SIZE;
 
         // Header — stamp v2 format so readers know to expect 56-byte entries.
         let mut hdr = MoonPageHeader::new(PageType::ManifestRoot, 0, 0);
         hdr.format_version = MANIFEST_FORMAT_V2;
         hdr.payload_bytes = payload_bytes as u32;
-        hdr.entry_count = root.entries.len() as u32;
+        hdr.entry_count = inline_count as u32;
+        hdr.next_page = overflow_start_page; // 0 when no overflow run
         hdr.write_to(page);
 
         // Manifest-specific metadata after header (64 bytes)
@@ -623,21 +678,162 @@ impl ShardManifest {
         page[p..p + 8].copy_from_slice(&root.epoch.to_le_bytes());
         page[p + 8..p + 16].copy_from_slice(&root.redo_lsn.to_le_bytes());
         page[p + 16..p + 24].copy_from_slice(&root.wal_flush_lsn.to_le_bytes());
-        page[p + 24..p + 28].copy_from_slice(&root.file_count.to_le_bytes());
+        // file_count = TOTAL entries (inline + overflow), the source of truth
+        // used on read to compute how many overflow entries to expect.
+        page[p + 24..p + 28].copy_from_slice(&(total as u32).to_le_bytes());
         page[p + 28..p + 32].copy_from_slice(&root.entry_page_count.to_le_bytes());
         page[p + 32..p + 40].copy_from_slice(&root.snapshot_lsn.to_le_bytes());
         page[p + 40..p + 48].copy_from_slice(&root.created_at.to_le_bytes());
         page[p + 48..p + 64].copy_from_slice(&root.shard_uuid);
 
-        // FileEntry records
+        // Inline FileEntry records (first `inline_count`)
         let entries_start = p + ROOT_META_SIZE;
-        for (i, entry) in root.entries.iter().enumerate() {
+        for (i, entry) in root.entries.iter().take(inline_count).enumerate() {
             let offset = entries_start + i * FileEntry::SIZE;
             entry.write_to(&mut page[offset..offset + FileEntry::SIZE]);
         }
 
         // Compute CRC32C over payload region
         MoonPageHeader::compute_checksum(page);
+    }
+
+    /// Serialize up to `ENTRIES_PER_OVERFLOW_PAGE` FileEntry records into a 4KB
+    /// `ManifestEntry` overflow page (header + entries + CRC32C, no per-page
+    /// meta). `entries.len()` must be ≤ `ENTRIES_PER_OVERFLOW_PAGE`.
+    fn serialize_overflow_page(entries: &[FileEntry], page: &mut [u8]) {
+        assert!(page.len() >= PAGE_4K);
+        assert!(entries.len() <= ENTRIES_PER_OVERFLOW_PAGE);
+        page[..PAGE_4K].fill(0);
+
+        let mut hdr = MoonPageHeader::new(PageType::ManifestEntry, 0, 0);
+        hdr.format_version = MANIFEST_FORMAT_V2;
+        hdr.payload_bytes = (entries.len() * FileEntry::SIZE) as u32;
+        hdr.entry_count = entries.len() as u32;
+        hdr.write_to(page);
+
+        let start = MOONPAGE_HEADER_SIZE;
+        for (i, e) in entries.iter().enumerate() {
+            let off = start + i * FileEntry::SIZE;
+            e.write_to(&mut page[off..off + FileEntry::SIZE]);
+        }
+        MoonPageHeader::compute_checksum(page);
+    }
+
+    /// Parse a `ManifestEntry` overflow page. Returns `None` on ANY header,
+    /// type, CRC, or framing failure so a torn/corrupt overflow page makes the
+    /// whole root fall back to the last-good slot (never surfaces garbage).
+    fn parse_overflow_page(page: &[u8]) -> Option<Vec<FileEntry>> {
+        if page.len() < PAGE_4K {
+            return None;
+        }
+        let hdr = MoonPageHeader::read_from(page)?;
+        if hdr.page_type != PageType::ManifestEntry {
+            return None;
+        }
+        if !MoonPageHeader::verify_checksum(page) {
+            return None;
+        }
+        let n = hdr.entry_count as usize;
+        if n > ENTRIES_PER_OVERFLOW_PAGE {
+            return None;
+        }
+        if hdr.payload_bytes as usize != n * FileEntry::SIZE {
+            return None;
+        }
+        let start = MOONPAGE_HEADER_SIZE;
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            let off = start + i * FileEntry::SIZE;
+            out.push(FileEntry::read_from(&page[off..])?);
+        }
+        Some(out)
+    }
+
+    /// Load one slot fully: parse its inline root, then read its append-only
+    /// overflow run. Returns `None` (→ dual-root fallback) if the root is
+    /// invalid OR its overflow is torn/short/corrupt/inconsistent — so a crash
+    /// mid-overflow-write can never surface a torn mix or garbage entries.
+    fn load_root(buf: &[u8], slot_offset: usize) -> Option<ManifestRoot> {
+        let end = slot_offset.checked_add(PAGE_4K)?;
+        if end > buf.len() {
+            return None;
+        }
+        let slice = &buf[slot_offset..end];
+        let mut root = Self::try_parse_root(slice)?;
+
+        if root.entry_page_count > 0 {
+            // Overflow run start lives in the root header's `next_page`.
+            let hdr = MoonPageHeader::read_from(slice)?;
+            let start = hdr.next_page as usize;
+            let npages = root.entry_page_count as usize;
+            for pi in 0..npages {
+                let off = start.checked_add(pi)?.checked_mul(PAGE_4K)?;
+                let pend = off.checked_add(PAGE_4K)?;
+                if pend > buf.len() {
+                    return None; // torn/short overflow → fall back to last-good
+                }
+                let entries = Self::parse_overflow_page(&buf[off..pend])?;
+                root.entries.extend(entries);
+            }
+        }
+
+        // The reconstructed total must reconcile with the root's file_count,
+        // else treat the slot as corrupt and fall back.
+        if root.entries.len() != root.file_count as usize {
+            return None;
+        }
+        Some(root)
+    }
+
+    /// Rewrite the manifest compactly, reclaiming dead overflow pages from
+    /// superseded commits. Layout becomes `[Root A][Root B][fresh overflow]`
+    /// with the active root written to BOTH slots (same epoch) so either is a
+    /// valid recovery target. Crash-safe via temp-file + atomic rename: the
+    /// live manifest stays valid until the rename completes.
+    fn compact(&mut self) -> std::io::Result<()> {
+        let total = self.active_root.entries.len();
+        let inline_count = total.min(MAX_INLINE_ENTRIES);
+        let overflow = &self.active_root.entries[inline_count..];
+        let npages = overflow.len().div_ceil(ENTRIES_PER_OVERFLOW_PAGE);
+
+        // Overflow starts immediately after the two root pages.
+        let overflow_start_page: u32 = if npages > 0 { 2 } else { 0 };
+        self.active_root.entry_page_count = npages as u32;
+
+        let mut buf = vec![0u8; (2 + npages) * PAGE_4K];
+        for (pi, chunk) in overflow.chunks(ENTRIES_PER_OVERFLOW_PAGE).enumerate() {
+            let o = (2 + pi) * PAGE_4K;
+            Self::serialize_overflow_page(chunk, &mut buf[o..o + PAGE_4K]);
+        }
+        Self::serialize_root(&self.active_root, overflow_start_page, &mut buf[0..PAGE_4K]);
+        Self::serialize_root(
+            &self.active_root,
+            overflow_start_page,
+            &mut buf[PAGE_4K..2 * PAGE_4K],
+        );
+
+        let tmp = self.path.with_extension("manifest.compact.tmp");
+        std::fs::write(&tmp, &buf)?;
+        {
+            let tf = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&tmp)?;
+            tf.sync_data()?;
+        }
+        std::fs::rename(&tmp, &self.path)?;
+        if let Some(parent) = self.path.parent() {
+            crate::persistence::fsync::fsync_directory(parent)?;
+        }
+        // Repoint the file handle at the freshly-rewritten manifest. Both slots
+        // carry the active root at the same epoch; treat slot 0 as active so the
+        // next commit writes the incremented epoch to slot 1 (the newest).
+        self.file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&self.path)?;
+        self.active_slot = 0;
+        Ok(())
     }
 
     /// Try to parse a root page from a 4KB buffer.
@@ -677,18 +873,26 @@ impl ShardManifest {
         let epoch = u64::from_le_bytes(page[p..p + 8].try_into().ok()?);
         let redo_lsn = u64::from_le_bytes(page[p + 8..p + 16].try_into().ok()?);
         let wal_flush_lsn = u64::from_le_bytes(page[p + 16..p + 24].try_into().ok()?);
+        // `file_count` is the TOTAL across inline + overflow. Only the first
+        // `inline_count` records live in this root page; the surplus lives in
+        // overflow pages loaded later by `load_root`. v1 never overflows.
         let file_count = u32::from_le_bytes(page[p + 24..p + 28].try_into().ok()?);
         let entry_page_count = u32::from_le_bytes(page[p + 28..p + 32].try_into().ok()?);
+        let inline_count = if entry_size == FileEntry::SIZE_V1 {
+            file_count as usize
+        } else {
+            (file_count as usize).min(MAX_INLINE_ENTRIES)
+        };
 
-        // Validate payload framing: root metadata + declared entries must match
-        // the authenticated payload_bytes and entry_count in the header. This
-        // prevents reading unchecked trailing bytes on a corrupted root page.
-        let expected_payload =
-            ROOT_META_SIZE.checked_add((file_count as usize).checked_mul(entry_size)?)?;
+        // Validate payload framing against the INLINE count — the region this
+        // page's CRC32C authenticates. Overflow pages carry their own CRC and
+        // are validated when loaded. This prevents reading unchecked trailing
+        // bytes on a corrupted root page.
+        let expected_payload = ROOT_META_SIZE.checked_add(inline_count.checked_mul(entry_size)?)?;
         if hdr.payload_bytes as usize != expected_payload {
             return None;
         }
-        if hdr.entry_count != file_count {
+        if hdr.entry_count as usize != inline_count {
             return None;
         }
         let snapshot_lsn = u64::from_le_bytes(page[p + 32..p + 40].try_into().ok()?);
@@ -696,12 +900,12 @@ impl ShardManifest {
         let mut shard_uuid = [0u8; 16];
         shard_uuid.copy_from_slice(&page[p + 48..p + 64]);
 
-        // Parse entries. Use the size dictated by format_version so v1
-        // manifests remain readable; FileEntry::read_v1 synthesizes
+        // Parse the inline entries. Use the size dictated by format_version so
+        // v1 manifests remain readable; FileEntry::read_v1 synthesizes
         // `last_modified_lsn = created_lsn` for the upgraded in-memory view.
         let entries_start = p + ROOT_META_SIZE;
         let mut entries = Vec::with_capacity(file_count as usize);
-        for i in 0..file_count as usize {
+        for i in 0..inline_count {
             let offset = entries_start + i * entry_size;
             let entry = if entry_size == FileEntry::SIZE_V1 {
                 FileEntry::read_v1(&page[offset..])?
@@ -1062,12 +1266,174 @@ mod tests {
         let m2 = ShardManifest::open(&path).unwrap();
         assert_eq!(m2.files().len(), 70);
 
-        // Adding one more should fail on commit
+        // Beyond the inline cap, entries now persist via overflow pages
+        // (was: commit rejected the 71st entry).
         drop(m2);
         let mut m3 = ShardManifest::open(&path).unwrap();
         m3.add_file(make_entry(71));
-        let result = m3.commit();
-        assert!(result.is_err());
+        m3.commit()
+            .expect("71st entry must persist via an overflow page");
+        drop(m3);
+        assert_eq!(
+            ShardManifest::open(&path).unwrap().files().len(),
+            71,
+            "overflow entry must survive reopen",
+        );
+    }
+
+    /// #15 RED — durability contract: a manifest holding FAR more than the
+    /// 70-entry inline cap must persist every entry and recover them all.
+    /// 70 entries ≈ 9 MB cold/shard, so every real disk-offload deployment
+    /// blows past the cap immediately (Phase C hit "495 > 70"). RED today:
+    /// `commit()` returns Err at the 71st entry.
+    #[test]
+    fn test_overflow_persists_beyond_inline_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("shard-0.manifest");
+
+        let n = 200u64; // ~3 overflow pages worth
+        let mut m = ShardManifest::create(&path).unwrap();
+        for i in 0..n {
+            m.add_file(make_entry(i + 1));
+        }
+        m.commit()
+            .expect("manifest must persist >70 entries via overflow pages");
+        drop(m);
+
+        // Reopen from disk only — proves on-disk durability, not in-memory state.
+        let m2 = ShardManifest::open(&path).unwrap();
+        assert_eq!(
+            m2.files().len(),
+            n as usize,
+            "all {n} entries must recover from overflow pages",
+        );
+        let ids: std::collections::HashSet<u64> = m2.files().iter().map(|e| e.file_id).collect();
+        for i in 0..n {
+            assert!(ids.contains(&(i + 1)), "file_id {} lost on recovery", i + 1);
+        }
+    }
+
+    /// #15 RED — crash-atomicity: a torn overflow write during a later commit
+    /// must NEVER corrupt the previously-committed state. The advisor's key
+    /// risk: a naïve overflow chain converts today's PARTIAL loss (last-good
+    /// inline root intact) into TOTAL loss (root points at a half-written
+    /// overflow page → garbage → lose everything).
+    ///
+    /// Model: commit state1 (N1=150 > cap), then commit state2 (N2=300), then
+    /// truncate the file by one 4 KB page to simulate a crash mid-overflow-write
+    /// of state2. Reopen MUST yield a consistent state — the last-good state1
+    /// (150) via dual-root fallback — never a panic, never a torn mix.
+    #[test]
+    fn test_overflow_commit_crash_atomicity() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("shard-0.manifest");
+
+        let n1 = 150u64;
+        let n2 = 300u64;
+
+        let mut m = ShardManifest::create(&path).unwrap();
+        for i in 0..n1 {
+            m.add_file(make_entry(i + 1));
+        }
+        m.commit().expect("state1 (>cap) must commit via overflow");
+        // state2: extend to n2 and commit again (flips active slot; state1's
+        // root remains in the now-inactive slot as the last-good fallback).
+        for i in n1..n2 {
+            m.add_file(make_entry(i + 1));
+        }
+        m.commit().expect("state2 (>cap) must commit via overflow");
+        drop(m);
+
+        // Simulate a crash that tore the tail of state2's overflow write:
+        // lop off the final 4 KB page. state2's root now references an
+        // incomplete overflow region; state1's root + overflow are untouched.
+        let full = std::fs::metadata(&path).unwrap().len();
+        assert!(full > (2 * PAGE_4K) as u64, "overflow must extend the file");
+        let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        f.set_len(full - PAGE_4K as u64).unwrap();
+        drop(f);
+
+        // Recovery must be CONSISTENT, never corrupt. Newest root (state2) has a
+        // torn overflow → open() must fall back to the last-good state1 root.
+        let recovered = ShardManifest::open(&path)
+            .expect("torn overflow tail must not make the manifest unopenable");
+        let len = recovered.files().len();
+        assert_eq!(
+            len, n1 as usize,
+            "torn state2 overflow must fall back to last-good state1 ({n1}), got {len}",
+        );
+        // And every recovered entry must be a real state1 entry (no garbage ids).
+        for e in recovered.files() {
+            assert!(
+                e.file_id >= 1 && e.file_id <= n1,
+                "garbage file_id {} after torn-overflow recovery",
+                e.file_id,
+            );
+        }
+    }
+
+    /// #16 — append-only overflow must not grow the manifest without bound:
+    /// repeatedly committing a >cap set (each commit appends a fresh overflow
+    /// run) must trigger compaction so the file stays a small multiple of the
+    /// live set, and the data must still fully recover.
+    #[test]
+    fn test_overflow_compaction_bounds_growth() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("shard-0.manifest");
+
+        let mut m = ShardManifest::create(&path).unwrap();
+        for i in 0..100u64 {
+            m.add_file(make_entry(i + 1));
+        }
+        // Each commit re-appends the overflow run; without compaction the file
+        // would grow ~1 page per commit (60+ dead runs). Compaction bounds it.
+        for _ in 0..60 {
+            m.commit().unwrap();
+        }
+        drop(m);
+
+        let len = std::fs::metadata(&path).unwrap().len();
+        // Live set = 2 roots + ceil(30/72)=1 overflow page = 3 pages (12 KB).
+        // Compaction keeps the file within a small multiple of that.
+        assert!(
+            len <= 20 * PAGE_4K as u64,
+            "manifest grew unbounded despite compaction: {len} bytes",
+        );
+
+        let m2 = ShardManifest::open(&path).unwrap();
+        assert_eq!(m2.files().len(), 100, "data lost after compaction");
+        let ids: std::collections::HashSet<u64> = m2.files().iter().map(|e| e.file_id).collect();
+        for i in 0..100u64 {
+            assert!(ids.contains(&(i + 1)), "file_id {} lost", i + 1);
+        }
+    }
+
+    /// #16 — tombstoning + GC of an entry that lives in the OVERFLOW region
+    /// (id > inline cap) must remove exactly that entry and survive reopen.
+    #[test]
+    fn test_overflow_tombstone_and_gc() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("shard-0.manifest");
+
+        let mut m = ShardManifest::create(&path).unwrap();
+        for i in 0..200u64 {
+            m.add_file(make_entry(i + 1));
+        }
+        m.commit().unwrap();
+
+        // id 150 lives in the overflow region (inline cap is 70).
+        m.remove_file(150);
+        let pruned = m.gc_tombstones(0, 0, std::time::Instant::now());
+        assert_eq!(pruned, 1, "overflow-region tombstone must be prunable");
+        m.commit().unwrap();
+        drop(m);
+
+        let m2 = ShardManifest::open(&path).unwrap();
+        assert_eq!(m2.files().len(), 199);
+        assert!(
+            m2.files().iter().all(|e| e.file_id != 150),
+            "tombstoned overflow entry survived recovery",
+        );
     }
 
     /// P1 — manifest written today must always stamp format_version = 2.
