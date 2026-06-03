@@ -74,7 +74,7 @@ async fn start_txn_server(num_shards: usize, persistence_dir: &str) -> (u16, Can
         dir,
         dbfilename: "dump.rdb".to_string(),
         appendfilename: "appendonly.aof".to_string(),
-        maxmemory: 0,
+        maxmemory: Some(0),
         maxmemory_policy: "noeviction".to_string(),
         maxmemory_samples: 5,
         shards: num_shards,
@@ -140,6 +140,7 @@ async fn start_txn_server(num_shards: usize, persistence_dir: &str) -> (u16, Can
         migrate_aof_from: None,
         migrate_aof_to: None,
         migrate_aof_shards: 0,
+        ..Default::default()
     };
 
     let cancel = token.clone();

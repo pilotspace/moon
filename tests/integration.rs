@@ -38,7 +38,7 @@ async fn start_server() -> (u16, CancellationToken) {
         dir: ".".to_string(),
         dbfilename: "dump.rdb".to_string(),
         appendfilename: "appendonly.aof".to_string(),
-        maxmemory: 0,
+        maxmemory: Some(0),
         maxmemory_policy: "noeviction".to_string(),
         maxmemory_samples: 5,
         shards: 0,
@@ -106,6 +106,7 @@ async fn start_server() -> (u16, CancellationToken) {
         migrate_aof_from: None,
         migrate_aof_to: None,
         migrate_aof_shards: 0,
+        ..Default::default()
     };
 
     tokio::spawn(async move {
@@ -141,7 +142,7 @@ async fn start_server_with_pass(password: &str) -> (u16, CancellationToken) {
         dir: ".".to_string(),
         dbfilename: "dump.rdb".to_string(),
         appendfilename: "appendonly.aof".to_string(),
-        maxmemory: 0,
+        maxmemory: Some(0),
         maxmemory_policy: "noeviction".to_string(),
         maxmemory_samples: 5,
         shards: 0,
@@ -209,6 +210,7 @@ async fn start_server_with_pass(password: &str) -> (u16, CancellationToken) {
         migrate_aof_from: None,
         migrate_aof_to: None,
         migrate_aof_shards: 0,
+        ..Default::default()
     };
 
     tokio::spawn(async move {
@@ -1316,7 +1318,7 @@ async fn start_server_with_persistence(
         dir: dir.to_string_lossy().to_string(),
         dbfilename: "dump.rdb".to_string(),
         appendfilename: "appendonly.aof".to_string(),
-        maxmemory: 0,
+        maxmemory: Some(0),
         maxmemory_policy: "noeviction".to_string(),
         maxmemory_samples: 5,
         shards: 0,
@@ -1384,6 +1386,7 @@ async fn start_server_with_persistence(
         migrate_aof_from: None,
         migrate_aof_to: None,
         migrate_aof_shards: 0,
+        ..Default::default()
     };
 
     tokio::spawn(async move {
@@ -2203,7 +2206,7 @@ async fn start_server_with_maxmemory(maxmemory: usize, policy: &str) -> (u16, Ca
         dir: ".".to_string(),
         dbfilename: "dump.rdb".to_string(),
         appendfilename: "appendonly.aof".to_string(),
-        maxmemory,
+        maxmemory: Some(maxmemory),
         maxmemory_policy: policy.to_string(),
         maxmemory_samples: 5,
         shards: 0,
@@ -2271,6 +2274,7 @@ async fn start_server_with_maxmemory(maxmemory: usize, policy: &str) -> (u16, Ca
         migrate_aof_from: None,
         migrate_aof_to: None,
         migrate_aof_shards: 0,
+        ..Default::default()
     };
 
     tokio::spawn(async move {
@@ -2617,7 +2621,7 @@ async fn start_sharded_server(num_shards: usize) -> (u16, CancellationToken) {
         dir: ".".to_string(),
         dbfilename: "dump.rdb".to_string(),
         appendfilename: "appendonly.aof".to_string(),
-        maxmemory: 0,
+        maxmemory: Some(0),
         maxmemory_policy: "noeviction".to_string(),
         maxmemory_samples: 5,
         shards: num_shards,
@@ -2685,6 +2689,7 @@ async fn start_sharded_server(num_shards: usize) -> (u16, CancellationToken) {
         migrate_aof_from: None,
         migrate_aof_to: None,
         migrate_aof_shards: 0,
+        ..Default::default()
     };
 
     let cancel = token.clone();
@@ -3811,7 +3816,7 @@ async fn start_cluster_server() -> (u16, CancellationToken) {
         dir: ".".to_string(),
         dbfilename: "dump.rdb".to_string(),
         appendfilename: "appendonly.aof".to_string(),
-        maxmemory: 0,
+        maxmemory: Some(0),
         maxmemory_policy: "noeviction".to_string(),
         maxmemory_samples: 5,
         shards: 1,
@@ -3879,6 +3884,7 @@ async fn start_cluster_server() -> (u16, CancellationToken) {
         migrate_aof_from: None,
         migrate_aof_to: None,
         migrate_aof_shards: 0,
+        ..Default::default()
     };
 
     std::thread::spawn(move || {
@@ -4476,7 +4482,7 @@ async fn start_server_with_aclfile(acl_path: &str) -> (u16, CancellationToken) {
         dir: ".".to_string(),
         dbfilename: "dump.rdb".to_string(),
         appendfilename: "appendonly.aof".to_string(),
-        maxmemory: 0,
+        maxmemory: Some(0),
         maxmemory_policy: "noeviction".to_string(),
         maxmemory_samples: 5,
         shards: 0,
@@ -4544,6 +4550,7 @@ async fn start_server_with_aclfile(acl_path: &str) -> (u16, CancellationToken) {
         migrate_aof_from: None,
         migrate_aof_to: None,
         migrate_aof_shards: 0,
+        ..Default::default()
     };
 
     tokio::spawn(async move {

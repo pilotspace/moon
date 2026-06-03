@@ -43,7 +43,7 @@ fn build_config(port: u16, num_shards: usize) -> ServerConfig {
         dir: ".".to_string(),
         dbfilename: "dump.rdb".to_string(),
         appendfilename: "appendonly.aof".to_string(),
-        maxmemory: 0,
+        maxmemory: Some(0),
         maxmemory_policy: "noeviction".to_string(),
         maxmemory_samples: 5,
         shards: num_shards,
@@ -109,6 +109,7 @@ fn build_config(port: u16, num_shards: usize) -> ServerConfig {
         migrate_aof_from: None,
         migrate_aof_to: None,
         migrate_aof_shards: 0,
+        ..Default::default()
     }
 }
 

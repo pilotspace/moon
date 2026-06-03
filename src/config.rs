@@ -29,7 +29,7 @@ pub enum CrossShardFastPath {
 }
 
 /// Server configuration parsed from command-line arguments.
-#[derive(Parser, Debug, Clone)]
+#[derive(Parser, Debug, Clone, Default)]
 #[command(name = "moon", about = "A Redis-compatible server")]
 pub struct ServerConfig {
     /// Bind address

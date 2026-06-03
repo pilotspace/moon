@@ -48,7 +48,7 @@ async fn start_moon() -> (u16, CancellationToken) {
         dir: ".".to_string(),
         dbfilename: "dump.rdb".to_string(),
         appendfilename: "appendonly.aof".to_string(),
-        maxmemory: 0,
+        maxmemory: Some(0),
         maxmemory_policy: "noeviction".to_string(),
         maxmemory_samples: 5,
         shards: 0,
@@ -106,6 +106,7 @@ async fn start_moon() -> (u16, CancellationToken) {
         migrate_aof_from: None,
         migrate_aof_to: None,
         migrate_aof_shards: 0,
+        ..Default::default()
     };
 
     tokio::spawn(async move {

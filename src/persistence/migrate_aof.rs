@@ -45,7 +45,7 @@
 //!
 //! # Usage
 //!
-//! ```
+//! ```text
 //! moon --migrate-aof-from /old/dir --migrate-aof-to /new/dir --migrate-aof-shards 4
 //! ```
 //!
