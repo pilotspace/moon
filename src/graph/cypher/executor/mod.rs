@@ -181,6 +181,10 @@ pub struct ExecutionContext {
     /// Valid-time filter: only entities with valid_from <= T <= valid_to.
     /// None = no valid-time filter (current behavior).
     pub valid_time_as_of: Option<i64>,
+    /// Temporal-decay scoring for traversal cost (agent-memory recency),
+    /// parsed from `GRAPH.QUERY ... --decay <lambda_per_sec>`.
+    /// None = distance-only shortest paths (current behavior).
+    pub decay: Option<crate::graph::scoring::DecayConfig>,
 }
 
 // ---------------------------------------------------------------------------

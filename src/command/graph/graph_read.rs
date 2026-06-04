@@ -30,6 +30,53 @@ fn parse_valid_at(args: &[Frame]) -> Option<i64> {
     None
 }
 
+/// Parse optional `--decay <lambda_per_sec>` and `--time-weight <w>` from
+/// GRAPH.QUERY args into a `DecayConfig` (temporal-decay traversal scoring).
+///
+/// Strict validation (unlike `parse_valid_at`'s silent-None: decay is a new
+/// surface, so malformed input is an error, not a silent no-op):
+/// - both values must parse as finite, non-negative f64
+/// - `--time-weight` without `--decay` is rejected
+/// - a dangling flag with no value is rejected
+///
+/// Returns `Ok(None)` when neither flag is present.
+fn parse_decay(args: &[Frame]) -> Result<Option<crate::graph::scoring::DecayConfig>, &'static str> {
+    fn flag_value(args: &[Frame], flag: &[u8]) -> Result<Option<f64>, &'static str> {
+        for i in 0..args.len() {
+            if let Frame::BulkString(ref bs) = args[i] {
+                if bs.as_ref() == flag {
+                    let Some(Frame::BulkString(val)) = args.get(i + 1) else {
+                        return Err("ERR flag requires a value");
+                    };
+                    let parsed = std::str::from_utf8(val)
+                        .ok()
+                        .and_then(|s| s.trim().parse::<f64>().ok());
+                    return match parsed {
+                        Some(v) if v.is_finite() && v >= 0.0 => Ok(Some(v)),
+                        _ => Err("ERR value must be a finite non-negative number"),
+                    };
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    let lambda = flag_value(args, b"--decay")
+        .map_err(|_| "ERR --decay must be a finite non-negative number (1/seconds)")?;
+    let time_weight = flag_value(args, b"--time-weight")
+        .map_err(|_| "ERR --time-weight must be a finite non-negative number")?;
+
+    match (lambda, time_weight) {
+        (None, None) => Ok(None),
+        (None, Some(_)) => Err("ERR --time-weight requires --decay"),
+        (Some(lambda_per_sec), tw) => Ok(Some(crate::graph::scoring::DecayConfig {
+            lambda_per_sec,
+            time_weight: tw.unwrap_or(1.0),
+            now_ms: crate::storage::entry::current_time_ms(),
+        })),
+    }
+}
+
 /// Parse `--params <json_object>` from GRAPH.QUERY args into executor `Value` map.
 ///
 /// Scans args for `--params` keyword followed by a JSON string. The JSON must be
@@ -399,8 +446,13 @@ pub fn graph_query(store: &GraphStore, args: &[Frame]) -> Frame {
 
     let params = parse_params(args);
     let valid_at = parse_valid_at(args);
+    let decay = match parse_decay(args) {
+        Ok(d) => d,
+        Err(msg) => return Frame::Error(Bytes::from_static(msg.as_bytes())),
+    };
     let ctx = cypher::executor::ExecutionContext {
         valid_time_as_of: valid_at,
+        decay,
         ..Default::default()
     };
     let result = match cypher::executor::execute(graph, &plan, &params, &ctx) {
@@ -621,8 +673,19 @@ pub fn graph_query_or_write(
 
         let params = parse_params(args);
         let valid_at = parse_valid_at(args);
+        let decay = match parse_decay(args) {
+            Ok(d) => d,
+            Err(msg) => {
+                return (
+                    Frame::Error(Bytes::from_static(msg.as_bytes())),
+                    Vec::new(),
+                    Vec::new(),
+                );
+            }
+        };
         let ctx = cypher::executor::ExecutionContext {
             valid_time_as_of: valid_at,
+            decay,
             ..Default::default()
         };
         let result = match cypher::executor::execute(graph, &plan, &params, &ctx) {
@@ -930,8 +993,13 @@ pub fn graph_profile(store: &GraphStore, args: &[Frame]) -> Frame {
 
     let params = std::collections::HashMap::new();
     let valid_at = parse_valid_at(args);
+    let decay = match parse_decay(args) {
+        Ok(d) => d,
+        Err(msg) => return Frame::Error(Bytes::from_static(msg.as_bytes())),
+    };
     let ctx = cypher::executor::ExecutionContext {
         valid_time_as_of: valid_at,
+        decay,
         ..Default::default()
     };
     let profile = match cypher::executor::execute_profile(graph, &plan, &params, &ctx) {

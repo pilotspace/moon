@@ -23,6 +23,7 @@ pub(crate) fn run_shortest_path(
     memgraph: &MemGraph,
     immutable_segs: &[Arc<CsrStorage>],
     snapshot_lsn: u64,
+    decay: Option<crate::graph::scoring::DecayConfig>,
     src_key: NodeKey,
     dst_key: NodeKey,
     edge_types: &[String],
@@ -60,7 +61,13 @@ pub(crate) fn run_shortest_path(
         edge_type_filter,
     );
 
-    let cost_fn = crate::graph::scoring::WeightedCostFn::new(0.0, 1.0, 0);
+    // Decay off (None): distance-only Dijkstra — the time term is zero and
+    // edge ages are never read, preserving the exact pre-decay behavior.
+    // Decay on: cost = lambda*time_weight*age_sec + |weight| (see DecayConfig).
+    let cost_fn = match decay {
+        Some(d) => d.cost_fn(),
+        None => crate::graph::scoring::WeightedCostFn::new(0.0, 1.0, 0),
+    };
     let capped_hops = max_hops.min(MAX_HOPS_CAP);
     let dijkstra = DijkstraTraversal::new(cost_fn, capped_hops);
 

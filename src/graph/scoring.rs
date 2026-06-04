@@ -152,6 +152,55 @@ impl WeightedCostFn {
         let age = self.now.saturating_sub(timestamp) as f64;
         self.time_weight * age + self.distance_weight * weight.abs()
     }
+
+    /// Wall-clock variant: `created_ms` and `self.now` are Unix millis, the
+    /// age term is converted to SECONDS so `time_weight` reads as cost per
+    /// second of edge age (matching the user-facing `--decay <lambda_per_sec>`
+    /// knob).
+    ///
+    /// `created_ms == 0` means "unknown" (pre-upgrade edge, or CSR segment
+    /// without per-edge stamps): the time term is dropped entirely — neutral,
+    /// never treated as maximally old. A stamp ahead of `now` (clock skew)
+    /// saturates to age 0.
+    #[inline]
+    pub fn cost_ms(&self, created_ms: u64, weight: f64) -> f64 {
+        let distance_cost = self.distance_weight * weight.abs();
+        if created_ms == 0 {
+            return distance_cost;
+        }
+        let age_sec = self.now.saturating_sub(created_ms) as f64 / 1000.0;
+        self.time_weight * age_sec + distance_cost
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Decay configuration (user-facing knob)
+// ---------------------------------------------------------------------------
+
+/// Per-query temporal-decay configuration, parsed from the command surface
+/// (`GRAPH.QUERY ... --decay <lambda_per_sec> [--time-weight <w>]`,
+/// `FT.NAVIGATE ... DECAY <lambda_per_sec>`).
+///
+/// Rides `ExecutionContext` into the traversal layer; `None` keeps the
+/// exact pre-decay code path (zero cost when off).
+#[derive(Debug, Clone, Copy)]
+pub struct DecayConfig {
+    /// Decay rate in 1/seconds. The effective time cost per edge is
+    /// `lambda_per_sec * time_weight * age_seconds`.
+    pub lambda_per_sec: f64,
+    /// Multiplier on the decay term (default 1.0).
+    pub time_weight: f64,
+    /// Query-start wall clock (Unix millis) from the shard-cached clock.
+    pub now_ms: u64,
+}
+
+impl DecayConfig {
+    /// Build the traversal cost function for this decay setting.
+    /// Distance weight stays 1.0 — decay biases, it does not replace
+    /// the weight-based shortest path semantics.
+    pub fn cost_fn(&self) -> WeightedCostFn {
+        WeightedCostFn::new(self.lambda_per_sec * self.time_weight, 1.0, self.now_ms)
+    }
 }
 
 #[cfg(test)]
@@ -165,6 +214,32 @@ mod tests {
 
     fn dummy_edge_key() -> EdgeKey {
         KeyData::from_ffi(1).into()
+    }
+
+    // --- WeightedCostFn::cost_ms tests (wall-clock decay) ---
+
+    #[test]
+    fn test_cost_ms_converts_millis_to_seconds() {
+        // now = 10s (10_000 ms); edge created at 4s -> age 6s.
+        // cost = time_weight * age_sec + distance_weight * |weight|
+        //      = 0.5 * 6.0 + 1.0 * 2.0 = 5.0
+        let f = WeightedCostFn::new(0.5, 1.0, 10_000);
+        assert!((f.cost_ms(4_000, 2.0) - 5.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_cost_ms_zero_created_ms_is_neutral() {
+        // created_ms == 0 means "unknown" (pre-upgrade edge or CSR segment
+        // without per-edge stamps): no age penalty, distance cost only.
+        let f = WeightedCostFn::new(0.5, 1.0, 10_000);
+        assert!((f.cost_ms(0, 2.0) - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_cost_ms_future_stamp_saturates() {
+        // A stamp ahead of `now` (clock skew) must not underflow: age = 0.
+        let f = WeightedCostFn::new(0.5, 1.0, 10_000);
+        assert!((f.cost_ms(20_000, 2.0) - 2.0).abs() < 1e-9);
     }
 
     // --- TemporalDecayScorer tests ---

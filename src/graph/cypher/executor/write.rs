@@ -146,7 +146,7 @@ pub fn execute_mut(
             PhysicalOp::Filter { expr } => {
                 rows.retain(|row| {
                     matches!(
-                        eval_expr(expr, row, &graph.write_buf, params, &[], 0),
+                        eval_expr(expr, row, &graph.write_buf, params, &[], 0, None),
                         Value::Bool(true)
                     )
                 });
@@ -175,7 +175,15 @@ pub fn execute_mut(
                                         row.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
                                     Value::Map(entries)
                                 } else {
-                                    eval_expr(&item.expr, row, &graph.write_buf, params, &[], 0)
+                                    eval_expr(
+                                        &item.expr,
+                                        row,
+                                        &graph.write_buf,
+                                        params,
+                                        &[],
+                                        0,
+                                        None,
+                                    )
                                 }
                             })
                             .collect()
@@ -221,8 +229,8 @@ pub fn execute_mut(
                 } else {
                     rows.sort_by(|a, b| {
                         for (expr, ascending) in items {
-                            let va = eval_expr(expr, a, &graph.write_buf, params, &[], 0);
-                            let vb = eval_expr(expr, b, &graph.write_buf, params, &[], 0);
+                            let va = eval_expr(expr, a, &graph.write_buf, params, &[], 0, None);
+                            let vb = eval_expr(expr, b, &graph.write_buf, params, &[], 0, None);
                             let ord = compare_values(&va, &vb);
                             let ord = if *ascending { ord } else { ord.reverse() };
                             if ord != std::cmp::Ordering::Equal {
@@ -235,7 +243,15 @@ pub fn execute_mut(
             }
 
             PhysicalOp::Limit { count } => {
-                let n = match eval_expr(count, &HashMap::new(), &graph.write_buf, params, &[], 0) {
+                let n = match eval_expr(
+                    count,
+                    &HashMap::new(),
+                    &graph.write_buf,
+                    params,
+                    &[],
+                    0,
+                    None,
+                ) {
                     Value::Int(n) if n >= 0 => n as usize,
                     _ => 0,
                 };
@@ -247,7 +263,15 @@ pub fn execute_mut(
             }
 
             PhysicalOp::Skip { count } => {
-                let n = match eval_expr(count, &HashMap::new(), &graph.write_buf, params, &[], 0) {
+                let n = match eval_expr(
+                    count,
+                    &HashMap::new(),
+                    &graph.write_buf,
+                    params,
+                    &[],
+                    0,
+                    None,
+                ) {
                     Value::Int(n) if n >= 0 => n as usize,
                     _ => 0,
                 };
@@ -267,7 +291,7 @@ pub fn execute_mut(
             PhysicalOp::Unwind { expr, alias } => {
                 let mut new_rows = Vec::new();
                 for row in &rows {
-                    let val = eval_expr(expr, row, &graph.write_buf, params, &[], 0);
+                    let val = eval_expr(expr, row, &graph.write_buf, params, &[], 0, None);
                     if let Value::List(items) = val {
                         for item in items {
                             let mut new_row = row.clone();
@@ -296,8 +320,15 @@ pub fn execute_mut(
                                 .properties
                                 .iter()
                                 .filter_map(|(name, expr)| {
-                                    let val =
-                                        eval_expr(expr, &new_row, &graph.write_buf, params, &[], 0);
+                                    let val = eval_expr(
+                                        expr,
+                                        &new_row,
+                                        &graph.write_buf,
+                                        params,
+                                        &[],
+                                        0,
+                                        None,
+                                    );
                                     value_to_property_value(&val)
                                         .map(|pv| (label_to_id(name.as_bytes()), pv))
                                 })
@@ -362,8 +393,15 @@ pub fn execute_mut(
                                 value,
                             } => {
                                 if let Some(Value::Node(nk)) = row.get(variable) {
-                                    let val =
-                                        eval_expr(value, row, &graph.write_buf, params, &[], 0);
+                                    let val = eval_expr(
+                                        value,
+                                        row,
+                                        &graph.write_buf,
+                                        params,
+                                        &[],
+                                        0,
+                                        None,
+                                    );
                                     if let Some(pv) = value_to_property_value(&val) {
                                         let pid = label_to_id(property.as_bytes());
                                         if let Some(node) = graph.write_buf.get_node_mut(*nk) {
@@ -417,7 +455,7 @@ pub fn execute_mut(
                 let _ = detach; // Detach is always implied for MemGraph soft-delete.
                 for row in &rows {
                     for expr in exprs {
-                        let val = eval_expr(expr, row, &graph.write_buf, params, &[], 0);
+                        let val = eval_expr(expr, row, &graph.write_buf, params, &[], 0, None);
                         match val {
                             Value::Node(nk) => {
                                 // Phase 174 FIX-01: snapshot node state BEFORE
@@ -482,8 +520,15 @@ pub fn execute_mut(
                             .properties
                             .iter()
                             .filter_map(|(name, expr)| {
-                                let val =
-                                    eval_expr(expr, &new_row, &graph.write_buf, params, &[], 0);
+                                let val = eval_expr(
+                                    expr,
+                                    &new_row,
+                                    &graph.write_buf,
+                                    params,
+                                    &[],
+                                    0,
+                                    None,
+                                );
                                 value_to_property_value(&val)
                                     .map(|pv| (label_to_id(name.as_bytes()), pv))
                             })
@@ -656,6 +701,7 @@ pub fn execute_mut(
                                                 params,
                                                 &[],
                                                 0,
+                                                None,
                                             );
                                             value_to_property_value(&val)
                                                 .map(|pv| (label_to_id(name.as_bytes()), pv))
@@ -692,6 +738,7 @@ pub fn execute_mut(
                                                 params,
                                                 &[],
                                                 0,
+                                                None,
                                             );
                                             value_to_property_value(&val)
                                                 .map(|pv| (label_to_id(name.as_bytes()), pv))
@@ -826,7 +873,7 @@ pub(crate) fn apply_set_items(
                 value,
             } => {
                 if let Some(Value::Node(nk)) = row.get(variable) {
-                    let val = eval_expr(value, row, memgraph, params, &[], 0);
+                    let val = eval_expr(value, row, memgraph, params, &[], 0, None);
                     if let Some(pv) = value_to_property_value(&val) {
                         let pid = label_to_id(property.as_bytes());
                         if let Some(node) = memgraph.get_node_mut(*nk) {
@@ -900,7 +947,7 @@ pub(crate) fn resolve_or_find_node(
         .properties
         .iter()
         .filter_map(|(name, expr)| {
-            let val = eval_expr(expr, row, memgraph, params, &[], 0);
+            let val = eval_expr(expr, row, memgraph, params, &[], 0, None);
             value_to_property_value(&val).map(|pv| (label_to_id(name.as_bytes()), pv))
         })
         .collect();

@@ -179,7 +179,15 @@ pub fn execute(
             PhysicalOp::Filter { expr } => {
                 rows.retain(|row| {
                     matches!(
-                        eval_expr(expr, row, memgraph, params, csr_segs, ctx.snapshot_lsn),
+                        eval_expr(
+                            expr,
+                            row,
+                            memgraph,
+                            params,
+                            csr_segs,
+                            ctx.snapshot_lsn,
+                            ctx.decay
+                        ),
                         Value::Bool(true)
                     )
                 });
@@ -215,6 +223,7 @@ pub fn execute(
                                         params,
                                         csr_segs,
                                         ctx.snapshot_lsn,
+                                        ctx.decay,
                                     )
                                 }
                             })
@@ -263,10 +272,24 @@ pub fn execute(
                 } else {
                     rows.sort_by(|a, b| {
                         for (expr, ascending) in items {
-                            let va =
-                                eval_expr(expr, a, memgraph, params, csr_segs, ctx.snapshot_lsn);
-                            let vb =
-                                eval_expr(expr, b, memgraph, params, csr_segs, ctx.snapshot_lsn);
+                            let va = eval_expr(
+                                expr,
+                                a,
+                                memgraph,
+                                params,
+                                csr_segs,
+                                ctx.snapshot_lsn,
+                                ctx.decay,
+                            );
+                            let vb = eval_expr(
+                                expr,
+                                b,
+                                memgraph,
+                                params,
+                                csr_segs,
+                                ctx.snapshot_lsn,
+                                ctx.decay,
+                            );
                             let ord = compare_values(&va, &vb);
                             let ord = if *ascending { ord } else { ord.reverse() };
                             if ord != std::cmp::Ordering::Equal {
@@ -286,6 +309,7 @@ pub fn execute(
                     params,
                     csr_segs,
                     ctx.snapshot_lsn,
+                    ctx.decay,
                 ) {
                     Value::Int(n) if n >= 0 => n as usize,
                     _ => 0,
@@ -305,6 +329,7 @@ pub fn execute(
                     params,
                     csr_segs,
                     ctx.snapshot_lsn,
+                    ctx.decay,
                 ) {
                     Value::Int(n) if n >= 0 => n as usize,
                     _ => 0,
@@ -325,7 +350,15 @@ pub fn execute(
             PhysicalOp::Unwind { expr, alias } => {
                 let mut new_rows = Vec::new();
                 for row in &rows {
-                    let val = eval_expr(expr, row, memgraph, params, csr_segs, ctx.snapshot_lsn);
+                    let val = eval_expr(
+                        expr,
+                        row,
+                        memgraph,
+                        params,
+                        csr_segs,
+                        ctx.snapshot_lsn,
+                        ctx.decay,
+                    );
                     if let Value::List(items) = val {
                         for item in items {
                             let mut new_row = row.clone();
@@ -405,6 +438,7 @@ pub fn execute(
                         memgraph,
                         csr_segs,
                         ctx.snapshot_lsn,
+                        ctx.decay,
                         src_key,
                         dst_key,
                         edge_types,
@@ -650,7 +684,15 @@ pub fn execute_profile(
             PhysicalOp::Filter { expr } => {
                 rows.retain(|row| {
                     matches!(
-                        eval_expr(expr, row, memgraph, params, csr_segs, ctx.snapshot_lsn),
+                        eval_expr(
+                            expr,
+                            row,
+                            memgraph,
+                            params,
+                            csr_segs,
+                            ctx.snapshot_lsn,
+                            ctx.decay
+                        ),
                         Value::Bool(true)
                     )
                 });
@@ -686,6 +728,7 @@ pub fn execute_profile(
                                         params,
                                         csr_segs,
                                         ctx.snapshot_lsn,
+                                        ctx.decay,
                                     )
                                 }
                             })
@@ -732,10 +775,24 @@ pub fn execute_profile(
                 } else {
                     rows.sort_by(|a, b| {
                         for (expr, ascending) in items {
-                            let va =
-                                eval_expr(expr, a, memgraph, params, csr_segs, ctx.snapshot_lsn);
-                            let vb =
-                                eval_expr(expr, b, memgraph, params, csr_segs, ctx.snapshot_lsn);
+                            let va = eval_expr(
+                                expr,
+                                a,
+                                memgraph,
+                                params,
+                                csr_segs,
+                                ctx.snapshot_lsn,
+                                ctx.decay,
+                            );
+                            let vb = eval_expr(
+                                expr,
+                                b,
+                                memgraph,
+                                params,
+                                csr_segs,
+                                ctx.snapshot_lsn,
+                                ctx.decay,
+                            );
                             let ord = compare_values(&va, &vb);
                             let ord = if *ascending { ord } else { ord.reverse() };
                             if ord != std::cmp::Ordering::Equal {
@@ -755,6 +812,7 @@ pub fn execute_profile(
                     params,
                     csr_segs,
                     ctx.snapshot_lsn,
+                    ctx.decay,
                 ) {
                     Value::Int(n) if n >= 0 => n as usize,
                     _ => 0,
@@ -774,6 +832,7 @@ pub fn execute_profile(
                     params,
                     csr_segs,
                     ctx.snapshot_lsn,
+                    ctx.decay,
                 ) {
                     Value::Int(n) if n >= 0 => n as usize,
                     _ => 0,
@@ -794,7 +853,15 @@ pub fn execute_profile(
             PhysicalOp::Unwind { expr, alias } => {
                 let mut new_rows = Vec::new();
                 for row in &rows {
-                    let val = eval_expr(expr, row, memgraph, params, csr_segs, ctx.snapshot_lsn);
+                    let val = eval_expr(
+                        expr,
+                        row,
+                        memgraph,
+                        params,
+                        csr_segs,
+                        ctx.snapshot_lsn,
+                        ctx.decay,
+                    );
                     if let Value::List(items) = val {
                         for item in items {
                             let mut new_row = row.clone();
@@ -875,6 +942,7 @@ pub fn execute_profile(
                         memgraph,
                         csr_segs,
                         ctx.snapshot_lsn,
+                        ctx.decay,
                         src_key,
                         dst_key,
                         edge_types,

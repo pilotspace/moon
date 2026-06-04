@@ -18,6 +18,7 @@ pub(crate) fn eval_expr(
     params: &HashMap<String, Value>,
     immutable_segs: &[std::sync::Arc<crate::graph::csr::CsrStorage>],
     snapshot_lsn: u64,
+    decay: Option<crate::graph::scoring::DecayConfig>,
 ) -> Value {
     match expr {
         Expr::Integer(n) => Value::Int(*n),
@@ -31,7 +32,15 @@ pub(crate) fn eval_expr(
         Expr::Parameter(name) => params.get(name).cloned().unwrap_or(Value::Null),
 
         Expr::PropertyAccess { object, property } => {
-            let obj = eval_expr(object, row, memgraph, params, immutable_segs, snapshot_lsn);
+            let obj = eval_expr(
+                object,
+                row,
+                memgraph,
+                params,
+                immutable_segs,
+                snapshot_lsn,
+                decay,
+            );
             match obj {
                 Value::Node(key) => {
                     if let Some(node) = memgraph.get_node(key) {
@@ -70,13 +79,37 @@ pub(crate) fn eval_expr(
         }
 
         Expr::BinaryOp { left, op, right } => {
-            let lv = eval_expr(left, row, memgraph, params, immutable_segs, snapshot_lsn);
-            let rv = eval_expr(right, row, memgraph, params, immutable_segs, snapshot_lsn);
+            let lv = eval_expr(
+                left,
+                row,
+                memgraph,
+                params,
+                immutable_segs,
+                snapshot_lsn,
+                decay,
+            );
+            let rv = eval_expr(
+                right,
+                row,
+                memgraph,
+                params,
+                immutable_segs,
+                snapshot_lsn,
+                decay,
+            );
             eval_binary_op(&lv, *op, &rv)
         }
 
         Expr::Not(inner) => {
-            let v = eval_expr(inner, row, memgraph, params, immutable_segs, snapshot_lsn);
+            let v = eval_expr(
+                inner,
+                row,
+                memgraph,
+                params,
+                immutable_segs,
+                snapshot_lsn,
+                decay,
+            );
             match v {
                 Value::Bool(b) => Value::Bool(!b),
                 Value::Null => Value::Null,
@@ -85,7 +118,15 @@ pub(crate) fn eval_expr(
         }
 
         Expr::Negate(inner) => {
-            let v = eval_expr(inner, row, memgraph, params, immutable_segs, snapshot_lsn);
+            let v = eval_expr(
+                inner,
+                row,
+                memgraph,
+                params,
+                immutable_segs,
+                snapshot_lsn,
+                decay,
+            );
             match v {
                 Value::Int(n) => Value::Int(-n),
                 Value::Float(f) => Value::Float(-f),
@@ -94,14 +135,38 @@ pub(crate) fn eval_expr(
         }
 
         Expr::IsNull { expr, negated } => {
-            let v = eval_expr(expr, row, memgraph, params, immutable_segs, snapshot_lsn);
+            let v = eval_expr(
+                expr,
+                row,
+                memgraph,
+                params,
+                immutable_segs,
+                snapshot_lsn,
+                decay,
+            );
             let is_null = matches!(v, Value::Null);
             Value::Bool(if *negated { !is_null } else { is_null })
         }
 
         Expr::InList { expr, list } => {
-            let val = eval_expr(expr, row, memgraph, params, immutable_segs, snapshot_lsn);
-            let list_val = eval_expr(list, row, memgraph, params, immutable_segs, snapshot_lsn);
+            let val = eval_expr(
+                expr,
+                row,
+                memgraph,
+                params,
+                immutable_segs,
+                snapshot_lsn,
+                decay,
+            );
+            let list_val = eval_expr(
+                list,
+                row,
+                memgraph,
+                params,
+                immutable_segs,
+                snapshot_lsn,
+                decay,
+            );
             match list_val {
                 Value::List(items) => {
                     let found = items.iter().any(|item| {
@@ -118,7 +183,15 @@ pub(crate) fn eval_expr(
             match lower_name.as_str() {
                 "id" => {
                     if let Some(arg) = args.first() {
-                        let v = eval_expr(arg, row, memgraph, params, immutable_segs, snapshot_lsn);
+                        let v = eval_expr(
+                            arg,
+                            row,
+                            memgraph,
+                            params,
+                            immutable_segs,
+                            snapshot_lsn,
+                            decay,
+                        );
                         match v {
                             Value::Node(k) => Value::Int(k.data().as_ffi() as i64),
                             Value::Edge(k) => Value::Int(k.data().as_ffi() as i64),
@@ -130,7 +203,15 @@ pub(crate) fn eval_expr(
                 }
                 "labels" => {
                     if let Some(arg) = args.first() {
-                        let v = eval_expr(arg, row, memgraph, params, immutable_segs, snapshot_lsn);
+                        let v = eval_expr(
+                            arg,
+                            row,
+                            memgraph,
+                            params,
+                            immutable_segs,
+                            snapshot_lsn,
+                            decay,
+                        );
                         if let Value::Node(k) = v {
                             if let Some(node) = memgraph.get_node(k) {
                                 let labels: Vec<Value> =
@@ -145,7 +226,15 @@ pub(crate) fn eval_expr(
                 }
                 "type" => {
                     if let Some(arg) = args.first() {
-                        let v = eval_expr(arg, row, memgraph, params, immutable_segs, snapshot_lsn);
+                        let v = eval_expr(
+                            arg,
+                            row,
+                            memgraph,
+                            params,
+                            immutable_segs,
+                            snapshot_lsn,
+                            decay,
+                        );
                         if let Value::Edge(k) = v {
                             if let Some(edge) = memgraph.get_edge(k) {
                                 return Value::Int(edge.edge_type as i64);
@@ -158,7 +247,15 @@ pub(crate) fn eval_expr(
                 }
                 "size" => {
                     if let Some(arg) = args.first() {
-                        let v = eval_expr(arg, row, memgraph, params, immutable_segs, snapshot_lsn);
+                        let v = eval_expr(
+                            arg,
+                            row,
+                            memgraph,
+                            params,
+                            immutable_segs,
+                            snapshot_lsn,
+                            decay,
+                        );
                         match v {
                             Value::List(items) => Value::Int(items.len() as i64),
                             Value::String(s) => Value::Int(s.len() as i64),
@@ -170,7 +267,15 @@ pub(crate) fn eval_expr(
                 }
                 "tointeger" | "toint" => {
                     if let Some(arg) = args.first() {
-                        let v = eval_expr(arg, row, memgraph, params, immutable_segs, snapshot_lsn);
+                        let v = eval_expr(
+                            arg,
+                            row,
+                            memgraph,
+                            params,
+                            immutable_segs,
+                            snapshot_lsn,
+                            decay,
+                        );
                         match v {
                             Value::Int(n) => Value::Int(n),
                             Value::Float(f) => Value::Int(f as i64),
@@ -183,7 +288,15 @@ pub(crate) fn eval_expr(
                 }
                 "tofloat" => {
                     if let Some(arg) = args.first() {
-                        let v = eval_expr(arg, row, memgraph, params, immutable_segs, snapshot_lsn);
+                        let v = eval_expr(
+                            arg,
+                            row,
+                            memgraph,
+                            params,
+                            immutable_segs,
+                            snapshot_lsn,
+                            decay,
+                        );
                         match v {
                             Value::Float(f) => Value::Float(f),
                             Value::Int(n) => Value::Float(n as f64),
@@ -196,7 +309,15 @@ pub(crate) fn eval_expr(
                 }
                 "tostring" => {
                     if let Some(arg) = args.first() {
-                        let v = eval_expr(arg, row, memgraph, params, immutable_segs, snapshot_lsn);
+                        let v = eval_expr(
+                            arg,
+                            row,
+                            memgraph,
+                            params,
+                            immutable_segs,
+                            snapshot_lsn,
+                            decay,
+                        );
                         Value::String(value_to_string(&v))
                     } else {
                         Value::Null
@@ -207,7 +328,15 @@ pub(crate) fn eval_expr(
                     // the Project phase as a future enhancement. For now,
                     // return the value or null for count.
                     if let Some(arg) = args.first() {
-                        eval_expr(arg, row, memgraph, params, immutable_segs, snapshot_lsn)
+                        eval_expr(
+                            arg,
+                            row,
+                            memgraph,
+                            params,
+                            immutable_segs,
+                            snapshot_lsn,
+                            decay,
+                        )
                     } else {
                         Value::Null
                     }
@@ -217,7 +346,15 @@ pub(crate) fn eval_expr(
                     // Enables Lunaris GraphFirstRetriever edge-property temporal
                     // filter: `coalesce(r.valid_to, 9999999999) >= asof`.
                     for arg in args {
-                        let v = eval_expr(arg, row, memgraph, params, immutable_segs, snapshot_lsn);
+                        let v = eval_expr(
+                            arg,
+                            row,
+                            memgraph,
+                            params,
+                            immutable_segs,
+                            snapshot_lsn,
+                            decay,
+                        );
                         if !matches!(v, Value::Null) {
                             return v;
                         }
@@ -231,7 +368,17 @@ pub(crate) fn eval_expr(
         Expr::List(items) => {
             let values: Vec<Value> = items
                 .iter()
-                .map(|item| eval_expr(item, row, memgraph, params, immutable_segs, snapshot_lsn))
+                .map(|item| {
+                    eval_expr(
+                        item,
+                        row,
+                        memgraph,
+                        params,
+                        immutable_segs,
+                        snapshot_lsn,
+                        decay,
+                    )
+                })
                 .collect();
             Value::List(values)
         }
@@ -242,7 +389,15 @@ pub(crate) fn eval_expr(
                 .map(|(k, v)| {
                     (
                         k.clone(),
-                        eval_expr(v, row, memgraph, params, immutable_segs, snapshot_lsn),
+                        eval_expr(
+                            v,
+                            row,
+                            memgraph,
+                            params,
+                            immutable_segs,
+                            snapshot_lsn,
+                            decay,
+                        ),
                     )
                 })
                 .collect();
@@ -280,6 +435,7 @@ pub(crate) fn eval_expr(
                 memgraph,
                 immutable_segs,
                 snapshot_lsn,
+                decay,
                 src_key,
                 dst_key,
                 edge_types,
