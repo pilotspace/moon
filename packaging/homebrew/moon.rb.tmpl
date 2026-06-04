@@ -38,6 +38,9 @@ class Moon < Formula
 
   def install
     bin.install "moon"
+    # Always create the service working directory so `brew services start`
+    # does not fail with "working directory does not exist".
+    (var/"moon").mkpath
     # Install default config only when the tarball ships moon.conf.example
     # (provided by a future packaging PR; omit silently when absent so
     # `brew install` never raises "No such file" on older releases).
@@ -48,8 +51,9 @@ class Moon < Formula
   end
 
   service do
-    # moon is a pure --flag CLI (no positional config-file argument).
-    # Configuration is supplied via flags or environment variables.
+    # moon does not yet support a config-file argument (--config / positional
+    # path). Configuration is supplied via --flag arguments only until the
+    # moon.conf file-loading feature lands in a future release.
     run [opt_bin/"moon"]
     keep_alive true
     log_path var/"log/moon.log"
@@ -68,11 +72,16 @@ class Moon < Formula
       To start moon now and at login:
         brew services start pilotspace/moon/moon
 
-      The default config is at:
+      NOTE: A moon.conf template may be installed at:
         #{etc}/moon/moon.conf
+      This file is provided as a reference for CLI flag values. The managed
+      service (brew services) does NOT load it automatically — moon.conf
+      file-loading is not yet implemented. Pass flags directly, e.g.:
+        brew services start pilotspace/moon/moon -- --port 6379 --appendonly yes
+      Full config-file support (--config <path>) is planned for a future release.
 
       The embedded web console is reachable at:
-        http://localhost:<admin-port>   (see admin-port in moon.conf)
+        http://localhost:<admin-port>   (set via --admin-port flag)
     EOS
   end
 
