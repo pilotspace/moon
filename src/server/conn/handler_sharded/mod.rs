@@ -191,10 +191,7 @@ pub(crate) async fn handle_connection_sharded(
     // still decremented so the connected_clients counter stays accurate.
     #[cfg(not(unix))]
     {
-        let is_migration = matches!(
-            result.0,
-            HandlerResult::MigrateConnection { .. }
-        );
+        let is_migration = matches!(result.0, HandlerResult::MigrateConnection { .. });
         if is_migration {
             tracing::debug!(
                 "Shard {}: connection migration not supported on this platform; \

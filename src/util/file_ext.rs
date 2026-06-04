@@ -16,7 +16,6 @@
 /// Each call site MUST open its own `File` handle. Sharing a `File` across
 /// concurrent `write_at`/`read_exact_at` calls on Windows is incorrect because
 /// the cursor is process-global per handle.
-
 use std::fs::File;
 use std::io::{self, ErrorKind};
 
