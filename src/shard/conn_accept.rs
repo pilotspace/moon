@@ -272,7 +272,13 @@ pub(crate) fn spawn_tokio_connection(
 ///
 /// TLS connections cannot be migrated because TLS session state lives in userspace and
 /// cannot be reconstructed from a raw FD. Only plain TCP connections should be migrated.
-#[cfg(feature = "runtime-tokio")]
+// `unix`-gated alongside `runtime-tokio`: the signature takes a
+// `std::os::unix::io::RawFd` and reconstructs the socket via `from_raw_fd`,
+// both of which only exist on Unix. Moon targets Linux + macOS (both Unix), so
+// on every supported build `unix` is always true; the extra predicate just makes
+// the platform coupling explicit (CodeRabbit PR #144). Full non-Unix support
+// would also require gating `MigrateConnectionPayload.fd` — out of scope.
+#[cfg(all(feature = "runtime-tokio", unix))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_migrated_tokio_connection(
     fd: std::os::unix::io::RawFd,
@@ -301,6 +307,9 @@ pub(crate) fn spawn_migrated_tokio_connection(
     shard_id: usize,
     num_shards: usize,
     config_port: u16,
+    spill_sender: &Option<flume::Sender<crate::storage::tiered::spill_thread::SpillRequest>>,
+    spill_file_id: &Rc<std::cell::Cell<u64>>,
+    disk_offload_dir: &Option<std::path::PathBuf>,
 ) {
     use std::os::unix::io::FromRawFd;
 
@@ -365,6 +374,13 @@ pub(crate) fn spawn_migrated_tokio_connection(
 
             // Pool is built by the spawn site and threaded through here.
             let pool_for_ctx = aof_pool.as_ref().map(Arc::clone);
+            // Preserve the disk-offload spill context across migration — without
+            // this a migrated connection silently falls back to the non-spilling
+            // eviction path even when disk-offload is enabled, so cold-tier
+            // durability would depend on whether the connection had migrated.
+            let spill_tx = spill_sender.clone();
+            let spill_fid = spill_file_id.clone();
+            let do_dir = disk_offload_dir.clone();
             let conn_ctx = crate::server::conn::ConnectionContext::new(
                 sdbs,
                 shard_id,
@@ -390,9 +406,9 @@ pub(crate) fn spawn_migrated_tokio_connection(
                 all_regs,
                 all_rsm,
                 aff,
-                None,                             // spill_sender
-                Rc::new(std::cell::Cell::new(0)), // spill_file_id
-                None,                             // disk_offload_dir
+                spill_tx,  // spill_sender (preserved across migration)
+                spill_fid, // spill_file_id
+                do_dir,    // disk_offload_dir
             );
 
             // State restoration happens directly via migrated_state parameter —
@@ -739,7 +755,10 @@ pub(crate) fn spawn_monoio_connection(
 /// # Limitations
 ///
 /// TLS connections cannot be migrated (TLS session state is in userspace).
-#[cfg(feature = "runtime-monoio")]
+// `unix`-gated alongside `runtime-monoio` for the same reason as the tokio twin
+// above: the `RawFd` signature + `from_raw_fd` are Unix-only. Always true on
+// supported targets (Linux + macOS).
+#[cfg(all(feature = "runtime-monoio", unix))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_migrated_monoio_connection(
     fd: std::os::unix::io::RawFd,

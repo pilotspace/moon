@@ -227,16 +227,6 @@ pub fn try_evict_if_needed_with_spill_and_total(
     Ok(())
 }
 
-/// Check if eviction is needed, spilling evicted entries asynchronously via
-/// a background `SpillThread` instead of doing synchronous pwrite.
-///
-/// The async path: extracts key/value bytes, removes entry from DashTable
-/// (freeing RAM immediately), then sends a `SpillRequest` to the background
-/// thread. The pwrite is best-effort -- if the channel is full, the request
-/// is dropped (entry already removed from RAM).
-///
-/// Callers must poll `SpillThread::drain_completions()` to apply manifest
-/// and ColdIndex updates from completed spills.
 /// Seed value for a shard's spill `file_id` counter after recovery.
 ///
 /// On restart, AOF/RDB replay re-populates the hot tier and the persistence
@@ -296,6 +286,21 @@ pub fn next_spill_file_id_seed(shard_dir: Option<&Path>) -> u64 {
     }
 }
 
+/// Evict over-budget entries, spilling them to disk asynchronously via a
+/// background `SpillThread` instead of doing a synchronous pwrite on the event
+/// loop.
+///
+/// Per victim (`evict_one_async_spill`): serialize the key/value into a
+/// `SpillRequest`, **`try_send` it to the spill channel BEFORE removing the
+/// entry from the hot tier, and only remove from RAM once the send succeeds.**
+/// This ordering is fail-safe: if the channel is full or disconnected the send
+/// fails, the key stays in RAM, and the eviction loop bails out to retry on the
+/// next tick — no acknowledged data is lost. The worst case under sustained
+/// backpressure is keys remaining resident (eventually an OOM write-rejection
+/// once at budget), which is correct behaviour, not data loss.
+///
+/// Callers must poll `SpillThread::drain_completions()` to apply the manifest
+/// and `ColdIndex` updates produced by completed spills.
 pub fn try_evict_if_needed_async_spill(
     db: &mut Database,
     config: &RuntimeConfig,
@@ -355,76 +360,6 @@ pub fn try_evict_if_needed_async_spill_with_total(
     }
 
     Ok(())
-}
-
-/// Evict entries to bring memory under maxmemory, returning removed
-/// (key, Entry) pairs for deferred spill OUTSIDE the write lock.
-///
-/// Inside the lock: only find_victim + db.remove (~600ns per eviction).
-/// The caller extracts value bytes from the owned Entry after releasing
-/// the lock, then sends SpillRequests to the background thread.
-pub fn try_evict_deferred(
-    db: &mut Database,
-    config: &RuntimeConfig,
-) -> Result<smallvec::SmallVec<[(Bytes, crate::storage::entry::Entry); 2]>, Frame> {
-    if config.maxmemory == 0 {
-        return Ok(smallvec::SmallVec::new());
-    }
-
-    // Per-shard budget (see `try_evict_if_needed_with_spill_and_total`).
-    let budget = config.maxmemory_per_shard();
-    let total_memory = db.estimated_memory();
-    if total_memory <= budget {
-        return Ok(smallvec::SmallVec::new());
-    }
-
-    let policy = EvictionPolicy::from_str(&config.maxmemory_policy);
-    let mut evicted = smallvec::SmallVec::new();
-    let mut current_total = total_memory;
-
-    while current_total > budget {
-        if policy == EvictionPolicy::NoEviction {
-            return Err(oom_error());
-        }
-
-        let victim = find_victim_for_policy(db, config, &policy);
-        let key = match victim {
-            Some(k) => k,
-            None => return Err(oom_error()),
-        };
-
-        let before = db.estimated_memory();
-        let key_bytes = Bytes::copy_from_slice(key.as_bytes());
-        if let Some(entry) = db.remove(key.as_bytes()) {
-            evicted.push((key_bytes, entry));
-        }
-        let after = db.estimated_memory();
-        current_total = current_total.saturating_sub(before.saturating_sub(after));
-    }
-
-    Ok(evicted)
-}
-
-/// Find a victim key using the given eviction policy.
-fn find_victim_for_policy(
-    db: &Database,
-    config: &RuntimeConfig,
-    policy: &EvictionPolicy,
-) -> Option<CompactKey> {
-    match policy {
-        EvictionPolicy::NoEviction => None,
-        EvictionPolicy::AllKeysLru => find_victim_lru(db, config.maxmemory_samples, false),
-        EvictionPolicy::AllKeysLfu => {
-            find_victim_lfu(db, config.maxmemory_samples, config.lfu_decay_time, false)
-        }
-        EvictionPolicy::AllKeysRandom => find_victim_random(db, false),
-        EvictionPolicy::VolatileLru => find_victim_lru(db, config.maxmemory_samples, true),
-        EvictionPolicy::VolatileLfu => {
-            find_victim_lfu(db, config.maxmemory_samples, config.lfu_decay_time, true)
-        }
-        EvictionPolicy::VolatileRandom => find_victim_random(db, true),
-        EvictionPolicy::VolatileTtl => find_victim_volatile_ttl(db, config.maxmemory_samples),
-    }
 }
 
 /// Evict a single key via the async spill path.
@@ -1046,6 +981,62 @@ mod tests {
 
         // file_id should have been incremented
         assert_eq!(next_file_id, 2);
+    }
+
+    /// Fail-safe send-before-remove: when the async-spill request channel is
+    /// FULL, eviction must NOT remove the victim from the hot tier (no data
+    /// loss) and must surface OOM rather than pretend success. The live path
+    /// (`evict_one_async_spill`) `try_send`s the `SpillRequest` BEFORE
+    /// `db.remove`, so a failed send leaves the key resident for retry on the
+    /// next eviction tick. This regression guard locks that ordering — the exact
+    /// request-side data-loss scenario CodeRabbit raised on PR #144 (verified
+    /// stale against the live code; this test keeps it that way).
+    #[test]
+    fn async_spill_full_channel_keeps_victim_in_ram_no_data_loss() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shard_dir = tmp.path();
+        let mut next_file_id = 1u64;
+
+        let mut db = Database::new();
+        db.set_string(Bytes::from_static(b"k1"), Bytes::from_static(b"v1"));
+
+        // Per-shard budget of 1 byte forces an eviction attempt for k1.
+        let config = make_config(1, "allkeys-lru");
+
+        // bounded(1) PRE-FILLED so the eviction's `try_send` observes a FULL
+        // channel (the reviewer's backpressure scenario) rather than a
+        // disconnect — both fail `try_send`, but full is the precise concern.
+        let (tx, _rx) = flume::bounded::<SpillRequest>(1);
+        tx.try_send(SpillRequest {
+            key: Bytes::from_static(b"filler"),
+            db_index: 0,
+            value_bytes: Bytes::from_static(b"x"),
+            value_type: ValueType::String,
+            flags: 0,
+            ttl_ms: None,
+            file_id: 0,
+            shard_dir: shard_dir.to_path_buf(),
+        })
+        .expect("filler occupies the single channel slot");
+
+        let result =
+            try_evict_if_needed_async_spill(&mut db, &config, &tx, shard_dir, &mut next_file_id, 0);
+
+        // Could not enqueue the spill → OOM surfaced, never a false success.
+        assert!(
+            result.is_err(),
+            "a full spill channel must surface OOM, never silently succeed"
+        );
+        // CRUCIAL: the victim is still resident — no acknowledged-write data loss.
+        assert_eq!(
+            db.len(),
+            1,
+            "victim must NOT be removed from RAM when the spill send fails"
+        );
+        assert!(
+            db.data().get(&b"k1"[..]).is_some(),
+            "k1 must remain in the hot tier for retry on the next eviction tick"
+        );
     }
 
     #[test]

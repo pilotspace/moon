@@ -1233,7 +1233,7 @@ impl super::Shard {
                             "Shard {}: accepting migrated connection (fd={}, client_id={}, from={})",
                             shard_id, fd, state.client_id, state.peer_addr
                         );
-                        #[cfg(feature = "runtime-tokio")]
+                        #[cfg(all(feature = "runtime-tokio", unix))]
                         {
                             conn_accept::spawn_migrated_tokio_connection(
                                 fd, state,
@@ -1244,9 +1244,10 @@ impl super::Shard {
                                 &cached_clock, &remote_sub_map_arc, &all_pubsub_registries,
                                 &all_remote_sub_maps, &affinity_tracker,
                                 shard_id, num_shards, config_port,
+                                &spill_sender, &spill_file_id, &disk_offload_dir,
                             );
                         }
-                        #[cfg(feature = "runtime-monoio")]
+                        #[cfg(all(feature = "runtime-monoio", unix))]
                         {
                             conn_accept::spawn_migrated_monoio_connection(
                                 fd, state,
@@ -1332,7 +1333,7 @@ impl super::Shard {
                             "Shard {}: accepting migrated connection (fd={}, client_id={}, from={})",
                             shard_id, fd, state.client_id, state.peer_addr
                         );
-                        #[cfg(feature = "runtime-tokio")]
+                        #[cfg(all(feature = "runtime-tokio", unix))]
                         {
                             conn_accept::spawn_migrated_tokio_connection(
                                 fd, state,
@@ -1343,9 +1344,10 @@ impl super::Shard {
                                 &cached_clock, &remote_sub_map_arc, &all_pubsub_registries,
                                 &all_remote_sub_maps, &affinity_tracker,
                                 shard_id, num_shards, config_port,
+                                &spill_sender, &spill_file_id, &disk_offload_dir,
                             );
                         }
-                        #[cfg(feature = "runtime-monoio")]
+                        #[cfg(all(feature = "runtime-monoio", unix))]
                         {
                             conn_accept::spawn_migrated_monoio_connection(
                                 fd, state,
@@ -1975,6 +1977,10 @@ impl super::Shard {
                         state.client_id,
                         state.peer_addr
                     );
+                    // `unix`-gated to match `spawn_migrated_monoio_connection`'s
+                    // Unix-only `RawFd` signature (CodeRabbit PR #144). Always
+                    // compiled on supported targets (Linux + macOS).
+                    #[cfg(unix)]
                     conn_accept::spawn_migrated_monoio_connection(
                         fd,
                         state,

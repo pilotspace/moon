@@ -32,10 +32,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 /// reasonable memory budget and keeps file sizes manageable.
 const FLUSH_ENTRY_CAP: usize = 256;
 
-/// Cumulative count of `SpillCompletion`s dropped because the event-loop-side
-/// completion channel was full. Each drop means the data is on disk but the
-/// in-memory `cold_index` slot was not refreshed; the next checkpoint repairs
-/// it from the manifest.
+/// Cumulative count of `SpillCompletion`s dropped. Dropping is **data loss**:
+/// the `.mpf` file is on disk but its manifest `add_file` + `cold_index` insert
+/// happen only when the event loop consumes the completion, and the keys are
+/// already evicted from RAM. The sender therefore blocks on a full channel
+/// instead of dropping, so this only increments in the rare
+/// shutdown-with-full-channel edge. Exposed for INFO / metrics scraping.
 static SPILL_COMPLETION_DROPPED: AtomicU64 = AtomicU64::new(0);
 
 /// Returns the cumulative number of dropped spill completions across all
@@ -183,7 +185,7 @@ fn flush_buffer(buffer: &mut Vec<SpillRequest>) -> Vec<SpillCompletion> {
             })
             .collect();
 
-        let completion = match build_kv_spill_batch(&spill_entries, file_id) {
+        match build_kv_spill_batch(&spill_entries, file_id) {
             Ok(batch) => {
                 let total_pages = batch.leaves.len() as u32; // overflow is always empty (inline-only)
                 match write_kv_spill_batch(&shard_dir, file_id, &batch) {
@@ -198,23 +200,23 @@ fn flush_buffer(buffer: &mut Vec<SpillRequest>) -> Vec<SpillCompletion> {
                                 slot_idx,
                             })
                             .collect();
-                        SpillCompletion {
+                        completions.push(SpillCompletion {
                             file_entry: make_file_entry(file_id, total_pages, byte_size),
                             entries,
                             success: true,
-                        }
+                        });
                     }
                     Err(e) => {
                         warn!(
                             file_id,
                             error = %e,
                             count = inline_indices.len(),
-                            "spill_thread: inline batch write failed"
+                            "spill_thread: inline batch write failed; falling back to per-entry spill"
                         );
-                        SpillCompletion {
-                            file_entry: make_file_entry(file_id, 0, 0),
-                            entries: Vec::new(),
-                            success: false,
+                        // Salvage each entry individually rather than dropping the
+                        // whole already-evicted flush.
+                        for &i in &inline_indices {
+                            completions.push(spill_single_entry(&buffer[i], buffer[i].file_id));
                         }
                     }
                 }
@@ -224,63 +226,61 @@ fn flush_buffer(buffer: &mut Vec<SpillRequest>) -> Vec<SpillCompletion> {
                     file_id,
                     error = %e,
                     count = inline_indices.len(),
-                    "spill_thread: inline batch build failed"
+                    "spill_thread: inline batch build failed; falling back to per-entry spill"
                 );
-                SpillCompletion {
-                    file_entry: make_file_entry(file_id, 0, 0),
-                    entries: Vec::new(),
-                    success: false,
+                // One entry that does not fit a fresh inline leaf must not drop the
+                // whole batch — write each via the overflow path instead.
+                for &i in &inline_indices {
+                    completions.push(spill_single_entry(&buffer[i], buffer[i].file_id));
                 }
             }
-        };
-        completions.push(completion);
+        }
     }
 
     // ── Write ONE single-page file per oversized entry ────────────────────────
     for &i in &oversized_indices {
-        let req = &buffer[i];
-        let file_id = req.file_id;
-        let shard_dir = req.shard_dir.clone();
+        completions.push(spill_single_entry(&buffer[i], buffer[i].file_id));
+    }
 
-        let completion = match build_kv_spill_pages(
-            &req.key,
-            &req.value_bytes,
-            req.value_type,
-            req.flags,
-            req.ttl_ms,
-            file_id,
-        ) {
-            Ok(pages) => match write_kv_spill_pages(&shard_dir, file_id, &pages) {
-                Ok(byte_size) => SpillCompletion {
-                    file_entry: make_file_entry(file_id, pages.total_pages, byte_size),
-                    entries: vec![SpillCompletionEntry {
-                        key: req.key.clone(),
-                        db_index: req.db_index,
-                        page_idx: 0,
-                        slot_idx: 0,
-                    }],
-                    success: true,
-                },
-                Err(e) => {
-                    warn!(
-                        file_id,
-                        error = %e,
-                        key_len = req.key.len(),
-                        "spill_thread: oversized single-file write failed"
-                    );
-                    SpillCompletion {
-                        file_entry: make_file_entry(file_id, 0, 0),
-                        entries: Vec::new(),
-                        success: false,
-                    }
-                }
+    buffer.clear();
+    completions
+}
+
+/// Spill ONE entry as its own single-page (+overflow) file via
+/// `build_kv_spill_pages`.
+///
+/// Used both for oversized entries and as the inline-batch fallback: when an
+/// inline batch fails (an entry that passed the `value_bytes.len()` pre-screen
+/// still does not fit a fresh leaf), salvaging each entry here prevents one bad
+/// candidate from dropping a whole flush whose keys are already out of RAM.
+/// Returns a failed completion only if this single entry cannot be written even
+/// with overflow pages (key too large for a leaf).
+fn spill_single_entry(req: &SpillRequest, file_id: u64) -> SpillCompletion {
+    match build_kv_spill_pages(
+        &req.key,
+        &req.value_bytes,
+        req.value_type,
+        req.flags,
+        req.ttl_ms,
+        file_id,
+    ) {
+        Ok(pages) => match write_kv_spill_pages(&req.shard_dir, file_id, &pages) {
+            Ok(byte_size) => SpillCompletion {
+                file_entry: make_file_entry(file_id, pages.total_pages, byte_size),
+                entries: vec![SpillCompletionEntry {
+                    key: req.key.clone(),
+                    db_index: req.db_index,
+                    page_idx: 0,
+                    slot_idx: 0,
+                }],
+                success: true,
             },
             Err(e) => {
                 warn!(
                     file_id,
                     error = %e,
                     key_len = req.key.len(),
-                    "spill_thread: oversized single-file build failed (key too large)"
+                    "spill_thread: single-file write failed"
                 );
                 SpillCompletion {
                     file_entry: make_file_entry(file_id, 0, 0),
@@ -288,12 +288,21 @@ fn flush_buffer(buffer: &mut Vec<SpillRequest>) -> Vec<SpillCompletion> {
                     success: false,
                 }
             }
-        };
-        completions.push(completion);
+        },
+        Err(e) => {
+            warn!(
+                file_id,
+                error = %e,
+                key_len = req.key.len(),
+                "spill_thread: single-file build failed (key too large)"
+            );
+            SpillCompletion {
+                file_entry: make_file_entry(file_id, 0, 0),
+                entries: Vec::new(),
+                success: false,
+            }
+        }
     }
-
-    buffer.clear();
-    completions
 }
 
 /// Background thread that performs pwrite for evicted KV entries.
@@ -357,10 +366,15 @@ impl SpillThread {
         let mut buffer: Vec<SpillRequest> = Vec::with_capacity(FLUSH_ENTRY_CAP);
 
         loop {
-            // Check stop flag — but flush the buffer before exiting.
+            // Check stop flag — drain any still-queued requests and flush them
+            // before exiting, so spills queued at shutdown are not lost (their
+            // keys may already be evicted from RAM).
             if stop_flag.load(Ordering::Acquire) {
+                while let Ok(req) = request_rx.try_recv() {
+                    buffer.push(req);
+                }
                 if !buffer.is_empty() {
-                    Self::send_completions(&completion_tx, flush_buffer(&mut buffer));
+                    Self::send_completions(&completion_tx, flush_buffer(&mut buffer), &stop_flag);
                 }
                 break;
             }
@@ -369,19 +383,31 @@ impl SpillThread {
                 Ok(req) => {
                     buffer.push(req);
                     if buffer.len() >= FLUSH_ENTRY_CAP {
-                        Self::send_completions(&completion_tx, flush_buffer(&mut buffer));
+                        Self::send_completions(
+                            &completion_tx,
+                            flush_buffer(&mut buffer),
+                            &stop_flag,
+                        );
                     }
                 }
                 Err(flume::RecvTimeoutError::Timeout) => {
                     // Latency guard: flush non-empty buffer on tick.
                     if !buffer.is_empty() {
-                        Self::send_completions(&completion_tx, flush_buffer(&mut buffer));
+                        Self::send_completions(
+                            &completion_tx,
+                            flush_buffer(&mut buffer),
+                            &stop_flag,
+                        );
                     }
                 }
                 Err(flume::RecvTimeoutError::Disconnected) => {
                     // Drain guard: flush remaining entries then exit.
                     if !buffer.is_empty() {
-                        Self::send_completions(&completion_tx, flush_buffer(&mut buffer));
+                        Self::send_completions(
+                            &completion_tx,
+                            flush_buffer(&mut buffer),
+                            &stop_flag,
+                        );
                     }
                     break;
                 }
@@ -389,32 +415,63 @@ impl SpillThread {
         }
     }
 
-    /// Send multiple completions, dropping on full channel and bumping the counter.
+    /// Send multiple completions, applying backpressure on a full channel.
     fn send_completions(
         completion_tx: &flume::Sender<SpillCompletion>,
         completions: Vec<SpillCompletion>,
+        stop_flag: &Arc<AtomicBool>,
     ) {
         for completion in completions {
-            Self::send_one_completion(completion_tx, completion);
+            Self::send_one_completion(completion_tx, completion, stop_flag);
         }
     }
 
-    /// Send a single completion, dropping on full channel and bumping the counter.
+    /// Send a single completion to the event loop.
+    ///
+    /// Dropping a completion is **data loss**: by the time it is produced the
+    /// key has already been evicted from RAM, and the manifest `add_file` +
+    /// `cold_index` insert happen only when the event loop consumes the
+    /// completion (`apply_spill_completions`). A dropped completion therefore
+    /// orphans the on-disk `.mpf` file (never recorded in the manifest) and
+    /// loses its keys permanently after restart.
+    ///
+    /// So we block until the event loop drains a slot rather than dropping.
+    /// This is safe: the dedicated spill thread is the only blocker, and the
+    /// eviction path enqueues `SpillRequest`s with `try_send` (never blocking
+    /// on us), so there is no cyclic wait. We honour `stop_flag` so shutdown
+    /// cannot wedge the join — and because `shutdown()` drains the channel
+    /// after the join, the final-flush completions are still applied.
     fn send_one_completion(
         completion_tx: &flume::Sender<SpillCompletion>,
         completion: SpillCompletion,
+        stop_flag: &Arc<AtomicBool>,
     ) {
-        match completion_tx.try_send(completion) {
-            Ok(()) => {}
-            Err(flume::TrySendError::Full(_)) => {
-                SPILL_COMPLETION_DROPPED.fetch_add(1, Ordering::Relaxed);
-                warn!(
-                    "spill_thread: completion channel full, dropping completion (total dropped: {})",
-                    SPILL_COMPLETION_DROPPED.load(Ordering::Relaxed)
-                );
-            }
-            Err(flume::TrySendError::Disconnected(_)) => {
-                // Event loop dropped its receiver -- shutting down; ignore.
+        let mut pending = completion;
+        loop {
+            match completion_tx.send_timeout(pending, std::time::Duration::from_millis(100)) {
+                Ok(()) => return,
+                Err(flume::SendTimeoutError::Timeout(c)) => {
+                    if stop_flag.load(Ordering::Acquire) {
+                        // Shutting down and the event loop is no longer draining;
+                        // we cannot persist the manifest entry ourselves. Count +
+                        // warn. In practice unreachable: shutdown() drains the
+                        // channel before the final flush, and that flush is bounded
+                        // by FLUSH_ENTRY_CAP (< channel capacity), so it always fits.
+                        SPILL_COMPLETION_DROPPED.fetch_add(1, Ordering::Relaxed);
+                        warn!(
+                            "spill_thread: completion channel full at shutdown; dropping completion (total dropped: {})",
+                            SPILL_COMPLETION_DROPPED.load(Ordering::Relaxed)
+                        );
+                        return;
+                    }
+                    // Backpressure: the event loop will drain a slot. Retry rather
+                    // than drop — a dropped completion is permanent key loss.
+                    pending = c;
+                }
+                Err(flume::SendTimeoutError::Disconnected(_)) => {
+                    // Event loop dropped its receiver -- shutting down; ignore.
+                    return;
+                }
             }
         }
     }
@@ -444,11 +501,18 @@ impl SpillThread {
     /// still alive: the background thread polls the flag every 100 ms and
     /// exits without waiting for channel close. This avoids the deadlock where
     /// connection futures held cloned senders past shutdown.
-    pub fn shutdown(mut self) {
+    /// Returns any completions produced by the thread's final buffer flush that
+    /// the event loop never drained, so the caller can still apply them
+    /// (manifest `add_file` + `cold_index` insert) instead of losing those keys.
+    #[must_use]
+    pub fn shutdown(mut self) -> Vec<SpillCompletion> {
         self.stop_flag.store(true, Ordering::Release);
         if let Some(handle) = self.join_handle.take() {
             let _ = handle.join();
         }
+        // Thread has exited; surface any completions from its final buffer flush
+        // that the event loop never drained, so the caller can still apply them.
+        self.completion_rx.try_iter().collect()
     }
 }
 
@@ -486,7 +550,7 @@ mod tests {
         let st = SpillThread::new(0);
         assert!(!st.request_tx.is_disconnected());
         assert!(!st.completion_rx.is_disconnected());
-        st.shutdown();
+        let _ = st.shutdown();
     }
 
     /// Single request produces a successful per-FILE completion with one entry.
@@ -551,7 +615,143 @@ mod tests {
             _ => panic!("expected String"),
         }
 
-        st.shutdown();
+        let _ = st.shutdown();
+    }
+
+    /// A full completion channel must apply backpressure (block until the event
+    /// loop drains a slot), never drop — a dropped completion permanently loses
+    /// the already-evicted keys (orphaned `.mpf`, never recorded in the manifest).
+    #[test]
+    fn full_completion_channel_blocks_instead_of_dropping() {
+        use std::sync::atomic::AtomicUsize;
+        let (tx, rx) = flume::bounded::<SpillCompletion>(1);
+        let stop = Arc::new(AtomicBool::new(false));
+        let dummy = || SpillCompletion {
+            file_entry: make_file_entry(7, 1, PAGE_4K as u64),
+            entries: Vec::new(),
+            success: true,
+        };
+
+        // Saturate the single slot so the next send must wait for a free slot.
+        tx.try_send(dummy()).unwrap();
+
+        let received = Arc::new(AtomicUsize::new(0));
+        let r2 = received.clone();
+        let drainer = std::thread::spawn(move || {
+            // Delay draining so send_one_completion is forced to block first.
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while std::time::Instant::now() < deadline {
+                if rx
+                    .recv_timeout(std::time::Duration::from_millis(50))
+                    .is_ok()
+                {
+                    r2.fetch_add(1, Ordering::Relaxed);
+                } else if r2.load(Ordering::Relaxed) >= 2 {
+                    break;
+                }
+            }
+        });
+
+        // Must block until a slot frees, then deliver — never drop on Full.
+        SpillThread::send_one_completion(&tx, dummy(), &stop);
+        drop(tx);
+        drainer.join().unwrap();
+
+        assert_eq!(
+            received.load(Ordering::Relaxed),
+            2,
+            "both completions must be delivered; a Full channel must block, not drop"
+        );
+    }
+
+    /// `shutdown()` must surface the thread's final-flush completions so the
+    /// caller can still apply them — they would otherwise be silently lost
+    /// (file on disk, never added to the manifest).
+    #[test]
+    fn shutdown_drains_and_returns_unapplied_completions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let st = SpillThread::new(9);
+        let sender = st.sender();
+        sender
+            .send(SpillRequest {
+                key: Bytes::from_static(b"shutdown_key"),
+                db_index: 0,
+                value_bytes: Bytes::from_static(b"v"),
+                value_type: ValueType::String,
+                flags: 0,
+                ttl_ms: None,
+                file_id: 1,
+                shard_dir: tmp.path().to_path_buf(),
+            })
+            .unwrap();
+        drop(sender);
+
+        // Deliberately do NOT drain via the event loop. The completion is
+        // produced by the thread's final flush; shutdown() must return it.
+        let leftover = st.shutdown();
+        let total: usize = leftover.iter().map(|c| c.entries.len()).sum();
+        assert_eq!(
+            total, 1,
+            "shutdown must return the unapplied completion, not drop it"
+        );
+    }
+
+    /// An entry that passes the `INLINE_MAX_VALUE_BYTES` pre-screen but does not
+    /// fit a fresh inline leaf (large key + incompressible value) makes
+    /// `build_kv_spill_batch` fail. That must NOT fail the whole inline flush —
+    /// the offender is salvaged via the per-entry (overflow) path instead, since
+    /// its key is already evicted from RAM.
+    #[test]
+    fn inline_batch_failure_falls_back_to_per_entry_spill() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // High-entropy (LZ4-incompressible) value at the inline threshold.
+        let mut value = Vec::with_capacity(INLINE_MAX_VALUE_BYTES);
+        let mut s: u32 = 0x1234_5678;
+        for _ in 0..INLINE_MAX_VALUE_BYTES {
+            s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            value.push((s >> 24) as u8);
+        }
+        // Sizable key so key + value overflows a 4KB leaf (forces batch failure),
+        // yet the key alone fits a leaf with an overflow pointer (pages succeed).
+        let key = vec![b'k'; 800];
+
+        let mut buffer = vec![SpillRequest {
+            key: Bytes::from(key),
+            db_index: 0,
+            value_bytes: Bytes::from(value),
+            value_type: ValueType::String,
+            flags: 0,
+            ttl_ms: None,
+            file_id: 1,
+            shard_dir: tmp.path().to_path_buf(),
+        }];
+
+        let completions = flush_buffer(&mut buffer);
+        let succeeded: usize = completions
+            .iter()
+            .filter(|c| c.success)
+            .map(|c| c.entries.len())
+            .sum();
+        assert_eq!(
+            succeeded, 1,
+            "inline entry that overflows a leaf must be salvaged via per-entry fallback, not dropped"
+        );
+
+        // And the salvaged entry must be readable back from its on-disk file.
+        let c = completions
+            .iter()
+            .find(|c| c.success && !c.entries.is_empty())
+            .expect("expected a successful fallback completion");
+        let file_path = tmp
+            .path()
+            .join("data")
+            .join(format!("heap-{:06}.mpf", c.file_entry.file_id));
+        assert!(
+            file_path.exists(),
+            "fallback spill file should exist on disk"
+        );
     }
 
     #[test]
@@ -584,7 +784,7 @@ mod tests {
         assert!(c.success);
         assert_eq!(c.file_entry.file_type, PageType::KvLeaf as u8);
 
-        st.shutdown();
+        let _ = st.shutdown();
     }
 
     #[test]
@@ -592,7 +792,7 @@ mod tests {
         let st = SpillThread::new(3);
         let sender = st.sender();
         drop(sender);
-        st.shutdown();
+        let _ = st.shutdown();
         // Reaching here without hang = clean exit.
     }
 
@@ -645,7 +845,7 @@ mod tests {
             }
         }
 
-        st.shutdown();
+        let _ = st.shutdown();
     }
 
     /// Full pipeline: 5 requests, verify round-trip via cold_read.
@@ -680,7 +880,7 @@ mod tests {
             assert!(c.success);
         }
 
-        st.shutdown();
+        let _ = st.shutdown();
     }
 
     #[test]
@@ -717,7 +917,7 @@ mod tests {
         assert_eq!(received, sent, "should receive all sent entries");
 
         drop(sender);
-        st.shutdown();
+        let _ = st.shutdown();
     }
 
     #[test]
@@ -742,7 +942,7 @@ mod tests {
         drop(sender);
 
         let start = std::time::Instant::now();
-        st.shutdown();
+        let _ = st.shutdown();
         let elapsed = start.elapsed();
 
         assert!(
