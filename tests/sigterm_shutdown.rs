@@ -65,7 +65,10 @@ fn send_sigterm(pid: u32) {
 }
 
 /// Core test body: spawn moon, wait for readiness, send SIGTERM, assert clean exit.
-fn assert_sigterm_clean_exit(label: &str) {
+///
+/// `extra_args` is appended to the base arg list so individual cases can enable
+/// optional subsystems (e.g. `--admin-port`) that spawn threads earlier in main().
+fn assert_sigterm_clean_exit(label: &str, extra_args: &[&str]) {
     let port = free_port();
     let dir = std::env::temp_dir().join(format!(
         "moon-sigterm-{}-{}-{}",
@@ -75,17 +78,24 @@ fn assert_sigterm_clean_exit(label: &str) {
     ));
     std::fs::create_dir_all(&dir).expect("mk tmpdir");
 
+    // Bind to locals so the &str slices in base_args are not temporaries.
+    let port_str = port.to_string();
+    let dir_str = dir.to_string_lossy().into_owned();
+
+    let mut base_args: Vec<&str> = vec![
+        "--port",
+        &port_str,
+        "--dir",
+        &dir_str,
+        "--appendonly",
+        "no",
+        "--shards",
+        "1",
+    ];
+    base_args.extend_from_slice(extra_args);
+
     let mut child = Command::new(moon_binary())
-        .args([
-            "--port",
-            &port.to_string(),
-            "--dir",
-            &dir.to_string_lossy(),
-            "--appendonly",
-            "no",
-            "--shards",
-            "1",
-        ])
+        .args(&base_args)
         .stdout(std::fs::File::create(dir.join("moon.stdout.log")).expect("create stdout log"))
         .stderr(std::fs::File::create(dir.join("moon.stderr.log")).expect("create stderr log"))
         .spawn()
@@ -134,5 +144,20 @@ fn assert_sigterm_clean_exit(label: &str) {
 
 #[test]
 fn sigterm_clean_exit_default() {
-    assert_sigterm_clean_exit("default");
+    assert_sigterm_clean_exit("default", &[]);
+}
+
+/// Regression guard: the Prometheus/admin thread is spawned at line ~267 in
+/// main(), which is BEFORE the old (wrong) location of the SIGTERM block (~370).
+/// With `--admin-port` set, that thread exists with SIGTERM unblocked unless the
+/// block runs at the very top of main (current correct position: ~69).
+///
+/// If someone moves the sigmask call back below metrics init, a process-directed
+/// SIGTERM will be delivered to the admin thread (SIG_DFL → terminate with
+/// signal 15), this test turns RED, and the regression is caught.
+#[test]
+fn sigterm_clean_exit_with_admin_port() {
+    let admin_port = free_port();
+    let admin_port_str = admin_port.to_string();
+    assert_sigterm_clean_exit("admin", &["--admin-port", &admin_port_str]);
 }
