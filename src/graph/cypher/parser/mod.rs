@@ -2,7 +2,7 @@
 //!
 //! Operates on tokens from the `logos`-based lexer. Each clause type has its
 //! own parsing method. Nesting depth is tracked to prevent stack overflow
-//! from pathologically nested expressions (default limit: 64).
+//! from pathologically nested expressions (`DEFAULT_MAX_NESTING_DEPTH`).
 //!
 //! Parameters (`$name`) are stored as `Expr::Parameter` -- never interpolated
 //! into the query string, preventing Cypher injection (CVE-2024-8309).
@@ -72,6 +72,20 @@ impl core::fmt::Display for CypherError {
         }
     }
 }
+
+/// Default nesting-depth limit for Cypher expressions/patterns.
+///
+/// The recursive-descent expression grammar pushes ~9 stack frames per source
+/// nesting level (`parse_expression` → or → and → not → comparison → addition →
+/// multiplication → unary → primary → recurse). `check_depth` only counts source
+/// levels, so the limit must be low enough that `limit × ~9` debug frames fit the
+/// SMALLEST stack the parser can run on. Cypher is parsed on async worker threads
+/// (tokio/monoio default to 2 MiB stacks, not the 8 MiB main thread), so a limit
+/// that overflows 2 MiB is a real DoS: a pathologically nested query aborts the
+/// process (SIGABRT) instead of returning `NestingDepthExceeded`. 32 levels keeps
+/// the worst-case descent to ~288 frames (well under 2 MiB even in debug) while
+/// still allowing far deeper nesting than any real query needs.
+pub const DEFAULT_MAX_NESTING_DEPTH: u32 = 32;
 
 /// Recursive descent Cypher parser.
 pub struct Parser<'a> {
@@ -562,7 +576,7 @@ mod tests {
     use super::*;
 
     fn parse(input: &str) -> Result<CypherQuery, CypherError> {
-        let mut parser = Parser::new(input.as_bytes(), 64);
+        let mut parser = Parser::new(input.as_bytes(), DEFAULT_MAX_NESTING_DEPTH);
         parser.parse()
     }
 
@@ -754,22 +768,30 @@ mod tests {
 
     #[test]
     fn test_nesting_depth_exceeded() {
-        // Create deeply nested expression: (((((...))))) > 64 levels
+        // Nesting well beyond DEFAULT_MAX_NESTING_DEPTH must return a graceful
+        // error — NOT overflow the stack (SIGABRT). The guard has to fire before
+        // the recursive-descent frames exhaust a 2 MiB worker-thread stack, which
+        // is why the limit is bounded; this test runs on a default (small) test
+        // thread stack and historically aborted the whole process here.
+        let depth = (DEFAULT_MAX_NESTING_DEPTH as usize) + 8;
         let mut query = String::from("MATCH (n) WHERE ");
-        for _ in 0..70 {
+        for _ in 0..depth {
             query.push('(');
         }
         query.push('1');
-        for _ in 0..70 {
+        for _ in 0..depth {
             query.push(')');
         }
         query.push_str(" = 1 RETURN n");
 
         let result = parse(&query);
         assert!(
-            matches!(result, Err(CypherError::NestingDepthExceeded { limit: 64 })),
-            "expected NestingDepthExceeded, got {:?}",
-            result
+            matches!(
+                result,
+                Err(CypherError::NestingDepthExceeded { limit })
+                    if limit == DEFAULT_MAX_NESTING_DEPTH
+            ),
+            "expected NestingDepthExceeded(limit={DEFAULT_MAX_NESTING_DEPTH}), got {result:?}"
         );
     }
 

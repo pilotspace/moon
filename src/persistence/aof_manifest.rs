@@ -1152,17 +1152,27 @@ impl AofManifest {
     }
 
     /// Advance a single shard to a new sequence: write the shard's new base RDB,
-    /// create a new empty incr file, delete old shard files, then update the
-    /// shard's `max_lsn` in the in-memory manifest.
+    /// create a new empty incr file, then update the shard's `max_lsn` in the
+    /// in-memory manifest.
+    ///
+    /// **Does NOT delete the old generation's files.** Deletion is deferred to
+    /// the coordinator via [`prune_shard_files`](Self::prune_shard_files),
+    /// called only AFTER `write_manifest()` durably commits the new seq.
+    /// Deleting before the commit would leave a crash window where the
+    /// persisted (old) seq points at files that are already gone — recovery
+    /// resolves base/incr by `self.seq`, so a crash mid-fan-out would lose data
+    /// for any shard that had already advanced. This matches the post-commit
+    /// deletion ordering in [`advance`](Self::advance) (TopLevel layout).
     ///
     /// **Caller MUST call `write_manifest()` after all shards have been advanced**
-    /// to persist the updated manifest atomically. Advancing shards one at a time
-    /// and writing the manifest per-shard would leave the manifest in an
-    /// inconsistent state between calls.
+    /// (and set `self.seq` to the new seq) to persist the updated manifest
+    /// atomically — this is the single durable commit point for the rewrite.
+    /// Advancing shards one at a time and writing the manifest per-shard would
+    /// leave the manifest in an inconsistent state between calls.
     ///
     /// For `TopLevel` layout, `shard_id` must be 0 and this delegates to
-    /// `advance()`. For `PerShard` layout, files are written to
-    /// `shard_dir(shard_id)/`.
+    /// `advance()` (which deletes post-commit internally). For `PerShard`
+    /// layout, files are written to `shard_dir(shard_id)/`.
     ///
     /// Returns the path to the new incremental file for this shard.
     pub fn advance_shard(
@@ -1189,7 +1199,6 @@ impl AofManifest {
                 ),
             })?;
 
-        let old_seq = self.seq;
         let shard_dir = self.shard_dir(shard_id);
         std::fs::create_dir_all(&shard_dir).map_err(|e| crate::error::AofError::Io {
             path: shard_dir.clone(),
@@ -1234,31 +1243,11 @@ impl AofManifest {
             source: e,
         })?;
 
-        // 3. Delete old shard files (best-effort).
-        let old_base = self.shard_base_path_seq(shard_id, old_seq);
-        let old_incr = self.shard_incr_path_seq(shard_id, old_seq);
-        if old_base.exists() {
-            if let Err(e) = std::fs::remove_file(&old_base) {
-                warn!(
-                    "advance_shard {}: failed to delete old base {}: {}",
-                    shard_id,
-                    old_base.display(),
-                    e
-                );
-            }
-        }
-        if old_incr.exists() {
-            if let Err(e) = std::fs::remove_file(&old_incr) {
-                warn!(
-                    "advance_shard {}: failed to delete old incr {}: {}",
-                    shard_id,
-                    old_incr.display(),
-                    e
-                );
-            }
-        }
-
-        // 4. Update per-shard LSN in-memory (manifest write is the caller's job).
+        // 3. Update per-shard LSN in-memory (manifest write is the caller's job).
+        //    Old-generation files are intentionally NOT deleted here — the
+        //    coordinator prunes them via `prune_shard_files` only after
+        //    `write_manifest()` durably commits the new seq (see the fn doc;
+        //    delete-before-commit would lose data on a mid-fan-out crash).
         self.shards[shard_idx].max_lsn = self.shards[shard_idx].max_lsn.max(new_seq);
 
         info!(
@@ -1270,6 +1259,40 @@ impl AofManifest {
         );
 
         Ok(new_incr)
+    }
+
+    /// Delete a shard's base + incr files for a specific `seq`. Best-effort.
+    ///
+    /// **Crash-safety contract:** the rewrite coordinator MUST call this only
+    /// AFTER `write_manifest()` has durably committed the new seq. Deleting an
+    /// old generation's files before the manifest flips would orphan the
+    /// persisted (old) seq whose files are already gone — recovery resolves
+    /// base/incr by `self.seq`, so it would read a missing base and lose data
+    /// for any shard that completed before the crash. This mirrors the
+    /// post-commit deletion ordering in `advance()` (TopLevel layout).
+    pub fn prune_shard_files(&self, shard_id: u16, seq: u64) {
+        let base = self.shard_base_path_seq(shard_id, seq);
+        let incr = self.shard_incr_path_seq(shard_id, seq);
+        if base.exists() {
+            if let Err(e) = std::fs::remove_file(&base) {
+                warn!(
+                    "prune_shard_files {}: failed to delete old base {}: {}",
+                    shard_id,
+                    base.display(),
+                    e
+                );
+            }
+        }
+        if incr.exists() {
+            if let Err(e) = std::fs::remove_file(&incr) {
+                warn!(
+                    "prune_shard_files {}: failed to delete old incr {}: {}",
+                    shard_id,
+                    incr.display(),
+                    e
+                );
+            }
+        }
     }
 }
 
@@ -1456,9 +1479,13 @@ pub struct OrderedEntry {
 /// in global LSN order across all shards.
 ///
 /// Returns `(commands_replayed, max_lsn)` — the count covers only inline
-/// (non-ordered) replays, and `max_lsn` covers both inline AND ordered
-/// entries (the high bit is masked out before max comparison, so it reflects
-/// the true issued LSN).
+/// (non-ordered) replays. `max_lsn` is the NEXT-FREE replication offset:
+/// `max(entry.lsn + entry.len)` across both inline AND ordered entries (the
+/// high bit is masked out before the computation). It is the offset AFTER the
+/// last byte on disk, NOT the start LSN of the last entry — because
+/// `ReplicationState::issue_lsn` returns the offset BEFORE adding the entry
+/// length, seeding `master_repl_offset` with a start LSN would reissue the
+/// last on-disk LSN and break the lsn->entry uniqueness invariant (F5).
 ///
 /// **Truncated entries:** a header partly written at crash time is treated as
 /// EOF (parity with `replay_incr_resp` semantics). A whole header followed by
@@ -1530,8 +1557,12 @@ fn replay_incr_framed(
                 lsn,
                 bytes,
             });
-            if lsn > max_lsn {
-                max_lsn = lsn;
+            // F5: track the next-free replication offset (entry end), not the
+            // start LSN — `issue_lsn` returns the offset BEFORE adding the
+            // entry length, so the seed must clear every byte already on disk.
+            let entry_end = lsn + len as u64;
+            if entry_end > max_lsn {
+                max_lsn = entry_end;
             }
             offset = payload_end;
             continue;
@@ -1578,8 +1609,10 @@ fn replay_incr_framed(
                 };
                 engine.replay_command(databases, cmd, cmd_args, &mut selected_db);
                 count += 1;
-                if lsn > max_lsn {
-                    max_lsn = lsn;
+                // F5: next-free offset = entry start LSN + RESP byte length.
+                let entry_end = lsn + len as u64;
+                if entry_end > max_lsn {
+                    max_lsn = entry_end;
                 }
             }
             Ok(None) => {
@@ -2316,11 +2349,41 @@ mod tests_v2 {
         assert!(ordered.is_empty(), "no ordered entries in this stream");
 
         assert_eq!(count, 2);
-        assert_eq!(max_lsn, 11);
+        // F5: max_lsn is the NEXT-FREE offset = max(lsn + len) = max(7+14, 11+16) = 27.
+        assert_eq!(max_lsn, 27);
         let calls = engine.calls.borrow();
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0], "PING");
         assert_eq!(calls[1], "DBSIZE");
+    }
+
+    #[test]
+    fn replay_incr_framed_max_lsn_is_next_free_offset() {
+        // F5: replay must return the next-free replication offset (entry end =
+        // start LSN + RESP byte length), not the START LSN of the last entry.
+        // `issue_lsn` hands out the offset BEFORE adding the entry's length, so
+        // seeding `master_repl_offset` with a start LSN reissues the last
+        // pre-crash entry's LSN — breaking lsn->entry uniqueness (RFC § 2 Rule 3).
+        let ping = b"*1\r\n$4\r\nPING\r\n"; // 14 bytes
+        let dbsize = b"*1\r\n$6\r\nDBSIZE\r\n"; // 16 bytes
+        // Cumulative LSNs as the writer issues them: each entry starts at the
+        // previous entry's end.
+        let mut bytes = frame_entry(100, ping);
+        bytes.extend_from_slice(&frame_entry(100 + ping.len() as u64, dbsize));
+
+        let mut dbs: Vec<crate::storage::Database> = vec![crate::storage::Database::new()];
+        let engine = RecordingEngine::new();
+        let mut ordered: Vec<OrderedEntry> = Vec::new();
+        let (_count, max_lsn) =
+            replay_incr_framed(0, &mut dbs, &bytes, &engine, &mut ordered).expect("framed replay");
+
+        // Last entry: start 114 + len 16 = 130. The next write MUST get >= 130.
+        let expected_next_free = 100 + ping.len() as u64 + dbsize.len() as u64;
+        assert_eq!(expected_next_free, 130);
+        assert_eq!(
+            max_lsn, expected_next_free,
+            "max_lsn must be the next-free offset (entry end), not the last start LSN"
+        );
     }
 
     #[test]
@@ -2336,7 +2399,8 @@ mod tests_v2 {
             .expect("truncated-header is EOF");
 
         assert_eq!(count, 1);
-        assert_eq!(max_lsn, 3);
+        // F5: next-free offset = PING entry start 3 + RESP len 14 = 17.
+        assert_eq!(max_lsn, 17);
     }
 
     #[test]
@@ -2408,7 +2472,12 @@ mod tests_v2 {
         };
 
         assert_eq!(total, 2, "two SETs replayed");
-        assert_eq!(global_max_lsn, 20, "global max lsn = max(shard maxes)");
+        // F5: global_max_lsn = max next-free offset across shards. shard-1 SET
+        // is 29 RESP bytes at lsn 20 → next-free 49 (> shard-0's 10+29=39).
+        assert_eq!(
+            global_max_lsn, 49,
+            "global max lsn = max(shard next-free offsets)"
+        );
         assert!(ordered.is_empty(), "no ordered entries in this stream");
 
         // Each shard's DB now holds its key (and only its key).
@@ -2487,10 +2556,13 @@ mod tests_v2 {
         };
 
         assert_eq!(total, n_shards as usize, "one SET per shard = N total");
+        // F5: global_max_lsn = highest shard's NEXT-FREE offset. The highest
+        // shard (sid=N-1) SETs at lsn N*10 with a 29-byte RESP → next-free
+        // N*10 + 29 (here 40 + 29 = 69), not the bare start LSN.
         assert_eq!(
             global_max_lsn,
-            n_shards as u64 * 10,
-            "global max lsn = highest shard lsn"
+            n_shards as u64 * 10 + 29,
+            "global max lsn = highest shard next-free offset"
         );
         assert!(ordered.is_empty(), "no ordered entries");
 
@@ -2542,7 +2614,13 @@ mod tests_v2 {
             .expect("framed replay with ordered");
 
         assert_eq!(count, 2, "two inline entries dispatched (PING, DBSIZE)");
-        assert_eq!(max_lsn, 12, "max LSN tracks both inline and ordered");
+        // F5: max_lsn is the next-free offset across inline AND ordered. The
+        // ordered SET (27 RESP bytes) at lsn 8 → next-free 35, exceeding the
+        // PING (5+14=19) and DBSIZE (12+16=28) ends.
+        assert_eq!(
+            max_lsn, 35,
+            "max LSN = next-free offset across inline and ordered"
+        );
         assert_eq!(ordered.len(), 1, "one entry buffered as ordered");
         let buffered = &ordered[0];
         assert_eq!(buffered.shard_id, 3, "shard_id forwarded");
@@ -2820,10 +2898,16 @@ mod tests_v2 {
     }
 
     // -----------------------------------------------------------------------
-    // FIX-W2-3 (partial): advance_shard writes new base+incr, deletes old
+    // F6 crash-safety ordering: advance_shard writes new base+incr but MUST
+    // NOT delete old files. Deleting before the manifest durably commits the
+    // new seq leaves a window where a crash orphans the persisted (old) seq
+    // whose files are already gone → recovery reads a missing base → data
+    // loss for completed shards. Deletion is the coordinator's job, AFTER
+    // write_manifest(), via prune_shard_files(). This mirrors the proven
+    // ordering in advance() (TopLevel), which deletes only post-commit.
     // -----------------------------------------------------------------------
     #[test]
-    fn advance_shard_writes_new_seq_and_deletes_old() {
+    fn advance_shard_defers_delete_until_after_commit() {
         let dir = temp_dir();
 
         // Initialize 2-shard manifest at seq=1.
@@ -2833,41 +2917,81 @@ mod tests_v2 {
         let empty_rdb = crate::persistence::rdb::save_to_bytes(&[] as &[crate::storage::Database])
             .expect("empty rdb");
 
-        // Old shard-0 files at seq=1 must exist before advance.
-        let old_base_s0 = manifest.shard_base_path(0);
-        let old_incr_s0 = manifest.shard_incr_path(0);
+        // Old shard files at seq=1 must exist before advance.
+        let old_base_s0 = manifest.shard_base_path_seq(0, 1);
+        let old_incr_s0 = manifest.shard_incr_path_seq(0, 1);
+        let old_base_s1 = manifest.shard_base_path_seq(1, 1);
+        let old_incr_s1 = manifest.shard_incr_path_seq(1, 1);
         assert!(old_base_s0.exists(), "seq=1 base must exist for shard 0");
         assert!(old_incr_s0.exists(), "seq=1 incr must exist for shard 0");
 
-        // Advance shard-0 to seq=2.
-        let new_incr = manifest
+        // Fan out: coordinator picks new_seq=2 once and advances every shard
+        // to it. No manifest write, no deletion, happens inside the fan-out.
+        let new_incr_s0 = manifest
             .advance_shard(0, 2, &empty_rdb)
             .expect("advance_shard 0 → seq=2");
-        assert!(new_incr.exists(), "new incr file must be created");
+        let new_incr_s1 = manifest
+            .advance_shard(1, 2, &empty_rdb)
+            .expect("advance_shard 1 → seq=2");
+        assert!(new_incr_s0.exists(), "new incr file must be created (s0)");
+        assert!(new_incr_s1.exists(), "new incr file must be created (s1)");
+
+        // PRE-COMMIT INVARIANT: new files written, OLD files NOT yet deleted.
+        // This is the regression guard against delete-before-commit.
         assert!(
             manifest.shard_base_path_seq(0, 2).exists(),
             "new seq=2 base must exist for shard 0"
         );
         assert!(
-            !old_base_s0.exists(),
-            "old seq=1 base must be deleted for shard 0"
+            manifest.shard_base_path_seq(1, 2).exists(),
+            "new seq=2 base must exist for shard 1"
         );
         assert!(
-            !old_incr_s0.exists(),
-            "old seq=1 incr must be deleted for shard 0"
+            old_base_s0.exists(),
+            "old seq=1 base (s0) MUST survive until the manifest commits"
         );
-
-        // Shard-1 must be unaffected.
         assert!(
-            manifest.shard_base_path(1).exists(),
-            "shard-1 seq=1 base must survive advance of shard-0"
+            old_incr_s0.exists(),
+            "old seq=1 incr (s0) MUST survive until the manifest commits"
+        );
+        assert!(
+            old_base_s1.exists(),
+            "old seq=1 base (s1) MUST survive until the manifest commits"
         );
 
-        // Caller must write_manifest after all shards advanced.
+        // COMMIT: coordinator bumps seq and persists the manifest atomically.
+        // This is the single durable commit point for the whole rewrite.
         manifest.seq = 2;
         manifest
             .write_manifest()
             .expect("write manifest after advance");
+
+        // POST-COMMIT: coordinator prunes old files — safe now that recovery
+        // resolves base/incr by the durably-committed new seq.
+        manifest.prune_shard_files(0, 1);
+        manifest.prune_shard_files(1, 1);
+        assert!(
+            !old_base_s0.exists(),
+            "old seq=1 base (s0) pruned post-commit"
+        );
+        assert!(
+            !old_incr_s0.exists(),
+            "old seq=1 incr (s0) pruned post-commit"
+        );
+        assert!(
+            !old_base_s1.exists(),
+            "old seq=1 base (s1) pruned post-commit"
+        );
+        assert!(
+            !old_incr_s1.exists(),
+            "old seq=1 incr (s1) pruned post-commit"
+        );
+        assert!(
+            manifest.shard_base_path_seq(0, 2).exists(),
+            "new seq=2 base (s0) must remain after prune"
+        );
+
+        // Recovery reads base by manifest.seq — must resolve to the new seq.
         let reloaded = AofManifest::load(&dir).expect("load").expect("present");
         assert_eq!(reloaded.seq, 2);
 

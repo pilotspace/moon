@@ -41,6 +41,20 @@ use crate::shard::dispatch::ShardMessage;
 // ResponseSlotPool NOT used on monoio — its AtomicWaker doesn't cross
 // monoio's single-threaded (!Send) executor boundary. Use oneshot channels.
 
+// ── F3: cross-shard dispatch backpressure / response-wait bounds ──
+// Design-for-failure: a wedged or saturated target shard must surface a
+// bounded error, never park the connection (holding its buffers) forever.
+// Push-retry bounds live in `crate::shard::dispatch` (shared with the tokio
+// handler); the response-wait bound below is monoio-specific (the tokio path
+// awaits via `ResponseSlotPool`, not this busy-wait relay).
+
+/// Max ~1ms event-loop wake cycles to wait for a cross-shard reply before
+/// declaring the response lost. The batch was already dispatched, so this is
+/// an *uncertain write* backstop (the command may have applied on the target)
+/// — set generously (~30s) and primarily guarded by the shutdown check.
+#[cfg(feature = "runtime-monoio")]
+const CROSS_SHARD_RESPONSE_MAX_WAITS: u32 = 30_000;
+
 /// Result of `handle_connection_sharded_monoio` execution.
 ///
 /// Same purpose as the Tokio handler's `HandlerResult`: the generic handler cannot
@@ -1919,28 +1933,58 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     reply_tx,
                 };
                 let target_idx = ChannelMesh::target_index(ctx.shard_id, target);
-                {
-                    let mut pending = msg;
-                    loop {
-                        let push_result = {
+                // F3: bounded backpressure retry. The closure retains the
+                // message on a full ring; the helper checks `shutdown` before
+                // every backoff so a graceful shutdown can't hang on a wedged
+                // peer. Borrow of `ctx.dispatch_tx` is taken+released inside
+                // each attempt — never held across the await.
+                let mut pending = Some(msg);
+                let outcome = crate::shard::dispatch::push_with_backpressure(
+                    &shutdown,
+                    crate::shard::dispatch::CROSS_SHARD_PUSH_MAX_RETRIES,
+                    crate::shard::dispatch::CROSS_SHARD_PUSH_BACKOFF,
+                    || match pending.take() {
+                        None => true,
+                        Some(m) => {
                             let mut producers = ctx.dispatch_tx.borrow_mut();
-                            producers[target_idx].try_push(pending)
-                        };
-                        match push_result {
-                            Ok(()) => {
-                                tracing::trace!(
-                                    "Shard {}: pushed PipelineBatch to shard {}, notifying",
-                                    ctx.shard_id,
-                                    target
-                                );
-                                ctx.spsc_notifiers[target].notify_one();
-                                break;
-                            }
-                            Err(val) => {
-                                pending = val;
-                                monoio::time::sleep(std::time::Duration::from_micros(10)).await;
+                            match producers[target_idx].try_push(m) {
+                                Ok(()) => true,
+                                Err(back) => {
+                                    pending = Some(back);
+                                    false
+                                }
                             }
                         }
+                    },
+                )
+                .await;
+                match outcome {
+                    crate::shard::dispatch::PushOutcome::Pushed => {
+                        tracing::trace!(
+                            "Shard {}: pushed PipelineBatch to shard {}, notifying",
+                            ctx.shard_id,
+                            target
+                        );
+                        ctx.spsc_notifiers[target].notify_one();
+                    }
+                    crate::shard::dispatch::PushOutcome::Backpressure
+                    | crate::shard::dispatch::PushOutcome::Cancelled => {
+                        // Target shard not draining (saturated/wedged) or
+                        // shutting down. The PipelineBatch was NEVER accepted,
+                        // so this is a clean reject — fail this batch's entries
+                        // instead of parking the connection forever.
+                        tracing::warn!(
+                            "Shard {}: cross-shard push to shard {} gave up ({:?}); rejecting batch",
+                            ctx.shard_id,
+                            target,
+                            outcome
+                        );
+                        for (resp_idx, _, _) in &meta {
+                            responses[*resp_idx] = Frame::Error(Bytes::from_static(
+                                b"ERR cross-shard dispatch backpressure",
+                            ));
+                        }
+                        continue;
                     }
                 }
                 oneshot_futures.push((target, meta, reply_rx));
@@ -1958,11 +2002,33 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 );
                 let shard_responses = {
                     let pw = pending_wakers.clone();
+                    // F3: bound the response wait. The batch was already
+                    // dispatched, so a missing reply is an *uncertain write*
+                    // (the target shard may have applied it) — the error must
+                    // NOT imply rejection. Break on disconnect (writer gone),
+                    // shutdown, or the generous wait cap (~30s of ~1ms wakes).
+                    let mut waits: u32 = 0;
                     loop {
                         match reply_rx.try_recv() {
                             Ok(value) => break Ok(value),
-                            Err(flume::TryRecvError::Disconnected) => break Err(()),
+                            Err(flume::TryRecvError::Disconnected) => {
+                                break Err("ERR cross-shard dispatch failed");
+                            }
                             Err(flume::TryRecvError::Empty) => {
+                                if shutdown.is_cancelled() {
+                                    break Err("ERR cross-shard response aborted (shutdown)");
+                                }
+                                waits += 1;
+                                if waits > CROSS_SHARD_RESPONSE_MAX_WAITS {
+                                    tracing::warn!(
+                                        "Shard {}: cross-shard response wait exhausted; \
+                                         target may have applied the write",
+                                        ctx.shard_id
+                                    );
+                                    break Err(
+                                        "ERR cross-shard response timeout (write may have applied)",
+                                    );
+                                }
                                 // Yield once: register waker, return Pending, then Ready on wake.
                                 let mut yielded = false;
                                 std::future::poll_fn(|cx| {
@@ -1982,11 +2048,10 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 };
                 let shard_responses = match shard_responses {
                     Ok(r) => r,
-                    Err(()) => {
+                    Err(err_msg) => {
                         for (resp_idx, _, _) in &meta {
-                            responses[*resp_idx] = Frame::Error(Bytes::from_static(
-                                b"ERR cross-shard dispatch failed",
-                            ));
+                            responses[*resp_idx] =
+                                Frame::Error(Bytes::from_static(err_msg.as_bytes()));
                         }
                         continue;
                     }

@@ -592,12 +592,170 @@ const _: () = {
     );
 };
 
+/// Backoff between cross-shard SPSC push retries when the target ring is full
+/// (F3). Small so genuine transient backpressure adds minimal latency; runtime
+/// timers may round it up to their tick granularity.
+pub(crate) const CROSS_SHARD_PUSH_BACKOFF: std::time::Duration =
+    std::time::Duration::from_micros(100);
+
+/// Max push retries before giving up on a non-draining target ring (F3). With
+/// the 100µs backoff the real budget is ~0.5s (timer honoured) to a few
+/// seconds (coarse granularity) — wedged-shard detection scale, generous
+/// enough not to false-reject a merely saturated shard under heavy load.
+pub(crate) const CROSS_SHARD_PUSH_MAX_RETRIES: u32 = 5_000;
+
+/// Outcome of a bounded cross-shard SPSC push ([`push_with_backpressure`], F3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PushOutcome {
+    /// The target ring accepted the message.
+    Pushed,
+    /// The ring stayed full for the whole retry budget — the target shard is
+    /// not draining (wedged or saturated). The command was **never executed**,
+    /// so the caller returns a clean reject error to the client.
+    Backpressure,
+    /// Shutdown was requested mid-retry. The command was **never executed**.
+    Cancelled,
+}
+
+/// Push a message onto a cross-shard SPSC ring with bounded backpressure
+/// retry (F3 — design-for-failure).
+///
+/// `try_push` returns `true` when the ring accepted the message and `false`
+/// when the ring is full. On a `false`, the closure MUST retain ownership of
+/// the message (stash it) so the next attempt can re-send it. We back off
+/// `backoff` and retry up to `max_retries` times, checking `shutdown` before
+/// every sleep so a graceful shutdown can never be blocked by a wedged peer.
+///
+/// This replaces the previous unbounded `loop { try_push; sleep(10µs) }` in
+/// the monoio cross-shard dispatch path. That loop parked a connection task
+/// forever — holding its read/write buffers and piling wakers into the
+/// `pending_wakers` relay — whenever a target shard stopped draining: the
+/// multi-shard "zombie connection" RAM-growth vector from the investigation.
+///
+/// **Hot path:** the happy case is a single `try_push()` returning `true` —
+/// no sleep, no allocation. `TimerImpl::sleep` boxes a future, but only on
+/// the contended retry path (ring already full), never on the fast path.
+///
+/// **Wall-clock budget:** the total bound is roughly
+/// `max_retries * max(backoff, timer_granularity)`. Callers pick
+/// `max_retries` for the *intended* budget, not a literal microsecond count,
+/// because runtime timers round small sleeps up to their tick granularity.
+pub(crate) async fn push_with_backpressure(
+    shutdown: &crate::runtime::cancel::CancellationToken,
+    max_retries: u32,
+    backoff: std::time::Duration,
+    mut try_push: impl FnMut() -> bool,
+) -> PushOutcome {
+    use crate::runtime::{TimerImpl, traits::RuntimeTimer};
+
+    if try_push() {
+        return PushOutcome::Pushed;
+    }
+    for _ in 0..max_retries {
+        if shutdown.is_cancelled() {
+            return PushOutcome::Cancelled;
+        }
+        TimerImpl::sleep(backoff).await;
+        if try_push() {
+            return PushOutcome::Pushed;
+        }
+    }
+    PushOutcome::Backpressure
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashSet;
     #[cfg(feature = "runtime-tokio")]
     use std::sync::Arc;
+
+    // ── F3: bounded cross-shard push (push_with_backpressure) ──
+    // Tokio-gated: these drive the runtime timer via TimerImpl::sleep.
+
+    #[cfg(feature = "runtime-tokio")]
+    #[tokio::test]
+    async fn push_backpressure_pushes_on_first_try_without_sleeping() {
+        let token = crate::runtime::cancel::CancellationToken::new();
+        let mut calls = 0u32;
+        let start = std::time::Instant::now();
+        let outcome =
+            push_with_backpressure(&token, 1000, std::time::Duration::from_millis(10), || {
+                calls += 1;
+                true // ring accepts immediately
+            })
+            .await;
+        assert_eq!(outcome, PushOutcome::Pushed);
+        assert_eq!(calls, 1, "happy path must not retry");
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(5),
+            "happy path must not sleep"
+        );
+    }
+
+    #[cfg(feature = "runtime-tokio")]
+    #[tokio::test]
+    async fn push_backpressure_succeeds_after_transient_full() {
+        let token = crate::runtime::cancel::CancellationToken::new();
+        let mut calls = 0u32;
+        let outcome =
+            push_with_backpressure(&token, 1000, std::time::Duration::from_millis(1), || {
+                calls += 1;
+                calls >= 3 // full twice, then drains
+            })
+            .await;
+        assert_eq!(outcome, PushOutcome::Pushed);
+        assert_eq!(calls, 3, "should retry until the ring drains");
+    }
+
+    #[cfg(feature = "runtime-tokio")]
+    #[tokio::test]
+    async fn push_backpressure_gives_up_when_ring_never_drains() {
+        // A wedged target shard: ring always full. The bounded retry MUST
+        // give up (Backpressure) rather than spin forever — the command was
+        // never accepted, so the caller returns a clean reject.
+        let token = crate::runtime::cancel::CancellationToken::new();
+        let mut calls = 0u32;
+        let start = std::time::Instant::now();
+        let outcome =
+            push_with_backpressure(&token, 5, std::time::Duration::from_millis(1), || {
+                calls += 1;
+                false // never accepts
+            })
+            .await;
+        let elapsed = start.elapsed();
+        assert_eq!(outcome, PushOutcome::Backpressure);
+        // initial attempt + 5 retries = 6 try_push calls.
+        assert_eq!(calls, 6, "initial try + max_retries attempts");
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "must give up within the budget, not hang (took {:?})",
+            elapsed
+        );
+    }
+
+    #[cfg(feature = "runtime-tokio")]
+    #[tokio::test]
+    async fn push_backpressure_aborts_on_shutdown() {
+        // Shutdown signalled before the call: a full ring must surface
+        // Cancelled immediately (checked before the first backoff sleep),
+        // never blocking a graceful shutdown on a wedged peer.
+        let token = crate::runtime::cancel::CancellationToken::new();
+        token.cancel();
+        let mut calls = 0u32;
+        let outcome = push_with_backpressure(
+            &token,
+            1_000_000, // huge budget — only the shutdown check can break us out
+            std::time::Duration::from_millis(10),
+            || {
+                calls += 1;
+                false
+            },
+        )
+        .await;
+        assert_eq!(outcome, PushOutcome::Cancelled);
+        assert_eq!(calls, 1, "one attempt, then the shutdown check aborts");
+    }
 
     /// Diagnostic: print ShardMessage total size + representative payload sizes
     /// so we can see which variants cap the enum and target them for hot/cold split.

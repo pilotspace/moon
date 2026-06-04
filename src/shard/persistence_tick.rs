@@ -374,8 +374,12 @@ pub(crate) fn drain_and_shutdown_spill(
     }
 }
 
-/// For each successful completion: update manifest and ColdIndex.
-/// Called on each eviction tick from the event loop.
+/// For each successful completion: update manifest (ONE add_file+commit per
+/// file) and ColdIndex (one insert per entry within that file).
+///
+/// Under the batching model each `SpillCompletion` covers ONE DataFile that
+/// may contain many KV entries.  This makes manifest entries == #files, not
+/// #keys, removing the ~70-entry inline-root cap.
 pub(crate) fn apply_spill_completions(
     spill_thread: &crate::storage::tiered::spill_thread::SpillThread,
     shard_manifest: &mut Option<crate::persistence::manifest::ShardManifest>,
@@ -390,45 +394,46 @@ pub(crate) fn apply_spill_completions(
     for c in completions {
         if !c.success {
             tracing::warn!(
-                key = %String::from_utf8_lossy(&c.key),
-                file_id = c.file_id,
+                file_id = c.file_entry.file_id,
                 "Spill pwrite failed on background thread"
             );
             continue;
         }
 
-        // Update manifest
+        let file_id = c.file_entry.file_id;
+
+        // ONE manifest add_file + commit per flushed file.
         if let Some(ref mut manifest) = *shard_manifest {
             manifest.add_file(c.file_entry);
             if let Err(e) = manifest.commit() {
-                tracing::warn!(file_id = c.file_id, error = %e, "Manifest commit failed for spill completion");
+                tracing::warn!(
+                    file_id,
+                    error = %e,
+                    "Manifest commit failed for spill completion"
+                );
             }
         }
 
-        // Update ColdIndex in the originating logical DB.
-        // Phase 2d: gate on is_initialized(); new path uses ShardSlice directly.
-        if crate::shard::slice::is_initialized() {
-            crate::shard::slice::with_shard_db(c.db_index, |db| {
-                if let Some(ref mut ci) = db.cold_index {
-                    ci.insert(
-                        c.key,
-                        crate::storage::tiered::cold_index::ColdLocation {
-                            file_id: c.file_id,
-                            slot_idx: c.slot_idx,
-                        },
-                    );
+        // Insert one ColdIndex entry per KV within this file.
+        for entry in c.entries {
+            let location = crate::storage::tiered::cold_index::ColdLocation {
+                file_id,
+                page_idx: entry.page_idx,
+                slot_idx: entry.slot_idx,
+            };
+
+            // Phase 2d: gate on is_initialized(); new path uses ShardSlice directly.
+            if crate::shard::slice::is_initialized() {
+                crate::shard::slice::with_shard_db(entry.db_index, |db| {
+                    if let Some(ref mut ci) = db.cold_index {
+                        ci.insert(entry.key.clone(), location);
+                    }
+                });
+            } else {
+                let mut guard = shard_databases.write_db(shard_id, entry.db_index);
+                if let Some(ref mut ci) = guard.cold_index {
+                    ci.insert(entry.key, location);
                 }
-            });
-        } else {
-            let mut guard = shard_databases.write_db(shard_id, c.db_index);
-            if let Some(ref mut ci) = guard.cold_index {
-                ci.insert(
-                    c.key,
-                    crate::storage::tiered::cold_index::ColdLocation {
-                        file_id: c.file_id,
-                        slot_idx: c.slot_idx,
-                    },
-                );
             }
         }
     }
@@ -452,7 +457,11 @@ pub(crate) fn should_run_pressure_cascade(
     if rt.maxmemory == 0 {
         return false; // No memory limit set -- no pressure possible
     }
-    let threshold = (rt.maxmemory as f64 * server_config.disk_offload_threshold) as usize;
+    // `used` is this shard's aggregate (across its DBs); compare against the
+    // PER-SHARD budget so the cascade fires at maxmemory/num_shards per shard,
+    // bounding aggregate RSS instead of the whole-instance cap per shard.
+    let threshold =
+        (rt.maxmemory_per_shard() as f64 * server_config.disk_offload_threshold) as usize;
     let used = shard_databases.aggregate_memory(shard_id);
     used > threshold
 }
@@ -532,7 +541,9 @@ pub(crate) fn handle_memory_pressure(
 
     // Step 3: KV eviction -- run existing LRU/LFU eviction, with spill-to-disk
     // when disk-offload is enabled (evicted entries written to KvLeaf DataFiles).
-    // Use aggregate memory (server-wide) to match Redis maxmemory semantics.
+    // Compare this shard's aggregate (across its DBs) against the PER-SHARD
+    // budget (maxmemory/num_shards) so the summed eviction across shards bounds
+    // aggregate RSS at the whole-instance maxmemory.
     //
     // When a SpillThread is available, use the async path: entries are removed
     // from DashTable immediately (freeing RAM) and pwrite is deferred to the
@@ -542,7 +553,7 @@ pub(crate) fn handle_memory_pressure(
         if rt.maxmemory > 0 {
             // Compute aggregate BEFORE acquiring write locks (same pattern as handler_sharded).
             let total_mem = shard_databases.aggregate_memory(shard_id);
-            if total_mem > rt.maxmemory {
+            if total_mem > rt.maxmemory_per_shard() {
                 let db_count = shard_databases.db_count();
                 let shard_dir = server_config
                     .effective_disk_offload_dir()

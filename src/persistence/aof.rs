@@ -15,7 +15,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::runtime::cancel::CancellationToken;
 use crate::runtime::channel;
@@ -92,6 +92,25 @@ pub enum AofAck {
 pub static AOF_BACKPRESSURE_DROPPED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// Result of awaiting an `AppendSync` ack under a bounded timeout (F2).
+///
+/// Distinguishes the three terminal states the `Always` durability path
+/// can reach so the caller can map each to the correct client-facing
+/// outcome:
+/// - `Ack(_)`        — the writer reported back; inspect the `AofAck`.
+/// - `Disconnected`  — the writer task is gone / channel dropped (no ack
+///   will ever arrive). Treated as `WriteFailed`.
+/// - `TimedOut`      — the fsync did not confirm within the configured
+///   bound. Durability is unconfirmed; treated as `FsyncFailed`. The
+///   entry may still reach disk later, so the caller must NOT report
+///   success but also must not assume the write was rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AckOutcome {
+    Ack(AofAck),
+    Disconnected,
+    TimedOut,
+}
+
 /// AOF fsync policy controlling when data is flushed to disk.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum FsyncPolicy {
@@ -160,8 +179,152 @@ pub enum AofMessage {
     Rewrite(SharedDatabases),
     /// Trigger AOF rewrite in sharded mode (all shards' databases).
     RewriteSharded(Arc<crate::shard::shared_databases::ShardDatabases>),
+    /// [F6] Trigger a per-shard AOF rewrite (compaction) in the PerShard
+    /// layout. Sent to EVERY per-shard writer at once. Each writer folds its
+    /// own shard (drain → lock → snapshot → write new base+incr at the
+    /// coordinator's `new_seq` → reopen), then decrements the shared
+    /// `PerShardRewriteCoord`; the last writer commits the manifest once
+    /// (single seq flip) and prunes the old generation. The synchronized seq
+    /// + single commit are what make multi-shard BGREWRITEAOF crash-safe.
+    RewritePerShard {
+        shard_dbs: Arc<crate::shard::shared_databases::ShardDatabases>,
+        coord: Arc<PerShardRewriteCoord>,
+    },
     /// Shut down the AOF writer task gracefully.
     Shutdown,
+}
+
+/// Coordinator shared by all per-shard writers participating in one
+/// BGREWRITEAOF fan-out (F6).
+///
+/// Crash-safety contract (mirrors `AofManifest::advance` ordering, but
+/// distributed across N writer threads):
+///
+/// 1. Each writer writes its new base+incr at `new_seq` via
+///    `manifest.advance_shard(shard_id, new_seq, rdb)` — which does NOT bump
+///    `manifest.seq` or rewrite the manifest. So until the final commit, the
+///    on-disk manifest still resolves to `old_seq`; a crash here recovers the
+///    intact old generation (no loss, no double-apply).
+/// 2. The LAST writer to finish (countdown reaches zero) performs the single
+///    durable commit: `manifest.seq = new_seq; write_manifest()`. This is the
+///    atomic point at which recovery flips to the new generation.
+/// 3. Only AFTER the commit are the old-generation files pruned.
+///
+/// The manifest is shared via `Arc<Mutex<..>>` and locked ONLY for the brief,
+/// await-free `advance_shard` and final-commit critical sections — never held
+/// across a blocking disk write of the base RDB (that happens before the lock)
+/// nor across `.await`.
+pub struct PerShardRewriteCoord {
+    /// Writers still to finish. Starts at the shard count; the writer that
+    /// decrements it to zero performs the commit + prune.
+    remaining: std::sync::atomic::AtomicUsize,
+    /// Shared manifest, loaded fresh from disk by the BGREWRITEAOF handler at
+    /// rewrite time (normal appends never touch the manifest, and BGREWRITEAOF
+    /// is CAS-serialized, so a fresh load is the authoritative current state).
+    manifest: Arc<parking_lot::Mutex<crate::persistence::aof_manifest::AofManifest>>,
+    /// The generation every writer advances to. Computed once = old_seq + 1.
+    new_seq: u64,
+    /// The generation being retired; pruned only after the commit.
+    old_seq: u64,
+    /// Number of shards participating (= initial `remaining`).
+    n_shards: usize,
+    /// Set by any shard whose fold fails. The final writer checks this and
+    /// ABORTS the commit if set — committing `new_seq` while a shard never
+    /// wrote its new base would make recovery look for a missing base and
+    /// refuse to start. On abort the old generation (`old_seq`) stays the
+    /// committed state for all shards (crash-safe).
+    failed: std::sync::atomic::AtomicBool,
+}
+
+impl PerShardRewriteCoord {
+    /// Construct a coordinator for an `n_shards`-way rewrite advancing the
+    /// shared `manifest` from its current seq to `current_seq + 1`.
+    pub fn new(
+        manifest: Arc<parking_lot::Mutex<crate::persistence::aof_manifest::AofManifest>>,
+        current_seq: u64,
+        n_shards: usize,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            remaining: std::sync::atomic::AtomicUsize::new(n_shards),
+            manifest,
+            new_seq: current_seq + 1,
+            old_seq: current_seq,
+            n_shards,
+            failed: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    /// The generation writers advance to.
+    #[inline]
+    pub fn new_seq(&self) -> u64 {
+        self.new_seq
+    }
+
+    /// Mark the whole rewrite as failed (called by a shard whose fold errored).
+    /// The final writer will abort the commit, leaving `old_seq` authoritative.
+    #[inline]
+    pub fn mark_failed(&self) {
+        self.failed
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Called by each writer AFTER it has durably written its new base+incr at
+    /// `new_seq` and reopened its append file. Decrements the countdown; the
+    /// final caller commits the manifest (single seq flip) and prunes the old
+    /// generation, then clears the global in-progress flag.
+    ///
+    /// Crash-safety: the commit (`write_manifest`) is the atomic flip point;
+    /// pruning runs strictly after it, so a crash mid-prune only orphans
+    /// already-superseded files (recovery uses `new_seq`).
+    pub fn shard_done(&self) {
+        use std::sync::atomic::Ordering;
+        // AcqRel: the decrement-to-zero must observe all prior writers'
+        // advance_shard manifest mutations before committing.
+        if self.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
+            // Abort if any shard failed to fold: committing new_seq while a
+            // shard lacks its new base would break recovery. Keep old_seq.
+            if self.failed.load(Ordering::Acquire) {
+                let m = self.manifest.lock();
+                // Best-effort: prune the orphaned new-seq files written by the
+                // shards that DID fold, so they don't linger.
+                for sid in 0..self.n_shards {
+                    m.prune_shard_files(sid as u16, self.new_seq);
+                }
+                drop(m);
+                error!(
+                    "F6 per-shard rewrite ABORTED: a shard failed to fold; seq stays {}. \
+                     Old generation remains authoritative (crash-safe). A RESTART is \
+                     recommended so successful shards' writers stop appending to the \
+                     discarded new generation.",
+                    self.old_seq
+                );
+                crate::command::persistence::AOF_REWRITE_IN_PROGRESS.store(false, Ordering::SeqCst);
+                return;
+            }
+            let mut m = self.manifest.lock();
+            m.seq = self.new_seq;
+            if let Err(e) = m.write_manifest() {
+                error!(
+                    "F6 per-shard rewrite: final manifest commit (seq {}) failed: {}. \
+                     Old generation remains authoritative; rewrite did not take effect.",
+                    self.new_seq, e
+                );
+                // Do NOT prune — old generation is still the committed state.
+                drop(m);
+                crate::command::persistence::AOF_REWRITE_IN_PROGRESS.store(false, Ordering::SeqCst);
+                return;
+            }
+            for sid in 0..self.n_shards {
+                m.prune_shard_files(sid as u16, self.old_seq);
+            }
+            drop(m);
+            info!(
+                "F6 per-shard rewrite complete: committed seq {} across {} shards, pruned seq {}",
+                self.new_seq, self.n_shards, self.old_seq
+            );
+            crate::command::persistence::AOF_REWRITE_IN_PROGRESS.store(false, Ordering::SeqCst);
+        }
+    }
 }
 
 /// Reasons a pool send may be refused without queueing.
@@ -187,6 +350,11 @@ pub enum AofPoolSendError {
 /// Step 2a is additive — this type is defined here but no call site is wired
 /// to it yet. Step 2c performs the type plumbing in `conn_state` and
 /// `conn/core`; steps 2d/2e/2f update the call sites and spawn paths.
+/// Default bound for the `appendfsync=always` fsync-ack await. Mirrors the
+/// `--aof-fsync-timeout-ms` config default; used by constructors that don't
+/// take an explicit timeout (non-production / test helpers).
+pub const DEFAULT_AOF_FSYNC_TIMEOUT: Duration = Duration::from_millis(2000);
+
 #[derive(Clone)]
 pub struct AofWriterPool {
     senders: Vec<channel::MpscSender<AofMessage>>,
@@ -196,6 +364,16 @@ pub struct AofWriterPool {
     /// fsync-before-ack durability (H1 fix); everything else stays on
     /// the fire-and-forget `Append` path.
     fsync_policy: FsyncPolicy,
+    /// F2: max time `try_send_append_durable` waits for the `Always` fsync
+    /// ack before failing the write. `Duration::ZERO` means unbounded
+    /// (legacy behavior). Prevents a stalled disk from parking write
+    /// connections forever (design-for-failure).
+    fsync_timeout: Duration,
+    /// F6: persistence base dir (the parent of `appendonlydir/`), set only for
+    /// PerShard pools that may service a per-shard BGREWRITEAOF. Needed to load
+    /// the authoritative manifest fresh at rewrite time. `None` for TopLevel
+    /// pools and test pools that never rewrite.
+    base_dir: Option<PathBuf>,
 }
 
 impl AofWriterPool {
@@ -203,20 +381,25 @@ impl AofWriterPool {
     /// legacy v1 deployments and `--shards 1` v2 deployments where one writer
     /// thread services every shard.
     pub fn top_level(sender: channel::MpscSender<AofMessage>) -> Arc<Self> {
-        Self::top_level_with_policy(sender, FsyncPolicy::EverySec)
+        Self::top_level_with_policy(sender, FsyncPolicy::EverySec, DEFAULT_AOF_FSYNC_TIMEOUT)
     }
 
     /// Same as [`Self::top_level`] but with an explicit fsync policy. The
     /// policy controls whether [`Self::try_send_append_durable`] takes the
     /// fast (fire-and-forget) or rendezvous (`AppendSync`) path.
+    /// `fsync_timeout` bounds the `Always` ack await (F2); `Duration::ZERO`
+    /// = unbounded.
     pub fn top_level_with_policy(
         sender: channel::MpscSender<AofMessage>,
         fsync_policy: FsyncPolicy,
+        fsync_timeout: Duration,
     ) -> Arc<Self> {
         Arc::new(Self {
             senders: vec![sender],
             layout: crate::persistence::aof_manifest::AofLayout::TopLevel,
             fsync_policy,
+            fsync_timeout,
+            base_dir: None,
         })
     }
 
@@ -225,13 +408,16 @@ impl AofWriterPool {
     /// shard count; passing a length-1 vector here is a bug — use
     /// [`AofWriterPool::top_level`] instead.
     pub fn per_shard(senders: Vec<channel::MpscSender<AofMessage>>) -> Arc<Self> {
-        Self::per_shard_with_policy(senders, FsyncPolicy::EverySec)
+        Self::per_shard_with_policy(senders, FsyncPolicy::EverySec, DEFAULT_AOF_FSYNC_TIMEOUT)
     }
 
     /// Same as [`Self::per_shard`] but with an explicit fsync policy.
+    /// `fsync_timeout` bounds the `Always` ack await (F2); `Duration::ZERO`
+    /// = unbounded.
     pub fn per_shard_with_policy(
         senders: Vec<channel::MpscSender<AofMessage>>,
         fsync_policy: FsyncPolicy,
+        fsync_timeout: Duration,
     ) -> Arc<Self> {
         debug_assert!(
             senders.len() >= 2,
@@ -241,6 +427,31 @@ impl AofWriterPool {
             senders,
             layout: crate::persistence::aof_manifest::AofLayout::PerShard,
             fsync_policy,
+            fsync_timeout,
+            base_dir: None,
+        })
+    }
+
+    /// F6: same as [`Self::per_shard_with_policy`] but records the persistence
+    /// `base_dir` so a per-shard BGREWRITEAOF can load the authoritative
+    /// manifest fresh at rewrite time. This is the production constructor used
+    /// by `main.rs` for the PerShard layout.
+    pub fn per_shard_with_base_dir(
+        senders: Vec<channel::MpscSender<AofMessage>>,
+        fsync_policy: FsyncPolicy,
+        fsync_timeout: Duration,
+        base_dir: PathBuf,
+    ) -> Arc<Self> {
+        debug_assert!(
+            senders.len() >= 2,
+            "per_shard pool needs >=2 writers; use top_level for single-writer"
+        );
+        Arc::new(Self {
+            senders,
+            layout: crate::persistence::aof_manifest::AofLayout::PerShard,
+            fsync_policy,
+            fsync_timeout,
+            base_dir: Some(base_dir),
         })
     }
 
@@ -278,17 +489,66 @@ impl AofWriterPool {
         match self.fsync_policy {
             FsyncPolicy::Always => {
                 let rx = self.try_send_append_sync(shard_id, lsn, bytes);
-                match rx.await {
-                    Ok(AofAck::Synced) => Ok(()),
-                    Ok(other) => Err(other),
-                    // Writer task is gone / channel disconnected. Caller
-                    // treats this as a hard failure.
-                    Err(_) => Err(AofAck::WriteFailed),
+                // F2 (design-for-failure): bound the wait so a stalled disk
+                // can't park this connection forever. On elapse the write is
+                // failed — the entry may still land on disk later, but
+                // durability is NOT confirmed, so the caller must not report
+                // success. `Duration::ZERO` keeps the legacy unbounded await.
+                match Self::await_ack(rx, self.fsync_timeout).await {
+                    AckOutcome::Ack(AofAck::Synced) => Ok(()),
+                    AckOutcome::Ack(other) => Err(other),
+                    // Writer task gone / channel disconnected.
+                    AckOutcome::Disconnected => Err(AofAck::WriteFailed),
+                    // Fsync did not confirm within the bound.
+                    AckOutcome::TimedOut => Err(AofAck::FsyncFailed),
                 }
             }
             FsyncPolicy::EverySec | FsyncPolicy::No => {
                 self.try_send_append(shard_id, lsn, bytes);
                 Ok(())
+            }
+        }
+    }
+
+    /// Await an `AppendSync` ack receiver under a bounded timeout (F2).
+    ///
+    /// `timeout == Duration::ZERO` preserves the legacy unbounded await
+    /// (used when the operator explicitly opts out via
+    /// `--aof-fsync-timeout-ms 0`). Otherwise the await is capped by the
+    /// runtime-appropriate timer; on elapse the in-flight fsync is
+    /// abandoned (the receiver is dropped) and `TimedOut` is returned.
+    ///
+    /// Runtime-agnostic: monoio uses `select! { rx, sleep }` (matching the
+    /// established `cluster::failover` pattern — monoio 0.2 has no
+    /// `time::timeout`); tokio uses `tokio::time::timeout`. Both resolve the
+    /// ack first if it arrives within the bound, otherwise `TimedOut`.
+    async fn await_ack(
+        rx: crate::runtime::channel::OneshotReceiver<AofAck>,
+        timeout: Duration,
+    ) -> AckOutcome {
+        if timeout.is_zero() {
+            return match rx.await {
+                Ok(ack) => AckOutcome::Ack(ack),
+                Err(_) => AckOutcome::Disconnected,
+            };
+        }
+
+        #[cfg(feature = "runtime-monoio")]
+        {
+            monoio::select! {
+                res = rx => match res {
+                    Ok(ack) => AckOutcome::Ack(ack),
+                    Err(_) => AckOutcome::Disconnected,
+                },
+                _ = monoio::time::sleep(timeout) => AckOutcome::TimedOut,
+            }
+        }
+        #[cfg(all(feature = "runtime-tokio", not(feature = "runtime-monoio")))]
+        {
+            match tokio::time::timeout(timeout, rx).await {
+                Ok(Ok(ack)) => AckOutcome::Ack(ack),
+                Ok(Err(_)) => AckOutcome::Disconnected,
+                Err(_) => AckOutcome::TimedOut,
             }
         }
     }
@@ -473,6 +733,87 @@ impl AofWriterPool {
         self.senders[0]
             .try_send(msg)
             .map_err(|_| AofPoolSendError::SendFailed)
+    }
+
+    /// [F6] Initiate a per-shard BGREWRITEAOF across every writer in a
+    /// PerShard pool.
+    ///
+    /// Loads the authoritative manifest fresh from `base_dir` (normal appends
+    /// never mutate the manifest, and BGREWRITEAOF is CAS-serialized by
+    /// `AOF_REWRITE_IN_PROGRESS`, so a fresh load is the current committed
+    /// state), builds a shared [`PerShardRewriteCoord`] that advances the
+    /// generation by one, and hands every writer the same `coord` + a cheap
+    /// `Arc` clone of `shard_dbs`.
+    ///
+    /// **Reliable delivery (design-for-failure):** the fan-out uses the
+    /// *blocking* `send` rather than `try_send`. A dropped rewrite message
+    /// would leave the countdown unable to reach zero — folded writers would
+    /// have reopened to new-seq files that the manifest never commits, silently
+    /// losing their post-rewrite appends. The writers run on dedicated threads
+    /// draining continuously, so `send` blocks only until a channel slot frees
+    /// (sub-millisecond), which is acceptable for a rare admin command.
+    ///
+    /// Returns `SendFailed` if `base_dir` is unset, the manifest can't be
+    /// loaded, or a writer thread is gone (disconnected channel). On the last
+    /// case the rewrite aborts WITHOUT committing — the old generation stays
+    /// authoritative (crash-safe), but a dead writer already means that shard's
+    /// persistence was compromised before this call.
+    pub fn try_send_rewrite_per_shard(
+        &self,
+        shard_dbs: Arc<crate::shard::shared_databases::ShardDatabases>,
+    ) -> Result<(), AofPoolSendError> {
+        use crate::persistence::aof_manifest::{AofLayout, AofManifest};
+        if self.layout != AofLayout::PerShard {
+            // A TopLevel pool rewrites via try_send_rewrite; this entry point
+            // is PerShard-only.
+            return Err(AofPoolSendError::RewriteUnsupportedInPerShard);
+        }
+        let base_dir = self.base_dir.as_ref().ok_or(AofPoolSendError::SendFailed)?;
+        let manifest = match AofManifest::load(base_dir) {
+            Ok(Some(m)) if m.layout == AofLayout::PerShard => m,
+            Ok(_) => {
+                error!(
+                    "F6 per-shard rewrite: manifest at {} missing or not PerShard; aborting",
+                    base_dir.display()
+                );
+                return Err(AofPoolSendError::SendFailed);
+            }
+            Err(e) => {
+                error!(
+                    "F6 per-shard rewrite: failed to load manifest at {}: {}",
+                    base_dir.display(),
+                    e
+                );
+                return Err(AofPoolSendError::SendFailed);
+            }
+        };
+        let current_seq = manifest.seq;
+        let n_shards = self.senders.len();
+        let shared_manifest = Arc::new(parking_lot::Mutex::new(manifest));
+        let coord = PerShardRewriteCoord::new(shared_manifest, current_seq, n_shards);
+        for s in &self.senders {
+            // Blocking send for guaranteed delivery — see the doc comment.
+            if s.send(AofMessage::RewritePerShard {
+                shard_dbs: shard_dbs.clone(),
+                coord: coord.clone(),
+            })
+            .is_err()
+            {
+                error!(
+                    "F6 per-shard rewrite: a writer channel is disconnected; \
+                     rewrite aborted (no manifest commit, old generation remains \
+                     authoritative). Inspect AOF writer threads."
+                );
+                return Err(AofPoolSendError::SendFailed);
+            }
+        }
+        info!(
+            "F6 per-shard rewrite dispatched: seq {} -> {} across {} shards",
+            current_seq,
+            current_seq + 1,
+            n_shards
+        );
+        Ok(())
     }
 
     /// Broadcast `Shutdown` to every writer. Used by orchestrated shutdown
@@ -704,6 +1045,176 @@ mod pool_tests {
         assert_eq!(result, AofAck::FsyncFailed);
     }
 
+    // F2 (design-for-failure): `appendfsync=always` must bound its fsync-ack
+    // await. A stalled writer must surface a hard error within the budget,
+    // never park the connection forever. Tokio-gated because it drives the
+    // runtime timer; the monoio path shares the proven `select! + sleep`
+    // shape from `cluster::failover`, exercised end-to-end by the crash tests.
+    #[cfg(feature = "runtime-tokio")]
+    #[tokio::test]
+    async fn always_fsync_times_out_when_writer_never_acks() {
+        // Writer channel is held (kept open) but never drained → the
+        // AppendSync sits buffered with its ack sender alive, so the receiver
+        // never resolves. The bounded await MUST elapse and report failure.
+        let (tx0, _rx0) = channel::mpsc_bounded::<AofMessage>(4);
+        let (tx1, _rx1) = channel::mpsc_bounded::<AofMessage>(4);
+        let pool = AofWriterPool::per_shard_with_policy(
+            vec![tx0, tx1],
+            FsyncPolicy::Always,
+            Duration::from_millis(50),
+        );
+
+        let start = Instant::now();
+        let res = pool
+            .try_send_append_durable(0, 1, Bytes::from_static(b"x"))
+            .await;
+        let elapsed = start.elapsed();
+
+        assert_eq!(
+            res,
+            Err(AofAck::FsyncFailed),
+            "timed-out fsync must map to FsyncFailed (durability unconfirmed)"
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "must fail within the bound, not hang (took {:?})",
+            elapsed
+        );
+        // Keep the receivers alive until here so the message stays buffered.
+        drop((_rx0, _rx1));
+    }
+
+    #[cfg(feature = "runtime-tokio")]
+    #[tokio::test]
+    async fn always_fsync_succeeds_when_writer_acks_in_time() {
+        // Happy path: a writer drains the AppendSync and acks `Synced` well
+        // within the bound → the durable append returns Ok(()).
+        let (tx0, rx0) = channel::mpsc_bounded::<AofMessage>(4);
+        let (tx1, _rx1) = channel::mpsc_bounded::<AofMessage>(4);
+        let pool = AofWriterPool::per_shard_with_policy(
+            vec![tx0, tx1],
+            FsyncPolicy::Always,
+            Duration::from_millis(500),
+        );
+
+        tokio::spawn(async move {
+            if let Ok(AofMessage::AppendSync { ack, .. }) = rx0.recv_async().await {
+                let _ = ack.send(AofAck::Synced);
+            }
+        });
+
+        let res = pool
+            .try_send_append_durable(0, 1, Bytes::from_static(b"x"))
+            .await;
+        assert_eq!(res, Ok(()), "ack within the bound must succeed");
+        drop(_rx1);
+    }
+
+    /// Parse the PerShard incr framing `[u64 lsn LE][u32 len LE][len bytes]`,
+    /// stopping at a truncated tail (the crash/torn boundary) — exactly what
+    /// `replay_incr_framed` does. Returns the cleanly-replayable prefix.
+    #[cfg(feature = "runtime-tokio")]
+    fn parse_framed(buf: &[u8]) -> Vec<(u64, Vec<u8>)> {
+        let mut out = Vec::new();
+        let mut i = 0usize;
+        while i + 12 <= buf.len() {
+            let lsn = u64::from_le_bytes(buf[i..i + 8].try_into().unwrap());
+            let len = u32::from_le_bytes(buf[i + 8..i + 12].try_into().unwrap()) as usize;
+            if i + 12 + len > buf.len() {
+                break; // truncated tail → crash boundary, stop
+            }
+            out.push((lsn, buf[i + 12..i + 12 + len].to_vec()));
+            i += 12 + len;
+        }
+        out
+    }
+
+    // Regression (PR #136 review, BUG #2): the tokio per-shard writer must carry
+    // a `write_error` latch like the single-file (~:1467) and monoio (~:2125)
+    // writers. A torn write (header lands, payload fails) must NOT be followed by
+    // more records — a lone orphaned header makes the framed replay misread the
+    // next record's bytes as the orphan's payload, corrupting everything after.
+    // The latch suppresses all writes after the tear and reports WriteFailed to
+    // AppendSync callers (so they error instead of ack'ing a corrupt write).
+    #[cfg(feature = "runtime-tokio")]
+    #[tokio::test]
+    async fn tokio_per_shard_writer_latches_after_torn_write() {
+        use crate::persistence::aof_manifest::AofManifest;
+        use std::sync::atomic::Ordering;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let base_dir = tmp.path().to_path_buf();
+        // PerShard layout, 2 shards (the per-shard pool needs >=2); drive shard 0.
+        let manifest = AofManifest::initialize_multi(&base_dir, 2).unwrap();
+        let incr = manifest.shard_incr_path(0);
+
+        // Inject: the 2nd Append tears (header written, payload "fails").
+        TEST_FAIL_WRITE_AT.store(2, Ordering::SeqCst);
+
+        let (tx, rx) = channel::mpsc_bounded::<AofMessage>(16);
+        let cancel = CancellationToken::new();
+        let writer = tokio::spawn(per_shard_aof_writer_task(
+            rx,
+            base_dir.clone(),
+            0,
+            FsyncPolicy::Always,
+            cancel.clone(),
+        ));
+
+        // 1: clean. 2: torn (header only). 3: must be suppressed by the latch.
+        tx.try_send(AofMessage::Append {
+            lsn: 1,
+            bytes: Bytes::from_static(b"AAAA"),
+        })
+        .unwrap();
+        tx.try_send(AofMessage::Append {
+            lsn: 2,
+            bytes: Bytes::from_static(b"BBBB"),
+        })
+        .unwrap();
+        tx.try_send(AofMessage::Append {
+            lsn: 3,
+            bytes: Bytes::from_static(b"CCCC"),
+        })
+        .unwrap();
+
+        // Barrier + assertion: an AppendSync after the tear MUST come back
+        // WriteFailed (latched), never Synced.
+        let (ack_tx, ack_rx) = crate::runtime::channel::oneshot::<AofAck>();
+        tx.try_send(AofMessage::AppendSync {
+            lsn: 4,
+            bytes: Bytes::from_static(b"DDDD"),
+            ack: ack_tx,
+        })
+        .unwrap();
+
+        let ack = tokio::time::timeout(std::time::Duration::from_secs(5), ack_rx)
+            .await
+            .expect("writer must answer the AppendSync within 5s")
+            .expect("ack channel must not drop");
+        assert_eq!(
+            ack,
+            AofAck::WriteFailed,
+            "after a torn write the latch must reject further writes (got {ack:?})"
+        );
+
+        cancel.cancel();
+        TEST_FAIL_WRITE_AT.store(0, Ordering::SeqCst);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), writer).await;
+
+        // On disk: exactly one replayable frame (lsn=1, "AAAA"). The orphaned
+        // lsn=2 header is a truncated tail (crash boundary); lsn 3 and 4 were
+        // never written (latch held) — no corruption.
+        let raw = std::fs::read(&incr).unwrap();
+        let frames = parse_framed(&raw);
+        assert_eq!(
+            frames,
+            vec![(1u64, b"AAAA".to_vec())],
+            "only the pre-tear record may replay; orphaned headers / suppressed \
+             records must not corrupt the stream"
+        );
+    }
+
     #[test]
     fn broadcast_shutdown_reaches_every_writer() {
         let (tx0, rx0) = channel::mpsc_bounded::<AofMessage>(2);
@@ -736,6 +1247,7 @@ mod pool_tests {
         let pool = std::sync::Arc::new(AofWriterPool::per_shard_with_policy(
             vec![tx0, tx1],
             FsyncPolicy::Always,
+            Duration::ZERO, // legacy unbounded await — disconnect/ack resolves it
         ));
 
         // Spawn a mock writer that drains AppendSync and responds with FsyncFailed.
@@ -870,7 +1382,11 @@ mod pool_tests {
         // ack sender, simulating a dead writer.
         let (tx0, rx0) = channel::mpsc_bounded::<AofMessage>(4);
         let (tx1, _rx1) = channel::mpsc_bounded::<AofMessage>(4);
-        let pool = AofWriterPool::per_shard_with_policy(vec![tx0, tx1], FsyncPolicy::Always);
+        let pool = AofWriterPool::per_shard_with_policy(
+            vec![tx0, tx1],
+            FsyncPolicy::Always,
+            Duration::ZERO, // legacy unbounded await — disconnect resolves it
+        );
 
         // Spawn a thread that pulls the AppendSync off the channel but drops
         // the ack without sending — simulating a writer crash mid-fsync.
@@ -910,7 +1426,11 @@ mod pool_tests {
         // use try_send_append_durable so the policy is respected.
         let (tx0, _rx0) = channel::mpsc_bounded::<AofMessage>(4);
         let (tx1, _rx1) = channel::mpsc_bounded::<AofMessage>(4);
-        let pool = AofWriterPool::per_shard_with_policy(vec![tx0, tx1], FsyncPolicy::EverySec);
+        let pool = AofWriterPool::per_shard_with_policy(
+            vec![tx0, tx1],
+            FsyncPolicy::EverySec,
+            Duration::ZERO,
+        );
 
         let result = futures::executor::block_on(pool.try_send_append_durable(
             0,
@@ -1185,6 +1705,14 @@ pub async fn aof_writer_task(
                     crate::command::persistence::AOF_REWRITE_IN_PROGRESS
                         .store(false, std::sync::atomic::Ordering::SeqCst);
                 }
+                // [F6] A TopLevel writer never owns per-shard files; receiving
+                // RewritePerShard means a routing bug. Self-abort so the
+                // coordinator's countdown completes and the flag clears.
+                Ok(AofMessage::RewritePerShard { coord, .. }) => {
+                    warn!("AOF TopLevel writer received RewritePerShard — routing bug; aborting");
+                    coord.mark_failed();
+                    coord.shard_done();
+                }
             }
         }
         return;
@@ -1272,6 +1800,13 @@ pub async fn aof_writer_task(
                             Err(e) => { error!("Failed to reopen AOF after rewrite: {}", e); return; }
                         }
                     }
+                    // [F6] TopLevel writer never owns per-shard files — routing
+                    // bug. Self-abort so the countdown completes + flag clears.
+                    Ok(AofMessage::RewritePerShard { coord, .. }) => {
+                        warn!("AOF TopLevel writer received RewritePerShard — routing bug; aborting");
+                        coord.mark_failed();
+                        coord.shard_done();
+                    }
                     Ok(AofMessage::Shutdown) | Err(_) => {
                         let _ = writer.flush().await;
                         let _ = writer.get_ref().sync_data().await;
@@ -1314,6 +1849,15 @@ pub async fn aof_writer_task(
 ///
 /// Wait/timeout/corruption semantics for manifest loading match the existing
 /// `aof_writer_task` (60s bounded wait, hard fail on corrupt manifest).
+/// Test-only torn-write injection for `per_shard_aof_writer_task`: when set to a
+/// nonzero `N`, the `N`-th `Append` received by a tokio per-shard writer writes
+/// its header and then simulates a payload write failure, exercising the
+/// `write_error` latch. `0` disables. Atomic (not an env var) because
+/// `std::env::set_var` is `unsafe` under edition 2024. Compiled out of release.
+#[cfg(all(test, feature = "runtime-tokio"))]
+pub(crate) static TEST_FAIL_WRITE_AT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 pub async fn per_shard_aof_writer_task(
     rx: channel::MpscReceiver<AofMessage>,
     base_dir: PathBuf,
@@ -1422,8 +1966,11 @@ pub async fn per_shard_aof_writer_task(
 
         let mut writer = tokio::io::BufWriter::new(file);
         let mut last_fsync = Instant::now();
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
-        interval.tick().await;
+        // (No `interval` here: the EverySec flush deadline is enforced by the
+        // timeout-bounded recv in the loop below, which wakes at least every
+        // 200ms regardless of message traffic. A long-lived `interval.tick()`
+        // select arm is fairness-starvable under sustained writes and proved
+        // unreliable when idle on this dedicated current-thread writer runtime.)
 
         // Test-only fault injection: if MOON_TEST_AOF_FSYNC_FAIL=1 is set in
         // the environment at writer task startup, every AppendSync ack resolves
@@ -1433,24 +1980,81 @@ pub async fn per_shard_aof_writer_task(
         // hot path in production deployments where the var is absent.
         let fail_fsync_for_test = std::env::var("MOON_TEST_AOF_FSYNC_FAIL").as_deref() == Ok("1");
 
+        // Torn-write latch: once any write to this incr file fails partway
+        // (e.g. the header landed but the payload did not), we must NEVER write
+        // another record — a lone orphaned header makes the framed reader
+        // misinterpret the next record's bytes as the orphan's payload,
+        // corrupting every record after it on replay. Stay latched for the
+        // writer's lifetime; recovery replays the clean prefix and a rewrite
+        // starts a fresh file. This mirrors the single-file (line ~1467) and
+        // monoio per-shard (line ~2125) writers, which already carry the latch.
+        let mut write_error = false;
+        // Test-only fault injection (no env var: edition-2024 set_var is unsafe).
+        // When `TEST_FAIL_WRITE_AT` is the ordinal of an incoming Append, that
+        // append writes its header then simulates a payload failure, exercising
+        // the latch. Compiled out of production builds.
+        #[cfg(test)]
+        let mut test_append_ordinal: usize = 0;
+
         loop {
             tokio::select! {
-                msg = rx.recv_async() => {
+                // Bounded recv (EverySec durability): wake at least every 200ms
+                // even when idle so the flush deadline after this select! is
+                // honored within its 1s bound. flume's recv future is drop-safe
+                // on the Elapsed branch (no message consumed on timeout); the
+                // Ok(Ok(msg)) path below captures the message with no loss.
+                r = tokio::time::timeout(
+                    std::time::Duration::from_millis(200),
+                    rx.recv_async(),
+                ) => {
+                    // On Elapsed (timeout) `r` is Err: skip the match and fall
+                    // through to the EverySec deadline check after this select!.
+                    if let Ok(msg) = r {
                     match msg {
                         // PerShard writer (tokio): per RFC § 2 Rule 1 the on-disk
                         // format is `[u64 lsn LE][u32 len LE][RESP bytes]`. Header
                         // is written sequentially with the body — both calls land
                         // in the same BufWriter so this is one syscall under load.
                         Ok(AofMessage::Append { lsn, bytes: data }) => {
+                            // Latch: stream already torn — drop silently (Append
+                            // is fire-and-forget; no ack channel to notify).
+                            if write_error {
+                                continue;
+                            }
+                            #[cfg(test)]
+                            {
+                                test_append_ordinal += 1;
+                                let fail_at = TEST_FAIL_WRITE_AT
+                                    .load(std::sync::atomic::Ordering::Relaxed);
+                                if fail_at != 0 && fail_at == test_append_ordinal {
+                                    // Reproduce a torn write: header lands, payload
+                                    // "fails". The orphaned header is flushed so the
+                                    // on-disk effect matches the real I/O-error case.
+                                    let mut header = [0u8; 12];
+                                    header[..8].copy_from_slice(&lsn.to_le_bytes());
+                                    header[8..]
+                                        .copy_from_slice(&(data.len() as u32).to_le_bytes());
+                                    let _ = writer.write_all(&header).await;
+                                    let _ = writer.flush().await;
+                                    error!(
+                                        "AOF shard {}: injected torn write after header (test)",
+                                        shard_id
+                                    );
+                                    write_error = true;
+                                    continue;
+                                }
+                            }
                             let mut header = [0u8; 12];
                             header[..8].copy_from_slice(&lsn.to_le_bytes());
                             header[8..].copy_from_slice(&(data.len() as u32).to_le_bytes());
                             if let Err(e) = writer.write_all(&header).await {
                                 error!("AOF header write error shard {}: {}", shard_id, e);
+                                write_error = true;
                                 continue;
                             }
                             if let Err(e) = writer.write_all(&data).await {
                                 error!("AOF write error shard {}: {}", shard_id, e);
+                                write_error = true;
                                 continue;
                             }
                             if matches!(fsync, FsyncPolicy::Always) {
@@ -1460,6 +2064,13 @@ pub async fn per_shard_aof_writer_task(
                         }
                         // AppendSync (tokio + PerShard): framed write + fsync + ack.
                         Ok(AofMessage::AppendSync { lsn, bytes: data, ack }) => {
+                            // Latch: stream already torn — refuse to write more and
+                            // report failure so the caller does not hang to the F2
+                            // timeout and does not ack a write into a corrupt stream.
+                            if write_error {
+                                let _ = ack.send(AofAck::WriteFailed);
+                                continue;
+                            }
                             let mut header = [0u8; 12];
                             header[..8].copy_from_slice(&lsn.to_le_bytes());
                             header[8..].copy_from_slice(&(data.len() as u32).to_le_bytes());
@@ -1468,6 +2079,7 @@ pub async fn per_shard_aof_writer_task(
                                     "AOF AppendSync header write error shard {}: {}",
                                     shard_id, e
                                 );
+                                write_error = true;
                                 let _ = ack.send(AofAck::WriteFailed);
                                 continue;
                             }
@@ -1476,6 +2088,7 @@ pub async fn per_shard_aof_writer_task(
                                     "AOF AppendSync write error shard {}: {}",
                                     shard_id, e
                                 );
+                                write_error = true;
                                 let _ = ack.send(AofAck::WriteFailed);
                                 continue;
                             }
@@ -1506,10 +2119,52 @@ pub async fn per_shard_aof_writer_task(
                         Ok(AofMessage::Rewrite(_)) | Ok(AofMessage::RewriteSharded(_)) => {
                             warn!(
                                 "AOF writer shard {}: received Rewrite/RewriteSharded — \
-                                 not supported in PerShard layout, dropped. \
-                                 Per-shard BGREWRITEAOF lands in RFC step 6.",
+                                 not applicable in PerShard layout, dropped.",
                                 shard_id
                             );
+                        }
+                        // [F6] Per-shard rewrite (tokio): reuse the proven
+                        // synchronous fold (`do_rewrite_per_shard`) verbatim, so
+                        // the exactly-once invariant carries over unchanged. This
+                        // writer runs on a DEDICATED std::thread (block_on_local,
+                        // main.rs) — not a shared tokio worker — so executing the
+                        // blocking fold here cannot starve the runtime. We flush
+                        // the BufWriter (its `into_inner` does NOT flush) so any
+                        // buffered appends are durable in the OLD incr, convert
+                        // `tokio::fs::File` -> `std::fs::File` for the sync fold,
+                        // then wrap the (reopened) file back into the BufWriter.
+                        Ok(AofMessage::RewritePerShard { shard_dbs, coord }) => {
+                            if let Err(e) = writer.flush().await {
+                                error!(
+                                    "F6 tokio per-shard rewrite: shard {} pre-fold flush \
+                                     failed: {}. Aborting; old generation stays authoritative.",
+                                    shard_id, e
+                                );
+                                coord.mark_failed();
+                                coord.shard_done();
+                            } else {
+                                // `into_std().await` waits for in-flight ops and is
+                                // infallible; the buffer is already flushed above.
+                                let mut sf = writer.into_inner().into_std().await;
+                                let res = do_rewrite_per_shard(
+                                    shard_id, &shard_dbs, &mut sf, &rx, &coord,
+                                );
+                                // On success `sf` points at the NEW incr (the fold
+                                // reopened it + already called `shard_done()`); on
+                                // error it is still the OLD incr (pre-reopen). Wrap
+                                // it back either way so the writer stays valid.
+                                writer =
+                                    tokio::io::BufWriter::new(tokio::fs::File::from_std(sf));
+                                if let Err(e) = res {
+                                    error!(
+                                        "F6 tokio per-shard rewrite: shard {} fold failed: {}. \
+                                         Aborting commit; old generation stays authoritative.",
+                                        shard_id, e
+                                    );
+                                    coord.mark_failed();
+                                    coord.shard_done();
+                                }
+                            }
                         }
                         Ok(AofMessage::Shutdown) | Err(_) => {
                             let _ = writer.flush().await;
@@ -1518,12 +2173,6 @@ pub async fn per_shard_aof_writer_task(
                             break;
                         }
                     }
-                }
-                _ = interval.tick(), if fsync == FsyncPolicy::EverySec => {
-                    if last_fsync.elapsed() >= std::time::Duration::from_secs(1) {
-                        let _ = writer.flush().await;
-                        let _ = writer.get_ref().sync_data().await;
-                        last_fsync = Instant::now();
                     }
                 }
                 _ = cancel.cancelled() => {
@@ -1532,6 +2181,19 @@ pub async fn per_shard_aof_writer_task(
                     info!("AOF writer shard {} cancelled", shard_id);
                     break;
                 }
+            }
+            // EverySec deadline — checked after EVERY wake (message OR timeout),
+            // so it is NOT subject to select! fairness and holds the 1s bound
+            // under sustained writes as well as when idle. (The old long-lived
+            // `interval.tick()` arm could be starved by the always-ready recv
+            // arm under load, leaving >1s of writes buffered in the BufWriter
+            // and lost on SIGKILL — the COMPOSE crash-matrix failure.)
+            if fsync == FsyncPolicy::EverySec
+                && last_fsync.elapsed() >= std::time::Duration::from_secs(1)
+            {
+                let _ = writer.flush().await;
+                let _ = writer.get_ref().sync_data().await;
+                last_fsync = Instant::now();
             }
         }
     }
@@ -1752,10 +2414,31 @@ pub async fn per_shard_aof_writer_task(
                 Ok(AofMessage::Rewrite(_)) | Ok(AofMessage::RewriteSharded(_)) => {
                     warn!(
                         "AOF writer shard {}: received Rewrite/RewriteSharded — \
-                         not supported in PerShard layout, dropped. \
-                         Per-shard BGREWRITEAOF lands in RFC step 6.",
+                         not applicable in PerShard layout (use per-shard \
+                         BGREWRITEAOF), dropped.",
                         shard_id
                     );
+                }
+                // [F6] Per-shard rewrite fan-out (monoio). Fold THIS shard,
+                // then signal the coordinator; the last shard commits the
+                // manifest. On error the old generation stays authoritative
+                // (advance_shard did not commit the seq).
+                Ok(AofMessage::RewritePerShard { shard_dbs, coord }) => {
+                    if let Err(e) =
+                        do_rewrite_per_shard(shard_id, &shard_dbs, &mut file, &rx, &coord)
+                    {
+                        error!(
+                            "F6 per-shard rewrite: shard {} fold failed: {}. \
+                             Aborting rewrite; old generation stays authoritative.",
+                            shard_id, e
+                        );
+                        // Mark the whole rewrite failed so the final writer
+                        // aborts the commit (committing new_seq with a shard
+                        // missing its new base would break recovery), then
+                        // decrement so the countdown can still complete.
+                        coord.mark_failed();
+                        coord.shard_done();
+                    }
                 }
                 Ok(AofMessage::Shutdown) | Err(_) => {
                     if !write_error {
@@ -2181,7 +2864,7 @@ fn snapshot_and_generate(db: &SharedDatabases) -> BytesMut {
 /// are dropped silently (duplicate rewrites while a rewrite is in progress) or
 /// returned via the flag for Shutdown (caller is responsible for honoring it
 /// after the rewrite completes).
-#[cfg(feature = "runtime-monoio")]
+#[cfg(any(feature = "runtime-monoio", feature = "runtime-tokio"))]
 #[derive(Default)]
 struct DrainOutcome {
     drained: usize,
@@ -2229,12 +2912,233 @@ fn drain_pending_appends(
             AofMessage::Shutdown => {
                 outcome.shutdown_requested = true;
             }
-            AofMessage::Rewrite(_) | AofMessage::RewriteSharded(_) => {
+            AofMessage::Rewrite(_)
+            | AofMessage::RewriteSharded(_)
+            | AofMessage::RewritePerShard { .. } => {
                 // Already rewriting — drop redundant request.
             }
         }
     }
     Ok(outcome)
+}
+
+/// [F6] Drain a per-shard writer's queued appends into its OLD incr file using
+/// the framed `[u64 lsn LE][u32 len LE][RESP bytes]` on-disk format that
+/// per-shard recovery expects.
+///
+/// This is the per-shard twin of [`drain_pending_appends`] (which writes the
+/// legacy TopLevel raw-RESP format). Correctness depends on the framing
+/// matching `replay_per_shard`'s reader — an unframed write here would make the
+/// drained appends unparseable on restart.
+#[cfg(any(feature = "runtime-monoio", feature = "runtime-tokio"))]
+fn drain_pending_appends_framed(
+    rx: &channel::MpscReceiver<AofMessage>,
+    file: &mut std::fs::File,
+) -> Result<DrainOutcome, MoonError> {
+    use std::io::Write;
+    let mut outcome = DrainOutcome::default();
+    let write_framed = |file: &mut std::fs::File, lsn: u64, data: &[u8]| -> std::io::Result<()> {
+        let mut header = [0u8; 12];
+        header[..8].copy_from_slice(&lsn.to_le_bytes());
+        header[8..].copy_from_slice(&(data.len() as u32).to_le_bytes());
+        file.write_all(&header)?;
+        file.write_all(data)
+    };
+    while let Ok(msg) = rx.try_recv() {
+        match msg {
+            AofMessage::Append { lsn, bytes: data } => {
+                write_framed(file, lsn, &data).map_err(|e| AofError::Io {
+                    path: PathBuf::from("<aof per-shard incr drain>"),
+                    source: e,
+                })?;
+                outcome.drained += 1;
+            }
+            AofMessage::AppendSync {
+                lsn,
+                bytes: data,
+                ack,
+            } => {
+                write_framed(file, lsn, &data).map_err(|e| AofError::Io {
+                    path: PathBuf::from("<aof per-shard incr drain>"),
+                    source: e,
+                })?;
+                outcome.drained += 1;
+                // Durability for these is covered by the post-drain fsync at
+                // the rewrite boundary (mirrors drain_pending_appends).
+                let _ = ack.send(AofAck::Synced);
+            }
+            AofMessage::Shutdown => {
+                outcome.shutdown_requested = true;
+            }
+            AofMessage::Rewrite(_)
+            | AofMessage::RewriteSharded(_)
+            | AofMessage::RewritePerShard { .. } => {
+                // Already rewriting this shard — drop redundant request.
+            }
+        }
+    }
+    Ok(outcome)
+}
+
+/// [F6] Per-shard rewrite fold (monoio). Run by a single per-shard writer for
+/// ITS shard only; the manifest commit is coordinated across all shards by the
+/// shared [`PerShardRewriteCoord`].
+///
+/// Correctness ordering (prevents double-apply of non-idempotent commands like
+/// INCR after the rewrite) — identical discipline to [`do_rewrite_sharded`],
+/// scoped to one shard:
+///
+/// 1. Drain queued appends into the OLD incr (framed) and fsync.
+/// 2. Acquire write locks on this shard's databases.
+/// 3. Re-drain appends that arrived between phase 1 and the lock, into OLD
+///    incr, and fsync.
+/// 4. Snapshot this shard's databases under the locks.
+/// 5. Release the locks before the expensive base-RDB write.
+/// 6. Write the new base + new (empty) incr at `coord.new_seq` via
+///    `advance_shard` (which does NOT bump `manifest.seq`), then reopen
+///    `file` to the new incr. Subsequent appends land in the new generation.
+/// 7. Signal completion to the coordinator; the last shard commits the
+///    manifest (single seq flip) and prunes the old generation.
+///
+/// Until step 7's commit, the on-disk manifest still resolves to the old seq,
+/// so a crash anywhere in steps 1-6 recovers the intact old generation.
+///
+/// # Cross-thread exactly-once invariant (load-bearing)
+///
+/// This fold runs on the per-shard *writer* thread, which is distinct from the
+/// shard event-loop thread that applies commands. Exactly-once across the
+/// rewrite boundary depends on a single ordering fact: the live write path
+/// enqueues each command's AOF append **inside** the same `RwLock<Database>`
+/// write guard under which it mutated the db (see `spsc_handler.rs`:
+/// `wal_append_and_fanout` is called before `drop(guard)`). Phase 2 here
+/// acquires those *same* locks (`all_shard_dbs()[sidx]` is
+/// `ShardDatabases::shards[sidx]`, the exact `RwLock`s `write_db` locks), so
+/// RwLock mutual exclusion forces the order
+/// `enqueue → guard-release → fold-acquire → mid-drain(phase 3)`. Hence every
+/// INCR whose mutation lands in the phase-4 snapshot had its append drained
+/// into the OLD incr (then pruned at commit) — never replayed on top of the
+/// new base. Were the append enqueued *after* the guard drop, a snapshot would
+/// capture the mutation while its append still raced toward the NEW incr →
+/// double-apply. The in-guard append is therefore the invariant; do not move it.
+///
+/// This also assumes the `RwLock`-backed `ShardDatabases` is the *live* store.
+/// It is, because the thread-local `ShardSlice` fast path is dead code until
+/// Phase 4 wires `init_shard` (`is_initialized()` is always false today). A
+/// future Phase 4 that makes ShardSlice live MUST revisit this fold: the writer
+/// thread cannot lock another thread's `!Send` `Rc<RefCell<Shard>>`, so the
+/// per-shard rewrite would need a different snapshot-coordination mechanism.
+///
+/// # Known limitation — channel saturation during the fold
+///
+/// Exactly-once holds *absent append-channel saturation during the fold*. While
+/// this function runs (phases 2-6, including the base-RDB serialize + write +
+/// fsync of phase 6, which is hundreds of ms on a large shard) the writer is
+/// NOT in its recv loop, so it is not draining the bounded
+/// `mpsc_bounded::<AofMessage>(10_000)` append channel. Post-snapshot appends
+/// queue there for the new incr; the event loop enqueues them with
+/// `try_send_append` (drop-on-full, return ignored — `spsc_handler.rs`). Under
+/// *sustained concurrent* writes on a large dataset, > 10_000 appends can pile
+/// up during the window and the overflow is silently dropped — lost even on a
+/// clean restart (worse than the everysec contract, which only loses on crash).
+/// The single-client crash matrix cannot surface this (serialized `redis-cli`
+/// never pressures the channel). This window is *pre-existing*: the shipped
+/// `do_rewrite_sharded` has the identical non-draining gap. Tracked as a
+/// known limitation (F6 is behind `--experimental-per-shard-rewrite`); the fix
+/// (keep draining during phase 6, or block-on-full for the rewrite's duration)
+/// is a separate scoped task. See `tmp/F6-known-limitations.md`.
+#[cfg(any(feature = "runtime-monoio", feature = "runtime-tokio"))]
+fn do_rewrite_per_shard(
+    shard_id: u16,
+    shard_dbs: &crate::shard::shared_databases::ShardDatabases,
+    file: &mut std::fs::File,
+    rx: &channel::MpscReceiver<AofMessage>,
+    coord: &PerShardRewriteCoord,
+) -> Result<(), MoonError> {
+    let sidx = shard_id as usize;
+    let all_shards = shard_dbs.all_shard_dbs();
+    if sidx >= all_shards.len() {
+        return Err(AofError::RewriteFailed {
+            detail: format!(
+                "do_rewrite_per_shard: shard {} out of range ({} shards)",
+                sidx,
+                all_shards.len()
+            ),
+        }
+        .into());
+    }
+
+    // Phase 1: drain pre-rewrite queued appends into old incr (framed).
+    let pre_drain = drain_pending_appends_framed(rx, file)?;
+    file.sync_data().map_err(|e| AofError::Io {
+        path: PathBuf::from("<aof per-shard incr>"),
+        source: e,
+    })?;
+
+    // Phase 2: acquire write locks on this shard's db(s) (db_idx ascending).
+    let shard_locks = &all_shards[sidx];
+    let guards: Vec<_> = shard_locks.iter().map(|lock| lock.write()).collect();
+
+    // Phase 3: drain appends that completed between phase 1 and phase 2.
+    let mid_drain = drain_pending_appends_framed(rx, file)?;
+    file.sync_data().map_err(|e| AofError::Io {
+        path: PathBuf::from("<aof per-shard incr>"),
+        source: e,
+    })?;
+
+    // Phase 4: snapshot this shard's databases under the locks.
+    let now_ms = current_time_ms();
+    let mut snapshot: Vec<(
+        Vec<(
+            crate::storage::compact_key::CompactKey,
+            crate::storage::entry::Entry,
+        )>,
+        u32,
+    )> = Vec::with_capacity(guards.len());
+    for guard in &guards {
+        let base_ts = guard.base_timestamp();
+        let mut entries = Vec::new();
+        for (key, entry) in guard.data().iter() {
+            if !entry.is_expired_at(base_ts, now_ms) {
+                entries.push((key.clone(), entry.clone()));
+            }
+        }
+        snapshot.push((entries, base_ts));
+    }
+
+    // Phase 5: release locks before the expensive disk write.
+    drop(guards);
+
+    // Phase 6: write new base, advance THIS shard's manifest entry (no seq
+    // commit), reopen to the new incr. The manifest lock is held only for the
+    // brief, await-free advance_shard call.
+    let rdb_bytes = crate::persistence::rdb::save_snapshot_to_bytes(&snapshot)?;
+    let new_incr = {
+        let mut m = coord.manifest.lock();
+        m.advance_shard(shard_id, coord.new_seq, &rdb_bytes)?
+    };
+    *file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&new_incr)
+        .map_err(|e| AofError::Io {
+            path: new_incr,
+            source: e,
+        })?;
+
+    info!(
+        "F6 per-shard rewrite: shard {} folded (drained {}+{} appends), new seq {}",
+        shard_id, pre_drain.drained, mid_drain.drained, coord.new_seq
+    );
+    if pre_drain.shutdown_requested || mid_drain.shutdown_requested {
+        warn!(
+            "F6 per-shard rewrite: shard {} saw shutdown during rewrite (honored after commit)",
+            shard_id
+        );
+    }
+
+    // Phase 7: signal completion; the last writer commits + prunes.
+    coord.shard_done();
+    Ok(())
 }
 
 /// Multi-part rewrite: snapshot single-shard databases → RDB base → advance manifest.

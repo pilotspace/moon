@@ -206,10 +206,13 @@ pub fn try_evict_if_needed_with_spill_and_total(
 
     let policy = EvictionPolicy::from_str(&config.maxmemory_policy);
 
-    // Check aggregate memory (server-wide maxmemory limit per Redis semantics).
-    // Evict from this DB until total memory drops below limit.
+    // Compare against the PER-SHARD budget, not the whole-instance maxmemory.
+    // `maxmemory` is a whole-instance cap; each shard enforces independently, so
+    // the threshold is `maxmemory / num_shards` (single shard ⇒ unchanged). This
+    // is what bounds aggregate RSS in multishard mode.
+    let budget = config.maxmemory_per_shard();
     let mut current_total = total_memory;
-    while current_total > config.maxmemory {
+    while current_total > budget {
         if policy == EvictionPolicy::NoEviction {
             return Err(oom_error());
         }
@@ -234,6 +237,65 @@ pub fn try_evict_if_needed_with_spill_and_total(
 ///
 /// Callers must poll `SpillThread::drain_completions()` to apply manifest
 /// and ColdIndex updates from completed spills.
+/// Seed value for a shard's spill `file_id` counter after recovery.
+///
+/// On restart, AOF/RDB replay re-populates the hot tier and the persistence
+/// cascade re-evicts the excess. If the counter restarted at 1 it would mint
+/// `heap-000001.mpf`, `heap-000257.mpf`, … — the *same names* recovery just
+/// loaded — and atomically overwrite cold files the rebuilt `cold_index` still
+/// references, silently corrupting cold read-through (the B-2 bug).
+///
+/// Scanning the on-disk `<shard_dir>/data/heap-NNNNNN.mpf` files (rather than
+/// the manifest) is deliberate: a spill that wrote its `.mpf` but crashed
+/// before the manifest commit leaves an orphan the manifest doesn't know about,
+/// yet it still occupies a filename that must not be clobbered. The physical
+/// files are the authority on what can be overwritten.
+///
+/// Returns `max(existing file_id) + 1`. Because each batch file is named after
+/// its first request's `file_id` (gaps are harmless — recovery iterates
+/// manifest entries, see `spill_thread`), any seed strictly above the current
+/// max guarantees every future filename is new. Returns `1` when disk-offload
+/// is off, the directory is absent, or it holds no heap files — identical to
+/// the historical default, so a fresh server and the live hot path are
+/// unchanged by this seeding.
+#[must_use]
+pub fn next_spill_file_id_seed(shard_dir: Option<&Path>) -> u64 {
+    let Some(dir) = shard_dir else { return 1 };
+    let data_dir = dir.join("data");
+    let entries = match std::fs::read_dir(&data_dir) {
+        Ok(e) => e,
+        Err(e) => {
+            // NotFound is the normal fresh-server case (data/ not created yet).
+            // Anything else (permissions, I/O) is anomalous: fail safe to the
+            // legacy default but surface it so a misseed can't hide silently.
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(
+                    dir = %data_dir.display(),
+                    error = %e,
+                    "spill file_id seed: could not scan cold dir; defaulting to 1"
+                );
+            }
+            return 1;
+        }
+    };
+    let mut max_id: Option<u64> = None;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if let Some(id) = name
+            .to_str()
+            .and_then(|n| n.strip_prefix("heap-"))
+            .and_then(|r| r.strip_suffix(".mpf"))
+            .and_then(|s| s.parse::<u64>().ok())
+        {
+            max_id = Some(max_id.map_or(id, |m| m.max(id)));
+        }
+    }
+    match max_id {
+        Some(m) => m + 1,
+        None => 1,
+    }
+}
+
 pub fn try_evict_if_needed_async_spill(
     db: &mut Database,
     config: &RuntimeConfig,
@@ -269,8 +331,10 @@ pub fn try_evict_if_needed_async_spill_with_total(
 
     let policy = EvictionPolicy::from_str(&config.maxmemory_policy);
 
+    // Per-shard budget (see `try_evict_if_needed_with_spill_and_total`).
+    let budget = config.maxmemory_per_shard();
     let mut current_total = total_memory;
-    while current_total > config.maxmemory {
+    while current_total > budget {
         if policy == EvictionPolicy::NoEviction {
             return Err(oom_error());
         }
@@ -307,8 +371,10 @@ pub fn try_evict_deferred(
         return Ok(smallvec::SmallVec::new());
     }
 
+    // Per-shard budget (see `try_evict_if_needed_with_spill_and_total`).
+    let budget = config.maxmemory_per_shard();
     let total_memory = db.estimated_memory();
-    if total_memory <= config.maxmemory {
+    if total_memory <= budget {
         return Ok(smallvec::SmallVec::new());
     }
 
@@ -316,7 +382,7 @@ pub fn try_evict_deferred(
     let mut evicted = smallvec::SmallVec::new();
     let mut current_total = total_memory;
 
-    while current_total > config.maxmemory {
+    while current_total > budget {
         if policy == EvictionPolicy::NoEviction {
             return Err(oom_error());
         }
@@ -459,19 +525,13 @@ fn evict_one_async_spill(
         // produce a SpillCompletion that updates cold_index for this db_index.
         db.remove(key.as_bytes());
 
-        // Insert a tentative cold_index entry so subsequent GETs in this DB
-        // can resolve the key while the bg pwrite is in flight. The completion
-        // handler in persistence_tick::apply_spill_completions will overwrite
-        // this with the authoritative ColdLocation once pwrite finishes.
-        if let Some(ref mut ci) = db.cold_index {
-            ci.insert(
-                Bytes::copy_from_slice(key.as_bytes()),
-                crate::storage::tiered::cold_index::ColdLocation {
-                    file_id,
-                    slot_idx: 0,
-                },
-            );
-        }
+        // NOTE: we do NOT insert a tentative cold_index entry here.
+        // Under batching the (page_idx, slot_idx) are unknown at evict time;
+        // slot 0 would return a *different* key's value in the pre-flush window.
+        // Accept a brief read-miss until the completion applies — the key is
+        // safe: it is in the SpillRequest and will be registered once the bg
+        // thread writes and the event loop processes the SpillCompletion.
+        // AOF incr log is the durability backstop for the pre-flush window.
     } else {
         // Entry disappeared (race with expiry), just remove
         db.remove(key.as_bytes());
@@ -695,7 +755,49 @@ mod tests {
             maxclients: 10000,
             timeout: 0,
             tcp_keepalive: 300,
+            num_shards: 1,
         }
+    }
+
+    #[test]
+    fn per_shard_budget_divides_maxmemory_at_enforcement() {
+        // Regression for the multishard "zombie RAM" bug: maxmemory is a
+        // whole-instance cap, but each shard enforces eviction independently.
+        // Without per-shard division an N-shard server tolerates ~N×maxmemory.
+        let mut db = Database::new();
+        db.set_string(Bytes::from_static(b"k1"), Bytes::from_static(b"v1"));
+        db.set_string(Bytes::from_static(b"k2"), Bytes::from_static(b"v2"));
+        db.set_string(Bytes::from_static(b"k3"), Bytes::from_static(b"v3"));
+        db.set_string(Bytes::from_static(b"k4"), Bytes::from_static(b"v4"));
+        let total = db.estimated_memory();
+        assert!(total > 0);
+
+        // Whole-instance cap == current memory, single shard: per-shard budget
+        // equals `total`, so nothing is evicted.
+        let mut cfg1 = make_config(total, "allkeys-lru");
+        cfg1.num_shards = 1;
+        assert!(try_evict_if_needed(&mut db, &cfg1).is_ok());
+        assert_eq!(
+            db.len(),
+            4,
+            "single shard: nothing evicted at budget == total"
+        );
+
+        // SAME whole-instance cap, 4 shards: per-shard budget = ceil(total/4) <<
+        // total, so this shard MUST shed keys until it is under the per-shard
+        // budget. Pre-fix (comparison vs raw maxmemory) this evicted nothing.
+        let mut cfg4 = make_config(total, "allkeys-lru");
+        cfg4.num_shards = 4;
+        assert!(try_evict_if_needed(&mut db, &cfg4).is_ok());
+        assert!(
+            db.len() < 4,
+            "4 shards: per-shard budget must force eviction (got len {})",
+            db.len()
+        );
+        assert!(
+            db.estimated_memory() <= cfg4.maxmemory_per_shard(),
+            "evicted below the per-shard budget"
+        );
     }
 
     #[test]
@@ -956,5 +1058,46 @@ mod tests {
         let result = try_evict_if_needed_with_spill(&mut db, &config, None);
         assert!(result.is_ok());
         assert_eq!(db.len(), 0);
+    }
+
+    // ── B-2: post-crash cold-spill file_id seeding ──────────────────────────
+    // The spill file_id counter must resume ABOVE every recovered `heap-*.mpf`
+    // so post-restart re-eviction never overwrites a cold file the rebuilt
+    // cold_index still points at (which silently corrupts cold read-through).
+
+    /// `None` dir (disk-offload off) → seed 1 (historical default, no change).
+    #[test]
+    fn test_spill_seed_none_dir_is_one() {
+        assert_eq!(next_spill_file_id_seed(None), 1);
+    }
+
+    /// Fresh server (dir absent / empty) → seed 1 == legacy behaviour, so the
+    /// live read-through hot path cannot regress from this change.
+    #[test]
+    fn test_spill_seed_fresh_server_is_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        // data/ does not exist yet
+        assert_eq!(next_spill_file_id_seed(Some(tmp.path())), 1);
+        // data/ exists but empty
+        std::fs::create_dir_all(tmp.path().join("data")).unwrap();
+        assert_eq!(next_spill_file_id_seed(Some(tmp.path())), 1);
+    }
+
+    /// With recovered heap files, seed = max(file_id) + 1 so the next batch's
+    /// filename is strictly greater than any existing one (filenames are the
+    /// first request id of each batch; gaps are harmless).
+    #[test]
+    fn test_spill_seed_resumes_above_max_recovered() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        for id in [1u64, 257, 513] {
+            std::fs::write(data.join(format!("heap-{id:06}.mpf")), b"x").unwrap();
+        }
+        // non-heap files and bad names must be ignored
+        std::fs::write(data.join("manifest.bin"), b"x").unwrap();
+        std::fs::write(data.join("heap-notanum.mpf"), b"x").unwrap();
+        std::fs::write(data.join("base-000999.rdb"), b"x").unwrap();
+        assert_eq!(next_spill_file_id_seed(Some(tmp.path())), 514);
     }
 }

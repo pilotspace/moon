@@ -19,7 +19,7 @@ use crate::persistence::aof;
 use crate::protocol::Frame;
 use crate::shard::dispatch::{ShardMessage, key_to_shard};
 use crate::shard::mesh::ChannelMesh;
-use crate::storage::eviction::try_evict_if_needed;
+use crate::storage::eviction::{try_evict_if_needed, try_evict_if_needed_async_spill};
 use crate::workspace::{strip_workspace_prefix_from_response, workspace_rewrite_args};
 
 use super::affinity::MigratedConnectionState;
@@ -1272,7 +1272,34 @@ pub(crate) async fn handle_connection_sharded_inner<
                                                 conn: &mut super::core::ConnectionState|
                              -> WriteOutcome {
                                 let rt = ctx.runtime_config.read();
-                                if let Err(oom_frame) = try_evict_if_needed(db, &rt) {
+                                // Disk-offload: when a per-shard spill sender is wired
+                                // (ConnCtx populated by spawn_tokio_connection), evicted
+                                // KVs are spilled to the cold tier on the background spill
+                                // thread instead of being deleted — mirrors handler_monoio.
+                                // Without the sender (disk-offload disabled) fall back to
+                                // delete-only eviction. Both evictors run under this shard's
+                                // db write lock, so they cannot race the persistence-tick
+                                // cascade on the same key.
+                                let evict_result = if let Some(ref sender) = ctx.spill_sender {
+                                    let mut fid = ctx.spill_file_id.get();
+                                    let dir = ctx
+                                        .disk_offload_dir
+                                        .as_deref()
+                                        .unwrap_or(std::path::Path::new("."));
+                                    let res = try_evict_if_needed_async_spill(
+                                        db,
+                                        &rt,
+                                        sender,
+                                        dir,
+                                        &mut fid,
+                                        conn.selected_db,
+                                    );
+                                    ctx.spill_file_id.set(fid);
+                                    res
+                                } else {
+                                    try_evict_if_needed(db, &rt)
+                                };
+                                if let Err(oom_frame) = evict_result {
                                     drop(rt);
                                     return Err(oom_frame);
                                 }
@@ -1674,17 +1701,51 @@ pub(crate) async fn handle_connection_sharded_inner<
                             entries.into_iter().map(|(idx, arc_frame, aof, cmd, _db)| ((idx, aof, cmd), arc_frame)).unzip();
                         let msg = ShardMessage::PipelineBatchSlotted { db_index: batch_db, commands, response_slot: crate::shard::dispatch::ResponseSlotPtr(slot_ptr) };
                         let target_idx = ChannelMesh::target_index(ctx.shard_id, target);
-                        {
-                            let mut pending = msg;
-                            loop {
-                                let push_result = { let mut producers = ctx.dispatch_tx.borrow_mut(); producers[target_idx].try_push(pending) };
-                                match push_result {
-                                    Ok(()) => { ctx.spsc_notifiers[target].notify_one(); break; }
-                                    Err(val) => { pending = val; tokio::task::yield_now().await; }
+                        // F3: bounded backpressure retry (shared helper). The
+                        // closure retains the message on a full ring; the helper
+                        // checks `shutdown` before each backoff so a wedged peer
+                        // can't park this connection forever. On give-up the
+                        // batch was NEVER sent — `slot_ptr` has no side effect, so
+                        // simply skip `future_for` (no accounting leak) and error
+                        // the entries directly.
+                        let mut pending = Some(msg);
+                        let outcome = crate::shard::dispatch::push_with_backpressure(
+                            &shutdown,
+                            crate::shard::dispatch::CROSS_SHARD_PUSH_MAX_RETRIES,
+                            crate::shard::dispatch::CROSS_SHARD_PUSH_BACKOFF,
+                            || match pending.take() {
+                                None => true,
+                                Some(m) => {
+                                    let mut producers = ctx.dispatch_tx.borrow_mut();
+                                    match producers[target_idx].try_push(m) {
+                                        Ok(()) => true,
+                                        Err(back) => {
+                                            pending = Some(back);
+                                            false
+                                        }
+                                    }
+                                }
+                            },
+                        )
+                        .await;
+                        match outcome {
+                            crate::shard::dispatch::PushOutcome::Pushed => {
+                                ctx.spsc_notifiers[target].notify_one();
+                                reply_futures.push((meta, target));
+                            }
+                            crate::shard::dispatch::PushOutcome::Backpressure
+                            | crate::shard::dispatch::PushOutcome::Cancelled => {
+                                tracing::warn!(
+                                    "Shard {}: cross-shard push to shard {} gave up ({:?}); rejecting batch",
+                                    ctx.shard_id, target, outcome
+                                );
+                                for (resp_idx, _, _) in &meta {
+                                    responses[*resp_idx] = Frame::Error(Bytes::from_static(
+                                        b"ERR cross-shard dispatch backpressure",
+                                    ));
                                 }
                             }
                         }
-                        reply_futures.push((meta, target));
                     }
                     let proto_ver = conn.protocol_version;
                     for (meta, target) in reply_futures {

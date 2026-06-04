@@ -45,19 +45,19 @@ fn read_cold_entry(
     location: ColdLocation,
     now_ms: u64,
 ) -> Option<(RedisValue, Option<u64>)> {
+    use std::os::unix::fs::FileExt as _;
+
     let file_path = shard_dir
         .join("data")
         .join(format!("heap-{:06}.mpf", location.file_id));
 
-    // Read the full file (needed for potential overflow chain reads)
-    let file_data = std::fs::read(&file_path).ok()?;
-    if file_data.len() < PAGE_4K {
-        return None;
-    }
+    let file = std::fs::File::open(&file_path).ok()?;
 
-    // Parse the KvLeaf page (page 0)
+    // Read only the specific 4KB page identified by page_idx (pread, no whole-file read).
+    let page_offset = (location.page_idx as u64) * (PAGE_4K as u64);
     let mut leaf_buf = [0u8; PAGE_4K];
-    leaf_buf.copy_from_slice(&file_data[..PAGE_4K]);
+    file.read_exact_at(&mut leaf_buf, page_offset).ok()?;
+
     let page = crate::persistence::kv_page::KvLeafPage::from_bytes(leaf_buf)?;
     let entry = page.get(location.slot_idx)?;
 
@@ -68,13 +68,16 @@ fn read_cold_entry(
         }
     }
 
-    // Resolve value bytes: handle overflow chain if flagged
+    // Resolve value bytes: handle overflow chain if flagged.
+    // For overflow we need the full file to traverse the chain.
     let value_bytes = if entry.flags & entry_flags::OVERFLOW != 0 {
         // Overflow pointer: start_page_idx as u32 LE
         if entry.value.len() < 4 {
             return None;
         }
         let start_page_idx = u32::from_le_bytes(entry.value[..4].try_into().ok()?) as usize;
+        // Only read the full file when following an overflow chain.
+        let file_data = std::fs::read(&file_path).ok()?;
         read_overflow_chain(&file_data, start_page_idx)?
     } else {
         entry.value

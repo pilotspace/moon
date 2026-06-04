@@ -84,6 +84,10 @@ pub async fn run_embedded(
         )
     })?;
 
+    // G1 memory guardrail: resolve --maxmemory before RuntimeConfig is built
+    // (matches the binary entry in main.rs).
+    crate::config::log_memory_guardrail(config.apply_memory_guardrail());
+
     // Resolve shard count (`0` => auto-detect core count, matches main.rs).
     if config.shards == 0 {
         config.shards = std::thread::available_parallelism()
@@ -136,7 +140,11 @@ pub async fn run_embedded(
             .context("embedded moon: failed to spawn AOF writer thread")?;
         info!("embedded moon: AOF enabled (fsync: {:?})", fsync);
         (
-            Some(AofWriterPool::top_level_with_policy(tx, fsync)),
+            Some(AofWriterPool::top_level_with_policy(
+                tx,
+                fsync,
+                std::time::Duration::from_millis(config.aof_fsync_timeout_ms),
+            )),
             Some(handle),
         )
     } else {
@@ -172,6 +180,10 @@ pub async fn run_embedded(
     // Shared runtime + server configs.
     let runtime_config_shared: Arc<RwLock<crate::config::RuntimeConfig>> =
         Arc::new(RwLock::new(config.to_runtime_config()));
+    // Publish the resolved shard count so maxmemory is enforced as a
+    // whole-instance cap (per-shard budget = maxmemory / num_shards).
+    runtime_config_shared.write().num_shards = num_shards;
+    crate::config::log_maxmemory_sharding(runtime_config_shared.read().maxmemory, num_shards);
     let server_config_shared: Arc<ServerConfig> = Arc::new(config.clone());
 
     // Per-shard pubsub + remote-subscriber registries.

@@ -300,6 +300,34 @@ pub fn bgrewriteaof_start_sharded(
             b"ERR Background AOF rewrite already in progress",
         ));
     }
+
+    // [F6] PerShard pools use the per-shard fan-out (synchronized seq bump +
+    // single manifest commit across all writers). TopLevel multi-DB pools keep
+    // the legacy single-writer RewriteSharded path.
+    if pool.layout() == crate::persistence::aof_manifest::AofLayout::PerShard {
+        // Per-shard fan-out for BOTH runtimes. The fold is synchronous std::fs
+        // IO; on monoio the writer runs it inline, on tokio the writer converts
+        // its `tokio::fs` handle to `std::fs` for the fold's duration (both run
+        // on a dedicated block_on_local thread, so blocking is safe). The fold
+        // body — and therefore the exactly-once invariant — is identical.
+        //
+        // try_send_rewrite_per_shard loads the manifest, builds the shared
+        // coordinator, and reliably fans out to every writer. The in-progress
+        // flag is cleared by the coordinator's final commit
+        // (PerShardRewriteCoord::shard_done), not here.
+        match pool.try_send_rewrite_per_shard(shard_databases) {
+            Ok(()) => {
+                return Frame::SimpleString(Bytes::from_static(
+                    b"Background append only file rewriting started",
+                ));
+            }
+            Err(e) => {
+                AOF_REWRITE_IN_PROGRESS.store(false, Ordering::SeqCst);
+                return rewrite_pool_error_frame(e);
+            }
+        }
+    }
+
     match pool.try_send_rewrite(AofMessage::RewriteSharded(shard_databases)) {
         Ok(()) => Frame::SimpleString(Bytes::from_static(
             b"Background append only file rewriting started",

@@ -29,7 +29,7 @@ pub enum CrossShardFastPath {
 }
 
 /// Server configuration parsed from command-line arguments.
-#[derive(Parser, Debug, Clone)]
+#[derive(Parser, Debug, Clone, Default)]
 #[command(name = "moon", about = "A Redis-compatible server")]
 pub struct ServerConfig {
     /// Bind address
@@ -117,9 +117,33 @@ pub struct ServerConfig {
     #[arg(long, default_value_t = false)]
     pub unsafe_multishard_aof: bool,
 
+    /// [EXPERIMENTAL] Enable per-shard BGREWRITEAOF (compaction) for the
+    /// `--shards >= 2 + --appendonly yes` PerShard layout.
+    ///
+    /// Default `false`: BGREWRITEAOF stays gated in PerShard mode (the
+    /// shipped, crash-safe "append-only, no in-place compaction" behavior).
+    /// When `true`, BGREWRITEAOF fans the rewrite out to every per-shard
+    /// writer (synchronized seq bump + single manifest commit). This path is
+    /// validated by `tests/crash_matrix_per_shard_bgrewriteaof.rs` and is
+    /// opt-in until the both-runtime crash matrix is green by default.
+    ///
+    /// The flag only takes effect alongside `per_shard_aof_active`; it is a
+    /// no-op for `--shards 1` (TopLevel rewrite already works) and for
+    /// `--appendonly no`.
+    #[arg(long, default_value_t = false)]
+    pub experimental_per_shard_rewrite: bool,
+
     /// AOF fsync policy (always/everysec/no)
     #[arg(long, default_value = "everysec")]
     pub appendfsync: String,
+
+    /// Max time (ms) a write may block awaiting the `appendfsync=always`
+    /// fsync ack before the write is failed instead of parking the
+    /// connection forever. Design-for-failure bound: a stalled disk must
+    /// not turn write connections into zombies holding their buffers.
+    /// 0 disables the bound (legacy unbounded await). Default 2000ms.
+    #[arg(long = "aof-fsync-timeout-ms", default_value_t = 2000)]
+    pub aof_fsync_timeout_ms: u64,
 
     /// RDB auto-save rules (e.g., "3600 1 300 100")
     #[arg(long)]
@@ -137,9 +161,21 @@ pub struct ServerConfig {
     #[arg(long, default_value = "appendonly.aof")]
     pub appendfilename: String,
 
-    /// Maximum memory in bytes (0 = unlimited)
-    #[arg(long, default_value_t = 0)]
-    pub maxmemory: usize,
+    /// Maximum memory in bytes.
+    ///
+    /// G1 memory guardrail (design-for-failure against unbounded keyspace
+    /// growth → OOM kill):
+    /// - **flag omitted** (`None`) → Moon auto-caps at ~80% of the detected
+    ///   memory limit (cgroup-aware on Linux, host RAM otherwise) and switches
+    ///   a `noeviction` policy to `allkeys-lru`, logging a startup notice.
+    /// - `--maxmemory 0` → explicitly UNLIMITED (Redis-compatible escape hatch).
+    /// - `--maxmemory N` → exact cap in bytes (honored verbatim).
+    ///
+    /// Resolved once at startup by [`ServerConfig::apply_memory_guardrail`];
+    /// downstream code reads the resolved `usize` from `RuntimeConfig`
+    /// (`0 = unlimited`).
+    #[arg(long)]
+    pub maxmemory: Option<usize>,
 
     /// Eviction policy when maxmemory is reached
     #[arg(long, default_value = "noeviction")]
@@ -334,8 +370,15 @@ pub struct ServerConfig {
     /// the on-disk DataFile, and tombstones the manifest entry.
     ///
     /// Set to 0 to disable the sweeper entirely.
-    /// Default: 300 (5 minutes). Recommended range: 60–3600.
-    #[arg(long = "cold-orphan-sweep-interval-secs", default_value_t = 300)]
+    /// Default: 60 (1 minute). Recommended range: 60–3600.
+    ///
+    /// Lowered from 300 → 60: at 300s the sweep never fired within a typical
+    /// benchmark window, which both let cold orphans accumulate on disk for up
+    /// to 5 minutes AND masked a batch-file shared-deletion data-loss bug (fixed
+    /// by the per-file-liveness refcount in ColdIndex). 60s reclaims promptly;
+    /// the sweep's per-file unlinks run off the hot path so a shorter interval
+    /// keeps each batch small rather than churning under the shard lock.
+    #[arg(long = "cold-orphan-sweep-interval-secs", default_value_t = 60)]
     pub cold_orphan_sweep_interval_secs: u64,
 
     // ── MoonStore v2: Point-in-time recovery (PITR) ────────────────
@@ -652,10 +695,49 @@ impl ServerConfig {
             .unwrap_or(maxmemory / 4)
     }
 
+    /// Resolve the G1 memory guardrail, mutating `self` in place, and return
+    /// the [`GuardrailOutcome`] for the caller to log as a startup notice.
+    ///
+    /// MUST be called once at startup, after parsing and before
+    /// [`Self::to_runtime_config`]. Idempotent in effect: once `maxmemory` is
+    /// `Some`, re-calling returns `Explicit` and changes nothing.
+    pub fn apply_memory_guardrail(&mut self) -> GuardrailOutcome {
+        let detected = detect_memory_limit_bytes();
+        let outcome = resolve_memory_guardrail(
+            self.maxmemory,
+            &self.maxmemory_policy,
+            detected,
+            MAXMEMORY_GUARDRAIL_PERCENT,
+        );
+        match &outcome {
+            GuardrailOutcome::Applied {
+                cap_bytes,
+                policy_changed_to,
+                ..
+            } => {
+                self.maxmemory = Some(*cap_bytes);
+                if let Some(p) = policy_changed_to {
+                    self.maxmemory_policy = p.clone();
+                }
+            }
+            GuardrailOutcome::Explicit(_) => { /* operator set it; honor verbatim */ }
+            GuardrailOutcome::Skipped => {
+                // Omitted but no limit detectable → leave UNLIMITED but make it
+                // concrete so downstream sees the `0` sentinel, not `None`.
+                self.maxmemory = Some(0);
+            }
+        }
+        outcome
+    }
+
     /// Create a RuntimeConfig from this server config, copying mutable parameters.
+    ///
+    /// `maxmemory` resolves `None`/`Some(0)` → `0` (the downstream "unlimited"
+    /// sentinel). Call [`Self::apply_memory_guardrail`] BEFORE this if the G1
+    /// auto-guardrail should populate an unset `--maxmemory`.
     pub fn to_runtime_config(&self) -> RuntimeConfig {
         RuntimeConfig {
-            maxmemory: self.maxmemory,
+            maxmemory: self.maxmemory.unwrap_or(0),
             maxmemory_policy: self.maxmemory_policy.clone(),
             maxmemory_samples: self.maxmemory_samples,
             lfu_log_factor: 10,
@@ -674,8 +756,188 @@ impl ServerConfig {
             maxclients: self.maxclients,
             timeout: self.timeout,
             tcp_keepalive: self.tcp_keepalive,
+            // Default to single-shard (no division). The server overwrites this
+            // on the shared RuntimeConfig with the resolved shard count once it
+            // is known (main.rs / embedded.rs), so the per-shard eviction budget
+            // bounds aggregate RSS. Tests that call this directly run 1 shard.
+            num_shards: 1,
         }
     }
+}
+
+/// Fraction (percent) of the detected memory limit used as the G1 auto
+/// guardrail cap when `--maxmemory` is omitted. 80% leaves headroom for
+/// allocator fragmentation, page cache, and non-keyspace overhead.
+pub const MAXMEMORY_GUARDRAIL_PERCENT: u64 = 80;
+
+/// Result of resolving the G1 memory guardrail — drives the startup notice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GuardrailOutcome {
+    /// Operator set `--maxmemory` explicitly (including `0` = unlimited).
+    /// The value is honored verbatim; no guardrail applied.
+    Explicit(usize),
+    /// `--maxmemory` was omitted and a memory limit was detected: Moon
+    /// auto-capped at `cap_bytes` (`~PERCENT%` of `detected_limit_bytes`).
+    /// `policy_changed_to` is `Some` when a `noeviction` policy was switched
+    /// to an evicting one so the cap actually sheds memory instead of OOM-ing.
+    Applied {
+        cap_bytes: usize,
+        detected_limit_bytes: usize,
+        policy_changed_to: Option<String>,
+    },
+    /// `--maxmemory` was omitted but no memory limit could be detected (e.g.
+    /// non-Linux dev host, or `/proc`/`/sys` unreadable). Left UNLIMITED — the
+    /// caller warns the operator to set `--maxmemory` explicitly.
+    Skipped,
+}
+
+/// Parse the `MemTotal:` line of `/proc/meminfo` contents into bytes.
+/// Format: `MemTotal:       16384256 kB`. Pure for testability.
+///
+/// Only compiled where used: the Linux detector and the unit tests (avoids a
+/// dead-code warning on non-Linux non-test builds).
+#[cfg(any(target_os = "linux", test))]
+fn parse_meminfo_memtotal(contents: &str) -> Option<usize> {
+    for line in contents.lines() {
+        if let Some(rest) = line.strip_prefix("MemTotal:") {
+            let kb: usize = rest.split_whitespace().next()?.parse().ok()?;
+            return kb.checked_mul(1024);
+        }
+    }
+    None
+}
+
+/// Parse a cgroup memory-limit file's contents into a byte cap.
+///
+/// Handles cgroup v2 (`memory.max`: a number or the literal `max`) and v1
+/// (`memory.limit_in_bytes`: a number, with a near-`i64::MAX` "no limit"
+/// sentinel). Returns `None` for "unlimited". Pure for testability.
+#[cfg(any(target_os = "linux", test))]
+fn parse_cgroup_mem_max(contents: &str) -> Option<usize> {
+    let t = contents.trim();
+    if t.is_empty() || t == "max" {
+        return None;
+    }
+    let v: usize = t.parse().ok()?;
+    // cgroup v1 uses a huge page-rounded value (~i64::MAX) to mean "no limit".
+    if v >= (1usize << 62) {
+        return None;
+    }
+    Some(v)
+}
+
+/// Detect the effective memory limit in bytes: the minimum of the cgroup limit
+/// (v2 then v1) and host RAM. Linux-only; returns `None` elsewhere or when
+/// nothing is readable (the guardrail then fails open with a warning).
+#[cfg(target_os = "linux")]
+fn detect_memory_limit_bytes() -> Option<usize> {
+    let host = std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|c| parse_meminfo_memtotal(&c));
+    let cgroup = std::fs::read_to_string("/sys/fs/cgroup/memory.max")
+        .ok()
+        .and_then(|c| parse_cgroup_mem_max(&c))
+        .or_else(|| {
+            std::fs::read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes")
+                .ok()
+                .and_then(|c| parse_cgroup_mem_max(&c))
+        });
+    match (host, cgroup) {
+        (Some(h), Some(c)) => Some(h.min(c)),
+        (Some(h), None) => Some(h),
+        (None, Some(c)) => Some(c),
+        (None, None) => None,
+    }
+}
+
+/// Non-Linux: no portable, dependency-free memory-limit probe. The guardrail
+/// is skipped (operator sets `--maxmemory` explicitly on dev hosts). Production
+/// targets Linux per the platform policy.
+#[cfg(not(target_os = "linux"))]
+fn detect_memory_limit_bytes() -> Option<usize> {
+    None
+}
+
+/// Pure resolution of the guardrail decision (no I/O) for unit testing.
+fn resolve_memory_guardrail(
+    maxmemory: Option<usize>,
+    policy: &str,
+    detected_limit: Option<usize>,
+    percent: u64,
+) -> GuardrailOutcome {
+    if let Some(explicit) = maxmemory {
+        return GuardrailOutcome::Explicit(explicit);
+    }
+    match detected_limit {
+        Some(limit) if limit > 0 => {
+            // u128 intermediate avoids overflow on large-RAM hosts.
+            let cap = ((limit as u128 * percent as u128) / 100) as usize;
+            let policy_changed_to = (policy == "noeviction").then(|| "allkeys-lru".to_string());
+            GuardrailOutcome::Applied {
+                cap_bytes: cap,
+                detected_limit_bytes: limit,
+                policy_changed_to,
+            }
+        }
+        _ => GuardrailOutcome::Skipped,
+    }
+}
+
+/// Emit the G1 startup notice for a resolved guardrail outcome. Shared by the
+/// binary entry (`main`) and the embedded entry so the message is identical.
+pub fn log_memory_guardrail(outcome: GuardrailOutcome) {
+    match outcome {
+        GuardrailOutcome::Applied {
+            cap_bytes,
+            detected_limit_bytes,
+            policy_changed_to,
+        } => {
+            let policy_note = policy_changed_to
+                .map(|p| format!("; eviction policy set to '{p}'"))
+                .unwrap_or_default();
+            tracing::warn!(
+                "Memory guardrail: --maxmemory not set; auto-capping at {} bytes \
+                 (~{}% of detected {} bytes){}. Override with --maxmemory <bytes>, \
+                 or --maxmemory 0 for unlimited.",
+                cap_bytes,
+                MAXMEMORY_GUARDRAIL_PERCENT,
+                detected_limit_bytes,
+                policy_note
+            );
+        }
+        GuardrailOutcome::Skipped => {
+            tracing::warn!(
+                "Memory guardrail: --maxmemory not set and no memory limit could be \
+                 detected on this platform; running UNLIMITED. Set --maxmemory <bytes> \
+                 to bound keyspace growth and avoid OOM termination."
+            );
+        }
+        GuardrailOutcome::Explicit(_) => { /* operator chose; stay silent */ }
+    }
+}
+
+/// Emit a one-line startup notice when `maxmemory` is split across multiple shards.
+///
+/// `maxmemory` is a whole-instance cap, but each shard enforces eviction
+/// independently against `maxmemory / num_shards` (see
+/// [`RuntimeConfig::maxmemory_per_shard`]). Without this notice an operator
+/// running e.g. `--maxmemory 8gb --shards 4` would silently get an 8 GB
+/// (not 32 GB) effective ceiling and see "surprise" evictions with nothing
+/// in the logs explaining why. Only fires when the division actually changes
+/// the effective budget (`num_shards > 1` and a finite cap).
+pub fn log_maxmemory_sharding(maxmemory: usize, num_shards: usize) {
+    if maxmemory == 0 || num_shards <= 1 {
+        return;
+    }
+    let per_shard = maxmemory.div_ceil(num_shards);
+    tracing::info!(
+        "maxmemory {} bytes is a whole-instance cap; each of {} shards enforces \
+         eviction against a per-shard budget of {} bytes (maxmemory / shards). \
+         CONFIG GET / INFO continue to report the whole-instance value.",
+        maxmemory,
+        num_shards,
+        per_shard
+    );
 }
 
 /// Runtime-mutable configuration parameters.
@@ -722,6 +984,38 @@ pub struct RuntimeConfig {
     pub timeout: u64,
     /// TCP keepalive interval in seconds (0 = disabled).
     pub tcp_keepalive: u64,
+    /// Resolved shard count — used only to derive the per-shard eviction budget.
+    ///
+    /// `maxmemory` is a whole-instance cap (Redis-compatible: `CONFIG GET` /
+    /// INFO report it verbatim). But each shard is shared-nothing and enforces
+    /// eviction independently, so without dividing, an N-shard server would
+    /// tolerate ~N×`maxmemory` before evicting. The per-shard threshold is
+    /// therefore `maxmemory / num_shards` (see [`RuntimeConfig::maxmemory_per_shard`]).
+    /// Defaults to `1` (single shard ⇒ no division, preserving prior behavior);
+    /// the server overwrites it on the shared instance at startup with the
+    /// resolved shard count.
+    pub num_shards: usize,
+}
+
+impl RuntimeConfig {
+    /// Per-shard eviction budget in bytes.
+    ///
+    /// `maxmemory` is a whole-instance cap. Because each shard enforces eviction
+    /// independently (shared-nothing), the effective per-shard threshold is
+    /// `maxmemory / num_shards`, so the aggregate across all shards converges on
+    /// the configured whole-instance cap instead of overshooting it ~N×.
+    ///
+    /// Uses `div_ceil` so the summed per-shard budgets never undershoot the cap,
+    /// and `max(1)` on the divisor guards against a mis-set `num_shards`. Returns
+    /// `0` (unlimited) iff `maxmemory == 0`.
+    #[inline]
+    #[must_use]
+    pub fn maxmemory_per_shard(&self) -> usize {
+        if self.maxmemory == 0 {
+            return 0;
+        }
+        self.maxmemory.div_ceil(self.num_shards.max(1))
+    }
 }
 
 impl Default for RuntimeConfig {
@@ -746,6 +1040,7 @@ impl Default for RuntimeConfig {
             maxclients: 10000,
             timeout: 0,
             tcp_keepalive: 300,
+            num_shards: 1,
         }
     }
 }
@@ -826,7 +1121,9 @@ mod tests {
     #[test]
     fn test_maxmemory_defaults() {
         let config = ServerConfig::parse_from::<[&str; 0], &str>([]);
-        assert_eq!(config.maxmemory, 0);
+        // G1: omitted flag parses to None (the auto-guardrail sentinel),
+        // distinct from an explicit `--maxmemory 0` (= unlimited).
+        assert_eq!(config.maxmemory, None);
         assert_eq!(config.maxmemory_policy, "noeviction");
         assert_eq!(config.maxmemory_samples, 5);
     }
@@ -842,9 +1139,102 @@ mod tests {
             "--maxmemory-samples",
             "10",
         ]);
-        assert_eq!(config.maxmemory, 1048576);
+        assert_eq!(config.maxmemory, Some(1048576));
         assert_eq!(config.maxmemory_policy, "allkeys-lru");
         assert_eq!(config.maxmemory_samples, 10);
+    }
+
+    #[test]
+    fn test_maxmemory_explicit_zero_is_unlimited() {
+        // The Redis escape hatch: explicit `--maxmemory 0` must stay unlimited
+        // and NOT trigger the guardrail.
+        let mut config = ServerConfig::parse_from(["moon", "--maxmemory", "0"]);
+        assert_eq!(config.maxmemory, Some(0));
+        let outcome = config.apply_memory_guardrail();
+        assert_eq!(outcome, GuardrailOutcome::Explicit(0));
+        assert_eq!(config.maxmemory, Some(0));
+        assert_eq!(config.to_runtime_config().maxmemory, 0);
+    }
+
+    // ── G1 pure resolution + parsing ──
+
+    #[test]
+    fn guardrail_applies_percent_and_flips_noeviction() {
+        let out = resolve_memory_guardrail(None, "noeviction", Some(1000), 80);
+        assert_eq!(
+            out,
+            GuardrailOutcome::Applied {
+                cap_bytes: 800,
+                detected_limit_bytes: 1000,
+                policy_changed_to: Some("allkeys-lru".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn guardrail_keeps_existing_evicting_policy() {
+        // Operator already chose an evicting policy → don't override it.
+        let out = resolve_memory_guardrail(None, "allkeys-lfu", Some(2000), 80);
+        assert_eq!(
+            out,
+            GuardrailOutcome::Applied {
+                cap_bytes: 1600,
+                detected_limit_bytes: 2000,
+                policy_changed_to: None,
+            }
+        );
+    }
+
+    #[test]
+    fn guardrail_explicit_value_is_honored() {
+        assert_eq!(
+            resolve_memory_guardrail(Some(4096), "noeviction", Some(1 << 30), 80),
+            GuardrailOutcome::Explicit(4096)
+        );
+    }
+
+    #[test]
+    fn guardrail_skipped_when_no_limit_detected() {
+        assert_eq!(
+            resolve_memory_guardrail(None, "noeviction", None, 80),
+            GuardrailOutcome::Skipped
+        );
+        // Zero/invalid detection also skips (fail open, never cap at 0-by-math).
+        assert_eq!(
+            resolve_memory_guardrail(None, "noeviction", Some(0), 80),
+            GuardrailOutcome::Skipped
+        );
+    }
+
+    #[test]
+    fn guardrail_skipped_outcome_leaves_unlimited() {
+        let mut config = ServerConfig::parse_from::<[&str; 0], &str>([]);
+        // Force the Skipped branch deterministically by resolving against a
+        // None detection (mirrors non-Linux / unreadable /proc).
+        let out = resolve_memory_guardrail(config.maxmemory, &config.maxmemory_policy, None, 80);
+        assert_eq!(out, GuardrailOutcome::Skipped);
+        // apply_* on Skipped must concretize to Some(0) = unlimited.
+        if let GuardrailOutcome::Skipped = out {
+            config.maxmemory = Some(0);
+        }
+        assert_eq!(config.to_runtime_config().maxmemory, 0);
+    }
+
+    #[test]
+    fn parse_meminfo_extracts_memtotal_bytes() {
+        let sample = "MemTotal:       16384256 kB\nMemFree:    1000 kB\n";
+        assert_eq!(parse_meminfo_memtotal(sample), Some(16_384_256 * 1024));
+        assert_eq!(parse_meminfo_memtotal("MemFree: 10 kB\n"), None);
+        assert_eq!(parse_meminfo_memtotal(""), None);
+    }
+
+    #[test]
+    fn parse_cgroup_max_handles_v1_v2_sentinels() {
+        assert_eq!(parse_cgroup_mem_max("2147483648\n"), Some(2_147_483_648));
+        assert_eq!(parse_cgroup_mem_max("max\n"), None); // v2 unlimited
+        assert_eq!(parse_cgroup_mem_max(""), None);
+        // v1 near-i64::MAX "no limit" sentinel.
+        assert_eq!(parse_cgroup_mem_max("9223372036854771712"), None);
     }
 
     #[test]
@@ -862,6 +1252,59 @@ mod tests {
         assert_eq!(rt.maxmemory_samples, 5);
         assert_eq!(rt.lfu_log_factor, 10);
         assert_eq!(rt.lfu_decay_time, 1);
+        // to_runtime_config defaults num_shards to 1 (no per-shard division until
+        // the server sets the resolved count on the shared instance).
+        assert_eq!(rt.num_shards, 1);
+        assert_eq!(rt.maxmemory_per_shard(), 1024);
+    }
+
+    #[test]
+    fn maxmemory_per_shard_unlimited_stays_zero() {
+        let mut rt = RuntimeConfig::default();
+        rt.maxmemory = 0;
+        for n in [1, 2, 4, 16] {
+            rt.num_shards = n;
+            assert_eq!(
+                rt.maxmemory_per_shard(),
+                0,
+                "unlimited (0) must stay 0 regardless of shard count"
+            );
+        }
+    }
+
+    #[test]
+    fn maxmemory_per_shard_single_shard_is_whole_instance() {
+        let mut rt = RuntimeConfig::default();
+        rt.maxmemory = 1_000;
+        rt.num_shards = 1;
+        assert_eq!(rt.maxmemory_per_shard(), 1_000);
+    }
+
+    #[test]
+    fn maxmemory_per_shard_divides_by_shard_count() {
+        let mut rt = RuntimeConfig::default();
+        rt.maxmemory = 400;
+        rt.num_shards = 4;
+        assert_eq!(rt.maxmemory_per_shard(), 100);
+    }
+
+    #[test]
+    fn maxmemory_per_shard_div_ceil_never_undershoots() {
+        // 10 / 3 = 3.33 -> ceil 4 so the summed per-shard budgets (12) >= cap (10).
+        let mut rt = RuntimeConfig::default();
+        rt.maxmemory = 10;
+        rt.num_shards = 3;
+        assert_eq!(rt.maxmemory_per_shard(), 4);
+        assert!(rt.maxmemory_per_shard() * rt.num_shards >= rt.maxmemory);
+    }
+
+    #[test]
+    fn maxmemory_per_shard_guards_zero_shard_count() {
+        // A mis-set num_shards == 0 must not divide-by-zero; treat as 1 shard.
+        let mut rt = RuntimeConfig::default();
+        rt.maxmemory = 500;
+        rt.num_shards = 0;
+        assert_eq!(rt.maxmemory_per_shard(), 500);
     }
 
     #[test]

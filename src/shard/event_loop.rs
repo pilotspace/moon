@@ -82,11 +82,22 @@ impl super::Shard {
             std::sync::atomic::Ordering::Relaxed,
         );
 
-        // On Linux with tokio runtime, attempt to initialize io_uring for high-performance I/O.
+        // io_uring under the tokio runtime is an EXPERIMENTAL bridge (io_uring CQEs
+        // relayed into tokio via an eventfd). It is broken under sustained load: the
+        // driver floods `Unknown io_uring event type: 0` and then drops connections
+        // (BrokenPipe), taking multishard + disk-offload down with it. tokio is the
+        // PORTABILITY runtime — production io_uring lives in monoio (a separate path,
+        // unaffected by this gate). So default tokio to pure-tokio (epoll) I/O, which
+        // is stable under load. Opt back into the bridge with `MOON_URING=1` (for
+        // benchmarking / fixing it). `MOON_NO_URING` still force-disables and remains
+        // the CI default. Guarded by tests/multishard_serve_smoke + crash_recovery_*.
         #[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
         let mut uring_state: Option<UringDriver> = {
-            if std::env::var("MOON_NO_URING").is_ok() {
-                info!("Shard {} io_uring disabled via MOON_NO_URING", self.id);
+            if std::env::var("MOON_NO_URING").is_ok() || std::env::var("MOON_URING").is_err() {
+                info!(
+                    "Shard {} io_uring disabled (tokio default; set MOON_URING=1 to opt in)",
+                    self.id
+                );
                 None
             } else {
                 match UringDriver::new(UringConfig {
@@ -443,16 +454,37 @@ impl super::Shard {
         // Per-shard PageCache (None when disk-offload is disabled).
         // Manages 4KB + 64KB page frames with clock-sweep eviction.
         let page_cache: Option<PageCache> = if server_config.disk_offload_enabled() {
-            // Default: pagecache_size_bytes returns configured size or maxmemory/4.
-            // Split: 75% for 4KB frames, 25% for 64KB frames.
-            let budget = server_config.pagecache_size_bytes(server_config.maxmemory as u64);
-            let num_4k = ((budget * 3 / 4) / 4096) as usize;
-            let num_64k = ((budget / 4) / 65536) as usize;
-            let num_4k = num_4k.max(64); // minimum 64 frames
-            let num_64k = num_64k.max(8); // minimum 8 frames
+            use crate::persistence::page_cache::{
+                pagecache_frame_counts, per_shard_pagecache_budget,
+            };
+            // `pagecache_size_bytes` (explicit --pagecache-size, else 25% of
+            // maxmemory) is a WHOLE-INSTANCE intent, but each shard builds its
+            // own PageCache. Sizing every shard to the whole budget over-committed
+            // by num_shards× — the multishard "zombie eating RAM". Divide across
+            // shards so total pre-allocation is bounded by the budget. Buffers are
+            // also lazy now (grown on first use), so this is a ceiling, not RSS.
+            let whole_budget =
+                server_config.pagecache_size_bytes(server_config.maxmemory.unwrap_or(0) as u64);
+            let budget = per_shard_pagecache_budget(whole_budget, num_shards);
+            let (num_4k, num_64k) = pagecache_frame_counts(budget);
+            // Design-for-failure: an oversized explicit --pagecache-size lets the
+            // page cache crowd out the keyspace under pressure. Warn once.
+            if shard_id == 0
+                && let Some(maxmem) = server_config.maxmemory
+                && maxmem > 0
+                && whole_budget.saturating_mul(2) > maxmem as u64
+            {
+                tracing::warn!(
+                    "PageCache budget {} B is >50% of maxmemory {} B — under cache \
+                     pressure it competes with the keyspace; lower --pagecache-size",
+                    whole_budget,
+                    maxmem
+                );
+            }
             info!(
-                "Shard {}: PageCache initialized ({} x 4KB + {} x 64KB frames, budget={})",
-                shard_id, num_4k, num_64k, budget
+                "Shard {}: PageCache initialized ({} x 4KB + {} x 64KB frames, \
+                 per-shard budget={} B of whole {} B across {} shard(s), lazy buffers)",
+                shard_id, num_4k, num_64k, budget, whole_budget, num_shards
             );
             Some(PageCache::new(num_4k, num_64k))
         } else {
@@ -581,8 +613,30 @@ impl super::Shard {
         > = spill_thread.as_ref().map(|st| st.sender());
         let spill_file_id: std::rc::Rc<std::cell::Cell<u64>> =
             std::rc::Rc::new(std::cell::Cell::new(1));
-        let mut next_file_id: u64 = 1;
-        let disk_offload_dir: Option<std::path::PathBuf> = disk_offload_base.clone();
+        // Per-shard spill directory for the write-path eviction (handler_monoio).
+        // MUST match the reader's `cold_shard_dir` (main.rs / shard::mod) and the
+        // persistence-tick cascade, which both use `<offload>/shard-{id}`. Using the
+        // bare base here wrote cold files to `<offload>/data` while reads looked in
+        // `<offload>/shard-{id}/data`, so spilled values were never read back.
+        let disk_offload_dir: Option<std::path::PathBuf> = disk_offload_base
+            .clone()
+            .map(|base| base.join(format!("shard-{}", shard_id)));
+
+        // B-2: resume the spill file_id counter ABOVE every recovered
+        // `heap-*.mpf`. Without this the counter restarts at 1 each boot and
+        // post-restart re-eviction overwrites cold files the rebuilt cold_index
+        // still points at, silently corrupting post-crash cold read-through.
+        // Fresh server / disk-offload off → seed 1 (unchanged from before).
+        let spill_seed =
+            crate::storage::eviction::next_spill_file_id_seed(disk_offload_dir.as_deref());
+        spill_file_id.set(spill_seed);
+        let mut next_file_id: u64 = spill_seed;
+        if spill_seed > 1 {
+            info!(
+                "Shard {}: spill file_id counter seeded at {} from recovered cold files",
+                shard_id, spill_seed
+            );
+        }
 
         // Per-shard warm-segment mmap budget enforcer.
         // Owned exclusively by this event-loop task; no locking needed.
@@ -1053,6 +1107,7 @@ impl super::Shard {
                                 &cached_clock, &remote_sub_map_arc, &all_pubsub_registries,
                                 &all_remote_sub_maps, &affinity_tracker,
                                 shard_id, num_shards, config_port,
+                                &spill_sender, &spill_file_id, &disk_offload_dir,
                             );
                         }
                         Err(e) => {
@@ -1104,6 +1159,7 @@ impl super::Shard {
                                 &all_remote_sub_maps,
                                 &affinity_tracker,
                                 shard_id, num_shards, config_port,
+                                &spill_sender, &spill_file_id, &disk_offload_dir,
                             );
                         }
                         Err(_) => {

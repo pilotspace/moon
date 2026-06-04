@@ -60,6 +60,28 @@ pub struct PageCache {
     sweep_64k: ClockSweep,
 }
 
+/// Split a per-shard PageCache budget (bytes) into (4KB, 64KB) frame counts.
+///
+/// 75% of the budget backs 4KB frames, 25% backs 64KB frames, with minimum
+/// floors of 64 / 8 frames so a tiny budget still yields a usable cache. With
+/// lazy buffers these are only *capacities* — actual memory grows on demand.
+pub fn pagecache_frame_counts(budget_bytes: u64) -> (usize, usize) {
+    let num_4k = ((budget_bytes * 3 / 4) / PAGE_4K as u64) as usize;
+    let num_64k = ((budget_bytes / 4) / PAGE_64K as u64) as usize;
+    (num_4k.max(64), num_64k.max(8))
+}
+
+/// Divide a whole-instance PageCache budget across shards.
+///
+/// `--pagecache-size` (and the 25%-of-maxmemory default) express a
+/// whole-instance intent, but each shard builds its own PageCache. Sizing every
+/// shard to the whole budget over-committed by `num_shards`× — the multishard
+/// "zombie eating RAM". Dividing here bounds total pre-allocation to the budget
+/// regardless of shard count. `num_shards == 0` is treated as 1 (never panics).
+pub fn per_shard_pagecache_budget(whole_budget_bytes: u64, num_shards: usize) -> u64 {
+    whole_budget_bytes / (num_shards.max(1) as u64)
+}
+
 impl PageCache {
     /// Create a new PageCache with pre-allocated frame pools.
     ///
@@ -68,15 +90,20 @@ impl PageCache {
     pub fn new(num_frames_4k: usize, num_frames_64k: usize) -> Self {
         let frames_4k: Vec<FrameDescriptor> =
             (0..num_frames_4k).map(|_| FrameDescriptor::new()).collect();
+        // Lazy buffers: start EMPTY (zero heap), grown to a full page on first
+        // use in `fetch_page`. Eagerly committing `num_frames * PAGE` zeroed
+        // bytes here was the multishard "zombie eating RAM" — a 4-shard server
+        // with the auto memory guardrail pre-committed ≈80% of host RAM at
+        // startup before serving a command. RSS now tracks the working set.
         let buffers_4k: Vec<RwLock<Vec<u8>>> = (0..num_frames_4k)
-            .map(|_| RwLock::new(vec![0u8; PAGE_4K]))
+            .map(|_| RwLock::new(Vec::new()))
             .collect();
 
         let frames_64k: Vec<FrameDescriptor> = (0..num_frames_64k)
             .map(|_| FrameDescriptor::new())
             .collect();
         let buffers_64k: Vec<RwLock<Vec<u8>>> = (0..num_frames_64k)
-            .map(|_| RwLock::new(vec![0u8; PAGE_64K]))
+            .map(|_| RwLock::new(Vec::new()))
             .collect();
 
         Self {
@@ -88,6 +115,17 @@ impl PageCache {
             sweep_4k: ClockSweep::new(num_frames_4k),
             sweep_64k: ClockSweep::new(num_frames_64k),
         }
+    }
+
+    /// Total bytes currently committed across all page buffers.
+    ///
+    /// With lazy buffers this reflects the actual resident working set, not the
+    /// configured budget — a freshly constructed cache returns 0. Used by tests
+    /// and memory reporting; not a hot path (locks each buffer).
+    pub fn resident_buffer_bytes(&self) -> usize {
+        let small: usize = self.buffers_4k.iter().map(|b| b.read().len()).sum();
+        let large: usize = self.buffers_64k.iter().map(|b| b.read().len()).sum();
+        small + large
     }
 
     /// Fetch a page into the cache and return a pinned handle.
@@ -154,9 +192,15 @@ impl PageCache {
         // Reset frame for new page
         victim.reset(file_id, page_offset);
 
-        // Read page data from disk
+        // Read page data from disk. Lazily commit this frame's buffer to a full
+        // page on first use (it starts empty from `new`); a reused frame already
+        // has the right length so this is a no-op after the first miss.
+        let page_size = if is_large { PAGE_64K } else { PAGE_4K };
         {
             let mut buf = buffers[victim_idx].write();
+            if buf.len() != page_size {
+                buf.resize(page_size, 0);
+            }
             read_fn(&mut buf)?;
         }
 
@@ -941,5 +985,90 @@ mod tests {
             !fpi_called,
             "FPI should not be called when FPI_PENDING is not set"
         );
+    }
+
+    // ── Zombie-RAM regression: lazy buffers + per-shard budget ──────────────
+    //
+    // Root cause of "moon eats RAM in multishard": disk-offload is on by
+    // default, so every shard EAGERLY committed a PageCache frame pool sized to
+    // 25% of the WHOLE maxmemory at startup. N shards => N x 25% x maxmemory
+    // pre-committed before serving one command (≈80% of host RAM with the auto
+    // guardrail). These tests lock in the two fixes: (1) buffers allocate
+    // lazily on first use, (2) the budget is divided across shards.
+
+    #[test]
+    fn buffers_are_lazily_allocated_not_eagerly() {
+        // A pool big enough to be obvious if eager: 1000x4K + 100x64K ≈ 10.4 MB.
+        let cache = PageCache::new(1000, 100);
+        assert_eq!(
+            cache.resident_buffer_bytes(),
+            0,
+            "a freshly constructed PageCache must NOT pre-commit page buffers \
+             (the eager-alloc zombie); buffers grow on demand"
+        );
+
+        // First miss on a single 4K page commits exactly one frame's buffer.
+        let h = cache
+            .fetch_page(1, 0, false, |buf| {
+                // The miss path must size the buffer to a full page before the
+                // fill closure runs — callers index buf[..PAGE_4K].
+                assert_eq!(buf.len(), PAGE_4K);
+                buf[0] = 7;
+                buf[PAGE_4K - 1] = 9;
+                Ok(())
+            })
+            .expect("fetch_page");
+        assert_eq!(
+            cache.resident_buffer_bytes(),
+            PAGE_4K,
+            "exactly one 4K buffer resident after one 4K miss"
+        );
+        {
+            let d = cache.page_data(&h);
+            assert_eq!(d.len(), PAGE_4K);
+            assert_eq!(d[0], 7);
+            assert_eq!(d[PAGE_4K - 1], 9);
+        }
+        cache.unpin_page(h);
+
+        // A 64K miss commits exactly one 64K buffer on top.
+        let h2 = cache
+            .fetch_page(2, 0, true, |buf| {
+                assert_eq!(buf.len(), PAGE_64K);
+                Ok(())
+            })
+            .expect("fetch_page large");
+        assert_eq!(
+            cache.resident_buffer_bytes(),
+            PAGE_4K + PAGE_64K,
+            "one 4K + one 64K buffer resident; the other 1098 frames stay unallocated"
+        );
+        cache.unpin_page(h2);
+    }
+
+    #[test]
+    fn pagecache_budget_divides_across_shards() {
+        let whole = 1024u64 * 1024 * 1024; // 1 GiB whole-instance budget
+        // The bug: each shard used the WHOLE budget. The fix: split by shards.
+        assert_eq!(per_shard_pagecache_budget(whole, 4), whole / 4);
+        assert_eq!(per_shard_pagecache_budget(whole, 1), whole);
+        // div-by-zero guard: 0 shards treated as 1 (never panics).
+        assert_eq!(per_shard_pagecache_budget(whole, 0), whole);
+
+        // Frame counts scale down with the per-shard budget.
+        let (f4_whole, f64_whole) = pagecache_frame_counts(whole);
+        let (f4_quarter, f64_quarter) = pagecache_frame_counts(whole / 4);
+        assert!(
+            f4_quarter < f4_whole && f64_quarter < f64_whole,
+            "per-shard frame counts must shrink with the divided budget"
+        );
+        assert!(
+            f4_quarter >= 64 && f64_quarter >= 8,
+            "minimum frame floors hold"
+        );
+
+        // Tiny budget still respects the minimum floors (never zero frames).
+        let (f4_min, f64_min) = pagecache_frame_counts(1);
+        assert_eq!((f4_min, f64_min), (64, 8));
     }
 }

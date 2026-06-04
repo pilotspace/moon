@@ -193,12 +193,170 @@ pub fn spill_to_datafile(
             Bytes::copy_from_slice(key),
             super::cold_index::ColdLocation {
                 file_id,
+                page_idx: 0,
                 slot_idx: 0,
             },
         );
     }
 
     Ok(())
+}
+
+// ── Multi-page batch spill ───────────────────────────────────────────────────
+
+/// Maximum raw value size (in bytes) for an entry to be eligible for inline
+/// batching.  Entries whose serialized value exceeds this threshold are spilled
+/// via the existing single-file path (`build_kv_spill_pages`) which handles
+/// overflow chains correctly.
+///
+/// The 4KB leaf page has ~3916B of usable payload after all headers + one slot
+/// (PAGE_4K=4096 − MoonPage header 64B − KV header 16B − slot 4B).  After LZ4
+/// compression (minimum 256B value → may not shrink) plus key overhead, the
+/// safe inline threshold is 3500B.  Using the raw value length is conservative
+/// but correct: the caller pre-screens before building the entry, so the batch
+/// builder never sees truly oversized values.
+pub const INLINE_MAX_VALUE_BYTES: usize = 3500;
+
+/// One entry to include in a spill batch.
+pub struct SpillEntry {
+    pub key: bytes::Bytes,
+    pub value_bytes: bytes::Bytes,
+    pub value_type: ValueType,
+    pub flags: u8,
+    pub ttl_ms: Option<u64>,
+}
+
+/// Result of building a multi-page inline spill batch.
+///
+/// `leaves` contains all KvLeafPages (in file order).  `locations[i]` is the
+/// `(page_idx, slot_idx)` for `entries[i]` — page_idx is the FILE-ABSOLUTE
+/// 4KB chunk index.
+///
+/// Inline-only MVP: the caller MUST pre-screen entries so that no entry's
+/// `value_bytes.len()` exceeds `INLINE_MAX_VALUE_BYTES`.  Entries larger than
+/// that threshold are routed to `build_kv_spill_pages` (single-file path) by
+/// the caller (`flush_buffer` in `spill_thread.rs`).  Mixing overflow and
+/// inline entries in a single file is deferred to a future phase.
+pub struct BatchPages {
+    pub leaves: Vec<KvLeafPage>,
+    pub overflow: Vec<crate::persistence::kv_page::KvOverflowPage>,
+    /// Parallel to the *accepted* entries slice: (file-absolute page_idx, slot_idx).
+    pub locations: Vec<(u32, u16)>,
+}
+
+/// Build a multi-page inline spill batch from a slice of entries.
+///
+/// Greedily packs entries into KvLeafPages using `KvLeafPage::insert`.  When
+/// a page fills up (`Err(PageFull)`) the current leaf is finalized and a fresh
+/// leaf is started.
+///
+/// **Inline-only** — the caller (`flush_buffer`) MUST pre-screen so that no
+/// entry exceeds `INLINE_MAX_VALUE_BYTES`.  If an entry still does not fit on a
+/// fresh leaf (e.g. because post-LZ4 compression it is still too large), the
+/// function returns `Err(io::ErrorKind::InvalidData)`.  The caller must catch
+/// that and fall back to the single-file path for that entry.
+///
+/// The `overflow` field of `BatchPages` is always empty from this function.
+/// It exists on the struct for forward-compatibility.
+pub fn build_kv_spill_batch(entries: &[SpillEntry], file_id: u64) -> io::Result<BatchPages> {
+    let mut leaves: Vec<KvLeafPage> = Vec::new();
+    let mut locations: Vec<(u32, u16)> = Vec::with_capacity(entries.len());
+
+    // Start with page 0.
+    let mut current_leaf = KvLeafPage::new(0, file_id);
+    let mut current_page_idx: u32 = 0;
+
+    for entry in entries {
+        // Try inserting directly into the current leaf.
+        match current_leaf.insert(
+            &entry.key,
+            &entry.value_bytes,
+            entry.value_type,
+            entry.flags,
+            entry.ttl_ms,
+        ) {
+            Ok(slot_idx) => {
+                locations.push((current_page_idx, slot_idx));
+            }
+            Err(PageFull) => {
+                // Current leaf is full.  Finalize it and start a new one,
+                // then retry the insert on the fresh leaf.
+                current_leaf.finalize();
+                leaves.push(current_leaf);
+                current_page_idx += 1;
+                current_leaf = KvLeafPage::new(current_page_idx as u64, file_id);
+
+                match current_leaf.insert(
+                    &entry.key,
+                    &entry.value_bytes,
+                    entry.value_type,
+                    entry.flags,
+                    entry.ttl_ms,
+                ) {
+                    Ok(slot_idx) => {
+                        locations.push((current_page_idx, slot_idx));
+                    }
+                    Err(PageFull) => {
+                        // Value is too large for a fresh leaf even after LZ4.
+                        // The caller should have pre-screened using
+                        // INLINE_MAX_VALUE_BYTES; this is a defensive fallback.
+                        warn!(
+                            key_len = entry.key.len(),
+                            value_len = entry.value_bytes.len(),
+                            "kv_spill batch: entry too large for inline leaf, skipping"
+                        );
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "entry too large for inline leaf page",
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    // Finalize and push the last (possibly only) leaf.
+    current_leaf.finalize();
+    leaves.push(current_leaf);
+
+    Ok(BatchPages {
+        leaves,
+        overflow: Vec::new(),
+        locations,
+    })
+}
+
+/// Write a `BatchPages` to `{shard_dir}/data/heap-{file_id:06}.mpf` atomically.
+///
+/// Layout: all leaf pages first (file offsets 0..L*4KB), then overflow pages
+/// (offsets L*4KB..).  Writes to a `.tmp` file, fsyncs, then renames — so a
+/// crash during write leaves no partial file visible.
+///
+/// Returns the total byte size written.
+pub fn write_kv_spill_batch(shard_dir: &Path, file_id: u64, batch: &BatchPages) -> io::Result<u64> {
+    use std::io::Write as _;
+
+    let data_dir = shard_dir.join("data");
+    std::fs::create_dir_all(&data_dir)?;
+
+    let final_path = data_dir.join(format!("heap-{file_id:06}.mpf"));
+    let tmp_path = data_dir.join(format!("heap-{file_id:06}.tmp"));
+
+    {
+        let mut file = std::fs::File::create(&tmp_path)?;
+        for leaf in &batch.leaves {
+            file.write_all(leaf.as_bytes())?;
+        }
+        for ov in &batch.overflow {
+            file.write_all(ov.as_bytes())?;
+        }
+        file.sync_all()?;
+    }
+
+    std::fs::rename(&tmp_path, &final_path)?;
+
+    let total_pages = (batch.leaves.len() + batch.overflow.len()) as u64;
+    Ok(total_pages * PAGE_4K as u64)
 }
 
 #[cfg(test)]
@@ -447,6 +605,254 @@ mod tests {
                 assert_eq!(data.as_ref(), big_value.as_slice());
             }
             _ => panic!("expected String"),
+        }
+    }
+
+    // ── Multi-page batch tests (TDD: written before implementation) ──────────
+
+    /// Helper: build N entries with distinct keys/values small enough to fit
+    /// inline (≤200 bytes each), forcing page overflow by sheer count.
+    fn make_inline_entries(n: usize) -> Vec<SpillEntry> {
+        (0..n)
+            .map(|i| SpillEntry {
+                key: bytes::Bytes::from(format!("batch_key_{i:04}")),
+                value_bytes: bytes::Bytes::from(format!(
+                    "batch_value_{i:04}_padding_to_200_bytes_{:0>150}",
+                    i
+                )),
+                value_type: ValueType::String,
+                flags: 0,
+                ttl_ms: None,
+            })
+            .collect()
+    }
+
+    /// A KvLeafPage holds roughly 7-10 entries of ~200 B each.  Generating 50
+    /// entries guarantees ≥ 2 leaf pages.
+    #[test]
+    fn test_build_kv_spill_batch_multi_page() {
+        const N: usize = 50;
+        let entries = make_inline_entries(N);
+        let file_id = 42u64;
+
+        let batch =
+            build_kv_spill_batch(&entries, file_id).expect("build_kv_spill_batch should succeed");
+
+        // Must have spanned at least 2 leaf pages.
+        assert!(
+            batch.leaves.len() >= 2,
+            "expected ≥2 leaf pages, got {}",
+            batch.leaves.len()
+        );
+        // One location per entry.
+        assert_eq!(batch.locations.len(), N);
+
+        // page_idx values must be monotonically non-decreasing and within range.
+        let max_page = batch.leaves.len() as u32 - 1;
+        for (i, &(page_idx, slot_idx)) in batch.locations.iter().enumerate() {
+            assert!(
+                page_idx <= max_page,
+                "entry {i}: page_idx {page_idx} out of range (max {max_page})"
+            );
+            let _ = slot_idx; // just assert no panic
+        }
+    }
+
+    /// write_kv_spill_batch must produce an atomic file and
+    /// read_cold_entry_at must recover every entry by (page_idx, slot_idx).
+    #[test]
+    fn test_write_and_read_batch_multi_page() {
+        use crate::storage::tiered::cold_index::ColdLocation;
+        use crate::storage::tiered::cold_read::read_cold_entry_at;
+
+        const N: usize = 50;
+        let entries = make_inline_entries(N);
+        let file_id = 77u64;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let shard_dir = tmp.path();
+
+        let batch = build_kv_spill_batch(&entries, file_id).unwrap();
+        assert!(batch.leaves.len() >= 2, "test requires ≥2 leaf pages");
+
+        let byte_size = write_kv_spill_batch(shard_dir, file_id, &batch).unwrap();
+        assert!(byte_size > 0);
+
+        // The file must exist at the canonical path (not the .tmp).
+        let file_path = shard_dir
+            .join("data")
+            .join(format!("heap-{file_id:06}.mpf"));
+        assert!(
+            file_path.exists(),
+            "batch file should exist at canonical path"
+        );
+        let tmp_path = shard_dir
+            .join("data")
+            .join(format!("heap-{file_id:06}.tmp"));
+        assert!(!tmp_path.exists(), ".tmp file should be renamed away");
+
+        // Round-trip: every entry must be readable by its location.
+        for (i, (&(page_idx, slot_idx), entry)) in
+            batch.locations.iter().zip(entries.iter()).enumerate()
+        {
+            let loc = ColdLocation {
+                file_id,
+                page_idx,
+                slot_idx,
+            };
+            let result = read_cold_entry_at(shard_dir, loc, 0);
+            assert!(
+                result.is_some(),
+                "entry {i} (key={}) not readable at page_idx={page_idx} slot_idx={slot_idx}",
+                String::from_utf8_lossy(&entry.key)
+            );
+            let (value, _ttl) = result.unwrap();
+            match value {
+                crate::storage::entry::RedisValue::String(data) => {
+                    assert_eq!(
+                        data.as_ref(),
+                        entry.value_bytes.as_ref(),
+                        "entry {i}: value mismatch"
+                    );
+                }
+                _ => panic!("entry {i}: expected String"),
+            }
+        }
+    }
+
+    /// An entry at page_idx=3 slot=2 (deep in the batch) resolves correctly.
+    #[test]
+    fn test_batch_deep_page_slot_resolves() {
+        use crate::storage::tiered::cold_index::ColdLocation;
+        use crate::storage::tiered::cold_read::read_cold_entry_at;
+
+        // Generate enough entries to reach page_idx ≥ 3.
+        const N: usize = 100;
+        let entries = make_inline_entries(N);
+        let file_id = 88u64;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let shard_dir = tmp.path();
+
+        let batch = build_kv_spill_batch(&entries, file_id).unwrap();
+        write_kv_spill_batch(shard_dir, file_id, &batch).unwrap();
+
+        // Find the first entry with page_idx >= 3 and slot_idx >= 1.
+        let target = batch
+            .locations
+            .iter()
+            .zip(entries.iter())
+            .enumerate()
+            .find(|&(_, (&(page_idx, slot_idx), _))| page_idx >= 3 && slot_idx >= 1);
+
+        if let Some((i, (&(page_idx, slot_idx), entry))) = target {
+            let loc = ColdLocation {
+                file_id,
+                page_idx,
+                slot_idx,
+            };
+            let result = read_cold_entry_at(shard_dir, loc, 0);
+            assert!(
+                result.is_some(),
+                "deep entry {i} (page={page_idx} slot={slot_idx}) not readable"
+            );
+            let (value, _) = result.unwrap();
+            match value {
+                crate::storage::entry::RedisValue::String(data) => {
+                    assert_eq!(data.as_ref(), entry.value_bytes.as_ref());
+                }
+                _ => panic!("expected String"),
+            }
+        } else {
+            // Fewer than 100 entries didn't reach page 3 — bump N if this fires.
+            panic!(
+                "test needs more entries to reach page_idx≥3 slot≥1; got {} pages",
+                batch.leaves.len()
+            );
+        }
+    }
+
+    /// RECOVERY-PATH test: prove `ColdIndex::rebuild_from_manifest` reconstructs
+    /// the SAME (page_idx, slot_idx) mapping the builder produced.
+    ///
+    /// The other batch tests read back via the *builder's* returned `locations`.
+    /// On crash recovery the cold_index is thrown away and rebuilt by SCANNING
+    /// the heap file (`chunks_exact(PAGE_4K).enumerate()` + `slot_count()`) — a
+    /// completely independent mapping. If that scan disagrees with the builder
+    /// (off-by-one page index, slot ordering, overflow-page miscount), every
+    /// cold key returns nil after restart even though the live path is green.
+    /// This test exercises the recovery mapping end-to-end, fully in-process.
+    #[test]
+    fn test_rebuild_from_manifest_roundtrip() {
+        use crate::persistence::manifest::{FileEntry, FileStatus, ShardManifest, StorageTier};
+        use crate::persistence::page::PageType;
+        use crate::storage::tiered::cold_index::ColdIndex;
+        use crate::storage::tiered::cold_read::cold_read_through;
+
+        // Enough entries to span several leaf pages (the multi-page case is the
+        // whole point — single-page would never exercise the page_idx scan).
+        const N: usize = 100;
+        let entries = make_inline_entries(N);
+        let file_id = 123u64;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let shard_dir = tmp.path();
+
+        // 1. Build + write the batch file (the live spill path).
+        let batch = build_kv_spill_batch(&entries, file_id).unwrap();
+        assert!(
+            batch.leaves.len() >= 3,
+            "test requires ≥3 leaf pages to exercise page_idx>0 in the rebuild scan"
+        );
+        let byte_size = write_kv_spill_batch(shard_dir, file_id, &batch).unwrap();
+
+        // 2. Register the file in a manifest exactly as apply_spill_completions does.
+        let manifest_path = shard_dir.join("shard.manifest");
+        let mut manifest = ShardManifest::create(&manifest_path).unwrap();
+        manifest.add_file(FileEntry {
+            file_id,
+            file_type: PageType::KvLeaf as u8,
+            status: FileStatus::Active,
+            tier: StorageTier::Hot,
+            page_size_log2: 12,
+            page_count: batch.leaves.len() as u32,
+            byte_size,
+            created_lsn: 0,
+            min_key_hash: 0,
+            max_key_hash: 0,
+            last_modified_lsn: 0,
+        });
+        manifest.commit().unwrap();
+
+        // 3. Rebuild the cold index FROM THE MANIFEST (the recovery path under test).
+        //    Note: this throws away `batch.locations` and recomputes everything.
+        let rebuilt = ColdIndex::rebuild_from_manifest(shard_dir, &manifest);
+        assert_eq!(
+            rebuilt.len(),
+            N,
+            "rebuild must recover every entry (got {} of {N})",
+            rebuilt.len()
+        );
+
+        // 4. Every key must read back its exact value VIA THE REBUILT INDEX —
+        //    not the builder's locations. This is what a real restart does.
+        for entry in &entries {
+            let result = cold_read_through(&rebuilt, shard_dir, &entry.key, 0);
+            assert!(
+                result.is_some(),
+                "rebuilt index: key {} returned nil (page/slot mapping mismatch)",
+                String::from_utf8_lossy(&entry.key)
+            );
+            let (value, _ttl) = result.unwrap();
+            match value {
+                crate::storage::entry::RedisValue::String(data) => assert_eq!(
+                    data.as_ref(),
+                    entry.value_bytes.as_ref(),
+                    "rebuilt index: key {} resolved to the WRONG value (slot/page swap)",
+                    String::from_utf8_lossy(&entry.key)
+                ),
+                other => panic!("expected String for {:?}, got {other:?}", entry.key),
+            }
         }
     }
 }

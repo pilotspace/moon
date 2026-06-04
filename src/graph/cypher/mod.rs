@@ -5,7 +5,8 @@
 //! DELETE, SET, MERGE, WITH, UNWIND, CALL ... YIELD.
 //!
 //! Parameterized queries (`$param`) prevent Cypher injection.
-//! Nesting depth is limited (default 64) to prevent stack overflow DoS.
+//! Nesting depth is limited (`DEFAULT_MAX_NESTING_DEPTH`) to prevent a
+//! stack-overflow DoS — deep nesting returns `NestingDepthExceeded`, never aborts.
 
 pub mod ast;
 pub mod executor;
@@ -15,14 +16,15 @@ pub mod planner;
 
 pub use ast::{Clause, CypherQuery, Expr};
 pub use executor::{ExecResult, OpProfile, ProfileResult, Value};
-pub use parser::{CypherError, Parser};
+pub use parser::{CypherError, DEFAULT_MAX_NESTING_DEPTH, Parser};
 pub use planner::{CostEstimate, PhysicalPlan, PlanCache, Strategy};
 
 /// Parse a Cypher query from a byte slice.
 ///
-/// Uses the default nesting depth limit of 64.
+/// Uses `DEFAULT_MAX_NESTING_DEPTH` so pathologically nested input returns
+/// `NestingDepthExceeded` instead of overflowing the (2 MiB worker-thread) stack.
 pub fn parse_cypher(input: &[u8]) -> Result<CypherQuery, CypherError> {
-    let mut parser = Parser::new(input, 64);
+    let mut parser = Parser::new(input, DEFAULT_MAX_NESTING_DEPTH);
     parser.parse()
 }
 

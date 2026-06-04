@@ -11,6 +11,21 @@
 //!   5. `test_autovacuum_tick_updates_last_run_ts` — RECL_AUTOVACUUM_LAST_RUN_TS advances.
 
 use std::sync::atomic::Ordering;
+use std::sync::{Mutex, MutexGuard, OnceLock};
+
+/// Serializes the two tests that read/assert the process-global
+/// `RECL_AUTOVACUUM_LAST_RUN_TS`. The default parallel test runner otherwise lets
+/// `test_autovacuum_tick_updates_last_run_ts` advance that global while
+/// `test_disabled_autovacuum_is_noop` is mid-assertion → spurious cross-test
+/// failure (observed flaking under load). Poison-tolerant: a panicking holder
+/// must not wedge the sibling.
+fn autovacuum_ts_lock() -> MutexGuard<'static, ()> {
+    static GUARD: OnceLock<Mutex<()>> = OnceLock::new();
+    GUARD
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
 
 // ---------------------------------------------------------------------------
 // Unit tests for AutovacuumDaemon budget logic (no server required)
@@ -137,6 +152,7 @@ fn test_disabled_autovacuum_is_noop() {
     use moon::command::info_reclamation::RECL_AUTOVACUUM_LAST_RUN_TS;
     use moon::shard::autovacuum::{AutovacuumConfig, AutovacuumDaemon};
 
+    let _serialize = autovacuum_ts_lock();
     let cfg = AutovacuumConfig {
         enabled: false,
         budget_ms_min: 5,
@@ -163,6 +179,7 @@ fn test_autovacuum_tick_updates_last_run_ts() {
     use moon::command::info_reclamation::RECL_AUTOVACUUM_LAST_RUN_TS;
     use moon::shard::autovacuum::{AutovacuumConfig, AutovacuumDaemon};
 
+    let _serialize = autovacuum_ts_lock();
     let cfg = AutovacuumConfig {
         enabled: true,
         budget_ms_min: 5,
