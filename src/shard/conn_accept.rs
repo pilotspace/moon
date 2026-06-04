@@ -301,6 +301,9 @@ pub(crate) fn spawn_migrated_tokio_connection(
     shard_id: usize,
     num_shards: usize,
     config_port: u16,
+    spill_sender: &Option<flume::Sender<crate::storage::tiered::spill_thread::SpillRequest>>,
+    spill_file_id: &Rc<std::cell::Cell<u64>>,
+    disk_offload_dir: &Option<std::path::PathBuf>,
 ) {
     use std::os::unix::io::FromRawFd;
 
@@ -365,6 +368,13 @@ pub(crate) fn spawn_migrated_tokio_connection(
 
             // Pool is built by the spawn site and threaded through here.
             let pool_for_ctx = aof_pool.as_ref().map(Arc::clone);
+            // Preserve the disk-offload spill context across migration — without
+            // this a migrated connection silently falls back to the non-spilling
+            // eviction path even when disk-offload is enabled, so cold-tier
+            // durability would depend on whether the connection had migrated.
+            let spill_tx = spill_sender.clone();
+            let spill_fid = spill_file_id.clone();
+            let do_dir = disk_offload_dir.clone();
             let conn_ctx = crate::server::conn::ConnectionContext::new(
                 sdbs,
                 shard_id,
@@ -390,9 +400,9 @@ pub(crate) fn spawn_migrated_tokio_connection(
                 all_regs,
                 all_rsm,
                 aff,
-                None,                             // spill_sender
-                Rc::new(std::cell::Cell::new(0)), // spill_file_id
-                None,                             // disk_offload_dir
+                spill_tx,  // spill_sender (preserved across migration)
+                spill_fid, // spill_file_id
+                do_dir,    // disk_offload_dir
             );
 
             // State restoration happens directly via migrated_state parameter —
