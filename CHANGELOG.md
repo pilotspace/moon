@@ -10,30 +10,6 @@ The v0.2 enterprise beachhead. Built additively on per-shard WAL v3 + the
 dual-root manifest; no changes to the KV hot path, MVCC, page format, or
 transaction layer.
 
-### Infra — Packaging fixes, install scripts, CI Windows/macOS gates (feat/packaging-install-ci)
-
-Addresses PR-4 of the v0.2.0 ship plan: packaging correctness, one-liner
-install scripts for future use, and CI hardening.
-
-- **nfpm license:** `MIT` → `Apache-2.0`; adds `moon.conf.example` as a
-  `config|noreplace` entry; fixes `moon.service` `ExecStart` path and
-  `Documentation` URL.
-- **install.sh / install.ps1:** new one-liner install scripts for Linux,
-  macOS, and Windows. Scripts use the v0.2.0 tarball naming convention
-  (`moon-vVER-ARCH-OS[-RUNTIME].tar.gz`) — they are present in the repo and
-  functional; the README Install section will expose them once the v0.2.0
-  release pipeline cuts the matching artifacts.
-- **README Install section:** replaced premature one-liners (which would
-  404 against current releases) with a stub directing users to build from
-  source until v0.2.0 ships.
-- **CI `check-windows` job:** adds clippy + test on `windows-latest`
-  (main-push only). NASM action SHA-pinned to `ilammy/setup-nasm@v1.5.2`
-  (`72793074`) with a `choco install nasm` fallback for supply-chain safety.
-- **CI `check-console` job:** clippy for `runtime-monoio + console` feature
-  combination (catches tokio-stream interaction).
-- **CI `check-macos` job:** adds Intel-Mac cross-build
-  (`x86_64-apple-darwin`) step.
-
 ### Fixed — CodeRabbit PR #136 durability follow-ups + decomposition + test isolation (PR #144)
 
 Closes the 8 CodeRabbit findings left open after PR #136, plus two PR #144-review
