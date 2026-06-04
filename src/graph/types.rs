@@ -84,6 +84,11 @@ pub struct MutableEdge {
     pub valid_from: i64,
     /// Valid-time end (Unix millis). i64::MAX = still valid / open-ended (default).
     pub valid_to: i64,
+    /// Wall-clock creation stamp (Unix millis) from the shard-cached clock.
+    /// Used by temporal-decay traversal scoring (agent-memory recency).
+    /// 0 = unknown (e.g. pre-upgrade data); decay treats unknown as neutral.
+    /// Distinct from `valid_from`, which is user-owned bi-temporal valid-time.
+    pub created_ms: u64,
 }
 
 /// On-disk CSR segment header -- cache-line aligned, zero-copy mmap.

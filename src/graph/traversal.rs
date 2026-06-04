@@ -76,6 +76,10 @@ pub struct MergedNeighbor {
     pub weight: f64,
     /// Timestamp (created_lsn) of the edge.
     pub timestamp: u64,
+    /// Wall-clock creation stamp (Unix millis) of the edge. 0 = unknown
+    /// (pre-upgrade data or CSR segments without per-edge stamps); decay
+    /// scoring treats 0 as neutral (no age penalty).
+    pub created_ms: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -164,6 +168,7 @@ impl<'a> SegmentMergeReader<'a> {
                             edge_type: edge.edge_type,
                             weight: edge.weight,
                             timestamp: edge.created_lsn,
+                            created_ms: edge.created_ms,
                         });
                     }
                 }
@@ -219,6 +224,13 @@ impl<'a> SegmentMergeReader<'a> {
                             edge_type: meta.edge_type,
                             weight: 1.0,
                             timestamp: csr_lsn,
+                            // 0 = unknown until CSR segments persist per-edge
+                            // wall-clock stamps (P3, .planning/feat-graph-
+                            // temporal-decay/CONTEXT.md); decay treats 0 as
+                            // neutral rather than inheriting the segment's
+                            // compaction time (which would make old edges
+                            // look freshly created).
+                            created_ms: 0,
                         });
                     }
                 }
@@ -761,6 +773,34 @@ mod tests {
     }
 
     // --- SegmentMergeReader tests ---
+
+    #[test]
+    fn test_merge_reader_propagates_created_ms() {
+        // MemGraph edges must surface their wall-clock creation stamp through
+        // MergedNeighbor so decay-aware cost functions can age them.
+        crate::storage::entry::tl_clock_set(7, 7_000);
+        let mut mg = MemGraph::new(1000);
+        let a = mg.add_node(smallvec![0], empty_props(), None, 1);
+        let b = mg.add_node(smallvec![0], empty_props(), None, 1);
+        mg.add_edge(a, b, 1, 2.0, None, 2).expect("ok");
+        crate::storage::entry::tl_clock_set(0, 0);
+
+        let csr_segs: Vec<Arc<CsrStorage>> = vec![];
+        let reader = SegmentMergeReader::new(
+            Some(&mg),
+            &csr_segs,
+            Direction::Outgoing,
+            u64::MAX - 1,
+            None,
+        );
+
+        let neighbors = reader.neighbors(a);
+        assert_eq!(neighbors.len(), 1);
+        assert_eq!(
+            neighbors[0].created_ms, 7_000,
+            "MergedNeighbor must carry the edge's created_ms"
+        );
+    }
 
     #[test]
     fn test_merge_reader_memgraph_only() {
