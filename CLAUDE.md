@@ -85,7 +85,8 @@ orb run -m moon-dev bash -c 'sudo apt-get update -qq && sudo apt-get install -y 
 ## Environment Variables
 
 - `RUST_LOG=moon=debug` — enable tracing output (uses `tracing-subscriber` with `env-filter`)
-- `MOON_NO_URING=1` — disable io_uring at runtime; used in CI/containers/WSL where io_uring is unavailable
+- `MOON_NO_URING=1` — force-disable io_uring everywhere (monoio runtime + tokio bridge); used in CI/containers/WSL where io_uring is unavailable
+- `MOON_URING=1` — opt **into** the tokio→io_uring bridge. The bridge is **default-off under the tokio runtime** (it floods errors under load and can hang the accept loop); tokio shards run plain epoll/kqueue unless this is set. No effect on the monoio runtime, which always uses io_uring unless `MOON_NO_URING` is set.
 - `RUSTFLAGS="-C target-cpu=native"` — enable CPU-specific optimizations for benchmarking
 
 ## Key Design Decisions

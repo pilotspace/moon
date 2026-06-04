@@ -77,6 +77,58 @@ supported under per-shard AOF layout`. Tracked for v0.2.0.
 `CDC.SUBSCRIBE` push channel (C3b), and the multi-shard master PSYNC
 deferred from v0.1.10. Tracked in `.planning/rfcs/v02-enterprise-architecture.md`.
 
+### Fixed — Multishard idle-RAM blowup + tokio-Linux serving hang + graph parser DoS (PR #136)
+
+Closes the "multishard RAM zombie": a fresh multishard instance with no
+`maxmemory` could commit multiple GB of RSS while idle, and the tokio
+runtime could hang its accept loop on Linux. Three independent root
+causes, all fixed and verified in the OrbStack VM under a cgroup memory
+cap (idle RSS **3791 MB → 29 MB** for a 4-shard no-`maxmemory` instance;
+~45 MB under load):
+
+- **PageCache eager pre-allocation.** Each shard committed
+  `num_frames × PAGE` zeroed bytes at construction, sized to 25% of the
+  **whole-instance** `maxmemory` (or a large default when unset). Now the
+  page buffers allocate lazily and the frame budget is divided by shard
+  count (`per_shard_pagecache_budget`); a startup `WARN` reports the
+  resolved per-shard budget.
+- **tokio listener bind-race.** The central accept listener bound the port
+  *without* `SO_REUSEPORT` while per-shard listeners bound *with* it,
+  producing a bind-order race that could leave the port served by a shard
+  that never received connections. The central listener now also binds
+  `SO_REUSEPORT`; `--per-shard-accept` defaults to `false` under tokio.
+- **io_uring-under-tokio default-off.** The tokio→io_uring bridge floods
+  errors under load. It is now **opt-in via `MOON_URING=1`**; tokio shards
+  run plain epoll/kqueue by default. `MOON_NO_URING=1` still force-disables
+  io_uring everywhere. The monoio runtime is unaffected (always io_uring
+  unless `MOON_NO_URING`).
+
+Two durability defects found during review were fixed in-PR with
+red/green TDD:
+
+- **Manifest compact-reopen failure no longer silently loses commits.**
+  `manifest.rs compact()` reopened `self.file` *after* `rename(tmp, path)`;
+  if that reopen failed, later commits silently wrote to an orphaned inode.
+  A `needs_reopen` flag now reattaches to `self.path` before any subsequent
+  commit (or fails loudly).
+- **tokio per-shard AOF writer now latches after a torn write.** The tokio
+  per-shard writer lacked the `write_error` latch present on the single-file
+  and monoio writers; a torn write (header OK, data fails) corrupted the
+  frame stream. It now latches on any write failure and acks `WriteFailed`.
+
+- **Cypher parser stack-overflow DoS bounded.** The precedence-climbing
+  expression grammar pushes ~9 stack frames per source nesting level but
+  `check_depth()` counts only one level per recursion, so the previous
+  limit of 64 overflowed a 2 MiB async-worker stack (SIGABRT) **before**
+  the guard could fire. `DEFAULT_MAX_NESTING_DEPTH` is now `32`
+  (~288 worst-case debug frames, ~50% margin); deep nesting returns
+  `NestingDepthExceeded` gracefully.
+
+Low-severity durability edge cases filed as follow-ups: #137
+(`apply_spill_completions` failed-commit cold-key window), #138
+(`do_rewrite_per_shard` panic wedges `--experimental-per-shard-rewrite`),
+#139 (multi-DB `SELECT >0` cold recovery restores db0 only).
+
 ### Fixed — `maxmemory` is now a whole-instance cap across shards (G2)
 
 **Behavior change for multishard deployments.** Previously each shard
