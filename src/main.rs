@@ -457,11 +457,12 @@ fn main() -> anyhow::Result<()> {
         std::thread::Builder::new()
             .name("sigterm-handler".to_string())
             .spawn(move || {
-                // SAFETY: sigset_t is zero-initialised; sigemptyset/sigaddset/sigwait
-                // are async-signal-safe POSIX functions. SIGTERM is already blocked
-                // in this thread (inherited from main), which is the precondition for
-                // sigwait(2) — sigwait atomically removes a blocked signal from the
-                // pending set and returns its number.
+                // SIGTERM is already blocked in this thread (inherited from main
+                // before any threads spawned) — the precondition for sigwait(2),
+                // which atomically consumes a pending blocked signal.
+                // SAFETY: sigset_t is a plain C struct zero-initialised to the
+                // empty set; sigemptyset/sigaddset/sigwait are async-signal-safe
+                // POSIX functions; the set is exclusively owned by this thread.
                 unsafe {
                     let mut set: libc::sigset_t = std::mem::zeroed();
                     libc::sigemptyset(&mut set);
