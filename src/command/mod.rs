@@ -491,7 +491,9 @@ fn dispatch_inner(
                 return resp(list::lpushx(db, args));
             }
             if cmd.eq_ignore_ascii_case(b"LOLWUT") {
-                return resp(Frame::BulkString(Bytes::from_static(b"Moon v0.1.0\n")));
+                return resp(Frame::BulkString(Bytes::from_static(
+                    concat!("Moon v", env!("CARGO_PKG_VERSION"), "\n").as_bytes(),
+                )));
             }
         }
         (6, b'm') => {
