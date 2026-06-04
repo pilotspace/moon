@@ -791,7 +791,7 @@ impl AofWriterPool {
         let n_shards = self.senders.len();
         let shared_manifest = Arc::new(parking_lot::Mutex::new(manifest));
         let coord = PerShardRewriteCoord::new(shared_manifest, current_seq, n_shards);
-        for s in &self.senders {
+        for (idx, s) in self.senders.iter().enumerate() {
             // Blocking send for guaranteed delivery — see the doc comment.
             if s.send(AofMessage::RewritePerShard {
                 shard_dbs: shard_dbs.clone(),
@@ -800,10 +800,21 @@ impl AofWriterPool {
             .is_err()
             {
                 error!(
-                    "F6 per-shard rewrite: a writer channel is disconnected; \
+                    "F6 per-shard rewrite: writer {} channel disconnected; \
                      rewrite aborted (no manifest commit, old generation remains \
-                     authoritative). Inspect AOF writer threads."
+                     authoritative). Inspect AOF writer threads.",
+                    idx
                 );
+                // Account for the shards that did NOT receive the message (this
+                // one plus the unsent tail). The writers that DID receive it will
+                // fold and call `shard_done`; decrementing for the rest here lets
+                // the countdown still reach zero, so the final `shard_done` runs
+                // the abort path (keeps `old_seq`, clears AOF_REWRITE_IN_PROGRESS)
+                // instead of wedging the rewrite flag forever.
+                coord.mark_failed();
+                for _ in idx..n_shards {
+                    coord.shard_done();
+                }
                 return Err(AofPoolSendError::SendFailed);
             }
         }
@@ -845,6 +856,47 @@ mod pool_tests {
     use super::*;
     use crate::persistence::aof_manifest::AofLayout;
     use crate::runtime::channel;
+
+    /// A per-shard BGREWRITEAOF fan-out that fails partway (a writer channel is
+    /// disconnected) must NOT leave `AOF_REWRITE_IN_PROGRESS` stuck true. The
+    /// failed/unsent shards are accounted for (`mark_failed` + `shard_done`) so
+    /// the countdown still reaches zero and the abort path clears the flag,
+    /// leaving the old generation authoritative.
+    #[test]
+    fn rewrite_fan_out_partial_failure_clears_in_progress_flag() {
+        use crate::command::persistence::AOF_REWRITE_IN_PROGRESS;
+        use std::sync::atomic::Ordering;
+
+        let tmp = tempfile::tempdir().unwrap();
+        // PerShard manifest on disk so the rewrite reaches the fan-out loop.
+        crate::persistence::aof_manifest::AofManifest::initialize_multi(tmp.path(), 2).unwrap();
+
+        // Disconnect shard-0's writer so the FIRST send fails (before any
+        // successful send), making the abort accounting deterministic.
+        let (tx0, rx0) = channel::mpsc_bounded::<AofMessage>(4);
+        let (tx1, _rx1) = channel::mpsc_bounded::<AofMessage>(4);
+        drop(rx0);
+        let pool = AofWriterPool::per_shard_with_base_dir(
+            vec![tx0, tx1],
+            FsyncPolicy::EverySec,
+            DEFAULT_AOF_FSYNC_TIMEOUT,
+            tmp.path().to_path_buf(),
+        );
+
+        let shard_dbs = crate::shard::shared_databases::ShardDatabases::new(vec![
+            vec![crate::storage::Database::new()],
+            vec![crate::storage::Database::new()],
+        ]);
+
+        // The command handler sets this before dispatching the rewrite.
+        AOF_REWRITE_IN_PROGRESS.store(true, Ordering::SeqCst);
+        let res = pool.try_send_rewrite_per_shard(shard_dbs);
+        assert!(res.is_err(), "disconnected writer must fail the fan-out");
+        assert!(
+            !AOF_REWRITE_IN_PROGRESS.load(Ordering::SeqCst),
+            "partial fan-out failure must clear AOF_REWRITE_IN_PROGRESS, not wedge it"
+        );
+    }
 
     #[test]
     fn top_level_pool_routes_all_shards_to_writer_zero() {
