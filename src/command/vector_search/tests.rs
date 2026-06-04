@@ -1,9 +1,9 @@
 use super::*;
 use smallvec::SmallVec;
-use std::sync::Mutex;
+use std::sync::RwLock;
 
 /// Serialize tests that touch global atomic metrics to avoid flaky interference.
-static METRICS_LOCK: Mutex<()> = Mutex::new(());
+static METRICS_LOCK: RwLock<()> = RwLock::new(());
 
 fn bulk(s: &[u8]) -> Frame {
     Frame::BulkString(Bytes::from(s.to_vec()))
@@ -292,6 +292,7 @@ fn ft_create_args() -> Vec<Frame> {
 
 #[test]
 fn test_ft_create_parse_full_syntax() {
+    let _metrics_guard = METRICS_LOCK.read().unwrap();
     let mut store = VectorStore::new();
     let args = ft_create_args();
     let result = ft_create(&mut store, &mut crate::text::store::TextStore::new(), &args);
@@ -309,6 +310,7 @@ fn test_ft_create_parse_full_syntax() {
 
 #[test]
 fn test_ft_create_missing_dim() {
+    let _metrics_guard = METRICS_LOCK.read().unwrap();
     let mut store = VectorStore::new();
     // Remove DIM param pair: keep TYPE FLOAT32 and DISTANCE_METRIC L2 (4 params = 2 pairs)
     let args = vec![
@@ -337,6 +339,7 @@ fn test_ft_create_missing_dim() {
 
 #[test]
 fn test_ft_create_duplicate() {
+    let _metrics_guard = METRICS_LOCK.read().unwrap();
     let mut store = VectorStore::new();
     let args = ft_create_args();
     let r1 = ft_create(&mut store, &mut crate::text::store::TextStore::new(), &args);
@@ -356,6 +359,7 @@ fn test_ft_create_duplicate() {
 
 #[test]
 fn test_ft_dropindex() {
+    let _metrics_guard = METRICS_LOCK.read().unwrap();
     let mut store = VectorStore::new();
     let args = ft_create_args();
     ft_create(&mut store, &mut crate::text::store::TextStore::new(), &args);
@@ -518,6 +522,7 @@ fn test_merge_search_results_empty() {
 
 #[test]
 fn test_ft_search_dimension_mismatch() {
+    let _metrics_guard = METRICS_LOCK.read().unwrap();
     let mut store = VectorStore::new();
     let args = ft_create_args();
     ft_create(&mut store, &mut crate::text::store::TextStore::new(), &args);
@@ -544,6 +549,7 @@ fn test_ft_search_dimension_mismatch() {
 
 #[test]
 fn test_ft_search_empty_index() {
+    let _metrics_guard = METRICS_LOCK.read().unwrap();
     let mut store = VectorStore::new();
     let args = ft_create_args();
     ft_create(&mut store, &mut crate::text::store::TextStore::new(), &args);
@@ -570,6 +576,7 @@ fn test_ft_search_empty_index() {
 
 #[test]
 fn test_ft_info() {
+    let _metrics_guard = METRICS_LOCK.read().unwrap();
     let mut store = VectorStore::new();
     let args = ft_create_args();
     ft_create(&mut store, &mut crate::text::store::TextStore::new(), &args);
@@ -645,6 +652,7 @@ fn build_ft_create_args(
 
 #[test]
 fn test_end_to_end_create_insert_search() {
+    let _metrics_guard = METRICS_LOCK.read().unwrap();
     // Initialize distance functions (required before any search)
     crate::vector::distance::init();
 
@@ -736,6 +744,7 @@ fn test_end_to_end_create_insert_search() {
 
 #[test]
 fn test_ft_info_returns_correct_data() {
+    let _metrics_guard = METRICS_LOCK.read().unwrap();
     let mut store = VectorStore::new();
     let args = build_ft_create_args("testidx", "test:", "vec", 128, "COSINE");
     ft_create(&mut store, &mut crate::text::store::TextStore::new(), &args);
@@ -889,6 +898,7 @@ fn test_parse_filter_clause_none() {
 
 #[test]
 fn test_ft_search_with_filter_no_regression() {
+    let _metrics_guard = METRICS_LOCK.read().unwrap();
     // Unfiltered FT.SEARCH still works identically
     crate::vector::distance::init();
     let mut store = VectorStore::new();
@@ -915,6 +925,7 @@ fn test_ft_search_with_filter_no_regression() {
 
 #[test]
 fn test_vector_index_has_payload_index() {
+    let _metrics_guard = METRICS_LOCK.read().unwrap();
     let mut store = VectorStore::new();
     let args = ft_create_args();
     ft_create(&mut store, &mut crate::text::store::TextStore::new(), &args);
@@ -927,18 +938,21 @@ fn test_vector_index_has_payload_index() {
 fn test_vector_metrics_increment_decrement() {
     use std::sync::atomic::Ordering;
 
-    let _guard = METRICS_LOCK.lock().unwrap();
+    let _guard = METRICS_LOCK.write().unwrap();
 
     let mut store = VectorStore::new();
     let args = ft_create_args();
 
-    // FT.CREATE should increment VECTOR_INDEXES
+    // FT.CREATE should increment VECTOR_INDEXES by exactly 1. The exclusive
+    // write guard excludes every lock-respecting mutator, so the delta is
+    // deterministic (no concurrent ft_create/ft_dropindex can perturb it).
     let before_create = crate::vector::metrics::VECTOR_INDEXES.load(Ordering::Relaxed);
     ft_create(&mut store, &mut crate::text::store::TextStore::new(), &args);
     let after_create = crate::vector::metrics::VECTOR_INDEXES.load(Ordering::Relaxed);
-    assert!(
-        after_create > before_create,
-        "FT.CREATE should increment VECTOR_INDEXES"
+    assert_eq!(
+        after_create,
+        before_create + 1,
+        "FT.CREATE should increment VECTOR_INDEXES by exactly 1"
     );
 
     // FT.SEARCH should increment VECTOR_SEARCH_TOTAL
@@ -955,12 +969,15 @@ fn test_vector_metrics_increment_decrement() {
     ];
     ft_search(&mut store, &search_args, None, None, 0);
     let after_search = crate::vector::metrics::VECTOR_SEARCH_TOTAL.load(Ordering::Relaxed);
-    assert!(
-        after_search > before_search,
-        "FT.SEARCH should increment VECTOR_SEARCH_TOTAL"
+    assert_eq!(
+        after_search,
+        before_search + 1,
+        "FT.SEARCH should increment VECTOR_SEARCH_TOTAL by exactly 1"
     );
 
-    // FT.DROPINDEX should decrement VECTOR_INDEXES
+    // FT.DROPINDEX should decrement VECTOR_INDEXES by exactly 1. Deterministic
+    // under the write guard — this is the assertion that flaked when concurrent
+    // mutators ran lock-free (a stray ft_create could cancel the decrement).
     let before_drop = crate::vector::metrics::VECTOR_INDEXES.load(Ordering::Relaxed);
     ft_dropindex(
         &mut store,
@@ -969,10 +986,64 @@ fn test_vector_metrics_increment_decrement() {
         &[bulk(b"myidx")],
     );
     let after_drop = crate::vector::metrics::VECTOR_INDEXES.load(Ordering::Relaxed);
-    assert!(
-        after_drop < before_drop,
-        "FT.DROPINDEX should decrement VECTOR_INDEXES"
+    assert_eq!(
+        after_drop,
+        before_drop - 1,
+        "FT.DROPINDEX should decrement VECTOR_INDEXES by exactly 1"
     );
+}
+
+/// Deterministic regression for the `VECTOR_INDEXES` parallel-test flake.
+///
+/// `VECTOR_INDEXES` is a process-global counter shared by every test in this
+/// binary. Before the RwLock fix, ~28 tests mutated it lock-free while the
+/// delta-reader tests asserted on it, so a concurrent `ft_create` (+1) could
+/// land inside a reader's read-modify-read window and cancel an observed
+/// decrement — breaking `after_drop < before_drop` (the failure first seen on
+/// the tokio full-suite run, never in isolation).
+///
+/// The fix: delta-readers take `METRICS_LOCK.write()` (exclusive) and every
+/// mutator takes `METRICS_LOCK.read()` (shared, keeps their parallelism). This
+/// test proves the write guard excludes a lock-respecting mutator. It is
+/// deterministic in BOTH directions: GREEN as written; flipping the `write()`
+/// below to `read()` lets the mutator run during the sleep and turns the
+/// assertion RED.
+#[test]
+fn metrics_write_guard_isolates_index_counter_from_concurrent_mutator() {
+    use std::sync::atomic::Ordering;
+
+    let _exclusive = METRICS_LOCK.write().unwrap();
+
+    // Seed +1 so the decrement is observable even with no other live index.
+    crate::vector::metrics::increment_indexes();
+    let before_drop = crate::vector::metrics::VECTOR_INDEXES.load(Ordering::Relaxed);
+
+    // A concurrent "ft_create" that respects the lock: it blocks on read()
+    // until we drop the write guard, so it cannot mutate inside our window.
+    let mutator = std::thread::spawn(|| {
+        let _shared = METRICS_LOCK.read().unwrap();
+        crate::vector::metrics::increment_indexes();
+    });
+    // Let the mutator reach (and park on) the read lock. Under the write guard
+    // it stays blocked; without it, it would increment here and corrupt the
+    // delta below — that is exactly the RED case.
+    std::thread::sleep(std::time::Duration::from_millis(20));
+
+    crate::vector::metrics::decrement_indexes();
+    let after_drop = crate::vector::metrics::VECTOR_INDEXES.load(Ordering::Relaxed);
+    assert_eq!(
+        after_drop,
+        before_drop - 1,
+        "write guard must isolate the drop delta from the concurrent mutator"
+    );
+
+    // Release; the mutator proceeds with its +1.
+    drop(_exclusive);
+    mutator.join().unwrap();
+
+    // Restore the global under a fresh exclusive guard (undo the mutator's +1).
+    let _cleanup = METRICS_LOCK.write().unwrap();
+    crate::vector::metrics::decrement_indexes();
 }
 
 #[test]
@@ -1275,6 +1346,7 @@ fn test_parse_ft_search_args_without_limit() {
 
 #[test]
 fn test_ft_config_autocompact_on_off() {
+    let _metrics_guard = METRICS_LOCK.read().unwrap();
     let mut store = VectorStore::new();
     let args = ft_create_args();
     ft_create(&mut store, &mut crate::text::store::TextStore::new(), &args);
@@ -1344,6 +1416,7 @@ fn test_ft_config_autocompact_on_off() {
 
 #[test]
 fn test_ft_config_unknown_param() {
+    let _metrics_guard = METRICS_LOCK.read().unwrap();
     let mut store = VectorStore::new();
     let args = ft_create_args();
     ft_create(&mut store, &mut crate::text::store::TextStore::new(), &args);
@@ -1394,6 +1467,7 @@ fn test_ft_config_unknown_index() {
 
 #[test]
 fn test_ft_config_autocompact_guards_try_compact() {
+    let _metrics_guard = METRICS_LOCK.read().unwrap();
     let mut store = VectorStore::new();
     let args = ft_create_args();
     ft_create(&mut store, &mut crate::text::store::TextStore::new(), &args);
@@ -1433,6 +1507,7 @@ fn test_ft_config_autocompact_guards_try_compact() {
 
 #[test]
 fn test_ft_config_autocompact_accepts_variants() {
+    let _metrics_guard = METRICS_LOCK.read().unwrap();
     let mut store = VectorStore::new();
     let args = ft_create_args();
     ft_create(&mut store, &mut crate::text::store::TextStore::new(), &args);
@@ -1869,6 +1944,7 @@ mod cache_search_tests {
 
     #[test]
     fn test_ft_cachesearch_miss_on_empty_store() {
+        let _metrics_guard = METRICS_LOCK.read().unwrap();
         let mut store = VectorStore::new();
         let create_args = ft_create_args();
         ft_create(
@@ -2157,6 +2233,7 @@ fn ft_create_multi_field_args() -> Vec<Frame> {
 
 #[test]
 fn test_ft_create_multi_field() {
+    let _metrics_guard = METRICS_LOCK.read().unwrap();
     let mut store = VectorStore::new();
     let args = ft_create_multi_field_args();
     let result = ft_create(&mut store, &mut crate::text::store::TextStore::new(), &args);
@@ -2182,6 +2259,7 @@ fn test_ft_create_multi_field() {
 
 #[test]
 fn test_ft_create_duplicate_field_rejected() {
+    let _metrics_guard = METRICS_LOCK.read().unwrap();
     let mut store = VectorStore::new();
     let args = vec![
         bulk(b"dupidx"),
@@ -2226,6 +2304,7 @@ fn test_ft_create_duplicate_field_rejected() {
 
 #[test]
 fn test_ft_create_exceeds_max_fields() {
+    let _metrics_guard = METRICS_LOCK.read().unwrap();
     let mut store = VectorStore::new();
     let mut args = vec![
         bulk(b"toomanyidx"),
@@ -2263,6 +2342,7 @@ fn test_ft_create_exceeds_max_fields() {
 
 #[test]
 fn test_ft_info_multi_field() {
+    let _metrics_guard = METRICS_LOCK.read().unwrap();
     let mut store = VectorStore::new();
     let args = ft_create_multi_field_args();
     ft_create(&mut store, &mut crate::text::store::TextStore::new(), &args);
@@ -2325,6 +2405,7 @@ fn test_ft_info_multi_field() {
 
 #[test]
 fn test_ft_search_field_targeting() {
+    let _metrics_guard = METRICS_LOCK.read().unwrap();
     crate::vector::distance::init();
 
     let mut store = VectorStore::new();
@@ -2430,6 +2511,7 @@ fn test_ft_search_field_targeting() {
 
 #[test]
 fn test_ft_search_default_field_compat() {
+    let _metrics_guard = METRICS_LOCK.read().unwrap();
     crate::vector::distance::init();
 
     let mut store = VectorStore::new();
@@ -2477,6 +2559,7 @@ fn test_ft_search_default_field_compat() {
 
 #[test]
 fn test_ft_search_unknown_field_error() {
+    let _metrics_guard = METRICS_LOCK.read().unwrap();
     let mut store = VectorStore::new();
     let args = ft_create_args();
     ft_create(&mut store, &mut crate::text::store::TextStore::new(), &args);
@@ -2745,7 +2828,7 @@ fn insert_hybrid_doc(
 
 #[test]
 fn test_hybrid_search_basic() {
-    let _lock = METRICS_LOCK.lock().unwrap();
+    let _lock = METRICS_LOCK.write().unwrap();
     crate::vector::distance::init();
 
     let mut store = VectorStore::new();
@@ -2827,7 +2910,7 @@ fn test_hybrid_search_basic() {
 
 #[test]
 fn test_hybrid_search_sparse_only() {
-    let _lock = METRICS_LOCK.lock().unwrap();
+    let _lock = METRICS_LOCK.write().unwrap();
     crate::vector::distance::init();
 
     let mut store = VectorStore::new();
@@ -2873,7 +2956,7 @@ fn test_hybrid_search_sparse_only() {
 
 #[test]
 fn test_hybrid_search_dense_only_backward_compat() {
-    let _lock = METRICS_LOCK.lock().unwrap();
+    let _lock = METRICS_LOCK.write().unwrap();
     crate::vector::distance::init();
 
     let mut store = VectorStore::new();
@@ -2903,7 +2986,7 @@ fn test_hybrid_search_dense_only_backward_compat() {
 
 #[test]
 fn test_hybrid_search_hit_counts() {
-    let _lock = METRICS_LOCK.lock().unwrap();
+    let _lock = METRICS_LOCK.write().unwrap();
     crate::vector::distance::init();
 
     let mut store = VectorStore::new();
@@ -3039,7 +3122,7 @@ fn test_parse_range_clause_case_insensitive() {
 
 #[test]
 fn test_range_filter_l2_search() {
-    let _lock = METRICS_LOCK.lock().unwrap();
+    let _lock = METRICS_LOCK.write().unwrap();
     crate::vector::distance::init();
 
     let mut store = VectorStore::new();
@@ -3215,7 +3298,7 @@ fn test_recommend_unknown_index() {
 
 #[test]
 fn test_recommend_missing_key_vectors() {
-    let _lock = METRICS_LOCK.lock().unwrap();
+    let _lock = METRICS_LOCK.write().unwrap();
     crate::vector::distance::init();
 
     let mut store = VectorStore::new();
@@ -3244,7 +3327,7 @@ fn test_recommend_missing_key_vectors() {
 
 #[test]
 fn test_recommend_basic_with_vectors() {
-    let _lock = METRICS_LOCK.lock().unwrap();
+    let _lock = METRICS_LOCK.write().unwrap();
     crate::vector::distance::init();
 
     let mut store = VectorStore::new();
@@ -3405,6 +3488,7 @@ mod ft_navigate_tests {
 
 #[test]
 fn test_ft_dropindex_dd_deletes_docs() {
+    let _metrics_guard = METRICS_LOCK.read().unwrap();
     use crate::storage::db::Database;
 
     // Create database and vector store
@@ -3477,6 +3561,7 @@ fn test_ft_dropindex_dd_deletes_docs() {
 
 #[test]
 fn test_ft_dropindex_preserves_docs() {
+    let _metrics_guard = METRICS_LOCK.read().unwrap();
     use crate::storage::db::Database;
 
     let mut db = Database::new();
@@ -3531,6 +3616,7 @@ fn test_ft_dropindex_preserves_docs() {
 
 #[test]
 fn test_ft_dropindex_dd_case_insensitive() {
+    let _metrics_guard = METRICS_LOCK.read().unwrap();
     use crate::storage::db::Database;
 
     // Test lowercase 'dd'
@@ -3636,6 +3722,7 @@ fn test_ft_dropindex_dd_case_insensitive() {
 
 #[test]
 fn test_ft_dropindex_dd_unknown_index() {
+    let _metrics_guard = METRICS_LOCK.read().unwrap();
     use crate::storage::db::Database;
 
     let mut db = Database::new();
@@ -3658,6 +3745,7 @@ fn test_ft_dropindex_dd_unknown_index() {
 
 #[test]
 fn test_ft_dropindex_extra_args_error() {
+    let _metrics_guard = METRICS_LOCK.read().unwrap();
     let mut store = VectorStore::new();
     let mut text_store = crate::text::store::TextStore::new();
 
