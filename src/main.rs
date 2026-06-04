@@ -13,6 +13,14 @@ compile_error!(
      Disable one -- typically: cargo build --no-default-features --features runtime-monoio,mimalloc-alt,graph,text-index"
 );
 
+// tikv-jemallocator does not build on Windows MSVC. Use mimalloc instead:
+//   cargo build --no-default-features --features runtime-tokio,graph,text-index
+#[cfg(all(feature = "jemalloc", target_os = "windows"))]
+compile_error!(
+    "Feature `jemalloc` (tikv-jemallocator) does not build on Windows MSVC. \
+     Build with: cargo build --no-default-features --features runtime-tokio,graph,text-index"
+);
+
 #[cfg(not(feature = "jemalloc"))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -131,7 +139,36 @@ fn main() -> anyhow::Result<()> {
     // G1 memory guardrail: resolve --maxmemory before any RuntimeConfig is
     // built so an unset cap is auto-populated (cgroup-aware) and the startup
     // notice prints exactly once.
-    moon::config::log_memory_guardrail(config.apply_memory_guardrail());
+    let guardrail_outcome = config.apply_memory_guardrail();
+
+    // Windows-specific startup warnings (compiled out on unix).
+    #[cfg(windows)]
+    {
+        // VirtualLock has working-set limits on Windows; mlock-equivalent is
+        // unreliable for large vector code buffers. Advise operators to disable.
+        if config.vec_codes_mlock_enabled() {
+            tracing::warn!(
+                "Windows: --vec-codes-mlock is enabled but VirtualLock has working-set \
+                 size limits that may cause failures under memory pressure. \
+                 Consider disabling: --vec-codes-mlock disable"
+            );
+        }
+        // The G1 memory guardrail relies on /proc/cgroups (Linux) or sysctl (macOS).
+        // Neither is available on Windows, so the guardrail is always skipped.
+        // Operators must set --maxmemory explicitly to bound RSS.
+        if !matches!(
+            guardrail_outcome,
+            moon::config::GuardrailOutcome::Explicit(_)
+        ) {
+            tracing::warn!(
+                "Windows: memory guardrail is unavailable (no /proc/cgroups). \
+                 Set --maxmemory <bytes> explicitly to bound RSS, \
+                 or --maxmemory 0 for unlimited."
+            );
+        }
+    }
+
+    moon::config::log_memory_guardrail(guardrail_outcome);
 
     // Build TLS configuration if tls_port is set.
     // Uses ArcSwap for SIGHUP-based certificate hot-reload.
