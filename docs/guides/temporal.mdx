@@ -45,6 +45,43 @@ OK
 |--------|---------|-------------|
 | `AS_OF <unix_ms>` | `FT.SEARCH` | Search vectors using the index state at the given timestamp |
 | `VALID_AT <unix_ms>` | `GRAPH.QUERY` | Execute Cypher query against graph state valid at the given timestamp |
+| `--decay <λ> [--time-weight <w>]` | `GRAPH.QUERY` | Bias `shortestPath()` toward recently created edges (temporal-decay scoring) |
+| `DECAY <λ>` | `FT.NAVIGATE` | Penalize graph-expanded hits discovered over stale edges |
+
+## Temporal-decay traversal scoring
+
+Moon stamps every graph edge with its wall-clock creation time (from the
+shard-cached clock — no syscall on the insert path). The decay knobs turn
+that stamp into a recency bias for traversal — the primitive behind
+"prefer what the agent learned recently" in agent memory graphs:
+
+```bash
+# shortestPath() cost per edge: |weight| + λ × w × edge_age_seconds
+127.0.0.1:6379> GRAPH.QUERY social \
+    "MATCH p = shortestPath((a:Person {name: 'A'})-[*..5]->(c:Person {name: 'C'})) RETURN p" \
+    --decay 0.1
+
+# Scale the age term independently of λ
+127.0.0.1:6379> GRAPH.QUERY social "..." --decay 0.1 --time-weight 2.0
+
+# FT.NAVIGATE: final_score += λ × age_seconds of the discovery edge
+127.0.0.1:6379> FT.NAVIGATE idx "*=>[KNN 5 @vec $q]" PARAMS 2 q <vec> HOPS 2 DECAY 0.1
+```
+
+- `λ` is a decay rate in **1/seconds**; both surfaces validate it strictly
+  (finite, non-negative). `--time-weight` requires `--decay`.
+- **Decay off (no flag) is exact distance-only behavior** — the age term
+  contributes zero to every edge cost, so path choice is identical to
+  pre-decay Moon.
+- Edges with an unknown creation time (created before the upgrade, or loaded
+  from a pre-v3 segment file) are **neutral**: they pay no age penalty rather
+  than being treated as maximally old.
+- Stamps survive the full segment lifecycle: mutable graph → frozen CSR
+  segment (format v3 stores a per-edge `created_ms` array) → disk → mmap →
+  compaction merges.
+- This is **transaction-time recency** (when the edge was created), distinct
+  from the user-owned `valid_from`/`valid_to` bi-temporal valid-time used by
+  `VALID_AT` and `TEMPORAL.INVALIDATE`.
 
 ## How it works
 
@@ -79,3 +116,4 @@ Both record types are replayed on startup to reconstruct the temporal registry a
 - Temporal snapshots consume memory proportional to the number of snapshots recorded. No automatic GC policy yet.
 - `AS_OF` requires at least one `TEMPORAL.SNAPSHOT_AT` recorded at or before the requested timestamp.
 - Bi-temporal fields are currently limited to graph entities (nodes/edges). KV temporal versioning uses a sparse index.
+- Decay stamps on edges still in the mutable (not yet frozen) segment are re-stamped to replay time after a restart — only CSR-resident edges keep their exact creation time across restarts. Newest edges look new either way, so the bias direction is preserved.
