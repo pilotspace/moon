@@ -28,8 +28,8 @@ fuzz_target!(|data: &[u8]| {
             Ok(Some(_frame)) => {
                 // Parsed a valid frame — buffer advanced, try next
             }
-            Ok(None) => break,    // Incomplete — need more data
-            Err(_) => break,      // Protocol error — stop
+            Ok(None) => break, // Incomplete — need more data
+            Err(_) => break,   // Protocol error — stop
         }
     }
 });

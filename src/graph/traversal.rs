@@ -197,7 +197,7 @@ impl<'a> SegmentMergeReader<'a> {
             let node_meta = csr.node_meta();
             let csr_lsn = csr.created_lsn();
 
-            csr.for_each_neighbor_edge(row, |col_idx, meta| {
+            csr.for_each_neighbor_edge_ms(row, |col_idx, meta, created_ms| {
                 // Apply edge type filter.
                 if let Some(filter) = edge_type_filter {
                     if meta.edge_type != filter {
@@ -224,13 +224,10 @@ impl<'a> SegmentMergeReader<'a> {
                             edge_type: meta.edge_type,
                             weight: 1.0,
                             timestamp: csr_lsn,
-                            // 0 = unknown until CSR segments persist per-edge
-                            // wall-clock stamps (P3, .planning/feat-graph-
-                            // temporal-decay/CONTEXT.md); decay treats 0 as
-                            // neutral rather than inheriting the segment's
-                            // compaction time (which would make old edges
-                            // look freshly created).
-                            created_ms: 0,
+                            // Real per-edge wall-clock stamp from the version
+                            // >= 3 segment format; 0 = unknown (pre-v3 file),
+                            // which decay treats as neutral.
+                            created_ms,
                         });
                     }
                 }
@@ -1406,6 +1403,32 @@ mod tests {
         let neighbors = reader.neighbors(node_a_key);
         // Should find neighbor(s) from CSR 1 at minimum.
         assert!(!neighbors.is_empty());
+    }
+
+    #[test]
+    fn test_csr_neighbors_surface_edge_created_ms() {
+        // Edges frozen into a CSR segment keep their wall-clock stamps (v3
+        // format) — the merge reader must surface them on MergedNeighbor so
+        // decay scoring sees true edge age after compaction.
+        let mut mg = MemGraph::new(1000);
+        let a = mg.add_node(smallvec![0], empty_props(), None, 1);
+        let b = mg.add_node(smallvec![0], empty_props(), None, 1);
+        crate::storage::entry::tl_clock_set(42, 42_000);
+        mg.add_edge(a, b, 1, 1.0, None, 2).expect("ok");
+        crate::storage::entry::tl_clock_set(0, 0);
+
+        let frozen = mg.freeze().expect("ok");
+        let csr = CsrSegment::from_frozen(frozen, 5).expect("ok");
+        let csr_segs = vec![Arc::new(CsrStorage::from(csr))];
+        let reader: SegmentMergeReader<'_> =
+            SegmentMergeReader::new(None, &csr_segs, Direction::Outgoing, u64::MAX - 1, None);
+
+        let neighbors = reader.neighbors(a);
+        assert_eq!(neighbors.len(), 1);
+        assert_eq!(
+            neighbors[0].created_ms, 42_000,
+            "CSR neighbor must carry the persisted per-edge stamp"
+        );
     }
 
     // --- ParallelBfs tests ---

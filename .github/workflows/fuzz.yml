@@ -31,6 +31,7 @@ jobs:
           - acl_rule
           - rdb_load
           - cypher_parse
+          - csr_from_bytes
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@nightly
@@ -70,6 +71,7 @@ jobs:
           - acl_rule
           - rdb_load
           - cypher_parse
+          - csr_from_bytes
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@nightly

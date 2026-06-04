@@ -108,10 +108,14 @@ pub struct GraphSegmentHeader {
     pub validity_bitmap_offset: u64,
     pub created_lsn: u64,
     pub checksum: u64,
+    /// Byte offset of the per-edge `created_ms` array (version >= 3).
+    /// 0 for version 1/2 segments (section absent). Informational — parsers
+    /// compute section positions positionally and gate on `version`.
+    pub edge_created_ms_offset: u64,
 }
 
-// 4 + 4 + 4 + 4 + 8 + 8 + 8 + 8 + 8 + 8 + 8 + 8 = 80 bytes, padded to 128 with align(64)
-// Actually: fields sum to 80 bytes. With align(64) the struct is padded to 128.
+// Fields sum to 88 bytes (was 80 before edge_created_ms_offset). With
+// align(64) the struct is padded to 128 — the on-disk size is unchanged.
 const _: () = assert!(core::mem::size_of::<GraphSegmentHeader>() == 128);
 const _: () = assert!(core::mem::align_of::<GraphSegmentHeader>() == 64);
 

@@ -19,9 +19,8 @@ fuzz_target!(|data: &[u8]| {
     let temp = tempfile::NamedTempFile::new().unwrap();
     temp.as_file().write_all(data).unwrap();
 
-    let mut databases: Vec<moon::storage::db::Database> = (0..1)
-        .map(|_| moon::storage::db::Database::new())
-        .collect();
+    let mut databases: Vec<moon::storage::db::Database> =
+        (0..1).map(|_| moon::storage::db::Database::new()).collect();
 
     // Should not panic regardless of input
     let _ = moon::persistence::rdb::load(&mut databases, temp.path());

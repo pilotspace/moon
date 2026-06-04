@@ -221,6 +221,9 @@ struct MergedEdge {
     edge_type: u16,
     flags: u16,
     created_lsn: u64,
+    /// Per-edge wall-clock stamp carried through the merge (0 = unknown,
+    /// e.g. input segment predates the version 3 format).
+    created_ms: u64,
 }
 
 /// Compact multiple CSR segments into one with Rabbit Order reordering.
@@ -271,6 +274,7 @@ pub fn compact_segments(
         let seg_row_offsets = seg.row_offsets();
         let seg_col_indices = seg.col_indices();
         let seg_edge_meta = seg.edge_meta();
+        let seg_edge_created_ms = seg.edge_created_ms();
         let seg_validity = seg.validity();
         for src_row in 0..seg.node_count() {
             let src_ext = seg_node_meta[src_row as usize].external_id;
@@ -299,6 +303,8 @@ pub fn compact_segments(
                     edge_type: em.edge_type,
                     flags: em.flags,
                     created_lsn: seg.created_lsn(),
+                    // Checked access: empty slice for pre-v3 input segments.
+                    created_ms: seg_edge_created_ms.get(edge_idx).copied().unwrap_or(0),
                 };
 
                 edge_map
@@ -352,9 +358,10 @@ pub fn compact_segments(
 
     let edge_count = reordered_edges.len();
 
-    // Build col_indices and edge_meta.
+    // Build col_indices, edge_meta, and the parallel created_ms array.
     let mut col_indices = Vec::with_capacity(edge_count);
     let mut edge_meta_vec = Vec::with_capacity(edge_count);
+    let mut edge_created_ms_vec = Vec::with_capacity(edge_count);
     for e in &reordered_edges {
         col_indices.push(e.dst_row);
         edge_meta_vec.push(EdgeMeta {
@@ -362,6 +369,7 @@ pub fn compact_segments(
             flags: e.flags,
             property_offset: 0,
         });
+        edge_created_ms_vec.push(e.created_ms);
     }
 
     // Build node_meta with reordered positions.
@@ -458,9 +466,12 @@ pub fn compact_segments(
         hasher.finalize() as u64
     };
 
+    // Version 3: to_bytes always writes 48-byte v2+ NodeMeta records plus the
+    // per-edge created_ms section. Stamping an older version here would make
+    // from_bytes misparse the serialized segment (version 1 = 32-byte stride).
     let header = GraphSegmentHeader {
         magic: *b"MNGR",
-        version: 1,
+        version: 3,
         node_count: node_count as u32,
         edge_count: edge_count as u32,
         min_node_id,
@@ -471,6 +482,7 @@ pub fn compact_segments(
         validity_bitmap_offset: 0,
         created_lsn,
         checksum,
+        edge_created_ms_offset: 0, // populated during serialization
     };
 
     // Build indexes from compacted data. MPH is empty (no NodeKeys in compaction).
@@ -483,6 +495,7 @@ pub fn compact_segments(
         row_offsets,
         col_indices,
         edge_meta: edge_meta_vec,
+        edge_created_ms: edge_created_ms_vec,
         node_meta: node_meta_vec,
         validity,
         node_id_to_row,
@@ -625,6 +638,23 @@ mod tests {
         CsrSegment::from_frozen(frozen, lsn).expect("ok")
     }
 
+    /// Like [`make_csr`] but each edge carries a pinned wall-clock stamp
+    /// (Unix millis) via the thread-local cached clock.
+    fn make_csr_stamped(node_count: usize, edges: &[(usize, usize, u64)], lsn: u64) -> CsrSegment {
+        let mut mg = MemGraph::new(100_000);
+        let mut keys = Vec::with_capacity(node_count);
+        for _ in 0..node_count {
+            keys.push(mg.add_node(smallvec![0], smallvec![], None, 1));
+        }
+        for &(s, d, ms) in edges {
+            crate::storage::entry::tl_clock_set((ms / 1000) as u32, ms);
+            mg.add_edge(keys[s], keys[d], 1, 1.0, None, 2).expect("ok");
+        }
+        crate::storage::entry::tl_clock_set(0, 0);
+        let frozen = mg.freeze().expect("ok");
+        CsrSegment::from_frozen(frozen, lsn).expect("ok")
+    }
+
     #[test]
     fn test_merge_three_segments() {
         let seg1 = Arc::new(CsrStorage::from(make_csr(3, &[(0, 1), (1, 2)], 10)));
@@ -639,6 +669,68 @@ mod tests {
         // Should have merged edges (deduplication may reduce count).
         assert!(result.edge_count() > 0);
         assert!(result.node_count() > 0);
+    }
+
+    #[test]
+    fn test_compacted_segment_serialize_parse_roundtrip() {
+        // A merged segment must survive to_bytes -> from_bytes intact.
+        // Regression: compact_segments stamped `version: 1` while to_bytes
+        // always writes 48-byte v2+ NodeMeta records, so a reloaded merged
+        // segment misparsed node_meta with the 32-byte v1 stride (recovery
+        // serializes every immutable segment via write_to_file).
+        let seg1 = Arc::new(CsrStorage::from(make_csr(3, &[(0, 1), (1, 2)], 10)));
+        let seg2 = Arc::new(CsrStorage::from(make_csr(3, &[(0, 2)], 20)));
+        let config = CompactionConfig {
+            min_segments: 2,
+            max_segment_edges: 1_000_000,
+        };
+        let merged = compact_segments(&[seg1, seg2], &config).expect("ok");
+
+        let parsed = CsrSegment::from_bytes(&merged.to_bytes()).expect("parse ok");
+        assert_eq!(parsed.node_count(), merged.node_count());
+        assert_eq!(parsed.edge_count(), merged.edge_count());
+        let mut want: Vec<u64> = merged.node_meta.iter().map(|nm| nm.external_id).collect();
+        let mut got: Vec<u64> = parsed.node_meta.iter().map(|nm| nm.external_id).collect();
+        want.sort_unstable();
+        got.sort_unstable();
+        assert_eq!(
+            got, want,
+            "external_ids must round-trip through serialization"
+        );
+    }
+
+    #[test]
+    fn test_compact_carries_edge_created_ms() {
+        // Distinct edges from two segments keep their own wall-clock stamps
+        // through the merge — vacuum must not zero per-edge recency.
+        let seg1 = Arc::new(CsrStorage::from(make_csr_stamped(3, &[(0, 1, 10_000)], 10)));
+        let seg2 = Arc::new(CsrStorage::from(make_csr_stamped(3, &[(1, 2, 20_000)], 20)));
+        let config = CompactionConfig {
+            min_segments: 2,
+            max_segment_edges: 1_000_000,
+        };
+        let merged = compact_segments(&[seg1, seg2], &config).expect("ok");
+
+        assert_eq!(merged.edge_created_ms.len(), merged.col_indices.len());
+        let mut stamps = merged.edge_created_ms.clone();
+        stamps.sort_unstable();
+        assert_eq!(stamps, vec![10_000, 20_000]);
+    }
+
+    #[test]
+    fn test_compact_dedup_keeps_winning_edge_stamp() {
+        // Same (src, dst, type) edge in both segments: dedup keeps the
+        // higher-LSN segment's edge AND its created_ms stamp.
+        let seg1 = Arc::new(CsrStorage::from(make_csr_stamped(2, &[(0, 1, 10_000)], 10)));
+        let seg2 = Arc::new(CsrStorage::from(make_csr_stamped(2, &[(0, 1, 20_000)], 20)));
+        let config = CompactionConfig {
+            min_segments: 2,
+            max_segment_edges: 1_000_000,
+        };
+        let merged = compact_segments(&[seg1, seg2], &config).expect("ok");
+
+        assert_eq!(merged.edge_count(), 1);
+        assert_eq!(merged.edge_created_ms, vec![20_000]);
     }
 
     #[test]

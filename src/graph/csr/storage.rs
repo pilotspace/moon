@@ -58,6 +58,15 @@ impl CsrStorage {
         }
     }
 
+    /// Per-edge wall-clock creation stamps, parallel to col_indices.
+    /// Empty for segments loaded from version < 3 files (stamp unknown).
+    pub fn edge_created_ms(&self) -> &[u64] {
+        match self {
+            CsrStorage::Heap(s) => &s.edge_created_ms,
+            CsrStorage::Mmap(s) => s.edge_created_ms(),
+        }
+    }
+
     /// Outgoing neighbor row indices for a CSR row.
     pub fn neighbors_out(&self, row: u32) -> &[u32] {
         match self {
@@ -218,6 +227,32 @@ impl CsrStorage {
         for idx in start..end {
             if validity.contains(idx as u32) {
                 f(ci[idx], em[idx]);
+            }
+        }
+    }
+
+    /// Like [`for_each_neighbor_edge`], additionally yielding the edge's
+    /// wall-clock creation stamp (Unix millis) for temporal-decay scoring.
+    /// Yields 0 (= unknown, decay-neutral) for segments without per-edge
+    /// stamps (version < 3 files).
+    #[inline]
+    pub fn for_each_neighbor_edge_ms(&self, row: u32, mut f: impl FnMut(u32, EdgeMeta, u64)) {
+        let r = row as usize;
+        let ro = self.row_offsets();
+        let (start, end) = if r < self.node_count() as usize {
+            (ro[r] as usize, ro[r + 1] as usize)
+        } else {
+            (0, 0)
+        };
+        let ci = self.col_indices();
+        let em = self.edge_meta();
+        let ecms = self.edge_created_ms();
+        let validity = self.validity();
+        for idx in start..end {
+            if validity.contains(idx as u32) {
+                // Checked access: ecms is empty for pre-v3 segments.
+                let ms = ecms.get(idx).copied().unwrap_or(0);
+                f(ci[idx], em[idx], ms);
             }
         }
     }
