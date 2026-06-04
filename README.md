@@ -211,62 +211,11 @@ traced to source).
 
 ## Install
 
-### Homebrew (macOS and Linux)
-
-```bash
-brew tap pilotspace/moon
-brew install moon
-brew services start moon   # optional: start at login
-```
-
-> **Namespace note:** Homebrew Core contains a different project (`moonrepo/moon`)
-> with the same binary name. Use the tap-qualified form
-> `brew install pilotspace/moon/moon` to avoid PATH conflicts.
-
-### curl one-liner (Linux / macOS)
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/pilotspace/moon/main/install.sh | sh
-```
-
-Installs to `~/.local/bin` (or `/usr/local/bin` when run as root).
-Override with `VERSION=v0.2.0 INSTALL_DIR=/usr/local/bin sh install.sh`.
-
-### PowerShell one-liner (Windows)
-
-```powershell
-irm https://raw.githubusercontent.com/pilotspace/moon/main/install.ps1 | iex
-```
-
-Installs to `%LOCALAPPDATA%\moon\bin` (or `%ProgramFiles%\moon\bin` when run
-as Administrator) and appends to your user `PATH`.
-
-> **Windows SmartScreen:** Binaries are not Authenticode-signed in v0.2.0.
-> If SmartScreen prompts, click **"More info" → "Run anyway"**.
-> Authenticode signing is planned for v0.3.0.
-
-### .deb / .rpm (Linux)
-
-Download the latest package from
-[GitHub Releases](https://github.com/pilotspace/moon/releases):
-
-```bash
-# Debian / Ubuntu
-sudo dpkg -i moon_<version>_amd64.deb
-
-# RHEL / Fedora / Amazon Linux
-sudo rpm -i moon-<version>.x86_64.rpm
-```
-
-The package creates a `moon` system user, installs a systemd unit, and places
-a default config at `/etc/moon/moon.conf` (preserved on upgrade).
-
-### Docker
-
-```bash
-docker pull ghcr.io/pilotspace/moon:latest
-docker run -d -p 6379:6379 ghcr.io/pilotspace/moon:latest
-```
+> **Packaged releases are coming in v0.2.0.** The Homebrew tap, one-liner
+> install scripts (`install.sh` / `install.ps1`), `.deb`/`.rpm` packages,
+> and pre-built tarballs will be available once the v0.2.0 release pipeline
+> (PR-5) is merged and the `v0.2.0` tag is cut. Until then, please build
+> from source using the [Quick start](#quick-start) instructions below.
 
 ---
 

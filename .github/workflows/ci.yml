@@ -125,8 +125,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: windows-${{ hashFiles('Cargo.lock') }}
-      # NASM is required by aws-lc-sys (TLS) on Windows
-      - uses: ilammy/setup-nasm@v1
+      # NASM is required by aws-lc-sys (TLS) on Windows.
+      # SHA-pinned to v1.5.2 (72793074) for supply-chain safety;
+      # choco fallback fires only if the action itself fails.
+      - uses: ilammy/setup-nasm@72793074d3c8cdda771dba85f6deafe00623038b  # v1.5.2
+        id: nasm
+        continue-on-error: true
+      - name: NASM fallback (choco)
+        if: steps.nasm.outcome == 'failure'
+        run: choco install nasm -y
       - name: Verify cmake available
         run: cmake --version
       # No jemalloc on Windows (tikv-jemallocator does not support MSVC)
