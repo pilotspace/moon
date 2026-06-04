@@ -1352,6 +1352,82 @@ mod pool_tests {
         assert_eq!(result, AofAck::FsyncFailed);
     }
 
+    /// Issue #140: an AppendSync drained during a BGREWRITEAOF must NOT be acked
+    /// `Synced` inside the drain — that reports the write durable before the
+    /// post-drain boundary fsync, so a crash in the window loses an entry the
+    /// client was told was safe. The drain must PARK the ack and only fulfil it
+    /// after the boundary `sync_data()`. (Framed / per-shard drain.)
+    #[test]
+    fn drain_framed_parks_appendsync_ack_until_boundary_fsync() {
+        let tmp = tempfile::tempdir().unwrap();
+        let incr = tmp.path().join("incr.aof");
+        let (tx0, rx0) = channel::mpsc_bounded::<AofMessage>(4);
+        let (tx1, _rx1) = channel::mpsc_bounded::<AofMessage>(4);
+        let pool = AofWriterPool::per_shard(vec![tx0, tx1]);
+
+        let recv = pool.try_send_append_sync(0, 99, Bytes::from_static(b"SET k v"));
+
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&incr)
+            .unwrap();
+        let mut outcome = drain_pending_appends_framed(&rx0, &mut file).unwrap();
+
+        // CONTRACT: drained + parked, NOT yet acked.
+        assert_eq!(outcome.drained, 1, "the AppendSync was drained");
+        assert_eq!(
+            outcome.pending_acks.len(),
+            1,
+            "the ack must be parked until the boundary fsync, not sent during drain"
+        );
+
+        // Boundary fsync succeeds → fulfil Synced; only NOW is the client told durable.
+        file.sync_data().unwrap();
+        outcome.fulfill_acks(true);
+        assert_eq!(
+            recv.recv_blocking().expect("ack resolves"),
+            AofAck::Synced,
+            "post-fsync the parked ack must resolve Synced"
+        );
+    }
+
+    /// Issue #140 failure path: if the rewrite-boundary fsync FAILS, a drained
+    /// AppendSync must resolve `FsyncFailed`, never `Synced`. Exercises the
+    /// non-framed `drain_pending_appends` — the DEFAULT `--shards 1` rewrite
+    /// path (`do_rewrite_single`), which is reachable under appendfsync=always.
+    #[cfg(feature = "runtime-monoio")]
+    #[test]
+    fn drain_single_fulfills_fsync_failure_as_fsync_failed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let incr = tmp.path().join("incr.aof");
+        let (tx0, rx0) = channel::mpsc_bounded::<AofMessage>(4);
+        let (tx1, _rx1) = channel::mpsc_bounded::<AofMessage>(4);
+        let pool = AofWriterPool::per_shard(vec![tx0, tx1]);
+
+        let recv = pool.try_send_append_sync(0, 7, Bytes::from_static(b"SET a b"));
+
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&incr)
+            .unwrap();
+        let mut outcome = drain_pending_appends(&rx0, &mut file).unwrap();
+        assert_eq!(
+            outcome.pending_acks.len(),
+            1,
+            "ack parked, not sent in drain"
+        );
+
+        // Simulate a failed boundary fsync: the parked ack must report FsyncFailed.
+        outcome.fulfill_acks(false);
+        assert_eq!(
+            recv.recv_blocking().expect("ack resolves"),
+            AofAck::FsyncFailed,
+            "a failed boundary fsync must NOT be reported Synced to the client"
+        );
+    }
+
     // F2 (design-for-failure): `appendfsync=always` must bound its fsync-ack
     // await. A stalled writer must surface a hard error within the budget,
     // never park the connection forever. Tokio-gated because it drives the
@@ -3178,6 +3254,62 @@ fn snapshot_and_generate(db: &SharedDatabases) -> BytesMut {
 struct DrainOutcome {
     drained: usize,
     shutdown_requested: bool,
+    /// AppendSync ack senders for entries drained during a rewrite. Under
+    /// `appendfsync=always` the client must NOT be told `Synced` until the
+    /// post-drain boundary `sync_data()` makes those bytes durable, so the acks
+    /// are parked here and resolved by [`fulfill_acks`](Self::fulfill_acks) AFTER
+    /// the caller's fsync — `Synced` on success, `FsyncFailed` on failure. Acking
+    /// inside the drain (the old behaviour) reports a write durable before the
+    /// boundary fsync, so a crash in that window loses an entry the client was
+    /// told was safe. (Issue #140.)
+    pending_acks: Vec<crate::runtime::channel::OneshotSender<AofAck>>,
+}
+
+#[cfg(any(feature = "runtime-monoio", feature = "runtime-tokio"))]
+impl DrainOutcome {
+    /// Resolve every parked AppendSync ack after the rewrite-boundary fsync.
+    /// `synced=true` → `Synced`; `false` → `FsyncFailed`. A fresh `AofAck` is
+    /// built per sender so `AofAck` needs no `Copy`/`Clone`. Drains the vec so a
+    /// second call is a no-op.
+    fn fulfill_acks(&mut self, synced: bool) {
+        for tx in std::mem::take(&mut self.pending_acks) {
+            let _ = tx.send(if synced {
+                AofAck::Synced
+            } else {
+                AofAck::FsyncFailed
+            });
+        }
+    }
+}
+
+/// Fsync `file` at a rewrite drain boundary, then resolve the drained batch's
+/// parked AppendSync acks against the result: `Synced` on success, or
+/// `FsyncFailed` + propagate the IO error on failure. Centralizes the issue-#140
+/// durability ordering (ack strictly AFTER the bytes are durable) for every
+/// `do_rewrite_*` drain site.
+#[cfg(any(feature = "runtime-monoio", feature = "runtime-tokio"))]
+fn sync_and_fulfill_drain(
+    outcome: &mut DrainOutcome,
+    file: &mut std::fs::File,
+    incr_path: PathBuf,
+) -> Result<(), MoonError> {
+    match file.sync_data() {
+        Ok(()) => {
+            outcome.fulfill_acks(true);
+            Ok(())
+        }
+        Err(e) => {
+            // Boundary fsync failed: the drained writes are NOT durable. Tell the
+            // waiting clients FsyncFailed (never Synced) and propagate the error
+            // so the rewrite aborts.
+            outcome.fulfill_acks(false);
+            Err(AofError::Io {
+                path: incr_path,
+                source: e,
+            }
+            .into())
+        }
+    }
 }
 
 #[cfg(feature = "runtime-monoio")]
@@ -3201,11 +3333,12 @@ fn drain_pending_appends(
                 })?;
                 outcome.drained += 1;
             }
-            // AppendSync during a rewrite drain: bytes are written and counted;
-            // the post-drain fsync at the rewrite boundary covers durability,
-            // so we ack `Synced`. If the write itself fails the error is
-            // already propagated upward by the `?` and the ack is dropped —
-            // the caller observes `RecvError`, which it treats as failure.
+            // AppendSync during a rewrite drain: bytes are written and counted,
+            // but the ack is PARKED until the caller's post-drain boundary fsync
+            // (issue #140) — acking `Synced` here would report durability before
+            // the bytes are fsynced. If the write itself fails the `?` propagates
+            // the error and the parked ack is dropped with the outcome — the
+            // caller observes `RecvError`, which it treats as failure.
             AofMessage::AppendSync {
                 bytes: data,
                 lsn: _,
@@ -3216,7 +3349,7 @@ fn drain_pending_appends(
                     source: e,
                 })?;
                 outcome.drained += 1;
-                let _ = ack.send(AofAck::Synced);
+                outcome.pending_acks.push(ack);
             }
             AofMessage::Shutdown => {
                 outcome.shutdown_requested = true;
@@ -3272,9 +3405,10 @@ fn drain_pending_appends_framed(
                     source: e,
                 })?;
                 outcome.drained += 1;
-                // Durability for these is covered by the post-drain fsync at
-                // the rewrite boundary (mirrors drain_pending_appends).
-                let _ = ack.send(AofAck::Synced);
+                // Park the ack until the caller's post-drain boundary fsync
+                // (issue #140); resolved Synced/FsyncFailed by
+                // `sync_and_fulfill_drain`. Mirrors `drain_pending_appends`.
+                outcome.pending_acks.push(ack);
             }
             AofMessage::Shutdown => {
                 outcome.shutdown_requested = true;
@@ -3383,23 +3517,19 @@ fn do_rewrite_per_shard(
         .into());
     }
 
-    // Phase 1: drain pre-rewrite queued appends into old incr (framed).
-    let pre_drain = drain_pending_appends_framed(rx, file)?;
-    file.sync_data().map_err(|e| AofError::Io {
-        path: PathBuf::from("<aof per-shard incr>"),
-        source: e,
-    })?;
+    // Phase 1: drain pre-rewrite queued appends into old incr (framed), fsync,
+    // then resolve their parked AppendSync acks (issue #140).
+    let mut pre_drain = drain_pending_appends_framed(rx, file)?;
+    sync_and_fulfill_drain(&mut pre_drain, file, PathBuf::from("<aof per-shard incr>"))?;
 
     // Phase 2: acquire write locks on this shard's db(s) (db_idx ascending).
     let shard_locks = &all_shards[sidx];
     let guards: Vec<_> = shard_locks.iter().map(|lock| lock.write()).collect();
 
-    // Phase 3: drain appends that completed between phase 1 and phase 2.
-    let mid_drain = drain_pending_appends_framed(rx, file)?;
-    file.sync_data().map_err(|e| AofError::Io {
-        path: PathBuf::from("<aof per-shard incr>"),
-        source: e,
-    })?;
+    // Phase 3: drain appends that completed between phase 1 and phase 2, fsync,
+    // then resolve their parked AppendSync acks (issue #140).
+    let mut mid_drain = drain_pending_appends_framed(rx, file)?;
+    sync_and_fulfill_drain(&mut mid_drain, file, PathBuf::from("<aof per-shard incr>"))?;
 
     // Phase 4: snapshot this shard's databases under the locks.
     let now_ms = current_time_ms();
@@ -3513,12 +3643,10 @@ fn do_rewrite_single(
     file: &mut std::fs::File,
     rx: &channel::MpscReceiver<AofMessage>,
 ) -> Result<(), MoonError> {
-    // Phase 1: drain pre-rewrite queued appends into old incr, fsync.
-    let pre_drain = drain_pending_appends(rx, file)?;
-    file.sync_data().map_err(|e| AofError::Io {
-        path: manifest.incr_path(),
-        source: e,
-    })?;
+    // Phase 1: drain pre-rewrite queued appends into old incr, fsync, then
+    // resolve their parked AppendSync acks (issue #140).
+    let mut pre_drain = drain_pending_appends(rx, file)?;
+    sync_and_fulfill_drain(&mut pre_drain, file, manifest.incr_path())?;
 
     // Phase 2: acquire write locks on every database in the shard.
     // Order is consistent (index-ascending) so concurrent callers would
@@ -3526,12 +3654,10 @@ fn do_rewrite_single(
     // acquires multi-db locks.
     let guards: Vec<_> = db.iter().map(|lock| lock.write()).collect();
 
-    // Phase 3: drain any appends the handlers sent between phase 1 and phase 2.
-    let mid_drain = drain_pending_appends(rx, file)?;
-    file.sync_data().map_err(|e| AofError::Io {
-        path: manifest.incr_path(),
-        source: e,
-    })?;
+    // Phase 3: drain any appends the handlers sent between phase 1 and phase 2,
+    // fsync, then resolve their parked AppendSync acks (issue #140).
+    let mut mid_drain = drain_pending_appends(rx, file)?;
+    sync_and_fulfill_drain(&mut mid_drain, file, manifest.incr_path())?;
 
     // Phase 4: snapshot under the write locks. No mutation is possible.
     let now_ms = current_time_ms();
@@ -3596,12 +3722,10 @@ fn do_rewrite_sharded(
     file: &mut std::fs::File,
     rx: &channel::MpscReceiver<AofMessage>,
 ) -> Result<(), MoonError> {
-    // Phase 1: drain pre-rewrite queued appends into old incr.
-    let pre_drain = drain_pending_appends(rx, file)?;
-    file.sync_data().map_err(|e| AofError::Io {
-        path: manifest.incr_path(),
-        source: e,
-    })?;
+    // Phase 1: drain pre-rewrite queued appends into old incr, fsync, then
+    // resolve their parked AppendSync acks (issue #140).
+    let mut pre_drain = drain_pending_appends(rx, file)?;
+    sync_and_fulfill_drain(&mut pre_drain, file, manifest.incr_path())?;
 
     // Phase 2: acquire write locks on ALL (shard, db) pairs simultaneously.
     // Lock order is (shard_idx, db_idx) ascending — must match anywhere else
@@ -3618,12 +3742,10 @@ fn do_rewrite_sharded(
         guards.push(shard_guards);
     }
 
-    // Phase 3: drain appends completed between phase 1 and phase 2.
-    let mid_drain = drain_pending_appends(rx, file)?;
-    file.sync_data().map_err(|e| AofError::Io {
-        path: manifest.incr_path(),
-        source: e,
-    })?;
+    // Phase 3: drain appends completed between phase 1 and phase 2, fsync, then
+    // resolve their parked AppendSync acks (issue #140).
+    let mut mid_drain = drain_pending_appends(rx, file)?;
+    sync_and_fulfill_drain(&mut mid_drain, file, manifest.incr_path())?;
 
     // Phase 4: snapshot under locks.
     let db_count = shard_dbs.db_count();
