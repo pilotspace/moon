@@ -44,6 +44,7 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use moon::config::ServerConfig;
+use moon::config::conf_file::merge_conf_argv;
 use moon::persistence::aof::{self, AofMessage, AofWriterPool, FsyncPolicy};
 use moon::runtime::cancel::CancellationToken;
 use moon::runtime::channel;
@@ -68,7 +69,25 @@ fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let mut config = ServerConfig::parse();
+    // ── moon.conf integration: build merged argv before clap parse ──────────
+    // `merge_conf_argv` scans argv for a positional conf path (argv[1] not
+    // starting with `-`) or `--config FILE`.  When found it loads and tokenises
+    // the conf, prepends the tokens to the remaining real argv, and returns the
+    // merged vector.  CLI args come *after* conf tokens so clap last-wins gives
+    // CLI priority.
+    //
+    // NOTE: `maybe_respawn_with_arena_override()` above only scans *raw*
+    // argv — it will NOT see a `memory-arenas-cap` value that comes from the
+    // conf file.  That setting must be given on the CLI if the jemalloc
+    // respawn is needed.  This is documented behaviour.
+    let mut config = match merge_conf_argv(std::env::args_os()) {
+        Ok(Some(merged)) => ServerConfig::parse_from(merged),
+        Ok(None) => ServerConfig::parse(),
+        Err(e) => {
+            eprintln!("moon: conf file error: {e}");
+            std::process::exit(1);
+        }
+    };
 
     // ── AOF v1→v2 migration (FIX-W3-2): early-exit before normal boot ──
     // When `--migrate-aof-from` is set, run the migration tool and exit.

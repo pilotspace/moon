@@ -2,6 +2,12 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
+// NOTE: `src/config.rs` (this file) co-exists with `src/config/conf_file.rs`
+// using the Rust "file + directory-sibling" layout.  We add `conf_file` as a
+// submodule here rather than converting config.rs → config/mod.rs because the
+// plan calls for a minimal diff (an *addition*, not a split).
+pub mod conf_file;
+
 /// Controls whether cross-shard reads use the shared-read fast path
 /// (direct `RwLock` read on the target shard) or always route through
 /// the per-shard SPSC channel.
@@ -30,7 +36,11 @@ pub enum CrossShardFastPath {
 
 /// Server configuration parsed from command-line arguments.
 #[derive(Parser, Debug, Clone, Default)]
-#[command(name = "moon", about = "A Redis-compatible server")]
+#[command(
+    name = "moon",
+    about = "A Redis-compatible server",
+    args_override_self = true
+)]
 pub struct ServerConfig {
     /// Bind address
     #[arg(long, default_value = "127.0.0.1")]

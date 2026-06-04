@@ -241,6 +241,37 @@ cargo build --release
 > Moon auto-caps at ~80% of detected RAM with `allkeys-lru` (pass
 > `--maxmemory 0` for unlimited).
 
+### Config file
+
+Moon supports a Redis-style configuration file so you can move all flags out of
+your systemd unit / launchd plist:
+
+```bash
+# Use the bundled example as a starting point
+cp packaging/moon.conf.example /etc/moon/moon.conf
+$EDITOR /etc/moon/moon.conf
+
+# Pass the conf file as the first argument (redis convention)
+./target/release/moon /etc/moon/moon.conf
+
+# Or with --config
+./target/release/moon --config /etc/moon/moon.conf
+```
+
+**Precedence (highest → lowest): CLI flags → conf file → built-in defaults.**
+CLI flags always win, so you can override any conf option at the command line:
+
+```bash
+# conf says port 6379, but this instance listens on 7380
+./target/release/moon /etc/moon/moon.conf --port 7380
+```
+
+Validate your conf file without starting the server:
+
+```bash
+./target/release/moon /etc/moon/moon.conf --check-config
+```
+
 ### Connect with any Redis client
 
 ```bash
