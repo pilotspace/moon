@@ -1,0 +1,78 @@
+# Formula template for moon — rendered by packaging/bump-homebrew.sh
+# Placeholders: {{VERSION}} {{SHA_AARCH64_MACOS}} {{SHA_X86_64_MACOS}}
+#               {{SHA_AARCH64_LINUX}} {{SHA_X86_64_LINUX}}
+#
+# VERSION is the numeric version (e.g. 0.2.0), without a leading 'v'.
+# URLs use a literal 'v' prefix so the release asset name stays correct:
+#   moon-v0.2.0-aarch64-macos.tar.gz
+
+class Moon < Formula
+  desc "High-performance Redis-compatible server"
+  homepage "https://github.com/pilotspace/moon"
+  license "Apache-2.0"
+  version "{{VERSION}}"
+
+  on_macos do
+    on_arm do
+      url "https://github.com/pilotspace/moon/releases/download/v{{VERSION}}/moon-v{{VERSION}}-aarch64-macos.tar.gz"
+      sha256 "{{SHA_AARCH64_MACOS}}"
+    end
+
+    on_intel do
+      url "https://github.com/pilotspace/moon/releases/download/v{{VERSION}}/moon-v{{VERSION}}-x86_64-macos.tar.gz"
+      sha256 "{{SHA_X86_64_MACOS}}"
+    end
+  end
+
+  on_linux do
+    on_arm do
+      url "https://github.com/pilotspace/moon/releases/download/v{{VERSION}}/moon-v{{VERSION}}-aarch64-linux-tokio.tar.gz"
+      sha256 "{{SHA_AARCH64_LINUX}}"
+    end
+
+    on_intel do
+      url "https://github.com/pilotspace/moon/releases/download/v{{VERSION}}/moon-v{{VERSION}}-x86_64-linux-tokio.tar.gz"
+      sha256 "{{SHA_X86_64_LINUX}}"
+    end
+  end
+
+  def install
+    bin.install "moon"
+    # Install default config, preserving any existing user config on upgrade.
+    (etc/"moon").mkpath
+    etc.install "moon.conf.example" => "moon/moon.conf" unless (etc/"moon/moon.conf").exist?
+  end
+
+  service do
+    run [opt_bin/"moon", etc/"moon/moon.conf"]
+    keep_alive true
+    log_path var/"log/moon.log"
+    error_log_path var/"log/moon.log"
+    working_dir var/"moon"
+  end
+
+  def caveats
+    <<~EOS
+      IMPORTANT: PATH CONFLICT — Homebrew core ships a tool called "moon" from
+      the moonrepo project. Installing this formula via the tap:
+        brew install pilotspace/moon/moon
+      places this binary (Redis-compatible server) on your PATH as "moon".
+      If you have moonrepo's moon installed, rename one or set explicit aliases.
+
+      To start moon now and at login:
+        brew services start pilotspace/moon/moon
+
+      The default config is at:
+        #{etc}/moon/moon.conf
+
+      The embedded web console is reachable at:
+        http://localhost:<admin-port>   (see admin-port in moon.conf)
+    EOS
+  end
+
+  test do
+    # Validate config without spawning a server (avoids port conflicts in
+    # the Homebrew sandbox). moon --check-config exits 0 on valid config.
+    system bin/"moon", "--check-config"
+  end
+end
