@@ -101,11 +101,13 @@ jobs:
         run: cargo test --no-default-features --features runtime-tokio,jemalloc
         timeout-minutes: 15
       # Cross-build for Intel Mac (build only — no jemalloc: release matrix
-      # ships x86_64-macos WITHOUT jemalloc to match what ships in releases).
+      # ships x86_64-macos WITHOUT jemalloc to match what ships in releases.
+      # console excluded here: rust_embed requires console/dist/ from `pnpm build`
+      # which is not set up in check-macos; console is tested in check-console).
       - name: Add x86_64-apple-darwin target
         run: rustup target add x86_64-apple-darwin
       - name: Build (x86_64-apple-darwin)
-        run: cargo build --no-default-features --features runtime-tokio --target x86_64-apple-darwin
+        run: cargo build --no-default-features --features runtime-tokio,graph,text-index --target x86_64-apple-darwin
 
   # ── Windows — main-push only (cost control) ─────────────────────────
   # NOTE: This job is EXPECTED TO FAIL until feat/windows-native-port
