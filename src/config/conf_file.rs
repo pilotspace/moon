@@ -85,6 +85,10 @@ pub enum ConfFileError {
     /// A key appeared on a line by itself with no value.
     #[error("conf file line {line}: key '{key}' has no value")]
     EmptyValue { line: usize, key: String },
+
+    /// `--config` was the last argument, with no path following it.
+    #[error("missing value for --config (expected a conf file path)")]
+    MissingConfigValue,
 }
 
 /// Long-form flag names (without leading `--`) for every `bool` field in
@@ -238,6 +242,9 @@ where
                 i += 2;
                 continue;
             }
+            // `--config` as the final argument: fail with a clear message
+            // instead of letting clap report a confusing "unexpected argument".
+            return Err(ConfFileError::MissingConfigValue);
         } else if let Some(val) = arg.strip_prefix("--config=") {
             // --config=FILE form.
             conf_path = Some(std::path::PathBuf::from(val));
@@ -503,6 +510,18 @@ mod tests {
         assert!(merged.contains(&"6400".to_string()));
 
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn merge_config_flag_without_value_is_clear_error() {
+        // `--config` as the last argument must yield MissingConfigValue,
+        // not fall through to clap's confusing "unexpected argument".
+        let args = os_args(&["moon", "--config"]);
+        let err = merge_conf_argv(args).unwrap_err();
+        assert!(
+            matches!(err, ConfFileError::MissingConfigValue),
+            "expected MissingConfigValue, got: {err}"
+        );
     }
 
     #[test]
