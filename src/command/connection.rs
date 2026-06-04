@@ -5,6 +5,20 @@ use bytes::Bytes;
 use crate::framevec;
 use crate::protocol::Frame;
 use crate::storage::Database;
+
+/// Moon's own release version, taken from `Cargo.toml` at compile time.
+///
+/// Used in the INFO `moon_version` field, HELLO `version` field, and LOLWUT.
+pub const MOON_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Redis compatibility version advertised to clients.
+///
+/// Clients gate features (e.g. RESP3, command-info, ACL) on `redis_version`.
+/// Advertising 7.4.0 unlocks the full Redis 7 feature set in standard clients
+/// while staying conservative enough to avoid enabling Redis 8 alpha paths.
+/// The real moon version is always present in the `moon_version` INFO field.
+pub const REDIS_COMPAT_VERSION: &str = "7.4.0";
+
 /// Global monotonic client ID counter.
 static NEXT_CLIENT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -155,7 +169,8 @@ pub fn info(db: &Database, _args: &[Frame]) -> Frame {
     let mut sections = String::with_capacity(2048);
 
     sections.push_str("# Server\r\n");
-    sections.push_str("redis_version:0.1.0\r\n");
+    let _ = write!(sections, "redis_version:{REDIS_COMPAT_VERSION}\r\n");
+    let _ = write!(sections, "moon_version:{MOON_VERSION}\r\n");
     sections.push_str("moon:true\r\n");
     sections.push_str("\r\n");
 
@@ -568,7 +583,7 @@ pub fn hello_acl(
         ),
         (
             Frame::BulkString(Bytes::from_static(b"version")),
-            Frame::BulkString(Bytes::from_static(b"0.1.0")),
+            Frame::BulkString(Bytes::from_static(MOON_VERSION.as_bytes())),
         ),
         (
             Frame::BulkString(Bytes::from_static(b"proto")),
@@ -810,7 +825,7 @@ pub fn hello(
         ),
         (
             Frame::BulkString(Bytes::from_static(b"version")),
-            Frame::BulkString(Bytes::from_static(b"0.1.0")),
+            Frame::BulkString(Bytes::from_static(MOON_VERSION.as_bytes())),
         ),
         (
             Frame::BulkString(Bytes::from_static(b"proto")),
@@ -937,7 +952,8 @@ mod tests {
             Frame::BulkString(s) => {
                 let text = std::str::from_utf8(&s).unwrap();
                 assert!(text.contains("# Server"));
-                assert!(text.contains("redis_version:0.1.0"));
+                assert!(text.contains("redis_version:7.4.0"));
+                assert!(text.contains("moon_version:"));
                 assert!(text.contains("# Keyspace"));
             }
             _ => panic!("Expected BulkString"),
