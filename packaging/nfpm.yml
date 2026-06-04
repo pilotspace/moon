@@ -16,7 +16,7 @@ description: |
   replication, Lua scripting, vector search (FT.*), and pub/sub.
 vendor: Moon
 homepage: https://github.com/tindang/moon
-license: MIT
+license: Apache-2.0
 
 contents:
   - src: ../target/release/moon
@@ -28,6 +28,17 @@ contents:
     dst: /usr/lib/systemd/system/moon.service
     file_info:
       mode: 0644
+
+  # moon.conf.example is created in feat/moon-conf — the path is referenced here
+  # so the config file is installed on package upgrade (type config|noreplace
+  # prevents overwriting user-edited config on upgrade).
+  - src: moon.conf.example
+    dst: /etc/moon/moon.conf
+    type: "config|noreplace"
+    file_info:
+      mode: 0644
+      owner: root
+      group: moon
 
   - dst: /etc/moon
     type: dir
