@@ -194,8 +194,7 @@ pub(crate) async fn handle_connection_sharded(
         let is_migration = matches!(result.0, HandlerResult::MigrateConnection { .. });
         if is_migration {
             tracing::debug!(
-                "Shard {}: connection migration not supported on this platform; \
-                 connection stays on originating shard",
+                "Shard {}: connection migration not supported on this platform; connection closed",
                 ctx.shard_id
             );
         }
