@@ -1,0 +1,133 @@
+# moon.conf.example — Reference configuration for the Moon server.
+#
+# Usage:  moon /etc/moon/moon.conf
+#         moon --config /etc/moon/moon.conf
+#
+# Every option is shown with its default value.
+# Lines beginning with # are comments and are ignored.
+# Inline comments are supported: `key value  # comment`
+# Keys may use underscores or dashes interchangeably: `max_memory` = `max-memory`.
+#
+# CLI flags override conf-file values (last-wins).  Example:
+#   moon /etc/moon/moon.conf --port 7380
+# starts the server on port 7380 regardless of the `port` directive below.
+#
+# Precedence (highest → lowest): CLI flags → conf file → built-in defaults.
+
+################################################################################
+# NETWORK
+################################################################################
+
+# Bind address.  Use 0.0.0.0 to listen on all interfaces.
+bind 127.0.0.1
+
+# Port to listen on.
+port 6379
+
+# Protected mode: reject non-loopback connections when no password is set.
+# Set to `no` when you add `requirepass` or `aclfile` and want remote access.
+protected-mode yes
+
+# Maximum simultaneous client connections (0 = unlimited).
+maxclients 10000
+
+# Close connections idle for more than N seconds (0 = disabled).
+timeout 0
+
+# TCP keepalive interval in seconds (0 = disabled).
+tcp-keepalive 300
+
+################################################################################
+# GENERAL
+################################################################################
+
+# Data directory for persistence files (AOF, RDB, WAL).
+# Create this directory before starting the server.
+dir /var/lib/moon
+
+# Require clients to authenticate with a password.
+# Uncomment and set a strong password in production.
+# requirepass your-strong-password-here
+
+# Path to an ACL file (Redis-compatible).
+# aclfile /etc/moon/users.acl
+
+# Number of logical databases (0–N-1).
+databases 16
+
+# Number of shards (0 = auto-detect from CPU count).
+shards 0
+
+################################################################################
+# PERSISTENCE
+################################################################################
+
+# Append-only file (AOF) persistence.
+appendonly yes
+
+# AOF fsync policy: always | everysec | no
+appendfsync everysec
+
+# RDB snapshot rules — comment out to disable snapshots.
+# Format: "seconds changes" pairs, space-separated.
+# save 3600 1 300 100 60 10000
+
+# RDB snapshot filename.
+dbfilename dump.rdb
+
+# AOF filename.
+appendfilename appendonly.aof
+
+################################################################################
+# MEMORY
+################################################################################
+
+# Maximum memory in bytes.  Moon auto-caps at ~80% of detected RAM when unset.
+# Set to 0 for explicitly unlimited.
+# 1 GiB example:
+# maxmemory 1073741824
+
+# Eviction policy when maxmemory is reached.
+# Options: noeviction, allkeys-lru, allkeys-lfu, volatile-lru, volatile-lfu,
+#          allkeys-random, volatile-random, volatile-ttl
+maxmemory-policy noeviction
+
+################################################################################
+# OBSERVABILITY
+################################################################################
+
+# Admin/metrics HTTP port.  Serves /metrics (Prometheus), /healthz, /readyz.
+# 0 disables the admin listener.
+# admin-port 9100
+
+# Slowlog: log commands slower than N microseconds (0 = log everything).
+slowlog-log-slower-than 10000
+
+# Maximum number of entries in the slowlog.
+slowlog-max-len 128
+
+################################################################################
+# TLS (disabled by default — uncomment to enable)
+################################################################################
+
+# TLS port (0 = TLS disabled).
+# tls-port 6380
+
+# Path to TLS certificate file (PEM).
+# tls-cert-file /etc/moon/tls/server.crt
+
+# Path to TLS private key file (PEM).
+# tls-key-file /etc/moon/tls/server.key
+
+# Path to CA certificate for mutual TLS (mTLS) client auth — optional.
+# tls-ca-cert-file /etc/moon/tls/ca.crt
+
+################################################################################
+# CLUSTER (disabled by default)
+################################################################################
+
+# Enable cluster mode.
+cluster-enabled no
+
+# Cluster node timeout in milliseconds.
+cluster-node-timeout 15000
