@@ -244,24 +244,14 @@ fn main() -> anyhow::Result<()> {
         None
     };
 
-    // Validate persistence directory is accessible
-    if let Err(e) = std::fs::create_dir_all(&config.dir) {
-        return Err(anyhow::anyhow!(
-            "failed to create persistence directory {:?}: {}",
-            config.dir,
-            e
-        ));
-    }
-
     // --check-config: validate and exit without starting.
-    // Runs AFTER TLS cert/key validation, protected mode check, and persistence dir check
-    // so that real configuration errors are caught before reporting success.
+    // Runs AFTER TLS cert/key validation and protected-mode check so that real
+    // configuration errors are caught before reporting success.
+    // Intentionally runs BEFORE create_dir_all: directory creation is a startup
+    // concern, not a config-validation concern, so --check-config must not require
+    // the persistence directory to already exist or be writable.
     // Remaining initialization (metrics, shards, AOF) is runtime-only and not validated here.
     if config.check_config {
-        // Validate shard count is reasonable
-        if config.shards == 0 {
-            return Err(anyhow::anyhow!("--shards must be >= 1"));
-        }
         // Validate admin port doesn't conflict with main port
         if config.admin_port > 0 && config.admin_port == config.port {
             return Err(anyhow::anyhow!(
@@ -286,6 +276,15 @@ fn main() -> anyhow::Result<()> {
         }
         info!("Configuration is valid.");
         return Ok(());
+    }
+
+    // Validate persistence directory is accessible
+    if let Err(e) = std::fs::create_dir_all(&config.dir) {
+        return Err(anyhow::anyhow!(
+            "failed to create persistence directory {:?}: {}",
+            config.dir,
+            e
+        ));
     }
 
     // ── Admin/console hardening (HARD-01/02/03, Phase 137) ──────────
