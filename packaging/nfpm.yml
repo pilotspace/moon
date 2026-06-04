@@ -15,7 +15,7 @@ description: |
   Supports RESP2/RESP3 protocol, persistence (RDB + WAL),
   replication, Lua scripting, vector search (FT.*), and pub/sub.
 vendor: Moon
-homepage: https://github.com/tindang/moon
+homepage: https://github.com/pilotspace/moon
 license: Apache-2.0
 
 contents:
