@@ -63,7 +63,8 @@ resolve_latest_version() {
     need_cmd curl
     # curl -sI follows redirects and prints headers only.
     # HTTP/2 headers are lowercase; strip trailing CR with tr.
-    _location=$(curl -sI https://github.com/pilotspace/moon/releases/latest \
+    _location=$(curl -sI --connect-timeout 15 --max-time 60 \
+        https://github.com/pilotspace/moon/releases/latest \
         | tr -d '\r' \
         | grep -i '^location:' \
         | tail -1 \
@@ -130,32 +131,49 @@ main() {
     ARTIFACT="moon-${VERSION}-${ARCH}-${OS}${RUNTIME}.tar.gz"
     BASE_URL="https://github.com/pilotspace/moon/releases/download/${VERSION}"
 
-    # Create temp dir with guaranteed cleanup
-    TMPDIR=$(mktemp -d)
-    trap 'rm -rf "$TMPDIR"' EXIT INT TERM
+    # Create temp dir with guaranteed cleanup.
+    # Note: deliberately NOT named TMPDIR — that would shadow the system
+    # TMPDIR environment variable inherited by child processes (tar, etc.).
+    WORK_DIR=$(mktemp -d)
+    trap 'rm -rf "$WORK_DIR"' EXIT INT TERM
 
     # Download tarball
     say "Downloading ${ARTIFACT}…"
-    curl -fSL "${BASE_URL}/${ARTIFACT}" -o "${TMPDIR}/${ARTIFACT}" \
+    curl -fSL --connect-timeout 30 --max-time 300 \
+        "${BASE_URL}/${ARTIFACT}" -o "${WORK_DIR}/${ARTIFACT}" \
         || die "download failed: ${BASE_URL}/${ARTIFACT}"
 
     # Download checksum file
     say "Downloading SHA256SUMS.txt…"
-    curl -fSL "${BASE_URL}/SHA256SUMS.txt" -o "${TMPDIR}/SHA256SUMS.txt" \
+    curl -fSL --connect-timeout 30 --max-time 120 \
+        "${BASE_URL}/SHA256SUMS.txt" -o "${WORK_DIR}/SHA256SUMS.txt" \
         || die "download failed: ${BASE_URL}/SHA256SUMS.txt"
 
-    # Verify checksum (runs in TMPDIR so relative path in sums file works)
+    # Verify checksum (runs in WORK_DIR so relative path in sums file works)
     say "Verifying checksum…"
-    (cd "$TMPDIR" && verify_checksum "$ARTIFACT" SHA256SUMS.txt)
+    (cd "$WORK_DIR" && verify_checksum "$ARTIFACT" SHA256SUMS.txt)
     say "Checksum OK."
 
     # Extract
     say "Extracting…"
-    tar -xzf "${TMPDIR}/${ARTIFACT}" -C "$TMPDIR"
+    tar -xzf "${WORK_DIR}/${ARTIFACT}" -C "$WORK_DIR"
+
+    # Locate the binary. Release tarballs nest contents under a top-level
+    # directory named after the artifact (e.g. moon-v0.2.0-x86_64-linux-monoio/);
+    # fall back to a flat layout, then to a recursive search.
+    MOON_BIN="${WORK_DIR}/${ARTIFACT%.tar.gz}/moon"
+    if [ ! -f "$MOON_BIN" ]; then
+        MOON_BIN="${WORK_DIR}/moon"
+    fi
+    if [ ! -f "$MOON_BIN" ]; then
+        MOON_BIN=$(find "$WORK_DIR" -type f -name moon | head -1)
+    fi
+    [ -n "$MOON_BIN" ] && [ -f "$MOON_BIN" ] \
+        || die "moon binary not found in extracted archive"
 
     # Install binary
     mkdir -p "$INSTALL_DIR"
-    install -m 755 "${TMPDIR}/moon" "${INSTALL_DIR}/moon" \
+    install -m 755 "$MOON_BIN" "${INSTALL_DIR}/moon" \
         || die "install failed — try running with sudo or set INSTALL_DIR"
     say "Installed moon to ${INSTALL_DIR}/moon"
 

@@ -25,6 +25,11 @@ param()
 
 $ErrorActionPreference = 'Stop'
 
+# PowerShell 5.1 / older .NET defaults may negotiate TLS 1.0/1.1, which GitHub
+# rejects ("Could not create SSL/TLS secure channel"). Force TLS 1.2 before any
+# network call (same pattern as rustup-init.ps1).
+[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+
 # ── Version / directory from env overrides or params ─────────────────────────
 $Version    = if ($env:VERSION)     { $env:VERSION }    else { $null }
 $InstallDir = if ($env:INSTALL_DIR) { $env:INSTALL_DIR } else { $null }
