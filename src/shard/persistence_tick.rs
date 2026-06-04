@@ -369,7 +369,11 @@ pub(crate) fn drain_and_shutdown_spill(
         apply_spill_completions(spill_t, shard_manifest, shard_databases, shard_id);
     }
     if let Some(st) = spill_thread.take() {
-        st.shutdown();
+        // shutdown() returns any completions from the thread's final buffer
+        // flush that the drain above did not see; apply them so those cold keys
+        // are not lost (file on disk but never recorded in the manifest).
+        let leftover = st.shutdown();
+        apply_completion_vec(leftover, shard_manifest, shard_databases, shard_id);
         tracing::info!("Shard {}: spill background thread shut down", shard_id);
     }
 }
@@ -387,6 +391,18 @@ pub(crate) fn apply_spill_completions(
     shard_id: usize,
 ) {
     let completions = spill_thread.drain_completions();
+    apply_completion_vec(completions, shard_manifest, shard_databases, shard_id);
+}
+
+/// Apply a batch of spill completions: ONE manifest `add_file`+commit per file,
+/// one `cold_index` insert per KV entry within it. Shared by the live drain
+/// (`apply_spill_completions`) and the shutdown final-flush drain.
+fn apply_completion_vec(
+    completions: Vec<crate::storage::tiered::spill_thread::SpillCompletion>,
+    shard_manifest: &mut Option<crate::persistence::manifest::ShardManifest>,
+    shard_databases: &std::sync::Arc<super::shared_databases::ShardDatabases>,
+    shard_id: usize,
+) {
     if completions.is_empty() {
         return;
     }
