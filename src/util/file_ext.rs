@@ -17,7 +17,9 @@
 /// concurrent `write_at`/`read_exact_at` calls on Windows is incorrect because
 /// the cursor is process-global per handle.
 use std::fs::File;
-use std::io::{self, ErrorKind};
+use std::io;
+#[cfg(not(unix))]
+use std::io::ErrorKind;
 
 /// Write `buf` at byte `offset` of `file`.
 ///
