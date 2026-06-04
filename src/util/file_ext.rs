@@ -97,6 +97,7 @@ pub fn read_exact_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::ErrorKind;
     use tempfile::tempfile;
 
     /// Roundtrip: write data at various offsets and read it back.
