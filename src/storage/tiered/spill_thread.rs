@@ -32,10 +32,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 /// reasonable memory budget and keeps file sizes manageable.
 const FLUSH_ENTRY_CAP: usize = 256;
 
-/// Cumulative count of `SpillCompletion`s dropped because the event-loop-side
-/// completion channel was full. Each drop means the data is on disk but the
-/// in-memory `cold_index` slot was not refreshed; the next checkpoint repairs
-/// it from the manifest.
+/// Cumulative count of `SpillCompletion`s dropped. Dropping is **data loss**:
+/// the `.mpf` file is on disk but its manifest `add_file` + `cold_index` insert
+/// happen only when the event loop consumes the completion, and the keys are
+/// already evicted from RAM. The sender therefore blocks on a full channel
+/// instead of dropping, so this only increments in the rare
+/// shutdown-with-full-channel edge. Exposed for INFO / metrics scraping.
 static SPILL_COMPLETION_DROPPED: AtomicU64 = AtomicU64::new(0);
 
 /// Returns the cumulative number of dropped spill completions across all
@@ -183,7 +185,7 @@ fn flush_buffer(buffer: &mut Vec<SpillRequest>) -> Vec<SpillCompletion> {
             })
             .collect();
 
-        let completion = match build_kv_spill_batch(&spill_entries, file_id) {
+        match build_kv_spill_batch(&spill_entries, file_id) {
             Ok(batch) => {
                 let total_pages = batch.leaves.len() as u32; // overflow is always empty (inline-only)
                 match write_kv_spill_batch(&shard_dir, file_id, &batch) {
@@ -198,23 +200,23 @@ fn flush_buffer(buffer: &mut Vec<SpillRequest>) -> Vec<SpillCompletion> {
                                 slot_idx,
                             })
                             .collect();
-                        SpillCompletion {
+                        completions.push(SpillCompletion {
                             file_entry: make_file_entry(file_id, total_pages, byte_size),
                             entries,
                             success: true,
-                        }
+                        });
                     }
                     Err(e) => {
                         warn!(
                             file_id,
                             error = %e,
                             count = inline_indices.len(),
-                            "spill_thread: inline batch write failed"
+                            "spill_thread: inline batch write failed; falling back to per-entry spill"
                         );
-                        SpillCompletion {
-                            file_entry: make_file_entry(file_id, 0, 0),
-                            entries: Vec::new(),
-                            success: false,
+                        // Salvage each entry individually rather than dropping the
+                        // whole already-evicted flush.
+                        for &i in &inline_indices {
+                            completions.push(spill_single_entry(&buffer[i], buffer[i].file_id));
                         }
                     }
                 }
@@ -224,63 +226,61 @@ fn flush_buffer(buffer: &mut Vec<SpillRequest>) -> Vec<SpillCompletion> {
                     file_id,
                     error = %e,
                     count = inline_indices.len(),
-                    "spill_thread: inline batch build failed"
+                    "spill_thread: inline batch build failed; falling back to per-entry spill"
                 );
-                SpillCompletion {
-                    file_entry: make_file_entry(file_id, 0, 0),
-                    entries: Vec::new(),
-                    success: false,
+                // One entry that does not fit a fresh inline leaf must not drop the
+                // whole batch — write each via the overflow path instead.
+                for &i in &inline_indices {
+                    completions.push(spill_single_entry(&buffer[i], buffer[i].file_id));
                 }
             }
-        };
-        completions.push(completion);
+        }
     }
 
     // ── Write ONE single-page file per oversized entry ────────────────────────
     for &i in &oversized_indices {
-        let req = &buffer[i];
-        let file_id = req.file_id;
-        let shard_dir = req.shard_dir.clone();
+        completions.push(spill_single_entry(&buffer[i], buffer[i].file_id));
+    }
 
-        let completion = match build_kv_spill_pages(
-            &req.key,
-            &req.value_bytes,
-            req.value_type,
-            req.flags,
-            req.ttl_ms,
-            file_id,
-        ) {
-            Ok(pages) => match write_kv_spill_pages(&shard_dir, file_id, &pages) {
-                Ok(byte_size) => SpillCompletion {
-                    file_entry: make_file_entry(file_id, pages.total_pages, byte_size),
-                    entries: vec![SpillCompletionEntry {
-                        key: req.key.clone(),
-                        db_index: req.db_index,
-                        page_idx: 0,
-                        slot_idx: 0,
-                    }],
-                    success: true,
-                },
-                Err(e) => {
-                    warn!(
-                        file_id,
-                        error = %e,
-                        key_len = req.key.len(),
-                        "spill_thread: oversized single-file write failed"
-                    );
-                    SpillCompletion {
-                        file_entry: make_file_entry(file_id, 0, 0),
-                        entries: Vec::new(),
-                        success: false,
-                    }
-                }
+    buffer.clear();
+    completions
+}
+
+/// Spill ONE entry as its own single-page (+overflow) file via
+/// `build_kv_spill_pages`.
+///
+/// Used both for oversized entries and as the inline-batch fallback: when an
+/// inline batch fails (an entry that passed the `value_bytes.len()` pre-screen
+/// still does not fit a fresh leaf), salvaging each entry here prevents one bad
+/// candidate from dropping a whole flush whose keys are already out of RAM.
+/// Returns a failed completion only if this single entry cannot be written even
+/// with overflow pages (key too large for a leaf).
+fn spill_single_entry(req: &SpillRequest, file_id: u64) -> SpillCompletion {
+    match build_kv_spill_pages(
+        &req.key,
+        &req.value_bytes,
+        req.value_type,
+        req.flags,
+        req.ttl_ms,
+        file_id,
+    ) {
+        Ok(pages) => match write_kv_spill_pages(&req.shard_dir, file_id, &pages) {
+            Ok(byte_size) => SpillCompletion {
+                file_entry: make_file_entry(file_id, pages.total_pages, byte_size),
+                entries: vec![SpillCompletionEntry {
+                    key: req.key.clone(),
+                    db_index: req.db_index,
+                    page_idx: 0,
+                    slot_idx: 0,
+                }],
+                success: true,
             },
             Err(e) => {
                 warn!(
                     file_id,
                     error = %e,
                     key_len = req.key.len(),
-                    "spill_thread: oversized single-file build failed (key too large)"
+                    "spill_thread: single-file write failed"
                 );
                 SpillCompletion {
                     file_entry: make_file_entry(file_id, 0, 0),
@@ -288,12 +288,21 @@ fn flush_buffer(buffer: &mut Vec<SpillRequest>) -> Vec<SpillCompletion> {
                     success: false,
                 }
             }
-        };
-        completions.push(completion);
+        },
+        Err(e) => {
+            warn!(
+                file_id,
+                error = %e,
+                key_len = req.key.len(),
+                "spill_thread: single-file build failed (key too large)"
+            );
+            SpillCompletion {
+                file_entry: make_file_entry(file_id, 0, 0),
+                entries: Vec::new(),
+                success: false,
+            }
+        }
     }
-
-    buffer.clear();
-    completions
 }
 
 /// Background thread that performs pwrite for evicted KV entries.
@@ -685,6 +694,63 @@ mod tests {
         assert_eq!(
             total, 1,
             "shutdown must return the unapplied completion, not drop it"
+        );
+    }
+
+    /// An entry that passes the `INLINE_MAX_VALUE_BYTES` pre-screen but does not
+    /// fit a fresh inline leaf (large key + incompressible value) makes
+    /// `build_kv_spill_batch` fail. That must NOT fail the whole inline flush —
+    /// the offender is salvaged via the per-entry (overflow) path instead, since
+    /// its key is already evicted from RAM.
+    #[test]
+    fn inline_batch_failure_falls_back_to_per_entry_spill() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // High-entropy (LZ4-incompressible) value at the inline threshold.
+        let mut value = Vec::with_capacity(INLINE_MAX_VALUE_BYTES);
+        let mut s: u32 = 0x1234_5678;
+        for _ in 0..INLINE_MAX_VALUE_BYTES {
+            s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            value.push((s >> 24) as u8);
+        }
+        // Sizable key so key + value overflows a 4KB leaf (forces batch failure),
+        // yet the key alone fits a leaf with an overflow pointer (pages succeed).
+        let key = vec![b'k'; 800];
+
+        let mut buffer = vec![SpillRequest {
+            key: Bytes::from(key),
+            db_index: 0,
+            value_bytes: Bytes::from(value),
+            value_type: ValueType::String,
+            flags: 0,
+            ttl_ms: None,
+            file_id: 1,
+            shard_dir: tmp.path().to_path_buf(),
+        }];
+
+        let completions = flush_buffer(&mut buffer);
+        let succeeded: usize = completions
+            .iter()
+            .filter(|c| c.success)
+            .map(|c| c.entries.len())
+            .sum();
+        assert_eq!(
+            succeeded, 1,
+            "inline entry that overflows a leaf must be salvaged via per-entry fallback, not dropped"
+        );
+
+        // And the salvaged entry must be readable back from its on-disk file.
+        let c = completions
+            .iter()
+            .find(|c| c.success && !c.entries.is_empty())
+            .expect("expected a successful fallback completion");
+        let file_path = tmp
+            .path()
+            .join("data")
+            .join(format!("heap-{:06}.mpf", c.file_entry.file_id));
+        assert!(
+            file_path.exists(),
+            "fallback spill file should exist on disk"
         );
     }
 
