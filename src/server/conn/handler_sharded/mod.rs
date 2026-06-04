@@ -101,7 +101,10 @@ pub(crate) async fn handle_connection_sharded(
     )
     .await;
 
-    // Handle migration result: extract FD from the returned stream and send via SPSC
+    // Handle migration result: extract FD from the returned stream and send via SPSC.
+    // Connection migration uses Unix fd-passing; on non-unix platforms the entire
+    // migration path is compiled out and the connection stays on the originating shard.
+    #[cfg(unix)]
     if let (
         HandlerResult::MigrateConnection {
             state,
@@ -180,6 +183,25 @@ pub(crate) async fn handle_connection_sharded(
     } else {
         // Only decrement connected_clients when the connection is actually closing,
         // not when migrating to another shard (the connection stays alive).
+        crate::admin::metrics_setup::record_connection_closed();
+    }
+
+    // On non-unix platforms connection migration is not supported (no fd-passing).
+    // The connection terminates normally on the originating shard; metrics are
+    // still decremented so the connected_clients counter stays accurate.
+    #[cfg(not(unix))]
+    {
+        let is_migration = matches!(
+            result.0,
+            HandlerResult::MigrateConnection { .. }
+        );
+        if is_migration {
+            tracing::debug!(
+                "Shard {}: connection migration not supported on this platform; \
+                 connection stays on originating shard",
+                ctx.shard_id
+            );
+        }
         crate::admin::metrics_setup::record_connection_closed();
     }
 }
