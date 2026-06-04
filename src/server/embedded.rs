@@ -57,6 +57,18 @@ use crate::shard::Shard;
 use crate::shard::mesh::{CHANNEL_BUFFER_SIZE, ChannelMesh};
 use crate::shard::shared_databases::ShardDatabases;
 
+/// Whether pre-loop recovery (`Shard::restore_from_persistence`) must run.
+///
+/// Recovery is required when EITHER durable persistence (`persistence_dir`) OR
+/// disk-offload is configured. The disk-offload case is the subtle one: under
+/// `--appendonly no` + disk-offload, `persistence_dir` is `None`, yet the cold
+/// tier still has on-disk state whose baseline must be restored on restart —
+/// skipping it leaves cold keys unrecoverable. Mirrors the `main.rs` gate.
+#[inline]
+fn should_run_recovery(persistence_dir: Option<&str>, disk_offload_enabled: bool) -> bool {
+    persistence_dir.is_some() || disk_offload_enabled
+}
+
 /// Run an embedded sharded Moon server until `cancel` is fired.
 ///
 /// Behaves like the production `main.rs` startup path but with cluster,
@@ -218,8 +230,13 @@ pub async fn run_embedded(
                 config.initial_keyspace_hint,
                 config.to_runtime_config(),
             );
-            if let Some(ref dir) = persistence_dir {
-                shard.restore_from_persistence(dir, disk_offload_base.as_deref());
+            // Recover whenever persistence OR disk-offload is configured. Under
+            // `--appendonly no` + disk-offload, persistence_dir is None but the
+            // cold tier still needs its baseline restored on restart, else cold
+            // keys are unrecoverable (mirrors main.rs).
+            if should_run_recovery(persistence_dir.as_deref(), disk_offload_base.is_some()) {
+                let recover_dir = persistence_dir.as_deref().unwrap_or(config.dir.as_str());
+                shard.restore_from_persistence(recover_dir, disk_offload_base.as_deref());
             }
             if let Some(ref offload_base) = disk_offload_base {
                 let shard_dir = offload_base.join(format!("shard-{}", id));
@@ -355,8 +372,10 @@ pub async fn run_embedded(
     }
     let _ = snap_tx; // keep the watch sender alive for the shard's snap_rx clones
 
-    // Run the sharded listener until cancelled.
-    let per_shard_accept = cfg!(target_os = "linux");
+    // Run the sharded listener until cancelled. Use the central accept path
+    // (per_shard_accept = false) like main.rs: the per-shard tokio/Linux accept
+    // loop has a bind-order race that can hang serving (fixed in PR #136).
+    let per_shard_accept = false;
     let listener_result = server::listener::run_sharded(
         config,
         conn_txs,
@@ -461,5 +480,27 @@ fn panic_message<'a>(payload: &'a Box<dyn std::any::Any + Send + 'static>) -> &'
         s.as_str()
     } else {
         "<non-string panic payload>"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_run_recovery;
+
+    #[test]
+    fn recovery_runs_for_disk_offload_without_persistence() {
+        // The regression: `--appendonly no` + disk-offload means persistence_dir
+        // is None but the cold tier must still be recovered on restart.
+        assert!(
+            should_run_recovery(None, true),
+            "disk-offload-only (appendonly=no) must still run cold-tier recovery"
+        );
+        // Other combinations behave as before.
+        assert!(should_run_recovery(Some("/var/lib/moon"), false));
+        assert!(should_run_recovery(Some("/var/lib/moon"), true));
+        assert!(
+            !should_run_recovery(None, false),
+            "no persistence and no disk-offload: nothing to recover"
+        );
     }
 }
