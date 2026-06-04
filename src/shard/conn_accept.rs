@@ -17,6 +17,7 @@ use crate::pubsub::PubSubRegistry;
 use crate::replication::state::ReplicationState;
 use crate::runtime::cancel::CancellationToken;
 use crate::runtime::channel;
+#[cfg(unix)]
 use crate::server::conn::affinity::MigratedConnectionState;
 use crate::storage::entry::CachedClock;
 use crate::tracking::TrackingTable;
@@ -64,6 +65,10 @@ pub(crate) fn create_reuseport_socket(addr: &str) -> std::io::Result<std::net::T
 /// State restoration (selected_db, client_name, protocol_version, current_user)
 /// is handled directly by the handler via the `migrated_state` parameter —
 /// no synthetic RESP commands are injected into the read buffer.
+///
+/// unix-only: connection migration is fd-passing, so all callers are
+/// `#[cfg(unix)]`-gated — this helper would be dead code on Windows.
+#[cfg(unix)]
 fn take_migration_read_buf(state: &mut MigratedConnectionState) -> BytesMut {
     std::mem::take(&mut state.read_buf_remainder)
 }
@@ -167,13 +172,14 @@ pub(crate) fn spawn_tokio_connection(
     let all_rsm = all_remote_sub_maps.to_vec();
     let reqpass = rtcfg.read().requirepass.clone();
     let maxclients_tokio = rtcfg.read().maxclients;
-    let tcp_keepalive_secs = rtcfg.read().tcp_keepalive;
     let clk = cached_clock.clone();
 
-    // Set TCP keepalive on accepted socket
+    // Set TCP keepalive on accepted socket (unix-only: set_tcp_keepalive uses
+    // raw-fd setsockopt; Windows analog deferred with the v0.3.0 service work)
     #[cfg(unix)]
     {
         use std::os::unix::io::AsRawFd;
+        let tcp_keepalive_secs = rtcfg.read().tcp_keepalive;
         set_tcp_keepalive(tcp_stream.as_raw_fd(), tcp_keepalive_secs);
     }
 
