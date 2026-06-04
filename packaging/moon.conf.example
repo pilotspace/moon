@@ -55,8 +55,9 @@ dir /var/lib/moon
 # Number of logical databases (0–N-1).
 databases 16
 
-# Number of shards (0 = auto-detect from CPU count).
-shards 0
+# Number of shards (0 = auto-detect from CPU count at runtime).
+# Leave commented for auto-detection; set explicitly for reproducible deployments.
+# shards 4
 
 ################################################################################
 # PERSISTENCE
