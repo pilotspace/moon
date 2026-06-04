@@ -406,8 +406,6 @@ pub fn recover_shard_v3_pitr(
             }
         };
         let on_fpi = &mut |record: &WalRecord| {
-            use std::os::unix::fs::FileExt;
-
             let payload = &record.payload;
             if payload.len() < 16 {
                 tracing::warn!(
@@ -491,7 +489,7 @@ pub fn recover_shard_v3_pitr(
                 .open(&file_path)
             {
                 Ok(file) => {
-                    if let Err(e) = file.write_at(page_data, byte_offset) {
+                    if let Err(e) = crate::util::file_ext::write_at(&file, page_data, byte_offset) {
                         tracing::error!(
                             "Shard {}: FPI pwrite failed for file_id={}, offset={}: {}",
                             shard_id,

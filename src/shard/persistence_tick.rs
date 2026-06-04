@@ -951,7 +951,6 @@ pub(crate) fn handle_checkpoint_tick(
                     // KV heap pages: {shard_dir}/data/heap-{file_id:06}.mpf
                     // Warm-tier .mpf pages are immutable and never dirtied, so
                     // only KV heap pages reach this path.
-                    use std::os::unix::fs::FileExt;
                     let page_size = if is_large {
                         crate::persistence::page::PAGE_64K
                     } else {
@@ -963,7 +962,7 @@ pub(crate) fn handle_checkpoint_tick(
                         .join("data")
                         .join(format!("heap-{:06}.mpf", file_id));
                     let file = std::fs::OpenOptions::new().write(true).open(&file_path)?;
-                    file.write_at(data, byte_offset)?;
+                    crate::util::file_ext::write_at(&file, data, byte_offset)?;
                     Ok(())
                 },
             );
