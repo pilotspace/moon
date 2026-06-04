@@ -1266,7 +1266,7 @@ impl super::Shard {
                             let _ = (fd, state);
                             tracing::debug!(
                                 "Shard {}: connection migration not supported on this platform; \
-                                 connection stays on originating shard",
+                                 connection closed",
                                 shard_id
                             );
                         }
@@ -1374,7 +1374,7 @@ impl super::Shard {
                             let _ = (fd, state);
                             tracing::debug!(
                                 "Shard {}: connection migration not supported on this platform; \
-                                 connection stays on originating shard",
+                                 connection closed",
                                 shard_id
                             );
                         }
@@ -2033,7 +2033,7 @@ impl super::Shard {
                         let _ = (fd, state);
                         tracing::debug!(
                             "Shard {}: connection migration not supported on this platform; \
-                             connection stays on originating shard",
+                             connection closed",
                             shard_id
                         );
                     }
