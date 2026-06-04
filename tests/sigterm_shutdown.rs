@@ -1,14 +1,17 @@
 //! SIGTERM-SHUTDOWN: the server must exit cleanly (exit code 0) when sent SIGTERM.
 //!
 //! Regression guard for the missing SIGTERM handler: before this fix, systemd/launchd
-//! `stop` sent SIGTERM which was not handled, causing the kernel to deliver the default
-//! action (non-zero exit, AOF not flushed).
+//! `stop` sent SIGTERM which was not handled, so the kernel delivered the default
+//! action (signal death, graceful-shutdown path skipped).
+//!
+//! What IS asserted: `status.code() == Some(0)` — i.e. the process took the graceful
+//! shutdown path (signal death reports `code() == None`). Exit code 0 is only
+//! reachable through main()'s normal return after `broadcast_shutdown` + shard joins.
+//! What is NOT asserted: log output or AOF contents (the test runs with
+//! `--appendonly no`; an AOF flush-on-SIGTERM integration test is follow-up work).
 //!
 //! TDD note: this test was written RED first (before the SIGTERM handler was installed
-//! in main.rs). The red phase confirms: SIGTERM terminates the process, but
-//! `status.code()` returns `None` (signal death, not normal exit) and the exit is not
-//! clean. The green phase (SIGTERM handler installed) confirms: clean exit with code 0
-//! and the "Server shut down" log line.
+//! in main.rs). The red phase confirmed `status.code()` returns `None` (signal death).
 
 #![cfg(unix)]
 #![cfg(any(feature = "runtime-monoio", feature = "runtime-tokio"))]
@@ -23,6 +26,10 @@ fn moon_binary() -> std::path::PathBuf {
 }
 
 /// Pick an ephemeral port by binding :0 and releasing it.
+///
+/// Note: classic TOCTOU race — another process can grab the port between the
+/// `drop(l)` and the server's bind. Acceptable in test code: ephemeral-range
+/// collisions are rare, and a collision fails loudly in `wait_for_ready`.
 fn free_port() -> u16 {
     let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind :0");
     let p = l.local_addr().expect("local_addr").port();
