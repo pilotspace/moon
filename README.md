@@ -214,8 +214,8 @@ traced to source).
 > **Packaged releases are coming in v0.2.0.** The Homebrew tap, one-liner
 > install scripts (`install.sh` / `install.ps1`), `.deb`/`.rpm` packages,
 > and pre-built tarballs will be available once the v0.2.0 release pipeline
-> (PR-5) is merged and the `v0.2.0` tag is cut. Until then, please build
-> from source using the [Quick start](#quick-start) instructions below.
+> is merged and the `v0.2.0` tag is cut. Until then, please build from
+> source using the [Quick start](#quick-start) instructions below.
 
 ---
 
