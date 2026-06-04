@@ -234,6 +234,15 @@ pub struct PerShardRewriteCoord {
     /// refuse to start. On abort the old generation (`old_seq`) stays the
     /// committed state for all shards (crash-safe).
     failed: std::sync::atomic::AtomicBool,
+    /// The committed generation, published exactly once by the terminal writer
+    /// (`new_seq` on success, `old_seq` on abort/commit-failure). Every folded
+    /// writer blocks on this in `await_outcome` after `shard_done` so it can
+    /// reopen its append file onto the COMMITTED generation before resuming
+    /// appends — without this barrier a writer that reopened onto `new_seq` in
+    /// phase 6 keeps appending there after an abort, into a generation recovery
+    /// ignores (silent data loss; the old "RESTART recommended" hazard).
+    outcome: parking_lot::Mutex<Option<u64>>,
+    outcome_cv: parking_lot::Condvar,
 }
 
 impl PerShardRewriteCoord {
@@ -251,7 +260,39 @@ impl PerShardRewriteCoord {
             old_seq: current_seq,
             n_shards,
             failed: std::sync::atomic::AtomicBool::new(false),
+            outcome: parking_lot::Mutex::new(None),
+            outcome_cv: parking_lot::Condvar::new(),
         })
+    }
+
+    /// Publish the committed generation to every writer blocked in
+    /// `await_outcome`. Called exactly once, by the terminal `shard_done`.
+    #[inline]
+    fn publish_outcome(&self, committed_seq: u64) {
+        let mut slot = self.outcome.lock();
+        *slot = Some(committed_seq);
+        self.outcome_cv.notify_all();
+    }
+
+    /// Block until the terminal writer publishes the committed generation, then
+    /// return it (`new_seq` on success, `old_seq` on abort/commit-failure). Each
+    /// folded writer calls this AFTER `shard_done` so it can reopen its append
+    /// file onto the committed generation. Safe against missed wake-ups: the
+    /// outcome is set under the same lock the condvar waits on, so a writer that
+    /// arrives after the publish observes `Some` and skips the wait.
+    ///
+    /// Deadlock-free: all `n_shards` writers call `shard_done` exactly once
+    /// (success via phase 7, fold-error/send-failure via the caller), so the
+    /// countdown always reaches zero and the terminal branch always publishes.
+    /// Each per-shard writer runs on its own dedicated OS thread, so blocking
+    /// one here never starves the thread that must publish.
+    #[must_use]
+    fn await_outcome(&self) -> u64 {
+        let mut slot = self.outcome.lock();
+        while slot.is_none() {
+            self.outcome_cv.wait(&mut slot);
+        }
+        slot.expect("outcome is Some after the wait loop")
     }
 
     /// The generation writers advance to.
@@ -293,11 +334,14 @@ impl PerShardRewriteCoord {
                 drop(m);
                 error!(
                     "F6 per-shard rewrite ABORTED: a shard failed to fold; seq stays {}. \
-                     Old generation remains authoritative (crash-safe). A RESTART is \
-                     recommended so successful shards' writers stop appending to the \
-                     discarded new generation.",
+                     Old generation remains authoritative (crash-safe). Folded writers \
+                     roll their append files back to the old generation at the \
+                     barrier — no restart required.",
                     self.old_seq
                 );
+                // Publish BEFORE clearing the in-progress flag so every blocked
+                // writer wakes and reopens onto the (still-authoritative) old gen.
+                self.publish_outcome(self.old_seq);
                 crate::command::persistence::AOF_REWRITE_IN_PROGRESS.store(false, Ordering::SeqCst);
                 return;
             }
@@ -311,6 +355,10 @@ impl PerShardRewriteCoord {
                 );
                 // Do NOT prune — old generation is still the committed state.
                 drop(m);
+                // Commit failed: old_seq is still authoritative, so folded
+                // writers must roll back to it (their phase-6 reopen targeted
+                // new_seq, which never committed).
+                self.publish_outcome(self.old_seq);
                 crate::command::persistence::AOF_REWRITE_IN_PROGRESS.store(false, Ordering::SeqCst);
                 return;
             }
@@ -322,7 +370,59 @@ impl PerShardRewriteCoord {
                 "F6 per-shard rewrite complete: committed seq {} across {} shards, pruned seq {}",
                 self.new_seq, self.n_shards, self.old_seq
             );
+            // Success: new_seq is committed. Folded writers already reopened onto
+            // new_seq in phase 6, so the barrier is a no-op for them — but it must
+            // still unblock them.
+            self.publish_outcome(self.new_seq);
             crate::command::persistence::AOF_REWRITE_IN_PROGRESS.store(false, Ordering::SeqCst);
+        }
+    }
+}
+
+/// Panic-safety guard for a per-shard fold's `shard_done` obligation.
+///
+/// The `await_outcome` barrier in `do_rewrite_per_shard` turns "every shard
+/// calls `shard_done` exactly once" from a tidiness rule into a LIVENESS
+/// requirement: any folded writer that decrements then blocks in `await_outcome`
+/// hangs forever if some other shard never decrements. The one path that would
+/// skip `shard_done` is a panic mid-fold (e.g. `save_snapshot_to_bytes`
+/// OOM-unwinding — issue #138), which under `panic = "unwind"` would otherwise
+/// hang every healthy shard's AOF writer thread.
+///
+/// This guard makes the decrement unconditional. The fold creates it on entry
+/// and calls [`complete`](Self::complete) on the success path (clean
+/// `shard_done`). On ANY other exit — `?` error or panic unwind — `Drop` fires
+/// `mark_failed` + `shard_done`, so the countdown still reaches zero, the
+/// terminal writer publishes `old_seq`, and every barrier waiter wakes and rolls
+/// back. Because the guard owns the decrement for ALL exits, callers MUST NOT
+/// call `shard_done` again after invoking `do_rewrite_per_shard`.
+struct ShardDoneGuard<'a> {
+    coord: &'a PerShardRewriteCoord,
+    done: bool,
+}
+
+impl<'a> ShardDoneGuard<'a> {
+    #[inline]
+    fn new(coord: &'a PerShardRewriteCoord) -> Self {
+        Self { coord, done: false }
+    }
+
+    /// Success-path completion: a single clean `shard_done` (no `mark_failed`).
+    /// Consumes the guard so the subsequent `Drop` is a no-op.
+    #[inline]
+    fn complete(mut self) {
+        self.done = true;
+        self.coord.shard_done();
+    }
+}
+
+impl Drop for ShardDoneGuard<'_> {
+    fn drop(&mut self) {
+        if !self.done {
+            // Unwind or early-error before completion: abort the rewrite (keep
+            // old_seq) and still decrement so the barrier releases every waiter.
+            self.coord.mark_failed();
+            self.coord.shard_done();
         }
     }
 }
@@ -895,6 +995,161 @@ mod pool_tests {
         assert!(
             !AOF_REWRITE_IN_PROGRESS.load(Ordering::SeqCst),
             "partial fan-out failure must clear AOF_REWRITE_IN_PROGRESS, not wedge it"
+        );
+    }
+
+    /// A per-shard rewrite that ABORTS (another shard failed to fold) must roll
+    /// THIS shard's append file back onto the committed old generation. Phase 6
+    /// reopens `*file` onto the new-seq incr; if the rewrite then aborts, the
+    /// manifest keeps `old_seq` and prunes the new-seq files — so without a
+    /// barrier-before-resume the writer keeps appending into a discarded incr
+    /// that recovery ignores (silent data loss). This test drives one shard's
+    /// real fold to completion with a second shard pre-marked failed, then proves
+    /// post-abort appends land in the COMMITTED old-gen incr.
+    #[test]
+    fn rewrite_abort_reopens_writer_onto_committed_old_generation() {
+        use crate::command::persistence::AOF_REWRITE_IN_PROGRESS;
+        use std::io::Write;
+        use std::sync::atomic::Ordering;
+
+        let tmp = tempfile::tempdir().unwrap();
+        // 2-shard manifest at seq=1 on disk; share it through the coord's Arc.
+        let manifest =
+            crate::persistence::aof_manifest::AofManifest::initialize_multi(tmp.path(), 2).unwrap();
+        let old_seq = manifest.seq;
+        let old_incr_s0 = manifest.shard_incr_path_seq(0, old_seq);
+        assert!(old_incr_s0.exists(), "old-gen incr must exist pre-rewrite");
+        let manifest = std::sync::Arc::new(parking_lot::Mutex::new(manifest));
+
+        let coord = PerShardRewriteCoord::new(manifest.clone(), old_seq, 2);
+        let new_seq = coord.new_seq();
+        assert_ne!(new_seq, old_seq);
+
+        // Shard 1 "fails to fold": mark_failed + shard_done (countdown 2 -> 1).
+        // Shard 0's shard_done (inside do_rewrite_per_shard) will then be the
+        // terminal decrement and take the abort path.
+        coord.mark_failed();
+        coord.shard_done();
+
+        // Shard 0's append file starts on the OLD incr (where the live writer
+        // appends before a rewrite). Empty databases keep the fold trivial; the
+        // reopen behaviour is independent of key count.
+        let shard_dbs = crate::shard::shared_databases::ShardDatabases::new(vec![
+            vec![crate::storage::Database::new()],
+            vec![crate::storage::Database::new()],
+        ]);
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&old_incr_s0)
+            .unwrap();
+        let (_tx, rx) = channel::mpsc_bounded::<AofMessage>(4);
+
+        AOF_REWRITE_IN_PROGRESS.store(true, Ordering::SeqCst);
+        // The fold itself succeeds; aborting is a coordinator decision, so this
+        // returns Ok even though the rewrite is discarded.
+        do_rewrite_per_shard(0, &shard_dbs, &mut file, &rx, &coord).unwrap();
+
+        // Abort kept the old generation committed and pruned the new-gen incr.
+        assert_eq!(manifest.lock().seq, old_seq, "abort must keep old_seq");
+        let new_incr_s0 = manifest.lock().shard_incr_path_seq(0, new_seq);
+        assert!(
+            !new_incr_s0.exists(),
+            "aborted new-gen incr must be pruned (the dangling target)"
+        );
+
+        // The writer must have been rolled back onto the old-gen incr: appends
+        // through `*file` after the rewrite must land in the committed file, not
+        // the pruned/unlinked new-gen inode.
+        let marker = b"*1\r\n$4\r\nPING\r\n";
+        file.write_all(marker).unwrap();
+        file.sync_data().unwrap();
+        drop(file);
+        let committed = std::fs::read(&old_incr_s0).unwrap();
+        assert!(
+            committed.windows(marker.len()).any(|w| w == marker),
+            "post-abort appends must land in the committed old-gen incr (no silent loss)"
+        );
+    }
+
+    /// Cross-thread barrier wakeup: a folded writer that decrements then blocks
+    /// in `await_outcome` on one thread must be woken with the committed
+    /// generation by the terminal `shard_done` running on ANOTHER thread. The
+    /// single-threaded behavioural test above never actually blocks (its
+    /// `await_outcome` returns immediately), so this exercises the real condvar
+    /// wait/notify path across threads.
+    #[test]
+    fn rewrite_abort_wakes_waiter_cross_thread() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest =
+            crate::persistence::aof_manifest::AofManifest::initialize_multi(tmp.path(), 2).unwrap();
+        let old_seq = manifest.seq;
+        let manifest = std::sync::Arc::new(parking_lot::Mutex::new(manifest));
+        let coord = PerShardRewriteCoord::new(manifest, old_seq, 2);
+
+        // Shard A: decrement (countdown 2 -> 1, non-terminal) then block.
+        let c_a = coord.clone();
+        let waiter = std::thread::spawn(move || {
+            c_a.shard_done();
+            c_a.await_outcome()
+        });
+
+        // Shard B fails: mark_failed + the terminal decrement (-> 0). Whichever
+        // of the two `shard_done` calls is terminal sees `failed` set (B sets it
+        // first) and publishes old_seq.
+        coord.mark_failed();
+        coord.shard_done();
+
+        let observed = waiter.join().expect("waiter must wake, not hang or panic");
+        assert_eq!(
+            observed, old_seq,
+            "aborted rewrite must publish old_seq to the cross-thread waiter"
+        );
+    }
+
+    /// Panic-safety / liveness: a fold that PANICS mid-flight (the OOM-unwind
+    /// hazard of issue #138) must not hang the other shards' writers at the
+    /// barrier. The `ShardDoneGuard`'s `Drop` must fire `mark_failed` +
+    /// `shard_done` on unwind so the countdown still closes and every waiter
+    /// wakes. Without the guard this test hangs forever (the panicking shard
+    /// never decrements).
+    #[test]
+    fn rewrite_fold_panic_releases_barrier_for_other_writers() {
+        use std::sync::atomic::Ordering;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest =
+            crate::persistence::aof_manifest::AofManifest::initialize_multi(tmp.path(), 2).unwrap();
+        let old_seq = manifest.seq;
+        let manifest = std::sync::Arc::new(parking_lot::Mutex::new(manifest));
+        let coord = PerShardRewriteCoord::new(manifest, old_seq, 2);
+
+        // Shard A folds, decrements, then blocks on the barrier in a thread.
+        let c_a = coord.clone();
+        let waiter = std::thread::spawn(move || {
+            c_a.shard_done();
+            c_a.await_outcome()
+        });
+
+        // Shard B "panics mid-fold": a ShardDoneGuard dropped during unwind. The
+        // guard's Drop must abort + decrement so A's barrier releases.
+        let c_b = coord.clone();
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = ShardDoneGuard::new(&c_b);
+            panic!("simulated OOM unwind during fold");
+        }));
+        assert!(panicked.is_err(), "the simulated fold must have panicked");
+
+        let observed = waiter
+            .join()
+            .expect("waiter must wake after the panicking shard's guard fires");
+        assert_eq!(
+            observed, old_seq,
+            "panic-aborted rewrite must publish old_seq, not hang"
+        );
+        assert!(
+            coord.failed.load(Ordering::Acquire),
+            "the dropped guard must have marked the rewrite failed"
         );
     }
 
@@ -2201,20 +2456,22 @@ pub async fn per_shard_aof_writer_task(
                                 let res = do_rewrite_per_shard(
                                     shard_id, &shard_dbs, &mut sf, &rx, &coord,
                                 );
-                                // On success `sf` points at the NEW incr (the fold
-                                // reopened it + already called `shard_done()`); on
-                                // error it is still the OLD incr (pre-reopen). Wrap
-                                // it back either way so the writer stays valid.
+                                // `sf` is left pointing at the committed generation
+                                // by the fold's internal barrier: NEW incr on
+                                // success, OLD incr on abort (phase-8 rollback) or
+                                // on a pre-reopen error. The fold's ShardDoneGuard
+                                // already performed `shard_done` for every exit, so
+                                // we MUST NOT decrement again here. Wrap `sf` back so
+                                // the writer stays valid either way.
                                 writer =
                                     tokio::io::BufWriter::new(tokio::fs::File::from_std(sf));
                                 if let Err(e) = res {
                                     error!(
                                         "F6 tokio per-shard rewrite: shard {} fold failed: {}. \
-                                         Aborting commit; old generation stays authoritative.",
+                                         Rewrite aborted by the fold guard; old generation \
+                                         stays authoritative.",
                                         shard_id, e
                                     );
-                                    coord.mark_failed();
-                                    coord.shard_done();
                                 }
                             }
                         }
@@ -2479,17 +2736,17 @@ pub async fn per_shard_aof_writer_task(
                     if let Err(e) =
                         do_rewrite_per_shard(shard_id, &shard_dbs, &mut file, &rx, &coord)
                     {
+                        // The fold's ShardDoneGuard already marked the rewrite
+                        // failed and decremented on this error exit (committing
+                        // new_seq with a shard missing its new base would break
+                        // recovery), so do NOT decrement again here. `file` is left
+                        // on the OLD incr (error exits are pre-reopen).
                         error!(
                             "F6 per-shard rewrite: shard {} fold failed: {}. \
-                             Aborting rewrite; old generation stays authoritative.",
+                             Rewrite aborted by the fold guard; old generation \
+                             stays authoritative.",
                             shard_id, e
                         );
-                        // Mark the whole rewrite failed so the final writer
-                        // aborts the commit (committing new_seq with a shard
-                        // missing its new base would break recovery), then
-                        // decrement so the countdown can still complete.
-                        coord.mark_failed();
-                        coord.shard_done();
                     }
                 }
                 Ok(AofMessage::Shutdown) | Err(_) => {
@@ -3106,6 +3363,13 @@ fn do_rewrite_per_shard(
     rx: &channel::MpscReceiver<AofMessage>,
     coord: &PerShardRewriteCoord,
 ) -> Result<(), MoonError> {
+    // Panic/early-error safety: guarantees `shard_done` runs on EVERY exit
+    // (success via `complete()`, `?`-error or panic-unwind via `Drop`). The
+    // phase-8 `await_outcome` barrier makes that a liveness requirement, so
+    // callers MUST NOT call `shard_done` after invoking this function — the
+    // guard owns the single decrement for all exits. See `ShardDoneGuard`.
+    let guard = ShardDoneGuard::new(coord);
+
     let sidx = shard_id as usize;
     let all_shards = shard_dbs.all_shard_dbs();
     if sidx >= all_shards.len() {
@@ -3188,8 +3452,37 @@ fn do_rewrite_per_shard(
         );
     }
 
-    // Phase 7: signal completion; the last writer commits + prunes.
-    coord.shard_done();
+    // Phase 7: signal completion; the last writer commits + prunes. `complete()`
+    // performs the single clean `shard_done` and disarms the guard's Drop.
+    guard.complete();
+
+    // Phase 8 (barrier-before-resume): block until the terminal writer publishes
+    // the committed generation, then make sure THIS writer's append file points
+    // at it. On the happy path committed == new_seq and *file already points at
+    // new_incr (phase 6) — nothing to do. On an abort/commit-failure the manifest
+    // kept old_seq and pruned our new_seq incr, so reopen *file onto old_seq's
+    // incr; otherwise we keep appending into a discarded generation that recovery
+    // ignores — silent data loss. Replaces the old "RESTART recommended" hazard.
+    let committed_seq = coord.await_outcome();
+    if committed_seq != coord.new_seq {
+        let committed_incr = coord
+            .manifest
+            .lock()
+            .shard_incr_path_seq(shard_id, committed_seq);
+        *file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&committed_incr)
+            .map_err(|e| AofError::Io {
+                path: committed_incr,
+                source: e,
+            })?;
+        warn!(
+            "F6 per-shard rewrite ABORTED: shard {} rolled its append file back to \
+             committed seq {} (no restart needed)",
+            shard_id, committed_seq
+        );
+    }
     Ok(())
 }
 
