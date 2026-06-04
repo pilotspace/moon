@@ -4,58 +4,146 @@ on:
   push:
     tags:
       - 'v[0-9]*'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run (skip gh release, docker push, homebrew bump)'
+        type: boolean
+        default: false
+      version:
+        description: 'Version override for dry_run (e.g. v0.0.0-dryrun)'
+        type: string
+        default: 'v0.0.0-dryrun'
 
 env:
   CARGO_TERM_COLOR: always
 
+# ─── Job DAG ────────────────────────────────────────────────────────────────
+# setup
+#   └─ prepare-console
+#        └─ build (7 Linux/macOS targets, matrix) + build-windows
+#             └─ package (deb/rpm, amd64+arm64)
+#                  └─ sign (SHA256SUMS + cosign over ALL artifacts)
+#                       └─ release
+#                            ├─ docker
+#                            └─ homebrew-tap
+
 jobs:
+  # ── 0. Centralise version (once) ─────────────────────────────────────────
+  setup:
+    name: Setup
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+    steps:
+      - name: Resolve version
+        id: ver
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          DISPATCH_VERSION: ${{ inputs.version }}
+          IS_DISPATCH: ${{ github.event_name == 'workflow_dispatch' }}
+        run: |
+          if [ "$IS_DISPATCH" = "true" ]; then
+            echo "version=${DISPATCH_VERSION}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${REF_NAME}" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ── 1. Build web console ──────────────────────────────────────────────────
+  prepare-console:
+    name: Build Console
+    needs: setup
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Install dependencies
+        working-directory: console
+        run: pnpm install --frozen-lockfile
+
+      - name: Build console
+        working-directory: console
+        run: pnpm build
+
+      - name: Verify console build
+        run: |
+          if [ ! -f console/dist/index.html ]; then
+            echo "::error::console/dist/index.html missing after pnpm build"
+            exit 1
+          fi
+
+      - name: Upload console-dist
+        uses: actions/upload-artifact@v4
+        with:
+          name: console-dist
+          path: console/dist/
+          retention-days: 1
+
+  # ── 2a. Build matrix (Linux / macOS targets) ──────────────────────────────
   build:
     name: Build ${{ matrix.name }}
+    needs: [setup, prepare-console]
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         include:
-          - name: linux-tokio
+          # 1) x86_64 Linux monoio
+          - name: x86_64-linux-monoio
             os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            features: runtime-tokio,jemalloc
-            binary: moon-linux-tokio
+            features: runtime-monoio,jemalloc,graph,text-index,console
 
-          - name: linux-monoio
+          # 2) x86_64 Linux tokio
+          - name: x86_64-linux-tokio
             os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            features: runtime-monoio,jemalloc
-            binary: moon-linux-monoio
+            features: runtime-tokio,jemalloc,graph,text-index,console
 
-          - name: linux-aarch64-tokio
+          # 3) aarch64 Linux tokio (cross)
+          - name: aarch64-linux-tokio
             os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
-            features: runtime-tokio,jemalloc
-            binary: moon-linux-aarch64-tokio
+            features: runtime-tokio,jemalloc,graph,text-index,console
             cross: true
 
-          - name: linux-musl-tokio
+          # 4) x86_64 Linux musl tokio
+          - name: x86_64-linux-musl
             os: ubuntu-latest
             target: x86_64-unknown-linux-musl
-            features: runtime-tokio,jemalloc
-            binary: moon-linux-musl-tokio
+            features: runtime-tokio,jemalloc,graph,text-index,console
             musl: true
 
-          - name: linux-aarch64-musl-tokio
+          # 5) aarch64 Linux musl tokio (cross)
+          - name: aarch64-linux-musl
             os: ubuntu-latest
             target: aarch64-unknown-linux-musl
-            features: runtime-tokio,jemalloc
-            binary: moon-linux-aarch64-musl-tokio
+            features: runtime-tokio,jemalloc,graph,text-index,console
             cross: true
 
-          - name: macos-tokio
+          # 6) aarch64 macOS tokio
+          - name: aarch64-macos
             os: macos-latest
             target: aarch64-apple-darwin
-            features: runtime-tokio,jemalloc
-            binary: moon-macos-tokio
+            features: runtime-tokio,jemalloc,graph,text-index,console
+
+          # 7) x86_64 macOS tokio (cross from arm64 runner, NO jemalloc)
+          - name: x86_64-macos
+            os: macos-latest
+            target: x86_64-apple-darwin
+            features: runtime-tokio,graph,text-index,console
+            add_target: true
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@1.94.1
         with:
@@ -63,7 +151,11 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Install cross (aarch64/musl-cross)
+      - name: Add cross target (macOS Intel)
+        if: matrix.add_target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Install cross (aarch64/musl builds)
         if: matrix.cross
         run: cargo install cross --locked
 
@@ -71,39 +163,183 @@ jobs:
         if: matrix.musl
         run: sudo apt-get update -qq && sudo apt-get install -y -qq musl-tools
 
+      - name: Download console-dist
+        uses: actions/download-artifact@v4
+        with:
+          name: console-dist
+          path: console/dist/
+
       - name: Build
         env:
           CROSS: ${{ matrix.cross }}
           FEATURES: ${{ matrix.features }}
           TARGET: ${{ matrix.target }}
-          BINARY: ${{ matrix.binary }}
         run: |
-          if [ "$CROSS" = "true" ]; then
-            cross build --release --no-default-features --features "$FEATURES" --target "$TARGET"
+          if [ "${CROSS}" = "true" ]; then
+            cross build --release --bin moon --no-default-features --features "$FEATURES" --target "$TARGET"
           else
-            cargo build --release --no-default-features --features "$FEATURES" --target "$TARGET"
+            cargo build --release --bin moon --no-default-features --features "$FEATURES" --target "$TARGET"
           fi
-          cp "target/$TARGET/release/moon" "$BINARY"
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v7
+      - name: Package archive
+        env:
+          VER: ${{ needs.setup.outputs.version }}
+          NAME: ${{ matrix.name }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          ARCHIVE_DIR="moon-${VER}-${NAME}"
+          ARTIFACT_NAME="${ARCHIVE_DIR}.tar.gz"
+          mkdir -p "$ARCHIVE_DIR"
+          cp "target/$TARGET/release/moon" "$ARCHIVE_DIR/moon"
+          cp LICENSE "$ARCHIVE_DIR/LICENSE"
+          cp README.md "$ARCHIVE_DIR/README.md"
+          # moon.conf.example provided by PR-3 (B2); include if present
+          if [ -f packaging/moon.conf.example ]; then
+            cp packaging/moon.conf.example "$ARCHIVE_DIR/moon.conf.example"
+          fi
+          tar czf "$ARTIFACT_NAME" "$ARCHIVE_DIR"
+          echo "ARTIFACT_NAME=$ARTIFACT_NAME" >> "$GITHUB_ENV"
+
+      - name: Upload archive
+        uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.binary }}
-          path: ${{ matrix.binary }}
+          name: ${{ env.ARTIFACT_NAME }}
+          path: ${{ env.ARTIFACT_NAME }}
           retention-days: 1
 
-  release:
-    name: Create Release
-    needs: build
+  # ── 2b. Build Windows ─────────────────────────────────────────────────────
+  build-windows:
+    name: Build x86_64-windows
+    needs: [setup, prepare-console]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@1.94.1
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Setup NASM (required by aws-lc-rs)
+        uses: ilammy/setup-nasm@v1
+
+      - name: Download console-dist
+        uses: actions/download-artifact@v4
+        with:
+          name: console-dist
+          path: console/dist/
+
+      - name: Build
+        shell: bash
+        run: |
+          cargo build --release --bin moon \
+            --no-default-features \
+            --features runtime-tokio,graph,text-index,console \
+            --target x86_64-pc-windows-msvc
+
+      - name: Package zip
+        env:
+          VER: ${{ needs.setup.outputs.version }}
+        shell: pwsh
+        run: |
+          $archiveDir = "moon-$env:VER-x86_64-windows"
+          New-Item -ItemType Directory -Path $archiveDir | Out-Null
+          Copy-Item "target\x86_64-pc-windows-msvc\release\moon.exe" "$archiveDir\moon.exe"
+          Copy-Item "LICENSE" "$archiveDir\LICENSE"
+          Copy-Item "README.md" "$archiveDir\README.md"
+          if (Test-Path "packaging\moon.conf.example") {
+            Copy-Item "packaging\moon.conf.example" "$archiveDir\moon.conf.example"
+          }
+          Compress-Archive -Path $archiveDir -DestinationPath "moon-$env:VER-x86_64-windows.zip"
+
+      - name: Upload zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: moon-${{ needs.setup.outputs.version }}-x86_64-windows.zip
+          path: moon-${{ needs.setup.outputs.version }}-x86_64-windows.zip
+          retention-days: 1
+
+  # ── 3. Build deb/rpm packages ─────────────────────────────────────────────
+  package:
+    name: Package ${{ matrix.arch }} (deb/rpm)
+    needs: [setup, build]
     runs-on: ubuntu-latest
     permissions:
-      contents: write
-      id-token: write
+      contents: read
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            tarball_name: x86_64-linux-tokio
+            nfpm_arch: amd64
+          - arch: arm64
+            tarball_name: aarch64-linux-tokio
+            nfpm_arch: arm64
+
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
+
+      - name: Download tokio tarball
+        uses: actions/download-artifact@v4
+        with:
+          name: moon-${{ needs.setup.outputs.version }}-${{ matrix.tarball_name }}.tar.gz
+          path: dist/
+
+      - name: Extract binary from tarball
+        env:
+          VER: ${{ needs.setup.outputs.version }}
+          SUFFIX: ${{ matrix.tarball_name }}
+        run: |
+          mkdir -p target/release
+          tar xzf "dist/moon-${VER}-${SUFFIX}.tar.gz" --strip-components=1 -C target/release/ 'moon-*/moon'
+          chmod +x target/release/moon
+
+      - name: Install nfpm
+        env:
+          NFPM_VERSION: "2.46.1"
+        run: |
+          curl -sfL "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz" \
+            | tar xz -C /usr/local/bin nfpm
+
+      - name: Build deb and rpm
+        env:
+          VERSION: ${{ needs.setup.outputs.version }}
+          ARCH: ${{ matrix.nfpm_arch }}
+        run: |
+          VER="${VERSION#v}"
+          cd packaging
+          nfpm package --packager deb --config nfpm.yml --target "../moon_${VER}_${ARCH}.deb"
+          nfpm package --packager rpm --config nfpm.yml --target "../moon-${VER}-1.${ARCH}.rpm"
+          echo "VER_STRIP=${VER}" >> "$GITHUB_ENV"
+
+      - name: Upload deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: moon_${{ env.VER_STRIP }}_${{ matrix.nfpm_arch }}.deb
+          path: moon_${{ env.VER_STRIP }}_${{ matrix.nfpm_arch }}.deb
+          retention-days: 1
+
+      - name: Upload rpm
+        uses: actions/upload-artifact@v4
+        with:
+          name: moon-${{ env.VER_STRIP }}-1.${{ matrix.nfpm_arch }}.rpm
+          path: moon-${{ env.VER_STRIP }}-1.${{ matrix.nfpm_arch }}.rpm
+          retention-days: 1
+
+  # ── 4. Sign all artifacts ─────────────────────────────────────────────────
+  sign:
+    name: Sign Artifacts
+    needs: [setup, build, build-windows, package]
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@v4
         with:
           path: artifacts/
           merge-multiple: true
@@ -116,63 +352,117 @@ jobs:
       - name: Generate SBOMs
         run: |
           # Per-variant SBOMs so each binary has an accurate dependency graph.
-          # cargo-cyclonedx v0.5+ writes to <override-filename>.json in the manifest dir.
-          cargo cyclonedx --format json --no-default-features --features runtime-tokio,jemalloc \
+          cargo cyclonedx --format json --no-default-features \
+            --features runtime-tokio,jemalloc,graph,text-index,console \
             --override-filename moon-sbom-tokio
-          cargo cyclonedx --format json --no-default-features --features runtime-monoio,jemalloc \
+          cargo cyclonedx --format json --no-default-features \
+            --features runtime-monoio,jemalloc,graph,text-index,console \
             --override-filename moon-sbom-monoio
-          # Combined superset SBOM for convenience (covers all variants).
+          # Combined superset SBOM.
           cargo cyclonedx --format json --override-filename moon-sbom
           mv moon-sbom-tokio.json artifacts/moon-sbom-tokio.json
           mv moon-sbom-monoio.json artifacts/moon-sbom-monoio.json
           mv moon-sbom.json artifacts/moon-sbom.json
 
-      - name: Generate checksums
+      - name: Generate SHA256SUMS
         run: |
           cd artifacts
-          sha256sum moon-* > SHA256SUMS.txt
+          # moon* captures both moon-... (tarballs/zip/rpm/sbom) and moon_... (deb)
+          sha256sum moon* > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
       - name: Install cosign
         uses: sigstore/cosign-installer@v3
 
-      - name: Sign artifacts
+      - name: Sign all artifacts (keyless)
         env:
           COSIGN_EXPERIMENTAL: "1"
         run: |
-          for f in artifacts/moon-*; do
+          # Sign every artifact; skip any pre-existing .sig files
+          for f in artifacts/moon*; do
+            [[ "$f" == *.sig ]] && continue
             cosign sign-blob --yes "$f" --output-signature "${f}.sig"
           done
+          # Also sign the checksum manifest
+          cosign sign-blob --yes artifacts/SHA256SUMS.txt \
+            --output-signature artifacts/SHA256SUMS.txt.sig
 
-      - name: Create release
+      - name: Upload signed artifacts bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: signed-release-artifacts
+          path: artifacts/
+          retention-days: 1
+
+  # ── 5. Create GitHub Release ──────────────────────────────────────────────
+  release:
+    name: Create Release
+    needs: [setup, sign]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download signed artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: signed-release-artifacts
+          path: artifacts/
+
+      - name: Create release (or dry-run echo)
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.ref_name }}
+          TAG: ${{ needs.setup.outputs.version }}
+          DRY_RUN: ${{ inputs.dry_run }}
         run: |
-          gh release create "$TAG" \
-            --title "moon $TAG" \
-            --generate-notes \
-            artifacts/moon-linux-* \
-            artifacts/moon-macos-* \
-            artifacts/moon-sbom*.json \
-            artifacts/SHA256SUMS.txt
+          # Determine prerelease flag: tag contains '-' (e.g. v0.2.0-rc.1)
+          PRERELEASE_FLAG=""
+          if echo "$TAG" | grep -q -- '-'; then
+            PRERELEASE_FLAG="--prerelease"
+          fi
 
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "DRY RUN — would run:"
+            echo "  gh release create $TAG $PRERELEASE_FLAG --title 'moon $TAG' --generate-notes \\"
+            echo "    artifacts/moon-* artifacts/moon_* artifacts/SHA256SUMS* artifacts/moon-sbom*.json"
+          else
+            gh release create "$TAG" \
+              $PRERELEASE_FLAG \
+              --title "moon $TAG" \
+              --generate-notes \
+              artifacts/moon-* \
+              artifacts/moon_* \
+              artifacts/SHA256SUMS.txt \
+              artifacts/SHA256SUMS.txt.sig \
+              artifacts/moon-sbom*.json
+          fi
+
+  # ── 6. Docker image ───────────────────────────────────────────────────────
   docker:
     name: Docker Image
-    needs: build
+    needs: [setup, release]
     runs-on: ubuntu-latest
     permissions:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
 
-      - name: Download Linux artifacts
-        uses: actions/download-artifact@v8
+      - name: Download signed artifacts
+        uses: actions/download-artifact@v4
         with:
-          pattern: moon-linux-*
+          name: signed-release-artifacts
           path: artifacts/
-          merge-multiple: true
+
+      - name: Extract Linux binaries for Docker
+        env:
+          VER: ${{ needs.setup.outputs.version }}
+        run: |
+          mkdir -p docker-bin/amd64 docker-bin/arm64
+          tar xzf "artifacts/moon-${VER}-x86_64-linux-monoio.tar.gz" \
+            --strip-components=1 -C docker-bin/amd64/ 'moon-*/moon'
+          tar xzf "artifacts/moon-${VER}-aarch64-linux-tokio.tar.gz" \
+            --strip-components=1 -C docker-bin/arm64/ 'moon-*/moon'
+          chmod +x docker-bin/amd64/moon docker-bin/arm64/moon
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
@@ -184,17 +474,17 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract version
+      - name: Extract numeric version
         id: version
         env:
-          REF_NAME: ${{ github.ref_name }}
-        run: echo "version=${REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          VER: ${{ needs.setup.outputs.version }}
+        run: echo "version=${VER#v}" >> "$GITHUB_OUTPUT"
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
         with:
           context: .
-          push: true
+          push: ${{ inputs.dry_run != true }}
           tags: |
             ghcr.io/${{ github.repository }}:${{ steps.version.outputs.version }}
             ghcr.io/${{ github.repository }}:latest
@@ -203,68 +493,21 @@ jobs:
             org.opencontainers.image.version=${{ steps.version.outputs.version }}
             org.opencontainers.image.revision=${{ github.sha }}
 
-  package:
-    name: Build Packages (deb/rpm)
-    needs: [build, release]
+  # ── 7. Homebrew tap bump ───────────────────────────────────────────────────
+  homebrew-tap:
+    name: Bump Homebrew Tap
+    needs: [setup, sign, release]
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    strategy:
-      matrix:
-        include:
-          - arch: amd64
-            binary: moon-linux-tokio
-            nfpm_arch: amd64
-          - arch: arm64
-            binary: moon-linux-aarch64-tokio
-            nfpm_arch: arm64
+    # Skip on prerelease tags (contains '-') and dry_run
+    if: >-
+      !contains(needs.setup.outputs.version, '-') &&
+      inputs.dry_run != true
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
 
-      - name: Download binary
-        uses: actions/download-artifact@v8
-        with:
-          name: ${{ matrix.binary }}
-          path: target/release/
-
-      - name: Prepare binary
-        run: |
-          mv "target/release/${{ matrix.binary }}" target/release/moon
-          chmod +x target/release/moon
-
-      - name: Install nfpm
+      - name: Bump homebrew formula
         env:
-          NFPM_VERSION: "2.46.1"
-        run: |
-          curl -sfL "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_x86_64.tar.gz" | tar xz -C /usr/local/bin nfpm
-
-      - name: Build deb
-        env:
-          VERSION: ${{ github.ref_name }}
-          ARCH: ${{ matrix.nfpm_arch }}
-        run: |
-          export VERSION="${VERSION#v}"
-          cd packaging
-          nfpm package --packager deb --config nfpm.yml --target "../moon_${VERSION}_${ARCH}.deb"
-
-      - name: Build rpm
-        env:
-          VERSION: ${{ github.ref_name }}
-          ARCH: ${{ matrix.nfpm_arch }}
-        run: |
-          export VERSION="${VERSION#v}"
-          cd packaging
-          nfpm package --packager rpm --config nfpm.yml --target "../moon-${VERSION}-1.${ARCH}.rpm"
-
-      - name: Upload packages to release
-        env:
+          TAG: ${{ needs.setup.outputs.version }}
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.ref_name }}
-          ARCH: ${{ matrix.nfpm_arch }}
-          VERSION: ${{ github.ref_name }}
-        run: |
-          VER="${VERSION#v}"
-          gh release upload "$TAG" \
-            "moon_${VER}_${ARCH}.deb" \
-            "moon-${VER}-1.${ARCH}.rpm" \
-            --clobber
+        run: bash packaging/bump-homebrew.sh
