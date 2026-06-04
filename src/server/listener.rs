@@ -340,13 +340,8 @@ pub async fn run_sharded(
 
     let mut next_shard: usize = 0;
 
-    // Ctrl+C handler
-    let shutdown_signal = shutdown.clone();
-    tokio::spawn(async move {
-        tokio::signal::ctrl_c().await.ok();
-        info!("Shutdown signal received");
-        shutdown_signal.cancel();
-    });
+    // Note: SIGINT/Ctrl+C and SIGTERM handlers are installed centrally in
+    // main.rs (before shard/listener startup). This loop polls shutdown.cancelled().
 
     // Spawn TLS listener if tls_port > 0
     if config.tls_port > 0 {
@@ -488,14 +483,8 @@ pub async fn run_sharded(
 
     let mut next_shard: usize = 0;
 
-    // Ctrl+C handler -- ctrlc crate sets handler on OS thread, signals our token
-    let shutdown_signal = shutdown.clone();
-    #[allow(clippy::expect_used)] // Startup: no recovery possible without signal handler
-    ctrlc::set_handler(move || {
-        info!("Shutdown signal received");
-        shutdown_signal.cancel();
-    })
-    .expect("failed to set Ctrl+C handler");
+    // Note: SIGINT/Ctrl+C and SIGTERM handlers are installed centrally in
+    // main.rs (before shard/listener startup). This loop polls shutdown.cancelled().
 
     // Spawn TLS listener if tls_port > 0
     let tls_listener = if config.tls_port > 0 {
