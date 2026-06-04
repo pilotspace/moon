@@ -38,6 +38,11 @@ use super::expiration;
 ///
 /// Binds to the configured address, spawns a task per connection, and shuts down
 /// gracefully on Ctrl+C (SIGINT).
+///
+/// NOTE: this is a self-contained convenience entry point (not used by the moon
+/// binary — `main.rs` routes through `run_sharded` and installs centralized
+/// SIGINT/SIGTERM handlers itself). The Ctrl+C handler below belongs to *this*
+/// standalone API only; do not add signal handling for the binary here.
 #[cfg(feature = "runtime-tokio")]
 pub async fn run(config: ServerConfig) -> anyhow::Result<()> {
     let token = CancellationToken::new();
