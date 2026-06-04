@@ -27,6 +27,11 @@ pub struct ExpandedResult {
     pub vec_score: f32,
     /// Graph distance in hops from the nearest seed node.
     pub graph_hops: u32,
+    /// Wall-clock creation stamp (Unix millis) of the edge that discovered
+    /// this node (the last hop on the shortest discovery path). 0 = unknown
+    /// (pre-upgrade edge or CSR segment without per-edge stamps); decay
+    /// treats 0 as neutral.
+    pub edge_created_ms: u64,
 }
 
 /// Build a reverse map from NodeKey -> Bytes by inverting NamedGraph.key_to_node.
@@ -65,8 +70,8 @@ pub fn expand_results_via_graph(
     // Track seed keys for dedup (seeds are excluded from results).
     let seed_set: HashSet<&[u8]> = seed_keys.iter().map(|(k, _)| k.as_ref()).collect();
 
-    // Track minimum hops per discovered key across all seeds.
-    let mut discovered: HashMap<Bytes, u32> = HashMap::new();
+    // Track (min hops, discovery-edge created_ms) per key across all seeds.
+    let mut discovered: HashMap<Bytes, (u32, u64)> = HashMap::new();
 
     // Load immutable CSR segments for the merge reader.
     let seg_guard = graph.segments.load();
@@ -95,7 +100,7 @@ pub fn expand_results_via_graph(
         };
 
         // Process BFS results: skip the seed node (depth 0), map NodeKeys to Redis keys.
-        for &(visited_node, hop_depth, _) in &result.visited {
+        for &(visited_node, hop_depth, edge_used) in &result.visited {
             if hop_depth == 0 {
                 continue; // skip the seed itself
             }
@@ -110,10 +115,13 @@ pub fn expand_results_via_graph(
                 continue;
             }
 
-            // Track minimum hop distance across all seeds.
-            let entry = discovered.entry(redis_key.clone()).or_insert(u32::MAX);
-            if hop_depth < *entry {
-                *entry = hop_depth;
+            // Track minimum hop distance across all seeds, carrying the
+            // wall-clock stamp of the edge that discovered the node on that
+            // shortest path (for FT.NAVIGATE DECAY re-ranking).
+            let edge_ms = edge_used.map(|e| e.created_ms).unwrap_or(0);
+            let entry = discovered.entry(redis_key.clone()).or_insert((u32::MAX, 0));
+            if hop_depth < entry.0 {
+                *entry = (hop_depth, edge_ms);
             }
         }
     }
@@ -121,10 +129,11 @@ pub fn expand_results_via_graph(
     // Build results sorted by graph_hops ascending.
     let mut results: Vec<ExpandedResult> = discovered
         .into_iter()
-        .map(|(key, hops)| ExpandedResult {
+        .map(|(key, (hops, edge_created_ms))| ExpandedResult {
             key,
             vec_score: 0.0,
             graph_hops: hops,
+            edge_created_ms,
         })
         .collect();
     results.sort_by_key(|r| r.graph_hops);
@@ -155,9 +164,47 @@ mod tests {
             key: Bytes::from_static(b"doc:1"),
             vec_score: 0.95,
             graph_hops: 2,
+            edge_created_ms: 0,
         };
         let r2 = r.clone();
         assert_eq!(r2.graph_hops, 2);
         assert!(format!("{:?}", r2).contains("doc:1"));
+    }
+
+    #[test]
+    fn test_expand_carries_discovery_edge_created_ms() {
+        // seed -> n1 over an edge created at t=42s: the expanded result for
+        // n1 must surface that edge's wall-clock stamp so FT.NAVIGATE DECAY
+        // can age it.
+        use smallvec::smallvec;
+
+        let mut gs = crate::graph::store::GraphStore::new();
+        gs.create_graph(Bytes::from_static(b"g"), 64_000, 0)
+            .expect("create");
+        let graph = gs.get_graph_mut(b"g").expect("graph");
+
+        let seed = graph.write_buf.add_node(smallvec![0], smallvec![], None, 1);
+        let n1 = graph.write_buf.add_node(smallvec![0], smallvec![], None, 1);
+
+        crate::storage::entry::tl_clock_set(42, 42_000);
+        graph
+            .write_buf
+            .add_edge(seed, n1, 1, 1.0, None, 2)
+            .expect("edge");
+        crate::storage::entry::tl_clock_set(0, 0);
+
+        graph.register_key(Bytes::from_static(b"doc:seed"), seed);
+        graph.register_key(Bytes::from_static(b"doc:n1"), n1);
+
+        let graph = gs.get_graph(b"g").expect("graph");
+        let seeds = vec![(Bytes::from_static(b"doc:seed"), 0.1f32)];
+        let results = expand_results_via_graph(graph, &seeds, 2);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].key.as_ref(), b"doc:n1");
+        assert_eq!(
+            results[0].edge_created_ms, 42_000,
+            "expansion must carry the discovery edge's created_ms"
+        );
     }
 }

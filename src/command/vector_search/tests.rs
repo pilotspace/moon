@@ -1771,6 +1771,7 @@ mod graph_expand_tests {
             key: Bytes::from_static(b"doc:neighbor"),
             vec_score: 0.0,
             graph_hops: 2,
+            edge_created_ms: 0,
         }];
         let result = build_combined_response(&knn, &expanded);
         if let Frame::Array(items) = &result {
