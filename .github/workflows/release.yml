@@ -292,7 +292,10 @@ jobs:
           SUFFIX: ${{ matrix.tarball_name }}
         run: |
           mkdir -p target/release
-          tar xzf "dist/moon-${VER}-${SUFFIX}.tar.gz" --strip-components=1 -C target/release/ 'moon-*/moon'
+          # Extract all members with --strip-components=1 (avoids GNU tar
+          # wildcard-matching quirks). Lands moon + LICENSE + README in
+          # target/release/; nfpm.yml references ../target/release/moon.
+          tar xzf "dist/moon-${VER}-${SUFFIX}.tar.gz" --strip-components=1 -C target/release/
           chmod +x target/release/moon
 
       - name: Install nfpm
@@ -425,6 +428,9 @@ jobs:
             echo "  gh release create $TAG $PRERELEASE_FLAG --title 'moon $TAG' --generate-notes \\"
             echo "    artifacts/moon-* artifacts/moon_* artifacts/SHA256SUMS* artifacts/moon-sbom*.json"
           else
+            # artifacts/moon-* covers tarballs, zip, rpm, sbom-*.json, *.sig
+            # artifacts/moon_* covers deb (underscore naming from nfpm)
+            # SHA256SUMS.txt / SHA256SUMS.txt.sig are not moon-prefixed: explicit
             gh release create "$TAG" \
               $PRERELEASE_FLAG \
               --title "moon $TAG" \
@@ -432,11 +438,12 @@ jobs:
               artifacts/moon-* \
               artifacts/moon_* \
               artifacts/SHA256SUMS.txt \
-              artifacts/SHA256SUMS.txt.sig \
-              artifacts/moon-sbom*.json
+              artifacts/SHA256SUMS.txt.sig
           fi
 
   # ── 6. Docker image ───────────────────────────────────────────────────────
+  # The Dockerfile is a full source build (cargo-chef multi-stage); it does
+  # not consume prebuilt binaries. context: . supplies the full source tree.
   docker:
     name: Docker Image
     needs: [setup, release]
@@ -446,23 +453,6 @@ jobs:
       packages: write
     steps:
       - uses: actions/checkout@v4
-
-      - name: Download signed artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: signed-release-artifacts
-          path: artifacts/
-
-      - name: Extract Linux binaries for Docker
-        env:
-          VER: ${{ needs.setup.outputs.version }}
-        run: |
-          mkdir -p docker-bin/amd64 docker-bin/arm64
-          tar xzf "artifacts/moon-${VER}-x86_64-linux-monoio.tar.gz" \
-            --strip-components=1 -C docker-bin/amd64/ 'moon-*/moon'
-          tar xzf "artifacts/moon-${VER}-aarch64-linux-tokio.tar.gz" \
-            --strip-components=1 -C docker-bin/arm64/ 'moon-*/moon'
-          chmod +x docker-bin/amd64/moon docker-bin/arm64/moon
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
