@@ -272,7 +272,13 @@ pub(crate) fn spawn_tokio_connection(
 ///
 /// TLS connections cannot be migrated because TLS session state lives in userspace and
 /// cannot be reconstructed from a raw FD. Only plain TCP connections should be migrated.
-#[cfg(feature = "runtime-tokio")]
+// `unix`-gated alongside `runtime-tokio`: the signature takes a
+// `std::os::unix::io::RawFd` and reconstructs the socket via `from_raw_fd`,
+// both of which only exist on Unix. Moon targets Linux + macOS (both Unix), so
+// on every supported build `unix` is always true; the extra predicate just makes
+// the platform coupling explicit (CodeRabbit PR #144). Full non-Unix support
+// would also require gating `MigrateConnectionPayload.fd` — out of scope.
+#[cfg(all(feature = "runtime-tokio", unix))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_migrated_tokio_connection(
     fd: std::os::unix::io::RawFd,
@@ -749,7 +755,10 @@ pub(crate) fn spawn_monoio_connection(
 /// # Limitations
 ///
 /// TLS connections cannot be migrated (TLS session state is in userspace).
-#[cfg(feature = "runtime-monoio")]
+// `unix`-gated alongside `runtime-monoio` for the same reason as the tokio twin
+// above: the `RawFd` signature + `from_raw_fd` are Unix-only. Always true on
+// supported targets (Linux + macOS).
+#[cfg(all(feature = "runtime-monoio", unix))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_migrated_monoio_connection(
     fd: std::os::unix::io::RawFd,
