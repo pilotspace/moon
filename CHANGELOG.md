@@ -10,6 +10,34 @@ The v0.2 enterprise beachhead. Built additively on per-shard WAL v3 + the
 dual-root manifest; no changes to the KV hot path, MVCC, page format, or
 transaction layer.
 
+### Fixed — CodeRabbit PR #136 durability follow-ups + decomposition + test isolation (PR #144)
+
+Closes the 8 CodeRabbit findings left open after PR #136, plus two PR #144-review
+Majors, oversized-file decomposition, and a parallel-test flake. No production
+hot-path behaviour change.
+
+- **Disk-offload spill (data-loss fixes):** block instead of dropping spill
+  completions; salvage inline-batch spill failures per-entry rather than
+  wholesale; preserve spill context across tokio connection migration; recover
+  the cold tier under `appendonly=no`.
+- **Per-shard AOF rewrite robustness:** clear the rewrite flag when fan-out
+  fails partway; roll per-shard rewrite writers back to the committed generation
+  on abort (barrier-before-resume + panic-safe `ShardDoneGuard`); ack drained
+  `AppendSync` only after the boundary fsync (issue #140 ordering).
+- **Async-spill eviction:** corrected a stale doc comment, removed the dead
+  remove-first eviction path, and added a regression test locking the fail-safe
+  send-before-remove ordering (a full spill channel keeps the victim resident —
+  no data loss).
+- **Platform hygiene:** gate the migrated-connection spawn fns behind
+  `cfg(all(..., unix))` to match their `RawFd` usage.
+- **File decomposition (1500-line cap):** split `aof_manifest.rs` (3058 →
+  mod/shard_replay/shard_rewrite) and `aof.rs` (4379 → mod/pool/writer_task/
+  rewrite); pure code relocation, verified line-exact on both runtimes.
+- **Test isolation:** fixed the `VECTOR_INDEXES` counter flake — the process-
+  global metrics counter is now guarded by an `RwLock` (delta-reader tests take
+  `write()`, mutator tests take `read()`), making the index-count delta
+  assertions deterministic under the parallel test harness.
+
 ### Persistence — Per-shard AOF migration complete (PR #129)
 
 Closes the P0 multi-shard AOF data-loss bug (~50% loss on SIGKILL with
