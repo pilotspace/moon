@@ -61,6 +61,22 @@ fn main() -> anyhow::Result<()> {
     // at process start, so the env var must be set before exec.
     maybe_respawn_with_arena_override()?;
 
+    // Block SIGTERM in the main thread BEFORE any child threads are spawned
+    // (TLS reload thread, Prometheus admin thread, ctrlc internal thread,
+    // shard threads). All child threads inherit the blocked mask, so SIGTERM
+    // is delivered only to our dedicated `sigterm-handler` thread via sigwait(2).
+    // See the "Signal handler setup" block below for the handler threads.
+    #[cfg(unix)]
+    // SAFETY: sigset_t is a plain C struct zero-initialised to the empty set.
+    // sigemptyset, sigaddset, and pthread_sigmask are async-signal-safe POSIX
+    // functions. We hold no locks during the mask modification.
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGTERM);
+        libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -354,6 +370,85 @@ fn main() -> anyhow::Result<()> {
 
     // Shared cancellation token for graceful shutdown
     let cancel_token = CancellationToken::new();
+
+    // ── Signal handler setup ──────────────────────────────────────────────────
+    //
+    // SIGTERM was already blocked at the very top of main() (before any thread
+    // is spawned), so all child threads — TLS reload, Prometheus/admin, ctrlc's
+    // internal thread, shard threads — inherit the blocked mask. The kernel
+    // therefore cannot deliver SIGTERM to any of those threads; it queues until
+    // our dedicated `sigterm-handler` thread below consumes it via sigwait(2).
+    //
+    // Steps here:
+    // 1. Install the SIGINT/Ctrl+C handler (ctrlc spawns its thread here; it
+    //    inherits the already-blocked SIGTERM mask).
+    // 2. Spawn the dedicated SIGTERM handler thread (also inherits the mask).
+
+    // Step 1: Centralized SIGINT/Ctrl+C handler.
+    //
+    // Installed here in main so BOTH runtimes share a single handler.
+    // The listener no longer installs its own ctrl_c handler; it only polls
+    // `shutdown.cancelled()`.
+    {
+        let sigint_token = cancel_token.clone();
+        ctrlc::set_handler(move || {
+            info!("Shutdown signal received");
+            sigint_token.cancel();
+        })
+        .map_err(|e| anyhow::anyhow!("failed to set Ctrl+C handler: {e}"))?;
+    }
+
+    // Step 2: SIGTERM graceful shutdown handler (Unix only).
+    //
+    // ctrlc (without the `termination` feature) handles SIGINT/Ctrl+C only.
+    // systemd/launchd send SIGTERM on `systemctl stop` / `launchctl stop`,
+    // which was previously unhandled — the kernel delivered the default action
+    // (non-zero exit, AOF not flushed).
+    //
+    // We use a dedicated OS thread with sigwait(2) so that:
+    //   1. SIGHUP is NOT touched (avoids clobbering the TLS cert-reload handler).
+    //   2. The handler works on both `runtime-tokio` and `runtime-monoio`.
+    //   3. Signal safety: cancel() is backed by atomics — safe from any context.
+    //
+    // SIGTERM was blocked at the top of main() before any threads were spawned,
+    // so every thread (including ctrlc's thread and all shard threads) has it
+    // blocked. The sigterm-handler thread keeps SIGTERM blocked and consumes it
+    // via sigwait.
+    #[cfg(unix)]
+    {
+        let sigterm_token = cancel_token.clone();
+        std::thread::Builder::new()
+            .name("sigterm-handler".to_string())
+            .spawn(move || {
+                // SAFETY: sigset_t is zero-initialised; sigemptyset/sigaddset/sigwait
+                // are async-signal-safe POSIX functions. SIGTERM is already blocked
+                // in this thread (inherited from main), which is the precondition for
+                // sigwait(2) — sigwait atomically removes a blocked signal from the
+                // pending set and returns its number.
+                unsafe {
+                    let mut set: libc::sigset_t = std::mem::zeroed();
+                    libc::sigemptyset(&mut set);
+                    libc::sigaddset(&mut set, libc::SIGTERM);
+                    loop {
+                        let mut sig: libc::c_int = 0;
+                        let ret = libc::sigwait(&set, &mut sig);
+                        if ret != 0 {
+                            tracing::error!(
+                                "sigwait(SIGTERM) failed: {}",
+                                std::io::Error::from_raw_os_error(ret)
+                            );
+                            continue;
+                        }
+                        if sig == libc::SIGTERM {
+                            info!("Shutdown signal received");
+                            sigterm_token.cancel();
+                            return;
+                        }
+                    }
+                }
+            })
+            .map_err(|e| anyhow::anyhow!("failed to spawn SIGTERM handler thread: {e}"))?;
+    }
 
     // Collect connection senders for the listener before spawning shard threads
     let conn_txs: Vec<_> = (0..num_shards).map(|i| mesh.conn_tx(i)).collect();
