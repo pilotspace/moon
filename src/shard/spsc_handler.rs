@@ -57,7 +57,7 @@ pub(crate) fn drain_spsc_shared(
     script_cache: &Rc<RefCell<crate::scripting::ScriptCache>>,
     cached_clock: &CachedClock,
     pending_migrations: &mut Vec<(
-        std::os::unix::io::RawFd,
+        crate::shard::dispatch::RawSocketFd,
         crate::server::conn::affinity::MigratedConnectionState,
     )>,
     vector_store: &mut VectorStore,

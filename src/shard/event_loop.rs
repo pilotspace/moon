@@ -757,7 +757,7 @@ impl super::Shard {
 
         // Pending FD migrations collected from SPSC drain (spawn wired in Plan 50-02).
         let mut pending_migrations: Vec<(
-            std::os::unix::io::RawFd,
+            crate::shard::dispatch::RawSocketFd,
             crate::server::conn::affinity::MigratedConnectionState,
         )> = Vec::new();
 
@@ -1229,12 +1229,13 @@ impl super::Shard {
                         wal_v3_writer.as_ref().map(|w| w.current_lsn().saturating_sub(1)).unwrap_or(0),
                     );
                     for (fd, state) in pending_migrations.drain(..) {
-                        tracing::info!(
-                            "Shard {}: accepting migrated connection (fd={}, client_id={}, from={})",
-                            shard_id, fd, state.client_id, state.peer_addr
-                        );
-                        #[cfg(all(feature = "runtime-tokio", unix))]
+                        #[cfg(unix)]
                         {
+                            tracing::info!(
+                                "Shard {}: accepting migrated connection (fd={}, client_id={}, from={})",
+                                shard_id, fd, state.client_id, state.peer_addr
+                            );
+                            #[cfg(feature = "runtime-tokio")]
                             conn_accept::spawn_migrated_tokio_connection(
                                 fd, state,
                                 &shard_databases, &dispatch_tx, &pubsub_arc, &blocking_rc,
@@ -1246,9 +1247,7 @@ impl super::Shard {
                                 shard_id, num_shards, config_port,
                                 &spill_sender, &spill_file_id, &disk_offload_dir,
                             );
-                        }
-                        #[cfg(all(feature = "runtime-monoio", unix))]
-                        {
+                            #[cfg(feature = "runtime-monoio")]
                             conn_accept::spawn_migrated_monoio_connection(
                                 fd, state,
                                 &shard_databases, &dispatch_tx, &pubsub_arc, &blocking_rc,
@@ -1260,6 +1259,15 @@ impl super::Shard {
                                 shard_id, num_shards, config_port,
                                 &pending_wakers,
                                 &spill_sender, &spill_file_id, &disk_offload_dir,
+                            );
+                        }
+                        #[cfg(not(unix))]
+                        {
+                            let _ = (fd, state);
+                            tracing::debug!(
+                                "Shard {}: connection migration not supported on this platform; \
+                                 connection stays on originating shard",
+                                shard_id
                             );
                         }
                     }
@@ -1329,12 +1337,13 @@ impl super::Shard {
                         wal_v3_writer.as_ref().map(|w| w.current_lsn().saturating_sub(1)).unwrap_or(0),
                     );
                     for (fd, state) in pending_migrations.drain(..) {
-                        tracing::info!(
-                            "Shard {}: accepting migrated connection (fd={}, client_id={}, from={})",
-                            shard_id, fd, state.client_id, state.peer_addr
-                        );
-                        #[cfg(all(feature = "runtime-tokio", unix))]
+                        #[cfg(unix)]
                         {
+                            tracing::info!(
+                                "Shard {}: accepting migrated connection (fd={}, client_id={}, from={})",
+                                shard_id, fd, state.client_id, state.peer_addr
+                            );
+                            #[cfg(feature = "runtime-tokio")]
                             conn_accept::spawn_migrated_tokio_connection(
                                 fd, state,
                                 &shard_databases, &dispatch_tx, &pubsub_arc, &blocking_rc,
@@ -1346,9 +1355,7 @@ impl super::Shard {
                                 shard_id, num_shards, config_port,
                                 &spill_sender, &spill_file_id, &disk_offload_dir,
                             );
-                        }
-                        #[cfg(all(feature = "runtime-monoio", unix))]
-                        {
+                            #[cfg(feature = "runtime-monoio")]
                             conn_accept::spawn_migrated_monoio_connection(
                                 fd, state,
                                 &shard_databases, &dispatch_tx, &pubsub_arc, &blocking_rc,
@@ -1360,6 +1367,15 @@ impl super::Shard {
                                 shard_id, num_shards, config_port,
                                 &pending_wakers,
                                 &spill_sender, &spill_file_id, &disk_offload_dir,
+                            );
+                        }
+                        #[cfg(not(unix))]
+                        {
+                            let _ = (fd, state);
+                            tracing::debug!(
+                                "Shard {}: connection migration not supported on this platform; \
+                                 connection stays on originating shard",
+                                shard_id
                             );
                         }
                     }
@@ -1970,49 +1986,57 @@ impl super::Shard {
                         .unwrap_or(0),
                 );
                 for (fd, state) in pending_migrations.drain(..) {
-                    tracing::info!(
-                        "Shard {}: accepting migrated connection (fd={}, client_id={}, from={})",
-                        shard_id,
-                        fd,
-                        state.client_id,
-                        state.peer_addr
-                    );
-                    // `unix`-gated to match `spawn_migrated_monoio_connection`'s
-                    // Unix-only `RawFd` signature (CodeRabbit PR #144). Always
-                    // compiled on supported targets (Linux + macOS).
                     #[cfg(unix)]
-                    conn_accept::spawn_migrated_monoio_connection(
-                        fd,
-                        state,
-                        &shard_databases,
-                        &dispatch_tx,
-                        &pubsub_arc,
-                        &blocking_rc,
-                        &shutdown,
-                        &aof_pool,
-                        &tracking_rc,
-                        &lua_rc,
-                        &script_cache_rc,
-                        &acl_table,
-                        &runtime_config,
-                        &server_config,
-                        &all_notifiers,
-                        &snapshot_trigger_tx,
-                        &repl_state,
-                        &cluster_state,
-                        &cached_clock,
-                        &remote_sub_map_arc,
-                        &all_pubsub_registries,
-                        &all_remote_sub_maps,
-                        &affinity_tracker,
-                        shard_id,
-                        num_shards,
-                        config_port,
-                        &pending_wakers,
-                        &spill_sender,
-                        &spill_file_id,
-                        &disk_offload_dir,
-                    );
+                    {
+                        tracing::info!(
+                            "Shard {}: accepting migrated connection (fd={}, client_id={}, from={})",
+                            shard_id,
+                            fd,
+                            state.client_id,
+                            state.peer_addr
+                        );
+                        conn_accept::spawn_migrated_monoio_connection(
+                            fd,
+                            state,
+                            &shard_databases,
+                            &dispatch_tx,
+                            &pubsub_arc,
+                            &blocking_rc,
+                            &shutdown,
+                            &aof_pool,
+                            &tracking_rc,
+                            &lua_rc,
+                            &script_cache_rc,
+                            &acl_table,
+                            &runtime_config,
+                            &server_config,
+                            &all_notifiers,
+                            &snapshot_trigger_tx,
+                            &repl_state,
+                            &cluster_state,
+                            &cached_clock,
+                            &remote_sub_map_arc,
+                            &all_pubsub_registries,
+                            &all_remote_sub_maps,
+                            &affinity_tracker,
+                            shard_id,
+                            num_shards,
+                            config_port,
+                            &pending_wakers,
+                            &spill_sender,
+                            &spill_file_id,
+                            &disk_offload_dir,
+                        );
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        let _ = (fd, state);
+                        tracing::debug!(
+                            "Shard {}: connection migration not supported on this platform; \
+                             connection stays on originating shard",
+                            shard_id
+                        );
+                    }
                 }
 
                 persistence_tick::check_auto_save_trigger(
