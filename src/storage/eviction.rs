@@ -983,6 +983,62 @@ mod tests {
         assert_eq!(next_file_id, 2);
     }
 
+    /// Fail-safe send-before-remove: when the async-spill request channel is
+    /// FULL, eviction must NOT remove the victim from the hot tier (no data
+    /// loss) and must surface OOM rather than pretend success. The live path
+    /// (`evict_one_async_spill`) `try_send`s the `SpillRequest` BEFORE
+    /// `db.remove`, so a failed send leaves the key resident for retry on the
+    /// next eviction tick. This regression guard locks that ordering — the exact
+    /// request-side data-loss scenario CodeRabbit raised on PR #144 (verified
+    /// stale against the live code; this test keeps it that way).
+    #[test]
+    fn async_spill_full_channel_keeps_victim_in_ram_no_data_loss() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shard_dir = tmp.path();
+        let mut next_file_id = 1u64;
+
+        let mut db = Database::new();
+        db.set_string(Bytes::from_static(b"k1"), Bytes::from_static(b"v1"));
+
+        // Per-shard budget of 1 byte forces an eviction attempt for k1.
+        let config = make_config(1, "allkeys-lru");
+
+        // bounded(1) PRE-FILLED so the eviction's `try_send` observes a FULL
+        // channel (the reviewer's backpressure scenario) rather than a
+        // disconnect — both fail `try_send`, but full is the precise concern.
+        let (tx, _rx) = flume::bounded::<SpillRequest>(1);
+        tx.try_send(SpillRequest {
+            key: Bytes::from_static(b"filler"),
+            db_index: 0,
+            value_bytes: Bytes::from_static(b"x"),
+            value_type: ValueType::String,
+            flags: 0,
+            ttl_ms: None,
+            file_id: 0,
+            shard_dir: shard_dir.to_path_buf(),
+        })
+        .expect("filler occupies the single channel slot");
+
+        let result =
+            try_evict_if_needed_async_spill(&mut db, &config, &tx, shard_dir, &mut next_file_id, 0);
+
+        // Could not enqueue the spill → OOM surfaced, never a false success.
+        assert!(
+            result.is_err(),
+            "a full spill channel must surface OOM, never silently succeed"
+        );
+        // CRUCIAL: the victim is still resident — no acknowledged-write data loss.
+        assert_eq!(
+            db.len(),
+            1,
+            "victim must NOT be removed from RAM when the spill send fails"
+        );
+        assert!(
+            db.data().get(&b"k1"[..]).is_some(),
+            "k1 must remain in the hot tier for retry on the next eviction tick"
+        );
+    }
+
     #[test]
     fn test_evict_without_spill_unchanged() {
         let mut db = Database::new();
