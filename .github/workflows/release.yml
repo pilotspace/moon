@@ -310,7 +310,13 @@ jobs:
           VERSION: ${{ needs.setup.outputs.version }}
           ARCH: ${{ matrix.nfpm_arch }}
         run: |
-          VER="${VERSION#v}"
+          # Strip the 'v' prefix and re-export VERSION so nfpm.yml reads the
+          # numeric version (e.g. "0.2.0"). Debian policy requires versions to
+          # start with a digit; dpkg rejects packages whose Version field
+          # begins with 'v'.
+          VERSION="${VERSION#v}"
+          VER="$VERSION"
+          export VERSION
           cd packaging
           nfpm package --packager deb --config nfpm.yml --target "../moon_${VER}_${ARCH}.deb"
           nfpm package --packager rpm --config nfpm.yml --target "../moon-${VER}-1.${ARCH}.rpm"

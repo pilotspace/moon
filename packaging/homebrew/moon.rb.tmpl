@@ -38,13 +38,19 @@ class Moon < Formula
 
   def install
     bin.install "moon"
-    # Install default config, preserving any existing user config on upgrade.
-    (etc/"moon").mkpath
-    etc.install "moon.conf.example" => "moon/moon.conf" unless (etc/"moon/moon.conf").exist?
+    # Install default config only when the tarball ships moon.conf.example
+    # (provided by a future packaging PR; omit silently when absent so
+    # `brew install` never raises "No such file" on older releases).
+    if (buildpath/"moon.conf.example").exist?
+      (etc/"moon").mkpath
+      etc.install "moon.conf.example" => "moon/moon.conf" unless (etc/"moon/moon.conf").exist?
+    end
   end
 
   service do
-    run [opt_bin/"moon", etc/"moon/moon.conf"]
+    # moon is a pure --flag CLI (no positional config-file argument).
+    # Configuration is supplied via flags or environment variables.
+    run [opt_bin/"moon"]
     keep_alive true
     log_path var/"log/moon.log"
     error_log_path var/"log/moon.log"
