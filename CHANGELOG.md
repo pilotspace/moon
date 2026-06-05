@@ -10,6 +10,24 @@ The v0.2 enterprise beachhead. Built additively on per-shard WAL v3 + the
 dual-root manifest; no changes to the KV hot path, MVCC, page format, or
 transaction layer.
 
+### Changed — default persistence directory is the platform user-data dir (was: current directory)
+
+- **`--dir` now defaults to the platform user-data directory**, created
+  on first run: Linux `$XDG_DATA_HOME/moon` (or `~/.local/share/moon`),
+  macOS `~/Library/Application Support/moon`, Windows
+  `%LOCALAPPDATA%\moon`. Installed binaries no longer litter whatever
+  directory they happen to be started from.
+- **Back-compat guard:** if the startup directory already contains moon
+  persistence data (`appendonlydir`, `shard-0`, `dump.rdb`,
+  `replication.state` — the pre-v0.2.0 default layout), moon keeps using
+  it and logs a warning, so upgrades never silently boot with an empty
+  keyspace away from their data.
+- Explicit `--dir <path>` / conf `dir` (including `--dir .`) opt out of
+  auto-resolution entirely; environments with no `HOME`/`LOCALAPPDATA`
+  fall back to the current directory with a warning. Docker
+  (`--dir /data`) and the systemd package (`dir /var/lib/moon`) already
+  pass explicit paths and are unaffected.
+
 ### Changed — default shard count is now 1 (was: auto-detect)
 
 - **`--shards` defaults to 1** instead of auto-detecting the CPU count.

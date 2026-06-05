@@ -43,6 +43,15 @@ tcp-keepalive 300
 
 # Data directory for persistence files (AOF, RDB, WAL).
 # Create this directory before starting the server.
+#
+# When `dir` is not set anywhere (no conf entry, no --dir flag), moon
+# auto-resolves to the platform user-data directory and creates it:
+#   Linux:   $XDG_DATA_HOME/moon  (or ~/.local/share/moon)
+#   macOS:   ~/Library/Application Support/moon
+#   Windows: %LOCALAPPDATA%\moon
+# If the startup directory already contains moon data from a pre-v0.2.0
+# deployment (default was the current directory), that data keeps being
+# used, with a startup warning.
 dir /var/lib/moon
 
 # Require clients to authenticate with a password.

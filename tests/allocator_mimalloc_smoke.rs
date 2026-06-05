@@ -26,6 +26,10 @@ fn moon_binary() -> std::path::PathBuf {
 }
 
 fn spawn_moon(port: u16) -> std::process::Child {
+    // Explicit --dir: the default resolves to the platform user-data
+    // directory, which parallel test servers must not share.
+    let dir = std::env::temp_dir().join(format!("moon-mimalloc-smoke-{port}"));
+    std::fs::create_dir_all(&dir).expect("create test dir");
     Command::new(moon_binary())
         .args([
             "--port",
@@ -34,6 +38,8 @@ fn spawn_moon(port: u16) -> std::process::Child {
             "1",
             "--appendonly",
             "no",
+            "--dir",
+            &dir.to_string_lossy(),
         ])
         .stdout(Stdio::null())
         .stderr(Stdio::null())

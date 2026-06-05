@@ -113,6 +113,12 @@ fn main() -> anyhow::Result<()> {
         }
     };
 
+    // Resolve the persistence directory before anything reads config.dir
+    // (check-config validation, persistence init, WAL). Empty --dir
+    // auto-resolves to the platform user-data directory, or stays on the
+    // current directory when it already holds pre-v0.2.0 moon data.
+    config.resolve_dir();
+
     // ── AOF v1→v2 migration (FIX-W3-2): early-exit before normal boot ──
     // When `--migrate-aof-from` is set, run the migration tool and exit.
     // This must run BEFORE any shard/AOF initialization so the source
