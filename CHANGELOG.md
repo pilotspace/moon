@@ -10,6 +10,18 @@ The v0.2 enterprise beachhead. Built additively on per-shard WAL v3 + the
 dual-root manifest; no changes to the KV hot path, MVCC, page format, or
 transaction layer.
 
+### Changed — v0.2.0 release prep
+
+- Crate version bumped 0.1.12 → 0.2.0; `INFO server` `moon_version` now
+  reports 0.2.0 (previously released binaries would have self-reported
+  the stale crate version regardless of the git tag).
+- `release.yml`: the `homebrew-tap` bump job is gated behind the
+  `HOMEBREW_TAP_ENABLED` repository variable. Homebrew distribution is
+  deferred — v0.2.0 ships via curl `install.sh`/`install.ps1`, .deb/.rpm,
+  and Docker. Without the gate the job would hard-fail on every stable
+  tag (missing `HOMEBREW_TAP_TOKEN` secret). `packaging/bump-homebrew.sh`
+  and the formula template stay in-tree for later enablement.
+
 ### Added — Temporal-decay traversal scoring (agent-memory recency)
 
 User-facing recency bias for graph traversal: paths through recently

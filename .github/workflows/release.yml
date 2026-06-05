@@ -494,10 +494,17 @@ jobs:
     name: Bump Homebrew Tap
     needs: [setup, sign, release]
     runs-on: ubuntu-latest
-    # Skip on prerelease tags (contains '-') and dry_run
+    # Skip on prerelease tags (contains '-') and dry_run.
+    # Gated behind the HOMEBREW_TAP_ENABLED repo variable: Homebrew
+    # distribution is deferred (no tap repo / HOMEBREW_TAP_TOKEN secret yet),
+    # and without the gate bump-homebrew.sh would hard-fail on every stable
+    # tag at its `:?` validation of the missing secret. To enable later:
+    # create pilotspace/homebrew-moon + the token secret, then set the
+    # repo variable HOMEBREW_TAP_ENABLED=true.
     if: >-
       !contains(needs.setup.outputs.version, '-') &&
-      inputs.dry_run != true
+      inputs.dry_run != true &&
+      vars.HOMEBREW_TAP_ENABLED == 'true'
     steps:
       - uses: actions/checkout@v4
 
