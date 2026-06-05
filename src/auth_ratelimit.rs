@@ -41,10 +41,16 @@ static RATE_LIMITER: LazyLock<Mutex<HashMap<IpAddr, FailureRecord>>> =
 pub fn record_failure(ip: IpAddr) -> u64 {
     let mut map = RATE_LIMITER.lock();
 
-    // Periodic cleanup when map grows too large
+    // Periodic cleanup when map grows too large.
+    // checked_sub: Windows `Instant` is unsigned (time since boot) — raw
+    // subtraction panics if the process is younger than the threshold. If the
+    // cutoff would predate boot, no record can be stale yet → skip cleanup.
     if map.len() >= MAX_ENTRIES {
-        let cutoff = Instant::now() - std::time::Duration::from_secs(STALE_THRESHOLD_SECS);
-        map.retain(|_, r| r.last_failure > cutoff);
+        if let Some(cutoff) =
+            Instant::now().checked_sub(std::time::Duration::from_secs(STALE_THRESHOLD_SECS))
+        {
+            map.retain(|_, r| r.last_failure > cutoff);
+        }
     }
 
     let now = Instant::now();

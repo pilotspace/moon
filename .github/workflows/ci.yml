@@ -145,8 +145,11 @@ jobs:
       # No jemalloc on Windows (tikv-jemallocator does not support MSVC)
       - name: Clippy (windows)
         run: cargo clippy --no-default-features --features runtime-tokio,graph,text-index -- -D warnings
+      # --no-fail-fast: cargo stops at the first failing test BINARY by default,
+      # hiding failures in later binaries. This job runs at most once per main
+      # push / dispatch — full visibility is worth the extra red-run minutes.
       - name: Test (windows)
-        run: cargo test --no-default-features --features runtime-tokio,graph,text-index
+        run: cargo test --no-default-features --features runtime-tokio,graph,text-index --no-fail-fast
         timeout-minutes: 30
 
   # ── console feature — monoio+jemalloc+graph+text-index+console ───────
