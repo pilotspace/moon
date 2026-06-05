@@ -387,14 +387,20 @@ jobs:
         env:
           COSIGN_EXPERIMENTAL: "1"
         run: |
-          # Sign every artifact; skip any pre-existing .sig files
+          # Sign every artifact; skip signing outputs from a previous pass.
+          # --output-certificate is required for downstream verification:
+          # keyless `cosign verify-blob` needs the Fulcio certificate
+          # alongside the signature — a bare .sig is unverifiable.
           for f in artifacts/moon*; do
-            [[ "$f" == *.sig ]] && continue
-            cosign sign-blob --yes "$f" --output-signature "${f}.sig"
+            [[ "$f" == *.sig || "$f" == *.crt ]] && continue
+            cosign sign-blob --yes "$f" \
+              --output-signature "${f}.sig" \
+              --output-certificate "${f}.crt"
           done
           # Also sign the checksum manifest
           cosign sign-blob --yes artifacts/SHA256SUMS.txt \
-            --output-signature artifacts/SHA256SUMS.txt.sig
+            --output-signature artifacts/SHA256SUMS.txt.sig \
+            --output-certificate artifacts/SHA256SUMS.txt.crt
 
       - name: Upload signed artifacts bundle
         uses: actions/upload-artifact@v4
@@ -434,9 +440,9 @@ jobs:
             echo "  gh release create $TAG $PRERELEASE_FLAG --title 'moon $TAG' --generate-notes \\"
             echo "    artifacts/moon-* artifacts/moon_* artifacts/SHA256SUMS* artifacts/moon-sbom*.json"
           else
-            # artifacts/moon-* covers tarballs, zip, rpm, sbom-*.json, *.sig
+            # artifacts/moon-* covers tarballs, zip, rpm, sbom-*.json, *.sig, *.crt
             # artifacts/moon_* covers deb (underscore naming from nfpm)
-            # SHA256SUMS.txt / SHA256SUMS.txt.sig are not moon-prefixed: explicit
+            # SHA256SUMS.txt{,.sig,.crt} are not moon-prefixed: explicit
             gh release create "$TAG" \
               $PRERELEASE_FLAG \
               --title "moon $TAG" \
@@ -444,7 +450,8 @@ jobs:
               artifacts/moon-* \
               artifacts/moon_* \
               artifacts/SHA256SUMS.txt \
-              artifacts/SHA256SUMS.txt.sig
+              artifacts/SHA256SUMS.txt.sig \
+              artifacts/SHA256SUMS.txt.crt
           fi
 
   # ── 6. Docker image ───────────────────────────────────────────────────────
@@ -470,20 +477,33 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract numeric version
+      - name: Compute version and Docker tags
         id: version
         env:
           VER: ${{ needs.setup.outputs.version }}
-        run: echo "version=${VER#v}" >> "$GITHUB_OUTPUT"
+          REPO: ${{ github.repository }}
+        run: |
+          VERSION="${VER#v}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          # Only stable releases move :latest — a prerelease tag (contains
+          # '-', e.g. v0.2.0-rc.1) must not repoint the default pull tag at
+          # an RC. The versioned tag is always pushed.
+          TAGS="ghcr.io/${REPO}:${VERSION}"
+          if [[ "$VERSION" != *-* ]]; then
+            TAGS="${TAGS}"$'\n'"ghcr.io/${REPO}:latest"
+          fi
+          {
+            echo "tags<<EOF"
+            echo "$TAGS"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
         with:
           context: .
           push: ${{ inputs.dry_run != true }}
-          tags: |
-            ghcr.io/${{ github.repository }}:${{ steps.version.outputs.version }}
-            ghcr.io/${{ github.repository }}:latest
+          tags: ${{ steps.version.outputs.tags }}
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.version=${{ steps.version.outputs.version }}

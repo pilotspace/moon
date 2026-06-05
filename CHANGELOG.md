@@ -27,6 +27,16 @@ transaction layer.
   (also linked from the error message itself, now as a full GitHub URL so
   installed binaries point somewhere reachable).
 
+### Fixed — release pipeline verification + prerelease safety
+
+- `release.yml` sign job now publishes Fulcio certificates (`*.crt`)
+  alongside signatures: keyless `cosign verify-blob` requires the
+  certificate — the previous `.sig`-only output was unverifiable by
+  users.
+- Docker job no longer moves `ghcr.io/pilotspace/moon:latest` on
+  prerelease tags (e.g. `v0.2.0-rc.1`); only stable releases repoint
+  `:latest`. The versioned tag is always pushed.
+
 ### Changed — v0.2.0 release prep
 
 - Crate version bumped 0.1.12 → 0.2.0; `INFO server` `moon_version` now
