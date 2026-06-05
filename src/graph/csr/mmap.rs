@@ -231,12 +231,20 @@ impl MmapCsrSegment {
         // SAFETY: em_ptr validated above (alignment checked, mmap alive for scope).
         let edge_meta_slice = unsafe { core::slice::from_raw_parts(em_ptr, em_len) };
 
+        // Duplicate keys (corrupted/malicious file) must be rejected here:
+        // MphNodeIndex::build panics inside boomphf on non-unique keys
+        // (found by the csr_from_bytes fuzz target).
         let mut node_id_to_row: HashMap<NodeKey, u32> = HashMap::with_capacity(nc);
         let mut sorted_keys = Vec::with_capacity(nc);
         for (row, nm) in node_meta_slice.iter().enumerate() {
             let key_data = slotmap::KeyData::from_ffi(nm.external_id);
             let nk = NodeKey::from(key_data);
-            node_id_to_row.insert(nk, row as u32);
+            if node_id_to_row.insert(nk, row as u32).is_some() {
+                return Err(CsrError::InvalidData(format!(
+                    "duplicate node external_id {} at row {row}",
+                    nm.external_id
+                )));
+            }
             sorted_keys.push(nk);
         }
 

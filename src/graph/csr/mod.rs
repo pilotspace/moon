@@ -629,12 +629,20 @@ impl CsrSegment {
         // Rebuild node_id_to_row from node_meta external_id.
         // The external_id is the raw u64 from NodeKey::data().as_ffi().
         // We need to reconstruct NodeKey from the u64 -- use KeyData::from_ffi.
+        // Duplicate keys (corrupted/malicious file) must be rejected here:
+        // MphNodeIndex::build panics inside boomphf on non-unique keys
+        // (found by the csr_from_bytes fuzz target).
         let mut node_id_to_row: HashMap<NodeKey, u32> = HashMap::with_capacity(nc);
         let mut sorted_keys = Vec::with_capacity(nc);
         for (row, nm) in node_meta.iter().enumerate() {
             let key_data = slotmap::KeyData::from_ffi(nm.external_id);
             let nk = NodeKey::from(key_data);
-            node_id_to_row.insert(nk, row as u32);
+            if node_id_to_row.insert(nk, row as u32).is_some() {
+                return Err(CsrError::InvalidData(format!(
+                    "duplicate node external_id {} at row {row}",
+                    nm.external_id
+                )));
+            }
             sorted_keys.push(nk);
         }
 
@@ -1406,5 +1414,46 @@ mod tests {
         let loaded = CsrSegment::from_bytes(&v2_bytes).expect("v2 parse ok");
         let rewritten = loaded.to_bytes();
         assert_eq!(rewritten, v2_bytes, "v2 re-serialization must be stable");
+    }
+
+    #[test]
+    fn test_duplicate_external_id_rejected_not_panic() {
+        // Found by the csr_from_bytes fuzz target (CI, 217K execs): a
+        // corrupted/malicious segment file whose node_meta carries duplicate
+        // external_ids fed duplicate keys into MphNodeIndex::build, which
+        // panics inside boomphf. Corrupted files must fail with CsrError,
+        // never crash recovery.
+        let frozen = build_stamped_graph();
+        let csr = CsrSegment::from_frozen(frozen, 100).expect("csr ok");
+        let mut bytes = csr.to_bytes();
+
+        // node_meta starts after header(128) + row_offsets(4*(nc+1)) +
+        // col_indices(4*ec) + edge_meta(8*ec); external_id is the first
+        // field of each 48-byte NodeMeta record.
+        let nc = csr.node_count() as usize;
+        let ec = csr.edge_count() as usize;
+        let nm_start = 128 + 4 * (nc + 1) + 4 * ec + 8 * ec;
+        // Overwrite node 1's external_id with node 0's.
+        let id0: [u8; 8] = bytes[nm_start..nm_start + 8].try_into().expect("8 bytes");
+        bytes[nm_start + 48..nm_start + 48 + 8].copy_from_slice(&id0);
+        // Recompute the checksum (offset 72) over the patched payload.
+        bytes[72..80].copy_from_slice(&0u64.to_le_bytes());
+        let checksum = compute_csr_checksum(&bytes) as u64;
+        bytes[72..80].copy_from_slice(&checksum.to_le_bytes());
+
+        // Heap parser: must return Err, not panic.
+        assert!(
+            CsrSegment::from_bytes(&bytes).is_err(),
+            "duplicate external_id must be rejected by from_bytes"
+        );
+
+        // Mmap parser: same bytes from a file must also fail cleanly.
+        let dir = tempfile::TempDir::new().expect("tmpdir");
+        let path = dir.path().join("dup.csr");
+        std::fs::write(&path, &bytes).expect("write ok");
+        assert!(
+            MmapCsrSegment::from_mmap_file(&path).is_err(),
+            "duplicate external_id must be rejected by the mmap loader"
+        );
     }
 }
