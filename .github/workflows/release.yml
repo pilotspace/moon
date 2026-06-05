@@ -426,6 +426,11 @@ jobs:
       - name: Create release (or dry-run echo)
         env:
           GH_TOKEN: ${{ github.token }}
+          # This job never checks out the repo (it only downloads artifacts),
+          # so `gh` cannot infer the repository from a git remote — it dies
+          # with "fatal: not a git repository" (first seen on v0.2.0-rc.1).
+          # GH_REPO pins the target explicitly.
+          GH_REPO: ${{ github.repository }}
           TAG: ${{ needs.setup.outputs.version }}
           DRY_RUN: ${{ inputs.dry_run }}
         run: |
