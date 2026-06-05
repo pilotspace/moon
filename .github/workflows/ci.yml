@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # Manual trigger: lets the main-push-only jobs (check-windows,
+  # check-console) run against any branch before merging.
+  workflow_dispatch: {}
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -114,13 +117,12 @@ jobs:
         run: cargo build --no-default-features --features runtime-tokio,graph,text-index --target x86_64-apple-darwin
 
   # ── Windows — main-push only (cost control) ─────────────────────────
-  # NOTE: This job is EXPECTED TO FAIL until feat/windows-native-port
-  # merges. It is the merge-order gate: that PR must land on main first
-  # so this job goes green before the release PR (PR-5) is merged.
+  # Also runnable on any branch via workflow_dispatch (gh workflow run
+  # ci.yml --ref <branch>) to validate Windows before merging.
   check-windows:
     name: Check (Windows)
     runs-on: windows-latest
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@1.94.1
@@ -156,7 +158,7 @@ jobs:
   check-console:
     name: Check (console feature)
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@1.94.1

@@ -701,13 +701,12 @@ fn test_fpi_selective_recovery_only_fpi_pages_restored() {
         file.write_all(&[0xFF; 64]).unwrap();
     }
     {
-        use std::os::unix::fs::FileExt;
         let file = std::fs::OpenOptions::new()
             .write(true)
             .open(&heap_path)
             .unwrap();
-        // Corrupt page 1 header (at offset 4096)
-        file.write_at(&[0xFF; 64], 4096).unwrap();
+        // Corrupt page 1 header (at offset 4096) — cross-platform positioned write
+        moon::util::file_ext::write_at(&file, &[0xFF; 64], 4096).unwrap();
     }
 
     // Verify both pages are corrupted
