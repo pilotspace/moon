@@ -43,7 +43,12 @@ jobs:
           workspaces: fuzz
           shared-key: fuzz-nightly
       - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz --locked
+        # Prebuilt binary: `cargo install --locked` broke when nightly started
+        # rejecting the lockfile's rustix 0.36.5 (reserved `rustc_*` attrs);
+        # a binary install is immune to toolchain drift and faster.
+        uses: taiki-e/install-action@4bc351f7f2614e48088386e2a0ad917ca3a7e4ba # v2.81.5
+        with:
+          tool: cargo-fuzz
       - name: Download nightly corpus
         uses: actions/download-artifact@v4
         with:
@@ -84,7 +89,12 @@ jobs:
           workspaces: fuzz
           shared-key: fuzz-nightly
       - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz --locked
+        # Prebuilt binary: `cargo install --locked` broke when nightly started
+        # rejecting the lockfile's rustix 0.36.5 (reserved `rustc_*` attrs);
+        # a binary install is immune to toolchain drift and faster.
+        uses: taiki-e/install-action@4bc351f7f2614e48088386e2a0ad917ca3a7e4ba # v2.81.5
+        with:
+          tool: cargo-fuzz
       - name: Download previous corpus
         uses: actions/download-artifact@v4
         with:
