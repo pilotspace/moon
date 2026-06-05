@@ -61,5 +61,10 @@ name = "cypher_parse"
 path = "fuzz_targets/cypher_parse.rs"
 doc = false
 
+[[bin]]
+name = "conf_parse"
+path = "fuzz_targets/conf_parse.rs"
+doc = false
+
 [workspace]
 members = ["."]
