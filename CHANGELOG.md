@@ -55,6 +55,14 @@ Five-PR milestone making moon installable on all three platforms
   syncs the wire codec when `HELLO 3` negotiates RESP3; previously the
   codec stayed on RESP2 and silently flattened map/set/push frames,
   breaking RESP3 clients on connect (redis-py 8 defaults to RESP3).
+- **Windows runtime fixes (PR #154)** — first fully green `check-windows`
+  run: fsync helpers reworked for Windows semantics (no directory
+  handles, writable handle for `FlushFileBuffers`); unsigned-`Instant`
+  underflows fixed (autovacuum scheduling, rate-limiter cutoffs, mvcc
+  test anchors); the tokio sharded handler no longer initiates connection
+  migration on non-unix platforms (previously aborted clients mid-session
+  in multishard workloads); `GraphManifest::save` now propagates
+  parent-dir fsync errors.
 - **Known limitations (v0.2.0)** — Windows binaries are not
   Authenticode-signed (SmartScreen warning); connection migration is
   unix-only (connections stay on the originating shard on Windows);
