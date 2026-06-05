@@ -7,7 +7,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/pilotspace/moon/releases/tag/v0.1.12"><img src="https://img.shields.io/badge/version-v0.1.12-blue" alt="Version"></a>
+  <a href="https://github.com/pilotspace/moon/releases/latest"><img src="https://img.shields.io/github/v/release/pilotspace/moon?label=version&color=blue" alt="Version"></a>
   <a href="https://crates.io/crates/moondb"><img src="https://img.shields.io/crates/v/moondb?label=moondb" alt="Rust SDK"></a>
   <a href="https://pypi.org/project/moondb/"><img src="https://img.shields.io/pypi/v/moondb?label=moondb" alt="Python SDK"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="License"></a>
@@ -133,11 +133,9 @@ size curve is on the v0.2 roadmap.
 | Native API QPS     | **19×**  | N/A     |
 | Bulk insert        | **23×**  | 1×      |
 
-### Hash-field TTL — Valkey 9.0/9.1 parity (v0.2.0-alpha preview)
+### Hash-field TTL — Valkey 9.0/9.1 parity
 
-> **Status:** ships in **v0.2.0-alpha** (currently on `main`, no tagged
-> release yet). Not present in the latest tagged build `v0.1.12`. Build
-> from `main` to reproduce these numbers.
+> **Status:** ships in **v0.2.0**. Not present in `v0.1.12` or earlier.
 
 OrbStack moon-dev, n=200K c=50, median of 3. Three-way comparison on the per-field TTL surface added in v0.2.0. Full methodology + 26 scenarios in [docs/perf/2026-05-27-hash-ttl-3way-bench.md](docs/perf/2026-05-27-hash-ttl-3way-bench.md); reproducible via [scripts/bench-hash-ttl-3way.sh](scripts/bench-hash-ttl-3way.sh).
 
@@ -211,11 +209,61 @@ traced to source).
 
 ## Install
 
-> **Packaged releases are coming in v0.2.0.** The Homebrew tap, one-liner
-> install scripts (`install.sh` / `install.ps1`), `.deb`/`.rpm` packages,
-> and pre-built tarballs will be available once the v0.2.0 release pipeline
-> is merged and the `v0.2.0` tag is cut. Until then, please build from
-> source using the [Quick start](#quick-start) instructions below.
+### Linux / macOS — one-liner
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/pilotspace/moon/main/install.sh | sh
+```
+
+Detects OS/arch, downloads the latest release tarball, verifies its SHA256
+against the signed `SHA256SUMS.txt`, and installs to `~/.local/bin`
+(`/usr/local/bin` when run as root). Linux x86_64 gets the io_uring
+(`monoio`) build; Linux aarch64 and macOS get the `tokio` build.
+Overrides: `VERSION=v0.2.0 INSTALL_DIR=/opt/bin sh install.sh`.
+
+### Windows — PowerShell
+
+```powershell
+irm https://raw.githubusercontent.com/pilotspace/moon/main/install.ps1 | iex
+```
+
+Installs `moon.exe` to `%LOCALAPPDATA%\moon\bin` (or `%ProgramFiles%\moon\bin`
+as Administrator) and adds it to your user PATH. The binary is not yet
+Authenticode-signed — SmartScreen may prompt "Run anyway" (signing is
+planned for v0.3.0).
+
+### Debian / RHEL packages
+
+`.deb` and `.rpm` packages (amd64 + arm64) ship with a systemd unit and
+`/etc/moon/moon.conf`:
+
+```bash
+# grab the package for your arch from the latest release page:
+# https://github.com/pilotspace/moon/releases/latest
+sudo dpkg -i moon_<version>_arm64.deb     # or: sudo rpm -i moon-<version>-1.arm64.rpm
+sudo systemctl enable --now moon
+```
+
+### Docker
+
+```bash
+docker run -p 6379:6379 ghcr.io/pilotspace/moon:latest
+```
+
+### Verify downloads
+
+Every artifact is checksummed in `SHA256SUMS.txt` and signed with
+[cosign](https://docs.sigstore.dev/) (keyless). To verify:
+
+```bash
+cosign verify-blob --signature SHA256SUMS.txt.sig SHA256SUMS.txt \
+  --certificate-identity-regexp 'github.com/pilotspace/moon' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
+### From source
+
+See [Quick start](#quick-start) below.
 
 ---
 
@@ -475,8 +523,7 @@ Contribution guide and coding rules (unsafe policy, hot-path allocation rules, l
 
 ## Production readiness
 
-Honest matrix of where Moon is today (v0.1.12 GA + v0.2.0-alpha
-unreleased). Read alongside
+Honest matrix of where Moon is today (v0.2.0). Read alongside
 [`docs/PRODUCTION-CONTRACT.md`](docs/PRODUCTION-CONTRACT.md) (the
 machine-checkable GA exit criteria) and
 [`docs/OPERATOR-GUIDE.md`](docs/OPERATOR-GUIDE.md) (memory accounting,
@@ -548,17 +595,16 @@ sizing, runbooks).
 
 | Milestone        | Focus                                                                                       | Status      |
 |------------------|---------------------------------------------------------------------------------------------|-------------|
-| **v0.2.0** (next) | Multi-node clustering soak (PSYNC2 + atomic slot migration); PITR P3c; CDC push (`SUBSCRIBE`) | alpha       |
+| **v0.2.0**       | Multi-node clustering soak (PSYNC2 + atomic slot migration); PITR P3c; CDC push (`SUBSCRIBE`); packaged installs (macOS/Linux/Windows) | released    |
 | **v0.2.x**       | GPU vector acceleration (`gpu-cuda`); operator runbooks; full SLO lock-in (`PERF-01..05`)    | planned     |
 | **v1.0**         | Every [`PRODUCTION-CONTRACT.md`](docs/PRODUCTION-CONTRACT.md) GA exit-criteria box ticked    | gate        |
 
-What's already in `main` (v0.1.0 → v0.2.0-alpha, 14 months of work):
+What's in `v0.2.0` (v0.1.0 → v0.2.0, 14 months of work):
 
-> Hash-field TTL and PITR + CDC ship in **v0.2.0** — currently alpha on
-> `main`, no tagged release yet. **v0.1.12** is the latest tag and does
-> NOT include them. Everything else below is in `v0.1.12` GA.
+> Hash-field TTL, PITR + CDC, and packaged installers ship in **v0.2.0**
+> (the latest tag). Everything below was already in `v0.1.12` GA.
 
-**Shipped in v0.1.12 (latest tag, single-node production-grade):**
+**Shipped in v0.1.12 (single-node production-grade):**
 
 - Forkless persistence (RDB v2 + per-shard WAL v3 + multi-part AOF).
 - Tiered disk offload (RAM → NVMe) with 100 % crash recovery.
