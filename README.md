@@ -233,10 +233,12 @@ git clone https://github.com/pilotspace/moon.git
 cd moon
 cargo build --release
 
-# Defaults: bind 127.0.0.1:6379, shard count = CPU count
+# Defaults: bind 127.0.0.1:6379, single shard (best non-pipelined throughput)
 ./target/release/moon
 
-# Or with production flags
+# Or with production flags (--shards 0 = auto-detect from CPU count;
+# changing the count on an existing AOF dir requires a migration — see
+# docs/runbooks/shard-count-change.md)
 ./target/release/moon \
   --port 6379 \
   --shards 8 \

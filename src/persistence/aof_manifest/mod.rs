@@ -734,8 +734,11 @@ impl AofManifest {
     pub fn verify_shard_count(&self, expected: u16) -> Result<(), String> {
         let actual = self.shards.len() as u16;
         if actual != expected {
+            // Full GitHub URL (not a repo-relative path): installed binaries
+            // surface this at startup on machines that don't have the source
+            // tree checked out.
             return Err(format!(
-                "ERR shard count changed (manifest={}, config={}); refusing to start to avoid data loss. See docs/runbooks/shard-count-change.md",
+                "ERR shard count changed (manifest={}, config={}); refusing to start to avoid data loss. See https://github.com/pilotspace/moon/blob/main/docs/runbooks/shard-count-change.md",
                 actual, expected
             ));
         }
@@ -1146,7 +1149,7 @@ mod tests_v2 {
         let err = m.verify_shard_count(4).expect_err("should mismatch");
         assert_eq!(
             err,
-            "ERR shard count changed (manifest=2, config=4); refusing to start to avoid data loss. See docs/runbooks/shard-count-change.md"
+            "ERR shard count changed (manifest=2, config=4); refusing to start to avoid data loss. See https://github.com/pilotspace/moon/blob/main/docs/runbooks/shard-count-change.md"
         );
 
         // Matching count succeeds.

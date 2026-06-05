@@ -21,7 +21,7 @@ Moon is configured entirely through command-line flags. There is no configuratio
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--shards` | `0` (auto) | Number of shards. `0` auto-detects from CPU count |
+| `--shards` | `1` | Number of shards. `0` auto-detects from CPU count |
 | `--databases` | `16` | Number of logical databases |
 | `--requirepass` | *(none)* | Require clients to authenticate with this password |
 | `--check-config` | `false` | Validate configuration and exit without starting |

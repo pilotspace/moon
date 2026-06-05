@@ -195,8 +195,14 @@ pub struct ServerConfig {
     #[arg(long, default_value_t = 5)]
     pub maxmemory_samples: usize,
 
-    /// Number of shards (0 = auto-detect from CPU count)
-    #[arg(long, default_value_t = 0)]
+    /// Number of shards (0 = auto-detect from CPU count).
+    ///
+    /// Defaults to 1: single-shard gives the best throughput for
+    /// non-pipelined workloads (cross-shard SPSC dispatch dominates local
+    /// lookups otherwise) and a deterministic persistence layout across
+    /// hosts. Pass `--shards 0` to auto-detect from the CPU count, or pin
+    /// an explicit count for pipelined/AOF-heavy multi-core deployments.
+    #[arg(long, default_value_t = 1)]
     pub shards: usize,
 
     /// Initial keyspace size hint (total entries across all shards, 0 = disabled).
@@ -1065,6 +1071,16 @@ mod tests {
         assert_eq!(config.bind, "127.0.0.1");
         assert_eq!(config.port, 6379);
         assert_eq!(config.databases, 16);
+        // Single shard by default: best throughput for non-pipelined
+        // workloads and a deterministic persistence layout. `--shards 0`
+        // remains the explicit auto-detect opt-in.
+        assert_eq!(config.shards, 1);
+    }
+
+    #[test]
+    fn test_shards_zero_is_explicit_auto_detect() {
+        let config = ServerConfig::parse_from(["moon", "--shards", "0"]);
+        assert_eq!(config.shards, 0);
     }
 
     #[test]
@@ -1432,7 +1448,7 @@ mod tests {
     #[test]
     fn test_shards_default() {
         let config = ServerConfig::parse_from::<[&str; 0], &str>([]);
-        assert_eq!(config.shards, 0); // auto-detect
+        assert_eq!(config.shards, 1); // single shard; `--shards 0` opts into auto-detect
     }
 
     #[test]

@@ -10,6 +10,23 @@ The v0.2 enterprise beachhead. Built additively on per-shard WAL v3 + the
 dual-root manifest; no changes to the KV hot path, MVCC, page format, or
 transaction layer.
 
+### Changed — default shard count is now 1 (was: auto-detect)
+
+- **`--shards` defaults to 1** instead of auto-detecting the CPU count.
+  Single-shard gives the best throughput for non-pipelined workloads
+  (cross-shard SPSC dispatch dominates local lookups) and a deterministic
+  persistence layout across hosts. `--shards 0` remains the explicit
+  auto-detect opt-in; nothing changes for deployments that pass `--shards`
+  explicitly.
+- **Upgrade note:** deployments that previously relied on the auto-detect
+  default with `appendonly yes` will refuse to start after upgrading
+  (`ERR shard count changed (manifest=N, config=1)`) — this is the
+  intended data-loss guard. Start with `--shards <N>` matching the
+  manifest, or see the new
+  [shard-count-change runbook](docs/runbooks/shard-count-change.md)
+  (also linked from the error message itself, now as a full GitHub URL so
+  installed binaries point somewhere reachable).
+
 ### Changed — v0.2.0 release prep
 
 - Crate version bumped 0.1.12 → 0.2.0; `INFO server` `moon_version` now

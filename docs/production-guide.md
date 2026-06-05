@@ -14,7 +14,7 @@ docker run -d \
   moondb/moon:latest
 ```
 
-This starts Moon on port 6379 with auto-detected shard count, persistence directory at `/data`, and protected mode disabled (safe inside Docker networks).
+This starts Moon on port 6379 with a single shard (the default), persistence directory at `/data`, and protected mode disabled (safe inside Docker networks). Pass `--shards 0` to auto-detect from the CPU count.
 
 ### Docker run (production)
 
@@ -422,11 +422,11 @@ Moon uses a thread-per-core, shared-nothing architecture. Each shard owns its ev
 |----------|----------------------|-----------|
 | Development/testing | `1` | Simplest debugging, deterministic behavior |
 | Small workload (<100K keys) | `1` | Single shard avoids cross-shard dispatch overhead |
-| General production | `0` (auto) | Matches CPU core count inside the container |
+| General production | `1` (default) | Best non-pipelined throughput; cross-shard dispatch dominates otherwise |
 | Memory benchmarking | `1` | Fair per-key comparison against Redis |
-| High-throughput pipeline | CPU cores | Per-shard WAL eliminates global serialization bottleneck |
+| High-throughput pipeline | CPU cores (or `0` = auto) | Per-shard WAL eliminates global serialization bottleneck |
 
-Set CPU limits in Docker to control auto-detected shard count:
+When using `--shards 0` (auto-detect), set CPU limits in Docker to control the detected count:
 
 ```yaml
 deploy:
