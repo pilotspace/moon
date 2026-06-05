@@ -32,10 +32,14 @@ jobs:
       - name: CHANGELOG check
         if: github.event_name == 'pull_request'
         env:
-          PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
+          # Fetch labels live — the event payload snapshots labels at trigger
+          # time, so a label applied after `gh pr create` is invisible to it.
+          PR_LABELS=$(gh api "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/labels" --jq '[.[].name] | join(",")' || echo "")
           if echo "$PR_LABELS" | grep -q 'skip-changelog'; then
             echo "skip-changelog label found — skipping"
             exit 0
