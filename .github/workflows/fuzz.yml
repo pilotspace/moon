@@ -36,11 +36,6 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@nightly
-        with:
-          # cargo-fuzz builds with -Zbuild-std (sanitizer-instrumented std),
-          # which needs the rust-src component; without it every target dies
-          # with E0463 "can't find crate for `core`".
-          components: rust-src
       - name: Override rust-toolchain.toml for nightly
         run: rm -f rust-toolchain.toml
       - uses: Swatinem/rust-cache@v2
@@ -61,7 +56,10 @@ jobs:
           path: fuzz/corpus/
         continue-on-error: true
       - name: Run fuzzer (15m, multi-process)
-        run: cargo +nightly fuzz run "$TARGET" -- -max_total_time=900 -max_len=65536 -fork=2 -ignore_crashes=0
+        # Explicit --target: the prebuilt cargo-fuzz binary is musl-linked and
+        # self-detects musl as the default build target, whose std is not
+        # installed (E0463 "can't find crate for `core`").
+        run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu "$TARGET" -- -max_total_time=900 -max_len=65536 -fork=2 -ignore_crashes=0
         env:
           MOON_NO_URING: "1"
           TARGET: ${{ matrix.target }}
@@ -87,11 +85,6 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@nightly
-        with:
-          # cargo-fuzz builds with -Zbuild-std (sanitizer-instrumented std),
-          # which needs the rust-src component; without it every target dies
-          # with E0463 "can't find crate for `core`".
-          components: rust-src
       - name: Override rust-toolchain.toml for nightly
         run: rm -f rust-toolchain.toml
       - uses: Swatinem/rust-cache@v2
@@ -112,7 +105,8 @@ jobs:
           path: fuzz/corpus/
         continue-on-error: true
       - name: Run fuzzer (6h, multi-process)
-        run: cargo +nightly fuzz run "$TARGET" -- -max_total_time=21600 -max_len=65536 -fork=2 -ignore_crashes=0
+        # Explicit --target: see fuzz-pr note (prebuilt musl cargo-fuzz).
+        run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu "$TARGET" -- -max_total_time=21600 -max_len=65536 -fork=2 -ignore_crashes=0
         env:
           MOON_NO_URING: "1"
           TARGET: ${{ matrix.target }}
