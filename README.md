@@ -599,8 +599,8 @@ sizing, runbooks).
 
 | Milestone        | Focus                                                                                       | Status      |
 |------------------|---------------------------------------------------------------------------------------------|-------------|
-| **v0.2.0**       | Multi-node clustering soak (PSYNC2 + atomic slot migration); PITR P3c; CDC push (`SUBSCRIBE`); packaged installs (macOS/Linux/Windows) | released    |
-| **v0.2.x**       | GPU vector acceleration (`gpu-cuda`); operator runbooks; full SLO lock-in (`PERF-01..05`)    | planned     |
+| **v0.2.0**       | Packaged installs (macOS/Linux/Windows); hash-field TTL; PITR replay-to-LSN + `CDC.READ`; temporal-decay graph scoring | **released** |
+| **v0.2.x**       | Multi-node clustering soak (PSYNC2 + atomic slot migration); PITR P3c; CDC push (`SUBSCRIBE`); GPU vector acceleration (`gpu-cuda`); full SLO lock-in (`PERF-01..05`) | planned     |
 | **v1.0**         | Every [`PRODUCTION-CONTRACT.md`](docs/PRODUCTION-CONTRACT.md) GA exit-criteria box ticked    | gate        |
 
 What's in `v0.2.0` (v0.1.0 → v0.2.0, 14 months of work):
@@ -621,15 +621,26 @@ What's in `v0.2.0` (v0.1.0 → v0.2.0, 14 months of work):
 - Web console (7-view React app, embedded in binary).
 - Thread-per-core dispatch optimization (5.11M GET/s on x86_64).
 
-**Added in v0.2.0-alpha (on `main`, untagged):**
+**Added in v0.2.0:**
 
+- Packaged installers — curl `install.sh` / PowerShell `install.ps1`,
+  `.deb`/`.rpm` with systemd unit, Docker, signed + checksummed release
+  artifacts (cosign keyless), redis-style `moon.conf`, graceful
+  SIGTERM shutdown, native Windows binary.
 - Hash-field TTL — Valkey 9.0 / 9.1 parity, O(1) HGET / HLEN fast path
   (`HEXPIRE`, `HEXPIREAT`, `HPEXPIRE`, `HPEXPIREAT`, `HEXPIRETIME`,
   `HPEXPIRETIME`, `HTTL`, `HPTTL`, `HPERSIST`, `HGETEX`, `HGETDEL`).
 - PITR — `--recovery-target-lsn` deterministic WAL replay-to-LSN.
-- CDC — `CDC.READ` pull-mode change stream (push-mode planned for v0.2.0
-  GA).
-- Multi-node clustering soak (PSYNC2 + atomic slot migration).
+- CDC — `CDC.READ` pull-mode change stream (push-mode `CDC.SUBSCRIBE`
+  planned for v0.2.x).
+- Temporal-decay traversal scoring — `GRAPH.QUERY --decay`,
+  `FT.NAVIGATE DECAY`, CSR v3 edge timestamps.
+- `--shards` defaults to 1 (deterministic persistence layout;
+  `--shards 0` = auto-detect); `--maxmemory` is a whole-instance cap.
+
+Multi-node clustering (PSYNC2 + atomic slot migration) remains **alpha**
+— protocol-compatible code is in the tree but not soak-tested; it moves
+to v0.2.x (see [Not yet GA](#not-yet-ga--avoid-for-production) above).
 
 ## Production Readiness Contract
 
