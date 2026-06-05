@@ -109,7 +109,12 @@ impl RateLimiter {
     /// Evict bucket entries that have not been accessed within `idle`.
     /// Called by the spawned cleanup task every 60s (idle = 5 min).
     fn cleanup(&self, idle: Duration) {
-        let cutoff = Instant::now() - idle;
+        // checked_sub: Windows `Instant` is unsigned (time since boot) — raw
+        // subtraction panics if the process is younger than `idle`. If the
+        // cutoff would predate boot, no bucket can be stale yet.
+        let Some(cutoff) = Instant::now().checked_sub(idle) else {
+            return;
+        };
         self.buckets.lock().retain(|_, b| b.last_access >= cutoff);
     }
 
