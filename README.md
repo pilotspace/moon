@@ -637,6 +637,9 @@ What's in `v0.2.0` (v0.1.0 → v0.2.0, 14 months of work):
   `FT.NAVIGATE DECAY`, CSR v3 edge timestamps.
 - `--shards` defaults to 1 (deterministic persistence layout;
   `--shards 0` = auto-detect); `--maxmemory` is a whole-instance cap.
+- Persistence directory defaults to the platform user-data dir
+  (Linux `~/.local/share/moon`, macOS `~/Library/Application Support/moon`,
+  Windows `%LOCALAPPDATA%\moon`); `--dir <path>` overrides.
 
 Multi-node clustering (PSYNC2 + atomic slot migration) remains **alpha**
 — protocol-compatible code is in the tree but not soak-tested; it moves
