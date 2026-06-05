@@ -48,6 +48,7 @@ pub(super) fn check_auth_gate(
     client_id: u64,
     responses: &mut Vec<Frame>,
     auth_delay_ms: &mut u64,
+    codec: &mut crate::server::codec::RespCodec,
 ) -> AuthGateResult {
     if conn.authenticated {
         return AuthGateResult::Authenticated;
@@ -90,6 +91,9 @@ pub(super) fn check_auth_gate(
             );
             if !matches!(&response, Frame::Error(_)) {
                 conn.protocol_version = new_proto;
+                // Keep the wire codec in lockstep: the HELLO reply itself must
+                // already be serialized in the negotiated protocol (RESP3 map).
+                codec.set_protocol_version(new_proto);
             }
             if let Some(name) = new_name {
                 conn.client_name = Some(name);
@@ -382,6 +386,7 @@ pub(super) fn try_handle_hello(
     peer_addr: &str,
     auth_delay_ms: &mut u64,
     responses: &mut Vec<Frame>,
+    codec: &mut crate::server::codec::RespCodec,
 ) -> bool {
     if !cmd.eq_ignore_ascii_case(b"HELLO") {
         return false;
@@ -395,6 +400,9 @@ pub(super) fn try_handle_hello(
     );
     if !matches!(&response, Frame::Error(_)) {
         conn.protocol_version = new_proto;
+        // Keep the wire codec in lockstep: the HELLO reply itself must
+        // already be serialized in the negotiated protocol (RESP3 map).
+        codec.set_protocol_version(new_proto);
     }
     if let Some(name) = new_name {
         conn.client_name = Some(name);
