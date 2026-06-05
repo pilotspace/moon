@@ -21,12 +21,14 @@ composite cost) existed but was unreachable — `shortestPath()` hardcoded
   becomes `|weight| + λ·w·age_seconds` for `shortestPath()`; λ is 1/seconds,
   strictly validated. Decay off (no flag) keeps exact distance-only
   behavior — the age term contributes zero to every edge cost, so path
-  choice is identical to pre-decay Moon. Applies to the read,
-  write-aware, and `GRAPH.PROFILE` paths via `ExecutionContext` (same
-  pattern as `VALID_AT`).
+  choice is identical to pre-decay Moon. Applies to the read-only and
+  `GRAPH.PROFILE` paths via `ExecutionContext` (same pattern as
+  `VALID_AT`); write queries (CREATE/SET/DELETE/MERGE) reject the flag
+  instead of silently ignoring it.
 - **`FT.NAVIGATE ... DECAY <λ>`** — graph-expanded hits pay
-  `λ × age_seconds` of their discovery edge on top of the hop penalty;
-  KNN direct hits unaffected.
+  `λ × age_seconds` of their discovery edge on top of the hop penalty
+  (a re-rank of the already-explored expansion, not a steer of the
+  expansion itself); KNN direct hits unaffected.
 - **Edges stamp `created_ms` at insert** from the shard-cached clock
   (zero syscall on the insert path). `0 = unknown` is decay-neutral —
   pre-upgrade edges never look maximally old. Distinct from the

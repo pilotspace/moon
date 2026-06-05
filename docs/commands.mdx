@@ -187,7 +187,7 @@ GRAPH.QUERY g "..." --decay 0.1 --time-weight 2.0   -- scale the age term
 FT.NAVIGATE idx "*=>[KNN 5 @vec $q]" PARAMS 2 q <vec> HOPS 2 DECAY 0.1
 ```
 
-`--decay <λ>` (1/seconds) adds `λ × edge_age_seconds` to each edge's traversal cost, so `shortestPath()` prefers fresh routes over stale ones at equal weight. `FT.NAVIGATE ... DECAY <λ>` applies the same penalty to the discovery edge of each graph-expanded hit. Decay off (no flag) keeps exact distance-only behavior. See the [temporal guide](/guides/temporal) for details.
+`--decay <λ>` (1/seconds) adds `λ × edge_age_seconds` to each edge's traversal cost, so `shortestPath()` prefers fresh routes over stale ones at equal weight; the flag is read-only-query only (rejected on CREATE/SET/DELETE/MERGE). `FT.NAVIGATE ... DECAY <λ>` applies the same penalty to the discovery edge of each graph-expanded hit — a re-rank of the already-explored expansion, not a steer of the expansion itself. Decay off (no flag) keeps exact distance-only behavior. See the [temporal guide](/guides/temporal) for details.
 
 ## Server (12)
 

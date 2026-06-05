@@ -785,12 +785,15 @@ mod tests {
         let b = mg.add_node(smallvec![0], empty_props(), None, 1);
         let c = mg.add_node(smallvec![0], empty_props(), None, 1);
 
-        crate::storage::entry::tl_clock_set(1, 1_000);
-        mg.add_edge(a, c, 1, 1.0, None, 2).expect("stale direct");
-        crate::storage::entry::tl_clock_set(99, 99_000);
-        mg.add_edge(a, b, 1, 0.6, None, 3).expect("fresh hop 1");
-        mg.add_edge(b, c, 1, 0.6, None, 4).expect("fresh hop 2");
-        crate::storage::entry::tl_clock_set(0, 0);
+        {
+            let _pin = crate::storage::entry::ClockPin::set(1, 1_000);
+            mg.add_edge(a, c, 1, 1.0, None, 2).expect("stale direct");
+        }
+        {
+            let _pin = crate::storage::entry::ClockPin::set(99, 99_000);
+            mg.add_edge(a, b, 1, 0.6, None, 3).expect("fresh hop 1");
+            mg.add_edge(b, c, 1, 0.6, None, 4).expect("fresh hop 2");
+        }
 
         let csr_segs: Vec<Arc<CsrStorage>> = vec![];
         let reader = SegmentMergeReader::new(
@@ -828,12 +831,13 @@ mod tests {
     fn test_merge_reader_propagates_created_ms() {
         // MemGraph edges must surface their wall-clock creation stamp through
         // MergedNeighbor so decay-aware cost functions can age them.
-        crate::storage::entry::tl_clock_set(7, 7_000);
         let mut mg = MemGraph::new(1000);
         let a = mg.add_node(smallvec![0], empty_props(), None, 1);
         let b = mg.add_node(smallvec![0], empty_props(), None, 1);
-        mg.add_edge(a, b, 1, 2.0, None, 2).expect("ok");
-        crate::storage::entry::tl_clock_set(0, 0);
+        {
+            let _pin = crate::storage::entry::ClockPin::set(7, 7_000);
+            mg.add_edge(a, b, 1, 2.0, None, 2).expect("ok");
+        }
 
         let csr_segs: Vec<Arc<CsrStorage>> = vec![];
         let reader = SegmentMergeReader::new(
@@ -1281,18 +1285,23 @@ mod tests {
 
         // Route 1: a->c, weight=2.0, created at t=90s (age=10s at now=100s)
         //   cost = 0.5*10 + 1.0*2.0 = 7.0
-        crate::storage::entry::tl_clock_set(90, 90_000);
-        mg.add_edge(a, c, 1, 2.0, None, 90).expect("ok");
+        {
+            let _pin = crate::storage::entry::ClockPin::set(90, 90_000);
+            mg.add_edge(a, c, 1, 2.0, None, 90).expect("ok");
+        }
 
         // Route 2: a->b (weight=1.0, t=95s, age=5s) -> b->c (weight=1.0, t=80s, age=20s)
         //   a->b cost = 0.5*5 + 1.0*1.0 = 3.5
         //   b->c cost = 0.5*20 + 1.0*1.0 = 11.0
         //   total = 14.5
-        crate::storage::entry::tl_clock_set(95, 95_000);
-        mg.add_edge(a, b, 1, 1.0, None, 95).expect("ok");
-        crate::storage::entry::tl_clock_set(80, 80_000);
-        mg.add_edge(b, c, 1, 1.0, None, 80).expect("ok");
-        crate::storage::entry::tl_clock_set(0, 0);
+        {
+            let _pin = crate::storage::entry::ClockPin::set(95, 95_000);
+            mg.add_edge(a, b, 1, 1.0, None, 95).expect("ok");
+        }
+        {
+            let _pin = crate::storage::entry::ClockPin::set(80, 80_000);
+            mg.add_edge(b, c, 1, 1.0, None, 80).expect("ok");
+        }
 
         let csr_segs: Vec<Arc<CsrStorage>> = vec![];
         let reader = SegmentMergeReader::new(
@@ -1413,9 +1422,10 @@ mod tests {
         let mut mg = MemGraph::new(1000);
         let a = mg.add_node(smallvec![0], empty_props(), None, 1);
         let b = mg.add_node(smallvec![0], empty_props(), None, 1);
-        crate::storage::entry::tl_clock_set(42, 42_000);
-        mg.add_edge(a, b, 1, 1.0, None, 2).expect("ok");
-        crate::storage::entry::tl_clock_set(0, 0);
+        {
+            let _pin = crate::storage::entry::ClockPin::set(42, 42_000);
+            mg.add_edge(a, b, 1, 1.0, None, 2).expect("ok");
+        }
 
         let frozen = mg.freeze().expect("ok");
         let csr = CsrSegment::from_frozen(frozen, 5).expect("ok");

@@ -133,11 +133,11 @@ fn parse_hop_penalty(args: &[Frame]) -> Option<f32> {
 fn parse_decay(args: &[Frame]) -> Result<Option<crate::graph::scoring::DecayConfig>, &'static str> {
     for i in 0..args.len() {
         if matches_keyword(&args[i], b"DECAY") {
-            let parsed = args
-                .get(i + 1)
-                .and_then(extract_bulk)
-                .and_then(|b| std::str::from_utf8(&b).ok().map(|s| s.to_owned()))
-                .and_then(|s| s.trim().parse::<f64>().ok());
+            let parsed = args.get(i + 1).and_then(extract_bulk).and_then(|b| {
+                std::str::from_utf8(&b)
+                    .ok()
+                    .and_then(|s| s.trim().parse::<f64>().ok())
+            });
             return match parsed {
                 Some(v) if v.is_finite() && v >= 0.0 => {
                     Ok(Some(crate::graph::scoring::DecayConfig {
@@ -309,14 +309,10 @@ fn build_navigate_response(
         } else {
             er.graph_hops as f32 * hop_penalty
         };
-        // DECAY: age the discovery edge — lambda * time_weight * age_seconds
-        // added to the score (lower = better). Unknown stamp (0) is neutral,
-        // matching WeightedCostFn::cost_ms semantics on the GRAPH.QUERY path.
+        // DECAY: age the discovery edge — same formula and 0-neutral rule as
+        // the GRAPH.QUERY traversal path, via the single DecayConfig home.
         if let Some(d) = decay {
-            if er.edge_created_ms != 0 {
-                let age_sec = d.now_ms.saturating_sub(er.edge_created_ms) as f64 / 1000.0;
-                final_score += (d.lambda_per_sec * d.time_weight * age_sec) as f32;
-            }
+            final_score += d.age_penalty_ms(er.edge_created_ms) as f32;
         }
         let idx = candidates.len();
         candidates.push(RankedCandidate {

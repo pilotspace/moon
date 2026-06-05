@@ -34,6 +34,28 @@ pub fn tl_clock_set(secs: u32, ms: u64) {
     TL_NOW_MS.with(|c| c.set(ms));
 }
 
+/// RAII pin for the thread-local cached clock in tests; resets to 0 on drop
+/// (panic-safe), restoring the syscall fallback. Single shared home so test
+/// modules don't each carry their own copy or leak a pinned clock into the
+/// next test on the same thread.
+#[cfg(test)]
+pub struct ClockPin;
+
+#[cfg(test)]
+impl ClockPin {
+    pub fn set(secs: u32, ms: u64) -> Self {
+        tl_clock_set(secs, ms);
+        ClockPin
+    }
+}
+
+#[cfg(test)]
+impl Drop for ClockPin {
+    fn drop(&mut self) {
+        tl_clock_set(0, 0);
+    }
+}
+
 #[cold]
 fn current_secs_syscall() -> u32 {
     SystemTime::now()

@@ -495,6 +495,19 @@ pub fn graph_query_write(store: &mut GraphStore, args: &[Frame]) -> Frame {
         }
     };
 
+    // Decay biases read-path traversal cost only; reject before any side
+    // effect (LSN allocation, mutation) — same contract as the write branch
+    // of `graph_query_or_write`.
+    match parse_decay(args) {
+        Ok(None) => {}
+        Ok(Some(_)) => {
+            return Frame::Error(Bytes::from_static(
+                b"ERR --decay requires a read-only Cypher query",
+            ));
+        }
+        Err(msg) => return Frame::Error(Bytes::from_static(msg.as_bytes())),
+    }
+
     let plan = match cypher::planner::compile(&query) {
         Ok(p) => p,
         Err(e) => {
@@ -698,6 +711,29 @@ pub fn graph_query_or_write(
 
         (exec_result_to_frame(&result), Vec::new(), Vec::new())
     } else {
+        // Decay biases read-path traversal cost only; a write query must not
+        // silently accept (or skip validating) the flag. Reject before any
+        // side effect (LSN allocation, mutation).
+        match parse_decay(args) {
+            Ok(None) => {}
+            Ok(Some(_)) => {
+                return (
+                    Frame::Error(Bytes::from_static(
+                        b"ERR --decay requires a read-only Cypher query",
+                    )),
+                    Vec::new(),
+                    Vec::new(),
+                );
+            }
+            Err(msg) => {
+                return (
+                    Frame::Error(Bytes::from_static(msg.as_bytes())),
+                    Vec::new(),
+                    Vec::new(),
+                );
+            }
+        }
+
         // Write path: compile plan (no cache for writes), execute with mutations.
         let plan = match cypher::planner::compile(&query) {
             Ok(p) => p,

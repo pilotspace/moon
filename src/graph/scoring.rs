@@ -201,6 +201,16 @@ impl DecayConfig {
     pub fn cost_fn(&self) -> WeightedCostFn {
         WeightedCostFn::new(self.lambda_per_sec * self.time_weight, 1.0, self.now_ms)
     }
+
+    /// Pure age penalty `lambda * time_weight * age_seconds` for an edge
+    /// created at `created_ms` (Unix millis). Single home for the decay
+    /// formula so re-ranking surfaces (FT.NAVIGATE) cannot drift from the
+    /// traversal cost: unknown stamps (0) are neutral and future stamps
+    /// saturate to age 0, exactly per [`WeightedCostFn::cost_ms`].
+    #[inline]
+    pub fn age_penalty_ms(&self, created_ms: u64) -> f64 {
+        self.cost_fn().cost_ms(created_ms, 0.0)
+    }
 }
 
 #[cfg(test)]
@@ -388,6 +398,22 @@ mod tests {
         // age = 100 - 30 = 70
         let cost = cost_fn.cost(30, 999.0);
         assert!((cost - 70.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_decay_age_penalty_ms_matches_cost_ms() {
+        let d = DecayConfig {
+            lambda_per_sec: 0.5,
+            time_weight: 2.0,
+            now_ms: 100_000,
+        };
+        // age = (100_000 - 40_000) / 1000 = 60s; penalty = 0.5 * 2.0 * 60 = 60
+        assert!((d.age_penalty_ms(40_000) - 60.0).abs() < f64::EPSILON);
+        // identical to the traversal cost with zero weight — one formula
+        assert_eq!(d.age_penalty_ms(40_000), d.cost_fn().cost_ms(40_000, 0.0));
+        // unknown stamp is neutral, future stamp saturates to 0
+        assert_eq!(d.age_penalty_ms(0), 0.0);
+        assert_eq!(d.age_penalty_ms(200_000), 0.0);
     }
 
     // --- EdgeScore tests ---

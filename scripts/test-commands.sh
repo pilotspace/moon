@@ -1992,6 +1992,16 @@ if should_run "temporal"; then
         PASS=$((PASS + 1)); echo "  PASS: FT.NAVIGATE DECAY 0.5 accepted (no DECAY parse error)"
     fi
 
+    # DECAY-07: --decay on a write query rejected (read-only-traversal knob,
+    # never silently ignored)
+    TOTAL=$((TOTAL + 1))
+    WR_OUT=$(mcli GRAPH.QUERY decayg "CREATE (:Person {name: 'X'})" --decay 0.5 2>&1)
+    if echo "$WR_OUT" | grep -qi "read-only"; then
+        PASS=$((PASS + 1)); echo "  PASS: GRAPH.QUERY --decay on write query rejected"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: --decay on CREATE should be rejected: $WR_OUT"
+    fi
+
     mcli GRAPH.DELETE decayg >/dev/null 2>&1
     echo "  temporal decay: done"
 fi

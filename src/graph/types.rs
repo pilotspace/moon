@@ -91,6 +91,15 @@ pub struct MutableEdge {
     pub created_ms: u64,
 }
 
+/// Current CSR segment format version, stamped on every newly built segment
+/// (`CsrSegment::from_frozen`, `compact_segments`). Single source of truth —
+/// a construction site stamping a stale literal is exactly the bug class that
+/// made vacuumed segments misparse on reload (v1 stamp on v2 records).
+///
+/// Parse-side gates stay numeric (`version >= 2`, `version >= 3`): they encode
+/// the version a feature was INTRODUCED at and must not track this constant.
+pub const CSR_CURRENT_VERSION: u32 = 3;
+
 /// On-disk CSR segment header -- cache-line aligned, zero-copy mmap.
 #[derive(Debug)]
 #[repr(C, align(64))]

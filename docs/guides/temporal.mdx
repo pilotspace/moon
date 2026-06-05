@@ -69,7 +69,16 @@ that stamp into a recency bias for traversal — the primitive behind
 ```
 
 - `λ` is a decay rate in **1/seconds**; both surfaces validate it strictly
-  (finite, non-negative). `--time-weight` requires `--decay`.
+  (finite, non-negative). `--time-weight` requires `--decay`, and `--decay`
+  is rejected on write queries (CREATE, SET, DELETE, MERGE) — it biases
+  read-path traversal only.
+- The two surfaces apply decay differently: `GRAPH.QUERY --decay` **steers**
+  the traversal itself (the age term is part of the Dijkstra edge cost, so
+  decay changes which paths get explored), while `FT.NAVIGATE DECAY`
+  **re-ranks** hits the graph expansion already discovered — the BFS frontier
+  itself is not decay-aware, so nodes reachable only through stale edges
+  beyond the expansion budget are penalized, not replaced by fresher
+  alternatives. KNN (hop-0) hits are never decay-penalized.
 - **Decay off (no flag) is exact distance-only behavior** — the age term
   contributes zero to every edge cost, so path choice is identical to
   pre-decay Moon.

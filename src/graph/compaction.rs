@@ -466,12 +466,13 @@ pub fn compact_segments(
         hasher.finalize() as u64
     };
 
-    // Version 3: to_bytes always writes 48-byte v2+ NodeMeta records plus the
-    // per-edge created_ms section. Stamping an older version here would make
-    // from_bytes misparse the serialized segment (version 1 = 32-byte stride).
+    // Current version: to_bytes always writes 48-byte v2+ NodeMeta records
+    // plus the per-edge created_ms section. Stamping an older version here
+    // would make from_bytes misparse the serialized segment (version 1 =
+    // 32-byte stride) — the exact bug fixed in the P3 durability fix.
     let header = GraphSegmentHeader {
         magic: *b"MNGR",
-        version: 3,
+        version: crate::graph::types::CSR_CURRENT_VERSION,
         node_count: node_count as u32,
         edge_count: edge_count as u32,
         min_node_id,
@@ -647,10 +648,11 @@ mod tests {
             keys.push(mg.add_node(smallvec![0], smallvec![], None, 1));
         }
         for &(s, d, ms) in edges {
-            crate::storage::entry::tl_clock_set((ms / 1000) as u32, ms);
+            // RAII pin: an expect() failure must not leak a pinned clock
+            // into the next test on this thread.
+            let _pin = crate::storage::entry::ClockPin::set((ms / 1000) as u32, ms);
             mg.add_edge(keys[s], keys[d], 1, 1.0, None, 2).expect("ok");
         }
-        crate::storage::entry::tl_clock_set(0, 0);
         let frozen = mg.freeze().expect("ok");
         CsrSegment::from_frozen(frozen, lsn).expect("ok")
     }

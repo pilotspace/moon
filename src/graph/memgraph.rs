@@ -405,21 +405,7 @@ mod tests {
         assert_eq!(node.deleted_lsn, u64::MAX);
     }
 
-    /// Pins the thread-local cached clock for the test and resets it on drop
-    /// (Drop also runs on panic, so other tests on this thread never observe
-    /// the pinned value).
-    struct ClockPin;
-    impl ClockPin {
-        fn set(secs: u32, ms: u64) -> Self {
-            crate::storage::entry::tl_clock_set(secs, ms);
-            ClockPin
-        }
-    }
-    impl Drop for ClockPin {
-        fn drop(&mut self) {
-            crate::storage::entry::tl_clock_set(0, 0);
-        }
-    }
+    use crate::storage::entry::ClockPin;
 
     #[test]
     fn test_add_edge_stamps_created_ms_from_cached_clock() {

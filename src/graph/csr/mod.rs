@@ -186,7 +186,7 @@ impl CsrSegment {
 
         let header = GraphSegmentHeader {
             magic: *b"MNGR",
-            version: 3,
+            version: crate::graph::types::CSR_CURRENT_VERSION,
             node_count: node_count as u32,
             edge_count: edge_count as u32,
             min_node_id,
@@ -354,6 +354,15 @@ impl CsrSegment {
         let nm_size = self.node_meta.len() * core::mem::size_of::<NodeMeta>();
         // Per-edge created_ms section only exists in version >= 3 files.
         // Always edge_count entries (zero-filled when stamps are unknown).
+        // Invariant: stamps are either absent entirely (pre-v3 source, the
+        // loop below zero-fills) or exactly parallel to col_indices — a
+        // partial array means a construction-site bug, not a valid state.
+        debug_assert!(
+            self.edge_created_ms.is_empty() || self.edge_created_ms.len() == self.col_indices.len(),
+            "edge_created_ms ({}) must be empty or parallel to col_indices ({})",
+            self.edge_created_ms.len(),
+            self.col_indices.len()
+        );
         let write_ecms = self.header.version >= 3;
         let ecms_size = if write_ecms {
             self.col_indices.len() * 8
@@ -1285,19 +1294,7 @@ mod tests {
 
     // --- P3: per-edge created_ms fidelity (temporal-decay scoring) ---
 
-    /// Pin the thread-local cached clock; reset on drop (panic-safe).
-    struct ClockPin;
-    impl ClockPin {
-        fn set(secs: u32, ms: u64) -> Self {
-            crate::storage::entry::tl_clock_set(secs, ms);
-            ClockPin
-        }
-    }
-    impl Drop for ClockPin {
-        fn drop(&mut self) {
-            crate::storage::entry::tl_clock_set(0, 0);
-        }
-    }
+    use crate::storage::entry::ClockPin;
 
     /// 2 nodes, 3 edges with distinct pinned wall-clock stamps.
     /// Shape chosen so node_meta lands 8-aligned (nc+1+ec even) and the
@@ -1355,25 +1352,29 @@ mod tests {
         assert_eq!(storage.edge_created_ms(), csr.edge_created_ms.as_slice());
     }
 
-    #[test]
-    fn test_v2_bytes_parse_with_empty_edge_created_ms() {
-        // Construct v2-format bytes (no edge_created_ms section) from a v3
-        // segment: strip the trailing section, patch version to 2, recompute
-        // the CRC. The parser must accept them with empty stamps and the
-        // graph fully intact — old segment files keep loading after upgrade.
-        let frozen = build_stamped_graph();
-        let csr = CsrSegment::from_frozen(frozen, 100).expect("csr ok");
+    /// Construct v2-format bytes (no edge_created_ms section) from a v3
+    /// segment: strip the trailing section, patch version to 2, zero the v3
+    /// edge_created_ms_offset header field (byte 80 — a v2 writer never set
+    /// it), recompute the CRC.
+    fn downgrade_to_v2(csr: &CsrSegment) -> Vec<u8> {
         let v3_bytes = csr.to_bytes();
-
         let ec = csr.edge_count() as usize;
         let mut v2_bytes = v3_bytes[..v3_bytes.len() - ec * 8].to_vec();
         v2_bytes[4..8].copy_from_slice(&2u32.to_le_bytes());
-        // Zero the v3 edge_created_ms_offset header field (byte 80) — a v2
-        // writer never set it.
         v2_bytes[80..88].copy_from_slice(&0u64.to_le_bytes());
         v2_bytes[72..80].copy_from_slice(&0u64.to_le_bytes());
         let checksum = compute_csr_checksum(&v2_bytes) as u64;
         v2_bytes[72..80].copy_from_slice(&checksum.to_le_bytes());
+        v2_bytes
+    }
+
+    #[test]
+    fn test_v2_bytes_parse_with_empty_edge_created_ms() {
+        // Old (v2) segment files must keep loading after the v3 upgrade:
+        // the parser accepts them with empty stamps and the graph intact.
+        let frozen = build_stamped_graph();
+        let csr = CsrSegment::from_frozen(frozen, 100).expect("csr ok");
+        let v2_bytes = downgrade_to_v2(&csr);
 
         // Heap parse path.
         let restored = CsrSegment::from_bytes(&v2_bytes).expect("v2 parse ok");
@@ -1400,14 +1401,7 @@ mod tests {
         // for it, and the round-trip stays consistent.
         let frozen = build_stamped_graph();
         let csr = CsrSegment::from_frozen(frozen, 100).expect("csr ok");
-        let v3_bytes = csr.to_bytes();
-        let ec = csr.edge_count() as usize;
-        let mut v2_bytes = v3_bytes[..v3_bytes.len() - ec * 8].to_vec();
-        v2_bytes[4..8].copy_from_slice(&2u32.to_le_bytes());
-        v2_bytes[80..88].copy_from_slice(&0u64.to_le_bytes());
-        v2_bytes[72..80].copy_from_slice(&0u64.to_le_bytes());
-        let checksum = compute_csr_checksum(&v2_bytes) as u64;
-        v2_bytes[72..80].copy_from_slice(&checksum.to_le_bytes());
+        let v2_bytes = downgrade_to_v2(&csr);
 
         let loaded = CsrSegment::from_bytes(&v2_bytes).expect("v2 parse ok");
         let rewritten = loaded.to_bytes();
