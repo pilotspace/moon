@@ -85,10 +85,10 @@ impl GraphManifest {
         std::fs::rename(&tmp_path, path)?;
         // Fsync the parent directory to ensure the rename metadata is durable.
         // Without this, a crash between rename and directory fsync loses the manifest.
+        // Routed through the cross-platform helper (no-op on Windows); errors
+        // propagate so callers see a save() that is not actually durable.
         if let Some(parent) = path.parent() {
-            if let Ok(dir) = std::fs::File::open(parent) {
-                let _ = dir.sync_all();
-            }
+            crate::persistence::fsync::fsync_directory(parent)?;
         }
         Ok(())
     }

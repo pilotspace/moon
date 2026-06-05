@@ -1,0 +1,104 @@
+# Formula template for moon — rendered by packaging/bump-homebrew.sh
+# Placeholders: {{VERSION}} {{SHA_AARCH64_MACOS}} {{SHA_X86_64_MACOS}}
+#               {{SHA_AARCH64_LINUX}} {{SHA_X86_64_LINUX}}
+#
+# VERSION is the numeric version (e.g. 0.2.0), without a leading 'v'.
+# URLs use a literal 'v' prefix so the release asset name stays correct:
+#   moon-v0.2.0-aarch64-macos.tar.gz
+
+class Moon < Formula
+  desc "High-performance Redis-compatible server"
+  homepage "https://github.com/pilotspace/moon"
+  license "Apache-2.0"
+  version "{{VERSION}}"
+
+  on_macos do
+    on_arm do
+      url "https://github.com/pilotspace/moon/releases/download/v{{VERSION}}/moon-v{{VERSION}}-aarch64-macos.tar.gz"
+      sha256 "{{SHA_AARCH64_MACOS}}"
+    end
+
+    on_intel do
+      url "https://github.com/pilotspace/moon/releases/download/v{{VERSION}}/moon-v{{VERSION}}-x86_64-macos.tar.gz"
+      sha256 "{{SHA_X86_64_MACOS}}"
+    end
+  end
+
+  on_linux do
+    on_arm do
+      url "https://github.com/pilotspace/moon/releases/download/v{{VERSION}}/moon-v{{VERSION}}-aarch64-linux-tokio.tar.gz"
+      sha256 "{{SHA_AARCH64_LINUX}}"
+    end
+
+    on_intel do
+      url "https://github.com/pilotspace/moon/releases/download/v{{VERSION}}/moon-v{{VERSION}}-x86_64-linux-tokio.tar.gz"
+      sha256 "{{SHA_X86_64_LINUX}}"
+    end
+  end
+
+  def install
+    bin.install "moon"
+    # Always create the service working directory so `brew services start`
+    # does not fail with "working directory does not exist".
+    (var/"moon").mkpath
+    # Guarantee a config file exists at #{etc}/moon/moon.conf — the brew
+    # service runs `moon --config` against it. Prefer the commented example
+    # shipped in the tarball; fall back to a minimal default. Never overwrite
+    # a user-edited config on upgrade.
+    (etc/"moon").mkpath
+    unless (etc/"moon/moon.conf").exist?
+      if (buildpath/"moon.conf.example").exist?
+        etc.install "moon.conf.example" => "moon/moon.conf"
+      else
+        (etc/"moon/moon.conf").write <<~EOS
+          # moon.conf — redis-style configuration (key value per line).
+          # CLI flags override values in this file.
+          # Data directory is supplied by the brew service via --dir.
+          bind 127.0.0.1
+          port 6379
+          appendonly yes
+        EOS
+      end
+    end
+  end
+
+  service do
+    # moon loads redis-style config via --config (CLI flags still override).
+    # --dir is passed explicitly so data lands in Homebrew's var tree even if
+    # the user removes the dir directive from the conf.
+    run [opt_bin/"moon", "--config", etc/"moon/moon.conf", "--dir", var/"moon"]
+    keep_alive true
+    log_path var/"log/moon.log"
+    error_log_path var/"log/moon.log"
+    working_dir var/"moon"
+  end
+
+  def caveats
+    <<~EOS
+      IMPORTANT: PATH CONFLICT — Homebrew core ships a tool called "moon" from
+      the moonrepo project. Installing this formula via the tap:
+        brew install pilotspace/moon/moon
+      places this binary (Redis-compatible server) on your PATH as "moon".
+      If you have moonrepo's moon installed, rename one or set explicit aliases.
+
+      To start moon now and at login:
+        brew services start pilotspace/moon/moon
+
+      Configuration file (loaded by the managed service via --config):
+        #{etc}/moon/moon.conf
+      Edit it and restart the service to apply changes:
+        brew services restart pilotspace/moon/moon
+      CLI flags override conf values when running moon directly:
+        moon --config #{etc}/moon/moon.conf --port 6380
+
+      The embedded web console is reachable at:
+        http://localhost:<admin-port>   (set via --admin-port flag)
+    EOS
+  end
+
+  test do
+    # Validate config without spawning a server (avoids port conflicts in
+    # the Homebrew sandbox). moon --check-config exits 0 on valid config.
+    system bin/"moon", "--check-config"
+  end
+end

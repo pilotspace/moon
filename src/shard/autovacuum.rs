@@ -499,15 +499,14 @@ impl AutovacuumDaemon {
         self.budget_ms = ms.clamp(self.cfg.budget_ms_min, self.cfg.budget_ms_max);
     }
 
-    /// Force `last_run_at` to be far in the past so next tick is always overdue.
+    /// Force the next tick to be overdue by resetting `last_run_at` to "never ran".
     ///
     /// Intentionally not `#[cfg(test)]` — same reason as `set_budget_ms_for_test`.
+    /// `None` (not a far-past `Instant`) because Windows `Instant` is unsigned:
+    /// `checked_sub` of a huge duration returns `None` there, and the old
+    /// `unwrap_or_else(Instant::now)` fallback silently made the tick NOT overdue.
     pub fn force_overdue_for_test(&mut self) {
-        self.last_run_at = Some(
-            Instant::now()
-                .checked_sub(Duration::from_secs(u64::MAX / 2))
-                .unwrap_or_else(Instant::now),
-        );
+        self.last_run_at = None;
     }
 
     // ----------------------------------------------------------------

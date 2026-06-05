@@ -50,6 +50,64 @@ composite cost) existed but was unreachable — `shortestPath()` hardcoded
   on restart (newest edges look new — bias direction preserved);
   CSR-resident edges keep exact age.
 
+### Added — Ship moon as an installable application on macOS, Linux, and Windows
+
+Five-PR milestone making moon installable on all three platforms
+(consolidated entry; the sibling PRs carry the `skip-changelog` label).
+
+- **Windows native port** — cross-platform positioned-I/O helper
+  (`src/util/file_ext.rs`; pwrite/pread on unix, `seek_write`/`seek_read`
+  loops on Windows), portable `RawSocketFd` alias with `#[cfg(unix)]`-gated
+  connection-migration fd ops, `compile_error!` guard for `jemalloc` on
+  Windows MSVC (mimalloc fallback), and Windows-only startup warnings
+  (VirtualLock working-set, no memory guardrail). Build:
+  `--no-default-features --features runtime-tokio,graph,text-index`.
+- **Graceful shutdown on SIGTERM** — `ctrlc` `termination` feature with a
+  single centralized handler in `main.rs`; `systemctl stop` / `launchctl
+  stop` now flush AOF before exit (previously only SIGINT was caught).
+- **Version strings** — `INFO server` reports `redis_version:7.4.0`
+  (client feature-gating) plus a new `moon_version:` field from
+  `CARGO_PKG_VERSION`; HELLO/LOLWUT report the real moon version
+  (previously hardcoded `0.1.0`).
+- **moon.conf config file** — redis-style `key value` config
+  (`moon /etc/moon/moon.conf` or `--config`), CLI flags override the file;
+  commented default shipped as `packaging/moon.conf.example` and installed
+  to `/etc/moon/moon.conf` (deb/rpm, `config|noreplace`).
+- **Install channels** — `install.sh` (Linux/macOS) and `install.ps1`
+  (Windows) one-liner installers with SHA256 verification; Homebrew tap
+  automation (`packaging/homebrew/moon.rb.tmpl` + `bump-homebrew.sh`
+  publishing to `pilotspace/homebrew-moon` on release).
+- **Release pipeline overhaul** — 8-target matrix (linux gnu/musl
+  x86_64/aarch64, macOS arm64/Intel, Windows x86_64 MSVC), all release
+  binaries now include `graph,text-index,console` (previously missing from
+  releases), `prepare-console` pnpm build job, checksums + cosign over all
+  artifacts including .deb/.rpm, `--prerelease` for `-rc` tags, and a
+  `workflow_dispatch` dry-run mode.
+- **Packaging fixes** — nfpm license corrected to Apache-2.0,
+  `moon.service` ExecStart path fixed (`/usr/bin/moon`), CI gains
+  main-push-only `check-windows` and `check-console` jobs plus a macOS
+  Intel cross-build check.
+- **Console build fix (PR #152)** — graph components aligned with the
+  pinned `@cosmos.gl/graph` 2.6.4 API (`setConfigPartial` → `setConfig`,
+  no async `ready` hook); `pnpm run build` type-checks again, unblocking
+  the Console Integration workflow and the release `prepare-console` job.
+- **RESP3 negotiation fix (PR #153)** — the monoio (default) handler now
+  syncs the wire codec when `HELLO 3` negotiates RESP3; previously the
+  codec stayed on RESP2 and silently flattened map/set/push frames,
+  breaking RESP3 clients on connect (redis-py 8 defaults to RESP3).
+- **Windows runtime fixes (PR #154)** — first fully green `check-windows`
+  run: fsync helpers reworked for Windows semantics (no directory
+  handles, writable handle for `FlushFileBuffers`); unsigned-`Instant`
+  underflows fixed (autovacuum scheduling, rate-limiter cutoffs, mvcc
+  test anchors); the tokio sharded handler no longer initiates connection
+  migration on non-unix platforms (previously aborted clients mid-session
+  in multishard workloads); `GraphManifest::save` now propagates
+  parent-dir fsync errors.
+- **Known limitations (v0.2.0)** — Windows binaries are not
+  Authenticode-signed (SmartScreen warning); connection migration is
+  unix-only (connections stay on the originating shard on Windows);
+  Windows service wrapper + MSI deferred.
+
 ### Fixed — CodeRabbit PR #136 durability follow-ups + decomposition + test isolation (PR #144)
 
 Closes the 8 CodeRabbit findings left open after PR #136, plus two PR #144-review
