@@ -906,11 +906,13 @@ mod tests {
     fn test_mark_old_snapshots_killed_returns_count() {
         let mut mgr = TransactionManager::new();
         let baseline = Instant::now();
-        // Begin a snapshot "700 seconds ago" by using a synthetic past Instant.
-        // We inject the started_at directly via begin_with_time.
-        let t1 = mgr.begin_with_time(baseline - Duration::from_secs(700));
+        // Begin a snapshot at `baseline`, then evaluate 700 seconds "later" by
+        // passing a synthetic future `now`. Anchors shift FORWARD because
+        // Windows `Instant` is unsigned (time since boot) — `baseline - 700s`
+        // panics there whenever the host has been up less than 700s.
+        let t1 = mgr.begin_with_time(baseline);
         let threshold = Duration::from_secs(600);
-        let now = baseline; // 700s after t1's start
+        let now = baseline + Duration::from_secs(700); // t1 is 700s old at `now`
         let killed = mgr.mark_old_snapshots_killed(now, threshold);
         assert_eq!(
             killed, 1,
@@ -924,9 +926,10 @@ mod tests {
     fn test_mark_old_snapshots_killed_spares_young_snapshots() {
         let mut mgr = TransactionManager::new();
         let baseline = Instant::now();
-        let t1 = mgr.begin_with_time(baseline - Duration::from_secs(300));
+        // Forward-shifted anchor (see test_mark_old_snapshots_killed_returns_count).
+        let t1 = mgr.begin_with_time(baseline);
         let threshold = Duration::from_secs(600);
-        let killed = mgr.mark_old_snapshots_killed(baseline, threshold);
+        let killed = mgr.mark_old_snapshots_killed(baseline + Duration::from_secs(300), threshold);
         assert_eq!(killed, 0, "young snapshot must not be killed");
         assert!(!mgr.is_killed(t1.txn_id));
     }
@@ -937,15 +940,16 @@ mod tests {
     fn test_killed_snapshot_advances_oldest_snapshot() {
         let mut mgr = TransactionManager::new();
         let baseline = Instant::now();
-        // t1: old (700s), t2: young (100s)
-        let t1 = mgr.begin_with_time(baseline - Duration::from_secs(700));
-        let t2 = mgr.begin_with_time(baseline - Duration::from_secs(100));
+        // Forward-shifted anchors (see test_mark_old_snapshots_killed_returns_count):
+        // at `now` = baseline+700s, t1 is 700s old and t2 is 100s old.
+        let t1 = mgr.begin_with_time(baseline);
+        let t2 = mgr.begin_with_time(baseline + Duration::from_secs(600));
         let threshold = Duration::from_secs(600);
 
         // Before kill: oldest_snapshot is t1's snapshot_lsn (0).
         assert_eq!(mgr.oldest_snapshot(), t1.snapshot_lsn);
 
-        mgr.mark_old_snapshots_killed(baseline, threshold);
+        mgr.mark_old_snapshots_killed(baseline + Duration::from_secs(700), threshold);
 
         // After kill: oldest_snapshot must skip t1 and reflect t2's snapshot_lsn.
         assert_eq!(
@@ -1015,8 +1019,11 @@ mod tests {
     fn test_oldest_snapshot_age_with_active() {
         let mut mgr = TransactionManager::new();
         let baseline = Instant::now();
-        let _t1 = mgr.begin_with_time(baseline - Duration::from_secs(42));
-        let age = mgr.oldest_snapshot_age(baseline).expect("age must be Some");
+        // Forward-shifted anchor (see test_mark_old_snapshots_killed_returns_count).
+        let _t1 = mgr.begin_with_time(baseline);
+        let age = mgr
+            .oldest_snapshot_age(baseline + Duration::from_secs(42))
+            .expect("age must be Some");
         assert!(age.as_secs() >= 42, "age must be >= 42s; got {:?}", age);
     }
 }
