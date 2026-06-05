@@ -95,7 +95,12 @@ pub(crate) async fn handle_connection_sharded(
         ctx,
         shutdown,
         client_id,
-        true, // can_migrate: plain TCP supports FD extraction
+        // can_migrate: FD extraction is unix-only. On other platforms the
+        // affinity tracker must NOT initiate migration — the handler would
+        // return the stream for fd-passing and the non-unix arm below can only
+        // drop it, aborting the client mid-session (seen as WSAECONNABORTED
+        // 10053 in multishard tests on Windows). Mirrors conn_accept.rs:627.
+        cfg!(unix),
         BytesMut::new(),
         None, // fresh connection, no migrated state
     )
