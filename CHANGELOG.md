@@ -47,6 +47,10 @@ Five-PR milestone making moon installable on all three platforms
   `moon.service` ExecStart path fixed (`/usr/bin/moon`), CI gains
   main-push-only `check-windows` and `check-console` jobs plus a macOS
   Intel cross-build check.
+- **Console build fix (PR #152)** — graph components aligned with the
+  pinned `@cosmos.gl/graph` 2.6.4 API (`setConfigPartial` → `setConfig`,
+  no async `ready` hook); `pnpm run build` type-checks again, unblocking
+  the Console Integration workflow and the release `prepare-console` job.
 - **Known limitations (v0.2.0)** — Windows binaries are not
   Authenticode-signed (SmartScreen warning); connection migration is
   unix-only (connections stay on the originating shard on Windows);
