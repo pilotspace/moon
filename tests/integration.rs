@@ -224,16 +224,31 @@ async fn start_server_with_pass(password: &str) -> (u16, CancellationToken) {
     (port, token)
 }
 
+/// Connection config for tests: redis-rs 1.x defaults `response_timeout` to
+/// 500ms, which is tighter than moon's 2000ms appendfsync=always ack bound and
+/// flakes on slow CI disks (observed: Windows runners, first fsync > 500ms).
+/// 30s keeps a bound (a hung server still fails fast) without latency-testing.
+fn test_conn_config() -> redis::AsyncConnectionConfig {
+    redis::AsyncConnectionConfig::new()
+        .set_response_timeout(Some(std::time::Duration::from_secs(30)))
+}
+
 /// Create a multiplexed async connection to the server on the given port.
 async fn connect(port: u16) -> redis::aio::MultiplexedConnection {
     let client = redis::Client::open(format!("redis://127.0.0.1:{}/", port)).unwrap();
-    client.get_multiplexed_async_connection().await.unwrap()
+    client
+        .get_multiplexed_async_connection_with_config(&test_conn_config())
+        .await
+        .unwrap()
 }
 
 /// Create a non-multiplexed async connection (needed for SELECT).
 async fn connect_single(port: u16) -> redis::aio::MultiplexedConnection {
     let client = redis::Client::open(format!("redis://127.0.0.1:{}/", port)).unwrap();
-    client.get_multiplexed_async_connection().await.unwrap()
+    client
+        .get_multiplexed_async_connection_with_config(&test_conn_config())
+        .await
+        .unwrap()
 }
 
 #[tokio::test]
@@ -1166,7 +1181,10 @@ async fn test_auth_required() {
     // Connect without auth -- use a single (non-multiplexed) connection
     // so we control the auth flow precisely
     let client = redis::Client::open(format!("redis://127.0.0.1:{}/", port)).unwrap();
-    let mut conn = client.get_multiplexed_async_connection().await.unwrap();
+    let mut conn = client
+        .get_multiplexed_async_connection_with_config(&test_conn_config())
+        .await
+        .unwrap();
 
     // GET before AUTH -> NOAUTH error
     let result: redis::RedisResult<Option<String>> =
@@ -3377,7 +3395,10 @@ async fn blpop_blocks_then_wakes() {
 
     // Use non-multiplexed connection for blocking
     let client1 = redis::Client::open(format!("redis://127.0.0.1:{}/", port)).unwrap();
-    let mut con1 = client1.get_multiplexed_async_connection().await.unwrap();
+    let mut con1 = client1
+        .get_multiplexed_async_connection_with_config(&test_conn_config())
+        .await
+        .unwrap();
 
     let mut con2 = connect(port).await;
 
@@ -3418,7 +3439,10 @@ async fn blpop_timeout() {
     let (port, shutdown) = start_sharded_server(1).await;
 
     let client = redis::Client::open(format!("redis://127.0.0.1:{}/", port)).unwrap();
-    let mut conn = client.get_multiplexed_async_connection().await.unwrap();
+    let mut conn = client
+        .get_multiplexed_async_connection_with_config(&test_conn_config())
+        .await
+        .unwrap();
 
     let start = std::time::Instant::now();
     // BLPOP on empty key with short timeout
@@ -3481,7 +3505,10 @@ async fn blpop_cross_shard_wakeup() {
     let (port, shutdown) = start_sharded_server(4).await;
 
     let client1 = redis::Client::open(format!("redis://127.0.0.1:{}/", port)).unwrap();
-    let mut con1 = client1.get_multiplexed_async_connection().await.unwrap();
+    let mut con1 = client1
+        .get_multiplexed_async_connection_with_config(&test_conn_config())
+        .await
+        .unwrap();
     let mut con2 = connect(port).await;
 
     // BLPOP blocks on two keys; push to the second key from another connection
@@ -3523,7 +3550,10 @@ async fn blpop_cross_shard_timeout() {
     let (port, shutdown) = start_sharded_server(4).await;
 
     let client = redis::Client::open(format!("redis://127.0.0.1:{}/", port)).unwrap();
-    let mut conn = client.get_multiplexed_async_connection().await.unwrap();
+    let mut conn = client
+        .get_multiplexed_async_connection_with_config(&test_conn_config())
+        .await
+        .unwrap();
 
     let start = std::time::Instant::now();
     let result: Option<(String, String)> = redis::cmd("BLPOP")
@@ -3556,7 +3586,10 @@ async fn blpop_multi_key_all_local_regression() {
     let (port, shutdown) = start_sharded_server(1).await;
 
     let client1 = redis::Client::open(format!("redis://127.0.0.1:{}/", port)).unwrap();
-    let mut con1 = client1.get_multiplexed_async_connection().await.unwrap();
+    let mut con1 = client1
+        .get_multiplexed_async_connection_with_config(&test_conn_config())
+        .await
+        .unwrap();
     let mut con2 = connect(port).await;
 
     let blpop_handle = tokio::spawn(async move {
@@ -3687,7 +3720,10 @@ async fn bzpopmin_blocks_then_wakes() {
     let (port, shutdown) = start_sharded_server(1).await;
 
     let client1 = redis::Client::open(format!("redis://127.0.0.1:{}/", port)).unwrap();
-    let mut con1 = client1.get_multiplexed_async_connection().await.unwrap();
+    let mut con1 = client1
+        .get_multiplexed_async_connection_with_config(&test_conn_config())
+        .await
+        .unwrap();
 
     let mut con2 = connect(port).await;
 
