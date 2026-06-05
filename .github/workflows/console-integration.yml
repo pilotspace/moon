@@ -30,6 +30,8 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install python deps
-        run: python -m pip install --upgrade pip numpy redis
+        # redis-py majors change protocol behaviour (8.0 made RESP3 the
+        # default handshake) — pin the major so the harness doesn't drift.
+        run: python -m pip install --upgrade pip numpy "redis>=8,<9"
       - name: Run integration harness
         run: bash scripts/test-integration.sh
