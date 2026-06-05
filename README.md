@@ -253,10 +253,14 @@ docker run -p 6379:6379 ghcr.io/pilotspace/moon:latest
 ### Verify downloads
 
 Every artifact is checksummed in `SHA256SUMS.txt` and signed with
-[cosign](https://docs.sigstore.dev/) (keyless). To verify:
+[cosign](https://docs.sigstore.dev/) (keyless) — each signature ships
+with its Fulcio certificate (`.sig` + `.crt`). To verify the manifest,
+download `SHA256SUMS.txt{,.sig,.crt}` from the release and run:
 
 ```bash
-cosign verify-blob --signature SHA256SUMS.txt.sig SHA256SUMS.txt \
+cosign verify-blob SHA256SUMS.txt \
+  --signature SHA256SUMS.txt.sig \
+  --certificate SHA256SUMS.txt.crt \
   --certificate-identity-regexp 'github.com/pilotspace/moon' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```
