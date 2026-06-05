@@ -31,6 +31,7 @@ jobs:
           - acl_rule
           - rdb_load
           - cypher_parse
+          - conf_parse
           - csr_from_bytes
     steps:
       - uses: actions/checkout@v6
@@ -71,6 +72,7 @@ jobs:
           - acl_rule
           - rdb_load
           - cypher_parse
+          - conf_parse
           - csr_from_bytes
     steps:
       - uses: actions/checkout@v6

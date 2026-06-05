@@ -170,26 +170,28 @@ impl WarmSearchSegment {
         // `vector::persistence::sealed_mmap` module docs for the seal contract.
         // The mmaps live only for the duration of `open()` — payload bytes are
         // copied into owned `Vec<u8>` before this function returns.
-        use crate::vector::persistence::sealed_mmap::map_sealed_file;
+        use crate::vector::persistence::sealed_mmap::{
+            AccessPattern, advise_pattern, lock_resident, map_sealed_file,
+        };
 
         let codes_mmap = map_sealed_file(&segment_dir.join("codes.mpf"))?;
-        codes_mmap.advise(memmap2::Advice::Sequential)?;
+        advise_pattern(&codes_mmap, AccessPattern::Sequential)?;
         if mlock_codes {
-            if let Err(e) = codes_mmap.lock() {
+            if let Err(e) = lock_resident(&codes_mmap) {
                 tracing::warn!("mlock codes.mpf failed for segment {segment_id}: {e}");
             }
         }
 
         // Open and mmap graph.mpf (4KB pages)
         let graph_mmap = map_sealed_file(&segment_dir.join("graph.mpf"))?;
-        graph_mmap.advise(memmap2::Advice::Random)?;
+        advise_pattern(&graph_mmap, AccessPattern::Random)?;
 
         // Open and mmap mvcc.mpf (4KB pages)
         let mvcc_mmap = map_sealed_file(&segment_dir.join("mvcc.mpf"))?;
-        mvcc_mmap.advise(memmap2::Advice::Sequential)?;
+        advise_pattern(&mvcc_mmap, AccessPattern::Sequential)?;
         // Lock mvcc pages in RAM -- visibility checks run on every query (design S14).
         // Failure is non-fatal: mlock may fail in containers or when RLIMIT_MEMLOCK is low.
-        if let Err(e) = mvcc_mmap.lock() {
+        if let Err(e) = lock_resident(&mvcc_mmap) {
             tracing::warn!(
                 "mlock mvcc.mpf failed for segment {segment_id}: {e} (continuing without mlock)"
             );

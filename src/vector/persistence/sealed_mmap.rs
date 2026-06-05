@@ -93,6 +93,66 @@ pub fn advise_dontneed(_mmap: &Mmap) {}
 #[cfg(unix)]
 use libc;
 
+// ── Access-pattern + residency hints ──────────────────────────────────────────
+
+/// Access-pattern hint for a sealed mmap, applied via `madvise(2)` on Unix.
+///
+/// Only the patterns the warm-segment readers need are exposed; extend as call
+/// sites require.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccessPattern {
+    /// `MADV_SEQUENTIAL` — aggressive read-ahead (linear scans of codes/mvcc).
+    Sequential,
+    /// `MADV_RANDOM` — disable read-ahead (HNSW graph traversal pointer-chases).
+    Random,
+}
+
+/// Apply an access-pattern hint to a sealed mmap.
+///
+/// On Unix this calls [`Mmap::advise`] (`madvise(2)`). On non-Unix targets it
+/// is a no-op returning `Ok(())` — the hint is purely advisory, and the
+/// Windows `PrefetchVirtualMemory` analog is deferred to v0.3.0.
+///
+/// `memmap2::Advice` only exists on Unix, which is why call sites must go
+/// through this wrapper instead of calling `Mmap::advise` directly.
+#[cfg(unix)]
+#[inline]
+pub fn advise_pattern(mmap: &Mmap, pattern: AccessPattern) -> io::Result<()> {
+    let advice = match pattern {
+        AccessPattern::Sequential => memmap2::Advice::Sequential,
+        AccessPattern::Random => memmap2::Advice::Random,
+    };
+    mmap.advise(advice)
+}
+
+/// No-op stub on non-Unix platforms (Windows, WASM): the hint is advisory only.
+#[cfg(not(unix))]
+#[inline]
+pub fn advise_pattern(_mmap: &Mmap, _pattern: AccessPattern) -> io::Result<()> {
+    Ok(())
+}
+
+/// Pin the mapped pages in physical memory (`mlock(2)`).
+///
+/// On Unix this calls [`Mmap::lock`]; the error is returned to the caller
+/// (mlock can fail under low `RLIMIT_MEMLOCK`, e.g. in containers — callers
+/// decide whether that is fatal). On non-Unix targets it is a no-op returning
+/// `Ok(())` — pages are NOT pinned; the Windows `VirtualLock` analog needs
+/// working-set tuning and is deferred (main.rs emits a startup warning when
+/// `--vec-codes-mlock` is enabled on Windows).
+#[cfg(unix)]
+#[inline]
+pub fn lock_resident(mmap: &Mmap) -> io::Result<()> {
+    mmap.lock()
+}
+
+/// No-op stub on non-Unix platforms: pages are not pinned.
+#[cfg(not(unix))]
+#[inline]
+pub fn lock_resident(_mmap: &Mmap) -> io::Result<()> {
+    Ok(())
+}
+
 /// Open `path` read-only and return a read-only mmap of the full file.
 ///
 /// The returned [`Mmap`] is sound to read for as long as the file adheres to
@@ -125,4 +185,40 @@ pub fn map_sealed(file: &File) -> io::Result<Mmap> {
     // no moon code writes to or truncates it while any mmap may be live.
     // SAFETY: File is sealed (read-only); no concurrent mutation within our process.
     unsafe { memmap2::MmapOptions::new().map(file) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    /// Write a small non-empty file and mmap it (empty files cannot be mapped).
+    fn mapped_fixture() -> (tempfile::TempDir, Mmap) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("fixture.mpf");
+        let mut f = File::create(&path).expect("create fixture");
+        f.write_all(&[0xABu8; 4096]).expect("write fixture");
+        f.sync_all().expect("sync fixture");
+        let mmap = map_sealed_file(&path).expect("map fixture");
+        (dir, mmap)
+    }
+
+    #[test]
+    fn advise_pattern_accepts_both_patterns() {
+        let (_dir, mmap) = mapped_fixture();
+        advise_pattern(&mmap, AccessPattern::Sequential).expect("Sequential advise");
+        advise_pattern(&mmap, AccessPattern::Random).expect("Random advise");
+        // Mapping stays readable after advice.
+        assert_eq!(mmap[0], 0xAB);
+    }
+
+    #[test]
+    fn lock_resident_does_not_invalidate_mapping() {
+        let (_dir, mmap) = mapped_fixture();
+        // mlock of one page may still fail under a tiny RLIMIT_MEMLOCK
+        // (containers); the contract is "Ok or a clean io::Error", never a
+        // panic, and the mapping stays readable either way.
+        let _ = lock_resident(&mmap);
+        assert_eq!(mmap[4095], 0xAB);
+    }
 }

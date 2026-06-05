@@ -32,10 +32,14 @@ jobs:
       - name: CHANGELOG check
         if: github.event_name == 'pull_request'
         env:
-          PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
+          # Fetch labels live — the event payload snapshots labels at trigger
+          # time, so a label applied after `gh pr create` is invisible to it.
+          PR_LABELS=$(gh api "repos/${GITHUB_REPOSITORY}/issues/${PR_NUMBER}/labels" --jq '[.[].name] | join(",")' || echo "")
           if echo "$PR_LABELS" | grep -q 'skip-changelog'; then
             echo "skip-changelog label found — skipping"
             exit 0
@@ -100,6 +104,81 @@ jobs:
       - name: Test (tokio)
         run: cargo test --no-default-features --features runtime-tokio,jemalloc
         timeout-minutes: 15
+      # Cross-build for Intel Mac (build only — no jemalloc: release matrix
+      # ships x86_64-macos WITHOUT jemalloc to match what ships in releases.
+      # console excluded here: rust_embed requires console/dist/ from `pnpm build`
+      # which is not set up in check-macos; console is tested in check-console).
+      - name: Add x86_64-apple-darwin target
+        run: rustup target add x86_64-apple-darwin
+      - name: Build (x86_64-apple-darwin)
+        run: cargo build --no-default-features --features runtime-tokio,graph,text-index --target x86_64-apple-darwin
+
+  # ── Windows — main-push only (cost control) ─────────────────────────
+  # NOTE: This job is EXPECTED TO FAIL until feat/windows-native-port
+  # merges. It is the merge-order gate: that PR must land on main first
+  # so this job goes green before the release PR (PR-5) is merged.
+  check-windows:
+    name: Check (Windows)
+    runs-on: windows-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.94.1
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: windows-${{ hashFiles('Cargo.lock') }}
+      # NASM is required by aws-lc-sys (TLS) on Windows.
+      # SHA-pinned to v1.5.2 (72793074) for supply-chain safety;
+      # choco fallback fires only if the action itself fails.
+      - uses: ilammy/setup-nasm@72793074d3c8cdda771dba85f6deafe00623038b  # v1.5.2
+        id: nasm
+        continue-on-error: true
+      - name: NASM fallback (choco)
+        if: steps.nasm.outcome == 'failure'
+        run: choco install nasm -y
+      - name: Verify cmake available
+        run: cmake --version
+      # No jemalloc on Windows (tikv-jemallocator does not support MSVC)
+      - name: Clippy (windows)
+        run: cargo clippy --no-default-features --features runtime-tokio,graph,text-index -- -D warnings
+      - name: Test (windows)
+        run: cargo test --no-default-features --features runtime-tokio,graph,text-index
+        timeout-minutes: 30
+
+  # ── console feature — monoio+jemalloc+graph+text-index+console ───────
+  # Catches the monoio+console (tokio-stream) interaction flagged as a risk.
+  # pnpm build MUST run before clippy: rust_embed embeds console/dist/ at
+  # compile time; without it the console feature builds but embeds nothing.
+  # Main-push only — console CI is also covered by console-integration.yml
+  # on PRs that touch console/ paths.
+  check-console:
+    name: Check (console feature)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.94.1
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: console-${{ hashFiles('Cargo.lock') }}
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "20"
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - name: Install console deps
+        working-directory: console
+        run: pnpm install --frozen-lockfile
+      - name: Build console assets
+        working-directory: console
+        run: pnpm build
+      - name: Clippy (monoio + console)
+        run: cargo clippy --no-default-features --features runtime-monoio,jemalloc,graph,text-index,console -- -D warnings
 
   # ── MSRV — minimal build, different cache key ───────────────────────
   msrv:

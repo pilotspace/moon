@@ -11,7 +11,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
-    "test:e2e": "playwright test",
+    "test:e2e": "playwright test \"e2e/(?!benchmarks).*\\.spec\\.ts\"",
     "test:e2e:install": "playwright install --with-deps chromium",
     "test:integration": "playwright test tests/e2e/integration.spec.ts",
     "test:benchmarks": "playwright test tests/e2e/benchmarks.spec.ts",

@@ -378,30 +378,31 @@ impl WarmSegmentFiles {
         handle: SegmentHandle,
         mlock_codes: bool,
     ) -> std::io::Result<Self> {
-        use crate::vector::persistence::sealed_mmap::map_sealed_file;
+        use crate::vector::persistence::sealed_mmap::{
+            AccessPattern, advise_pattern, lock_resident, map_sealed_file,
+        };
 
         // codes.mpf — sealed warm-segment file, see `sealed_mmap` module docs
         // and invariants 1-4 on `WarmSegmentFiles`.
         let codes = map_sealed_file(&segment_dir.join("codes.mpf"))?;
-        codes.advise(memmap2::Advice::Sequential)?;
-        #[cfg(unix)]
+        advise_pattern(&codes, AccessPattern::Sequential)?;
         if mlock_codes {
-            codes.lock()?;
+            lock_resident(&codes)?;
         }
 
         // graph.mpf
         let graph = map_sealed_file(&segment_dir.join("graph.mpf"))?;
-        graph.advise(memmap2::Advice::Random)?;
+        advise_pattern(&graph, AccessPattern::Random)?;
 
         // mvcc.mpf
         let mvcc = map_sealed_file(&segment_dir.join("mvcc.mpf"))?;
-        mvcc.advise(memmap2::Advice::Sequential)?;
+        advise_pattern(&mvcc, AccessPattern::Sequential)?;
 
         // vectors.mpf (optional)
         let vectors_path = segment_dir.join("vectors.mpf");
         let vectors = match map_sealed_file(&vectors_path) {
             Ok(v) => {
-                v.advise(memmap2::Advice::Sequential)?;
+                advise_pattern(&v, AccessPattern::Sequential)?;
                 Some(v)
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,

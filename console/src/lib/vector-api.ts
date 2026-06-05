@@ -144,7 +144,7 @@ export async function fetchVectorData(
       }
 
       // Find vector field — check for base64 blob or CSV string
-      let vector = new Float32Array(0);
+      let vector: Float32Array = new Float32Array(0);
       const vectorFieldNames = ["v", "vector", "embedding", "emb", "__vector"];
       for (const fname of vectorFieldNames) {
         const val = fieldMap.get(fname);

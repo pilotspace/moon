@@ -286,13 +286,24 @@ pub struct BlockRegisterPayload {
     pub reply_tx: channel::OneshotSender<Option<crate::protocol::Frame>>,
 }
 
+/// Portable raw socket file descriptor type.
+///
+/// On Unix this is `std::os::unix::io::RawFd` (i32). On Windows (and any other
+/// non-unix target) it aliases to `i32` so that `MigrateConnectionPayload` and
+/// the pending-migrations Vec compile on all platforms. Actual fd operations are
+/// gated by `#[cfg(unix)]` at every call site.
+#[cfg(unix)]
+pub type RawSocketFd = std::os::unix::io::RawFd;
+#[cfg(not(unix))]
+pub type RawSocketFd = i32;
+
 /// Boxed payload for `ShardMessage::MigrateConnection` (Phase 177, hot-path split).
 ///
 /// `MigratedConnectionState` already holds heap-backed strings/bytes but still
 /// exceeds 120 B inline. Moving it behind a Box keeps the enum slot in the
 /// cache-line budget set by the slotted variants.
 pub struct MigrateConnectionPayload {
-    pub fd: std::os::unix::io::RawFd,
+    pub fd: RawSocketFd,
     pub state: crate::server::conn::affinity::MigratedConnectionState,
 }
 

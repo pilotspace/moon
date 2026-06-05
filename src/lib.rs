@@ -69,6 +69,7 @@ pub mod text;
 pub mod tls;
 pub mod tracking;
 pub mod transaction;
+pub mod util;
 pub mod vector;
 #[cfg(test)]
 mod version_token_tests;

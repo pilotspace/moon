@@ -13,6 +13,14 @@ compile_error!(
      Disable one -- typically: cargo build --no-default-features --features runtime-monoio,mimalloc-alt,graph,text-index"
 );
 
+// tikv-jemallocator does not build on Windows MSVC. Use mimalloc instead:
+//   cargo build --no-default-features --features runtime-tokio,graph,text-index
+#[cfg(all(feature = "jemalloc", target_os = "windows"))]
+compile_error!(
+    "Feature `jemalloc` (tikv-jemallocator) does not build on Windows MSVC. \
+     Build with: cargo build --no-default-features --features runtime-tokio,graph,text-index"
+);
+
 #[cfg(not(feature = "jemalloc"))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -44,6 +52,7 @@ use std::path::PathBuf;
 
 use clap::Parser;
 use moon::config::ServerConfig;
+use moon::config::conf_file::merge_conf_argv;
 use moon::persistence::aof::{self, AofMessage, AofWriterPool, FsyncPolicy};
 use moon::runtime::cancel::CancellationToken;
 use moon::runtime::channel;
@@ -61,6 +70,22 @@ fn main() -> anyhow::Result<()> {
     // at process start, so the env var must be set before exec.
     maybe_respawn_with_arena_override()?;
 
+    // Block SIGTERM in the main thread BEFORE any child threads are spawned
+    // (TLS reload thread, Prometheus admin thread, ctrlc internal thread,
+    // shard threads). All child threads inherit the blocked mask, so SIGTERM
+    // is delivered only to our dedicated `sigterm-handler` thread via sigwait(2).
+    // See the "Signal handler setup" block below for the handler threads.
+    #[cfg(unix)]
+    // SAFETY: sigset_t is a plain C struct zero-initialised to the empty set.
+    // sigemptyset, sigaddset, and pthread_sigmask are async-signal-safe POSIX
+    // functions. We hold no locks during the mask modification.
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGTERM);
+        libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -68,7 +93,25 @@ fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let mut config = ServerConfig::parse();
+    // ── moon.conf integration: build merged argv before clap parse ──────────
+    // `merge_conf_argv` scans argv for a positional conf path (argv[1] not
+    // starting with `-`) or `--config FILE`.  When found it loads and tokenises
+    // the conf, prepends the tokens to the remaining real argv, and returns the
+    // merged vector.  CLI args come *after* conf tokens so clap last-wins gives
+    // CLI priority.
+    //
+    // NOTE: `maybe_respawn_with_arena_override()` above only scans *raw*
+    // argv — it will NOT see a `memory-arenas-cap` value that comes from the
+    // conf file.  That setting must be given on the CLI if the jemalloc
+    // respawn is needed.  This is documented behaviour.
+    let mut config = match merge_conf_argv(std::env::args_os()) {
+        Ok(Some(merged)) => ServerConfig::parse_from(merged),
+        Ok(None) => ServerConfig::parse(),
+        Err(e) => {
+            eprintln!("moon: conf file error: {e}");
+            std::process::exit(1);
+        }
+    };
 
     // ── AOF v1→v2 migration (FIX-W3-2): early-exit before normal boot ──
     // When `--migrate-aof-from` is set, run the migration tool and exit.
@@ -131,7 +174,36 @@ fn main() -> anyhow::Result<()> {
     // G1 memory guardrail: resolve --maxmemory before any RuntimeConfig is
     // built so an unset cap is auto-populated (cgroup-aware) and the startup
     // notice prints exactly once.
-    moon::config::log_memory_guardrail(config.apply_memory_guardrail());
+    let guardrail_outcome = config.apply_memory_guardrail();
+
+    // Windows-specific startup warnings (compiled out on unix).
+    #[cfg(windows)]
+    {
+        // VirtualLock has working-set limits on Windows; mlock-equivalent is
+        // unreliable for large vector code buffers. Advise operators to disable.
+        if config.vec_codes_mlock_enabled() {
+            tracing::warn!(
+                "Windows: --vec-codes-mlock is enabled but VirtualLock has working-set \
+                 size limits that may cause failures under memory pressure. \
+                 Consider disabling: --vec-codes-mlock disable"
+            );
+        }
+        // The G1 memory guardrail relies on /proc/cgroups (Linux) or sysctl (macOS).
+        // Neither is available on Windows, so the guardrail is always skipped.
+        // Operators must set --maxmemory explicitly to bound RSS.
+        if !matches!(
+            guardrail_outcome,
+            moon::config::GuardrailOutcome::Explicit(_)
+        ) {
+            tracing::warn!(
+                "Windows: memory guardrail is unavailable (no /proc/cgroups). \
+                 Set --maxmemory <bytes> explicitly to bound RSS, \
+                 or --maxmemory 0 for unlimited."
+            );
+        }
+    }
+
+    moon::config::log_memory_guardrail(guardrail_outcome);
 
     // Build TLS configuration if tls_port is set.
     // Uses ArcSwap for SIGHUP-based certificate hot-reload.
@@ -172,24 +244,14 @@ fn main() -> anyhow::Result<()> {
         None
     };
 
-    // Validate persistence directory is accessible
-    if let Err(e) = std::fs::create_dir_all(&config.dir) {
-        return Err(anyhow::anyhow!(
-            "failed to create persistence directory {:?}: {}",
-            config.dir,
-            e
-        ));
-    }
-
     // --check-config: validate and exit without starting.
-    // Runs AFTER TLS cert/key validation, protected mode check, and persistence dir check
-    // so that real configuration errors are caught before reporting success.
+    // Runs AFTER TLS cert/key validation and protected-mode check so that real
+    // configuration errors are caught before reporting success.
+    // Intentionally runs BEFORE create_dir_all: directory creation is a startup
+    // concern, not a config-validation concern, so --check-config must not require
+    // the persistence directory to already exist or be writable.
     // Remaining initialization (metrics, shards, AOF) is runtime-only and not validated here.
     if config.check_config {
-        // Validate shard count is reasonable
-        if config.shards == 0 {
-            return Err(anyhow::anyhow!("--shards must be >= 1"));
-        }
         // Validate admin port doesn't conflict with main port
         if config.admin_port > 0 && config.admin_port == config.port {
             return Err(anyhow::anyhow!(
@@ -214,6 +276,15 @@ fn main() -> anyhow::Result<()> {
         }
         info!("Configuration is valid.");
         return Ok(());
+    }
+
+    // Validate persistence directory is accessible
+    if let Err(e) = std::fs::create_dir_all(&config.dir) {
+        return Err(anyhow::anyhow!(
+            "failed to create persistence directory {:?}: {}",
+            config.dir,
+            e
+        ));
     }
 
     // ── Admin/console hardening (HARD-01/02/03, Phase 137) ──────────
@@ -354,6 +425,86 @@ fn main() -> anyhow::Result<()> {
 
     // Shared cancellation token for graceful shutdown
     let cancel_token = CancellationToken::new();
+
+    // ── Signal handler setup ──────────────────────────────────────────────────
+    //
+    // SIGTERM was already blocked at the very top of main() (before any thread
+    // is spawned), so all child threads — TLS reload, Prometheus/admin, ctrlc's
+    // internal thread, shard threads — inherit the blocked mask. The kernel
+    // therefore cannot deliver SIGTERM to any of those threads; it queues until
+    // our dedicated `sigterm-handler` thread below consumes it via sigwait(2).
+    //
+    // Steps here:
+    // 1. Install the SIGINT/Ctrl+C handler (ctrlc spawns its thread here; it
+    //    inherits the already-blocked SIGTERM mask).
+    // 2. Spawn the dedicated SIGTERM handler thread (also inherits the mask).
+
+    // Step 1: Centralized SIGINT/Ctrl+C handler.
+    //
+    // Installed here in main so BOTH runtimes share a single handler.
+    // The listener no longer installs its own ctrl_c handler; it only polls
+    // `shutdown.cancelled()`.
+    {
+        let sigint_token = cancel_token.clone();
+        ctrlc::set_handler(move || {
+            info!("Shutdown signal received");
+            sigint_token.cancel();
+        })
+        .map_err(|e| anyhow::anyhow!("failed to set Ctrl+C handler: {e}"))?;
+    }
+
+    // Step 2: SIGTERM graceful shutdown handler (Unix only).
+    //
+    // ctrlc (without the `termination` feature) handles SIGINT/Ctrl+C only.
+    // systemd/launchd send SIGTERM on `systemctl stop` / `launchctl stop`,
+    // which was previously unhandled — the kernel delivered the default action
+    // (non-zero exit, AOF not flushed).
+    //
+    // We use a dedicated OS thread with sigwait(2) so that:
+    //   1. SIGHUP is NOT touched (avoids clobbering the TLS cert-reload handler).
+    //   2. The handler works on both `runtime-tokio` and `runtime-monoio`.
+    //   3. Signal safety: cancel() is backed by atomics — safe from any context.
+    //
+    // SIGTERM was blocked at the top of main() before any threads were spawned,
+    // so every thread (including ctrlc's thread and all shard threads) has it
+    // blocked. The sigterm-handler thread keeps SIGTERM blocked and consumes it
+    // via sigwait.
+    #[cfg(unix)]
+    {
+        let sigterm_token = cancel_token.clone();
+        std::thread::Builder::new()
+            .name("sigterm-handler".to_string())
+            .spawn(move || {
+                // SIGTERM is already blocked in this thread (inherited from main
+                // before any threads spawned) — the precondition for sigwait(2),
+                // which atomically consumes a pending blocked signal.
+                // SAFETY: sigset_t is a plain C struct zero-initialised to the
+                // empty set; sigemptyset/sigaddset/sigwait are async-signal-safe
+                // POSIX functions; the set is exclusively owned by this thread.
+                unsafe {
+                    let mut set: libc::sigset_t = std::mem::zeroed();
+                    libc::sigemptyset(&mut set);
+                    libc::sigaddset(&mut set, libc::SIGTERM);
+                    loop {
+                        let mut sig: libc::c_int = 0;
+                        let ret = libc::sigwait(&set, &mut sig);
+                        if ret != 0 {
+                            tracing::error!(
+                                "sigwait(SIGTERM) failed: {}",
+                                std::io::Error::from_raw_os_error(ret)
+                            );
+                            continue;
+                        }
+                        if sig == libc::SIGTERM {
+                            info!("Shutdown signal received");
+                            sigterm_token.cancel();
+                            return;
+                        }
+                    }
+                }
+            })
+            .map_err(|e| anyhow::anyhow!("failed to spawn SIGTERM handler thread: {e}"))?;
+    }
 
     // Collect connection senders for the listener before spawning shard threads
     let conn_txs: Vec<_> = (0..num_shards).map(|i| mesh.conn_tx(i)).collect();

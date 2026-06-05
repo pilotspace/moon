@@ -589,6 +589,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 client_id,
                 &mut responses,
                 &mut auth_delay_ms,
+                &mut codec,
             ) {
                 dispatch::AuthGateResult::Consumed => continue,
                 dispatch::AuthGateResult::Quit => {
@@ -677,6 +678,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     &peer_addr,
                     &mut auth_delay_ms,
                     &mut responses,
+                    &mut codec,
                 )
             {
                 continue;

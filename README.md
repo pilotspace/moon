@@ -18,6 +18,7 @@
 </p>
 
 <p align="center">
+  <a href="#install">Install</a> &bull;
   <a href="#quick-start">Quick start</a> &bull;
   <a href="#why-moon">Why Moon</a> &bull;
   <a href="#benchmarks">Benchmarks</a> &bull;
@@ -208,6 +209,16 @@ traced to source).
 - Specific Redis Enterprise features (CRDT active-active, Redis Flash)
   that Moon and Valkey OSS do not match.
 
+## Install
+
+> **Packaged releases are coming in v0.2.0.** The Homebrew tap, one-liner
+> install scripts (`install.sh` / `install.ps1`), `.deb`/`.rpm` packages,
+> and pre-built tarballs will be available once the v0.2.0 release pipeline
+> is merged and the `v0.2.0` tag is cut. Until then, please build from
+> source using the [Quick start](#quick-start) instructions below.
+
+---
+
 ## Quick start
 
 ### Prerequisites
@@ -240,6 +251,37 @@ cargo build --release
 > log line shows the resolved per-shard budget. If `--maxmemory` is omitted,
 > Moon auto-caps at ~80% of detected RAM with `allkeys-lru` (pass
 > `--maxmemory 0` for unlimited).
+
+### Config file
+
+Moon supports a Redis-style configuration file so you can move all flags out of
+your systemd unit / launchd plist:
+
+```bash
+# Use the bundled example as a starting point
+cp packaging/moon.conf.example /etc/moon/moon.conf
+$EDITOR /etc/moon/moon.conf
+
+# Pass the conf file as the first argument (redis convention)
+./target/release/moon /etc/moon/moon.conf
+
+# Or with --config
+./target/release/moon --config /etc/moon/moon.conf
+```
+
+**Precedence (highest → lowest): CLI flags → conf file → built-in defaults.**
+CLI flags always win, so you can override any conf option at the command line:
+
+```bash
+# conf says port 6379, but this instance listens on 7380
+./target/release/moon /etc/moon/moon.conf --port 7380
+```
+
+Validate your conf file without starting the server:
+
+```bash
+./target/release/moon /etc/moon/moon.conf --check-config
+```
 
 ### Connect with any Redis client
 

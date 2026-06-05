@@ -1,6 +1,6 @@
 [Unit]
 Description=Moon — High-Performance Redis-Compatible Server
-Documentation=https://github.com/tidwall/moon
+Documentation=https://github.com/pilotspace/moon
 After=network-online.target
 Wants=network-online.target
 
@@ -8,7 +8,7 @@ Wants=network-online.target
 Type=simple
 User=moon
 Group=moon
-ExecStart=/usr/local/bin/moon --bind 0.0.0.0 --port 6379 --dir /var/lib/moon --appendonly yes
+ExecStart=/usr/bin/moon /etc/moon/moon.conf
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=5s
@@ -18,7 +18,8 @@ NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
-ReadWritePaths=/var/lib/moon
+ReadOnlyPaths=/etc/moon
+ReadWritePaths=/var/lib/moon /var/log/moon
 LimitNOFILE=65536
 LimitNPROC=4096
 

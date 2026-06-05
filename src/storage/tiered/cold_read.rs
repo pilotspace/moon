@@ -45,8 +45,6 @@ fn read_cold_entry(
     location: ColdLocation,
     now_ms: u64,
 ) -> Option<(RedisValue, Option<u64>)> {
-    use std::os::unix::fs::FileExt as _;
-
     let file_path = shard_dir
         .join("data")
         .join(format!("heap-{:06}.mpf", location.file_id));
@@ -56,7 +54,7 @@ fn read_cold_entry(
     // Read only the specific 4KB page identified by page_idx (pread, no whole-file read).
     let page_offset = (location.page_idx as u64) * (PAGE_4K as u64);
     let mut leaf_buf = [0u8; PAGE_4K];
-    file.read_exact_at(&mut leaf_buf, page_offset).ok()?;
+    crate::util::file_ext::read_exact_at(&file, &mut leaf_buf, page_offset).ok()?;
 
     let page = crate::persistence::kv_page::KvLeafPage::from_bytes(leaf_buf)?;
     let entry = page.get(location.slot_idx)?;
