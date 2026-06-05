@@ -25,10 +25,10 @@ cargo build --release --no-default-features --features runtime-tokio,jemalloc
 ## Start the server
 
 ```bash
-# Default: binds to 127.0.0.1:6379, auto-detects CPU count for shards
+# Default: binds to 127.0.0.1:6379, single shard
 ./target/release/moon
 
-# Custom port and shard count
+# Custom port and shard count (0 = auto-detect from CPU count)
 ./target/release/moon --port 6399 --shards 4
 ```
 

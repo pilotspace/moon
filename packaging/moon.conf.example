@@ -55,9 +55,12 @@ dir /var/lib/moon
 # Number of logical databases (0–N-1).
 databases 16
 
-# Number of shards (0 = auto-detect from CPU count at runtime).
-# Leave commented for auto-detection; set explicitly for reproducible deployments.
-# shards 4
+# Number of shards. Default 1: best throughput for non-pipelined workloads
+# and a deterministic persistence layout (the on-disk AOF layout is keyed by
+# shard count — see docs/runbooks/shard-count-change.md before changing this
+# on an existing data directory). Set 0 to auto-detect from the CPU count;
+# pin an explicit value for reproducible multi-core deployments.
+# shards 1
 
 ################################################################################
 # PERSISTENCE
