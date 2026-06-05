@@ -1908,6 +1908,105 @@ PYEOF
 fi
 
 # ===========================================================================
+# TEMPORAL DECAY (GRAPH.QUERY --decay / FT.NAVIGATE DECAY)
+# ===========================================================================
+
+if should_run "temporal"; then
+    echo ""
+    echo "=== TEMPORAL DECAY (GRAPH.QUERY --decay / FT.NAVIGATE DECAY) ==="
+    mcli FLUSHALL >/dev/null 2>&1
+
+    # Build the stale-direct vs fresh-detour graph:
+    #   A -> C  weight 1.0, created ~2s before the detour edges (stale direct)
+    #   A -> B -> C  weight 0.6 each, created last (fresh detour)
+    # Without --decay the cheaper direct path wins (1.0 < 1.2); with a decay
+    # rate the older direct edge pays lambda * age_seconds and the fresh
+    # detour wins. Real wall-clock sleep creates the age gap.
+    mcli GRAPH.CREATE decayg >/dev/null 2>&1
+    DECAY_A=$(mcli GRAPH.ADDNODE decayg Person name A 2>&1 | grep -oE '[0-9]+' | head -1)
+    DECAY_B=$(mcli GRAPH.ADDNODE decayg Person name B 2>&1 | grep -oE '[0-9]+' | head -1)
+    DECAY_C=$(mcli GRAPH.ADDNODE decayg Person name C 2>&1 | grep -oE '[0-9]+' | head -1)
+
+    mcli GRAPH.ADDEDGE decayg "$DECAY_A" "$DECAY_C" KNOWS WEIGHT 1.0 >/dev/null 2>&1
+    sleep 2
+    mcli GRAPH.ADDEDGE decayg "$DECAY_A" "$DECAY_B" KNOWS WEIGHT 0.6 >/dev/null 2>&1
+    mcli GRAPH.ADDEDGE decayg "$DECAY_B" "$DECAY_C" KNOWS WEIGHT 0.6 >/dev/null 2>&1
+
+    DECAY_QUERY="MATCH p = shortestPath((a:Person {name: 'A'})-[*..5]->(c:Person {name: 'C'})) RETURN p"
+
+    # The returned path renders as one node id per line; the detour is
+    # detected by whether B's node id appears in the path.
+
+    # DECAY-01: without --decay the direct path wins (A -> C, no B)
+    TOTAL=$((TOTAL + 1))
+    OFF_OUT=$(mcli GRAPH.QUERY decayg "$DECAY_QUERY" 2>&1)
+    if echo "$OFF_OUT" | grep -qE "^${DECAY_C}\$" && ! echo "$OFF_OUT" | grep -qE "^${DECAY_B}\$"; then
+        PASS=$((PASS + 1)); echo "  PASS: GRAPH.QUERY shortestPath without --decay takes direct path (no B)"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: expected direct A->C path without --decay: $OFF_OUT"
+    fi
+
+    # DECAY-02: with --decay the fresh detour wins (A -> B -> C)
+    TOTAL=$((TOTAL + 1))
+    ON_OUT=$(mcli GRAPH.QUERY decayg "$DECAY_QUERY" --decay 5 2>&1)
+    if echo "$ON_OUT" | grep -qE "^${DECAY_B}\$"; then
+        PASS=$((PASS + 1)); echo "  PASS: GRAPH.QUERY shortestPath --decay 5 prefers fresh detour (via B)"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: expected detour via B with --decay 5: $ON_OUT"
+    fi
+
+    # DECAY-03: --decay garbage value rejected
+    TOTAL=$((TOTAL + 1))
+    BAD_OUT=$(mcli GRAPH.QUERY decayg "$DECAY_QUERY" --decay abc 2>&1)
+    if echo "$BAD_OUT" | grep -qi "finite non-negative"; then
+        PASS=$((PASS + 1)); echo "  PASS: GRAPH.QUERY --decay rejects non-numeric value"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: --decay abc should be rejected: $BAD_OUT"
+    fi
+
+    # DECAY-04: --time-weight without --decay rejected
+    TOTAL=$((TOTAL + 1))
+    TW_OUT=$(mcli GRAPH.QUERY decayg "$DECAY_QUERY" --time-weight 2.0 2>&1)
+    if echo "$TW_OUT" | grep -qi "requires --decay"; then
+        PASS=$((PASS + 1)); echo "  PASS: GRAPH.QUERY --time-weight without --decay rejected"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: --time-weight alone should be rejected: $TW_OUT"
+    fi
+
+    # DECAY-05: FT.NAVIGATE DECAY strict validation (parses before index lookup)
+    TOTAL=$((TOTAL + 1))
+    NAV_BAD=$(mcli FT.NAVIGATE noidx "*" HOPS 2 DECAY notanumber 2>&1)
+    if echo "$NAV_BAD" | grep -qi "DECAY must be a finite non-negative number"; then
+        PASS=$((PASS + 1)); echo "  PASS: FT.NAVIGATE DECAY rejects non-numeric value"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: FT.NAVIGATE DECAY notanumber should be rejected: $NAV_BAD"
+    fi
+
+    # DECAY-06: FT.NAVIGATE with valid DECAY proceeds past parsing (the error,
+    # if any, is about the missing index — NOT about the DECAY value)
+    TOTAL=$((TOTAL + 1))
+    NAV_OK=$(mcli FT.NAVIGATE noidx "*" HOPS 2 DECAY 0.5 2>&1)
+    if echo "$NAV_OK" | grep -qi "DECAY"; then
+        FAIL=$((FAIL + 1)); echo "  FAIL: valid DECAY 0.5 should not produce a DECAY error: $NAV_OK"
+    else
+        PASS=$((PASS + 1)); echo "  PASS: FT.NAVIGATE DECAY 0.5 accepted (no DECAY parse error)"
+    fi
+
+    # DECAY-07: --decay on a write query rejected (read-only-traversal knob,
+    # never silently ignored)
+    TOTAL=$((TOTAL + 1))
+    WR_OUT=$(mcli GRAPH.QUERY decayg "CREATE (:Person {name: 'X'})" --decay 0.5 2>&1)
+    if echo "$WR_OUT" | grep -qi "read-only"; then
+        PASS=$((PASS + 1)); echo "  PASS: GRAPH.QUERY --decay on write query rejected"
+    else
+        FAIL=$((FAIL + 1)); echo "  FAIL: --decay on CREATE should be rejected: $WR_OUT"
+    fi
+
+    mcli GRAPH.DELETE decayg >/dev/null 2>&1
+    echo "  temporal decay: done"
+fi
+
+# ===========================================================================
 # WORKSPACE COMMANDS (WS CREATE/LIST/INFO/AUTH/DROP)
 # ===========================================================================
 

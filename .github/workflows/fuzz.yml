@@ -32,6 +32,7 @@ jobs:
           - rdb_load
           - cypher_parse
           - conf_parse
+          - csr_from_bytes
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@nightly
@@ -42,7 +43,12 @@ jobs:
           workspaces: fuzz
           shared-key: fuzz-nightly
       - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz --locked
+        # Prebuilt binary: `cargo install --locked` broke when nightly started
+        # rejecting the lockfile's rustix 0.36.5 (reserved `rustc_*` attrs);
+        # a binary install is immune to toolchain drift and faster.
+        uses: taiki-e/install-action@4bc351f7f2614e48088386e2a0ad917ca3a7e4ba # v2.81.5
+        with:
+          tool: cargo-fuzz
       - name: Download nightly corpus
         uses: actions/download-artifact@v4
         with:
@@ -50,7 +56,10 @@ jobs:
           path: fuzz/corpus/
         continue-on-error: true
       - name: Run fuzzer (15m, multi-process)
-        run: cargo +nightly fuzz run "$TARGET" -- -max_total_time=900 -max_len=65536 -fork=2 -ignore_crashes=0
+        # Explicit --target: the prebuilt cargo-fuzz binary is musl-linked and
+        # self-detects musl as the default build target, whose std is not
+        # installed (E0463 "can't find crate for `core`").
+        run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu "$TARGET" -- -max_total_time=900 -max_len=65536 -fork=2 -ignore_crashes=0
         env:
           MOON_NO_URING: "1"
           TARGET: ${{ matrix.target }}
@@ -72,6 +81,7 @@ jobs:
           - rdb_load
           - cypher_parse
           - conf_parse
+          - csr_from_bytes
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@nightly
@@ -82,7 +92,12 @@ jobs:
           workspaces: fuzz
           shared-key: fuzz-nightly
       - name: Install cargo-fuzz
-        run: cargo install cargo-fuzz --locked
+        # Prebuilt binary: `cargo install --locked` broke when nightly started
+        # rejecting the lockfile's rustix 0.36.5 (reserved `rustc_*` attrs);
+        # a binary install is immune to toolchain drift and faster.
+        uses: taiki-e/install-action@4bc351f7f2614e48088386e2a0ad917ca3a7e4ba # v2.81.5
+        with:
+          tool: cargo-fuzz
       - name: Download previous corpus
         uses: actions/download-artifact@v4
         with:
@@ -90,7 +105,8 @@ jobs:
           path: fuzz/corpus/
         continue-on-error: true
       - name: Run fuzzer (6h, multi-process)
-        run: cargo +nightly fuzz run "$TARGET" -- -max_total_time=21600 -max_len=65536 -fork=2 -ignore_crashes=0
+        # Explicit --target: see fuzz-pr note (prebuilt musl cargo-fuzz).
+        run: cargo +nightly fuzz run --target x86_64-unknown-linux-gnu "$TARGET" -- -max_total_time=21600 -max_len=65536 -fork=2 -ignore_crashes=0
         env:
           MOON_NO_URING: "1"
           TARGET: ${{ matrix.target }}

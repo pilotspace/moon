@@ -45,6 +45,11 @@ pub struct CsrSegment {
     pub col_indices: Vec<u32>,
     /// Parallel to col_indices. Per-edge metadata.
     pub edge_meta: Vec<EdgeMeta>,
+    /// Parallel to col_indices. Wall-clock creation stamp (Unix millis) per
+    /// edge, used by temporal-decay traversal scoring. Empty for segments
+    /// loaded from version < 3 files (stamp unknown — decay treats it as
+    /// neutral). Access with `.get(idx)`, never by direct indexing.
+    pub edge_created_ms: Vec<u64>,
     /// Parallel to rows (length = node_count). Per-node metadata.
     pub node_meta: Vec<NodeMeta>,
     /// Validity bitmap: bit set = edge is live. One bit per edge.
@@ -119,9 +124,10 @@ impl CsrSegment {
         row_offsets.push(offset);
         let edge_count = offset as usize;
 
-        // Build col_indices and edge_meta.
+        // Build col_indices, edge_meta, and the parallel created_ms array.
         let mut col_indices = Vec::with_capacity(edge_count);
         let mut edge_meta = Vec::with_capacity(edge_count);
+        let mut edge_created_ms = Vec::with_capacity(edge_count);
         for edges in &edges_by_src {
             for &(dst_row, edge) in edges {
                 col_indices.push(dst_row);
@@ -130,6 +136,10 @@ impl CsrSegment {
                     flags: 0,
                     property_offset: 0,
                 });
+                // Real wall-clock stamp from the mutable edge — survives
+                // compaction so decay scoring keeps true edge age (0 stays
+                // 0 = unknown for pre-upgrade edges).
+                edge_created_ms.push(edge.created_ms);
             }
         }
 
@@ -176,7 +186,7 @@ impl CsrSegment {
 
         let header = GraphSegmentHeader {
             magic: *b"MNGR",
-            version: 2,
+            version: crate::graph::types::CSR_CURRENT_VERSION,
             node_count: node_count as u32,
             edge_count: edge_count as u32,
             min_node_id,
@@ -187,6 +197,7 @@ impl CsrSegment {
             validity_bitmap_offset: 0,
             created_lsn: lsn,
             checksum,
+            edge_created_ms_offset: 0, // populated during serialization
         };
 
         // Build indexes (Phase 116).
@@ -200,6 +211,7 @@ impl CsrSegment {
             row_offsets,
             col_indices,
             edge_meta,
+            edge_created_ms,
             node_meta,
             validity,
             node_id_to_row,
@@ -330,6 +342,7 @@ impl CsrSegment {
 
     /// Serialize the CSR segment to a contiguous byte buffer.
     /// Layout: header (128B) | row_offsets | col_indices | edge_meta | node_meta
+    ///         | edge_created_ms (version >= 3 only)
     ///
     /// The CRC32 checksum covers the entire payload (header fields +
     /// all data arrays), ensuring corrupted array content is detected.
@@ -339,15 +352,37 @@ impl CsrSegment {
         let ci_size = self.col_indices.len() * 4;
         let em_size = self.edge_meta.len() * core::mem::size_of::<EdgeMeta>();
         let nm_size = self.node_meta.len() * core::mem::size_of::<NodeMeta>();
+        // Per-edge created_ms section only exists in version >= 3 files.
+        // Always edge_count entries (zero-filled when stamps are unknown).
+        // Invariant: stamps are either absent entirely (pre-v3 source, the
+        // loop below zero-fills) or exactly parallel to col_indices — a
+        // partial array means a construction-site bug, not a valid state.
+        debug_assert!(
+            self.edge_created_ms.is_empty() || self.edge_created_ms.len() == self.col_indices.len(),
+            "edge_created_ms ({}) must be empty or parallel to col_indices ({})",
+            self.edge_created_ms.len(),
+            self.col_indices.len()
+        );
+        let write_ecms = self.header.version >= 3;
+        let ecms_size = if write_ecms {
+            self.col_indices.len() * 8
+        } else {
+            0
+        };
 
-        let total = header_size + ro_size + ci_size + em_size + nm_size;
+        let total = header_size + ro_size + ci_size + em_size + nm_size + ecms_size;
         let mut buf = Vec::with_capacity(total);
 
         // Write header with computed offsets (checksum placeholder = 0).
         let ro_offset = header_size as u64;
         let ci_offset = ro_offset + ro_size as u64;
         let em_offset = ci_offset + ci_size as u64;
-        let _nm_offset = em_offset + em_size as u64;
+        let nm_offset = em_offset + em_size as u64;
+        let ecms_offset = if write_ecms {
+            nm_offset + nm_size as u64
+        } else {
+            0
+        };
 
         buf.extend_from_slice(&self.header.magic);
         buf.extend_from_slice(&self.header.version.to_le_bytes());
@@ -361,6 +396,7 @@ impl CsrSegment {
         buf.extend_from_slice(&0u64.to_le_bytes()); // validity_bitmap_offset placeholder
         buf.extend_from_slice(&self.header.created_lsn.to_le_bytes());
         buf.extend_from_slice(&0u64.to_le_bytes()); // checksum placeholder — filled below
+        buf.extend_from_slice(&ecms_offset.to_le_bytes()); // 0 for version < 3
 
         // Pad header to 128 bytes.
         while buf.len() < header_size {
@@ -384,7 +420,7 @@ impl CsrSegment {
             buf.extend_from_slice(&em.property_offset.to_le_bytes());
         }
 
-        // Write node_meta (version 2: 48 bytes per entry with bi-temporal fields).
+        // Write node_meta (version 2+: 48 bytes per entry with bi-temporal fields).
         for nm in &self.node_meta {
             buf.extend_from_slice(&nm.external_id.to_le_bytes());
             buf.extend_from_slice(&nm.label_bitmap.to_le_bytes());
@@ -393,6 +429,16 @@ impl CsrSegment {
             buf.extend_from_slice(&nm.deleted_lsn.to_le_bytes());
             buf.extend_from_slice(&nm.valid_from.to_le_bytes());
             buf.extend_from_slice(&nm.valid_to.to_le_bytes());
+        }
+
+        // Write per-edge created_ms (version >= 3). Zero-fill if the segment
+        // carries no stamps (e.g. loaded from a v2 file then re-serialized) so
+        // the section length always matches edge_count.
+        if write_ecms {
+            for i in 0..self.col_indices.len() {
+                let ms = self.edge_created_ms.get(i).copied().unwrap_or(0);
+                buf.extend_from_slice(&ms.to_le_bytes());
+            }
         }
 
         // Compute CRC32 over the entire buffer (with checksum field zeroed),
@@ -437,6 +483,12 @@ impl CsrSegment {
         let _vb_offset = u64::from_le_bytes(read8(data, 56)?);
         let created_lsn = u64::from_le_bytes(read8(data, 64)?);
         let stored_checksum = u64::from_le_bytes(read8(data, 72)?);
+        // Version 3+: byte offset of the per-edge created_ms section (informational).
+        let ecms_offset = if version >= 3 {
+            u64::from_le_bytes(read8(data, 80)?)
+        } else {
+            0
+        };
 
         let nc = node_count as usize;
         let ec = edge_count as usize;
@@ -444,6 +496,8 @@ impl CsrSegment {
         // Version 1: 32-byte NodeMeta (no bi-temporal fields).
         // Version 2+: 48-byte NodeMeta (includes valid_from and valid_to).
         let nm_elem_size: usize = if version >= 2 { 48 } else { 32 };
+        // Version 3+: trailing per-edge created_ms array (8 bytes per edge).
+        let ecms_elem_size: usize = if version >= 3 { 8 } else { 0 };
 
         // Use checked arithmetic to prevent integer overflow from attacker-controlled
         // node_count/edge_count values bypassing the size validation.
@@ -452,11 +506,13 @@ impl CsrSegment {
             let ci_size = ec.checked_mul(4)?;
             let em_size = ec.checked_mul(em_elem_size)?;
             let nm_size = nc.checked_mul(nm_elem_size)?;
+            let ecms_size = ec.checked_mul(ecms_elem_size)?;
             header_size
                 .checked_add(ro_size)?
                 .checked_add(ci_size)?
                 .checked_add(em_size)?
-                .checked_add(nm_size)
+                .checked_add(nm_size)?
+                .checked_add(ecms_size)
         })()
         .ok_or_else(|| CsrError::InvalidData("size overflow in CSR header fields".to_owned()))?;
         if data.len() < expected_len {
@@ -553,6 +609,17 @@ impl CsrSegment {
             pos += nm_elem_size;
         }
 
+        // Parse per-edge created_ms (version >= 3). Older files leave the
+        // Vec empty — readers treat a missing stamp as 0 = unknown/neutral.
+        let mut edge_created_ms = Vec::new();
+        if version >= 3 {
+            edge_created_ms.reserve_exact(ec);
+            for _ in 0..ec {
+                edge_created_ms.push(u64::from_le_bytes(read8(data, pos)?));
+                pos += 8;
+            }
+        }
+
         // Rebuild validity bitmap: all edges valid (fresh load).
         let mut validity = RoaringBitmap::new();
         for i in 0..ec as u32 {
@@ -562,12 +629,20 @@ impl CsrSegment {
         // Rebuild node_id_to_row from node_meta external_id.
         // The external_id is the raw u64 from NodeKey::data().as_ffi().
         // We need to reconstruct NodeKey from the u64 -- use KeyData::from_ffi.
+        // Duplicate keys (corrupted/malicious file) must be rejected here:
+        // MphNodeIndex::build panics inside boomphf on non-unique keys
+        // (found by the csr_from_bytes fuzz target).
         let mut node_id_to_row: HashMap<NodeKey, u32> = HashMap::with_capacity(nc);
         let mut sorted_keys = Vec::with_capacity(nc);
         for (row, nm) in node_meta.iter().enumerate() {
             let key_data = slotmap::KeyData::from_ffi(nm.external_id);
             let nk = NodeKey::from(key_data);
-            node_id_to_row.insert(nk, row as u32);
+            if node_id_to_row.insert(nk, row as u32).is_some() {
+                return Err(CsrError::InvalidData(format!(
+                    "duplicate node external_id {} at row {row}",
+                    nm.external_id
+                )));
+            }
             sorted_keys.push(nk);
         }
 
@@ -589,6 +664,7 @@ impl CsrSegment {
             validity_bitmap_offset: _vb_offset,
             created_lsn,
             checksum: stored_checksum,
+            edge_created_ms_offset: ecms_offset,
         };
 
         Ok(Self {
@@ -596,6 +672,7 @@ impl CsrSegment {
             row_offsets,
             col_indices,
             edge_meta,
+            edge_created_ms,
             node_meta,
             validity,
             node_id_to_row,
@@ -688,7 +765,7 @@ mod tests {
         assert_eq!(csr.node_count(), 5);
         assert_eq!(csr.edge_count(), 10);
         assert_eq!(csr.header.magic, *b"MNGR");
-        assert_eq!(csr.header.version, 2);
+        assert_eq!(csr.header.version, 3);
     }
 
     #[test]
@@ -746,7 +823,7 @@ mod tests {
         // Read back header fields.
         assert_eq!(&bytes[0..4], b"MNGR");
         let version = u32::from_le_bytes(bytes[4..8].try_into().expect("4 bytes"));
-        assert_eq!(version, 2);
+        assert_eq!(version, 3);
         let nc = u32::from_le_bytes(bytes[8..12].try_into().expect("4 bytes"));
         assert_eq!(nc, 5);
         let ec = u32::from_le_bytes(bytes[12..16].try_into().expect("4 bytes"));
@@ -900,12 +977,13 @@ mod tests {
         let restored = CsrSegment::from_bytes(&bytes).expect("from_bytes ok");
 
         assert_eq!(restored.header.magic, *b"MNGR");
-        assert_eq!(restored.header.version, 2);
+        assert_eq!(restored.header.version, 3);
         assert_eq!(restored.node_count(), original.node_count());
         assert_eq!(restored.edge_count(), original.edge_count());
         assert_eq!(restored.created_lsn, 42);
         assert_eq!(restored.row_offsets, original.row_offsets);
         assert_eq!(restored.col_indices, original.col_indices);
+        assert_eq!(restored.edge_created_ms, original.edge_created_ms);
 
         // Verify neighbor queries still work.
         for row in 0..restored.node_count() {
@@ -1087,16 +1165,17 @@ mod tests {
 
     #[test]
     fn test_csr_v1_migration_zero_fill() {
-        // Build a v2 CSR, serialize to bytes, then manually construct v1-format
-        // bytes by: patching version to 1, truncating each NodeMeta from 48 to
-        // 32 bytes (dropping valid_from/valid_to), and recomputing the CRC.
+        // Build a current-version CSR, serialize to bytes, then manually
+        // construct v1-format bytes by: patching version to 1, truncating each
+        // NodeMeta from 48 to 32 bytes (dropping valid_from/valid_to), omitting
+        // the v3 edge_created_ms section, and recomputing the CRC.
         let frozen = build_small_graph();
         let csr = CsrSegment::from_frozen(frozen, 42).expect("csr ok");
-        let v2_bytes = csr.to_bytes();
+        let v3_bytes = csr.to_bytes();
 
-        // Verify it is version 2.
-        let ver = u32::from_le_bytes(v2_bytes[4..8].try_into().expect("4 bytes"));
-        assert_eq!(ver, 2);
+        // Verify it is version 3.
+        let ver = u32::from_le_bytes(v3_bytes[4..8].try_into().expect("4 bytes"));
+        assert_eq!(ver, 3);
 
         let header_size = core::mem::size_of::<GraphSegmentHeader>(); // 128
         let nc = csr.node_count() as usize;
@@ -1113,17 +1192,18 @@ mod tests {
         let nm_start = header_size + ro_size + ci_size + em_size;
 
         // Build v1 bytes: header + arrays (ro + ci + em) + truncated node_meta.
+        // The v3 edge_created_ms section (after node_meta) is dropped.
         let mut v1_bytes = Vec::with_capacity(nm_start + nc * nm_v1_elem);
         // Copy everything up to node_meta unchanged.
-        v1_bytes.extend_from_slice(&v2_bytes[..nm_start]);
+        v1_bytes.extend_from_slice(&v3_bytes[..nm_start]);
 
         // For each NodeMeta, copy only the first 32 bytes (skip valid_from/valid_to).
         for i in 0..nc {
             let offset = nm_start + i * nm_v2_elem;
-            v1_bytes.extend_from_slice(&v2_bytes[offset..offset + nm_v1_elem]);
+            v1_bytes.extend_from_slice(&v3_bytes[offset..offset + nm_v1_elem]);
         }
 
-        // Patch version field at offset 4 from 2 to 1.
+        // Patch version field at offset 4 down to 1.
         v1_bytes[4..8].copy_from_slice(&1u32.to_le_bytes());
 
         // Recompute CRC with checksum field zeroed.
@@ -1136,6 +1216,8 @@ mod tests {
         assert_eq!(restored.header.version, 1);
         assert_eq!(restored.node_count(), csr.node_count());
         assert_eq!(restored.edge_count(), csr.edge_count());
+        // Pre-v3 files carry no per-edge stamps: empty = unknown (decay-neutral).
+        assert!(restored.edge_created_ms.is_empty());
 
         // All node_meta entries must have valid_from=0, valid_to=i64::MAX.
         for (i, nm) in restored.node_meta.iter().enumerate() {
@@ -1181,7 +1263,7 @@ mod tests {
 
         let frozen = g.freeze().expect("freeze ok");
         let csr = CsrSegment::from_frozen(frozen, 50).expect("csr ok");
-        assert_eq!(csr.header.version, 2);
+        assert_eq!(csr.header.version, 3);
 
         // Verify from_frozen propagated temporal fields.
         // Note: sorted_nodes order may differ from insertion order,
@@ -1203,7 +1285,7 @@ mod tests {
         // Serialize and deserialize.
         let bytes = csr.to_bytes();
         let restored = CsrSegment::from_bytes(&bytes).expect("roundtrip ok");
-        assert_eq!(restored.header.version, 2);
+        assert_eq!(restored.header.version, 3);
 
         // Verify temporal fields survive roundtrip.
         for (i, nm) in restored.node_meta.iter().enumerate() {
@@ -1216,5 +1298,162 @@ mod tests {
                 "node {i} valid_to mismatch"
             );
         }
+    }
+
+    // --- P3: per-edge created_ms fidelity (temporal-decay scoring) ---
+
+    use crate::storage::entry::ClockPin;
+
+    /// 2 nodes, 3 edges with distinct pinned wall-clock stamps.
+    /// Shape chosen so node_meta lands 8-aligned (nc+1+ec even) and the
+    /// mmap loader succeeds — exercising the zero-copy v3 section.
+    fn build_stamped_graph() -> FrozenMemGraph {
+        let mut g = MemGraph::new(100);
+        let a = g.add_node(smallvec![0], smallvec![], None, 1);
+        let b = g.add_node(smallvec![1], smallvec![], None, 1);
+        {
+            let _pin = ClockPin::set(10, 10_000);
+            g.add_edge(a, b, 1, 1.0, None, 2).expect("ok");
+        }
+        {
+            let _pin = ClockPin::set(20, 20_000);
+            g.add_edge(b, a, 2, 0.5, None, 2).expect("ok");
+        }
+        {
+            let _pin = ClockPin::set(30, 30_000);
+            g.add_edge(a, b, 3, 2.0, None, 2).expect("ok");
+        }
+        g.freeze().expect("freeze ok")
+    }
+
+    #[test]
+    fn test_from_frozen_populates_edge_created_ms() {
+        let frozen = build_stamped_graph();
+        let csr = CsrSegment::from_frozen(frozen, 100).expect("csr ok");
+
+        assert_eq!(csr.header.version, 3);
+        assert_eq!(csr.edge_created_ms.len(), csr.col_indices.len());
+        let mut stamps = csr.edge_created_ms.clone();
+        stamps.sort_unstable();
+        assert_eq!(stamps, vec![10_000, 20_000, 30_000]);
+    }
+
+    #[test]
+    fn test_v3_roundtrip_preserves_edge_created_ms() {
+        let frozen = build_stamped_graph();
+        let csr = CsrSegment::from_frozen(frozen, 100).expect("csr ok");
+
+        // Heap parse path.
+        let restored = CsrSegment::from_bytes(&csr.to_bytes()).expect("parse ok");
+        assert_eq!(restored.edge_created_ms, csr.edge_created_ms);
+
+        // File path (mmap-first). nc=2, ec=3 -> node_meta is 8-aligned, so
+        // this must take the zero-copy Mmap variant, not the heap fallback.
+        let dir = tempfile::TempDir::new().expect("tmpdir");
+        let path = dir.path().join("stamped.csr");
+        csr.write_to_file(&path).expect("write ok");
+        let storage = CsrStorage::from_file(&path).expect("load ok");
+        assert!(
+            matches!(storage, CsrStorage::Mmap(_)),
+            "expected mmap load for 8-aligned shape"
+        );
+        assert_eq!(storage.edge_created_ms(), csr.edge_created_ms.as_slice());
+    }
+
+    /// Construct v2-format bytes (no edge_created_ms section) from a v3
+    /// segment: strip the trailing section, patch version to 2, zero the v3
+    /// edge_created_ms_offset header field (byte 80 — a v2 writer never set
+    /// it), recompute the CRC.
+    fn downgrade_to_v2(csr: &CsrSegment) -> Vec<u8> {
+        let v3_bytes = csr.to_bytes();
+        let ec = csr.edge_count() as usize;
+        let mut v2_bytes = v3_bytes[..v3_bytes.len() - ec * 8].to_vec();
+        v2_bytes[4..8].copy_from_slice(&2u32.to_le_bytes());
+        v2_bytes[80..88].copy_from_slice(&0u64.to_le_bytes());
+        v2_bytes[72..80].copy_from_slice(&0u64.to_le_bytes());
+        let checksum = compute_csr_checksum(&v2_bytes) as u64;
+        v2_bytes[72..80].copy_from_slice(&checksum.to_le_bytes());
+        v2_bytes
+    }
+
+    #[test]
+    fn test_v2_bytes_parse_with_empty_edge_created_ms() {
+        // Old (v2) segment files must keep loading after the v3 upgrade:
+        // the parser accepts them with empty stamps and the graph intact.
+        let frozen = build_stamped_graph();
+        let csr = CsrSegment::from_frozen(frozen, 100).expect("csr ok");
+        let v2_bytes = downgrade_to_v2(&csr);
+
+        // Heap parse path.
+        let restored = CsrSegment::from_bytes(&v2_bytes).expect("v2 parse ok");
+        assert_eq!(restored.header.version, 2);
+        assert!(restored.edge_created_ms.is_empty());
+        assert_eq!(restored.node_count(), csr.node_count());
+        assert_eq!(restored.edge_count(), csr.edge_count());
+        assert_eq!(restored.row_offsets, csr.row_offsets);
+        assert_eq!(restored.col_indices, csr.col_indices);
+
+        // Mmap path: same bytes from a file must load with empty stamps.
+        let dir = tempfile::TempDir::new().expect("tmpdir");
+        let path = dir.path().join("v2.csr");
+        std::fs::write(&path, &v2_bytes).expect("write ok");
+        let storage = CsrStorage::from_file(&path).expect("load ok");
+        assert!(storage.edge_created_ms().is_empty());
+        assert_eq!(storage.edge_count(), csr.edge_count());
+    }
+
+    #[test]
+    fn test_v2_reserialization_zero_fills_stamps() {
+        // A segment loaded from a v2 file then re-serialized keeps its
+        // (now version 2) header — to_bytes must not emit the v3 section
+        // for it, and the round-trip stays consistent.
+        let frozen = build_stamped_graph();
+        let csr = CsrSegment::from_frozen(frozen, 100).expect("csr ok");
+        let v2_bytes = downgrade_to_v2(&csr);
+
+        let loaded = CsrSegment::from_bytes(&v2_bytes).expect("v2 parse ok");
+        let rewritten = loaded.to_bytes();
+        assert_eq!(rewritten, v2_bytes, "v2 re-serialization must be stable");
+    }
+
+    #[test]
+    fn test_duplicate_external_id_rejected_not_panic() {
+        // Found by the csr_from_bytes fuzz target (CI, 217K execs): a
+        // corrupted/malicious segment file whose node_meta carries duplicate
+        // external_ids fed duplicate keys into MphNodeIndex::build, which
+        // panics inside boomphf. Corrupted files must fail with CsrError,
+        // never crash recovery.
+        let frozen = build_stamped_graph();
+        let csr = CsrSegment::from_frozen(frozen, 100).expect("csr ok");
+        let mut bytes = csr.to_bytes();
+
+        // node_meta starts after header(128) + row_offsets(4*(nc+1)) +
+        // col_indices(4*ec) + edge_meta(8*ec); external_id is the first
+        // field of each 48-byte NodeMeta record.
+        let nc = csr.node_count() as usize;
+        let ec = csr.edge_count() as usize;
+        let nm_start = 128 + 4 * (nc + 1) + 4 * ec + 8 * ec;
+        // Overwrite node 1's external_id with node 0's.
+        let id0: [u8; 8] = bytes[nm_start..nm_start + 8].try_into().expect("8 bytes");
+        bytes[nm_start + 48..nm_start + 48 + 8].copy_from_slice(&id0);
+        // Recompute the checksum (offset 72) over the patched payload.
+        bytes[72..80].copy_from_slice(&0u64.to_le_bytes());
+        let checksum = compute_csr_checksum(&bytes) as u64;
+        bytes[72..80].copy_from_slice(&checksum.to_le_bytes());
+
+        // Heap parser: must return Err, not panic.
+        assert!(
+            CsrSegment::from_bytes(&bytes).is_err(),
+            "duplicate external_id must be rejected by from_bytes"
+        );
+
+        // Mmap parser: same bytes from a file must also fail cleanly.
+        let dir = tempfile::TempDir::new().expect("tmpdir");
+        let path = dir.path().join("dup.csr");
+        std::fs::write(&path, &bytes).expect("write ok");
+        assert!(
+            MmapCsrSegment::from_mmap_file(&path).is_err(),
+            "duplicate external_id must be rejected by the mmap loader"
+        );
     }
 }

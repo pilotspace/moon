@@ -117,6 +117,9 @@ impl MemGraph {
             txn_id: 0,
             valid_from: 0,
             valid_to: i64::MAX,
+            // Shard-cached clock read (1ms tick) -- no syscall on the insert
+            // path. Powers temporal-decay traversal scoring.
+            created_ms: crate::storage::entry::current_time_ms(),
         });
 
         // Push edge key into src.outgoing and dst.incoming.
@@ -400,6 +403,23 @@ mod tests {
         assert_eq!(node.labels.as_slice(), &[1, 2]);
         assert_eq!(node.created_lsn, 1);
         assert_eq!(node.deleted_lsn, u64::MAX);
+    }
+
+    use crate::storage::entry::ClockPin;
+
+    #[test]
+    fn test_add_edge_stamps_created_ms_from_cached_clock() {
+        let _pin = ClockPin::set(5, 5_000);
+        let mut g = MemGraph::new(1000);
+        let a = g.add_node(smallvec![0], empty_props(), None, 1);
+        let b = g.add_node(smallvec![0], empty_props(), None, 1);
+        let ek = g.add_edge(a, b, 1, 1.0, None, 2).expect("edge ok");
+
+        let edge = g.get_edge(ek).expect("edge should exist");
+        assert_eq!(
+            edge.created_ms, 5_000,
+            "add_edge must stamp created_ms from the shard-cached clock"
+        );
     }
 
     #[test]

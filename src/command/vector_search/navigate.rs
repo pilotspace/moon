@@ -63,6 +63,12 @@ pub fn ft_navigate(
     // --- Parse HOP_PENALTY p (optional, default 0.1) ---
     let hop_penalty = parse_hop_penalty(args).unwrap_or(DEFAULT_HOP_PENALTY);
 
+    // --- Parse DECAY <lambda_per_sec> (optional, strict validation) ---
+    let decay = match parse_decay(args) {
+        Ok(d) => d,
+        Err(msg) => return Frame::Error(Bytes::from_static(msg.as_bytes())),
+    };
+
     // --- Parse K from the KNN query for result cap ---
     let k = parse_k_from_query(args).unwrap_or(10) as usize;
 
@@ -89,7 +95,7 @@ pub fn ft_navigate(
     let expanded = expand_results_via_graph(graph, &seed_keys, hops);
 
     // --- Step 3: Re-rank and merge ---
-    build_navigate_response(&knn_result, &expanded, hop_penalty, k)
+    build_navigate_response(&knn_result, &expanded, hop_penalty, k, decay)
 }
 
 /// Parse HOPS N from args. Returns None if not found.
@@ -120,6 +126,33 @@ fn parse_hop_penalty(args: &[Frame]) -> Option<f32> {
     None
 }
 
+/// Parse `DECAY <lambda_per_sec>` from args (temporal-decay re-ranking).
+///
+/// Strict validation: the value must be a finite non-negative f64; a dangling
+/// keyword or garbage value is an error (`Err`), absence is `Ok(None)`.
+fn parse_decay(args: &[Frame]) -> Result<Option<crate::graph::scoring::DecayConfig>, &'static str> {
+    for i in 0..args.len() {
+        if matches_keyword(&args[i], b"DECAY") {
+            let parsed = args.get(i + 1).and_then(extract_bulk).and_then(|b| {
+                std::str::from_utf8(&b)
+                    .ok()
+                    .and_then(|s| s.trim().parse::<f64>().ok())
+            });
+            return match parsed {
+                Some(v) if v.is_finite() && v >= 0.0 => {
+                    Ok(Some(crate::graph::scoring::DecayConfig {
+                        lambda_per_sec: v,
+                        time_weight: 1.0,
+                        now_ms: crate::storage::entry::current_time_ms(),
+                    }))
+                }
+                _ => Err("ERR DECAY must be a finite non-negative number (1/seconds)"),
+            };
+        }
+    }
+    Ok(None)
+}
+
 /// Extract K from the KNN query string: "*=>[KNN k @field $param]".
 fn parse_k_from_query(args: &[Frame]) -> Option<u32> {
     if args.len() < 2 {
@@ -135,7 +168,7 @@ fn parse_k_from_query(args: &[Frame]) -> Option<u32> {
     num_str.parse::<u32>().ok()
 }
 
-/// Build synthetic FT.SEARCH args by stripping HOPS, HOP_PENALTY keywords.
+/// Build synthetic FT.SEARCH args by stripping HOPS, HOP_PENALTY, DECAY keywords.
 fn build_search_args(args: &[Frame]) -> Vec<Frame> {
     let mut result = Vec::with_capacity(args.len());
     let mut skip_next = false;
@@ -144,7 +177,10 @@ fn build_search_args(args: &[Frame]) -> Vec<Frame> {
             skip_next = false;
             continue;
         }
-        if matches_keyword(frame, b"HOPS") || matches_keyword(frame, b"HOP_PENALTY") {
+        if matches_keyword(frame, b"HOPS")
+            || matches_keyword(frame, b"HOP_PENALTY")
+            || matches_keyword(frame, b"DECAY")
+        {
             // Skip this keyword and its value.
             if i + 1 < args.len() {
                 skip_next = true;
@@ -223,6 +259,7 @@ fn build_navigate_response(
     expanded: &[ExpandedResult],
     hop_penalty: f32,
     k: usize,
+    decay: Option<crate::graph::scoring::DecayConfig>,
 ) -> Frame {
     let knn_items = match knn_response {
         Frame::Array(items) => items,
@@ -267,11 +304,16 @@ fn build_navigate_response(
         if seen.contains_key(&er.key) {
             continue; // keep the KNN version (lower score, hop_depth=0)
         }
-        let final_score = if er.vec_score > 0.0 {
+        let mut final_score = if er.vec_score > 0.0 {
             er.vec_score + (er.graph_hops as f32 * hop_penalty)
         } else {
             er.graph_hops as f32 * hop_penalty
         };
+        // DECAY: age the discovery edge — same formula and 0-neutral rule as
+        // the GRAPH.QUERY traversal path, via the single DecayConfig home.
+        if let Some(d) = decay {
+            final_score += d.age_penalty_ms(er.edge_created_ms) as f32;
+        }
         let idx = candidates.len();
         candidates.push(RankedCandidate {
             key: er.key.clone(),
@@ -344,6 +386,108 @@ fn extract_score_from_fields(fields: &Frame) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_navigate_decay_penalizes_stale_edges() {
+        // Two expanded hits at equal hop depth: the one reached over a stale
+        // edge must rank below the one reached over a fresh edge when DECAY
+        // is active, and tie without it. Penalty = lambda * time_weight *
+        // age_seconds, added to final_score (lower = better).
+        let knn = Frame::Array(
+            vec![
+                Frame::Integer(1),
+                Frame::BulkString(Bytes::from_static(b"doc:knn")),
+                Frame::Array(
+                    vec![
+                        Frame::BulkString(Bytes::from_static(b"__vec_score")),
+                        Frame::BulkString(Bytes::from_static(b"0.05")),
+                    ]
+                    .into(),
+                ),
+            ]
+            .into(),
+        );
+        let expanded = vec![
+            super::super::graph_expand::ExpandedResult {
+                key: Bytes::from_static(b"doc:stale"),
+                vec_score: 0.0,
+                graph_hops: 1,
+                edge_created_ms: 1_000, // age 99s at now=100s
+            },
+            super::super::graph_expand::ExpandedResult {
+                key: Bytes::from_static(b"doc:fresh"),
+                vec_score: 0.0,
+                graph_hops: 1,
+                edge_created_ms: 99_000, // age 1s at now=100s
+            },
+        ];
+
+        let decay = crate::graph::scoring::DecayConfig {
+            lambda_per_sec: 0.01,
+            time_weight: 1.0,
+            now_ms: 100_000,
+        };
+
+        // With decay: knn (0.05) < fresh (0.1 + 0.01) < stale (0.1 + 0.99).
+        let resp = build_navigate_response(&knn, &expanded, 0.1, 10, Some(decay));
+        let keys = response_keys(&resp);
+        assert_eq!(keys, vec!["doc:knn", "doc:fresh", "doc:stale"]);
+
+        // Without decay: stale and fresh tie at 0.1 (stable sort keeps
+        // insertion order: stale first).
+        let resp = build_navigate_response(&knn, &expanded, 0.1, 10, None);
+        let keys = response_keys(&resp);
+        assert_eq!(keys, vec!["doc:knn", "doc:stale", "doc:fresh"]);
+    }
+
+    /// Collect result keys from a navigate response frame.
+    fn response_keys(resp: &Frame) -> Vec<String> {
+        let Frame::Array(items) = resp else {
+            panic!("expected Array, got {resp:?}");
+        };
+        let mut keys = Vec::new();
+        let mut i = 1;
+        while i + 1 < items.len() {
+            if let Frame::BulkString(k) = &items[i] {
+                keys.push(String::from_utf8_lossy(k).into_owned());
+            }
+            i += 2;
+        }
+        keys
+    }
+
+    #[test]
+    fn test_parse_decay_keyword() {
+        let args = vec![
+            Frame::BulkString(Bytes::from_static(b"myidx")),
+            Frame::BulkString(Bytes::from_static(b"*=>[KNN 10 @vec $v]")),
+            Frame::BulkString(Bytes::from_static(b"HOPS")),
+            Frame::BulkString(Bytes::from_static(b"2")),
+            Frame::BulkString(Bytes::from_static(b"DECAY")),
+            Frame::BulkString(Bytes::from_static(b"0.05")),
+        ];
+        let parsed = parse_decay(&args).expect("valid");
+        let cfg = parsed.expect("present");
+        assert!((cfg.lambda_per_sec - 0.05).abs() < 1e-12);
+        assert!((cfg.time_weight - 1.0).abs() < 1e-12);
+
+        // Absent -> Ok(None).
+        assert!(parse_decay(&args[..4]).expect("valid").is_none());
+
+        // Garbage values -> Err.
+        for bad in [&b"nan"[..], b"-0.5", b"abc", b""] {
+            let args = vec![
+                Frame::BulkString(Bytes::from_static(b"myidx")),
+                Frame::BulkString(Bytes::from_static(b"DECAY")),
+                Frame::BulkString(Bytes::from(bad.to_vec())),
+            ];
+            assert!(
+                parse_decay(&args).is_err(),
+                "DECAY {:?} must be rejected",
+                String::from_utf8_lossy(bad)
+            );
+        }
+    }
 
     #[test]
     fn test_parse_hops() {

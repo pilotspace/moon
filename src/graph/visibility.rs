@@ -182,6 +182,7 @@ mod tests {
             txn_id,
             valid_from: 0,
             valid_to: i64::MAX,
+            created_ms: 0,
         }
     }
 

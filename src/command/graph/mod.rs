@@ -253,6 +253,219 @@ mod tests {
         assert!(matches!(resp, Frame::Integer(_)));
     }
 
+    use crate::storage::entry::ClockPin;
+
+    /// Build the stale-direct vs fresh-detour graph used by the decay tests.
+    /// Returns (store, node id of B) with edges:
+    ///   A -> C  weight 1.0, created at t=1s   (stale direct)
+    ///   A -> B  weight 0.6, created at t=99s  (fresh detour)
+    ///   B -> C  weight 0.6, created at t=99s
+    fn build_decay_graph() -> (GraphStore, i64) {
+        let mut store = GraphStore::new();
+        dispatch_graph_command(&mut store, &make_cmd(&[b"GRAPH.CREATE", b"g"]));
+
+        let mut add_node = |name: &[u8]| -> i64 {
+            let resp = dispatch_graph_command(
+                &mut store,
+                &make_cmd(&[b"GRAPH.ADDNODE", b"g", b"Person", b"name", name]),
+            );
+            match resp {
+                Frame::Integer(id) => id,
+                other => panic!("expected node id, got {other:?}"),
+            }
+        };
+        let a = add_node(b"A").to_string();
+        let b_id = add_node(b"B");
+        let b = b_id.to_string();
+        let c = add_node(b"C").to_string();
+
+        let mut add_edge = |src: &str, dst: &str, weight: &[u8]| {
+            let resp = dispatch_graph_command(
+                &mut store,
+                &make_cmd(&[
+                    b"GRAPH.ADDEDGE",
+                    b"g",
+                    src.as_bytes(),
+                    dst.as_bytes(),
+                    b"KNOWS",
+                    b"WEIGHT",
+                    weight,
+                ]),
+            );
+            assert!(
+                matches!(resp, Frame::Integer(_)),
+                "ADDEDGE failed: {resp:?}"
+            );
+        };
+
+        {
+            let _pin = ClockPin::set(1, 1_000);
+            add_edge(&a, &c, b"1.0");
+        }
+        {
+            let _pin = ClockPin::set(99, 99_000);
+            add_edge(&a, &b, b"0.6");
+            add_edge(&b, &c, b"0.6");
+        }
+        (store, b_id)
+    }
+
+    const DECAY_QUERY: &[u8] =
+        b"MATCH p = shortestPath((a:Person {name: 'A'})-[*..5]->(c:Person {name: 'C'})) RETURN p";
+
+    #[test]
+    fn test_graph_query_decay_flag_changes_shortest_path() {
+        let (mut store, b_id) = build_decay_graph();
+        let _pin = ClockPin::set(100, 100_000);
+
+        let off =
+            dispatch_graph_command(&mut store, &make_cmd(&[b"GRAPH.QUERY", b"g", DECAY_QUERY]));
+        assert!(
+            !matches!(off, Frame::Error(_)),
+            "baseline query must succeed: {off:?}"
+        );
+
+        let on = dispatch_graph_command(
+            &mut store,
+            &make_cmd(&[b"GRAPH.QUERY", b"g", DECAY_QUERY, b"--decay", b"0.01"]),
+        );
+        assert!(
+            !matches!(on, Frame::Error(_)),
+            "--decay query must succeed: {on:?}"
+        );
+
+        // Compare path content, not whole-frame debug strings: the stats row
+        // embeds execution_time_us, which differs between any two runs and
+        // would make a plain inequality assertion pass vacuously.
+        // Result frame shape: [header, rows-array, stats].
+        let path_rows = |resp: &Frame| -> String {
+            match resp {
+                Frame::Array(items) => match items.get(1) {
+                    Some(rows) => format!("{rows:?}"),
+                    None => panic!("missing rows array: {resp:?}"),
+                },
+                other => panic!("expected array result: {other:?}"),
+            }
+        };
+        // Decay off picks the stale direct path A->C; decay on detours
+        // through the fresh B. Node B's id must appear only in the on-path.
+        let b_token = b_id.to_string();
+        let off_rows = path_rows(&off);
+        let on_rows = path_rows(&on);
+        assert!(
+            !off_rows.contains(&b_token),
+            "decay-off must take the direct A->C path, got {off_rows}"
+        );
+        assert!(
+            on_rows.contains(&b_token),
+            "decay-on must detour through B (id {b_token}), got {on_rows}"
+        );
+    }
+
+    #[test]
+    fn test_graph_query_decay_flag_rejects_garbage() {
+        let (mut store, _b_id) = build_decay_graph();
+        for bad in [&b"nan"[..], b"-1", b"abc", b""] {
+            let resp = dispatch_graph_command(
+                &mut store,
+                &make_cmd(&[b"GRAPH.QUERY", b"g", DECAY_QUERY, b"--decay", bad]),
+            );
+            assert!(
+                matches!(resp, Frame::Error(_)),
+                "--decay {:?} must be rejected, got {resp:?}",
+                String::from_utf8_lossy(bad)
+            );
+        }
+        // --decay without a value is also malformed.
+        let resp = dispatch_graph_command(
+            &mut store,
+            &make_cmd(&[b"GRAPH.QUERY", b"g", DECAY_QUERY, b"--decay"]),
+        );
+        assert!(
+            matches!(resp, Frame::Error(_)),
+            "dangling --decay must error"
+        );
+    }
+
+    #[test]
+    fn test_graph_query_time_weight_requires_decay_and_parses() {
+        let (mut store, _b_id) = build_decay_graph();
+        let _pin = ClockPin::set(100, 100_000);
+
+        // --time-weight scales the decay term; with decay present it parses.
+        let resp = dispatch_graph_command(
+            &mut store,
+            &make_cmd(&[
+                b"GRAPH.QUERY",
+                b"g",
+                DECAY_QUERY,
+                b"--decay",
+                b"0.01",
+                b"--time-weight",
+                b"2.0",
+            ]),
+        );
+        assert!(!matches!(resp, Frame::Error(_)), "valid combo: {resp:?}");
+
+        // --time-weight without --decay is meaningless -> error.
+        let resp = dispatch_graph_command(
+            &mut store,
+            &make_cmd(&[b"GRAPH.QUERY", b"g", DECAY_QUERY, b"--time-weight", b"2.0"]),
+        );
+        assert!(
+            matches!(resp, Frame::Error(_)),
+            "--time-weight without --decay must error"
+        );
+    }
+
+    #[test]
+    fn test_graph_query_decay_flag_rejected_on_write_query() {
+        let (mut store, _b_id) = build_decay_graph();
+        const WRITE_QUERY: &[u8] = b"CREATE (:Person {name: 'X'})";
+
+        // Valid --decay on a write query is rejected, not silently ignored.
+        let resp = dispatch_graph_command(
+            &mut store,
+            &make_cmd(&[b"GRAPH.QUERY", b"g", WRITE_QUERY, b"--decay", b"0.5"]),
+        );
+        match &resp {
+            Frame::Error(msg) => assert!(
+                msg.windows(b"read-only".len()).any(|w| w == b"read-only"),
+                "error must say decay needs a read-only query, got {resp:?}"
+            ),
+            other => panic!("--decay on write query must error, got {other:?}"),
+        }
+
+        // Garbage --decay on a write query is validated, not silently ignored.
+        let resp = dispatch_graph_command(
+            &mut store,
+            &make_cmd(&[b"GRAPH.QUERY", b"g", WRITE_QUERY, b"--decay", b"notanumber"]),
+        );
+        assert!(
+            matches!(resp, Frame::Error(_)),
+            "garbage --decay on write query must error, got {resp:?}"
+        );
+
+        // The rejection happens before execution: still exactly the 3 nodes
+        // from build_decay_graph (A, B, C) -- no 'X' was created.
+        let check = dispatch_graph_command(
+            &mut store,
+            &make_cmd(&[b"GRAPH.QUERY", b"g", b"MATCH (n:Person) RETURN n"]),
+        );
+        // Result frame shape: [header, rows-array, stats].
+        let rows = match &check {
+            Frame::Array(items) => match items.get(1) {
+                Some(Frame::Array(rows)) => rows.len(),
+                other => panic!("expected rows array, got {other:?}"),
+            },
+            other => panic!("verification query failed: {other:?}"),
+        };
+        assert_eq!(
+            rows, 3,
+            "rejected write query must not have executed, got {check:?}"
+        );
+    }
+
     #[test]
     fn test_graph_neighbors() {
         let mut store = GraphStore::new();

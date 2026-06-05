@@ -76,6 +76,10 @@ pub struct MergedNeighbor {
     pub weight: f64,
     /// Timestamp (created_lsn) of the edge.
     pub timestamp: u64,
+    /// Wall-clock creation stamp (Unix millis) of the edge. 0 = unknown
+    /// (pre-upgrade data or CSR segments without per-edge stamps); decay
+    /// scoring treats 0 as neutral (no age penalty).
+    pub created_ms: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -164,6 +168,7 @@ impl<'a> SegmentMergeReader<'a> {
                             edge_type: edge.edge_type,
                             weight: edge.weight,
                             timestamp: edge.created_lsn,
+                            created_ms: edge.created_ms,
                         });
                     }
                 }
@@ -192,7 +197,7 @@ impl<'a> SegmentMergeReader<'a> {
             let node_meta = csr.node_meta();
             let csr_lsn = csr.created_lsn();
 
-            csr.for_each_neighbor_edge(row, |col_idx, meta| {
+            csr.for_each_neighbor_edge_ms(row, |col_idx, meta, created_ms| {
                 // Apply edge type filter.
                 if let Some(filter) = edge_type_filter {
                     if meta.edge_type != filter {
@@ -219,6 +224,10 @@ impl<'a> SegmentMergeReader<'a> {
                             edge_type: meta.edge_type,
                             weight: 1.0,
                             timestamp: csr_lsn,
+                            // Real per-edge wall-clock stamp from the version
+                            // >= 3 segment format; 0 = unknown (pre-v3 file),
+                            // which decay treats as neutral.
+                            created_ms,
                         });
                     }
                 }
@@ -565,7 +574,7 @@ impl BoundedDfs {
                 if visited_set.contains(&neighbor.node) {
                     continue;
                 }
-                let edge_cost = self.cost_fn.cost(neighbor.timestamp, neighbor.weight);
+                let edge_cost = self.cost_fn.cost_ms(neighbor.created_ms, neighbor.weight);
                 let new_cost = cum_cost + edge_cost;
 
                 // Max-cost pruning (TRAV-02).
@@ -700,7 +709,7 @@ impl DijkstraTraversal {
 
             reader.neighbors_into(node, &mut nb_seen, &mut nb_buf);
             for &neighbor in &nb_buf {
-                let edge_cost = self.cost_fn.cost(neighbor.timestamp, neighbor.weight);
+                let edge_cost = self.cost_fn.cost_ms(neighbor.created_ms, neighbor.weight);
                 let new_cost = cost + edge_cost;
 
                 let is_better = match dist.get(&neighbor.node) {
@@ -761,6 +770,91 @@ mod tests {
     }
 
     // --- SegmentMergeReader tests ---
+
+    #[test]
+    fn test_dijkstra_decay_prefers_fresh_path() {
+        // Topology: direct a->c (weight 1.0, STALE, created at t=1s) vs
+        // detour a->b->c (weight 0.6 each, FRESH, created at t=99s).
+        //
+        // Decay OFF (time_weight = 0): direct wins (1.0 < 1.2).
+        // Decay ON  (time_weight = 0.01/sec, now = 100s):
+        //   direct: 1.0 + 0.01 * 99s            = 1.99
+        //   detour: 1.2 + 0.01 * (1s + 1s)      = 1.22  -> detour wins.
+        let mut mg = MemGraph::new(1000);
+        let a = mg.add_node(smallvec![0], empty_props(), None, 1);
+        let b = mg.add_node(smallvec![0], empty_props(), None, 1);
+        let c = mg.add_node(smallvec![0], empty_props(), None, 1);
+
+        {
+            let _pin = crate::storage::entry::ClockPin::set(1, 1_000);
+            mg.add_edge(a, c, 1, 1.0, None, 2).expect("stale direct");
+        }
+        {
+            let _pin = crate::storage::entry::ClockPin::set(99, 99_000);
+            mg.add_edge(a, b, 1, 0.6, None, 3).expect("fresh hop 1");
+            mg.add_edge(b, c, 1, 0.6, None, 4).expect("fresh hop 2");
+        }
+
+        let csr_segs: Vec<Arc<CsrStorage>> = vec![];
+        let reader = SegmentMergeReader::new(
+            Some(&mg),
+            &csr_segs,
+            Direction::Outgoing,
+            u64::MAX - 1,
+            None,
+        );
+
+        // Decay off: direct path.
+        let off = DijkstraTraversal::new(WeightedCostFn::new(0.0, 1.0, 0), 10)
+            .shortest_path(&reader, a, c)
+            .expect("ok")
+            .expect("path");
+        assert_eq!(
+            off.path,
+            vec![a, c],
+            "decay off must keep distance-only behavior"
+        );
+
+        // Decay on: fresh detour wins.
+        let on = DijkstraTraversal::new(WeightedCostFn::new(0.01, 1.0, 100_000), 10)
+            .shortest_path(&reader, a, c)
+            .expect("ok")
+            .expect("path");
+        assert_eq!(
+            on.path,
+            vec![a, b, c],
+            "decay must steer toward fresh edges"
+        );
+    }
+
+    #[test]
+    fn test_merge_reader_propagates_created_ms() {
+        // MemGraph edges must surface their wall-clock creation stamp through
+        // MergedNeighbor so decay-aware cost functions can age them.
+        let mut mg = MemGraph::new(1000);
+        let a = mg.add_node(smallvec![0], empty_props(), None, 1);
+        let b = mg.add_node(smallvec![0], empty_props(), None, 1);
+        {
+            let _pin = crate::storage::entry::ClockPin::set(7, 7_000);
+            mg.add_edge(a, b, 1, 2.0, None, 2).expect("ok");
+        }
+
+        let csr_segs: Vec<Arc<CsrStorage>> = vec![];
+        let reader = SegmentMergeReader::new(
+            Some(&mg),
+            &csr_segs,
+            Direction::Outgoing,
+            u64::MAX - 1,
+            None,
+        );
+
+        let neighbors = reader.neighbors(a);
+        assert_eq!(neighbors.len(), 1);
+        assert_eq!(
+            neighbors[0].created_ms, 7_000,
+            "MergedNeighbor must carry the edge's created_ms"
+        );
+    }
 
     #[test]
     fn test_merge_reader_memgraph_only() {
@@ -1181,22 +1275,33 @@ mod tests {
 
     #[test]
     fn test_dijkstra_composite_cost() {
-        // TRAV-03/04: time_weight * (now - ts) + distance_weight * distance
+        // TRAV-03/04: time_weight * age_seconds + distance_weight * distance.
+        // Edge ages come from wall-clock created_ms (pinned cached clock);
+        // cost_ms converts ms -> seconds.
         let mut mg = MemGraph::new(1000);
         let a = mg.add_node(smallvec![0], empty_props(), None, 1);
         let b = mg.add_node(smallvec![0], empty_props(), None, 1);
         let c = mg.add_node(smallvec![0], empty_props(), None, 1);
 
-        // Route 1: a->c, weight=2.0, timestamp=90 (age=10)
+        // Route 1: a->c, weight=2.0, created at t=90s (age=10s at now=100s)
         //   cost = 0.5*10 + 1.0*2.0 = 7.0
-        mg.add_edge(a, c, 1, 2.0, None, 90).expect("ok");
+        {
+            let _pin = crate::storage::entry::ClockPin::set(90, 90_000);
+            mg.add_edge(a, c, 1, 2.0, None, 90).expect("ok");
+        }
 
-        // Route 2: a->b (weight=1.0, ts=95, age=5) -> b->c (weight=1.0, ts=80, age=20)
+        // Route 2: a->b (weight=1.0, t=95s, age=5s) -> b->c (weight=1.0, t=80s, age=20s)
         //   a->b cost = 0.5*5 + 1.0*1.0 = 3.5
         //   b->c cost = 0.5*20 + 1.0*1.0 = 11.0
         //   total = 14.5
-        mg.add_edge(a, b, 1, 1.0, None, 95).expect("ok");
-        mg.add_edge(b, c, 1, 1.0, None, 80).expect("ok");
+        {
+            let _pin = crate::storage::entry::ClockPin::set(95, 95_000);
+            mg.add_edge(a, b, 1, 1.0, None, 95).expect("ok");
+        }
+        {
+            let _pin = crate::storage::entry::ClockPin::set(80, 80_000);
+            mg.add_edge(b, c, 1, 1.0, None, 80).expect("ok");
+        }
 
         let csr_segs: Vec<Arc<CsrStorage>> = vec![];
         let reader = SegmentMergeReader::new(
@@ -1207,7 +1312,7 @@ mod tests {
             None,
         );
 
-        let cost_fn = WeightedCostFn::new(0.5, 1.0, 100);
+        let cost_fn = WeightedCostFn::new(0.5, 1.0, 100_000);
         let dijkstra = DijkstraTraversal::new(cost_fn, 10);
         let result = dijkstra
             .shortest_path(&reader, a, c)
@@ -1307,6 +1412,33 @@ mod tests {
         let neighbors = reader.neighbors(node_a_key);
         // Should find neighbor(s) from CSR 1 at minimum.
         assert!(!neighbors.is_empty());
+    }
+
+    #[test]
+    fn test_csr_neighbors_surface_edge_created_ms() {
+        // Edges frozen into a CSR segment keep their wall-clock stamps (v3
+        // format) — the merge reader must surface them on MergedNeighbor so
+        // decay scoring sees true edge age after compaction.
+        let mut mg = MemGraph::new(1000);
+        let a = mg.add_node(smallvec![0], empty_props(), None, 1);
+        let b = mg.add_node(smallvec![0], empty_props(), None, 1);
+        {
+            let _pin = crate::storage::entry::ClockPin::set(42, 42_000);
+            mg.add_edge(a, b, 1, 1.0, None, 2).expect("ok");
+        }
+
+        let frozen = mg.freeze().expect("ok");
+        let csr = CsrSegment::from_frozen(frozen, 5).expect("ok");
+        let csr_segs = vec![Arc::new(CsrStorage::from(csr))];
+        let reader: SegmentMergeReader<'_> =
+            SegmentMergeReader::new(None, &csr_segs, Direction::Outgoing, u64::MAX - 1, None);
+
+        let neighbors = reader.neighbors(a);
+        assert_eq!(neighbors.len(), 1);
+        assert_eq!(
+            neighbors[0].created_ms, 42_000,
+            "CSR neighbor must carry the persisted per-edge stamp"
+        );
     }
 
     // --- ParallelBfs tests ---

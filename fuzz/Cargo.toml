@@ -66,5 +66,10 @@ name = "conf_parse"
 path = "fuzz_targets/conf_parse.rs"
 doc = false
 
+[[bin]]
+name = "csr_from_bytes"
+path = "fuzz_targets/csr_from_bytes.rs"
+doc = false
+
 [workspace]
 members = ["."]

@@ -31,6 +31,10 @@ pub struct MmapCsrSegment {
     /// Pointer into mmap: length = node_count.
     node_meta_ptr: *const NodeMeta,
     node_meta_len: usize,
+    /// Pointer into mmap: length = edge_count for version >= 3 segments,
+    /// 0 (dangling) for older files without per-edge created_ms stamps.
+    edge_created_ms_ptr: *const u64,
+    edge_created_ms_len: usize,
     /// Validity bitmap (heap-allocated, mutable).
     pub validity: RoaringBitmap,
     pub node_id_to_row: HashMap<NodeKey, u32>,
@@ -91,11 +95,20 @@ impl MmapCsrSegment {
         let vb_offset = u64::from_le_bytes(read8(data, 56)?);
         let created_lsn = u64::from_le_bytes(read8(data, 64)?);
         let stored_checksum = u64::from_le_bytes(read8(data, 72)?);
+        // Version 3+: byte offset of the per-edge created_ms section (informational).
+        let ecms_offset = if version >= 3 {
+            u64::from_le_bytes(read8(data, 80)?)
+        } else {
+            0
+        };
 
         let nc = node_count as usize;
         let ec = edge_count as usize;
         let em_elem_size = core::mem::size_of::<EdgeMeta>(); // 8
-        let nm_elem_size = core::mem::size_of::<NodeMeta>(); // 32
+        let nm_elem_size = core::mem::size_of::<NodeMeta>(); // 48 (version 2+ layout;
+        // version 1 files fail the length check below and fall back to the heap loader)
+        // Version 3+: trailing per-edge created_ms array (8 bytes per edge).
+        let ecms_elem_size: usize = if version >= 3 { 8 } else { 0 };
 
         // Use checked arithmetic to prevent integer overflow from attacker-controlled
         // node_count/edge_count values bypassing the size validation.
@@ -104,11 +117,13 @@ impl MmapCsrSegment {
             let ci_size = ec.checked_mul(4)?;
             let em_size = ec.checked_mul(em_elem_size)?;
             let nm_size = nc.checked_mul(nm_elem_size)?;
+            let ecms_size = ec.checked_mul(ecms_elem_size)?;
             header_size
                 .checked_add(ro_size)?
                 .checked_add(ci_size)?
                 .checked_add(em_size)?
-                .checked_add(nm_size)
+                .checked_add(nm_size)?
+                .checked_add(ecms_size)
         })()
         .ok_or_else(|| CsrError::InvalidData("size overflow in CSR header fields".to_owned()))?;
         if mmap.len() < expected_len {
@@ -165,6 +180,26 @@ impl MmapCsrSegment {
         }
         let nm_len = nc;
 
+        // Version 3+: per-edge created_ms array after node_meta. Older files
+        // get a dangling pointer with len 0 — the accessor returns &[].
+        let (ecms_ptr, ecms_len) = if version >= 3 {
+            let ecms_start = nm_start + nc * nm_elem_size;
+            // SAFETY: base + ecms_start is in-bounds (expected_len validated
+            // above includes ec * 8 for version >= 3), alignment checked below.
+            let p = unsafe { base.add(ecms_start) } as *const u64;
+            if !(p as usize).is_multiple_of(core::mem::align_of::<u64>()) {
+                return Err(CsrError::InvalidData(
+                    "edge_created_ms alignment violated in mmap".to_owned(),
+                ));
+            }
+            (p, ec)
+        } else {
+            (
+                core::ptr::NonNull::<u64>::dangling().as_ptr() as *const u64,
+                0,
+            )
+        };
+
         // Validate row_offsets: every entry must be <= edge_count and
         // the array must be monotonically non-decreasing. Without this,
         // corrupted CSR files cause panics via out-of-bounds slice indexing
@@ -196,12 +231,20 @@ impl MmapCsrSegment {
         // SAFETY: em_ptr validated above (alignment checked, mmap alive for scope).
         let edge_meta_slice = unsafe { core::slice::from_raw_parts(em_ptr, em_len) };
 
+        // Duplicate keys (corrupted/malicious file) must be rejected here:
+        // MphNodeIndex::build panics inside boomphf on non-unique keys
+        // (found by the csr_from_bytes fuzz target).
         let mut node_id_to_row: HashMap<NodeKey, u32> = HashMap::with_capacity(nc);
         let mut sorted_keys = Vec::with_capacity(nc);
         for (row, nm) in node_meta_slice.iter().enumerate() {
             let key_data = slotmap::KeyData::from_ffi(nm.external_id);
             let nk = NodeKey::from(key_data);
-            node_id_to_row.insert(nk, row as u32);
+            if node_id_to_row.insert(nk, row as u32).is_some() {
+                return Err(CsrError::InvalidData(format!(
+                    "duplicate node external_id {} at row {row}",
+                    nm.external_id
+                )));
+            }
             sorted_keys.push(nk);
         }
 
@@ -228,6 +271,7 @@ impl MmapCsrSegment {
             validity_bitmap_offset: vb_offset,
             created_lsn,
             checksum: stored_checksum,
+            edge_created_ms_offset: ecms_offset,
         };
 
         Ok(Self {
@@ -241,6 +285,8 @@ impl MmapCsrSegment {
             edge_meta_len: em_len,
             node_meta_ptr: nm_ptr,
             node_meta_len: nm_len,
+            edge_created_ms_ptr: ecms_ptr,
+            edge_created_ms_len: ecms_len,
             validity,
             node_id_to_row,
             mph,
@@ -273,6 +319,16 @@ impl MmapCsrSegment {
     pub fn node_meta(&self) -> &[NodeMeta] {
         // SAFETY: same as row_offsets — pointer validated, mmap alive.
         unsafe { core::slice::from_raw_parts(self.node_meta_ptr, self.node_meta_len) }
+    }
+
+    /// Per-edge wall-clock creation stamps (version >= 3; empty for older files).
+    pub fn edge_created_ms(&self) -> &[u64] {
+        if self.edge_created_ms_len == 0 {
+            return &[];
+        }
+        // SAFETY: pointer validated (bounds + alignment) in from_mmap_file for
+        // version >= 3; len 0 (dangling pointer) is handled by the early return.
+        unsafe { core::slice::from_raw_parts(self.edge_created_ms_ptr, self.edge_created_ms_len) }
     }
 
     /// Outgoing neighbor row indices for a CSR row.

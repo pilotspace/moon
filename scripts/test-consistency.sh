@@ -774,6 +774,9 @@ TEMP_INV_RESULT_12=""
 FT_ASOF_RESULT_1=""
 FT_ASOF_RESULT_4=""
 FT_ASOF_RESULT_12=""
+DECAY_RESULT_1=""
+DECAY_RESULT_4=""
+DECAY_RESULT_12=""
 
 for NSHARDS in 1 4 12; do
     log "  -- temporal shards=$NSHARDS --"
@@ -856,6 +859,31 @@ PYEOF
         12) FT_ASOF_RESULT_12="$FT_SIG" ;;
     esac
 
+    # Temporal decay parity: stale-direct vs fresh-detour shortestPath must
+    # flip identically under --decay on every shard config (graphs are
+    # shard-local; the decay knob rides ExecutionContext like VALID_AT).
+    # The returned path renders one node id per line — the detour is
+    # detected by whether B's node id appears.
+    redis-cli -p "$PORT_RUST" GRAPH.CREATE decayg >/dev/null 2>&1
+    DECAY_A=$(redis-cli -p "$PORT_RUST" GRAPH.ADDNODE decayg Person name A 2>&1 | grep -oE '[0-9]+' | head -1)
+    DECAY_B=$(redis-cli -p "$PORT_RUST" GRAPH.ADDNODE decayg Person name B 2>&1 | grep -oE '[0-9]+' | head -1)
+    DECAY_C=$(redis-cli -p "$PORT_RUST" GRAPH.ADDNODE decayg Person name C 2>&1 | grep -oE '[0-9]+' | head -1)
+    redis-cli -p "$PORT_RUST" GRAPH.ADDEDGE decayg "$DECAY_A" "$DECAY_C" KNOWS WEIGHT 1.0 >/dev/null 2>&1
+    sleep 2
+    redis-cli -p "$PORT_RUST" GRAPH.ADDEDGE decayg "$DECAY_A" "$DECAY_B" KNOWS WEIGHT 0.6 >/dev/null 2>&1
+    redis-cli -p "$PORT_RUST" GRAPH.ADDEDGE decayg "$DECAY_B" "$DECAY_C" KNOWS WEIGHT 0.6 >/dev/null 2>&1
+    DECAY_Q="MATCH p = shortestPath((a:Person {name: 'A'})-[*..5]->(c:Person {name: 'C'})) RETURN p"
+    DECAY_OFF=$(redis-cli -p "$PORT_RUST" GRAPH.QUERY decayg "$DECAY_Q" 2>&1)
+    DECAY_ON=$(redis-cli -p "$PORT_RUST" GRAPH.QUERY decayg "$DECAY_Q" --decay 5 2>&1)
+    OFF_VIA_B="no"; echo "$DECAY_OFF" | grep -qE "^${DECAY_B}\$" && OFF_VIA_B="yes"
+    ON_VIA_B="no";  echo "$DECAY_ON"  | grep -qE "^${DECAY_B}\$" && ON_VIA_B="yes"
+    case "$NSHARDS" in
+        1)  DECAY_RESULT_1="off_via_b=$OFF_VIA_B|on_via_b=$ON_VIA_B" ;;
+        4)  DECAY_RESULT_4="off_via_b=$OFF_VIA_B|on_via_b=$ON_VIA_B" ;;
+        12) DECAY_RESULT_12="off_via_b=$OFF_VIA_B|on_via_b=$ON_VIA_B" ;;
+    esac
+    redis-cli -p "$PORT_RUST" GRAPH.DELETE decayg >/dev/null 2>&1
+
     stop_moon
 done
 
@@ -908,6 +936,20 @@ else
     echo "    1-shard:  $FT_ASOF_RESULT_1"
     echo "    4-shard:  $FT_ASOF_RESULT_4"
     echo "    12-shard: $FT_ASOF_RESULT_12"
+fi
+
+# DECAY consistency: decay-off takes the cheaper direct path (no B),
+# decay-on flips through the fresh detour (via B), identically across
+# shard configs.
+if [[ "$DECAY_RESULT_1" == "off_via_b=no|on_via_b=yes" \
+   && "$DECAY_RESULT_1" == "$DECAY_RESULT_4" && "$DECAY_RESULT_4" == "$DECAY_RESULT_12" ]]; then
+    PASS=$((PASS + 1)); echo "  PASS: GRAPH.QUERY --decay path flip consistent across 1/4/12 shards"
+else
+    FAIL=$((FAIL + 1))
+    echo "  FAIL: GRAPH.QUERY --decay cross-shard divergence (expected off_via_b=no|on_via_b=yes)"
+    echo "    1-shard:  $DECAY_RESULT_1"
+    echo "    4-shard:  $DECAY_RESULT_4"
+    echo "    12-shard: $DECAY_RESULT_12"
 fi
 
 # Restart moon with the originally-requested shard count so later sections work.

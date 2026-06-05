@@ -10,6 +10,46 @@ The v0.2 enterprise beachhead. Built additively on per-shard WAL v3 + the
 dual-root manifest; no changes to the KV hot path, MVCC, page format, or
 transaction layer.
 
+### Added — Temporal-decay traversal scoring (agent-memory recency)
+
+User-facing recency bias for graph traversal: paths through recently
+created edges win over stale ones. The decay engine (scorers, Dijkstra
+composite cost) existed but was unreachable — `shortestPath()` hardcoded
+`lambda = 0`. This wires it end to end.
+
+- **`GRAPH.QUERY ... --decay <λ> [--time-weight <w>]`** — per-edge cost
+  becomes `|weight| + λ·w·age_seconds` for `shortestPath()`; λ is 1/seconds,
+  strictly validated. Decay off (no flag) keeps exact distance-only
+  behavior — the age term contributes zero to every edge cost, so path
+  choice is identical to pre-decay Moon. Applies to the read-only and
+  `GRAPH.PROFILE` paths via `ExecutionContext` (same pattern as
+  `VALID_AT`); write queries (CREATE/SET/DELETE/MERGE) reject the flag
+  instead of silently ignoring it.
+- **`FT.NAVIGATE ... DECAY <λ>`** — graph-expanded hits pay
+  `λ × age_seconds` of their discovery edge on top of the hop penalty
+  (a re-rank of the already-explored expansion, not a steer of the
+  expansion itself); KNN direct hits unaffected.
+- **Edges stamp `created_ms` at insert** from the shard-cached clock
+  (zero syscall on the insert path). `0 = unknown` is decay-neutral —
+  pre-upgrade edges never look maximally old. Distinct from the
+  user-owned bi-temporal `valid_from`/`valid_to`.
+- **CSR segment format v3** — per-edge `created_ms` array (parallel to
+  `col_indices`) survives freeze → disk → mmap → compaction, so decay
+  sees true edge age after segments rotate. v1/v2 files keep loading
+  (empty stamps = neutral); both parsers (heap + mmap zero-copy) are
+  version-gated, plus a new `csr_from_bytes` fuzz target.
+- **Fixed (latent durability bug):** `compact_segments` stamped merged
+  segments `version: 1` while the serializer always writes 48-byte v2+
+  NodeMeta records — a vacuumed segment written to disk misparsed on
+  reload (panic in debug, silent node_meta corruption in release).
+  Merged segments are now v3 and carry per-edge stamps through dedup.
+- Docs: `guides/temporal.mdx` decay section + `commands.mdx`; script
+  coverage in `test-commands.sh` (6 DECAY cases) and `test-consistency.sh`
+  (1/4/12-shard path-flip parity).
+- Known gap: WAL-replayed not-yet-frozen edges re-stamp to replay time
+  on restart (newest edges look new — bias direction preserved);
+  CSR-resident edges keep exact age.
+
 ### Added — Ship moon as an installable application on macOS, Linux, and Windows
 
 Five-PR milestone making moon installable on all three platforms

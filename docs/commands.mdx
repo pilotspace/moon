@@ -179,6 +179,16 @@ GRAPH.QUERY social "MATCH (a) RETURN a" VALID_AT 1713394800000
 Cypher subset: MATCH, WHERE, RETURN, CREATE, DELETE, SET, MERGE, WITH, ORDER BY, LIMIT, SKIP. Supports hybrid graph+vector queries via `EXPAND GRAPH` clause in `FT.SEARCH`.
 </Note>
 
+Temporal-decay traversal scoring biases path finding toward recently created edges — the recency primitive for agent memory graphs:
+
+```
+GRAPH.QUERY g "MATCH p = shortestPath((a:P {name: 'A'})-[*..5]->(c:P {name: 'C'})) RETURN p" --decay 0.1
+GRAPH.QUERY g "..." --decay 0.1 --time-weight 2.0   -- scale the age term
+FT.NAVIGATE idx "*=>[KNN 5 @vec $q]" PARAMS 2 q <vec> HOPS 2 DECAY 0.1
+```
+
+`--decay <λ>` (1/seconds) adds `λ × edge_age_seconds` to each edge's traversal cost, so `shortestPath()` prefers fresh routes over stale ones at equal weight; the flag is read-only-query only (rejected on CREATE/SET/DELETE/MERGE). `FT.NAVIGATE ... DECAY <λ>` applies the same penalty to the discovery edge of each graph-expanded hit — a re-rank of the already-explored expansion, not a steer of the expansion itself. Decay off (no flag) keeps exact distance-only behavior. See the [temporal guide](/guides/temporal) for details.
+
 ## Server (12)
 
 `CONFIG GET`, `CONFIG SET`, `DBSIZE`, `FLUSHDB`, `FLUSHALL`, `HELLO`, `CLIENT`, `OBJECT`, `DEBUG`, `SLOWLOG`, `WAIT`, `COMMAND DOCS`

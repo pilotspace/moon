@@ -75,7 +75,7 @@ Any Redis client connects out of the box.
 - **Cross-store ACID transactions.** `TXN.BEGIN` / `TXN.COMMIT` / `TXN.ABORT` for atomic writes across KV, vector, and graph stores with undo-log rollback.
 - **Workspace partitioning.** `WS CREATE` / `WS AUTH` — multi-tenant namespace isolation with transparent key prefixing and per-shard registries.
 - **Durable message queues.** `MQ CREATE` / `MQ PUSH` / `MQ POP` / `MQ ACK` — at-least-once delivery with dead-letter queues, debounced triggers, and WAL-backed crash recovery.
-- **Bi-temporal MVCC.** `TEMPORAL.SNAPSHOT_AT` / `TEMPORAL.INVALIDATE` — point-in-time queries across KV (`FT.SEARCH AS_OF`) and graph (`GRAPH.QUERY VALID_AT`).
+- **Bi-temporal MVCC.** `TEMPORAL.SNAPSHOT_AT` / `TEMPORAL.INVALIDATE` — point-in-time queries across KV (`FT.SEARCH AS_OF`) and graph (`GRAPH.QUERY VALID_AT`), plus temporal-decay traversal scoring (`GRAPH.QUERY --decay`, `FT.NAVIGATE DECAY`) that biases path finding toward recently created edges.
 - **Embedded web console.** 7-view React UI (Dashboard, Browser, Console, Vectors, Graph, Memory) served at `/ui/` — zero deployment, one binary. REST + WebSocket + SSE gateway with Bearer auth and rate limiting.
 
 <p align="center">
