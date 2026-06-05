@@ -35,7 +35,7 @@ Moon is configured entirely through command-line flags. There is no configuratio
 | `--appendfilename` | `appendonly.aof` | AOF filename |
 | `--save` | *(none)* | RDB auto-save rules (e.g., `"3600 1 300 100"`) |
 | `--dbfilename` | `dump.rdb` | RDB snapshot filename |
-| `--dir` | `.` | Directory for persistence files |
+| `--dir` | *(user data dir)* | Directory for persistence files. Default auto-resolves per platform: Linux `$XDG_DATA_HOME/moon` (or `~/.local/share/moon`), macOS `~/Library/Application Support/moon`, Windows `%LOCALAPPDATA%\moon` — created on first run. Pre-v0.2.0 data in the startup directory keeps being used (with a warning). Pass any path (e.g. `--dir .`) to override |
 
 ## Memory & Eviction
 
