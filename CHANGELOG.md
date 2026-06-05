@@ -51,6 +51,10 @@ Five-PR milestone making moon installable on all three platforms
   pinned `@cosmos.gl/graph` 2.6.4 API (`setConfigPartial` → `setConfig`,
   no async `ready` hook); `pnpm run build` type-checks again, unblocking
   the Console Integration workflow and the release `prepare-console` job.
+- **RESP3 negotiation fix (PR #153)** — the monoio (default) handler now
+  syncs the wire codec when `HELLO 3` negotiates RESP3; previously the
+  codec stayed on RESP2 and silently flattened map/set/push frames,
+  breaking RESP3 clients on connect (redis-py 8 defaults to RESP3).
 - **Known limitations (v0.2.0)** — Windows binaries are not
   Authenticode-signed (SmartScreen warning); connection migration is
   unix-only (connections stay on the originating shard on Windows);
