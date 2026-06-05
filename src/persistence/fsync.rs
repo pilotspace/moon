@@ -3,7 +3,6 @@
 //! These functions ensure metadata and data durability on disk after
 //! atomic rename operations, WAL truncation, and segment writes.
 
-use std::fs::File;
 use std::path::Path;
 
 /// Fsync a directory to ensure rename/unlink metadata durability.
@@ -11,17 +10,42 @@ use std::path::Path;
 /// Required after: snapshot rename, segment staging rename, WAL segment creation.
 /// On POSIX systems, directory fsync makes the directory entry durable so that
 /// a power failure after rename does not lose the new name.
+///
+/// On Windows this is a no-op (beyond an existence check): directory handles
+/// cannot be opened for flushing without `FILE_FLAG_BACKUP_SEMANTICS`, and
+/// NTFS journals rename metadata without an explicit directory flush — the
+/// same approach LevelDB/RocksDB take on Windows.
 pub fn fsync_directory(dir: &Path) -> std::io::Result<()> {
-    let f = File::open(dir)?;
-    f.sync_all()
+    #[cfg(unix)]
+    {
+        let f = std::fs::File::open(dir)?;
+        f.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        // Preserve error semantics for bad paths so callers still surface them.
+        if dir.is_dir() {
+            Ok(())
+        } else {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("not a directory: {}", dir.display()),
+            ))
+        }
+    }
 }
 
 /// Fsync a file to ensure data durability before rename.
 ///
-/// Opens the file read-only and calls `sync_all()` to flush OS page cache
-/// and filesystem metadata to stable storage.
+/// Flushes OS page cache and filesystem metadata to stable storage.
+/// POSIX allows fsync on a read-only descriptor; Windows
+/// `FlushFileBuffers` requires a writable handle, so the file is opened
+/// with write access there (contents are never modified).
 pub fn fsync_file(path: &Path) -> std::io::Result<()> {
-    let f = File::open(path)?;
+    #[cfg(unix)]
+    let f = std::fs::File::open(path)?;
+    #[cfg(not(unix))]
+    let f = std::fs::OpenOptions::new().write(true).open(path)?;
     f.sync_all()
 }
 
