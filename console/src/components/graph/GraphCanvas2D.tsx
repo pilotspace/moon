@@ -26,7 +26,6 @@ export function GraphCanvas2D() {
   } | null>(null);
   const rafRef = useRef(0);
   const dirtyRef = useRef(true);
-  const mouseWorldRef = useRef<{ x: number; y: number } | null>(null);
 
   const nodes = useGraphStore((s) => s.nodes);
   const edges = useGraphStore((s) => s.edges);

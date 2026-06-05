@@ -143,8 +143,8 @@ export function GraphCosmos() {
 
     graphRef.current = graph;
 
-    // Catch async init errors (WebGL context creation)
-    graph.ready.catch(() => setInitError(true));
+    // @cosmos.gl/graph 2.6.4 has no async `ready` promise — WebGL context
+    // creation failures throw synchronously and are caught above.
 
     return () => {
       try { graph.stop(); } catch { /* ignore cleanup errors */ }
@@ -156,7 +156,8 @@ export function GraphCosmos() {
 
   // ── Update callbacks when they change ──
   useEffect(() => {
-    graphRef.current?.setConfigPartial({
+    // setConfig deep-merges only the provided keys (2.6.4 has no setConfigPartial)
+    graphRef.current?.setConfig({
       onPointClick,
       onPointMouseOver,
       onPointMouseOut,
@@ -234,10 +235,10 @@ export function GraphCosmos() {
     if (selectedNodeId) {
       const idx = nodeIdToIndex.get(selectedNodeId);
       if (idx != null) {
-        graph.setConfigPartial({ focusedPointIndex: idx });
+        graph.setConfig({ focusedPointIndex: idx });
       }
     } else {
-      graph.setConfigPartial({ focusedPointIndex: undefined });
+      graph.setConfig({ focusedPointIndex: undefined });
     }
 
     graph.render();
