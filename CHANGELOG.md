@@ -4,6 +4,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed — Rust SDK released as moondb 0.2.0 on crates.io
+
+- **`moondb` crate `0.1.1` → `0.2.0`** — publishes the v0.2-era client API
+  that has lived in-tree since the `hybrid_search` sparse upgrade
+  (`f4fcd5a`). Breaking: `text().hybrid_search()` now takes
+  `sparse_field: Option<&str>` and `weights: [f64; 3]` (was two-way
+  `[f64; 2]`) and speaks the PARAMS-based wire format with `@`-prefixed
+  field refs. Added: `Client::connect_with_timeout` for bulk-write
+  workloads. Released as 0.2.0 — not 0.1.2 — because cargo treats 0.1.x
+  versions as compatible, and the signature change would break published
+  0.1.x consumers (lunaris-retrieve / lunaris-storage-moon 0.2.1 pin
+  `"0.1.1"` with the two-way call). Aligns the SDK version with the Moon
+  v0.2.0 server release.
+
 ## [0.2.0] — 2026-06-06
 
 The v0.2 enterprise beachhead. Built additively on per-shard WAL v3 + the
