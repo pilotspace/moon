@@ -21,7 +21,7 @@
 
 Moon is a clean-room Rust rewrite of a Redis-compatible in-memory data
 store with first-class AI primitives. It speaks the Redis wire protocol
-(RESP2/RESP3) and implements **230+ commands** — every standard Redis data
+(RESP2/RESP3) and implements **250+ commands** — every standard Redis data
 type plus native `FT.*` vector + BM25 search, `GRAPH.*` Cypher, `TXN.*`
 cross-store ACID, workspaces, durable message queues, bi-temporal MVCC,
 and an embedded web console. Any Redis client connects out of the box.

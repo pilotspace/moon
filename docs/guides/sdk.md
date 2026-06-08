@@ -130,19 +130,21 @@ for h in hits:
     print(h.id, h.score, h.fields.get("title"))
 
 # Aggregation pipeline
+# Note: GroupBy/SortBy fields are bare names (no leading "@" — the SDK adds it).
+# Reducer aliases use `alias=`, and the pipeline is passed positionally.
 pipeline = [
-    GroupBy("@status", reducers=[Count(as_name="total"), Avg("@priority", as_name="avg_p")]),
-    SortBy("@total", order="DESC"),
+    GroupBy(["status"], reducers=[Count(alias="total"), Avg("priority", alias="avg_p")]),
+    SortBy("total", direction="DESC"),
     Limit(0, 10),
 ]
-result = client.text.aggregate("issues", "*", steps=pipeline)
+result = client.text.aggregate("issues", "*", pipeline)
 
 # Hybrid fusion (BM25 + dense + sparse)
 hits = client.text.hybrid_search(
     "docs", "machine learning",
     vector=[0.1, 0.2, ...],
-    sparse_vector=sparse_vec,
-    k=10,
+    sparse=sparse_vec,
+    limit=10,
 )
 ```
 

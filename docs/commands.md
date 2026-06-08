@@ -1,11 +1,11 @@
 ---
 title: "Command reference"
-description: "All 230+ supported commands grouped by category."
+description: "All 250+ supported commands grouped by category."
 ---
 
 # Command reference
 
-Moon implements 230+ commands. Redis-compatible commands follow [Redis command semantics](https://redis.io/docs/latest/commands/). Moon-native commands (TXN, WS, MQ, TEMPORAL, FT.AGGREGATE) extend the protocol for cross-store transactions, workspaces, message queues, temporal queries, and full-text search.
+Moon implements 250+ commands. Redis-compatible commands follow [Redis command semantics](https://redis.io/docs/latest/commands/). Moon-native commands (TXN, WS, MQ, TEMPORAL, FT.AGGREGATE) extend the protocol for cross-store transactions, workspaces, message queues, temporal queries, and full-text search.
 
 ## Connection (7)
 
@@ -50,6 +50,20 @@ Per-field return code on the TTL commands: `-2` = no such field, `-1` = no TTL, 
 ## Sorted sets (21)
 
 `ZADD`, `ZREM`, `ZSCORE`, `ZCARD`, `ZINCRBY`, `ZRANK`, `ZREVRANK`, `ZPOPMIN`, `ZPOPMAX`, `ZSCAN`, `ZRANGE`, `ZREVRANGE`, `ZRANGEBYSCORE`, `ZREVRANGEBYSCORE`, `ZRANGEBYLEX`, `ZCOUNT`, `ZLEXCOUNT`, `ZUNIONSTORE`, `ZINTERSTORE`, `BZPOPMIN`, `BZPOPMAX`
+
+## Geospatial (8)
+
+`GEOADD`, `GEOPOS`, `GEODIST`, `GEOHASH`, `GEOSEARCH`, `GEOSEARCHSTORE`, `GEORADIUS`, `GEORADIUSBYMEMBER`
+
+!!! tip
+    `GEOSEARCH` / `GEOSEARCHSTORE` (Redis 6.2+) supersede the older `GEORADIUS` / `GEORADIUSBYMEMBER` and support both radius (`BYRADIUS`) and bounding-box (`BYBOX`) queries. Geo sets are stored as sorted sets, so `Z*` commands also work on them.
+
+## HyperLogLog (3)
+
+`PFADD`, `PFCOUNT`, `PFMERGE`
+
+!!! note
+    Probabilistic cardinality estimation with a standard error of ~0.81%. `PFCOUNT` accepts multiple keys (union), and `PFMERGE` combines source HLLs into a destination.
 
 ## Streams (14)
 
