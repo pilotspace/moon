@@ -91,7 +91,7 @@ orb run -m moon-dev bash -c 'sudo apt-get update -qq && sudo apt-get install -y 
 
 ## Key Design Decisions
 
-- **HeapString**: SSO at 23 bytes inline, heap beyond. Eliminates significant per-key overhead vs naive Arc<String>.
+- **Compact SSO types**: `CompactKey` stores keys up to 23 bytes inline; `CompactValue` stores values up to 12 bytes inline (heap beyond, via `HeapString(Vec<u8>)`). Eliminates significant per-key overhead vs naive `Arc<String>`.
 - **Per-shard WAL**: No global lock on writes. Low-latency append via in-memory buffer flushed on 1ms tick.
 - **Lazy Lua/backlog init**: Reduces baseline memory. Lua sandbox initialized on first EVAL.
 - **Lock-free channels (flume)**: Critical for pipeline throughput; avoids mutex contention on the hot path.

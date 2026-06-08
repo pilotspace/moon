@@ -1,3 +1,4 @@
 # Documentation site (MkDocs Material) — build with: pip install -r requirements-docs.txt
 mkdocs-material>=9.5,<10
 mkdocs-include-markdown-plugin>=6.0,<8
+mkdocs-glightbox>=0.4,<1
