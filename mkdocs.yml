@@ -18,6 +18,7 @@ exclude_docs: |
 
 theme:
   name: material
+  custom_dir: overrides
   language: en
   logo: images/logo-light.png
   favicon: images/favicon.png
@@ -46,6 +47,7 @@ theme:
         icon: material/brightness-4
         name: Switch to system preference
   features:
+    - announce.dismiss
     - navigation.tabs
     - navigation.tabs.sticky
     - navigation.sections
@@ -93,10 +95,27 @@ markdown_extensions:
       emoji_index: !!python/name:material.extensions.emoji.twemoji
       emoji_generator: !!python/name:material.extensions.emoji.to_svg
 
+extra_css:
+  - stylesheets/extra.css
+
 extra:
   social:
     - icon: fontawesome/brands/github
       link: https://github.com/pilotspace/moon
+  analytics:
+    feedback:
+      title: Was this page helpful?
+      ratings:
+        - icon: material/emoticon-happy-outline
+          name: This page was helpful
+          data: 1
+          note: Thanks for your feedback!
+        - icon: material/emoticon-sad-outline
+          name: This page could be improved
+          data: 0
+          note: >-
+            Thanks for your feedback! Help us improve by
+            <a href="https://github.com/pilotspace/moon/issues/new" target="_blank" rel="noopener">opening an issue</a>.
 
 nav:
   - Home: index.md
