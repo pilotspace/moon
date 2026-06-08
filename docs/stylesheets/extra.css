@@ -1,0 +1,307 @@
+/* ============================================================================
+   Moon — "Midnight" theme for MkDocs Material
+   Indigo primary + violet accent, night-sky hero, GitBook-style polish.
+   ========================================================================== */
+
+:root {
+  --moon-indigo: #4f46e5;        /* indigo-600 */
+  --moon-indigo-600: #4f46e5;
+  --moon-indigo-700: #4338ca;
+  --moon-violet: #7c3aed;        /* violet-600 */
+  --moon-violet-400: #a78bfa;
+  --moon-night-1: #0b0a1f;
+  --moon-night-2: #1e1b4b;       /* indigo-950 */
+  --moon-night-3: #312e81;       /* indigo-900 */
+  --moon-radius: 14px;
+}
+
+/* Palette overrides (config keeps primary/accent = indigo; we restyle them) */
+[data-md-color-primary="indigo"] {
+  --md-primary-fg-color: var(--moon-indigo);
+  --md-primary-fg-color--light: #6366f1;
+  --md-primary-fg-color--dark: var(--moon-indigo-700);
+}
+[data-md-color-accent="indigo"] {
+  --md-accent-fg-color: var(--moon-violet);
+}
+[data-md-color-scheme="slate"] {
+  --md-hue: 250;
+  --md-default-bg-color: #0e0c22;
+  --md-primary-fg-color: #6366f1;
+  --md-accent-fg-color: var(--moon-violet-400);
+}
+
+/* Typography ------------------------------------------------------------- */
+.md-typeset {
+  font-feature-settings: "kern", "liga", "calt";
+}
+.md-typeset h1,
+.md-typeset h2 {
+  font-weight: 700;
+  letter-spacing: -0.02em;
+}
+.md-typeset h2 {
+  margin-top: 2.4em;
+}
+
+/* Header ----------------------------------------------------------------- */
+.md-header {
+  background: rgba(15, 13, 43, 0.92);
+  backdrop-filter: saturate(140%) blur(8px);
+  box-shadow: 0 1px 0 rgba(255, 255, 255, 0.06);
+}
+.md-header__title {
+  font-weight: 700;
+}
+
+/* Announcement bar ------------------------------------------------------- */
+.md-banner {
+  background: linear-gradient(90deg, var(--moon-night-2), var(--moon-indigo-700) 55%, var(--moon-violet));
+  color: #ffffff;
+}
+.md-banner__inner {
+  text-align: center;
+  font-size: 0.74rem;
+}
+.md-announce__link {
+  color: #ffffff;
+}
+.md-announce__cta {
+  margin-left: 0.4rem;
+  font-weight: 700;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.md-banner a:hover {
+  color: #ede9fe;
+}
+
+/* Hero ------------------------------------------------------------------- */
+.moon-hero {
+  position: relative;
+  margin: -1.2rem -1.2rem 2.6rem;
+  padding: 4rem 1.2rem 3.4rem;
+  border-radius: 0 0 28px 28px;
+  background:
+    radial-gradient(900px 320px at 80% -10%, rgba(167, 139, 250, 0.35), transparent 60%),
+    radial-gradient(700px 280px at 8% 10%, rgba(99, 102, 241, 0.28), transparent 55%),
+    linear-gradient(160deg, var(--moon-night-1), var(--moon-night-2) 45%, var(--moon-night-3));
+  overflow: hidden;
+  isolation: isolate;
+}
+/* faint starfield */
+.moon-hero::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  background-image:
+    radial-gradient(1.4px 1.4px at 20% 30%, rgba(255,255,255,0.7), transparent),
+    radial-gradient(1.2px 1.2px at 70% 20%, rgba(255,255,255,0.5), transparent),
+    radial-gradient(1.6px 1.6px at 40% 70%, rgba(255,255,255,0.6), transparent),
+    radial-gradient(1.1px 1.1px at 85% 60%, rgba(255,255,255,0.45), transparent),
+    radial-gradient(1.3px 1.3px at 55% 45%, rgba(255,255,255,0.4), transparent);
+  opacity: 0.7;
+}
+.moon-hero__inner {
+  max-width: 46rem;
+  margin: 0 auto;
+  text-align: center;
+}
+.md-typeset .moon-hero h1 {
+  color: #ffffff;
+  font-size: 2.9rem;
+  line-height: 1.05;
+  margin: 0 0 0.4rem;
+}
+.moon-hero__tagline {
+  color: #c7d2fe;
+  font-size: 1.05rem;
+  margin: 0 auto 1.8rem;
+  max-width: 38rem;
+}
+.moon-hero .md-button {
+  margin: 0.3rem 0.35rem 0;
+  border-radius: 999px;
+  padding: 0.5rem 1.3rem;
+  font-weight: 600;
+}
+.moon-hero .md-button--primary {
+  background: linear-gradient(135deg, var(--moon-indigo), var(--moon-violet));
+  border-color: transparent;
+  color: #fff;
+  box-shadow: 0 8px 24px rgba(79, 70, 229, 0.45);
+}
+.moon-hero .md-button--primary:hover {
+  filter: brightness(1.08);
+}
+.moon-hero .md-button:not(.md-button--primary) {
+  color: #ede9fe;
+  border-color: rgba(199, 210, 254, 0.55);
+}
+.moon-hero .md-button:not(.md-button--primary):hover {
+  background: rgba(255, 255, 255, 0.08);
+  border-color: #fff;
+  color: #fff;
+}
+.moon-stats {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 1.6rem 2.4rem;
+  margin-top: 2.2rem;
+}
+.moon-stats div {
+  color: #c7d2fe;
+  font-size: 0.74rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+.moon-stats strong {
+  display: block;
+  color: #fff;
+  font-size: 1.5rem;
+  letter-spacing: -0.02em;
+}
+
+/* Buttons (global) ------------------------------------------------------- */
+.md-typeset .md-button {
+  border-radius: 10px;
+  font-weight: 600;
+  transition: transform 0.08s ease, box-shadow 0.15s ease, filter 0.15s ease;
+}
+.md-typeset .md-button--primary:hover {
+  transform: translateY(-1px);
+}
+
+/* Cards grid ------------------------------------------------------------- */
+.md-typeset .grid.cards > ul > li,
+.md-typeset .grid.cards > :is(ul, ol) > li,
+.md-typeset .grid > .card {
+  border: 1px solid var(--md-default-fg-color--lightest);
+  border-radius: var(--moon-radius);
+  padding: 1.1rem 1.15rem;
+  transition: transform 0.12s ease, box-shadow 0.18s ease, border-color 0.18s ease;
+  background: var(--md-default-bg-color);
+}
+.md-typeset .grid.cards > ul > li:hover,
+.md-typeset .grid > .card:hover {
+  transform: translateY(-3px);
+  border-color: color-mix(in srgb, var(--moon-indigo) 45%, transparent);
+  box-shadow: 0 12px 30px -12px rgba(79, 70, 229, 0.45);
+}
+.md-typeset .grid.cards .twemoji.lg svg,
+.md-typeset .grid.cards :is(.lg) svg {
+  height: 1.9rem;
+  width: 1.9rem;
+}
+.md-typeset .grid.cards > ul > li > hr {
+  margin: 0.7rem 0;
+  border-color: var(--md-default-fg-color--lightest);
+}
+.md-typeset .grid.cards .twemoji svg {
+  fill: var(--moon-indigo);
+}
+
+/* Tables ----------------------------------------------------------------- */
+.md-typeset table:not([class]) {
+  border-radius: var(--moon-radius);
+  overflow: hidden;
+  box-shadow: 0 1px 0 var(--md-default-fg-color--lightest);
+}
+.md-typeset table:not([class]) th {
+  background: color-mix(in srgb, var(--moon-indigo) 10%, var(--md-default-bg-color));
+  font-weight: 700;
+}
+
+/* Code ------------------------------------------------------------------- */
+.md-typeset pre > code {
+  border-radius: var(--moon-radius);
+}
+
+/* Nav active state ------------------------------------------------------- */
+.md-nav__link--active,
+.md-nav__item .md-nav__link--active {
+  font-weight: 700;
+}
+
+/* Footer columns --------------------------------------------------------- */
+.md-footer-cols {
+  background: var(--moon-night-2);
+  color: #c7d2fe;
+}
+.md-footer-cols__inner {
+  display: grid;
+  grid-template-columns: 1.4fr repeat(3, 1fr);
+  gap: 2rem;
+  padding: 2.6rem 0.8rem 2.2rem;
+}
+.md-footer-col__brand {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  color: #fff;
+  font-weight: 700;
+  font-size: 1.05rem;
+}
+.md-footer-col__brand img {
+  height: 1.4rem;
+  filter: brightness(0) invert(1);
+}
+.md-footer-col--brand p {
+  margin-top: 0.7rem;
+  font-size: 0.74rem;
+  line-height: 1.5;
+  max-width: 18rem;
+}
+.md-footer-col h2 {
+  color: #fff;
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  margin: 0 0 0.8rem;
+}
+.md-footer-col ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.md-footer-col li {
+  margin: 0.4rem 0;
+}
+.md-footer-col a {
+  color: #c7d2fe;
+  font-size: 0.78rem;
+  transition: color 0.12s ease;
+}
+.md-footer-col a:hover {
+  color: #fff;
+}
+.md-footer-meta {
+  background: var(--moon-night-1);
+}
+
+@media screen and (max-width: 60em) {
+  .md-footer-cols__inner {
+    grid-template-columns: 1fr 1fr;
+    gap: 1.6rem;
+  }
+  .md-typeset .moon-hero h1 {
+    font-size: 2.1rem;
+  }
+}
+@media screen and (max-width: 30em) {
+  .md-footer-cols__inner {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* Feedback widget -------------------------------------------------------- */
+.md-feedback {
+  margin-top: 2.4rem;
+}
+.md-feedback__inner {
+  border: 1px dashed var(--md-default-fg-color--lighter);
+  border-radius: var(--moon-radius);
+  padding: 0.8rem 1rem;
+}
