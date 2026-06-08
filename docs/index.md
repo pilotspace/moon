@@ -1,18 +1,18 @@
 ---
 title: "Moon"
 description: "A high-performance, Redis-compatible in-memory data store written in Rust."
-keywords: ["redis", "rust", "in-memory", "database", "key-value"]
 ---
+
+# Moon
 
 Moon is a Redis-compatible in-memory data store built from scratch in Rust. It implements 230+ commands with a thread-per-core shared-nothing architecture, achieving up to **1.7–2.2x Redis throughput** while using **27-35% less memory** for real-world value sizes. Beyond Redis compatibility, Moon provides cross-store ACID transactions, HNSW vector + BM25 full-text search, a Cypher property graph, workspace partitioning, durable message queues, and bi-temporal MVCC.
 
-<Note>
-**Production-grade architecture, pre-1.0 maturity.** Single-node Moon (v0.2.0) is recommended for production caching, AI workloads, and Redis-compatible OLTP. Multi-node clustering and multi-shard master PSYNC are **alpha** — see the [production contract](/configuration) for the honest GA matrix. Wire protocol and on-disk format are LTS as of v0.2; CLI flags may still evolve until v1.0.
-</Note>
+!!! note
+    **Production-grade architecture, pre-1.0 maturity.** Single-node Moon (v0.2.0) is recommended for production caching, AI workloads, and Redis-compatible OLTP. Multi-node clustering and multi-shard master PSYNC are **alpha** — see the [production contract](configuration.md) for the honest GA matrix. Wire protocol and on-disk format are LTS as of v0.2; CLI flags may still evolve until v1.0.
 
 ## Key metrics
 
-Headline numbers vs Redis 8.6.1 on GCloud c3-standard-8 (x86_64), peak throughput. Full report: see [benchmarks](/benchmarks).
+Headline numbers vs Redis 8.6.1 on GCloud c3-standard-8 (x86_64), peak throughput. Full report: see [benchmarks](benchmarks.md).
 
 | Metric | Result | Conditions |
 |--------|--------|------------|
@@ -25,32 +25,26 @@ Headline numbers vs Redis 8.6.1 on GCloud c3-standard-8 (x86_64), peak throughpu
 
 ## Highlights
 
-<Columns cols={2}>
-  <Card title="230+ commands" icon="terminal" href="/commands">
+<div class="grid cards" markdown>
+
+-   [__230+ commands__](commands.md)
     Strings, hashes, lists, sets, sorted sets, streams, pub/sub, transactions, Lua scripting, vector search, graph, and more.
-  </Card>
-  <Card title="Thread-per-core architecture" icon="microchip" href="/architecture">
+-   [__Thread-per-core architecture__](architecture.md)
     Shared-nothing design with per-shard event loops, DashTable SIMD probing, and lock-free channels.
-  </Card>
-  <Card title="Dual runtime" icon="bolt" href="/architecture#dual-runtime">
+-   [__Dual runtime__](architecture.md#dual-runtime)
     Monoio (io_uring on Linux, kqueue on macOS) for peak performance. Tokio for portability.
-  </Card>
-  <Card title="Per-shard persistence" icon="hard-drive" href="/guides/persistence">
+-   [__Per-shard persistence__](guides/persistence.md)
     Forkless RDB snapshots and per-shard WAL with no global lock. AOF advantage grows with pipeline depth.
-  </Card>
-  <Card title="Cross-store transactions" icon="lock" href="/guides/transactions">
+-   [__Cross-store transactions__](guides/transactions.md)
     TXN.BEGIN/COMMIT/ABORT for atomic writes across KV, vector, and graph stores with undo-log rollback.
-  </Card>
-  <Card title="Full-text + vector search" icon="magnifying-glass" href="/commands#full-text-search-2">
+-   [__Full-text + vector search__](commands.md#full-text-search-2)
     BM25 inverted index, HNSW + TurboQuant vectors, three-way hybrid fusion, FT.AGGREGATE with GROUPBY/REDUCE.
-  </Card>
-  <Card title="Workspaces and message queues" icon="building" href="/guides/workspaces">
+-   [__Workspaces and message queues__](guides/workspaces.md)
     Multi-tenant namespace isolation (WS), durable at-least-once queues with dead-letter and triggers (MQ).
-  </Card>
-  <Card title="Drop-in compatible" icon="plug" href="/quickstart">
+-   [__Drop-in compatible__](quickstart.md)
     Works with any Redis client. Connect with redis-cli, Jedis, ioredis, or redis-py out of the box.
-  </Card>
-</Columns>
+
+</div>
 
 ## Quick start
 
@@ -69,6 +63,5 @@ OK
 "world"
 ```
 
-<Card title="Full quick start guide" icon="rocket" href="/quickstart">
-  Prerequisites, build options, Docker, and connecting with clients.
-</Card>
+-   [__Full quick start guide__](quickstart.md)
+    Prerequisites, build options, Docker, and connecting with clients.

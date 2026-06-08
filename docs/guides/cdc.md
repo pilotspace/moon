@@ -1,8 +1,9 @@
 ---
 title: "Change Data Capture (CDC)"
 description: "Stream Moon WAL records as Debezium-compatible JSON envelopes."
-keywords: ["cdc", "debezium", "wal", "change-data-capture", "streaming"]
 ---
+
+# Change Data Capture (CDC)
 
 Moon v0.2 exposes its per-shard WAL as a structured change stream. Records are
 translated into typed events and emitted as **Debezium-compatible JSON

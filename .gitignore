@@ -93,3 +93,6 @@ sdk/python/moondb.egg-info/
 __pycache__/
 *.pyc
 tmp/
+
+# MkDocs documentation site build output
+/site/

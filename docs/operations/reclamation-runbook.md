@@ -12,7 +12,7 @@ provides a decision tree, and lists concrete mitigation commands.
 - [Disk Full During WAL Rotation](../runbooks/disk-full-during-wal-rotation.md) — WAL-rotation-specific disk ENOSPC
 - [OOM During Snapshot](../runbooks/oom-during-snapshot.md) — BGSAVE memory spike
 - [PRODUCTION-CONTRACT.md](../PRODUCTION-CONTRACT.md) — overall durability and uptime guarantees
-- [TODO.md](../../TODO.md) — Wave 1/2 roadmap and acceptance criteria
+- TODO.md — Wave 1/2 roadmap and acceptance criteria
 
 **Wave-1 commands available (v0.1.13 P8):**
 
@@ -444,7 +444,7 @@ Escalate to the on-call engineering lead when:
 
 5. **`FT.SEARCH` latency did not improve** after `FT.COMPACT` / `VACUUM VECTOR`.
    The read amplification cliff may have a different root cause (HNSW graph corruption,
-   TQ4 quantization degradation on low-dimensional embeddings — see [CLAUDE.md](../../CLAUDE.md) gotchas).
+   TQ4 quantization degradation on low-dimensional embeddings — see [CLAUDE.md](https://github.com/pilotspace/moon/blob/main/CLAUDE.md) gotchas).
 
 6. **Manifest tombstones not dropping** after `VACUUM` with `--manifest-tombstone-retain-epochs 1`.
    Indicates a manifest GC bug.
@@ -461,5 +461,5 @@ Escalate to the on-call engineering lead when:
 | AOF corruption recovery | [docs/runbooks/corrupted-aof-recovery.md](../runbooks/corrupted-aof-recovery.md) |
 | Memory accounting guide | [docs/OPERATOR-GUIDE.md](../OPERATOR-GUIDE.md) |
 | Production contract | [docs/PRODUCTION-CONTRACT.md](../PRODUCTION-CONTRACT.md) |
-| Wave 1/2 roadmap | [TODO.md](../../TODO.md) |
-| Coding rules and gotchas | [CLAUDE.md](../../CLAUDE.md) |
+| Wave 1/2 roadmap | TODO.md |
+| Coding rules and gotchas | [CLAUDE.md](https://github.com/pilotspace/moon/blob/main/CLAUDE.md) |

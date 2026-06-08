@@ -1,14 +1,14 @@
 ---
 title: "Cross-store transactions"
 description: "Atomic writes across KV, vector, and graph stores with TXN.BEGIN/COMMIT/ABORT."
-keywords: ["transactions", "acid", "txn", "cross-store", "atomicity", "rollback"]
 ---
+
+# Cross-store transactions
 
 Moon provides cross-store ACID transactions via `TXN.BEGIN`, `TXN.COMMIT`, and `TXN.ABORT`. These enable atomic writes that span KV operations, vector auto-indexing, graph mutations, and message queue enqueues — all committed or rolled back as a unit.
 
-<Warning>
-Cross-store transactions (`TXN.*`) cannot be mixed with Redis `MULTI`/`EXEC` blocks. Starting a `TXN` while in a `MULTI` block (or vice versa) returns an error.
-</Warning>
+!!! warning
+    Cross-store transactions (`TXN.*`) cannot be mixed with Redis `MULTI`/`EXEC` blocks. Starting a `TXN` while in a `MULTI` block (or vice versa) returns an error.
 
 ## Quick start
 

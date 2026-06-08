@@ -1,8 +1,9 @@
 ---
 title: "Temporal queries"
 description: "Bi-temporal MVCC for point-in-time KV and graph queries."
-keywords: ["temporal", "mvcc", "bi-temporal", "snapshot", "point-in-time", "valid-time"]
 ---
+
+# Temporal queries
 
 Moon provides bi-temporal MVCC for point-in-time queries across KV and graph stores. Record wall-clock snapshots, invalidate graph entities at specific times, and query historical state via `AS_OF` and `VALID_AT` clauses.
 

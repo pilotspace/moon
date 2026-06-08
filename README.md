@@ -328,13 +328,15 @@ Full release history: [CHANGELOG.md](CHANGELOG.md).
 
 ## Documentation
 
-Start at [docs/index.mdx](docs/index.mdx), then follow the trail:
+📖 **Full documentation site: [pilotspace.github.io/moon](https://pilotspace.github.io/moon/)** — searchable, with every guide, runbook, and reference.
 
-- **Get running** — [Quick start](docs/quickstart.mdx) · [Configuration](docs/configuration.mdx) · [Docker](docs/guides/docker.mdx) · [TLS](docs/guides/tls.mdx)
-- **Understand it** — [Architecture](docs/architecture.mdx) · [Commands](docs/commands.mdx) · [Benchmarks](BENCHMARK.md) · [Storage format](docs/STORAGE-FORMAT-V1.md)
-- **Build with it** — [SDKs](docs/guides/sdk.mdx) · [Full-text + vector search](docs/guides/full-text-search.mdx) · [Transactions](docs/guides/transactions.mdx) · [Workspaces](docs/guides/workspaces.mdx) · [Message queues](docs/guides/message-queues.mdx) · [Temporal](docs/guides/temporal.mdx)
-- **Operate it** — [Operator guide](docs/OPERATOR-GUIDE.md) · [Production contract](docs/PRODUCTION-CONTRACT.md) · [Persistence](docs/guides/persistence.mdx) · [PITR](docs/guides/pitr.md) · [CDC](docs/guides/cdc.md) · [Clustering](docs/guides/clustering.mdx) · [Monitoring](docs/guides/monitoring.md) · [Runbooks](docs/runbooks/)
-- **Trust it** — [Threat model](docs/THREAT-MODEL.md) · [Unsafe policy](UNSAFE_POLICY.md) · [References & papers](docs/references.mdx)
+Start at [docs/index.md](docs/index.md), then follow the trail:
+
+- **Get running** — [Quick start](docs/quickstart.md) · [Configuration](docs/configuration.md) · [Docker](docs/guides/docker.md) · [TLS](docs/guides/tls.md)
+- **Understand it** — [Architecture](docs/architecture.md) · [Commands](docs/commands.md) · [Benchmarks](BENCHMARK.md) · [Storage format](docs/STORAGE-FORMAT-V1.md)
+- **Build with it** — [SDKs](docs/guides/sdk.md) · [Full-text + vector search](docs/guides/full-text-search.md) · [Transactions](docs/guides/transactions.md) · [Workspaces](docs/guides/workspaces.md) · [Message queues](docs/guides/message-queues.md) · [Temporal](docs/guides/temporal.md)
+- **Operate it** — [Operator guide](docs/OPERATOR-GUIDE.md) · [Production contract](docs/PRODUCTION-CONTRACT.md) · [Persistence](docs/guides/persistence.md) · [PITR](docs/guides/pitr.md) · [CDC](docs/guides/cdc.md) · [Clustering](docs/guides/clustering.md) · [Monitoring](docs/guides/monitoring.md) · [Runbooks](docs/runbooks/)
+- **Trust it** — [Threat model](docs/THREAT-MODEL.md) · [Unsafe policy](UNSAFE_POLICY.md) · [References & papers](docs/references.md)
 
 ## Development
 

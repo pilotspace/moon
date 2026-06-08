@@ -2,12 +2,12 @@
 
 Moon is a high-performance Redis-compatible server in Rust. This guide covers the rules, conventions, and contracts that every contributor (human or AI) must follow.
 
-For build/run/test commands and architecture details, see [CLAUDE.md](CLAUDE.md) and [README.md](README.md).
+For build/run/test commands and architecture details, see [CLAUDE.md](https://github.com/pilotspace/moon/blob/main/CLAUDE.md) and [README.md](https://github.com/pilotspace/moon/blob/main/README.md).
 
 ## Golden Rules
 
 1. **Never crash on client input.** Protocol parsers, command handlers, and any code reachable from a client connection MUST return errors, not panic. No `.unwrap()` on data derived from the wire.
-2. **No allocations on the hot path.** See [CLAUDE.md § Allocations on Hot Paths](CLAUDE.md#allocations-on-hot-paths). Use `itoa`, `SmallVec`, `Vec::with_capacity`, `Bytes::slice`, or `write!` to pre-allocated buffers.
+2. **No allocations on the hot path.** See [CLAUDE.md § Allocations on Hot Paths](https://github.com/pilotspace/moon/blob/main/CLAUDE.md#allocations-on-hot-paths). Use `itoa`, `SmallVec`, `Vec::with_capacity`, `Bytes::slice`, or `write!` to pre-allocated buffers.
 3. **Every unsafe block has a `// SAFETY:` comment.** CI enforces this via `scripts/audit-unsafe.sh`. No exceptions.
 4. **Both runtimes must compile.** `cargo clippy -- -D warnings` AND `cargo clippy --no-default-features --features runtime-tokio,jemalloc -- -D warnings` must pass.
 5. **No file exceeds 1500 lines.** Split into submodules proactively.

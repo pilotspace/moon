@@ -1,13 +1,12 @@
 ---
 title: "Benchmarks"
 description: "Performance results, methodology, and reproduction steps."
-keywords: ["benchmarks", "performance", "throughput", "latency", "memory"]
-mode: "wide"
 ---
 
-<Note>
-Production benchmark numbers are measured on **Linux (GCloud c3-standard-8 x86_64 / t2a-standard-8 ARM64)** — see the canonical [**BENCHMARK.md**](https://github.com/pilotspace/moon/blob/main/BENCHMARK.md) for the full report (raw throughput, persistence, vector, graph, latency, variance notes). The detailed per-table figures **below** are an Apple M4 Pro (12 cores, 24 GB) development reference; absolute numbers differ from the Linux production figures, but the Moon/Redis ratios are representative. All runs co-locate client and server using `redis-benchmark`, fresh server instance per memory data point.
-</Note>
+# Benchmarks
+
+!!! note
+    Production benchmark numbers are measured on **Linux (GCloud c3-standard-8 x86_64 / t2a-standard-8 ARM64)** — see the canonical [**BENCHMARK.md**](https://github.com/pilotspace/moon/blob/main/BENCHMARK.md) for the full report (raw throughput, persistence, vector, graph, latency, variance notes). The detailed per-table figures **below** are an Apple M4 Pro (12 cores, 24 GB) development reference; absolute numbers differ from the Linux production figures, but the Moon/Redis ratios are representative. All runs co-locate client and server using `redis-benchmark`, fresh server instance per memory data point.
 
 ## Executive summary
 
@@ -42,9 +41,8 @@ At 1M keys:
 | 256 B | 231.5 MB | 234.4 MB | 372 B | 376 B | Tied |
 | 1,024 B | 954.2 MB | **703.0 MB** | 1,571 B | **1,153 B** | **Moon** |
 
-<Tip>
-Moon's advantage comes from `HeapString(Vec<u8>)` (48 bytes overhead) vs Redis's `robj` + SDS chain (~64-80 bytes overhead). TTL is packed as a 4-byte delta inside `CompactEntry` at zero extra cost, while Redis allocates a separate 24-byte `dictEntry` per expiring key.
-</Tip>
+!!! tip
+    Moon's advantage comes from `HeapString(Vec<u8>)` (48 bytes overhead) vs Redis's `robj` + SDS chain (~64-80 bytes overhead). TTL is packed as a 4-byte delta inside `CompactEntry` at zero extra cost, while Redis allocates a separate 24-byte `dictEntry` per expiring key.
 
 ### Baseline RSS
 
@@ -93,9 +91,8 @@ At pipeline=64, Moon delivers **1.71x the throughput of Redis while using 23x le
 | p=16 | 1,887K | 1.90x | **2.21x** |
 | p=64 | **2,778K** | 1.80x | **2.75x** |
 
-<Note>
-Moon's per-shard WAL avoids the global serialization point that Redis's single AOF file introduces. The advantage grows with pipeline depth because per-shard WAL scales linearly with shards.
-</Note>
+!!! note
+    Moon's per-shard WAL avoids the global serialization point that Redis's single AOF file introduces. The advantage grows with pipeline depth because per-shard WAL scales linearly with shards.
 
 ## Latency
 
@@ -137,6 +134,5 @@ RUSTFLAGS="-C target-cpu=native" cargo build --release
 ./scripts/test-consistency.sh --shards 4
 ```
 
-<Warning>
-Co-located benchmarks (client and server on the same machine) are conservative. Separate-machine benchmarks with dedicated NICs show higher throughput. Always use `redis-benchmark -r <num_keys>` to generate unique keys. Use `redis-benchmark` 8.x which correctly handles `\r` in progress output.
-</Warning>
+!!! warning
+    Co-located benchmarks (client and server on the same machine) are conservative. Separate-machine benchmarks with dedicated NICs show higher throughput. Always use `redis-benchmark -r <num_keys>` to generate unique keys. Use `redis-benchmark` 8.x which correctly handles `\r` in progress output.

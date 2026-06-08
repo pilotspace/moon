@@ -1,8 +1,9 @@
 ---
 title: "TLS"
 description: "Enable TLS 1.3 encryption and mutual TLS client authentication."
-keywords: ["tls", "ssl", "encryption", "security", "mtls", "certificates"]
 ---
+
+# TLS
 
 Moon supports TLS 1.3 via [rustls](https://github.com/rustls/rustls) and [aws-lc-rs](https://github.com/aws/aws-lc-rs). You can run plaintext and TLS listeners simultaneously on different ports.
 
@@ -67,6 +68,5 @@ redis-cli -p 6379 --tls \
 | `--tls-ca-cert-file` | *(none)* | CA cert for mTLS client auth |
 | `--tls-ciphersuites` | *(default)* | TLS 1.3 cipher suites |
 
-<Note>
-Moon uses pure-Rust TLS (rustls) with no OpenSSL dependency. The cryptographic backend is aws-lc-rs, which is FIPS-capable and provides high-performance AES-GCM and ChaCha20.
-</Note>
+!!! note
+    Moon uses pure-Rust TLS (rustls) with no OpenSSL dependency. The cryptographic backend is aws-lc-rs, which is FIPS-capable and provides high-performance AES-GCM and ChaCha20.

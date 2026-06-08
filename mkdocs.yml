@@ -1,0 +1,163 @@
+site_name: Moon
+site_description: A high-performance, Redis-compatible in-memory data store written in Rust.
+site_url: https://pilotspace.github.io/moon/
+site_author: pilotspace
+
+repo_name: pilotspace/moon
+repo_url: https://github.com/pilotspace/moon
+edit_uri: edit/main/docs/
+
+docs_dir: docs
+site_dir: site
+strict: true
+
+# Scratch / internal docs kept in-repo but off the published site.
+exclude_docs: |
+  perf/
+  W2-M2-FT-INVALIDATE-RANGE-SUMMARY.md
+
+theme:
+  name: material
+  language: en
+  logo: images/logo-light.png
+  favicon: images/favicon.png
+  icon:
+    repo: fontawesome/brands/github
+  font:
+    text: Inter
+    code: JetBrains Mono
+  palette:
+    - media: "(prefers-color-scheme)"
+      toggle:
+        icon: material/brightness-auto
+        name: Switch to light mode
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-4
+        name: Switch to system preference
+  features:
+    - navigation.tabs
+    - navigation.tabs.sticky
+    - navigation.sections
+    - navigation.top
+    - navigation.tracking
+    - navigation.indexes
+    - navigation.footer
+    - toc.follow
+    - search.suggest
+    - search.highlight
+    - search.share
+    - content.code.copy
+    - content.code.annotate
+    - content.tabs.link
+    - content.action.edit
+
+plugins:
+  - search
+  - include-markdown
+
+markdown_extensions:
+  - abbr
+  - admonition
+  - attr_list
+  - def_list
+  - footnotes
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+      toc_depth: 3
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.tasklist:
+      custom_checkbox: true
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/pilotspace/moon
+
+nav:
+  - Home: index.md
+  - Getting started:
+      - Quick start: quickstart.md
+      - Getting started guide: guides/getting-started.md
+      - Migrating from Redis: guides/migration.md
+  - Concepts:
+      - Architecture: architecture.md
+      - Command reference: commands.md
+      - Redis compatibility: redis-compat.md
+      - Moon vs Valkey: comparison-valkey.md
+  - Guides:
+      - SDKs: guides/sdk.md
+      - Memory engine: guides/memory-engine.md
+      - Full-text search: guides/full-text-search.md
+      - Vector search: vector-search-guide.md
+      - Transactions: guides/transactions.md
+      - Workspaces: guides/workspaces.md
+      - Message queues: guides/message-queues.md
+      - Temporal queries: guides/temporal.md
+      - Persistence: guides/persistence.md
+      - Point-in-time recovery: guides/pitr.md
+      - Change data capture: guides/cdc.md
+      - Clustering: guides/clustering.md
+      - TLS: guides/tls.md
+      - Docker: guides/docker.md
+      - Monitoring: guides/monitoring.md
+  - Operations:
+      - Operator guide: OPERATOR-GUIDE.md
+      - Production guide: production-guide.md
+      - Production contract: PRODUCTION-CONTRACT.md
+      - Memory reclamation:
+          - Overview: operations/README.md
+          - Reclamation runbook: operations/reclamation-runbook.md
+          - Reclamation SLO: operations/reclamation-slo.md
+  - Runbooks:
+      - Overview: runbooks/README.md
+      - Rolling restart: runbooks/rolling-restart.md
+      - Corrupted AOF recovery: runbooks/corrupted-aof-recovery.md
+      - Disk full during WAL rotation: runbooks/disk-full-during-wal-rotation.md
+      - Multi-shard AOF rewrite: runbooks/multi-shard-aof-rewrite.md
+      - OOM during snapshot: runbooks/oom-during-snapshot.md
+      - Replica fell behind: runbooks/replica-fell-behind.md
+      - Shard count change: runbooks/shard-count-change.md
+      - TLS cert rotation: runbooks/tls-cert-rotation.md
+  - Security:
+      - Security policy: security.md
+      - Threat model: THREAT-MODEL.md
+      - Lua sandbox: security/lua-sandbox.md
+      - Unsafe audit: security/unsafe-audit.md
+      - Unsafe code policy: unsafe-policy.md
+  - Reference:
+      - Configuration flags: configuration.md
+      - Configuration file (moon.conf): guides/configuration.md
+      - Benchmarks: benchmarks.md
+      - Full benchmark report: benchmark-report.md
+      - API contract: API-CONTRACT.md
+      - Storage format v1: STORAGE-FORMAT-V1.md
+      - Log schema: log-schema.md
+      - Versioning: versioning.md
+      - Credits & references: references.md
+      - Changelog: changelog.md
+  - Contributing: contributing.md

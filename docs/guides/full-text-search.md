@@ -1,8 +1,9 @@
 ---
 title: "Full-text search"
 description: "BM25 text search with hybrid fusion, FT.AGGREGATE, and typo tolerance."
-keywords: ["full-text", "bm25", "search", "aggregate", "text", "hybrid", "fuzzy"]
 ---
+
+# Full-text search
 
 Moon v0.1.7 added BM25 full-text search alongside existing vector search. Create indexes with `TEXT`, `TAG`, and `NUMERIC` fields, run full-text queries with typo tolerance, and combine BM25 + dense vector + sparse vector results via three-way Reciprocal Rank Fusion (RRF).
 

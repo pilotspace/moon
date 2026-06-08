@@ -1,8 +1,9 @@
 ---
 title: "Persistence"
 description: "Configure RDB snapshots and AOF write-ahead logging for durability."
-keywords: ["persistence", "aof", "rdb", "wal", "durability", "snapshots"]
 ---
+
+# Persistence
 
 Moon supports two persistence mechanisms: RDB point-in-time snapshots and AOF (append-only file) write-ahead logging. Both can be used together.
 

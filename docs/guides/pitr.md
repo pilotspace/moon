@@ -1,8 +1,9 @@
 ---
 title: "Point-in-Time Recovery (PITR)"
 description: "Restart Moon at a specific WAL LSN or wall-clock time."
-keywords: ["pitr", "recovery", "wal", "lsn", "snapshot", "persistence"]
 ---
+
+# Point-in-Time Recovery (PITR)
 
 Moon v0.2 adds **point-in-time recovery** on top of the existing per-shard WAL +
 RDB snapshot stack. Operators can rewind a shard to any LSN that still lives in

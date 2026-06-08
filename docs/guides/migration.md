@@ -1,8 +1,9 @@
 ---
 title: "Migrating from Redis"
 description: "Move an existing Redis deployment to Moon with minimal disruption."
-keywords: ["migration", "redis", "compatibility", "cutover", "drop-in"]
 ---
+
+# Migrating from Redis
 
 Moon is a drop-in replacement for Redis. This guide covers how to migrate
 existing Redis deployments to Moon with minimal disruption.
@@ -10,7 +11,7 @@ existing Redis deployments to Moon with minimal disruption.
 ## Compatibility
 
 Moon implements 200+ Redis commands across all core data types. See
-[redis-compat.md](/docs/redis-compat.md) for the full compatibility matrix
+[redis-compat.md](../redis-compat.md) for the full compatibility matrix
 and known differences.
 
 **Supported:** Strings, Lists, Hashes, Sets, Sorted Sets, Streams, Pub/Sub,

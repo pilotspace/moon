@@ -1,8 +1,9 @@
 ---
 title: "Building a memory engine"
 description: "Use Moon's unified KV + vector + graph + transactions to build an AI memory engine."
-keywords: ["memory engine", "agent memory", "graphrag", "rag", "knowledge graph", "temporal"]
 ---
+
+# Building a memory engine
 
 Moon's converged storage (KV, HNSW vectors, CSR graph, BM25 text) with cross-store ACID transactions makes it a natural substrate for AI memory engines. This guide shows how to wire the primitives together using the `moondb` Python SDK.
 
@@ -177,7 +178,6 @@ def hybrid_retrieve(client, query_text, query_embedding, graph_name="knowledge",
         k=k,
     )
 
-
 def rrf_fuse(*key_lists, k=10, constant=60):
     """Reciprocal Rank Fusion: score = sum(1 / (constant + rank))."""
     scores = {}
@@ -297,7 +297,6 @@ dlq_depth = client.execute_command("MQ", "DLQLEN", "memory:events")
 import json
 from moondb import MoonClient, encode_vector
 
-
 class MemoryEngine:
     def __init__(self, host="localhost", port=6379):
         self.client = MoonClient(host=host, port=port)
@@ -355,7 +354,6 @@ class MemoryEngine:
     def snapshot(self):
         """Record a temporal snapshot for point-in-time queries."""
         self.client.execute_command("TEMPORAL.SNAPSHOT_AT")
-
 
 # Usage
 engine = MemoryEngine()

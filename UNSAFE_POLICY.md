@@ -1,7 +1,7 @@
 # Unsafe Code Policy
 
 Moon enforces a strict gate on `unsafe` blocks. This document complements the
-"Unsafe Code" section in [`CLAUDE.md`](CLAUDE.md) with concrete review and
+"Unsafe Code" section in [`CLAUDE.md`](https://github.com/pilotspace/moon/blob/main/CLAUDE.md) with concrete review and
 merge requirements.
 
 ## Why this matters

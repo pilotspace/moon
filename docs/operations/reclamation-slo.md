@@ -17,7 +17,7 @@ alert rules to fire only when the field is `> 0` and breaches the threshold.
 - [Reclamation Runbook](./reclamation-runbook.md) — step-by-step triage for SLO breaches
 - [PRODUCTION-CONTRACT.md](../PRODUCTION-CONTRACT.md) — overall Moon SLOs (durability, latency, throughput)
 - [OPERATOR-GUIDE.md](../OPERATOR-GUIDE.md) — memory accounting and jemalloc tuning
-- [TODO.md](../../TODO.md) — Wave 1/2 roadmap and wave-acceptance criteria
+- TODO.md — Wave 1/2 roadmap and wave-acceptance criteria
 
 ---
 

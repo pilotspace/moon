@@ -1,8 +1,9 @@
 ---
 title: "Configuration"
 description: "All command-line flags and configuration options for Moon."
-keywords: ["configuration", "flags", "options", "cli", "settings"]
 ---
+
+# Configuration
 
 All options are available as command-line flags. Run `moon --help` for the full list.
 
@@ -139,14 +140,11 @@ All options are available as command-line flags. Run `moon --help` for the full 
 
 ## Tips
 
-<Note>
-Use `--shards 0` to auto-detect CPU count. Use `--shards 1` for benchmarking or when comparing per-key memory against Redis.
-</Note>
+!!! note
+    Use `--shards 0` to auto-detect CPU count. Use `--shards 1` for benchmarking or when comparing per-key memory against Redis.
 
-<Tip>
-Hash tags like `{tag}` in key names (e.g., `user:{1234}:name`) route all tagged keys to the same shard, eliminating cross-shard dispatch for MGET/MSET operations.
-</Tip>
+!!! tip
+    Hash tags like `{tag}` in key names (e.g., `user:{1234}:name`) route all tagged keys to the same shard, eliminating cross-shard dispatch for MGET/MSET operations.
 
-<Warning>
-Testing with more than 1,000 concurrent clients may require `ulimit -n 65536`. At 5,000 clients with pipelining, connection drops can occur without it.
-</Warning>
+!!! warning
+    Testing with more than 1,000 concurrent clients may require `ulimit -n 65536`. At 5,000 clients with pipelining, connection drops can occur without it.

@@ -1,8 +1,9 @@
 ---
 title: "Message queues"
 description: "Durable at-least-once message queues with dead-letter and triggers."
-keywords: ["message queue", "mq", "durable", "dead-letter", "dlq", "triggers", "at-least-once"]
 ---
+
+# Message queues
 
 Moon provides durable message queues built on Redis Streams with at-least-once delivery semantics, automatic dead-letter handling, and debounced trigger callbacks.
 

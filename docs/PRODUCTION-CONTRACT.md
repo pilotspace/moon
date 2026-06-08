@@ -8,7 +8,7 @@ description: "Moon's v1.0 promises: SLOs, durability modes, supported platforms,
 **Status:** provisional — SLO numbers lock in at Phase 97 (Performance SLO Lock-In) and the full checklist locks at Phase 100 (GA Gate).
 **Last updated:** 2026-04-08 (Phase 87 initial publication)
 **Milestone:** v0.1.3 Production Readiness
-**Architectural baseline:** [`.planning/MOON-DATAFLOW-WALKTHROUGH.md`](../.planning/MOON-DATAFLOW-WALKTHROUGH.md)
+**Architectural baseline:** `.planning/MOON-DATAFLOW-WALKTHROUGH.md`
 
 ## What this document is
 
@@ -104,7 +104,7 @@ Moon ships three fsync modes and a disk-offload cold tier. Each has a documented
 - **ACL enforcement:** every command dispatch checks the user's category + key-pattern rules before execution. Proven by `SEC-08` ACL fuzzing (Phase 89).
 - **Lua sandbox scope:** no fs, net, os, debug, or package access. Audited in `SEC-04` (Phase 98). Any sandbox finding is a P0.
 - **Unsafe code:** every `unsafe` block carries a `// SAFETY:` comment. Enforced by `UNSAFE-01` xtask audit in CI.
-- **CVE disclosure:** [SECURITY.md](../SECURITY.md) (Phase 98 `SEC-07`) documents the 90-day embargo disclosure process and GPG key.
+- **CVE disclosure:** [SECURITY.md](security.md) (Phase 98 `SEC-07`) documents the 90-day embargo disclosure process and GPG key.
 - **Supply chain:** `cargo audit` + `cargo deny` block PR merges. SBOM (CycloneDX) published per release. Release artifacts signed via cosign with provenance attestation. All enforced in Phase 98 (`SEC-01`, `SEC-02`).
 
 ## Out of Scope
@@ -130,7 +130,7 @@ Explicitly **not** promised by this contract:
 
 ## GA Exit Criteria Checklist
 
-Every box below must be ticked green before `v0.1.3` promotes to `v1.0-rc1`. Each line links to a REQ-ID in [`.planning/REQUIREMENTS.md`](../.planning/REQUIREMENTS.md) and the phase that closes it.
+Every box below must be ticked green before `v0.1.3` promotes to `v1.0-rc1`. Each line links to a REQ-ID in `.planning/REQUIREMENTS.md` and the phase that closes it.
 
 ### Production Contract
 - [ ] `CONTRACT-01` — this document published (Phase 87) ← **you are here**

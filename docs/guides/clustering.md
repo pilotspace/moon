@@ -1,8 +1,9 @@
 ---
 title: "Clustering and replication"
 description: "Set up replication, cluster mode, and automatic failover."
-keywords: ["cluster", "replication", "failover", "psync", "gossip", "slots"]
 ---
+
+# Clustering and replication
 
 Moon supports Redis-compatible replication and cluster mode for high availability and horizontal scaling.
 
@@ -10,48 +11,48 @@ Moon supports Redis-compatible replication and cluster mode for high availabilit
 
 Moon implements PSYNC2-compatible replication with per-shard WAL streaming and partial resync support.
 
-<Warning>
-**v0.1.x limitation — master must run `--shards 1`.**
+!!! warning
+    **v0.1.x limitation — master must run `--shards 1`.**
 
-PSYNC on a multi-shard master (`--shards N` where N > 1) currently returns `-ERR PSYNC across multiple shards is not yet supported (use --shards 1 on the master)`. The master's N shard-local databases cannot yet be serialized into a single consistent RDB stream for a replica to consume.
+    PSYNC on a multi-shard master (`--shards N` where N > 1) currently returns `-ERR PSYNC across multiple shards is not yet supported (use --shards 1 on the master)`. The master's N shard-local databases cannot yet be serialized into a single consistent RDB stream for a replica to consume.
 
-**Supported deployment shape for v0.1.x:**
-- **Master:** `--shards 1` (single-core writer, ~1–1.5 M ops/s ceiling)
-- **Replicas:** any `--shards N` (multi-core read scaling is unaffected)
+    **Supported deployment shape for v0.1.x:**
+    - **Master:** `--shards 1` (single-core writer, ~1–1.5 M ops/s ceiling)
+    - **Replicas:** any `--shards N` (multi-core read scaling is unaffected)
 
-**Multi-shard master replication is scheduled for v0.2** (see `.planning/rfcs/multi-shard-replication-design.md`). If you need a multi-core master today, run without replication; if you need replication, accept the single-shard master ceiling.
+    **Multi-shard master replication is scheduled for v0.2** (see `.planning/rfcs/multi-shard-replication-design.md`). If you need a multi-core master today, run without replication; if you need replication, accept the single-shard master ceiling.
 
-**Observability caveats (v0.1.x):**
-- `WAIT` returns 0 until the master parses `REPLCONF ACK <offset>` (v0.2 scope).
-- `CLIENT LIST TYPE replica` has no predicate yet; returns all clients.
-- `master_link_status` in `INFO replication` correctly reflects the handshake state — use it to detect a failed REPLICAOF.
-</Warning>
+    **Observability caveats (v0.1.x):**
+    - `WAIT` returns 0 until the master parses `REPLCONF ACK <offset>` (v0.2 scope).
+    - `CLIENT LIST TYPE replica` has no predicate yet; returns all clients.
+    - `master_link_status` in `INFO replication` correctly reflects the handshake state — use it to detect a failed REPLICAOF.
 
 ### Set up a replica
 
-<Steps>
-  <Step title="Start the leader (must be --shards 1 in v0.1.x)">
-    ```bash
-    ./target/release/moon --port 6379 --shards 1
-    ```
-  </Step>
-  <Step title="Start the replica (any shard count)">
-    ```bash
-    ./target/release/moon --port 6380 --shards 4
-    ```
-  </Step>
-  <Step title="Connect the replica to the leader">
-    ```bash
-    redis-cli -p 6380 REPLICAOF 127.0.0.1 6379
-    ```
-  </Step>
-  <Step title="Verify link status">
-    ```bash
-    redis-cli -p 6380 INFO replication | grep master_link_status
-    # Expect: master_link_status:up
-    ```
-  </Step>
-</Steps>
+### Start the leader (must be --shards 1 in v0.1.x)
+
+```bash
+./target/release/moon --port 6379 --shards 1
+```
+
+### Start the replica (any shard count)
+
+```bash
+./target/release/moon --port 6380 --shards 4
+```
+
+### Connect the replica to the leader
+
+```bash
+redis-cli -p 6380 REPLICAOF 127.0.0.1 6379
+```
+
+### Verify link status
+
+```bash
+redis-cli -p 6380 INFO replication | grep master_link_status
+# Expect: master_link_status:up
+```
 
 ### Replication features
 

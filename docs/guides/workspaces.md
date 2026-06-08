@@ -1,8 +1,9 @@
 ---
 title: "Workspaces"
 description: "Multi-tenant namespace isolation with transparent key prefixing."
-keywords: ["workspaces", "multi-tenant", "namespace", "isolation", "ws"]
 ---
+
+# Workspaces
 
 Workspaces provide multi-tenant namespace isolation. Each workspace gets a unique UUID v7 prefix that is transparently applied to all keys, ensuring complete data separation without application-level key management.
 

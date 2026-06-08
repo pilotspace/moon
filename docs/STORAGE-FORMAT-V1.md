@@ -25,7 +25,7 @@ to be supported.
 ## 2. The Compatibility Guarantee
 
 For the duration of the Moon v0.2.x minor series (≥ 18 months of LTS — see
-[`docs/SUPPORT.md`](SUPPORT.md)):
+`docs/SUPPORT.md`):
 
 1. **Forward read.** Every v0.2.x release reads files written by every
    earlier v0.2.x release.
@@ -136,7 +136,7 @@ once v2 is the default.
 - WAL v3 segment header: `src/persistence/wal_v3/segment.rs`
 - RDB v2 preamble: `src/persistence/snapshot.rs`
 - AOF manifest framing: `src/persistence/aof_manifest.rs`
-- Support / LTS policy: [`docs/SUPPORT.md`](SUPPORT.md) *(to be added in #104)*
-- Security disclosure: [`SECURITY.md`](../SECURITY.md)
+- Support / LTS policy: `docs/SUPPORT.md` *(to be added in #104)*
+- Security disclosure: [`SECURITY.md`](security.md)
 - Operator capacity planning: [`docs/OPERATOR-GUIDE.md`](OPERATOR-GUIDE.md)
-- v0.3.0 roadmap (this file is a v0.2.0 deliverable): [`.planning/milestones/v0.3.0-ROADMAP.md`](../.planning/milestones/v0.3.0-ROADMAP.md)
+- v0.3.0 roadmap (this file is a v0.2.0 deliverable): `.planning/milestones/v0.3.0-ROADMAP.md`
