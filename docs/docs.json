@@ -35,7 +35,7 @@
         "groups": [
           {
             "group": "Getting started",
-            "pages": ["index", "quickstart"]
+            "pages": ["index", "quickstart", "guides/migration"]
           },
           {
             "group": "Core concepts",
@@ -52,9 +52,12 @@
               "guides/message-queues",
               "guides/temporal",
               "guides/persistence",
+              "guides/pitr",
+              "guides/cdc",
               "guides/clustering",
               "guides/tls",
-              "guides/docker"
+              "guides/docker",
+              "guides/monitoring"
             ]
           },
           {

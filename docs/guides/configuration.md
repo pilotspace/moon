@@ -1,6 +1,6 @@
 # Configuration Reference
 
-Moon is configured entirely through command-line flags. There is no configuration file; use your process manager or shell script to persist flags.
+Moon is configured through command-line flags and an optional Redis-style configuration file (`moon.conf`). Precedence is **CLI flags → conf file → built-in defaults**. Pass the conf file as the first argument (`moon /etc/moon/moon.conf`) or via `--config`; validate it without starting using `--check-config`. The flags below can all be set in either place.
 
 ## Usage
 

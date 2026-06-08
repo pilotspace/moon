@@ -1,4 +1,8 @@
-# Migrating from Redis to Moon
+---
+title: "Migrating from Redis"
+description: "Move an existing Redis deployment to Moon with minimal disruption."
+keywords: ["migration", "redis", "compatibility", "cutover", "drop-in"]
+---
 
 Moon is a drop-in replacement for Redis. This guide covers how to migrate
 existing Redis deployments to Moon with minimal disruption.

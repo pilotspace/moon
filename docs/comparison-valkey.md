@@ -1,6 +1,6 @@
 # Moon vs Valkey — Deep Architectural Comparison
 
-*Reviewed: Moon v0.1.12 (~206K LOC Rust, traced from source) vs Valkey 9.1.0 (released 2026-05-19). Document date: 2026-05-25.*
+*Reviewed: Moon v0.2.0 (~224K LOC Rust, traced from source) vs Valkey 9.1.0 (released 2026-05-19). Document date: 2026-05-25; version refreshed 2026-06-08.*
 
 ---
 
@@ -9,7 +9,7 @@
 These two projects are **not** the same kind of thing.
 
 - **Valkey** is the *Linux-Foundation-stewarded continuation of Redis OSS* — a C codebase forked from Redis 7.2 after the SSPL relicense (March 2024). Its commercial DNA is "drop-in Redis replacement, blessed by hyperscalers, governed in the open." Every change is constrained by *preserving 30 years of Redis semantics* and the C single-threaded-command-execution mental model.
-- **Moon** is a *clean-room rewrite in Rust* with a different bet: thread-per-core shared-nothing, in-process AI primitives (vector + BM25 + graph), and a converged data-platform surface. Wire-compatible, but the architectural premises diverge from the first byte. Status is still **experimental** — README leads with that warning.
+- **Moon** is a *clean-room rewrite in Rust* with a different bet: thread-per-core shared-nothing, in-process AI primitives (vector + BM25 + graph), and a converged data-platform surface. Wire-compatible, but the architectural premises diverge from the first byte. Single-node Moon is **production-grade** as of v0.2.0; multi-node clustering remains alpha — the README leads with that honest matrix.
 
 The right mental model is **Valkey = horizontal moat (ecosystem + governance), Moon = vertical moat (architecture + integrated AI surface)**. They compete on different axes, not feature parity.
 
@@ -17,9 +17,9 @@ The right mental model is **Valkey = horizontal moat (ecosystem + governance), M
 
 ## 1. Headline Comparison Table
 
-| Dimension | **Moon v0.1.12** | **Valkey 9.1.0** | Strategic note |
+| Dimension | **Moon v0.2.0** | **Valkey 9.1.0** | Strategic note |
 |---|---|---|---|
-| **Language / age** | Rust edition 2024, MSRV 1.94, ~206K LOC, started 2025 | C99, ~150K LOC pre-fork + ~30K added, lineage 2009 (Redis) | Moon trades ecosystem maturity for memory safety + modern language. |
+| **Language / age** | Rust edition 2024, MSRV 1.94, ~224K LOC, started 2025 | C99, ~150K LOC pre-fork + ~30K added, lineage 2009 (Redis) | Moon trades ecosystem maturity for memory safety + modern language. |
 | **License / governance** | Apache-2.0, single-project repo | BSD-3-Clause, LF TSC, ~50 backers (AWS / GCP / Oracle / Alibaba / Tencent / Huawei…) | Valkey is the **safe-by-governance** choice; Moon has no foundation, no co-vendor, no module ecosystem. |
 | **Threading model** | **Thread-per-core, shared-nothing.** Each `Shard` owns `databases[16]`, `pubsub_registry`, `vector_store` directly — *no Arc, no Mutex* per `src/shard/mod.rs`. Cross-shard = lock-free SPSC (`flume`) + `AtomicWaker` response slots. | **Single main thread executes all commands.** I/O threads (off by default; up to 9 used in published bench) parallelize parsing, response framing, `epoll_wait`. Comm model redesigned in 9.1 for +17 % throughput. Parallel read-execution on I/O threads (Issue #2022, 3.1M RPS prototype) is *TSC-pending, not merged*. | Moon's model is structurally further along the scaling curve; Valkey is incrementally retrofitting concurrency onto a single-threaded core. |
 | **I/O driver** | Default **`monoio`** = io_uring on Linux / kqueue on macOS; **`tokio`** runtime alternative gated by feature. Same binary, dual codepath. SO_REUSEPORT per-shard listener. `MOON_NO_URING=1` runtime kill-switch. | **`epoll` (Linux) / `kqueue` (macOS) only.** *No io_uring* in any released or active PR (verified May 2026). No per-thread `SO_REUSEPORT`. RDMA exists as experimental compile flag. | Moon owns "modern Linux I/O." Valkey's design philosophy is portability over peak-Linux. |
@@ -49,8 +49,8 @@ The right mental model is **Valkey = horizontal moat (ecosystem + governance), M
 | **Memory safety** | 156 `unsafe` blocks with mandatory `// SAFETY:` audit (CI-enforced via `scripts/audit-unsafe.sh`). Unwrap ratchet. 7 fuzz targets (resp_parse, inline_parse, wal_v3_record, gossip_deser, acl_rule, …), 15 min/PR, 6 h nightly. Loom model tests. | C memory model. Long history of CVE exposure (any C codebase of this age). Module ABI also exposes C unsafety surface. | Architectural advantage Moon will own as long as the rewrite stays disciplined. |
 | **GPU acceleration** | `cudarc` feature flag, kernel scaffold under `src/gpu/`, vector-distance kernels planned. CPU + SIMD fallback mandatory. | None. | Moon-only direction; not yet shipping production kernels. |
 | **Published throughput** | 5.11M GET/s p=64, 3.50M SET/s p=64 (GCP c3-8, monoio, **single server**, Apr 2026). 2.20× Redis on ARM Neoverse-N1. | 2.1M RPS (Valkey 9.1, 9 I/O threads, p=10, 512 B, single server). 1B+ RPS on **2000-node cluster** (9.0 target). | Single-server: Moon ~2.4× Valkey 9.1 (caveat: different harnesses). Cluster-scale: Valkey has demonstrated multi-node scale; Moon has not yet published cluster-scale numbers. |
-| **Production readiness** | README labels **experimental**. No managed cloud offering. Moon Console + Rust/Python SDKs published. | Production. **AWS ElastiCache, Google Memorystore, Oracle OCI, Alibaba, Tencent, Huawei, DigitalOcean, Aiven, Heroku** all GA. Bitnami + hyperspike + SAP Helm charts/operators. | Valkey wins the production-readiness axis by a continent. This is Moon's biggest non-technical risk. |
-| **Client SDK story** | `moon-client` Rust on crates.io, `moondb` Python on PyPI. Wire-compatible with any Redis client. | All Redis clients work. Official `valkey-glide` (Rust core, Java / Python / Node / Go bindings, OTel built-in). | Valkey has multi-language first-party clients with OTel; Moon relies on protocol compatibility. |
+| **Production readiness** | Single-node **production-grade** as of v0.2.0; multi-node clustering **alpha**. No managed cloud offering. Moon Console + Rust/Python SDKs published. | Production. **AWS ElastiCache, Google Memorystore, Oracle OCI, Alibaba, Tencent, Huawei, DigitalOcean, Aiven, Heroku** all GA. Bitnami + hyperspike + SAP Helm charts/operators. | Valkey wins the production-readiness axis by a continent. This is Moon's biggest non-technical risk. |
+| **Client SDK story** | `moondb` Rust on crates.io, `moondb` Python on PyPI. Wire-compatible with any Redis client. | All Redis clients work. Official `valkey-glide` (Rust core, Java / Python / Node / Go bindings, OTel built-in). | Valkey has multi-language first-party clients with OTel; Moon relies on protocol compatibility. |
 
 ---
 
@@ -105,7 +105,7 @@ Both are valid; they will likely coexist.
 
 ## 4. Risks for Moon (Project-Owner View)
 
-1. **The "experimental" label is a moat for Valkey.** Until Moon has a managed offering, multi-year production reference, and an independent third-party benchmark validating the published numbers, Valkey wins every procurement conversation by default. **This is the single highest-leverage item.**
+1. **The missing managed offering and third-party validation are a moat for Valkey.** Even with single-node v0.2.0 now production-grade, until Moon has a managed offering, a multi-year production reference, and an independent third-party benchmark validating the published numbers, Valkey wins every procurement conversation by default. **This is the single highest-leverage item.**
 2. **No module API** is starting to look like a strategic constraint, not a clean-architecture win. Valkey's ability to ship JSON, Bloom, LDAP, Search as modules — and to expose a Rust module SDK — means *the community can extend Valkey faster than Moon's core team can extend Moon*. Reconsider whether a sandboxed (WASM?) module surface is worth opening.
 3. **Cluster operational features** (atomic slot migration, CLUSTERSCAN, hash-field TTL, multi-DB-in-cluster) are real workload features Valkey shipped in 9.0 / 9.1 that Moon's cluster code does not yet match. These will surface in any serious operator evaluation.
 4. **Valkey's vector module will add quantization.** It's the obvious next step and they have the contributor base. Moon's current TQ moat shrinks every quarter — lean into agentic / hybrid / temporal differentiation that's harder to copy.
@@ -121,7 +121,7 @@ The competitive narrative writes itself: **"Moon is what Redis would look like i
 Two strategic plays look high-value:
 
 1. **Double down on the AI-platform vertical** (vector + graph + transactions + hybrid + temporal) where Valkey has no path to parity in 12 months.
-2. **Cross the credibility chasm** with (a) one independent third-party benchmark, (b) a documented cluster-scale run (≥16 nodes), and (c) a stable storage-format guarantee. The "experimental" label is currently the biggest single drag on adoption.
+2. **Cross the credibility chasm** with (a) one independent third-party benchmark, (b) a documented cluster-scale run (≥16 nodes), and (c) a stable storage-format guarantee. The absence of a managed offering and independent validation is currently the biggest single drag on adoption.
 
 ---
 

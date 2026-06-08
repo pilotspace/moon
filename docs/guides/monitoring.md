@@ -1,4 +1,8 @@
-# Monitoring with Prometheus
+---
+title: "Monitoring"
+description: "Scrape Moon's Prometheus metrics and set up alerting."
+keywords: ["monitoring", "prometheus", "metrics", "observability", "alerting"]
+---
 
 Moon exposes a Prometheus-compatible metrics endpoint on its admin HTTP port. This guide covers enabling the admin port, scraping metrics, and setting up basic alerting.
 
