@@ -1,8 +1,9 @@
 ---
 title: "References & credits"
 description: "Open-source projects, research papers, and specifications Moon builds on."
-keywords: ["references", "credits", "papers", "dependencies", "design"]
 ---
+
+# References & credits
 
 Moon stands on the shoulders of decades of systems research and a vibrant open-source ecosystem. This page lists the projects, papers, and specifications that directly shaped Moon's design, along with the core runtime dependencies and the rationale for each.
 
@@ -62,7 +63,7 @@ Each dependency was chosen for a specific, load-bearing reason. Swapping any of 
 | **[xxhash-rust](https://github.com/DoumanAsh/xxhash-rust)** | Non-cryptographic hashing | Fast key hashing for DashTable segment routing. |
 | **[crossbeam-utils](https://github.com/crossbeam-rs/crossbeam)** | Concurrency primitives | `CachePadded<T>` for false-sharing prevention on hot atomics. |
 | **[ringbuf](https://github.com/agerasev/ringbuf)** | SPSC ring buffer | Lock-free cross-shard message passing. |
-| **[phf](https://github.com/rust-phf/rust-phf)** | Perfect hash map | Static command metadata registry; constant-time lookup for cold commands (hot commands use a direct match — see [dispatch hot-path recovery](/benchmarks#dispatch-hot-path-recovery)). |
+| **[phf](https://github.com/rust-phf/rust-phf)** | Perfect hash map | Static command metadata registry; constant-time lookup for cold commands (hot commands use a direct match — see [dispatch hot-path recovery](benchmarks.md#dispatch-hot-path-recovery)). |
 | **[ordered-float](https://github.com/reem/rust-ordered-float)** | Total-ordered floats | Sorted-set score keys. |
 | **[parking_lot](https://github.com/Amanieu/parking_lot)** | Non-poisoning locks | Faster, poisoning-free `RwLock`/`Mutex` for per-shard state. |
 

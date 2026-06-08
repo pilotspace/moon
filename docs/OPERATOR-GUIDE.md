@@ -3,7 +3,7 @@
 Practical reference for running Moon in production: memory accounting,
 allocator tuning, and observability. Companion to
 [PRODUCTION-CONTRACT.md](PRODUCTION-CONTRACT.md) (SLOs and durability) and
-[BENCHMARK.md](../BENCHMARK.md) (throughput methodology).
+[BENCHMARK.md](benchmark-report.md) (throughput methodology).
 
 ---
 
@@ -418,7 +418,7 @@ See also:
   platform guarantees.
 - [production-guide.md](production-guide.md) for deployment configuration and
   tuning recommendations.
-- [Phase 190 plans](../.planning/phases/190-memory-observability/) for
+- Phase 190 plans for
   `MEMORY DOCTOR` and Prometheus internals.
-- [Phase 191 plans](../.planning/phases/191-allocator-ux/) for the arena-cap
+- Phase 191 plans for the arena-cap
   and `mimalloc-alt` feature design notes.

@@ -1,8 +1,9 @@
 ---
 title: "Architecture"
 description: "Thread-per-core shared-nothing design, data structures, and key optimizations."
-keywords: ["architecture", "sharding", "dashtable", "simd", "io_uring", "monoio"]
 ---
+
+# Architecture
 
 Moon uses a thread-per-core shared-nothing architecture where each shard runs independently on its own thread with no shared mutable state.
 

@@ -1,8 +1,9 @@
 ---
 title: "Python SDK"
 description: "moondb Python SDK — typed client for vector search, graph, full-text, sessions, caching, and framework integrations."
-keywords: ["sdk", "python", "moondb", "client", "langchain", "llamaindex", "async"]
 ---
+
+# Python SDK
 
 The `moondb` Python SDK extends `redis-py` with typed helpers for Moon's vector search, graph engine, full-text search, session-aware retrieval, and semantic caching. All standard Redis commands remain available.
 

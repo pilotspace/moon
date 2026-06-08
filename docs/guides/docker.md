@@ -1,8 +1,9 @@
 ---
 title: "Docker"
 description: "Run Moon in Docker with persistence and TLS."
-keywords: ["docker", "container", "deployment"]
 ---
+
+# Docker
 
 Moon ships with a Dockerfile for containerized deployments.
 
@@ -64,10 +65,8 @@ docker run -d \
     --maxmemory-policy allkeys-lfu
 ```
 
-<Tip>
-Use `--shards 0` to auto-detect available CPU cores inside the container. Set `--ulimit nofile=65536:65536` for high client counts.
-</Tip>
+!!! tip
+    Use `--shards 0` to auto-detect available CPU cores inside the container. Set `--ulimit nofile=65536:65536` for high client counts.
 
-<Warning>
-Always use `--bind 0.0.0.0` inside Docker containers. The default `127.0.0.1` is not reachable from outside the container. Use `--requirepass` or network-level access controls when binding to all interfaces.
-</Warning>
+!!! warning
+    Always use `--bind 0.0.0.0` inside Docker containers. The default `127.0.0.1` is not reachable from outside the container. Use `--requirepass` or network-level access controls when binding to all interfaces.

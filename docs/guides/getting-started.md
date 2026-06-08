@@ -80,5 +80,5 @@ See the [configuration guide](configuration.md) for all available flags.
 
 - [Configuration reference](configuration.md) -- all CLI flags and defaults
 - [Monitoring with Prometheus](monitoring.md) -- set up metrics collection
-- [Persistence guide](../persistence.mdx) -- AOF, RDB, and crash recovery
-- [TLS setup](../tls.mdx) -- encrypted connections with mTLS
+- [Persistence guide](persistence.md) -- AOF, RDB, and crash recovery
+- [TLS setup](tls.md) -- encrypted connections with mTLS

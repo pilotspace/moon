@@ -1,8 +1,9 @@
 ---
 title: "Quick start"
 description: "Install, build, and run Moon in under five minutes."
-keywords: ["install", "setup", "getting started", "docker", "build"]
 ---
+
+# Quick start
 
 ## Prerequisites
 
@@ -11,58 +12,56 @@ keywords: ["install", "setup", "getting started", "docker", "build"]
 
 ## Build from source
 
-<Steps>
-  <Step title="Clone the repository">
+### Clone the repository
+
+```bash
+git clone https://github.com/pilotspace/moon.git
+cd moon
+```
+
+### Build the release binary
+
+The default build uses the Monoio runtime with jemalloc:
+
+```bash
+cargo build --release
+```
+
+??? note "Alternative build configurations"
     ```bash
-    git clone https://github.com/pilotspace/moon.git
-    cd moon
+    # Tokio runtime (required for macOS CI, CodeQL, GitHub Actions)
+    cargo build --release --no-default-features --features runtime-tokio
+
+    # Tokio with jemalloc
+    cargo build --release --no-default-features --features runtime-tokio,jemalloc
+
+    # Native CPU optimizations (recommended for benchmarking)
+    RUSTFLAGS="-C target-cpu=native" cargo build --release
     ```
-  </Step>
-  <Step title="Build the release binary">
-    The default build uses the Monoio runtime with jemalloc:
 
-    ```bash
-    cargo build --release
-    ```
+### Start the server
 
-    <AccordionGroup>
-      <Accordion title="Alternative build configurations">
-        ```bash
-        # Tokio runtime (required for macOS CI, CodeQL, GitHub Actions)
-        cargo build --release --no-default-features --features runtime-tokio
+```bash
+# Default: 127.0.0.1:6379, auto-detect CPU count for shards
+./target/release/moon
 
-        # Tokio with jemalloc
-        cargo build --release --no-default-features --features runtime-tokio,jemalloc
+# With specific options
+./target/release/moon --port 6379 --shards 4
+```
 
-        # Native CPU optimizations (recommended for benchmarking)
-        RUSTFLAGS="-C target-cpu=native" cargo build --release
-        ```
-      </Accordion>
-    </AccordionGroup>
-  </Step>
-  <Step title="Start the server">
-    ```bash
-    # Default: 127.0.0.1:6379, auto-detect CPU count for shards
-    ./target/release/moon
+### Connect
 
-    # With specific options
-    ./target/release/moon --port 6379 --shards 4
-    ```
-  </Step>
-  <Step title="Connect">
-    Any Redis client works out of the box:
+Any Redis client works out of the box:
 
-    ```bash
-    redis-cli -p 6379
-    127.0.0.1:6379> PING
-    PONG
-    127.0.0.1:6379> SET hello world
-    OK
-    127.0.0.1:6379> GET hello
-    "world"
-    ```
-  </Step>
-</Steps>
+```bash
+redis-cli -p 6379
+127.0.0.1:6379> PING
+PONG
+127.0.0.1:6379> SET hello world
+OK
+127.0.0.1:6379> GET hello
+"world"
+```
 
 ## Docker
 
@@ -87,8 +86,7 @@ docker run -p 6379:6379 -p 6380:6380 moon \
 
 Moon is compatible with any Redis client. Here are a few examples:
 
-<Tabs>
-  <Tab title="Python">
+=== "Python"
     ```python
     import redis
 
@@ -96,8 +94,8 @@ Moon is compatible with any Redis client. Here are a few examples:
     r.set('key', 'value')
     print(r.get('key'))  # b'value'
     ```
-  </Tab>
-  <Tab title="Node.js">
+
+=== "Node.js"
     ```javascript
     import { createClient } from 'redis';
 
@@ -106,8 +104,8 @@ Moon is compatible with any Redis client. Here are a few examples:
     await client.set('key', 'value');
     console.log(await client.get('key')); // 'value'
     ```
-  </Tab>
-  <Tab title="Go">
+
+=== "Go"
     ```go
     import "github.com/redis/go-redis/v9"
 
@@ -116,15 +114,13 @@ Moon is compatible with any Redis client. Here are a few examples:
     val, _ := rdb.Get(ctx, "key").Result()
     fmt.Println(val) // "value"
     ```
-  </Tab>
-  <Tab title="Java">
+
+=== "Java"
     ```java
     Jedis jedis = new Jedis("localhost", 6379);
     jedis.set("key", "value");
     System.out.println(jedis.get("key")); // "value"
     ```
-  </Tab>
-</Tabs>
 
 ## Python SDK
 
@@ -154,8 +150,7 @@ See [sdk/python/README.md](https://github.com/pilotspace/moon/tree/main/sdk/pyth
 
 ## Try Moon-native features
 
-<Tabs>
-  <Tab title="Cross-store transactions">
+=== "Cross-store transactions"
     ```bash
     redis-cli -p 6379
     127.0.0.1:6379> TXN BEGIN
@@ -167,8 +162,8 @@ See [sdk/python/README.md](https://github.com/pilotspace/moon/tree/main/sdk/pyth
     127.0.0.1:6379> TXN COMMIT
     OK
     ```
-  </Tab>
-  <Tab title="Workspaces">
+
+=== "Workspaces"
     ```bash
     redis-cli -p 6379
     127.0.0.1:6379> WS CREATE myapp
@@ -180,8 +175,8 @@ See [sdk/python/README.md](https://github.com/pilotspace/moon/tree/main/sdk/pyth
     127.0.0.1:6379> WS LIST
     1) "0193a9f2-e456-7890-abcd-ef1234567890"
     ```
-  </Tab>
-  <Tab title="Message queues">
+
+=== "Message queues"
     ```bash
     redis-cli -p 6379
     127.0.0.1:6379> MQ CREATE orders MAXDELIVERY 5
@@ -194,30 +189,26 @@ See [sdk/python/README.md](https://github.com/pilotspace/moon/tree/main/sdk/pyth
     127.0.0.1:6379> MQ ACK orders 1713394800000-0
     (integer) 1
     ```
-  </Tab>
-  <Tab title="Temporal queries">
+
+=== "Temporal queries"
     ```bash
     redis-cli -p 6379
     127.0.0.1:6379> TEMPORAL.SNAPSHOT_AT
     OK
     127.0.0.1:6379> FT.SEARCH idx "*=>[KNN 5 @v $q]" AS_OF 1713394800000 PARAMS 2 q <vec> DIALECT 2
     ```
-  </Tab>
-</Tabs>
 
 ## Next steps
 
-<Columns cols={2}>
-  <Card title="Configuration" icon="gear" href="/configuration">
+<div class="grid cards" markdown>
+
+-   [__Configuration__](configuration.md)
     All CLI flags and options.
-  </Card>
-  <Card title="Architecture" icon="microchip" href="/architecture">
+-   [__Architecture__](architecture.md)
     How Moon works under the hood.
-  </Card>
-  <Card title="Transactions" icon="lock" href="/guides/transactions">
+-   [__Transactions__](guides/transactions.md)
     Cross-store ACID transactions across KV, vector, and graph.
-  </Card>
-  <Card title="Full-text search" icon="magnifying-glass" href="/guides/full-text-search">
+-   [__Full-text search__](guides/full-text-search.md)
     BM25, hybrid fusion, FT.AGGREGATE with GROUPBY/REDUCE.
-  </Card>
-</Columns>
+
+</div>
