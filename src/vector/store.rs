@@ -138,6 +138,21 @@ pub struct FieldSegments {
     pub collection: Arc<CollectionMetadata>,
 }
 
+/// State for an in-flight background compaction of the default field.
+///
+/// Created by [`VectorIndex::begin_background_compact`] and consumed by
+/// [`VectorIndex::poll_install_compaction`].
+struct InFlightCompaction {
+    /// Reply channel from the worker thread.
+    reply_rx: flume::Receiver<crate::vector::background_compact::CompactionResult>,
+    /// Number of entries the mutable segment had when we froze it.
+    /// Used to compute the tail window `[frozen_len..current_len)`.
+    frozen_len: usize,
+    /// Global ID base of the mutable segment at freeze time.
+    /// Used to re-anchor the tail segment after install.
+    frozen_global_base: u32,
+}
+
 /// A single vector index: meta + segments + scratch + collection config.
 ///
 /// The top-level `segments`, `scratch`, `collection` are the DEFAULT field
@@ -188,6 +203,9 @@ pub struct VectorIndex {
     /// Sparse vector stores, keyed by field name.
     /// Populated when FT.CREATE includes SPARSE field declarations.
     pub sparse_stores: HashMap<Bytes, crate::vector::sparse::store::SparseStore>,
+    /// In-flight background compaction for the default field, if any.
+    /// `None` means no compaction is currently running.
+    bg_compact_inflight: Option<InFlightCompaction>,
 }
 
 /// Default minimum vector count to trigger compaction before search.
@@ -278,26 +296,27 @@ impl VectorIndex {
         if !self.autocompact_enabled {
             return;
         }
-        let mutable_len;
-        {
-            let snapshot = self.segments.load();
-            mutable_len = snapshot.mutable.len();
-        } // drop snapshot guard before freeze/compact
 
+        // Default field: BACKGROUND path. Neither call blocks the shard event
+        // loop — the HNSW build runs on a worker thread (background_compact.rs).
+        //   1. poll_install: install a segment a worker finished building since
+        //      the last search (non-blocking; no-op if nothing is ready).
+        //   2. begin_*_due: dispatch a new build iff the mutable segment crossed
+        //      its compact threshold and none is already in flight. The
+        //      triggering FT.SEARCH then continues against the still-present
+        //      brute-force mutable segment, so it is NOT frozen — this replaces
+        //      the former inline `compact_segments` that stalled the shard for
+        //      seconds (0.42s @2k … 24.9s @50k vectors, measured).
+        self.poll_install_compaction();
+        let _ = self.begin_background_compact_due(crate::vector::background_compact::global());
+
+        // Additional vector fields still use the inline (blocking) path.
+        // TODO(bg-compact): extend background compaction to field_segments.
         let threshold = if self.meta.compact_threshold > 0 {
             self.meta.compact_threshold as usize
         } else {
             DEFAULT_COMPACT_THRESHOLD
         };
-        if mutable_len >= threshold {
-            Self::compact_segments(
-                &mut self.segments,
-                &mut self.scratch,
-                &self.collection,
-                self.meta.dimension,
-            );
-        }
-        // Also try compact additional fields with the same threshold
         for (_, fs) in &mut self.field_segments {
             let fs_len = fs.segments.load().mutable.len();
             if fs_len >= threshold {
@@ -326,6 +345,50 @@ impl VectorIndex {
     /// silently no-ops, leaving all vectors in brute-force mutable segment
     /// (O(n) search instead of HNSW O(log n)).
     pub fn force_compact(&mut self) {
+        // If a background compaction is already in flight for the default field,
+        // drain it by blocking on the reply channel (worker is already building).
+        // This prevents double-compaction of the same frozen snapshot.
+        if let Some(inflight) = self.bg_compact_inflight.take() {
+            // Block until the worker finishes.
+            if let Ok(Ok(mut immutable)) = inflight.reply_rx.recv() {
+                // Reconcile window deletes (same logic as poll_install_compaction).
+                snap_and_reconcile(
+                    &self.segments,
+                    inflight.frozen_len,
+                    &mut immutable,
+                );
+                let snap = self.segments.load();
+                let tail_mutable = snap.mutable.clone_suffix(inflight.frozen_len);
+                let num_nodes = immutable.graph().num_nodes();
+                let padded = self.collection.padded_dimension;
+                self.scratch = SearchScratch::new(num_nodes, padded);
+                let mut imm_list = snap.immutable.clone();
+                imm_list.push(Arc::new(immutable));
+                let new_list = SegmentList {
+                    mutable: tail_mutable,
+                    immutable: imm_list,
+                    ivf: snap.ivf.clone(),
+                    warm: snap.warm.clone(),
+                    cold: snap.cold.clone(),
+                };
+                drop(snap);
+                self.segments.swap(new_list);
+                // After draining we're done — the data is compacted.
+                // Compact additional fields inline (no in-flight for those).
+                for (_, fs) in &mut self.field_segments {
+                    let dim = fs.collection.dimension;
+                    Self::compact_segments(
+                        &mut fs.segments,
+                        &mut fs.scratch,
+                        &fs.collection,
+                        dim,
+                    );
+                }
+                return;
+            }
+            // Worker failed or dropped — fall through to inline compact below.
+        }
+
         // Compact default field
         Self::compact_segments(
             &mut self.segments,
@@ -386,7 +449,189 @@ impl VectorIndex {
     }
 }
 
+/// Walk the window `[0..frozen_len)` of `segments.mutable` and apply
+/// post-freeze tombstones to `immutable` before it is wrapped in `Arc`.
+///
+/// Two cases are handled:
+/// 1. **Deleted entries** — window entry has `delete_lsn != 0` (DEL/UNLINK).
+/// 2. **Overwritten entries** — same `key_hash` re-appears in the tail
+///    `[frozen_len..end)` (HSET overwrite without a preceding DEL). In this
+///    case the frozen snapshot holds the *old* version; the tail holds the
+///    *new* version. We must tombstone the old copy so searches don't return
+///    both.
+///
+/// Called from both `poll_install_compaction` and the `force_compact` drain path.
+fn snap_and_reconcile(
+    segments: &SegmentHolder,
+    frozen_len: usize,
+    immutable: &mut crate::vector::segment::immutable::ImmutableSegment,
+) {
+    let snap = segments.load();
+
+    // Collect key_hashes re-inserted in the tail (HSET overwrite case).
+    let mut tail_keys: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    snap.mutable.for_each_tail_entry(frozen_len, |key_hash| {
+        tail_keys.insert(key_hash);
+    });
+
+    snap.mutable
+        .for_each_window_entry(frozen_len, |key_hash, delete_lsn| {
+            if delete_lsn != 0 || tail_keys.contains(&key_hash) {
+                immutable.mark_deleted_by_key_hash_install(key_hash);
+            }
+        });
+}
+
 impl VectorIndex {
+    /// Dispatch a background compaction for the default field if no compaction
+    /// is already in flight and the mutable segment is non-empty.
+    ///
+    /// Returns `true` if a job was submitted, `false` otherwise.
+    ///
+    /// This is non-blocking: the actual HNSW build runs on a worker thread.
+    /// Call [`poll_install_compaction`] on subsequent ticks to install the result.
+    pub fn begin_background_compact(
+        &mut self,
+        compactor: &crate::vector::background_compact::BackgroundCompactor,
+    ) -> bool {
+        if self.bg_compact_inflight.is_some() {
+            return false; // already running
+        }
+        let snap = self.segments.load();
+        let frozen_len = snap.mutable.len();
+        if frozen_len == 0 {
+            return false;
+        }
+        let frozen_global_base = snap.mutable.global_id_base();
+        let frozen = snap.mutable.freeze();
+        drop(snap);
+
+        let seed = self
+            .collection
+            .collection_id
+            .wrapping_mul(6364136223846793005);
+        match compactor.submit(frozen, self.collection.clone(), seed) {
+            Ok(reply_rx) => {
+                self.bg_compact_inflight = Some(InFlightCompaction {
+                    reply_rx,
+                    frozen_len,
+                    frozen_global_base,
+                });
+                true
+            }
+            Err(_) => false, // worker queue full — retry next tick
+        }
+    }
+
+    /// Threshold-gated wrapper over [`begin_background_compact`]: dispatches a
+    /// background build ONLY when the mutable segment has reached its
+    /// `compact_threshold` (or [`DEFAULT_COMPACT_THRESHOLD`] when unset).
+    ///
+    /// This is the *policy* entry point used by the search path
+    /// ([`try_compact`]) and the autovacuum backstop. The bare
+    /// [`begin_background_compact`] is the *mechanism* (compacts any non-empty
+    /// segment) used by `FT.COMPACT` drain and tests.
+    ///
+    /// Non-blocking. Returns `true` if a job was submitted.
+    pub fn begin_background_compact_due(
+        &mut self,
+        compactor: &crate::vector::background_compact::BackgroundCompactor,
+    ) -> bool {
+        let threshold = if self.meta.compact_threshold > 0 {
+            self.meta.compact_threshold as usize
+        } else {
+            DEFAULT_COMPACT_THRESHOLD
+        };
+        if self.segments.load().mutable.len() < threshold {
+            return false;
+        }
+        self.begin_background_compact(compactor)
+    }
+
+    /// Poll for a completed background compaction and install the result.
+    ///
+    /// Returns `true` if a segment was installed, `false` if no result was ready.
+    ///
+    /// ## Install reconciliation
+    ///
+    /// When the worker finishes, the mutable segment may have grown since we
+    /// froze it. Let `N = frozen_len`, `M = current_len`.
+    ///
+    /// 1. **Window deletes** `[0..N)`: any entry tombstoned in the mutable
+    ///    window after freeze is applied to the new immutable via
+    ///    `mark_deleted_by_key_hash` (interior mutability — segment not yet Arc'd).
+    ///
+    /// 2. **Window overwrites** `[0..N)`: if a key in the window was re-inserted
+    ///    (same `key_hash`, `insert_lsn > delete_lsn`), its older version in the
+    ///    immutable must also be tombstoned to avoid resurrection.
+    ///
+    /// 3. **Tail clone** `[N..M)`: entries that arrived during the build are
+    ///    byte-copied into a fresh mutable segment with the correct `global_id_base`.
+    ///
+    /// After reconciliation the new `SegmentList` is atomically swapped in.
+    ///
+    /// ## Autovacuum hook
+    ///
+    /// `poll_install_compactions` on [`VectorStore`] calls this for every index.
+    /// That method should be called from the shard event loop on every tick
+    /// (autovacuum **Pass D** — background compact install).
+    pub fn poll_install_compaction(&mut self) -> bool {
+        let inflight = match self.bg_compact_inflight.as_ref() {
+            Some(f) => f,
+            None => return false,
+        };
+
+        // Non-blocking check.
+        let result = match inflight.reply_rx.try_recv() {
+            Ok(r) => r,
+            Err(flume::TryRecvError::Empty) => return false,
+            Err(flume::TryRecvError::Disconnected) => {
+                // Worker panicked or dropped — clear inflight and give up.
+                self.bg_compact_inflight = None;
+                return false;
+            }
+        };
+
+        // Take ownership now that we know we have a result.
+        let inflight = self.bg_compact_inflight.take().unwrap();
+
+        let mut immutable = match result {
+            Ok(imm) => imm,
+            Err(_) => return false, // compaction failed — drop, retry later
+        };
+
+        // ── Reconciliation ────────────────────────────────────────────────────
+        let frozen_len = inflight.frozen_len;
+        let _ = inflight.frozen_global_base; // documented anchor; clone_suffix uses it implicitly
+
+        // Step 1 & 2: walk window [0..frozen_len), apply post-freeze tombstones.
+        snap_and_reconcile(&self.segments, frozen_len, &mut immutable);
+
+        // Step 3: clone the tail [frozen_len..M) into a fresh mutable.
+        let snap = self.segments.load();
+        let tail_mutable = snap.mutable.clone_suffix(frozen_len);
+
+        // Rebuild scratch for the new immutable's graph size.
+        let num_nodes = immutable.graph().num_nodes();
+        let padded = self.collection.padded_dimension;
+        self.scratch = SearchScratch::new(num_nodes, padded);
+
+        // ── Atomic swap ───────────────────────────────────────────────────────
+        let mut imm_list = snap.immutable.clone();
+        imm_list.push(Arc::new(immutable));
+        let new_list = SegmentList {
+            mutable: tail_mutable,
+            immutable: imm_list,
+            ivf: snap.ivf.clone(),
+            warm: snap.warm.clone(),
+            cold: snap.cold.clone(),
+        };
+        drop(snap);
+        self.segments.swap(new_list);
+
+        true
+    }
+
     /// Check each immutable segment's age. If older than `warm_after_secs`,
     /// transition it to warm tier (mmap-backed on disk).
     ///
@@ -809,6 +1054,7 @@ impl VectorStore {
                 compaction_weight: COMPACTION_WEIGHT_DEFAULT,
                 field_segments: extra_fields,
                 sparse_stores: HashMap::new(),
+                bg_compact_inflight: None,
             },
         );
 
@@ -919,7 +1165,13 @@ impl VectorStore {
         for idx_name in matching_names {
             if let Some(idx) = self.indexes.get(&idx_name) {
                 let snap = idx.segments.load();
+                // Tombstone in mutable segment (always present).
                 snap.mutable.mark_deleted_by_key_hash(key_hash, 1);
+                // Also tombstone any already-compacted immutable segments that
+                // may still contain the key (steady-state interior tombstone).
+                for imm in snap.immutable.iter() {
+                    imm.mark_deleted_by_key_hash(key_hash);
+                }
                 any_deleted = true;
             }
         }
@@ -927,6 +1179,65 @@ impl VectorStore {
         if any_deleted {
             self.bump_version();
         }
+    }
+
+    /// Dispatch background compactions for all indexes that are ready
+    /// (mutable segment non-empty, no compaction already in flight).
+    ///
+    /// Call once per tick from the shard event loop (autovacuum Pass D).
+    ///
+    /// Returns the number of jobs submitted.
+    pub fn begin_background_compactions(
+        &mut self,
+        compactor: &crate::vector::background_compact::BackgroundCompactor,
+    ) -> usize {
+        let mut submitted = 0;
+        for idx in self.indexes.values_mut() {
+            if idx.begin_background_compact(compactor) {
+                submitted += 1;
+            }
+        }
+        submitted
+    }
+
+    /// Threshold-gated variant of [`begin_background_compactions`] for the
+    /// autovacuum backstop (Pass D): dispatches only indexes whose mutable
+    /// segment has reached its compact threshold. The search path drives the
+    /// same logic per-index via [`VectorIndex::begin_background_compact_due`];
+    /// this catches indexes that stopped receiving `FT.SEARCH`.
+    ///
+    /// Returns the number of jobs submitted.
+    pub fn begin_background_compactions_due(
+        &mut self,
+        compactor: &crate::vector::background_compact::BackgroundCompactor,
+    ) -> usize {
+        let mut submitted = 0;
+        for idx in self.indexes.values_mut() {
+            if idx.begin_background_compact_due(compactor) {
+                submitted += 1;
+            }
+        }
+        submitted
+    }
+
+    /// Poll all indexes for completed background compactions and install any
+    /// ready results.
+    ///
+    /// Returns the number of segments installed.
+    ///
+    /// ## Autovacuum Pass D
+    ///
+    /// This method should be called from the shard event loop on every tick,
+    /// after command processing and before the next sleep. It is intentionally
+    /// non-blocking: if no worker has finished, it returns 0 immediately.
+    pub fn poll_install_compactions(&mut self) -> usize {
+        let mut installed = 0;
+        for idx in self.indexes.values_mut() {
+            if idx.poll_install_compaction() {
+                installed += 1;
+            }
+        }
+        installed
     }
 
     /// Number of indexes.
@@ -1800,5 +2111,464 @@ mod tests {
 
         // Should discover the segment without panicking
         store.register_cold_segments(vec![(10, seg_dir)]);
+    }
+}
+
+// ── Background compaction TDD tests ─────────────────────────────────────────
+//
+// These tests drive the background-compact pipeline end-to-end:
+//   1. Basic round-trip: begin → poll → immutable segment installed.
+//   2. Tail vectors inserted during build appear in results after install.
+//   3. Delete before install is reconciled: deleted key absent from results.
+//   4. Overwrite before install: only newest version survives.
+//   5. Steady-state HDEL after install tombstones immutable via interior set.
+//   6. force_compact while in-flight drains the in-flight first.
+//
+// Tests 3 and 4 are RED before install reconciliation exists (the deleted/stale
+// key would appear in results). They turn GREEN after reconciliation is wired.
+
+#[cfg(test)]
+mod bg_compact_tests {
+    use bytes::Bytes;
+
+    use super::*;
+    use crate::vector::background_compact::BackgroundCompactor;
+    use crate::vector::distance;
+
+    // ── helpers ──────────────────────────────────────────────────────────────
+
+    fn make_idx(dim: u32) -> IndexMeta {
+        IndexMeta {
+            name: Bytes::from_static(b"idx"),
+            dimension: dim,
+            padded_dimension: padded_dimension(dim),
+            metric: DistanceMetric::L2,
+            hnsw_m: 8,
+            hnsw_ef_construction: 50,
+            hnsw_ef_runtime: 0,
+            compact_threshold: 0,
+            source_field: Bytes::from_static(b"vec"),
+            key_prefixes: vec![Bytes::from_static(b"doc:")],
+            quantization: QuantizationConfig::TurboQuant4,
+            build_mode: crate::vector::turbo_quant::collection::BuildMode::Light,
+            vector_fields: Vec::new(),
+            schema_fields: Vec::new(),
+            merge_mode: MergeMode::GraphUnion,
+            keep_raw: false,
+        }
+    }
+
+    fn random_vec(dim: usize, seed: u64) -> Vec<f32> {
+        // LCG-based deterministic pseudo-random for no-dep generation.
+        let mut state = seed.wrapping_add(1);
+        let mut v: Vec<f32> = (0..dim)
+            .map(|_| {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                ((state >> 33) as f32) / (u32::MAX as f32) * 2.0 - 1.0
+            })
+            .collect();
+        let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-6);
+        v.iter_mut().for_each(|x| *x /= norm);
+        v
+    }
+
+    fn insert(store: &mut VectorStore, key: &[u8], vec: Vec<f32>) {
+        let hash = xxhash_rust::xxh64::xxh64(key, 0);
+        let key_bytes = Bytes::copy_from_slice(key);
+        store.insert_vector(b"idx", &vec, hash, key_bytes).unwrap();
+    }
+
+    /// Poll until a segment is installed or we hit `max_iters`.
+    fn poll_until_installed(store: &mut VectorStore, max_iters: usize) -> bool {
+        for _ in 0..max_iters {
+            if store.poll_install_compactions() > 0 {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        false
+    }
+
+    fn search_key_hashes(store: &mut VectorStore, query: &[f32], k: usize) -> Vec<u64> {
+        let idx = store.indexes.get_mut(b"idx".as_ref()).unwrap();
+        let results = idx.segments.search(query, k, 50, &mut idx.scratch);
+        results.iter().map(|r| r.key_hash).collect()
+    }
+
+    /// Like [`make_idx`] but with a caller-chosen index name (and a matching
+    /// key prefix), so a test can create several independent indexes.
+    fn make_idx_named(name: Bytes, dim: u32) -> IndexMeta {
+        let prefix = Bytes::from([name.as_ref(), b":"].concat());
+        let mut meta = make_idx(dim);
+        meta.name = name;
+        meta.key_prefixes = vec![prefix];
+        meta
+    }
+
+    // ── Test 7: worker-pool parallelism (limitation #1 fix) ───────────────────
+
+    /// K independent index compactions on a K-worker pool must finish in well
+    /// under the fully-serialized time, proving the pool parallelizes builds
+    /// across indexes/shards (a single-worker pool serializes them).
+    ///
+    /// Self-calibrating: measures ONE build alone, then asserts K builds on K
+    /// workers stay far below `K × single` (a 1-worker pool would take ≈
+    /// `K × single`). Timing assertion is skipped on machines with < K+1 cores
+    /// (can't physically parallelize) so it never flakes on tiny CI runners;
+    /// the correctness checks still run everywhere.
+    #[test]
+    fn test_bg_compact_pool_parallelism() {
+        use std::time::{Duration, Instant};
+        distance::init();
+        const K: usize = 3;
+        const T: usize = 1500;
+        let dim = 48u32;
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+
+        // Build a store with `n` indexes (idx0..idxn), each holding T vectors.
+        let build_store = |n: usize| -> VectorStore {
+            let mut store = VectorStore::new();
+            for k in 0..n {
+                let name = format!("idx{k}");
+                store
+                    .create_index(make_idx_named(Bytes::from(name.clone()), dim))
+                    .unwrap();
+                for i in 0..T {
+                    let key = format!("idx{k}:{i}");
+                    let hash = xxhash_rust::xxh64::xxh64(key.as_bytes(), 0);
+                    store
+                        .insert_vector(
+                            name.as_bytes(),
+                            &random_vec(dim as usize, (k * T + i) as u64),
+                            hash,
+                            Bytes::from(key),
+                        )
+                        .unwrap();
+                }
+            }
+            store
+        };
+
+        // Drive begin+poll until every index has an immutable segment.
+        let run_until_all_compacted =
+            |store: &mut VectorStore, compactor: &BackgroundCompactor, n: usize| -> Duration {
+                let t0 = Instant::now();
+                loop {
+                    store.begin_background_compactions(compactor);
+                    store.poll_install_compactions();
+                    let done = (0..n).all(|k| {
+                        store
+                            .get_index(format!("idx{k}").as_bytes())
+                            .map(|idx| !idx.segments.load().immutable.is_empty())
+                            .unwrap_or(false)
+                    });
+                    if done {
+                        return t0.elapsed();
+                    }
+                    assert!(t0.elapsed().as_secs() < 30, "compaction timed out");
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+            };
+
+        // Calibrate: time ONE build on a 1-worker pool.
+        let mut s1 = build_store(1);
+        let c1 = BackgroundCompactor::new(1);
+        let single = run_until_all_compacted(&mut s1, &c1, 1);
+
+        // Time K builds on a K-worker pool.
+        let mut sk = build_store(K);
+        let ck = BackgroundCompactor::new(K);
+        let parallel = run_until_all_compacted(&mut sk, &ck, K);
+
+        // Correctness: all K indexes compacted to exactly one immutable segment.
+        for k in 0..K {
+            assert_eq!(
+                sk.get_index(format!("idx{k}").as_bytes())
+                    .unwrap()
+                    .segments
+                    .load()
+                    .immutable
+                    .len(),
+                1,
+                "index idx{k} must have one immutable segment after parallel compaction"
+            );
+        }
+
+        // Concurrency: a serial (1-worker) run would take ≈ K × single. A
+        // K-worker pool should stay well under `K × single × 0.6`. Generous
+        // margin avoids flakiness; only a genuinely non-parallel pool fails.
+        if cores >= K + 1 {
+            assert!(
+                parallel.as_secs_f64() < single.as_secs_f64() * (K as f64) * 0.6,
+                "K-worker pool not parallelizing: single={single:?}, parallel(K={K})={parallel:?}"
+            );
+        }
+    }
+
+    // ── Test 1: basic round-trip ──────────────────────────────────────────────
+
+    /// Background compaction dispatches and installs a segment.
+    /// After install the search uses HNSW (immutable list is non-empty).
+    #[test]
+    fn test_bg_compact_basic_roundtrip() {
+        distance::init();
+        let compactor = BackgroundCompactor::new(1);
+        let mut store = VectorStore::new();
+        store.create_index(make_idx(64)).unwrap();
+
+        // Insert T vectors so the segment is worth compacting.
+        const T: usize = 30;
+        for i in 0..T {
+            let key = format!("doc:{i}");
+            insert(&mut store, key.as_bytes(), random_vec(64, i as u64));
+        }
+
+        let snap_before = store
+            .get_index(b"idx")
+            .unwrap()
+            .segments
+            .load()
+            .immutable
+            .len();
+        assert_eq!(snap_before, 0, "no immutable segments before compact");
+
+        let submitted = store.begin_background_compactions(&compactor);
+        assert_eq!(submitted, 1, "one job submitted");
+
+        let installed = poll_until_installed(&mut store, 200);
+        assert!(installed, "segment must be installed within timeout");
+
+        let snap_after = store
+            .get_index(b"idx")
+            .unwrap()
+            .segments
+            .load()
+            .immutable
+            .len();
+        assert_eq!(snap_after, 1, "one immutable segment after compact");
+    }
+
+    // ── Test 2: tail vectors visible after install ────────────────────────────
+
+    /// Vectors inserted AFTER begin_background_compact() (during the build)
+    /// must appear in search results after install.
+    #[test]
+    fn test_bg_compact_tail_vectors_visible() {
+        distance::init();
+        let compactor = BackgroundCompactor::new(1);
+        let mut store = VectorStore::new();
+        store.create_index(make_idx(64)).unwrap();
+
+        // Insert initial batch.
+        const T: usize = 20;
+        for i in 0..T {
+            let key = format!("doc:{i}");
+            insert(&mut store, key.as_bytes(), random_vec(64, i as u64));
+        }
+
+        // Dispatch compaction.
+        let submitted = store.begin_background_compactions(&compactor);
+        assert_eq!(submitted, 1);
+
+        // Insert tail vectors AFTER dispatch.
+        let tail_hash = xxhash_rust::xxh64::xxh64(b"doc:tail", 0);
+        let tail_vec = random_vec(64, 9999);
+        store
+            .insert_vector(b"idx", &tail_vec, tail_hash, Bytes::from_static(b"doc:tail"))
+            .unwrap();
+
+        let installed = poll_until_installed(&mut store, 200);
+        assert!(installed, "must install");
+
+        // The tail entry must be in the mutable segment of the new list.
+        let snap = store.get_index(b"idx").unwrap().segments.load();
+        let mutable_len = snap.mutable.len();
+        assert_eq!(mutable_len, 1, "tail segment has exactly 1 entry");
+
+        // Search for the tail vector — it must be findable.
+        let results = search_key_hashes(&mut store, &tail_vec, 5);
+        assert!(
+            results.contains(&tail_hash),
+            "tail vector must appear in search results"
+        );
+    }
+
+    // ── Test 3: delete-before-install reconciliation (RED before reconciliation) ──
+
+    /// A vector deleted AFTER begin_background_compact() but BEFORE install
+    /// must NOT appear in search results after install.
+    ///
+    /// Without reconciliation this is RED: the deleted key resurrects because
+    /// the frozen snapshot captured it as live.
+    #[test]
+    fn test_bg_compact_delete_before_install_reconciled() {
+        distance::init();
+        let compactor = BackgroundCompactor::new(1);
+        let mut store = VectorStore::new();
+        store.create_index(make_idx(64)).unwrap();
+
+        const T: usize = 25;
+        for i in 0..T {
+            let key = format!("doc:{i}");
+            insert(&mut store, key.as_bytes(), random_vec(64, i as u64));
+        }
+
+        // Dispatch compaction — freezes the segment.
+        assert_eq!(store.begin_background_compactions(&compactor), 1);
+
+        // Delete doc:0 AFTER dispatch (post-freeze window delete).
+        store.mark_deleted_for_key(b"doc:0");
+        let deleted_hash = xxhash_rust::xxh64::xxh64(b"doc:0", 0);
+
+        let installed = poll_until_installed(&mut store, 200);
+        assert!(installed, "must install");
+
+        // doc:0 must NOT appear in search results (reconciled during install).
+        let query = random_vec(64, 0); // same seed as doc:0 → near-neighbor
+        let results = search_key_hashes(&mut store, &query, T);
+        assert!(
+            !results.contains(&deleted_hash),
+            "deleted key must be absent from results after reconciled install"
+        );
+    }
+
+    // ── Test 4: overwrite-before-install reconciliation (RED before reconciliation) ─
+
+    /// A key overwritten (delete + re-insert) AFTER begin_background_compact()
+    /// must appear exactly ONCE in results after install, with the new version.
+    ///
+    /// Without reconciliation this is RED: the old frozen version resurfaces.
+    #[test]
+    fn test_bg_compact_overwrite_before_install_no_duplicate() {
+        distance::init();
+        let compactor = BackgroundCompactor::new(1);
+        let mut store = VectorStore::new();
+        store.create_index(make_idx(64)).unwrap();
+
+        const T: usize = 20;
+        for i in 0..T {
+            let key = format!("doc:{i}");
+            insert(&mut store, key.as_bytes(), random_vec(64, i as u64));
+        }
+
+        // Dispatch compaction.
+        assert_eq!(store.begin_background_compactions(&compactor), 1);
+
+        // Overwrite doc:5: delete the old version, insert a new one.
+        store.mark_deleted_for_key(b"doc:5");
+        let overwrite_hash = xxhash_rust::xxh64::xxh64(b"doc:5", 0);
+        let new_vec = random_vec(64, 555); // different vector
+        store
+            .insert_vector(
+                b"idx",
+                &new_vec,
+                overwrite_hash,
+                Bytes::from_static(b"doc:5"),
+            )
+            .unwrap();
+
+        let installed = poll_until_installed(&mut store, 200);
+        assert!(installed, "must install");
+
+        // Search: doc:5's hash must appear AT MOST ONCE (no duplicate from frozen snapshot).
+        let query = random_vec(64, 5); // near doc:5 old version
+        let results = search_key_hashes(&mut store, &query, T + 5);
+        let count = results.iter().filter(|&&h| h == overwrite_hash).count();
+        assert_eq!(
+            count, 1,
+            "overwritten key must appear exactly once (not 0=data-lost, not 2=duplicate), got {count}"
+        );
+    }
+
+    // ── Test 5: steady-state HDEL tombstones installed immutable ─────────────
+
+    /// mark_deleted_for_key on an already-installed immutable segment must
+    /// tombstone that entry so it no longer appears in search results.
+    #[test]
+    fn test_bg_compact_steady_state_delete_tombstones_immutable() {
+        distance::init();
+        let compactor = BackgroundCompactor::new(1);
+        let mut store = VectorStore::new();
+        store.create_index(make_idx(64)).unwrap();
+
+        const T: usize = 20;
+        for i in 0..T {
+            let key = format!("doc:{i}");
+            insert(&mut store, key.as_bytes(), random_vec(64, i as u64));
+        }
+
+        assert_eq!(store.begin_background_compactions(&compactor), 1);
+        let installed = poll_until_installed(&mut store, 200);
+        assert!(installed, "must install");
+
+        // Verify doc:3 is findable BEFORE deletion.
+        let target_hash = xxhash_rust::xxh64::xxh64(b"doc:3", 0);
+        let query = random_vec(64, 3);
+        let before = search_key_hashes(&mut store, &query, T);
+        assert!(
+            before.contains(&target_hash),
+            "doc:3 must be found before deletion"
+        );
+
+        // Now tombstone it via the steady-state path (Arc'd immutable).
+        store.mark_deleted_for_key(b"doc:3");
+
+        // Search again — doc:3 must be absent.
+        let after = search_key_hashes(&mut store, &query, T);
+        assert!(
+            !after.contains(&target_hash),
+            "doc:3 must be absent after steady-state tombstone"
+        );
+    }
+
+    // ── Test 6: force_compact while in-flight ────────────────────────────────
+
+    /// force_compact_index() called while a background job is in-flight must
+    /// drain and install the in-flight result (or discard it) and NOT produce
+    /// a duplicate compaction of the same data.
+    ///
+    /// Invariant: after force_compact completes, there is at least 1 immutable
+    /// segment and no stale in-flight state.
+    #[test]
+    fn test_bg_compact_force_compact_while_inflight() {
+        distance::init();
+        let compactor = BackgroundCompactor::new(1);
+        let mut store = VectorStore::new();
+        store.create_index(make_idx(64)).unwrap();
+
+        const T: usize = 20;
+        for i in 0..T {
+            let key = format!("doc:{i}");
+            insert(&mut store, key.as_bytes(), random_vec(64, i as u64));
+        }
+
+        // Start background compaction but do NOT poll yet.
+        assert_eq!(store.begin_background_compactions(&compactor), 1);
+
+        // Wait for worker to finish (so result is queued in the channel).
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        // force_compact should drain the in-flight result first (poll it),
+        // then no-op the inline compact (mutable is already empty / tail only).
+        // At minimum it must not panic and the index must have ≥ 1 immutable.
+        store.force_compact_index(b"idx").unwrap();
+
+        // Clean up any remaining inflight (poll once more just in case).
+        store.poll_install_compactions();
+
+        let snap = store.get_index(b"idx").unwrap().segments.load();
+        assert!(
+            !snap.immutable.is_empty(),
+            "at least one immutable segment must exist after force_compact"
+        );
+
+        // No stale in-flight.
+        let idx = store.get_index(b"idx").unwrap();
+        assert!(
+            idx.bg_compact_inflight.is_none(),
+            "no in-flight state after force_compact"
+        );
     }
 }

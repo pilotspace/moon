@@ -375,31 +375,37 @@ impl AutovacuumDaemon {
         }
 
         // ----------------------------------------------------------------
-        // Pass D — Vector compact (P2 hook)
+        // Pass D — Background vector compaction (install + dispatch).
         //
-        // Call `force_compact` on any index whose immutable segment count
-        // exceeds the threshold. P2 will later provide `force_merge_if_needed`
-        // for segment merging; this pass currently triggers compaction of the
-        // mutable→immutable transition.
+        // The mutable→immutable HNSW build runs on a worker thread
+        // (src/vector/background_compact.rs), NEVER on this shard loop. Both
+        // calls below are non-blocking:
+        //   * poll_install: install any segment a worker finished building.
+        //   * begin_*_due:  dispatch a build for any index past its compact
+        //                   threshold and not already in flight.
+        // This is the BACKSTOP for indexes that stopped receiving FT.SEARCH —
+        // the search path drives the same poll/begin via `try_compact`.
         // ----------------------------------------------------------------
+        let bg_installed = vector_store.poll_install_compactions();
+        let bg_dispatched = vector_store
+            .begin_background_compactions_due(crate::vector::background_compact::global());
+        if bg_installed > 0 || bg_dispatched > 0 {
+            stats.segments_compacted += bg_installed as u64;
+            tracing::debug!(
+                bg_installed,
+                bg_dispatched,
+                "autovacuum: pass D (background vector compaction)"
+            );
+        }
+
+        // Immutable segment MERGE remains a separate P2 hook (distinct from the
+        // mutable→immutable compaction handled above).
         let imm_count = vector_store.total_immutable_segment_count();
         if imm_count > max_immutable_segments {
-            // TODO(P2): call vector_store.force_merge_if_needed() when P2 lands
-            // (immutable segment merge). Until then, log the over-threshold condition
-            // so operators can observe backlog via tracing.
-            //
-            // The segment-stall backpressure (MA1) prevents unbounded accumulation:
-            // writes stall when count > max_unflushed_immutable_segments.
             tracing::debug!(
                 imm_count,
                 threshold = max_immutable_segments,
-                "autovacuum: pass D (vector compact) over threshold — P2 merge hook pending"
-            );
-        } else {
-            tracing::debug!(
-                imm_count,
-                threshold = max_immutable_segments,
-                "autovacuum: pass D (vector compact) skipped — within threshold"
+                "autovacuum: pass D — immutable segment merge pending (P2)"
             );
         }
 

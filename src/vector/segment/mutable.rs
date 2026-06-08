@@ -627,6 +627,39 @@ impl MutableSegment {
         count
     }
 
+    /// Visit each entry in `[0..window_len)` calling `f(key_hash, delete_lsn)`.
+    ///
+    /// Used by background-compaction reconciliation to detect post-freeze
+    /// deletions and overwrites in the window without exposing `inner`.
+    pub fn for_each_window_entry<F>(&self, window_len: usize, mut f: F)
+    where
+        F: FnMut(u64, u64),
+    {
+        let inner = self.inner.read();
+        let limit = window_len.min(inner.entries.len());
+        for entry in inner.entries[..limit].iter() {
+            f(entry.key_hash, entry.delete_lsn);
+        }
+    }
+
+    /// Visit each entry in `[frozen_len..end)` calling `f(key_hash)`.
+    ///
+    /// Used by background-compaction reconciliation to detect key-hashes that
+    /// were re-inserted in the tail window after the freeze point.  Combined
+    /// with [`for_each_window_entry`] this lets `snap_and_reconcile` tombstone
+    /// both deleted-then-gone entries *and* overwritten entries (same key_hash
+    /// appears again in the tail) before wrapping the new ImmutableSegment.
+    pub fn for_each_tail_entry<F>(&self, frozen_len: usize, mut f: F)
+    where
+        F: FnMut(u64),
+    {
+        let inner = self.inner.read();
+        let start = frozen_len.min(inner.entries.len());
+        for entry in inner.entries[start..].iter() {
+            f(entry.key_hash);
+        }
+    }
+
     /// Tombstone entries matching `key_hash` whose `insert_lsn > threshold_lsn`.
     ///
     /// Designed for TXN.ABORT: the aborting transaction should only roll back
@@ -717,6 +750,107 @@ impl MutableSegment {
             global_id_base: inner.global_id_base,
             dimension: inner.dimension,
         }
+    }
+
+    /// Copy the tail `[start..len)` of this segment into a fresh `MutableSegment`.
+    ///
+    /// Used by background-compaction install to preserve vectors that arrived
+    /// **while** the worker was building the HNSW graph. The returned segment is
+    /// ready to accept new appends immediately after install.
+    ///
+    /// ## Byte-copy semantics
+    ///
+    /// TQ codes and sub-centroid signs are copied verbatim — no re-encoding.
+    /// In Light mode `raw_f32`, `qjl_signs`, and `residual_norms` are empty and
+    /// are skipped. In Exact mode they are copied slice-by-slice.
+    ///
+    /// Entries whose `delete_lsn != 0` in the window are copied as-is (deleted).
+    /// The brute-force path in the new segment already skips `delete_lsn != 0`
+    /// entries, so they are invisible to search without filtering here.
+    ///
+    /// ## Global IDs
+    ///
+    /// `global_id_base` of the returned segment is set to
+    /// `old_base + start`, preserving the global ID space.
+    pub fn clone_suffix(&self, start: usize) -> Arc<MutableSegment> {
+        let inner = self.inner.read();
+        let n = inner.entries.len();
+        let start = start.min(n); // clamp — never panic on stale index
+        let count = n - start;
+
+        let bpc = inner.bytes_per_code;
+        let sub_bpv = inner.sub_sign_bytes_per_vec;
+        let qjl_bpv = inner.qjl_bytes_per_vec;
+        let dim = inner.dimension as usize;
+
+        // ── TQ codes ────────────────────────────────────────────────────────
+        let tq_start = start * bpc;
+        let tq_codes = inner.tq_codes[tq_start..].to_vec();
+
+        // ── Sub-centroid signs (always present, even if zero-filled) ─────────
+        let sub_start = start * sub_bpv;
+        let sub_centroid_signs = inner.sub_centroid_signs[sub_start..].to_vec();
+
+        // ── Exact-mode optional fields ───────────────────────────────────────
+        let qjl_signs = if inner.qjl_signs.is_empty() {
+            Vec::new()
+        } else {
+            let qs = start * qjl_bpv;
+            inner.qjl_signs[qs..].to_vec()
+        };
+        let residual_norms = if inner.residual_norms.is_empty() {
+            Vec::new()
+        } else {
+            inner.residual_norms[start..].to_vec()
+        };
+        let raw_f32 = if inner.raw_f32.is_empty() {
+            Vec::new()
+        } else {
+            let rs = start * dim;
+            inner.raw_f32[rs..].to_vec()
+        };
+
+        // ── Entries: rebase internal_id and vector_offset to 0-based ─────────
+        let entries: Vec<MutableEntry> = inner.entries[start..]
+            .iter()
+            .enumerate()
+            .map(|(i, e)| MutableEntry {
+                internal_id: i as u32,
+                key_hash: e.key_hash,
+                vector_offset: i as u32,
+                norm: e.norm,
+                insert_lsn: e.insert_lsn,
+                delete_lsn: e.delete_lsn,
+                txn_id: e.txn_id,
+            })
+            .collect();
+
+        let byte_size = count * (bpc + std::mem::size_of::<MutableEntry>())
+            + count * sub_bpv
+            + (if !qjl_signs.is_empty() { count * qjl_bpv } else { 0 })
+            + (if !residual_norms.is_empty() { count * 4 } else { 0 })
+            + (if !raw_f32.is_empty() { count * dim * 4 } else { 0 });
+
+        let new_inner = MutableSegmentInner {
+            tq_codes,
+            qjl_signs,
+            residual_norms,
+            raw_f32,
+            sub_centroid_signs,
+            sub_sign_bytes_per_vec: sub_bpv,
+            entries,
+            global_id_base: inner.global_id_base + start as u32,
+            dimension: inner.dimension,
+            padded_dimension: inner.padded_dimension,
+            bytes_per_code: bpc,
+            qjl_bytes_per_vec: qjl_bpv,
+            byte_size,
+        };
+
+        Arc::new(MutableSegment {
+            inner: parking_lot::RwLock::new(new_inner),
+            collection: self.collection.clone(),
+        })
     }
 
     /// Recompute QJL signs from retained raw f32 vectors.
