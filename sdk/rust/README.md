@@ -14,7 +14,7 @@ Async Rust client for [Moon](https://github.com/pilotspace/moon) — a high-perf
 
 ```toml
 [dependencies]
-moondb = "0.1"
+moondb = "0.2"
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -283,7 +283,7 @@ session.reset("session:user1").await?;
 
 ```toml
 # TLS with rustls
-moondb = { version = "0.1", features = ["tls-rustls"] }
+moondb = { version = "0.2", features = ["tls-rustls"] }
 ```
 
 ## Live Validation

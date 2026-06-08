@@ -25,6 +25,10 @@ fn moon_binary() -> std::path::PathBuf {
 }
 
 fn spawn_moon(extra_args: &[&str], port: u16) -> std::process::Child {
+    // Explicit --dir: the default resolves to the platform user-data
+    // directory, which parallel test servers must not share.
+    let dir = std::env::temp_dir().join(format!("moon-arenas-cap-{port}"));
+    std::fs::create_dir_all(&dir).expect("create test dir");
     let mut cmd = Command::new(moon_binary());
     cmd.args([
         "--port",
@@ -33,6 +37,8 @@ fn spawn_moon(extra_args: &[&str], port: u16) -> std::process::Child {
         "1",
         "--appendonly",
         "no",
+        "--dir",
+        &dir.to_string_lossy(),
     ])
     .args(extra_args)
     .stdout(Stdio::null())

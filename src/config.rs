@@ -159,8 +159,14 @@ pub struct ServerConfig {
     #[arg(long)]
     pub save: Option<String>,
 
-    /// Directory for persistence files
-    #[arg(long, default_value = ".")]
+    /// Directory for persistence files. Empty (the default) auto-resolves
+    /// at startup: the current directory when it already holds moon
+    /// persistence data (pre-v0.2.0 default layout), otherwise the
+    /// platform user-data directory (Linux: `$XDG_DATA_HOME/moon` or
+    /// `~/.local/share/moon`; macOS: `~/Library/Application Support/moon`;
+    /// Windows: `%LOCALAPPDATA%\moon`), created on first run. Pass an
+    /// explicit path (e.g. `--dir .`) to opt out of auto-resolution.
+    #[arg(long, default_value = "")]
     pub dir: String,
 
     /// RDB snapshot filename
@@ -195,8 +201,14 @@ pub struct ServerConfig {
     #[arg(long, default_value_t = 5)]
     pub maxmemory_samples: usize,
 
-    /// Number of shards (0 = auto-detect from CPU count)
-    #[arg(long, default_value_t = 0)]
+    /// Number of shards (0 = auto-detect from CPU count).
+    ///
+    /// Defaults to 1: single-shard gives the best throughput for
+    /// non-pipelined workloads (cross-shard SPSC dispatch dominates local
+    /// lookups otherwise) and a deterministic persistence layout across
+    /// hosts. Pass `--shards 0` to auto-detect from the CPU count, or pin
+    /// an explicit count for pipelined/AOF-heavy multi-core deployments.
+    #[arg(long, default_value_t = 1)]
     pub shards: usize,
 
     /// Initial keyspace size hint (total entries across all shards, 0 = disabled).
@@ -607,7 +619,139 @@ pub struct ServerConfig {
     pub cross_shard_fast_path: CrossShardFastPath,
 }
 
+/// Filesystem markers that identify an existing moon persistence layout.
+/// Used to keep pre-v0.2.0 deployments (default `dir = "."`) pointed at
+/// their data after the default moved to the platform user-data directory.
+const MOON_DATA_MARKERS: [&str; 4] = ["appendonlydir", "shard-0", "dump.rdb", "replication.state"];
+
+/// True when `base` already contains moon persistence data.
+fn dir_has_moon_data(base: &std::path::Path) -> bool {
+    MOON_DATA_MARKERS.iter().any(|m| base.join(m).exists())
+}
+
+/// Platform user-data directory for moon, derived from the given
+/// environment values (parameterized for testability — the runtime
+/// wrapper is [`default_data_dir`]).
+///
+/// Linux/other unix: `$XDG_DATA_HOME/moon`, else `~/.local/share/moon`.
+/// macOS: `~/Library/Application Support/moon`.
+/// Windows: `%LOCALAPPDATA%\moon`.
+fn data_dir_from_env(
+    home: Option<&std::ffi::OsStr>,
+    xdg_data_home: Option<&std::ffi::OsStr>,
+    local_app_data: Option<&std::ffi::OsStr>,
+) -> Option<std::path::PathBuf> {
+    use std::path::Path;
+    fn non_empty(v: Option<&std::ffi::OsStr>) -> Option<&std::ffi::OsStr> {
+        v.filter(|s| !s.is_empty())
+    }
+    if cfg!(target_os = "windows") {
+        non_empty(local_app_data).map(|d| Path::new(d).join("moon"))
+    } else if cfg!(target_os = "macos") {
+        non_empty(home).map(|h| {
+            Path::new(h)
+                .join("Library")
+                .join("Application Support")
+                .join("moon")
+        })
+    } else {
+        // Linux + other unix: XDG, then conventional fallback.
+        if let Some(x) = non_empty(xdg_data_home) {
+            return Some(Path::new(x).join("moon"));
+        }
+        non_empty(home).map(|h| Path::new(h).join(".local").join("share").join("moon"))
+    }
+}
+
+/// Runtime wrapper over [`data_dir_from_env`] reading the real environment.
+fn default_data_dir() -> Option<std::path::PathBuf> {
+    data_dir_from_env(
+        std::env::var_os("HOME").as_deref(),
+        std::env::var_os("XDG_DATA_HOME").as_deref(),
+        std::env::var_os("LOCALAPPDATA").as_deref(),
+    )
+}
+
+/// Outcome of persistence-directory auto-resolution (pure decision —
+/// IO happens in [`ServerConfig::resolve_dir`]).
+#[derive(Debug, PartialEq, Eq)]
+enum DirResolution {
+    /// User passed `--dir` (or conf `dir`) — never touched.
+    Explicit,
+    /// Existing moon data found in the current directory (pre-v0.2.0
+    /// default layout) — keep using it so upgrades don't silently boot
+    /// with an empty keyspace away from their data.
+    LegacyCwd,
+    /// Fresh start — use the platform user-data directory.
+    UserData(std::path::PathBuf),
+    /// No usable user-data directory (no HOME/LOCALAPPDATA) — fall back
+    /// to the current directory.
+    FallbackCwd,
+}
+
+fn decide_dir(
+    dir: &str,
+    cwd_has_data: bool,
+    data_dir: Option<std::path::PathBuf>,
+) -> DirResolution {
+    if !dir.is_empty() {
+        return DirResolution::Explicit;
+    }
+    if cwd_has_data {
+        return DirResolution::LegacyCwd;
+    }
+    match data_dir {
+        Some(d) => DirResolution::UserData(d),
+        None => DirResolution::FallbackCwd,
+    }
+}
+
 impl ServerConfig {
+    /// Resolve the persistence directory when `--dir` was not given.
+    ///
+    /// Must run once at startup (after conf-file merge, before any
+    /// persistence component reads `self.dir`). See `decide_dir` for the
+    /// resolution order. Creation failure of the user-data directory
+    /// degrades to the current directory with a warning rather than
+    /// refusing to start.
+    pub fn resolve_dir(&mut self) {
+        match decide_dir(
+            &self.dir,
+            dir_has_moon_data(std::path::Path::new(".")),
+            default_data_dir(),
+        ) {
+            DirResolution::Explicit => {}
+            DirResolution::LegacyCwd => {
+                tracing::warn!(
+                    "--dir not set and existing moon data found in the current \
+                     directory; continuing to use '.'. Pass --dir explicitly to \
+                     silence this warning."
+                );
+                self.dir = ".".to_owned();
+            }
+            DirResolution::UserData(d) => match std::fs::create_dir_all(&d) {
+                Ok(()) => {
+                    tracing::info!(dir = %d.display(), "--dir not set; using platform user-data directory");
+                    self.dir = d.to_string_lossy().into_owned();
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        dir = %d.display(), error = %e,
+                        "cannot create user-data directory; falling back to current directory"
+                    );
+                    self.dir = ".".to_owned();
+                }
+            },
+            DirResolution::FallbackCwd => {
+                tracing::warn!(
+                    "--dir not set and no HOME/XDG_DATA_HOME/LOCALAPPDATA in the \
+                     environment; falling back to the current directory"
+                );
+                self.dir = ".".to_owned();
+            }
+        }
+    }
+
     /// Returns true when the cross-shard shared-read fast path is enabled.
     ///
     /// Both `Auto` and `On` return `true` — they are identical today.
@@ -1065,6 +1209,16 @@ mod tests {
         assert_eq!(config.bind, "127.0.0.1");
         assert_eq!(config.port, 6379);
         assert_eq!(config.databases, 16);
+        // Single shard by default: best throughput for non-pipelined
+        // workloads and a deterministic persistence layout. `--shards 0`
+        // remains the explicit auto-detect opt-in.
+        assert_eq!(config.shards, 1);
+    }
+
+    #[test]
+    fn test_shards_zero_is_explicit_auto_detect() {
+        let config = ServerConfig::parse_from(["moon", "--shards", "0"]);
+        assert_eq!(config.shards, 0);
     }
 
     #[test]
@@ -1098,9 +1252,107 @@ mod tests {
         assert_eq!(config.appendonly, "yes");
         assert_eq!(config.appendfsync, "everysec");
         assert_eq!(config.save, None);
-        assert_eq!(config.dir, ".");
+        assert_eq!(config.dir, ""); // empty = auto-resolve (user data dir / legacy cwd)
         assert_eq!(config.dbfilename, "dump.rdb");
         assert_eq!(config.appendfilename, "appendonly.aof");
+    }
+
+    #[test]
+    fn test_dir_explicit_dot_is_preserved() {
+        // `--dir .` is an explicit opt-out of auto-resolution.
+        let mut config = ServerConfig::parse_from(["moon", "--dir", "."]);
+        config.resolve_dir();
+        assert_eq!(config.dir, ".");
+    }
+
+    #[test]
+    fn test_dir_explicit_path_is_preserved() {
+        let mut config = ServerConfig::parse_from(["moon", "--dir", "/var/lib/moon"]);
+        config.resolve_dir();
+        assert_eq!(config.dir, "/var/lib/moon");
+    }
+
+    #[test]
+    fn test_decide_dir_explicit_wins_over_everything() {
+        assert_eq!(
+            decide_dir("/x", true, Some("/y".into())),
+            DirResolution::Explicit
+        );
+    }
+
+    #[test]
+    fn test_decide_dir_legacy_cwd_beats_user_data() {
+        // Pre-v0.2.0 deployments keep their data: cwd markers win.
+        assert_eq!(
+            decide_dir("", true, Some("/y".into())),
+            DirResolution::LegacyCwd
+        );
+    }
+
+    #[test]
+    fn test_decide_dir_user_data_on_fresh_start() {
+        assert_eq!(
+            decide_dir("", false, Some("/y".into())),
+            DirResolution::UserData("/y".into())
+        );
+    }
+
+    #[test]
+    fn test_decide_dir_falls_back_to_cwd_without_env() {
+        assert_eq!(decide_dir("", false, None), DirResolution::FallbackCwd);
+    }
+
+    #[test]
+    fn test_dir_has_moon_data_markers() {
+        let tmp = std::env::temp_dir().join(format!("moon-marker-test-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).expect("create temp base");
+        assert!(!dir_has_moon_data(&tmp), "empty dir must have no markers");
+        std::fs::create_dir_all(tmp.join("appendonlydir")).expect("create marker");
+        assert!(
+            dir_has_moon_data(&tmp),
+            "appendonlydir marker must be detected"
+        );
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    #[test]
+    fn test_data_dir_from_env_platform_layout() {
+        use std::ffi::OsStr;
+        let got = data_dir_from_env(
+            Some(OsStr::new("/home/u")),
+            Some(OsStr::new("/xdg/data")),
+            Some(OsStr::new(r"C:\Users\u\AppData\Local")),
+        )
+        .expect("resolves on every supported platform");
+        if cfg!(target_os = "windows") {
+            assert!(got.ends_with("moon"));
+            assert!(got.starts_with(r"C:\Users\u\AppData\Local"));
+        } else if cfg!(target_os = "macos") {
+            assert_eq!(
+                got,
+                std::path::Path::new("/home/u/Library/Application Support/moon")
+            );
+        } else {
+            assert_eq!(got, std::path::Path::new("/xdg/data/moon"));
+        }
+    }
+
+    #[test]
+    fn test_data_dir_from_env_unix_ignores_empty_xdg() {
+        // Empty XDG_DATA_HOME must fall back to ~/.local/share, never "/moon".
+        use std::ffi::OsStr;
+        let got = data_dir_from_env(Some(OsStr::new("/home/u")), Some(OsStr::new("")), None);
+        if cfg!(all(unix, not(target_os = "macos"))) {
+            assert_eq!(
+                got.expect("home fallback"),
+                std::path::Path::new("/home/u/.local/share/moon")
+            );
+        }
+    }
+
+    #[test]
+    fn test_data_dir_from_env_none_without_env() {
+        assert_eq!(data_dir_from_env(None, None, None), None);
     }
 
     #[test]
@@ -1432,7 +1684,7 @@ mod tests {
     #[test]
     fn test_shards_default() {
         let config = ServerConfig::parse_from::<[&str; 0], &str>([]);
-        assert_eq!(config.shards, 0); // auto-detect
+        assert_eq!(config.shards, 1); // single shard; `--shards 0` opts into auto-detect
     }
 
     #[test]

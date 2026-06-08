@@ -43,6 +43,15 @@ tcp-keepalive 300
 
 # Data directory for persistence files (AOF, RDB, WAL).
 # Create this directory before starting the server.
+#
+# When `dir` is not set anywhere (no conf entry, no --dir flag), moon
+# auto-resolves to the platform user-data directory and creates it:
+#   Linux:   $XDG_DATA_HOME/moon  (or ~/.local/share/moon)
+#   macOS:   ~/Library/Application Support/moon
+#   Windows: %LOCALAPPDATA%\moon
+# If the startup directory already contains moon data from a pre-v0.2.0
+# deployment (default was the current directory), that data keeps being
+# used, with a startup warning.
 dir /var/lib/moon
 
 # Require clients to authenticate with a password.
@@ -55,9 +64,12 @@ dir /var/lib/moon
 # Number of logical databases (0–N-1).
 databases 16
 
-# Number of shards (0 = auto-detect from CPU count at runtime).
-# Leave commented for auto-detection; set explicitly for reproducible deployments.
-# shards 4
+# Number of shards. Default 1: best throughput for non-pipelined workloads
+# and a deterministic persistence layout (the on-disk AOF layout is keyed by
+# shard count — see docs/runbooks/shard-count-change.md before changing this
+# on an existing data directory). Set 0 to auto-detect from the CPU count;
+# pin an explicit value for reproducible multi-core deployments.
+# shards 1
 
 ################################################################################
 # PERSISTENCE

@@ -4,11 +4,84 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed — Rust SDK released as moondb 0.2.0 on crates.io
+
+- **`moondb` crate `0.1.1` → `0.2.0`** — publishes the v0.2-era client API
+  that has lived in-tree since the `hybrid_search` sparse upgrade
+  (`f4fcd5a`). Breaking: `text().hybrid_search()` now takes
+  `sparse_field: Option<&str>` and `weights: [f64; 3]` (was two-way
+  `[f64; 2]`) and speaks the PARAMS-based wire format with `@`-prefixed
+  field refs. Added: `Client::connect_with_timeout` for bulk-write
+  workloads. Released as 0.2.0 — not 0.1.2 — because cargo treats 0.1.x
+  versions as compatible, and the signature change would break published
+  0.1.x consumers (lunaris-retrieve / lunaris-storage-moon 0.2.1 pin
+  `"0.1.1"` with the two-way call). Aligns the SDK version with the Moon
+  v0.2.0 server release.
+
 ## [0.2.0] — 2026-06-06
 
 The v0.2 enterprise beachhead. Built additively on per-shard WAL v3 + the
 dual-root manifest; no changes to the KV hot path, MVCC, page format, or
 transaction layer.
+
+### Changed — default persistence directory is the platform user-data dir (was: current directory)
+
+- **`--dir` now defaults to the platform user-data directory**, created
+  on first run: Linux `$XDG_DATA_HOME/moon` (or `~/.local/share/moon`),
+  macOS `~/Library/Application Support/moon`, Windows
+  `%LOCALAPPDATA%\moon`. Installed binaries no longer litter whatever
+  directory they happen to be started from.
+- **Back-compat guard:** if the startup directory already contains moon
+  persistence data (`appendonlydir`, `shard-0`, `dump.rdb`,
+  `replication.state` — the pre-v0.2.0 default layout), moon keeps using
+  it and logs a warning, so upgrades never silently boot with an empty
+  keyspace away from their data.
+- Explicit `--dir <path>` / conf `dir` (including `--dir .`) opt out of
+  auto-resolution entirely; environments with no `HOME`/`LOCALAPPDATA`
+  fall back to the current directory with a warning. Docker
+  (`--dir /data`) and the systemd package (`dir /var/lib/moon`) already
+  pass explicit paths and are unaffected.
+
+### Changed — default shard count is now 1 (was: auto-detect)
+
+- **`--shards` defaults to 1** instead of auto-detecting the CPU count.
+  Single-shard gives the best throughput for non-pipelined workloads
+  (cross-shard SPSC dispatch dominates local lookups) and a deterministic
+  persistence layout across hosts. `--shards 0` remains the explicit
+  auto-detect opt-in; nothing changes for deployments that pass `--shards`
+  explicitly.
+- **Upgrade note:** deployments that previously relied on the auto-detect
+  default with `appendonly yes` will refuse to start after upgrading
+  (`ERR shard count changed (manifest=N, config=1)`) — this is the
+  intended data-loss guard. Start with `--shards <N>` matching the
+  manifest, or see the new
+  [shard-count-change runbook](docs/runbooks/shard-count-change.md)
+  (also linked from the error message itself, now as a full GitHub URL so
+  installed binaries point somewhere reachable).
+
+### Fixed — release pipeline verification + prerelease safety
+
+- `release.yml` sign job now publishes Fulcio certificates (`*.crt`)
+  alongside signatures: keyless `cosign verify-blob` requires the
+  certificate — the previous `.sig`-only output was unverifiable by
+  users.
+- Docker job no longer moves `ghcr.io/pilotspace/moon:latest` on
+  prerelease tags (e.g. `v0.2.0-rc.1`); only stable releases repoint
+  `:latest`. The versioned tag is always pushed.
+
+### Changed — v0.2.0 release prep
+
+- Crate version bumped 0.1.12 → 0.2.0; `INFO server` `moon_version` now
+  reports 0.2.0 (previously released binaries would have self-reported
+  the stale crate version regardless of the git tag).
+- `release.yml`: the `homebrew-tap` bump job is gated behind the
+  `HOMEBREW_TAP_ENABLED` repository variable. Homebrew distribution is
+  deferred — v0.2.0 ships via curl `install.sh`/`install.ps1`, .deb/.rpm,
+  and Docker. Without the gate the job would hard-fail on every stable
+  tag (missing `HOMEBREW_TAP_TOKEN` secret). `packaging/bump-homebrew.sh`
+  and the formula template stay in-tree for later enablement.
 
 ### Added — Temporal-decay traversal scoring (agent-memory recency)
 

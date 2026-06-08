@@ -88,6 +88,10 @@ pub async fn run_embedded(
     mut config: ServerConfig,
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
+    // Resolve empty --dir to the platform user-data directory (or legacy
+    // cwd data) before validating it — matches the binary entry in main.rs.
+    config.resolve_dir();
+
     // Validate / create persistence directory up front.
     std::fs::create_dir_all(&config.dir).with_context(|| {
         format!(

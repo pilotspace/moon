@@ -7,7 +7,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/pilotspace/moon/releases/tag/v0.2.0"><img src="https://img.shields.io/badge/version-v0.2.0-blue" alt="Version"></a>
+  <a href="https://github.com/pilotspace/moon/releases/latest"><img src="https://img.shields.io/github/v/release/pilotspace/moon?label=version&color=blue" alt="Version"></a>
   <a href="https://crates.io/crates/moondb"><img src="https://img.shields.io/crates/v/moondb?label=moondb" alt="Rust SDK"></a>
   <a href="https://pypi.org/project/moondb/"><img src="https://img.shields.io/pypi/v/moondb?label=moondb" alt="Python SDK"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="License"></a>
@@ -69,23 +69,45 @@ available for portability. **macOS** is a first-class development platform
 
 ## Install
 
-Moon ships signed packages and a one-line installer for Linux and macOS.
+Moon ships signed, checksummed packages for Linux, macOS, and Windows. All artifacts are listed on the [latest release page](https://github.com/pilotspace/moon/releases/latest).
+
+**Linux / macOS — one-liner** (detects OS/arch, verifies SHA256 against the signed `SHA256SUMS.txt`, installs to `~/.local/bin`; Linux x86_64 gets the io_uring `monoio` build, aarch64/macOS get `tokio`):
 
 ```bash
-# One-liner (Linux + macOS, installs the latest release to ~/.local/bin)
 curl -fsSL https://raw.githubusercontent.com/pilotspace/moon/main/install.sh | sh
-
-# Pin a version / install dir
-VERSION=v0.2.0 INSTALL_DIR=/usr/local/bin sh install.sh
+# pin: VERSION=v0.2.0 INSTALL_DIR=/usr/local/bin sh install.sh
 ```
 
-Other channels:
+**Windows — PowerShell** (installs `moon.exe` and adds it to PATH; not yet Authenticode-signed, so SmartScreen may prompt "Run anyway"):
 
-- **Debian/RPM** — `.deb` and `.rpm` (amd64 + arm64) on the [releases page](https://github.com/pilotspace/moon/releases/latest), each with cosign `.sig`/`.crt` and an SBOM.
-- **Tarballs** — `moon-vX.Y.Z-<arch>-linux-{musl,tokio}.tar.gz` for static (musl) and tokio-runtime builds.
-- **Docker** — see [Quick start → Docker](#docker).
-- **Cargo** — add the [`moondb`](https://crates.io/crates/moondb) Rust client library to your project (`moondb = "0.1"`); build the server itself from source (below).
-- **Homebrew** — a tap is planned for v0.2.x (formula template in [`packaging/homebrew/`](packaging/homebrew/)).
+```powershell
+irm https://raw.githubusercontent.com/pilotspace/moon/main/install.ps1 | iex
+```
+
+**Debian / RHEL** — `.deb` and `.rpm` (amd64 + arm64) ship a systemd unit and `/etc/moon/moon.conf`:
+
+```bash
+sudo dpkg -i moon_<version>_arm64.deb     # or: sudo rpm -i moon-<version>-1.arm64.rpm
+sudo systemctl enable --now moon
+```
+
+**Docker:**
+
+```bash
+docker run -p 6379:6379 ghcr.io/pilotspace/moon:latest
+```
+
+**Cargo** — add the [`moondb`](https://crates.io/crates/moondb) Rust client library to your project (`moondb = "0.2"`); build the server itself [from source](#quick-start).
+**Homebrew** — a tap is planned for v0.2.x (formula template in [`packaging/homebrew/`](packaging/homebrew/)).
+
+**Verify downloads** — every artifact is checksummed in `SHA256SUMS.txt` and signed with keyless [cosign](https://docs.sigstore.dev/) (`.sig` + Fulcio `.crt`):
+
+```bash
+cosign verify-blob SHA256SUMS.txt \
+  --signature SHA256SUMS.txt.sig --certificate SHA256SUMS.txt.crt \
+  --certificate-identity-regexp 'github.com/pilotspace/moon' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
 
 ## Quick start
 
@@ -96,10 +118,12 @@ git clone https://github.com/pilotspace/moon.git
 cd moon
 cargo build --release          # needs Rust stable (edition 2024) + cmake (for TLS)
 
-# Defaults: bind 127.0.0.1:6379, shard count = CPU count
+# Defaults: bind 127.0.0.1:6379, single shard (best non-pipelined throughput)
 ./target/release/moon
 
-# Production flags
+# Production flags (--shards 0 = auto-detect from CPU count; changing the
+# count on an existing AOF dir needs a migration — see
+# docs/runbooks/shard-count-change.md)
 ./target/release/moon \
   --port 6379 --shards 8 \
   --appendonly yes --appendfsync everysec \
