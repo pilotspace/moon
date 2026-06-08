@@ -667,6 +667,22 @@ impl ImmutableSegment {
 
     // ── Merge-support accessors (P2) ─────────────────────────────────────────
 
+    /// Clone the set of key_hashes tombstoned via steady-state interior deletion.
+    ///
+    /// Used by `poll_install_merge` to reapply deletes that arrived *during*
+    /// the background merge window: `merge_immutable` read the source Arc's
+    /// mvcc headers at worker-thread time, but `mark_deleted_by_key_hash` calls
+    /// that arrived between snapshot and install only wrote into this interior
+    /// set (they cannot touch `mvcc` while the segment is Arc'd).  Applying
+    /// these hashes to the merged output via
+    /// `mark_deleted_by_key_hash_install` closes the resurrection window.
+    ///
+    /// Acquires the interior `tombstoned_keys` read-lock briefly; returns a
+    /// cloned `Vec` so the lock is released before caller does any work.
+    pub fn tombstoned_key_hashes(&self) -> Vec<u64> {
+        self.tombstoned_keys.read().iter().copied().collect()
+    }
+
     /// Total QJL bytes across all entries. 0 if QJL not encoded for this segment.
     #[inline]
     pub fn qjl_bytes(&self) -> usize {

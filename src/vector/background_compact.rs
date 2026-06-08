@@ -9,30 +9,56 @@
 //! - The shard thread polls [`BackgroundCompactor::try_recv`] on subsequent ticks
 //!   without blocking. When a reply arrives it installs the segment.
 //! - Worker threads exit when the compactor is dropped (channel disconnects).
+//! - [`BackgroundCompactor::submit_merge`] works identically but the worker calls
+//!   [`compaction::merge_immutable`] instead of `compact`. Both return the same
+//!   `CompactionResult` type over the same reply channel type.
 //!
 //! ## Thread Safety
 //!
 //! `FrozenSegment` and `CollectionMetadata` are `Send + Sync` (verified: no Rc,
 //! no raw pointers beyond AlignedBuffer which has `unsafe impl Send/Sync`).
 //! `ImmutableSegment` is `Send` for the same reason.
+//! `Arc<ImmutableSegment>` is `Send + Sync` — the worker only reads the source
+//! segments (graph and TQ codes); it never writes to their interior state.
 
 use std::sync::{Arc, OnceLock};
 
-use crate::vector::segment::compaction::{self, CompactionError};
+use crate::vector::segment::compaction::{self, CompactionError, MergeMode};
 use crate::vector::segment::immutable::ImmutableSegment;
 use crate::vector::segment::mutable::FrozenSegment;
 use crate::vector::turbo_quant::collection::CollectionMetadata;
 
+/// The operation a worker should perform.
+///
+/// Both variants produce the same `CompactionResult` so a single worker loop
+/// handles both without special-casing the reply path.
+enum BuildOp {
+    /// Mutable-to-immutable: build HNSW graph from a frozen mutable snapshot.
+    Compact {
+        frozen: FrozenSegment,
+        collection: Arc<CollectionMetadata>,
+        seed: u64,
+    },
+    /// Many-immutables-to-one: merge N Arc'd immutable segments into one.
+    ///
+    /// The worker only reads the source segments (graph + TQ codes). No lock is
+    /// held on the source Arcs during the build — graph search on the source
+    /// segments is fine to run concurrently.
+    Merge {
+        segments: Vec<Arc<ImmutableSegment>>,
+        collection: Arc<CollectionMetadata>,
+        seed: u64,
+        mode: MergeMode,
+        recall_tolerance: f32,
+    },
+}
+
 /// Payload sent from the shard thread to a worker.
-pub struct CompactionJob {
-    /// Frozen snapshot of the mutable segment at the moment compaction began.
-    pub frozen: FrozenSegment,
-    /// Collection metadata (Arc — cheap to clone, immutable after creation).
-    pub collection: Arc<CollectionMetadata>,
-    /// Deterministic seed for graph construction.
-    pub seed: u64,
+struct WorkerJob {
+    /// The operation to perform.
+    op: BuildOp,
     /// One-shot reply channel. Worker sends exactly one message then drops it.
-    pub reply_tx: flume::Sender<CompactionResult>,
+    reply_tx: flume::Sender<CompactionResult>,
 }
 
 /// Result sent back to the shard thread.
@@ -48,8 +74,8 @@ pub type CompactionResult = Result<ImmutableSegment, CompactionError>;
 /// Workers are started **lazily on first submit** to match the codebase's
 /// lazy-init policy (see CLAUDE.md — "Lazy Lua/backlog init").
 pub struct BackgroundCompactor {
-    /// Submission channel — workers receive `CompactionJob`s from here.
-    job_tx: flume::Sender<CompactionJob>,
+    /// Submission channel — workers receive `WorkerJob`s from here.
+    job_tx: flume::Sender<WorkerJob>,
     /// Worker thread join handles.
     _workers: Vec<std::thread::JoinHandle<()>>,
 }
@@ -61,7 +87,7 @@ impl BackgroundCompactor {
     /// when this `BackgroundCompactor` is dropped).
     pub fn new(num_workers: usize) -> Self {
         assert!(num_workers >= 1, "at least one worker required");
-        let (job_tx, job_rx) = flume::bounded::<CompactionJob>(num_workers * 2);
+        let (job_tx, job_rx) = flume::bounded::<WorkerJob>(num_workers * 2);
         let workers: Vec<_> = (0..num_workers)
             .map(|i| {
                 let rx = job_rx.clone();
@@ -69,8 +95,26 @@ impl BackgroundCompactor {
                     .name(format!("moon-vec-compact-{i}"))
                     .spawn(move || {
                         while let Ok(job) = rx.recv() {
-                            let result =
-                                compaction::compact(&job.frozen, &job.collection, job.seed, None);
+                            let result = match job.op {
+                                BuildOp::Compact {
+                                    frozen,
+                                    collection,
+                                    seed,
+                                } => compaction::compact(&frozen, &collection, seed, None),
+                                BuildOp::Merge {
+                                    segments,
+                                    collection,
+                                    seed,
+                                    mode,
+                                    recall_tolerance,
+                                } => compaction::merge_immutable(
+                                    &segments,
+                                    &collection,
+                                    seed,
+                                    mode,
+                                    recall_tolerance,
+                                ),
+                            };
                             // If the receiver was dropped before we finished, swallow the error.
                             let _ = job.reply_tx.send(result);
                         }
@@ -85,7 +129,7 @@ impl BackgroundCompactor {
         }
     }
 
-    /// Submit a compaction job.
+    /// Submit a mutable→immutable compaction job.
     ///
     /// Returns an `Err` only when all workers have exited (compactor shut down).
     /// Returns the `reply_rx` — the caller polls it with [`try_recv`](flume::Receiver::try_recv).
@@ -96,10 +140,41 @@ impl BackgroundCompactor {
         seed: u64,
     ) -> Result<flume::Receiver<CompactionResult>, CompactionSubmitError> {
         let (reply_tx, reply_rx) = flume::bounded::<CompactionResult>(1);
-        let job = CompactionJob {
-            frozen,
-            collection,
-            seed,
+        let job = WorkerJob {
+            op: BuildOp::Compact {
+                frozen,
+                collection,
+                seed,
+            },
+            reply_tx,
+        };
+        self.job_tx
+            .try_send(job)
+            .map_err(|_| CompactionSubmitError::WorkersBusy)?;
+        Ok(reply_rx)
+    }
+
+    /// Submit an immutable→immutable merge job.
+    ///
+    /// The worker reads the source segment Arcs but never mutates them.
+    /// Returns `reply_rx` — caller polls it non-blocking with `try_recv`.
+    pub fn submit_merge(
+        &self,
+        segments: Vec<Arc<ImmutableSegment>>,
+        collection: Arc<CollectionMetadata>,
+        seed: u64,
+        mode: MergeMode,
+        recall_tolerance: f32,
+    ) -> Result<flume::Receiver<CompactionResult>, CompactionSubmitError> {
+        let (reply_tx, reply_rx) = flume::bounded::<CompactionResult>(1);
+        let job = WorkerJob {
+            op: BuildOp::Merge {
+                segments,
+                collection,
+                seed,
+                mode,
+                recall_tolerance,
+            },
             reply_tx,
         };
         self.job_tx
