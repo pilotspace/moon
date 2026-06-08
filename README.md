@@ -98,6 +98,7 @@ docker run -p 6379:6379 ghcr.io/pilotspace/moon:latest
 ```
 
 **Cargo** — add the [`moondb`](https://crates.io/crates/moondb) Rust client library to your project (`moondb = "0.2"`); build the server itself [from source](#quick-start).
+
 **Homebrew** — a tap is planned for v0.2.x (formula template in [`packaging/homebrew/`](packaging/homebrew/)).
 
 **Verify downloads** — every artifact is checksummed in `SHA256SUMS.txt` and signed with keyless [cosign](https://docs.sigstore.dev/) (`.sig` + Fulcio `.crt`):
