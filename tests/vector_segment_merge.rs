@@ -82,6 +82,29 @@ fn make_meta(name: &str, dim: u32) -> IndexMeta {
     }
 }
 
+/// IndexMeta for an SQ8 (scalar-8-bit) Cosine index — exercises the real SQ8
+/// merge wire path (force_compact -> force_merge) through VectorStore.
+fn make_meta_sq8(name: &str, dim: u32) -> IndexMeta {
+    IndexMeta {
+        name: Bytes::from(name.to_owned()),
+        dimension: dim,
+        padded_dimension: padded_dimension(dim),
+        metric: DistanceMetric::Cosine,
+        hnsw_m: 16,
+        hnsw_ef_construction: 200,
+        hnsw_ef_runtime: 0,
+        compact_threshold: 0,
+        source_field: Bytes::from_static(b"vec"),
+        key_prefixes: vec![Bytes::from_static(b"doc:")],
+        quantization: QuantizationConfig::Sq8,
+        build_mode: BuildMode::Light,
+        vector_fields: Vec::new(),
+        schema_fields: Vec::new(),
+        merge_mode: MergeMode::GraphUnion,
+        keep_raw: false,
+    }
+}
+
 /// Compute recall@k: fraction of ground-truth neighbors found by approximate search.
 fn recall_at_k(ground_truth: &[usize], approx: &[u32], k: usize) -> f32 {
     let gt_set: std::collections::HashSet<usize> = ground_truth.iter().take(k).copied().collect();
@@ -187,6 +210,104 @@ fn test_graph_union_merge_reduces_segment_count() {
     assert!(
         mean_recall >= RECALL_FLOOR,
         "Post-merge recall {mean_recall:.3} < floor {RECALL_FLOOR}"
+    );
+}
+
+// ── Test 1b: SQ8 graph-union merge preserves recall (real wire path) ──
+
+/// SQ8 analogue of test 1: build N_SEGS SQ8 immutable segments via the real
+/// VectorStore path (insert -> force_compact), fan-out search as the oracle,
+/// force_merge to a single graph, and assert post-merge recall is preserved.
+///
+/// Preservation methodology (post-vs-pre, not vs-exact-f32) isolates merge
+/// quality from quantization loss, so a correct SQ8 merge scores ≥ floor even
+/// though absolute recall on random vectors is lower. Before the SQ8 merge
+/// branches this RED'd: the stride mismatch (padded+4 vs dim+8) corrupted the
+/// merged graph (panic / EmptySegment / collapsed recall).
+#[test]
+fn test_sq8_graph_union_merge_preserves_recall() {
+    distance::init();
+
+    const DIM: u32 = 96;
+    const VECS_PER_SEG: usize = 80;
+    const N_SEGS: usize = 4;
+    const RECALL_FLOOR: f32 = 0.90;
+    const K: usize = 10;
+
+    let mut store = VectorStore::new();
+    let meta = make_meta_sq8("idx", DIM);
+    store.create_index(meta).expect("create_index failed");
+
+    let mut rng = Rng::new(0xDEAD_BEEF);
+    let mut all_vecs: Vec<Vec<f32>> = Vec::new();
+
+    for seg in 0..N_SEGS {
+        for _ in 0..VECS_PER_SEG {
+            let v = random_unit_vec(&mut rng, DIM as usize);
+            let key = Bytes::from(format!("doc:{}", all_vecs.len()));
+            let key_hash = xxhash_rust::xxh64::xxh64(&key, 0);
+            store
+                .insert_vector(b"idx", &v, key_hash, key)
+                .expect("insert failed");
+            all_vecs.push(v);
+        }
+        store
+            .force_compact_index(b"idx")
+            .expect("force_compact failed");
+        let _ = seg;
+    }
+
+    let imm_count_pre = store
+        .immutable_segment_count(b"idx")
+        .expect("index not found");
+    assert_eq!(
+        imm_count_pre, N_SEGS,
+        "Expected {N_SEGS} SQ8 immutable segments before merge, got {imm_count_pre}"
+    );
+
+    const N_QUERIES: usize = 50;
+    let queries: Vec<Vec<f32>> = (0..N_QUERIES)
+        .map(|i| random_unit_vec(&mut Rng::new(0xC0DE + i as u64), DIM as usize))
+        .collect();
+
+    let pre_results: Vec<Vec<u32>> = queries
+        .iter()
+        .map(|q| {
+            store
+                .search_index(b"idx", q, K, 200)
+                .expect("pre-merge search failed")
+        })
+        .collect();
+
+    let stats = store.force_merge_index(b"idx").expect("force_merge failed");
+    assert_eq!(
+        stats.segments_merged, N_SEGS,
+        "Expected {N_SEGS} SQ8 segments merged"
+    );
+
+    let imm_count_post = store
+        .immutable_segment_count(b"idx")
+        .expect("index not found");
+    assert_eq!(
+        imm_count_post, 1,
+        "Expected 1 SQ8 immutable segment after merge"
+    );
+
+    let mut total_recall = 0.0f32;
+    for (query, pre) in queries.iter().zip(pre_results.iter()) {
+        let post = store
+            .search_index(b"idx", query, K, 200)
+            .expect("post-merge search failed");
+        total_recall += recall_at_k(
+            &pre.iter().map(|&x| x as usize).collect::<Vec<_>>(),
+            &post,
+            K,
+        );
+    }
+    let mean_recall = total_recall / N_QUERIES as f32;
+    assert!(
+        mean_recall >= RECALL_FLOOR,
+        "SQ8 post-merge recall {mean_recall:.3} < floor {RECALL_FLOOR}"
     );
 }
 
