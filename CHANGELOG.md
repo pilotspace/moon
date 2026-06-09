@@ -25,6 +25,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   non-normalized inputs by magnitude. SQ8 now normalizes for both unit-sphere
   metrics (Cosine + InnerProduct), matching the rest of the engine; `L2` keeps
   raw vectors for true Euclidean ranking.
+- **Docs:** corrected the ≤384d quantization guidance to recommend **SQ8**
+  (the real 8-bit option) instead of the nonexistent "TQ8".
 
 ### Changed — Rust SDK released as moondb 0.2.0 on crates.io
 
