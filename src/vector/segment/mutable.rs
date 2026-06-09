@@ -827,9 +827,21 @@ impl MutableSegment {
 
         let byte_size = count * (bpc + std::mem::size_of::<MutableEntry>())
             + count * sub_bpv
-            + (if !qjl_signs.is_empty() { count * qjl_bpv } else { 0 })
-            + (if !residual_norms.is_empty() { count * 4 } else { 0 })
-            + (if !raw_f32.is_empty() { count * dim * 4 } else { 0 });
+            + (if !qjl_signs.is_empty() {
+                count * qjl_bpv
+            } else {
+                0
+            })
+            + (if !residual_norms.is_empty() {
+                count * 4
+            } else {
+                0
+            })
+            + (if !raw_f32.is_empty() {
+                count * dim * 4
+            } else {
+                0
+            });
 
         let new_inner = MutableSegmentInner {
             tq_codes,

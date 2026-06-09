@@ -7,8 +7,8 @@
 //! and skips the lock entirely when no keys have been tombstoned.
 
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use roaring::RoaringBitmap;

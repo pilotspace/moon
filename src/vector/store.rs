@@ -378,11 +378,7 @@ impl VectorIndex {
             // Block until the worker finishes.
             if let Ok(Ok(mut immutable)) = inflight.reply_rx.recv() {
                 // Reconcile window deletes (same logic as poll_install_compaction).
-                snap_and_reconcile(
-                    &self.segments,
-                    inflight.frozen_len,
-                    &mut immutable,
-                );
+                snap_and_reconcile(&self.segments, inflight.frozen_len, &mut immutable);
                 let snap = self.segments.load();
                 let tail_mutable = snap.mutable.clone_suffix(inflight.frozen_len);
                 let num_nodes = immutable.graph().num_nodes();
@@ -403,12 +399,7 @@ impl VectorIndex {
                 // Compact additional fields inline (no in-flight for those).
                 for (_, fs) in &mut self.field_segments {
                     let dim = fs.collection.dimension;
-                    Self::compact_segments(
-                        &mut fs.segments,
-                        &mut fs.scratch,
-                        &fs.collection,
-                        dim,
-                    );
+                    Self::compact_segments(&mut fs.segments, &mut fs.scratch, &fs.collection, dim);
                 }
                 return;
             }
@@ -825,11 +816,10 @@ impl VectorIndex {
         let current_imm = &snap.immutable;
 
         // Check that every merged source is still present (ptr_eq identity).
-        let all_present = inflight.merged_sources.iter().all(|src| {
-            current_imm
-                .iter()
-                .any(|cur| Arc::ptr_eq(cur, src))
-        });
+        let all_present = inflight
+            .merged_sources
+            .iter()
+            .all(|src| current_imm.iter().any(|cur| Arc::ptr_eq(cur, src)));
         if !all_present {
             // A warm-tier transition removed one or more source segments while
             // we were building.  Abort — the data is safe in the warm tier.
@@ -1848,14 +1838,19 @@ impl VectorStore {
                 }
                 let snap = idx.segments.load();
                 let merged_arc = Arc::new(merged);
-                let mut new_immutable: Vec<Arc<crate::vector::segment::immutable::ImmutableSegment>> =
-                    snap.immutable
-                        .iter()
-                        .filter(|cur| {
-                            !inflight.merged_sources.iter().any(|src| Arc::ptr_eq(cur, src))
-                        })
-                        .cloned()
-                        .collect();
+                let mut new_immutable: Vec<
+                    Arc<crate::vector::segment::immutable::ImmutableSegment>,
+                > = snap
+                    .immutable
+                    .iter()
+                    .filter(|cur| {
+                        !inflight
+                            .merged_sources
+                            .iter()
+                            .any(|src| Arc::ptr_eq(cur, src))
+                    })
+                    .cloned()
+                    .collect();
                 new_immutable.push(merged_arc.clone());
                 idx.scratch = crate::vector::hnsw::search::SearchScratch::new(
                     merged_arc.graph().num_nodes(),
@@ -2494,7 +2489,9 @@ mod bg_compact_tests {
         let mut state = seed.wrapping_add(1);
         let mut v: Vec<f32> = (0..dim)
             .map(|_| {
-                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 ((state >> 33) as f32) / (u32::MAX as f32) * 2.0 - 1.0
             })
             .collect();
@@ -2707,7 +2704,12 @@ mod bg_compact_tests {
         let tail_hash = xxhash_rust::xxh64::xxh64(b"doc:tail", 0);
         let tail_vec = random_vec(64, 9999);
         store
-            .insert_vector(b"idx", &tail_vec, tail_hash, Bytes::from_static(b"doc:tail"))
+            .insert_vector(
+                b"idx",
+                &tail_vec,
+                tail_hash,
+                Bytes::from_static(b"doc:tail"),
+            )
             .unwrap();
 
         let installed = poll_until_installed(&mut store, 200);
@@ -2934,14 +2936,22 @@ mod bg_compact_tests {
         for seg in 0..M {
             for i in 0..T {
                 let key = format!("seg{seg}_doc{i}");
-                insert(&mut store, key.as_bytes(), random_vec(64, (seg * T + i) as u64));
+                insert(
+                    &mut store,
+                    key.as_bytes(),
+                    random_vec(64, (seg * T + i) as u64),
+                );
             }
             store.force_compact_index(b"idx").unwrap();
         }
 
         {
             let snap = store.get_index(b"idx").unwrap().segments.load();
-            assert_eq!(snap.immutable.len(), M, "expected {M} segments before merge");
+            assert_eq!(
+                snap.immutable.len(),
+                M,
+                "expected {M} segments before merge"
+            );
         }
 
         // Dispatch background merge directly (bypass needs_merge threshold).
@@ -3107,7 +3117,11 @@ mod bg_compact_tests {
         for seg in 0..2usize {
             for i in 0..T {
                 let key = format!("s{seg}_doc{i}");
-                insert(&mut store, key.as_bytes(), random_vec(64, (seg * T + i) as u64));
+                insert(
+                    &mut store,
+                    key.as_bytes(),
+                    random_vec(64, (seg * T + i) as u64),
+                );
             }
             store.force_compact_index(b"idx").unwrap();
         }
@@ -3122,7 +3136,10 @@ mod bg_compact_tests {
         {
             let idx = store.get_index_mut(b"idx").unwrap();
             let compaction_started = idx.begin_background_compact(&compactor);
-            assert!(compaction_started, "compaction must start (mutable is non-empty)");
+            assert!(
+                compaction_started,
+                "compaction must start (mutable is non-empty)"
+            );
             let merge_started = idx.begin_background_merge(&compactor);
             assert!(
                 !merge_started,
@@ -3237,12 +3254,15 @@ mod bg_compact_tests {
                 })
                 .collect();
             dists.sort_unstable();
-            let gt: std::collections::HashSet<u64> =
-                dists[..K.min(dists.len())].iter().map(|(_, kh)| *kh).collect();
+            let gt: std::collections::HashSet<u64> = dists[..K.min(dists.len())]
+                .iter()
+                .map(|(_, kh)| *kh)
+                .collect();
 
             // Merged-segment search results.
-            let found: std::collections::HashSet<u64> =
-                search_key_hashes(&mut store, &query, K).into_iter().collect();
+            let found: std::collections::HashSet<u64> = search_key_hashes(&mut store, &query, K)
+                .into_iter()
+                .collect();
 
             let overlap = gt.intersection(&found).count();
             total_recall += overlap as f32 / K as f32;

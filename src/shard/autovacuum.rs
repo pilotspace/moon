@@ -393,8 +393,8 @@ impl AutovacuumDaemon {
         let merge_installed = vector_store.poll_install_merges();
         let bg_dispatched = vector_store
             .begin_background_compactions_due(crate::vector::background_compact::global());
-        let merge_dispatched = vector_store
-            .begin_background_merges_due(crate::vector::background_compact::global());
+        let merge_dispatched =
+            vector_store.begin_background_merges_due(crate::vector::background_compact::global());
         if bg_installed > 0 || bg_dispatched > 0 || merge_installed > 0 || merge_dispatched > 0 {
             stats.segments_compacted += bg_installed as u64;
             tracing::debug!(
