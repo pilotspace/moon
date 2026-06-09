@@ -19,7 +19,8 @@ use crate::vector::aligned_buffer::AlignedBuffer;
 use crate::vector::hnsw::build::HnswBuilder;
 use crate::vector::hnsw::search_sq::hnsw_search_f32;
 use crate::vector::persistence::segment_io;
-use crate::vector::turbo_quant::collection::CollectionMetadata;
+use crate::vector::turbo_quant::collection::{CollectionMetadata, QuantizationConfig};
+use crate::vector::turbo_quant::sq8::{decode_sq8, sq8_params};
 
 #[allow(dead_code)]
 const RECALL_SAMPLE_SIZE: usize = 1000;
@@ -533,12 +534,16 @@ pub fn compact(
     } else {
         None
     };
-    let codebook_opt: Option<&[f32; 16]> = if !is_a2 {
+    // SQ8 has no shared codebook; leave it None so the scalar-TQ decode/sub-sign
+    // branches skip (the dedicated SQ8 branch handles decoding) and codebook_16()
+    // never logs a spurious "empty codebook" error for SQ8.
+    let is_sq8 = collection.quantization == QuantizationConfig::Sq8;
+    let codebook_opt: Option<&[f32; 16]> = if !is_a2 && !is_sq8 {
         Some(collection.codebook_16())
     } else {
         None
     };
-    let _codebook_for_adc: &[f32; 16] = if !is_a2 {
+    let _codebook_for_adc: &[f32; 16] = if !is_a2 && !is_sq8 {
         collection.codebook_16()
     } else {
         &[0.0; 16]
@@ -563,7 +568,18 @@ pub fn compact(
     // Also decode TQ → centroid for sub-centroid sign computation (needed later).
     let all_rotated: Vec<Vec<f32>> = if need_cpu_build {
         let mut rotated: Vec<Vec<f32>> = Vec::with_capacity(n);
-        if is_a2 {
+        if is_sq8 {
+            // SQ8: decode `dim` u8 codes via per-vector (min, scale) into an f32
+            // vector. The HNSW builder then uses symmetric L2 over these decoded
+            // vectors (no FWHT, no centroids) — the same approach the scalar-TQ
+            // path uses, just with affine decode instead of codebook lookup.
+            for i in 0..n {
+                let offset = i * bytes_per_code;
+                let slot = &tq_buffer_orig[offset..offset + bytes_per_code];
+                let (min, scale) = sq8_params(slot, dim);
+                rotated.push(decode_sq8(&slot[..dim], min, scale));
+            }
+        } else if is_a2 {
             // A2: each nibble is a pair index; decode via A2Codebook
             // is_a2 branch guarantees a2_cb is Some
             let cb = match a2_cb.as_ref() {
@@ -1578,6 +1594,77 @@ mod tests {
         let results = imm.search(&query, 5, 64, &mut scratch);
         assert!(!results.is_empty());
         assert!(results.len() <= 5);
+    }
+
+    #[test]
+    fn test_sq8_compact_and_immutable_search_recall() {
+        distance::init();
+        let dim = 96usize;
+        let n = 200usize;
+        let collection = Arc::new(CollectionMetadata::new(
+            1,
+            dim as u32,
+            DistanceMetric::Cosine,
+            QuantizationConfig::Sq8,
+            42,
+        ));
+        let seg = MutableSegment::new(dim as u32, collection.clone());
+        let mut db: Vec<Vec<f32>> = Vec::with_capacity(n);
+        for i in 0..n {
+            let mut v = lcg_f32(dim, (i * 7 + 13) as u32);
+            normalize(&mut v);
+            seg.append(i as u64, &v, &[], 1.0, i as u64 + 1);
+            db.push(v);
+        }
+        let frozen = seg.freeze();
+        let imm = compact(&frozen, &collection, 12345, None).expect("SQ8 compact failed");
+        assert_eq!(imm.live_count(), n as u32);
+
+        let padded = collection.padded_dimension;
+
+        // Exact-match invariant: query == db[7] must rank 7 first. The broken
+        // codebook fallback returned ml:0 here (degenerate codes); real SQ8 must not.
+        let mut scratch =
+            crate::vector::hnsw::search::SearchScratch::new(imm.graph().num_nodes(), padded);
+        let res = imm.search(&db[7], 10, 128, &mut scratch);
+        assert!(!res.is_empty(), "SQ8 immutable search returned nothing");
+        assert_eq!(
+            res[0].id.0 as usize, 7,
+            "SQ8 nearest != exact match: got {}",
+            res[0].id.0
+        );
+
+        // recall@10 vs exact-f32 L2 ground truth over several queries. The broken
+        // SQ8 scored ~0.01 here; 8-bit fidelity + HNSW should recover the bulk.
+        let queries = [3usize, 7, 50, 123, 199];
+        let mut total_hits = 0usize;
+        for &qi in &queries {
+            let mut idx: Vec<usize> = (0..n).collect();
+            idx.sort_by(|&a, &b| {
+                let da: f32 = db[qi]
+                    .iter()
+                    .zip(&db[a])
+                    .map(|(x, y)| (x - y) * (x - y))
+                    .sum();
+                let dbb: f32 = db[qi]
+                    .iter()
+                    .zip(&db[b])
+                    .map(|(x, y)| (x - y) * (x - y))
+                    .sum();
+                da.total_cmp(&dbb)
+            });
+            let exact: std::collections::HashSet<u32> =
+                idx.into_iter().take(10).map(|i| i as u32).collect();
+            let mut sc =
+                crate::vector::hnsw::search::SearchScratch::new(imm.graph().num_nodes(), padded);
+            let got = imm.search(&db[qi], 10, 128, &mut sc);
+            let got_ids: std::collections::HashSet<u32> = got.iter().map(|r| r.id.0).collect();
+            total_hits += exact.intersection(&got_ids).count();
+        }
+        assert!(
+            total_hits >= 42,
+            "SQ8 immutable recall@10 too low: {total_hits}/50"
+        );
     }
 
     #[test]
