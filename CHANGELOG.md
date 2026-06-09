@@ -6,6 +6,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — SQ8 vector quantization now works across the full FT lifecycle
+
+- **`FT.CREATE ... QUANTIZATION SQ8` was a declared-but-unimplemented
+  quantizer** — vectors fell through to the TQ4 encoder against an empty
+  codebook, producing degenerate codes and random search (recall 0.014,
+  exact-match returned the wrong key) on real embeddings. Implemented a real
+  per-vector affine scalar-8-bit quantizer (`dim` u8 codes + `(min, scale)`
+  trailer) and wired it through the entire segment lifecycle: append,
+  brute-force search, compact, immutable HNSW search, multi-segment search
+  fan-out, segment **merge**, and persistence reload. Recall on real
+  all-MiniLM-L6-v2 384d embeddings: **0.014 → 0.897**, exact-match correct.
+- **`append_transactional()` corrupted SQ8 vectors** — it wrote the TQ slot
+  layout (`padded/2 + 4`) into `dim + 8` SQ8 slots, corrupting the code stride
+  for every transactionally-inserted or WAL-recovered SQ8 vector. Both append
+  paths now share one `encode_sq8_slot()` helper.
+- **SQ8 ignored the index metric** — an `InnerProduct` index ranked
+  non-normalized inputs by magnitude. SQ8 now normalizes for both unit-sphere
+  metrics (Cosine + InnerProduct), matching the rest of the engine; `L2` keeps
+  raw vectors for true Euclidean ranking.
+
 ### Changed — Rust SDK released as moondb 0.2.0 on crates.io
 
 - **`moondb` crate `0.1.1` → `0.2.0`** — publishes the v0.2-era client API
