@@ -1186,6 +1186,49 @@ mod tests {
     }
 
     #[test]
+    fn test_sq8_cosine_nonnormalized_ranking() {
+        // Advisor must-fix: a Cosine index must rank by ANGLE even when inputs are
+        // NOT unit-normalized. SQ8 normalizes at encode + query time; without that
+        // the per-vector ||x||^2 term corrupts the squared-L2 ordering. The recall
+        // harness pre-normalizes embeddings, so only a test like this catches it.
+        use crate::vector::turbo_quant::collection::BuildMode;
+        distance::init();
+        let dim = 48usize;
+        let collection = Arc::new(CollectionMetadata::with_build_mode(
+            1,
+            dim as u32,
+            DistanceMetric::Cosine,
+            QuantizationConfig::Sq8,
+            7,
+            BuildMode::Light,
+        ));
+        let seg = MutableSegment::new(dim as u32, collection);
+        // Non-normalized db with widely varying magnitudes.
+        let mut db: Vec<Vec<f32>> = Vec::new();
+        for i in 0..40u32 {
+            let mut v = make_f32_vector(dim, 500 + i); // unit direction
+            let scale = 0.1 + (i as f32) * 0.5; // blow up + vary magnitude per vector
+            for x in v.iter_mut() {
+                *x *= scale;
+            }
+            seg.append(i as u64, &v, &[], 0.0, 1);
+            db.push(v);
+        }
+        // Query == db[12] scaled by a different factor: identical direction (cos = 1),
+        // very different magnitude. Cosine-nearest must still be 12.
+        let mut q = db[12].clone();
+        for x in q.iter_mut() {
+            *x *= 4.2;
+        }
+        let res = seg.brute_force_search(&q, None, 5);
+        assert_eq!(
+            res[0].id.0, 12,
+            "Cosine SQ8 misranked non-normalized input: got {}",
+            res[0].id.0
+        );
+    }
+
+    #[test]
     fn test_brute_force_search_excludes_deleted() {
         distance::init();
         let dim = 128;
