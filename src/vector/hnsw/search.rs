@@ -252,13 +252,14 @@ pub fn hnsw_search_filtered(
     let padded = collection.padded_dimension as usize;
 
     // SQ8 uses an axis-aligned per-vector affine quantizer: no FWHT, no codebook,
-    // no sub-centroid LUT. The query stays full-precision f32 (normalized for
-    // Cosine to match the encode side) and feeds a dedicated ADC in the distance
-    // closures below. The entire TQ LUT setup is skipped for SQ8.
+    // no sub-centroid LUT. The query stays full-precision f32 (normalized for the
+    // unit-sphere metrics Cosine + InnerProduct to match the encode side, raw for
+    // L2) and feeds a dedicated ADC in the distance closures below. The entire TQ
+    // LUT setup is skipped for SQ8.
     let is_sq8 = collection.quantization == QuantizationConfig::Sq8;
     let sq8_query: Vec<f32> = if is_sq8 {
         let mut q = query.to_vec();
-        if collection.metric == DistanceMetric::Cosine {
+        if collection.metric != DistanceMetric::L2 {
             let n: f32 = q.iter().map(|x| x * x).sum::<f32>().sqrt();
             if n > 0.0 {
                 let inv = 1.0 / n;

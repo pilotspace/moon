@@ -111,6 +111,36 @@ impl PartialOrd for DistF32 {
     }
 }
 
+/// Encode one vector into a self-contained SQ8 slot: `dim` u8 affine codes
+/// followed by an 8-byte `(min, scale)` f32 trailer (`dim + SQ8_PARAMS_BYTES`).
+///
+/// Cosine and InnerProduct are unit-sphere metrics in this engine (the TQ path
+/// normalizes the query unconditionally — there is no true dot-product ranking
+/// anywhere), so both normalize the vector before quantizing; only L2 encodes the
+/// raw vector so its squared-L2 ADC ranks by true Euclidean distance.
+///
+/// Returns `(slot_bytes, raw_norm)` — `raw_norm` is the pre-normalization L2 norm,
+/// stored on the entry. Single source of truth shared by `append()` and
+/// `append_transactional()`: encoding them separately is exactly how the two paths
+/// drifted into a stride mismatch.
+fn encode_sq8_slot(vector_f32: &[f32], metric: DistanceMetric, dim: usize) -> (Vec<u8>, f32) {
+    let raw_norm: f32 = vector_f32.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let mut codes = vec![0u8; dim + SQ8_PARAMS_BYTES];
+    let (min, scale) = if metric != DistanceMetric::L2 && raw_norm > 0.0 {
+        let inv = 1.0 / raw_norm;
+        let mut unit = vec![0.0f32; dim];
+        for (u, &x) in unit.iter_mut().zip(vector_f32) {
+            *u = x * inv;
+        }
+        encode_sq8_into(&unit, &mut codes[..dim])
+    } else {
+        encode_sq8_into(vector_f32, &mut codes[..dim])
+    };
+    codes[dim..dim + 4].copy_from_slice(&min.to_le_bytes());
+    codes[dim + 4..dim + 8].copy_from_slice(&scale.to_le_bytes());
+    (codes, raw_norm)
+}
+
 /// Append-only flat buffer with TQ-ADC brute-force search.
 pub struct MutableSegment {
     inner: RwLock<MutableSegmentInner>,
@@ -176,21 +206,7 @@ impl MutableSegment {
         // For Cosine, normalize first so squared-L2 ADC ranking == cosine ranking
         // (mirrors how TQ operates on unit vectors); L2/IP encode the raw vector.
         if self.collection.quantization == QuantizationConfig::Sq8 {
-            let raw_norm: f32 = vector_f32.iter().map(|x| x * x).sum::<f32>().sqrt();
-            let mut codes = vec![0u8; dim + SQ8_PARAMS_BYTES];
-            let (min, scale) = if self.collection.metric == DistanceMetric::Cosine && raw_norm > 0.0
-            {
-                let inv = 1.0 / raw_norm;
-                let mut unit = vec![0.0f32; dim];
-                for (u, &x) in unit.iter_mut().zip(vector_f32) {
-                    *u = x * inv;
-                }
-                encode_sq8_into(&unit, &mut codes[..dim])
-            } else {
-                encode_sq8_into(vector_f32, &mut codes[..dim])
-            };
-            codes[dim..dim + 4].copy_from_slice(&min.to_le_bytes());
-            codes[dim + 4..dim + 8].copy_from_slice(&scale.to_le_bytes());
+            let (codes, raw_norm) = encode_sq8_slot(vector_f32, self.collection.metric, dim);
             inner.tq_codes.extend_from_slice(&codes);
 
             // Keep the sub-centroid sign buffer offset-consistent (unused for SQ8).
@@ -330,10 +346,13 @@ impl MutableSegment {
         let bytes_per_code = inner.bytes_per_code;
 
         // SQ8: per-vector affine decode + true squared-L2 ADC (no FWHT, no codebook).
-        // Query is normalized for Cosine to match the encode-side normalization.
+        // Query is normalized for unit-sphere metrics (Cosine + InnerProduct) to
+        // match the encode-side normalization.
         if self.collection.quantization == QuantizationConfig::Sq8 {
             let mut q = query_f32.to_vec();
-            if self.collection.metric == DistanceMetric::Cosine {
+            // Normalize for unit-sphere metrics (Cosine + InnerProduct) to match the
+            // encode side; L2 keeps the raw query for true Euclidean ADC.
+            if self.collection.metric != DistanceMetric::L2 {
                 let n: f32 = q.iter().map(|x| x * x).sum::<f32>().sqrt();
                 if n > 0.0 {
                     let inv = 1.0 / n;
@@ -522,7 +541,9 @@ impl MutableSegment {
         // SQ8: per-vector affine decode + true squared-L2 ADC (MVCC-visible scan).
         if self.collection.quantization == QuantizationConfig::Sq8 {
             let mut q = query_f32.to_vec();
-            if self.collection.metric == DistanceMetric::Cosine {
+            // Normalize for unit-sphere metrics (Cosine + InnerProduct) to match the
+            // encode side; L2 keeps the raw query for true Euclidean ADC.
+            if self.collection.metric != DistanceMetric::L2 {
                 let n: f32 = q.iter().map(|x| x * x).sum::<f32>().sqrt();
                 if n > 0.0 {
                     let inv = 1.0 / n;
@@ -678,6 +699,46 @@ impl MutableSegment {
         let dim = inner.dimension as usize;
         let padded = inner.padded_dimension as usize;
         let bytes_per_code = inner.bytes_per_code;
+
+        // SQ8 uses a `dim + 8` affine slot, not the TQ `padded/2 + 4` layout. Without
+        // this branch the TQ encoder below writes the wrong stride into `tq_codes`,
+        // corrupting every transactionally-inserted or WAL-recovered SQ8 vector
+        // (recovery.rs and the txn insert path both call this). Mirrors append()'s
+        // SQ8 branch exactly (shared `encode_sq8_slot`), differing only in `txn_id`.
+        if self.collection.quantization == QuantizationConfig::Sq8 {
+            let (codes, raw_norm) = encode_sq8_slot(vector_f32, self.collection.metric, dim);
+            inner.tq_codes.extend_from_slice(&codes);
+
+            // Keep the sub-centroid sign buffer offset-consistent (unused for SQ8).
+            let sub_bpv = inner.sub_sign_bytes_per_vec;
+            inner
+                .sub_centroid_signs
+                .extend(std::iter::repeat_n(0u8, sub_bpv));
+
+            let is_exact = self.collection.build_mode
+                == crate::vector::turbo_quant::collection::BuildMode::Exact;
+            let mut extra_bytes = 0usize;
+            if is_exact {
+                let qjl_bpv = inner.qjl_bytes_per_vec;
+                let new_qjl_len = inner.qjl_signs.len() + qjl_bpv;
+                inner.qjl_signs.resize(new_qjl_len, 0u8);
+                inner.residual_norms.push(0.0);
+                inner.raw_f32.extend_from_slice(vector_f32);
+                extra_bytes = qjl_bpv + 4 + dim * 4;
+            }
+
+            inner.entries.push(MutableEntry {
+                internal_id,
+                key_hash,
+                vector_offset: internal_id,
+                norm: raw_norm,
+                insert_lsn,
+                delete_lsn: 0,
+                txn_id,
+            });
+            inner.byte_size += bytes_per_code + extra_bytes + std::mem::size_of::<MutableEntry>();
+            return internal_id;
+        }
 
         let signs = self.collection.fwht_sign_flips.as_slice();
         let mut work_buf = vec![0.0f32; padded];
@@ -1224,6 +1285,100 @@ mod tests {
         assert_eq!(
             res[0].id.0, 12,
             "Cosine SQ8 misranked non-normalized input: got {}",
+            res[0].id.0
+        );
+    }
+
+    #[test]
+    fn test_sq8_append_transactional_stride_and_exact_match() {
+        // Regression (PR #166 review, Finding 3): append_transactional() must produce
+        // the SAME dim+8 SQ8 slot as append(). Before the fix it ran the TQ encoder
+        // (padded/2 + 4 layout), so every transactionally-inserted or WAL-recovered
+        // SQ8 vector (recovery.rs:176 + the txn insert path) corrupted the tq_codes
+        // stride. A stride mismatch scrambles the exact-match invariant below.
+        use crate::vector::turbo_quant::collection::BuildMode;
+        distance::init();
+        let dim = 64usize;
+        let collection = Arc::new(CollectionMetadata::with_build_mode(
+            1,
+            dim as u32,
+            DistanceMetric::Cosine,
+            QuantizationConfig::Sq8,
+            42,
+            BuildMode::Light,
+        ));
+        let seg = MutableSegment::new(dim as u32, collection);
+        let db: Vec<Vec<f32>> = (0..50u32).map(|i| make_f32_vector(dim, 100 + i)).collect();
+        for (i, v) in db.iter().enumerate() {
+            seg.append_transactional(i as u64, v, &[], 0.0, 1, 7);
+        }
+
+        // Direct stride check: n slots of exactly dim + SQ8_PARAMS_BYTES bytes.
+        {
+            let inner = seg.inner.read();
+            assert_eq!(
+                inner.tq_codes.len(),
+                db.len() * (dim + SQ8_PARAMS_BYTES),
+                "append_transactional wrote wrong SQ8 slot stride"
+            );
+        }
+
+        // Exact-match: query == db[7] must rank db[7] first (broken under a stride
+        // mismatch or the TQ empty-codebook fallback).
+        let res = seg.brute_force_search(&db[7], None, 10);
+        assert!(
+            !res.is_empty(),
+            "SQ8 transactional brute force returned no results"
+        );
+        assert_eq!(
+            res[0].id.0, 7,
+            "SQ8 transactional nearest != exact match (got {})",
+            res[0].id.0
+        );
+    }
+
+    #[test]
+    fn test_sq8_inner_product_ranks_by_angle() {
+        // PR #166 review (Findings 1 & 4): InnerProduct is a unit-sphere metric in
+        // this engine — the TQ search path normalizes the query unconditionally, so
+        // there is no true dot-product ranking anywhere; Cosine and IP are
+        // equivalent. SQ8 must therefore normalize for IP exactly as for Cosine
+        // (rank by ANGLE), not by raw squared-L2. Before the fix SQ8 only checked
+        // `== Cosine`, so an IP index ranked non-normalized inputs by magnitude.
+        use crate::vector::turbo_quant::collection::BuildMode;
+        distance::init();
+        let dim = 48usize;
+        let collection = Arc::new(CollectionMetadata::with_build_mode(
+            1,
+            dim as u32,
+            DistanceMetric::InnerProduct,
+            QuantizationConfig::Sq8,
+            7,
+            BuildMode::Light,
+        ));
+        let seg = MutableSegment::new(dim as u32, collection);
+        // Non-normalized db, magnitudes varying widely across vectors.
+        let mut db: Vec<Vec<f32>> = Vec::new();
+        for i in 0..40u32 {
+            let mut v = make_f32_vector(dim, 500 + i);
+            let scale = 0.1 + (i as f32) * 0.5;
+            for x in v.iter_mut() {
+                *x *= scale;
+            }
+            seg.append(i as u64, &v, &[], 0.0, 1);
+            db.push(v);
+        }
+        // Query == db[12] at a very different magnitude (same direction). With the
+        // fix (normalize for IP) the angle-nearest is 12; ranking by raw L2 instead
+        // would pick a high-magnitude vector.
+        let mut q = db[12].clone();
+        for x in q.iter_mut() {
+            *x *= 4.2;
+        }
+        let res = seg.brute_force_search(&q, None, 5);
+        assert_eq!(
+            res[0].id.0, 12,
+            "SQ8 InnerProduct misranked by magnitude: got {}",
             res[0].id.0
         );
     }
