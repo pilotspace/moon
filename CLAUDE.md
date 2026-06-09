@@ -195,7 +195,7 @@ Moon ships a native HNSW + TurboQuant vector engine exposed via a RediSearch-com
 - **Segment lifecycle:** auto-indexed on HSET → mutable segment (brute force) → compact → immutable segment (HNSW graph + TQ codes). Segments do not merge once immutable — lossy decode+re-encode accumulates quantization error (tested, recall collapsed 0.73 → 0.0005).
 - **Key hash map:** `key_hash_to_key: HashMap<u64, Bytes>` must be populated in `auto_index_hset` and propagated via `SearchResult.key_hash`; otherwise multi-segment search returns synthetic `vec:<id>` instead of original keys.
 - **FT.INFO `num_docs`** must sum across all segments (mutable + immutable), not just the mutable one.
-- **TQ4 at 384d loses recall** (concentration of distances + quantization noise). Use TQ8 or FP32 HNSW for ≤384d workloads; TQ4 shines at 768d+.
+- **TQ4 at 384d loses recall** (concentration of distances + quantization noise). Use **SQ8** or FP32 HNSW for ≤384d workloads; TQ4 shines at 768d+. (There is no TQ8 — SQ8 is the real 8-bit option: per-vector affine scalar quant, normalizes for the unit-sphere metrics Cosine + InnerProduct, validated across the full lifecycle — search/merge/persistence — at ~0.90 R@10 on real MiniLM 384d. PR #166.)
 
 ## GPU / CUDA Acceleration
 
