@@ -178,8 +178,7 @@ impl MutableSegment {
         if self.collection.quantization == QuantizationConfig::Sq8 {
             let raw_norm: f32 = vector_f32.iter().map(|x| x * x).sum::<f32>().sqrt();
             let mut codes = vec![0u8; dim + SQ8_PARAMS_BYTES];
-            let (min, scale) = if self.collection.metric == DistanceMetric::Cosine
-                && raw_norm > 0.0
+            let (min, scale) = if self.collection.metric == DistanceMetric::Cosine && raw_norm > 0.0
             {
                 let inv = 1.0 / raw_norm;
                 let mut unit = vec![0.0f32; dim];
@@ -1157,14 +1156,26 @@ mod tests {
         // that the broken codebook fallback violated, returning ml:0).
         let res = seg.brute_force_search(&db[7], None, 10);
         assert!(!res.is_empty(), "SQ8 brute force returned no results");
-        assert_eq!(res[0].id.0, 7, "SQ8 nearest != exact match (got {})", res[0].id.0);
+        assert_eq!(
+            res[0].id.0, 7,
+            "SQ8 nearest != exact match (got {})",
+            res[0].id.0
+        );
 
         // recall@10 vs exact-f32 L2 (== Cosine on unit vectors) must be near-perfect:
         // 8-bit fidelity barely perturbs ranking.
         let mut idx: Vec<usize> = (0..db.len()).collect();
         idx.sort_by(|&a, &b| {
-            let da: f32 = db[7].iter().zip(&db[a]).map(|(x, y)| (x - y) * (x - y)).sum();
-            let dbb: f32 = db[7].iter().zip(&db[b]).map(|(x, y)| (x - y) * (x - y)).sum();
+            let da: f32 = db[7]
+                .iter()
+                .zip(&db[a])
+                .map(|(x, y)| (x - y) * (x - y))
+                .sum();
+            let dbb: f32 = db[7]
+                .iter()
+                .zip(&db[b])
+                .map(|(x, y)| (x - y) * (x - y))
+                .sum();
             da.total_cmp(&dbb)
         });
         let exact: std::collections::HashSet<u32> =

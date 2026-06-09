@@ -103,7 +103,10 @@ pub fn sq8_decode_one(code: u8, min: f32, scale: f32) -> f32 {
 
 /// Decode the `dim` codes back to an approximate `f32` vector.
 pub fn decode_sq8(codes: &[u8], min: f32, scale: f32) -> Vec<f32> {
-    codes.iter().map(|&c| sq8_decode_one(c, min, scale)).collect()
+    codes
+        .iter()
+        .map(|&c| sq8_decode_one(c, min, scale))
+        .collect()
 }
 
 /// Asymmetric squared-L2 distance: `||query - decode(codes)||²`.
@@ -237,11 +240,18 @@ mod tests {
                 let sb = encode_sq8(&db[b]);
                 let (mna, sca) = sq8_params(&sa, 128);
                 let (mnb, scb) = sq8_params(&sb, 128);
-                sq8_l2_adc(&q, &sa[..128], mna, sca)
-                    .total_cmp(&sq8_l2_adc(&q, &sb[..128], mnb, scb))
+                sq8_l2_adc(&q, &sa[..128], mna, sca).total_cmp(&sq8_l2_adc(
+                    &q,
+                    &sb[..128],
+                    mnb,
+                    scb,
+                ))
             })
             .unwrap();
-        assert_eq!(exact_best, sq8_best, "SQ8 nearest neighbor diverged from exact");
+        assert_eq!(
+            exact_best, sq8_best,
+            "SQ8 nearest neighbor diverged from exact"
+        );
     }
 
     #[test]
