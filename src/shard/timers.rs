@@ -44,10 +44,12 @@ pub(crate) fn run_eviction(
 ) {
     let rt = runtime_config.read();
     if rt.maxmemory > 0 {
+        // GAP-1: enforce the elastic budget (0 = static fallback inside).
+        let budget = shard_databases.elastic_budget(shard_id);
         let db_count = shard_databases.db_count();
         for i in 0..db_count {
             let mut guard = shard_databases.write_db(shard_id, i);
-            let _ = crate::storage::eviction::try_evict_if_needed(&mut guard, &rt);
+            let _ = crate::storage::eviction::try_evict_if_needed_budget(&mut guard, &rt, budget);
         }
     }
 }
