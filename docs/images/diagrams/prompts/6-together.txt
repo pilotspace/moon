@@ -1,0 +1,29 @@
+Create a calm, light, whiteboard-style technical infographic on a pure white background.
+
+TITLE at top center: "Moon — One Write, Every Index. One Query, Every Engine." in clean charcoal print lettering.
+Subtitle below in lighter gray: "How KV, vector, graph and full-text compose into GraphRAG"
+
+LAYOUT — two rows:
+
+TOP ROW, section label "Ingest": on the left one box with morning peach tint containing
+the command text "HSET doc:42 ...". From it, three thin solid pencil arrows fan out
+to the right into three small boxes:
+  box with cloud blue tint: "KV hash" with sub-label "source of truth"
+  box with cream lilac tint: "Vector index" with sub-label "auto-indexed embedding"
+  box with soft sage tint: "BM25 index" with sub-label "auto-indexed text"
+
+BOTTOM ROW, section label "Retrieve": a left-to-right chain of four boxes connected
+by thin solid pencil arrows:
+  "FT.SEARCH HYBRID" with sub-label "dense + sparse + BM25, RRF-fused"
+  "GRAPH expand" with sub-label "walk relationships for context"
+  "Session + cache" with sub-label "semantic dedup"
+  "Agent answer" with sub-label "grounded context, one round-trip"
+
+EXACTLY THREE pencil annotations with thin leader lines, each used once, nowhere else:
+  1. spanning the top-row fan-out: "one command, one LSN, all indexes consistent"
+  2. on the right side between the rows, next to a tall thin bracket labeled "TXN.BEGIN / TXN.COMMIT":
+     "cross-store ACID - commit or roll back together"
+  3. on the left side between the rows, next to a small clock icon: "AS_OF time travel - query any past snapshot"
+
+Bottom-left corner: small box "one process - no sync pipelines between four databases"
+Bottom-right corner: small note "the alternative: Redis + Qdrant + Neo4j + Elastic + glue code"

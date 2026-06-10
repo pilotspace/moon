@@ -6,6 +6,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Docs: Design Advantages page with architecture diagrams
+
+- New docs page (`design-advantages.md`, MkDocs nav → Concepts) telling the
+  full architecture story with 6 whiteboard diagrams: platform hero, memory
+  engine, persistence, vector engine, graph engine, converged GraphRAG
+  workflow, plus an "AI agent era" section mapping agent memory types to
+  Moon surfaces. Originally authored for the retired Mintlify site (PR
+  #145), converted to MkDocs Material and refreshed: quantization guidance
+  now says SQ8 (TQ8 never existed), and the segment-lifecycle and disk
+  offload sections reflect background compaction (PR #165) and elastic
+  memory budgets (PR #170). README "Why Moon" embeds the hero diagram.
+
 ### Changed — Background FT compaction + segment merge (no more shard freezes)
 
 - **HNSW index builds no longer block the shard event loop.** `try_compact`

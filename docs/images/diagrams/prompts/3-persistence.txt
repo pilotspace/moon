@@ -1,0 +1,27 @@
+Create a calm, light, whiteboard-style technical infographic on a pure white background.
+
+TITLE at top center: "Moon — Forkless, Per-Shard Persistence" in clean charcoal print lettering.
+Subtitle below in lighter gray: "RDB snapshots without fork(). One AOF per shard. Point-in-time recovery."
+
+LAYOUT — two horizontal swim lanes:
+
+TOP LANE (cloud blue tint) labeled "Write path":
+  "Client write" -> "Shard 0..N" -> "Per-Shard AOF writer"
+  Under the AOF writer, a small file stack icon labeled "appendonlydir/" containing three file rows:
+    "base.rdb - RDB snapshot base"
+    "incr.aof - RESP commands since base"
+    "manifest - crash-atomic file registry"
+  Pencil annotation with leader line: "one AOF per shard - writers never share a lock"
+  Second annotation: "fsync: always / everysec / no - per operator choice"
+
+BOTTOM LANE (soft sage tint) labeled "Snapshot + recovery path":
+  Box "Forkless RDB" with sub-label "iterates DashTable segments incrementally"
+  Pencil annotation: "no fork() - no copy-on-write memory spike, RSS stays flat"
+  Arrow to box "WAL v3" with sub-label "per-record LSN - CRC32C checksums"
+  Arrow to box "Recovery" with sub-label "replay to any LSN or timestamp (PITR)"
+
+CONNECTIONS: thin solid pencil arrows along each lane; one thin dashed pencil arrow from
+"Per-Shard AOF writer" down to "Recovery" labeled "BGREWRITEAOF compacts in background".
+
+Bottom-left corner: small box "100% crash recovery - 200/200 keys after SIGKILL"
+Bottom-right corner: small note "AOF advantage over Redis grows with pipeline depth"

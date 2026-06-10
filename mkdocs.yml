@@ -130,6 +130,7 @@ nav:
       - Migrating from Redis: guides/migration.md
   - Concepts:
       - Architecture: architecture.md
+      - Design advantages: design-advantages.md
       - Command reference: commands.md
       - Redis compatibility: redis-compat.md
       - Moon vs Valkey: comparison-valkey.md

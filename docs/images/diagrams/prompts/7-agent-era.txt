@@ -1,0 +1,38 @@
+Create a calm, light, whiteboard-style technical infographic on a pure white background.
+
+TITLE at top center: "Moon — The Agent-State Engine" in clean charcoal print lettering.
+Subtitle below in lighter gray: "memory, tools, queues and audit for stateful AI agents"
+
+LAYOUT — two columns:
+
+LEFT COLUMN: a large circle of four nodes connected clockwise by thin solid pencil
+arrows, label "the agent loop" above it. The four nodes, clockwise from top:
+  "Recall" with sub-label "session state"
+  "Retrieve" with sub-label "knowledge"
+  "Act" with sub-label "queue work"
+  "Remember" with sub-label "write facts"
+In the center of the circle a small line icon of a robot head and the words "AI agent".
+
+RIGHT COLUMN: one tall rounded container labeled "Moon — one process" containing four
+stacked small boxes:
+  box with morning peach tint: "Session hashes" with sub-label "per-field TTL"
+  box with cloud blue tint: "Hybrid retrieval" with sub-label "vectors + BM25 + graph"
+  box with soft sage tint: "Durable queues" with sub-label "at-least-once + DLQ"
+  box with cream lilac tint: "Time travel" with sub-label "AS_OF snapshots"
+
+EXACTLY FOUR thin solid pencil arrows run from loop nodes to stacked boxes. The
+pairing is critical — each arrow starts at the named node and ends at the named box:
+  arrow 1: from Recall to the "Session hashes" box
+  arrow 2: from Retrieve to the "Hybrid retrieval" box
+  arrow 3: from Act to the "Durable queues" box
+  arrow 4: from Remember, curving below the circle, to the "Time travel" box
+No other arrows between the columns. Act must NOT connect to Time travel.
+
+EXACTLY FOUR pencil annotations with thin leader lines, each used once, nowhere else:
+  1. near the Retrieve arrow: "semantic cache hit skips inference"
+  2. near the Durable queues box: "poisoned tasks land in the DLQ"
+  3. near the Time travel box: "what did the agent know when it decided"
+  4. below the Remember node: "facts commit atomically across engines"
+
+Bottom-left corner: small box "tools ship with OpenAI function-calling schemas"
+Bottom-right corner: small note "the alternative: five systems plus glue code"

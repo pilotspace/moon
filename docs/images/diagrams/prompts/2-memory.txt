@@ -1,0 +1,32 @@
+Create a calm, light, whiteboard-style technical infographic on a pure white background.
+
+TITLE at top center: "Moon — In-Memory Storage Engine" in clean charcoal print lettering.
+Subtitle below in lighter gray: "Thread-per-core. Shared-nothing. SIMD everywhere."
+
+LAYOUT — horizontal architecture, left to right:
+
+LEFT, with a morning peach tint behind it: three small terminal icons labeled "Clients",
+below them the text "RESP2 / RESP3".
+
+CENTER-LEFT, warm sand tint: rounded box "Shard Router", inside: "hash(key) % N"
+
+CENTER, cloud blue tint, hero element, slightly larger: three vertical lanes labeled
+"Shard 0", "Shard 1", "Shard N-1". Each lane contains three stacked items:
+  "DashTable" with sub-label "Swiss Table SIMD probe"
+  "CompactKey / CompactValue" with sub-label "23B / 12B inline SSO"
+  "Cached clock" with sub-label "no syscall per key"
+The lanes do NOT connect to each other — they are independent columns.
+
+RIGHT, soft sage tint: rounded box "Per-Shard WAL" with sub-label "lock-free append, 1ms flush tick".
+
+EXACTLY FOUR pencil annotations with thin leader lines, each used once, nowhere else:
+  1. pointing at the arrow between Clients and Shard Router: "zero-copy parse"
+  2. pointing at the top of the shard lanes: "one thread per core - no locks"
+  3. pointing at a DashTable item: "SIMD compares 16 fingerprints per instruction"
+  4. pointing at the Per-Shard WAL box: "writes scale with cores"
+
+CONNECTIONS: thin solid pencil arrows for request flow left to right;
+one thin dashed pencil line between router and lanes labeled "SPSC channels".
+
+Bottom-left corner: small box "27-35% less memory than Redis at values >= 1 KB"
+Bottom-right corner: legend "solid = request flow · dashed = cross-shard messages"
