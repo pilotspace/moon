@@ -2595,7 +2595,10 @@ mod bg_compact_tests {
                     if done {
                         return t0.elapsed();
                     }
-                    assert!(t0.elapsed().as_secs() < 30, "compaction timed out");
+                    // Generous deadline: under a full `cargo test` run every
+                    // core is saturated by sibling tests and worker builds can
+                    // take many times their isolated duration (observed >30s).
+                    assert!(t0.elapsed().as_secs() < 120, "compaction timed out");
                     std::thread::sleep(Duration::from_millis(2));
                 }
             };
