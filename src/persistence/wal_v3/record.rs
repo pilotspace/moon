@@ -132,13 +132,15 @@ pub fn write_wal_v3_record(
     let should_compress =
         record_type == WalRecordType::FullPageImage && payload.len() > FPI_COMPRESS_THRESHOLD;
 
-    let (actual_payload, flags) = if should_compress {
+    // Cow keeps the common non-FPI path allocation-free: only compressed
+    // FPI payloads own a buffer; everything else borrows `payload` directly.
+    let (actual_payload, flags): (std::borrow::Cow<'_, [u8]>, u8) = if should_compress {
         (
-            lz4_flex::compress_prepend_size(payload),
+            std::borrow::Cow::Owned(lz4_flex::compress_prepend_size(payload)),
             FLAG_LZ4_COMPRESSED,
         )
     } else {
-        (payload.to_vec(), 0u8)
+        (std::borrow::Cow::Borrowed(payload), 0u8)
     };
 
     // record_len = 4 (len field) + 12 (header) + payload + 4 (crc)

@@ -79,8 +79,20 @@ pub(crate) fn drain_spsc_shared(
     let mut drained = 0;
 
     // Collect all messages first, then batch Execute/PipelineBatch under single borrow.
-    let mut execute_batch: Vec<ShardMessage> = Vec::new();
-    let mut other_messages: Vec<ShardMessage> = Vec::new();
+    //
+    // Scratch buffers are thread-local (one shard per OS thread) so this
+    // function — called from the 1ms tick and every I/O select arm — does
+    // not heap-allocate two Vecs per invocation. `mem::take` (instead of
+    // holding the RefCell borrow) keeps re-entrancy safe: a nested call
+    // would simply fall back to fresh empty Vecs.
+    thread_local! {
+        static DRAIN_SCRATCH: RefCell<(Vec<ShardMessage>, Vec<ShardMessage>)> =
+            const { RefCell::new((Vec::new(), Vec::new())) };
+    }
+    let (mut execute_batch, mut other_messages) =
+        DRAIN_SCRATCH.with(|s| std::mem::take(&mut *s.borrow_mut()));
+    execute_batch.clear();
+    other_messages.clear();
 
     let mut snapshot_seen = false;
     for consumer in consumers.iter_mut() {
@@ -156,7 +168,7 @@ pub(crate) fn drain_spsc_shared(
 
     // Process Execute/PipelineBatch/MultiExecute batch under single borrow_mut
     if !execute_batch.is_empty() {
-        for msg in execute_batch {
+        for msg in execute_batch.drain(..) {
             handle_shard_message_shared(
                 shard_databases,
                 pubsub_registry,
@@ -188,7 +200,7 @@ pub(crate) fn drain_spsc_shared(
     }
 
     // Process other messages (PubSubPublish, SnapshotBegin, etc.)
-    for msg in other_messages {
+    for msg in other_messages.drain(..) {
         handle_shard_message_shared(
             shard_databases,
             pubsub_registry,
@@ -213,6 +225,12 @@ pub(crate) fn drain_spsc_shared(
             aof_pool, // FIX-W1-2: thread AOF pool through SPSC drain
         );
     }
+
+    // Return the (now drained) scratch buffers so their capacity is reused
+    // by the next drain cycle.
+    DRAIN_SCRATCH.with(|s| {
+        *s.borrow_mut() = (execute_batch, other_messages);
+    });
 }
 
 /// Process a single cross-shard message using shared database access.

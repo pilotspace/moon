@@ -257,8 +257,10 @@ pub fn hnsw_search_filtered(
     // L2) and feeds a dedicated ADC in the distance closures below. The entire TQ
     // LUT setup is skipped for SQ8.
     let is_sq8 = collection.quantization == QuantizationConfig::Sq8;
-    let sq8_query: Vec<f32> = if is_sq8 {
-        let mut q = query.to_vec();
+    // Inline buffer keeps the per-query SQ8 path heap-free for dim ≤ 512
+    // (preserves the VEC-HNSW-03 zero-allocation guarantee).
+    let sq8_query: SmallVec<[f32; 512]> = if is_sq8 {
+        let mut q: SmallVec<[f32; 512]> = SmallVec::from_slice(query);
         if collection.metric != DistanceMetric::L2 {
             let n: f32 = q.iter().map(|x| x * x).sum::<f32>().sqrt();
             if n > 0.0 {
@@ -270,7 +272,7 @@ pub fn hnsw_search_filtered(
         }
         q
     } else {
-        Vec::new()
+        SmallVec::new()
     };
 
     let q_rot = scratch.query_rotated.as_mut_slice();

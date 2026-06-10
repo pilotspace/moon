@@ -1072,19 +1072,24 @@ impl super::Shard {
                     #[cfg(target_os = "linux")]
                     if let Some(ref mut driver) = uring_state {
                         driver.drain_eventfd();
+                        // Borrow the driver's reusable event buffer: zero
+                        // allocations per CQE batch in this drain loop.
+                        let mut events = driver.take_event_scratch();
                         loop {
                             let _ = driver.submit_and_wait_nonblocking();
-                            let events = driver.drain_completions();
+                            events.clear();
+                            driver.drain_completions_into(&mut events);
                             if events.is_empty() {
                                 break;
                             }
-                            for event in events {
+                            for event in events.drain(..) {
                                 uring_handler::handle_uring_event(
                                     event, driver, &shard_databases, shard_id, &mut uring_parse_bufs,
                                     &mut inflight_sends, uring_listener_fd, &cached_clock,
                                 );
                             }
                         }
+                        driver.return_event_scratch(events);
                     }
                 }
                 // Per-shard SO_REUSEPORT accept (unix, non-uring tokio path)
@@ -1465,13 +1470,16 @@ impl super::Shard {
                     #[cfg(target_os = "linux")]
                     if let Some(ref mut driver) = uring_state {
                         let _ = driver.submit_and_wait_nonblocking();
-                        let events = driver.drain_completions();
-                        for event in events {
+                        // Reuse the driver's event buffer (1ms tick path).
+                        let mut events = driver.take_event_scratch();
+                        driver.drain_completions_into(&mut events);
+                        for event in events.drain(..) {
                             uring_handler::handle_uring_event(
                                 event, driver, &shard_databases, shard_id, &mut uring_parse_bufs,
                                 &mut inflight_sends, uring_listener_fd, &cached_clock,
                             );
                         }
+                        driver.return_event_scratch(events);
                     }
                 }
                 // WAL fsync + MVCC sweep on 1-second interval

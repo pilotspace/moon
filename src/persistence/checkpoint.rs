@@ -67,7 +67,10 @@ impl CheckpointTrigger {
 }
 
 /// Internal state of the checkpoint protocol.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// All fields are scalar — `Copy` keeps `advance_tick` (1ms tick path)
+/// free of `clone()` calls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CheckpointState {
     /// No checkpoint in progress.
     Idle,
@@ -163,7 +166,7 @@ impl CheckpointManager {
     /// - `FlushPages(n)` — flush n dirty pages
     /// - `Finalize { redo_lsn }` — all pages done, write WAL checkpoint record
     pub fn advance_tick(&mut self) -> CheckpointAction {
-        match self.state.clone() {
+        match self.state {
             CheckpointState::Idle => CheckpointAction::Nothing,
             CheckpointState::InProgress {
                 redo_lsn,

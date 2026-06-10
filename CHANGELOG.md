@@ -6,6 +6,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — Hot-path performance: deep-review optimization pass (PR #168)
+
+- **+33% pipelined SET, +25% pipelined GET (single shard)** from a deep
+  performance review covering protocol → dispatch → shard → storage →
+  persistence → vector. 11 verified findings implemented:
+  - `Database::get`: 3 → 2 DashTable probes on a hit, 2 → 1 on a miss
+    (single-probe live/expired/absent classification).
+  - WAL v2 flush: 3 → 1 `write(2)` syscalls per 1ms tick via a reusable
+    staging buffer; on-disk format unchanged.
+  - WAL v3 record append no longer heap-allocates per non-FPI record
+    (`Cow::Borrowed`); checkpoint state machine no longer clones per tick.
+  - SPSC drain (`drain_spsc_shared`) reuses thread-local batch buffers
+    instead of allocating two `Vec`s per call.
+  - `Frame::Double` serialization is zero-alloc (stack `f64` Display
+    formatter, byte-identical wire output) in RESP2 and RESP3.
+  - SQ8 vector search no longer heap-allocates per query (HNSW + both
+    brute-force paths); IVF rotation/LUT buffers hoisted out of the
+    per-segment loop in `search_filtered` (parity with `search_mvcc`).
+  - io_uring `drain_completions` reuses persistent CQE/event buffers
+    (allocation-free drain loop at steady state).
+- Multi-shard (2/4/8/16/auto): no regressions; +9–32% pipelined SET at
+  2 and 8 shards. The unpipelined cross-shard latency floor (~1.7ms p50,
+  waker-relay + dispatch tick) is unchanged and tracked for follow-up.
+
 ### Fixed — SQ8 vector quantization now works across the full FT lifecycle
 
 - **`FT.CREATE ... QUANTIZATION SQ8` was a declared-but-unimplemented
