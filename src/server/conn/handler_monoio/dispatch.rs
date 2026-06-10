@@ -1298,6 +1298,26 @@ pub(super) async fn try_handle_cross_shard_commands(
         responses.push(response);
         return true;
     }
+    if cmd.eq_ignore_ascii_case(b"HOTKEYS") {
+        let response = match crate::command::server_admin::parse_hotkeys_count(cmd_args) {
+            Ok(count) => {
+                crate::shard::coordinator::coordinate_hotkeys(
+                    count,
+                    ctx.shard_id,
+                    ctx.num_shards,
+                    conn.selected_db,
+                    &ctx.shard_databases,
+                    &ctx.dispatch_tx,
+                    &ctx.spsc_notifiers,
+                    &(), // monoio: coordinator uses oneshot, not response_pool
+                )
+                .await
+            }
+            Err(e) => e,
+        };
+        responses.push(response);
+        return true;
+    }
 
     // --- Multi-key commands: MGET, MSET, DEL, UNLINK, EXISTS ---
     if is_multi_key_command(cmd, cmd_args) {

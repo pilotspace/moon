@@ -74,6 +74,15 @@ fn dispatch_inner(
     }
     let b0 = cmd[0] | 0x20; // lowercase first byte
 
+    // Hot-key sampling: tick() is one relaxed fetch_add; the O(K) sketch
+    // update only runs on 1-in-16 keyed commands, keeping the amortized
+    // dispatch cost well under the hot-path allocation budget.
+    if db.hot_keys().tick() {
+        if let Some(key) = crate::server::conn::shared::extract_primary_key(cmd, args) {
+            db.hot_keys().observe(key);
+        }
+    }
+
     #[inline(always)]
     fn resp(f: Frame) -> DispatchResult {
         DispatchResult::Response(f)
@@ -633,9 +642,12 @@ fn dispatch_inner(
             }
         }
         (7, b'h') => {
-            // HEALTHZ HGETALL HEXISTS HINCRBY HEXPIRE HGETDEL
+            // HEALTHZ HOTKEYS HGETALL HEXISTS HINCRBY HEXPIRE HGETDEL
             if cmd.eq_ignore_ascii_case(b"HEALTHZ") {
                 return resp(connection::healthz());
+            }
+            if cmd.eq_ignore_ascii_case(b"HOTKEYS") {
+                return resp(server_admin::hotkeys(db, args));
             }
             if cmd.eq_ignore_ascii_case(b"HGETALL") {
                 return resp(hash::hgetall(db, args));
@@ -1004,6 +1016,7 @@ pub fn is_dispatch_read_supported(cmd: &[u8]) -> bool {
         | (6, b'g')  // GETBIT
         | (6, b'l')  // LRANGE, LINDEX
         | (6, b'm')  // MEMORY
+        | (6, b'o')  // OBJECT
         | (6, b's')  // STRLEN, SUBSTR, SINTER, SUNION
         | (6, b'z')  // ZSCORE, ZRANGE, ZCOUNT
         | (7, b'c')  // COMMAND
@@ -1043,6 +1056,16 @@ fn dispatch_read_inner(db: &Database, cmd: &[u8], args: &[Frame], now_ms: u64) -
         return DispatchResult::Response(err_unknown(cmd));
     }
     let b0 = cmd[0] | 0x20;
+
+    // Hot-key sampling (read path). The sketch uses interior mutability:
+    // tick() is a relaxed fetch_add and observe() try_locks (drops the
+    // sample under contention), so concurrent cross-shard fast-path reads
+    // never block here. Counts land in the OWNING shard's sketch.
+    if db.hot_keys().tick() {
+        if let Some(key) = crate::server::conn::shared::extract_primary_key(cmd, args) {
+            db.hot_keys().observe(key);
+        }
+    }
 
     #[inline(always)]
     fn resp(f: Frame) -> DispatchResult {
@@ -1215,6 +1238,12 @@ fn dispatch_read_inner(db: &Database, cmd: &[u8], args: &[Frame], now_ms: u64) -
                 return resp(server_admin::memory_readonly(db, args, now_ms));
             }
         }
+        (6, b'o') => {
+            // OBJECT (ENCODING / FREQ / IDLETIME / REFCOUNT / HELP — all read-only)
+            if cmd.eq_ignore_ascii_case(b"OBJECT") {
+                return resp(key::object_readonly(db, args, now_ms));
+            }
+        }
         (6, b's') => {
             // STRLEN SUBSTR SINTER SUNION
             if cmd.eq_ignore_ascii_case(b"STRLEN") {
@@ -1249,12 +1278,15 @@ fn dispatch_read_inner(db: &Database, cmd: &[u8], args: &[Frame], now_ms: u64) -
             }
         }
         (7, b'h') => {
-            // HGETALL HEXISTS
+            // HGETALL HEXISTS HOTKEYS
             if cmd.eq_ignore_ascii_case(b"HGETALL") {
                 return resp(hash::hgetall_readonly(db, args, now_ms));
             }
             if cmd.eq_ignore_ascii_case(b"HEXISTS") {
                 return resp(hash::hexists_readonly(db, args, now_ms));
+            }
+            if cmd.eq_ignore_ascii_case(b"HOTKEYS") {
+                return resp(server_admin::hotkeys(db, args));
             }
         }
         (7, b'p') => {
@@ -1363,6 +1395,86 @@ mod tests {
             .iter()
             .map(|p| Frame::BulkString(Bytes::copy_from_slice(p)))
             .collect()
+    }
+
+    #[test]
+    fn hotkeys_reports_sampled_hot_key() {
+        let mut db = Database::new();
+        let mut selected = 0usize;
+        let set_args = make_args(&[b"hotkey", b"v"]);
+        dispatch(&mut db, b"SET", &set_args, &mut selected, 16);
+        // 64 keyed commands → exactly 4 sampled observations (1-in-16).
+        let get_args = make_args(&[b"hotkey"]);
+        for _ in 0..63 {
+            dispatch(&mut db, b"GET", &get_args, &mut selected, 16);
+        }
+        match dispatch(&mut db, b"HOTKEYS", &[], &mut selected, 16) {
+            DispatchResult::Response(Frame::Array(entries)) => {
+                assert_eq!(entries.len(), 1, "only one distinct key was touched");
+                match &entries[0] {
+                    Frame::Array(pair) => {
+                        assert_eq!(pair[0], Frame::BulkString(Bytes::from_static(b"hotkey")));
+                        assert_eq!(pair[1], Frame::Integer(4));
+                    }
+                    _ => panic!("expected [key, count] pair"),
+                }
+            }
+            _ => panic!("expected array response"),
+        }
+    }
+
+    #[test]
+    fn hotkeys_count_argument_is_validated() {
+        let mut db = Database::new();
+        let mut selected = 0usize;
+        // COUNT 0 and COUNT > capacity are rejected.
+        for bad in [&b"0"[..], b"129", b"abc"] {
+            let args = make_args(&[b"COUNT", bad]);
+            match dispatch(&mut db, b"HOTKEYS", &args, &mut selected, 16) {
+                DispatchResult::Response(Frame::Error(_)) => {}
+                _ => panic!("expected error for bad COUNT argument"),
+            }
+        }
+        // Unknown subcommand rejected.
+        let args = make_args(&[b"LIMIT", b"5"]);
+        match dispatch(&mut db, b"HOTKEYS", &args, &mut selected, 16) {
+            DispatchResult::Response(Frame::Error(_)) => {}
+            _ => panic!("expected error for LIMIT"),
+        }
+        // Valid COUNT on an empty sketch returns an empty array.
+        let args = make_args(&[b"COUNT", b"5"]);
+        match dispatch(&mut db, b"HOTKEYS", &args, &mut selected, 16) {
+            DispatchResult::Response(Frame::Array(entries)) => assert!(entries.is_empty()),
+            _ => panic!("expected empty array"),
+        }
+    }
+
+    #[test]
+    fn read_path_serves_object_and_hotkeys() {
+        // Regression: the monoio handler routes every non-write command
+        // through dispatch_read; OBJECT and HOTKEYS used to die in its
+        // unknown-command fallback even though dispatch() handled them.
+        let mut db = Database::new();
+        let mut selected = 0usize;
+        let set_args = make_args(&[b"k", b"v"]);
+        dispatch(&mut db, b"SET", &set_args, &mut selected, 16);
+
+        let obj_args = make_args(&[b"ENCODING", b"k"]);
+        match dispatch_read(&db, b"OBJECT", &obj_args, 0, &mut selected, 16) {
+            DispatchResult::Response(f) => {
+                assert_eq!(f, Frame::BulkString(Bytes::from("embstr")));
+            }
+            _ => panic!("expected OBJECT ENCODING response on read path"),
+        }
+        let freq_args = make_args(&[b"FREQ", b"k"]);
+        match dispatch_read(&db, b"OBJECT", &freq_args, 0, &mut selected, 16) {
+            DispatchResult::Response(Frame::Integer(_)) => {}
+            _ => panic!("expected OBJECT FREQ integer on read path"),
+        }
+        match dispatch_read(&db, b"HOTKEYS", &[], 0, &mut selected, 16) {
+            DispatchResult::Response(Frame::Array(_)) => {}
+            _ => panic!("expected HOTKEYS array on read path"),
+        }
     }
 
     #[test]

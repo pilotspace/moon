@@ -269,6 +269,7 @@ pub(crate) fn extract_primary_key<'a>(cmd: &[u8], args: &'a [Frame]) -> Option<&
         (6, b's') => cmd.eq_ignore_ascii_case(b"SELECT"),
         (7, b'c') => cmd.eq_ignore_ascii_case(b"COMMAND") || cmd.eq_ignore_ascii_case(b"CLUSTER"),
         (7, b'd') => cmd.eq_ignore_ascii_case(b"DISCARD"),
+        (7, b'h') => cmd.eq_ignore_ascii_case(b"HOTKEYS"),
         (7, b'p') => cmd.eq_ignore_ascii_case(b"PUBLISH"),
         (7, b's') => cmd.eq_ignore_ascii_case(b"SLAVEOF"),
         (8, b'l') => cmd.eq_ignore_ascii_case(b"LASTSAVE"),
@@ -284,6 +285,16 @@ pub(crate) fn extract_primary_key<'a>(cmd: &[u8], args: &'a [Frame]) -> Option<&
 
     if is_keyless || args.is_empty() {
         return None;
+    }
+    // OBJECT <subcommand> <key>: the key is the 2nd argument (first_key=2
+    // in metadata). Routing by args[0] would hash the subcommand name and
+    // send the command to an arbitrary shard ("ERR no such key").
+    // OBJECT HELP has no key and falls through to None (executes locally).
+    if (len, b0) == (6, b'o') && cmd.eq_ignore_ascii_case(b"OBJECT") {
+        return match args.get(1) {
+            Some(Frame::BulkString(key)) => Some(key),
+            _ => None,
+        };
     }
     match &args[0] {
         Frame::BulkString(key) => Some(key),
@@ -358,6 +369,25 @@ mod as_of_tests {
             args.push(Frame::BulkString(Bytes::from(wall_ms.to_string())));
         }
         args
+    }
+
+    #[test]
+    fn extract_primary_key_object_routes_by_real_key() {
+        // OBJECT <subcommand> <key>: routing must hash the key (arg 2),
+        // never the subcommand name.
+        let args = vec![frame_bulk(b"FREQ"), frame_bulk(b"mykey")];
+        let got = extract_primary_key(b"OBJECT", &args);
+        assert_eq!(got.map(|b| b.as_ref()), Some(&b"mykey"[..]));
+        // OBJECT HELP has no key — executes locally.
+        let help = vec![frame_bulk(b"HELP")];
+        assert!(extract_primary_key(b"OBJECT", &help).is_none());
+    }
+
+    #[test]
+    fn extract_primary_key_hotkeys_is_keyless() {
+        // HOTKEYS COUNT 5 must not route by "COUNT".
+        let args = vec![frame_bulk(b"COUNT"), frame_bulk(b"5")];
+        assert!(extract_primary_key(b"HOTKEYS", &args).is_none());
     }
 
     #[test]

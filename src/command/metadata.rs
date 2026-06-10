@@ -357,6 +357,8 @@ pub static COMMAND_META: phf::Map<&'static str, CommandMeta> = phf_map! {
     "CONFIG" => CommandMeta { name: "CONFIG", arity: -2, flags: A, first_key: 0, last_key: 0, step: 0, acl_categories: SRV },
     "ACL" => CommandMeta { name: "ACL", arity: -2, flags: A, first_key: 0, last_key: 0, step: 0, acl_categories: SRV },
     "SLOWLOG" => CommandMeta { name: "SLOWLOG", arity: -2, flags: A, first_key: 0, last_key: 0, step: 0, acl_categories: SRV },
+    // Moon extension: HOTKEYS [COUNT n] — top sampled keys from the per-shard sketch.
+    "HOTKEYS" => CommandMeta { name: "HOTKEYS", arity: -1, flags: RA, first_key: 0, last_key: 0, step: 0, acl_categories: SRV },
     "DEBUG" => CommandMeta { name: "DEBUG", arity: -2, flags: A, first_key: 0, last_key: 0, step: 0, acl_categories: DNG },
     // MA2: KILL SNAPSHOT <txn_id> — operator command to forcibly kill an active MVCC snapshot.
     // Arity -3: KILL SNAPSHOT <txn_id> (exactly 3 tokens). Admin + Dangerous category.

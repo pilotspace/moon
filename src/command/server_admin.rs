@@ -92,6 +92,53 @@ fn check_flush_args(args: &[Frame]) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// HOTKEYS
+// ---------------------------------------------------------------------------
+
+/// `HOTKEYS [COUNT n]` — top sampled keys on this database (Moon extension).
+///
+/// Returns an array of `[key, sampled_count]` pairs sorted by count
+/// descending. Counts are 1-in-16 samples of keyed commands; multiply by 16
+/// for an approximate command rate. In multi-shard mode the connection
+/// handler merges per-shard results, so clients always see the global view.
+pub fn hotkeys(db: &Database, args: &[Frame]) -> Frame {
+    let count = match parse_hotkeys_count(args) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let top = db.hot_keys().top(count);
+    let mut out: Vec<Frame> = Vec::with_capacity(top.len());
+    for (key, sampled) in top {
+        out.push(Frame::Array(framevec![
+            Frame::BulkString(key),
+            Frame::Integer(sampled as i64),
+        ]));
+    }
+    Frame::Array(out.into())
+}
+
+/// Parse `HOTKEYS [COUNT n]` arguments. Shared by the local command and the
+/// cross-shard coordinator path so both reject identically.
+pub fn parse_hotkeys_count(args: &[Frame]) -> Result<usize, Frame> {
+    match args {
+        [] => Ok(crate::storage::hotkey::HOTKEY_DEFAULT_COUNT),
+        [subcmd, n] => {
+            let valid = extract_bytes(subcmd).is_some_and(|s| s.eq_ignore_ascii_case(b"COUNT"));
+            if !valid {
+                return Err(Frame::Error(Bytes::from_static(b"ERR syntax error")));
+            }
+            match extract_bytes(n).and_then(|s| atoi::atoi::<usize>(s)) {
+                Some(n) if (1..=crate::storage::hotkey::HOTKEY_CAPACITY).contains(&n) => Ok(n),
+                _ => Err(Frame::Error(Bytes::from_static(
+                    b"ERR COUNT must be an integer between 1 and 128",
+                ))),
+            }
+        }
+        _ => Err(err_wrong_args("HOTKEYS")),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // DEBUG OBJECT / SLEEP / HELP
 // ---------------------------------------------------------------------------
 
