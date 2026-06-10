@@ -80,6 +80,34 @@ pub enum MonoioHandlerResult {
     },
 }
 
+/// Write-path eviction gate shared by the slice and guard write paths.
+///
+/// Reads the runtime config, fetches this shard's elastic budget (GAP-1),
+/// and runs the spill-aware evictor when disk offload is wired, the plain
+/// budget evictor otherwise. Returns the evictor's OOM frame verbatim.
+#[cfg(feature = "runtime-monoio")]
+fn run_write_eviction_gate(
+    ctx: &super::core::ConnectionContext,
+    db: &mut crate::storage::db::Database,
+    sel_db: usize,
+) -> Result<(), Frame> {
+    let rt = ctx.runtime_config.read();
+    let budget = ctx.shard_databases.elastic_budget(ctx.shard_id);
+    if let Some(ref sender) = ctx.spill_sender {
+        let mut fid = ctx.spill_file_id.get();
+        let dir = ctx
+            .disk_offload_dir
+            .as_deref()
+            .unwrap_or(std::path::Path::new("."));
+        let res =
+            try_evict_if_needed_async_spill_budget(db, &rt, sender, dir, &mut fid, sel_db, budget);
+        ctx.spill_file_id.set(fid);
+        res
+    } else {
+        try_evict_if_needed_budget(db, &rt, budget)
+    }
+}
+
 /// Monoio connection handler using ownership-based I/O (AsyncReadRent/AsyncWriteRent).
 /// Dispatches commands through `crate::command::dispatch()` with monoio's ownership I/O model.
 #[cfg(feature = "runtime-monoio")]
@@ -1278,23 +1306,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
 
                                 // Eviction under the new path
                                 if batch_eviction_active {
-                                    let rt = ctx.runtime_config.read();
-                                    let budget = ctx.shard_databases.elastic_budget(ctx.shard_id);
-                                    let evict_result = if let Some(ref sender) = ctx.spill_sender {
-                                        let mut fid = ctx.spill_file_id.get();
-                                        let dir = ctx
-                                            .disk_offload_dir
-                                            .as_deref()
-                                            .unwrap_or(std::path::Path::new("."));
-                                        let res = try_evict_if_needed_async_spill_budget(
-                                            db, &rt, sender, dir, &mut fid, sel_db, budget,
-                                        );
-                                        ctx.spill_file_id.set(fid);
-                                        res
-                                    } else {
-                                        try_evict_if_needed_budget(db, &rt, budget)
-                                    };
-                                    evict_result?;
+                                    run_write_eviction_gate(ctx, db, sel_db)?;
                                 }
 
                                 // KV undo-log capture (MUST precede dispatch)
@@ -1407,34 +1419,12 @@ pub(crate) async fn handle_connection_sharded_monoio<
                             let mut guard =
                                 ctx.shard_databases.write_db(ctx.shard_id, conn.selected_db);
                             if batch_eviction_active {
-                                let rt = ctx.runtime_config.read();
-                                let budget = ctx.shard_databases.elastic_budget(ctx.shard_id);
-                                let evict_result = if let Some(ref sender) = ctx.spill_sender {
-                                    let mut fid = ctx.spill_file_id.get();
-                                    let dir = ctx
-                                        .disk_offload_dir
-                                        .as_deref()
-                                        .unwrap_or(std::path::Path::new("."));
-                                    let res = try_evict_if_needed_async_spill_budget(
-                                        &mut guard,
-                                        &rt,
-                                        sender,
-                                        dir,
-                                        &mut fid,
-                                        conn.selected_db,
-                                        budget,
-                                    );
-                                    ctx.spill_file_id.set(fid);
-                                    res
-                                } else {
-                                    try_evict_if_needed_budget(&mut guard, &rt, budget)
-                                };
+                                let evict_result =
+                                    run_write_eviction_gate(ctx, &mut guard, conn.selected_db);
                                 if let Err(oom_frame) = evict_result {
                                     drop(guard);
-                                    drop(rt);
                                     break 'write_path Err(oom_frame);
                                 }
-                                drop(rt);
                             }
 
                             if let Some(ref mut txn) = conn.active_cross_txn {
