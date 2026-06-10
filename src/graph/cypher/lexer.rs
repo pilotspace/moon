@@ -10,69 +10,69 @@ use logos::Logos;
 /// Each variant either carries no data (keywords, punctuation) or borrows
 /// a `&[u8]` slice from the input (identifiers, literals, parameters).
 #[derive(Logos, Debug, Clone, PartialEq)]
-#[logos(source = [u8])]
+#[logos(utf8 = false)]
 #[logos(skip br"[ \t\r\n]+")]
 pub enum Token<'a> {
     // --- Keywords (case-insensitive via callback) ---
-    #[token(b"MATCH", ignore(ascii_case))]
+    #[token(b"MATCH", ignore(case))]
     Match,
-    #[token(b"OPTIONAL", ignore(ascii_case))]
+    #[token(b"OPTIONAL", ignore(case))]
     Optional,
-    #[token(b"WHERE", ignore(ascii_case))]
+    #[token(b"WHERE", ignore(case))]
     Where,
-    #[token(b"RETURN", ignore(ascii_case))]
+    #[token(b"RETURN", ignore(case))]
     Return,
-    #[token(b"CREATE", ignore(ascii_case))]
+    #[token(b"CREATE", ignore(case))]
     Create,
-    #[token(b"DELETE", ignore(ascii_case))]
+    #[token(b"DELETE", ignore(case))]
     Delete,
-    #[token(b"DETACH", ignore(ascii_case))]
+    #[token(b"DETACH", ignore(case))]
     Detach,
-    #[token(b"SET", ignore(ascii_case))]
+    #[token(b"SET", ignore(case))]
     Set,
-    #[token(b"MERGE", ignore(ascii_case))]
+    #[token(b"MERGE", ignore(case))]
     Merge,
-    #[token(b"WITH", ignore(ascii_case))]
+    #[token(b"WITH", ignore(case))]
     With,
-    #[token(b"UNWIND", ignore(ascii_case))]
+    #[token(b"UNWIND", ignore(case))]
     Unwind,
-    #[token(b"ORDER", ignore(ascii_case))]
+    #[token(b"ORDER", ignore(case))]
     Order,
-    #[token(b"BY", ignore(ascii_case))]
+    #[token(b"BY", ignore(case))]
     By,
-    #[token(b"LIMIT", ignore(ascii_case))]
+    #[token(b"LIMIT", ignore(case))]
     Limit,
-    #[token(b"SKIP", ignore(ascii_case))]
+    #[token(b"SKIP", ignore(case))]
     Skip,
-    #[token(b"AS", ignore(ascii_case))]
+    #[token(b"AS", ignore(case))]
     As,
-    #[token(b"AND", ignore(ascii_case))]
+    #[token(b"AND", ignore(case))]
     And,
-    #[token(b"OR", ignore(ascii_case))]
+    #[token(b"OR", ignore(case))]
     Or,
-    #[token(b"NOT", ignore(ascii_case))]
+    #[token(b"NOT", ignore(case))]
     Not,
-    #[token(b"TRUE", ignore(ascii_case))]
+    #[token(b"TRUE", ignore(case))]
     True,
-    #[token(b"FALSE", ignore(ascii_case))]
+    #[token(b"FALSE", ignore(case))]
     False,
-    #[token(b"NULL", ignore(ascii_case))]
+    #[token(b"NULL", ignore(case))]
     Null,
-    #[token(b"IN", ignore(ascii_case))]
+    #[token(b"IN", ignore(case))]
     In,
-    #[token(b"IS", ignore(ascii_case))]
+    #[token(b"IS", ignore(case))]
     Is,
-    #[token(b"CALL", ignore(ascii_case))]
+    #[token(b"CALL", ignore(case))]
     Call,
-    #[token(b"YIELD", ignore(ascii_case))]
+    #[token(b"YIELD", ignore(case))]
     Yield,
-    #[token(b"DISTINCT", ignore(ascii_case))]
+    #[token(b"DISTINCT", ignore(case))]
     Distinct,
-    #[token(b"ASC", ignore(ascii_case))]
+    #[token(b"ASC", ignore(case))]
     Asc,
-    #[token(b"DESC", ignore(ascii_case))]
+    #[token(b"DESC", ignore(case))]
     Desc,
-    #[token(b"ON", ignore(ascii_case))]
+    #[token(b"ON", ignore(case))]
     On,
 
     // --- Identifiers ---
@@ -156,7 +156,7 @@ pub enum Token<'a> {
     ArrowLeft,
 
     // --- Comments (skipped) ---
-    #[regex(br"//[^\n]*")]
+    #[regex(br"//[^\n]*", allow_greedy = true)]
     LineComment,
 
     // --- Block comments ---
