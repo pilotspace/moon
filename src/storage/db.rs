@@ -124,6 +124,8 @@ pub struct Database {
     pub cold_index: Option<crate::storage::tiered::cold_index::ColdIndex>,
     /// Shard directory for cold reads (None when disk-offload disabled).
     pub cold_shard_dir: Option<std::path::PathBuf>,
+    /// Hot-key detection sketch, fed by sampled dispatch observations.
+    hot_keys: crate::storage::hotkey::HotKeySketch,
 }
 
 impl Database {
@@ -138,6 +140,7 @@ impl Database {
             maybe_has_expiring_keys: false,
             cold_index: None,
             cold_shard_dir: None,
+            hot_keys: crate::storage::hotkey::HotKeySketch::new(),
         }
     }
 
@@ -161,6 +164,7 @@ impl Database {
             maybe_has_expiring_keys: false,
             cold_index: None,
             cold_shard_dir: None,
+            hot_keys: crate::storage::hotkey::HotKeySketch::new(),
         }
     }
 
@@ -817,6 +821,14 @@ impl Database {
         self.data = DashTable::new();
         self.used_memory = 0;
         self.maybe_has_expiring_keys = false;
+        self.hot_keys.clear();
+    }
+
+    /// The hot-key sketch (sampling hooks, HOTKEYS command, coordinator
+    /// merge). Interior mutability — `&self` suffices for observe/top/clear.
+    #[inline]
+    pub fn hot_keys(&self) -> &crate::storage::hotkey::HotKeySketch {
+        &self.hot_keys
     }
 
     /// Bulk-load insert: skip duplicate check, version tracking, and per-key memory accounting.
