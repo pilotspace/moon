@@ -1,6 +1,6 @@
 //! Per-shard hot-key detection: SpaceSaving top-K sketch.
 //!
-//! Each `Database` owns one `HotKeySketch`. Both dispatchers sample 1-in-16
+//! Each `Database` owns one `HotKeySketch`. Both dispatchers sample 1-in-64
 //! keyed commands (`tick()` gates the sampling) and record the primary key
 //! into the sketch. `HOTKEYS [COUNT n]` reads the top entries; in multi-shard
 //! mode the coordinator merges per-shard results.
@@ -19,8 +19,9 @@
 //! retain any key whose true frequency exceeds total/K.
 //!
 //! Memory: K=128 slots × ~40 B ≈ 5 KB per database — L1-resident, so the
-//! linear scans below are a few ns. With 1-in-16 sampling the amortized
-//! dispatch cost is well under 1% of a SET.
+//! linear scans below are a few ns. With 1-in-64 sampling the amortized
+//! dispatch cost is well under 1% of a SET (A/B verified; 1-in-16 cost 3-5%
+//! on uniform-random pipelined workloads).
 //!
 //! Kill switch: `MOON_NO_HOTKEYS=1` disables sampling at process start
 //! (checked once; `tick()` then never fires).
@@ -35,8 +36,15 @@ use std::sync::atomic::{AtomicU32, Ordering};
 /// to be retained; in practice the top ~dozen are what operators act on.
 pub const HOTKEY_CAPACITY: usize = 128;
 
-/// Sample 1 in 2^4 = 16 keyed commands.
-const SAMPLE_SHIFT_MASK: u32 = 0xF;
+/// Sample 1 in 2^6 = 64 keyed commands. Chosen by A/B benchmark: at 1-in-16
+/// a uniform-random key stream (sketch always full, every observe pays the
+/// full O(K) scan) cost 3-5% pipelined throughput; 1-in-64 brings the
+/// amortized cost under the 1% gate while a 100k op/s hot key still gets
+/// ~1.5k samples/s — orders of magnitude above the detection threshold.
+const SAMPLE_SHIFT_MASK: u32 = 0x3F;
+
+/// Multiplier from sampled counts to approximate command counts.
+pub const HOTKEY_SAMPLE_RATE: u64 = (SAMPLE_SHIFT_MASK as u64) + 1;
 
 /// Default number of entries returned by `HOTKEYS` without COUNT.
 pub const HOTKEY_DEFAULT_COUNT: usize = 10;
@@ -50,8 +58,8 @@ fn hotkeys_disabled() -> bool {
 pub struct HotKeySketch {
     /// Unsorted (key, estimated_count) slots; at most `HOTKEY_CAPACITY`.
     entries: Mutex<Vec<(CompactKey, u64)>>,
-    /// Dispatch tick counter driving 1-in-16 sampling (relaxed — exact
-    /// cadence under concurrency doesn't matter, only the ~1/16 rate).
+    /// Dispatch tick counter driving 1-in-64 sampling (relaxed — exact
+    /// cadence under concurrency doesn't matter, only the ~1/64 rate).
     sample_tick: AtomicU32,
     /// Process-wide kill switch, latched at construction.
     enabled: bool,
@@ -75,24 +83,32 @@ impl HotKeySketch {
     }
 
     /// Advance the sampling counter; returns `true` when this command should
-    /// be observed (1 in 16). One relaxed fetch_add — the only per-dispatch cost.
+    /// be observed (1 in 64). One relaxed fetch_add — the only per-dispatch cost.
     #[inline]
     pub fn tick(&self) -> bool {
         let prev = self.sample_tick.fetch_add(1, Ordering::Relaxed);
         self.enabled && prev.wrapping_add(1) & SAMPLE_SHIFT_MASK == 0
     }
 
-    /// Record one observation of `key` (SpaceSaving update). O(K) scan —
-    /// only reached on sampled ticks. Never blocks: a contended lock drops
-    /// the sample.
+    /// Record one observation of `key` (SpaceSaving update). Single O(K)
+    /// scan — membership check and min tracking share one pass (uniform
+    /// random keys hit the worst case on EVERY sampled observe, so the scan
+    /// count directly bounds the hot-path cost). Only reached on sampled
+    /// ticks. Never blocks: a contended lock drops the sample.
     pub fn observe(&self, key: &[u8]) {
         let Some(mut entries) = self.entries.try_lock() else {
             return;
         };
-        for entry in entries.iter_mut() {
+        let mut min_idx = 0usize;
+        let mut min_count = u64::MAX;
+        for (i, entry) in entries.iter_mut().enumerate() {
             if entry.0.as_bytes() == key {
                 entry.1 += 1;
                 return;
+            }
+            if entry.1 < min_count {
+                min_count = entry.1;
+                min_idx = i;
             }
         }
         if entries.len() < HOTKEY_CAPACITY {
@@ -100,14 +116,12 @@ impl HotKeySketch {
             return;
         }
         // Table full: replace the minimum-count slot, inheriting min + 1.
-        #[allow(clippy::unwrap_used)] // entries.len() == HOTKEY_CAPACITY > 0 here
-        let (min_idx, _) = entries.iter().enumerate().min_by_key(|(_, e)| e.1).unwrap();
-        let inherited = entries[min_idx].1 + 1;
-        entries[min_idx] = (CompactKey::from(key), inherited);
+        entries[min_idx] = (CompactKey::from(key), min_count + 1);
     }
 
     /// Top `n` entries by estimated count, descending. Counts are sample
-    /// counts (multiply by 16 for an approximate command rate).
+    /// counts (multiply by `HOTKEY_SAMPLE_RATE` for an approximate command
+    /// rate).
     pub fn top(&self, n: usize) -> Vec<(Bytes, u64)> {
         let entries = self.entries.lock();
         let mut sorted: Vec<(Bytes, u64)> = entries
@@ -193,9 +207,10 @@ mod tests {
     }
 
     #[test]
-    fn tick_fires_one_in_sixteen() {
+    fn tick_fires_at_sample_rate() {
         let sk = HotKeySketch::new();
-        let fired = (0..160).filter(|_| sk.tick()).count();
+        let n = (HOTKEY_SAMPLE_RATE as usize) * 10;
+        let fired = (0..n).filter(|_| sk.tick()).count();
         assert_eq!(fired, 10);
     }
 

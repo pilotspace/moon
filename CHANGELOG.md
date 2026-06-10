@@ -10,12 +10,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **New `HOTKEYS [COUNT n]` command** (Moon extension, `@server` ACL,
   read-only): returns the top sampled keys as `[key, sampled_count]` pairs,
-  count descending. Counts are 1-in-16 samples of keyed commands — multiply
-  by 16 for an approximate command rate. In multi-shard mode the connection
+  count descending. Counts are 1-in-64 samples of keyed commands — multiply
+  by 64 for an approximate command rate. In multi-shard mode the connection
   handler merges per-shard sketches (DBSIZE-style scatter-gather), so clients
   always see the global view.
 - **Per-shard SpaceSaving top-K sketch** (K=128, ~5 KB per database,
-  L1-resident): fed by all three execution paths — write dispatch, the shared
+  L1-resident, single-pass scan): fed by all three execution paths — write dispatch, the shared
   read path, and the inline GET/SET fast path. The tick counter is one relaxed
   `fetch_add` per command; the O(K) sketch update runs only on sampled ticks
   and `try_lock`s (a contended sample is dropped — the hot path never blocks).

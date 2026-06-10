@@ -601,8 +601,8 @@ echo ""
 log "=== HOTKEYS (moon-only) ==="
 
 redis-cli -p "$PORT_RUST" SET hotk:probe v >/dev/null 2>&1
-# 64 keyed commands guarantee >= 4 sketch samples at the 1-in-16 rate.
-for _ in $(seq 1 64); do redis-cli -p "$PORT_RUST" GET hotk:probe >/dev/null 2>&1; done
+# 128 keyed commands guarantee >= 2 sketch samples at the 1-in-64 rate.
+for _ in $(seq 1 128); do redis-cli -p "$PORT_RUST" GET hotk:probe >/dev/null 2>&1; done
 HOTKEYS_OUT=$(redis-cli -p "$PORT_RUST" HOTKEYS COUNT 5 2>&1)
 if echo "$HOTKEYS_OUT" | grep -q "hotk:probe"; then
     PASS=$((PASS + 1))

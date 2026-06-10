@@ -75,7 +75,7 @@ fn dispatch_inner(
     let b0 = cmd[0] | 0x20; // lowercase first byte
 
     // Hot-key sampling: tick() is one relaxed fetch_add; the O(K) sketch
-    // update only runs on 1-in-16 keyed commands, keeping the amortized
+    // update only runs on 1-in-64 keyed commands, keeping the amortized
     // dispatch cost well under the hot-path allocation budget.
     if db.hot_keys().tick() {
         if let Some(key) = crate::server::conn::shared::extract_primary_key(cmd, args) {
@@ -1403,9 +1403,9 @@ mod tests {
         let mut selected = 0usize;
         let set_args = make_args(&[b"hotkey", b"v"]);
         dispatch(&mut db, b"SET", &set_args, &mut selected, 16);
-        // 64 keyed commands → exactly 4 sampled observations (1-in-16).
+        // 128 keyed commands → exactly 2 sampled observations (1-in-64).
         let get_args = make_args(&[b"hotkey"]);
-        for _ in 0..63 {
+        for _ in 0..127 {
             dispatch(&mut db, b"GET", &get_args, &mut selected, 16);
         }
         match dispatch(&mut db, b"HOTKEYS", &[], &mut selected, 16) {
@@ -1414,7 +1414,7 @@ mod tests {
                 match &entries[0] {
                     Frame::Array(pair) => {
                         assert_eq!(pair[0], Frame::BulkString(Bytes::from_static(b"hotkey")));
-                        assert_eq!(pair[1], Frame::Integer(4));
+                        assert_eq!(pair[1], Frame::Integer(2));
                     }
                     _ => panic!("expected [key, count] pair"),
                 }

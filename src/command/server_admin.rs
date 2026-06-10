@@ -98,7 +98,7 @@ fn check_flush_args(args: &[Frame]) -> bool {
 /// `HOTKEYS [COUNT n]` — top sampled keys on this database (Moon extension).
 ///
 /// Returns an array of `[key, sampled_count]` pairs sorted by count
-/// descending. Counts are 1-in-16 samples of keyed commands; multiply by 16
+/// descending. Counts are 1-in-64 samples of keyed commands; multiply by 64
 /// for an approximate command rate. In multi-shard mode the connection
 /// handler merges per-shard results, so clients always see the global view.
 pub fn hotkeys(db: &Database, args: &[Frame]) -> Frame {
