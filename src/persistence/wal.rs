@@ -63,6 +63,10 @@ pub struct WalWriter {
     shard_id: usize,
     /// Buffered RESP bytes awaiting flush.
     buf: Vec<u8>,
+    /// Staging buffer for assembling the full block frame
+    /// (header + payload + CRC) so each flush is a single write syscall.
+    /// Cleared after every flush; capacity is retained.
+    frame_buf: Vec<u8>,
     /// File handle for the WAL.
     file: Option<std::fs::File>,
     /// Path to the WAL file.
@@ -97,6 +101,7 @@ impl WalWriter {
         let mut writer = Self {
             shard_id,
             buf: Vec::with_capacity(8192),
+            frame_buf: Vec::with_capacity(8192),
             file: Some(file),
             file_path,
             write_offset,
@@ -233,15 +238,19 @@ impl WalWriter {
             // block_len = cmd_count(2) + db_idx(1) + payload.len() + crc32(4)
             let block_len = (2 + 1 + self.buf.len() + 4) as u32;
 
-            // Write block frame: 7-byte header on stack, then payload, then CRC
-            let mut block_header = [0u8; 7];
-            block_header[0..4].copy_from_slice(&block_len.to_le_bytes());
-            block_header[4..6].copy_from_slice(&cmd_count_bytes);
-            block_header[6] = db_idx;
+            // Assemble the full block frame (header + payload + CRC) in the
+            // reusable staging buffer so the flush is ONE write syscall
+            // instead of three. On-disk layout is unchanged:
+            // [block_len:4 LE][cmd_count:2 LE][db_idx:1][payload:var][crc32:4 LE]
+            self.frame_buf.clear();
+            self.frame_buf.reserve(7 + self.buf.len() + 4);
+            self.frame_buf.extend_from_slice(&block_len.to_le_bytes());
+            self.frame_buf.extend_from_slice(&cmd_count_bytes);
+            self.frame_buf.push(db_idx);
+            self.frame_buf.extend_from_slice(&self.buf);
+            self.frame_buf.extend_from_slice(&crc.to_le_bytes());
 
-            file.write_all(&block_header)?;
-            file.write_all(&self.buf)?;
-            file.write_all(&crc.to_le_bytes())?;
+            file.write_all(&self.frame_buf)?;
 
             let total_written = 4 + block_len as u64; // block_len prefix + block_len contents
             self.write_offset += total_written;

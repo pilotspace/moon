@@ -223,6 +223,12 @@ pub struct UringDriver {
     /// Eventfd registered with io_uring for CQE notifications.
     /// When CQEs arrive, the kernel writes to this fd, waking tokio's epoll.
     cqe_eventfd: RawFd,
+    /// Reusable scratch for decoded CQEs so `drain_completions*` doesn't
+    /// heap-allocate per batch (called on every eventfd wake + 1ms tick).
+    cqe_scratch: Vec<(u8, u32, u32, i32, u32)>,
+    /// Reusable event buffer loaned to the event loop via
+    /// `take_event_scratch` / `return_event_scratch`.
+    event_scratch: Vec<IoEvent>,
 }
 
 impl UringDriver {
@@ -293,6 +299,8 @@ impl UringDriver {
             pending_sqes: 0,
             tick: 0,
             cqe_eventfd: efd,
+            cqe_scratch: Vec::with_capacity(256),
+            event_scratch: Vec::with_capacity(256),
         })
     }
 
@@ -586,28 +594,54 @@ impl UringDriver {
         Ok(n)
     }
 
+    /// Take the reusable event buffer (capacity retained across drains).
+    ///
+    /// The event loop borrows this around its drain loop so per-batch event
+    /// collection is allocation-free; give it back with
+    /// `return_event_scratch` when done.
+    #[inline]
+    pub fn take_event_scratch(&mut self) -> Vec<IoEvent> {
+        std::mem::take(&mut self.event_scratch)
+    }
+
+    /// Return the event buffer taken with `take_event_scratch`.
+    #[inline]
+    pub fn return_event_scratch(&mut self, mut events: Vec<IoEvent>) {
+        events.clear();
+        self.event_scratch = events;
+    }
+
     /// Drain all completed CQEs, returning events for the caller to process.
+    ///
+    /// Allocating variant of [`Self::drain_completions_into`]; prefer the
+    /// `_into` form with `take_event_scratch` on the hot path.
+    pub fn drain_completions(&mut self) -> Vec<IoEvent> {
+        let mut events = Vec::new();
+        self.drain_completions_into(&mut events);
+        events
+    }
+
+    /// Drain all completed CQEs, appending events for the caller to process.
     ///
     /// The caller (shard event loop) handles command dispatch based on event type.
     /// Buffer lifecycle: recv data is copied from the provided buffer before
     /// the buffer is returned to the ring (per pitfall 1 in research).
-    pub fn drain_completions(&mut self) -> Vec<IoEvent> {
+    pub fn drain_completions_into(&mut self, events: &mut Vec<IoEvent>) {
         self.tick += 1;
         let current_tick = self.tick;
-        let mut events = Vec::new();
 
         // Collect CQEs first to release the mutable borrow on self.ring,
         // allowing return_buf to access the ring's submission queue below.
-        let cqes: Vec<(u8, u32, u32, i32, u32)> = self
-            .ring
-            .completion()
-            .map(|cqe| {
-                let (event_type, conn_id, aux) = decode_user_data(cqe.user_data());
-                (event_type, conn_id, aux, cqe.result(), cqe.flags())
-            })
-            .collect();
+        // Reuses the persistent scratch (mem::take avoids a borrow conflict
+        // with the buf_ring/connections accesses in the loop body).
+        let mut cqes = std::mem::take(&mut self.cqe_scratch);
+        cqes.clear();
+        cqes.extend(self.ring.completion().map(|cqe| {
+            let (event_type, conn_id, aux) = decode_user_data(cqe.user_data());
+            (event_type, conn_id, aux, cqe.result(), cqe.flags())
+        }));
 
-        for (event_type, conn_id, _aux, result, flags) in cqes {
+        for (event_type, conn_id, _aux, result, flags) in cqes.drain(..) {
             match event_type {
                 EVENT_ACCEPT => {
                     if result >= 0 {
@@ -691,7 +725,8 @@ impl UringDriver {
             }
         }
 
-        events
+        // Put the (drained) CQE scratch back for the next batch.
+        self.cqe_scratch = cqes;
     }
 
     // -----------------------------------------------------------------------

@@ -365,7 +365,7 @@ Moon stands on systems research and an open-source ecosystem. Headline credits:
 - **[Monoio (ByteDance)](https://github.com/bytedance/monoio)** + **[io_uring (Axboe)](https://kernel.dk/io_uring.pdf)** — thread-per-core io_uring runtime.
 - **[Redis Protocol Spec (RESP2/RESP3)](https://redis.io/docs/latest/develop/reference/protocol-spec/)** + **[Redis Cluster Spec](https://redis.io/docs/latest/operate/oss_and_stack/reference/cluster-spec/)** — wire protocol and cluster semantics.
 
-Full list with per-dependency rationale and paper summaries: **[docs/references.mdx](docs/references.mdx)**.
+Full list with per-dependency rationale and paper summaries: **[docs/references.mdx](docs/references.md)**.
 
 ## License
 

@@ -21,8 +21,9 @@ use crate::vector::hnsw::search::{
 };
 #[allow(unused_imports)]
 use crate::vector::hnsw::search_sq::hnsw_search_f32;
-use crate::vector::turbo_quant::collection::CollectionMetadata;
+use crate::vector::turbo_quant::collection::{CollectionMetadata, QuantizationConfig};
 use crate::vector::turbo_quant::inner_product::{prepare_query_prod, score_l2_prod};
+use crate::vector::turbo_quant::sq8::{decode_sq8, sq8_params};
 use crate::vector::turbo_quant::sub_centroid;
 use crate::vector::types::SearchResult;
 use crate::vector::types::VectorId;
@@ -421,8 +422,20 @@ impl ImmutableSegment {
     pub fn decode_vector(&self, internal_id: u32) -> Vec<f32> {
         let bfs_pos = self.graph.to_bfs(internal_id) as usize;
         let bytes_per_code = self.graph.bytes_per_code() as usize;
-        let code_len = bytes_per_code - 4;
         let offset = bfs_pos * bytes_per_code;
+        let dim = self.collection_meta.dimension as usize;
+
+        // SQ8 stores `dim` u8 codes + an 8-byte (min, scale) trailer (= dim + 8);
+        // there is no TQ codebook / FWHT to invert. Decode the affine codes
+        // directly. Without this branch the TQ path below would mis-stride the
+        // slot and return garbage if this (merge-oriented) helper is ever called.
+        if self.collection_meta.quantization == QuantizationConfig::Sq8 {
+            let slot = &self.vectors_tq.as_slice()[offset..offset + bytes_per_code];
+            let (min, scale) = sq8_params(slot, dim);
+            return decode_sq8(&slot[..dim], min, scale);
+        }
+
+        let code_len = bytes_per_code - 4;
         let code_bytes = self.vectors_tq.as_slice()[offset..offset + code_len].to_vec();
         let norm_bytes = &self.vectors_tq.as_slice()[offset + code_len..offset + bytes_per_code];
         let norm = f32::from_le_bytes([norm_bytes[0], norm_bytes[1], norm_bytes[2], norm_bytes[3]]);
@@ -431,7 +444,6 @@ impl ImmutableSegment {
             codes: code_bytes,
             norm,
         };
-        let dim = self.collection_meta.dimension as usize;
         let padded = self.collection_meta.padded_dimension as usize;
         let centroids = self.collection_meta.codebook_16();
         let sign_flips = self.collection_meta.fwht_sign_flips.as_slice();

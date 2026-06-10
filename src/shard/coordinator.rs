@@ -755,6 +755,89 @@ pub async fn coordinate_dbsize(
     Frame::Integer(total)
 }
 
+/// Coordinate HOTKEYS across all shards: merge per-shard top-K sketches.
+///
+/// Each key lives on exactly one shard, so the merge never has to sum
+/// duplicate keys — it sorts the union by sampled count and truncates.
+pub async fn coordinate_hotkeys(
+    count: usize,
+    my_shard: usize,
+    num_shards: usize,
+    db_index: usize,
+    shard_databases: &Arc<ShardDatabases>,
+    dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
+    spsc_notifiers: &[Arc<channel::Notify>],
+    _response_pool: &(), // placeholder — coordinator uses oneshot internally
+) -> Frame {
+    let mut merged: Vec<(Bytes, i64)> = Vec::new();
+
+    // Local shard: read the sketch directly.
+    {
+        let local = if crate::shard::slice::is_initialized() {
+            crate::shard::slice::with_shard_db(db_index, |db| db.hot_keys().top(count))
+        } else {
+            let guard = shard_databases.read_db(my_shard, db_index);
+            guard.hot_keys().top(count)
+        };
+        merged.extend(local.into_iter().map(|(k, c)| (k, c as i64)));
+    }
+
+    // Remote shards: synthetic HOTKEYS COUNT <n> executes via normal dispatch.
+    let mut count_buf = itoa::Buffer::new();
+    let count_bytes = Bytes::copy_from_slice(count_buf.format(count).as_bytes());
+    let mut pending_shards: Vec<channel::OneshotReceiver<Frame>> = Vec::new();
+    for target in 0..num_shards {
+        if target == my_shard {
+            continue;
+        }
+        let (reply_tx, reply_rx) = channel::oneshot();
+        let cmd_frame = Frame::Array(framevec![
+            Frame::BulkString(Bytes::from_static(b"HOTKEYS")),
+            Frame::BulkString(Bytes::from_static(b"COUNT")),
+            Frame::BulkString(count_bytes.clone()),
+        ]);
+        let msg = ShardMessage::Execute {
+            db_index,
+            command: std::sync::Arc::new(cmd_frame),
+            reply_tx,
+        };
+        spsc_send(dispatch_tx, my_shard, target, msg, spsc_notifiers).await;
+        pending_shards.push(reply_rx);
+    }
+
+    for reply_rx in pending_shards {
+        match reply_rx.recv().await {
+            Ok(Frame::Array(entries)) => {
+                for entry in entries.iter() {
+                    if let Frame::Array(pair) = entry
+                        && let (Some(Frame::BulkString(k)), Some(Frame::Integer(c))) =
+                            (pair.first(), pair.get(1))
+                    {
+                        merged.push((k.clone(), *c));
+                    }
+                }
+            }
+            Ok(_) => {} // Error/unexpected reply from one shard — skip its entries
+            Err(_) => {
+                return Frame::Error(Bytes::from_static(
+                    b"ERR cross-shard reply channel closed during HOTKEYS",
+                ));
+            }
+        }
+    }
+
+    merged.sort_unstable_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    merged.truncate(count);
+    let mut out: Vec<Frame> = Vec::with_capacity(merged.len());
+    for (key, sampled) in merged {
+        out.push(Frame::Array(framevec![
+            Frame::BulkString(key),
+            Frame::Integer(sampled),
+        ]));
+    }
+    Frame::Array(out.into())
+}
+
 /// Scatter a vector search query to all shards, collect per-shard results,
 /// and merge into a global top-K response.
 ///

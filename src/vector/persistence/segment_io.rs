@@ -696,4 +696,100 @@ mod tests {
             Err(e) => panic!("expected Io error, got {:?}", e),
         }
     }
+
+    /// Build a real SQ8 immutable segment via the production pipeline
+    /// (MutableSegment append → freeze → compact). Returns the segment, its
+    /// collection, and the f32 db vectors for recall checking.
+    fn build_sq8_segment(
+        n: usize,
+        dim: usize,
+    ) -> (ImmutableSegment, Arc<CollectionMetadata>, Vec<Vec<f32>>) {
+        use crate::vector::segment::compaction::compact;
+        use crate::vector::segment::mutable::MutableSegment;
+        distance::init();
+        let collection = Arc::new(CollectionMetadata::new(
+            1,
+            dim as u32,
+            DistanceMetric::Cosine,
+            QuantizationConfig::Sq8,
+            42,
+        ));
+        let seg = MutableSegment::new(dim as u32, collection.clone());
+        let mut db = Vec::with_capacity(n);
+        for i in 0..n {
+            let mut v = lcg_f32(dim, (i * 7 + 13) as u32);
+            normalize(&mut v);
+            seg.append(i as u64, &v, &[], 1.0, i as u64 + 1);
+            db.push(v);
+        }
+        let frozen = seg.freeze();
+        let imm = compact(&frozen, &collection, 12345, None).expect("SQ8 compact failed");
+        (imm, collection, db)
+    }
+
+    /// Persistence round-trip for SQ8: write an SQ8 immutable segment to disk,
+    /// read it back, and prove the reloaded segment searches correctly.
+    ///
+    /// Uses config-D-strength assertions (exact-match top1 + recall@10), NOT
+    /// `!is_empty()` — a broken-stride reload would still return k results, so
+    /// only a recall check discriminates a correct SQ8 reload from garbage.
+    #[test]
+    fn test_sq8_roundtrip_search_recall() {
+        let dim = 96usize;
+        let n = 200usize;
+        let (segment, collection, db) = build_sq8_segment(n, dim);
+        let tmp = tempfile::tempdir().unwrap();
+
+        write_immutable_segment(tmp.path(), 1, &segment, &collection).unwrap();
+        let (restored, restored_col) = read_immutable_segment(tmp.path(), 1).unwrap();
+
+        assert_eq!(restored_col.quantization, QuantizationConfig::Sq8);
+        assert_eq!(restored.live_count(), segment.live_count());
+
+        let padded = collection.padded_dimension;
+
+        // Exact-match invariant: query == db[7] must rank 7 first after reload.
+        let mut scratch =
+            crate::vector::hnsw::search::SearchScratch::new(restored.graph().num_nodes(), padded);
+        let res = restored.search(&db[7], 10, 128, &mut scratch);
+        assert!(!res.is_empty(), "reloaded SQ8 search returned nothing");
+        assert_eq!(
+            res[0].id.0 as usize, 7,
+            "reloaded SQ8 nearest != exact match: got {}",
+            res[0].id.0
+        );
+
+        // recall@10 vs exact-f32 L2 ground truth over several queries.
+        let queries = [3usize, 7, 50, 123, 199];
+        let mut total_hits = 0usize;
+        for &qi in &queries {
+            let mut idx: Vec<usize> = (0..n).collect();
+            idx.sort_by(|&a, &b| {
+                let da: f32 = db[qi]
+                    .iter()
+                    .zip(&db[a])
+                    .map(|(x, y)| (x - y) * (x - y))
+                    .sum();
+                let dbb: f32 = db[qi]
+                    .iter()
+                    .zip(&db[b])
+                    .map(|(x, y)| (x - y) * (x - y))
+                    .sum();
+                da.total_cmp(&dbb)
+            });
+            let exact: std::collections::HashSet<u32> =
+                idx.into_iter().take(10).map(|i| i as u32).collect();
+            let mut sc = crate::vector::hnsw::search::SearchScratch::new(
+                restored.graph().num_nodes(),
+                padded,
+            );
+            let got = restored.search(&db[qi], 10, 128, &mut sc);
+            let got_ids: std::collections::HashSet<u32> = got.iter().map(|r| r.id.0).collect();
+            total_hits += exact.intersection(&got_ids).count();
+        }
+        assert!(
+            total_hits >= 42,
+            "reloaded SQ8 recall@10 too low: {total_hits}/50"
+        );
+    }
 }

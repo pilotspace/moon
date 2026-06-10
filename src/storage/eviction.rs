@@ -106,7 +106,7 @@ pub fn aggregate_used_memory(databases: &[Database]) -> usize {
 }
 
 /// Eviction policy variants matching Redis maxmemory-policy.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EvictionPolicy {
     NoEviction,
     AllKeysLru,
@@ -120,17 +120,26 @@ pub enum EvictionPolicy {
 
 impl EvictionPolicy {
     /// Parse a policy name string (case-insensitive) into an EvictionPolicy.
+    ///
+    /// Allocation-free: called per `try_evict_if_needed` invocation (i.e. per
+    /// write command under memory pressure), so it must not build a lowercase
+    /// `String` on every call.
     pub fn from_str(s: &str) -> Self {
-        match s.to_ascii_lowercase().as_str() {
-            "allkeys-lru" => EvictionPolicy::AllKeysLru,
-            "allkeys-lfu" => EvictionPolicy::AllKeysLfu,
-            "allkeys-random" => EvictionPolicy::AllKeysRandom,
-            "volatile-lru" => EvictionPolicy::VolatileLru,
-            "volatile-lfu" => EvictionPolicy::VolatileLfu,
-            "volatile-random" => EvictionPolicy::VolatileRandom,
-            "volatile-ttl" => EvictionPolicy::VolatileTtl,
-            _ => EvictionPolicy::NoEviction,
+        const TABLE: [(&str, EvictionPolicy); 7] = [
+            ("allkeys-lru", EvictionPolicy::AllKeysLru),
+            ("allkeys-lfu", EvictionPolicy::AllKeysLfu),
+            ("allkeys-random", EvictionPolicy::AllKeysRandom),
+            ("volatile-lru", EvictionPolicy::VolatileLru),
+            ("volatile-lfu", EvictionPolicy::VolatileLfu),
+            ("volatile-random", EvictionPolicy::VolatileRandom),
+            ("volatile-ttl", EvictionPolicy::VolatileTtl),
+        ];
+        for (name, policy) in TABLE {
+            if s.eq_ignore_ascii_case(name) {
+                return policy;
+            }
         }
+        EvictionPolicy::NoEviction
     }
 
     /// Return the canonical string name for this policy.
@@ -165,12 +174,66 @@ pub struct SpillContext<'a> {
     pub next_file_id: &'a mut u64,
 }
 
+/// Compute a shard's elastic memory budget from a snapshot of every shard's
+/// published usage (GAP-1: hot-shard memory pooling).
+///
+/// `base` is the static per-shard budget (`maxmemory / num_shards`). Shards
+/// under `base` donate their headroom; shards at-or-over `base` split the
+/// donated surplus evenly. The aggregate invariant holds by construction:
+///
+/// ```text
+/// Σ_hot (base + surplus/H) + Σ_under used_u
+///   ≤ H·base + Σ_under (base − used_u) + Σ_under used_u  = N·base ≈ maxmemory
+/// ```
+///
+/// so the instance-wide cap is never exceeded (modulo one tick of staleness
+/// in the snapshot — the same bound the static scheme already has between
+/// eviction ticks). An under-budget shard always keeps its full `base`, so
+/// a shard whose load returns is never squeezed below its static share.
+///
+/// Returns `base` when pooling cannot help: unlimited memory, single shard,
+/// this shard under budget, or no hot shard in the snapshot.
+pub fn compute_elastic_budget(shard_id: usize, base: usize, used: &[usize]) -> usize {
+    if base == 0 || used.len() <= 1 || shard_id >= used.len() {
+        return base;
+    }
+    let mut surplus = 0usize;
+    let mut hot = 0usize;
+    for &u in used {
+        if u < base {
+            surplus += base - u;
+        } else {
+            hot += 1;
+        }
+    }
+    if used[shard_id] < base || hot == 0 {
+        return base;
+    }
+    base.saturating_add(surplus / hot)
+}
+
 /// Check if eviction is needed and attempt to free memory.
 ///
 /// Returns Ok(()) if memory is within limits (or maxmemory is 0).
 /// Returns Err(Frame) with OOM error if eviction fails to free enough memory.
 pub fn try_evict_if_needed(db: &mut Database, config: &RuntimeConfig) -> Result<(), Frame> {
     try_evict_if_needed_with_spill(db, config, None)
+}
+
+/// Like [`try_evict_if_needed`] but enforcing an elastic per-shard budget
+/// (`0` falls back to the static `maxmemory / num_shards`).
+pub fn try_evict_if_needed_budget(
+    db: &mut Database,
+    config: &RuntimeConfig,
+    budget_override: usize,
+) -> Result<(), Frame> {
+    try_evict_if_needed_with_spill_and_total_budget(
+        db,
+        config,
+        None,
+        db.estimated_memory(),
+        budget_override,
+    )
 }
 
 /// Check if eviction is needed, optionally spilling evicted entries to disk.
@@ -197,8 +260,24 @@ pub fn try_evict_if_needed_with_spill(
 pub fn try_evict_if_needed_with_spill_and_total(
     db: &mut Database,
     config: &RuntimeConfig,
+    spill: Option<&mut SpillContext<'_>>,
+    total_memory: usize,
+) -> Result<(), Frame> {
+    try_evict_if_needed_with_spill_and_total_budget(db, config, spill, total_memory, 0)
+}
+
+/// Core sync eviction loop with an elastic budget override (GAP-1).
+///
+/// `budget_override == 0` keeps the static `maxmemory / num_shards`
+/// threshold; a non-zero value (from
+/// `ShardDatabases::recompute_elastic_budget`) lets a hot shard borrow
+/// headroom donated by under-budget siblings before evicting.
+pub fn try_evict_if_needed_with_spill_and_total_budget(
+    db: &mut Database,
+    config: &RuntimeConfig,
     mut spill: Option<&mut SpillContext<'_>>,
     total_memory: usize,
+    budget_override: usize,
 ) -> Result<(), Frame> {
     if config.maxmemory == 0 {
         return Ok(());
@@ -209,8 +288,13 @@ pub fn try_evict_if_needed_with_spill_and_total(
     // Compare against the PER-SHARD budget, not the whole-instance maxmemory.
     // `maxmemory` is a whole-instance cap; each shard enforces independently, so
     // the threshold is `maxmemory / num_shards` (single shard ⇒ unchanged). This
-    // is what bounds aggregate RSS in multishard mode.
-    let budget = config.maxmemory_per_shard();
+    // is what bounds aggregate RSS in multishard mode. An elastic override
+    // (capped at the instance maxmemory) widens the threshold for hot shards.
+    let budget = if budget_override > 0 {
+        budget_override.min(config.maxmemory)
+    } else {
+        config.maxmemory_per_shard()
+    };
     let mut current_total = total_memory;
     while current_total > budget {
         if policy == EvictionPolicy::NoEviction {
@@ -330,14 +414,66 @@ pub fn try_evict_if_needed_async_spill_with_total(
     total_memory: usize,
     db_index: usize,
 ) -> Result<(), Frame> {
+    try_evict_if_needed_async_spill_with_total_budget(
+        db,
+        config,
+        sender,
+        shard_dir,
+        next_file_id,
+        total_memory,
+        db_index,
+        0,
+    )
+}
+
+/// Like [`try_evict_if_needed_async_spill`] but enforcing an elastic
+/// per-shard budget (`0` falls back to the static `maxmemory / num_shards`).
+pub fn try_evict_if_needed_async_spill_budget(
+    db: &mut Database,
+    config: &RuntimeConfig,
+    sender: &flume::Sender<SpillRequest>,
+    shard_dir: &Path,
+    next_file_id: &mut u64,
+    db_index: usize,
+    budget_override: usize,
+) -> Result<(), Frame> {
+    try_evict_if_needed_async_spill_with_total_budget(
+        db,
+        config,
+        sender,
+        shard_dir,
+        next_file_id,
+        db.estimated_memory(),
+        db_index,
+        budget_override,
+    )
+}
+
+/// Async spill eviction with an elastic budget override (GAP-1; see
+/// `try_evict_if_needed_with_spill_and_total_budget`).
+#[allow(clippy::too_many_arguments)]
+pub fn try_evict_if_needed_async_spill_with_total_budget(
+    db: &mut Database,
+    config: &RuntimeConfig,
+    sender: &flume::Sender<SpillRequest>,
+    shard_dir: &Path,
+    next_file_id: &mut u64,
+    total_memory: usize,
+    db_index: usize,
+    budget_override: usize,
+) -> Result<(), Frame> {
     if config.maxmemory == 0 {
         return Ok(());
     }
 
     let policy = EvictionPolicy::from_str(&config.maxmemory_policy);
 
-    // Per-shard budget (see `try_evict_if_needed_with_spill_and_total`).
-    let budget = config.maxmemory_per_shard();
+    // Per-shard budget (see `try_evict_if_needed_with_spill_and_total_budget`).
+    let budget = if budget_override > 0 {
+        budget_override.min(config.maxmemory)
+    } else {
+        config.maxmemory_per_shard()
+    };
     let mut current_total = total_memory;
     while current_total > budget {
         if policy == EvictionPolicy::NoEviction {
@@ -668,6 +804,131 @@ mod tests {
     use crate::persistence::kv_page::read_datafile;
     use crate::persistence::manifest::ShardManifest;
     use crate::storage::entry::{Entry, current_secs, current_time_ms};
+
+    // -----------------------------------------------------------------
+    // compute_elastic_budget (GAP-1)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn elastic_budget_balanced_load_keeps_base() {
+        // Every shard at base — no surplus to borrow.
+        assert_eq!(compute_elastic_budget(0, 100, &[100, 100, 100, 100]), 100);
+    }
+
+    #[test]
+    fn elastic_budget_under_budget_shard_keeps_base() {
+        // An under-budget shard never borrows (and never shrinks below base).
+        assert_eq!(compute_elastic_budget(1, 100, &[100, 10, 100, 100]), 100);
+    }
+
+    #[test]
+    fn elastic_budget_single_hot_shard_takes_all_surplus() {
+        // Shard 0 hot, three idle siblings donate (100-10)*3 = 270.
+        assert_eq!(compute_elastic_budget(0, 100, &[100, 10, 10, 10]), 370);
+    }
+
+    #[test]
+    fn elastic_budget_two_hot_shards_split_surplus() {
+        // Two hot shards split (100-10)*2 = 180 → +90 each.
+        assert_eq!(compute_elastic_budget(0, 100, &[150, 10, 10, 120]), 190);
+        assert_eq!(compute_elastic_budget(3, 100, &[150, 10, 10, 120]), 190);
+    }
+
+    #[test]
+    fn elastic_budget_snapshot_aggregate_never_exceeds_total() {
+        // Snapshot invariant: Σ_hot budget_i + Σ_under used_i ≤ N·base.
+        // (A donor growing back is re-balanced on the next 100ms tick — the
+        // hot shard's budget shrinks with the surplus and write-path
+        // eviction pulls it back down, so transient overshoot is bounded by
+        // one tick of donor write growth, same class as the static scheme's
+        // between-tick slack.)
+        let base = 100usize;
+        for used in [
+            vec![400, 0, 0, 0],
+            vec![150, 150, 0, 0],
+            vec![100, 100, 100, 100],
+            vec![0, 0, 0, 0],
+            vec![350, 99, 1, 0],
+        ] {
+            let n = used.len();
+            let total: usize = (0..n)
+                .map(|i| {
+                    if used[i] >= base {
+                        compute_elastic_budget(i, base, &used)
+                    } else {
+                        used[i]
+                    }
+                })
+                .sum();
+            assert!(
+                total <= n * base,
+                "snapshot aggregate {total} > cap {} for {used:?}",
+                n * base
+            );
+        }
+    }
+
+    #[test]
+    fn elastic_budget_degenerate_inputs_fall_back_to_base() {
+        assert_eq!(compute_elastic_budget(0, 0, &[10, 10]), 0); // unlimited
+        assert_eq!(compute_elastic_budget(0, 100, &[500]), 100); // single shard
+        assert_eq!(compute_elastic_budget(7, 100, &[100, 0]), 100); // bad index
+    }
+
+    #[test]
+    fn elastic_budget_override_widens_eviction_threshold() {
+        // A db over the static budget but under the override must NOT evict;
+        // override 0 must evict down to the static threshold.
+        let mut db = Database::new();
+        let mut config = make_config(20_000, "allkeys-lru");
+        config.num_shards = 4; // static per-shard budget = 5000
+        for i in 0..50 {
+            let key = bytes::Bytes::from(format!("k{i}"));
+            let entry = Entry::new_string(bytes::Bytes::from(vec![0u8; 100]));
+            db.set(key, entry);
+        }
+        let used = db.estimated_memory();
+        assert!(
+            used > 5_000 && used < 20_000,
+            "fixture must sit between static budget and maxmemory, got {used}"
+        );
+
+        // Elastic override above current usage: no eviction.
+        let keys_before = db.len();
+        try_evict_if_needed_with_spill_and_total_budget(&mut db, &config, None, used, used + 1024)
+            .expect("within elastic budget must not OOM");
+        assert_eq!(db.len(), keys_before, "no eviction under elastic budget");
+
+        // Static budget (override 0): must evict below 5000 bytes.
+        let used_now = db.estimated_memory();
+        try_evict_if_needed_with_spill_and_total_budget(&mut db, &config, None, used_now, 0)
+            .expect("eviction should succeed");
+        assert!(
+            db.estimated_memory() <= 5_000,
+            "static budget must evict down to maxmemory/num_shards"
+        );
+        assert!(db.len() < keys_before);
+    }
+
+    #[test]
+    fn elastic_budget_override_is_capped_at_instance_maxmemory() {
+        // Override beyond maxmemory clamps: usage above maxmemory must evict.
+        let mut db = Database::new();
+        let config = make_config(500, "allkeys-lru");
+        for i in 0..50 {
+            let key = bytes::Bytes::from(format!("k{i}"));
+            let entry = Entry::new_string(bytes::Bytes::from(vec![0u8; 100]));
+            db.set(key, entry);
+        }
+        let used = db.estimated_memory();
+        assert!(used > 500);
+        try_evict_if_needed_with_spill_and_total_budget(&mut db, &config, None, used, usize::MAX)
+            .expect("eviction should succeed");
+        assert!(
+            db.estimated_memory() <= 500,
+            "override must clamp at instance maxmemory"
+        );
+    }
 
     fn make_config(maxmemory: usize, policy: &str) -> RuntimeConfig {
         RuntimeConfig {

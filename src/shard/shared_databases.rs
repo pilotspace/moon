@@ -67,6 +67,14 @@ pub struct ShardDatabases {
     /// sum (Phase 3). Coexists with the existing `aggregate_memory()` path
     /// until Phase 3 switches the eviction tick.
     memory_per_shard: Vec<Arc<AtomicUsize>>,
+    /// Per-shard elastic memory budgets (GAP-1 hot-shard pooling).
+    ///
+    /// Recomputed by each shard's 100ms eviction tick from the
+    /// `memory_per_shard` snapshot (`recompute_elastic_budget`). `0` means
+    /// "no elastic budget yet" — readers fall back to the static
+    /// `maxmemory / num_shards`. Write paths read with one Relaxed load
+    /// (`elastic_budget`).
+    elastic_budgets: Vec<Arc<AtomicUsize>>,
 }
 
 impl ShardDatabases {
@@ -103,6 +111,9 @@ impl ShardDatabases {
         let memory_per_shard = (0..num_shards)
             .map(|_| Arc::new(AtomicUsize::new(0)))
             .collect();
+        let elastic_budgets = (0..num_shards)
+            .map(|_| Arc::new(AtomicUsize::new(0)))
+            .collect();
         Arc::new(Self {
             shards,
             vector_stores,
@@ -120,6 +131,7 @@ impl ShardDatabases {
             num_shards,
             db_count,
             memory_per_shard,
+            elastic_budgets,
         })
     }
 
@@ -760,6 +772,55 @@ impl ShardDatabases {
         self.memory_per_shard[shard_id].clone()
     }
 
+    /// Publish a shard's aggregate memory usage (GAP-1 / Phase 2 wiring).
+    ///
+    /// Called from the shard's 100ms eviction tick with the freshly computed
+    /// `aggregate_memory(shard_id)` value. One Relaxed store — siblings read
+    /// the snapshot in `recompute_elastic_budget`.
+    #[inline]
+    pub fn publish_memory(&self, shard_id: usize, used: usize) {
+        self.memory_per_shard[shard_id].store(used, Ordering::Relaxed);
+    }
+
+    /// Recompute and publish this shard's elastic memory budget (GAP-1).
+    ///
+    /// Reads every shard's published usage (N Relaxed loads, once per 100ms
+    /// tick) and derives this shard's budget via
+    /// [`crate::storage::eviction::compute_elastic_budget`]: under-budget
+    /// siblings donate their headroom, hot shards split it evenly, and the
+    /// snapshot aggregate never exceeds `maxmemory`. Returns the budget it
+    /// stored. Single-shard or unlimited deployments publish `0`
+    /// ("use static budget") so readers take the unchanged fallback path.
+    pub fn recompute_elastic_budget(
+        &self,
+        shard_id: usize,
+        config: &crate::config::RuntimeConfig,
+    ) -> usize {
+        let base = config.maxmemory_per_shard();
+        if base == 0 || self.num_shards <= 1 {
+            self.elastic_budgets[shard_id].store(0, Ordering::Relaxed);
+            return 0;
+        }
+        // Snapshot of every shard's published usage. SmallVec would save the
+        // alloc, but this runs 10×/s on a background tick — a Vec is fine.
+        let used: Vec<usize> = self
+            .memory_per_shard
+            .iter()
+            .map(|a| a.load(Ordering::Relaxed))
+            .collect();
+        let budget = crate::storage::eviction::compute_elastic_budget(shard_id, base, &used);
+        self.elastic_budgets[shard_id].store(budget, Ordering::Relaxed);
+        budget
+    }
+
+    /// This shard's current elastic budget; `0` = none published yet (use
+    /// the static `maxmemory / num_shards`). One Relaxed load — cheap enough
+    /// for the per-write eviction check.
+    #[inline]
+    pub fn elastic_budget(&self, shard_id: usize) -> usize {
+        self.elastic_budgets[shard_id].load(Ordering::Relaxed)
+    }
+
     /// Sum all per-shard memory publishers with `Relaxed` loads. Lock-free.
     ///
     /// Returns a best-effort estimate of total server memory across all shards.
@@ -873,6 +934,54 @@ mod tests {
         let (seg_counts, base_ts) = shared.snapshot_metadata(0);
         assert_eq!(seg_counts.len(), 2);
         assert_eq!(base_ts.len(), 2);
+    }
+
+    // ── GAP-1: elastic budget publish/recompute ──────────────────────────
+
+    fn rt_config(maxmemory: usize, num_shards: usize) -> crate::config::RuntimeConfig {
+        let mut rt = crate::config::RuntimeConfig::default();
+        rt.maxmemory = maxmemory;
+        rt.num_shards = num_shards;
+        rt
+    }
+
+    #[test]
+    fn elastic_budget_defaults_to_zero_until_recomputed() {
+        let shared = ShardDatabases::new(vec![vec![Database::new()], vec![Database::new()]]);
+        assert_eq!(shared.elastic_budget(0), 0);
+        assert_eq!(shared.elastic_budget(1), 0);
+    }
+
+    #[test]
+    fn recompute_elastic_budget_hot_shard_borrows_idle_headroom() {
+        let shared = ShardDatabases::new(vec![
+            vec![Database::new()],
+            vec![Database::new()],
+            vec![Database::new()],
+            vec![Database::new()],
+        ]);
+        let rt = rt_config(400, 4); // base = 100 per shard
+        shared.publish_memory(0, 120); // hot
+        shared.publish_memory(1, 10);
+        shared.publish_memory(2, 10);
+        shared.publish_memory(3, 10);
+        // Hot shard borrows (100-10)*3 = 270 → budget 370.
+        assert_eq!(shared.recompute_elastic_budget(0, &rt), 370);
+        assert_eq!(shared.elastic_budget(0), 370);
+        // Idle shards keep base.
+        assert_eq!(shared.recompute_elastic_budget(1, &rt), 100);
+    }
+
+    #[test]
+    fn recompute_elastic_budget_disabled_for_single_shard_or_unlimited() {
+        let shared = ShardDatabases::new(vec![vec![Database::new()]]);
+        let rt = rt_config(400, 1);
+        assert_eq!(shared.recompute_elastic_budget(0, &rt), 0);
+
+        let shared2 = ShardDatabases::new(vec![vec![Database::new()], vec![Database::new()]]);
+        let unlimited = rt_config(0, 2);
+        assert_eq!(shared2.recompute_elastic_budget(0, &unlimited), 0);
+        assert_eq!(shared2.elastic_budget(0), 0);
     }
 
     #[test]

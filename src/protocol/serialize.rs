@@ -2,6 +2,52 @@ use bytes::{BufMut, BytesMut};
 
 use super::frame::Frame;
 
+/// Stack buffer holding the `Display` output of an `f64`.
+///
+/// `{}` formatting of `f64` never uses scientific notation, so the longest
+/// output is a subnormal like `5e-324`: `-0.` + 323 zeros + up to 17
+/// significant digits ≈ 343 bytes. 400 leaves comfortable margin.
+/// Produces byte-identical output to `format!("{}", f)` without the heap
+/// allocation (response serialization is a hot path).
+struct F64Display {
+    buf: [u8; 400],
+    len: usize,
+}
+
+impl F64Display {
+    #[inline]
+    fn format(f: f64) -> Self {
+        use std::fmt::Write;
+        let mut this = F64Display {
+            buf: [0u8; 400],
+            len: 0,
+        };
+        // Cannot fail: buffer is sized for the worst-case f64 Display output
+        // (see struct doc). On the impossible overflow, output is truncated
+        // rather than panicking.
+        let _ = write!(this, "{f}");
+        this
+    }
+
+    #[inline]
+    fn as_bytes(&self) -> &[u8] {
+        &self.buf[..self.len]
+    }
+}
+
+impl std::fmt::Write for F64Display {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        let bytes = s.as_bytes();
+        let end = self.len + bytes.len();
+        let Some(dst) = self.buf.get_mut(self.len..end) else {
+            return Err(std::fmt::Error);
+        };
+        dst.copy_from_slice(bytes);
+        self.len = end;
+        Ok(())
+    }
+}
+
 /// Serialize a Frame into RESP2 wire format, appending to the buffer.
 pub fn serialize(frame: &Frame, buf: &mut BytesMut) {
     match frame {
@@ -64,23 +110,26 @@ pub fn serialize(frame: &Frame, buf: &mut BytesMut) {
             }
         }
         Frame::Double(f) => {
-            // Downgrade: BulkString of formatted float
-            let s = if f.is_infinite() {
+            // Downgrade: BulkString of formatted float (zero-alloc: stack
+            // buffer for finite values, static slices for inf/nan)
+            let formatted;
+            let s: &[u8] = if f.is_infinite() {
                 if f.is_sign_positive() {
-                    "inf".to_string()
+                    b"inf"
                 } else {
-                    "-inf".to_string()
+                    b"-inf"
                 }
             } else if f.is_nan() {
-                "nan".to_string()
+                b"nan"
             } else {
-                format!("{}", f)
+                formatted = F64Display::format(*f);
+                formatted.as_bytes()
             };
             buf.put_u8(b'$');
             let mut itoa_buf = itoa::Buffer::new();
             buf.put_slice(itoa_buf.format(s.len()).as_bytes());
             buf.put_slice(b"\r\n");
-            buf.put_slice(s.as_bytes());
+            buf.put_slice(s);
             buf.put_slice(b"\r\n");
         }
         Frame::Boolean(b) => {
@@ -173,8 +222,8 @@ pub fn serialize_resp3(frame: &Frame, buf: &mut BytesMut) {
             } else if f.is_nan() {
                 buf.put_slice(b"nan");
             } else {
-                let s = format!("{}", f);
-                buf.put_slice(s.as_bytes());
+                // Zero-alloc: stack buffer, byte-identical to format!("{}", f)
+                buf.put_slice(F64Display::format(*f).as_bytes());
             }
             buf.put_slice(b"\r\n");
         }
@@ -616,6 +665,52 @@ mod tests {
     fn test_resp2_downgrade_double_to_bulk_string() {
         let buf = serialize_frame(&Frame::Double(1.5));
         assert_eq!(&buf[..], b"$3\r\n1.5\r\n");
+    }
+
+    // === F64Display stack formatter: must match format!("{}", f) exactly ===
+
+    #[test]
+    fn test_f64_display_matches_std_format() {
+        // Includes the worst-case Display lengths: f64::MAX (~309 digits)
+        // and the smallest subnormal (~326 chars), which guard the stack
+        // buffer capacity in F64Display.
+        let cases = [
+            0.0,
+            -0.0,
+            1.5,
+            -42.5,
+            1.23,
+            3.141592653589793,
+            f64::MAX,
+            f64::MIN,
+            f64::MIN_POSITIVE,
+            5e-324, // smallest subnormal — longest Display output
+            1e308,
+            -1e-308,
+        ];
+        for f in cases {
+            let expected = format!("{}", f);
+            let got = F64Display::format(f);
+            assert_eq!(
+                got.as_bytes(),
+                expected.as_bytes(),
+                "F64Display mismatch for {f:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_serialize_double_extreme_values_resp2_and_resp3() {
+        for f in [f64::MAX, 5e-324, -1e-308] {
+            let s = format!("{}", f);
+            let buf = serialize_frame(&Frame::Double(f));
+            let expected = format!("${}\r\n{}\r\n", s.len(), s);
+            assert_eq!(&buf[..], expected.as_bytes());
+
+            let buf3 = serialize_resp3_frame(&Frame::Double(f));
+            let expected3 = format!(",{}\r\n", s);
+            assert_eq!(&buf3[..], expected3.as_bytes());
+        }
     }
 
     #[test]

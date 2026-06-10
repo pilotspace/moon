@@ -6,6 +6,100 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Elastic per-shard memory budgets (hot-shard headroom borrowing)
+
+- **Hot shards now borrow idle siblings' unused `maxmemory` headroom**
+  instead of being capped at a static `maxmemory / num_shards`. Each shard
+  publishes its used memory on its existing 100ms eviction tick and
+  recomputes an elastic budget from the published snapshot:
+  `base + Σ(under-budget surplus) / hot_shard_count`, clamped to total
+  `maxmemory`. No new locks or channels — two relaxed atomics per shard,
+  read once per write-path eviction check.
+- Snapshot invariant: hot shards' budgets plus under-budget shards' usage
+  never exceed `N × base` at recompute time; transient overshoot is bounded
+  by one tick of donor write growth and converges via write-path eviction.
+- Live 4-shard validation (32MB cap, allkeys-lru, all writes to one shard
+  via a `{tag}`): hot shard retained ~28k × 1KB keys (~30MB) vs the ~7.2k
+  (8MB) static ceiling — 3.9× more of the configured memory actually
+  usable under skewed load. Uniform load is unchanged (same global
+  ceiling, budgets stay at base).
+- Disk-offload pressure cascade and timer-based eviction enforce the same
+  elastic budget; budget `0` (not yet published, single shard, or
+  `maxmemory=0`) falls back to the static per-shard cap everywhere.
+
+### Added — Hot-key detection: `HOTKEYS` command + per-shard SpaceSaving sketch
+
+- **New `HOTKEYS [COUNT n]` command** (Moon extension, `@server` ACL,
+  read-only): returns the top sampled keys as `[key, sampled_count]` pairs,
+  count descending. Counts are 1-in-64 samples of keyed commands — multiply
+  by 64 for an approximate command rate. In multi-shard mode the connection
+  handler merges per-shard sketches (DBSIZE-style scatter-gather), so clients
+  always see the global view.
+- **Per-shard SpaceSaving top-K sketch** (K=128, ~5 KB per database,
+  L1-resident, single-pass scan): fed by all three execution paths — write dispatch, the shared
+  read path, and the inline GET/SET fast path. The tick counter is one relaxed
+  `fetch_add` per command; the O(K) sketch update runs only on sampled ticks
+  and `try_lock`s (a contended sample is dropped — the hot path never blocks).
+  Kill switch: `MOON_NO_HOTKEYS=1`.
+
+### Fixed — `OBJECT` was unreachable over the wire (monoio handler)
+
+- **`OBJECT ENCODING/FREQ/IDLETIME/REFCOUNT` returned `ERR unknown command`
+  on a live server** even though dispatch implemented them: the monoio
+  handler routes every non-write command through the read dispatcher, which
+  had no `OBJECT` arm. Added a read-only `OBJECT` handler (`get_if_alive`,
+  never mutates expiry state) and enabled it on the cross-shard fast path.
+- **`OBJECT <subcmd> <key>` routed by the subcommand name** in multi-shard
+  mode (`extract_primary_key` hashes `args[0]`, which is `FREQ`/`ENCODING`,
+  not the key) — the command landed on an arbitrary shard and answered
+  `ERR no such key`. Key extraction now uses the real key (arg 2).
+
+### Changed — Hot-path performance: deep-review optimization pass (PR #168)
+
+- **+33% pipelined SET, +25% pipelined GET (single shard)** from a deep
+  performance review covering protocol → dispatch → shard → storage →
+  persistence → vector. 11 verified findings implemented:
+  - `Database::get`: 3 → 2 DashTable probes on a hit, 2 → 1 on a miss
+    (single-probe live/expired/absent classification).
+  - WAL v2 flush: 3 → 1 `write(2)` syscalls per 1ms tick via a reusable
+    staging buffer; on-disk format unchanged.
+  - WAL v3 record append no longer heap-allocates per non-FPI record
+    (`Cow::Borrowed`); checkpoint state machine no longer clones per tick.
+  - SPSC drain (`drain_spsc_shared`) reuses thread-local batch buffers
+    instead of allocating two `Vec`s per call.
+  - `Frame::Double` serialization is zero-alloc (stack `f64` Display
+    formatter, byte-identical wire output) in RESP2 and RESP3.
+  - SQ8 vector search no longer heap-allocates per query (HNSW + both
+    brute-force paths); IVF rotation/LUT buffers hoisted out of the
+    per-segment loop in `search_filtered` (parity with `search_mvcc`).
+  - io_uring `drain_completions` reuses persistent CQE/event buffers
+    (allocation-free drain loop at steady state).
+- Multi-shard (2/4/8/16/auto): no regressions; +9–32% pipelined SET at
+  2 and 8 shards. The unpipelined cross-shard latency floor (~1.7ms p50,
+  waker-relay + dispatch tick) is unchanged and tracked for follow-up.
+
+### Fixed — SQ8 vector quantization now works across the full FT lifecycle
+
+- **`FT.CREATE ... QUANTIZATION SQ8` was a declared-but-unimplemented
+  quantizer** — vectors fell through to the TQ4 encoder against an empty
+  codebook, producing degenerate codes and random search (recall 0.014,
+  exact-match returned the wrong key) on real embeddings. Implemented a real
+  per-vector affine scalar-8-bit quantizer (`dim` u8 codes + `(min, scale)`
+  trailer) and wired it through the entire segment lifecycle: append,
+  brute-force search, compact, immutable HNSW search, multi-segment search
+  fan-out, segment **merge**, and persistence reload. Recall on real
+  all-MiniLM-L6-v2 384d embeddings: **0.014 → 0.897**, exact-match correct.
+- **`append_transactional()` corrupted SQ8 vectors** — it wrote the TQ slot
+  layout (`padded/2 + 4`) into `dim + 8` SQ8 slots, corrupting the code stride
+  for every transactionally-inserted or WAL-recovered SQ8 vector. Both append
+  paths now share one `encode_sq8_slot()` helper.
+- **SQ8 ignored the index metric** — an `InnerProduct` index ranked
+  non-normalized inputs by magnitude. SQ8 now normalizes for both unit-sphere
+  metrics (Cosine + InnerProduct), matching the rest of the engine; `L2` keeps
+  raw vectors for true Euclidean ranking.
+- **Docs:** corrected the ≤384d quantization guidance to recommend **SQ8**
+  (the real 8-bit option) instead of the nonexistent "TQ8".
+
 ### Changed — Rust SDK released as moondb 0.2.0 on crates.io
 
 - **`moondb` crate `0.1.1` → `0.2.0`** — publishes the v0.2-era client API

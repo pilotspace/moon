@@ -9,9 +9,10 @@ use smallvec::SmallVec;
 
 use super::graph::{HnswGraph, SENTINEL};
 use crate::vector::aligned_buffer::AlignedBuffer;
-use crate::vector::turbo_quant::collection::CollectionMetadata;
+use crate::vector::turbo_quant::collection::{CollectionMetadata, QuantizationConfig};
 use crate::vector::turbo_quant::fwht;
-use crate::vector::types::{SearchResult, VectorId};
+use crate::vector::turbo_quant::sq8::{sq8_l2_adc, sq8_params};
+use crate::vector::types::{DistanceMetric, SearchResult, VectorId};
 
 /// Bit vector for O(1) visited tracking. 64x more cache-efficient than HashSet
 /// for dense integer keys. Uses test_and_set for combined check+mark.
@@ -249,6 +250,31 @@ pub fn hnsw_search_filtered(
     // Step 1: Prepare rotated query into scratch.query_rotated
     let dim = query.len();
     let padded = collection.padded_dimension as usize;
+
+    // SQ8 uses an axis-aligned per-vector affine quantizer: no FWHT, no codebook,
+    // no sub-centroid LUT. The query stays full-precision f32 (normalized for the
+    // unit-sphere metrics Cosine + InnerProduct to match the encode side, raw for
+    // L2) and feeds a dedicated ADC in the distance closures below. The entire TQ
+    // LUT setup is skipped for SQ8.
+    let is_sq8 = collection.quantization == QuantizationConfig::Sq8;
+    // Inline buffer keeps the per-query SQ8 path heap-free for dim ≤ 512
+    // (preserves the VEC-HNSW-03 zero-allocation guarantee).
+    let sq8_query: SmallVec<[f32; 512]> = if is_sq8 {
+        let mut q: SmallVec<[f32; 512]> = SmallVec::from_slice(query);
+        if collection.metric != DistanceMetric::L2 {
+            let n: f32 = q.iter().map(|x| x * x).sum::<f32>().sqrt();
+            if n > 0.0 {
+                let inv = 1.0 / n;
+                for v in q.iter_mut() {
+                    *v *= inv;
+                }
+            }
+        }
+        q
+    } else {
+        SmallVec::new()
+    };
+
     let q_rot = scratch.query_rotated.as_mut_slice();
     // Copy query and zero-pad
     q_rot[..dim].copy_from_slice(query);
@@ -268,12 +294,21 @@ pub fn hnsw_search_filtered(
             *v *= inv;
         }
     }
-    // Apply FWHT with collection's sign flips
-    fwht::fwht(&mut q_rot[..padded], collection.fwht_sign_flips.as_slice());
+    // Apply FWHT with collection's sign flips (TQ only — SQ8 is axis-aligned).
+    if !is_sq8 {
+        fwht::fwht(&mut q_rot[..padded], collection.fwht_sign_flips.as_slice());
+    }
 
     // Capture immutable slice of rotated query (after mutation phase is done)
     let q_rotated: &[f32] = scratch.query_rotated.as_slice();
-    let codebook = collection.codebook_16();
+    // SQ8 has no shared codebook; use a zero placeholder so codebook_16() never
+    // logs a spurious "empty codebook" error (the SQ8 closures ignore the LUT).
+    let zero_codebook = [0.0f32; 16];
+    let codebook: &[f32; 16] = if is_sq8 {
+        &zero_codebook
+    } else {
+        collection.codebook_16()
+    };
     let use_subcent = !sub_centroid_signs.is_empty() && sub_sign_bpv > 0;
 
     // Pre-compute per-query distance LUT.
@@ -303,7 +338,10 @@ pub fn hnsw_search_filtered(
             .reserve(lut_needed - scratch.adc_lut.capacity());
     }
 
-    if let Some(st) = sub_table.filter(|_| use_subcent) {
+    // SQ8 distance is computed directly from the affine codes; no per-query LUT.
+    if is_sq8 {
+        // adc_lut stays empty (cleared above); the SQ8 closures never read it.
+    } else if let Some(st) = sub_table.filter(|_| use_subcent) {
         for j in 0..padded_dim {
             let q = q_rotated[j];
             for e in 0..32 {
@@ -331,22 +369,32 @@ pub fn hnsw_search_filtered(
     // Invariants relied on by the unsafe ADC LUT inner loops below. These are
     // free in release builds and catch refactor bugs that would otherwise
     // produce out-of-bounds reads on the LUT or sign array.
-    debug_assert_eq!(
-        code_len,
-        padded_dim / 2,
-        "code_len must equal padded_dim/2 for nibble-packed codes",
-    );
-    debug_assert_eq!(
-        adc_lut.len(),
-        padded_dim * entries_per_coord,
-        "adc_lut size mismatch — unsafe loop will read OOB",
-    );
+    // These invariants describe the TQ nibble-packed layout; SQ8 uses a different
+    // slot (dim u8 codes + 8-byte trailer) and its own ADC, so they don't apply.
+    if !is_sq8 {
+        debug_assert_eq!(
+            code_len,
+            padded_dim / 2,
+            "code_len must equal padded_dim/2 for nibble-packed codes",
+        );
+        debug_assert_eq!(
+            adc_lut.len(),
+            padded_dim * entries_per_coord,
+            "adc_lut size mismatch — unsafe loop will read OOB",
+        );
+    }
 
     // LUT-based unbounded distance with optional sub-centroid scoring.
     // Hot path: processes `code_len` bytes (nibble-packed TQ codes) with LUT lookups.
     // For 384d: code_len ≈ 192, 384 nibble lookups per candidate, called ~500 times per query.
     let dist_bfs = |bfs_pos: u32| -> f32 {
         let offset = bfs_pos as usize * bytes_per_code;
+        if is_sq8 {
+            // SQ8: decode (min, scale) from the slot trailer, ADC squared-L2.
+            let slot = &vectors_tq[offset..offset + bytes_per_code];
+            let (min, scale) = sq8_params(slot, dim);
+            return sq8_l2_adc(&sq8_query, &slot[..dim], min, scale);
+        }
         let code_only = &vectors_tq[offset..offset + code_len];
         let norm_bytes = &vectors_tq[offset + code_len..offset + bytes_per_code];
         let norm = f32::from_le_bytes([norm_bytes[0], norm_bytes[1], norm_bytes[2], norm_bytes[3]]);
@@ -479,6 +527,13 @@ pub fn hnsw_search_filtered(
     // LUT-based budgeted distance with early termination.
     let dist_bfs_budgeted = |bfs_pos: u32, budget: f32| -> f32 {
         let offset = bfs_pos as usize * bytes_per_code;
+        if is_sq8 {
+            // SQ8 ADC is cheap and exact; ignore the budget early-exit.
+            let _ = budget;
+            let slot = &vectors_tq[offset..offset + bytes_per_code];
+            let (min, scale) = sq8_params(slot, dim);
+            return sq8_l2_adc(&sq8_query, &slot[..dim], min, scale);
+        }
         let code_only = &vectors_tq[offset..offset + code_len];
         let norm_bytes = &vectors_tq[offset + code_len..offset + bytes_per_code];
         let norm = f32::from_le_bytes([norm_bytes[0], norm_bytes[1], norm_bytes[2], norm_bytes[3]]);

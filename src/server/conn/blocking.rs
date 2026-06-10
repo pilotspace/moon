@@ -1251,6 +1251,11 @@ pub(crate) fn try_inline_dispatch(
         let consumed = key_end_crlf;
         let key_bytes = &buf[key_start..key_end];
         let guard = shard_databases.read_db(shard_id, selected_db);
+        // Hot-key sampling: the inline path bypasses both dispatchers, so it
+        // must feed the sketch itself. tick() is one relaxed fetch_add.
+        if guard.hot_keys().tick() {
+            guard.hot_keys().observe(key_bytes);
+        }
         match guard.get_if_alive(key_bytes, now_ms) {
             Some(entry) => match entry.value.as_bytes() {
                 Some(val) => {
@@ -1347,7 +1352,8 @@ pub(crate) fn try_inline_dispatch(
     {
         let rt = runtime_config.read();
         let mut guard = shard_databases.write_db(shard_id, selected_db);
-        if crate::storage::eviction::try_evict_if_needed(&mut guard, &rt).is_err() {
+        let budget = shard_databases.elastic_budget(shard_id);
+        if crate::storage::eviction::try_evict_if_needed_budget(&mut guard, &rt, budget).is_err() {
             write_buf
                 .extend_from_slice(b"-OOM command not allowed when used memory > 'maxmemory'\r\n");
             return 1;
@@ -1356,6 +1362,11 @@ pub(crate) fn try_inline_dispatch(
 
         let key = frozen.slice(key_start..key_end);
         let value = frozen.slice(val_start..val_end);
+        // Hot-key sampling: the inline path bypasses both dispatchers, so it
+        // must feed the sketch itself. tick() is one relaxed fetch_add.
+        if guard.hot_keys().tick() {
+            guard.hot_keys().observe(&key);
+        }
         let mut entry = crate::storage::entry::Entry::new_string(value);
         entry.set_last_access(guard.now());
         entry.set_access_counter(5);
