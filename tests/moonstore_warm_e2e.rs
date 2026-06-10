@@ -84,10 +84,12 @@ fn test_warm_transition_end_to_end() {
         );
     }
 
-    // 4. Compact
+    // 4. Compact synchronously. try_compact() now only *begins* a background
+    // build (worker thread); force_compact() blocks until the immutable
+    // segment is installed, which is what this lifecycle test needs.
     {
         let idx = store.get_index_mut(b"idx").unwrap();
-        idx.try_compact();
+        idx.force_compact();
     }
 
     // 5. Verify immutable segment was created
@@ -204,7 +206,8 @@ fn test_warm_transition_respects_age_threshold() {
     }
     {
         let idx = store.get_index_mut(b"idx").unwrap();
-        idx.try_compact();
+        // Synchronous compact: try_compact() only begins a background build.
+        idx.force_compact();
     }
 
     // Verify we have immutable segments
@@ -269,7 +272,8 @@ fn test_warm_transition_search_still_works_on_mutable() {
     }
     {
         let idx = store.get_index_mut(b"idx").unwrap();
-        idx.try_compact();
+        // Synchronous compact: try_compact() only begins a background build.
+        idx.force_compact();
     }
 
     // Warm-transition all immutable segments

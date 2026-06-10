@@ -6,6 +6,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — Background FT compaction + segment merge (no more shard freezes)
+
+- **HNSW index builds no longer block the shard event loop.** `try_compact`
+  (auto-compaction on search) now begins the build on a background worker
+  pool and installs the finished immutable segment on a later poll; the
+  triggering search continues against the still-present brute-force mutable
+  segment. Inline builds previously froze the shard for the full build
+  (0.42s @2k → 24.9s @50k vectors, measured); the event-loop stall is now
+  ~4.4ms and PING latency stays flat during compaction.
+- **Background immutable-segment merge**: many small immutable segments are
+  merged into one on the same worker pool (graph-union, no lossy
+  decode/re-encode), bounding per-search segment fan-out. Real-MiniLM
+  recall preserved across the merge (0.9447 → 0.9440 R@10, 18 segments → 1).
+- Deletes that race a background build are reconciled at install time
+  (delete-window replay) — no resurrection of removed vectors.
+- `FT.COMPACT` (explicit user intent) stays synchronous: it drains any
+  in-flight background build, then compacts inline. Tradeoff: searches run
+  brute-force on the mutable segment until the background build installs.
+
 ### Added — Elastic per-shard memory budgets (hot-shard headroom borrowing)
 
 - **Hot shards now borrow idle siblings' unused `maxmemory` headroom**

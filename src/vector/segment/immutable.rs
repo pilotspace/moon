@@ -1,8 +1,14 @@
 //! Read-only segment with HNSW graph and TurboQuant codes.
 //!
 //! Truly immutable after construction -- no locks needed for search.
+//! Interior-mutable tombstoning via `tombstoned_keys` is used only for
+//! steady-state `mark_deleted_for_key` (i.e. a HDEL hits an already-Arc'd
+//! immutable). The hot search path checks `has_tombstones` (one atomic load)
+//! and skips the lock entirely when no keys have been tombstoned.
 
+use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use roaring::RoaringBitmap;
@@ -61,6 +67,24 @@ pub struct ImmutableSegment {
     total_count: u32,
     /// Timestamp when this segment was created (for warm tier age-based transition).
     created_at: Instant,
+
+    // ── Interior-mutable tombstoning ──────────────────────────────────────────
+    //
+    // Two-tier tombstone approach:
+    //   1. `mark_deleted(&mut self)` — used at install time (segment not yet Arc'd),
+    //      writes directly into `mvcc[].delete_lsn` and decrements `live_count`.
+    //   2. `mark_deleted_by_key_hash(&self)` — used for steady-state HDEL on an
+    //      already-Arc'd segment, writes into `tombstoned_keys` (RwLock set).
+    //
+    // Hot search path: `is_live_bfs()` checks `has_tombstones` (one Relaxed atomic
+    // load). When `false` (common case) it skips the lock entirely. When `true` it
+    // acquires a read lock and checks the set. Contention is nil — tombstones are
+    // written at most once per HDEL, and only during deletion.
+    //
+    // Note: steady-state tombstones do NOT decrement `live_count()` (prototype
+    // limitation — count becomes a lower bound, not exact).
+    has_tombstones: AtomicBool,
+    tombstoned_keys: parking_lot::RwLock<HashSet<u64>>,
 }
 
 impl ImmutableSegment {
@@ -91,7 +115,57 @@ impl ImmutableSegment {
             live_count,
             total_count,
             created_at: Instant::now(),
+            has_tombstones: AtomicBool::new(false),
+            tombstoned_keys: parking_lot::RwLock::new(HashSet::new()),
         }
+    }
+
+    /// Mark a key as deleted via interior mutability.
+    ///
+    /// This is the **steady-state** tombstone path: called when a HDEL or
+    /// `mark_deleted_for_key` fires against an already-Arc'd immutable segment.
+    /// Does **not** modify `mvcc` or `live_count` (prototype limitation; see
+    /// struct field comment above).
+    ///
+    /// Returns 1 if the key was newly tombstoned, 0 if it was already present.
+    pub fn mark_deleted_by_key_hash(&self, key_hash: u64) -> u32 {
+        {
+            let guard = self.tombstoned_keys.read();
+            if guard.contains(&key_hash) {
+                return 0;
+            }
+        }
+        let mut guard = self.tombstoned_keys.write();
+        if guard.insert(key_hash) {
+            // Release-store so the next `is_live_bfs` Acquire-load sees the set.
+            self.has_tombstones.store(true, Ordering::Release);
+            1
+        } else {
+            0
+        }
+    }
+
+    /// Returns `true` if the entry at `bfs_pos` is live (not deleted).
+    ///
+    /// Checks both MVCC `delete_lsn` (install-time tombstones) and the
+    /// interior `tombstoned_keys` set (steady-state tombstones). The fast path
+    /// skips the lock when `has_tombstones` is `false`.
+    #[inline]
+    fn is_live_bfs(&self, bfs_pos: u32) -> bool {
+        let bfs = bfs_pos as usize;
+        if bfs >= self.mvcc.len() {
+            return false;
+        }
+        let hdr = &self.mvcc[bfs];
+        if hdr.delete_lsn != 0 {
+            return false;
+        }
+        // Fast path: no steady-state tombstones yet.
+        if !self.has_tombstones.load(Ordering::Acquire) {
+            return true;
+        }
+        // Slow path: check the interior tombstone set.
+        !self.tombstoned_keys.read().contains(&hdr.key_hash)
     }
 
     /// Two-stage HNSW search: TQ-ADC beam + TurboQuant_prod reranking.
@@ -138,6 +212,12 @@ impl ImmutableSegment {
             self.rerank_with_prod(&mut cands, query);
             cands
         };
+        // Filter deleted entries before truncating so that k live results are
+        // returned even when some candidates are tombstoned.
+        candidates.retain(|c| {
+            let bfs = self.graph.to_bfs(c.id.0);
+            self.is_live_bfs(bfs)
+        });
         candidates.truncate(k);
         self.remap_to_global_ids(&mut candidates);
         candidates
@@ -172,6 +252,11 @@ impl ImmutableSegment {
         if self.sub_centroid_signs.is_empty() {
             self.rerank_with_prod(&mut candidates, query);
         }
+        // Filter deleted entries before truncating.
+        candidates.retain(|c| {
+            let bfs = self.graph.to_bfs(c.id.0);
+            self.is_live_bfs(bfs)
+        });
         candidates.truncate(k);
         self.remap_to_global_ids(&mut candidates);
         candidates
@@ -572,7 +657,43 @@ impl ImmutableSegment {
         }
     }
 
+    /// Mark all entries matching `key_hash` as deleted at install time.
+    ///
+    /// This is the **install-time** tombstone path: called while the segment is
+    /// still `&mut` (not yet wrapped in `Arc`) during background-compaction
+    /// reconciliation. Modifies `mvcc[].delete_lsn` directly and decrements
+    /// `live_count` accurately.
+    ///
+    /// Returns the number of entries tombstoned.
+    pub fn mark_deleted_by_key_hash_install(&mut self, key_hash: u64) -> u32 {
+        let mut count = 0u32;
+        for h in self.mvcc.iter_mut() {
+            if h.key_hash == key_hash && h.delete_lsn == 0 {
+                h.delete_lsn = 1; // sentinel: deleted during reconciliation
+                self.live_count = self.live_count.saturating_sub(1);
+                count += 1;
+            }
+        }
+        count
+    }
+
     // ── Merge-support accessors (P2) ─────────────────────────────────────────
+
+    /// Clone the set of key_hashes tombstoned via steady-state interior deletion.
+    ///
+    /// Used by `poll_install_merge` to reapply deletes that arrived *during*
+    /// the background merge window: `merge_immutable` read the source Arc's
+    /// mvcc headers at worker-thread time, but `mark_deleted_by_key_hash` calls
+    /// that arrived between snapshot and install only wrote into this interior
+    /// set (they cannot touch `mvcc` while the segment is Arc'd).  Applying
+    /// these hashes to the merged output via
+    /// `mark_deleted_by_key_hash_install` closes the resurrection window.
+    ///
+    /// Acquires the interior `tombstoned_keys` read-lock briefly; returns a
+    /// cloned `Vec` so the lock is released before caller does any work.
+    pub fn tombstoned_key_hashes(&self) -> Vec<u64> {
+        self.tombstoned_keys.read().iter().copied().collect()
+    }
 
     /// Total QJL bytes across all entries. 0 if QJL not encoded for this segment.
     #[inline]
