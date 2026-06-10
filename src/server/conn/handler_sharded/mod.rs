@@ -19,7 +19,9 @@ use crate::persistence::aof;
 use crate::protocol::Frame;
 use crate::shard::dispatch::{ShardMessage, key_to_shard};
 use crate::shard::mesh::ChannelMesh;
-use crate::storage::eviction::{try_evict_if_needed, try_evict_if_needed_async_spill};
+use crate::storage::eviction::{
+    try_evict_if_needed_async_spill_budget, try_evict_if_needed_budget,
+};
 use crate::workspace::{strip_workspace_prefix_from_response, workspace_rewrite_args};
 
 use super::affinity::MigratedConnectionState;
@@ -1303,24 +1305,26 @@ pub(crate) async fn handle_connection_sharded_inner<
                                 // delete-only eviction. Both evictors run under this shard's
                                 // db write lock, so they cannot race the persistence-tick
                                 // cascade on the same key.
+                                let budget = ctx.shard_databases.elastic_budget(ctx.shard_id);
                                 let evict_result = if let Some(ref sender) = ctx.spill_sender {
                                     let mut fid = ctx.spill_file_id.get();
                                     let dir = ctx
                                         .disk_offload_dir
                                         .as_deref()
                                         .unwrap_or(std::path::Path::new("."));
-                                    let res = try_evict_if_needed_async_spill(
+                                    let res = try_evict_if_needed_async_spill_budget(
                                         db,
                                         &rt,
                                         sender,
                                         dir,
                                         &mut fid,
                                         conn.selected_db,
+                                        budget,
                                     );
                                     ctx.spill_file_id.set(fid);
                                     res
                                 } else {
-                                    try_evict_if_needed(db, &rt)
+                                    try_evict_if_needed_budget(db, &rt, budget)
                                 };
                                 if let Err(oom_frame) = evict_result {
                                     drop(rt);
