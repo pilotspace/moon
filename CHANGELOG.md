@@ -6,6 +6,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Elastic per-shard memory budgets (hot-shard headroom borrowing)
+
+- **Hot shards now borrow idle siblings' unused `maxmemory` headroom**
+  instead of being capped at a static `maxmemory / num_shards`. Each shard
+  publishes its used memory on its existing 100ms eviction tick and
+  recomputes an elastic budget from the published snapshot:
+  `base + Σ(under-budget surplus) / hot_shard_count`, clamped to total
+  `maxmemory`. No new locks or channels — two relaxed atomics per shard,
+  read once per write-path eviction check.
+- Snapshot invariant: hot shards' budgets plus under-budget shards' usage
+  never exceed `N × base` at recompute time; transient overshoot is bounded
+  by one tick of donor write growth and converges via write-path eviction.
+- Live 4-shard validation (32MB cap, allkeys-lru, all writes to one shard
+  via a `{tag}`): hot shard retained ~28k × 1KB keys (~30MB) vs the ~7.2k
+  (8MB) static ceiling — 3.9× more of the configured memory actually
+  usable under skewed load. Uniform load is unchanged (same global
+  ceiling, budgets stay at base).
+- Disk-offload pressure cascade and timer-based eviction enforce the same
+  elastic budget; budget `0` (not yet published, single shard, or
+  `maxmemory=0`) falls back to the static per-shard cap everywhere.
+
 ### Changed — Hot-path performance: deep-review optimization pass (PR #168)
 
 - **+33% pipelined SET, +25% pipelined GET (single shard)** from a deep
