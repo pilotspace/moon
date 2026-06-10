@@ -565,6 +565,10 @@ if should_run "key"; then
     assert_moon_ok "SCAN cursor"       SCAN 0
     assert_moon_ok "KEYS pattern"      KEYS "k:*"
     assert_moon_ok "OBJECT HELP"       OBJECT HELP
+    assert_moon_ok "OBJECT ENCODING"   OBJECT ENCODING k:nox
+    assert_moon_ok "OBJECT FREQ"       OBJECT FREQ k:nox
+    assert_moon_ok "HOTKEYS"           HOTKEYS
+    assert_moon_ok "HOTKEYS COUNT"     HOTKEYS COUNT 5
 
     # Bit operations
     rcli SET k:bits "\xff\x0f" >/dev/null 2>&1; mcli SET k:bits "\xff\x0f" >/dev/null 2>&1

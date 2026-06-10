@@ -486,29 +486,94 @@ pub fn object(db: &mut Database, args: &[Frame]) -> Frame {
             None => Frame::Error(Bytes::from_static(b"ERR no such key")),
         }
     } else if subcommand.eq_ignore_ascii_case(b"HELP") {
-        Frame::Array(framevec![
-            Frame::BulkString(Bytes::from_static(b"OBJECT ENCODING <key>")),
-            Frame::BulkString(Bytes::from_static(
-                b"  Return the encoding of the object stored at <key>."
-            )),
-            Frame::BulkString(Bytes::from_static(b"OBJECT FREQ <key>")),
-            Frame::BulkString(Bytes::from_static(
-                b"  Return the access frequency of the object at <key>."
-            )),
-            Frame::BulkString(Bytes::from_static(b"OBJECT IDLETIME <key>")),
-            Frame::BulkString(Bytes::from_static(
-                b"  Return the idle time in seconds of the object at <key>."
-            )),
-            Frame::BulkString(Bytes::from_static(b"OBJECT REFCOUNT <key>")),
-            Frame::BulkString(Bytes::from_static(
-                b"  Return the reference count of the object at <key>."
-            )),
-            Frame::BulkString(Bytes::from_static(b"OBJECT HELP")),
-            Frame::BulkString(Bytes::from_static(b"  Return subcommand help.")),
-        ])
+        object_help()
     } else {
         Frame::Error(Bytes::from_static(b"ERR unknown OBJECT subcommand"))
     }
+}
+
+/// OBJECT (read-only) — served from the shared read path.
+///
+/// All OBJECT subcommands are pure reads; this variant uses
+/// `get_if_alive` so it never mutates expiry state. Without it, OBJECT
+/// over the wire dies in `dispatch_read`'s unknown-command fallback
+/// (the monoio handler routes every non-write command through the read
+/// dispatcher).
+pub fn object_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
+    if args.is_empty() {
+        return err_wrong_args("OBJECT");
+    }
+    let subcommand = match extract_key(&args[0]) {
+        Some(s) => s,
+        None => return err_wrong_args("OBJECT"),
+    };
+    if subcommand.eq_ignore_ascii_case(b"HELP") {
+        return object_help();
+    }
+    if args.len() != 2 {
+        return err_wrong_args("OBJECT");
+    }
+    let key = match extract_key(&args[1]) {
+        Some(k) => k,
+        None => return err_wrong_args("OBJECT"),
+    };
+    if subcommand.eq_ignore_ascii_case(b"ENCODING") {
+        match db.get_if_alive(key, now_ms) {
+            Some(entry) => {
+                let encoding = entry.value.as_redis_value().encoding_name();
+                Frame::BulkString(Bytes::from(encoding))
+            }
+            None => Frame::Null,
+        }
+    } else if subcommand.eq_ignore_ascii_case(b"FREQ") {
+        match db.get_if_alive(key, now_ms) {
+            Some(entry) => Frame::Integer(entry.access_counter() as i64),
+            None => Frame::Error(Bytes::from_static(b"ERR no such key")),
+        }
+    } else if subcommand.eq_ignore_ascii_case(b"IDLETIME") {
+        let now = db.now();
+        match db.get_if_alive(key, now_ms) {
+            Some(entry) => {
+                let last = entry.last_access();
+                // Wraparound-safe delta in seconds (16-bit)
+                let idle = (now.wrapping_sub(last)) & 0xFFFF;
+                Frame::Integer(idle as i64)
+            }
+            None => Frame::Error(Bytes::from_static(b"ERR no such key")),
+        }
+    } else if subcommand.eq_ignore_ascii_case(b"REFCOUNT") {
+        match db.get_if_alive(key, now_ms) {
+            // Moon doesn't use reference counting — always return 1
+            Some(_) => Frame::Integer(1),
+            None => Frame::Error(Bytes::from_static(b"ERR no such key")),
+        }
+    } else {
+        Frame::Error(Bytes::from_static(b"ERR unknown OBJECT subcommand"))
+    }
+}
+
+/// Shared OBJECT HELP response.
+fn object_help() -> Frame {
+    Frame::Array(framevec![
+        Frame::BulkString(Bytes::from_static(b"OBJECT ENCODING <key>")),
+        Frame::BulkString(Bytes::from_static(
+            b"  Return the encoding of the object stored at <key>."
+        )),
+        Frame::BulkString(Bytes::from_static(b"OBJECT FREQ <key>")),
+        Frame::BulkString(Bytes::from_static(
+            b"  Return the access frequency of the object at <key>."
+        )),
+        Frame::BulkString(Bytes::from_static(b"OBJECT IDLETIME <key>")),
+        Frame::BulkString(Bytes::from_static(
+            b"  Return the idle time in seconds of the object at <key>."
+        )),
+        Frame::BulkString(Bytes::from_static(b"OBJECT REFCOUNT <key>")),
+        Frame::BulkString(Bytes::from_static(
+            b"  Return the reference count of the object at <key>."
+        )),
+        Frame::BulkString(Bytes::from_static(b"OBJECT HELP")),
+        Frame::BulkString(Bytes::from_static(b"  Return subcommand help.")),
+    ])
 }
 
 /// Redis-compatible glob pattern matcher.

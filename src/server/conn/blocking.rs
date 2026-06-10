@@ -1251,6 +1251,11 @@ pub(crate) fn try_inline_dispatch(
         let consumed = key_end_crlf;
         let key_bytes = &buf[key_start..key_end];
         let guard = shard_databases.read_db(shard_id, selected_db);
+        // Hot-key sampling: the inline path bypasses both dispatchers, so it
+        // must feed the sketch itself. tick() is one relaxed fetch_add.
+        if guard.hot_keys().tick() {
+            guard.hot_keys().observe(key_bytes);
+        }
         match guard.get_if_alive(key_bytes, now_ms) {
             Some(entry) => match entry.value.as_bytes() {
                 Some(val) => {
@@ -1357,6 +1362,11 @@ pub(crate) fn try_inline_dispatch(
 
         let key = frozen.slice(key_start..key_end);
         let value = frozen.slice(val_start..val_end);
+        // Hot-key sampling: the inline path bypasses both dispatchers, so it
+        // must feed the sketch itself. tick() is one relaxed fetch_add.
+        if guard.hot_keys().tick() {
+            guard.hot_keys().observe(&key);
+        }
         let mut entry = crate::storage::entry::Entry::new_string(value);
         entry.set_last_access(guard.now());
         entry.set_access_counter(5);
