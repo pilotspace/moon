@@ -24,7 +24,9 @@ use crate::persistence::aof;
 use crate::protocol::Frame;
 use crate::shard::dispatch::key_to_shard;
 use crate::shard::mesh::ChannelMesh;
-use crate::storage::eviction::{try_evict_if_needed, try_evict_if_needed_async_spill};
+use crate::storage::eviction::{
+    try_evict_if_needed_async_spill_budget, try_evict_if_needed_budget,
+};
 use crate::workspace::{strip_workspace_prefix_from_response, workspace_rewrite_args};
 
 use super::affinity::MigratedConnectionState;
@@ -1277,19 +1279,20 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                 // Eviction under the new path
                                 if batch_eviction_active {
                                     let rt = ctx.runtime_config.read();
+                                    let budget = ctx.shard_databases.elastic_budget(ctx.shard_id);
                                     let evict_result = if let Some(ref sender) = ctx.spill_sender {
                                         let mut fid = ctx.spill_file_id.get();
                                         let dir = ctx
                                             .disk_offload_dir
                                             .as_deref()
                                             .unwrap_or(std::path::Path::new("."));
-                                        let res = try_evict_if_needed_async_spill(
-                                            db, &rt, sender, dir, &mut fid, sel_db,
+                                        let res = try_evict_if_needed_async_spill_budget(
+                                            db, &rt, sender, dir, &mut fid, sel_db, budget,
                                         );
                                         ctx.spill_file_id.set(fid);
                                         res
                                     } else {
-                                        try_evict_if_needed(db, &rt)
+                                        try_evict_if_needed_budget(db, &rt, budget)
                                     };
                                     evict_result?;
                                 }
@@ -1405,24 +1408,26 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                 ctx.shard_databases.write_db(ctx.shard_id, conn.selected_db);
                             if batch_eviction_active {
                                 let rt = ctx.runtime_config.read();
+                                let budget = ctx.shard_databases.elastic_budget(ctx.shard_id);
                                 let evict_result = if let Some(ref sender) = ctx.spill_sender {
                                     let mut fid = ctx.spill_file_id.get();
                                     let dir = ctx
                                         .disk_offload_dir
                                         .as_deref()
                                         .unwrap_or(std::path::Path::new("."));
-                                    let res = try_evict_if_needed_async_spill(
+                                    let res = try_evict_if_needed_async_spill_budget(
                                         &mut guard,
                                         &rt,
                                         sender,
                                         dir,
                                         &mut fid,
                                         conn.selected_db,
+                                        budget,
                                     );
                                     ctx.spill_file_id.set(fid);
                                     res
                                 } else {
-                                    try_evict_if_needed(&mut guard, &rt)
+                                    try_evict_if_needed_budget(&mut guard, &rt, budget)
                                 };
                                 if let Err(oom_frame) = evict_result {
                                     drop(guard);
