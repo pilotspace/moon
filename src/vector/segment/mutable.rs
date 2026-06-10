@@ -30,6 +30,10 @@ const MUTABLE_SEGMENT_MAX: usize = 128 * 1024 * 1024;
 /// no normalization needed). Unit-sphere metrics (Cosine + InnerProduct)
 /// copy into an inline buffer (stack for dim ≤ 512) and normalize to match
 /// the encode-side normalization.
+// The 2KB inline variant is deliberate: a stack buffer that keeps the
+// per-query SQ8 hot path heap-free. The enum lives only as a short-lived
+// stack local during search; boxing it would reintroduce the allocation.
+#[allow(clippy::large_enum_variant)]
 enum Sq8Query<'a> {
     Borrowed(&'a [f32]),
     Normalized(SmallVec<[f32; 512]>),
