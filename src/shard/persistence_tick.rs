@@ -334,6 +334,19 @@ pub(crate) fn run_eviction_tick(
         apply_spill_completions(spill_t, shard_manifest, shard_databases, shard_id);
     }
 
+    // GAP-1: publish this shard's usage and refresh its elastic budget once
+    // per 100ms tick. Siblings read the published snapshot on their own
+    // ticks, so every budget is at most one tick stale — the same slack the
+    // static scheme already has between eviction passes.
+    {
+        let rt = runtime_config.read();
+        if rt.maxmemory > 0 {
+            let used = shard_databases.aggregate_memory(shard_id);
+            shard_databases.publish_memory(shard_id, used);
+            shard_databases.recompute_elastic_budget(shard_id, &rt);
+        }
+    }
+
     if server_config.disk_offload_enabled()
         && should_run_pressure_cascade(runtime_config, server_config, shard_databases, shard_id)
     {
@@ -476,8 +489,13 @@ pub(crate) fn should_run_pressure_cascade(
     // `used` is this shard's aggregate (across its DBs); compare against the
     // PER-SHARD budget so the cascade fires at maxmemory/num_shards per shard,
     // bounding aggregate RSS instead of the whole-instance cap per shard.
-    let threshold =
-        (rt.maxmemory_per_shard() as f64 * server_config.disk_offload_threshold) as usize;
+    // GAP-1: an elastic budget (idle siblings' donated headroom) widens the
+    // threshold for hot shards; 0 means none published yet (static fallback).
+    let budget = match shard_databases.elastic_budget(shard_id) {
+        0 => rt.maxmemory_per_shard(),
+        elastic => elastic.min(rt.maxmemory),
+    };
+    let threshold = (budget as f64 * server_config.disk_offload_threshold) as usize;
     let used = shard_databases.aggregate_memory(shard_id);
     used > threshold
 }
@@ -569,7 +587,13 @@ pub(crate) fn handle_memory_pressure(
         if rt.maxmemory > 0 {
             // Compute aggregate BEFORE acquiring write locks (same pattern as handler_sharded).
             let total_mem = shard_databases.aggregate_memory(shard_id);
-            if total_mem > rt.maxmemory_per_shard() {
+            // GAP-1: hot shards evict against their elastic budget (idle
+            // siblings' donated headroom), not the static maxmemory/N.
+            let budget = match shard_databases.elastic_budget(shard_id) {
+                0 => rt.maxmemory_per_shard(),
+                elastic => elastic.min(rt.maxmemory),
+            };
+            if total_mem > budget {
                 let db_count = shard_databases.db_count();
                 let shard_dir = server_config
                     .effective_disk_offload_dir()
@@ -583,7 +607,7 @@ pub(crate) fn handle_memory_pressure(
                     for i in 0..db_count {
                         if use_slice {
                             crate::shard::slice::with_shard_db(i, |db| {
-                                let _ = crate::storage::eviction::try_evict_if_needed_async_spill_with_total(
+                                let _ = crate::storage::eviction::try_evict_if_needed_async_spill_with_total_budget(
                                     db,
                                     &rt,
                                     &sender,
@@ -591,11 +615,12 @@ pub(crate) fn handle_memory_pressure(
                                     next_file_id,
                                     total_mem,
                                     i,
+                                    budget,
                                 );
                             });
                         } else {
                             let mut guard = shard_databases.write_db(shard_id, i);
-                            let _ = crate::storage::eviction::try_evict_if_needed_async_spill_with_total(
+                            let _ = crate::storage::eviction::try_evict_if_needed_async_spill_with_total_budget(
                                 &mut guard,
                                 &rt,
                                 &sender,
@@ -603,6 +628,7 @@ pub(crate) fn handle_memory_pressure(
                                 next_file_id,
                                 total_mem,
                                 i,
+                                budget,
                             );
                         }
                     }
@@ -619,15 +645,16 @@ pub(crate) fn handle_memory_pressure(
                                         manifest,
                                         next_file_id,
                                     };
-                                    let _ = crate::storage::eviction::try_evict_if_needed_with_spill_and_total(
+                                    let _ = crate::storage::eviction::try_evict_if_needed_with_spill_and_total_budget(
                                         db,
                                         &rt,
                                         Some(&mut ctx),
                                         total_mem,
+                                        budget,
                                     );
                                 } else {
-                                    let _ = crate::storage::eviction::try_evict_if_needed_with_spill_and_total(
-                                        db, &rt, None, total_mem,
+                                    let _ = crate::storage::eviction::try_evict_if_needed_with_spill_and_total_budget(
+                                        db, &rt, None, total_mem, budget,
                                     );
                                 }
                             });
@@ -639,15 +666,16 @@ pub(crate) fn handle_memory_pressure(
                                     manifest,
                                     next_file_id,
                                 };
-                                let _ = crate::storage::eviction::try_evict_if_needed_with_spill_and_total(
+                                let _ = crate::storage::eviction::try_evict_if_needed_with_spill_and_total_budget(
                                     &mut guard,
                                     &rt,
                                     Some(&mut ctx),
                                     total_mem,
+                                    budget,
                                 );
                             } else {
-                                let _ = crate::storage::eviction::try_evict_if_needed_with_spill_and_total(
-                                    &mut guard, &rt, None, total_mem,
+                                let _ = crate::storage::eviction::try_evict_if_needed_with_spill_and_total_budget(
+                                    &mut guard, &rt, None, total_mem, budget,
                                 );
                             }
                         }
