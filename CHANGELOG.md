@@ -6,6 +6,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — Hot-key detection: `HOTKEYS` command + per-shard SpaceSaving sketch
+
+- **New `HOTKEYS [COUNT n]` command** (Moon extension, `@server` ACL,
+  read-only): returns the top sampled keys as `[key, sampled_count]` pairs,
+  count descending. Counts are 1-in-64 samples of keyed commands — multiply
+  by 64 for an approximate command rate. In multi-shard mode the connection
+  handler merges per-shard sketches (DBSIZE-style scatter-gather), so clients
+  always see the global view.
+- **Per-shard SpaceSaving top-K sketch** (K=128, ~5 KB per database,
+  L1-resident, single-pass scan): fed by all three execution paths — write dispatch, the shared
+  read path, and the inline GET/SET fast path. The tick counter is one relaxed
+  `fetch_add` per command; the O(K) sketch update runs only on sampled ticks
+  and `try_lock`s (a contended sample is dropped — the hot path never blocks).
+  Kill switch: `MOON_NO_HOTKEYS=1`.
+
+### Fixed — `OBJECT` was unreachable over the wire (monoio handler)
+
+- **`OBJECT ENCODING/FREQ/IDLETIME/REFCOUNT` returned `ERR unknown command`
+  on a live server** even though dispatch implemented them: the monoio
+  handler routes every non-write command through the read dispatcher, which
+  had no `OBJECT` arm. Added a read-only `OBJECT` handler (`get_if_alive`,
+  never mutates expiry state) and enabled it on the cross-shard fast path.
+- **`OBJECT <subcmd> <key>` routed by the subcommand name** in multi-shard
+  mode (`extract_primary_key` hashes `args[0]`, which is `FREQ`/`ENCODING`,
+  not the key) — the command landed on an arbitrary shard and answered
+  `ERR no such key`. Key extraction now uses the real key (arg 2).
+
 ### Changed — Hot-path performance: deep-review optimization pass (PR #168)
 
 - **+33% pipelined SET, +25% pipelined GET (single shard)** from a deep

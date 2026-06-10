@@ -10,6 +10,7 @@ pub mod engine;
 pub mod entry;
 pub mod eviction;
 pub mod hll;
+pub mod hotkey;
 pub mod intset;
 pub mod listpack;
 pub mod stream;

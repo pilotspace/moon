@@ -596,6 +596,27 @@ assert_both "FLUSHDB" FLUSHDB
 
 echo ""
 # ===========================================================================
+# HOTKEYS + OBJECT FREQ (moon-only — sampled hot-key sketch)
+# ===========================================================================
+log "=== HOTKEYS (moon-only) ==="
+
+redis-cli -p "$PORT_RUST" SET hotk:probe v >/dev/null 2>&1
+# 128 keyed commands guarantee >= 2 sketch samples at the 1-in-64 rate.
+for _ in $(seq 1 128); do redis-cli -p "$PORT_RUST" GET hotk:probe >/dev/null 2>&1; done
+HOTKEYS_OUT=$(redis-cli -p "$PORT_RUST" HOTKEYS COUNT 5 2>&1)
+if echo "$HOTKEYS_OUT" | grep -q "hotk:probe"; then
+    PASS=$((PASS + 1))
+else
+    FAIL=$((FAIL + 1)); echo "  FAIL: HOTKEYS should report hotk:probe (got: $HOTKEYS_OUT)"
+fi
+OBJ_FREQ=$(redis-cli -p "$PORT_RUST" OBJECT FREQ hotk:probe 2>&1)
+case "$OBJ_FREQ" in
+    ''|*[!0-9]*) FAIL=$((FAIL + 1)); echo "  FAIL: OBJECT FREQ should return an integer (got: $OBJ_FREQ)" ;;
+    *) PASS=$((PASS + 1)) ;;
+esac
+
+echo ""
+# ===========================================================================
 # Vector Search (moon-only — FT.* not available in Redis)
 # ===========================================================================
 log "=== Vector Search (moon-only) ==="
