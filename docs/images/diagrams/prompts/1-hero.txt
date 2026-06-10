@@ -1,0 +1,29 @@
+Create a calm, light, whiteboard-style technical marketing infographic on a pure white background.
+
+TITLE at top center: "Moon — One Engine. Four Data Models." in clean charcoal print lettering.
+Subtitle below in lighter gray: "Redis-compatible KV · Vector · Graph · Full-Text — in one process"
+
+LAYOUT — one large rounded container in the center labeled "One Moon Shard (one CPU core, zero shared state)"
+containing four small rounded boxes in a 2x2 arrangement:
+
+  Top-left (cloud blue tint): "KV Store" with sub-label "DashTable · 230+ Redis commands"
+  Top-right (cream lilac tint): "Vector Search" with sub-label "HNSW + TurboQuant"
+  Bottom-left (soft sage tint): "Property Graph" with sub-label "CSR segments + Cypher"
+  Bottom-right (morning peach tint): "Full-Text" with sub-label "BM25 + RRF fusion"
+
+In the middle of the four boxes: a small circle labeled "same keyspace" with thin pencil lines
+connecting it to all four boxes.
+
+ABOVE the container: a row of three small client terminal icons labeled "Any Redis client",
+with one thin pencil arrow down to the container labeled "RESP2 / RESP3".
+
+BELOW the container: one box labeled "Per-Shard AOF + WAL" with sub-label "one durability story for all four models".
+
+LEFT margin annotation with pencil leader line pointing at the container:
+"thread-per-core - no locks, no cross-engine network hops"
+
+RIGHT margin annotation with pencil leader line:
+"a query can search vectors, walk the graph, and read KV — in one process"
+
+Bottom-left corner: small box "Apache-2.0 · single binary"
+Bottom-right corner: small note "vs. stitching Redis + Qdrant + Neo4j + Elasticsearch together"

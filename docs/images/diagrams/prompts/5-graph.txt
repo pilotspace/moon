@@ -1,0 +1,33 @@
+Create a calm, light, whiteboard-style technical infographic on a pure white background.
+
+TITLE at top center: "Moon — Property Graph on KV Foundations" in clean charcoal print lettering.
+Subtitle below in lighter gray: "Cypher queries. CSR segments. Same shard, same WAL."
+
+LAYOUT — left-to-right pipeline connected by thin solid pencil arrows:
+
+LEFT, morning peach tint: box with two lines of text "GRAPH.QUERY" and "(Cypher)"
+
+CENTER-LEFT, cream lilac tint: box "MemGraph" with sub-label "mutable, instant writes"
+The arrow leaving this box is labeled "freeze + compact".
+
+CENTER, cloud blue tint, hero element, slightly larger: box titled "CSR Segment (immutable)"
+containing three thin horizontal bars labeled:
+  "row_offsets"
+  "col_indices"
+  "validity bitmap"
+
+RIGHT, soft sage tint: two stacked boxes:
+  "Traversal" with sub-label "BFS, Dijkstra, SIMD-accelerated"
+  "Hybrid with vectors" with sub-label "graph-filtered KNN"
+
+BELOW the pipeline, one wide shallow box with warm sand tint:
+"Per-shard WAL + manifest - same durability as KV"
+
+EXACTLY FOUR pencil annotations with thin leader lines, each used once, nowhere else:
+  1. pointing at the left box: "14 GRAPH.* commands"
+  2. pointing at the CSR Segment box: "neighbor scan = one contiguous memory read"
+  3. pointing at the validity bitmap bar: "deletes flip one bit - arrays never rewritten"
+  4. pointing at the Hybrid box: "embeddings come from the vector engine next door"
+
+Bottom-left corner: small box "23x FalkorDB insert - 2.4x Cypher QPS"
+Bottom-right corner: legend "solid = query flow"

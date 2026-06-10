@@ -1,0 +1,14 @@
+
+STYLE RULES (apply to everything):
+- Pure white (#FAFAFA) background, like premium matte paper — no texture, no grid
+- Thin charcoal ink lines (#3d3d3a), pencil-weight, slightly organic — never bold or heavy
+- Color only as whisper-soft watercolor tints at ~15% opacity behind content areas
+- ALL TEXT in a CLEAN READABLE PRINT FONT (neat sans-serif technical lettering) — NOT handwriting,
+  NOT cursive. Text must be crisp, perfectly legible, and spelled exactly as written in this prompt.
+- Arrows and annotation leader lines are thin hand-drawn PENCIL lines with small open arrowheads
+- CRITICAL: every text string in this prompt appears AT MOST ONCE in the image. Never mirror,
+  echo, or repeat any annotation in another position. If layout feels empty, leave whitespace —
+  whitespace is part of the style. Fewer words is better than repeated words.
+- Generous whitespace; sections separated by space, not heavy borders
+- No solid fills, no gradients, no drop shadows, no dark backgrounds, no emoji, no clipart
+- Minimal line icons only: 1-2 strokes, same thin charcoal ink

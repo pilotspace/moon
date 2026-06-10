@@ -1,0 +1,30 @@
+Create a calm, light, whiteboard-style technical infographic on a pure white background.
+
+TITLE at top center: "Moon — Vector Engine Inside the Keyspace" in clean charcoal print lettering.
+Subtitle below in lighter gray: "Your vectors live in Redis hashes. Indexing is automatic."
+
+LAYOUT — left-to-right pipeline with four stages connected by thin solid pencil arrows:
+
+STAGE 1, morning peach tint: box containing the command text "HSET doc:42 title ... embedding <bytes>"
+
+STAGE 2, cream lilac tint: box "Auto-Index" with sub-label "key prefix match, one LSN across dense + BM25"
+
+STAGE 3, cloud blue tint, hero element: two stacked boxes showing the segment lifecycle:
+  upper box "Mutable segment" with sub-label "brute-force scan, instant visibility"
+  a short pencil arrow downward labeled "compact" to
+  lower box "Immutable segment" with sub-label "HNSW graph + TurboQuant codes"
+
+STAGE 4, soft sage tint: box "FT.SEARCH" containing three small rows:
+  "dense KNN (HNSW)"
+  "BM25 full-text"
+  "sparse vectors"
+below the rows a small funnel icon labeled "RRF fusion" with output text "one ranked result list".
+
+EXACTLY FOUR pencil annotations with thin leader lines, each used once, nowhere else:
+  1. pointing at stage 1: "plain Redis command - no special ingest API"
+  2. pointing at stage 2: "MVCC snapshots - FT.SEARCH AS_OF time travel"
+  3. pointing at the lower box of stage 3: "TurboQuant: 8x compression, 1-8 bit per dimension"
+  4. pointing at stage 4: "three-way hybrid retrieval in one command"
+
+Bottom-left corner: small box "12.7K search QPS at 384d COSINE (GCloud x86_64)"
+Bottom-right corner: small note "per-index knobs: EF_RUNTIME, COMPACT_THRESHOLD"

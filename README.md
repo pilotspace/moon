@@ -56,6 +56,14 @@ available for portability. **macOS** is a first-class development platform
 
 ## Why Moon
 
+<p align="center">
+  <img src="docs/images/diagrams/moon-platform-hero.png" alt="Moon — one engine, four data models: KV, vector, graph, and full-text on a thread-per-core shared-nothing core" width="100%">
+</p>
+
+See [Design Advantages](https://pilotspace.github.io/moon/design-advantages/) for the
+full architecture story with diagrams — memory engine, persistence, vector, graph,
+and how they compose.
+
 - **Thread-per-core, zero shared state.** Each shard owns its event loop, DashTable, WAL writer, and Pub/Sub registry. No global locks; cross-shard dispatch is a lock-free SPSC channel.
 - **Dual runtime.** Monoio (`io_uring` on Linux, `kqueue` on macOS) for peak throughput; Tokio for portability and CI. Same binary, feature-gated.
 - **Forkless persistence.** RDB snapshots iterate DashTable segments incrementally — no `fork()`, no COW memory spike. AOF is a per-shard WAL v3 with batched fsync; the advantage over Redis grows with pipeline depth.
