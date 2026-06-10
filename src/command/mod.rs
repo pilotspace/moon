@@ -1942,8 +1942,9 @@ mod tests {
             b"FLUSHDB",
             b"FLUSHALL",
             // BGSAVE shares (6, b'b') bucket with BITPOS — prefilter is coarse
+            // OBJECT moved to the read path (it is a pure read; the missing
+            // arm made it unreachable over the wire).
             b"WAIT",
-            b"OBJECT",
             b"RANDOMKEY",
         ] {
             assert!(
