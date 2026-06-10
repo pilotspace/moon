@@ -24,6 +24,43 @@ use crate::vector::types::{DistanceMetric, SearchResult, VectorId};
 /// Maximum byte size before a mutable segment is considered full (128 MB).
 const MUTABLE_SEGMENT_MAX: usize = 128 * 1024 * 1024;
 
+/// SQ8 ADC query preparation, heap-free on the per-query hot path.
+///
+/// L2 borrows the caller's query directly (encode side stores raw values,
+/// no normalization needed). Unit-sphere metrics (Cosine + InnerProduct)
+/// copy into an inline buffer (stack for dim ≤ 512) and normalize to match
+/// the encode-side normalization.
+enum Sq8Query<'a> {
+    Borrowed(&'a [f32]),
+    Normalized(SmallVec<[f32; 512]>),
+}
+
+impl<'a> Sq8Query<'a> {
+    #[inline]
+    fn prepare(query_f32: &'a [f32], metric: DistanceMetric) -> Self {
+        if metric == DistanceMetric::L2 {
+            return Sq8Query::Borrowed(query_f32);
+        }
+        let mut q: SmallVec<[f32; 512]> = SmallVec::from_slice(query_f32);
+        let n: f32 = q.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if n > 0.0 {
+            let inv = 1.0 / n;
+            for v in q.iter_mut() {
+                *v *= inv;
+            }
+        }
+        Sq8Query::Normalized(q)
+    }
+
+    #[inline]
+    fn as_slice(&self) -> &[f32] {
+        match self {
+            Sq8Query::Borrowed(s) => s,
+            Sq8Query::Normalized(q) => q,
+        }
+    }
+}
+
 /// 48 bytes. MVCC fields prepared for Phase 65.
 #[repr(C)]
 pub struct MutableEntry {
@@ -349,18 +386,9 @@ impl MutableSegment {
         // Query is normalized for unit-sphere metrics (Cosine + InnerProduct) to
         // match the encode-side normalization.
         if self.collection.quantization == QuantizationConfig::Sq8 {
-            let mut q = query_f32.to_vec();
-            // Normalize for unit-sphere metrics (Cosine + InnerProduct) to match the
-            // encode side; L2 keeps the raw query for true Euclidean ADC.
-            if self.collection.metric != DistanceMetric::L2 {
-                let n: f32 = q.iter().map(|x| x * x).sum::<f32>().sqrt();
-                if n > 0.0 {
-                    let inv = 1.0 / n;
-                    for v in q.iter_mut() {
-                        *v *= inv;
-                    }
-                }
-            }
+            // Heap-free query prep: borrow for L2, inline-normalize otherwise.
+            let q = Sq8Query::prepare(query_f32, self.collection.metric);
+            let q = q.as_slice();
             let mut heap: BinaryHeap<DistF32> = BinaryHeap::with_capacity(k + 1);
             for entry in &inner.entries {
                 if entry.delete_lsn != 0 {
@@ -376,7 +404,7 @@ impl MutableSegment {
                 let off = id * bytes_per_code;
                 let slot = &inner.tq_codes[off..off + bytes_per_code];
                 let (min, scale) = sq8_params(slot, dim);
-                let dist = sq8_l2_adc(&q, &slot[..dim], min, scale);
+                let dist = sq8_l2_adc(q, &slot[..dim], min, scale);
                 let global_id = inner.global_id_base + entry.internal_id;
                 if heap.len() < k {
                     heap.push(DistF32(dist, global_id, entry.key_hash));
@@ -540,18 +568,9 @@ impl MutableSegment {
 
         // SQ8: per-vector affine decode + true squared-L2 ADC (MVCC-visible scan).
         if self.collection.quantization == QuantizationConfig::Sq8 {
-            let mut q = query_f32.to_vec();
-            // Normalize for unit-sphere metrics (Cosine + InnerProduct) to match the
-            // encode side; L2 keeps the raw query for true Euclidean ADC.
-            if self.collection.metric != DistanceMetric::L2 {
-                let n: f32 = q.iter().map(|x| x * x).sum::<f32>().sqrt();
-                if n > 0.0 {
-                    let inv = 1.0 / n;
-                    for v in q.iter_mut() {
-                        *v *= inv;
-                    }
-                }
-            }
+            // Heap-free query prep: borrow for L2, inline-normalize otherwise.
+            let q = Sq8Query::prepare(query_f32, self.collection.metric);
+            let q = q.as_slice();
             let mut heap: BinaryHeap<DistF32> = BinaryHeap::with_capacity(k + 1);
             for entry in &inner.entries {
                 if !is_visible(
@@ -574,7 +593,7 @@ impl MutableSegment {
                 let off = id * bytes_per_code;
                 let slot = &inner.tq_codes[off..off + bytes_per_code];
                 let (min, scale) = sq8_params(slot, dim);
-                let dist = sq8_l2_adc(&q, &slot[..dim], min, scale);
+                let dist = sq8_l2_adc(q, &slot[..dim], min, scale);
                 let global_id = inner.global_id_base + entry.internal_id;
                 if heap.len() < k {
                     heap.push(DistF32(dist, global_id, entry.key_hash));
