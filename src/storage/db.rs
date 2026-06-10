@@ -673,53 +673,63 @@ impl Database {
     /// Get an entry by key, performing lazy expiration.
     ///
     /// Returns `None` if the key does not exist or has expired.
-    /// Optimized: immutable lookup for expiry check, no LRU touch on reads
-    /// (LRU is only needed when eviction is active; callers requiring LRU
-    /// updates should use `get_mut()`). This reduces the hot path from
-    /// get_mut+get (2 SIMD probes) to get+get (1 probe for non-expired keys
-    /// since the compiler can often elide the second immutable lookup).
+    /// Optimized: a single immutable probe classifies the key as live,
+    /// expired, or absent. NLL forces one re-probe on the live path
+    /// (the cold fallback below mutates `self`, so the first borrow cannot
+    /// be returned directly): 2 probes on a live hit, 1 on a miss — down
+    /// from 3/2 with the previous expiry-check + `is_some()` + get chain.
+    /// No LRU touch on reads (callers requiring LRU updates use `get_mut()`).
     pub fn get(&mut self, key: &[u8]) -> Option<&Entry> {
         let now_ms = self.cached_now_ms;
         let base_ts = self.base_timestamp;
-        // Single immutable lookup: check existence + expiry
-        let expired = self
-            .data
-            .get(key)
-            .is_some_and(|e| e.is_expired_at(base_ts, now_ms));
-        if expired {
-            let removed = self.data.remove(key)?;
-            self.used_memory = self
-                .used_memory
-                .saturating_sub(entry_overhead(key, &removed));
-            return None;
+        enum KeyState {
+            Live,
+            Expired,
+            Absent,
         }
-        // Hot path: DashTable lookup
-        if self.data.get(key).is_some() {
-            return self.data.get(key);
-        }
-        // Cold fallback: read from disk DataFile via cold_read helper.
-        // Extract owned result first to drop immutable borrows before mutation.
-        let cold_result = self.cold_shard_dir.as_ref().and_then(|shard_dir| {
-            self.cold_index.as_ref().and_then(|ci| {
-                crate::storage::tiered::cold_read::cold_read_through(ci, shard_dir, key, now_ms)
-            })
-        });
-        if let Some((redis_value, ttl_ms)) = cold_result {
-            let key_bytes = Bytes::copy_from_slice(key);
-            // Build an entry from the RedisValue (works for strings and collections)
-            let mut entry = Entry::new_string(Bytes::new()); // placeholder
-            entry.value =
-                crate::storage::compact_value::CompactValue::from_redis_value(redis_value);
-            if let Some(ttl) = ttl_ms {
-                entry.set_expires_at_ms(self.base_timestamp, ttl);
+        let state = match self.data.get(key) {
+            Some(e) if e.is_expired_at(base_ts, now_ms) => KeyState::Expired,
+            Some(_) => KeyState::Live,
+            None => KeyState::Absent,
+        };
+        match state {
+            // Hot path: single re-probe, borrow returned to caller.
+            KeyState::Live => self.data.get(key),
+            KeyState::Expired => {
+                let removed = self.data.remove(key)?;
+                self.used_memory = self
+                    .used_memory
+                    .saturating_sub(entry_overhead(key, &removed));
+                None
             }
-            self.set(key_bytes, entry);
-            if let Some(ref mut ci) = self.cold_index {
-                ci.remove(key);
+            KeyState::Absent => {
+                // Cold fallback: read from disk DataFile via cold_read helper.
+                // Extract owned result first to drop immutable borrows before mutation.
+                let cold_result = self.cold_shard_dir.as_ref().and_then(|shard_dir| {
+                    self.cold_index.as_ref().and_then(|ci| {
+                        crate::storage::tiered::cold_read::cold_read_through(
+                            ci, shard_dir, key, now_ms,
+                        )
+                    })
+                });
+                if let Some((redis_value, ttl_ms)) = cold_result {
+                    let key_bytes = Bytes::copy_from_slice(key);
+                    // Build an entry from the RedisValue (works for strings and collections)
+                    let mut entry = Entry::new_string(Bytes::new()); // placeholder
+                    entry.value =
+                        crate::storage::compact_value::CompactValue::from_redis_value(redis_value);
+                    if let Some(ttl) = ttl_ms {
+                        entry.set_expires_at_ms(self.base_timestamp, ttl);
+                    }
+                    self.set(key_bytes, entry);
+                    if let Some(ref mut ci) = self.cold_index {
+                        ci.remove(key);
+                    }
+                    return self.data.get(key);
+                }
+                None
             }
-            return self.data.get(key);
         }
-        None
     }
 
     /// Get a mutable reference to an entry by key, performing lazy expiration and access tracking.

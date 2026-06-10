@@ -106,7 +106,7 @@ pub fn aggregate_used_memory(databases: &[Database]) -> usize {
 }
 
 /// Eviction policy variants matching Redis maxmemory-policy.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EvictionPolicy {
     NoEviction,
     AllKeysLru,
@@ -120,17 +120,26 @@ pub enum EvictionPolicy {
 
 impl EvictionPolicy {
     /// Parse a policy name string (case-insensitive) into an EvictionPolicy.
+    ///
+    /// Allocation-free: called per `try_evict_if_needed` invocation (i.e. per
+    /// write command under memory pressure), so it must not build a lowercase
+    /// `String` on every call.
     pub fn from_str(s: &str) -> Self {
-        match s.to_ascii_lowercase().as_str() {
-            "allkeys-lru" => EvictionPolicy::AllKeysLru,
-            "allkeys-lfu" => EvictionPolicy::AllKeysLfu,
-            "allkeys-random" => EvictionPolicy::AllKeysRandom,
-            "volatile-lru" => EvictionPolicy::VolatileLru,
-            "volatile-lfu" => EvictionPolicy::VolatileLfu,
-            "volatile-random" => EvictionPolicy::VolatileRandom,
-            "volatile-ttl" => EvictionPolicy::VolatileTtl,
-            _ => EvictionPolicy::NoEviction,
+        const TABLE: [(&str, EvictionPolicy); 7] = [
+            ("allkeys-lru", EvictionPolicy::AllKeysLru),
+            ("allkeys-lfu", EvictionPolicy::AllKeysLfu),
+            ("allkeys-random", EvictionPolicy::AllKeysRandom),
+            ("volatile-lru", EvictionPolicy::VolatileLru),
+            ("volatile-lfu", EvictionPolicy::VolatileLfu),
+            ("volatile-random", EvictionPolicy::VolatileRandom),
+            ("volatile-ttl", EvictionPolicy::VolatileTtl),
+        ];
+        for (name, policy) in TABLE {
+            if s.eq_ignore_ascii_case(name) {
+                return policy;
+            }
         }
+        EvictionPolicy::NoEviction
     }
 
     /// Return the canonical string name for this policy.
