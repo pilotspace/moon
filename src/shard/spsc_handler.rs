@@ -5,7 +5,7 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use ringbuf::HeapCons;
 use ringbuf::traits::Consumer;
@@ -20,7 +20,6 @@ use crate::persistence::wal::WalWriter;
 use crate::persistence::wal_v3::segment::WalWriterV3;
 use crate::pubsub::PubSubRegistry;
 use crate::replication::backlog::ReplicationBacklog;
-use crate::replication::state::ReplicationState;
 use crate::runtime::channel;
 use crate::storage::Database;
 use crate::storage::entry::CachedClock;
@@ -36,6 +35,11 @@ use super::shared_databases::ShardDatabases;
 /// SnapshotBegin messages are collected into `pending_snapshot` for deferred handling
 /// (the caller has mutable access to snapshot_state). COW intercepts and WAL appends
 /// happen inline for Execute/MultiExecute write commands.
+///
+/// Returns `true` when the cycle stopped early (MAX_DRAIN_PER_CYCLE cap or a
+/// SnapshotBegin barrier) and queued messages may remain — the caller must
+/// self-re-notify its own `spsc_notify` so the tail drains on the next loop
+/// iteration instead of waiting for the periodic tick (spsc-wake-floor M3).
 #[tracing::instrument(skip_all, level = "debug")]
 pub(crate) fn drain_spsc_shared(
     shard_databases: &Arc<ShardDatabases>,
@@ -52,7 +56,7 @@ pub(crate) fn drain_spsc_shared(
     wal_v3_writer: &mut Option<WalWriterV3>,
     repl_backlog: &crate::replication::backlog::SharedBacklog,
     replica_txs: &mut Vec<(u64, channel::MpscSender<bytes::Bytes>)>,
-    repl_state: &Option<Arc<RwLock<ReplicationState>>>,
+    repl_state: &Option<crate::replication::state::OffsetHandle>,
     shard_id: usize,
     script_cache: &Rc<RefCell<crate::scripting::ScriptCache>>,
     cached_clock: &CachedClock,
@@ -74,7 +78,7 @@ pub(crate) fn drain_spsc_shared(
     // FIX-W1-2: per-shard AOF writer pool. Passed through to handle_shard_message_shared
     // so cross-shard writes (MSET/MultiExecute) also land in the per-shard AOF files.
     aof_pool: Option<&std::sync::Arc<crate::persistence::aof::AofWriterPool>>,
-) {
+) -> bool {
     const MAX_DRAIN_PER_CYCLE: usize = 256;
     let mut drained = 0;
 
@@ -231,6 +235,12 @@ pub(crate) fn drain_spsc_shared(
     DRAIN_SCRATCH.with(|s| {
         *s.borrow_mut() = (execute_batch, other_messages);
     });
+
+    // spsc-wake-floor M3: `true` means this cycle stopped early (drain cap or
+    // SnapshotBegin barrier) and messages may remain queued — the caller must
+    // self-re-notify so the tail is drained on the next loop iteration instead
+    // of stranding until the next periodic tick.
+    drained >= MAX_DRAIN_PER_CYCLE || snapshot_seen
 }
 
 /// Process a single cross-shard message using shared database access.
@@ -252,7 +262,7 @@ pub(crate) fn handle_shard_message_shared(
     wal_v3_writer: &mut Option<WalWriterV3>,
     repl_backlog: &crate::replication::backlog::SharedBacklog,
     replica_txs: &mut Vec<(u64, channel::MpscSender<bytes::Bytes>)>,
-    repl_state: &Option<Arc<RwLock<ReplicationState>>>,
+    repl_state: &Option<crate::replication::state::OffsetHandle>,
     shard_id: usize,
     script_cache: &Rc<RefCell<crate::scripting::ScriptCache>>,
     cached_clock: &CachedClock,
@@ -3042,7 +3052,7 @@ pub(crate) fn wal_append_and_fanout(
     wal_v3_writer: &mut Option<WalWriterV3>,
     repl_backlog: &crate::replication::backlog::SharedBacklog,
     replica_txs: &[(u64, channel::MpscSender<bytes::Bytes>)],
-    repl_state: &Option<Arc<RwLock<ReplicationState>>>,
+    repl_state: &Option<crate::replication::state::OffsetHandle>,
     shard_id: usize,
     aof_pool: Option<&std::sync::Arc<crate::persistence::aof::AofWriterPool>>,
 ) {
@@ -3086,11 +3096,11 @@ pub(crate) fn wal_append_and_fanout(
     }
     drop(guard);
     // 3. Advance monotonic replication offset (NEVER resets on WAL truncation)
-    if let Some(rs) = repl_state {
-        match rs.read() {
-            Ok(rs) => rs.increment_shard_offset(shard_id, data.len() as u64),
-            Err(_) => tracing::error!("repl_state lock poisoned, replication offset not updated"),
-        }
+    // QW3 (2026-06 review finding 1.4): `repl_state` is a lock-free
+    // OffsetHandle cloned out of `RwLock<ReplicationState>` once at shard
+    // startup — the per-write advance no longer read-locks the RwLock.
+    if let Some(offsets) = repl_state {
+        offsets.increment_shard_offset(shard_id, data.len() as u64);
     }
     // 4. Fan-out to replica sender tasks (non-blocking: lagging replicas are skipped)
     if !replica_txs.is_empty() {
@@ -3312,5 +3322,117 @@ mod wal_append_tests {
             matches!(msg, AofMessage::Append { .. }),
             "expected AofMessage::Append from MultiExecute arm, got unexpected variant",
         );
+    }
+}
+
+#[cfg(test)]
+mod drain_cap_tests {
+    use super::*;
+    use ringbuf::HeapRb;
+    use ringbuf::traits::{Producer, Split};
+
+    /// M3 (spsc-wake-floor): a drain cycle that stops at MAX_DRAIN_PER_CYCLE
+    /// (256) must return `true` — queued messages may remain, so the caller
+    /// self-re-notifies — while a cycle that empties the rings returns
+    /// `false`. The integration suite cannot reach the cap from one client
+    /// (pipelined commands coalesce into one PipelineBatch per target per
+    /// read chunk), so the cap path is pinned here with 300 real ring
+    /// messages. `BlockCancel` for an unknown wait_id is a harmless no-op,
+    /// which keeps every other dependency inert (no WAL, no snapshot).
+    #[test]
+    fn drain_cap_reports_possible_tail() {
+        let shard_databases = Arc::new(ShardDatabases::new(vec![vec![Database::new()]]));
+        let rb = HeapRb::<ShardMessage>::new(512);
+        let (mut prod, cons) = rb.split();
+        for i in 0..300u64 {
+            assert!(
+                prod.try_push(ShardMessage::BlockCancel { wait_id: i })
+                    .is_ok(),
+                "ring accepts 300 messages"
+            );
+        }
+        let mut consumers = vec![cons];
+
+        let mut pubsub = PubSubRegistry::new();
+        let blocking = Rc::new(RefCell::new(BlockingRegistry::new(0)));
+        let mut pending_snapshot = None;
+        let mut snapshot_state: Option<SnapshotState> = None;
+        let mut wal_writer: Option<WalWriter> = None;
+        let mut wal_v3_writer: Option<WalWriterV3> = None;
+        let backlog: crate::replication::backlog::SharedBacklog =
+            Arc::new(parking_lot::Mutex::new(None));
+        let mut replica_txs = Vec::new();
+        let offsets: Option<crate::replication::state::OffsetHandle> = None;
+        let script_cache = Rc::new(RefCell::new(crate::scripting::ScriptCache::new()));
+        let clock = CachedClock::new();
+        let mut migrations = Vec::new();
+        let mut vector_store = VectorStore::new();
+        let mut cdc = Vec::new();
+        let mut manifest = None;
+        let mut autovacuum = crate::shard::autovacuum::AutovacuumDaemon::new(Default::default());
+
+        // First cycle: 300 queued > 256 cap -> drains exactly 256, reports tail.
+        let hit_cap = drain_spsc_shared(
+            &shard_databases,
+            &mut consumers,
+            &mut pubsub,
+            &blocking,
+            &mut pending_snapshot,
+            &mut snapshot_state,
+            &mut wal_writer,
+            &mut wal_v3_writer,
+            &backlog,
+            &mut replica_txs,
+            &offsets,
+            0,
+            &script_cache,
+            &clock,
+            &mut migrations,
+            &mut vector_store,
+            &mut cdc,
+            &mut manifest,
+            1000,
+            8,
+            0.2,
+            &mut autovacuum,
+            None,
+        );
+        assert!(
+            hit_cap,
+            "300 queued messages exceed the 256 cap: first cycle must report a possible tail"
+        );
+
+        // Second cycle: the 44 remaining messages drain fully -> no tail.
+        let hit_cap2 = drain_spsc_shared(
+            &shard_databases,
+            &mut consumers,
+            &mut pubsub,
+            &blocking,
+            &mut pending_snapshot,
+            &mut snapshot_state,
+            &mut wal_writer,
+            &mut wal_v3_writer,
+            &backlog,
+            &mut replica_txs,
+            &offsets,
+            0,
+            &script_cache,
+            &clock,
+            &mut migrations,
+            &mut vector_store,
+            &mut cdc,
+            &mut manifest,
+            1000,
+            8,
+            0.2,
+            &mut autovacuum,
+            None,
+        );
+        assert!(
+            !hit_cap2,
+            "44 remaining messages drain fully: second cycle must report no tail"
+        );
+        use ringbuf::traits::Observer;
+        assert!(consumers[0].is_empty(), "all 300 messages must be consumed");
     }
 }

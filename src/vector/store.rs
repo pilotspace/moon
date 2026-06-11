@@ -1399,7 +1399,7 @@ impl VectorStore {
         let key_hash = xxhash_rust::xxh64::xxh64(key, 0);
         let mut any_deleted = false;
         for idx_name in matching_names {
-            if let Some(idx) = self.indexes.get(&idx_name) {
+            if let Some(idx) = self.indexes.get_mut(&idx_name) {
                 let snap = idx.segments.load();
                 // Tombstone in mutable segment (always present).
                 snap.mutable.mark_deleted_by_key_hash(key_hash, 1);
@@ -1408,6 +1408,12 @@ impl VectorStore {
                 for imm in snap.immutable.iter() {
                     imm.mark_deleted_by_key_hash(key_hash);
                 }
+                // QW7 (2026-06 review finding 6.3): prune the key-hash maps so
+                // they track LIVE keys, not historical inserts — without this
+                // they grow monotonically under key churn (~1GB / 24M deletes).
+                // A re-insert of the same key repopulates both maps.
+                idx.key_hash_to_key.remove(&key_hash);
+                idx.key_hash_to_global_id.remove(&key_hash);
                 any_deleted = true;
             }
         }

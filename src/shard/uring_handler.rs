@@ -45,7 +45,7 @@ pub(crate) fn send_serialized(
     driver: &mut UringDriver,
     conn_id: u32,
     resp_buf: bytes::BytesMut,
-    inflight_sends: &mut std::collections::HashMap<u32, Vec<InFlightSend>>,
+    inflight_sends: &mut std::collections::HashMap<u32, std::collections::VecDeque<InFlightSend>>,
 ) {
     let resp_len = resp_buf.len();
     // Try pooled fixed buffer: must fit in pool buffer size
@@ -56,7 +56,7 @@ pub(crate) fn send_serialized(
             inflight_sends
                 .entry(conn_id)
                 .or_default()
-                .push(InFlightSend::Fixed(buf_idx));
+                .push_back(InFlightSend::Fixed(buf_idx));
             return;
         }
         // Response too large for pooled buffer -- reclaim and fall through to heap
@@ -69,7 +69,7 @@ pub(crate) fn send_serialized(
     inflight_sends
         .entry(conn_id)
         .or_default()
-        .push(InFlightSend::Buf(resp_buf));
+        .push_back(InFlightSend::Buf(resp_buf));
 }
 
 /// Handles recv (parse RESP frames + execute commands + send responses),
@@ -83,7 +83,7 @@ pub(crate) fn handle_uring_event(
     shard_databases: &Arc<ShardDatabases>,
     shard_id: usize,
     parse_bufs: &mut std::collections::HashMap<u32, bytes::BytesMut>,
-    inflight_sends: &mut std::collections::HashMap<u32, Vec<InFlightSend>>,
+    inflight_sends: &mut std::collections::HashMap<u32, std::collections::VecDeque<InFlightSend>>,
     uring_listener_fd: Option<std::os::fd::RawFd>,
     cached_clock: &CachedClock,
 ) {
@@ -269,7 +269,7 @@ pub(crate) fn handle_uring_event(
                                 inflight_sends
                                     .entry(conn_id)
                                     .or_default()
-                                    .push(InFlightSend::Writev(guard));
+                                    .push_back(InFlightSend::Writev(guard));
                             }
                             Err(e) => {
                                 tracing::warn!(
@@ -290,7 +290,7 @@ pub(crate) fn handle_uring_event(
                                 inflight_sends
                                     .entry(conn_id)
                                     .or_default()
-                                    .push(InFlightSend::Writev(guard));
+                                    .push_back(InFlightSend::Writev(guard));
                             }
                             Err(e) => {
                                 tracing::warn!(
@@ -342,11 +342,10 @@ pub(crate) fn handle_uring_event(
         IoEvent::SendComplete { conn_id } => {
             // Drop the oldest in-flight send buffer (FIFO order matches CQE order).
             if let Some(sends) = inflight_sends.get_mut(&conn_id) {
-                if !sends.is_empty() {
-                    let send = sends.remove(0);
-                    if let InFlightSend::Fixed(idx) = send {
-                        driver.reclaim_send_buf(idx);
-                    }
+                // QW6 (2026-06 review finding 3.6): VecDeque pop_front is
+                // O(1); Vec::remove(0) shifted the whole tail per CQE.
+                if let Some(InFlightSend::Fixed(idx)) = sends.pop_front() {
+                    driver.reclaim_send_buf(idx);
                 }
                 if sends.is_empty() {
                     inflight_sends.remove(&conn_id);
@@ -380,5 +379,13 @@ pub(crate) fn handle_uring_event(
 pub(crate) fn create_reuseport_listener(addr: &str) -> std::io::Result<std::os::fd::RawFd> {
     use std::os::unix::io::IntoRawFd;
     let std_listener = super::conn_accept::create_reuseport_socket(addr)?;
+    // QW1: TCP_NODELAY on the LISTENING socket. Multishot-accept CQEs deliver
+    // raw fds with no safe per-socket hook; Linux copies the nonagle flag to
+    // sockets returned by accept(2), so setting it here covers them.
+    if let Err(e) = crate::server::socket_opts::apply_client_socket_opts(&std_listener) {
+        // Non-fatal: the listener still works, but accepted sockets keep Nagle
+        // (pipelined replies may see delayed-ACK latency). Surface it loudly.
+        tracing::warn!("failed to set TCP_NODELAY on uring listener: {e}");
+    }
     Ok(std_listener.into_raw_fd())
 }

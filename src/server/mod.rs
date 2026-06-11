@@ -7,6 +7,7 @@ pub mod expiration;
 pub mod listener;
 pub mod response_slot;
 pub mod shutdown;
+pub mod socket_opts;
 
 // Backward-compatible re-export: callers using crate::server::connection::* still work
 pub mod connection {

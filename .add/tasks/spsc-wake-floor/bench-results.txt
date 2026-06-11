@@ -1,0 +1,36 @@
+# spsc-wake-floor — swf5 verify bench evidence
+# Date: 2026-06-11 · Host: OrbStack moon-dev VM (Ubuntu 24.04, aarch64, kernel 6.17)
+# Baseline binary: commit 9861407 (task-1 quickwins, PRE wake-floor) — moon-baseline worktree
+# Wakefloor binary: working tree (race2 tick+notify, drain-cap re-notify, direct reply race)
+# Runtime under test: monoio release (MOON_NO_URING unset → io_uring), redis-benchmark 8.x
+# Method: tmp/bench-swf.sh — fresh server per row, --appendonly no, -r 100000, n=100k
+#         (baseline c1 latency row used n=20k: at 562 rps a 100k run takes ~3 min)
+
+## swf5 — 4-shard single-client SET latency (cross-shard dispatch path), c=1 P=1
+                 avg       p50       p95       p99       max     rps
+baseline       1.774     1.967     3.983     4.071    15.495      562
+wakefloor      0.027     0.031     0.055     0.071     2.391   12,786
+
+  EXIT CRITERION cross-shard p99 < 1ms: PASS (0.071 ms, 57x better than baseline)
+  The ~1.8ms baseline floor = the periodic-tick-only wake (reply swept on next 1ms
+  tick + dispatch alignment); event-driven Notify removes it entirely.
+
+## Throughput no-regression (A2 bench gate) — SET / GET rps
+config        baseline-SET  wakefloor-SET   baseline-GET  wakefloor-GET
+s1 P1  c50        138,313        225,734        107,066        255,102
+s1 P16 c50        704,225      1,265,823      1,333,333      2,127,660
+s4 P1  c50         29,351        147,929        185,529        175,747
+s4 P16 c50        314,465      1,470,588      1,785,714      2,127,660
+s4 c1  P1             562         12,786        187,617        175,131
+
+  Pipelined 4-shard (the A2 gate): SET +368%, GET +19% — NO regression.
+  4-shard non-pipelined SET +404% (29K -> 148K): cross-shard writes no longer
+  wait for the tick. GET s4 P1/c1 within run-to-run VM noise (-5..-7%) —
+  expected: cross-shard READS take the shared-read fastpath (no SPSC message),
+  so the wake change does not touch their path.
+  Single-shard improvements (+63..+80%) come from the same loop no longer
+  oversleeping its own local work between ticks.
+
+## Notes
+- All numbers from Linux VM per project rule (macOS numbers are dev-only).
+- redis-benchmark progress lines stripped via tr '\r' '\n' (8.x gotcha).

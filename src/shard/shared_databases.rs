@@ -31,8 +31,10 @@ pub struct ShardDatabases {
     graph_stores: Vec<RwLock<GraphStore>>,
     /// Per-shard WAL append channel sender. Connection handlers send serialized
     /// write commands here; the event loop drains into WAL v2/v3 on the 1ms tick.
-    /// Mutex<Option<>> for single-writer init, then read-only via wal_append().
-    wal_append_txs: Vec<Mutex<Option<crate::runtime::channel::MpscSender<bytes::Bytes>>>>,
+    /// OnceLock: set once at event-loop startup (before connections are
+    /// accepted), then every hot-path read is lock-free (QW2, 2026-06 review
+    /// finding 1.8 — was Mutex<Option<>>, one lock acquire per write command).
+    wal_append_txs: Vec<std::sync::OnceLock<crate::runtime::channel::MpscSender<bytes::Bytes>>>,
     /// Per-shard TemporalRegistry for wall-clock-to-LSN bindings.
     /// Lazy-init: None until first TEMPORAL.SNAPSHOT_AT call.
     temporal_registries: Vec<Mutex<Option<Box<TemporalRegistry>>>>,
@@ -96,7 +98,9 @@ impl ShardDatabases {
         let graph_stores = (0..num_shards)
             .map(|_| RwLock::new(GraphStore::new()))
             .collect();
-        let wal_append_txs = (0..num_shards).map(|_| Mutex::new(None)).collect();
+        let wal_append_txs = (0..num_shards)
+            .map(|_| std::sync::OnceLock::new())
+            .collect();
         let temporal_registries = (0..num_shards).map(|_| Mutex::new(None)).collect();
         let temporal_kv_indexes = (0..num_shards).map(|_| Mutex::new(None)).collect();
         let workspace_registries = (0..num_shards).map(|_| Mutex::new(None)).collect();
@@ -147,7 +151,12 @@ impl ShardDatabases {
         shard_id: usize,
         tx: crate::runtime::channel::MpscSender<bytes::Bytes>,
     ) {
-        *self.wal_append_txs[shard_id].lock() = Some(tx);
+        if self.wal_append_txs[shard_id].set(tx).is_err() {
+            tracing::warn!(
+                shard_id,
+                "wal_append_tx already initialized; re-init ignored (OnceLock)"
+            );
+        }
     }
 
     /// Send serialized command bytes to the WAL append channel for a shard.
@@ -157,7 +166,7 @@ impl ShardDatabases {
     /// No-op when persistence is disabled.
     #[inline]
     pub fn wal_append(&self, shard_id: usize, data: bytes::Bytes) {
-        if let Some(ref tx) = *self.wal_append_txs[shard_id].lock() {
+        if let Some(tx) = self.wal_append_txs[shard_id].get() {
             let _ = tx.try_send(data);
         }
     }
@@ -171,8 +180,8 @@ impl ShardDatabases {
     #[inline]
     #[must_use = "callers must check the result and skip the mutation on WAL failure"]
     pub fn try_wal_append_required(&self, shard_id: usize, data: bytes::Bytes) -> bool {
-        match *self.wal_append_txs[shard_id].lock() {
-            Some(ref tx) => tx.try_send(data).is_ok(),
+        match self.wal_append_txs[shard_id].get() {
+            Some(tx) => tx.try_send(data).is_ok(),
             None => true, // persistence disabled — no durability requirement
         }
     }

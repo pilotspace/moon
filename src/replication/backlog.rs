@@ -31,15 +31,27 @@ impl ReplicationBacklog {
     }
 
     /// Append bytes to the backlog. Evicts oldest bytes when at capacity.
+    ///
+    /// Bulk-copy implementation (QW5, 2026-06 review finding 1.5): one drain
+    /// plus one extend instead of a per-byte eviction loop. State machine is
+    /// identical to the per-byte version — the live window is always the last
+    /// `capacity` bytes ever appended, and `start_offset` maintains the
+    /// invariant `start_offset = end_offset - buf.len()`.
     pub fn append(&mut self, data: &[u8]) {
-        for &b in data {
-            if self.buf.len() == self.capacity {
-                self.buf.pop_front();
-                self.start_offset += 1;
-            }
-            self.buf.push_back(b);
-        }
         self.end_offset += data.len() as u64;
+        if data.len() >= self.capacity {
+            // The live window comes entirely from the tail of `data`.
+            self.buf.clear();
+            self.buf
+                .extend(data[data.len() - self.capacity..].iter().copied());
+        } else {
+            let overflow = (self.buf.len() + data.len()).saturating_sub(self.capacity);
+            if overflow > 0 {
+                self.buf.drain(..overflow);
+            }
+            self.buf.extend(data.iter().copied());
+        }
+        self.start_offset = self.end_offset - self.buf.len() as u64;
     }
 
     /// Returns owned Vec of bytes from `offset` to end_offset, or None if offset was evicted.
