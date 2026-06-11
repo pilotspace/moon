@@ -161,15 +161,16 @@ pub fn handle_slowlog(slowlog: &Slowlog, args: &[Frame]) -> Frame {
         ));
     }
 
-    let subcmd = match &args[0] {
-        Frame::BulkString(b) => b.to_ascii_uppercase(),
+    // Case-insensitive byte compare — no uppercase copy on the read path.
+    let subcmd: &[u8] = match &args[0] {
+        Frame::BulkString(b) => b,
         _ => {
             return Frame::Error(Bytes::from_static(b"ERR invalid slowlog subcommand"));
         }
     };
 
-    match subcmd.as_slice() {
-        b"GET" => {
+    match subcmd {
+        s if s.eq_ignore_ascii_case(b"GET") => {
             let count = if args.len() > 1 {
                 match &args[1] {
                     Frame::BulkString(b) => {
@@ -210,12 +211,12 @@ pub fn handle_slowlog(slowlog: &Slowlog, args: &[Frame]) -> Frame {
             let frames: Vec<Frame> = entries.iter().map(entry_to_frame).collect();
             Frame::Array(crate::protocol::FrameVec::from(frames))
         }
-        b"LEN" => Frame::Integer(slowlog.len() as i64),
-        b"RESET" => {
+        s if s.eq_ignore_ascii_case(b"LEN") => Frame::Integer(slowlog.len() as i64),
+        s if s.eq_ignore_ascii_case(b"RESET") => {
             slowlog.reset();
             Frame::SimpleString(Bytes::from_static(b"OK"))
         }
-        b"HELP" => {
+        s if s.eq_ignore_ascii_case(b"HELP") => {
             let help = vec![
                 Frame::BulkString(Bytes::from_static(b"SLOWLOG GET [<count>]")),
                 Frame::BulkString(Bytes::from_static(

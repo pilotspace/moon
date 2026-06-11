@@ -1430,7 +1430,10 @@ fn dispatch_read_inner(db: &Database, cmd: &[u8], args: &[Frame], now_ms: u64) -
             }
         }
         (4, b'w') => {
-            // WAIT: no replication — always 0 (mirrors handler_single.rs:833)
+            // WAIT: no replication — always 0 (mirrors handler_single.rs:833).
+            // WAIT is in extract_primary_key's keyless table, so it routes
+            // locally: this arm fires on the local read path only, never the
+            // cross-shard fast path.
             if cmd.eq_ignore_ascii_case(b"WAIT") {
                 return resp(Frame::Integer(0));
             }

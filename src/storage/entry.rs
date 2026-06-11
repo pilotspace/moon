@@ -413,7 +413,10 @@ impl CompactEntry {
         if self.ttl_secs == 0 {
             return false;
         }
-        now_ms >= self.ttl_secs * 1000
+        // saturating_mul: adversarial EXPIREAT near u64::MAX/1000 must clamp
+        // to "far future", never wrap to the past (debug builds would panic,
+        // release builds would silently expire the key immediately).
+        now_ms >= self.ttl_secs.saturating_mul(1000)
     }
 
     /// Check if this entry has an expiry set.
@@ -425,7 +428,7 @@ impl CompactEntry {
     /// Get the absolute expiry time in milliseconds (for serialization/TTL commands).
     #[inline]
     pub fn expires_at_ms(&self, _base_ts: u32) -> u64 {
-        self.ttl_secs * 1000
+        self.ttl_secs.saturating_mul(1000)
     }
 
     /// Set the expiry from absolute milliseconds. Pass 0 to remove expiry.

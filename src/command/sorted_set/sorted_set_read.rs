@@ -1391,19 +1391,26 @@ fn collect_source_sets(
 /// Compact (listpack) encodings return an empty map — callers see an absent
 /// set, which is correct because compact sets are upgraded to BPTree on first
 /// write access.
-fn collect_source_sets_readonly(
-    db: &Database,
+fn collect_source_sets_readonly<'a>(
+    db: &'a Database,
     keys: &[Bytes],
     now_ms: u64,
-) -> Result<Vec<HashMap<Bytes, f64>>, Frame> {
-    let mut source_data: Vec<HashMap<Bytes, f64>> = Vec::with_capacity(keys.len());
+) -> Result<Vec<std::borrow::Cow<'a, HashMap<Bytes, f64>>>, Frame> {
+    use std::borrow::Cow;
+    let mut source_data: Vec<Cow<'a, HashMap<Bytes, f64>>> = Vec::with_capacity(keys.len());
     for key in keys {
-        match db.get_sorted_set_if_alive(key, now_ms) {
-            Ok(Some((members, _))) => {
-                source_data.push(members.clone());
-            }
+        // get_sorted_set_ref_if_alive handles ALL encodings (BPTree, Listpack
+        // from RDB load, Legacy) — the BPTree-only accessor would silently
+        // treat a listpack zset as missing. BPTree/Legacy borrow their map
+        // (no clone); listpacks are small by definition, so materializing an
+        // owned map for them is bounded.
+        match db.get_sorted_set_ref_if_alive(key, now_ms) {
+            Ok(Some(zref)) => match zref.members_map() {
+                Some(m) => source_data.push(Cow::Borrowed(m)),
+                None => source_data.push(Cow::Owned(zref.entries_sorted().into_iter().collect())),
+            },
             Ok(None) => {
-                source_data.push(HashMap::new());
+                source_data.push(Cow::Owned(HashMap::new()));
             }
             Err(e) => return Err(e),
         }
@@ -1776,7 +1783,7 @@ pub fn zdiff_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
     };
     let mut result_map: HashMap<Bytes, f64> = HashMap::new();
     if let Some(first) = source_data.first() {
-        'outer: for (member, score) in first {
+        'outer: for (member, score) in first.iter() {
             for src in source_data.iter().skip(1) {
                 if src.contains_key(member) {
                     continue 'outer;
@@ -1800,7 +1807,7 @@ pub fn zunion_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
     };
     let mut result_map: HashMap<Bytes, f64> = HashMap::new();
     for (idx, src) in source_data.iter().enumerate() {
-        for (member, score) in src {
+        for (member, score) in src.iter() {
             let weighted = *score * weights[idx];
             result_map
                 .entry(member.clone())
@@ -1829,7 +1836,7 @@ pub fn zinter_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
     };
     let mut result_map: HashMap<Bytes, f64> = HashMap::new();
     if let Some(first) = source_data.first() {
-        for (member, score) in first {
+        for (member, score) in first.iter() {
             let weighted = *score * weights[0];
             let mut final_score = weighted;
             let mut in_all = true;
@@ -1949,8 +1956,10 @@ pub fn zrandmember_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame
         Some(k) => k,
         None => return err_wrong_args("ZRANDMEMBER"),
     };
-    let members_map = match db.get_sorted_set_if_alive(key, now_ms) {
-        Ok(Some((members, _))) => members,
+    // Ref accessor: handles every encoding (BPTree, Listpack from RDB load,
+    // Legacy) — the BPTree-only accessor would treat a listpack zset as missing.
+    let zref = match db.get_sorted_set_ref_if_alive(key, now_ms) {
+        Ok(Some(z)) => z,
         Ok(None) => {
             return if args.len() == 1 {
                 Frame::Null
@@ -1960,14 +1969,22 @@ pub fn zrandmember_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame
         }
         Err(e) => return e,
     };
-    if members_map.is_empty() {
+    // Borrow the map when one exists; materialize only for small listpacks.
+    let entries_owned: Vec<(Bytes, f64)>;
+    let entries: Vec<(&Bytes, f64)> = match zref.members_map() {
+        Some(m) => m.iter().map(|(m, s)| (m, *s)).collect(),
+        None => {
+            entries_owned = zref.entries_sorted();
+            entries_owned.iter().map(|(m, s)| (m, *s)).collect()
+        }
+    };
+    if entries.is_empty() {
         return if args.len() == 1 {
             Frame::Null
         } else {
             Frame::Array(framevec![])
         };
     }
-    let entries: Vec<(&Bytes, f64)> = members_map.iter().map(|(m, s)| (m, *s)).collect();
     let mut rng = rand::rng();
     if args.len() == 1 {
         return if let Some(chosen) = entries.choose(&mut rng) {
@@ -2040,8 +2057,10 @@ pub fn zmscore_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
         Some(k) => k,
         None => return err_wrong_args("ZMSCORE"),
     };
-    match db.get_sorted_set_if_alive(key, now_ms) {
-        Ok(Some((members, _))) => {
+    // Ref accessor: handles every encoding (BPTree, Listpack from RDB load,
+    // Legacy) — the BPTree-only accessor would treat a listpack zset as missing.
+    match db.get_sorted_set_ref_if_alive(key, now_ms) {
+        Ok(Some(zref)) => {
             let mut result = Vec::with_capacity(args.len() - 1);
             for arg in &args[1..] {
                 let member = match extract_bytes(arg) {
@@ -2051,9 +2070,9 @@ pub fn zmscore_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
                         continue;
                     }
                 };
-                match members.get(member) {
+                match zref.score(member) {
                     Some(score) => {
-                        result.push(Frame::BulkString(format_score_bytes(*score)));
+                        result.push(Frame::BulkString(format_score_bytes(score)));
                     }
                     None => result.push(Frame::Null),
                 }

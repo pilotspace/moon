@@ -374,12 +374,16 @@ pub fn time() -> Frame {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
-    let secs = now.as_secs();
-    let micros = now.subsec_micros();
+    let mut secs_buf = itoa::Buffer::new();
+    let mut micros_buf = itoa::Buffer::new();
     Frame::Array(
         vec![
-            Frame::BulkString(Bytes::from(secs.to_string())),
-            Frame::BulkString(Bytes::from(micros.to_string())),
+            Frame::BulkString(Bytes::copy_from_slice(
+                secs_buf.format(now.as_secs()).as_bytes(),
+            )),
+            Frame::BulkString(Bytes::copy_from_slice(
+                micros_buf.format(now.subsec_micros()).as_bytes(),
+            )),
         ]
         .into(),
     )
