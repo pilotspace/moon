@@ -24,12 +24,12 @@ Out: FT.SEARCH off-event-loop execution (review priority 3 → v2) · WAL group 
 - eventfd wake protocol between shards (who signals, when, idempotency under coalescing) -> owning task `spsc-wake-floor`
 
 ## Tasks (breadth-first decomposition; detail lives in each TASK.md)
-- [ ] hotpath-lock-quickwins   depends-on: none                    — remove per-command global locks/atomics (OnceLock WAL sender, lock-free repl offsets, per-shard metrics counters, backlog bulk-append, VecDeque inflight sends, key_hash prune) + TCP_NODELAY on accept; establishes the measurement baseline
+- [x] hotpath-lock-quickwins   depends-on: none                    — remove per-command global locks/atomics (OnceLock WAL sender, lock-free repl offsets, per-shard metrics counters, backlog bulk-append, VecDeque inflight sends, key_hash prune) + TCP_NODELAY on accept; establishes the measurement baseline
 - [ ] spsc-wake-floor          depends-on: hotpath-lock-quickwins  — eventfd-based cross-thread wake for monoio replies + SPSC drain-until-empty; removes the ~1ms cross-shard latency floor
 - [ ] shardslice-migration     depends-on: hotpath-lock-quickwins  — complete the ShardSlice migration: route remaining cross-shard reads through SPSC, delete Arc<ShardDatabases> foreign-thread access and every `is_initialized()` dual branch
 
 ## Exit criteria (observable; map each to the task that delivers it)
-- [ ] Lock inventory: zero global lock acquisitions on the per-command write path for metrics, replication offsets, WAL sender, client registry batch-update — verified by a recorded audit + tests        (← hotpath-lock-quickwins)
+- [x] Lock inventory: zero global lock acquisitions on the per-command write path for metrics, replication offsets, WAL sender, client registry batch-update — verified by a recorded audit + tests (TASK.md §6, 2026-06-11)        (← hotpath-lock-quickwins)
 - [ ] `scripts/bench-compare.sh` on moon-dev shows no regression at 1 shard and measured improvement at 4 shards vs the recorded v0.3.0 baseline        (← hotpath-lock-quickwins · spsc-wake-floor · shardslice-migration)
 - [ ] Cross-shard single-key SET/GET p99 on monoio drops below 1ms (the old floor) in a recorded latency run        (← spsc-wake-floor)
 - [ ] `grep -r "is_initialized()" src/shard/` returns zero dual-path branches; `ShardDatabases` no longer exposes cross-shard read access        (← shardslice-migration)

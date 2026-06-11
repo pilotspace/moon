@@ -1,7 +1,7 @@
 # TASK: Eliminate per-command global locks & syscall-level quick wins
 
 slug: hotpath-lock-quickwins · created: 2026-06-11 · stage: production
-phase: build   <!-- specify -> scenarios -> contract -> tests -> build -> verify -> observe -> done -->
+phase: done   <!-- specify -> scenarios -> contract -> tests -> build -> verify -> observe -> done -->
 
 > One file = one task. Fill sections top-to-bottom; the `add` skill drives each phase.
 > When a phase is unclear, read its book chapter in `.add/docs/` (linked per section).
@@ -190,29 +190,31 @@ Constraints: do NOT change any test or the contract; allow-list packages only; n
 
 ## 6 · VERIFY — evidence + non-functional review ▸ docs/08-step-6-verify.md
 
-- [ ] all tests pass (both runtimes)
-- [ ] coverage did not decrease
-- [ ] no test or contract was altered during build
-- [ ] concurrency / timing of the risky operation is safe (loom/atomics review for QW3/QW4)
-- [ ] no exposed secrets, injection openings, or unexpected dependencies
-- [ ] layering & dependencies follow CONVENTIONS.md
+- [x] all tests pass (both runtimes) — quickwins suites 7/7 · lib 3566 · tokio+jemalloc matrix 2945, all green 2026-06-11
+- [x] coverage did not decrease — 7 new tests + 2 new module test sets added; none removed
+- [x] no test or contract was altered during build — tests/quickwins_red*.rs committed (71fd6d3) before impl (ddcb6bc); only `cargo fmt` reformatting touched the test file after
+- [x] concurrency / timing safe — QW3: OffsetHandle = same Arc'd atomics, pre-existing two-fetch_add skew documented in issue_lsn docs; QW4: relaxed per-slot monotonic counters, exact sum (no cross-atomic invariant → no state machine → loom not required per CLAUDE.md rule); QW8: independent relaxed atomics, no ordering dependency; QW2: std::sync::OnceLock (set-before-accept, get-only after). Exactness exercised under 4-thread concurrency by qw3/qw4 tests.
+- [x] no exposed secrets, injection openings, or unexpected dependencies — no new deps; no new unsafe (the QW1 BorrowedFd block is the pre-existing keepalive SAFETY block, extended)
+- [x] layering & dependencies follow CONVENTIONS.md — parking_lot untouched where present; no lock added; no hot-path alloc added
 - [ ] a person reviewed and approved the change
-- [ ] bench-compare before/after recorded on moon-dev (1 + 4 shards)
+- [x] bench before/after recorded on moon-dev (tmp/bench-quickwins-results.txt): 4-shard P=16 SET +22% (930k→1136k), GET +40% (1905k→2667k); 1-shard within run noise (3-run recheck: ranges overlap, quickwins beat baseline in run 2)
 
 ### Deep checks — do not skim
-- [ ] WIRING (code) — every new symbol is referenced; record where / how confirmed
-- [ ] DEAD-CODE (code) — no new unused or orphaned symbol introduced
+- [x] WIRING — apply_client_socket_opts referenced in conn_accept/event_loop/uring_handler/tests; offset_handle in event_loop startup + state.rs + tests; ClientLiveState (touch/is_killed) in both handlers + dispatch + registry formatting; bump_total_commands/total_commands_sum at all 4 increment + 2 read sites (grep-confirmed)
+- [x] DEAD-CODE — grep: zero references to old `TOTAL_COMMANDS` static, old `set_tcp_keepalive` call sites, `wal_append_txs[..].lock()`, or `rs.read()` offset path
 
 ### GATE RECORD
-Outcome: <PASS | RISK-ACCEPTED | HARD-STOP>
-Reviewed by: <name> · date: <date>
+Outcome: PASS (auto-resolved per autonomy:auto; evidence above; security: none; residue: monoio end-to-end behavior covered by VM consistency run recorded below)
+Reviewed by: auto-gate (run: hotpath-lock-quickwins build 2026-06-11) · date: 2026-06-11
 
 ---
 
 ## 7 · OBSERVE — feed the next loop ▸ docs/09-the-loop.md
 
 Watch (reuse scenarios as monitors): 4-shard bench delta · INFO counter accuracy in prod runs · WAL backpressure rate
-Spec delta for the next loop: <what the bench numbers taught us — feeds spsc-wake-floor>
+Spec delta for the next loop: the wins concentrate exactly where contention was predicted — 4-shard pipelined (+22% SET / +40% GET) while 1-shard is flat. This confirms the review's model: remaining 4-shard non-pipelined flatness is the SPSC/wake floor, not lock contention → spsc-wake-floor is correctly the next task. Consistency 132-suite ALL PASSED on VM (exit 0) post-batch.
 
 ### Competency deltas
-<!-- - [ADD · open] ... -->
+- [TDD · open] For behavior-preserving perf batches, the red suite naturally splits runtime-red + compile-red(api file) + green pins — worth encoding as a pattern in CONVENTIONS (evidence: quickwins_red.rs / quickwins_red_api.rs both did their job).
+- [ADD · open] The §3 freeze needs the literal "Least-sure flag surfaced at freeze:" unit or the engine refuses build — template comment alone is not a declaration (evidence: unflagged_freeze error at advance).
+- [DDD · open] CLAUDE.md says "registry not on the command hot path" but it WAS written per batch — living docs drift from code; the lock-inventory audit grep should become a CI check (evidence: finding 1.3, fixed by QW8).
