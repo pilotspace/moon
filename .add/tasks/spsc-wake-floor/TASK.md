@@ -1,7 +1,7 @@
 # TASK: Remove the ~1ms monoio cross-shard reply floor (eventfd wake + drain-until-empty)
 
 slug: spsc-wake-floor · created: 2026-06-11 · stage: production
-phase: tests   <!-- specify -> scenarios -> contract -> tests -> build -> verify -> observe -> done -->
+phase: done   <!-- specify -> scenarios -> contract -> tests -> build -> verify -> observe -> done -->
 
 > One file = one task. Fill sections top-to-bottom; the `add` skill drives each phase.
 > When a phase is unclear, read its book chapter in `.add/docs/` (linked per section).
@@ -289,6 +289,30 @@ Red-state record (2026-06-11, before build):
 - swf0 Linux io_uring: **PASS on moon-dev VM (Ubuntu 24.04, kernel 6.17, io_uring)** —
   1 passed in 0.02s. **A1 CONFIRMED on BOTH drivers; frozen mechanism stands, no fallback.**
 
+Test amendments during build (assertions kept; STIMULI corrected — recorded as deltas in §7):
+- swf2's original stimulus (one client's 4096-cmd pipeline) was factually unreachable:
+  pipelined commands COALESCE into one PipelineBatch per target per read chunk (~14 ring
+  messages for 4096 commands), so a single connection can never hit the 256-message cap.
+  Split into: (a) swf2 — burst completeness + INFO field presence (CI); (b) the cap-path
+  return unit-tested with 300 real ring messages (spsc_handler.rs
+  `drain_cap_reports_possible_tail`, CI); (c) swf2b `#[ignore]` — true >256-concurrent-client
+  e2e wiring evidence, run explicitly (recipe found empirically: per-conn keys [hot-key storms
+  resolve local], WRITES only [cross-shard reads take the shared-read fastpath], heavy-head
+  SETRANGE zero-fills to stall the consumer while the light wave piles in).
+  PSYNC/SnapshotBegin trigger was explored and rejected (multi-shard PSYNC unsupported;
+  1-shard has no self-ring).
+- swf2b stimulus v2 (universal shape — assertion unchanged): the macOS-only shape (untagged
+  32MB heavies + single per-conn SETs) failed on Linux release because SO_REUSEPORT there
+  SPLITS connections across shards (~half the load per ring) and release executes the heavies
+  too fast. Universal shape proven on BOTH platforms: 8 hash tags {t0}..{t7}; heavies =
+  `SETRANGE h:{t<i>}:k 134217728 x` (128MB zero-fill, one per tag) stall BOTH shards; light
+  wave = each of the remaining 692 conns pipelines one SET per tag (`w:{t<i>}:<conn>`) so
+  EVERY conn loads BOTH rings regardless of kernel placement. ~1GB transient. Manually
+  validated on Linux release (spsc_drain_renotify:2) before encoding; encoded test PASSED
+  macOS debug (renotify ≥1, 6.79s); VM release run at verify.
+- wait_ready connect deadline 10s → 30s: macOS first-exec code-signature validation can
+  stall concurrent freshly-built server spawns >10s (observed via dyld sample).
+
 <!-- EXIT: one test per scenario; suite red for the RIGHT reason; target recorded. -->
 
 ---
@@ -309,21 +333,55 @@ ask if unclear.
 
 ## 6 · VERIFY — evidence + non-functional review ▸ docs/08-step-6-verify.md
 
-- [ ] all tests pass (default features AND --no-default-features --features runtime-tokio,jemalloc)
-- [ ] coverage did not decrease
-- [ ] no test or contract was altered during build
-- [ ] concurrency / timing of the risky operation is safe (lost-wake window analysis: notify
-      AFTER push on producer side; drain BEFORE await re-arm on consumer side)
-- [ ] no exposed secrets, injection openings, or unexpected dependencies
-- [ ] layering & dependencies follow CONVENTIONS.md
-- [ ] a person reviewed and approved the change
-- [ ] VM bench evidence: swf5 p99 < 1ms + bench-compare no-regression (pipelined 4-shard)
+- [x] all tests pass (default features AND --no-default-features --features runtime-tokio,jemalloc)
+      — macOS: 3570 lib + all suites green; Linux VM release: 30 suites ok / 0 failed; Linux VM
+      tokio (MOON_NO_URING=1): 2968 lib + all integration suites, 0 failed, exit code captured
+      via PIPESTATUS (the earlier grep-pipeline masking is a recorded §7 lesson).
+      ⚠ test_txn_commit_wal_crash_recovery flaked once in the first tokio sweep: binary-level
+      A/B (15 runs each) shows 1/15 failure on BOTH the task-1 baseline binary AND this build —
+      PRE-EXISTING flake (BGREWRITEAOF/kill race), NOT introduced here. Follow-up noted in §7.
+- [x] coverage did not decrease — 11 new tests added (5 CI + swf0 monoio-only + swf2b ignored
+      load + 3 race2 in-module + drain-cap unit); zero tests removed or weakened.
+- [x] no test or contract was altered during build — §3 untouched since freeze; swf2/swf2b
+      STIMULUS amendments (assertions kept) recorded in §4 + §7. Error strings byte-identical
+      (swf4 constraint): verified by diff of the three reply-error literals.
+- [x] concurrency / timing safe — lost-wake analysis: producer notify_one() AFTER ring push
+      (flume token persists if consumer not yet awaiting — swf_a3 proves drop-requeue); consumer
+      drains AFTER wake and re-notifies itself when the 256 cap (or snapshot barrier) leaves a
+      tail; losing race2 arm drops cleanly (token re-queued). Under stall: 1400 msgs → 9 wakes
+      (coalescing works). Cadence work stays timer-exclusive (WAL flush / auto-save / clock).
+- [x] no exposed secrets, injection openings, or unexpected dependencies — zero new deps
+      (race.rs is hand-rolled std-only); counters are plain AtomicU64.
+- [x] layering & dependencies follow CONVENTIONS.md — race future in src/runtime/, metrics in
+      src/admin/metrics_setup.rs, INFO wiring in src/command/connection.rs; no upward imports.
+- [ ] a person reviewed and approved the change — pending PR review (both tasks ship in one PR
+      on perf/hotpath-lock-quickwins per user decision).
+- [x] VM bench evidence — .add/tasks/spsc-wake-floor/bench-results.txt: 4-shard c=1 SET p99
+      4.071ms → 0.071ms (57×), 562 → 12,786 rps; pipelined 4-shard SET +368% / GET +19% (A2
+      no-regression gate PASS); milestone exit criterion cross-shard p99 < 1ms: PASS.
+- [x] consistency suite (scripts/test-consistency.sh, VM-local clone) — branch 4ecf285 vs
+      main 3e376a1: IDENTICAL results (same 15 pre-existing FAILs — GEO*/EXPIRETIME/
+      PEXPIRETIME/TOUCH unreachable over the wire [known dispatch_read gotcha], SETRANGE
+      script bug [SETRANGE only sent to moon, then both GETs compared], FT.CREATE algorithm
+      arg mismatch — and the same Phase-152 early-exit rc=1). ZERO new failures introduced.
+      ⚠ Pre-existing residue surfaced to milestone level: the "consistency green" milestone
+      exit criterion is not currently met by MAIN itself; follow-up task proposed in §7.
+      NOTE: suites must run from VM-local disk — /Volumes/Games at ~4% free trips Moon's
+      5% diskfull write-pause guard and poisons every write test (first sweep discarded).
 
 ### Deep checks — do not skim (fill the path that applies; the resolver judges which)
-- [ ] WIRING (code) — every new symbol is referenced; record where / how confirmed
-- [ ] DEAD-CODE (code) — no new unused or orphaned symbol introduced
-- [ ] SEMANTIC (prose / non-code) — stale cross-thread-wake comments corrected everywhere
-      they appear (event_loop.rs, handler_monoio/mod.rs, conn_accept.rs, dispatch.rs)
+- [x] WIRING (code) — race2: awaited in event_loop.rs monoio loop + handler_monoio reply loop +
+      unit/api tests. drain_spsc_shared bool: consumed at all 3 call sites (monoio every-wake,
+      tokio notify arm, tokio periodic arm) → notify_one + bump_spsc_drain_renotify.
+      bump_spsc_notify_wake: monoio !timer_fired branch + tokio notify arm entry. Both counters
+      read by INFO Stats (connection.rs) and asserted live by swf1/swf2/swf2b.
+- [x] DEAD-CODE (code) — pending_wakers relay RETAINED by design with HISTORICAL NOTE (future
+      registrants); handler_monoio param renamed _pending_wakers with comment; no orphan symbols
+      (cargo clippy -D warnings green on both feature sets, both platforms).
+- [x] SEMANTIC (prose / non-code) — stale cross-thread-wake comments corrected in event_loop.rs
+      (pending_wakers decl), handler_monoio/mod.rs (header + reply loop), runtime/channel.rs
+      (try_recv doc); conn_accept.rs + dispatch.rs reviewed — their comments are historical
+      descriptions that remain accurate, left unchanged.
 
 ### GATE RECORD
 Outcome: <PASS | RISK-ACCEPTED | HARD-STOP>
@@ -338,8 +396,45 @@ Reviewed by: <name> · date: <date>
 
 Watch (reuse scenarios as monitors): spsc_notify_wakes rate vs command rate (event-driven
 path live), spsc_drain_renotify rate (burst pressure), cross-shard p99.
-Spec delta for the next loop: <what production taught you>
+
+Spec delta for the next loop:
+- The ~1ms floor was BIGGER than spec'd: removing it bought not just c=1 latency (p99 57×)
+  but +368% pipelined 4-shard SET and +63–80% single-shard throughput — the tick-only loop
+  was oversleeping its own local work too. Task-3 (shardslice-migration) projections should
+  re-baseline against these numbers.
+- Platform model corrected: monoio 0.2.4 `sync` DOES deliver cross-thread wakes on both
+  drivers (swf0). The pending_wakers relay is no longer load-bearing for replies; remove it
+  entirely once the last registrants migrate (candidate task-3 cleanup).
 
 ### Competency deltas
-What did this loop teach the foundation? One line each, tagged by competency
-(`DDD · SDD · UDD · TDD · ADD`), status `open`, with evidence. See the `add` skill's `deltas.md`.
+- TDD · open — A test stimulus can be FACTUALLY unreachable while its assertion is right:
+  swf2's one-client 4096-pipeline could never exceed the 256 drain cap (commands COALESCE
+  into ~14 PipelineBatch ring messages per read chunk). Amend the stimulus, never the
+  assertion; record the discovery (TASK.md §4) — evidence: swf2 split → unit + e2e + presence.
+- TDD · open — Load-test stimuli must be platform-portable by CONSTRUCTION: macOS
+  SO_REUSEPORT does NOT balance accepts (all conns one shard); Linux splits them. The
+  universal swf2b shape (hash tags pinning work to BOTH rings from every conn) is the
+  pattern — evidence: swf2b green on both platforms with one stimulus.
+- ADD · open — Run the FULL CI matrix (both feature sets, Linux) before declaring a task
+  done: task-1 shipped a Linux+tokio-only compile break (uring_handler VecDeque .push) that
+  macOS-only checks could not see; caught here at task-2 verify — evidence: 4ecf285.
+- ADD · open — Never pipe a gating command through grep/tail without PIPESTATUS: a masked
+  exit code reported "tokio-tests-done" over a compile failure — evidence: §6 test record.
+- ADD · open — Verify the VM runs the repo you think it runs: a stale second checkout at
+  the CLAUDE.md-documented path (/Users/tindang/workspaces/tind-repo/moon) absorbed several
+  test runs silently; the live repo is /Volumes/Games/tindang-repo/moon. Fix CLAUDE.md —
+  evidence: txn-flake false alarm traced to wrong-repo runs.
+- ADD · open — Flake triage by BINARY-LEVEL A/B (15× baseline vs 15× build) settles
+  "pre-existing or introduced" in minutes: test_txn_commit_wal_crash_recovery fails 1/15 on
+  BOTH → pre-existing (BGREWRITEAOF/kill race) — follow-up task candidate.
+- SDD · open — Moon's diskfull guard (free% < 5) trips on the HOST volume when test servers
+  CWD on the OrbStack shared fs (/Volumes/Games at ~4% free): consistency suites must run
+  from VM-local disk — evidence: MOONERR diskfull poisoning a whole consistency sweep.
+- SDD · open — macOS first-exec code-signature validation stalls freshly-built binary
+  spawns >10s under concurrency; spawn-deadlines in tests need ≥30s headroom on macOS —
+  evidence: wait_ready deadline bump in spsc_wake_floor_red.rs.
+- SDD · open — scripts/test-consistency.sh has 15 pre-existing FAILs on MAIN (GEO*/
+  EXPIRETIME/PEXPIRETIME/TOUCH unreachable over the wire = dispatch_read gaps; SETRANGE
+  script bug; FT.CREATE arg mismatch) plus a Phase-152 early-exit (rc=1). The milestone
+  "consistency green" criterion needs a dedicated fix task — evidence: identical
+  branch-vs-main A/B logs (/tmp/consistency-{vmlocal,main}.log on moon-dev).
