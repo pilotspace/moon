@@ -1,0 +1,66 @@
+# dependencies.allowlist — one package per line; CI rejects anything not listed.
+# Defeats the AI "invented a plausible package name" supply-chain risk.
+# evidence-grounded: Cargo.toml [dependencies] (+ optional/feature-gated crates) as of v0.3.0.
+
+atoi
+bumpalo
+bytes
+memchr
+smallvec
+thiserror
+mimalloc
+crc32c
+crossbeam-utils
+flume
+atomic-waker
+tokio
+tokio-util
+clap
+tracing
+tracing-subscriber
+anyhow
+futures
+ordered-float
+phf
+rand
+crc16
+crc32fast
+arc-swap
+parking_lot
+itoa
+xxhash-rust
+ringbuf
+core_affinity
+once_cell
+mlua
+sha1_smol
+sha2
+hex
+uuid
+ctrlc
+metrics
+metrics-exporter-prometheus
+rustls
+rustls-pemfile
+aws-lc-rs
+tokio-rustls
+monoio-rustls
+roaring
+serde
+serde_json
+socket2
+memmap2
+lz4_flex
+dashmap
+# feature-gated / platform
+monoio
+io-uring
+libc
+jemallocator
+cudarc
+# dev/test/bench
+criterion
+loom
+proptest
+tempfile
+redis

@@ -1,0 +1,40 @@
+{
+  "project": "moon",
+  "stage": "production",
+  "active_task": "hotpath-lock-quickwins",
+  "active_milestone": "v1-shared-nothing",
+  "tasks": {
+    "hotpath-lock-quickwins": {
+      "title": "Eliminate per-command global locks & syscall-level quick wins",
+      "phase": "build",
+      "gate": "none",
+      "milestone": "v1-shared-nothing",
+      "depends_on": [],
+      "created": "2026-06-11T03:23:03+00:00",
+      "updated": "2026-06-11T03:36:43+00:00",
+      "flag_verified": true
+    }
+  },
+  "milestones": {
+    "v1-shared-nothing": {
+      "title": "Shared-Nothing Integrity & Cross-Shard Latency",
+      "goal": "a 4-shard Moon serves cross-shard traffic without per-command global locks and without the 1ms monoio reply floor, with measured multi-shard scaling improvement over the v0.3.0 baseline",
+      "stage": "mvp",
+      "status": "active",
+      "created": "2026-06-11T03:23:03+00:00",
+      "updated": "2026-06-11T03:23:03+00:00"
+    }
+  },
+  "created": "2026-06-11T03:18:21+00:00",
+  "updated": "2026-06-11T03:36:43+00:00",
+  "setup": {
+    "locked": true,
+    "locked_at": "2026-06-11T03:28:00+00:00",
+    "locked_by": "Tin Dang",
+    "layers": [
+      "foundation",
+      "scope",
+      "contract"
+    ]
+  }
+}
