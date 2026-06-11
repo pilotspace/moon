@@ -8,83 +8,126 @@ use std::f64::consts::PI;
 // Geohash encoding/decoding (52-bit integer, Redis-compatible)
 // ---------------------------------------------------------------------------
 
-// Redis uses standard geohash lat bounds [-90, 90] for encode/decode.
-// The WGS84 input clamp (±85.05112878) is enforced in GEOADD argument
-// validation — it does NOT affect the bit-encoding range.  Using [-90, 90]
-// here produces hashes that match Redis exactly (verified against sqc8b* for
-// Palermo 13.361389 / 38.115556 and the full test-commands.sh suite).
-const GEO_LAT_MIN: f64 = -90.0;
-const GEO_LAT_MAX: f64 = 90.0;
+// Redis (geohash.h) encodes the 52-bit zset SCORE with the WGS84 web-mercator
+// latitude clamp ±85.05112878 — NOT ±90. Only the GEOHASH string command
+// re-encodes the decoded cell center with standard geohash bounds (lat ±90)
+// before base32-ing it. Both bounds are needed for byte parity:
+// score bounds wrong → GEOPOS/GEODIST cell centers diverge from Redis;
+// string bounds wrong → GEOHASH characters diverge.
+const GEO_LAT_MIN: f64 = -85.05112878;
+const GEO_LAT_MAX: f64 = 85.05112878;
 const GEO_LON_MIN: f64 = -180.0;
 const GEO_LON_MAX: f64 = 180.0;
 const GEO_STEP_MAX: u8 = 26; // 52-bit precision
 
-/// Encode longitude/latitude into a 52-bit geohash stored as f64 score.
-pub(crate) fn geohash_encode(lon: f64, lat: f64) -> f64 {
-    let mut lat_range = (GEO_LAT_MIN, GEO_LAT_MAX);
-    let mut lon_range = (GEO_LON_MIN, GEO_LON_MAX);
-    let mut hash: u64 = 0;
-
-    for i in 0..GEO_STEP_MAX {
-        // Longitude bit
-        let mid = (lon_range.0 + lon_range.1) / 2.0;
-        if lon >= mid {
-            hash |= 1 << (51 - i * 2);
-            lon_range.0 = mid;
-        } else {
-            lon_range.1 = mid;
-        }
-        // Latitude bit
-        let mid = (lat_range.0 + lat_range.1) / 2.0;
-        if lat >= mid {
-            hash |= 1 << (50 - i * 2);
-            lat_range.0 = mid;
-        } else {
-            lat_range.1 = mid;
-        }
-    }
-
-    hash as f64
+/// Interleave the low 26 bits of `xlo` (even positions) and `ylo` (odd
+/// positions) — Redis's interleave64 (Morton code). `xlo` = latitude cells,
+/// `ylo` = longitude cells, so longitude owns the MSB (bit 51).
+fn interleave64(xlo: u32, ylo: u32) -> u64 {
+    const B: [u64; 5] = [
+        0x5555555555555555,
+        0x3333333333333333,
+        0x0F0F0F0F0F0F0F0F,
+        0x00FF00FF00FF00FF,
+        0x0000FFFF0000FFFF,
+    ];
+    const S: [u32; 5] = [1, 2, 4, 8, 16];
+    let mut x = xlo as u64;
+    let mut y = ylo as u64;
+    x = (x | (x << S[4])) & B[4];
+    x = (x | (x << S[3])) & B[3];
+    x = (x | (x << S[2])) & B[2];
+    x = (x | (x << S[1])) & B[1];
+    x = (x | (x << S[0])) & B[0];
+    y = (y | (y << S[4])) & B[4];
+    y = (y | (y << S[3])) & B[3];
+    y = (y | (y << S[2])) & B[2];
+    y = (y | (y << S[1])) & B[1];
+    y = (y | (y << S[0])) & B[0];
+    x | (y << 1)
 }
 
-/// Decode a 52-bit geohash score back to (longitude, latitude).
+/// Inverse of interleave64: extract the even bits — Redis's deinterleave64
+/// helper (call once on `bits` for latitude, once on `bits >> 1` for
+/// longitude).
+fn deinterleave_even(mut x: u64) -> u32 {
+    const B: [u64; 6] = [
+        0x5555555555555555,
+        0x3333333333333333,
+        0x0F0F0F0F0F0F0F0F,
+        0x00FF00FF00FF00FF,
+        0x0000FFFF0000FFFF,
+        0x00000000FFFFFFFF,
+    ];
+    const S: [u32; 6] = [0, 1, 2, 4, 8, 16];
+    x &= B[0];
+    x = (x | (x >> S[1])) & B[1];
+    x = (x | (x >> S[2])) & B[2];
+    x = (x | (x >> S[3])) & B[3];
+    x = (x | (x >> S[4])) & B[4];
+    x = (x | (x >> S[5])) & B[5];
+    x as u32
+}
+
+/// Redis geohashEncode for arbitrary ranges: normalize, scale by 2^26
+/// (truncating cast, exactly like the C double→uint32 conversion), interleave.
+fn geohash_encode_raw(lon: f64, lat: f64, lat_min: f64, lat_max: f64) -> u64 {
+    let lat_offset = (lat - lat_min) / (lat_max - lat_min) * (1u64 << GEO_STEP_MAX) as f64;
+    let lon_offset =
+        (lon - GEO_LON_MIN) / (GEO_LON_MAX - GEO_LON_MIN) * (1u64 << GEO_STEP_MAX) as f64;
+    interleave64(lat_offset as u32, lon_offset as u32)
+}
+
+/// Encode longitude/latitude into the 52-bit geohash score (Redis score bounds).
+pub(crate) fn geohash_encode(lon: f64, lat: f64) -> f64 {
+    geohash_encode_raw(lon, lat, GEO_LAT_MIN, GEO_LAT_MAX) as f64
+}
+
+/// Decode a 52-bit geohash score to the cell-center (longitude, latitude),
+/// using Redis's direct min/max arithmetic (geohashDecode + center) so the
+/// resulting f64s are bit-identical to Redis's GEOPOS output.
 pub(crate) fn geohash_decode(score: f64) -> (f64, f64) {
     let hash = score as u64;
-    let mut lat_range = (GEO_LAT_MIN, GEO_LAT_MAX);
-    let mut lon_range = (GEO_LON_MIN, GEO_LON_MAX);
+    let ilato = deinterleave_even(hash) as f64;
+    let ilono = deinterleave_even(hash >> 1) as f64;
+    let scale = (1u64 << GEO_STEP_MAX) as f64;
 
-    for i in 0..GEO_STEP_MAX {
-        // Longitude bit
-        if hash & (1 << (51 - i * 2)) != 0 {
-            lon_range.0 = (lon_range.0 + lon_range.1) / 2.0;
-        } else {
-            lon_range.1 = (lon_range.0 + lon_range.1) / 2.0;
-        }
-        // Latitude bit
-        if hash & (1 << (50 - i * 2)) != 0 {
-            lat_range.0 = (lat_range.0 + lat_range.1) / 2.0;
-        } else {
-            lat_range.1 = (lat_range.0 + lat_range.1) / 2.0;
-        }
-    }
+    let lat_min = GEO_LAT_MIN + (ilato / scale) * (GEO_LAT_MAX - GEO_LAT_MIN);
+    let lat_max = GEO_LAT_MIN + ((ilato + 1.0) / scale) * (GEO_LAT_MAX - GEO_LAT_MIN);
+    let lon_min = GEO_LON_MIN + (ilono / scale) * (GEO_LON_MAX - GEO_LON_MIN);
+    let lon_max = GEO_LON_MIN + ((ilono + 1.0) / scale) * (GEO_LON_MAX - GEO_LON_MIN);
 
-    let lon = (lon_range.0 + lon_range.1) / 2.0;
-    let lat = (lat_range.0 + lat_range.1) / 2.0;
-    (lon, lat)
+    ((lon_min + lon_max) / 2.0, (lat_min + lat_max) / 2.0)
 }
 
-/// Convert a 52-bit integer geohash to the 11-character base32 string Redis uses.
+/// The 11-character base32 geohash string, Redis-exact: decode the score
+/// (score bounds), re-encode the cell center with STANDARD geohash bounds
+/// (lat ±90), then emit 11 chars from the top 50 bits — the 11th character
+/// is always '0' (Redis emits index 0 once the bit budget is exhausted).
 pub(crate) fn geohash_to_string(score: f64) -> String {
     const ALPHABET: &[u8] = b"0123456789bcdefghjkmnpqrstuvwxyz";
-    let hash = score as u64;
-    // Redis uses 11 characters (55 bits, but we only have 52 so pad with 0)
-    let padded = hash << 3; // shift left 3 to fill 55 bits
+    let (lon, lat) = geohash_decode(score);
+    let bits = geohash_encode_raw(lon, lat, -90.0, 90.0);
     let mut result = [0u8; 11];
-    for i in 0..11 {
-        let idx = ((padded >> (50 - i * 5)) & 0x1F) as usize;
-        result[i] = ALPHABET[idx];
+    for (i, slot) in result.iter_mut().enumerate() {
+        let used = (i + 1) * 5;
+        let idx = if used <= 52 {
+            ((bits >> (52 - used)) & 0x1F) as usize
+        } else {
+            0
+        };
+        *slot = ALPHABET[idx];
     }
     String::from_utf8_lossy(&result).to_string()
+}
+
+/// Format a coordinate the way Redis 8 replies to GEOPOS / WITHCOORD.
+/// Redis's d2string uses fpconv_dtoa (grisu2) — the SHORTEST decimal that
+/// round-trips to the same f64 — which is exactly Rust's `{}` Display for
+/// f64 (verified byte-identical against redis-server 8.x for the geohash
+/// cell centers the consistency suite compares).
+pub(crate) fn fmt_geo_coord(v: f64) -> String {
+    format!("{v}")
 }
 
 // ---------------------------------------------------------------------------
@@ -94,15 +137,22 @@ pub(crate) fn geohash_to_string(score: f64) -> String {
 const EARTH_RADIUS_M: f64 = 6372797.560856;
 
 /// Haversine distance in meters between two (lon, lat) pairs.
+///
+/// Operation order matches Redis's geohashGetDistance exactly (radians first,
+/// then differences; u/v half-angle sines; single asin) so the resulting f64
+/// is bit-identical and GEODIST's %.4f output matches byte-for-byte.
 pub(crate) fn haversine_distance(lon1: f64, lat1: f64, lon2: f64, lat2: f64) -> f64 {
-    let lat1_r = lat1 * PI / 180.0;
-    let lat2_r = lat2 * PI / 180.0;
-    let dlat = (lat2 - lat1) * PI / 180.0;
-    let dlon = (lon2 - lon1) * PI / 180.0;
-
-    let a = (dlat / 2.0).sin().powi(2) + lat1_r.cos() * lat2_r.cos() * (dlon / 2.0).sin().powi(2);
-    let c = 2.0 * a.sqrt().asin();
-    EARTH_RADIUS_M * c
+    let lat1r = lat1 * PI / 180.0;
+    let lon1r = lon1 * PI / 180.0;
+    let lat2r = lat2 * PI / 180.0;
+    let lon2r = lon2 * PI / 180.0;
+    let u = ((lat2r - lat1r) / 2.0).sin();
+    let v = ((lon2r - lon1r) / 2.0).sin();
+    if u == 0.0 && v == 0.0 {
+        return 0.0;
+    }
+    let a = u * u + lat1r.cos() * lat2r.cos() * v * v;
+    2.0 * EARTH_RADIUS_M * a.sqrt().asin()
 }
 
 /// Convert meters to the specified unit.
@@ -142,6 +192,37 @@ mod tests {
 
     fn bs(s: &[u8]) -> Frame {
         Frame::BulkString(Bytes::copy_from_slice(s))
+    }
+
+    /// Byte-parity pins vs redis-server 8.x (values captured by
+    /// scripts/test-consistency.sh on moon-dev): score-bounds decode,
+    /// %.17g coordinate formatting, ±90 string re-encode, and the Redis
+    /// haversine op order must all match for these to hold.
+    #[test]
+    fn test_redis_parity_palermo() {
+        let score_p = geohash_encode(13.361389, 38.115556);
+        let score_c = geohash_encode(15.087269, 37.502669);
+
+        // GEOPOS Palermo
+        let (lon, lat) = geohash_decode(score_p);
+        assert_eq!(fmt_geo_coord(lon), "13.361389338970184");
+        assert_eq!(fmt_geo_coord(lat), "38.1155563954963");
+
+        // GEOHASH Palermo — 11 chars, Redis's 11th is always '0'
+        assert_eq!(geohash_to_string(score_p), "sqc8b49rny0");
+
+        // GEODIST Palermo Catania in m and km
+        let (lon2, lat2) = geohash_decode(score_c);
+        let d = haversine_distance(lon, lat, lon2, lat2);
+        assert_eq!(format!("{:.4}", convert_distance(d, b"m")), "166274.1516");
+        assert_eq!(format!("{:.4}", convert_distance(d, b"km")), "166.2742");
+    }
+
+    #[test]
+    fn test_fmt_geo_coord_edges() {
+        assert_eq!(fmt_geo_coord(0.0), "0");
+        assert_eq!(fmt_geo_coord(0.5), "0.5");
+        assert_eq!(fmt_geo_coord(-13.361389338970184), "-13.361389338970184");
     }
 
     #[test]

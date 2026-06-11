@@ -7,8 +7,8 @@ use crate::storage::Database;
 use crate::command::helpers::{err_wrong_args, extract_bytes};
 
 use super::{
-    convert_distance, geohash_decode, geohash_encode, geohash_to_string, haversine_distance,
-    parse_unit,
+    convert_distance, fmt_geo_coord, geohash_decode, geohash_encode, geohash_to_string,
+    haversine_distance, parse_unit,
 };
 
 fn parse_f64(frame: &Frame) -> Option<f64> {
@@ -154,8 +154,8 @@ pub fn geopos(db: &mut Database, args: &[Frame]) -> Frame {
                 let (lon, lat) = geohash_decode(score);
                 Frame::Array(
                     vec![
-                        Frame::BulkString(Bytes::from(format!("{:.4}", lon))),
-                        Frame::BulkString(Bytes::from(format!("{:.4}", lat))),
+                        Frame::BulkString(Bytes::from(fmt_geo_coord(lon))),
+                        Frame::BulkString(Bytes::from(fmt_geo_coord(lat))),
                     ]
                     .into(),
                 )
@@ -712,8 +712,8 @@ pub fn geopos_readonly(db: &crate::storage::db::Database, args: &[Frame], now_ms
                 let (lon, lat) = geohash_decode(score);
                 Frame::Array(
                     vec![
-                        Frame::BulkString(Bytes::from(format!("{:.4}", lon))),
-                        Frame::BulkString(Bytes::from(format!("{:.4}", lat))),
+                        Frame::BulkString(Bytes::from(fmt_geo_coord(lon))),
+                        Frame::BulkString(Bytes::from(fmt_geo_coord(lat))),
                     ]
                     .into(),
                 )
