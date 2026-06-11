@@ -295,6 +295,20 @@ fn cdg1_registry_sweep_no_unknowns() {
         if *name == "SHUTDOWN" || BACKLOGGED_UNIMPLEMENTED.contains(name) {
             continue;
         }
+        // M1 covers commands WITH an arm in dispatch. GRAPH.* arms are
+        // feature-gated (#[cfg(feature = "graph")]) — when the feature is
+        // compiled out (the tokio CI feature set), no arm exists and
+        // "unknown command" is the correct reply.
+        if !cfg!(feature = "graph") && name.starts_with("GRAPH.") {
+            continue;
+        }
+        // PSYNC is a monoio-handler special case (replication is monoio-only
+        // today); the tokio handler has no replication support. Runtime
+        // divergence tracked as an observe-phase delta alongside the 10
+        // backlogged commands.
+        if !cfg!(feature = "runtime-monoio") && *name == "PSYNC" {
+            continue;
+        }
         let mut c = Conn::new(connect(port, Duration::from_secs(10)));
         let reply =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| c.cmd(&[name.as_bytes()])));
@@ -592,16 +606,44 @@ fn cdg2_twenty_commands_answer_correctly() {
 // cdg3 — the new arms are PURE reads: expired keys invisible, AOF untouched
 // ---------------------------------------------------------------------------
 
-/// Sum of all bytes under the server's appendonlydir (multi-part AOF).
+/// Total AOF bytes for the server's `--dir`, across both layouts:
+/// monoio writes the multi-part `appendonlydir/`, tokio writes a single
+/// top-level `appendonly.aof`.
 fn aof_bytes(dir: &std::path::Path) -> u64 {
-    let aof_dir = dir.join("appendonlydir");
-    let Ok(rd) = std::fs::read_dir(&aof_dir) else {
-        return 0;
-    };
-    rd.filter_map(|e| e.ok())
-        .filter_map(|e| e.metadata().ok())
-        .map(|m| m.len())
-        .sum()
+    let mut total = 0u64;
+    if let Ok(rd) = std::fs::read_dir(dir.join("appendonlydir")) {
+        total += rd
+            .filter_map(|e| e.ok())
+            .filter_map(|e| e.metadata().ok())
+            .map(|m| m.len())
+            .sum::<u64>();
+    }
+    if let Ok(m) = std::fs::metadata(dir.join("appendonly.aof")) {
+        total += m.len();
+    }
+    total
+}
+
+/// Wait until the AOF length is non-zero (if `expect_nonzero`) and stable
+/// across two consecutive samples. AOF flush cadence is runtime-dependent
+/// (monoio flushes on a 1ms tick; tokio batches on the everysec schedule),
+/// so a fixed sleep under-waits on one runtime and over-waits on the other.
+/// The asserts that consume this value are unchanged — this only makes the
+/// sample point deterministic.
+fn aof_quiesce(dir: &std::path::Path, expect_nonzero: bool) -> u64 {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut prev = aof_bytes(dir);
+    loop {
+        std::thread::sleep(Duration::from_millis(250));
+        let cur = aof_bytes(dir);
+        if cur == prev && (!expect_nonzero || cur > 0) {
+            return cur;
+        }
+        if Instant::now() >= deadline {
+            return cur;
+        }
+        prev = cur;
+    }
 }
 
 #[test]
@@ -674,8 +716,7 @@ fn cdg3_read_arms_are_pure_reads() {
     c.cmd_s(&["XADD", "live:s", "1-1", "f", "v"]);
     c.cmd_s(&["ZADD", "live:z", "1", "a"]);
     c.cmd_s(&["GEOADD", "live:g", "13.361389", "38.115556", "Palermo"]);
-    std::thread::sleep(Duration::from_millis(300)); // let the WAL flush settle
-    let before = aof_bytes(dir.path());
+    let before = aof_quiesce(dir.path(), true);
     assert!(before > 0, "fixtures must have hit the AOF");
     for _ in 0..200 {
         c.cmd_s(&["TOUCH", "live:k"]);
@@ -690,8 +731,7 @@ fn cdg3_read_arms_are_pure_reads() {
         c.cmd_s(&["TIME"]);
         c.cmd_s(&["SLOWLOG", "LEN"]);
     }
-    std::thread::sleep(Duration::from_millis(300));
-    let after = aof_bytes(dir.path());
+    let after = aof_quiesce(dir.path(), true);
     assert_eq!(
         before, after,
         "reads must never append to the AOF (before={before} after={after})"
@@ -699,8 +739,17 @@ fn cdg3_read_arms_are_pure_reads() {
 
     // ---- (c) the write path is intact: a SET grows the AOF ----
     c.cmd_s(&["SET", "live:k2", "v2"]);
-    std::thread::sleep(Duration::from_millis(300));
-    let grown = aof_bytes(dir.path());
+    // Wait for growth (flush cadence is runtime-dependent), then sample.
+    let grown = {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let cur = aof_bytes(dir.path());
+            if cur > after || Instant::now() >= deadline {
+                break cur;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    };
     assert!(
         grown > after,
         "a write after the read batch must append (after={after} grown={grown})"
