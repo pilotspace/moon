@@ -438,3 +438,22 @@ Spec delta for the next loop:
   script bug; FT.CREATE arg mismatch) plus a Phase-152 early-exit (rc=1). The milestone
   "consistency green" criterion needs a dedicated fix task — evidence: identical
   branch-vs-main A/B logs (/tmp/consistency-{vmlocal,main}.log on moon-dev).
+
+### PR #172 review findings deferred to follow-up (adversarial perf + safety review, 2026-06-11)
+Both reviewers: 0 BLOCKER / 0 introduced regressions. Deferred items, all pre-existing or
+out-of-scope, candidates for the next loop:
+- PERF (major, pre-existing gap) — `AofWriterPool::issue_append_lsn` (persistence/aof/pool.rs)
+  still takes the `RwLock<ReplicationState>` read PER WRITE on the connection path when AOF
+  is enabled; QW3's OffsetHandle fixed only the shard-drain side. Fix: thread an OffsetHandle
+  into ConnectionContext. Completes review finding 1.4.
+- PERF (minor, rare path) — CLIENT LIST/INFO dispatch calls registry `update()` (global write
+  lock) just to invoke the already-lock-free `live.touch()`; needs client_live threaded into
+  dispatch scope (handler_monoio + handler_sharded dispatch.rs).
+- PERF (low, pre-existing) — drain cap exits on consumer[0]; consumers[1..] can wait an extra
+  cycle under single-ring saturation. Fix: round-robin drain start index.
+- SAFETY (nit, pre-existing) — double `mark_deleted_for_key` on the non-slice DEL/UNLINK path
+  (spsc_handler.rs ~814/829, idempotent); remove the inner call.
+- CLEANUP — pending_wakers relay is permanently empty in normal operation post-M2; remove with
+  task-3 (already flagged in spec delta above).
+- DOCUMENTED in-PR — `spsc_notify_wakes` includes drain-cap self-re-notify wakes (flume
+  bounded(1) tokens coalesce; producer wakes ≈ notify_wakes − drain_renotify).

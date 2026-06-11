@@ -34,6 +34,12 @@ static SPSC_DRAIN_RENOTIFY: AtomicU64 = AtomicU64::new(0);
 
 /// Count a shard-loop wake that came from the cross-shard `Notify` arm
 /// (event-driven drain) rather than the periodic timer.
+///
+/// Includes wakes caused by the drain-cap self-re-notify: the `flume
+/// bounded(1)` token coalesces producer notifies and self-re-notifies, so
+/// they are indistinguishable at the wake site. Producer-driven wakes ≈
+/// `spsc_notify_wakes - spsc_drain_renotify` (approximate — a coalesced
+/// token can carry both causes).
 #[inline]
 pub fn bump_spsc_notify_wake() {
     SPSC_NOTIFY_WAKES.fetch_add(1, Ordering::Relaxed);
