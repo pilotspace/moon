@@ -382,6 +382,10 @@ pub(crate) fn create_reuseport_listener(addr: &str) -> std::io::Result<std::os::
     // QW1: TCP_NODELAY on the LISTENING socket. Multishot-accept CQEs deliver
     // raw fds with no safe per-socket hook; Linux copies the nonagle flag to
     // sockets returned by accept(2), so setting it here covers them.
-    let _ = crate::server::socket_opts::apply_client_socket_opts(&std_listener);
+    if let Err(e) = crate::server::socket_opts::apply_client_socket_opts(&std_listener) {
+        // Non-fatal: the listener still works, but accepted sockets keep Nagle
+        // (pipelined replies may see delayed-ACK latency). Surface it loudly.
+        tracing::warn!("failed to set TCP_NODELAY on uring listener: {e}");
+    }
     Ok(std_listener.into_raw_fd())
 }

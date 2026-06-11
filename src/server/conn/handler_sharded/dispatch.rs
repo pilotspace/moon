@@ -119,12 +119,16 @@ pub(super) fn try_handle_client_command(
                 return true;
             }
             if sub_bytes.eq_ignore_ascii_case(b"INFO") {
+                // Derive flags from CURRENT conn state (same as the LIST path
+                // above) — reloading e.live.flags would freeze stale bits.
                 crate::client_registry::update(client_id, |e| {
                     e.live.touch(
                         conn.selected_db,
-                        crate::client_registry::ClientFlags::from_bits(
-                            e.live.flags.load(std::sync::atomic::Ordering::Relaxed),
-                        ),
+                        crate::client_registry::ClientFlags {
+                            subscriber: conn.subscription_count > 0,
+                            in_multi: conn.in_multi,
+                            blocked: false,
+                        },
                     );
                 });
                 let info = crate::client_registry::client_info(client_id).unwrap_or_default();
