@@ -25,12 +25,16 @@ Out: FT.SEARCH off-event-loop execution (review priority 3 → v2) · WAL group 
 
 ## Tasks (breadth-first decomposition; detail lives in each TASK.md)
 - [x] hotpath-lock-quickwins   depends-on: none                    — remove per-command global locks/atomics (OnceLock WAL sender, lock-free repl offsets, per-shard metrics counters, backlog bulk-append, VecDeque inflight sends, key_hash prune) + TCP_NODELAY on accept; establishes the measurement baseline
-- [ ] spsc-wake-floor          depends-on: hotpath-lock-quickwins  — eventfd-based cross-thread wake for monoio replies + SPSC drain-until-empty; removes the ~1ms cross-shard latency floor
+- [x] spsc-wake-floor          depends-on: hotpath-lock-quickwins  — eventfd-based cross-thread wake for monoio replies + SPSC drain-until-empty; removes the ~1ms cross-shard latency floor (gate PASS 2026-06-11; p99 4.071ms → 0.071ms)
 - [ ] shardslice-migration     depends-on: hotpath-lock-quickwins  — complete the ShardSlice migration: route remaining cross-shard reads through SPSC, delete Arc<ShardDatabases> foreign-thread access and every `is_initialized()` dual branch
 
 ## Exit criteria (observable; map each to the task that delivers it)
 - [x] Lock inventory: zero global lock acquisitions on the per-command write path for metrics, replication offsets, WAL sender, client registry batch-update — verified by a recorded audit + tests (TASK.md §6, 2026-06-11)        (← hotpath-lock-quickwins)
 - [ ] `scripts/bench-compare.sh` on moon-dev shows no regression at 1 shard and measured improvement at 4 shards vs the recorded v0.3.0 baseline        (← hotpath-lock-quickwins · spsc-wake-floor · shardslice-migration)
-- [ ] Cross-shard single-key SET/GET p99 on monoio drops below 1ms (the old floor) in a recorded latency run        (← spsc-wake-floor)
+- [x] Cross-shard single-key SET/GET p99 on monoio drops below 1ms (the old floor) in a recorded latency run — 0.071 ms, 57× under the bar (.add/tasks/spsc-wake-floor/bench-results.txt, 2026-06-11)        (← spsc-wake-floor)
 - [ ] `grep -r "is_initialized()" src/shard/` returns zero dual-path branches; `ShardDatabases` no longer exposes cross-shard read access        (← shardslice-migration)
 - [ ] `scripts/test-consistency.sh` passes 132/132 on 1/4/12 shards and full CI matrix is green after each task        (← all three)
+      ⚠ Gap discovered 2026-06-11: MAIN itself fails 15 of these (dispatch_read gaps for
+      GEO*/EXPIRETIME/PEXPIRETIME/TOUCH + two script bugs + a Phase-152 early-exit), so this
+      criterion needs a dedicated fix task; tasks 1–2 verified zero NEW failures vs main
+      instead (identical branch-vs-main A/B). CI matrix green per task: holding so far.
