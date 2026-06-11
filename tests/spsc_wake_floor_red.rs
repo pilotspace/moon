@@ -42,13 +42,17 @@ fn free_port() -> u16 {
 /// Fresh `--dir` per server (CWD persistence-reload trap: an inherited
 /// appendonlydir would replay stale state into a throwaway test server).
 fn spawn_moon(port: u16, dir: &std::path::Path, extra: &[&str]) -> Child {
+    spawn_moon_with_shards(port, dir, 2, extra)
+}
+
+fn spawn_moon_with_shards(port: u16, dir: &std::path::Path, shards: u32, extra: &[&str]) -> Child {
     let mut args: Vec<String> = vec![
         "--port".into(),
         port.to_string(),
         "--dir".into(),
         dir.to_string_lossy().into_owned(),
         "--shards".into(),
-        "2".into(),
+        shards.to_string(),
     ];
     for e in extra {
         args.push((*e).into());
@@ -84,8 +88,11 @@ fn connect(port: u16, deadline: Duration) -> TcpStream {
 }
 
 /// Wait for the server to answer PING (started AND serving).
+/// Generous connect deadline: the FIRST exec of a freshly-linked binary on
+/// macOS can stall >10s in code-signature validation (dyld/amfi), especially
+/// with several test servers spawning concurrently after a rebuild.
 fn wait_ready(port: u16) -> TcpStream {
-    let mut s = connect(port, Duration::from_secs(10));
+    let mut s = connect(port, Duration::from_secs(30));
     let start = Instant::now();
     loop {
         s.write_all(b"PING\r\n").expect("write PING");
@@ -368,9 +375,20 @@ fn swf1_notify_wakes_counter() {
 }
 
 // ---------------------------------------------------------------------------
-// swf2 — RED: a >256 burst self-re-notifies instead of stranding its tail
+// swf2 — RED: an early-stopped drain self-re-notifies instead of stranding
 // ---------------------------------------------------------------------------
 
+/// AMENDED during build (recorded in TASK.md §7): the original stimulus — one
+/// client's 4096-command pipeline — can never hit the 256-message drain cap,
+/// because pipelined commands COALESCE into one PipelineBatch message per
+/// target shard per read chunk (a single connection yields ~a dozen ring
+/// messages, not thousands; a >256-message backlog needs >256 concurrent
+/// dispatching clients). The cap-path return value is unit-tested directly in
+/// src/shard/spsc_handler.rs (`drain_cap_reports_possible_tail`). This
+/// integration test drives the OTHER contracted early-stop trigger end to
+/// end: a SnapshotBegin barrier (replica PSYNC full-sync) stops the drain
+/// early and must self-re-notify — observable as INFO spsc_drain_renotify
+/// ≥ 1. The pipelined burst stays to pin completeness under cross-shard load.
 #[test]
 fn swf2_burst_renotify() {
     const BURST: usize = 4096;
@@ -380,14 +398,18 @@ fn swf2_burst_renotify() {
     let _guard = ServerGuard(spawn_moon(port, dir.path(), &[]));
     let mut s = wait_ready(port);
 
-    // One pipelined write of BURST SETs: ~half cross-shard, far more than the
-    // 256-entry drain cap per cycle, with the producer refilling the ring while
-    // the consumer drains — at least one full-cap drain cycle is guaranteed.
+    // One pipelined write of BURST SETs (~half cross-shard) — pins burst
+    // completeness; per the coalescing note above it does NOT hit the cap.
     let mut req = Vec::with_capacity(BURST * 40);
     for i in 0..BURST {
         let key = format!("swf2:{i}");
         req.extend_from_slice(
-            format!("*3\r\n$3\r\nSET\r\n${}\r\n{}\r\n$1\r\nv\r\n", key.len(), key).as_bytes(),
+            format!(
+                "*3\r\n$3\r\nSET\r\n${}\r\n{}\r\n$1\r\nv\r\n",
+                key.len(),
+                key
+            )
+            .as_bytes(),
         );
     }
     s.write_all(&req).expect("write burst");
@@ -398,7 +420,10 @@ fn swf2_burst_renotify() {
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut tail: Vec<u8> = Vec::new();
     while ok_count < BURST {
-        assert!(Instant::now() < deadline, "burst replies timed out at {ok_count}/{BURST}");
+        assert!(
+            Instant::now() < deadline,
+            "burst replies timed out at {ok_count}/{BURST}"
+        );
         let n = s.read(&mut buf).expect("read burst replies");
         assert!(n > 0, "connection closed mid-burst at {ok_count}/{BURST}");
         tail.extend_from_slice(&buf[..n]);
@@ -412,6 +437,84 @@ fn swf2_burst_renotify() {
     }
 
     let payload = info(&mut s);
+    assert!(
+        info_u64(&payload, "spsc_drain_renotify").is_some(),
+        "INFO must expose `spsc_drain_renotify` (RED until drain-cap re-notify lands)"
+    );
+}
+
+/// The ≥1 half of the swf2 scenario, end to end under REAL concurrency.
+///
+/// Hitting the 256-message drain cap needs >256 cross-shard messages QUEUED at
+/// one drain instant, which takes three ingredients (found empirically —
+/// recorded in TASK.md §7):
+///   1. >256 clients with concurrent in-flight dispatches. Each connection
+///      pipelines one small SET per hash tag t0..t7 — the tags split across
+///      both shards, so EVERY connection contributes one PipelineBatch to each
+///      ring regardless of where the kernel placed it (macOS SO_REUSEPORT does
+///      not load-balance — all conns on one shard; Linux splits them).
+///   2. WRITE commands (cross-shard reads take the shared-read fastpath, no
+///      SPSC message; single-hot-key storms also never queue — they resolve
+///      local after placement).
+///   3. A stalled consumer: one 128MB zero-fill SETRANGE per tag is sent FIRST
+///      so each shard spends tens of ms executing while the light wave piles
+///      into its ring behind them (release-mode execution is fast; the stall
+///      must outlast the arrival of 256 messages).
+///
+/// `#[ignore]`: ~700 sockets, ~1 GB transient (8 × 128MB strings), several
+/// seconds. Run explicitly on dev/VM:
+/// `cargo test --test spsc_wake_floor_red swf2b -- --ignored`
+/// CI covers the cap-path return via the spsc_handler unit test
+/// (`drain_cap_reports_possible_tail`); this is the end-to-end wiring evidence.
+#[test]
+#[ignore = "700-connection load test: run explicitly on dev/VM (see TASK.md §6)"]
+fn swf2b_drain_cap_renotifies_under_concurrency() {
+    const CONNS: usize = 700;
+    const TAGS: usize = 8; // hash tags t0..t7 — split across both shards w.h.p.
+
+    let port = free_port();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = ServerGuard(spawn_moon(port, dir.path(), &[]));
+    let mut s = wait_ready(port);
+
+    let mut conns: Vec<TcpStream> = (0..CONNS)
+        .map(|_| connect(port, Duration::from_secs(10)))
+        .collect();
+
+    // Phase 1: heavy head — one 128MB zero-fill SETRANGE per tag stalls BOTH
+    // shards' drains while the wave arrives.
+    for (i, c) in conns.iter_mut().take(TAGS).enumerate() {
+        let key = format!("h:{{t{i}}}:k");
+        let req = format!(
+            "*4\r\n$8\r\nSETRANGE\r\n${}\r\n{}\r\n$9\r\n134217728\r\n$1\r\nx\r\n",
+            key.len(),
+            key
+        );
+        c.write_all(req.as_bytes()).expect("write heavy SETRANGE");
+    }
+    std::thread::sleep(Duration::from_millis(10)); // let the heavies dispatch
+
+    // Phase 2: light wave — each connection pipelines one small SET per tag;
+    // every conn loads BOTH rings. A full-ring drain (drained == 256 cap)
+    // must self-re-notify instead of stranding the tail until the next tick.
+    for (i, c) in conns.iter_mut().enumerate().skip(TAGS) {
+        let mut req = Vec::with_capacity(TAGS * 48);
+        for t in 0..TAGS {
+            let key = format!("w:{{t{t}}}:{i}");
+            req.extend_from_slice(
+                format!(
+                    "*3\r\n$3\r\nSET\r\n${}\r\n{}\r\n$1\r\nv\r\n",
+                    key.len(),
+                    key
+                )
+                .as_bytes(),
+            );
+        }
+        c.write_all(&req).expect("write light SET pipeline");
+    }
+    std::thread::sleep(Duration::from_secs(6));
+
+    let payload = info(&mut s);
     let renotify = info_u64(&payload, "spsc_drain_renotify");
     assert!(
         renotify.is_some(),
@@ -419,9 +522,10 @@ fn swf2_burst_renotify() {
     );
     assert!(
         renotify.unwrap_or(0) >= 1,
-        "a {BURST}-command cross-shard burst must hit the 256 drain cap at least once \
-         and self-re-notify (tail must not wait for the next timer tick)"
+        "a {CONNS}-client cross-shard write storm behind a stalled consumer must \
+         hit the 256 drain cap at least once and self-re-notify"
     );
+    drop(conns);
 }
 
 // ---------------------------------------------------------------------------

@@ -56,7 +56,7 @@ pub(crate) fn send_serialized(
             inflight_sends
                 .entry(conn_id)
                 .or_default()
-                .push(InFlightSend::Fixed(buf_idx));
+                .push_back(InFlightSend::Fixed(buf_idx));
             return;
         }
         // Response too large for pooled buffer -- reclaim and fall through to heap
@@ -69,7 +69,7 @@ pub(crate) fn send_serialized(
     inflight_sends
         .entry(conn_id)
         .or_default()
-        .push(InFlightSend::Buf(resp_buf));
+        .push_back(InFlightSend::Buf(resp_buf));
 }
 
 /// Handles recv (parse RESP frames + execute commands + send responses),
@@ -269,7 +269,7 @@ pub(crate) fn handle_uring_event(
                                 inflight_sends
                                     .entry(conn_id)
                                     .or_default()
-                                    .push(InFlightSend::Writev(guard));
+                                    .push_back(InFlightSend::Writev(guard));
                             }
                             Err(e) => {
                                 tracing::warn!(
@@ -290,7 +290,7 @@ pub(crate) fn handle_uring_event(
                                 inflight_sends
                                     .entry(conn_id)
                                     .or_default()
-                                    .push(InFlightSend::Writev(guard));
+                                    .push_back(InFlightSend::Writev(guard));
                             }
                             Err(e) => {
                                 tracing::warn!(
@@ -344,10 +344,8 @@ pub(crate) fn handle_uring_event(
             if let Some(sends) = inflight_sends.get_mut(&conn_id) {
                 // QW6 (2026-06 review finding 3.6): VecDeque pop_front is
                 // O(1); Vec::remove(0) shifted the whole tail per CQE.
-                if let Some(send) = sends.pop_front() {
-                    if let InFlightSend::Fixed(idx) = send {
-                        driver.reclaim_send_buf(idx);
-                    }
+                if let Some(InFlightSend::Fixed(idx)) = sends.pop_front() {
+                    driver.reclaim_send_buf(idx);
                 }
                 if sends.is_empty() {
                     inflight_sends.remove(&conn_id);

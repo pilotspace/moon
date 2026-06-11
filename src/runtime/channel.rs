@@ -67,7 +67,8 @@ impl<T: Send + 'static> OneshotReceiver<T> {
 }
 
 impl<T: Send> OneshotReceiver<T> {
-    /// Non-blocking try_recv for use with pending_wakers polling pattern.
+    /// Non-blocking try_recv — fast path before awaiting the receiver as a
+    /// Future (cross-thread wake works on both runtimes; see swf0).
     ///
     /// Returns `Ok(value)` if a value is available, `Err(TryRecvEmpty)` if not yet,
     /// or `Err(TryRecvDisconnected)` if the sender was dropped or rx was taken.

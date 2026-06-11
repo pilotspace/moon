@@ -26,6 +26,38 @@ pub fn is_server_ready() -> bool {
 static TOTAL_CONNECTIONS: AtomicU64 = AtomicU64::new(0);
 static CONNECTED_CLIENTS: AtomicU64 = AtomicU64::new(0);
 
+// ── spsc-wake-floor (M5): event-driven wake observability ───────────────
+// Bumped at most once per shard-loop wake / per capped drain cycle — never
+// per command — so plain (unsharded) atomics are fine here.
+static SPSC_NOTIFY_WAKES: AtomicU64 = AtomicU64::new(0);
+static SPSC_DRAIN_RENOTIFY: AtomicU64 = AtomicU64::new(0);
+
+/// Count a shard-loop wake that came from the cross-shard `Notify` arm
+/// (event-driven drain) rather than the periodic timer.
+#[inline]
+pub fn bump_spsc_notify_wake() {
+    SPSC_NOTIFY_WAKES.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Total shard-loop wakes driven by the cross-shard `Notify` (for INFO Stats).
+#[inline]
+pub fn spsc_notify_wakes() -> u64 {
+    SPSC_NOTIFY_WAKES.load(Ordering::Relaxed)
+}
+
+/// Count a self-re-notify issued because `drain_spsc_shared` stopped at the
+/// per-cycle drain cap with messages possibly remaining.
+#[inline]
+pub fn bump_spsc_drain_renotify() {
+    SPSC_DRAIN_RENOTIFY.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Total capped-drain self-re-notifies (for INFO Stats).
+#[inline]
+pub fn spsc_drain_renotify() -> u64 {
+    SPSC_DRAIN_RENOTIFY.load(Ordering::Relaxed)
+}
+
 // ── QW4 (2026-06 review finding 1.6): sharded total-commands counter ────
 // Previously a single `TOTAL_COMMANDS: AtomicU64` — one cache line bounced
 // across every shard core at full command rate (false sharing). Each OS

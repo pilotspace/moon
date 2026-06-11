@@ -40,22 +40,31 @@ use crate::framevec;
 use crate::pubsub::subscriber::Subscriber;
 use crate::server::codec::RespCodec;
 use crate::shard::dispatch::ShardMessage;
-// ResponseSlotPool NOT used on monoio — its AtomicWaker doesn't cross
-// monoio's single-threaded (!Send) executor boundary. Use oneshot channels.
+// ResponseSlotPool is not used on monoio (yet): this handler predates the
+// proof that cross-thread wakes DO reach monoio tasks (the `sync` feature's
+// waker channel + driver unpark — see tests/spsc_wake_floor_red.rs::swf0).
+// The flume oneshot per batch works the same way; unifying on the
+// zero-allocation ResponseSlotPool is a candidate follow-up.
 
 // ── F3: cross-shard dispatch backpressure / response-wait bounds ──
 // Design-for-failure: a wedged or saturated target shard must surface a
 // bounded error, never park the connection (holding its buffers) forever.
 // Push-retry bounds live in `crate::shard::dispatch` (shared with the tokio
-// handler); the response-wait bound below is monoio-specific (the tokio path
-// awaits via `ResponseSlotPool`, not this busy-wait relay).
+// handler); the response-wait bounds below are monoio-specific (the tokio
+// path awaits via `ResponseSlotPool`, not a flume oneshot).
 
-/// Max ~1ms event-loop wake cycles to wait for a cross-shard reply before
-/// declaring the response lost. The batch was already dispatched, so this is
-/// an *uncertain write* backstop (the command may have applied on the target)
-/// — set generously (~30s) and primarily guarded by the shutdown check.
+/// Chunk length for the bounded cross-shard reply wait (M2, spsc-wake-floor).
+/// Replies normally wake the task directly (cross-thread waker via monoio's
+/// `sync` feature); the chunking only bounds how long a shutdown can go
+/// unnoticed when the reply never arrives.
 #[cfg(feature = "runtime-monoio")]
-const CROSS_SHARD_RESPONSE_MAX_WAITS: u32 = 30_000;
+const CROSS_SHARD_RESPONSE_CHUNK_MS: u64 = 100;
+
+/// Total reply-wait budget before declaring the response lost. The batch was
+/// already dispatched, so this is an *uncertain write* backstop (the command
+/// may have applied on the target) — set generously (~30s).
+#[cfg(feature = "runtime-monoio")]
+const CROSS_SHARD_RESPONSE_TIMEOUT_MS: u64 = 30_000;
 
 /// Result of `handle_connection_sharded_monoio` execution.
 ///
@@ -122,7 +131,11 @@ pub(crate) async fn handle_connection_sharded_monoio<
     client_id: u64,
     can_migrate: bool,
     initial_read_buf: BytesMut,
-    pending_wakers: Rc<RefCell<Vec<std::task::Waker>>>,
+    // Event-loop waker relay. No longer used by this handler — the cross-shard
+    // reply path awaits its oneshot directly (M2, spsc-wake-floor; cross-thread
+    // wake proven by swf0). The relay plumbing is kept for future registrants
+    // and the event loop still sweeps it every iteration.
+    _pending_wakers: Rc<RefCell<Vec<std::task::Waker>>>,
     migrated_state: Option<&MigratedConnectionState>,
 ) -> (MonoioHandlerResult, Option<S>) {
     use monoio::io::AsyncWriteRentExt;
@@ -1987,58 +2000,67 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 oneshot_futures.push((target, meta, reply_rx));
             }
 
-            // Poll all shard responses via pending_wakers relay (monoio cross-thread waker fix).
-            // monoio's !Send executor doesn't see cross-thread Waker::wake() from flume.
-            // Instead, the connection task registers its waker in pending_wakers; the event
-            // loop drains and wakes them after every SPSC cycle (~1ms). On wake, try_recv()
-            // checks if the response arrived; if not, re-register and yield again.
+            // M2 (spsc-wake-floor): await each reply oneshot DIRECTLY. The executing
+            // shard's `send` wakes this task cross-thread — monoio 0.2.4's `sync`
+            // feature routes a remote Waker::wake() through a per-thread waker
+            // channel + driver unpark (eventfd on io_uring, kqueue wake on the
+            // legacy driver), proven at runtime by tests/spsc_wake_floor_red.rs::
+            // swf0 on both drivers. The previous pending_wakers relay assumed this
+            // was impossible and polled on the shard loop's ~1ms tick — the relay
+            // sweep still runs in the event loop, but this path no longer uses it.
             for (target, meta, reply_rx) in oneshot_futures.drain(..) {
                 tracing::trace!(
-                    "Shard {}: awaiting cross-shard response via pending_wakers",
+                    "Shard {}: awaiting cross-shard response (direct oneshot)",
                     ctx.shard_id
                 );
-                let shard_responses = {
-                    let pw = pending_wakers.clone();
-                    // F3: bound the response wait. The batch was already
-                    // dispatched, so a missing reply is an *uncertain write*
-                    // (the target shard may have applied it) — the error must
-                    // NOT imply rejection. Break on disconnect (writer gone),
-                    // shutdown, or the generous wait cap (~30s of ~1ms wakes).
-                    let mut waits: u32 = 0;
-                    loop {
-                        match reply_rx.try_recv() {
-                            Ok(value) => break Ok(value),
-                            Err(flume::TryRecvError::Disconnected) => {
-                                break Err("ERR cross-shard dispatch failed");
+                // F3: bound the response wait. The batch was already dispatched,
+                // so a missing reply is an *uncertain write* (the target shard may
+                // have applied it) — the error must NOT imply rejection. Break on
+                // disconnect (sender gone), shutdown, or the generous ~30s cap.
+                //
+                // The wait is CHUNKED (race2 against a short sleep + is_cancelled
+                // check) instead of racing `shutdown.cancelled()`: CancelledFuture
+                // pushes a waker clone into the token's wakers Vec on every
+                // registration and never drains it until cancel fires — racing it
+                // per batch would accumulate wakers for the server's lifetime.
+                let shard_responses = match reply_rx.try_recv() {
+                    // Fast path: pipelined batches often have the reply queued by
+                    // the time this target is awaited — no future, no allocation.
+                    Ok(value) => Ok(value),
+                    Err(flume::TryRecvError::Disconnected) => {
+                        Err("ERR cross-shard dispatch failed")
+                    }
+                    Err(flume::TryRecvError::Empty) => {
+                        // OneshotReceiver is itself a Future with a cached inner
+                        // recv future — pin it ONCE so its waker registration
+                        // persists across chunk boundaries.
+                        let mut recv = std::pin::pin!(reply_rx);
+                        let mut waited_ms: u64 = 0;
+                        loop {
+                            if shutdown.is_cancelled() {
+                                break Err("ERR cross-shard response aborted (shutdown)");
                             }
-                            Err(flume::TryRecvError::Empty) => {
-                                if shutdown.is_cancelled() {
-                                    break Err("ERR cross-shard response aborted (shutdown)");
+                            let chunk = std::pin::pin!(monoio::time::sleep(
+                                std::time::Duration::from_millis(CROSS_SHARD_RESPONSE_CHUNK_MS)
+                            ));
+                            match crate::runtime::race::race2(recv.as_mut(), chunk).await {
+                                crate::runtime::race::Arm::First(Ok(value)) => break Ok(value),
+                                crate::runtime::race::Arm::First(Err(_)) => {
+                                    break Err("ERR cross-shard dispatch failed");
                                 }
-                                waits += 1;
-                                if waits > CROSS_SHARD_RESPONSE_MAX_WAITS {
-                                    tracing::warn!(
-                                        "Shard {}: cross-shard response wait exhausted; \
-                                         target may have applied the write",
-                                        ctx.shard_id
-                                    );
-                                    break Err(
-                                        "ERR cross-shard response timeout (write may have applied)",
-                                    );
-                                }
-                                // Yield once: register waker, return Pending, then Ready on wake.
-                                let mut yielded = false;
-                                std::future::poll_fn(|cx| {
-                                    if yielded {
-                                        std::task::Poll::Ready(())
-                                    } else {
-                                        yielded = true;
-                                        pw.borrow_mut().push(cx.waker().clone());
-                                        std::task::Poll::Pending
+                                crate::runtime::race::Arm::Second(()) => {
+                                    waited_ms += CROSS_SHARD_RESPONSE_CHUNK_MS;
+                                    if waited_ms >= CROSS_SHARD_RESPONSE_TIMEOUT_MS {
+                                        tracing::warn!(
+                                            "Shard {}: cross-shard response wait exhausted; \
+                                             target may have applied the write",
+                                            ctx.shard_id
+                                        );
+                                        break Err(
+                                            "ERR cross-shard response timeout (write may have applied)",
+                                        );
                                     }
-                                })
-                                .await;
-                                // After wake, loop back to try_recv
+                                }
                             }
                         }
                     }

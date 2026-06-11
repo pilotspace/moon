@@ -22,6 +22,7 @@ compile_error!("No runtime selected. Enable either `runtime-tokio` or `runtime-m
 
 pub mod cancel;
 pub mod channel;
+pub mod race;
 pub mod traits;
 
 #[cfg(feature = "runtime-tokio")]

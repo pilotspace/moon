@@ -33,7 +33,7 @@ impl ReplicationBacklog {
     /// Append bytes to the backlog. Evicts oldest bytes when at capacity.
     ///
     /// Bulk-copy implementation (QW5, 2026-06 review finding 1.5): one drain
-    /// + one extend instead of a per-byte eviction loop. State machine is
+    /// plus one extend instead of a per-byte eviction loop. State machine is
     /// identical to the per-byte version — the live window is always the last
     /// `capacity` bytes ever appended, and `start_offset` maintains the
     /// invariant `start_offset = end_offset - buf.len()`.

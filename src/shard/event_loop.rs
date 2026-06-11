@@ -1053,10 +1053,14 @@ impl super::Shard {
             }
         }
 
-        // Pending wakers for monoio cross-shard write dispatch.
-        // monoio's !Send single-threaded executor doesn't see cross-thread Waker::wake()
-        // from flume oneshot channels. Connection tasks register their waker here; the
-        // event loop drains and wakes them after every SPSC processing cycle (~1ms).
+        // Waker relay, swept after every drain cycle. HISTORICAL NOTE: this was
+        // built on the belief that monoio's !Send executor cannot receive
+        // cross-thread Waker::wake() — that is FALSE with the `sync` feature
+        // (enabled in Cargo.toml): a remote wake rides a per-thread waker
+        // channel + driver unpark (eventfd/kqueue), proven at runtime by
+        // tests/spsc_wake_floor_red.rs::swf0. The hot cross-shard reply path
+        // now awaits its oneshot directly (handler_monoio, M2); the relay is
+        // kept for future registrants and stays correct either way.
         #[cfg(feature = "runtime-monoio")]
         let pending_wakers: Rc<RefCell<Vec<std::task::Waker>>> = Rc::new(RefCell::new(Vec::new()));
 
@@ -1184,9 +1188,10 @@ impl super::Shard {
                 }
                 // SPSC notify -- event-driven cross-shard message drain
                 _ = spsc_notify_local.notified() => {
+                    crate::admin::metrics_setup::bump_spsc_notify_wake();
                     let mut pending_snapshot = None;
                     // Phase 2d: gate on is_initialized(); new path uses ShardSlice directly.
-                    if crate::shard::slice::is_initialized() {
+                    let hit_cap = if crate::shard::slice::is_initialized() {
                         crate::shard::slice::with_shard(|s| {
                             spsc_handler::drain_spsc_shared(
                                 &shard_databases, &mut consumers, &mut *pubsub_arc.write(),
@@ -1201,8 +1206,8 @@ impl super::Shard {
                                 server_config.graph_dead_edge_trigger,
                                 &mut autovacuum_daemon,
                                 aof_pool.as_ref(),  // FIX-W1-2
-                            );
-                        });
+                            )
+                        })
                     } else {
                         spsc_handler::drain_spsc_shared(
                             &shard_databases, &mut consumers, &mut *pubsub_arc.write(),
@@ -1217,7 +1222,13 @@ impl super::Shard {
                             server_config.graph_dead_edge_trigger,
                             &mut autovacuum_daemon,
                             aof_pool.as_ref(),  // FIX-W1-2
-                        );
+                        )
+                    };
+                    if hit_cap {
+                        // M3: capped drain may have left a tail — re-arm immediately
+                        // instead of stranding it until the next periodic tick.
+                        spsc_notify_local.notify_one();
+                        crate::admin::metrics_setup::bump_spsc_drain_renotify();
                     }
                     // MA5: persist maintenance schedule when modified by RECLAMATION SCHEDULE.
                     if autovacuum_daemon.maintenance_schedule.is_dirty() {
@@ -1294,7 +1305,7 @@ impl super::Shard {
 
                     let mut pending_snapshot = None;
                     // Phase 2d: gate on is_initialized(); new path uses ShardSlice directly.
-                    if crate::shard::slice::is_initialized() {
+                    let hit_cap = if crate::shard::slice::is_initialized() {
                         crate::shard::slice::with_shard(|s| {
                             spsc_handler::drain_spsc_shared(
                                 &shard_databases, &mut consumers, &mut *pubsub_arc.write(),
@@ -1309,8 +1320,8 @@ impl super::Shard {
                                 server_config.graph_dead_edge_trigger,
                                 &mut autovacuum_daemon,
                                 aof_pool.as_ref(),  // FIX-W1-2
-                            );
-                        });
+                            )
+                        })
                     } else {
                         spsc_handler::drain_spsc_shared(
                             &shard_databases, &mut consumers, &mut *pubsub_arc.write(),
@@ -1325,7 +1336,13 @@ impl super::Shard {
                             server_config.graph_dead_edge_trigger,
                             &mut autovacuum_daemon,
                             aof_pool.as_ref(),  // FIX-W1-2
-                        );
+                        )
+                    };
+                    if hit_cap {
+                        // M3: capped drain may have left a tail — re-arm immediately
+                        // instead of stranding it until the next periodic tick.
+                        spsc_notify_local.notify_one();
+                        crate::admin::metrics_setup::bump_spsc_drain_renotify();
                     }
                     // MA5: persist maintenance schedule when modified by RECLAMATION SCHEDULE.
                     if autovacuum_daemon.maintenance_schedule.is_dirty() {
@@ -1917,18 +1934,34 @@ impl super::Shard {
                     break;
                 }
 
-                // Single await point — no select!, no per-iteration allocation.
-                // .0.tick() bypasses the RuntimeInterval trait's Box::pin() wrapper.
-                periodic_interval.0.tick().await;
-                monoio_tick_counter = monoio_tick_counter.wrapping_add(1);
+                // Single race await — still no monoio::select! (it leaks ~100 B per
+                // re-entry; hand-rolled race2 instead, M6) and no per-iteration
+                // allocation. .0.tick() bypasses the RuntimeInterval trait's
+                // Box::pin() wrapper. The timer arm drives the periodic body at its
+                // ~1ms cadence; the Notify arm (cross-shard producers + drain-cap
+                // self-re-notify) wakes the loop the moment a message arrives.
+                // monoio 0.2.4's `sync` feature carries the producer's cross-thread
+                // wake (per-thread waker channel + eventfd/kqueue unpark) — proven
+                // at runtime by tests/spsc_wake_floor_red.rs::swf0 on both drivers.
+                // A losing notified() arm re-queues an undelivered token on drop
+                // (swf_a3), so there is no lost-wake window.
+                let timer_fired = {
+                    let tick = std::pin::pin!(periodic_interval.0.tick());
+                    let notified = std::pin::pin!(spsc_notify_local.notified());
+                    matches!(
+                        crate::runtime::race::race2(tick, notified).await,
+                        crate::runtime::race::Arm::First(_)
+                    )
+                };
+                if !timer_fired {
+                    crate::admin::metrics_setup::bump_spsc_notify_wake();
+                }
 
-                // --- Periodic tick body (same as tokio periodic_interval branch) ---
-                cached_clock.update();
-                next_file_id = next_file_id.max(spill_file_id.get());
-
+                // --- Every-wake body (mirrors the tokio notify arm): drain SPSC,
+                //     handle drain outputs, sweep the pending_wakers relay ---
                 let mut pending_snapshot = None;
                 // Phase 2d: gate on is_initialized(); new path uses ShardSlice directly.
-                if crate::shard::slice::is_initialized() {
+                let hit_cap = if crate::shard::slice::is_initialized() {
                     crate::shard::slice::with_shard(|s| {
                         spsc_handler::drain_spsc_shared(
                             &shard_databases,
@@ -1954,8 +1987,8 @@ impl super::Shard {
                             server_config.graph_dead_edge_trigger,
                             &mut autovacuum_daemon,
                             aof_pool.as_ref(), // FIX-W1-2
-                        );
-                    });
+                        )
+                    })
                 } else {
                     spsc_handler::drain_spsc_shared(
                         &shard_databases,
@@ -1981,7 +2014,14 @@ impl super::Shard {
                         server_config.graph_dead_edge_trigger,
                         &mut autovacuum_daemon,
                         aof_pool.as_ref(), // FIX-W1-2
-                    );
+                    )
+                };
+                if hit_cap {
+                    // M3: the drain stopped at its per-cycle cap (or a snapshot
+                    // barrier) — re-arm immediately so the tail drains on the next
+                    // iteration instead of stranding until the next timer tick.
+                    spsc_notify_local.notify_one();
+                    crate::admin::metrics_setup::bump_spsc_drain_renotify();
                 }
                 if !pending_cdc_subscribes.is_empty() {
                     let wal_dir = wal_v3_writer.as_ref().map(|w| w.wal_dir());
@@ -2055,6 +2095,16 @@ impl super::Shard {
                         );
                     }
                 }
+
+                // --- Periodic tick body (timer arm ONLY — M4: cadence work like
+                //     WAL flush, sub-timers, and the cached clock must never run
+                //     off-schedule on a notify wake) ---
+                if !timer_fired {
+                    continue;
+                }
+                monoio_tick_counter = monoio_tick_counter.wrapping_add(1);
+                cached_clock.update();
+                next_file_id = next_file_id.max(spill_file_id.get());
 
                 persistence_tick::check_auto_save_trigger(
                     &snapshot_trigger_rx,
