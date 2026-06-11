@@ -4,6 +4,39 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed — Event-driven cross-shard wake (the ~1ms monoio floor is gone)
+
+- **The monoio shard event loop is now event-driven.** Its single await point
+  was the 1ms periodic tick, so every cross-shard hop queued up to 1ms on the
+  target shard plus up to 1ms on the origin's reply sweep. The loop now races
+  the tick against the shard's SPSC `Notify` (hand-rolled allocation-free
+  `race2` future — `monoio::select!` remains banned), and connection tasks
+  await cross-shard replies directly. Cadence work (WAL flush, cached clock,
+  snapshot/auto-save sub-timers) stays pinned to the timer arm. Measured on
+  a 4-shard Linux server: single-client cross-shard SET p99 4.07 ms → 0.071 ms
+  (57×), pipelined SET +368%, non-pipelined SET +404%; single-shard
+  throughput +63–80%. (PR #172)
+- **Drain-cap self-re-notify:** a >256-message cross-shard burst no longer
+  strands its tail until the next tick — a capped drain re-arms the wake
+  immediately (both runtimes).
+- **New INFO Stats counters:** `spsc_notify_wakes` and `spsc_drain_renotify`
+  make the event-driven path observable from a black-box client.
+
+### Changed — Hot-path lock quick wins
+
+- Per-command global lock acquisitions removed from the command dispatch path
+  (replication offset reads, shared-databases lookups, socket-option setup,
+  accept-path state), with the replication backlog append switched to a
+  bulk-copy. (PR #172)
+
+### Fixed
+
+- `uring_handler` in-flight send queue used `Vec` API on a `VecDeque`
+  (`.push` → `.push_back`) — the Linux+tokio io_uring bridge path failed to
+  compile on its own. (PR #172)
+
 ## [0.3.0] — 2026-06-11
 
 Hot-shard elasticity + vector engine maturity: background HNSW compaction
