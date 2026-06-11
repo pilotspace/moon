@@ -73,19 +73,22 @@ fn take_migration_read_buf(state: &mut MigratedConnectionState) -> BytesMut {
     std::mem::take(&mut state.read_buf_remainder)
 }
 
-/// Set TCP keepalive on a raw file descriptor.
+/// Apply per-connection socket options on a raw file descriptor.
 ///
-/// Sets SO_KEEPALIVE and TCP_KEEPIDLE (Linux) / TCP_KEEPALIVE (macOS) to detect
-/// dead connections. Called once per accepted socket.
+/// TCP_NODELAY always (QW1 — Redis defaults `tcp-nodelay yes`; Nagle holds
+/// pipelined responses for a delayed-ACK window otherwise), plus SO_KEEPALIVE
+/// with TCP_KEEPIDLE (Linux) / TCP_KEEPALIVE (macOS) to detect dead
+/// connections when `keepalive_secs > 0`. Called once per accepted socket.
 #[cfg(unix)]
-fn set_tcp_keepalive(fd: std::os::unix::io::RawFd, keepalive_secs: u64) {
-    if keepalive_secs == 0 {
-        return;
-    }
+fn apply_accepted_socket_opts(fd: std::os::unix::io::RawFd, keepalive_secs: u64) {
     use std::os::unix::io::BorrowedFd;
     // SAFETY: fd is a valid open socket owned by the caller. We borrow it
     // for the duration of this function — SockRef does not close on drop.
     let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+    let _ = crate::server::socket_opts::apply_client_socket_opts(&borrowed);
+    if keepalive_secs == 0 {
+        return;
+    }
     let sock = socket2::SockRef::from(&borrowed);
     let interval = std::cmp::max(keepalive_secs / 3, 1);
     let ka = socket2::TcpKeepalive::new()
@@ -180,7 +183,7 @@ pub(crate) fn spawn_tokio_connection(
     {
         use std::os::unix::io::AsRawFd;
         let tcp_keepalive_secs = rtcfg.read().tcp_keepalive;
-        set_tcp_keepalive(tcp_stream.as_raw_fd(), tcp_keepalive_secs);
+        apply_accepted_socket_opts(tcp_stream.as_raw_fd(), tcp_keepalive_secs);
     }
 
     // Construct ConnectionContext from cloned shared state. The pool is
@@ -485,7 +488,7 @@ pub(crate) fn spawn_monoio_connection(
     {
         use std::os::unix::io::AsRawFd;
         let keepalive_secs = runtime_config.read().tcp_keepalive;
-        set_tcp_keepalive(std_tcp_stream.as_raw_fd(), keepalive_secs);
+        apply_accepted_socket_opts(std_tcp_stream.as_raw_fd(), keepalive_secs);
     }
 
     match monoio::net::TcpStream::from_std(std_tcp_stream) {

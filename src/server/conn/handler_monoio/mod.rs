@@ -153,7 +153,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
     let db_count = ctx.shard_databases.db_count();
 
     // Register in global client registry for CLIENT LIST/INFO/KILL.
-    crate::client_registry::register(
+    let client_live = crate::client_registry::register(
         client_id,
         peer_addr.clone(),
         conn.current_user.clone(),
@@ -196,8 +196,8 @@ pub(crate) async fn handle_connection_sharded_monoio<
     let mut frames: Vec<Frame> = Vec::with_capacity(64);
 
     loop {
-        // Check if CLIENT KILL targeted this connection
-        if crate::client_registry::is_killed(client_id) {
+        // Check if CLIENT KILL targeted this connection (lock-free, QW8)
+        if client_live.is_killed() {
             break;
         }
 
@@ -2116,16 +2116,16 @@ pub(crate) async fn handle_connection_sharded_monoio<
             }
         }
 
-        // Update registry with current state after each batch
-        crate::client_registry::update(client_id, |e| {
-            e.db = conn.selected_db;
-            e.last_cmd_at = std::time::Instant::now();
-            e.flags = crate::client_registry::ClientFlags {
+        // Update live state after each batch — lock-free (QW8, 2026-06
+        // review: this was a global registry write lock per batch).
+        client_live.touch(
+            conn.selected_db,
+            crate::client_registry::ClientFlags {
                 subscriber: conn.subscription_count > 0,
                 in_multi: conn.in_multi,
                 blocked: false,
-            };
-        });
+            },
+        );
 
         // Check if migration was triggered during frame processing.
         // All responses for the current batch have been written, so the

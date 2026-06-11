@@ -218,7 +218,7 @@ impl super::Shard {
         #[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
         let mut inflight_sends: std::collections::HashMap<
             u32,
-            Vec<uring_handler::InFlightSend>,
+            std::collections::VecDeque<uring_handler::InFlightSend>,
         > = std::collections::HashMap::new();
 
         // Per-shard SO_REUSEPORT listener (unix + tokio, non-uring path).
@@ -664,6 +664,13 @@ impl super::Shard {
         };
         let mut replica_txs: Vec<(u64, channel::MpscSender<bytes::Bytes>)> = Vec::new();
         let repl_state: Option<Arc<std::sync::RwLock<ReplicationState>>> = repl_state_ext;
+        // QW3 (2026-06 review): lock-free offset handle cloned ONCE at shard
+        // startup. The SPSC drain's per-write offset advance goes through this
+        // handle, so the surrounding RwLock is never read-locked per write.
+        let repl_offsets: Option<crate::replication::state::OffsetHandle> = repl_state
+            .as_ref()
+            .and_then(|rs| rs.read().ok())
+            .map(|g| g.offset_handle());
 
         // Track last seen snapshot epoch to detect watch channel triggers
         let mut last_snapshot_epoch = snapshot_trigger_rx.borrow();
@@ -1132,6 +1139,8 @@ impl super::Shard {
                                         match tcp_stream.into_std() {
                                             Ok(std_stream) => {
                                                 use std::os::unix::io::IntoRawFd;
+                                                // QW1: nodelay before handing the fd to io_uring.
+                                                let _ = crate::server::socket_opts::apply_client_socket_opts(&std_stream);
                                                 let raw_fd = std_stream.into_raw_fd();
                                                 match driver.register_connection(raw_fd) {
                                                     Ok(Some(_conn_id)) => {
@@ -1183,7 +1192,7 @@ impl super::Shard {
                                 &shard_databases, &mut consumers, &mut *pubsub_arc.write(),
                                 &blocking_rc, &mut pending_snapshot, &mut snapshot_state,
                                 &mut wal_writer, &mut wal_v3_writer, &repl_backlog, &mut replica_txs,
-                                &repl_state, shard_id, &script_cache_rc, &cached_clock,
+                                &repl_offsets, shard_id, &script_cache_rc, &cached_clock,
                                 &mut pending_migrations, &mut s.vector_store,
                                 &mut pending_cdc_subscribes,
                                 &mut shard_manifest,
@@ -1199,7 +1208,7 @@ impl super::Shard {
                             &shard_databases, &mut consumers, &mut *pubsub_arc.write(),
                             &blocking_rc, &mut pending_snapshot, &mut snapshot_state,
                             &mut wal_writer, &mut wal_v3_writer, &repl_backlog, &mut replica_txs,
-                            &repl_state, shard_id, &script_cache_rc, &cached_clock,
+                            &repl_offsets, shard_id, &script_cache_rc, &cached_clock,
                             &mut pending_migrations, &mut *shard_databases.vector_store(shard_id),
                             &mut pending_cdc_subscribes,
                             &mut shard_manifest,
@@ -1291,7 +1300,7 @@ impl super::Shard {
                                 &shard_databases, &mut consumers, &mut *pubsub_arc.write(),
                                 &blocking_rc, &mut pending_snapshot, &mut snapshot_state,
                                 &mut wal_writer, &mut wal_v3_writer, &repl_backlog, &mut replica_txs,
-                                &repl_state, shard_id, &script_cache_rc, &cached_clock,
+                                &repl_offsets, shard_id, &script_cache_rc, &cached_clock,
                                 &mut pending_migrations, &mut s.vector_store,
                                 &mut pending_cdc_subscribes,
                                 &mut shard_manifest,
@@ -1307,7 +1316,7 @@ impl super::Shard {
                             &shard_databases, &mut consumers, &mut *pubsub_arc.write(),
                             &blocking_rc, &mut pending_snapshot, &mut snapshot_state,
                             &mut wal_writer, &mut wal_v3_writer, &repl_backlog, &mut replica_txs,
-                            &repl_state, shard_id, &script_cache_rc, &cached_clock,
+                            &repl_offsets, shard_id, &script_cache_rc, &cached_clock,
                             &mut pending_migrations, &mut *shard_databases.vector_store(shard_id),
                             &mut pending_cdc_subscribes,
                             &mut shard_manifest,
@@ -1932,7 +1941,7 @@ impl super::Shard {
                             &mut wal_v3_writer,
                             &repl_backlog,
                             &mut replica_txs,
-                            &repl_state,
+                            &repl_offsets,
                             shard_id,
                             &script_cache_rc,
                             &cached_clock,
@@ -1959,7 +1968,7 @@ impl super::Shard {
                         &mut wal_v3_writer,
                         &repl_backlog,
                         &mut replica_txs,
-                        &repl_state,
+                        &repl_offsets,
                         shard_id,
                         &script_cache_rc,
                         &cached_clock,

@@ -5,7 +5,7 @@
 
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use ringbuf::HeapCons;
 use ringbuf::traits::Consumer;
@@ -20,7 +20,6 @@ use crate::persistence::wal::WalWriter;
 use crate::persistence::wal_v3::segment::WalWriterV3;
 use crate::pubsub::PubSubRegistry;
 use crate::replication::backlog::ReplicationBacklog;
-use crate::replication::state::ReplicationState;
 use crate::runtime::channel;
 use crate::storage::Database;
 use crate::storage::entry::CachedClock;
@@ -52,7 +51,7 @@ pub(crate) fn drain_spsc_shared(
     wal_v3_writer: &mut Option<WalWriterV3>,
     repl_backlog: &crate::replication::backlog::SharedBacklog,
     replica_txs: &mut Vec<(u64, channel::MpscSender<bytes::Bytes>)>,
-    repl_state: &Option<Arc<RwLock<ReplicationState>>>,
+    repl_state: &Option<crate::replication::state::OffsetHandle>,
     shard_id: usize,
     script_cache: &Rc<RefCell<crate::scripting::ScriptCache>>,
     cached_clock: &CachedClock,
@@ -252,7 +251,7 @@ pub(crate) fn handle_shard_message_shared(
     wal_v3_writer: &mut Option<WalWriterV3>,
     repl_backlog: &crate::replication::backlog::SharedBacklog,
     replica_txs: &mut Vec<(u64, channel::MpscSender<bytes::Bytes>)>,
-    repl_state: &Option<Arc<RwLock<ReplicationState>>>,
+    repl_state: &Option<crate::replication::state::OffsetHandle>,
     shard_id: usize,
     script_cache: &Rc<RefCell<crate::scripting::ScriptCache>>,
     cached_clock: &CachedClock,
@@ -3042,7 +3041,7 @@ pub(crate) fn wal_append_and_fanout(
     wal_v3_writer: &mut Option<WalWriterV3>,
     repl_backlog: &crate::replication::backlog::SharedBacklog,
     replica_txs: &[(u64, channel::MpscSender<bytes::Bytes>)],
-    repl_state: &Option<Arc<RwLock<ReplicationState>>>,
+    repl_state: &Option<crate::replication::state::OffsetHandle>,
     shard_id: usize,
     aof_pool: Option<&std::sync::Arc<crate::persistence::aof::AofWriterPool>>,
 ) {
@@ -3086,11 +3085,11 @@ pub(crate) fn wal_append_and_fanout(
     }
     drop(guard);
     // 3. Advance monotonic replication offset (NEVER resets on WAL truncation)
-    if let Some(rs) = repl_state {
-        match rs.read() {
-            Ok(rs) => rs.increment_shard_offset(shard_id, data.len() as u64),
-            Err(_) => tracing::error!("repl_state lock poisoned, replication offset not updated"),
-        }
+    // QW3 (2026-06 review finding 1.4): `repl_state` is a lock-free
+    // OffsetHandle cloned out of `RwLock<ReplicationState>` once at shard
+    // startup — the per-write advance no longer read-locks the RwLock.
+    if let Some(offsets) = repl_state {
+        offsets.increment_shard_offset(shard_id, data.len() as u64);
     }
     // 4. Fan-out to replica sender tasks (non-blocking: lagging replicas are skipped)
     if !replica_txs.is_empty() {

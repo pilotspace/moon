@@ -14,10 +14,13 @@ pub struct ReplicationState {
     /// Secondary replication ID (previous master's ID). Used after failover.
     pub repl_id2: String,
     /// Per-shard write offset (monotonic bytes appended, NEVER resets on WAL truncation).
-    /// Length = num_shards.
-    pub shard_offsets: Vec<AtomicU64>,
+    /// Length = num_shards. Arc'd so `offset_handle()` can hand shards a
+    /// lock-free clone — the per-write advance must never take the
+    /// surrounding `RwLock` (QW3, 2026-06 review).
+    pub shard_offsets: Arc<[AtomicU64]>,
     /// Sum of all shard offsets -- global master replication offset.
-    pub master_repl_offset: AtomicU64,
+    /// Arc'd for the same lock-free `offset_handle()` distribution.
+    pub master_repl_offset: Arc<AtomicU64>,
     /// Connected replicas (master mode). Guarded by Arc<RwLock<ReplicationState>> callers.
     pub replicas: Vec<ReplicaInfo>,
     /// Per-shard replication backlogs, shared between the shard event loop
@@ -59,7 +62,7 @@ impl ReplicationState {
             repl_id,
             repl_id2,
             shard_offsets: (0..num_shards).map(|_| AtomicU64::new(0)).collect(),
-            master_repl_offset: AtomicU64::new(0),
+            master_repl_offset: Arc::new(AtomicU64::new(0)),
             replicas: Vec::new(),
             per_shard_backlogs: (0..num_shards)
                 .map(|_| Arc::new(parking_lot::Mutex::new(None)))
@@ -171,6 +174,47 @@ impl ReplicationState {
             .get(shard_id)
             .map(|o| o.load(Ordering::Relaxed))
             .unwrap_or(0)
+    }
+
+    /// Clone out a lock-free handle to the offset atomics.
+    ///
+    /// Called once per shard at event-loop startup; the handle is what the
+    /// per-write path uses, so `RwLock<ReplicationState>` is never read-locked
+    /// per write (QW3, 2026-06 review finding 1.4).
+    pub fn offset_handle(&self) -> OffsetHandle {
+        OffsetHandle {
+            shard_offsets: Arc::clone(&self.shard_offsets),
+            master_repl_offset: Arc::clone(&self.master_repl_offset),
+        }
+    }
+}
+
+/// Lock-free handle to the replication offset atomics, distributed to each
+/// shard at startup via [`ReplicationState::offset_handle`]. Advancing
+/// offsets through this handle is equivalent to `ReplicationState::issue_lsn`
+/// — both operate on the same `Arc`'d atomics.
+#[derive(Clone)]
+pub struct OffsetHandle {
+    shard_offsets: Arc<[AtomicU64]>,
+    master_repl_offset: Arc<AtomicU64>,
+}
+
+impl OffsetHandle {
+    /// See [`ReplicationState::issue_lsn`] — same semantics, same atomics,
+    /// no surrounding lock.
+    #[inline]
+    pub fn issue_lsn(&self, shard_id: usize, delta: u64) -> u64 {
+        if shard_id >= self.shard_offsets.len() {
+            return 0;
+        }
+        self.shard_offsets[shard_id].fetch_add(delta, Ordering::Relaxed);
+        self.master_repl_offset.fetch_add(delta, Ordering::Relaxed)
+    }
+
+    /// See [`ReplicationState::increment_shard_offset`].
+    #[inline]
+    pub fn increment_shard_offset(&self, shard_id: usize, delta: u64) {
+        let _ = self.issue_lsn(shard_id, delta);
     }
 }
 

@@ -23,9 +23,48 @@ pub fn is_server_ready() -> bool {
 // ── Lightweight atomic counters for INFO ────────────────────────────────
 // These counters work even when the Prometheus exporter is disabled
 // (admin_port=0), so INFO always returns meaningful stats.
-static TOTAL_COMMANDS: AtomicU64 = AtomicU64::new(0);
 static TOTAL_CONNECTIONS: AtomicU64 = AtomicU64::new(0);
 static CONNECTED_CLIENTS: AtomicU64 = AtomicU64::new(0);
+
+// ── QW4 (2026-06 review finding 1.6): sharded total-commands counter ────
+// Previously a single `TOTAL_COMMANDS: AtomicU64` — one cache line bounced
+// across every shard core at full command rate (false sharing). Each OS
+// thread takes a padded slot (round-robin at first use); increments touch
+// only that thread's line. Readers (INFO, server_stats tick) sum all slots;
+// the sum is exact — every increment lands in exactly one slot.
+const COMMAND_COUNTER_SLOTS: usize = 64;
+
+#[repr(align(64))]
+struct PaddedCounter(AtomicU64);
+
+#[allow(clippy::declare_interior_mutable_const)] // template for static array init only
+const PADDED_COUNTER_ZERO: PaddedCounter = PaddedCounter(AtomicU64::new(0));
+static COMMAND_COUNTERS: [PaddedCounter; COMMAND_COUNTER_SLOTS] =
+    [PADDED_COUNTER_ZERO; COMMAND_COUNTER_SLOTS];
+static NEXT_COMMAND_COUNTER_SLOT: AtomicU64 = AtomicU64::new(0);
+
+thread_local! {
+    static COMMAND_COUNTER_SLOT: usize =
+        (NEXT_COMMAND_COUNTER_SLOT.fetch_add(1, Ordering::Relaxed) as usize)
+            % COMMAND_COUNTER_SLOTS;
+}
+
+/// Increment this thread's slot of the sharded total-commands counter.
+#[inline]
+fn bump_total_commands() {
+    COMMAND_COUNTER_SLOT.with(|&slot| {
+        COMMAND_COUNTERS[slot].0.fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+/// Exact sum across all counter slots. O(64) loads — read paths only
+/// (INFO, the 1s server_stats tick), never the command hot path.
+fn total_commands_sum() -> u64 {
+    COMMAND_COUNTERS
+        .iter()
+        .map(|c| c.0.load(Ordering::Relaxed))
+        .sum()
+}
 
 // ── P6: WAL aggressive reclamation counters (read by P10 INFO emitter) ───
 // Incremented by WalWriterV3::recycle_aggressive(). P10 reads these via the
@@ -398,7 +437,7 @@ fn sanitize_cmd_label(cmd: &str) -> &'static str {
 /// Record a command execution.
 #[inline]
 pub fn record_command(cmd: &str, latency_us: u64) {
-    TOTAL_COMMANDS.fetch_add(1, Ordering::Relaxed);
+    bump_total_commands();
     if !METRICS_INITIALIZED.load(Ordering::Relaxed) {
         return;
     }
@@ -415,7 +454,7 @@ pub fn record_command(cmd: &str, latency_us: u64) {
 /// would otherwise bias the distribution with a zero value.
 #[inline]
 pub fn record_command_no_latency(cmd: &str) {
-    TOTAL_COMMANDS.fetch_add(1, Ordering::Relaxed);
+    bump_total_commands();
     if !METRICS_INITIALIZED.load(Ordering::Relaxed) {
         return;
     }
@@ -495,7 +534,7 @@ impl CachedMetricsHandles {
 /// recorder-backend DashMap lookup on cache hit.
 #[inline]
 pub fn record_command_cached(cmd: &str, latency_us: u64, cache: &mut CachedMetricsHandles) {
-    TOTAL_COMMANDS.fetch_add(1, Ordering::Relaxed);
+    bump_total_commands();
     if !METRICS_INITIALIZED.load(Ordering::Relaxed) {
         return;
     }
@@ -509,7 +548,7 @@ pub fn record_command_cached(cmd: &str, latency_us: u64, cache: &mut CachedMetri
 /// the recorder-backend DashMap lookup on cache hit.
 #[inline]
 pub fn record_command_no_latency_cached(cmd: &str, cache: &mut CachedMetricsHandles) {
-    TOTAL_COMMANDS.fetch_add(1, Ordering::Relaxed);
+    bump_total_commands();
     if !METRICS_INITIALIZED.load(Ordering::Relaxed) {
         return;
     }
@@ -1080,7 +1119,7 @@ pub fn get_rss_bytes() -> u64 {
 /// Total commands processed since server start (for INFO Stats).
 #[inline]
 pub fn total_commands_processed() -> u64 {
-    TOTAL_COMMANDS.load(Ordering::Relaxed)
+    total_commands_sum()
 }
 
 /// Total connections received since server start (for INFO Stats).
@@ -1259,7 +1298,7 @@ pub fn spawn_metrics_publisher() {
                 None => continue,
             };
 
-            let total_ops = TOTAL_COMMANDS.load(Ordering::Relaxed);
+            let total_ops = total_commands_sum();
             let ops_per_sec = total_ops.saturating_sub(prev_ops);
             prev_ops = total_ops;
 
