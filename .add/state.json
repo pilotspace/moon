@@ -1,7 +1,7 @@
 {
   "project": "moon",
   "stage": "production",
-  "active_task": "hotpath-lock-quickwins",
+  "active_task": "spsc-wake-floor",
   "active_milestone": "v1-shared-nothing",
   "tasks": {
     "hotpath-lock-quickwins": {
@@ -13,6 +13,15 @@
       "created": "2026-06-11T03:23:03+00:00",
       "updated": "2026-06-11T04:17:08+00:00",
       "flag_verified": true
+    },
+    "spsc-wake-floor": {
+      "title": "Remove the ~1ms monoio cross-shard reply floor (eventfd wake + drain-until-empty)",
+      "phase": "tests",
+      "gate": "none",
+      "milestone": "v1-shared-nothing",
+      "depends_on": [],
+      "created": "2026-06-11T05:02:18+00:00",
+      "updated": "2026-06-11T05:31:37+00:00"
     }
   },
   "milestones": {
@@ -26,7 +35,7 @@
     }
   },
   "created": "2026-06-11T03:18:21+00:00",
-  "updated": "2026-06-11T04:17:08+00:00",
+  "updated": "2026-06-11T05:31:37+00:00",
   "setup": {
     "locked": true,
     "locked_at": "2026-06-11T03:28:00+00:00",

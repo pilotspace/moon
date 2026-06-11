@@ -96,3 +96,6 @@ tmp/
 
 # MkDocs documentation site build output
 /site/
+
+# Linux VM cross-build dir (avoids Mach-O/ELF clobbering in shared target/)
+/target-linux/
