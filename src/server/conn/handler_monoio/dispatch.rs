@@ -545,6 +545,22 @@ pub(super) fn try_handle_replconf(
     true
 }
 
+/// CDC.READ — polling-based change data capture (C3 v1).
+///
+/// Stateless / synchronous — reads WAL files from disk, no shard state
+/// involved. Mirrors the identical function in handler_sharded/dispatch.rs.
+pub(super) fn try_handle_cdc_read(
+    cmd: &[u8],
+    cmd_args: &[Frame],
+    responses: &mut Vec<Frame>,
+) -> bool {
+    if !cmd.eq_ignore_ascii_case(b"CDC.READ") {
+        return false;
+    }
+    responses.push(crate::command::cdc::cdc_read(cmd_args));
+    true
+}
+
 /// Handle PSYNC command. Returns `Some((repl_id, offset))` when this PSYNC
 /// arrival should hijack the connection. The caller breaks out of the dispatch
 /// loop and returns the stream so the master replication driver can take over.

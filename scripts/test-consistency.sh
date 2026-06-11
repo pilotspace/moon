@@ -205,6 +205,7 @@ fi
 both SET mut:setrange "Hello, World!"
 rust_sr=$(redis-cli -p "$PORT_RUST" SETRANGE mut:setrange 7 "Redis" 2>&1)
 if [[ "$rust_sr" != *"unknown command"* ]]; then
+    both SETRANGE mut:setrange 7 "Redis"
     assert_both "SETRANGE" GET mut:setrange
 else
     log "  SKIP: SETRANGE not implemented"
@@ -622,7 +623,7 @@ echo ""
 log "=== Vector Search (moon-only) ==="
 
 # Create index on moon only
-FT_CREATE=$(redis-cli -p "$PORT_RUST" FT.CREATE vecidx ON HASH PREFIX 1 vec: SCHEMA embedding VECTOR FLAT 6 DIM 4 DISTANCE_METRIC L2 TYPE FLOAT32 2>&1)
+FT_CREATE=$(redis-cli -p "$PORT_RUST" FT.CREATE vecidx ON HASH PREFIX 1 vec: SCHEMA embedding VECTOR HNSW 6 DIM 4 DISTANCE_METRIC L2 TYPE FLOAT32 2>&1)
 assert_eq "FT.CREATE" "OK" "$FT_CREATE"
 
 # Insert vectors — use python3 to avoid null byte stripping in bash

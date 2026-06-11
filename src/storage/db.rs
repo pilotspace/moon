@@ -1870,6 +1870,27 @@ impl Database {
         }
     }
 
+    /// Read-only stream access for the shared-lock read path.
+    ///
+    /// Checks expiry using `now_ms` but does NOT remove the expired key or
+    /// touch LRU (mirrors `get_if_alive` semantics).  Returns `Ok(None)` for
+    /// missing or expired keys, `Err(WRONGTYPE)` for non-stream keys.
+    pub fn get_stream_if_alive(
+        &self,
+        key: &[u8],
+        now_ms: u64,
+    ) -> Result<Option<&StreamData>, Frame> {
+        let base_ts = self.base_timestamp;
+        match self.data.get(key) {
+            None => Ok(None),
+            Some(entry) if entry.is_expired_at(base_ts, now_ms) => Ok(None),
+            Some(entry) => match entry.value.as_redis_value() {
+                RedisValueRef::Stream(s) => Ok(Some(s)),
+                _ => Err(Self::wrongtype_error()),
+            },
+        }
+    }
+
     /// Get a read-only reference to a stream. Returns Ok(None) if key doesn't exist.
     /// Returns WRONGTYPE error if key holds another type.
     pub fn get_stream(&mut self, key: &[u8]) -> Result<Option<&StreamData>, Frame> {

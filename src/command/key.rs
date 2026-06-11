@@ -1185,6 +1185,89 @@ pub fn scan_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
     ])
 }
 
+// ---------------------------------------------------------------------------
+// New read-only twins (dispatch_read path)
+// ---------------------------------------------------------------------------
+
+/// EXPIRETIME key — read-only twin.
+///
+/// Returns -2 if missing/expired, -1 if no TTL, else absolute Unix seconds.
+pub fn expiretime_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
+    if args.len() != 1 {
+        return err_wrong_args("EXPIRETIME");
+    }
+    let key = match extract_key(&args[0]) {
+        Some(k) => k,
+        None => return err_wrong_args("EXPIRETIME"),
+    };
+    let base_ts = db.base_timestamp();
+    match db.get_if_alive(key, now_ms) {
+        None => Frame::Integer(-2),
+        Some(entry) => {
+            if !entry.has_expiry() {
+                Frame::Integer(-1)
+            } else {
+                Frame::Integer((entry.expires_at_ms(base_ts) / 1000) as i64)
+            }
+        }
+    }
+}
+
+/// PEXPIRETIME key — read-only twin.
+///
+/// Returns -2 if missing/expired, -1 if no TTL, else absolute Unix milliseconds.
+pub fn pexpiretime_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
+    if args.len() != 1 {
+        return err_wrong_args("PEXPIRETIME");
+    }
+    let key = match extract_key(&args[0]) {
+        Some(k) => k,
+        None => return err_wrong_args("PEXPIRETIME"),
+    };
+    let base_ts = db.base_timestamp();
+    match db.get_if_alive(key, now_ms) {
+        None => Frame::Integer(-2),
+        Some(entry) => {
+            if !entry.has_expiry() {
+                Frame::Integer(-1)
+            } else {
+                Frame::Integer(entry.expires_at_ms(base_ts) as i64)
+            }
+        }
+    }
+}
+
+/// RANDOMKEY — read-only twin.
+///
+/// Returns a random alive key, or Null if all keys are expired/absent.
+/// Uses `random_key()` which already filters expired keys without deleting them.
+pub fn randomkey_readonly(db: &Database, _args: &[Frame], _now_ms: u64) -> Frame {
+    match db.random_key() {
+        Some(key) => Frame::BulkString(key),
+        None => Frame::Null,
+    }
+}
+
+/// TOUCH key [key …] — read-only twin.
+///
+/// Counts alive keys. Does NOT update LRU/access metadata (contract M2).
+pub fn touch_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
+    if args.is_empty() {
+        return err_wrong_args("TOUCH");
+    }
+    let mut count = 0i64;
+    for arg in args {
+        let key = match extract_key(arg) {
+            Some(k) => k,
+            None => continue,
+        };
+        if db.exists_if_alive(key, now_ms) {
+            count += 1;
+        }
+    }
+    Frame::Integer(count)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

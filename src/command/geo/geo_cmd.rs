@@ -654,3 +654,194 @@ fn geosearch_inner(db: &mut Database, args: &[Frame], _store_mode: bool) -> (Vec
 
     (matches, Frame::Array(results.into()))
 }
+
+// ---------------------------------------------------------------------------
+// Read-only twins for the shared-lock (dispatch_read) path
+// ---------------------------------------------------------------------------
+//
+// GEO data is stored as a sorted set: all twins use `get_sorted_set_if_alive`.
+
+/// GEOPOS key member [member …] — read-only twin.
+pub fn geopos_readonly(db: &crate::storage::db::Database, args: &[Frame], now_ms: u64) -> Frame {
+    if args.len() < 2 {
+        return err_wrong_args("GEOPOS");
+    }
+    let key = match extract_bytes(&args[0]) {
+        Some(k) => k,
+        None => return err_wrong_args("GEOPOS"),
+    };
+
+    let scores: Vec<Option<f64>> = {
+        let members_map = match db.get_sorted_set_if_alive(key, now_ms) {
+            Ok(Some((members, _))) => Some(members),
+            Ok(None) => None,
+            Err(e) => return e,
+        };
+        args[1..]
+            .iter()
+            .map(|arg| {
+                let member = extract_bytes(arg)?;
+                members_map.as_ref()?.get(member).copied()
+            })
+            .collect()
+    };
+
+    let results: Vec<Frame> = scores
+        .into_iter()
+        .map(|opt_score| match opt_score {
+            Some(score) => {
+                let (lon, lat) = geohash_decode(score);
+                Frame::Array(
+                    vec![
+                        Frame::BulkString(Bytes::from(format!("{:.4}", lon))),
+                        Frame::BulkString(Bytes::from(format!("{:.4}", lat))),
+                    ]
+                    .into(),
+                )
+            }
+            None => Frame::Null,
+        })
+        .collect();
+
+    Frame::Array(results.into())
+}
+
+/// GEODIST key member1 member2 [M|KM|FT|MI] — read-only twin.
+pub fn geodist_readonly(db: &crate::storage::db::Database, args: &[Frame], now_ms: u64) -> Frame {
+    if args.len() < 3 {
+        return err_wrong_args("GEODIST");
+    }
+    let key = match extract_bytes(&args[0]) {
+        Some(k) => k,
+        None => return err_wrong_args("GEODIST"),
+    };
+    let m1 = match extract_bytes(&args[1]) {
+        Some(m) => m,
+        None => return err_wrong_args("GEODIST"),
+    };
+    let m2 = match extract_bytes(&args[2]) {
+        Some(m) => m,
+        None => return err_wrong_args("GEODIST"),
+    };
+    let unit = if args.len() >= 4 {
+        match extract_bytes(&args[3]) {
+            Some(u) => {
+                if parse_unit(u).is_none() {
+                    return Frame::Error(Bytes::from_static(
+                        b"ERR unsupported unit provided. please use M, KM, FT, MI",
+                    ));
+                }
+                u
+            }
+            None => b"m" as &[u8],
+        }
+    } else {
+        b"m"
+    };
+
+    let members_map = match db.get_sorted_set_if_alive(key, now_ms) {
+        Ok(Some((members, _))) => members.clone(),
+        Ok(None) => return Frame::Null,
+        Err(e) => return e,
+    };
+
+    let score1 = match members_map.get(m1) {
+        Some(&s) => s,
+        None => return Frame::Null,
+    };
+    let score2 = match members_map.get(m2) {
+        Some(&s) => s,
+        None => return Frame::Null,
+    };
+
+    let (lon1, lat1) = geohash_decode(score1);
+    let (lon2, lat2) = geohash_decode(score2);
+    let dist = haversine_distance(lon1, lat1, lon2, lat2);
+    let converted = convert_distance(dist, unit);
+
+    Frame::BulkString(Bytes::from(format!("{:.4}", converted)))
+}
+
+/// GEOHASH key member [member …] — read-only twin.
+pub fn geohash_readonly(db: &crate::storage::db::Database, args: &[Frame], now_ms: u64) -> Frame {
+    if args.len() < 2 {
+        return err_wrong_args("GEOHASH");
+    }
+    let key = match extract_bytes(&args[0]) {
+        Some(k) => k,
+        None => return err_wrong_args("GEOHASH"),
+    };
+
+    let members_map = match db.get_sorted_set_if_alive(key, now_ms) {
+        Ok(Some((members, _))) => Some(members.clone()),
+        Ok(None) => None,
+        Err(e) => return e,
+    };
+
+    let mut results = Vec::with_capacity(args.len() - 1);
+    for arg in &args[1..] {
+        let member = match extract_bytes(arg) {
+            Some(m) => m,
+            None => {
+                results.push(Frame::Null);
+                continue;
+            }
+        };
+
+        match &members_map {
+            Some(m) => match m.get(member) {
+                Some(&score) => {
+                    let hash_str = geohash_to_string(score);
+                    results.push(Frame::BulkString(Bytes::from(hash_str)));
+                }
+                None => results.push(Frame::Null),
+            },
+            None => results.push(Frame::Null),
+        }
+    }
+
+    Frame::Array(results.into())
+}
+
+/// GEOSEARCH key FROMMEMBER|FROMLONLAT … BYRADIUS|BYBOX … — read-only twin.
+///
+/// `geosearch_inner` takes `&mut Database` (for `get_sorted_set`).  Rather
+/// than duplicating the full 300-line parser, we delegate via the public
+/// `geosearch` function which already does the right thing for live keys.
+/// For expired keys `get_sorted_set_if_alive` on the read path returns None,
+/// so we replicate that check here and short-circuit with an empty array.
+pub fn geosearch_readonly(db: &crate::storage::db::Database, args: &[Frame], now_ms: u64) -> Frame {
+    if args.is_empty() {
+        return err_wrong_args("GEOSEARCH");
+    }
+    // Key is always args[0].
+    let key = match extract_bytes(&args[0]) {
+        Some(k) => k,
+        None => return err_wrong_args("GEOSEARCH"),
+    };
+    // If the key is expired/absent on the read path, return an empty array —
+    // identical to what the mutable path returns for a missing key.
+    match db.get_sorted_set_if_alive(key, now_ms) {
+        Ok(None) => return Frame::Array(Vec::new().into()),
+        Err(e) => return e,
+        Ok(Some(_)) => {} // key alive; fall through to full parse
+    }
+    // Key is alive — re-use the complete parsing logic via the public
+    // `geosearch` function.  We clone the single entry into a throwaway
+    // Database so the mutable `geosearch_inner` parser can run unchanged.
+    //
+    // NAMED EXCEPTION (contract §3): GEOSEARCH on the read path clones the
+    // single GEO entry into a throwaway Database. The clone is bounded (one
+    // sorted-set entry) and only occurs when the key is confirmed alive above.
+    // No mutation escapes the throwaway; `refresh_now()` keeps the timestamp
+    // current so the entry is never mistakenly expired inside the clone.
+    let entry = match db.data().get(key) {
+        Some(e) => e.clone(),
+        None => return Frame::Array(Vec::new().into()),
+    };
+    let key_bytes = bytes::Bytes::copy_from_slice(key);
+    let mut tmp_db = crate::storage::db::Database::new();
+    tmp_db.refresh_now(); // syscall — keeps cached_now_ms current
+    tmp_db.set(key_bytes, entry);
+    geosearch(&mut tmp_db, args)
+}

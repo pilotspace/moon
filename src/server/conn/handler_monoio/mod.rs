@@ -750,6 +750,10 @@ pub(crate) async fn handle_connection_sharded_monoio<
             if cmd_len == 8 && dispatch::try_handle_replconf(cmd, cmd_args, ctx, &mut responses) {
                 continue;
             }
+            // CDC.READ (8) — stateless WAL reader, no shard state involved.
+            if cmd_len == 8 && dispatch::try_handle_cdc_read(cmd, cmd_args, &mut responses) {
+                continue;
+            }
             // PSYNC: arrives only on a master, hijacks the connection. Encode
             // any pending responses, flush, then return the stream so the
             // caller can drive the resync handshake.

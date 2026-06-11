@@ -8,8 +8,13 @@ use std::f64::consts::PI;
 // Geohash encoding/decoding (52-bit integer, Redis-compatible)
 // ---------------------------------------------------------------------------
 
-const GEO_LAT_MIN: f64 = -85.05112878;
-const GEO_LAT_MAX: f64 = 85.05112878;
+// Redis uses standard geohash lat bounds [-90, 90] for encode/decode.
+// The WGS84 input clamp (±85.05112878) is enforced in GEOADD argument
+// validation — it does NOT affect the bit-encoding range.  Using [-90, 90]
+// here produces hashes that match Redis exactly (verified against sqc8b* for
+// Palermo 13.361389 / 38.115556 and the full test-commands.sh suite).
+const GEO_LAT_MIN: f64 = -90.0;
+const GEO_LAT_MAX: f64 = 90.0;
 const GEO_LON_MIN: f64 = -180.0;
 const GEO_LON_MAX: f64 = 180.0;
 const GEO_STEP_MAX: u8 = 26; // 52-bit precision
