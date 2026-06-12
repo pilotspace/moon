@@ -36,12 +36,12 @@ use std::sync::atomic::AtomicUsize;
 use crate::graph::store::GraphStore;
 use crate::mq::{DurableQueueRegistry, TriggerRegistry};
 use crate::runtime::channel::MpscSender;
+use crate::shard::shared_databases::ShardStoreMemory;
 use crate::storage::Database;
 use crate::temporal::{TemporalKvIndex, TemporalRegistry};
 use crate::text::store::TextStore;
 use crate::transaction::{DeferredHnswInserts, KvWriteIntents};
 use crate::vector::store::VectorStore;
-use crate::workspace::WorkspaceRegistry;
 
 /// Per-shard owned aggregate. `!Send` by construction.
 ///
@@ -82,9 +82,6 @@ pub struct ShardSlice {
     /// Temporal KV index for versioned KV reads. Lazy-init: `None` until the
     /// first `TemporalUpsert` WAL write on this shard.
     pub temporal_kv_index: Option<Box<TemporalKvIndex>>,
-    /// Workspace registry for workspace metadata. Lazy-init: `None` until the
-    /// first `WS.CREATE` call on this shard.
-    pub workspace_registry: Option<Box<WorkspaceRegistry>>,
     /// Durable queue registry for MQ.* commands. Lazy-init: `None` until the
     /// first `MQ.CREATE` call on this shard.
     pub durable_queue_registry: Option<Box<DurableQueueRegistry>>,
@@ -100,6 +97,12 @@ pub struct ShardSlice {
     /// Phase 3 will switch the eviction tick to read this atomic instead of
     /// calling `aggregate_memory()`, which acquires per-DB read locks.
     pub estimated_memory: Arc<AtomicUsize>,
+    /// Per-shard published store-memory atomics (C5 / M4).
+    ///
+    /// Shared with `ShardDatabases::store_memory_per_shard[shard_id]`. The
+    /// shard refreshes vector/text/graph bytes on its 100ms tick; cross-thread
+    /// observers (metrics, MEMORY DOCTOR) read without locks.
+    pub store_memory: Arc<ShardStoreMemory>,
     /// Makes `ShardSlice` unconditionally `!Send` and `!Sync`.
     ///
     /// `Rc<()>` is neither `Send` nor `Sync`, so any type containing
@@ -125,13 +128,14 @@ pub struct ShardSliceInit {
     pub deferred_hnsw_inserts: DeferredHnswInserts,
     pub temporal_registry: Option<Box<TemporalRegistry>>,
     pub temporal_kv_index: Option<Box<TemporalKvIndex>>,
-    pub workspace_registry: Option<Box<WorkspaceRegistry>>,
     pub durable_queue_registry: Option<Box<DurableQueueRegistry>>,
     pub trigger_registry: Option<Box<TriggerRegistry>>,
     pub wal_append_tx: Option<MpscSender<bytes::Bytes>>,
     /// A clone of `ShardDatabases::memory_per_shard[shard_id]`. The master
     /// `Arc<AtomicUsize>` lives in `ShardDatabases`; this is a second owner.
     pub estimated_memory: Arc<AtomicUsize>,
+    /// A clone of `ShardDatabases::store_memory_per_shard[shard_id]`.
+    pub store_memory: Arc<ShardStoreMemory>,
 }
 
 impl ShardSlice {
@@ -151,11 +155,11 @@ impl ShardSlice {
             deferred_hnsw_inserts: init.deferred_hnsw_inserts,
             temporal_registry: init.temporal_registry,
             temporal_kv_index: init.temporal_kv_index,
-            workspace_registry: init.workspace_registry,
             durable_queue_registry: init.durable_queue_registry,
             trigger_registry: init.trigger_registry,
             wal_append_tx: init.wal_append_tx,
             estimated_memory: init.estimated_memory,
+            store_memory: init.store_memory,
             _not_send: PhantomData,
         }
     }
@@ -307,11 +311,15 @@ mod tests {
             deferred_hnsw_inserts: DeferredHnswInserts::new(),
             temporal_registry: None,
             temporal_kv_index: None,
-            workspace_registry: None,
             durable_queue_registry: None,
             trigger_registry: None,
             wal_append_tx: None,
             estimated_memory: Arc::new(AtomicUsize::new(0)),
+            store_memory: Arc::new(crate::shard::shared_databases::ShardStoreMemory {
+                vector: AtomicUsize::new(0),
+                text: AtomicUsize::new(0),
+                graph: AtomicUsize::new(0),
+            }),
         }
     }
 

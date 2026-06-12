@@ -15,6 +15,24 @@ use crate::vector::store::VectorStore;
 use crate::workspace::wal::{decode_workspace_create, decode_workspace_drop};
 use crate::workspace::{WorkspaceId, WorkspaceMetadata, WorkspaceRegistry};
 
+/// Published per-shard store-memory counters (C5 / M4).
+///
+/// Each shard's 100ms tick writes vector/text/graph resident bytes into these
+/// atomics via the existing lock path. Cross-thread observers — Prometheus
+/// publisher (metrics_setup.rs) and MEMORY DOCTOR (server_admin.rs) — read
+/// from these atomics with zero lock acquisitions.
+///
+/// Figures lag at most one tick (≤100 ms); this is documented and acceptable
+/// for observability paths.
+pub struct ShardStoreMemory {
+    /// Combined resident bytes of all VectorStore segments (mutable + immutable).
+    pub vector: AtomicUsize,
+    /// Resident bytes of TextStore indexes.
+    pub text: AtomicUsize,
+    /// Resident bytes of GraphStore CSR segments.
+    pub graph: AtomicUsize,
+}
+
 /// Thread-safe wrapper over per-shard databases.
 ///
 /// Each shard owns `db_count` databases (SELECT 0-15). The outer Vec is indexed
@@ -41,9 +59,15 @@ pub struct ShardDatabases {
     /// Per-shard TemporalKvIndex for versioned KV reads.
     /// Lazy-init: None until first TemporalUpsert WAL write.
     temporal_kv_indexes: Vec<Mutex<Option<Box<TemporalKvIndex>>>>,
-    /// Per-shard WorkspaceRegistry for workspace metadata.
-    /// Lazy-init: None until first WS.CREATE call on this shard.
-    workspace_registries: Vec<Mutex<Option<Box<WorkspaceRegistry>>>>,
+    /// Process-global WorkspaceRegistry (C3 / M3).
+    ///
+    /// Workspaces are control-plane objects looked up by every connection
+    /// regardless of which shard accepted it — a single Mutex is not a
+    /// hot-path concern (WS commands are rare). The per-shard array
+    /// (`workspace_registries`) is retired; all paths use this one field.
+    /// WAL records keep the shard-0 stream via `wal_append(0, …)` (unchanged).
+    /// Caller lazy-inits via `get_or_insert_with(|| Box::new(WorkspaceRegistry::new()))`.
+    workspace_registry: Mutex<Option<Box<WorkspaceRegistry>>>,
     /// Per-shard DurableQueueRegistry for MQ.* commands.
     /// Lazy-init: None until first MQ.CREATE call on this shard.
     durable_queue_registries: Vec<Mutex<Option<Box<DurableQueueRegistry>>>>,
@@ -77,6 +101,13 @@ pub struct ShardDatabases {
     /// `maxmemory / num_shards`. Write paths read with one Relaxed load
     /// (`elastic_budget`).
     elastic_budgets: Vec<Arc<AtomicUsize>>,
+    /// Per-shard published store-memory atomics (C5 / M4).
+    ///
+    /// The shard's 100ms tick refreshes these via the existing lock path.
+    /// Prometheus publisher and MEMORY DOCTOR read them with zero lock
+    /// acquisitions. Figures lag at most one tick (≤100 ms) — acceptable for
+    /// observability paths.
+    pub store_memory_per_shard: Box<[Arc<ShardStoreMemory>]>,
 }
 
 impl ShardDatabases {
@@ -103,7 +134,7 @@ impl ShardDatabases {
             .collect();
         let temporal_registries = (0..num_shards).map(|_| Mutex::new(None)).collect();
         let temporal_kv_indexes = (0..num_shards).map(|_| Mutex::new(None)).collect();
-        let workspace_registries = (0..num_shards).map(|_| Mutex::new(None)).collect();
+        let workspace_registry = Mutex::new(None);
         let durable_queue_registries = (0..num_shards).map(|_| Mutex::new(None)).collect();
         let trigger_registries = (0..num_shards).map(|_| Mutex::new(None)).collect();
         let kv_write_intents = (0..num_shards)
@@ -118,6 +149,16 @@ impl ShardDatabases {
         let elastic_budgets = (0..num_shards)
             .map(|_| Arc::new(AtomicUsize::new(0)))
             .collect();
+        let store_memory_per_shard = (0..num_shards)
+            .map(|_| {
+                Arc::new(ShardStoreMemory {
+                    vector: AtomicUsize::new(0),
+                    text: AtomicUsize::new(0),
+                    graph: AtomicUsize::new(0),
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
         Arc::new(Self {
             shards,
             vector_stores,
@@ -127,7 +168,7 @@ impl ShardDatabases {
             wal_append_txs,
             temporal_registries,
             temporal_kv_indexes,
-            workspace_registries,
+            workspace_registry,
             durable_queue_registries,
             trigger_registries,
             kv_write_intents,
@@ -136,6 +177,7 @@ impl ShardDatabases {
             db_count,
             memory_per_shard,
             elastic_budgets,
+            store_memory_per_shard,
         })
     }
 
@@ -232,15 +274,16 @@ impl ShardDatabases {
         self.temporal_kv_indexes[shard_id].lock()
     }
 
-    /// Acquire the GLOBAL WorkspaceRegistry lock (slot 0 of the per-shard
-    /// array). Workspaces are control-plane objects looked up by every
-    /// connection regardless of which shard accepted it, so all paths —
-    /// handlers, uring intercept, WAL replay — share one registry. WS
-    /// commands are rare; a single mutex is not a hot-path concern.
+    /// Acquire the process-global WorkspaceRegistry lock (C3 / M3).
+    ///
+    /// Workspaces are control-plane objects looked up by every connection
+    /// regardless of which shard accepted it, so all paths — handlers,
+    /// uring intercept, WAL replay — share one registry. WS commands are
+    /// rare; a single mutex is not a hot-path concern.
     /// Caller lazy-inits via `get_or_insert_with(|| Box::new(WorkspaceRegistry::new()))`.
     #[inline]
     pub fn workspace_registry(&self) -> MutexGuard<'_, Option<Box<WorkspaceRegistry>>> {
-        self.workspace_registries[0].lock()
+        self.workspace_registry.lock()
     }
 
     /// Acquire the per-shard DurableQueueRegistry lock.
@@ -277,16 +320,26 @@ impl ShardDatabases {
         self.deferred_hnsw_inserts[shard_id].lock()
     }
 
-    /// Replay WAL WorkspaceCreate and WorkspaceDrop records to restore workspace registry.
+    /// Replay WAL WorkspaceCreate and WorkspaceDrop records to restore the
+    /// process-global workspace registry (C3 / M3).
     ///
     /// Called during server startup after graph and temporal WAL replay.
-    /// Scans per-shard WAL directories for v3 segment files and processes
-    /// WorkspaceCreate/WorkspaceDrop records to restore workspace metadata.
+    /// Scans `shard-{id}/wal-v3/` (matching recovery.rs:361 convention) for
+    /// v3 segment files and processes WorkspaceCreate/WorkspaceDrop records.
+    /// All records populate the single global registry regardless of which
+    /// shard stream they came from (WS WAL records are always written via
+    /// `wal_append(0, …)`, so they live in `shard-0/wal-v3/`).
     pub fn replay_workspace_wal(&self, persistence_dir: &std::path::Path) {
-        use crate::persistence::wal_v3::record::{WalRecord, WalRecordType};
+        use crate::persistence::wal_v3::record::{WalRecord, WalRecordType, read_wal_v3_record};
+
+        let mut total_create = 0u64;
+        let mut total_drop = 0u64;
 
         for shard_id in 0..self.num_shards {
-            let wal_dir = persistence_dir.join(format!("shard-{}", shard_id));
+            // WAL v3 segments live in shard-{id}/wal-v3/ — matching recovery.rs:361.
+            let wal_dir = persistence_dir
+                .join(format!("shard-{}", shard_id))
+                .join("wal-v3");
             if !wal_dir.exists() {
                 continue;
             }
@@ -294,18 +347,20 @@ impl ShardDatabases {
             let mut create_count = 0u64;
             let mut drop_count = 0u64;
 
-            let on_command = &mut |record: &WalRecord| {
-                match record.record_type {
+            // Process a workspace WAL record payload (either a direct WorkspaceCreate/Drop
+            // record OR an inner record embedded in a Command wrapper).
+            let mut handle_record = |record_type: WalRecordType, payload: &[u8]| {
+                match record_type {
                     WalRecordType::WorkspaceCreate => {
-                        if let Some((ws_bytes, name)) = decode_workspace_create(&record.payload) {
+                        if let Some((ws_bytes, name)) = decode_workspace_create(payload) {
                             let ws_id = WorkspaceId::from_bytes(ws_bytes);
                             let meta = WorkspaceMetadata {
                                 id: ws_id,
                                 name: bytes::Bytes::from(name),
                                 created_at: 0, // WAL doesn't store created_at; use 0 as placeholder
                             };
-                            // Global registry (slot 0) — see workspace_registry().
-                            let mut guard = self.workspace_registries[0].lock();
+                            // Process-global registry (C3).
+                            let mut guard = self.workspace_registry.lock();
                             let reg =
                                 guard.get_or_insert_with(|| Box::new(WorkspaceRegistry::new()));
                             reg.insert(ws_id, meta);
@@ -313,13 +368,40 @@ impl ShardDatabases {
                         }
                     }
                     WalRecordType::WorkspaceDrop => {
-                        if let Some(ws_bytes) = decode_workspace_drop(&record.payload) {
+                        if let Some(ws_bytes) = decode_workspace_drop(payload) {
                             let ws_id = WorkspaceId::from_bytes(ws_bytes);
-                            let mut guard = self.workspace_registries[0].lock();
+                            let mut guard = self.workspace_registry.lock();
                             if let Some(reg) = guard.as_mut() {
                                 reg.remove(&ws_id);
                             }
                             drop_count += 1;
+                        }
+                    }
+                    _ => {}
+                }
+            };
+
+            let on_command = &mut |record: &WalRecord| {
+                match record.record_type {
+                    WalRecordType::WorkspaceCreate | WalRecordType::WorkspaceDrop => {
+                        // Direct workspace record — process it.
+                        handle_record(record.record_type, &record.payload);
+                    }
+                    WalRecordType::Command => {
+                        // The connection handler pre-builds a WorkspaceCreate/Drop WAL
+                        // record and sends it via wal_append(). The event loop (event_loop.rs,
+                        // spsc_handler.rs) then wraps the raw bytes in a Command (0x01) outer
+                        // record. So workspace records appear as Command records whose payload
+                        // IS a complete inner WAL v3 record.
+                        //
+                        // Decode the inner record and check if it is a workspace operation.
+                        if let Some(inner) = read_wal_v3_record(&record.payload) {
+                            match inner.record_type {
+                                WalRecordType::WorkspaceCreate | WalRecordType::WorkspaceDrop => {
+                                    handle_record(inner.record_type, &inner.payload);
+                                }
+                                _ => {} // Not a workspace record — skip
+                            }
                         }
                     }
                     _ => {} // Skip non-workspace records
@@ -327,7 +409,7 @@ impl ShardDatabases {
             };
             let on_fpi = &mut |_: &WalRecord| {};
 
-            // Scan WAL files in the shard directory
+            // Scan WAL v3 segment files in the wal-v3 subdirectory.
             if let Ok(entries) = std::fs::read_dir(&wal_dir) {
                 let mut wal_files: Vec<_> = entries
                     .filter_map(|e| e.ok())
@@ -343,14 +425,26 @@ impl ShardDatabases {
                 }
             }
 
+            total_create += create_count;
+            total_drop += drop_count;
+
             if create_count > 0 || drop_count > 0 {
                 tracing::info!(
-                    "Shard {}: replayed {} WorkspaceCreate + {} WorkspaceDrop WAL records",
+                    "Shard {}: replayed {} WorkspaceCreate + {} WorkspaceDrop WAL records \
+                     into global registry",
                     shard_id,
                     create_count,
                     drop_count,
                 );
             }
+        }
+
+        if total_create > 0 || total_drop > 0 {
+            tracing::info!(
+                "Workspace WAL replay complete: {} creates, {} drops across all shards",
+                total_create,
+                total_drop,
+            );
         }
     }
 
@@ -894,6 +988,62 @@ impl ShardDatabases {
         let mut guard_lo = self.shards[shard_id][lo].write();
         let mut guard_hi = self.shards[shard_id][hi].write();
         std::mem::swap(&mut *guard_lo, &mut *guard_hi);
+    }
+
+    /// Read the last published KV memory for a single shard with one Relaxed
+    /// load. Lock-free. Returns the value written by the most recent
+    /// `publish_memory(shard_id, …)` call — zero until the first 100ms tick.
+    ///
+    /// Used by the eviction tick (persistence_tick.rs) as a lock-free
+    /// replacement for `aggregate_memory(shard_id)` in pressure-check paths
+    /// (C5 / Phase 3).
+    #[inline]
+    pub fn published_shard_memory(&self, shard_id: usize) -> usize {
+        self.memory_per_shard[shard_id].load(Ordering::Relaxed)
+    }
+
+    /// Return a clone of the `Arc<ShardStoreMemory>` for `shard_id`.
+    ///
+    /// Called once at shard startup to hand the `Arc` into `ShardSliceInit`.
+    /// The master copy lives in `store_memory_per_shard`; the slice holds a
+    /// second owner and calls `store()` on the atomics on its 100ms tick.
+    #[inline]
+    pub fn store_memory_publisher(&self, shard_id: usize) -> Arc<ShardStoreMemory> {
+        self.store_memory_per_shard[shard_id].clone()
+    }
+
+    /// Publish this shard's vector/text/graph memory usage into the per-shard
+    /// atomics (C5).
+    ///
+    /// Called from the shard's 100ms persistence/elastic tick AFTER acquiring
+    /// the store locks (existing lock path — Wave E will collapse to slice).
+    /// Observers (metrics, MEMORY DOCTOR) read these atomics without locks.
+    pub fn publish_store_memory(&self, shard_id: usize) {
+        // VectorStore: sum mutable + immutable resident bytes.
+        {
+            let vs = self.vector_stores[shard_id].lock();
+            let (mutable, immutable) = vs.resident_bytes();
+            self.store_memory_per_shard[shard_id]
+                .vector
+                .store(mutable + immutable, Ordering::Relaxed);
+        }
+
+        // TextStore: TextStore has no aggregate resident_bytes API yet.
+        // Observers (metrics, MEMORY DOCTOR) do not currently report text
+        // memory, so publishing 0 is a safe placeholder until a store-level
+        // memory accessor is added (Wave E).
+        self.store_memory_per_shard[shard_id]
+            .text
+            .store(0, Ordering::Relaxed);
+
+        // GraphStore: resident bytes (cfg-gated; zero when graph feature off).
+        #[cfg(feature = "graph")]
+        {
+            let gs = self.graph_stores[shard_id].read();
+            self.store_memory_per_shard[shard_id]
+                .graph
+                .store(gs.resident_bytes(), Ordering::Relaxed);
+        }
     }
 }
 

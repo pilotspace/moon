@@ -383,37 +383,34 @@ fn memory_doctor() -> Frame {
     let rss = crate::admin::metrics_setup::get_rss_bytes() as usize;
     let vsz = get_vsz_bytes();
 
-    // ── Gather per-subsystem resident bytes ──────────────────────────────
-    let mut dashtable_bytes: usize = 0;
-    let mut hnsw_bytes: usize = 0;
-    let mut sealed_bytes: usize = 0;
-    #[cfg_attr(not(feature = "graph"), allow(unused_mut))]
-    let mut csr_bytes: usize = 0;
+    // ── Gather per-subsystem resident bytes (C5 / M4 — lock-free atomics) ──
+    // KV and store memory are read from published per-shard atomics. Figures
+    // lag at most one 100ms tick — acceptable for an on-demand diagnostic.
+    use std::sync::atomic::Ordering;
+    let dashtable_bytes: usize;
+    let hnsw_bytes: usize;
+    let sealed_bytes: usize = 0; // combined into hnsw_bytes from vector atomic
+    #[cfg_attr(not(feature = "graph"), allow(unused_variables))]
+    let csr_bytes: usize;
     let wal_bytes: usize = 0;
 
     if let Some(shard_dbs) = crate::admin::metrics_setup::get_global_shard_databases() {
-        let num_shards = shard_dbs.num_shards();
-        for shard_id in 0..num_shards {
-            // Database + DashTable (DB 0 only — the hot database)
-            let db_guard = shard_dbs.read_db(shard_id, 0);
-            dashtable_bytes += db_guard.resident_bytes();
-            dashtable_bytes += db_guard.data().resident_bytes();
-            drop(db_guard);
+        // KV memory: sum of per-shard published atomics. Lock-free.
+        dashtable_bytes = shard_dbs.read_memory_sum();
 
-            // VectorStore: (mutable/hnsw, immutable/sealed)
-            let vs = shard_dbs.vector_store(shard_id);
-            let (mutable, immutable) = vs.resident_bytes();
-            hnsw_bytes += mutable;
-            sealed_bytes += immutable;
-            drop(vs);
-
-            // GraphStore (CSR)
-            #[cfg(feature = "graph")]
-            {
-                let gs = shard_dbs.graph_store_read(shard_id);
-                csr_bytes += gs.resident_bytes();
-            }
+        // Store memory: sum published per-shard vector/graph atomics.
+        let mut vec_total = 0usize;
+        let mut csr_total = 0usize;
+        for mem in shard_dbs.store_memory_per_shard.iter() {
+            vec_total += mem.vector.load(Ordering::Relaxed);
+            csr_total += mem.graph.load(Ordering::Relaxed);
         }
+        hnsw_bytes = vec_total;
+        csr_bytes = csr_total;
+    } else {
+        dashtable_bytes = 0;
+        hnsw_bytes = 0;
+        csr_bytes = 0;
     }
 
     // Replication backlog via global state (same pattern as INFO replication).

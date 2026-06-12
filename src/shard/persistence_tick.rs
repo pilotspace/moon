@@ -341,11 +341,30 @@ pub(crate) fn run_eviction_tick(
     {
         let rt = runtime_config.read();
         if rt.maxmemory > 0 {
-            let used = shard_databases.aggregate_memory(shard_id);
+            // C5 / Phase 3: compute per-shard KV memory without lock acquisitions.
+            // Use the slice path if the shard is initialized (avoids per-DB
+            // read locks), otherwise fall back to the previously-published
+            // atomic value (zero on the very first tick — acceptable; the
+            // elastic budget is a best-effort heuristic, not a hard limit).
+            let used = if crate::shard::slice::is_initialized() {
+                crate::shard::slice::with_shard(|s| {
+                    s.databases
+                        .iter()
+                        .map(|db| db.estimated_memory())
+                        .sum::<usize>()
+                })
+            } else {
+                shard_databases.published_shard_memory(shard_id)
+            };
             shard_databases.publish_memory(shard_id, used);
             shard_databases.recompute_elastic_budget(shard_id, &rt);
         }
     }
+
+    // C5 / M4: publish vector/text/graph store memory for lock-free observers.
+    // Uses the existing lock path (Wave E collapses to slice). Runs every tick
+    // so Prometheus and MEMORY DOCTOR never see stale zero values for long.
+    shard_databases.publish_store_memory(shard_id);
 
     if server_config.disk_offload_enabled()
         && should_run_pressure_cascade(runtime_config, server_config, shard_databases, shard_id)
@@ -496,7 +515,9 @@ pub(crate) fn should_run_pressure_cascade(
         elastic => elastic.min(rt.maxmemory),
     };
     let threshold = (budget as f64 * server_config.disk_offload_threshold) as usize;
-    let used = shard_databases.aggregate_memory(shard_id);
+    // C5 / Phase 3: read the already-published per-shard KV memory (written
+    // earlier this same tick by `run_eviction_tick`). Lock-free Relaxed load.
+    let used = shard_databases.published_shard_memory(shard_id);
     used > threshold
 }
 
@@ -585,8 +606,9 @@ pub(crate) fn handle_memory_pressure(
     {
         let rt = runtime_config.read();
         if rt.maxmemory > 0 {
-            // Compute aggregate BEFORE acquiring write locks (same pattern as handler_sharded).
-            let total_mem = shard_databases.aggregate_memory(shard_id);
+            // C5 / Phase 3: read the already-published per-shard KV memory
+            // (written earlier this same tick). Lock-free Relaxed load.
+            let total_mem = shard_databases.published_shard_memory(shard_id);
             // GAP-1: hot shards evict against their elastic budget (idle
             // siblings' donated headroom), not the static maxmemory/N.
             let budget = match shard_databases.elastic_budget(shard_id) {
