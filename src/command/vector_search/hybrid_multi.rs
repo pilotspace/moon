@@ -58,6 +58,13 @@ pub struct ShardHybridReply {
 /// three separate ranked lists (bm25, dense, sparse), each locally truncated
 /// to `top_k` but UNFUSED. The coordinator performs the single RRF call.
 ///
+/// CHANGE F2: when `filter` is `Some`, applies the filter to all three raw
+/// streams BEFORE returning them. The allowlist is computed from THIS shard's
+/// own `text_index` (doc_ids are shard-local — the allowlist CANNOT be
+/// computed at the coordinator). Filtering happens pre-return, NOT after
+/// coordinator `rrf_fuse_three` — post-fusion filtering would reintroduce
+/// k-starvation (filtered-out hits would consume fused-window slots).
+///
 /// Errors (all returned as `Frame::Error`, never panic):
 /// - Unknown index → `"ERR unknown index"`
 /// - Index has no TEXT fields → propagated via `execute_query_on_index`
@@ -78,6 +85,7 @@ pub fn execute_hybrid_search_local_raw_streams(
     global_df: &std::collections::HashMap<String, u32>,
     global_n: u32,
     as_of_lsn: u64,
+    filter: Option<&crate::command::vector_search::hybrid::HybridFilter>,
 ) -> Frame {
     // ── Stream 1: BM25 with injected global IDF ──────────────────────────────
     let text_index = match text_store.get_index(index_name.as_ref()) {
@@ -93,15 +101,15 @@ pub fn execute_hybrid_search_local_raw_streams(
     // v0.1.10 G-1: multi-shard hybrid BM25 honours `as_of_lsn` via the
     // MVCC visibility filter on TextIndex. Parity with the single-shard
     // fast path in hybrid.rs.
-    let text_results = crate::command::vector_search::ft_text_search::execute_query_on_index_as_of(
-        text_index,
-        &clause,
-        Some(global_df),
-        Some(global_n),
-        k_per_stream,
-        as_of_lsn,
-    );
-    let bm25 = bm25_to_search_results(&text_results);
+    let mut text_results =
+        crate::command::vector_search::ft_text_search::execute_query_on_index_as_of(
+            text_index,
+            &clause,
+            Some(global_df),
+            Some(global_n),
+            k_per_stream,
+            as_of_lsn,
+        );
 
     // ── Stream 2: dense KNN ──────────────────────────────────────────────────
     // Phase 171 HYB-02 / SCAT-02: snapshot the committed treemap BEFORE
@@ -114,7 +122,7 @@ pub fn execute_hybrid_search_local_raw_streams(
         Some(ix) => ix,
         None => return Frame::Error(Bytes::from_static(b"ERR unknown index")),
     };
-    let (dense_results, key_hash_to_key) = match run_dense_knn(
+    let (mut dense_results, key_hash_to_key) = match run_dense_knn(
         idx,
         dense_field,
         dense_blob,
@@ -127,7 +135,7 @@ pub fn execute_hybrid_search_local_raw_streams(
     };
 
     // ── Stream 3: sparse (optional) ──────────────────────────────────────────
-    let sparse_results: Vec<SearchResult> = if let Some((sf, sblob)) = sparse {
+    let mut sparse_results: Vec<SearchResult> = if let Some((sf, sblob)) = sparse {
         match idx.sparse_stores.get(sf.as_ref()) {
             Some(store) => {
                 let pairs = parse_sparse_query_blob(sblob);
@@ -145,6 +153,28 @@ pub fn execute_hybrid_search_local_raw_streams(
     } else {
         Vec::new()
     };
+
+    // ── CHANGE F2: pre-return per-shard filter application ───────────────────
+    //
+    // Apply the filter against THIS shard's text_index (shard-local doc_ids).
+    // Must happen BEFORE truncation and encode, not at the coordinator after
+    // rrf_fuse_three — post-fusion filtering reintroduces k-starvation.
+    #[cfg(feature = "text-index")]
+    if let Some(f) = filter {
+        use crate::command::vector_search::hybrid_filter::{
+            eval_filter, filter_bm25_results, filter_vector_results,
+        };
+        let allowlist = eval_filter(f, text_index);
+        filter_bm25_results(&mut text_results, &allowlist);
+        filter_vector_results(&mut dense_results, &text_index.key_hash_to_doc_id, &allowlist);
+        filter_vector_results(
+            &mut sparse_results,
+            &text_index.key_hash_to_doc_id,
+            &allowlist,
+        );
+    }
+
+    let bm25 = bm25_to_search_results(&text_results);
 
     // Truncate each stream to top_k locally — shard does NOT fuse them.
     let bm25: Vec<SearchResult> = bm25.into_iter().take(top_k).collect();
@@ -384,6 +414,7 @@ mod tests {
             &empty_df,
             0,
             0,
+            None,
         );
         match result {
             Frame::Error(msg) => {
