@@ -21,6 +21,8 @@ pub mod graph_expand;
 pub mod helpers;
 pub mod hybrid;
 #[cfg(feature = "text-index")]
+pub mod hybrid_filter;
+#[cfg(feature = "text-index")]
 pub mod hybrid_multi;
 #[cfg(feature = "graph")]
 pub mod navigate;
@@ -51,7 +53,7 @@ pub use ft_text_search::{
     summarize_field,
 };
 pub use helpers::{metric_to_bytes, quantization_to_bytes, quantize_f32_to_sq};
-pub use hybrid::{HybridQuery, HybridQueryPartial, parse_hybrid_modifier};
+pub use hybrid::{HybridFilter, HybridQuery, HybridQueryPartial, parse_hybrid_modifier};
 #[cfg(feature = "text-index")]
 pub use hybrid_multi::{
     KeyedResult, ShardHybridReply, decode_shard_hybrid_partial, encode_shard_hybrid_partial,
