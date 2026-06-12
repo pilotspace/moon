@@ -6,6 +6,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — HYBRID FT.SEARCH `FILTER` push-down on both branches (PR #174)
+
+`FT.SEARCH ... HYBRID` now accepts an optional `FILTER` clause that is
+applied to **both** the BM25 and the dense-KNN streams *before* RRF
+fusion, closing a bypass where a filtered hybrid query leaked
+foreign-field hits through the unfiltered dense branch. The filter is a
+recursive, arity-counted grammar — `TAG @field value` (exact, or prefix
+when `value` ends in `*`), `NUMERIC @field min max` (inclusive range),
+and `AND`/`OR` combinators — bounded at depth 4 / 16 leaves and parsed
+without panicking on malformed input. Filtering is per-shard on the
+scatter/gather path, so multi-shard results stay correct. Absent a
+`FILTER` clause the wire format and behavior are byte-identical to
+before (fully backward compatible). Exposed through the Rust SDK as
+`TextClient::hybrid_search(..., filter: Option<&HybridFilter>)`.
+
 ### Fixed — Cross-shard commands now route to the owning shard (PR #173)
 
 On multi-shard servers, SO_REUSEPORT spreads client connections across
