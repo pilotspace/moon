@@ -275,6 +275,59 @@ impl AofWriterPool {
         }
     }
 
+    /// Durability barrier for cross-shard pipelined writes under
+    /// `appendfsync=always` (H1 fix, C4-FOLD-FIX follow-up).
+    ///
+    /// **Why this exists:** the C4-FOLD-FIX moved AOF appends for cross-shard
+    /// writes into the SPSC arm (fire-and-forget `try_send_append`) so the
+    /// append is in the AOF channel *before* the response slot is filled —
+    /// required to keep AofFold's `pending_aof_count` accurate. The former
+    /// handler code that awaited `try_send_append_durable` was removed to
+    /// prevent double-apply on restart. However that removal also stripped the
+    /// H1 durability guarantee: under `appendfsync=always` the connection
+    /// handler was replying `+OK` without confirming fsync.
+    ///
+    /// **What this does:** after all cross-shard responses have been collected,
+    /// the handler calls this method ONCE per distinct target shard. Under
+    /// `Always` it enqueues a zero-length `AppendSync` into the target shard's
+    /// AOF writer channel and awaits the fsync ack with the same F2
+    /// bounded-await as `try_send_append_durable`. Because the writer processes
+    /// messages in order, an acked barrier proves all prior `Append` messages
+    /// to that shard are also durable. Under `EverySec`/`No` it returns
+    /// `Ok(())` immediately (zero cost — one `match` on a field).
+    ///
+    /// **Zero-length AppendSync in the writer:** the per-shard writers (and
+    /// the rewrite mid-drain) recognize an empty payload as a barrier and
+    /// write NOTHING to disk — they fsync and ack only. This matters: a len=0
+    /// framed header would otherwise be parsed by `replay_incr_framed` as a
+    /// corrupt entry (empty RESP payload → `Ok(None)` → RewriteFailed) and
+    /// brick the next boot. `replay_incr_framed` additionally skips len=0
+    /// records as defense-in-depth.
+    ///
+    /// **Failure handling:** returns `Err(AofAck)` on the Always path if the
+    /// writer task has died, the channel is full, or the fsync timed out.
+    /// Callers MUST overwrite all cross-shard write responses with
+    /// `Frame::Error(AOF_FSYNC_ERR)` on `Err` — identical to the local-shard
+    /// durable path.
+    #[inline]
+    pub async fn fsync_barrier(&self, shard_id: usize) -> Result<(), AofAck> {
+        match self.fsync_policy {
+            FsyncPolicy::Always => {
+                // Enqueue a zero-length AppendSync. The writer will fsync all
+                // preceding Append messages (ordered channel) then ack Synced.
+                let rx = self.try_send_append_sync(shard_id, 0, Bytes::new());
+                // F2 bounded await — same semantics as try_send_append_durable.
+                match Self::await_ack(rx, self.fsync_timeout).await {
+                    AckOutcome::Ack(AofAck::Synced) => Ok(()),
+                    AckOutcome::Ack(other) => Err(other),
+                    AckOutcome::Disconnected => Err(AofAck::WriteFailed),
+                    AckOutcome::TimedOut => Err(AofAck::FsyncFailed),
+                }
+            }
+            FsyncPolicy::EverySec | FsyncPolicy::No => Ok(()),
+        }
+    }
+
     /// Await an `AppendSync` ack receiver under a bounded timeout (F2).
     ///
     /// `timeout == Duration::ZERO` preserves the legacy unbounded await
@@ -1129,6 +1182,51 @@ mod pool_tests {
         );
     }
 
+    /// H1-BARRIER: a zero-length AppendSync (fsync barrier) drained during a
+    /// rewrite must write NOTHING to the incr file — a len=0 framed header is
+    /// rejected by `replay_incr_framed` as corruption and bricks the next boot.
+    /// It still counts toward `drained` (the fold's `pending_aof_count` is a
+    /// channel-message count) and its ack still parks for the boundary fsync.
+    #[test]
+    fn drain_framed_barrier_writes_no_bytes_but_parks_ack() {
+        let tmp = tempfile::tempdir().unwrap();
+        let incr = tmp.path().join("incr.aof");
+        let (tx0, rx0) = channel::mpsc_bounded::<AofMessage>(4);
+        let (tx1, _rx1) = channel::mpsc_bounded::<AofMessage>(4);
+        let pool = AofWriterPool::per_shard(vec![tx0, tx1]);
+
+        // A real append followed by a barrier (empty payload).
+        pool.try_send_append(0, 5, Bytes::from_static(b"*1\r\n$4\r\nPING\r\n"));
+        let barrier_recv = pool.try_send_append_sync(0, 0, Bytes::new());
+
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&incr)
+            .unwrap();
+        let mut outcome = drain_pending_appends_framed(&rx0, &mut file, usize::MAX).unwrap();
+
+        assert_eq!(outcome.drained, 2, "both messages count toward drained");
+        assert_eq!(outcome.pending_acks.len(), 1, "barrier ack parked");
+
+        // On disk: ONLY the real append's framed record (12-byte header + 14
+        // payload bytes). The barrier must leave no trace.
+        file.sync_data().unwrap();
+        let on_disk = std::fs::read(&incr).unwrap();
+        assert_eq!(
+            on_disk.len(),
+            12 + 14,
+            "barrier must write no header/payload; got {} bytes",
+            on_disk.len()
+        );
+
+        outcome.fulfill_acks(true);
+        assert_eq!(
+            barrier_recv.recv_blocking().expect("ack resolves"),
+            AofAck::Synced
+        );
+    }
+
     /// Issue #140 failure path: if the rewrite-boundary fsync FAILS, a drained
     /// AppendSync must resolve `FsyncFailed`, never `Synced`. Exercises the
     /// non-framed `drain_pending_appends` — the DEFAULT `--shards 1` rewrite
@@ -1562,6 +1660,107 @@ mod pool_tests {
             result.is_ok(),
             "EverySec policy must be fire-and-forget (Ok), got {:?}",
             result
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // H1-BARRIER-1: fsync_barrier under EverySec must be a zero-cost noop —
+    // no message enqueued, channel stays empty, returns Ok(()) immediately.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn fsync_barrier_everysec_is_noop() {
+        let (tx0, rx0) = channel::mpsc_bounded::<AofMessage>(4);
+        let (tx1, _rx1) = channel::mpsc_bounded::<AofMessage>(4);
+        let pool = AofWriterPool::per_shard_with_policy(
+            vec![tx0, tx1],
+            FsyncPolicy::EverySec,
+            Duration::ZERO,
+        );
+
+        let result = futures::executor::block_on(pool.fsync_barrier(0));
+
+        assert!(
+            result.is_ok(),
+            "fsync_barrier under EverySec must return Ok immediately, got {:?}",
+            result
+        );
+        // No AppendSync must have been enqueued — channel stays empty.
+        assert!(
+            rx0.try_recv().is_err(),
+            "fsync_barrier under EverySec must NOT enqueue any message"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // H1-BARRIER-2: fsync_barrier under Always with a writer that acks Synced
+    // must return Ok(()).
+    // -----------------------------------------------------------------------
+    #[cfg(feature = "runtime-tokio")]
+    #[tokio::test]
+    async fn fsync_barrier_always_writer_acks_synced_returns_ok() {
+        let (tx0, rx0) = channel::mpsc_bounded::<AofMessage>(4);
+        let (tx1, _rx1) = channel::mpsc_bounded::<AofMessage>(4);
+        let pool = AofWriterPool::per_shard_with_policy(
+            vec![tx0, tx1],
+            FsyncPolicy::Always,
+            Duration::from_millis(500),
+        );
+
+        // Spawn a mock writer that receives the AppendSync barrier and acks Synced.
+        tokio::spawn(async move {
+            if let Ok(AofMessage::AppendSync { bytes, ack, .. }) = rx0.recv_async().await {
+                // The barrier sends a zero-length payload — verify it.
+                assert!(
+                    bytes.is_empty(),
+                    "fsync_barrier must send zero-length AppendSync, got {} bytes",
+                    bytes.len()
+                );
+                let _ = ack.send(AofAck::Synced);
+            }
+        });
+
+        let result = pool.fsync_barrier(0).await;
+        assert_eq!(
+            result,
+            Ok(()),
+            "fsync_barrier with Synced ack must return Ok"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // H1-BARRIER-3: fsync_barrier under Always with dead writer (ack dropped)
+    // must return Err(WriteFailed). Mirrors
+    // try_send_append_durable_always_writer_dead_returns_write_failed.
+    // -----------------------------------------------------------------------
+    #[test]
+    fn fsync_barrier_always_dead_writer_returns_write_failed() {
+        let (tx0, rx0) = channel::mpsc_bounded::<AofMessage>(4);
+        let (tx1, _rx1) = channel::mpsc_bounded::<AofMessage>(4);
+        let pool = AofWriterPool::per_shard_with_policy(
+            vec![tx0, tx1],
+            FsyncPolicy::Always,
+            Duration::ZERO, // legacy unbounded await — disconnect resolves it
+        );
+
+        // Spawn a thread that pulls the AppendSync but drops ack — simulating
+        // a crashed writer.
+        let handle = std::thread::spawn(move || match rx0.recv() {
+            Ok(AofMessage::AppendSync { ack, .. }) => drop(ack),
+            other => panic!("unexpected message: {:?}", other.is_ok()),
+        });
+
+        let result = futures::executor::block_on(pool.fsync_barrier(0));
+
+        handle.join().expect("ack dropper thread");
+
+        assert!(
+            result.is_err(),
+            "fsync_barrier with dead writer must return Err, got Ok"
+        );
+        assert_eq!(
+            result.unwrap_err(),
+            AofAck::WriteFailed,
+            "dead writer must resolve to WriteFailed"
         );
     }
 }

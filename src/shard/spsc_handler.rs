@@ -807,13 +807,17 @@ pub(crate) fn handle_shard_message_shared(
                             replica_txs,
                             repl_state,
                             shard_id,
-                            // FIX-W1-2 r2: PipelineBatch AOF is written by the
-                            // connection handler coordinator AFTER collecting the
-                            // shard response (handler_monoio/mod.rs:2004,
-                            // handler_sharded/mod.rs:1703). Passing aof_pool here
-                            // would cause a second write to the same shard's AOF
-                            // file, doubling every cross-shard pipeline entry.
-                            None,
+                            // C4-FOLD-FIX: AOF append MUST happen here (in the SPSC arm,
+                            // before the response is sent) so the append is already in the
+                            // AOF channel when AofFold reads sender.len(). Moving the append
+                            // to the connection handler (after awaiting the response) defers
+                            // it until AFTER drain_spsc_shared returns, so AofFold's
+                            // pending_aof_count undercount by ≥1 and that append escapes
+                            // into the NEW incr → double-apply on restart (+1 after
+                            // restart observed in test_ssm4a_fold_4shard_experimental).
+                            // The handler_monoio cross-shard AOF write is removed to avoid
+                            // the double-write that was the original reason for None.
+                            aof_pool, // FIX-C4-FOLD
                         );
                     }
 
@@ -1106,12 +1110,18 @@ pub(crate) fn handle_shard_message_shared(
                             replica_txs,
                             repl_state,
                             shard_id,
-                            // FIX-W1-2 r2: PipelineBatchSlotted AOF is written by the
-                            // connection-handler coordinator after collecting the shard
-                            // response (handler_sharded/mod.rs:1703). Passing aof_pool
-                            // here produces a duplicate AOF entry for every cross-shard
-                            // pipeline command (double-write P0 bug).
-                            None,
+                            // C4-FOLD-FIX: AOF append MUST happen here, before the
+                            // response_slot is filled, so the append is already in the
+                            // AOF channel when AofFold reads sender.len(). Deferring to
+                            // the connection handler (after slot.fill wakes the handler
+                            // task) means the append arrives AFTER drain_spsc_shared
+                            // returns and AFTER AofFold's sender.len() snapshot, so
+                            // pending_aof_count undercounts by ≥1 → that append escapes
+                            // into the NEW incr → double-apply on restart (+1 observed
+                            // in test_ssm4a_fold_4shard_experimental). The handler's
+                            // cross-shard AOF write (handler_sharded/mod.rs) is removed
+                            // to avoid the double-write this None guard was preventing.
+                            aof_pool, // FIX-C4-FOLD
                         );
                     }
 
@@ -1708,9 +1718,7 @@ pub(crate) fn handle_shard_message_shared(
             // pending messages are pre-snapshot appends. The AOF writer uses this
             // count as the phase-3 mid-drain bound, preventing an infinite drain
             // loop under sustained high write load where the channel never empties.
-            let pending_aof_count = aof_pool
-                .map(|p| p.sender(shard_id).len())
-                .unwrap_or(0);
+            let pending_aof_count = aof_pool.map(|p| p.sender(shard_id).len()).unwrap_or(0);
             let now_ms = crate::storage::entry::current_time_ms();
             let snapshot = crate::shard::slice::with_shard(|s| {
                 let mut dbs = Vec::with_capacity(s.databases.len());
@@ -1724,7 +1732,10 @@ pub(crate) fn handle_shard_message_shared(
                     }
                     dbs.push((entries, base_ts));
                 }
-                crate::shard::dispatch::AofFoldSnapshot { dbs, pending_aof_count }
+                crate::shard::dispatch::AofFoldSnapshot {
+                    dbs,
+                    pending_aof_count,
+                }
             });
             // Ignore send failure: the AOF writer dropped its receiver
             // (e.g. rewrite aborted) — the snapshot is simply discarded.

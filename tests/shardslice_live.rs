@@ -717,13 +717,6 @@ fn aof_fold_exactly_once(shards: u32, extra: &[&str]) {
                 if matches!(c.cmd_s(&["INCR", "ssm4a:ctr"]), Resp::Int(_)) {
                     count_clone.fetch_add(1, Ordering::Relaxed);
                 }
-                // Throttle to ~100 INCR/s so the AOF append channel (capacity
-                // 10 000) is never saturated during the fold window.  At 100/s
-                // the channel takes 100 s to fill — far longer than the ~20 s
-                // needed for the per-shard fold to complete.  At 1 000/s the
-                // channel filled in ~10 s, causing drops that silently lost
-                // INCRs and failed the post-restart durability assertion.
-                std::thread::sleep(std::time::Duration::from_micros(10_000));
             }
         });
 

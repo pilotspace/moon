@@ -628,26 +628,32 @@ pub async fn per_shard_aof_writer_task(
                                 let _ = ack.send(AofAck::WriteFailed);
                                 continue;
                             }
-                            let mut header = [0u8; 12];
-                            header[..8].copy_from_slice(&lsn.to_le_bytes());
-                            header[8..].copy_from_slice(&(data.len() as u32).to_le_bytes());
-                            if let Err(e) = writer.write_all(&header).await {
-                                error!(
-                                    "AOF AppendSync header write error shard {}: {}",
-                                    shard_id, e
-                                );
-                                write_error = true;
-                                let _ = ack.send(AofAck::WriteFailed);
-                                continue;
-                            }
-                            if let Err(e) = writer.write_all(&data).await {
-                                error!(
-                                    "AOF AppendSync write error shard {}: {}",
-                                    shard_id, e
-                                );
-                                write_error = true;
-                                let _ = ack.send(AofAck::WriteFailed);
-                                continue;
+                            // H1-BARRIER: a zero-length AppendSync is an fsync
+                            // barrier (pool::fsync_barrier) — fsync + ack only,
+                            // NO on-disk record. A len=0 framed header would make
+                            // replay_incr_framed reject the file as corrupt.
+                            if !data.is_empty() {
+                                let mut header = [0u8; 12];
+                                header[..8].copy_from_slice(&lsn.to_le_bytes());
+                                header[8..].copy_from_slice(&(data.len() as u32).to_le_bytes());
+                                if let Err(e) = writer.write_all(&header).await {
+                                    error!(
+                                        "AOF AppendSync header write error shard {}: {}",
+                                        shard_id, e
+                                    );
+                                    write_error = true;
+                                    let _ = ack.send(AofAck::WriteFailed);
+                                    continue;
+                                }
+                                if let Err(e) = writer.write_all(&data).await {
+                                    error!(
+                                        "AOF AppendSync write error shard {}: {}",
+                                        shard_id, e
+                                    );
+                                    write_error = true;
+                                    let _ = ack.send(AofAck::WriteFailed);
+                                    continue;
+                                }
                             }
                             // Test-only: skip real fsync and return FsyncFailed
                             // immediately when the fault-injection env var is set.
@@ -876,26 +882,32 @@ pub async fn per_shard_aof_writer_task(
                         let _ = ack.send(AofAck::WriteFailed);
                         continue;
                     }
-                    let mut header = [0u8; 12];
-                    header[..8].copy_from_slice(&lsn.to_le_bytes());
-                    header[8..].copy_from_slice(&(data.len() as u32).to_le_bytes());
-                    if let Err(e) = file.write_all(&header) {
-                        error!(
-                            "AOF AppendSync header write failed shard {} (seq {}): {}",
-                            shard_id, manifest.seq, e
-                        );
-                        write_error = true;
-                        let _ = ack.send(AofAck::WriteFailed);
-                        continue;
-                    }
-                    if let Err(e) = file.write_all(&data) {
-                        error!(
-                            "AOF AppendSync write failed shard {} (seq {}): {}",
-                            shard_id, manifest.seq, e
-                        );
-                        write_error = true;
-                        let _ = ack.send(AofAck::WriteFailed);
-                        continue;
+                    // H1-BARRIER: a zero-length AppendSync is an fsync barrier
+                    // (pool::fsync_barrier) — fsync + ack only, NO on-disk
+                    // record. A len=0 framed header would make
+                    // replay_incr_framed reject the file as corrupt.
+                    if !data.is_empty() {
+                        let mut header = [0u8; 12];
+                        header[..8].copy_from_slice(&lsn.to_le_bytes());
+                        header[8..].copy_from_slice(&(data.len() as u32).to_le_bytes());
+                        if let Err(e) = file.write_all(&header) {
+                            error!(
+                                "AOF AppendSync header write failed shard {} (seq {}): {}",
+                                shard_id, manifest.seq, e
+                            );
+                            write_error = true;
+                            let _ = ack.send(AofAck::WriteFailed);
+                            continue;
+                        }
+                        if let Err(e) = file.write_all(&data) {
+                            error!(
+                                "AOF AppendSync write failed shard {} (seq {}): {}",
+                                shard_id, manifest.seq, e
+                            );
+                            write_error = true;
+                            let _ = ack.send(AofAck::WriteFailed);
+                            continue;
+                        }
                     }
                     // Test-only: skip real fsync and return FsyncFailed
                     // immediately when the fault-injection env var is set.
@@ -960,7 +972,7 @@ pub async fn per_shard_aof_writer_task(
                             write_error = true;
                         } else {
                             crate::admin::metrics_setup::record_aof_fsync(
-                                t.elapsed().as_micros() as u64,
+                                t.elapsed().as_micros() as u64
                             );
                         }
                     }
@@ -1034,8 +1046,7 @@ pub async fn per_shard_aof_writer_task(
                                 // Back-date last_fsync by 900ms: the proactive check
                                 // (threshold=1s) fires within the next 100ms, covering
                                 // any appends that arrived after the drain above.
-                                last_fsync = Instant::now()
-                                    - std::time::Duration::from_millis(900);
+                                last_fsync = Instant::now() - std::time::Duration::from_millis(900);
                             }
                         }
                     }
@@ -1051,7 +1062,10 @@ pub async fn per_shard_aof_writer_task(
                     }
                     info!(
                         "AOF writer shard {} shutting down (monoio, seq {}, processed {} appends in {:.3}s)",
-                        shard_id, manifest.seq, _dbg_processed, _dbg_start.elapsed().as_secs_f64()
+                        shard_id,
+                        manifest.seq,
+                        _dbg_processed,
+                        _dbg_start.elapsed().as_secs_f64()
                     );
                     break;
                 }

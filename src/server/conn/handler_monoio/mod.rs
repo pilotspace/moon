@@ -1795,45 +1795,41 @@ pub(crate) async fn handle_connection_sharded_monoio<
                         continue;
                     }
                 };
+                // H1-BARRIER: collect write resp_idxs before consuming meta
+                // so we can overwrite them if the fsync barrier fails.
+                let mut write_resp_idxs: Vec<usize> = Vec::new();
                 for ((resp_idx, aof_bytes, cmd_name), resp) in meta.into_iter().zip(shard_responses)
                 {
-                    // AOF logging for successful remote writes.
-                    // Owner shard is `target` (NOT ctx.shard_id) — under PerShard
-                    // layout the write must land in the target shard's AOF file
-                    // since that shard owns the mutated data. Mirrors the
-                    // load-bearing fix at handler_sharded/mod.rs:1651.
-                    if let Some(bytes) = aof_bytes {
-                        if !matches!(resp, Frame::Error(_)) {
-                            if let Some(ref pool) = ctx.aof_pool {
-                                // Cross-shard write: LSN must be sourced
-                                // using `target`'s shard_id so the
-                                // per-shard offset increment lands on the
-                                // shard that owns the mutated data.
-                                let lsn = aof::AofWriterPool::issue_append_lsn(
-                                    &ctx.repl_state,
-                                    target,
-                                    bytes.len(),
-                                );
-                                // H1: durable path under appendfsync=always.
-                                if pool
-                                    .try_send_append_durable(target, lsn, bytes)
-                                    .await
-                                    .is_err()
-                                {
-                                    let err = Frame::Error(Bytes::from_static(aof::AOF_FSYNC_ERR));
-                                    let err = apply_resp3_conversion(
-                                        &cmd_name,
-                                        err,
-                                        conn.protocol_version,
-                                    );
-                                    responses[resp_idx] = err;
-                                    continue;
-                                }
+                    // C4-FOLD-FIX: AOF append for cross-shard writes is now done
+                    // inside the SPSC arm (PipelineBatch), BEFORE the oneshot reply
+                    // is sent. Appending here (after awaiting the oneshot response)
+                    // defers the append until after drain_spsc_shared returns, which
+                    // makes AofFold's pending_aof_count undercount it → escape to
+                    // new incr → double-apply on restart. The SPSC arm now owns the
+                    // AOF write; aof_bytes below is used only for the barrier check.
+                    let resp = apply_resp3_conversion(&cmd_name, resp, conn.protocol_version);
+                    if aof_bytes.is_some() && !matches!(resp, Frame::Error(_)) {
+                        write_resp_idxs.push(resp_idx);
+                    }
+                    responses[resp_idx] = resp;
+                }
+
+                // H1-BARRIER (C4-FOLD-FIX follow-up): under appendfsync=always,
+                // call fsync_barrier once per target shard AFTER responses are
+                // collected. The SPSC arm enqueued the Append fire-and-forget;
+                // the barrier enqueues a zero-length AppendSync into the SAME
+                // shard channel. Because the writer processes messages in order,
+                // an acked barrier proves all prior Appends to this shard are on
+                // durable storage. Under EverySec/No this is a zero-cost noop.
+                if !write_resp_idxs.is_empty() {
+                    if let Some(ref pool) = ctx.aof_pool {
+                        if pool.fsync_barrier(target).await.is_err() {
+                            for idx in write_resp_idxs {
+                                responses[idx] =
+                                    Frame::Error(Bytes::from_static(aof::AOF_FSYNC_ERR));
                             }
                         }
                     }
-                    let resp = apply_resp3_conversion(&cmd_name, resp, conn.protocol_version);
-                    responses[resp_idx] = resp;
                 }
             }
         }

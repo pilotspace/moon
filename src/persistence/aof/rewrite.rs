@@ -440,10 +440,17 @@ pub(crate) fn drain_pending_appends_framed(
                     bytes: data,
                     ack,
                 } => {
-                    write_framed(file, lsn, &data).map_err(|e| AofError::Io {
-                        path: PathBuf::from("<aof per-shard incr drain>"),
-                        source: e,
-                    })?;
+                    // H1-BARRIER: a zero-length AppendSync is an fsync barrier
+                    // (pool::fsync_barrier) — it must produce NO on-disk record
+                    // (a len=0 framed header reads as corruption on replay) but
+                    // still counts toward `drained` (sender.len() counted it)
+                    // and its ack still parks for the boundary fsync.
+                    if !data.is_empty() {
+                        write_framed(file, lsn, &data).map_err(|e| AofError::Io {
+                            path: PathBuf::from("<aof per-shard incr drain>"),
+                            source: e,
+                        })?;
+                    }
                     outcome.drained += 1;
                     // Park the ack until the caller's post-drain boundary fsync
                     // (issue #140); resolved Synced/FsyncFailed by
@@ -566,7 +573,9 @@ pub(crate) fn do_rewrite_per_shard(
     sync_and_fulfill_drain(&mut pre_drain, file, PathBuf::from("<aof per-shard incr>"))?;
     info!(
         "F6 shard {} phase1 done: drained {} appends ({:.1}ms)",
-        shard_id, pre_drain.drained, _fold_t0.elapsed().as_secs_f64() * 1000.0
+        shard_id,
+        pre_drain.drained,
+        _fold_t0.elapsed().as_secs_f64() * 1000.0
     );
 
     // Phases 2-5 (C4 cooperative snapshot — ShardSlice is the live store):
@@ -654,7 +663,10 @@ pub(crate) fn do_rewrite_per_shard(
     let snapshot = fold_snapshot.dbs;
     info!(
         "F6 shard {} snapshot received: {} dbs, {} pre-snapshot pending ({:.1}ms total)",
-        shard_id, snapshot.len(), pending_aof_count, _fold_t0.elapsed().as_secs_f64() * 1000.0
+        shard_id,
+        snapshot.len(),
+        pending_aof_count,
+        _fold_t0.elapsed().as_secs_f64() * 1000.0
     );
 
     // Phase 3: drain appends that arrived while the shard was building the snapshot,
@@ -672,7 +684,9 @@ pub(crate) fn do_rewrite_per_shard(
     sync_and_fulfill_drain(&mut mid_drain, file, PathBuf::from("<aof per-shard incr>"))?;
     info!(
         "F6 shard {} phase3 done: drained {} mid-appends ({:.1}ms total)",
-        shard_id, mid_drain.drained, _fold_t0.elapsed().as_secs_f64() * 1000.0
+        shard_id,
+        mid_drain.drained,
+        _fold_t0.elapsed().as_secs_f64() * 1000.0
     );
 
     // Phase 6: write new base, advance THIS shard's manifest entry (no seq
@@ -681,7 +695,9 @@ pub(crate) fn do_rewrite_per_shard(
     let rdb_bytes = crate::persistence::rdb::save_snapshot_to_bytes(&snapshot)?;
     info!(
         "F6 shard {} rdb serialized: {} bytes ({:.1}ms total)",
-        shard_id, rdb_bytes.len(), _fold_t0.elapsed().as_secs_f64() * 1000.0
+        shard_id,
+        rdb_bytes.len(),
+        _fold_t0.elapsed().as_secs_f64() * 1000.0
     );
     let new_incr = {
         let mut m = coord.manifest.lock();
