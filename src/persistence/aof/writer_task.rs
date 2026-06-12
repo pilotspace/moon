@@ -12,11 +12,22 @@ use super::rewrite::{do_rewrite_sharded, do_rewrite_single};
 
 /// Background AOF writer task. Receives commands via mpsc channel and appends them
 /// to the AOF file. Handles fsync according to the configured policy.
+///
+/// `fold_channels` — for the TopLevel `--shards 1` path: an optional
+/// `(fold_producer, fold_notifier)` pair for shard 0, wired by `main.rs` via
+/// `set_fold_channels` + extracted here.  When `Some`, `do_rewrite_sharded`
+/// uses the C4 cooperative-snapshot fold; when `None` (legacy, no AOF fold
+/// wired), `do_rewrite_sharded` falls back to an error-abort so the old
+/// generation stays authoritative rather than deadlocking.
 pub async fn aof_writer_task(
     rx: channel::MpscReceiver<AofMessage>,
     aof_path: PathBuf,
     fsync: FsyncPolicy,
     cancel: CancellationToken,
+    fold_channels: Option<(
+        Arc<parking_lot::Mutex<ringbuf::HeapProd<crate::shard::dispatch::ShardMessage>>>,
+        Arc<crate::runtime::channel::Notify>,
+    )>,
 ) {
     #[cfg(feature = "runtime-tokio")]
     use tokio::io::AsyncWriteExt;
@@ -253,7 +264,18 @@ pub async fn aof_writer_task(
                             error!("AOF pre-rewrite sync failed (seq {}): {}", manifest.seq, e);
                         }
                     }
-                    match do_rewrite_sharded(&shard_dbs, &mut manifest, &mut file, &rx) {
+                    // C4 TopLevel cooperative fold: pass the wired fold channels
+                    // (producer + notifier for shard 0) so do_rewrite_sharded can
+                    // use the AofFold SPSC protocol instead of the deleted RwLock
+                    // path.  `fold_channels` is `None` only if main.rs failed to
+                    // wire them at startup (Arc::get_mut race — logged at boot).
+                    match do_rewrite_sharded(
+                        &shard_dbs,
+                        &mut manifest,
+                        &mut file,
+                        &rx,
+                        fold_channels.as_ref(),
+                    ) {
                         Ok(()) => {
                             write_error = false;
                         }
@@ -343,11 +365,24 @@ pub async fn aof_writer_task(
                         }
                     }
                     Ok(AofMessage::RewriteSharded(shard_dbs)) => {
+                        // C4 TopLevel cooperative fold (tokio path):
+                        // flush + sync the BufWriter, convert to std::fs::File
+                        // for the sync fold (same pattern as tokio per-shard),
+                        // then reopen for appending.
                         let _ = writer.flush().await;
                         let _ = writer.get_ref().sync_data().await;
-                        if let Err(e) = rewrite_aof_sharded_sync(&shard_dbs, &aof_path) {
+                        let mut sf = writer.into_inner().into_std().await;
+                        if let Err(e) = rewrite_aof_sharded_sync(
+                            &shard_dbs,
+                            &aof_path,
+                            &rx,
+                            &mut sf,
+                            fold_channels.as_ref(),
+                        ) {
                             error!("AOF rewrite (sharded) failed: {}", e);
                         }
+                        // Drop sf — caller will reopen aof_path below.
+                        drop(sf);
                         crate::command::persistence::AOF_REWRITE_IN_PROGRESS
                             .store(false, std::sync::atomic::Ordering::SeqCst);
                         let reopen_result: Result<tokio::fs::File, _> = tokio::fs::OpenOptions::new()

@@ -150,7 +150,7 @@ pub async fn run_embedded(
             .spawn(move || {
                 RuntimeFactoryImpl::block_on_local(
                     "embedded-moon-aof".to_string(),
-                    aof::aof_writer_task(rx, aof_file_path, fsync, aof_token),
+                    aof::aof_writer_task(rx, aof_file_path, fsync, aof_token, None),
                 );
             })
             .context("embedded moon: failed to spawn AOF writer thread")?;

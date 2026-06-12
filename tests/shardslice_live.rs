@@ -319,11 +319,42 @@ fn read_log(dir: &std::path::Path) -> String {
 // ---------------------------------------------------------------------------
 // Helper: detect a seq>1 base RDB file (proves BGREWRITEAOF physically ran).
 // Mirrors crash_matrix_per_shard_bgrewriteaof.rs::compacted_base_exists.
+//
+// Recognises three layouts:
+//   PerShard:   appendonlydir/shard-*/moon.aof.<seq>.base.rdb   (seq > 1)
+//   TopLevel:   appendonlydir/moon.aof.<seq>.base.rdb            (seq > 1)
+//               (also searched directly under `dir` as a fallback)
+//   tokio-TopLevel (in-place rewrite): <dir>/appendonly.aof starts with
+//               the 4-byte RDB magic b"MOON" — proves a full rewrite
+//               completed; the pre-rewrite file is raw RESP (starts with '*'
+//               or '+'), so the magic check is sufficient.
 // ---------------------------------------------------------------------------
 
 fn compacted_base_exists(dir: &std::path::Path) -> bool {
-    // Per-shard layout: appendonlydir/shard-*/moon.aof.<seq>.base.rdb
+    let is_seq_gt1 = |name: &str| -> bool {
+        if let Some(rest) = name.strip_prefix("moon.aof.") {
+            if let Some(seq_str) = rest.strip_suffix(".base.rdb") {
+                return seq_str.parse::<u64>().map(|s| s > 1).unwrap_or(false);
+            }
+        }
+        false
+    };
+
     let aof_dir = dir.join("appendonlydir");
+
+    // TopLevel layout: base files live directly in appendonlydir/ (or `dir`).
+    for search_dir in &[&aof_dir, dir] {
+        if let Ok(files) = std::fs::read_dir(search_dir) {
+            for f in files.flatten() {
+                let name = f.file_name().to_string_lossy().to_string();
+                if is_seq_gt1(&name) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    // PerShard layout: appendonlydir/shard-*/moon.aof.<seq>.base.rdb
     if let Ok(shards) = std::fs::read_dir(&aof_dir) {
         for entry in shards.flatten() {
             let p = entry.path();
@@ -333,33 +364,29 @@ fn compacted_base_exists(dir: &std::path::Path) -> bool {
             if let Ok(files) = std::fs::read_dir(&p) {
                 for f in files.flatten() {
                     let name = f.file_name().to_string_lossy().to_string();
-                    if let Some(rest) = name.strip_prefix("moon.aof.") {
-                        if let Some(seq_str) = rest.strip_suffix(".base.rdb") {
-                            if seq_str.parse::<u64>().map(|s| s > 1).unwrap_or(false) {
-                                return true;
-                            }
-                        }
+                    if is_seq_gt1(&name) {
+                        return true;
                     }
                 }
             }
         }
     }
-    // Top-level layout (--shards 1 TopLevel AOF): single appendonly.aof file +
-    // seq-stamped base file may live directly under `dir` or `aof_dir`.
-    for search_dir in &[dir, &aof_dir] {
-        if let Ok(files) = std::fs::read_dir(search_dir) {
-            for f in files.flatten() {
-                let name = f.file_name().to_string_lossy().to_string();
-                if let Some(rest) = name.strip_prefix("moon.aof.") {
-                    if let Some(seq_str) = rest.strip_suffix(".base.rdb") {
-                        if seq_str.parse::<u64>().map(|s| s > 1).unwrap_or(false) {
-                            return true;
-                        }
-                    }
-                }
+
+    // tokio TopLevel (--shards 1) rewrites aof_path in-place: the legacy
+    // single AOF file gets atomically replaced with an RDB-preamble snapshot.
+    // No manifest-stamped base.rdb is produced.  Detect by checking whether
+    // appendonly.aof (the default appendfilename) starts with b"MOON".
+    // Also check directly under appendonlydir/ as a belt-and-suspenders search.
+    for candidate in &[dir.join("appendonly.aof"), aof_dir.join("appendonly.aof")] {
+        if let Ok(mut f) = std::fs::File::open(candidate) {
+            use std::io::Read as _;
+            let mut magic = [0u8; 4];
+            if f.read_exact(&mut magic).is_ok() && &magic == b"MOON" {
+                return true;
             }
         }
     }
+
     false
 }
 
@@ -757,8 +784,11 @@ fn aof_fold_exactly_once(shards: u32, extra: &[&str]) {
                 break;
             }
             if Instant::now() > rewrite_deadline {
-                // Proceed anyway — the key assertion below is what matters.
-                break;
+                panic!(
+                    "BGREWRITEAOF did not complete within 30s — \
+                     no layout-appropriate compaction artifact appeared in {:?}.",
+                    dir.path()
+                );
             }
         }
 

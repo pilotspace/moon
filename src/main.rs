@@ -601,6 +601,18 @@ fn main() -> anyhow::Result<()> {
         std::process::exit(2);
     }
 
+    // C4 TopLevel staging variables: populated in the `else` branch of the pool
+    // construction block when layout==TopLevel, consumed in the fold-channel
+    // wiring block and the shard-spawn loop below.
+    let mut toplevel_fold_consumer_staging: Option<
+        ringbuf::HeapCons<moon::shard::dispatch::ShardMessage>,
+    > = None;
+    let mut toplevel_pool_fold_producer: Option<
+        std::sync::Arc<parking_lot::Mutex<ringbuf::HeapProd<moon::shard::dispatch::ShardMessage>>>,
+    > = None;
+    let mut toplevel_pool_fold_notifier: Option<std::sync::Arc<moon::runtime::channel::Notify>> =
+        None;
+
     let mut aof_pool: Option<std::sync::Arc<AofWriterPool>> = if config.appendonly == "yes" {
         let fsync = FsyncPolicy::from_str(&config.appendfsync);
         // PerShard writers required when num_shards >= 2 AND we'll have a
@@ -657,6 +669,20 @@ fn main() -> anyhow::Result<()> {
             let (tx, rx) = channel::mpsc_bounded::<AofMessage>(10_000);
             let aof_token = cancel_token.child_token();
             let aof_file_path = PathBuf::from(&config.dir).join(&config.appendfilename);
+
+            // C4 TopLevel: create fold channels for shard 0 here (before the
+            // writer spawn) so they can be moved into the closure.  The consumer
+            // is stored in `toplevel_fold_cons_staging` and later merged into shard
+            // 0's consumers vec in the shard-spawn loop below.
+            // Notifier: use shard 0's mesh notifier (same handle the shard event
+            // loop is woken by) so the AofFold push wakes the right thread.
+            let (mut tl_fold_producers, mut tl_fold_consumers) = create_aof_fold_channels(1, 4);
+            let tl_fold_producer = tl_fold_producers.remove(0);
+            let tl_fold_consumer = tl_fold_consumers.remove(0);
+            let tl_fold_notifier = mesh.take_notify(0);
+            // fold channels for the writer task
+            let writer_fold_channels = Some((tl_fold_producer.clone(), tl_fold_notifier.clone()));
+
             // Legacy single-writer thread. Each shard clones the outer
             // `aof_pool` Arc; sender lifetime is governed by the pool's Drop.
             std::thread::Builder::new()
@@ -664,11 +690,23 @@ fn main() -> anyhow::Result<()> {
                 .spawn(move || {
                     RuntimeFactoryImpl::block_on_local(
                         "aof-writer".to_string(),
-                        aof::aof_writer_task(rx, aof_file_path, fsync, aof_token),
+                        aof::aof_writer_task(
+                            rx,
+                            aof_file_path,
+                            fsync,
+                            aof_token,
+                            writer_fold_channels,
+                        ),
                     );
                 })
                 .expect("failed to spawn AOF writer thread");
             info!("AOF enabled (TopLevel, fsync: {:?})", fsync);
+
+            // Stash consumer + pool-side channels for wiring in the blocks below.
+            toplevel_fold_consumer_staging = Some(tl_fold_consumer);
+            toplevel_pool_fold_producer = Some(tl_fold_producer);
+            toplevel_pool_fold_notifier = Some(tl_fold_notifier);
+
             Some(AofWriterPool::top_level_with_policy(
                 tx,
                 fsync,
@@ -787,36 +825,58 @@ fn main() -> anyhow::Result<()> {
     // Collect all notifiers before spawning shard threads
     let all_notifiers = mesh.all_notifiers();
 
-    // C4: Wire AOF fold channels for the per-shard cooperative snapshot protocol.
+    // C4: Wire AOF fold channels for the cooperative snapshot protocol.
     //
-    // The pool is built BEFORE the mesh (line ~650) so fold channels cannot be
-    // set at construction time — we set them here via set_fold_channels, using
-    // Arc::get_mut which is safe at this point because no shard threads have
-    // spawned yet (the first Arc clone happens at ~line 1290).
+    // Two paths:
     //
-    // fold_consumers[i] is merged into shard i's consumers vec before
-    // shard.run() is called, mirroring the admin_consumers merge pattern.
+    // A) PerShard layout (num_shards >= 2): fold channels are created here and
+    //    wired into the pool via set_fold_channels. Arc::get_mut is safe because
+    //    no shard threads have spawned yet (first Arc clone happens ~line 1290).
+    //    fold_consumers[i] is merged into shard i's consumers vec before run().
     //
-    // Only PerShard pools participate in the per-shard rewrite; TopLevel pools
-    // (--shards 1 or legacy single-writer) do not need fold channels.
+    // B) TopLevel layout (--shards 1): fold channels were already created AND
+    //    WIRED INTO THE WRITER TASK in the TopLevel writer-spawn branch above.
+    //    The consumer side was stashed in `toplevel_fold_consumer_staging`.
+    //    Here we only wire the pool's set_fold_channels and collect the consumer
+    //    into fold_consumers so the shard-spawn loop can prepend it.
     let mut fold_consumers: Option<Vec<ringbuf::HeapCons<moon::shard::dispatch::ShardMessage>>> =
         None;
-    if let Some(ref mut pool_arc) = aof_pool
-        && pool_arc.layout() == moon::persistence::aof_manifest::AofLayout::PerShard
-    {
-        let (fold_producers, fold_cons) = create_aof_fold_channels(num_shards, 4);
-        // SAFETY: Arc::get_mut is valid here — no clones exist yet; the first
-        // shard_aof_pool clone happens inside the shard-spawn loop below.
-        if let Some(pool_mut) = std::sync::Arc::get_mut(pool_arc) {
-            pool_mut.set_fold_channels(fold_producers, all_notifiers.clone());
-            fold_consumers = Some(fold_cons);
+    if let Some(ref mut pool_arc) = aof_pool {
+        let layout = pool_arc.layout();
+        if layout == moon::persistence::aof_manifest::AofLayout::PerShard {
+            // Path A: PerShard — create fold channels and wire now.
+            let (fold_producers, fold_cons) = create_aof_fold_channels(num_shards, 4);
+            // SAFETY: Arc::get_mut is valid here — no clones exist yet; the first
+            // shard_aof_pool clone happens inside the shard-spawn loop below.
+            if let Some(pool_mut) = std::sync::Arc::get_mut(pool_arc) {
+                pool_mut.set_fold_channels(fold_producers, all_notifiers.clone());
+                fold_consumers = Some(fold_cons);
+            } else {
+                tracing::error!(
+                    "C4 wiring (PerShard): Arc::get_mut failed — fold channels not wired. \
+                     BGREWRITEAOF will abort cleanly (old generation remains authoritative)."
+                );
+            }
         } else {
-            // Should never happen at this point in startup.
-            tracing::error!(
-                "C4 wiring: Arc::get_mut failed — fold channels not wired. \
-                 Per-shard BGREWRITEAOF will abort cleanly (old generation \
-                 remains authoritative) rather than deadlock."
-            );
+            // Path B: TopLevel — channels were created + wired at writer-spawn time.
+            // Wire the producer/notifier into the pool and collect the consumer.
+            if let (Some(prod), Some(notif)) = (
+                toplevel_pool_fold_producer.take(),
+                toplevel_pool_fold_notifier.take(),
+            ) {
+                // SAFETY: Arc::get_mut is valid here — no clones exist yet.
+                if let Some(pool_mut) = std::sync::Arc::get_mut(pool_arc) {
+                    pool_mut.set_fold_channels(vec![prod], vec![notif]);
+                } else {
+                    tracing::error!(
+                        "C4 wiring (TopLevel): Arc::get_mut failed — pool fold channels \
+                         not wired. BGREWRITEAOF will abort cleanly."
+                    );
+                }
+            }
+            if let Some(cons) = toplevel_fold_consumer_staging.take() {
+                fold_consumers = Some(vec![cons]);
+            }
         }
     }
 
