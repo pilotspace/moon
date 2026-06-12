@@ -6,6 +6,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — Cross-shard commands now route to the owning shard (PR #173)
+
+On multi-shard servers, SO_REUSEPORT spreads client connections across
+shard accept loops — and several command families operated on the
+*connection's* shard instead of the shard that owns the data. Whether
+these commands worked depended on which shard the kernel happened to
+accept the connection on. All four groups are fixed; the consistency
+suite now passes 197/197 at 1, 4, and 12 shards:
+
+- **BITOP** routed by its sub-operation literal (`AND`/`OR`/…): sources
+  were read and the destination written on an arbitrary shard. A new
+  coordinator gathers sources per owning shard and writes the result on
+  the destination's owner (Redis semantics: NOT arity, zero-padding,
+  all-missing sources delete the destination and return 0).
+- **COPY** wrote the destination into the *source's* shard, making it
+  unreadable at its own. Cross-shard string copies preserve value + TTL
+  and honor REPLACE/NX; cross-shard non-string COPY returns an explicit
+  error instead of corrupting state.
+- **GRAPH.\*, TEMPORAL.INVALIDATE, and TXN.ABORT graph rollback** ran on
+  the connection's per-shard graph store — graphs randomly "did not
+  exist" from ~3/4 of connections at 4 shards. Graph commands now hop to
+  the graph-name-owning shard; transactional rollback partitions undo
+  work by owner and awaits acknowledgements.
+- **WS.\* and MQ.\***: the workspace registry was per-shard (WS AUTH
+  from another connection answered "workspace not found"; WS LIST
+  diverged per connection) and durable queues lived on the creating
+  connection's shard (MQ PUSH/POP/ACK/DLQLEN from elsewhere answered
+  "queue is not durable"). The workspace registry is now global with a
+  single WAL stream, and every MQ operation targets the queue key's
+  owning shard — including dead-letter routing, trigger registration,
+  and MQ.PUBLISH materialization at TXN.COMMIT.
+
 ### Changed — Event-driven cross-shard wake (the ~1ms monoio floor is gone)
 
 - **The monoio shard event loop is now event-driven.** Its single await point
