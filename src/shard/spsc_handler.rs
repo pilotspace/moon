@@ -2464,6 +2464,101 @@ pub(crate) fn handle_shard_message_shared(
             // Notify the coordinator that this shard completed its swap.
             let _ = reply_tx.send(());
         }
+        // ── C2: shardslice-migration Wave A1 ─────────────────────────────────
+        //
+        // These four arms are the owner-side execution legs for the new
+        // ShardMessage variants defined in §C2 of the frozen contract.
+        // They run AFTER init_shard is wired (Wave B) — until then the
+        // variants are never sent, so these arms are dead code at runtime
+        // today. They are slice-only (no is_initialized() dual-branch):
+        // the owning shard's slice is the authoritative state once slice mode
+        // is live.
+        ShardMessage::MqCommand(payload) => {
+            // MQ domain hop: execute the full MQ.* subcommand arm against the
+            // owner's ShardSlice. All six subcommands (CREATE/PUSH/POP/ACK/
+            // DLQLEN/TRIGGER) are dispatched through `mq_exec::execute_mq_on_owner`,
+            // which takes the three data fields directly and returns a Frame.
+            // Destructure first so reply_tx stays here for the send.
+            let crate::shard::dispatch::MqCommandPayload {
+                db_index,
+                key_prefix,
+                command,
+                reply_tx,
+            } = *payload;
+            let response =
+                crate::shard::mq_exec::execute_mq_on_owner(db_index, key_prefix, command);
+            // Ignore send failure: receiver dropped means the client disconnected.
+            let _ = reply_tx.send(response);
+        }
+        ShardMessage::MqTxnMaterialize {
+            db_index,
+            intents,
+            reply_tx,
+        } => {
+            // TXN.COMMIT MQ-intent materialize: fold deferred MQ.PUBLISH messages
+            // onto the owner shard. Mirrors txn.rs:160–167 exactly:
+            //   for intent in intents: get_stream_mut → durable-check → add.
+            crate::shard::slice::with_shard_db(db_index, |db| {
+                for intent in &intents {
+                    if let Ok(Some(stream)) = db.get_stream_mut(&intent.queue_key) {
+                        if stream.durable {
+                            let msg_id = stream.next_auto_id();
+                            stream.add(msg_id, intent.fields.clone());
+                        }
+                    }
+                }
+            });
+            // Ignore send failure: receiver dropped means the TXN coordinator
+            // has already given up (e.g. client disconnect mid-commit).
+            let _ = reply_tx.send(());
+        }
+        ShardMessage::WsDropCleanup { prefix, reply_tx } => {
+            // WS.DROP best-effort key cleanup. The connection handler routes
+            // this to the shard that owns `prefix` (hash-tag co-location).
+            // db pinned to 0 — matches the lock-path behaviour in both runtimes.
+            let deleted_count = crate::shard::slice::with_shard_db(0, |db| {
+                let keys_to_delete: Vec<Vec<u8>> = db
+                    .keys()
+                    .filter(|k| k.as_bytes().starts_with(prefix.as_ref()))
+                    .map(|k| k.as_bytes().to_vec())
+                    .collect();
+                let count = keys_to_delete.len() as u64;
+                for key in &keys_to_delete {
+                    db.remove(key);
+                }
+                count
+            });
+            // Ignore send failure: caller logs the count but the drop already
+            // completed; losing the ack is harmless.
+            let _ = reply_tx.send(deleted_count);
+        }
+        ShardMessage::AofFold { reply_tx } => {
+            // AOF cooperative-snapshot (C4): build an expired-filtered snapshot
+            // of ALL databases on this shard and reply. The AOF rewrite writer
+            // blocks on the oneshot; the shard processes this between commands,
+            // providing the equivalent mutual-exclusion that the old RwLock write
+            // guards gave (single-threaded event loop = no concurrent mutations).
+            let now_ms = crate::storage::entry::current_time_ms();
+            let snapshot = crate::shard::slice::with_shard(|s| {
+                let mut dbs = Vec::with_capacity(s.databases.len());
+                for db in s.databases.iter() {
+                    let base_ts = db.base_timestamp();
+                    let mut entries = Vec::new();
+                    for (key, entry) in db.data().iter() {
+                        if !entry.is_expired_at(base_ts, now_ms) {
+                            entries.push((key.clone(), entry.clone()));
+                        }
+                    }
+                    dbs.push((entries, base_ts));
+                }
+                crate::shard::dispatch::AofFoldSnapshot { dbs }
+            });
+            // Ignore send failure: the AOF writer dropped its receiver
+            // (e.g. rewrite aborted) — the snapshot is simply discarded.
+            let _ = reply_tx.send(snapshot);
+        }
+
+        // ─────────────────────────────────────────────────────────────────────
         ShardMessage::Shutdown => {
             info!("Received shutdown via SPSC");
         }

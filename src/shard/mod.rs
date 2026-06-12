@@ -9,6 +9,8 @@ pub mod event_loop;
 /// MA5: maintenance-window scheduler (cron-style budget multipliers).
 pub mod maintenance_schedule;
 pub mod mesh;
+/// C2 (shardslice-migration Wave A1): owner-side MQ.* execution on the shard thread.
+pub(crate) mod mq_exec;
 pub mod numa;
 pub mod persistence_tick;
 pub mod remote_subscriber_map;
