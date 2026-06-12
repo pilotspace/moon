@@ -629,7 +629,9 @@ impl AofWriterPool {
         // 272988 INCRs survived restart). Abort cleanly instead: log an error,
         // mark the coord failed, and return — the old generation stays
         // authoritative (same abort path as a disconnected writer channel above).
-        if self.fold_producers.is_none() || self.fold_notifiers.is_none() {
+        let (Some(fold_producers_vec), Some(fold_notifiers_vec)) =
+            (self.fold_producers.as_ref(), self.fold_notifiers.as_ref())
+        else {
             error!(
                 "F6 per-shard rewrite: fold channels not wired (pool built with \
                  per_shard_with_base_dir — call set_fold_channels after mesh \
@@ -641,16 +643,18 @@ impl AofWriterPool {
                 coord.shard_done();
             }
             return Err(AofPoolSendError::SendFailed);
-        }
-        // SAFETY: both options are Some, checked above.
-        let fold_producers_vec = self.fold_producers.as_ref().expect("checked above");
-        let fold_notifiers_vec = self.fold_notifiers.as_ref().expect("checked above");
+        };
 
         for (idx, s) in self.senders.iter().enumerate() {
+            // Fail fast on a length mismatch rather than zip-truncating: a
+            // shard that never receives RewritePerShard never calls
+            // shard_done(), wedging the coordinator forever.
+            #[allow(clippy::unwrap_used)] // len == senders len, debug_asserted at set_fold_channels
             let fold_producer = fold_producers_vec
                 .get(idx)
                 .cloned()
                 .expect("fold_producers len == senders len (debug_asserted at set_fold_channels)");
+            #[allow(clippy::unwrap_used)] // len == senders len, debug_asserted at set_fold_channels
             let fold_notifier = fold_notifiers_vec
                 .get(idx)
                 .cloned()
