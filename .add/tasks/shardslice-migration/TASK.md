@@ -580,9 +580,56 @@ RED-SUITE RECORD (verified 2026-06-12, macOS, MOON_BIN=target/debug/moon):
 
 ## 5 · BUILD — AI writes code ▸ docs/07-step-5-build.md
 
-Safety rule (feature-specific): <e.g. debit+credit in one atomic transaction>
+Safety rule (feature-specific): AOF fold exactly-once — every acked write
+survives restart exactly once; no append may straddle the snapshot boundary
+into the wrong incr generation.
 Code lives in: `./src/`
 Constraints: do NOT change any test or the contract; allow-list packages only; ask if unclear.
+
+### BUILD RECORD (2026-06-12, branch feat/shardslice-migration)
+
+Waves (parallel Sonnet subagents, orchestrator-reviewed; commits in order):
+- f31f6cd bundle · 1e9dc8d A2 WS-WAL replay fix · 498fc19 A1 dispatch
+  variants · 7d2f271 B owner-routing · 4de32a8 E1 gate collapse ·
+  ee7da49 fold bounded-drain · 6f32f90 E2 structural cutover (C1+C6) ·
+  8b2d87c C4 exact fold boundary + H1 fsync barrier.
+- NOTE: seven foreign HYBRID FILTER commits (4e9c03c..e969cf0) from a
+  concurrent session are interleaved on this branch + their uncommitted
+  edits in tree; left untouched (not this task's work).
+
+Build-phase findings fixed beyond plan (each caught by frozen oracles or
+orchestrator review, never by weakening a test):
+1. Slice re-entrancy (frozen reject hit live): drain_spsc_shared was
+   wrapped in with_shard → BorrowMutError; arms now take flat borrows.
+2. AOF fold deadlock: fold channels existed but were never wired in
+   main.rs; unwired pools now abort rewrites cleanly.
+3. ±1 double-apply (ssm4a flake): cross-shard PipelineBatch[Slotted]
+   AOF appends were handler-deferred → escaped pending_aof_count →
+   replayed onto a base already containing them. Appends moved into the
+   SPSC arms (before response-slot fill).
+4. H1 regression from (3): appendfsync=always lost its fsync ack for
+   cross-shard writes → new AofWriterPool::fsync_barrier (zero-length
+   AppendSync rendezvous, F2-bounded), one per target shard per batch.
+5. P0 in (4) caught in orchestrator review: a len=0 framed record would
+   be read as corruption by replay_incr_framed and brick boot. Writers +
+   rewrite mid-drain now skip the disk write for barriers (fsync+ack
+   only); reader skips len=0 defensively. Regression tests added.
+6. Pre-existing crash-matrix harness flake (unique_port()+1 SO_REUSEPORT
+   collision between the two parallel tests): +1 dropped.
+7. Throttle a fix-iteration added to the frozen aof_fold_exactly_once
+   writer loop was REVERTED (test-weakening); tight loop passes.
+8. E2's test migration missed 29 call sites in 28 tokio-gated integration
+   tests (never compiled under default monoio features → invisible to all
+   macOS runs). All migrated to the tuple API + slice_init run() arg;
+   compile-verified on both feature sets.
+9. Slice re-entrancy #2, found by the first-ever post-cutover run of the
+   tokio integration suites: the cross-store TXN undo-capture re-entered
+   with_shard from inside the write closure (handler_sharded via
+   with_shard_db; handler_monoio nested inside its own with_shard) →
+   BorrowMutError panic on any TXN write. Fixed with disjoint NLL field
+   borrows (s.kv_write_intents directly); handler_sharded's do_write now
+   takes the whole ShardSlice. txn_kv_wiring 12/12 under tokio
+   (MOON_BIN pinned to the Linux binary per the Mach-O host-proxy trap).
 
 <!-- EXIT: all green; coverage held; no test/contract touched; no unlisted dependency. -->
 
@@ -590,18 +637,75 @@ Constraints: do NOT change any test or the contract; allow-list packages only; a
 
 ## 6 · VERIFY — evidence + non-functional review ▸ docs/08-step-6-verify.md
 
-- [ ] all tests pass
-- [ ] coverage did not decrease
-- [ ] no test or contract was altered during build
-- [ ] concurrency / timing of the risky operation is safe
-- [ ] no exposed secrets, injection openings, or unexpected dependencies
-- [ ] layering & dependencies follow CONVENTIONS.md
-- [ ] a person reviewed and approved the change
+- [x] all tests pass — EVIDENCE (2026-06-12, eb5d664):
+  - frozen oracles: shape 5/5 · live 6/6 serial (ssm1 marker+ids, ssm3 ×2,
+    ssm4a 1-shard + 4-shard experimental, wire guard) · ssm4a 10/10 serial
+    repeat at full INCR rate · cdg 7/7
+  - lib: 3594 (monoio, macOS) · 2955+ (tokio; full VM integration sweep
+    all targets green, MOON_BIN=target-linux/debug/moon)
+  - crash_matrix_per_shard_bgrewriteaof 2/2 ×5 parallel + ×3 serial
+  - loom_response_slot 4/4
+  - clippy -D warnings: macOS ×2 featuresets + VM tokio (incl. the
+    never-before-compiled cfg(linux+tokio) uring_handler) · fmt clean
+  - consistency sweep: 197/197 PASSED @ shards=1/4/12 (VM-local clone of
+    eb5d664, release build, 2026-06-12 23:49 — incl. TXN/GRAPH/FT/WS/MQ
+    cross-shard groups)
+- [x] coverage did not decrease — red suite all flipped green; +4 new
+  regression tests (len-0 barrier reader/drain, H1-BARRIER ×3 in pool.rs)
+- [x] no test or contract was altered during build — §3 untouched since
+  freeze; one frozen-test VIOLATION (agent throttle in aof_fold_exactly_once)
+  was caught and REVERTED, tight loop green; crash-matrix port fix is
+  harness isolation (strengthens), not weakening
+- [x] concurrency / timing of the risky operation is safe — C4 exactly-once
+  verified 10/10 serial under saturating INCR load; slice re-entrancy guard
+  caught both nesting defects (event-loop drain, TXN intent capture), both
+  fixed with flat/disjoint borrows; no lock held across .await
+  (shape test test_reject_borrow_across_await green)
+- [x] no exposed secrets, injection openings, or unexpected dependencies —
+  no new deps; no new unsafe (PhantomData<Rc<()>> design holds);
+  parser paths untouched except replay_incr_framed len=0 skip (defensive,
+  fuzz targets unaffected — no new decode surface)
+- [x] layering & dependencies follow CONVENTIONS.md — slice access only via
+  with_shard/with_shard_db; is_initialized confined to slice.rs (shape pin)
+- [ ] a person reviewed and approved the change — PENDING (gate below)
+
+### M7 bench-swf evidence (2026-06-13, VM idle load<1, REQS=200k, fresh
+### server per rep ×3, eb5d664 vs main 3e376a1, both VM-local release)
+- s1/P1: SET 305k vs 294k · GET 316k vs 306k — parity (slice ≥ main)
+- s1/P16: SET 1.48M vs 1.61M (−5..8%, borderline vs noise) · GET 2.64M
+  vs 2.64M — parity
+- s4 vs main ROUTED (--cross-shard-fast-path off; architecture-fair):
+  P1 SET 196k vs 187k · P1 GET 187k vs 186k · P16 SET 1.77M vs 1.81M ·
+  P16 GET 1.99M vs 1.78M (+12%) · c1 SET 33.5k vs 33.7k — parity or
+  slice ahead in every routed cell
+- s4 vs main DEFAULT (fast path ON — user-visible): read cells regress
+  by mechanism: c1 GET ~190k → ~26-34k (−85%; 4µs lock-read → ~47µs SPSC
+  round trip) · P1 GET ~224k → ~187k (−16%). The cross-thread RwLock
+  read_db fast path is definitionally incompatible with shared-nothing
+  (deleting those locks IS this task). This materializes the ⚠ flag
+  accepted at freeze; strictly exceeds the ssm7 "no cell beyond noise"
+  bar → escalated to the human gate rather than auto-passed.
+  Mitigations: {hash-tag} co-location (zero hops), --shards 1 guidance
+  (already CLAUDE.md), follow-up task candidate: slice-native cross-shard
+  read acceleration (read batching / snapshot reads) without locks.
+- Methodology note: the first back-to-back run (both binaries, all cells
+  sequentially against long-lived servers) showed phantom −20..−40% on
+  s4 pipelined cells; fresh-server-per-rep ×3 showed parity. Recorded so
+  future benches use the per-rep protocol.
 
 ### Deep checks — do not skim (fill the path that applies; the resolver judges which)
-- [ ] WIRING (code) — every new symbol is referenced; record where / how confirmed
-- [ ] DEAD-CODE (code) — no new unused or orphaned symbol introduced
-- [ ] SEMANTIC (prose / non-code) — read in full, not skimmed: <what read · what confirmed>
+- [x] WIRING (code) — fsync_barrier: called from both handlers' cross-shard
+  batch paths (handler_sharded/mod.rs:1667, handler_monoio/mod.rs:1828),
+  policy-gated in pool.rs:313; fold channels: create_aof_fold_channels (mesh) → main.rs
+  wiring → pool.set_fold_channels → spsc AofFold arm → rewrite recv;
+  slice_init: main.rs/embedded.rs destructure → Shard::run → init_shard
+  (28 test harnesses migrated to same shape)
+- [x] DEAD-CODE (code) — uring_handler shard_id underscored w/ comment;
+  E2 removed Cold variant + wrapper methods wholesale; clippy -D warnings
+  clean on all three featureset×OS combos confirms no orphans
+- [x] SEMANTIC (prose / non-code) — fsync_barrier doc corrected during
+  review (claimed "reader skips len=0" before the writer-side skip existed;
+  doc now matches the implemented mechanism)
 
 ### GATE RECORD
 Outcome: <PASS | RISK-ACCEPTED | HARD-STOP>
