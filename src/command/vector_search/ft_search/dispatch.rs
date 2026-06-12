@@ -97,6 +97,8 @@ pub fn ft_search(
                 top_k,
                 offset: limit_offset,
                 count: limit_count,
+                // CHANGE D: thread FILTER from parsed partial into HybridQuery.
+                filter: partial.filter,
             };
             crate::vector::metrics::increment_search();
             // BM25 AS_OF threaded through execute_query_on_index_as_of per Phase 170
