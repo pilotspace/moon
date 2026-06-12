@@ -316,16 +316,14 @@ pub(super) fn try_handle_info(
     if !cmd.eq_ignore_ascii_case(b"INFO") {
         return false;
     }
-    let guard = ctx.shard_databases.read_db(ctx.shard_id, conn.selected_db);
-    let response_text = {
-        let resp_frame = conn_cmd::info_readonly(&guard, cmd_args);
+    // ShardSlice path: access the local shard's database via thread-local.
+    let mut response_text = crate::shard::slice::with_shard_db(conn.selected_db, |db| {
+        let resp_frame = conn_cmd::info_readonly(db, cmd_args);
         match resp_frame {
             Frame::BulkString(b) => String::from_utf8_lossy(&b).to_string(),
             _ => String::new(),
         }
-    };
-    drop(guard);
-    let mut response_text = response_text;
+    });
     if let Some(ref rs) = ctx.repl_state {
         if let Ok(rs_guard) = rs.try_read() {
             response_text.push_str(&crate::replication::handshake::build_info_replication(

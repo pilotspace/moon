@@ -9,9 +9,18 @@ use crate::storage::Database;
 use crate::storage::entry::Entry;
 use bytes::{Bytes, BytesMut};
 
-/// Helper: create a single-shard, single-database ShardDatabases for testing.
+/// Helper: create a single-shard, single-database ShardDatabases for testing
+/// and initialize the thread-local ShardSlice so dispatch paths work.
+///
+/// Each test must call this before any dispatch or write_db calls.
+/// Uses `reset_test_shard` (test-only) so multiple tests on the same OS thread
+/// each get a fresh, empty shard state.
 fn make_dbs() -> std::sync::Arc<crate::shard::shared_databases::ShardDatabases> {
-    crate::shard::shared_databases::ShardDatabases::new(vec![vec![Database::new()]])
+    let (shared, mut inits) =
+        crate::shard::shared_databases::ShardDatabases::new(vec![vec![Database::new()]]);
+    let init = inits.remove(0);
+    crate::shard::slice::reset_test_shard(crate::shard::slice::ShardSlice::new(init));
+    shared
 }
 
 /// Helper: default runtime config for inline dispatch tests.
@@ -22,13 +31,12 @@ fn make_rt_config() -> parking_lot::RwLock<crate::config::RuntimeConfig> {
 #[test]
 fn test_inline_get_hit() {
     let dbs = make_dbs();
-    {
-        let mut guard = dbs.write_db(0, 0);
-        guard.set(
+    crate::shard::slice::with_shard_db(0, |db| {
+        db.set(
             Bytes::from_static(b"foo"),
             Entry::new_string(Bytes::from_static(b"bar")),
         );
-    }
+    });
     let mut read_buf = BytesMut::from(&b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n"[..]);
     let mut write_buf = BytesMut::new();
     let aof_pool: Option<std::sync::Arc<crate::persistence::aof::AofWriterPool>> = None;
@@ -135,15 +143,16 @@ fn test_inline_set_executes_when_writes_enabled() {
     assert_eq!(&write_buf[..], b"+OK\r\n");
 
     // Verify the key was actually set
-    let guard = dbs.read_db(0, 0);
-    // Test assertion: SET was just issued with a live TTL, so the key must
-    // exist and hold a string-typed value; an absent or wrong-typed value
-    // would indicate the inline SET path regressed.
-    #[allow(clippy::expect_used, clippy::unwrap_used)]
-    let entry = guard.get_if_alive(b"foo", 0).expect("key should exist");
-    #[allow(clippy::unwrap_used)]
-    let value_bytes = entry.value.as_bytes().unwrap();
-    assert_eq!(value_bytes, b"bar");
+    crate::shard::slice::with_shard_db(0, |db| {
+        // Test assertion: SET was just issued with a live TTL, so the key must
+        // exist and hold a string-typed value; an absent or wrong-typed value
+        // would indicate the inline SET path regressed.
+        #[allow(clippy::expect_used, clippy::unwrap_used)]
+        let entry = db.get_if_alive(b"foo", 0).expect("key should exist");
+        #[allow(clippy::unwrap_used)]
+        let value_bytes = entry.value.as_bytes().unwrap();
+        assert_eq!(value_bytes, b"bar");
+    });
 }
 
 #[test]
@@ -205,13 +214,12 @@ fn test_inline_fallthrough() {
 #[test]
 fn test_inline_mixed_batch() {
     let dbs = make_dbs();
-    {
-        let mut guard = dbs.write_db(0, 0);
-        guard.set(
+    crate::shard::slice::with_shard_db(0, |db| {
+        db.set(
             Bytes::from_static(b"foo"),
             Entry::new_string(Bytes::from_static(b"bar")),
         );
-    }
+    });
     // GET foo followed by PING
     let mut read_buf = BytesMut::new();
     read_buf.extend_from_slice(b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n");
@@ -242,13 +250,12 @@ fn test_inline_mixed_batch() {
 #[test]
 fn test_inline_case_insensitive() {
     let dbs = make_dbs();
-    {
-        let mut guard = dbs.write_db(0, 0);
-        guard.set(
+    crate::shard::slice::with_shard_db(0, |db| {
+        db.set(
             Bytes::from_static(b"foo"),
             Entry::new_string(Bytes::from_static(b"baz")),
         );
-    }
+    });
     let mut read_buf = BytesMut::from(&b"*2\r\n$3\r\nget\r\n$3\r\nfoo\r\n"[..]);
     let mut write_buf = BytesMut::new();
     let aof_pool: Option<std::sync::Arc<crate::persistence::aof::AofWriterPool>> = None;
@@ -339,17 +346,16 @@ fn test_inline_set_with_aof_falls_through_when_writes_disabled() {
 #[test]
 fn test_inline_multiple_gets() {
     let dbs = make_dbs();
-    {
-        let mut guard = dbs.write_db(0, 0);
-        guard.set(
+    crate::shard::slice::with_shard_db(0, |db| {
+        db.set(
             Bytes::from_static(b"a"),
             Entry::new_string(Bytes::from_static(b"1")),
         );
-        guard.set(
+        db.set(
             Bytes::from_static(b"b"),
             Entry::new_string(Bytes::from_static(b"2")),
         );
-    }
+    });
     let mut read_buf = BytesMut::new();
     read_buf.extend_from_slice(b"*2\r\n$3\r\nGET\r\n$1\r\na\r\n");
     read_buf.extend_from_slice(b"*2\r\n$3\r\nGET\r\n$1\r\nb\r\n");

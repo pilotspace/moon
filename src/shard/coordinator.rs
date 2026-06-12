@@ -2004,7 +2004,11 @@ pub async fn coordinate_swapdb(
                 b"ERR SWAPDB aborted: WAL enqueue failed (persistence backpressure)",
             ));
         }
-        shard_databases.swap_dbs(my_shard, a, b);
+        crate::shard::slice::with_shard(|s| {
+            if a != b {
+                s.databases.swap(a, b);
+            }
+        });
     }
 
     // Await all-remote-shard acks before returning +OK.
@@ -2075,7 +2079,11 @@ mod tests {
         dbs[0].set_string(Bytes::from_static(b"a"), Bytes::from_static(b"1"));
         dbs[0].set_string(Bytes::from_static(b"b"), Bytes::from_static(b"2"));
 
-        let shard_databases = ShardDatabases::new(vec![dbs]);
+        let (shard_databases, mut inits) = ShardDatabases::new(vec![dbs]);
+        // coordinate_mget uses with_shard_db for local keys; ShardSlice must be initialized.
+        crate::shard::slice::reset_test_shard(crate::shard::slice::ShardSlice::new(
+            inits.remove(0),
+        ));
         let dispatch_tx: Rc<RefCell<Vec<HeapProd<ShardMessage>>>> =
             Rc::new(RefCell::new(Vec::new()));
 
@@ -2115,7 +2123,10 @@ mod tests {
     async fn test_coordinate_mset_all_local() {
         use crate::storage::Database;
         let dbs = vec![Database::new()];
-        let shard_databases = ShardDatabases::new(vec![dbs]);
+        let (shard_databases, mut inits) = ShardDatabases::new(vec![dbs]);
+        crate::shard::slice::reset_test_shard(crate::shard::slice::ShardSlice::new(
+            inits.remove(0),
+        ));
         let dispatch_tx: Rc<RefCell<Vec<HeapProd<ShardMessage>>>> =
             Rc::new(RefCell::new(Vec::new()));
 
@@ -2143,11 +2154,11 @@ mod tests {
         .await;
         assert_eq!(result, Frame::SimpleString(Bytes::from_static(b"OK")));
 
-        // Verify keys were set
-        let mut guard = shard_databases.write_db(0, 0);
-        guard.refresh_now_from_cache(&cached_clock);
-        let entry = guard.get(b"x");
-        assert!(entry.is_some());
+        // Verify keys were set via ShardSlice path.
+        crate::shard::slice::with_shard_db(0, |db| {
+            let entry = db.get(b"x");
+            assert!(entry.is_some());
+        });
     }
 
     #[cfg(feature = "runtime-tokio")]
@@ -2159,7 +2170,11 @@ mod tests {
         dbs[0].set_string(Bytes::from_static(b"b"), Bytes::from_static(b"2"));
         dbs[0].set_string(Bytes::from_static(b"c"), Bytes::from_static(b"3"));
 
-        let shard_databases = ShardDatabases::new(vec![dbs]);
+        let (shard_databases, mut inits) = ShardDatabases::new(vec![dbs]);
+        // coordinate_multi_del_or_exists uses with_shard_db for local keys; ShardSlice must be initialized.
+        crate::shard::slice::reset_test_shard(crate::shard::slice::ShardSlice::new(
+            inits.remove(0),
+        ));
         let dispatch_tx: Rc<RefCell<Vec<HeapProd<ShardMessage>>>> =
             Rc::new(RefCell::new(Vec::new()));
 
@@ -2278,7 +2293,13 @@ mod tests {
         use crate::storage::Database;
 
         let dbs = vec![Database::new()];
-        let shard_databases = Arc::new(ShardDatabases::new(vec![dbs]));
+        let (shard_databases_inner, mut inits) = ShardDatabases::new(vec![dbs]);
+        // scatter_text_search calls execute_text_search_local which uses with_shard;
+        // ShardSlice must be initialized on this thread.
+        crate::shard::slice::reset_test_shard(crate::shard::slice::ShardSlice::new(
+            inits.remove(0),
+        ));
+        let shard_databases = Arc::new(shard_databases_inner);
 
         // Empty dispatch_tx — any SPSC send would panic (no channels configured).
         let dispatch_tx: Rc<RefCell<Vec<HeapProd<ShardMessage>>>> =

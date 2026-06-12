@@ -275,20 +275,26 @@ pub async fn run_embedded(
         .iter_mut()
         .map(|s| std::mem::take(&mut s.databases))
         .collect();
-    let shard_databases = ShardDatabases::new(all_dbs);
+    let (shard_databases, mut slice_inits) = ShardDatabases::new(all_dbs);
 
     // Auxiliary WAL replay paths (no-op when files do not exist).
+    // Graph + temporal + MQ replays operate on ShardSliceInit (mutate pre-shard state).
+    // Workspace replay operates on Arc<ShardDatabases> (shared WorkspaceRegistry).
     #[cfg(feature = "graph")]
     if let Some(ref dir) = persistence_dir {
         let dir_path = std::path::Path::new(dir);
-        shard_databases.recover_graph_stores(dir_path);
-        shard_databases.replay_graph_wal(dir_path);
+        crate::shard::shared_databases::recover_graph_stores(&mut slice_inits, dir_path);
+        crate::shard::shared_databases::replay_graph_wal(
+            &mut slice_inits,
+            dir_path,
+            config.databases,
+        );
     }
     if let Some(ref dir) = persistence_dir {
         let dir_path = std::path::Path::new(dir);
-        shard_databases.replay_temporal_wal(dir_path);
-        shard_databases.replay_workspace_wal(dir_path);
-        shard_databases.replay_mq_wal(dir_path);
+        crate::shard::shared_databases::replay_temporal_wal(&mut slice_inits, dir_path);
+        crate::shard::shared_databases::replay_workspace_wal(&shard_databases, dir_path);
+        crate::shard::shared_databases::replay_mq_wal(&mut slice_inits, dir_path);
     }
 
     // Readiness flag — `/readyz` is gated on this; harmless without admin port.
@@ -317,6 +323,8 @@ pub async fn run_embedded(
         let shard_pubsub_regs = all_pubsub_registries.clone();
         let shard_remote_sub_maps = all_remote_sub_maps.clone();
         let shard_affinity = affinity_tracker.clone();
+        // C1: hand the shard its ShardSlice initializer — consumed by init_shard inside run().
+        let shard_slice_init = slice_inits.remove(0);
 
         let handle = std::thread::Builder::new()
             .name(format!("embedded-moon-shard-{}", id))
@@ -349,6 +357,7 @@ pub async fn run_embedded(
                                 shard_pubsub_regs,
                                 shard_remote_sub_maps,
                                 shard_affinity,
+                                shard_slice_init,
                             )
                             .await;
                     },

@@ -138,6 +138,47 @@ pub struct ShardSliceInit {
     pub store_memory: Arc<ShardStoreMemory>,
 }
 
+impl ShardSliceInit {
+    /// Build one init package per shard from pre-restored databases plus
+    /// clones of the shared masters' atomics (shardslice-migration C1).
+    ///
+    /// Called by `ShardDatabases::new` at boot; each package is handed to its
+    /// shard thread's spawn closure BY MOVE and consumed by `init_shard`.
+    /// Stores and registries start empty/lazy — recovery has already replayed
+    /// into `shard_databases` before this point, and store recovery (vector/
+    /// text/graph) happens on the shard thread after `init_shard`.
+    pub fn build_all(
+        shard_databases: Vec<Vec<Database>>,
+        memory_per_shard: &[Arc<AtomicUsize>],
+        store_memory_per_shard: &[Arc<ShardStoreMemory>],
+    ) -> Vec<ShardSliceInit> {
+        shard_databases
+            .into_iter()
+            .enumerate()
+            .map(|(shard_id, dbs)| {
+                let databases: Box<[Database]> = dbs.into_boxed_slice();
+                ShardSliceInit {
+                    shard_id,
+                    databases,
+                    vector_store: VectorStore::new(),
+                    text_store: TextStore::new(),
+                    #[cfg(feature = "graph")]
+                    graph_store: GraphStore::new(),
+                    kv_write_intents: KvWriteIntents::new(),
+                    deferred_hnsw_inserts: DeferredHnswInserts::new(),
+                    temporal_registry: None,
+                    temporal_kv_index: None,
+                    durable_queue_registry: None,
+                    trigger_registry: None,
+                    wal_append_tx: None,
+                    estimated_memory: memory_per_shard[shard_id].clone(),
+                    store_memory: store_memory_per_shard[shard_id].clone(),
+                }
+            })
+            .collect()
+    }
+}
+
 impl ShardSlice {
     /// Construct a `ShardSlice` from its initializer.
     ///
@@ -184,6 +225,7 @@ thread_local! {
 /// Panics if called a second time on the same thread — double-initialization
 /// indicates a programming error in shard startup.
 pub fn init_shard(slice: ShardSlice) {
+    let shard_id = slice.shard_id;
     SHARD.with(|cell| {
         let mut guard = cell.borrow_mut();
         if guard.is_some() {
@@ -194,6 +236,26 @@ pub fn init_shard(slice: ShardSlice) {
             );
         }
         *guard = Some(slice);
+    });
+    // C1 (shardslice-migration): one line per shard, before its first accept.
+    // test_ssm1_slice_live_at_startup pins this exact marker + shard id.
+    // The shard id is embedded directly in the message (not as a structured
+    // tracing field) so that the test can match "shard=N" as a contiguous
+    // substring — ANSI colour codes inserted around structured-field `=`
+    // separators break plain string matching of `"shard=0"`.
+    tracing::info!("ShardSlice initialized shard={}", shard_id);
+}
+
+/// Test-only: forcibly replace the thread-local ShardSlice with a fresh one.
+///
+/// Production code MUST use `init_shard` (which panics on double-init).
+/// Tests often run multiple test functions on the same OS thread; this helper
+/// lets each test reset to a clean state without triggering the double-init
+/// guard.  Only compiled in `#[cfg(test)]` — never available in production.
+#[cfg(test)]
+pub fn reset_test_shard(slice: ShardSlice) {
+    SHARD.with(|cell| {
+        *cell.borrow_mut() = Some(slice);
     });
 }
 
@@ -283,6 +345,33 @@ pub fn is_initialized() -> bool {
         #[allow(clippy::unwrap_used)] // not inside any closure — cannot be reentrant here
         cell.try_borrow().map(|g| g.is_some()).unwrap_or(false)
     })
+}
+
+/// Assert that `init_shard` has been called on the current thread; abort the
+/// process with the shard id if it has not.
+///
+/// Call this ONCE at the entry of the shard accept/drain loop, after
+/// `init_shard(init)` is called and before the first connection is accepted.
+/// This is the C1 startup-abort guard: an uninitialized shard fails fast at
+/// startup (not per-command), so no command is ever answered on an
+/// uninitialized thread.
+///
+/// Using this helper keeps `is_initialized()` calls out of production
+/// dispatch paths (the shape test forbids `is_initialized()` outside
+/// slice.rs).
+#[inline]
+pub fn assert_initialized(shard_id: usize) {
+    if !is_initialized() {
+        // Startup abort: the shard event loop entered without init_shard.
+        // Panic here (before the first accept) so the process terminates
+        // before any command can be answered on an uninitialized thread.
+        panic!(
+            "ShardSlice not initialized on shard thread {} — \
+             init_shard must be called before the accept/drain loop. \
+             This is a startup-configuration bug, not a runtime error.",
+            shard_id
+        );
+    }
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────

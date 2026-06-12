@@ -120,7 +120,6 @@ pub(super) async fn try_handle_ft_command(
                         let as_of_lsn = match resolve_ft_search_as_of_lsn(
                             cmd_args,
                             Some(&ctx.shard_databases),
-                            ctx.shard_id,
                             conn.active_cross_txn.as_ref(),
                         ) {
                             Ok(lsn) => lsn,
@@ -225,46 +224,42 @@ pub(super) async fn try_handle_ft_command(
                 // We use the TextIndex's own field_analyzers (same pipeline used at index time).
                 type ParseResult =
                     Result<(Vec<crate::command::vector_search::QueryTerm>, Option<usize>), String>;
-                let parse_result: ParseResult = {
-                    let ts = ctx.shard_databases.text_store(ctx.shard_id);
-                    match ts.get_index(&index_name) {
+                // Parse query via thread-local slice (text_store is !Send, no lock needed).
+                let parse_result: ParseResult = crate::shard::slice::with_shard(|s| {
+                    match s.text_store.get_index(&index_name) {
                         None => Err("ERR no such index".to_owned()),
-                        Some(text_index) => {
-                            match text_index.field_analyzers.first() {
-                                None => Err("ERR index has no TEXT fields".to_owned()),
-                                Some(analyzer) => {
-                                    // analyzer borrows text_index which borrows ts — all in this block.
-                                    let parsed = crate::command::vector_search::parse_text_query(
-                                        &query_str, analyzer,
-                                    );
-                                    match parsed {
-                                        Err(e) => Err(e.to_owned()),
-                                        Ok(clause) => {
-                                            let field_idx = match &clause.field_name {
-                                                None => Ok(None),
-                                                Some(field_name) => match text_index
-                                                    .text_fields
-                                                    .iter()
-                                                    .position(|f| {
-                                                        f.field_name.as_ref().eq_ignore_ascii_case(
-                                                            field_name.as_ref(),
-                                                        )
-                                                    }) {
+                        Some(text_index) => match text_index.field_analyzers.first() {
+                            None => Err("ERR index has no TEXT fields".to_owned()),
+                            Some(analyzer) => {
+                                let parsed = crate::command::vector_search::parse_text_query(
+                                    &query_str, analyzer,
+                                );
+                                match parsed {
+                                    Err(e) => Err(e.to_owned()),
+                                    Ok(clause) => {
+                                        let field_idx = match &clause.field_name {
+                                            None => Ok(None),
+                                            Some(field_name) => {
+                                                match text_index.text_fields.iter().position(|f| {
+                                                    f.field_name
+                                                        .as_ref()
+                                                        .eq_ignore_ascii_case(field_name.as_ref())
+                                                }) {
                                                     Some(idx) => Ok(Some(idx)),
                                                     None => Err(format!(
                                                         "ERR unknown field '{}'",
                                                         String::from_utf8_lossy(field_name)
                                                     )),
-                                                },
-                                            };
-                                            field_idx.map(|idx| (clause.terms, idx))
-                                        }
+                                                }
+                                            }
+                                        };
+                                        field_idx.map(|idx| (clause.terms, idx))
                                     }
                                 }
                             }
-                        }
+                        },
                     }
-                }; // MutexGuard dropped here
+                }); // with_shard borrow released here
 
                 let (query_terms, field_idx) = match parse_result {
                     Ok(t) => t,
@@ -326,7 +321,6 @@ pub(super) async fn try_handle_ft_command(
                         match resolve_ft_search_as_of_lsn(
                             cmd_args,
                             Some(&ctx.shard_databases),
-                            ctx.shard_id,
                             conn.active_cross_txn.as_ref(),
                         ) {
                             Err(err_frame) => err_frame,
@@ -730,7 +724,6 @@ pub(super) async fn try_handle_ft_command(
             resolve_ft_search_as_of_lsn(
                 cmd_args,
                 Some(&ctx.shard_databases),
-                ctx.shard_id,
                 conn.active_cross_txn.as_ref(),
             )
         } else {

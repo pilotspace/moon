@@ -1511,7 +1511,7 @@ pub async fn handle_connection(
                                         // TEMP-04: single-shard handler has no TemporalRegistry and no cross-store TXN.
                                         // Unified helper with shard_databases=None returns ERR on AS_OF (correct per
                                         // Plan 165-01 contract); non-AS_OF continues to return latest (as_of_lsn=0).
-                                        match resolve_ft_search_as_of_lsn(cmd_args, None, 0, None) {
+                                        match resolve_ft_search_as_of_lsn(cmd_args, None, None) {
                                             Err(err_frame) => err_frame,
                                             Ok(as_of_lsn) => {
                                                 let has_session = cmd_args.iter().any(|a| {
@@ -1733,7 +1733,7 @@ pub async fn handle_connection(
                                             // TEMP-04: single-shard handler has no TemporalRegistry and no cross-store TXN.
                                             // Unified helper with shard_databases=None returns ERR on AS_OF (correct per
                                             // Plan 165-01 contract); non-AS_OF continues to return latest (as_of_lsn=0).
-                                            match resolve_ft_search_as_of_lsn(d_args, None, 0, None) {
+                                            match resolve_ft_search_as_of_lsn(d_args, None, None) {
                                                 Err(err_frame) => err_frame,
                                                 Ok(as_of_lsn) => {
                                                     let has_session = d_args.iter().any(|a| {
@@ -2017,7 +2017,7 @@ pub async fn handle_connection(
                                             // Write run: guard is already write-locked.
                                             // TEMP-04: single-shard handler has no registry and no TXN; helper returns
                                             // ERR on AS_OF and Ok(0) otherwise (Plan 165-01 contract).
-                                            match resolve_ft_search_as_of_lsn(d_args, None, 0, None) {
+                                            match resolve_ft_search_as_of_lsn(d_args, None, None) {
                                                 Err(err_frame) => err_frame,
                                                 Ok(as_of_lsn) => crate::command::vector_search::ft_search(&mut *store, d_args, Some(&mut *guard), Some(&*ts_m3), as_of_lsn),
                                             }

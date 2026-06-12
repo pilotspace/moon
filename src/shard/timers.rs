@@ -18,8 +18,9 @@ use super::shared_databases::ShardDatabases;
 pub(crate) fn run_active_expiry(shard_databases: &Arc<ShardDatabases>, shard_id: usize) {
     let db_count = shard_databases.db_count();
     for i in 0..db_count {
-        let mut guard = shard_databases.write_db(shard_id, i);
-        crate::server::expiration::expire_cycle_direct(&mut guard);
+        crate::shard::slice::with_shard_db(i, |db| {
+            crate::server::expiration::expire_cycle_direct(db);
+        });
     }
     // Update RSS gauge on shard 0 only, once per second (not every 100ms tick).
     // Gated by a simple counter to reduce /proc/self/statm open/read/close churn.
@@ -48,8 +49,9 @@ pub(crate) fn run_eviction(
         let budget = shard_databases.elastic_budget(shard_id);
         let db_count = shard_databases.db_count();
         for i in 0..db_count {
-            let mut guard = shard_databases.write_db(shard_id, i);
-            let _ = crate::storage::eviction::try_evict_if_needed_budget(&mut guard, &rt, budget);
+            crate::shard::slice::with_shard_db(i, |db| {
+                let _ = crate::storage::eviction::try_evict_if_needed_budget(db, &rt, budget);
+            });
         }
     }
 }
@@ -94,38 +96,40 @@ pub(crate) fn fire_pending_mq_triggers(
     now_ms: u64,
     pubsub_registry: &Arc<parking_lot::RwLock<crate::pubsub::PubSubRegistry>>,
 ) {
-    let mut guard = shard_databases.trigger_registry(shard_id);
-    let Some(reg) = guard.as_mut() else { return };
-
-    // Collect keys of triggers ready to fire
-    let ready_keys = reg.fire_ready(now_ms);
+    // Collect keys of triggers ready to fire via with_shard (no lock needed on slice path).
+    let ready_keys: Vec<bytes::Bytes> = crate::shard::slice::with_shard(|s| {
+        let Some(ref mut reg) = s.trigger_registry else {
+            return Vec::new();
+        };
+        reg.fire_ready(now_ms)
+    });
     if ready_keys.is_empty() {
         return;
     }
 
-    // Collect (channel, message) pairs while holding trigger lock,
-    // then publish after releasing it to avoid holding two locks.
-    let mut notifications: Vec<(bytes::Bytes, bytes::Bytes)> = Vec::with_capacity(ready_keys.len());
-
-    for key in &ready_keys {
-        if let Some(entry) = reg.get(key) {
-            // Build pub/sub channel name: "mq:trigger:{queue_key}"
-            let channel = {
-                let mut ch = Vec::with_capacity(11 + entry.queue_key.len());
-                ch.extend_from_slice(b"mq:trigger:");
-                ch.extend_from_slice(&entry.queue_key);
-                bytes::Bytes::from(ch)
-            };
-            notifications.push((channel, entry.callback_cmd.clone()));
+    // Collect (channel, message) pairs via with_shard while not crossing await.
+    let notifications: Vec<(bytes::Bytes, bytes::Bytes)> = crate::shard::slice::with_shard(|s| {
+        let Some(ref mut reg) = s.trigger_registry else {
+            return Vec::new();
+        };
+        let mut out = Vec::with_capacity(ready_keys.len());
+        for key in &ready_keys {
+            if let Some(entry) = reg.get(key) {
+                let channel = {
+                    let mut ch = Vec::with_capacity(11 + entry.queue_key.len());
+                    ch.extend_from_slice(b"mq:trigger:");
+                    ch.extend_from_slice(&entry.queue_key);
+                    bytes::Bytes::from(ch)
+                };
+                out.push((channel, entry.callback_cmd.clone()));
+            }
+            reg.mark_fired(key, now_ms);
         }
-        // Mark as fired (updates last_fire_ms, clears pending_fire_ms)
-        reg.mark_fired(key, now_ms);
-    }
+        out
+    });
+    let _ = shard_databases; // shared handle no longer needed on this path
 
-    // Release trigger registry lock before acquiring pubsub lock
-    drop(guard);
-
-    // Publish each trigger notification via pub/sub
+    // Publish each trigger notification via pub/sub (outside with_shard — no re-entry).
     if !notifications.is_empty() {
         let mut pubsub = pubsub_registry.write();
         for (channel, message) in &notifications {
@@ -169,55 +173,48 @@ pub(crate) fn run_cold_orphan_sweep(
     let mut total = SweepStats::default();
 
     for db_idx in 0..db_count {
-        let mut guard = shard_databases.write_db(shard_id, db_idx);
+        // Phase 1: collect orphan keys and pending-unlink flag inside with_shard_db.
+        let (orphan_keys, has_pending_unlink) = crate::shard::slice::with_shard_db(db_idx, |db| {
+            if db.cold_index.is_none() {
+                return (Vec::new(), false);
+            }
+            let orphan_keys: Vec<bytes::Bytes> = db
+                .cold_index
+                .as_ref()
+                .map(|ci| {
+                    ci.iter()
+                        .filter(|(key, _loc)| db.is_hot(key))
+                        .map(|(k, _)| k.clone())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let has_pending_unlink = db
+                .cold_index
+                .as_ref()
+                .map(|ci| ci.has_pending_unlink())
+                .unwrap_or(false);
+            (orphan_keys, has_pending_unlink)
+        });
 
-        // Skip databases without a cold index (disk-offload disabled or no spills).
-        if guard.cold_index.is_none() {
-            continue;
-        }
-
-        // Two-phase sweep to sidestep the &mut cold_index / &db borrow conflict:
-        //
-        // Phase 1: collect orphan keys (immutable borrow of cold_index + db).
-        // A cold entry is an orphan when the key is also present in the hot
-        // DashTable — meaning a hot write shadowed the spilled copy.
-        let orphan_keys: Vec<bytes::Bytes> = guard
-            .cold_index
-            .as_ref()
-            .map(|ci| {
-                ci.iter()
-                    .filter(|(key, _loc)| guard.is_hot(key))
-                    .map(|(k, _)| k.clone())
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        // Skip only when there is nothing to do: no hot-shadowed orphan keys AND
-        // no zero-ref files queued for unlink. Files orphaned by re-eviction
-        // (insert overwrite) or promotion (remove) carry no hot∩cold key, so the
-        // drain must still run for them even when `orphan_keys` is empty.
-        let has_pending_unlink = guard
-            .cold_index
-            .as_ref()
-            .map(|ci| ci.has_pending_unlink())
-            .unwrap_or(false);
         if orphan_keys.is_empty() && !has_pending_unlink {
             continue;
         }
 
-        // Phase 2: delete files + update cold_index (mutable borrow; db not borrowed).
-        let stats = guard.cold_index.as_mut().and_then(|ci| {
-            ci.sweep_known_orphans(orphan_keys, shard_dir, manifest.as_deref_mut())
-                .map_err(|e| {
-                    tracing::error!(
-                        shard = shard_id,
-                        db = db_idx,
-                        err = %e,
-                        "cold_orphan_sweep: manifest commit error",
-                    );
-                    e
-                })
-                .ok()
+        // Phase 2: delete files + update cold_index.
+        let stats = crate::shard::slice::with_shard_db(db_idx, |db| {
+            db.cold_index.as_mut().and_then(|ci| {
+                ci.sweep_known_orphans(orphan_keys, shard_dir, manifest.as_deref_mut())
+                    .map_err(|e| {
+                        tracing::error!(
+                            shard = shard_id,
+                            db = db_idx,
+                            err = %e,
+                            "cold_orphan_sweep: manifest commit error",
+                        );
+                        e
+                    })
+                    .ok()
+            })
         });
 
         if let Some(s) = stats {

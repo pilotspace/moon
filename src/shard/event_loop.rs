@@ -73,8 +73,15 @@ impl super::Shard {
         all_pubsub_registries: Vec<Arc<parking_lot::RwLock<PubSubRegistry>>>,
         all_remote_sub_maps: Vec<Arc<parking_lot::RwLock<RemoteSubscriberMap>>>,
         affinity_tracker: Arc<parking_lot::RwLock<AffinityTracker>>,
+        slice_init: crate::shard::slice::ShardSliceInit,
     ) {
         let _shard_id = self.id;
+
+        // C1: Initialize thread-local ShardSlice before any command handling.
+        // MUST be called before the accept/drain loop — assert_initialized panics
+        // on the first accept if this is skipped.
+        crate::shard::slice::init_shard(crate::shard::slice::ShardSlice::new(slice_init));
+        crate::shard::slice::assert_initialized(self.id);
 
         // Publish disk-offload status for INFO moonstore (set once per shard, idempotent).
         crate::vector::metrics::MOONSTORE_DISK_OFFLOAD_ENABLED.store(
@@ -1103,24 +1110,23 @@ impl super::Shard {
                 _ = spsc_notify_local.notified() => {
                     crate::admin::metrics_setup::bump_spsc_notify_wake();
                     let mut pending_snapshot = None;
-                    let hit_cap = {
-                        crate::shard::slice::with_shard(|s| {
-                            spsc_handler::drain_spsc_shared(
-                                &shard_databases, &mut consumers, &mut *pubsub_arc.write(),
-                                &blocking_rc, &mut pending_snapshot, &mut snapshot_state,
-                                &mut wal_writer, &mut wal_v3_writer, &repl_backlog, &mut replica_txs,
-                                &repl_offsets, shard_id, &script_cache_rc, &cached_clock,
-                                &mut pending_migrations, &mut s.vector_store,
-                                &mut pending_cdc_subscribes,
-                                &mut shard_manifest,
-                                server_config.mvcc_committed_prune_margin,
-                                server_config.graph_merge_max_segments,
-                                server_config.graph_dead_edge_trigger,
-                                &mut autovacuum_daemon,
-                                aof_pool.as_ref(),  // FIX-W1-2
-                            )
-                        })
-                    };
+                    // No outer with_shard wrapper — each arm in drain_spsc_shared
+                    // takes its own flat borrow, eliminating the re-entrancy BorrowMutError
+                    // that occurred when arms called with_shard inside an enclosing borrow.
+                    let hit_cap = spsc_handler::drain_spsc_shared(
+                        &shard_databases, &mut consumers, &mut *pubsub_arc.write(),
+                        &blocking_rc, &mut pending_snapshot, &mut snapshot_state,
+                        &mut wal_writer, &mut wal_v3_writer, &repl_backlog, &mut replica_txs,
+                        &repl_offsets, shard_id, &script_cache_rc, &cached_clock,
+                        &mut pending_migrations,
+                        &mut pending_cdc_subscribes,
+                        &mut shard_manifest,
+                        server_config.mvcc_committed_prune_margin,
+                        server_config.graph_merge_max_segments,
+                        server_config.graph_dead_edge_trigger,
+                        &mut autovacuum_daemon,
+                        aof_pool.as_ref(),  // FIX-W1-2
+                    );
                     if hit_cap {
                         // M3: capped drain may have left a tail — re-arm immediately
                         // instead of stranding it until the next periodic tick.
@@ -1201,24 +1207,21 @@ impl super::Shard {
                     next_file_id = next_file_id.max(spill_file_id.get());
 
                     let mut pending_snapshot = None;
-                    let hit_cap = {
-                        crate::shard::slice::with_shard(|s| {
-                            spsc_handler::drain_spsc_shared(
-                                &shard_databases, &mut consumers, &mut *pubsub_arc.write(),
-                                &blocking_rc, &mut pending_snapshot, &mut snapshot_state,
-                                &mut wal_writer, &mut wal_v3_writer, &repl_backlog, &mut replica_txs,
-                                &repl_offsets, shard_id, &script_cache_rc, &cached_clock,
-                                &mut pending_migrations, &mut s.vector_store,
-                                &mut pending_cdc_subscribes,
-                                &mut shard_manifest,
-                                server_config.mvcc_committed_prune_margin,
-                                server_config.graph_merge_max_segments,
-                                server_config.graph_dead_edge_trigger,
-                                &mut autovacuum_daemon,
-                                aof_pool.as_ref(),  // FIX-W1-2
-                            )
-                        })
-                    };
+                    // No outer with_shard — each arm takes its own flat borrow.
+                    let hit_cap = spsc_handler::drain_spsc_shared(
+                        &shard_databases, &mut consumers, &mut *pubsub_arc.write(),
+                        &blocking_rc, &mut pending_snapshot, &mut snapshot_state,
+                        &mut wal_writer, &mut wal_v3_writer, &repl_backlog, &mut replica_txs,
+                        &repl_offsets, shard_id, &script_cache_rc, &cached_clock,
+                        &mut pending_migrations,
+                        &mut pending_cdc_subscribes,
+                        &mut shard_manifest,
+                        server_config.mvcc_committed_prune_margin,
+                        server_config.graph_merge_max_segments,
+                        server_config.graph_dead_edge_trigger,
+                        &mut autovacuum_daemon,
+                        aof_pool.as_ref(),  // FIX-W1-2
+                    );
                     if hit_cap {
                         // M3: capped drain may have left a tail — re-arm immediately
                         // instead of stranding it until the next periodic tick.
@@ -1765,35 +1768,31 @@ impl super::Shard {
                 // --- Every-wake body (mirrors the tokio notify arm): drain SPSC,
                 //     handle drain outputs, sweep the pending_wakers relay ---
                 let mut pending_snapshot = None;
-                let hit_cap = {
-                    crate::shard::slice::with_shard(|s| {
-                        spsc_handler::drain_spsc_shared(
-                            &shard_databases,
-                            &mut consumers,
-                            &mut *pubsub_arc.write(),
-                            &blocking_rc,
-                            &mut pending_snapshot,
-                            &mut snapshot_state,
-                            &mut wal_writer,
-                            &mut wal_v3_writer,
-                            &repl_backlog,
-                            &mut replica_txs,
-                            &repl_offsets,
-                            shard_id,
-                            &script_cache_rc,
-                            &cached_clock,
-                            &mut pending_migrations,
-                            &mut s.vector_store,
-                            &mut pending_cdc_subscribes,
-                            &mut shard_manifest,
-                            server_config.mvcc_committed_prune_margin,
-                            server_config.graph_merge_max_segments,
-                            server_config.graph_dead_edge_trigger,
-                            &mut autovacuum_daemon,
-                            aof_pool.as_ref(), // FIX-W1-2
-                        )
-                    })
-                };
+                // No outer with_shard — each arm takes its own flat borrow.
+                let hit_cap = spsc_handler::drain_spsc_shared(
+                    &shard_databases,
+                    &mut consumers,
+                    &mut *pubsub_arc.write(),
+                    &blocking_rc,
+                    &mut pending_snapshot,
+                    &mut snapshot_state,
+                    &mut wal_writer,
+                    &mut wal_v3_writer,
+                    &repl_backlog,
+                    &mut replica_txs,
+                    &repl_offsets,
+                    shard_id,
+                    &script_cache_rc,
+                    &cached_clock,
+                    &mut pending_migrations,
+                    &mut pending_cdc_subscribes,
+                    &mut shard_manifest,
+                    server_config.mvcc_committed_prune_margin,
+                    server_config.graph_merge_max_segments,
+                    server_config.graph_dead_edge_trigger,
+                    &mut autovacuum_daemon,
+                    aof_pool.as_ref(), // FIX-W1-2
+                );
                 if hit_cap {
                     // M3: the drain stopped at its per-cycle cap (or a snapshot
                     // barrier) — re-arm immediately so the tail drains on the next

@@ -41,7 +41,15 @@ pub(crate) fn handle_pending_snapshot(
             } else {
                 snap_dir.join(format!("shard-{}.rrdshard", shard_id))
             };
-            let (segment_counts, base_timestamps) = shard_databases.snapshot_metadata(shard_id);
+            let (segment_counts, base_timestamps) = crate::shard::slice::with_shard(|s| {
+                let mut seg_counts = Vec::with_capacity(s.databases.len());
+                let mut base_ts = Vec::with_capacity(s.databases.len());
+                for db in s.databases.iter() {
+                    seg_counts.push(db.data().segment_count());
+                    base_ts.push(db.base_timestamp());
+                }
+                (seg_counts, base_ts)
+            });
             let db_count = shard_databases.db_count();
             let mut state = SnapshotState::new_from_metadata(
                 shard_id as u16,
@@ -89,7 +97,15 @@ pub(crate) fn check_auto_save_trigger(
             } else {
                 std::path::PathBuf::from(dir).join(format!("shard-{}.rrdshard", shard_id))
             };
-            let (segment_counts, base_timestamps) = shard_databases.snapshot_metadata(shard_id);
+            let (segment_counts, base_timestamps) = crate::shard::slice::with_shard(|s| {
+                let mut seg_counts = Vec::with_capacity(s.databases.len());
+                let mut base_ts = Vec::with_capacity(s.databases.len());
+                for db in s.databases.iter() {
+                    seg_counts.push(db.data().segment_count());
+                    base_ts.push(db.base_timestamp());
+                }
+                (seg_counts, base_ts)
+            });
             let db_count = shard_databases.db_count();
             let mut state = SnapshotState::new_from_metadata(
                 shard_id as u16,
@@ -352,7 +368,22 @@ pub(crate) fn run_eviction_tick(
     // C5 / M4: publish vector/text/graph store memory for lock-free observers.
     // Uses the existing lock path (Wave E collapses to slice). Runs every tick
     // so Prometheus and MEMORY DOCTOR never see stale zero values for long.
-    shard_databases.publish_store_memory(shard_id);
+    // C5 / M4: publish vector/text/graph store-memory atomics via thread-local slice.
+    crate::shard::slice::with_shard(|s| {
+        use std::sync::atomic::Ordering;
+        let (mutable, immutable) = s.vector_store.resident_bytes();
+        s.store_memory
+            .vector
+            .store(mutable + immutable, Ordering::Relaxed);
+        s.store_memory.text.store(0, Ordering::Relaxed); // TextStore has no aggregate API yet
+        #[cfg(feature = "graph")]
+        {
+            let graph_bytes = s.graph_store.resident_bytes();
+            s.store_memory.graph.store(graph_bytes, Ordering::Relaxed);
+        }
+        #[cfg(not(feature = "graph"))]
+        s.store_memory.graph.store(0, Ordering::Relaxed);
+    });
 
     if server_config.disk_offload_enabled()
         && should_run_pressure_cascade(runtime_config, server_config, shard_databases, shard_id)
@@ -1263,7 +1294,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let snap_dir = tmp.path().to_path_buf();
         let dbs = vec![vec![Database::new()]];
-        let shared = ShardDatabases::new(dbs);
+        let (shared, mut inits) = ShardDatabases::new(dbs);
+        crate::shard::slice::reset_test_shard(crate::shard::slice::ShardSlice::new(
+            inits.remove(0),
+        ));
 
         let (tx, _rx) = channel::oneshot::<Result<(), String>>();
         let mut snapshot_state: Option<SnapshotState> = None;
@@ -1290,7 +1324,10 @@ mod tests {
     fn test_handle_pending_snapshot_zero_lsn_is_unknown() {
         let tmp = tempfile::tempdir().unwrap();
         let dbs = vec![vec![Database::new()]];
-        let shared = ShardDatabases::new(dbs);
+        let (shared, mut inits) = ShardDatabases::new(dbs);
+        crate::shard::slice::reset_test_shard(crate::shard::slice::ShardSlice::new(
+            inits.remove(0),
+        ));
 
         let (tx, _rx) = channel::oneshot::<Result<(), String>>();
         let mut snapshot_state: Option<SnapshotState> = None;
@@ -1315,7 +1352,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().to_string_lossy().to_string();
         let dbs = vec![vec![Database::new()]];
-        let shared = ShardDatabases::new(dbs);
+        let (shared, mut inits) = ShardDatabases::new(dbs);
+        crate::shard::slice::reset_test_shard(crate::shard::slice::ShardSlice::new(
+            inits.remove(0),
+        ));
 
         // Trigger goes from epoch 0 → 5; helper observes 5 > last(0) and
         // creates a snapshot state.

@@ -22,7 +22,7 @@ pub(super) fn try_handle_txn_begin(
     cmd: &[u8],
     cmd_args: &[Frame],
     conn: &mut ConnectionState,
-    ctx: &ConnectionContext,
+    _ctx: &ConnectionContext,
     responses: &mut Vec<Frame>,
 ) -> bool {
     if !is_txn_begin(cmd, cmd_args) {
@@ -31,8 +31,8 @@ pub(super) fn try_handle_txn_begin(
     match txn_begin_validate(conn.in_multi, conn.in_cross_txn()) {
         Ok(()) => {
             // Get next txn_id and snapshot_lsn from vector store's transaction manager
-            let mut vector_store = ctx.shard_databases.vector_store(ctx.shard_id);
-            let active = vector_store.txn_manager_mut().begin();
+            let active =
+                crate::shard::slice::with_shard(|s| s.vector_store.txn_manager_mut().begin());
             conn.active_cross_txn = Some(CrossStoreTxn::new(active.txn_id, active.snapshot_lsn));
             responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
         }
@@ -62,16 +62,15 @@ pub(super) async fn try_handle_txn_commit(
                 // behaviour — force the client to restart the transaction.
                 // Scope the vector_store guard so it is DROPPED before any .await
                 // in the MQ-materialize hop below (lock-across-await rule).
-                let killed = {
-                    let mut vector_store = ctx.shard_databases.vector_store(ctx.shard_id);
-                    if vector_store.txn_manager().is_killed(txn.txn_id) {
-                        vector_store.txn_manager_mut().abort_killed(txn.txn_id);
+                let killed = crate::shard::slice::with_shard(|s| {
+                    if s.vector_store.txn_manager().is_killed(txn.txn_id) {
+                        s.vector_store.txn_manager_mut().abort_killed(txn.txn_id);
                         true
                     } else {
-                        vector_store.txn_manager_mut().commit(txn.txn_id);
+                        s.vector_store.txn_manager_mut().commit(txn.txn_id);
                         false
                     }
-                }; // vector_store guard dropped here
+                }); // with_shard borrow released here
                 if killed {
                     tracing::warn!(
                         txn_id = txn.txn_id,
@@ -106,20 +105,11 @@ pub(super) async fn try_handle_txn_commit(
                         .wal_append(ctx.shard_id, bytes::Bytes::from(wal_buf));
                 }
 
-                // Release KV write intents from shard side-table
-                ctx.shard_databases
-                    .kv_intents(ctx.shard_id)
-                    .release_txn(txn_id);
-
-                // Drain deferred HNSW inserts (post-commit hook).
-                // The drain prevents phantom neighbors on abort.
-                // Actual HNSW graph insertion happens during compaction,
-                // not at commit time (point is already in mutable segment).
-                let drain_count = ctx
-                    .shard_databases
-                    .hnsw_queue(ctx.shard_id)
-                    .drain_for_txn(txn_id)
-                    .count();
+                // Release KV write intents and drain HNSW queue via thread-local slice.
+                let drain_count = crate::shard::slice::with_shard(|s| {
+                    s.kv_write_intents.release_txn(txn_id);
+                    s.deferred_hnsw_inserts.drain_for_txn(txn_id).count()
+                });
                 if drain_count > 0 {
                     tracing::debug!(txn_id, count = drain_count, "Drained deferred HNSW inserts");
                 }
@@ -225,7 +215,7 @@ pub(super) async fn try_handle_txn_abort(
 pub(super) fn try_handle_temporal_snapshot_at(
     cmd: &[u8],
     cmd_args: &[Frame],
-    ctx: &ConnectionContext,
+    _ctx: &ConnectionContext,
     responses: &mut Vec<Frame>,
 ) -> bool {
     if !is_temporal_snapshot_at(cmd) {
@@ -234,16 +224,13 @@ pub(super) fn try_handle_temporal_snapshot_at(
     match validate_snapshot_at(cmd_args) {
         Ok(()) => {
             let wall_ms = capture_wall_ms();
-            let lsn = {
-                let vector_store = ctx.shard_databases.vector_store(ctx.shard_id);
-                vector_store.txn_manager().current_lsn()
-            };
-            {
-                let mut guard = ctx.shard_databases.temporal_registry(ctx.shard_id);
-                let registry =
-                    guard.get_or_insert_with(|| Box::new(crate::temporal::TemporalRegistry::new()));
+            crate::shard::slice::with_shard(|s| {
+                let lsn = s.vector_store.txn_manager().current_lsn();
+                let registry = s
+                    .temporal_registry
+                    .get_or_insert_with(|| Box::new(crate::temporal::TemporalRegistry::new()));
                 registry.record(wall_ms, lsn);
-            }
+            });
             responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
         }
         Err(e) => responses.push(e),

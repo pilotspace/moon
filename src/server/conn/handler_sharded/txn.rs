@@ -105,20 +105,18 @@ pub(super) async fn try_handle_txn_commit(
                         .wal_append(ctx.shard_id, bytes::Bytes::from(wal_buf));
                 }
 
-                // Release KV write intents from shard side-table
-                ctx.shard_databases
-                    .kv_intents(ctx.shard_id)
-                    .release_txn(txn_id);
+                // Release KV write intents from shard side-table (ShardSlice path).
+                crate::shard::slice::with_shard(|s| {
+                    s.kv_write_intents.release_txn(txn_id);
+                });
 
                 // Drain deferred HNSW inserts (post-commit hook).
                 // The drain prevents phantom neighbors on abort.
                 // Actual HNSW graph insertion happens during compaction,
                 // not at commit time (point is already in mutable segment).
-                let drain_count = ctx
-                    .shard_databases
-                    .hnsw_queue(ctx.shard_id)
-                    .drain_for_txn(txn_id)
-                    .count();
+                let drain_count = crate::shard::slice::with_shard(|s| {
+                    s.deferred_hnsw_inserts.drain_for_txn(txn_id).count()
+                });
                 if drain_count > 0 {
                     tracing::debug!(txn_id, count = drain_count, "Drained deferred HNSW inserts");
                 }
@@ -237,7 +235,7 @@ pub(super) async fn try_handle_txn_abort(
 pub(super) fn try_handle_temporal_snapshot_at(
     cmd: &[u8],
     cmd_args: &[Frame],
-    ctx: &ConnectionContext,
+    _ctx: &ConnectionContext,
     responses: &mut Vec<Frame>,
 ) -> bool {
     if !is_temporal_snapshot_at(cmd) {
@@ -247,14 +245,13 @@ pub(super) fn try_handle_temporal_snapshot_at(
         Ok(()) => {
             let wall_ms = capture_wall_ms();
             // Unconditional slice path: ShardSlice is always initialized.
-            let lsn =
-                crate::shard::slice::with_shard(|s| s.vector_store.txn_manager().current_lsn());
-            {
-                let mut guard = ctx.shard_databases.temporal_registry(ctx.shard_id);
-                let registry =
-                    guard.get_or_insert_with(|| Box::new(crate::temporal::TemporalRegistry::new()));
+            crate::shard::slice::with_shard(|s| {
+                let lsn = s.vector_store.txn_manager().current_lsn();
+                let registry = s
+                    .temporal_registry
+                    .get_or_insert_with(|| Box::new(crate::temporal::TemporalRegistry::new()));
                 registry.record(wall_ms, lsn);
-            }
+            });
             responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
         }
         Err(e) => responses.push(e),

@@ -441,7 +441,7 @@ mod tests {
         // Wrap as a TopLevel pool to match the post-2e-β helper signature.
         let (tx, _rx) = crate::runtime::channel::mpsc_bounded::<AofMessage>(1);
         let pool = AofWriterPool::top_level(tx);
-        let shard_dbs = crate::shard::shared_databases::ShardDatabases::new(vec![vec![
+        let (shard_dbs, _inits) = crate::shard::shared_databases::ShardDatabases::new(vec![vec![
             crate::storage::Database::new(),
         ]]);
 
@@ -505,7 +505,7 @@ mod tests {
         let _guard = GATE_TEST_LOCK.lock();
         let (tx, _rx) = crate::runtime::channel::mpsc_bounded::<AofMessage>(1);
         let pool = AofWriterPool::top_level(tx);
-        let shard_dbs = crate::shard::shared_databases::ShardDatabases::new(vec![vec![
+        let (shard_dbs, _inits) = crate::shard::shared_databases::ShardDatabases::new(vec![vec![
             crate::storage::Database::new(),
         ]]);
 

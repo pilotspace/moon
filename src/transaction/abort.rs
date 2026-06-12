@@ -90,7 +90,11 @@ use bytes::Bytes;
 /// `parking_lot` guards; no `.await` points are crossed while any guard is
 /// held. Follows Phase 161 lock ordering: each layer's guard is dropped
 /// before the next layer is accessed.
+// `shard_databases` and `shard_id` are consumed only under `#[cfg(feature = "graph")]`
+// (WAL record drain). Without the graph feature they are structurally unused;
+// suppress the lint rather than removing a semantically load-bearing parameter.
 #[allow(clippy::needless_pass_by_value)]
+#[cfg_attr(not(feature = "graph"), allow(unused_variables))]
 pub fn abort_cross_store_txn(
     shard_databases: &ShardDatabases,
     shard_id: usize,
@@ -105,21 +109,22 @@ pub fn abort_cross_store_txn(
     //    out of handler_sharded/handler_monoio TXN.ABORT.
     // ------------------------------------------------------------------
     {
-        let mut db = shard_databases.write_db(shard_id, selected_db);
-        for record in txn.kv_undo.into_rollback_order() {
-            match record {
-                UndoRecord::Insert { key } => {
-                    db.remove(&key);
-                }
-                UndoRecord::Update { key, old_entry } => {
-                    db.set(key, old_entry);
-                }
-                UndoRecord::Delete { key, old_entry } => {
-                    db.set(key, old_entry);
+        crate::shard::slice::with_shard_db(selected_db, |db| {
+            for record in txn.kv_undo.into_rollback_order() {
+                match record {
+                    UndoRecord::Insert { key } => {
+                        db.remove(&key);
+                    }
+                    UndoRecord::Update { key, old_entry } => {
+                        db.set(key, old_entry);
+                    }
+                    UndoRecord::Delete { key, old_entry } => {
+                        db.set(key, old_entry);
+                    }
                 }
             }
-        }
-        // db guard drops at scope end — releases write_db before next layer.
+        });
+        // with_shard_db releases the borrow at the closure boundary — before next layer.
     }
 
     // ------------------------------------------------------------------
@@ -153,53 +158,39 @@ pub fn abort_cross_store_txn(
 
     // ------------------------------------------------------------------
     // 3. Vector rollback — tombstone every mutable-HNSW entry appended
-    //    during the transaction. We use the txn-scoped variant
-    //    `mark_deleted_by_key_hash_after_lsn(key_hash, txn.snapshot_lsn)`
-    //    so that earlier-committed rows that happen to share the same
-    //    Redis key (same xxh64 `key_hash`) are NOT rolled back. The
-    //    method sets each matching entry's `delete_lsn = insert_lsn`,
-    //    which makes the entry invisible at every snapshot >= its own
-    //    insert LSN (per MVCC visibility) — the row "never existed" from
-    //    any reader's perspective, which is what TXN.ABORT requires.
-    //    This is the core of ACID-08 (HNSW rollback).
+    //    during the transaction. Uses with_shard so the thread-local
+    //    VectorStore is accessed without a lock.
     // ------------------------------------------------------------------
     {
         let txn_snapshot_lsn = txn.snapshot_lsn;
-        let mut vector_store = shard_databases.vector_store(shard_id);
-
-        for intent in &txn.vector_intents {
-            let Some(idx) = vector_store.get_index_mut(&intent.index_name) else {
-                tracing::warn!(
-                    txn_id,
-                    index_name = ?intent.index_name,
-                    point_id = intent.point_id,
-                    "txn abort: vector index missing at rollback time, skipping intent",
-                );
-                continue;
-            };
-            let snap = idx.segments.load();
-            // The threshold is the transaction's snapshot LSN — only rows
-            // appended inside the txn (insert_lsn > snapshot_lsn) get
-            // tombstoned. Preserves pre-txn rows sharing the same key_hash.
-            let count = snap
-                .mutable
-                .mark_deleted_by_key_hash_after_lsn(intent.point_id, txn_snapshot_lsn);
-            if count == 0 {
-                tracing::warn!(
-                    txn_id,
-                    index_name = ?intent.index_name,
-                    point_id = intent.point_id,
-                    "txn abort: mark_deleted_by_key_hash_after_lsn matched zero entries (rollback may leak)",
-                );
+        crate::shard::slice::with_shard(|s| {
+            for intent in &txn.vector_intents {
+                let Some(idx) = s.vector_store.get_index_mut(&intent.index_name) else {
+                    tracing::warn!(
+                        txn_id,
+                        index_name = ?intent.index_name,
+                        point_id = intent.point_id,
+                        "txn abort: vector index missing at rollback time, skipping intent",
+                    );
+                    continue;
+                };
+                let snap = idx.segments.load();
+                let count = snap
+                    .mutable
+                    .mark_deleted_by_key_hash_after_lsn(intent.point_id, txn_snapshot_lsn);
+                if count == 0 {
+                    tracing::warn!(
+                        txn_id,
+                        index_name = ?intent.index_name,
+                        point_id = intent.point_id,
+                        "txn abort: mark_deleted_by_key_hash_after_lsn matched zero entries (rollback may leak)",
+                    );
+                }
             }
-        }
-
-        // Transition the TransactionManager into abort state — emits
-        // whatever XactAbort-equivalent bookkeeping the manager owns.
-        vector_store.txn_manager_mut().abort(txn_id);
-
-        // LOCK-ORDER: drop vector_store before kv_intents
-        drop(vector_store);
+            // Transition the TransactionManager into abort state.
+            s.vector_store.txn_manager_mut().abort(txn_id);
+            // LOCK-ORDER: with_shard releases before kv_intents step.
+        });
     }
 
     // ------------------------------------------------------------------
@@ -208,8 +199,10 @@ pub fn abort_cross_store_txn(
     //    HNSW insertions queued for this txn (prevents phantom neighbors
     //    from showing up post-compaction on a txn that never committed).
     // ------------------------------------------------------------------
-    shard_databases.kv_intents(shard_id).release_txn(txn_id);
-    shard_databases.hnsw_queue(shard_id).discard_for_txn(txn_id);
+    crate::shard::slice::with_shard(|s| {
+        s.kv_write_intents.release_txn(txn_id);
+        s.deferred_hnsw_inserts.discard_for_txn(txn_id);
+    });
 }
 
 /// Apply the graph half of a TXN.ABORT to one `GraphStore`.

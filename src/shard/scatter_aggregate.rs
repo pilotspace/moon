@@ -226,7 +226,7 @@ mod tests {
         // SPSC dispatch would panic on index access, proving the fast path
         // was taken. Empty TextStore yields "ERR unknown index".
         let dbs = vec![Database::new()];
-        let shard_databases = ShardDatabases::new(vec![dbs]);
+        let (shard_databases, _inits) = ShardDatabases::new(vec![dbs]);
 
         let dispatch_tx: Rc<RefCell<Vec<HeapProd<ShardMessage>>>> =
             Rc::new(RefCell::new(Vec::new()));
