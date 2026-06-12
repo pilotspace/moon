@@ -1,7 +1,7 @@
 {
   "project": "moon",
   "stage": "production",
-  "active_task": "consistency-dispatch-gaps",
+  "active_task": "shardslice-migration",
   "active_milestone": "v1-shared-nothing",
   "tasks": {
     "hotpath-lock-quickwins": {
@@ -33,6 +33,16 @@
       "created": "2026-06-11T10:38:27+00:00",
       "updated": "2026-06-12T02:21:52+00:00",
       "flag_verified": true
+    },
+    "shardslice-migration": {
+      "title": "Wire ShardSlice: thread-local shared-nothing storage becomes the live path",
+      "phase": "build",
+      "gate": "none",
+      "milestone": "v1-shared-nothing",
+      "depends_on": [],
+      "created": "2026-06-12T03:23:36+00:00",
+      "updated": "2026-06-12T04:54:11+00:00",
+      "flag_verified": true
     }
   },
   "milestones": {
@@ -46,7 +56,7 @@
     }
   },
   "created": "2026-06-11T03:18:21+00:00",
-  "updated": "2026-06-12T02:21:52+00:00",
+  "updated": "2026-06-12T04:54:11+00:00",
   "setup": {
     "locked": true,
     "locked_at": "2026-06-11T03:28:00+00:00",
