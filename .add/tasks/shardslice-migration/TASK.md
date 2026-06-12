@@ -1,7 +1,7 @@
 # TASK: Wire ShardSlice: thread-local shared-nothing storage becomes the live path
 
 slug: shardslice-migration · created: 2026-06-12 · stage: production · risk: high · autonomy: conservative
-phase: build   <!-- specify -> scenarios -> contract -> tests -> build -> verify -> observe -> done -->
+phase: done   <!-- specify -> scenarios -> contract -> tests -> build -> verify -> observe -> done -->
 <!-- high-risk/method-defining scope? declare `risk: high` on the slug line above and lower
      the autonomy level with `autonomy: conservative` — the engine refuses an unguarded completion
      (`unguarded_high_risk_auto`, run.md guard). A comment is never a declaration. -->
@@ -667,7 +667,9 @@ orchestrator review, never by weakening a test):
   fuzz targets unaffected — no new decode surface)
 - [x] layering & dependencies follow CONVENTIONS.md — slice access only via
   with_shard/with_shard_db; is_initialized confined to slice.rs (shape pin)
-- [ ] a person reviewed and approved the change — PENDING (gate below)
+- [x] a person reviewed and approved the change — Tin Dang, 2026-06-13
+  (gate: RISK-ACCEPTED + follow-up; PR shape: clean cherry-picked branch;
+  PR creation approved)
 
 ### M7 bench-swf evidence (2026-06-13, VM idle load<1, REQS=200k, fresh
 ### server per rep ×3, eb5d664 vs main 3e376a1, both VM-local release)
@@ -708,9 +710,17 @@ orchestrator review, never by weakening a test):
   doc now matches the implemented mechanism)
 
 ### GATE RECORD
-Outcome: <PASS | RISK-ACCEPTED | HARD-STOP>
-If RISK-ACCEPTED -> owner: <name> · ticket: <link> · expires: <date>   (never for a security gap)
-Reviewed by: <name> · date: <date>
+Outcome: RISK-ACCEPTED
+Risk: cross-shard read fast-path cells regress vs main's default config
+(single-client cross-shard GET 4µs → ~47µs / −85%; P1 GET −16%) — the
+cross-thread RwLock read_db path is definitionally incompatible with
+shared-nothing. All routed-vs-routed cells parity or better; s1 parity.
+Non-security. Materializes the ⚠ flag accepted at the §3 freeze.
+If RISK-ACCEPTED -> owner: Tin Dang · ticket: follow-up task
+"cross-shard read acceleration (lock-free)" to be opened at observe ·
+expires: next perf milestone (M7 successor)
+Reviewed by: Tin Dang (gate decision via session, "RISK-ACCEPTED +
+follow-up") · date: 2026-06-13
 
 <!-- A security finding is ALWAYS HARD-STOP. Record exactly one outcome — no silent pass. -->
 
