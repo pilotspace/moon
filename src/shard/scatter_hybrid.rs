@@ -119,7 +119,7 @@ pub async fn scatter_hybrid_search(
                 }
             },
         }
-    }); // shard slice released here — no .await held
+    }); // shard slice released here — borrow released before first async op
     let (query_terms, term_strings) = match parse_outcome {
         Ok(v) => v,
         Err(f) => return f,

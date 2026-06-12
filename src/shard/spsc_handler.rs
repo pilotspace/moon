@@ -1571,6 +1571,7 @@ pub(crate) fn handle_shard_message_shared(
                 global_df,
                 global_n,
                 as_of_lsn,
+                filter,
                 reply_tx,
             } = *payload;
             let response = {
@@ -1582,6 +1583,7 @@ pub(crate) fn handle_shard_message_shared(
                     // Phase 171 HYB-02 / SCAT-02: forward the coordinator-resolved
                     // AS_OF LSN into the raw-streams executor so the dense branch
                     // applies MVCC filtering consistently across shards.
+                    // CHANGE F: forward the filter for per-shard pre-fusion filtering.
                     crate::command::vector_search::hybrid_multi::execute_hybrid_search_local_raw_streams(
                         &mut s.vector_store,
                         &s.text_store,
@@ -1596,6 +1598,7 @@ pub(crate) fn handle_shard_message_shared(
                         &global_df,
                         global_n,
                         as_of_lsn,
+                        filter.as_ref(),
                     )
                 })
             };
@@ -1630,8 +1633,12 @@ pub(crate) fn handle_shard_message_shared(
                 aof_pool, // FIX-W1-2
             );
 
-            // Perform the in-place swap under ascending-index write locks.
-            shard_databases.swap_dbs(shard_id, a, b);
+            // Perform the in-place swap via ShardSlice (thread-local, no locks needed).
+            crate::shard::slice::with_shard(|s| {
+                if a != b {
+                    s.databases.swap(a, b);
+                }
+            });
 
             // Notify the coordinator that this shard completed its swap.
             let _ = reply_tx.send(());
