@@ -282,13 +282,29 @@ fn parse_search_keys(v: &redis::Value) -> (i64, Vec<String>) {
 async fn ft_create_tag_idx(conn: &mut redis::aio::MultiplexedConnection) {
     let r: String = redis::cmd("FT.CREATE")
         .arg("idx")
-        .arg("ON").arg("HASH").arg("PREFIX").arg("1").arg("doc:")
+        .arg("ON")
+        .arg("HASH")
+        .arg("PREFIX")
+        .arg("1")
+        .arg("doc:")
         .arg("SCHEMA")
-        .arg("title").arg("TEXT")
-        .arg("source").arg("TAG")
-        .arg("vec").arg("VECTOR").arg("HNSW").arg("6")
-        .arg("DIM").arg("4").arg("TYPE").arg("FLOAT32").arg("DISTANCE_METRIC").arg("L2")
-        .query_async(conn).await.expect("FT.CREATE tag index should succeed");
+        .arg("title")
+        .arg("TEXT")
+        .arg("source")
+        .arg("TAG")
+        .arg("vec")
+        .arg("VECTOR")
+        .arg("HNSW")
+        .arg("6")
+        .arg("DIM")
+        .arg("4")
+        .arg("TYPE")
+        .arg("FLOAT32")
+        .arg("DISTANCE_METRIC")
+        .arg("L2")
+        .query_async(conn)
+        .await
+        .expect("FT.CREATE tag index should succeed");
     assert_eq!(r, "OK");
 }
 
@@ -301,10 +317,15 @@ async fn hset_doc(
 ) {
     let _: i64 = redis::cmd("HSET")
         .arg(key)
-        .arg("title").arg(title)
-        .arg("source").arg(source)
-        .arg("vec").arg(vec4_bytes(v))
-        .query_async(conn).await.expect("HSET should succeed");
+        .arg("title")
+        .arg(title)
+        .arg("source")
+        .arg(source)
+        .arg("vec")
+        .arg(vec4_bytes(v))
+        .query_async(conn)
+        .await
+        .expect("HSET should succeed");
 }
 
 // ---------------------------------------------------------------------------
@@ -321,24 +342,59 @@ async fn hybrid_filter_tag_excludes_foreign_from_both_branches() {
     ft_create_tag_idx(&mut conn).await;
 
     // doc:1 — KEEP: source=scratchpad, text-matches "alice", vector near query.
-    hset_doc(&mut conn, "doc:1", "alice knows bob", "scratchpad", [1.0, 0.0, 0.0, 0.0]).await;
+    hset_doc(
+        &mut conn,
+        "doc:1",
+        "alice knows bob",
+        "scratchpad",
+        [1.0, 0.0, 0.0, 0.0],
+    )
+    .await;
     // doc:2 — FOREIGN, BM25-leak candidate: source=planning, text-matches "alice".
-    hset_doc(&mut conn, "doc:2", "alice met carol", "planning", [0.0, 1.0, 0.0, 0.0]).await;
+    hset_doc(
+        &mut conn,
+        "doc:2",
+        "alice met carol",
+        "planning",
+        [0.0, 1.0, 0.0, 0.0],
+    )
+    .await;
     // doc:3 — FOREIGN, KNN-leak candidate: source=planning, vector near query,
     //          text does NOT match "alice".
-    hset_doc(&mut conn, "doc:3", "bob met carol", "planning", [0.9, 0.1, 0.0, 0.0]).await;
+    hset_doc(
+        &mut conn,
+        "doc:3",
+        "bob met carol",
+        "planning",
+        [0.9, 0.1, 0.0, 0.0],
+    )
+    .await;
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
     let q = vec4_bytes([1.0, 0.0, 0.0, 0.0]);
     let resp: redis::Value = redis::cmd("FT.SEARCH")
         .arg("idx")
         .arg("alice")
-        .arg("HYBRID").arg("VECTOR").arg("@vec").arg("$q")
-        .arg("FUSION").arg("RRF")
-        .arg("FILTER").arg("TAG").arg("@source").arg("scratchpad") // CHANGE E wire modifier
-        .arg("PARAMS").arg("2").arg("q").arg(q)
-        .arg("LIMIT").arg("0").arg("10")
-        .query_async(&mut conn).await.expect("filtered HYBRID must succeed");
+        .arg("HYBRID")
+        .arg("VECTOR")
+        .arg("@vec")
+        .arg("$q")
+        .arg("FUSION")
+        .arg("RRF")
+        .arg("FILTER")
+        .arg("TAG")
+        .arg("@source")
+        .arg("scratchpad") // CHANGE E wire modifier
+        .arg("PARAMS")
+        .arg("2")
+        .arg("q")
+        .arg(q)
+        .arg("LIMIT")
+        .arg("0")
+        .arg("10")
+        .query_async(&mut conn)
+        .await
+        .expect("filtered HYBRID must succeed");
 
     let (_count, keys) = parse_search_keys(&resp);
     println!("[hybrid_filter_tag] keys={keys:?}");
@@ -350,7 +406,10 @@ async fn hybrid_filter_tag_excludes_foreign_from_both_branches() {
         !keys.iter().any(|k| k == "doc:3"),
         "KNN-branch foreign doc:3 (planning) leaked past FILTER TAG @source scratchpad; keys={keys:?}",
     );
-    assert!(keys.contains(&"doc:1".to_string()), "kept doc:1 must remain; keys={keys:?}");
+    assert!(
+        keys.contains(&"doc:1".to_string()),
+        "kept doc:1 must remain; keys={keys:?}"
+    );
 
     shutdown.cancel();
 }

@@ -166,7 +166,11 @@ pub fn execute_hybrid_search_local_raw_streams(
         };
         let allowlist = eval_filter(f, text_index);
         filter_bm25_results(&mut text_results, &allowlist);
-        filter_vector_results(&mut dense_results, &text_index.key_hash_to_doc_id, &allowlist);
+        filter_vector_results(
+            &mut dense_results,
+            &text_index.key_hash_to_doc_id,
+            &allowlist,
+        );
         filter_vector_results(
             &mut sparse_results,
             &text_index.key_hash_to_doc_id,

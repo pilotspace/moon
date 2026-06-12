@@ -284,13 +284,30 @@ fn parse_search_keys(v: &redis::Value) -> (i64, Vec<String>) {
 
 async fn ft_create_tag_idx(conn: &mut redis::aio::MultiplexedConnection) {
     let r: String = redis::cmd("FT.CREATE")
-        .arg("idx").arg("ON").arg("HASH").arg("PREFIX").arg("1").arg("doc:")
+        .arg("idx")
+        .arg("ON")
+        .arg("HASH")
+        .arg("PREFIX")
+        .arg("1")
+        .arg("doc:")
         .arg("SCHEMA")
-        .arg("title").arg("TEXT")
-        .arg("source").arg("TAG")
-        .arg("vec").arg("VECTOR").arg("HNSW").arg("6")
-        .arg("DIM").arg("4").arg("TYPE").arg("FLOAT32").arg("DISTANCE_METRIC").arg("L2")
-        .query_async(conn).await.expect("FT.CREATE tag index should succeed");
+        .arg("title")
+        .arg("TEXT")
+        .arg("source")
+        .arg("TAG")
+        .arg("vec")
+        .arg("VECTOR")
+        .arg("HNSW")
+        .arg("6")
+        .arg("DIM")
+        .arg("4")
+        .arg("TYPE")
+        .arg("FLOAT32")
+        .arg("DISTANCE_METRIC")
+        .arg("L2")
+        .query_async(conn)
+        .await
+        .expect("FT.CREATE tag index should succeed");
     assert_eq!(r, "OK");
 }
 
@@ -303,10 +320,15 @@ async fn hset_doc(
 ) {
     let _: i64 = redis::cmd("HSET")
         .arg(key)
-        .arg("title").arg(title)
-        .arg("source").arg(source)
-        .arg("vec").arg(vec4_bytes(v))
-        .query_async(conn).await.expect("HSET should succeed");
+        .arg("title")
+        .arg(title)
+        .arg("source")
+        .arg(source)
+        .arg("vec")
+        .arg(vec4_bytes(v))
+        .query_async(conn)
+        .await
+        .expect("HSET should succeed");
 }
 
 // ---------------------------------------------------------------------------
@@ -328,8 +350,22 @@ async fn hybrid_filter_multishard_no_foreign_and_no_starvation() {
     // KNN branch on EVERY shard surfaces both sources pre-filter.
     for i in 0..12 {
         let v = [1.0 - (i as f32) * 0.01, 0.01 * i as f32, 0.0, 0.0];
-        hset_doc(&mut conn, &format!("doc:keep-{i}"), "alice topic", "scratchpad", v).await;
-        hset_doc(&mut conn, &format!("doc:foreign-{i}"), "alice topic", "planning", v).await;
+        hset_doc(
+            &mut conn,
+            &format!("doc:keep-{i}"),
+            "alice topic",
+            "scratchpad",
+            v,
+        )
+        .await;
+        hset_doc(
+            &mut conn,
+            &format!("doc:foreign-{i}"),
+            "alice topic",
+            "planning",
+            v,
+        )
+        .await;
     }
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
@@ -337,12 +373,26 @@ async fn hybrid_filter_multishard_no_foreign_and_no_starvation() {
     let resp: redis::Value = redis::cmd("FT.SEARCH")
         .arg("idx")
         .arg("alice")
-        .arg("HYBRID").arg("VECTOR").arg("@vec").arg("$q")
-        .arg("FUSION").arg("RRF")
-        .arg("FILTER").arg("TAG").arg("@source").arg("scratchpad")
-        .arg("PARAMS").arg("2").arg("q").arg(q)
-        .arg("LIMIT").arg("0").arg("10")
-        .query_async(&mut conn).await.expect("multishard filtered HYBRID must succeed");
+        .arg("HYBRID")
+        .arg("VECTOR")
+        .arg("@vec")
+        .arg("$q")
+        .arg("FUSION")
+        .arg("RRF")
+        .arg("FILTER")
+        .arg("TAG")
+        .arg("@source")
+        .arg("scratchpad")
+        .arg("PARAMS")
+        .arg("2")
+        .arg("q")
+        .arg(q)
+        .arg("LIMIT")
+        .arg("0")
+        .arg("10")
+        .query_async(&mut conn)
+        .await
+        .expect("multishard filtered HYBRID must succeed");
 
     let (count, keys) = parse_search_keys(&resp);
     println!("[hybrid_filter_multishard] count={count} keys={keys:?}");

@@ -295,24 +295,49 @@ async fn hybrid_no_filter_is_backward_compatible() {
 
     // Create a simple TEXT + VECTOR index (no TAG field needed for this test).
     let r: String = redis::cmd("FT.CREATE")
-        .arg("idx").arg("ON").arg("HASH").arg("PREFIX").arg("1").arg("doc:")
+        .arg("idx")
+        .arg("ON")
+        .arg("HASH")
+        .arg("PREFIX")
+        .arg("1")
+        .arg("doc:")
         .arg("SCHEMA")
-        .arg("title").arg("TEXT")
-        .arg("source").arg("TAG")
-        .arg("vec").arg("VECTOR").arg("HNSW").arg("6")
-        .arg("DIM").arg("4").arg("TYPE").arg("FLOAT32").arg("DISTANCE_METRIC").arg("L2")
-        .query_async(&mut conn).await.expect("FT.CREATE should succeed");
+        .arg("title")
+        .arg("TEXT")
+        .arg("source")
+        .arg("TAG")
+        .arg("vec")
+        .arg("VECTOR")
+        .arg("HNSW")
+        .arg("6")
+        .arg("DIM")
+        .arg("4")
+        .arg("TYPE")
+        .arg("FLOAT32")
+        .arg("DISTANCE_METRIC")
+        .arg("L2")
+        .query_async(&mut conn)
+        .await
+        .expect("FT.CREATE should succeed");
     assert_eq!(r, "OK");
 
     // Insert documents with different source tags.
-    for (i, source) in ["scratchpad", "planning", "episodes", "facts"].iter().enumerate() {
+    for (i, source) in ["scratchpad", "planning", "episodes", "facts"]
+        .iter()
+        .enumerate()
+    {
         let v = [1.0 - (i as f32) * 0.1, (i as f32) * 0.1, 0.0, 0.0];
         let _: i64 = redis::cmd("HSET")
             .arg(format!("doc:{i}"))
-            .arg("title").arg("alice memory topic")
-            .arg("source").arg(source)
-            .arg("vec").arg(vec4_bytes(v))
-            .query_async(&mut conn).await.expect("HSET should succeed");
+            .arg("title")
+            .arg("alice memory topic")
+            .arg("source")
+            .arg(source)
+            .arg("vec")
+            .arg(vec4_bytes(v))
+            .query_async(&mut conn)
+            .await
+            .expect("HSET should succeed");
     }
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
@@ -321,12 +346,23 @@ async fn hybrid_no_filter_is_backward_compatible() {
     let resp: redis::Value = redis::cmd("FT.SEARCH")
         .arg("idx")
         .arg("alice")
-        .arg("HYBRID").arg("VECTOR").arg("@vec").arg("$q")
-        .arg("FUSION").arg("RRF")
+        .arg("HYBRID")
+        .arg("VECTOR")
+        .arg("@vec")
+        .arg("$q")
+        .arg("FUSION")
+        .arg("RRF")
         // NO FILTER clause here — pure backward compat check
-        .arg("PARAMS").arg("2").arg("q").arg(q)
-        .arg("LIMIT").arg("0").arg("10")
-        .query_async(&mut conn).await.expect("unfiltered HYBRID must succeed");
+        .arg("PARAMS")
+        .arg("2")
+        .arg("q")
+        .arg(q)
+        .arg("LIMIT")
+        .arg("0")
+        .arg("10")
+        .query_async(&mut conn)
+        .await
+        .expect("unfiltered HYBRID must succeed");
 
     let (count, keys) = parse_search_keys(&resp);
     println!("[hybrid_backward_compat] count={count} keys={keys:?}");
