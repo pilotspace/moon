@@ -687,6 +687,15 @@ pub struct AofFoldSnapshot {
         )>,
         u32,
     )>,
+    /// Number of messages in the AOF channel at the instant the shard read
+    /// this value — BEFORE building the snapshot and BEFORE sending this reply.
+    ///
+    /// Because the shard event loop is single-threaded, no new commands execute
+    /// between this read and the snapshot reply being sent. Therefore ALL of
+    /// these messages are pre-snapshot appends. The AOF writer uses this as the
+    /// bound for its phase-3 mid-drain, preventing an infinite drain loop under
+    /// sustained high write load (where the channel never empties on its own).
+    pub pending_aof_count: usize,
 }
 
 // ShardMessage is Send because all fields are Send. The raw pointer in

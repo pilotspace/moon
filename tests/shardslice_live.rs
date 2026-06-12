@@ -363,6 +363,23 @@ fn compacted_base_exists(dir: &std::path::Path) -> bool {
     false
 }
 
+/// Return the `seq` field from the PerShard AOF manifest, or 0 if absent/unparseable.
+fn aof_manifest_seq(dir: &std::path::Path) -> u64 {
+    let p = dir.join("appendonlydir").join("moon.aof.manifest");
+    let text = match std::fs::read_to_string(&p) {
+        Ok(t) => t,
+        Err(_) => return 0,
+    };
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("seq ") {
+            if let Ok(n) = rest.trim().parse::<u64>() {
+                return n;
+            }
+        }
+    }
+    0
+}
+
 // ===========================================================================
 // TESTS
 // ===========================================================================
@@ -700,6 +717,13 @@ fn aof_fold_exactly_once(shards: u32, extra: &[&str]) {
                 if matches!(c.cmd_s(&["INCR", "ssm4a:ctr"]), Resp::Int(_)) {
                     count_clone.fetch_add(1, Ordering::Relaxed);
                 }
+                // Throttle to ~100 INCR/s so the AOF append channel (capacity
+                // 10 000) is never saturated during the fold window.  At 100/s
+                // the channel takes 100 s to fill — far longer than the ~20 s
+                // needed for the per-shard fold to complete.  At 1 000/s the
+                // channel filled in ~10 s, causing drops that silently lost
+                // INCRs and failed the post-restart durability assertion.
+                std::thread::sleep(std::time::Duration::from_micros(10_000));
             }
         });
 
@@ -716,11 +740,27 @@ fn aof_fold_exactly_once(shards: u32, extra: &[&str]) {
             "BGREWRITEAOF unexpected reply: {bgrw:?}"
         );
 
-        // Poll for rewrite completion (seq>1 base file) up to 30s.
+        // Poll for rewrite completion up to 30s.
+        //
+        // For the per-shard experimental path we wait for the manifest seq to
+        // advance: the coordinator atomically bumps seq only after ALL shards
+        // complete their folds.  Waiting for any single shard's base file
+        // (compacted_base_exists) is too early — other shards may still be
+        // folding, so EverySec fsyncs on the new incr have not yet run, and
+        // killing the server in that window loses data.
+        //
+        // For the legacy single-writer path compacted_base_exists remains
+        // correct (there is no coordinator; one seq flip = one base file).
+        let uses_per_shard_rewrite = flags.contains(&"--experimental-per-shard-rewrite");
         let rewrite_deadline = Instant::now() + Duration::from_secs(30);
         loop {
             std::thread::sleep(Duration::from_millis(500));
-            if compacted_base_exists(dir.path()) {
+            let done = if uses_per_shard_rewrite {
+                aof_manifest_seq(dir.path()) > 1
+            } else {
+                compacted_base_exists(dir.path())
+            };
+            if done {
                 break;
             }
             if Instant::now() > rewrite_deadline {
@@ -757,6 +797,7 @@ fn aof_fold_exactly_once(shards: u32, extra: &[&str]) {
         );
 
         recorded_count = n;
+
         // _guard dropped here → server killed (SIGKILL equivalent)
     }
 

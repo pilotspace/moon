@@ -64,7 +64,6 @@ pub(crate) fn drain_spsc_shared(
         crate::shard::dispatch::RawSocketFd,
         crate::server::conn::affinity::MigratedConnectionState,
     )>,
-    vector_store: &mut VectorStore,
     pending_cdc_subscribes: &mut Vec<crate::shard::dispatch::CdcSubscribePayload>,
     // P8: optional manifest for VACUUM manifest/WAL passes; None when no persistence_dir.
     shard_manifest: &mut Option<crate::persistence::manifest::ShardManifest>,
@@ -192,7 +191,6 @@ pub(crate) fn drain_spsc_shared(
                 shard_id,
                 script_cache,
                 cached_clock,
-                vector_store,
                 shard_manifest,
                 mvcc_prune_margin,
                 graph_merge_max_segments,
@@ -224,7 +222,6 @@ pub(crate) fn drain_spsc_shared(
             shard_id,
             script_cache,
             cached_clock,
-            vector_store,
             shard_manifest,
             mvcc_prune_margin,
             graph_merge_max_segments,
@@ -270,7 +267,6 @@ pub(crate) fn handle_shard_message_shared(
     shard_id: usize,
     script_cache: &Rc<RefCell<crate::scripting::ScriptCache>>,
     cached_clock: &CachedClock,
-    vector_store: &mut VectorStore,
     // P8: optional manifest for VACUUM manifest/WAL passes; None when no persistence_dir.
     shard_manifest: &mut Option<crate::persistence::manifest::ShardManifest>,
     // P8: MVCC committed-prune margin from server config (default 1000).
@@ -307,8 +303,9 @@ pub(crate) fn handle_shard_message_shared(
                 // Intercept before cmd_dispatch so the console gateway's
                 // ShardMessage::Execute path reaches the vector handlers.
                 if cmd.len() > 3 && cmd[..3].eq_ignore_ascii_case(b"FT.") {
-                    // graph_store, write_db(0), and text_store acquired in one closure
-                    // to avoid re-entrant with_shard calls (multi-resource arm).
+                    // All slice fields (vector_store, text_store, graph_store, databases)
+                    // acquired in one flat with_shard closure — no outer borrow active,
+                    // so this cannot re-enter with_shard.
                     let frame = {
                         crate::shard::slice::with_shard(|s| {
                             // SESSION clause needs Database access for sorted set storage.
@@ -330,7 +327,7 @@ pub(crate) fn handle_shard_message_shared(
                                 None
                             };
                             dispatch_vector_command(
-                                vector_store,
+                                &mut s.vector_store,
                                 &mut s.text_store,
                                 #[cfg(feature = "graph")]
                                 Some(&s.graph_store),
@@ -350,8 +347,12 @@ pub(crate) fn handle_shard_message_shared(
                     if let Some(crate::protocol::Frame::BulkString(sub)) = args.first() {
                         if sub.eq_ignore_ascii_case(b"VECTOR") {
                             let idx_args = &args[1..];
-                            let frame =
-                                crate::command::server_admin::vacuum_vector(vector_store, idx_args);
+                            let frame = crate::shard::slice::with_shard(|s| {
+                                crate::command::server_admin::vacuum_vector(
+                                    &mut s.vector_store,
+                                    idx_args,
+                                )
+                            });
                             let _ = reply_tx.send(frame);
                             return;
                         }
@@ -399,7 +400,9 @@ pub(crate) fn handle_shard_message_shared(
                 // Routes directly to VectorStore's TransactionManager; bypasses
                 // write-stall guards (it is an admin command, never a data write).
                 if cmd.eq_ignore_ascii_case(b"KILL") {
-                    let frame = crate::command::server_admin::kill_snapshot(vector_store, args);
+                    let frame = crate::shard::slice::with_shard(|s| {
+                        crate::command::server_admin::kill_snapshot(&mut s.vector_store, args)
+                    });
                     let _ = reply_tx.send(frame);
                     return;
                 }
@@ -407,13 +410,15 @@ pub(crate) fn handle_shard_message_shared(
                 // P8: VACUUM — manual reclamation across manifest, MVCC, and WAL.
                 // Bypasses write-stall guards (reclaims, does not write data).
                 if cmd.eq_ignore_ascii_case(b"VACUUM") {
-                    let frame = crate::command::server_admin::vacuum(
-                        vector_store,
-                        shard_manifest.as_mut(),
-                        wal_v3_writer.as_mut(),
-                        args,
-                        mvcc_prune_margin,
-                    );
+                    let frame = crate::shard::slice::with_shard(|s| {
+                        crate::command::server_admin::vacuum(
+                            &mut s.vector_store,
+                            shard_manifest.as_mut(),
+                            wal_v3_writer.as_mut(),
+                            args,
+                            mvcc_prune_margin,
+                        )
+                    });
                     let _ = reply_tx.send(frame);
                     return;
                 }
@@ -422,13 +427,15 @@ pub(crate) fn handle_shard_message_shared(
                 // Intercept here so it has access to manifest and WAL (read-only).
                 if cmd.eq_ignore_ascii_case(b"DEBUG") {
                     if let Some(sub) = args.first() {
-                        if let Some(s) = crate::command::helpers::extract_bytes(sub) {
-                            if s.eq_ignore_ascii_case(b"RECLAMATION") {
-                                let frame = crate::command::server_admin::debug_reclamation(
-                                    vector_store,
-                                    shard_manifest.as_ref(),
-                                    wal_v3_writer.as_ref(),
-                                );
+                        if let Some(sub_bytes) = crate::command::helpers::extract_bytes(sub) {
+                            if sub_bytes.eq_ignore_ascii_case(b"RECLAMATION") {
+                                let frame = crate::shard::slice::with_shard(|s| {
+                                    crate::command::server_admin::debug_reclamation(
+                                        &s.vector_store,
+                                        shard_manifest.as_ref(),
+                                        wal_v3_writer.as_ref(),
+                                    )
+                                });
                                 let _ = reply_tx.send(frame);
                                 return;
                             }
@@ -625,7 +632,7 @@ pub(crate) fn handle_shard_message_shared(
 
                         // Auto-index: if HSET succeeded and key matches a vector index prefix,
                         // extract the vector field and append to mutable segment.
-                        // text_store accessed here (same with_shard closure) to avoid re-entrancy.
+                        // vector_store and text_store accessed here (same with_shard closure).
                         if cmd.eq_ignore_ascii_case(b"HSET")
                             && !matches!(frame, crate::protocol::Frame::Error(_))
                         {
@@ -637,7 +644,7 @@ pub(crate) fn handle_shard_message_shared(
                                 // VectorIntents on the active CrossStoreTxn. Discarded
                                 // here because this path is not txn-aware yet.
                                 let _ = auto_index_hset(
-                                    vector_store,
+                                    &mut s.vector_store,
                                     &mut s.text_store,
                                     key_bytes,
                                     args,
@@ -651,14 +658,17 @@ pub(crate) fn handle_shard_message_shared(
                 };
 
                 // Auto-delete is a vector_store-only operation; runs outside the gate.
+                // Each arm uses its own flat with_shard borrow — no outer borrow is active.
                 if (cmd.eq_ignore_ascii_case(b"DEL") || cmd.eq_ignore_ascii_case(b"UNLINK"))
                     && !matches!(frame, crate::protocol::Frame::Error(_))
                 {
-                    for arg in args {
-                        if let crate::protocol::Frame::BulkString(key_bytes) = arg {
-                            vector_store.mark_deleted_for_key(key_bytes);
+                    crate::shard::slice::with_shard(|s| {
+                        for arg in args.iter() {
+                            if let crate::protocol::Frame::BulkString(key_bytes) = arg {
+                                s.vector_store.mark_deleted_for_key(key_bytes.as_ref());
+                            }
                         }
-                    }
+                    });
                 }
 
                 frame
@@ -808,7 +818,7 @@ pub(crate) fn handle_shard_message_shared(
                     }
 
                     // Auto-index: if HSET succeeded, check for vector index match.
-                    // text_store accessed here (same with_shard closure) to avoid re-entrancy.
+                    // text_store and vector_store accessed here (same with_shard closure).
                     if cmd.eq_ignore_ascii_case(b"HSET")
                         && !matches!(frame, crate::protocol::Frame::Error(_))
                     {
@@ -816,7 +826,7 @@ pub(crate) fn handle_shard_message_shared(
                             // Plan 166-01: Vec<(idx, key_hash)> return discarded
                             // here; Plan 166-02 threads it into CrossStoreTxn.
                             let _ = auto_index_hset(
-                                vector_store,
+                                &mut s.vector_store,
                                 &mut s.text_store,
                                 key_bytes,
                                 args,
@@ -1106,7 +1116,7 @@ pub(crate) fn handle_shard_message_shared(
                     }
 
                     // Auto-index: if HSET succeeded, check for vector index match.
-                    // text_store in same with_shard closure to avoid re-entrancy.
+                    // vector_store and text_store in same with_shard closure.
                     if cmd.eq_ignore_ascii_case(b"HSET")
                         && !matches!(frame, crate::protocol::Frame::Error(_))
                     {
@@ -1114,7 +1124,7 @@ pub(crate) fn handle_shard_message_shared(
                             // Plan 166-01: Vec<(idx, key_hash)> return discarded
                             // here; Plan 166-02 threads it into CrossStoreTxn.
                             let _ = auto_index_hset(
-                                vector_store,
+                                &mut s.vector_store,
                                 &mut s.text_store,
                                 key_bytes,
                                 args,
@@ -1263,17 +1273,20 @@ pub(crate) fn handle_shard_message_shared(
             // no-op and behavior matches the pre-171 path. Route through
             // `search_local_filtered` with AS_OF threaded in to apply MVCC
             // filtering against the committed treemap inside `search_local_raw`.
-            let response = vector_search::search_local_filtered(
-                vector_store,
-                &index_name,
-                &query_blob,
-                k,
-                None,
-                0,
-                usize::MAX,
-                None,
-                as_of_lsn,
-            );
+            // Flat with_shard borrow — no outer borrow active, no re-entrancy.
+            let response = crate::shard::slice::with_shard(|s| {
+                vector_search::search_local_filtered(
+                    &mut s.vector_store,
+                    &index_name,
+                    &query_blob,
+                    k,
+                    None,
+                    0,
+                    usize::MAX,
+                    None,
+                    as_of_lsn,
+                )
+            });
             let _ = reply_tx.send(response);
         }
         ShardMessage::DocFreq {
@@ -1368,8 +1381,8 @@ pub(crate) fn handle_shard_message_shared(
             let _ = reply_tx.send(response);
         }
         ShardMessage::VectorCommand { command, reply_tx } => {
-            // graph_store, write_db(0), and text_store acquired in one closure
-            // to avoid re-entrant with_shard calls (multi-resource arm).
+            // All slice fields (vector_store, text_store, graph_store, databases)
+            // acquired in one flat with_shard closure — no outer borrow active.
             let response = {
                 crate::shard::slice::with_shard(|s| {
                     let cmd_bytes = extract_command_static(&command).map(|(c, _)| c);
@@ -1384,7 +1397,7 @@ pub(crate) fn handle_shard_message_shared(
                             None
                         };
                     dispatch_vector_command(
-                        vector_store,
+                        &mut s.vector_store,
                         &mut s.text_store,
                         #[cfg(feature = "graph")]
                         Some(&s.graph_store),
@@ -1560,7 +1573,7 @@ pub(crate) fn handle_shard_message_shared(
                     // AS_OF LSN into the raw-streams executor so the dense branch
                     // applies MVCC filtering consistently across shards.
                     crate::command::vector_search::hybrid_multi::execute_hybrid_search_local_raw_streams(
-                        vector_store,
+                        &mut s.vector_store,
                         &s.text_store,
                         &index_name,
                         &query_terms,
@@ -1687,6 +1700,17 @@ pub(crate) fn handle_shard_message_shared(
             // blocks on the oneshot; the shard processes this between commands,
             // providing the equivalent mutual-exclusion that the old RwLock write
             // guards gave (single-threaded event loop = no concurrent mutations).
+            //
+            // C4-DRAIN-BOUND: Before building the snapshot, record how many
+            // messages are currently pending in this shard's AOF channel. Since
+            // the shard event loop is single-threaded, no new commands execute
+            // between this read and the reply being sent. Therefore ALL of these
+            // pending messages are pre-snapshot appends. The AOF writer uses this
+            // count as the phase-3 mid-drain bound, preventing an infinite drain
+            // loop under sustained high write load where the channel never empties.
+            let pending_aof_count = aof_pool
+                .map(|p| p.sender(shard_id).len())
+                .unwrap_or(0);
             let now_ms = crate::storage::entry::current_time_ms();
             let snapshot = crate::shard::slice::with_shard(|s| {
                 let mut dbs = Vec::with_capacity(s.databases.len());
@@ -1700,7 +1724,7 @@ pub(crate) fn handle_shard_message_shared(
                     }
                     dbs.push((entries, base_ts));
                 }
-                crate::shard::dispatch::AofFoldSnapshot { dbs }
+                crate::shard::dispatch::AofFoldSnapshot { dbs, pending_aof_count }
             });
             // Ignore send failure: the AOF writer dropped its receiver
             // (e.g. rewrite aborted) — the snapshot is simply discarded.
@@ -2633,7 +2657,8 @@ mod drain_cap_tests {
     /// which keeps every other dependency inert (no WAL, no snapshot).
     #[test]
     fn drain_cap_reports_possible_tail() {
-        let shard_databases = Arc::new(ShardDatabases::new(vec![vec![Database::new()]]));
+        let (shard_databases_inner, _inits) = ShardDatabases::new(vec![vec![Database::new()]]);
+        let shard_databases = Arc::new(shard_databases_inner);
         let rb = HeapRb::<ShardMessage>::new(512);
         let (mut prod, cons) = rb.split();
         for i in 0..300u64 {
@@ -2658,11 +2683,11 @@ mod drain_cap_tests {
         let script_cache = Rc::new(RefCell::new(crate::scripting::ScriptCache::new()));
         let clock = CachedClock::new();
         let mut migrations = Vec::new();
-        let mut vector_store = VectorStore::new();
         let mut cdc = Vec::new();
         let mut manifest = None;
         let mut autovacuum = crate::shard::autovacuum::AutovacuumDaemon::new(Default::default());
 
+        // BlockCancel messages don't touch ShardSlice, so no init_shard needed.
         // First cycle: 300 queued > 256 cap -> drains exactly 256, reports tail.
         let hit_cap = drain_spsc_shared(
             &shard_databases,
@@ -2680,7 +2705,6 @@ mod drain_cap_tests {
             &script_cache,
             &clock,
             &mut migrations,
-            &mut vector_store,
             &mut cdc,
             &mut manifest,
             1000,
@@ -2711,7 +2735,6 @@ mod drain_cap_tests {
             &script_cache,
             &clock,
             &mut migrations,
-            &mut vector_store,
             &mut cdc,
             &mut manifest,
             1000,

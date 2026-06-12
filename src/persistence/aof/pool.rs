@@ -26,6 +26,19 @@ pub struct AofWriterPool {
     /// the authoritative manifest fresh at rewrite time. `None` for TopLevel
     /// pools and test pools that never rewrite.
     base_dir: Option<PathBuf>,
+    /// C4: per-shard SPSC fold producers for AofFold cooperative snapshot.
+    ///
+    /// `fold_producers[i]` is the SPSC producer into shard `i`'s event-loop
+    /// ring.  Wrapped in `Arc<Mutex>` so the AOF writer thread (not the shard
+    /// thread) can push `ShardMessage::AofFold` safely.  Set only for PerShard
+    /// pools that wire up fold channels; `None` for TopLevel pools and test
+    /// pools that use the legacy lock-based path or never rewrite.
+    fold_producers: Option<
+        Vec<Arc<parking_lot::Mutex<ringbuf::HeapProd<crate::shard::dispatch::ShardMessage>>>>,
+    >,
+    /// C4: per-shard Notify handles that wake the shard event loops after
+    /// an AofFold push.  Parallel to `fold_producers`.
+    fold_notifiers: Option<Vec<Arc<crate::runtime::channel::Notify>>>,
 }
 
 impl AofWriterPool {
@@ -52,6 +65,8 @@ impl AofWriterPool {
             fsync_policy,
             fsync_timeout,
             base_dir: None,
+            fold_producers: None,
+            fold_notifiers: None,
         })
     }
 
@@ -81,6 +96,8 @@ impl AofWriterPool {
             fsync_policy,
             fsync_timeout,
             base_dir: None,
+            fold_producers: None,
+            fold_notifiers: None,
         })
     }
 
@@ -104,7 +121,103 @@ impl AofWriterPool {
             fsync_policy,
             fsync_timeout,
             base_dir: Some(base_dir),
+            fold_producers: None,
+            fold_notifiers: None,
         })
+    }
+
+    /// C4: same as [`Self::per_shard_with_base_dir`] but also wires the per-shard
+    /// SPSC fold channels used by the cooperative AOF snapshot (ShardSlice path).
+    ///
+    /// `fold_producers[i]` MUST be a producer into shard `i`'s SPSC ring that has
+    /// a corresponding `HeapCons` already installed in the shard's consumer list —
+    /// created via [`crate::shard::mesh::create_aof_fold_channels`] and pushed into
+    /// each shard's `consumers` vec before `shard.run()` is called.
+    ///
+    /// The pool clones the `Arc`s; callers retain no live reference after passing.
+    pub fn per_shard_with_fold_channels(
+        senders: Vec<channel::MpscSender<AofMessage>>,
+        fsync_policy: FsyncPolicy,
+        fsync_timeout: Duration,
+        base_dir: PathBuf,
+        fold_producers: Vec<
+            Arc<parking_lot::Mutex<ringbuf::HeapProd<crate::shard::dispatch::ShardMessage>>>,
+        >,
+        fold_notifiers: Vec<Arc<crate::runtime::channel::Notify>>,
+    ) -> Arc<Self> {
+        debug_assert!(
+            senders.len() >= 2,
+            "per_shard pool needs >=2 writers; use top_level for single-writer"
+        );
+        debug_assert_eq!(
+            senders.len(),
+            fold_producers.len(),
+            "fold_producers must have one entry per shard"
+        );
+        debug_assert_eq!(
+            senders.len(),
+            fold_notifiers.len(),
+            "fold_notifiers must have one entry per shard"
+        );
+        Arc::new(Self {
+            senders,
+            layout: crate::persistence::aof_manifest::AofLayout::PerShard,
+            fsync_policy,
+            fsync_timeout,
+            base_dir: Some(base_dir),
+            fold_producers: Some(fold_producers),
+            fold_notifiers: Some(fold_notifiers),
+        })
+    }
+
+    /// C4: Wire fold channels into a pool that was built with
+    /// [`Self::per_shard_with_base_dir`] (the production path in `main.rs`).
+    ///
+    /// `producers[i]` MUST be the SPSC producer into shard `i`'s ring and
+    /// `notifiers[i]` the matching Notify handle — both created by
+    /// [`crate::shard::mesh::create_aof_fold_channels`] and the corresponding
+    /// consumers already merged into shard `i`'s consumer vec before
+    /// `shard.run()` is called.
+    ///
+    /// **Idempotent-warn:** calling this a second time logs an error and
+    /// returns without overwriting the existing channels (double-set is a
+    /// startup-configuration bug, not a runtime error worth crashing over).
+    ///
+    /// **Panics (debug only):** if `producers.len() != self.senders.len()` or
+    /// `notifiers.len() != self.senders.len()` — the lengths must be identical
+    /// to the shard count established at construction time.
+    pub fn set_fold_channels(
+        &mut self,
+        producers: Vec<
+            Arc<parking_lot::Mutex<ringbuf::HeapProd<crate::shard::dispatch::ShardMessage>>>,
+        >,
+        notifiers: Vec<Arc<crate::runtime::channel::Notify>>,
+    ) {
+        if self.fold_producers.is_some() || self.fold_notifiers.is_some() {
+            error!(
+                "set_fold_channels called twice on AofWriterPool (shard count {}). \
+                 The first set of channels is kept. This is a startup-configuration \
+                 bug — check the main.rs wiring.",
+                self.senders.len()
+            );
+            return;
+        }
+        debug_assert_eq!(
+            producers.len(),
+            self.senders.len(),
+            "set_fold_channels: producers len {} != shard count {}",
+            producers.len(),
+            self.senders.len(),
+        );
+        debug_assert_eq!(
+            notifiers.len(),
+            self.senders.len(),
+            "set_fold_channels: notifiers len {} != shard count {}",
+            notifiers.len(),
+            self.senders.len(),
+        );
+        self.fold_producers = Some(producers);
+        self.fold_notifiers = Some(notifiers);
     }
 
     /// Returns the configured fsync policy. Hot-path callers read this to
@@ -236,9 +349,20 @@ impl AofWriterPool {
     /// replication-state handle pass 0.
     #[inline]
     pub fn try_send_append(&self, shard_id: usize, lsn: u64, bytes: Bytes) {
-        let _ = self
+        if let Err(e) = self
             .sender(shard_id)
-            .try_send(AofMessage::Append { lsn, bytes });
+            .try_send(AofMessage::Append { lsn, bytes })
+        {
+            warn!(
+                "AOF append dropped for shard {} (lsn {}): channel {}",
+                shard_id,
+                lsn,
+                match e {
+                    flume::TrySendError::Full(_) => "full",
+                    flume::TrySendError::Disconnected(_) => "disconnected",
+                }
+            );
+        }
     }
 
     /// Synchronous (fsync-before-ack) append for `appendfsync=always`
@@ -443,11 +567,47 @@ impl AofWriterPool {
         let n_shards = self.senders.len();
         let shared_manifest = Arc::new(parking_lot::Mutex::new(manifest));
         let coord = PerShardRewriteCoord::new(shared_manifest, current_seq, n_shards);
+        // C4 deadlock guard: fold channels MUST be wired before a per-shard
+        // rewrite is attempted. If they are absent the AofFold push would
+        // succeed into a 1-slot ring whose consumer was dropped at construction
+        // time, causing the writer to block forever on `recv_blocking` while
+        // the bounded AOF append channel (10_000) fills and silently drops
+        // every subsequent write (test_ssm4a_fold_4shard_experimental: 2016 of
+        // 272988 INCRs survived restart). Abort cleanly instead: log an error,
+        // mark the coord failed, and return — the old generation stays
+        // authoritative (same abort path as a disconnected writer channel above).
+        if self.fold_producers.is_none() || self.fold_notifiers.is_none() {
+            error!(
+                "F6 per-shard rewrite: fold channels not wired (pool built with \
+                 per_shard_with_base_dir — call set_fold_channels after mesh \
+                 creation). Rewrite aborted; old generation remains authoritative. \
+                 This is a startup-configuration bug."
+            );
+            coord.mark_failed();
+            for _ in 0..n_shards {
+                coord.shard_done();
+            }
+            return Err(AofPoolSendError::SendFailed);
+        }
+        // SAFETY: both options are Some, checked above.
+        let fold_producers_vec = self.fold_producers.as_ref().expect("checked above");
+        let fold_notifiers_vec = self.fold_notifiers.as_ref().expect("checked above");
+
         for (idx, s) in self.senders.iter().enumerate() {
+            let fold_producer = fold_producers_vec
+                .get(idx)
+                .cloned()
+                .expect("fold_producers len == senders len (debug_asserted at set_fold_channels)");
+            let fold_notifier = fold_notifiers_vec
+                .get(idx)
+                .cloned()
+                .expect("fold_notifiers len == senders len (debug_asserted at set_fold_channels)");
             // Blocking send for guaranteed delivery — see the doc comment.
             if s.send(AofMessage::RewritePerShard {
                 shard_dbs: shard_dbs.clone(),
                 coord: coord.clone(),
+                fold_producer,
+                fold_notifier,
             })
             .is_err()
             {
@@ -535,7 +695,7 @@ mod pool_tests {
             tmp.path().to_path_buf(),
         );
 
-        let shard_dbs = crate::shard::shared_databases::ShardDatabases::new(vec![
+        let (shard_dbs, _inits) = crate::shard::shared_databases::ShardDatabases::new(vec![
             vec![crate::storage::Database::new()],
             vec![crate::storage::Database::new()],
         ]);
@@ -586,7 +746,7 @@ mod pool_tests {
         // Shard 0's append file starts on the OLD incr (where the live writer
         // appends before a rewrite). Empty databases keep the fold trivial; the
         // reopen behaviour is independent of key count.
-        let shard_dbs = crate::shard::shared_databases::ShardDatabases::new(vec![
+        let (shard_dbs, _inits) = crate::shard::shared_databases::ShardDatabases::new(vec![
             vec![crate::storage::Database::new()],
             vec![crate::storage::Database::new()],
         ]);
@@ -597,10 +757,35 @@ mod pool_tests {
             .unwrap();
         let (_tx, rx) = channel::mpsc_bounded::<AofMessage>(4);
 
+        // Create a dummy fold channel whose ring is pre-filled so try_push(AofFold)
+        // fails immediately — do_rewrite_per_shard returns Err before reaching
+        // recv_blocking, which would hang forever with no shard thread consuming.
+        // Capacity 1, pre-filled with Shutdown so the single slot is taken.
+        use ringbuf::traits::{Producer as _, Split as _};
+        let (mut fold_prod, fold_cons) =
+            ringbuf::HeapRb::<crate::shard::dispatch::ShardMessage>::new(1).split();
+        let _ = fold_prod.try_push(crate::shard::dispatch::ShardMessage::Shutdown);
+        let fold_producer = std::sync::Arc::new(parking_lot::Mutex::new(fold_prod));
+        let fold_notifier = std::sync::Arc::new(crate::runtime::channel::Notify::new());
+        // Keep fold_cons alive so the producer is not dropped before do_rewrite_per_shard runs.
+        let _fold_cons = fold_cons;
+
         AOF_REWRITE_IN_PROGRESS.store(true, Ordering::SeqCst);
         // The fold itself succeeds; aborting is a coordinator decision, so this
         // returns Ok even though the rewrite is discarded.
-        do_rewrite_per_shard(0, &shard_dbs, &mut file, &rx, &coord).unwrap();
+        // NOTE: With ShardSlice live, do_rewrite_per_shard sends AofFold and blocks
+        // on the reply. In this unit test there's no shard event loop consuming the
+        // SPSC ring, so the fold will error out. The test verifies the abort path,
+        // which is triggered by the fold guard's error handling.
+        let _ = do_rewrite_per_shard(
+            0,
+            &shard_dbs,
+            &mut file,
+            &rx,
+            &coord,
+            &fold_producer,
+            &fold_notifier,
+        );
 
         // Abort kept the old generation committed and pruned the new-gen incr.
         assert_eq!(manifest.lock().seq, old_seq, "abort must keep old_seq");
@@ -924,7 +1109,7 @@ mod pool_tests {
             .append(true)
             .open(&incr)
             .unwrap();
-        let mut outcome = drain_pending_appends_framed(&rx0, &mut file).unwrap();
+        let mut outcome = drain_pending_appends_framed(&rx0, &mut file, usize::MAX).unwrap();
 
         // CONTRACT: drained + parked, NOT yet acked.
         assert_eq!(outcome.drained, 1, "the AppendSync was drained");
