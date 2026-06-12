@@ -42,7 +42,7 @@ pub(super) fn try_handle_txn_begin(
 }
 
 /// Handle TXN.COMMIT — returns `true` if the command was consumed.
-pub(super) fn try_handle_txn_commit(
+pub(super) async fn try_handle_txn_commit(
     cmd: &[u8],
     cmd_args: &[Frame],
     conn: &mut ConnectionState,
@@ -60,10 +60,19 @@ pub(super) fn try_handle_txn_commit(
                 // have been excluded from oldest_snapshot, allowing prune_committed to
                 // advance past its LSN. Committing with a stale read set is undefined
                 // behaviour — force the client to restart the transaction.
-                let mut vector_store = ctx.shard_databases.vector_store(ctx.shard_id);
-                if vector_store.txn_manager().is_killed(txn.txn_id) {
-                    vector_store.txn_manager_mut().abort_killed(txn.txn_id);
-                    drop(vector_store);
+                // Scope the vector_store guard so it is DROPPED before any .await
+                // in the MQ-materialize hop below (lock-across-await rule).
+                let killed = {
+                    let mut vector_store = ctx.shard_databases.vector_store(ctx.shard_id);
+                    if vector_store.txn_manager().is_killed(txn.txn_id) {
+                        vector_store.txn_manager_mut().abort_killed(txn.txn_id);
+                        true
+                    } else {
+                        vector_store.txn_manager_mut().commit(txn.txn_id);
+                        false
+                    }
+                }; // vector_store guard dropped here
+                if killed {
                     tracing::warn!(
                         txn_id = txn.txn_id,
                         "TXN.COMMIT rejected: snapshot was killed (snapshot too old)"
@@ -74,8 +83,6 @@ pub(super) fn try_handle_txn_commit(
                     responses.push(Frame::Error(msg.freeze()));
                     return true;
                 }
-                vector_store.txn_manager_mut().commit(txn.txn_id);
-                drop(vector_store);
 
                 // Write XactCommit WAL record with committed KV state
                 let txn_id = txn.txn_id;
@@ -129,16 +136,58 @@ pub(super) fn try_handle_txn_commit(
                 // Materialize MQ intents: enqueue deferred MQ.PUBLISH messages
                 if !txn.mq_intents.is_empty() {
                     if crate::shard::slice::is_initialized() {
-                        crate::shard::slice::with_shard_db(conn.selected_db as usize, |db| {
-                            for intent in &txn.mq_intents {
-                                if let Ok(Some(stream)) = db.get_stream_mut(&intent.queue_key) {
-                                    if stream.durable {
-                                        let msg_id = stream.next_auto_id();
-                                        stream.add(msg_id, intent.fields.clone());
-                                    }
-                                }
+                        // shardslice-migration Wave B1: group intents by owner shard.
+                        // Self-owned intents fold locally; foreign intents hop via
+                        // MqTxnMaterialize (mirrors the lock-path's per-intent owner
+                        // routing, but batched per shard and awaited before replying).
+                        use std::collections::HashMap;
+                        let mut by_shard: HashMap<usize, Vec<crate::transaction::MqIntent>> =
+                            HashMap::new();
+                        for intent in txn.mq_intents.iter().cloned() {
+                            let owner = crate::shard::dispatch::key_to_shard(
+                                &intent.queue_key,
+                                ctx.num_shards,
+                            );
+                            by_shard.entry(owner).or_default().push(intent);
+                        }
+                        for (owner, intents) in by_shard {
+                            if owner == ctx.shard_id {
+                                // Self: apply locally.
+                                crate::shard::slice::with_shard_db(
+                                    conn.selected_db as usize,
+                                    |db| {
+                                        for intent in &intents {
+                                            if let Ok(Some(stream)) =
+                                                db.get_stream_mut(&intent.queue_key)
+                                            {
+                                                if stream.durable {
+                                                    let msg_id = stream.next_auto_id();
+                                                    stream.add(msg_id, intent.fields.clone());
+                                                }
+                                            }
+                                        }
+                                    },
+                                );
+                            } else {
+                                // Foreign: send MqTxnMaterialize hop and await ack.
+                                let (reply_tx, reply_rx) = crate::runtime::channel::oneshot();
+                                let msg = crate::shard::dispatch::ShardMessage::MqTxnMaterialize {
+                                    db_index: conn.selected_db as usize,
+                                    intents,
+                                    reply_tx,
+                                };
+                                crate::shard::coordinator::spsc_send(
+                                    &ctx.dispatch_tx,
+                                    ctx.shard_id,
+                                    owner,
+                                    msg,
+                                    &ctx.spsc_notifiers,
+                                )
+                                .await;
+                                // Await the ack before replying OK to the client.
+                                let _ = reply_rx.recv().await;
                             }
-                        });
+                        }
                     } else {
                         // Each queue lives on the shard owning its key, which
                         // may differ from the connection's shard (and per

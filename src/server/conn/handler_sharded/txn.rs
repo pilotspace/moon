@@ -47,7 +47,7 @@ pub(super) fn try_handle_txn_begin(
 }
 
 /// Handle TXN.COMMIT — returns `true` if the command was consumed.
-pub(super) fn try_handle_txn_commit(
+pub(super) async fn try_handle_txn_commit(
     cmd: &[u8],
     cmd_args: &[Frame],
     conn: &mut ConnectionState,
@@ -157,19 +157,68 @@ pub(super) fn try_handle_txn_commit(
                 // Materialize MQ intents: enqueue deferred MQ.PUBLISH messages.
                 // Phase 2f: gate on is_initialized(); new path uses ShardSlice directly.
                 if !txn.mq_intents.is_empty() {
-                    let materialize = |db: &mut crate::storage::db::Database| {
-                        for intent in &txn.mq_intents {
-                            if let Ok(Some(stream)) = db.get_stream_mut(&intent.queue_key) {
-                                if stream.durable {
-                                    let msg_id = stream.next_auto_id();
-                                    stream.add(msg_id, intent.fields.clone());
+                    if crate::shard::slice::is_initialized() {
+                        // Slice path (shardslice-migration Wave B2): group intents by owning
+                        // shard. Self-shard intents are applied locally; foreign groups are
+                        // sent via MqTxnMaterialize and awaited before replying OK.
+                        let mut self_intents: Vec<crate::transaction::MqIntent> = Vec::new();
+                        let mut foreign: std::collections::HashMap<
+                            usize,
+                            Vec<crate::transaction::MqIntent>,
+                        > = std::collections::HashMap::new();
+                        for intent in txn.mq_intents.iter().cloned() {
+                            let owner = crate::shard::dispatch::key_to_shard(
+                                &intent.queue_key,
+                                ctx.num_shards,
+                            );
+                            if owner == ctx.shard_id {
+                                self_intents.push(intent);
+                            } else {
+                                foreign.entry(owner).or_default().push(intent);
+                            }
+                        }
+                        // Apply self-shard intents synchronously (no borrow across .await).
+                        if !self_intents.is_empty() {
+                            crate::shard::slice::with_shard_db(conn.selected_db, |db| {
+                                for intent in &self_intents {
+                                    if let Ok(Some(stream)) = db.get_stream_mut(&intent.queue_key) {
+                                        if stream.durable {
+                                            let msg_id = stream.next_auto_id();
+                                            stream.add(msg_id, intent.fields.clone());
+                                        }
+                                    }
+                                }
+                            });
+                        }
+                        // Send MqTxnMaterialize to each foreign shard and await all acks.
+                        for (owner, intents) in foreign {
+                            let (reply_tx, reply_rx) = crate::runtime::channel::oneshot();
+                            let msg = crate::shard::dispatch::ShardMessage::MqTxnMaterialize {
+                                db_index: conn.selected_db,
+                                intents,
+                                reply_tx,
+                            };
+                            crate::shard::coordinator::spsc_send(
+                                &ctx.dispatch_tx,
+                                ctx.shard_id,
+                                owner,
+                                msg,
+                                &ctx.spsc_notifiers,
+                            )
+                            .await;
+                            match reply_rx.recv().await {
+                                Ok(()) => {}
+                                Err(_) => {
+                                    tracing::warn!(
+                                        "TXN.COMMIT MQ materialize: reply channel closed \
+                                         for shard {}",
+                                        owner
+                                    );
                                 }
                             }
                         }
-                    };
-                    if crate::shard::slice::is_initialized() {
-                        crate::shard::slice::with_shard_db(conn.selected_db, materialize);
                     } else {
+                        // Lock path (byte-identical to pre-migration).
                         // Each queue lives on the shard owning its key, which
                         // may differ from the connection's shard (and per
                         // intent) — acquire the owner's db per queue.

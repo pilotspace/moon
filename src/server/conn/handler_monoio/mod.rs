@@ -879,7 +879,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
             if txn::try_handle_txn_begin(cmd, cmd_args, &mut conn, ctx, &mut responses) {
                 continue;
             }
-            if txn::try_handle_txn_commit(cmd, cmd_args, &mut conn, ctx, &mut responses) {
+            if txn::try_handle_txn_commit(cmd, cmd_args, &mut conn, ctx, &mut responses).await {
                 continue;
             }
             if txn::try_handle_txn_abort(cmd, cmd_args, &mut conn, ctx, &mut responses).await {
@@ -896,12 +896,14 @@ pub(crate) async fn handle_connection_sharded_monoio<
             }
 
             // --- WS.* ---
-            if write::try_handle_ws_command(cmd, cmd_args, &mut conn, ctx, &mut responses) {
+            if write::try_handle_ws_command(cmd, cmd_args, &mut conn, ctx, &mut responses).await {
                 continue;
             }
 
             // --- MQ.* ---
-            if write::try_handle_mq_command(cmd, cmd_args, &mut conn, ctx, &mut responses) {
+            if write::try_handle_mq_command(cmd, cmd_args, &frame, &mut conn, ctx, &mut responses)
+                .await
+            {
                 continue;
             }
 

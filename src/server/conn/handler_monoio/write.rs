@@ -28,7 +28,7 @@ use crate::workspace::{WorkspaceId, is_ws_command};
 use super::execute_transaction_sharded;
 
 /// Handle WS.* workspace commands. Returns `true` if consumed.
-pub(super) fn try_handle_ws_command(
+pub(super) async fn try_handle_ws_command(
     cmd: &[u8],
     cmd_args: &[Frame],
     conn: &mut ConnectionState,
@@ -116,16 +116,47 @@ pub(super) fn try_handle_ws_command(
                             {
                                 let prefix = format!("{{{}}}:", ws_id.as_hex());
                                 if crate::shard::slice::is_initialized() {
-                                    crate::shard::slice::with_shard_db(0, |db| {
-                                        let keys_to_delete: Vec<Vec<u8>> = db
-                                            .keys()
-                                            .filter(|k| k.as_bytes().starts_with(prefix.as_bytes()))
-                                            .map(|k| k.as_bytes().to_vec())
-                                            .collect();
-                                        for key in &keys_to_delete {
-                                            db.remove(key);
-                                        }
-                                    });
+                                    // shardslice-migration Wave B1: owner-route the
+                                    // cleanup via WsDropCleanup hop. The {wsid} hash
+                                    // tag co-locates every workspace key on ONE shard.
+                                    let prefix_bytes = Bytes::from(prefix.into_bytes());
+                                    let owner = crate::shard::dispatch::key_to_shard(
+                                        &prefix_bytes,
+                                        ctx.num_shards,
+                                    );
+                                    if owner == ctx.shard_id {
+                                        // Self: execute locally (we ARE the owner).
+                                        crate::shard::slice::with_shard_db(0, |db| {
+                                            let keys_to_delete: Vec<Vec<u8>> = db
+                                                .keys()
+                                                .filter(|k| {
+                                                    k.as_bytes().starts_with(prefix_bytes.as_ref())
+                                                })
+                                                .map(|k| k.as_bytes().to_vec())
+                                                .collect();
+                                            for key in &keys_to_delete {
+                                                db.remove(key);
+                                            }
+                                        });
+                                    } else {
+                                        // Foreign: send WsDropCleanup hop to owner.
+                                        let (reply_tx, reply_rx) =
+                                            crate::runtime::channel::oneshot();
+                                        let msg =
+                                            crate::shard::dispatch::ShardMessage::WsDropCleanup {
+                                                prefix: prefix_bytes,
+                                                reply_tx,
+                                            };
+                                        crate::shard::coordinator::spsc_send(
+                                            &ctx.dispatch_tx,
+                                            ctx.shard_id,
+                                            owner,
+                                            msg,
+                                            &ctx.spsc_notifiers,
+                                        )
+                                        .await;
+                                        let _ = reply_rx.recv().await;
+                                    }
                                 } else {
                                     // The {wsid} hash tag co-locates every
                                     // workspace key on ONE shard — clean up
@@ -257,9 +288,10 @@ pub(super) fn try_handle_ws_command(
 }
 
 /// Handle MQ.* message queue commands. Returns `true` if consumed.
-pub(super) fn try_handle_mq_command(
+pub(super) async fn try_handle_mq_command(
     cmd: &[u8],
     cmd_args: &[Frame],
+    frame: &Frame,
     conn: &mut ConnectionState,
     ctx: &ConnectionContext,
     responses: &mut Vec<Frame>,
@@ -289,21 +321,24 @@ pub(super) fn try_handle_mq_command(
                 // slice mode is never initialized yet (owner-routing there is
                 // the shardslice-migration task).
                 let owner = crate::shard::dispatch::key_to_shard(&effective_key, ctx.num_shards);
-                // Phase 2a: gate on is_initialized(); new path uses ShardSlice directly.
-                let create_result: Result<(), Frame> = if crate::shard::slice::is_initialized() {
-                    crate::shard::slice::with_shard_db(conn.selected_db, |db| {
-                        match db.get_or_create_stream(&effective_key) {
-                            Ok(stream) => {
-                                stream.durable = true;
-                                stream.max_delivery_count = max_delivery_count;
-                                let group_name = Bytes::from_static(b"__mq_consumers");
-                                let _ = stream.create_group(group_name, StreamId::ZERO);
-                                Ok(())
-                            }
-                            Err(e) => Err(e),
-                        }
-                    })
-                } else {
+                // Phase 2a / shardslice-migration Wave B1: gate on is_initialized();
+                // slice path owner-routes via MqCommand hop (execute_mq_on_owner
+                // handles stream create, registry insert, and WAL in one step).
+                if crate::shard::slice::is_initialized() {
+                    let key_prefix = mq_ws_prefix(conn.workspace_id.as_ref());
+                    let response = mq_hop_or_local(
+                        owner,
+                        conn.selected_db,
+                        ctx,
+                        key_prefix,
+                        std::sync::Arc::new(frame.clone()),
+                    )
+                    .await;
+                    responses.push(response);
+                    return true;
+                }
+
+                let create_result: Result<(), Frame> = {
                     let mut db_guard = ctx.shard_databases.write_db(owner, conn.selected_db);
                     match db_guard.get_or_create_stream(&effective_key) {
                         Ok(stream) => {
@@ -356,41 +391,38 @@ pub(super) fn try_handle_mq_command(
                     crate::workspace::workspace_key(conn.workspace_id.as_ref(), &queue_key);
                 // Owner-shard targeting — see MQ CREATE above.
                 let owner = crate::shard::dispatch::key_to_shard(&effective_key, ctx.num_shards);
-                // Phase 2a: gate on is_initialized(); new path uses ShardSlice.
-                // trigger_registry stays via old path (Phase 2b scope, not migrated here).
-                let push_result: Result<crate::storage::stream::StreamId, Frame> =
-                    if crate::shard::slice::is_initialized() {
-                        crate::shard::slice::with_shard_db(conn.selected_db, |db| {
-                            match db.get_stream_mut(&effective_key) {
-                                Ok(Some(stream)) => {
-                                    if !stream.durable {
-                                        Err(Frame::Error(Bytes::from_static(ERR_MQ_NOT_DURABLE)))
-                                    } else {
-                                        let id = stream.next_auto_id();
-                                        Ok(stream.add(id, fields))
-                                    }
-                                }
-                                Ok(None) => {
-                                    Err(Frame::Error(Bytes::from_static(ERR_MQ_NOT_DURABLE)))
-                                }
-                                Err(e) => Err(e),
+                // Phase 2a / shardslice-migration Wave B1: gate on is_initialized();
+                // slice path owner-routes via MqCommand hop (execute_mq_on_owner
+                // handles stream push, trigger debounce in one step).
+                if crate::shard::slice::is_initialized() {
+                    let key_prefix = mq_ws_prefix(conn.workspace_id.as_ref());
+                    let response = mq_hop_or_local(
+                        owner,
+                        conn.selected_db,
+                        ctx,
+                        key_prefix,
+                        std::sync::Arc::new(frame.clone()),
+                    )
+                    .await;
+                    responses.push(response);
+                    return true;
+                }
+
+                let push_result: Result<crate::storage::stream::StreamId, Frame> = {
+                    let mut db_guard = ctx.shard_databases.write_db(owner, conn.selected_db);
+                    match db_guard.get_stream_mut(&effective_key) {
+                        Ok(Some(stream)) => {
+                            if !stream.durable {
+                                Err(Frame::Error(Bytes::from_static(ERR_MQ_NOT_DURABLE)))
+                            } else {
+                                let id = stream.next_auto_id();
+                                Ok(stream.add(id, fields))
                             }
-                        })
-                    } else {
-                        let mut db_guard = ctx.shard_databases.write_db(owner, conn.selected_db);
-                        match db_guard.get_stream_mut(&effective_key) {
-                            Ok(Some(stream)) => {
-                                if !stream.durable {
-                                    Err(Frame::Error(Bytes::from_static(ERR_MQ_NOT_DURABLE)))
-                                } else {
-                                    let id = stream.next_auto_id();
-                                    Ok(stream.add(id, fields))
-                                }
-                            }
-                            Ok(None) => Err(Frame::Error(Bytes::from_static(ERR_MQ_NOT_DURABLE))),
-                            Err(e) => Err(e),
                         }
-                    };
+                        Ok(None) => Err(Frame::Error(Bytes::from_static(ERR_MQ_NOT_DURABLE))),
+                        Err(e) => Err(e),
+                    }
+                };
                 match push_result {
                     Ok(msg_id) => {
                         // trigger_registry: not in Phase 2a scope — old path only.
@@ -441,126 +473,42 @@ pub(super) fn try_handle_mq_command(
                 let group_name = Bytes::from_static(b"__mq_consumers");
                 let consumer_name = Bytes::from_static(b"__mq_default");
 
-                // Phase 2a: gate on is_initialized(); new path uses ShardSlice.
-                // All DB work (claim, DLQ routing) happens inside the closure;
-                // only owned data (result_frames) escapes.
-                let pop_frame: Result<Frame, Frame> = if crate::shard::slice::is_initialized() {
-                    crate::shard::slice::with_shard_db(conn.selected_db, |db| {
-                        let mdc = match db.get_stream_mut(&effective_key) {
-                            Ok(Some(stream)) => {
-                                if !stream.durable {
-                                    return Err(Frame::Error(Bytes::from_static(
-                                        ERR_MQ_NOT_DURABLE,
-                                    )));
-                                }
-                                stream.max_delivery_count
-                            }
-                            Ok(None) => {
-                                return Err(Frame::Error(Bytes::from_static(ERR_MQ_NOT_DURABLE)));
-                            }
-                            Err(e) => return Err(e),
-                        };
-                        let request_count = count + (mdc as usize);
-                        let claimed = match db.get_stream_mut(&effective_key) {
-                            Ok(Some(s)) => match s.read_group_new(
-                                &group_name,
-                                &consumer_name,
-                                Some(request_count),
-                                false,
-                            ) {
-                                Ok(entries) => entries,
-                                Err(_) => return Ok(Frame::Array(vec![].into())),
-                            },
-                            _ => {
-                                return Err(Frame::Error(Bytes::from_static(ERR_MQ_NOT_DURABLE)));
-                            }
-                        };
-                        let mut results = Vec::new();
-                        let mut dlq_entries: Vec<(StreamId, Vec<(Bytes, Bytes)>)> = Vec::new();
-                        let mut dlq_ack_ids: Vec<StreamId> = Vec::new();
-                        // Need stream again for PEL lookup
-                        if let Ok(Some(stream)) = db.get_stream_mut(&effective_key) {
-                            for (id, fields) in &claimed {
-                                let delivery_count = stream
-                                    .groups
-                                    .get(group_name.as_ref())
-                                    .and_then(|g| g.pel.get(id))
-                                    .map(|pe| pe.delivery_count)
-                                    .unwrap_or(1);
-                                if mdc > 0 && delivery_count >= mdc as u64 {
-                                    dlq_entries.push((*id, fields.clone()));
-                                    dlq_ack_ids.push(*id);
-                                } else if results.len() < count {
-                                    results.push((*id, fields.clone()));
-                                }
-                            }
-                            if !dlq_ack_ids.is_empty() {
-                                let _ = stream.xack(&group_name, &dlq_ack_ids);
-                            }
-                        }
-                        if !dlq_entries.is_empty() {
-                            let dlq_key = {
-                                let mut buf = Vec::with_capacity(effective_key.len() + 8);
-                                buf.extend_from_slice(&effective_key);
-                                buf.extend_from_slice(b"::mq:dlq");
-                                Bytes::from(buf)
-                            };
-                            if let Ok(dlq_stream) = db.get_or_create_stream(&dlq_key) {
-                                for (_id, fields) in dlq_entries {
-                                    let dlq_id = dlq_stream.next_auto_id();
-                                    dlq_stream.add(dlq_id, fields);
-                                }
-                            }
-                        }
-                        let result_frames: Vec<Frame> = results
-                            .iter()
-                            .map(|(id, fields)| {
-                                let mut entry_frames = Vec::with_capacity(2);
-                                entry_frames.push(Frame::BulkString(Bytes::from(format!(
-                                    "{}-{}",
-                                    id.ms, id.seq
-                                ))));
-                                let field_frames: Vec<Frame> = fields
-                                    .iter()
-                                    .flat_map(|(f, v)| {
-                                        vec![
-                                            Frame::BulkString(f.clone()),
-                                            Frame::BulkString(v.clone()),
-                                        ]
-                                    })
-                                    .collect();
-                                entry_frames.push(Frame::Array(field_frames.into()));
-                                Frame::Array(entry_frames.into())
-                            })
-                            .collect();
-                        Ok(Frame::Array(result_frames.into()))
-                    })
-                } else {
+                // Phase 2a / shardslice-migration Wave B1: gate on is_initialized();
+                // slice path owner-routes via MqCommand hop (execute_mq_on_owner
+                // handles claim, DLQ routing in one step).
+                if crate::shard::slice::is_initialized() {
+                    let key_prefix = mq_ws_prefix(conn.workspace_id.as_ref());
+                    let response = mq_hop_or_local(
+                        owner,
+                        conn.selected_db,
+                        ctx,
+                        key_prefix,
+                        std::sync::Arc::new(frame.clone()),
+                    )
+                    .await;
+                    responses.push(response);
+                    return true;
+                }
+
+                let pop_frame: Result<Frame, Frame> = (|| {
                     let mut db_guard = ctx.shard_databases.write_db(owner, conn.selected_db);
                     let mdc = match db_guard.get_stream_mut(&effective_key) {
                         Ok(Some(stream)) => {
                             if !stream.durable {
-                                responses
-                                    .push(Frame::Error(Bytes::from_static(ERR_MQ_NOT_DURABLE)));
-                                return true;
+                                return Err(Frame::Error(Bytes::from_static(ERR_MQ_NOT_DURABLE)));
                             }
                             stream.max_delivery_count
                         }
                         Ok(None) => {
-                            responses.push(Frame::Error(Bytes::from_static(ERR_MQ_NOT_DURABLE)));
-                            return true;
+                            return Err(Frame::Error(Bytes::from_static(ERR_MQ_NOT_DURABLE)));
                         }
-                        Err(e) => {
-                            responses.push(e);
-                            return true;
-                        }
+                        Err(e) => return Err(e),
                     };
                     let request_count = count + (mdc as usize);
                     let stream = match db_guard.get_stream_mut(&effective_key) {
                         Ok(Some(s)) => s,
                         _ => {
-                            responses.push(Frame::Error(Bytes::from_static(ERR_MQ_NOT_DURABLE)));
-                            return true;
+                            return Err(Frame::Error(Bytes::from_static(ERR_MQ_NOT_DURABLE)));
                         }
                     };
                     let claimed = match stream.read_group_new(
@@ -570,10 +518,7 @@ pub(super) fn try_handle_mq_command(
                         false,
                     ) {
                         Ok(entries) => entries,
-                        Err(_) => {
-                            responses.push(Frame::Array(vec![].into()));
-                            return true;
-                        }
+                        Err(_) => return Ok(Frame::Array(vec![].into())),
                     };
                     let mut results = Vec::new();
                     let mut dlq_entries: Vec<(StreamId, Vec<(Bytes, Bytes)>)> = Vec::new();
@@ -628,7 +573,7 @@ pub(super) fn try_handle_mq_command(
                         })
                         .collect();
                     Ok(Frame::Array(result_frames.into()))
-                };
+                })();
                 match pop_frame {
                     Ok(frame) => responses.push(frame),
                     Err(e) => {
@@ -653,35 +598,36 @@ pub(super) fn try_handle_mq_command(
                     .collect();
                 // Owner-shard targeting — see MQ CREATE above.
                 let owner = crate::shard::dispatch::key_to_shard(&effective_key, ctx.num_shards);
-                // Phase 2a: gate on is_initialized(); new path uses ShardSlice.
-                // WAL append stays outside closure (wal_append_tx not in Phase 2a scope).
-                let ack_result: Result<i64, ()> = if crate::shard::slice::is_initialized() {
-                    crate::shard::slice::with_shard_db(conn.selected_db, |db| {
-                        match db.get_stream_mut(&effective_key) {
-                            Ok(Some(stream)) => {
-                                let group_name = Bytes::from_static(b"__mq_consumers");
-                                Ok(stream
-                                    .xack(&group_name, &ids)
-                                    .map(|c| c as i64)
-                                    .unwrap_or(0))
-                            }
-                            _ => Ok(0i64),
-                        }
-                    })
-                } else {
+                // Phase 2a / shardslice-migration Wave B1: gate on is_initialized();
+                // slice path owner-routes via MqCommand hop (execute_mq_on_owner
+                // handles xack and WAL records in one step).
+                if crate::shard::slice::is_initialized() {
+                    let key_prefix = mq_ws_prefix(conn.workspace_id.as_ref());
+                    let response = mq_hop_or_local(
+                        owner,
+                        conn.selected_db,
+                        ctx,
+                        key_prefix,
+                        std::sync::Arc::new(frame.clone()),
+                    )
+                    .await;
+                    responses.push(response);
+                    return true;
+                }
+
+                let acked_count: i64 = {
                     let mut db_guard = ctx.shard_databases.write_db(owner, conn.selected_db);
                     match db_guard.get_stream_mut(&effective_key) {
                         Ok(Some(stream)) => {
                             let group_name = Bytes::from_static(b"__mq_consumers");
-                            Ok(stream
+                            stream
                                 .xack(&group_name, &ids)
                                 .map(|c| c as i64)
-                                .unwrap_or(0))
+                                .unwrap_or(0)
                         }
-                        _ => Ok(0i64),
+                        _ => 0i64,
                     }
                 };
-                let acked_count = ack_result.unwrap_or(0);
                 if acked_count > 0 {
                     // Emit MqAck WAL record for each acked ID (WAL stays outside closure)
                     for (ms, seq) in &msg_ids {
@@ -717,15 +663,23 @@ pub(super) fn try_handle_mq_command(
                     buf.extend_from_slice(b"::mq:dlq");
                     Bytes::from(buf)
                 };
-                // Phase 2a: gate on is_initialized(); new path uses ShardSlice.
-                let len: i64 = if crate::shard::slice::is_initialized() {
-                    crate::shard::slice::with_shard_db(conn.selected_db, |db| {
-                        match db.get_stream_mut(&dlq_key) {
-                            Ok(Some(stream)) => stream.length as i64,
-                            _ => 0i64,
-                        }
-                    })
-                } else {
+                // Phase 2a / shardslice-migration Wave B1: gate on is_initialized();
+                // slice path owner-routes via MqCommand hop.
+                if crate::shard::slice::is_initialized() {
+                    let key_prefix = mq_ws_prefix(conn.workspace_id.as_ref());
+                    let response = mq_hop_or_local(
+                        owner,
+                        conn.selected_db,
+                        ctx,
+                        key_prefix,
+                        std::sync::Arc::new(frame.clone()),
+                    )
+                    .await;
+                    responses.push(response);
+                    return true;
+                }
+
+                let len: i64 = {
                     let mut db_guard = ctx.shard_databases.write_db(owner, conn.selected_db);
                     match db_guard.get_stream_mut(&dlq_key) {
                         Ok(Some(stream)) => stream.length as i64,
@@ -744,6 +698,25 @@ pub(super) fn try_handle_mq_command(
             Ok((queue_key, callback_cmd, debounce_ms)) => {
                 let effective_key =
                     crate::workspace::workspace_key(conn.workspace_id.as_ref(), &queue_key);
+                // Owner's registry: its event-loop tick fires triggers
+                // (timers.rs documents the home shard as authoritative).
+                let owner = crate::shard::dispatch::key_to_shard(&effective_key, ctx.num_shards);
+                // shardslice-migration Wave B1: slice path owner-routes via MqCommand hop
+                // (execute_mq_on_owner registers the trigger in the owner's slice registry).
+                if crate::shard::slice::is_initialized() {
+                    let key_prefix = mq_ws_prefix(conn.workspace_id.as_ref());
+                    let response = mq_hop_or_local(
+                        owner,
+                        conn.selected_db,
+                        ctx,
+                        key_prefix,
+                        std::sync::Arc::new(frame.clone()),
+                    )
+                    .await;
+                    responses.push(response);
+                    return true;
+                }
+
                 let trig_key = if let Some(ws_id) = conn.workspace_id.as_ref() {
                     let ws_hex = ws_id.as_hex();
                     let mut k = Vec::with_capacity(ws_hex.len() + 1 + queue_key.len());
@@ -754,9 +727,6 @@ pub(super) fn try_handle_mq_command(
                 } else {
                     queue_key.clone()
                 };
-                // Owner's registry: its event-loop tick fires triggers
-                // (timers.rs documents the home shard as authoritative).
-                let owner = crate::shard::dispatch::key_to_shard(&effective_key, ctx.num_shards);
                 let entry = crate::mq::TriggerEntry {
                     queue_key: effective_key,
                     callback_cmd,
@@ -799,6 +769,76 @@ pub(super) fn try_handle_mq_command(
     // Unknown MQ subcommand
     responses.push(Frame::Error(Bytes::from_static(ERR_MQ_UNKNOWN_SUB)));
     true
+}
+
+// ── shardslice-migration Wave B1 helpers ─────────────────────────────────────
+
+/// Build the workspace prefix `"{ws_hex}:"` used as `MqCommandPayload.key_prefix`.
+///
+/// When the connection is not workspace-bound this returns `Bytes::new()`,
+/// matching `MqCommandPayload`'s "empty = no prefix" contract.
+#[inline]
+fn mq_ws_prefix(workspace_id: Option<&crate::workspace::WorkspaceId>) -> Bytes {
+    match workspace_id {
+        None => Bytes::new(),
+        Some(ws_id) => {
+            let ws_hex = ws_id.as_hex();
+            // "{" + 32 hex + "}" + ":" = 35 bytes
+            let mut buf = Vec::with_capacity(35);
+            buf.push(b'{');
+            buf.extend_from_slice(ws_hex.as_bytes());
+            buf.push(b'}');
+            buf.push(b':');
+            Bytes::from(buf)
+        }
+    }
+}
+
+/// Send an MQ command to the owning shard (or run locally if self).
+///
+/// When `owner == ctx.shard_id` the command runs synchronously via
+/// `mq_exec::execute_mq_on_owner` (same thread, slice live — no hop overhead).
+/// Otherwise a `ShardMessage::MqCommand` is pushed to the SPSC ring and the
+/// caller awaits the oneshot reply.
+///
+/// `db_index` = `conn.selected_db`; `owner` = `key_to_shard(effective_key)`.
+///
+/// Returns the `Frame` response to push to the client.
+async fn mq_hop_or_local(
+    owner: usize,
+    db_index: usize,
+    ctx: &ConnectionContext,
+    key_prefix: Bytes,
+    command: std::sync::Arc<crate::protocol::Frame>,
+) -> crate::protocol::Frame {
+    if owner == ctx.shard_id {
+        // Self-short-circuit: run directly on this shard's slice.
+        crate::shard::mq_exec::execute_mq_on_owner(db_index, key_prefix, command)
+    } else {
+        // Cross-shard hop via MqCommand SPSC message (GraphCommand precedent).
+        let (reply_tx, reply_rx) = crate::runtime::channel::oneshot();
+        let payload = crate::shard::dispatch::MqCommandPayload {
+            db_index,
+            key_prefix,
+            command,
+            reply_tx,
+        };
+        let msg = crate::shard::dispatch::ShardMessage::MqCommand(Box::new(payload));
+        crate::shard::coordinator::spsc_send(
+            &ctx.dispatch_tx,
+            ctx.shard_id,
+            owner,
+            msg,
+            &ctx.spsc_notifiers,
+        )
+        .await;
+        match reply_rx.recv().await {
+            Ok(f) => f,
+            Err(_) => crate::protocol::Frame::Error(bytes::Bytes::from_static(
+                b"ERR cross-shard MQ reply channel closed",
+            )),
+        }
+    }
 }
 
 /// Handle MULTI/EXEC/DISCARD commands. Returns `true` if consumed.
