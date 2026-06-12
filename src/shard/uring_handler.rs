@@ -81,7 +81,9 @@ pub(crate) fn handle_uring_event(
     event: IoEvent,
     driver: &mut UringDriver,
     shard_databases: &Arc<ShardDatabases>,
-    shard_id: usize,
+    // Unused since the ShardSlice cutover: this handler runs on the shard's
+    // own thread, so the thread-local slice (with_shard_db) IS this shard.
+    _shard_id: usize,
     parse_bufs: &mut std::collections::HashMap<u32, bytes::BytesMut>,
     inflight_sends: &mut std::collections::HashMap<u32, std::collections::VecDeque<InFlightSend>>,
     uring_listener_fd: Option<std::os::fd::RawFd>,

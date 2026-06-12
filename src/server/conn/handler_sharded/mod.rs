@@ -1206,9 +1206,24 @@ pub(crate) async fn handle_connection_sharded_inner<
                                 (Frame, bool, Option<std::time::Instant>),
                                 Frame,
                             >;
-                            let mut do_write = |db: &mut crate::storage::db::Database,
+                            // Takes the whole ShardSlice (not just the Database):
+                            // the KV undo-log capture below records write intents on
+                            // s.kv_write_intents, and re-entering with_shard from
+                            // inside a with_shard_db closure panics (slice
+                            // re-entrancy guard). `db` borrows s.databases only, so
+                            // s.kv_write_intents stays accessible (disjoint NLL
+                            // field borrows).
+                            let mut do_write = |s: &mut crate::shard::slice::ShardSlice,
                                                 conn: &mut super::core::ConnectionState|
                              -> WriteOutcome {
+                                let db_len = s.databases.len();
+                                #[allow(clippy::unwrap_used)] // mirror with_shard_db's panic semantics
+                                let db = s.databases.get_mut(conn.selected_db).unwrap_or_else(|| {
+                                    panic!(
+                                        "db_index {} out of bounds ({db_len} databases on shard {})",
+                                        conn.selected_db, s.shard_id
+                                    )
+                                });
                                 let rt = ctx.runtime_config.read();
                                 // Disk-offload: when a per-shard spill sender is wired
                                 // (ConnCtx populated by spawn_tokio_connection), evicted
@@ -1255,9 +1270,10 @@ pub(crate) async fn handle_connection_sharded_inner<
                                                     txn.kv_undo.record_delete(key_bytes.clone(), old_entry);
                                                     let lsn = txn.snapshot_lsn;
                                                     let tid = txn.txn_id;
-                                                    crate::shard::slice::with_shard(|s| {
-                                                        s.kv_write_intents.record_write(key_bytes.clone(), lsn, tid);
-                                                    });
+                                                    // Direct field access — `s` is this
+                                                    // closure's own param; re-entering
+                                                    // with_shard here panics.
+                                                    s.kv_write_intents.record_write(key_bytes.clone(), lsn, tid);
                                                 }
                                             }
                                         }
@@ -1269,9 +1285,8 @@ pub(crate) async fn handle_connection_sharded_inner<
                                             None => txn.kv_undo.record_insert(key.clone()),
                                             Some(entry) => txn.kv_undo.record_update(key.clone(), entry),
                                         }
-                                        crate::shard::slice::with_shard(|s| {
-                                            s.kv_write_intents.record_write(key.clone(), lsn, tid);
-                                        });
+                                        // Direct field access — see DEL/UNLINK arm above.
+                                        s.kv_write_intents.record_write(key.clone(), lsn, tid);
                                     }
                                 }
 
@@ -1303,7 +1318,7 @@ pub(crate) async fn handle_connection_sharded_inner<
 
                             // Unconditional slice path: ShardSlice is always initialized.
                             let write_outcome: WriteOutcome =
-                                crate::shard::slice::with_shard_db(conn.selected_db, |db| do_write(db, &mut conn));
+                                crate::shard::slice::with_shard(|s| do_write(s, &mut conn));
 
                             let (mut response, _sample_latency, dispatch_start): (Frame, bool, Option<std::time::Instant>) =
                                 match write_outcome {

@@ -211,7 +211,7 @@ fn qw2_try_wal_append_required_false_on_full() {
     use moon::shard::shared_databases::ShardDatabases;
     use moon::storage::db::Database;
 
-    let dbs = ShardDatabases::new(vec![vec![Database::new()]]);
+    let (dbs, _inits) = ShardDatabases::new(vec![vec![Database::new()]]);
 
     // Persistence disabled -> no durability requirement -> true.
     assert!(

@@ -1248,13 +1248,16 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                             txn.kv_undo.record_delete(key_bytes.clone(), old_entry);
                                             let lsn = txn.snapshot_lsn;
                                             let tid = txn.txn_id;
-                                            crate::shard::slice::with_shard(|s| {
-                                                s.kv_write_intents.record_write(
-                                                    key_bytes.clone(),
-                                                    lsn,
-                                                    tid,
-                                                );
-                                            });
+                                            // Direct field access — the outer with_shard
+                                            // closure already owns `s`; re-entering
+                                            // with_shard here panics (slice re-entrancy
+                                            // guard). `db` borrows s.databases only, so
+                                            // s.kv_write_intents is a disjoint field (NLL).
+                                            s.kv_write_intents.record_write(
+                                                key_bytes.clone(),
+                                                lsn,
+                                                tid,
+                                            );
                                         }
                                     }
                                 }
@@ -1268,9 +1271,8 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                     None => txn.kv_undo.record_insert(key.clone()),
                                     Some(entry) => txn.kv_undo.record_update(key.clone(), entry),
                                 }
-                                crate::shard::slice::with_shard(|s| {
-                                    s.kv_write_intents.record_write(key.clone(), lsn, tid);
-                                });
+                                // Direct field access — see DEL/UNLINK arm above.
+                                s.kv_write_intents.record_write(key.clone(), lsn, tid);
                             }
                         }
 

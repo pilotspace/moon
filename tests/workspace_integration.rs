@@ -152,7 +152,8 @@ async fn start_workspace_server(num_shards: usize) -> (u16, CancellationToken) {
             .iter_mut()
             .map(|s| std::mem::take(&mut s.databases))
             .collect();
-        let shard_databases = moon::shard::shared_databases::ShardDatabases::new(all_dbs);
+        let (shard_databases, mut slice_inits) =
+            moon::shard::shared_databases::ShardDatabases::new(all_dbs);
 
         let mut shard_handles = Vec::with_capacity(num_shards);
         for (id, mut shard) in shards.into_iter().enumerate() {
@@ -167,6 +168,7 @@ async fn start_workspace_server(num_shards: usize) -> (u16, CancellationToken) {
             let shard_pubsub_regs = all_pubsub_registries.clone();
             let shard_remote_sub_maps = all_remote_sub_maps.clone();
             let shard_affinity = affinity_tracker.clone();
+            let shard_slice_init = slice_inits.remove(0);
 
             let handle = std::thread::Builder::new()
                 .name(format!("ws-test-shard-{}", id))
@@ -209,6 +211,7 @@ async fn start_workspace_server(num_shards: usize) -> (u16, CancellationToken) {
                         shard_pubsub_regs,
                         shard_remote_sub_maps,
                         shard_affinity,
+                        shard_slice_init,
                     )));
                 })
                 .expect("failed to spawn shard thread");
@@ -375,7 +378,8 @@ async fn start_workspace_server_with_auth(
             .iter_mut()
             .map(|s| std::mem::take(&mut s.databases))
             .collect();
-        let shard_databases = moon::shard::shared_databases::ShardDatabases::new(all_dbs);
+        let (shard_databases, mut slice_inits) =
+            moon::shard::shared_databases::ShardDatabases::new(all_dbs);
 
         let mut shard_handles = Vec::with_capacity(num_shards);
         for (id, mut shard) in shards.into_iter().enumerate() {
@@ -390,6 +394,7 @@ async fn start_workspace_server_with_auth(
             let shard_pubsub_regs = all_pubsub_registries.clone();
             let shard_remote_sub_maps = all_remote_sub_maps.clone();
             let shard_affinity = affinity_tracker.clone();
+            let shard_slice_init = slice_inits.remove(0);
 
             let handle = std::thread::Builder::new()
                 .name(format!("ws-auth-shard-{}", id))
@@ -432,6 +437,7 @@ async fn start_workspace_server_with_auth(
                         shard_pubsub_regs,
                         shard_remote_sub_maps,
                         shard_affinity,
+                        shard_slice_init,
                     )));
                 })
                 .expect("failed to spawn shard thread");
