@@ -83,6 +83,51 @@ pub fn validate_invalidate(args: &[Frame]) -> Result<(u64, bool, Bytes), Frame> 
     Ok((entity_id, is_node, graph_name))
 }
 
+/// Apply a TEMPORAL.INVALIDATE mutation to a graph store.
+///
+/// Sets `valid_to = wall_ms` on the entity and pushes the WAL payload into
+/// `gs.wal_pending`. The CALLER drains the WAL and appends on its own shard —
+/// this keeps the function usable from both the connection-local path and the
+/// shard-side `ShardMessage::GraphCommand` handler (multi-shard routing sends
+/// the command to the shard that owns the graph name).
+#[cfg(feature = "graph")]
+pub fn apply_invalidate(
+    gs: &mut crate::graph::store::GraphStore,
+    entity_id: u64,
+    is_node: bool,
+    graph_name: &Bytes,
+    wall_ms: i64,
+) -> Result<(), &'static [u8]> {
+    let Some(named_graph) = gs.get_graph_mut(graph_name) else {
+        return Err(ERR_GRAPH_NOT_FOUND);
+    };
+    let mutated = if is_node {
+        let node_key: crate::graph::types::NodeKey = slotmap::KeyData::from_ffi(entity_id).into();
+        if let Some(node) = named_graph.write_buf.get_node_mut(node_key) {
+            node.valid_to = wall_ms;
+            true
+        } else {
+            false
+        }
+    } else {
+        let edge_key: crate::graph::types::EdgeKey = slotmap::KeyData::from_ffi(entity_id).into();
+        if let Some(edge) = named_graph.write_buf.get_edge_mut(edge_key) {
+            edge.valid_to = wall_ms;
+            true
+        } else {
+            false
+        }
+    };
+    if !mutated {
+        return Err(ERR_ENTITY_NOT_FOUND);
+    }
+    let payload = crate::persistence::wal_v3::record::encode_graph_temporal(
+        entity_id, is_node, wall_ms, wall_ms,
+    );
+    gs.wal_pending.push(payload);
+    Ok(())
+}
+
 /// Capture the current wall-clock time as i64 Unix milliseconds.
 ///
 /// CRITICAL: This function MUST be called at the handler level BEFORE

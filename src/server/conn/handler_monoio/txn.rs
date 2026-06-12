@@ -4,8 +4,6 @@
 
 use bytes::Bytes;
 
-#[cfg(feature = "graph")]
-use crate::command::temporal::{ERR_ENTITY_NOT_FOUND, ERR_GRAPH_NOT_FOUND};
 use crate::command::temporal::{
     capture_wall_ms, is_temporal_invalidate, is_temporal_snapshot_at, validate_invalidate,
     validate_snapshot_at,
@@ -142,9 +140,16 @@ pub(super) fn try_handle_txn_commit(
                             }
                         });
                     } else {
-                        let mut db_guard =
-                            ctx.shard_databases.write_db(ctx.shard_id, conn.selected_db);
+                        // Each queue lives on the shard owning its key, which
+                        // may differ from the connection's shard (and per
+                        // intent) — acquire the owner's db per queue.
                         for intent in &txn.mq_intents {
+                            let owner = crate::shard::dispatch::key_to_shard(
+                                &intent.queue_key,
+                                ctx.num_shards,
+                            );
+                            let mut db_guard =
+                                ctx.shard_databases.write_db(owner, conn.selected_db);
                             if let Ok(Some(stream)) = db_guard.get_stream_mut(&intent.queue_key) {
                                 if stream.durable {
                                     let msg_id = stream.next_auto_id();
@@ -165,8 +170,8 @@ pub(super) fn try_handle_txn_commit(
     true
 }
 
-/// Handle TXN.ABORT ��� returns `true` if the command was consumed.
-pub(super) fn try_handle_txn_abort(
+/// Handle TXN.ABORT — returns `true` if the command was consumed.
+pub(super) async fn try_handle_txn_abort(
     cmd: &[u8],
     cmd_args: &[Frame],
     conn: &mut ConnectionState,
@@ -183,12 +188,18 @@ pub(super) fn try_handle_txn_abort(
                 // KV undo -> graph intents reverse -> vector
                 // tombstone -> side-table release. See
                 // src/transaction/abort.rs for lock ordering.
-                crate::transaction::abort::abort_cross_store_txn(
+                // Multi-shard: graph legs route to the shards owning
+                // each graph name via ShardMessage::GraphRollback.
+                crate::transaction::abort::abort_cross_store_txn_routed(
                     &ctx.shard_databases,
                     ctx.shard_id,
                     conn.selected_db,
+                    ctx.num_shards,
+                    &ctx.dispatch_tx,
+                    &ctx.spsc_notifiers,
                     txn,
-                );
+                )
+                .await;
                 responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
             } else {
                 responses.push(Frame::Error(Bytes::from_static(b"ERR not in transaction")));
@@ -230,9 +241,10 @@ pub(super) fn try_handle_temporal_snapshot_at(
 }
 
 /// Handle TEMPORAL.INVALIDATE — returns `true` if the command was consumed.
-pub(super) fn try_handle_temporal_invalidate(
+pub(super) async fn try_handle_temporal_invalidate(
     cmd: &[u8],
     cmd_args: &[Frame],
+    frame: &Frame,
     ctx: &ConnectionContext,
     responses: &mut Vec<Frame>,
 ) -> bool {
@@ -241,100 +253,89 @@ pub(super) fn try_handle_temporal_invalidate(
     }
     match validate_invalidate(cmd_args) {
         Ok((entity_id, is_node, graph_name)) => {
-            let wall_ms = capture_wall_ms();
             #[cfg(feature = "graph")]
             {
-                // Phase 2a: gate on is_initialized(); new path is dead code until Phase 4
-                // wires init_shard() at shard startup. Both branches are semantically
-                // identical; the new path uses ShardSlice::graph_store directly (no lock).
-                let (mutated_ok, wal_records, err_frame) = if crate::shard::slice::is_initialized()
-                {
+                // Multi-shard: the graph lives on the shard that owns its
+                // NAME. Ship non-local invalidations there via GraphCommand —
+                // the shard-side handler applies the mutation and drains the
+                // graph WAL on the owning shard.
+                if ctx.num_shards > 1 {
+                    let owner = crate::shard::dispatch::graph_to_shard(&graph_name, ctx.num_shards);
+                    if owner != ctx.shard_id {
+                        let (reply_tx, reply_rx) = crate::runtime::channel::oneshot();
+                        let msg = crate::shard::dispatch::ShardMessage::GraphCommand {
+                            command: std::sync::Arc::new(frame.clone()),
+                            reply_tx,
+                        };
+                        crate::shard::coordinator::spsc_send(
+                            &ctx.dispatch_tx,
+                            ctx.shard_id,
+                            owner,
+                            msg,
+                            &ctx.spsc_notifiers,
+                        )
+                        .await;
+                        let response = match reply_rx.recv().await {
+                            Ok(f) => f,
+                            Err(_) => Frame::Error(Bytes::from_static(
+                                b"ERR cross-shard reply channel closed",
+                            )),
+                        };
+                        responses.push(response);
+                        return true;
+                    }
+                }
+                let wall_ms = capture_wall_ms();
+                // Phase 2a: gate on is_initialized(); both branches are
+                // semantically identical, the new path uses
+                // ShardSlice::graph_store directly (no lock).
+                let (result, wal_records) = if crate::shard::slice::is_initialized() {
                     crate::shard::slice::with_shard(|s| {
                         let gs = &mut s.graph_store;
-                        if let Some(named_graph) = gs.get_graph_mut(&graph_name) {
-                            let mutated = if is_node {
-                                let node_key: crate::graph::types::NodeKey =
-                                    slotmap::KeyData::from_ffi(entity_id).into();
-                                if let Some(node) = named_graph.write_buf.get_node_mut(node_key) {
-                                    node.valid_to = wall_ms;
-                                    true
-                                } else {
-                                    false
-                                }
-                            } else {
-                                let edge_key: crate::graph::types::EdgeKey =
-                                    slotmap::KeyData::from_ffi(entity_id).into();
-                                if let Some(edge) = named_graph.write_buf.get_edge_mut(edge_key) {
-                                    edge.valid_to = wall_ms;
-                                    true
-                                } else {
-                                    false
-                                }
-                            };
-                            if mutated {
-                                let payload =
-                                    crate::persistence::wal_v3::record::encode_graph_temporal(
-                                        entity_id, is_node, wall_ms, wall_ms,
-                                    );
-                                gs.wal_pending.push(payload);
-                                let recs = gs.drain_wal();
-                                (true, recs, None)
-                            } else {
-                                (false, Vec::new(), Some(ERR_ENTITY_NOT_FOUND))
-                            }
+                        let r = crate::command::temporal::apply_invalidate(
+                            gs,
+                            entity_id,
+                            is_node,
+                            &graph_name,
+                            wall_ms,
+                        );
+                        let recs = if r.is_ok() {
+                            gs.drain_wal()
                         } else {
-                            (false, Vec::new(), Some(ERR_GRAPH_NOT_FOUND))
-                        }
+                            Vec::new()
+                        };
+                        (r, recs)
                     })
                 } else {
                     let mut gs = ctx.shard_databases.graph_store_write(ctx.shard_id);
-                    if let Some(named_graph) = gs.get_graph_mut(&graph_name) {
-                        let mutated = if is_node {
-                            let node_key: crate::graph::types::NodeKey =
-                                slotmap::KeyData::from_ffi(entity_id).into();
-                            if let Some(node) = named_graph.write_buf.get_node_mut(node_key) {
-                                node.valid_to = wall_ms;
-                                true
-                            } else {
-                                false
-                            }
-                        } else {
-                            let edge_key: crate::graph::types::EdgeKey =
-                                slotmap::KeyData::from_ffi(entity_id).into();
-                            if let Some(edge) = named_graph.write_buf.get_edge_mut(edge_key) {
-                                edge.valid_to = wall_ms;
-                                true
-                            } else {
-                                false
-                            }
-                        };
-                        if mutated {
-                            let payload = crate::persistence::wal_v3::record::encode_graph_temporal(
-                                entity_id, is_node, wall_ms, wall_ms,
-                            );
-                            gs.wal_pending.push(payload);
-                            let recs = gs.drain_wal();
-                            (true, recs, None)
-                        } else {
-                            (false, Vec::new(), Some(ERR_ENTITY_NOT_FOUND))
-                        }
+                    let r = crate::command::temporal::apply_invalidate(
+                        &mut gs,
+                        entity_id,
+                        is_node,
+                        &graph_name,
+                        wall_ms,
+                    );
+                    let recs = if r.is_ok() {
+                        gs.drain_wal()
                     } else {
-                        (false, Vec::new(), Some(ERR_GRAPH_NOT_FOUND))
-                    }
+                        Vec::new()
+                    };
+                    (r, recs)
                 };
-                if mutated_ok {
-                    for record in wal_records {
-                        ctx.shard_databases
-                            .wal_append(ctx.shard_id, Bytes::from(record));
+                match result {
+                    Ok(()) => {
+                        for record in wal_records {
+                            ctx.shard_databases
+                                .wal_append(ctx.shard_id, Bytes::from(record));
+                        }
+                        responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
                     }
-                    responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
-                } else if let Some(err) = err_frame {
-                    responses.push(Frame::Error(Bytes::from_static(err)));
+                    Err(err) => responses.push(Frame::Error(Bytes::from_static(err))),
                 }
             }
             #[cfg(not(feature = "graph"))]
             {
-                let _ = (entity_id, is_node, graph_name, wall_ms, ctx);
+                let _ = (entity_id, is_node, graph_name, frame, ctx);
                 responses.push(Frame::Error(Bytes::from_static(
                     b"ERR graph feature not enabled",
                 )));

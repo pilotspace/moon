@@ -147,6 +147,10 @@ pub(crate) fn drain_spsc_shared(
                         ShardMessage::GraphTraverse(_) => {
                             execute_batch.push(msg);
                         }
+                        #[cfg(feature = "graph")]
+                        ShardMessage::GraphRollback(_) => {
+                            execute_batch.push(msg);
+                        }
                         ShardMessage::MigrateConnection(payload) => {
                             pending_migrations.push((payload.fd, payload.state));
                         }
@@ -2164,6 +2168,42 @@ pub(crate) fn handle_shard_message_shared(
                 shard_databases.wal_append(shard_id, bytes::Bytes::from(record));
             }
             let _ = reply_tx.send(response);
+        }
+        #[cfg(feature = "graph")]
+        ShardMessage::GraphRollback(payload) => {
+            let crate::shard::dispatch::GraphRollbackPayload {
+                txn_id,
+                graph_undo,
+                graph_intents,
+                reply_tx,
+            } = *payload;
+            // Multi-shard TXN.ABORT leg: this shard owns the graphs named in
+            // these ops. Apply the rollback on the local store and append the
+            // drained WAL records here so replay sees them on the owning shard.
+            let wal_records = if crate::shard::slice::is_initialized() {
+                crate::shard::slice::with_shard(|s| {
+                    crate::transaction::abort::apply_graph_rollback(
+                        &mut s.graph_store,
+                        txn_id,
+                        &graph_undo,
+                        &graph_intents,
+                    )
+                })
+            } else {
+                let mut gs = shard_databases.graph_store_write(shard_id);
+                crate::transaction::abort::apply_graph_rollback(
+                    &mut gs,
+                    txn_id,
+                    &graph_undo,
+                    &graph_intents,
+                )
+            };
+            for record in wal_records {
+                shard_databases.wal_append(shard_id, bytes::Bytes::from(record));
+            }
+            let _ = reply_tx.send(crate::protocol::Frame::SimpleString(
+                bytes::Bytes::from_static(b"OK"),
+            ));
         }
         #[cfg(feature = "graph")]
         ShardMessage::GraphTraverse(payload) => {

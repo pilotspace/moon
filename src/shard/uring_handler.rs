@@ -156,19 +156,32 @@ pub(crate) fn handle_uring_event(
                             let sub = args.first().and_then(|f| {
                                 if let crate::protocol::Frame::BulkString(b) = f { Some(b.as_ref()) } else { None }
                             });
-                            let mut reg_guard = shard_databases.workspace_registry(shard_id);
+                            let mut reg_guard = shard_databases.workspace_registry();
                             let registry = reg_guard.get_or_insert_with(|| Box::new(crate::workspace::registry::WorkspaceRegistry::new()));
                             match sub {
                                 Some(s) if s.eq_ignore_ascii_case(b"CREATE") => {
                                     let ws_id = crate::workspace::WorkspaceId::new_v7();
                                     let name = args.get(1).and_then(|f| {
                                         if let crate::protocol::Frame::BulkString(b) = f { Some(b.clone()) } else { None }
-                                    });
+                                    }).unwrap_or_else(|| bytes::Bytes::from_static(b""));
                                     registry.insert(ws_id, crate::workspace::registry::WorkspaceMetadata {
                                         id: ws_id,
-                                        name: name.unwrap_or_else(|| bytes::Bytes::from_static(b"")),
+                                        name: name.clone(),
                                         created_at: 0,
                                     });
+                                    // WAL: WorkspaceCreate to shard 0 — the global
+                                    // registry's single stream (mirrors the conn
+                                    // handlers; without it, workspaces created via
+                                    // this batch path were lost on restart).
+                                    let payload = crate::workspace::wal::encode_workspace_create(ws_id.as_bytes(), &name);
+                                    let mut wal_buf = Vec::new();
+                                    crate::persistence::wal_v3::record::write_wal_v3_record(
+                                        &mut wal_buf,
+                                        0,
+                                        crate::persistence::wal_v3::record::WalRecordType::WorkspaceCreate,
+                                        &payload,
+                                    );
+                                    shard_databases.wal_append(0, bytes::Bytes::from(wal_buf));
                                     return crate::protocol::Frame::BulkString(bytes::Bytes::from(ws_id.as_hex()));
                                 }
                                 Some(s) if s.eq_ignore_ascii_case(b"DROP") => {
@@ -177,7 +190,19 @@ pub(crate) fn handle_uring_event(
                                     });
                                     if let Some(hex) = ws_hex {
                                         if let Some(ws_id) = crate::workspace::WorkspaceId::from_hex(hex) {
-                                            registry.remove(&ws_id);
+                                            // WAL only a real removal; the OK-even-if-absent
+                                            // reply is pre-existing batch-path behavior.
+                                            if registry.remove(&ws_id).is_some() {
+                                                let payload = crate::workspace::wal::encode_workspace_drop(ws_id.as_bytes());
+                                                let mut wal_buf = Vec::new();
+                                                crate::persistence::wal_v3::record::write_wal_v3_record(
+                                                    &mut wal_buf,
+                                                    0,
+                                                    crate::persistence::wal_v3::record::WalRecordType::WorkspaceDrop,
+                                                    &payload,
+                                                );
+                                                shard_databases.wal_append(0, bytes::Bytes::from(wal_buf));
+                                            }
                                             return crate::protocol::Frame::SimpleString(bytes::Bytes::from_static(b"OK"));
                                         }
                                     }
@@ -208,7 +233,10 @@ pub(crate) fn handle_uring_event(
                                     }
                                     return crate::protocol::Frame::Error(bytes::Bytes::from_static(b"ERR workspace not found"));
                                 }
-                                // WS.AUTH not supported in uring_handler (no per-connection state)
+                                // WS.AUTH not supported in uring_handler (no per-connection
+                                // state). CREATE/DROP above DO mutate the global registry,
+                                // so a workspace created here is AUTH-able from any
+                                // standard connection handler.
                                 Some(s) if s.eq_ignore_ascii_case(b"AUTH") => {
                                     return crate::protocol::Frame::Error(bytes::Bytes::from_static(
                                         b"ERR WS.AUTH not available in io_uring batch mode; use standard connection handler",

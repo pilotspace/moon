@@ -1,7 +1,7 @@
 {
   "project": "moon",
   "stage": "production",
-  "active_task": "spsc-wake-floor",
+  "active_task": "consistency-dispatch-gaps",
   "active_milestone": "v1-shared-nothing",
   "tasks": {
     "hotpath-lock-quickwins": {
@@ -23,6 +23,16 @@
       "created": "2026-06-11T05:02:18+00:00",
       "updated": "2026-06-11T07:20:54+00:00",
       "flag_verified": true
+    },
+    "consistency-dispatch-gaps": {
+      "title": "Close the consistency-suite gaps: unreachable read commands + script defects",
+      "phase": "done",
+      "gate": "PASS",
+      "milestone": "v1-shared-nothing",
+      "depends_on": [],
+      "created": "2026-06-11T10:38:27+00:00",
+      "updated": "2026-06-12T02:21:52+00:00",
+      "flag_verified": true
     }
   },
   "milestones": {
@@ -36,7 +46,7 @@
     }
   },
   "created": "2026-06-11T03:18:21+00:00",
-  "updated": "2026-06-11T07:20:54+00:00",
+  "updated": "2026-06-12T02:21:52+00:00",
   "setup": {
     "locked": true,
     "locked_at": "2026-06-11T03:28:00+00:00",

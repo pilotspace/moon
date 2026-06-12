@@ -324,24 +324,33 @@ fn pack_metadata_u32(last_access: u16, version: u8, access_counter: u8) -> u32 {
     ((last_access as u32) << 16) | ((version as u32) << 8) | (access_counter as u32)
 }
 
-/// A compact 24-byte entry in the database, wrapping a CompactValue with TTL delta
-/// and packed metadata.
+/// A compact 32-byte entry in the database, wrapping a CompactValue with TTL and packed metadata.
 ///
-/// Layout:
-/// - `value: CompactValue` (16 bytes) -- SSO for small strings, tagged heap pointer otherwise
-/// - `ttl_delta: u32` (4 bytes) -- 0 = no expiry, else seconds from base_timestamp
-/// - `metadata: u32` (4 bytes) -- packed [last_access:16 | version:8 | counter:8]
+/// Layout (repr(C)):
+/// - `value: CompactValue` (16 bytes, offset 0) -- SSO for small strings, tagged heap pointer otherwise
+/// - `ttl_secs: u64` (8 bytes, offset 16) -- 0 = no expiry, else absolute Unix seconds (u64 supports
+///   timestamps up to year ~584 billion; u32 was limited to year 2106 and silently overflowed for
+///   timestamps like 9_999_999_999 used in EXPIREAT regression tests).
+/// - `metadata: u32` (4 bytes, offset 24) -- packed [last_access:16 | version:8 | counter:8]
+/// - _pad: u32 (4 bytes, offset 28) -- alignment padding
+///
+/// NOTE: the size changed from 24 → 32 bytes when `ttl_delta: u32` was widened to
+/// `ttl_secs: u64`. Memory overhead per key increases by 8 bytes (1/3 overhead on a
+/// 100M-key dataset = ~800 MB). The correctness gain (no silent TTL overflow past
+/// year 2106) outweighs the cost for all realistic key counts.
 #[repr(C)]
 #[derive(Debug, Clone)]
 pub struct CompactEntry {
     pub value: CompactValue,
-    /// TTL delta in seconds from the per-database base_timestamp. 0 = no expiry.
-    pub ttl_delta: u32,
+    /// Absolute expiry time in Unix seconds. 0 = no expiry.
+    /// Widened from u32 to u64 to support timestamps beyond year 2106.
+    pub ttl_secs: u64,
     /// Packed metadata: [last_access:16 | version:8 | access_counter:8]
     pub metadata: u32,
+    _pad: u32,
 }
 
-const _: () = assert!(std::mem::size_of::<CompactEntry>() == 24);
+const _: () = assert!(std::mem::size_of::<CompactEntry>() == 32);
 
 /// Type alias for backward compatibility during migration.
 pub type Entry = CompactEntry;
@@ -395,48 +404,41 @@ impl CompactEntry {
     }
 
     // --- Expiry helpers ---
-    // TTL is stored as a delta from a per-database base_timestamp.
-    // These methods take base_ts to convert to/from absolute milliseconds.
+    // TTL is stored as absolute Unix seconds (u64). 0 = no expiry.
+    // The base_ts parameter is accepted for API consistency but not used.
 
     /// Check if this entry is expired at the given time (unix millis).
-    /// `base_ts` is accepted for API consistency but not used (TTL stored as absolute seconds).
     #[inline]
     pub fn is_expired_at(&self, _base_ts: u32, now_ms: u64) -> bool {
-        if self.ttl_delta == 0 {
+        if self.ttl_secs == 0 {
             return false;
         }
-        let abs_ms = (self.ttl_delta as u64) * 1000;
-        now_ms >= abs_ms
+        // saturating_mul: adversarial EXPIREAT near u64::MAX/1000 must clamp
+        // to "far future", never wrap to the past (debug builds would panic,
+        // release builds would silently expire the key immediately).
+        now_ms >= self.ttl_secs.saturating_mul(1000)
     }
 
     /// Check if this entry has an expiry set.
     #[inline]
     pub fn has_expiry(&self) -> bool {
-        self.ttl_delta != 0
+        self.ttl_secs != 0
     }
 
     /// Get the absolute expiry time in milliseconds (for serialization/TTL commands).
-    /// `base_ts` is accepted for API consistency but not used (TTL stored as absolute seconds).
     #[inline]
     pub fn expires_at_ms(&self, _base_ts: u32) -> u64 {
-        if self.ttl_delta == 0 {
-            0
-        } else {
-            (self.ttl_delta as u64) * 1000
-        }
+        self.ttl_secs.saturating_mul(1000)
     }
 
     /// Set the expiry from absolute milliseconds. Pass 0 to remove expiry.
-    /// `base_ts` is accepted for API consistency but not used (TTL stored as absolute seconds).
     #[inline]
     pub fn set_expires_at_ms(&mut self, _base_ts: u32, ms: u64) {
         if ms == 0 {
-            self.ttl_delta = 0;
+            self.ttl_secs = 0;
         } else {
-            // Store as absolute seconds (u32 is good until year 2106)
-            let abs_secs = ms / 1000;
-            // Ensure non-zero delta for non-zero input
-            self.ttl_delta = (abs_secs.max(1)).min(u32::MAX as u64) as u32;
+            // Store as absolute seconds; ensure non-zero for non-zero input.
+            self.ttl_secs = (ms / 1000).max(1);
         }
     }
 
@@ -465,8 +467,9 @@ impl CompactEntry {
     pub fn new_string(value: Bytes) -> CompactEntry {
         CompactEntry {
             value: CompactValue::from_redis_value(RedisValue::String(value)),
-            ttl_delta: 0,
+            ttl_secs: 0,
             metadata: pack_metadata_u32(current_secs() as u16, 0, LFU_INIT_VAL),
+            _pad: 0,
         }
     }
 
@@ -474,8 +477,9 @@ impl CompactEntry {
     pub fn new_string_with_expiry(value: Bytes, expires_at_ms: u64, base_ts: u32) -> CompactEntry {
         let mut entry = CompactEntry {
             value: CompactValue::from_redis_value(RedisValue::String(value)),
-            ttl_delta: 0,
+            ttl_secs: 0,
             metadata: pack_metadata_u32(current_secs() as u16, 0, LFU_INIT_VAL),
+            _pad: 0,
         };
         entry.set_expires_at_ms(base_ts, expires_at_ms);
         entry
@@ -485,8 +489,9 @@ impl CompactEntry {
     pub fn new_hash() -> CompactEntry {
         CompactEntry {
             value: CompactValue::from_redis_value(RedisValue::Hash(HashMap::new())),
-            ttl_delta: 0,
+            ttl_secs: 0,
             metadata: pack_metadata_u32(current_secs() as u16, 0, LFU_INIT_VAL),
+            _pad: 0,
         }
     }
 
@@ -494,8 +499,9 @@ impl CompactEntry {
     pub fn new_list() -> CompactEntry {
         CompactEntry {
             value: CompactValue::from_redis_value(RedisValue::List(VecDeque::new())),
-            ttl_delta: 0,
+            ttl_secs: 0,
             metadata: pack_metadata_u32(current_secs() as u16, 0, LFU_INIT_VAL),
+            _pad: 0,
         }
     }
 
@@ -503,8 +509,9 @@ impl CompactEntry {
     pub fn new_set() -> CompactEntry {
         CompactEntry {
             value: CompactValue::from_redis_value(RedisValue::Set(HashSet::new())),
-            ttl_delta: 0,
+            ttl_secs: 0,
             metadata: pack_metadata_u32(current_secs() as u16, 0, LFU_INIT_VAL),
+            _pad: 0,
         }
     }
 
@@ -515,8 +522,9 @@ impl CompactEntry {
                 members: HashMap::new(),
                 scores: BTreeMap::new(),
             }),
-            ttl_delta: 0,
+            ttl_secs: 0,
             metadata: pack_metadata_u32(current_secs() as u16, 0, LFU_INIT_VAL),
+            _pad: 0,
         }
     }
 
@@ -524,8 +532,9 @@ impl CompactEntry {
     pub fn new_hash_listpack() -> CompactEntry {
         CompactEntry {
             value: CompactValue::from_redis_value(RedisValue::HashListpack(Listpack::new())),
-            ttl_delta: 0,
+            ttl_secs: 0,
             metadata: pack_metadata_u32(current_secs() as u16, 0, LFU_INIT_VAL),
+            _pad: 0,
         }
     }
 
@@ -533,8 +542,9 @@ impl CompactEntry {
     pub fn new_list_listpack() -> CompactEntry {
         CompactEntry {
             value: CompactValue::from_redis_value(RedisValue::ListListpack(Listpack::new())),
-            ttl_delta: 0,
+            ttl_secs: 0,
             metadata: pack_metadata_u32(current_secs() as u16, 0, LFU_INIT_VAL),
+            _pad: 0,
         }
     }
 
@@ -542,8 +552,9 @@ impl CompactEntry {
     pub fn new_set_listpack() -> CompactEntry {
         CompactEntry {
             value: CompactValue::from_redis_value(RedisValue::SetListpack(Listpack::new())),
-            ttl_delta: 0,
+            ttl_secs: 0,
             metadata: pack_metadata_u32(current_secs() as u16, 0, LFU_INIT_VAL),
+            _pad: 0,
         }
     }
 
@@ -551,8 +562,9 @@ impl CompactEntry {
     pub fn new_set_intset() -> CompactEntry {
         CompactEntry {
             value: CompactValue::from_redis_value(RedisValue::SetIntset(Intset::new())),
-            ttl_delta: 0,
+            ttl_secs: 0,
             metadata: pack_metadata_u32(current_secs() as u16, 0, LFU_INIT_VAL),
+            _pad: 0,
         }
     }
 
@@ -563,8 +575,9 @@ impl CompactEntry {
                 tree: BPTree::new(),
                 members: HashMap::new(),
             }),
-            ttl_delta: 0,
+            ttl_secs: 0,
             metadata: pack_metadata_u32(current_secs() as u16, 0, LFU_INIT_VAL),
+            _pad: 0,
         }
     }
 
@@ -572,8 +585,9 @@ impl CompactEntry {
     pub fn new_sorted_set_listpack() -> CompactEntry {
         CompactEntry {
             value: CompactValue::from_redis_value(RedisValue::SortedSetListpack(Listpack::new())),
-            ttl_delta: 0,
+            ttl_secs: 0,
             metadata: pack_metadata_u32(current_secs() as u16, 0, LFU_INIT_VAL),
+            _pad: 0,
         }
     }
 
@@ -581,8 +595,9 @@ impl CompactEntry {
     pub fn new_stream() -> CompactEntry {
         CompactEntry {
             value: CompactValue::from_redis_value(RedisValue::Stream(Box::new(StreamData::new()))),
-            ttl_delta: 0,
+            ttl_secs: 0,
             metadata: pack_metadata_u32(current_secs() as u16, 0, LFU_INIT_VAL),
+            _pad: 0,
         }
     }
 
@@ -607,7 +622,7 @@ mod tests {
     fn test_new_string_no_expiry() {
         let entry = Entry::new_string(Bytes::from_static(b"hello"));
         assert!(!entry.has_expiry());
-        assert_eq!(entry.ttl_delta, 0);
+        assert_eq!(entry.ttl_secs, 0);
         assert_eq!(entry.value.type_name(), "string");
         assert_eq!(entry.version(), 0);
         assert_eq!(entry.access_counter(), LFU_INIT_VAL);
@@ -619,7 +634,7 @@ mod tests {
         let exp_ms = current_time_ms() + 60_000;
         let entry = Entry::new_string_with_expiry(Bytes::from_static(b"hello"), exp_ms, base_ts);
         assert!(entry.has_expiry());
-        assert!(entry.ttl_delta > 0);
+        assert!(entry.ttl_secs > 0);
         // Verify round-trip: expires_at_ms should be approximately exp_ms
         let recovered_ms = entry.expires_at_ms(base_ts);
         // Allow 1 second tolerance due to integer division
@@ -776,7 +791,7 @@ mod tests {
 
     #[test]
     fn test_compact_entry_size() {
-        assert_eq!(std::mem::size_of::<CompactEntry>(), 24);
+        assert_eq!(std::mem::size_of::<CompactEntry>(), 32);
     }
 
     #[test]

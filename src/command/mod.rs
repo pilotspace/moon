@@ -996,6 +996,7 @@ pub fn is_dispatch_read_supported(cmd: &[u8]) -> bool {
     matches!(
         (len, b0),
         (3, b'g')  // GET
+        | (3, b'l')  // LCS
         | (3, b't')  // TTL
         | (4, b'e')  // ECHO
         | (4, b'h')  // HGET, HLEN, HTTL
@@ -1005,32 +1006,48 @@ pub fn is_dispatch_read_supported(cmd: &[u8]) -> bool {
         | (4, b'm')  // MGET
         | (4, b'p')  // PTTL, PING
         | (4, b's')  // SCAN
-        | (4, b't')  // TYPE
+        | (4, b't')  // TYPE, TIME
+        | (4, b'w')  // WAIT
+        | (4, b'x')  // XLEN
         | (5, b'd')  // DEBUG (OBJECT/SLEEP/HELP — read-only on the data plane)
         | (5, b'h')  // HMGET, HKEYS, HVALS, HSCAN, HPTTL
         | (5, b's')  // SCARD, SDIFF, SSCAN
-        | (5, b'z')  // ZCARD, ZRANK, ZSCAN
+        | (5, b't')  // TOUCH
+        | (5, b'x')  // XREAD, XINFO
+        | (5, b'z')  // ZCARD, ZRANK, ZSCAN, ZDIFF
         | (6, b'b')  // BITPOS
         | (6, b'd')  // DBSIZE
         | (6, b'e')  // EXISTS
-        | (6, b'g')  // GETBIT
-        | (6, b'l')  // LRANGE, LINDEX
+        | (6, b'g')  // GETBIT, GEOPOS
+        | (6, b'l')  // LRANGE, LINDEX, LOLWUT
         | (6, b'm')  // MEMORY
         | (6, b'o')  // OBJECT
         | (6, b's')  // STRLEN, SUBSTR, SINTER, SUNION
-        | (6, b'z')  // ZSCORE, ZRANGE, ZCOUNT
+        | (6, b'x')  // XRANGE
+        | (6, b'z')  // ZSCORE, ZRANGE, ZCOUNT, ZINTER, ZUNION
         | (7, b'c')  // COMMAND
+        | (7, b'g')  // GEODIST, GEOHASH
         | (7, b'h')  // HGETALL, HEXISTS
         | (7, b'p')  // PFCOUNT
+        | (7, b's')  // SLOWLOG
+        | (7, b'z')  // ZMSCORE
         | (8, b'b')  // BITCOUNT
         | (8, b'g')  // GETRANGE
         | (8, b's')  // SMEMBERS
+        | (8, b'x')  // XPENDING
         | (8, b'z')  // ZREVRANK
+        | (9, b'g')  // GEOSEARCH
+        | (9, b'r')  // RANDOMKEY
         | (9, b's')  // SISMEMBER
+        | (9, b'x')  // XREVRANGE
         | (9, b'z')  // ZREVRANGE, ZLEXCOUNT
+        | (10, b'e') // EXPIRETIME
         | (10, b'h') // HRANDFIELD
         | (10, b's') // SMISMEMBER, SINTERCARD
+        | (10, b'z') // ZINTERCARD
         | (11, b'h') // HEXPIRETIME
+        | (11, b'p') // PEXPIRETIME
+        | (11, b'z') // ZRANDMEMBER
         | (11, b's') // SRANDMEMBER
         | (12, b'h') // HPEXPIRETIME
         | (13, b'z') // ZRANGEBYSCORE
@@ -1146,9 +1163,12 @@ fn dispatch_read_inner(db: &Database, cmd: &[u8], args: &[Frame], now_ms: u64) -
             }
         }
         (4, b't') => {
-            // TYPE
+            // TYPE TIME
             if cmd.eq_ignore_ascii_case(b"TYPE") {
                 return resp(key::type_cmd_readonly(db, args, now_ms));
+            }
+            if cmd.eq_ignore_ascii_case(b"TIME") {
+                return resp(key::time());
             }
         }
         (5, b'd') => {
@@ -1187,13 +1207,22 @@ fn dispatch_read_inner(db: &Database, cmd: &[u8], args: &[Frame], now_ms: u64) -
                 return resp(set::sscan_readonly(db, args, now_ms));
             }
         }
+        (5, b't') => {
+            // TOUCH
+            if cmd.eq_ignore_ascii_case(b"TOUCH") {
+                return resp(key::touch_readonly(db, args, now_ms));
+            }
+        }
         (5, b'z') => {
-            // ZCARD ZRANK ZSCAN
+            // ZCARD ZRANK ZSCAN ZDIFF
             if cmd.eq_ignore_ascii_case(b"ZCARD") {
                 return resp(sorted_set::zcard_readonly(db, args, now_ms));
             }
             if cmd.eq_ignore_ascii_case(b"ZRANK") {
                 return resp(sorted_set::zrank_readonly(db, args, now_ms));
+            }
+            if cmd.eq_ignore_ascii_case(b"ZDIFF") {
+                return resp(sorted_set::zdiff_readonly(db, args, now_ms));
             }
             if cmd.eq_ignore_ascii_case(b"ZSCAN") {
                 return resp(sorted_set::zscan_readonly(db, args, now_ms));
@@ -1218,18 +1247,26 @@ fn dispatch_read_inner(db: &Database, cmd: &[u8], args: &[Frame], now_ms: u64) -
             }
         }
         (6, b'g') => {
-            // GETBIT
+            // GETBIT GEOPOS
             if cmd.eq_ignore_ascii_case(b"GETBIT") {
                 return resp(string::getbit_readonly(db, args, now_ms));
             }
+            if cmd.eq_ignore_ascii_case(b"GEOPOS") {
+                return resp(geo::geopos_readonly(db, args, now_ms));
+            }
         }
         (6, b'l') => {
-            // LRANGE LINDEX
+            // LRANGE LINDEX LOLWUT
             if cmd.eq_ignore_ascii_case(b"LRANGE") {
                 return resp(list::lrange_readonly(db, args, now_ms));
             }
             if cmd.eq_ignore_ascii_case(b"LINDEX") {
                 return resp(list::lindex_readonly(db, args, now_ms));
+            }
+            if cmd.eq_ignore_ascii_case(b"LOLWUT") {
+                return resp(Frame::BulkString(Bytes::from_static(
+                    concat!("Moon v", env!("CARGO_PKG_VERSION"), "\n").as_bytes(),
+                )));
             }
         }
         (6, b'm') => {
@@ -1260,7 +1297,7 @@ fn dispatch_read_inner(db: &Database, cmd: &[u8], args: &[Frame], now_ms: u64) -
             }
         }
         (6, b'z') => {
-            // ZSCORE ZRANGE ZCOUNT
+            // ZSCORE ZRANGE ZCOUNT ZINTER ZUNION
             if cmd.eq_ignore_ascii_case(b"ZSCORE") {
                 return resp(sorted_set::zscore_readonly(db, args, now_ms));
             }
@@ -1269,6 +1306,12 @@ fn dispatch_read_inner(db: &Database, cmd: &[u8], args: &[Frame], now_ms: u64) -
             }
             if cmd.eq_ignore_ascii_case(b"ZCOUNT") {
                 return resp(sorted_set::zcount_readonly(db, args, now_ms));
+            }
+            if cmd.eq_ignore_ascii_case(b"ZINTER") {
+                return resp(sorted_set::zinter_readonly(db, args, now_ms));
+            }
+            if cmd.eq_ignore_ascii_case(b"ZUNION") {
+                return resp(sorted_set::zunion_readonly(db, args, now_ms));
             }
         }
         (7, b'c') => {
@@ -1377,6 +1420,115 @@ fn dispatch_read_inner(db: &Database, cmd: &[u8], args: &[Frame], now_ms: u64) -
             // ZREVRANGEBYSCORE
             if cmd.eq_ignore_ascii_case(b"ZREVRANGEBYSCORE") {
                 return resp(sorted_set::zrevrangebyscore_readonly(db, args, now_ms));
+            }
+        }
+        // ---- new arms (contract v2): buckets that don't conflict with pre-existing ones ----
+        (3, b'l') => {
+            // LCS
+            if cmd.eq_ignore_ascii_case(b"LCS") {
+                return resp(string::lcs_readonly(db, args, now_ms));
+            }
+        }
+        (4, b'w') => {
+            // WAIT: no replication — always 0 (mirrors handler_single.rs:833).
+            // WAIT is in extract_primary_key's keyless table, so it routes
+            // locally: this arm fires on the local read path only, never the
+            // cross-shard fast path.
+            if cmd.eq_ignore_ascii_case(b"WAIT") {
+                return resp(Frame::Integer(0));
+            }
+        }
+        (4, b'x') => {
+            // XLEN
+            if cmd.eq_ignore_ascii_case(b"XLEN") {
+                return resp(stream::xlen_readonly(db, args, now_ms));
+            }
+        }
+        (5, b'x') => {
+            // XREAD XINFO
+            if cmd.eq_ignore_ascii_case(b"XREAD") {
+                return resp(stream::xread_readonly(db, args, now_ms));
+            }
+            if cmd.eq_ignore_ascii_case(b"XINFO") {
+                return resp(stream::xinfo_readonly(db, args, now_ms));
+            }
+        }
+        (6, b'x') => {
+            // XRANGE
+            if cmd.eq_ignore_ascii_case(b"XRANGE") {
+                return resp(stream::xrange_readonly(db, args, now_ms));
+            }
+        }
+        (7, b'g') => {
+            // GEODIST GEOHASH
+            if cmd.eq_ignore_ascii_case(b"GEODIST") {
+                return resp(geo::geodist_readonly(db, args, now_ms));
+            }
+            if cmd.eq_ignore_ascii_case(b"GEOHASH") {
+                return resp(geo::geohash_readonly(db, args, now_ms));
+            }
+        }
+        (7, b's') => {
+            // SLOWLOG — named exception: RESET mutates the global ring (own sync, not Database)
+            if cmd.eq_ignore_ascii_case(b"SLOWLOG") {
+                return resp(crate::admin::slowlog::handle_slowlog(
+                    crate::admin::metrics_setup::global_slowlog(),
+                    args,
+                ));
+            }
+        }
+        (7, b'z') => {
+            // ZMSCORE
+            if cmd.eq_ignore_ascii_case(b"ZMSCORE") {
+                return resp(sorted_set::zmscore_readonly(db, args, now_ms));
+            }
+        }
+        (8, b'x') => {
+            // XPENDING (8 bytes)
+            if cmd.eq_ignore_ascii_case(b"XPENDING") {
+                return resp(stream::xpending_readonly(db, args, now_ms));
+            }
+        }
+        (9, b'g') => {
+            // GEOSEARCH (9 bytes)
+            if cmd.eq_ignore_ascii_case(b"GEOSEARCH") {
+                return resp(geo::geosearch_readonly(db, args, now_ms));
+            }
+        }
+        (9, b'r') => {
+            // RANDOMKEY (9 bytes)
+            if cmd.eq_ignore_ascii_case(b"RANDOMKEY") {
+                return resp(key::randomkey_readonly(db, args, now_ms));
+            }
+        }
+        (9, b'x') => {
+            // XREVRANGE (9 bytes)
+            if cmd.eq_ignore_ascii_case(b"XREVRANGE") {
+                return resp(stream::xrevrange_readonly(db, args, now_ms));
+            }
+        }
+        (10, b'e') => {
+            // EXPIRETIME (10 bytes)
+            if cmd.eq_ignore_ascii_case(b"EXPIRETIME") {
+                return resp(key::expiretime_readonly(db, args, now_ms));
+            }
+        }
+        (10, b'z') => {
+            // ZINTERCARD (10 bytes)
+            if cmd.eq_ignore_ascii_case(b"ZINTERCARD") {
+                return resp(sorted_set::zintercard_readonly(db, args, now_ms));
+            }
+        }
+        (11, b'p') => {
+            // PEXPIRETIME (11 bytes)
+            if cmd.eq_ignore_ascii_case(b"PEXPIRETIME") {
+                return resp(key::pexpiretime_readonly(db, args, now_ms));
+            }
+        }
+        (11, b'z') => {
+            // ZRANDMEMBER (11 bytes)
+            if cmd.eq_ignore_ascii_case(b"ZRANDMEMBER") {
+                return resp(sorted_set::zrandmember_readonly(db, args, now_ms));
             }
         }
         _ => {}
@@ -1919,6 +2071,32 @@ mod tests {
             b"EXISTS",
             b"GETRANGE",
             b"COMMAND",
+            // contract v2: the 25 new read arms
+            b"LCS",
+            b"WAIT",
+            b"XLEN",
+            b"XREAD",
+            b"XRANGE",
+            b"XREVRANGE",
+            b"XINFO",
+            b"XPENDING",
+            b"GEOPOS",
+            b"GEODIST",
+            b"GEOHASH",
+            b"GEOSEARCH",
+            b"ZDIFF",
+            b"ZINTER",
+            b"ZUNION",
+            b"ZINTERCARD",
+            b"ZRANDMEMBER",
+            b"ZMSCORE",
+            b"RANDOMKEY",
+            b"EXPIRETIME",
+            b"PEXPIRETIME",
+            b"TOUCH",
+            b"LOLWUT",
+            b"TIME",
+            b"SLOWLOG",
         ] {
             assert!(
                 is_dispatch_read_supported(cmd),
@@ -1944,8 +2122,9 @@ mod tests {
             // BGSAVE shares (6, b'b') bucket with BITPOS — prefilter is coarse
             // OBJECT moved to the read path (it is a pure read; the missing
             // arm made it unreachable over the wire).
-            b"WAIT",
-            b"RANDOMKEY",
+            // NOTE: WAIT and RANDOMKEY were here before contract v2; they now
+            // have dispatch_read arms and gate buckets — moved to the supported
+            // test above. Leaving this comment so git-blame is clear.
         ] {
             assert!(
                 !is_dispatch_read_supported(cmd),

@@ -60,13 +60,16 @@ pub(super) fn try_handle_ws_command(
                     created_at,
                 };
                 {
-                    let mut guard = ctx.shard_databases.workspace_registry(ctx.shard_id);
+                    let mut guard = ctx.shard_databases.workspace_registry();
                     let reg = guard.get_or_insert_with(|| {
                         Box::new(crate::workspace::WorkspaceRegistry::new())
                     });
                     reg.insert(ws_id, meta);
                 }
-                // WAL: WorkspaceCreate record
+                // WAL: WorkspaceCreate record. The registry is global, so its
+                // WAL stream is pinned to shard 0 — one stream gives replay a
+                // total order over Create/Drop regardless of which connection
+                // issued them.
                 let payload =
                     crate::workspace::wal::encode_workspace_create(ws_id.as_bytes(), &ws_name);
                 let mut wal_buf = Vec::new();
@@ -76,8 +79,7 @@ pub(super) fn try_handle_ws_command(
                     crate::persistence::wal_v3::record::WalRecordType::WorkspaceCreate,
                     &payload,
                 );
-                ctx.shard_databases
-                    .wal_append(ctx.shard_id, Bytes::from(wal_buf));
+                ctx.shard_databases.wal_append(0, Bytes::from(wal_buf));
                 responses.push(Frame::BulkString(Bytes::from(ws_id.to_string())));
             }
             Err(e) => responses.push(e),
@@ -90,7 +92,7 @@ pub(super) fn try_handle_ws_command(
             Ok(ws_id_raw) => match parse_workspace_id_from_bytes(&ws_id_raw) {
                 Some(ws_id) => {
                     let removed = {
-                        let mut guard = ctx.shard_databases.workspace_registry(ctx.shard_id);
+                        let mut guard = ctx.shard_databases.workspace_registry();
                         match guard.as_mut() {
                             Some(reg) => reg.remove(&ws_id).is_some(),
                             None => false,
@@ -107,8 +109,7 @@ pub(super) fn try_handle_ws_command(
                             crate::persistence::wal_v3::record::WalRecordType::WorkspaceDrop,
                             &payload,
                         );
-                        ctx.shard_databases
-                            .wal_append(ctx.shard_id, Bytes::from(wal_buf));
+                        ctx.shard_databases.wal_append(0, Bytes::from(wal_buf));
                         // Best-effort cleanup: delete all KV keys with ws
                         // prefix (WS-03).
                         // Phase 2f: gate on is_initialized(); new path uses ShardSlice directly.
@@ -126,7 +127,14 @@ pub(super) fn try_handle_ws_command(
                             });
                         } else {
                             let prefix = format!("{{{}}}:", ws_id.as_hex());
-                            let mut db_guard = ctx.shard_databases.write_db(ctx.shard_id, 0);
+                            // The {wsid} hash tag co-locates every workspace
+                            // key on ONE shard — clean up there, not on the
+                            // connection's shard.
+                            let owner = crate::shard::dispatch::key_to_shard(
+                                prefix.as_bytes(),
+                                ctx.num_shards,
+                            );
+                            let mut db_guard = ctx.shard_databases.write_db(owner, 0);
                             let keys_to_delete: Vec<Vec<u8>> = db_guard
                                 .keys()
                                 .filter(|k| k.as_bytes().starts_with(prefix.as_bytes()))
@@ -153,7 +161,7 @@ pub(super) fn try_handle_ws_command(
     if sub.eq_ignore_ascii_case(b"LIST") {
         match validate_ws_list(cmd_args) {
             Ok(()) => {
-                let guard = ctx.shard_databases.workspace_registry(ctx.shard_id);
+                let guard = ctx.shard_databases.workspace_registry();
                 let entries: Vec<Frame> = match guard.as_ref() {
                     Some(reg) => reg
                         .iter()
@@ -181,7 +189,7 @@ pub(super) fn try_handle_ws_command(
         match validate_ws_info(cmd_args) {
             Ok(ws_id_raw) => match parse_workspace_id_from_bytes(&ws_id_raw) {
                 Some(ws_id) => {
-                    let guard = ctx.shard_databases.workspace_registry(ctx.shard_id);
+                    let guard = ctx.shard_databases.workspace_registry();
                     let found = guard.as_ref().and_then(|reg| reg.get(&ws_id));
                     match found {
                         Some(meta) => {
@@ -218,7 +226,7 @@ pub(super) fn try_handle_ws_command(
                     match parse_workspace_id_from_bytes(&ws_id_raw) {
                         Some(ws_id) => {
                             let found = {
-                                let guard = ctx.shard_databases.workspace_registry(ctx.shard_id);
+                                let guard = ctx.shard_databases.workspace_registry();
                                 guard
                                     .as_ref()
                                     .map_or(false, |reg| reg.get(&ws_id).is_some())
@@ -270,6 +278,15 @@ pub(super) fn try_handle_mq_command(
             Ok((queue_key, max_delivery_count, _debounce_ms)) => {
                 let effective_key =
                     crate::workspace::workspace_key(conn.workspace_id.as_ref(), &queue_key);
+                // A durable queue lives on the shard that owns its key — the
+                // stream, registry entry, trigger entry, and WAL records must
+                // all target `owner`, not the connection's shard, or fresh
+                // connections landing elsewhere (SO_REUSEPORT) can't see the
+                // queue. Lock-mode ShardDatabases permits direct cross-shard
+                // access; the ShardSlice branches stay conn-local because
+                // slice mode is never initialized yet (owner-routing there is
+                // the shardslice-migration task).
+                let owner = crate::shard::dispatch::key_to_shard(&effective_key, ctx.num_shards);
                 // Phase 2f: gate on is_initialized(); new path uses ShardSlice directly.
                 let create_result: Result<(), Frame> = if crate::shard::slice::is_initialized() {
                     crate::shard::slice::with_shard_db(conn.selected_db, |db| {
@@ -285,7 +302,7 @@ pub(super) fn try_handle_mq_command(
                         }
                     })
                 } else {
-                    let mut db_guard = ctx.shard_databases.write_db(ctx.shard_id, conn.selected_db);
+                    let mut db_guard = ctx.shard_databases.write_db(owner, conn.selected_db);
                     let r = match db_guard.get_or_create_stream(&effective_key) {
                         Ok(stream) => {
                             stream.durable = true;
@@ -307,12 +324,14 @@ pub(super) fn try_handle_mq_command(
                 let config =
                     crate::mq::DurableStreamConfig::new(effective_key.clone(), max_delivery_count);
                 {
-                    let mut guard = ctx.shard_databases.durable_queue_registry(ctx.shard_id);
+                    let mut guard = ctx.shard_databases.durable_queue_registry(owner);
                     let reg = guard
                         .get_or_insert_with(|| Box::new(crate::mq::DurableQueueRegistry::new()));
                     reg.insert(effective_key.clone(), config);
                 }
 
+                // Owner's WAL so replay restores the registry on the shard
+                // that also holds the stream.
                 let payload = crate::mq::wal::encode_mq_create(&effective_key, max_delivery_count);
                 let mut wal_buf = Vec::new();
                 crate::persistence::wal_v3::record::write_wal_v3_record(
@@ -321,8 +340,7 @@ pub(super) fn try_handle_mq_command(
                     crate::persistence::wal_v3::record::WalRecordType::MqCreate,
                     &payload,
                 );
-                ctx.shard_databases
-                    .wal_append(ctx.shard_id, Bytes::from(wal_buf));
+                ctx.shard_databases.wal_append(owner, Bytes::from(wal_buf));
                 responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
             }
             Err(e) => responses.push(e),
@@ -335,6 +353,8 @@ pub(super) fn try_handle_mq_command(
             Ok((queue_key, fields)) => {
                 let effective_key =
                     crate::workspace::workspace_key(conn.workspace_id.as_ref(), &queue_key);
+                // Owner-shard targeting — see MQ CREATE above.
+                let owner = crate::shard::dispatch::key_to_shard(&effective_key, ctx.num_shards);
                 // Phase 2f: gate on is_initialized(); new path uses ShardSlice directly.
                 // Push outcome: Ok(Some(msg_id)) = pushed; Ok(None) = not durable; Err(e) = stream error.
                 type PushOutcome = Result<Option<crate::storage::stream::StreamId>, Frame>;
@@ -355,7 +375,7 @@ pub(super) fn try_handle_mq_command(
                         }
                     })
                 } else {
-                    let mut db_guard = ctx.shard_databases.write_db(ctx.shard_id, conn.selected_db);
+                    let mut db_guard = ctx.shard_databases.write_db(owner, conn.selected_db);
                     let r = match db_guard.get_stream_mut(&effective_key) {
                         Ok(Some(stream)) => {
                             if !stream.durable {
@@ -374,8 +394,9 @@ pub(super) fn try_handle_mq_command(
                 };
                 match push_outcome {
                     Ok(Some(msg_id)) => {
+                        // Owner's registry: its event-loop tick fires triggers.
                         {
-                            let mut trig_guard = ctx.shard_databases.trigger_registry(ctx.shard_id);
+                            let mut trig_guard = ctx.shard_databases.trigger_registry(owner);
                             if let Some(reg) = trig_guard.as_mut() {
                                 let trig_key = if let Some(ws_id) = conn.workspace_id.as_ref() {
                                     let ws_hex = ws_id.as_hex();
@@ -418,6 +439,8 @@ pub(super) fn try_handle_mq_command(
             Ok((queue_key, count)) => {
                 let effective_key =
                     crate::workspace::workspace_key(conn.workspace_id.as_ref(), &queue_key);
+                // Owner-shard targeting — see MQ CREATE above.
+                let owner = crate::shard::dispatch::key_to_shard(&effective_key, ctx.num_shards);
                 let group_name = Bytes::from_static(b"__mq_consumers");
                 let consumer_name = Bytes::from_static(b"__mq_default");
 
@@ -520,7 +543,7 @@ pub(super) fn try_handle_mq_command(
                 let response = if crate::shard::slice::is_initialized() {
                     crate::shard::slice::with_shard_db(conn.selected_db, pop_body)
                 } else {
-                    let mut db_guard = ctx.shard_databases.write_db(ctx.shard_id, conn.selected_db);
+                    let mut db_guard = ctx.shard_databases.write_db(owner, conn.selected_db);
                     let r = pop_body(&mut *db_guard);
                     drop(db_guard);
                     r
@@ -541,6 +564,8 @@ pub(super) fn try_handle_mq_command(
                     .iter()
                     .map(|(ms, seq)| StreamId { ms: *ms, seq: *seq })
                     .collect();
+                // Owner-shard targeting — see MQ CREATE above.
+                let owner = crate::shard::dispatch::key_to_shard(&effective_key, ctx.num_shards);
                 // Phase 2f: gate on is_initialized(); new path uses ShardSlice directly.
                 // Closure returns Some(acked_count) on success, None on any error/miss.
                 let ack_body = |db: &mut crate::storage::db::Database| -> Option<u64> {
@@ -559,7 +584,7 @@ pub(super) fn try_handle_mq_command(
                 let acked = if crate::shard::slice::is_initialized() {
                     crate::shard::slice::with_shard_db(conn.selected_db, ack_body)
                 } else {
-                    let mut db_guard = ctx.shard_databases.write_db(ctx.shard_id, conn.selected_db);
+                    let mut db_guard = ctx.shard_databases.write_db(owner, conn.selected_db);
                     let r = ack_body(&mut *db_guard);
                     drop(db_guard);
                     r
@@ -575,8 +600,7 @@ pub(super) fn try_handle_mq_command(
                                 crate::persistence::wal_v3::record::WalRecordType::MqAck,
                                 &payload,
                             );
-                            ctx.shard_databases
-                                .wal_append(ctx.shard_id, Bytes::from(wal_buf));
+                            ctx.shard_databases.wal_append(owner, Bytes::from(wal_buf));
                         }
                         responses.push(Frame::Integer(acked_count as i64));
                     }
@@ -593,6 +617,9 @@ pub(super) fn try_handle_mq_command(
             Ok(queue_key) => {
                 let effective_key =
                     crate::workspace::workspace_key(conn.workspace_id.as_ref(), &queue_key);
+                // Owner of the QUEUE key, not the dlq_key: POP creates the
+                // DLQ stream in the same db as the queue it drains.
+                let owner = crate::shard::dispatch::key_to_shard(&effective_key, ctx.num_shards);
                 let dlq_key = {
                     let mut buf = Vec::with_capacity(effective_key.len() + 8);
                     buf.extend_from_slice(&effective_key);
@@ -609,7 +636,7 @@ pub(super) fn try_handle_mq_command(
                 let len = if crate::shard::slice::is_initialized() {
                     crate::shard::slice::with_shard_db(conn.selected_db, dlq_body)
                 } else {
-                    let mut db_guard = ctx.shard_databases.write_db(ctx.shard_id, conn.selected_db);
+                    let mut db_guard = ctx.shard_databases.write_db(owner, conn.selected_db);
                     let r = dlq_body(&mut *db_guard);
                     drop(db_guard);
                     r
@@ -636,6 +663,9 @@ pub(super) fn try_handle_mq_command(
                 } else {
                     queue_key.clone()
                 };
+                // Owner's registry: its event-loop tick fires triggers
+                // (timers.rs documents the home shard as authoritative).
+                let owner = crate::shard::dispatch::key_to_shard(&effective_key, ctx.num_shards);
                 let entry = crate::mq::TriggerEntry {
                     queue_key: effective_key,
                     callback_cmd,
@@ -644,7 +674,7 @@ pub(super) fn try_handle_mq_command(
                     pending_fire_ms: 0,
                 };
                 {
-                    let mut guard = ctx.shard_databases.trigger_registry(ctx.shard_id);
+                    let mut guard = ctx.shard_databases.trigger_registry(owner);
                     let reg =
                         guard.get_or_insert_with(|| Box::new(crate::mq::TriggerRegistry::new()));
                     reg.register(trig_key, entry);
@@ -741,15 +771,78 @@ pub(super) fn try_handle_multi_exec(
 
 /// Handle GRAPH.* graph commands. Returns `true` if consumed.
 #[cfg(feature = "graph")]
-pub(super) fn try_handle_graph_command(
+pub(super) async fn try_handle_graph_command(
     cmd: &[u8],
     cmd_args: &[Frame],
+    frame: &Frame,
     conn: &mut ConnectionState,
     ctx: &ConnectionContext,
     responses: &mut Vec<Frame>,
 ) -> bool {
     if cmd.len() <= 6 || !cmd[..6].eq_ignore_ascii_case(b"GRAPH.") {
         return false;
+    }
+    // Multi-shard: a graph lives on the shard that owns its NAME (same xxh64
+    // + {tag} hashing as key routing). The per-shard graph store is
+    // thread-local once ShardSlice is initialized, so non-owner commands MUST
+    // hop via ShardMessage::GraphCommand — the shard-side handler dispatches
+    // on its own store and drains graph WAL records locally.
+    // GRAPH.LIST has no name argument and stays connection-local (it reports
+    // this shard's graphs only — recorded as a v3 observe delta).
+    if ctx.num_shards > 1 && !cmd.eq_ignore_ascii_case(b"GRAPH.LIST") {
+        if let Some(name) = cmd_args.first().and_then(extract_bytes) {
+            let owner = crate::shard::dispatch::graph_to_shard(&name, ctx.num_shards);
+            if owner != ctx.shard_id {
+                // Cypher WRITE queries inside a cross-store TXN cannot ship
+                // their undo intents back across the hop — reject like the
+                // other two-domain TXN cases (MOVE, COPY ... DB).
+                if conn.in_cross_txn()
+                    && cmd.eq_ignore_ascii_case(b"GRAPH.QUERY")
+                    && crate::command::graph::is_cypher_write_query(cmd_args)
+                {
+                    responses.push(Frame::Error(bytes::Bytes::from_static(
+                        crate::command::transaction::ERR_TXN_CROSS_SHARD,
+                    )));
+                    return true;
+                }
+                let (reply_tx, reply_rx) = crate::runtime::channel::oneshot();
+                let msg = crate::shard::dispatch::ShardMessage::GraphCommand {
+                    command: std::sync::Arc::new(frame.clone()),
+                    reply_tx,
+                };
+                crate::shard::coordinator::spsc_send(
+                    &ctx.dispatch_tx,
+                    ctx.shard_id,
+                    owner,
+                    msg,
+                    &ctx.spsc_notifiers,
+                )
+                .await;
+                let mut response = match reply_rx.recv().await {
+                    Ok(f) => f,
+                    Err(_) => Frame::Error(bytes::Bytes::from_static(
+                        b"ERR cross-shard reply channel closed",
+                    )),
+                };
+                // Phase 166: explicit ADDNODE/ADDEDGE intents are captured
+                // from the routed RESPONSE id, exactly like the local path;
+                // the abort path routes the rollback back to the owner.
+                if let Some(txn) = conn.active_cross_txn.as_mut() {
+                    let is_node = cmd.eq_ignore_ascii_case(b"GRAPH.ADDNODE");
+                    let is_edge = cmd.eq_ignore_ascii_case(b"GRAPH.ADDEDGE");
+                    if is_node || is_edge {
+                        if let Frame::Integer(id) = &response {
+                            txn.record_graph(*id as u64, is_node, name.clone());
+                        }
+                    }
+                }
+                if let Some(ws_id) = conn.workspace_id.as_ref() {
+                    strip_workspace_prefix_from_response(ws_id, cmd, &mut response);
+                }
+                responses.push(response);
+                return true;
+            }
+        }
     }
     let is_write = crate::command::graph::is_graph_write_cmd(cmd)
         || (cmd.eq_ignore_ascii_case(b"GRAPH.QUERY")

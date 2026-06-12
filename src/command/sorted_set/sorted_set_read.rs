@@ -1386,6 +1386,38 @@ fn collect_source_sets(
     Ok(source_data)
 }
 
+/// Read-only twin: collect source sets using `get_sorted_set_if_alive`.
+///
+/// Compact (listpack) encodings return an empty map — callers see an absent
+/// set, which is correct because compact sets are upgraded to BPTree on first
+/// write access.
+fn collect_source_sets_readonly<'a>(
+    db: &'a Database,
+    keys: &[Bytes],
+    now_ms: u64,
+) -> Result<Vec<std::borrow::Cow<'a, HashMap<Bytes, f64>>>, Frame> {
+    use std::borrow::Cow;
+    let mut source_data: Vec<Cow<'a, HashMap<Bytes, f64>>> = Vec::with_capacity(keys.len());
+    for key in keys {
+        // get_sorted_set_ref_if_alive handles ALL encodings (BPTree, Listpack
+        // from RDB load, Legacy) — the BPTree-only accessor would silently
+        // treat a listpack zset as missing. BPTree/Legacy borrow their map
+        // (no clone); listpacks are small by definition, so materializing an
+        // owned map for them is bounded.
+        match db.get_sorted_set_ref_if_alive(key, now_ms) {
+            Ok(Some(zref)) => match zref.members_map() {
+                Some(m) => source_data.push(Cow::Borrowed(m)),
+                None => source_data.push(Cow::Owned(zref.entries_sorted().into_iter().collect())),
+            },
+            Ok(None) => {
+                source_data.push(Cow::Owned(HashMap::new()));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(source_data)
+}
+
 /// Format a result map into a Frame::Array, optionally with scores.
 fn result_map_to_frame(result: &HashMap<Bytes, f64>, withscores: bool) -> Frame {
     let mut entries: Vec<(&Bytes, f64)> = result.iter().map(|(m, s)| (m, *s)).collect();
@@ -1732,5 +1764,328 @@ pub fn zrandmember(db: &mut Database, args: &[Frame]) -> Frame {
             }
         }
         Frame::Array(result.into())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Read-only twins for the shared-lock (dispatch_read) path
+// ---------------------------------------------------------------------------
+
+/// ZDIFF numkeys key [key …] [WITHSCORES] — read-only twin.
+pub fn zdiff_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
+    let (keys, _, _, withscores) = match parse_setop_args(args, "ZDIFF", false) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let source_data = match collect_source_sets_readonly(db, &keys, now_ms) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let mut result_map: HashMap<Bytes, f64> = HashMap::new();
+    if let Some(first) = source_data.first() {
+        'outer: for (member, score) in first.iter() {
+            for src in source_data.iter().skip(1) {
+                if src.contains_key(member) {
+                    continue 'outer;
+                }
+            }
+            result_map.insert(member.clone(), *score);
+        }
+    }
+    result_map_to_frame(&result_map, withscores)
+}
+
+/// ZUNION numkeys key [key …] [WEIGHTS …] [AGGREGATE …] [WITHSCORES] — read-only twin.
+pub fn zunion_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
+    let (keys, weights, aggregate, withscores) = match parse_setop_args(args, "ZUNION", true) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let source_data = match collect_source_sets_readonly(db, &keys, now_ms) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let mut result_map: HashMap<Bytes, f64> = HashMap::new();
+    for (idx, src) in source_data.iter().enumerate() {
+        for (member, score) in src.iter() {
+            let weighted = *score * weights[idx];
+            result_map
+                .entry(member.clone())
+                .and_modify(|existing| {
+                    *existing = match aggregate {
+                        AggregateOp::Sum => *existing + weighted,
+                        AggregateOp::Min => existing.min(weighted),
+                        AggregateOp::Max => existing.max(weighted),
+                    };
+                })
+                .or_insert(weighted);
+        }
+    }
+    result_map_to_frame(&result_map, withscores)
+}
+
+/// ZINTER numkeys key [key …] [WEIGHTS …] [AGGREGATE …] [WITHSCORES] — read-only twin.
+pub fn zinter_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
+    let (keys, weights, aggregate, withscores) = match parse_setop_args(args, "ZINTER", true) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let source_data = match collect_source_sets_readonly(db, &keys, now_ms) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let mut result_map: HashMap<Bytes, f64> = HashMap::new();
+    if let Some(first) = source_data.first() {
+        for (member, score) in first.iter() {
+            let weighted = *score * weights[0];
+            let mut final_score = weighted;
+            let mut in_all = true;
+            for (idx, src) in source_data.iter().enumerate().skip(1) {
+                match src.get(member) {
+                    Some(s) => {
+                        let ws = *s * weights[idx];
+                        final_score = match aggregate {
+                            AggregateOp::Sum => final_score + ws,
+                            AggregateOp::Min => final_score.min(ws),
+                            AggregateOp::Max => final_score.max(ws),
+                        };
+                    }
+                    None => {
+                        in_all = false;
+                        break;
+                    }
+                }
+            }
+            if in_all {
+                result_map.insert(member.clone(), final_score);
+            }
+        }
+    }
+    result_map_to_frame(&result_map, withscores)
+}
+
+/// ZINTERCARD numkeys key [key …] [LIMIT limit] — read-only twin.
+pub fn zintercard_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
+    if args.is_empty() {
+        return err_wrong_args("ZINTERCARD");
+    }
+    let numkeys_bytes = match extract_bytes(&args[0]) {
+        Some(b) => b,
+        None => return err_wrong_args("ZINTERCARD"),
+    };
+    let numkeys: usize = match std::str::from_utf8(numkeys_bytes)
+        .ok()
+        .and_then(|s| s.parse().ok())
+    {
+        Some(n) if n > 0 => n,
+        _ => return err("ERR numkeys can't be non-positive value"),
+    };
+    if args.len() < 1 + numkeys {
+        return err_wrong_args("ZINTERCARD");
+    }
+    let keys: Vec<Bytes> = (0..numkeys)
+        .map(|j| {
+            extract_bytes(&args[1 + j])
+                .cloned()
+                .unwrap_or_else(Bytes::new)
+        })
+        .collect();
+    let mut limit: usize = 0;
+    let mut i = 1 + numkeys;
+    while i < args.len() {
+        let opt = match extract_bytes(&args[i]) {
+            Some(b) => b.as_ref(),
+            None => {
+                i += 1;
+                continue;
+            }
+        };
+        if opt.eq_ignore_ascii_case(b"LIMIT") {
+            if i + 1 >= args.len() {
+                return err_wrong_args("ZINTERCARD");
+            }
+            let lb = match extract_bytes(&args[i + 1]) {
+                Some(b) => b,
+                None => return err_wrong_args("ZINTERCARD"),
+            };
+            limit = match std::str::from_utf8(lb).ok().and_then(|s| s.parse().ok()) {
+                Some(v) => v,
+                None => return err("ERR value is not an integer or out of range"),
+            };
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    let source_data = match collect_source_sets_readonly(db, &keys, now_ms) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    if source_data.iter().any(|s| s.is_empty()) {
+        return Frame::Integer(0);
+    }
+    let mut indices: Vec<usize> = (0..source_data.len()).collect();
+    indices.sort_by_key(|&i| source_data[i].len());
+    let smallest_idx = indices[0];
+    let mut count: i64 = 0;
+    for member in source_data[smallest_idx].keys() {
+        let mut in_all = true;
+        for &idx in indices.iter().skip(1) {
+            if !source_data[idx].contains_key(member) {
+                in_all = false;
+                break;
+            }
+        }
+        if in_all {
+            count += 1;
+            if limit > 0 && count >= limit as i64 {
+                break;
+            }
+        }
+    }
+    Frame::Integer(count)
+}
+
+/// ZRANDMEMBER key [count [WITHSCORES]] — read-only twin.
+pub fn zrandmember_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
+    use rand::seq::IndexedRandom;
+    if args.is_empty() || args.len() > 3 {
+        return err_wrong_args("ZRANDMEMBER");
+    }
+    let key = match extract_bytes(&args[0]) {
+        Some(k) => k,
+        None => return err_wrong_args("ZRANDMEMBER"),
+    };
+    // Ref accessor: handles every encoding (BPTree, Listpack from RDB load,
+    // Legacy) — the BPTree-only accessor would treat a listpack zset as missing.
+    let zref = match db.get_sorted_set_ref_if_alive(key, now_ms) {
+        Ok(Some(z)) => z,
+        Ok(None) => {
+            return if args.len() == 1 {
+                Frame::Null
+            } else {
+                Frame::Array(framevec![])
+            };
+        }
+        Err(e) => return e,
+    };
+    // Borrow the map when one exists; materialize only for small listpacks.
+    let entries_owned: Vec<(Bytes, f64)>;
+    let entries: Vec<(&Bytes, f64)> = match zref.members_map() {
+        Some(m) => m.iter().map(|(m, s)| (m, *s)).collect(),
+        None => {
+            entries_owned = zref.entries_sorted();
+            entries_owned.iter().map(|(m, s)| (m, *s)).collect()
+        }
+    };
+    if entries.is_empty() {
+        return if args.len() == 1 {
+            Frame::Null
+        } else {
+            Frame::Array(framevec![])
+        };
+    }
+    let mut rng = rand::rng();
+    if args.len() == 1 {
+        return if let Some(chosen) = entries.choose(&mut rng) {
+            Frame::BulkString(chosen.0.clone())
+        } else {
+            Frame::Null
+        };
+    }
+    let count_bytes = match extract_bytes(&args[1]) {
+        Some(b) => b,
+        None => return err_wrong_args("ZRANDMEMBER"),
+    };
+    let count: i64 = match std::str::from_utf8(count_bytes)
+        .ok()
+        .and_then(|s| s.parse().ok())
+    {
+        Some(c) => c,
+        None => return err("ERR value is not an integer or out of range"),
+    };
+    let withscores = if args.len() == 3 {
+        let opt = match extract_bytes(&args[2]) {
+            Some(b) => b,
+            None => return err("ERR syntax error"),
+        };
+        if opt.eq_ignore_ascii_case(b"WITHSCORES") {
+            true
+        } else {
+            return err("ERR syntax error");
+        }
+    } else {
+        false
+    };
+    if count == 0 {
+        return Frame::Array(framevec![]);
+    }
+    if count > 0 {
+        let n = std::cmp::min(count as usize, entries.len());
+        let chosen: Vec<&(&Bytes, f64)> = entries.sample(&mut rng, n).collect();
+        let cap = if withscores { n * 2 } else { n };
+        let mut result = Vec::with_capacity(cap);
+        for (member, score) in chosen {
+            result.push(Frame::BulkString((*member).clone()));
+            if withscores {
+                result.push(Frame::BulkString(format_score_bytes(*score)));
+            }
+        }
+        Frame::Array(result.into())
+    } else {
+        let n = std::cmp::min(count.unsigned_abs() as usize, entries.len() * 10);
+        let cap = if withscores { n * 2 } else { n };
+        let mut result = Vec::with_capacity(cap);
+        for _ in 0..n {
+            if let Some(chosen) = entries.choose(&mut rng) {
+                result.push(Frame::BulkString(chosen.0.clone()));
+                if withscores {
+                    result.push(Frame::BulkString(format_score_bytes(chosen.1)));
+                }
+            }
+        }
+        Frame::Array(result.into())
+    }
+}
+
+/// ZMSCORE key member [member …] — read-only twin.
+pub fn zmscore_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
+    if args.len() < 2 {
+        return err_wrong_args("ZMSCORE");
+    }
+    let key = match extract_bytes(&args[0]) {
+        Some(k) => k,
+        None => return err_wrong_args("ZMSCORE"),
+    };
+    // Ref accessor: handles every encoding (BPTree, Listpack from RDB load,
+    // Legacy) — the BPTree-only accessor would treat a listpack zset as missing.
+    match db.get_sorted_set_ref_if_alive(key, now_ms) {
+        Ok(Some(zref)) => {
+            let mut result = Vec::with_capacity(args.len() - 1);
+            for arg in &args[1..] {
+                let member = match extract_bytes(arg) {
+                    Some(m) => m,
+                    None => {
+                        result.push(Frame::Null);
+                        continue;
+                    }
+                };
+                match zref.score(member) {
+                    Some(score) => {
+                        result.push(Frame::BulkString(format_score_bytes(score)));
+                    }
+                    None => result.push(Frame::Null),
+                }
+            }
+            Frame::Array(result.into())
+        }
+        Ok(None) => {
+            let mut result = Vec::with_capacity(args.len() - 1);
+            for _ in &args[1..] {
+                result.push(Frame::Null);
+            }
+            Frame::Array(result.into())
+        }
+        Err(e) => e,
     }
 }

@@ -296,6 +296,62 @@ pub(crate) fn extract_primary_key<'a>(cmd: &[u8], args: &'a [Frame]) -> Option<&
             _ => None,
         };
     }
+    // XGROUP <subcommand> <key> ...: args[0] is the subcommand ("CREATE",
+    // "SETID", "DESTROY", "DELCONSUMER", "CREATECONSUMER") and args[1] is
+    // the stream key. Same pattern as OBJECT above.
+    // XINFO STREAM/GROUPS/CONSUMERS <key>: identical layout.
+    if (len == 6 && b0 == b'x' && cmd.eq_ignore_ascii_case(b"XGROUP"))
+        || (len == 5 && b0 == b'x' && cmd.eq_ignore_ascii_case(b"XINFO"))
+    {
+        return match args.get(1) {
+            Some(Frame::BulkString(key)) => Some(key),
+            _ => None,
+        };
+    }
+    // BITOP <op> destkey key [key ...]: args[0] is the operation literal
+    // ("AND"/"OR"/"XOR"/"NOT"); the first key is the DESTINATION at args[1]
+    // (metadata first_key=2). Routing by args[0] hashed the operation name.
+    // Multi-shard servers consume BITOP in the multi-key coordinator before
+    // this routing runs; this arm fixes single-shard-local + cluster-slot
+    // routing.
+    if (len, b0) == (5, b'b') && cmd.eq_ignore_ascii_case(b"BITOP") {
+        return match args.get(1) {
+            Some(Frame::BulkString(key)) => Some(key),
+            _ => None,
+        };
+    }
+    // ZDIFF/ZINTER/ZUNION/ZINTERCARD numkeys key [key ...]:
+    //   args[0] is the integer numkeys literal; the first actual key is args[1].
+    // Routing by args[0] would hash "2" (the numkeys string) to an arbitrary
+    // shard and produce "ERR wrong type" or a silent miss.
+    // Note: ZDIFF = 5 bytes, ZINTER/ZUNION = 6 bytes, ZINTERCARD = 10 bytes.
+    if (len == 5 && b0 == b'z' && cmd.eq_ignore_ascii_case(b"ZDIFF"))
+        || (len == 6
+            && b0 == b'z'
+            && (cmd.eq_ignore_ascii_case(b"ZINTER") || cmd.eq_ignore_ascii_case(b"ZUNION")))
+        || (len == 10 && b0 == b'z' && cmd.eq_ignore_ascii_case(b"ZINTERCARD"))
+    {
+        return match args.get(1) {
+            Some(Frame::BulkString(key)) => Some(key),
+            _ => None,
+        };
+    }
+    // XREAD [COUNT count] [BLOCK ms] STREAMS key [key ...] id [id ...]:
+    // Scan args for the STREAMS token; the key immediately follows it.
+    // No allocation — scan &[Frame] linearly.
+    if len == 5 && b0 == b'x' && cmd.eq_ignore_ascii_case(b"XREAD") {
+        for (i, arg) in args.iter().enumerate() {
+            if let Frame::BulkString(tok) = arg {
+                if tok.eq_ignore_ascii_case(b"STREAMS") {
+                    return match args.get(i + 1) {
+                        Some(Frame::BulkString(key)) => Some(key),
+                        _ => None,
+                    };
+                }
+            }
+        }
+        return None;
+    }
     match &args[0] {
         Frame::BulkString(key) => Some(key),
         _ => None,
@@ -318,6 +374,20 @@ pub(crate) fn is_multi_key_command(cmd: &[u8], args: &[Frame]) -> bool {
         (3, b'd') => args.len() > 1 && cmd.eq_ignore_ascii_case(b"DEL"),
         (6, b'u') => args.len() > 1 && cmd.eq_ignore_ascii_case(b"UNLINK"),
         (6, b'e') => args.len() > 1 && cmd.eq_ignore_ascii_case(b"EXISTS"),
+        // BITOP <op> dest src...: dest + sources can live on different shards.
+        (5, b'b') => args.len() >= 3 && cmd.eq_ignore_ascii_case(b"BITOP"),
+        // COPY src dst [REPLACE]: src and dst can live on different shards.
+        // The `COPY ... DB n` form is EXCLUDED: it needs two databases and is
+        // owned by the handlers' two-db interception (cross-db + cross-shard
+        // simultaneously is unsupported, as before).
+        (4, b'c') => {
+            args.len() >= 2
+                && cmd.eq_ignore_ascii_case(b"COPY")
+                && !args
+                    .iter()
+                    .skip(2)
+                    .any(|a| matches!(a, Frame::BulkString(o) if o.eq_ignore_ascii_case(b"DB")))
+        }
         _ => false,
     }
 }

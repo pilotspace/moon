@@ -579,7 +579,14 @@ pub(crate) async fn handle_connection_sharded_inner<
                                 if is_multi_key_command(cmd, cmd_args) {
                                     let first_slot = slot;
                                     let mut cross_slot = false;
-                                    for arg in cmd_args.iter().skip(1) {
+                                    // COPY's keys are exactly args[0..2]; trailing args
+                                    // are the REPLACE literal — not slot-checked.
+                                    let key_args: &[Frame] = if cmd.eq_ignore_ascii_case(b"COPY") {
+                                        &cmd_args[..cmd_args.len().min(2)]
+                                    } else {
+                                        cmd_args
+                                    };
+                                    for arg in key_args.iter().skip(1) {
                                         if let Some(k) = match arg {
                                             Frame::BulkString(b) => Some(b.as_ref()),
                                             _ => None,
@@ -834,7 +841,9 @@ pub(crate) async fn handle_connection_sharded_inner<
                     if txn::try_handle_txn_commit(cmd, cmd_args, &mut conn, ctx, &mut responses) {
                         continue;
                     }
-                    if txn::try_handle_txn_abort(cmd, cmd_args, &mut conn, ctx, &mut responses) {
+                    if txn::try_handle_txn_abort(cmd, cmd_args, &mut conn, ctx, &mut responses)
+                        .await
+                    {
                         continue;
                     }
 
@@ -842,7 +851,15 @@ pub(crate) async fn handle_connection_sharded_inner<
                     if txn::try_handle_temporal_snapshot_at(cmd, cmd_args, ctx, &mut responses) {
                         continue;
                     }
-                    if txn::try_handle_temporal_invalidate(cmd, cmd_args, ctx, &mut responses) {
+                    if txn::try_handle_temporal_invalidate(
+                        cmd,
+                        cmd_args,
+                        &frame,
+                        ctx,
+                        &mut responses,
+                    )
+                    .await
+                    {
                         continue;
                     }
 
@@ -958,7 +975,7 @@ pub(crate) async fn handle_connection_sharded_inner<
 
                     // --- GRAPH.* graph commands ---
                     #[cfg(feature = "graph")]
-                    if write::try_handle_graph_command(cmd, cmd_args, &mut conn, ctx, &mut responses) {
+                    if write::try_handle_graph_command(cmd, cmd_args, &frame, &mut conn, ctx, &mut responses).await {
                         continue;
                     }
 
@@ -1925,12 +1942,16 @@ pub(crate) async fn handle_connection_sharded_inner<
     // Closes T-161-05 — without this, a disconnect after TXN.BEGIN + SET would leak
     // kv_intents and pin the key invisible for all subsequent readers.
     if let Some(txn) = conn.active_cross_txn.take() {
-        crate::transaction::abort::abort_cross_store_txn(
+        crate::transaction::abort::abort_cross_store_txn_routed(
             &ctx.shard_databases,
             ctx.shard_id,
             conn.selected_db,
+            ctx.num_shards,
+            &ctx.dispatch_tx,
+            &ctx.spsc_notifiers,
             txn,
-        );
+        )
+        .await;
     }
 
     // Clean up pub/sub subscriptions on disconnect

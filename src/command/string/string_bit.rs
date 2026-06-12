@@ -338,6 +338,70 @@ pub fn bitcount_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
     }
 }
 
+/// Pure BITOP combine: given the operation name and gathered source values
+/// (missing keys = empty Vec), return the result string, or `None` when all
+/// sources are empty/missing (caller deletes dest and replies 0).
+///
+/// `Err(Frame)` carries the Redis-exact operation/arity errors. Shared by the
+/// local `bitop` path and the cross-shard coordinator so semantics cannot
+/// drift between them.
+pub(crate) fn bitop_compute(op: &[u8], sources: &[Vec<u8>]) -> Result<Option<Vec<u8>>, Frame> {
+    let is_not = op.eq_ignore_ascii_case(b"NOT");
+    if is_not && sources.len() != 1 {
+        return Err(Frame::Error(Bytes::from_static(
+            b"ERR BITOP NOT requires one and only one key",
+        )));
+    }
+    if !is_not
+        && !op.eq_ignore_ascii_case(b"AND")
+        && !op.eq_ignore_ascii_case(b"OR")
+        && !op.eq_ignore_ascii_case(b"XOR")
+    {
+        return Err(Frame::Error(Bytes::from_static(
+            b"ERR BITOP requires AND, OR, XOR, or NOT",
+        )));
+    }
+
+    let max_len = sources.iter().map(Vec::len).max().unwrap_or(0);
+    if max_len == 0 {
+        return Ok(None);
+    }
+
+    let mut result = vec![0u8; max_len];
+    if is_not {
+        let src = &sources[0];
+        for (i, byte) in result.iter_mut().enumerate() {
+            *byte = if i < src.len() { !src[i] } else { 0xFF };
+        }
+    } else if op.eq_ignore_ascii_case(b"AND") {
+        // Start with all 1s
+        result.iter_mut().for_each(|b| *b = 0xFF);
+        for src in sources {
+            for (i, byte) in result.iter_mut().enumerate() {
+                let v = if i < src.len() { src[i] } else { 0 };
+                *byte &= v;
+            }
+        }
+    } else if op.eq_ignore_ascii_case(b"OR") {
+        for src in sources {
+            for (i, byte) in result.iter_mut().enumerate() {
+                if i < src.len() {
+                    *byte |= src[i];
+                }
+            }
+        }
+    } else {
+        for src in sources {
+            for (i, byte) in result.iter_mut().enumerate() {
+                if i < src.len() {
+                    *byte ^= src[i];
+                }
+            }
+        }
+    }
+    Ok(Some(result))
+}
+
 /// BITOP operation destkey key [key ...]
 ///
 /// Perform bitwise operations between strings.
@@ -354,9 +418,9 @@ pub fn bitop(db: &mut Database, args: &[Frame]) -> Frame {
         None => return err_wrong_args("BITOP"),
     };
 
-    // Determine operation
-    let is_not = op.eq_ignore_ascii_case(b"NOT");
-    if is_not && args.len() != 3 {
+    // NOT arity is validated BEFORE touching any key (Redis order: a
+    // wrong-arity NOT errors even when a source key holds the wrong type).
+    if op.eq_ignore_ascii_case(b"NOT") && args.len() != 3 {
         return Frame::Error(Bytes::from_static(
             b"ERR BITOP NOT requires one and only one key",
         ));
@@ -364,7 +428,6 @@ pub fn bitop(db: &mut Database, args: &[Frame]) -> Frame {
 
     // Gather source values
     let mut sources: Vec<Vec<u8>> = Vec::with_capacity(args.len() - 2);
-    let mut max_len = 0usize;
     for arg in &args[2..] {
         let key = match extract_bytes(arg) {
             Some(k) => k,
@@ -381,61 +444,23 @@ pub fn bitop(db: &mut Database, args: &[Frame]) -> Frame {
             },
             None => Vec::new(),
         };
-        if data.len() > max_len {
-            max_len = data.len();
-        }
         sources.push(data);
     }
 
-    if max_len == 0 {
-        // All keys empty/missing — delete dest, return 0
-        db.remove(&destkey);
-        return Frame::Integer(0);
+    match bitop_compute(op, &sources) {
+        Err(e) => e,
+        Ok(None) => {
+            // All keys empty/missing — delete dest, return 0
+            db.remove(&destkey);
+            Frame::Integer(0)
+        }
+        Ok(Some(result)) => {
+            let result_len = result.len() as i64;
+            let entry = Entry::new_string(Bytes::from(result));
+            db.set(destkey, entry);
+            Frame::Integer(result_len)
+        }
     }
-
-    let mut result = vec![0u8; max_len];
-
-    if is_not {
-        let src = &sources[0];
-        for (i, byte) in result.iter_mut().enumerate() {
-            *byte = if i < src.len() { !src[i] } else { 0xFF };
-        }
-    } else if op.eq_ignore_ascii_case(b"AND") {
-        // Start with all 1s
-        result.iter_mut().for_each(|b| *b = 0xFF);
-        for src in &sources {
-            for (i, byte) in result.iter_mut().enumerate() {
-                let v = if i < src.len() { src[i] } else { 0 };
-                *byte &= v;
-            }
-        }
-    } else if op.eq_ignore_ascii_case(b"OR") {
-        for src in &sources {
-            for (i, byte) in result.iter_mut().enumerate() {
-                if i < src.len() {
-                    *byte |= src[i];
-                }
-            }
-        }
-    } else if op.eq_ignore_ascii_case(b"XOR") {
-        for src in &sources {
-            for (i, byte) in result.iter_mut().enumerate() {
-                if i < src.len() {
-                    *byte ^= src[i];
-                }
-            }
-        }
-    } else {
-        return Frame::Error(Bytes::from_static(
-            b"ERR BITOP requires AND, OR, XOR, or NOT",
-        ));
-    }
-
-    let result_len = result.len() as i64;
-    let entry = Entry::new_string(Bytes::from(result));
-    db.set(destkey, entry);
-
-    Frame::Integer(result_len)
 }
 
 /// BITPOS key bit [start [end [BYTE|BIT]]]

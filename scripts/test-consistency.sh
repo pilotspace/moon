@@ -38,8 +38,20 @@ cleanup() {
     [[ -n "${REDIS_PID:-}" ]] && kill "$REDIS_PID" 2>/dev/null; wait "$REDIS_PID" 2>/dev/null || true
     pkill -f "redis-server.*${PORT_REDIS}" 2>/dev/null || true
     pkill -f "moon.*${PORT_RUST}" 2>/dev/null || true
+    [[ -n "${MOON_DATA_DIR:-}" ]] && rm -rf "$MOON_DATA_DIR"
 }
 trap cleanup EXIT
+
+# Every moon start gets a fresh --dir. Without it the server resolves a shared
+# default data dir, and (a) stale AOF/index sidecars leak state across runs,
+# (b) a 1-shard run writes a TopLevel AOF manifest that makes any later
+# --shards >= 2 start REFUSE (the multi-shard data-loss guard), breaking every
+# cross-shard restart loop below.
+MOON_DATA_DIR=""
+new_moon_dir() {
+    [[ -n "$MOON_DATA_DIR" ]] && rm -rf "$MOON_DATA_DIR"
+    MOON_DATA_DIR=$(mktemp -d /tmp/moon-consistency-dir.XXXXXX)
+}
 
 assert_eq() {
     local desc="$1" expected="$2" actual="$3"
@@ -91,7 +103,8 @@ redis-server --port "$PORT_REDIS" --save "" --appendonly no --loglevel warning -
 REDIS_PID=$!
 
 log "Starting moon on :$PORT_RUST (shards=$SHARDS)..."
-"$RUST_BINARY" --port "$PORT_RUST" --shards "$SHARDS" &>/dev/null &
+new_moon_dir
+"$RUST_BINARY" --port "$PORT_RUST" --shards "$SHARDS" --dir "$MOON_DATA_DIR" &>/dev/null &
 RUST_PID=$!
 
 wait_for_port "$PORT_REDIS"
@@ -205,6 +218,7 @@ fi
 both SET mut:setrange "Hello, World!"
 rust_sr=$(redis-cli -p "$PORT_RUST" SETRANGE mut:setrange 7 "Redis" 2>&1)
 if [[ "$rust_sr" != *"unknown command"* ]]; then
+    both SETRANGE mut:setrange 7 "Redis"
     assert_both "SETRANGE" GET mut:setrange
 else
     log "  SKIP: SETRANGE not implemented"
@@ -399,8 +413,8 @@ for i in $(seq 0 999); do
 done
 
 # DBSIZE: verify both have 1000 keys (exact match not required due to prior test keys)
-redis_db=$(redis-cli -p "$PORT_REDIS" DBSIZE 2>&1 | grep -oE '[0-9]+')
-rust_db=$(redis-cli -p "$PORT_RUST" DBSIZE 2>&1 | grep -oE '[0-9]+')
+redis_db=$(redis-cli -p "$PORT_REDIS" DBSIZE 2>&1 | grep -oE '[0-9]+') || true
+rust_db=$(redis-cli -p "$PORT_RUST" DBSIZE 2>&1 | grep -oE '[0-9]+') || true
 if (( redis_db >= 1000 && rust_db >= 1000 )); then
     PASS=$((PASS + 1))
 else
@@ -622,7 +636,7 @@ echo ""
 log "=== Vector Search (moon-only) ==="
 
 # Create index on moon only
-FT_CREATE=$(redis-cli -p "$PORT_RUST" FT.CREATE vecidx ON HASH PREFIX 1 vec: SCHEMA embedding VECTOR FLAT 6 DIM 4 DISTANCE_METRIC L2 TYPE FLOAT32 2>&1)
+FT_CREATE=$(redis-cli -p "$PORT_RUST" FT.CREATE vecidx ON HASH PREFIX 1 vec: SCHEMA embedding VECTOR HNSW 6 DIM 4 DISTANCE_METRIC L2 TYPE FLOAT32 2>&1)
 assert_eq "FT.CREATE" "OK" "$FT_CREATE"
 
 # Insert vectors — use python3 to avoid null byte stripping in bash
@@ -668,7 +682,15 @@ sleep 0.3
 # Helper: start moon on PORT_RUST with given shard count, wait for it.
 start_moon_with_shards() {
     local nshards=$1
-    "$RUST_BINARY" --port "$PORT_RUST" --shards "$nshards" &>/dev/null &
+    # A previous instance may still own PORT_RUST (each section restarts the
+    # main-config server after its internal loop, and not every loop stops it
+    # before starting its own). SO_REUSEPORT lets BOTH processes bind the
+    # port, silently splitting connections between two servers with different
+    # stores/shard counts — every "divergence" then compares two servers.
+    # Stop first, always.
+    stop_moon
+    new_moon_dir
+    "$RUST_BINARY" --port "$PORT_RUST" --shards "$nshards" --dir "$MOON_DATA_DIR" &>/dev/null &
     RUST_PID=$!
     wait_for_port "$PORT_RUST" || return 1
 }
@@ -707,10 +729,21 @@ for NSHARDS in 1 4 12; do
     for i in $(seq 1 30); do
         STATUS=$([ $((i % 3)) -eq 0 ] && echo closed || echo open)
         PRIORITY=$([ $((i % 2)) -eq 0 ] && echo high || echo low)
-        TITLE="machine learning doc $i"
-        # Deterministic vector: [i/30, 0, 0, 0] as f32 LE
-        VECTOR=$(python3 -c "import struct,sys; v=$i/30.0; sys.stdout.buffer.write(struct.pack('<4f', v, 0.0, 0.0, 0.0))")
-        redis-cli -p "$PORT_RUST" HSET cdoc:$i status "$STATUS" priority "$PRIORITY" title "$TITLE" vec "$VECTOR" >/dev/null 2>&1
+        # Discriminative fixture: only docs 1-5 match the BM25 query, and the
+        # vectors [cos(i*0.05), sin(i*0.05), 0, 0] have strictly decreasing
+        # cosine similarity to the query [1,0,0,0]. With the original fixture
+        # (all vectors parallel to the query, all titles the same 4 tokens)
+        # every BM25 and dense score was tied, so "top-5" was arbitrary
+        # tie-breaking — legitimately different across shard partitionings.
+        if [ "$i" -le 5 ]; then
+            TITLE="machine learning doc $i"
+        else
+            TITLE="unrelated filler text $i"
+        fi
+        # Piped via redis-cli -x: $(...) substitution strips null bytes and
+        # would corrupt the 16-byte blob to ~4 bytes (dim mismatch).
+        python3 -c "import struct,sys,math; t=$i*0.05; sys.stdout.buffer.write(struct.pack('<4f', math.cos(t), math.sin(t), 0.0, 0.0))" \
+            | redis-cli -x -p "$PORT_RUST" HSET cdoc:$i status "$STATUS" priority "$PRIORITY" title "$TITLE" vec >/dev/null 2>&1
     done
     sleep 0.5
 
@@ -724,10 +757,13 @@ for NSHARDS in 1 4 12; do
     esac
 
     # HYB-01: FT.SEARCH HYBRID top-K (BM25 + dense, RRF). Fixed query vector + text.
-    QVEC=$(python3 -c "import struct,sys; sys.stdout.buffer.write(struct.pack('<4f', 1.0, 0.0, 0.0, 0.0))")
-    HYB_OUT=$(redis-cli -p "$PORT_RUST" FT.SEARCH cidx "machine learning" HYBRID VECTOR @vec '$q' FUSION RRF LIMIT 0 5 PARAMS 2 q "$QVEC" 2>&1)
+    # Query blob piped via -x (null-byte-safe); it is the last argument (PARAMS 2 q <blob>).
+    HYB_OUT=$(python3 -c "import struct,sys; sys.stdout.buffer.write(struct.pack('<4f', 1.0, 0.0, 0.0, 0.0))" \
+        | redis-cli -x -p "$PORT_RUST" FT.SEARCH cidx "machine learning" HYBRID VECTOR @vec '$q' FUSION RRF LIMIT 0 5 PARAMS 2 q 2>&1)
     # Extract just the keys (cdoc:N lines) to compare top-K ordering.
-    HYB_KEYS=$(printf '%s\n' "$HYB_OUT" | grep -oE 'cdoc:[0-9]+' | head -5 | tr '\n' ' ')
+    # `|| true`: zero matches must surface as an HYB-01 FAIL below, not kill
+    # the whole script via set -e + pipefail on grep's exit 1.
+    HYB_KEYS=$(printf '%s\n' "$HYB_OUT" | grep -oE 'cdoc:[0-9]+' | head -5 | tr '\n' ' ' || true)
     case "$NSHARDS" in
         1) HYB_RESULT_1="$HYB_KEYS" ;;
         4) HYB_RESULT_4="$HYB_KEYS" ;;
@@ -815,7 +851,7 @@ for NSHARDS in 1 4 12; do
     # TEMPORAL.INVALIDATE with graph entity — create graph, add node, invalidate
     redis-cli -p "$PORT_RUST" GRAPH.CREATE tempgraph >/dev/null 2>&1
     ADDNODE_OUT=$(redis-cli -p "$PORT_RUST" GRAPH.ADDNODE tempgraph :TempLabel 2>&1)
-    NODE_ID=$(echo "$ADDNODE_OUT" | grep -oE '[0-9]+' | head -1)
+    NODE_ID=$(echo "$ADDNODE_OUT" | grep -oE '[0-9]+' | head -1) || true
     if [[ -n "$NODE_ID" ]]; then
         INV_OUT=$(redis-cli -p "$PORT_RUST" TEMPORAL.INVALIDATE "$NODE_ID" NODE tempgraph 2>&1)
         # Verify node is still visible without VALID_AT filter
@@ -886,9 +922,9 @@ PYEOF
     # The returned path renders one node id per line — the detour is
     # detected by whether B's node id appears.
     redis-cli -p "$PORT_RUST" GRAPH.CREATE decayg >/dev/null 2>&1
-    DECAY_A=$(redis-cli -p "$PORT_RUST" GRAPH.ADDNODE decayg Person name A 2>&1 | grep -oE '[0-9]+' | head -1)
-    DECAY_B=$(redis-cli -p "$PORT_RUST" GRAPH.ADDNODE decayg Person name B 2>&1 | grep -oE '[0-9]+' | head -1)
-    DECAY_C=$(redis-cli -p "$PORT_RUST" GRAPH.ADDNODE decayg Person name C 2>&1 | grep -oE '[0-9]+' | head -1)
+    DECAY_A=$(redis-cli -p "$PORT_RUST" GRAPH.ADDNODE decayg Person name A 2>&1 | grep -oE '[0-9]+' | head -1) || true
+    DECAY_B=$(redis-cli -p "$PORT_RUST" GRAPH.ADDNODE decayg Person name B 2>&1 | grep -oE '[0-9]+' | head -1) || true
+    DECAY_C=$(redis-cli -p "$PORT_RUST" GRAPH.ADDNODE decayg Person name C 2>&1 | grep -oE '[0-9]+' | head -1) || true
     redis-cli -p "$PORT_RUST" GRAPH.ADDEDGE decayg "$DECAY_A" "$DECAY_C" KNOWS WEIGHT 1.0 >/dev/null 2>&1
     sleep 2
     redis-cli -p "$PORT_RUST" GRAPH.ADDEDGE decayg "$DECAY_A" "$DECAY_B" KNOWS WEIGHT 0.6 >/dev/null 2>&1
@@ -1029,7 +1065,7 @@ for NSHARDS in 1 4 12; do
     # Fallback: if awk did not find a scalar after node_count (e.g. map
     # response), grep the next line after the key.
     if [[ "$NCOUNT" == "-1" ]]; then
-        NCOUNT=$(echo "$GINFO" | grep -A1 -E '^node_count$' | tail -1 | tr -d '[:space:]')
+        NCOUNT=$(echo "$GINFO" | grep -A1 -E '^node_count$' | tail -1 | tr -d '[:space:]') || true
     fi
     case "$NSHARDS" in
         1)  TXN_GRAPH_ABORT_1="$NCOUNT" ;;
@@ -1057,7 +1093,7 @@ for NSHARDS in 1 4 12; do
         for (i=1; i<=NF; i++) if ($i=="edge_count" && (i+1)<=NF) { n=$(i+1) }
     } END{print n}')
     if [[ "$ECOUNT" == "-1" ]]; then
-        ECOUNT=$(echo "$GINFO2" | grep -A1 -E '^edge_count$' | tail -1 | tr -d '[:space:]')
+        ECOUNT=$(echo "$GINFO2" | grep -A1 -E '^edge_count$' | tail -1 | tr -d '[:space:]') || true
     fi
     case "$NSHARDS" in
         1)  TXN_EDGE_ABORT_1="$ECOUNT" ;;
@@ -1081,7 +1117,17 @@ except Exception:
     pass
 v = struct.pack("<16f", *[i * 0.1 for i in range(16)])
 r.execute_command("TXN", "BEGIN")
-r.hset("v:{t}:1", mapping={"vec": v, "label": "x"})
+# Pre-existing documented limitation: TXN KV writes execute on the
+# CONNECTION's shard, so on a multi-shard server a connection that the
+# kernel lands on a different shard than {t} gets "ERR TXN does not
+# support cross-shard writes" (reproduced on the v0.3.0 release binary;
+# accept-shard roulette under Linux SO_REUSEPORT). Survive it: the abort
+# still runs, FT.SEARCH then reports 0 and the assert's 1-shard oracle +
+# multi-shard-divergence-note path handles the comparison.
+try:
+    r.hset("v:{t}:1", mapping={"vec": v, "label": "x"})
+except Exception:
+    pass
 r.execute_command("TXN", "ABORT")
 time.sleep(0.05)
 res = r.execute_command("FT.SEARCH", "vidx_{t}", "*=>[KNN 5 @vec $q]",
@@ -1201,11 +1247,18 @@ for NSHARDS in 1 4 12; do
     start_moon_with_shards "$NSHARDS" || { echo "  FAIL: moon failed to start with shards=$NSHARDS"; FAIL=$((FAIL + 1)); continue; }
     redis-cli -p "$PORT_RUST" FLUSHALL >/dev/null 2>&1
 
-    # WS CREATE + WS AUTH + SET + GET consistency
+    # WS CREATE + WS AUTH + SET + GET consistency.
+    # AUTH/SET/GET are piped through ONE redis-cli process: WS AUTH binds a
+    # CONNECTION, and one-shot redis-cli opens a fresh (unbound) connection
+    # per invocation — the old probe's SET ran unbound, so it never tested
+    # workspace scoping at all. CREATE stays one-shot on purpose: with
+    # SO_REUSEPORT it lands on an arbitrary shard, which is exactly the
+    # cross-connection registry visibility this section asserts.
     WS_ID=$(redis-cli -p "$PORT_RUST" WS CREATE "testws" 2>&1)
-    AUTH_OK=$(redis-cli -p "$PORT_RUST" WS AUTH "$WS_ID" 2>&1)
-    SET_OK=$(redis-cli -p "$PORT_RUST" SET mykey myval 2>&1)
-    GET_VAL=$(redis-cli -p "$PORT_RUST" GET mykey 2>&1)
+    BOUND_OUT=$(printf 'WS AUTH %s\nSET mykey myval\nGET mykey\n' "$WS_ID" | redis-cli -p "$PORT_RUST" 2>&1)
+    AUTH_OK=$(echo "$BOUND_OUT" | sed -n 1p)
+    SET_OK=$(echo "$BOUND_OUT" | sed -n 2p)
+    GET_VAL=$(echo "$BOUND_OUT" | sed -n 3p)
     WS_RESULT="$AUTH_OK|$SET_OK|$GET_VAL"
     case "$NSHARDS" in
         1)  WS_RESULT_1="$WS_RESULT" ;;
@@ -1218,14 +1271,10 @@ for NSHARDS in 1 4 12; do
     LIST_HAS_WS="no"
     echo "$WS_LIST" | grep -qF "testws" && LIST_HAS_WS="yes"
 
-    # Workspace isolation: unbound GET should not see workspace key
-    # Open a fresh connection (redis-cli is one-shot, so each call is a new conn)
-    # We need a separate connection that is NOT bound to the workspace.
-    # Since redis-cli opens a new TCP connection per invocation, and our
-    # WS AUTH above was on the previous connection, a new redis-cli call
-    # will be unbound. But redis-cli reuses connections in interactive mode.
-    # For one-shot mode, each redis-cli is a new connection, so GET mykey
-    # from a fresh connection should return nil (key is workspace-scoped).
+    # Workspace isolation: unbound GET should not see workspace key.
+    # One-shot redis-cli = fresh unbound connection; the SET above ran on a
+    # workspace-bound connection (stored as {wsid}:mykey), so this GET must
+    # return nil (empty), never "myval".
     UNBOUND_GET=$(redis-cli -p "$PORT_RUST" GET mykey 2>&1)
     WS_ISO_RESULT="$LIST_HAS_WS|$UNBOUND_GET"
     case "$NSHARDS" in

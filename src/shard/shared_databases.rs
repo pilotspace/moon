@@ -232,14 +232,15 @@ impl ShardDatabases {
         self.temporal_kv_indexes[shard_id].lock()
     }
 
-    /// Acquire the per-shard WorkspaceRegistry lock.
+    /// Acquire the GLOBAL WorkspaceRegistry lock (slot 0 of the per-shard
+    /// array). Workspaces are control-plane objects looked up by every
+    /// connection regardless of which shard accepted it, so all paths —
+    /// handlers, uring intercept, WAL replay — share one registry. WS
+    /// commands are rare; a single mutex is not a hot-path concern.
     /// Caller lazy-inits via `get_or_insert_with(|| Box::new(WorkspaceRegistry::new()))`.
     #[inline]
-    pub fn workspace_registry(
-        &self,
-        shard_id: usize,
-    ) -> MutexGuard<'_, Option<Box<WorkspaceRegistry>>> {
-        self.workspace_registries[shard_id].lock()
+    pub fn workspace_registry(&self) -> MutexGuard<'_, Option<Box<WorkspaceRegistry>>> {
+        self.workspace_registries[0].lock()
     }
 
     /// Acquire the per-shard DurableQueueRegistry lock.
@@ -303,7 +304,8 @@ impl ShardDatabases {
                                 name: bytes::Bytes::from(name),
                                 created_at: 0, // WAL doesn't store created_at; use 0 as placeholder
                             };
-                            let mut guard = self.workspace_registries[shard_id].lock();
+                            // Global registry (slot 0) — see workspace_registry().
+                            let mut guard = self.workspace_registries[0].lock();
                             let reg =
                                 guard.get_or_insert_with(|| Box::new(WorkspaceRegistry::new()));
                             reg.insert(ws_id, meta);
@@ -313,7 +315,7 @@ impl ShardDatabases {
                     WalRecordType::WorkspaceDrop => {
                         if let Some(ws_bytes) = decode_workspace_drop(&record.payload) {
                             let ws_id = WorkspaceId::from_bytes(ws_bytes);
-                            let mut guard = self.workspace_registries[shard_id].lock();
+                            let mut guard = self.workspace_registries[0].lock();
                             if let Some(reg) = guard.as_mut() {
                                 reg.remove(&ws_id);
                             }
