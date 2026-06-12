@@ -51,10 +51,6 @@ pub async fn aof_writer_task(
     let mut writer = tokio::io::BufWriter::new(file);
     #[cfg(feature = "runtime-tokio")]
     let mut last_fsync = Instant::now();
-    #[cfg(feature = "runtime-tokio")]
-    let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
-    #[cfg(feature = "runtime-tokio")]
-    interval.tick().await; // consume first tick
 
     // Monoio path: multi-part AOF (base RDB + incremental RESP) with sync I/O.
     //
@@ -299,11 +295,33 @@ pub async fn aof_writer_task(
 
     loop {
         #[cfg(feature = "runtime-tokio")]
-        tokio::select! {
-            msg = rx.recv_async() => {
+        {
+            // Bounded recv (EverySec durability): wake at least every 200ms even
+            // when idle so the flush deadline check after this select! is honored
+            // within its 1s bound. A long-lived `interval.tick()` select arm is
+            // fairness-starvable under sustained writes and unreliable when idle
+            // (see the per-shard writer below, which hit exactly that) — the
+            // bounded recv cannot starve. flume's recv future is drop-safe on
+            // the Elapsed branch (no message consumed on timeout).
+            let recv_result = tokio::select! {
+                r = tokio::time::timeout(
+                    std::time::Duration::from_millis(200),
+                    rx.recv_async(),
+                ) => r,
+                _ = cancel.cancelled() => {
+                    let _ = writer.flush().await;
+                    let _ = writer.get_ref().sync_data().await;
+                    info!("AOF writer cancelled");
+                    break;
+                }
+            };
+            if let Ok(msg) = recv_result {
                 match msg {
                     // TopLevel writer (tokio): legacy v1 plain RESP, lsn ignored.
-                    Ok(AofMessage::Append { bytes: data, lsn: _ }) => {
+                    Ok(AofMessage::Append {
+                        bytes: data,
+                        lsn: _,
+                    }) => {
                         if let Err(e) = writer.write_all(&data).await {
                             error!("AOF write error: {}", e);
                             continue;
@@ -314,12 +332,17 @@ pub async fn aof_writer_task(
                                 let _ = writer.get_ref().sync_data().await;
                             }
                             FsyncPolicy::EverySec | FsyncPolicy::No => {
-                                // EverySec handled by interval tick below; No does nothing
+                                // EverySec handled by the deadline check after
+                                // the select!; No does nothing
                             }
                         }
                     }
                     // AppendSync: write + fsync + ack, regardless of policy.
-                    Ok(AofMessage::AppendSync { bytes: data, lsn: _, ack }) => {
+                    Ok(AofMessage::AppendSync {
+                        bytes: data,
+                        lsn: _,
+                        ack,
+                    }) => {
                         if let Err(e) = writer.write_all(&data).await {
                             error!("AOF AppendSync write error: {}", e);
                             let _ = ack.send(AofAck::WriteFailed);
@@ -349,11 +372,12 @@ pub async fn aof_writer_task(
                             .store(false, std::sync::atomic::Ordering::SeqCst);
 
                         // Reopen file after rewrite (it was replaced)
-                        let reopen_result: Result<tokio::fs::File, _> = tokio::fs::OpenOptions::new()
-                            .create(true)
-                            .append(true)
-                            .open(&aof_path)
-                            .await;
+                        let reopen_result: Result<tokio::fs::File, _> =
+                            tokio::fs::OpenOptions::new()
+                                .create(true)
+                                .append(true)
+                                .open(&aof_path)
+                                .await;
                         match reopen_result {
                             Ok(f) => {
                                 writer = tokio::io::BufWriter::new(f);
@@ -363,6 +387,11 @@ pub async fn aof_writer_task(
                                 return;
                             }
                         }
+                        // Back-date so the backlog drained right after the
+                        // rewrite reaches disk within ~100ms + wake floor,
+                        // not a full second later (mirrors the per-shard
+                        // writer's post-rewrite back-dating).
+                        last_fsync = Instant::now() - std::time::Duration::from_millis(900);
                     }
                     Ok(AofMessage::RewriteSharded(shard_dbs)) => {
                         // C4 TopLevel cooperative fold (tokio path):
@@ -385,17 +414,31 @@ pub async fn aof_writer_task(
                         drop(sf);
                         crate::command::persistence::AOF_REWRITE_IN_PROGRESS
                             .store(false, std::sync::atomic::Ordering::SeqCst);
-                        let reopen_result: Result<tokio::fs::File, _> = tokio::fs::OpenOptions::new()
-                            .create(true).append(true).open(&aof_path).await;
+                        let reopen_result: Result<tokio::fs::File, _> =
+                            tokio::fs::OpenOptions::new()
+                                .create(true)
+                                .append(true)
+                                .open(&aof_path)
+                                .await;
                         match reopen_result {
                             Ok(f) => writer = tokio::io::BufWriter::new(f),
-                            Err(e) => { error!("Failed to reopen AOF after rewrite: {}", e); return; }
+                            Err(e) => {
+                                error!("Failed to reopen AOF after rewrite: {}", e);
+                                return;
+                            }
                         }
+                        // Back-date so the channel backlog that accumulated
+                        // during the blocking fold reaches disk within ~100ms
+                        // + wake floor — a SIGKILL shortly after rewrite
+                        // completion must not take the tail with it.
+                        last_fsync = Instant::now() - std::time::Duration::from_millis(900);
                     }
                     // [F6] TopLevel writer never owns per-shard files — routing
                     // bug. Self-abort so the countdown completes + flag clears.
                     Ok(AofMessage::RewritePerShard { coord, .. }) => {
-                        warn!("AOF TopLevel writer received RewritePerShard — routing bug; aborting");
+                        warn!(
+                            "AOF TopLevel writer received RewritePerShard — routing bug; aborting"
+                        );
                         coord.mark_failed();
                         coord.shard_done();
                     }
@@ -407,18 +450,17 @@ pub async fn aof_writer_task(
                     }
                 }
             }
-            _ = interval.tick(), if fsync == FsyncPolicy::EverySec => {
-                if last_fsync.elapsed() >= std::time::Duration::from_secs(1) {
-                    let _ = writer.flush().await;
-                    let _ = writer.get_ref().sync_data().await;
-                    last_fsync = Instant::now();
-                }
-            }
-            _ = cancel.cancelled() => {
+            // EverySec deadline: the oldest unflushed byte reaches disk at
+            // most ~1.2s after it was written (1s deadline + 200ms wake
+            // floor). tokio's BufWriter holds up to 8KB in userspace — a
+            // SIGKILL takes that tail with it, so the bound must hold even
+            // when the recv arm is saturated with messages.
+            if fsync == FsyncPolicy::EverySec
+                && last_fsync.elapsed() >= std::time::Duration::from_secs(1)
+            {
                 let _ = writer.flush().await;
                 let _ = writer.get_ref().sync_data().await;
-                info!("AOF writer cancelled");
-                break;
+                last_fsync = Instant::now();
             }
         }
     }

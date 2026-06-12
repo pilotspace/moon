@@ -6,6 +6,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — Shared-nothing thread-local shard storage (PR #175)
+
+Shard storage moved from `RwLock`/`Mutex`-wrapped shared databases to
+thread-local **ShardSlices** owned exclusively by each shard's event
+loop, on both runtimes (monoio and tokio). The lock wrappers are
+deleted; all cross-shard access routes through the owner shard's SPSC
+ring. Routed multi-shard workloads are parity or better (up to +12% on
+pipelined GET at 4 shards); the cross-shard *read fast-path* (direct
+RwLock read of another shard's data) is definitionally gone and those
+cells regress — accepted with a follow-up task for lock-free cross-shard
+read acceleration. BGREWRITEAOF on every layout now uses the C4
+cooperative-fold protocol: the AOF writer requests an atomic snapshot
+from the owning shard and drains pre-snapshot appends with an exact
+bound, so concurrent writes are neither lost nor double-applied. This
+also fixes BGREWRITEAOF being silently inoperative on the top-level AOF
+layout (`--shards 1`), where the rewrite previously errored internally
+while the client was told it had started.
+
 ### Added — HYBRID FT.SEARCH `FILTER` push-down on both branches (PR #174)
 
 `FT.SEARCH ... HYBRID` now accepts an optional `FILTER` clause that is
