@@ -366,12 +366,13 @@ pub fn eval_filter(filter: &HybridFilter, text_index: &TextIndex) -> HashSet<u32
                 .collect()
         }
         HybridFilter::And(children) => {
-            if children.is_empty() {
-                return HashSet::new();
-            }
             let mut iter = children.iter();
-            // Start from the first child's result.
-            let mut result = eval_filter(iter.next().expect("checked non-empty"), text_index);
+            // Start from the first child's result; an empty AND yields the
+            // empty set (no annotated unwrap — `let-else` folds the guard).
+            let Some(first) = iter.next() else {
+                return HashSet::new();
+            };
+            let mut result = eval_filter(first, text_index);
             for child in iter {
                 let child_set = eval_filter(child, text_index);
                 result.retain(|id| child_set.contains(id));
