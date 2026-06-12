@@ -573,7 +573,7 @@ pub async fn handle_psync_inline_single_shard(
     client_offset: i64,
     mut stream: monoio::net::TcpStream,
     repl_state: Arc<RwLock<ReplicationState>>,
-    shard_databases: Arc<crate::shard::shared_databases::ShardDatabases>,
+    _shard_databases: Arc<crate::shard::shared_databases::ShardDatabases>,
     dispatch_tx: Rc<RefCell<Vec<ringbuf::HeapProd<crate::shard::dispatch::ShardMessage>>>>,
     replica_addr: std::net::SocketAddr,
 ) -> anyhow::Result<()> {
@@ -624,13 +624,11 @@ pub async fn handle_psync_inline_single_shard(
             // Clone — its internal DashTable + FT/graph indices are large).
             let mut rdb_buf: Vec<u8> = Vec::new();
             {
-                let db_count = shard_databases.db_count();
-                let mut guards = Vec::with_capacity(db_count);
-                for db_idx in 0..db_count {
-                    guards.push(shard_databases.read_db(0, db_idx));
-                }
-                let refs: Vec<&crate::storage::Database> = guards.iter().map(|g| &**g).collect();
-                crate::persistence::redis_rdb::write_rdb_refs(&refs, &mut rdb_buf);
+                // Shard 0 is this thread's shard — use the thread-local slice.
+                crate::shard::slice::with_shard(|s| {
+                    let refs: Vec<&crate::storage::Database> = s.databases.iter().collect();
+                    crate::persistence::redis_rdb::write_rdb_refs(&refs, &mut rdb_buf);
+                });
             }
             let header = format!("${}\r\n", rdb_buf.len());
             let (wr, _) = stream.write_all(header.into_bytes()).await;

@@ -9,6 +9,8 @@ pub mod event_loop;
 /// MA5: maintenance-window scheduler (cron-style budget multipliers).
 pub mod maintenance_schedule;
 pub mod mesh;
+/// C2 (shardslice-migration Wave A1): owner-side MQ.* execution on the shard thread.
+pub(crate) mod mq_exec;
 pub mod numa;
 pub mod persistence_tick;
 pub mod remote_subscriber_map;
@@ -359,7 +361,7 @@ mod tests {
     #[test]
     fn test_pubsub_fanout_via_spsc() {
         let mut pubsub = PubSubRegistry::new();
-        let shard_databases = ShardDatabases::new(vec![vec![Database::new()]]);
+        let (shard_databases, _inits) = ShardDatabases::new(vec![vec![Database::new()]]);
 
         let (tx, rx) = rt_channel::mpsc_bounded::<Bytes>(16);
         let sub = Subscriber::new(tx, 42);
@@ -384,7 +386,6 @@ mod tests {
         let blocking = Rc::new(RefCell::new(BlockingRegistry::new(0)));
         let script_cache = Rc::new(RefCell::new(crate::scripting::ScriptCache::new()));
         let clock = CachedClock::new();
-        let mut vs = crate::vector::store::VectorStore::new();
         let backlog = std::sync::Arc::new(parking_lot::Mutex::new(None));
         spsc_handler::drain_spsc_shared(
             &shard_databases,
@@ -402,7 +403,6 @@ mod tests {
             &script_cache,
             &clock,
             &mut Vec::new(),
-            &mut vs,
             &mut Vec::new(),
             &mut None, // shard_manifest — None in tests (no persistence_dir)
             1000,      // mvcc_prune_margin default
@@ -424,7 +424,7 @@ mod tests {
     #[test]
     fn test_drain_spsc_respects_limit() {
         let mut pubsub = PubSubRegistry::new();
-        let shard_databases = ShardDatabases::new(vec![vec![Database::new()]]);
+        let (shard_databases, _inits) = ShardDatabases::new(vec![vec![Database::new()]]);
 
         let rb = HeapRb::new(512);
         let (mut prod, cons) = rb.split();
@@ -448,7 +448,6 @@ mod tests {
         let blocking = Rc::new(RefCell::new(BlockingRegistry::new(0)));
         let script_cache = Rc::new(RefCell::new(crate::scripting::ScriptCache::new()));
         let clock = CachedClock::new();
-        let mut vs = crate::vector::store::VectorStore::new();
         let backlog = std::sync::Arc::new(parking_lot::Mutex::new(None));
         spsc_handler::drain_spsc_shared(
             &shard_databases,
@@ -466,7 +465,6 @@ mod tests {
             &script_cache,
             &clock,
             &mut Vec::new(),
-            &mut vs,
             &mut Vec::new(),
             &mut None, // shard_manifest — None in tests (no persistence_dir)
             1000,      // mvcc_prune_margin default
@@ -525,7 +523,7 @@ mod tests {
 
         let config = RuntimeConfig::default();
         let shard = Shard::new(0, 1, 1, config);
-        let shard_databases = ShardDatabases::new(vec![shard.databases]);
+        let (shard_databases, _inits) = ShardDatabases::new(vec![shard.databases]);
         let mut parse_bufs = std::collections::HashMap::new();
         parse_bufs.insert(42u32, bytes::BytesMut::from(&b"partial"[..]));
         let mut inflight_sends = std::collections::HashMap::new();
@@ -563,7 +561,7 @@ mod tests {
 
         let config = RuntimeConfig::default();
         let shard = Shard::new(0, 1, 1, config);
-        let shard_databases = ShardDatabases::new(vec![shard.databases]);
+        let (shard_databases, _inits) = ShardDatabases::new(vec![shard.databases]);
         let mut parse_bufs = std::collections::HashMap::new();
         let mut inflight_sends = std::collections::HashMap::new();
 

@@ -59,7 +59,7 @@ use moon::runtime::channel;
 use moon::runtime::{RuntimeFactoryImpl, traits::RuntimeFactory};
 use moon::server;
 use moon::shard::Shard;
-use moon::shard::mesh::{CHANNEL_BUFFER_SIZE, ChannelMesh};
+use moon::shard::mesh::{CHANNEL_BUFFER_SIZE, ChannelMesh, create_aof_fold_channels};
 use moon::shard::shared_databases::ShardDatabases;
 use tracing::info;
 
@@ -601,7 +601,19 @@ fn main() -> anyhow::Result<()> {
         std::process::exit(2);
     }
 
-    let aof_pool: Option<std::sync::Arc<AofWriterPool>> = if config.appendonly == "yes" {
+    // C4 TopLevel staging variables: populated in the `else` branch of the pool
+    // construction block when layout==TopLevel, consumed in the fold-channel
+    // wiring block and the shard-spawn loop below.
+    let mut toplevel_fold_consumer_staging: Option<
+        ringbuf::HeapCons<moon::shard::dispatch::ShardMessage>,
+    > = None;
+    let mut toplevel_pool_fold_producer: Option<
+        std::sync::Arc<parking_lot::Mutex<ringbuf::HeapProd<moon::shard::dispatch::ShardMessage>>>,
+    > = None;
+    let mut toplevel_pool_fold_notifier: Option<std::sync::Arc<moon::runtime::channel::Notify>> =
+        None;
+
+    let mut aof_pool: Option<std::sync::Arc<AofWriterPool>> = if config.appendonly == "yes" {
         let fsync = FsyncPolicy::from_str(&config.appendfsync);
         // PerShard writers required when num_shards >= 2 AND we'll have a
         // PerShard manifest at runtime. Two cases produce PerShard:
@@ -657,6 +669,20 @@ fn main() -> anyhow::Result<()> {
             let (tx, rx) = channel::mpsc_bounded::<AofMessage>(10_000);
             let aof_token = cancel_token.child_token();
             let aof_file_path = PathBuf::from(&config.dir).join(&config.appendfilename);
+
+            // C4 TopLevel: create fold channels for shard 0 here (before the
+            // writer spawn) so they can be moved into the closure.  The consumer
+            // is stored in `toplevel_fold_cons_staging` and later merged into shard
+            // 0's consumers vec in the shard-spawn loop below.
+            // Notifier: use shard 0's mesh notifier (same handle the shard event
+            // loop is woken by) so the AofFold push wakes the right thread.
+            let (mut tl_fold_producers, mut tl_fold_consumers) = create_aof_fold_channels(1, 4);
+            let tl_fold_producer = tl_fold_producers.remove(0);
+            let tl_fold_consumer = tl_fold_consumers.remove(0);
+            let tl_fold_notifier = mesh.take_notify(0);
+            // fold channels for the writer task
+            let writer_fold_channels = Some((tl_fold_producer.clone(), tl_fold_notifier.clone()));
+
             // Legacy single-writer thread. Each shard clones the outer
             // `aof_pool` Arc; sender lifetime is governed by the pool's Drop.
             std::thread::Builder::new()
@@ -664,11 +690,23 @@ fn main() -> anyhow::Result<()> {
                 .spawn(move || {
                     RuntimeFactoryImpl::block_on_local(
                         "aof-writer".to_string(),
-                        aof::aof_writer_task(rx, aof_file_path, fsync, aof_token),
+                        aof::aof_writer_task(
+                            rx,
+                            aof_file_path,
+                            fsync,
+                            aof_token,
+                            writer_fold_channels,
+                        ),
                     );
                 })
                 .expect("failed to spawn AOF writer thread");
             info!("AOF enabled (TopLevel, fsync: {:?})", fsync);
+
+            // Stash consumer + pool-side channels for wiring in the blocks below.
+            toplevel_fold_consumer_staging = Some(tl_fold_consumer);
+            toplevel_pool_fold_producer = Some(tl_fold_producer);
+            toplevel_pool_fold_notifier = Some(tl_fold_notifier);
+
             Some(AofWriterPool::top_level_with_policy(
                 tx,
                 fsync,
@@ -786,6 +824,61 @@ fn main() -> anyhow::Result<()> {
 
     // Collect all notifiers before spawning shard threads
     let all_notifiers = mesh.all_notifiers();
+
+    // C4: Wire AOF fold channels for the cooperative snapshot protocol.
+    //
+    // Two paths:
+    //
+    // A) PerShard layout (num_shards >= 2): fold channels are created here and
+    //    wired into the pool via set_fold_channels. Arc::get_mut is safe because
+    //    no shard threads have spawned yet (first Arc clone happens ~line 1290).
+    //    fold_consumers[i] is merged into shard i's consumers vec before run().
+    //
+    // B) TopLevel layout (--shards 1): fold channels were already created AND
+    //    WIRED INTO THE WRITER TASK in the TopLevel writer-spawn branch above.
+    //    The consumer side was stashed in `toplevel_fold_consumer_staging`.
+    //    Here we only wire the pool's set_fold_channels and collect the consumer
+    //    into fold_consumers so the shard-spawn loop can prepend it.
+    let mut fold_consumers: Option<Vec<ringbuf::HeapCons<moon::shard::dispatch::ShardMessage>>> =
+        None;
+    if let Some(ref mut pool_arc) = aof_pool {
+        let layout = pool_arc.layout();
+        if layout == moon::persistence::aof_manifest::AofLayout::PerShard {
+            // Path A: PerShard — create fold channels and wire now.
+            let (fold_producers, fold_cons) = create_aof_fold_channels(num_shards, 4);
+            // SAFETY: Arc::get_mut is valid here — no clones exist yet; the first
+            // shard_aof_pool clone happens inside the shard-spawn loop below.
+            if let Some(pool_mut) = std::sync::Arc::get_mut(pool_arc) {
+                pool_mut.set_fold_channels(fold_producers, all_notifiers.clone());
+                fold_consumers = Some(fold_cons);
+            } else {
+                tracing::error!(
+                    "C4 wiring (PerShard): Arc::get_mut failed — fold channels not wired. \
+                     BGREWRITEAOF will abort cleanly (old generation remains authoritative)."
+                );
+            }
+        } else {
+            // Path B: TopLevel — channels were created + wired at writer-spawn time.
+            // Wire the producer/notifier into the pool and collect the consumer.
+            if let (Some(prod), Some(notif)) = (
+                toplevel_pool_fold_producer.take(),
+                toplevel_pool_fold_notifier.take(),
+            ) {
+                // SAFETY: Arc::get_mut is valid here — no clones exist yet.
+                if let Some(pool_mut) = std::sync::Arc::get_mut(pool_arc) {
+                    pool_mut.set_fold_channels(vec![prod], vec![notif]);
+                } else {
+                    tracing::error!(
+                        "C4 wiring (TopLevel): Arc::get_mut failed — pool fold channels \
+                         not wired. BGREWRITEAOF will abort cleanly."
+                    );
+                }
+            }
+            if let Some(cons) = toplevel_fold_consumer_staging.take() {
+                fold_consumers = Some(vec![cons]);
+            }
+        }
+    }
 
     // Create admin SPSC channels for the console gateway (one per shard).
     #[cfg(feature = "console")]
@@ -1227,32 +1320,37 @@ fn main() -> anyhow::Result<()> {
         .iter_mut()
         .map(|s| std::mem::take(&mut s.databases))
         .collect();
-    let shard_databases = ShardDatabases::new(all_dbs);
+    let (shard_databases, mut slice_inits) = ShardDatabases::new(all_dbs);
 
     // Recover graph stores from persistence (CSR segments + metadata + WAL replay).
+    // These run on ShardSliceInit (mutate pre-shard state before handoff to threads).
     #[cfg(feature = "graph")]
     if let Some(ref dir) = persistence_dir {
         let dir_path = std::path::Path::new(dir);
-        shard_databases.recover_graph_stores(dir_path);
-        shard_databases.replay_graph_wal(dir_path);
+        moon::shard::shared_databases::recover_graph_stores(&mut slice_inits, dir_path);
+        moon::shard::shared_databases::replay_graph_wal(
+            &mut slice_inits,
+            dir_path,
+            config.databases,
+        );
     }
 
     // Replay temporal WAL records (not gated on graph feature — temporal KV is core).
     if let Some(ref dir) = persistence_dir {
         let dir_path = std::path::Path::new(dir);
-        shard_databases.replay_temporal_wal(dir_path);
+        moon::shard::shared_databases::replay_temporal_wal(&mut slice_inits, dir_path);
     }
 
-    // Replay workspace WAL records (not gated on graph feature — workspaces are core).
+    // Replay workspace WAL records — uses shared registry, takes Arc<ShardDatabases>.
     if let Some(ref dir) = persistence_dir {
         let dir_path = std::path::Path::new(dir);
-        shard_databases.replay_workspace_wal(dir_path);
+        moon::shard::shared_databases::replay_workspace_wal(&shard_databases, dir_path);
     }
 
     // Replay MQ WAL records (cursor-rollback for durable queues).
     if let Some(ref dir) = persistence_dir {
         let dir_path = std::path::Path::new(dir);
-        shard_databases.replay_mq_wal(dir_path);
+        moon::shard::shared_databases::replay_mq_wal(&mut slice_inits, dir_path);
     }
 
     // All shards recovered — mark server as ready for /readyz.
@@ -1280,6 +1378,28 @@ fn main() -> anyhow::Result<()> {
             });
             consumers.push(admin_cons);
         }
+        // C4: Prepend AOF fold consumer for this shard (aof-writer-N -> shard SPSC).
+        // The consumer receives ShardMessage::AofFold pushed by the per-shard AOF
+        // writer thread; the shard event loop processes it between commands and
+        // replies with a frozen snapshot. Only wired for PerShard pools.
+        //
+        // PRIORITY: the fold consumer is inserted at index 0 (before command
+        // consumers) so that AofFold is never starved by MAX_DRAIN_PER_CYCLE.
+        // Under sustained write load the command consumer can saturate the
+        // 256-message drain cap every cycle, which would prevent the fold
+        // consumer (appended last) from ever being reached — the AofFold reply
+        // is never sent, the per-shard writer blocks on recv_blocking() forever,
+        // and all other shards' writers wait on await_outcome() indefinitely
+        // (permanent deadlock until SIGKILL). Putting the fold consumer first
+        // costs ≤ 2 extra try_pop calls per cycle (ring capacity is 4) and
+        // eliminates the starvation window.
+        if let Some(ref mut fold_cons_vec) = fold_consumers {
+            let fold_cons = std::mem::replace(&mut fold_cons_vec[id], {
+                use ringbuf::traits::Split;
+                ringbuf::HeapRb::new(1).split().1
+            });
+            consumers.insert(0, fold_cons);
+        }
         let conn_rx = mesh.take_conn_rx(id);
         let shard_cancel = cancel_token.clone();
         let shard_aof_pool = aof_pool.clone();
@@ -1299,6 +1419,8 @@ fn main() -> anyhow::Result<()> {
         let shard_pubsub_registries = all_pubsub_registries.clone();
         let shard_remote_sub_maps = all_remote_sub_maps.clone();
         let shard_affinity = affinity_tracker.clone();
+        // C1: hand the shard its ShardSlice initializer — consumed by init_shard inside run().
+        let shard_slice_init = slice_inits.remove(0);
 
         let handle = std::thread::Builder::new()
             .name(format!("shard-{}", id))
@@ -1340,6 +1462,7 @@ fn main() -> anyhow::Result<()> {
                             shard_pubsub_registries,
                             shard_remote_sub_maps,
                             shard_affinity,
+                            shard_slice_init,
                         )
                         .await;
                 });

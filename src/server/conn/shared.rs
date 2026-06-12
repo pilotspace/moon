@@ -50,21 +50,23 @@ pub(crate) type SharedDatabases = Arc<Vec<parking_lot::RwLock<Database>>>;
 pub(crate) fn resolve_ft_search_as_of_lsn(
     cmd_args: &[Frame],
     shard_databases: Option<&ShardDatabases>,
-    shard_id: usize,
     active_cross_txn: Option<&CrossStoreTxn>,
 ) -> Result<u64, Frame> {
     use crate::command::vector_search::ft_search::parse::parse_as_of_clause;
     const ERR_MSG: &[u8] =
         b"ERR no temporal snapshot registered for the given AS_OF timestamp; call TEMPORAL.SNAPSHOT_AT first";
     if let Some(wall_ms) = parse_as_of_clause(cmd_args) {
-        let Some(shard_dbs) = shard_databases else {
+        // `shard_databases` is `None` for the single-shard tokio handler, which
+        // has no ShardDatabases in scope. Presence/absence is the guard; the
+        // actual registry is accessed through the thread-local ShardSlice below.
+        if shard_databases.is_none() {
             return Err(Frame::Error(Bytes::from_static(ERR_MSG)));
-        };
-        let guard = shard_dbs.temporal_registry(shard_id);
-        return guard
-            .as_ref()
-            .and_then(|r| r.lsn_at(wall_ms))
-            .ok_or_else(|| Frame::Error(Bytes::from_static(ERR_MSG)));
+        }
+        // Read temporal registry via thread-local slice (no lock needed on shard path).
+        return crate::shard::slice::with_shard(|s| {
+            s.temporal_registry.as_ref().and_then(|r| r.lsn_at(wall_ms))
+        })
+        .ok_or_else(|| Frame::Error(Bytes::from_static(ERR_MSG)));
     }
     Ok(active_cross_txn.map(|t| t.snapshot_lsn).unwrap_or(0))
 }
@@ -189,14 +191,12 @@ pub(crate) fn execute_transaction(
 /// keys only. Cross-shard transactions require distributed coordination (future work).
 pub(crate) fn execute_transaction_sharded(
     shard_databases: &std::sync::Arc<crate::shard::shared_databases::ShardDatabases>,
-    shard_id: usize,
+    _shard_id: usize,
     command_queue: &[Frame],
     selected_db: usize,
     cached_clock: &CachedClock,
 ) -> Frame {
-    let mut guard = shard_databases.write_db(shard_id, selected_db);
     let db_count = shard_databases.db_count();
-    guard.refresh_now_from_cache(cached_clock);
 
     let mut results = Vec::with_capacity(command_queue.len());
     let mut selected = selected_db;
@@ -212,7 +212,10 @@ pub(crate) fn execute_transaction_sharded(
             }
         };
 
-        let result = dispatch(&mut guard, cmd, cmd_args, &mut selected, db_count);
+        let result = crate::shard::slice::with_shard_db(selected, |db| {
+            db.refresh_now_from_cache(cached_clock);
+            dispatch(db, cmd, cmd_args, &mut selected, db_count)
+        });
         let response = match result {
             DispatchResult::Response(f) => f,
             DispatchResult::Quit(f) => f,
@@ -221,13 +224,16 @@ pub(crate) fn execute_transaction_sharded(
         // Auto-index: if HSET succeeded, check for vector index match
         if cmd.eq_ignore_ascii_case(b"HSET") && !matches!(response, Frame::Error(_)) {
             if let Some(Frame::BulkString(key_bytes)) = cmd_args.first() {
-                let mut vs = shard_databases.vector_store(shard_id);
-                let mut ts = shard_databases.text_store(shard_id);
-                // Plan 166-01 return value is not consumed here — this is a
-                // non-txn-aware batch write path. Plan 166-02 wires txn paths.
-                let _ = crate::shard::spsc_handler::auto_index_hset_public(
-                    &mut vs, &mut *ts, key_bytes, cmd_args,
-                );
+                crate::shard::slice::with_shard(|s| {
+                    // Plan 166-01 return value is not consumed here — this is a
+                    // non-txn-aware batch write path. Plan 166-02 wires txn paths.
+                    let _ = crate::shard::spsc_handler::auto_index_hset_public(
+                        &mut s.vector_store,
+                        &mut s.text_store,
+                        key_bytes,
+                        cmd_args,
+                    );
+                });
             }
         }
 
@@ -416,13 +422,18 @@ mod as_of_tests {
 
     /// Build a 1-shard / 1-db `ShardDatabases` with a registered binding
     /// `wall_ms=1_000 -> lsn=42` so tests can exercise the registry path.
+    ///
+    /// Also initialises the thread-local `ShardSlice` (via `reset_test_shard`)
+    /// with the temporal registry pre-populated, so `with_shard` queries in
+    /// `resolve_ft_search_as_of_lsn` find the binding.
     fn build_fixture() -> Arc<ShardDatabases> {
-        let dbs = ShardDatabases::new(vec![vec![Database::new()]]);
-        {
-            let mut guard = dbs.temporal_registry(0);
-            let reg = guard.get_or_insert_with(|| Box::new(TemporalRegistry::new()));
-            reg.record(1_000, 42);
-        }
+        let (dbs, mut inits) = ShardDatabases::new(vec![vec![Database::new()]]);
+        let mut init = inits.remove(0);
+        // Pre-populate temporal registry on the ShardSliceInit before wiring it.
+        let mut reg = Box::new(TemporalRegistry::new());
+        reg.record(1_000, 42);
+        init.temporal_registry = Some(reg);
+        crate::shard::slice::reset_test_shard(crate::shard::slice::ShardSlice::new(init));
         dbs
     }
 
@@ -464,7 +475,7 @@ mod as_of_tests {
     fn resolve_ft_search_as_of_lsn_default_returns_zero() {
         let fixture = build_fixture();
         let args = ft_search_args(None);
-        let got = resolve_ft_search_as_of_lsn(&args, Some(&fixture), 0, None);
+        let got = resolve_ft_search_as_of_lsn(&args, Some(&fixture), None);
         assert_eq!(got, Ok(0));
     }
 
@@ -473,7 +484,7 @@ mod as_of_tests {
         let fixture = build_fixture();
         let args = ft_search_args(None);
         let txn = CrossStoreTxn::new(1, 99);
-        let got = resolve_ft_search_as_of_lsn(&args, Some(&fixture), 0, Some(&txn));
+        let got = resolve_ft_search_as_of_lsn(&args, Some(&fixture), Some(&txn));
         assert_eq!(got, Ok(99));
     }
 
@@ -482,7 +493,7 @@ mod as_of_tests {
         let fixture = build_fixture();
         let args = ft_search_args(Some(1_000));
         let txn = CrossStoreTxn::new(1, 99);
-        let got = resolve_ft_search_as_of_lsn(&args, Some(&fixture), 0, Some(&txn));
+        let got = resolve_ft_search_as_of_lsn(&args, Some(&fixture), Some(&txn));
         // Registry binding at wall_ms=1_000 is lsn=42, NOT txn.snapshot_lsn=99.
         assert_eq!(got, Ok(42));
     }
@@ -492,7 +503,7 @@ mod as_of_tests {
         let fixture = build_fixture();
         // wall_ms=500 precedes the only registered binding (1_000 -> 42).
         let args = ft_search_args(Some(500));
-        let got = resolve_ft_search_as_of_lsn(&args, Some(&fixture), 0, None);
+        let got = resolve_ft_search_as_of_lsn(&args, Some(&fixture), None);
         match got {
             Err(Frame::Error(msg)) => assert_eq!(msg.as_ref(), ERR_BYTES),
             other => panic!("expected Err(Frame::Error(ERR_BYTES)), got {other:?}"),
@@ -504,7 +515,7 @@ mod as_of_tests {
         // handler_single.rs has no ShardDatabases in scope -> Option::None.
         // AS_OF cannot be resolved without a registry; surface the same ERR.
         let args = ft_search_args(Some(1_000));
-        let got = resolve_ft_search_as_of_lsn(&args, None, 0, None);
+        let got = resolve_ft_search_as_of_lsn(&args, None, None);
         match got {
             Err(Frame::Error(msg)) => assert_eq!(msg.as_ref(), ERR_BYTES),
             other => panic!("expected Err(Frame::Error(ERR_BYTES)), got {other:?}"),

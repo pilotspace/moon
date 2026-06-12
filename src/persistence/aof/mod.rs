@@ -181,14 +181,25 @@ pub enum AofMessage {
     RewriteSharded(Arc<crate::shard::shared_databases::ShardDatabases>),
     /// [F6] Trigger a per-shard AOF rewrite (compaction) in the PerShard
     /// layout. Sent to EVERY per-shard writer at once. Each writer folds its
-    /// own shard (drain → lock → snapshot → write new base+incr at the
-    /// coordinator's `new_seq` → reopen), then decrements the shared
+    /// own shard (drain → AofFold SPSC → snapshot → write new base+incr at
+    /// the coordinator's `new_seq` → reopen), then decrements the shared
     /// `PerShardRewriteCoord`; the last writer commits the manifest once
     /// (single seq flip) and prunes the old generation. The synchronized seq
     /// + single commit are what make multi-shard BGREWRITEAOF crash-safe.
+    ///
+    /// `fold_producer` / `fold_notifier` are per-shard SPSC handles used for
+    /// the C4 cooperative snapshot (ShardMessage::AofFold).  Each writer
+    /// receives the producer/notifier for ITS own shard only.
     RewritePerShard {
         shard_dbs: Arc<crate::shard::shared_databases::ShardDatabases>,
         coord: Arc<PerShardRewriteCoord>,
+        /// SPSC producer into this shard's event-loop ring buffer.
+        /// Wrapped in `Mutex` so the AOF writer thread (not the shard thread)
+        /// can push the AofFold message safely.
+        fold_producer:
+            Arc<parking_lot::Mutex<ringbuf::HeapProd<crate::shard::dispatch::ShardMessage>>>,
+        /// Notifier that wakes the shard event loop after an SPSC push.
+        fold_notifier: Arc<crate::runtime::channel::Notify>,
     },
     /// Shut down the AOF writer task gracefully.
     Shutdown,

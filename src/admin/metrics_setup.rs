@@ -1391,41 +1391,31 @@ pub fn spawn_moon_memory_publisher() {
 /// Collect per-subsystem resident bytes and emit all 7
 /// `moon_memory_bytes{kind=...}` series plus `moon_rss_bytes`.
 ///
-/// Called every 15 s by `spawn_moon_memory_publisher`. Allocation-free in
-/// the steady state — all label values are `&'static str`.
+/// Called every 15 s by `spawn_moon_memory_publisher`. Lock-free: reads from
+/// per-shard published atomics (C5 / M4). Figures lag at most one 100ms tick.
 fn update_moon_memory_bytes() {
+    use std::sync::atomic::Ordering;
+
     let rss = get_rss_bytes() as usize;
 
     let mut dashtable: usize = 0;
     let mut hnsw: usize = 0;
-    let mut sealed: usize = 0;
-    #[cfg_attr(not(feature = "graph"), allow(unused_mut))]
+    let sealed: usize = 0; // combined into hnsw from vector atomic (C5)
     let mut csr: usize = 0;
     let wal: usize = 0; // WalWriterV3 is stack-owned; not reachable here
     let mut backlog: usize = 0;
 
     if let Some(shard_dbs) = get_global_shard_databases() {
-        let num_shards = shard_dbs.num_shards();
-        for shard_id in 0..num_shards {
-            // Database + DashTable (DB 0 — the hot database)
-            let db_guard = shard_dbs.read_db(shard_id, 0);
-            dashtable += db_guard.resident_bytes();
-            dashtable += db_guard.data().resident_bytes();
-            drop(db_guard);
+        // KV memory: sum of per-shard published atomics. Lock-free.
+        // C5 / M4: `read_memory_sum()` replaces per-shard `read_db(…)` locks.
+        dashtable = shard_dbs.read_memory_sum();
 
-            // VectorStore: (mutable/hnsw, immutable/sealed)
-            let vs = shard_dbs.vector_store(shard_id);
-            let (m, i) = vs.resident_bytes();
-            hnsw += m;
-            sealed += i;
-            drop(vs);
-
-            // GraphStore (CSR)
-            #[cfg(feature = "graph")]
-            {
-                let gs = shard_dbs.graph_store_read(shard_id);
-                csr += gs.resident_bytes();
-            }
+        // Store memory: sum published per-shard vector/graph atomics.
+        // Values are refreshed by each shard's 100ms tick (publish_store_memory).
+        for mem in shard_dbs.store_memory_per_shard.iter() {
+            hnsw += mem.vector.load(Ordering::Relaxed);
+            // graph is cfg-gated at publish time; the atomic is always present.
+            csr += mem.graph.load(Ordering::Relaxed);
         }
     }
 

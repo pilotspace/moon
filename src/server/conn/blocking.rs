@@ -97,7 +97,7 @@ pub(crate) async fn handle_blocking_command(
     cmd: &[u8],
     args: &[Frame],
     selected_db: usize,
-    shard_databases: &std::sync::Arc<ShardDatabases>,
+    _shard_databases: &std::sync::Arc<ShardDatabases>,
     blocking_registry: &Rc<RefCell<crate::blocking::BlockingRegistry>>,
     shard_id: usize,
     num_shards: usize,
@@ -120,14 +120,20 @@ pub(crate) async fn handle_blocking_command(
 
     // --- Non-blocking fast path: try to get data immediately ---
     {
-        let mut guard = shard_databases.write_db(shard_id, selected_db);
-        for key in &keys {
-            let result = try_immediate_pop(cmd, &mut guard, key, args);
-            if let Some(frame) = result {
-                return frame;
+        // Check immediate availability via the thread-local slice.
+        let maybe_frame = crate::shard::slice::with_shard_db(selected_db, |db| {
+            for key in &keys {
+                let result = try_immediate_pop(cmd, db, key, args);
+                if result.is_some() {
+                    return result;
+                }
             }
+            None
+        });
+        if let Some(frame) = maybe_frame {
+            return frame;
         }
-        drop(guard); // CRITICAL before await
+        // Borrow released at with_shard_db boundary — safe before await.
     }
 
     let deadline = if timeout_secs > 0.0 {
@@ -331,7 +337,7 @@ pub(crate) async fn handle_blocking_command_monoio(
     cmd: &[u8],
     args: &[Frame],
     selected_db: usize,
-    shard_databases: &std::sync::Arc<ShardDatabases>,
+    _shard_databases: &std::sync::Arc<ShardDatabases>,
     blocking_registry: &Rc<RefCell<crate::blocking::BlockingRegistry>>,
     shard_id: usize,
     num_shards: usize,
@@ -354,15 +360,19 @@ pub(crate) async fn handle_blocking_command_monoio(
     };
 
     // --- Non-blocking fast path: try to get data immediately ---
+    // Use with_shard_db (thread-local ShardSlice) — no RwLock guard needed.
     {
-        let mut guard = shard_databases.write_db(shard_id, selected_db);
-        for key in &keys {
-            let result = try_immediate_pop(cmd, &mut guard, key, args);
-            if let Some(frame) = result {
-                return frame;
+        let immediate_result = crate::shard::slice::with_shard_db(selected_db, |db| {
+            for key in &keys {
+                if let Some(frame) = try_immediate_pop(cmd, db, key, args) {
+                    return Some(frame);
+                }
             }
+            None
+        });
+        if let Some(frame) = immediate_result {
+            return frame;
         }
-        drop(guard); // CRITICAL before await
     }
 
     let deadline = if timeout_secs > 0.0 {
@@ -1250,32 +1260,42 @@ pub(crate) fn try_inline_dispatch(
         // proven safe just above.
         let consumed = key_end_crlf;
         let key_bytes = &buf[key_start..key_end];
-        let guard = shard_databases.read_db(shard_id, selected_db);
-        // Hot-key sampling: the inline path bypasses both dispatchers, so it
-        // must feed the sketch itself. tick() is one relaxed fetch_add.
-        if guard.hot_keys().tick() {
-            guard.hot_keys().observe(key_bytes);
+        // Hot-key sampling + lookup via thread-local slice — no lock needed.
+        enum GetResult {
+            Found(Vec<u8>),
+            WrongType,
+            Miss,
         }
-        match guard.get_if_alive(key_bytes, now_ms) {
-            Some(entry) => match entry.value.as_bytes() {
-                Some(val) => {
-                    write_buf.extend_from_slice(b"$");
-                    let mut itoa_buf = itoa::Buffer::new();
-                    write_buf.extend_from_slice(itoa_buf.format(val.len()).as_bytes());
-                    write_buf.extend_from_slice(b"\r\n");
-                    write_buf.extend_from_slice(val);
-                    write_buf.extend_from_slice(b"\r\n");
-                }
+        let (inline_result, cold_loc) = crate::shard::slice::with_shard_db(selected_db, |db| {
+            if db.hot_keys().tick() {
+                db.hot_keys().observe(key_bytes);
+            }
+            match db.get_if_alive(key_bytes, now_ms) {
+                Some(entry) => match entry.value.as_bytes() {
+                    Some(val) => (GetResult::Found(val.to_vec()), None),
+                    None => (GetResult::WrongType, None),
+                },
                 None => {
-                    write_buf.extend_from_slice(
-                        b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
-                    );
+                    let loc = db.cold_lookup_location(key_bytes);
+                    (GetResult::Miss, loc)
                 }
-            },
-            None => {
-                // Cold storage fallback
-                let cold_loc = guard.cold_lookup_location(key_bytes);
-                drop(guard);
+            }
+        });
+        match inline_result {
+            GetResult::Found(val) => {
+                write_buf.extend_from_slice(b"$");
+                let mut itoa_buf = itoa::Buffer::new();
+                write_buf.extend_from_slice(itoa_buf.format(val.len()).as_bytes());
+                write_buf.extend_from_slice(b"\r\n");
+                write_buf.extend_from_slice(&val);
+                write_buf.extend_from_slice(b"\r\n");
+            }
+            GetResult::WrongType => {
+                write_buf.extend_from_slice(
+                    b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
+                );
+            }
+            GetResult::Miss => {
                 let cold = cold_loc.and_then(|(loc, shard_dir)| {
                     crate::storage::tiered::cold_read::read_cold_entry_at(&shard_dir, loc, now_ms)
                 });
@@ -1299,7 +1319,6 @@ pub(crate) fn try_inline_dispatch(
                 return 1;
             }
         }
-        drop(guard);
         let _ = read_buf.split_to(consumed);
         return 1;
     }
@@ -1348,29 +1367,31 @@ pub(crate) fn try_inline_dispatch(
     // We must not index into `buf` after this point — use `frozen` instead.
     let frozen = read_buf.split_to(consumed).freeze();
 
-    // Eviction check + write under exclusive lock
+    // Eviction check + write via the thread-local slice (no lock needed).
     {
         let rt = runtime_config.read();
-        let mut guard = shard_databases.write_db(shard_id, selected_db);
         let budget = shard_databases.elastic_budget(shard_id);
-        if crate::storage::eviction::try_evict_if_needed_budget(&mut guard, &rt, budget).is_err() {
+        let oom = crate::shard::slice::with_shard_db(selected_db, |db| {
+            crate::storage::eviction::try_evict_if_needed_budget(db, &rt, budget).is_err()
+        });
+        drop(rt);
+        if oom {
             write_buf
                 .extend_from_slice(b"-OOM command not allowed when used memory > 'maxmemory'\r\n");
             return 1;
         }
-        drop(rt);
 
         let key = frozen.slice(key_start..key_end);
         let value = frozen.slice(val_start..val_end);
-        // Hot-key sampling: the inline path bypasses both dispatchers, so it
-        // must feed the sketch itself. tick() is one relaxed fetch_add.
-        if guard.hot_keys().tick() {
-            guard.hot_keys().observe(&key);
-        }
-        let mut entry = crate::storage::entry::Entry::new_string(value);
-        entry.set_last_access(guard.now());
-        entry.set_access_counter(5);
-        guard.set(key, entry);
+        crate::shard::slice::with_shard_db(selected_db, |db| {
+            if db.hot_keys().tick() {
+                db.hot_keys().observe(&key);
+            }
+            let mut entry = crate::storage::entry::Entry::new_string(value.clone());
+            entry.set_last_access(db.now());
+            entry.set_access_counter(5);
+            db.set(key.clone(), entry);
+        });
     }
 
     // AOF: reuse the frozen RESP bytes directly (Arc clone, zero-copy).

@@ -192,6 +192,38 @@ pub fn create_admin_channels(
     (producers, consumers)
 }
 
+/// Create N SPSC channels for the AOF fold cooperative snapshot protocol (C4).
+///
+/// Returns `(producers, consumers)` where:
+/// - `producers[i]` is the SPSC producer into shard `i`'s event-loop ring,
+///   wrapped in `Arc<Mutex>` so the AOF writer thread (not the shard thread)
+///   can push `ShardMessage::AofFold` safely.
+/// - `consumers[i]` is the matching consumer, to be merged into shard `i`'s
+///   consumers vec before `shard.run()` is called (same merge pattern as admin
+///   channels — see `create_admin_channels`).
+///
+/// `capacity` of 4 is sufficient: only one `AofFold` can be in flight per
+/// shard at a time (the writer blocks on the reply before issuing another), so
+/// the ring never holds more than 1 entry in practice; 4 provides headroom for
+/// any transient burst.
+pub fn create_aof_fold_channels(
+    num_shards: usize,
+    capacity: usize,
+) -> (
+    Vec<Arc<parking_lot::Mutex<HeapProd<ShardMessage>>>>,
+    Vec<HeapCons<ShardMessage>>,
+) {
+    let mut producers = Vec::with_capacity(num_shards);
+    let mut consumers = Vec::with_capacity(num_shards);
+    for _ in 0..num_shards {
+        let rb = HeapRb::new(capacity);
+        let (prod, cons) = rb.split();
+        producers.push(Arc::new(parking_lot::Mutex::new(prod)));
+        consumers.push(cons);
+    }
+    (producers, consumers)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -254,6 +254,14 @@ fn replay_incr_framed(
             break;
         }
 
+        // H1-BARRIER defense-in-depth: a zero-length record carries no RESP
+        // command (the writer skips barrier records entirely, but tolerate one
+        // if it ever lands on disk) — skip it rather than reject the file.
+        if len == 0 {
+            offset = payload_end;
+            continue;
+        }
+
         // Strip the OrderedAcrossShards flag to recover the true LSN.
         let is_ordered = raw_lsn & crate::persistence::aof::ORDERED_LSN_FLAG != 0;
         let lsn = raw_lsn & !crate::persistence::aof::ORDERED_LSN_FLAG;
@@ -774,6 +782,27 @@ mod tests {
             max_lsn, expected_next_free,
             "max_lsn must be the next-free offset (entry end), not the last start LSN"
         );
+    }
+
+    #[test]
+    fn replay_incr_framed_skips_zero_length_barrier_record() {
+        // H1-BARRIER defense-in-depth: a len=0 record (an fsync barrier that
+        // leaked to disk) carries no RESP command. Replay must SKIP it and
+        // continue — not reject the file as corrupt, which would brick boot.
+        let mut bytes = frame_entry(7, b"*1\r\n$4\r\nPING\r\n");
+        bytes.extend_from_slice(&frame_entry(0, b"")); // barrier: lsn=0, len=0
+        bytes.extend_from_slice(&frame_entry(21, b"*1\r\n$6\r\nDBSIZE\r\n"));
+
+        let mut dbs: Vec<crate::storage::Database> = vec![crate::storage::Database::new()];
+        let engine = RecordingEngine::new();
+        let mut ordered: Vec<OrderedEntry> = Vec::new();
+        let (count, max_lsn) = replay_incr_framed(0, &mut dbs, &bytes, &engine, &mut ordered)
+            .expect("zero-length record must not be treated as corruption");
+
+        assert_eq!(count, 2, "both real commands replay; barrier is skipped");
+        assert_eq!(max_lsn, 37, "next-free offset = 21 + 16");
+        let calls = engine.calls.borrow();
+        assert_eq!(&*calls, &["PING".to_string(), "DBSIZE".to_string()]);
     }
 
     #[test]

@@ -63,6 +63,7 @@ pub async fn scatter_hybrid_search(
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
     spsc_notifiers: &[Arc<channel::Notify>],
 ) -> Frame {
+    let _ = shard_databases; // E2 removes
     let top_k = query.top_k;
     let k_per_stream = query.effective_k_per_stream();
 
@@ -73,26 +74,14 @@ pub async fn scatter_hybrid_search(
         // Phase 171 HYB-02 / SCAT-02: thread coordinator-resolved AS_OF LSN
         // through the single-shard fast path so callers routed here still
         // honor temporal snapshots.
-        // Phase 2e: gate on is_initialized(); new path acquires vector_store
-        // and text_store via a single `with_shard` closure to avoid reentrant
-        // RefCell double-borrow panics.
-        return if crate::shard::slice::is_initialized() {
-            crate::shard::slice::with_shard(|s| {
-                crate::command::vector_search::hybrid::execute_hybrid_search_local(
-                    &mut s.vector_store,
-                    &s.text_store,
-                    &query,
-                    as_of_lsn,
-                )
-            })
-        } else {
-            let mut vs = shard_databases.vector_store(my_shard);
-            let ts = shard_databases.text_store(my_shard);
+        return crate::shard::slice::with_shard(|s| {
             crate::command::vector_search::hybrid::execute_hybrid_search_local(
-                &mut vs, &ts, &query, as_of_lsn,
+                &mut s.vector_store,
+                &s.text_store,
+                &query,
+                as_of_lsn,
             )
-            // guards drop at end of this block
-        };
+        });
     }
 
     // ─── Parse text query into QueryTerms using the index's own analyzer ───
@@ -105,38 +94,10 @@ pub async fn scatter_hybrid_search(
         ),
         Frame,
     >;
-    // Phase 2e: gate on is_initialized(); inner closure parses against the
-    // owned text_store. Both branches return a fully-owned ParseOutcome so
+    // Both branches return a fully-owned ParseOutcome so
     // no borrows of the shard slice escape.
-    let parse_outcome: ParseOutcome = if crate::shard::slice::is_initialized() {
-        crate::shard::slice::with_shard(|s| {
-            match s.text_store.get_index(query.index_name.as_ref()) {
-                None => Err(Frame::Error(Bytes::from_static(b"ERR unknown index"))),
-                Some(text_index) => match text_index.field_analyzers.first() {
-                    None => Err(Frame::Error(Bytes::from_static(
-                        b"ERR index has no TEXT fields",
-                    ))),
-                    Some(analyzer) => {
-                        match crate::command::vector_search::parse_text_query(text_bytes, analyzer)
-                        {
-                            Ok(clause) => {
-                                let strings: Vec<String> =
-                                    clause.terms.iter().map(|qt| qt.text.clone()).collect();
-                                Ok((clause.terms, strings))
-                            }
-                            Err(e) => {
-                                let mut msg = b"ERR ".to_vec();
-                                msg.extend_from_slice(e.as_bytes());
-                                Err(Frame::Error(Bytes::from(msg)))
-                            }
-                        }
-                    }
-                },
-            }
-        })
-    } else {
-        let ts = shard_databases.text_store(my_shard);
-        match ts.get_index(query.index_name.as_ref()) {
+    let parse_outcome: ParseOutcome = crate::shard::slice::with_shard(|s| {
+        match s.text_store.get_index(query.index_name.as_ref()) {
             None => Err(Frame::Error(Bytes::from_static(b"ERR unknown index"))),
             Some(text_index) => match text_index.field_analyzers.first() {
                 None => Err(Frame::Error(Bytes::from_static(
@@ -158,7 +119,7 @@ pub async fn scatter_hybrid_search(
                 }
             },
         }
-    }; // MutexGuard dropped here — no .await held
+    }); // shard slice released here — borrow released before first async op
     let (query_terms, term_strings) = match parse_outcome {
         Ok(v) => v,
         Err(f) => return f,
@@ -174,33 +135,9 @@ pub async fn scatter_hybrid_search(
         if shard_id == my_shard {
             // Local DFS — direct read, no SPSC overhead. Drop guard before .await.
             //
-            // Phase 2e: gate on is_initialized(); both branches build the
-            // same owned Frame result. The new path borrows `text_store`
-            // exclusively from the slice — no other companion store is
-            // accessed in this branch, so a one-store `with_shard` suffices.
-            let response = if crate::shard::slice::is_initialized() {
-                crate::shard::slice::with_shard(|s| {
-                    match s.text_store.get_index(query.index_name.as_ref()) {
-                        Some(text_index) => {
-                            let mut items: Vec<Frame> = Vec::new();
-                            for (field_idx_opt, terms) in &field_queries {
-                                let fidx = field_idx_opt.unwrap_or(0);
-                                let (term_dfs, n) = text_index.doc_freq_for_terms(fidx, terms);
-                                for (term, df) in term_dfs {
-                                    items.push(Frame::BulkString(Bytes::from(term)));
-                                    items.push(Frame::Integer(i64::from(df)));
-                                }
-                                items.push(Frame::BulkString(Bytes::from_static(b"N")));
-                                items.push(Frame::Integer(i64::from(n)));
-                            }
-                            Frame::Array(FrameVec::from(items))
-                        }
-                        None => Frame::Error(Bytes::from_static(b"ERR unknown index")),
-                    }
-                })
-            } else {
-                let ts = shard_databases.text_store(shard_id);
-                match ts.get_index(query.index_name.as_ref()) {
+            // Local DFS via slice — text_store accessed exclusively in the closure.
+            let response = crate::shard::slice::with_shard(|s| {
+                match s.text_store.get_index(query.index_name.as_ref()) {
                     Some(text_index) => {
                         let mut items: Vec<Frame> = Vec::new();
                         for (field_idx_opt, terms) in &field_queries {
@@ -217,7 +154,7 @@ pub async fn scatter_hybrid_search(
                     }
                     None => Frame::Error(Bytes::from_static(b"ERR unknown index")),
                 }
-            }; // text_guard drops here
+            }); // shard slice released here
             local_dfs = Some(response);
         } else {
             let (reply_tx, reply_rx) = channel::oneshot();
@@ -256,43 +193,20 @@ pub async fn scatter_hybrid_search(
 
     for shard_id in 0..num_shards {
         if shard_id == my_shard {
-            // Phase 2e: gate on is_initialized(); new path holds vector_store
-            // + text_store through ONE `with_shard` closure to avoid reentrant
-            // RefCell double-borrow panics.
+            // vector_store + text_store acquired in one with_shard closure to
+            // avoid reentrant RefCell double-borrow panics.
             let sparse_pair = match (sparse_field.as_ref(), sparse_blob.as_ref()) {
                 (Some(f), Some(b)) => Some((f, b)),
                 _ => None,
             };
-            let response = if crate::shard::slice::is_initialized() {
-                crate::shard::slice::with_shard(|s| {
-                    // Phase 171 HYB-02 / SCAT-02: forward as_of_lsn through the
-                    // local raw-streams executor (symmetric with remote payload).
-                    crate::command::vector_search::hybrid_multi::execute_hybrid_search_local_raw_streams(
-                        &mut s.vector_store,
-                        &s.text_store,
-                        &query.index_name,
-                        &query_terms,
-                        &query.dense_field,
-                        &query.dense_blob,
-                        sparse_pair,
-                        query.weights,
-                        k_per_stream,
-                        top_k,
-                        &global_df,
-                        global_n,
-                        as_of_lsn,
-                        query.filter.as_ref(),
-                    )
-                })
-            } else {
-                let mut vs = shard_databases.vector_store(shard_id);
-                let ts = shard_databases.text_store(shard_id);
-                // Phase 171 HYB-02 / SCAT-02: forward as_of_lsn to the local
-                // raw-streams executor so the coordinator's own shard honors
-                // AS_OF on the dense branch (symmetric with remote payload below).
+            // Phase 171 HYB-02 / SCAT-02: forward as_of_lsn through the
+            // local raw-streams executor (symmetric with remote payload).
+            // CHANGE F: clone filter for local path (shard-local allowlist eval).
+            let filter_clone = query.filter.clone();
+            let response = crate::shard::slice::with_shard(|s| {
                 crate::command::vector_search::hybrid_multi::execute_hybrid_search_local_raw_streams(
-                    &mut vs,
-                    &ts,
+                    &mut s.vector_store,
+                    &s.text_store,
                     &query.index_name,
                     &query_terms,
                     &query.dense_field,
@@ -304,10 +218,9 @@ pub async fn scatter_hybrid_search(
                     &global_df,
                     global_n,
                     as_of_lsn,
-                    query.filter.as_ref(),
+                    filter_clone.as_ref(),
                 )
-                // guards drop here
-            };
+            });
             local_hyb = Some(response);
         } else {
             let (reply_tx, reply_rx) = channel::oneshot();
@@ -324,6 +237,7 @@ pub async fn scatter_hybrid_search(
                 global_df: global_df.clone(),
                 global_n,
                 as_of_lsn,
+                // CHANGE F: forward filter to remote shard payload.
                 filter: query.filter.clone(),
                 reply_tx,
             };

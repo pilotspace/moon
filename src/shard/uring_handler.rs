@@ -81,7 +81,9 @@ pub(crate) fn handle_uring_event(
     event: IoEvent,
     driver: &mut UringDriver,
     shard_databases: &Arc<ShardDatabases>,
-    shard_id: usize,
+    // Unused since the ShardSlice cutover: this handler runs on the shard's
+    // own thread, so the thread-local slice (with_shard_db) IS this shard.
+    _shard_id: usize,
     parse_bufs: &mut std::collections::HashMap<u32, bytes::BytesMut>,
     inflight_sends: &mut std::collections::HashMap<u32, std::collections::VecDeque<InFlightSend>>,
     uring_listener_fd: Option<std::os::fd::RawFd>,
@@ -133,15 +135,21 @@ pub(crate) fn handle_uring_event(
                 return;
             }
 
-            // Phase B: Dispatch all commands under a single write lock.
-            let responses: Vec<crate::protocol::Frame> = {
-                let mut guard = shard_databases.write_db(shard_id, 0);
-                let db_count = shard_databases.db_count();
-                guard.refresh_now_from_cache(cached_clock);
-                let mut selected = 0usize;
-                let result: Vec<_> = batch
-                    .iter()
-                    .map(|frame| {
+            // Phase B: Dispatch all commands inside a single ShardSlice borrow.
+            // This handler runs synchronously ON the shard thread, so the
+            // thread-local slice borrow replaces the old per-batch write lock
+            // (shardslice-migration C6). The workspace-registry Mutex and
+            // wal_append channel sends inside the closure are independent of
+            // the slice borrow — no re-entrancy, no await.
+            let db_count = shard_databases.db_count();
+            let responses: Vec<crate::protocol::Frame> = crate::shard::slice::with_shard_db(
+                0,
+                |db| {
+                    db.refresh_now_from_cache(cached_clock);
+                    let mut selected = 0usize;
+                    batch
+                        .iter()
+                        .map(|frame| {
                         let (cmd, args) = match extract_command_static(frame) {
                             Some(pair) => pair,
                             None => {
@@ -276,16 +284,15 @@ pub(crate) fn handle_uring_event(
                             ));
                         }
 
-                        let result = cmd_dispatch(&mut guard, cmd, args, &mut selected, db_count);
-                        match result {
-                            DispatchResult::Response(f) => f,
-                            DispatchResult::Quit(f) => f,
-                        }
-                    })
-                    .collect();
-                drop(guard);
-                result
-            };
+                            let result = cmd_dispatch(db, cmd, args, &mut selected, db_count);
+                            match result {
+                                DispatchResult::Response(f) => f,
+                                DispatchResult::Quit(f) => f,
+                            }
+                        })
+                        .collect()
+                },
+            );
 
             // Phase C: Serialize and send all responses (outside borrow).
             for response in responses {

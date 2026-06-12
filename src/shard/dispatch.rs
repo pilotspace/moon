@@ -236,9 +236,11 @@ pub struct FtHybridPayload {
     /// Non-zero values are forwarded to the dense KNN stream for MVCC filtering.
     /// BM25 stream remains AS_OF-unaware until text-index MVCC ships (v0.2).
     pub as_of_lsn: u64,
-    /// CHANGE F — per-shard filter forwarded to the raw-streams executor so the
-    /// allowlist is computed from the shard-local text index and applied to all
-    /// three streams BEFORE coordinator RRF fusion. `None` ⇒ unfiltered.
+    /// CHANGE F: optional pre-RRF filter tree forwarded from the coordinator's
+    /// `HybridQuery.filter`. The per-shard executor (`execute_hybrid_search_local_raw_streams`)
+    /// evaluates it against its OWN shard-local `text_index` (doc_ids are
+    /// shard-local — the allowlist CANNOT be computed at the coordinator).
+    /// `None` → unfiltered (backward compat).
     pub filter: Option<crate::command::vector_search::hybrid::HybridFilter>,
     pub reply_tx: channel::OneshotSender<Frame>,
 }
@@ -592,8 +594,108 @@ pub enum ShardMessage {
         b: usize,
         reply_tx: channel::OneshotSender<()>,
     },
+    /// MQ domain hop (C2, shardslice-migration Wave A1).
+    ///
+    /// The connection handler computes `owner = key_to_shard(effective_queue_key)`
+    /// and sends this message to the owning shard. The owner executes the full
+    /// MQ.* arm (durable flag, DLQ stream creation on max-delivery exhaustion,
+    /// trigger debounce, WAL records) against its ShardSlice — mirroring the
+    /// GraphCommand precedent. All six subcommands (CREATE/PUSH/POP/ACK/
+    /// DLQLEN/TRIGGER) are dispatched via `mq_exec::execute_mq_on_owner`.
+    ///
+    /// Boxed because the inline payload (4 fields: usize + Bytes + Arc<Frame> +
+    /// OneshotSender) totals ~48 B, which would push the enum past the 64-byte
+    /// (1 cache-line) cap when combined with the discriminant and alignment
+    /// padding. Boxing keeps this variant at 8 B (pointer only).
+    MqCommand(Box<MqCommandPayload>),
+    /// TXN.COMMIT MQ-intent materialize hop (C2, shardslice-migration Wave A1).
+    ///
+    /// The TXN.COMMIT path groups `txn.mq_intents` by owner shard and sends one
+    /// `MqTxnMaterialize` per owning shard. The owner applies the fold
+    /// `get_stream_mut → durable-check → next_auto_id → add` exactly as
+    /// txn.rs:160–167 does today, then replies `()` to unblock the coordinator.
+    ///
+    /// Inline: `usize(8) + Vec(24) + OneshotSender(8)` = 40 B — fits within
+    /// the 64-byte cap even after discriminant + alignment.
+    MqTxnMaterialize {
+        db_index: usize,
+        intents: Vec<crate::transaction::MqIntent>,
+        reply_tx: channel::OneshotSender<()>,
+    },
+    /// WS.DROP best-effort key cleanup hop (C2, shardslice-migration Wave A1).
+    ///
+    /// `prefix` = `"{<wsid-hex>}:"`. The connection handler computes
+    /// `owner = key_to_shard(prefix)` and sends this to the owning shard
+    /// (the hash-tag in the prefix guarantees co-location). The owner scans
+    /// db 0, removes every key starting with `prefix`, and replies with the
+    /// deleted count (logged by the caller; not surfaced to the client).
+    ///
+    /// Inline: `Bytes(16) + OneshotSender(8)` = 24 B — comfortably within the cap.
+    WsDropCleanup {
+        prefix: Bytes,
+        reply_tx: channel::OneshotSender<u64>,
+    },
+    /// AOF cooperative-snapshot hop (C2/C4, shardslice-migration Wave A1).
+    ///
+    /// The AOF rewrite writer pushes this message into the shard's external
+    /// mesh producer and blocks on the oneshot reply. The shard event loop
+    /// processes it atomically between commands: it builds an expired-filtered
+    /// snapshot of ALL its dbs (same fold as `do_rewrite_per_shard` phase 4)
+    /// and replies with the frozen view. The writer thread never touches the
+    /// shard's state directly.
+    ///
+    /// Inline: `OneshotSender(8)` — smallest possible inline payload.
+    AofFold {
+        reply_tx: channel::OneshotSender<AofFoldSnapshot>,
+    },
     /// Graceful shutdown signal.
     Shutdown,
+}
+
+/// Payload for [`ShardMessage::MqCommand`].
+///
+/// Boxed via `Box<MqCommandPayload>` in the enum variant to keep `ShardMessage`
+/// within the 64-byte (1 cache-line) cap.
+pub struct MqCommandPayload {
+    /// Target database index (from the connection's `selected_db`).
+    pub db_index: usize,
+    /// Workspace prefix (`"{wsid}:"` when the connection is WS-bound, empty
+    /// otherwise). The owner derives effective keys via
+    /// `workspace_key(key_prefix, raw_key)`, identical to the inline arm.
+    pub key_prefix: Bytes,
+    /// Full original MQ.* frame (CREATE/PUSH/POP/ACK/DLQLEN/TRIGGER).
+    /// Wrapped in `Arc` to avoid deep-cloning on dispatch.
+    pub command: std::sync::Arc<crate::protocol::Frame>,
+    /// Oneshot channel: owner sends the response `Frame` back to the caller.
+    pub reply_tx: channel::OneshotSender<crate::protocol::Frame>,
+}
+
+/// Snapshot payload for [`ShardMessage::AofFold`].
+///
+/// Produced by the shard thread and consumed by the AOF rewrite writer thread.
+/// Shape mirrors the per-shard snapshot that `do_rewrite_per_shard` phase 4
+/// builds today: `(entries, base_timestamp)` per db index. The writer feeds
+/// this directly to `rdb::save_snapshot_to_bytes` unchanged.
+pub struct AofFoldSnapshot {
+    /// One element per db: `(live_entries, base_timestamp)`.
+    /// Entries are pre-filtered — expired entries (per `is_expired_at`) are
+    /// excluded at snapshot time by the shard thread.
+    pub dbs: Vec<(
+        Vec<(
+            crate::storage::compact_key::CompactKey,
+            crate::storage::entry::Entry,
+        )>,
+        u32,
+    )>,
+    /// Number of messages in the AOF channel at the instant the shard read
+    /// this value — BEFORE building the snapshot and BEFORE sending this reply.
+    ///
+    /// Because the shard event loop is single-threaded, no new commands execute
+    /// between this read and the snapshot reply being sent. Therefore ALL of
+    /// these messages are pre-snapshot appends. The AOF writer uses this as the
+    /// bound for its phase-3 mid-drain, preventing an infinite drain loop under
+    /// sustained high write load (where the channel never empties on its own).
+    pub pending_aof_count: usize,
 }
 
 // ShardMessage is Send because all fields are Send. The raw pointer in

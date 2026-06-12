@@ -318,7 +318,7 @@ impl DrainOutcome {
 /// durability ordering (ack strictly AFTER the bytes are durable) for every
 /// `do_rewrite_*` drain site.
 #[cfg(any(feature = "runtime-monoio", feature = "runtime-tokio"))]
-fn sync_and_fulfill_drain(
+pub(crate) fn sync_and_fulfill_drain(
     outcome: &mut DrainOutcome,
     file: &mut std::fs::File,
     incr_path: PathBuf,
@@ -342,70 +342,91 @@ fn sync_and_fulfill_drain(
     }
 }
 
+/// Bounded variant of [`drain_pending_appends`]: drain at most `max_drain`
+/// messages (RAW RESP, no framing).  Pass [`usize::MAX`] for unbounded.
+///
+/// The TopLevel fold's phase-3 mid-drain passes `pending_aof_count` as the
+/// bound (C4-DRAIN-BOUND): draining more would consume post-snapshot appends
+/// that belong in the NEW incr, and those bytes would then be lost when
+/// `manifest.advance()` deletes the old incr at the end of the fold.
 #[cfg(feature = "runtime-monoio")]
-pub(crate) fn drain_pending_appends(
+pub(crate) fn drain_pending_appends_bounded(
     rx: &channel::MpscReceiver<AofMessage>,
     file: &mut std::fs::File,
+    max_drain: usize,
 ) -> Result<DrainOutcome, MoonError> {
     use std::io::Write;
     let mut outcome = DrainOutcome::default();
-    while let Ok(msg) = rx.try_recv() {
-        match msg {
-            // BGREWRITEAOF drain runs on the TopLevel writer (monoio) only;
-            // PerShard rewrite is RFC step 6. Legacy v1 disk format → ignore lsn.
-            AofMessage::Append {
-                bytes: data,
-                lsn: _,
-            } => {
-                file.write_all(&data).map_err(|e| AofError::Io {
-                    path: PathBuf::from("<aof incr drain>"),
-                    source: e,
-                })?;
-                outcome.drained += 1;
-            }
-            // AppendSync during a rewrite drain: bytes are written and counted,
-            // but the ack is PARKED until the caller's post-drain boundary fsync
-            // (issue #140) — acking `Synced` here would report durability before
-            // the bytes are fsynced. If the write itself fails the `?` propagates
-            // the error and the parked ack is dropped with the outcome — the
-            // caller observes `RecvError`, which it treats as failure.
-            AofMessage::AppendSync {
-                bytes: data,
-                lsn: _,
-                ack,
-            } => {
-                file.write_all(&data).map_err(|e| AofError::Io {
-                    path: PathBuf::from("<aof incr drain>"),
-                    source: e,
-                })?;
-                outcome.drained += 1;
-                outcome.pending_acks.push(ack);
-            }
-            AofMessage::Shutdown => {
-                outcome.shutdown_requested = true;
-            }
-            AofMessage::Rewrite(_)
-            | AofMessage::RewriteSharded(_)
-            | AofMessage::RewritePerShard { .. } => {
-                // Already rewriting — drop redundant request.
-            }
+    while outcome.drained < max_drain {
+        match rx.try_recv() {
+            Ok(msg) => match msg {
+                AofMessage::Append {
+                    bytes: data,
+                    lsn: _,
+                } => {
+                    file.write_all(&data).map_err(|e| AofError::Io {
+                        path: PathBuf::from("<aof toplevel incr drain>"),
+                        source: e,
+                    })?;
+                    outcome.drained += 1;
+                }
+                AofMessage::AppendSync {
+                    bytes: data,
+                    lsn: _,
+                    ack,
+                } => {
+                    file.write_all(&data).map_err(|e| AofError::Io {
+                        path: PathBuf::from("<aof toplevel incr drain>"),
+                        source: e,
+                    })?;
+                    outcome.drained += 1;
+                    outcome.pending_acks.push(ack);
+                }
+                AofMessage::Shutdown => {
+                    outcome.shutdown_requested = true;
+                }
+                AofMessage::Rewrite(_)
+                | AofMessage::RewriteSharded(_)
+                | AofMessage::RewritePerShard { .. } => {
+                    // Already rewriting — drop redundant request.
+                }
+            },
+            Err(flume::TryRecvError::Empty) => break,
+            Err(flume::TryRecvError::Disconnected) => break,
         }
     }
     Ok(outcome)
 }
 
-/// [F6] Drain a per-shard writer's queued appends into its OLD incr file using
-/// the framed `[u64 lsn LE][u32 len LE][RESP bytes]` on-disk format that
-/// per-shard recovery expects.
+#[cfg(feature = "runtime-monoio")]
+pub(crate) fn drain_pending_appends(
+    rx: &channel::MpscReceiver<AofMessage>,
+    file: &mut std::fs::File,
+) -> Result<DrainOutcome, MoonError> {
+    drain_pending_appends_bounded(rx, file, usize::MAX)
+}
+
+/// [F6] Drain at most `max_drain` pending [`AofMessage::Append`] /
+/// [`AofMessage::AppendSync`] messages from `rx` into `file` using the framed
+/// `[u64 lsn LE][u32 len LE][RESP bytes]` on-disk format that per-shard
+/// recovery expects.
+///
+/// Pass [`usize::MAX`] for an unbounded drain (captures all currently-queued
+/// messages). The fold phase-3 mid-drain passes
+/// [`AofFoldSnapshot::pending_aof_count`] as the bound to avoid an infinite
+/// loop under sustained high write load: all pre-snapshot appends are
+/// guaranteed to be in the channel already (shard event loop is single-
+/// threaded), so draining exactly that many captures every pre-snapshot append
+/// without consuming post-snapshot ones.
 ///
 /// This is the per-shard twin of [`drain_pending_appends`] (which writes the
 /// legacy TopLevel raw-RESP format). Correctness depends on the framing
-/// matching `replay_per_shard`'s reader — an unframed write here would make the
-/// drained appends unparseable on restart.
+/// matching `replay_per_shard`'s reader.
 #[cfg(any(feature = "runtime-monoio", feature = "runtime-tokio"))]
 pub(crate) fn drain_pending_appends_framed(
     rx: &channel::MpscReceiver<AofMessage>,
     file: &mut std::fs::File,
+    max_drain: usize,
 ) -> Result<DrainOutcome, MoonError> {
     use std::io::Write;
     let mut outcome = DrainOutcome::default();
@@ -416,38 +437,49 @@ pub(crate) fn drain_pending_appends_framed(
         file.write_all(&header)?;
         file.write_all(data)
     };
-    while let Ok(msg) = rx.try_recv() {
-        match msg {
-            AofMessage::Append { lsn, bytes: data } => {
-                write_framed(file, lsn, &data).map_err(|e| AofError::Io {
-                    path: PathBuf::from("<aof per-shard incr drain>"),
-                    source: e,
-                })?;
-                outcome.drained += 1;
-            }
-            AofMessage::AppendSync {
-                lsn,
-                bytes: data,
-                ack,
-            } => {
-                write_framed(file, lsn, &data).map_err(|e| AofError::Io {
-                    path: PathBuf::from("<aof per-shard incr drain>"),
-                    source: e,
-                })?;
-                outcome.drained += 1;
-                // Park the ack until the caller's post-drain boundary fsync
-                // (issue #140); resolved Synced/FsyncFailed by
-                // `sync_and_fulfill_drain`. Mirrors `drain_pending_appends`.
-                outcome.pending_acks.push(ack);
-            }
-            AofMessage::Shutdown => {
-                outcome.shutdown_requested = true;
-            }
-            AofMessage::Rewrite(_)
-            | AofMessage::RewriteSharded(_)
-            | AofMessage::RewritePerShard { .. } => {
-                // Already rewriting this shard — drop redundant request.
-            }
+    while outcome.drained < max_drain {
+        match rx.try_recv() {
+            Ok(msg) => match msg {
+                AofMessage::Append { lsn, bytes: data } => {
+                    write_framed(file, lsn, &data).map_err(|e| AofError::Io {
+                        path: PathBuf::from("<aof per-shard incr drain>"),
+                        source: e,
+                    })?;
+                    outcome.drained += 1;
+                }
+                AofMessage::AppendSync {
+                    lsn,
+                    bytes: data,
+                    ack,
+                } => {
+                    // H1-BARRIER: a zero-length AppendSync is an fsync barrier
+                    // (pool::fsync_barrier) — it must produce NO on-disk record
+                    // (a len=0 framed header reads as corruption on replay) but
+                    // still counts toward `drained` (sender.len() counted it)
+                    // and its ack still parks for the boundary fsync.
+                    if !data.is_empty() {
+                        write_framed(file, lsn, &data).map_err(|e| AofError::Io {
+                            path: PathBuf::from("<aof per-shard incr drain>"),
+                            source: e,
+                        })?;
+                    }
+                    outcome.drained += 1;
+                    // Park the ack until the caller's post-drain boundary fsync
+                    // (issue #140); resolved Synced/FsyncFailed by
+                    // `sync_and_fulfill_drain`. Mirrors `drain_pending_appends`.
+                    outcome.pending_acks.push(ack);
+                }
+                AofMessage::Shutdown => {
+                    outcome.shutdown_requested = true;
+                }
+                AofMessage::Rewrite(_)
+                | AofMessage::RewriteSharded(_)
+                | AofMessage::RewritePerShard { .. } => {
+                    // Already rewriting this shard — drop redundant request.
+                }
+            },
+            Err(flume::TryRecvError::Empty) => break,
+            Err(flume::TryRecvError::Disconnected) => break,
         }
     }
     Ok(outcome)
@@ -522,72 +554,163 @@ pub(crate) fn drain_pending_appends_framed(
 #[cfg(any(feature = "runtime-monoio", feature = "runtime-tokio"))]
 pub(crate) fn do_rewrite_per_shard(
     shard_id: u16,
-    shard_dbs: &crate::shard::shared_databases::ShardDatabases,
+    _shard_dbs: &crate::shard::shared_databases::ShardDatabases,
     file: &mut std::fs::File,
     rx: &channel::MpscReceiver<AofMessage>,
     coord: &PerShardRewriteCoord,
+    fold_producer: &parking_lot::Mutex<ringbuf::HeapProd<crate::shard::dispatch::ShardMessage>>,
+    fold_notifier: &std::sync::Arc<crate::runtime::channel::Notify>,
 ) -> Result<(), MoonError> {
+    use ringbuf::traits::Producer;
     // Panic/early-error safety: guarantees `shard_done` runs on EVERY exit
     // (success via `complete()`, `?`-error or panic-unwind via `Drop`). The
     // phase-8 `await_outcome` barrier makes that a liveness requirement, so
     // callers MUST NOT call `shard_done` after invoking this function — the
     // guard owns the single decrement for all exits. See `ShardDoneGuard`.
     let guard = ShardDoneGuard::new(coord);
-
-    let sidx = shard_id as usize;
-    let all_shards = shard_dbs.all_shard_dbs();
-    if sidx >= all_shards.len() {
-        return Err(AofError::RewriteFailed {
-            detail: format!(
-                "do_rewrite_per_shard: shard {} out of range ({} shards)",
-                sidx,
-                all_shards.len()
-            ),
-        }
-        .into());
-    }
+    let _fold_t0 = std::time::Instant::now();
 
     // Phase 1: drain pre-rewrite queued appends into old incr (framed), fsync,
     // then resolve their parked AppendSync acks (issue #140).
-    let mut pre_drain = drain_pending_appends_framed(rx, file)?;
+    //
+    // C4-DRAIN-BOUND (phase 1): snapshot `rx.len()` NOW — all messages currently
+    // in the channel are pre-fold appends. New appends that arrive AFTER this
+    // snapshot were enqueued concurrently with the fold and belong in the NEW incr;
+    // draining them here would pull post-fold appends into the OLD incr, causing
+    // them to be replayed on top of a base that already contains them (double-apply).
+    // Without this bound, under sustained high write load the drain loops forever
+    // because the INCR producer keeps the channel perpetually non-empty.
+    let pre_drain_bound = rx.len();
+    let mut pre_drain = drain_pending_appends_framed(rx, file, pre_drain_bound)?;
     sync_and_fulfill_drain(&mut pre_drain, file, PathBuf::from("<aof per-shard incr>"))?;
+    info!(
+        "F6 shard {} phase1 done: drained {} appends ({:.1}ms)",
+        shard_id,
+        pre_drain.drained,
+        _fold_t0.elapsed().as_secs_f64() * 1000.0
+    );
 
-    // Phase 2: acquire write locks on this shard's db(s) (db_idx ascending).
-    let shard_locks = &all_shards[sidx];
-    let guards: Vec<_> = shard_locks.iter().map(|lock| lock.write()).collect();
+    // Phases 2-5 (C4 cooperative snapshot — ShardSlice is the live store):
+    //
+    // Instead of acquiring RwLock write guards on the shard's databases (which
+    // the AOF writer thread cannot do because ShardSlice is thread-local/!Send),
+    // we send an AofFold message to the shard's SPSC ring and block on the
+    // oneshot reply.  The shard event loop processes AofFold atomically between
+    // commands (single-threaded cooperative runtime), providing the same mutual
+    // exclusion that RwLock write guards gave.  See ShardMessage::AofFold and
+    // its handler in spsc_handler.rs.
+    //
+    // Ordering discipline (exactly-once guarantee preserved):
+    //   1. Phase 1 above drained pre-fold appends into OLD incr.
+    //   2. AofFold push notifies the shard; the shard event loop will drain its
+    //      SPSC ring before processing AofFold, so any command that was
+    //      in-flight when Phase 1 finished but not yet queued to the AOF channel
+    //      will be processed (and its append enqueued) before the snapshot.
+    //   3. Phase 3 (mid-drain below) captures appends enqueued after Phase 1
+    //      but before the shard built the snapshot — same as the old mid-drain.
+    //   4. Snapshot is replied after all prior mutations are applied; no
+    //      command can mutate the shard while it is building the snapshot.
+    let (reply_tx, reply_rx) =
+        crate::runtime::channel::oneshot::<crate::shard::dispatch::AofFoldSnapshot>();
+    {
+        let mut prod = fold_producer.lock();
+        prod.try_push(crate::shard::dispatch::ShardMessage::AofFold { reply_tx })
+            .map_err(|_| AofError::RewriteFailed {
+                detail: format!(
+                    "do_rewrite_per_shard: shard {} AofFold SPSC ring full — fold aborted",
+                    shard_id
+                ),
+            })?;
+    }
+    fold_notifier.notify_one();
 
-    // Phase 3: drain appends that completed between phase 1 and phase 2, fsync,
-    // then resolve their parked AppendSync acks (issue #140).
-    let mut mid_drain = drain_pending_appends_framed(rx, file)?;
-    sync_and_fulfill_drain(&mut mid_drain, file, PathBuf::from("<aof per-shard incr>"))?;
-
-    // Phase 4: snapshot this shard's databases under the locks.
-    let now_ms = current_time_ms();
-    let mut snapshot: Vec<(
-        Vec<(
-            crate::storage::compact_key::CompactKey,
-            crate::storage::entry::Entry,
-        )>,
-        u32,
-    )> = Vec::with_capacity(guards.len());
-    for guard in &guards {
-        let base_ts = guard.base_timestamp();
-        let mut entries = Vec::new();
-        for (key, entry) in guard.data().iter() {
-            if !entry.is_expired_at(base_ts, now_ms) {
-                entries.push((key.clone(), entry.clone()));
+    // Phase 4: collect the cooperative snapshot (blocks until the shard replies).
+    // Use recv_blocking since do_rewrite_per_shard runs on a dedicated std::thread
+    // (the per-shard AOF writer), not inside an async executor.
+    //
+    // C4 ordering invariant (exactly-once guarantee — frozen contract §3 C4):
+    //   Every command the shard processed BEFORE building its snapshot had already
+    //   enqueued its AOF append (via `try_send_append`) before the shard sent the
+    //   reply — happens-before, by the single-threaded event-loop order. Therefore
+    //   the mid-drain (phase 3) executed AFTER this recv_blocking captures ALL
+    //   pre-snapshot appends into the OLD incr; post-snapshot appends land in the
+    //   NEW incr. Running mid-drain BEFORE recv_blocking (the prior buggy order)
+    //   misses appends that arrive while the shard is building its snapshot —
+    //   they would land in the NEW incr and be replayed on top of a base that
+    //   already contains them → double-apply on recovery (observed: 2016 of
+    //   272988 INCRs survived restart in test_ssm4a_fold_4shard_experimental).
+    // Wait for the shard event loop to build and reply with the snapshot.
+    // Poll with try_recv + sleep so we can log a warning if the reply is slow
+    // (helps diagnose starvation of the fold consumer under high write load).
+    let fold_snapshot = {
+        let wait_start = std::time::Instant::now();
+        let mut warned = false;
+        loop {
+            match reply_rx.try_recv() {
+                Ok(snap) => break snap,
+                Err(flume::TryRecvError::Empty) => {
+                    if !warned && wait_start.elapsed() >= std::time::Duration::from_millis(500) {
+                        warned = true;
+                        warn!(
+                            "do_rewrite_per_shard: shard {} waiting for AofFold snapshot ({:.1}s elapsed) — \
+                             shard event loop may be stalled or fold consumer not draining",
+                            shard_id,
+                            wait_start.elapsed().as_secs_f64()
+                        );
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(flume::TryRecvError::Disconnected) => {
+                    return Err(AofError::RewriteFailed {
+                        detail: format!(
+                            "do_rewrite_per_shard: shard {} AofFold reply channel dropped (shard shut down?)",
+                            shard_id
+                        ),
+                    }.into());
+                }
             }
         }
-        snapshot.push((entries, base_ts));
-    }
+    };
+    let pending_aof_count = fold_snapshot.pending_aof_count;
+    let snapshot = fold_snapshot.dbs;
+    info!(
+        "F6 shard {} snapshot received: {} dbs, {} pre-snapshot pending ({:.1}ms total)",
+        shard_id,
+        snapshot.len(),
+        pending_aof_count,
+        _fold_t0.elapsed().as_secs_f64() * 1000.0
+    );
 
-    // Phase 5: release locks before the expensive disk write.
-    drop(guards);
+    // Phase 3: drain appends that arrived while the shard was building the snapshot,
+    // fsync, then resolve their parked AppendSync acks (issue #140).
+    //
+    // MUST run AFTER receiving the snapshot (see C4 ordering invariant above): the
+    // shard's event loop enqueues every pre-snapshot append before sending the reply,
+    // so a post-reply drain captures them all into the OLD incr.
+    //
+    // C4-DRAIN-BOUND: drain at most `pending_aof_count` messages — the exact number
+    // of pre-snapshot appends the shard reported before building its snapshot. This
+    // prevents an infinite drain loop under sustained high write load where new
+    // (post-snapshot) appends arrive faster than we can drain them.
+    let mut mid_drain = drain_pending_appends_framed(rx, file, pending_aof_count)?;
+    sync_and_fulfill_drain(&mut mid_drain, file, PathBuf::from("<aof per-shard incr>"))?;
+    info!(
+        "F6 shard {} phase3 done: drained {} mid-appends ({:.1}ms total)",
+        shard_id,
+        mid_drain.drained,
+        _fold_t0.elapsed().as_secs_f64() * 1000.0
+    );
 
     // Phase 6: write new base, advance THIS shard's manifest entry (no seq
     // commit), reopen to the new incr. The manifest lock is held only for the
     // brief, await-free advance_shard call.
     let rdb_bytes = crate::persistence::rdb::save_snapshot_to_bytes(&snapshot)?;
+    info!(
+        "F6 shard {} rdb serialized: {} bytes ({:.1}ms total)",
+        shard_id,
+        rdb_bytes.len(),
+        _fold_t0.elapsed().as_secs_f64() * 1000.0
+    );
     let new_incr = {
         let mut m = coord.manifest.lock();
         m.advance_shard(shard_id, coord.new_seq, &rdb_bytes)?
@@ -739,75 +862,155 @@ pub(crate) fn do_rewrite_single(
     Ok(())
 }
 
-/// Multi-part rewrite: snapshot all shards → merged RDB base → advance manifest.
+/// TopLevel cooperative fold: snapshot shard 0 → merged RDB base → advance manifest.
 ///
-/// See [`do_rewrite_single`] for the ordering rationale. The multi-shard variant
-/// holds write locks on every (shard, db) pair simultaneously for the duration
-/// of the snapshot. This creates a brief global write pause, but it is the only
-/// way to guarantee a torn-free snapshot without per-message sequence numbers.
+/// Implements the C4 cooperative-snapshot protocol for the TopLevel (--shards 1)
+/// AOF layout.  Mirrors [`do_rewrite_per_shard`] but operates on the single
+/// TopLevel manifest instead of per-shard manifest entries.
+///
+/// Correctness ordering (exactly-once for non-idempotent commands like INCR):
+///
+/// 1. Drain queued appends (RAW RESP, not framed) into the OLD incr and fsync.
+/// 2. Send `ShardMessage::AofFold` to shard 0's SPSC ring and block on the
+///    cooperative snapshot reply.  The shard event loop processes AofFold
+///    atomically between commands, providing the same mutual exclusion the old
+///    RwLock write guards gave.
+/// 3. Mid-drain: drain exactly `pending_aof_count` pre-snapshot appends into
+///    OLD incr and fsync.
+/// 4. Write new base RDB → advance manifest → reopen `file` to new incr.
+///
+/// If `fold_channels` is `None` (main.rs failed to wire them at startup),
+/// abort cleanly with an error so the old generation stays authoritative.
+///
+/// **RAW RESP format**: TopLevel incr files use plain RESP bytes (no [lsn][len]
+/// framing).  [`drain_pending_appends`] writes the correct format; never use
+/// [`drain_pending_appends_framed`] here.
 #[cfg(feature = "runtime-monoio")]
 pub(crate) fn do_rewrite_sharded(
-    shard_dbs: &crate::shard::shared_databases::ShardDatabases,
+    _shard_dbs: &crate::shard::shared_databases::ShardDatabases,
     manifest: &mut crate::persistence::aof_manifest::AofManifest,
     file: &mut std::fs::File,
     rx: &channel::MpscReceiver<AofMessage>,
+    fold_channels: Option<&(
+        Arc<parking_lot::Mutex<ringbuf::HeapProd<crate::shard::dispatch::ShardMessage>>>,
+        Arc<crate::runtime::channel::Notify>,
+    )>,
 ) -> Result<(), MoonError> {
-    // Phase 1: drain pre-rewrite queued appends into old incr, fsync, then
-    // resolve their parked AppendSync acks (issue #140).
+    use ringbuf::traits::Producer;
+
+    let _fold_t0 = std::time::Instant::now();
+
+    // C4 deadlock guard: fold channels MUST be wired.  If absent, abort
+    // cleanly — the old generation stays authoritative.
+    let (fold_producer, fold_notifier) = match fold_channels {
+        Some(pair) => pair,
+        None => {
+            return Err(AofError::RewriteFailed {
+                detail: "do_rewrite_sharded (TopLevel): fold channels not wired at startup; \
+                         rewrite aborted — old generation stays authoritative. \
+                         Check main.rs fold-channel wiring."
+                    .to_string(),
+            }
+            .into());
+        }
+    };
+
+    // Phase 1: drain pre-rewrite queued appends into old incr (RAW RESP), fsync.
     let mut pre_drain = drain_pending_appends(rx, file)?;
     sync_and_fulfill_drain(&mut pre_drain, file, manifest.incr_path())?;
+    info!(
+        "TopLevel fold phase1 done: drained {} appends ({:.1}ms)",
+        pre_drain.drained,
+        _fold_t0.elapsed().as_secs_f64() * 1000.0
+    );
 
-    // Phase 2: acquire write locks on ALL (shard, db) pairs simultaneously.
-    // Lock order is (shard_idx, db_idx) ascending — must match anywhere else
-    // that acquires multiple locks to prevent deadlock (currently no other
-    // call site does, but the ordering discipline is documented for future
-    // maintainers).
-    let all_shards = shard_dbs.all_shard_dbs();
-    let mut guards: Vec<Vec<_>> = Vec::with_capacity(all_shards.len());
-    for shard_locks in all_shards {
-        let mut shard_guards = Vec::with_capacity(shard_locks.len());
-        for lock in shard_locks {
-            shard_guards.push(lock.write());
-        }
-        guards.push(shard_guards);
+    // Phases 2-4 (C4 cooperative snapshot):
+    //
+    // Send AofFold to shard 0 and block on the cooperative snapshot reply.
+    // The shard event loop processes AofFold atomically between commands —
+    // same mutual exclusion the old RwLock write guards provided.
+    let (reply_tx, reply_rx) =
+        crate::runtime::channel::oneshot::<crate::shard::dispatch::AofFoldSnapshot>();
+    {
+        let mut prod = fold_producer.lock();
+        prod.try_push(crate::shard::dispatch::ShardMessage::AofFold { reply_tx })
+            .map_err(|_| AofError::RewriteFailed {
+                detail: "do_rewrite_sharded (TopLevel): AofFold SPSC ring full — fold aborted"
+                    .to_string(),
+            })?;
     }
+    fold_notifier.notify_one();
 
-    // Phase 3: drain appends completed between phase 1 and phase 2, fsync, then
-    // resolve their parked AppendSync acks (issue #140).
-    let mut mid_drain = drain_pending_appends(rx, file)?;
-    sync_and_fulfill_drain(&mut mid_drain, file, manifest.incr_path())?;
-
-    // Phase 4: snapshot under locks.
-    let db_count = shard_dbs.db_count();
-    let mut merged: Vec<(
-        Vec<(
-            crate::storage::compact_key::CompactKey,
-            crate::storage::entry::Entry,
-        )>,
-        u32,
-    )> = (0..db_count).map(|_| (Vec::new(), 0u32)).collect();
-    let now_ms = current_time_ms();
-    for shard_guards in &guards {
-        for (db_idx, guard) in shard_guards.iter().enumerate() {
-            let base_ts = guard.base_timestamp();
-            if merged[db_idx].0.is_empty() {
-                merged[db_idx].1 = base_ts;
-            }
-            for (key, entry) in guard.data().iter() {
-                if !entry.is_expired_at(base_ts, now_ms) {
-                    merged[db_idx].0.push((key.clone(), entry.clone()));
+    // Poll for the cooperative snapshot (blocks until shard 0 replies).
+    // Runs on the dedicated AOF writer thread (not inside an async executor),
+    // so recv_blocking / sleep are safe.
+    let fold_snapshot = {
+        let wait_start = std::time::Instant::now();
+        let mut warned = false;
+        loop {
+            match reply_rx.try_recv() {
+                Ok(snap) => break snap,
+                Err(flume::TryRecvError::Empty) => {
+                    if !warned && wait_start.elapsed() >= std::time::Duration::from_millis(500) {
+                        warned = true;
+                        warn!(
+                            "do_rewrite_sharded (TopLevel): waiting for AofFold snapshot \
+                             ({:.1}s elapsed) — shard 0 event loop may be stalled",
+                            wait_start.elapsed().as_secs_f64()
+                        );
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(flume::TryRecvError::Disconnected) => {
+                    return Err(AofError::RewriteFailed {
+                        detail: "do_rewrite_sharded (TopLevel): AofFold reply channel dropped \
+                                 (shard 0 shut down?)"
+                            .to_string(),
+                    }
+                    .into());
                 }
             }
         }
-    }
+    };
+    let pending_aof_count = fold_snapshot.pending_aof_count;
+    let snapshot = fold_snapshot.dbs;
+    info!(
+        "TopLevel fold snapshot received: {} dbs, {} pre-snapshot pending ({:.1}ms)",
+        snapshot.len(),
+        pending_aof_count,
+        _fold_t0.elapsed().as_secs_f64() * 1000.0
+    );
 
-    // Phase 5: release locks before the expensive disk write.
-    drop(guards);
+    // Phase 3: mid-drain — drain exactly `pending_aof_count` pre-snapshot appends
+    // into OLD incr (RAW RESP format), then fsync + fulfill parked AppendSync acks.
+    //
+    // MUST run AFTER receiving the snapshot (C4 ordering invariant — identical
+    // to do_rewrite_per_shard's phase 3 rationale).
+    //
+    // C4-DRAIN-BOUND: drain at most `pending_aof_count` messages — the exact count
+    // the shard reported before building its snapshot.  Draining beyond this count
+    // would consume post-snapshot appends that belong in the NEW incr; those bytes
+    // would be silently lost when `manifest.advance()` deletes the old incr file
+    // at the end of phase 4.  This mirrors the identical bound used by
+    // `drain_pending_appends_framed` in `do_rewrite_per_shard`.
+    let mut mid_drain = drain_pending_appends_bounded(rx, file, pending_aof_count)?;
+    sync_and_fulfill_drain(&mut mid_drain, file, manifest.incr_path())?;
+    info!(
+        "TopLevel fold phase3 done: drained {} mid-appends ({:.1}ms)",
+        mid_drain.drained,
+        _fold_t0.elapsed().as_secs_f64() * 1000.0
+    );
 
-    // Phase 6: write new base, advance manifest, reopen.
-    let rdb_bytes = crate::persistence::rdb::save_snapshot_to_bytes(&merged)?;
+    // Phase 4 (= Phase 6 in do_rewrite_per_shard numbering):
+    // Write new base RDB, advance the manifest (bumps seq, writes manifest,
+    // deletes old files), reopen `file` to the new incr.
+    let rdb_bytes = crate::persistence::rdb::save_snapshot_to_bytes(&snapshot)?;
+    info!(
+        "TopLevel fold rdb serialized: {} bytes ({:.1}ms)",
+        rdb_bytes.len(),
+        _fold_t0.elapsed().as_secs_f64() * 1000.0
+    );
     let new_incr = manifest.advance(&rdb_bytes)?;
-
     *file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -818,11 +1021,11 @@ pub(crate) fn do_rewrite_sharded(
         })?;
 
     info!(
-        "AOF rewrite complete (sharded): drained {}+{} pre-snapshot appends, seq={}",
+        "TopLevel AOF rewrite complete: drained {}+{} appends, seq={}",
         pre_drain.drained, mid_drain.drained, manifest.seq
     );
     if pre_drain.shutdown_requested || mid_drain.shutdown_requested {
-        warn!("AOF writer: shutdown requested during rewrite (will honor on next recv)");
+        warn!("TopLevel AOF writer: shutdown requested during rewrite (honored on next recv)");
     }
     Ok(())
 }
@@ -875,37 +1078,243 @@ fn rewrite_aof_sync(db: &SharedDatabases, aof_path: &Path) -> Result<(), MoonErr
     Ok(())
 }
 
-/// Rewrite the AOF in sharded mode with RDB preamble.
+/// TopLevel cooperative fold for the tokio runtime.
 ///
-/// Merges all shards' databases into a single RDB snapshot, writes it as
-/// the AOF base file. New incremental writes are appended as RESP after.
+/// Implements the C4 cooperative-snapshot protocol for the TopLevel (--shards 1)
+/// AOF layout under `runtime-tokio`.  Called by the tokio `aof_writer_task` when
+/// it receives `AofMessage::RewriteSharded`.
+///
+/// Unlike the monoio path (which has a manifest and a proper incr file), the
+/// tokio TopLevel writer uses the legacy single-file `aof_path`.  The rewrite:
+///
+/// 1. Drains pre-snapshot appends from `rx` into `old_file` (RAW RESP).
+/// 2. Sends `ShardMessage::AofFold` to shard 0 and blocks for the snapshot.
+/// 3. Mid-drains into `old_file`.
+/// 4. Writes the RDB snapshot to `aof_path.tmp` then renames atomically to
+///    `aof_path` — the same post-rewrite file the caller will reopen for appending.
+///
+/// Returns `Err` (abort, old file unchanged) if fold channels are absent or the
+/// shard reply channel is dropped.  The caller clears `AOF_REWRITE_IN_PROGRESS`
+/// regardless.
+///
+/// **Detection note:** the tokio path writes to `aof_path` (e.g. `appendonly.aof`),
+/// NOT to a manifest-stamped `moon.aof.<seq>.base.rdb`.  Test helpers that poll
+/// for completion should check for `appendonly.aof` containing the RDB preamble
+/// (`MOON` magic at offset 0) rather than a manifest-based file.
 #[allow(dead_code)]
 pub(crate) fn rewrite_aof_sharded_sync(
-    shard_dbs: &crate::shard::shared_databases::ShardDatabases,
+    _shard_dbs: &crate::shard::shared_databases::ShardDatabases,
     aof_path: &Path,
+    rx: &channel::MpscReceiver<AofMessage>,
+    old_file: &mut std::fs::File,
+    fold_channels: Option<&(
+        Arc<parking_lot::Mutex<ringbuf::HeapProd<crate::shard::dispatch::ShardMessage>>>,
+        Arc<crate::runtime::channel::Notify>,
+    )>,
 ) -> Result<(), MoonError> {
-    let db_count = shard_dbs.db_count();
-    let now_ms = current_time_ms();
-    let mut merged_dbs: Vec<Database> = (0..db_count).map(|_| Database::new()).collect();
+    use ringbuf::traits::Producer;
+    use std::io::Write as _;
 
-    for shard_locks in shard_dbs.all_shard_dbs() {
-        for (db_idx, lock) in shard_locks.iter().enumerate() {
-            let guard = lock.read();
-            for (key, entry) in guard.data().iter() {
-                if !entry.is_expired_at(guard.base_timestamp(), now_ms) {
-                    merged_dbs[db_idx].set(key.to_bytes(), entry.clone());
+    let _fold_t0 = std::time::Instant::now();
+
+    // C4 deadlock guard: fold channels MUST be wired.
+    let (fold_producer, fold_notifier) = match fold_channels {
+        Some(pair) => pair,
+        None => {
+            return Err(AofError::RewriteFailed {
+                detail: "rewrite_aof_sharded_sync (tokio TopLevel): fold channels not wired; \
+                         rewrite aborted — old file unchanged."
+                    .to_string(),
+            }
+            .into());
+        }
+    };
+
+    // Phase 1: pre-drain (RAW RESP) into old file, then fsync + resolve parked
+    // AppendSync acks (D2 fix: park acks here; fulfill after boundary fsync so
+    // clients are never told Synced before the bytes are durable).
+    // drain_pending_appends is #[cfg(runtime-monoio)] only; under tokio we do
+    // the minimal equivalent inline (read until channel is empty).
+    let mut pre_shutdown_requested = false;
+    {
+        let mut pre_acks: Vec<crate::runtime::channel::OneshotSender<AofAck>> = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            match msg {
+                AofMessage::Append { bytes: data, .. } => {
+                    old_file.write_all(&data).map_err(|e| AofError::Io {
+                        path: aof_path.to_path_buf(),
+                        source: e,
+                    })?;
+                }
+                AofMessage::AppendSync {
+                    bytes: data, ack, ..
+                } => {
+                    old_file.write_all(&data).map_err(|e| AofError::Io {
+                        path: aof_path.to_path_buf(),
+                        source: e,
+                    })?;
+                    pre_acks.push(ack);
+                }
+                AofMessage::Shutdown => {
+                    pre_shutdown_requested = true;
+                }
+                AofMessage::Rewrite(_)
+                | AofMessage::RewriteSharded(_)
+                | AofMessage::RewritePerShard { .. } => {}
+            }
+        }
+        let _ = old_file.flush();
+        // Fulfill pre-drain acks after the boundary fsync (issue #140).
+        match old_file.sync_data() {
+            Ok(()) => {
+                for ack in pre_acks {
+                    let _ = ack.send(AofAck::Synced);
+                }
+            }
+            Err(_) => {
+                for ack in pre_acks {
+                    let _ = ack.send(AofAck::FsyncFailed);
                 }
             }
         }
     }
+    info!(
+        "rewrite_aof_sharded_sync (tokio) phase1 done ({:.1}ms)",
+        _fold_t0.elapsed().as_secs_f64() * 1000.0
+    );
 
-    let rdb_bytes = crate::persistence::rdb::save_to_bytes(&merged_dbs)?;
+    // Phases 2-3: AofFold cooperative snapshot.
+    let (reply_tx, reply_rx) =
+        crate::runtime::channel::oneshot::<crate::shard::dispatch::AofFoldSnapshot>();
+    {
+        let mut prod = fold_producer.lock();
+        prod.try_push(crate::shard::dispatch::ShardMessage::AofFold { reply_tx })
+            .map_err(|_| AofError::RewriteFailed {
+                detail: "rewrite_aof_sharded_sync (tokio): AofFold SPSC ring full".to_string(),
+            })?;
+    }
+    fold_notifier.notify_one();
 
+    let fold_snapshot = {
+        let wait_start = std::time::Instant::now();
+        let mut warned = false;
+        loop {
+            match reply_rx.try_recv() {
+                Ok(snap) => break snap,
+                Err(flume::TryRecvError::Empty) => {
+                    if !warned && wait_start.elapsed() >= std::time::Duration::from_millis(500) {
+                        warned = true;
+                        warn!(
+                            "rewrite_aof_sharded_sync (tokio): waiting for AofFold snapshot \
+                             ({:.1}s) — shard 0 may be stalled",
+                            wait_start.elapsed().as_secs_f64()
+                        );
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(flume::TryRecvError::Disconnected) => {
+                    return Err(AofError::RewriteFailed {
+                        detail: "rewrite_aof_sharded_sync (tokio): AofFold reply channel dropped"
+                            .to_string(),
+                    }
+                    .into());
+                }
+            }
+        }
+    };
+    // D1 fix: capture pending_aof_count to bound the mid-drain (C4-DRAIN-BOUND).
+    // The shard reports exactly how many AOF messages were enqueued before it
+    // built the snapshot. Draining more would consume post-snapshot appends that
+    // must land in the new file (aof_path) AFTER the rename in phase 4.
+    let pending_aof_count = fold_snapshot.pending_aof_count;
+    let snapshot = fold_snapshot.dbs;
+    info!(
+        "rewrite_aof_sharded_sync (tokio) snapshot: {} dbs, {} pre-snapshot pending ({:.1}ms)",
+        snapshot.len(),
+        pending_aof_count,
+        _fold_t0.elapsed().as_secs_f64() * 1000.0
+    );
+
+    // Phase 3 mid-drain: drain exactly `pending_aof_count` pre-snapshot appends
+    // into OLD file (RAW RESP), then fsync + resolve parked AppendSync acks.
+    //
+    // C4-DRAIN-BOUND: must NOT drain beyond pending_aof_count. Post-snapshot
+    // appends MUST remain in the channel so the writer loop appends them to the
+    // reopened new file after this function returns. Draining them here would
+    // cause them to be written to old_file (old inode), which is superseded by
+    // the rename in phase 4 → those bytes are lost on restart (D1 bug).
+    let mut mid_shutdown_requested = false;
+    {
+        let mut mid_acks: Vec<crate::runtime::channel::OneshotSender<AofAck>> = Vec::new();
+        let mut drained = 0usize;
+        while drained < pending_aof_count {
+            match rx.try_recv() {
+                Ok(msg) => match msg {
+                    AofMessage::Append { bytes: data, .. } => {
+                        old_file.write_all(&data).map_err(|e| AofError::Io {
+                            path: aof_path.to_path_buf(),
+                            source: e,
+                        })?;
+                        drained += 1;
+                    }
+                    AofMessage::AppendSync {
+                        bytes: data, ack, ..
+                    } => {
+                        old_file.write_all(&data).map_err(|e| AofError::Io {
+                            path: aof_path.to_path_buf(),
+                            source: e,
+                        })?;
+                        drained += 1;
+                        mid_acks.push(ack);
+                    }
+                    AofMessage::Shutdown => {
+                        mid_shutdown_requested = true;
+                    }
+                    AofMessage::Rewrite(_)
+                    | AofMessage::RewriteSharded(_)
+                    | AofMessage::RewritePerShard { .. } => {}
+                },
+                Err(_) => break,
+            }
+        }
+        let _ = old_file.flush();
+        // Fulfill mid-drain acks after the boundary fsync (issue #140).
+        match old_file.sync_data() {
+            Ok(()) => {
+                for ack in mid_acks {
+                    let _ = ack.send(AofAck::Synced);
+                }
+            }
+            Err(_) => {
+                for ack in mid_acks {
+                    let _ = ack.send(AofAck::FsyncFailed);
+                }
+            }
+        }
+        info!(
+            "rewrite_aof_sharded_sync (tokio) phase3 mid-drain done: {} messages ({:.1}ms)",
+            drained,
+            _fold_t0.elapsed().as_secs_f64() * 1000.0
+        );
+    }
+
+    // Phase 4: write RDB snapshot to aof_path (atomic tmp → rename).
+    let rdb_bytes = crate::persistence::rdb::save_snapshot_to_bytes(&snapshot)?;
     let tmp_path = aof_path.with_extension("aof.tmp");
-    std::fs::write(&tmp_path, &rdb_bytes).map_err(|e| AofError::Io {
-        path: tmp_path.clone(),
-        source: e,
-    })?;
+    {
+        let mut f = std::fs::File::create(&tmp_path).map_err(|e| AofError::Io {
+            path: tmp_path.clone(),
+            source: e,
+        })?;
+        f.write_all(&rdb_bytes).map_err(|e| AofError::Io {
+            path: tmp_path.clone(),
+            source: e,
+        })?;
+        f.sync_data().map_err(|e| AofError::Io {
+            path: tmp_path.clone(),
+            source: e,
+        })?;
+    }
     std::fs::rename(&tmp_path, aof_path).map_err(|e| AofError::RewriteFailed {
         detail: format!(
             "rename {} -> {}: {}",
@@ -916,9 +1325,16 @@ pub(crate) fn rewrite_aof_sharded_sync(
     })?;
 
     info!(
-        "AOF rewrite (sharded, RDB preamble) complete: {} bytes",
-        rdb_bytes.len()
+        "rewrite_aof_sharded_sync (tokio) complete: {} bytes ({:.1}ms)",
+        rdb_bytes.len(),
+        _fold_t0.elapsed().as_secs_f64() * 1000.0
     );
+    if pre_shutdown_requested || mid_shutdown_requested {
+        warn!(
+            "rewrite_aof_sharded_sync (tokio): shutdown requested during rewrite \
+             (will honor on next recv)"
+        );
+    }
     Ok(())
 }
 

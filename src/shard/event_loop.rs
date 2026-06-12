@@ -73,8 +73,15 @@ impl super::Shard {
         all_pubsub_registries: Vec<Arc<parking_lot::RwLock<PubSubRegistry>>>,
         all_remote_sub_maps: Vec<Arc<parking_lot::RwLock<RemoteSubscriberMap>>>,
         affinity_tracker: Arc<parking_lot::RwLock<AffinityTracker>>,
+        slice_init: crate::shard::slice::ShardSliceInit,
     ) {
         let _shard_id = self.id;
+
+        // C1: Initialize thread-local ShardSlice before any command handling.
+        // MUST be called before the accept/drain loop — assert_initialized panics
+        // on the first accept if this is skipped.
+        crate::shard::slice::init_shard(crate::shard::slice::ShardSlice::new(slice_init));
+        crate::shard::slice::assert_initialized(self.id);
 
         // Publish disk-offload status for INFO moonstore (set once per shard, idempotent).
         crate::vector::metrics::MOONSTORE_DISK_OFFLOAD_ENABLED.store(
@@ -804,22 +811,10 @@ impl super::Shard {
 
             if let Some(ref vdir) = vector_persist_dir {
                 let _ = std::fs::create_dir_all(vdir);
-                // Phase 2d: gate on is_initialized(); new path uses ShardSlice directly.
-                if crate::shard::slice::is_initialized() {
-                    crate::shard::slice::with_shard(|s| {
-                        s.vector_store.set_persist_dir(vdir.clone());
-                        s.text_store.set_persist_dir(vdir.clone());
-                    });
-                } else {
-                    let mut vs = shard_databases.vector_store(shard_id);
-                    vs.set_persist_dir(vdir.clone());
-                    drop(vs);
-
-                    // Text indexes share the same shard directory (different filename).
-                    let mut ts = shard_databases.text_store(shard_id);
-                    ts.set_persist_dir(vdir.clone());
-                    drop(ts);
-                }
+                crate::shard::slice::with_shard(|s| {
+                    s.vector_store.set_persist_dir(vdir.clone());
+                    s.text_store.set_persist_dir(vdir.clone());
+                });
             }
 
             // Try loading saved index metadata (with compaction weights) from the vector persist dir.
@@ -841,32 +836,7 @@ impl super::Shard {
             });
 
             if let Some(ref metas) = metas {
-                // Phase 2d: gate on is_initialized(); new path uses ShardSlice directly.
-                if crate::shard::slice::is_initialized() {
-                    crate::shard::slice::with_shard(|s| {
-                        info!(
-                            "Shard {}: restoring {} vector index(es) from sidecar",
-                            shard_id,
-                            metas.len()
-                        );
-                        for (meta, weight) in metas {
-                            let name = meta.name.clone();
-                            if let Err(e) = s.vector_store.create_index(meta.clone()) {
-                                tracing::warn!(
-                                    "Shard {}: failed to restore index '{}': {}",
-                                    shard_id,
-                                    String::from_utf8_lossy(&name),
-                                    e
-                                );
-                            } else if *weight != 1.0 {
-                                if let Some(idx) = s.vector_store.get_index_mut(&name) {
-                                    idx.set_compaction_weight(*weight);
-                                }
-                            }
-                        }
-                    });
-                } else {
-                    let mut vs = shard_databases.vector_store(shard_id);
+                crate::shard::slice::with_shard(|s| {
                     info!(
                         "Shard {}: restoring {} vector index(es) from sidecar",
                         shard_id,
@@ -874,7 +844,7 @@ impl super::Shard {
                     );
                     for (meta, weight) in metas {
                         let name = meta.name.clone();
-                        if let Err(e) = vs.create_index(meta.clone()) {
+                        if let Err(e) = s.vector_store.create_index(meta.clone()) {
                             tracing::warn!(
                                 "Shard {}: failed to restore index '{}': {}",
                                 shard_id,
@@ -882,48 +852,18 @@ impl super::Shard {
                                 e
                             );
                         } else if *weight != 1.0 {
-                            // W3-deep: restore persisted compaction_weight (skip default to avoid
-                            // redundant write on every startup when weight=1.0).
-                            if let Some(idx) = vs.get_index_mut(&name) {
+                            if let Some(idx) = s.vector_store.get_index_mut(&name) {
                                 idx.set_compaction_weight(*weight);
                             }
                         }
                     }
-                    drop(vs); // release VectorStore lock before scanning databases
-                }
+                });
             }
 
             // Restore text indexes from sidecar metadata.
             #[cfg(feature = "text-index")]
             if let Some(ref text_metas) = text_metas {
-                // Phase 2d: gate on is_initialized(); new path uses ShardSlice directly.
-                if crate::shard::slice::is_initialized() {
-                    crate::shard::slice::with_shard(|s| {
-                        info!(
-                            "Shard {}: restoring {} text index(es) from sidecar",
-                            shard_id,
-                            text_metas.len()
-                        );
-                        for meta in text_metas {
-                            let text_index = crate::text::store::TextIndex::new(
-                                meta.name.clone(),
-                                meta.key_prefixes.clone(),
-                                meta.text_fields.clone(),
-                                meta.bm25_config,
-                            );
-                            if let Err(e) = s.text_store.create_index(meta.name.clone(), text_index)
-                            {
-                                tracing::warn!(
-                                    "Shard {}: failed to restore text index '{}': {}",
-                                    shard_id,
-                                    String::from_utf8_lossy(&meta.name),
-                                    e
-                                );
-                            }
-                        }
-                    });
-                } else {
-                    let mut ts = shard_databases.text_store(shard_id);
+                crate::shard::slice::with_shard(|s| {
                     info!(
                         "Shard {}: restoring {} text index(es) from sidecar",
                         shard_id,
@@ -936,7 +876,7 @@ impl super::Shard {
                             meta.text_fields.clone(),
                             meta.bm25_config,
                         );
-                        if let Err(e) = ts.create_index(meta.name.clone(), text_index) {
+                        if let Err(e) = s.text_store.create_index(meta.name.clone(), text_index) {
                             tracing::warn!(
                                 "Shard {}: failed to restore text index '{}': {}",
                                 shard_id,
@@ -945,8 +885,7 @@ impl super::Shard {
                             );
                         }
                     }
-                    drop(ts);
-                }
+                });
             }
 
             // Auto-reindex existing HASH keys that match vector or text index prefixes.
@@ -955,7 +894,6 @@ impl super::Shard {
                 let db_count = shard_databases.db_count();
                 let mut reindexed = 0usize;
                 for db_idx in 0..db_count {
-                    // Phase 2d: gate read on is_initialized(); new path uses ShardSlice directly.
                     let collect_matching = |db: &crate::storage::Database| -> Vec<(Vec<u8>, Vec<crate::protocol::Frame>)> {
                         let mut matching: Vec<(Vec<u8>, Vec<crate::protocol::Frame>)> = Vec::new();
                         for (key, entry) in db.data().iter() {
@@ -1009,39 +947,21 @@ impl super::Shard {
                         }
                         matching
                     };
-                    let matching = if crate::shard::slice::is_initialized() {
-                        crate::shard::slice::with_shard_db(db_idx, |db| collect_matching(db))
-                    } else {
-                        let guard = shard_databases.read_db(shard_id, db_idx);
-                        collect_matching(&guard)
-                    };
+                    let matching =
+                        { crate::shard::slice::with_shard_db(db_idx, |db| collect_matching(db)) };
 
                     if !matching.is_empty() {
-                        // Phase 2d: gate write on is_initialized().
-                        if crate::shard::slice::is_initialized() {
-                            crate::shard::slice::with_shard(|s| {
-                                for (key, args) in &matching {
-                                    let _ = crate::shard::spsc_handler::auto_index_hset_public(
-                                        &mut s.vector_store,
-                                        &mut s.text_store,
-                                        key,
-                                        args,
-                                    );
-                                    reindexed += 1;
-                                }
-                            });
-                        } else {
-                            let mut vs = shard_databases.vector_store(shard_id);
-                            let mut ts = shard_databases.text_store(shard_id);
+                        crate::shard::slice::with_shard(|s| {
                             for (key, args) in &matching {
-                                // Plan 166-01: return discarded — this is a
-                                // reindex path, not a txn write path.
                                 let _ = crate::shard::spsc_handler::auto_index_hset_public(
-                                    &mut vs, &mut *ts, key, args,
+                                    &mut s.vector_store,
+                                    &mut s.text_store,
+                                    key,
+                                    args,
                                 );
                                 reindexed += 1;
                             }
-                        }
+                        });
                     }
                 }
                 if reindexed > 0 {
@@ -1190,40 +1110,23 @@ impl super::Shard {
                 _ = spsc_notify_local.notified() => {
                     crate::admin::metrics_setup::bump_spsc_notify_wake();
                     let mut pending_snapshot = None;
-                    // Phase 2d: gate on is_initialized(); new path uses ShardSlice directly.
-                    let hit_cap = if crate::shard::slice::is_initialized() {
-                        crate::shard::slice::with_shard(|s| {
-                            spsc_handler::drain_spsc_shared(
-                                &shard_databases, &mut consumers, &mut *pubsub_arc.write(),
-                                &blocking_rc, &mut pending_snapshot, &mut snapshot_state,
-                                &mut wal_writer, &mut wal_v3_writer, &repl_backlog, &mut replica_txs,
-                                &repl_offsets, shard_id, &script_cache_rc, &cached_clock,
-                                &mut pending_migrations, &mut s.vector_store,
-                                &mut pending_cdc_subscribes,
-                                &mut shard_manifest,
-                                server_config.mvcc_committed_prune_margin,
-                                server_config.graph_merge_max_segments,
-                                server_config.graph_dead_edge_trigger,
-                                &mut autovacuum_daemon,
-                                aof_pool.as_ref(),  // FIX-W1-2
-                            )
-                        })
-                    } else {
-                        spsc_handler::drain_spsc_shared(
-                            &shard_databases, &mut consumers, &mut *pubsub_arc.write(),
-                            &blocking_rc, &mut pending_snapshot, &mut snapshot_state,
-                            &mut wal_writer, &mut wal_v3_writer, &repl_backlog, &mut replica_txs,
-                            &repl_offsets, shard_id, &script_cache_rc, &cached_clock,
-                            &mut pending_migrations, &mut *shard_databases.vector_store(shard_id),
-                            &mut pending_cdc_subscribes,
-                            &mut shard_manifest,
-                            server_config.mvcc_committed_prune_margin,
-                            server_config.graph_merge_max_segments,
-                            server_config.graph_dead_edge_trigger,
-                            &mut autovacuum_daemon,
-                            aof_pool.as_ref(),  // FIX-W1-2
-                        )
-                    };
+                    // No outer with_shard wrapper — each arm in drain_spsc_shared
+                    // takes its own flat borrow, eliminating the re-entrancy BorrowMutError
+                    // that occurred when arms called with_shard inside an enclosing borrow.
+                    let hit_cap = spsc_handler::drain_spsc_shared(
+                        &shard_databases, &mut consumers, &mut *pubsub_arc.write(),
+                        &blocking_rc, &mut pending_snapshot, &mut snapshot_state,
+                        &mut wal_writer, &mut wal_v3_writer, &repl_backlog, &mut replica_txs,
+                        &repl_offsets, shard_id, &script_cache_rc, &cached_clock,
+                        &mut pending_migrations,
+                        &mut pending_cdc_subscribes,
+                        &mut shard_manifest,
+                        server_config.mvcc_committed_prune_margin,
+                        server_config.graph_merge_max_segments,
+                        server_config.graph_dead_edge_trigger,
+                        &mut autovacuum_daemon,
+                        aof_pool.as_ref(),  // FIX-W1-2
+                    );
                     if hit_cap {
                         // M3: capped drain may have left a tail — re-arm immediately
                         // instead of stranding it until the next periodic tick.
@@ -1304,40 +1207,21 @@ impl super::Shard {
                     next_file_id = next_file_id.max(spill_file_id.get());
 
                     let mut pending_snapshot = None;
-                    // Phase 2d: gate on is_initialized(); new path uses ShardSlice directly.
-                    let hit_cap = if crate::shard::slice::is_initialized() {
-                        crate::shard::slice::with_shard(|s| {
-                            spsc_handler::drain_spsc_shared(
-                                &shard_databases, &mut consumers, &mut *pubsub_arc.write(),
-                                &blocking_rc, &mut pending_snapshot, &mut snapshot_state,
-                                &mut wal_writer, &mut wal_v3_writer, &repl_backlog, &mut replica_txs,
-                                &repl_offsets, shard_id, &script_cache_rc, &cached_clock,
-                                &mut pending_migrations, &mut s.vector_store,
-                                &mut pending_cdc_subscribes,
-                                &mut shard_manifest,
-                                server_config.mvcc_committed_prune_margin,
-                                server_config.graph_merge_max_segments,
-                                server_config.graph_dead_edge_trigger,
-                                &mut autovacuum_daemon,
-                                aof_pool.as_ref(),  // FIX-W1-2
-                            )
-                        })
-                    } else {
-                        spsc_handler::drain_spsc_shared(
-                            &shard_databases, &mut consumers, &mut *pubsub_arc.write(),
-                            &blocking_rc, &mut pending_snapshot, &mut snapshot_state,
-                            &mut wal_writer, &mut wal_v3_writer, &repl_backlog, &mut replica_txs,
-                            &repl_offsets, shard_id, &script_cache_rc, &cached_clock,
-                            &mut pending_migrations, &mut *shard_databases.vector_store(shard_id),
-                            &mut pending_cdc_subscribes,
-                            &mut shard_manifest,
-                            server_config.mvcc_committed_prune_margin,
-                            server_config.graph_merge_max_segments,
-                            server_config.graph_dead_edge_trigger,
-                            &mut autovacuum_daemon,
-                            aof_pool.as_ref(),  // FIX-W1-2
-                        )
-                    };
+                    // No outer with_shard — each arm takes its own flat borrow.
+                    let hit_cap = spsc_handler::drain_spsc_shared(
+                        &shard_databases, &mut consumers, &mut *pubsub_arc.write(),
+                        &blocking_rc, &mut pending_snapshot, &mut snapshot_state,
+                        &mut wal_writer, &mut wal_v3_writer, &repl_backlog, &mut replica_txs,
+                        &repl_offsets, shard_id, &script_cache_rc, &cached_clock,
+                        &mut pending_migrations,
+                        &mut pending_cdc_subscribes,
+                        &mut shard_manifest,
+                        server_config.mvcc_committed_prune_margin,
+                        server_config.graph_merge_max_segments,
+                        server_config.graph_dead_edge_trigger,
+                        &mut autovacuum_daemon,
+                        aof_pool.as_ref(),  // FIX-W1-2
+                    );
                     if hit_cap {
                         // M3: capped drain may have left a tail — re-arm immediately
                         // instead of stranding it until the next periodic tick.
@@ -1514,28 +1398,16 @@ impl super::Shard {
                     timers::sync_wal_v3(&mut wal_v3_writer);
                     // P3+MA1+MA2: prune committed + sweep zombies + kill old snapshots
                     //             + update RECL_MVCC_* + segment-stall.
-                    // Phase 2d: gate on is_initialized(); new path uses ShardSlice directly.
-                    if crate::shard::slice::is_initialized() {
-                        crate::shard::slice::with_shard(|s| {
-                            timers::run_mvcc_sweep(
-                                &mut s.vector_store,
-                                #[cfg(feature = "graph")]
-                                &mut s.graph_store,
-                                server_config.mvcc_committed_prune_margin,
-                                server_config.max_unflushed_immutable_segments,
-                                server_config.mvcc_old_snapshot_threshold_secs,
-                            );
-                        });
-                    } else {
+                    crate::shard::slice::with_shard(|s| {
                         timers::run_mvcc_sweep(
-                            &mut *shard_databases.vector_store(shard_id),
+                            &mut s.vector_store,
                             #[cfg(feature = "graph")]
-                            &mut *shard_databases.graph_store_write(shard_id),
+                            &mut s.graph_store,
                             server_config.mvcc_committed_prune_margin,
                             server_config.max_unflushed_immutable_segments,
                             server_config.mvcc_old_snapshot_threshold_secs,
                         );
-                    }
+                    });
                     // P6: ceiling-trigger — runs at 1s cadence to avoid the
                     // read_dir syscall overhead of wal.stats() on every 1ms tick.
                     if let (Some(ckpt_mgr), Some(page_cache_inst), Some(wal_v3), Some(manifest), Some(ctrl), Some(ctrl_path)) =
@@ -1563,22 +1435,9 @@ impl super::Shard {
                         if let Some(ref mut manifest) = shard_manifest {
                             let shard_dir = server_config.effective_disk_offload_dir()
                                 .join(format!("shard-{}", shard_id));
-                            // Phase 2d: gate on is_initialized(); new path uses ShardSlice directly.
-                            if crate::shard::slice::is_initialized() {
-                                crate::shard::slice::with_shard(|s| {
-                                    persistence_tick::check_warm_transitions(
-                                        &s.vector_store,
-                                        &shard_dir,
-                                        manifest,
-                                        server_config.segment_warm_after,
-                                        &mut next_file_id,
-                                        shard_id,
-                                        &mut wal_v3_writer,
-                                    );
-                                });
-                            } else {
+                            crate::shard::slice::with_shard(|s| {
                                 persistence_tick::check_warm_transitions(
-                                    &*shard_databases.vector_store(shard_id),
+                                    &s.vector_store,
                                     &shard_dir,
                                     manifest,
                                     server_config.segment_warm_after,
@@ -1586,28 +1445,19 @@ impl super::Shard {
                                     shard_id,
                                     &mut wal_v3_writer,
                                 );
-                            }
+                            });
                         }
                     }
                     // Budget enforcement runs on every warm-check tick regardless of
                     // disk-offload state: warm segments can accumulate from in-memory
                     // compaction even without disk-offload enabled.
-                    // Phase 2d: gate on is_initialized(); new path uses ShardSlice directly.
-                    if crate::shard::slice::is_initialized() {
-                        crate::shard::slice::with_shard(|s| {
-                            persistence_tick::enforce_warm_mmap_budget(
-                                &s.vector_store,
-                                &mut warm_mmap_budget,
-                                shard_id,
-                            );
-                        });
-                    } else {
+                    crate::shard::slice::with_shard(|s| {
                         persistence_tick::enforce_warm_mmap_budget(
-                            &*shard_databases.vector_store(shard_id),
+                            &s.vector_store,
                             &mut warm_mmap_budget,
                             shard_id,
                         );
-                    }
+                    });
                 }
                 // Cold tier transition check (60s, disk-offload only)
                 _ = cold_check_interval.0.tick() => {
@@ -1615,28 +1465,16 @@ impl super::Shard {
                         if let Some(ref mut manifest) = shard_manifest {
                             let shard_dir = server_config.effective_disk_offload_dir()
                                 .join(format!("shard-{}", shard_id));
-                            // Phase 2d: gate on is_initialized(); new path uses ShardSlice directly.
-                            if crate::shard::slice::is_initialized() {
-                                crate::shard::slice::with_shard(|s| {
-                                    persistence_tick::check_cold_transitions(
-                                        &s.vector_store,
-                                        &shard_dir,
-                                        manifest,
-                                        server_config.segment_cold_after,
-                                        &mut next_file_id,
-                                        shard_id,
-                                    );
-                                });
-                            } else {
+                            crate::shard::slice::with_shard(|s| {
                                 persistence_tick::check_cold_transitions(
-                                    &*shard_databases.vector_store(shard_id),
+                                    &s.vector_store,
                                     &shard_dir,
                                     manifest,
                                     server_config.segment_cold_after,
                                     &mut next_file_id,
                                     shard_id,
                                 );
-                            }
+                            });
                         }
                     }
                 }
@@ -1706,29 +1544,11 @@ impl super::Shard {
                 }
                 // P4: Autovacuum daemon tick (default 30s interval).
                 _ = autovacuum_interval.0.tick() => {
-                    // Phase 2d: gate on is_initialized(); new path uses ShardSlice directly.
-                    if crate::shard::slice::is_initialized() {
-                        crate::shard::slice::with_shard(|s| {
-                            autovacuum_daemon.run_tick(
-                                &mut s.vector_store,
-                                #[cfg(feature = "graph")]
-                                &mut s.graph_store,
-                                shard_manifest.as_mut(),
-                                wal_v3_writer.as_mut(),
-                                server_config.max_wal_size_bytes(),
-                                server_config.manifest_tombstone_retain_epochs,
-                                server_config.manifest_tombstone_retain_secs,
-                                server_config.max_unflushed_immutable_segments as usize,
-                                server_config.graph_merge_max_segments,
-                                server_config.graph_dead_edge_trigger,
-                                false,
-                            );
-                        });
-                    } else {
+                    crate::shard::slice::with_shard(|s| {
                         autovacuum_daemon.run_tick(
-                            &mut *shard_databases.vector_store(shard_id),
+                            &mut s.vector_store,
                             #[cfg(feature = "graph")]
-                            &mut *shard_databases.graph_store_write(shard_id),
+                            &mut s.graph_store,
                             shard_manifest.as_mut(),
                             wal_v3_writer.as_mut(),
                             server_config.max_wal_size_bytes(),
@@ -1739,7 +1559,7 @@ impl super::Shard {
                             server_config.graph_dead_edge_trigger,
                             false,
                         );
-                    }
+                    });
                 }
                 _ = shutdown.cancelled() => {
                     info!("Shard {} shutting down", self.id);
@@ -1756,35 +1576,23 @@ impl super::Shard {
                         persistence_tick::force_checkpoint(ckpt_mgr, page_cache_inst, wal_v3, manifest, ctrl, ctrl_path, shard_id, server_config.manifest_tombstone_retain_epochs, server_config.manifest_tombstone_retain_secs);
                     }
                     // Persist graph store to disk on shutdown.
-                    // Phase 2d: gate on is_initialized(); new path uses ShardSlice directly.
                     #[cfg(feature = "graph")]
                     if let Some(ref dir) = persistence_dir {
-                        if crate::shard::slice::is_initialized() {
-                            crate::shard::slice::with_shard(|s| {
-                                if s.graph_store.graph_count() > 0 {
-                                    if let Err(e) = crate::graph::recovery::save_graph_store(
-                                        &s.graph_store,
-                                        std::path::Path::new(dir),
-                                        shard_id,
-                                    ) {
-                                        tracing::warn!(
-                                            "Shard {shard_id}: failed to save graph store on shutdown: {e}"
-                                        );
-                                    } else {
-                                        info!("Shard {shard_id}: graph store saved to {dir}");
-                                    }
-                                }
-                            });
-                        } else {
-                            let gs = shard_databases.graph_store_read(shard_id);
-                            if gs.graph_count() > 0 {
-                                if let Err(e) = crate::graph::recovery::save_graph_store(&gs, std::path::Path::new(dir), shard_id) {
-                                    tracing::warn!("Shard {shard_id}: failed to save graph store on shutdown: {e}");
+                        crate::shard::slice::with_shard(|s| {
+                            if s.graph_store.graph_count() > 0 {
+                                if let Err(e) = crate::graph::recovery::save_graph_store(
+                                    &s.graph_store,
+                                    std::path::Path::new(dir),
+                                    shard_id,
+                                ) {
+                                    tracing::warn!(
+                                        "Shard {shard_id}: failed to save graph store on shutdown: {e}"
+                                    );
                                 } else {
                                     info!("Shard {shard_id}: graph store saved to {dir}");
                                 }
                             }
-                        }
+                        });
                     }
                     if let Some(ref mut wal) = wal_writer {
                         let _ = wal.shutdown();
@@ -1960,62 +1768,31 @@ impl super::Shard {
                 // --- Every-wake body (mirrors the tokio notify arm): drain SPSC,
                 //     handle drain outputs, sweep the pending_wakers relay ---
                 let mut pending_snapshot = None;
-                // Phase 2d: gate on is_initialized(); new path uses ShardSlice directly.
-                let hit_cap = if crate::shard::slice::is_initialized() {
-                    crate::shard::slice::with_shard(|s| {
-                        spsc_handler::drain_spsc_shared(
-                            &shard_databases,
-                            &mut consumers,
-                            &mut *pubsub_arc.write(),
-                            &blocking_rc,
-                            &mut pending_snapshot,
-                            &mut snapshot_state,
-                            &mut wal_writer,
-                            &mut wal_v3_writer,
-                            &repl_backlog,
-                            &mut replica_txs,
-                            &repl_offsets,
-                            shard_id,
-                            &script_cache_rc,
-                            &cached_clock,
-                            &mut pending_migrations,
-                            &mut s.vector_store,
-                            &mut pending_cdc_subscribes,
-                            &mut shard_manifest,
-                            server_config.mvcc_committed_prune_margin,
-                            server_config.graph_merge_max_segments,
-                            server_config.graph_dead_edge_trigger,
-                            &mut autovacuum_daemon,
-                            aof_pool.as_ref(), // FIX-W1-2
-                        )
-                    })
-                } else {
-                    spsc_handler::drain_spsc_shared(
-                        &shard_databases,
-                        &mut consumers,
-                        &mut *pubsub_arc.write(),
-                        &blocking_rc,
-                        &mut pending_snapshot,
-                        &mut snapshot_state,
-                        &mut wal_writer,
-                        &mut wal_v3_writer,
-                        &repl_backlog,
-                        &mut replica_txs,
-                        &repl_offsets,
-                        shard_id,
-                        &script_cache_rc,
-                        &cached_clock,
-                        &mut pending_migrations,
-                        &mut *shard_databases.vector_store(shard_id),
-                        &mut pending_cdc_subscribes,
-                        &mut shard_manifest,
-                        server_config.mvcc_committed_prune_margin,
-                        server_config.graph_merge_max_segments,
-                        server_config.graph_dead_edge_trigger,
-                        &mut autovacuum_daemon,
-                        aof_pool.as_ref(), // FIX-W1-2
-                    )
-                };
+                // No outer with_shard — each arm takes its own flat borrow.
+                let hit_cap = spsc_handler::drain_spsc_shared(
+                    &shard_databases,
+                    &mut consumers,
+                    &mut *pubsub_arc.write(),
+                    &blocking_rc,
+                    &mut pending_snapshot,
+                    &mut snapshot_state,
+                    &mut wal_writer,
+                    &mut wal_v3_writer,
+                    &repl_backlog,
+                    &mut replica_txs,
+                    &repl_offsets,
+                    shard_id,
+                    &script_cache_rc,
+                    &cached_clock,
+                    &mut pending_migrations,
+                    &mut pending_cdc_subscribes,
+                    &mut shard_manifest,
+                    server_config.mvcc_committed_prune_margin,
+                    server_config.graph_merge_max_segments,
+                    server_config.graph_dead_edge_trigger,
+                    &mut autovacuum_daemon,
+                    aof_pool.as_ref(), // FIX-W1-2
+                );
                 if hit_cap {
                     // M3: the drain stopped at its per-cycle cap (or a snapshot
                     // barrier) — re-arm immediately so the tail drains on the next
@@ -2256,28 +2033,16 @@ impl super::Shard {
                     timers::sync_wal_v3(&mut wal_v3_writer);
                     // P3+MA1+MA2: MVCC committed prune + zombie sweep + kill old snapshots
                     //             + RECL_* + segment-stall.
-                    // Phase 2d: gate on is_initialized(); new path uses ShardSlice directly.
-                    if crate::shard::slice::is_initialized() {
-                        crate::shard::slice::with_shard(|s| {
-                            timers::run_mvcc_sweep(
-                                &mut s.vector_store,
-                                #[cfg(feature = "graph")]
-                                &mut s.graph_store,
-                                server_config.mvcc_committed_prune_margin,
-                                server_config.max_unflushed_immutable_segments,
-                                server_config.mvcc_old_snapshot_threshold_secs,
-                            );
-                        });
-                    } else {
+                    crate::shard::slice::with_shard(|s| {
                         timers::run_mvcc_sweep(
-                            &mut *shard_databases.vector_store(shard_id),
+                            &mut s.vector_store,
                             #[cfg(feature = "graph")]
-                            &mut *shard_databases.graph_store_write(shard_id),
+                            &mut s.graph_store,
                             server_config.mvcc_committed_prune_margin,
                             server_config.max_unflushed_immutable_segments,
                             server_config.mvcc_old_snapshot_threshold_secs,
                         );
-                    }
+                    });
                     if let (
                         Some(ckpt_mgr),
                         Some(page_cache_inst),
@@ -2316,22 +2081,9 @@ impl super::Shard {
                             let shard_dir = server_config
                                 .effective_disk_offload_dir()
                                 .join(format!("shard-{}", shard_id));
-                            // Phase 2d: gate on is_initialized(); new path uses ShardSlice directly.
-                            if crate::shard::slice::is_initialized() {
-                                crate::shard::slice::with_shard(|s| {
-                                    persistence_tick::check_warm_transitions(
-                                        &s.vector_store,
-                                        &shard_dir,
-                                        manifest,
-                                        server_config.segment_warm_after,
-                                        &mut next_file_id,
-                                        shard_id,
-                                        &mut wal_v3_writer,
-                                    );
-                                });
-                            } else {
+                            crate::shard::slice::with_shard(|s| {
                                 persistence_tick::check_warm_transitions(
-                                    &*shard_databases.vector_store(shard_id),
+                                    &s.vector_store,
                                     &shard_dir,
                                     manifest,
                                     server_config.segment_warm_after,
@@ -2339,26 +2091,17 @@ impl super::Shard {
                                     shard_id,
                                     &mut wal_v3_writer,
                                 );
-                            }
+                            });
                         }
                     }
                     // Budget enforcement: runs on every warm-check tick.
-                    // Phase 2d: gate on is_initialized(); new path uses ShardSlice directly.
-                    if crate::shard::slice::is_initialized() {
-                        crate::shard::slice::with_shard(|s| {
-                            persistence_tick::enforce_warm_mmap_budget(
-                                &s.vector_store,
-                                &mut warm_mmap_budget,
-                                shard_id,
-                            );
-                        });
-                    } else {
+                    crate::shard::slice::with_shard(|s| {
                         persistence_tick::enforce_warm_mmap_budget(
-                            &*shard_databases.vector_store(shard_id),
+                            &s.vector_store,
                             &mut warm_mmap_budget,
                             shard_id,
                         );
-                    }
+                    });
                 }
                 // Cold tier check: every cold_poll_secs * 1000 ticks
                 if monoio_tick_counter % (cold_poll_secs as u64 * 1000) == 0 {
@@ -2368,28 +2111,16 @@ impl super::Shard {
                             let shard_dir = server_config
                                 .effective_disk_offload_dir()
                                 .join(format!("shard-{}", shard_id));
-                            // Phase 2d: gate on is_initialized(); new path uses ShardSlice directly.
-                            if crate::shard::slice::is_initialized() {
-                                crate::shard::slice::with_shard(|s| {
-                                    persistence_tick::check_cold_transitions(
-                                        &s.vector_store,
-                                        &shard_dir,
-                                        manifest,
-                                        server_config.segment_cold_after,
-                                        &mut next_file_id,
-                                        shard_id,
-                                    );
-                                });
-                            } else {
+                            crate::shard::slice::with_shard(|s| {
                                 persistence_tick::check_cold_transitions(
-                                    &*shard_databases.vector_store(shard_id),
+                                    &s.vector_store,
                                     &shard_dir,
                                     manifest,
                                     server_config.segment_cold_after,
                                     &mut next_file_id,
                                     shard_id,
                                 );
-                            }
+                            });
                         }
                     }
                 }
@@ -2401,29 +2132,11 @@ impl super::Shard {
                 if monoio_tick_counter % (autovacuum_interval_secs * 1000) == 0
                     && monoio_tick_counter > 0
                 {
-                    // Phase 2d: gate on is_initialized(); new path uses ShardSlice directly.
-                    if crate::shard::slice::is_initialized() {
-                        crate::shard::slice::with_shard(|s| {
-                            autovacuum_daemon.run_tick(
-                                &mut s.vector_store,
-                                #[cfg(feature = "graph")]
-                                &mut s.graph_store,
-                                shard_manifest.as_mut(),
-                                wal_v3_writer.as_mut(),
-                                server_config.max_wal_size_bytes(),
-                                server_config.manifest_tombstone_retain_epochs,
-                                server_config.manifest_tombstone_retain_secs,
-                                server_config.max_unflushed_immutable_segments as usize,
-                                server_config.graph_merge_max_segments,
-                                server_config.graph_dead_edge_trigger,
-                                false,
-                            );
-                        });
-                    } else {
+                    crate::shard::slice::with_shard(|s| {
                         autovacuum_daemon.run_tick(
-                            &mut *shard_databases.vector_store(shard_id),
+                            &mut s.vector_store,
                             #[cfg(feature = "graph")]
-                            &mut *shard_databases.graph_store_write(shard_id),
+                            &mut s.graph_store,
                             shard_manifest.as_mut(),
                             wal_v3_writer.as_mut(),
                             server_config.max_wal_size_bytes(),
@@ -2434,7 +2147,7 @@ impl super::Shard {
                             server_config.graph_dead_edge_trigger,
                             false,
                         );
-                    }
+                    });
                 }
                 // Cold-tier orphan sweep (P9): every orphan_sweep_interval_secs * 1000 ticks.
                 // Matches the tokio select! branch above. Disabled when interval is 0.

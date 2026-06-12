@@ -278,7 +278,15 @@ fn bgrewriteaof_base_plus_incr_recovers_exact() {
     const PRE: i64 = 300;
     const POST: i64 = 200;
 
-    let port = unique_port().saturating_add(1);
+    // Plain unique_port(), NOT unique_port()+1: macOS allocates ephemeral
+    // ports sequentially, so when this test runs in parallel with the
+    // straddle test, `+1` lands exactly on the port the straddle test's own
+    // unique_port() call returns next. Both moons then bind the SAME port via
+    // SO_REUSEPORT (no bind error) and the kernel splits each test's
+    // redis-cli connections between the two servers — INCRs land on the
+    // wrong server and the rewrite asserts fire ("rewrite did not compact").
+    // Two independent kernel allocations never return the same port.
+    let port = unique_port();
     let dir = unique_dir("compose");
     std::fs::create_dir_all(&dir).expect("create test dir");
 
