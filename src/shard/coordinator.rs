@@ -120,7 +120,6 @@ pub async fn coordinate_multi_key(
 /// (identical semantics to a remote MultiExecute leg, minus the hop).
 fn run_local(
     shard_databases: &Arc<ShardDatabases>,
-    my_shard: usize,
     db_index: usize,
     cached_clock: &CachedClock,
     cmd: &[u8],
@@ -128,19 +127,13 @@ fn run_local(
 ) -> Frame {
     let db_count = shard_databases.db_count();
     let mut selected = db_index;
-    let mut run = |db: &mut crate::storage::Database| {
+    let run = |db: &mut crate::storage::Database| {
         db.refresh_now_from_cache(cached_clock);
         match cmd_dispatch(db, cmd, args, &mut selected, db_count) {
             DispatchResult::Response(f) | DispatchResult::Quit(f) => f,
         }
     };
-    // Phase 2c: gate on is_initialized(); new path uses ShardSlice directly.
-    if crate::shard::slice::is_initialized() {
-        crate::shard::slice::with_shard_db(db_index, run)
-    } else {
-        let mut guard = shard_databases.write_db(my_shard, db_index);
-        run(&mut guard)
-    }
+    crate::shard::slice::with_shard_db(db_index, run)
 }
 
 /// Send one full command to a REMOTE shard and await its reply.
@@ -187,14 +180,7 @@ async fn run_on_owner(
             Some((Frame::BulkString(c), rest)) => (c.clone(), rest),
             _ => return Frame::Error(Bytes::from_static(b"ERR invalid command format")),
         };
-        run_local(
-            shard_databases,
-            my_shard,
-            db_index,
-            cached_clock,
-            &cmd,
-            args,
-        )
+        run_local(shard_databases, db_index, cached_clock, &cmd, args)
     } else {
         let command = Frame::Array(command_parts.to_vec().into());
         run_remote(
@@ -240,14 +226,7 @@ async fn coordinate_bitop(
     // Single-shard server: straight to local dispatch — zero coordinator
     // overhead (no key vec, no owner hashing) on the 1-shard hot path.
     if num_shards == 1 {
-        return run_local(
-            shard_databases,
-            my_shard,
-            db_index,
-            cached_clock,
-            b"BITOP",
-            args,
-        );
+        return run_local(shard_databases, db_index, cached_clock, b"BITOP", args);
     }
     if args.len() < 3 {
         return Frame::Error(Bytes::from_static(
@@ -317,7 +296,6 @@ async fn coordinate_bitop(
             for (idx, key) in indexed {
                 let reply = run_local(
                     shard_databases,
-                    my_shard,
                     db_index,
                     cached_clock,
                     b"GET",
@@ -440,14 +418,7 @@ async fn coordinate_copy(
     // Single-shard server: straight to local dispatch — zero coordinator
     // overhead on the 1-shard hot path.
     if num_shards == 1 {
-        return run_local(
-            shard_databases,
-            my_shard,
-            db_index,
-            cached_clock,
-            b"COPY",
-            args,
-        );
+        return run_local(shard_databases, db_index, cached_clock, b"COPY", args);
     }
     if args.len() < 2 {
         return Frame::Error(Bytes::from_static(
@@ -640,7 +611,7 @@ async fn coordinate_mget(
     my_shard: usize,
     num_shards: usize,
     db_index: usize,
-    shard_databases: &Arc<ShardDatabases>,
+    _shard_databases: &Arc<ShardDatabases>,
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
     spsc_notifiers: &[Arc<channel::Notify>],
     cached_clock: &CachedClock,
@@ -663,16 +634,10 @@ async fn coordinate_mget(
 
     // Fast path: all keys on local shard -- use mget directly
     if groups.len() == 1 && groups.contains_key(&my_shard) {
-        // Phase 2c: gate on is_initialized(); new path uses ShardSlice directly.
-        if crate::shard::slice::is_initialized() {
-            return crate::shard::slice::with_shard_db(db_index, |db| {
-                db.refresh_now_from_cache(cached_clock);
-                crate::command::string::mget(db, args)
-            });
-        }
-        let mut guard = shard_databases.write_db(my_shard, db_index);
-        guard.refresh_now_from_cache(cached_clock);
-        return crate::command::string::mget(&mut guard, args);
+        return crate::shard::slice::with_shard_db(db_index, |db| {
+            db.refresh_now_from_cache(cached_clock);
+            crate::command::string::mget(db, args)
+        });
     }
 
     let total = args.len();
@@ -685,27 +650,10 @@ async fn coordinate_mget(
 
         if *shard_id == my_shard {
             // Local execution: GET each key directly
-            // Phase 2c: gate on is_initialized(); new path uses ShardSlice directly.
-            if crate::shard::slice::is_initialized() {
-                crate::shard::slice::with_shard_db(db_index, |db| {
-                    db.refresh_now_from_cache(cached_clock);
-                    for (orig_idx, key) in indexed_keys {
-                        let entry = db.get(key);
-                        let frame = match entry {
-                            Some(e) => match e.value.as_bytes() {
-                                Some(v) => Frame::BulkString(Bytes::copy_from_slice(v)),
-                                None => Frame::Null,
-                            },
-                            None => Frame::Null,
-                        };
-                        results[*orig_idx] = Some(frame);
-                    }
-                });
-            } else {
-                let mut guard = shard_databases.write_db(my_shard, db_index);
-                guard.refresh_now_from_cache(cached_clock);
+            crate::shard::slice::with_shard_db(db_index, |db| {
+                db.refresh_now_from_cache(cached_clock);
                 for (orig_idx, key) in indexed_keys {
-                    let entry = guard.get(key);
+                    let entry = db.get(key);
                     let frame = match entry {
                         Some(e) => match e.value.as_bytes() {
                             Some(v) => Frame::BulkString(Bytes::copy_from_slice(v)),
@@ -715,7 +663,7 @@ async fn coordinate_mget(
                     };
                     results[*orig_idx] = Some(frame);
                 }
-            }
+            });
         } else {
             // Remote dispatch: batch of GET commands via MultiExecuteSlotted
             let (reply_tx, reply_rx) = channel::oneshot();
@@ -776,7 +724,7 @@ async fn coordinate_mset(
     my_shard: usize,
     num_shards: usize,
     db_index: usize,
-    shard_databases: &Arc<ShardDatabases>,
+    _shard_databases: &Arc<ShardDatabases>,
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
     spsc_notifiers: &[Arc<channel::Notify>],
     cached_clock: &CachedClock,
@@ -813,37 +761,22 @@ async fn coordinate_mset(
 
     // Fast path: all keys on local shard
     if groups.len() == 1 && groups.contains_key(&my_shard) {
-        // Phase 2c: gate on is_initialized(); new path uses ShardSlice directly.
-        if crate::shard::slice::is_initialized() {
-            return crate::shard::slice::with_shard_db(db_index, |db| {
-                db.refresh_now_from_cache(cached_clock);
-                crate::command::string::mset(db, args)
-            });
-        }
-        let mut guard = shard_databases.write_db(my_shard, db_index);
-        guard.refresh_now_from_cache(cached_clock);
-        return crate::command::string::mset(&mut guard, args);
+        return crate::shard::slice::with_shard_db(db_index, |db| {
+            db.refresh_now_from_cache(cached_clock);
+            crate::command::string::mset(db, args)
+        });
     }
 
     let mut pending_shards: Vec<channel::OneshotReceiver<Vec<Frame>>> = Vec::new();
 
     for (shard_id, kv_pairs) in &groups {
         if *shard_id == my_shard {
-            // Phase 2c: gate on is_initialized(); new path uses ShardSlice directly.
-            if crate::shard::slice::is_initialized() {
-                crate::shard::slice::with_shard_db(db_index, |db| {
-                    db.refresh_now_from_cache(cached_clock);
-                    for (key, value) in kv_pairs {
-                        db.set_string(key.clone(), value.clone());
-                    }
-                });
-            } else {
-                let mut guard = shard_databases.write_db(my_shard, db_index);
-                guard.refresh_now_from_cache(cached_clock);
+            crate::shard::slice::with_shard_db(db_index, |db| {
+                db.refresh_now_from_cache(cached_clock);
                 for (key, value) in kv_pairs {
-                    guard.set_string(key.clone(), value.clone());
+                    db.set_string(key.clone(), value.clone());
                 }
-            }
+            });
         } else {
             let (reply_tx, reply_rx) = channel::oneshot();
             let commands: Vec<(Bytes, Frame)> = kv_pairs
@@ -907,17 +840,10 @@ async fn coordinate_multi_del_or_exists(
     // Fast path: all keys on local shard
     if groups.len() == 1 && groups.contains_key(&my_shard) {
         let mut selected = db_index;
-        // Phase 2c: gate on is_initialized(); new path uses ShardSlice directly.
-        let result = if crate::shard::slice::is_initialized() {
-            crate::shard::slice::with_shard_db(db_index, |db| {
-                db.refresh_now_from_cache(cached_clock);
-                cmd_dispatch(db, cmd, args, &mut selected, db_count)
-            })
-        } else {
-            let mut guard = shard_databases.write_db(my_shard, db_index);
-            guard.refresh_now_from_cache(cached_clock);
-            cmd_dispatch(&mut guard, cmd, args, &mut selected, db_count)
-        };
+        let result = crate::shard::slice::with_shard_db(db_index, |db| {
+            db.refresh_now_from_cache(cached_clock);
+            cmd_dispatch(db, cmd, args, &mut selected, db_count)
+        });
         return match result {
             DispatchResult::Response(f) => f,
             DispatchResult::Quit(f) => f,
@@ -930,17 +856,10 @@ async fn coordinate_multi_del_or_exists(
     for (shard_id, key_args) in &groups {
         if *shard_id == my_shard {
             let mut selected = db_index;
-            // Phase 2c: gate on is_initialized(); new path uses ShardSlice directly.
-            let result = if crate::shard::slice::is_initialized() {
-                crate::shard::slice::with_shard_db(db_index, |db| {
-                    db.refresh_now_from_cache(cached_clock);
-                    cmd_dispatch(db, cmd, key_args, &mut selected, db_count)
-                })
-            } else {
-                let mut guard = shard_databases.write_db(my_shard, db_index);
-                guard.refresh_now_from_cache(cached_clock);
-                cmd_dispatch(&mut guard, cmd, key_args, &mut selected, db_count)
-            };
+            let result = crate::shard::slice::with_shard_db(db_index, |db| {
+                db.refresh_now_from_cache(cached_clock);
+                cmd_dispatch(db, cmd, key_args, &mut selected, db_count)
+            });
             if let DispatchResult::Response(Frame::Integer(n)) = result {
                 total_count += n;
             }
@@ -1016,17 +935,10 @@ pub async fn coordinate_keys(
     {
         let db_count = shard_databases.db_count();
         let mut selected = db_index;
-        // Phase 2c: gate on is_initialized(); new path uses ShardSlice directly.
-        let result = if crate::shard::slice::is_initialized() {
-            crate::shard::slice::with_shard_db(db_index, |db| {
-                db.refresh_now_from_cache(cached_clock);
-                cmd_dispatch(db, b"KEYS", args, &mut selected, db_count)
-            })
-        } else {
-            let mut guard = shard_databases.write_db(my_shard, db_index);
-            guard.refresh_now_from_cache(cached_clock);
-            cmd_dispatch(&mut guard, b"KEYS", args, &mut selected, db_count)
-        };
+        let result = crate::shard::slice::with_shard_db(db_index, |db| {
+            db.refresh_now_from_cache(cached_clock);
+            cmd_dispatch(db, b"KEYS", args, &mut selected, db_count)
+        });
         if let DispatchResult::Response(Frame::Array(keys)) = result {
             all_keys.extend(keys);
         }
@@ -1120,17 +1032,10 @@ pub async fn coordinate_scan(
     let scan_result = if target_shard_id == my_shard {
         let db_count = shard_databases.db_count();
         let mut selected = db_index;
-        // Phase 2c: gate on is_initialized(); new path uses ShardSlice directly.
-        let result = if crate::shard::slice::is_initialized() {
-            crate::shard::slice::with_shard_db(db_index, |db| {
-                db.refresh_now_from_cache(cached_clock);
-                cmd_dispatch(db, b"SCAN", &scan_args, &mut selected, db_count)
-            })
-        } else {
-            let mut guard = shard_databases.write_db(my_shard, db_index);
-            guard.refresh_now_from_cache(cached_clock);
-            cmd_dispatch(&mut guard, b"SCAN", &scan_args, &mut selected, db_count)
-        };
+        let result = crate::shard::slice::with_shard_db(db_index, |db| {
+            db.refresh_now_from_cache(cached_clock);
+            cmd_dispatch(db, b"SCAN", &scan_args, &mut selected, db_count)
+        });
         match result {
             DispatchResult::Response(f) => f,
             DispatchResult::Quit(f) => f,
@@ -1202,7 +1107,7 @@ pub async fn coordinate_dbsize(
     my_shard: usize,
     num_shards: usize,
     db_index: usize,
-    shard_databases: &Arc<ShardDatabases>,
+    _shard_databases: &Arc<ShardDatabases>,
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
     spsc_notifiers: &[Arc<channel::Notify>],
     _response_pool: &(), // placeholder — coordinator uses oneshot internally
@@ -1212,13 +1117,7 @@ pub async fn coordinate_dbsize(
 
     // Local shard
     {
-        // Phase 2c: gate on is_initialized(); new path uses ShardSlice directly.
-        let local_len = if crate::shard::slice::is_initialized() {
-            crate::shard::slice::with_shard_db(db_index, |db| db.len()) as i64
-        } else {
-            let guard = shard_databases.read_db(my_shard, db_index);
-            guard.len() as i64
-        };
+        let local_len = crate::shard::slice::with_shard_db(db_index, |db| db.len()) as i64;
         total += local_len;
     }
 
@@ -1262,7 +1161,7 @@ pub async fn coordinate_hotkeys(
     my_shard: usize,
     num_shards: usize,
     db_index: usize,
-    shard_databases: &Arc<ShardDatabases>,
+    _shard_databases: &Arc<ShardDatabases>,
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
     spsc_notifiers: &[Arc<channel::Notify>],
     _response_pool: &(), // placeholder — coordinator uses oneshot internally
@@ -1271,12 +1170,7 @@ pub async fn coordinate_hotkeys(
 
     // Local shard: read the sketch directly.
     {
-        let local = if crate::shard::slice::is_initialized() {
-            crate::shard::slice::with_shard_db(db_index, |db| db.hot_keys().top(count))
-        } else {
-            let guard = shard_databases.read_db(my_shard, db_index);
-            guard.hot_keys().top(count)
-        };
+        let local = crate::shard::slice::with_shard_db(db_index, |db| db.hot_keys().top(count));
         merged.extend(local.into_iter().map(|(k, c)| (k, c as i64)));
     }
 
@@ -1428,29 +1322,14 @@ pub async fn scatter_vector_search_remote(
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
     spsc_notifiers: &[Arc<channel::Notify>],
 ) -> Frame {
+    let _ = shard_databases; // E2 removes
     // LOCAL: direct vector store access (avoids SPSC self-send).
     // Phase 171 SCAT-01: honor AS_OF on the coordinator's own shard by
     // routing through `search_local_filtered` with the resolved LSN rather
     // than the AS_OF-unaware `search_local` helper.
-    // Phase 2c: gate on is_initialized(); new path uses ShardSlice directly.
-    let local_result = if crate::shard::slice::is_initialized() {
-        crate::shard::slice::with_shard(|s| {
-            crate::command::vector_search::search_local_filtered(
-                &mut s.vector_store,
-                &index_name,
-                &query_blob,
-                k,
-                None,
-                0,
-                usize::MAX,
-                None,
-                as_of_lsn,
-            )
-        })
-    } else {
-        let mut vs = shard_databases.vector_store(my_shard);
+    let local_result = crate::shard::slice::with_shard(|s| {
         crate::command::vector_search::search_local_filtered(
-            &mut vs,
+            &mut s.vector_store,
             &index_name,
             &query_blob,
             k,
@@ -1460,7 +1339,7 @@ pub async fn scatter_vector_search_remote(
             None,
             as_of_lsn,
         )
-    };
+    });
 
     // REMOTE: SPSC to all other shards
     let mut receivers = Vec::with_capacity(num_shards.saturating_sub(1));
@@ -1513,6 +1392,7 @@ pub async fn broadcast_vector_command(
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
     spsc_notifiers: &[Arc<channel::Notify>],
 ) -> Frame {
+    let _ = shard_databases; // E2 removes
     // REMOTE FIRST: send to all other shards via SPSC before local mutation.
     // This ensures we detect remote failures before committing locally,
     // avoiding partial index metadata across the cluster.
@@ -1552,62 +1432,36 @@ pub async fn broadcast_vector_command(
         _ => false,
     };
 
-    // Phase 2c: gate on is_initialized(); new path uses ShardSlice with
-    // disjoint borrows of vector_store / text_store / graph_store / databases[0].
-    let local_result = if crate::shard::slice::is_initialized() {
-        crate::shard::slice::with_shard(|s| {
-            // Split borrows so rustc sees `&mut s.vector_store`,
-            // `&mut s.text_store`, `&s.graph_store`, and optional
-            // `&mut s.databases[0]` as four disjoint fields.
-            let (db_slice, vs, ts);
-            #[cfg(feature = "graph")]
-            let graph_ref;
-            // Reborrow each field through `&mut *s` so the compiler
-            // tracks them independently.
-            {
-                vs = &mut s.vector_store;
-                ts = &mut s.text_store;
-                #[cfg(feature = "graph")]
-                {
-                    graph_ref = &s.graph_store;
-                }
-                db_slice = &mut s.databases;
-            }
-            let db_opt = if is_dropindex {
-                db_slice.get_mut(0)
-            } else {
-                None
-            };
-            crate::shard::spsc_handler::dispatch_vector_command(
-                vs,
-                ts,
-                #[cfg(feature = "graph")]
-                Some(graph_ref),
-                &command,
-                db_opt,
-            )
-        })
-    } else {
-        let mut vs = shard_databases.vector_store(my_shard);
-        let mut ts = shard_databases.text_store(my_shard);
+    // Split borrows so rustc sees `&mut s.vector_store`,
+    // `&mut s.text_store`, `&s.graph_store`, and optional
+    // `&mut s.databases[0]` as four disjoint fields.
+    let local_result = crate::shard::slice::with_shard(|s| {
+        let (db_slice, vs, ts);
         #[cfg(feature = "graph")]
-        let graph_guard = shard_databases.graph_store_read(my_shard);
-        let mut db_guard;
+        let graph_ref;
+        {
+            vs = &mut s.vector_store;
+            ts = &mut s.text_store;
+            #[cfg(feature = "graph")]
+            {
+                graph_ref = &s.graph_store;
+            }
+            db_slice = &mut s.databases;
+        }
         let db_opt = if is_dropindex {
-            db_guard = shard_databases.write_db(my_shard, 0);
-            Some(&mut *db_guard)
+            db_slice.get_mut(0)
         } else {
             None
         };
         crate::shard::spsc_handler::dispatch_vector_command(
-            &mut vs,
-            &mut *ts,
+            vs,
+            ts,
             #[cfg(feature = "graph")]
-            Some(&graph_guard),
+            Some(graph_ref),
             &command,
             db_opt,
         )
-    };
+    });
     local_result
 }
 
@@ -1630,6 +1484,7 @@ pub async fn scatter_invalidate_range(
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
     spsc_notifiers: &[Arc<channel::Notify>],
 ) -> Frame {
+    let _ = shard_databases; // E2 removes
     // PARTIAL-STATE: sends fire to all remotes in parallel, then we collect
     // sequentially. If any remote returns an error after others already
     // applied their deletes, this call returns Frame::Error but the
@@ -1673,31 +1528,16 @@ pub async fn scatter_invalidate_range(
     }
 
     // Execute locally and add to total.
-    let local = if crate::shard::slice::is_initialized() {
-        crate::shard::slice::with_shard(|s| {
-            crate::shard::spsc_handler::dispatch_vector_command(
-                &mut s.vector_store,
-                &mut s.text_store,
-                #[cfg(feature = "graph")]
-                Some(&s.graph_store),
-                &command,
-                None,
-            )
-        })
-    } else {
-        let mut vs = shard_databases.vector_store(my_shard);
-        let mut ts = shard_databases.text_store(my_shard);
-        #[cfg(feature = "graph")]
-        let graph_guard = shard_databases.graph_store_read(my_shard);
+    let local = crate::shard::slice::with_shard(|s| {
         crate::shard::spsc_handler::dispatch_vector_command(
-            &mut vs,
-            &mut *ts,
+            &mut s.vector_store,
+            &mut s.text_store,
             #[cfg(feature = "graph")]
-            Some(&graph_guard),
+            Some(&s.graph_store),
             &command,
             None,
         )
-    };
+    });
 
     match local {
         Frame::Integer(n) => Frame::Integer(total.saturating_add(n)),
@@ -1741,6 +1581,7 @@ pub async fn scatter_text_search(
     highlight_opts: Option<crate::command::vector_search::HighlightOpts>,
     summarize_opts: Option<crate::command::vector_search::SummarizeOpts>,
 ) -> Frame {
+    let _ = shard_databases; // E2 removes
     // Extract plain term strings for DocFreq phase (only needs term text, not modifiers).
     let term_strings: Vec<String> = query_terms.iter().map(|qt| qt.text.clone()).collect();
 
@@ -1749,44 +1590,12 @@ pub async fn scatter_text_search(
         // Local IDF is globally accurate with one shard — skip DFS pre-pass.
         // Apply HIGHLIGHT/SUMMARIZE post-processing after local search.
         //
-        // Phase 2c: gate on is_initialized(); new path holds text_store +
-        // databases[0] simultaneously via a single `with_shard` call to avoid
-        // a reentrant `with_shard*` panic.
-        let result = if crate::shard::slice::is_initialized() {
-            crate::shard::slice::with_shard(|s| {
-                let ts = &s.text_store;
-                let mut r =
-                    crate::command::vector_search::ft_text_search::execute_text_search_local(
-                        ts,
-                        &index_name,
-                        field_idx,
-                        &query_terms,
-                        top_k,
-                        offset,
-                        count,
-                    );
-                if highlight_opts.is_some() || summarize_opts.is_some() {
-                    // Get the text_index reference, then borrow databases[0]
-                    // disjointly. Both fields are tracked independently by rustc.
-                    if let Some(text_index) = ts.get_index(&index_name) {
-                        if let Some(db) = s.databases.get_mut(0) {
-                            crate::command::vector_search::ft_text_search::apply_post_processing(
-                                &mut r,
-                                &term_strings,
-                                text_index,
-                                db,
-                                highlight_opts.as_ref(),
-                                summarize_opts.as_ref(),
-                            );
-                        }
-                    }
-                }
-                r
-            })
-        } else {
-            let ts = shard_databases.text_store(my_shard);
+        // text_store + databases[0] accessed simultaneously via a single
+        // `with_shard` call to avoid a reentrant `with_shard*` panic.
+        let result = crate::shard::slice::with_shard(|s| {
+            let ts = &s.text_store;
             let mut r = crate::command::vector_search::ft_text_search::execute_text_search_local(
-                &ts,
+                ts,
                 &index_name,
                 field_idx,
                 &query_terms,
@@ -1794,24 +1603,24 @@ pub async fn scatter_text_search(
                 offset,
                 count,
             );
-            // Apply post-processing if requested — guards held, no .await below.
             if highlight_opts.is_some() || summarize_opts.is_some() {
+                // Get the text_index reference, then borrow databases[0]
+                // disjointly. Both fields are tracked independently by rustc.
                 if let Some(text_index) = ts.get_index(&index_name) {
-                    let db_guard = shard_databases.read_db(my_shard, 0);
-                    crate::command::vector_search::ft_text_search::apply_post_processing(
-                        &mut r,
-                        &term_strings,
-                        text_index,
-                        &*db_guard,
-                        highlight_opts.as_ref(),
-                        summarize_opts.as_ref(),
-                    );
-                    // db_guard drops here.
+                    if let Some(db) = s.databases.get_mut(0) {
+                        crate::command::vector_search::ft_text_search::apply_post_processing(
+                            &mut r,
+                            &term_strings,
+                            text_index,
+                            db,
+                            highlight_opts.as_ref(),
+                            summarize_opts.as_ref(),
+                        );
+                    }
                 }
             }
             r
-            // MutexGuard dropped here — no .await held
-        };
+        });
         return result;
     }
 
@@ -1826,9 +1635,8 @@ pub async fn scatter_text_search(
     for shard_id in 0..num_shards {
         if shard_id == my_shard {
             // Local: extract df/N directly — no SPSC overhead.
-            // CRITICAL: block scope drops MutexGuard before any .await (RESEARCH Pitfall 2).
-            // Phase 2c: gate on is_initialized(); new path uses ShardSlice directly.
-            let response = if crate::shard::slice::is_initialized() {
+            // Shard slice released before any .await.
+            let response =
                 crate::shard::slice::with_shard(|s| match s.text_store.get_index(&index_name) {
                     Some(text_index) => {
                         let mut items: Vec<Frame> = Vec::new();
@@ -1845,28 +1653,7 @@ pub async fn scatter_text_search(
                         Frame::Array(items.into())
                     }
                     None => Frame::Error(Bytes::from_static(b"ERR unknown index")),
-                })
-            } else {
-                let ts = shard_databases.text_store(shard_id);
-                match ts.get_index(&index_name) {
-                    Some(text_index) => {
-                        let mut items: Vec<Frame> = Vec::new();
-                        for (field_idx_opt, terms) in &field_queries {
-                            let fidx = field_idx_opt.unwrap_or(0);
-                            let (term_dfs, n) = text_index.doc_freq_for_terms(fidx, terms);
-                            for (term, df) in term_dfs {
-                                items.push(Frame::BulkString(Bytes::from(term)));
-                                items.push(Frame::Integer(i64::from(df)));
-                            }
-                            items.push(Frame::BulkString(Bytes::from_static(b"N")));
-                            items.push(Frame::Integer(i64::from(n)));
-                        }
-                        Frame::Array(items.into())
-                    }
-                    None => Frame::Error(Bytes::from_static(b"ERR unknown index")),
-                }
-                // MutexGuard dropped here, before .await below
-            };
+                });
             local_doc_freq = Some(response);
         } else {
             let (reply_tx, reply_rx) = channel::oneshot();
@@ -1905,45 +1692,11 @@ pub async fn scatter_text_search(
 
     for shard_id in 0..num_shards {
         if shard_id == my_shard {
-            // Local: execute with global IDF directly — block scope drops guard.
-            // CRITICAL: guard dropped before any .await (RESEARCH Pitfall 2).
-            // Phase 2c: gate on is_initialized(); fold text_store + databases[0]
-            // into a single `with_shard` to avoid reentrant `with_shard*` panic.
-            let response = if crate::shard::slice::is_initialized() {
-                crate::shard::slice::with_shard(|s| {
-                    match s.text_store.get_index(&index_name) {
-                        Some(text_index) => {
-                            let mut r =
-                                crate::command::vector_search::ft_text_search::execute_text_search_with_global_idf(
-                                    text_index,
-                                    field_idx,
-                                    &query_terms,
-                                    &global_df,
-                                    global_n,
-                                    top_k,
-                                    0,      // each shard returns top_k; coordinator applies final offset
-                                    top_k,
-                                );
-                            if highlight_opts.is_some() || summarize_opts.is_some() {
-                                if let Some(db) = s.databases.get_mut(0) {
-                                    crate::command::vector_search::ft_text_search::apply_post_processing(
-                                        &mut r,
-                                        &term_strings,
-                                        text_index,
-                                        db,
-                                        highlight_opts.as_ref(),
-                                        summarize_opts.as_ref(),
-                                    );
-                                }
-                            }
-                            r
-                        }
-                        None => Frame::Error(Bytes::from_static(b"ERR unknown index")),
-                    }
-                })
-            } else {
-                let ts = shard_databases.text_store(shard_id);
-                match ts.get_index(&index_name) {
+            // Local: execute with global IDF directly.
+            // text_store + databases[0] folded into a single `with_shard` to
+            // avoid reentrant `with_shard*` panic. Slice released before .await.
+            let response = crate::shard::slice::with_shard(|s| {
+                match s.text_store.get_index(&index_name) {
                     Some(text_index) => {
                         let mut r =
                             crate::command::vector_search::ft_text_search::execute_text_search_with_global_idf(
@@ -1956,25 +1709,23 @@ pub async fn scatter_text_search(
                                 0,      // each shard returns top_k; coordinator applies final offset
                                 top_k,
                             );
-                        // Apply HIGHLIGHT/SUMMARIZE while guards are held — sync, no .await.
                         if highlight_opts.is_some() || summarize_opts.is_some() {
-                            let db_guard = shard_databases.read_db(shard_id, 0);
-                            crate::command::vector_search::ft_text_search::apply_post_processing(
-                                &mut r,
-                                &term_strings,
-                                text_index,
-                                &*db_guard,
-                                highlight_opts.as_ref(),
-                                summarize_opts.as_ref(),
-                            );
-                            // db_guard drops here.
+                            if let Some(db) = s.databases.get_mut(0) {
+                                crate::command::vector_search::ft_text_search::apply_post_processing(
+                                    &mut r,
+                                    &term_strings,
+                                    text_index,
+                                    db,
+                                    highlight_opts.as_ref(),
+                                    summarize_opts.as_ref(),
+                                );
+                            }
                         }
                         r
                     }
                     None => Frame::Error(Bytes::from_static(b"ERR unknown index")),
                 }
-                // MutexGuard dropped here, before .await below
-            };
+            });
             local_search = Some(response);
         } else {
             let (reply_tx, reply_rx) = channel::oneshot();
@@ -2048,10 +1799,10 @@ pub async fn scatter_text_search_filter(
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
     spsc_notifiers: &[Arc<channel::Notify>],
 ) -> Frame {
+    let _ = shard_databases; // E2 removes
     // ── Single-shard fast path ────────────────────────────────────────────────
     if num_shards == 1 {
-        // Phase 2c: gate on is_initialized(); new path uses ShardSlice directly.
-        let response = if crate::shard::slice::is_initialized() {
+        let response =
             crate::shard::slice::with_shard(|s| match s.text_store.get_index(&index_name) {
                 None => Frame::Error(Bytes::from_static(b"ERR no such index")),
                 Some(text_index) => {
@@ -2068,28 +1819,7 @@ pub async fn scatter_text_search_filter(
                         &results, offset, count,
                     )
                 }
-            })
-        } else {
-            let ts = shard_databases.text_store(my_shard);
-            match ts.get_index(&index_name) {
-                None => Frame::Error(Bytes::from_static(b"ERR no such index")),
-                Some(text_index) => {
-                    let clause = crate::command::vector_search::ft_text_search::TextQueryClause {
-                        field_name: None,
-                        terms: Vec::new(),
-                        filter: Some(filter),
-                    };
-                    let results =
-                        crate::command::vector_search::ft_text_search::execute_query_on_index(
-                            text_index, &clause, None, None, top_k,
-                        );
-                    crate::command::vector_search::ft_text_search::build_text_response(
-                        &results, offset, count,
-                    )
-                }
-            }
-            // MutexGuard dropped here
-        };
+            });
         return response;
     }
 
@@ -2100,29 +1830,8 @@ pub async fn scatter_text_search_filter(
 
     for shard_id in 0..num_shards {
         if shard_id == my_shard {
-            // Phase 2c: gate on is_initialized(); new path uses ShardSlice directly.
-            let response = if crate::shard::slice::is_initialized() {
+            let response =
                 crate::shard::slice::with_shard(|s| match s.text_store.get_index(&index_name) {
-                    None => Frame::Error(Bytes::from_static(b"ERR no such index")),
-                    Some(text_index) => {
-                        let clause =
-                            crate::command::vector_search::ft_text_search::TextQueryClause {
-                                field_name: None,
-                                terms: Vec::new(),
-                                filter: Some(filter.clone()),
-                            };
-                        let results =
-                            crate::command::vector_search::ft_text_search::execute_query_on_index(
-                                text_index, &clause, None, None, top_k,
-                            );
-                        crate::command::vector_search::ft_text_search::build_text_response(
-                            &results, 0, top_k,
-                        )
-                    }
-                })
-            } else {
-                let ts = shard_databases.text_store(my_shard);
-                match ts.get_index(&index_name) {
                     None => Frame::Error(Bytes::from_static(b"ERR no such index")),
                     Some(text_index) => {
                         let clause =
@@ -2141,9 +1850,7 @@ pub async fn scatter_text_search_filter(
                             &results, 0, top_k,
                         )
                     }
-                }
-                // MutexGuard dropped here, before the next `.await`
-            };
+                });
             local_response = Some(response);
         } else {
             let (reply_tx, reply_rx) = channel::oneshot();

@@ -22,7 +22,7 @@ pub(super) fn try_handle_txn_begin(
     cmd: &[u8],
     cmd_args: &[Frame],
     conn: &mut ConnectionState,
-    ctx: &ConnectionContext,
+    _ctx: &ConnectionContext,
     responses: &mut Vec<Frame>,
 ) -> bool {
     if !is_txn_begin(cmd, cmd_args) {
@@ -31,13 +31,9 @@ pub(super) fn try_handle_txn_begin(
     match txn_begin_validate(conn.in_multi, conn.in_cross_txn()) {
         Ok(()) => {
             // Get next txn_id and snapshot_lsn from vector store's transaction manager.
-            // Phase 2f: gate on is_initialized(); new path uses ShardSlice directly.
-            let active = if crate::shard::slice::is_initialized() {
-                crate::shard::slice::with_shard(|s| s.vector_store.txn_manager_mut().begin())
-            } else {
-                let mut vector_store = ctx.shard_databases.vector_store(ctx.shard_id);
-                vector_store.txn_manager_mut().begin()
-            };
+            // Unconditional slice path: ShardSlice is always initialized.
+            let active =
+                crate::shard::slice::with_shard(|s| s.vector_store.txn_manager_mut().begin());
             conn.active_cross_txn = Some(CrossStoreTxn::new(active.txn_id, active.snapshot_lsn));
             responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
         }
@@ -65,31 +61,16 @@ pub(super) async fn try_handle_txn_commit(
                 // have been excluded from oldest_snapshot, allowing prune_committed to
                 // advance past its LSN. Committing with a stale read set is undefined
                 // behaviour — force the client to restart the transaction.
-                // Phase 2f: gate on is_initialized(); new path uses ShardSlice directly.
-                // Closure returns true iff the snapshot was killed (caller emits MOONERR
-                // and short-circuits the commit path).
-                let was_killed = if crate::shard::slice::is_initialized() {
-                    crate::shard::slice::with_shard(|s| {
-                        if s.vector_store.txn_manager().is_killed(txn.txn_id) {
-                            s.vector_store.txn_manager_mut().abort_killed(txn.txn_id);
-                            true
-                        } else {
-                            s.vector_store.txn_manager_mut().commit(txn.txn_id);
-                            false
-                        }
-                    })
-                } else {
-                    let mut vector_store = ctx.shard_databases.vector_store(ctx.shard_id);
-                    let killed = if vector_store.txn_manager().is_killed(txn.txn_id) {
-                        vector_store.txn_manager_mut().abort_killed(txn.txn_id);
+                // Unconditional slice path: returns true iff the snapshot was killed.
+                let was_killed = crate::shard::slice::with_shard(|s| {
+                    if s.vector_store.txn_manager().is_killed(txn.txn_id) {
+                        s.vector_store.txn_manager_mut().abort_killed(txn.txn_id);
                         true
                     } else {
-                        vector_store.txn_manager_mut().commit(txn.txn_id);
+                        s.vector_store.txn_manager_mut().commit(txn.txn_id);
                         false
-                    };
-                    drop(vector_store);
-                    killed
-                };
+                    }
+                });
                 if was_killed {
                     tracing::warn!(
                         txn_id = txn.txn_id,
@@ -105,26 +86,14 @@ pub(super) async fn try_handle_txn_commit(
                 // Write XactCommit WAL record with committed KV state
                 let txn_id = txn.txn_id;
                 if !txn.kv_undo.is_empty() {
-                    // Phase 2f: gate on is_initialized(); new path uses ShardSlice directly.
-                    let payload = if crate::shard::slice::is_initialized() {
-                        crate::shard::slice::with_shard_db(conn.selected_db, |db| {
-                            crate::persistence::wal_v3::record::encode_xact_commit_payload(
-                                txn_id,
-                                txn.kv_undo.records(),
-                                db,
-                            )
-                        })
-                    } else {
-                        let db_guard = ctx.shard_databases.read_db(ctx.shard_id, conn.selected_db);
-                        let payload =
-                            crate::persistence::wal_v3::record::encode_xact_commit_payload(
-                                txn_id,
-                                txn.kv_undo.records(),
-                                &*db_guard,
-                            );
-                        drop(db_guard);
-                        payload
-                    };
+                    // Unconditional slice path: ShardSlice is always initialized.
+                    let payload = crate::shard::slice::with_shard_db(conn.selected_db, |db| {
+                        crate::persistence::wal_v3::record::encode_xact_commit_payload(
+                            txn_id,
+                            txn.kv_undo.records(),
+                            db,
+                        )
+                    });
                     let mut wal_buf = Vec::new();
                     crate::persistence::wal_v3::record::write_wal_v3_record(
                         &mut wal_buf,
@@ -155,85 +124,60 @@ pub(super) async fn try_handle_txn_commit(
                 }
 
                 // Materialize MQ intents: enqueue deferred MQ.PUBLISH messages.
-                // Phase 2f: gate on is_initialized(); new path uses ShardSlice directly.
+                // Unconditional slice path (Wave B2): group intents by owning shard.
+                // Self-shard intents applied locally; foreign groups sent via MqTxnMaterialize.
                 if !txn.mq_intents.is_empty() {
-                    if crate::shard::slice::is_initialized() {
-                        // Slice path (shardslice-migration Wave B2): group intents by owning
-                        // shard. Self-shard intents are applied locally; foreign groups are
-                        // sent via MqTxnMaterialize and awaited before replying OK.
-                        let mut self_intents: Vec<crate::transaction::MqIntent> = Vec::new();
-                        let mut foreign: std::collections::HashMap<
-                            usize,
-                            Vec<crate::transaction::MqIntent>,
-                        > = std::collections::HashMap::new();
-                        for intent in txn.mq_intents.iter().cloned() {
-                            let owner = crate::shard::dispatch::key_to_shard(
-                                &intent.queue_key,
-                                ctx.num_shards,
-                            );
-                            if owner == ctx.shard_id {
-                                self_intents.push(intent);
-                            } else {
-                                foreign.entry(owner).or_default().push(intent);
-                            }
+                    let mut self_intents: Vec<crate::transaction::MqIntent> = Vec::new();
+                    let mut foreign: std::collections::HashMap<
+                        usize,
+                        Vec<crate::transaction::MqIntent>,
+                    > = std::collections::HashMap::new();
+                    for intent in txn.mq_intents.iter().cloned() {
+                        let owner =
+                            crate::shard::dispatch::key_to_shard(&intent.queue_key, ctx.num_shards);
+                        if owner == ctx.shard_id {
+                            self_intents.push(intent);
+                        } else {
+                            foreign.entry(owner).or_default().push(intent);
                         }
-                        // Apply self-shard intents synchronously (no borrow across .await).
-                        if !self_intents.is_empty() {
-                            crate::shard::slice::with_shard_db(conn.selected_db, |db| {
-                                for intent in &self_intents {
-                                    if let Ok(Some(stream)) = db.get_stream_mut(&intent.queue_key) {
-                                        if stream.durable {
-                                            let msg_id = stream.next_auto_id();
-                                            stream.add(msg_id, intent.fields.clone());
-                                        }
+                    }
+                    // Apply self-shard intents synchronously (no borrow across .await).
+                    if !self_intents.is_empty() {
+                        crate::shard::slice::with_shard_db(conn.selected_db, |db| {
+                            for intent in &self_intents {
+                                if let Ok(Some(stream)) = db.get_stream_mut(&intent.queue_key) {
+                                    if stream.durable {
+                                        let msg_id = stream.next_auto_id();
+                                        stream.add(msg_id, intent.fields.clone());
                                     }
                                 }
-                            });
-                        }
-                        // Send MqTxnMaterialize to each foreign shard and await all acks.
-                        for (owner, intents) in foreign {
-                            let (reply_tx, reply_rx) = crate::runtime::channel::oneshot();
-                            let msg = crate::shard::dispatch::ShardMessage::MqTxnMaterialize {
-                                db_index: conn.selected_db,
-                                intents,
-                                reply_tx,
-                            };
-                            crate::shard::coordinator::spsc_send(
-                                &ctx.dispatch_tx,
-                                ctx.shard_id,
-                                owner,
-                                msg,
-                                &ctx.spsc_notifiers,
-                            )
-                            .await;
-                            match reply_rx.recv().await {
-                                Ok(()) => {}
-                                Err(_) => {
-                                    tracing::warn!(
-                                        "TXN.COMMIT MQ materialize: reply channel closed \
-                                         for shard {}",
-                                        owner
-                                    );
-                                }
                             }
-                        }
-                    } else {
-                        // Lock path (byte-identical to pre-migration).
-                        // Each queue lives on the shard owning its key, which
-                        // may differ from the connection's shard (and per
-                        // intent) — acquire the owner's db per queue.
-                        for intent in &txn.mq_intents {
-                            let owner = crate::shard::dispatch::key_to_shard(
-                                &intent.queue_key,
-                                ctx.num_shards,
-                            );
-                            let mut db_guard =
-                                ctx.shard_databases.write_db(owner, conn.selected_db);
-                            if let Ok(Some(stream)) = db_guard.get_stream_mut(&intent.queue_key) {
-                                if stream.durable {
-                                    let msg_id = stream.next_auto_id();
-                                    stream.add(msg_id, intent.fields.clone());
-                                }
+                        });
+                    }
+                    // Send MqTxnMaterialize to each foreign shard and await all acks.
+                    for (owner, intents) in foreign {
+                        let (reply_tx, reply_rx) = crate::runtime::channel::oneshot();
+                        let msg = crate::shard::dispatch::ShardMessage::MqTxnMaterialize {
+                            db_index: conn.selected_db,
+                            intents,
+                            reply_tx,
+                        };
+                        crate::shard::coordinator::spsc_send(
+                            &ctx.dispatch_tx,
+                            ctx.shard_id,
+                            owner,
+                            msg,
+                            &ctx.spsc_notifiers,
+                        )
+                        .await;
+                        match reply_rx.recv().await {
+                            Ok(()) => {}
+                            Err(_) => {
+                                tracing::warn!(
+                                    "TXN.COMMIT MQ materialize: reply channel closed \
+                                     for shard {}",
+                                    owner
+                                );
                             }
                         }
                     }
@@ -302,13 +246,9 @@ pub(super) fn try_handle_temporal_snapshot_at(
     match validate_snapshot_at(cmd_args) {
         Ok(()) => {
             let wall_ms = capture_wall_ms();
-            // Phase 2f: gate on is_initialized(); new path uses ShardSlice directly.
-            let lsn = if crate::shard::slice::is_initialized() {
-                crate::shard::slice::with_shard(|s| s.vector_store.txn_manager().current_lsn())
-            } else {
-                let vector_store = ctx.shard_databases.vector_store(ctx.shard_id);
-                vector_store.txn_manager().current_lsn()
-            };
+            // Unconditional slice path: ShardSlice is always initialized.
+            let lsn =
+                crate::shard::slice::with_shard(|s| s.vector_store.txn_manager().current_lsn());
             {
                 let mut guard = ctx.shard_databases.temporal_registry(ctx.shard_id);
                 let registry =
@@ -368,30 +308,11 @@ pub(super) async fn try_handle_temporal_invalidate(
                     }
                 }
                 let wall_ms = capture_wall_ms();
-                // Phase 2f: gate on is_initialized(); both branches are
-                // semantically identical, the new path uses
-                // ShardSlice::graph_store directly (no lock).
-                let (result, wal_records) = if crate::shard::slice::is_initialized() {
-                    crate::shard::slice::with_shard(|s| {
-                        let gs = &mut s.graph_store;
-                        let r = crate::command::temporal::apply_invalidate(
-                            gs,
-                            entity_id,
-                            is_node,
-                            &graph_name,
-                            wall_ms,
-                        );
-                        let recs = if r.is_ok() {
-                            gs.drain_wal()
-                        } else {
-                            Vec::new()
-                        };
-                        (r, recs)
-                    })
-                } else {
-                    let mut gs = ctx.shard_databases.graph_store_write(ctx.shard_id);
+                // Unconditional slice path: ShardSlice is always initialized.
+                let (result, wal_records) = crate::shard::slice::with_shard(|s| {
+                    let gs = &mut s.graph_store;
                     let r = crate::command::temporal::apply_invalidate(
-                        &mut gs,
+                        gs,
                         entity_id,
                         is_node,
                         &graph_name,
@@ -403,7 +324,7 @@ pub(super) async fn try_handle_temporal_invalidate(
                         Vec::new()
                     };
                     (r, recs)
-                };
+                });
                 match result {
                     Ok(()) => {
                         for record in wal_records {

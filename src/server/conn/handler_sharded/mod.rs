@@ -507,35 +507,20 @@ pub(crate) async fn handle_connection_sharded_inner<
                     // --- Lua scripting: EVAL / EVALSHA ---
                     if cmd.eq_ignore_ascii_case(b"EVAL") || cmd.eq_ignore_ascii_case(b"EVALSHA") {
                         let db_count = ctx.shard_databases.db_count();
-                        // Phase 2f: gate on is_initialized(); new path uses ShardSlice directly.
-                        let response = if crate::shard::slice::is_initialized() {
-                            crate::shard::slice::with_shard_db(conn.selected_db, |db| {
-                                if cmd.eq_ignore_ascii_case(b"EVAL") {
-                                    crate::scripting::handle_eval(
-                                        &ctx.lua, &ctx.script_cache, cmd_args, db,
-                                        ctx.shard_id, ctx.num_shards, conn.selected_db, db_count,
-                                    )
-                                } else {
-                                    crate::scripting::handle_evalsha(
-                                        &ctx.lua, &ctx.script_cache, cmd_args, db,
-                                        ctx.shard_id, ctx.num_shards, conn.selected_db, db_count,
-                                    )
-                                }
-                            })
-                        } else {
-                            let mut guard = ctx.shard_databases.write_db(ctx.shard_id, conn.selected_db);
+                        // Unconditional slice path: ShardSlice is always initialized.
+                        let response = crate::shard::slice::with_shard_db(conn.selected_db, |db| {
                             if cmd.eq_ignore_ascii_case(b"EVAL") {
                                 crate::scripting::handle_eval(
-                                    &ctx.lua, &ctx.script_cache, cmd_args, &mut guard,
+                                    &ctx.lua, &ctx.script_cache, cmd_args, db,
                                     ctx.shard_id, ctx.num_shards, conn.selected_db, db_count,
                                 )
                             } else {
                                 crate::scripting::handle_evalsha(
-                                    &ctx.lua, &ctx.script_cache, cmd_args, &mut guard,
+                                    &ctx.lua, &ctx.script_cache, cmd_args, db,
                                     ctx.shard_id, ctx.num_shards, conn.selected_db, db_count,
                                 )
                             }
-                        };
+                        });
                         responses.push(response);
                         continue;
                     }
@@ -749,41 +734,25 @@ pub(crate) async fn handle_connection_sharded_inner<
                         }
                         if cmd.eq_ignore_ascii_case(b"FCALL") {
                             let db_count = ctx.shard_databases.db_count();
-                            // Phase 2f: gate on is_initialized(); new path uses ShardSlice directly.
-                            let response = if crate::shard::slice::is_initialized() {
-                                crate::shard::slice::with_shard_db(conn.selected_db, |db| {
-                                    crate::command::functions::handle_fcall(
-                                        &func_registry.borrow(), cmd_args, db,
-                                        ctx.shard_id, ctx.num_shards, conn.selected_db, db_count,
-                                    )
-                                })
-                            } else {
-                                let mut guard = ctx.shard_databases.write_db(ctx.shard_id, conn.selected_db);
+                            // Unconditional slice path: ShardSlice is always initialized.
+                            let response = crate::shard::slice::with_shard_db(conn.selected_db, |db| {
                                 crate::command::functions::handle_fcall(
-                                    &func_registry.borrow(), cmd_args, &mut guard,
+                                    &func_registry.borrow(), cmd_args, db,
                                     ctx.shard_id, ctx.num_shards, conn.selected_db, db_count,
                                 )
-                            };
+                            });
                             responses.push(response);
                             continue;
                         }
                         if cmd.eq_ignore_ascii_case(b"FCALL_RO") {
                             let db_count = ctx.shard_databases.db_count();
-                            // Phase 2f: gate on is_initialized(); new path uses ShardSlice directly.
-                            let response = if crate::shard::slice::is_initialized() {
-                                crate::shard::slice::with_shard_db(conn.selected_db, |db| {
-                                    crate::command::functions::handle_fcall_ro(
-                                        &func_registry.borrow(), cmd_args, db,
-                                        ctx.shard_id, ctx.num_shards, conn.selected_db, db_count,
-                                    )
-                                })
-                            } else {
-                                let mut guard = ctx.shard_databases.write_db(ctx.shard_id, conn.selected_db);
+                            // Unconditional slice path: ShardSlice is always initialized.
+                            let response = crate::shard::slice::with_shard_db(conn.selected_db, |db| {
                                 crate::command::functions::handle_fcall_ro(
-                                    &func_registry.borrow(), cmd_args, &mut guard,
+                                    &func_registry.borrow(), cmd_args, db,
                                     ctx.shard_id, ctx.num_shards, conn.selected_db, db_count,
                                 )
-                            };
+                            });
                             responses.push(response);
                             continue;
                         }
@@ -983,18 +952,10 @@ pub(crate) async fn handle_connection_sharded_inner<
                     // Routes directly to VectorStore's TransactionManager on the
                     // local shard. Bypasses write-stall guards (admin command).
                     if cmd.eq_ignore_ascii_case(b"KILL") {
-                        // Phase 2f: gate on is_initialized(); new path uses ShardSlice directly.
-                        let response = if crate::shard::slice::is_initialized() {
-                            crate::shard::slice::with_shard(|s| {
-                                crate::command::server_admin::kill_snapshot(&mut s.vector_store, cmd_args)
-                            })
-                        } else {
-                            let mut vs = ctx.shard_databases.vector_store(ctx.shard_id);
-                            let response =
-                                crate::command::server_admin::kill_snapshot(&mut vs, cmd_args);
-                            drop(vs);
-                            response
-                        };
+                        // Unconditional slice path: ShardSlice is always initialized.
+                        let response = crate::shard::slice::with_shard(|s| {
+                            crate::command::server_admin::kill_snapshot(&mut s.vector_store, cmd_args)
+                        });
                         responses.push(response);
                         continue;
                     }
@@ -1010,84 +971,44 @@ pub(crate) async fn handle_connection_sharded_inner<
                                 crate::command::helpers::extract_bytes(sub_frame)
                             {
                                 if sub.eq_ignore_ascii_case(b"VECTOR") {
-                                    // Phase 2f: gate on is_initialized(); new path uses ShardSlice directly.
-                                    let response = if crate::shard::slice::is_initialized() {
-                                        crate::shard::slice::with_shard(|s| {
-                                            crate::command::server_admin::vacuum_vector(
-                                                &mut s.vector_store,
-                                                &cmd_args[1..],
-                                            )
-                                        })
-                                    } else {
-                                        let mut vs =
-                                            ctx.shard_databases.vector_store(ctx.shard_id);
-                                        let r =
-                                            crate::command::server_admin::vacuum_vector(
-                                                &mut vs,
-                                                &cmd_args[1..],
-                                            );
-                                        drop(vs);
-                                        r
-                                    };
+                                    // Unconditional slice path: ShardSlice is always initialized.
+                                    let response = crate::shard::slice::with_shard(|s| {
+                                        crate::command::server_admin::vacuum_vector(
+                                            &mut s.vector_store,
+                                            &cmd_args[1..],
+                                        )
+                                    });
                                     responses.push(response);
                                     continue;
                                 }
                                 #[cfg(feature = "graph")]
                                 if sub.eq_ignore_ascii_case(b"GRAPH") {
-                                    // Phase 2f: gate on is_initialized(); new path uses ShardSlice directly.
-                                    let response = if crate::shard::slice::is_initialized() {
-                                        let graph_merge_max = ctx.config.graph_merge_max_segments;
-                                        let graph_dead = ctx.config.graph_dead_edge_trigger;
-                                        crate::shard::slice::with_shard(|s| {
-                                            crate::command::server_admin::vacuum_graph(
-                                                &mut s.graph_store,
-                                                &cmd_args[1..],
-                                                graph_merge_max,
-                                                graph_dead,
-                                            )
-                                        })
-                                    } else {
-                                        let mut gs = ctx
-                                            .shard_databases
-                                            .graph_store_write(ctx.shard_id);
-                                        let r =
-                                            crate::command::server_admin::vacuum_graph(
-                                                &mut gs,
-                                                &cmd_args[1..],
-                                                ctx.config.graph_merge_max_segments,
-                                                ctx.config.graph_dead_edge_trigger,
-                                            );
-                                        drop(gs);
-                                        r
-                                    };
+                                    // Unconditional slice path: ShardSlice is always initialized.
+                                    let graph_merge_max = ctx.config.graph_merge_max_segments;
+                                    let graph_dead = ctx.config.graph_dead_edge_trigger;
+                                    let response = crate::shard::slice::with_shard(|s| {
+                                        crate::command::server_admin::vacuum_graph(
+                                            &mut s.graph_store,
+                                            &cmd_args[1..],
+                                            graph_merge_max,
+                                            graph_dead,
+                                        )
+                                    });
                                     responses.push(response);
                                     continue;
                                 }
                             }
                         }
-                        // Phase 2f: gate on is_initialized(); new path uses ShardSlice directly.
-                        let response = if crate::shard::slice::is_initialized() {
-                            crate::shard::slice::with_shard(|s| {
-                                crate::command::server_admin::vacuum(
-                                    &mut s.vector_store,
-                                    None,
-                                    None,
-                                    cmd_args,
-                                    crate::command::server_admin::DEFAULT_VACUUM_PRUNE_MARGIN,
-                                )
-                            })
-                        } else {
-                            let mut vs = ctx.shard_databases.vector_store(ctx.shard_id);
-                            let r = crate::command::server_admin::vacuum(
-                                &mut vs,
-                                None, // manifest — not available in connection handler
-                                None, // wal_v3 — not available in connection handler
+                        // Unconditional slice path: ShardSlice is always initialized.
+                        let response = crate::shard::slice::with_shard(|s| {
+                            crate::command::server_admin::vacuum(
+                                &mut s.vector_store,
+                                None,
+                                None,
                                 cmd_args,
-                                crate::command::server_admin::DEFAULT_VACUUM_PRUNE_MARGIN, // see server_admin.rs
-                            );
-                            drop(vs);
-                            r
-                        };
+                                crate::command::server_admin::DEFAULT_VACUUM_PRUNE_MARGIN,
+                            )
+                        });
                         responses.push(response);
                         continue;
                     }
@@ -1097,23 +1018,14 @@ pub(crate) async fn handle_connection_sharded_inner<
                         if let Some(sub) = cmd_args.first() {
                             if let Some(s) = crate::command::helpers::extract_bytes(sub) {
                                 if s.eq_ignore_ascii_case(b"RECLAMATION") {
-                                    // Phase 2f: gate on is_initialized(); new path uses ShardSlice directly.
-                                    let response = if crate::shard::slice::is_initialized() {
-                                        crate::shard::slice::with_shard(|s| {
-                                            crate::command::server_admin::debug_reclamation(
-                                                &s.vector_store,
-                                                None,
-                                                None,
-                                            )
-                                        })
-                                    } else {
-                                        let vs = ctx.shard_databases.vector_store(ctx.shard_id);
-                                        let r = crate::command::server_admin::debug_reclamation(
-                                            &vs, None, None,
-                                        );
-                                        drop(vs);
-                                        r
-                                    };
+                                    // Unconditional slice path: ShardSlice is always initialized.
+                                    let response = crate::shard::slice::with_shard(|s| {
+                                        crate::command::server_admin::debug_reclamation(
+                                            &s.vector_store,
+                                            None,
+                                            None,
+                                        )
+                                    });
                                     responses.push(response);
                                     continue;
                                 }
@@ -1193,21 +1105,12 @@ pub(crate) async fn handle_connection_sharded_inner<
                                 Err(e) => e,
                                 Ok((_key, dst_db)) if dst_db == src_db => Frame::Integer(0),
                                 Ok((key, dst_db)) => {
-                                    if crate::shard::slice::is_initialized() {
-                                        crate::shard::slice::with_shard(|s| {
-                                            ksmv::with_two_slice_dbs(&mut s.databases, src_db, dst_db, |src, dst| {
-                                                ksmv::move_core(src, dst, &key)
-                                            })
+                                    // Unconditional slice path: ShardSlice is always initialized.
+                                    crate::shard::slice::with_shard(|s| {
+                                        ksmv::with_two_slice_dbs(&mut s.databases, src_db, dst_db, |src, dst| {
+                                            ksmv::move_core(src, dst, &key)
                                         })
-                                    } else {
-                                        // Lock ordering (lower index first) prevents deadlock
-                                        // with concurrent reverse MOVE from another connection.
-                                        ksmv::with_two_dbs_locked(
-                                            &ctx.shard_databases.all_shard_dbs()[ctx.shard_id],
-                                            src_db, dst_db,
-                                            |src, dst| ksmv::move_core(src, dst, &key),
-                                        )
-                                    }
+                                    })
                                 }
                             };
                             // AOF only on actual success (:1). Matches handler_single
@@ -1252,19 +1155,12 @@ pub(crate) async fn handle_connection_sharded_inner<
                                 let response = match copy_result {
                                     Err(e) => e,
                                     Ok(ca) => {
-                                        if crate::shard::slice::is_initialized() {
-                                            crate::shard::slice::with_shard(|s| {
-                                                ksmv::with_two_slice_dbs(&mut s.databases, src_db, ca.dst_db, |src, dst| {
-                                                    ksmv::copy_core(src, dst, &ca.src_key, &ca.dst_key, ca.replace)
-                                                })
+                                        // Unconditional slice path: ShardSlice is always initialized.
+                                        crate::shard::slice::with_shard(|s| {
+                                            ksmv::with_two_slice_dbs(&mut s.databases, src_db, ca.dst_db, |src, dst| {
+                                                ksmv::copy_core(src, dst, &ca.src_key, &ca.dst_key, ca.replace)
                                             })
-                                        } else {
-                                            ksmv::with_two_dbs_locked(
-                                                &ctx.shard_databases.all_shard_dbs()[ctx.shard_id],
-                                                src_db, ca.dst_db,
-                                                |src, dst| ksmv::copy_core(src, dst, &ca.src_key, &ca.dst_key, ca.replace),
-                                            )
-                                        }
+                                        })
                                     }
                                 };
                                 // AOF only on actual success (:1). Matches handler_single
@@ -1296,12 +1192,12 @@ pub(crate) async fn handle_connection_sharded_inner<
                         if metadata::is_write(cmd) {
                             // WRITE PATH: single lock acquisition for eviction + dispatch.
                             //
-                            // Phase 2f: gate on is_initialized(); new path uses ShardSlice
-                            // directly. Eviction → KV undo-log capture → dispatch → wakeup
-                            // run inside the with_shard_db closure so the &mut Database
-                            // borrow stays disjoint from the post-drop HSET auto-index
-                            // and DEL/UNLINK auto-delete paths (which need vector/text
-                            // stores, separate ShardSlice fields).
+                            // Unconditional slice path: ShardSlice is always initialized.
+                            // Eviction → KV undo-log capture → dispatch → wakeup run inside
+                            // the with_shard_db closure so the &mut Database borrow stays
+                            // disjoint from the post-drop HSET auto-index and DEL/UNLINK
+                            // auto-delete paths (which need vector/text stores, separate
+                            // ShardSlice fields).
                             let db_count = ctx.shard_databases.db_count();
                             // Returns Ok((response, sample_latency, dispatch_start)) on
                             // success or Err(oom_frame) when eviction fails (caller
@@ -1403,14 +1299,9 @@ pub(crate) async fn handle_connection_sharded_inner<
                                 Ok((response, sample_latency, dispatch_start))
                             };
 
-                            let write_outcome: WriteOutcome = if crate::shard::slice::is_initialized() {
-                                crate::shard::slice::with_shard_db(conn.selected_db, |db| do_write(db, &mut conn))
-                            } else {
-                                let mut guard = ctx.shard_databases.write_db(ctx.shard_id, conn.selected_db);
-                                let r = do_write(&mut *guard, &mut conn);
-                                drop(guard);
-                                r
-                            };
+                            // Unconditional slice path: ShardSlice is always initialized.
+                            let write_outcome: WriteOutcome =
+                                crate::shard::slice::with_shard_db(conn.selected_db, |db| do_write(db, &mut conn));
 
                             let (mut response, _sample_latency, dispatch_start): (Frame, bool, Option<std::time::Instant>) =
                                 match write_outcome {
@@ -1468,26 +1359,15 @@ pub(crate) async fn handle_connection_sharded_inner<
                                         .as_ref()
                                         .map(|t| t.txn_id)
                                         .unwrap_or(0);
-                                    // Phase 2f: gate on is_initialized(); new path uses ShardSlice directly.
-                                    // vector_store + text_store accessed in ONE with_shard closure
-                                    // (multi-resource arm) to avoid re-entrant RefCell borrow.
-                                    let inserted = if crate::shard::slice::is_initialized() {
-                                        crate::shard::slice::with_shard(|s| {
-                                            if active_txn_id != 0 {
-                                                crate::shard::spsc_handler::auto_index_hset_public_txn(&mut s.vector_store, &mut s.text_store, &key, cmd_args, active_txn_id)
-                                            } else {
-                                                crate::shard::spsc_handler::auto_index_hset_public(&mut s.vector_store, &mut s.text_store, &key, cmd_args)
-                                            }
-                                        })
-                                    } else {
-                                        let mut vs = ctx.shard_databases.vector_store(ctx.shard_id);
-                                        let mut ts = ctx.shard_databases.text_store(ctx.shard_id);
+                                    // Unconditional slice path: vector_store + text_store accessed in ONE
+                                    // with_shard closure (multi-resource arm) to avoid re-entrant RefCell borrow.
+                                    let inserted = crate::shard::slice::with_shard(|s| {
                                         if active_txn_id != 0 {
-                                            crate::shard::spsc_handler::auto_index_hset_public_txn(&mut vs, &mut *ts, &key, cmd_args, active_txn_id)
+                                            crate::shard::spsc_handler::auto_index_hset_public_txn(&mut s.vector_store, &mut s.text_store, &key, cmd_args, active_txn_id)
                                         } else {
-                                            crate::shard::spsc_handler::auto_index_hset_public(&mut vs, &mut *ts, &key, cmd_args)
+                                            crate::shard::spsc_handler::auto_index_hset_public(&mut s.vector_store, &mut s.text_store, &key, cmd_args)
                                         }
-                                    };
+                                    });
                                     // Push one VectorIntent per (index_name, key_hash) so
                                     // TXN.ABORT (Plan 166-03) can tombstone via
                                     // MutableSegment::mark_deleted_by_key_hash.
@@ -1504,23 +1384,14 @@ pub(crate) async fn handle_connection_sharded_inner<
                             if !matches!(response, Frame::Error(_))
                                 && (cmd.eq_ignore_ascii_case(b"DEL") || cmd.eq_ignore_ascii_case(b"UNLINK"))
                             {
-                                // Phase 2f: gate on is_initialized(); new path uses ShardSlice directly.
-                                if crate::shard::slice::is_initialized() {
-                                    crate::shard::slice::with_shard(|s| {
-                                        for arg in cmd_args.iter() {
-                                            if let Some(key) = extract_bytes(arg) {
-                                                s.vector_store.mark_deleted_for_key(key.as_ref());
-                                            }
-                                        }
-                                    });
-                                } else {
-                                    let mut vs = ctx.shard_databases.vector_store(ctx.shard_id);
+                                // Unconditional slice path: ShardSlice is always initialized.
+                                crate::shard::slice::with_shard(|s| {
                                     for arg in cmd_args.iter() {
                                         if let Some(key) = extract_bytes(arg) {
-                                            vs.mark_deleted_for_key(key.as_ref());
+                                            s.vector_store.mark_deleted_for_key(key.as_ref());
                                         }
                                     }
-                                }
+                                });
                             }
                             // H1: durable path under appendfsync=always.
                             let mut aof_failed = false;
@@ -1569,15 +1440,10 @@ pub(crate) async fn handle_connection_sharded_inner<
                                         let my_txn_id = txn.txn_id;
                                         // Clone committed treemap to release vector_store lock
                                         // before acquiring kv_intents lock (lock ordering).
-                                        // Phase 2f: gate on is_initialized(); new path uses ShardSlice directly.
-                                        let committed = if crate::shard::slice::is_initialized() {
-                                            crate::shard::slice::with_shard(|s| {
-                                                s.vector_store.txn_manager().committed_treemap().clone()
-                                            })
-                                        } else {
-                                            let vs = ctx.shard_databases.vector_store(ctx.shard_id);
-                                            vs.txn_manager().committed_treemap().clone()
-                                        };
+                                        // Unconditional slice path: ShardSlice is always initialized.
+                                        let committed = crate::shard::slice::with_shard(|s| {
+                                            s.vector_store.txn_manager().committed_treemap().clone()
+                                        });
                                         let visible = {
                                             let intents = ctx.shard_databases.kv_intents(ctx.shard_id);
                                             intents.is_key_visible(key.as_ref(), snapshot_lsn, my_txn_id, &committed)
@@ -1590,23 +1456,15 @@ pub(crate) async fn handle_connection_sharded_inner<
                                 }
                             }
 
-                            // READ PATH: shared lock — no contention with other shards' reads.
-                            // Phase 2f: gate on is_initialized(); new path uses ShardSlice directly.
+                            // READ PATH: unconditional slice path — ShardSlice is always initialized.
                             let now_ms = ctx.cached_clock.ms();
                             let db_count = ctx.shard_databases.db_count();
                             conn.cmd_counter = conn.cmd_counter.wrapping_add(1);
                             let sample_latency = (conn.cmd_counter & 0xF) == 0;
                             let dispatch_start = sample_latency.then(std::time::Instant::now);
-                            let result = if crate::shard::slice::is_initialized() {
-                                crate::shard::slice::with_shard_db(conn.selected_db, |db| {
-                                    dispatch_read(db, cmd, cmd_args, now_ms, &mut conn.selected_db, db_count)
-                                })
-                            } else {
-                                let guard = ctx.shard_databases.read_db(ctx.shard_id, conn.selected_db);
-                                let r = dispatch_read(&guard, cmd, cmd_args, now_ms, &mut conn.selected_db, db_count);
-                                drop(guard);
-                                r
-                            };
+                            let result = crate::shard::slice::with_shard_db(conn.selected_db, |db| {
+                                dispatch_read(db, cmd, cmd_args, now_ms, &mut conn.selected_db, db_count)
+                            });
                             if let Ok(cmd_str) = std::str::from_utf8(cmd) {
                                 if let Some(start) = dispatch_start {
                                     let elapsed_us = start.elapsed().as_micros() as u64;

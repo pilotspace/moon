@@ -87,23 +87,14 @@ pub(super) async fn try_handle_txn_commit(
                 // Write XactCommit WAL record with committed KV state
                 let txn_id = txn.txn_id;
                 if !txn.kv_undo.is_empty() {
-                    let payload = if crate::shard::slice::is_initialized() {
+                    let payload =
                         crate::shard::slice::with_shard_db(conn.selected_db as usize, |db| {
                             crate::persistence::wal_v3::record::encode_xact_commit_payload(
                                 txn_id,
                                 txn.kv_undo.records(),
                                 db,
                             )
-                        })
-                    } else {
-                        let db_guard = ctx.shard_databases.read_db(ctx.shard_id, conn.selected_db);
-                        let p = crate::persistence::wal_v3::record::encode_xact_commit_payload(
-                            txn_id,
-                            txn.kv_undo.records(),
-                            &*db_guard,
-                        );
-                        p
-                    };
+                        });
                     let mut wal_buf = Vec::new();
                     crate::persistence::wal_v3::record::write_wal_v3_record(
                         &mut wal_buf,
@@ -133,78 +124,49 @@ pub(super) async fn try_handle_txn_commit(
                     tracing::debug!(txn_id, count = drain_count, "Drained deferred HNSW inserts");
                 }
 
-                // Materialize MQ intents: enqueue deferred MQ.PUBLISH messages
+                // Materialize MQ intents: enqueue deferred MQ.PUBLISH messages.
+                // Owner-route via MqTxnMaterialize: self-owned intents fold locally;
+                // foreign intents hop to the owning shard and await ack before reply.
                 if !txn.mq_intents.is_empty() {
-                    if crate::shard::slice::is_initialized() {
-                        // shardslice-migration Wave B1: group intents by owner shard.
-                        // Self-owned intents fold locally; foreign intents hop via
-                        // MqTxnMaterialize (mirrors the lock-path's per-intent owner
-                        // routing, but batched per shard and awaited before replying).
-                        use std::collections::HashMap;
-                        let mut by_shard: HashMap<usize, Vec<crate::transaction::MqIntent>> =
-                            HashMap::new();
-                        for intent in txn.mq_intents.iter().cloned() {
-                            let owner = crate::shard::dispatch::key_to_shard(
-                                &intent.queue_key,
-                                ctx.num_shards,
-                            );
-                            by_shard.entry(owner).or_default().push(intent);
-                        }
-                        for (owner, intents) in by_shard {
-                            if owner == ctx.shard_id {
-                                // Self: apply locally.
-                                crate::shard::slice::with_shard_db(
-                                    conn.selected_db as usize,
-                                    |db| {
-                                        for intent in &intents {
-                                            if let Ok(Some(stream)) =
-                                                db.get_stream_mut(&intent.queue_key)
-                                            {
-                                                if stream.durable {
-                                                    let msg_id = stream.next_auto_id();
-                                                    stream.add(msg_id, intent.fields.clone());
-                                                }
-                                            }
+                    use std::collections::HashMap;
+                    let mut by_shard: HashMap<usize, Vec<crate::transaction::MqIntent>> =
+                        HashMap::new();
+                    for intent in txn.mq_intents.iter().cloned() {
+                        let owner =
+                            crate::shard::dispatch::key_to_shard(&intent.queue_key, ctx.num_shards);
+                        by_shard.entry(owner).or_default().push(intent);
+                    }
+                    for (owner, intents) in by_shard {
+                        if owner == ctx.shard_id {
+                            // Self: apply locally via slice.
+                            crate::shard::slice::with_shard_db(conn.selected_db as usize, |db| {
+                                for intent in &intents {
+                                    if let Ok(Some(stream)) = db.get_stream_mut(&intent.queue_key) {
+                                        if stream.durable {
+                                            let msg_id = stream.next_auto_id();
+                                            stream.add(msg_id, intent.fields.clone());
                                         }
-                                    },
-                                );
-                            } else {
-                                // Foreign: send MqTxnMaterialize hop and await ack.
-                                let (reply_tx, reply_rx) = crate::runtime::channel::oneshot();
-                                let msg = crate::shard::dispatch::ShardMessage::MqTxnMaterialize {
-                                    db_index: conn.selected_db as usize,
-                                    intents,
-                                    reply_tx,
-                                };
-                                crate::shard::coordinator::spsc_send(
-                                    &ctx.dispatch_tx,
-                                    ctx.shard_id,
-                                    owner,
-                                    msg,
-                                    &ctx.spsc_notifiers,
-                                )
-                                .await;
-                                // Await the ack before replying OK to the client.
-                                let _ = reply_rx.recv().await;
-                            }
-                        }
-                    } else {
-                        // Each queue lives on the shard owning its key, which
-                        // may differ from the connection's shard (and per
-                        // intent) — acquire the owner's db per queue.
-                        for intent in &txn.mq_intents {
-                            let owner = crate::shard::dispatch::key_to_shard(
-                                &intent.queue_key,
-                                ctx.num_shards,
-                            );
-                            let mut db_guard =
-                                ctx.shard_databases.write_db(owner, conn.selected_db);
-                            if let Ok(Some(stream)) = db_guard.get_stream_mut(&intent.queue_key) {
-                                if stream.durable {
-                                    let msg_id = stream.next_auto_id();
-                                    stream.add(msg_id, intent.fields.clone());
+                                    }
                                 }
-                            }
+                            });
+                        } else {
+                            // Foreign: send MqTxnMaterialize hop and await ack.
+                            let (reply_tx, reply_rx) = crate::runtime::channel::oneshot();
+                            let msg = crate::shard::dispatch::ShardMessage::MqTxnMaterialize {
+                                db_index: conn.selected_db as usize,
+                                intents,
+                                reply_tx,
+                            };
+                            crate::shard::coordinator::spsc_send(
+                                &ctx.dispatch_tx,
+                                ctx.shard_id,
+                                owner,
+                                msg,
+                                &ctx.spsc_notifiers,
+                            )
+                            .await;
+                            // Await the ack before replying OK to the client.
+                            let _ = reply_rx.recv().await;
                         }
                     }
                 }
@@ -335,30 +297,12 @@ pub(super) async fn try_handle_temporal_invalidate(
                     }
                 }
                 let wall_ms = capture_wall_ms();
-                // Phase 2a: gate on is_initialized(); both branches are
-                // semantically identical, the new path uses
+                // Unconditional slice path: apply temporal invalidation via
                 // ShardSlice::graph_store directly (no lock).
-                let (result, wal_records) = if crate::shard::slice::is_initialized() {
-                    crate::shard::slice::with_shard(|s| {
-                        let gs = &mut s.graph_store;
-                        let r = crate::command::temporal::apply_invalidate(
-                            gs,
-                            entity_id,
-                            is_node,
-                            &graph_name,
-                            wall_ms,
-                        );
-                        let recs = if r.is_ok() {
-                            gs.drain_wal()
-                        } else {
-                            Vec::new()
-                        };
-                        (r, recs)
-                    })
-                } else {
-                    let mut gs = ctx.shard_databases.graph_store_write(ctx.shard_id);
+                let (result, wal_records) = crate::shard::slice::with_shard(|s| {
+                    let gs = &mut s.graph_store;
                     let r = crate::command::temporal::apply_invalidate(
-                        &mut gs,
+                        gs,
                         entity_id,
                         is_node,
                         &graph_name,
@@ -370,7 +314,7 @@ pub(super) async fn try_handle_temporal_invalidate(
                         Vec::new()
                     };
                     (r, recs)
-                };
+                });
                 match result {
                     Ok(()) => {
                         for record in wal_records {

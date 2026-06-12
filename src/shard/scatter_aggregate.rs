@@ -50,43 +50,26 @@ pub async fn scatter_text_aggregate(
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
     spsc_notifiers: &[Arc<channel::Notify>],
 ) -> Frame {
+    let _ = shard_databases; // E2 removes
     // ─── Single-shard fast path ───────────────────────────────────────────
     if num_shards == 1 {
-        // Phase 2e: gate on is_initialized(); new path holds vector_store +
-        // text_store + databases[0] simultaneously via a single `with_shard`
-        // call to avoid a reentrant `with_shard*` panic (RefCell double-borrow).
-        let result = if crate::shard::slice::is_initialized() {
-            crate::shard::slice::with_shard(|s| {
-                // Every shard slice is constructed with at least one database
-                // (db 0); see Shard::new in src/shard/mod.rs.
-                #[allow(clippy::expect_used)]
-                let db = s
-                    .databases
-                    .first()
-                    .expect("shard slice must have at least db 0");
-                crate::command::vector_search::ft_aggregate::execute_local_full(
-                    &mut s.vector_store,
-                    &s.text_store,
-                    &index_name,
-                    &query,
-                    &pipeline,
-                    db,
-                )
-            })
-        } else {
-            let mut vs = shard_databases.vector_store(my_shard);
-            let ts = shard_databases.text_store(my_shard);
-            let db_guard = shard_databases.read_db(my_shard, 0);
+        let result = crate::shard::slice::with_shard(|s| {
+            // Every shard slice is constructed with at least one database
+            // (db 0); see Shard::new in src/shard/mod.rs.
+            #[allow(clippy::expect_used)]
+            let db = s
+                .databases
+                .first()
+                .expect("shard slice must have at least db 0");
             crate::command::vector_search::ft_aggregate::execute_local_full(
-                &mut vs,
-                &ts,
+                &mut s.vector_store,
+                &s.text_store,
                 &index_name,
                 &query,
                 &pipeline,
-                &db_guard,
+                db,
             )
-            // guards drop at end of this block, before any .await below
-        };
+        });
         return result;
     }
 
@@ -101,37 +84,21 @@ pub async fn scatter_text_aggregate(
             // round trip (CONTEXT.md D-08 follows scatter_text_search
             // template).
             //
-            // Phase 2e: gate on is_initialized(); new path holds text_store
-            // + databases[0] together via a single `with_shard` closure to
-            // avoid a reentrant `with_shard*` panic.
-            let response = if crate::shard::slice::is_initialized() {
-                crate::shard::slice::with_shard(|s| {
-                    // See note on previous expect — db 0 is constructor-guaranteed.
-                    #[allow(clippy::expect_used)]
-                    let db = s
-                        .databases
-                        .first()
-                        .expect("shard slice must have at least db 0");
-                    crate::command::vector_search::ft_aggregate::execute_local_partial(
-                        &s.text_store,
-                        &index_name,
-                        &query,
-                        &pipeline,
-                        db,
-                    )
-                })
-            } else {
-                let ts = shard_databases.text_store(shard_id);
-                let db_guard = shard_databases.read_db(shard_id, 0);
+            let response = crate::shard::slice::with_shard(|s| {
+                // See note on previous expect — db 0 is constructor-guaranteed.
+                #[allow(clippy::expect_used)]
+                let db = s
+                    .databases
+                    .first()
+                    .expect("shard slice must have at least db 0");
                 crate::command::vector_search::ft_aggregate::execute_local_partial(
-                    &ts,
+                    &s.text_store,
                     &index_name,
                     &query,
                     &pipeline,
-                    &db_guard,
+                    db,
                 )
-                // guards drop before the subsequent .await
-            };
+            });
             local_partial = Some(response);
         } else {
             let (reply_tx, reply_rx) = channel::oneshot();

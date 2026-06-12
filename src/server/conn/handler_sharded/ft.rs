@@ -113,6 +113,9 @@ pub(super) async fn try_handle_ft_command(
                             top_k,
                             offset: limit_offset,
                             count: limit_count,
+                            // CHANGE D: thread the parsed FILTER tree (if any) into
+                            // HybridQuery so execute_hybrid_search_local / scatter
+                            // can apply it pre-RRF on both branches (CHANGE B/F).
                             filter: partial.filter,
                         };
                         // Phase 171 HYB-02 / SCAT-02: resolve AS_OF /
@@ -223,9 +226,7 @@ pub(super) async fn try_handle_ft_command(
                 // We use the TextIndex's own field_analyzers (same pipeline used at index time).
                 type ParseResult =
                     Result<(Vec<crate::command::vector_search::QueryTerm>, Option<usize>), String>;
-                // Phase 2f: gate on is_initialized(); new path uses ShardSlice directly.
-                // The inner closure scans the TextIndex via text_store; same logic in
-                // both branches.
+                // The inner closure scans the TextIndex via text_store.
                 let parse_body = |ts: &crate::text::store::TextStore| -> ParseResult {
                     match ts.get_index(&index_name) {
                         None => Err("ERR no such index".to_owned()),
@@ -261,14 +262,9 @@ pub(super) async fn try_handle_ft_command(
                         },
                     }
                 };
-                let parse_result: ParseResult = if crate::shard::slice::is_initialized() {
-                    crate::shard::slice::with_shard(|s| parse_body(&s.text_store))
-                } else {
-                    let ts = ctx.shard_databases.text_store(ctx.shard_id);
-                    let r = parse_body(&ts);
-                    drop(ts);
-                    r
-                };
+                // Unconditional slice path: ShardSlice is always initialized.
+                let parse_result: ParseResult =
+                    crate::shard::slice::with_shard(|s| parse_body(&s.text_store));
 
                 let (query_terms, field_idx) = match parse_result {
                     Ok(t) => t,
@@ -468,7 +464,6 @@ pub(super) async fn try_handle_ft_command(
                                         offset.saturating_add(count)
                                     }
                                     .max(1);
-                                    // Phase 2f: gate on is_initialized(); new path uses ShardSlice directly.
                                     let lookup_body =
                                         |ts: &crate::text::store::TextStore| -> Frame {
                                             match ts.get_index(&index_name) {
@@ -485,16 +480,10 @@ pub(super) async fn try_handle_ft_command(
                                                 }
                                             }
                                         };
-                                    let response = if crate::shard::slice::is_initialized() {
-                                        crate::shard::slice::with_shard(|s| {
-                                            lookup_body(&s.text_store)
-                                        })
-                                    } else {
-                                        let ts_guard = ctx.shard_databases.text_store(ctx.shard_id);
-                                        let r = lookup_body(&ts_guard);
-                                        drop(ts_guard);
-                                        r
-                                    };
+                                    // Unconditional slice path: ShardSlice is always initialized.
+                                    let response = crate::shard::slice::with_shard(|s| {
+                                        lookup_body(&s.text_store)
+                                    });
                                     let mut response = response;
                                     if let Some(ws_id) = conn.workspace_id.as_ref() {
                                         strip_workspace_prefix_from_response(
@@ -513,8 +502,7 @@ pub(super) async fn try_handle_ft_command(
                                 return true;
                             }
                         }
-                        // Phase 2f: gate on is_initialized(); new path uses ShardSlice directly.
-                        // text_store + read_db(0) accessed in ONE with_shard closure
+                        // text_store + databases[0] accessed in ONE with_shard closure
                         // (multi-resource arm) — text_index borrows from text_store and is
                         // also passed to apply_post_processing alongside &Database.
                         let (offset, count) =
@@ -608,24 +596,12 @@ pub(super) async fn try_handle_ft_command(
                             response
                         };
 
-                        let response = if crate::shard::slice::is_initialized() {
-                            crate::shard::slice::with_shard(|s| {
-                                let db_opt: Option<&crate::storage::db::Database> =
-                                    if need_db { Some(&s.databases[0]) } else { None };
-                                text_search_body(&s.text_store, db_opt)
-                            })
-                        } else {
-                            let ts_guard = ctx.shard_databases.text_store(ctx.shard_id);
-                            let db_guard_opt = if need_db {
-                                Some(ctx.shard_databases.read_db(ctx.shard_id, 0))
-                            } else {
-                                None
-                            };
-                            let response = text_search_body(&ts_guard, db_guard_opt.as_deref());
-                            drop(db_guard_opt);
-                            drop(ts_guard);
-                            response
-                        };
+                        // Unconditional slice path: ShardSlice is always initialized.
+                        let response = crate::shard::slice::with_shard(|s| {
+                            let db_opt: Option<&crate::storage::db::Database> =
+                                if need_db { Some(&s.databases[0]) } else { None };
+                            text_search_body(&s.text_store, db_opt)
+                        });
                         let mut response = response;
                         if let Some(ws_id) = conn.workspace_id.as_ref() {
                             strip_workspace_prefix_from_response(ws_id, cmd, &mut response);
@@ -637,14 +613,12 @@ pub(super) async fn try_handle_ft_command(
             }
         }
     }
-    // Phase 2f: gate on is_initialized(); new path uses ShardSlice directly.
-    // All five companion stores (vector_store, text_store, databases[0],
-    // graph_store) are accessed from ONE with_shard closure to avoid
-    // re-entrant RefCell borrows — this is the canonical multi-resource arm.
+    // All companion stores (vector_store, text_store, databases[0], graph_store)
+    // accessed from ONE with_shard closure to avoid re-entrant RefCell borrows.
     //
     // Resolve AS_OF outside the closure (acquires shard_databases for the
     // resolver helper, which itself reads vector_store; doing this inside
-    // would re-enter with_shard on the new path).
+    // would re-enter with_shard).
     let as_of_lsn_opt: Option<Result<u64, Frame>> = if cmd.eq_ignore_ascii_case(b"FT.SEARCH") {
         Some(resolve_ft_search_as_of_lsn(
             cmd_args,
@@ -656,116 +630,17 @@ pub(super) async fn try_handle_ft_command(
         None
     };
 
-    let response = if crate::shard::slice::is_initialized() {
-        crate::shard::slice::with_shard(|s| {
-            if cmd.eq_ignore_ascii_case(b"FT.CREATE") {
-                crate::command::vector_search::ft_create(
-                    &mut s.vector_store,
-                    &mut s.text_store,
-                    cmd_args,
-                )
-            } else if cmd.eq_ignore_ascii_case(b"FT.SEARCH") {
-                #[allow(clippy::unwrap_used)] // as_of_lsn_opt is Some when cmd == FT.SEARCH
-                match as_of_lsn_opt.unwrap() {
-                    Err(err_frame) => err_frame,
-                    Ok(as_of_lsn) => {
-                        let has_session = cmd_args.iter().any(|a| {
-                            if let Frame::BulkString(b) = a {
-                                b.eq_ignore_ascii_case(b"SESSION")
-                            } else {
-                                false
-                            }
-                        });
-                        if has_session {
-                            // Borrow databases[0] disjointly from vector_store/text_store.
-                            let (vs, ts, dbs) =
-                                (&mut s.vector_store, &s.text_store, &mut s.databases);
-                            crate::command::vector_search::ft_search(
-                                vs,
-                                cmd_args,
-                                Some(&mut dbs[0]),
-                                Some(ts),
-                                as_of_lsn,
-                            )
-                        } else {
-                            crate::command::vector_search::ft_search(
-                                &mut s.vector_store,
-                                cmd_args,
-                                None,
-                                Some(&s.text_store),
-                                as_of_lsn,
-                            )
-                        }
-                    }
-                }
-            } else if cmd.eq_ignore_ascii_case(b"FT.DROPINDEX") {
-                let (vs, ts, dbs) = (&mut s.vector_store, &mut s.text_store, &mut s.databases);
-                crate::command::vector_search::ft_dropindex(vs, ts, Some(&mut dbs[0]), cmd_args)
-            } else if cmd.eq_ignore_ascii_case(b"FT.INFO") {
-                crate::command::vector_search::ft_info(&s.vector_store, &s.text_store, cmd_args)
-            } else if cmd.eq_ignore_ascii_case(b"FT._LIST") {
-                crate::command::vector_search::ft_list(&s.vector_store)
-            } else if cmd.eq_ignore_ascii_case(b"FT.COMPACT") {
-                crate::command::vector_search::ft_compact(
-                    &mut s.vector_store,
-                    &mut s.text_store,
-                    cmd_args,
-                )
-            } else if cmd.eq_ignore_ascii_case(b"FT.CACHESEARCH") {
-                crate::command::vector_search::cache_search::ft_cachesearch(
-                    &mut s.vector_store,
-                    cmd_args,
-                )
-            } else if cmd.eq_ignore_ascii_case(b"FT.CONFIG") {
-                crate::command::vector_search::ft_config(
-                    &mut s.vector_store,
-                    &mut s.text_store,
-                    cmd_args,
-                )
-            } else if cmd.eq_ignore_ascii_case(b"FT.RECOMMEND") {
-                let (vs, dbs) = (&mut s.vector_store, &mut s.databases);
-                crate::command::vector_search::recommend::ft_recommend(
-                    vs,
-                    cmd_args,
-                    Some(&mut dbs[0]),
-                )
-            } else if cmd.eq_ignore_ascii_case(b"FT.NAVIGATE") {
-                #[cfg(feature = "graph")]
-                {
-                    crate::command::vector_search::navigate::ft_navigate(
-                        &mut s.vector_store,
-                        Some(&s.graph_store),
-                        cmd_args,
-                        None,
-                    )
-                }
-                #[cfg(not(feature = "graph"))]
-                {
-                    Frame::Error(Bytes::from_static(
-                        b"ERR FT.NAVIGATE requires graph feature",
-                    ))
-                }
-            } else if cmd.eq_ignore_ascii_case(b"FT.EXPAND") {
-                #[cfg(feature = "graph")]
-                {
-                    crate::command::vector_search::ft_expand(&s.graph_store, cmd_args)
-                }
-                #[cfg(not(feature = "graph"))]
-                {
-                    Frame::Error(Bytes::from_static(b"ERR FT.EXPAND requires graph feature"))
-                }
-            } else {
-                Frame::Error(Bytes::from_static(b"ERR unknown FT.* command"))
-            }
-        })
-    } else {
-        let shard_databases_ref = &ctx.shard_databases;
-        let mut vs = shard_databases_ref.vector_store(ctx.shard_id);
-        let mut ts = shard_databases_ref.text_store(ctx.shard_id);
+    // Unconditional slice path: ShardSlice is always initialized.
+    // All companion stores (vector_store, text_store, databases[0], graph_store)
+    // accessed from ONE with_shard closure to avoid re-entrant RefCell borrows.
+    let response = crate::shard::slice::with_shard(|s| {
         if cmd.eq_ignore_ascii_case(b"FT.CREATE") {
-            crate::command::vector_search::ft_create(&mut vs, &mut ts, cmd_args)
+            crate::command::vector_search::ft_create(
+                &mut s.vector_store,
+                &mut s.text_store,
+                cmd_args,
+            )
         } else if cmd.eq_ignore_ascii_case(b"FT.SEARCH") {
-            // Resolve AS_OF temporal clause + TXN snapshot precedence (TEMP-04, ACID-09).
             #[allow(clippy::unwrap_used)] // as_of_lsn_opt is Some when cmd == FT.SEARCH
             match as_of_lsn_opt.unwrap() {
                 Err(err_frame) => err_frame,
@@ -778,57 +653,59 @@ pub(super) async fn try_handle_ft_command(
                         }
                     });
                     if has_session {
-                        let mut db_guard = shard_databases_ref.write_db(ctx.shard_id, 0);
+                        // Borrow databases[0] disjointly from vector_store/text_store.
+                        let (vs, ts, dbs) = (&mut s.vector_store, &s.text_store, &mut s.databases);
                         crate::command::vector_search::ft_search(
-                            &mut vs,
+                            vs,
                             cmd_args,
-                            Some(&mut *db_guard),
-                            Some(&*ts),
+                            Some(&mut dbs[0]),
+                            Some(ts),
                             as_of_lsn,
                         )
                     } else {
                         crate::command::vector_search::ft_search(
-                            &mut vs,
+                            &mut s.vector_store,
                             cmd_args,
                             None,
-                            Some(&*ts),
+                            Some(&s.text_store),
                             as_of_lsn,
                         )
                     }
                 }
             }
         } else if cmd.eq_ignore_ascii_case(b"FT.DROPINDEX") {
-            let mut db_guard = shard_databases_ref.write_db(ctx.shard_id, 0);
-            crate::command::vector_search::ft_dropindex(
-                &mut vs,
-                &mut ts,
-                Some(&mut *db_guard),
-                cmd_args,
-            )
+            let (vs, ts, dbs) = (&mut s.vector_store, &mut s.text_store, &mut s.databases);
+            crate::command::vector_search::ft_dropindex(vs, ts, Some(&mut dbs[0]), cmd_args)
         } else if cmd.eq_ignore_ascii_case(b"FT.INFO") {
-            crate::command::vector_search::ft_info(&vs, &ts, cmd_args)
+            crate::command::vector_search::ft_info(&s.vector_store, &s.text_store, cmd_args)
         } else if cmd.eq_ignore_ascii_case(b"FT._LIST") {
-            crate::command::vector_search::ft_list(&vs)
+            crate::command::vector_search::ft_list(&s.vector_store)
         } else if cmd.eq_ignore_ascii_case(b"FT.COMPACT") {
-            crate::command::vector_search::ft_compact(&mut vs, &mut ts, cmd_args)
-        } else if cmd.eq_ignore_ascii_case(b"FT.CACHESEARCH") {
-            crate::command::vector_search::cache_search::ft_cachesearch(&mut vs, cmd_args)
-        } else if cmd.eq_ignore_ascii_case(b"FT.CONFIG") {
-            crate::command::vector_search::ft_config(&mut vs, &mut ts, cmd_args)
-        } else if cmd.eq_ignore_ascii_case(b"FT.RECOMMEND") {
-            let mut db_guard = shard_databases_ref.write_db(ctx.shard_id, 0);
-            crate::command::vector_search::recommend::ft_recommend(
-                &mut vs,
+            crate::command::vector_search::ft_compact(
+                &mut s.vector_store,
+                &mut s.text_store,
                 cmd_args,
-                Some(&mut *db_guard),
             )
+        } else if cmd.eq_ignore_ascii_case(b"FT.CACHESEARCH") {
+            crate::command::vector_search::cache_search::ft_cachesearch(
+                &mut s.vector_store,
+                cmd_args,
+            )
+        } else if cmd.eq_ignore_ascii_case(b"FT.CONFIG") {
+            crate::command::vector_search::ft_config(
+                &mut s.vector_store,
+                &mut s.text_store,
+                cmd_args,
+            )
+        } else if cmd.eq_ignore_ascii_case(b"FT.RECOMMEND") {
+            let (vs, dbs) = (&mut s.vector_store, &mut s.databases);
+            crate::command::vector_search::recommend::ft_recommend(vs, cmd_args, Some(&mut dbs[0]))
         } else if cmd.eq_ignore_ascii_case(b"FT.NAVIGATE") {
             #[cfg(feature = "graph")]
             {
-                let graph_guard = shard_databases_ref.graph_store_read(ctx.shard_id);
                 crate::command::vector_search::navigate::ft_navigate(
-                    &mut vs,
-                    Some(&graph_guard),
+                    &mut s.vector_store,
+                    Some(&s.graph_store),
                     cmd_args,
                     None,
                 )
@@ -842,28 +719,17 @@ pub(super) async fn try_handle_ft_command(
         } else if cmd.eq_ignore_ascii_case(b"FT.EXPAND") {
             #[cfg(feature = "graph")]
             {
-                let graph_guard = shard_databases_ref.graph_store_read(ctx.shard_id);
-                crate::command::vector_search::ft_expand(&graph_guard, cmd_args)
+                crate::command::vector_search::ft_expand(&s.graph_store, cmd_args)
             }
             #[cfg(not(feature = "graph"))]
             {
                 Frame::Error(Bytes::from_static(b"ERR FT.EXPAND requires graph feature"))
             }
-        } else if cmd.eq_ignore_ascii_case(b"FT.INVALIDATE_RANGE") {
-            #[cfg(feature = "text-index")]
-            {
-                crate::command::vector_search::ft_invalidate_range(&mut ts, cmd_args)
-            }
-            #[cfg(not(feature = "text-index"))]
-            {
-                Frame::Error(Bytes::from_static(
-                    b"ERR FT.INVALIDATE_RANGE requires text-index feature",
-                ))
-            }
         } else {
             Frame::Error(Bytes::from_static(b"ERR unknown FT.* command"))
         }
-    };
+    });
+
     let mut response = response;
     if let Some(ws_id) = conn.workspace_id.as_ref() {
         strip_workspace_prefix_from_response(ws_id, cmd, &mut response);

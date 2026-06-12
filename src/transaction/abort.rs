@@ -133,21 +133,15 @@ pub fn abort_cross_store_txn(
     #[cfg(feature = "graph")]
     {
         if !txn.graph_undo.is_empty() || !txn.graph_intents.is_empty() {
-            let wal_records = if crate::shard::slice::is_initialized() {
-                crate::shard::slice::with_shard(|s| {
-                    apply_graph_rollback(
-                        &mut s.graph_store,
-                        txn_id,
-                        &txn.graph_undo,
-                        &txn.graph_intents,
-                    )
-                })
-            } else {
-                let mut gs = shard_databases.graph_store_write(shard_id);
-                apply_graph_rollback(&mut gs, txn_id, &txn.graph_undo, &txn.graph_intents)
-                // gs guard drops at scope end — releases graph_store_write
-                // before the next layer (vector_store).
-            };
+            // Unconditional slice path: ShardSlice is always initialized.
+            let wal_records = crate::shard::slice::with_shard(|s| {
+                apply_graph_rollback(
+                    &mut s.graph_store,
+                    txn_id,
+                    &txn.graph_undo,
+                    &txn.graph_intents,
+                )
+            });
             // Drain any WAL records produced by remove_node/remove_edge so
             // replay observes the rollback in the same ordering the live
             // write path would have produced.
