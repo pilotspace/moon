@@ -9,8 +9,15 @@
 //!     FUSION RRF
 //!     [WEIGHTS <w_bm25> <w_dense> <w_sparse>]
 //!     [K_PER_STREAM N]
+//!     [FILTER <expr>]
 //!     [LIMIT offset count]
 //!     PARAMS <count> <name1> <blob1> ...
+//!
+//! FILTER grammar:
+//!   <expr> := TAG @<field> <value>
+//!           | NUMERIC @<field> <min> <max>
+//!           | AND <n> <expr>{n}
+//!           | OR  <n> <expr>{n}
 //! ```
 //!
 //! # Invariants
@@ -38,7 +45,24 @@ use crate::vector::types::{SearchResult, VectorId};
 
 use super::ft_search::execute::parse_sparse_query_blob;
 use super::ft_search::parse::{extract_param_blob, parse_usize};
+#[cfg(feature = "text-index")]
+use super::hybrid_filter::{
+    eval_filter, filter_bm25_results, filter_vector_results, parse_filter_modifier,
+};
 use super::{extract_bulk, matches_keyword};
+
+// Re-export HybridFilter at this module level so callers can write
+// `use crate::command::vector_search::hybrid::HybridFilter`.
+// The type itself is unconditional; parse/eval helpers are text-index only.
+#[cfg(feature = "text-index")]
+pub use super::hybrid_filter::HybridFilter;
+// When text-index is disabled, provide a no-op stub so the rest of hybrid.rs
+// compiles: HybridFilter is only constructed/used inside #[cfg(text-index)]
+// blocks, but the struct field declarations on HybridQuery/HybridQueryPartial
+// are unconditional and reference this type.
+#[cfg(not(feature = "text-index"))]
+#[derive(Debug, Clone)]
+pub enum HybridFilter {}
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -66,18 +90,29 @@ pub struct HybridQuery {
     pub offset: usize,
     /// LIMIT count (default top_k).
     pub count: usize,
+    /// Optional pre-RRF filter — constrains BOTH BM25 and KNN streams before
+    /// fusion (CHANGE A). `None` → unfiltered, byte-identical to pre-CHANGE-A
+    /// behaviour (backward compat).
+    pub filter: Option<HybridFilter>,
 }
 
 impl HybridQuery {
     /// Resolve the effective per-stream candidate cap per CONTEXT D-15.
     ///
-    /// Default: `max(60, 3 * top_k)`. This gives each stream at least 60
-    /// candidates (matching RRF's k-constant headroom) and scales with top_k
-    /// so fusion has enough rescue headroom for docs appearing in multiple streams.
+    /// Default (no filter): `max(60, 3 * top_k)`.
+    /// When a filter is present (CHANGE C): `max(60, 5 * top_k)` — the wider
+    /// window compensates for filter attrition so the fused result still fills
+    /// `top_k` even when a large fraction of candidates is filtered out
+    /// (k-starvation guard from TASK.md Must 3).
+    ///
+    /// An explicit `K_PER_STREAM` override always wins over both defaults.
     #[inline]
     pub fn effective_k_per_stream(&self) -> usize {
-        self.k_per_stream
-            .unwrap_or_else(|| 60usize.max(3usize.saturating_mul(self.top_k.max(1))))
+        if let Some(explicit) = self.k_per_stream {
+            return explicit;
+        }
+        let multiplier = if self.filter.is_some() { 5 } else { 3 };
+        60usize.max(multiplier * self.top_k.max(1))
     }
 }
 
@@ -92,6 +127,9 @@ pub struct HybridQueryPartial {
     pub sparse: Option<(Bytes, Bytes)>,
     pub weights: [f32; 3],
     pub k_per_stream: Option<usize>,
+    /// Parsed FILTER tree, if a `FILTER <expr>` clause was present (CHANGE E).
+    /// `None` means no FILTER clause — backward-compat, unfiltered path.
+    pub filter: Option<HybridFilter>,
     /// Index into `args` one past the last HYBRID-modifier token consumed.
     /// LIMIT / SESSION / PARAMS parsers may start their scan from here.
     pub end_index: usize,
@@ -206,12 +244,32 @@ pub fn parse_hybrid_modifier(args: &[Frame]) -> Result<Option<HybridQueryPartial
         None
     };
 
+    // ── Optional FILTER <expr> (CHANGE E) ─────────────────────────────────────
+    // Appended after K_PER_STREAM. The recursive prefix-arity grammar is parsed
+    // by `parse_filter_modifier`; any error is propagated immediately.
+    // Gated: the filter module and its parser only exist with the text-index feature.
+    #[cfg(feature = "text-index")]
+    let filter = if i < args.len() && matches_keyword(&args[i], b"FILTER") {
+        match parse_filter_modifier(args, i)? {
+            Some((f, new_i)) => {
+                i = new_i;
+                Some(f)
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
+    #[cfg(not(feature = "text-index"))]
+    let filter: Option<HybridFilter> = None;
+
     Ok(Some(HybridQueryPartial {
         dense_field,
         dense_blob,
         sparse,
         weights,
         k_per_stream,
+        filter,
         end_index: i,
     }))
 }
@@ -340,7 +398,7 @@ pub fn execute_hybrid_search_local(
             return Frame::Error(Bytes::from(msg));
         }
     };
-    let text_results: Vec<TextSearchResult> =
+    let mut text_results: Vec<TextSearchResult> =
         crate::command::vector_search::ft_text_search::execute_query_on_index_as_of(
             text_index,
             &text_clause,
@@ -349,14 +407,13 @@ pub fn execute_hybrid_search_local(
             k_per_stream,
             as_of_lsn,
         );
-    let bm25_results = bm25_to_search_results(&text_results);
 
     // ── Stream 2: Dense KNN (per D-11 — existing KNN against the vector index) ─
     let idx = match vector_store.get_index_mut(query.index_name.as_ref()) {
         Some(ix) => ix,
         None => return Frame::Error(Bytes::from_static(b"ERR unknown index")),
     };
-    let (dense_results, key_hash_to_key) = match run_dense_knn(
+    let (mut dense_results, key_hash_to_key) = match run_dense_knn(
         idx,
         &query.dense_field,
         &query.dense_blob,
@@ -369,7 +426,7 @@ pub fn execute_hybrid_search_local(
     };
 
     // ── Stream 3: Sparse (optional, per D-12 + D-16) ──────────────────────────
-    let sparse_results: Vec<SearchResult> = if let Some((sf, sblob)) = &query.sparse {
+    let mut sparse_results: Vec<SearchResult> = if let Some((sf, sblob)) = &query.sparse {
         match idx.sparse_stores.get(sf.as_ref()) {
             Some(store) => {
                 let pairs = parse_sparse_query_blob(sblob);
@@ -388,6 +445,35 @@ pub fn execute_hybrid_search_local(
     } else {
         Vec::new()
     };
+
+    // ── CHANGE B: pre-RRF filter application ─────────────────────────────────
+    //
+    // If a filter is present, compute the doc_id allowlist ONCE from the
+    // shard-local text_index, then retain only matching results in all three
+    // streams BEFORE rrf_fuse_three. This ensures both the BM25 branch AND the
+    // dense-KNN branch are constrained — the root cause of the bypass bug.
+    //
+    // NOTE: a dense/sparse result whose key_hash has NO text doc_id is DROPPED
+    // (correctness-first: we cannot confirm it matches an indexed-field filter;
+    // a filtered BM25-only search would not see it either — matches k-starvation
+    // baseline). The CHANGE C 5× fan-out compensates for this attrition.
+    #[cfg(feature = "text-index")]
+    if let Some(ref filter) = query.filter {
+        let allowlist = eval_filter(filter, text_index);
+        filter_bm25_results(&mut text_results, &allowlist);
+        filter_vector_results(
+            &mut dense_results,
+            &text_index.key_hash_to_doc_id,
+            &allowlist,
+        );
+        filter_vector_results(
+            &mut sparse_results,
+            &text_index.key_hash_to_doc_id,
+            &allowlist,
+        );
+    }
+
+    let bm25_results = bm25_to_search_results(&text_results);
 
     // ── Local RRF (per D-13) ──────────────────────────────────────────────────
     let (fused, bm25_count, dense_count, sparse_count) = crate::vector::fusion::rrf_fuse_three(
@@ -978,8 +1064,9 @@ mod tests {
             top_k: 10,
             offset: 0,
             count: 10,
+            filter: None,
         };
-        // max(60, 3*10) = 60
+        // max(60, 3*10) = 60 (no filter → 3× multiplier)
         assert_eq!(hq.effective_k_per_stream(), 60);
 
         let hq50 = HybridQuery {
@@ -991,9 +1078,36 @@ mod tests {
 
         let hq_explicit = HybridQuery {
             k_per_stream: Some(200),
-            ..hq
+            ..hq.clone()
         };
+        // Explicit override wins.
         assert_eq!(hq_explicit.effective_k_per_stream(), 200);
+
+        // CHANGE C: with filter present, 5× multiplier.
+        // Only exercisable when text-index feature is enabled (HybridFilter variants).
+        #[cfg(feature = "text-index")]
+        {
+            let hq_filtered = HybridQuery {
+                filter: Some(HybridFilter::Tag {
+                    field: "source".to_string(),
+                    value: "scratchpad".to_string(),
+                }),
+                ..hq.clone()
+            };
+            // max(60, 5*10) = 60
+            assert_eq!(hq_filtered.effective_k_per_stream(), 60);
+
+            let hq_filtered_big = HybridQuery {
+                top_k: 50,
+                filter: Some(HybridFilter::Tag {
+                    field: "source".to_string(),
+                    value: "scratchpad".to_string(),
+                }),
+                ..hq
+            };
+            // max(60, 5*50) = 250
+            assert_eq!(hq_filtered_big.effective_k_per_stream(), 250);
+        }
     }
 
     // ── bm25_to_search_results tests (Task 3) ─────────────────────────────────
@@ -1086,6 +1200,7 @@ mod tests {
             top_k: 10,
             offset: 0,
             count: 10,
+            filter: None,
         };
         let result = execute_hybrid_search_local(&mut vs, &ts, &query, 0);
         match result {
