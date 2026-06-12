@@ -120,9 +120,9 @@ fn parse_expr(state: &mut ParseState<'_>) -> Result<HybridFilter, Frame> {
     if matches_keyword(&head, b"TAG") {
         state.pos += 1; // consume TAG
         // @<field>
-        let raw_field = state.consume_bulk().ok_or_else(|| {
-            Frame::Error(Bytes::from_static(b"ERR FILTER TAG missing field"))
-        })?;
+        let raw_field = state
+            .consume_bulk()
+            .ok_or_else(|| Frame::Error(Bytes::from_static(b"ERR FILTER TAG missing field")))?;
         // Strip leading `@` if present.
         let field_bytes = if let Some(stripped) = raw_field.strip_prefix(b"@") {
             Bytes::copy_from_slice(stripped)
@@ -133,9 +133,9 @@ fn parse_expr(state: &mut ParseState<'_>) -> Result<HybridFilter, Frame> {
             .map_err(|_| Frame::Error(Bytes::from_static(b"ERR FILTER TAG non-UTF8 field")))?
             .to_owned();
         // <value>
-        let val_bytes = state.consume_bulk().ok_or_else(|| {
-            Frame::Error(Bytes::from_static(b"ERR FILTER TAG missing value"))
-        })?;
+        let val_bytes = state
+            .consume_bulk()
+            .ok_or_else(|| Frame::Error(Bytes::from_static(b"ERR FILTER TAG missing value")))?;
         let value = std::str::from_utf8(&val_bytes)
             .map_err(|_| Frame::Error(Bytes::from_static(b"ERR FILTER TAG non-UTF8 value")))?
             .to_owned();
@@ -147,41 +147,35 @@ fn parse_expr(state: &mut ParseState<'_>) -> Result<HybridFilter, Frame> {
     } else if matches_keyword(&head, b"NUMERIC") {
         state.pos += 1; // consume NUMERIC
         // @<field>
-        let raw_field = state.consume_bulk().ok_or_else(|| {
-            Frame::Error(Bytes::from_static(b"ERR FILTER NUMERIC missing field"))
-        })?;
+        let raw_field = state
+            .consume_bulk()
+            .ok_or_else(|| Frame::Error(Bytes::from_static(b"ERR FILTER NUMERIC missing field")))?;
         let field_bytes = if let Some(stripped) = raw_field.strip_prefix(b"@") {
             Bytes::copy_from_slice(stripped)
         } else {
             raw_field
         };
         let field = std::str::from_utf8(&field_bytes)
-            .map_err(|_| {
-                Frame::Error(Bytes::from_static(b"ERR FILTER NUMERIC non-UTF8 field"))
-            })?
+            .map_err(|_| Frame::Error(Bytes::from_static(b"ERR FILTER NUMERIC non-UTF8 field")))?
             .to_owned();
         // <min>
-        let min_bytes = state.consume_bulk().ok_or_else(|| {
-            Frame::Error(Bytes::from_static(b"ERR FILTER NUMERIC missing min"))
-        })?;
+        let min_bytes = state
+            .consume_bulk()
+            .ok_or_else(|| Frame::Error(Bytes::from_static(b"ERR FILTER NUMERIC missing min")))?;
         let min: f64 = std::str::from_utf8(&min_bytes)
             .ok()
             .and_then(|s| s.parse().ok())
             .filter(|v: &f64| v.is_finite())
-            .ok_or_else(|| {
-                Frame::Error(Bytes::from_static(b"ERR FILTER NUMERIC invalid min"))
-            })?;
+            .ok_or_else(|| Frame::Error(Bytes::from_static(b"ERR FILTER NUMERIC invalid min")))?;
         // <max>
-        let max_bytes = state.consume_bulk().ok_or_else(|| {
-            Frame::Error(Bytes::from_static(b"ERR FILTER NUMERIC missing max"))
-        })?;
+        let max_bytes = state
+            .consume_bulk()
+            .ok_or_else(|| Frame::Error(Bytes::from_static(b"ERR FILTER NUMERIC missing max")))?;
         let max: f64 = std::str::from_utf8(&max_bytes)
             .ok()
             .and_then(|s| s.parse().ok())
             .filter(|v: &f64| v.is_finite())
-            .ok_or_else(|| {
-                Frame::Error(Bytes::from_static(b"ERR FILTER NUMERIC invalid max"))
-            })?;
+            .ok_or_else(|| Frame::Error(Bytes::from_static(b"ERR FILTER NUMERIC invalid max")))?;
         state.leaf_count += 1;
         if state.leaf_count > 16 {
             return Err(Frame::Error(Bytes::from_static(b"ERR FILTER too complex")));
@@ -224,9 +218,9 @@ fn parse_expr(state: &mut ParseState<'_>) -> Result<HybridFilter, Frame> {
 
 /// Parse a non-negative arity count from the next argument.
 fn parse_arity(state: &mut ParseState<'_>) -> Result<usize, Frame> {
-    let f = state.consume().ok_or_else(|| {
-        Frame::Error(Bytes::from_static(b"ERR FILTER arity truncated"))
-    })?;
+    let f = state
+        .consume()
+        .ok_or_else(|| Frame::Error(Bytes::from_static(b"ERR FILTER arity truncated")))?;
     match f {
         Frame::Integer(n) => {
             if *n < 0 || *n > 16 {
@@ -236,19 +230,20 @@ fn parse_arity(state: &mut ParseState<'_>) -> Result<usize, Frame> {
             }
         }
         Frame::BulkString(b) => {
-            let s = std::str::from_utf8(b).map_err(|_| {
-                Frame::Error(Bytes::from_static(b"ERR FILTER invalid arity"))
-            })?;
-            let n: usize = s.parse().map_err(|_| {
-                Frame::Error(Bytes::from_static(b"ERR FILTER invalid arity"))
-            })?;
+            let s = std::str::from_utf8(b)
+                .map_err(|_| Frame::Error(Bytes::from_static(b"ERR FILTER invalid arity")))?;
+            let n: usize = s
+                .parse()
+                .map_err(|_| Frame::Error(Bytes::from_static(b"ERR FILTER invalid arity")))?;
             if n > 16 {
                 Err(Frame::Error(Bytes::from_static(b"ERR FILTER too complex")))
             } else {
                 Ok(n)
             }
         }
-        _ => Err(Frame::Error(Bytes::from_static(b"ERR FILTER invalid arity"))),
+        _ => Err(Frame::Error(Bytes::from_static(
+            b"ERR FILTER invalid arity",
+        ))),
     }
 }
 
@@ -506,7 +501,9 @@ mod tests {
     #[test]
     fn test_parse_filter_and_two_tags() {
         // FILTER AND 2 TAG @source a TAG @chunk_type fact
-        let args = filter_args(&[b"AND", b"2", b"TAG", b"@source", b"a", b"TAG", b"@type", b"fact"]);
+        let args = filter_args(&[
+            b"AND", b"2", b"TAG", b"@source", b"a", b"TAG", b"@type", b"fact",
+        ]);
         let (f, _) = parse_filter_modifier(&args, 0)
             .expect("no error")
             .expect("some");
@@ -521,7 +518,9 @@ mod tests {
     #[test]
     fn test_parse_filter_or() {
         // FILTER OR 2 TAG @source a TAG @source b
-        let args = filter_args(&[b"OR", b"2", b"TAG", b"@source", b"a", b"TAG", b"@source", b"b"]);
+        let args = filter_args(&[
+            b"OR", b"2", b"TAG", b"@source", b"a", b"TAG", b"@source", b"b",
+        ]);
         let (f, _) = parse_filter_modifier(&args, 0)
             .expect("no error")
             .expect("some");
@@ -582,11 +581,8 @@ mod tests {
         // Build a 5-deep AND nesting: AND 1 AND 1 AND 1 AND 1 AND 1 TAG @f v
         // depth limit is 4; the 5th AND violates it.
         let args = filter_args(&[
-            b"AND", b"1",
-            b"AND", b"1",
-            b"AND", b"1",
-            b"AND", b"1",
-            b"AND", b"1",  // <-- depth 5
+            b"AND", b"1", b"AND", b"1", b"AND", b"1", b"AND", b"1", b"AND",
+            b"1", // <-- depth 5
             b"TAG", b"@f", b"v",
         ]);
         let r = parse_filter_modifier(&args, 0);
@@ -646,11 +642,7 @@ mod tests {
     #[test]
     fn test_parse_filter_negative_arity() {
         // AND -1 … → invalid.
-        let args = vec![
-            bs(b"FILTER"),
-            bs(b"AND"),
-            Frame::Integer(-1),
-        ];
+        let args = vec![bs(b"FILTER"), bs(b"AND"), Frame::Integer(-1)];
         let r = parse_filter_modifier(&args, 0);
         assert!(r.is_err(), "negative arity → error");
     }
