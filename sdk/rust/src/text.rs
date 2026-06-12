@@ -2,6 +2,101 @@ use crate::error::{MoonError, Result};
 use crate::types::{AggregateRow, Reducer, TextSearchHit, encode_vector};
 use crate::util::{parse_aggregate_rows, parse_text_search_hits};
 
+// ─── HybridFilter (CHANGE G) ─────────────────────────────────────────────────
+
+/// Recursive filter tree for HYBRID FT.SEARCH (SDK mirror of the server enum).
+///
+/// A [`HybridFilter::Tag`] whose `value` ends in `'*'` is a prefix match
+/// (StartsWith); all other values are exact matches.
+///
+/// The encoder enforces the same limits as the server-side parser: max depth 4,
+/// max 16 leaves. Exceeding either returns a [`MoonError::InvalidArgument`]
+/// before sending the wire request.
+///
+/// `None` passed to [`TextClient::hybrid_search`] ⇒ wire unchanged (backward
+/// compatible with all pre-CHANGE-G callers).
+#[derive(Debug, Clone)]
+pub enum HybridFilter {
+    /// `TAG @<field> <value>` — exact if `value` has no trailing `'*'`;
+    /// prefix (StartsWith) if `value` ends with `'*'`.
+    Tag { field: String, value: String },
+    /// `NUMERIC @<field> <min> <max>` — inclusive range `[min, max]`.
+    Numeric { field: String, min: f64, max: f64 },
+    /// `AND <n> <expr>{n}` — all children must match.
+    And(Vec<HybridFilter>),
+    /// `OR <n> <expr>{n}` — at least one child must match.
+    Or(Vec<HybridFilter>),
+}
+
+/// State for client-side depth/leaf validation.
+struct FilterValidator {
+    leaf_count: usize,
+}
+
+impl FilterValidator {
+    fn new() -> Self {
+        Self { leaf_count: 0 }
+    }
+
+    fn validate(&mut self, filter: &HybridFilter, depth: usize) -> std::result::Result<(), String> {
+        if depth > 4 {
+            return Err("FILTER too complex (depth > 4)".to_string());
+        }
+        match filter {
+            HybridFilter::Tag { .. } | HybridFilter::Numeric { .. } => {
+                self.leaf_count += 1;
+                if self.leaf_count > 16 {
+                    return Err("FILTER too complex (> 16 leaves)".to_string());
+                }
+            }
+            HybridFilter::And(children) | HybridFilter::Or(children) => {
+                for child in children {
+                    self.validate(child, depth + 1)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Encode a `HybridFilter` into the CHANGE E wire form, appending tokens to `cmd`.
+///
+/// Grammar (recursive prefix, arity-counted):
+/// ```text
+/// FILTER TAG @<field> <value>
+/// FILTER NUMERIC @<field> <min> <max>
+/// FILTER AND <n> <expr>{n}
+/// FILTER OR  <n> <expr>{n}
+/// ```
+fn encode_filter(cmd: &mut redis::Cmd, filter: &HybridFilter, top_level: bool) {
+    if top_level {
+        cmd.arg("FILTER");
+    }
+    match filter {
+        HybridFilter::Tag { field, value } => {
+            cmd.arg("TAG").arg(format!("@{field}")).arg(value);
+        }
+        HybridFilter::Numeric { field, min, max } => {
+            cmd.arg("NUMERIC")
+                .arg(format!("@{field}"))
+                .arg(min.to_string())
+                .arg(max.to_string());
+        }
+        HybridFilter::And(children) => {
+            cmd.arg("AND").arg(children.len());
+            for child in children {
+                encode_filter(cmd, child, false);
+            }
+        }
+        HybridFilter::Or(children) => {
+            cmd.arg("OR").arg(children.len());
+            for child in children {
+                encode_filter(cmd, child, false);
+            }
+        }
+    }
+}
+
 /// Full-text search sub-client (BM25, `FT.AGGREGATE`, hybrid RRF).
 ///
 /// Obtain via [`MoonClient::text`](crate::MoonClient::text).
@@ -43,8 +138,17 @@ impl TextClient {
     /// `src/command/vector_search/hybrid.rs` (`HybridQuery::sparse: Option`).
     /// `weights[2]` is ignored in two-way mode.
     ///
-    /// Wire format (full): `HYBRID VECTOR @vec_field $qv SPARSE @sparse_field $sq FUSION RRF WEIGHTS w1 w2 w3 PARAMS 4 ...`
-    /// Wire format (no sparse): `HYBRID VECTOR @vec_field $qv FUSION RRF WEIGHTS w1 w2 w3 PARAMS 2 query_vec <blob>`
+    /// `filter` is an optional pre-RRF filter (CHANGE G). When `None` the wire
+    /// format is **identical** to the pre-CHANGE-G form — fully backward
+    /// compatible. When `Some`, the filter tree is appended as a `FILTER <expr>`
+    /// clause after `FUSION RRF WEIGHTS`. The encoder validates depth (≤ 4) and
+    /// leaf count (≤ 16) client-side and returns [`MoonError::InvalidArgument`]
+    /// before sending if the limits are exceeded.
+    ///
+    /// Wire format (no filter, no sparse):
+    ///   `HYBRID VECTOR @f $qv FUSION RRF WEIGHTS w1 w2 w3 LIMIT 0 k PARAMS 2 ...`
+    /// Wire format (with filter):
+    ///   `HYBRID VECTOR @f $qv FUSION RRF WEIGHTS w1 w2 w3 FILTER TAG @source v LIMIT 0 k PARAMS 2 ...`
     pub async fn hybrid_search(
         &mut self,
         index: &str,
@@ -54,6 +158,7 @@ impl TextClient {
         sparse_field: Option<&str>,
         k: usize,
         weights: [f64; 3],
+        filter: Option<&HybridFilter>,
     ) -> Result<Vec<TextSearchHit>> {
         for (i, &w) in weights.iter().enumerate() {
             if !w.is_finite() || w < 0.0 {
@@ -64,6 +169,14 @@ impl TextClient {
         }
         if weights.iter().all(|&w| w == 0.0) {
             return Err(MoonError::invalid_arg("all RRF weights are zero"));
+        }
+
+        // Client-side filter validation (same depth/leaf limits as the server parser).
+        if let Some(f) = filter {
+            let mut validator = FilterValidator::new();
+            validator
+                .validate(f, 0)
+                .map_err(MoonError::invalid_arg)?;
         }
 
         let blob = encode_vector(query_vec);
@@ -82,10 +195,15 @@ impl TextClient {
             .arg("WEIGHTS")
             .arg(weights[0])
             .arg(weights[1])
-            .arg(weights[2])
-            .arg("LIMIT")
-            .arg("0")
-            .arg(k);
+            .arg(weights[2]);
+
+        // Append FILTER clause after WEIGHTS, before LIMIT (CHANGE G).
+        // When None, wire is unchanged — backward compat.
+        if let Some(f) = filter {
+            encode_filter(&mut cmd, f, true);
+        }
+
+        cmd.arg("LIMIT").arg("0").arg(k);
         if sparse_field.is_some() {
             cmd.arg("PARAMS")
                 .arg(4)
