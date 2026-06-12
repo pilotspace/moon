@@ -330,6 +330,19 @@ pub struct GraphTraversePayload {
     pub reply_tx: channel::OneshotSender<Frame>,
 }
 
+/// Boxed payload for `ShardMessage::GraphRollback` (multi-shard TXN.ABORT).
+///
+/// Carries the graph-undo ops and create-intents whose graph names hash to
+/// the receiving shard, so the rollback mutates the store that actually owns
+/// those graphs. Boxed: two Vecs + oneshot would blow the 64 B enum ceiling.
+#[cfg(feature = "graph")]
+pub struct GraphRollbackPayload {
+    pub txn_id: u64,
+    pub graph_undo: Vec<crate::transaction::GraphUndoOp>,
+    pub graph_intents: Vec<crate::transaction::GraphIntent>,
+    pub reply_tx: channel::OneshotSender<Frame>,
+}
+
 /// Boxed payload for `ShardMessage::CdcSubscribe` (C3b-2).
 ///
 /// Carries the per-subscriber sink and replay start point to the shard
@@ -545,6 +558,10 @@ pub enum ShardMessage {
     /// Boxed (Phase 177) — Vec<u64> + Bytes + oneshot pushed this past 80 B inline.
     #[cfg(feature = "graph")]
     GraphTraverse(Box<GraphTraversePayload>),
+    /// Multi-shard TXN.ABORT: apply graph rollback (undo ops + create-intent
+    /// removal) for graphs owned by this shard.
+    #[cfg(feature = "graph")]
+    GraphRollback(Box<GraphRollbackPayload>),
     /// Cross-shard PUBLISH with shared atomic response slot for subscriber count accumulation.
     ///
     /// Boxed (Phase 177) — two Bytes + Arc was 72 B inline.

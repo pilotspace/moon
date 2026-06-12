@@ -68,6 +68,32 @@ pub async fn coordinate_multi_key(
             _response_pool,
         )
         .await
+    } else if cmd.eq_ignore_ascii_case(b"BITOP") {
+        coordinate_bitop(
+            args,
+            my_shard,
+            num_shards,
+            db_index,
+            shard_databases,
+            dispatch_tx,
+            spsc_notifiers,
+            cached_clock,
+            _response_pool,
+        )
+        .await
+    } else if cmd.eq_ignore_ascii_case(b"COPY") {
+        coordinate_copy(
+            args,
+            my_shard,
+            num_shards,
+            db_index,
+            shard_databases,
+            dispatch_tx,
+            spsc_notifiers,
+            cached_clock,
+            _response_pool,
+        )
+        .await
     } else {
         // DEL, UNLINK, EXISTS with multiple keys
         coordinate_multi_del_or_exists(
@@ -84,6 +110,478 @@ pub async fn coordinate_multi_key(
         )
         .await
     }
+}
+
+// ---------------------------------------------------------------------------
+// Shared legs for the BITOP / COPY coordinators
+// ---------------------------------------------------------------------------
+
+/// Run one full command on the LOCAL shard through the real dispatcher
+/// (identical semantics to a remote MultiExecute leg, minus the hop).
+fn run_local(
+    shard_databases: &Arc<ShardDatabases>,
+    my_shard: usize,
+    db_index: usize,
+    cached_clock: &CachedClock,
+    cmd: &[u8],
+    args: &[Frame],
+) -> Frame {
+    let db_count = shard_databases.db_count();
+    let mut selected = db_index;
+    let mut run = |db: &mut crate::storage::Database| {
+        db.refresh_now_from_cache(cached_clock);
+        match cmd_dispatch(db, cmd, args, &mut selected, db_count) {
+            DispatchResult::Response(f) | DispatchResult::Quit(f) => f,
+        }
+    };
+    // Phase 2c: gate on is_initialized(); new path uses ShardSlice directly.
+    if crate::shard::slice::is_initialized() {
+        crate::shard::slice::with_shard_db(db_index, run)
+    } else {
+        let mut guard = shard_databases.write_db(my_shard, db_index);
+        run(&mut guard)
+    }
+}
+
+/// Send one full command to a REMOTE shard and await its reply.
+async fn run_remote(
+    target_shard: usize,
+    routing_key: &Bytes,
+    command: Frame,
+    my_shard: usize,
+    db_index: usize,
+    dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
+    spsc_notifiers: &[Arc<channel::Notify>],
+) -> Frame {
+    // ChannelMesh has no self-send slot — local legs must go via run_local.
+    debug_assert_ne!(target_shard, my_shard, "run_remote called for own shard");
+    let (reply_tx, reply_rx) = channel::oneshot();
+    let msg = ShardMessage::MultiExecute {
+        db_index,
+        commands: vec![(routing_key.clone(), command)],
+        reply_tx,
+    };
+    spsc_send(dispatch_tx, my_shard, target_shard, msg, spsc_notifiers).await;
+    match reply_rx.recv().await {
+        Ok(mut frames) if !frames.is_empty() => frames.swap_remove(0),
+        _ => Frame::Error(Bytes::from_static(b"ERR cross-shard reply channel closed")),
+    }
+}
+
+/// Run one full command on whichever shard owns `routing_key`.
+#[allow(clippy::too_many_arguments)]
+async fn run_on_owner(
+    routing_key: &Bytes,
+    command_parts: &[Frame],
+    my_shard: usize,
+    num_shards: usize,
+    db_index: usize,
+    shard_databases: &Arc<ShardDatabases>,
+    dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
+    spsc_notifiers: &[Arc<channel::Notify>],
+    cached_clock: &CachedClock,
+) -> Frame {
+    let owner = key_to_shard(routing_key, num_shards);
+    if owner == my_shard {
+        let (cmd, args) = match command_parts.split_first() {
+            Some((Frame::BulkString(c), rest)) => (c.clone(), rest),
+            _ => return Frame::Error(Bytes::from_static(b"ERR invalid command format")),
+        };
+        run_local(
+            shard_databases,
+            my_shard,
+            db_index,
+            cached_clock,
+            &cmd,
+            args,
+        )
+    } else {
+        let command = Frame::Array(command_parts.to_vec().into());
+        run_remote(
+            owner,
+            routing_key,
+            command,
+            my_shard,
+            db_index,
+            dispatch_tx,
+            spsc_notifiers,
+        )
+        .await
+    }
+}
+
+fn bulk(b: &Bytes) -> Frame {
+    Frame::BulkString(b.clone())
+}
+
+fn bulk_static(s: &'static [u8]) -> Frame {
+    Frame::BulkString(Bytes::from_static(s))
+}
+
+/// Coordinate BITOP across shards.
+///
+/// `BITOP <op> dest src [src ...]` — sources are gathered (local read or
+/// remote GET), combined via the same `bitop_compute` the local path uses,
+/// and the result is written on DEST's owning shard (SET, or DEL when the
+/// combine is empty). Full Redis semantics: BITOP is string-only by spec,
+/// so value transfer is exact; WRONGTYPE from any source propagates.
+#[allow(clippy::too_many_arguments)]
+async fn coordinate_bitop(
+    args: &[Frame],
+    my_shard: usize,
+    num_shards: usize,
+    db_index: usize,
+    shard_databases: &Arc<ShardDatabases>,
+    dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
+    spsc_notifiers: &[Arc<channel::Notify>],
+    cached_clock: &CachedClock,
+    _response_pool: &(),
+) -> Frame {
+    // Single-shard server: straight to local dispatch — zero coordinator
+    // overhead (no key vec, no owner hashing) on the 1-shard hot path.
+    if num_shards == 1 {
+        return run_local(
+            shard_databases,
+            my_shard,
+            db_index,
+            cached_clock,
+            b"BITOP",
+            args,
+        );
+    }
+    if args.len() < 3 {
+        return Frame::Error(Bytes::from_static(
+            b"ERR wrong number of arguments for 'BITOP' command",
+        ));
+    }
+    let (Some(op), Some(dest)) = (extract_key(&args[0]), extract_key(&args[1])) else {
+        return Frame::Error(Bytes::from_static(
+            b"ERR wrong number of arguments for 'BITOP' command",
+        ));
+    };
+    // Redis validation order: NOT arity errors before any key is touched.
+    if op.eq_ignore_ascii_case(b"NOT") && args.len() != 3 {
+        return Frame::Error(Bytes::from_static(
+            b"ERR BITOP NOT requires one and only one key",
+        ));
+    }
+    let mut src_keys: Vec<Bytes> = Vec::with_capacity(args.len() - 2);
+    for arg in &args[2..] {
+        match extract_key(arg) {
+            Some(k) => src_keys.push(k),
+            None => {
+                return Frame::Error(Bytes::from_static(
+                    b"ERR wrong number of arguments for 'BITOP' command",
+                ));
+            }
+        }
+    }
+
+    // Single-owner fast path: every key (dest included) on one shard —
+    // forward the whole command for byte-identical local semantics.
+    let dest_shard = key_to_shard(&dest, num_shards);
+    if src_keys
+        .iter()
+        .all(|k| key_to_shard(k, num_shards) == dest_shard)
+    {
+        let mut parts: Vec<Frame> = Vec::with_capacity(args.len() + 1);
+        parts.push(bulk_static(b"BITOP"));
+        parts.extend_from_slice(args);
+        return run_on_owner(
+            &dest,
+            &parts,
+            my_shard,
+            num_shards,
+            db_index,
+            shard_databases,
+            dispatch_tx,
+            spsc_notifiers,
+            cached_clock,
+        )
+        .await;
+    }
+
+    // Gather sources: group by shard ascending (VLL), local legs direct,
+    // remote legs as GET batches.
+    let mut groups: BTreeMap<usize, Vec<(usize, Bytes)>> = BTreeMap::new();
+    for (i, k) in src_keys.iter().enumerate() {
+        groups
+            .entry(key_to_shard(k, num_shards))
+            .or_default()
+            .push((i, k.clone()));
+    }
+    let mut sources: Vec<Option<Vec<u8>>> = vec![None; src_keys.len()];
+    let mut pending: Vec<(Vec<usize>, channel::OneshotReceiver<Vec<Frame>>)> = Vec::new();
+    for (shard_id, indexed) in &groups {
+        if *shard_id == my_shard {
+            for (idx, key) in indexed {
+                let reply = run_local(
+                    shard_databases,
+                    my_shard,
+                    db_index,
+                    cached_clock,
+                    b"GET",
+                    &[bulk(key)],
+                );
+                match reply {
+                    Frame::BulkString(v) => sources[*idx] = Some(v.to_vec()),
+                    Frame::Error(e) => return Frame::Error(e),
+                    _ => sources[*idx] = Some(Vec::new()),
+                }
+            }
+        } else {
+            let (reply_tx, reply_rx) = channel::oneshot();
+            let commands: Vec<(Bytes, Frame)> = indexed
+                .iter()
+                .map(|(_, k)| {
+                    (
+                        k.clone(),
+                        Frame::Array(framevec![bulk_static(b"GET"), bulk(k)]),
+                    )
+                })
+                .collect();
+            let indices: Vec<usize> = indexed.iter().map(|(i, _)| *i).collect();
+            let msg = ShardMessage::MultiExecute {
+                db_index,
+                commands,
+                reply_tx,
+            };
+            spsc_send(dispatch_tx, my_shard, *shard_id, msg, spsc_notifiers).await;
+            pending.push((indices, reply_rx));
+        }
+    }
+    for (indices, reply_rx) in pending {
+        match reply_rx.recv().await {
+            Ok(frames) => {
+                for (idx, frame) in indices.into_iter().zip(frames) {
+                    match frame {
+                        Frame::BulkString(v) => sources[idx] = Some(v.to_vec()),
+                        Frame::Error(e) => return Frame::Error(e),
+                        _ => sources[idx] = Some(Vec::new()),
+                    }
+                }
+            }
+            Err(_) => {
+                return Frame::Error(Bytes::from_static(b"ERR cross-shard reply channel closed"));
+            }
+        }
+    }
+    let gathered: Vec<Vec<u8>> = sources.into_iter().map(Option::unwrap_or_default).collect();
+
+    match crate::command::string::bitop_compute(&op, &gathered) {
+        Err(e) => e,
+        Ok(None) => {
+            // All sources empty/missing — dest is deleted, reply 0.
+            let reply = run_on_owner(
+                &dest,
+                &[bulk_static(b"DEL"), bulk(&dest)],
+                my_shard,
+                num_shards,
+                db_index,
+                shard_databases,
+                dispatch_tx,
+                spsc_notifiers,
+                cached_clock,
+            )
+            .await;
+            if let Frame::Error(e) = reply {
+                return Frame::Error(e);
+            }
+            Frame::Integer(0)
+        }
+        Ok(Some(result)) => {
+            let len = result.len() as i64;
+            let reply = run_on_owner(
+                &dest,
+                &[
+                    bulk_static(b"SET"),
+                    bulk(&dest),
+                    Frame::BulkString(Bytes::from(result)),
+                ],
+                my_shard,
+                num_shards,
+                db_index,
+                shard_databases,
+                dispatch_tx,
+                spsc_notifiers,
+                cached_clock,
+            )
+            .await;
+            if let Frame::Error(e) = reply {
+                return Frame::Error(e);
+            }
+            Frame::Integer(len)
+        }
+    }
+}
+
+/// Coordinate COPY across shards.
+///
+/// `COPY src dst [REPLACE]` — same-shard pairs (hash tags) forward to the
+/// owning shard and keep full any-type fidelity via the local copy path.
+/// Cross-shard pairs transfer STRING values exactly (value + TTL, NX unless
+/// REPLACE); cross-shard non-string values return an explicit error instead
+/// of silently corrupting (full-fidelity transfer is DUMP/RESTORE territory,
+/// tracked in the task backlog). `COPY ... DB n` never reaches this path
+/// (excluded in `is_multi_key_command`; the handlers' two-db interception
+/// keeps owning it).
+#[allow(clippy::too_many_arguments)]
+async fn coordinate_copy(
+    args: &[Frame],
+    my_shard: usize,
+    num_shards: usize,
+    db_index: usize,
+    shard_databases: &Arc<ShardDatabases>,
+    dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
+    spsc_notifiers: &[Arc<channel::Notify>],
+    cached_clock: &CachedClock,
+    _response_pool: &(),
+) -> Frame {
+    // Single-shard server: straight to local dispatch — zero coordinator
+    // overhead on the 1-shard hot path.
+    if num_shards == 1 {
+        return run_local(
+            shard_databases,
+            my_shard,
+            db_index,
+            cached_clock,
+            b"COPY",
+            args,
+        );
+    }
+    if args.len() < 2 {
+        return Frame::Error(Bytes::from_static(
+            b"ERR wrong number of arguments for 'COPY' command",
+        ));
+    }
+    let (Some(src), Some(dst)) = (extract_key(&args[0]), extract_key(&args[1])) else {
+        return Frame::Error(Bytes::from_static(
+            b"ERR wrong number of arguments for 'COPY' command",
+        ));
+    };
+    let mut replace = false;
+    for opt in &args[2..] {
+        match extract_key(opt) {
+            Some(o) if o.eq_ignore_ascii_case(b"REPLACE") => replace = true,
+            _ => return Frame::Error(Bytes::from_static(b"ERR syntax error")),
+        }
+    }
+
+    let src_shard = key_to_shard(&src, num_shards);
+    let dst_shard = key_to_shard(&dst, num_shards);
+
+    // Same owner: forward the whole COPY — full any-type fidelity.
+    if src_shard == dst_shard {
+        let mut parts: Vec<Frame> = Vec::with_capacity(args.len() + 1);
+        parts.push(bulk_static(b"COPY"));
+        parts.extend_from_slice(args);
+        return run_on_owner(
+            &src,
+            &parts,
+            my_shard,
+            num_shards,
+            db_index,
+            shard_databases,
+            dispatch_tx,
+            spsc_notifiers,
+            cached_clock,
+        )
+        .await;
+    }
+
+    // Cross-shard: read value + TTL from src's shard.
+    let value = match run_on_owner(
+        &src,
+        &[bulk_static(b"GET"), bulk(&src)],
+        my_shard,
+        num_shards,
+        db_index,
+        shard_databases,
+        dispatch_tx,
+        spsc_notifiers,
+        cached_clock,
+    )
+    .await
+    {
+        Frame::BulkString(v) => v,
+        Frame::Error(e) if e.starts_with(b"WRONGTYPE") => {
+            return Frame::Error(Bytes::from_static(
+                b"ERR COPY across shards supports only string values; co-locate the keys with {hash} tags for other types",
+            ));
+        }
+        Frame::Error(e) => return Frame::Error(e),
+        _ => return Frame::Integer(0), // src missing
+    };
+    let ttl_ms = match run_on_owner(
+        &src,
+        &[bulk_static(b"PTTL"), bulk(&src)],
+        my_shard,
+        num_shards,
+        db_index,
+        shard_databases,
+        dispatch_tx,
+        spsc_notifiers,
+        cached_clock,
+    )
+    .await
+    {
+        Frame::Integer(t) if t > 0 => Some(t),
+        Frame::Integer(-2) => return Frame::Integer(0), // expired between reads
+        _ => None,
+    };
+
+    // Write to dst's shard: NX unless REPLACE, then restore TTL.
+    let set_parts: Vec<Frame> = if replace {
+        vec![bulk_static(b"SET"), bulk(&dst), Frame::BulkString(value)]
+    } else {
+        vec![
+            bulk_static(b"SET"),
+            bulk(&dst),
+            Frame::BulkString(value),
+            bulk_static(b"NX"),
+        ]
+    };
+    let set_reply = run_on_owner(
+        &dst,
+        &set_parts,
+        my_shard,
+        num_shards,
+        db_index,
+        shard_databases,
+        dispatch_tx,
+        spsc_notifiers,
+        cached_clock,
+    )
+    .await;
+    match set_reply {
+        Frame::SimpleString(_) => {}
+        Frame::Error(e) => return Frame::Error(e),
+        // Null reply = NX refused (dst exists); anything else is unexpected.
+        _ => return Frame::Integer(0),
+    }
+    if let Some(t) = ttl_ms {
+        let mut ttl_buf = itoa::Buffer::new();
+        let reply = run_on_owner(
+            &dst,
+            &[
+                bulk_static(b"PEXPIRE"),
+                bulk(&dst),
+                Frame::BulkString(Bytes::copy_from_slice(ttl_buf.format(t).as_bytes())),
+            ],
+            my_shard,
+            num_shards,
+            db_index,
+            shard_databases,
+            dispatch_tx,
+            spsc_notifiers,
+            cached_clock,
+        )
+        .await;
+        if let Frame::Error(e) = reply {
+            return Frame::Error(e);
+        }
+    }
+    Frame::Integer(1)
 }
 
 /// Extract Bytes from a Frame argument.

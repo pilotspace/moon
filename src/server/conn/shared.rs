@@ -308,6 +308,18 @@ pub(crate) fn extract_primary_key<'a>(cmd: &[u8], args: &'a [Frame]) -> Option<&
             _ => None,
         };
     }
+    // BITOP <op> destkey key [key ...]: args[0] is the operation literal
+    // ("AND"/"OR"/"XOR"/"NOT"); the first key is the DESTINATION at args[1]
+    // (metadata first_key=2). Routing by args[0] hashed the operation name.
+    // Multi-shard servers consume BITOP in the multi-key coordinator before
+    // this routing runs; this arm fixes single-shard-local + cluster-slot
+    // routing.
+    if (len, b0) == (5, b'b') && cmd.eq_ignore_ascii_case(b"BITOP") {
+        return match args.get(1) {
+            Some(Frame::BulkString(key)) => Some(key),
+            _ => None,
+        };
+    }
     // ZDIFF/ZINTER/ZUNION/ZINTERCARD numkeys key [key ...]:
     //   args[0] is the integer numkeys literal; the first actual key is args[1].
     // Routing by args[0] would hash "2" (the numkeys string) to an arbitrary
@@ -362,6 +374,20 @@ pub(crate) fn is_multi_key_command(cmd: &[u8], args: &[Frame]) -> bool {
         (3, b'd') => args.len() > 1 && cmd.eq_ignore_ascii_case(b"DEL"),
         (6, b'u') => args.len() > 1 && cmd.eq_ignore_ascii_case(b"UNLINK"),
         (6, b'e') => args.len() > 1 && cmd.eq_ignore_ascii_case(b"EXISTS"),
+        // BITOP <op> dest src...: dest + sources can live on different shards.
+        (5, b'b') => args.len() >= 3 && cmd.eq_ignore_ascii_case(b"BITOP"),
+        // COPY src dst [REPLACE]: src and dst can live on different shards.
+        // The `COPY ... DB n` form is EXCLUDED: it needs two databases and is
+        // owned by the handlers' two-db interception (cross-db + cross-shard
+        // simultaneously is unsupported, as before).
+        (4, b'c') => {
+            args.len() >= 2
+                && cmd.eq_ignore_ascii_case(b"COPY")
+                && !args
+                    .iter()
+                    .skip(2)
+                    .any(|a| matches!(a, Frame::BulkString(o) if o.eq_ignore_ascii_case(b"DB")))
+        }
         _ => false,
     }
 }

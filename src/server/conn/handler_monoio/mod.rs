@@ -882,7 +882,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
             if txn::try_handle_txn_commit(cmd, cmd_args, &mut conn, ctx, &mut responses) {
                 continue;
             }
-            if txn::try_handle_txn_abort(cmd, cmd_args, &mut conn, ctx, &mut responses) {
+            if txn::try_handle_txn_abort(cmd, cmd_args, &mut conn, ctx, &mut responses).await {
                 continue;
             }
 
@@ -890,7 +890,8 @@ pub(crate) async fn handle_connection_sharded_monoio<
             if txn::try_handle_temporal_snapshot_at(cmd, cmd_args, ctx, &mut responses) {
                 continue;
             }
-            if txn::try_handle_temporal_invalidate(cmd, cmd_args, ctx, &mut responses) {
+            if txn::try_handle_temporal_invalidate(cmd, cmd_args, &frame, ctx, &mut responses).await
+            {
                 continue;
             }
 
@@ -960,7 +961,16 @@ pub(crate) async fn handle_connection_sharded_monoio<
 
             // --- GRAPH.* graph commands ---
             #[cfg(feature = "graph")]
-            if write::try_handle_graph_command(cmd, cmd_args, &mut conn, ctx, &mut responses) {
+            if write::try_handle_graph_command(
+                cmd,
+                cmd_args,
+                &frame,
+                &mut conn,
+                ctx,
+                &mut responses,
+            )
+            .await
+            {
                 continue;
             }
 
@@ -2215,12 +2225,16 @@ pub(crate) async fn handle_connection_sharded_monoio<
     // sharded runtime block in handler_sharded.rs so both paths delegate to the same
     // shared helper. FIN has already been sent; shard state is still intact.
     if let Some(txn) = conn.active_cross_txn.take() {
-        crate::transaction::abort::abort_cross_store_txn(
+        crate::transaction::abort::abort_cross_store_txn_routed(
             &ctx.shard_databases,
             ctx.shard_id,
             conn.selected_db,
+            ctx.num_shards,
+            &ctx.dispatch_tx,
+            &ctx.spsc_notifiers,
             txn,
-        );
+        )
+        .await;
     }
 
     // --- Disconnect cleanup: propagate unsubscribe to all shards' remote subscriber maps ---

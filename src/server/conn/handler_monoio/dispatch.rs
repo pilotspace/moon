@@ -325,7 +325,14 @@ pub(super) fn try_handle_cluster_routing(
         if is_multi_key_command(cmd, cmd_args) {
             let first_slot = slot;
             let mut cross_slot = false;
-            for arg in cmd_args.iter().skip(1) {
+            // COPY's keys are exactly args[0..2]; trailing args are the
+            // REPLACE literal, which must not be slot-checked.
+            let key_args: &[Frame] = if cmd.eq_ignore_ascii_case(b"COPY") {
+                &cmd_args[..cmd_args.len().min(2)]
+            } else {
+                cmd_args
+            };
+            for arg in key_args.iter().skip(1) {
                 if let Some(k) = match arg {
                     Frame::BulkString(b) => Some(b.as_ref()),
                     _ => None,

@@ -26,12 +26,12 @@
     },
     "consistency-dispatch-gaps": {
       "title": "Close the consistency-suite gaps: unreachable read commands + script defects",
-      "phase": "build",
+      "phase": "verify",
       "gate": "none",
       "milestone": "v1-shared-nothing",
       "depends_on": [],
       "created": "2026-06-11T10:38:27+00:00",
-      "updated": "2026-06-11T12:08:18+00:00",
+      "updated": "2026-06-11T13:27:13+00:00",
       "flag_verified": true
     }
   },
@@ -46,7 +46,7 @@
     }
   },
   "created": "2026-06-11T03:18:21+00:00",
-  "updated": "2026-06-11T12:08:18+00:00",
+  "updated": "2026-06-11T13:27:13+00:00",
   "setup": {
     "locked": true,
     "locked_at": "2026-06-11T03:28:00+00:00",

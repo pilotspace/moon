@@ -271,19 +271,61 @@ Observability: existing INFO dispatch counters (record_dispatch_local /
 cross_read_fastpath / spsc) are sufficient — no new fields.
 ```
 
-Status: FROZEN @ v2 — approved by Tin Dang (2026-06-11, "Fix 26, backlog the 10").
-v2 change request raised from the red run itself: the cdg1 registry sweep found 36
-unreachable commands, not 20 — 5 same-class (TIME WAIT SLOWLOG ZMSCORE XLEN, added
-as arms), 1 runtime divergence (CDC.READ, monoio port added), 10 never-implemented
-(backlogged with justification). v1 history: approved by Tin Dang (2026-06-11,
-"Approve — freeze & build"; direction set by his prior choice of read-arms over
-the NotSupported fallback).
+Status: FROZEN @ v4 — approved by Tin Dang (2026-06-12, "Fix WS/MQ here too").
+v4 change request raised from the cdg4 verify evidence: with the harness
+honest end-to-end for the first time (dual-server lifecycle bug fixed,
+193 PASS), the 4 remaining FAILs are a FOURTH cross-shard defect group,
+same class as graph: WS.* (per-shard WorkspaceRegistry + connection-shard
+execution → WS.AUTH "ERR workspace not found" from non-creating shards;
+WS isolation diverges at 12 shards) and MQ.* (per-shard durable-queue
+registry → PUSH/POP lose the queue from other connections at 4/12 shards;
+DLQ routing diverges). Fix in this task; suite must exit 0 at 1/4/12.
+v3 history: approved by Tin Dang (2026-06-11, "Fix all three here").
+v3 change request raised from the cdg4 verify evidence: the consistency suite's
+FIRST genuine end-to-end run at shards=4/12 (historical runs died at startup on a
+legacy-manifest guard or compared error-strings on a non-text-index binary)
+surfaced three pre-existing cross-shard defect groups. All confirmed absent from
+this branch's diff (latent on main, newly observed):
+  1. BITOP cross-shard: extract_primary_key routes by args[0] = the literal
+     operation name ("AND"); sources read on an arbitrary shard, dest written
+     there too. Fix: multi-key coordinator (gather sources via GET, compute,
+     SET/DEL dest on its owning shard) + routing special-case. Full Redis
+     semantics (BITOP is string-only by spec).
+  2. COPY cross-shard: routed by src (args[0]); dst written on src's shard.
+     Fix: coordinator — cross-shard string COPY (value + TTL + REPLACE/NX);
+     non-string cross-shard COPY returns an explicit error (full-fidelity
+     cross-shard value transfer = DUMP/RESTORE territory, already backlogged);
+     co-located keys (hash tags) keep the full-type local path.
+  3. GRAPH.* multi-shard: graph store is per-shard and commands execute on the
+     CONNECTION's shard — which connection you got decides whether the graph
+     exists ("ERR graph not found" from 3/4 of connections at shards=4).
+     Behind the suite's TEMPORAL.INVALIDATE + decay-divergence failures (these
+     cycle 1/4/12 inside the suite, so they fail every sweep config).
+     Fix: route GRAPH.* to the graph-name-owning shard via the EXISTING
+     ShardMessage::GraphCommand (shard-side handler fully implemented, never
+     wired) + graph_to_shard() helper. {tag} co-location keeps working.
+     Note: an earlier probe suggested ADDNODE could HANG a shard; on a healthy
+     VM it reproduces as clean fast errors — the hang was VM starvation noise
+     (zombie load avg ~70). Recorded as observe delta to re-check, not a fix
+     target.
+v2 history: approved by Tin Dang (2026-06-11, "Fix 26, backlog the 10") — the
+cdg1 registry sweep found 36 unreachable commands, not 20 — 5 same-class (TIME
+WAIT SLOWLOG ZMSCORE XLEN, added as arms), 1 runtime divergence (CDC.READ,
+monoio port added), 10 never-implemented (backlogged with justification).
+v1 history: approved by Tin Dang (2026-06-11, "Approve — freeze & build";
+direction set by his prior choice of read-arms over the NotSupported fallback).
 Least-sure flag surfaced at freeze:
   ⚠ [spec] A1 — first wire exposure of the 25 — parity diffs vs redis-server
     possible; in-scope per-command fixes, consistency suite arbitrates.
   ⚠ [spec] A2 — all 25 presumed expressible on &Database read-only accessors
     (TOUCH/XREAD pre-verified); single-command write-path exception allowed
     but must be NAMED at the gate.
+  ⚠ [spec] A3 (v3) — GRAPH routing changes where graph WAL records land
+    (owning shard, was connection shard); presumed safe because multi-shard
+    graphs never worked (no compatibility surface) and the GraphCommand
+    handler already drains WAL on its own shard — but TXN.ABORT graph
+    rollback and the graph replay path must stay consistent; suite's
+    txn-abort + temporal sections arbitrate.
 <!-- The freeze IS the one approval — lead it with the bundle's lowest-confidence flag: the 1–2
      points most likely wrong across the whole bundle, tagged [spec|scenario|contract|test], each
      with why + cost (the §1 ⚠ assumptions feed it; a flag may point at a scenario or the contract
@@ -327,6 +369,69 @@ Plan (one test per scenario, asserting behavior not internals):
   - cdg4 (verify-phase evidence, not a .rs test): test-consistency.sh exit 0 at
     1/4/12 on moon-dev VM-local; diff of the script shows only the two named fixes.
   - cdg5 (verify-phase evidence): tmp/bench-swf.sh within noise of PR #172 numbers.
+  - cdg6 (v3, new red suite tests/cross_shard_consistency_red.rs — additive, the
+    frozen wire suite untouched): 4-shard server, keys chosen via the same xxh64
+    so src/dst/sources provably land on DIFFERENT shards from ONE connection:
+    (a) BITOP AND/OR/XOR/NOT writes correct result readable at dest's shard,
+    missing-sources → dest deleted + Int(0); (b) COPY string cross-shard
+    (value, TTL preserved, no-REPLACE returns 0 vs existing dst, REPLACE
+    overwrites); (c) GRAPH: N sequential fresh connections all ADDNODE the
+    same graph successfully and a final connection's GRAPH.QUERY sees all N
+    nodes (red on Linux SO_REUSEPORT spread; macOS may vacuously pass — red
+    state established on the VM); (d, A3) TEMPORAL.INVALIDATE succeeds from
+    12 fresh connections against an owner-shard graph (was "ERR graph not
+    found" from non-owner conns); (e, A3) TXN.BEGIN + GRAPH.ADDNODE +
+    TXN.ABORT from 12 fresh connections leaves node_count at baseline —
+    pins the routed-intent capture AND the distributed GraphRollback leg.
+  - cdg4 amendment (v3): the script's phase-152/temporal/start-dir harness
+    defects fixed (null-safe -x vectors, discriminative HYB fixture, fresh
+    --dir per start, guarded grep substitutions) — these CHANGED the harness,
+    so the full suite diff is re-reviewed at verify; assertions only added,
+    none weakened.
+  - cdg4 amendment 2 (verify phase): txn-abort scenario 3's python died on
+    "ERR TXN does not support cross-shard writes" from HSET-in-TXN whenever
+    the kernel landed the connection off {t}'s shard (Linux SO_REUSEPORT
+    roulette; killed all three sweep configs via set -e on the command
+    substitution). ATTRIBUTED PRE-EXISTING by direct A/B on the VM: the
+    v0.3.0 release binary rejects identically (6/10 fresh conns failed on
+    v0.3.0 vs 8/10 on this branch — same accept-shard randomness, suite
+    previously passed by luck). Harness fix: HSET wrapped in try/except —
+    survival only; the assert's count=0 + 1-shard-oracle semantics are
+    untouched (a real ACID-08 leak still reports count>0). Repro scripts:
+    tmp/txnrepro.{sh,py}. Observe delta: TXN KV writes require the
+    connection to land on the key's shard — pre-existing product limitation
+    to revisit (route TXN KV writes like the new graph-TXN legs, or document).
+  - cdg6 v4 additions (contract v4, "Fix WS/MQ here too"): (f) WS CREATE on
+    one connection → WS AUTH + WS LIST from 12 fresh connections must all
+    succeed (red: per-shard registry answered "ERR workspace not found"
+    from non-creating shards); bound SET visible to bound GET on the same
+    conn, invisible to an unbound conn. (g) MQ CREATE on one connection →
+    PUSH from 6 fresh conns, POP from another sees all 6; MAXDELIVERY 1
+    queue dead-letters on first POP and DLQLEN reports 1 from yet another
+    conn (red: stream + registry lived on the conn's shard — "queue is not
+    durable" / DLQLEN 0 from elsewhere). Red state = the four cdg4 sweep
+    failure signatures at shards=4/12 (2026-06-12 run, 193 PASS / 4 FAIL).
+  - cdg4 amendment 4 (v4): the WS isolation probe was design-broken — its
+    SET ran on a fresh UNBOUND one-shot redis-cli conn, so the "unbound GET
+    must not see myval" assertion tested nothing (the value was global).
+    AUTH/SET/GET now pipe through ONE redis-cli process; the SET is
+    genuinely workspace-bound and the nil assertion is meaningful.
+    Assertion string unchanged ("OK|OK|myval" + unbound != myval) —
+    strictly stronger, nothing weakened.
+  - cdg4 amendment 3 (verify phase): first full end-to-end run (191 PASS)
+    exposed a harness lifecycle bug — start_moon_with_shards never stopped
+    the previous server, and each section's trailing "restart with $SHARDS"
+    left a process owning :6400. SO_REUSEPORT lets BOTH servers bind, so
+    redis-cli connections were silently split between two servers with
+    different stores/shard counts: txn-abort scenario legs returned empty
+    (GRAPH.CREATE on server A, GRAPH.INFO on server B → "graph not found"),
+    scenario 4's GET hit the wrong server, and the WS/MQ "divergence" FAILs
+    are suspected to be the same split. Fix: start_moon_with_shards now
+    calls stop_moon first (single-point lifecycle hygiene; no assertion
+    touched). Also the s12 sweep's earlier scenario-3 death at its internal
+    shards=1 cycle is explained: the python conn hit the lingering 12-shard
+    server. VM note: starvation (load 100+) invalidated one sweep run —
+    sweeps now gated on /proc/loadavg < 4.
 </test_plan>
 
 Tests live in: `tests/wire_reachability_red.rs` · MUST run red (missing implementation) before Build.
@@ -387,6 +492,82 @@ Build record (2026-06-11):
     geosearch_core shared parse (throwaway-Database hack removed);
     saturating_mul ttl guard; TIME via itoa; SLOWLOG byte-compare parse.
 
+Build record v3 (2026-06-11/12, orchestrator-direct — the three cross-shard
+defect groups from the frozen v3 amendment):
+  - BITOP + COPY coordinators (src/shard/coordinator.rs): coordinate_bitop
+    (validate → single-owner fast path → BTreeMap gather, local direct GET /
+    remote single-command MultiExecute → shared bitop_compute → SET/DEL dest
+    on its owner) and coordinate_copy (same-owner forward; cross-shard string
+    GET+PTTL → SET [NX] + PEXPIRE; non-string → explicit error, dst untouched;
+    COPY ... DB excluded — stays with the handlers' two-db interception).
+    bitop_compute extracted pure in string_bit.rs (NOT-arity validated before
+    key reads, Redis order). Wiring: is_multi_key_command + extract_primary_key
+    BITOP arm (dest) in shared.rs; CROSSSLOT loop fix in both runtimes (COPY
+    checks only its 2 key args, REPLACE literal not slot-checked).
+  - GRAPH owner-shard routing (both runtimes' try_handle_graph_command, now
+    async + frame-aware): num_shards>1 and not GRAPH.LIST → owner =
+    graph_to_shard(args[0]); non-local → ShardMessage::GraphCommand to the
+    owner (existing shard-side handler: full dispatch + WAL drain on owner),
+    TXN ADDNODE/ADDEDGE intents captured from the routed response id;
+    cypher-write-in-txn to a remote graph rejected with ERR_TXN_CROSS_SHARD.
+  - TEMPORAL.INVALIDATE routing: mutation extracted to shared
+    temporal::apply_invalidate; dispatch_graph_command (the GraphCommand
+    entry) now serves TEMPORAL.INVALIDATE on the owner (wall_ms captured at
+    that handler entry); both runtimes' try_handle_temporal_invalidate are
+    async + route non-local graphs through the same GraphCommand hop; local
+    path deduplicated through apply_invalidate (slice-aware).
+  - Distributed TXN.ABORT graph rollback: apply_graph_rollback extracted from
+    abort.rs (undo ops LIFO, then create-intent removal LIFO, returns drained
+    WAL); new ShardMessage::GraphRollback(Box<GraphRollbackPayload>) + shard-
+    side handler (apply + wal_append on owner); abort_cross_store_txn_routed
+    partitions graph_undo/graph_intents by graph_to_shard, runs the full
+    local abort, then ships each remote group and awaits acks. All 4 abort
+    call sites (TXN.ABORT + conn teardown, both runtimes) now route. Side
+    effect: the local graph-rollback leg is now slice-aware (was lock-only —
+    latent wrong-store access once ShardSlice initializes).
+  - fmt + clippy clean (default AND runtime-tokio,jemalloc); all three
+    feature sets (default / tokio+graph+text-index / tokio CI) cargo check
+    clean.
+
+Build record v4 (2026-06-12, orchestrator-direct — fourth defect group from
+the frozen v4 amendment, WS/MQ connection-shard keying):
+  - WS: ShardDatabases::workspace_registry() is now GLOBAL (slot 0 of the
+    per-shard array; param dropped, ~11 call sites: both runtimes' handlers
+    ×5 each, uring intercept, WAL replay ×2). WorkspaceCreate/Drop WAL
+    records pin to shard 0 (one totally-ordered stream for replay). WS DROP
+    prefix cleanup targets key_to_shard("{wsid}:") — the hash-tag home of
+    every workspace key — instead of the conn's shard. Rationale: workspaces
+    are rare control-plane objects; a single registry mutex is not a hot
+    path, and broadcast/SPSC would buy nothing.
+  - MQ: all six arms (CREATE/PUSH/POP/ACK/DLQLEN/TRIGGER) in both runtimes
+    compute owner = key_to_shard(effective_key) and target the owner's
+    db/durable_queue_registry/trigger_registry/wal_append on the lock path
+    (direct cross-shard access is legal there; the ShardSlice branches stay
+    conn-local — dead until shardslice-migration wires init_shard, noted in
+    the CREATE-arm comment). DLQLEN keys off the QUEUE's owner (POP creates
+    the DLQ stream in the queue's db). Trigger entries land on the owner's
+    registry — timers.rs:88 already documents the home shard as
+    authoritative; the conn-shard registration was the bug. TXN.COMMIT
+    MQ.PUBLISH materialization acquires each intent's owner db per queue
+    (both runtimes' txn.rs).
+  - Verified: cdg6 suite 7/7 on macOS 4-shard; cargo test --lib 3572 pass;
+    fmt + clippy clean on both CI feature sets; both runtimes compile.
+  - Review (senior-rust-engineer subagent, invariants a–g with file:line
+    evidence): APPROVE-WITH-FIXES. Confirmed: no locks across .await; no
+    guard-ordering inversions (uring Phase B co-holds write_db→registry but
+    no path holds them reversed); both runtime handler files semantically
+    equivalent; PUSH drops the owner db guard before trigger_registry; WAL
+    write targets match replay read targets (incl. backward compat for
+    pre-fix records spread across shard dirs); no new unwrap/allocs on hot
+    paths; cdg6f/g assertions verified against actual reply shapes (incl.
+    the MAXDELIVERY=1 first-POP-dead-letters semantics). FIX-1 applied:
+    uring batch-path WS CREATE/DROP mutated the global registry with NO WAL
+    record (pre-existing gap, now load-bearing since the registry is
+    global) — WorkspaceCreate/Drop records now appended to shard 0,
+    mirroring the conn handlers; DROP WALs only a real removal. FIX-2
+    applied: comment documenting that batch-path CREATE/DROP feed the
+    global registry so conn-handler AUTH finds them.
+
 <!-- EXIT: all green; coverage held; no test/contract touched; no unlisted dependency. -->
 
 ---
@@ -394,10 +575,51 @@ Build record (2026-06-11):
 ## 6 · VERIFY — evidence + non-functional review ▸ docs/08-step-6-verify.md
 
 - [x] all tests pass — macOS: wire_reachability_red 3/3 (cdg1/cdg2/cdg3),
-      cargo test --lib 3570 passed, fmt + clippy clean (default AND
-      runtime-tokio,jemalloc). Linux VM matrix: <pending — task bqu4i698t>
+      cargo test --lib 3572 passed (incl. geo parity pins), fmt + clippy clean
+      (default AND runtime-tokio,jemalloc). Linux VM matrix: monoio release
+      full suite green; tokio CI feature set green with MOON_BIN pinned to
+      target-linux/release/moon (94 test binaries ok). The one tokio failure
+      (test_txn_commit_wal_crash_recovery, 5/5 deterministic) was the
+      Mach-O binary trap, NOT a regression: the spawned server was the stale
+      macOS target/release/moon via OrbStack host-proxy (jemalloc
+      "background_thread currently supports pthread only" in its log was the
+      tell); passes with MOON_BIN pinned.
+- [x] v3/v4 evidence (2026-06-12):
+      · cdg6 cross_shard_consistency_red 7/7 (a–g) on macOS 4-shard AND on
+        the Linux VM (release, SO_REUSEPORT conn spread — the configuration
+        where the red state was established).
+      · cdg4 sweep: scripts/test-consistency.sh exit 0 at shards=1, 4, AND
+        12 (VM-local ~/moon-sweep staging, ELF binary verified, load-gated
+        at 1.2): 197 PASS / 0 FAIL per config, "STATUS: ALL PASSED" ×3 —
+        including the four formerly-failing WS/MQ checks (WS
+        CREATE+AUTH+SET+GET, WS isolation, MQ CREATE+PUSH+POP, MQ DLQ
+        routing) now PASS at every shard count. Logs: VM /tmp/cdg4-v4-s{1,4,12}.log.
+      · cdg5 bench (tmp/bench-swf.sh, REQS=100000, idle VM load 0.84,
+        label cdgv4) vs the spsc-wake-floor baseline — no regression in any
+        cell, all configs at or above baseline: s1 P1 SET 269,542 vs
+        225,734 / GET 284,091 vs 255,102; s1 P16 SET 1,428,571 vs 1,265,823
+        / GET 2,702,703 vs 2,127,660; s4 P1 SET 175,131 vs 147,929 / GET
+        278,552 vs 175,747; s4 P16 SET 2,222,222 vs 1,470,588 / GET
+        3,333,334 vs 2,127,660; s4 c1 SET 33,434 vs 12,786 / GET 219,298 vs
+        175,131. (The earlier mixed ±15% run was residual VM load — 5-min
+        avg 29–45; re-run idle.)
+      · cargo test --lib 3572 passed (macOS, post-v4 AND post-review-fix);
+        fmt + clippy clean on default AND runtime-tokio,jemalloc; all three
+        feature sets compile.
+      · VM tokio CI matrix (MOON_NO_URING=1, MOON_BIN pinned to
+        target-linux/release/moon): full suite clean on re-run. Run 1 had a
+        single failure — test_txn_commit_wal_crash_recovery's WAL-replay
+        assert (txn_kv_wiring.rs:1195) — adjudicated PRE-EXISTING load
+        flake, not a regression: 5/5 PASS isolated with MOON_BIN pinned
+        (0.11s each); 5/5 FAIL at exactly 15.0s WITHOUT MOON_BIN (the
+        documented Mach-O binary-trap signature, find_moon_binary fallback);
+        full-suite re-run zero failures; and the test runs --shards 1,
+        where every v4 owner computation is the identity (owner == 0 ==
+        conn shard — this branch's delta is a no-op on that path). Same
+        family as the v0.3.0-documented perf_v0112 under-load flake.
 - [x] coverage did not decrease — 3 new integration tests + the build's twins;
-      no test removed; gate unit tests extended per contract
+      no test removed; gate unit tests extended per contract; v3/v4 added
+      cdg6a–g (7 cross-shard integration tests)
 - [x] no test or contract was altered during build — frozen suite
       tests/wire_reachability_red.rs untouched post-tests-phase (only its
       first-commit + cargo-fmt formatting); contract changes were the

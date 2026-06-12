@@ -113,6 +113,29 @@ pub fn dispatch_graph_command(store: &mut GraphStore, command: &Frame) -> Frame 
         return resp;
     }
 
+    // TEMPORAL.INVALIDATE mutates a graph entity, so it must execute on the
+    // shard that owns the graph name; multi-shard routing ships it here via
+    // ShardMessage::GraphCommand. wall_ms is captured at this handler entry
+    // (on the owning shard) — apply_invalidate never calls NOW() itself.
+    if crate::command::temporal::is_temporal_invalidate(cmd) {
+        return match crate::command::temporal::validate_invalidate(args) {
+            Ok((entity_id, is_node, graph_name)) => {
+                let wall_ms = crate::command::temporal::capture_wall_ms();
+                match crate::command::temporal::apply_invalidate(
+                    store,
+                    entity_id,
+                    is_node,
+                    &graph_name,
+                    wall_ms,
+                ) {
+                    Ok(()) => Frame::SimpleString(Bytes::from_static(b"OK")),
+                    Err(e) => Frame::Error(Bytes::from_static(e)),
+                }
+            }
+            Err(e) => e,
+        };
+    }
+
     if is_graph_write_cmd(cmd) {
         dispatch_graph_write(store, cmd, args)
     } else {
