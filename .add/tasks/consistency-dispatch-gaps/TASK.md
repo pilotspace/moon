@@ -1,7 +1,7 @@
 # TASK: Close the consistency-suite gaps: unreachable read commands + script defects
 
 slug: consistency-dispatch-gaps · created: 2026-06-11 · stage: production
-phase: verify   <!-- specify -> scenarios -> contract -> tests -> build -> verify -> observe -> done -->
+phase: done   <!-- specify -> scenarios -> contract -> tests -> build -> verify -> observe -> done -->
 <!-- high-risk/method-defining scope? declare `risk: high` on the slug line above and lower
      the autonomy level with `autonomy: conservative` — the engine refuses an unguarded completion
      (`unguarded_high_risk_auto`, run.md guard). A comment is never a declaration. -->
@@ -652,9 +652,15 @@ the frozen v4 amendment, WS/MQ connection-shard keying):
       moon-only SETRANGE line now serves as the capability probe
 
 ### GATE RECORD
-Outcome: <PASS | RISK-ACCEPTED | HARD-STOP>
-If RISK-ACCEPTED -> owner: <name> · ticket: <link> · expires: <date>   (never for a security gap)
-Reviewed by: <name> · date: <date>
+Outcome: PASS
+Reviewed by: orchestrator (auto-gate on complete evidence; line-review of all
+three deltas + two senior-rust-engineer review subagents, all required fixes
+applied) · date: 2026-06-12
+Evidence basis: cdg1–3 wire suite 3/3 · cdg4 sweep 197/197 ×3 (exit 0 at
+shards=1/4/12) · cdg5 bench no-regression vs wakefloor baseline · cdg6 a–g
+7/7 (macOS + Linux VM) · 3572 lib tests · fmt/clippy clean both CI feature
+sets · VM tokio matrix clean (one adjudicated pre-existing load flake,
+recorded above). No security findings. Commit 255520d.
 
 <!-- A security finding is ALWAYS HARD-STOP. Record exactly one outcome — no silent pass. -->
 
@@ -662,8 +668,33 @@ Reviewed by: <name> · date: <date>
 
 ## 7 · OBSERVE — feed the next loop ▸ docs/09-the-loop.md
 
-Watch (reuse scenarios as monitors): <error rate / per-rejection rate / latency>
-Spec delta for the next loop: <what production taught you>
+Watch (reuse scenarios as monitors): the cdg6 suite + the 1/4/12 sweep are the
+regression monitors; any future shard-routing change must keep them green.
+
+Spec deltas for the next loop (incl. PR #173 CodeRabbit triage, 2026-06-12 —
+each verified against code; "both-path" items are FAITHFUL twin mirrors where
+fixing only the readonly twin would create divergence):
+  - GRAPH.LIST stays connection-local (v3 decision; revisit with broadcast).
+  - TXN KV writes require the conn to land on the key's shard (pre-existing;
+    route like the graph-TXN legs or document).
+  - MQ PUSH stream content is never WAL'd (pre-existing durability gap;
+    MqCreate/MqAck are WAL'd, the messages are not).
+  - XREAD mixed hit/miss returns [key, []] for misses in BOTH paths (Redis
+    omits empty streams) — shared parity delta.
+  - XPENDING IDLE is parsed-but-ignored in BOTH paths — shared parity delta.
+  - COPY src dst DB n keeps the pre-existing two-db conn-shard interception
+    (cross-db + cross-shard simultaneously unsupported, documented at v3).
+  - Cross-shard COPY is two-step (GET+PTTL, SET+PEXPIRE) — not snapshot-safe
+    under concurrent writers; same property as the MSET/DEL coordinators.
+  - CompactEntry TTL is second-granularity (pre-existing; PX sub-second
+    precision floors — product decision if ms precision is ever needed).
+  - src/shard/coordinator.rs exceeds the 1500-line cap (was over before this
+    task; +498 here) — split into directory-module as a follow-up refactor.
+  - GEO reply float formatting uses format!() (parity-shaped output; swap to
+    ryu/itoa buffer writes if GEO ever becomes hot).
+  - ShardSlice branches in WS/MQ/graph paths are conn-local — the
+    shardslice-migration task MUST owner-route them (slice::init_shard is
+    never called today, so they are dead code until then).
 
 ### Competency deltas
 What did this loop teach the foundation? One line each, tagged by competency
