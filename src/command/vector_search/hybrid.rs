@@ -398,6 +398,10 @@ pub fn execute_hybrid_search_local(
             return Frame::Error(Bytes::from(msg));
         }
     };
+    // `mut` is consumed by the CHANGE B filter block below, which is
+    // `#[cfg(feature = "text-index")]`; without that feature the binding is
+    // never mutated, so silence the lint only in the no-text-index build.
+    #[cfg_attr(not(feature = "text-index"), allow(unused_mut))]
     let mut text_results: Vec<TextSearchResult> =
         crate::command::vector_search::ft_text_search::execute_query_on_index_as_of(
             text_index,
@@ -413,6 +417,7 @@ pub fn execute_hybrid_search_local(
         Some(ix) => ix,
         None => return Frame::Error(Bytes::from_static(b"ERR unknown index")),
     };
+    #[cfg_attr(not(feature = "text-index"), allow(unused_mut))]
     let (mut dense_results, key_hash_to_key) = match run_dense_knn(
         idx,
         &query.dense_field,
@@ -426,6 +431,7 @@ pub fn execute_hybrid_search_local(
     };
 
     // ── Stream 3: Sparse (optional, per D-12 + D-16) ──────────────────────────
+    #[cfg_attr(not(feature = "text-index"), allow(unused_mut))]
     let mut sparse_results: Vec<SearchResult> = if let Some((sf, sblob)) = &query.sparse {
         match idx.sparse_stores.get(sf.as_ref()) {
             Some(store) => {
