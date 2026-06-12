@@ -281,6 +281,7 @@ pub async fn scatter_hybrid_search(
                         &global_df,
                         global_n,
                         as_of_lsn,
+                        query.filter.as_ref(),
                     )
                 })
             } else {
@@ -303,6 +304,7 @@ pub async fn scatter_hybrid_search(
                     &global_df,
                     global_n,
                     as_of_lsn,
+                    query.filter.as_ref(),
                 )
                 // guards drop here
             };
@@ -322,6 +324,7 @@ pub async fn scatter_hybrid_search(
                 global_df: global_df.clone(),
                 global_n,
                 as_of_lsn,
+                filter: query.filter.clone(),
                 reply_tx,
             };
             let msg = ShardMessage::FtHybrid(Box::new(payload));

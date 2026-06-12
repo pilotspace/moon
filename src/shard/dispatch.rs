@@ -236,6 +236,10 @@ pub struct FtHybridPayload {
     /// Non-zero values are forwarded to the dense KNN stream for MVCC filtering.
     /// BM25 stream remains AS_OF-unaware until text-index MVCC ships (v0.2).
     pub as_of_lsn: u64,
+    /// CHANGE F — per-shard filter forwarded to the raw-streams executor so the
+    /// allowlist is computed from the shard-local text index and applied to all
+    /// three streams BEFORE coordinator RRF fusion. `None` ⇒ unfiltered.
+    pub filter: Option<crate::command::vector_search::hybrid::HybridFilter>,
     pub reply_tx: channel::OneshotSender<Frame>,
 }
 

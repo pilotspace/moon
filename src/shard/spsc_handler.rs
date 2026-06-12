@@ -2418,6 +2418,7 @@ pub(crate) fn handle_shard_message_shared(
                     &global_df,
                     global_n,
                     as_of_lsn,
+                    filter.as_ref(),
                 );
                 // text_guard drops here
                 r

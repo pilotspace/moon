@@ -113,6 +113,7 @@ pub(super) async fn try_handle_ft_command(
                             top_k,
                             offset: limit_offset,
                             count: limit_count,
+                            filter: partial.filter,
                         };
                         // Phase 171 HYB-02 / SCAT-02: resolve AS_OF /
                         // TXN LSN ONCE on the coordinator and forward to
