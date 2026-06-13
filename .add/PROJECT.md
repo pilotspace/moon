@@ -6,7 +6,7 @@
 > UI/UX = UDD. When a loop reveals a gap here, come back and update this file —
 > that is the re-entrant arrow from the engine down to the foundation.
 
-slug: moon · stage: production · updated: 2026-06-11
+slug: moon · stage: production · updated: 2026-06-13 · foundation-version: 1
 goal: a Redis-compatible server whose thread-per-core architecture measurably out-scales Redis on multi-core hardware — without sacrificing protocol compatibility or durability semantics
 
 ---
@@ -21,6 +21,7 @@ goal: a Redis-compatible server whose thread-per-core architecture measurably ou
   - No new `unsafe` without approval + `// SAFETY:` comment (UNSAFE_POLICY.md)
   - No alloc in command dispatch / protocol parse / shard event loop / io drivers
   - All runtime-specific code compiles under both `runtime-monoio` and `runtime-tokio`
+  - [foundation v1, 2026-06-13] The shared-nothing write-path lock invariant above is RESTORED and machine-checked as of milestone v1 (`tests/shardslice_shape.rs` forbids `is_initialized()` dual-branches + cross-shard read accessors). Living-doc claims about hot-path locking are NOT self-evident — back them with a CI grep: v1 found CLAUDE.md asserted the client registry was off the hot path, but it was written per batch (finding 1.3 / QW8). The lock-inventory audit grep should become a CI check.
 
 ## Spec / Living Document (SDD) — what we are building, now
 - Active milestone → `.add/milestones/v1-shared-nothing/MILESTONE.md` (see `add.py status`)
@@ -42,3 +43,5 @@ goal: a Redis-compatible server whose thread-per-core architecture measurably ou
 | pre-ADD | SSO CompactKey(23B)/CompactValue(12B) | per-key memory vs naive Arc<String> | lower RSS than Redis per key |
 | 2026-06-11 | adopt ADD; v1 milestone = restore shared-nothing integrity + remove cross-shard latency floor (review priorities 1·2·5) | 2026-06 architecture review: these two themes explain sub-linear multi-shard scaling | pending |
 | 2026-06-11 | FT.SEARCH off-event-loop + WAL group commit deferred to v2 | different themes (event-loop blocking; durability); keep v1 one outcome | recorded in v1 Out list |
+| 2026-06-13 | CLOSE v1-shared-nothing: shared-nothing restored (locks deleted, shape-enforced), 1ms monoio wake floor gone (cross-shard p99 0.071ms), consistency 197/197 @1/4/12; s4 routed parity-or-better (+12% P16 GET) vs v0.3.0 | exit criteria met to the agreed "no-regression + honest measurement" bar | done; default-config cross-shard read regression (−85% c1 GET) RISK-ACCEPTED → follow-up: lock-free cross-shard read acceleration (waiver → next perf milestone) |
+| 2026-06-13 | fold v1 deltas → foundation-version 1 | close the ADD loop so learnings outlive the milestone | DDD: lock-inventory grep → CI (PROJECT §Domain); TDD: red-suite split pattern + ADD: §3 freeze flag-line requirement (CONVENTIONS) |
