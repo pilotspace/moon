@@ -51,21 +51,35 @@ the spike, REJECTED — unconditional spin=4096 cut c100 throughput −48%, mate
 architectural cross-thread wake+reschedule cost, not a lost-wake bug) · RCU/ArcSwap
 snapshot reads (the only path to ~4µs, rejected at milestone scope — memory vs
 low-RSS) · hard-remove the dead flag (CHOSEN — breaking, cleanest) vs deprecate
-(declined). The spike also proved the OrbStack VM is an INVALID instrument for this
-metric under host vCPU contention → measurement moves to GCloud bare-metal.
+(declined). The spike proved the OrbStack VM is an invalid instrument for ABSOLUTE
+cross-shard latency under host vCPU contention; GCloud bare-metal was then BLOCKED
+(no open billing account, 2026-06-13) → the "halve" target is measured as a RELATIVE
+ratio on the SAME quiesced, core-pinned VM (best-of-N = latency floor; fixed VM
+overhead cancels in the pre/post ratio). GCloud absolute validation is deferred/optional.
 
 Must:
 <must>
-  - M0 (baseline, GCloud bare-metal): the FIRST build step re-establishes the
-    "before" numbers on a GCloud bare-metal / dedicated-core instance
-    (scripts/gcloud-bench-setup.sh), NOT the OrbStack VM — the spike proved the VM
-    is an invalid instrument for this metric (host→guest vCPU starvation floors the
-    1-min load ~1.5 and inflates cross-shard latency 36µs→580µs while the wake
-    count stays correct). Per-runtime (monoio + tokio), fresh-server-per-rep ×3,
-    confirmed idle (load<1): s4 c1 GET + P1 GET + P16 GET, s1 P1/P16, recorded in §6.
-    "Halve the gap" is anchored to THIS bare-metal baseline.
+  - M0 (baseline, quiesced-VM RELATIVE anchor): re-establish the "before" numbers
+    on moon-dev with the SAME pinned instrument that will measure the M1 result —
+    moon shards pinned to cores 0-3, redis-benchmark to 4-5, fresh-server-per-rep,
+    best-of-N RPS (= latency floor) counted only when the 1-min load is quiesced
+    (<0.7). The absolute µs is NOT trusted (the spike proved host→guest vCPU
+    starvation inflates it 36µs→580µs); the RATIO is, because contention only ADDS
+    latency and any fixed VM/virtiofs overhead cancels pre/post. Measures BOTH
+    commits — 3e376a1 (pre-regression, had the lock read fast-path) vs current main
+    (post-shardslice SPSC) — per-runtime. "Halve the gap" is anchored to THIS relative
+    baseline (harness: scripts/baseline-xshard-quiesced.sh). GCloud bare-metal absolute
+    validation is deferred/optional (revisit only if billing reopens).
+    ESTABLISHED 2026-06-14 (monoio, clean-VM best-of-5; full table in §6 M0 RECORD):
+    s4-c1-GET 37580 (3e376a1) → 22252 (HEAD a497602) = −40.8% ← the gap to halve.
+    Controls: s1 LOCAL c1-GET ~40k on BOTH (regression is cross-shard-specific, not a
+    VM/binary artifact); s4-c100-GET 286k→202k (the starvation-guard baseline);
+    s4-c1-SET 564→21720 (v0.3.0 cross-shard WRITES were the slow side — shared-nothing
+    improved writes 38×; confirms this task is reads-only). NOTE the live regression is
+    −40.8%, NOT the historical −85% (current main already recovered post-§6 via PR #173).
   - M1 (c1 latency, the primary win): a single-client (c=1, P=1) cross-shard GET
-    shows median AND p99 latency at least HALVED vs the M0 bare-metal baseline,
+    recovers at least HALF the 15.3k-RPS gap on the same pinned instrument —
+    best-of-N c1-GET ≥ ~30k RPS (from 22.3k), i.e. regression-vs-3e376a1 ≤ ~20%,
     achieved by an ADAPTIVE IDLE-GATED reply-side poll — the requesting connection
     polls the reply (skipping the reply-side cross-thread wake) ONLY when its shard
     has no other ready connection/SPSC work to serve; when the shard is busy it
@@ -136,18 +150,19 @@ Assumptions — lowest-confidence first:
     GATED middle is untested, and "shard has no other ready work" is a subtle signal
     in the monoio/tokio loops (a connection may be parked-on-reply yet another is
     runnable). If wrong: either the gate mis-fires and starvation returns, or it's
-    too conservative and c1 sees no win — surfaced at the §3 freeze. MUST be proven
-    on the GCloud bare-metal instrument, not the VM.
+    too conservative and c1 sees no win — surfaced at the §3 freeze. Proven on the
+    same quiesced-VM pinned instrument as the baseline (relative ratio); GCloud
+    absolute deferred.
   ⚠ Cross-connection read coalescing preserves the read-your-writes / ordering
     guarantees the current lock-free path provides — lower confidence because it
     changes dispatch granularity on a path the 197-suite exercises at 1/4/12; if
     wrong: a subtle cross-shard consistency regression visible only under concurrent
     load.
-  - [ ] A GCloud bare-metal / dedicated-core instance reaches genuine idle (load<1,
-        shards getting prompt vCPU) so cross-shard c1 latency is reproducible to the
-        warm ~36µs the spike saw transiently — i.e. the gap is REAL and measurable
-        off the VM. If wrong (even bare-metal is noisy): the target can't be anchored
-        and we fall back to coalescing + documented mitigation. (The spike already
+  - [ ] On the quiesced, core-pinned VM, the 3e376a1→main best-of-N RPS gap is
+        REPRODUCIBLE across reps (the latency floor is stable, not a fluke) so the
+        relative anchor is trustworthy even though the absolute µs is not. If wrong
+        (the floor itself is noisy run-to-run): raise N / widen the quiesce gate, and
+        if still unstable fall back to coalescing + documented mitigation. (The spike
         characterized the cells: s1 c1 GET 146k/7µs healthy; s4 c1 warm 36µs.)
   - [ ] Hard-removing `--cross-shard-fast-path` breaks only internal bench scripts
         (it was Phase-0 migration scaffolding); no production deployment relies on
@@ -190,9 +205,11 @@ fixable wake bug.** Evidence:
 - Spike scaffolding: `scripts/spike-xshard-read.sh` (kept); the env-gated
   `MOON_XSHARD_SPIN` prototype in handler_monoio was REVERTED (throwaway).
 - DIRECTION (user, 2026-06-13): pivoted to "diagnose wake degradation first" →
-  diagnosis complete (no bug). §1 Must/target to be re-cut at the next decision:
-  adaptive-spin + bare-metal validation, OR reframe to mitigation+docs and shift
-  milestone weight to FT-off-event-loop / WAL-group-commit. AWAITING that call.
+  diagnosis complete (no bug). RESOLVED (user, 2026-06-13): "adaptive spin + validate
+  on GCloud" → §1 Must re-cut to the adaptive idle-gate (C1/C2) + coalescing (C3).
+  GCloud bare-metal baseline was then BLOCKED (no open billing account); user chose
+  to pivot the M0 anchor to the quiesced-VM RELATIVE ratio (same pinned instrument
+  pre/post; best-of-N floor) — GCloud absolute validation deferred/optional.
 
 <!-- EXIT: every rule stated, every rejection named; assumptions ranked lowest-confidence first, the top one or two ⚠-flagged with why + cost (or, for trivial scope, an honest "none material" that still names the single biggest risk). -->
 
@@ -203,20 +220,20 @@ fixable wake bug.** Evidence:
 <scenarios>
 
 ```gherkin
-Scenario: xrf0 GCloud bare-metal baseline is recorded (M0)
-  Given a GCloud bare-metal / dedicated-core instance confirmed idle (1-min load < 1,
-        shards getting prompt vCPU) — NOT the OrbStack VM
-  When the M0 harness runs per-runtime (monoio + tokio), fresh-server-per-rep ×3,
-       for s4 {c1,P1,P16} GET and s1 {P1,P16}
-  Then a baseline file records each cell with its load reading, and s4 c1 GET
-       cross-shard latency is reproducible at the warm order (~tens of µs, not the
-       VM's 0.5ms tick-floor)
-  And the recorded baseline — not any VM number — is the anchor for "halve"
+Scenario: xrf0 quiesced-VM relative baseline is recorded (M0)
+  Given moon-dev quiesced (1-min load < 0.7) with moon pinned to cores 0-3 and
+        redis-benchmark to 4-5 — the SAME instrument used to measure the M1 result
+  When the M0 harness runs per-runtime (monoio + tokio), fresh-server-per-rep,
+       best-of-N RPS, for BOTH commits 3e376a1 (pre-regression) and current main
+       (s4 c1 GET, s4 c100 GET, s4 c1 SET)
+  Then a baseline file records each cell's reps + best-of-N + the 3e376a1→main
+       RPS-regression %, and that relative gap is reproducible run-to-run
+  And the recorded RELATIVE gap — not any absolute VM µs — is the anchor for "halve"
 
-Scenario: xrf1 idle-gated spin halves c1 cross-shard read latency (M1)
-  Given idle-gated reply-side spin enabled, on the GCloud bare-metal instance
+Scenario: xrf1 idle-gated spin halves the c1 cross-shard read gap (M1)
+  Given idle-gated reply-side spin enabled, measured on the same quiesced pinned VM
   When a single client (c=1, P=1) runs cross-shard GET (random keys, ~75% foreign)
-  Then median AND p99 latency are at most HALF the M0 baseline for that cell
+  Then its best-of-N RPS recovers at least HALF the M0 3e376a1→main gap for that cell
   And on the same binary, s4 c100 P1 GET throughput is within run-to-run noise of
       spin-disabled (the gate must not move the busy-shard case)
 
@@ -382,10 +399,10 @@ Least-sure flag surfaced at freeze:
   "only cross-connection reads are grouped"; if wrong: a concurrent-load consistency
   regression (197-suite is the oracle).
 
-Status: DRAFT — NOT YET FROZEN. Freeze is gated on (1) the GCloud bare-metal M0
-baseline (anchors M1's "halve" target with a real number; the VM is invalid) and
-(2) the one human approval over the §1–§4 bundle. Do not advance to tests/build
-until FROZEN.
+Status: DRAFT — NOT YET FROZEN. Freeze is gated on (1) the quiesced-VM RELATIVE M0
+baseline (best-of-N floor, core-pinned, same instrument pre/post → the 3e376a1→main
+gap that anchors "halve"; GCloud absolute deferred — billing blocked) and (2) the
+one human approval over the §1–§4 bundle. Do not advance to tests/build until FROZEN.
 <!-- The freeze IS the one approval — lead it with the bundle's lowest-confidence flag: the 1–2
      points most likely wrong across the whole bundle, tagged [spec|scenario|contract|test], each
      with why + cost (the §1 ⚠ assumptions feed it; a flag may point at a scenario or the contract
@@ -425,6 +442,33 @@ Constraints: do NOT change any test or the contract; allow-list packages only; a
 ---
 
 ## 6 · VERIFY — evidence + non-functional review ▸ docs/08-step-6-verify.md
+
+### M0 BASELINE RECORD (the "before" — M1 verify compares against this)
+Measured 2026-06-14 on moon-dev, monoio, FRESH-BOOT clean VM (load 0.00 at start),
+moon pinned cores 0-3 / redis-benchmark cores 4-5, fresh-server-per-rep, best-of-5,
+-r 1000000, --appendonly no. Harness: `scripts/baseline-xshard-quiesced.sh`.
+Both binaries built from a VM-local clone (`scripts/probe-xshard.sh` = the local-vs-xshard discriminator).
+
+| cell | 3e376a1 (v0.3.0, lock read-path) best/med | a497602 (HEAD, SPSC) best/med | Δ(best) |
+|------|------------------------------------------|-------------------------------|---------|
+| s4-c1-GET   (TARGET) | 37580 / 36860 | 22252 / 22163 | **−40.8%** |
+| s4-c100-GET (guard)  | 286533 / 280112 | 202429 / 200401 | −29.4% |
+| s4-c1-SET   (control)| 564 / 555 | 21720 / 21552 | +3751% |
+| s1-c1-GET   (LOCAL control, probe) | ~41k | ~40k | ~flat |
+
+Reads of the table:
+- **Anchor**: c1-GET XSHARD 37580 → 22252 = a 15328-RPS gap. M1 must recover ≥ half → ≥ ~30k.
+- **LOCAL control flat at ~40k on both** ⇒ the regression is cross-shard-specific (not a slow
+  binary / slow VM). This is the proof the relative anchor is valid on this instrument.
+- **c100 guard baseline = ~202k** (a497602): the idle-gate must leave this within run-to-run noise.
+- **c1-SET**: v0.3.0 cross-shard WRITES were the slow path (564 RPS ≈ 1.8ms); shared-nothing
+  improved writes 38× → confirms reads-only scope. NOT a regression to chase.
+- Live regression is **−40.8%**, not the historical −85% (shardslice §6, eb5d664-era); current
+  main already recovered part of it post-§6. The task halves the LIVE gap.
+- ⚠ INSTRUMENT HYGIENE (hard-won): a leaked `moon-<hash>-monoio` busy-poller (4 shard threads)
+  from an earlier run survived `pkill -f "moon --port"` (name is `…monoio --port`, no match) and
+  floored c1 at 1–6k for hours. Cross-shard c1 latency is ONLY valid on a verified-clean VM —
+  assert `pgrep -af moon-baseline-bins` is empty before measuring.
 
 - [ ] all tests pass
 - [ ] coverage did not decrease
