@@ -1,8 +1,8 @@
 {
   "project": "moon",
   "stage": "production",
-  "active_task": "shardslice-migration",
-  "active_milestone": "v1-shared-nothing",
+  "active_task": "xshard-read-fastpath",
+  "active_milestone": "v2-performance",
   "tasks": {
     "hotpath-lock-quickwins": {
       "title": "Eliminate per-command global locks & syscall-level quick wins",
@@ -48,6 +48,15 @@
         "ticket": "follow-up task: cross-shard-read-acceleration (observe)",
         "expires": "2026-08-01"
       }
+    },
+    "xshard-read-fastpath": {
+      "title": "Recover cross-shard read latency lock-free: adaptive spin-then-park + coalescing + dead-flag cleanup",
+      "phase": "scenarios",
+      "gate": "none",
+      "milestone": "v2-performance",
+      "depends_on": [],
+      "created": "2026-06-13T08:25:14+00:00",
+      "updated": "2026-06-13T11:31:17+00:00"
     }
   },
   "milestones": {
@@ -55,13 +64,21 @@
       "title": "Shared-Nothing Integrity & Cross-Shard Latency",
       "goal": "a 4-shard Moon serves cross-shard traffic without per-command global locks and without the 1ms monoio reply floor, with measured multi-shard scaling improvement over the v0.3.0 baseline",
       "stage": "mvp",
-      "status": "active",
+      "status": "done",
       "created": "2026-06-11T03:23:03+00:00",
-      "updated": "2026-06-11T03:23:03+00:00"
+      "updated": "2026-06-13T08:03:52+00:00"
+    },
+    "v2-performance": {
+      "title": "Multi-Core Throughput Hardening (v1-deferred perf wins)",
+      "goal": "a 4-shard Moon measurably improves the three throughput bottlenecks v1 deferred \u2014 cross-shard read latency, FT.SEARCH event-loop stalls, and appendfsync=always write collapse \u2014 without re-introducing cross-thread locks or growing per-key memory",
+      "stage": "production",
+      "status": "active",
+      "created": "2026-06-13T08:24:32+00:00",
+      "updated": "2026-06-13T08:24:32+00:00"
     }
   },
   "created": "2026-06-11T03:18:21+00:00",
-  "updated": "2026-06-12T17:04:31+00:00",
+  "updated": "2026-06-13T11:31:17+00:00",
   "setup": {
     "locked": true,
     "locked_at": "2026-06-11T03:28:00+00:00",
