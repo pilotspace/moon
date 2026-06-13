@@ -51,12 +51,12 @@
     },
     "xshard-read-fastpath": {
       "title": "Recover cross-shard read latency lock-free: adaptive spin-then-park + coalescing + dead-flag cleanup",
-      "phase": "scenarios",
+      "phase": "contract",
       "gate": "none",
       "milestone": "v2-performance",
       "depends_on": [],
       "created": "2026-06-13T08:25:14+00:00",
-      "updated": "2026-06-13T11:31:17+00:00"
+      "updated": "2026-06-13T12:06:32+00:00"
     }
   },
   "milestones": {
@@ -78,7 +78,7 @@
     }
   },
   "created": "2026-06-11T03:18:21+00:00",
-  "updated": "2026-06-13T11:31:17+00:00",
+  "updated": "2026-06-13T12:06:32+00:00",
   "setup": {
     "locked": true,
     "locked_at": "2026-06-11T03:28:00+00:00",

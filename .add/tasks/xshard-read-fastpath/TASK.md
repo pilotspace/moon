@@ -1,7 +1,7 @@
 # TASK: Recover cross-shard read latency lock-free: adaptive spin-then-park + coalescing + dead-flag cleanup
 
 slug: xshard-read-fastpath · created: 2026-06-13 · stage: production · risk: high · autonomy: conservative
-phase: scenarios   <!-- specify -> scenarios -> contract -> tests -> build -> verify -> observe -> done -->
+phase: contract   <!-- specify -> scenarios -> contract -> tests -> build -> verify -> observe -> done -->
 <!-- high-risk/method-defining scope? declare `risk: high` on the slug line above and lower
      the autonomy level with `autonomy: conservative` — the engine refuses an unguarded completion
      (`unguarded_high_risk_auto`, run.md guard). A comment is never a declaration. -->
@@ -292,14 +292,100 @@ Scenario: reject removed_flag_referenced
 
 ## 3 · CONTRACT — freeze the shape ▸ docs/05-step-3-contract.md
 
-```
-<METHOD> <path>   body: { <fields> }
-  200 -> { <success fields> }
-  4xx -> { error: "<code>" | "<code>" }
-Schema: <tables/fields touched, and access pattern>
+No wire-protocol change: every RESP command stays byte-identical (the 197-test
+consistency suite is the wire contract and must stay byte-identical — reject
+test_weakening/read_your_writes_regression). The frozen shape is the *internal*
+mechanism: the idle-gate, the reply-side poll integration, the coalescing message,
+and the exact cleanup surface.
+
+### C1 — Idle-gate signal (M1)
+```rust
+// src/shard/slice.rs — sibling to the existing `thread_local! { static SHARD }`.
+// The shard thread is single-threaded, so a Cell needs NO atomic and NO lock.
+thread_local! {
+    /// Connections on THIS shard thread currently blocked in a cross-shard
+    /// reply-wait. Incremented on entry, decremented on exit (RAII guard).
+    static XSHARD_INFLIGHT: core::cell::Cell<u32> = const { core::cell::Cell::new(0) };
+}
+/// May the caller POLL its reply instead of parking? True when it is (near-)alone
+/// on its shard, so polling steals no co-located connection's turn.
+pub fn xshard_may_spin() -> bool;            // XSHARD_INFLIGHT.get() <= XSHARD_SPIN_GATE
+const XSHARD_SPIN_GATE: u32 = 2;             // tuned on bare metal; NOT a CLI flag (no new surface)
+const XSHARD_SPIN_BUDGET: u32;               // bounded poll iterations before park
+/// RAII: increments on construct, decrements on drop — wraps each reply-wait.
+pub struct XshardWaitGuard;
 ```
 
-Status: DRAFT
+### C2 — Reply-side adaptive poll (M1)
+At each cross-shard reply-wait site — monoio `handler_monoio` `Err(Empty)` branch
+(mod.rs:~1755) and tokio `handler_sharded` `response_pool.future_for(target).await`
+(mod.rs:~1636) — wrap the wait in an `XshardWaitGuard`; if `xshard_may_spin()`, poll
+the reply (`try_recv()` / `ResponseSlot` state) up to `XSHARD_SPIN_BUDGET` with
+`core::hint::spin_loop()`; on hit, return WITHOUT parking; else fall through to the
+EXISTING park path (race2+sleep / ResponseSlotFuture) UNCHANGED. The poll is
+synchronous — it holds no borrow across `.await`. When the gate is false, the path
+is byte-identical to today (immediate park).
+
+### C3 — Cross-connection read coalescing (M2) — most-novel surface
+```rust
+// src/shard/dispatch.rs — one batched message carrying N independent foreign
+// reads from DIFFERENT connections on the origin shard to ONE owner shard, each
+// result routed back to its own connection's response slot.
+CoalescedReadBatch {
+    db_index: usize,
+    reads: smallvec::SmallVec<[(std::sync::Arc<Frame>, ResponseSlotPtr); 8]>,
+}
+```
+- The origin shard accumulates outbound single-key foreign READs per target within
+  one event-loop turn and flushes as ONE message (reuses the MultiExecuteSlotted
+  batching precedent, extended to per-read slots). Flush bound: the existing
+  connection-batch boundary OR a small cap (no unbounded buffer → no memory_regression).
+- INVARIANT (load-bearing): coalescing groups reads ACROSS connections only; within
+  a connection, submission order and read-your-writes are preserved exactly as the
+  current lock-free path (a read is never reordered before that connection's own
+  acked write). The 197-suite + xrf-ryw are the oracle.
+
+### C4 — Cleanup surface (M3, hard-remove — exact symbols)
+- `src/config.rs`: `cross_shard_fast_path` field + `--cross-shard-fast-path` arg
+  (615-619), `CrossShardFastPath` enum, `cross_shard_fast_path_enabled()` (760),
+  the docstring (603-613), the 6 unit tests (1725-1768).
+- `src/admin/metrics_setup.rs`: `moon_cross_shard_lock_contention_total`,
+  `moon_dispatch_cross_read_fastpath_latency_us`, `record_dispatch_cross_read_fastpath_*`
+  (824-863).
+- `src/server/conn/handler_sharded/mod.rs`: `cross_read_fast_dispatches` (384) + its
+  `record_…_batch` call (1573) + the stale `Arc<ShardDatabases>…RwLock` doc (60-area).
+- `src/command/connection.rs`: drop any fast-path INFO field.
+- CHANGELOG: breaking-change note. RESULT: clap rejects `--cross-shard-fast-path`.
+
+### Contracted responses for §1 rejects
+| Reject | Contracted response |
+|---|---|
+| lock_reintroduced | idle-gate is a thread-local `Cell<u32>` — no lock/atomic/Send; `shardslice_shape.rs` + `audit-unsafe.sh` green |
+| borrow_across_await | poll is synchronous, before the `.await`; grep-pin: no `with_shard` across `.await` |
+| shard_starvation | `xshard_may_spin()` gates on `XSHARD_INFLIGHT <= XSHARD_SPIN_GATE`; c100-GET guard bench shows no regression |
+| read_your_writes_regression | C3 groups cross-connection reads only; per-connection order preserved; 197-suite @1/4/12 + xrf-ryw byte-identical-green |
+| memory_regression | gate = one `Cell<u32>`/shard; coalescing buffer bounded+reused (SmallVec), not keyspace-scaled; RSS-under-load guard |
+| removed_flag_referenced | M3 grep-pin in `shardslice_shape.rs` (or a new shape test) fails CI on any resurrected symbol |
+
+Names from GLOSSARY: ShardSlice, ShardMessage, ResponseSlotPtr, MultiExecuteSlotted,
+with_shard, key_to_shard. New names introduced here: XSHARD_INFLIGHT, xshard_may_spin,
+XshardWaitGuard, XSHARD_SPIN_GATE, XSHARD_SPIN_BUDGET, CoalescedReadBatch.
+
+Least-sure flag surfaced at freeze:
+⚠ [contract] The idle-gate (`XSHARD_INFLIGHT <= gate`) is a sufficient proxy for "no
+  other ready work" — it counts cross-shard WAITERS, not all runnable tasks, so a
+  shard busy with local pipelines/accepts but only 1 cross-shard waiter would still
+  spin and steal cycles. If wrong: starvation returns in MIXED workloads the c100-GET
+  guard doesn't cover. Mitigation in reserve: also gate on the inbound SPSC being empty.
+⚠ [contract] C3's per-result reply routing (one batched message → N different
+  connection slots) is the most novel surface and the read-your-writes proof rests on
+  "only cross-connection reads are grouped"; if wrong: a concurrent-load consistency
+  regression (197-suite is the oracle).
+
+Status: DRAFT — NOT YET FROZEN. Freeze is gated on (1) the GCloud bare-metal M0
+baseline (anchors M1's "halve" target with a real number; the VM is invalid) and
+(2) the one human approval over the §1–§4 bundle. Do not advance to tests/build
+until FROZEN.
 <!-- The freeze IS the one approval — lead it with the bundle's lowest-confidence flag: the 1–2
      points most likely wrong across the whole bundle, tagged [spec|scenario|contract|test], each
      with why + cost (the §1 ⚠ assumptions feed it; a flag may point at a scenario or the contract
