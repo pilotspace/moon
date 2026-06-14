@@ -32,6 +32,11 @@ SETTLE_TIMEOUT="${SETTLE_TIMEOUT:-300}"           # max seconds to wait for deep
 RUNTIMES="${RUNTIMES:-monoio}"                    # space-sep: monoio tokio
 BASELINE_COMMIT="${BASELINE_COMMIT:-3e376a1}"     # v0.3.0 tag = pre-shared-nothing main, has the lock read fast-path (~190k c1 GET per shardslice §6)
 CURRENT_COMMIT="${CURRENT_COMMIT:-a497602}"       # current main HEAD (shared-nothing, SPSC round-trip); explicit hash avoids detached-HEAD ambiguity in the clone
+# COMMITS: space-sep list measured (in order) in ONE quiescence window so every pair-wise
+# ratio is same-run (the only trustworthy comparison). First entry is the 1.0 reference for
+# the anchor block. Default = baseline + current; override to add a no-mechanism control, e.g.
+#   COMMITS="3e376a1 a497602 2bfc5bc"  (baseline / no-mech regression / with-mechanism)
+COMMITS="${COMMITS:-$BASELINE_COMMIT $CURRENT_COMMIT}"
 
 SERVER_CORES="${SERVER_CORES:-0-3}"               # 4 shards, one per core
 CLIENT_CORES="${CLIENT_CORES:-4,5}"               # redis-benchmark isolated from server cores
@@ -150,7 +155,7 @@ echo "###### NOTE: best-of-N RPS = latency floor; anchor is the RELATIVE ratio (
 
 declare -A RESULT
 for rt in $RUNTIMES; do
-  for commit in "$BASELINE_COMMIT" "$CURRENT_COMMIT"; do
+  for commit in $COMMITS; do
     if ! bin=$(build "$commit" "$rt"); then
       log "FATAL: build failed for commit=$commit runtime=$rt — aborting baseline"; exit 1
     fi
@@ -170,15 +175,33 @@ for rt in $RUNTIMES; do
 done
 
 echo
-echo "###### RELATIVE ANCHOR (best-of-N RPS; regression = (pre - cur)/pre on RPS) ######"
+echo "###### RELATIVE ANCHOR (best-of-N RPS; regression = (pre - cur)/pre vs baseline=$BASELINE_COMMIT) ######"
+for rt in $RUNTIMES; do
+  for commit in $COMMITS; do
+    [[ "$commit" == "$BASELINE_COMMIT" ]] && continue
+    for name in s4-c1-GET s4-c100-GET s4-c1-SET; do
+      pre="${RESULT["$rt|$BASELINE_COMMIT|$name"]:-}"; cur="${RESULT["$rt|$commit|$name"]:-}"
+      [[ -z "$pre" || -z "$cur" ]] && continue
+      pb=$(echo "$pre" | cut -d'|' -f2); cb=$(echo "$cur" | cut -d'|' -f2)
+      reg=$(awk -v p="$pb" -v c="$cb" 'BEGIN{ if(p>0) printf "%+.1f", (p-c)*100.0/p; else print "n/a" }')
+      printf '%-8s %-9s %-26s pre=%s  cur=%s  RPS-regression=%s%%\n' \
+        "$rt" "$commit" "$name" "$pb" "$cb" "$reg"
+    done
+  done
+done
+# Same-run C2 recovery: with-mechanism vs no-mechanism (only meaningful when both are in COMMITS).
+# Override NOMECH_COMMIT / MECH_COMMIT to label which pair to diff; default = the documented hashes.
+NOMECH_COMMIT="${NOMECH_COMMIT:-a497602}"
+MECH_COMMIT="${MECH_COMMIT:-2bfc5bc}"
+echo "###### C2 RECOVERY (same-run mech vs no-mech; recovery = (mech - nomech)/nomech) ######"
 for rt in $RUNTIMES; do
   for name in s4-c1-GET s4-c100-GET s4-c1-SET; do
-    pre="${RESULT["$rt|$BASELINE_COMMIT|$name"]:-}"; cur="${RESULT["$rt|$CURRENT_COMMIT|$name"]:-}"
-    [[ -z "$pre" || -z "$cur" ]] && continue
-    pb=$(echo "$pre" | cut -d'|' -f2); cb=$(echo "$cur" | cut -d'|' -f2)
-    reg=$(awk -v p="$pb" -v c="$cb" 'BEGIN{ if(p>0) printf "%+.1f", (p-c)*100.0/p; else print "n/a" }')
-    printf '%-8s %-26s pre(%s)=%s  cur(%s)=%s  RPS-regression=%s%%\n' \
-      "$rt" "$name" "$BASELINE_COMMIT" "$pb" "$CURRENT_COMMIT" "$cb" "$reg"
+    nm="${RESULT["$rt|$NOMECH_COMMIT|$name"]:-}"; mc="${RESULT["$rt|$MECH_COMMIT|$name"]:-}"
+    [[ -z "$nm" || -z "$mc" ]] && continue
+    nb=$(echo "$nm" | cut -d'|' -f2); mb=$(echo "$mc" | cut -d'|' -f2)
+    rec=$(awk -v n="$nb" -v m="$mb" 'BEGIN{ if(n>0) printf "%+.1f", (m-n)*100.0/n; else print "n/a" }')
+    printf '%-8s %-26s nomech(%s)=%s  mech(%s)=%s  recovery=%s%%\n' \
+      "$rt" "$name" "$NOMECH_COMMIT" "$nb" "$MECH_COMMIT" "$mb" "$rec"
   done
 done
 echo "###### END BASELINE ######"
