@@ -152,7 +152,12 @@ fn collect_respects_max_batch() {
     for _ in 0..10 {
         q.push_back(append(b"x"));
     }
-    let batch = collect_group_commit_batch(append(b"first"), || q.pop_front(), 3, AOF_GROUP_COMMIT_MAX_BYTES);
+    let batch = collect_group_commit_batch(
+        append(b"first"),
+        || q.pop_front(),
+        3,
+        AOF_GROUP_COMMIT_MAX_BYTES,
+    );
     assert_eq!(
         batch.data.len(),
         3,
@@ -171,7 +176,12 @@ fn collect_respects_max_bytes() {
         q.push_back(append(&[0u8; 100]));
     }
     // first=100 → +100=200 (<250) → +100=300 (≥250, include then stop) ⇒ 3 messages.
-    let batch = collect_group_commit_batch(append(&[0u8; 100]), || q.pop_front(), AOF_GROUP_COMMIT_MAX_BATCH, 250);
+    let batch = collect_group_commit_batch(
+        append(&[0u8; 100]),
+        || q.pop_front(),
+        AOF_GROUP_COMMIT_MAX_BATCH,
+        250,
+    );
     assert_eq!(
         batch.data.len(),
         3,
@@ -231,8 +241,14 @@ fn commit_write_fail_acks_write_failed() {
 
     let outcome = commit_group_commit_batch(&mut sink, &mut batch, true);
 
-    assert!(outcome.write_failed, "the batch must report a write failure");
-    assert_eq!(outcome.synced, 0, "no waiter may be acked Synced on a write failure");
+    assert!(
+        outcome.write_failed,
+        "the batch must report a write failure"
+    );
+    assert_eq!(
+        outcome.synced, 0,
+        "no waiter may be acked Synced on a write failure"
+    );
     // The ack oneshot is single-use (flume bounded-1): read each receiver ONCE
     // into a local, then assert on the captured value. (The original suite read
     // rx2.try_recv() twice, draining it before the second assertion — a
@@ -260,8 +276,14 @@ fn commit_fsync_fail_acks_fsync_failed() {
 
     let outcome = commit_group_commit_batch(&mut sink, &mut batch, true);
 
-    assert!(outcome.fsync_failed, "the batch must report an fsync failure");
-    assert_eq!(outcome.synced, 0, "no waiter may be acked Synced when the fsync fails");
+    assert!(
+        outcome.fsync_failed,
+        "the batch must report an fsync failure"
+    );
+    assert_eq!(
+        outcome.synced, 0,
+        "no waiter may be acked Synced when the fsync fails"
+    );
     assert_eq!(rx1.try_recv(), Ok(AofAck::FsyncFailed));
     assert_eq!(rx2.try_recv(), Ok(AofAck::FsyncFailed));
 }
@@ -278,9 +300,15 @@ fn commit_everysec_no_fsync() {
 
     let outcome = commit_group_commit_batch(&mut sink, &mut batch, false);
 
-    assert_eq!(sink.sync_calls, 0, "everysec (do_fsync=false) must not fsync per batch");
+    assert_eq!(
+        sink.sync_calls, 0,
+        "everysec (do_fsync=false) must not fsync per batch"
+    );
     assert_eq!(sink.writes.len(), 2, "bytes are still written in order");
-    assert_eq!(outcome.synced, 0, "no AppendSync waiters in an everysec batch");
+    assert_eq!(
+        outcome.synced, 0,
+        "no AppendSync waiters in an everysec batch"
+    );
 }
 
 /// M2 barrier_property_preserved — a single batch fsync makes preceding
@@ -298,7 +326,10 @@ fn commit_barrier_covers_preceding_appends() {
 
     let outcome = commit_group_commit_batch(&mut sink, &mut batch, true);
 
-    assert_eq!(sink.sync_calls, 1, "one fsync covers the appends + the barrier");
+    assert_eq!(
+        sink.sync_calls, 1,
+        "one fsync covers the appends + the barrier"
+    );
     assert_eq!(
         sink.synced_at_write_count,
         Some(3),
