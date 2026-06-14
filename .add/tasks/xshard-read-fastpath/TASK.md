@@ -417,13 +417,41 @@ clause or the M1 ≥~30k line now is a change request back to SPECIFY.
 
 ## 4 · TESTS — failing-first suite (red) ▸ docs/06-step-4-tests.md
 
-Coverage target: <e.g. 90%>
-Plan (one test per scenario, asserting behavior not internals):
+Coverage target: gate logic + cleanup surface fully unit-covered; the perf/correctness
+Musts are EVIDENCE-gated (bench + consistency suite), not unit tests — this is the
+behavior-preserving-perf red-suite split (CONVENTIONS): runtime-red + compile-red API
+pin + green-pin oracles. A latency "halve" cannot be a deterministic unit assert; it is
+recorded in §6 against the M0 anchor on the same pinned instrument.
+
+Plan (one test per scenario; unit-red where deterministic, else named to its oracle):
 <test_plan>
-  - test_<scenario>: arrange <Given> / act <When> / assert <Then> + assert <unchanged>
+  COMPILE-RED + RUNTIME-RED  (`tests/xshard_fastpath_api.rs` — red: symbols absent until §5)
+  - idle_gate_allows_spin_when_alone (xrf1): fresh thread, 0 in-flight ⇒ `xshard_may_spin()==true`.
+  - idle_gate_blocks_spin_above_gate (xrf1 / reject shard_starvation): hold `XSHARD_SPIN_GATE+1`
+    `XshardWaitGuard`s ⇒ `xshard_may_spin()==false`; drop ⇒ true again (RAII inc/dec is the
+    anti-starvation invariant — the gate, not a fixed budget, is what protects c100).
+  - coalesced_read_batch_type_pin (xrf2): `moon::shard::dispatch::CoalescedReadBatch` exists and
+    is referenceable (db_index + reads). Routing CORRECTNESS is the consistency oracle, not here.
+
+  CLEANUP SHAPE-RED  (`tests/xshard_cleanup_shape.rs` — red NOW: symbols still exist; green after M3)
+  - dead_fastpath_surface_removed (xrf3 / reject removed_flag_referenced): grep production `src/`
+    for `cross_shard_fast_path`, `CrossShardFastPath`, `cross_shard_fast_path_enabled`,
+    `moon_cross_shard_lock_contention_total`, `moon_dispatch_cross_read_fastpath_latency_us`,
+    `record_dispatch_cross_read_fastpath`, `cross_read_fast_dispatches` ⇒ assert ZERO matches.
+
+  EVIDENCE-GATED (recorded in §6 against the M0 anchor — NOT unit tests; named to their oracle)
+  - xrf1 perf: `scripts/baseline-xshard-quiesced.sh` c1-GET best-of-N ≥ ~30k (halve the 15.3k gap).
+  - xrf1 guard / reject shard_starvation: same harness, s4-c100-GET within noise of ~202k.
+  - xrf2 perf: P1 multi-client cell recovers toward parity + a coalescing INFO/stat counter > 0.
+  - reject read_your_writes_regression / xrf-ryw: `scripts/test-consistency.sh` 197/197 @1/4/12 byte-identical.
+  - reject memory_regression / xrf4: `scripts/bench-resources.sh` RSS within noise of M0; dual-runtime green.
+
+  EXISTING GREEN-PINS (must stay green — reject lock_reintroduced / borrow_across_await)
+  - `tests/shardslice_shape.rs` (no new cross-thread lock / Send-Sync / `.await` in `with_shard`)
+    + `scripts/audit-unsafe.sh` (zero new unsafe).
 </test_plan>
 
-Tests live in: `./tests/` · MUST run red (missing implementation) before Build.
+Tests live in: `tests/` · MUST run red (missing implementation) before Build.
 <!-- declare paths as backticked tokens on this line: `./…` = this task dir ·
      a token with "/" = project root · a bare name = sibling of the previous
      token's dir · a directory counts its *.py files (non-recursive); reports
