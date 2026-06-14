@@ -1,7 +1,7 @@
 # TASK: Recover cross-shard read latency lock-free: adaptive spin-then-park + coalescing + dead-flag cleanup
 
 slug: xshard-read-fastpath · created: 2026-06-13 · stage: production · risk: high · autonomy: conservative
-phase: contract   <!-- specify -> scenarios -> contract -> tests -> build -> verify -> observe -> done -->
+phase: tests   <!-- specify -> scenarios -> contract -> tests -> build -> verify -> observe -> done -->
 <!-- high-risk/method-defining scope? declare `risk: high` on the slug line above and lower
      the autonomy level with `autonomy: conservative` — the engine refuses an unguarded completion
      (`unguarded_high_risk_auto`, run.md guard). A comment is never a declaration. -->
@@ -399,10 +399,12 @@ Least-sure flag surfaced at freeze:
   "only cross-connection reads are grouped"; if wrong: a concurrent-load consistency
   regression (197-suite is the oracle).
 
-Status: DRAFT — NOT YET FROZEN. Freeze is gated on (1) the quiesced-VM RELATIVE M0
-baseline (best-of-N floor, core-pinned, same instrument pre/post → the 3e376a1→main
-gap that anchors "halve"; GCloud absolute deferred — billing blocked) and (2) the
-one human approval over the §1–§4 bundle. Do not advance to tests/build until FROZEN.
+Status: FROZEN @ v1 — approved by Tin Dang 2026-06-14. Both freeze gates satisfied:
+(1) the quiesced-VM RELATIVE M0 baseline is established (clean-VM best-of-5; c1-GET
+37580→22252 = −40.8%; full table in §6 M0 RECORD) and (2) the one human approval over
+the §1–§4 bundle was given "Freeze as-is", lowest-confidence flag surfaced first (the
+~30k halve target sits at the mechanism's ~one-wake-removed ceiling). Changing any C1–C4
+clause or the M1 ≥~30k line now is a change request back to SPECIFY.
 <!-- The freeze IS the one approval — lead it with the bundle's lowest-confidence flag: the 1–2
      points most likely wrong across the whole bundle, tagged [spec|scenario|contract|test], each
      with why + cost (the §1 ⚠ assumptions feed it; a flag may point at a scenario or the contract
