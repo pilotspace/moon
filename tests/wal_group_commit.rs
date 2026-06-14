@@ -233,9 +233,15 @@ fn commit_write_fail_acks_write_failed() {
 
     assert!(outcome.write_failed, "the batch must report a write failure");
     assert_eq!(outcome.synced, 0, "no waiter may be acked Synced on a write failure");
-    assert_ne!(rx1.try_recv(), Ok(AofAck::Synced));
-    assert_ne!(rx2.try_recv(), Ok(AofAck::Synced));
-    assert_eq!(rx2.try_recv(), Ok(AofAck::WriteFailed));
+    // The ack oneshot is single-use (flume bounded-1): read each receiver ONCE
+    // into a local, then assert on the captured value. (The original suite read
+    // rx2.try_recv() twice, draining it before the second assertion — a
+    // use-after-consume defect that no correct impl could satisfy.)
+    let r1 = rx1.try_recv();
+    let r2 = rx2.try_recv();
+    assert_ne!(r1, Ok(AofAck::Synced));
+    assert_ne!(r2, Ok(AofAck::Synced));
+    assert_eq!(r2, Ok(AofAck::WriteFailed));
 }
 
 /// batch_fsync_failed (+ ack_before_fsync) — when the single fsync fails, ALL
