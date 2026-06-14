@@ -103,6 +103,21 @@ pub async fn aof_writer_task(
     let mut writer = tokio::io::BufWriter::new(file);
     #[cfg(feature = "runtime-tokio")]
     let mut last_fsync = Instant::now();
+    // Torn-write latch (tokio TopLevel): once a batch write fails partway, the
+    // plain-RESP stream may carry a partial record — never append more bytes nor
+    // claim durability after the tear. Latched for the writer's lifetime; reset
+    // only on a successful rewrite (the rewrite replaces the file with a fresh
+    // one). Mirrors the monoio TopLevel and both per-shard writers, which already
+    // carry this latch (group_commit::CommitOutcome.write_failed ⇒ "latch must
+    // engage").
+    #[cfg(feature = "runtime-tokio")]
+    let mut write_error = false;
+    // Test-only fault injection: when MOON_TEST_AOF_FSYNC_FAIL=1 every AppendSync
+    // batch acks FsyncFailed instead of Synced (read once; zero cost in prod).
+    // Mirrors the monoio TopLevel + per-shard writers so the AOF_FSYNC_ERR wire
+    // path is exercised identically under both runtimes (shards=1 TopLevel).
+    #[cfg(feature = "runtime-tokio")]
+    let fail_fsync_for_test = std::env::var("MOON_TEST_AOF_FSYNC_FAIL").as_deref() == Ok("1");
 
     // Monoio path: multi-part AOF (base RDB + incremental RESP) with sync I/O.
     //
@@ -346,8 +361,13 @@ pub async fn aof_writer_task(
                     rx.recv_async(),
                 ) => r,
                 _ = cancel.cancelled() => {
-                    let _ = writer.flush().await;
-                    let _ = writer.get_ref().sync_data().await;
+                    // Skip the final sync if the stream is torn — syncing past a
+                    // partial record cannot recover it and risks a false durability
+                    // signal (mirrors the monoio TopLevel disconnect/shutdown gate).
+                    if !write_error {
+                        let _ = writer.flush().await;
+                        let _ = writer.get_ref().sync_data().await;
+                    }
                     info!("AOF writer cancelled");
                     break;
                 }
@@ -358,8 +378,10 @@ pub async fn aof_writer_task(
                 Err(_) => {}
                 // Channel disconnected — final sync + shut down.
                 Ok(Err(_)) => {
-                    let _ = writer.flush().await;
-                    let _ = writer.get_ref().sync_data().await;
+                    if !write_error {
+                        let _ = writer.flush().await;
+                        let _ = writer.get_ref().sync_data().await;
+                    }
                     info!("AOF writer shutting down");
                     break;
                 }
@@ -375,41 +397,62 @@ pub async fn aof_writer_task(
 
                     // -- write the data batch inline (async), then ONE fsync --
                     if !batch.data.is_empty() {
-                        let mut write_failed = false;
-                        for msg in &batch.data {
-                            let body = group_commit::msg_body(msg);
-                            if body.is_empty() {
-                                continue; // zero-length barrier: fsync+ack only
-                            }
-                            if let Err(e) = writer.write_all(body).await {
-                                error!("AOF batch write error: {}", e);
-                                write_failed = true;
-                                break;
-                            }
-                        }
-                        let do_fsync = matches!(fsync, FsyncPolicy::Always);
-                        if write_failed {
+                        if write_error {
+                            // Stream already torn — drop appends and fail every
+                            // AppendSync waiter (never ack into a corrupt stream).
                             let _ = group_commit::ack_batch(&mut batch, BatchAck::WriteFailed);
-                        } else if do_fsync {
-                            let mut fsync_failed = false;
-                            if let Err(e) = writer.flush().await {
-                                error!("AOF batch flush error: {}", e);
-                                fsync_failed = true;
-                            } else if let Err(e) = writer.get_ref().sync_data().await {
-                                error!("AOF batch sync_data error: {}", e);
-                                fsync_failed = true;
+                        } else {
+                            let mut write_failed = false;
+                            for msg in &batch.data {
+                                let body = group_commit::msg_body(msg);
+                                if body.is_empty() {
+                                    continue; // zero-length barrier: fsync+ack only
+                                }
+                                if let Err(e) = writer.write_all(body).await {
+                                    error!("AOF batch write error: {}", e);
+                                    write_failed = true;
+                                    break;
+                                }
                             }
-                            let verdict = if fsync_failed {
+                            let do_fsync = matches!(fsync, FsyncPolicy::Always);
+                            let verdict = if write_failed {
+                                // A torn write may leave a partial record — latch so
+                                // no further bytes are appended after the tear.
+                                write_error = true;
+                                BatchAck::WriteFailed
+                            } else if fail_fsync_for_test && do_fsync {
+                                // Injected: bytes written, the batch fsync "fails"
+                                // → every waiter FsyncFailed (no disk error needed).
                                 BatchAck::FsyncFailed
+                            } else if do_fsync {
+                                let mut fsync_failed = false;
+                                if let Err(e) = writer.flush().await {
+                                    error!("AOF batch flush error: {}", e);
+                                    fsync_failed = true;
+                                } else if let Err(e) = writer.get_ref().sync_data().await {
+                                    error!("AOF batch sync_data error: {}", e);
+                                    fsync_failed = true;
+                                }
+                                if fsync_failed {
+                                    BatchAck::FsyncFailed
+                                } else {
+                                    BatchAck::Synced
+                                }
                             } else {
+                                // EverySec/No: batch buffered; the deadline check
+                                // after this block fsyncs. An AppendSync is enqueued
+                                // ONLY under Always (pool::try_send_append_durable /
+                                // fsync_barrier), so this branch acks no waiter.
+                                debug_assert!(
+                                    !batch
+                                        .data
+                                        .iter()
+                                        .any(|m| matches!(m, AofMessage::AppendSync { .. })),
+                                    "everysec/no batch must contain no AppendSync"
+                                );
                                 BatchAck::Synced
                             };
                             let _ = group_commit::ack_batch(&mut batch, verdict);
-                        } else {
-                            // EverySec/No: batch buffered; the deadline check
-                            // after this block fsyncs. No AppendSync under
-                            // everysec/no ⇒ this acks nothing.
-                            let _ = group_commit::ack_batch(&mut batch, BatchAck::Synced);
                         }
                     }
 
@@ -417,12 +460,17 @@ pub async fn aof_writer_task(
                     match batch.deferred_control {
                         None => {}
                         Some(AofMessage::Rewrite(db)) => {
-                            // Flush current writer before rewrite
-                            let _ = writer.flush().await;
-                            let _ = writer.get_ref().sync_data().await;
+                            // Flush current writer before rewrite (skip if torn).
+                            if !write_error {
+                                let _ = writer.flush().await;
+                                let _ = writer.get_ref().sync_data().await;
+                            }
 
-                            if let Err(e) = rewrite_aof(db, &aof_path).await {
-                                error!("AOF rewrite failed: {}", e);
+                            match rewrite_aof(db, &aof_path).await {
+                                // Rewrite replaced the file with a clean one — the
+                                // torn-write latch resets (mirrors monoio TopLevel).
+                                Ok(()) => write_error = false,
+                                Err(e) => error!("AOF rewrite failed: {}", e),
                             }
                             crate::command::persistence::AOF_REWRITE_IN_PROGRESS
                                 .store(false, std::sync::atomic::Ordering::SeqCst);
@@ -451,20 +499,24 @@ pub async fn aof_writer_task(
                         }
                         Some(AofMessage::RewriteSharded(shard_dbs)) => {
                             // C4 TopLevel cooperative fold (tokio path):
-                            // flush + sync the BufWriter, convert to std::fs::File
-                            // for the sync fold (same pattern as tokio per-shard),
-                            // then reopen for appending.
-                            let _ = writer.flush().await;
-                            let _ = writer.get_ref().sync_data().await;
+                            // flush + sync the BufWriter (skip if torn), convert to
+                            // std::fs::File for the sync fold (same pattern as tokio
+                            // per-shard), then reopen for appending.
+                            if !write_error {
+                                let _ = writer.flush().await;
+                                let _ = writer.get_ref().sync_data().await;
+                            }
                             let mut sf = writer.into_inner().into_std().await;
-                            if let Err(e) = rewrite_aof_sharded_sync(
+                            match rewrite_aof_sharded_sync(
                                 &shard_dbs,
                                 &aof_path,
                                 &rx,
                                 &mut sf,
                                 fold_channels.as_ref(),
                             ) {
-                                error!("AOF rewrite (sharded) failed: {}", e);
+                                // Fold rewrote aof_path clean — the latch resets.
+                                Ok(()) => write_error = false,
+                                Err(e) => error!("AOF rewrite (sharded) failed: {}", e),
                             }
                             // Drop sf — caller will reopen aof_path below.
                             drop(sf);
@@ -499,8 +551,10 @@ pub async fn aof_writer_task(
                             coord.shard_done();
                         }
                         Some(AofMessage::Shutdown) => {
-                            let _ = writer.flush().await;
-                            let _ = writer.get_ref().sync_data().await;
+                            if !write_error {
+                                let _ = writer.flush().await;
+                                let _ = writer.get_ref().sync_data().await;
+                            }
                             info!("AOF writer shutting down");
                             break;
                         }
@@ -513,8 +567,10 @@ pub async fn aof_writer_task(
             // most ~1.2s after it was written (1s deadline + 200ms wake
             // floor). tokio's BufWriter holds up to 8KB in userspace — a
             // SIGKILL takes that tail with it, so the bound must hold even
-            // when the recv arm is saturated with messages.
+            // when the recv arm is saturated with messages. Skip if torn:
+            // syncing past a partial record cannot recover it.
             if fsync == FsyncPolicy::EverySec
+                && !write_error
                 && last_fsync.elapsed() >= std::time::Duration::from_secs(1)
             {
                 let _ = writer.flush().await;
