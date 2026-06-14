@@ -14,7 +14,7 @@
 //!
 //! Running:  cargo test --test xshard_fastpath_api
 
-use moon::shard::slice::{xshard_may_spin, XshardWaitGuard, XSHARD_SPIN_GATE};
+use moon::shard::slice::{XSHARD_SPIN_GATE, XshardWaitGuard, xshard_may_spin};
 
 /// xrf1 — a near-idle shard (no in-flight cross-shard reply-waiters on this thread)
 /// MUST allow the reply-side spin. This is the entire c1 latency win: when the
@@ -66,10 +66,7 @@ fn idle_gate_boundary_is_inclusive() {
         "at exactly XSHARD_SPIN_GATE in-flight waiters the gate is still open (inclusive bound)"
     );
     guards.push(XshardWaitGuard::new()); // gate + 1
-    assert!(
-        !xshard_may_spin(),
-        "one waiter past the gate closes it"
-    );
+    assert!(!xshard_may_spin(), "one waiter past the gate closes it");
     drop(guards);
 }
 

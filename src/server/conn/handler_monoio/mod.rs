@@ -1790,10 +1790,14 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                         break Err("ERR cross-shard response aborted (shutdown)");
                                     }
                                     let chunk = std::pin::pin!(monoio::time::sleep(
-                                        std::time::Duration::from_millis(CROSS_SHARD_RESPONSE_CHUNK_MS)
+                                        std::time::Duration::from_millis(
+                                            CROSS_SHARD_RESPONSE_CHUNK_MS
+                                        )
                                     ));
                                     match crate::runtime::race::race2(recv.as_mut(), chunk).await {
-                                        crate::runtime::race::Arm::First(Ok(value)) => break Ok(value),
+                                        crate::runtime::race::Arm::First(Ok(value)) => {
+                                            break Ok(value);
+                                        }
                                         crate::runtime::race::Arm::First(Err(_)) => {
                                             break Err("ERR cross-shard dispatch failed");
                                         }

@@ -572,7 +572,6 @@ pub struct ServerConfig {
     /// Defaults to 0 (invalid — must be set when `--migrate-aof-from` is used).
     #[arg(long = "migrate-aof-shards", default_value_t = 0)]
     pub migrate_aof_shards: u16,
-
 }
 
 /// Filesystem markers that identify an existing moon persistence layout.

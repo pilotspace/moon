@@ -19,12 +19,12 @@ use std::path::{Path, PathBuf};
 /// Dead symbols that M3 must remove. Each is specific enough not to match legitimate
 /// cross-shard code (e.g. plain `cross_shard` dispatch is NOT in this list).
 const DEAD_SYMBOLS: &[&str] = &[
-    "cross_shard_fast_path",                       // the `cross_shard_fast_path` field + `--cross-shard-fast-path` arg + `cross_shard_fast_path_enabled`
-    "CrossShardFastPath",                          // the config enum
-    "moon_cross_shard_lock_contention_total",      // the dead metric
-    "moon_dispatch_cross_read_fastpath_latency_us",// the dead histogram
-    "record_dispatch_cross_read_fastpath",         // the dead recorder fns
-    "cross_read_fast_dispatches",                  // the hardcoded-0 stat field
+    "cross_shard_fast_path", // the `cross_shard_fast_path` field + `--cross-shard-fast-path` arg + `cross_shard_fast_path_enabled`
+    "CrossShardFastPath",    // the config enum
+    "moon_cross_shard_lock_contention_total", // the dead metric
+    "moon_dispatch_cross_read_fastpath_latency_us", // the dead histogram
+    "record_dispatch_cross_read_fastpath", // the dead recorder fns
+    "cross_read_fast_dispatches", // the hardcoded-0 stat field
 ];
 
 /// Recursively collect all `.rs` files under `src/` (relative to manifest root).
