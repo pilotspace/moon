@@ -1,7 +1,7 @@
 # TASK: Recover cross-shard read latency lock-free: adaptive spin-then-park + coalescing + dead-flag cleanup
 
 slug: xshard-read-fastpath · created: 2026-06-13 · stage: production · risk: high · autonomy: conservative
-phase: build   <!-- specify -> scenarios -> contract -> tests -> build -> verify -> observe -> done -->
+phase: verify   <!-- specify -> scenarios -> contract -> tests -> build -> verify -> observe -> done -->
 <!-- high-risk/method-defining scope? declare `risk: high` on the slug line above and lower
      the autonomy level with `autonomy: conservative` — the engine refuses an unguarded completion
      (`unguarded_high_risk_auto`, run.md guard). A comment is never a declaration. -->
@@ -86,7 +86,8 @@ Must:
     parks immediately (no poll). The gate is checked from cheap shard-local state
     (ready-queue/connection count), never a lock. Ceiling is ~half because only the
     reply-side wake is removed; the target-side wake is irreducible.
-  - M2 (P1 multi-client): under c>1, P=1 cross-shard read load, multiple in-flight
+  - M2 (P1 multi-client) — [DEFERRED v2 → task `xshard-read-coalescing`; see v2 CHANGE
+    REQUEST in §3]: under c>1, P=1 cross-shard read load, multiple in-flight
     foreign reads from different connections to the SAME target shard are coalesced
     into fewer SPSC messages; the s4 P1 GET cell recovers measurably toward parity
     vs the M0 baseline. Coalescing preserves per-connection command order and
@@ -238,6 +239,7 @@ Scenario: xrf1 idle-gated spin halves the c1 cross-shard read gap (M1)
       spin-disabled (the gate must not move the busy-shard case)
 
 Scenario: xrf2 cross-connection coalescing recovers the P1 multi-client cell (M2)
+  # [DEFERRED v2 → task `xshard-read-coalescing`; see v2 CHANGE REQUEST in §3]
   Given idle-gated spin + read coalescing live, multiple clients (c>1, P=1)
   When their cross-shard reads target the same owner shard concurrently
   Then the owner serves them in fewer SPSC messages than reads (coalescing observable
@@ -344,6 +346,10 @@ synchronous — it holds no borrow across `.await`. When the gate is false, the 
 is byte-identical to today (immediate park).
 
 ### C3 — Cross-connection read coalescing (M2) — most-novel surface
+> [DEFERRED v2 → task `xshard-read-coalescing`; see v2 CHANGE REQUEST under Status]. The
+> `CoalescedReadBatch` TYPE below is RETAINED in code (defined in C1, pinned by the xrf2
+> type test); only the producer/consumer LOGIC is deferred. Kept here verbatim as the
+> frozen design the follow-up task inherits.
 ```rust
 // src/shard/dispatch.rs — one batched message carrying N independent foreign
 // reads from DIFFERENT connections on the origin shard to ONE owner shard, each
@@ -399,12 +405,30 @@ Least-sure flag surfaced at freeze:
   "only cross-connection reads are grouped"; if wrong: a concurrent-load consistency
   regression (197-suite is the oracle).
 
-Status: FROZEN @ v1 — approved by Tin Dang 2026-06-14. Both freeze gates satisfied:
-(1) the quiesced-VM RELATIVE M0 baseline is established (clean-VM best-of-5; c1-GET
-37580→22252 = −40.8%; full table in §6 M0 RECORD) and (2) the one human approval over
-the §1–§4 bundle was given "Freeze as-is", lowest-confidence flag surfaced first (the
-~30k halve target sits at the mechanism's ~one-wake-removed ceiling). Changing any C1–C4
-clause or the M1 ≥~30k line now is a change request back to SPECIFY.
+Status: FROZEN @ v2 — amended by Tin Dang 2026-06-14 (change request: descope D2/M2/C3).
+
+v2 CHANGE REQUEST (2026-06-14, approved by Tin Dang at the M1 verify-checkpoint):
+D2 / M2 / scenario xrf2 / contract C3 (cross-connection read coalescing) are DEFERRED to a
+new follow-up task `xshard-read-coalescing`. Rationale (senior-eng decision at the M1
+checkpoint): C2's idle-gated reply-side spin delivered a clean SAME-RUN +18.0% c1-GET
+recovery (21468→25336, 3-way 3e376a1/a497602/2bfc5bc) — the SINGLE-CONNECTION STRUCTURAL
+CEILING for this approach. The remaining c1 gap is the second cross-thread wake, removable
+only by the RCU/snapshot path §1 explicitly REJECTED (low-RSS invariant). C3 coalescing
+cannot move c1 (no batching partner at 1 in-flight); it only helps the concurrent
+cross-shard-FANOUT cell (c100), which moon's design already answers via hash-tag
+co-location — the lowest-ROI cell carrying the HIGHEST validation/correctness cost (the
+read-your-writes invariant across the 197-suite ×1/4/12 ×dual-runtime). Banking C2 now
+discharges the shardslice waiver intent (recover the regression WITHOUT a cross-thread
+lock) ahead of the 2026-08-01 expiry. The `CoalescedReadBatch` TYPE stays in code (defined
+in C1, referenced by the xrf2 type-pin test); only the coalescing LOGIC is deferred.
+RETAINED & verified this task: M0, M1 (C1+C2), M3 (C4 cleanup), M4 (no-regression).
+
+v1 FROZEN — approved by Tin Dang 2026-06-14. Both freeze gates satisfied: (1) the
+quiesced-VM RELATIVE M0 baseline is established (clean-VM best-of-5; c1-GET 37580→22252
+= −40.8%; full table in §6 M0 RECORD) and (2) the one human approval over the §1–§4 bundle
+was given "Freeze as-is", lowest-confidence flag surfaced first (the ~30k halve target sits
+at the mechanism's ~one-wake-removed ceiling). Changing any RETAINED C1/C2/C4 clause or the
+M1 ≥~30k line now is a change request back to SPECIFY.
 <!-- The freeze IS the one approval — lead it with the bundle's lowest-confidence flag: the 1–2
      points most likely wrong across the whole bundle, tagged [spec|scenario|contract|test], each
      with why + cost (the §1 ⚠ assumptions feed it; a flag may point at a scenario or the contract
@@ -443,6 +467,8 @@ Plan (one test per scenario; unit-red where deterministic, else named to its ora
   - xrf1 perf: `scripts/baseline-xshard-quiesced.sh` c1-GET best-of-N ≥ ~30k (halve the 15.3k gap).
   - xrf1 guard / reject shard_starvation: same harness, s4-c100-GET within noise of ~202k.
   - xrf2 perf: P1 multi-client cell recovers toward parity + a coalescing INFO/stat counter > 0.
+    [DEFERRED v2 → task `xshard-read-coalescing`]. (The `coalesced_read_batch_type_pin` unit
+    test above is RETAINED — the TYPE ships in C1; only the coalescing LOGIC/perf is deferred.)
   - reject read_your_writes_regression / xrf-ryw: `scripts/test-consistency.sh` 197/197 @1/4/12 byte-identical.
   - reject memory_regression / xrf4: `scripts/bench-resources.sh` RSS within noise of M0; dual-runtime green.
 
@@ -500,23 +526,145 @@ Reads of the table:
   floored c1 at 1–6k for hours. Cross-shard c1 latency is ONLY valid on a verified-clean VM —
   assert `pgrep -af moon-baseline-bins` is empty before measuring.
 
-- [ ] all tests pass
-- [ ] coverage did not decrease
-- [ ] no test or contract was altered during build
-- [ ] concurrency / timing of the risky operation is safe
-- [ ] no exposed secrets, injection openings, or unexpected dependencies
-- [ ] layering & dependencies follow CONVENTIONS.md
-- [ ] a person reviewed and approved the change
+### M1 RESULT — 3-way SAME-RUN anchor (monoio, best-of-5, quiesced VM, 2026-06-14)
+Harness: `scripts/baseline-xshard-quiesced.sh COMMITS="3e376a1 a497602 2bfc5bc"`. All three
+binaries measured in ONE quiescence window so the ratio is variance-cancelled (cross-run
+absolute RPS is invalid per the milestone VM exception).
+
+| cell | 3e376a1 base | a497602 no-mech | 2bfc5bc with-mech | C2 recovery (same-run) | regression vs base |
+|------|--------------|-----------------|-------------------|------------------------|--------------------|
+| s4-c1-GET (TARGET) | 31437 | 21468 | **25336** | **+18.0%** | no-mech −31.7% → mech **−19.4%** |
+| s4-c1-SET (write control) | 592 | 20627 | 24981 | +21.1% (bonus, shared reply path) | n/a |
+| s4-c100-GET (starvation guard) | 303490 | 201207 | 218103 | +8.4% | no-mech −33.7% → mech −28.1% |
+
+**M1 verdict: MET** on the contract's relative form — "regression-vs-3e376a1 ≤ ~20%": with-mech
+**−19.4% ≤ ~20%**. The stable, variance-cancelled deliverable is the **+18.0% same-run c1-GET
+recovery** (21468→25336; mech reps `[25336,25104,25085,24854,25056]` are ±1%-tight). Absolute
+25336 sits below 30k only because today's whole-VM baseline (31437) is below M0's (37580); the
+relative anchor — the contract-sanctioned metric — neutralizes that drift. HONEST CAVEAT: the
+−19.4% line-pass benefits from today's milder no-mech baseline (−31.7% vs M0 −40.8%); the +18%
+recovery is the trustworthy characterization, NOT a clean "halved." Residual = the second
+cross-thread wake (RCU-only, §1-REJECTED for low-RSS) ⇒ this is the single-connection STRUCTURAL
+FLOOR for the approach. xrf1 starvation guard: c100 **+8.4% (not regressed)** — the idle gate
+prevents the spike's fixed-spin −48% collapse. ✓
+
+### M1 RE-MEASURE — batch-depth gate fix (the verify-caught P16 regression, resolved)
+Verify caught a **−27% s4-P16 regression** in the with-mech build (2bfc5bc): a synchronous reply
+spin SERIALIZES a pipelined cross-shard fan-out — the INFLIGHT-only gate can't see it because the
+spin never yields. FIX (commit 7048e8a): a second gate `xshard_should_spin(batch_remote) =
+batch_remote ≤ XSHARD_SPIN_MAX_BATCH_REMOTE(=1) && xshard_may_spin()`; both handlers sum
+`batch_remote_total = Σ meta.len()` over pending cross-shard replies and only spin a SINGLETON read.
+3-way re-measure, SAME quiescence window, best-of-5, core-pinned, `scripts/remeasure-xshard-fix.sh`:
+
+| cell | no-mech a497602 (med) | old-mech 2bfc5bc (med) | **new-mech 7048e8a (med)** | new vs no-mech | new vs old |
+|------|----------------------|------------------------|----------------------------|----------------|------------|
+| s4-c1-GET (the win)       | 20243   | 24779             | **24892**   | **+22.9%** | +0.5% (win kept) |
+| s4-c100-GET (guard)       | 188679  | 202156            | **208189**  | +10.3% (no regression) | +3.0% |
+| s4-P16-GET (the regression)| 2479339 | 1796407 (**−27.5%**) | **2608696** | **+5.2%** (cleared) | **+45.2%** |
+| s1-P16-CTRL (noise floor) | 4166667 | 4411764           | **4109589** | −1.4% (flat) | −6.9% |
+
+**Verdict: fix CONFIRMED.** The batch gate cleanly separates the regimes — the singleton c1 read
+still spins (**+22.9%** recovery preserved), the P16 fan-out now PARKS instead of serializing
+(old-mech −27.5% → new-mech **+5.2%** vs no-mech, fully recovered in the same run), c100 stays
+safe on the inflight gate. The s1 control is flat (±noise, no cross-shard path) — proving the
+P16 delta is a real mechanism effect, not VM drift. The fix is a strict *narrowing* of the spin
+condition (only batch_remote ≤ 1), falling back to the already-proven park path otherwise — so it
+carries no new data-correctness surface beyond old-mech (which already passed consistency 197/197).
+
+### M3 RESULT — cleanup (C4): the dead fast-path surface is gone
+`tests/xshard_cleanup_shape.rs` green — zero source matches for all 6 symbols
+(`cross_shard_fast_path`, `CrossShardFastPath`, `moon_cross_shard_lock_contention_total`,
+`moon_dispatch_cross_read_fastpath_latency_us`, `record_dispatch_cross_read_fastpath`,
+`cross_read_fast_dispatches`); clap now rejects `--cross-shard-fast-path` (breaking change). ✓
+
+### M4 RESULT — no-regression guardrail
+- **Consistency 197/197 @ shards=1/4/12** (monoio+text-index, run b9kzw48zu @ cc943ef): KV / Hash /
+  List / Set / ZSet / bulk-1K / FT.AGGREGATE / TEMPORAL / TXN-abort / workspace / MQ all PASS.
+  This is the reject_read_your_writes_regression oracle. ✓
+- clippy ×2 featuresets `-D warnings` ✓ · `cargo fmt --check` ✓
+- `audit-unsafe.sh` 218/218 SAFETY (net **−2** vs 2bfc5bc — try_take consolidated into
+  `take_if_filled`, zero NEW unsafe) ✓ · `audit-unwrap.sh` 0/0 ✓
+- Zero new cross-thread lock: `shardslice_shape.rs` 5/5 (incl. reject_borrow_across_await,
+  observer_lockfree); the idle gate is a thread-local `Cell<u32>` ✓
+- **RSS not regressed**: HWM under 4-shard `-r 1M` load — no-mech 49456 kB → with-mech 48992 kB
+  (within noise; the `Cell<u32>` adds ~16 B) ✓
+- s1 LOCAL control within noise (39809 → 38700, best-of-3); the local path constructs no
+  `XshardWaitGuard` (C2 code executes ONLY at the two cross-shard reply-wait sites) — unregressed
+  by construction ✓
+- **Dual-runtime green** (VM-local clones, in-tree target, release — the CI-parity env):
+  tokio full suite (`--no-default-features --features runtime-tokio,jemalloc`, `MOON_NO_URING=1`,
+  run blh7j4hov) ALL `ok`/0 failed; monoio full suite (run bhbau47rw) **3837 passed / 0 failed**. ✓
+  (NB: an earlier tokio run via an EXTERNAL `CARGO_TARGET_DIR` showed 6 `shardslice_live`
+  "server never accepted" failures — the documented binary-provenance trap: `find_moon_binary`
+  resolves `{manifest}/target/release/moon` (a macOS Mach-O), not the external-dir Linux binary.
+  Re-run in-tree: all pass. NOT a C2 fault.)
+- **Post-fix re-confirm on 7048e8a** (the batch-gate commit): the cross-shard surface re-run on BOTH
+  runtimes, in-tree VM clone — `cross_shard_consistency_red` (7) + `shardslice_live` (6, real
+  cross-shard reads over the wire = the liveness oracle for the spin/park path) + `multishard_serve_smoke`
+  (3) + `xshard_cleanup_shape` (1) + `xshard_fastpath_api` (6, incl. the 2 new batch-gate unit tests)
+  = **23/23 monoio + 23/23 tokio, 0 failed**. The gate change carries no data surface (strict spin
+  narrowing → proven park fallback), and these oracles confirm no liveness/correctness regression. ✓
+
+### VERIFY FINDINGS — caught & fixed during this phase (verify earned its keep)
+1. **New `unsafe` (M4 "zero new unsafe" violation)** — C2's `ResponseSlot::try_take()` had added a
+   3rd inline `unsafe { (*data.get()).take() }`. FIX: consolidated the lone UnsafeCell take into a
+   private `take_if_filled()` shared by poll_take + try_take → response_slot 4→2 unsafe blocks
+   (net −2); audit-unsafe 218/218. Commit 9789bf1. Logic byte-identical (10 unit + loom green).
+2. **Incomplete M3 cleanup (repo-wide)** — C4 deleted `CrossShardFastPath`/`cross_shard_fast_path`
+   from src but left dangling refs in 15 integration tests + a dead `bench-cross-shard-fastpath.sh`;
+   the `xshard_cleanup_shape` grep-pin only scans `src/`, so the full-suite break hid until the
+   dual-runtime pass. FIX: purged the field/imports from tests, `git rm` the script, CHANGELOG
+   breaking note. Commit fda52a4. (The grep-pin's src-only scope is a real test gap — see §7.)
+
+3. **−27% s4-P16 regression (the ⚠ flag-#1 trap, made real)** — the M1 anchor (c1/c100 only) was
+   green, but a pipelined fan-out (P16) measured **−27.5%** with-mech: a synchronous spin serializes
+   pipelined cross-shard reads, and the INFLIGHT-only gate is blind to it (the spin never yields to
+   reveal the queue). Best-of-3 first hid it as noise (an impossible s1 +32%); best-of-7 + a flat s1
+   control confirmed it REAL. FIX: a batch-depth gate (`xshard_should_spin`, `XSHARD_SPIN_MAX_BATCH_REMOTE=1`)
+   so only a SINGLETON cross-shard read spins; any pipeline parks. Re-measured 3-way (M1 RE-MEASURE
+   table): regression cleared (−27.5% → +5.2%), c1 win preserved (+22.9%). Commit 7048e8a + 2 unit
+   tests (`batch_gate_blocks_spin_for_pipelined_batch`, `batch_gate_and_inflight_gate_compose`).
+
+### M2 — DEFERRED v2 → task `xshard-read-coalescing` (see §3 Status). Not gated by this task.
+
+- [x] all tests pass — api(4) + cleanup(1) + response_slot unit(10) + loom-model(4) +
+  shardslice_shape(5) + consistency 197/197 @1/4/12; cross-shard smoke (40 GET + MGET) correct
+- [x] coverage did not decrease — gate logic + cleanup surface unit-pinned; perf/consistency
+  evidence-gated per §4 (behavior-preserving-perf split). New `take_if_filled` covered by the
+  10 ResponseSlot tests + loom model.
+- [~] no test or contract was altered during build — tests changed by `cargo fmt` ONLY
+  (whitespace/import-order, no assertion touched); §3 contract amended v1→v2 via a HUMAN-APPROVED
+  CHANGE REQUEST (descope M2/C3), NOT a build-time edit to force a pass
+- [x] concurrency / timing of the risky operation is safe — idle gate is single-thread
+  `Cell<u32>` (no atomic/lock); spin is synchronous (no borrow across `.await`); `_wait_guard`
+  correctly spans the park (parked = in-flight); ResponseSlot loom model + 197-suite green
+- [x] no exposed secrets, injection openings, or unexpected dependencies — no new deps; internal
+  mechanism only; no wire-protocol change
+- [x] layering & dependencies follow CONVENTIONS.md — slice.rs gate + dispatch.rs type +
+  response_slot helper sit in their existing modules; `crate::` imports
+- [ ] a person reviewed and approved the change — PENDING human gate (conservative autonomy +
+  concurrency/architecture residue ⇒ human-gated, not auto)
 
 ### Deep checks — do not skim (fill the path that applies; the resolver judges which)
-- [ ] WIRING (code) — every new symbol is referenced; record where / how confirmed
-- [ ] DEAD-CODE (code) — no new unused or orphaned symbol introduced
-- [ ] SEMANTIC (prose / non-code) — read in full, not skimmed: <what read · what confirmed>
+- [x] WIRING (code) — `xshard_may_spin`/`XshardWaitGuard`/`XSHARD_SPIN_GATE`/`XSHARD_SPIN_BUDGET`
+  referenced at both reply-wait sites (handler_monoio `Err(Empty)`, handler_sharded `future_for`)
+  + pinned by xshard_fastpath_api; `take_if_filled` consumed by poll_take + try_take;
+  `CoalescedReadBatch` referenced by the type-pin test (type retained, logic deferred). Confirmed
+  by clippy (no dead_code under either featureset) + the 5 api/cleanup tests.
+- [x] DEAD-CODE (code) — `try_take` dead ONLY under monoio (replies via flume) is a precise
+  cfg-gated `allow`; live + checked under tokio. `CoalescedReadBatch` is referenced (not dead).
+  No orphan introduced.
 
 ### GATE RECORD
-Outcome: <PASS | RISK-ACCEPTED | HARD-STOP>
-If RISK-ACCEPTED -> owner: <name> · ticket: <link> · expires: <date>   (never for a security gap)
-Reviewed by: <name> · date: <date>
+Outcome: PASS (RECOMMENDED — pending human sign-off; not auto-gated: conservative autonomy +
+concurrency/architecture surface). Verify HEAD = **7048e8a** (the batch-gate fix). Evidence above;
+all RETAINED Musts (M0/M1/M3/M4) satisfied — including the verify-caught P16 regression, found AND
+fixed within this phase (VERIFY FINDING #3 → M1 RE-MEASURE: −27.5% → +5.2%, c1 win +22.9% kept;
+post-fix 23/23 dual-runtime). M2 deferred via human-approved v2 change request. No security finding.
+No RISK-ACCEPTED needed (M1 met on its relative form; residual is a scope-rejected RCU floor,
+documented, not a waiver).
+If RISK-ACCEPTED -> owner: <n/a> · ticket: <n/a> · expires: <n/a>   (never for a security gap)
+Reviewed by: <PENDING — Tin Dang> · date: 2026-06-14
 
 <!-- A security finding is ALWAYS HARD-STOP. Record exactly one outcome — no silent pass. -->
 
@@ -524,10 +672,35 @@ Reviewed by: <name> · date: <date>
 
 ## 7 · OBSERVE — feed the next loop ▸ docs/09-the-loop.md
 
-Watch (reuse scenarios as monitors): <error rate / per-rejection rate / latency>
-Spec delta for the next loop: <what production taught you>
+Watch (reuse scenarios as monitors): cross-shard c1 GET p50/p99 (xrf1) · s4 c100 GET throughput
+(reject shard_starvation — must not fall vs spin-disabled) · INFO `spsc_notify_wakes` ratio (a
+drift below 1.0 would mean the reply-spin is silently eating wakes) · steady-state RSS (memory_regression).
+Spec delta for the next loop: state perf Musts on the OrbStack VM ONLY in the relative-regression
+form ("≤ ~X% vs baseline, same-run"), never an absolute RPS — the M1 "≥30k" line was fragile under
+baseline drift (37580→31437 across two clean runs); the same-run +18% recovery was the durable signal.
 
 ### Competency deltas
 What did this loop teach the foundation? One line each, tagged by competency
 (`DDD · SDD · UDD · TDD · ADD`), status `open`, with evidence. See the `add` skill's `deltas.md`.
-<!-- e.g.  - [DDD · open] the model missed multi-tenancy (evidence: scenario_x failed) -->
+- [TDD · open] A "symbol hard-removed repo-wide" shape test must grep the WHOLE repo (tests/ +
+  scripts/ + benches/), not just `src/`: `xshard_cleanup_shape` scanned only `src/`, so 15 test
+  files + 1 script kept dangling `cross_shard_fast_path` refs that broke the full build, invisibly,
+  until the dual-runtime pass (evidence: commit fda52a4, −340 lines). Fix forward: widen the pin.
+- [ADD · open] Scoped `cargo test --test X` runs give FALSE GREEN for cross-cutting deletions — only
+  a full `cargo test` on BOTH runtimes is an honest gate for a symbol removal (evidence: M3 break hid
+  through every scoped run; surfaced only at dual-runtime verify).
+- [ADD · open] Run `audit-unsafe.sh` / `audit-unwrap.sh` during BUILD, not just verify — C2's new
+  `unsafe` slipped from build to verify; an at-build audit would have caught it one phase earlier
+  (evidence: commit 9789bf1).
+- [TDD · open] Integration tests that spawn a server must pin `MOON_BIN` (or be run in-tree) on the
+  OrbStack VM — `find_moon_binary`'s `{manifest}/target/release/moon` fallback resolves a macOS
+  Mach-O under an external `CARGO_TARGET_DIR`, yielding phantom "server never accepted" failures
+  (evidence: 6 `shardslice_live` false-fails, green in-tree). Reinforces gotcha_orbstack_macho_binary_trap.
+- [TDD · open] A perf anchor must sweep the PIPELINED regime, not just connection count: the c1/c100
+  anchor was green while a P16 fan-out regressed −27.5% — a synchronous spin serializes a pipelined
+  batch, visible ONLY under pipeline depth. And best-of-3 hid it as noise; a flat single-shard CONTROL
+  cell + best-of-7 was required to separate the signal from VM drift (evidence: M1 RE-MEASURE, 7048e8a).
+- [SDD · open] Keeping a REJECTED-risk flag in the frozen contract pays off: §3 ⚠ flag-#1 ("a
+  synchronous spin could serialize pipelined reads") was the exact failure that materialized at verify —
+  the pre-named, pre-reasoned risk turned a surprise regression into a targeted batch-depth-gate fix,
+  not a redesign (evidence: §3 flag-#1 → VERIFY FINDING #3 → M1 RE-MEASURE).
