@@ -61,12 +61,12 @@
     },
     "wal-group-commit": {
       "title": "WAL group commit: batch concurrent pending writes into one fsync under appendfsync=always",
-      "phase": "verify",
-      "gate": "none",
+      "phase": "done",
+      "gate": "PASS",
       "milestone": "v2-performance",
       "depends_on": [],
       "created": "2026-06-14T06:54:39+00:00",
-      "updated": "2026-06-14T16:15:37+00:00",
+      "updated": "2026-06-14T16:20:23+00:00",
       "flag_verified": true
     }
   },
@@ -89,7 +89,7 @@
     }
   },
   "created": "2026-06-11T03:18:21+00:00",
-  "updated": "2026-06-14T16:15:37+00:00",
+  "updated": "2026-06-14T16:20:23+00:00",
   "setup": {
     "locked": true,
     "locked_at": "2026-06-11T03:28:00+00:00",

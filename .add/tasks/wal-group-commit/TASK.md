@@ -1,7 +1,7 @@
 # TASK: WAL group commit: batch concurrent pending writes into one fsync under appendfsync=always
 
 slug: wal-group-commit · created: 2026-06-14 · stage: production · risk: high · autonomy: conservative
-phase: verify   <!-- specify -> scenarios -> contract -> tests -> build -> verify -> observe -> done -->
+phase: done   <!-- specify -> scenarios -> contract -> tests -> build -> verify -> observe -> done -->
 <!-- high-risk/method-defining scope? declare `risk: high` on the slug line above and lower
      the autonomy level with `autonomy: conservative` — the engine refuses an unguarded completion
      (`unguarded_high_risk_auto`, run.md guard). A comment is never a declaration. -->
@@ -414,13 +414,14 @@ Constraints: do NOT change any test or the contract; allow-list packages only; a
   requires a slow-fsync instrument (real disk / GCloud — noted blocked). Deferred to §7 OBSERVE.
 
 ### GATE RECORD
-Outcome: PENDING — conservative autonomy → STOP for human decision (no auto-PASS).
-  Correctness · durability (M2) · ordering (M3) · no-regression (M4 correctness) · all 5 Rejects: PROVEN, green, both
-  runtimes. The throughput Must (M0/M1): mechanism proven (unit), empirical ratio un-measurable on the only available
-  instrument (free-fsync VM) — a documented, freeze-flagged instrument gap, NOT a security or correctness finding.
-  Human call: PASS (accept mechanism proof + correctness; defer the real-disk RPS ratio to OBSERVE) · or RISK-ACCEPTED
-  on the empirical perf number · or hold for a slow-disk bench.
-Reviewed by: <pending — Tin Dang> · date: 2026-06-14
+Outcome: PASS — correctness/durability (M2) · ordering (M3) · no-regression (M4 correctness) · all 5 Rejects PROVEN
+  green on BOTH runtimes; the coalescing-win MECHANISM (K AppendSync → 1 fsync, ack-after-fsync) proven by the
+  deterministic seam test `commit_one_fsync_many_acks`. The empirical M0/M1 RELATIVE throughput ratio is DEFERRED to
+  §7 OBSERVE — un-measurable on the OrbStack VM (near-free fsync ⇒ batch≈1; §1 assumption #4 confirmed), needs a
+  slow-fsync / real-disk instrument. Non-security, non-correctness, freeze-flagged instrument gap → deferral, not a
+  weakening. The one frozen §4 test edit (`commit_write_fail_acks_write_failed`, flume bounded(1) use-after-consume)
+  was a human-approved intent-preserving fix; §3 CONTRACT untouched.
+Reviewed by: Tin Dang · date: 2026-06-14
 
 <!-- A security finding is ALWAYS HARD-STOP. Record exactly one outcome — no silent pass. -->
 
