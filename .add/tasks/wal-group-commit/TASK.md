@@ -1,7 +1,7 @@
 # TASK: WAL group commit: batch concurrent pending writes into one fsync under appendfsync=always
 
 slug: wal-group-commit · created: 2026-06-14 · stage: production · risk: high · autonomy: conservative
-phase: tests   <!-- specify -> scenarios -> contract -> tests -> build -> verify -> observe -> done -->
+phase: build   <!-- specify -> scenarios -> contract -> tests -> build -> verify -> observe -> done -->
 <!-- high-risk/method-defining scope? declare `risk: high` on the slug line above and lower
      the autonomy level with `autonomy: conservative` — the engine refuses an unguarded completion
      (`unguarded_high_risk_auto`, run.md guard). A comment is never a declaration. -->
@@ -291,7 +291,7 @@ Reject → contracted response (all five):
 - `batch_cap_exceeded`  -> `collect_*` stops at `max_batch`/`max_bytes`; a fresh batch begins next loop.
 
 Status: FROZEN @ v1 — approved by Tin Dang 2026-06-14.
-Bundle lowest-confidence flags surfaced at freeze:
+Least-sure flag surfaced at freeze:
   ⚠ [contract·spec] mixed-stream drain preserves C4-fold + H1-BARRIER + everysec invariants exactly —
      if wrong: silent data loss / AOF corruption under crash (the milestone's freeze-first risk).
      Mitigated in shape: control msgs route to `deferred_control` (never in `data`) ⇒ `batch_straddles_control`
