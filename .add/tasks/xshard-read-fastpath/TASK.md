@@ -1,7 +1,7 @@
 # TASK: Recover cross-shard read latency lock-free: adaptive spin-then-park + coalescing + dead-flag cleanup
 
 slug: xshard-read-fastpath · created: 2026-06-13 · stage: production · risk: high · autonomy: conservative
-phase: verify   <!-- specify -> scenarios -> contract -> tests -> build -> verify -> observe -> done -->
+phase: done   <!-- specify -> scenarios -> contract -> tests -> build -> verify -> observe -> done -->
 <!-- high-risk/method-defining scope? declare `risk: high` on the slug line above and lower
      the autonomy level with `autonomy: conservative` — the engine refuses an unguarded completion
      (`unguarded_high_risk_auto`, run.md guard). A comment is never a declaration. -->
