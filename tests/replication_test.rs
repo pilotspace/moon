@@ -82,7 +82,6 @@ async fn start_server() -> (u16, CancellationToken) {
         console_rate_limit: 1000.0,
         console_rate_burst: 2000.0,
         wal_max_checkpoint_lag_ms: 10_000,
-        cross_shard_fast_path: moon::config::CrossShardFastPath::Auto,
         recovery_target_lsn: None,
         recovery_target_time: None,
         manifest_tombstone_retain_epochs: 2,

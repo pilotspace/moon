@@ -11,7 +11,7 @@ use moon::runtime::channel;
 use redis::AsyncCommands;
 use tokio::net::TcpListener;
 
-use moon::config::{CrossShardFastPath, ServerConfig};
+use moon::config::ServerConfig;
 use moon::server::listener;
 use moon::shard::Shard;
 use moon::shard::mesh::{CHANNEL_BUFFER_SIZE, ChannelMesh};
@@ -84,7 +84,6 @@ async fn start_server() -> (u16, CancellationToken) {
         console_rate_limit: 1000.0,
         console_rate_burst: 2000.0,
         wal_max_checkpoint_lag_ms: 10_000,
-        cross_shard_fast_path: CrossShardFastPath::Auto,
         recovery_target_lsn: None,
         recovery_target_time: None,
         manifest_tombstone_retain_epochs: 2,
@@ -188,7 +187,6 @@ async fn start_server_with_pass(password: &str) -> (u16, CancellationToken) {
         console_rate_limit: 1000.0,
         console_rate_burst: 2000.0,
         wal_max_checkpoint_lag_ms: 10_000,
-        cross_shard_fast_path: CrossShardFastPath::Auto,
         recovery_target_lsn: None,
         recovery_target_time: None,
         manifest_tombstone_retain_epochs: 2,
@@ -1382,7 +1380,6 @@ async fn start_server_with_persistence(
         console_rate_limit: 1000.0,
         console_rate_burst: 2000.0,
         wal_max_checkpoint_lag_ms: 10_000,
-        cross_shard_fast_path: CrossShardFastPath::Auto,
         recovery_target_lsn: None,
         recovery_target_time: None,
         manifest_tombstone_retain_epochs: 2,
@@ -2270,7 +2267,6 @@ async fn start_server_with_maxmemory(maxmemory: usize, policy: &str) -> (u16, Ca
         console_rate_limit: 1000.0,
         console_rate_burst: 2000.0,
         wal_max_checkpoint_lag_ms: 10_000,
-        cross_shard_fast_path: CrossShardFastPath::Auto,
         recovery_target_lsn: None,
         recovery_target_time: None,
         manifest_tombstone_retain_epochs: 2,
@@ -2685,7 +2681,6 @@ async fn start_sharded_server(num_shards: usize) -> (u16, CancellationToken) {
         console_rate_limit: 1000.0,
         console_rate_burst: 2000.0,
         wal_max_checkpoint_lag_ms: 10_000,
-        cross_shard_fast_path: CrossShardFastPath::Auto,
         recovery_target_lsn: None,
         recovery_target_time: None,
         manifest_tombstone_retain_epochs: 2,
@@ -3901,7 +3896,6 @@ async fn start_cluster_server() -> (u16, CancellationToken) {
         console_rate_limit: 1000.0,
         console_rate_burst: 2000.0,
         wal_max_checkpoint_lag_ms: 10_000,
-        cross_shard_fast_path: CrossShardFastPath::Auto,
         recovery_target_lsn: None,
         recovery_target_time: None,
         manifest_tombstone_retain_epochs: 2,
@@ -4570,7 +4564,6 @@ async fn start_server_with_aclfile(acl_path: &str) -> (u16, CancellationToken) {
         console_rate_limit: 1000.0,
         console_rate_burst: 2000.0,
         wal_max_checkpoint_lag_ms: 10_000,
-        cross_shard_fast_path: CrossShardFastPath::Auto,
         recovery_target_lsn: None,
         recovery_target_time: None,
         manifest_tombstone_retain_epochs: 2,
