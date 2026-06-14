@@ -1734,7 +1734,8 @@ pub(crate) async fn handle_connection_sharded_monoio<
             // commands in THIS batch. The reply-side spin may engage only for a singleton
             // foreign read; >1 means a pipeline / multi-key fan-out where a synchronous
             // spin would serialize the reads and starve pipelined throughput (s4-P16 −27%).
-            let batch_remote_total: usize = oneshot_futures.iter().map(|(_, meta, _)| meta.len()).sum();
+            let batch_remote_total: usize =
+                oneshot_futures.iter().map(|(_, meta, _)| meta.len()).sum();
             for (target, meta, reply_rx) in oneshot_futures.drain(..) {
                 tracing::trace!(
                     "Shard {}: awaiting cross-shard response (direct oneshot)",
