@@ -61,8 +61,8 @@ use super::{
 /// Handle a single client connection on a sharded (thread-per-core) runtime.
 ///
 /// Runs within a shard's single-threaded Tokio runtime. Has direct mutable access
-/// to the shard's databases via `Arc<ShardDatabases>` (thread-safe: parking_lot RwLock
-/// single-threaded scheduling means no concurrent borrows).
+/// to the shard's databases via the thread-local `ShardSlice` (`!Send`; the
+/// single-threaded ownership IS the safety — no lock, no concurrent borrows).
 ///
 /// Routing logic:
 /// - **Keyless commands** (PING, ECHO, SELECT, etc.): execute locally, zero overhead.
@@ -381,7 +381,6 @@ pub(crate) async fn handle_connection_sharded_inner<
                 // Per-batch dispatch-path accumulators — flushed once at end of
                 // batch so we pay one global atomic per path instead of N.
                 let mut local_dispatches: u32 = 0;
-                let cross_read_fast_dispatches: u32 = 0; // fast-path removed in wave-e2; always 0
                 let mut cross_spsc_dispatches: u32 = 0;
 
                 for frame in batch {
@@ -1570,7 +1569,6 @@ pub(crate) async fn handle_connection_sharded_inner<
                 // Flush per-batch dispatch-path counters — one global atomic
                 // per path instead of N per batch. Short-circuits on 0.
                 crate::admin::metrics_setup::record_dispatch_local_batch(local_dispatches as u64);
-                crate::admin::metrics_setup::record_dispatch_cross_read_fastpath_batch(cross_read_fast_dispatches as u64);
                 crate::admin::metrics_setup::record_dispatch_cross_spsc_batch(cross_spsc_dispatches as u64);
 
                 // Phase 2: Dispatch deferred remote commands (zero-allocation via ResponseSlotPool)
@@ -1633,7 +1631,30 @@ pub(crate) async fn handle_connection_sharded_inner<
                     }
                     let proto_ver = conn.protocol_version;
                     for (meta, target) in reply_futures {
-                        let shard_responses = response_pool.future_for(target).await;
+                        // C2 (xshard-read-fastpath): adaptive idle-gated reply-side spin.
+                        // When this shard is near-idle (xshard_may_spin), busy-poll the
+                        // response slot for a bounded budget to skip the reply-side
+                        // cross-thread wake (the c1 win). The poll is synchronous — it
+                        // holds no borrow across `.await`; on miss it falls through to the
+                        // EXISTING `future_for(...).await` park path unchanged. When the
+                        // gate is closed (busy shard) the path is byte-identical to before.
+                        let _wait_guard = crate::shard::slice::XshardWaitGuard::new();
+                        let shard_responses = {
+                            let mut spun = None;
+                            if crate::shard::slice::xshard_may_spin() {
+                                for _ in 0..crate::shard::slice::XSHARD_SPIN_BUDGET {
+                                    if let Some(r) = response_pool.slot_for(target).try_take() {
+                                        spun = Some(r);
+                                        break;
+                                    }
+                                    core::hint::spin_loop();
+                                }
+                            }
+                            match spun {
+                                Some(r) => r,
+                                None => response_pool.future_for(target).await,
+                            }
+                        };
 
                         // H1-BARRIER: collect (resp_idx, had_aof_bytes) pairs so
                         // we can overwrite write responses on fsync failure below.

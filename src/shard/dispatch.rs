@@ -21,6 +21,26 @@ pub struct ResponseSlotPtr(pub *const ResponseSlot);
 // which outlives all dispatched ShardMessage values.
 unsafe impl Send for ResponseSlotPtr {}
 
+/// One batched cross-shard READ message carrying N independent single-key foreign
+/// reads from DIFFERENT connections on the ORIGIN shard to ONE owner shard. Each
+/// result is routed back to its own connection's response slot.
+///
+/// xshard-read-fastpath C3 (cross-connection coalescing). The TYPE is defined with
+/// C1; the producer (origin-shard accumulation) and consumer (owner-shard drain +
+/// per-slot reply) are wired in the C3 build stage. INVARIANT (load-bearing, proven
+/// by the consistency suite, not a unit test): coalescing groups reads ACROSS
+/// connections only — within a connection, submission order and read-your-writes are
+/// preserved exactly as the current lock-free path (a read is never reordered before
+/// that connection's own acked write).
+pub struct CoalescedReadBatch {
+    /// Logical DB index the batched reads target (all reads in a batch share it).
+    pub db_index: usize,
+    /// Each foreign read: its dispatch frame + the response slot to route the
+    /// reply back to. `SmallVec` inline-stores up to 8 (the common fan-in) with no
+    /// heap allocation; the buffer is reused per event-loop turn, never keyspace-scaled.
+    pub reads: smallvec::SmallVec<[(std::sync::Arc<Frame>, ResponseSlotPtr); 8]>,
+}
+
 /// Lock-free response slot for accumulating cross-shard PUBLISH subscriber counts.
 ///
 /// Instead of N-1 oneshot channels (one per target shard), a single `Arc<PubSubResponseSlot>`

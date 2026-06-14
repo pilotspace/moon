@@ -26,7 +26,7 @@
 //! - The closure passed to `with_shard` or `with_shard_db` MUST NOT re-enter
 //!   either function — doing so causes a `RefCell` double-borrow panic.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::marker::PhantomData;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -210,6 +210,84 @@ impl ShardSlice {
 
 thread_local! {
     static SHARD: RefCell<Option<ShardSlice>> = const { RefCell::new(None) };
+}
+
+// ── Cross-shard reply-wait idle gate (xshard-read-fastpath C1) ─────────────────
+//
+// The shard thread is single-threaded, so this counter needs NO atomic and NO
+// lock — a plain `Cell<u32>`. It tracks how many connections on THIS shard thread
+// are currently blocked in a cross-shard reply-wait. The reply-side adaptive poll
+// (C2) consults `xshard_may_spin()` to decide whether to busy-poll the reply
+// (skipping one cross-thread wake) or park immediately: it spins ONLY when the
+// shard is near-idle, so polling never steals a co-located connection's turn (the
+// spike measured a −48% c100 collapse from an unconditional spin).
+
+thread_local! {
+    /// Connections on this shard thread currently blocked in a cross-shard
+    /// reply-wait. Incremented on entry, decremented on exit (see `XshardWaitGuard`).
+    static XSHARD_INFLIGHT: Cell<u32> = const { Cell::new(0) };
+}
+
+/// Upper bound (INCLUSIVE) on concurrent cross-shard reply-waiters for which the
+/// reply-side spin is still allowed. At or below the gate the requesting
+/// connection is effectively alone, so polling its reply steals no co-located
+/// turn; above it, the path parks immediately. Tuned on bare metal; NOT a CLI flag.
+pub const XSHARD_SPIN_GATE: u32 = 2;
+
+/// Bounded number of poll iterations before the reply-side path falls back to
+/// parking. Caps the busy-loop so a slow owner shard cannot starve this thread.
+pub const XSHARD_SPIN_BUDGET: u32 = 4_096;
+
+/// May the calling connection POLL its cross-shard reply instead of parking?
+///
+/// True when this shard thread has `<= XSHARD_SPIN_GATE` in-flight cross-shard
+/// reply-waiters — i.e. it is near-idle and the spin steals no co-located work.
+/// Reads a thread-local `Cell<u32>`: no atomic, no lock, no syscall.
+#[inline]
+pub fn xshard_may_spin() -> bool {
+    XSHARD_INFLIGHT.with(|c| c.get() <= XSHARD_SPIN_GATE)
+}
+
+/// Test-only: current in-flight cross-shard reply-waiter count on this thread.
+#[cfg(test)]
+pub fn xshard_inflight_count() -> u32 {
+    XSHARD_INFLIGHT.with(|c| c.get())
+}
+
+/// RAII guard that marks the current connection as an in-flight cross-shard
+/// reply-waiter for its lifetime: increments `XSHARD_INFLIGHT` on construction,
+/// decrements on drop. Wrap every cross-shard reply-wait in one so the idle gate
+/// reflects reality even across early returns / cancellation. `!Send` in spirit —
+/// the thread-local it guards is per-thread and the guard must not cross threads.
+#[must_use = "the guard must be held for the duration of the reply-wait; dropping it early ends the in-flight window"]
+pub struct XshardWaitGuard {
+    // Private field: construct only via `new()`, and a `PhantomData<Rc<()>>`-free
+    // marker is unnecessary because the type holds no data that could be moved
+    // across threads; callers keep it on the shard thread's stack.
+    _priv: (),
+}
+
+impl XshardWaitGuard {
+    /// Enter a cross-shard reply-wait: increment this thread's in-flight count.
+    #[inline]
+    pub fn new() -> Self {
+        XSHARD_INFLIGHT.with(|c| c.set(c.get().saturating_add(1)));
+        Self { _priv: () }
+    }
+}
+
+impl Default for XshardWaitGuard {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for XshardWaitGuard {
+    #[inline]
+    fn drop(&mut self) {
+        XSHARD_INFLIGHT.with(|c| c.set(c.get().saturating_sub(1)));
+    }
 }
 
 // ── Lifecycle API ─────────────────────────────────────────────────────────────

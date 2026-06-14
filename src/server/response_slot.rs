@@ -119,6 +119,31 @@ impl ResponseSlot {
         Poll::Pending
     }
 
+    /// Non-blocking take: returns the response iff the slot is already FILLED,
+    /// WITHOUT registering a waker. For the reply-side idle-gated spin
+    /// (xshard-read-fastpath C2): the caller is busy-polling, not parking, so it
+    /// must not register a waker. Single consumer (connection owner thread).
+    ///
+    /// Live under the tokio runtime (handler_sharded's `ResponseSlotPool` reply
+    /// path). Dead under monoio, which replies via a flume oneshot rather than a
+    /// response slot — hence the cfg-gated allow keeps the dead-code check active
+    /// where the method is actually used.
+    #[inline]
+    #[cfg_attr(not(feature = "runtime-tokio"), allow(dead_code))]
+    pub(crate) fn try_take(&self) -> Option<Vec<Frame>> {
+        if self.state.load(Ordering::Acquire) == FILLED {
+            // SAFETY: Acquire load confirmed FILLED, happens-after the producer's
+            // Release store in fill(), so the UnsafeCell data write is visible.
+            // Single consumer ensures no concurrent read. Mirrors poll_take's fast path.
+            #[allow(clippy::unwrap_used)] // fill() always writes Some before the FILLED transition
+            let data = unsafe { (*self.data.get()).take().unwrap() };
+            self.state.store(EMPTY, Ordering::Release);
+            Some(data)
+        } else {
+            None
+        }
+    }
+
     /// Force-reset the slot to EMPTY, clearing any pending data and waker.
     ///
     /// Used after connection errors to ensure clean state for potential reuse.
