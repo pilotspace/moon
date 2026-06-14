@@ -341,6 +341,18 @@ Plan (one test per scenario, asserting behavior not internals):
 
 Tests live in: `tests/wal_group_commit.rs` (integration) + `src/persistence/aof/group_commit.rs` unit
 tests · MUST run red (symbols/behavior missing) before Build.
+
+RED CONFIRMED 2026-06-14 (VM, monoio): `cargo test --test wal_group_commit --no-run` fails with
+exactly `error[E0432]: unresolved import moon::persistence::aof::group_commit — could not find
+group_commit in aof` — the right reason (missing implementation, harness otherwise compiles). 9 seam
+tests cover: collect (control-first, stop-at-control+order, max_batch, max_bytes) + commit
+(one-fsync-many-acks+ordering, write-fail, fsync-fail+ack-after, everysec-no-fsync, barrier-covers-appends).
+The end-to-end durability scenarios (every_acked_write_survives_crash, rewrite-during-writes) are
+gated on the integration crash-matrix + a new concurrent-writers SIGKILL test (added at build) — a unit
+mock cannot prove on-disk survival across a real kill.
+NOTE (non-behavioral): §3's `<W: Write>` + "flush()+sync_data()" is realized as a sync-capable
+`GroupCommitSink { write_all; sync }` trait so the single fsync is mockable/countable; the FROZEN
+durability behavior (one fsync after all writes, ack-after-fsync, the 5 reject mappings) is unchanged.
 <!-- declare paths as backticked tokens on this line: `./…` = this task dir ·
      a token with "/" = project root · a bare name = sibling of the previous
      token's dir · a directory counts its *.py files (non-recursive); reports
