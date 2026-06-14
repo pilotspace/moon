@@ -338,3 +338,318 @@ fn commit_barrier_covers_preceding_appends() {
     assert_eq!(outcome.synced, 1, "the barrier AppendSync is acked");
     assert_eq!(rx.try_recv(), Ok(AofAck::Synced));
 }
+
+// ===========================================================================
+// INTEGRATION — real server, SIGKILL, replay (the §4 durability scenarios).
+//
+// A unit mock cannot prove on-disk survival across a real kill, so these spawn
+// the release binary under `appendfsync=always` and drive CONCURRENT durable
+// writers (the cell group commit lives in), then assert every acked write
+// survives a SIGKILL and nothing is double-applied on replay.
+//
+// `#[ignore]` — require the release binary at ./target/release/moon + redis-cli
+// on PATH. Run (monoio default, matches CI release build):
+//   cargo build --release
+//   cargo test --release --test wal_group_commit -- --ignored
+// Tokio runtime:
+//   cargo build --release --no-default-features \
+//     --features runtime-tokio,jemalloc,graph,text-index
+//   cargo test --release --no-default-features \
+//     --features runtime-tokio,jemalloc,graph,text-index \
+//     --test wal_group_commit -- --ignored
+// ===========================================================================
+#[cfg(unix)]
+mod integration {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::TcpStream;
+    use std::process::{Child, Command, Stdio};
+    use std::time::Duration;
+
+    fn unique_port() -> u16 {
+        use std::net::TcpListener;
+        let l = TcpListener::bind("127.0.0.1:0").expect("bind port 0");
+        let p = l.local_addr().expect("local addr").port();
+        drop(l);
+        p
+    }
+
+    fn unique_dir(suffix: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!(
+            "moon-wal-gc-{}-{}-{}",
+            std::process::id(),
+            suffix,
+            nanos
+        ))
+    }
+
+    fn start_moon(port: u16, dir: &std::path::Path, shards: u16, fsync: &str) -> Child {
+        Command::new("./target/release/moon")
+            .args([
+                "--port",
+                &port.to_string(),
+                "--shards",
+                &shards.to_string(),
+                "--appendonly",
+                "yes",
+                "--appendfsync",
+                fsync,
+                "--dir",
+            ])
+            .arg(dir)
+            .stdout(std::fs::File::create(dir.join("moon.stdout.log")).expect("create stdout log"))
+            .stderr(std::fs::File::create(dir.join("moon.stderr.log")).expect("create stderr log"))
+            .spawn()
+            .expect("spawn moon — run `cargo build --release` first")
+    }
+
+    fn wait_for_port(port: u16) {
+        for _ in 0..80 {
+            if TcpStream::connect(format!("127.0.0.1:{}", port)).is_ok() {
+                std::thread::sleep(Duration::from_millis(200));
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        panic!("moon did not start within 8s on port {}", port);
+    }
+
+    fn sigkill(child: &mut Child) {
+        let pid = child.id() as i32;
+        // SAFETY: `pid` is this test's own freshly-spawned child; SIGKILL has no
+        // userspace side effects beyond terminating it. We then reap it.
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
+        let _ = child.wait();
+    }
+
+    /// Read one RESP reply line and return it trimmed (e.g. ":42", "+OK", "-ERR ...").
+    fn read_reply_line(reader: &mut BufReader<TcpStream>) -> Option<String> {
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(0) => None,
+            Ok(_) => Some(line.trim_end_matches("\r\n").to_string()),
+            Err(_) => None,
+        }
+    }
+
+    /// Open a connection and issue `n` sequential `INCR key` commands, each one
+    /// sent only AFTER the previous reply is read (so under `appendfsync=always`
+    /// every counted reply observed an fsync). Returns the count of integer
+    /// replies received — the number of ACKED increments for this key.
+    fn incr_acked(port: u16, key: &str, n: usize) -> usize {
+        let stream = match TcpStream::connect(format!("127.0.0.1:{}", port)) {
+            Ok(s) => s,
+            Err(_) => return 0,
+        };
+        stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
+        let mut writer = stream.try_clone().expect("clone stream");
+        let mut reader = BufReader::new(stream);
+        let cmd = format!("*2\r\n$4\r\nINCR\r\n${}\r\n{}\r\n", key.len(), key);
+        let mut acked = 0usize;
+        for _ in 0..n {
+            if writer.write_all(cmd.as_bytes()).is_err() {
+                break;
+            }
+            if writer.flush().is_err() {
+                break;
+            }
+            match read_reply_line(&mut reader) {
+                Some(l) if l.starts_with(':') => acked += 1,
+                _ => break, // error / disconnect — stop counting at the first non-ack
+            }
+        }
+        acked
+    }
+
+    /// GET an integer counter; returns its value or -1 on miss/parse failure.
+    fn get_int(port: u16, key: &str) -> i64 {
+        let out = Command::new("redis-cli")
+            .args(["-p", &port.to_string(), "GET", key])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("redis-cli GET");
+        String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse()
+            .unwrap_or(-1)
+    }
+
+    /// M2 every_acked_write_survives_crash — N concurrent connections each drive
+    /// M durable INCRs on a distinct counter under `appendfsync=always` (so the
+    /// writer coalesces concurrent AppendSyncs into group-committed fsyncs). All
+    /// threads are joined (every counted INCR is acked ⇒ fsynced) BEFORE the
+    /// SIGKILL, so recovery MUST show each counter == its acked count — every
+    /// acked write durable, none lost, none double-applied (INCR is non-idempotent).
+    fn concurrent_writers_survive_sigkill(shards: u16, tag: &str) {
+        const WRITERS: usize = 16;
+        const PER_WRITER: usize = 60;
+
+        let port = unique_port();
+        let dir = unique_dir(tag);
+        std::fs::create_dir_all(&dir).expect("create test dir");
+
+        let mut child = start_moon(port, &dir, shards, "always");
+        wait_for_port(port);
+
+        // Fan out WRITERS concurrent durable-write loops; collect per-key acked counts.
+        let handles: Vec<_> = (0..WRITERS)
+            .map(|i| {
+                let key = format!("gc:{{{}}}:{}", i, i);
+                std::thread::spawn(move || (key.clone(), incr_acked(port, &key, PER_WRITER)))
+            })
+            .collect();
+        let acked: Vec<(String, usize)> = handles
+            .into_iter()
+            .map(|h| h.join().expect("writer thread"))
+            .collect();
+
+        // Every counted INCR was acked ⇒ fsynced under Always. Kill WITHOUT a
+        // quiescing sleep: the durability contract is that each ack already saw disk.
+        sigkill(&mut child);
+
+        // -- recover --
+        let mut child2 = start_moon(port, &dir, shards, "always");
+        wait_for_port(port);
+
+        let mut wrong: Vec<String> = Vec::new();
+        for (key, want) in &acked {
+            let got = get_int(port, key);
+            if got != *want as i64 {
+                wrong.push(format!("{}: want={} got={}", key, want, got));
+            }
+        }
+        sigkill(&mut child2);
+
+        assert!(
+            wrong.is_empty(),
+            "group-commit durability ({} shards): {} counters wrong after SIGKILL+recovery. \
+             A loss under-counts, a double-apply over-counts. Sample: {:?}",
+            shards,
+            wrong.len(),
+            wrong.iter().take(8).collect::<Vec<_>>(),
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// M2 — TopLevel path (shards=1): all durable writes converge on ONE writer
+    /// (the `commit_group_commit_batch` path), maximizing batch coalescing.
+    #[test]
+    #[ignore]
+    fn concurrent_writers_all_acked_survive_sigkill_top_level() {
+        concurrent_writers_survive_sigkill(1, "concurrent-s1");
+    }
+
+    /// M2 — PerShard path (shards=4): writes spread across per-shard framed
+    /// writers; recovery merges. Exercises the production default layout.
+    #[test]
+    #[ignore]
+    fn concurrent_writers_all_acked_survive_sigkill_per_shard() {
+        concurrent_writers_survive_sigkill(4, "concurrent-s4");
+    }
+
+    /// M4 lone_writer_no_added_latency — with exactly ONE writer (C=1) every
+    /// durable write is a batch of 1: it fsyncs immediately and is acked Synced.
+    /// A SIGKILL with no quiescing sleep must leave every acked INCR on disk.
+    #[test]
+    #[ignore]
+    fn lone_writer_fsyncs_immediately() {
+        let port = unique_port();
+        let dir = unique_dir("lone");
+        std::fs::create_dir_all(&dir).expect("create test dir");
+
+        let mut child = start_moon(port, &dir, 1, "always");
+        wait_for_port(port);
+
+        let acked = incr_acked(port, "lone:counter", 200);
+        assert!(acked > 0, "lone writer made no progress");
+        sigkill(&mut child);
+
+        let mut child2 = start_moon(port, &dir, 1, "always");
+        wait_for_port(port);
+        let got = get_int(port, "lone:counter");
+        sigkill(&mut child2);
+
+        assert_eq!(
+            got, acked as i64,
+            "lone (C=1) writer: counter after SIGKILL+recovery = {} (expected {} acked)",
+            got, acked,
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// M3 control_message_breaks_the_batch — BGREWRITEAOF while many durable
+    /// writes are in flight. The Rewrite control must flush the in-progress batch
+    /// (write + fsync + ack) BEFORE it is handled, and post-rewrite replay must
+    /// lose no acked write. Writers are joined (all acked ⇒ durable) before the
+    /// kill, so each counter MUST recover exactly.
+    #[test]
+    #[ignore]
+    fn rewrite_during_active_writes_no_loss() {
+        const WRITERS: usize = 12;
+        const PER_WRITER: usize = 80;
+
+        let port = unique_port();
+        let dir = unique_dir("rewrite");
+        std::fs::create_dir_all(&dir).expect("create test dir");
+
+        let mut child = start_moon(port, &dir, 4, "always");
+        wait_for_port(port);
+
+        // Fire BGREWRITEAOF repeatedly from a side thread while writers run, so a
+        // Rewrite control message lands mid-drain on at least one writer.
+        let rewrite_port = port;
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop2 = stop.clone();
+        let rewriter = std::thread::spawn(move || {
+            while !stop2.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = Command::new("redis-cli")
+                    .args(["-p", &rewrite_port.to_string(), "BGREWRITEAOF"])
+                    .output();
+                std::thread::sleep(Duration::from_millis(40));
+            }
+        });
+
+        let handles: Vec<_> = (0..WRITERS)
+            .map(|i| {
+                let key = format!("rw:{{{}}}:{}", i, i);
+                std::thread::spawn(move || (key.clone(), incr_acked(port, &key, PER_WRITER)))
+            })
+            .collect();
+        let acked: Vec<(String, usize)> = handles
+            .into_iter()
+            .map(|h| h.join().expect("writer thread"))
+            .collect();
+
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = rewriter.join();
+
+        sigkill(&mut child);
+
+        let mut child2 = start_moon(port, &dir, 4, "always");
+        wait_for_port(port);
+        let mut wrong: Vec<String> = Vec::new();
+        for (key, want) in &acked {
+            let got = get_int(port, key);
+            if got != *want as i64 {
+                wrong.push(format!("{}: want={} got={}", key, want, got));
+            }
+        }
+        sigkill(&mut child2);
+
+        assert!(
+            wrong.is_empty(),
+            "BGREWRITEAOF during active durable writes: {} counters wrong after recovery. \
+             The control message must flush its batch before the rewrite (no loss, no double-apply). \
+             Sample: {:?}",
+            wrong.len(),
+            wrong.iter().take(8).collect::<Vec<_>>(),
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
