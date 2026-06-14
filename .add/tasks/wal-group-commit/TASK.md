@@ -1,7 +1,7 @@
 # TASK: WAL group commit: batch concurrent pending writes into one fsync under appendfsync=always
 
 slug: wal-group-commit · created: 2026-06-14 · stage: production · risk: high · autonomy: conservative
-phase: build   <!-- specify -> scenarios -> contract -> tests -> build -> verify -> observe -> done -->
+phase: verify   <!-- specify -> scenarios -> contract -> tests -> build -> verify -> observe -> done -->
 <!-- high-risk/method-defining scope? declare `risk: high` on the slug line above and lower
      the autonomy level with `autonomy: conservative` — the engine refuses an unguarded completion
      (`unguarded_high_risk_auto`, run.md guard). A comment is never a declaration. -->
@@ -374,23 +374,53 @@ Constraints: do NOT change any test or the contract; allow-list packages only; a
 
 ## 6 · VERIFY — evidence + non-functional review ▸ docs/08-step-6-verify.md
 
-- [ ] all tests pass
-- [ ] coverage did not decrease
-- [ ] no test or contract was altered during build
-- [ ] concurrency / timing of the risky operation is safe
-- [ ] no exposed secrets, injection openings, or unexpected dependencies
-- [ ] layering & dependencies follow CONVENTIONS.md
-- [ ] a person reviewed and approved the change
+- [x] all tests pass — dual-runtime, VM-local clone `~/moon-gc` @ `12681b3` (home volume; shared-volume diskfull avoided):
+      · seam unit 9/9 (tokio) · AOF lib 94 (tokio) / 90 (monoio) · integration crash 4/4 ×both runtimes
+        (incl. `concurrent_writers_all_acked_survive_sigkill_top_level` — exercises the Finding-2 tokio-TopLevel latch)
+      · crash-matrix 5/5 ×both (`crash_matrix_per_shard_aof` 3, `..._bgrewriteaof` 2) · consistency 197/197 @1/4/12
+- [x] coverage did not decrease — +4 integration crash tests added at build; the tokio-TopLevel torn-write path is now
+      covered by the top_level SIGKILL test; no test removed or weakened.
+- [~] no test or contract was altered during build — §3 CONTRACT unchanged (FROZEN @v1). ONE frozen §4 test
+      (`commit_write_fail_acks_write_failed`) got a HUMAN-APPROVED intent-preserving fix: it double-consumed a flume
+      `bounded(1)` (use-after-consume) — the test was wrong, my impl was correct (both waiters acked `WriteFailed`).
+      Fixed by reading each receiver once; all 3 assertions kept. NOT a weakening. (Surfaced at gate.)
+- [x] concurrency / timing safe — fsync-before-ack preserved; the `write_error` torn-write latch is now UNIFORM across
+      all 4 writer loops (Finding 2 closed in `2750d1c`); no lock held across `.await`; zero new cross-thread lock;
+      the flume oneshot ack pattern is unchanged; `ack_batch` is the single-sourced ack-after-fsync ordering.
+- [x] no exposed secrets, injection openings, or unexpected dependencies — internal mechanism only; zero new deps.
+- [x] layering & dependencies follow conventions — `group_commit.rs` is a pure runtime-free seam under
+      `persistence/aof/`; the loops call it; no new module edges; clippy ×2 + `fmt` clean; zero new `unsafe`.
 
 ### Deep checks — do not skim (fill the path that applies; the resolver judges which)
-- [ ] WIRING (code) — every new symbol is referenced; record where / how confirmed
-- [ ] DEAD-CODE (code) — no new unused or orphaned symbol introduced
-- [ ] SEMANTIC (prose / non-code) — read in full, not skimmed: <what read · what confirmed>
+- [x] WIRING (code) — every group_commit symbol referenced: `collect_group_commit_batch`/`commit_group_commit_batch`/
+      `GroupCommitSink`/`CommitOutcome`/`AOF_GROUP_COMMIT_MAX_{BATCH,BYTES}` from `writer_task.rs` + the seam tests;
+      `ack_batch`/`BatchAck`/`msg_body` `pub(crate)` from `writer_task.rs`; `is_control`/`msg_body_len` private,
+      used in-module. Confirmed by grep + clippy-clean ×2 runtimes.
+- [x] DEAD-CODE (code) — no new orphan; clippy `-D warnings` clean on default (monoio) AND tokio,jemalloc.
+- [x] SEMANTIC — n/a (code task; no prose contract surface).
+
+### M0/M1 performance evidence — instrument limitation (NOT a correctness gap)
+- Mechanism of the win (K `AppendSync` → exactly ONE fsync, ack-after-fsync) is proven DETERMINISTICALLY by the seam
+  unit test `commit_one_fsync_many_acks`.
+- Empirical M0→M1 RELATIVE throughput delta is NOT resolvable on the OrbStack VM. Baseline (`3150f8b`, one-fsync-per-
+  AppendSync) vs HEAD (`12681b3`), `appendfsync=always`, fresh-server best-of-3, redis-benchmark `-P16`:
+      shards=1 C=32: base 934K / head 917K = 0.98×   ·   shards=4 C=32: 892K / 917K = 1.03×
+      shards=1 conc sweep C∈{32,128,256,512}: 1.00× / 1.16× / 0.90× / 1.00×  (no trend; within the ±~10% VM noise the
+      everysec controls also showed: 1.03×, 1.12×).
+  Root cause: the virtio disk's `fsync` is near-free — `always` runs at ~0.9M RPS (NOT the 11× penalty 135K→12K the
+  feature targets), so the writer drains each `AppendSync` before the next arrives ⇒ a coalescing batch never forms
+  (batch≈1) ⇒ nothing to amortize. This is exactly §1 assumption #4 (lowest-confidence perf flag): "confirm the
+  OrbStack VM instrument is valid for this metric before anchoring M1" — now CONFIRMED INVALID. The M0/M1 ratio
+  requires a slow-fsync instrument (real disk / GCloud — noted blocked). Deferred to §7 OBSERVE.
 
 ### GATE RECORD
-Outcome: <PASS | RISK-ACCEPTED | HARD-STOP>
-If RISK-ACCEPTED -> owner: <name> · ticket: <link> · expires: <date>   (never for a security gap)
-Reviewed by: <name> · date: <date>
+Outcome: PENDING — conservative autonomy → STOP for human decision (no auto-PASS).
+  Correctness · durability (M2) · ordering (M3) · no-regression (M4 correctness) · all 5 Rejects: PROVEN, green, both
+  runtimes. The throughput Must (M0/M1): mechanism proven (unit), empirical ratio un-measurable on the only available
+  instrument (free-fsync VM) — a documented, freeze-flagged instrument gap, NOT a security or correctness finding.
+  Human call: PASS (accept mechanism proof + correctness; defer the real-disk RPS ratio to OBSERVE) · or RISK-ACCEPTED
+  on the empirical perf number · or hold for a slow-disk bench.
+Reviewed by: <pending — Tin Dang> · date: 2026-06-14
 
 <!-- A security finding is ALWAYS HARD-STOP. Record exactly one outcome — no silent pass. -->
 
@@ -398,10 +428,24 @@ Reviewed by: <name> · date: <date>
 
 ## 7 · OBSERVE — feed the next loop ▸ docs/09-the-loop.md
 
-Watch (reuse scenarios as monitors): <error rate / per-rejection rate / latency>
-Spec delta for the next loop: <what production taught you>
+Watch (reuse scenarios as monitors):
+- `moon_aof_fsync_duration_microseconds_count` per N durable writes → effective batch size = N / fsync_count
+  (the direct mechanism monitor; <1 fsync per write under `always`+concurrency is the win materializing).
+- `AOF_FSYNC_ERR` / `WriteFailed` ack rate (reject-path health) · everysec 1s-deadline tail-loss at SIGKILL (M4 control).
+Spec delta for the next loop:
+- The M0/M1 throughput Must is only observable on a SLOW-fsync instrument. The OrbStack virtio disk drains each
+  `AppendSync` before the next arrives (batch≈1), so the coalescing win is STRUCTURALLY unmeasurable there — measure the
+  RPS ratio on GCloud / a real disk (or an O_DIRECT / fsync-delay harness) BEFORE anchoring the perf number. Until then
+  the win is asserted by the deterministic seam test + the on-disk crash-survival suites, not by a VM RPS delta.
 
 ### Competency deltas
-What did this loop teach the foundation? One line each, tagged by competency
-(`DDD · SDD · UDD · TDD · ADD`), status `open`, with evidence. See the `add` skill's `deltas.md`.
-<!-- e.g.  - [DDD · open] the model missed multi-tenancy (evidence: scenario_x failed) -->
+- [TDD · open] a frozen RED test can itself be wrong: `commit_write_fail_acks_write_failed` double-consumed a flume
+  `bounded(1)` (use-after-consume) — the fix was intent-preserving + human-approved, never a weakening
+  (evidence: failed `left: Err(Disconnected)` vs `right: Ok(WriteFailed)`; my impl acked both waiters WriteFailed).
+- [SDD · open] the contract invariant "`CommitOutcome.write_failed` ⇒ the latch must engage" applied to all 4 writer
+  loops, but the pre-existing tokio-TopLevel loop never carried a `write_error` latch (nor the fsync-fail injection) —
+  group commit made the latent durability gap explicit (evidence: adversarial Finding 2 @0.97; fixed `2750d1c`).
+- [ADD · open] a perf Must can be un-measurable on the only available instrument: the OrbStack VM's near-free fsync
+  makes the group-commit win structurally invisible (batch≈1; `always`≈0.9M RPS, no 11× penalty) — §1 ranked exactly
+  this risk lowest-confidence (assumption #4); confirm instrument validity BEFORE committing to a perf Must
+  (evidence: 0.98× ratio, conc-sweep no-trend within ±10% VM noise).
