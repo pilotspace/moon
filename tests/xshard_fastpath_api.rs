@@ -14,7 +14,10 @@
 //!
 //! Running:  cargo test --test xshard_fastpath_api
 
-use moon::shard::slice::{XSHARD_SPIN_GATE, XshardWaitGuard, xshard_may_spin};
+use moon::shard::slice::{
+    XSHARD_SPIN_GATE, XSHARD_SPIN_MAX_BATCH_REMOTE, XshardWaitGuard, xshard_may_spin,
+    xshard_should_spin,
+};
 
 /// xrf1 — a near-idle shard (no in-flight cross-shard reply-waiters on this thread)
 /// MUST allow the reply-side spin. This is the entire c1 latency win: when the
@@ -68,6 +71,54 @@ fn idle_gate_boundary_is_inclusive() {
     guards.push(XshardWaitGuard::new()); // gate + 1
     assert!(!xshard_may_spin(), "one waiter past the gate closes it");
     drop(guards);
+}
+
+/// xrf1 / reject shard_starvation (pipeline regime) — the spin must NOT engage for a
+/// pipelined / multi-key batch even on an otherwise-idle shard. This is the §3 flag-#1
+/// mitigation: a synchronous spin serializes pipelined cross-shard reads and starves
+/// throughput (measured −27% on s4-P16 before this gate). `xshard_should_spin` ANDs the
+/// batch-depth gate with the inflight gate, so a singleton read on an idle shard spins
+/// while any pipeline parks.
+#[test]
+fn batch_gate_blocks_spin_for_pipelined_batch() {
+    // Idle shard (0 in-flight waiters), so only the batch-depth gate is in play.
+    assert!(
+        xshard_should_spin(1),
+        "a singleton cross-shard read on an idle shard must spin (the c1 win)"
+    );
+    assert!(
+        !xshard_should_spin(2),
+        "two cross-shard reads in the batch ⇒ pipelined ⇒ must park (no serializing spin)"
+    );
+    assert!(
+        !xshard_should_spin(16),
+        "a P16 fan-out must park — never serialize the pipeline behind per-read spins"
+    );
+    // The singleton bound is exactly 1 (the only depth at which the spin is safe).
+    assert_eq!(
+        XSHARD_SPIN_MAX_BATCH_REMOTE, 1,
+        "only a single outstanding cross-shard read may spin"
+    );
+}
+
+/// xrf1 — the two gates compose: a singleton batch still parks when the shard is busy
+/// with other cross-shard waiters (inflight gate dominates), proving neither gate alone
+/// is sufficient and `xshard_should_spin` requires BOTH.
+#[test]
+fn batch_gate_and_inflight_gate_compose() {
+    let mut guards = Vec::new();
+    for _ in 0..=XSHARD_SPIN_GATE {
+        guards.push(XshardWaitGuard::new()); // gate + 1 ⇒ inflight gate closed
+    }
+    assert!(
+        !xshard_should_spin(1),
+        "even a singleton read must park when the shard already has > gate waiters"
+    );
+    drop(guards);
+    assert!(
+        xshard_should_spin(1),
+        "singleton read on a now-idle shard spins again once waiters drain"
+    );
 }
 
 /// xrf2 — the cross-connection coalescing message type exists and is referenceable.

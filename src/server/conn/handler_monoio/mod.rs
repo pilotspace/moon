@@ -1730,6 +1730,11 @@ pub(crate) async fn handle_connection_sharded_monoio<
             // swf0 on both drivers. The previous pending_wakers relay assumed this
             // was impossible and polled on the shard loop's ~1ms tick — the relay
             // sweep still runs in the event loop, but this path no longer uses it.
+            // C2 pipeline guard (see XSHARD_SPIN_MAX_BATCH_REMOTE): total cross-shard
+            // commands in THIS batch. The reply-side spin may engage only for a singleton
+            // foreign read; >1 means a pipeline / multi-key fan-out where a synchronous
+            // spin would serialize the reads and starve pipelined throughput (s4-P16 −27%).
+            let batch_remote_total: usize = oneshot_futures.iter().map(|(_, meta, _)| meta.len()).sum();
             for (target, meta, reply_rx) in oneshot_futures.drain(..) {
                 tracing::trace!(
                     "Shard {}: awaiting cross-shard response (direct oneshot)",
@@ -1762,7 +1767,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                         // the path is byte-identical to before (immediate park).
                         let _wait_guard = crate::shard::slice::XshardWaitGuard::new();
                         let mut spun = None;
-                        if crate::shard::slice::xshard_may_spin() {
+                        if crate::shard::slice::xshard_should_spin(batch_remote_total) {
                             for _ in 0..crate::shard::slice::XSHARD_SPIN_BUDGET {
                                 match reply_rx.try_recv() {
                                     Ok(value) => {

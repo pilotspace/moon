@@ -1630,18 +1630,23 @@ pub(crate) async fn handle_connection_sharded_inner<
                         }
                     }
                     let proto_ver = conn.protocol_version;
+                    // C2 pipeline guard: total cross-shard commands in THIS batch. The spin
+                    // may engage only for a singleton foreign read; >1 means a pipeline /
+                    // multi-key fan-out, where a synchronous spin would serialize the reads
+                    // and starve pipelined throughput (s4-P16 −27%). See XSHARD_SPIN_MAX_BATCH_REMOTE.
+                    let batch_remote_total: usize = reply_futures.iter().map(|(meta, _)| meta.len()).sum();
                     for (meta, target) in reply_futures {
                         // C2 (xshard-read-fastpath): adaptive idle-gated reply-side spin.
-                        // When this shard is near-idle (xshard_may_spin), busy-poll the
-                        // response slot for a bounded budget to skip the reply-side
-                        // cross-thread wake (the c1 win). The poll is synchronous — it
-                        // holds no borrow across `.await`; on miss it falls through to the
-                        // EXISTING `future_for(...).await` park path unchanged. When the
-                        // gate is closed (busy shard) the path is byte-identical to before.
+                        // When this shard is near-idle (xshard_may_spin) AND this batch holds a
+                        // single cross-shard read, busy-poll the response slot for a bounded
+                        // budget to skip the reply-side cross-thread wake (the c1 win). The poll
+                        // is synchronous — it holds no borrow across `.await`; on miss it falls
+                        // through to the EXISTING `future_for(...).await` park path unchanged.
+                        // When the gate is closed (busy/pipelined shard) the path is byte-identical.
                         let _wait_guard = crate::shard::slice::XshardWaitGuard::new();
                         let shard_responses = {
                             let mut spun = None;
-                            if crate::shard::slice::xshard_may_spin() {
+                            if crate::shard::slice::xshard_should_spin(batch_remote_total) {
                                 for _ in 0..crate::shard::slice::XSHARD_SPIN_BUDGET {
                                     if let Some(r) = response_pool.slot_for(target).try_take() {
                                         spun = Some(r);

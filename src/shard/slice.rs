@@ -238,6 +238,20 @@ pub const XSHARD_SPIN_GATE: u32 = 2;
 /// parking. Caps the busy-loop so a slow owner shard cannot starve this thread.
 pub const XSHARD_SPIN_BUDGET: u32 = 4_096;
 
+/// Max cross-shard commands in the CURRENT connection batch for which the reply-side
+/// spin is allowed — the call site gates on `batch_remote <= this && xshard_may_spin()`.
+///
+/// The spin is SYNCHRONOUS (it blocks the shard thread, which never yields mid-spin), so
+/// it must engage ONLY for a singleton foreign read (the c1 win). When a batch carries
+/// multiple cross-shard reads — a pipeline (P>1) or a multi-key fan-out — spinning
+/// SERIALIZES them behind per-read thread-blocks and starves pipelined throughput
+/// (measured −27% on s4-P16 best-of-7). The `XSHARD_INFLIGHT` gate alone cannot catch
+/// this: a synchronous spin never yields, so co-located waiters never register as
+/// in-flight for each other and the gate stays falsely open. This is the §3 contract
+/// flag-#1 reserved mitigation ("also gate on … other ready work"), realised as the
+/// cheap, shard-local batch-depth signal instead of an SPSC-inbox probe.
+pub const XSHARD_SPIN_MAX_BATCH_REMOTE: usize = 1;
+
 /// May the calling connection POLL its cross-shard reply instead of parking?
 ///
 /// True when this shard thread has `<= XSHARD_SPIN_GATE` in-flight cross-shard
@@ -246,6 +260,18 @@ pub const XSHARD_SPIN_BUDGET: u32 = 4_096;
 #[inline]
 pub fn xshard_may_spin() -> bool {
     XSHARD_INFLIGHT.with(|c| c.get() <= XSHARD_SPIN_GATE)
+}
+
+/// The full reply-side spin decision for the current batch: spin only when the batch
+/// holds at most `XSHARD_SPIN_MAX_BATCH_REMOTE` cross-shard commands (singleton — not a
+/// pipeline) AND the shard is near-idle (`xshard_may_spin`). Both reply-wait sites
+/// (monoio + tokio) call THIS, so the two regimes the spin must avoid — pipelined
+/// fan-out (batch gate) and concurrent waiters (inflight gate) — are enforced in one
+/// place. `batch_remote` is the count of cross-shard commands in the connection's
+/// current batch (cheap shard-local state; no atomic, no lock).
+#[inline]
+pub fn xshard_should_spin(batch_remote: usize) -> bool {
+    batch_remote <= XSHARD_SPIN_MAX_BATCH_REMOTE && xshard_may_spin()
 }
 
 /// Test-only: current in-flight cross-shard reply-waiter count on this thread.
