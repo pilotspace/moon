@@ -1,7 +1,7 @@
 {
   "project": "moon",
   "stage": "production",
-  "active_task": "wal-group-commit",
+  "active_task": "ft-search-off-eventloop",
   "active_milestone": "v2-performance",
   "tasks": {
     "hotpath-lock-quickwins": {
@@ -68,6 +68,15 @@
       "created": "2026-06-14T06:54:39+00:00",
       "updated": "2026-06-14T16:20:23+00:00",
       "flag_verified": true
+    },
+    "ft-search-off-eventloop": {
+      "title": "FT.SEARCH off-event-loop: a heavy vector/text query must not stall the shard's 1ms tick or co-located commands",
+      "phase": "specify",
+      "gate": "none",
+      "milestone": "v2-performance",
+      "depends_on": [],
+      "created": "2026-06-15T01:43:18+00:00",
+      "updated": "2026-06-15T01:43:18+00:00"
     }
   },
   "milestones": {
@@ -89,7 +98,7 @@
     }
   },
   "created": "2026-06-11T03:18:21+00:00",
-  "updated": "2026-06-14T16:20:23+00:00",
+  "updated": "2026-06-15T01:43:18+00:00",
   "setup": {
     "locked": true,
     "locked_at": "2026-06-11T03:28:00+00:00",
