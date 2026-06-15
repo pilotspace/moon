@@ -1,8 +1,8 @@
 {
   "project": "moon",
   "stage": "production",
-  "active_task": "ft-search-off-eventloop",
-  "active_milestone": "v2-performance",
+  "active_task": "ft-yield-costfree-monoio",
+  "active_milestone": "v2-1-throughput-polish",
   "tasks": {
     "hotpath-lock-quickwins": {
       "title": "Eliminate per-command global locks & syscall-level quick wins",
@@ -78,6 +78,16 @@
       "created": "2026-06-15T01:43:18+00:00",
       "updated": "2026-06-15T05:37:34+00:00",
       "flag_verified": true
+    },
+    "ft-yield-costfree-monoio": {
+      "title": "Swap monoio cooperative_yield timer-park -> cost-free io_uring CQ-reap; re-tune chunk; A/B re-validate",
+      "phase": "done",
+      "gate": "PASS",
+      "milestone": "v2-1-throughput-polish",
+      "depends_on": [],
+      "created": "2026-06-15T11:57:05+00:00",
+      "updated": "2026-06-15T14:39:07+00:00",
+      "flag_verified": true
     }
   },
   "milestones": {
@@ -96,10 +106,18 @@
       "status": "done",
       "created": "2026-06-13T08:24:32+00:00",
       "updated": "2026-06-15T06:10:04+00:00"
+    },
+    "v2-1-throughput-polish": {
+      "title": "Throughput Polish (recover v2-deferred costs)",
+      "goal": "On monoio, FT.SEARCH's off-event-loop yield reaps the io_uring CQ without timer-wheel latency, so the brute-force chunk shrinks back to its latency-optimal size and reclaims the ~22% throughput #179 deferred, with #179's co-located latency relief preserved.",
+      "stage": "production",
+      "status": "active",
+      "created": "2026-06-15T11:57:00+00:00",
+      "updated": "2026-06-15T11:57:00+00:00"
     }
   },
   "created": "2026-06-11T03:18:21+00:00",
-  "updated": "2026-06-15T06:10:04+00:00",
+  "updated": "2026-06-15T14:39:07+00:00",
   "setup": {
     "locked": true,
     "locked_at": "2026-06-11T03:28:00+00:00",

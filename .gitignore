@@ -99,6 +99,7 @@ tmp/
 
 # Linux VM cross-build dir (avoids Mach-O/ELF clobbering in shared target/)
 /target-linux/
+/target-linux-tokio/
 /target-tokio/
 /target-check-tokio/
 /target-check-monoio/
