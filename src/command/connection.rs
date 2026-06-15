@@ -266,12 +266,14 @@ pub fn info(db: &Database, _args: &[Frame]) -> Frame {
          total_connections_received:{}\r\n\
          total_dispatch_cross_spsc:{}\r\n\
          spsc_notify_wakes:{}\r\n\
-         spsc_drain_renotify:{}\r\n",
+         spsc_drain_renotify:{}\r\n\
+         ft_search_cooperative_yields_total:{}\r\n",
         crate::admin::metrics_setup::total_commands_processed(),
         crate::admin::metrics_setup::total_connections_received(),
         crate::admin::metrics_setup::total_dispatch_cross_spsc(),
         crate::admin::metrics_setup::spsc_notify_wakes(),
         crate::admin::metrics_setup::spsc_drain_renotify(),
+        crate::admin::metrics_setup::ft_search_cooperative_yields(),
     );
     sections.push_str("\r\n");
 
