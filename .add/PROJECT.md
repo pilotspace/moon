@@ -6,7 +6,7 @@
 > UI/UX = UDD. When a loop reveals a gap here, come back and update this file —
 > that is the re-entrant arrow from the engine down to the foundation.
 
-slug: moon · stage: production · updated: 2026-06-15 · foundation-version: 2
+slug: moon · stage: production · updated: 2026-06-15 · foundation-version: 3
 goal: a Redis-compatible server whose thread-per-core architecture measurably out-scales Redis on multi-core hardware — without sacrificing protocol compatibility or durability semantics
 
 ---
@@ -48,3 +48,4 @@ goal: a Redis-compatible server whose thread-per-core architecture measurably ou
 | 2026-06-13 | CLOSE v1-shared-nothing: shared-nothing restored (locks deleted, shape-enforced), 1ms monoio wake floor gone (cross-shard p99 0.071ms), consistency 197/197 @1/4/12; s4 routed parity-or-better (+12% P16 GET) vs v0.3.0 | exit criteria met to the agreed "no-regression + honest measurement" bar | done; default-config cross-shard read regression (−85% c1 GET) RISK-ACCEPTED → follow-up: lock-free cross-shard read acceleration (waiver → next perf milestone) |
 | 2026-06-13 | fold v1 deltas → foundation-version 1 | close the ADD loop so learnings outlive the milestone | DDD: lock-inventory grep → CI (PROJECT §Domain); TDD: red-suite split pattern + ADD: §3 freeze flag-line requirement (CONVENTIONS) |
 | 2026-06-15 | fold v2 deltas → foundation-version 2 (9 deltas from xshard-read-fastpath + wal-group-commit) | close the loop after the first 2 v2-performance tasks; perf-measurement + cross-cutting-deletion lessons recur | SDD: "verify each impl of an all-N invariant" + "keep rejected-risk flags in the freeze" (PROJECT §Spec); TDD: whole-repo symbol-removal grep, MOON_BIN-pinned VM integration, pipelined+control+best-of-7 perf anchor, frozen-red-test-may-be-wrong (CONVENTIONS); ADD: confirm instrument validity before a perf Must, full-dual-runtime gate for deletions, at-BUILD unsafe/unwrap audit (CONVENTIONS) |
+| 2026-06-15 | CLOSE v2-performance (3/3 PASS) + fold deltas → foundation-version 3 (3 deltas from ft-search-off-eventloop) | all three v1-deferred bottlenecks delivered (xshard read latency, FT.SEARCH stalls, WAL group commit); a default-runtime perf no-op slipped past green tests until the effectiveness bench | TDD: mechanism-proxy pass ≠ effect measured (CONVENTIONS); ADD: per-runtime EFFECTIVENESS validation for `#[cfg]`-split primitives + make the instrument work before deferring a defect-hiding measurement (CONVENTIONS). v2 absolute magnitudes (xshard µs, WAL throughput) GATE-DEFERRED to GCloud per the milestone's sanctioned VM bench-exception |

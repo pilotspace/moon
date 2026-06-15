@@ -537,18 +537,19 @@ Spec delta for the next loop:
   absolute validation is the same deferred/optional item the milestone already carries for xshard.
 
 ### Competency deltas
-- [TDD · open] A full-green test suite does NOT prove a perf MECHANISM is EFFECTIVE — the §4
+<!-- all 3 folded → foundation-version 3 (PROJECT.md changelog 2026-06-15; CONVENTIONS.md TDD×1 + ADD×2) -->
+- [TDD · folded] A full-green test suite does NOT prove a perf MECHANISM is EFFECTIVE — the §4
   m1 counter test was green on monoio while the yield relieved nothing (co-located p99 ≈ full
   search). Only the §6 effectiveness benchmark caught the no-op. Lesson: for a perf Must, a
   mechanism-fired counter (proxy) and an effect-measured benchmark are DIFFERENT gates; the
   proxy can pass while the effect is absent. (evidence: m1 green + RESULTS.md "GOAL UNMET" pre-fix.)
-- [ADD · open] A runtime-abstracted primitive (`#[cfg]`-split `cooperative_yield`) needs
+- [ADD · folded] A runtime-abstracted primitive (`#[cfg]`-split `cooperative_yield`) needs
   per-runtime EFFECTIVENESS validation, not just per-runtime COMPILE+CORRECTNESS. The same
   self-wake code was correct on both runtimes but effective only on tokio — monoio's io_uring
   loop never reaps the CQ under a self-waking task. Lesson: when a contract guarantee (C4 "both
   runtimes") rests on scheduler behavior, the verify plan must measure the behavior on EACH
   runtime, not assume parity from shared code. (evidence: tokio p99 6ms vs monoio 68ms, identical code.)
-- [ADD · open] The verify-time benchmark earned a HARD-STOP→build→re-verify cycle WITHIN the
+- [ADD · folded] The verify-time benchmark earned a HARD-STOP→build→re-verify cycle WITHIN the
   task (not a deferral) because disk was cleaned and the instrument was made to resolve the
   signal — honoring the user's "gather real metrics for evidence" over the easier GATE-DEFER.
   Lesson: prefer making the instrument work over deferring the measurement when the deferral
