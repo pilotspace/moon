@@ -73,7 +73,7 @@ cudarc = { version = "0.19", optional = true, default-features = false, features
 slotmap = "1"
 boomphf = "0.6"
 logos = { version = "0.16", optional = true }
-hyper-tungstenite = { version = "0.19", optional = true }
+hyper-tungstenite = { version = "0.20", optional = true }
 rust-embed = { version = "8", features = ["compression"], optional = true }
 mime_guess = { version = "2", optional = true }
 tokio-stream = { version = "0.1", features = ["sync"], optional = true }
