@@ -93,13 +93,13 @@
       "title": "Multi-Core Throughput Hardening (v1-deferred perf wins)",
       "goal": "a 4-shard Moon measurably improves the three throughput bottlenecks v1 deferred \u2014 cross-shard read latency, FT.SEARCH event-loop stalls, and appendfsync=always write collapse \u2014 without re-introducing cross-thread locks or growing per-key memory",
       "stage": "production",
-      "status": "active",
+      "status": "done",
       "created": "2026-06-13T08:24:32+00:00",
-      "updated": "2026-06-13T08:24:32+00:00"
+      "updated": "2026-06-15T06:10:04+00:00"
     }
   },
   "created": "2026-06-11T03:18:21+00:00",
-  "updated": "2026-06-15T05:37:34+00:00",
+  "updated": "2026-06-15T06:10:04+00:00",
   "setup": {
     "locked": true,
     "locked_at": "2026-06-11T03:28:00+00:00",
