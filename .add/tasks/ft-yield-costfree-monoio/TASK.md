@@ -187,7 +187,12 @@ Least-sure flag surfaced at freeze: ⚠ [contract] the exact knee K that recover
 the #179 relief is build-measured, not yet known — because it depends on the brute-force scan's real
 per-vec cost vs the now-µs yield. If wrong: K lands higher than hoped → partial recovery (logged in §7),
 never a correctness or relief regression (those are guarded by scenarios 1 & 6–8).
-[RESOLVED in verify: K=512 — end-to-end A/B (20k×384d, release) = +2.74% vs sync, within the 5% bound.]
+[RESOLVED in verify: K=512 — dev-VM A/B (aarch64, 20k×384d, release) = +2.74% vs sync, within the 5% bound.]
+[RE-RESOLVED post-merge-pending (GCloud cross-arch confirm, 2026-06-15): K=512 BREACHED the bound on x86_64
+ Sapphire Rapids (+6–8% across 3 runs) while holding on aarch64 Neoverse-N1 (+4%) — the knee is arch-dependent
+ (faster x86 scan → fixed yield cost a larger fraction). Final knee = **1024**, within 5% on BOTH arches
+ (x86 +2–3.5%, aarch64 +2–3.4%). This is the "flag landed higher than hoped → logged in §7" branch the freeze
+ anticipated; no correctness/relief regression (relief still ~20×/query). Code: holder.rs 512→1024.]
 
 Status: FROZEN @ v1 — approved by Tin Dang (conditional freeze pre-authorized "if spike yes → freeze + build";
 spike GREEN 2026-06-15). Changing this frozen contract = change request back to SPECIFY.
@@ -303,18 +308,20 @@ Reviewed by: Tin Dang · date: 2026-06-15
 ## 7 · OBSERVE — feed the next loop ▸ docs/09-the-loop.md
 
 Watch (reuse scenarios as monitors):
-- `ft_search_cooperative_yields_total` (INFO) — now increments ~32× more often (chunk 16384→512). NOT a regression
+- `ft_search_cooperative_yields_total` (INFO) — now increments ~16× more often (chunk 16384→1024). NOT a regression
   (each yield is 0.317µs), but the counter's MAGNITUDE shifted; any dashboard alerting on its absolute rate must re-baseline.
-- co-located command p99 during heavy FT.SEARCH — should now be ~40µs-class (512-vec gaps), far under the 6.6ms #179 anchor.
+- co-located command p99 during heavy FT.SEARCH — ~0.3–0.5ms-class (1024-vec gaps on real silicon), far under the 6.6ms #179 anchor.
 
 Spec delta for the next loop:
-- The default chunk 512 is the build-measured knee (+2.74% vs sync at 384d, 2× margin). It holds the <5% throughput bound
-  for ≥~210d — covering the common embedding floor (384d MiniLM, 768d, 1536d) and 256d models. LOW-dim/toy workloads (≤~210d,
-  e.g. the 4d test vectors) have a higher per-yield-relative cost — operators there should raise `MOON_FT_YIELD_CHUNK`
-  (and conversely 256 is reachable for latency-first deployments that accept ~5%). A future adaptive chunk (scale K by
-  measured per-vec distance cost) would remove the manual knob and let the knee track dimension automatically.
-- The end-to-end FT.SEARCH RPS A/B (scenario 2 absolute) remains GCloud-deferred (OrbStack bench-exception), joining the
-  milestone's two other deferred magnitudes — a natural `xshard-read-coalescing`-style follow-up bundles them on real disk.
+- The default chunk is **1024**, the CROSS-ARCH build-measured knee (GCloud, 2026-06-15): within the 5% throughput bound on
+  BOTH x86_64 Sapphire Rapids (+2–3.5%, 3 runs) AND aarch64 Neoverse-N1 (+2–3.4%). The knee is architecture-dependent — a
+  finer 512 held on aarch64 (dev VM +2.74%, bare-metal +4%) but BREACHED the bound on x86 (+6–8%): the faster AVX-512 scan
+  shrinks chunk wall-time so the fixed yield cost is a larger fraction. The dev-VM A/B (aarch64-only) green-lit 512 and MISSED
+  this. A future adaptive chunk (scale K by measured per-vec scan cost, which folds in BOTH dimension and arch) would remove the
+  knob and self-tune the knee; until then, latency-first deployments on slower-scan hardware can lower `MOON_FT_YIELD_CHUNK`.
+- The absolute single-shard RPS magnitude on real disk (xshard µs, WAL throughput) remains GCloud-deferred with the milestone's
+  two v2 siblings; this GCloud run confirmed the FT.SEARCH RELATIVE within-5% claim cross-arch (the scenario-2 contract) but did
+  not chase those absolutes — a natural follow-up bundles them on the same instances.
 
 ### Competency deltas
 - [TDD · folded] (foundation v4 → CONVENTIONS.md) A behavioral red test (`monoio_yield_overhead_is_microscopic`: 200 yields
@@ -331,3 +338,10 @@ Spec delta for the next loop:
   constant is necessary but NOT sufficient to freeze a tuning knee; pair it with a RELATIVE same-binary A/B (which cancels
   the absolute-RPS noise that made us defer in the first place) before committing the default. The relative A/B sidesteps the
   OrbStack absolute-noise problem entirely — control and treatment share the VM, so only the ratio matters.
+- [ADD · open] A perf tuning knee must be A/B-confirmed on EACH target architecture, not just the dev arch — it tracks a
+  hardware-specific cost. The dev-VM A/B (aarch64) green-lit K=512 at +2.74%, the gate PASSed, the milestone CLOSED — but a
+  GCloud cross-arch bench then measured K=512 at +6–8% on x86_64 Sapphire Rapids (faster AVX-512 scan shrinks chunk wall-time,
+  so the fixed yield cost is a larger fraction of it), BREACHING the same 5% bound the contract asserts. Refines the v4 delta:
+  the relative A/B cancels absolute-RPS noise but NOT cross-arch variance; run it on every supported arch (or pick the
+  conservative cross-arch value) before shipping a single default. Cost-if-missed here was low (caught pre-merge, knee just
+  coarsened 512→1024), but a single-arch green gate can ship a default that violates its own contract on a supported target.

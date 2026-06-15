@@ -1,8 +1,10 @@
 //! ADD task `ft-yield-costfree-monoio` — VERIFY-phase end-to-end FT.SEARCH QPS A/B
 //! (scenario 2). Same binary, same data, same queries; the ONLY difference is the
-//! brute-force yield chunk (sweeps 256/512/1024, gates on the shipped knee 512):
-//!   - treatment: MOON_FT_YIELD_CHUNK=512     -> shipped default (self-pipe ~39 yields/query)
+//! brute-force yield chunk (sweeps 256/512/1024, gates on the shipped knee 1024):
+//!   - treatment: MOON_FT_YIELD_CHUNK=1024    -> shipped cross-arch default (~20 yields/query)
 //!   - control:   MOON_FT_YIELD_CHUNK=1e9     -> one chunk = sync scan (no yield)
+//! 1024 is the cross-arch knee: 512 held on aarch64 but breached the 5% bound on x86
+//! (GCloud Sapphire Rapids +6–8%), so the default coarsened one step for x86 safety.
 //!
 //! If treatment QPS is within ~5% of the sync control, the cost-free yield's
 //! overhead is negligible and the deferred throughput is reclaimed.
@@ -256,12 +258,12 @@ fn scenario2_qps_within_5pct_of_sync_control() {
         "\n========== FT.SEARCH QPS A/B (brute-force {N_VECS}x{DIM}d L2, KNN10, release) =========="
     );
     println!("control (sync, chunk=1e9):  {sync:>10.1} qps   [self-pipe overhead vs sync]");
-    let mut at_default = 0.0f64; // shipped knee = 512
+    let mut at_default = 0.0f64; // shipped knee = 1024 (cross-arch safe; 512 breached on x86)
     for (c, tag) in chunks {
         let q = measure_arm(Some(c), tag);
         let ratio = q / sync;
         let overhead = (1.0 - ratio) * 100.0;
-        if c == "512" {
+        if c == "1024" {
             at_default = ratio;
         }
         println!("self-pipe chunk={c:<5}      {q:>10.1} qps   {overhead:+.2}%  (gap ~{c} vecs)");
@@ -272,8 +274,8 @@ fn scenario2_qps_within_5pct_of_sync_control() {
 
     assert!(
         at_default >= 0.95,
-        "scenario 2: self-pipe@512 (shipped knee) QPS must be within ~5% of the sync control \
-         at {DIM}d; got {:+.2}% overhead",
+        "scenario 2: self-pipe@1024 (shipped cross-arch knee) QPS must be within ~5% of the sync \
+         control at {DIM}d; got {:+.2}% overhead",
         (1.0 - at_default) * 100.0
     );
 }
