@@ -1,7 +1,7 @@
 # TASK: FT.SEARCH off-event-loop: a heavy vector/text query must not stall the shard's 1ms tick or co-located commands
 
 slug: ft-search-off-eventloop · created: 2026-06-15 · stage: production · risk: high · autonomy: conservative
-phase: contract   <!-- specify -> scenarios -> contract -> tests -> build -> verify -> observe -> done -->
+phase: tests   <!-- specify -> scenarios -> contract -> tests -> build -> verify -> observe -> done -->
 <!-- high-risk/method-defining scope? declare `risk: high` on the slug line above and lower
      the autonomy level with `autonomy: conservative` — the engine refuses an unguarded completion
      (`unguarded_high_risk_auto`, run.md guard). A comment is never a declaration. -->
@@ -317,13 +317,61 @@ Status: FROZEN @ v1 — approved by Tin Dang 2026-06-15 (with SAFETY-NET clause 
 
 ## 4 · TESTS — failing-first suite (red) ▸ docs/06-step-4-tests.md
 
-Coverage target: <e.g. 90%>
+Coverage target: behavior-level, not line-% — the gate is: every Must + Reject has a test or pin, and
+the suite is RED for the right reason (missing seam / un-relieved stall), confirmed on the default
+(monoio+graph) build. Follows the foundation-v1 red-suite shape: runtime-red (behavioral) +
+compile-red (API-shape, fails to compile until the seam exists) + green-pins (invariants that stay
+green). FT.* needs the default `graph` feature → runtime tests gate `#[cfg(feature = "graph")]`
+(mirrors `ft_search_concurrent_readers.rs`); the compile-red file is feature-agnostic.
+
 Plan (one test per scenario, asserting behavior not internals):
 <test_plan>
-  - test_<scenario>: arrange <Given> / act <When> / assert <Then> + assert <unchanged>
+  # --- compile-red: `tests/ft_search_yield_red_api.rs` (cargo test --test ft_search_yield_red_api → COMPILE ERROR = red) ---
+  - c2_search_mvcc_yielding_symbol_exists [Reject result_not_identical / M2]: reference
+    `moon::vector::segment::holder::SegmentHolder::search_mvcc_yielding` as a value (the C2 seam) →
+    unresolved import until BUILD ⇒ crate fails to compile (red). After build: resolves, asserts the
+    signature shape (async, takes &mut SearchSnapshot + YieldBudget, returns SmallVec<[SearchResult;32]>).
+  - c3_yield_budget_named_defaults [M1 bounded-cap]: reference `YieldBudget` + the named const
+    `FT_SEARCH_YIELD_BUDGET`; assert `max_segments_per_chunk >= 1`, `max_graph_nodes_per_chunk > 0`,
+    `max_brute_force_vecs_per_chunk > 0` (the explicit C3 cap exists, defaults sane).
+  - c1_search_snapshot_owns_state [M3 G-NOBORROW]: reference `SearchSnapshot` + assert it is `'static`
+    (owns `Arc<SegmentList>` + owned scratch; no borrow into idx) via a `fn assert_static<T:'static>()`
+    bound — pins the capture-before-yield shape. (compile-red until the type exists.)
+
+  # --- runtime-red + green-pins: `tests/ft_search_yield_red.rs` (spawn moon --shards 1; #[cfg(feature="graph")]) ---
+  - m1_heavy_search_yields_cooperatively [M1 / Reject no_yield_progress] RED-NOW:
+    arrange a heavy index (many vectors over forced-immutable segments) on a 1-shard server /
+    act: run one heavy FT.SEARCH, then INFO / assert the per-shard counter
+    `ft_search_cooperative_yields_total` is PRESENT and > 0 (deterministic C5 proxy — the search
+    relinquished to the loop). RED now (field absent ⇒ parsed 0). Mirrors swf1's INFO-counter red.
+    + assert (unchanged): FT.SEARCH still returned the correct hit count (the yield didn't drop results).
+  - m1b_colocated_ping_progress_during_search [M1 corroboration, #[ignore] — jitter-sensitive]:
+    while a heavy FT.SEARCH is in flight on the 1-shard loop, co-located PINGs' max RTT stays under a
+    generous bound measurably below the search duration. Corroborates the win on wall-clock; #[ignore]
+    so VM jitter never reds CI — run by hand at verify on a quiesced VM (flag #2).
+  - m2_topk_known_neighbors_keys_resolved [M2 / Reject result_not_identical] GREEN-PIN:
+    a deterministic small index with known vectors / FT.SEARCH KNN / assert the returned top-k doc
+    KEYS + order match the known nearest neighbors, and no row is a synthetic `vec:<id>`
+    (key_hash_to_key resolved). Green now; must stay green after build (guards G-IDENTITY at the wire).
+  - m3_concurrent_hset_isolated_from_inflight_search [M3 / Reject snapshot_straddle] GREEN-PIN:
+    issue an HSET concurrent with a search / assert the search result reflects the pre-write snapshot,
+    AND the post-write doc IS visible to the NEXT search (write isolated, not lost). Green now
+    (atomic today); the build's yield must keep it green (becomes the real interleave guard).
+  - m4_ft_basic_correctness_smoke [M4 no-regression] GREEN-PIN: FT.CREATE/HSET/FT.SEARCH/FT.INFO
+    num_docs basic correctness holds (a fast guard that the async-ripple build didn't break FT.*).
+
+  # --- verify-time (not authored as unit tests; measured at §6) ---
+  - M0 baseline + M1 wall-clock p99 (relative, best-of-N, monoio+tokio), M4 consistency 197/197 @1/4/12,
+    clippy ×2 + fmt, audit-unsafe/unwrap (zero new), RSS-flat + lock-count (zero new cross-thread lock):
+    recorded as VERIFY evidence per the milestone bench rule (CONVENTIONS: confirm instrument validity;
+    full-dual-runtime gate; at-BUILD safety audit). G-HOTPATH (no per-chunk alloc) is checked by the
+    no-alloc audit + manual review of the resume path, not a unit test.
 </test_plan>
 
-Tests live in: `./tests/` · MUST run red (missing implementation) before Build.
+Green-pins reused (must stay green, not authored here): `tests/ft_search_concurrent_readers.rs`,
+`tests/ft_search_as_of_*.rs`, `tests/ft_search_temporal_parity.rs` (existing MVCC/as-of isolation).
+
+Tests live in: `tests/ft_search_yield_red.rs` `tests/ft_search_yield_red_api.rs` · MUST run red (missing seam / un-relieved stall) before Build.
 <!-- declare paths as backticked tokens on this line: `./…` = this task dir ·
      a token with "/" = project root · a bare name = sibling of the previous
      token's dir · a directory counts its *.py files (non-recursive); reports
