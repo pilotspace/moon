@@ -1,7 +1,7 @@
 # TASK: FT.SEARCH off-event-loop: a heavy vector/text query must not stall the shard's 1ms tick or co-located commands
 
 slug: ft-search-off-eventloop · created: 2026-06-15 · stage: production · risk: high · autonomy: conservative
-phase: specify   <!-- specify -> scenarios -> contract -> tests -> build -> verify -> observe -> done -->
+phase: scenarios   <!-- specify -> scenarios -> contract -> tests -> build -> verify -> observe -> done -->
 <!-- high-risk/method-defining scope? declare `risk: high` on the slug line above and lower
      the autonomy level with `autonomy: conservative` — the engine refuses an unguarded completion
      (`unguarded_high_risk_auto`, run.md guard). A comment is never a declaration. -->
@@ -134,11 +134,83 @@ Assumptions — lowest-confidence first:
 <scenarios>
 
 ```gherkin
-Scenario: <short name>
-  Given <starting situation>
-  When <action>
-  Then <expected result>
-  And <what must remain unchanged>   # required for every rejection
+# ---- one per Must ----
+
+Scenario: M0 — baseline co-located stall is measurable (the instrument resolves the metric)
+  Given a fresh moon-dev server with an FT index large enough that one FT.SEARCH takes >> 1ms of CPU
+    (many immutable HNSW segments at ef_search >= 200 over the pre-yield SYNCHRONOUS local slice)
+  When a heavy FT.SEARCH runs on a shard while a separate connection streams simple PING/GET to the SAME shard
+  Then the co-located PING/GET p99 (and max) on that shard is recorded, best-of-N, for monoio and tokio,
+    AND a deterministic in-process proxy is recorded too — the count of 1ms ticks that fired and the count of
+    drain_spsc_shared cycles that ran DURING the search window — so M1 has a non-jitter anchor if VM p99 is noisy
+  And the FT.SEARCH recall + top-k ordering for this dataset is captured as the unchanged-result control
+
+Scenario: M1 — the yield relieves the stall (tick fires mid-search, co-located p99 bounded below M0)
+  Given the heavy-FT.SEARCH + co-located-PING/GET workload from M0 on the cooperatively-yielding build
+  When the FT.SEARCH runs as a sequence of bounded chunks (per-segment / per-N-graph-node) that yield to the loop
+  Then the 1ms tick fires >= K times and drain_spsc_shared runs during the single search window (vs ~0 at M0),
+    AND co-located PING/GET p99 on that shard stays under a recorded bound that is measurably below M0's p99
+  And the yield granularity is bounded by an explicit cap (work-per-chunk), not unbounded in either direction
+
+Scenario: M2 — result is byte-identical to the synchronous path
+  Given the same index data and the same FT.SEARCH query (vector KNN, with and without payload/numeric filter,
+    with LIMIT/top-k, across mutable + multiple immutable segments)
+  When the query is served by the yielding path and, separately, by the pre-change synchronous path
+  Then the two RESP responses are byte-identical — returned doc set, score ordering, top-k/LIMIT slice,
+    filtered-out docs, num_docs, and key resolution via key_hash_to_key all match exactly
+  And no result row resolves to a synthetic vec:<id> that the synchronous path resolved to a real key
+
+Scenario: M3 — a write during a mid-search yield is invisible to that search (MVCC isolation)
+  Given a heavy FT.SEARCH in flight on a shard, paused at a yield point, having captured its ArcSwap Guard at start
+  When a co-located HSET auto-index (or a compaction installing a new SegmentList, or a delete/mark_deleted)
+    commits on the SAME shard thread between two chunks of the paused search
+  Then that search's result reflects ONLY the SegmentList + metadata snapshot it captured at start —
+    the mid-search write is NOT in its result set, and existing as-of / concurrent-reader tests stay green
+  And the post-write segment state IS visible to the NEXT FT.SEARCH (the write is not lost, only isolated)
+
+Scenario: M4 — no regression (latency, correctness, invariants)
+  Given the cooperatively-yielding build
+  When the full guardrail suite runs: a single (un-contended) FT.SEARCH end-to-end latency vs the sync path,
+    scripts/test-consistency.sh @1/4/12, the FT.* suites, clippy x2 + fmt, and an RSS + lock-count check
+  Then single-query latency is not materially worse than sync (bounded yield overhead, no per-chunk heap alloc),
+    consistency is 197/197, both runtimes are green, there are zero new unsafe blocks and zero new cross-thread
+    locks, and steady-state RSS is not grown
+
+# ---- one per Reject (each asserts what stays unchanged) ----
+
+Scenario: reject result_not_identical
+  Given any index + query for which the synchronous path returns result R
+  When the yielding path returns a result that differs from R in recall, ordering, top-k, filter, num_docs,
+    or key mapping
+  Then the change is REJECTED as "result_not_identical"
+  And the synchronous path's result R for that query is unchanged (the oracle is the pre-change behavior)
+
+Scenario: reject snapshot_straddle
+  Given an in-flight search that captured its SegmentList snapshot before a co-located write
+  When that later write becomes visible inside the same search's result (the search straddled the snapshot)
+  Then the change is REJECTED as "snapshot_straddle"
+  And the write itself still commits and is durable — only its leakage INTO the prior search is forbidden
+
+Scenario: reject reentrancy_corruption
+  Given a search mid-iteration over SearchScratch / key_hash_to_key / payload_index, paused at a yield
+  When a co-located HSET/compaction/delete on the same thread mutates that structure and the resumed search
+    reads corrupted/torn metadata (panic, wrong key, or out-of-bounds)
+  Then the change is REJECTED as "reentrancy_corruption"
+  And the co-located write completes correctly and the index remains internally consistent for later queries
+
+Scenario: reject no_yield_progress
+  Given the heavy-FT.SEARCH + co-located-PING/GET workload
+  When the "yield" does not actually relinquish to the event loop — co-located p99 still stalls for the full
+    search duration and the 1ms tick fires ~0 times during the search
+  Then the change is REJECTED as "no_yield_progress" (the win asserted by M1 is absent)
+  And FT.SEARCH still returns the correct result (a non-yielding build is wrong on the WIN, not on correctness)
+
+Scenario: reject hotpath_alloc_or_lock
+  Given the yield machinery on the event-loop hot path
+  When resuming a chunk performs a heap allocation (Box/Vec/format!) or acquires a lock per chunk on the
+    command-dispatch / event-loop path
+  Then the change is REJECTED as "hotpath_alloc_or_lock"
+  And the no-alloc-on-hot-path + per-shard-lock-only invariants (CONVENTIONS) remain intact
 ```
 
 </scenarios>
