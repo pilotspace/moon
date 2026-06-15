@@ -83,40 +83,62 @@ impl ResponseSlot {
         self.waker.wake();
     }
 
+    /// Take the response iff the slot is FILLED, leaving it EMPTY; `None` if not yet
+    /// filled. Does NOT touch the waker. The SINGLE unsafe `UnsafeCell` access for the
+    /// whole slot lives here — `poll_take` and `try_take` both route through it, so
+    /// neither introduces an unsafe block of its own. Single consumer (connection
+    /// owner thread) only.
+    #[inline]
+    fn take_if_filled(&self) -> Option<Vec<Frame>> {
+        if self.state.load(Ordering::Acquire) != FILLED {
+            return None;
+        }
+        #[allow(clippy::unwrap_used)] // fill() always writes Some before the FILLED transition
+        // SAFETY: Acquire load above confirmed FILLED (happens-after fill()'s Release store,
+        // so the data write is visible); single-consumer slot, no concurrent read aliases it;
+        // fill() always writes Some before the FILLED transition, so take() is Some.
+        let data = unsafe { (*self.data.get()).take().unwrap() };
+        self.state.store(EMPTY, Ordering::Release);
+        Some(data)
+    }
+
     /// Poll for the response (called by the connection owner thread).
     ///
     /// Returns `Ready(data)` if the slot has been filled, or `Pending` if empty.
     /// After returning `Ready`, the slot is reset to EMPTY and can be reused.
     pub(crate) fn poll_take(&self, cx: &mut Context<'_>) -> Poll<Vec<Frame>> {
-        // Fast path: check if filled.
-        let state = self.state.load(Ordering::Acquire);
-        if state == FILLED {
-            // Data is ready. Take it out and reset to EMPTY.
-            // Atomic state == FILLED guarantees fill() wrote Some(data); see fill().
-            #[allow(clippy::unwrap_used)]
-            // SAFETY: Acquire load confirmed FILLED, happens-after producer's Release store,
-            // so UnsafeCell data write is visible. Single consumer ensures no concurrent read.
-            let data = unsafe { (*self.data.get()).take().unwrap() };
-            self.state.store(EMPTY, Ordering::Release);
+        // Fast path: already filled.
+        if let Some(data) = self.take_if_filled() {
             return Poll::Ready(data);
         }
 
         // Slot is empty. Register waker using AtomicWaker (handles synchronization).
         self.waker.register(cx.waker());
 
-        // Re-check state after waker registration.
-        // Handles the race where producer fills between our first load and waker store.
-        let state = self.state.load(Ordering::Acquire);
-        if state == FILLED {
-            // SAFETY: Same reasoning as fast path above — Acquire load confirmed FILLED,
-            // ensuring the producer's data write is visible. Single consumer, no aliasing.
-            #[allow(clippy::unwrap_used)] // fill() always writes Some before FILLED transition
-            let data = unsafe { (*self.data.get()).take().unwrap() };
-            self.state.store(EMPTY, Ordering::Release);
+        // Re-check after registration: closes the race where the producer fills
+        // between our first load and the waker store.
+        if let Some(data) = self.take_if_filled() {
             return Poll::Ready(data);
         }
 
         Poll::Pending
+    }
+
+    /// Non-blocking take: returns the response iff the slot is already FILLED,
+    /// WITHOUT registering a waker. For the reply-side idle-gated spin
+    /// (xshard-read-fastpath C2): the caller is busy-polling, not parking, so it
+    /// must not register a waker. Single consumer (connection owner thread).
+    ///
+    /// Live under the tokio runtime (handler_sharded's `ResponseSlotPool` reply
+    /// path). Dead under monoio, which replies via a flume oneshot rather than a
+    /// response slot — hence the cfg-gated allow keeps the dead-code check active
+    /// where the method is actually used.
+    #[inline]
+    #[cfg_attr(not(feature = "runtime-tokio"), allow(dead_code))]
+    pub(crate) fn try_take(&self) -> Option<Vec<Frame>> {
+        // Same FILLED-confirmed take as poll_take's fast path, minus the waker
+        // registration — the spin caller is busy-polling, not parking.
+        self.take_if_filled()
     }
 
     /// Force-reset the slot to EMPTY, clearing any pending data and waker.

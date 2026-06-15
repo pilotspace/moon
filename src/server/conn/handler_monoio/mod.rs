@@ -1730,6 +1730,12 @@ pub(crate) async fn handle_connection_sharded_monoio<
             // swf0 on both drivers. The previous pending_wakers relay assumed this
             // was impossible and polled on the shard loop's ~1ms tick — the relay
             // sweep still runs in the event loop, but this path no longer uses it.
+            // C2 pipeline guard (see XSHARD_SPIN_MAX_BATCH_REMOTE): total cross-shard
+            // commands in THIS batch. The reply-side spin may engage only for a singleton
+            // foreign read; >1 means a pipeline / multi-key fan-out where a synchronous
+            // spin would serialize the reads and starve pipelined throughput (s4-P16 −27%).
+            let batch_remote_total: usize =
+                oneshot_futures.iter().map(|(_, meta, _)| meta.len()).sum();
             for (target, meta, reply_rx) in oneshot_futures.drain(..) {
                 tracing::trace!(
                     "Shard {}: awaiting cross-shard response (direct oneshot)",
@@ -1753,34 +1759,67 @@ pub(crate) async fn handle_connection_sharded_monoio<
                         Err("ERR cross-shard dispatch failed")
                     }
                     Err(flume::TryRecvError::Empty) => {
-                        // OneshotReceiver is itself a Future with a cached inner
-                        // recv future — pin it ONCE so its waker registration
-                        // persists across chunk boundaries.
-                        let mut recv = std::pin::pin!(reply_rx);
-                        let mut waited_ms: u64 = 0;
-                        loop {
-                            if shutdown.is_cancelled() {
-                                break Err("ERR cross-shard response aborted (shutdown)");
-                            }
-                            let chunk = std::pin::pin!(monoio::time::sleep(
-                                std::time::Duration::from_millis(CROSS_SHARD_RESPONSE_CHUNK_MS)
-                            ));
-                            match crate::runtime::race::race2(recv.as_mut(), chunk).await {
-                                crate::runtime::race::Arm::First(Ok(value)) => break Ok(value),
-                                crate::runtime::race::Arm::First(Err(_)) => {
-                                    break Err("ERR cross-shard dispatch failed");
+                        // C2 (xshard-read-fastpath): adaptive idle-gated reply-side spin.
+                        // When this shard is near-idle (xshard_may_spin), busy-poll the
+                        // reply for a bounded budget to skip the reply-side cross-thread
+                        // wake (the c1 win). The poll is synchronous — it holds no borrow
+                        // across `.await`; on miss it falls through to the EXISTING chunked
+                        // race2 park loop UNCHANGED. When the gate is closed (busy shard)
+                        // the path is byte-identical to before (immediate park).
+                        let _wait_guard = crate::shard::slice::XshardWaitGuard::new();
+                        let mut spun = None;
+                        if crate::shard::slice::xshard_should_spin(batch_remote_total) {
+                            for _ in 0..crate::shard::slice::XSHARD_SPIN_BUDGET {
+                                match reply_rx.try_recv() {
+                                    Ok(value) => {
+                                        spun = Some(Ok(value));
+                                        break;
+                                    }
+                                    Err(flume::TryRecvError::Disconnected) => {
+                                        spun = Some(Err("ERR cross-shard dispatch failed"));
+                                        break;
+                                    }
+                                    Err(flume::TryRecvError::Empty) => core::hint::spin_loop(),
                                 }
-                                crate::runtime::race::Arm::Second(()) => {
-                                    waited_ms += CROSS_SHARD_RESPONSE_CHUNK_MS;
-                                    if waited_ms >= CROSS_SHARD_RESPONSE_TIMEOUT_MS {
-                                        tracing::warn!(
-                                            "Shard {}: cross-shard response wait exhausted; \
-                                             target may have applied the write",
-                                            ctx.shard_id
-                                        );
-                                        break Err(
-                                            "ERR cross-shard response timeout (write may have applied)",
-                                        );
+                            }
+                        }
+                        match spun {
+                            Some(result) => result,
+                            None => {
+                                // OneshotReceiver is itself a Future with a cached inner
+                                // recv future — pin it ONCE so its waker registration
+                                // persists across chunk boundaries.
+                                let mut recv = std::pin::pin!(reply_rx);
+                                let mut waited_ms: u64 = 0;
+                                loop {
+                                    if shutdown.is_cancelled() {
+                                        break Err("ERR cross-shard response aborted (shutdown)");
+                                    }
+                                    let chunk = std::pin::pin!(monoio::time::sleep(
+                                        std::time::Duration::from_millis(
+                                            CROSS_SHARD_RESPONSE_CHUNK_MS
+                                        )
+                                    ));
+                                    match crate::runtime::race::race2(recv.as_mut(), chunk).await {
+                                        crate::runtime::race::Arm::First(Ok(value)) => {
+                                            break Ok(value);
+                                        }
+                                        crate::runtime::race::Arm::First(Err(_)) => {
+                                            break Err("ERR cross-shard dispatch failed");
+                                        }
+                                        crate::runtime::race::Arm::Second(()) => {
+                                            waited_ms += CROSS_SHARD_RESPONSE_CHUNK_MS;
+                                            if waited_ms >= CROSS_SHARD_RESPONSE_TIMEOUT_MS {
+                                                tracing::warn!(
+                                                    "Shard {}: cross-shard response wait exhausted; \
+                                                     target may have applied the write",
+                                                    ctx.shard_id
+                                                );
+                                                break Err(
+                                                    "ERR cross-shard response timeout (write may have applied)",
+                                                );
+                                            }
+                                        }
                                     }
                                 }
                             }

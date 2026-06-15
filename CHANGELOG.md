@@ -6,6 +6,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed (BREAKING) — `--cross-shard-fast-path` flag and its dead telemetry
+
+The orphaned `--cross-shard-fast-path` CLI flag (with its `CrossShardFastPath`
+config enum and `cross_shard_fast_path_enabled()`) is deleted, along with the
+dead `moon_cross_shard_lock_contention_total` metric, the
+`moon_dispatch_cross_read_fastpath_latency_us` histogram, the
+`record_dispatch_cross_read_fastpath_*` recorders, and the hardcoded-`0`
+`cross_read_fast_dispatches` stat. These were Phase-0 scaffolding for the
+pre-shared-nothing RwLock read path (gone since PR #175) and had zero
+production callers. **Breaking:** `moon --cross-shard-fast-path …` now exits
+non-zero with a clap unknown-argument error — remove it from any launch
+script. The internal `scripts/bench-cross-shard-fastpath.sh` is also deleted.
+
+### Performance — Lock-free cross-shard read recovery (idle-gated reply spin)
+
+Cross-shard single-key reads recover a meaningful share of the latency the
+shared-nothing migration (PR #175) gave up, **without** re-introducing a
+cross-thread lock or growing per-key memory. When a shard is near-idle the
+requesting connection briefly busy-polls its cross-shard reply instead of
+parking — skipping one of the round-trip's two cross-thread wakes. The poll is
+gated on a thread-local in-flight counter (`Cell<u32>`, no atomic/lock), so a
+busy shard never spins and high-concurrency throughput is unaffected. Same-run
+quiesced-VM measurement (monoio, 4 shards): single-client cross-shard GET
+**+18.0%** (and cross-shard SET +21%, sharing the reply path); c100 GET +8.4%
+with no starvation. Consistency 197/197 across 1/4/12 shards; dual-runtime
+(monoio + tokio). Cross-connection read *coalescing* — the second half of the
+original design — is deferred to a dedicated follow-up.
+
 ### Changed — Shared-nothing thread-local shard storage (PR #175)
 
 Shard storage moved from `RwLock`/`Mutex`-wrapped shared databases to

@@ -8,32 +8,6 @@ use clap::Parser;
 // plan calls for a minimal diff (an *addition*, not a split).
 pub mod conf_file;
 
-/// Controls whether cross-shard reads use the shared-read fast path
-/// (direct `RwLock` read on the target shard) or always route through
-/// the per-shard SPSC channel.
-///
-/// Background: the fast path bypasses SPSC dispatch for read-only commands
-/// directed at a foreign shard, reducing round-trip latency at the cost of
-/// `RwLock` contention on the target shard's `Database`. At low client counts
-/// (c < 25 × shards) this contention is invisible in production profiling; at
-/// synthetic c=50 it caused a 14× SET p=1 collapse.
-///
-/// See `docs/production-guide.md` §Cross-shard fast path and
-/// `.planning/shared-nothing-migration/PLAN.md` for the full migration story.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum, Default)]
-pub enum CrossShardFastPath {
-    /// Current behavior (fast path enabled). Equivalent to `On`.
-    #[default]
-    Auto,
-    /// Fast path enabled: cross-shard reads bypass SPSC and hold a short-lived
-    /// `RwLock` read guard on the target shard's database.
-    On,
-    /// Fast path disabled: all cross-shard reads are dispatched through the
-    /// SPSC channel. Eliminates `RwLock` contention at the cost of one extra
-    /// channel round-trip per foreign-shard read command.
-    Off,
-}
-
 /// Server configuration parsed from command-line arguments.
 #[derive(Parser, Debug, Clone, Default)]
 #[command(
@@ -598,25 +572,6 @@ pub struct ServerConfig {
     /// Defaults to 0 (invalid — must be set when `--migrate-aof-from` is used).
     #[arg(long = "migrate-aof-shards", default_value_t = 0)]
     pub migrate_aof_shards: u16,
-
-    // ── Shared-nothing migration (Phase 0) ─────────────────────────────
-    /// Control whether cross-shard reads use the shared-read fast path.
-    ///
-    /// `auto` (default) and `on` use the current behavior: read-only commands
-    /// directed at a foreign shard acquire a short-lived `RwLock` read guard
-    /// on the target shard's database, bypassing SPSC dispatch.
-    ///
-    /// `off` routes all foreign-shard reads through the SPSC channel.  Use
-    /// this when you observe `moon_cross_shard_lock_contention_total` climbing
-    /// at your client concurrency level (typically c < 25 × shards).
-    ///
-    /// See `docs/production-guide.md` §Cross-shard fast path for guidance.
-    #[arg(
-        long = "cross-shard-fast-path",
-        value_enum,
-        default_value_t = CrossShardFastPath::Auto
-    )]
-    pub cross_shard_fast_path: CrossShardFastPath,
 }
 
 /// Filesystem markers that identify an existing moon persistence layout.
@@ -750,15 +705,6 @@ impl ServerConfig {
                 self.dir = ".".to_owned();
             }
         }
-    }
-
-    /// Returns true when the cross-shard shared-read fast path is enabled.
-    ///
-    /// Both `Auto` and `On` return `true` — they are identical today.
-    /// Only `Off` returns `false`, routing all foreign-shard reads through SPSC.
-    #[inline]
-    pub fn cross_shard_fast_path_enabled(&self) -> bool {
-        self.cross_shard_fast_path != CrossShardFastPath::Off
     }
 
     /// Returns true when disk offload is enabled.
@@ -1719,53 +1665,6 @@ mod tests {
         assert!((config.segment_cold_min_qps - 0.1).abs() < f64::EPSILON);
         assert_eq!(config.vec_diskann_beam_width, 8);
         assert_eq!(config.vec_diskann_cache_levels, 3);
-    }
-
-    #[test]
-    fn test_cross_shard_fast_path_default() {
-        let config = ServerConfig::parse_from::<[&str; 0], &str>([]);
-        assert_eq!(
-            config.cross_shard_fast_path,
-            CrossShardFastPath::Auto,
-            "default must be Auto (preserves current behavior)"
-        );
-    }
-
-    #[test]
-    fn test_cross_shard_fast_path_off() {
-        let config = ServerConfig::parse_from(["moon", "--cross-shard-fast-path", "off"]);
-        assert_eq!(config.cross_shard_fast_path, CrossShardFastPath::Off);
-    }
-
-    #[test]
-    fn test_cross_shard_fast_path_on() {
-        let config = ServerConfig::parse_from(["moon", "--cross-shard-fast-path", "on"]);
-        assert_eq!(config.cross_shard_fast_path, CrossShardFastPath::On);
-    }
-
-    #[test]
-    fn test_cross_shard_fast_path_auto_explicit() {
-        let config = ServerConfig::parse_from(["moon", "--cross-shard-fast-path", "auto"]);
-        assert_eq!(config.cross_shard_fast_path, CrossShardFastPath::Auto);
-    }
-
-    #[test]
-    fn test_cross_shard_fast_path_enabled_auto() {
-        let config = ServerConfig::parse_from::<[&str; 0], &str>([]);
-        // Auto and On both mean "fast path enabled"
-        assert!(config.cross_shard_fast_path_enabled());
-    }
-
-    #[test]
-    fn test_cross_shard_fast_path_enabled_on() {
-        let config = ServerConfig::parse_from(["moon", "--cross-shard-fast-path", "on"]);
-        assert!(config.cross_shard_fast_path_enabled());
-    }
-
-    #[test]
-    fn test_cross_shard_fast_path_enabled_off() {
-        let config = ServerConfig::parse_from(["moon", "--cross-shard-fast-path", "off"]);
-        assert!(!config.cross_shard_fast_path_enabled());
     }
 
     #[test]

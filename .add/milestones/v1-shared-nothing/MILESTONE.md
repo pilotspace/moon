@@ -30,10 +30,13 @@ Out: FT.SEARCH off-event-loop execution (review priority 3 → v2) · WAL group 
 
 ## Exit criteria (observable; map each to the task that delivers it)
 - [x] Lock inventory: zero global lock acquisitions on the per-command write path for metrics, replication offsets, WAL sender, client registry batch-update — verified by a recorded audit + tests (TASK.md §6, 2026-06-11)        (← hotpath-lock-quickwins)
-- [ ] `scripts/bench-compare.sh` on moon-dev shows no regression at 1 shard and measured improvement at 4 shards vs the recorded v0.3.0 baseline        (← hotpath-lock-quickwins · spsc-wake-floor · shardslice-migration)
+- [x] `scripts/bench-compare.sh` on moon-dev shows no regression at 1 shard and measured improvement at 4 shards vs the recorded v0.3.0 baseline        (← hotpath-lock-quickwins · spsc-wake-floor · shardslice-migration)
+      MET 2026-06-13 (slice eb5d664 vs v0.3.0 3e376a1, VM idle, REQS=200k, fresh-server-per-rep ×3): s1 parity (SET/GET ≥ main); s4 ROUTED parity-or-better every cell, P16 GET +12%. The default-config cross-shard read regression (c1 GET −85%, P1 GET −16%) is the signed RISK-ACCEPTED tradeoff (shardslice gate, Tin Dang 2026-06-13) — deleting the cross-thread RwLock IS the task; follow-up ticket "lock-free cross-shard read acceleration". (shardslice-migration §6 M7 evidence)
 - [x] Cross-shard single-key SET/GET p99 on monoio drops below 1ms (the old floor) in a recorded latency run — 0.071 ms, 57× under the bar (.add/tasks/spsc-wake-floor/bench-results.txt, 2026-06-11)        (← spsc-wake-floor)
-- [ ] `grep -r "is_initialized()" src/shard/` returns zero dual-path branches; `ShardDatabases` no longer exposes cross-shard read access        (← shardslice-migration)
-- [ ] `scripts/test-consistency.sh` passes 132/132 on 1/4/12 shards and full CI matrix is green after each task        (← all three)
+- [x] `grep -r "is_initialized()" src/shard/` returns zero dual-path branches; `ShardDatabases` no longer exposes cross-shard read access        (← shardslice-migration)
+      MET 2026-06-13: `is_initialized()` confined to slice.rs (definition + single guarded helper + tests); zero production dual-branch gates. Machine-enforced by `tests/shardslice_shape.rs::assert_wrappers_gone`. No public cross-shard read accessor on ShardDatabases (C6 residual contract).
+- [x] `scripts/test-consistency.sh` passes 132/132 on 1/4/12 shards and full CI matrix is green after each task        (← all three)
+      MET 2026-06-13: suite grew to 197 via consistency-dispatch-gaps (the dedicated fix task for the 15 MAIN-baseline failures noted below); 197/197 PASSED @ shards=1/4/12 (VM-local release, shardslice eb5d664). CI matrix green per task: clippy -D warnings ×3 featureset×OS + fmt clean.
       ⚠ Gap discovered 2026-06-11: MAIN itself fails 15 of these (dispatch_read gaps for
       GEO*/EXPIRETIME/PEXPIRETIME/TOUCH + two script bugs + a Phase-152 early-exit), so this
       criterion needs a dedicated fix task; tasks 1–2 verified zero NEW failures vs main

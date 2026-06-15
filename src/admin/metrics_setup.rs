@@ -124,7 +124,6 @@ static WAL_AGGRESSIVE_RECYCLE_BYTES_TOTAL: AtomicU64 = AtomicU64::new(0);
 // the existing `record_dispatch_cross_spsc` covers both reads routed via
 // SPSC (when fast-path is off) and writes. INFO exposes the unified total
 // as `total_dispatch_cross_spsc`.
-static DISPATCH_CROSS_READ_FASTPATH_TOTAL: AtomicU64 = AtomicU64::new(0);
 static DISPATCH_CROSS_READ_SPSC_TOTAL: AtomicU64 = AtomicU64::new(0);
 
 /// Initialize the Prometheus metrics exporter and admin HTTP server.
@@ -795,78 +794,6 @@ pub fn record_dispatch_local_batch(count: u64) {
     counter!("moon_dispatch_path_total", "path" => "local").increment(count);
 }
 
-/// Command executed on a remote shard via the shared-read fast path
-/// (RwLock read on the target shard's database, no SPSC message).
-#[inline]
-pub fn record_dispatch_cross_read_fastpath() {
-    // Always increment the INFO-visible atomic (works even with admin_port=0).
-    DISPATCH_CROSS_READ_FASTPATH_TOTAL.fetch_add(1, Ordering::Relaxed);
-    if !METRICS_INITIALIZED.load(Ordering::Relaxed) {
-        return;
-    }
-    counter!("moon_dispatch_path_total", "path" => "cross_read_fast").increment(1);
-}
-
-/// Batched variant of `record_dispatch_cross_read_fastpath`.
-#[inline]
-pub fn record_dispatch_cross_read_fastpath_batch(count: u64) {
-    if count == 0 {
-        return;
-    }
-    // Always increment the INFO-visible atomic (works even with admin_port=0).
-    DISPATCH_CROSS_READ_FASTPATH_TOTAL.fetch_add(count, Ordering::Relaxed);
-    if !METRICS_INITIALIZED.load(Ordering::Relaxed) {
-        return;
-    }
-    counter!("moon_dispatch_path_total", "path" => "cross_read_fast").increment(count);
-}
-
-/// Record latency and optional lock-contention for a single cross-shard fast-path read.
-///
-/// Called at `handler_monoio/mod.rs` after `read_db(target, …)` returns.
-///
-/// - `target_shard`: foreign shard index (used as a low-cardinality label; bounded by
-///   `num_shards`, so label space is always ≤ 64 series).
-/// - `lock_acquire_ns`: nanoseconds from `Instant::now()` before the `read_db()` call
-///   to the moment the guard was obtained. Values > 1 000 ns (1 µs) are counted as
-///   contention events in `moon_cross_shard_lock_contention_total`.
-///
-/// Uses a static per-shard label array (no heap allocation on the hot path).
-/// The shard index is clamped to MAX_SHARD_LABEL_IDX (63) for safety.
-#[inline]
-pub fn record_dispatch_cross_read_fastpath_timed(target_shard: usize, lock_acquire_ns: u64) {
-    if !METRICS_INITIALIZED.load(Ordering::Relaxed) {
-        return;
-    }
-    // Shard label: static array avoids per-call heap allocation.
-    // Cardinality is bounded by num_shards (≤ 64 in practice).
-    static SHARD_LABELS: &[&str] = &[
-        "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16",
-        "17", "18", "19", "20", "21", "22", "23", "24", "25", "26", "27", "28", "29", "30", "31",
-        "32", "33", "34", "35", "36", "37", "38", "39", "40", "41", "42", "43", "44", "45", "46",
-        "47", "48", "49", "50", "51", "52", "53", "54", "55", "56", "57", "58", "59", "60", "61",
-        "62", "63",
-    ];
-    let shard_label = SHARD_LABELS.get(target_shard).copied().unwrap_or("unknown");
-
-    // Latency histogram: records µs for observability dashboards.
-    let latency_us = lock_acquire_ns as f64 / 1_000.0;
-    histogram!(
-        "moon_dispatch_cross_read_fastpath_latency_us",
-        "target_shard" => shard_label
-    )
-    .record(latency_us);
-
-    // Contention counter: threshold 1 µs (1 000 ns) — safely above syscall noise.
-    if lock_acquire_ns > 1_000 {
-        counter!(
-            "moon_cross_shard_lock_contention_total",
-            "target_shard" => shard_label
-        )
-        .increment(1);
-    }
-}
-
 /// Command deferred to cross-shard SPSC dispatch (the slow path).
 /// Recorded when a command is enqueued into a `remote_groups` bucket that
 /// will be flushed as a `PipelineBatchSlotted` message.
@@ -1166,14 +1093,6 @@ pub fn total_connections_received() -> u64 {
     TOTAL_CONNECTIONS.load(Ordering::Relaxed)
 }
 
-/// Total cross-shard reads served via the shared-read fast path
-/// (RwLock read on the target shard's database, no SPSC message).
-/// Always accurate — does not require Prometheus to be initialised.
-#[inline]
-pub fn total_dispatch_cross_read_fastpath() -> u64 {
-    DISPATCH_CROSS_READ_FASTPATH_TOTAL.load(Ordering::Relaxed)
-}
-
 /// Total cross-shard commands dispatched via the SPSC slow path.
 /// Covers both read and write commands that bypass the fast path.
 /// Always accurate — does not require Prometheus to be initialised.
@@ -1462,7 +1381,6 @@ mod tests {
         // we actually care about: no string allocation, no label churn.
         assert!(!METRICS_INITIALIZED.load(Ordering::Relaxed));
         record_dispatch_local();
-        record_dispatch_cross_read_fastpath();
         record_dispatch_cross_spsc();
         record_dispatch_local_inline(0); // count == 0 must short-circuit even when init
         record_dispatch_local_inline(7);
@@ -1511,41 +1429,6 @@ mod tests {
     // The zero-is-noop tests read the counter twice with no intervening
     // increment; they assert `after >= before` (monotone), which is the
     // strongest correct claim under parallel execution.
-
-    #[test]
-    fn cross_read_fastpath_atomic_increments() {
-        let before = total_dispatch_cross_read_fastpath();
-        record_dispatch_cross_read_fastpath();
-        let after = total_dispatch_cross_read_fastpath();
-        assert!(
-            after >= before + 1,
-            "counter must have increased by at least 1; before={before} after={after}"
-        );
-    }
-
-    #[test]
-    fn cross_read_fastpath_batch_atomic_increments() {
-        let before = total_dispatch_cross_read_fastpath();
-        record_dispatch_cross_read_fastpath_batch(7);
-        let after = total_dispatch_cross_read_fastpath();
-        assert!(
-            after >= before + 7,
-            "counter must have increased by at least 7; before={before} after={after}"
-        );
-    }
-
-    #[test]
-    fn cross_read_fastpath_batch_zero_is_noop() {
-        // batch(0) must not call fetch_add — the counter must not move
-        // backward; it may move forward due to concurrent tests.
-        let before = total_dispatch_cross_read_fastpath();
-        record_dispatch_cross_read_fastpath_batch(0);
-        let after = total_dispatch_cross_read_fastpath();
-        assert!(
-            after >= before,
-            "counter must be monotone; before={before} after={after}"
-        );
-    }
 
     #[test]
     fn cross_spsc_atomic_increments() {
