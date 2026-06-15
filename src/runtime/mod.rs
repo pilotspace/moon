@@ -25,6 +25,41 @@ pub mod channel;
 pub mod race;
 pub mod traits;
 
+/// Cooperatively relinquish to the shard event loop, letting co-located
+/// connections + the 1ms tick make progress, then resume.
+///
+/// Used by the FT.SEARCH local slice (`ft-search-off-eventloop`) to interleave a
+/// heavy search with the rest of the loop instead of monopolizing it. The yield
+/// is **runtime-specific** because a naive self-wake is effective on tokio but a
+/// silent no-op on monoio (benchmark: `tmp/bench_ftsearch/RESULTS.md`).
+///
+/// **monoio:** the io_uring run loop only reaps the completion queue when its task
+/// queue empties (it `park()`s — `monoio-0.2.4/src/runtime.rs`). A self-waking
+/// task re-queues itself, so the loop spins on `submit()` and NEVER reaps the CQ
+/// — co-located connections' read completions are never serviced until the search
+/// fully finishes (measured: co-located p99 ≈ full search time, zero relief). A
+/// zero-duration timer instead PARKS the search on the timer driver: the task
+/// queue empties, the loop `park()`s, the CQ is reaped (waking co-located tasks),
+/// and the already-expired timer re-wakes us next iteration (measured after the
+/// fix: co-located p99 ≪ search time).
+///
+/// **tokio:** the scheduler polls the I/O driver on its event interval, so the
+/// canonical cooperative yield already lets co-located connections progress
+/// (measured: co-located p99 ~6ms under a ~63ms search).
+#[cfg(feature = "runtime-monoio")]
+pub async fn cooperative_yield() {
+    // ZERO-duration timer: forces a driver park()/CQ-reap cycle without blocking.
+    // Registers a TimerEntry and returns Pending on first poll (the search does
+    // NOT re-queue itself), so monoio's task queue can drain to empty.
+    monoio::time::sleep(std::time::Duration::ZERO).await;
+}
+
+/// See [`cooperative_yield`] (monoio variant) for the full rationale.
+#[cfg(feature = "runtime-tokio")]
+pub async fn cooperative_yield() {
+    tokio::task::yield_now().await;
+}
+
 #[cfg(feature = "runtime-tokio")]
 pub mod tokio_impl;
 
