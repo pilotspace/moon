@@ -1,7 +1,7 @@
 {
   "project": "moon",
   "stage": "production",
-  "active_task": "xshard-read-fastpath",
+  "active_task": "wal-group-commit",
   "active_milestone": "v2-performance",
   "tasks": {
     "hotpath-lock-quickwins": {
@@ -58,6 +58,16 @@
       "created": "2026-06-13T08:25:14+00:00",
       "updated": "2026-06-14T06:06:01+00:00",
       "flag_verified": true
+    },
+    "wal-group-commit": {
+      "title": "WAL group commit: batch concurrent pending writes into one fsync under appendfsync=always",
+      "phase": "done",
+      "gate": "PASS",
+      "milestone": "v2-performance",
+      "depends_on": [],
+      "created": "2026-06-14T06:54:39+00:00",
+      "updated": "2026-06-14T16:20:23+00:00",
+      "flag_verified": true
     }
   },
   "milestones": {
@@ -79,7 +89,7 @@
     }
   },
   "created": "2026-06-11T03:18:21+00:00",
-  "updated": "2026-06-14T06:06:01+00:00",
+  "updated": "2026-06-14T16:20:23+00:00",
   "setup": {
     "locked": true,
     "locked_at": "2026-06-11T03:28:00+00:00",

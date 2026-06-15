@@ -6,6 +6,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance — WAL group commit under `appendfsync=always` (PR #178)
+
+Concurrent writes pending at the same shard now coalesce into a single
+`fsync` instead of one sync per write, collapsing a large share of the
+~11× `appendfsync=always` throughput penalty that appears when multiple
+clients write in parallel. The batching is opportunistic — a writer drains
+every `AppendSync` already queued on its shard channel and issues one
+barrier `fsync` for the whole group — and is wired into all four AOF writer
+loops (`{TopLevel, PerShard}` × `{monoio sync, tokio async}`). Durability is
+unchanged: control records route to a separate deferred queue so a batch can
+never straddle a non-data message, and the exactly-once-under-crash
+invariant (crash-matrix + SIGKILL integration tests) holds on both runtimes.
+The absolute throughput gain is disk-dependent — structurally unmeasurable on
+the near-free virtio `fsync` of the dev VM, so the coalescing mechanism (K
+`AppendSync` → 1 `fsync`) is pinned by a deterministic batching seam test and
+the wall-clock magnitude is deferred to real-disk hardware.
+
 ### Removed (BREAKING) — `--cross-shard-fast-path` flag and its dead telemetry
 
 The orphaned `--cross-shard-fast-path` CLI flag (with its `CrossShardFastPath`
