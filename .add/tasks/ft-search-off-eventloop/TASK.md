@@ -1,7 +1,7 @@
 # TASK: FT.SEARCH off-event-loop: a heavy vector/text query must not stall the shard's 1ms tick or co-located commands
 
 slug: ft-search-off-eventloop · created: 2026-06-15 · stage: production · risk: high · autonomy: conservative
-phase: tests   <!-- specify -> scenarios -> contract -> tests -> build -> verify -> observe -> done -->
+phase: build   <!-- specify -> scenarios -> contract -> tests -> build -> verify -> observe -> done -->
 <!-- high-risk/method-defining scope? declare `risk: high` on the slug line above and lower
      the autonomy level with `autonomy: conservative` — the engine refuses an unguarded completion
      (`unguarded_high_risk_auto`, run.md guard). A comment is never a declaration. -->
