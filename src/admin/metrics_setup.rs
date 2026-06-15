@@ -32,6 +32,25 @@ static CONNECTED_CLIENTS: AtomicU64 = AtomicU64::new(0);
 static SPSC_NOTIFY_WAKES: AtomicU64 = AtomicU64::new(0);
 static SPSC_DRAIN_RENOTIFY: AtomicU64 = AtomicU64::new(0);
 
+// ── ft-search-off-eventloop (C5): cooperative-yield observability ────────
+// Bumped once per cooperative yield taken by the FT.SEARCH local slice (the
+// per-chunk relinquish to the shard event loop). The deterministic proxy that
+// a heavy search interleaved with the 1ms tick + co-located commands instead
+// of monopolizing the loop. Coarse (≪ per-command rate) ⇒ plain atomic is fine.
+static FT_SEARCH_COOPERATIVE_YIELDS: AtomicU64 = AtomicU64::new(0);
+
+/// Count one cooperative yield taken by the FT.SEARCH local slice (per chunk).
+#[inline]
+pub fn bump_ft_search_cooperative_yield() {
+    FT_SEARCH_COOPERATIVE_YIELDS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Total cooperative yields taken by FT.SEARCH local slices (for INFO Stats).
+#[inline]
+pub fn ft_search_cooperative_yields() -> u64 {
+    FT_SEARCH_COOPERATIVE_YIELDS.load(Ordering::Relaxed)
+}
+
 /// Count a shard-loop wake that came from the cross-shard `Notify` arm
 /// (event-driven drain) rather than the periodic timer.
 ///

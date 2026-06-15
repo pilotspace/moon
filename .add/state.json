@@ -1,7 +1,7 @@
 {
   "project": "moon",
   "stage": "production",
-  "active_task": "wal-group-commit",
+  "active_task": "ft-search-off-eventloop",
   "active_milestone": "v2-performance",
   "tasks": {
     "hotpath-lock-quickwins": {
@@ -68,6 +68,16 @@
       "created": "2026-06-14T06:54:39+00:00",
       "updated": "2026-06-14T16:20:23+00:00",
       "flag_verified": true
+    },
+    "ft-search-off-eventloop": {
+      "title": "FT.SEARCH off-event-loop: a heavy vector/text query must not stall the shard's 1ms tick or co-located commands",
+      "phase": "done",
+      "gate": "PASS",
+      "milestone": "v2-performance",
+      "depends_on": [],
+      "created": "2026-06-15T01:43:18+00:00",
+      "updated": "2026-06-15T05:37:34+00:00",
+      "flag_verified": true
     }
   },
   "milestones": {
@@ -83,13 +93,13 @@
       "title": "Multi-Core Throughput Hardening (v1-deferred perf wins)",
       "goal": "a 4-shard Moon measurably improves the three throughput bottlenecks v1 deferred \u2014 cross-shard read latency, FT.SEARCH event-loop stalls, and appendfsync=always write collapse \u2014 without re-introducing cross-thread locks or growing per-key memory",
       "stage": "production",
-      "status": "active",
+      "status": "done",
       "created": "2026-06-13T08:24:32+00:00",
-      "updated": "2026-06-13T08:24:32+00:00"
+      "updated": "2026-06-15T06:10:04+00:00"
     }
   },
   "created": "2026-06-11T03:18:21+00:00",
-  "updated": "2026-06-14T16:20:23+00:00",
+  "updated": "2026-06-15T06:10:04+00:00",
   "setup": {
     "locked": true,
     "locked_at": "2026-06-11T03:28:00+00:00",
