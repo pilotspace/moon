@@ -682,25 +682,25 @@ baseline drift (37580→31437 across two clean runs); the same-run +18% recovery
 ### Competency deltas
 What did this loop teach the foundation? One line each, tagged by competency
 (`DDD · SDD · UDD · TDD · ADD`), status `open`, with evidence. See the `add` skill's `deltas.md`.
-- [TDD · open] A "symbol hard-removed repo-wide" shape test must grep the WHOLE repo (tests/ +
+- [TDD · folded] A "symbol hard-removed repo-wide" shape test must grep the WHOLE repo (tests/ +
   scripts/ + benches/), not just `src/`: `xshard_cleanup_shape` scanned only `src/`, so 15 test
   files + 1 script kept dangling `cross_shard_fast_path` refs that broke the full build, invisibly,
   until the dual-runtime pass (evidence: commit fda52a4, −340 lines). Fix forward: widen the pin.
-- [ADD · open] Scoped `cargo test --test X` runs give FALSE GREEN for cross-cutting deletions — only
+- [ADD · folded] Scoped `cargo test --test X` runs give FALSE GREEN for cross-cutting deletions — only
   a full `cargo test` on BOTH runtimes is an honest gate for a symbol removal (evidence: M3 break hid
   through every scoped run; surfaced only at dual-runtime verify).
-- [ADD · open] Run `audit-unsafe.sh` / `audit-unwrap.sh` during BUILD, not just verify — C2's new
+- [ADD · folded] Run `audit-unsafe.sh` / `audit-unwrap.sh` during BUILD, not just verify — C2's new
   `unsafe` slipped from build to verify; an at-build audit would have caught it one phase earlier
   (evidence: commit 9789bf1).
-- [TDD · open] Integration tests that spawn a server must pin `MOON_BIN` (or be run in-tree) on the
+- [TDD · folded] Integration tests that spawn a server must pin `MOON_BIN` (or be run in-tree) on the
   OrbStack VM — `find_moon_binary`'s `{manifest}/target/release/moon` fallback resolves a macOS
   Mach-O under an external `CARGO_TARGET_DIR`, yielding phantom "server never accepted" failures
   (evidence: 6 `shardslice_live` false-fails, green in-tree). Reinforces gotcha_orbstack_macho_binary_trap.
-- [TDD · open] A perf anchor must sweep the PIPELINED regime, not just connection count: the c1/c100
+- [TDD · folded] A perf anchor must sweep the PIPELINED regime, not just connection count: the c1/c100
   anchor was green while a P16 fan-out regressed −27.5% — a synchronous spin serializes a pipelined
   batch, visible ONLY under pipeline depth. And best-of-3 hid it as noise; a flat single-shard CONTROL
   cell + best-of-7 was required to separate the signal from VM drift (evidence: M1 RE-MEASURE, 7048e8a).
-- [SDD · open] Keeping a REJECTED-risk flag in the frozen contract pays off: §3 ⚠ flag-#1 ("a
+- [SDD · folded] Keeping a REJECTED-risk flag in the frozen contract pays off: §3 ⚠ flag-#1 ("a
   synchronous spin could serialize pipelined reads") was the exact failure that materialized at verify —
   the pre-named, pre-reasoned risk turned a surprise regression into a targeted batch-depth-gate fix,
   not a redesign (evidence: §3 flag-#1 → VERIFY FINDING #3 → M1 RE-MEASURE).
