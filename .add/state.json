@@ -71,12 +71,12 @@
     },
     "ft-search-off-eventloop": {
       "title": "FT.SEARCH off-event-loop: a heavy vector/text query must not stall the shard's 1ms tick or co-located commands",
-      "phase": "build",
+      "phase": "verify",
       "gate": "none",
       "milestone": "v2-performance",
       "depends_on": [],
       "created": "2026-06-15T01:43:18+00:00",
-      "updated": "2026-06-15T03:22:02+00:00",
+      "updated": "2026-06-15T04:17:13+00:00",
       "flag_verified": true
     }
   },
@@ -99,7 +99,7 @@
     }
   },
   "created": "2026-06-11T03:18:21+00:00",
-  "updated": "2026-06-15T03:22:02+00:00",
+  "updated": "2026-06-15T04:17:13+00:00",
   "setup": {
     "locked": true,
     "locked_at": "2026-06-11T03:28:00+00:00",

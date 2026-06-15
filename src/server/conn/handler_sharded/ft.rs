@@ -682,7 +682,7 @@ pub(super) async fn try_handle_ft_command(
             } => {
                 let results = crate::vector::segment::holder::SegmentHolder::search_mvcc_yielding(
                     &mut *snapshot,
-                    crate::vector::segment::holder::FT_SEARCH_YIELD_BUDGET,
+                    crate::vector::segment::holder::ft_search_yield_budget(),
                 )
                 .await;
                 crate::command::vector_search::build_search_response(

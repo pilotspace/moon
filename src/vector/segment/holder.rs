@@ -65,14 +65,37 @@ pub struct YieldBudget {
     pub max_brute_force_vecs_per_chunk: usize,
 }
 
-/// Default yield cap for FT.SEARCH. 256 vectors/chunk keeps a chunk well under a
-/// millisecond of scan while bounding the co-located stall; per-segment (1) is
-/// the natural immutable boundary.
+/// Default yield cap for FT.SEARCH. The brute-force chunk size trades co-located
+/// latency against search throughput: each yield costs one runtime trip (cheap on
+/// tokio; on monoio a `sleep(ZERO)` is bounded by the ~ms timer wheel, so yields
+/// must be coarse enough to amortize). Tuned on real-disk A/B
+/// (`tmp/bench_ftsearch/RESULTS.md`); per-segment (1) is the natural immutable
+/// boundary. Override per-deployment via `MOON_FT_YIELD_CHUNK`.
 pub const FT_SEARCH_YIELD_BUDGET: YieldBudget = YieldBudget {
     max_segments_per_chunk: 1,
     max_graph_nodes_per_chunk: 4096,
-    max_brute_force_vecs_per_chunk: 256,
+    max_brute_force_vecs_per_chunk: 16384,
 };
+
+/// Runtime-resolved FT.SEARCH yield budget: [`FT_SEARCH_YIELD_BUDGET`] with the
+/// brute-force chunk size optionally overridden by `MOON_FT_YIELD_CHUNK` (an
+/// operator tuning knob — the latency/throughput trade-off is workload- and
+/// runtime-dependent). The env read is cached in a `OnceLock`, so it is one-time
+/// at first search, never a per-search hot-path cost.
+pub fn ft_search_yield_budget() -> YieldBudget {
+    static RESOLVED: std::sync::OnceLock<YieldBudget> = std::sync::OnceLock::new();
+    *RESOLVED.get_or_init(|| {
+        let mut budget = FT_SEARCH_YIELD_BUDGET;
+        if let Ok(raw) = std::env::var("MOON_FT_YIELD_CHUNK") {
+            if let Ok(n) = raw.parse::<usize>() {
+                if n > 0 {
+                    budget.max_brute_force_vecs_per_chunk = n;
+                }
+            }
+        }
+        budget
+    })
+}
 
 /// Owned, `'static` capture of everything a yielding FT.SEARCH local slice reads
 /// (ft-search-off-eventloop, §3 C1). Built under one `&mut VectorIndex` borrow

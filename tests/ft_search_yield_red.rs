@@ -71,6 +71,13 @@ fn spawn_single_shard(port: u16, dir: &std::path::Path) -> Child {
             "--dir",
             &dir.to_string_lossy(),
         ])
+        // Pin a SMALL brute-force yield chunk so a 1000-vector search crosses it
+        // (=> the yield fires) deterministically and fast. The PRODUCTION default
+        // is tuned much coarser for throughput (monoio's timer-yield has a per-yield
+        // cost — see tmp/bench_ftsearch/RESULTS.md); this test exercises the yield
+        // MECHANISM, not the tuning, so it pins the chunk rather than inserting
+        // tens of thousands of vectors. The `yields > 0` assertion is unchanged.
+        .env("MOON_FT_YIELD_CHUNK", "256")
         .stdout(std::fs::File::create(dir.join("moon.stdout.log")).expect("stdout log"))
         .stderr(std::fs::File::create(dir.join("moon.stderr.log")).expect("stderr log"))
         .spawn()

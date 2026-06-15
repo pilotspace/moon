@@ -1,7 +1,7 @@
 # TASK: FT.SEARCH off-event-loop: a heavy vector/text query must not stall the shard's 1ms tick or co-located commands
 
 slug: ft-search-off-eventloop · created: 2026-06-15 · stage: production · risk: high · autonomy: conservative
-phase: build   <!-- specify -> scenarios -> contract -> tests -> build -> verify -> observe -> done -->
+phase: verify   <!-- specify -> scenarios -> contract -> tests -> build -> verify -> observe -> done -->
 <!-- high-risk/method-defining scope? declare `risk: high` on the slug line above and lower
      the autonomy level with `autonomy: conservative` — the engine refuses an unguarded completion
      (`unguarded_high_risk_auto`, run.md guard). A comment is never a declaration. -->
@@ -393,21 +393,118 @@ Constraints: do NOT change any test or the contract; allow-list packages only; a
 
 ## 6 · VERIFY — evidence + non-functional review ▸ docs/08-step-6-verify.md
 
-- [ ] all tests pass
-- [ ] coverage did not decrease
-- [ ] no test or contract was altered during build
-- [ ] concurrency / timing of the risky operation is safe
-- [ ] no exposed secrets, injection openings, or unexpected dependencies
-- [ ] layering & dependencies follow CONVENTIONS.md
-- [ ] a person reviewed and approved the change
+- [x] all tests pass — §4 red suite GREEN on **both runtimes**: m1 (yields cooperatively,
+      INFO `ft_search_cooperative_yields_total` > 0) flipped RED→GREEN on monoio (macOS +
+      OrbStack VM) AND tokio+graph; m2 (top-k known neighbors), m3 (write visible+consistent),
+      m4 (smoke) green pins hold on both; api compile-red 3/3 both runtimes.
+- [x] coverage did not decrease — added the §4 suite (5 runtime + 3 compile-shape tests);
+      regression suites unchanged and GREEN on tokio: `txn_ft_search_snapshot` (MVCC, 3),
+      `ft_search_as_of_filter`/`_boundary` (AS_OF, 1+3), `lunaris_hybrid_ft_search`
+      (HYBRID→Sync, 1), `ft_search_concurrent_readers` (2), `vector_edge_cases` (16).
+- [x] no test or contract was altered during build — §3 contract FROZEN @ v1 untouched; the
+      only test-file change is cargo-fmt whitespace on `tests/ft_search_yield_red.rs`
+      (verified: zero assertion/comparison lines changed). No red driver weakened.
+- [x] concurrency / timing of the risky operation is safe — the seam captures an OWNED
+      `SearchSnapshot` (Arc-clone of the segment list + owned query/committed/scratch) under
+      one `&mut idx` borrow BEFORE the first yield; it holds NO borrow into VectorStore/Index
+      across `.await` (borrow-checker-enforced: the capture closure returns before any await).
+      G-IDENTITY proof: the mutable segment is APPEND-ONLY (entries are only `.push`ed; deletes
+      set `delete_lsn` in place), so a chunked scan over the START-captured `[0, mutable_len)`
+      with the captured `snapshot_lsn` is byte-identical to the atomic sync scan — during-yield
+      appends land beyond `mutable_len` (invisible), during-yield deletes carry
+      `delete_lsn > snapshot_lsn` (still-visible, matching sync). Empirically confirmed by
+      m2/m3 + `txn_ft_search_snapshot` MVCC snapshot tests under tokio. No new cross-thread
+      lock. `cooperative_yield()` is `#[cfg]`-split per runtime (C4) — tokio:
+      `tokio::task::yield_now()`; monoio: `monoio::time::sleep(Duration::ZERO)` (registers a
+      thread-local `TimerEntry`, returns Pending → the search task PARKS so monoio's run loop
+      empties its ready queue and reaps the io_uring CQ — see effectiveness section). BOTH
+      primitives are thread-local: no cross-thread waker, no cross-thread lock.
+- [x] no exposed secrets, injection openings, or unexpected dependencies — no new crates; the
+      capture parses the same client-supplied KNN args the legacy path already parsed; no
+      new I/O, no logging of query content. audit-unsafe 218/218 (0 new unsafe blocks),
+      audit-unwrap 0 new (a `match` replaced one annotated `as_of_lsn_opt.unwrap()`).
+- [x] layering & dependencies follow CONVENTIONS.md — capture lives in the command layer
+      (`command/vector_search/ft_search/dispatch.rs`), the seam in the engine layer
+      (`vector/segment/holder.rs`), yield primitive in `runtime/` (runtime-abstracted, C4).
+      The `Box<SearchSnapshot>` is ONE alloc per FT.SEARCH command (clippy::large_enum_variant
+      fix) — NOT per-key/per-chunk, so G-HOTPATH (no per-chunk alloc on the resume path)
+      holds; IVF query buffers are allocated once per query before the segment loop. The Box
+      is covered by the §3 SAFETY-NET clause (one per-query alloc authorized). The C3 default
+      `FT_SEARCH_YIELD_BUDGET.max_brute_force_vecs_per_chunk` is tuned to **16384** (the monoio
+      timer-yield knee, see effectiveness section), operator-overridable via the
+      `MOON_FT_YIELD_CHUNK` env var resolved once in `ft_search_yield_budget()` (OnceLock; no
+      per-query parse). The env knob is a no-RSS, no-lock read of process env at first use.
+- [ ] a person reviewed and approved the change — **gate escalated to human** (concurrency +
+      architecture residue; not auto-PASS per run.md). Pending.
 
 ### Deep checks — do not skim (fill the path that applies; the resolver judges which)
-- [ ] WIRING (code) — every new symbol is referenced; record where / how confirmed
-- [ ] DEAD-CODE (code) — no new unused or orphaned symbol introduced
-- [ ] SEMANTIC (prose / non-code) — read in full, not skimmed: <what read · what confirmed>
+- [x] WIRING (code) — every new symbol is referenced:
+      `ft_search_capture` + `FtSearchPlan` → re-exported in `vector_search/mod.rs` and called
+      in BOTH `handler_monoio/ft.rs:756,764` and `handler_sharded/ft.rs:659,667`;
+      `SegmentHolder::search_mvcc_yielding` → called in both handlers' Yield arm;
+      `SearchSnapshot`/`YieldBudget`/`FT_SEARCH_YIELD_BUDGET`/`load_full` → used by the seam +
+      capture + handlers; `cooperative_yield` → called in the seam; INFO counter
+      `ft_search_cooperative_yields_total` → written in `connection.rs`, asserted by m1.
+      All confirmed via grep reference search + the m1 GREEN signal (the counter only bumps if
+      the live wire path executed).
+- [x] DEAD-CODE (code) — no new orphan: the old synchronous FT.SEARCH branch was REMOVED from
+      both `with_shard` closures (not left behind); `handler_single.rs` left intentionally
+      unwired and DOCUMENTED (legacy `run_with_shutdown`/embedded path — Mutex-guarded shared
+      store, task-per-connection, no shard event loop; off the moon-binary FT.SEARCH path,
+      `main.rs` calls `run_sharded` only). clippy -D warnings (both runtimes) reports zero
+      unused/dead-code.
+
+### Build-shape findings (recorded; none altered the frozen §3 contract)
+1. Dispatch is SYNCHRONOUS (`with_shard` closures + `handle_shard_message_shared`), not
+   "already async" as the §3 build-note assumed. Resolved within frozen guarantees: the async
+   seam sits at the connection-handler layer; cross-shard scatter targets stay sync (§1-OUT).
+2. Mutable segment mutates in place (freeze-first isolation risk). Resolved: the append-only
+   invariant makes the chunked captured-length scan byte-identical to sync — no data copy, no
+   RSS growth (Arc refcount bump only).
+3. §3 C5 prose floated a tick/drain proxy counter; the frozen §4 test + build use a dedicated
+   `ft_search_cooperative_yields_total` counter — a stronger, deterministic anchor, consistent
+   with C4. Not a contract change.
+4. clippy::large_enum_variant → boxed the `Yield` snapshot (one per-query alloc; §3 SAFETY-NET).
+
+### M1 effectiveness — MEASURED, a monoio defect found + fixed (full record: `tmp/bench_ftsearch/RESULTS.md`)
+Disk was cleaned (host freed to 26Gi; builds moved to VM home volume) and M1 effectiveness WAS
+benchmarked on moon-dev (1-shard, 99k×768d brute-force mutable, COMPACT_THRESHOLD 100000, no
+compaction; co-located PING latency while N threads loop a heavy FT.SEARCH). This surfaced the §1
+lowest-confidence assumption as a REAL defect and drove the user's "fix monoio yield, re-bench"
+decision (2026-06-15):
+
+1. **First bench exposed a monoio-only defect.** The original `cooperative_yield()` = self-wake
+   (`waker.wake_by_ref()` + Pending). On monoio's single-threaded io_uring loop the self-woken
+   search task re-enters the ready queue every poll, so the loop never drains → never reaps the
+   io_uring CQ → the co-located PING's read completion is never reaped until the search finishes.
+   Result: co-located p99 ≈ T_search (68ms ≈ 44ms sync) — the yield fired (counter +386/search)
+   but relieved NOTHING. On tokio the SAME code achieved the goal for free (p99 6ms « 63ms search)
+   because tokio's scheduler pumps its I/O driver on an interval between task polls. **M1 was UNMET
+   on monoio (the default production runtime).** → HARD-STOP back to build (Reject `no_yield_progress`).
+
+2. **The fix: runtime-split `cooperative_yield()` (C4).** tokio keeps `yield_now()`; monoio uses
+   `monoio::time::sleep(Duration::ZERO)` — registers a `TimerEntry`, returns Pending → the search
+   PARKS → monoio's task queue empties → the run loop `park()`s → the io_uring CQ is reaped
+   (co-located reads serviced) → the expired timer re-wakes the search. Verified this reaps the CQ.
+   Cost: each monoio `sleep(ZERO)` ≈ 1.4ms (timer-wheel granularity), so the chunk must be COARSE.
+
+3. **Re-bench (monoio, post-fix) — GOAL NOW MET.** Chunk sweep found the knee at
+   `max_brute_force_vecs_per_chunk = 16384` (new default): co-located PING p99 **6.6ms** (1-thread)
+   / **27ms** (3-thread saturated) vs sync **48ms / ~300ms** — **~7–11× relief**. The 1ms tick now
+   fires + `drain_spsc_shared` runs mid-search. tokio gets the same relief for free.
+
+**Trade-off (the §1 tuning flag, now quantified — monoio only):** the timer-yield is not free.
+Heavy brute-force searches over a large *uncompacted* mutable segment pay ~**+19% latency / −22%
+search QPS** at chunk=16384 (coarser chunk=32768 → −14% QPS / 14.9ms p99; finer 1024 → −82% QPS /
+0.9ms p99 — full sweep in RESULTS.md, `MOON_FT_YIELD_CHUNK`-tunable). **Light/HNSW searches whose
+total work is < one chunk never yield → ZERO cost** — the tax falls only on the transient
+heavy-brute-force window before background compaction installs the HNSW graph. tokio pays ~0.
 
 ### GATE RECORD
-Outcome: <PASS | RISK-ACCEPTED | HARD-STOP>
+Outcome: <PASS | RISK-ACCEPTED | HARD-STOP>   (recommendation: PASS — M1 MET on BOTH runtimes
+  (monoio p99 6.6/27ms vs sync 48/300ms; tokio 6ms for free), correctness + MVCC + dual-runtime
+  green, zero new unsafe/lock/RSS. Residual: monoio's −22% heavy-search QPS at the default chunk
+  is a documented, env-tunable trade-off, not a defect — operating point is the human's call.)
 If RISK-ACCEPTED -> owner: <name> · ticket: <link> · expires: <date>   (never for a security gap)
 Reviewed by: <name> · date: <date>
 
