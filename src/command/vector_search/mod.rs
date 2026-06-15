@@ -41,8 +41,8 @@ pub use ft_invalidate_range::ft_invalidate_range;
 #[cfg(feature = "graph")]
 pub use ft_search::ft_search_with_graph;
 pub use ft_search::{
-    ft_search, merge_search_results, parse_ft_search_args, parse_session_clause, search_local,
-    search_local_filtered,
+    FtSearchPlan, ft_search, ft_search_capture, merge_search_results, parse_ft_search_args,
+    parse_session_clause, search_local, search_local_filtered,
 };
 #[cfg(feature = "text-index")]
 pub use ft_text_search::{FieldFilter, pre_parse_field_filter};
