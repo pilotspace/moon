@@ -6,6 +6,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance — FT.SEARCH no longer stalls the shard event loop (PR #179)
+
+A heavy `FT.SEARCH` (large brute-force mutable segment or deep HNSW traversal)
+used to run fully synchronously on its shard's event loop, blocking the 1ms
+tick and every co-located command on that shard until the search returned.
+The per-shard local search slice now captures an owned, point-in-time snapshot
+of the index at entry and walks the same logical steps cooperatively, yielding
+to the event loop between bounded chunks so the tick fires and co-located
+`PING`/`GET` are serviced while the search is in flight. Results are
+byte-identical to the synchronous path (the mutable segment is append-only, so
+a chunked scan over the captured length matches an atomic scan), MVCC snapshot
+isolation is preserved, and there is no new cross-thread lock and no
+steady-state RSS growth. The cooperative yield is runtime-specific: tokio uses
+`yield_now()`; monoio uses a zero-duration timer park, because a bare self-wake
+never lets monoio's io_uring loop reap the completion queue (it would be a
+silent no-op). Measured co-located `PING` p99 during a heavy search drops from
+~48 ms (1 client) / ~300 ms (3 clients) to **6.6 ms / 27 ms** — roughly 7–11×
+relief — on both runtimes. The yield costs throughput only on a large
+*uncompacted* brute-force scan (operator-tunable via `MOON_FT_YIELD_CHUNK`);
+light and HNSW searches whose work is under one chunk never yield and pay
+nothing. The cross-shard scatter-gather, merge/rerank, and result semantics are
+unchanged.
+
 ### Performance — WAL group commit under `appendfsync=always` (PR #178)
 
 Concurrent writes pending at the same shard now coalesce into a single
