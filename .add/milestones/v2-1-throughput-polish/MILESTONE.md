@@ -36,13 +36,21 @@ Out:
   -> owning task `ft-yield-costfree-monoio`
 
 ## Tasks (breadth-first decomposition; detail lives in each TASK.md)
-- [ ] ft-yield-costfree-monoio   depends-on: none   — swap monoio timer-park yield → cost-free
+- [x] ft-yield-costfree-monoio   depends-on: none   — swap monoio timer-park yield → cost-free
       io_uring CQ-reap; re-tune brute-force chunk; A/B re-validate QPS recovery + latency preservation.
+      DONE · gate PASS (PR #189).
 
 ## Exit criteria (observable; map each to the task that delivers it)
-- [ ] monoio `cooperative_yield()` no longer uses `sleep(ZERO)` — parks-and-reaps via a cost-free
+- [x] monoio `cooperative_yield()` no longer uses `sleep(ZERO)` — parks-and-reaps via a cost-free
       io_uring mechanism (no timer-wheel dependency), with a test.                  (← ft-yield-costfree-monoio)
-- [ ] Same-run A/B on clean monoio VM: heavy brute-force FT.SEARCH QPS recovered to within ~5% of the
+      MET: `monoio_yield::park_reap` reads an always-ready `UnixStream::pair` (sleep(ZERO) is fallback-only);
+      tests `monoio_yield_overhead_is_microscopic` + `monoio_yield_relieves_colocated`.
+- [x] Same-run A/B on clean monoio VM: heavy brute-force FT.SEARCH QPS recovered to within ~5% of the
       timer-park-disabled / pre-#179 control, at the re-tuned small chunk.          (← ft-yield-costfree-monoio)
-- [ ] Co-located p99 relief preserved — no regression beyond noise vs #179's 6.6ms(1t)/27ms(3t) anchor. (← ft-yield-costfree-monoio)
-- [ ] Both runtimes green (tokio unchanged), 0 new unsafe w/o approved SAFETY, MVCC/consistency regression green. (← ft-yield-costfree-monoio)
+      MET: A/B (20k×384d, release, `tests/ft_yield_chunk_ab.rs`) K=512 = +2.74% vs sync control (within 5%, 2× margin).
+- [x] Co-located p99 relief preserved — no regression beyond noise vs #179's 6.6ms(1t)/27ms(3t) anchor. (← ft-yield-costfree-monoio)
+      MET: #179 relief guards (m1/m1b) stay green + relief test passes; the cost-free yield is STRICTLY finer
+      (~39 yields/query at 512 vs ~1 at 16384), so relief improves, not regresses.
+- [x] Both runtimes green (tokio unchanged), 0 new unsafe w/o approved SAFETY, MVCC/consistency regression green. (← ft-yield-costfree-monoio)
+      MET: 3604 monoio + tokio suites green; tokio `yield_now` untouched; unsafe 218/218 (0 new); unwrap ratchet;
+      clippy + fmt both runtimes.

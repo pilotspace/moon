@@ -111,13 +111,13 @@
       "title": "Throughput Polish (recover v2-deferred costs)",
       "goal": "On monoio, FT.SEARCH's off-event-loop yield reaps the io_uring CQ without timer-wheel latency, so the brute-force chunk shrinks back to its latency-optimal size and reclaims the ~22% throughput #179 deferred, with #179's co-located latency relief preserved.",
       "stage": "production",
-      "status": "active",
+      "status": "done",
       "created": "2026-06-15T11:57:00+00:00",
-      "updated": "2026-06-15T11:57:00+00:00"
+      "updated": "2026-06-15T14:49:42+00:00"
     }
   },
   "created": "2026-06-11T03:18:21+00:00",
-  "updated": "2026-06-15T14:39:07+00:00",
+  "updated": "2026-06-15T14:49:42+00:00",
   "setup": {
     "locked": true,
     "locked_at": "2026-06-11T03:28:00+00:00",
