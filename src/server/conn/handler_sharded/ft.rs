@@ -627,6 +627,79 @@ pub(super) async fn try_handle_ft_command(
         None
     };
 
+    // FT.SEARCH cooperative-yield seam (ft-search-off-eventloop §3): capture an
+    // OWNED snapshot inside the shard slice, release the borrow, then `.await` the
+    // chunked yielding search so a heavy KNN scan interleaves with the 1ms tick and
+    // co-located commands instead of monopolizing the event loop. Non-yieldable
+    // shapes (HYBRID/SPARSE/SESSION/RANGE/non-default-field/unknown-index/parse-error)
+    // come back as `FtSearchPlan::Sync` from the proven synchronous path —
+    // byte-identical to the legacy behavior. (Multi-shard scatter + text fast paths
+    // already returned above; only the single-shard local vector path reaches here.)
+    if cmd.eq_ignore_ascii_case(b"FT.SEARCH") {
+        // as_of_lsn_opt is Some when cmd == FT.SEARCH (resolved just above).
+        let as_of_lsn = match as_of_lsn_opt {
+            Some(Ok(lsn)) => lsn,
+            Some(Err(err_frame)) => {
+                responses.push(err_frame);
+                return true;
+            }
+            None => 0,
+        };
+        let has_session = cmd_args.iter().any(|a| {
+            if let Frame::BulkString(b) = a {
+                b.eq_ignore_ascii_case(b"SESSION")
+            } else {
+                false
+            }
+        });
+        let plan = crate::shard::slice::with_shard(|s| {
+            if has_session {
+                // Borrow databases[0] disjointly from vector_store/text_store.
+                let (vs, ts, dbs) = (&mut s.vector_store, &s.text_store, &mut s.databases);
+                crate::command::vector_search::ft_search_capture(
+                    vs,
+                    cmd_args,
+                    Some(&mut dbs[0]),
+                    Some(ts),
+                    as_of_lsn,
+                )
+            } else {
+                crate::command::vector_search::ft_search_capture(
+                    &mut s.vector_store,
+                    cmd_args,
+                    None,
+                    Some(&s.text_store),
+                    as_of_lsn,
+                )
+            }
+        }); // shard-slice borrow released here — snapshot is owned ('static)
+        let mut response = match plan {
+            crate::command::vector_search::FtSearchPlan::Sync(frame) => frame,
+            crate::command::vector_search::FtSearchPlan::Yield {
+                mut snapshot,
+                offset,
+                count,
+            } => {
+                let results = crate::vector::segment::holder::SegmentHolder::search_mvcc_yielding(
+                    &mut *snapshot,
+                    crate::vector::segment::holder::ft_search_yield_budget(),
+                )
+                .await;
+                crate::command::vector_search::build_search_response(
+                    &results,
+                    &snapshot.key_hash_to_key,
+                    offset,
+                    count,
+                )
+            }
+        };
+        if let Some(ws_id) = conn.workspace_id.as_ref() {
+            strip_workspace_prefix_from_response(ws_id, cmd, &mut response);
+        }
+        responses.push(response);
+        return true;
+    }
+
     // Unconditional slice path: ShardSlice is always initialized.
     // All companion stores (vector_store, text_store, databases[0], graph_store)
     // accessed from ONE with_shard closure to avoid re-entrant RefCell borrows.
@@ -637,39 +710,6 @@ pub(super) async fn try_handle_ft_command(
                 &mut s.text_store,
                 cmd_args,
             )
-        } else if cmd.eq_ignore_ascii_case(b"FT.SEARCH") {
-            #[allow(clippy::unwrap_used)] // as_of_lsn_opt is Some when cmd == FT.SEARCH
-            match as_of_lsn_opt.unwrap() {
-                Err(err_frame) => err_frame,
-                Ok(as_of_lsn) => {
-                    let has_session = cmd_args.iter().any(|a| {
-                        if let Frame::BulkString(b) = a {
-                            b.eq_ignore_ascii_case(b"SESSION")
-                        } else {
-                            false
-                        }
-                    });
-                    if has_session {
-                        // Borrow databases[0] disjointly from vector_store/text_store.
-                        let (vs, ts, dbs) = (&mut s.vector_store, &s.text_store, &mut s.databases);
-                        crate::command::vector_search::ft_search(
-                            vs,
-                            cmd_args,
-                            Some(&mut dbs[0]),
-                            Some(ts),
-                            as_of_lsn,
-                        )
-                    } else {
-                        crate::command::vector_search::ft_search(
-                            &mut s.vector_store,
-                            cmd_args,
-                            None,
-                            Some(&s.text_store),
-                            as_of_lsn,
-                        )
-                    }
-                }
-            }
         } else if cmd.eq_ignore_ascii_case(b"FT.DROPINDEX") {
             let (vs, ts, dbs) = (&mut s.vector_store, &mut s.text_store, &mut s.databases);
             crate::command::vector_search::ft_dropindex(vs, ts, Some(&mut dbs[0]), cmd_args)
