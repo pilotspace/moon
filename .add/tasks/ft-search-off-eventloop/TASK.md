@@ -1,6 +1,6 @@
 # TASK: FT.SEARCH off-event-loop: a heavy vector/text query must not stall the shard's 1ms tick or co-located commands
 
-slug: ft-search-off-eventloop · created: 2026-06-15 · stage: production
+slug: ft-search-off-eventloop · created: 2026-06-15 · stage: production · risk: high · autonomy: conservative
 phase: specify   <!-- specify -> scenarios -> contract -> tests -> build -> verify -> observe -> done -->
 <!-- high-risk/method-defining scope? declare `risk: high` on the slug line above and lower
      the autonomy level with `autonomy: conservative` — the engine refuses an unguarded completion
@@ -14,24 +14,115 @@ phase: specify   <!-- specify -> scenarios -> contract -> tests -> build -> veri
 
 ## 1 · SPECIFY — the rules ▸ docs/03-step-1-specify.md
 
-Feature: <name>
-Framings weighed: <chosen> (chosen) · <alternative> · <alternative>
+Feature: FT.SEARCH (and the heavy FT.* read path) must not monopolize a shard's event loop.
+moon ALREADY scatter-gathers across shards concurrently (each shard searches its local slice, the
+coordinator merges + reranks — `src/shard/scatter_hybrid.rs`, `merge_search_results`). The defect is
+INTRA-shard: each shard runs its local slice (`search_local_*` → `idx.segments.search_mvcc` — brute-force
+mutable scan + per-immutable-segment HNSW traversal at ef_search 200–1000 + TQ/SQ8 decode) FULLY
+SYNCHRONOUSLY on its event-loop task (`ft_search/execute.rs:38/208`, no `.await`/`spawn_blocking`). While
+that runs, the shard cannot fire its 1ms tick, cannot `drain_spsc_shared` (256 msgs/cycle), and co-located
+PING/GET/SET pile up in the SPSC ring until the search returns. **Fix = make the per-shard local slice
+yield cooperatively between bounded chunks** (per-segment / per-N-graph-nodes) so the shard interleaves its
+queued commands + the 1ms tick — single-threaded, NO new cross-thread lock, NO snapshot, NO RSS growth. The
+cross-shard scatter-gather, the merge/rerank/filter, and FT.SEARCH result semantics are UNCHANGED.
+
+Ground truth (investigation 2026-06-15, file:line): FT.SEARCH dispatch `spsc_handler.rs:1820`
+(`dispatch_vector_command`) → `ft_search/dispatch.rs:50` → `ft_search/execute.rs:38 search_local_raw` /
+`:208 search_local_filtered` → `vector/segment/holder.rs:126 search_mvcc` — all synchronous, no yield. The
+shard event loop `shard/event_loop.rs:987` runs ONE task; the 1ms `periodic_interval` (`:692`, fires `:1204`)
+drives `cached_clock.update` + `drain_spsc_shared` + WAL/snapshot tick — none can run while a search blocks.
+Concurrency model: the vector engine is single-threaded-by-construction — `VectorStore::indexes`,
+`VectorIndex::{key_hash_to_key, payload_index, scratch}` are PLAIN unsynchronized HashMaps/structs (no Arc /
+RwLock); only `segments: ArcSwap<SegmentList>` (`holder.rs:51`) is concurrency-safe. A write (HSET
+auto-index, compaction install via `segments.swap`) and a read never overlap today because both run on the
+shard thread. A YIELD breaks that "never overlap" assumption: between two chunks of a paused search, a
+co-located HSET/compaction-install can run on the same thread (intra-thread re-entrancy) and mutate
+`key_hash_to_key` / `payload_index` / install a new segment list — so the yield's correctness rests on the
+search reading a STABLE snapshot across yields (the `ArcSwap` `Guard` held for the whole search) and never
+re-reading mutated metadata mid-result.
+
+Framings weighed: cooperative yield, single-thread (CHOSEN — user 2026-06-15: the only path that honors the
+milestone's no-new-cross-thread-lock + no-RSS-growth constraints; snapshot/offload were declined milestone-wide
+for the same low-RSS reason) · worker-thread offload below the shards (REJECTED — frees the loop + uses idle
+cores, but the worker reads unsynchronized per-index metadata ⇒ needs Arc/RwLock or per-query snapshot ⇒
+the locks/RAM the milestone forbids) · hybrid bounded-work-per-tick (declined — same low-RSS profile but needs
+the synchronous HNSW traversal refactored into a resumable state machine; more invasive than natural yields).
+Scope: FT.SEARCH + FT.* vector/text read path (the heavy queries); FT.AGGREGATE/hybrid reuse the same local
+slice. OUT: the cross-shard scatter mechanism, the merge/rerank, write-path indexing, compaction.
 Must:
 <must>
-  - <required behavior>
+  - M0 (baseline anchor — the stall, per-runtime relative): on moon-dev, fresh-server, drive a HEAVY FT.SEARCH
+    on a shard while issuing a stream of co-located simple commands (PING/GET) to the SAME shard; record p99
+    (and max) of those co-located commands — the "before" stall — for monoio and tokio, best-of-N. Record
+    FT.SEARCH recall + top-k ordering as the unchanged-control. State the win as a RELATIVE before/after on
+    the same instrument (milestone bench rule); confirm the instrument can resolve co-located p99 before
+    anchoring (the wal-group-commit instrument-validity lesson — CONVENTIONS foundation v2).
+  - M1 (the win): during a heavy FT.SEARCH, the shard's local slice yields between bounded chunks so the 1ms
+    tick fires and `drain_spsc_shared` runs while the search is in flight ⇒ co-located PING/GET p99 on that
+    shard stays under a recorded bound, measurably below M0. The yield granularity is BOUNDED (a cap on
+    work per chunk — segments and/or graph-node visits) so neither the co-located p99 (too-coarse) nor
+    per-query overhead (too-fine) is unbounded.
+  - M2 (result-identity invariant — freeze-first): the FT.SEARCH response (the returned doc set, score
+    ordering, top-k/LIMIT, payload/numeric filter, num_docs, key resolution via `key_hash_to_key`) is
+    BYTE-IDENTICAL to the pre-change synchronous path for the same data + query. Cooperative yielding changes
+    WHEN the work runs, never WHAT it returns.
+  - M3 (MVCC / re-entrancy safety): a write that runs on the shard thread DURING a yield of an in-flight
+    search (HSET auto-index, compaction installing a new `SegmentList`, a delete/`mark_deleted`) is INVISIBLE
+    to that search — it observes the stable `ArcSwap` `SegmentList` `Guard` it captured at start, and never
+    reads post-yield-mutated `key_hash_to_key` / `payload_index` for a result it already gathered. Existing
+    MVCC/temporal isolation tests (`tests/ft_search_concurrent_readers.rs`, `ft_search_as_of_*`) stay GREEN,
+    and a NEW test asserts a concurrent HSET issued mid-search is not reflected in that search's result.
+  - M4 (no-regression guardrail): single-query end-to-end latency is not materially worse than the
+    synchronous path (yield overhead bounded, no per-chunk heap alloc on the event-loop hot path); the
+    cross-shard scatter-gather + merge/rerank are unchanged; `scripts/test-consistency.sh` 197/197 @1/4/12;
+    dual-runtime green; clippy ×2 + `fmt`; zero new `unsafe`; **zero new cross-thread lock; steady-state RSS
+    not grown** (the milestone's hard constraints); no new allocation on command dispatch / event loop.
 </must>
 Reject:
 <reject>
-  - <bad input / situation> -> "<error_code>"
+  - a yield path that changes the search result (recall, ordering, top-k, filter, num_docs, key mapping)
+    vs the synchronous path -> "result_not_identical"
+  - a write committed on the shard thread during a yield becoming visible to the in-flight search that
+    captured its snapshot before that write -> "snapshot_straddle" (MVCC violation)
+  - a co-located command (HSET/compaction/delete) running during a yield corrupting `SearchScratch` or the
+    per-index metadata the paused search is mid-iteration on -> "reentrancy_corruption"
+  - a "yield" that does not actually relinquish to the event loop (co-located p99 still stalls for the full
+    search) -> "no_yield_progress" (the win is absent — a bound, asserted by M1)
+  - a per-chunk heap allocation / lock acquisition on the event-loop hot path introduced by the yield
+    machinery -> "hotpath_alloc_or_lock" (violates the milestone hot-path + zero-lock rule)
 </reject>
 After:
 <after>
-  - <state that is true once it succeeds>
+  - A heavy FT.SEARCH runs as a sequence of bounded, cooperatively-yielding chunks on its shard's event loop;
+    co-located PING/GET p99 on that shard stays under the recorded bound (measurably below M0) while the
+    search is in flight; the search RESULT, MVCC isolation, cross-shard scatter-gather, RSS, and the
+    zero-cross-thread-lock invariant are all unchanged; consistency 197/197 and the FT.* suites green on both
+    runtimes.
 </after>
 Assumptions — lowest-confidence first:
 <assumptions>
-  ⚠ <the one assumption most likely to be wrong> — lowest confidence because <why>; if wrong: <cost>
-  - [ ] <next assumption, ranked> — confirm or deny; never carry an open one forward
+  ⚠ A cooperative yield inserted into the synchronous local search preserves MVCC/result identity EXACTLY —
+    lowest confidence because the search reads `scratch` + `key_hash_to_key` + `payload_index` that are NOT
+    snapshotted (only `segments` is, via `ArcSwap`), so a yield that lets a co-located HSET/compaction/delete
+    run mid-search could change metadata the search still depends on; getting the snapshot boundary exactly
+    right (capture the `Guard` once, resolve keys only against captured state, never re-read mutated maps) is
+    the freeze-first risk — if wrong: silently wrong/inconsistent FT.SEARCH results or a crash under
+    concurrent write load (the milestone's correctness-parity bar broken).
+  ⚠ Yielding relieves co-located p99 WITHOUT making single-query latency materially worse — the shard still
+    does all the search work, just interleaved; if chunk granularity is too coarse the p99 isn't relieved,
+    too fine the yield overhead dominates a query — lowest-confidence on the tuning, not the direction; if
+    wrong: the win is marginal or trades query latency for it (an effectiveness miss, re-tune the cap).
+  - [ ] the synchronous HNSW traversal (`ImmutableSegment::search`) + the brute-force mutable scan can be
+        chunked at NATURAL boundaries (per-segment, and per-N-node within a segment) without a full async
+        rewrite of the vector engine — confirm the search loop exposes a yield point; if wrong, scope grows
+        to a resumable-iterator refactor (the rejected hybrid framing).
+  - [ ] DiskANN cold-tier search (NVMe beam reads) and warm mmap page-faults are coarse enough that
+        per-segment yields suffice (they already do blocking I/O) — confirm; if wrong, those tiers need their
+        own yield cadence (likely already I/O-yielding).
+  - [ ] the OrbStack VM can resolve co-located-p99-under-FT.SEARCH as a stable RELATIVE signal (a latency
+        metric, jitter-sensitive) — confirm instrument validity BEFORE anchoring M1 (CONVENTIONS foundation
+        v2: a perf Must can be un-measurable on the only instrument); if wrong, anchor on a deterministic
+        proxy (tick-fired-count / SPSC-drained-count during a search) instead of wall-clock p99.
 </assumptions>
 
 <!-- EXIT: every rule stated, every rejection named; assumptions ranked lowest-confidence first, the top one or two ⚠-flagged with why + cost (or, for trivial scope, an honest "none material" that still names the single biggest risk). -->
