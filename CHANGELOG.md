@@ -59,7 +59,7 @@ production callers. **Breaking:** `moon --cross-shard-fast-path …` now exits
 non-zero with a clap unknown-argument error — remove it from any launch
 script. The internal `scripts/bench-cross-shard-fastpath.sh` is also deleted.
 
-### Performance — Lock-free cross-shard read recovery (idle-gated reply spin)
+### Performance — Lock-free cross-shard read recovery (idle-gated reply spin) (PR #177)
 
 Cross-shard single-key reads recover a meaningful share of the latency the
 shared-nothing migration (PR #175) gave up, **without** re-introducing a
