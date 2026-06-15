@@ -1,7 +1,7 @@
 # TASK: FT.SEARCH off-event-loop: a heavy vector/text query must not stall the shard's 1ms tick or co-located commands
 
 slug: ft-search-off-eventloop · created: 2026-06-15 · stage: production · risk: high · autonomy: conservative
-phase: scenarios   <!-- specify -> scenarios -> contract -> tests -> build -> verify -> observe -> done -->
+phase: contract   <!-- specify -> scenarios -> contract -> tests -> build -> verify -> observe -> done -->
 <!-- high-risk/method-defining scope? declare `risk: high` on the slug line above and lower
      the autonomy level with `autonomy: conservative` — the engine refuses an unguarded completion
      (`unguarded_high_risk_auto`, run.md guard). A comment is never a declaration. -->
@@ -221,14 +221,90 @@ Scenario: reject hotpath_alloc_or_lock
 
 ## 3 · CONTRACT — freeze the shape ▸ docs/05-step-3-contract.md
 
+This is an INTERNAL Rust seam, not a wire API — the frozen shape is the
+yielding search seam + its capture-before-yield invariant. The FT.SEARCH RESP
+surface is UNCHANGED (frozen elsewhere, Redis-compatible). Names from GLOSSARY:
+shard event loop · segment (vector) · hot path.
+
 ```
-<METHOD> <path>   body: { <fields> }
-  200 -> { <success fields> }
-  4xx -> { error: "<code>" | "<code>" }
-Schema: <tables/fields touched, and access pattern>
+# ---- C1 · the captured snapshot (the consistency anchor) ----
+# Taken at search entry WHILE the &mut VectorIndex borrow is held, BEFORE the
+# first yield. After capture the search holds NO borrow into VectorStore/Index.
+struct SearchSnapshot {
+    segments:        Arc<SegmentList>,             // idx.segments.load_full() — O(1) Arc refcount bump, NOT a data copy (no RSS growth)
+    key_hash_to_key: Arc<HashMap<u64, Bytes>>,     // captured at START (not after the loop) so a mid-search delete cannot drop a needed entry
+    filter_bitmap:   Option<RoaringBitmap>,        // materialized from payload_index BEFORE the loop (already is, execute.rs:113)
+    committed:       Arc<TxnTreemap> | owned clone, // MVCC committed set, captured with the segments
+    query_f32:       Vec<f32>,                      // owned (already is)
+    scratch:         SearchScratch,                 // OWNED by the query for its duration — NOT a &mut into idx.scratch held across a yield
+    k: usize, ef_search: usize, snapshot_lsn: u64,
+}
+# Invariant CAP: SearchSnapshot is captured atomically under one &mut idx borrow;
+# that borrow is dropped before the first cooperative_yield().await.
+
+# ---- C2 · the yielding seam ----
+async fn search_mvcc_yielding(
+    snap:   &mut SearchSnapshot,
+    budget: YieldBudget,
+) -> SmallVec<[SearchResult; 32]>
+#   walks the SAME logical steps as the sync search_mvcc, in the SAME order
+#   (brute-force mutable → per-immutable HNSW → warm → cold → ivf → merge:
+#    all.sort_unstable(); all.truncate(k)), against `snap` ONLY;
+#   awaits cooperative_yield() between bounded chunks (per-segment, and within a
+#   segment every budget.max_graph_nodes_per_chunk node-visits).
+#   Holds only owned `snap` state across every yield — zero borrow into idx/store.
+
+# ---- C3 · the explicit bounded cap ----
+struct YieldBudget {                               // the M1 "bounded granularity" knob
+    max_segments_per_chunk:        usize,          // default 1 (yield between segments)
+    max_graph_nodes_per_chunk:     usize,          // default const — yield inside a large HNSW segment
+    max_brute_force_vecs_per_chunk:usize,          // default const — yield inside a large mutable scan
+}
+const FT_SEARCH_YIELD_BUDGET: YieldBudget = …;     // named defaults; tuned at M1
+
+# ---- C4 · runtime-abstracted cooperative yield (both runtimes) ----
+async fn cooperative_yield();   // monoio: monoio::time::yield equiv · tokio: tokio::task::yield_now
+#   relinquishes to the shard event loop so the 1ms tick + drain_spsc_shared run, then resumes.
+
+# ---- C5 · M0/M1 deterministic proxy counters (non-jitter anchor) ----
+# observable per-shard: ticks fired and drain_spsc_shared cycles that ran during a search window.
+# (reuse existing tick/drain counters sampled around the search; exposed for the M1 assert.)
 ```
 
-Status: DRAFT
+Guarantees (each maps to a Must / a Reject response):
+- G-IDENTITY (M2 / `result_not_identical`): `search_mvcc_yielding(snap)` is byte-identical to the sync `search_mvcc` for the same `snap` — same per-segment order, same `sort_unstable`+`truncate(k)`, same `key_hash_to_key` resolution. Pinned by a differential test (oracle = sync path; the yielding path with an ∞ budget MUST equal it).
+- G-ISOLATION (M3 / `snapshot_straddle`): results derive solely from `snap` captured at entry; a write committed after capture (segment `swap`, `key_hash_to_key` insert/delete, `mark_deleted`) is invisible to this search, visible to the NEXT. Key resolution uses the START-captured `key_hash_to_key`, never an end-of-loop re-read.
+- G-NOBORROW (M3 / `reentrancy_corruption`): the yielding seam holds NO `&mut VectorStore`/`&mut VectorIndex`/`&mut idx.scratch` borrow across any `cooperative_yield().await` — it owns `snap` (incl. its own `SearchScratch`). A co-located write runs on the released borrow without aliasing the search's owned state.
+- G-PROGRESS (M1 / `no_yield_progress`): the seam awaits `cooperative_yield()` at least once per `YieldBudget` of work; during one heavy search the C5 proxy shows ticks-fired > 0 and drain cycles > 0 (vs ~0 on the sync path).
+- G-HOTPATH (M4 / `hotpath_alloc_or_lock`): the per-chunk resume path performs NO heap alloc (`Box`/`Vec`/`format!`) and acquires NO lock; the snapshot is captured ONCE at entry (one `load_full` + one `key_hash_to_key` Arc/clone); no per-chunk allocation, no new cross-thread lock, steady-state RSS not grown.
+- G-UNCHANGED (M4): cross-shard scatter (`scatter_hybrid.rs`), `merge_search_results`, the FT.SEARCH RESP response builder (`response.rs`), write-path indexing, and compaction are UNTOUCHED.
+
+SAFETY-NET clause (pre-authorized build fallback — approved at freeze v1, Tin Dang): if owning /
+re-installing the per-index `idx.scratch` across a yield is NOT cleanly expressible, the build MAY
+allocate the yielding search's `SearchScratch` ONCE per query at capture time (a single allocation at
+entry, BEFORE the first yield) instead of moving `idx.scratch`. This per-QUERY allocation does NOT
+violate G-HOTPATH (which forbids per-CHUNK alloc on the resume path) and is NOT an RSS-growth breach
+(one transient scratch freed at query end, not retained state). It is an explicit, contracted deviation
+— taking it does NOT re-open SPECIFY. Any OTHER divergence from C1–C5 still re-opens SPECIFY.
+
+Build-surface note (not a guarantee — a ripple the build owns): `search_local_raw` /
+`search_local_filtered` / `search_local` become async (they `.await` the yielding seam),
+rippling to both call sites — the direct FT.SEARCH dispatch (`spsc_handler.rs:1820` →
+`ft_search/dispatch.rs`) and the cross-shard `ShardMessage::VectorSearch` handler. Both already
+run on the (async) shard event loop. The contract does not fix HOW the async ripple is wired,
+only that the seam's five guarantees hold.
+
+Least-sure flag surfaced at freeze: ⚠ [contract] G-NOBORROW + scratch-ownership is the freeze-first
+risk — the sync path runs the WHOLE search holding `&mut idx` (incl. `&mut idx.scratch`); the contract
+forces that borrow to be released before the first yield and the search to own its `SearchScratch` +
+an `Arc<SegmentList>` (`load_full`) + a START-captured `key_hash_to_key`. If owning/re-installing the
+per-index scratch is not cleanly expressible (or `load_full` + map-clone-at-start subtly changes
+ordering), either G-IDENTITY (byte-identical result) or G-HOTPATH (no per-chunk alloc) breaks →
+re-open SPECIFY. Second flag: ⚠ [spec] M1's anchor — wall-clock co-located p99 may be too jittery on
+the VM; mitigated by the C5 deterministic proxy (tick/drain counts during the search) as the primary
+assert, p99 as corroboration.
+
+Status: FROZEN @ v1 — approved by Tin Dang 2026-06-15 (with SAFETY-NET clause for scratch ownership)
 <!-- The freeze IS the one approval — lead it with the bundle's lowest-confidence flag: the 1–2
      points most likely wrong across the whole bundle, tagged [spec|scenario|contract|test], each
      with why + cost (the §1 ⚠ assumptions feed it; a flag may point at a scenario or the contract
