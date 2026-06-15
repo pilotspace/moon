@@ -440,13 +440,13 @@ Spec delta for the next loop:
   the win is asserted by the deterministic seam test + the on-disk crash-survival suites, not by a VM RPS delta.
 
 ### Competency deltas
-- [TDD · open] a frozen RED test can itself be wrong: `commit_write_fail_acks_write_failed` double-consumed a flume
+- [TDD · folded] a frozen RED test can itself be wrong: `commit_write_fail_acks_write_failed` double-consumed a flume
   `bounded(1)` (use-after-consume) — the fix was intent-preserving + human-approved, never a weakening
   (evidence: failed `left: Err(Disconnected)` vs `right: Ok(WriteFailed)`; my impl acked both waiters WriteFailed).
-- [SDD · open] the contract invariant "`CommitOutcome.write_failed` ⇒ the latch must engage" applied to all 4 writer
+- [SDD · folded] the contract invariant "`CommitOutcome.write_failed` ⇒ the latch must engage" applied to all 4 writer
   loops, but the pre-existing tokio-TopLevel loop never carried a `write_error` latch (nor the fsync-fail injection) —
   group commit made the latent durability gap explicit (evidence: adversarial Finding 2 @0.97; fixed `2750d1c`).
-- [ADD · open] a perf Must can be un-measurable on the only available instrument: the OrbStack VM's near-free fsync
+- [ADD · folded] a perf Must can be un-measurable on the only available instrument: the OrbStack VM's near-free fsync
   makes the group-commit win structurally invisible (batch≈1; `always`≈0.9M RPS, no 11× penalty) — §1 ranked exactly
   this risk lowest-confidence (assumption #4); confirm instrument validity BEFORE committing to a perf Must
   (evidence: 0.98× ratio, conc-sweep no-trend within ±10% VM noise).
