@@ -25,6 +25,36 @@ pub mod channel;
 pub mod race;
 pub mod traits;
 
+/// Cooperatively relinquish to the shard event loop exactly once, then resume.
+///
+/// Runtime-agnostic (works on both monoio and tokio): a one-shot future that
+/// returns `Pending` on its first poll after re-arming its own waker, then
+/// `Ready` on the next. The executor parks this task, drains other ready work
+/// (the 1ms tick, co-located commands, the SPSC drain), and re-polls us. Used by
+/// the FT.SEARCH local slice (`ft-search-off-eventloop`) to interleave a heavy
+/// search with the rest of the loop instead of monopolizing it. No allocation,
+/// no lock, no cross-thread wake (the self-wake is always local to this thread).
+pub async fn cooperative_yield() {
+    struct YieldOnce(bool);
+    impl std::future::Future for YieldOnce {
+        type Output = ();
+        fn poll(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<()> {
+            if self.0 {
+                std::task::Poll::Ready(())
+            } else {
+                self.0 = true;
+                // Re-arm locally so the executor re-polls us after other ready work.
+                cx.waker().wake_by_ref();
+                std::task::Poll::Pending
+            }
+        }
+    }
+    YieldOnce(false).await;
+}
+
 #[cfg(feature = "runtime-tokio")]
 pub mod tokio_impl;
 

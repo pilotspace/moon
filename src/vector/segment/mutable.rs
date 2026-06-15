@@ -555,6 +555,15 @@ impl MutableSegment {
     }
 
     /// MVCC-aware brute-force search using TurboQuant_prod L2 distance.
+    ///
+    /// Scans the half-open entry range `[start, end)` (clamped to the current
+    /// entry count). The mutable segment is APPEND-ONLY (entries only `push`;
+    /// deletes set `delete_lsn` in place — never removal/reorder), so a caller
+    /// that captured `end = len` at search start can scan `[0, end)` across
+    /// cooperative yields and remain isolation-correct: appends committed during
+    /// a yield land at indices ≥ `end` (invisible to this scan), and deletes set
+    /// `delete_lsn > snapshot_lsn` (still visible to this snapshot via
+    /// `is_visible`). Full-scan callers pass `0..len`. (ft-search-off-eventloop)
     pub fn brute_force_search_mvcc(
         &self,
         query_f32: &[f32],
@@ -564,8 +573,12 @@ impl MutableSegment {
         snapshot_lsn: u64,
         my_txn_id: u64,
         committed: &roaring::RoaringTreemap,
+        start: usize,
+        end: usize,
     ) -> SmallVec<[SearchResult; 32]> {
         let inner = self.inner.read();
+        let hi = end.min(inner.entries.len());
+        let lo = start.min(hi);
         let dim = inner.dimension as usize;
         let padded = inner.padded_dimension as usize;
         let bytes_per_code = inner.bytes_per_code;
@@ -576,7 +589,7 @@ impl MutableSegment {
             let q = Sq8Query::prepare(query_f32, self.collection.metric);
             let q = q.as_slice();
             let mut heap: BinaryHeap<DistF32> = BinaryHeap::with_capacity(k + 1);
-            for entry in &inner.entries {
+            for entry in &inner.entries[lo..hi] {
                 if !is_visible(
                     entry.insert_lsn,
                     entry.delete_lsn,
@@ -646,7 +659,7 @@ impl MutableSegment {
 
         let mut heap: BinaryHeap<DistF32> = BinaryHeap::with_capacity(k + 1);
 
-        for entry in &inner.entries {
+        for entry in &inner.entries[lo..hi] {
             if !is_visible(
                 entry.insert_lsn,
                 entry.delete_lsn,
@@ -1626,7 +1639,8 @@ mod tests {
         let qs = make_query_state(&vectors[0], &col);
 
         let non_mvcc = seg.brute_force_search(&vectors[0], Some(&qs), 3);
-        let mvcc = seg.brute_force_search_mvcc(&vectors[0], Some(&qs), 3, None, 0, 0, &committed);
+        let mvcc =
+            seg.brute_force_search_mvcc(&vectors[0], Some(&qs), 3, None, 0, 0, &committed, 0, usize::MAX);
 
         assert_eq!(non_mvcc.len(), mvcc.len());
         for (a, b) in non_mvcc.iter().zip(mvcc.iter()) {

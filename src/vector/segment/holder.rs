@@ -46,6 +46,71 @@ pub struct SegmentList {
     pub cold: Vec<Arc<DiskAnnSegment>>,
 }
 
+/// Bounded cooperative-yield cap for the FT.SEARCH local slice
+/// (ft-search-off-eventloop, §3 C3). The search relinquishes to the shard event
+/// loop between chunks bounded by these caps — coarse enough that per-query
+/// overhead stays negligible, fine enough that co-located commands are not
+/// starved for the whole search.
+#[derive(Clone, Copy, Debug)]
+pub struct YieldBudget {
+    /// Yield after this many immutable/warm/cold/ivf segments (default 1: per-segment).
+    pub max_segments_per_chunk: usize,
+    /// Reserved cap for yielding inside one large HNSW segment's traversal
+    /// (per-node). Honored where the traversal exposes a yield point; bounds the
+    /// segment-entry threshold above which the per-segment yield is taken.
+    pub max_graph_nodes_per_chunk: usize,
+    /// Mutable brute-force scan chunk size: the scan is split into ranges of this
+    /// many entries, yielding between chunks (the mutable segment is append-only,
+    /// so chunked scanning over the captured length is isolation-correct).
+    pub max_brute_force_vecs_per_chunk: usize,
+}
+
+/// Default yield cap for FT.SEARCH. 256 vectors/chunk keeps a chunk well under a
+/// millisecond of scan while bounding the co-located stall; per-segment (1) is
+/// the natural immutable boundary.
+pub const FT_SEARCH_YIELD_BUDGET: YieldBudget = YieldBudget {
+    max_segments_per_chunk: 1,
+    max_graph_nodes_per_chunk: 4096,
+    max_brute_force_vecs_per_chunk: 256,
+};
+
+/// Owned, `'static` capture of everything a yielding FT.SEARCH local slice reads
+/// (ft-search-off-eventloop, §3 C1). Built under one `&mut VectorIndex` borrow
+/// at search entry, BEFORE the first yield; after capture the search holds NO
+/// borrow into `VectorStore`/`VectorIndex`. `segments` is an O(1) `Arc` refcount
+/// bump (not a data copy); `mutable_len` + `snapshot_lsn` pin an isolation-stable
+/// view of the append-only mutable segment across yields.
+pub struct SearchSnapshot {
+    /// Owned segment-list snapshot (immune to concurrent `swap`).
+    pub segments: Arc<SegmentList>,
+    /// Query vector (owned).
+    pub query_f32: Vec<f32>,
+    /// Top-k.
+    pub k: usize,
+    /// HNSW ef_search (resolved at capture).
+    pub ef_search: usize,
+    /// Pre-evaluated payload/numeric filter bitmap (owned), or None.
+    pub filter_bitmap: Option<RoaringBitmap>,
+    /// MVCC snapshot LSN captured at entry — governs visibility across yields.
+    pub snapshot_lsn: u64,
+    /// Active txn id (0 for non-transactional reads).
+    pub my_txn_id: u64,
+    /// Committed-treemap snapshot (owned) for MVCC visibility.
+    pub committed: roaring::RoaringTreemap,
+    /// Vector dimension.
+    pub dimension: u32,
+    /// Entry count of the mutable segment captured at entry. The append-only
+    /// invariant makes `[0, mutable_len)` a stable scan range across yields.
+    pub mutable_len: usize,
+    /// Owned scratch for this query (SAFETY-NET clause: a single per-query alloc
+    /// at capture, never per-chunk — does not violate G-HOTPATH).
+    pub scratch: SearchScratch,
+    /// Key-hash → key map captured at START (§3 C1) so a mid-search delete cannot
+    /// drop an entry this search still needs to resolve. Used by the response
+    /// builder, not the segment scan.
+    pub key_hash_to_key: std::collections::HashMap<u64, bytes::Bytes>,
+}
+
 /// Lock-free segment holder. Searches load() once at query start and hold
 /// the Arc for the query duration -- immune to concurrent swaps.
 pub struct SegmentHolder {
@@ -72,6 +137,15 @@ impl SegmentHolder {
     /// Single atomic load, lock-free, wait-free. This is the hot-path read.
     pub fn load(&self) -> arc_swap::Guard<Arc<SegmentList>> {
         self.segments.load()
+    }
+
+    /// Owned snapshot of the segment list: a single atomic `Arc` refcount bump
+    /// (O(1), NOT a data copy — no RSS growth). Unlike `load()`'s borrowed
+    /// `Guard`, the returned `Arc` can be held across a cooperative yield with no
+    /// borrow into the index — the capture-before-yield anchor for
+    /// `search_mvcc_yielding` (ft-search-off-eventloop).
+    pub fn load_full(&self) -> Arc<SegmentList> {
+        self.segments.load_full()
     }
 
     /// Atomically replace the segment list. Old segments are dropped when
@@ -377,7 +451,7 @@ impl SegmentHolder {
             None
         };
 
-        // 1. MVCC-aware brute-force
+        // 1. MVCC-aware brute-force (full mutable scan: 0..len)
         let mut all = snapshot.mutable.brute_force_search_mvcc(
             query_f32,
             query_state.as_ref(),
@@ -386,6 +460,8 @@ impl SegmentHolder {
             mvcc.snapshot_lsn,
             mvcc.my_txn_id,
             mvcc.committed,
+            0,
+            usize::MAX,
         );
 
         // 2. HNSW search on immutable segments (TQ-ADC distance).
@@ -468,6 +544,171 @@ impl SegmentHolder {
         // (transactional writes are rare in vector workloads).
 
         // 4. Merge all results, take global top-k
+        all.sort_unstable();
+        all.truncate(k);
+        all
+    }
+
+    /// Cooperatively-yielding twin of [`Self::search_mvcc`]
+    /// (ft-search-off-eventloop, §3 C2). Associated fn (NO `&self`) driving the
+    /// chunked search against an owned [`SearchSnapshot`] — it holds no borrow
+    /// into `VectorStore`/`VectorIndex` across any yield (§3 G-NOBORROW), so a
+    /// co-located write may run between chunks on the same shard thread.
+    ///
+    /// Runs the SAME steps in the SAME order as `search_mvcc`, producing a
+    /// BYTE-IDENTICAL result (§3 G-IDENTITY): the mutable brute-force is chunked
+    /// over the append-only captured range `[0, mutable_len)` and each chunk's
+    /// top-k merges into the same global top-k a single full scan yields;
+    /// immutable/warm/cold/ivf segments are committed-by-definition and yielded
+    /// between. Relinquishes to the shard event loop (and bumps the C5 proxy
+    /// counter) between bounded chunks (§3 G-PROGRESS).
+    pub async fn search_mvcc_yielding(
+        snap: &mut SearchSnapshot,
+        budget: YieldBudget,
+    ) -> SmallVec<[SearchResult; 32]> {
+        // Capture-before-yield: move all read-only inputs into owned locals so
+        // the per-chunk loops touch only `snap.scratch` (mutably) — no aliasing
+        // borrow of `snap`. `key_hash_to_key` stays in `snap` for the response
+        // builder; the moved fields are unused after the search.
+        let segments = Arc::clone(&snap.segments);
+        let query_f32 = std::mem::take(&mut snap.query_f32);
+        let filter_bitmap = snap.filter_bitmap.take();
+        let committed = std::mem::take(&mut snap.committed);
+        let query_f32 = query_f32.as_slice();
+        let filter_ref = filter_bitmap.as_ref();
+        let k = snap.k;
+        let ef_search = snap.ef_search;
+        let snapshot_lsn = snap.snapshot_lsn;
+        let my_txn_id = snap.my_txn_id;
+        let mutable_len = snap.mutable_len;
+
+        // Prepare TurboQuant_prod query state for mutable search (same as sync).
+        let collection = segments.mutable.collection();
+        let query_state = if !collection.qjl_matrices.is_empty() {
+            Some(crate::vector::turbo_quant::inner_product::prepare_query_prod(
+                query_f32,
+                &collection.qjl_matrices,
+                collection.fwht_sign_flips.as_slice(),
+                collection.padded_dimension as usize,
+            ))
+        } else {
+            None
+        };
+
+        let mut all: SmallVec<[SearchResult; 32]> = SmallVec::new();
+
+        // 1. MVCC brute-force over the captured append-only range [0, mutable_len),
+        //    chunked + cooperatively yielded between chunks. Each chunk's top-k
+        //    merges into the same global top-k a single full scan produces.
+        let chunk = budget.max_brute_force_vecs_per_chunk.max(1);
+        let mut start = 0usize;
+        while start < mutable_len {
+            let end = (start + chunk).min(mutable_len);
+            let part = segments.mutable.brute_force_search_mvcc(
+                query_f32,
+                query_state.as_ref(),
+                k,
+                filter_ref,
+                snapshot_lsn,
+                my_txn_id,
+                &committed,
+                start,
+                end,
+            );
+            all.extend(part);
+            start = end;
+            if start < mutable_len {
+                crate::admin::metrics_setup::bump_ft_search_cooperative_yield();
+                crate::runtime::cooperative_yield().await;
+            }
+        }
+
+        let seg_cap = budget.max_segments_per_chunk.max(1);
+        let mut since_yield = 0usize;
+
+        // 2. HNSW search on immutable segments (committed by definition).
+        for imm in &segments.immutable {
+            if filter_ref.is_some() {
+                all.extend(imm.search_filtered(query_f32, k, ef_search, &mut snap.scratch, filter_ref));
+            } else {
+                all.extend(imm.search(query_f32, k, ef_search, &mut snap.scratch));
+            }
+            since_yield += 1;
+            if since_yield >= seg_cap {
+                since_yield = 0;
+                crate::admin::metrics_setup::bump_ft_search_cooperative_yield();
+                crate::runtime::cooperative_yield().await;
+            }
+        }
+
+        // 2a. Warm segment search (committed by definition, same as immutable).
+        for warm_seg in &segments.warm {
+            if filter_ref.is_some() {
+                all.extend(warm_seg.search_filtered(query_f32, k, ef_search, &mut snap.scratch, filter_ref));
+            } else {
+                all.extend(warm_seg.search(query_f32, k, ef_search, &mut snap.scratch));
+            }
+            since_yield += 1;
+            if since_yield >= seg_cap {
+                since_yield = 0;
+                crate::admin::metrics_setup::bump_ft_search_cooperative_yield();
+                crate::runtime::cooperative_yield().await;
+            }
+        }
+
+        // 2b. Cold segment search (DiskANN, committed by definition).
+        for cold_seg in &segments.cold {
+            all.extend(cold_seg.search(query_f32, k, 8));
+            since_yield += 1;
+            if since_yield >= seg_cap {
+                since_yield = 0;
+                crate::admin::metrics_setup::bump_ft_search_cooperative_yield();
+                crate::runtime::cooperative_yield().await;
+            }
+        }
+
+        // 2c. IVF segment search (IVF entries are committed by definition).
+        if !segments.ivf.is_empty() {
+            let dim = query_f32.len();
+            let pdim = padded_dimension(dim as u32) as usize;
+            // Allocate query rotation + LUT buffers ONCE per query (not per chunk).
+            let mut q_rotated = vec![0.0f32; pdim];
+            let mut lut_buf = vec![0u8; pdim * 16];
+
+            for ivf_seg in &segments.ivf {
+                q_rotated.iter_mut().for_each(|v| *v = 0.0);
+                q_rotated[..dim].copy_from_slice(query_f32);
+                let qnorm: f32 = query_f32.iter().map(|x| x * x).sum::<f32>().sqrt();
+                if qnorm > 0.0 {
+                    let inv = 1.0 / qnorm;
+                    for v in q_rotated[..dim].iter_mut() {
+                        *v *= inv;
+                    }
+                }
+                fwht::fwht(&mut q_rotated, ivf_seg.sign_flips());
+
+                if let Some(bm) = filter_ref {
+                    all.extend(ivf_seg.search_filtered(
+                        query_f32,
+                        &q_rotated,
+                        k,
+                        DEFAULT_NPROBE,
+                        &mut lut_buf,
+                        bm,
+                    ));
+                } else {
+                    all.extend(ivf_seg.search(query_f32, &q_rotated, k, DEFAULT_NPROBE, &mut lut_buf));
+                }
+                since_yield += 1;
+                if since_yield >= seg_cap {
+                    since_yield = 0;
+                    crate::admin::metrics_setup::bump_ft_search_cooperative_yield();
+                    crate::runtime::cooperative_yield().await;
+                }
+            }
+        }
+
+        // 4. Merge all results, take global top-k (identical to search_mvcc).
         all.sort_unstable();
         all.truncate(k);
         all
