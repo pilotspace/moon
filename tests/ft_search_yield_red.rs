@@ -355,7 +355,11 @@ fn m1b_colocated_ping_progress_during_search() {
     for i in 0..2000u32 {
         let key = format!("doc:{i}");
         let a = (i % 97) as f32 / 97.0;
-        hset_vec(&mut setup, key.as_bytes(), [a, 1.0 - a, a * 0.5, 1.0 - a * 0.5]);
+        hset_vec(
+            &mut setup,
+            key.as_bytes(),
+            [a, 1.0 - a, a * 0.5, 1.0 - a * 0.5],
+        );
     }
 
     // Connection A fires a continuous stream of heavy searches; connection B
@@ -408,7 +412,10 @@ fn m2_topk_known_neighbors_keys_resolved() {
 
     let reply = ft_search(&mut s);
     let count = ft_search_count(&reply).expect("FT.SEARCH count parses");
-    assert!(count >= 1, "expected at least the exact-match doc, got {count}");
+    assert!(
+        count >= 1,
+        "expected at least the exact-match doc, got {count}"
+    );
     assert!(
         reply.windows(5).any(|w| w == b"doc:a"),
         "G-IDENTITY: the exact-match key `doc:a` must be in the result, got {:?}",
@@ -448,7 +455,10 @@ fn m3_write_visible_and_consistent() {
     hset_vec(&mut s, b"doc:c", [0.0, 0.0, 1.0, 0.0]);
     std::thread::sleep(Duration::from_millis(60));
     let c1 = ft_search_count(&ft_search(&mut s)).expect("count");
-    assert_eq!(c1, 3, "the new doc is visible to a subsequent search (write not lost)");
+    assert_eq!(
+        c1, 3,
+        "the new doc is visible to a subsequent search (write not lost)"
+    );
     drop(guard);
 }
 
@@ -478,6 +488,9 @@ fn m4_ft_basic_correctness_smoke() {
         String::from_utf8_lossy(&info_reply)
     );
     let count = ft_search_count(&ft_search(&mut s)).expect("count");
-    assert_eq!(count, 10, "FT.SEARCH must see all 10 indexed docs, got {count}");
+    assert_eq!(
+        count, 10,
+        "FT.SEARCH must see all 10 indexed docs, got {count}"
+    );
     drop(guard);
 }

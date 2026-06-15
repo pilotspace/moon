@@ -585,12 +585,14 @@ impl SegmentHolder {
         // Prepare TurboQuant_prod query state for mutable search (same as sync).
         let collection = segments.mutable.collection();
         let query_state = if !collection.qjl_matrices.is_empty() {
-            Some(crate::vector::turbo_quant::inner_product::prepare_query_prod(
-                query_f32,
-                &collection.qjl_matrices,
-                collection.fwht_sign_flips.as_slice(),
-                collection.padded_dimension as usize,
-            ))
+            Some(
+                crate::vector::turbo_quant::inner_product::prepare_query_prod(
+                    query_f32,
+                    &collection.qjl_matrices,
+                    collection.fwht_sign_flips.as_slice(),
+                    collection.padded_dimension as usize,
+                ),
+            )
         } else {
             None
         };
@@ -629,7 +631,13 @@ impl SegmentHolder {
         // 2. HNSW search on immutable segments (committed by definition).
         for imm in &segments.immutable {
             if filter_ref.is_some() {
-                all.extend(imm.search_filtered(query_f32, k, ef_search, &mut snap.scratch, filter_ref));
+                all.extend(imm.search_filtered(
+                    query_f32,
+                    k,
+                    ef_search,
+                    &mut snap.scratch,
+                    filter_ref,
+                ));
             } else {
                 all.extend(imm.search(query_f32, k, ef_search, &mut snap.scratch));
             }
@@ -644,7 +652,13 @@ impl SegmentHolder {
         // 2a. Warm segment search (committed by definition, same as immutable).
         for warm_seg in &segments.warm {
             if filter_ref.is_some() {
-                all.extend(warm_seg.search_filtered(query_f32, k, ef_search, &mut snap.scratch, filter_ref));
+                all.extend(warm_seg.search_filtered(
+                    query_f32,
+                    k,
+                    ef_search,
+                    &mut snap.scratch,
+                    filter_ref,
+                ));
             } else {
                 all.extend(warm_seg.search(query_f32, k, ef_search, &mut snap.scratch));
             }
@@ -697,7 +711,13 @@ impl SegmentHolder {
                         bm,
                     ));
                 } else {
-                    all.extend(ivf_seg.search(query_f32, &q_rotated, k, DEFAULT_NPROBE, &mut lut_buf));
+                    all.extend(ivf_seg.search(
+                        query_f32,
+                        &q_rotated,
+                        k,
+                        DEFAULT_NPROBE,
+                        &mut lut_buf,
+                    ));
                 }
                 since_yield += 1;
                 if since_yield >= seg_cap {

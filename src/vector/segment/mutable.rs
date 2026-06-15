@@ -1639,8 +1639,17 @@ mod tests {
         let qs = make_query_state(&vectors[0], &col);
 
         let non_mvcc = seg.brute_force_search(&vectors[0], Some(&qs), 3);
-        let mvcc =
-            seg.brute_force_search_mvcc(&vectors[0], Some(&qs), 3, None, 0, 0, &committed, 0, usize::MAX);
+        let mvcc = seg.brute_force_search_mvcc(
+            &vectors[0],
+            Some(&qs),
+            3,
+            None,
+            0,
+            0,
+            &committed,
+            0,
+            usize::MAX,
+        );
 
         assert_eq!(non_mvcc.len(), mvcc.len());
         for (a, b) in non_mvcc.iter().zip(mvcc.iter()) {

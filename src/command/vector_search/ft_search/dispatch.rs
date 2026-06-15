@@ -455,6 +455,212 @@ pub fn ft_search(
     }
 }
 
+/// Execution plan produced by [`ft_search_capture`] — the capture half of the
+/// cooperative-yield split (ft-search-off-eventloop, §3 C1). Built under one
+/// `&mut VectorStore` borrow inside `with_shard`; the `Yield` variant owns its
+/// snapshot (no borrow into the store) so the caller can drop the borrow and
+/// `.await` the yielding search.
+pub enum FtSearchPlan {
+    /// Plain dense-KNN on the default field — yieldable. The caller runs
+    /// `SegmentHolder::search_mvcc_yielding(&mut snapshot, budget).await` then
+    /// `build_search_response(&results, &snapshot.key_hash_to_key, offset, count)`
+    /// — byte-identical to the synchronous `search_local_filtered` (§3 G-IDENTITY).
+    Yield {
+        // Boxed: `SearchSnapshot` is ~320 bytes; `Sync(Frame)` is small. Boxing the
+        // large variant keeps the enum compact (clippy::large_enum_variant) at the
+        // cost of ONE alloc per FT.SEARCH command — not per-key/per-chunk, so it
+        // does NOT violate G-HOTPATH (which forbids per-chunk alloc on the resume
+        // path) and falls under the §3 SAFETY-NET (one per-query alloc authorized).
+        snapshot: Box<crate::vector::segment::holder::SearchSnapshot>,
+        offset: usize,
+        count: usize,
+    },
+    /// Every other FT.SEARCH shape (HYBRID / SPARSE / SESSION / RANGE /
+    /// non-default field / unknown index / query parse error) — already fully
+    /// evaluated on the proven synchronous `ft_search` path. Byte-identical to
+    /// the legacy behavior; the complex paths keep their exact semantics and only
+    /// the hot dense-KNN path yields.
+    Sync(Frame),
+}
+
+/// Capture half of the yielding FT.SEARCH split (§3 C1). MUST run inside the
+/// shard-slice borrow (`with_shard`). For the plain dense-KNN default-field case
+/// it builds an owned [`SearchSnapshot`] and returns `Yield`; for every other
+/// shape (or any condition that would change the result) it runs the synchronous
+/// `ft_search` and returns `Sync(frame)`. The plain gate is a store-free arg scan;
+/// the store-phase capture mirrors `search_local_filtered`'s default-field path.
+pub fn ft_search_capture(
+    store: &mut VectorStore,
+    args: &[Frame],
+    db: Option<&mut crate::storage::db::Database>,
+    text_store: Option<&TextStore>,
+    as_of_lsn: u64,
+) -> FtSearchPlan {
+    // Store-free gate: only the plain dense-KNN path is yieldable.
+    let hybrid = matches!(
+        crate::command::vector_search::hybrid::parse_hybrid_modifier(args),
+        Ok(Some(_)) | Err(_)
+    );
+    let query_str = args
+        .get(1)
+        .and_then(crate::command::vector_search::extract_bulk);
+    let has_knn = query_str
+        .as_ref()
+        .map(|q| parse_knn_query(q).is_some())
+        .unwrap_or(false);
+    let not_plain = hybrid
+        || parse_sparse_clause(args).is_some()
+        || parse_session_clause(args).is_some()
+        || parse_range_clause(args).is_some()
+        || !has_knn;
+    if not_plain {
+        return FtSearchPlan::Sync(ft_search(store, args, db, text_store, as_of_lsn));
+    }
+
+    // Plain dense-KNN. Parse the inputs (store-free), then capture the snapshot.
+    let index_name = match args
+        .first()
+        .and_then(crate::command::vector_search::extract_bulk)
+    {
+        Some(b) => b,
+        None => return FtSearchPlan::Sync(ft_search(store, args, db, text_store, as_of_lsn)),
+    };
+    // query_str is Some here (has_knn implies it parsed).
+    let query_str = match query_str {
+        Some(q) => q,
+        None => return FtSearchPlan::Sync(ft_search(store, args, db, text_store, as_of_lsn)),
+    };
+    let (k, field_name, dense_param) = match parse_knn_query(&query_str) {
+        Some(t) => t,
+        None => return FtSearchPlan::Sync(ft_search(store, args, db, text_store, as_of_lsn)),
+    };
+    let blob = match extract_param_blob(args, &dense_param) {
+        Some(b) => b,
+        None => return FtSearchPlan::Sync(ft_search(store, args, db, text_store, as_of_lsn)),
+    };
+    let filter_expr = parse_filter_clause(args).or_else(|| parse_inline_filter(&query_str));
+    let (offset, count) = parse_limit_clause(args);
+
+    // Store phase: build the owned snapshot, or None → exact-frame sync fallback.
+    match capture_dense_knn_snapshot(
+        store,
+        index_name.as_ref(),
+        &blob,
+        k,
+        field_name.as_ref(),
+        filter_expr.as_ref(),
+        as_of_lsn,
+    ) {
+        Some(snapshot) => {
+            crate::vector::metrics::increment_search();
+            FtSearchPlan::Yield {
+                snapshot: Box::new(snapshot),
+                offset,
+                count,
+            }
+        }
+        None => FtSearchPlan::Sync(ft_search(store, args, db, text_store, as_of_lsn)),
+    }
+}
+
+/// Build the owned [`SearchSnapshot`] for a plain dense-KNN default-field search,
+/// mirroring `search_local_filtered`'s pre-search capture (§3 C1). Returns `None`
+/// for any condition the yielding path does not handle (unknown index, non-default
+/// field, query dimension mismatch) so the caller falls back to the exact-frame
+/// synchronous path. After this returns, NO borrow into the store remains.
+fn capture_dense_knn_snapshot(
+    store: &mut VectorStore,
+    index_name: &[u8],
+    query_blob: &[u8],
+    k: usize,
+    field_name: Option<&Bytes>,
+    filter: Option<&crate::vector::filter::FilterExpr>,
+    as_of_lsn: u64,
+) -> Option<crate::vector::segment::holder::SearchSnapshot> {
+    use crate::vector::hnsw::search::SearchScratch;
+    use crate::vector::segment::holder::SearchSnapshot;
+    use crate::vector::turbo_quant::encoder::padded_dimension;
+
+    // Clone committed treemap BEFORE get_index_mut (borrow-checker ordering),
+    // matching search_local_raw / search_local_filtered.
+    let committed = store.txn_manager().committed_treemap().clone();
+    let idx = store.get_index_mut(index_name)?;
+
+    // Default field only — non-default field stays on the sync path.
+    let dim = match field_name {
+        Some(fname) => {
+            let field_meta = idx.meta.find_field(fname)?;
+            if !fname.eq_ignore_ascii_case(&idx.meta.default_field().field_name) {
+                return None;
+            }
+            field_meta.dimension as usize
+        }
+        None => idx.meta.dimension as usize,
+    };
+
+    // Parse query vector (binary LE f32, or csv fallback) — mismatch → sync path
+    // reproduces the exact error frame.
+    let query_f32 = if query_blob.len() == dim * 4 {
+        let mut v = Vec::with_capacity(dim);
+        for chunk in query_blob.chunks_exact(4) {
+            v.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+        }
+        v
+    } else if let Ok(text) = std::str::from_utf8(query_blob) {
+        let parsed: Vec<f32> = text
+            .split(',')
+            .filter(|s| !s.is_empty())
+            .filter_map(|s| s.trim().parse::<f32>().ok())
+            .collect();
+        if parsed.len() != dim {
+            return None;
+        }
+        parsed
+    } else {
+        return None;
+    };
+
+    // Auto-compact (same side effect + timing as the sync path).
+    idx.try_compact();
+
+    let ef_search = if idx.meta.hnsw_ef_runtime > 0 {
+        idx.meta.hnsw_ef_runtime as usize
+    } else {
+        let base = (k * 20).max(200);
+        let dim_factor = if dim >= 768 {
+            2
+        } else if dim >= 384 {
+            3
+        } else {
+            2
+        };
+        (base * dim_factor / 2).clamp(200, 1000)
+    };
+
+    let filter_bitmap = filter.map(|f| {
+        let total = idx.segments.total_vectors();
+        idx.payload_index.evaluate_bitmap(f, total)
+    });
+
+    let segments = idx.segments.load_full();
+    let mutable_len = segments.mutable.len();
+
+    Some(SearchSnapshot {
+        segments,
+        query_f32,
+        k,
+        ef_search,
+        filter_bitmap,
+        snapshot_lsn: as_of_lsn,
+        my_txn_id: 0,
+        committed,
+        dimension: dim as u32,
+        mutable_len,
+        scratch: SearchScratch::new(0, padded_dimension(dim as u32)),
+        key_hash_to_key: idx.key_hash_to_key.clone(),
+    })
+}
+
 /// FT.SEARCH with optional EXPAND GRAPH support.
 ///
 /// Takes both VectorStore and an optional GraphStore reference. If the query

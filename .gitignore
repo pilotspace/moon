@@ -102,3 +102,4 @@ tmp/
 /target-tokio/
 /target-check-tokio/
 /target-check-monoio/
+/target-check/
