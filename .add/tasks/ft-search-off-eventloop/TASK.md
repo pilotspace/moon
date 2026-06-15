@@ -1,7 +1,7 @@
 # TASK: FT.SEARCH off-event-loop: a heavy vector/text query must not stall the shard's 1ms tick or co-located commands
 
 slug: ft-search-off-eventloop · created: 2026-06-15 · stage: production · risk: high · autonomy: conservative
-phase: verify   <!-- specify -> scenarios -> contract -> tests -> build -> verify -> observe -> done -->
+phase: done   <!-- specify -> scenarios -> contract -> tests -> build -> verify -> observe -> done -->
 <!-- high-risk/method-defining scope? declare `risk: high` on the slug line above and lower
      the autonomy level with `autonomy: conservative` — the engine refuses an unguarded completion
      (`unguarded_high_risk_auto`, run.md guard). A comment is never a declaration. -->
@@ -501,12 +501,17 @@ total work is < one chunk never yield → ZERO cost** — the tax falls only on 
 heavy-brute-force window before background compaction installs the HNSW graph. tokio pays ~0.
 
 ### GATE RECORD
-Outcome: <PASS | RISK-ACCEPTED | HARD-STOP>   (recommendation: PASS — M1 MET on BOTH runtimes
-  (monoio p99 6.6/27ms vs sync 48/300ms; tokio 6ms for free), correctness + MVCC + dual-runtime
-  green, zero new unsafe/lock/RSS. Residual: monoio's −22% heavy-search QPS at the default chunk
-  is a documented, env-tunable trade-off, not a defect — operating point is the human's call.)
-If RISK-ACCEPTED -> owner: <name> · ticket: <link> · expires: <date>   (never for a security gap)
-Reviewed by: <name> · date: <date>
+Outcome: PASS — M1 MET on BOTH runtimes (monoio co-located p99 6.6ms/27ms vs sync 48/300ms,
+  ~7–11× relief; tokio 6ms for free). Correctness + MVCC + dual-runtime + regression green;
+  zero new unsafe/cross-thread-lock/RSS. Operating point CONFIRMED by human at the gate:
+  default `max_brute_force_vecs_per_chunk = 16384` (the benchmarked knee — strongest co-located
+  relief). Residual: monoio's −22% heavy-search QPS at this chunk is a documented, env-tunable
+  (`MOON_FT_YIELD_CHUNK`) trade-off that falls ONLY on the transient uncompacted-brute-force
+  window (light/HNSW searches never yield → zero cost) — accepted as a non-defect trade, not a
+  RISK-ACCEPTED gap. The monoio yield defect found by the verify bench was FIXED (commit 7c4f8cd,
+  runtime-split timer-park), not deferred.
+If RISK-ACCEPTED -> owner: n/a · ticket: n/a · expires: n/a   (never for a security gap)
+Reviewed by: Tin Dang · date: 2026-06-15
 
 <!-- A security finding is ALWAYS HARD-STOP. Record exactly one outcome — no silent pass. -->
 
@@ -514,10 +519,37 @@ Reviewed by: <name> · date: <date>
 
 ## 7 · OBSERVE — feed the next loop ▸ docs/09-the-loop.md
 
-Watch (reuse scenarios as monitors): <error rate / per-rejection rate / latency>
-Spec delta for the next loop: <what production taught you>
+Watch (reuse scenarios as monitors):
+- `ft_search_cooperative_yields_total` (INFO) — the C5 proxy; a heavy FT.SEARCH that yields 0×
+  on monoio = regression of the timer-park primitive (e.g. a monoio bump that changes
+  `sleep(ZERO)` semantics) → the M1 win silently lost. Alert if heavy searches stop yielding.
+- co-located command p99 on a shard running FT.SEARCH (M1/M0 monitor) — re-run the
+  `tmp/bench_ftsearch` probe on real hardware to confirm the VM-measured 7–11× relief holds.
+- heavy-search QPS vs the −22% budget at chunk=16384 — if a real-disk/multi-core box shifts the
+  knee, retune `MOON_FT_YIELD_CHUNK` (the env knob exists precisely for this).
+
+Spec delta for the next loop:
+- The monoio yield cost (~1.4ms/`sleep(ZERO)`, timer-wheel-bound) is a real tax on heavy
+  brute-force search throughput. A FUTURE cost-free monoio yield — a self-pipe/NOP io_uring op
+  that pumps the CQ without a timer round-trip — would recover the −22% QPS. Out of scope here;
+  candidate v3 perf item (mirrors xshard-read-fastpath's deferred RCU residual).
+- Absolute co-located-p99 stays VM-untrusted (the §1 instrument flag held); GCloud bare-metal
+  absolute validation is the same deferred/optional item the milestone already carries for xshard.
 
 ### Competency deltas
-What did this loop teach the foundation? One line each, tagged by competency
-(`DDD · SDD · UDD · TDD · ADD`), status `open`, with evidence. See the `add` skill's `deltas.md`.
-<!-- e.g.  - [DDD · open] the model missed multi-tenancy (evidence: scenario_x failed) -->
+- [TDD · open] A full-green test suite does NOT prove a perf MECHANISM is EFFECTIVE — the §4
+  m1 counter test was green on monoio while the yield relieved nothing (co-located p99 ≈ full
+  search). Only the §6 effectiveness benchmark caught the no-op. Lesson: for a perf Must, a
+  mechanism-fired counter (proxy) and an effect-measured benchmark are DIFFERENT gates; the
+  proxy can pass while the effect is absent. (evidence: m1 green + RESULTS.md "GOAL UNMET" pre-fix.)
+- [ADD · open] A runtime-abstracted primitive (`#[cfg]`-split `cooperative_yield`) needs
+  per-runtime EFFECTIVENESS validation, not just per-runtime COMPILE+CORRECTNESS. The same
+  self-wake code was correct on both runtimes but effective only on tokio — monoio's io_uring
+  loop never reaps the CQ under a self-waking task. Lesson: when a contract guarantee (C4 "both
+  runtimes") rests on scheduler behavior, the verify plan must measure the behavior on EACH
+  runtime, not assume parity from shared code. (evidence: tokio p99 6ms vs monoio 68ms, identical code.)
+- [ADD · open] The verify-time benchmark earned a HARD-STOP→build→re-verify cycle WITHIN the
+  task (not a deferral) because disk was cleaned and the instrument was made to resolve the
+  signal — honoring the user's "gather real metrics for evidence" over the easier GATE-DEFER.
+  Lesson: prefer making the instrument work over deferring the measurement when the deferral
+  would hide a real defect. (evidence: monoio no-op would have shipped under the disk-full defer.)
