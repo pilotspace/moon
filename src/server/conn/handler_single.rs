@@ -1335,6 +1335,8 @@ pub async fn handle_connection(
                                                 Ok(None) => {
                                                     if crate::command::vector_search::is_text_query(
                                                         query_bytes.as_ref(),
+                                                    ) && !crate::command::vector_search::has_sparse_clause(
+                                                        cmd_args,
                                                     ) {
                                                         // Step 1: index_name.
                                                         let index_name = match cmd_args.first() {

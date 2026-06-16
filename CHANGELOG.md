@@ -6,6 +6,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — FT.SEARCH routing: prose "knn" searches as text, standalone SPARSE reaches the vector engine, no panic on the BM25 AND path (PR #192)
+
+`is_text_query` uppercased the query and matched the bare substring `KNN `, so a
+text search whose terms merely contained the word *knn* (e.g.
+`FT.SEARCH idx "knn tutorial"`) was misclassified as a vector query and fell to
+the KNN parser, returning `ERR invalid KNN query syntax` instead of text
+results. It now keys on the canonical `[KNN` vector-query bracket — prose
+containing "knn" searches as text while `*=>[KNN …]` still routes to the vector
+engine. A standalone `SPARSE @field $param` clause paired with a text-looking
+query string was silently dropped onto the text path (`is_text_query` only sees
+`args[1]`); a `has_sparse_clause` guard now defers any SPARSE-carrying query to
+the vector engine at every text-route gate. The three `.expect("posting exists")`
+on `TextStore::search_field`'s BM25 AND + scoring path are replaced with
+defensive control flow, so a vanished posting yields empty results instead of
+panicking the server. Output is byte-identical for all existing queries.
+
 ### Fixed — FT.SEARCH integer reply is the true total-matched, not the page size (PR #192)
 
 The first element of an `FT.SEARCH` reply (the match count) was capped at the

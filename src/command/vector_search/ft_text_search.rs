@@ -993,26 +993,44 @@ pub struct TextQueryClause {
 
 // ─── Query detection ─────────────────────────────────────────────────────────
 
-/// Returns `true` when the FT.SEARCH query is a text query.
+/// Returns `true` when the FT.SEARCH **query string** (`args[1]`) is a text query.
 ///
-/// A query is NOT a text query when:
-/// - It is exactly `*` (match-all for vector index scan)
-/// - It contains `"KNN "` (dense KNN query syntax)
-/// - It contains `"SPARSE "` after `@field` (sparse query syntax)
+/// This inspects ONLY the query string, so it can recognize the two query-string-level
+/// non-text forms:
+/// - exactly `*` (match-all for a vector index scan)
+/// - the canonical vector-KNN syntax `*=>[KNN k @field $param]`, identified by the `[KNN`
+///   bracket marker (case-insensitive)
 ///
-/// Everything else is treated as a text query (bare terms or `@field:(terms)`).
+/// Everything else is a text query — including prose that merely contains the word "knn"
+/// (e.g. `"knn tutorial"`), which the older bare-`"KNN "`-substring check wrongly routed to the
+/// vector engine (fts-query-routing-robustness R2).
+///
+/// CLAUSE-level retrievers (`SPARSE @f $p`, `HYBRID …`) live in SEPARATE args, NOT in the query
+/// string, so they are NOT visible here — routing defers them to `ft_search` via
+/// [`has_sparse_clause`] / `parse_hybrid_modifier` at the handler layer.
 pub fn is_text_query(query: &[u8]) -> bool {
     if query == b"*" {
         return false;
     }
-    // Avoid UTF-8 parse cost for the common case: just scan bytes.
-    // KNN queries look like: "*=>[KNN 10 @vec $q]"
-    // The distinguishing substring is "KNN " (case-insensitive scan).
+    // The canonical dense-KNN form is `*=>[KNN k @vec $q]`; the `[KNN` bracket is the unambiguous
+    // marker (a bare word "knn" in prose has no bracket). Case-insensitive byte scan, no allocation
+    // beyond the uppercase copy.
     let upper: Vec<u8> = query.iter().map(|b| b.to_ascii_uppercase()).collect();
-    if upper.windows(4).any(|w| w == b"KNN ") {
+    if upper.windows(4).any(|w| w == b"[KNN") {
         return false;
     }
     true
+}
+
+/// Returns `true` when the FT.SEARCH `args` carry a standalone `SPARSE @field $param` clause.
+///
+/// SPARSE is a separate argument (not part of the `args[1]` query string), so [`is_text_query`]
+/// cannot see it. Routing AND-s `!has_sparse_clause(args)` into every text-fast-path gate so a
+/// standalone-SPARSE query defers to `ft_search` (the vector/sparse engine) instead of being
+/// silently treated as pure text (fts-query-routing-robustness R3). SPARSE inside a HYBRID clause
+/// is handled separately and earlier by `parse_hybrid_modifier`.
+pub fn has_sparse_clause(args: &[Frame]) -> bool {
+    crate::command::vector_search::ft_search::parse::parse_sparse_clause(args).is_some()
 }
 
 // ─── Query parser ────────────────────────────────────────────────────────────
@@ -1561,7 +1579,8 @@ pub fn run_text_query_on_index(
         Ok(node) => {
             // fts-search-count-semantics C3: `total` is the true matched-and-resolvable count
             // (pre-truncation), so reply[0] is correct even when top_k truncates the returned page.
-            let (results, total) = eval_query_counted(text_index, &node, global_df, global_n, top_k);
+            let (results, total) =
+                eval_query_counted(text_index, &node, global_df, global_n, top_k);
             build_text_response_with_total(&results, total, offset, count)
         }
         // The five frozen wire codes (fts-query-combinators §3); never panics on malformed input.
@@ -2026,15 +2045,66 @@ mod tests {
 
     #[test]
     fn is_text_query_knn_is_not_text() {
+        // Canonical vector-KNN form (the `[KNN` bracket marker) stays NON-text.
         assert!(!is_text_query(b"*=>[KNN 10 @vec $query]"));
         assert!(!is_text_query(b"*=>[KNN 5 @embedding $q]"));
-        assert!(!is_text_query(b"knn 10")); // lowercase KNN
+    }
+
+    #[test]
+    fn is_text_query_prose_knn_is_text() {
+        // fts-query-routing-robustness R2: a bare word "knn" in prose (no `[KNN` bracket) is a TEXT
+        // query, not a malformed KNN query. SUPERSEDES the old `!is_text_query(b"knn 10")` assertion —
+        // the bare-substring detection wrongly routed these to ft_search → "ERR invalid KNN query syntax".
+        assert!(is_text_query(b"knn tutorial"));
+        assert!(is_text_query(b"learn knn basics"));
+        assert!(is_text_query(b"knn 10"));
+        assert!(is_text_query(b"KNN clustering")); // uppercase prose, still text (no bracket)
     }
 
     #[test]
     fn is_text_query_field_syntax_is_text() {
         assert!(is_text_query(b"@title:(machine learning)"));
         assert!(is_text_query(b"@body:(rust)"));
+    }
+
+    // ── has_sparse_clause + text-route predicate (fts-query-routing-robustness R3) ──────
+
+    fn args_of(parts: &[&str]) -> Vec<Frame> {
+        parts
+            .iter()
+            .map(|p| Frame::BulkString(Bytes::copy_from_slice(p.as_bytes())))
+            .collect()
+    }
+
+    #[test]
+    fn has_sparse_clause_detects_standalone() {
+        // R3: a standalone `SPARSE @field $param` clause is detected from the full args.
+        assert!(has_sparse_clause(&args_of(&[
+            "idx", "machine", "SPARSE", "@vec", "$q"
+        ])));
+        // A plain text query carries no SPARSE clause.
+        assert!(!has_sparse_clause(&args_of(&["idx", "machine learning"])));
+        assert!(!has_sparse_clause(&args_of(&["idx", "@title:(rust)"])));
+    }
+
+    #[test]
+    fn text_route_predicate_defers_sparse() {
+        // R3: the exact gate the 6 routing sites use — text route iff text query AND no SPARSE clause.
+        let sparse = args_of(&["idx", "machine", "SPARSE", "@vec", "$q"]);
+        let plain = args_of(&["idx", "machine learning"]);
+        let route = |a: &[Frame]| -> bool {
+            a.get(1)
+                .and_then(extract_bulk)
+                .is_some_and(|q| is_text_query(&q))
+                && !has_sparse_clause(a)
+        };
+        // args[1]="machine" alone IS a text query, but the SPARSE clause forces deferral to ft_search.
+        assert!(is_text_query(b"machine"));
+        assert!(
+            !route(&sparse),
+            "standalone SPARSE must defer to the vector engine"
+        );
+        assert!(route(&plain), "a plain text query takes the BM25 text path");
     }
 
     // ── parse_text_query ───────────────────────────────────────────────────────
