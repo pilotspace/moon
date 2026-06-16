@@ -1,7 +1,7 @@
 {
   "project": "moon",
   "stage": "production",
-  "active_task": "fts-query-combinators",
+  "active_task": "fts-query-routing-robustness",
   "active_milestone": "v3-1-fts-hardening",
   "tasks": {
     "hotpath-lock-quickwins": {
@@ -121,6 +121,40 @@
       ],
       "created": "2026-06-16T06:21:47+00:00",
       "updated": "2026-06-16T09:07:25+00:00"
+    },
+    "fts-upsert-incremental": {
+      "title": "Incremental posting-list upsert (kill O(V) per-doc scan)",
+      "phase": "done",
+      "gate": "PASS",
+      "milestone": "v3-1-fts-hardening",
+      "depends_on": [],
+      "created": "2026-06-16T10:34:55+00:00",
+      "updated": "2026-06-16T12:46:23+00:00",
+      "flag_verified": true
+    },
+    "fts-search-count-semantics": {
+      "title": "FT.SEARCH integer reply = true total-matched (RediSearch count semantics)",
+      "phase": "done",
+      "gate": "PASS",
+      "milestone": "v3-1-fts-hardening",
+      "depends_on": [
+        "fts-query-eval-dispatch"
+      ],
+      "created": "2026-06-16T12:48:50+00:00",
+      "updated": "2026-06-16T13:13:21+00:00",
+      "flag_verified": true
+    },
+    "fts-query-routing-robustness": {
+      "title": "FT.SEARCH routing robustness: SPARSE detection + no expect() on the BM25 AND path",
+      "phase": "done",
+      "gate": "PASS",
+      "milestone": "v3-1-fts-hardening",
+      "depends_on": [
+        "fts-query-eval-dispatch"
+      ],
+      "created": "2026-06-16T13:14:26+00:00",
+      "updated": "2026-06-16T13:41:08+00:00",
+      "flag_verified": true
     }
   },
   "milestones": {
@@ -174,7 +208,7 @@
     }
   },
   "created": "2026-06-11T03:18:21+00:00",
-  "updated": "2026-06-16T09:07:25+00:00",
+  "updated": "2026-06-16T13:41:08+00:00",
   "setup": {
     "locked": true,
     "locked_at": "2026-06-11T03:28:00+00:00",

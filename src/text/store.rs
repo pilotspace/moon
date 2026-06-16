@@ -457,17 +457,22 @@ impl TextIndex {
 
         // Build candidate bitmap: start from first term's doc_ids, AND with rest.
         let mut candidate_bitmap: RoaringBitmap = {
-            // Safety: term_postings is non-empty (query_terms non-empty guard above)
-            let first_posting = self.field_postings[field_idx]
-                .get_posting(term_postings[0].1)
-                .expect("posting exists: checked above");
+            // Defensive (no expect/panic): term_postings is non-empty and each posting was just
+            // verified present, but a missing posting here would mean the AND term has no docs ⇒
+            // no results. Never panic on the BM25 hot path.
+            let Some(first_posting) =
+                self.field_postings[field_idx].get_posting(term_postings[0].1)
+            else {
+                return Vec::new();
+            };
             first_posting.doc_ids.clone()
         };
 
         for (_, term_id) in &term_postings[1..] {
-            let posting = self.field_postings[field_idx]
-                .get_posting(*term_id)
-                .expect("posting exists: checked above");
+            // Defensive: an absent AND-term posting ⇒ empty intersection ⇒ no results.
+            let Some(posting) = self.field_postings[field_idx].get_posting(*term_id) else {
+                return Vec::new();
+            };
             candidate_bitmap &= &posting.doc_ids;
         }
 
@@ -495,9 +500,11 @@ impl TextIndex {
 
             let mut doc_score = 0.0f32;
             for (term, term_id) in &term_postings {
-                let posting = self.field_postings[field_idx]
-                    .get_posting(*term_id)
-                    .expect("posting exists: checked above");
+                // Defensive: skip a term whose posting vanished rather than panic; its BM25
+                // contribution is simply omitted (the doc already matched the AND candidate set).
+                let Some(posting) = self.field_postings[field_idx].get_posting(*term_id) else {
+                    continue;
+                };
 
                 // Rank-aligned TF lookup (fts-posting-rank-tf): sub-linear and correct after
                 // document updates. term_freqs is now kept in sorted-doc_id (rank) order, so the

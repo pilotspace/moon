@@ -1841,7 +1841,9 @@ pub(crate) fn dispatch_vector_command(
             crate::protocol::Frame::BulkString(b) => Some(b.as_ref()),
             _ => None,
         });
-        if query_bytes.map_or(false, vector_search::is_text_query) {
+        if query_bytes.map_or(false, vector_search::is_text_query)
+            && !vector_search::has_sparse_clause(args)
+        {
             return vector_search::ft_text_search(text_store, args);
         }
         // Existing vector search path (KNN / SPARSE / hybrid).

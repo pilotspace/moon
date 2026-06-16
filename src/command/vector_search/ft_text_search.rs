@@ -993,26 +993,44 @@ pub struct TextQueryClause {
 
 // ─── Query detection ─────────────────────────────────────────────────────────
 
-/// Returns `true` when the FT.SEARCH query is a text query.
+/// Returns `true` when the FT.SEARCH **query string** (`args[1]`) is a text query.
 ///
-/// A query is NOT a text query when:
-/// - It is exactly `*` (match-all for vector index scan)
-/// - It contains `"KNN "` (dense KNN query syntax)
-/// - It contains `"SPARSE "` after `@field` (sparse query syntax)
+/// This inspects ONLY the query string, so it can recognize the two query-string-level
+/// non-text forms:
+/// - exactly `*` (match-all for a vector index scan)
+/// - the canonical vector-KNN syntax `*=>[KNN k @field $param]`, identified by the `[KNN`
+///   bracket marker (case-insensitive)
 ///
-/// Everything else is treated as a text query (bare terms or `@field:(terms)`).
+/// Everything else is a text query — including prose that merely contains the word "knn"
+/// (e.g. `"knn tutorial"`), which the older bare-`"KNN "`-substring check wrongly routed to the
+/// vector engine (fts-query-routing-robustness R2).
+///
+/// CLAUSE-level retrievers (`SPARSE @f $p`, `HYBRID …`) live in SEPARATE args, NOT in the query
+/// string, so they are NOT visible here — routing defers them to `ft_search` via
+/// [`has_sparse_clause`] / `parse_hybrid_modifier` at the handler layer.
 pub fn is_text_query(query: &[u8]) -> bool {
     if query == b"*" {
         return false;
     }
-    // Avoid UTF-8 parse cost for the common case: just scan bytes.
-    // KNN queries look like: "*=>[KNN 10 @vec $q]"
-    // The distinguishing substring is "KNN " (case-insensitive scan).
+    // The canonical dense-KNN form is `*=>[KNN k @vec $q]`; the `[KNN` bracket is the unambiguous
+    // marker (a bare word "knn" in prose has no bracket). Case-insensitive byte scan, no allocation
+    // beyond the uppercase copy.
     let upper: Vec<u8> = query.iter().map(|b| b.to_ascii_uppercase()).collect();
-    if upper.windows(4).any(|w| w == b"KNN ") {
+    if upper.windows(4).any(|w| w == b"[KNN") {
         return false;
     }
     true
+}
+
+/// Returns `true` when the FT.SEARCH `args` carry a standalone `SPARSE @field $param` clause.
+///
+/// SPARSE is a separate argument (not part of the `args[1]` query string), so [`is_text_query`]
+/// cannot see it. Routing AND-s `!has_sparse_clause(args)` into every text-fast-path gate so a
+/// standalone-SPARSE query defers to `ft_search` (the vector/sparse engine) instead of being
+/// silently treated as pure text (fts-query-routing-robustness R3). SPARSE inside a HYBRID clause
+/// is handled separately and earlier by `parse_hybrid_modifier`.
+pub fn has_sparse_clause(args: &[Frame]) -> bool {
+    crate::command::vector_search::ft_search::parse::parse_sparse_clause(args).is_some()
 }
 
 // ─── Query parser ────────────────────────────────────────────────────────────
@@ -1555,12 +1573,15 @@ pub fn run_text_query_on_index(
     offset: usize,
     count: usize,
 ) -> Frame {
-    use crate::text::query::{QuerySchema, eval_query, parse_query};
+    use crate::text::query::{QuerySchema, eval_query_counted, parse_query};
     let schema = QuerySchema::from_index(text_index);
     match parse_query(query, &schema) {
         Ok(node) => {
-            let results = eval_query(text_index, &node, global_df, global_n, top_k);
-            build_text_response(&results, offset, count)
+            // fts-search-count-semantics C3: `total` is the true matched-and-resolvable count
+            // (pre-truncation), so reply[0] is correct even when top_k truncates the returned page.
+            let (results, total) =
+                eval_query_counted(text_index, &node, global_df, global_n, top_k);
+            build_text_response_with_total(&results, total, offset, count)
         }
         // The five frozen wire codes (fts-query-combinators §3); never panics on malformed input.
         Err(e) => Frame::Error(Bytes::copy_from_slice(e.code().as_bytes())),
@@ -1844,14 +1865,31 @@ pub(crate) fn execute_query_on_index(
 ///
 /// Format: `[total, key1, ["__bm25_score", "N.NNNNNN"], key2, [...], ...]`
 ///
-/// `total` is the full number of matched results before pagination.
-/// Document entries are `results[offset..offset+count]`.
+/// Thin wrapper over [`build_text_response_with_total`] that reports `results.len()` as the total —
+/// the legacy behavior for callers that hand it an UNTRUNCATED result set (so `len` already equals
+/// the full matched count). The live FT.SEARCH text path uses `build_text_response_with_total`
+/// directly with the true total-matched count (fts-search-count-semantics C2/C3).
 pub(crate) fn build_text_response(
     results: &[TextSearchResult],
     offset: usize,
     count: usize,
 ) -> Frame {
-    let total = results.len() as i64;
+    build_text_response_with_total(results, results.len(), offset, count)
+}
+
+/// Build the FT.SEARCH text response with an EXPLICIT total-matched count for `reply[0]`.
+///
+/// `total_matched` is the true number of documents that matched the query (RediSearch semantics),
+/// independent of `LIMIT`/`top_k` — it may exceed the number of document entries actually emitted
+/// (`results[offset..offset+count]`). Document entries, ordering, and score formatting are
+/// identical to the legacy builder; only `reply[0]` carries the supplied total.
+pub(crate) fn build_text_response_with_total(
+    results: &[TextSearchResult],
+    total_matched: usize,
+    offset: usize,
+    count: usize,
+) -> Frame {
+    let total = total_matched as i64;
     let page_count = if count == usize::MAX {
         results.len()
     } else {
@@ -1903,15 +1941,24 @@ pub fn merge_text_results(
     count: usize,
 ) -> Frame {
     let mut all_results: Vec<(f32, Bytes, Frame)> = Vec::new();
+    // fts-search-count-semantics C4: reply[0] = Σ per-shard true matched counts (each shard's
+    // items[0]), NOT the merged-and-truncated returned-doc count. Keys partition to exactly one
+    // shard, so the sum has no double-count.
+    let mut total_matched: i64 = 0;
 
     for resp in shard_responses {
         let items = match resp {
             Frame::Array(items) => items,
-            Frame::Error(_) => continue, // skip errored shards
+            Frame::Error(_) => continue, // skip errored shards (shard_total_absent_zero: add 0)
             _ => continue,
         };
         if items.is_empty() {
             continue;
+        }
+        // items[0] = this shard's true local matched count (Integer); a missing/non-integer
+        // items[0] contributes 0 (shard_total_absent_zero) — never panics.
+        if let Some(Frame::Integer(t)) = items.first() {
+            total_matched += *t;
         }
         // items[0] = total count (Integer), then pairs of (key, fields_array)
         let mut i = 1;
@@ -1934,7 +1981,7 @@ pub fn merge_text_results(
     all_results.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
     all_results.truncate(top_k);
 
-    let total = all_results.len() as i64;
+    let total = total_matched;
     let page_count = if count == usize::MAX {
         all_results.len()
     } else {
@@ -1998,15 +2045,66 @@ mod tests {
 
     #[test]
     fn is_text_query_knn_is_not_text() {
+        // Canonical vector-KNN form (the `[KNN` bracket marker) stays NON-text.
         assert!(!is_text_query(b"*=>[KNN 10 @vec $query]"));
         assert!(!is_text_query(b"*=>[KNN 5 @embedding $q]"));
-        assert!(!is_text_query(b"knn 10")); // lowercase KNN
+    }
+
+    #[test]
+    fn is_text_query_prose_knn_is_text() {
+        // fts-query-routing-robustness R2: a bare word "knn" in prose (no `[KNN` bracket) is a TEXT
+        // query, not a malformed KNN query. SUPERSEDES the old `!is_text_query(b"knn 10")` assertion —
+        // the bare-substring detection wrongly routed these to ft_search → "ERR invalid KNN query syntax".
+        assert!(is_text_query(b"knn tutorial"));
+        assert!(is_text_query(b"learn knn basics"));
+        assert!(is_text_query(b"knn 10"));
+        assert!(is_text_query(b"KNN clustering")); // uppercase prose, still text (no bracket)
     }
 
     #[test]
     fn is_text_query_field_syntax_is_text() {
         assert!(is_text_query(b"@title:(machine learning)"));
         assert!(is_text_query(b"@body:(rust)"));
+    }
+
+    // ── has_sparse_clause + text-route predicate (fts-query-routing-robustness R3) ──────
+
+    fn args_of(parts: &[&str]) -> Vec<Frame> {
+        parts
+            .iter()
+            .map(|p| Frame::BulkString(Bytes::copy_from_slice(p.as_bytes())))
+            .collect()
+    }
+
+    #[test]
+    fn has_sparse_clause_detects_standalone() {
+        // R3: a standalone `SPARSE @field $param` clause is detected from the full args.
+        assert!(has_sparse_clause(&args_of(&[
+            "idx", "machine", "SPARSE", "@vec", "$q"
+        ])));
+        // A plain text query carries no SPARSE clause.
+        assert!(!has_sparse_clause(&args_of(&["idx", "machine learning"])));
+        assert!(!has_sparse_clause(&args_of(&["idx", "@title:(rust)"])));
+    }
+
+    #[test]
+    fn text_route_predicate_defers_sparse() {
+        // R3: the exact gate the 6 routing sites use — text route iff text query AND no SPARSE clause.
+        let sparse = args_of(&["idx", "machine", "SPARSE", "@vec", "$q"]);
+        let plain = args_of(&["idx", "machine learning"]);
+        let route = |a: &[Frame]| -> bool {
+            a.get(1)
+                .and_then(extract_bulk)
+                .is_some_and(|q| is_text_query(&q))
+                && !has_sparse_clause(a)
+        };
+        // args[1]="machine" alone IS a text query, but the SPARSE clause forces deferral to ft_search.
+        assert!(is_text_query(b"machine"));
+        assert!(
+            !route(&sparse),
+            "standalone SPARSE must defer to the vector engine"
+        );
+        assert!(route(&plain), "a plain text query takes the BM25 text path");
     }
 
     // ── parse_text_query ───────────────────────────────────────────────────────
@@ -2163,6 +2261,103 @@ mod tests {
             }
             _ => panic!("expected BulkString field name"),
         }
+    }
+
+    // ── count semantics (fts-search-count-semantics) ───────────────────────────
+
+    fn shard_frame(key: &str, total: i64, score: f32) -> Frame {
+        let mut sb = String::with_capacity(16);
+        use std::fmt::Write;
+        let _ = write!(sb, "{score:.6}");
+        Frame::Array(
+            vec![
+                Frame::Integer(total),
+                Frame::BulkString(Bytes::copy_from_slice(key.as_bytes())),
+                Frame::Array(
+                    vec![
+                        Frame::BulkString(Bytes::from_static(b"__bm25_score")),
+                        Frame::BulkString(Bytes::from(sb)),
+                    ]
+                    .into(),
+                ),
+            ]
+            .into(),
+        )
+    }
+
+    fn results_n(n: usize) -> Vec<TextSearchResult> {
+        (0..n)
+            .map(|i| TextSearchResult {
+                doc_id: i as u32,
+                key: Bytes::from(format!("d{i}")),
+                score: (n - i) as f32,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn build_text_response_with_total_reports_supplied_total() {
+        // C2: reply[0] is the supplied total_matched, NOT the page length.
+        let results = results_n(3);
+        let resp = build_text_response_with_total(&results, 47, 0, 3);
+        let items = match &resp {
+            Frame::Array(a) => a,
+            _ => panic!("expected Array"),
+        };
+        assert_eq!(items[0], Frame::Integer(47), "reply[0] = total_matched");
+        assert_eq!(items.len(), 1 + 3 * 2, "3 doc entries");
+    }
+
+    #[test]
+    fn build_text_response_wrapper_reports_page_len() {
+        // C2: the 3-arg wrapper preserves old behavior (reply[0] = results.len()).
+        let results = results_n(3);
+        let resp = build_text_response(&results, 0, usize::MAX);
+        let items = match &resp {
+            Frame::Array(a) => a,
+            _ => panic!("expected Array"),
+        };
+        assert_eq!(items[0], Frame::Integer(3));
+    }
+
+    #[test]
+    fn merge_text_results_sums_shard_totals() {
+        // C4: per-shard items[0] (true local matched) are SUMMED, even when each shard returns
+        // fewer docs than it matched (per-shard top_k truncation). Old code reported 3 (merged docs).
+        let frames = [
+            shard_frame("a", 40, 3.0),
+            shard_frame("b", 35, 2.0),
+            shard_frame("c", 25, 1.0),
+        ];
+        let merged = merge_text_results(&frames, 100, 0, usize::MAX);
+        let items = match &merged {
+            Frame::Array(a) => a,
+            _ => panic!("expected Array"),
+        };
+        assert_eq!(
+            items[0],
+            Frame::Integer(100),
+            "total = 40+35+25, not the 3 merged docs"
+        );
+        assert_eq!(items.len(), 1 + 3 * 2, "3 docs returned");
+    }
+
+    #[test]
+    fn merge_text_results_errored_shard_contributes_zero() {
+        // Reject shard_total_absent_zero: an errored shard frame adds 0 and the merge survives.
+        let good = shard_frame("a", 3, 2.0);
+        let bad = Frame::Error(Bytes::from_static(b"ERR boom"));
+        let merged = merge_text_results(&[good, bad], 100, 0, usize::MAX);
+        let items = match &merged {
+            Frame::Array(a) => a,
+            _ => panic!("expected Array"),
+        };
+        assert_eq!(
+            items[0],
+            Frame::Integer(3),
+            "errored shard contributes 0 to the sum"
+        );
+        assert_eq!(items.len(), 1 + 2, "the one good doc survives");
     }
 
     // ── response_contains_bm25_score ───────────────────────────────────────────

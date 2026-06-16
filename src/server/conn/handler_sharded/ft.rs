@@ -64,7 +64,8 @@ pub(super) async fn try_handle_ft_command(
                 .and_then(|f| crate::command::vector_search::extract_bulk(f));
             let is_text = query_bytes
                 .as_ref()
-                .map_or(false, |q| crate::command::vector_search::is_text_query(q));
+                .map_or(false, |q| crate::command::vector_search::is_text_query(q))
+                && !crate::command::vector_search::has_sparse_clause(cmd_args);
 
             // -- HYBRID multi-shard path (Phase 152 Plan 05, D-13) --
             // If the args contain a HYBRID clause, route through
@@ -337,7 +338,9 @@ pub(super) async fn try_handle_ft_command(
                     return true;
                 }
                 Ok(None) => {
-                    if crate::command::vector_search::is_text_query(query_bytes.as_ref()) {
+                    if crate::command::vector_search::is_text_query(query_bytes.as_ref())
+                        && !crate::command::vector_search::has_sparse_clause(cmd_args)
+                    {
                         // Step 1: index_name.
                         let index_name = match cmd_args.first() {
                             Some(Frame::BulkString(b)) => b.clone(),

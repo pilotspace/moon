@@ -242,6 +242,175 @@ mod tests {
         );
     }
 
+    // ===== fts-upsert-incremental: reverse doc_id -> term_ids map =====
+
+    #[test]
+    fn test_reverse_map_records_unique_terms() {
+        // U1: doc 7 contributes terms 10, 20 (twice), 30 -> reverse set {10,20,30}, 20 once.
+        let mut store = PostingStore::new();
+        store.add_term_occurrence(10, 7, None);
+        store.add_term_occurrence(20, 7, None);
+        store.add_term_occurrence(20, 7, None); // same (doc,term): tf++, NOT a new reverse edge
+        store.add_term_occurrence(30, 7, None);
+        let mut terms = store
+            .doc_terms_for(7)
+            .expect("doc 7 has a reverse entry")
+            .to_vec();
+        terms.sort_unstable();
+        assert_eq!(
+            terms,
+            vec![10, 20, 30],
+            "reverse map is the unique term set (20 recorded once)"
+        );
+    }
+
+    #[test]
+    fn test_remove_doc_consults_reverse_map() {
+        // U2: remove_doc returns exactly the doc's terms and clears its reverse entry.
+        use std::collections::HashSet;
+        let mut store = PostingStore::new();
+        store.add_term_occurrence(10, 7, None);
+        store.add_term_occurrence(20, 7, None);
+        store.add_term_occurrence(10, 8, None); // another doc shares term 10
+        let before: HashSet<u32> = store.doc_terms_for(7).unwrap().iter().copied().collect();
+        let removed: HashSet<u32> = store.remove_doc(7).into_iter().map(|(t, _)| t).collect();
+        assert_eq!(
+            removed, before,
+            "removed terms == the doc's reverse-map terms"
+        );
+        assert!(
+            store.doc_terms_for(7).is_none(),
+            "reverse entry cleared after remove"
+        );
+        assert_eq!(store.doc_freq(10), 1, "doc 8 still present in term 10");
+        assert_eq!(store.doc_freq(20), 0, "term 20 had only doc 7");
+    }
+
+    #[test]
+    fn test_remove_absent_doc_is_noop() {
+        // Reject absent_doc_noop: removing a never-seen doc is a no-op, no panic.
+        let mut store = PostingStore::new();
+        store.add_term_occurrence(10, 1, None);
+        let removed = store.remove_doc(999);
+        assert!(removed.is_empty(), "removing an unknown doc returns empty");
+        assert_eq!(store.doc_freq(10), 1, "existing postings untouched");
+        assert!(store.doc_terms_for(999).is_none());
+    }
+
+    #[test]
+    fn test_stale_reverse_entry_skipped() {
+        // Reject stale_reverse_entry_skip: a reverse term whose posting no longer holds the doc
+        // is skipped (no unwrap/expect panic); the doc's other terms still get removed.
+        let mut store = PostingStore::new();
+        store.add_term_occurrence(10, 7, None);
+        store.add_term_occurrence(20, 7, None);
+        // Desync: forcibly clear doc 7 from term 10's posting, leaving the reverse map stale.
+        store.test_force_clear_doc_from_posting(10, 7);
+        let _ = store.remove_doc(7); // must not panic
+        assert!(store.doc_terms_for(7).is_none(), "reverse entry cleared");
+        assert_eq!(store.doc_freq(20), 0, "non-stale term 20 still removed");
+    }
+
+    #[test]
+    fn test_reverse_map_reclaimed_on_repeated_upsert() {
+        // U4: upserting the same doc 100x keeps exactly one reverse entry of constant size.
+        let mut store = PostingStore::new();
+        for _ in 0..100 {
+            store.remove_doc(7);
+            store.add_term_occurrence(10, 7, None);
+            store.add_term_occurrence(20, 7, None);
+        }
+        assert_eq!(
+            store.doc_terms_for(7).map(<[u32]>::len),
+            Some(2),
+            "reverse entry holds the 2 terms, not 100x"
+        );
+        assert_eq!(store.doc_terms_count(), 1, "exactly one doc tracked");
+        store.remove_doc(7);
+        assert!(
+            store.doc_terms_for(7).is_none(),
+            "reverse entry gone after delete"
+        );
+        assert_eq!(store.doc_terms_count(), 0);
+    }
+
+    #[test]
+    fn test_posting_state_identical_after_upsert_delete() {
+        // U3 (correctness boundary, posting layer): an index/upsert/delete sequence leaves posting
+        // state byte-identical to a fresh build of the same FINAL state. remove_doc only touches
+        // this layer, so identical doc_ids + term_freqs here ⇒ identical doc_freq/tf/search output.
+        // Incremental: doc1{10,20}, doc2{20,30}, doc3{10,30}; upsert doc2 -> {30,40}; delete doc3.
+        let mut inc = PostingStore::new();
+        inc.add_term_occurrence(10, 1, None);
+        inc.add_term_occurrence(20, 1, None);
+        inc.add_term_occurrence(20, 2, None);
+        inc.add_term_occurrence(30, 2, None);
+        inc.add_term_occurrence(10, 3, None);
+        inc.add_term_occurrence(30, 3, None);
+        inc.remove_doc(2); // upsert doc2
+        inc.add_term_occurrence(30, 2, None);
+        inc.add_term_occurrence(40, 2, None);
+        inc.remove_doc(3); // delete doc3
+        // Fresh build of the final state: doc1{10,20}, doc2{30,40}.
+        let mut fresh = PostingStore::new();
+        fresh.add_term_occurrence(10, 1, None);
+        fresh.add_term_occurrence(20, 1, None);
+        fresh.add_term_occurrence(30, 2, None);
+        fresh.add_term_occurrence(40, 2, None);
+        for term in [10u32, 20, 30, 40, 99] {
+            let a = inc.get_posting(term);
+            let b = fresh.get_posting(term);
+            match (a, b) {
+                (Some(pa), Some(pb)) => {
+                    assert_eq!(pa.doc_ids, pb.doc_ids, "term {term}: doc_ids identical");
+                    assert_eq!(
+                        pa.term_freqs, pb.term_freqs,
+                        "term {term}: term_freqs identical"
+                    );
+                }
+                (None, None) => {}
+                _ => panic!("term {term}: posting presence differs (inc vs fresh)"),
+            }
+            assert_eq!(
+                inc.doc_freq(term),
+                fresh.doc_freq(term),
+                "term {term}: doc_freq identical"
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "perf/A1 proof — timing flakes in CI; run manually"]
+    fn test_upsert_scaling_flat() {
+        // U2/A1: per-doc removal cost is independent of vocabulary V. Old O(V) impl scales ~V.
+        use std::time::Instant;
+        fn build(vocab: u32) -> PostingStore {
+            let mut s = PostingStore::new();
+            // The target doc (id 0) holds the same 10 terms in both stores.
+            for t in 0..10u32 {
+                s.add_term_occurrence(t, 0, None);
+            }
+            // Fill the rest of the vocabulary, each term in its own filler doc.
+            for t in 10..vocab {
+                s.add_term_occurrence(t, t, None);
+            }
+            s
+        }
+        let time_remove = |vocab: u32| {
+            let mut s = build(vocab);
+            let t = Instant::now();
+            s.remove_doc(0);
+            t.elapsed()
+        };
+        let small = time_remove(20).max(std::time::Duration::from_nanos(1));
+        let large = time_remove(40_000);
+        let ratio = large.as_secs_f64() / small.as_secs_f64();
+        assert!(
+            ratio < 20.0,
+            "remove_doc must be ~O(terms-in-doc): V=40000 took {ratio:.1}x V=20 (old O(V) ≈ 2000x)"
+        );
+    }
+
     #[test]
     fn test_posting_store_term_count() {
         let mut store = PostingStore::new();

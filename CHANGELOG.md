@@ -6,6 +6,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — FT.SEARCH routing: prose "knn" searches as text, standalone SPARSE reaches the vector engine, no panic on the BM25 AND path (PR #192)
+
+`is_text_query` uppercased the query and matched the bare substring `KNN `, so a
+text search whose terms merely contained the word *knn* (e.g.
+`FT.SEARCH idx "knn tutorial"`) was misclassified as a vector query and fell to
+the KNN parser, returning `ERR invalid KNN query syntax` instead of text
+results. It now keys on the canonical `[KNN` vector-query bracket — prose
+containing "knn" searches as text while `*=>[KNN …]` still routes to the vector
+engine. A standalone `SPARSE @field $param` clause paired with a text-looking
+query string was silently dropped onto the text path (`is_text_query` only sees
+`args[1]`); a `has_sparse_clause` guard now defers any SPARSE-carrying query to
+the vector engine at every text-route gate. The three `.expect("posting exists")`
+on `TextStore::search_field`'s BM25 AND + scoring path are replaced with
+defensive control flow, so a vanished posting yields empty results instead of
+panicking the server. Output is byte-identical for all existing queries.
+
+### Fixed — FT.SEARCH integer reply is the true total-matched, not the page size (PR #192)
+
+The first element of an `FT.SEARCH` reply (the match count) was capped at the
+`LIMIT`/`top_k` page size: `FT.SEARCH idx "term" LIMIT 0 5` over 100 matches
+reported `5`, not `100`, because the count was read from the already-truncated
+result page. On multi-shard indexes the coordinator compounded it by counting the
+merged-and-truncated returned docs rather than each shard's true matched count.
+The reply now reports the true number of matched, key-resolvable documents
+(RediSearch semantics): the evaluator surfaces the count before truncation, and
+the multi-shard merge sums each shard's local matched count (keys partition to
+exactly one shard, so the sum is exact; errored shards contribute 0). Verified
+identical on 1- and 4-shard servers. Returned document pages (count, order,
+scores, keys) are unchanged.
+
+### Performance — FT.SEARCH upsert / bulk re-index no longer O(V) per document (PR #192)
+
+Re-indexing a document (an HSET upsert, or a bulk re-index pass) called
+`PostingStore::remove_doc`, which scanned EVERY term's posting list to clear one
+document — O(total-vocabulary) per doc — so per-upsert cost grew with the corpus
+(the indexing-rate cliff: ~376 vs ~18,052 docs/s as vocabulary V grew).
+`PostingStore` now keeps a reverse `doc_id → term_ids` index, populated once per
+(doc, term) edge as terms are added, so `remove_doc` visits only the terms the
+document actually contributed — O(terms-in-doc), independent of V. Search output
+is byte-identical (the rank-aligned posting contract is unchanged): matched doc
+sets, BM25 scores, `doc_freq`, `num_docs`, and avgdl are unaffected. A missing or
+already-cleared reverse entry is skipped defensively — never an unwrap/panic.
+
 ### Fixed — FT.SEARCH `OR` and multi-clause queries return correct result sets (PR #190)
 
 `FT.SEARCH` query combinators were silently broken: `OR` (`alpha | beta`)

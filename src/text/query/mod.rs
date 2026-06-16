@@ -13,5 +13,7 @@ mod eval;
 mod parse;
 
 pub use ast::{QueryError, QueryNode};
-pub use eval::{collect_df_field_terms, collect_highlight_terms, eval_query, eval_set};
+pub use eval::{
+    collect_df_field_terms, collect_highlight_terms, eval_query, eval_query_counted, eval_set,
+};
 pub use parse::{QuerySchema, parse_query};

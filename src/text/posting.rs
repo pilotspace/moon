@@ -9,6 +9,7 @@
 /// positions are not needed, but stores them from day one for future phrase
 /// queries and HIGHLIGHT support.
 use roaring::RoaringBitmap;
+use smallvec::SmallVec;
 use std::collections::HashMap;
 
 /// A single term's posting data across all documents.
@@ -88,6 +89,12 @@ impl PostingList {
 /// Per-field inverted index storing term_id -> PostingList.
 pub struct PostingStore {
     postings: HashMap<u32, PostingList>,
+    /// Reverse index: doc_id -> the term_ids that document contributed (a set, no duplicates).
+    /// Lets `remove_doc` visit only a document's own terms instead of scanning every posting,
+    /// making per-doc removal O(terms-in-doc) instead of O(total vocabulary) — the upsert/bulk
+    /// re-index cliff (fts-upsert-incremental). Kept in sync with `postings`: `add_term_occurrence`
+    /// records the edge on the new-doc branch; `remove_doc` erases the doc's entry.
+    doc_terms: HashMap<u32, SmallVec<[u32; 8]>>,
 }
 
 impl PostingStore {
@@ -95,6 +102,7 @@ impl PostingStore {
     pub fn new() -> Self {
         Self {
             postings: HashMap::new(),
+            doc_terms: HashMap::new(),
         }
     }
 
@@ -148,6 +156,10 @@ impl PostingStore {
                 }
                 (None, None) => {}
             }
+            // Record the (doc -> term) reverse edge exactly once: this branch fires only the first
+            // time `doc_id` joins `term_id`'s posting, so no de-dup is needed. `posting`'s borrow of
+            // `self.postings` has ended (last use above), so this disjoint-field access is sound.
+            self.doc_terms.entry(doc_id).or_default().push(term_id);
         }
     }
 
@@ -171,26 +183,73 @@ impl PostingStore {
 
     /// Clear all postings for a specific document (used during upsert).
     ///
-    /// Returns the old term frequencies for stats adjustment.
+    /// Returns the old term frequencies `(term_id, old_tf)` for stats adjustment (order
+    /// unspecified — callers only sum it). Visits ONLY the terms this document contributed via the
+    /// `doc_terms` reverse map — O(terms-in-doc), not O(total vocabulary) — eliminating the upsert /
+    /// bulk re-index cliff. The empty-posting entries are intentionally left in `postings` (a fully
+    /// removed term keeps an empty `PostingList`), matching the prior O(V) implementation so
+    /// `doc_freq`/`tf`/search output stay byte-identical.
     pub fn remove_doc(&mut self, doc_id: u32) -> Vec<(u32, u32)> {
-        let mut removed = Vec::new();
-        for (&term_id, posting) in &mut self.postings {
-            if posting.doc_ids.contains(doc_id) {
-                // Rank-aligned index — compute BEFORE removing from the bitmap.
-                let idx = posting.rank_index(doc_id);
-                if idx < posting.term_freqs.len() {
-                    let old_tf = posting.term_freqs.remove(idx);
-                    posting.doc_ids.remove(doc_id);
-                    if let Some(pos_list) = &mut posting.positions {
-                        if idx < pos_list.len() {
-                            pos_list.remove(idx);
-                        }
+        // absent_doc_noop: a doc never indexed has no reverse entry -> nothing to remove.
+        let Some(term_ids) = self.doc_terms.remove(&doc_id) else {
+            return Vec::new();
+        };
+        let mut removed = Vec::with_capacity(term_ids.len());
+        for term_id in term_ids {
+            // stale_reverse_entry_skip: defend against a reverse edge whose posting is gone or no
+            // longer holds the doc — skip, never unwrap/expect/panic.
+            let Some(posting) = self.postings.get_mut(&term_id) else {
+                continue;
+            };
+            if !posting.doc_ids.contains(doc_id) {
+                continue;
+            }
+            // Rank-aligned index — compute BEFORE removing from the bitmap.
+            let idx = posting.rank_index(doc_id);
+            if idx < posting.term_freqs.len() {
+                let old_tf = posting.term_freqs.remove(idx);
+                posting.doc_ids.remove(doc_id);
+                if let Some(pos_list) = &mut posting.positions {
+                    if idx < pos_list.len() {
+                        pos_list.remove(idx);
                     }
-                    removed.push((term_id, old_tf));
                 }
+                removed.push((term_id, old_tf));
             }
         }
         removed
+    }
+
+    /// Reverse-map term_ids a document contributed (rank-unordered). `#[cfg(test)]` accessor.
+    #[cfg(test)]
+    pub(crate) fn doc_terms_for(&self, doc_id: u32) -> Option<&[u32]> {
+        self.doc_terms.get(&doc_id).map(SmallVec::as_slice)
+    }
+
+    /// Number of distinct documents tracked in the reverse map. `#[cfg(test)]` accessor.
+    #[cfg(test)]
+    pub(crate) fn doc_terms_count(&self) -> usize {
+        self.doc_terms.len()
+    }
+
+    /// Test-only: forcibly clear `doc_id` from `term_id`'s posting WITHOUT touching the reverse map,
+    /// to synthesize the stale-reverse-entry state that `remove_doc` must tolerate.
+    #[cfg(test)]
+    pub(crate) fn test_force_clear_doc_from_posting(&mut self, term_id: u32, doc_id: u32) {
+        if let Some(posting) = self.postings.get_mut(&term_id) {
+            if posting.doc_ids.contains(doc_id) {
+                let idx = posting.rank_index(doc_id);
+                if idx < posting.term_freqs.len() {
+                    posting.term_freqs.remove(idx);
+                }
+                posting.doc_ids.remove(doc_id);
+                if let Some(p) = &mut posting.positions {
+                    if idx < p.len() {
+                        p.remove(idx);
+                    }
+                }
+            }
+        }
     }
 
     /// Estimated memory usage in bytes.

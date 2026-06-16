@@ -50,9 +50,9 @@ pub use ft_text_search::{
 };
 pub use ft_text_search::{
     HighlightOpts, QueryTerm, SummarizeOpts, apply_post_processing, execute_text_search_local,
-    execute_text_search_with_global_idf, ft_text_search, highlight_field, is_text_query,
-    merge_text_results, parse_highlight_clause, parse_summarize_clause, parse_text_query,
-    summarize_field,
+    execute_text_search_with_global_idf, ft_text_search, has_sparse_clause, highlight_field,
+    is_text_query, merge_text_results, parse_highlight_clause, parse_summarize_clause,
+    parse_text_query, summarize_field,
 };
 pub use helpers::{metric_to_bytes, quantization_to_bytes, quantize_f32_to_sq};
 pub use hybrid::{HybridFilter, HybridQuery, HybridQueryPartial, parse_hybrid_modifier};
