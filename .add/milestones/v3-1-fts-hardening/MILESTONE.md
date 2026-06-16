@@ -53,9 +53,15 @@ Out:
 - [ ] fts-upsert-incremental        depends-on: none                      — replace O(V) per-doc posting
       upsert scan with incremental update; fast bulk indexing.
 - [ ] fts-query-combinators         depends-on: none                      — `OR` (`|`) unions and
-      `TEXT+TAG` combo intersects; correct matched sets.
-- [ ] fts-search-count-semantics    depends-on: fts-query-combinators     — FT.SEARCH reply = true
-      total-matched count (RediSearch semantics).
+      `TEXT+TAG`/`TEXT+NUMERIC` combos intersect; correct matched sets. Code trace upgraded this from
+      two point-bugs to a missing PARSER layer; froze a query GRAMMAR+AST+eval_set contract @ v1
+      (2026-06-16) and SPLIT the build into 2a+2b:
+  - [ ] fts-query-combinators (2a)  depends-on: none                      — recursive-descent
+        `parse_query` → `QueryNode`/`QueryError` + grammar + parser fuzz target. Owns the frozen contract.
+  - [ ] fts-query-eval-dispatch (2b) depends-on: fts-query-combinators    — `eval_set` (RoaringBitmap
+        union/intersect) + ft_text_search dispatch rewrite + wire reply. Inherits the frozen contract.
+- [ ] fts-search-count-semantics    depends-on: fts-query-eval-dispatch  — FT.SEARCH reply = true
+      total-matched count = `eval_set(root).len()` (RediSearch semantics). Counts over 2b's matched set.
 - [ ] fts-query-routing-robustness  depends-on: none                      — `is_text_query()` recognizes
       `SPARSE`; remove 3× `expect()` on the FT query path.
 
