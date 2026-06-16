@@ -1,6 +1,6 @@
 # moon Benchmark Report
 
-**Last Updated:** 2026-06-15 (§2.8 added — v2-1/PR #189 `db61973` K=1024 re-measurement on c3/t2a, confirms no KV/multi-shard/graph regression; v0.1.6 tag results in §2.1–2.6; §2.7 re-measurement on perf/shard-dispatch-hot-path branch)
+**Last Updated:** 2026-06-16 (4-feature concurrent-vs-competitor pass added — §10.5 vector vs RediSearch, §11.4 graph vs FalkorDB, **new §12 Full-Text Search** vs RediSearch; honestly records where Moon trails. §2.8 = v2-1/PR #189 `db61973` K=1024 re-measurement; v0.1.6 in §2.1–2.6; §2.7 on perf/shard-dispatch-hot-path)
 **Platforms:** Linux (GCloud x86_64 + ARM64), macOS (Apple M4 Pro)
 **Redis:** 8.6.1 in §2.1–2.6; 7.0.15 in §2.7
 **moon:** v0.1.6 in §2.1–2.6; perf/shard-dispatch-hot-path HEAD (commit `6582fa9`) in §2.7. Monoio runtime (io_uring on Linux, kqueue on macOS), fat LTO, codegen-units=1, target-cpu=native
@@ -27,9 +27,10 @@ The SET absolute number can differ 3-4× between methodologies. Only strict-vs-s
 9. [Latency](#9-latency)
 10. [Vector Search](#10-vector-search)
 11. [Graph Engine](#11-graph-engine)
-12. [Data Correctness](#12-data-correctness)
-13. [Architecture Notes](#13-architecture-notes)
-14. [How to Reproduce](#14-how-to-reproduce)
+12. [Full-Text Search](#12-full-text-search)
+13. [Data Correctness](#13-data-correctness)
+14. [Architecture Notes](#14-architecture-notes)
+15. [How to Reproduce](#15-how-to-reproduce)
 
 ---
 
@@ -49,8 +50,10 @@ The SET absolute number can differ 3-4× between methodologies. Only strict-vs-s
 | Multi-shard (8s P=16) | **1.84-1.99x Redis** | GET / SET |
 | p50 latency (8-shard) | **8-10x lower** | 0.031ms vs 0.26ms |
 | Data correctness | **2613+ tests pass** | All types, 1/4/12 shards |
-| Vector search (384d) | **12.7K QPS** | HNSW + TQ, COSINE |
-| Graph (1-hop query) | **303 QPS** | CSR + Cypher, redis-cli |
+| Vector insert (384d) | **6–20× RediSearch** | GCloud, 8-thread concurrent, §10.5 |
+| Vector search (384d) | RediSearch ~16× QPS; recall 0.86 vs 0.96 | concurrent vs RediSearch, §10.5 |
+| Full-text search (100K) | low-DF competitive; indexing + high-DF trail RediSearch | vs RediSearch, §12 |
+| Graph build (native API) | **21–26× FalkorDB** | §11.4 (native 1-hop ≈1.2× FalkorDB Cypher) |
 
 ---
 
@@ -560,6 +563,26 @@ TQ4 is designed for 768d+ workloads. For 384d and below, use TQ8 or FP32 HNSW.
 
 Moon's insert pipeline is 7.7x faster than RediSearch due to zero-copy HSET + in-memory auto-indexing. Search QPS with brute-force mutable segment is competitive; HNSW immutable segment search is faster after FT.COMPACT.
 
+### 10.5 2026-06-16 Concurrent throughput vs RediSearch (GCloud, db61973)
+
+Re-measured under **8 concurrent clients** (not single-connection pipelined as §10.1–10.2) against a **live RediSearch**
+(`redis/redis-stack-server` Docker), on c3-standard-8 (x86) + t2a-standard-8 (ARM). 50K × 384d clustered vectors
+(mixture-of-Gaussians → meaningful recall), COSINE, KNN-10, recall@10 vs exact numpy ground truth.
+
+| metric | x86 Moon | x86 RediSearch | ARM Moon | ARM RediSearch |
+|--------|:--------:|:--------------:|:--------:|:--------------:|
+| Insert/s | **25,133** | 3,989 | **35,937** | 1,799 |
+| Search QPS (HNSW, 8 threads) | 552 | **9,088** | 505 | **6,842** |
+| Search p50 | 14.2 ms | **0.71 ms** | 15.5 ms | **1.17 ms** |
+| Recall@10 (HNSW) | 0.858 | **0.961** | 0.858 | **0.961** |
+
+**Honest reframing of §10.1's 12.7K QPS** (which was single-connection *pipelined*, Moon-only): under 8-way
+concurrency against a live RediSearch, **Moon's vector *insert* is 6–20× faster** (zero-copy HSET + auto-index) but
+**RediSearch's vector *search* is ~16× higher QPS at higher recall** (0.96 vs Moon's 0.86 — Moon's default
+auto-quantization SQ8/TQ trades recall for memory at 384d; CLAUDE.md notes 384d quantization loses recall). RediSearch
+has no `FT.COMPACT` (auto-builds HNSW on insert), so its row is already its HNSW. Detail:
+`docs/reviews/2026-06-16/4FEATURE-BENCH.md`.
+
 ---
 
 ## 11. Graph Engine
@@ -595,11 +618,67 @@ Moon's insert pipeline is 7.7x faster than RediSearch due to zero-copy HSET + in
 
 Moon's shared-nothing per-shard graph with CSR compaction provides sub-nanosecond edge traversal after compaction. The native GRAPH.* API avoids Cypher parsing overhead for simple operations.
 
+### 11.4 2026-06-16 vs FalkorDB (GCloud, 8 concurrent clients)
+
+5K nodes, 15K edges. Moon native `GRAPH.CREATE`/`ADDNODE`/`ADDEDGE`; FalkorDB Cypher. redis-py, 8 threads.
+
+| metric | x86 Moon | x86 FalkorDB | ARM Moon | ARM FalkorDB |
+|--------|:--------:|:------------:|:--------:|:------------:|
+| Build ops/s | **25,333** | 962 | **12,592** | 605 |
+| 1-hop qps (Moon native / Falkor Cypher) | **5,671** | 4,739 | **4,474** | 3,794 |
+| 1-hop p50 | **1.12 ms** | 1.53 ms | 1.54 ms | 1.94 ms |
+| Cypher 1-hop / 2-hop qps | 40† / 13† | **4,739 / 4,459** | 28† / 9† | **3,794 / 3,639** |
+
+**Moon native builds 21–26× faster** and its native 1-hop neighbor lookup edges out FalkorDB Cypher. † **But Moon's
+Cypher `MATCH (a {id:N})` does not filter on an inline node-property predicate** — it full-scans the label
+(returns ~all 15K edges vs FalkorDB's correctly-filtered 4), so Moon Cypher point/2-hop queries are slow whole-graph
+scans. **Use `GRAPH.NEIGHBORS` for Moon point lookups, not Cypher.** Detail: `docs/reviews/2026-06-16/4FEATURE-BENCH.md`.
+
 ---
 
-## 12. Data Correctness
+## 12. Full-Text Search
 
-### 12.1 Consistency Test Suite
+**Date:** 2026-06-16
+**Engine:** inverted index in `src/text/` — BM25 (k1=1.2, b=0.75), FST term dictionary, RoaringBitmap postings,
+analyzer pipeline (NFKD → lowercase → UAX#29 → stopword → Snowball English stem); TAG + NUMERIC stores.
+**Surface:** RediSearch-compatible `FT.CREATE` (TEXT/TAG/NUMERIC) · `FT.SEARCH` · `FT.AGGREGATE`.
+
+### 12.1 vs RediSearch (GCloud, 100K docs, 8 concurrent clients)
+
+100K docs, Zipf vocabulary (8000 terms), TEXT + TAG + NUMERIC schema; vs `redis/redis-stack-server`. x86 shown
+(ARM mirrors within ~15%). `qps (p50)`:
+
+| query | Moon | RediSearch | note |
+|-------|:----:|:----------:|------|
+| index docs/s | 376 | **18,052** | Moon ~48× slower to index |
+| term high-DF (~5k docs) | 19 (419 ms) | **3,813** (2.1 ms) | Moon O(M²) TF-lookup cliff |
+| term mid-DF (~1k docs) | 429 (18.6 ms) | **4,909** (1.0 ms) | Moon slower |
+| term low-DF (~95 docs) | **7,765** (0.81 ms) | 3,606 (1.9 ms) | **Moon faster** (small posting, lock-free) |
+| AND (2-term) | 7,665 | 8,485 | parity |
+| OR (`\|`, 2-term) | 7,686 | 3,474 | ⚠ Moon doesn't union (total 10 vs 2072) |
+| TAG `@cat:{}` | 7,791 | 3,319 | ⚠ Moon reports returned-count not total (10 vs 5064) |
+| NUMERIC `@price:[..]` | 107 (74.7 ms) | **351** (22.8 ms) | Moon ~3× slower |
+| TEXT + TAG combo | 12,843 | 4,077 | ⚠ Moon returns 0 hits (vs 253) |
+| FT.AGGREGATE groupby | 6 (698 ms) | 11 (361 ms) | Moon ~2× slower |
+
+### 12.2 Status
+
+Moon's full-text search is **functional but early-stage** relative to RediSearch's mature engine. It is **faster on
+low-cardinality single-term queries** (small posting lists, per-shard lock-free path) but trails on:
+- **Indexing throughput** (~40–48× slower) — synchronous analyzer + an O(V) per-doc upsert scan (`posting.rs:139`).
+- **High-DF queries** — an O(N) term-frequency lookup (`store.rs:504`) degrades to O(M²); a term in ~5% of docs
+  takes 419 ms (this was *predicted* by the code review and reproduced exactly here).
+- **Query correctness** — OR (`|`) does not union, TEXT+TAG combos return 0, and `FT.SEARCH` reports the returned
+  count rather than the total-matched count.
+
+These are well-scoped fixes (RoaringBitmap::rank for TF lookup, OR-union, combo-query, count semantics, async
+indexing). See `docs/reviews/2026-06-16/review-fts.md` + `4FEATURE-BENCH.md`.
+
+---
+
+## 13. Data Correctness
+
+### 13.1 Consistency Test Suite
 
 `scripts/test-consistency.sh` runs 132 tests comparing moon output against Redis as ground truth.
 
@@ -628,15 +707,15 @@ Tested across all shard configurations:
 | 4 | 132/132 PASS |
 | 12 (auto) | 132/132 PASS |
 
-### 12.2 Known Unimplemented Commands
+### 13.2 Known Unimplemented Commands
 
 - `GETRANGE` / `SETRANGE` — not yet implemented (returns `ERR unknown command`)
 
 ---
 
-## 13. Architecture Notes
+## 14. Architecture Notes
 
-### 13.1 Data Structure Sizes
+### 14.1 Data Structure Sizes
 
 | Struct | Size | Notes |
 |--------|:----:|-------|
@@ -647,7 +726,7 @@ Tested across all shard configurations:
 | DashTable Segment | ~3 KB | 64B ctrl + 8B meta + 60 slots x (24B key + 24B value), align(64) |
 | Segment load threshold | 90% | 54/60 slots; avg fill ~67% |
 
-### 13.2 Key Optimizations Applied
+### 14.2 Key Optimizations Applied
 
 | Optimization | Impact | Component |
 |-------------|--------|-----------|
@@ -666,7 +745,7 @@ Tested across all shard configurations:
 
 ---
 
-## 14. How to Reproduce
+## 15. How to Reproduce
 
 ### Build
 
@@ -743,6 +822,11 @@ bash scripts/gcloud-bench-setup.sh
 
 # Run full benchmark suite (KV + vector + graph)
 bash scripts/run-full-bench.sh
+
+# 4-feature concurrent-vs-competitor pass (KV/Vector/Graph/FTS vs Redis/RediSearch/FalkorDB) — §10.5/§11.4/§12
+# Pulls redis-stack + falkordb Docker images; env-tunable dataset sizes.
+scp docs/reviews/2026-06-16/gce-4feature-bench.sh <instance>:~/ && \
+  ssh <instance> 'VEC_NUM=50000 FTS_NDOC=100000 GRAPH_NN=5000 GRAPH_NE=15000 BENCH_DUR=8 bash ~/gce-4feature-bench.sh'
 
 # Cleanup
 gcloud compute instances delete moon-bench-x86 --zone=us-central1-a --quiet
