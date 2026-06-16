@@ -6,6 +6,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance — monoio FT.SEARCH yield is now cost-free; brute-force knee raised to 1024 (PR #189)
+
+PR #179's monoio cooperative yield reaped the io_uring completion queue by
+parking on `sleep(ZERO)` — correct, but ~1746 µs per yield, which is what forced
+#179 to keep the brute-force chunk small and defer ~22% of transient throughput.
+The yield now reaps the CQ by parking on a pre-armed `UnixStream::pair` read
+(~0.317 µs — effectively free), so the brute-force chunk knee walks back up from
+256 to **1024** elements per yield without reintroducing the co-located latency
+#179 fixed. The knee was A/B confirmed per-architecture on GCloud: K=512 breached
+the 5% latency budget on x86 (+6–8%) but held on aarch64, so 1024 was chosen as
+the value safe on both. #179's co-located p99 relief is fully preserved — this
+reclaims only the throughput #179 had to trade away. tokio is unaffected (it
+already used `yield_now()`). Companion benchmark/review docs land alongside:
+`BENCHMARK.md` §2.8 (GCloud cross-arch re-measurement) and a 4-feature deep
+review + concurrent-vs-competitor benchmark under `docs/reviews/2026-06-16/`.
+
 ### Performance — FT.SEARCH no longer stalls the shard event loop (PR #179)
 
 A heavy `FT.SEARCH` (large brute-force mutable segment or deep HNSW traversal)
