@@ -286,3 +286,17 @@ fn test_parser_never_panics() {
         let _ = parse_query(q, &schema());
     }
 }
+
+/// The frozen §3 wire error codes — QueryError::code() must map 1:1 (the dispatch layer in 2b
+/// emits these as Frame::Error). Locking them here keeps 2b from drifting off the contract.
+#[test]
+fn test_error_codes_match_contract() {
+    assert_eq!(QueryError::Syntax.code(), "syntax_error");
+    assert_eq!(QueryError::EmptyQuery.code(), "empty_query");
+    assert_eq!(
+        QueryError::UnknownField(Bytes::new()).code(),
+        "unknown_field"
+    );
+    assert_eq!(QueryError::NumericInvalid.code(), "numeric_filter_invalid");
+    assert_eq!(QueryError::TagInvalid.code(), "tag_filter_invalid");
+}
