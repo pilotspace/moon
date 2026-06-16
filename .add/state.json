@@ -103,12 +103,13 @@
     },
     "fts-query-combinators": {
       "title": "OR unions + TEXT+TAG intersects \u2014 correct combinator result sets",
-      "phase": "tests",
+      "phase": "build",
       "gate": "none",
       "milestone": "v3-1-fts-hardening",
       "depends_on": [],
       "created": "2026-06-16T05:44:57+00:00",
-      "updated": "2026-06-16T06:21:58+00:00"
+      "updated": "2026-06-16T06:28:15+00:00",
+      "flag_verified": true
     },
     "fts-query-eval-dispatch": {
       "title": "Evaluate the query AST to matched sets + wire FT.SEARCH dispatch (2b)",
@@ -173,7 +174,7 @@
     }
   },
   "created": "2026-06-11T03:18:21+00:00",
-  "updated": "2026-06-16T06:21:58+00:00",
+  "updated": "2026-06-16T06:28:15+00:00",
   "setup": {
     "locked": true,
     "locked_at": "2026-06-11T03:28:00+00:00",

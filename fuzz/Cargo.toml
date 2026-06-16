@@ -14,7 +14,7 @@ bytes = "1"
 [dependencies.moon]
 path = ".."
 default-features = false
-features = ["runtime-tokio", "jemalloc", "graph"]
+features = ["runtime-tokio", "jemalloc", "graph", "text-index"]
 
 [dependencies.tempfile]
 version = "3"
@@ -69,6 +69,11 @@ doc = false
 [[bin]]
 name = "csr_from_bytes"
 path = "fuzz_targets/csr_from_bytes.rs"
+doc = false
+
+[[bin]]
+name = "fts_query_parse"
+path = "fuzz_targets/fts_query_parse.rs"
 doc = false
 
 [workspace]

@@ -1,7 +1,7 @@
 # TASK: OR unions + TEXT+TAG intersects — correct combinator result sets
 
 slug: fts-query-combinators · created: 2026-06-16 · stage: production · risk: high · autonomy: conservative
-phase: tests   <!-- specify -> scenarios -> contract -> tests -> build -> verify -> observe -> done -->
+phase: build   <!-- specify -> scenarios -> contract -> tests -> build -> verify -> observe -> done -->
 <!-- risk: high — freezes the FT query GRAMMAR + matched-set semantics (the contract
      fts-search-count-semantics depends-on and counts over) AND changes wire-visible FT.SEARCH
      behavior. Verify must NOT auto-pass: human gate (run.md unguarded_high_risk_auto guard). -->
@@ -290,6 +290,11 @@ Coverage target: 90% of parse_query branches (every grammar production + every Q
 SCOPE = 2a PARSER ONLY — pure `parse_query(bytes, schema) -> Result<QueryNode, QueryError>` unit tests,
 no index/server needed. The end-to-end matched-SET scenarios (M1/M2/M3 result sets, M5 no-regression,
 M7 server-stays-up) are 2b's tests (`fts-query-eval-dispatch`); here we assert the PARSE TREE + errors.
+Notation: per the frozen §3 AST there is NO separate Field node — a field scopes its terms by being
+pushed onto each leaf `Term{field:Some(idx), ...}`. So `Field(body,[foo])` below is shorthand for
+`Term{field:body, token:foo}`, and `@f:(a|b)` parses to `Or[Term{f,a}, Term{f,b}]` (field pushed into
+the group). `@f:t1 t2` scopes BOTH terms to f (`term+`, Moon-compatible — keeps M5 safe; RediSearch's
+stricter one-token binding is a deferred refinement, noted not silently adopted).
 Plan (asserting the AST/error, not internals):
 <test_plan>
   - test_or_parses_as_or_node: "alpha | beta" -> Or[Term(alpha), Term(beta)]   (M1 at parse level)
