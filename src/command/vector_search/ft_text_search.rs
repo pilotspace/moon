@@ -1428,57 +1428,39 @@ pub fn ft_text_search(text_store: &TextStore, args: &[Frame]) -> Frame {
         None => return Frame::Error(Bytes::from_static(b"ERR invalid query")),
     };
 
-    let text_index = match text_store.get_index(index_name.as_ref()) {
-        Some(idx) => idx,
-        None => {
-            return Frame::Error(Bytes::from_static(b"ERR no such index"));
-        }
-    };
-
     // Parse LIMIT clause (offset, count) with defaults (0, usize::MAX).
     let (limit_offset, limit_count) = parse_limit_clause(args);
 
     // Determine top_k: search for offset + count results so we can paginate.
+    // usize::MAX/2 for unlimited (avoids overflow in saturating arithmetic).
     let top_k = if limit_count == usize::MAX {
-        usize::MAX / 2 // large but not overflow-prone
+        usize::MAX / 2
     } else {
         limit_offset.saturating_add(limit_count)
     };
     let top_k = top_k.max(1);
 
-    // B-01 SITE 1 FIX (Plan 152-06): FieldFilter short-circuit BEFORE analyzer
-    // lookup. If the query is `@field:{value}` (or Plan 07 `@field:[min max]`),
-    // dispatch through the inverted-index path — TAG-only indexes (zero TEXT
-    // fields) and indexes whose analyzer would strip the tag value as a
-    // stopword (UAT Gap 2) work without touching the analyzer.
+    // Route through the centralized AST-based wrapper (fts-query-eval-dispatch 2b).
+    // run_text_query handles index lookup, parse, eval, tag/numeric filters, OR,
+    // multi-@clause combinators, and unknown-field errors — replacing the old
+    // pre_parse_field_filter / parse_text_query / execute_query_on_index dance.
+    // No HIGHLIGHT in this entry point (dispatch_vector_command callers have no db).
     #[cfg(feature = "text-index")]
-    match pre_parse_field_filter(query_bytes.as_ref()) {
-        Ok(Some(clause)) => {
-            let results = execute_query_on_index(text_index, &clause, None, None, top_k);
-            return build_text_response(&results, limit_offset, limit_count);
-        }
-        Ok(None) => { /* fall through to BM25 path */ }
-        Err(e) => return Frame::Error(Bytes::copy_from_slice(e.as_bytes())),
+    {
+        run_text_query(
+            text_store,
+            index_name.as_ref(),
+            query_bytes.as_ref(),
+            top_k,
+            limit_offset,
+            limit_count,
+        )
     }
-
-    // Use the first field's analyzer for query parsing (per D-03: all fields share same language).
-    let analyzer = match text_index.field_analyzers.first() {
-        Some(a) => a,
-        None => {
-            return Frame::Error(Bytes::from_static(b"ERR index has no TEXT fields"));
-        }
-    };
-
-    // Parse the query into (field_name, terms).
-    let clause = match parse_text_query(query_bytes.as_ref(), analyzer) {
-        Ok(c) => c,
-        Err(e) => return Frame::Error(Bytes::copy_from_slice(e.as_bytes())),
-    };
-
-    // Execute the search (cross-field or field-targeted).
-    let results = execute_query_on_index(text_index, &clause, None, None, top_k);
-
-    build_text_response(&results, limit_offset, limit_count)
+    #[cfg(not(feature = "text-index"))]
+    {
+        let _ = (text_store, index_name, query_bytes, top_k);
+        Frame::Error(Bytes::from_static(b"ERR text-index feature not enabled"))
+    }
 }
 
 /// Execute text search on local shard without global IDF override (single-shard path).
@@ -1550,6 +1532,59 @@ pub fn execute_text_search_with_global_idf(
         execute_query_on_index(text_index, &clause, Some(global_df), Some(global_n), top_k);
 
     build_text_response(&results, offset, count)
+}
+
+// ─── Centralized AST dispatch (fts-query-eval-dispatch 2b) ─────────────────────
+
+/// Centralized FT.SEARCH text dispatch: parse the query with the recursive-descent parser, evaluate
+/// the AST to a matched + BM25-scored result set, and build the FT.SEARCH reply. This is the single
+/// path that replaces the old `pre_parse_field_filter` / `parse_text_query` /
+/// `execute_text_search_local` dance on the text branch, so OR unions, multi-`@clause` intersections,
+/// and grouping return correct results. A parse error becomes a coded `Frame::Error` and NEVER
+/// panics (E6). HYBRID / vector-KNN / SPARSE are caught before this and never reach it (E4).
+///
+/// `global_df`/`global_n` inject the DFS global-IDF weights (multi-shard Phase 2); pass `None` on the
+/// single-shard / local path (E5). The reply format is unchanged — `build_text_response`.
+#[cfg(feature = "text-index")]
+pub fn run_text_query_on_index(
+    text_index: &TextIndex,
+    query: &[u8],
+    global_df: Option<&HashMap<String, u32>>,
+    global_n: Option<u32>,
+    top_k: usize,
+    offset: usize,
+    count: usize,
+) -> Frame {
+    use crate::text::query::{QuerySchema, eval_query, parse_query};
+    let schema = QuerySchema::from_index(text_index);
+    match parse_query(query, &schema) {
+        Ok(node) => {
+            let results = eval_query(text_index, &node, global_df, global_n, top_k);
+            build_text_response(&results, offset, count)
+        }
+        // The five frozen wire codes (fts-query-combinators §3); never panics on malformed input.
+        Err(e) => Frame::Error(Bytes::copy_from_slice(e.code().as_bytes())),
+    }
+}
+
+/// Store-level wrapper around [`run_text_query_on_index`] — resolves the index, then dispatches on
+/// the local (no global-IDF) path. Returns `ERR no such index` for an unknown index. Used by the
+/// single-shard handlers, the per-handler co-located fast paths, and the SPSC text entry.
+#[cfg(feature = "text-index")]
+pub fn run_text_query(
+    text_store: &TextStore,
+    index_name: &[u8],
+    query: &[u8],
+    top_k: usize,
+    offset: usize,
+    count: usize,
+) -> Frame {
+    match text_store.get_index(index_name) {
+        Some(text_index) => {
+            run_text_query_on_index(text_index, query, None, None, top_k, offset, count)
+        }
+        None => Frame::Error(Bytes::from_static(b"ERR no such index")),
+    }
 }
 
 // ─── Cross-field accumulation ─────────────────────────────────────────────────

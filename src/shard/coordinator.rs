@@ -1568,8 +1568,7 @@ pub async fn scatter_invalidate_range(
 /// **before** any `.await` point — required by RESEARCH Pitfall 2.
 pub async fn scatter_text_search(
     index_name: Bytes,
-    query_terms: Vec<crate::command::vector_search::QueryTerm>,
-    field_idx: Option<usize>,
+    query: Bytes,
     top_k: usize,
     offset: usize,
     count: usize,
@@ -1582,31 +1581,59 @@ pub async fn scatter_text_search(
     summarize_opts: Option<crate::command::vector_search::SummarizeOpts>,
 ) -> Frame {
     let _ = shard_databases; // E2 removes
-    // Extract plain term strings for DocFreq phase (only needs term text, not modifiers).
-    let term_strings: Vec<String> = query_terms.iter().map(|qt| qt.text.clone()).collect();
+
+    // ── Parse once for Phase-1 df terms + highlight terms (fts-query-eval-dispatch 2b) ──
+    // Parse inside a with_shard block so we have the index schema, then move owned
+    // values out. with_shard releases the borrow before any .await.
+    #[cfg(feature = "text-index")]
+    let (field_queries, term_strings) = {
+        use crate::text::query::{QuerySchema, collect_df_field_terms, collect_highlight_terms};
+        let parse_result: Result<
+            (Vec<(Option<usize>, Vec<String>)>, Vec<String>),
+            crate::protocol::Frame,
+        > = crate::shard::slice::with_shard(|s| match s.text_store.get_index(&index_name) {
+            None => Err(Frame::Error(Bytes::from_static(b"ERR no such index"))),
+            Some(text_index) => {
+                let schema = QuerySchema::from_index(text_index);
+                match crate::text::query::parse_query(&query, &schema) {
+                    Err(e) => Err(Frame::Error(Bytes::copy_from_slice(e.code().as_bytes()))),
+                    Ok(node) => {
+                        let fq = collect_df_field_terms(&node, text_index);
+                        let ts = collect_highlight_terms(&node, text_index);
+                        Ok((fq, ts))
+                    }
+                }
+            }
+        });
+        match parse_result {
+            Err(err_frame) => return err_frame,
+            Ok(pair) => pair,
+        }
+    };
+    #[cfg(not(feature = "text-index"))]
+    let (field_queries, _term_strings): (Vec<(Option<usize>, Vec<String>)>, Vec<String>) =
+        (Vec::new(), Vec::new());
 
     // ── Single-shard fast path (per D-06) ────────────────────────────────────
     if num_shards == 1 {
         // Local IDF is globally accurate with one shard — skip DFS pre-pass.
-        // Apply HIGHLIGHT/SUMMARIZE post-processing after local search.
+        // Use run_text_query_on_index with no global IDF (single-shard path).
         //
         // text_store + databases[0] accessed simultaneously via a single
         // `with_shard` call to avoid a reentrant `with_shard*` panic.
         let result = crate::shard::slice::with_shard(|s| {
             let ts = &s.text_store;
-            let mut r = crate::command::vector_search::ft_text_search::execute_text_search_local(
-                ts,
-                &index_name,
-                field_idx,
-                &query_terms,
-                top_k,
-                offset,
-                count,
-            );
-            if highlight_opts.is_some() || summarize_opts.is_some() {
-                // Get the text_index reference, then borrow databases[0]
-                // disjointly. Both fields are tracked independently by rustc.
-                if let Some(text_index) = ts.get_index(&index_name) {
+            let text_index = match ts.get_index(&index_name) {
+                Some(idx) => idx,
+                None => return Frame::Error(Bytes::from_static(b"ERR no such index")),
+            };
+            #[cfg(feature = "text-index")]
+            {
+                let mut r = crate::command::vector_search::ft_text_search::run_text_query_on_index(
+                    text_index, &query, None, None, top_k, offset, count,
+                );
+                if highlight_opts.is_some() || summarize_opts.is_some() {
+                    // databases[0] borrowed disjointly from text_store — both live on `s`.
                     if let Some(db) = s.databases.get_mut(0) {
                         crate::command::vector_search::ft_text_search::apply_post_processing(
                             &mut r,
@@ -1618,16 +1645,20 @@ pub async fn scatter_text_search(
                         );
                     }
                 }
+                r
             }
-            r
+            #[cfg(not(feature = "text-index"))]
+            {
+                let _ = text_index;
+                Frame::Error(Bytes::from_static(b"ERR text-index feature not enabled"))
+            }
         });
         return result;
     }
 
     // ── Phase 1: scatter DocFreq to all shards ────────────────────────────────
     // Collect (term, df, N) from each shard to build global IDF weights.
-    // DocFreq only needs term strings (not modifiers) for df lookup.
-    let field_queries = vec![(field_idx, term_strings.clone())];
+    // field_queries comes from collect_df_field_terms (above); shape unchanged.
     let mut doc_freq_receivers: Vec<crate::runtime::channel::OneshotReceiver<Frame>> =
         Vec::with_capacity(num_shards.saturating_sub(1));
     let mut local_doc_freq: Option<Frame> = None;
@@ -1692,36 +1723,42 @@ pub async fn scatter_text_search(
 
     for shard_id in 0..num_shards {
         if shard_id == my_shard {
-            // Local: execute with global IDF directly.
+            // Local: execute with global IDF via run_text_query_on_index.
             // text_store + databases[0] folded into a single `with_shard` to
             // avoid reentrant `with_shard*` panic. Slice released before .await.
             let response = crate::shard::slice::with_shard(|s| {
                 match s.text_store.get_index(&index_name) {
                     Some(text_index) => {
-                        let mut r =
-                            crate::command::vector_search::ft_text_search::execute_text_search_with_global_idf(
+                        #[cfg(feature = "text-index")]
+                        {
+                            let mut r = crate::command::vector_search::ft_text_search::run_text_query_on_index(
                                 text_index,
-                                field_idx,
-                                &query_terms,
-                                &global_df,
-                                global_n,
+                                &query,
+                                Some(&global_df),
+                                Some(global_n),
                                 top_k,
                                 0,      // each shard returns top_k; coordinator applies final offset
                                 top_k,
                             );
-                        if highlight_opts.is_some() || summarize_opts.is_some() {
-                            if let Some(db) = s.databases.get_mut(0) {
-                                crate::command::vector_search::ft_text_search::apply_post_processing(
-                                    &mut r,
-                                    &term_strings,
-                                    text_index,
-                                    db,
-                                    highlight_opts.as_ref(),
-                                    summarize_opts.as_ref(),
-                                );
+                            if highlight_opts.is_some() || summarize_opts.is_some() {
+                                if let Some(db) = s.databases.get_mut(0) {
+                                    crate::command::vector_search::ft_text_search::apply_post_processing(
+                                        &mut r,
+                                        &term_strings,
+                                        text_index,
+                                        db,
+                                        highlight_opts.as_ref(),
+                                        summarize_opts.as_ref(),
+                                    );
+                                }
                             }
+                            r
                         }
-                        r
+                        #[cfg(not(feature = "text-index"))]
+                        {
+                            let _ = text_index;
+                            Frame::Error(Bytes::from_static(b"ERR text-index feature not enabled"))
+                        }
                     }
                     None => Frame::Error(Bytes::from_static(b"ERR unknown index")),
                 }
@@ -1732,9 +1769,8 @@ pub async fn scatter_text_search(
             let msg =
                 ShardMessage::TextSearch(Box::new(crate::shard::dispatch::TextSearchPayload {
                     index_name: index_name.clone(),
-                    field_idx,
-                    // Send full QueryTerm so remote shard applies the same expansion.
-                    query_terms: query_terms.clone(),
+                    // Send raw query bytes; each remote shard re-parses with the full AST.
+                    query: query.clone(),
                     global_df: global_df.clone(),
                     global_n,
                     top_k,
@@ -2308,12 +2344,7 @@ mod tests {
 
         let result = scatter_text_search(
             Bytes::from_static(b"nonexistent_index"),
-            vec![crate::command::vector_search::QueryTerm {
-                text: "machine".to_owned(),
-                #[cfg(feature = "text-index")]
-                modifier: crate::text::store::TermModifier::Exact,
-            }],
-            None, // cross-field
+            Bytes::from_static(b"machine"), // raw query bytes (fts-query-eval-dispatch 2b)
             10,
             0,
             10,
@@ -2327,7 +2358,7 @@ mod tests {
         )
         .await;
 
-        // Should be "ERR no such index" (local execute_text_search_local path),
+        // Should be "ERR no such index" (single-shard run_text_query_on_index path),
         // NOT a channel error. This proves the DFS pre-pass was skipped entirely.
         match &result {
             Frame::Error(e) => {

@@ -18,6 +18,8 @@ pub mod bm25;
 pub mod fst_dict;
 pub mod index_persist;
 pub mod posting;
+#[cfg(feature = "text-index")]
+pub mod query;
 pub mod store;
 pub mod term_dict;
 pub mod types;

@@ -499,14 +499,11 @@ impl TextIndex {
                     .get_posting(*term_id)
                     .expect("posting exists: checked above");
 
-                // Per RESEARCH Pitfall 1: use linear scan (not rank()) for correct TF lookup.
-                // term_freqs is in insertion order, NOT sorted doc_id order.
-                let tf = posting
-                    .doc_ids
-                    .iter()
-                    .position(|id| id == doc_id)
-                    .map(|idx| posting.term_freqs[idx] as f32)
-                    .unwrap_or(0.0);
+                // Rank-aligned TF lookup (fts-posting-rank-tf): sub-linear and correct after
+                // document updates. term_freqs is now kept in sorted-doc_id (rank) order, so the
+                // old linear scan is gone — see PostingList::tf. (Supersedes the former
+                // "RESEARCH Pitfall 1" note, which assumed insertion-order term_freqs.)
+                let tf = posting.tf(doc_id) as f32;
 
                 // Use global_df if provided (DFS path), else local doc frequency.
                 let df = global_df
@@ -766,13 +763,8 @@ impl TextIndex {
                     continue;
                 }
 
-                // Linear scan TF lookup (same as search_field — insertion order, not rank).
-                let tf = posting
-                    .doc_ids
-                    .iter()
-                    .position(|id| id == doc_id)
-                    .map(|idx| posting.term_freqs[idx] as f32)
-                    .unwrap_or(0.0);
+                // Rank-aligned TF lookup (fts-posting-rank-tf) — same as search_field.
+                let tf = posting.tf(doc_id) as f32;
 
                 // Use local posting list df for expanded term IDs.
                 let df = posting.doc_ids.len() as u32;

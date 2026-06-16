@@ -6,6 +6,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — FT.SEARCH `OR` and multi-clause queries return correct result sets (PR #190)
+
+`FT.SEARCH` query combinators were silently broken: `OR` (`alpha | beta`)
+collapsed to an intersection (returning only docs matching *both* terms), and a
+multi-clause query such as `@body:foo @tag:{bar}` returned **zero** results
+instead of the intersection. A code trace showed the root cause was a missing
+parser layer — four runtime handlers each re-parsed the query inline with a
+flat, AND-only shape that could not represent an `OR`/grouped AST, and the
+cross-shard scatter carried that same flat shape so `OR` was unfixable at the
+leaf. This lands a recursive-descent query parser producing a frozen
+`QueryNode` AST and one centralized evaluator (`eval_set` folds the AST to a
+`RoaringBitmap` — `AND` = intersection, `OR` = union — over the shared doc-id
+space; `eval_query` adds best-effort BM25 with deterministic score-desc /
+doc-id-asc ordering). All four FT.SEARCH text branches plus the cross-shard
+Phase-2 scatter now route raw query bytes through `parse_query → eval_query →
+build_text_response`; the cross-shard payload carries the opaque query bytes and
+each shard re-parses, so `OR`/grouping/`TEXT+TAG`/`TEXT+NUMERIC` work in every
+shard configuration. Malformed queries return a coded `Frame::Error` (one of
+five frozen codes) and never panic the server. Verified end-to-end over the wire
+on 1- and 4-shard servers (`alpha | beta` → union, `@body:foo @tag:{bar}` →
+intersection, 1-shard vs 4-shard result sets identical). `HYBRID`/vector-KNN/
+`SPARSE`/`SESSION`/`RANGE` dispatch is untouched.
+
+### Performance — high-DF FT.SEARCH term queries no longer O(M²) (PR #190)
+
+The per-document term-frequency lookup on the BM25 path was an O(N)
+`.position(|id| id == doc_id)` linear scan over a posting list, so a query on a
+high-document-frequency term degraded to O(M²) (a ~5%-of-corpus term took
+~419 ms on a 100K-doc index). `PostingList` now keeps `term_freqs`/`positions`
+in sorted-doc-id (rank) order aligned with the doc-id `RoaringBitmap`, and
+`tf()`/`positions_for()` resolve via `RoaringBitmap::rank` (sub-linear). The
+rank alignment also fixed a latent BM25 corruption where re-indexing an updated
+low-id document pushed its term frequency out of position, silently misaligning
+scores.
+
 ### Performance — monoio FT.SEARCH yield is now cost-free; brute-force knee raised to 1024 (PR #189)
 
 PR #179's monoio cooperative yield reaped the io_uring completion queue by

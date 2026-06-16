@@ -275,8 +275,11 @@ pub struct FtHybridPayload {
 ///   lines when the hot slotted variants are enqueued.
 pub struct TextSearchPayload {
     pub index_name: Bytes,
-    pub field_idx: Option<usize>,
-    pub query_terms: Vec<crate::command::vector_search::ft_text_search::QueryTerm>,
+    /// Raw FT.SEARCH query bytes (fts-query-eval-dispatch 2b). Each shard
+    /// re-parses this with the recursive-descent parser so the full AST
+    /// (OR, multi-@clause, grouping) is evaluated correctly — replacing the
+    /// old `field_idx`/`query_terms` pre-parsed flat representation.
+    pub query: Bytes,
     pub global_df: std::collections::HashMap<String, u32>,
     pub global_n: u32,
     pub top_k: usize,

@@ -170,105 +170,12 @@ pub(super) async fn try_handle_ft_command(
                 #[allow(clippy::unwrap_used)]
                 let query_str = query_bytes.unwrap();
 
-                // B-01 SITE 2 FIX (Plan 152-06): FieldFilter short-circuit BEFORE
-                // the analyzer-first parse_result block. TAG queries (and Plan 07
-                // NumericRange) route through the InvertedSearch fan-out — no
-                // analyzer touched, no field_idx resolution (the filter carries
-                // its own field name; search_tag resolves against tag_fields).
-                #[cfg(feature = "text-index")]
-                {
-                    match crate::command::vector_search::pre_parse_field_filter(query_str.as_ref())
-                    {
-                        Ok(Some(clause)) => {
-                            if let Some(filter) = clause.filter {
-                                let (offset, count) =
-                                    crate::command::vector_search::parse_limit_clause(cmd_args);
-                                let top_k = if count == usize::MAX {
-                                    10000
-                                } else {
-                                    offset.saturating_add(count)
-                                }
-                                .max(1);
-                                let response =
-                                    crate::shard::coordinator::scatter_text_search_filter(
-                                        index_name,
-                                        filter,
-                                        top_k,
-                                        offset,
-                                        count,
-                                        ctx.shard_id,
-                                        ctx.num_shards,
-                                        &ctx.shard_databases,
-                                        &ctx.dispatch_tx,
-                                        &ctx.spsc_notifiers,
-                                    )
-                                    .await;
-                                let mut response = response;
-                                if let Some(ws_id) = conn.workspace_id.as_ref() {
-                                    strip_workspace_prefix_from_response(ws_id, cmd, &mut response);
-                                }
-                                responses.push(response);
-                                return true;
-                            }
-                        }
-                        Ok(None) => { /* fall through to BM25 path */ }
-                        Err(e) => {
-                            responses.push(Frame::Error(Bytes::from(e.to_owned())));
-                            return true;
-                        }
-                    }
-                }
-
-                // Parse query and resolve field_idx inside a block scope so the
-                // MutexGuard from text_store() is dropped BEFORE .await.
-                // We use the TextIndex's own field_analyzers (same pipeline used at index time).
-                type ParseResult =
-                    Result<(Vec<crate::command::vector_search::QueryTerm>, Option<usize>), String>;
-                // Parse query via thread-local slice (text_store is !Send, no lock needed).
-                let parse_result: ParseResult = crate::shard::slice::with_shard(|s| {
-                    match s.text_store.get_index(&index_name) {
-                        None => Err("ERR no such index".to_owned()),
-                        Some(text_index) => match text_index.field_analyzers.first() {
-                            None => Err("ERR index has no TEXT fields".to_owned()),
-                            Some(analyzer) => {
-                                let parsed = crate::command::vector_search::parse_text_query(
-                                    &query_str, analyzer,
-                                );
-                                match parsed {
-                                    Err(e) => Err(e.to_owned()),
-                                    Ok(clause) => {
-                                        let field_idx = match &clause.field_name {
-                                            None => Ok(None),
-                                            Some(field_name) => {
-                                                match text_index.text_fields.iter().position(|f| {
-                                                    f.field_name
-                                                        .as_ref()
-                                                        .eq_ignore_ascii_case(field_name.as_ref())
-                                                }) {
-                                                    Some(idx) => Ok(Some(idx)),
-                                                    None => Err(format!(
-                                                        "ERR unknown field '{}'",
-                                                        String::from_utf8_lossy(field_name)
-                                                    )),
-                                                }
-                                            }
-                                        };
-                                        field_idx.map(|idx| (clause.terms, idx))
-                                    }
-                                }
-                            }
-                        },
-                    }
-                }); // with_shard borrow released here
-
-                let (query_terms, field_idx) = match parse_result {
-                    Ok(t) => t,
-                    Err(e) => {
-                        responses.push(Frame::Error(Bytes::from(e)));
-                        return true;
-                    }
-                };
-
+                // fts-query-eval-dispatch 2b: pass raw query bytes to scatter_text_search.
+                // The coordinator parses once (for Phase-1 df terms), then each shard
+                // re-parses with the recursive-descent AST evaluator. This correctly
+                // handles OR unions, multi-@clause intersections, tag/numeric filters,
+                // and grouping — replacing the old pre_parse_field_filter / parse_text_query
+                // pre-pass and the scatter_text_search_filter split path.
                 let (offset, count) = crate::command::vector_search::parse_limit_clause(cmd_args);
                 let top_k = if count == usize::MAX {
                     10000
@@ -277,7 +184,6 @@ pub(super) async fn try_handle_ft_command(
                 }
                 .max(1);
 
-                // Parse optional HIGHLIGHT/SUMMARIZE clauses from args.
                 let highlight_opts =
                     crate::command::vector_search::parse_highlight_clause(cmd_args);
                 let summarize_opts =
@@ -285,8 +191,7 @@ pub(super) async fn try_handle_ft_command(
 
                 let response = crate::shard::coordinator::scatter_text_search(
                     index_name,
-                    query_terms,
-                    field_idx,
+                    query_str,
                     top_k,
                     offset,
                     count,
@@ -543,61 +448,11 @@ pub(super) async fn try_handle_ft_command(
                                     return true;
                                 }
                             };
-                            // B-01 SITE 2 FIX (single-shard 151-03 fast path, Plan 152-06):
-                            // FieldFilter short-circuit BEFORE the analyzer lookup and
-                            // BEFORE the text_fields.is_empty() bail.
-                            #[cfg(feature = "text-index")]
-                            match crate::command::vector_search::pre_parse_field_filter(
-                                query_bytes.as_ref(),
-                            ) {
-                                Ok(Some(clause)) => {
-                                    if clause.filter.is_some() {
-                                        let (offset, count) =
-                                            crate::command::vector_search::parse_limit_clause(
-                                                cmd_args,
-                                            );
-                                        let top_k = if count == usize::MAX {
-                                            10000
-                                        } else {
-                                            offset.saturating_add(count)
-                                        }
-                                        .max(1);
-                                        let response = crate::shard::slice::with_shard(|s| match s
-                                            .text_store
-                                            .get_index(&index_name)
-                                        {
-                                            None => Frame::Error(Bytes::from_static(
-                                                b"ERR no such index",
-                                            )),
-                                            Some(text_index) => {
-                                                let results = crate::command::vector_search::ft_text_search::execute_query_on_index(
-                                                        text_index, &clause, None, None, top_k,
-                                                    );
-                                                crate::command::vector_search::ft_text_search::build_text_response(
-                                                        &results, offset, count,
-                                                    )
-                                            }
-                                        });
-                                        let mut response = response;
-                                        if let Some(ws_id) = conn.workspace_id.as_ref() {
-                                            strip_workspace_prefix_from_response(
-                                                ws_id,
-                                                cmd,
-                                                &mut response,
-                                            );
-                                        }
-                                        responses.push(response);
-                                        return true;
-                                    }
-                                }
-                                Ok(None) => { /* fall through */ }
-                                Err(e) => {
-                                    responses
-                                        .push(Frame::Error(Bytes::copy_from_slice(e.as_bytes())));
-                                    return true;
-                                }
-                            }
-                            // Step 7: LIMIT parsing + top_k cap (T-151-03-02).
+                            // fts-query-eval-dispatch 2b: single-shard local fast path.
+                            // run_text_query handles index lookup, parse, eval, tag/numeric
+                            // filters, OR, multi-@clause combinators in one call.
+                            // HIGHLIGHT/SUMMARIZE: re-parse inside the same with_shard closure
+                            // so text_index and databases[0] are borrowed disjointly off `s`.
                             let (offset, count) =
                                 crate::command::vector_search::parse_limit_clause(cmd_args);
                             let top_k = if count == usize::MAX {
@@ -606,108 +461,56 @@ pub(super) async fn try_handle_ft_command(
                                 offset.saturating_add(count)
                             }
                             .max(1);
-                            // Step 8: HIGHLIGHT / SUMMARIZE options.
                             let highlight_opts =
                                 crate::command::vector_search::parse_highlight_clause(cmd_args);
                             let summarize_opts =
                                 crate::command::vector_search::parse_summarize_clause(cmd_args);
-                            let needs_db = highlight_opts.is_some() || summarize_opts.is_some();
-                            // Steps 2-10: acquire stores and execute via ShardSlice.
-                            let text_search_result: Result<Frame, Frame> =
-                                crate::shard::slice::with_shard(|s| {
-                                    // Step 2-3: resolve index from text_store.
-                                    let text_index = match s.text_store.get_index(&index_name) {
-                                        Some(idx) => idx,
-                                        None => {
-                                            return Err(Frame::Error(Bytes::from_static(
-                                                b"ERR no such index",
-                                            )));
-                                        }
-                                    };
-                                    // Step 4: ensure TEXT fields.
-                                    if text_index.text_fields.is_empty() {
-                                        return Err(Frame::Error(Bytes::from_static(
-                                            b"ERR index has no TEXT fields",
-                                        )));
-                                    }
-                                    // Step 5: parse query.
-                                    let analyzer = match text_index.field_analyzers.first() {
-                                        Some(a) => a,
-                                        None => {
-                                            return Err(Frame::Error(Bytes::from_static(
-                                                b"ERR index has no TEXT fields",
-                                            )));
-                                        }
-                                    };
-                                    let clause =
-                                        match crate::command::vector_search::parse_text_query(
-                                            query_bytes.as_ref(),
-                                            analyzer,
-                                        ) {
-                                            Ok(c) => c,
-                                            Err(msg) => {
-                                                return Err(Frame::Error(Bytes::copy_from_slice(
-                                                    msg.as_bytes(),
-                                                )));
-                                            }
-                                        };
-                                    // Step 5b: resolve field_idx.
-                                    let field_idx = match &clause.field_name {
-                                        None => None,
-                                        Some(field_name) => {
-                                            match text_index.text_fields.iter().position(|f| {
-                                                f.field_name
-                                                    .as_ref()
-                                                    .eq_ignore_ascii_case(field_name.as_ref())
-                                            }) {
-                                                Some(idx) => Some(idx),
-                                                None => {
-                                                    let bad = field_name.clone();
-                                                    return Err(Frame::Error(Bytes::from(
-                                                        format!(
-                                                            "ERR unknown field '{}'",
-                                                            String::from_utf8_lossy(&bad)
-                                                        ),
-                                                    )));
-                                                }
+                            let need_hl = highlight_opts.is_some() || summarize_opts.is_some();
+
+                            let mut response = crate::shard::slice::with_shard(|s| {
+                                #[cfg(feature = "text-index")]
+                                {
+                                    let mut r = crate::command::vector_search::run_text_query(
+                                        &s.text_store,
+                                        &index_name,
+                                        query_bytes.as_ref(),
+                                        top_k,
+                                        offset,
+                                        count,
+                                    );
+                                    if need_hl {
+                                        if let Some(text_index) =
+                                            s.text_store.get_index(&index_name)
+                                        {
+                                            if let Ok(node) = crate::text::query::parse_query(
+                                                query_bytes.as_ref(),
+                                                &crate::text::query::QuerySchema::from_index(
+                                                    text_index,
+                                                ),
+                                            ) {
+                                                let terms =
+                                                    crate::text::query::collect_highlight_terms(
+                                                        &node, text_index,
+                                                    );
+                                                let db = &s.databases[0];
+                                                crate::command::vector_search::apply_post_processing(
+                                                    &mut r,
+                                                    &terms,
+                                                    text_index,
+                                                    db,
+                                                    highlight_opts.as_ref(),
+                                                    summarize_opts.as_ref(),
+                                                );
                                             }
                                         }
-                                    };
-                                    let query_terms = clause.terms;
-                                    // Step 10: execute.
-                                    let mut response =
-                                        crate::command::vector_search::execute_text_search_local(
-                                            &s.text_store,
-                                            &index_name,
-                                            field_idx,
-                                            &query_terms,
-                                            top_k,
-                                            offset,
-                                            count,
-                                        );
-                                    // Step 9+10b: optional post-processing with db access.
-                                    if needs_db {
-                                        let db = &s.databases[0];
-                                        let term_strings: Vec<String> =
-                                            query_terms.iter().map(|qt| qt.text.clone()).collect();
-                                        crate::command::vector_search::apply_post_processing(
-                                            &mut response,
-                                            &term_strings,
-                                            text_index,
-                                            db,
-                                            highlight_opts.as_ref(),
-                                            summarize_opts.as_ref(),
-                                        );
                                     }
-                                    Ok(response)
-                                });
-                            let mut response = match text_search_result {
-                                Ok(r) => r,
-                                Err(e) => {
-                                    responses.push(e);
-                                    return true;
+                                    r
                                 }
-                            };
+                                #[cfg(not(feature = "text-index"))]
+                                Frame::Error(Bytes::from_static(
+                                    b"ERR text-index feature not enabled",
+                                ))
+                            });
                             if let Some(ws_id) = conn.workspace_id.as_ref() {
                                 strip_workspace_prefix_from_response(ws_id, cmd, &mut response);
                             }
