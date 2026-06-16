@@ -6,6 +6,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance — FT.SEARCH upsert / bulk re-index no longer O(V) per document (PR #192)
+
+Re-indexing a document (an HSET upsert, or a bulk re-index pass) called
+`PostingStore::remove_doc`, which scanned EVERY term's posting list to clear one
+document — O(total-vocabulary) per doc — so per-upsert cost grew with the corpus
+(the indexing-rate cliff: ~376 vs ~18,052 docs/s as vocabulary V grew).
+`PostingStore` now keeps a reverse `doc_id → term_ids` index, populated once per
+(doc, term) edge as terms are added, so `remove_doc` visits only the terms the
+document actually contributed — O(terms-in-doc), independent of V. Search output
+is byte-identical (the rank-aligned posting contract is unchanged): matched doc
+sets, BM25 scores, `doc_freq`, `num_docs`, and avgdl are unaffected. A missing or
+already-cleared reverse entry is skipped defensively — never an unwrap/panic.
+
 ### Fixed — FT.SEARCH `OR` and multi-clause queries return correct result sets (PR #190)
 
 `FT.SEARCH` query combinators were silently broken: `OR` (`alpha | beta`)

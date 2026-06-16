@@ -1,7 +1,7 @@
 {
   "project": "moon",
   "stage": "production",
-  "active_task": "fts-query-combinators",
+  "active_task": "fts-upsert-incremental",
   "active_milestone": "v3-1-fts-hardening",
   "tasks": {
     "hotpath-lock-quickwins": {
@@ -121,6 +121,16 @@
       ],
       "created": "2026-06-16T06:21:47+00:00",
       "updated": "2026-06-16T09:07:25+00:00"
+    },
+    "fts-upsert-incremental": {
+      "title": "Incremental posting-list upsert (kill O(V) per-doc scan)",
+      "phase": "done",
+      "gate": "PASS",
+      "milestone": "v3-1-fts-hardening",
+      "depends_on": [],
+      "created": "2026-06-16T10:34:55+00:00",
+      "updated": "2026-06-16T12:46:23+00:00",
+      "flag_verified": true
     }
   },
   "milestones": {
@@ -174,7 +184,7 @@
     }
   },
   "created": "2026-06-11T03:18:21+00:00",
-  "updated": "2026-06-16T09:07:25+00:00",
+  "updated": "2026-06-16T12:46:23+00:00",
   "setup": {
     "locked": true,
     "locked_at": "2026-06-11T03:28:00+00:00",
