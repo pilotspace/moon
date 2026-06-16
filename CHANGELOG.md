@@ -6,6 +6,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — Graph Incoming / Both traversals return incoming edges after compaction (PR #193)
+
+A compacted graph stores edges only in immutable CSR segments, which keep just
+OUTGOING adjacency. `SegmentMergeReader` therefore `continue`d past the CSR for
+`Direction::Incoming` (returning nothing) and silently dropped the incoming half
+for `Direction::Both` — so `MATCH (a)<-[]-(b)` / undirected traversals over
+compacted data missed every predecessor. The reader now serves predecessors from
+a derived reverse index (`IncomingIndex`) built once per segment from the existing
+forward arrays (`row_offsets` + `col_indices`) and cached in a non-persisted
+`OnceLock` — no segment format/version change, so on-disk heap and mmap segments
+answer incoming queries unchanged. Incoming edges reuse the same `edge_meta` /
+`edge_created_ms` / validity / node-visibility by edge index, so the edge-type
+filter, tombstones, decay stamp, deleted-node exclusion, snapshot rules, and
+NodeKey dedup are identical to the outgoing path. `Direction::Outgoing` is
+unchanged. MemGraph already handled all three directions; this fixes the
+immutable-CSR path only.
+
 ### Fixed — Cypher MATCH narrows on inline node-property predicates instead of full-scanning the label (PR #193)
 
 `compile_match` built each pattern node's `NodeScan`/`Expand` but silently

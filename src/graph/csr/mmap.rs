@@ -6,7 +6,7 @@ use std::path::Path;
 use memmap2::Mmap;
 use roaring::RoaringBitmap;
 
-use super::{CsrError, compute_csr_checksum, read4, read8};
+use super::{CsrError, IncomingIndex, compute_csr_checksum, read4, read8};
 use crate::graph::index::{EdgeTypeIndex, LabelIndex, MphNodeIndex};
 use crate::graph::types::{EdgeMeta, GraphSegmentHeader, NodeKey, NodeMeta};
 
@@ -42,6 +42,10 @@ pub struct MmapCsrSegment {
     pub label_index: LabelIndex,
     pub edge_type_index: EdgeTypeIndex,
     pub created_lsn: u64,
+    /// Lazily-built reverse (incoming) adjacency, DERIVED from the mmap'd forward
+    /// arrays. NOT part of the on-disk format — rebuilt on the first Incoming/Both
+    /// query. (v3-2 graph-incoming-edges.)
+    pub incoming: std::sync::OnceLock<IncomingIndex>,
 }
 
 // SAFETY: MmapCsrSegment contains raw pointers into an immutable Mmap region.
@@ -293,6 +297,7 @@ impl MmapCsrSegment {
             label_index,
             edge_type_index,
             created_lsn,
+            incoming: std::sync::OnceLock::new(),
         })
     }
 

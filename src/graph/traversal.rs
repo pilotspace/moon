@@ -185,53 +185,60 @@ impl<'a> SegmentMergeReader<'a> {
                 continue;
             };
 
-            // CSR only stores outgoing edges. For Direction::Both or Incoming,
-            // we would need an incoming CSR or reverse index. For now, CSR
-            // contributes outgoing neighbors only (matching the CSR data model).
-            if self.direction == Direction::Incoming {
-                continue;
-            }
-
             let edge_type_filter = self.edge_type_filter;
             let snapshot_lsn = self.snapshot_lsn;
             let node_meta = csr.node_meta();
             let csr_lsn = csr.created_lsn();
 
-            csr.for_each_neighbor_edge_ms(row, |col_idx, meta, created_ms| {
-                // Apply edge type filter.
-                if let Some(filter) = edge_type_filter {
-                    if meta.edge_type != filter {
-                        return;
+            // Resolve a CSR row to a visible NodeKey, push as a MergedNeighbor.
+            // Shared by the outgoing (target row) and incoming (source row) loops
+            // so both apply the same edge-type filter, node visibility, and dedup.
+            let mut push_neighbor =
+                |row_idx: u32, meta: crate::graph::types::EdgeMeta, created_ms: u64| {
+                    if let Some(filter) = edge_type_filter {
+                        if meta.edge_type != filter {
+                            return;
+                        }
                     }
-                }
+                    if (row_idx as usize) < node_meta.len() {
+                        let meta_n = &node_meta[row_idx as usize];
+                        // Skip nodes deleted at/before the snapshot.
+                        if meta_n.deleted_lsn != u64::MAX && meta_n.deleted_lsn <= snapshot_lsn {
+                            return;
+                        }
+                        let key: NodeKey = slotmap::KeyData::from_ffi(meta_n.external_id).into();
+                        if seen.insert(key) {
+                            result.push(MergedNeighbor {
+                                node: key,
+                                edge: slotmap::KeyData::from_ffi(0).into(),
+                                edge_type: meta.edge_type,
+                                weight: 1.0,
+                                timestamp: csr_lsn,
+                                // Real per-edge wall-clock stamp from the version
+                                // >= 3 segment format; 0 = unknown (pre-v3 file),
+                                // which decay treats as neutral.
+                                created_ms,
+                            });
+                        }
+                    }
+                };
 
-                // Resolve col_idx back to a NodeKey via node_meta.
-                if (col_idx as usize) < node_meta.len() {
-                    let target_meta = &node_meta[col_idx as usize];
-                    // Check target node visibility (not deleted at snapshot).
-                    if target_meta.deleted_lsn != u64::MAX
-                        && target_meta.deleted_lsn <= snapshot_lsn
-                    {
-                        return;
-                    }
-                    let target_key: NodeKey =
-                        slotmap::KeyData::from_ffi(target_meta.external_id).into();
+            // Outgoing successors (Outgoing | Both): the forward CSR row.
+            if self.direction != Direction::Incoming {
+                csr.for_each_neighbor_edge_ms(row, |col_idx, meta, created_ms| {
+                    push_neighbor(col_idx, meta, created_ms);
+                });
+            }
 
-                    if seen.insert(target_key) {
-                        result.push(MergedNeighbor {
-                            node: target_key,
-                            edge: slotmap::KeyData::from_ffi(0).into(),
-                            edge_type: meta.edge_type,
-                            weight: 1.0,
-                            timestamp: csr_lsn,
-                            // Real per-edge wall-clock stamp from the version
-                            // >= 3 segment format; 0 = unknown (pre-v3 file),
-                            // which decay treats as neutral.
-                            created_ms,
-                        });
-                    }
-                }
-            });
+            // Incoming predecessors (Incoming | Both): the DERIVED reverse index.
+            // CSR stores only outgoing adjacency; for_each_incoming_edge_ms serves
+            // predecessors from a lazily-built reverse index over the same forward
+            // arrays, so post-compaction Incoming/Both no longer drop these edges.
+            if self.direction != Direction::Outgoing {
+                csr.for_each_incoming_edge_ms(row, |src_idx, meta, created_ms| {
+                    push_neighbor(src_idx, meta, created_ms);
+                });
+            }
         }
     }
 
@@ -1582,5 +1589,176 @@ mod tests {
         seq_nodes.sort_by_key(|k| k.data().as_ffi());
         par_nodes.sort_by_key(|k| k.data().as_ffi());
         assert_eq!(seq_nodes, par_nodes);
+    }
+
+    // ─── graph-incoming-edges (v3-2): Incoming/Both on a compacted CSR segment ─────
+    // Frozen contract: SegmentMergeReader returns predecessors for Direction::Incoming
+    // and the predecessor∪successor union for Direction::Both on a compacted segment,
+    // via a derived (not persisted) reverse index. RED until the fix — today the CSR
+    // branch `continue`s on Incoming and drops the incoming half of Both.
+    //
+    // Corpus G: A-[R1]->C, B-[R2]->C, C-[R1]->D  (R1=1, R2=2), frozen into ONE segment.
+    // Predecessors(C)={A,B}; Successors(C)={D}; Predecessors(A)={}.
+
+    fn build_corpus_g_csr(created_lsn: u64) -> (CsrSegment, NodeKey, NodeKey, NodeKey, NodeKey) {
+        let mut mg = MemGraph::new(1000);
+        let a = mg.add_node(smallvec![0], empty_props(), None, 1);
+        let b = mg.add_node(smallvec![0], empty_props(), None, 1);
+        let c = mg.add_node(smallvec![0], empty_props(), None, 1);
+        let d = mg.add_node(smallvec![0], empty_props(), None, 1);
+        mg.add_edge(a, c, 1, 1.0, None, 2).expect("A-[R1]->C");
+        mg.add_edge(b, c, 2, 1.0, None, 2).expect("B-[R2]->C");
+        mg.add_edge(c, d, 1, 1.0, None, 2).expect("C-[R1]->D");
+        let frozen = mg.freeze().expect("freeze");
+        let csr = CsrSegment::from_frozen(frozen, created_lsn).expect("from_frozen");
+        (csr, a, b, c, d)
+    }
+
+    fn incoming_set(
+        segs: &[Arc<CsrStorage>],
+        node: NodeKey,
+        dir: Direction,
+        snapshot_lsn: u64,
+        filter: Option<u16>,
+    ) -> std::collections::HashSet<NodeKey> {
+        let reader = SegmentMergeReader::new(None, segs, dir, snapshot_lsn, filter);
+        reader.neighbors(node).into_iter().map(|n| n.node).collect()
+    }
+
+    #[test]
+    fn test_incoming_returns_predecessors_post_compaction() {
+        // M1 — Incoming(C) on a compacted segment returns C's predecessors {A, B}.
+        let (csr, a, b, c, _d) = build_corpus_g_csr(5);
+        let segs = vec![Arc::new(CsrStorage::from(csr))];
+        let got = incoming_set(&segs, c, Direction::Incoming, u64::MAX - 1, None);
+        assert_eq!(
+            got,
+            std::collections::HashSet::from([a, b]),
+            "Incoming(C) must be predecessors {{A,B}} post-compaction; got {got:?}"
+        );
+    }
+
+    #[test]
+    fn test_both_returns_union_of_pred_and_succ() {
+        // M2 — Both(C) returns predecessors {A,B} ∪ successors {D}.
+        let (csr, a, b, c, d) = build_corpus_g_csr(5);
+        let segs = vec![Arc::new(CsrStorage::from(csr))];
+        let got = incoming_set(&segs, c, Direction::Both, u64::MAX - 1, None);
+        assert_eq!(
+            got,
+            std::collections::HashSet::from([a, b, d]),
+            "Both(C) must be {{A,B,D}} (predecessors ∪ successors); got {got:?}"
+        );
+    }
+
+    #[test]
+    fn test_incoming_honors_edge_type_validity_and_node_visibility() {
+        // M3 — edge-type filter, tombstone, and deleted-node visibility on the incoming path.
+        // (a) edge_type filter R1=1 keeps only A (B's edge into C is R2=2).
+        let (csr, a, _b, c, _d) = build_corpus_g_csr(5);
+        let segs = vec![Arc::new(CsrStorage::from(csr))];
+        let reader =
+            SegmentMergeReader::new(None, &segs, Direction::Incoming, u64::MAX - 1, Some(1));
+        let inc = reader.neighbors(c);
+        let got: std::collections::HashSet<NodeKey> = inc.iter().map(|n| n.node).collect();
+        assert_eq!(
+            got,
+            std::collections::HashSet::from([a]),
+            "edge_type=R1 filter keeps only A on the incoming path; got {got:?}"
+        );
+        assert!(
+            inc.iter().all(|n| n.edge_type == 1),
+            "each incoming result carries its real edge_type (R1)"
+        );
+
+        // (b) tombstone A->C (clear its validity bit): Incoming(C) -> {B}.
+        let (mut csr2, a2, b2, c2, _d2) = build_corpus_g_csr(5);
+        let a_row = csr2.lookup_node(a2).expect("A is in the segment");
+        let a_first_edge = csr2.row_offsets[a_row as usize]; // A's only out-edge is A->C
+        csr2.mark_deleted(a_first_edge);
+        let segs2 = vec![Arc::new(CsrStorage::from(csr2))];
+        assert_eq!(
+            incoming_set(&segs2, c2, Direction::Incoming, u64::MAX - 1, None),
+            std::collections::HashSet::from([b2]),
+            "after tombstoning A->C, Incoming(C) = {{B}}"
+        );
+
+        // (c) soft-delete node A (deleted_lsn <= snapshot): Incoming(C) excludes A.
+        let (mut csr3, a3, b3, c3, _d3) = build_corpus_g_csr(5);
+        let a_row3 = csr3.lookup_node(a3).expect("A is in the segment") as usize;
+        csr3.node_meta[a_row3].deleted_lsn = 1; // deleted at lsn 1 <= snapshot
+        let segs3 = vec![Arc::new(CsrStorage::from(csr3))];
+        assert_eq!(
+            incoming_set(&segs3, c3, Direction::Incoming, u64::MAX - 1, None),
+            std::collections::HashSet::from([b3]),
+            "a predecessor deleted at/before the snapshot is excluded from Incoming(C)"
+        );
+    }
+
+    #[test]
+    fn test_incoming_respects_segment_snapshot() {
+        // M4 — a segment with created_lsn=10 is skipped at snapshot 5, included at 10.
+        let (csr, a, b, c, _d) = build_corpus_g_csr(10);
+        let segs = vec![Arc::new(CsrStorage::from(csr))];
+        assert!(
+            incoming_set(&segs, c, Direction::Incoming, 5, None).is_empty(),
+            "segment created_lsn=10 must be skipped at snapshot 5 (same rule as outgoing)"
+        );
+        assert_eq!(
+            incoming_set(&segs, c, Direction::Incoming, 10, None),
+            std::collections::HashSet::from([a, b]),
+            "at snapshot 10 the segment contributes {{A,B}}"
+        );
+    }
+
+    #[test]
+    fn test_outgoing_unchanged() {
+        // M5 (green-pin) — Direction::Outgoing of C is {D}, unchanged by this work.
+        let (csr, _a, _b, c, d) = build_corpus_g_csr(5);
+        let segs = vec![Arc::new(CsrStorage::from(csr))];
+        assert_eq!(
+            incoming_set(&segs, c, Direction::Outgoing, u64::MAX - 1, None),
+            std::collections::HashSet::from([d]),
+            "Outgoing(C) = {{D}}, byte-identical to today"
+        );
+    }
+
+    #[test]
+    fn test_incoming_after_to_bytes_from_bytes_roundtrip() {
+        // M6 — Incoming works on a heap segment round-tripped through to_bytes/from_bytes,
+        // proving the incoming answer is DERIVED from the existing forward arrays (not from
+        // any newly-persisted incoming data) and the on-disk format/version is unchanged.
+        let (csr, a, b, c, _d) = build_corpus_g_csr(5);
+        let bytes = csr.to_bytes();
+        let reloaded = CsrSegment::from_bytes(&bytes).expect("from_bytes parses unchanged format");
+        let segs = vec![Arc::new(CsrStorage::from(reloaded))];
+        assert_eq!(
+            incoming_set(&segs, c, Direction::Incoming, u64::MAX - 1, None),
+            std::collections::HashSet::from([a, b]),
+            "Incoming(C) = {{A,B}} after a to_bytes/from_bytes round-trip"
+        );
+    }
+
+    #[test]
+    fn test_incoming_degenerate_no_panic() {
+        // Reject / robustness (green-pin) — degenerate Incoming queries must not panic.
+        // NOTE: self-loops are unreachable here — MemGraph::add_edge rejects src==dst with
+        // `SelfLoop`, so a self-loop CSR segment cannot exist. We exercise the reachable
+        // degenerate shapes instead: a node with NO predecessors and a node absent from the
+        // segment. Both return an empty incoming contribution without panicking.
+        let (csr, a, _b, _c, _d) = build_corpus_g_csr(5);
+        let segs = vec![Arc::new(CsrStorage::from(csr))];
+
+        // A has no incoming edges -> empty, no panic.
+        assert!(
+            incoming_set(&segs, a, Direction::Incoming, u64::MAX - 1, None).is_empty(),
+            "a node with no predecessors yields an empty incoming set; must not panic"
+        );
+        // A node absent from the segment contributes nothing, no panic.
+        let absent: NodeKey = slotmap::KeyData::from_ffi(0xDEAD_BEEF).into();
+        assert!(
+            incoming_set(&segs, absent, Direction::Incoming, u64::MAX - 1, None).is_empty(),
+            "an absent node yields an empty incoming contribution, no panic"
+        );
     }
 }

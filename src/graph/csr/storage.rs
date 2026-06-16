@@ -6,7 +6,7 @@ use std::path::Path;
 use roaring::RoaringBitmap;
 
 use super::mmap::MmapCsrSegment;
-use super::{CsrError, CsrSegment};
+use super::{CsrError, CsrSegment, IncomingIndex};
 use crate::graph::index::{EdgeTypeIndex, LabelIndex, MphNodeIndex};
 use crate::graph::types::{EdgeMeta, GraphSegmentHeader, NodeKey, NodeMeta};
 
@@ -254,6 +254,44 @@ impl CsrStorage {
                 let ms = ecms.get(idx).copied().unwrap_or(0);
                 f(ci[idx], em[idx], ms);
             }
+        }
+    }
+
+    /// Reverse of [`for_each_neighbor_edge_ms`]: for each LIVE edge INCOMING to
+    /// `dst_row`, invoke `f(src_row, edge_meta, created_ms)`. The source row +
+    /// per-edge attributes are recovered by forward edge index, so the edge-type
+    /// filter, validity tombstones, and decay stamp are identical to the outgoing
+    /// path. Lazily builds and caches the derived [`IncomingIndex`] on first call.
+    /// (v3-2 graph-incoming-edges.)
+    #[inline]
+    pub fn for_each_incoming_edge_ms(&self, dst_row: u32, mut f: impl FnMut(u32, EdgeMeta, u64)) {
+        let index = self.incoming_index();
+        let em = self.edge_meta();
+        let ecms = self.edge_created_ms();
+        let validity = self.validity();
+        for &(src_row, edge_idx) in index.incoming(dst_row) {
+            if validity.contains(edge_idx) {
+                let e = edge_idx as usize;
+                let ms = ecms.get(e).copied().unwrap_or(0);
+                f(src_row, em[e], ms);
+            }
+        }
+    }
+
+    /// Get-or-build this segment's derived reverse (incoming) adjacency index.
+    /// Built once from the forward `row_offsets` + `col_indices`; cached in the
+    /// segment's `OnceLock` (interior mutability — the index is read-only state).
+    fn incoming_index(&self) -> &IncomingIndex {
+        match self {
+            CsrStorage::Heap(s) => s.incoming.get_or_init(|| {
+                let nc = s.row_offsets.len().saturating_sub(1);
+                IncomingIndex::build(&s.row_offsets, &s.col_indices, nc)
+            }),
+            CsrStorage::Mmap(s) => s.incoming.get_or_init(|| {
+                let ro = s.row_offsets();
+                let nc = ro.len().saturating_sub(1);
+                IncomingIndex::build(ro, s.col_indices(), nc)
+            }),
         }
     }
 

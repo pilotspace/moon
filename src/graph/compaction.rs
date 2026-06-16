@@ -504,6 +504,7 @@ pub fn compact_segments(
         label_index,
         edge_type_index,
         created_lsn,
+        incoming: std::sync::OnceLock::new(),
     })
 }
 

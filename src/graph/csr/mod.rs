@@ -4,9 +4,11 @@
 //! from `col_indices[row_offsets[v]]` to `col_indices[row_offsets[v+1]]`.
 //! Edge deletions use a Roaring validity bitmap without modifying CSR arrays.
 
+pub mod incoming;
 pub mod mmap;
 pub mod storage;
 
+pub use incoming::IncomingIndex;
 pub use mmap::MmapCsrSegment;
 pub use storage::CsrStorage;
 
@@ -65,6 +67,10 @@ pub struct CsrSegment {
     pub edge_type_index: EdgeTypeIndex,
     /// LSN at which this segment was created.
     pub created_lsn: u64,
+    /// Lazily-built reverse (incoming) adjacency, DERIVED from `row_offsets` +
+    /// `col_indices`. NOT persisted (excluded from `to_bytes`/`from_bytes`) —
+    /// rebuilt on the first Incoming/Both query. (v3-2 graph-incoming-edges.)
+    pub incoming: std::sync::OnceLock<IncomingIndex>,
 }
 
 impl CsrSegment {
@@ -219,6 +225,7 @@ impl CsrSegment {
             label_index,
             edge_type_index,
             created_lsn: lsn,
+            incoming: std::sync::OnceLock::new(),
         })
     }
 
@@ -680,6 +687,7 @@ impl CsrSegment {
             label_index,
             edge_type_index,
             created_lsn,
+            incoming: std::sync::OnceLock::new(),
         })
     }
 
