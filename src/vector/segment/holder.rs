@@ -66,15 +66,23 @@ pub struct YieldBudget {
 }
 
 /// Default yield cap for FT.SEARCH. The brute-force chunk size trades co-located
-/// latency against search throughput: each yield costs one runtime trip (cheap on
-/// tokio; on monoio a `sleep(ZERO)` is bounded by the ~ms timer wheel, so yields
-/// must be coarse enough to amortize). Tuned on real-disk A/B
-/// (`tmp/bench_ftsearch/RESULTS.md`); per-segment (1) is the natural immutable
-/// boundary. Override per-deployment via `MOON_FT_YIELD_CHUNK`.
+/// latency against search throughput: each yield costs one runtime trip. The
+/// monoio yield is now cost-free (`ft-yield-costfree-monoio`: a self-pipe
+/// `UnixStream` park-reap at ~µs vs `sleep(ZERO)`'s ~1.8ms timer wheel), so the
+/// chunk no longer has to be coarse to amortize the yield — it returns to a fine
+/// 1024, down from the timer tax's 16384. 1024 is the CROSS-ARCH build-measured
+/// knee: an end-to-end FT.SEARCH A/B (20k×384d, KNN10, release) holds it within the
+/// 5% throughput bound on BOTH targets — x86_64 Sapphire Rapids +2–3.5%, aarch64
+/// Neoverse-N1 +2–3.4% — while still yielding ~20×/query (vs ~1 at 16384) so
+/// co-located connections see far finer relief. A finer 512 holds on aarch64 (+4%)
+/// but BREACHES the bound on x86 (+6–8%): the faster AVX-512 scan shrinks chunk
+/// wall-time, so the fixed per-yield cost is a larger fraction — caught by a GCloud
+/// cross-arch bench, hence the conservative cross-arch default. Reach a finer chunk
+/// per-deployment via `MOON_FT_YIELD_CHUNK`. Per-segment (1) is the immutable boundary.
 pub const FT_SEARCH_YIELD_BUDGET: YieldBudget = YieldBudget {
     max_segments_per_chunk: 1,
     max_graph_nodes_per_chunk: 4096,
-    max_brute_force_vecs_per_chunk: 16384,
+    max_brute_force_vecs_per_chunk: 1024,
 };
 
 /// Runtime-resolved FT.SEARCH yield budget: [`FT_SEARCH_YIELD_BUDGET`] with the
