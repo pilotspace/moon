@@ -1,7 +1,7 @@
 {
   "project": "moon",
   "stage": "production",
-  "active_task": "fts-upsert-incremental",
+  "active_task": "fts-search-count-semantics",
   "active_milestone": "v3-1-fts-hardening",
   "tasks": {
     "hotpath-lock-quickwins": {
@@ -131,6 +131,18 @@
       "created": "2026-06-16T10:34:55+00:00",
       "updated": "2026-06-16T12:46:23+00:00",
       "flag_verified": true
+    },
+    "fts-search-count-semantics": {
+      "title": "FT.SEARCH integer reply = true total-matched (RediSearch count semantics)",
+      "phase": "done",
+      "gate": "PASS",
+      "milestone": "v3-1-fts-hardening",
+      "depends_on": [
+        "fts-query-eval-dispatch"
+      ],
+      "created": "2026-06-16T12:48:50+00:00",
+      "updated": "2026-06-16T13:13:21+00:00",
+      "flag_verified": true
     }
   },
   "milestones": {
@@ -184,7 +196,7 @@
     }
   },
   "created": "2026-06-11T03:18:21+00:00",
-  "updated": "2026-06-16T12:46:23+00:00",
+  "updated": "2026-06-16T13:13:21+00:00",
   "setup": {
     "locked": true,
     "locked_at": "2026-06-11T03:28:00+00:00",

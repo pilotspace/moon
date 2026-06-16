@@ -104,6 +104,10 @@ pub fn eval_set(node: &QueryNode, idx: &TextIndex) -> RoaringBitmap {
 /// Membership is `eval_set` (authoritative); scoring sums TEXT-leaf BM25 per doc (filters score
 /// `0.0`). Order: score DESC, doc_id ASC (stable). `global_df`/`global_n` forward the DFS global
 /// IDF weights to the text leaves (multi-shard path, E5). Truncated to `top_k`.
+///
+/// Thin wrapper over [`eval_query_counted`] — the `.0` projection, kept for the frozen
+/// fts-query-eval-dispatch §3 contract (`eval_query(..) -> Vec<TextSearchResult>`). Callers that also
+/// need the FT.SEARCH total-matched count use [`eval_query_counted`] directly.
 pub fn eval_query(
     idx: &TextIndex,
     node: &QueryNode,
@@ -111,10 +115,28 @@ pub fn eval_query(
     global_n: Option<u32>,
     top_k: usize,
 ) -> Vec<TextSearchResult> {
+    eval_query_counted(idx, node, global_df, global_n, top_k).0
+}
+
+/// Like [`eval_query`] but ALSO returns the true total number of matched, key-resolvable documents
+/// — the FT.SEARCH integer reply (`reply[0]`, RediSearch semantics), counted BEFORE the `top_k`
+/// truncation (fts-search-count-semantics C1). `eval_set` is evaluated EXACTLY ONCE.
+///
+/// The total is the length of the assembled (resolvable) `results` vector *before* truncation, NOT
+/// `set.len()`: a `doc_id` present in the match set but absent from `doc_id_to_key` is unreturnable
+/// and is already dropped by the assembly `filter_map`, so it is excluded from both the page and the
+/// total (`unresolvable_doc_uncounted`). In a consistent index the two coincide.
+pub fn eval_query_counted(
+    idx: &TextIndex,
+    node: &QueryNode,
+    global_df: Option<&HashMap<String, u32>>,
+    global_n: Option<u32>,
+    top_k: usize,
+) -> (Vec<TextSearchResult>, usize) {
     // 1. Authoritative membership (complete — no truncation).
     let set = eval_set(node, idx);
     if set.is_empty() {
-        return Vec::new();
+        return (Vec::new(), 0);
     }
 
     // 2. Best-effort scores from TEXT leaves only. usize::MAX so every matched doc gets its true
@@ -135,6 +157,9 @@ pub fn eval_query(
         })
         .collect();
 
+    // True total-matched: matched AND key-resolvable, captured BEFORE truncation (C1).
+    let total_matched = results.len();
+
     // 4. Order: score DESC, doc_id ASC (stable, deterministic tie-break).
     results.sort_by(|a, b| {
         b.score
@@ -143,7 +168,7 @@ pub fn eval_query(
             .then(a.doc_id.cmp(&b.doc_id))
     });
     results.truncate(top_k);
-    results
+    (results, total_matched)
 }
 
 /// Walk the AST, accumulating each TEXT leaf's BM25 contribution per doc into `scores`. TAG /

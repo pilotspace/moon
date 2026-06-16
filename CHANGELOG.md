@@ -6,6 +6,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — FT.SEARCH integer reply is the true total-matched, not the page size (PR #192)
+
+The first element of an `FT.SEARCH` reply (the match count) was capped at the
+`LIMIT`/`top_k` page size: `FT.SEARCH idx "term" LIMIT 0 5` over 100 matches
+reported `5`, not `100`, because the count was read from the already-truncated
+result page. On multi-shard indexes the coordinator compounded it by counting the
+merged-and-truncated returned docs rather than each shard's true matched count.
+The reply now reports the true number of matched, key-resolvable documents
+(RediSearch semantics): the evaluator surfaces the count before truncation, and
+the multi-shard merge sums each shard's local matched count (keys partition to
+exactly one shard, so the sum is exact; errored shards contribute 0). Verified
+identical on 1- and 4-shard servers. Returned document pages (count, order,
+scores, keys) are unchanged.
+
 ### Performance — FT.SEARCH upsert / bulk re-index no longer O(V) per document (PR #192)
 
 Re-indexing a document (an HSET upsert, or a bulk re-index pass) called

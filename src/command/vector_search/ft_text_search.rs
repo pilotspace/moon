@@ -1555,12 +1555,14 @@ pub fn run_text_query_on_index(
     offset: usize,
     count: usize,
 ) -> Frame {
-    use crate::text::query::{QuerySchema, eval_query, parse_query};
+    use crate::text::query::{QuerySchema, eval_query_counted, parse_query};
     let schema = QuerySchema::from_index(text_index);
     match parse_query(query, &schema) {
         Ok(node) => {
-            let results = eval_query(text_index, &node, global_df, global_n, top_k);
-            build_text_response(&results, offset, count)
+            // fts-search-count-semantics C3: `total` is the true matched-and-resolvable count
+            // (pre-truncation), so reply[0] is correct even when top_k truncates the returned page.
+            let (results, total) = eval_query_counted(text_index, &node, global_df, global_n, top_k);
+            build_text_response_with_total(&results, total, offset, count)
         }
         // The five frozen wire codes (fts-query-combinators §3); never panics on malformed input.
         Err(e) => Frame::Error(Bytes::copy_from_slice(e.code().as_bytes())),
@@ -1844,14 +1846,31 @@ pub(crate) fn execute_query_on_index(
 ///
 /// Format: `[total, key1, ["__bm25_score", "N.NNNNNN"], key2, [...], ...]`
 ///
-/// `total` is the full number of matched results before pagination.
-/// Document entries are `results[offset..offset+count]`.
+/// Thin wrapper over [`build_text_response_with_total`] that reports `results.len()` as the total —
+/// the legacy behavior for callers that hand it an UNTRUNCATED result set (so `len` already equals
+/// the full matched count). The live FT.SEARCH text path uses `build_text_response_with_total`
+/// directly with the true total-matched count (fts-search-count-semantics C2/C3).
 pub(crate) fn build_text_response(
     results: &[TextSearchResult],
     offset: usize,
     count: usize,
 ) -> Frame {
-    let total = results.len() as i64;
+    build_text_response_with_total(results, results.len(), offset, count)
+}
+
+/// Build the FT.SEARCH text response with an EXPLICIT total-matched count for `reply[0]`.
+///
+/// `total_matched` is the true number of documents that matched the query (RediSearch semantics),
+/// independent of `LIMIT`/`top_k` — it may exceed the number of document entries actually emitted
+/// (`results[offset..offset+count]`). Document entries, ordering, and score formatting are
+/// identical to the legacy builder; only `reply[0]` carries the supplied total.
+pub(crate) fn build_text_response_with_total(
+    results: &[TextSearchResult],
+    total_matched: usize,
+    offset: usize,
+    count: usize,
+) -> Frame {
+    let total = total_matched as i64;
     let page_count = if count == usize::MAX {
         results.len()
     } else {
@@ -1903,15 +1922,24 @@ pub fn merge_text_results(
     count: usize,
 ) -> Frame {
     let mut all_results: Vec<(f32, Bytes, Frame)> = Vec::new();
+    // fts-search-count-semantics C4: reply[0] = Σ per-shard true matched counts (each shard's
+    // items[0]), NOT the merged-and-truncated returned-doc count. Keys partition to exactly one
+    // shard, so the sum has no double-count.
+    let mut total_matched: i64 = 0;
 
     for resp in shard_responses {
         let items = match resp {
             Frame::Array(items) => items,
-            Frame::Error(_) => continue, // skip errored shards
+            Frame::Error(_) => continue, // skip errored shards (shard_total_absent_zero: add 0)
             _ => continue,
         };
         if items.is_empty() {
             continue;
+        }
+        // items[0] = this shard's true local matched count (Integer); a missing/non-integer
+        // items[0] contributes 0 (shard_total_absent_zero) — never panics.
+        if let Some(Frame::Integer(t)) = items.first() {
+            total_matched += *t;
         }
         // items[0] = total count (Integer), then pairs of (key, fields_array)
         let mut i = 1;
@@ -1934,7 +1962,7 @@ pub fn merge_text_results(
     all_results.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
     all_results.truncate(top_k);
 
-    let total = all_results.len() as i64;
+    let total = total_matched;
     let page_count = if count == usize::MAX {
         all_results.len()
     } else {
@@ -2163,6 +2191,103 @@ mod tests {
             }
             _ => panic!("expected BulkString field name"),
         }
+    }
+
+    // ── count semantics (fts-search-count-semantics) ───────────────────────────
+
+    fn shard_frame(key: &str, total: i64, score: f32) -> Frame {
+        let mut sb = String::with_capacity(16);
+        use std::fmt::Write;
+        let _ = write!(sb, "{score:.6}");
+        Frame::Array(
+            vec![
+                Frame::Integer(total),
+                Frame::BulkString(Bytes::copy_from_slice(key.as_bytes())),
+                Frame::Array(
+                    vec![
+                        Frame::BulkString(Bytes::from_static(b"__bm25_score")),
+                        Frame::BulkString(Bytes::from(sb)),
+                    ]
+                    .into(),
+                ),
+            ]
+            .into(),
+        )
+    }
+
+    fn results_n(n: usize) -> Vec<TextSearchResult> {
+        (0..n)
+            .map(|i| TextSearchResult {
+                doc_id: i as u32,
+                key: Bytes::from(format!("d{i}")),
+                score: (n - i) as f32,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn build_text_response_with_total_reports_supplied_total() {
+        // C2: reply[0] is the supplied total_matched, NOT the page length.
+        let results = results_n(3);
+        let resp = build_text_response_with_total(&results, 47, 0, 3);
+        let items = match &resp {
+            Frame::Array(a) => a,
+            _ => panic!("expected Array"),
+        };
+        assert_eq!(items[0], Frame::Integer(47), "reply[0] = total_matched");
+        assert_eq!(items.len(), 1 + 3 * 2, "3 doc entries");
+    }
+
+    #[test]
+    fn build_text_response_wrapper_reports_page_len() {
+        // C2: the 3-arg wrapper preserves old behavior (reply[0] = results.len()).
+        let results = results_n(3);
+        let resp = build_text_response(&results, 0, usize::MAX);
+        let items = match &resp {
+            Frame::Array(a) => a,
+            _ => panic!("expected Array"),
+        };
+        assert_eq!(items[0], Frame::Integer(3));
+    }
+
+    #[test]
+    fn merge_text_results_sums_shard_totals() {
+        // C4: per-shard items[0] (true local matched) are SUMMED, even when each shard returns
+        // fewer docs than it matched (per-shard top_k truncation). Old code reported 3 (merged docs).
+        let frames = [
+            shard_frame("a", 40, 3.0),
+            shard_frame("b", 35, 2.0),
+            shard_frame("c", 25, 1.0),
+        ];
+        let merged = merge_text_results(&frames, 100, 0, usize::MAX);
+        let items = match &merged {
+            Frame::Array(a) => a,
+            _ => panic!("expected Array"),
+        };
+        assert_eq!(
+            items[0],
+            Frame::Integer(100),
+            "total = 40+35+25, not the 3 merged docs"
+        );
+        assert_eq!(items.len(), 1 + 3 * 2, "3 docs returned");
+    }
+
+    #[test]
+    fn merge_text_results_errored_shard_contributes_zero() {
+        // Reject shard_total_absent_zero: an errored shard frame adds 0 and the merge survives.
+        let good = shard_frame("a", 3, 2.0);
+        let bad = Frame::Error(Bytes::from_static(b"ERR boom"));
+        let merged = merge_text_results(&[good, bad], 100, 0, usize::MAX);
+        let items = match &merged {
+            Frame::Array(a) => a,
+            _ => panic!("expected Array"),
+        };
+        assert_eq!(
+            items[0],
+            Frame::Integer(3),
+            "errored shard contributes 0 to the sum"
+        );
+        assert_eq!(items.len(), 1 + 2, "the one good doc survives");
     }
 
     // ── response_contains_bm25_score ───────────────────────────────────────────

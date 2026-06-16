@@ -22,7 +22,9 @@ use std::collections::BTreeSet;
 use bytes::Bytes;
 use moon::command::vector_search::run_text_query;
 use moon::protocol::Frame;
-use moon::text::query::{QuerySchema, collect_df_field_terms, eval_query, parse_query};
+use moon::text::query::{
+    QuerySchema, collect_df_field_terms, eval_query, eval_query_counted, eval_set, parse_query,
+};
 use moon::text::store::{TextIndex, TextStore};
 use moon::text::types::{BM25Config, NumericFieldDef, TagFieldDef, TextFieldDef};
 
@@ -492,5 +494,81 @@ fn test_df_field_terms_pure_filter_vs_fuzzy() {
     assert!(
         fq[0].1.is_empty(),
         "fuzzy terms use LOCAL df → no exact df terms collected"
+    );
+}
+
+// ───────────── count semantics (fts-search-count-semantics) ─────────────
+// FT.SEARCH reply[0] = TRUE total-matched, independent of LIMIT/top_k (RediSearch semantics).
+// RED until BUILD: `eval_query_counted` does not exist yet → this file fails to compile.
+
+/// An index where exactly `n` docs all contain the term "alpha".
+fn alpha_corpus(n: u64) -> TextStore {
+    let mut idx = empty_index();
+    for i in 0..n {
+        let key = format!("d{i}");
+        add_doc(&mut idx, i + 1, &key, &[("body", "alpha")], &[], &[]);
+    }
+    idx.build_fst();
+    store_of(idx)
+}
+
+#[test]
+fn test_eval_query_counted_total_is_pre_truncation() {
+    // C1: 12 docs match "alpha"; top_k=5 truncates the returned page but NOT the total.
+    let mut idx = empty_index();
+    for i in 0..12u64 {
+        let key = format!("d{i}");
+        add_doc(&mut idx, i + 1, &key, &[("body", "alpha")], &[], &[]);
+    }
+    idx.build_fst();
+
+    let schema = QuerySchema::from_index(&idx);
+    let node = parse_query(b"alpha", &schema).expect("parse ok");
+
+    let (results, matched) = eval_query_counted(&idx, &node, None, None, 5);
+    assert_eq!(results.len(), 5, "returned page is truncated to top_k");
+    assert_eq!(
+        matched, 12,
+        "total is the full matched count, pre-truncation"
+    );
+
+    // `.0` must be byte-identical to the frozen 2b `eval_query` wrapper.
+    let plain = eval_query(&idx, &node, None, None, 5);
+    assert_eq!(
+        plain.iter().map(|r| r.key.clone()).collect::<Vec<_>>(),
+        results.iter().map(|r| r.key.clone()).collect::<Vec<_>>(),
+        "eval_query == eval_query_counted(..).0"
+    );
+
+    // Reject `unresolvable_doc_uncounted` (structural): every matched doc here resolves to a key,
+    // so the resolvable total equals the raw eval_set cardinality. The total is derived from the
+    // resolvable `results` vector, never `set.len()`, so an unreturnable doc can never inflate it.
+    let set = eval_set(&node, &idx);
+    assert_eq!(
+        matched as u64,
+        set.len(),
+        "fully-resolvable corpus: total == |eval_set|"
+    );
+}
+
+#[test]
+fn test_run_text_query_limit_reports_true_total() {
+    // C3: LIMIT 0 5 over a 12-match corpus → reply[0]==12, exactly 5 docs returned.
+    let ts = alpha_corpus(12);
+    let r = run_text_query(&ts, b"idx", b"alpha", 5, 0, 5);
+    assert_eq!(total(&r), 12, "reply[0] = true matched, not the page size");
+    assert_eq!(keys_ordered(&r).len(), 5, "page = LIMIT count");
+}
+
+#[test]
+fn test_run_text_query_no_limit_total_unchanged() {
+    // C5: no LIMIT (unbounded top_k) → reply[0]==12==returned count (strict no-regression).
+    let ts = alpha_corpus(12);
+    let r = run_text_query(&ts, b"idx", b"alpha", usize::MAX / 2, 0, usize::MAX);
+    assert_eq!(total(&r), 12);
+    assert_eq!(
+        keys_ordered(&r).len(),
+        12,
+        "all matches returned when unbounded"
     );
 }
