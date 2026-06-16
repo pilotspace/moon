@@ -46,8 +46,10 @@ Out:
   call; wrong here re-does downstream query work.             -> owning task `fts-posting-rank-tf`
 
 ## Tasks (breadth-first decomposition; detail lives in each TASK.md)
-- [ ] fts-posting-rank-tf           depends-on: none                      — replace O(N) TF `.position()`
-      with rank-based lookup; kills the high-DF O(M^2) cliff.
+- [x] fts-posting-rank-tf           depends-on: none                      — replace O(N) TF `.position()`
+      with rank-based lookup; kills the high-DF O(M^2) cliff. DONE 2026-06-16 (gate PASS, commits
+      45b3db8+a7e816d). Also fixed a latent BM25-misalignment bug; froze the rank-aligned PostingList
+      TF contract (term_freqs/positions sorted-doc_id-aligned, tf()/positions_for() via rank).
 - [ ] fts-upsert-incremental        depends-on: none                      — replace O(V) per-doc posting
       upsert scan with incremental update; fast bulk indexing.
 - [ ] fts-query-combinators         depends-on: none                      — `OR` (`|`) unions and
