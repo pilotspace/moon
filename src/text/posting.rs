@@ -42,6 +42,47 @@ impl PostingList {
             positions: None,
         }
     }
+
+    /// 0-based index of `doc_id` within the rank-aligned parallel arrays.
+    ///
+    /// `RoaringBitmap::rank(d)` is the count of stored ids `<= d`, so for a present
+    /// `doc_id` it is the 1-based sorted position; subtract one for the array index.
+    /// Sub-linear (container-stride + popcount), unlike `iter().position()` (O(N)).
+    #[inline]
+    fn rank_index(&self, doc_id: u32) -> usize {
+        (self.doc_ids.rank(doc_id) as usize).saturating_sub(1)
+    }
+
+    /// Term frequency of `doc_id` in this posting list.
+    ///
+    /// Returns the rank-aligned `term_freqs` entry when the doc is present, else `0`
+    /// (the `tf_absent` default — BM25 treats the term as not occurring). Never panics:
+    /// the rank-alignment invariant guarantees the index is valid, and a defensive
+    /// `get` degrades to `0` rather than indexing out of bounds.
+    #[inline]
+    pub fn tf(&self, doc_id: u32) -> u32 {
+        if !self.doc_ids.contains(doc_id) {
+            return 0;
+        }
+        self.term_freqs
+            .get(self.rank_index(doc_id))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Position list for `doc_id` (rank-aligned), or `None` when positions are not
+    /// tracked or the doc is absent.
+    #[inline]
+    pub fn positions_for(&self, doc_id: u32) -> Option<&[u32]> {
+        if !self.doc_ids.contains(doc_id) {
+            return None;
+        }
+        let idx = self.rank_index(doc_id);
+        self.positions
+            .as_ref()
+            .and_then(|p| p.get(idx))
+            .map(Vec::as_slice)
+    }
 }
 
 /// Per-field inverted index storing term_id -> PostingList.
@@ -75,42 +116,37 @@ impl PostingStore {
         });
 
         if posting.doc_ids.contains(doc_id) {
-            // Upsert: find the index of this doc_id
-            let idx = posting.doc_ids.iter().position(|id| id == doc_id);
-            if let Some(idx) = idx {
-                posting.term_freqs[idx] += 1;
-                // Append positions if provided
-                if let Some(pos) = &positions {
-                    if let Some(pos_list) = &mut posting.positions {
-                        pos_list[idx].extend_from_slice(pos);
-                    } else {
-                        // Upgrade: create position tracking
-                        let mut pos_list = vec![Vec::new(); posting.term_freqs.len()];
-                        pos_list[idx] = pos.clone();
-                        posting.positions = Some(pos_list);
-                    }
+            // Existing doc: increment at the rank-aligned index.
+            let idx = posting.rank_index(doc_id);
+            posting.term_freqs[idx] += 1;
+            // Append positions if provided.
+            if let Some(pos) = &positions {
+                if let Some(pos_list) = &mut posting.positions {
+                    pos_list[idx].extend_from_slice(pos);
+                } else {
+                    // Upgrade: create position tracking, aligned to current docs.
+                    let mut pos_list = vec![Vec::new(); posting.term_freqs.len()];
+                    pos_list[idx] = pos.clone();
+                    posting.positions = Some(pos_list);
                 }
             }
         } else {
-            // New document
+            // New document: insert into the bitmap, then insert tf/positions AT THE RANK
+            // INDEX (not push) so term_freqs/positions stay rank-aligned with doc_ids — correct
+            // even when doc_id is not the current maximum (the document-update re-add path).
             posting.doc_ids.insert(doc_id);
-            posting.term_freqs.push(1);
+            let idx = posting.rank_index(doc_id);
+            posting.term_freqs.insert(idx, 1);
             match (&mut posting.positions, &positions) {
-                (Some(pos_list), Some(pos)) => {
-                    pos_list.push(pos.clone());
-                }
-                (Some(pos_list), None) => {
-                    pos_list.push(Vec::new());
-                }
+                (Some(pos_list), Some(pos)) => pos_list.insert(idx, pos.clone()),
+                (Some(pos_list), None) => pos_list.insert(idx, Vec::new()),
                 (None, Some(pos)) => {
-                    // Upgrade: create position tracking for all existing docs
-                    let mut pos_list = vec![Vec::new(); posting.term_freqs.len() - 1];
-                    pos_list.push(pos.clone());
+                    // Upgrade: track positions for all docs; this doc's positions at idx.
+                    let mut pos_list = vec![Vec::new(); posting.term_freqs.len()];
+                    pos_list[idx] = pos.clone();
                     posting.positions = Some(pos_list);
                 }
-                (None, None) => {
-                    // No positions, no change
-                }
+                (None, None) => {}
             }
         }
     }
@@ -140,7 +176,9 @@ impl PostingStore {
         let mut removed = Vec::new();
         for (&term_id, posting) in &mut self.postings {
             if posting.doc_ids.contains(doc_id) {
-                if let Some(idx) = posting.doc_ids.iter().position(|id| id == doc_id) {
+                // Rank-aligned index — compute BEFORE removing from the bitmap.
+                let idx = posting.rank_index(doc_id);
+                if idx < posting.term_freqs.len() {
                     let old_tf = posting.term_freqs.remove(idx);
                     posting.doc_ids.remove(doc_id);
                     if let Some(pos_list) = &mut posting.positions {

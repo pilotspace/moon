@@ -1,7 +1,7 @@
 # TASK: Rank-based posting TF lookup (kill the high-DF O(M^2) cliff)
 
 slug: fts-posting-rank-tf · created: 2026-06-16 · stage: production · risk: high · autonomy: conservative
-phase: tests   <!-- specify -> scenarios -> contract -> tests -> build -> verify -> observe -> done -->
+phase: build   <!-- specify -> scenarios -> contract -> tests -> build -> verify -> observe -> done -->
 <!-- risk: high — freeze-first shared contract (the PostingList TF representation that
      fts-upsert-incremental inherits) AND it fixes a latent BM25-correctness bug, so verify
      must NOT auto-pass: human gate required (run.md unguarded_high_risk_auto guard). -->
@@ -169,6 +169,7 @@ OUT OF CONTRACT:
 ```
 
 Status: FROZEN @ v1 — approved by Tin Dang (2026-06-16). Lowest-confidence flags surfaced + accepted at freeze.
+Least-sure flag surfaced at freeze: [spec] fixing the misalignment CHANGES BM25 output for previously-corrupted post-update cases — that is the bug being corrected, NOT a regression, so M4's no-regression golden must come from an ascending-insert corpus (the path already correct); if wrong, a snapshot of the OLD buggy scores would mis-fail. [contract] rank-aligned arrays make `add_term_occurrence` O(rank) on insert (shift `term_freqs`/`positions`) — the write cost `fts-upsert-incremental` inherits; if high-churn indexing regresses, that task re-tunes the structure it inherits here.
 <!-- bundle lowest-confidence flag (surfaced at freeze):
   ⚠ [spec] Fixing the misalignment CHANGES BM25 output for previously-corrupted (post-update) cases —
      that is the bug being corrected, not a regression. Any golden/snapshot asserting the OLD buggy
