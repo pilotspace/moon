@@ -1,7 +1,7 @@
 {
   "project": "moon",
   "stage": "production",
-  "active_task": "fts-query-routing-robustness",
+  "active_task": "graph-cypher-inline-filter",
   "active_milestone": "v3-1-fts-hardening",
   "tasks": {
     "hotpath-lock-quickwins": {
@@ -155,6 +155,16 @@
       "created": "2026-06-16T13:14:26+00:00",
       "updated": "2026-06-16T13:41:08+00:00",
       "flag_verified": true
+    },
+    "graph-cypher-inline-filter": {
+      "title": "Cypher MATCH narrows on inline node-property predicate (no label full-scan)",
+      "phase": "done",
+      "gate": "PASS",
+      "milestone": "v3-2-graph-correctness",
+      "depends_on": [],
+      "created": "2026-06-16T14:37:40+00:00",
+      "updated": "2026-06-16T16:07:31+00:00",
+      "flag_verified": true
     }
   },
   "milestones": {
@@ -208,7 +218,7 @@
     }
   },
   "created": "2026-06-11T03:18:21+00:00",
-  "updated": "2026-06-16T14:23:36+00:00",
+  "updated": "2026-06-16T16:07:31+00:00",
   "setup": {
     "locked": true,
     "locked_at": "2026-06-11T03:28:00+00:00",

@@ -6,6 +6,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — Cypher MATCH narrows on inline node-property predicates instead of full-scanning the label (PR #193)
+
+`compile_match` built each pattern node's `NodeScan`/`Expand` but silently
+dropped the node's inline properties `(v {k:e, …})`, so
+`MATCH (a:Person {id:1})-[]->(b)` ignored `{id:1}` and returned every edge of the
+`Person` label (≈|E| rows) instead of node 1's out-edges. The planner now emits a
+`Filter` — the equality conjunction `v.k = e AND …` built by the existing
+`properties_to_filter` — immediately after the op that binds each
+inline-propertied node: after its `NodeScan` for the first node, after the
+`Expand` that produces any subsequent node. It reuses the existing `Filter`/`Expr`
+evaluation, so parameters (`{id:$p}`), cross-type compares, and missing-property
+⇒ excluded all follow the same semantics as `WHERE`; an empty `{}` pattern emits
+no Filter, leaving plain label/all scans byte-identical. No new `PhysicalOp`, no
+index, no executor change.
+
 ### Fixed — FT.SEARCH routing: prose "knn" searches as text, standalone SPARSE reaches the vector engine, no panic on the BM25 AND path (PR #192)
 
 `is_text_query` uppercased the query and matched the bare substring `KNN `, so a
