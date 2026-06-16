@@ -320,22 +320,22 @@ shard — `fts-search-count-semantics` (consumes `eval_set(root).len()`) and `ft
 build on this; `fts-upsert-incremental` is independent of the query path.
 
 ### Competency deltas
-- [TDD · open] Test SELECTION must be validated to actually execute, not just compile: 4 of my chosen
+- [TDD · folded] Test SELECTION must be validated to actually execute, not just compile: 4 of my chosen
   FT integration tests ran 0 cases (`#![cfg(feature="runtime-tokio")]`-gated under monoio default;
   one `#[ignore]`'d) and a green `cargo test --release` hid it. Evidence: first verify pass reported
   "0 passed; 0 failed" yet I nearly read it as PASS. Lesson: assert a nonzero ran-count per suite, or
   the suite is silent coverage. Mitigation already applied: ran them under the correct feature set.
-- [TDD · open] A pre-existing `#[ignore]`'d manual test (`inverted_search_numeric_shard_consistency`)
+- [TDD · folded] A pre-existing `#[ignore]`'d manual test (`inverted_search_numeric_shard_consistency`)
   is stale-broken at its seed (`let _: i64` vs HMSET `+OK`), so it cannot guard the scatter path it
   was written for. Evidence: panics at line 73 before any assertion. Follow-up task: fix annotation +
   per-test index isolation + un-ignore (a real cross-shard numeric guard is valuable post-2b).
-- [SDD · open] A flat dispatch payload `(field_idx, Vec<QueryTerm>)` silently constrained the wire to
+- [SDD · folded] A flat dispatch payload `(field_idx, Vec<QueryTerm>)` silently constrained the wire to
   AND-only — the OR bug was unfixable at the leaf without a payload redesign. Evidence: OR returned
   AND on multi-shard until `TextSearchPayload` carried raw `Bytes`. Lesson: when a cross-shard payload
   can't REPRESENT the contract's algebra, that's a contract-blocking design smell to surface at freeze.
-- [ADD · open] Building 2b on 2a's frozen contract before gating either ("gate together") worked: it
+- [ADD · folded] Building 2b on 2a's frozen contract before gating either ("gate together") worked: it
   let the inherited eval_set algebra be validated by real end-to-end result sets rather than parser
   unit tests alone. Evidence: 12/12 e2e + x-shard identity. Keep "split parser/dispatch, gate the
   pair" as a pattern for contract-then-wire features.
-- [ADD · open] Deferred-cleanup honesty: `scatter_text_search_filter` left dead-but-flagged (FLAG-2)
+- [ADD · folded] Deferred-cleanup honesty: `scatter_text_search_filter` left dead-but-flagged (FLAG-2)
   rather than removed-with-scope-creep into the InvertedSearch protocol. Folds at milestone close.

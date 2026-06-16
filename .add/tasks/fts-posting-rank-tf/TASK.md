@@ -302,17 +302,17 @@ that task re-tunes the representation (the A2 HashMap fallback) rather than re-o
 What did this loop teach the foundation? One line each, tagged by competency
 (`DDD · SDD · UDD · TDD · ADD`), status `open`, with evidence. See the `add` skill's `deltas.md`.
 <!-- e.g.  - [DDD · open] the model missed multi-tenancy (evidence: scenario_x failed) -->
-- [SDD · open] A milestone scoped a task as "perf-only" but grounded code investigation in
+- [SDD · folded] A milestone scoped a task as "perf-only" but grounded code investigation in
   Specify found a latent correctness bug on the same path (insertion-order term_freqs vs
   sorted-bitmap read) — perf and correctness were inseparable. Lesson: re-derive task scope
   from the code during Specify, don't inherit the milestone's framing verbatim. (evidence:
   A1 flag; the misalignment was real and is fixed + tested.)
-- [TDD · open] The bug survived the code's entire prior life because every existing test used
+- [TDD · folded] The bug survived the code's entire prior life because every existing test used
   EQUAL term frequencies, which mask alignment errors. Lesson: index/posting fixtures must use
   DISTINCT, asymmetric values so a positional misalignment changes an observable output.
   (evidence: test_tf_correct_after_low_id_update needs a=5,b=2,c=3 to catch it; equal tfs pass
   under the buggy code.)
-- [ADD · open] risk:high + autonomy:conservative correctly forced a human gate on a change that
+- [ADD · folded] risk:high + autonomy:conservative correctly forced a human gate on a change that
   looked mechanically green — the surfaced flag (positions_for is test-only-referenced forward
   API) was a real judgement call the auto-gate should not have silently swallowed. (evidence:
   unguarded_high_risk_auto guard held; gate presented + human-approved.)

@@ -50,29 +50,29 @@ Out:
       with rank-based lookup; kills the high-DF O(M^2) cliff. DONE 2026-06-16 (gate PASS, commits
       45b3db8+a7e816d). Also fixed a latent BM25-misalignment bug; froze the rank-aligned PostingList
       TF contract (term_freqs/positions sorted-doc_id-aligned, tf()/positions_for() via rank).
-- [ ] fts-upsert-incremental        depends-on: none                      — replace O(V) per-doc posting
+- [x] fts-upsert-incremental        depends-on: none                      — replace O(V) per-doc posting
       upsert scan with incremental update; fast bulk indexing.
-- [ ] fts-query-combinators         depends-on: none                      — `OR` (`|`) unions and
+- [x] fts-query-combinators         depends-on: none                      — `OR` (`|`) unions and
       `TEXT+TAG`/`TEXT+NUMERIC` combos intersect; correct matched sets. Code trace upgraded this from
       two point-bugs to a missing PARSER layer; froze a query GRAMMAR+AST+eval_set contract @ v1
       (2026-06-16) and SPLIT the build into 2a+2b:
-  - [ ] fts-query-combinators (2a)  depends-on: none                      — recursive-descent
+  - [x] fts-query-combinators (2a)  depends-on: none                      — recursive-descent
         `parse_query` → `QueryNode`/`QueryError` + grammar + parser fuzz target. Owns the frozen contract.
-  - [ ] fts-query-eval-dispatch (2b) depends-on: fts-query-combinators    — `eval_set` (RoaringBitmap
+  - [x] fts-query-eval-dispatch (2b) depends-on: fts-query-combinators    — `eval_set` (RoaringBitmap
         union/intersect) + ft_text_search dispatch rewrite + wire reply. Inherits the frozen contract.
-- [ ] fts-search-count-semantics    depends-on: fts-query-eval-dispatch  — FT.SEARCH reply = true
+- [x] fts-search-count-semantics    depends-on: fts-query-eval-dispatch  — FT.SEARCH reply = true
       total-matched count = `eval_set(root).len()` (RediSearch semantics). Counts over 2b's matched set.
-- [ ] fts-query-routing-robustness  depends-on: none                      — `is_text_query()` recognizes
+- [x] fts-query-routing-robustness  depends-on: none                      — `is_text_query()` recognizes
       `SPARSE`; remove 3× `expect()` on the FT query path.
 
 ## Exit criteria (observable; map each to the task that delivers it)
-- [ ] A high-DF term (~5% of docs) returns without the O(M^2) cliff — a 100K-doc query-latency test
+- [x] A high-DF term (~5% of docs) returns without the O(M^2) cliff — a 100K-doc query-latency test
       holds well under the old 419 ms (rank-based, not linear scan).            (← fts-posting-rank-tf)
-- [ ] Bulk indexing scales ~linearly (no O(V) per-doc scan) — an indexing-rate test shows the cliff
+- [x] Bulk indexing scales ~linearly (no O(V) per-doc scan) — an indexing-rate test shows the cliff
       gone vs the 376 docs/s baseline.                                          (← fts-upsert-incremental)
-- [ ] `OR` returns |A ∪ B| matched docs and `TEXT+TAG` returns the non-empty intersection —
+- [x] `OR` returns |A ∪ B| matched docs and `TEXT+TAG` returns the non-empty intersection —
       correctness tests over a known corpus.                                    (← fts-query-combinators)
-- [ ] FT.SEARCH's integer reply equals the true matched count (not the page size) — test asserts the
+- [x] FT.SEARCH's integer reply equals the true matched count (not the page size) — test asserts the
       total over a corpus larger than the returned page.                        (← fts-search-count-semantics)
-- [ ] A `SPARSE @field …` query routes to the vector path (not BM25), and malformed FT input returns
+- [x] A `SPARSE @field …` query routes to the vector path (not BM25), and malformed FT input returns
       an error frame (no panic) — routing + fuzz/negative tests.                (← fts-query-routing-robustness)

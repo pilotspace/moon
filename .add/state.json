@@ -186,9 +186,9 @@
       "title": "FTS Hardening",
       "goal": "Moon's full-text search is trustworthy and competitive: every query combinator (term, AND, OR, TEXT+TAG, NUMERIC) returns correct results with true total-matched counts, and indexing plus high-DF queries run without the O(V)/O(M^2) cliffs the 2026-06-16 benchmark exposed.",
       "stage": "production",
-      "status": "active",
+      "status": "done",
       "created": "2026-06-16T04:42:21+00:00",
-      "updated": "2026-06-16T04:42:21+00:00"
+      "updated": "2026-06-16T14:23:36+00:00"
     },
     "v3-2-graph-correctness": {
       "title": "Graph Correctness & Cypher Filtering",
@@ -208,7 +208,7 @@
     }
   },
   "created": "2026-06-11T03:18:21+00:00",
-  "updated": "2026-06-16T13:41:08+00:00",
+  "updated": "2026-06-16T14:23:36+00:00",
   "setup": {
     "locked": true,
     "locked_at": "2026-06-11T03:28:00+00:00",

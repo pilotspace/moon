@@ -338,7 +338,7 @@ Spec delta for the next loop:
   constant is necessary but NOT sufficient to freeze a tuning knee; pair it with a RELATIVE same-binary A/B (which cancels
   the absolute-RPS noise that made us defer in the first place) before committing the default. The relative A/B sidesteps the
   OrbStack absolute-noise problem entirely — control and treatment share the VM, so only the ratio matters.
-- [ADD · open] A perf tuning knee must be A/B-confirmed on EACH target architecture, not just the dev arch — it tracks a
+- [ADD · folded] A perf tuning knee must be A/B-confirmed on EACH target architecture, not just the dev arch — it tracks a
   hardware-specific cost. The dev-VM A/B (aarch64) green-lit K=512 at +2.74%, the gate PASSed, the milestone CLOSED — but a
   GCloud cross-arch bench then measured K=512 at +6–8% on x86_64 Sapphire Rapids (faster AVX-512 scan shrinks chunk wall-time,
   so the fixed yield cost is a larger fraction of it), BREACHING the same 5% bound the contract asserts. Refines the v4 delta:
