@@ -1,8 +1,8 @@
 {
   "project": "moon",
   "stage": "production",
-  "active_task": "ft-yield-costfree-monoio",
-  "active_milestone": "v2-1-throughput-polish",
+  "active_task": "fts-posting-rank-tf",
+  "active_milestone": "v3-1-fts-hardening",
   "tasks": {
     "hotpath-lock-quickwins": {
       "title": "Eliminate per-command global locks & syscall-level quick wins",
@@ -88,6 +88,17 @@
       "created": "2026-06-15T11:57:05+00:00",
       "updated": "2026-06-15T14:39:07+00:00",
       "flag_verified": true
+    },
+    "fts-posting-rank-tf": {
+      "title": "Rank-based posting TF lookup (kill the high-DF O(M^2) cliff)",
+      "phase": "tests",
+      "gate": "none",
+      "milestone": "v3-1-fts-hardening",
+      "depends_on": [
+        "none"
+      ],
+      "created": "2026-06-16T04:51:36+00:00",
+      "updated": "2026-06-16T05:06:04+00:00"
     }
   },
   "milestones": {
@@ -114,10 +125,34 @@
       "status": "done",
       "created": "2026-06-15T11:57:00+00:00",
       "updated": "2026-06-15T14:49:42+00:00"
+    },
+    "v3-1-fts-hardening": {
+      "title": "FTS Hardening",
+      "goal": "Moon's full-text search is trustworthy and competitive: every query combinator (term, AND, OR, TEXT+TAG, NUMERIC) returns correct results with true total-matched counts, and indexing plus high-DF queries run without the O(V)/O(M^2) cliffs the 2026-06-16 benchmark exposed.",
+      "stage": "production",
+      "status": "active",
+      "created": "2026-06-16T04:42:21+00:00",
+      "updated": "2026-06-16T04:42:21+00:00"
+    },
+    "v3-2-graph-correctness": {
+      "title": "Graph Correctness & Cypher Filtering",
+      "goal": "Moon's graph queries are correct: Cypher MATCH narrows on inline node-property predicates instead of full-scanning the label, directional traversal covers incoming/Both edges post-compaction, and node labels >= 32 are no longer silently dropped.",
+      "stage": "production",
+      "status": "planned",
+      "created": "2026-06-16T04:42:42+00:00",
+      "updated": "2026-06-16T04:42:42+00:00"
+    },
+    "v3-3-vector-kv-polish": {
+      "title": "Vector & KV Latent-Correctness + Hot-Path Polish",
+      "goal": "Moon's vector segments decode at the correct code length (SQ8 included) and FT.INFO reports true cross-segment doc counts, and the KV/vector command hot paths honor the no-alloc and parking_lot lock-discipline rules.",
+      "stage": "production",
+      "status": "planned",
+      "created": "2026-06-16T04:42:42+00:00",
+      "updated": "2026-06-16T04:42:42+00:00"
     }
   },
   "created": "2026-06-11T03:18:21+00:00",
-  "updated": "2026-06-15T14:49:42+00:00",
+  "updated": "2026-06-16T05:06:04+00:00",
   "setup": {
     "locked": true,
     "locked_at": "2026-06-11T03:28:00+00:00",
