@@ -1,7 +1,7 @@
 # TASK: OR unions + TEXT+TAG intersects — correct combinator result sets
 
 slug: fts-query-combinators · created: 2026-06-16 · stage: production · risk: high · autonomy: conservative
-phase: build   <!-- specify -> scenarios -> contract -> tests -> build -> verify -> observe -> done -->
+phase: verify   <!-- specify -> scenarios -> contract -> tests -> build -> verify -> observe -> done -->
 <!-- risk: high — freezes the FT query GRAMMAR + matched-set semantics (the contract
      fts-search-count-semantics depends-on and counts over) AND changes wire-visible FT.SEARCH
      behavior. Verify must NOT auto-pass: human gate (run.md unguarded_high_risk_auto guard). -->
@@ -351,23 +351,56 @@ no new deps); ask if unclear.
 
 ## 6 · VERIFY — evidence + non-functional review ▸ docs/08-step-6-verify.md
 
-- [ ] all tests pass
-- [ ] coverage did not decrease
-- [ ] no test or contract was altered during build
-- [ ] concurrency / timing of the risky operation is safe
-- [ ] no exposed secrets, injection openings, or unexpected dependencies
-- [ ] layering & dependencies follow CONVENTIONS.md
-- [ ] a person reviewed and approved the change
+SCOPE = 2a PARSER. (The matched-SET / no-regression / server-stays-up scenarios are 2b's verify.)
+- [x] all tests pass — 20/20 `tests/fts_query_parse.rs` (incl. error-code conformance). Full lib
+      3584/0; `text::` 144/0 (M5 no-regression net — 2a is purely additive). fmt --check clean;
+      `cargo clippy -- -D warnings` clean (no query/ warnings); fuzz target type-checks warning-free
+      on nightly (`cargo +nightly check --manifest-path fuzz/Cargo.toml --bin fts_query_parse`).
+- [x] coverage did not decrease — net +20 parser tests + 1 fuzz target on a brand-new module; the
+      grammar productions + all five reject codes are exercised.
+- [x] no test or contract was altered during build — §3 FROZEN @ v1 untouched; red suite went green
+      via new src only. (The error-code conformance test was ADDED in verify — a STRENGTHENING test
+      that locks the frozen wire codes, never a weakening.)
+- [x] concurrency / timing safe — `parse_query` is a PURE function: no shared state, no async, no
+      locks, no interior mutability. Called once per FT.SEARCH command (per-query); 2b will invoke it
+      single-threaded on the owning shard's event loop. Nothing to race. No residue.
+- [x] no exposed secrets, injection openings, or unexpected dependencies — parser sits on the
+      untrusted-input boundary and is hardened: never panics (test table + fuzz target), depth-bounded
+      (MAX_DEPTH=64, no stack blow-up on `(((…)))`), no unwrap/expect, raw-byte safe (handles \xff\xfe,
+      no UTF-8 assumption on tokens), bounded per-command allocation. It produces an AST — executes
+      nothing — so no injection surface. No new runtime crate: only ENABLED the existing `text-index`
+      feature in the fuzz crate (matches how `graph` is enabled there for cypher_parse). No finding.
+- [x] layering & dependencies follow CONVENTIONS.md — new module is in the `text/` layer (below
+      `command/`); it imports only same-layer items (`text::store::{TermModifier, TextIndex}`) and has
+      NO upward dependency on `command/` — numeric-bound parsing was re-implemented locally precisely
+      to avoid importing the command-layer helper. File sizes: parse.rs ~440 / ast.rs ~85 / mod.rs ~15
+      (all « 1500). No hot-path allocation concern (per-command, not per-key).
+- [ ] a person reviewed and approved the change   <!-- PENDING: risk:high · conservative -> human gate -->
 
 ### Deep checks — do not skim (fill the path that applies; the resolver judges which)
-- [ ] WIRING (code) — every new symbol is referenced; record where / how confirmed
-- [ ] DEAD-CODE (code) — no new unused or orphaned symbol introduced
-- [ ] SEMANTIC (prose / non-code) — read in full, not skimmed: <what read · what confirmed>
+- [x] WIRING (code) — `parse_query`/`QueryNode`/`QuerySchema`/`QueryError` are referenced by the 20
+      conformance tests + the fuzz target; `QueryError::code()` is referenced by
+      test_error_codes_match_contract; `QuerySchema::from_names` by tests/fuzz, `from_index` is the
+      production constructor 2b calls. ⚠ THE FLAG: this is task 2a of a deliberate 2-way split — the
+      parser is NOT yet called from production dispatch; **`fts-query-eval-dispatch` (2b, depends-on
+      this task, recorded in state.json) is the imminent production consumer**. Every public symbol is
+      exercised by tests/fuzz, so nothing is orphaned — but production wiring is intentionally deferred
+      to 2b. Surfaced, not buried.
+- [x] DEAD-CODE (code) — no orphaned symbol: the closed item above (code() now tested) was the only
+      gap. `FieldRef` (private) is used by resolve + the field-clause match. `push_field` is used for
+      field-scoped groups. clippy reports no dead code. No existing code was deleted (2a is additive;
+      the old parser is retired by 2b, not here).
+- [ ] SEMANTIC (prose / non-code) — n/a (code change).
 
 ### GATE RECORD
-Outcome: <PASS | RISK-ACCEPTED | HARD-STOP>
+Proposed outcome: PASS — but GATE DEFERRED. Per the human decision at the 2a verify gate (Tin Dang,
+2026-06-16), 2a is NOT gated standalone: build 2b (`fts-query-eval-dispatch`) on top, then present ONE
+combined verify gate for the parser+evaluator+dispatch wired end-to-end. 2a's evidence stands (20/20,
+lib 3584/0, fmt/clippy/fuzz clean, no residue); the combined gate will PASS 2a and 2b together.
+Lowest-confidence item (carried to the combined gate): the full-replacement integration in 2b — does
+the new parse→eval→reply path regress any already-working FT.SEARCH shape (M5)?
 If RISK-ACCEPTED -> owner: <name> · ticket: <link> · expires: <date>   (never for a security gap)
-Reviewed by: <name> · date: <date>
+Reviewed by: <DEFERRED to combined 2a+2b gate> · date: <pending 2b>
 
 <!-- A security finding is ALWAYS HARD-STOP. Record exactly one outcome — no silent pass. -->
 
