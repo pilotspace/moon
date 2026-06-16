@@ -1334,61 +1334,77 @@ pub(crate) fn handle_shard_message_shared(
             let _ = reply_tx.send(response);
         }
         ShardMessage::TextSearch(payload) => {
-            let crate::shard::dispatch::TextSearchPayload {
-                index_name,
-                field_idx,
-                query_terms,
-                global_df,
-                global_n,
-                top_k,
-                offset,
-                count,
-                highlight_opts,
-                summarize_opts,
-                reply_tx,
-            } = *payload;
-            // DFS Phase 2: execute BM25 text search with global IDF injected by coordinator.
-            // After scoring, apply HIGHLIGHT/SUMMARIZE post-processing if requested.
-            // Each shard applies post-processing to its own results using its local hash store
-            // (direct access — no cross-shard reads needed, no .await — safe to hold guards).
-            //
-            // query_terms is Vec<QueryTerm> — fuzzy/prefix terms use the OR-union expansion path.
-            // Extract plain strings for HIGHLIGHT/SUMMARIZE (needs analyzed term text only).
-            let term_strings: Vec<String> = query_terms.iter().map(|qt| qt.text.clone()).collect();
-            // text_store and read_db(0) accessed in one with_shard closure (multi-resource).
-            let response = {
-                crate::shard::slice::with_shard(|s| match s.text_store.get_index(&index_name) {
-                    Some(text_index) => {
-                        let mut result =
-                                crate::command::vector_search::ft_text_search::execute_text_search_with_global_idf(
+            // Non-text-index build: only reply_tx is needed (the BM25 path is feature-gated, so the
+            // other payload fields would be unused). `..` ignores them.
+            #[cfg(not(feature = "text-index"))]
+            {
+                let crate::shard::dispatch::TextSearchPayload { reply_tx, .. } = *payload;
+                let _ = reply_tx.send(crate::protocol::Frame::Error(bytes::Bytes::from_static(
+                    b"ERR text-index feature not enabled",
+                )));
+            }
+            #[cfg(feature = "text-index")]
+            {
+                let crate::shard::dispatch::TextSearchPayload {
+                    index_name,
+                    query,
+                    global_df,
+                    global_n,
+                    top_k,
+                    offset,
+                    count,
+                    highlight_opts,
+                    summarize_opts,
+                    reply_tx,
+                } = *payload;
+                // DFS Phase 2: execute BM25 text search with global IDF injected by coordinator.
+                // The raw query bytes are re-parsed here with the recursive-descent parser so the
+                // full AST (OR, multi-@clause, grouping) is evaluated correctly on this shard.
+                // After scoring, apply HIGHLIGHT/SUMMARIZE post-processing if requested. Each shard
+                // post-processes against its own local hash store (no cross-shard read, no .await —
+                // safe to hold guards). text_store + databases[0] in one with_shard (multi-resource).
+                let response = {
+                    crate::shard::slice::with_shard(|s| match s.text_store.get_index(&index_name) {
+                        Some(text_index) => {
+                            let mut result =
+                                crate::command::vector_search::ft_text_search::run_text_query_on_index(
                                     text_index,
-                                    field_idx,
-                                    &query_terms,
-                                    &global_df,
-                                    global_n,
+                                    &query,
+                                    Some(&global_df),
+                                    Some(global_n),
                                     top_k,
                                     offset,
                                     count,
                                 );
-                        if highlight_opts.is_some() || summarize_opts.is_some() {
-                            let db = &s.databases[0];
-                            crate::command::vector_search::ft_text_search::apply_post_processing(
-                                &mut result,
-                                &term_strings,
-                                text_index,
-                                db,
-                                highlight_opts.as_ref(),
-                                summarize_opts.as_ref(),
-                            );
+                            if highlight_opts.is_some() || summarize_opts.is_some() {
+                                // Re-parse to extract highlight terms for post-processing.
+                                let term_strings = crate::text::query::parse_query(
+                                    &query,
+                                    &crate::text::query::QuerySchema::from_index(text_index),
+                                )
+                                .map(|n| {
+                                    crate::text::query::collect_highlight_terms(&n, text_index)
+                                })
+                                .unwrap_or_default();
+                                let db = &s.databases[0];
+                                crate::command::vector_search::ft_text_search::apply_post_processing(
+                                    &mut result,
+                                    &term_strings,
+                                    text_index,
+                                    db,
+                                    highlight_opts.as_ref(),
+                                    summarize_opts.as_ref(),
+                                );
+                            }
+                            result
                         }
-                        result
-                    }
-                    None => crate::protocol::Frame::Error(bytes::Bytes::from_static(
-                        b"ERR unknown index",
-                    )),
-                })
-            };
-            let _ = reply_tx.send(response);
+                        None => crate::protocol::Frame::Error(bytes::Bytes::from_static(
+                            b"ERR unknown index",
+                        )),
+                    })
+                };
+                let _ = reply_tx.send(response);
+            }
         }
         ShardMessage::VectorCommand { command, reply_tx } => {
             // All slice fields (vector_store, text_store, graph_store, databases)

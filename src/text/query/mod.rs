@@ -9,7 +9,9 @@
 //! The parser is a pure function (no index/analyzer): tokens are RAW and analyzed at eval time.
 
 mod ast;
+mod eval;
 mod parse;
 
 pub use ast::{QueryError, QueryNode};
+pub use eval::{collect_df_field_terms, collect_highlight_terms, eval_query, eval_set};
 pub use parse::{QuerySchema, parse_query};

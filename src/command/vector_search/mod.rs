@@ -45,7 +45,9 @@ pub use ft_search::{
     parse_session_clause, search_local, search_local_filtered,
 };
 #[cfg(feature = "text-index")]
-pub use ft_text_search::{FieldFilter, pre_parse_field_filter};
+pub use ft_text_search::{
+    FieldFilter, pre_parse_field_filter, run_text_query, run_text_query_on_index,
+};
 pub use ft_text_search::{
     HighlightOpts, QueryTerm, SummarizeOpts, apply_post_processing, execute_text_search_local,
     execute_text_search_with_global_idf, ft_text_search, highlight_field, is_text_query,
