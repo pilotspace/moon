@@ -160,7 +160,11 @@ fn test_or_union_e2e() {
     let ts = store_of(idx);
 
     let r = search(&ts, "alpha | beta");
-    assert_eq!(keys_set(&r), set_of(&["a", "b", "c", "d", "e"]), "OR must union");
+    assert_eq!(
+        keys_set(&r),
+        set_of(&["a", "b", "c", "d", "e"]),
+        "OR must union"
+    );
     assert_eq!(total(&r), 5);
 
     // sanity: AND still narrows to the overlap, single terms unchanged.
@@ -178,7 +182,14 @@ fn test_text_tag_intersect_e2e() {
     add_doc(&mut idx, 2, "2", &[("body", "foo")], &[("tag", "x")], &[]);
     add_doc(&mut idx, 3, "3", &[("body", "foo")], &[("tag", "bar")], &[]);
     add_doc(&mut idx, 4, "4", &[("body", "foo")], &[("tag", "bar")], &[]);
-    add_doc(&mut idx, 5, "5", &[("body", "other")], &[("tag", "bar")], &[]);
+    add_doc(
+        &mut idx,
+        5,
+        "5",
+        &[("body", "other")],
+        &[("tag", "bar")],
+        &[],
+    );
     idx.build_fst();
     let ts = store_of(idx);
 
@@ -194,10 +205,38 @@ fn test_text_tag_intersect_e2e() {
 fn test_text_numeric_intersect_e2e() {
     // @body:phone = {1,2,3}; @price:[10 20] = {2,3,9}. Intersection = {2,3}.
     let mut idx = empty_index();
-    add_doc(&mut idx, 1, "1", &[("body", "phone")], &[], &[("price", "5")]);
-    add_doc(&mut idx, 2, "2", &[("body", "phone")], &[], &[("price", "10")]);
-    add_doc(&mut idx, 3, "3", &[("body", "phone")], &[], &[("price", "20")]);
-    add_doc(&mut idx, 9, "9", &[("body", "tablet")], &[], &[("price", "15")]);
+    add_doc(
+        &mut idx,
+        1,
+        "1",
+        &[("body", "phone")],
+        &[],
+        &[("price", "5")],
+    );
+    add_doc(
+        &mut idx,
+        2,
+        "2",
+        &[("body", "phone")],
+        &[],
+        &[("price", "10")],
+    );
+    add_doc(
+        &mut idx,
+        3,
+        "3",
+        &[("body", "phone")],
+        &[],
+        &[("price", "20")],
+    );
+    add_doc(
+        &mut idx,
+        9,
+        "9",
+        &[("body", "tablet")],
+        &[],
+        &[("price", "15")],
+    );
     idx.build_fst();
     let ts = store_of(idx);
 
@@ -287,17 +326,58 @@ fn test_no_regression_single_and_filter() {
     // same result SETS. (Exact BM25 scores are held by the existing store/text unit suites,
     // which eval_query reuses verbatim — see §4 regression-net note.)
     let mut idx = empty_index();
-    add_doc(&mut idx, 1, "1", &[("body", "alpha beta")], &[("tag", "bar")], &[("price", "10")]);
-    add_doc(&mut idx, 2, "2", &[("body", "alpha")], &[("tag", "bar")], &[("price", "15")]);
-    add_doc(&mut idx, 3, "3", &[("body", "beta")], &[("tag", "baz")], &[("price", "99")]);
+    add_doc(
+        &mut idx,
+        1,
+        "1",
+        &[("body", "alpha beta")],
+        &[("tag", "bar")],
+        &[("price", "10")],
+    );
+    add_doc(
+        &mut idx,
+        2,
+        "2",
+        &[("body", "alpha")],
+        &[("tag", "bar")],
+        &[("price", "15")],
+    );
+    add_doc(
+        &mut idx,
+        3,
+        "3",
+        &[("body", "beta")],
+        &[("tag", "baz")],
+        &[("price", "99")],
+    );
     idx.build_fst();
     let ts = store_of(idx);
 
-    assert_eq!(keys_set(&search(&ts, "alpha")), set_of(&["1", "2"]), "single term");
-    assert_eq!(keys_set(&search(&ts, "alpha beta")), set_of(&["1"]), "implicit AND");
-    assert_eq!(keys_set(&search(&ts, "@body:alpha")), set_of(&["1", "2"]), "single @field");
-    assert_eq!(keys_set(&search(&ts, "@tag:{bar}")), set_of(&["1", "2"]), "bare tag filter");
-    assert_eq!(keys_set(&search(&ts, "@price:[10 20]")), set_of(&["1", "2"]), "bare numeric filter");
+    assert_eq!(
+        keys_set(&search(&ts, "alpha")),
+        set_of(&["1", "2"]),
+        "single term"
+    );
+    assert_eq!(
+        keys_set(&search(&ts, "alpha beta")),
+        set_of(&["1"]),
+        "implicit AND"
+    );
+    assert_eq!(
+        keys_set(&search(&ts, "@body:alpha")),
+        set_of(&["1", "2"]),
+        "single @field"
+    );
+    assert_eq!(
+        keys_set(&search(&ts, "@tag:{bar}")),
+        set_of(&["1", "2"]),
+        "bare tag filter"
+    );
+    assert_eq!(
+        keys_set(&search(&ts, "@price:[10 20]")),
+        set_of(&["1", "2"]),
+        "bare numeric filter"
+    );
 
     // pure-filter docs score 0.0; the reply is still well-formed (count matches set size).
     assert_eq!(total(&search(&ts, "@tag:{bar}")), 2);
@@ -333,7 +413,11 @@ fn test_eval_query_kernel_direct() {
     let results = eval_query(&idx, &node, None, None, 1000);
 
     let got: BTreeSet<Vec<u8>> = results.iter().map(|r| r.key.to_vec()).collect();
-    assert_eq!(got, set_of(&["a", "b", "c"]), "kernel must union the OR branches");
+    assert_eq!(
+        got,
+        set_of(&["a", "b", "c"]),
+        "kernel must union the OR branches"
+    );
     // text leaves carry a BM25 score; the union is non-empty and finite.
     assert!(results.iter().all(|r| r.score.is_finite()));
 }
@@ -344,15 +428,30 @@ fn test_eval_query_kernel_direct() {
 #[test]
 fn test_df_field_terms_single_entry_invariant() {
     let mut idx = empty_index();
-    add_doc(&mut idx, 1, "1", &[("body", "alpha"), ("title", "beta")], &[("tag", "bar")], &[("price", "10")]);
+    add_doc(
+        &mut idx,
+        1,
+        "1",
+        &[("body", "alpha"), ("title", "beta")],
+        &[("tag", "bar")],
+        &[("price", "10")],
+    );
     idx.build_fst();
     let schema = QuerySchema::from_index(&idx);
 
     // OR across fields + a tag filter: still exactly one df entry (so N is gathered exactly once).
     let node = parse_query(b"alpha | @title:beta @tag:{bar}", &schema).expect("parse ok");
     let fq = collect_df_field_terms(&node, &idx);
-    assert!(fq.len() <= 1, "must emit at most one (field,terms) df entry, got {}", fq.len());
-    assert_eq!(fq.len(), 1, "a query with text leaves must emit one entry so N is gathered");
+    assert!(
+        fq.len() <= 1,
+        "must emit at most one (field,terms) df entry, got {}",
+        fq.len()
+    );
+    assert_eq!(
+        fq.len(),
+        1,
+        "a query with text leaves must emit one entry so N is gathered"
+    );
 
     // Single-field query → hint is that field (pre-2b parity).
     let single = parse_query(b"@body:alpha", &schema).expect("parse ok");
@@ -364,17 +463,34 @@ fn test_df_field_terms_single_entry_invariant() {
 #[test]
 fn test_df_field_terms_pure_filter_vs_fuzzy() {
     let mut idx = empty_index();
-    add_doc(&mut idx, 1, "1", &[("body", "alpha")], &[("tag", "bar")], &[]);
+    add_doc(
+        &mut idx,
+        1,
+        "1",
+        &[("body", "alpha")],
+        &[("tag", "bar")],
+        &[],
+    );
     idx.build_fst();
     let schema = QuerySchema::from_index(&idx);
 
     // Pure TAG filter → NO text leaf → no entry (no text scoring → N not needed).
     let tag_only = parse_query(b"@tag:{bar}", &schema).expect("parse ok");
-    assert!(collect_df_field_terms(&tag_only, &idx).is_empty(), "pure filter → no df entry");
+    assert!(
+        collect_df_field_terms(&tag_only, &idx).is_empty(),
+        "pure filter → no df entry"
+    );
 
     // Pure fuzzy → has a text leaf but no Exact term → still ONE entry (empty terms) so N is gathered.
     let fuzzy = parse_query(b"%alph%", &schema).expect("parse ok");
     let fq = collect_df_field_terms(&fuzzy, &idx);
-    assert_eq!(fq.len(), 1, "fuzzy text leaf must still yield one entry so global N is gathered");
-    assert!(fq[0].1.is_empty(), "fuzzy terms use LOCAL df → no exact df terms collected");
+    assert_eq!(
+        fq.len(),
+        1,
+        "fuzzy text leaf must still yield one entry so global N is gathered"
+    );
+    assert!(
+        fq[0].1.is_empty(),
+        "fuzzy terms use LOCAL df → no exact df terms collected"
+    );
 }

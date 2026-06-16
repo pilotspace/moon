@@ -404,9 +404,7 @@ pub(super) async fn try_handle_ft_command(
                                 r
                             }
                             #[cfg(not(feature = "text-index"))]
-                            Frame::Error(Bytes::from_static(
-                                b"ERR text-index feature not enabled",
-                            ))
+                            Frame::Error(Bytes::from_static(b"ERR text-index feature not enabled"))
                         });
                         let mut response = response;
                         if let Some(ws_id) = conn.workspace_id.as_ref() {

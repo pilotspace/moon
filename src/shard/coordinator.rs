@@ -1591,18 +1591,16 @@ pub async fn scatter_text_search(
         let parse_result: Result<
             (Vec<(Option<usize>, Vec<String>)>, Vec<String>),
             crate::protocol::Frame,
-        > = crate::shard::slice::with_shard(|s| {
-            match s.text_store.get_index(&index_name) {
-                None => Err(Frame::Error(Bytes::from_static(b"ERR no such index"))),
-                Some(text_index) => {
-                    let schema = QuerySchema::from_index(text_index);
-                    match crate::text::query::parse_query(&query, &schema) {
-                        Err(e) => Err(Frame::Error(Bytes::copy_from_slice(e.code().as_bytes()))),
-                        Ok(node) => {
-                            let fq = collect_df_field_terms(&node, text_index);
-                            let ts = collect_highlight_terms(&node, text_index);
-                            Ok((fq, ts))
-                        }
+        > = crate::shard::slice::with_shard(|s| match s.text_store.get_index(&index_name) {
+            None => Err(Frame::Error(Bytes::from_static(b"ERR no such index"))),
+            Some(text_index) => {
+                let schema = QuerySchema::from_index(text_index);
+                match crate::text::query::parse_query(&query, &schema) {
+                    Err(e) => Err(Frame::Error(Bytes::copy_from_slice(e.code().as_bytes()))),
+                    Ok(node) => {
+                        let fq = collect_df_field_terms(&node, text_index);
+                        let ts = collect_highlight_terms(&node, text_index);
+                        Ok((fq, ts))
                     }
                 }
             }
@@ -1632,13 +1630,7 @@ pub async fn scatter_text_search(
             #[cfg(feature = "text-index")]
             {
                 let mut r = crate::command::vector_search::ft_text_search::run_text_query_on_index(
-                    text_index,
-                    &query,
-                    None,
-                    None,
-                    top_k,
-                    offset,
-                    count,
+                    text_index, &query, None, None, top_k, offset, count,
                 );
                 if highlight_opts.is_some() || summarize_opts.is_some() {
                     // databases[0] borrowed disjointly from text_store — both live on `s`.

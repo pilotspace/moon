@@ -165,7 +165,15 @@ fn accumulate_text_scores(
             token,
             modifier,
         } => {
-            for r in term_results(idx, *field, token, modifier, global_df, global_n, usize::MAX) {
+            for r in term_results(
+                idx,
+                *field,
+                token,
+                modifier,
+                global_df,
+                global_n,
+                usize::MAX,
+            ) {
                 *scores.entry(r.doc_id).or_insert(0.0) += r.score;
             }
         }
@@ -198,7 +206,9 @@ fn term_results(
     };
 
     match field {
-        Some(fidx) => term_results_in_field(idx, fidx, raw_str, modifier, global_df, global_n, top_k),
+        Some(fidx) => {
+            term_results_in_field(idx, fidx, raw_str, modifier, global_df, global_n, top_k)
+        }
         None => {
             // Cross-field: union over non-NOINDEX text fields, summing per-doc scores.
             let mut acc: HashMap<u32, (f32, Bytes)> = HashMap::new();
@@ -214,11 +224,7 @@ fn term_results(
                 }
             }
             acc.into_iter()
-                .map(|(doc_id, (score, key))| TextSearchResult {
-                    doc_id,
-                    key,
-                    score,
-                })
+                .map(|(doc_id, (score, key))| TextSearchResult { doc_id, key, score })
                 .collect()
         }
     }
@@ -268,7 +274,12 @@ fn term_results_in_field(
 /// terms (stop word) or >1; fuzzy/prefix terms are lowercased + NFKD only (no stemming, D-06/D-07)
 /// and yield a single normalized string. Centralizes the query-time analysis reused by the leaf
 /// evaluator and the DFS / HIGHLIGHT term collectors so they cannot drift.
-fn analyze_raw(idx: &TextIndex, fidx: usize, raw_str: &str, modifier: &TermModifier) -> Vec<String> {
+fn analyze_raw(
+    idx: &TextIndex,
+    fidx: usize,
+    raw_str: &str,
+    modifier: &TermModifier,
+) -> Vec<String> {
     match modifier {
         TermModifier::Exact => match idx.field_analyzers.get(fidx) {
             Some(analyzer) => analyzer
