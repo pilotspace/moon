@@ -1,7 +1,7 @@
 # TASK: Rank-based posting TF lookup (kill the high-DF O(M^2) cliff)
 
 slug: fts-posting-rank-tf · created: 2026-06-16 · stage: production · risk: high · autonomy: conservative
-phase: build   <!-- specify -> scenarios -> contract -> tests -> build -> verify -> observe -> done -->
+phase: done   <!-- specify -> scenarios -> contract -> tests -> build -> verify -> observe -> done -->
 <!-- risk: high — freeze-first shared contract (the PostingList TF representation that
      fts-upsert-incremental inherits) AND it fixes a latent BM25-correctness bug, so verify
      must NOT auto-pass: human gate required (run.md unguarded_high_risk_auto guard). -->
@@ -229,23 +229,59 @@ Constraints: do NOT change any test or the contract; allow-list packages only; a
 
 ## 6 · VERIFY — evidence + non-functional review ▸ docs/08-step-6-verify.md
 
-- [ ] all tests pass
-- [ ] coverage did not decrease
-- [ ] no test or contract was altered during build
-- [ ] concurrency / timing of the risky operation is safe
-- [ ] no exposed secrets, injection openings, or unexpected dependencies
-- [ ] layering & dependencies follow CONVENTIONS.md
-- [ ] a person reviewed and approved the change
+- [x] all tests pass — 7/7 new (`tests/fts_posting_rank_tf.rs`); full lib suite 3584/0;
+      `text::` 144/0; `text::store::tests` 15/0. Tokio+text-index parity `cargo check
+      --no-default-features --features runtime-tokio,jemalloc,text-index,graph` → clean
+      (change has zero runtime-specific code). `cargo fmt --check` clean; `cargo clippy
+      -- -D warnings` clean (no posting.rs/store.rs warnings).
+- [x] coverage did not decrease — net +7 tests; they cover the previously-UNTESTED
+      update-misalignment path (distinct tfs after a low-id re-index), which no prior
+      test exercised. M4 keeps the already-correct ascending path green.
+- [x] no test or contract was altered during build — §3 CONTRACT FROZEN @ v1 untouched;
+      red suite (tests phase) went green via `src/text/{posting,store}.rs` edits only.
+- [x] concurrency / timing of the risky operation is safe — BM25 search
+      (`search_field`/`search_field_or`, store.rs:506,767 reading `posting.tf`) runs
+      SYNCHRONOUSLY on the owning shard's event loop under an exclusive `&mut TextStore`
+      borrow: the off-event-loop `FtSearchPlan::Yield` path (PR #179) is dense-KNN-only on
+      an owned `SearchSnapshot` and routes every TEXT shape to `Sync` (ft_search/dispatch.rs),
+      so it never reads postings. Writes (`add_term_occurrence` via HSET auto-index) run on
+      the SAME single thread under the SAME `&mut`. No concurrent reader/writer of
+      `PostingStore`; the change preserves the prior mutation discipline (read indexes the
+      same Vec, write mutates the same Vec — neither adds shared mutability). No residue.
+- [x] no exposed secrets, injection openings, or unexpected dependencies — pure in-memory
+      index re-indexing; no I/O, no new crate, no on-disk format change (postings rebuilt
+      from HSET replay on reload). `tf()`/`positions_for()` are panic-free (`contains` guard
+      + `.get().unwrap_or(0)`), so malformed/absent doc_ids degrade to tf 0, never a crash.
+      No security finding.
+- [x] layering & dependencies follow CONVENTIONS.md — change confined to `src/text/`:
+      `posting.rs` owns the structure, `store.rs` the read sites. New methods hang off the
+      existing public `PostingList`; `rank_index` is private. No new module, no cross-layer
+      dependency, no hot-path allocation introduced (rank/insert on existing Vecs).
+- [x] a person reviewed and approved the change   <!-- Tin Dang · 2026-06-16 · risk:high human gate · PASS -->
+
 
 ### Deep checks — do not skim (fill the path that applies; the resolver judges which)
-- [ ] WIRING (code) — every new symbol is referenced; record where / how confirmed
-- [ ] DEAD-CODE (code) — no new unused or orphaned symbol introduced
-- [ ] SEMANTIC (prose / non-code) — read in full, not skimmed: <what read · what confirmed>
+- [x] WIRING (code) — `tf()` referenced at store.rs:506 and store.rs:767 (the ONLY two BM25
+      read sites; confirmed by serena pattern sweep of `src/text` — store.rs:891 `.position()`
+      is an unrelated TAG-separator byte scan, not a posting read). `rank_index()` (private) is
+      called by `tf`, `positions_for`, `add_term_occurrence` (×2 branches) and `remove_doc`.
+- [x] DEAD-CODE (code) — the old linear-scan blocks were REMOVED (not left behind); the stale
+      "RESEARCH Pitfall 1" note was rewritten, not orphaned. clippy reports no dead code.
+      ⚠ ONE flag: `positions_for()` is currently exercised only by its M5 conformance test —
+      there is NO production reader of `positions` yet (positions are stored "from day one for
+      future phrase queries"; verified the only `.positions` accesses are the write path +
+      `estimated_bytes`). It is the frozen-contract forward accessor (the rank-aligned
+      counterpart to `tf()`) that `fts-upsert-incremental` inherits and phrase/HIGHLIGHT will
+      consume — intentional contract API, not accidental dead code. Surfaced, not buried.
+- [ ] SEMANTIC (prose / non-code) — n/a (code change).
 
 ### GATE RECORD
-Outcome: <PASS | RISK-ACCEPTED | HARD-STOP>
-If RISK-ACCEPTED -> owner: <name> · ticket: <link> · expires: <date>   (never for a security gap)
-Reviewed by: <name> · date: <date>
+Outcome: PASS  (human gate — risk: high · autonomy: conservative)
+Lowest-confidence item surfaced + accepted at the gate: `positions_for()` is contract API
+referenced only by its conformance test today (no production reader of positions until phrase
+queries / fts-upsert-incremental land) — accepted as intentional frozen-contract forward API.
+No security or concurrency residue; no test/contract weakened.
+Reviewed by: Tin Dang · date: 2026-06-16
 
 <!-- A security finding is ALWAYS HARD-STOP. Record exactly one outcome — no silent pass. -->
 
@@ -253,10 +289,30 @@ Reviewed by: <name> · date: <date>
 
 ## 7 · OBSERVE — feed the next loop ▸ docs/09-the-loop.md
 
-Watch (reuse scenarios as monitors): <error rate / per-rejection rate / latency>
-Spec delta for the next loop: <what production taught you>
+Watch (reuse scenarios as monitors): BM25 score correctness after document re-index (M1
+scenario as a regression monitor) · high-DF term-query p99 latency vs the ~419 ms O(M²)
+baseline (M2 scenario) · FT.SEARCH ranking stability under update-heavy workloads.
+Spec delta for the next loop: a milestone-scoped "perf fix" hid a latent correctness bug —
+the rank-based lookup is only sound if `term_freqs` is sorted-aligned, so perf and correctness
+were inseparable. fts-upsert-incremental now inherits the FROZEN rank-aligned contract: its
+known cost is O(rank) insert (shift `term_freqs`/`positions`); if high-churn indexing regresses,
+that task re-tunes the representation (the A2 HashMap fallback) rather than re-opening this one.
 
 ### Competency deltas
 What did this loop teach the foundation? One line each, tagged by competency
 (`DDD · SDD · UDD · TDD · ADD`), status `open`, with evidence. See the `add` skill's `deltas.md`.
 <!-- e.g.  - [DDD · open] the model missed multi-tenancy (evidence: scenario_x failed) -->
+- [SDD · open] A milestone scoped a task as "perf-only" but grounded code investigation in
+  Specify found a latent correctness bug on the same path (insertion-order term_freqs vs
+  sorted-bitmap read) — perf and correctness were inseparable. Lesson: re-derive task scope
+  from the code during Specify, don't inherit the milestone's framing verbatim. (evidence:
+  A1 flag; the misalignment was real and is fixed + tested.)
+- [TDD · open] The bug survived the code's entire prior life because every existing test used
+  EQUAL term frequencies, which mask alignment errors. Lesson: index/posting fixtures must use
+  DISTINCT, asymmetric values so a positional misalignment changes an observable output.
+  (evidence: test_tf_correct_after_low_id_update needs a=5,b=2,c=3 to catch it; equal tfs pass
+  under the buggy code.)
+- [ADD · open] risk:high + autonomy:conservative correctly forced a human gate on a change that
+  looked mechanically green — the surfaced flag (positions_for is test-only-referenced forward
+  API) was a real judgement call the auto-gate should not have silently swallowed. (evidence:
+  unguarded_high_risk_auto guard held; gate presented + human-approved.)
