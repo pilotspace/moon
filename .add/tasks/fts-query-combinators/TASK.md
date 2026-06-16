@@ -1,7 +1,7 @@
 # TASK: OR unions + TEXT+TAG intersects — correct combinator result sets
 
 slug: fts-query-combinators · created: 2026-06-16 · stage: production · risk: high · autonomy: conservative
-phase: verify   <!-- specify -> scenarios -> contract -> tests -> build -> verify -> observe -> done -->
+phase: done   <!-- specify -> scenarios -> contract -> tests -> build -> verify -> observe -> done -->
 <!-- risk: high — freezes the FT query GRAMMAR + matched-set semantics (the contract
      fts-search-count-semantics depends-on and counts over) AND changes wire-visible FT.SEARCH
      behavior. Verify must NOT auto-pass: human gate (run.md unguarded_high_risk_auto guard). -->
@@ -399,8 +399,11 @@ combined verify gate for the parser+evaluator+dispatch wired end-to-end. 2a's ev
 lib 3584/0, fmt/clippy/fuzz clean, no residue); the combined gate will PASS 2a and 2b together.
 Lowest-confidence item (carried to the combined gate): the full-replacement integration in 2b — does
 the new parse→eval→reply path regress any already-working FT.SEARCH shape (M5)?
+Outcome: **PASS** — resolved at the combined 2a+2b gate (2026-06-16). 2b wired the frozen parser
+end-to-end; the M5 full-replacement question was answered green (lib 3584/0, e2e 12/12, tokio FT 5/5,
+OR/combinator correct over the wire on shards 1 AND 4). No regression to any already-working shape.
 If RISK-ACCEPTED -> owner: <name> · ticket: <link> · expires: <date>   (never for a security gap)
-Reviewed by: <DEFERRED to combined 2a+2b gate> · date: <pending 2b>
+Reviewed by: Tin Dang (combined 2a+2b human gate, "PASS both") · date: 2026-06-16
 
 <!-- A security finding is ALWAYS HARD-STOP. Record exactly one outcome — no silent pass. -->
 
