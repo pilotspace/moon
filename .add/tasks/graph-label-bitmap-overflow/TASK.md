@@ -322,7 +322,7 @@ stay equally strong; the backward-compat tests remain and now evidence M5):
       (mmap unsafe untouched — overflow is heap-owned). Transitively fuzzed by `csr_from_bytes`.
 - [x] layering & dependencies — change is confined to `src/graph/{types,index,compaction}.rs`
       + `src/graph/csr/{mod,mmap,storage}.rs`; mirrors the v3 `edge_created_ms` precedent exactly.
-- [ ] a person reviewed and approved the change — **PENDING (this gate)**.
+- [x] a person reviewed and approved the change — Tin Dang, verify gate PASS (2026-06-17).
 
 ### Deep checks — do not skim (fill the path that applies; the resolver judges which)
 - [x] WIRING (code) — `label_overflow` field: written by from_frozen/from_bytes/from_mmap/compact,
@@ -345,10 +345,26 @@ Reviewed by: Tin Dang · date: 2026-06-17
 
 ## 7 · OBSERVE — feed the next loop ▸ docs/09-the-loop.md
 
-Watch (reuse scenarios as monitors): <error rate / per-rejection rate / latency>
-Spec delta for the next loop: <what production taught you>
+Watch (reuse scenarios as monitors): a graph using > 32 distinct labels now matches every label
+(previously the 33rd+ silently returned nothing); CSR segment files are now version 4 (`from_bytes`
+rejects nothing new — v≤3 still loads). No production telemetry yet (correctness milestone).
+Spec delta for the next loop: the `u16` label-id space is now fully usable; if a future task adds a
+SECOND on-disk graph section, factor a shared "trailing version-gated section" writer/parser — this
+task hand-rolled the third such section (edge_created_ms v3, label_overflow v4) by copy-precedent.
 
 ### Competency deltas
-What did this loop teach the foundation? One line each, tagged by competency
-(`DDD · SDD · UDD · TDD · ADD`), status `open`, with evidence. See the `add` skill's `deltas.md`.
-<!-- e.g.  - [DDD · open] the model missed multi-tenancy (evidence: scenario_x failed) -->
+- [TDD · open] A RED/GREEN test that loads via `CsrStorage::from_file` can silently exercise the
+  HEAP loader instead of mmap when node_meta isn't 8-aligned (edgeless nc=2 shape → byte 140) — the
+  test passes but never covers the intended mmap path. Assert `matches!(CsrStorage::Mmap(_))` (and
+  pick an 8-aligned shape) whenever a test's POINT is the zero-copy path. (evidence:
+  test_overflow_survives_mmap_reload fell back to heap until the fixture was corrected; A1 was the
+  flagged risk.)
+- [ADD · open] A CONTRACTED on-disk version bump (v3→v4) ripples to pre-existing constant-pinning
+  tests (`assert version==3`, byte-stripping helpers). Updating those to the new constant is
+  propagation, NOT the forbidden "weaken a test to pass" — but it must be surfaced at the gate, and
+  the backward-compat tests must remain (they then positively evidence the M5 compat claim).
+  (evidence: 6 `version==3`→`4` + downgrade_to_v2 byte-math, all listed in §5.)
+- [DDD · open] `compact_segments` leaves `node_id_to_row` EMPTY by design (it merges at external_id
+  level, not NodeKey) — so `lookup_node` returns None on every compacted segment. Tests/consumers
+  that need a post-merge row must locate it by `external_id`, not `lookup_node`. (evidence: the
+  compaction test panicked on `lookup_node` before switching to external_id lookup.)

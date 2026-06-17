@@ -2,7 +2,7 @@
 
 goal: Moon's graph queries are correct: Cypher MATCH narrows on inline node-property predicates instead of full-scanning the label, directional traversal covers incoming/Both edges post-compaction, and node labels >= 32 are no longer silently dropped.
 rationale: new-major (split 2/3) — part of the v3 "secondary-engine correctness & parity" theme from the 2026-06-16 deep review + 4-feature benchmark. No closed milestone (v1 shared-nothing, v2/v2-1 throughput) covers graph-query correctness. This slice owns the three graph defects the review/benchmark surfaced; FTS (v3-1) and Vector/KV (v3-3) are sibling slices. Correctness only — Moon's native graph build + 1-hop already beat FalkorDB (bench §11.4).
-stage: production · status: planned · created: 2026-06-16
+stage: production · status: done · created: 2026-06-16 · closed: 2026-06-17
 
 > SDD living doc for this milestone. Keep it THIN: breadth, shared decisions, and
 > exit criteria only — per-task detail lives in each `.add/tasks/<slug>/TASK.md`,
@@ -41,17 +41,17 @@ Out:
   traversal work both read.                                   -> owning task `graph-incoming-edges`
 
 ## Tasks (breadth-first decomposition; detail lives in each TASK.md)
-- [ ] graph-cypher-inline-filter   depends-on: none   — Cypher MATCH narrows on inline node-property
+- [x] graph-cypher-inline-filter   depends-on: none   — Cypher MATCH narrows on inline node-property
       predicate instead of full-scanning the label; point-query returns only the matching node's edges.
-- [ ] graph-incoming-edges         depends-on: none   — CSR traversal returns incoming / Both-direction
+- [x] graph-incoming-edges         depends-on: none   — CSR traversal returns incoming / Both-direction
       edges post-compaction (reverse adjacency or incoming index).
-- [ ] graph-label-bitmap-overflow  depends-on: none   — node label storage supports id >= 32 without
+- [x] graph-label-bitmap-overflow  depends-on: none   — node label storage supports id >= 32 without
       silent truncation.
 
 ## Exit criteria (observable; map each to the task that delivers it)
-- [ ] A Cypher point-query `MATCH (a {id:N})-[]->(b)` returns only node N's edges (returned rows ==
+- [x] A Cypher point-query `MATCH (a {id:N})-[]->(b)` returns only node N's edges (returned rows ==
       expected, not ≈|E|) — test asserts the narrowed row count.            (← graph-cypher-inline-filter)
-- [ ] On a compacted graph, `Direction::Incoming` and `Both` return the incoming edges (non-empty
+- [x] On a compacted graph, `Direction::Incoming` and `Both` return the incoming edges (non-empty
       where they should be) — test on a post-compaction graph.              (← graph-incoming-edges)
-- [ ] A node assigned label id >= 32 (e.g. a 40-label graph) is matched by its label query — no
+- [x] A node assigned label id >= 32 (e.g. a 40-label graph) is matched by its label query — no
       silent drop; test with >= 33 distinct labels.                         (← graph-label-bitmap-overflow)
