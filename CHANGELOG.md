@@ -22,6 +22,20 @@ high-DF cliff gone (419 ms → 33 ms). KV and Vector unchanged (no regression). 
 as layered BENCHMARK.md §2.9 / §10.6 / §11.5 / §12.3 over the 2026-06-16 record;
 full report + corrected harness + raw logs in `docs/reviews/2026-06-17/`.
 
+### Docs — Wider cross-arch benchmark: shard scaling (1/4/12) × structures × pipeline/datasize × production (PR #194)
+
+Ran the repo-canonical `scripts/bench-compare.sh` (all-commands × pipeline 1–128 ×
+datasize 8B–64KB × connections) at `--shards 1/4/12` plus `scripts/bench-production.sh`
+(10 scenarios at shards 1 and 12) on GCloud x86 `c3-standard-8` + ARM `t2a-standard-8`,
+Moon `8238515` vs Redis 7.0.15. Quantifies the core scaling claim honestly: Moon's
+advantage is **pipeline depth, not shard count** (break-even p=16; GET p=128 ~2.8×, SET
+p=64 ~1.85×), every core data structure tracks GET/SET at p=1 (~0.79×, TCP-RTT bound),
+and **adding shards hurts uniform single-key non-pipelined throughput** (12 shards →
+0.46–0.51× Redis vs ~0.79× at 1 shard). Folded as BENCHMARK.md §4.5 (structure coverage)
++ §6.4 (cross-arch shard scaling); full detail + logs in
+`docs/reviews/2026-06-17/WIDER-BENCH.md`. The run also patched a latent unfairness in the
+bench scripts (they start Redis AOF-off but Moon AOF-on, flooding ~1M WARN lines).
+
 ### Fixed — Graph node labels with id ≥ 32 are stored, matched, and persisted (no silent truncation) (PR #193)
 
 CSR node labels were packed into a 32-bit `NodeMeta::label_bitmap`, so any label

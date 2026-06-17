@@ -399,6 +399,15 @@ Scaling is sub-linear due to cross-shard SPSC dispatch overhead and shared loopb
 
 > **Refined 2026-06-15 (§2.8.4):** on GCloud c3/t2a with a **uniform single-key** GET/SET workload at c=50, 1→8 shards is flat-to-slightly-negative (x86 GET p=64 holds ~4.7M, p=16 −2%; ARM −4–5%), not the +1.46× above. The positive scaling here reflects a non-uniform / higher-concurrency workload; for uniform cross-shard routing, single-shard is best (CLAUDE.md gotcha). Multi-shard wins come from pipeline/AOF parallelism and hash-tag co-location, not raw uniform-key fan-out.
 
+### 4.5 2026-06-17 data-structure coverage (cross-arch, shards=1, p=1)
+
+A wider `bench-compare.sh` pass (build `8238515`) confirmed **every core data structure tracks GET/SET** at
+p=1 (~0.79× Redis, TCP-RTT bound — see §6.2) with **no structure-specific cliff**: SET/GET/INCR 0.79×,
+LPUSH/RPUSH/LPOP/RPOP 0.76–0.80×, LRANGE 100–600 0.78–0.80×, SADD/SPOP 0.80×, HSET 0.78×, ZADD 0.79×,
+ZPOPMIN 0.72× (x86). ARM shows several structures at/above parity at p=1 (ZPOPMIN 1.10×, SADD 0.99×, HSET
+0.97×). All cross decisively into Moon's favor under pipelining (§6.4). Detail:
+`docs/reviews/2026-06-17/WIDER-BENCH.md`.
+
 ---
 
 ## 5. CPU Efficiency
@@ -467,6 +476,28 @@ At p=1, TCP loopback latency (~5000ns) dominates. Command processing (156ns) is 
 | 100-500 | 0.88-0.92x (async runtime overhead under contention) |
 
 Optimal operating point: **10-50 clients per shard**.
+
+### 6.4 2026-06-17 cross-arch shard scaling (1 / 4 / 12, GCloud, build `8238515`)
+
+A wider sweep (`scripts/bench-compare.sh` at `--shards 1/4/12` + `bench-production.sh`, Moon vs Redis 7.0.15,
+x86 `c3-standard-8` + ARM `t2a-standard-8`, AOF-off both sides). **The clean result: Moon's advantage is
+pipeline depth, not shard count.** GET ratio (Moon/Redis), x86 — *flat across shard count*:
+
+| pipeline | shards=1 | shards=4 | shards=12 |
+|---------:|:--------:|:--------:|:---------:|
+| p=1  | 0.79× | 0.79× | 0.82× |
+| p=16 | 1.05× | 0.94× | 0.96× |
+| p=64 | **1.88×** | **1.88×** | **1.91×** |
+| p=128 | **2.84×** | **2.92×** | **2.81×** |
+
+SET wins similarly at depth (p=64 1.85× s1, declining to 1.54× s12 — cross-shard write dispatch). **Adding
+shards does not help, and for uniform single-key *non-pipelined* work it hurts:** at **12 shards** the
+production p=1 GET/SET collapse to **0.46–0.51×** Redis (vs ~0.79× at 1 shard) on both arches — the
+cross-shard SPSC dispatch tax (confirms the "single-shard is best for non-pipelined" gotcha, quantified). ARM
+mirrors x86 (SET p=64 1.96×/1.86× at s1/s12; GET p=128 2.74×/2.42×). **Guidance: `--shards 1` for uniform
+non-pipelined workloads; add shards only for pipelined / AOF / hash-tag-co-located workloads.** `MSET`
+degrades with shard count (0.93×→0.61× as 1→12) as its keys scatter cross-shard — `{hash-tag}` co-location
+restores it. Detail: `docs/reviews/2026-06-17/WIDER-BENCH.md`.
 
 ---
 

@@ -1,0 +1,557 @@
+================ WIDER BENCH START · arch=x86_64 · Wed Jun 17 08:41:24 UTC 2026 ================
+HEAD: 8238515 docs(add): fold v3-2-graph-correctness deltas → foundation-version 6
+    Finished `release` profile [optimized] target(s) in 3m 45s
+CPU: Intel(R) Xeon(R) Platinum 8481C CPU @ 2.70GHz · cores=8
+Redis server v=7.0.15 sha=00000000:0 malloc=jemalloc-5.3.0 bits=64 build=e53ff17674aa6190
+PATCH check (compare): 1 line(s)
+PATCH check (production): 1 line(s)
+
+########## COMPARE shards=1 START (req=200000, AOF off) ##########
+13242:C 17 Jun 2026 08:51:19.369 # oO0OoO0OoO0Oo Redis is starting oO0OoO0OoO0Oo
+13242:C 17 Jun 2026 08:51:19.369 # Redis version=7.0.15, bits=64, commit=00000000, modified=0, pid=13242, just started
+13242:C 17 Jun 2026 08:51:19.369 # Configuration loaded
+13242:M 17 Jun 2026 08:51:19.370 # Server initialized
+13242:M 17 Jun 2026 08:51:19.370 # WARNING Memory overcommit must be enabled! Without it, a background save or replication may fail under low memory condition. Being disabled, it can can also cause failures without low memory condition, see https://github.com/jemalloc/jemalloc/issues/1328. To fix this issue add 'vm.overcommit_memory = 1' to /etc/sysctl.conf and then reboot or run the command 'sysctl vm.overcommit_memory=1' for this to take effect.
+# Moon vs Redis Benchmark
+
+**Date:** 2026-06-17
+**Redis:** 7.0.15
+**Moon:** 1 shard(s)
+**Requests:** 200000 per test, 50 clients
+**Platform:** Linux x86_64 / Ubuntu 24.04.4 LTS
+
+## Core Commands (p=1, 50 clients)
+
+| Command                        |    Redis RPS |     Moon RPS |   Ratio |
+|--------------------------------|--------------|--------------|---------|
+| PING inline                    |    135226.50 |    106951.88 |   0.79x |
+| PING mbulk                     |    133511.34 |    107411.38 |   0.80x |
+| SET                            |    134408.59 |    106780.56 |   0.79x |
+| GET                            |    135043.89 |    107009.10 |   0.79x |
+| INCR                           |    135501.36 |    107584.73 |   0.79x |
+| MSET (10 keys)                 |    146092.05 |    135685.22 |   0.93x |
+| LPUSH                          |    136986.30 |    103680.66 |   0.76x |
+| RPUSH                          |    135318.00 |    105318.59 |   0.78x |
+| LPOP                           |    135409.61 |    106213.48 |   0.78x |
+| RPOP                           |    135593.22 |    108108.11 |   0.80x |
+| LRANGE 100                     |    133333.33 |    107066.38 |   0.80x |
+| LRANGE 300                     |    135409.61 |    107123.73 |   0.79x |
+| LRANGE 500                     |    136798.91 |    106269.93 |   0.78x |
+| LRANGE 600                     |    133600.53 |    107296.14 |   0.80x |
+| SADD                           |    133333.33 |    106723.59 |   0.80x |
+| SPOP                           |    135777.33 |    108049.70 |   0.80x |
+| HSET                           |    136054.42 |    106269.93 |   0.78x |
+| ZADD                           |    136705.39 |    108459.87 |   0.79x |
+| ZPOPMIN                        |    134408.59 |     96571.70 |   0.72x |
+
+## Pipeline Scaling (SET)
+
+| Pipeline Depth                 |    Redis RPS |     Moon RPS |   Ratio |
+|--------------------------------|--------------|--------------|---------|
+| SET p=1                        |    136705.39 |    107526.88 |   0.79x |
+| SET p=2                        |    276625.19 |    209863.59 |   0.76x |
+| SET p=4                        |    557103.06 |    427350.44 |   0.77x |
+| SET p=8                        |    917431.19 |    826446.31 |   0.90x |
+| SET p=16                       |   1398601.38 |   1960784.38 |   1.40x |
+| SET p=32                       |   1754386.00 |   2702702.75 |   1.54x |
+| SET p=64                       |   1739130.38 |   3225806.50 |   1.85x |
+| SET p=128                      |   2198505.50 |   3774792.50 |   1.72x |
+
+## Pipeline Scaling (GET)
+
+| Pipeline Depth                 |    Redis RPS |     Moon RPS |   Ratio |
+|--------------------------------|--------------|--------------|---------|
+| GET p=1                        |    135777.33 |    107874.87 |   0.79x |
+| GET p=2                        |    273597.81 |    215053.77 |   0.79x |
+| GET p=4                        |    531914.94 |    425531.91 |   0.80x |
+| GET p=8                        |   1104972.38 |    816326.50 |   0.74x |
+| GET p=16                       |   1481481.38 |   1550387.62 |   1.05x |
+| GET p=32                       |   1680672.25 |   2816901.25 |   1.68x |
+| GET p=64                       |   2531645.50 |   4761905.00 |   1.88x |
+| GET p=128                      |   2817802.75 |   8002560.00 |   2.84x |
+
+## Data Size Scaling (SET)
+
+| Value Size                     |    Redis RPS |     Moon RPS |   Ratio |
+|--------------------------------|--------------|--------------|---------|
+| SET 8B                         |    133779.27 |    107411.38 |   0.80x |
+| SET 64B                        |    132275.14 |    107238.60 |   0.81x |
+| SET 256B                       |    132802.12 |    105540.90 |   0.79x |
+| SET 1024B                      |    131233.59 |    104931.80 |   0.80x |
+| SET 4096B                      |    122399.02 |     99651.22 |   0.81x |
+| SET 16384B                     |    102774.92 |    108108.11 |   1.05x |
+| SET 65536B                     |     52617.73 |     35580.86 |   0.68x |
+
+## Data Size Scaling (GET)
+
+| Value Size                     |    Redis RPS |     Moon RPS |   Ratio |
+|--------------------------------|--------------|--------------|---------|
+| GET 8B                         |    131406.05 |    106780.56 |   0.81x |
+| GET 64B                        |    135961.94 |    106837.61 |   0.79x |
+| GET 256B                       |    134770.89 |    107411.38 |   0.80x |
+| GET 1024B                      |    133868.81 |    108283.70 |   0.81x |
+| GET 4096B                      |    125707.11 |    103305.79 |   0.82x |
+| GET 16384B                     |    105485.23 |     93066.55 |   0.88x |
+| GET 65536B                     |     50403.23 |     47778.31 |   0.95x |
+
+## Connection Scaling (SET)
+
+| Clients                        |    Redis RPS |     Moon RPS |   Ratio |
+|--------------------------------|--------------|--------------|---------|
+| SET c=1                        |     42229.73 |     42964.55 |   1.02x |
+| SET c=10                       |    137646.25 |    107469.11 |   0.78x |
+| SET c=50                       |    136054.42 |    108342.37 |   0.80x |
+| SET c=100                      |    134952.77 |    108518.72 |   0.80x |
+| SET c=200                      |    137457.05 |    109469.07 |   0.80x |
+| SET c=500                      |    131665.56 |    106100.80 |   0.81x |
+
+---
+*Generated by bench-compare.sh*
+13242:signal-handler (1781686516) Received SIGTERM scheduling shutdown...
+13242:M 17 Jun 2026 08:55:16.336 # User requested shutdown...
+13242:M 17 Jun 2026 08:55:16.336 # Redis is now ready to exit, bye bye...
+########## COMPARE shards=1 END ##########
+
+########## COMPARE shards=4 START (req=200000, AOF off) ##########
+14168:C 17 Jun 2026 08:55:18.373 # oO0OoO0OoO0Oo Redis is starting oO0OoO0OoO0Oo
+14168:C 17 Jun 2026 08:55:18.373 # Redis version=7.0.15, bits=64, commit=00000000, modified=0, pid=14168, just started
+14168:C 17 Jun 2026 08:55:18.373 # Configuration loaded
+14168:M 17 Jun 2026 08:55:18.373 # Server initialized
+14168:M 17 Jun 2026 08:55:18.373 # WARNING Memory overcommit must be enabled! Without it, a background save or replication may fail under low memory condition. Being disabled, it can can also cause failures without low memory condition, see https://github.com/jemalloc/jemalloc/issues/1328. To fix this issue add 'vm.overcommit_memory = 1' to /etc/sysctl.conf and then reboot or run the command 'sysctl vm.overcommit_memory=1' for this to take effect.
+# Moon vs Redis Benchmark
+
+**Date:** 2026-06-17
+**Redis:** 7.0.15
+**Moon:** 4 shard(s)
+**Requests:** 200000 per test, 50 clients
+**Platform:** Linux x86_64 / Ubuntu 24.04.4 LTS
+
+## Core Commands (p=1, 50 clients)
+
+| Command                        |    Redis RPS |     Moon RPS |   Ratio |
+|--------------------------------|--------------|--------------|---------|
+| PING inline                    |    132890.36 |    101112.23 |   0.76x |
+| PING mbulk                     |    132187.70 |    100200.40 |   0.76x |
+| SET                            |    132626.00 |    105152.48 |   0.79x |
+| GET                            |    134408.59 |    105429.62 |   0.78x |
+| INCR                           |    134048.27 |    106666.66 |   0.80x |
+| MSET (10 keys)                 |    143163.92 |     91157.70 |   0.64x |
+| LPUSH                          |    134861.77 |    106100.80 |   0.79x |
+| RPUSH                          |    132275.14 |    105708.25 |   0.80x |
+| LPOP                           |    132275.14 |    107700.59 |   0.81x |
+| RPOP                           |    132714.00 |    105596.62 |   0.80x |
+| LRANGE 100                     |    132802.12 |    105374.08 |   0.79x |
+| LRANGE 300                     |    132978.73 |    104821.80 |   0.79x |
+| LRANGE 500                     |    131752.31 | 95283.47
+21365.24 | 95283.47x |
+| LRANGE 600                     |    133422.28 |    106382.98 |   0.80x |
+| SADD                           |    131147.55 |    106269.93 |   0.81x |
+| SPOP                           |    130039.02 |    104602.52 |   0.80x |
+| HSET                           |    131406.05 |    106382.98 |   0.81x |
+| ZADD                           |    134318.34 |    104931.80 |   0.78x |
+| ZPOPMIN                        |    134318.34 |    105708.25 |   0.79x |
+
+## Pipeline Scaling (SET)
+
+| Pipeline Depth                 |    Redis RPS |     Moon RPS |   Ratio |
+|--------------------------------|--------------|--------------|---------|
+| SET p=1                        |    133779.27 |    105820.11 |   0.79x |
+| SET p=2                        |    271370.44 |    210970.47 |   0.78x |
+| SET p=4                        |    549450.56 |    411522.62 |   0.75x |
+| SET p=8                        |    990099.00 |    793650.75 |   0.80x |
+| SET p=16                       |   1379310.38 |   1941747.62 |   1.41x |
+| SET p=32                       |   1754386.00 |   2631579.00 |   1.50x |
+| SET p=64                       |   1980198.00 |   3278688.50 |   1.66x |
+| SET p=128                      |   2174608.75 |   3637527.25 |   1.67x |
+
+## Pipeline Scaling (GET)
+
+| Pipeline Depth                 |    Redis RPS |     Moon RPS |   Ratio |
+|--------------------------------|--------------|--------------|---------|
+| GET p=1                        |    130975.77 |    103842.16 |   0.79x |
+| GET p=2                        |    263157.91 |    210084.03 |   0.80x |
+| GET p=4                        |    542005.44 |    409836.06 |   0.76x |
+| GET p=8                        |   1063829.88 |    711743.81 |   0.67x |
+| GET p=16                       |   1626016.25 |   1526717.62 |   0.94x |
+| GET p=32                       |   2083333.38 |   2739726.00 |   1.32x |
+| GET p=64                       |   2469135.75 |   4651162.50 |   1.88x |
+| GET p=128                      |   2740602.75 |   8002560.00 |   2.92x |
+
+## Data Size Scaling (SET)
+
+| Value Size                     |    Redis RPS |     Moon RPS |   Ratio |
+|--------------------------------|--------------|--------------|---------|
+| SET 8B                         |    134861.77 |    104821.80 |   0.78x |
+| SET 64B                        |    133600.53 |    104931.80 |   0.79x |
+| SET 256B                       |    134861.77 |    104493.20 |   0.77x |
+| SET 1024B                      |    131319.77 |     99900.09 |   0.76x |
+| SET 4096B                      |    123076.92 |     97323.60 |   0.79x |
+| SET 16384B                     |    101832.99 |    103680.66 |   1.02x |
+| SET 65536B                     |     51321.53 |     32035.88 |   0.62x |
+
+## Data Size Scaling (GET)
+
+| Value Size                     |    Redis RPS |     Moon RPS |   Ratio |
+|--------------------------------|--------------|--------------|---------|
+| GET 8B                         |    133779.27 |    104766.89 |   0.78x |
+| GET 64B                        |    131926.12 |    105820.11 |   0.80x |
+| GET 256B                       |    130804.45 |    104329.68 |   0.80x |
+| GET 1024B                      |    130378.09 |     95648.01 |   0.73x |
+| GET 4096B                      |    127713.92 |    100857.28 |   0.79x |
+| GET 16384B                     |    103950.10 |     90620.75 |   0.87x |
+| GET 65536B                     |     49714.15 |     46339.20 |   0.93x |
+
+## Connection Scaling (SET)
+
+| Clients                        |    Redis RPS |     Moon RPS |   Ratio |
+|--------------------------------|--------------|--------------|---------|
+| SET c=1                        |     41806.02 |     41902.37 |   1.00x |
+| SET c=10                       |    136892.55 |    100704.94 |   0.74x |
+| SET c=50                       |    132626.00 |    106382.98 |   0.80x |
+| SET c=100                      |    132100.39 |     94517.96 |   0.72x |
+| SET c=200                      |    132450.33 |    103519.66 |   0.78x |
+| SET c=500                      |    125549.27 |     85543.20 |   0.68x |
+
+---
+*Generated by bench-compare.sh*
+14168:signal-handler (1781686765) Received SIGTERM scheduling shutdown...
+14168:M 17 Jun 2026 08:59:25.648 # User requested shutdown...
+14168:M 17 Jun 2026 08:59:25.648 # Redis is now ready to exit, bye bye...
+########## COMPARE shards=4 END ##########
+
+########## COMPARE shards=12 START (req=200000, AOF off) ##########
+15159:C 17 Jun 2026 08:59:27.685 # oO0OoO0OoO0Oo Redis is starting oO0OoO0OoO0Oo
+15159:C 17 Jun 2026 08:59:27.685 # Redis version=7.0.15, bits=64, commit=00000000, modified=0, pid=15159, just started
+15159:C 17 Jun 2026 08:59:27.685 # Configuration loaded
+15159:M 17 Jun 2026 08:59:27.686 # Server initialized
+15159:M 17 Jun 2026 08:59:27.686 # WARNING Memory overcommit must be enabled! Without it, a background save or replication may fail under low memory condition. Being disabled, it can can also cause failures without low memory condition, see https://github.com/jemalloc/jemalloc/issues/1328. To fix this issue add 'vm.overcommit_memory = 1' to /etc/sysctl.conf and then reboot or run the command 'sysctl vm.overcommit_memory=1' for this to take effect.
+# Moon vs Redis Benchmark
+
+**Date:** 2026-06-17
+**Redis:** 7.0.15
+**Moon:** 12 shard(s)
+**Requests:** 200000 per test, 50 clients
+**Platform:** Linux x86_64 / Ubuntu 24.04.4 LTS
+
+## Core Commands (p=1, 50 clients)
+
+| Command                        |    Redis RPS |     Moon RPS |   Ratio |
+|--------------------------------|--------------|--------------|---------|
+| PING inline                    |    131406.05 |    102986.61 |   0.78x |
+| PING mbulk                     |    128452.15 |    105932.20 |   0.82x |
+| SET                            |    127713.92 |    103680.66 |   0.81x |
+| GET                            |    128865.98 |    105152.48 |   0.82x |
+| INCR                           |    130718.95 |    105596.62 |   0.81x |
+| MSET (10 keys)                 |    140548.14 |     85506.62 |   0.61x |
+| LPUSH                          |    130718.95 |    100603.62 |   0.77x |
+| RPUSH                          |    131926.12 |    105652.41 |   0.80x |
+| LPOP                           |    131752.31 |     95238.10 |   0.72x |
+| RPOP                           |    129366.11 |    102197.24 |   0.79x |
+| LRANGE 100                     |    129115.55 |    106951.88 |   0.83x |
+| LRANGE 300                     |    129870.13 |    103680.66 |   0.80x |
+| LRANGE 500                     |    132714.00 |    104384.13 |   0.79x |
+| LRANGE 600                     |    130975.77 |    106609.80 |   0.81x |
+| SADD                           |    128783.00 |    104058.27 |   0.81x |
+| SPOP                           |    131665.56 |    105540.90 |   0.80x |
+| HSET                           |    132275.14 |    105042.02 |   0.79x |
+| ZADD                           |    128865.98 |    105042.02 |   0.82x |
+| ZPOPMIN                        |    130548.30 |    105042.02 |   0.80x |
+
+## Pipeline Scaling (SET)
+
+| Pipeline Depth                 |    Redis RPS |     Moon RPS |   Ratio |
+|--------------------------------|--------------|--------------|---------|
+| SET p=1                        |    128783.00 |     98522.17 |   0.77x |
+| SET p=2                        |    269541.78 |    207253.89 |   0.77x |
+| SET p=4                        |    550964.19 |    404858.31 |   0.73x |
+| SET p=8                        |    961538.44 |    819672.12 |   0.85x |
+| SET p=16                       |   1351351.38 |   1904762.00 |   1.41x |
+| SET p=32                       |   1724138.00 |   2597402.50 |   1.51x |
+| SET p=64                       |   1754386.00 |   2702702.75 |   1.54x |
+| SET p=128                      |   2041469.50 |   3572571.25 |   1.75x |
+
+## Pipeline Scaling (GET)
+
+| Pipeline Depth                 |    Redis RPS |     Moon RPS |   Ratio |
+|--------------------------------|--------------|--------------|---------|
+| GET p=1                        |    126422.25 |    103519.66 |   0.82x |
+| GET p=2                        |    261780.11 |    207900.20 |   0.79x |
+| GET p=4                        |    537634.38 |    417536.53 |   0.78x |
+| GET p=8                        |   1092896.12 |    793650.75 |   0.73x |
+| GET p=16                       |   1562499.88 |   1492537.25 |   0.96x |
+| GET p=32                       |   2105263.25 |   2777778.00 |   1.32x |
+| GET p=64                       |   2439024.25 |   4651162.50 |   1.91x |
+| GET p=128                      |   2740602.75 |   7694769.00 |   2.81x |
+
+## Data Size Scaling (SET)
+
+| Value Size                     |    Redis RPS |     Moon RPS |   Ratio |
+|--------------------------------|--------------|--------------|---------|
+| SET 8B                         |    130208.34 |    103896.11 |   0.80x |
+| SET 64B                        |    128205.13 |    104275.29 |   0.81x |
+| SET 256B                       |    131578.95 |    105429.62 |   0.80x |
+| SET 1024B                      |    128205.13 |    103412.62 |   0.81x |
+| SET 4096B                      |    118906.06 |     95969.28 |   0.81x |
+| SET 16384B                     |     99206.34 |     94161.95 |   0.95x |
+| SET 65536B                     |     49419.32 |     33715.44 |   0.68x |
+
+## Data Size Scaling (GET)
+
+| Value Size                     |    Redis RPS |     Moon RPS |   Ratio |
+|--------------------------------|--------------|--------------|---------|
+| GET 8B                         |    129449.84 |    104547.83 |   0.81x |
+| GET 64B                        |    128287.36 |    104657.25 |   0.82x |
+| GET 256B                       |    127877.23 |    104493.20 |   0.82x |
+| GET 1024B                      |    127145.59 |    104438.64 |   0.82x |
+| GET 4096B                      |    123456.79 |     97228.98 |   0.79x |
+| GET 16384B                     |    103359.18 |     81699.35 |   0.79x |
+| GET 65536B                     |     49261.09 |     45829.52 |   0.93x |
+
+## Connection Scaling (SET)
+
+| Clients                        |    Redis RPS |     Moon RPS |   Ratio |
+|--------------------------------|--------------|--------------|---------|
+| SET c=1                        |     41631.97 |     42140.75 |   1.01x |
+| SET c=10                       |    130890.05 |    105318.59 |   0.80x |
+| SET c=50                       |    130123.62 |    105152.48 |   0.81x |
+| SET c=100                      |    128700.12 |    105042.02 |   0.82x |
+| SET c=200                      |    126742.72 |    104384.13 |   0.82x |
+| SET c=500                      |    122699.39 |     98231.83 |   0.80x |
+
+---
+*Generated by bench-compare.sh*
+15159:signal-handler (1781687013) Received SIGTERM scheduling shutdown...
+15159:M 17 Jun 2026 09:03:33.661 # User requested shutdown...
+15159:M 17 Jun 2026 09:03:33.661 # Redis is now ready to exit, bye bye...
+########## COMPARE shards=12 END ##########
+
+########## PRODUCTION shards=1 START (dur=12s, AOF off) ##########
+# Production Benchmark: moon vs Redis 7.0.15
+
+**Date:** 2026-06-17 09:03
+**Machine:** x86_64
+**Redis:** 7.0.15
+**moon:** 1 shard(s), Tokio runtime
+**Tool:** redis-benchmark (co-located)
+**Requests:** 200000 per test
+
+---
+
+### Session Store (80% GET / 15% SET / 5% DEL)
+
+| Operation | Redis | moon | Ratio |
+|-----------|------:|----------:|------:|
+| GET (session check, p=1) | 137551 | 106723 | 0.78x |
+| SET (login, 512B, p=1) | 135593 | 104438 | 0.77x |
+| GET (batch check, p=8) | 743494 | 952381 | 1.28x |
+| GET p50 latency | 0.191ms | 0.247ms | |
+
+### Rate Limiter (INCR + EXPIRE pattern)
+
+| Operation | Redis | moon | Ratio |
+|-----------|------:|----------:|------:|
+| INCR (p=1, 100 clients) | 134680 | 107469 | 0.80x |
+| INCR (p=16, 100 clients) | 1418439 | 917431 | 0.65x |
+| INCR (p=1, 200 clients) | 134952 | 109829 | 0.81x |
+| INCR p50 latency | 0.383ms | 0.479ms | |
+
+### Leaderboard (Sorted Sets)
+
+| Operation | Redis | moon | Ratio |
+|-----------|------:|----------:|------:|
+| ZADD (score update, p=1) | 140646 | 123533 | 0.88x |
+| ZADD (batch ingest, p=16) | 677966 | 441501 | 0.65x |
+| ZPOPMIN (top-of-board, p=1) | 131578 | 105263 | 0.80x |
+| ZPOPMIN p50 latency | 0.199ms | 0.247ms | |
+
+### Cache Layer (1KB-4KB values, 90% GET / 10% SET)
+
+| Operation | Redis | moon | Ratio |
+|-----------|------:|----------:|------:|
+| GET 1KB (cache hit, p=1) | 136054 | 105820 | 0.78x |
+| SET 4KB (cache populate, p=1) | 126262 | 100603 | 0.80x |
+| GET 4KB (batch warm, p=16) | 518134 | 613496 | 1.18x |
+| MSET 10x1KB (batch update) | 117647 | 91743 | 0.78x |
+| GET 1KB p50 latency | 0.191ms | 0.247ms | |
+
+### Job Queue (LPUSH/RPOP producer-consumer)
+
+| Operation | Redis | moon | Ratio |
+|-----------|------:|----------:|------:|
+| LPUSH (enqueue 256B, p=1) | 138121 | 107469 | 0.78x |
+| RPOP (dequeue, p=1) | 136518 | 107469 | 0.79x |
+| LPUSH (batch enqueue, p=16) | 995024 | 833333 | 0.84x |
+| RPOP (batch dequeue, p=16) | 1052631 | 943396 | 0.90x |
+
+### Hash Objects (user profiles, config store)
+
+| Operation | Redis | moon | Ratio |
+|-----------|------:|----------:|------:|
+| HSET (field update, p=1) | 132100 | 105876 | 0.80x |
+| HSET (batch update, p=16) | 1273885 | 829875 | 0.65x |
+| SPOP (random sample, p=1) | 133868 | 106837 | 0.80x |
+
+### Connection Scaling (1 → 500 clients)
+
+| Clients | Redis SET/s | moon SET/s | Ratio | Redis p50 | moon p50 |
+|--------:|----------:|----------------:|------:|----------:|---------------:|
+| 1 | 40791 | 42480 | 1.04x | 0.023ms | 0.023ms |
+| 10 | 135869 | 106269 | 0.78x | 0.047ms | 0.055ms |
+| 50 | 136147 | 107066 | 0.79x | 0.191ms | 0.239ms |
+| 100 | 132978 | 107411 | 0.81x | 0.383ms | 0.471ms |
+| 200 | 134861 | 107181 | 0.79x | 0.751ms | 0.943ms |
+| 500 | 129701 | 103519 | 0.80x | 1.927ms | 2.423ms |
+
+### Data Size Scaling (8B → 64KB)
+
+| Value Size | Redis SET/s | moon SET/s | Ratio | Redis GET/s | moon GET/s | Ratio |
+|-----------:|----------:|----------------:|------:|----------:|----------------:|------:|
+| 8B | 134589 | 105820 | 0.79x | 134408 | 106044 | 0.79x |
+| 64B | 134952 | 106044 | 0.79x | 134770 | 101317 | 0.75x |
+| 256B | 137174 | 107526 | 0.78x | 134952 | 106044 | 0.79x |
+| 1KB | 134770 | 103734 | 0.77x | 135135 | 105820 | 0.78x |
+| 4KB | 129533 | 98231 | 0.76x | 131752 | 102354 | 0.78x |
+| 16KB | 108225 | 88417 | 0.82x | 105932 | 91324 | 0.86x |
+| 64KB | 53619 | 29620 | 0.55x | 46125 | 44662 | 0.97x |
+
+### Memory Efficiency
+
+| Dataset | Redis RSS | moon RSS | Ratio | Per-Key Redis | Per-Key moon |
+|--------:|----------:|---------------:|------:|--------------:|-------------------:|
+| 10K keys | 12364 KB | 129960 KB | 0.10x | 231 B | N/A B |
+| 50K keys | 22412 KB | 92844 KB | 0.24x | 221 B | N/A B |
+| 100K keys | 34928 KB | 46428 KB | 0.75x | 230 B | N/A B |
+
+### Pipeline Depth Scaling
+
+| Pipeline | Redis SET/s | moon SET/s | Ratio | Redis GET/s | moon GET/s | Ratio |
+|---------:|----------:|----------------:|------:|----------:|----------------:|------:|
+| 1 | 135226 | 107353 | 0.79x | 136518 | 107642 | 0.79x |
+| 2 | 269905 | 212992 | 0.79x | 268456 | 212089 | 0.79x |
+| 4 | 568181 | 416666 | 0.73x | 539083 | 420168 | 0.78x |
+| 8 | 980392 | 806451 | 0.82x | 1098901 | 816326 | 0.74x |
+| 16 | 1379310 | 2020202 | 1.46x | 1600000 | 1538461 | 0.96x |
+| 32 | 1739130 | 2739726 | 1.58x | 2105263 | 2777778 | 1.32x |
+| 64 | 1980198 | 3333333 | 1.68x | 2469135 | 4651162 | 1.88x |
+| 128 | 2174608 | 3774792 | 1.74x | 2740602 | 7694769 | 2.81x |
+
+---
+
+*Generated by bench-production.sh*
+########## PRODUCTION shards=1 END ##########
+
+########## PRODUCTION shards=12 START (dur=12s, AOF off) ##########
+# Production Benchmark: moon vs Redis 7.0.15
+
+**Date:** 2026-06-17 09:05
+**Machine:** x86_64
+**Redis:** 7.0.15
+**moon:** 12 shard(s), Tokio runtime
+**Tool:** redis-benchmark (co-located)
+**Requests:** 200000 per test
+
+---
+
+### Session Store (80% GET / 15% SET / 5% DEL)
+
+| Operation | Redis | moon | Ratio |
+|-----------|------:|----------:|------:|
+| GET (session check, p=1) | 134861 | 61900 | 0.46x |
+| SET (login, 512B, p=1) | 137457 | 63091 | 0.46x |
+| GET (batch check, p=8) | 716845 | 472813 | 0.66x |
+| GET p50 latency | 0.191ms | 0.527ms | |
+
+### Rate Limiter (INCR + EXPIRE pattern)
+
+| Operation | Redis | moon | Ratio |
+|-----------|------:|----------:|------:|
+| INCR (p=1, 100 clients) | 126742 | 74266 | 0.59x |
+| INCR (p=16, 100 clients) | 1360544 | 858369 | 0.63x |
+| INCR (p=1, 200 clients) | 130975 | 74460 | 0.57x |
+| INCR p50 latency | 0.407ms | 0.751ms | |
+
+### Leaderboard (Sorted Sets)
+
+| Operation | Redis | moon | Ratio |
+|-----------|------:|----------:|------:|
+| ZADD (score update, p=1) | 139470 | 135593 | 0.97x |
+| ZADD (batch ingest, p=16) | 649350 | 414078 | 0.64x |
+| ZPOPMIN (top-of-board, p=1) | 129449 | 91324 | 0.71x |
+| ZPOPMIN p50 latency | 0.199ms | 0.279ms | |
+
+### Cache Layer (1KB-4KB values, 90% GET / 10% SET)
+
+| Operation | Redis | moon | Ratio |
+|-----------|------:|----------:|------:|
+| GET 1KB (cache hit, p=1) | 134318 | 65040 | 0.48x |
+| SET 4KB (cache populate, p=1) | 123456 | 59523 | 0.48x |
+| GET 4KB (batch warm, p=16) | 465116 | 469483 | 1.01x |
+| MSET 10x1KB (batch update) | 116959 | 76045 | 0.65x |
+| GET 1KB p50 latency | 0.191ms | 0.479ms | |
+
+### Job Queue (LPUSH/RPOP producer-consumer)
+
+| Operation | Redis | moon | Ratio |
+|-----------|------:|----------:|------:|
+| LPUSH (enqueue 256B, p=1) | 135409 | 106609 | 0.79x |
+| RPOP (dequeue, p=1) | 131406 | 105820 | 0.81x |
+| LPUSH (batch enqueue, p=16) | 1041666 | 809716 | 0.78x |
+| RPOP (batch dequeue, p=16) | 985221 | 854700 | 0.87x |
+
+### Hash Objects (user profiles, config store)
+
+| Operation | Redis | moon | Ratio |
+|-----------|------:|----------:|------:|
+| HSET (field update, p=1) | 131926 | 106382 | 0.81x |
+| HSET (batch update, p=16) | 1197604 | 706713 | 0.59x |
+| SPOP (random sample, p=1) | 128783 | 99900 | 0.78x |
+
+### Connection Scaling (1 → 500 clients)
+
+| Clients | Redis SET/s | moon SET/s | Ratio | Redis p50 | moon p50 |
+|--------:|----------:|----------------:|------:|----------:|---------------:|
+| 1 | 41519 | 41736 | 1.01x | 0.023ms | 0.023ms |
+| 10 | 132538 | 106439 | 0.80x | 0.047ms | 0.055ms |
+| 50 | 133244 | 105429 | 0.79x | 0.199ms | 0.247ms |
+| 100 | 130208 | 103896 | 0.80x | 0.391ms | 0.479ms |
+| 200 | 130208 | 104329 | 0.80x | 0.775ms | 0.959ms |
+| 500 | 123915 | 99453 | 0.80x | 2.023ms | 2.495ms |
+
+### Data Size Scaling (8B → 64KB)
+
+| Value Size | Redis SET/s | moon SET/s | Ratio | Redis GET/s | moon GET/s | Ratio |
+|-----------:|----------:|----------------:|------:|----------:|----------------:|------:|
+| 8B | 131926 | 63371 | 0.48x | 130208 | 63775 | 0.49x |
+| 64B | 130378 | 68681 | 0.53x | 130718 | 63011 | 0.48x |
+| 256B | 131578 | 63291 | 0.48x | 132450 | 64020 | 0.48x |
+| 1KB | 131061 | 63532 | 0.48x | 132450 | 64143 | 0.48x |
+| 4KB | 125313 | 62617 | 0.50x | 127877 | 60753 | 0.48x |
+| 16KB | 101832 | 50607 | 0.50x | 102459 | 51813 | 0.51x |
+| 64KB | 51519 | 32268 | 0.63x | 45146 | 30129 | 0.67x |
+
+### Memory Efficiency
+
+| Dataset | Redis RSS | moon RSS | Ratio | Per-Key Redis | Per-Key moon |
+|--------:|----------:|---------------:|------:|--------------:|-------------------:|
+| 10K keys | 12352 KB | 438668 KB | 0.03x | 238 B | N/A B |
+| 50K keys | 22348 KB | 264460 KB | 0.08x | 229 B | N/A B |
+| 100K keys | 34900 KB | 118312 KB | 0.29x | 235 B | N/A B |
+
+### Pipeline Depth Scaling
+
+| Pipeline | Redis SET/s | moon SET/s | Ratio | Redis GET/s | moon GET/s | Ratio |
+|---------:|----------:|----------------:|------:|----------:|----------------:|------:|
+| 1 | 131319 | 105318 | 0.80x | 130804 | 106213 | 0.81x |
+| 2 | 264200 | 209205 | 0.79x | 262812 | 210526 | 0.80x |
+| 4 | 540540 | 410677 | 0.76x | 531914 | 414937 | 0.78x |
+| 8 | 970873 | 793650 | 0.82x | 1075268 | 800000 | 0.74x |
+| 16 | 1351351 | 1886792 | 1.40x | 1587301 | 1515151 | 0.95x |
+| 32 | 1724138 | 2061855 | 1.20x | 2105263 | 2777778 | 1.32x |
+| 64 | 1980198 | 3076923 | 1.55x | 2469135 | 3448276 | 1.40x |
+| 128 | 2105936 | 3226838 | 1.53x | 2703567 | 7409777 | 2.74x |
+
+---
+
+*Generated by bench-production.sh*
+########## PRODUCTION shards=12 END ##########
+================ WIDER BENCH DONE · arch=x86_64 · Wed Jun 17 09:07:56 UTC 2026 ================
