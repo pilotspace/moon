@@ -5,8 +5,9 @@ use std::path::Path;
 
 use memmap2::Mmap;
 use roaring::RoaringBitmap;
+use smallvec::SmallVec;
 
-use super::{CsrError, compute_csr_checksum, read4, read8};
+use super::{CsrError, IncomingIndex, compute_csr_checksum, parse_label_overflow, read4, read8};
 use crate::graph::index::{EdgeTypeIndex, LabelIndex, MphNodeIndex};
 use crate::graph::types::{EdgeMeta, GraphSegmentHeader, NodeKey, NodeMeta};
 
@@ -40,8 +41,17 @@ pub struct MmapCsrSegment {
     pub node_id_to_row: HashMap<NodeKey, u32>,
     pub mph: MphNodeIndex,
     pub label_index: LabelIndex,
+    /// Sparse node label overflow (CSR row -> labels >= 32), parsed into an
+    /// OWNED map at load — NOT zero-copied from the mmap, because the section is
+    /// variable-length (the raw-pointer fields stay fixed-stride casts). Empty
+    /// for version <= 3 files. `LabelIndex` is built from this and the bitmap.
+    pub label_overflow: HashMap<u32, SmallVec<[u16; 4]>>,
     pub edge_type_index: EdgeTypeIndex,
     pub created_lsn: u64,
+    /// Lazily-built reverse (incoming) adjacency, DERIVED from the mmap'd forward
+    /// arrays. NOT part of the on-disk format — rebuilt on the first Incoming/Both
+    /// query. (v3-2 graph-incoming-edges.)
+    pub incoming: std::sync::OnceLock<IncomingIndex>,
 }
 
 // SAFETY: MmapCsrSegment contains raw pointers into an immutable Mmap region.
@@ -98,6 +108,13 @@ impl MmapCsrSegment {
         // Version 3+: byte offset of the per-edge created_ms section (informational).
         let ecms_offset = if version >= 3 {
             u64::from_le_bytes(read8(data, 80)?)
+        } else {
+            0
+        };
+        // Version 4+: byte offset of the node label-overflow section (informational;
+        // parsed positionally after edge_created_ms below).
+        let lov_offset = if version >= 4 {
+            u64::from_le_bytes(read8(data, 88)?)
         } else {
             0
         };
@@ -248,8 +265,19 @@ impl MmapCsrSegment {
             sorted_keys.push(nk);
         }
 
+        // Parse the node label-overflow section (version >= 4) into an OWNED map
+        // (A1: NOT zero-copied — the section is variable-length, unlike the
+        // fixed-stride raw-cast arrays). It begins right after edge_created_ms;
+        // reuse the shared bounds-checked parser (errors, never panics).
+        let label_overflow = if version >= 4 {
+            let overflow_start = nm_start + nc * nm_elem_size + ec * ecms_elem_size;
+            parse_label_overflow(data, overflow_start, node_count)?
+        } else {
+            HashMap::new()
+        };
+
         let mph = MphNodeIndex::build(&sorted_keys);
-        let label_index = LabelIndex::build(node_meta_slice);
+        let label_index = LabelIndex::build(node_meta_slice, &label_overflow);
         let edge_type_index = EdgeTypeIndex::build(edge_meta_slice);
 
         // Initialize validity bitmap: all edges valid.
@@ -272,6 +300,7 @@ impl MmapCsrSegment {
             created_lsn,
             checksum: stored_checksum,
             edge_created_ms_offset: ecms_offset,
+            label_overflow_offset: lov_offset,
         };
 
         Ok(Self {
@@ -291,8 +320,10 @@ impl MmapCsrSegment {
             node_id_to_row,
             mph,
             label_index,
+            label_overflow,
             edge_type_index,
             created_lsn,
+            incoming: std::sync::OnceLock::new(),
         })
     }
 

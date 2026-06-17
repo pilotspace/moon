@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use ordered_float::OrderedFloat;
 use roaring::RoaringBitmap;
+use smallvec::SmallVec;
 
 use crate::graph::types::{EdgeMeta, NodeKey, NodeMeta};
 
@@ -18,8 +19,10 @@ use crate::graph::types::{EdgeMeta, NodeKey, NodeMeta};
 
 /// Per-label Roaring bitmap mapping label ID -> set of CSR row indices.
 ///
-/// Built during CSR construction from `NodeMeta::label_bitmap`.
-/// Supports up to 32 labels (matching the 32-bit label bitmap in NodeMeta).
+/// Built during CSR construction from two sources: each node's `label_bitmap`
+/// (the u32 fast path for labels 0-31) AND the per-segment `label_overflow`
+/// map (labels >= 32, version >= 4). Together they index every `u16` label id,
+/// so `nodes_with_label` resolves all labels without the historical 32 cap.
 #[derive(Debug, Clone)]
 pub struct LabelIndex {
     /// label_id -> bitmap of node row indices carrying that label.
@@ -27,11 +30,14 @@ pub struct LabelIndex {
 }
 
 impl LabelIndex {
-    /// Build a label index from CSR node metadata.
+    /// Build a label index from CSR node metadata and the label-overflow map.
     ///
     /// Iterates once over `node_meta`, extracting set bits from each node's
-    /// `label_bitmap` and inserting the row index into the corresponding bitmap.
-    pub fn build(node_meta: &[NodeMeta]) -> Self {
+    /// `label_bitmap` (labels 0-31), then folds in `overflow` (row -> labels of
+    /// id 32 and up) so every `u16` label id is matchable. `overflow` is keyed
+    /// by the same CSR row index as `node_meta`; pass an empty map for segments
+    /// with no labels of id 32 or higher (version 3 and earlier, or sparse).
+    pub fn build(node_meta: &[NodeMeta], overflow: &HashMap<u32, SmallVec<[u16; 4]>>) -> Self {
         let mut labels: HashMap<u16, RoaringBitmap> = HashMap::new();
         for (row, meta) in node_meta.iter().enumerate() {
             let mut bitmap = meta.label_bitmap;
@@ -42,6 +48,15 @@ impl LabelIndex {
                     .or_insert_with(RoaringBitmap::new)
                     .insert(row as u32);
                 bitmap &= bitmap - 1; // clear lowest set bit
+            }
+        }
+        // Fold in labels >= 32 from the overflow store (sparse, keyed by row).
+        for (&row, label_ids) in overflow {
+            for &label in label_ids {
+                labels
+                    .entry(label)
+                    .or_insert_with(RoaringBitmap::new)
+                    .insert(row);
             }
         }
         labels.shrink_to_fit();
@@ -346,7 +361,7 @@ mod tests {
             },
         ];
 
-        let idx = LabelIndex::build(&node_meta);
+        let idx = LabelIndex::build(&node_meta, &HashMap::new());
         assert_eq!(idx.label_count(), 3); // labels 0, 1, 2
 
         // Label 0: rows 0, 2
@@ -376,7 +391,7 @@ mod tests {
 
     #[test]
     fn test_label_index_empty() {
-        let idx = LabelIndex::build(&[]);
+        let idx = LabelIndex::build(&[], &HashMap::new());
         assert!(idx.is_empty());
         assert_eq!(idx.label_count(), 0);
     }
@@ -392,7 +407,7 @@ mod tests {
             valid_from: 0,
             valid_to: i64::MAX,
         }];
-        let idx = LabelIndex::build(&node_meta);
+        let idx = LabelIndex::build(&node_meta, &HashMap::new());
         assert!(idx.is_empty());
     }
 

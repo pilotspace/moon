@@ -1,7 +1,7 @@
 {
   "project": "moon",
   "stage": "production",
-  "active_task": "fts-query-routing-robustness",
+  "active_task": "graph-label-bitmap-overflow",
   "active_milestone": "v3-1-fts-hardening",
   "tasks": {
     "hotpath-lock-quickwins": {
@@ -155,6 +155,36 @@
       "created": "2026-06-16T13:14:26+00:00",
       "updated": "2026-06-16T13:41:08+00:00",
       "flag_verified": true
+    },
+    "graph-cypher-inline-filter": {
+      "title": "Cypher MATCH narrows on inline node-property predicate (no label full-scan)",
+      "phase": "done",
+      "gate": "PASS",
+      "milestone": "v3-2-graph-correctness",
+      "depends_on": [],
+      "created": "2026-06-16T14:37:40+00:00",
+      "updated": "2026-06-16T16:07:31+00:00",
+      "flag_verified": true
+    },
+    "graph-incoming-edges": {
+      "title": "CSR traversal returns Incoming / Both-direction edges post-compaction",
+      "phase": "done",
+      "gate": "PASS",
+      "milestone": "v3-2-graph-correctness",
+      "depends_on": [],
+      "created": "2026-06-16T16:10:49+00:00",
+      "updated": "2026-06-16T16:41:54+00:00",
+      "flag_verified": true
+    },
+    "graph-label-bitmap-overflow": {
+      "title": "Node label storage supports label ids >= 32 without silent truncation",
+      "phase": "done",
+      "gate": "PASS",
+      "milestone": "v3-2-graph-correctness",
+      "depends_on": [],
+      "created": "2026-06-16T16:43:09+00:00",
+      "updated": "2026-06-17T01:47:24+00:00",
+      "flag_verified": true
     }
   },
   "milestones": {
@@ -194,9 +224,9 @@
       "title": "Graph Correctness & Cypher Filtering",
       "goal": "Moon's graph queries are correct: Cypher MATCH narrows on inline node-property predicates instead of full-scanning the label, directional traversal covers incoming/Both edges post-compaction, and node labels >= 32 are no longer silently dropped.",
       "stage": "production",
-      "status": "planned",
+      "status": "done",
       "created": "2026-06-16T04:42:42+00:00",
-      "updated": "2026-06-16T04:42:42+00:00"
+      "updated": "2026-06-17T01:48:51+00:00"
     },
     "v3-3-vector-kv-polish": {
       "title": "Vector & KV Latent-Correctness + Hot-Path Polish",
@@ -208,7 +238,7 @@
     }
   },
   "created": "2026-06-11T03:18:21+00:00",
-  "updated": "2026-06-16T14:23:36+00:00",
+  "updated": "2026-06-17T01:48:51+00:00",
   "setup": {
     "locked": true,
     "locked_at": "2026-06-11T03:28:00+00:00",

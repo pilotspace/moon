@@ -371,13 +371,23 @@ fn compile_match(m: &MatchClause, ops: &mut Vec<PhysicalOp>) -> Result<(), PlanE
 
         // First node becomes a scan.
         let first = &pattern.nodes[0];
+        let first_var = first
+            .variable
+            .clone()
+            .unwrap_or_else(|| "_anon".to_string());
         ops.push(PhysicalOp::NodeScan {
-            variable: first
-                .variable
-                .clone()
-                .unwrap_or_else(|| "_anon".to_string()),
+            variable: first_var.clone(),
             label: first.labels.first().cloned(),
         });
+        // Inline node properties `(v {k:e, …})` become an equality-conjunction
+        // Filter applied right after the op that BINDS the node — here, the
+        // scan. Without this the predicate is silently dropped and the query
+        // returns the whole label's edges (the ≈|E| full-scan bug).
+        if !first.properties.is_empty() {
+            ops.push(PhysicalOp::Filter {
+                expr: properties_to_filter(&first_var, &first.properties),
+            });
+        }
 
         // Subsequent node+edge pairs become expands.
         for (i, edge) in pattern.edges.iter().enumerate() {
@@ -395,6 +405,10 @@ fn compile_match(m: &MatchClause, ops: &mut Vec<PhysicalOp>) -> Result<(), PlanE
 
             let source_node = &pattern.nodes[i];
             let target = &pattern.nodes[i + 1];
+            let target_var = target
+                .variable
+                .clone()
+                .unwrap_or_else(|| format!("_anon_{}", i + 1));
             let (min_hops, max_hops) = edge.var_length.unwrap_or((1, 1));
             ops.push(PhysicalOp::Expand {
                 source: source_node.variable.clone().unwrap_or_else(|| {
@@ -404,16 +418,21 @@ fn compile_match(m: &MatchClause, ops: &mut Vec<PhysicalOp>) -> Result<(), PlanE
                         format!("_anon_{i}")
                     }
                 }),
-                target: target
-                    .variable
-                    .clone()
-                    .unwrap_or_else(|| format!("_anon_{}", i + 1)),
+                target: target_var.clone(),
                 edge_variable: edge.variable.clone(),
                 edge_types: edge.edge_types.clone(),
                 direction: edge.direction,
                 min_hops,
                 max_hops,
             });
+            // Inline properties on the expanded target node — filter right after
+            // the Expand that BINDS it (after, never before: the var is unbound
+            // until Expand produces it).
+            if !target.properties.is_empty() {
+                ops.push(PhysicalOp::Filter {
+                    expr: properties_to_filter(&target_var, &target.properties),
+                });
+            }
         }
     }
     Ok(())
@@ -467,9 +486,11 @@ fn compile_shortest_path_match(sp: &ShortestPathMatchClause, ops: &mut Vec<Physi
 }
 
 /// Build a filter expression `var.k1 = v1 AND var.k2 = v2 ...` from a
-/// PatternNode's inline property map. Mirrors how existing MATCH patterns
-/// behave, but expressed as a standalone Filter op for ShortestPath
-/// endpoint selection.
+/// PatternNode's inline property map, expressed as a standalone Filter op.
+/// Used to apply inline node-property predicates `(v {k:e, …})` in both
+/// `compile_match` (every inline-propertied pattern node) and
+/// `compile_shortest_path_match` (endpoint selection). Equality semantics
+/// are the existing `Expr`/`Filter` evaluation — no new coercion rules.
 fn properties_to_filter(var: &str, props: &[(String, Expr)]) -> Expr {
     let mut iter = props.iter();
     let first = match iter.next() {
@@ -543,6 +564,110 @@ mod tests {
             plan.operators
                 .iter()
                 .any(|op| matches!(op, PhysicalOp::Filter { .. }))
+        );
+    }
+
+    // ─── graph-cypher-inline-filter (v3-2): inline node-property predicate ─────────
+    // Frozen contract: compile_match emits PhysicalOp::Filter(properties_to_filter(..))
+    // immediately AFTER the op that binds each inline-propertied node. RED until the fix.
+
+    #[test]
+    fn test_inline_prop_emits_filter_after_nodescan() {
+        // M3 — `MATCH (a:Person {id:1})-[]->(b)`: a Filter must immediately follow the NodeScan.
+        let query =
+            parse_cypher(b"MATCH (a:Person {id:1})-[]->(b) RETURN b").expect("parse failed");
+        let plan = compile(&query).expect("compile failed");
+        let ns = plan
+            .operators
+            .iter()
+            .position(|op| matches!(op, PhysicalOp::NodeScan { .. }))
+            .expect("a NodeScan is planned");
+        assert!(
+            matches!(plan.operators.get(ns + 1), Some(PhysicalOp::Filter { .. })),
+            "inline-property Filter must immediately follow the NodeScan; ops = {:?}",
+            plan.operators
+        );
+    }
+
+    #[test]
+    fn test_inline_prop_on_expanded_node_filters_after_expand() {
+        // M2 — `MATCH (a {id:1})-[]->(b {id:3})`: a Filter after the NodeScan AND one after the Expand.
+        let query =
+            parse_cypher(b"MATCH (a {id:1})-[]->(b {id:3}) RETURN b").expect("parse failed");
+        let plan = compile(&query).expect("compile failed");
+        let ns = plan
+            .operators
+            .iter()
+            .position(|op| matches!(op, PhysicalOp::NodeScan { .. }))
+            .expect("a NodeScan is planned");
+        assert!(
+            matches!(plan.operators.get(ns + 1), Some(PhysicalOp::Filter { .. })),
+            "scanned node's inline Filter must follow the NodeScan; ops = {:?}",
+            plan.operators
+        );
+        let ex = plan
+            .operators
+            .iter()
+            .position(|op| matches!(op, PhysicalOp::Expand { .. }))
+            .expect("an Expand is planned");
+        assert!(
+            matches!(plan.operators.get(ex + 1), Some(PhysicalOp::Filter { .. })),
+            "expanded node's inline Filter must follow the Expand; ops = {:?}",
+            plan.operators
+        );
+    }
+
+    #[test]
+    fn test_inline_prop_without_label_emits_filter() {
+        // M4 — `MATCH (a {id:1})`: a Filter is emitted even though the NodeScan label is None.
+        let query = parse_cypher(b"MATCH (a {id:1}) RETURN a").expect("parse failed");
+        let plan = compile(&query).expect("compile failed");
+        assert!(
+            plan.operators
+                .iter()
+                .any(|op| matches!(op, PhysicalOp::Filter { .. })),
+            "label-less inline properties must still produce a Filter; ops = {:?}",
+            plan.operators
+        );
+    }
+
+    #[test]
+    fn test_inline_multi_prop_is_and_conjunction() {
+        // M1 — `{id:1, name:'alice'}`: the Filter expr is an AND of the two equality compares.
+        let query = parse_cypher(b"MATCH (a {id:1, name:'alice'}) RETURN a").expect("parse failed");
+        let plan = compile(&query).expect("compile failed");
+        let expr = plan
+            .operators
+            .iter()
+            .find_map(|op| match op {
+                PhysicalOp::Filter { expr } => Some(expr),
+                _ => None,
+            })
+            .expect("a Filter op is emitted for inline properties");
+        assert!(
+            matches!(
+                expr,
+                Expr::BinaryOp {
+                    op: BinaryOperator::And,
+                    ..
+                }
+            ),
+            "two inline properties must AND-conjoin; expr = {expr:?}"
+        );
+    }
+
+    #[test]
+    fn test_no_inline_prop_emits_no_filter() {
+        // M6 (green-pin) — no inline props and no WHERE ⇒ NO Filter (plan unchanged from today).
+        let query = parse_cypher(b"MATCH (a:Person)-[]->(b) RETURN b").expect("parse failed");
+        let plan = compile(&query).expect("compile failed");
+        assert!(
+            !plan
+                .operators
+                .iter()
+                .any(|op| matches!(op, PhysicalOp::Filter { .. })),
+            "a pattern with no inline properties must add no Filter; ops = {:?}",
+            plan.operators
         );
     }
 
