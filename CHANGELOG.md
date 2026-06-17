@@ -36,6 +36,15 @@ and **adding shards hurts uniform single-key non-pipelined throughput** (12 shar
 `docs/reviews/2026-06-17/WIDER-BENCH.md`. The run also patched a latent unfairness in the
 bench scripts (they start Redis AOF-off but Moon AOF-on, flooding ~1M WARN lines).
 
+### Fixed — bench-compare.sh / bench-production.sh start moon AOF-off to match Redis (fair, no flood) (PR #194)
+
+Both benchmark scripts started Redis in-memory (`--save "" --appendonly no`) but moon with
+persistence defaults (AOF on). Under SET load moon's AOF channel saturated, flooding
+`AOF append dropped … channel full` WARN logs (~1M lines, which also pinned the port so
+later shard configs failed to bind) and unfairly handicapping moon against a no-AOF Redis.
+Both scripts now start moon with `--appendonly no --disk-offload disable` (and redirect its
+stdout/stderr), so the comparison is AOF-off on both sides and the report stays clean.
+
 ### Fixed — Graph node labels with id ≥ 32 are stored, matched, and persisted (no silent truncation) (PR #193)
 
 CSR node labels were packed into a 32-bit `NodeMeta::label_bitmap`, so any label

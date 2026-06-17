@@ -638,7 +638,11 @@ redis-server --port "$PORT_REDIS" --save "" --appendonly no --daemonize yes --lo
 wait_for_server "$PORT_REDIS" "Redis"
 
 log "Starting moon on port $PORT_RUST ($SHARDS shards)..."
-$RUST_BINARY --port "$PORT_RUST" --shards "$SHARDS" &
+# Match Redis's in-memory config (--save "" --appendonly no): disable persistence so the
+# comparison is AOF-off on both sides (Redis above runs no-AOF). Without this, moon runs
+# AOF-on under SET load, saturating its AOF channel (floods "AOF append dropped" WARNs) and
+# is unfairly handicapped. Redirect moon's output to keep the report clean.
+RUST_LOG=warn $RUST_BINARY --port "$PORT_RUST" --shards "$SHARDS" --appendonly no --disk-offload disable >/dev/null 2>&1 &
 RUST_PID=$!
 wait_for_server "$PORT_RUST" "moon"
 

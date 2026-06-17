@@ -92,7 +92,12 @@ redis-server --port "$PORT_REDIS" --save "" --appendonly no --loglevel warning -
 REDIS_PID=$!
 
 log "Starting moon on port $PORT_MOON ($SHARDS shards)..."
-RUST_LOG=warn "$RUST_BINARY" --port "$PORT_MOON" --shards "$SHARDS" --protected-mode no &
+# Match Redis's in-memory config (--save "" --appendonly no): disable persistence so the
+# comparison is AOF-off on both sides. Without this, moon runs AOF-on while Redis does not —
+# under SET load moon's AOF channel saturates, floods "AOF append dropped … channel full"
+# WARN logs (can be ~1M lines), and is unfairly handicapped. Redirect moon's stdout/stderr
+# to keep the benchmark report clean.
+RUST_LOG=warn "$RUST_BINARY" --port "$PORT_MOON" --shards "$SHARDS" --protected-mode no --appendonly no --disk-offload disable >/dev/null 2>&1 &
 MOON_PID=$!
 
 # Wait for servers with retry loop (max 10s)
