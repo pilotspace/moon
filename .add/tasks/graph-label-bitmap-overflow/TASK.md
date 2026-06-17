@@ -353,18 +353,18 @@ SECOND on-disk graph section, factor a shared "trailing version-gated section" w
 task hand-rolled the third such section (edge_created_ms v3, label_overflow v4) by copy-precedent.
 
 ### Competency deltas
-- [TDD · open] A RED/GREEN test that loads via `CsrStorage::from_file` can silently exercise the
+- [TDD · folded] A RED/GREEN test that loads via `CsrStorage::from_file` can silently exercise the
   HEAP loader instead of mmap when node_meta isn't 8-aligned (edgeless nc=2 shape → byte 140) — the
   test passes but never covers the intended mmap path. Assert `matches!(CsrStorage::Mmap(_))` (and
   pick an 8-aligned shape) whenever a test's POINT is the zero-copy path. (evidence:
   test_overflow_survives_mmap_reload fell back to heap until the fixture was corrected; A1 was the
   flagged risk.)
-- [ADD · open] A CONTRACTED on-disk version bump (v3→v4) ripples to pre-existing constant-pinning
+- [ADD · folded] A CONTRACTED on-disk version bump (v3→v4) ripples to pre-existing constant-pinning
   tests (`assert version==3`, byte-stripping helpers). Updating those to the new constant is
   propagation, NOT the forbidden "weaken a test to pass" — but it must be surfaced at the gate, and
   the backward-compat tests must remain (they then positively evidence the M5 compat claim).
   (evidence: 6 `version==3`→`4` + downgrade_to_v2 byte-math, all listed in §5.)
-- [DDD · open] `compact_segments` leaves `node_id_to_row` EMPTY by design (it merges at external_id
+- [DDD · folded] `compact_segments` leaves `node_id_to_row` EMPTY by design (it merges at external_id
   level, not NodeKey) — so `lookup_node` returns None on every compacted segment. Tests/consumers
   that need a post-merge row must locate it by `external_id`, not `lookup_node`. (evidence: the
   compaction test panicked on `lookup_node` before switching to external_id lookup.)
