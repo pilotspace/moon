@@ -52,8 +52,9 @@ The SET absolute number can differ 3-4× between methodologies. Only strict-vs-s
 | Data correctness | **2613+ tests pass** | All types, 1/4/12 shards |
 | Vector insert (384d) | **6–20× RediSearch** | GCloud, 8-thread concurrent, §10.5 |
 | Vector search (384d) | RediSearch ~16× QPS; recall 0.86 vs 0.96 | concurrent vs RediSearch, §10.5 |
-| Full-text search (100K) | low-DF competitive; indexing + high-DF trail RediSearch | vs RediSearch, §12 |
-| Graph build (native API) | **21–26× FalkorDB** | §11.4 (native 1-hop ≈1.2× FalkorDB Cypher) |
+| Full-text search (100K) | counts **exact** vs RediSearch; index ~0.85×, low-DF wins; multi-term QPS trails | vs RediSearch, §12.3 (v3-1 verified) |
+| Graph build (native API) | **21–26× FalkorDB** | §11.5 (native 1-hop ≈1.2× FalkorDB Cypher) |
+| Graph Cypher point-query | **correct + ~28–30×** vs old full-scan; ~4× behind Falkor's indexed scan | §11.5 (v3-2 verified, `match_rows`=Falkor's) |
 
 ---
 
@@ -263,6 +264,21 @@ Graph (`bench-graph-compare.sh --moon-only --nodes 2000`): x86 node 290/s · edg
 - **Strict GET = miss workload** (GET-before-SET ordering); strict SET is the honest distributed-write number (see †).
 - **Per-key memory not recorded** — the harness failed to capture Redis RSS (empty), so no Moon-vs-Redis per-key comparison was possible this run; §3 stands unchanged. Moon-only RSS for ~63K keys (coupon-collector over `-r 100000`) was sane (x86: 32B 24.0 MB, 256B 38.3 MB, 1KB 90.2 MB total incl. ~11 MB base).
 - **Vector harness** is single-connection latency-bound (see §2.8.5).
+
+### 2.9 2026-06-17 KV confirmation (v3-1/v3-2 verified build, `8238515`)
+
+The 4-feature **verified** cross-arch run (KV slice; full report `docs/reviews/2026-06-17/4FEATURE-VERIFIED.md`)
+re-confirmed KV is unaffected by v3-1-fts-hardening / v3-2-graph-correctness (text + graph paths only).
+Moon-fair vs Redis (ratio = Moon/Redis), 8-vCPU c3/t2a, best-of-3:
+
+| arch | mode | GET P64 | SET P64 | GET P16 | SET P16 | GET P1 | SET P1 |
+|------|------|:-------:|:-------:|:-------:|:-------:|:------:|:------:|
+| x86 | loose  | **1.87×** (4.44M) | **1.69×** (2.99M) | 0.96× | **1.43×** | 0.81× | 0.82× |
+| x86 | strict | **1.15×** | **1.14×** | **1.11×** | **1.12×** | 0.83× | 0.77× |
+| ARM | loose  | **1.85×** (2.99M) | **2.05×** (2.50M) | 0.95× | **1.34×** | 0.82× | 0.82× |
+| ARM | strict | **1.27×** | **1.32×** | **1.12×** | **1.19×** | 0.83× | 0.80× |
+
+Within VM variance of §2.8 (x86 loose P64 1.87–1.90×). Moon wins at pipeline depth, loses p=1 (TCP-RTT bound). No regression.
 
 ---
 
@@ -583,6 +599,21 @@ auto-quantization SQ8/TQ trades recall for memory at 384d; CLAUDE.md notes 384d 
 has no `FT.COMPACT` (auto-builds HNSW on insert), so its row is already its HNSW. Detail:
 `docs/reviews/2026-06-16/4FEATURE-BENCH.md`.
 
+### 10.6 2026-06-17 verified re-run (v3-1/v3-2 build `8238515`) — no regression
+
+Re-ran the §10.5 protocol on the verified post-v3-1/v3-2 build to confirm Vector is untouched. Identical
+within VM variance — Vector engine was not changed by either milestone (= the planned **v3-3-vector-kv-polish**
+target). Detail: `docs/reviews/2026-06-17/4FEATURE-VERIFIED.md`.
+
+| metric | x86 Moon | x86 RediSearch | ARM Moon | ARM RediSearch |
+|--------|:--------:|:--------------:|:--------:|:--------------:|
+| Insert/s | **28,136** | 3,750 | **28,343** | 1,906 |
+| Search QPS (HNSW, 8 threads) | 473 | **9,143** | 540 | **6,926** |
+| Recall@10 (HNSW) | 0.858 | **0.961** | 0.858 | **0.961** |
+
+Moon insert **7.5× (x86) / 14.9× (ARM)** faster; RediSearch search ~16× higher QPS at higher recall (the
+SQ8/TQ-at-384d recall trade-off). Unchanged from §10.5 — no v3-1/v3-2 regression.
+
 ---
 
 ## 11. Graph Engine
@@ -634,6 +665,28 @@ Cypher `MATCH (a {id:N})` does not filter on an inline node-property predicate**
 (returns ~all 15K edges vs FalkorDB's correctly-filtered 4), so Moon Cypher point/2-hop queries are slow whole-graph
 scans. **Use `GRAPH.NEIGHBORS` for Moon point lookups, not Cypher.** Detail: `docs/reviews/2026-06-16/4FEATURE-BENCH.md`.
 
+### 11.5 2026-06-17 v3-2 inline-filter VERIFIED (GCloud, build `8238515`)
+
+The v3-2-graph-correctness milestone added the inline `Filter` op so `MATCH (a:N {id:N})` narrows on the
+node-`id` property instead of full-scanning the label (the §11.4 `cypher_match_rows=14991` defect). This run
+**proves it in-harness** — the 2026-06-16 harness filtered on the internal `GRAPH.ADDNODE` handle (a false
+`0`); the corrected harness (`docs/reviews/2026-06-17/gce-4feature-bench.sh`) filters on the `id` property value.
+
+| metric | §11.4 (pre-v3-2) | **2026-06-17 verified** | FalkorDB |
+|--------|:----------------:|:-----------------------:|:--------:|
+| Moon `cypher_match_rows` (x86 & ARM) | 14,991 (full scan) | **4** | 4 |
+| Moon cypher_1hop qps (x86 / ARM) | 40† / 28† | **1,195 (6.68 ms) / 787 (10.15 ms)** | 4,734 / 3,869 |
+| Moon cypher_2hop qps (x86 / ARM) | 13† / 9† | **1,156 (6.92 ms) / 755 (10.33 ms)** | 4,395 / 3,659 |
+| Moon build ops/s (x86 / ARM) | 25,333 / 12,592 | **25,094 / 13,939** | 959 / 604 |
+| Moon native_neighbors qps (x86 / ARM) | 5,671 / 4,474 | **5,650 / 4,442** | — |
+
+**`cypher_match_rows` = 4 on both arches — identical to FalkorDB's filtered 4** (was a 14,991-edge full scan).
+Moon's Cypher point-query is now **correct and ~28–30× faster than its old full-scan self** (2-hop ~84–89×).
+It still trails FalkorDB ~4× because FalkorDB has a **property index** on `id` while Moon does a **filtered
+label scan** — a property index for inline-equality is a legitimate future optimization, explicitly out of
+v3-2 scope. Moon native builds 23–26× faster and native 1-hop edges out FalkorDB Cypher.
+Detail: `docs/reviews/2026-06-17/4FEATURE-VERIFIED.md`.
+
 ---
 
 ## 12. Full-Text Search
@@ -673,6 +726,29 @@ low-cardinality single-term queries** (small posting lists, per-shard lock-free 
 
 These are well-scoped fixes (RoaringBitmap::rank for TF lookup, OR-union, combo-query, count semantics, async
 indexing). See `docs/reviews/2026-06-16/review-fts.md` + `4FEATURE-BENCH.md`.
+
+### 12.3 2026-06-17 v3-1 hardening VERIFIED (GCloud, build `8238515`)
+
+The v3-1-fts-hardening milestone (PRs #190/#192) targeted exactly the §12.2 gaps. This run **confirms every
+one is fixed on both arches** — most importantly, **every Moon `hits` count now equals RediSearch's exactly**
+(the §12.1 OR/TAG/combo counts were broken: 10/10/0). x86 shown; ARM mirrors within ~15%.
+
+| query | §12.1 Moon | **2026-06-17 Moon** | RediSearch | `hits` (Moon = RS) | fix |
+|-------|:----------:|:-------------------:|:----------:|:------------------:|-----|
+| index docs/s | 376 | **15,052** | 18,232 | — | **~40× (O(V) upsert)** |
+| term high-DF (~5k) | 19 (419 ms) | **240 (33 ms)** | 3,791 | 5068 = 5068 | **O(M²) cliff gone** |
+| term mid-DF (~1k) | 429 | **1,416** | 5,293 | 1046 = 1046 | — |
+| term low-DF (~95) | **7,765** | **7,714** | 3,594 | 95 = 95 | **Moon still wins** |
+| OR (`\|`) | 7,686 (hits=10) | 688 | 3,778 | **2072 = 2072** | **union fixed** |
+| TAG `@cat:{}` | 7,791 (hits=10) | 2,227 | 3,367 | **5064 = 5064** | **count fixed** |
+| NUMERIC `@price:[..]` | 107 | 97 | 377 | 10119 = 10119 | correct |
+| TEXT + TAG combo | 12,843 (hits=0) | 270 | 4,314 | **253 = 253** | **combo fixed** |
+
+The §12.1 OR/TAG/combo QPS *looked* fast only because they did no real work (10 or 0 hits — broken). Now that
+they compute the full correct result, the QPS reflects real work; Moon still trails RediSearch on raw
+multi-term QPS but **indexes at near-RediSearch rates and is correct**, and **wins low-DF single-term**. All
+four §12.2 gaps — OR union, TAG/NUMERIC total-match counts, TEXT+TAG combo, O(V) index + O(M²) high-DF — are
+**resolved**. Detail: `docs/reviews/2026-06-17/4FEATURE-VERIFIED.md`.
 
 ---
 
@@ -823,10 +899,11 @@ bash scripts/gcloud-bench-setup.sh
 # Run full benchmark suite (KV + vector + graph)
 bash scripts/run-full-bench.sh
 
-# 4-feature concurrent-vs-competitor pass (KV/Vector/Graph/FTS vs Redis/RediSearch/FalkorDB) — §10.5/§11.4/§12
+# 4-feature concurrent-vs-competitor pass (KV/Vector/Graph/FTS vs Redis/RediSearch/FalkorDB) — §2.9/§10.6/§11.5/§12.3
+# Use the 2026-06-17 harness: graph filters on the `id` PROPERTY value (not the GRAPH.ADDNODE handle), builds MOON_BRANCH (default main).
 # Pulls redis-stack + falkordb Docker images; env-tunable dataset sizes.
-scp docs/reviews/2026-06-16/gce-4feature-bench.sh <instance>:~/ && \
-  ssh <instance> 'VEC_NUM=50000 FTS_NDOC=100000 GRAPH_NN=5000 GRAPH_NE=15000 BENCH_DUR=8 bash ~/gce-4feature-bench.sh'
+scp docs/reviews/2026-06-17/gce-4feature-bench.sh <instance>:~/ && \
+  ssh <instance> 'MOON_BRANCH=main VEC_NUM=50000 FTS_NDOC=100000 GRAPH_NN=5000 GRAPH_NE=15000 BENCH_DUR=8 bash ~/gce-4feature-bench.sh'
 
 # Cleanup
 gcloud compute instances delete moon-bench-x86 --zone=us-central1-a --quiet

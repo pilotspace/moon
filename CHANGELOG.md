@@ -6,6 +6,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Docs — Verified cross-arch GCloud benchmark confirms v3-1 FTS + v3-2 graph fixes (PR #194)
+
+Re-ran the 4-feature concurrent-vs-competitor benchmark (KV / Vector / Graph / FTS
+vs Redis / RediSearch / FalkorDB) on GCloud x86 `c3-standard-8` (Sapphire Rapids) +
+ARM `t2a-standard-8` (Neoverse-N1) against build `8238515`, with the graph harness
+corrected to filter on the node `id` **property value** (not the internal
+`GRAPH.ADDNODE` handle that produced a false `cypher_match_rows=0` in the prior
+re-baseline). Proves **in-harness** that v3-2's inline filter narrows Cypher
+point-queries (`cypher_match_rows` 14991 → **4**, identical to FalkorDB; cypher_1hop
+~28–30× faster than its old full-scan self) and that v3-1's FTS hardening makes every
+query combinator return RediSearch-exact total counts (OR 2072, TAG 5064, TEXT+TAG
+253, NUMERIC 10119) while indexing ~40× faster (376 → 15052 docs/s) with the O(M²)
+high-DF cliff gone (419 ms → 33 ms). KV and Vector unchanged (no regression). Folded
+as layered BENCHMARK.md §2.9 / §10.6 / §11.5 / §12.3 over the 2026-06-16 record;
+full report + corrected harness + raw logs in `docs/reviews/2026-06-17/`.
+
 ### Fixed — Graph node labels with id ≥ 32 are stored, matched, and persisted (no silent truncation) (PR #193)
 
 CSR node labels were packed into a 32-bit `NodeMeta::label_bitmap`, so any label

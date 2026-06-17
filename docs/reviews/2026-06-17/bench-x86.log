@@ -1,0 +1,63 @@
+================ 4FEATURE BENCH START · arch=x86_64 · Wed Jun 17 07:45:01 UTC 2026 ================
+[setup] pulling competitor images (redis-stack, falkordb)…
+[setup] redis-stack up
+[setup] falkordb up
+HEAD: 8238515 docs(add): fold v3-2-graph-correctness deltas → foundation-version 6
+    Finished `release` profile [optimized] target(s) in 3m 50s
+CPU: Intel(R) Xeon(R) Platinum 8481C CPU @ 2.70GHz · cores=8
+[setup] competitor ready: redis-stack=1 falkordb=1
+---- [1/4] KV: Moon-fair vs Redis ----
+KV|x86_64|loose|get|P1|moon=99034|redis=122737
+KV|x86_64|loose|set|P1|moon=98741|redis=120700
+KV|x86_64|loose|get|P16|moon=1423487|redis=1476014
+KV|x86_64|loose|set|P16|moon=1746724|redis=1219512
+KV|x86_64|loose|get|P64|moon=4444444|redis=2380952
+KV|x86_64|loose|set|P64|moon=2985074|redis=1769911
+/home/tindang/bench.sh: line 51: 14231 Killed                  "$MOONBIN" --port $MOON --shards "${1:-1}" --protected-mode no --appendonly no --disk-offload disable $IKH --dir /tmp/md > /dev/null 2>&1
+KV|x86_64|strict|get|P1|moon=99132|redis=120084
+KV|x86_64|strict|set|P1|moon=100025|redis=129491
+KV|x86_64|strict|get|P16|moon=919540|redis=824742
+KV|x86_64|strict|set|P16|moon=722021|redis=643086
+KV|x86_64|strict|get|P64|moon=1101928|redis=959232
+KV|x86_64|strict|set|P64|moon=863930|redis=759013
+/home/tindang/bench.sh: line 51: 14410 Killed                  "$MOONBIN" --port $MOON --shards "${1:-1}" --protected-mode no --appendonly no --disk-offload disable $IKH --dir /tmp/md > /dev/null 2>&1
+VEC|x86_64|=== Vector: 50K x 384d clustered, COSINE, KNN10 ===
+VEC|x86_64|moon|insert_rate=28136/s
+VEC|x86_64|moon|brute|recall@10=0.7586|qps=25|p50ms=319.37|p99ms=345.22|ret=500/500
+VEC|x86_64|moon|hnsw|recall@10=0.8580|qps=473|p50ms=17.05|p99ms=22.05|ret=500/500
+VEC|x86_64|redisearch|insert_rate=3750/s
+VEC|x86_64|redisearch|brute|recall@10=0.9610|qps=9143|p50ms=0.71|p99ms=2.90|ret=500/500
+VEC|x86_64|redisearch|compact_err=unknown command 'FT.COMPACT', with args beginning with: 'vid
+FTS|x86_64|=== Full-Text Search: 100K docs, BM25, Zipf vocab ===
+FTS|x86_64|moon|index_rate=15052docs/s
+FTS|x86_64|moon|term_hi|qps=240|p50ms=33.25|p99ms=33.89|hits=5068
+FTS|x86_64|moon|term_mid|qps=1416|p50ms=5.65|p99ms=6.12|hits=1046
+FTS|x86_64|moon|term_rare|qps=7714|p50ms=0.82|p99ms=3.77|hits=95
+FTS|x86_64|moon|and2|qps=841|p50ms=9.49|p99ms=9.99|hits=10
+FTS|x86_64|moon|or2|qps=688|p50ms=11.64|p99ms=12.29|hits=2072
+FTS|x86_64|moon|tag|qps=2227|p50ms=3.59|p99ms=4.07|hits=5064
+FTS|x86_64|moon|numeric|qps=97|p50ms=82.12|p99ms=83.12|hits=10119
+FTS|x86_64|moon|text_tag|qps=270|p50ms=29.65|p99ms=30.22|hits=253
+FTS|x86_64|moon|aggregate_groupby|qps=5|p50ms=720.77|p99ms=915.67
+FTS|x86_64|redisearch|index_rate=18232docs/s
+FTS|x86_64|redisearch|term_hi|qps=3791|p50ms=2.10|p99ms=2.64|hits=5068
+FTS|x86_64|redisearch|term_mid|qps=5293|p50ms=0.96|p99ms=5.79|hits=1046
+FTS|x86_64|redisearch|term_rare|qps=3594|p50ms=1.91|p99ms=5.97|hits=95
+FTS|x86_64|redisearch|and2|qps=8277|p50ms=0.87|p99ms=4.16|hits=10
+FTS|x86_64|redisearch|or2|qps=3778|p50ms=2.11|p99ms=2.58|hits=2072
+FTS|x86_64|redisearch|tag|qps=3367|p50ms=2.36|p99ms=3.10|hits=5064
+FTS|x86_64|redisearch|numeric|qps=377|p50ms=21.19|p99ms=22.04|hits=10119
+FTS|x86_64|redisearch|text_tag|qps=4314|p50ms=1.83|p99ms=2.47|hits=253
+FTS|x86_64|redisearch|aggregate_groupby|qps=9|p50ms=422.97|p99ms=442.63
+GRAPH|x86_64|=== Graph: 5K nodes, 15K edges, 1-hop/2-hop ===
+GRAPH|x86_64|moon|build_rate=25094ops/s
+GRAPH|x86_64|moon|cypher_1hop|qps=1195|p50ms=6.68|p99ms=6.99
+GRAPH|x86_64|moon|cypher_2hop|qps=1156|p50ms=6.92|p99ms=7.50
+GRAPH|x86_64|moon|cypher_match_rows=4
+GRAPH|x86_64|moon|native_neighbors_1hop|qps=5650|p50ms=1.11|p99ms=5.17
+GRAPH|x86_64|falkordb|build_rate=959ops/s
+GRAPH|x86_64|falkordb|cypher_1hop|qps=4734|p50ms=1.54|p99ms=3.50
+GRAPH|x86_64|falkordb|cypher_2hop|qps=4395|p50ms=1.66|p99ms=3.81
+GRAPH|x86_64|falkordb|cypher_match_rows=4
+/home/tindang/bench.sh: line 51: 14645 Killed                  "$MOONBIN" --port $MOON --shards "${1:-1}" --protected-mode no --appendonly no --disk-offload disable $IKH --dir /tmp/md > /dev/null 2>&1
+================ 4FEATURE BENCH DONE · arch=x86_64 · Wed Jun 17 07:56:00 UTC 2026 ================
