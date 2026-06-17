@@ -8,12 +8,15 @@ pipeline 1–128 × datasize 8B–64KB × connections 1–500, run at `--shards 
 (10 workload scenarios, `--shards 1` and `12`). redis-benchmark, 200K req/test, co-located.
 Logs: `bench2-{x86,arm}.log` (this dir). Instances DELETED (0/0 verified).
 
-> **Fairness patch (important):** the canonical scripts start **Redis with `--appendonly no` but Moon with
-> persistence defaults (AOF on)**. Under SET load Moon's AOF channel saturates, floods
-> `AOF append dropped … channel full` (≈1M lines), pins the port, and unfairly handicaps Moon. The harness
-> patches both scripts to start Moon `--appendonly no --disk-offload disable` + `RUST_LOG=error` so the
-> comparison is **AOF-off on both sides**. (This Moon-with-AOF-vs-Redis-without is a latent unfairness in
-> `scripts/bench-compare.sh` / `bench-production.sh` worth fixing upstream — see Follow-ups.)
+> **Fairness fix (now in-repo — `322d58b`):** the canonical scripts started **Redis with `--appendonly no`
+> but Moon with persistence defaults (AOF on)**. Under SET load Moon's AOF channel saturated, flooded
+> `AOF append dropped … channel full` (≈1M lines), pinned the port, and unfairly handicapped Moon.
+> **`scripts/bench-compare.sh` and `scripts/bench-production.sh` now start Moon `--appendonly no
+> --disk-offload disable` (output redirected)** so the comparison is **AOF-off on both sides**. The first
+> wider run (tables below, `bench2-{x86,arm}.log`) applied this at the harness level; a **fair re-run from the
+> fixed scripts** (`bench-fairfix-{x86,arm}.log`, build `322d58b`, **0 flood lines**) reproduced every
+> headline within VM variance (x86 s1 GET p=128 2.73× vs 2.84×; s12 p=1 collapse 0.44–0.45× vs 0.46×),
+> confirming the in-repo fix needs no wrapper patch.
 
 ---
 
@@ -109,7 +112,8 @@ non-pipelined workloads; add shards only for pipelined/AOF/hash-tag-colocated wo
   process *after* the 200K-key throughput tests — RSS is a high-water mark (CLAUDE.md: "FLUSHALL does not
   return pages"), so the 10K-key "130 MB / 438 MB" rows reflect that high-water, **not** real per-key memory.
   Use `scripts/bench-resources.sh` (fresh server per row) for memory — §3 of BENCHMARK.md stands.
-- **Latent unfairness in the repo bench scripts:** they start Redis AOF-off but Moon AOF-on (see fairness
-  patch). Worth a one-line upstream fix (`--appendonly no` on the Moon start lines).
+- **Bench-script AOF unfairness — FIXED in-repo (`322d58b`).** Both scripts now start Moon `--appendonly no
+  --disk-offload disable` to match Redis's in-memory config; a fair re-run from the fixed scripts
+  (`bench-fairfix-{x86,arm}.log`, 0 flood lines) reproduced these numbers within VM variance.
 - No CPU pinning; same-run ratios are the signal. `--shards 1`, c=50 default unless noted.
 - Two LRANGE rows have a redis-benchmark multi-line-output parse glitch (cosmetic).
