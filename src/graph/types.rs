@@ -96,9 +96,9 @@ pub struct MutableEdge {
 /// a construction site stamping a stale literal is exactly the bug class that
 /// made vacuumed segments misparse on reload (v1 stamp on v2 records).
 ///
-/// Parse-side gates stay numeric (`version >= 2`, `version >= 3`): they encode
-/// the version a feature was INTRODUCED at and must not track this constant.
-pub const CSR_CURRENT_VERSION: u32 = 3;
+/// Parse-side gates stay numeric (`version >= 2`, `version >= 3`, `version >= 4`):
+/// they encode the version a feature was INTRODUCED at and must not track this constant.
+pub const CSR_CURRENT_VERSION: u32 = 4;
 
 /// On-disk CSR segment header -- cache-line aligned, zero-copy mmap.
 #[derive(Debug)]
@@ -121,9 +121,14 @@ pub struct GraphSegmentHeader {
     /// 0 for version 1/2 segments (section absent). Informational — parsers
     /// compute section positions positionally and gate on `version`.
     pub edge_created_ms_offset: u64,
+    /// Byte offset of the node label-overflow section, storing labels >= 32
+    /// (version >= 4). 0 for version <= 3 segments (section absent). Like
+    /// `edge_created_ms_offset`, informational — parsers locate the section
+    /// positionally (after `edge_created_ms`) and gate on `version`.
+    pub label_overflow_offset: u64,
 }
 
-// Fields sum to 88 bytes (was 80 before edge_created_ms_offset). With
+// Fields sum to 96 bytes (was 88 before label_overflow_offset). With
 // align(64) the struct is padded to 128 — the on-disk size is unchanged.
 const _: () = assert!(core::mem::size_of::<GraphSegmentHeader>() == 128);
 const _: () = assert!(core::mem::align_of::<GraphSegmentHeader>() == 64);

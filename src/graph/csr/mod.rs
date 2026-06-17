@@ -17,6 +17,7 @@ use std::path::Path;
 
 use roaring::RoaringBitmap;
 use slotmap::Key;
+use smallvec::SmallVec;
 
 use crate::graph::index::{EdgeTypeIndex, LabelIndex, MphNodeIndex};
 use crate::graph::memgraph::FrozenMemGraph;
@@ -63,6 +64,12 @@ pub struct CsrSegment {
     pub mph: MphNodeIndex,
     /// Per-label Roaring bitmap index for O(1) label filtering.
     pub label_index: LabelIndex,
+    /// Sparse node label overflow: CSR row -> labels with id >= 32 (version >= 4).
+    /// Labels 0-31 live in `NodeMeta::label_bitmap` (the fast path); ids >= 32
+    /// that the u32 bitmap cannot hold live here. Only rows carrying a >= 32
+    /// label appear (empty for version <= 3 segments and 0-31-only graphs).
+    /// `LabelIndex` is built from BOTH this map and the bitmap.
+    pub label_overflow: HashMap<u32, SmallVec<[u16; 4]>>,
     /// Per-edge-type Roaring bitmap index for O(1) edge type filtering.
     pub edge_type_index: EdgeTypeIndex,
     /// LSN at which this segment was created.
@@ -149,11 +156,13 @@ impl CsrSegment {
             }
         }
 
-        // Build node_meta.
+        // Build node_meta. Labels partition by id: 0-31 -> the u32 bitmap
+        // (fast path), >= 32 -> the sparse `label_overflow` store keyed by row.
         let mut node_meta = Vec::with_capacity(node_count);
+        let mut label_overflow: HashMap<u32, SmallVec<[u16; 4]>> = HashMap::new();
         let mut min_node_id = u64::MAX;
         let mut max_node_id = 0u64;
-        for (key, node) in &sorted_nodes {
+        for (row, (key, node)) in sorted_nodes.iter().enumerate() {
             let id_bits = key.data().as_ffi();
             if id_bits < min_node_id {
                 min_node_id = id_bits;
@@ -161,11 +170,13 @@ impl CsrSegment {
             if id_bits > max_node_id {
                 max_node_id = id_bits;
             }
-            // Build label bitmap from labels SmallVec.
+            // Partition labels: ids < 32 set a bitmap bit; ids >= 32 go to overflow.
             let mut label_bitmap: u32 = 0;
             for &label in &node.labels {
                 if label < 32 {
                     label_bitmap |= 1 << label;
+                } else {
+                    label_overflow.entry(row as u32).or_default().push(label);
                 }
             }
             node_meta.push(NodeMeta {
@@ -204,12 +215,13 @@ impl CsrSegment {
             created_lsn: lsn,
             checksum,
             edge_created_ms_offset: 0, // populated during serialization
+            label_overflow_offset: 0,  // populated during serialization
         };
 
         // Build indexes (Phase 116).
         let sorted_keys: Vec<NodeKey> = sorted_nodes.iter().map(|(k, _)| *k).collect();
         let mph = MphNodeIndex::build(&sorted_keys);
-        let label_index = LabelIndex::build(&node_meta);
+        let label_index = LabelIndex::build(&node_meta, &label_overflow);
         let edge_type_index = EdgeTypeIndex::build(&edge_meta);
 
         Ok(Self {
@@ -223,6 +235,7 @@ impl CsrSegment {
             node_id_to_row,
             mph,
             label_index,
+            label_overflow,
             edge_type_index,
             created_lsn: lsn,
             incoming: std::sync::OnceLock::new(),
@@ -377,7 +390,25 @@ impl CsrSegment {
             0
         };
 
-        let total = header_size + ro_size + ci_size + em_size + nm_size + ecms_size;
+        // Node label-overflow section (version >= 4): [entry_count: u32] then
+        // sparse (row, label_count, label_id*) entries written ascending by row.
+        let write_overflow = self.header.version >= 4;
+        let mut overflow_entries: Vec<(u32, &SmallVec<[u16; 4]>)> = if write_overflow {
+            self.label_overflow.iter().map(|(&r, v)| (r, v)).collect()
+        } else {
+            Vec::new()
+        };
+        overflow_entries.sort_unstable_by_key(|(r, _)| *r);
+        let overflow_size = if write_overflow {
+            4 + overflow_entries
+                .iter()
+                .map(|(_, v)| 4 + 2 + v.len() * 2)
+                .sum::<usize>()
+        } else {
+            0
+        };
+
+        let total = header_size + ro_size + ci_size + em_size + nm_size + ecms_size + overflow_size;
         let mut buf = Vec::with_capacity(total);
 
         // Write header with computed offsets (checksum placeholder = 0).
@@ -387,6 +418,12 @@ impl CsrSegment {
         let nm_offset = em_offset + em_size as u64;
         let ecms_offset = if write_ecms {
             nm_offset + nm_size as u64
+        } else {
+            0
+        };
+        // Overflow section follows the (zero-or-more-byte) ecms section.
+        let lov_offset = if write_overflow {
+            nm_offset + nm_size as u64 + ecms_size as u64
         } else {
             0
         };
@@ -404,6 +441,7 @@ impl CsrSegment {
         buf.extend_from_slice(&self.header.created_lsn.to_le_bytes());
         buf.extend_from_slice(&0u64.to_le_bytes()); // checksum placeholder — filled below
         buf.extend_from_slice(&ecms_offset.to_le_bytes()); // 0 for version < 3
+        buf.extend_from_slice(&lov_offset.to_le_bytes()); // byte 88; 0 for version < 4
 
         // Pad header to 128 bytes.
         while buf.len() < header_size {
@@ -445,6 +483,20 @@ impl CsrSegment {
             for i in 0..self.col_indices.len() {
                 let ms = self.edge_created_ms.get(i).copied().unwrap_or(0);
                 buf.extend_from_slice(&ms.to_le_bytes());
+            }
+        }
+
+        // Write the node label-overflow section (version >= 4): entry_count
+        // then sparse (row, label_count, label_id*) entries ascending by row.
+        // Covered by the trailing CRC32 like every other section.
+        if write_overflow {
+            buf.extend_from_slice(&(overflow_entries.len() as u32).to_le_bytes());
+            for (row, labels) in &overflow_entries {
+                buf.extend_from_slice(&row.to_le_bytes());
+                buf.extend_from_slice(&(labels.len() as u16).to_le_bytes());
+                for &label in labels.iter() {
+                    buf.extend_from_slice(&label.to_le_bytes());
+                }
             }
         }
 
@@ -493,6 +545,13 @@ impl CsrSegment {
         // Version 3+: byte offset of the per-edge created_ms section (informational).
         let ecms_offset = if version >= 3 {
             u64::from_le_bytes(read8(data, 80)?)
+        } else {
+            0
+        };
+        // Version 4+: byte offset of the node label-overflow section (informational;
+        // the section is parsed positionally after edge_created_ms below).
+        let lov_offset = if version >= 4 {
+            u64::from_le_bytes(read8(data, 88)?)
         } else {
             0
         };
@@ -627,6 +686,16 @@ impl CsrSegment {
             }
         }
 
+        // Parse the node label-overflow section (version >= 4): labels >= 32 by
+        // row. `pos` sits right after edge_created_ms. Shared with the mmap loader
+        // so the wire format has one parser; bounds-checked (never panics). The CRC
+        // validated above already covers these bytes.
+        let label_overflow = if version >= 4 {
+            parse_label_overflow(data, pos, node_count)?
+        } else {
+            HashMap::new()
+        };
+
         // Rebuild validity bitmap: all edges valid (fresh load).
         let mut validity = RoaringBitmap::new();
         for i in 0..ec as u32 {
@@ -655,7 +724,7 @@ impl CsrSegment {
 
         // Rebuild indexes.
         let mph = MphNodeIndex::build(&sorted_keys);
-        let label_index = LabelIndex::build(&node_meta);
+        let label_index = LabelIndex::build(&node_meta, &label_overflow);
         let edge_type_index = EdgeTypeIndex::build(&edge_meta);
 
         let header = GraphSegmentHeader {
@@ -672,6 +741,7 @@ impl CsrSegment {
             created_lsn,
             checksum: stored_checksum,
             edge_created_ms_offset: ecms_offset,
+            label_overflow_offset: lov_offset,
         };
 
         Ok(Self {
@@ -685,6 +755,7 @@ impl CsrSegment {
             node_id_to_row,
             mph,
             label_index,
+            label_overflow,
             edge_type_index,
             created_lsn,
             incoming: std::sync::OnceLock::new(),
@@ -735,6 +806,52 @@ pub(super) fn read8(data: &[u8], offset: usize) -> Result<[u8; 8], CsrError> {
         .ok_or_else(|| CsrError::InvalidData(format!("read8 out of bounds at {offset}")))
 }
 
+/// Parse the version-4 node label-overflow section beginning at byte `pos`:
+///   `[entry_count: u32]` then `entry_count` × `[row: u32][label_count: u16][label_id: u16]*`,
+/// sparse and strictly ascending by row (only rows carrying a label id >= 32).
+///
+/// Shared by the heap (`from_bytes`) and mmap (`from_mmap_file`) loaders so the
+/// wire format has a single parser. Bounds-checked via `read2`/`read4` — returns
+/// `CsrError` on truncation, never panics. Rows must be `< node_count` and
+/// strictly ascending, which also caps `entry_count` at `node_count` distinct
+/// rows, so a corrupt-but-valid-CRC header cannot drive an unbounded read.
+pub(super) fn parse_label_overflow(
+    data: &[u8],
+    mut pos: usize,
+    node_count: u32,
+) -> Result<HashMap<u32, SmallVec<[u16; 4]>>, CsrError> {
+    let mut label_overflow: HashMap<u32, SmallVec<[u16; 4]>> = HashMap::new();
+    let entry_count = u32::from_le_bytes(read4(data, pos)?);
+    pos += 4;
+    let mut prev_row: Option<u32> = None;
+    for _ in 0..entry_count {
+        let row = u32::from_le_bytes(read4(data, pos)?);
+        pos += 4;
+        if row >= node_count {
+            return Err(CsrError::InvalidData(format!(
+                "label-overflow row {row} >= node_count {node_count}"
+            )));
+        }
+        if let Some(p) = prev_row
+            && row <= p
+        {
+            return Err(CsrError::InvalidData(format!(
+                "label-overflow rows not strictly ascending: {row} after {p}"
+            )));
+        }
+        prev_row = Some(row);
+        let label_count = u16::from_le_bytes(read2(data, pos)?) as usize;
+        pos += 2;
+        let mut labels: SmallVec<[u16; 4]> = SmallVec::with_capacity(label_count);
+        for _ in 0..label_count {
+            labels.push(u16::from_le_bytes(read2(data, pos)?));
+            pos += 2;
+        }
+        label_overflow.insert(row, labels);
+    }
+    Ok(label_overflow)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -773,7 +890,7 @@ mod tests {
         assert_eq!(csr.node_count(), 5);
         assert_eq!(csr.edge_count(), 10);
         assert_eq!(csr.header.magic, *b"MNGR");
-        assert_eq!(csr.header.version, 3);
+        assert_eq!(csr.header.version, 4);
     }
 
     #[test]
@@ -831,7 +948,7 @@ mod tests {
         // Read back header fields.
         assert_eq!(&bytes[0..4], b"MNGR");
         let version = u32::from_le_bytes(bytes[4..8].try_into().expect("4 bytes"));
-        assert_eq!(version, 3);
+        assert_eq!(version, 4);
         let nc = u32::from_le_bytes(bytes[8..12].try_into().expect("4 bytes"));
         assert_eq!(nc, 5);
         let ec = u32::from_le_bytes(bytes[12..16].try_into().expect("4 bytes"));
@@ -985,7 +1102,7 @@ mod tests {
         let restored = CsrSegment::from_bytes(&bytes).expect("from_bytes ok");
 
         assert_eq!(restored.header.magic, *b"MNGR");
-        assert_eq!(restored.header.version, 3);
+        assert_eq!(restored.header.version, 4);
         assert_eq!(restored.node_count(), original.node_count());
         assert_eq!(restored.edge_count(), original.edge_count());
         assert_eq!(restored.created_lsn, 42);
@@ -1175,15 +1292,17 @@ mod tests {
     fn test_csr_v1_migration_zero_fill() {
         // Build a current-version CSR, serialize to bytes, then manually
         // construct v1-format bytes by: patching version to 1, truncating each
-        // NodeMeta from 48 to 32 bytes (dropping valid_from/valid_to), omitting
-        // the v3 edge_created_ms section, and recomputing the CRC.
+        // NodeMeta from 48 to 32 bytes (dropping valid_from/valid_to), and
+        // stopping the copy at node_meta — which omits BOTH the v3
+        // edge_created_ms section and the v4 label-overflow section — then
+        // recomputing the CRC.
         let frozen = build_small_graph();
         let csr = CsrSegment::from_frozen(frozen, 42).expect("csr ok");
         let v3_bytes = csr.to_bytes();
 
-        // Verify it is version 3.
+        // Verify the source is the current version (4).
         let ver = u32::from_le_bytes(v3_bytes[4..8].try_into().expect("4 bytes"));
-        assert_eq!(ver, 3);
+        assert_eq!(ver, 4);
 
         let header_size = core::mem::size_of::<GraphSegmentHeader>(); // 128
         let nc = csr.node_count() as usize;
@@ -1271,7 +1390,7 @@ mod tests {
 
         let frozen = g.freeze().expect("freeze ok");
         let csr = CsrSegment::from_frozen(frozen, 50).expect("csr ok");
-        assert_eq!(csr.header.version, 3);
+        assert_eq!(csr.header.version, 4);
 
         // Verify from_frozen propagated temporal fields.
         // Note: sorted_nodes order may differ from insertion order,
@@ -1293,7 +1412,7 @@ mod tests {
         // Serialize and deserialize.
         let bytes = csr.to_bytes();
         let restored = CsrSegment::from_bytes(&bytes).expect("roundtrip ok");
-        assert_eq!(restored.header.version, 3);
+        assert_eq!(restored.header.version, 4);
 
         // Verify temporal fields survive roundtrip.
         for (i, nm) in restored.node_meta.iter().enumerate() {
@@ -1339,7 +1458,7 @@ mod tests {
         let frozen = build_stamped_graph();
         let csr = CsrSegment::from_frozen(frozen, 100).expect("csr ok");
 
-        assert_eq!(csr.header.version, 3);
+        assert_eq!(csr.header.version, 4);
         assert_eq!(csr.edge_created_ms.len(), csr.col_indices.len());
         let mut stamps = csr.edge_created_ms.clone();
         stamps.sort_unstable();
@@ -1368,16 +1487,22 @@ mod tests {
         assert_eq!(storage.edge_created_ms(), csr.edge_created_ms.as_slice());
     }
 
-    /// Construct v2-format bytes (no edge_created_ms section) from a v3
-    /// segment: strip the trailing section, patch version to 2, zero the v3
-    /// edge_created_ms_offset header field (byte 80 — a v2 writer never set
-    /// it), recompute the CRC.
+    /// Construct v2-format bytes (no edge_created_ms section, no label-overflow
+    /// section) from a current (v4) segment: strip both trailing sections, patch
+    /// version to 2, zero the v3 edge_created_ms_offset (byte 80) and v4
+    /// label_overflow_offset (byte 88) header fields — a v2 writer never set
+    /// either — and recompute the CRC. The fixtures carry no labels >= 32, so the
+    /// label-overflow section is its 4-byte empty form (entry_count = 0).
     fn downgrade_to_v2(csr: &CsrSegment) -> Vec<u8> {
-        let v3_bytes = csr.to_bytes();
+        let cur_bytes = csr.to_bytes();
         let ec = csr.edge_count() as usize;
-        let mut v2_bytes = v3_bytes[..v3_bytes.len() - ec * 8].to_vec();
+        // v4 trailer = edge_created_ms (ec*8) + empty label-overflow (4 bytes).
+        let strip = ec * 8 + 4;
+        let mut v2_bytes = cur_bytes[..cur_bytes.len() - strip].to_vec();
         v2_bytes[4..8].copy_from_slice(&2u32.to_le_bytes());
-        v2_bytes[80..88].copy_from_slice(&0u64.to_le_bytes());
+        // Zero edge_created_ms_offset (80..88) AND label_overflow_offset (88..96)
+        // so the downgraded header matches what a v2 writer emits.
+        v2_bytes[80..96].copy_from_slice(&[0u8; 16]);
         v2_bytes[72..80].copy_from_slice(&0u64.to_le_bytes());
         let checksum = compute_csr_checksum(&v2_bytes) as u64;
         v2_bytes[72..80].copy_from_slice(&checksum.to_le_bytes());
@@ -1462,6 +1587,183 @@ mod tests {
         assert!(
             MmapCsrSegment::from_mmap_file(&path).is_err(),
             "duplicate external_id must be rejected by the mmap loader"
+        );
+    }
+
+    // ─── graph-label-bitmap-overflow (v3-2): node labels with id >= 32 ─────────────
+    // Frozen contract: labels >= 32 are stored in a version-gated overflow section and
+    // indexed by LabelIndex, surviving build/query/persist/reload/compact. RED until the
+    // fix — from_frozen drops labels >= 32 (`if label < 32`), so a query for an id >= 32
+    // (LabelIndex::nodes_with_label) returns None.
+
+    fn frozen_with_labels(
+        node_labels: &[&[u16]],
+    ) -> (FrozenMemGraph, Vec<crate::graph::types::NodeKey>) {
+        let mut g = MemGraph::new(1000);
+        let mut keys = Vec::new();
+        for labels in node_labels {
+            let lv: smallvec::SmallVec<[u16; 4]> = labels.iter().copied().collect();
+            keys.push(g.add_node(lv, smallvec![], None, 1));
+        }
+        (g.freeze().expect("freeze"), keys)
+    }
+
+    #[test]
+    fn test_label_index_matches_ids_0_to_39() {
+        // M1 + M2 (headline) — 40 nodes, node i carries label id i; EVERY id 0..40 must be
+        // matchable (esp. 32..40). RED: ids >= 32 are dropped at build, nodes_with_label -> None.
+        let labels: Vec<Vec<u16>> = (0..40u16).map(|i| vec![i]).collect();
+        let refs: Vec<&[u16]> = labels.iter().map(|v| v.as_slice()).collect();
+        let (frozen, keys) = frozen_with_labels(&refs);
+        let csr = CsrSegment::from_frozen(frozen, 5).expect("from_frozen");
+        for i in 0..40u16 {
+            let bm = csr.label_index.nodes_with_label(i);
+            assert!(
+                bm.is_some(),
+                "label id {i} must be indexed (esp. >= 32); got None"
+            );
+            let row = csr.lookup_node(keys[i as usize]).expect("node i present");
+            assert!(
+                bm.unwrap().contains(row),
+                "label {i} must map to node i's row"
+            );
+        }
+    }
+
+    #[test]
+    fn test_overflow_survives_heap_roundtrip() {
+        // M3 — label 40 survives to_bytes -> from_bytes (heap).
+        let (frozen, keys) = frozen_with_labels(&[&[40u16], &[5u16]]);
+        let csr = CsrSegment::from_frozen(frozen, 5).expect("from_frozen");
+        let reloaded = CsrSegment::from_bytes(&csr.to_bytes()).expect("from_bytes");
+        let row = reloaded.lookup_node(keys[0]).expect("node 0 present");
+        let bm = reloaded.label_index.nodes_with_label(40);
+        assert!(
+            bm.is_some() && bm.unwrap().contains(row),
+            "label 40 must survive a heap round-trip"
+        );
+    }
+
+    #[test]
+    fn test_overflow_survives_mmap_reload() {
+        // M3 / A1 — label 40 survives an mmap reload (owned parse, not zero-copy).
+        // Shape (nc=3, ec=2) lands node_meta 8-aligned so from_file takes the
+        // zero-copy Mmap variant (asserted) instead of the heap fallback — this is
+        // what actually exercises the mmap overflow parse, the flagged A1 risk.
+        let mut g = MemGraph::new(1000);
+        let n0 = g.add_node(smallvec![40u16], smallvec![], None, 1);
+        let n1 = g.add_node(smallvec![5u16], smallvec![], None, 1);
+        let n2 = g.add_node(smallvec![6u16], smallvec![], None, 1);
+        g.add_edge(n0, n1, 1, 1.0, None, 2).expect("0->1");
+        g.add_edge(n1, n2, 1, 1.0, None, 2).expect("1->2");
+        let csr = CsrSegment::from_frozen(g.freeze().expect("freeze"), 5).expect("from_frozen");
+        let dir = tempfile::TempDir::new().expect("tmpdir");
+        let path = dir.path().join("seg.csr");
+        csr.write_to_file(&path).expect("write");
+        let storage = CsrStorage::from_file(&path).expect("from_file");
+        assert!(
+            matches!(storage, CsrStorage::Mmap(_)),
+            "8-aligned shape must load via the zero-copy mmap variant (exercises A1)"
+        );
+        let row = storage.lookup_node(n0).expect("node 0 present");
+        let bm = storage.label_index().nodes_with_label(40);
+        assert!(
+            bm.is_some() && bm.unwrap().contains(row),
+            "label 40 must survive an mmap reload"
+        );
+    }
+
+    // Like `frozen_with_labels`, but also adds a single edge node[0]->node[1] so the
+    // wide-label node is a first-class merge participant. compact_segments rebuilds the
+    // CSR from edges, so an edgeless node has no row to survive under — this keeps the
+    // compaction scenario RED for the right reason (label dropped), not a vanished node.
+    fn frozen_with_labels_and_edge(
+        node_labels: &[&[u16]],
+    ) -> (FrozenMemGraph, Vec<crate::graph::types::NodeKey>) {
+        let mut g = MemGraph::new(1000);
+        let mut keys = Vec::new();
+        for labels in node_labels {
+            let lv: smallvec::SmallVec<[u16; 4]> = labels.iter().copied().collect();
+            keys.push(g.add_node(lv, smallvec![], None, 1));
+        }
+        g.add_edge(keys[0], keys[1], 1, 1.0, None, 2)
+            .expect("edge 0->1");
+        (g.freeze().expect("freeze"), keys)
+    }
+
+    #[test]
+    fn test_overflow_survives_compaction() {
+        // M4 / A2 — label 40 survives segment merge under the node's remapped row.
+        // Segments share an external-id keyspace (NodeKey::as_ffi from a fresh SlotMap),
+        // so node[0] is the SAME logical node in both — it carries label 40 in each.
+        // compact_segments leaves node_id_to_row empty (it works at external_id level),
+        // so the merged row is located by external_id captured from the heap segment.
+        use crate::graph::compaction::{CompactionConfig, compact_segments};
+        let (f1, k1) = frozen_with_labels_and_edge(&[&[40u16], &[5u16]]);
+        let seg1 = std::sync::Arc::new(CsrStorage::from(
+            CsrSegment::from_frozen(f1, 10).expect("f1"),
+        ));
+        let ext_id = {
+            let r = seg1
+                .lookup_node(k1[0])
+                .expect("wide-label node present pre-merge");
+            seg1.node_meta()[r as usize].external_id
+        };
+        let (f2, _k2) = frozen_with_labels_and_edge(&[&[40u16], &[7u16]]);
+        let seg2 = std::sync::Arc::new(CsrStorage::from(
+            CsrSegment::from_frozen(f2, 20).expect("f2"),
+        ));
+        let config = CompactionConfig {
+            min_segments: 2,
+            max_segment_edges: 1_000_000,
+        };
+        let merged = compact_segments(&[seg1, seg2], &config).expect("compact");
+        let row = merged
+            .node_meta
+            .iter()
+            .position(|nm| nm.external_id == ext_id)
+            .expect("wide-label node survives merge") as u32;
+        let bm = merged.label_index.nodes_with_label(40);
+        assert!(
+            bm.is_some() && bm.unwrap().contains(row),
+            "label 40 must survive compaction under the node's new row"
+        );
+    }
+
+    #[test]
+    fn test_labels_0_31_unchanged() {
+        // M6 (green-pin) — labels 0-31 match identically; an absent id -> None.
+        let (frozen, _keys) = frozen_with_labels(&[&[5u16], &[5u16, 7u16], &[31u16]]);
+        let csr = CsrSegment::from_frozen(frozen, 5).expect("from_frozen");
+        assert!(csr.label_index.nodes_with_label(5).is_some());
+        assert!(csr.label_index.nodes_with_label(7).is_some());
+        assert!(csr.label_index.nodes_with_label(31).is_some());
+        assert!(
+            csr.label_index.nodes_with_label(20).is_none(),
+            "an absent label id must return None"
+        );
+    }
+
+    #[test]
+    fn test_no_wide_labels_roundtrip() {
+        // M7 (green-pin) — a 0-31-only segment round-trips cleanly (empty overflow once it exists).
+        let (frozen, _keys) = frozen_with_labels(&[&[5u16], &[10u16]]);
+        let csr = CsrSegment::from_frozen(frozen, 5).expect("from_frozen");
+        let reloaded = CsrSegment::from_bytes(&csr.to_bytes()).expect("from_bytes");
+        assert!(reloaded.label_index.nodes_with_label(5).is_some());
+        assert!(reloaded.label_index.nodes_with_label(10).is_some());
+    }
+
+    #[test]
+    fn test_truncated_segment_bytes_error_no_panic() {
+        // Reject (green-pin) — truncated segment bytes -> CsrError, never a panic.
+        let (frozen, _keys) = frozen_with_labels(&[&[40u16], &[5u16]]);
+        let csr = CsrSegment::from_frozen(frozen, 5).expect("from_frozen");
+        let mut bytes = csr.to_bytes();
+        bytes.truncate(bytes.len() - 4);
+        assert!(
+            CsrSegment::from_bytes(&bytes).is_err(),
+            "truncated bytes must return CsrError, not panic"
         );
     }
 }

@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use roaring::RoaringBitmap;
+use smallvec::SmallVec;
 
 use super::mmap::MmapCsrSegment;
 use super::{CsrError, CsrSegment, IncomingIndex};
@@ -179,6 +180,15 @@ impl CsrStorage {
         match self {
             CsrStorage::Heap(s) => &s.label_index,
             CsrStorage::Mmap(s) => &s.label_index,
+        }
+    }
+
+    /// Access the sparse node label-overflow map (CSR row -> labels with id >= 32).
+    /// Empty for version <= 3 segments and graphs with no labels >= 32.
+    pub fn label_overflow(&self) -> &HashMap<u32, SmallVec<[u16; 4]>> {
+        match self {
+            CsrStorage::Heap(s) => &s.label_overflow,
+            CsrStorage::Mmap(s) => &s.label_overflow,
         }
     }
 

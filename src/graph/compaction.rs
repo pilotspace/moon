@@ -21,6 +21,7 @@
 use std::sync::Arc;
 
 use roaring::RoaringBitmap;
+use smallvec::SmallVec;
 
 use crate::graph::csr::{CsrError, CsrSegment, CsrStorage};
 use crate::graph::index::{EdgeTypeIndex, LabelIndex, MphNodeIndex};
@@ -380,38 +381,54 @@ pub fn compact_segments(
     }
 
     let mut node_meta_vec = Vec::with_capacity(node_count);
-    // Find the most recent node metadata for each external ID across segments.
+    // Find the most recent node metadata for each external ID across segments,
+    // and carry its label overflow (labels >= 32) from the SAME winning segment
+    // so the merged node's full label set (bitmap + overflow) stays coherent —
+    // a node that won on a no-overflow segment must NOT inherit a loser's
+    // overflow. Keyed by external_id; re-keyed to the new row below. (A2)
     let mut best_node_meta: std::collections::HashMap<u64, NodeMeta> =
         std::collections::HashMap::with_capacity(node_count);
+    let mut best_overflow: std::collections::HashMap<u64, SmallVec<[u16; 4]>> =
+        std::collections::HashMap::new();
     for seg in segments {
-        for nm in seg.node_meta() {
-            best_node_meta
-                .entry(nm.external_id)
-                .and_modify(|existing| {
-                    if nm.created_lsn > existing.created_lsn {
-                        *existing = NodeMeta {
-                            external_id: nm.external_id,
-                            label_bitmap: nm.label_bitmap,
-                            property_offset: 0,
-                            created_lsn: nm.created_lsn,
-                            deleted_lsn: nm.deleted_lsn,
-                            valid_from: nm.valid_from,
-                            valid_to: nm.valid_to,
-                        };
+        let seg_overflow = seg.label_overflow();
+        for (row, nm) in seg.node_meta().iter().enumerate() {
+            // Same tie-break as before: take the first occurrence, then replace
+            // only on a strictly-greater created_lsn.
+            let take = match best_node_meta.get(&nm.external_id) {
+                Some(existing) => nm.created_lsn > existing.created_lsn,
+                None => true,
+            };
+            if take {
+                best_node_meta.insert(
+                    nm.external_id,
+                    NodeMeta {
+                        external_id: nm.external_id,
+                        label_bitmap: nm.label_bitmap,
+                        property_offset: 0,
+                        created_lsn: nm.created_lsn,
+                        deleted_lsn: nm.deleted_lsn,
+                        valid_from: nm.valid_from,
+                        valid_to: nm.valid_to,
+                    },
+                );
+                // Overflow follows the winning segment: set it when present,
+                // clear any stale entry from a previously-winning segment.
+                match seg_overflow.get(&(row as u32)) {
+                    Some(labels) => {
+                        best_overflow.insert(nm.external_id, labels.clone());
                     }
-                })
-                .or_insert(NodeMeta {
-                    external_id: nm.external_id,
-                    label_bitmap: nm.label_bitmap,
-                    property_offset: 0,
-                    created_lsn: nm.created_lsn,
-                    deleted_lsn: nm.deleted_lsn,
-                    valid_from: nm.valid_from,
-                    valid_to: nm.valid_to,
-                });
+                    None => {
+                        best_overflow.remove(&nm.external_id);
+                    }
+                }
+            }
         }
     }
 
+    // Re-key label overflow from external_id -> the node's NEW merged row. (A2)
+    let mut merged_overflow: std::collections::HashMap<u32, SmallVec<[u16; 4]>> =
+        std::collections::HashMap::new();
     for new_row in 0..node_count {
         let old_row = inv_perm[new_row] as usize;
         let ext_id = all_node_ids[old_row];
@@ -435,6 +452,9 @@ pub fn compact_segments(
                 valid_from: 0,
                 valid_to: i64::MAX,
             });
+        }
+        if let Some(labels) = best_overflow.get(&ext_id) {
+            merged_overflow.insert(new_row as u32, labels.clone());
         }
     }
 
@@ -484,11 +504,12 @@ pub fn compact_segments(
         created_lsn,
         checksum,
         edge_created_ms_offset: 0, // populated during serialization
+        label_overflow_offset: 0,  // populated during serialization
     };
 
     // Build indexes from compacted data. MPH is empty (no NodeKeys in compaction).
     let mph = MphNodeIndex::build(&[]);
-    let label_index = LabelIndex::build(&node_meta_vec);
+    let label_index = LabelIndex::build(&node_meta_vec, &merged_overflow);
     let edge_type_index = EdgeTypeIndex::build(&edge_meta_vec);
 
     Ok(CsrSegment {
@@ -502,6 +523,7 @@ pub fn compact_segments(
         node_id_to_row,
         mph,
         label_index,
+        label_overflow: merged_overflow,
         edge_type_index,
         created_lsn,
         incoming: std::sync::OnceLock::new(),

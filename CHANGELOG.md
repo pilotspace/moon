@@ -6,6 +6,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — Graph node labels with id ≥ 32 are stored, matched, and persisted (no silent truncation) (PR #193)
+
+CSR node labels were packed into a 32-bit `NodeMeta::label_bitmap`, so any label
+id ≥ 32 was silently dropped at `from_frozen` (`if label < 32`) — `MATCH (a:Label40)`
+matched nothing and a graph using more than 32 distinct labels lost the rest. Labels
+0–31 keep the u32 bitmap fast path; ids ≥ 32 now live in a sparse, per-row
+`label_overflow` store, and `LabelIndex` is built from both sources, so every `u16`
+label id is matchable. The on-disk CSR format is bumped to **version 4** with a new
+version-gated trailing section (`[entry_count][ (row, label_count, label_id…) ]`,
+ascending by row, covered by the existing CRC); the `GraphSegmentHeader` gains a
+`label_overflow_offset` field reusing existing padding (on-disk header size
+unchanged). Both the heap (`from_bytes`) and mmap (`from_mmap_file`) loaders parse
+the section into an owned map via one shared bounds-checked parser (returns
+`CsrError` on truncation, never panics; transitively fuzzed by `csr_from_bytes`),
+and `compact_segments` re-keys overflow labels to each surviving node's new merged
+row. Backward-compatible: version ≤ 3 segments load with an empty overflow store and
+behave exactly as before; `NodeMeta`'s 48-byte layout is unchanged.
+
 ### Fixed — Graph Incoming / Both traversals return incoming edges after compaction (PR #193)
 
 A compacted graph stores edges only in immutable CSR segments, which keep just
