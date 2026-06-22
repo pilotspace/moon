@@ -34,7 +34,7 @@ jobs:
           - conf_parse
           - csr_from_bytes
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
       - name: Override rust-toolchain.toml for nightly
         run: rm -f rust-toolchain.toml
@@ -83,7 +83,7 @@ jobs:
           - conf_parse
           - csr_from_bytes
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
       - name: Override rust-toolchain.toml for nightly
         run: rm -f rust-toolchain.toml

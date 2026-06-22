@@ -16,7 +16,7 @@ jobs:
     env:
       MOON_NO_URING: "1"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.94.1
         with:
           components: rustfmt, clippy
