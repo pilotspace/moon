@@ -36,6 +36,13 @@ and **adding shards hurts uniform single-key non-pipelined throughput** (12 shar
 `docs/reviews/2026-06-17/WIDER-BENCH.md`. The run also patched a latent unfairness in the
 bench scripts (they start Redis AOF-off but Moon AOF-on, flooding ~1M WARN lines).
 
+Follow-up root cause for the `shards=12, pipeline=1` worst case: a controlled single-VM
+A/B (`docs/reviews/2026-06-22/`) isolates it as a three-factor interaction — cross-shard
+dispatch (2 cross-thread wakes/op) × `p=1` (no batch amortization) × random keys (defeat
+the ≥62.5% `AffinityTracker` migration, so the connection never goes local). The collapse
+is confined to the `s12 × random` cell (GET 0.47× / SET 0.41×); `s1 random` is 0.95×/1.15×
+and `s12 single` self-heals to 0.74×/0.73×. WIDER-BENCH.md §4a + `XSHARD-P1-ROOTCAUSE.md`.
+
 ### Fixed — bench-compare.sh / bench-production.sh start moon AOF-off to match Redis (fair, no flood) (PR #194)
 
 Both benchmark scripts started Redis in-memory (`--save "" --appendonly no`) but moon with
