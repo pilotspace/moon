@@ -107,6 +107,27 @@ non-pipelined workloads; add shards only for pipelined/AOF/hash-tag-colocated wo
 
 ---
 
+## 4a. Why `s12 p1` collapses — root cause (follow-up 2026-06-22)
+
+§1 and §4 disagreed on the *same* `GET p=1 s12`: bench-compare **0.82×** vs production
+**0.46×**. The only difference is the key generator — bench-compare runs **without `-r`** (one
+fixed `__rand_key__`, lands on one shard) while bench-production uses **`-r <N>`** (keys spread
+over all 12 shards). A controlled single-VM A/B (`../2026-06-22/xshard-p1-ab.sh`, Linux ELF
+`target-linux`, `p=1 c=50 n=200K`) isolates it as a **three-factor interaction**:
+
+| | single key | random keys (`-r`) |
+|---|:--:|:--:|
+| **s1** (no cross-shard) | GET 0.80× · SET 1.00× | GET 0.95× · SET 1.15× |
+| **s12** | GET 0.74× · SET 0.73× | **GET 0.47× · SET 0.41×** |
+
+The collapse is confined to `s12 × random`. Random keys alone don't hurt (s1=0.95×/1.15×);
+12 shards alone barely hurt (s12 single self-heals to 0.74×/0.73×); only **both** collapse —
+cross-shard dispatch (2 cross-thread wakes/op) × `p=1` (no batch amortization) × random keys
+(defeat the ≥62.5%-to-one-shard `AffinityTracker` migration, so the connection never goes
+local). Full code-grounded analysis: **`../2026-06-22/XSHARD-P1-ROOTCAUSE.md`**.
+
+---
+
 ## 5. Caveats & follow-ups
 - **Memory rows are NOT reportable.** `bench-production.sh`'s memory scenario measures RSS in the *same* Moon
   process *after* the 200K-key throughput tests — RSS is a high-water mark (CLAUDE.md: "FLUSHALL does not

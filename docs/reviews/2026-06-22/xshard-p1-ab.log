@@ -1,0 +1,21 @@
+# xshard p=1 A/B  (n=200000 c=50 P=1)  2026-06-22T06:32:53Z
+
+## Redis baselines (port 7000)
+redis GET single = 295420.97
+redis GET random = 267737.62
+redis SET single = 275862.06
+redis SET random = 253485.44
+
+## Moon shards=1 (port 7001)
+moon s1 GET single = 235294.11   ratio=0.80x
+moon s1 GET random = 253807.11   ratio=0.95x
+moon s1 SET single = 275862.06   ratio=1.00x
+moon s1 SET random = 290275.75   ratio=1.15x
+
+## Moon shards=12 (port 7001)
+moon s12 GET single = 217864.92   ratio=0.74x
+moon s12 GET random = 125707.11   ratio=0.47x
+moon s12 SET single = 202634.25   ratio=0.73x
+moon s12 SET random = 104876.77   ratio=0.41x
+
+# done
