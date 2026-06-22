@@ -55,6 +55,8 @@ Never: implement the feature, or assert on internals.
 - [ ] Coverage target recorded.
 </exit_gate>
 
+> **Advisor · Confidence** — spawn a test-author for a broad red suite (advisor.md); score Completeness — one test per scenario, every rejection covered (confidence.md).
+
 ## Next
 
 `python3 .add/tooling/add.py advance` → read `phases/5-build.md`.

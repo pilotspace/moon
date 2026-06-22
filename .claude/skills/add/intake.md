@@ -31,10 +31,16 @@ First ask "does this change already-frozen scope?" → if yes, it is a `change-r
 → `new-major`; a slice of a live theme → `sub-milestone`; fits the active milestone
 → `task`.
 
+**One-task gap rule.** If the request is ONE task but does NOT fit the active milestone's
+stated scope, do NOT force it into `sub-milestone` (which requires "too big for one task").
+Instead: create a new micro-milestone to house it (`new-milestone` + `new-task`). The
+micro-milestone gives the task ledger attribution and clear exit criteria without inflating scope.
+
 ## What you emit (the proposal)
 
 Present the proposal to the human via `report-template.md` — open with the ARC (goal · done ·
 plan): the goal this request serves, what is already covered, and the plan the chosen bucket sets up.
+Render the proposal as a guided choice — the recommended bucket + its described alternatives (per `report-template.md`).
 
 For every request, emit ONE of:
 

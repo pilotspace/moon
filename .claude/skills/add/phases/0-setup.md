@@ -49,13 +49,41 @@ Ask only the live ones; skip what the request already answers. Rank your drafts 
 one notation every scope level shares — `⚠ <assumption> — lowest confidence because <why>; if wrong: <cost>` — and
 tag thin or inferred answers `guessed`.
 
+## 2c · Domain deep-dive — per-drive, across multiple turns (deepens §2b)
+
+§2b gets a foundation from one question per lens; this step DEEPENS it across **multiple
+turns**, one deep-dive per **drive** — naming all four, including the one §2b's lens list omitted:
+
+| Drive | Deepen |
+|-------|--------|
+| **DDD** (domain) | core nouns → model: the entities, the invariants, the bounded edges |
+| **SDD** (spec) | the milestone outcome → the behaviors and the explicit non-goals |
+| **UDD** (users) | the primary user → the jobs, the surface, the one flow that must feel right |
+| **TDD** (trust) | what "done & trusted" means: the risks to prove, the evidence that closes them |
+
+Capture each surfaced decision as an **ADR** (architecture decision record) into `PROJECT.md`
+**Key Decisions** as it lands — the Decisions lens becomes explicit ADR capture (the *why*, not just the *what*).
+
+**Under `autonomy: auto` with full context, auto-complete all four drives in one pass** — draft
+each without stopping to interview, still lowest-confidence-first, surfacing the top **flag**. Ask
+only the live drives; skip what the request already answered. This deepens **drafting**, never the
+gate: auto-complete NEVER skips the human baseline approval — the `lock` (§4) stays the one decision.
+
 ## 3 · Draft to the lock (both paths)
 
 1. **Fill the living documentation** (it outlives all code): `.add/PROJECT.md` (the foundation — Domain · Spec/active
    milestone · UI/UX · Key Decisions, one screen), `CONVENTIONS.md`, `GLOSSARY.md`, `MODEL_REGISTRY.md`,
-   `dependencies.allowlist`. Brownfield: from the code. Greenfield: from the interview, gaps flagged `guessed`.
-2. **Size the first milestone** (read `scope.md`) and draft its `MILESTONE.md` — goal · scope · exit criteria
-   · breadth-first tasks.
+   `dependencies.allowlist`, and — for a UI project — `DESIGN.md` (the design source of truth: identity ·
+   principles · screens · the named-set foundation pointers + render recipe; delete it if there's no UI;
+   the design-definition loop that fills it — domain → components → wireframe → a captured screen confirmed before build — is `design.md`).
+   Brownfield: from the code. Greenfield: from the interview, gaps flagged `guessed`.
+2. **Propose, then size it.** You just read the codebase (brownfield) or interviewed (greenfield) — so
+   don't silently draft. First float a **kickoff suggestion** for the first milestone the human reacts to:
+   a **goal** (one outcome sentence), a **flow** (the breadth-first task order that gets there), and
+   **scenarios** (concrete examples of what the user can DO once it ships). Keep it a lightweight react-to
+   sketch — a few bullets, NOT the frozen `MILESTONE.md` or per-task §2 suites. This is show-before-ask:
+   the human reacts (confirm / adjust / redirect); you do not auto-create. On their reaction, draft its
+   `MILESTONE.md` (read `scope.md`) — goal · scope · exit criteria · breadth-first tasks.
 3. **Create the first task and draft its candidate specification bundle.** `new-task` is allowed pre-lock:
    ```bash
    python3 .add/tooling/add.py new-task <slug> --title "<first feature>"
@@ -66,9 +94,31 @@ tag thin or inferred answers `guessed`.
 4. **Write `.add/SETUP-REVIEW.md`** per `setup-review.md`: every decision you drafted (foundation, scope,
    first contract), **lowest-confidence-first**, each tagged `guessed` | `evidence-grounded`.
 
+## Run mode — how the build will be driven (propose parallel + auto; confirm to keep)
+
+Before the lock, surface ONE more choice so the human is aware of how ADD will drive the build:
+the **run mode**. Two settings compose it — the **autonomy** level (`add.py autonomy`, run.md: who owns
+the verify gate) and **streams** (`add.py waves` + `streams.md`: whether independent tasks pipeline).
+Show this table so the human sees the flow behavior of each, then PROPOSE the default:
+
+| Run mode | Human gates that fire | Concurrency / flow behavior |
+|----------|-----------------------|-----------------------------|
+| **sequential · manual/conservative** | the contract freeze **and** every Verify, one task at a time | one task start-to-finish before the next; safest, slowest; the reviewer waits on each build |
+| **parallel · auto** *(proposed default)* | the contract freeze **only** — Verify auto-PASSes on complete evidence (security/residue still escalate) | `add.py waves` schedules independent tasks into waves; builds overlap behind their frozen contracts while you review one bundle; the reviewer is never blocked on a build |
+
+**Propose `parallel + auto` as the default, and ask the human to confirm-to-keep** (or downgrade in
+one step — `add.py autonomy set conservative --project`, or just run tasks one at a time). This is a
+confirm, never a silent flip. Record the chosen mode in **`PROJECT.md` Key Decisions** (e.g. "run mode:
+parallel + auto (opt-out), confirmed by <name>") so every later session inherits it.
+
+What the default does **not** change: the irreducible floor still holds — **one human approval per
+contract** fires no matter the mode. `auto` + `parallel` change the *order and throttle* of the build
+(which tasks run when, and who gates Verify), never *whether* the contract decision point fires. A
+high-risk task still refuses `auto` and forces a lowered rung (run.md guard).
+
 ## 4 · The one human gate — the baseline approval
 
-Open the report with the ARC (goal · done · plan) per `report-template.md`, then present
+Open the report with the ARC (goal · done · plan) per `report-template.md`, render the baseline-lock DECISION as a guided choice (the recommended pick + described alternatives), then present
 `SETUP-REVIEW.md` lowest-confidence-first (the `guessed` rows are what the human must actually check). They
 confirm **once** — an explicit yes to the baseline approval itself, in conversation; ambient agreement mid-stream is
 not a confirmation. On that recorded confirmation, you run the lock with their name:

@@ -37,10 +37,24 @@ When every task is done but the goal is not, `add.py status` shows
 4. **Create** each accepted task — `add.py new-task <slug> --title "..."` — and run it through
    the normal flow (specify → … → verify).
 5. **Repeat** until the work the goal needs is done.
-6. **Close** — when the goal is genuinely met, check the exit-criteria boxes in `MILESTONE.md`,
-   then `add.py milestone-done <slug>` succeeds (then consolidate the open deltas and archive).
-   Present the close via `report-template.md` — open with the ARC (goal · done · plan): the
-   milestone goal, the exit-criteria met that prove it, and the plan beyond the close.
+6. **Close** — when the goal is genuinely met, run the **ship review** before you close:
+   - **Fill the ship review first** — write the milestone's `## Close — ship review` section (the
+     scaffold ships in `MILESTONE.md`): **Ship by domain** — what changed per bounded context
+     (`tooling` · `skill` · `book`, or "untouched"); **Cross-task evidence** — one row per task
+     (`gate` · `tests` · `residue`); and the **Goal met?** map — each exit criterion tied to the
+     evidence that satisfies it. This is the whole-milestone, cross-task evidence the human READS;
+     it is evidence, **not a new gate**.
+   - **Check the boxes** — read that evidence, then check the exit-criteria boxes in `MILESTONE.md`
+     (the single affirmation — the same gate as ever), and `add.py milestone-done <slug>` succeeds
+     (then consolidate the open deltas and archive — the `milestone-done → fold → compact → archive`
+     lifecycle, per `fold.md` · `compact-foundation.md`).
+   - **Define the release steps** — write the milestone's `## Release steps` (merge is one small step
+     among them; PR, asset export, tag/publish are others — tool-agnostic hints the human runs).
+     These **feed** the release scope — read `release.md` for the cut; loop.md never re-specifies it.
+   Present the close via `report-template.md` — open with the ARC (goal · done · plan): the milestone
+   goal, the exit-criteria met (with the ship-review evidence) that prove it, and the plan beyond the
+   close. Render the close as a guided choice — the recommended next move + its described alternatives
+   (per `report-template.md`).
 
 ## Reopen is the verb; this loop is the trigger
 

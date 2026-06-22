@@ -40,7 +40,8 @@ That line is the trigger. Before both tallies complete, status is silent and not
    is what these milestones *contain*; this guide proposes them, it does not do them.
 4. **Human confirms** — present the roadmap via `report-template.md`, opening with the ARC
    (goal · done · plan): the stage-graduation goal, the MVP coverage that earns the move, and the
-   plan the production milestones lay out. The human accepts, edits, or declines each drafted
+   plan the production milestones lay out. Render the roadmap as a guided choice — the recommended path
+   + its described alternatives (per `report-template.md`). The human accepts, edits, or declines each drafted
    milestone. No milestone is created without this; nothing advances on a draft the human has not confirmed.
 5. **Flip — the final step** — only now run `add.py stage production`. Because ≥1 production milestone
    now exists, the guard passes and the transition is recorded. This is the orchestration's last act.

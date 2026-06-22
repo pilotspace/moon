@@ -1,8 +1,11 @@
 # Parallel streams — pipelining independent tasks
 
-Load this **only** when a milestone has more than one task and you want to run them
-concurrently. The default ADD path is one task at a time; this rubric is the opt-in
-escape hatch for when independent tasks are queued and a human is ready to review.
+Load this when a milestone has more than one task and you want to run them concurrently.
+**Default:** when a project confirms `parallel + auto` as its run mode at setup
+(`phases/0-setup.md` "Run mode"), parallel streaming is the project default — an **opt-out**, not
+the opt-in it once was; downgrade in one step (`add.py autonomy set conservative --project`, or just
+run tasks one at a time). A project that kept the conservative run mode still treats this rubric as
+the opt-in escape hatch. Either way it changes nothing below.
 
 It changes **no `add.py` code and no phase semantics**. It is a way *you, the
 orchestrator*, drive several tasks at once by reading the dependency DAG that
@@ -35,6 +38,44 @@ Compute both from one `python3 .add/tooling/add.py status` — no new state:
        └──────────────── a task gating PASS unblocks its dependents ──────────────┘
 ```
 
+## The DAG strategy — let the engine schedule the waves (`add.py waves`)
+
+Do **not** eyeball the READY-QUEUE by hand once a milestone has more than a couple of
+tasks — the engine computes the whole schedule from the dependency DAG `status` already
+holds. `add.py waves` (read-only, writes nothing) groups the active milestone's not-done
+tasks into **topological waves**, names the **critical path**, and emits an advisory
+**tier hint** — exactly the inputs you need to fan out effectively:
+
+```
+$ add.py waves
+milestone: v13-onboarding-polish
+wave 1: dag-scheduler, setup-suggest-milestone, setup-domain-deepdive, soul-artifact
+wave 2: setup-run-mode (deps: dag-scheduler), soul-self-improve (deps: soul-artifact)
+critical path: dag-scheduler → setup-run-mode  (2 tasks)
+tier hint: top → dag-scheduler, setup-run-mode; mid → the rest
+```
+
+Read the schedule as a strategy, not a command:
+
+- **Wave = a fan-out batch.** Every task in a wave has all its in-milestone deps already
+  PASS, so the whole wave is spawnable at once (one worker per task, `isolation="worktree"`).
+  Finish a wave, gate its tasks PASS, then `add.py waves` again — the next wave is unblocked.
+- **Run the widest wave first.** It hides the most build latency under the human's review
+  latency (the honest frame above): more concurrent builds while the reviewer reads one bundle.
+- **Spend your strongest model on the critical path.** The critical-path tasks gate the most
+  downstream work, so a wrong-but-plausible result there is the costliest — give them the
+  **top** tier (`run.md` tiers); off-path tasks take **mid**. The tier hint is exactly this rule,
+  applied to the graph. It is **advisory** — graph position is a proxy for scope difficulty, not a
+  gate; override it when you know a task is harder than its position suggests.
+- **`--json`** (`{ milestone, waves, critical_path, critical_path_len, tiers, blocked }`) feeds a
+  runner that spawns the wave programmatically. `blocked` lists any task whose dep can never be
+  satisfied within this milestone (a cross-milestone dep) — surfaced, never silently dropped; a
+  `dependency_cycle` is refused with the offending members named (no schedule exists).
+
+What `waves` does **not** change: the irreducible floor below still holds — one human approval
+per contract, builds overlap but the review queue stays serial. `waves` decides *order and model*,
+never *whether the human gate fires*.
+
 ## The autonomy level is the throttle (not a new flag)
 
 How much concurrency you actually get is set by each task's `autonomy:` header
@@ -42,9 +83,9 @@ How much concurrency you actually get is set by each task's `autonomy:` header
 
 | `autonomy` (TASK.md) | What serializes on the human | Concurrency |
 |----------------------|------------------------------|-------------|
-| `conservative` | bundle approval **+** every Verify | pure pipelining — builds overlap, both gates queue |
+| `conservative` / `manual` | bundle approval **+** every Verify | pure pipelining — builds overlap, both gates queue (`manual` is the strict floor; same streams behaviour) |
 | `auto` (default) | bundle approval **only**; Verify auto-PASSes on evidence | real concurrency — only the decision point + residue escalations queue |
-| `auto` but **high-risk** | refused → forced `conservative` (`unguarded_high_risk_auto`) | back to pipelining, by design |
+| `auto` but **high-risk** | refused → must lower to `conservative` / `manual` (`unguarded_high_risk_auto`) | back to pipelining, by design |
 
 The irreducible floor is **one human approval per task at the contract decision point** — the decision point
 never drops to zero (`run.md:22`). That floor is correct; do not engineer around it.
@@ -72,6 +113,16 @@ never drops to zero (`run.md:22`). That floor is correct; do not engineer around
   worktree forked from a stale base forces the worker to recreate the frozen artifacts by hand
   (the v10 dogfood hit exactly this). Before the worker starts, confirm `git -C <worktree>
   rev-parse HEAD` equals the orchestrator's `HEAD`; if it drifted, `git merge` the base in first.
+  On a runner that creates each worktree **at spawn** from a pool (e.g. Claude Code), that pool can hand
+  out a STALE base, so the pre-spawn `rev-parse` evidence cell is unsatisfiable. The `unverified_fork_base`
+  check then **shifts** — it never skips: the worker's **step-0** syncs to base (`git merge` the orchestrator's
+  `HEAD`) and re-echoes `rev-parse HEAD`, which the orchestrator verifies at **merge-time**, before merge-back.
+  The pre-spawn check stays the DEFAULT for fresh-`HEAD`-worktree runners; the merge-time path is the additive
+  ALTERNATIVE for spawn-time runners — never a replacement of the pre-spawn rule.
+  **The engine executes this gate** (engine-merge-base-enforcement): run
+  `python3 .add/tooling/add.py wave-verify` before the first merge-back — it refuses a mismatched or
+  pending echo (`unverified_fork_base`) and an off-template ledger (`wave_ledger_malformed`, fail-closed);
+  `add.py check` is the standing monitor (red at `status: merging`, `fork_base_pending` WARN at `live`).
 - **Lease + timeout** — record which worker holds which task (in the wave ledger, below);
   if a worker dies, release the claim back to READY (re-spawn, do not assume partial work is sound).
 - **Failure isolates** — a worker that hits a STOP-and-escalate (below) blocks only its
@@ -114,7 +165,10 @@ base: <orchestrator HEAD at spawn — the sha every fork must equal>
 `git -C <worktree> rev-parse HEAD`, and it must equal `base:`. A tick is not evidence; a row
 you can only fill by running the command is the fresh-worktree-base check EXECUTING — the
 v12-1 lesson (words-exist ≠ method-works) closed structurally. Spawning a worker whose roster
-row lacks that evidence is refused (`unverified_fork_base`).
+row lacks that evidence is refused (`unverified_fork_base`). On a spawn-time pool runner this
+PRE-spawn paste is unsatisfiable (the pooled base is stale until the worker syncs), so the cell
+instead holds the worker's **step-0** post-sync echo (still `== base:`) and the `unverified_fork_base`
+refusal **shifts to merge-time**, before merge-back — it shifts, it never lifts.
 
 **Lifecycle — open → consume → digest → delete.** Open the ledger when the first worker
 spawns. The serial integration Verify consumes it (the merge order is read from it, one
@@ -181,7 +235,7 @@ STOP-and-escalate (return your findings; do not decide):
   • a discovered scope/contract gap  → backward-correction, reopen Specify (principle 4)
   • any SECURITY finding              → HARD-STOP, always
   • a concurrency/timing OR architecture/layering risk the tests cannot exercise
-  • [include this bullet ONLY when autonomy=conservative] the verify gate itself — STOP for the human
+  • [include this bullet when autonomy is conservative OR manual — any lowered rung] the verify gate itself — STOP for the human
 Auto-PASS only if autonomy=auto AND: all tests green · coverage not decreased · no test weakened ·
   no contract edited · loops dry · completeness-critic clean · no residue above. Log it as
   auto-resolved, naming this run as owner — never forge a human signature.
@@ -204,7 +258,9 @@ ripgrep otherwise. Design every IO path for failure — timeouts, retries, rollb
 </tools>
 
 <return>   <!-- the worker PROPOSES; the orchestrator RECORDS. A worker never runs add.py. -->
-End with a structured verdict AND write the same into SUMMARY.md in the task dir:
+End with a structured verdict AND write the same into SUMMARY.md in the task dir, then
+**commit SUMMARY.md + deltas.md** in the worktree (uncommitted worktree files survive only by
+harness courtesy — commit them so the serial-integration merge-back carries your report):
 { task, outcome: PASS|RISK-ACCEPTED|HARD-STOP|ESCALATE, evidence: <tests+coverage>,
   residue: [security|concurrency|architecture findings], deltas: [open lessons learned] }.
 Do NOT touch add.py or any shared file — the orchestrator gates on your verdict.
@@ -222,7 +278,7 @@ The contract is identical whichever model runs it (the model is disposable, like
 | **top** | complex / ambiguous / cross-cutting / broad scope of impact | `opus` | the runner's strongest reasoning model |
 
 Two rules sit **above** model choice and never bend:
-- **High-risk ⇒ `conservative` autonomy, regardless of model** (`run.md` high-risk guard). A
+- **High-risk ⇒ a lowered rung (`conservative` or `manual`), regardless of model** (`run.md` high-risk guard). A
   stronger model does not buy back the human gate.
 - **Security residue always escalates** — no tier and no model auto-passes it.
 

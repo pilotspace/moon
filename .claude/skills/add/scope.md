@@ -20,6 +20,25 @@ scope drafting honors intake's classification — it never re-sizes a request:
 means one drafting pass, NOT auto-creation. Nothing is written to disk — single draft or the
 whole batch — until the human confirms. You propose; you wait.
 
+## Position the goal — ground in assets, relate to the milestone map   (do this FIRST)
+
+Before you draft the goal sentence — before Diverge below — position the request in what
+already exists. You cannot write a correct goal without knowing where it sits.
+
+1. **Ground in current assets.** Read the goal input against `PROJECT.md` (domain · spec ·
+   UI/UX), the code it touches, and the existing docs — so the goal is grounded in what the
+   project already is, not in what you assume.
+2. **Relate to the milestone map.** Read every existing goal — `.add/milestones/*/MILESTONE.md`
+   and `.add/archive/*` — and name THIS request's relationship to them: *extends* theme X ·
+   *depends-on* Y · *overlaps* Z. Record that relationship in the `rationale` line you will write.
+3. **If the goal is already delivered** by an existing milestone, do NOT fork it — reject
+   `duplicate_goal` and route the request as a `task` or `change-request` (create nothing).
+
+This COMPLEMENTS `intake.md`'s bucket test (which weighs only whether a live milestone's goal
+covers the request); positioning also grounds the goal in current assets and relates it to the
+prior milestone map (`.add/milestones/*` + `.add/archive/*`) — which classification does not do.
+Point at intake for the bucket; do not restate it here.
+
 ## Brainstorm before you draft — co-specify at milestone level
 
 Don't draft a MILESTONE.md from thin input. Run the same three-move co-specify as a
@@ -39,11 +58,14 @@ Rank assumptions lowest-confidence first; the top 1–2 get the flag the human r
 `⚠ <assumption> — lowest confidence because <why>; if wrong: <cost>`. Present the draft via
 `report-template.md` — open with the ARC (goal · done · plan): the goal this milestone serves,
 what is already covered, and the plan its task list lays out.
+Render the draft as a guided choice — the recommended scope + its described alternatives (per `report-template.md`).
 
 ## Drafting a good MILESTONE.md (section by section)
 
 - **goal** — ONE sentence, an outcome not an output ("a user can size any request", not "write
   intake.md"). If it needs an "and", it is probably two milestones.
+- **rationale** — the confirmed intake bucket + WHY (the theme · slice · fit), AND the milestone
+  relationship you captured in "Position the goal" above. One or two header lines; never in state.json.
 - **Scope In/Out** — the explicit anti-creep deferral list. Naming what is OUT is as important
   as what is IN; an empty Out list usually means the scope is not yet thought through.
 - **Shared decisions & glossary deltas** — cross-cutting rules every task must honor, named from
@@ -53,6 +75,22 @@ what is already covered, and the plan its task list lays out.
   by phase; keep each task one-file-sized. Order by dependency, not by guesswork.
 - **Exit criteria** — observable, and **every exit criterion maps to a declared task slug**
   (no dangling criterion). Each line answers "which task delivers this, and how would we see it?"
+- **Close — ship review** + **Release steps** — leave these as the template at draft time: they are
+  **drafted-blank** here and filled LATER (Close at `milestone-done`, the close flow; Release steps when
+  the ship path is known, owned by `release.md`) — not scope drafting. Named here so you know the full
+  9-section shape and neither fill them early nor read a fresh draft as "incomplete".
+
+## Draft well-formedness gate   (a draft passes ALL of these before you propose it)
+
+A scope draft is well-formed — ready to show the human — only when:
+- [ ] the goal is ONE outcome sentence (no "and" — that is two milestones)
+- [ ] every exit criterion maps to a declared task slug (no dangling criterion)
+- [ ] `rationale` records the bucket + the milestone relationship from "Position the goal"
+- [ ] `Close — ship review` and `Release steps` are left as the template (drafted-blank)
+- [ ] the In/Out list names what is deferred (an empty Out list is unfinished thinking)
+
+Propose only a well-formed draft — an incomplete one is the gap that lets a milestone reach
+task breakdown half-formed.
 
 ## Reject codes (emit `{ reject, rationale }`, create nothing)
 
@@ -64,6 +102,9 @@ what is already covered, and the plan its task list lays out.
   a malformed milestone. With no engine lint, you are the first check and the human is the backstop.
 - `no_milestone` — intake routed the request to `task` or `change-request`; scope drafting
   creates NO milestone. Honor the classification; do not invent milestone-sized scope.
+- `duplicate_goal` — the goal is already delivered by an existing milestone (live or in
+  `.add/archive/`). Do NOT fork it into a parallel milestone; route the request as a `task` or
+  `change-request` and create nothing. (Raised by the "Position the goal" step.)
 </reject_codes>
 
 ## Worked example (from this repo's own history)

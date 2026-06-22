@@ -28,6 +28,7 @@ Objective: one scenario per Must and per Reject rule, each result specific and o
 Steps:
   1. Write one scenario per Must rule and one per Reject rule.
   2. For every rejection add an And-clause asserting what must NOT change.
+  3. Sweep for the edge cases the spec omits — boundary, duplicate, partial failure, concurrency, malformed input — add one per case that applies, or rule it out on purpose.
 Never: settle for a vague result ("then it works") — results must be specific and observable.
 </prompt>
 
@@ -36,9 +37,12 @@ Never: settle for a vague result ("then it works") — results must be specific 
 <exit_gate>
 - [ ] One scenario per Must rule.
 - [ ] One scenario per Reject rule.
+- [ ] Edge cases the spec omits are covered (boundary · duplicate · partial failure · …) or ruled out on purpose.
 - [ ] Each result is a specific, observable fact.
 - [ ] Every rejection asserts what stays unchanged.
 </exit_gate>
+
+> **Advisor · Confidence** — delegate a wide scenario sweep when the surface is large (advisor.md); score Edge cases honestly — a missing case surfaces there first (confidence.md).
 
 ## Next
 

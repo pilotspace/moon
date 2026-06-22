@@ -28,7 +28,7 @@ What the human is actually approving in that one gate: that the drafted Spec cap
 that the Scenarios cover the cases that matter, and that the Contract shape is the one to freeze. Reject
 any part and the bundle goes back to draft — that is backward-correction (principle 4), not failure.
 Approve, and the run begins. The decision-point guide (`phases/3-contract.md`) carries the
-**freeze review checklist** — six lines that walk the human through exactly this, ⚠-first.
+**freeze review checklist** — seven lines that walk the human through exactly this, ⚠-first.
 
 **The lowest-confidence flag — aiming the one approval.** A single approval over a whole bundle is easy to
 grant without reading. So the AI presents the bundle **lowest-confidence first**: of everything it is asking the human
@@ -117,6 +117,34 @@ The auto-gate NEVER writes a human signature it did not get. An auto-PASS is log
 honestly — the line between a pass and a skip is the recorded outcome, not a forged name.
 </constraints>
 
+## The bounded self-heal loop — a confirmed cheat returns to build
+
+The auto-gate trusts evidence; but evidence can be **gamed**. A build can make the unchanged red suite
+pass without EARNING it — a test or the frozen contract edited after the red run, src **overfit** to the
+fixtures, **vacuous** asserts, or real logic **stubbed away**. That is a **confirmed cheat**, and a cheat
+is **HARD-STOP-class**: never auto-passed, never RISK-ACCEPTED-waived (like a security finding). But a
+first cheat is not yet a stop — it is a chance to redo honestly.
+
+So a confirmed cheat enters a **bounded self-heal loop**: the engine returns the task to **build** for an
+honest redo, **counts** the attempt, and **caps** it. After **3** honest re-build attempts a fourth
+confirmed cheat forces a **HARD-STOP that escalates to the human** — never an auto-PASS, never an unbounded
+loop. The engine COUNTS, CAPS, and ESCALATES; the **agent** does the honest re-build (the engine never
+auto-fixes). The counter is **monotonic** — it never auto-resets, so the cap cannot be cleared by
+re-crossing a phase; only an honest build (no cheat) escapes the loop, and an honest build PASSes even at
+the third attempt (the cap bites a *continued* cheat, never a recovery).
+
+Two findings enter the loop:
+- **mechanical** (enforced) — the tamper tripwire (`tamper-tripwire`): at the gate the engine re-hashes the
+  red test files + the frozen §3 against the `tests→build` snapshot; any divergence is a cheat, routed to
+  the loop before any completing outcome is recorded.
+- **semantic** (honor-system, necessary-not-sufficient) — the **adversarial refute-read** (`6-verify.md`):
+  an independent reviewer argues "the green was NOT earned" and, on a confirmed overfit/vacuous/stub, the
+  agent reports it with `add.py heal <slug> --reason "<finding>"`. The engine cannot SEE a judgment cheat,
+  so this entry is the agent's honest report — the human verify gate stays the real backstop.
+
+The mechanical entry returns-to-build automatically at the gate; the `heal` verb is how a *reported* cheat
+enters the same bounded loop. Either way: ≤3 honest redos, then escalate. A gamed green never ships.
+
 ## Emitting deltas — feeding the foundation back
 
 The completeness-critic does not discard what it finds. Every gap, surprise, or convention that helped
@@ -137,14 +165,19 @@ How much a run may auto-gate is a **per-scope setting**, not a global switch (pr
 earned per scope). A task declares its level in its `TASK.md` header:
 
 ```
-autonomy: auto | conservative
+autonomy: manual | conservative | auto
 ```
 
-- **auto (the default)** — the run may auto-PASS when the evidence + residue checks above are
+An ordered ladder — `manual < conservative < auto` — declared once in the header and reviewed at the freeze:
+
+- **auto (the seeded default)** — the run may auto-PASS when the evidence + residue checks above are
   satisfied. Security still always escalates. This is the default starting point: a frozen contract
   flips the task into a self-driving run that converges and auto-gates on evidence.
 - **conservative** — the deliberate *lowering*: the run does all the work and converges, but STOPS at
   the verify gate for a human. Auto-PASS is disabled. Choose it wherever evidence is thin or risk is high.
+- **manual** — the strict floor: the human owns the verify gate and the engine never auto-resolves
+  (behaviourally the conservative floor with the explicit "I drive this decision; the AI proposes only"
+  name). Choose it for the highest-stakes scope; like `conservative`, it satisfies the high-risk guard.
 
 > **v7 reversal (recorded, not hidden).** Earlier the default was `conservative` and `auto` was the
 > earned exception; v7 flips this — `auto` is the default, `conservative` is the deliberate lowering.
@@ -154,7 +187,8 @@ autonomy: auto | conservative
 **The high-risk guard — `auto` is refused where it matters most.** The autonomy level is not a blank cheque. On a
 **high-risk or method-defining scope** — anything where a wrong-but-plausible result is expensive or
 hard to reverse (auth, money, data-loss paths, the method/trust-layer itself) — `auto` must be lowered
-to `conservative`; leaving it at `auto` there is the reject code **`unguarded_high_risk_auto`**. This
+to a stricter rung — `conservative` or `manual`; leaving it at `auto` there is the reject code
+**`unguarded_high_risk_auto`**. This
 closes the v6 dogfood gap, where the whole milestone ran at `auto` on the riskiest possible
 scope (defining the method) with no friction. The default is `auto` *for ordinary, well-tested scope*;
 high risk still earns a human gate.
@@ -163,9 +197,18 @@ Judging *what* is high-risk stays human — the scope declares **`risk: high`** 
 header where the autonomy level lives, reviewed at the freeze like every header line (the engine never
 classifies scope). **Since v14 the guard is mechanical for the declared case:**
 the engine refuses the declared combination — `add.py gate` will not complete (`PASS`/`RISK-ACCEPTED`) a task whose header
-carries `risk: high` without `autonomy: conservative` (error `unguarded_high_risk_auto`; `HARD-STOP`
+carries `risk: high` without a lowered level — `conservative` or `manual` (error `unguarded_high_risk_auto`; `HARD-STOP`
 always records — stopping is never blocked), and `add.py audit` flags the same code on a finished
 record whose header was tampered or whose GATE RECORD reviewer is the auto-gate — which CI enforces
 (audit-ci). The honest limit mirrors the audit's: an **undeclared** high-risk scope passes; declaring
 is the human decision point, the engine enforces what was declared.
+
+**Autonomy is earned by goal-clarity — the auto-ready goal.** The level decides *who* resolves Verify;
+an **auto-ready goal** decides whether a self-verifying run is even *meaningful*. A milestone goal is
+auto-ready when **every exit criterion cites a verifier** — `(verify: <test | command | metric>)` — so the
+run can check its own result against the goal without human judgment. `add.py check` raises a
+`goal_not_auto_ready` WARN (never red, the active milestone only) while criteria are uncited, and `status`
+prints a `goal-ready:` line every session. It **measures, never blocks** — it changes neither the freeze
+gate nor the autonomy level. The lint forces a citation slot per criterion (raising the floor) but cannot
+prove the citation is honest (`(verify: it works)` passes) — that judgment stays the human's.
 </constraints>
