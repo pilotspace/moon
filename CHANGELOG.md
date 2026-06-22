@@ -6,6 +6,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-06-22
+
+Bundles 5 closed milestones (first ADD-recorded cut; see `RELEASES.md` for
+attribution): **Shared-Nothing Integrity & Cross-Shard Latency** (3 carried) ·
+**Multi-Core Throughput Hardening** (12 carried) · **Throughput Polish**
+(3 carried) · **FTS Hardening** (8 carried) · **Graph Correctness & Cypher
+Filtering**. Headlines: working FTS query combinators (OR / TEXT+TAG / NUMERIC)
+with true total-matched counts and the O(M²) high-DF cliff gone; correct Cypher
+inline-property narrowing, incoming-edge traversal after compaction, and >32
+graph labels; WAL group-commit, cross-shard read fast-path, and off-event-loop
+FT.SEARCH throughput wins. Per-change detail below.
+
+### Risk-accepted (shipped, disclosed) — cross-shard read fast-path removed (PR #175)
+
+The shared-nothing migration (PR #175) deleted the direct-`RwLock` cross-shard
+read fast-path; cross-shard reads now route through the owner shard's SPSC ring,
+so cross-shard-read cells regress versus the pre-migration lock-read. This is a
+**signed RISK-ACCEPTED waiver** (owner: Tin Dang) carried into this release, with
+a follow-up task **cross-shard-read-acceleration** (lock-free cross-shard read
+acceleration) tracked to land before **2026-08-01**. No correctness impact —
+consistency is 197/197 across 1/4/12 shards on both runtimes; the cost is latency
+on the cross-shard read path only.
+
 ### Docs — Verified cross-arch GCloud benchmark confirms v3-1 FTS + v3-2 graph fixes (PR #194)
 
 Re-ran the 4-feature concurrent-vs-competitor benchmark (KV / Vector / Graph / FTS
