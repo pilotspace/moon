@@ -6,7 +6,7 @@
 > UI/UX = UDD. When a loop reveals a gap here, come back and update this file —
 > that is the re-entrant arrow from the engine down to the foundation.
 
-slug: moon · stage: production · updated: 2026-06-17 · foundation-version: 6
+slug: moon · stage: production · updated: 2026-06-17 · foundation-version: 7
 goal: a Redis-compatible server whose thread-per-core architecture measurably out-scales Redis on multi-core hardware — without sacrificing protocol compatibility or durability semantics
 
 ---
@@ -25,6 +25,7 @@ goal: a Redis-compatible server whose thread-per-core architecture measurably ou
   - [foundation v6, 2026-06-17] Graph CSR compaction (`compact_segments`) merges at the **external_id** level, NOT NodeKey — so a compacted segment's `node_id_to_row` is left EMPTY by design and `lookup_node` returns None on it. Two fresh `MemGraph::new()` share an external-id keyspace (same `external_id` ⇒ same logical node). Any consumer needing a post-merge row (e.g. the label-overflow re-key) must locate it by `external_id`, never `lookup_node` (graph-label-bitmap-overflow).
 
 ## Spec / Living Document (SDD) — what we are building, now
+- (SDD) a RELATIVE-only win (OrbStack +18→+22.9%) needs an ABSOLUTE bare-metal cross-check before a line is closed — the absolute residual (~10µs) is the number that actually decides coalesce/RCU, invisible to a same-run ratio (evidence: this whole task; the residual was unknowable from the relative table).  [folded foundation-version 7 · from xshard-read-gcloud-validation]
 - Active milestone → `.add/milestones/v1-shared-nothing/MILESTONE.md` (see `add.py status`)
 - Frozen contracts (living docs): RESP2/RESP3 wire compatibility with Redis (external, immutable); CI matrix (fmt, clippy ×2, tests ×2, MSRV 1.94, unsafe/unwrap audits, fuzz)
 - Settled vs still open: settled — thread-per-core + SPSC mesh architecture, monoio default on Linux. Open — sub-linear multi-shard scaling (root causes mapped in 2026-06 review: leaky shared-nothing + 1ms monoio wake floor)
@@ -44,6 +45,7 @@ goal: a Redis-compatible server whose thread-per-core architecture measurably ou
 ## Key Decisions (append-only)
 | date | decision | why | outcome |
 |------|----------|-----|---------|
+| 2026-06-23 | fold all → foundation-version 7 (SDD 1 · TDD 1 · ADD 2) | consolidate captured OBSERVE lessons into the versioned foundation | 4 lessons open→folded; +4 routed bullets; 6→7 |
 | pre-ADD | thread-per-core, monoio/io_uring default on Linux | syscall/wakeup cost dominates at high QPS | shipped v0.3.0 |
 | pre-ADD | per-shard WAL, no global append lock | Redis single-AOF serializes at depth | AOF advantage grows with pipeline depth |
 | pre-ADD | SSO CompactKey(23B)/CompactValue(12B) | per-key memory vs naive Arc<String> | lower RSS than Redis per key |
