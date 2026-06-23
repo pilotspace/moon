@@ -1,8 +1,8 @@
 {
   "project": "moon",
   "stage": "production",
-  "active_task": "graph-label-bitmap-overflow",
-  "active_milestone": "v3-1-fts-hardening",
+  "active_task": null,
+  "active_milestone": null,
   "tasks": {
     "hotpath-lock-quickwins": {
       "title": "Eliminate per-command global locks & syscall-level quick wins",
@@ -238,7 +238,7 @@
     }
   },
   "created": "2026-06-11T03:18:21+00:00",
-  "updated": "2026-06-17T01:48:51+00:00",
+  "updated": "2026-06-23T08:25:16+00:00",
   "setup": {
     "locked": true,
     "locked_at": "2026-06-11T03:28:00+00:00",
@@ -248,5 +248,16 @@
       "scope",
       "contract"
     ]
-  }
+  },
+  "archived": [
+    {
+      "slug": "v2-2-xshard-read-validation",
+      "title": "V2 2 Xshard Read Validation",
+      "tasks": 1,
+      "task_slugs": [
+        "xshard-read-gcloud-validation"
+      ],
+      "archived": "2026-06-23"
+    }
+  ]
 }

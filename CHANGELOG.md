@@ -6,6 +6,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Validated — cross-shard read C2 fast-path measured on bare-metal GCloud (measure-only, no src change)
+
+Ported the quiesced-xshard latency instrument to dedicated-core GCloud bare-metal
+(`scripts/gcloud-xshard-absolute.sh`) to record TRUE absolute cross-shard read
+latency for the shipped C2 reply-spin fast-path — the win the shardslice waiver
+(expires 2026-08-01) left validated only as an OrbStack same-run *relative* ratio.
+Dual-vendor (Intel `c3-standard-22` + AMD `c2d-standard-16`), dual-runtime
+(monoio + tokio), best-of-5 floor, fail-closed validity gates (load/steal/clean/
+s1-LOCAL-control). Confirms the regression and the C2 recovery are real and
+vendor-independent: the singleton cross-shard read (`s4-c1-GET`) regresses ~17µs
+(Intel) / ~20µs (AMD) at the SPSC migration and C2 recovers ~38–46% of it, with a
+**vendor- and runtime-invariant ~10µs residual** to the pre-migration lock-read
+floor (the second, irreducible cross-thread reply hop). Guard cells (`s4-c100-GET`,
+`s4-P16`) unregressed at the C2 commit. Mechanism asserted byte-identical
+(`tests/xshard_mechanism_unchanged.rs`); `git diff --stat src/` empty. Evidence +
+disposition in `tmp/XSHARD-GCLOUD-ABS.md`.
+
 ## [0.4.0] — 2026-06-22
 
 Bundles 5 closed milestones (first ADD-recorded cut; see `RELEASES.md` for
