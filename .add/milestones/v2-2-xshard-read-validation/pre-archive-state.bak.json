@@ -1,0 +1,47 @@
+{
+  "milestone": {
+    "title": "V2 2 Xshard Read Validation",
+    "goal": "the shipped cross-shard read fast-path is validated on a trustworthy absolute instrument (GCloud bare-metal), with a data-backed decision on whether coalescing / RCU acceleration is warranted",
+    "stage": "production",
+    "status": "done",
+    "created": "2026-06-22T16:34:59+00:00",
+    "updated": "2026-06-23T08:24:50+00:00"
+  },
+  "tasks": {
+    "xshard-read-gcloud-validation": {
+      "title": "Xshard Read Gcloud Validation",
+      "phase": "done",
+      "gate": "PASS",
+      "milestone": "v2-2-xshard-read-validation",
+      "depends_on": [],
+      "created": "2026-06-22T16:35:05+00:00",
+      "updated": "2026-06-23T08:04:21+00:00",
+      "flag_verified": true,
+      "tripwire": {
+        "contract_md5": "d9a655fe271be9fb854f7c1653faff0a",
+        "tests": {}
+      },
+      "scope": {
+        "declared": [
+          ".add/tasks/xshard-read-gcloud-validation/CHANGELOG.md",
+          "scripts/gcloud-xshard-absolute.sh",
+          "tests/xshard_mechanism_unchanged.rs",
+          "tests/xshard_gcloud_harness_selftest.sh",
+          "tmp/XSHARD-GCLOUD-ABS.md"
+        ],
+        "snapshot_md5": "8cf972f73039efbe82655b67e0a3dfca"
+      },
+      "heal": {
+        "attempts": 1,
+        "history": [
+          {
+            "at": "2026-06-23T08:00:07+00:00",
+            "reason": "scope_violation: task 'xshard-read-gcloud-validation' touched outside its declared \u00a75 Scope \u2014 CHANGELOG.md \u00b7 target/.rustc_info.json \u00b7 target/CACHEDIR.TAG \u00b7 target/debug/.cargo-lock \u00b7 target/debug/.fingerprint/adler2-f944d3465e92b4a8/dep-lib-adler2 (5384 total)",
+            "source": "scope"
+          }
+        ]
+      }
+    }
+  },
+  "archived_at": "2026-06-23T08:25:16+00:00"
+}
