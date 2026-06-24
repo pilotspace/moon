@@ -49,7 +49,7 @@ hex = "0.4"
 uuid = { version = "1", features = ["v7"] }
 ctrlc = "3.4"
 metrics = "0.24"
-metrics-exporter-prometheus = { version = "0.16", default-features = false, features = ["http-listener"] }
+metrics-exporter-prometheus = { version = "0.18", default-features = false, features = ["http-listener"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12"], optional = true }
 rustls-pemfile = { version = "2", optional = true }
 aws-lc-rs = { version = "1", optional = true }
