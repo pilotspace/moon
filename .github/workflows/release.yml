@@ -145,7 +145,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@1.94.1
+      - uses: dtolnay/rust-toolchain@1.100.0
         with:
           targets: ${{ matrix.target }}
 
@@ -215,7 +215,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@1.94.1
+      - uses: dtolnay/rust-toolchain@1.100.0
         with:
           targets: x86_64-pc-windows-msvc
 
@@ -353,7 +353,7 @@ jobs:
           path: artifacts/
           merge-multiple: true
 
-      - uses: dtolnay/rust-toolchain@1.94.1
+      - uses: dtolnay/rust-toolchain@1.100.0
 
       - name: Install cargo-cyclonedx
         run: cargo install cargo-cyclonedx --locked
