@@ -557,6 +557,42 @@ mod tests {
         assert!(!entry.has_expiry());
     }
 
+    #[test]
+    fn test_getset_wrongtype_preserves_key() {
+        // Regression (data-loss): GETSET on a wrong-type key must return WRONGTYPE
+        // and MUST NOT overwrite it. Previously db.set_string ran unconditionally.
+        let mut db = make_db();
+        db.set(Bytes::from_static(b"myhash"), Entry::new_hash());
+        let result = getset(&mut db, &[bs(b"myhash"), bs(b"newval")]);
+        match result {
+            Frame::Error(e) => assert!(e.starts_with(b"WRONGTYPE")),
+            other => panic!("Expected WRONGTYPE error, got {other:?}"),
+        }
+        // The hash must be intact: a plain GET still reports WRONGTYPE (not the new string).
+        match get(&mut db, &[bs(b"myhash")]) {
+            Frame::Error(e) => assert!(e.starts_with(b"WRONGTYPE")),
+            other => panic!("GETSET must not overwrite a wrong-type key, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_set_get_option_wrongtype_preserves_key() {
+        // Regression (data-loss): SET key val GET on a wrong-type key must return
+        // WRONGTYPE and perform NO write (precedence over NX/XX). Previously db.set
+        // ran unconditionally, destroying the wrong-type value.
+        let mut db = make_db();
+        db.set(Bytes::from_static(b"myhash"), Entry::new_hash());
+        let result = set(&mut db, &[bs(b"myhash"), bs(b"newval"), bs(b"GET")]);
+        match result {
+            Frame::Error(e) => assert!(e.starts_with(b"WRONGTYPE")),
+            other => panic!("Expected WRONGTYPE error, got {other:?}"),
+        }
+        match get(&mut db, &[bs(b"myhash")]) {
+            Frame::Error(e) => assert!(e.starts_with(b"WRONGTYPE")),
+            other => panic!("SET..GET must not overwrite a wrong-type key, got {other:?}"),
+        }
+    }
+
     // --- GETDEL tests ---
 
     #[test]

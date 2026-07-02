@@ -127,6 +127,13 @@ pub fn set(db: &mut Database, args: &[Frame]) -> Frame {
         None
     };
 
+    // Check-before-mutate (Redis parity): SET ... GET on a wrong-type key returns
+    // WRONGTYPE and performs NO write. This takes precedence over NX/XX handling.
+    // Previously db.set(...) ran unconditionally, overwriting (destroying) the value.
+    if matches!(old_value, Some(Frame::Error(_))) {
+        return old_value.unwrap_or(Frame::Null);
+    }
+
     // NX + XX both set: contradictory, return nil (or old value if GET)
     if nx && xx {
         return if get_old {
@@ -636,8 +643,14 @@ pub fn getset(db: &mut Database, args: &[Frame]) -> Frame {
         )),
     });
 
-    // GETSET removes TTL (sets new entry without expiry)
-    db.set_string(key, value);
-
-    old.unwrap_or(Frame::Null)
+    // Check-before-mutate (Redis parity): a wrong-type key must return WRONGTYPE
+    // and stay untouched. Previously db.set_string ran unconditionally, destroying it.
+    match old {
+        Some(Frame::Error(e)) => Frame::Error(e),
+        other => {
+            // GETSET removes TTL (sets new entry without expiry)
+            db.set_string(key, value);
+            other.unwrap_or(Frame::Null)
+        }
+    }
 }
