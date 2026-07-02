@@ -575,6 +575,24 @@ mod tests {
         assert_eq!(result, Frame::Null);
     }
 
+    #[test]
+    fn test_getdel_wrongtype_preserves_key() {
+        // Regression (data-loss): GETDEL on a wrong-type key must return WRONGTYPE
+        // and MUST NOT delete the key. Previously db.remove() fired before the type
+        // check, destroying the key and then returning WRONGTYPE as if nothing happened.
+        let mut db = make_db();
+        db.set(Bytes::from_static(b"myhash"), Entry::new_hash());
+        let result = getdel(&mut db, &[bs(b"myhash")]);
+        match result {
+            Frame::Error(e) => assert!(e.starts_with(b"WRONGTYPE")),
+            other => panic!("Expected WRONGTYPE error, got {other:?}"),
+        }
+        assert!(
+            db.exists(b"myhash"),
+            "GETDEL on a wrong-type key must not delete it (data-loss regression)"
+        );
+    }
+
     // --- GETEX tests ---
 
     #[test]

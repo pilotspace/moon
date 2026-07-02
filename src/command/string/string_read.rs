@@ -189,12 +189,25 @@ pub fn getdel(db: &mut Database, args: &[Frame]) -> Frame {
         Some(k) => k,
         None => return err_wrong_args("GETDEL"),
     };
+    // Check-before-mutate (Redis parity): peek the type via a cheap borrow BEFORE
+    // removing. Removing a wrong-type key and only then returning WRONGTYPE would
+    // destroy the key (data-loss). as_bytes() borrows without cloning; the borrow
+    // ends before db.remove() so the mutable re-borrow is sound.
+    match db.get(key) {
+        None => return Frame::Null,
+        Some(entry) => {
+            if entry.value.as_bytes().is_none() {
+                return Frame::Error(Bytes::from_static(
+                    b"WRONGTYPE Operation against a key holding the wrong kind of value",
+                ));
+            }
+        }
+    }
+    // Confirmed string — safe to remove and return its bytes.
     match db.remove(key) {
         Some(entry) => match entry.value.as_bytes_owned() {
             Some(v) => Frame::BulkString(v),
-            None => Frame::Error(Bytes::from_static(
-                b"WRONGTYPE Operation against a key holding the wrong kind of value",
-            )),
+            None => Frame::Null,
         },
         None => Frame::Null,
     }
