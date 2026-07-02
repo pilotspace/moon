@@ -203,7 +203,6 @@ mod tests {
         );
     }
 
-
     // ── EXPIRE<=0 replay / propagation guard ──────────────────────────────────
 
     /// P0 propagation guard: WAL replay of `EXPIRE k -1` (non-positive TTL) must

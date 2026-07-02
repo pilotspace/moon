@@ -1436,7 +1436,10 @@ mod tests {
     #[test]
     fn test_expire_nonpositive_missing_key() {
         let mut db = Database::new();
-        assert_eq!(expire(&mut db, &[bs(b"nope"), bs(b"-1")]), Frame::Integer(0));
+        assert_eq!(
+            expire(&mut db, &[bs(b"nope"), bs(b"-1")]),
+            Frame::Integer(0)
+        );
     }
 
     #[test]
@@ -1449,7 +1452,10 @@ mod tests {
             matches!(result, Frame::Error(ref s) if s.starts_with(b"ERR invalid expire")),
             "overflowing EXPIRE must error, got {result:?}"
         );
-        assert!(db.exists(b"foo"), "rejected EXPIRE must not disturb the key");
+        assert!(
+            db.exists(b"foo"),
+            "rejected EXPIRE must not disturb the key"
+        );
     }
 
     // --- PEXPIRE tests ---
@@ -1470,7 +1476,10 @@ mod tests {
     fn test_pexpire_nonpositive_deletes() {
         // Redis parity: PEXPIRE with a non-positive TTL deletes the key and returns 1.
         let mut db = setup_db_with_key(b"foo", b"bar");
-        assert_eq!(pexpire(&mut db, &[bs(b"foo"), bs(b"-1")]), Frame::Integer(1));
+        assert_eq!(
+            pexpire(&mut db, &[bs(b"foo"), bs(b"-1")]),
+            Frame::Integer(1)
+        );
         assert!(!db.exists(b"foo"), "PEXPIRE foo -1 must delete the key");
     }
 
@@ -1962,7 +1971,10 @@ mod tests {
             matches!(result, Frame::Error(ref e) if e.starts_with(b"ERR invalid expire")),
             "overflowing EXPIREAT must error, got {result:?}"
         );
-        assert!(db.exists(b"k"), "rejected EXPIREAT must not disturb the key");
+        assert!(
+            db.exists(b"k"),
+            "rejected EXPIREAT must not disturb the key"
+        );
     }
 
     #[test]
