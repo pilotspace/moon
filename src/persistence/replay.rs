@@ -203,6 +203,57 @@ mod tests {
         );
     }
 
+
+    // ── EXPIRE<=0 replay / propagation guard ──────────────────────────────────
+
+    /// P0 propagation guard: WAL replay of `EXPIRE k -1` (non-positive TTL) must
+    /// DELETE the key, exactly as the live handler now does. Replay re-dispatches
+    /// the raw command, so a WAL-recovered replica stays consistent with the
+    /// master. Before the EXPIRE<=0 fix this failed (replay kept the key because
+    /// the handler returned an error and mutated nothing).
+    #[test]
+    fn replay_expire_nonpositive_deletes_key() {
+        let engine = DispatchReplayEngine::new();
+        let mut databases = vec![make_db_with_key(b"k", b"v")];
+        let mut selected = 0usize;
+        assert_eq!(
+            get_key(&mut databases[0], b"k").as_deref(),
+            Some(b"v".as_ref()),
+            "precondition: key present before replay"
+        );
+
+        let args = framevec![
+            Frame::BulkString(bytes::Bytes::from_static(b"k")),
+            Frame::BulkString(bytes::Bytes::from_static(b"-1")),
+        ];
+        engine.replay_command(&mut databases, b"EXPIRE", &args, &mut selected);
+
+        assert_eq!(
+            get_key(&mut databases[0], b"k"),
+            None,
+            "replay of EXPIRE k -1 must delete the key (no master/replica divergence)"
+        );
+    }
+
+    /// Sibling anchor: EXPIREAT with a past timestamp already deletes on replay.
+    /// Confirms the EXPIRE fix matches the established EXPIREAT propagation.
+    #[test]
+    fn replay_expireat_past_deletes_key() {
+        let engine = DispatchReplayEngine::new();
+        let mut databases = vec![make_db_with_key(b"k", b"v")];
+        let mut selected = 0usize;
+        let args = framevec![
+            Frame::BulkString(bytes::Bytes::from_static(b"k")),
+            Frame::BulkString(bytes::Bytes::from_static(b"-1")),
+        ];
+        engine.replay_command(&mut databases, b"EXPIREAT", &args, &mut selected);
+        assert_eq!(
+            get_key(&mut databases[0], b"k"),
+            None,
+            "replay of EXPIREAT k -1 must delete the key"
+        );
+    }
+
     /// Same-index SWAPDB is a no-op during replay.
     #[test]
     fn replay_swapdb_same_index_noop() {

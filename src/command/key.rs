@@ -64,8 +64,9 @@ pub fn exists(db: &mut Database, args: &[Frame]) -> Frame {
 
 /// EXPIRE key seconds
 ///
-/// Set a timeout on key. Returns 1 if timeout was set, 0 if key does not exist.
-/// Negative or zero seconds returns an error (modern Redis 7+ behavior).
+/// Set a timeout on key. Returns 1 if the timeout was set (or the key was
+/// deleted because of a non-positive/past TTL), 0 if the key does not exist.
+/// A non-positive TTL deletes the key immediately (Redis past-time semantics).
 pub fn expire(db: &mut Database, args: &[Frame]) -> Frame {
     if args.len() != 2 {
         return err_wrong_args("EXPIRE");
@@ -82,12 +83,28 @@ pub fn expire(db: &mut Database, args: &[Frame]) -> Frame {
             ));
         }
     };
+    // Redis parity: a non-positive TTL is a past-time expiry -> delete the key now
+    // (return 1 if it existed, 0 otherwise) rather than erroring. Mirrors EXPIREAT.
     if seconds <= 0 {
-        return Frame::Error(Bytes::from_static(
-            b"ERR invalid expire time in 'EXPIRE' command",
-        ));
+        return if db.remove(key).is_some() {
+            Frame::Integer(1)
+        } else {
+            Frame::Integer(0)
+        };
     }
-    let expires_at_ms = current_time_ms() + (seconds as u64) * 1000;
+    // Guard the u64 arithmetic: seconds can be up to i64::MAX, so seconds*1000
+    // (and now_ms + that) can overflow. Redis rejects an out-of-range expiry.
+    let expires_at_ms = match (seconds as u64)
+        .checked_mul(1000)
+        .and_then(|delta| current_time_ms().checked_add(delta))
+    {
+        Some(ms) => ms,
+        None => {
+            return Frame::Error(Bytes::from_static(
+                b"ERR invalid expire time in 'EXPIRE' command",
+            ));
+        }
+    };
     if db.set_expiry(key, expires_at_ms) {
         Frame::Integer(1)
     } else {
@@ -97,7 +114,8 @@ pub fn expire(db: &mut Database, args: &[Frame]) -> Frame {
 
 /// PEXPIRE key milliseconds
 ///
-/// Like EXPIRE but the timeout is specified in milliseconds.
+/// Like EXPIRE but the timeout is specified in milliseconds. A non-positive TTL
+/// deletes the key immediately (Redis past-time semantics).
 pub fn pexpire(db: &mut Database, args: &[Frame]) -> Frame {
     if args.len() != 2 {
         return err_wrong_args("PEXPIRE");
@@ -114,12 +132,24 @@ pub fn pexpire(db: &mut Database, args: &[Frame]) -> Frame {
             ));
         }
     };
+    // Redis parity: a non-positive TTL is a past-time expiry -> delete the key now.
     if millis <= 0 {
-        return Frame::Error(Bytes::from_static(
-            b"ERR invalid expire time in 'PEXPIRE' command",
-        ));
+        return if db.remove(key).is_some() {
+            Frame::Integer(1)
+        } else {
+            Frame::Integer(0)
+        };
     }
-    let expires_at_ms = current_time_ms() + millis as u64;
+    // Guard the u64 arithmetic against overflow (defensive; keeps the invariant
+    // local and consistent with EXPIRE).
+    let expires_at_ms = match current_time_ms().checked_add(millis as u64) {
+        Some(ms) => ms,
+        None => {
+            return Frame::Error(Bytes::from_static(
+                b"ERR invalid expire time in 'PEXPIRE' command",
+            ));
+        }
+    };
     if db.set_expiry(key, expires_at_ms) {
         Frame::Integer(1)
     } else {
@@ -1383,10 +1413,35 @@ mod tests {
     }
 
     #[test]
-    fn test_expire_negative() {
+    fn test_expire_nonpositive_deletes() {
+        // Redis parity: EXPIRE with a non-positive TTL deletes the key immediately
+        // (past-time expiry) and returns 1 -- it must NOT error and leave the key.
         let mut db = setup_db_with_key(b"foo", b"bar");
-        let result = expire(&mut db, &[bs(b"foo"), bs(b"-1")]);
-        assert!(matches!(result, Frame::Error(ref s) if s.starts_with(b"ERR invalid expire")));
+        assert_eq!(expire(&mut db, &[bs(b"foo"), bs(b"-1")]), Frame::Integer(1));
+        assert!(!db.exists(b"foo"), "EXPIRE foo -1 must delete the key");
+
+        let mut db2 = setup_db_with_key(b"foo", b"bar");
+        assert_eq!(expire(&mut db2, &[bs(b"foo"), bs(b"0")]), Frame::Integer(1));
+        assert!(!db2.exists(b"foo"), "EXPIRE foo 0 must delete the key");
+    }
+
+    #[test]
+    fn test_expire_nonpositive_missing_key() {
+        let mut db = Database::new();
+        assert_eq!(expire(&mut db, &[bs(b"nope"), bs(b"-1")]), Frame::Integer(0));
+    }
+
+    #[test]
+    fn test_expire_overflow_rejected() {
+        // now_ms + seconds*1000 overflows u64 -> error, no silent wrap; key untouched.
+        let mut db = setup_db_with_key(b"foo", b"bar");
+        let huge = Frame::BulkString(Bytes::from(i64::MAX.to_string()));
+        let result = expire(&mut db, &[bs(b"foo"), huge]);
+        assert!(
+            matches!(result, Frame::Error(ref s) if s.starts_with(b"ERR invalid expire")),
+            "overflowing EXPIRE must error, got {result:?}"
+        );
+        assert!(db.exists(b"foo"), "rejected EXPIRE must not disturb the key");
     }
 
     // --- PEXPIRE tests ---
@@ -1401,6 +1456,14 @@ mod tests {
             Frame::Integer(n) => assert!(n > 0 && n <= 100000, "PTTL was {}", n),
             _ => panic!("Expected integer"),
         }
+    }
+
+    #[test]
+    fn test_pexpire_nonpositive_deletes() {
+        // Redis parity: PEXPIRE with a non-positive TTL deletes the key and returns 1.
+        let mut db = setup_db_with_key(b"foo", b"bar");
+        assert_eq!(pexpire(&mut db, &[bs(b"foo"), bs(b"-1")]), Frame::Integer(1));
+        assert!(!db.exists(b"foo"), "PEXPIRE foo -1 must delete the key");
     }
 
     // --- TTL tests ---
