@@ -2,7 +2,7 @@
   "project": "moon",
   "stage": "production",
   "active_task": null,
-  "active_milestone": null,
+  "active_milestone": "v3-4-kv-correctness",
   "tasks": {
     "hotpath-lock-quickwins": {
       "title": "Eliminate per-command global locks & syscall-level quick wins",
@@ -235,10 +235,18 @@
       "status": "planned",
       "created": "2026-06-16T04:42:42+00:00",
       "updated": "2026-06-16T04:42:42+00:00"
+    },
+    "v3-4-kv-correctness": {
+      "title": "KV Write Correctness & Data-Integrity Parity",
+      "goal": "Moon's KV write commands honor Redis data-integrity contracts: no wrong-type command destroys data, integer commands reject overflow instead of panicking or wrapping, expire-in-the-past deletes the key, and MSETNX is atomic (cross-shard spans rejected).",
+      "stage": "production",
+      "status": "active",
+      "created": "2026-07-02T13:45:23+00:00",
+      "updated": "2026-07-02T13:45:23+00:00"
     }
   },
   "created": "2026-06-11T03:18:21+00:00",
-  "updated": "2026-06-23T08:25:16+00:00",
+  "updated": "2026-07-02T13:45:23+00:00",
   "setup": {
     "locked": true,
     "locked_at": "2026-06-11T03:28:00+00:00",
