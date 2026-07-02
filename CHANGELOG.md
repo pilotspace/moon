@@ -30,6 +30,16 @@ integer-overflow panics/wraps, past-expire deletes, atomic MSETNX).
 - **Expire-in-the-past semantics (P0):** `EXPIRE`/`PEXPIRE`/`EXPIREAT` with a non-positive or already-past
   time now deletes the key and returns 1 (Redis parity); verified to propagate through command-based WAL
   replay so replicas stay consistent.
+- **Cross-shard coordinator local-leg durability (P0, pre-existing):** a co-located `MSET`/`MSETNX` whose
+  keys hash to the **connection's own shard** now appends to that shard's AOF. The coordinator's local
+  leg previously executed the write in memory but never persisted it (the remote `MultiExecute` leg
+  always did), so with `--shards >1 --appendonly yes` an own-shard co-located `MSET`/`MSETNX` could be
+  lost on crash. It now persists via the same append path every local single-key write uses — the whole
+  command for a co-located owner, and a synthesized `MSET` over **only the local keys** for a scattered
+  `MSET`'s local slice — returning an AOF error instead of a false `+OK` on append failure.
+  Crash-recovery verified on both monoio and tokio (`tests/coordinator_local_leg_durability.rs`).
+  Single-shard (the default) was never affected. The same local-leg gap remains for coordinator
+  `BITOP` / `COPY` / `DEL` / `UNLINK` (tracked follow-up).
 
 ## [0.4.1] — 2026-06-23
 

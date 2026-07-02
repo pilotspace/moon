@@ -91,7 +91,9 @@ Out:
 - kv-integer-overflow-guard : gate=PASS · commits 56008df + 9a915d3 + d6b4136 (i64-domain bound — review Finding 2/3) ·
       tests=3 unit (min-overflow, SETEX, SET EX) + 9 unit (i64-bound reject + extreme-negative preserve) green
 - kv-expire-past-deletes    : gate=PASS · commit 56008df · tests=unit + 2 replay-propagation green
-- kv-msetnx-atomic          : gate=PASS · commit 3b2c7dc · tests=3 unit + 2 integration (--shards 4, red/green-proven) green
+- kv-msetnx-atomic          : gate=PASS · commit 3b2c7dc (atomicity) + coordinator local-leg AOF durability fix
+      (Finding 1) · tests=3 unit + 2 integration (--shards 4, red/green-proven) + 3 crash-recovery
+      (coordinator_local_leg_durability, red/green on monoio+tokio) green
 
 ### Adversarial code review   (whole-diff, senior-rust-engineer agent — **SHIP** verdict)
 The five milestone commits deliver their stated fixes with no new regressions or reachable
@@ -102,20 +104,33 @@ panics. Three findings surfaced (all independently re-verified against source be
   on a live key, and an extreme-negative `EXPIRE` deleted instead of erroring. Now bounded to
   the i64 domain at all eight expiry setters via a shared `expiry_ms_in_range` helper (red/green,
   9 tests). This makes the "not a wrapped TTL" exit criterion hold on the READ path too.
-- **Finding 1 (HIGH) — PRE-EXISTING, DEFERRED (out of v3-4 scope).** The cross-shard coordinator's
-  LOCAL leg (`run_local`, `coordinate_mset` fast-path) executes co-located multi-key writes in
-  memory but never appends them to the local shard's WAL — while the REMOTE leg (`MultiExecute` in
-  `spsc_handler`) does (`wal_append_and_fanout`). So a co-located `MSET`/`MSETNX` is durable when the
-  owner is a *remote* shard but silently **non-durable** when the owner is the connection's *own*
-  shard. Verified end-to-end: `run_local`→`cmd_dispatch`→`db.set_string` are all no-WAL, and both
-  handler call sites (`handler_monoio/dispatch.rs`, `handler_sharded/mod.rs`) `push(response)` then
-  `continue`/`return` with no `try_send_append_durable`. **Blast radius:** multi-shard (`--shards >1`)
-  **+ appendonly + keys hashing to the connection's own shard**; single-shard (the recommended default)
-  is unaffected — the coordinator is bypassed for `num_shards<=1` and normal dispatch DOES persist.
-  **Not introduced by MSETNX** (it copied the existing MSET coordinator pattern; MSETNX's exit
-  criterion is *atomicity*, delivered — not durability). Fixing it means plumbing the persistence
-  context (WAL writer / repl backlog / AOF pool) into the coordinator local path + a crash-recovery
-  test — a dedicated P0 follow-up, tracked separately (disposition confirmed with the user).
+- **Finding 1 (HIGH) — PRE-EXISTING, FIXED for MSET/MSETNX (this milestone).** The cross-shard
+  coordinator's LOCAL leg (`coordinate_mset` fast-path + scatter local slice; `coordinate_msetnx`
+  local branch) executed co-located multi-key writes in memory but never appended them to the owning
+  shard's AOF — while the REMOTE leg (`MultiExecute` in `spsc_handler`) does (`wal_append_and_fanout`).
+  So a co-located `MSET`/`MSETNX` was durable when the owner was a *remote* shard but silently
+  **non-durable** when the owner was the connection's *own* shard. **Blast radius:** multi-shard
+  (`--shards >1`) + appendonly + keys hashing to the connection's own shard; single-shard (the
+  recommended default) was unaffected (the coordinator is bypassed for `num_shards<=1` and normal
+  dispatch persists). **Not introduced by MSETNX** (it copied the existing MSET coordinator pattern;
+  MSETNX's own exit criterion is *atomicity*, delivered — not durability).
+  **Fix:** the local leg now persists to the owning shard's AOF via a new `persist_local_leg` helper —
+  the same `AofWriterPool::issue_append_lsn` + `try_send_append_durable` path **every local single-key
+  write already uses** (matching the local-write contract, NOT the SPSC remote path; `ChannelMesh` has
+  no self-send slot, so a local leg cannot route through `wal_append_and_fanout`). Granularity: the
+  **whole command** for a co-located owner (MSETNX; MSET fast path), and a **synthesized MSET over only
+  the local keys** for a scattered MSET's local slice (never the full scattered command — `my_shard`
+  does not own the remote keys, and replay re-dispatches raw commands). On AOF failure the leg returns
+  `AOF_FSYNC_ERR` instead of a false `+OK` (design-for-failure). Red/green crash-recovery TDD in
+  `tests/coordinator_local_leg_durability.rs` (`--shards 4 --appendonly yes`; one co-located group per
+  shard so exactly one is the local leg regardless of SO_REUSEPORT landing; SIGKILL → restart →
+  reload): RED before (the connection's-shard group vanished), GREEN after, on **both monoio and
+  tokio**. The fix strictly *adds* durability and changes nothing about replication (live fan-out via
+  `replica_txs` is SPSC-only and untouched — not independently re-verified for local writes here).
+  **Remaining (tracked follow-up — same mechanism, out of this KV milestone's command scope):** BITOP /
+  COPY (via `run_on_owner`'s local branch) and DEL / UNLINK (via `coordinate_multi_del_or_exists`)
+  carry the *identical* local-leg non-durability and are NOT yet fixed; a focused follow-up should
+  route their local legs through `persist_local_leg` too.
 
 ### Goal met?   (map the evidence back to this milestone's Exit criteria — read before the Exit-criteria boxes are checked)
 - [x] each Exit criterion above is satisfied by a Cross-task evidence row or a Ship-by-domain change (cited inline)

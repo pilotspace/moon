@@ -1286,6 +1286,8 @@ pub(super) async fn try_handle_cross_shard_commands(
             &ctx.dispatch_tx,
             &ctx.spsc_notifiers,
             &ctx.cached_clock,
+            ctx.aof_pool.as_ref(),
+            &ctx.repl_state,
             &(), // monoio: coordinator uses oneshot, not response_pool
         )
         .await;

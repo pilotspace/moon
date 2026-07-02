@@ -40,6 +40,12 @@ pub async fn coordinate_multi_key(
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
     spsc_notifiers: &[Arc<channel::Notify>],
     cached_clock: &CachedClock,
+    // Local-leg persistence context (review Finding 1): the coordinator's
+    // in-process local legs for MSET/MSETNX append to the owning shard's AOF
+    // via these, matching the local single-key write contract. `None` disables
+    // persistence (tests / no-AOF deployments).
+    aof_pool: Option<&Arc<crate::persistence::aof::AofWriterPool>>,
+    repl_state: ReplStateRef<'_>,
     _response_pool: &(), // placeholder — coordinator uses oneshot internally
 ) -> Frame {
     if cmd.eq_ignore_ascii_case(b"MGET") {
@@ -65,6 +71,8 @@ pub async fn coordinate_multi_key(
             dispatch_tx,
             spsc_notifiers,
             cached_clock,
+            aof_pool,
+            repl_state,
             _response_pool,
         )
         .await
@@ -78,6 +86,8 @@ pub async fn coordinate_multi_key(
             dispatch_tx,
             spsc_notifiers,
             cached_clock,
+            aof_pool,
+            repl_state,
             _response_pool,
         )
         .await
@@ -207,6 +217,62 @@ async fn run_on_owner(
         )
         .await
     }
+}
+
+/// Type of the replication-state handle threaded into the coordinator's local
+/// persistence path (same shape `AofWriterPool::issue_append_lsn` expects).
+type ReplStateRef<'a> =
+    &'a Option<Arc<std::sync::RwLock<crate::replication::state::ReplicationState>>>;
+
+/// Persist a coordinator LOCAL-leg write to the owning shard's AOF, matching the
+/// local single-key write contract (the `is_write` block in
+/// `handler_monoio`/`handler_sharded`): issue an LSN off `repl_state`, then
+/// durable-append. Under `appendfsync=always` this awaits the writer's fsync ack;
+/// under everysec/no it is fire-and-forget. WAL append is external to
+/// `cmd_dispatch`, so the coordinator's in-process local legs (`run_local`,
+/// `coordinate_mset` fast path / local slice) MUST call this or their writes are
+/// lost on restart while the remote legs (via `wal_append_and_fanout`) survive.
+///
+/// `serialized` MUST cover only keys OWNED by `my_shard`:
+///   - co-located command (MSETNX; MSET fast path)  → the whole command,
+///   - scattered MSET local slice                   → a synthesized MSET over
+///     just the local keys (never the full scattered command — `my_shard` does
+///     not own the remote keys and replay would misapply them on this shard).
+///
+/// Returns `Err(())` on AOF failure so the caller surfaces `AOF_FSYNC_ERR`
+/// instead of a false `+OK` (design-for-failure; matches the handler).
+async fn persist_local_leg(
+    aof_pool: Option<&Arc<crate::persistence::aof::AofWriterPool>>,
+    repl_state: ReplStateRef<'_>,
+    my_shard: usize,
+    serialized: Bytes,
+) -> Result<(), ()> {
+    let Some(pool) = aof_pool else { return Ok(()) };
+    let lsn = crate::persistence::aof::AofWriterPool::issue_append_lsn(
+        repl_state,
+        my_shard,
+        serialized.len(),
+    );
+    match pool
+        .try_send_append_durable(my_shard, lsn, serialized)
+        .await
+    {
+        Ok(()) => Ok(()),
+        Err(_) => Err(()),
+    }
+}
+
+/// Serialize an `MSET k v ...` command over `pairs` for AOF logging of a local
+/// MSET leg. Used for both the fast path (all keys local) and a scattered MSET's
+/// local slice (only the local keys) — never the full scattered command.
+fn serialize_local_mset(pairs: &[(Bytes, Bytes)]) -> Bytes {
+    let mut parts: Vec<Frame> = Vec::with_capacity(pairs.len() * 2 + 1);
+    parts.push(Frame::BulkString(Bytes::from_static(b"MSET")));
+    for (k, v) in pairs {
+        parts.push(Frame::BulkString(k.clone()));
+        parts.push(Frame::BulkString(v.clone()));
+    }
+    crate::persistence::aof::serialize_command(&Frame::Array(parts.into()))
 }
 
 fn bulk(b: &Bytes) -> Frame {
@@ -741,6 +807,8 @@ async fn coordinate_mset(
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
     spsc_notifiers: &[Arc<channel::Notify>],
     cached_clock: &CachedClock,
+    aof_pool: Option<&Arc<crate::persistence::aof::AofWriterPool>>,
+    repl_state: ReplStateRef<'_>,
     _response_pool: &(), // placeholder — coordinator uses oneshot internally
 ) -> Frame {
     if args.is_empty() || !args.len().is_multiple_of(2) {
@@ -774,10 +842,22 @@ async fn coordinate_mset(
 
     // Fast path: all keys on local shard
     if groups.len() == 1 && groups.contains_key(&my_shard) {
-        return crate::shard::slice::with_shard_db(db_index, |db| {
+        let resp = crate::shard::slice::with_shard_db(db_index, |db| {
             db.refresh_now_from_cache(cached_clock);
             crate::command::string::mset(db, args)
         });
+        // Local leg (review Finding 1): persist the whole MSET — every key is
+        // owned by my_shard — matching the local single-key write contract.
+        if let Some(pairs) = groups.get(&my_shard) {
+            let serialized = serialize_local_mset(pairs);
+            if persist_local_leg(aof_pool, repl_state, my_shard, serialized)
+                .await
+                .is_err()
+            {
+                return Frame::Error(Bytes::from_static(crate::persistence::aof::AOF_FSYNC_ERR));
+            }
+        }
+        return resp;
     }
 
     let mut pending_shards: Vec<channel::OneshotReceiver<Vec<Frame>>> = Vec::new();
@@ -817,6 +897,21 @@ async fn coordinate_mset(
         let _ = reply_rx.recv().await;
     }
 
+    // Local leg (review Finding 1): persist a synthesized MSET over ONLY the
+    // local keys. The remote slices persisted themselves on their owner shards
+    // via MultiExecute -> wal_append_and_fanout; my_shard must not log their keys
+    // (replay re-dispatches raw commands, so a full-command log here would try to
+    // write keys this shard doesn't own).
+    if let Some(pairs) = groups.get(&my_shard) {
+        let serialized = serialize_local_mset(pairs);
+        if persist_local_leg(aof_pool, repl_state, my_shard, serialized)
+            .await
+            .is_err()
+        {
+            return Frame::Error(Bytes::from_static(crate::persistence::aof::AOF_FSYNC_ERR));
+        }
+    }
+
     Frame::SimpleString(Bytes::from_static(b"OK"))
 }
 
@@ -838,6 +933,8 @@ async fn coordinate_msetnx(
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
     spsc_notifiers: &[Arc<channel::Notify>],
     cached_clock: &CachedClock,
+    aof_pool: Option<&Arc<crate::persistence::aof::AofWriterPool>>,
+    repl_state: ReplStateRef<'_>,
     _response_pool: &(), // placeholder — coordinator uses oneshot internally
 ) -> Frame {
     if args.is_empty() || !args.len().is_multiple_of(2) {
@@ -872,23 +969,40 @@ async fn coordinate_msetnx(
         }
     }
 
-    // All keys co-located -> run the whole MSETNX atomically on the owning shard
-    // (run_on_owner dispatches locally, or forwards intact to the remote owner).
+    // All keys co-located -> run the whole MSETNX atomically on the owning shard.
+    // Branch on ownership explicitly (rather than via run_on_owner) so the LOCAL
+    // leg can persist to my_shard's AOF on a successful write (review Finding 1);
+    // the REMOTE leg persists on the owner via MultiExecute -> wal_append_and_fanout.
     let mut command_parts: Vec<Frame> = Vec::with_capacity(args.len() + 1);
     command_parts.push(Frame::BulkString(Bytes::from_static(b"MSETNX")));
     command_parts.extend_from_slice(args);
-    run_on_owner(
-        &first_key,
-        &command_parts,
-        my_shard,
-        num_shards,
-        db_index,
-        shard_databases,
-        dispatch_tx,
-        spsc_notifiers,
-        cached_clock,
-    )
-    .await
+    if owner == my_shard {
+        let resp = run_local(shard_databases, db_index, cached_clock, b"MSETNX", args);
+        // Persist only on an actual write (:1). A :0 means some key already
+        // existed and MSETNX wrote nothing — there is nothing to log.
+        if matches!(resp, Frame::Integer(1)) {
+            let serialized =
+                crate::persistence::aof::serialize_command(&Frame::Array(command_parts.into()));
+            if persist_local_leg(aof_pool, repl_state, my_shard, serialized)
+                .await
+                .is_err()
+            {
+                return Frame::Error(Bytes::from_static(crate::persistence::aof::AOF_FSYNC_ERR));
+            }
+        }
+        resp
+    } else {
+        run_remote(
+            owner,
+            &first_key,
+            Frame::Array(command_parts.into()),
+            my_shard,
+            db_index,
+            dispatch_tx,
+            spsc_notifiers,
+        )
+        .await
+    }
 }
 
 /// Coordinate DEL/UNLINK/EXISTS with multiple keys across shards using VLL pattern.
@@ -2269,6 +2383,8 @@ mod tests {
             &dispatch_tx,
             &notifiers,
             &cached_clock,
+            None,
+            &None,
             &response_pool,
         )
         .await;
