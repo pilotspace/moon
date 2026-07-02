@@ -499,6 +499,8 @@ non-pipelined workloads; add shards only for pipelined / AOF / hash-tag-co-locat
 degrades with shard count (0.93×→0.61× as 1→12) as its keys scatter cross-shard — `{hash-tag}` co-location
 restores it. Detail: `docs/reviews/2026-06-17/WIDER-BENCH.md`.
 
+> **Clarification (2026-07-02 KV deep review).** The **0.46–0.51×** p=1 figure above is from `bench-production.sh`, which changes three things at once *besides* shard count: distributed keys (`-r`, real cross-shard scatter — vs `bench-compare.sh`'s single hot `__rand_key__`), larger values (512B–4KB), and higher client counts (`-c 100/200` on the INCR rows). It is a **throughput artifact of {distributed keys × high concurrency × value size × multi-key scatter}, not a clean shard-count signal** — the cross-shard hop itself is ~10µs (v2-2 bare-metal), ~2% of the ~460µs p=1 baseline. The controlled `bench-compare.sh` sweep in the table above (only shard count varies) is **flat at p=1** (0.79→0.82×). Read 0.46× as "production-shaped multi-key under concurrency," not "the cross-shard hop costs 2×."
+
 ---
 
 ## 7. Persistence (AOF) Performance

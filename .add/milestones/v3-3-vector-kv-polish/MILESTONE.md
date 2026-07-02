@@ -18,8 +18,13 @@ In:
 - FT.SEARCH avoids the ~3.2 MB `key_hash_to_key` clone per query (borrow / `Arc` the map).
 - KV `INCR`/`DECR` write the integer via `itoa` to a buffer — no per-op `String` alloc on the hot
   path. `src/command/string/string_write.rs:312,317`.
-- The command-dispatch path uses `parking_lot::RwLock`, not `std::sync::RwLock`, for the ACL table.
-  `src/shard/event_loop.rs:65`, `src/command/connection.rs:374,460`.
+- The command-dispatch path uses `parking_lot::RwLock`, not `std::sync::RwLock`, for the ACL table
+  (`src/shard/event_loop.rs:65`, `src/command/connection.rs:374,460`) **and for the replica-role check
+  that gates inline dispatch** on the p=1 read hot path (`ctx.repl_state.try_read()`,
+  `src/server/conn/handler_monoio/mod.rs:524` — cache as `AtomicBool` flipped on role change, or `parking_lot`).
+- KV inline `GET` hit writes the value **once**: frame the `$len\r\n…\r\n` reply straight from the borrowed
+  `&[u8]` into `write_buf`, dropping the intermediate `val.to_vec()` heap copy.
+  `src/server/conn/blocking.rs:1275` (on the p=1 read hot path; the wasted copy scales with value size).
 
 Out:
 - Re-quantization / new vector codecs — only the existing SQ8 decode length is in scope, not new
@@ -51,8 +56,10 @@ Out:
       FT.SEARCH (borrow / `Arc`).
 - [ ] kv-incr-itoa                  depends-on: none   — `INCR`/`DECR` via `itoa`-to-buffer; no
       `String` alloc on the hot path.
-- [ ] kv-dispatch-lock-discipline   depends-on: none   — ACL / dispatch `std::sync::RwLock` ->
-      `parking_lot::RwLock`.
+- [ ] kv-dispatch-lock-discipline   depends-on: none   — ACL / dispatch + inline-gate replica check
+      `std::sync::RwLock` -> `parking_lot::RwLock` / `AtomicBool` (incl. `handler_monoio/mod.rs:524`).
+- [ ] kv-inline-get-nocopy          depends-on: none   — inline `GET` hit writes value straight from the
+      borrow into `write_buf`; drop the `val.to_vec()` double-copy (`blocking.rs:1275`, scales w/ value size).
 
 ## Exit criteria (observable; map each to the task that delivers it)
 - [ ] An SQ8 immutable segment decodes vectors at the correct length — recall parity with the
@@ -61,5 +68,7 @@ Out:
 - [ ] FT.SEARCH performs no per-query 3 MB `key_hash` clone — allocation probe / throughput test
       shows the clone gone.                                                                          (← vector-search-keyhash-noclone)
 - [ ] `INCR`/`DECR` allocate no `String` on the hot path — `itoa` path asserted (test / no-alloc check). (← kv-incr-itoa)
-- [ ] No `std::sync::RwLock` remains on the command-dispatch path — ACL table is `parking_lot`;
-      audit/grep + test.                                                                             (← kv-dispatch-lock-discipline)
+- [ ] No `std::sync::RwLock` remains on the command-dispatch path — ACL table + inline-gate replica
+      check are `parking_lot`/atomic; audit/grep + test.                                             (← kv-dispatch-lock-discipline)
+- [ ] Inline `GET` performs no intermediate `Vec` copy of the value — the `$len…` reply is framed from
+      the borrowed slice; allocation probe / large-value throughput shows the copy gone.             (← kv-inline-get-nocopy)
