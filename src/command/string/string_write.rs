@@ -51,7 +51,19 @@ pub fn set(db: &mut Database, args: &[Frame]) -> Frame {
                 return Frame::Error(Bytes::from_static(b"ERR syntax error"));
             }
             match parse_positive_i64(&args[i]) {
-                Some(secs) => expires_at_ms = current_time_ms() + (secs as u64) * 1000,
+                Some(secs) => {
+                    expires_at_ms = match (secs as u64)
+                        .checked_mul(1000)
+                        .and_then(|d| current_time_ms().checked_add(d))
+                    {
+                        Some(ms) => ms,
+                        None => {
+                            return Frame::Error(Bytes::from_static(
+                                b"ERR invalid expire time in 'SET' command",
+                            ));
+                        }
+                    }
+                }
                 None => {
                     return Frame::Error(Bytes::from_static(
                         b"ERR value is not an integer or out of range",
@@ -78,7 +90,14 @@ pub fn set(db: &mut Database, args: &[Frame]) -> Frame {
             }
             match parse_positive_i64(&args[i]) {
                 Some(ts) => {
-                    expires_at_ms = (ts as u64) * 1000;
+                    expires_at_ms = match (ts as u64).checked_mul(1000) {
+                        Some(ms) => ms,
+                        None => {
+                            return Frame::Error(Bytes::from_static(
+                                b"ERR invalid expire time in 'SET' command",
+                            ));
+                        }
+                    };
                 }
                 None => {
                     return Frame::Error(Bytes::from_static(
@@ -265,7 +284,15 @@ pub fn decrby(db: &mut Database, args: &[Frame]) -> Frame {
             ));
         }
     };
-    incrby_internal(db, key, -delta)
+    // Guard i64::MIN: -(i64::MIN) is unrepresentable. Redis returns an overflow
+    // error rather than negating with a debug panic / release wrap.
+    let neg = match delta.checked_neg() {
+        Some(n) => n,
+        None => {
+            return Frame::Error(Bytes::from_static(b"ERR decrement would overflow"));
+        }
+    };
+    incrby_internal(db, key, neg)
 }
 
 /// Internal helper for INCR/DECR/INCRBY/DECRBY.
@@ -587,7 +614,18 @@ pub fn setex(db: &mut Database, args: &[Frame]) -> Frame {
         Some(v) => v.clone(),
         None => return err_wrong_args("SETEX"),
     };
-    db.set_string_with_expiry(key, value, current_time_ms() + (seconds as u64) * 1000);
+    let expires_at_ms = match (seconds as u64)
+        .checked_mul(1000)
+        .and_then(|d| current_time_ms().checked_add(d))
+    {
+        Some(ms) => ms,
+        None => {
+            return Frame::Error(Bytes::from_static(
+                b"ERR invalid expire time in 'SETEX' command",
+            ));
+        }
+    };
+    db.set_string_with_expiry(key, value, expires_at_ms);
     ok()
 }
 

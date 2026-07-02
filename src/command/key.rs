@@ -274,7 +274,15 @@ pub fn expireat(db: &mut Database, args: &[Frame]) -> Frame {
             Frame::Integer(0)
         };
     }
-    let expires_at_ms = (timestamp as u64) * 1000;
+    // Guard the *1000 conversion against u64 overflow (timestamp up to i64::MAX).
+    let expires_at_ms = match (timestamp as u64).checked_mul(1000) {
+        Some(ms) => ms,
+        None => {
+            return Frame::Error(Bytes::from_static(
+                b"ERR invalid expire time in 'EXPIREAT' command",
+            ));
+        }
+    };
     if db.set_expiry(key, expires_at_ms) {
         Frame::Integer(1)
     } else {
@@ -1942,6 +1950,19 @@ mod tests {
         );
         assert_eq!(result, Frame::Integer(1));
         assert!(db.get(b"k").unwrap().has_expiry());
+    }
+
+    #[test]
+    fn test_expireat_overflow_rejected() {
+        // (timestamp * 1000) overflows u64 for huge timestamps -> error, key untouched.
+        let mut db = setup_db_with_key(b"k", b"v");
+        let huge = Frame::BulkString(Bytes::from(i64::MAX.to_string()));
+        let result = expireat(&mut db, &[bs(b"k"), huge]);
+        assert!(
+            matches!(result, Frame::Error(ref e) if e.starts_with(b"ERR invalid expire")),
+            "overflowing EXPIREAT must error, got {result:?}"
+        );
+        assert!(db.exists(b"k"), "rejected EXPIREAT must not disturb the key");
     }
 
     #[test]

@@ -324,6 +324,39 @@ mod tests {
     }
 
     #[test]
+    fn test_decrby_min_overflow() {
+        // DECRBY key i64::MIN negates to +2^63, which is unrepresentable -> must
+        // return an error, not panic (debug) or wrap (release).
+        let mut db = make_db();
+        db.set_string(Bytes::from_static(b"n"), Bytes::from_static(b"0"));
+        let arg = Frame::BulkString(Bytes::from(i64::MIN.to_string()));
+        let result = decrby(&mut db, &[bs(b"n"), arg]);
+        match result {
+            Frame::Error(e) => assert!(e.ends_with(b"overflow"), "got {e:?}"),
+            other => panic!("expected overflow error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_setex_overflow_rejected() {
+        // now_ms + seconds*1000 overflows for huge seconds -> error, key not created.
+        let mut db = make_db();
+        let huge = Frame::BulkString(Bytes::from(i64::MAX.to_string()));
+        let result = setex(&mut db, &[bs(b"k"), huge, bs(b"v")]);
+        assert!(matches!(result, Frame::Error(ref e) if e.starts_with(b"ERR invalid expire")));
+        assert!(!db.exists(b"k"), "rejected SETEX must not create the key");
+    }
+
+    #[test]
+    fn test_set_ex_overflow_rejected() {
+        let mut db = make_db();
+        let huge = Frame::BulkString(Bytes::from(i64::MAX.to_string()));
+        let result = set(&mut db, &[bs(b"k"), bs(b"v"), bs(b"EX"), huge]);
+        assert!(matches!(result, Frame::Error(ref e) if e.starts_with(b"ERR invalid expire")));
+        assert!(!db.exists(b"k"), "rejected SET EX must not create the key");
+    }
+
+    #[test]
     fn test_incrby() {
         let mut db = make_db();
         db.set_string(Bytes::from_static(b"counter"), Bytes::from_static(b"10"));
