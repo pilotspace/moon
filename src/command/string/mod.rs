@@ -266,6 +266,44 @@ mod tests {
         assert!(matches!(result, Frame::Error(_)));
     }
 
+    #[test]
+    fn test_msetnx_all_new() {
+        // All keys absent -> set all, return 1.
+        let mut db = make_db();
+        let r = msetnx(&mut db, &[bs(b"a"), bs(b"1"), bs(b"b"), bs(b"2")]);
+        assert_eq!(r, Frame::Integer(1));
+        assert_eq!(
+            get(&mut db, &[bs(b"a")]),
+            Frame::BulkString(Bytes::from_static(b"1"))
+        );
+        assert_eq!(
+            get(&mut db, &[bs(b"b")]),
+            Frame::BulkString(Bytes::from_static(b"2"))
+        );
+    }
+
+    #[test]
+    fn test_msetnx_one_exists_sets_none() {
+        // Atomic all-or-nothing: if ANY key exists, set NOTHING, return 0.
+        let mut db = make_db();
+        db.set_string(Bytes::from_static(b"b"), Bytes::from_static(b"old"));
+        let r = msetnx(&mut db, &[bs(b"a"), bs(b"1"), bs(b"b"), bs(b"2")]);
+        assert_eq!(r, Frame::Integer(0));
+        assert_eq!(get(&mut db, &[bs(b"a")]), Frame::Null, "a must not be set");
+        assert_eq!(
+            get(&mut db, &[bs(b"b")]),
+            Frame::BulkString(Bytes::from_static(b"old")),
+            "b must be unchanged"
+        );
+    }
+
+    #[test]
+    fn test_msetnx_odd_args() {
+        let mut db = make_db();
+        let r = msetnx(&mut db, &[bs(b"a"), bs(b"1"), bs(b"b")]);
+        assert!(matches!(r, Frame::Error(_)));
+    }
+
     // --- INCR/DECR tests ---
 
     #[test]

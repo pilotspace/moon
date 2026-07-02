@@ -223,6 +223,43 @@ pub fn mset(db: &mut Database, args: &[Frame]) -> Frame {
     ok()
 }
 
+/// MSETNX command handler (single-shard atomic).
+///
+/// Sets all key/value pairs only if NONE of the keys already exist. Returns 1 if
+/// all were set, 0 if at least one key already existed (and nothing was set).
+///
+/// Atomic on a single shard/database (the two phases run without any await point).
+/// Cross-shard atomicity is enforced by the coordinator, which rejects MSETNX when
+/// keys span shards (CROSSSLOT); see `coordinate_msetnx`.
+pub fn msetnx(db: &mut Database, args: &[Frame]) -> Frame {
+    if args.is_empty() || !args.len().is_multiple_of(2) {
+        return err_wrong_args("MSETNX");
+    }
+    // Phase 1: verify NONE of the keys exist.
+    for pair in args.chunks(2) {
+        let key = match extract_bytes(&pair[0]) {
+            Some(k) => k,
+            None => return err_wrong_args("MSETNX"),
+        };
+        if db.exists(key) {
+            return Frame::Integer(0);
+        }
+    }
+    // Phase 2: all keys absent -> set them all.
+    for pair in args.chunks(2) {
+        let key = match extract_bytes(&pair[0]) {
+            Some(k) => k.clone(),
+            None => return err_wrong_args("MSETNX"),
+        };
+        let value = match extract_bytes(&pair[1]) {
+            Some(v) => v.clone(),
+            None => return err_wrong_args("MSETNX"),
+        };
+        db.set_string(key, value);
+    }
+    Frame::Integer(1)
+}
+
 /// INCR command handler.
 pub fn incr(db: &mut Database, args: &[Frame]) -> Frame {
     if args.len() != 1 {

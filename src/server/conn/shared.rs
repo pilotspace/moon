@@ -376,6 +376,9 @@ pub(crate) fn is_multi_key_command(cmd: &[u8], args: &[Frame]) -> bool {
     let b0 = cmd[0] | 0x20;
     match (len, b0) {
         (4, b'm') => cmd.eq_ignore_ascii_case(b"MGET") || cmd.eq_ignore_ascii_case(b"MSET"),
+        // MSETNX: atomic multi-key write; the coordinator rejects it (CROSSSLOT) when
+        // keys span shards, and runs it atomically when they are co-located.
+        (6, b'm') => cmd.eq_ignore_ascii_case(b"MSETNX"),
         // DEL, UNLINK, EXISTS with multiple keys
         (3, b'd') => args.len() > 1 && cmd.eq_ignore_ascii_case(b"DEL"),
         (6, b'u') => args.len() > 1 && cmd.eq_ignore_ascii_case(b"UNLINK"),

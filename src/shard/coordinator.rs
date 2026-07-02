@@ -68,6 +68,19 @@ pub async fn coordinate_multi_key(
             _response_pool,
         )
         .await
+    } else if cmd.eq_ignore_ascii_case(b"MSETNX") {
+        coordinate_msetnx(
+            args,
+            my_shard,
+            num_shards,
+            db_index,
+            shard_databases,
+            dispatch_tx,
+            spsc_notifiers,
+            cached_clock,
+            _response_pool,
+        )
+        .await
     } else if cmd.eq_ignore_ascii_case(b"BITOP") {
         coordinate_bitop(
             args,
@@ -805,6 +818,77 @@ async fn coordinate_mset(
     }
 
     Frame::SimpleString(Bytes::from_static(b"OK"))
+}
+
+/// Coordinate MSETNX across shards.
+///
+/// MSETNX is atomic by contract: set every pair iff *none* of the keys already
+/// exist. Moon cannot honor that atomically across shards (like MSET, cross-shard
+/// writes scatter with no two-phase commit or rollback), so — by design — MSETNX
+/// is rejected with a CROSSSLOT error when its keys hash to more than one shard.
+/// When all keys are co-located on a single shard (including via `{hash-tag}`),
+/// the whole command runs atomically on that shard's owner.
+#[allow(clippy::too_many_arguments)]
+async fn coordinate_msetnx(
+    args: &[Frame],
+    my_shard: usize,
+    num_shards: usize,
+    db_index: usize,
+    shard_databases: &Arc<ShardDatabases>,
+    dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
+    spsc_notifiers: &[Arc<channel::Notify>],
+    cached_clock: &CachedClock,
+    _response_pool: &(), // placeholder — coordinator uses oneshot internally
+) -> Frame {
+    if args.is_empty() || !args.len().is_multiple_of(2) {
+        return Frame::Error(Bytes::from_static(
+            b"ERR wrong number of arguments for 'MSETNX' command",
+        ));
+    }
+
+    // Every key must hash to the same shard; otherwise MSETNX cannot be atomic.
+    let first_key = match extract_key(&args[0]) {
+        Some(k) => k,
+        None => {
+            return Frame::Error(Bytes::from_static(
+                b"ERR wrong number of arguments for 'MSETNX' command",
+            ));
+        }
+    };
+    let owner = key_to_shard(&first_key, num_shards);
+    for pair in args.chunks(2) {
+        let key = match extract_key(&pair[0]) {
+            Some(k) => k,
+            None => {
+                return Frame::Error(Bytes::from_static(
+                    b"ERR wrong number of arguments for 'MSETNX' command",
+                ));
+            }
+        };
+        if key_to_shard(&key, num_shards) != owner {
+            return Frame::Error(Bytes::from_static(
+                b"CROSSSLOT Keys in MSETNX request don't hash to the same shard",
+            ));
+        }
+    }
+
+    // All keys co-located -> run the whole MSETNX atomically on the owning shard
+    // (run_on_owner dispatches locally, or forwards intact to the remote owner).
+    let mut command_parts: Vec<Frame> = Vec::with_capacity(args.len() + 1);
+    command_parts.push(Frame::BulkString(Bytes::from_static(b"MSETNX")));
+    command_parts.extend_from_slice(args);
+    run_on_owner(
+        &first_key,
+        &command_parts,
+        my_shard,
+        num_shards,
+        db_index,
+        shard_databases,
+        dispatch_tx,
+        spsc_notifiers,
+        cached_clock,
+    )
+    .await
 }
 
 /// Coordinate DEL/UNLINK/EXISTS with multiple keys across shards using VLL pattern.

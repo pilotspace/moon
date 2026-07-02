@@ -506,9 +506,12 @@ fn dispatch_inner(
             }
         }
         (6, b'm') => {
-            // MEMORY (USAGE, STATS, DOCTOR, HELP)
+            // MEMORY (USAGE, STATS, DOCTOR, HELP), MSETNX
             if cmd.eq_ignore_ascii_case(b"MEMORY") {
                 return resp(server_admin::memory(db, args));
+            }
+            if cmd.eq_ignore_ascii_case(b"MSETNX") {
+                return resp(string::msetnx(db, args));
             }
         }
         (6, b'o') => {
