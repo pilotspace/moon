@@ -394,6 +394,47 @@ mod tests {
         assert!(!db.exists(b"k"), "rejected SET EX must not create the key");
     }
 
+    // --- i64-domain expiry bound (Finding 2): reject expiries past i64::MAX so
+    // PTTL/PEXPIRETIME never wrap negative on a live key (Redis parity). ---
+
+    #[test]
+    fn test_setex_i64_bound_rejected() {
+        // seconds*1000 fits u64 but exceeds i64::MAX -> reject (else PTTL wraps negative).
+        let mut db = make_db();
+        let over = Frame::BulkString(Bytes::from("15000000000000000")); // 1.5e16 s
+        let result = setex(&mut db, &[bs(b"k"), over, bs(b"v")]);
+        assert!(matches!(result, Frame::Error(ref e) if e.starts_with(b"ERR invalid expire")));
+        assert!(!db.exists(b"k"), "rejected SETEX must not create the key");
+    }
+
+    #[test]
+    fn test_set_ex_i64_bound_rejected() {
+        let mut db = make_db();
+        let over = Frame::BulkString(Bytes::from("15000000000000000"));
+        let result = set(&mut db, &[bs(b"k"), bs(b"v"), bs(b"EX"), over]);
+        assert!(matches!(result, Frame::Error(ref e) if e.starts_with(b"ERR invalid expire")));
+        assert!(!db.exists(b"k"), "rejected SET EX must not create the key");
+    }
+
+    #[test]
+    fn test_set_px_i64_bound_rejected() {
+        // now_ms + i64::MAX ms exceeds i64::MAX -> reject.
+        let mut db = make_db();
+        let over = Frame::BulkString(Bytes::from(i64::MAX.to_string()));
+        let result = set(&mut db, &[bs(b"k"), bs(b"v"), bs(b"PX"), over]);
+        assert!(matches!(result, Frame::Error(ref e) if e.starts_with(b"ERR invalid expire")));
+        assert!(!db.exists(b"k"), "rejected SET PX must not create the key");
+    }
+
+    #[test]
+    fn test_psetex_i64_bound_rejected() {
+        let mut db = make_db();
+        let over = Frame::BulkString(Bytes::from(i64::MAX.to_string()));
+        let result = psetex(&mut db, &[bs(b"k"), over, bs(b"v")]);
+        assert!(matches!(result, Frame::Error(ref e) if e.starts_with(b"ERR invalid expire")));
+        assert!(!db.exists(b"k"), "rejected PSETEX must not create the key");
+    }
+
     #[test]
     fn test_incrby() {
         let mut db = make_db();

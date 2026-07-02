@@ -5,7 +5,7 @@ use crate::storage::Database;
 use crate::storage::entry::{Entry, current_time_ms};
 
 use super::{format_float, parse_f64, parse_i64, parse_positive_i64};
-use crate::command::helpers::{err_wrong_args, extract_bytes, ok};
+use crate::command::helpers::{err_wrong_args, expiry_ms_in_range, extract_bytes, ok};
 
 /// SET command handler with EX/PX/EXAT/PXAT/NX/XX/KEEPTTL/GET options.
 pub fn set(db: &mut Database, args: &[Frame]) -> Frame {
@@ -55,6 +55,7 @@ pub fn set(db: &mut Database, args: &[Frame]) -> Frame {
                     expires_at_ms = match (secs as u64)
                         .checked_mul(1000)
                         .and_then(|d| current_time_ms().checked_add(d))
+                        .filter(|ms| expiry_ms_in_range(*ms))
                     {
                         Some(ms) => ms,
                         None => {
@@ -76,7 +77,19 @@ pub fn set(db: &mut Database, args: &[Frame]) -> Frame {
                 return Frame::Error(Bytes::from_static(b"ERR syntax error"));
             }
             match parse_positive_i64(&args[i]) {
-                Some(ms) => expires_at_ms = current_time_ms() + ms as u64,
+                Some(ms) => {
+                    expires_at_ms = match current_time_ms()
+                        .checked_add(ms as u64)
+                        .filter(|v| expiry_ms_in_range(*v))
+                    {
+                        Some(v) => v,
+                        None => {
+                            return Frame::Error(Bytes::from_static(
+                                b"ERR invalid expire time in 'SET' command",
+                            ));
+                        }
+                    };
+                }
                 None => {
                     return Frame::Error(Bytes::from_static(
                         b"ERR value is not an integer or out of range",
@@ -90,7 +103,10 @@ pub fn set(db: &mut Database, args: &[Frame]) -> Frame {
             }
             match parse_positive_i64(&args[i]) {
                 Some(ts) => {
-                    expires_at_ms = match (ts as u64).checked_mul(1000) {
+                    expires_at_ms = match (ts as u64)
+                        .checked_mul(1000)
+                        .filter(|ms| expiry_ms_in_range(*ms))
+                    {
                         Some(ms) => ms,
                         None => {
                             return Frame::Error(Bytes::from_static(
@@ -654,6 +670,7 @@ pub fn setex(db: &mut Database, args: &[Frame]) -> Frame {
     let expires_at_ms = match (seconds as u64)
         .checked_mul(1000)
         .and_then(|d| current_time_ms().checked_add(d))
+        .filter(|ms| expiry_ms_in_range(*ms))
     {
         Some(ms) => ms,
         None => {
@@ -693,7 +710,18 @@ pub fn psetex(db: &mut Database, args: &[Frame]) -> Frame {
         Some(v) => v.clone(),
         None => return err_wrong_args("PSETEX"),
     };
-    db.set_string_with_expiry(key, value, current_time_ms() + millis as u64);
+    let expires_at_ms = match current_time_ms()
+        .checked_add(millis as u64)
+        .filter(|ms| expiry_ms_in_range(*ms))
+    {
+        Some(ms) => ms,
+        None => {
+            return Frame::Error(Bytes::from_static(
+                b"ERR invalid expire time in 'PSETEX' command",
+            ));
+        }
+    };
+    db.set_string_with_expiry(key, value, expires_at_ms);
     ok()
 }
 

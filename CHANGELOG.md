@@ -6,6 +6,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Milestone **v3-4 KV Write Correctness & Data-Integrity Parity** — the primary KV
+engine now honors Redis's data-integrity contracts (no wrong-type data loss, no
+integer-overflow panics/wraps, past-expire deletes, atomic MSETNX).
+
+### Added
+
+- **MSETNX** — atomic multi-key string write (set all pairs iff none of the keys exist; returns 1/0).
+  Single-shard atomic (two-phase check-then-set, no await between phases). The cross-shard coordinator
+  rejects a key span with `CROSSSLOT` (by design — no two-phase commit) and runs co-located `{hash-tag}`
+  keys atomically on the owning shard. New `--shards 4` regression suite `tests/msetnx_cross_shard_reject.rs`.
+
+### Fixed
+
+- **KV data-integrity (P0):** wrong-type `GETDEL` / `GETSET` / `SET … GET` no longer silently delete or
+  overwrite a key holding a non-string — they return `WRONGTYPE` and preserve the value (check-before-mutate).
+- **Integer overflow (P0):** `DECRBY key -9223372036854775808` no longer panics; every expiry-setting
+  command (`SET EX/PX/EXAT`, `SETEX`, `PSETEX`, `EXPIRE`/`EXPIREAT`/`PEXPIRE`) now rejects a time whose
+  absolute expiry falls outside the `i64` millisecond domain with an "invalid expire time" error —
+  matching Redis (`when > LLONG_MAX/1000`). This closes a latent wrap where an accepted-but-huge TTL
+  (e.g. `EXPIRE k 15000000000000000`) surfaced as a **negative** `PTTL`/`PEXPIRETIME` on a live key, and
+  makes an extreme-negative `EXPIRE`/`EXPIREAT` (`< i64::MIN/1000`) error instead of deleting.
+- **Expire-in-the-past semantics (P0):** `EXPIRE`/`PEXPIRE`/`EXPIREAT` with a non-positive or already-past
+  time now deletes the key and returns 1 (Redis parity); verified to propagate through command-based WAL
+  replay so replicas stay consistent.
+
 ## [0.4.1] — 2026-06-23
 
 Measure-only validation release — **no server behavior change**. Bundles the closed
