@@ -99,6 +99,15 @@ impl RuntimeFactory for MonoioRuntimeFactory {
             let sqpoll_idle_ms = std::env::var("MOON_URING_SQPOLL")
                 .ok()
                 .and_then(|v| v.parse::<u32>().ok());
+            // CQ spin (vendored-monoio MOON_URING_SPIN_US) requires completions
+            // to be observable from userspace WITHOUT an io_uring_enter:
+            // DEFER_TASKRUN posts CQEs only inside enter(GETEVENTS) and
+            // COOP_TASKRUN only at kernel-entry boundaries, so either flag makes
+            // the spin burn its whole budget every park (measured: 49µs/op on
+            // c4a, a 3× regression). Spin mode therefore forces a plain ring;
+            // combined with SQPOLL the sqpoll kthread posts CQEs continuously
+            // and the spinning shard thread reaps with zero per-op syscalls.
+            let spin_active = std::env::var_os("MOON_URING_SPIN_US").is_some();
             if let Some(idle_ms) = sqpoll_idle_ms {
                 urb.setup_sqpoll(idle_ms);
                 if let Some(cpu) = std::env::var("MOON_URING_SQPOLL_CPU")
@@ -107,7 +116,7 @@ impl RuntimeFactory for MonoioRuntimeFactory {
                 {
                     urb.setup_sqpoll_cpu(cpu);
                 }
-            } else {
+            } else if !spin_active {
                 urb.setup_coop_taskrun()
                     .setup_single_issuer()
                     .setup_defer_taskrun();

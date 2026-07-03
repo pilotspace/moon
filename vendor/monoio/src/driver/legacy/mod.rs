@@ -57,6 +57,18 @@ pub struct LegacyDriver {
 #[cfg(feature = "sync")]
 const TOKEN_WAKEUP: mio::Token = mio::Token(1 << 31);
 
+// moon patch: epoll spin budget from MOON_EPOLL_SPIN_US (0 = disabled), read
+// once. See inner_park for the poll-mode rationale.
+fn moon_epoll_spin_budget_us() -> u64 {
+    static SPIN_US: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *SPIN_US.get_or_init(|| {
+        std::env::var("MOON_EPOLL_SPIN_US")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    })
+}
+
 #[allow(dead_code)]
 impl LegacyDriver {
     const DEFAULT_ENTRIES: u32 = 1024;
@@ -152,10 +164,52 @@ impl LegacyDriver {
 
         // here we borrow 2 mut self, but its safe.
         let events = unsafe { &mut (*self.inner.get()).events };
-        match inner.poll.poll(events, timeout) {
-            Ok(_) => {}
-            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {}
-            Err(e) => return Err(e),
+
+        // ---- moon patch: readiness spin-poll before blocking (MOON_EPOLL_SPIN_US) ----
+        // Poll-mode for request/response workloads: instead of sleeping in
+        // epoll_wait and paying the scheduler wake on every op, busy-loop
+        // zero-timeout polls (~0.3µs each; readiness is published by softirq
+        // with no wake machinery) for a bounded window, falling back to the
+        // stock blocking poll on miss. Foreign wakes surface during the spin
+        // too: the waker eventfd is registered in this same mio poll. Off
+        // unless MOON_EPOLL_SPIN_US is set; zero behavior change otherwise.
+        let mut polled = false;
+        #[cfg(unix)]
+        if need_wait {
+            let spin_us = moon_epoll_spin_budget_us();
+            if spin_us > 0 {
+                let budget = match timeout {
+                    Some(d) => d.min(Duration::from_micros(spin_us)),
+                    None => Duration::from_micros(spin_us),
+                };
+                let deadline = std::time::Instant::now() + budget;
+                loop {
+                    match inner.poll.poll(events, Some(Duration::ZERO)) {
+                        Ok(_) => {}
+                        Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {}
+                        Err(e) => return Err(e),
+                    }
+                    if !events.is_empty() {
+                        polled = true;
+                        break;
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        break;
+                    }
+                    for _ in 0..16 {
+                        std::hint::spin_loop();
+                    }
+                }
+            }
+        }
+        // ---- end moon patch ----
+
+        if !polled {
+            match inner.poll.poll(events, timeout) {
+                Ok(_) => {}
+                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
         }
         #[cfg(unix)]
         let iter = events.iter();
