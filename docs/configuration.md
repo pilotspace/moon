@@ -13,7 +13,7 @@ All options are available as command-line flags. Run `moon --help` for the full 
 |------|---------|-------------|
 | `--bind` | `127.0.0.1` | Bind address |
 | `--port` / `-p` | `6379` | Port to listen on |
-| `--shards` | `0` (auto) | Number of shards (0 = CPU count) |
+| `--shards` | `1` | Number of shards (`0` = auto-detect CPU count) |
 | `--databases` | `16` | Number of databases |
 | `--requirepass` | *(none)* | Require password authentication |
 | `--protected-mode` | `yes` | Reject non-loopback when no password set |
@@ -22,8 +22,9 @@ All options are available as command-line flags. Run `moon --help` for the full 
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--appendonly` | `no` | Enable AOF persistence (`yes`/`no`) |
+| `--appendonly` | `yes` | Enable AOF persistence (`yes`/`no`) — Moon is durable by default |
 | `--appendfsync` | `everysec` | AOF fsync policy (`always`/`everysec`/`no`) |
+| `--aof-fsync-timeout-ms` | `2000` | Bound on a write's wait for its fsync barrier under `always` (0 = unbounded) |
 | `--appendfilename` | `appendonly.aof` | AOF filename |
 | `--save` | *(none)* | RDB auto-save rules (e.g., `"3600 1 300 100"`) |
 | `--dir` | `.` | Directory for persistence files |
@@ -105,6 +106,10 @@ All options are available as command-line flags. Run `moon --help` for the full 
 | `--tcp-keepalive` | `300` | TCP keepalive interval in seconds (0 = disabled) |
 | `--slowlog-log-slower-than` | `10000` | Slowlog threshold in microseconds |
 | `--slowlog-max-len` | `128` | Maximum slowlog entries |
+| `--io-driver` | `auto` | I/O driver: `auto` (io_uring on Linux, kqueue on macOS) or `epoll` |
+| `--io-busy-poll-us` | `0` (off) | Busy-poll the I/O driver for N µs before parking. Large single-op latency win on **dedicated, pinned cores**; a regression on shared/oversubscribed hosts. See the [tuning guide](guides/tuning.md) |
+| `--initial-keyspace-hint` | `0` | Pre-size the keyspace (e.g. `1000000`) to avoid rehash pauses during bulk loads |
+| `--memory-arenas-cap` | `8` | Cap jemalloc arenas — lower (e.g. `2`) for small containers |
 | `--uring-sqpoll` | *(disabled)* | io_uring SQPOLL idle timeout in ms. Requires CAP_SYS_NICE. Linux only |
 
 ## Disk offload (tiered storage)
@@ -141,10 +146,12 @@ All options are available as command-line flags. Run `moon --help` for the full 
 ## Tips
 
 !!! note
-    Use `--shards 0` to auto-detect CPU count. Use `--shards 1` for benchmarking or when comparing per-key memory against Redis.
+    The default `--shards 1` gives the best single-operation latency and is the right choice for most deployments. Add shards when you have **many concurrent connections (8+)** or **pipelined/batched traffic** — see the [tuning guide](guides/tuning.md) for measured guidance.
 
 !!! tip
     Hash tags like `{tag}` in key names (e.g., `user:{1234}:name`) route all tagged keys to the same shard, eliminating cross-shard dispatch for MGET/MSET operations.
 
 !!! warning
     Testing with more than 1,000 concurrent clients may require `ulimit -n 65536`. At 5,000 clients with pipelining, connection drops can occur without it.
+
+For workload-specific recipes (cache, high-concurrency API, durable store, vector search, containers), see the **[tuning guide](guides/tuning.md)**.

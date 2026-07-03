@@ -177,11 +177,13 @@ pub struct ServerConfig {
 
     /// Number of shards (0 = auto-detect from CPU count).
     ///
-    /// Defaults to 1: single-shard gives the best throughput for
-    /// non-pipelined workloads (cross-shard SPSC dispatch dominates local
-    /// lookups otherwise) and a deterministic persistence layout across
-    /// hosts. Pass `--shards 0` to auto-detect from the CPU count, or pin
-    /// an explicit count for pipelined/AOF-heavy multi-core deployments.
+    /// Defaults to 1: single-shard gives the best per-op latency for
+    /// low-concurrency, non-pipelined workloads (a cross-shard hop costs
+    /// ~10µs) and a deterministic persistence layout across hosts. Pin an
+    /// explicit count (e.g. 4) for 8+ concurrent connections or pipelined
+    /// traffic — measured 1.3-1.9x Redis at 8-64 conns on 4 shards — or
+    /// pass `--shards 0` to auto-detect on a dedicated host. See
+    /// docs/guides/tuning.md.
     #[arg(long, default_value_t = 1)]
     pub shards: usize,
 

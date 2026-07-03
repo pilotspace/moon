@@ -153,6 +153,7 @@ nav:
   - Operations:
       - Operator guide: OPERATOR-GUIDE.md
       - Production guide: production-guide.md
+      - Tuning guide: guides/tuning.md
       - Production contract: PRODUCTION-CONTRACT.md
       - Memory reclamation:
           - Overview: operations/README.md
