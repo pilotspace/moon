@@ -1769,7 +1769,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                         let _wait_guard = crate::shard::slice::XshardWaitGuard::new();
                         let mut spun = None;
                         if crate::shard::slice::xshard_should_spin(batch_remote_total) {
-                            for _ in 0..crate::shard::slice::XSHARD_SPIN_BUDGET {
+                            for _ in 0..crate::shard::slice::xshard_spin_budget() {
                                 match reply_rx.try_recv() {
                                     Ok(value) => {
                                         spun = Some(Ok(value));

@@ -1647,7 +1647,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                         let shard_responses = {
                             let mut spun = None;
                             if crate::shard::slice::xshard_should_spin(batch_remote_total) {
-                                for _ in 0..crate::shard::slice::XSHARD_SPIN_BUDGET {
+                                for _ in 0..crate::shard::slice::xshard_spin_budget() {
                                     if let Some(r) = response_pool.slot_for(target).try_take() {
                                         spun = Some(r);
                                         break;

@@ -238,6 +238,34 @@ pub const XSHARD_SPIN_GATE: u32 = 2;
 /// parking. Caps the busy-loop so a slow owner shard cannot starve this thread.
 pub const XSHARD_SPIN_BUDGET: u32 = 4_096;
 
+/// Effective reply-side spin budget: `MOON_XSHARD_SPIN_BUDGET` env override
+/// (diagnostic — same-instance A/Bs of the C2 spin without a rebuild; 0 fully
+/// disables the reply-side spin), else the tuned const. Read once; after init
+/// this is a lock-free load, cheap enough for the reply-wait path.
+#[inline]
+pub fn xshard_spin_budget() -> u32 {
+    static V: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("MOON_XSHARD_SPIN_BUDGET")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(XSHARD_SPIN_BUDGET)
+    })
+}
+
+/// Effective reply-side spin gate: `MOON_XSHARD_SPIN_GATE` env override
+/// (diagnostic), else the tuned const. Read once.
+#[inline]
+fn xshard_spin_gate() -> u32 {
+    static V: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("MOON_XSHARD_SPIN_GATE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(XSHARD_SPIN_GATE)
+    })
+}
+
 /// Max cross-shard commands in the CURRENT connection batch for which the reply-side
 /// spin is allowed — the call site gates on `batch_remote <= this && xshard_may_spin()`.
 ///
@@ -259,7 +287,7 @@ pub const XSHARD_SPIN_MAX_BATCH_REMOTE: usize = 1;
 /// Reads a thread-local `Cell<u32>`: no atomic, no lock, no syscall.
 #[inline]
 pub fn xshard_may_spin() -> bool {
-    XSHARD_INFLIGHT.with(|c| c.get() <= XSHARD_SPIN_GATE)
+    XSHARD_INFLIGHT.with(|c| c.get() <= xshard_spin_gate())
 }
 
 /// The full reply-side spin decision for the current batch: spin only when the batch

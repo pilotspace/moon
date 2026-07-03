@@ -571,10 +571,13 @@ measure_ab() {
   basebin=$(MOON_REF="$AB_BASE_REF" build_moon) || die "moon build (base=$AB_BASE_REF)"
   log "  settling compile heat..."; wait_quiesced
 
-  local combos=( "1|1" "8|1" )
+  # AB_COMBOS: space-separated "clients|pipe" cells. AB_BASE_ENV / AB_NEW_ENV:
+  # per-side MOON_START_ENV (env-knob A/B on ONE binary — set AB_BASE_REF=MOON_REF).
+  local combos; read -r -a combos <<< "${AB_COMBOS:-1|1 8|1}"
   CLIENT_CORE="${SHARD_CLIENT_CORES:-5-7}"
   echo "# kv-commit-ab raw (same-instance, pinned: client cores $CLIENT_CORE, best-of-$BEST_OF_N, strict keyspace)"
   echo "# base=$AB_BASE_REF new=$MOON_REF persist=$PERSIST requests=$REQUESTS shards=[${AB_SHARDS:-4}] spin=[${AB_SPINS:-0 40}]"
+  echo "# base_env='${AB_BASE_ENV:-}' new_env='${AB_NEW_ENV:-}' combos='${AB_COMBOS:-1|1 8|1}'"
   echo "# machine|shards|spin_us|clients|pipe|cmd|base_rps|new_rps|redis_rps|new_vs_base|new_vs_redis"
 
   declare -A RBEST BB NB
@@ -599,10 +602,10 @@ measure_ab() {
         BB=(); NB=()
         while IFS='|' read -r eng cmd best reps nn; do
           BB["$cmd"]="$best"
-        done < <( cell_engine moon "$basebin" )
+        done < <( MOON_START_ENV="${AB_BASE_ENV:-${MOON_START_ENV:-}}" cell_engine moon "$basebin" )
         while IFS='|' read -r eng cmd best reps nn; do
           NB["$cmd"]="$best"
-        done < <( cell_engine moon "$newbin" )
+        done < <( MOON_START_ENV="${AB_NEW_ENV:-${MOON_START_ENV:-}}" cell_engine moon "$newbin" )
         for cmd in SET GET; do
           b="${BB[$cmd]:-0}"; m="${NB[$cmd]:-0}"; r="${RBEST["$C|$P|$cmd"]:-0}"
           printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' "$GCE_MACHINE" "$S" "$SPIN" "$C" "$P" "$cmd" \
@@ -701,6 +704,7 @@ gcloud_run_one() {
     REQUESTS='$REQUESTS' KEYSPACE='$KEYSPACE' PIPES='$PIPES' CLIENTS_SWEEP='$CLIENTS_SWEEP' PERSIST='$PERSIST' \
     SHARDS_SWEEP='$SHARDS_SWEEP' SPIN_SWEEP='$SPIN_SWEEP' SHARD_CLIENT_CORES='$SHARD_CLIENT_CORES' \
     AB_BASE_REF='${AB_BASE_REF:-}' AB_SHARDS='${AB_SHARDS:-}' AB_SPINS='${AB_SPINS:-}' \
+    AB_BASE_ENV='${AB_BASE_ENV:-}' AB_NEW_ENV='${AB_NEW_ENV:-}' AB_COMBOS='${AB_COMBOS:-}' \
     MOON_SHARDS='${MOON_SHARDS:-}' SERVER_CORES='${SERVER_CORES:-}' MOON_EXTRA_FLAGS='${MOON_EXTRA_FLAGS:-}' \
     CLIENT_CORE='${CLIENT_CORE_OVERRIDE:-$CLIENT_CORE}' \
     MOON_START_ENV='${MOON_START_ENV:-}' \
