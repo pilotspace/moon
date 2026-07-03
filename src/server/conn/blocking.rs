@@ -1261,41 +1261,48 @@ pub(crate) fn try_inline_dispatch(
         let consumed = key_end_crlf;
         let key_bytes = &buf[key_start..key_end];
         // Hot-key sampling + lookup via thread-local slice — no lock needed.
-        enum GetResult {
-            Found(Vec<u8>),
-            WrongType,
+        // Frame the reply straight from the borrowed `&[u8]` INSIDE the closure so
+        // the value is copied exactly once (borrow -> write_buf), never via an
+        // intermediate `Vec` (`val.to_vec()`). The closure writes response bytes +
+        // itoa ONLY; it must not re-enter `with_shard*` (thread-local RefCell
+        // reentrancy) and takes no `.await`.
+        enum GetOutcome {
+            // Hit or wrong-type: the response is already framed into `write_buf`.
+            Handled,
+            // Absent locally: consult the cold tier below (`cold_loc` carries where).
             Miss,
         }
-        let (inline_result, cold_loc) = crate::shard::slice::with_shard_db(selected_db, |db| {
+        let (outcome, cold_loc) = crate::shard::slice::with_shard_db(selected_db, |db| {
             if db.hot_keys().tick() {
                 db.hot_keys().observe(key_bytes);
             }
             match db.get_if_alive(key_bytes, now_ms) {
                 Some(entry) => match entry.value.as_bytes() {
-                    Some(val) => (GetResult::Found(val.to_vec()), None),
-                    None => (GetResult::WrongType, None),
+                    Some(val) => {
+                        write_buf.extend_from_slice(b"$");
+                        let mut itoa_buf = itoa::Buffer::new();
+                        write_buf.extend_from_slice(itoa_buf.format(val.len()).as_bytes());
+                        write_buf.extend_from_slice(b"\r\n");
+                        write_buf.extend_from_slice(val);
+                        write_buf.extend_from_slice(b"\r\n");
+                        (GetOutcome::Handled, None)
+                    }
+                    None => {
+                        write_buf.extend_from_slice(
+                            b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
+                        );
+                        (GetOutcome::Handled, None)
+                    }
                 },
                 None => {
                     let loc = db.cold_lookup_location(key_bytes);
-                    (GetResult::Miss, loc)
+                    (GetOutcome::Miss, loc)
                 }
             }
         });
-        match inline_result {
-            GetResult::Found(val) => {
-                write_buf.extend_from_slice(b"$");
-                let mut itoa_buf = itoa::Buffer::new();
-                write_buf.extend_from_slice(itoa_buf.format(val.len()).as_bytes());
-                write_buf.extend_from_slice(b"\r\n");
-                write_buf.extend_from_slice(&val);
-                write_buf.extend_from_slice(b"\r\n");
-            }
-            GetResult::WrongType => {
-                write_buf.extend_from_slice(
-                    b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
-                );
-            }
-            GetResult::Miss => {
+        match outcome {
+            GetOutcome::Handled => {}
+            GetOutcome::Miss => {
                 let cold = cold_loc.and_then(|(loc, shard_dir)| {
                     crate::storage::tiered::cold_read::read_cold_entry_at(&shard_dir, loc, now_ms)
                 });
@@ -1315,8 +1322,6 @@ pub(crate) fn try_inline_dispatch(
                 } else {
                     write_buf.extend_from_slice(b"$-1\r\n");
                 }
-                let _ = read_buf.split_to(consumed);
-                return 1;
             }
         }
         let _ = read_buf.split_to(consumed);
