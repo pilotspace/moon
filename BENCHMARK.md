@@ -1,6 +1,6 @@
 # moon Benchmark Report
 
-**Last Updated:** 2026-07-03 (**new §2.10: p=1 single-op WIN on both arches via `--io-busy-poll-us` poll-mode park** — ARM c4a 1.19–1.21×, x86 c3 1.65–1.66× vs Redis, n=3 instances/arch; supersedes the "loses p=1" rows in §2.7–2.9 when busy-poll is on. Prior: 2026-06-16 4-feature concurrent-vs-competitor pass — §10.5 vector vs RediSearch, §11.4 graph vs FalkorDB, §12 Full-Text Search; §2.8 = v2-1/PR #189 `db61973` K=1024 re-measurement; v0.1.6 in §2.1–2.6; §2.7 on perf/shard-dispatch-hot-path)
+**Last Updated:** 2026-07-03 (**new §2.10: p=1 single-op WIN on both arches via `--io-busy-poll-us` poll-mode park** — ARM c4a 1.19–1.21×, x86 c3 1.65–1.66× vs Redis, n=3 instances/arch; supersedes the "loses p=1" rows in §2.7–2.9 when busy-poll is on. **New §6.5: shards × busy-poll sweep** — busy-poll recovers +22–42% of the cross-shard hop but shards>1 still loses non-pipelined; `--shards 1 --io-busy-poll-us 40` is the p=1 config. Prior: 2026-06-16 4-feature concurrent-vs-competitor pass — §10.5 vector vs RediSearch, §11.4 graph vs FalkorDB, §12 Full-Text Search; §2.8 = v2-1/PR #189 `db61973` K=1024 re-measurement; v0.1.6 in §2.1–2.6; §2.7 on perf/shard-dispatch-hot-path)
 **Platforms:** Linux (GCloud x86_64 + ARM64), macOS (Apple M4 Pro)
 **Redis:** 8.6.1 in §2.1–2.6; 7.0.15 in §2.7
 **moon:** v0.1.6 in §2.1–2.6; perf/shard-dispatch-hot-path HEAD (commit `6582fa9`) in §2.7. Monoio runtime (io_uring on Linux, kqueue on macOS), fat LTO, codegen-units=1, target-cpu=native
@@ -537,6 +537,34 @@ degrades with shard count (0.93×→0.61× as 1→12) as its keys scatter cross-
 restores it. Detail: `docs/reviews/2026-06-17/WIDER-BENCH.md`.
 
 > **Clarification (2026-07-02 KV deep review).** The **0.46–0.51×** p=1 figure above is from `bench-production.sh`, which changes three things at once *besides* shard count: distributed keys (`-r`, real cross-shard scatter — vs `bench-compare.sh`'s single hot `__rand_key__`), larger values (512B–4KB), and higher client counts (`-c 100/200` on the INCR rows). It is a **throughput artifact of {distributed keys × high concurrency × value size × multi-key scatter}, not a clean shard-count signal** — the cross-shard hop itself is ~10µs (v2-2 bare-metal), ~2% of the ~460µs p=1 baseline. The controlled `bench-compare.sh` sweep in the table above (only shard count varies) is **flat at p=1** (0.79→0.82×). Read 0.46× as "production-shaped multi-key under concurrency," not "the cross-shard hop costs 2×."
+
+### 6.5 2026-07-03 shards × busy-poll sweep (`--measure-shards`, build `74de849`)
+
+Same-instance rigor (pinned, steal-gated, fresh-server best-of-3, strict `-r 1M` keyspace so
+shards=4 really scatters), `c4a-standard-8` + `c3-standard-8`: Moon shards {1, 4} × `--io-busy-poll-us`
+{0, 40} vs one canonical single-threaded Redis; shards on cores 0–3, 3-thread client on 5–7.
+Ratio = Moon/Redis:
+
+| cell (cmd ≈ SET/GET) | ARM stock | ARM spin40 | x86 stock | x86 spin40 |
+|---|:---:|:---:|:---:|:---:|
+| **s1 c1 P1** (single-op latency) | 1.02 | **1.21 / 1.25** | 1.06 | **1.42 / 1.43** |
+| **s4 c1 P1** (cross-shard hop) | 0.70 | 0.85 / 0.88 | 0.64 | 0.88 / 0.91 |
+| **s4 c8 P1** (scattered, no pipeline) | 0.44 | 0.50 / 0.58 | 0.41 / 0.45 | 0.64 / 0.56 |
+| **s4 c8 P16 SET** (Redis server-bound) | **≥2.0×** | **≥2.0×** | ~1.0 (capped) | **≥2.0×** |
+
+Readings:
+- **The §2.10 busy-poll p=1 win replicates on the 8-vCPU shape** (5th ARM + 4th x86 instance).
+- **Busy-poll recovers a large fraction of the cross-shard hop** (the target shard normally sleeps;
+  spin removes that wake): s4 single-conn improves +22% ARM / +38–42% x86 — but shards=4 still
+  **loses** every non-pipelined cell. The SPSC dispatch cost dominates once keys scatter.
+- **Guidance unchanged, now sharper:** `--shards 1 --io-busy-poll-us 40` is the p=1 configuration
+  that beats Redis outright; add shards only for pipelined / AOF / hash-tag-co-located workloads.
+- ⚠ **Deep-pipeline cells (P16/P64) on this co-located pinned topology are mostly client-saturated**
+  — both engines plateau at ~1.2M ops/s with identical durations (the 3-thread pinned client is the
+  bottleneck), so their ≈1.00 "ties" are ceilings, not measurements. Readable exceptions: Redis SET
+  P16 is server-bound at ~599k (Moon ≥2.0× there, understated), and x86 s4 spin P64 SET burst past
+  the plateau to 1.74M (1.46×). For whole-machine peak throughput, §2.8/§6.4's methodology (client
+  gets the full core budget) remains the reference.
 
 ---
 
