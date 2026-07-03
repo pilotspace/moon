@@ -709,17 +709,22 @@ pub(crate) fn handle_shard_message_shared(
                     };
 
                     if is_write && !matches!(frame, crate::protocol::Frame::Error(_)) {
-                        let serialized = aof::serialize_command(cmd_frame);
-                        wal_append_and_fanout(
-                            &serialized,
-                            wal_writer,
-                            wal_v3_writer,
-                            repl_backlog,
-                            replica_txs,
-                            repl_state,
-                            shard_id,
-                            aof_pool, // FIX-W1-2
-                        );
+                        // Skip the serialization alloc when the fanout would
+                        // no-op (persistence + replication all off) — it was
+                        // pure waste on every cross-shard write.
+                        if wal_fanout_has_work(wal_writer, wal_v3_writer, replica_txs, aof_pool) {
+                            let serialized = aof::serialize_command(cmd_frame);
+                            wal_append_and_fanout(
+                                &serialized,
+                                wal_writer,
+                                wal_v3_writer,
+                                repl_backlog,
+                                replica_txs,
+                                repl_state,
+                                shard_id,
+                                aof_pool, // FIX-W1-2
+                            );
+                        }
 
                         let needs_wake = cmd.eq_ignore_ascii_case(b"LPUSH")
                             || cmd.eq_ignore_ascii_case(b"RPUSH")
@@ -1011,17 +1016,22 @@ pub(crate) fn handle_shard_message_shared(
                     };
 
                     if is_write && !matches!(frame, crate::protocol::Frame::Error(_)) {
-                        let serialized = aof::serialize_command(cmd_frame);
-                        wal_append_and_fanout(
-                            &serialized,
-                            wal_writer,
-                            wal_v3_writer,
-                            repl_backlog,
-                            replica_txs,
-                            repl_state,
-                            shard_id,
-                            aof_pool, // FIX-W1-2
-                        );
+                        // Skip the serialization alloc when the fanout would
+                        // no-op (persistence + replication all off) — it was
+                        // pure waste on every cross-shard write.
+                        if wal_fanout_has_work(wal_writer, wal_v3_writer, replica_txs, aof_pool) {
+                            let serialized = aof::serialize_command(cmd_frame);
+                            wal_append_and_fanout(
+                                &serialized,
+                                wal_writer,
+                                wal_v3_writer,
+                                repl_backlog,
+                                replica_txs,
+                                repl_state,
+                                shard_id,
+                                aof_pool, // FIX-W1-2
+                            );
+                        }
 
                         let needs_wake = cmd.eq_ignore_ascii_case(b"LPUSH")
                             || cmd.eq_ignore_ascii_case(b"RPUSH")
@@ -2398,6 +2408,26 @@ pub(crate) fn cow_intercept(
 /// through the per-shard AOF pool. The SPSC drain is synchronous so we use
 /// `try_send_append` (fire-and-forget). The `appendfsync=always` rendezvous is
 /// handled by the connection handler (async context), not here.
+/// True when `wal_append_and_fanout` has any consumer for the serialized
+/// command (S3.5b criterion: WAL v2/v3, live replicas, or the AOF pool).
+/// ARM perf annotate showed the pre-S3.5b locks were ~21% of CPU on 8-shard
+/// SET p=64 with everything off; the criterion is fully derivable from the
+/// inputs — no flags or shared state. Skipping leaves shard_offset
+/// un-advanced, which is fine: with no WAL and no replicas the offsets are
+/// dead bytes (no consumer exists). Callers on the cross-shard write arms
+/// check THIS before `aof::serialize_command` so the serialization alloc +
+/// copy is also skipped when the fanout would no-op (it was pure waste on
+/// every cross-shard write with persistence off).
+#[inline]
+pub(crate) fn wal_fanout_has_work(
+    wal_writer: &Option<WalWriter>,
+    wal_v3_writer: &Option<WalWriterV3>,
+    replica_txs: &[(u64, channel::MpscSender<bytes::Bytes>)],
+    aof_pool: Option<&std::sync::Arc<crate::persistence::aof::AofWriterPool>>,
+) -> bool {
+    wal_writer.is_some() || wal_v3_writer.is_some() || !replica_txs.is_empty() || aof_pool.is_some()
+}
+
 pub(crate) fn wal_append_and_fanout(
     data: &[u8],
     wal_writer: &mut Option<WalWriter>,
@@ -2409,20 +2439,9 @@ pub(crate) fn wal_append_and_fanout(
     aof_pool: Option<&std::sync::Arc<crate::persistence::aof::AofWriterPool>>,
 ) {
     // S3.5b (2026-04-27): hot-path bypass when nothing actually has work.
-    // ARM perf annotate showed `repl_backlog.lock()` (caslb/casab) and
-    // `repl_state.read()` (RwLock CAS) were ~21% of CPU on 8-shard SET p=64
-    // even with `--appendonly no` and zero replicas connected. The criterion
-    // is fully derivable from the inputs — no flags or shared state needed.
-    // Skipping leaves shard_offset un-advanced; that is fine since with no
-    // WAL and no replicas the offsets are dead bytes (no consumer exists).
-    //
-    // FIX-W1-2: also require `aof_pool.is_none()` so that per-shard AOF
-    // entries are not skipped when WAL/replication are off but AOF is on.
-    if wal_writer.is_none()
-        && wal_v3_writer.is_none()
-        && replica_txs.is_empty()
-        && aof_pool.is_none()
-    {
+    // See `wal_fanout_has_work` — callers use the same predicate to skip the
+    // `aof::serialize_command` alloc entirely when the fanout would no-op.
+    if !wal_fanout_has_work(wal_writer, wal_v3_writer, replica_txs, aof_pool) {
         return;
     }
     // WAL v3 supersedes v2 — skip v2 append when v3 is active to avoid
