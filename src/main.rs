@@ -810,6 +810,10 @@ fn main() -> anyhow::Result<()> {
     // whole-instance cap (per-shard budget = maxmemory / num_shards). Without
     // this, each shard would tolerate the full maxmemory → ~N× aggregate RSS.
     runtime_config_shared.write().num_shards = num_shards;
+    // Publish the lock-free maxmemory hints AFTER num_shards is resolved (the
+    // per-shard hint divides by it) — the inline write path's eviction
+    // pre-gate reads these instead of taking the runtime-config lock.
+    moon::storage::eviction::publish_maxmemory_hints(&runtime_config_shared.read());
     moon::config::log_maxmemory_sharding(runtime_config_shared.read().maxmemory, num_shards);
     let server_config_shared: std::sync::Arc<moon::config::ServerConfig> =
         { std::sync::Arc::new(config.clone()) };

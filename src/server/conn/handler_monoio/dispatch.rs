@@ -835,6 +835,7 @@ pub(super) fn try_handle_client_admin(
                             in_multi: conn.in_multi,
                             blocked: false,
                         },
+                        crate::storage::entry::current_time_ms(),
                     );
                 });
                 let list = crate::client_registry::client_list();
@@ -852,6 +853,7 @@ pub(super) fn try_handle_client_admin(
                             in_multi: conn.in_multi,
                             blocked: false,
                         },
+                        crate::storage::entry::current_time_ms(),
                     );
                 });
                 let info = crate::client_registry::client_info(client_id).unwrap_or_default();

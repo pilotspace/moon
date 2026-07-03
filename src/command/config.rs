@@ -98,7 +98,11 @@ pub fn config_set(runtime_config: &mut RuntimeConfig, args: &[Frame]) -> Frame {
 
         match param_name.as_str() {
             "maxmemory" => match value_str.parse::<usize>() {
-                Ok(v) => runtime_config.maxmemory = v,
+                Ok(v) => {
+                    runtime_config.maxmemory = v;
+                    // Keep the inline write path's lock-free pre-gate in sync.
+                    crate::storage::eviction::publish_maxmemory_hints(&*runtime_config);
+                }
                 Err(_) => {
                     return Frame::Error(Bytes::from(format!(
                         "ERR Invalid argument '{}' for CONFIG SET 'maxmemory'",

@@ -520,15 +520,15 @@ pub(crate) async fn handle_connection_sharded_monoio<
         // Skip when unauthenticated or workspace-bound (prefix injection in normal path only).
         if conn.authenticated && conn.workspace_id.is_none() {
             // Inline writes safe only when: ACL unrestricted, !in_multi, !tracking,
-            // !is_replica, no spill_sender. Replica check is non-blocking try_read.
-            let is_replica = ctx.repl_state.as_ref().is_some_and(|rs| {
-                rs.try_read().is_ok_and(|g| {
-                    matches!(
-                        g.role,
-                        crate::replication::state::ReplicationRole::Replica { .. }
-                    )
-                })
-            });
+            // !is_replica, no spill_sender. Replica check reads the lock-free
+            // `is_replica_mirror` (kept in sync by `ReplicationState::set_role`)
+            // instead of `repl_state.try_read()` — the RwLock CAS was a measured
+            // per-op cost on ARM (see S3.5a note in dispatch.rs), and unlike
+            // try_read the mirror stays accurate while the lock is held.
+            let is_replica = ctx
+                .is_replica_mirror
+                .as_ref()
+                .is_some_and(|m| m.load(std::sync::atomic::Ordering::Acquire));
             let can_inline_writes = conn.acl_skip_allowed()
                 && !conn.in_multi
                 && !conn.tracking_state.enabled
@@ -1896,7 +1896,8 @@ pub(crate) async fn handle_connection_sharded_monoio<
         }
 
         // Update live state after each batch — lock-free (QW8, 2026-06
-        // review: this was a global registry write lock per batch).
+        // review: this was a global registry write lock per batch), and
+        // clock-free (shard-cached ms, not Instant::now()).
         client_live.touch(
             conn.selected_db,
             crate::client_registry::ClientFlags {
@@ -1904,6 +1905,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 in_multi: conn.in_multi,
                 blocked: false,
             },
+            ctx.cached_clock.ms(),
         );
 
         // Check if migration was triggered during frame processing.

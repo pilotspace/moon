@@ -1372,30 +1372,39 @@ pub(crate) fn try_inline_dispatch(
     // We must not index into `buf` after this point — use `frozen` instead.
     let frozen = read_buf.split_to(consumed).freeze();
 
-    // Eviction check + write via the thread-local slice (no lock needed).
+    // Eviction check + write via the thread-local slice. The lock-free
+    // pre-gate proves the common case (no memory pressure / no limit) without
+    // the per-SET `runtime_config.read()` lock pair; only under pressure —
+    // or before the hints are published — does the full locked path run.
     {
-        let rt = runtime_config.read();
         let budget = shard_databases.elastic_budget(shard_id);
-        let oom = crate::shard::slice::with_shard_db(selected_db, |db| {
-            crate::storage::eviction::try_evict_if_needed_budget(db, &rt, budget).is_err()
-        });
-        drop(rt);
-        if oom {
-            write_buf
-                .extend_from_slice(b"-OOM command not allowed when used memory > 'maxmemory'\r\n");
-            return 1;
+        let est = crate::shard::slice::with_shard_db(selected_db, |db| db.estimated_memory());
+        if !crate::storage::eviction::inline_write_can_skip_eviction(est, budget) {
+            let rt = runtime_config.read();
+            let oom = crate::shard::slice::with_shard_db(selected_db, |db| {
+                crate::storage::eviction::try_evict_if_needed_budget(db, &rt, budget).is_err()
+            });
+            drop(rt);
+            if oom {
+                write_buf.extend_from_slice(
+                    b"-OOM command not allowed when used memory > 'maxmemory'\r\n",
+                );
+                return 1;
+            }
         }
 
         let key = frozen.slice(key_start..key_end);
         let value = frozen.slice(val_start..val_end);
-        crate::shard::slice::with_shard_db(selected_db, |db| {
+        // `move` closure: `key` and `value` are consumed here (last use), so the
+        // entry/set take ownership — no Bytes refcount bump+drop pair per SET.
+        crate::shard::slice::with_shard_db(selected_db, move |db| {
             if db.hot_keys().tick() {
                 db.hot_keys().observe(&key);
             }
-            let mut entry = crate::storage::entry::Entry::new_string(value.clone());
+            let mut entry = crate::storage::entry::Entry::new_string(value);
             entry.set_last_access(db.now());
             entry.set_access_counter(5);
-            db.set(key.clone(), entry);
+            db.set(key, entry);
         });
     }
 

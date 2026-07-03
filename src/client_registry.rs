@@ -22,6 +22,8 @@ static REGISTRY: LazyLock<RwLock<HashMap<u64, ClientEntry>>> =
 /// (writer, once per batch) and CLIENT LIST/INFO/KILL (occasional readers).
 pub struct ClientLiveState {
     pub connected_at: Instant,
+    /// Epoch ms at registration — baseline for `touch`'s caller-supplied clock.
+    pub connected_at_epoch_ms: u64,
     pub db: AtomicUsize,
     /// Milliseconds since `connected_at` of the last completed batch.
     pub last_cmd_ms: AtomicU64,
@@ -32,12 +34,17 @@ pub struct ClientLiveState {
 }
 
 impl ClientLiveState {
-    /// Record batch-completion state. Three relaxed stores — no lock.
+    /// Record batch-completion state. Three relaxed stores — no lock, and no
+    /// clock read: `now_epoch_ms` comes from the caller (the shard-cached
+    /// clock on hot paths), keeping `Instant::now()` off the per-batch path
+    /// per the timestamp-caching invariant. Up to 1ms of cached-clock
+    /// staleness is fine for an idle-time stat; `saturating_sub` guards the
+    /// stale-clock-before-connect edge.
     #[inline]
-    pub fn touch(&self, db: usize, flags: ClientFlags) {
+    pub fn touch(&self, db: usize, flags: ClientFlags, now_epoch_ms: u64) {
         self.db.store(db, Ordering::Relaxed);
         self.last_cmd_ms.store(
-            self.connected_at.elapsed().as_millis() as u64,
+            now_epoch_ms.saturating_sub(self.connected_at_epoch_ms),
             Ordering::Relaxed,
         );
         self.flags.store(flags.to_bits(), Ordering::Relaxed);
@@ -106,6 +113,7 @@ impl ClientFlags {
 pub fn register(id: u64, addr: String, user: String, shard: usize) -> Arc<ClientLiveState> {
     let live = Arc::new(ClientLiveState {
         connected_at: Instant::now(),
+        connected_at_epoch_ms: crate::storage::entry::current_time_ms(),
         db: AtomicUsize::new(0),
         last_cmd_ms: AtomicU64::new(0),
         flags: AtomicU8::new(ClientFlags::default().to_bits()),
@@ -316,10 +324,29 @@ mod tests {
         update(id, |e| {
             e.name = Some("myconn".into());
         });
-        live.touch(3, ClientFlags::default());
+        live.touch(3, ClientFlags::default(), live.connected_at_epoch_ms);
         let info = client_info(id).unwrap();
         assert!(info.contains("name=myconn"));
         assert!(info.contains("db=3"));
+        deregister(id);
+    }
+
+    #[test]
+    fn test_touch_uses_caller_clock_not_instant_now() {
+        let id = 999_004;
+        let live = register(id, "10.0.0.6:9000".into(), "default".into(), 0);
+        // touch takes the caller's (shard-cached) epoch clock — no per-op
+        // Instant::now(). last_cmd_ms stays "ms since connect".
+        live.touch(2, ClientFlags::default(), live.connected_at_epoch_ms + 5000);
+        assert_eq!(live.last_cmd_ms.load(Ordering::Relaxed), 5000);
+        // A cached clock up to 1ms stale can lag the registration timestamp;
+        // must saturate to 0, never wrap.
+        live.touch(
+            2,
+            ClientFlags::default(),
+            live.connected_at_epoch_ms.saturating_sub(10),
+        );
+        assert_eq!(live.last_cmd_ms.load(Ordering::Relaxed), 0);
         deregister(id);
     }
 

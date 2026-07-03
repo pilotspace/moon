@@ -1758,7 +1758,8 @@ pub(crate) async fn handle_connection_sharded_inner<
                 }
 
                 // Update live state after each batch — lock-free (QW8, 2026-06
-                // review: this was a global registry write lock per batch).
+                // review: this was a global registry write lock per batch), and
+                // clock-free (shard-cached ms, not Instant::now()).
                 client_live.touch(
                     conn.selected_db,
                     crate::client_registry::ClientFlags {
@@ -1766,6 +1767,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                         in_multi: conn.in_multi,
                         blocked: false,
                     },
+                    ctx.cached_clock.ms(),
                 );
 
                 // Check if migration was triggered during frame processing.
