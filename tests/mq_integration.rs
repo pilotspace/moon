@@ -83,6 +83,8 @@ async fn start_mq_server(num_shards: usize) -> (u16, CancellationToken) {
         vec_diskann_beam_width: 8,
         vec_diskann_cache_levels: 3,
         uring_sqpoll_ms: None,
+        io_driver: "auto".to_string(),
+        io_busy_poll_us: 0,
         admin_port: 0,
         slowlog_log_slower_than: 10000,
         slowlog_max_len: 128,

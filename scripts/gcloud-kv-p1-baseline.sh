@@ -58,6 +58,12 @@ BENCH_CLIENTS="${BENCH_CLIENTS:-1}"    # current -c for bench_pair (measure_tput
 # (per_shard_aof_active needs >=2) so NO WAL double-write. Redis AOF-on everysec = the matching config.
 PERSIST="${PERSIST:-memory}"
 
+# --- shard-scaling mode (--measure-shards): shards x busy-poll sweep on an 8-vCPU instance ---
+SHARDS_SWEEP="${SHARDS_SWEEP:-1 4}"          # moon --shards cells
+SPIN_SWEEP="${SPIN_SWEEP:-0 40}"             # --io-busy-poll-us cells (0 = off)
+SHARD_CLIENT_CORES="${SHARD_CLIENT_CORES:-5-7}"  # client core range (server takes 0..shards-1)
+BENCH_THREADS="${BENCH_THREADS:-}"           # client --threads for multi-conn cells (set per combo)
+
 # machines: x86 FIRST (cheapest decisive case), ARM second (config flip)
 MACHINES="${MACHINES:-c3-standard-4}"          # ARM run: MACHINES=c4a-standard-4 (or t2a-standard-4)
 GCE_MACHINE="${GCE_MACHINE:-c3-standard-4}"
@@ -196,9 +202,13 @@ start_moon() {  # start_moon <bin>  (shard=1, pinned, loopback; PERSIST=memory|a
   fi
   # MOON_START_ENV: optional space-separated KEY=VAL env for the server process
   # (diagnostics, e.g. MOON_START_ENV="MOON_NO_URING=1" for an epoll-driver A/B).
+  # MOON_SHARDS / SERVER_CORES / MOON_EXTRA_FLAGS: multi-shard cells
+  # (--measure-shards) override shard count, core mask, and add flags such as
+  # --io-busy-poll-us; defaults preserve the original shards=1 single-core path.
   # shellcheck disable=SC2086
-  taskset -c "$SERVER_CORE" env ${MOON_START_ENV:-} "$bin" --port "$MOON_PORT" --shards 1 --dir "$dir" \
-    "${pflags[@]}" --admin-port 0 >/dev/null 2>&1 &
+  taskset -c "${SERVER_CORES:-$SERVER_CORE}" env ${MOON_START_ENV:-} "$bin" --port "$MOON_PORT" \
+    --shards "${MOON_SHARDS:-1}" --dir "$dir" \
+    "${pflags[@]}" ${MOON_EXTRA_FLAGS:-} --admin-port 0 >/dev/null 2>&1 &
   MOON_PID=$!
   local deadline=$((SECONDS+10))
   until "$REDIS_CLI" -p "$MOON_PORT" ping >/dev/null 2>&1; do
@@ -242,7 +252,11 @@ start_redis() {  # canonical Redis, pinned, loopback; PERSIST=memory|aof
 
 bench_pair() {  # bench_pair <port> -> "SET_rps|GET_rps" (real keyspace, SET-then-GET hit-path)
   # -c/-P come from BENCH_CLIENTS/BENCH_PIPE (default 1/1 = the p=1 single-op path).
+  # BENCH_THREADS (optional): client threads for high-throughput multi-shard
+  # cells where a single client thread would be the bottleneck.
+  # shellcheck disable=SC2086
   local out; out=$(taskset -c "$CLIENT_CORE" "$REDIS_BENCH" -p "$1" -c "$BENCH_CLIENTS" -P "$BENCH_PIPE" -n "$REQUESTS" \
+      ${BENCH_THREADS:+--threads "$BENCH_THREADS"} \
       -r "$KEYSPACE" -t set,get --csv 2>/dev/null | tr '\r' '\n')
   local s g
   s=$(printf '%s\n' "$out" | grep '"SET"' | awk -F',' '{gsub(/"/,"",$2); printf "%.0f\n",$2}' | tail -1)
@@ -471,6 +485,69 @@ measure_tput() {
   done
 }
 
+# measure_shards: shard-scaling sweep with/without --io-busy-poll-us, same rigor
+# (pinned, steal-gated, fresh-server best-of-N, strict keyspace so multi-shard
+# actually scatters cross-shard). Needs an 8-vCPU instance: moon shards pin to
+# cores 0..3, the client to 5-7, Redis control to core 0. Cells:
+#   shards x spin x { c1/P1 (single-conn latency, incl. the cross-shard-hop
+#   story at shards=4), c8/P1, c8/P16, c8/P64 }.
+# Redis is measured once per client/pipe combo (single-threaded canonical).
+measure_shards() {
+  command -v taskset >/dev/null || die "taskset not available"
+  prepare_repo
+  build_redis
+  trap cleanup EXIT INT TERM
+
+  local steal; steal=$(current_steal); steal="${steal:-0}"
+  gate_steal "$steal" || { printf 'status: VOID\nreason: contended_instrument\n'; die "VOID contended (steal=$steal%)"; }
+  gate_clean       || { printf 'status: VOID\nreason: dirty_instrument\n'; die "VOID dirty_instrument"; }
+  log "=== gates OK (steal=$steal%, clean) — shard sweep on $(uname -srm) ==="
+
+  local moonbin; moonbin=$(build_moon) || die "moon build"
+  log "  settling compile heat..."; wait_quiesced
+
+  local combos=( "1|1" "8|1" "8|16" "8|64" )
+  CLIENT_CORE="${SHARD_CLIENT_CORES:-5-7}"
+  echo "# kv-shard-scaling raw (loopback, pinned: client cores $CLIENT_CORE, best-of-$BEST_OF_N, strict keyspace)"
+  echo "# persist=$PERSIST requests=$REQUESTS keyspace=$KEYSPACE shards=[$SHARDS_SWEEP] spin=[$SPIN_SWEEP]"
+  echo "# machine|shards|spin_us|clients|pipe|cmd|moon_rps|redis_rps|ratio|verdict"
+
+  declare -A RBEST MB
+  local combo C P eng cmd best reps nn S SPIN m r
+  # Redis control per combo (shards/spin don't apply to it)
+  for combo in "${combos[@]}"; do
+    C="${combo%%|*}"; P="${combo##*|}"
+    BENCH_CLIENTS="$C"; BENCH_PIPE="$P"
+    BENCH_THREADS=""; [[ "$C" -gt 1 ]] && BENCH_THREADS=3
+    while IFS='|' read -r eng cmd best reps nn; do
+      RBEST["$C|$P|$cmd"]="$best"
+    done < <( cell_engine redis "-" )
+  done
+  for S in $SHARDS_SWEEP; do
+    for SPIN in $SPIN_SWEEP; do
+      MOON_SHARDS="$S"
+      SERVER_CORES="0"; [[ "$S" -gt 1 ]] && SERVER_CORES="0-$((S-1))"
+      MOON_EXTRA_FLAGS=""; [[ "$SPIN" != 0 ]] && MOON_EXTRA_FLAGS="--io-busy-poll-us $SPIN"
+      for combo in "${combos[@]}"; do
+        C="${combo%%|*}"; P="${combo##*|}"
+        BENCH_CLIENTS="$C"; BENCH_PIPE="$P"
+        BENCH_THREADS=""; [[ "$C" -gt 1 ]] && BENCH_THREADS=3
+        MB=()
+        while IFS='|' read -r eng cmd best reps nn; do
+          MB["$cmd"]="$best"
+        done < <( cell_engine moon "$moonbin" )
+        for cmd in SET GET; do
+          m="${MB[$cmd]:-0}"; r="${RBEST["$C|$P|$cmd"]:-0}"
+          printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' "$GCE_MACHINE" "$S" "$SPIN" "$C" "$P" "$cmd" \
+            "$m" "$r" "$(ratio "$m" "$r")" "$(verdict "$m" "$r")"
+        done
+      done
+    done
+  done
+  # reset overrides so any later mode in the same process gets shards=1 defaults
+  MOON_SHARDS=""; SERVER_CORES=""; MOON_EXTRA_FLAGS=""; BENCH_THREADS=""
+}
+
 # ============================================================================= gcloud orchestration
 arch_image_family() {  # ubuntu image family for the machine's arch
   case "$1" in
@@ -538,6 +615,7 @@ gcloud_run_one() {
     source \$HOME/.cargo/env
     GCE_MACHINE='$GCE_MACHINE' MOON_REF='$MOON_REF' REDIS_VER='$REDIS_VER' BEST_OF_N='$BEST_OF_N' \
     REQUESTS='$REQUESTS' KEYSPACE='$KEYSPACE' PIPES='$PIPES' CLIENTS_SWEEP='$CLIENTS_SWEEP' PERSIST='$PERSIST' \
+    SHARDS_SWEEP='$SHARDS_SWEEP' SPIN_SWEEP='$SPIN_SWEEP' SHARD_CLIENT_CORES='$SHARD_CLIENT_CORES' \
     MOON_START_ENV='${MOON_START_ENV:-}' \
       bash ~/gcloud-kv-p1-baseline.sh $mcmd
   " | tee "$rawfile"
@@ -563,6 +641,7 @@ case "${1:---gcloud}" in
   --measure)      measure ;;
   --measure-driver) measure_driver ;;
   --measure-diag) measure_diag ;;
+  --measure-shards) measure_shards ;;
   --measure-tput) measure_tput ;;
   --gcloud)       gcloud_sweep ;;
   --one)          gcloud_run_one ;;
