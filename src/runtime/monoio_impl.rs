@@ -58,6 +58,22 @@ pub struct MonoioRuntimeFactory;
 
 impl RuntimeFactory for MonoioRuntimeFactory {
     fn block_on_local<F: Future<Output = ()> + 'static>(name: String, f: F) {
+        // Honor the documented MOON_NO_URING contract for the monoio runtime
+        // too: FusionDriver silently auto-picks io_uring on Linux and offers
+        // no runtime introspection, so the kill-switch must force the
+        // epoll/kqueue LegacyDriver explicitly. (Previously MOON_NO_URING
+        // only gated the tokio bridge + uring_active(); the monoio driver
+        // choice ignored it — discovered during the c4a p=1 driver A/B.)
+        if std::env::var_os("MOON_NO_URING").is_some() {
+            let mut rt = monoio::RuntimeBuilder::<monoio::LegacyDriver>::new()
+                .enable_timer()
+                .build()
+                .unwrap_or_else(|e| {
+                    panic!("failed to build monoio legacy runtime '{}': {}", name, e)
+                });
+            rt.block_on(f);
+            return;
+        }
         let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
             .enable_timer()
             .build()
