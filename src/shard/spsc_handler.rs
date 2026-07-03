@@ -803,27 +803,31 @@ pub(crate) fn handle_shard_message_shared(
                     };
 
                     if is_write && !matches!(frame, crate::protocol::Frame::Error(_)) {
-                        let serialized = aof::serialize_command(cmd_frame);
-                        wal_append_and_fanout(
-                            &serialized,
-                            wal_writer,
-                            wal_v3_writer,
-                            repl_backlog,
-                            replica_txs,
-                            repl_state,
-                            shard_id,
-                            // C4-FOLD-FIX: AOF append MUST happen here (in the SPSC arm,
-                            // before the response is sent) so the append is already in the
-                            // AOF channel when AofFold reads sender.len(). Moving the append
-                            // to the connection handler (after awaiting the response) defers
-                            // it until AFTER drain_spsc_shared returns, so AofFold's
-                            // pending_aof_count undercount by ≥1 and that append escapes
-                            // into the NEW incr → double-apply on restart (+1 after
-                            // restart observed in test_ssm4a_fold_4shard_experimental).
-                            // The handler_monoio cross-shard AOF write is removed to avoid
-                            // the double-write that was the original reason for None.
-                            aof_pool, // FIX-C4-FOLD
-                        );
+                        // See `wal_fanout_has_work` — skip the serialization alloc
+                        // entirely when the fanout would no-op (persistence off).
+                        if wal_fanout_has_work(wal_writer, wal_v3_writer, replica_txs, aof_pool) {
+                            let serialized = aof::serialize_command(cmd_frame);
+                            wal_append_and_fanout(
+                                &serialized,
+                                wal_writer,
+                                wal_v3_writer,
+                                repl_backlog,
+                                replica_txs,
+                                repl_state,
+                                shard_id,
+                                // C4-FOLD-FIX: AOF append MUST happen here (in the SPSC arm,
+                                // before the response is sent) so the append is already in the
+                                // AOF channel when AofFold reads sender.len(). Moving the append
+                                // to the connection handler (after awaiting the response) defers
+                                // it until AFTER drain_spsc_shared returns, so AofFold's
+                                // pending_aof_count undercount by ≥1 and that append escapes
+                                // into the NEW incr → double-apply on restart (+1 after
+                                // restart observed in test_ssm4a_fold_4shard_experimental).
+                                // The handler_monoio cross-shard AOF write is removed to avoid
+                                // the double-write that was the original reason for None.
+                                aof_pool, // FIX-C4-FOLD
+                            );
+                        }
                     }
 
                     // Auto-index: if HSET succeeded, check for vector index match.
@@ -1111,28 +1115,32 @@ pub(crate) fn handle_shard_message_shared(
                     };
 
                     if is_write && !matches!(frame, crate::protocol::Frame::Error(_)) {
-                        let serialized = aof::serialize_command(cmd_frame);
-                        wal_append_and_fanout(
-                            &serialized,
-                            wal_writer,
-                            wal_v3_writer,
-                            repl_backlog,
-                            replica_txs,
-                            repl_state,
-                            shard_id,
-                            // C4-FOLD-FIX: AOF append MUST happen here, before the
-                            // response_slot is filled, so the append is already in the
-                            // AOF channel when AofFold reads sender.len(). Deferring to
-                            // the connection handler (after slot.fill wakes the handler
-                            // task) means the append arrives AFTER drain_spsc_shared
-                            // returns and AFTER AofFold's sender.len() snapshot, so
-                            // pending_aof_count undercounts by ≥1 → that append escapes
-                            // into the NEW incr → double-apply on restart (+1 observed
-                            // in test_ssm4a_fold_4shard_experimental). The handler's
-                            // cross-shard AOF write (handler_sharded/mod.rs) is removed
-                            // to avoid the double-write this None guard was preventing.
-                            aof_pool, // FIX-C4-FOLD
-                        );
+                        // See `wal_fanout_has_work` — skip the serialization alloc
+                        // entirely when the fanout would no-op (persistence off).
+                        if wal_fanout_has_work(wal_writer, wal_v3_writer, replica_txs, aof_pool) {
+                            let serialized = aof::serialize_command(cmd_frame);
+                            wal_append_and_fanout(
+                                &serialized,
+                                wal_writer,
+                                wal_v3_writer,
+                                repl_backlog,
+                                replica_txs,
+                                repl_state,
+                                shard_id,
+                                // C4-FOLD-FIX: AOF append MUST happen here, before the
+                                // response_slot is filled, so the append is already in the
+                                // AOF channel when AofFold reads sender.len(). Deferring to
+                                // the connection handler (after slot.fill wakes the handler
+                                // task) means the append arrives AFTER drain_spsc_shared
+                                // returns and AFTER AofFold's sender.len() snapshot, so
+                                // pending_aof_count undercounts by ≥1 → that append escapes
+                                // into the NEW incr → double-apply on restart (+1 observed
+                                // in test_ssm4a_fold_4shard_experimental). The handler's
+                                // cross-shard AOF write (handler_sharded/mod.rs) is removed
+                                // to avoid the double-write this None guard was preventing.
+                                aof_pool, // FIX-C4-FOLD
+                            );
+                        }
                     }
 
                     // Auto-index: if HSET succeeded, check for vector index match.

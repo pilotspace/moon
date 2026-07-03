@@ -11,7 +11,6 @@ mod txn;
 mod write;
 
 use crate::runtime::cancel::CancellationToken;
-use crate::runtime::channel;
 use bytes::{Bytes, BytesMut};
 use ringbuf::traits::Producer;
 use std::cell::RefCell;
@@ -39,32 +38,15 @@ use super::{
 use crate::framevec;
 use crate::pubsub::subscriber::Subscriber;
 use crate::server::codec::RespCodec;
+use crate::server::response_slot::ResponseSlotPool;
 use crate::shard::dispatch::ShardMessage;
-// ResponseSlotPool is not used on monoio (yet): this handler predates the
-// proof that cross-thread wakes DO reach monoio tasks (the `sync` feature's
-// waker channel + driver unpark — see tests/spsc_wake_floor_red.rs::swf0).
-// The flume oneshot per batch works the same way; unifying on the
-// zero-allocation ResponseSlotPool is a candidate follow-up.
-
-// ── F3: cross-shard dispatch backpressure / response-wait bounds ──
-// Design-for-failure: a wedged or saturated target shard must surface a
-// bounded error, never park the connection (holding its buffers) forever.
-// Push-retry bounds live in `crate::shard::dispatch` (shared with the tokio
-// handler); the response-wait bounds below are monoio-specific (the tokio
-// path awaits via `ResponseSlotPool`, not a flume oneshot).
-
-/// Chunk length for the bounded cross-shard reply wait (M2, spsc-wake-floor).
-/// Replies normally wake the task directly (cross-thread waker via monoio's
-/// `sync` feature); the chunking only bounds how long a shutdown can go
-/// unnoticed when the reply never arrives.
-#[cfg(feature = "runtime-monoio")]
-const CROSS_SHARD_RESPONSE_CHUNK_MS: u64 = 100;
-
-/// Total reply-wait budget before declaring the response lost. The batch was
-/// already dispatched, so this is an *uncertain write* backstop (the command
-/// may have applied on the target) — set generously (~30s).
-#[cfg(feature = "runtime-monoio")]
-const CROSS_SHARD_RESPONSE_TIMEOUT_MS: u64 = 30_000;
+// L3b: the Phase 2b cross-shard batch path awaits replies via the
+// zero-allocation `ResponseSlotPool` (tokio parity, handler_sharded), not a
+// per-batch flume oneshot. Cross-thread wakes DO reach monoio tasks (the
+// `sync` feature's waker channel + driver unpark — proven at runtime by
+// tests/spsc_wake_floor_red.rs::swf0 on both drivers); the slot's
+// AtomicWaker rides that mechanism. Transaction (txn.rs) and blocking-write
+// (write.rs) paths remain on oneshots — they are off the hot path.
 
 /// Result of `handle_connection_sharded_monoio` execution.
 ///
@@ -210,6 +192,14 @@ pub(crate) async fn handle_connection_sharded_monoio<
     > = HashMap::with_capacity(ctx.num_shards);
     let mut reply_futures: Vec<(Vec<(usize, Option<Bytes>, Bytes)>, usize)> =
         Vec::with_capacity(ctx.num_shards);
+
+    // Pre-allocated response slots for zero-allocation cross-shard dispatch
+    // (L3b, tokio parity — handler_sharded/mod.rs). One slot per target shard;
+    // Phase 2b sends at most one slotted batch per target per round and drains
+    // every pushed slot before the round ends, so a slot is always EMPTY when
+    // reused. The pool lives on this task's stack — see the await-side SAFETY
+    // note in Phase 2b for the lifetime contract.
+    let response_pool = ResponseSlotPool::new(ctx.num_shards, ctx.shard_id);
 
     // Pre-allocate frames Vec outside the loop; reused via .clear() each iteration.
     let mut frames: Vec<Frame> = Vec::with_capacity(64);
@@ -1642,21 +1632,17 @@ pub(crate) async fn handle_connection_sharded_monoio<
             }
         }
 
-        // Phase 2b: Dispatch all deferred remote commands as batched PipelineBatch
-        // messages (one per target shard), await all in parallel.
+        // Phase 2b: Dispatch all deferred remote commands as batched
+        // PipelineBatchSlotted messages (one per target shard), await all in parallel.
         if !remote_groups.is_empty() {
             reply_futures.clear();
 
-            // Capture `target` per batch so the cross-shard AOF write at the bottom
-            // of the loop can route to the owning shard's pool (not ctx.shard_id —
-            // mirrors the load-bearing fix at handler_sharded/mod.rs:1651).
-            let mut oneshot_futures: Vec<(
-                usize, // target shard — owner for AOF append
-                Vec<(usize, Option<Bytes>, Bytes)>,
-                channel::OneshotReceiver<Vec<Frame>>,
-            )> = Vec::new();
+            // L3b: dispatch via the pre-allocated ResponseSlotPool (no per-batch
+            // flume oneshot alloc). `target` is captured per batch so the H1
+            // fsync barrier at the bottom of the loop can route to the owning
+            // shard's pool (not ctx.shard_id — mirrors handler_sharded).
             for (target, entries) in remote_groups.drain() {
-                let (reply_tx, reply_rx) = channel::oneshot();
+                let slot_ptr = response_pool.slot_ptr(target);
                 let (meta, commands): (
                     Vec<(usize, Option<Bytes>, Bytes)>,
                     Vec<std::sync::Arc<Frame>>,
@@ -1665,10 +1651,10 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     .map(|(idx, arc_frame, aof, cmd)| ((idx, aof, cmd), arc_frame))
                     .unzip();
 
-                let msg = ShardMessage::PipelineBatch {
+                let msg = ShardMessage::PipelineBatchSlotted {
                     db_index: conn.selected_db,
                     commands,
-                    reply_tx,
+                    response_slot: crate::shard::dispatch::ResponseSlotPtr(slot_ptr),
                 };
                 let target_idx = ChannelMesh::target_index(ctx.shard_id, target);
                 // F3: bounded backpressure retry. The closure retains the
@@ -1699,17 +1685,19 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 match outcome {
                     crate::shard::dispatch::PushOutcome::Pushed => {
                         tracing::trace!(
-                            "Shard {}: pushed PipelineBatch to shard {}, notifying",
+                            "Shard {}: pushed PipelineBatchSlotted to shard {}, notifying",
                             ctx.shard_id,
                             target
                         );
                         ctx.spsc_notifiers[target].notify_one();
+                        reply_futures.push((meta, target));
                     }
                     crate::shard::dispatch::PushOutcome::Backpressure
                     | crate::shard::dispatch::PushOutcome::Cancelled => {
                         // Target shard not draining (saturated/wedged) or
-                        // shutting down. The PipelineBatch was NEVER accepted,
-                        // so this is a clean reject — fail this batch's entries
+                        // shutting down. The batch was NEVER accepted, so this
+                        // is a clean reject — `slot_ptr` had no side effect
+                        // (the slot stays EMPTY); fail this batch's entries
                         // instead of parking the connection forever.
                         tracing::warn!(
                             "Shard {}: cross-shard push to shard {} gave up ({:?}); rejecting batch",
@@ -1722,124 +1710,54 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                 b"ERR cross-shard dispatch backpressure",
                             ));
                         }
-                        continue;
                     }
                 }
-                oneshot_futures.push((target, meta, reply_rx));
             }
 
-            // M2 (spsc-wake-floor): await each reply oneshot DIRECTLY. The executing
-            // shard's `send` wakes this task cross-thread — monoio 0.2.4's `sync`
-            // feature routes a remote Waker::wake() through a per-thread waker
-            // channel + driver unpark (eventfd on io_uring, kqueue wake on the
-            // legacy driver), proven at runtime by tests/spsc_wake_floor_red.rs::
-            // swf0 on both drivers. The previous pending_wakers relay assumed this
-            // was impossible and polled on the shard loop's ~1ms tick — the relay
-            // sweep still runs in the event loop, but this path no longer uses it.
+            // L3b: await each response slot directly (tokio parity —
+            // handler_sharded/mod.rs). Cross-thread wakes reach this task via
+            // the slot's AtomicWaker + monoio's `sync`-feature waker channel
+            // (proven by tests/spsc_wake_floor_red.rs::swf0 on both drivers).
+            //
+            // SAFETY CONTRACT (ResponseSlotPtr lifetime): every batch pushed
+            // above carries a raw pointer into `response_pool`, which lives on
+            // this task's stack. Once a batch is Pushed, this await MUST run to
+            // completion — no timeout, no shutdown break, no early `continue` —
+            // because abandoning it and letting the connection task drop while
+            // the target shard still holds the pointer would make the eventual
+            // `slot.fill()` a use-after-free. The target shard ALWAYS fills the
+            // slot for every message it drains, so this await terminates unless
+            // the target thread itself is gone (process teardown). The tokio
+            // handler carries the identical unbounded await.
+            //
             // C2 pipeline guard (see XSHARD_SPIN_MAX_BATCH_REMOTE): total cross-shard
             // commands in THIS batch. The reply-side spin may engage only for a singleton
             // foreign read; >1 means a pipeline / multi-key fan-out where a synchronous
             // spin would serialize the reads and starve pipelined throughput (s4-P16 −27%).
-            let batch_remote_total: usize =
-                oneshot_futures.iter().map(|(_, meta, _)| meta.len()).sum();
-            for (target, meta, reply_rx) in oneshot_futures.drain(..) {
-                tracing::trace!(
-                    "Shard {}: awaiting cross-shard response (direct oneshot)",
-                    ctx.shard_id
-                );
-                // F3: bound the response wait. The batch was already dispatched,
-                // so a missing reply is an *uncertain write* (the target shard may
-                // have applied it) — the error must NOT imply rejection. Break on
-                // disconnect (sender gone), shutdown, or the generous ~30s cap.
-                //
-                // The wait is CHUNKED (race2 against a short sleep + is_cancelled
-                // check) instead of racing `shutdown.cancelled()`: CancelledFuture
-                // pushes a waker clone into the token's wakers Vec on every
-                // registration and never drains it until cancel fires — racing it
-                // per batch would accumulate wakers for the server's lifetime.
-                let shard_responses = match reply_rx.try_recv() {
-                    // Fast path: pipelined batches often have the reply queued by
-                    // the time this target is awaited — no future, no allocation.
-                    Ok(value) => Ok(value),
-                    Err(flume::TryRecvError::Disconnected) => {
-                        Err("ERR cross-shard dispatch failed")
-                    }
-                    Err(flume::TryRecvError::Empty) => {
-                        // C2 (xshard-read-fastpath): adaptive idle-gated reply-side spin.
-                        // When this shard is near-idle (xshard_may_spin), busy-poll the
-                        // reply for a bounded budget to skip the reply-side cross-thread
-                        // wake (the c1 win). The poll is synchronous — it holds no borrow
-                        // across `.await`; on miss it falls through to the EXISTING chunked
-                        // race2 park loop UNCHANGED. When the gate is closed (busy shard)
-                        // the path is byte-identical to before (immediate park).
-                        let _wait_guard = crate::shard::slice::XshardWaitGuard::new();
-                        let mut spun = None;
-                        if crate::shard::slice::xshard_should_spin(batch_remote_total) {
-                            for _ in 0..crate::shard::slice::xshard_spin_budget() {
-                                match reply_rx.try_recv() {
-                                    Ok(value) => {
-                                        spun = Some(Ok(value));
-                                        break;
-                                    }
-                                    Err(flume::TryRecvError::Disconnected) => {
-                                        spun = Some(Err("ERR cross-shard dispatch failed"));
-                                        break;
-                                    }
-                                    Err(flume::TryRecvError::Empty) => core::hint::spin_loop(),
-                                }
+            let batch_remote_total: usize = reply_futures.iter().map(|(meta, _)| meta.len()).sum();
+            for (meta, target) in reply_futures.drain(..) {
+                // C2 (xshard-read-fastpath): adaptive idle-gated reply-side spin.
+                // When this shard is near-idle (xshard_may_spin) AND this batch holds
+                // a single cross-shard read, busy-poll the response slot for a bounded
+                // budget to skip the reply-side cross-thread wake (the c1 win). The
+                // poll is synchronous — it holds no borrow across `.await`; on miss it
+                // falls through to the slot's park path. When the gate is closed
+                // (busy/pipelined shard) the path is an immediate park.
+                let _wait_guard = crate::shard::slice::XshardWaitGuard::new();
+                let shard_responses = {
+                    let mut spun = None;
+                    if crate::shard::slice::xshard_should_spin(batch_remote_total) {
+                        for _ in 0..crate::shard::slice::xshard_spin_budget() {
+                            if let Some(r) = response_pool.slot_for(target).try_take() {
+                                spun = Some(r);
+                                break;
                             }
-                        }
-                        match spun {
-                            Some(result) => result,
-                            None => {
-                                // OneshotReceiver is itself a Future with a cached inner
-                                // recv future — pin it ONCE so its waker registration
-                                // persists across chunk boundaries.
-                                let mut recv = std::pin::pin!(reply_rx);
-                                let mut waited_ms: u64 = 0;
-                                loop {
-                                    if shutdown.is_cancelled() {
-                                        break Err("ERR cross-shard response aborted (shutdown)");
-                                    }
-                                    let chunk = std::pin::pin!(monoio::time::sleep(
-                                        std::time::Duration::from_millis(
-                                            CROSS_SHARD_RESPONSE_CHUNK_MS
-                                        )
-                                    ));
-                                    match crate::runtime::race::race2(recv.as_mut(), chunk).await {
-                                        crate::runtime::race::Arm::First(Ok(value)) => {
-                                            break Ok(value);
-                                        }
-                                        crate::runtime::race::Arm::First(Err(_)) => {
-                                            break Err("ERR cross-shard dispatch failed");
-                                        }
-                                        crate::runtime::race::Arm::Second(()) => {
-                                            waited_ms += CROSS_SHARD_RESPONSE_CHUNK_MS;
-                                            if waited_ms >= CROSS_SHARD_RESPONSE_TIMEOUT_MS {
-                                                tracing::warn!(
-                                                    "Shard {}: cross-shard response wait exhausted; \
-                                                     target may have applied the write",
-                                                    ctx.shard_id
-                                                );
-                                                break Err(
-                                                    "ERR cross-shard response timeout (write may have applied)",
-                                                );
-                                            }
-                                        }
-                                    }
-                                }
-                            }
+                            core::hint::spin_loop();
                         }
                     }
-                };
-                let shard_responses = match shard_responses {
-                    Ok(r) => r,
-                    Err(err_msg) => {
-                        for (resp_idx, _, _) in &meta {
-                            responses[*resp_idx] =
-                                Frame::Error(Bytes::from_static(err_msg.as_bytes()));
-                        }
-                        continue;
+                    match spun {
+                        Some(r) => r,
+                        None => response_pool.future_for(target).await,
                     }
                 };
                 // H1-BARRIER: collect write resp_idxs before consuming meta
@@ -1848,8 +1766,8 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 for ((resp_idx, aof_bytes, cmd_name), resp) in meta.into_iter().zip(shard_responses)
                 {
                     // C4-FOLD-FIX: AOF append for cross-shard writes is now done
-                    // inside the SPSC arm (PipelineBatch), BEFORE the oneshot reply
-                    // is sent. Appending here (after awaiting the oneshot response)
+                    // inside the SPSC arm (PipelineBatchSlotted), BEFORE the response
+                    // slot is filled. Appending here (after awaiting the response)
                     // defers the append until after drain_spsc_shared returns, which
                     // makes AofFold's pending_aof_count undercount it → escape to
                     // new incr → double-apply on restart. The SPSC arm now owns the

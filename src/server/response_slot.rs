@@ -129,12 +129,9 @@ impl ResponseSlot {
     /// (xshard-read-fastpath C2): the caller is busy-polling, not parking, so it
     /// must not register a waker. Single consumer (connection owner thread).
     ///
-    /// Live under the tokio runtime (handler_sharded's `ResponseSlotPool` reply
-    /// path). Dead under monoio, which replies via a flume oneshot rather than a
-    /// response slot — hence the cfg-gated allow keeps the dead-code check active
-    /// where the method is actually used.
+    /// Live under BOTH runtimes: handler_sharded (tokio) and handler_monoio
+    /// (L3b) reply paths spin on this before parking on `poll_take`.
     #[inline]
-    #[cfg_attr(not(feature = "runtime-tokio"), allow(dead_code))]
     pub(crate) fn try_take(&self) -> Option<Vec<Frame>> {
         // Same FILLED-confirmed take as poll_take's fast path, minus the waker
         // registration — the spin caller is busy-polling, not parking.
