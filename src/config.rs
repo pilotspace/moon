@@ -258,6 +258,15 @@ pub struct ServerConfig {
     #[arg(long = "uring-sqpoll")]
     pub uring_sqpoll_ms: Option<u32>,
 
+    /// I/O driver for the monoio runtime. "auto" lets FusionDriver pick
+    /// (io_uring on Linux when available, else epoll/kqueue); "epoll" forces
+    /// the legacy poller. Measured on GCE ARM (c4a Axion, 2026-07): epoll is
+    /// 2-4% faster than io_uring across ALL pipeline depths for KV workloads,
+    /// while other platforms (e.g. OrbStack aarch64) favor io_uring — bench
+    /// per platform. Equivalent env kill-switch: MOON_NO_URING=1.
+    #[arg(long = "io-driver", default_value = "auto", value_parser = ["auto", "epoll"])]
+    pub io_driver: String,
+
     // ── MoonStore v2: Disk Offload ──────────────────────────────────
     /// Enable disk offload (tiered storage: RAM -> mmap -> NVMe)
     #[arg(long = "disk-offload", default_value = "enable")]
@@ -1165,6 +1174,16 @@ mod tests {
     fn test_shards_zero_is_explicit_auto_detect() {
         let config = ServerConfig::parse_from(["moon", "--shards", "0"]);
         assert_eq!(config.shards, 0);
+    }
+
+    #[test]
+    fn test_io_driver_flag_parses_and_rejects_unknown() {
+        let config = ServerConfig::parse_from::<[&str; 0], &str>([]);
+        assert_eq!(config.io_driver, "auto", "auto must stay the default");
+        let config = ServerConfig::parse_from(["moon", "--io-driver", "epoll"]);
+        assert_eq!(config.io_driver, "epoll");
+        // clap-level validation: anything outside auto|epoll is a parse error.
+        assert!(ServerConfig::try_parse_from(["moon", "--io-driver", "iouring"]).is_err());
     }
 
     #[test]

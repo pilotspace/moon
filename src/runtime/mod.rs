@@ -25,6 +25,26 @@ pub mod channel;
 pub mod race;
 pub mod traits;
 
+/// Process-wide "force the epoll/kqueue LegacyDriver" switch for the monoio
+/// runtime, set ONCE from `--io-driver epoll` in main BEFORE any shard thread
+/// spawns (safe alternative to mutating `MOON_NO_URING` via unsafe `set_var`).
+/// Read by `MonoioRuntimeFactory::block_on_local` alongside the env var.
+static FORCE_LEGACY_DRIVER: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Request the legacy (epoll/kqueue) monoio driver for all shards. Must be
+/// called before shard threads spawn; later calls still apply to any runtime
+/// built afterwards but never to already-running shards.
+pub fn force_legacy_driver() {
+    FORCE_LEGACY_DRIVER.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// True when `--io-driver epoll` (or `MOON_NO_URING=1`) forces the legacy driver.
+pub fn legacy_driver_forced() -> bool {
+    FORCE_LEGACY_DRIVER.load(std::sync::atomic::Ordering::Acquire)
+        || std::env::var_os("MOON_NO_URING").is_some()
+}
+
 /// Cooperatively relinquish to the shard event loop, letting co-located
 /// connections + the 1ms tick make progress, then resume.
 ///

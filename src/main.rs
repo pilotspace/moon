@@ -803,6 +803,13 @@ fn main() -> anyhow::Result<()> {
         std::sync::Arc::new(std::sync::RwLock::new(table))
     };
 
+    // I/O driver selection — must land BEFORE any shard thread spawns so
+    // every monoio runtime observes it (clap restricts values to auto|epoll).
+    if config.io_driver == "epoll" {
+        moon::runtime::force_legacy_driver();
+        tracing::info!("I/O driver: legacy poller (epoll/kqueue) forced via --io-driver epoll");
+    }
+
     // Build shared runtime config for sharded handlers
     let runtime_config_shared: std::sync::Arc<parking_lot::RwLock<moon::config::RuntimeConfig>> =
         { std::sync::Arc::new(parking_lot::RwLock::new(config.to_runtime_config())) };
