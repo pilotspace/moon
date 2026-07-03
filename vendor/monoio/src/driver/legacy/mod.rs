@@ -57,9 +57,20 @@ pub struct LegacyDriver {
 #[cfg(feature = "sync")]
 const TOKEN_WAKEUP: mio::Token = mio::Token(1 << 31);
 
-// moon patch: epoll spin budget from MOON_EPOLL_SPIN_US (0 = disabled), read
-// once. See inner_park for the poll-mode rationale.
+// moon patch: programmatic spin-budget override (host CLI flag path).
+// u64::MAX = unset -> fall back to the MOON_EPOLL_SPIN_US env. Must be set by
+// the host before runtime threads first park.
+pub(crate) static SPIN_BUDGET_US: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(u64::MAX);
+
+// moon patch: epoll spin budget (0 = disabled): programmatic override first,
+// else MOON_EPOLL_SPIN_US env, read once. See inner_park for the poll-mode
+// rationale.
 fn moon_epoll_spin_budget_us() -> u64 {
+    let ovr = SPIN_BUDGET_US.load(std::sync::atomic::Ordering::Relaxed);
+    if ovr != u64::MAX {
+        return ovr;
+    }
     static SPIN_US: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *SPIN_US.get_or_init(|| {
         std::env::var("MOON_EPOLL_SPIN_US")

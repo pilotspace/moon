@@ -36,6 +36,13 @@ pub use self::uring::IoUringDriver;
 #[cfg(all(target_os = "linux", feature = "iouring"))]
 use self::uring::UringInner;
 
+// moon patch: programmatic legacy-driver spin-budget setter (see
+// legacy/mod.rs). Re-exported at the crate root for the host application.
+#[cfg(feature = "legacy")]
+pub(crate) fn set_legacy_spin_budget_us(us: u64) {
+    legacy::SPIN_BUDGET_US.store(us, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Unpark a runtime of another thread.
 pub(crate) mod unpark {
     #[allow(unreachable_pub)]

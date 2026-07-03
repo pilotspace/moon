@@ -267,6 +267,16 @@ pub struct ServerConfig {
     #[arg(long = "io-driver", default_value = "auto", value_parser = ["auto", "epoll"])]
     pub io_driver: String,
 
+    /// Busy-poll the shard event loop for N microseconds before sleeping
+    /// (0 = disabled). Implies `--io-driver epoll`. Poll-mode park: the shard
+    /// thread spins on readiness (zero-timeout polls) instead of blocking, so
+    /// the scheduler sleep+wake disappears from the request path. Best for
+    /// low-pipeline request/response workloads on dedicated cores; costs up to
+    /// ~N µs of CPU per idle park. Measured (GCE c1 GET p=1, 2026-07):
+    /// ARM c4a 0.95→1.21× vs Redis, x86 c3 1.06→1.66×. monoio runtime only.
+    #[arg(long = "io-busy-poll-us", default_value_t = 0)]
+    pub io_busy_poll_us: u64,
+
     // ── MoonStore v2: Disk Offload ──────────────────────────────────
     /// Enable disk offload (tiered storage: RAM -> mmap -> NVMe)
     #[arg(long = "disk-offload", default_value = "enable")]
@@ -1184,6 +1194,15 @@ mod tests {
         assert_eq!(config.io_driver, "epoll");
         // clap-level validation: anything outside auto|epoll is a parse error.
         assert!(ServerConfig::try_parse_from(["moon", "--io-driver", "iouring"]).is_err());
+    }
+
+    #[test]
+    fn test_io_busy_poll_flag_parses_with_zero_default() {
+        let config = ServerConfig::parse_from::<[&str; 0], &str>([]);
+        assert_eq!(config.io_busy_poll_us, 0, "busy-poll must default OFF");
+        let config = ServerConfig::parse_from(["moon", "--io-busy-poll-us", "40"]);
+        assert_eq!(config.io_busy_poll_us, 40);
+        assert!(ServerConfig::try_parse_from(["moon", "--io-busy-poll-us", "x"]).is_err());
     }
 
     #[test]

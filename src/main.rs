@@ -809,6 +809,21 @@ fn main() -> anyhow::Result<()> {
         moon::runtime::force_legacy_driver();
         tracing::info!("I/O driver: legacy poller (epoll/kqueue) forced via --io-driver epoll");
     }
+    if config.io_busy_poll_us > 0 {
+        // Busy-poll parks only exist in the legacy (readiness) driver: io_uring
+        // CQEs are not observable from userspace without task participation.
+        moon::runtime::force_legacy_driver();
+        #[cfg(feature = "runtime-monoio")]
+        {
+            monoio::set_legacy_spin_budget_us(config.io_busy_poll_us);
+            tracing::info!(
+                "I/O busy-poll: {}µs readiness spin before park (epoll/kqueue driver forced)",
+                config.io_busy_poll_us
+            );
+        }
+        #[cfg(not(feature = "runtime-monoio"))]
+        tracing::warn!("--io-busy-poll-us has no effect under the tokio runtime");
+    }
 
     // Build shared runtime config for sharded handlers
     let runtime_config_shared: std::sync::Arc<parking_lot::RwLock<moon::config::RuntimeConfig>> =

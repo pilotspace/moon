@@ -49,6 +49,15 @@ pub use runtime::{spawn, Runtime};
 #[cfg(any(all(target_os = "linux", feature = "iouring"), feature = "legacy"))]
 pub use {builder::FusionDriver, runtime::FusionRuntime};
 
+/// moon patch: set the legacy-driver readiness spin budget in microseconds
+/// before the runtime starts (poll-mode park; see driver/legacy). Equivalent
+/// to the MOON_EPOLL_SPIN_US env var; the programmatic value wins. 0 disables
+/// spinning.
+#[cfg(feature = "legacy")]
+pub fn set_legacy_spin_budget_us(us: u64) {
+    driver::set_legacy_spin_budget_us(us)
+}
+
 /// Start a monoio runtime.
 ///
 /// # Examples
