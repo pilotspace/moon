@@ -231,6 +231,11 @@ pub(crate) async fn handle_connection_sharded_inner<
 ) -> (HandlerResult, Option<S>) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    // Solo-conn spin gate (L1 convoy fix): register this connection on the
+    // shard thread so the C2 reply-spin's sibling check (`xshard_may_spin`)
+    // sees it. RAII — decrements when the handler returns (incl. migration).
+    let _conn_guard = crate::shard::slice::ShardConnGuard::new();
+
     // Direct buffer I/O: bypass Framed/codec for the hot path.
     let mut stream = stream;
     let mut read_buf = if initial_read_buf.is_empty() {

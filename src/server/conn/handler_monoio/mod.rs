@@ -140,6 +140,12 @@ pub(crate) async fn handle_connection_sharded_monoio<
 ) -> (MonoioHandlerResult, Option<S>) {
     use monoio::io::AsyncWriteRentExt;
 
+    // Solo-conn spin gate (L1 convoy fix): register this connection on the
+    // shard thread so the C2 reply-spin's sibling check (`xshard_may_spin`)
+    // sees it. RAII — decrements when the handler returns, including the
+    // migration hand-off (the conn re-registers on its new shard's thread).
+    let _conn_guard = crate::shard::slice::ShardConnGuard::new();
+
     // NOTE: do NOT call record_connection_opened() here — the caller
     // (conn_accept.rs) already increments via try_accept_connection().
 

@@ -226,6 +226,64 @@ thread_local! {
     /// Connections on this shard thread currently blocked in a cross-shard
     /// reply-wait. Incremented on entry, decremented on exit (see `XshardWaitGuard`).
     static XSHARD_INFLIGHT: Cell<u32> = const { Cell::new(0) };
+    /// Live client connections handled by THIS shard thread (fresh + migrated).
+    /// Maintained by `ShardConnGuard` at the top of both connection handlers.
+    static SHARD_CONN_COUNT: Cell<u32> = const { Cell::new(0) };
+}
+
+/// Max live connections on this shard thread for which the reply-side spin is
+/// still allowed. Default 1: spin only when the requesting connection is ALONE
+/// on its shard thread. The spin is synchronous — with ANY sibling connection
+/// present it starves that sibling AND stalls this shard's SPSC drain for other
+/// shards' requests, a circular cross-shard convoy (measured s4 c8P1 on GCE
+/// c4a same-instance A/B 2026-07-03: spin-on 72.7k vs spin-off 200k ops/s,
+/// 2.75×). The `XSHARD_INFLIGHT` gate cannot see a sibling whose readable
+/// event is still parked in the driver — it only counts conns already INSIDE a
+/// reply-wait — so the executor-level starvation needs this conn-count check.
+pub const XSHARD_SPIN_MAX_CONNS: u32 = 1;
+
+/// Effective solo-conn spin ceiling: `MOON_XSHARD_SPIN_MAX_CONNS` env override
+/// (diagnostic — a large value reproduces the pre-fix convoy for A/Bs), else
+/// the const. Read once.
+#[inline]
+fn xshard_spin_max_conns() -> u32 {
+    static V: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("MOON_XSHARD_SPIN_MAX_CONNS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(XSHARD_SPIN_MAX_CONNS)
+    })
+}
+
+/// RAII guard registering a live client connection on this shard thread for
+/// the solo-conn spin gate. Construct at connection-handler entry; the count
+/// decrements when the handler returns (including migration hand-off, where
+/// the connection re-registers on its new shard's thread).
+#[must_use = "the guard must live for the duration of the connection"]
+pub struct ShardConnGuard {
+    _priv: (),
+}
+
+impl ShardConnGuard {
+    #[inline]
+    pub fn new() -> Self {
+        SHARD_CONN_COUNT.with(|c| c.set(c.get().saturating_add(1)));
+        Self { _priv: () }
+    }
+}
+
+impl Default for ShardConnGuard {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for ShardConnGuard {
+    #[inline]
+    fn drop(&mut self) {
+        SHARD_CONN_COUNT.with(|c| c.set(c.get().saturating_sub(1)));
+    }
 }
 
 /// Upper bound (INCLUSIVE) on concurrent cross-shard reply-waiters for which the
@@ -288,6 +346,7 @@ pub const XSHARD_SPIN_MAX_BATCH_REMOTE: usize = 1;
 #[inline]
 pub fn xshard_may_spin() -> bool {
     XSHARD_INFLIGHT.with(|c| c.get() <= xshard_spin_gate())
+        && SHARD_CONN_COUNT.with(|c| c.get() <= xshard_spin_max_conns())
 }
 
 /// The full reply-side spin decision for the current batch: spin only when the batch

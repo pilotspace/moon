@@ -15,9 +15,41 @@
 //! Running:  cargo test --test xshard_fastpath_api
 
 use moon::shard::slice::{
-    XSHARD_SPIN_GATE, XSHARD_SPIN_MAX_BATCH_REMOTE, XshardWaitGuard, xshard_may_spin,
-    xshard_should_spin,
+    ShardConnGuard, XSHARD_SPIN_GATE, XSHARD_SPIN_MAX_BATCH_REMOTE, XshardWaitGuard,
+    xshard_may_spin, xshard_should_spin,
 };
+
+/// L1 convoy fix — the reply-side spin must engage ONLY when the requesting
+/// connection is ALONE on its shard thread. With any sibling connection present
+/// the synchronous spin starves that sibling AND stalls this shard's SPSC drain
+/// for other shards' requests — the measured s4 c8P1 convoy (GCE c4a
+/// same-instance A/B 2026-07-03: spin-on 72.7k vs spin-off 200k ops/s). The
+/// `XSHARD_INFLIGHT` gate cannot see a sibling whose readable event is still
+/// parked in the driver; the per-shard connection count can.
+#[test]
+fn solo_conn_gate_blocks_spin_with_sibling_connection() {
+    // Test threads start with 0 registered conns — gate open (idle thread).
+    assert!(xshard_may_spin(), "no registered conns → gate open");
+
+    let _me = ShardConnGuard::new();
+    assert!(
+        xshard_may_spin(),
+        "a solo connection may spin — this is the c1 latency win and must be preserved"
+    );
+
+    {
+        let _sibling = ShardConnGuard::new();
+        assert!(
+            !xshard_may_spin(),
+            "a sibling connection on the shard thread must force the park path (anti-convoy)"
+        );
+    }
+
+    assert!(
+        xshard_may_spin(),
+        "sibling disconnected (RAII decrement) → the solo conn may spin again"
+    );
+}
 
 /// xrf1 — a near-idle shard (no in-flight cross-shard reply-waiters on this thread)
 /// MUST allow the reply-side spin. This is the entire c1 latency win: when the
