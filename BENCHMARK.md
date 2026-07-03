@@ -1,6 +1,6 @@
 # moon Benchmark Report
 
-**Last Updated:** 2026-06-16 (4-feature concurrent-vs-competitor pass added — §10.5 vector vs RediSearch, §11.4 graph vs FalkorDB, **new §12 Full-Text Search** vs RediSearch; honestly records where Moon trails. §2.8 = v2-1/PR #189 `db61973` K=1024 re-measurement; v0.1.6 in §2.1–2.6; §2.7 on perf/shard-dispatch-hot-path)
+**Last Updated:** 2026-07-03 (**new §2.10: p=1 single-op WIN on both arches via `--io-busy-poll-us` poll-mode park** — ARM c4a 1.19–1.21×, x86 c3 1.65–1.66× vs Redis, n=3 instances/arch; supersedes the "loses p=1" rows in §2.7–2.9 when busy-poll is on. Prior: 2026-06-16 4-feature concurrent-vs-competitor pass — §10.5 vector vs RediSearch, §11.4 graph vs FalkorDB, §12 Full-Text Search; §2.8 = v2-1/PR #189 `db61973` K=1024 re-measurement; v0.1.6 in §2.1–2.6; §2.7 on perf/shard-dispatch-hot-path)
 **Platforms:** Linux (GCloud x86_64 + ARM64), macOS (Apple M4 Pro)
 **Redis:** 8.6.1 in §2.1–2.6; 7.0.15 in §2.7
 **moon:** v0.1.6 in §2.1–2.6; perf/shard-dispatch-hot-path HEAD (commit `6582fa9`) in §2.7. Monoio runtime (io_uring on Linux, kqueue on macOS), fat LTO, codegen-units=1, target-cpu=native
@@ -38,6 +38,8 @@ The SET absolute number can differ 3-4× between methodologies. Only strict-vs-s
 
 | Metric | moon vs Redis | Conditions |
 |--------|:-------------------:|------------|
+| p=1 single-op GET/SET (x86) | **1.65-1.66x Redis** | `--io-busy-poll-us 40`, GCE c3 dedicated, n=3, §2.10 |
+| p=1 single-op GET/SET (ARM) | **1.19-1.21x Redis** | `--io-busy-poll-us 40`, GCE c4a dedicated, n=3, §2.10 |
 | Peak GET (Linux x86_64) | **5.11M ops/s (1.72x)** | GCloud c3-standard-8, P=64 |
 | Peak GET (Linux ARM64) | **3.47M ops/s (2.20x)** | GCloud t2a-standard-8, P=64 |
 | Peak GET (macOS) | **7.94M ops/s (2.59x)** | OrbStack, Apple M4 Pro, P=64 |
@@ -279,6 +281,41 @@ Moon-fair vs Redis (ratio = Moon/Redis), 8-vCPU c3/t2a, best-of-3:
 | ARM | strict | **1.27×** | **1.32×** | **1.12×** | **1.19×** | 0.83× | 0.80× |
 
 Within VM variance of §2.8 (x86 loose P64 1.87–1.90×). Moon wins at pipeline depth, loses p=1 (TCP-RTT bound). No regression.
+
+### 2.10 2026-07-03 p=1 single-op WIN — `--io-busy-poll-us` poll-mode park (branch `perf/v3-3-p1-hotpath`, `6178a71`)
+
+The historical "loses p=1" rows (§2.7–2.9 P1 columns, 0.77–0.83×) are **superseded when busy-poll is
+enabled**. Root cause of the p=1 deficit was attributed by perf tracepoints on GCE: both engines
+sleep+wake the server thread on every non-pipelined op; Redis's 3-syscall epoll loop rode that path
+slightly cheaper than Moon's drivers (io_uring's 2 enters cost more than 3 light syscalls on GCE;
+Moon-epoll paid 4 syscalls/op from a speculative-read EAGAIN). `--io-busy-poll-us <µs>` removes the
+sleep entirely: the shard thread busy-loops zero-timeout readiness polls for the budget before
+blocking (vendored-monoio LegacyDriver patch; flag forces the epoll driver). Redis keeps paying the
+wake on every op — the win is structural, not a tuning delta.
+
+**Same-instance A/B (Moon-spin vs Moon-tuned-uring vs Redis 8.x control), GCE dedicated 4-vCPU,
+pinned disjoint cores, steal-gated, fresh-server best-of-5, loopback c=1 P=1, spin=40µs, n=3
+instances per arch:**
+
+| arch | cmd | Moon busy-poll | Redis | ratio (3 instances) |
+|------|-----|:---:|:---:|:---:|
+| **ARM c4a Axion** | SET | ~75.3k ops/s (13.3µs/op) | ~63.0k (15.9µs/op) | **1.193 / 1.196 / 1.198** |
+| **ARM c4a Axion** | GET | ~77.2k ops/s (12.9µs/op) | ~63.9k (15.6µs/op) | **1.206 / 1.205 / 1.212** |
+| **x86 c3 Intel**  | SET | ~62.0k ops/s (16.1µs/op) | ~37.4k (26.7µs/op) | **1.657 / 1.663 / 1.647** |
+| **x86 c3 Intel**  | GET | ~63.2k ops/s (15.8µs/op) | ~38.2k (26.2µs/op) | **1.657 / 1.656 / 1.646** |
+
+Sub-1% ratio spread across instances on both arches. Without busy-poll, Moon's best p=1 stance is
+`--io-driver epoll`: 0.95× ARM / 1.06× x86 (same-instance A/Bs, 2026-07-03).
+
+Multi-client (pinned-core VM probe): busy-poll also wins c=8 (+6.5%) and c=64 (+27.6%, p50 159→87µs)
+— under load the loop rarely parks, so the spin only fires where it helps. Idle cost: ~3% of a core
+(vs 1% stock) at the 40µs budget against 1ms timer parks.
+
+**Caveats:** (1) judge busy-poll ONLY on pinned/dedicated cores — on unpinned shared-core hosts
+(laptops, OrbStack defaults) the spinning thread displaces its own client and shows as a regression;
+(2) claim scope is shards=1, loopback; (3) io_uring cannot busy-poll this way (CQE posting requires
+owner-task participation — DEFER_TASKRUN, TWA_SIGNAL, and SQPOLL variants all measured worse;
+experiment ledger in `tmp/KV-FULLPROOF.md` Round 2).
 
 ---
 
