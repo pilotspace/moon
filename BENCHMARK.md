@@ -1,6 +1,6 @@
 # moon Benchmark Report
 
-**Last Updated:** 2026-07-03 (**new §2.10: p=1 single-op WIN on both arches via `--io-busy-poll-us` poll-mode park** — ARM c4a 1.19–1.21×, x86 c3 1.65–1.66× vs Redis, n=3 instances/arch; supersedes the "loses p=1" rows in §2.7–2.9 when busy-poll is on. **New §6.5: shards × busy-poll sweep** — busy-poll recovers +22–42% of the cross-shard hop but shards>1 still loses non-pipelined; `--shards 1 --io-busy-poll-us 40` is the p=1 config. Prior: 2026-06-16 4-feature concurrent-vs-competitor pass — §10.5 vector vs RediSearch, §11.4 graph vs FalkorDB, §12 Full-Text Search; §2.8 = v2-1/PR #189 `db61973` K=1024 re-measurement; v0.1.6 in §2.1–2.6; §2.7 on perf/shard-dispatch-hot-path)
+**Last Updated:** 2026-07-04 (**new §6.6: multi-shard multi-connection WIN — reply-convoy fix + slot-unified replies take s4 c8 P1 from 0.44–0.64× to 1.57–2.0× Redis and c64 to 2.5×, both arches**; supersedes §6.5's c≥8 rows. Prior 2026-07-03: **§2.10: p=1 single-op WIN on both arches via `--io-busy-poll-us` poll-mode park** — ARM c4a 1.19–1.21×, x86 c3 1.65–1.66× vs Redis, n=3 instances/arch; supersedes the "loses p=1" rows in §2.7–2.9 when busy-poll is on. **New §6.5: shards × busy-poll sweep** — busy-poll recovers +22–42% of the cross-shard hop but shards>1 still loses non-pipelined; `--shards 1 --io-busy-poll-us 40` is the p=1 config. Prior: 2026-06-16 4-feature concurrent-vs-competitor pass — §10.5 vector vs RediSearch, §11.4 graph vs FalkorDB, §12 Full-Text Search; §2.8 = v2-1/PR #189 `db61973` K=1024 re-measurement; v0.1.6 in §2.1–2.6; §2.7 on perf/shard-dispatch-hot-path)
 **Platforms:** Linux (GCloud x86_64 + ARM64), macOS (Apple M4 Pro)
 **Redis:** 8.6.1 in §2.1–2.6; 7.0.15 in §2.7
 **moon:** v0.1.6 in §2.1–2.6; perf/shard-dispatch-hot-path HEAD (commit `6582fa9`) in §2.7. Monoio runtime (io_uring on Linux, kqueue on macOS), fat LTO, codegen-units=1, target-cpu=native
@@ -565,6 +565,38 @@ Readings:
   P16 is server-bound at ~599k (Moon ≥2.0× there, understated), and x86 s4 spin P64 SET burst past
   the plateau to 1.74M (1.46×). For whole-machine peak throughput, §2.8/§6.4's methodology (client
   gets the full core budget) remains the reference.
+- ⚠ **SUPERSEDED for c≥8 by §6.6:** the s4 c8 P1 collapse in this table was a reply-spin convoy
+  bug, fixed on `perf/v3-3-p1-hotpath`. Multi-shard now **wins** every multi-connection cell.
+
+### 6.6 2026-07-04 multi-connection WIN — convoy fix + slot-unified replies (branch `perf/v3-3-p1-hotpath`, `fd13f03`)
+
+The §6.5 s4-c8 collapse (0.44–0.64×) was diagnosed as a **reply-spin convoy**: the cross-shard
+reply busy-poll ran synchronously on the shard thread with a gate that admitted two waiters, so
+at 2 conns/shard a spinning connection starved both its sibling and the shard's own SPSC drain
+(circular cross-shard stall). Fix chain, each same-instance A/B-validated on GCE:
+solo-conn spin gate (`795c4f0`, c8 P1 **2.75×** vs pre-fix) → monoio reply path unified on the
+zero-allocation `ResponseSlotPool` (`fd13f03`, c8 P1 **+11–14%** on top). Ratio = Moon/Redis,
+s4, P1, busy-poll 40, 4-thread pinned client, best-of-5 × 500k requests, n=2 instances on x86:
+
+| cell | ARM c4a-standard-8 | x86 c3-standard-8 |
+|---|:---:|:---:|
+| **c8 GET / SET** | **1.57× / 1.71×** | **1.9× / 2.0×** (same-instance; **≥1.6×** vs Redis's best client config) |
+| **c64 GET / SET** | **2.50×** | **2.50×** (same-instance; ≥1.86× best-vs-best) |
+| c1 (structural ceiling = s1 latency) | 0.93–0.96 | 0.91–0.94 |
+
+Readings:
+- **Guidance updated:** `--shards 1` remains best for 1–4 unpipelined connections, but from
+  **8 concurrent connections up, `--shards 4` beats Redis 1.5–2.5×** even without pipelining.
+  The pipeline moat (§6.5, §7) is unchanged. See `docs/guides/tuning.md`.
+- s4 c1 P1 is **hop-bound, not fixable by tuning**: a perfect message-passing multi-shard equals
+  s1 latency (its ceiling is §2.10's s1 ratio). Executing foreign reads locally (shared-read data
+  plane) is the only lever; deferred as future work.
+- ⚠ **Instrument notes:** raw files `tmp/hp-{c4a,c3}-l3b-ab.txt`, `tmp/hp-c3-l3b-ab2.txt`,
+  `tmp/redis-threads-control.txt`. redis-benchmark `--threads 4` lowers *Redis's* x86 c8/c64
+  readings 15–20% vs `--threads 3` (Moon is thread-insensitive; ARM unaffected) — the x86 row
+  therefore also states the conservative ratio against Redis's best client config. Unpipelined
+  c64 readings quantize to attractors (333,333 / 500,000 = requests ÷ ms-quantized duration);
+  values are best-of-5 per cell.
 
 ---
 
