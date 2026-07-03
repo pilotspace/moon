@@ -90,7 +90,7 @@ orb run -m moon-dev bash -c 'sudo apt-get update -qq && sudo apt-get install -y 
 ## Environment Variables
 
 - `RUST_LOG=moon=debug` — enable tracing output (uses `tracing-subscriber` with `env-filter`)
-- `MOON_NO_URING=1` — force-disable io_uring everywhere (monoio runtime + tokio bridge); used in CI/containers/WSL where io_uring is unavailable
+- `MOON_NO_URING=1` — force-disable io_uring everywhere (monoio runtime + tokio bridge); used in CI/containers/WSL where io_uring is unavailable. ⚠ Before 2026-07 this env was a silent NO-OP for the monoio driver (FusionDriver picked io_uring regardless); it now forces the epoll/kqueue LegacyDriver. CLI equivalent: `--io-driver epoll`. Empirically verify the driver via `ls -l /proc/<pid>/fd | grep io_uring` — monoio logs neither choice. **GCE ARM (c4a Axion): epoll beats io_uring by 2-4% at ALL pipeline depths for KV** (same-instance A/B 2026-07-03); other platforms favor io_uring — bench per platform.
 - `MOON_URING=1` — opt **into** the tokio→io_uring bridge. The bridge is **default-off under the tokio runtime** (it floods errors under load and can hang the accept loop); tokio shards run plain epoll/kqueue unless this is set. No effect on the monoio runtime, which always uses io_uring unless `MOON_NO_URING` is set.
 - `RUSTFLAGS="-C target-cpu=native"` — enable CPU-specific optimizations for benchmarking
 
