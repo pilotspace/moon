@@ -58,6 +58,18 @@ pub fn set_legacy_spin_budget_us(us: u64) {
     driver::set_legacy_spin_budget_us(us)
 }
 
+/// moon patch: register per-thread spin-park hooks for the legacy driver's
+/// poll-mode park (skip-notify handshake). `advertise(spinning)` is invoked
+/// at spin entry/exit; `probe()` each spin iteration plus once after the
+/// exit advertise (Dekker final check) — it must report (and locally wake
+/// for) pending host work such as SPSC ringbuf items. Must be called on the
+/// runtime's own thread before it first parks; closures are thread-local and
+/// need not be Send. No effect unless a spin budget is active.
+#[cfg(feature = "legacy")]
+pub fn set_legacy_spin_hooks(advertise: Box<dyn Fn(bool)>, probe: Box<dyn Fn() -> bool>) {
+    driver::set_legacy_spin_hooks(advertise, probe)
+}
+
 /// Start a monoio runtime.
 ///
 /// # Examples

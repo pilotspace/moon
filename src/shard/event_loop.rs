@@ -53,7 +53,7 @@ impl super::Shard {
         &mut self,
         conn_rx: channel::MpscReceiver<(crate::runtime::TcpStream, bool)>,
         tls_config: Option<crate::tls::SharedTlsConfig>,
-        mut consumers: Vec<HeapCons<ShardMessage>>,
+        consumers: Vec<HeapCons<ShardMessage>>,
         producers: Vec<HeapProd<ShardMessage>>,
         shutdown: CancellationToken,
         aof_pool: Option<Arc<crate::persistence::aof::AofWriterPool>>,
@@ -765,6 +765,47 @@ impl super::Shard {
         let spsc_notify_local = spsc_notify;
         #[cfg(feature = "runtime-monoio")]
         let _ = &spsc_notify_local;
+
+        // tokio drains through the select! arms below and mutates the Vec
+        // directly; monoio re-wraps it in Rc<RefCell<>> for the spin probe.
+        #[cfg(feature = "runtime-tokio")]
+        let mut consumers = consumers;
+
+        // Busy-poll skip-notify handshake (monoio only; tokio spawns Send
+        // tasks so its consumers stay a plain Vec). The driver's spin probe
+        // needs shared read access to this shard's SPSC consumers, so wrap
+        // them in Rc<RefCell<>>; the probe runs only while the event-loop
+        // task is parked in race2, so it never observes an active borrow
+        // (drain_spsc_shared's borrow_mut is not held across an await).
+        #[cfg(feature = "runtime-monoio")]
+        let consumers = Rc::new(RefCell::new(consumers));
+        #[cfg(feature = "runtime-monoio")]
+        if num_shards > 1 && crate::runtime::epoll_spin_configured(server_config.io_busy_poll_us) {
+            // While this shard's driver spin-polls, remote producers elide
+            // their cross-thread wake (flume send + foreign-waker relay +
+            // eventfd syscall) — the probe below discovers their ringbuf
+            // pushes instead and re-arms the race2 Notify from the local
+            // thread. set_skip_wake carries the SeqCst Dekker fences.
+            crate::runtime::channel::enable_notify_skip_wake();
+            let adv_notify = spsc_notify_local.clone();
+            let probe_notify = spsc_notify_local.clone();
+            let probe_consumers = Rc::clone(&consumers);
+            monoio::set_legacy_spin_hooks(
+                Box::new(move |spinning| adv_notify.set_skip_wake(spinning)),
+                Box::new(move || {
+                    use ringbuf::traits::Observer as _;
+                    let has_pending = probe_consumers.borrow().iter().any(|c| !c.is_empty());
+                    if has_pending {
+                        probe_notify.notify_local();
+                    }
+                    has_pending
+                }),
+            );
+            info!(
+                "Shard {}: busy-poll skip-notify hooks registered ({} shards)",
+                shard_id, num_shards
+            );
+        }
 
         // Per-shard cached clock: updated once per 1ms tick.
         let cached_clock = CachedClock::new();
@@ -1771,7 +1812,7 @@ impl super::Shard {
                 // No outer with_shard — each arm takes its own flat borrow.
                 let hit_cap = spsc_handler::drain_spsc_shared(
                     &shard_databases,
-                    &mut consumers,
+                    &mut consumers.borrow_mut(),
                     &mut *pubsub_arc.write(),
                     &blocking_rc,
                     &mut pending_snapshot,

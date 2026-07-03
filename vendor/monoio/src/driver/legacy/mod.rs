@@ -80,6 +80,53 @@ fn moon_epoll_spin_budget_us() -> u64 {
     })
 }
 
+// moon patch: per-thread spin-park hooks (skip-notify handshake with the
+// host's cross-shard mesh). `advertise(true)` is called at spin entry and
+// `advertise(false)` at every spin exit; the host publishes this so remote
+// producers can elide their cross-thread wake (flume send + waker relay +
+// eventfd write) while this thread is polling anyway. `probe()` is called
+// each spin iteration AND once after `advertise(false)` (the Dekker final
+// check — a producer that skipped its wake concurrently with spin exit is
+// caught either by its own flag re-read or by this probe): it returns true
+// when host-level work (SPSC ringbuf items) is pending, after delivering a
+// thread-local wake to the host task so the executor runs it on return.
+// Not Send: registered and invoked on this driver's thread only.
+struct MoonSpinHooks {
+    advertise: Box<dyn Fn(bool)>,
+    probe: Box<dyn Fn() -> bool>,
+}
+
+thread_local! {
+    static MOON_SPIN_HOOKS: std::cell::RefCell<Option<MoonSpinHooks>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+pub(crate) fn set_spin_hooks(advertise: Box<dyn Fn(bool)>, probe: Box<dyn Fn() -> bool>) {
+    MOON_SPIN_HOOKS.with(|h| *h.borrow_mut() = Some(MoonSpinHooks { advertise, probe }));
+}
+
+// Short borrows per call: the closures run host code (ringbuf checks, a
+// local flume send) that must not observe a held RefCell borrow.
+fn moon_spin_hooks_installed() -> bool {
+    MOON_SPIN_HOOKS.with(|h| h.borrow().is_some())
+}
+
+fn moon_spin_advertise(spinning: bool) {
+    MOON_SPIN_HOOKS.with(|h| {
+        if let Some(hooks) = &*h.borrow() {
+            (hooks.advertise)(spinning);
+        }
+    });
+}
+
+fn moon_spin_probe() -> bool {
+    MOON_SPIN_HOOKS.with(|h| {
+        h.borrow()
+            .as_ref()
+            .map_or(false, |hooks| (hooks.probe)())
+    })
+}
+
 #[allow(dead_code)]
 impl LegacyDriver {
     const DEFAULT_ENTRIES: u32 = 1024;
@@ -194,14 +241,31 @@ impl LegacyDriver {
                     None => Duration::from_micros(spin_us),
                 };
                 let deadline = std::time::Instant::now() + budget;
+                // Skip-notify handshake (see MoonSpinHooks above): advertise
+                // the spin window so remote producers elide their wake; probe
+                // host ringbufs each iteration in their stead.
+                let hooks = moon_spin_hooks_installed();
+                if hooks {
+                    moon_spin_advertise(true);
+                }
+                let mut probe_hit = false;
                 loop {
                     match inner.poll.poll(events, Some(Duration::ZERO)) {
                         Ok(_) => {}
                         Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {}
-                        Err(e) => return Err(e),
+                        Err(e) => {
+                            if hooks {
+                                moon_spin_advertise(false);
+                            }
+                            return Err(e);
+                        }
                     }
                     if !events.is_empty() {
                         polled = true;
+                        break;
+                    }
+                    if hooks && moon_spin_probe() {
+                        probe_hit = true;
                         break;
                     }
                     if std::time::Instant::now() >= deadline {
@@ -210,6 +274,23 @@ impl LegacyDriver {
                     for _ in 0..16 {
                         std::hint::spin_loop();
                     }
+                }
+                if hooks {
+                    // Retract BEFORE the final probe (SeqCst handshake lives
+                    // in the host closures): a producer that skipped its wake
+                    // during our exit is guaranteed visible to this probe, or
+                    // it re-reads the cleared flag and sends normally. Runs on
+                    // ALL exits — an fd-event exit can also have raced a
+                    // skipped notify.
+                    moon_spin_advertise(false);
+                    if !probe_hit && moon_spin_probe() {
+                        probe_hit = true;
+                    }
+                }
+                if probe_hit {
+                    // Host work is pending and a local wake was delivered —
+                    // return to the executor instead of blocking.
+                    polled = true;
                 }
             }
         }

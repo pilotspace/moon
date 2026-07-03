@@ -43,6 +43,13 @@ pub(crate) fn set_legacy_spin_budget_us(us: u64) {
     legacy::SPIN_BUDGET_US.store(us, std::sync::atomic::Ordering::Relaxed);
 }
 
+// moon patch: register per-thread spin-park hooks (skip-notify handshake
+// with the host's cross-shard mesh). See legacy::MoonSpinHooks.
+#[cfg(feature = "legacy")]
+pub(crate) fn set_legacy_spin_hooks(advertise: Box<dyn Fn(bool)>, probe: Box<dyn Fn() -> bool>) {
+    legacy::set_spin_hooks(advertise, probe);
+}
+
 /// Unpark a runtime of another thread.
 pub(crate) mod unpark {
     #[allow(unreachable_pub)]

@@ -169,16 +169,74 @@ impl<T: Clone> WatchReceiver<T> {
 pub struct Notify {
     tx: flume::Sender<()>,
     rx: flume::Receiver<()>,
+    // Busy-poll skip-notify handshake: while the owning shard's epoll driver
+    // spin-polls (probing its SPSC ringbufs itself — see the vendored monoio
+    // legacy driver "moon patch" and the hook registration in event_loop),
+    // it advertises `true` here and senders elide the entire cross-thread
+    // wake: the flume send, the foreign-waker relay, and the eventfd syscall.
+    // Always false unless the owning shard registered spin hooks.
+    skip_wake: std::sync::atomic::AtomicBool,
+}
+
+// Process-global gate for the skip-wake fast path: flipped once at shard
+// startup when busy-poll is configured with >1 shard. Keeps the Dekker fence
+// out of notify_one for every other deployment shape.
+static NOTIFY_SKIP_WAKE_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Enable the skip-wake fast path process-wide (idempotent; called per shard
+/// at startup when `--io-busy-poll-us` is active with more than one shard).
+pub fn enable_notify_skip_wake() {
+    NOTIFY_SKIP_WAKE_ENABLED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[inline]
+fn notify_skip_wake_enabled() -> bool {
+    NOTIFY_SKIP_WAKE_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 impl Notify {
     pub fn new() -> Self {
         let (tx, rx) = flume::bounded(1);
-        Self { tx, rx }
+        Self {
+            tx,
+            rx,
+            skip_wake: std::sync::atomic::AtomicBool::new(false),
+        }
     }
 
     pub fn notify_one(&self) {
+        if notify_skip_wake_enabled() {
+            // Dekker handshake with set_skip_wake(false): the SeqCst fence
+            // orders the caller's ringbuf push before this flag load, so
+            // either the spinning target's final probe sees the push or this
+            // load sees the cleared flag — a wake is never lost (classic
+            // store-buffering prevention; both sides fence).
+            std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+            if self.skip_wake.load(std::sync::atomic::Ordering::Relaxed) {
+                crate::admin::metrics_setup::bump_spsc_notify_skipped();
+                return;
+            }
+        }
         let _ = self.tx.try_send(());
+    }
+
+    /// Deliver the token from the owning shard's own thread, bypassing the
+    /// skip-wake gate. Used by the driver spin probe: the registered waker is
+    /// task-local there, so the wake is a run-queue push, not a syscall.
+    pub fn notify_local(&self) {
+        let _ = self.tx.try_send(());
+    }
+
+    /// Advertise (or retract) that the owning shard's driver is busy-polling
+    /// and will discover ringbuf items via its spin probe. Retraction fences
+    /// SeqCst before the caller's final probe (pairs with notify_one).
+    pub fn set_skip_wake(&self, spinning: bool) {
+        self.skip_wake
+            .store(spinning, std::sync::atomic::Ordering::SeqCst);
+        if !spinning {
+            std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+        }
     }
 
     pub async fn notified(&self) {
@@ -198,6 +256,31 @@ mod tests {
     use futures::StreamExt;
     use futures::executor::block_on;
     use futures::stream::FuturesUnordered;
+
+    #[test]
+    fn test_notify_skip_wake_gates_sender_but_not_local() {
+        let n = Notify::new();
+        // Gate off (default): notify_one delivers even if the flag is set.
+        n.set_skip_wake(true);
+        n.notify_one();
+        assert!(n.rx.try_recv().is_ok(), "gate off: token must deliver");
+
+        enable_notify_skip_wake();
+        // Gate on + flag set: sender-side notify is elided entirely.
+        n.notify_one();
+        assert!(
+            n.rx.try_recv().is_err(),
+            "gate on + spinning: notify_one must be skipped"
+        );
+        // The driver probe's local delivery bypasses the flag.
+        n.notify_local();
+        assert!(n.rx.try_recv().is_ok(), "notify_local must bypass the gate");
+
+        // Flag retracted: normal delivery resumes.
+        n.set_skip_wake(false);
+        n.notify_one();
+        assert!(n.rx.try_recv().is_ok(), "flag clear: token must deliver");
+    }
 
     #[test]
     fn test_oneshot_send_then_recv() {
