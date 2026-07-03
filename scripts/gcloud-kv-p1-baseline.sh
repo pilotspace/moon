@@ -518,7 +518,7 @@ measure_shards() {
   for combo in "${combos[@]}"; do
     C="${combo%%|*}"; P="${combo##*|}"
     BENCH_CLIENTS="$C"; BENCH_PIPE="$P"
-    BENCH_THREADS=""; [[ "$C" -gt 1 ]] && BENCH_THREADS=3
+    BENCH_THREADS=""; [[ "$C" -gt 1 ]] && BENCH_THREADS="${AB_BENCH_THREADS:-3}"
     while IFS='|' read -r eng cmd best reps nn; do
       RBEST["$C|$P|$cmd"]="$best"
     done < <( cell_engine redis "-" )
@@ -531,7 +531,7 @@ measure_shards() {
       for combo in "${combos[@]}"; do
         C="${combo%%|*}"; P="${combo##*|}"
         BENCH_CLIENTS="$C"; BENCH_PIPE="$P"
-        BENCH_THREADS=""; [[ "$C" -gt 1 ]] && BENCH_THREADS=3
+        BENCH_THREADS=""; [[ "$C" -gt 1 ]] && BENCH_THREADS="${AB_BENCH_THREADS:-3}"
         MB=()
         while IFS='|' read -r eng cmd best reps nn; do
           MB["$cmd"]="$best"
@@ -585,7 +585,7 @@ measure_ab() {
   for combo in "${combos[@]}"; do
     C="${combo%%|*}"; P="${combo##*|}"
     BENCH_CLIENTS="$C"; BENCH_PIPE="$P"
-    BENCH_THREADS=""; [[ "$C" -gt 1 ]] && BENCH_THREADS=3
+    BENCH_THREADS=""; [[ "$C" -gt 1 ]] && BENCH_THREADS="${AB_BENCH_THREADS:-3}"
     while IFS='|' read -r eng cmd best reps nn; do
       RBEST["$C|$P|$cmd"]="$best"
     done < <( cell_engine redis "-" )
@@ -598,7 +598,7 @@ measure_ab() {
       for combo in "${combos[@]}"; do
         C="${combo%%|*}"; P="${combo##*|}"
         BENCH_CLIENTS="$C"; BENCH_PIPE="$P"
-        BENCH_THREADS=""; [[ "$C" -gt 1 ]] && BENCH_THREADS=3
+        BENCH_THREADS=""; [[ "$C" -gt 1 ]] && BENCH_THREADS="${AB_BENCH_THREADS:-3}"
         BB=(); NB=()
         while IFS='|' read -r eng cmd best reps nn; do
           BB["$cmd"]="$best"
