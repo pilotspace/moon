@@ -124,6 +124,14 @@ text-index = [
     "dep:levenshtein_automata",
 ]
 
+# Vendored monoio 0.2.4 with one experiment patch: env-gated CQ spin-poll
+# before parking (MOON_URING_SPIN_US) in the io_uring driver — poll-mode
+# reaping that removes the per-op scheduler wakeup at p=1. Diff vs upstream is
+# confined to src/driver/uring/mod.rs (search "moon patch"). Default-off env
+# => byte-identical behavior when unset.
+[patch.crates-io]
+monoio = { path = "vendor/monoio" }
+
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.7"
 # Same crate, 0.6 line: monoio 0.2.4's `uring_builder()` takes an

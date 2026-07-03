@@ -86,9 +86,32 @@ impl RuntimeFactory for MonoioRuntimeFactory {
         #[cfg(target_os = "linux")]
         if std::env::var_os("MOON_URING_PLAIN").is_none() {
             let mut urb = io_uring_06::IoUring::builder();
-            urb.setup_coop_taskrun()
-                .setup_single_issuer()
-                .setup_defer_taskrun();
+            // SQPOLL experiment gate: MOON_URING_SQPOLL=<idle_ms> starts a
+            // kernel-side submission-polling thread — submits become shared-
+            // memory writes (no io_uring_enter), dropping p=1 to ~1 syscall/op
+            // vs Redis's 3. Costs a busy core while active. SQPOLL is mutually
+            // exclusive with DEFER_TASKRUN (kernel rejects the combo), so the
+            // tuned taskrun flags are skipped in this mode.
+            // MOON_URING_SQPOLL_CPU=<n> pins the poll thread (IORING_SETUP_SQ_AFF);
+            // REQUIRED when the server process is taskset-pinned — the kthread
+            // inherits the process affinity and would otherwise fight the shard
+            // thread for its core.
+            let sqpoll_idle_ms = std::env::var("MOON_URING_SQPOLL")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok());
+            if let Some(idle_ms) = sqpoll_idle_ms {
+                urb.setup_sqpoll(idle_ms);
+                if let Some(cpu) = std::env::var("MOON_URING_SQPOLL_CPU")
+                    .ok()
+                    .and_then(|v| v.parse::<u32>().ok())
+                {
+                    urb.setup_sqpoll_cpu(cpu);
+                }
+            } else {
+                urb.setup_coop_taskrun()
+                    .setup_single_issuer()
+                    .setup_defer_taskrun();
+            }
             match monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
                 .uring_builder(urb)
                 .enable_timer()

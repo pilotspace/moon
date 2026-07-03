@@ -1,0 +1,101 @@
+[package]
+authors = ["ChiHai <ihciah@gmail.com>", "XuShuai <dyxushuai@gmail.com>"]
+categories = ["asynchronous", "network-programming"]
+description = "A thread per core runtime based on iouring."
+edition = "2021"
+keywords = ["runtime", "iouring", "async"]
+license = "MIT OR Apache-2.0"
+name = "monoio"
+readme = "../README.md"
+repository = "https://github.com/bytedance/monoio"
+version = "0.2.4"
+
+# common dependencies
+[dependencies]
+monoio-macros = { version = "0.1.0", path = "../monoio-macros", optional = true }
+
+auto-const-array = "0.2"
+fxhash = "0.2"
+libc = "0.2"
+pin-project-lite = "0.2"
+socket2 = { version = "0.5", features = ["all"] }
+memchr = "2.7"
+
+bytes = { version = "1", optional = true }
+flume = { version = "0.11", optional = true }
+mio = { version = "0.8", features = [
+    "net",
+    "os-poll",
+    "os-ext",
+], optional = true }
+threadpool = { version = "1", optional = true }
+tokio = { version = "1", default-features = false, optional = true }
+tracing = { version = "0.1", default-features = false, features = [
+    "std",
+], optional = true }
+ctrlc = { version = "3", optional = true }
+lazy_static = { version = "1", optional = true }
+once_cell = { version = "1.19.0", optional = true }
+
+# windows dependencies(will be added when windows support finished)
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.48.0", features = [
+    "Win32_Foundation",
+    "Win32_Networking_WinSock",
+    "Win32_System_IO",
+    "Win32_Storage_FileSystem",
+    "Win32_Security"
+] }
+
+# unix dependencies
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.26", optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = { version = "0.6", optional = true }
+
+[dev-dependencies]
+futures = "0.3"
+local-sync = "0.0.5"
+tempfile = "3.2"
+
+[features]
+# use nightly only feature flags
+unstable = []
+# async-cancel will push a async-cancel entry into sq when op is canceled
+async-cancel = []
+# enanle zero copy(enable SOCK_ZEROCOPY + MSG_ZEROCOPY flag)
+# WARNING: this feature may cause performance degradation
+zero-copy = []
+# splice op(requires kernel 5.7+)
+splice = []
+# mkdirat2 op(requires kernel 5.15+)
+mkdirat = []
+# unlinkat op(requires kernel 5.11+)
+unlinkat = []
+# renameat op(requires kernel 5.11+)
+renameat = []
+# enable `async main` macros support
+macros = ["monoio-macros"]
+# allow waker to be sent across threads
+sync = ["flume", "threadpool", "once_cell"]
+# enable bind cpu set
+utils = ["nix"]
+# enable debug if you want to know what runtime does
+debug = ["tracing"]
+# enable legacy driver support(will make monoio available for older kernel and macOS)
+legacy = ["mio"]
+# iouring support
+iouring = ["io-uring"]
+# tokio-compatible(only have effect when legacy is enabled and iouring is not)
+tokio-compat = ["tokio"]
+# (experimental)enable poll-io to convert structs to structs that impl tokio's poll io
+poll-io = ["tokio", "mio"]
+# signal enables setting ctrl_c handler
+signal = ["ctrlc", "sync"]
+signal-termination = ["signal", "ctrlc/termination"]
+# by default both iouring and legacy are enabled
+default = ["async-cancel", "bytes", "iouring", "legacy", "macros", "utils"]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
