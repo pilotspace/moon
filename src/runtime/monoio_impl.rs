@@ -75,6 +75,40 @@ impl RuntimeFactory for MonoioRuntimeFactory {
             rt.block_on(f);
             return;
         }
+        // Tuned io_uring: COOP_TASKRUN + SINGLE_ISSUER + DEFER_TASKRUN slash
+        // io_uring_enter cost for a thread-per-core ring (created and entered
+        // only on this shard thread; moon's cross-thread signalling is fd-based
+        // — flume/eventfd/UnixStream — never a ring op from another thread,
+        // which DEFER_TASKRUN forbids). Measured need: on GCE (c4a/c3) the
+        // stock ring's enter cost made io_uring LOSE to epoll at p=1.
+        // Kernels <6.1 reject the flags -> warn once and fall back to the
+        // stock FusionDriver below. MOON_URING_PLAIN=1 skips the tuning.
+        #[cfg(target_os = "linux")]
+        if std::env::var_os("MOON_URING_PLAIN").is_none() {
+            let mut urb = io_uring_06::IoUring::builder();
+            urb.setup_coop_taskrun()
+                .setup_single_issuer()
+                .setup_defer_taskrun();
+            match monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
+                .uring_builder(urb)
+                .enable_timer()
+                .build()
+            {
+                Ok(mut rt) => {
+                    rt.block_on(f);
+                    return;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "tuned io_uring (COOP_TASKRUN|SINGLE_ISSUER|DEFER_TASKRUN) \
+                         unavailable for '{}' ({}); falling back to stock driver",
+                        name,
+                        e
+                    );
+                }
+            }
+        }
+
         let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
             .enable_timer()
             .build()

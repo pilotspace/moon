@@ -1842,6 +1842,7 @@ dependencies = [
  "hyper",
  "hyper-tungstenite",
  "hyper-util",
+ "io-uring 0.6.4",
  "io-uring 0.7.11",
  "itoa",
  "levenshtein_automata",
