@@ -548,6 +548,90 @@ measure_shards() {
   MOON_SHARDS=""; SERVER_CORES=""; MOON_EXTRA_FLAGS=""; BENCH_THREADS=""
 }
 
+# measure_ab: SAME-INSTANCE commit A/B — MOON_REF (new) vs AB_BASE_REF (base) —
+# at multi-shard busy-poll cells. Built for skip-notify validation: the delta
+# of interest is a few percent, well inside the ~2.5% instance-to-instance
+# variance, so both binaries MUST share one instance. spin=0 cells double as a
+# no-regression control (skip-notify is gated off there → expect ~1.00).
+# Ends with an engagement proof: INFO spsc_notify_skipped after a c1P1 burst.
+measure_ab() {
+  command -v taskset >/dev/null || die "taskset not available"
+  prepare_repo
+  build_redis
+  trap cleanup EXIT INT TERM
+
+  local steal; steal=$(current_steal); steal="${steal:-0}"
+  gate_steal "$steal" || { printf 'status: VOID\nreason: contended_instrument\n'; die "VOID contended (steal=$steal%)"; }
+  gate_clean       || { printf 'status: VOID\nreason: dirty_instrument\n'; die "VOID dirty_instrument"; }
+  log "=== gates OK (steal=$steal%, clean) — commit A/B on $(uname -srm) ==="
+
+  [[ -n "${AB_BASE_REF:-}" ]] || die "AB_BASE_REF not set"
+  local newbin basebin
+  newbin=$(build_moon) || die "moon build (new=$MOON_REF)"
+  basebin=$(MOON_REF="$AB_BASE_REF" build_moon) || die "moon build (base=$AB_BASE_REF)"
+  log "  settling compile heat..."; wait_quiesced
+
+  local combos=( "1|1" "8|1" )
+  CLIENT_CORE="${SHARD_CLIENT_CORES:-5-7}"
+  echo "# kv-commit-ab raw (same-instance, pinned: client cores $CLIENT_CORE, best-of-$BEST_OF_N, strict keyspace)"
+  echo "# base=$AB_BASE_REF new=$MOON_REF persist=$PERSIST requests=$REQUESTS shards=[${AB_SHARDS:-4}] spin=[${AB_SPINS:-0 40}]"
+  echo "# machine|shards|spin_us|clients|pipe|cmd|base_rps|new_rps|redis_rps|new_vs_base|new_vs_redis"
+
+  declare -A RBEST BB NB
+  local combo C P eng cmd best reps nn S SPIN b m r
+  for combo in "${combos[@]}"; do
+    C="${combo%%|*}"; P="${combo##*|}"
+    BENCH_CLIENTS="$C"; BENCH_PIPE="$P"
+    BENCH_THREADS=""; [[ "$C" -gt 1 ]] && BENCH_THREADS=3
+    while IFS='|' read -r eng cmd best reps nn; do
+      RBEST["$C|$P|$cmd"]="$best"
+    done < <( cell_engine redis "-" )
+  done
+  for S in ${AB_SHARDS:-4}; do
+    for SPIN in ${AB_SPINS:-0 40}; do
+      MOON_SHARDS="$S"
+      SERVER_CORES="0"; [[ "$S" -gt 1 ]] && SERVER_CORES="0-$((S-1))"
+      MOON_EXTRA_FLAGS=""; [[ "$SPIN" != 0 ]] && MOON_EXTRA_FLAGS="--io-busy-poll-us $SPIN"
+      for combo in "${combos[@]}"; do
+        C="${combo%%|*}"; P="${combo##*|}"
+        BENCH_CLIENTS="$C"; BENCH_PIPE="$P"
+        BENCH_THREADS=""; [[ "$C" -gt 1 ]] && BENCH_THREADS=3
+        BB=(); NB=()
+        while IFS='|' read -r eng cmd best reps nn; do
+          BB["$cmd"]="$best"
+        done < <( cell_engine moon "$basebin" )
+        while IFS='|' read -r eng cmd best reps nn; do
+          NB["$cmd"]="$best"
+        done < <( cell_engine moon "$newbin" )
+        for cmd in SET GET; do
+          b="${BB[$cmd]:-0}"; m="${NB[$cmd]:-0}"; r="${RBEST["$C|$P|$cmd"]:-0}"
+          printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' "$GCE_MACHINE" "$S" "$SPIN" "$C" "$P" "$cmd" \
+            "$b" "$m" "$r" "$(ratio "$m" "$b")" "$(ratio "$m" "$r")"
+        done
+      done
+    done
+  done
+
+  # Engagement proof: on the new binary at spin=40 the skip counter must move
+  # (near-total under sustained c1P1 load — the target shards spin constantly).
+  local eng_shards="${AB_SHARDS:-4}"; eng_shards="${eng_shards##* }"
+  MOON_SHARDS="$eng_shards"; SERVER_CORES="0-$((eng_shards-1))"
+  MOON_EXTRA_FLAGS="--io-busy-poll-us 40"
+  BENCH_CLIENTS=1; BENCH_PIPE=1; BENCH_THREADS=""
+  if start_moon "$newbin"; then
+    taskset -c "$CLIENT_CORE" "$REDIS_BENCH" -p "$MOON_PORT" -c 1 -P 1 -n 20000 \
+      -r "$KEYSPACE" -t set,get >/dev/null 2>&1 || true
+    local skipped wakes
+    skipped=$("$REDIS_CLI" -p "$MOON_PORT" info stats 2>/dev/null | tr -d '\r' | awk -F: '/^spsc_notify_skipped/{print $2}')
+    wakes=$("$REDIS_CLI" -p "$MOON_PORT" info stats 2>/dev/null | tr -d '\r' | awk -F: '/^spsc_notify_wakes/{print $2}')
+    echo "# engagement: spsc_notify_skipped=${skipped:-?} spsc_notify_wakes=${wakes:-?} (new bin, shards=$eng_shards, spin=40, 40k c1P1 ops)"
+    cleanup_moon
+  else
+    echo "# engagement: SKIPPED (server failed to start)"
+  fi
+  MOON_SHARDS=""; SERVER_CORES=""; MOON_EXTRA_FLAGS=""; BENCH_THREADS=""
+}
+
 # ============================================================================= gcloud orchestration
 arch_image_family() {  # ubuntu image family for the machine's arch
   case "$1" in
@@ -616,6 +700,7 @@ gcloud_run_one() {
     GCE_MACHINE='$GCE_MACHINE' MOON_REF='$MOON_REF' REDIS_VER='$REDIS_VER' BEST_OF_N='$BEST_OF_N' \
     REQUESTS='$REQUESTS' KEYSPACE='$KEYSPACE' PIPES='$PIPES' CLIENTS_SWEEP='$CLIENTS_SWEEP' PERSIST='$PERSIST' \
     SHARDS_SWEEP='$SHARDS_SWEEP' SPIN_SWEEP='$SPIN_SWEEP' SHARD_CLIENT_CORES='$SHARD_CLIENT_CORES' \
+    AB_BASE_REF='${AB_BASE_REF:-}' AB_SHARDS='${AB_SHARDS:-}' AB_SPINS='${AB_SPINS:-}' \
     MOON_SHARDS='${MOON_SHARDS:-}' SERVER_CORES='${SERVER_CORES:-}' MOON_EXTRA_FLAGS='${MOON_EXTRA_FLAGS:-}' \
     CLIENT_CORE='${CLIENT_CORE_OVERRIDE:-$CLIENT_CORE}' \
     MOON_START_ENV='${MOON_START_ENV:-}' \
@@ -644,6 +729,7 @@ case "${1:---gcloud}" in
   --measure-driver) measure_driver ;;
   --measure-diag) measure_diag ;;
   --measure-shards) measure_shards ;;
+  --measure-ab)   measure_ab ;;
   --measure-tput) measure_tput ;;
   --gcloud)       gcloud_sweep ;;
   --one)          gcloud_run_one ;;
