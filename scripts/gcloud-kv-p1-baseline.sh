@@ -338,11 +338,15 @@ measure_driver() {
   echo "# kv-p1 driver A/B raw (same instance: moon-uring vs moon-epoll vs redis control)"
   echo "# machine|variant|cmd|best_rps|us_per_op|reps|n"
   declare -A BEST N
+  # Caller-provided MOON_START_ENV (e.g. MOON_URING_SPIN_US=40) composes into
+  # the moon cells instead of being clobbered by the per-cell driver forcing —
+  # the uring cell is "caller env as-is", the epoll cell adds MOON_NO_URING=1.
+  local base_env="${MOON_START_ENV:-}"
   local eng cmd best reps nn variant vbin veng
   for variant in uring epoll redis; do
     case "$variant" in
-      uring) MOON_START_ENV=""; URING_REPORTED=""; veng=moon; vbin="$moonbin" ;;
-      epoll) MOON_START_ENV="MOON_NO_URING=1"; URING_REPORTED=""; veng=moon; vbin="$moonbin" ;;
+      uring) MOON_START_ENV="$base_env"; URING_REPORTED=""; veng=moon; vbin="$moonbin" ;;
+      epoll) MOON_START_ENV="$base_env MOON_NO_URING=1"; URING_REPORTED=""; veng=moon; vbin="$moonbin" ;;
       redis) veng=redis; vbin="-" ;;
     esac
     while IFS='|' read -r eng cmd best reps nn; do
@@ -362,6 +366,65 @@ measure_driver() {
     local u="${BEST["uring|$cmd"]:-0}" e="${BEST["epoll|$cmd"]:-0}" r="${BEST["redis|$cmd"]:-0}"
     printf '%s|%s|%s|%s|%s|%s|%s|%s\n' "$GCE_MACHINE" "$cmd" "$u" "$e" "$r" \
       "$(ratio "$u" "$r")" "$(ratio "$e" "$r")" "$(ratio "$e" "$u")"
+  done
+}
+
+# measure_diag: on-instance perf ATTRIBUTION (not a verdict) — flat perf profiles,
+# syscalls + ctx-switches for moon(epoll, debug-symbol build) vs redis under
+# sustained p=1 c1 GET load. Answers "where do the remaining ~µs/op go on THIS
+# machine". Requires linux-tools (installed by provisioning).
+measure_diag() {
+  command -v taskset >/dev/null || die "taskset not available"
+  command -v perf >/dev/null || die "perf not installed (linux-tools)"
+  prepare_repo
+  build_redis
+  trap cleanup EXIT INT TERM
+
+  local steal; steal=$(current_steal); steal="${steal:-0}"
+  gate_steal "$steal" || die "VOID steal=$steal%"
+  gate_clean || die "VOID dirty"
+  log "=== gates OK (steal=$steal%) — perf attribution on $(uname -srm) ==="
+
+  # Debug-symbol moon build (frame pointers for perf -g); separate cache name so
+  # it never contaminates the verdict-mode generic build.
+  local dbin="$BINS/moon-diag-${MOON_REF//\//_}"
+  if [[ ! -x "$dbin" ]]; then
+    git -C "$WORK" checkout -q "$MOON_REF" || die "checkout $MOON_REF"
+    ( cd "$WORK" && CARGO_TARGET_DIR="$WORK/target-diag" CARGO_PROFILE_RELEASE_DEBUG=true \
+        CARGO_PROFILE_RELEASE_STRIP=none RUSTFLAGS="-C force-frame-pointers=yes" \
+        cargo build --release >/dev/null 2>&1 ) || die "diag moon build failed"
+    mkdir -p "$BINS"; cp "$WORK/target-diag/release/moon" "$dbin"
+  fi
+  local magic; magic=$(od -An -tx1 -N4 "$dbin" | tr -d ' ')
+  [[ "$magic" == "7f454c46" ]] || die "diag binary not ELF (magic=$magic)"
+
+  echo "# p=1 perf attribution: moon(epoll driver, debug syms) vs redis, sustained c1 GET"
+  local engine pid port bpid rps
+  for engine in moon redis; do
+    wait_quiesced
+    if [[ "$engine" == moon ]]; then
+      MOON_START_ENV="MOON_NO_URING=1" URING_REPORTED="" start_moon "$dbin" || die "moon start"
+      pid=$MOON_PID; port=$MOON_PORT
+    else
+      start_redis || die "redis start"
+      pid=$REDIS_PID; port=$REDIS_PORT
+    fi
+    taskset -c "$CLIENT_CORE" "$REDIS_BENCH" -p "$port" -t set,get -n 30000 -c 1 -P 1 -r "$KEYSPACE" -q >/dev/null 2>&1
+    taskset -c "$CLIENT_CORE" "$REDIS_BENCH" -p "$port" -t get -n 3000000 -c 1 -P 1 -r "$KEYSPACE" -q \
+      > "/tmp/diagbench-$engine.txt" 2>&1 &
+    bpid=$!
+    sleep 2
+    sudo perf stat -e task-clock,context-switches,raw_syscalls:sys_enter -p "$pid" \
+      -o "/tmp/diagstat-$engine.txt" -- sleep 6 2>/dev/null || true
+    sudo perf record -F 997 -g -p "$pid" -o "/tmp/diagperf-$engine.data" -- sleep 8 2>/dev/null || true
+    kill "$bpid" 2>/dev/null; wait "$bpid" 2>/dev/null
+    cleanup
+    echo "== $engine =="
+    echo "-- perf stat (6s window; ctx-switches ~= ops at p=1) --"
+    grep -E 'task-clock|context-switches|sys_enter' "/tmp/diagstat-$engine.txt" 2>/dev/null
+    echo "-- flat self% top 30 --"
+    sudo perf report -i "/tmp/diagperf-$engine.data" --stdio --no-children -g none \
+      --percent-limit 0.4 2>/dev/null | grep -E "^\s+[0-9]" | head -30
   done
 }
 
@@ -457,6 +520,10 @@ gcloud_run_one() {
     set -e
     sudo apt-get update -qq
     sudo apt-get install -y -qq build-essential pkg-config libssl-dev git curl ca-certificates
+    # perf for --measure-diag (kernel-matched first, gcp/generic fallback; non-fatal)
+    sudo apt-get install -y -qq linux-tools-$(uname -r) 2>/dev/null \
+      || sudo apt-get install -y -qq linux-tools-gcp 2>/dev/null \
+      || sudo apt-get install -y -qq linux-tools-generic 2>/dev/null || true
     command -v cargo >/dev/null || curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.94.1
   ' || die "instance provisioning failed"
 
@@ -495,6 +562,7 @@ case "${1:---gcloud}" in
   --self-test)    self_test ;;
   --measure)      measure ;;
   --measure-driver) measure_driver ;;
+  --measure-diag) measure_diag ;;
   --measure-tput) measure_tput ;;
   --gcloud)       gcloud_sweep ;;
   --one)          gcloud_run_one ;;
