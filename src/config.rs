@@ -347,7 +347,7 @@ pub struct ServerConfig {
     /// recovery or full CDC history alongside `--appendonly yes`).
     /// `off`: never log KV records (FPI/checkpoint/feature records still
     /// written). With `--appendonly no` this leaves NO KV durability log.
-    #[arg(long = "wal-kv-log", default_value = "auto")]
+    #[arg(long = "wal-kv-log", default_value = "auto", value_parser = ["auto", "on", "off"])]
     pub wal_kv_log: String,
 
     // ── MoonStore v2: Vector Warm Tier ──────────────────────────────
@@ -760,8 +760,11 @@ impl ServerConfig {
         self.disk_offload == "enable"
     }
 
-    /// Resolve `--wal-kv-log` into its mode. Unknown values fall back to
-    /// `Auto` (matches the string-flag convention used by `--wal-fpi` etc.).
+    /// Resolve `--wal-kv-log` into its mode. The CLI rejects unknown values
+    /// at parse time (`value_parser`, fail-fast on typos — a silent `Auto`
+    /// fallback could unexpectedly disable WAL KV history needed for
+    /// PITR/CDC); the `_ => Auto` arm below only covers programmatic
+    /// construction in tests.
     pub fn wal_kv_log_mode(&self) -> WalKvLogMode {
         match self.wal_kv_log.as_str() {
             "on" => WalKvLogMode::On,

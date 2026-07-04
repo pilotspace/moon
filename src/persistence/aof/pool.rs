@@ -442,12 +442,20 @@ impl AofWriterPool {
     /// Append with bounded *blocking* backpressure — for synchronous callers
     /// (the shard event loop's SPSC drain) that cannot await.
     ///
-    /// Fast path: `try_send` (zero cost while the writer keeps up). When the
-    /// channel is full, blocks the calling thread up to `bound` waiting for
-    /// the writer to drain a group-commit batch, converting what used to be
-    /// a **silent, client-acked write loss** into a short stall. Only after
-    /// the bound elapses is the record dropped — counted in
-    /// [`AOF_BACKPRESSURE_DROPPED`] and logged at `error!`.
+    /// Fast path: `try_send` (zero cost while the writer keeps up; `budget`
+    /// untouched). When the channel is full, blocks the calling thread up to
+    /// the remaining `budget` waiting for the writer to drain a group-commit
+    /// batch, converting what used to be a **silent, client-acked write
+    /// loss** into a short stall. Only after the budget is exhausted is the
+    /// record dropped — counted in [`AOF_BACKPRESSURE_DROPPED`] and logged
+    /// at `error!`.
+    ///
+    /// `budget` is decremented by the time actually spent blocking so that
+    /// batched callers (MultiExecute / PipelineBatch drain arms) share ONE
+    /// bound across the whole batch — without this, an N-command batch under
+    /// sustained backpressure could hold the shard thread for N×bound.
+    /// Single-command callers pass a fresh
+    /// `&mut AOF_SPSC_BACKPRESSURE_BOUND.clone()`-style local.
     ///
     /// Deliberate trade-off: blocking the shard event loop is normally
     /// forbidden, but the block is (a) bounded, (b) only reachable when the
@@ -460,7 +468,7 @@ impl AofWriterPool {
         shard_id: usize,
         lsn: u64,
         bytes: Bytes,
-        bound: Duration,
+        budget: &mut Duration,
     ) -> bool {
         let mut msg = AofMessage::Append { lsn, bytes };
         match self.sender(shard_id).try_send(msg) {
@@ -474,7 +482,25 @@ impl AofWriterPool {
             }
             Err(flume::TrySendError::Full(returned)) => msg = returned,
         }
-        match self.sender(shard_id).send_timeout(msg, bound) {
+        if budget.is_zero() {
+            AOF_BACKPRESSURE_DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tracing::error!(
+                "AOF append LOST for shard {} (lsn {}): batch backpressure budget exhausted; \
+                 backpressure_dropped={}",
+                shard_id,
+                lsn,
+                AOF_BACKPRESSURE_DROPPED.load(std::sync::atomic::Ordering::Relaxed),
+            );
+            return false;
+        }
+        // Slow path only (channel full, about to block for up to `budget` —
+        // milliseconds): two `Instant::now()` calls are noise here, and the
+        // shard-cached timestamp is too coarse to meter the budget.
+        let blocked_at = std::time::Instant::now();
+        let result = self.sender(shard_id).send_timeout(msg, *budget);
+        let spent = *budget;
+        *budget = budget.saturating_sub(blocked_at.elapsed());
+        match result {
             Ok(()) => true,
             Err(e) => {
                 if matches!(e, flume::SendTimeoutError::Timeout(_)) {
@@ -489,7 +515,7 @@ impl AofWriterPool {
                         flume::SendTimeoutError::Timeout(_) => "full",
                         flume::SendTimeoutError::Disconnected(_) => "disconnected",
                     },
-                    bound,
+                    spent,
                     AOF_BACKPRESSURE_DROPPED.load(std::sync::atomic::Ordering::Relaxed),
                 );
                 false
@@ -517,6 +543,13 @@ impl AofWriterPool {
             Err(flume::TrySendError::Disconnected(_)) => return Err(AofAck::WriteFailed),
             Err(flume::TrySendError::Full(returned)) => msg = returned,
         }
+        // Cancel-safety note: flume's `send_async` future is NOT cancel-safe.
+        // If the timeout wins the race after the future has already enqueued
+        // the message, the record IS delivered while the caller sees
+        // `ChannelFull` (and the drop counter over-counts by one). That is
+        // the safe failure direction: the client receives an error and can
+        // retry an idempotent write; we never ack a write that was NOT
+        // enqueued. Standard ack-timeout semantics — not silent loss.
         let send_fut = self.sender(shard_id).send_async(msg);
         let timeout = self.fsync_timeout;
         if timeout.is_zero() {
@@ -2010,16 +2043,17 @@ mod pool_tests {
 
         let before = AOF_BACKPRESSURE_DROPPED.load(Ordering::Relaxed);
         let start = std::time::Instant::now();
-        let ok = pool.send_append_bounded_blocking(
-            0,
-            7,
-            Bytes::from_static(b"SET k v"),
-            Duration::from_millis(30),
-        );
+        let mut budget = Duration::from_millis(30);
+        let ok =
+            pool.send_append_bounded_blocking(0, 7, Bytes::from_static(b"SET k v"), &mut budget);
         assert!(!ok, "still-full channel after the bound must report loss");
         assert!(
             start.elapsed() >= Duration::from_millis(30),
             "the call must have blocked for the backpressure bound before giving up"
+        );
+        assert!(
+            budget.is_zero(),
+            "the budget must be fully consumed by the blocked send"
         );
         assert!(
             AOF_BACKPRESSURE_DROPPED.load(Ordering::Relaxed) > before,
@@ -2027,7 +2061,43 @@ mod pool_tests {
         );
     }
 
-    /// Fast path: capacity available → enqueued with no stall.
+    /// Batch-budget semantics (PR #211 review): once the shared budget is
+    /// exhausted, subsequent appends in the same batch fail IMMEDIATELY —
+    /// the shard thread must stall at most one bound per batch, not
+    /// bound × batch-len.
+    #[test]
+    fn spsc_bounded_blocking_exhausted_budget_fails_immediately() {
+        use std::sync::atomic::Ordering;
+        let (tx0, _rx0) = channel::mpsc_bounded::<AofMessage>(1);
+        tx0.try_send(AofMessage::Append {
+            lsn: 0,
+            bytes: Bytes::from_static(b"x"),
+        })
+        .unwrap();
+        let pool = AofWriterPool::top_level_with_policy(
+            tx0,
+            FsyncPolicy::EverySec,
+            DEFAULT_AOF_FSYNC_TIMEOUT,
+        );
+
+        let before = AOF_BACKPRESSURE_DROPPED.load(Ordering::Relaxed);
+        let mut budget = Duration::ZERO; // batch already spent its bound
+        let start = std::time::Instant::now();
+        let ok =
+            pool.send_append_bounded_blocking(0, 8, Bytes::from_static(b"SET k v"), &mut budget);
+        assert!(!ok, "exhausted budget must report loss");
+        assert!(
+            start.elapsed() < Duration::from_millis(10),
+            "exhausted budget must not block again (was: full bound per append)"
+        );
+        assert!(
+            AOF_BACKPRESSURE_DROPPED.load(Ordering::Relaxed) > before,
+            "the budget-exhausted drop must be counted"
+        );
+    }
+
+    /// Fast path: capacity available → enqueued with no stall and no budget
+    /// consumption (the try_send never touches the clock).
     #[test]
     fn spsc_bounded_blocking_fast_path_enqueues() {
         let (tx0, rx0) = channel::mpsc_bounded::<AofMessage>(4);
@@ -2036,12 +2106,18 @@ mod pool_tests {
             FsyncPolicy::EverySec,
             DEFAULT_AOF_FSYNC_TIMEOUT,
         );
+        let mut budget = Duration::from_millis(30);
         assert!(pool.send_append_bounded_blocking(
             0,
             9,
             Bytes::from_static(b"SET a 1"),
-            Duration::from_millis(30),
+            &mut budget,
         ));
+        assert_eq!(
+            budget,
+            Duration::from_millis(30),
+            "fast path must not consume budget"
+        );
         assert!(matches!(
             rx0.try_recv(),
             Ok(AofMessage::Append { lsn: 9, .. })

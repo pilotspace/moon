@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **AOF+WAL double-write eliminated for the common config (PR #TBD)** — new
+- **AOF+WAL double-write eliminated for the common config (PR #211)** — new
   `--wal-kv-log auto|on|off` (default `auto`). At `--appendonly yes` every
   SPSC-executed KV write was logged to BOTH the per-shard AOF and the per-shard WAL
   (measured 2.7× file-byte / 4.1× device write amplification at `--shards 4`), yet
@@ -19,13 +19,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   full CDC history alongside AOF); `off` never logs KV records. FPI/checkpoint/
   feature records are unaffected.
 - **everysec/no AOF appends are no longer silently dropped under backpressure
-  (PR #TBD)** — a full writer channel used to `warn!` + drop the record while the
+  (PR #211)** — a full writer channel used to `warn!` + drop the record while the
   client still received `+OK` (client-acked write loss + AOF/memory divergence on
   replay). Durable handler paths now await enqueue under `--aof-fsync-timeout-ms`
   and surface `ChannelFull`/`WriteFailed` as an error frame; the synchronous
-  SPSC-drain and monoio inline-SET paths apply a 5ms bounded blocking send before a
-  (now `error!`-logged and counted) last-resort drop. Watch
-  `aof_backpressure_dropped` in `INFO`.
+  SPSC-drain and monoio inline-SET paths apply a bounded blocking send (ONE 5ms
+  budget shared across a whole pipeline/MULTI batch) and, on loss, replace the
+  success frame with `MOONERR AOF backpressure` instead of acking — every drop is
+  `error!`-logged and counted. `--wal-kv-log` also rejects unknown values at parse
+  time. Watch `aof_backpressure_dropped` in `INFO`.
 
 - **Docker image build** — the multi-stage `Dockerfile` now copies the vendored
   `vendor/monoio` source into the cargo-chef planner and cook stages. The v0.5.0

@@ -476,7 +476,7 @@ pub(crate) fn handle_shard_message_shared(
                 // Both require two databases simultaneously; intercept before cmd_dispatch.
                 if cmd.eq_ignore_ascii_case(b"MOVE") {
                     use crate::command::keyspace::move_cmd as ksmv;
-                    let response = match ksmv::parse_move_args(args, db_count) {
+                    let mut response = match ksmv::parse_move_args(args, db_count) {
                         Err(e) => e,
                         Ok((_key, dst_db)) if dst_db == db_idx => {
                             crate::protocol::Frame::Integer(0)
@@ -504,7 +504,8 @@ pub(crate) fn handle_shard_message_shared(
                     };
                     if matches!(response, crate::protocol::Frame::Integer(1)) {
                         let serialized = aof::serialize_command(&command);
-                        wal_append_and_fanout(
+                        let mut aof_budget = crate::persistence::aof::AOF_SPSC_BACKPRESSURE_BOUND;
+                        if !wal_append_and_fanout(
                             &serialized,
                             wal_writer,
                             wal_v3_writer,
@@ -514,7 +515,12 @@ pub(crate) fn handle_shard_message_shared(
                             shard_id,
                             aof_pool, // FIX-W1-2
                             wal_kv_log,
-                        );
+                            &mut aof_budget,
+                        ) {
+                            response = crate::protocol::Frame::Error(bytes::Bytes::from_static(
+                                AOF_APPEND_LOST_ERR,
+                            ));
+                        }
                     }
                     let _ = reply_tx.send(response);
                     return;
@@ -523,7 +529,7 @@ pub(crate) fn handle_shard_message_shared(
                 if cmd.eq_ignore_ascii_case(b"COPY") {
                     use crate::command::keyspace::move_cmd as ksmv;
                     if let Some(copy_result) = ksmv::parse_copy_db_args(args, db_idx, db_count) {
-                        let response = match copy_result {
+                        let mut response = match copy_result {
                             Err(e) => e,
                             Ok(ca) => {
                                 // Refresh expiry clock on BOTH dbs to mirror the
@@ -551,7 +557,9 @@ pub(crate) fn handle_shard_message_shared(
                         };
                         if matches!(response, crate::protocol::Frame::Integer(1)) {
                             let serialized = aof::serialize_command(&command);
-                            wal_append_and_fanout(
+                            let mut aof_budget =
+                                crate::persistence::aof::AOF_SPSC_BACKPRESSURE_BOUND;
+                            if !wal_append_and_fanout(
                                 &serialized,
                                 wal_writer,
                                 wal_v3_writer,
@@ -561,7 +569,12 @@ pub(crate) fn handle_shard_message_shared(
                                 shard_id,
                                 aof_pool, // FIX-W1-2
                                 wal_kv_log,
-                            );
+                                &mut aof_budget,
+                            ) {
+                                response = crate::protocol::Frame::Error(
+                                    bytes::Bytes::from_static(AOF_APPEND_LOST_ERR),
+                                );
+                            }
                         }
                         let _ = reply_tx.send(response);
                         return;
@@ -590,9 +603,12 @@ pub(crate) fn handle_shard_message_shared(
                         };
 
                         // WAL append + replication fan-out for successful write commands
+                        let mut aof_ok = true;
                         if is_write && !matches!(frame, crate::protocol::Frame::Error(_)) {
                             let serialized = aof::serialize_command(&command);
-                            wal_append_and_fanout(
+                            let mut aof_budget =
+                                crate::persistence::aof::AOF_SPSC_BACKPRESSURE_BOUND;
+                            aof_ok = wal_append_and_fanout(
                                 &serialized,
                                 wal_writer,
                                 wal_v3_writer,
@@ -602,6 +618,7 @@ pub(crate) fn handle_shard_message_shared(
                                 shard_id,
                                 aof_pool, // FIX-W1-2
                                 wal_kv_log,
+                                &mut aof_budget,
                             );
                         }
 
@@ -665,7 +682,16 @@ pub(crate) fn handle_shard_message_shared(
                             }
                         }
 
-                        frame
+                        // Fail-loud: the mutation is applied (wake/auto-index above
+                        // ran on real state), but the client must not see success
+                        // for a write whose AOF record was dropped.
+                        if aof_ok {
+                            frame
+                        } else {
+                            crate::protocol::Frame::Error(bytes::Bytes::from_static(
+                                AOF_APPEND_LOST_ERR,
+                            ))
+                        }
                     })
                 };
 
@@ -697,6 +723,10 @@ pub(crate) fn handle_shard_message_shared(
             let db_idx = db_index.min(db_count.saturating_sub(1));
             crate::shard::slice::with_shard_db(db_idx, |guard| {
                 guard.refresh_now_from_cache(cached_clock);
+                // ONE backpressure budget for the whole batch: under sustained
+                // AOF backpressure the shard thread stalls at most BOUND total,
+                // not BOUND × batch-len (review finding, PR #211).
+                let mut aof_budget = crate::persistence::aof::AOF_SPSC_BACKPRESSURE_BOUND;
                 for (_key, cmd_frame) in &commands {
                     let (cmd, args) = match extract_command_static(cmd_frame) {
                         Some(pair) => pair,
@@ -720,6 +750,7 @@ pub(crate) fn handle_shard_message_shared(
                         DispatchResult::Quit(f) => f,
                     };
 
+                    let mut aof_ok = true;
                     if is_write && !matches!(frame, crate::protocol::Frame::Error(_)) {
                         // Skip the serialization alloc when the fanout would
                         // no-op (persistence + replication all off) — it was
@@ -732,7 +763,7 @@ pub(crate) fn handle_shard_message_shared(
                             wal_kv_log,
                         ) {
                             let serialized = aof::serialize_command(cmd_frame);
-                            wal_append_and_fanout(
+                            aof_ok = wal_append_and_fanout(
                                 &serialized,
                                 wal_writer,
                                 wal_v3_writer,
@@ -742,6 +773,7 @@ pub(crate) fn handle_shard_message_shared(
                                 shard_id,
                                 aof_pool, // FIX-W1-2
                                 wal_kv_log,
+                                &mut aof_budget,
                             );
                         }
 
@@ -780,7 +812,13 @@ pub(crate) fn handle_shard_message_shared(
                         }
                     }
 
-                    results.push(frame);
+                    results.push(if aof_ok {
+                        frame
+                    } else {
+                        crate::protocol::Frame::Error(bytes::Bytes::from_static(
+                            AOF_APPEND_LOST_ERR,
+                        ))
+                    });
                 }
             });
             let _ = reply_tx.send(results);
@@ -798,6 +836,10 @@ pub(crate) fn handle_shard_message_shared(
             crate::shard::slice::with_shard(|s| {
                 let guard = &mut s.databases[db_idx];
                 guard.refresh_now_from_cache(cached_clock);
+                // ONE backpressure budget for the whole batch: under sustained
+                // AOF backpressure the shard thread stalls at most BOUND total,
+                // not BOUND × batch-len (review finding, PR #211).
+                let mut aof_budget = crate::persistence::aof::AOF_SPSC_BACKPRESSURE_BOUND;
                 for cmd_frame in &commands {
                     let (cmd, args) = match extract_command_static(cmd_frame) {
                         Some(pair) => pair,
@@ -821,6 +863,7 @@ pub(crate) fn handle_shard_message_shared(
                         DispatchResult::Quit(f) => f,
                     };
 
+                    let mut aof_ok = true;
                     if is_write && !matches!(frame, crate::protocol::Frame::Error(_)) {
                         // See `wal_fanout_has_work` — skip the serialization alloc
                         // entirely when the fanout would no-op (persistence off).
@@ -832,7 +875,7 @@ pub(crate) fn handle_shard_message_shared(
                             wal_kv_log,
                         ) {
                             let serialized = aof::serialize_command(cmd_frame);
-                            wal_append_and_fanout(
+                            aof_ok = wal_append_and_fanout(
                                 &serialized,
                                 wal_writer,
                                 wal_v3_writer,
@@ -852,6 +895,7 @@ pub(crate) fn handle_shard_message_shared(
                                 // the double-write that was the original reason for None.
                                 aof_pool, // FIX-C4-FOLD
                                 wal_kv_log,
+                                &mut aof_budget,
                             );
                         }
                     }
@@ -911,7 +955,13 @@ pub(crate) fn handle_shard_message_shared(
                         }
                     }
 
-                    results.push(frame);
+                    results.push(if aof_ok {
+                        frame
+                    } else {
+                        crate::protocol::Frame::Error(bytes::Bytes::from_static(
+                            AOF_APPEND_LOST_ERR,
+                        ))
+                    });
                 }
             });
             let _ = reply_tx.send(results);
@@ -953,9 +1003,12 @@ pub(crate) fn handle_shard_message_shared(
                             DispatchResult::Quit(f) => f,
                         };
 
+                        let mut aof_ok = true;
                         if is_write && !matches!(frame, crate::protocol::Frame::Error(_)) {
                             let serialized = aof::serialize_command(&command);
-                            wal_append_and_fanout(
+                            let mut aof_budget =
+                                crate::persistence::aof::AOF_SPSC_BACKPRESSURE_BOUND;
+                            aof_ok = wal_append_and_fanout(
                                 &serialized,
                                 wal_writer,
                                 wal_v3_writer,
@@ -965,6 +1018,7 @@ pub(crate) fn handle_shard_message_shared(
                                 shard_id,
                                 aof_pool, // FIX-W1-2
                                 wal_kv_log,
+                                &mut aof_budget,
                             );
                         }
 
@@ -1004,7 +1058,15 @@ pub(crate) fn handle_shard_message_shared(
                             }
                         }
 
-                        frame
+                        // Fail-loud: mutation applied, but the client must not
+                        // see success for a write whose AOF record was dropped.
+                        if aof_ok {
+                            frame
+                        } else {
+                            crate::protocol::Frame::Error(bytes::Bytes::from_static(
+                                AOF_APPEND_LOST_ERR,
+                            ))
+                        }
                     })
                 };
                 // Arc-owned slot: deref is safe, refcount keeps it alive.
@@ -1022,6 +1084,10 @@ pub(crate) fn handle_shard_message_shared(
             let db_idx = db_index.min(db_count.saturating_sub(1));
             crate::shard::slice::with_shard_db(db_idx, |guard| {
                 guard.refresh_now_from_cache(cached_clock);
+                // ONE backpressure budget for the whole batch: under sustained
+                // AOF backpressure the shard thread stalls at most BOUND total,
+                // not BOUND × batch-len (review finding, PR #211).
+                let mut aof_budget = crate::persistence::aof::AOF_SPSC_BACKPRESSURE_BOUND;
                 for (_key, cmd_frame) in &commands {
                     let (cmd, args) = match extract_command_static(cmd_frame) {
                         Some(pair) => pair,
@@ -1045,6 +1111,7 @@ pub(crate) fn handle_shard_message_shared(
                         DispatchResult::Quit(f) => f,
                     };
 
+                    let mut aof_ok = true;
                     if is_write && !matches!(frame, crate::protocol::Frame::Error(_)) {
                         // Skip the serialization alloc when the fanout would
                         // no-op (persistence + replication all off) — it was
@@ -1057,7 +1124,7 @@ pub(crate) fn handle_shard_message_shared(
                             wal_kv_log,
                         ) {
                             let serialized = aof::serialize_command(cmd_frame);
-                            wal_append_and_fanout(
+                            aof_ok = wal_append_and_fanout(
                                 &serialized,
                                 wal_writer,
                                 wal_v3_writer,
@@ -1067,6 +1134,7 @@ pub(crate) fn handle_shard_message_shared(
                                 shard_id,
                                 aof_pool, // FIX-W1-2
                                 wal_kv_log,
+                                &mut aof_budget,
                             );
                         }
 
@@ -1105,7 +1173,13 @@ pub(crate) fn handle_shard_message_shared(
                         }
                     }
 
-                    results.push(frame);
+                    results.push(if aof_ok {
+                        frame
+                    } else {
+                        crate::protocol::Frame::Error(bytes::Bytes::from_static(
+                            AOF_APPEND_LOST_ERR,
+                        ))
+                    });
                 }
             });
             // Arc-owned slot: deref is safe, refcount keeps it alive.
@@ -1124,6 +1198,10 @@ pub(crate) fn handle_shard_message_shared(
             crate::shard::slice::with_shard(|s| {
                 let guard = &mut s.databases[db_idx];
                 guard.refresh_now_from_cache(cached_clock);
+                // ONE backpressure budget for the whole batch: under sustained
+                // AOF backpressure the shard thread stalls at most BOUND total,
+                // not BOUND × batch-len (review finding, PR #211).
+                let mut aof_budget = crate::persistence::aof::AOF_SPSC_BACKPRESSURE_BOUND;
                 for cmd_frame in &commands {
                     let (cmd, args) = match extract_command_static(cmd_frame) {
                         Some(pair) => pair,
@@ -1147,6 +1225,7 @@ pub(crate) fn handle_shard_message_shared(
                         DispatchResult::Quit(f) => f,
                     };
 
+                    let mut aof_ok = true;
                     if is_write && !matches!(frame, crate::protocol::Frame::Error(_)) {
                         // See `wal_fanout_has_work` — skip the serialization alloc
                         // entirely when the fanout would no-op (persistence off).
@@ -1158,7 +1237,7 @@ pub(crate) fn handle_shard_message_shared(
                             wal_kv_log,
                         ) {
                             let serialized = aof::serialize_command(cmd_frame);
-                            wal_append_and_fanout(
+                            aof_ok = wal_append_and_fanout(
                                 &serialized,
                                 wal_writer,
                                 wal_v3_writer,
@@ -1179,6 +1258,7 @@ pub(crate) fn handle_shard_message_shared(
                                 // to avoid the double-write this None guard was preventing.
                                 aof_pool, // FIX-C4-FOLD
                                 wal_kv_log,
+                                &mut aof_budget,
                             );
                         }
                     }
@@ -1237,7 +1317,13 @@ pub(crate) fn handle_shard_message_shared(
                         }
                     }
 
-                    results.push(frame);
+                    results.push(if aof_ok {
+                        frame
+                    } else {
+                        crate::protocol::Frame::Error(bytes::Bytes::from_static(
+                            AOF_APPEND_LOST_ERR,
+                        ))
+                    });
                 }
             });
             // Arc-owned slot: deref is safe, refcount keeps it alive.
@@ -1696,7 +1782,11 @@ pub(crate) fn handle_shard_message_shared(
                 crate::protocol::Frame::BulkString(bytes::Bytes::copy_from_slice(b_str.as_bytes())),
             ]);
             let serialized = aof::serialize_command(&wal_frame);
-            wal_append_and_fanout(
+            // No per-client response frame exists here (coordinator broadcast,
+            // reply is `()`): an AOF-append loss is already counted +
+            // error!-logged inside the pool, so the result is discarded.
+            let mut aof_budget = crate::persistence::aof::AOF_SPSC_BACKPRESSURE_BOUND;
+            let _ = wal_append_and_fanout(
                 &serialized,
                 wal_writer,
                 wal_v3_writer,
@@ -1706,6 +1796,7 @@ pub(crate) fn handle_shard_message_shared(
                 shard_id,
                 aof_pool, // FIX-W1-2
                 wal_kv_log,
+                &mut aof_budget,
             );
 
             // Perform the in-place swap via ShardSlice (thread-local, no locks needed).
@@ -2480,6 +2571,20 @@ pub(crate) fn wal_fanout_has_work(
         || aof_pool.is_some()
 }
 
+/// Error frame substituted for a write's success frame when the command
+/// mutated memory but its AOF record could not be enqueued within the
+/// backpressure budget — fail-loud so the client knows durability was not
+/// achieved (review finding, PR #211).
+pub(crate) const AOF_APPEND_LOST_ERR: &[u8] =
+    b"MOONERR AOF backpressure: write applied in memory but not queued for persistence";
+
+/// Returns `false` iff the AOF append was NOT enqueued (bounded backpressure
+/// exhausted / writer gone) — callers with a per-command response frame MUST
+/// replace it with [`AOF_APPEND_LOST_ERR`]. WAL/replica fan-out remains
+/// fire-and-forget by design (replication has its own resync path). Batched
+/// callers pass ONE `aof_budget` across the whole batch so sustained
+/// backpressure stalls the shard thread at most `AOF_SPSC_BACKPRESSURE_BOUND`
+/// per drain arm, not per command.
 pub(crate) fn wal_append_and_fanout(
     data: &[u8],
     wal_writer: &mut Option<WalWriter>,
@@ -2490,12 +2595,13 @@ pub(crate) fn wal_append_and_fanout(
     shard_id: usize,
     aof_pool: Option<&std::sync::Arc<crate::persistence::aof::AofWriterPool>>,
     wal_kv_log: bool,
-) {
+    aof_budget: &mut std::time::Duration,
+) -> bool {
     // S3.5b (2026-04-27): hot-path bypass when nothing actually has work.
     // See `wal_fanout_has_work` — callers use the same predicate to skip the
     // `aof::serialize_command` alloc entirely when the fanout would no-op.
     if !wal_fanout_has_work(wal_writer, wal_v3_writer, replica_txs, aof_pool, wal_kv_log) {
-        return;
+        return true;
     }
     // `wal_kv_log == false` (--wal-kv-log auto/off): the AOF is the recovery
     // authority and no CDC subscriber is attached, so the WAL copy of this
@@ -2551,13 +2657,14 @@ pub(crate) fn wal_append_and_fanout(
     // is preserved by write order; the LSN is only meaningful for cross-shard
     // TXN merge (RFC step 5, not yet wired).
     if let Some(pool) = aof_pool {
-        pool.send_append_bounded_blocking(
+        return pool.send_append_bounded_blocking(
             shard_id,
             0,
             bytes::Bytes::copy_from_slice(data),
-            crate::persistence::aof::AOF_SPSC_BACKPRESSURE_BOUND,
+            aof_budget,
         );
     }
+    true
 }
 
 /// Extract command name and args from a Frame (static helper for SPSC dispatch).
@@ -2603,6 +2710,7 @@ mod wal_append_tests {
             0,
             None, // no aof_pool
             true, // wal_kv_log
+            &mut std::time::Duration::from_millis(5),
         );
 
         let final_end = backlog.lock().as_ref().unwrap().end_offset();
@@ -2632,6 +2740,7 @@ mod wal_append_tests {
             0,
             None, // no aof_pool
             true, // wal_kv_log
+            &mut std::time::Duration::from_millis(5),
         );
 
         let end = backlog.lock().as_ref().unwrap().end_offset();
@@ -2670,6 +2779,7 @@ mod wal_append_tests {
             0,           // shard_id
             Some(&pool), // aof_pool provided — bypass must NOT fire
             true,        // wal_kv_log
+            &mut std::time::Duration::from_millis(5),
         );
 
         // The pool should have received exactly one message.
@@ -2734,6 +2844,7 @@ mod wal_append_tests {
             0,     // shard_id
             None,  // PipelineBatch fix: None prevents double-write
             true,  // wal_kv_log
+            &mut std::time::Duration::from_millis(5),
         );
         assert!(
             rx0.try_recv().is_err(),
@@ -2759,6 +2870,7 @@ mod wal_append_tests {
             0,
             Some(&pool), // MultiExecute: pool must receive this entry
             true,        // wal_kv_log
+            &mut std::time::Duration::from_millis(5),
         );
         let msg = rx0
             .try_recv()
@@ -2806,6 +2918,7 @@ mod wal_append_tests {
             0,
             Some(&pool),
             false, // wal_kv_log: AOF authoritative, no CDC consumer
+            &mut std::time::Duration::from_millis(5),
         );
         w3.as_mut().unwrap().flush_sync().unwrap();
         assert_eq!(
@@ -2830,6 +2943,7 @@ mod wal_append_tests {
             0,
             Some(&pool),
             true, // wal_kv_log
+            &mut std::time::Duration::from_millis(5),
         );
         w3.as_mut().unwrap().flush_sync().unwrap();
         assert!(

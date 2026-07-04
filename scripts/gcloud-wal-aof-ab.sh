@@ -215,7 +215,8 @@ measure_single(){ # $1=shards $2=walkv — one config only (chunked outer drivin
 
 case "${1:---one}" in
   --measure) measure ;;
-  --measure-one) measure_single "$2" "$3" ;;
+  --measure-one) measure_single "${2:?usage: --measure-one <shards> <on|auto|walonly>}" \
+                                "${3:?usage: --measure-one <shards> <on|auto|walonly>}" ;;
   --one)     run_one ;;
   *) die "unknown subcommand: $1 (use --measure | --one)" ;;
 esac
