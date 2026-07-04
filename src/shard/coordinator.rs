@@ -108,6 +108,9 @@ pub async fn coordinate_multi_key(
             dispatch_tx,
             spsc_notifiers,
             cached_clock,
+            aof_pool,
+            repl_state,
+            local_barrier_pending,
             _response_pool,
         )
         .await
@@ -121,6 +124,9 @@ pub async fn coordinate_multi_key(
             dispatch_tx,
             spsc_notifiers,
             cached_clock,
+            aof_pool,
+            repl_state,
+            local_barrier_pending,
             _response_pool,
         )
         .await
@@ -136,6 +142,9 @@ pub async fn coordinate_multi_key(
             dispatch_tx,
             spsc_notifiers,
             cached_clock,
+            aof_pool,
+            repl_state,
+            local_barrier_pending,
             _response_pool,
         )
         .await
@@ -226,6 +235,68 @@ async fn run_on_owner(
     }
 }
 
+/// Like [`run_on_owner`], but for WRITE commands: when the owner is the
+/// connection's own shard the command executes in-process, so nothing else
+/// persists it — append it to my_shard's AOF via [`persist_local_leg`]
+/// (v3-5: BITOP/COPY/DEL/UNLINK carried gap). Remote owners persist on their
+/// own shard via MultiExecute → wal_append_and_fanout, exactly as before.
+///
+/// `command_parts` MUST be replay-safe against my_shard alone (a full command
+/// whose keys are all owned by my_shard, or a synthesized write like
+/// `SET dest <computed>` for a scatter BITOP/COPY).
+///
+/// Persists only when the local execution did not error; sets
+/// `*local_barrier_pending` when the append rides group commit under
+/// `appendfsync=always` (the handler owes ONE `fsync_barrier(my_shard)` per
+/// batch). Returns `AOF_FSYNC_ERR` when the append never reached the writer.
+#[allow(clippy::too_many_arguments)]
+async fn run_on_owner_persist(
+    routing_key: &Bytes,
+    command_parts: &[Frame],
+    my_shard: usize,
+    num_shards: usize,
+    db_index: usize,
+    shard_databases: &Arc<ShardDatabases>,
+    dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
+    spsc_notifiers: &[Arc<channel::Notify>],
+    cached_clock: &CachedClock,
+    aof_pool: Option<&Arc<crate::persistence::aof::AofWriterPool>>,
+    repl_state: ReplStateRef<'_>,
+    local_barrier_pending: &mut bool,
+) -> Frame {
+    let owner = key_to_shard(routing_key, num_shards);
+    if owner != my_shard {
+        let command = Frame::Array(command_parts.to_vec().into());
+        return run_remote(
+            owner,
+            routing_key,
+            command,
+            my_shard,
+            db_index,
+            dispatch_tx,
+            spsc_notifiers,
+        )
+        .await;
+    }
+    let (cmd, args) = match command_parts.split_first() {
+        Some((Frame::BulkString(c), rest)) => (c.clone(), rest),
+        _ => return Frame::Error(Bytes::from_static(b"ERR invalid command format")),
+    };
+    let resp = run_local(shard_databases, db_index, cached_clock, &cmd, args);
+    if !matches!(resp, Frame::Error(_)) {
+        let serialized = crate::persistence::aof::serialize_command(&Frame::Array(
+            command_parts.to_vec().into(),
+        ));
+        match persist_local_leg(aof_pool, repl_state, my_shard, serialized).await {
+            Ok(needs_barrier) => *local_barrier_pending |= needs_barrier,
+            Err(()) => {
+                return Frame::Error(Bytes::from_static(crate::persistence::aof::AOF_FSYNC_ERR));
+            }
+        }
+    }
+    resp
+}
+
 /// Type of the replication-state handle threaded into the coordinator's local
 /// persistence path (same shape `AofWriterPool::issue_append_lsn` expects).
 type ReplStateRef<'a> =
@@ -312,6 +383,9 @@ async fn coordinate_bitop(
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
     spsc_notifiers: &[Arc<channel::Notify>],
     cached_clock: &CachedClock,
+    aof_pool: Option<&Arc<crate::persistence::aof::AofWriterPool>>,
+    repl_state: ReplStateRef<'_>,
+    local_barrier_pending: &mut bool,
     _response_pool: &(),
 ) -> Frame {
     // Single-shard server: straight to local dispatch — zero coordinator
@@ -357,7 +431,8 @@ async fn coordinate_bitop(
         let mut parts: Vec<Frame> = Vec::with_capacity(args.len() + 1);
         parts.push(bulk_static(b"BITOP"));
         parts.extend_from_slice(args);
-        return run_on_owner(
+        // Write command: the local-owner case must persist (v3-5 carried gap).
+        return run_on_owner_persist(
             &dest,
             &parts,
             my_shard,
@@ -367,6 +442,9 @@ async fn coordinate_bitop(
             dispatch_tx,
             spsc_notifiers,
             cached_clock,
+            aof_pool,
+            repl_state,
+            local_barrier_pending,
         )
         .await;
     }
@@ -441,7 +519,7 @@ async fn coordinate_bitop(
         Err(e) => e,
         Ok(None) => {
             // All sources empty/missing — dest is deleted, reply 0.
-            let reply = run_on_owner(
+            let reply = run_on_owner_persist(
                 &dest,
                 &[bulk_static(b"DEL"), bulk(&dest)],
                 my_shard,
@@ -451,6 +529,9 @@ async fn coordinate_bitop(
                 dispatch_tx,
                 spsc_notifiers,
                 cached_clock,
+                aof_pool,
+                repl_state,
+                local_barrier_pending,
             )
             .await;
             if let Frame::Error(e) = reply {
@@ -460,7 +541,7 @@ async fn coordinate_bitop(
         }
         Ok(Some(result)) => {
             let len = result.len() as i64;
-            let reply = run_on_owner(
+            let reply = run_on_owner_persist(
                 &dest,
                 &[
                     bulk_static(b"SET"),
@@ -474,6 +555,9 @@ async fn coordinate_bitop(
                 dispatch_tx,
                 spsc_notifiers,
                 cached_clock,
+                aof_pool,
+                repl_state,
+                local_barrier_pending,
             )
             .await;
             if let Frame::Error(e) = reply {
@@ -504,6 +588,9 @@ async fn coordinate_copy(
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
     spsc_notifiers: &[Arc<channel::Notify>],
     cached_clock: &CachedClock,
+    aof_pool: Option<&Arc<crate::persistence::aof::AofWriterPool>>,
+    repl_state: ReplStateRef<'_>,
+    local_barrier_pending: &mut bool,
     _response_pool: &(),
 ) -> Frame {
     // Single-shard server: straight to local dispatch — zero coordinator
@@ -537,7 +624,8 @@ async fn coordinate_copy(
         let mut parts: Vec<Frame> = Vec::with_capacity(args.len() + 1);
         parts.push(bulk_static(b"COPY"));
         parts.extend_from_slice(args);
-        return run_on_owner(
+        // Write command: the local-owner case must persist (v3-5 carried gap).
+        return run_on_owner_persist(
             &src,
             &parts,
             my_shard,
@@ -547,6 +635,9 @@ async fn coordinate_copy(
             dispatch_tx,
             spsc_notifiers,
             cached_clock,
+            aof_pool,
+            repl_state,
+            local_barrier_pending,
         )
         .await;
     }
@@ -603,7 +694,7 @@ async fn coordinate_copy(
             bulk_static(b"NX"),
         ]
     };
-    let set_reply = run_on_owner(
+    let set_reply = run_on_owner_persist(
         &dst,
         &set_parts,
         my_shard,
@@ -613,6 +704,9 @@ async fn coordinate_copy(
         dispatch_tx,
         spsc_notifiers,
         cached_clock,
+        aof_pool,
+        repl_state,
+        local_barrier_pending,
     )
     .await;
     match set_reply {
@@ -623,7 +717,7 @@ async fn coordinate_copy(
     }
     if let Some(t) = ttl_ms {
         let mut ttl_buf = itoa::Buffer::new();
-        let reply = run_on_owner(
+        let reply = run_on_owner_persist(
             &dst,
             &[
                 bulk_static(b"PEXPIRE"),
@@ -637,6 +731,9 @@ async fn coordinate_copy(
             dispatch_tx,
             spsc_notifiers,
             cached_clock,
+            aof_pool,
+            repl_state,
+            local_barrier_pending,
         )
         .await;
         if let Frame::Error(e) = reply {
@@ -1037,9 +1134,15 @@ async fn coordinate_multi_del_or_exists(
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
     spsc_notifiers: &[Arc<channel::Notify>],
     cached_clock: &CachedClock,
+    aof_pool: Option<&Arc<crate::persistence::aof::AofWriterPool>>,
+    repl_state: ReplStateRef<'_>,
+    local_barrier_pending: &mut bool,
     _response_pool: &(), // placeholder — coordinator uses oneshot internally
 ) -> Frame {
     let cmd_upper = cmd.to_ascii_uppercase();
+    // DEL/UNLINK mutate and must persist their in-process legs; EXISTS/TOUCH
+    // read (TOUCH updates access time only — never AOF-logged, like Redis).
+    let is_delete = cmd_upper == b"DEL" || cmd_upper == b"UNLINK";
 
     // Group keys by shard in ascending order (BTreeMap = VLL)
     let mut groups: BTreeMap<usize, Vec<Frame>> = BTreeMap::new();
@@ -1060,10 +1163,30 @@ async fn coordinate_multi_del_or_exists(
             db.refresh_now_from_cache(cached_clock);
             cmd_dispatch(db, cmd, args, &mut selected, db_count)
         });
-        return match result {
+        let resp = match result {
             DispatchResult::Response(f) => f,
             DispatchResult::Quit(f) => f,
         };
+        // v3-5 carried gap: the in-process DEL/UNLINK never reached the AOF —
+        // deleted keys RESURRECTED from the seed writes on restart. Persist
+        // only when something was actually removed (n=0 replays identically
+        // without a record).
+        if is_delete && matches!(resp, Frame::Integer(n) if n > 0) {
+            let mut parts: Vec<Frame> = Vec::with_capacity(args.len() + 1);
+            parts.push(Frame::BulkString(Bytes::from(cmd_upper.clone())));
+            parts.extend_from_slice(args);
+            let serialized =
+                crate::persistence::aof::serialize_command(&Frame::Array(parts.into()));
+            match persist_local_leg(aof_pool, repl_state, my_shard, serialized).await {
+                Ok(needs_barrier) => *local_barrier_pending |= needs_barrier,
+                Err(()) => {
+                    return Frame::Error(Bytes::from_static(
+                        crate::persistence::aof::AOF_FSYNC_ERR,
+                    ));
+                }
+            }
+        }
+        return resp;
     }
 
     let mut total_count: i64 = 0;
@@ -1078,6 +1201,24 @@ async fn coordinate_multi_del_or_exists(
             });
             if let DispatchResult::Response(Frame::Integer(n)) = result {
                 total_count += n;
+                // v3-5 carried gap: persist the local slice (synthesized over
+                // ONLY the keys this shard owns — remote slices persist on
+                // their owners via MultiExecute). Skip when nothing removed.
+                if is_delete && n > 0 {
+                    let mut parts: Vec<Frame> = Vec::with_capacity(key_args.len() + 1);
+                    parts.push(Frame::BulkString(Bytes::from(cmd_upper.clone())));
+                    parts.extend_from_slice(key_args);
+                    let serialized =
+                        crate::persistence::aof::serialize_command(&Frame::Array(parts.into()));
+                    match persist_local_leg(aof_pool, repl_state, my_shard, serialized).await {
+                        Ok(needs_barrier) => *local_barrier_pending |= needs_barrier,
+                        Err(()) => {
+                            return Frame::Error(Bytes::from_static(
+                                crate::persistence::aof::AOF_FSYNC_ERR,
+                            ));
+                        }
+                    }
+                }
             }
         } else {
             let (reply_tx, reply_rx) = channel::oneshot();
@@ -2392,6 +2533,7 @@ mod tests {
         let notifiers: Vec<Arc<channel::Notify>> = Vec::new();
         let cached_clock = CachedClock::new();
         let response_pool = ();
+        let mut local_barrier_pending = false;
         let result = coordinate_mset(
             &args,
             0,
@@ -2403,6 +2545,7 @@ mod tests {
             &cached_clock,
             None,
             &None,
+            &mut local_barrier_pending,
             &response_pool,
         )
         .await;
@@ -2441,6 +2584,7 @@ mod tests {
         let notifiers: Vec<Arc<channel::Notify>> = Vec::new();
         let cached_clock = CachedClock::new();
         let response_pool = ();
+        let mut local_barrier_pending = false;
         let result = coordinate_multi_del_or_exists(
             b"DEL",
             &args,
@@ -2451,6 +2595,9 @@ mod tests {
             &dispatch_tx,
             &notifiers,
             &cached_clock,
+            None,
+            &None,
+            &mut local_barrier_pending,
             &response_pool,
         )
         .await;
