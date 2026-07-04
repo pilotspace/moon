@@ -2,8 +2,9 @@
 # gcloud-wal-aof-ab.sh — same-instance A/B proof of the write-path durability fixes
 # (--wal-kv-log gate + everysec bounded backpressure) on GCloud real SSD.
 #
-# Proves, per config {--wal-kv-log on (old behavior) | auto (fix)} at shards={1,4},
-# appendonly=yes everysec (defaults):
+# Proves, per config {--wal-kv-log on (old behavior) | auto (fix) | walonly
+# (--appendonly no + default disk-offload: WAL-v3 is the sole KV log)} at
+# shards={1,4}, appendonly=yes everysec (defaults) except walonly:
 #   1. VOLUME     — on-disk bytes attributed AOF vs WAL (+ /proc/<pid>/io write_bytes).
 #                   Expect: auto ==> WAL header-only at shards=4 (~44% total cut); shards=1 unchanged.
 #   2. THROUGHPUT — SET RPS, P1 & P64, c50, median of 3 reps (fresh server per rep).
@@ -63,9 +64,18 @@ dir_bytes(){ # $1=dir  $2=glob-ere  -> total bytes of matching files
 }
 
 start_moon(){ # $1=shards $2=walkv $3=dir -> pid
-  ./moon-src/target/release/moon --port "$PORT" --shards "$1" \
-    --appendonly yes --appendfsync everysec --wal-kv-log "$2" \
-    --dir "$3" >"$3/server.log" 2>&1 &
+  if [[ "$2" == "walonly" ]]; then
+    # WAL-only posture: AOF off; disk-offload stays at its default (enable) so
+    # WAL-v3 is the sole KV log (wal-kv-log auto => keep logging, no AOF to
+    # defer to). NOTE: conn-LOCAL writes never enter the SPSC path and are not
+    # WAL-logged — the recovery check below sizes that gap empirically.
+    ./moon-src/target/release/moon --port "$PORT" --shards "$1" \
+      --appendonly no --dir "$3" >"$3/server.log" 2>&1 &
+  else
+    ./moon-src/target/release/moon --port "$PORT" --shards "$1" \
+      --appendonly yes --appendfsync everysec --wal-kv-log "$2" \
+      --dir "$3" >"$3/server.log" 2>&1 &
+  fi
   echo $!
 }
 
@@ -89,8 +99,9 @@ measure_one(){ # $1=shards $2=walkv  -> prints a report block
   if find "$dir" -name '*.wal' | head -5 | xargs -r strings 2>/dev/null | grep -q MARKERVALUE_QQQ8; then marker_wal=1; fi
   echo "volume: aof_bytes=$aof_b wal_bytes=$wal_b proc_write_bytes=$pio backpressure_dropped=${drops:-NA} marker_in_wal=$marker_wal"
 
-  # -- recovery check (auto only, shards=4: prove AOF-alone recovery) --
-  if [[ "$walkv" == "auto" && "$shards" == "4" ]]; then
+  # -- recovery check (shards=4: auto proves AOF-alone recovery; walonly sizes
+  #    WAL-alone recovery, incl. the conn-local-write gap) --
+  if [[ "$shards" == "4" && ( "$walkv" == "auto" || "$walkv" == "walonly" ) ]]; then
     local nkeys; nkeys=$(timeout 5 redis-cli -p "$PORT" dbsize | grep -oE '[0-9]+')
     stop_moon "$pid"
     pid=$(start_moon "$shards" "$walkv" "$dir")
@@ -130,7 +141,7 @@ measure(){
   echo "# moon: $(./moon-src/target/release/moon --version 2>/dev/null || echo unknown)"
   set +e
   for shards in 1 4; do
-    for walkv in on auto; do
+    for walkv in on auto walonly; do
       measure_one "$shards" "$walkv"
     done
   done
