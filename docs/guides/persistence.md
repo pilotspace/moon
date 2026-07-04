@@ -55,6 +55,14 @@ checkpoint/FPI and feature records, and KV logging re-engages automatically
 when a CDC subscriber attaches. Set `--wal-kv-log on` if you need
 point-in-time recovery or full CDC history alongside the AOF.
 
+> **⚠ The WAL is not a standalone durability log.** With `--appendonly no`,
+> only cross-shard (SPSC-dispatched) writes reach the WAL — writes local to a
+> connection's own shard are not logged anywhere, so crash recovery loses
+> roughly `1/num_shards` of writes at `--shards >= 2` (measured: 79% recovered
+> at 4 shards) and **everything** at `--shards 1`. Keep `--appendonly yes`
+> (the default) whenever you need KV durability; the WAL's KV stream exists
+> for CDC, PITR, and disk-offload — not as an AOF replacement.
+
 ## RDB snapshots
 
 RDB creates point-in-time snapshots of the entire dataset.
