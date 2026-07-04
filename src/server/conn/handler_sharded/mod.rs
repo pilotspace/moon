@@ -1580,13 +1580,13 @@ pub(crate) async fn handle_connection_sharded_inner<
                 if !remote_groups.is_empty() {
                     let mut reply_futures: Vec<(Vec<(usize, Option<Bytes>, Bytes)>, usize)> = Vec::with_capacity(remote_groups.len());
                     for (target, entries) in remote_groups {
-                        let slot_ptr = response_pool.slot_ptr(target);
+                        let slot_arc = response_pool.slot_arc(target);
                         // Use the db_index captured with the first command (all commands in a
                         // pipeline batch targeting the same shard share the same db_index).
                         let batch_db = entries.first().map(|(_, _, _, _, db)| *db).unwrap_or(conn.selected_db);
                         let (meta, commands): (Vec<(usize, Option<Bytes>, Bytes)>, Vec<std::sync::Arc<Frame>>) =
                             entries.into_iter().map(|(idx, arc_frame, aof, cmd, _db)| ((idx, aof, cmd), arc_frame)).unzip();
-                        let msg = ShardMessage::PipelineBatchSlotted { db_index: batch_db, commands, response_slot: crate::shard::dispatch::ResponseSlotPtr(slot_ptr) };
+                        let msg = ShardMessage::PipelineBatchSlotted { db_index: batch_db, commands, response_slot: crate::shard::dispatch::ResponseSlotPtr(slot_arc) };
                         let target_idx = ChannelMesh::target_index(ctx.shard_id, target);
                         // F3: bounded backpressure retry (shared helper). The
                         // closure retains the message on a full ring; the helper

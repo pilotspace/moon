@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};
 
 use atomic_waker::AtomicWaker;
@@ -8,18 +9,23 @@ use crate::protocol::Frame;
 use crate::runtime::channel;
 use crate::server::response_slot::ResponseSlot;
 
-/// Newtype wrapper for `*const ResponseSlot` to isolate the `Send` unsafety.
+/// Shared handle to a connection's `ResponseSlot`, carried cross-thread in a
+/// `ShardMessage` so the target shard can reply into it.
 ///
-/// Raw pointers are `!Send` by default. This newtype provides a localized
-/// `unsafe impl Send` with a clear safety contract, instead of requiring a
-/// blanket `unsafe impl Send for ShardMessage`.
-#[derive(Debug, Clone, Copy)]
-pub struct ResponseSlotPtr(pub *const ResponseSlot);
+/// Holds an `Arc<ResponseSlot>` (was a raw `*const`). The refcount keeps the slot
+/// alive until BOTH the connection's `ResponseSlotPool` AND this in-flight message
+/// drop, so the target shard's `fill()` can never dangle even if the connection task
+/// is dropped mid-flight (panic-unwind / shutdown). This closes the panic-unwind
+/// cross-shard reply use-after-free found in review, and — being an ordinary `Arc`
+/// over a `Send + Sync` slot — needs no `unsafe impl Send` and adds no `unsafe`.
+#[derive(Clone)]
+pub struct ResponseSlotPtr(pub Arc<ResponseSlot>);
 
-// SAFETY: The pointed-to ResponseSlot is Send+Sync (enforced by its own unsafe impls).
-// The pointer remains valid for the lifetime of the connection's ResponseSlotPool,
-// which outlives all dispatched ShardMessage values.
-unsafe impl Send for ResponseSlotPtr {}
+impl std::fmt::Debug for ResponseSlotPtr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ResponseSlotPtr({:p})", Arc::as_ptr(&self.0))
+    }
+}
 
 /// One batched cross-shard READ message carrying N independent single-key foreign
 /// reads from DIFFERENT connections on the ORIGIN shard to ONE owner shard. Each
@@ -721,9 +727,9 @@ pub struct AofFoldSnapshot {
     pub pending_aof_count: usize,
 }
 
-// ShardMessage is Send because all fields are Send. The raw pointer in
-// ResponseSlotPtr is the only non-auto-Send field, and it has its own
-// localized unsafe impl Send with documented safety invariants.
+// ShardMessage is Send because all fields are Send. ResponseSlotPtr wraps an
+// Arc<ResponseSlot> over a Send + Sync slot, so it is auto-Send — no unsafe impl
+// or raw pointer is involved.
 
 /// Compile-time guard: keep `ShardMessage` under 256 bytes to prevent
 /// hot-path allocator pressure in the SPSC ring buffer. Large variants

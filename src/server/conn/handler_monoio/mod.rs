@@ -1642,7 +1642,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
             // fsync barrier at the bottom of the loop can route to the owning
             // shard's pool (not ctx.shard_id — mirrors handler_sharded).
             for (target, entries) in remote_groups.drain() {
-                let slot_ptr = response_pool.slot_ptr(target);
+                let slot_arc = response_pool.slot_arc(target);
                 let (meta, commands): (
                     Vec<(usize, Option<Bytes>, Bytes)>,
                     Vec<std::sync::Arc<Frame>>,
@@ -1654,7 +1654,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 let msg = ShardMessage::PipelineBatchSlotted {
                     db_index: conn.selected_db,
                     commands,
-                    response_slot: crate::shard::dispatch::ResponseSlotPtr(slot_ptr),
+                    response_slot: crate::shard::dispatch::ResponseSlotPtr(slot_arc),
                 };
                 let target_idx = ChannelMesh::target_index(ctx.shard_id, target);
                 // F3: bounded backpressure retry. The closure retains the
@@ -1719,16 +1719,18 @@ pub(crate) async fn handle_connection_sharded_monoio<
             // the slot's AtomicWaker + monoio's `sync`-feature waker channel
             // (proven by tests/spsc_wake_floor_red.rs::swf0 on both drivers).
             //
-            // SAFETY CONTRACT (ResponseSlotPtr lifetime): every batch pushed
-            // above carries a raw pointer into `response_pool`, which lives on
-            // this task's stack. Once a batch is Pushed, this await MUST run to
-            // completion — no timeout, no shutdown break, no early `continue` —
-            // because abandoning it and letting the connection task drop while
-            // the target shard still holds the pointer would make the eventual
-            // `slot.fill()` a use-after-free. The target shard ALWAYS fills the
-            // slot for every message it drains, so this await terminates unless
-            // the target thread itself is gone (process teardown). The tokio
-            // handler carries the identical unbounded await.
+            // DROP-SAFETY (ResponseSlotPtr is Arc-owned): every batch pushed above
+            // carries an `Arc<ResponseSlot>` clone, so the slot outlives BOTH this
+            // connection's `response_pool` AND the in-flight message. Abandoning
+            // this await (drop, panic-unwind, or a future shutdown break) can no
+            // longer dangle the target shard's late `slot.fill()` — the refcount
+            // keeps the slot alive until the last handle drops. (This replaced the
+            // old raw-pointer-into-stack-pool design, whose contract required the
+            // await to run to completion to avoid a panic-unwind UAF; see the
+            // `ResponseSlotPtr` doc + PR review.) The await is still unbounded here
+            // for simplicity — the target shard always fills every message it
+            // drains — but a shutdown-aware bound is now a safe, tracked follow-up.
+            // The tokio handler carries the identical await.
             //
             // C2 pipeline guard (see XSHARD_SPIN_MAX_BATCH_REMOTE): total cross-shard
             // commands in THIS batch. The reply-side spin may engage only for a singleton

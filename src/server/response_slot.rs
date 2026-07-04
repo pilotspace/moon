@@ -7,8 +7,8 @@
 
 use std::cell::UnsafeCell;
 use std::future::Future;
-use std::marker::PhantomData;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::task::{Context, Poll};
 
@@ -160,26 +160,24 @@ impl Default for ResponseSlot {
     }
 }
 
-/// Future that wraps a `ResponseSlot` reference for async `.await` usage.
+/// Future that owns a shared handle to a `ResponseSlot` for async `.await` usage.
 ///
-/// The lifetime `'a` ties this future to the `ResponseSlotPool` that owns
-/// the slot, preventing use-after-free at compile time.
-pub struct ResponseSlotFuture<'a> {
-    slot: *const ResponseSlot,
-    _marker: PhantomData<&'a ResponseSlot>,
+/// Holds an `Arc<ResponseSlot>` clone (not a borrow or raw pointer), so the slot
+/// stays alive for as long as EITHER this future OR any in-flight `ResponseSlotPtr`
+/// on a target shard references it. Abandoning this future (drop, panic-unwind,
+/// shutdown break) can never dangle the target shard's late `fill()` — the refcount
+/// keeps the slot allocated until the last handle drops. This is the structural
+/// replacement for the old raw-pointer-into-stack-pool design (see PR review:
+/// panic-unwind cross-shard reply UAF).
+pub struct ResponseSlotFuture {
+    slot: Arc<ResponseSlot>,
 }
 
-// SAFETY: The underlying ResponseSlot is Send+Sync, and the lifetime parameter
-// ensures the pool (which owns the slot) outlives this future.
-unsafe impl Send for ResponseSlotFuture<'_> {}
-
-impl Future for ResponseSlotFuture<'_> {
+impl Future for ResponseSlotFuture {
     type Output = Vec<Frame>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        // SAFETY: Pointer validity guaranteed by lifetime bound to ResponseSlotPool.
-        let slot = unsafe { &*self.slot };
-        slot.poll_take(cx)
+        self.slot.poll_take(cx)
     }
 }
 
@@ -188,7 +186,7 @@ impl Future for ResponseSlotFuture<'_> {
 /// Eliminates oneshot channel allocation on the cross-shard dispatch hot path.
 /// Created once per connection, reused across all dispatches for that connection.
 pub struct ResponseSlotPool {
-    slots: Vec<ResponseSlot>,
+    slots: Vec<Arc<ResponseSlot>>,
     /// The shard this connection is assigned to (for diagnostics/debugging).
     #[allow(dead_code)]
     my_shard: usize,
@@ -199,34 +197,36 @@ impl ResponseSlotPool {
     pub fn new(num_shards: usize, my_shard: usize) -> Self {
         let mut slots = Vec::with_capacity(num_shards);
         for _ in 0..num_shards {
-            slots.push(ResponseSlot::new());
+            slots.push(Arc::new(ResponseSlot::new()));
         }
         Self { slots, my_shard }
     }
 
-    /// Get a reference to the slot for the given target shard.
+    /// Get a reference to the slot for the given target shard (for the reply-side
+    /// spin `try_take()`; borrows the pool, no refcount bump).
     #[inline]
     pub fn slot_for(&self, target_shard: usize) -> &ResponseSlot {
         &self.slots[target_shard]
     }
 
-    /// Get a raw pointer to the slot for the given target shard.
-    ///
-    /// This pointer is stable for the lifetime of the pool and can be
-    /// safely sent across threads in ShardMessage variants.
+    /// Clone the shared handle to the slot for the given target shard, to send
+    /// cross-thread in a `ShardMessage`. One refcount bump per batch — the clone
+    /// keeps the slot alive until BOTH this connection's pool AND the in-flight
+    /// message drop, so the target shard's `fill()` can never dangle even if the
+    /// connection task is dropped mid-flight (panic-unwind / shutdown).
     #[inline]
-    pub fn slot_ptr(&self, target_shard: usize) -> *const ResponseSlot {
-        &self.slots[target_shard] as *const ResponseSlot
+    pub fn slot_arc(&self, target_shard: usize) -> Arc<ResponseSlot> {
+        Arc::clone(&self.slots[target_shard])
     }
 
     /// Create a future that resolves when the target shard fills the slot.
     ///
-    /// The returned future borrows the pool, ensuring the slot outlives the future.
+    /// The future OWNS an `Arc` clone of the slot, so it is drop-safe: abandoning
+    /// it (shutdown break / panic-unwind) cannot dangle a concurrent `fill()`.
     #[inline]
-    pub fn future_for(&self, target_shard: usize) -> ResponseSlotFuture<'_> {
+    pub fn future_for(&self, target_shard: usize) -> ResponseSlotFuture {
         ResponseSlotFuture {
-            slot: self.slot_ptr(target_shard),
-            _marker: PhantomData,
+            slot: Arc::clone(&self.slots[target_shard]),
         }
     }
 }
@@ -324,14 +324,42 @@ mod tests {
     }
 
     #[test]
-    fn test_pool_slot_for_returns_correct_slot() {
+    fn test_pool_slot_arc_returns_correct_slot() {
         let pool = ResponseSlotPool::new(4, 0);
-        // Verify slot_ptr and slot_for return the same address
+        // Verify slot_arc and slot_for reference the same slot object.
         for i in 0..4 {
             let slot_ref = pool.slot_for(i) as *const ResponseSlot;
-            let slot_ptr = pool.slot_ptr(i);
-            assert_eq!(slot_ref, slot_ptr);
+            let slot_arc = pool.slot_arc(i);
+            assert_eq!(slot_ref, Arc::as_ptr(&slot_arc));
         }
+    }
+
+    /// Drop-safety regression (PR review: panic-unwind cross-shard reply UAF).
+    /// The slot handle sent cross-thread MUST outlive the connection's pool being
+    /// dropped while a reply is still in flight — otherwise the target shard's late
+    /// `fill()` is a use-after-free. With Arc-owned slots the allocation survives
+    /// (strong_count >= 1) until the last handle drops; the raw-pointer design this
+    /// replaced could not express this and would dangle. Provable without a
+    /// sanitizer via `Arc::strong_count`.
+    #[test]
+    fn test_slot_arc_outlives_pool_drop_and_is_fillable() {
+        let pool = ResponseSlotPool::new(4, 0);
+        // Simulate the cross-thread send: clone the handle out of the pool.
+        let in_flight = pool.slot_arc(2);
+        assert_eq!(Arc::strong_count(&in_flight), 2, "pool + in-flight handle");
+
+        // Connection task drops its pool (e.g. panic-unwind / shutdown) while the
+        // message is still queued on the target shard.
+        drop(pool);
+
+        // The slot is still alive and safe to fill — no dangling pointer.
+        assert_eq!(
+            Arc::strong_count(&in_flight),
+            1,
+            "handle keeps the slot allocated after pool drop"
+        );
+        in_flight.fill(vec![Frame::Integer(7)]);
+        assert_eq!(in_flight.try_take().map(|v| v.len()), Some(1));
     }
 
     #[test]
@@ -351,17 +379,14 @@ mod tests {
     #[test]
     fn test_concurrent_fill_from_another_thread() {
         let pool = ResponseSlotPool::new(4, 0);
-        let addr = pool.slot_ptr(2) as usize;
+        // The cross-thread send is now an Arc clone (always Send) — no raw pointer.
+        let in_flight = pool.slot_arc(2);
         let future = pool.future_for(2);
 
         // Spawn a thread that fills the slot after a brief yield.
-        // We transmit the address as usize (always Send) and reconstruct the pointer.
         let handle = std::thread::spawn(move || {
             std::thread::yield_now();
-            // SAFETY: addr points to a valid ResponseSlot in the pool
-            // which outlives this thread (we join before pool is dropped).
-            let slot = unsafe { &*(addr as *const ResponseSlot) };
-            slot.fill(vec![Frame::Integer(123)]);
+            in_flight.fill(vec![Frame::Integer(123)]);
         });
 
         let result = block_on(future);
