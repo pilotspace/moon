@@ -4060,8 +4060,19 @@ async fn start_cluster_server() -> (u16, CancellationToken) {
         }
     });
 
-    // Give the server time to bind and start shards
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    // Wait until the listener actually accepts instead of a fixed 100ms sleep —
+    // under full-suite parallelism the spawned listener thread can take longer
+    // to bind, and the callers' no-retry connect() then panics on refused.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        match tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
+            Ok(_) => break,
+            Err(_) if std::time::Instant::now() < deadline => {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            Err(e) => panic!("cluster server never bound port {port}: {e}"),
+        }
+    }
 
     (port, token)
 }
