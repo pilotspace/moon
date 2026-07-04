@@ -344,6 +344,8 @@ if should_run "string"; then
         assert_moon "INCRBYFLOAT"        "6.5"   INCRBYFLOAT str:cnt1 0.5
         assert_moon "MSET"               "OK"    MSET str:m1 a str:m2 b str:m3 c
         assert_moon_ok "MGET"            MGET str:m1 str:m2 str:m3
+        assert_moon "MSETNX (new)"       "(integer) 1" MSETNX "{mcm}n1" a "{mcm}n2" b
+        assert_moon "MSETNX (exists)"    "(integer) 0" MSETNX "{mcm}n2" x "{mcm}n3" c
         assert_moon_ok "GETEX with EX"   GETEX str:m1 EX 100
     else
         assert_match "SET basic"         SET str:k1 hello
@@ -369,6 +371,8 @@ if should_run "string"; then
         assert_match "INCRBYFLOAT"       INCRBYFLOAT str:cnt1 0.5
         assert_match "MSET"              MSET str:m1 a str:m2 b str:m3 c
         assert_match "MGET"              MGET str:m1 str:m2 str:m3
+        assert_match "MSETNX (new)"      MSETNX "{mcc}n1" a "{mcc}n2" b
+        assert_match "MSETNX (exists)"   MSETNX "{mcc}n2" x "{mcc}n3" c
         assert_match "GETEX with EX"     GETEX str:m1 EX 100
     fi
 fi

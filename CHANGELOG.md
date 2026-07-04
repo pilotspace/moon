@@ -6,6 +6,101 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+Two milestones since v0.4.1:
+
+- **v3-4 KV Write Correctness & Data-Integrity Parity** — the primary KV engine now honors
+  Redis's data-integrity contracts (no wrong-type data loss, no integer-overflow panics/wraps,
+  past-expire deletes, atomic MSETNX).
+- **p=1 & multi-shard throughput** — Moon now beats Redis on non-pipelined (p=1) GET/SET on both
+  GCE arches (ARM 1.19–1.21×, x86 1.65–1.66×), and multi-shard wins from 8 concurrent connections
+  up (s4 c8 1.57–2.0×, c64 2.50×), via a poll-mode park (`--io-busy-poll-us`, backed by a vendored
+  monoio fork) plus a cross-shard reply-path convoy fix. All perf gains are bench-only knobs /
+  opt-in flags — the default runtime behavior is unchanged unless you set `--io-busy-poll-us`.
+
+### Added
+
+- **MSETNX** — atomic multi-key string write (set all pairs iff none of the keys exist; returns 1/0).
+  Single-shard atomic (two-phase check-then-set, no await between phases). The cross-shard coordinator
+  rejects a key span with `CROSSSLOT` (by design — no two-phase commit) and runs co-located `{hash-tag}`
+  keys atomically on the owning shard. New `--shards 4` regression suite `tests/msetnx_cross_shard_reject.rs`.
+- **`--io-busy-poll-us <µs>`** — poll-mode park for the monoio legacy (epoll/kqueue) driver: the shard
+  thread busy-polls readiness for the given budget before blocking, deleting the per-op scheduler
+  sleep+wake. This is the lever that flips non-pipelined (p=1) GET/SET to a win vs Redis on both GCE
+  arches. Defaults to `0` (off); implies `--io-driver epoll`. Costs up to budget-µs CPU per idle park —
+  only a win on pinned, disjoint cores (a regression on shared-core hosts). Env equivalent
+  `MOON_EPOLL_SPIN_US`.
+- **`--io-driver <auto|epoll>`** for the monoio runtime — force the epoll/kqueue LegacyDriver instead of
+  io_uring (some platforms, e.g. GCE ARM Axion, run KV faster on epoll).
+- **Per-use-case tuning guide** at `docs/guides/tuning.md` (quick recipes, shard-count guidance,
+  busy-poll trade-offs, persistence cost, platform notes), linked from the docs-site Operations nav.
+
+### Performance
+
+- **Multi-shard now wins from 8 concurrent connections up, even without pipelining.** Fixed the C2
+  reply-spin *convoy*: the cross-shard reply busy-poll was synchronous on the shard thread and, at
+  ≥2 connections per shard, a spinning connection starved its sibling and the shard's SPSC drain — the
+  root cause of the `--shards 4` c8-P1 0.45× collapse. A solo-conn gate now spins only when a connection
+  is alone on its shard. Result (s4, P1, `--io-busy-poll-us 40`, vs Redis): c8 GET/SET ARM 1.57/1.71×,
+  x86 1.9/2.0×; c64 2.50× both arches. (c1-P1 remains the structural single-hop ceiling, 0.91–0.96×.)
+- **monoio cross-shard replies unified on the zero-allocation `ResponseSlotPool`** (L3b), removing the
+  per-op flume-oneshot allocation and chunked park from the hot reply path (+11–14% at c8).
+- **Non-pipelined GET reply framed from a borrow** — dropped a per-GET `Vec` copy.
+- Stripped four per-op lock/atomic costs from the p=1 dispatch hot path.
+- Tuned the default monoio io_uring driver (`COOP_TASKRUN | SINGLE_ISSUER | DEFER_TASKRUN`) on Linux.
+
+### Changed
+
+- Corrected default-config documentation: `--shards` default is **1** (not "0/auto") and `--appendonly`
+  default is **yes** (not "no") — both config pages were wrong.
+
+### Fixed
+
+- **Cross-shard reply use-after-free on panic-unwind (memory safety).** The cross-shard reply path
+  sent a raw `*const ResponseSlot` into a pool living on the connection task's stack; a panic unwinding
+  through the reply dispatch/drain would drop that pool while a target shard still held the pointer,
+  making the target's later `slot.fill()` a use-after-free (heap corruption). `ResponseSlotPtr` now
+  carries an `Arc<ResponseSlot>`, so the slot outlives whichever of {connection pool, in-flight message}
+  drops last — structurally closing the window on both dispatch and drain. This also **retroactively
+  fixes the same latent hazard on the tokio runtime** (shipped since v0.4.0) and removes four `unsafe`
+  blocks (net unsafe reduction). Follow-up: a shutdown-aware bound on the reply await (now safe to add)
+  to close a partial-shutdown liveness hang.
+- **`MOON_NO_URING=1` now actually switches the monoio driver.** It was a silent no-op for the monoio
+  FusionDriver (io_uring was selected regardless); it now forces the epoll/kqueue LegacyDriver, matching
+  its documented contract and the new `--io-driver epoll`.
+
+- **KV data-integrity (P0):** wrong-type `GETDEL` / `GETSET` / `SET … GET` no longer silently delete or
+  overwrite a key holding a non-string — they return `WRONGTYPE` and preserve the value (check-before-mutate).
+- **Integer overflow (P0):** `DECRBY key -9223372036854775808` no longer panics; every expiry-setting
+  command (`SET EX/PX/EXAT`, `SETEX`, `PSETEX`, `EXPIRE`/`EXPIREAT`/`PEXPIRE`) now rejects a time whose
+  absolute expiry falls outside the `i64` millisecond domain with an "invalid expire time" error —
+  matching Redis (`when > LLONG_MAX/1000`). This closes a latent wrap where an accepted-but-huge TTL
+  (e.g. `EXPIRE k 15000000000000000`) surfaced as a **negative** `PTTL`/`PEXPIRETIME` on a live key, and
+  makes an extreme-negative `EXPIRE`/`EXPIREAT` (`< i64::MIN/1000`) error instead of deleting.
+- **Expire-in-the-past semantics (P0):** `EXPIRE`/`PEXPIRE`/`EXPIREAT` with a non-positive or already-past
+  time now deletes the key and returns 1 (Redis parity); verified to propagate through command-based WAL
+  replay so replicas stay consistent.
+- **Cross-shard coordinator local-leg durability (P0, pre-existing):** a co-located `MSET`/`MSETNX` whose
+  keys hash to the **connection's own shard** now appends to that shard's AOF. The coordinator's local
+  leg previously executed the write in memory but never persisted it (the remote `MultiExecute` leg
+  always did), so with `--shards >1 --appendonly yes` an own-shard co-located `MSET`/`MSETNX` could be
+  lost on crash. It now persists via the same append path every local single-key write uses — the whole
+  command for a co-located owner, and a synthesized `MSET` over **only the local keys** for a scattered
+  `MSET`'s local slice — returning an AOF error instead of a false `+OK` on append failure.
+  Crash-recovery verified on both monoio and tokio (`tests/coordinator_local_leg_durability.rs`).
+  Single-shard (the default) was never affected. The same local-leg gap remains for coordinator
+  `BITOP` / `COPY` / `DEL` / `UNLINK` (tracked follow-up).
+
+### Dependencies
+
+- **Vendored `monoio` 0.2.4** (`vendor/monoio`, wired via `[patch.crates-io]`; upstream git sha
+  `f7827ddd`, recorded in `vendor/monoio/.cargo_vcs_info.json`). A fork of upstream monoio 0.2.4 with a
+  bounded "moon patch" (marked `// moon patch`, confined to 4 files — `lib.rs`, `driver/mod.rs`,
+  `driver/uring/mod.rs`, `driver/legacy/mod.rs` — verified against pristine upstream) that adds the
+  env/CLI-gated poll-mode park behind `--io-busy-poll-us` and a per-thread spin-hook handshake. Adds
+  **zero new `unsafe`**; the dependency list is byte-identical to upstream (no added transitive deps);
+  behavior is byte-identical to upstream when the `MOON_*` spin knobs are unset. Introduced to enable
+  the p=1 poll-mode park.
+
 ## [0.4.1] — 2026-06-23
 
 Measure-only validation release — **no server behavior change**. Bundles the closed

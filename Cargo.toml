@@ -124,8 +124,24 @@ text-index = [
     "dep:levenshtein_automata",
 ]
 
+# Vendored monoio 0.2.4 (upstream git sha f7827ddd, see vendor/monoio/.cargo_vcs_info.json)
+# with a bounded "moon patch": env/CLI-gated poll-mode park that busy-polls readiness
+# before blocking, removing the per-op scheduler wakeup at p=1 (io_uring:
+# MOON_URING_SPIN_US; legacy epoll/kqueue: MOON_EPOLL_SPIN_US / --io-busy-poll-us),
+# plus a per-thread spin-hook handshake. Diff vs upstream is confined to FOUR files —
+# src/lib.rs, src/driver/mod.rs, src/driver/uring/mod.rs, src/driver/legacy/mod.rs
+# (search "moon patch"); adds zero new unsafe. Default-off => byte-identical behavior
+# when the MOON_* spin knobs are unset.
+[patch.crates-io]
+monoio = { path = "vendor/monoio" }
+
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.7"
+# Same crate, 0.6 line: monoio 0.2.4's `uring_builder()` takes an
+# `io_uring 0.6::Builder`, incompatible with our 0.7 above. Used only to pass
+# tuned setup flags (COOP_TASKRUN / SINGLE_ISSUER / DEFER_TASKRUN) to the
+# monoio runtime; must track monoio's own io-uring version.
+io-uring-06 = { package = "io-uring", version = "0.6" }
 nix = { version = "0.31", features = ["net", "socket"] }
 
 [target.'cfg(unix)'.dependencies]

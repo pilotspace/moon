@@ -231,6 +231,11 @@ pub(crate) async fn handle_connection_sharded_inner<
 ) -> (HandlerResult, Option<S>) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    // Solo-conn spin gate (L1 convoy fix): register this connection on the
+    // shard thread so the C2 reply-spin's sibling check (`xshard_may_spin`)
+    // sees it. RAII — decrements when the handler returns (incl. migration).
+    let _conn_guard = crate::shard::slice::ShardConnGuard::new();
+
     // Direct buffer I/O: bypass Framed/codec for the hot path.
     let mut stream = stream;
     let mut read_buf = if initial_read_buf.is_empty() {
@@ -1035,7 +1040,7 @@ pub(crate) async fn handle_connection_sharded_inner<
 
                     // --- Multi-key commands ---
                     if is_multi_key_command(cmd, cmd_args) {
-                        let response = crate::shard::coordinator::coordinate_multi_key(cmd, cmd_args, ctx.shard_id, ctx.num_shards, conn.selected_db, &ctx.shard_databases, &ctx.dispatch_tx, &ctx.spsc_notifiers, &ctx.cached_clock, &()).await;
+                        let response = crate::shard::coordinator::coordinate_multi_key(cmd, cmd_args, ctx.shard_id, ctx.num_shards, conn.selected_db, &ctx.shard_databases, &ctx.dispatch_tx, &ctx.spsc_notifiers, &ctx.cached_clock, ctx.aof_pool.as_ref(), &ctx.repl_state, &()).await;
                         responses.push(response);
                         continue;
                     }
@@ -1575,13 +1580,13 @@ pub(crate) async fn handle_connection_sharded_inner<
                 if !remote_groups.is_empty() {
                     let mut reply_futures: Vec<(Vec<(usize, Option<Bytes>, Bytes)>, usize)> = Vec::with_capacity(remote_groups.len());
                     for (target, entries) in remote_groups {
-                        let slot_ptr = response_pool.slot_ptr(target);
+                        let slot_arc = response_pool.slot_arc(target);
                         // Use the db_index captured with the first command (all commands in a
                         // pipeline batch targeting the same shard share the same db_index).
                         let batch_db = entries.first().map(|(_, _, _, _, db)| *db).unwrap_or(conn.selected_db);
                         let (meta, commands): (Vec<(usize, Option<Bytes>, Bytes)>, Vec<std::sync::Arc<Frame>>) =
                             entries.into_iter().map(|(idx, arc_frame, aof, cmd, _db)| ((idx, aof, cmd), arc_frame)).unzip();
-                        let msg = ShardMessage::PipelineBatchSlotted { db_index: batch_db, commands, response_slot: crate::shard::dispatch::ResponseSlotPtr(slot_ptr) };
+                        let msg = ShardMessage::PipelineBatchSlotted { db_index: batch_db, commands, response_slot: crate::shard::dispatch::ResponseSlotPtr(slot_arc) };
                         let target_idx = ChannelMesh::target_index(ctx.shard_id, target);
                         // F3: bounded backpressure retry (shared helper). The
                         // closure retains the message on a full ring; the helper
@@ -1647,7 +1652,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                         let shard_responses = {
                             let mut spun = None;
                             if crate::shard::slice::xshard_should_spin(batch_remote_total) {
-                                for _ in 0..crate::shard::slice::XSHARD_SPIN_BUDGET {
+                                for _ in 0..crate::shard::slice::xshard_spin_budget() {
                                     if let Some(r) = response_pool.slot_for(target).try_take() {
                                         spun = Some(r);
                                         break;
@@ -1758,7 +1763,8 @@ pub(crate) async fn handle_connection_sharded_inner<
                 }
 
                 // Update live state after each batch — lock-free (QW8, 2026-06
-                // review: this was a global registry write lock per batch).
+                // review: this was a global registry write lock per batch), and
+                // clock-free (shard-cached ms, not Instant::now()).
                 client_live.touch(
                     conn.selected_db,
                     crate::client_registry::ClientFlags {
@@ -1766,6 +1772,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                         in_multi: conn.in_multi,
                         blocked: false,
                     },
+                    ctx.cached_clock.ms(),
                 );
 
                 // Check if migration was triggered during frame processing.

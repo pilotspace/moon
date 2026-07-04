@@ -266,6 +266,44 @@ mod tests {
         assert!(matches!(result, Frame::Error(_)));
     }
 
+    #[test]
+    fn test_msetnx_all_new() {
+        // All keys absent -> set all, return 1.
+        let mut db = make_db();
+        let r = msetnx(&mut db, &[bs(b"a"), bs(b"1"), bs(b"b"), bs(b"2")]);
+        assert_eq!(r, Frame::Integer(1));
+        assert_eq!(
+            get(&mut db, &[bs(b"a")]),
+            Frame::BulkString(Bytes::from_static(b"1"))
+        );
+        assert_eq!(
+            get(&mut db, &[bs(b"b")]),
+            Frame::BulkString(Bytes::from_static(b"2"))
+        );
+    }
+
+    #[test]
+    fn test_msetnx_one_exists_sets_none() {
+        // Atomic all-or-nothing: if ANY key exists, set NOTHING, return 0.
+        let mut db = make_db();
+        db.set_string(Bytes::from_static(b"b"), Bytes::from_static(b"old"));
+        let r = msetnx(&mut db, &[bs(b"a"), bs(b"1"), bs(b"b"), bs(b"2")]);
+        assert_eq!(r, Frame::Integer(0));
+        assert_eq!(get(&mut db, &[bs(b"a")]), Frame::Null, "a must not be set");
+        assert_eq!(
+            get(&mut db, &[bs(b"b")]),
+            Frame::BulkString(Bytes::from_static(b"old")),
+            "b must be unchanged"
+        );
+    }
+
+    #[test]
+    fn test_msetnx_odd_args() {
+        let mut db = make_db();
+        let r = msetnx(&mut db, &[bs(b"a"), bs(b"1"), bs(b"b")]);
+        assert!(matches!(r, Frame::Error(_)));
+    }
+
     // --- INCR/DECR tests ---
 
     #[test]
@@ -321,6 +359,80 @@ mod tests {
         db.set_string(Bytes::from_static(b"counter"), Bytes::from_static(b"10"));
         let result = decrby(&mut db, &[bs(b"counter"), bs(b"3")]);
         assert_eq!(result, Frame::Integer(7));
+    }
+
+    #[test]
+    fn test_decrby_min_overflow() {
+        // DECRBY key i64::MIN negates to +2^63, which is unrepresentable -> must
+        // return an error, not panic (debug) or wrap (release).
+        let mut db = make_db();
+        db.set_string(Bytes::from_static(b"n"), Bytes::from_static(b"0"));
+        let arg = Frame::BulkString(Bytes::from(i64::MIN.to_string()));
+        let result = decrby(&mut db, &[bs(b"n"), arg]);
+        match result {
+            Frame::Error(e) => assert!(e.ends_with(b"overflow"), "got {e:?}"),
+            other => panic!("expected overflow error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_setex_overflow_rejected() {
+        // now_ms + seconds*1000 overflows for huge seconds -> error, key not created.
+        let mut db = make_db();
+        let huge = Frame::BulkString(Bytes::from(i64::MAX.to_string()));
+        let result = setex(&mut db, &[bs(b"k"), huge, bs(b"v")]);
+        assert!(matches!(result, Frame::Error(ref e) if e.starts_with(b"ERR invalid expire")));
+        assert!(!db.exists(b"k"), "rejected SETEX must not create the key");
+    }
+
+    #[test]
+    fn test_set_ex_overflow_rejected() {
+        let mut db = make_db();
+        let huge = Frame::BulkString(Bytes::from(i64::MAX.to_string()));
+        let result = set(&mut db, &[bs(b"k"), bs(b"v"), bs(b"EX"), huge]);
+        assert!(matches!(result, Frame::Error(ref e) if e.starts_with(b"ERR invalid expire")));
+        assert!(!db.exists(b"k"), "rejected SET EX must not create the key");
+    }
+
+    // --- i64-domain expiry bound (Finding 2): reject expiries past i64::MAX so
+    // PTTL/PEXPIRETIME never wrap negative on a live key (Redis parity). ---
+
+    #[test]
+    fn test_setex_i64_bound_rejected() {
+        // seconds*1000 fits u64 but exceeds i64::MAX -> reject (else PTTL wraps negative).
+        let mut db = make_db();
+        let over = Frame::BulkString(Bytes::from("15000000000000000")); // 1.5e16 s
+        let result = setex(&mut db, &[bs(b"k"), over, bs(b"v")]);
+        assert!(matches!(result, Frame::Error(ref e) if e.starts_with(b"ERR invalid expire")));
+        assert!(!db.exists(b"k"), "rejected SETEX must not create the key");
+    }
+
+    #[test]
+    fn test_set_ex_i64_bound_rejected() {
+        let mut db = make_db();
+        let over = Frame::BulkString(Bytes::from("15000000000000000"));
+        let result = set(&mut db, &[bs(b"k"), bs(b"v"), bs(b"EX"), over]);
+        assert!(matches!(result, Frame::Error(ref e) if e.starts_with(b"ERR invalid expire")));
+        assert!(!db.exists(b"k"), "rejected SET EX must not create the key");
+    }
+
+    #[test]
+    fn test_set_px_i64_bound_rejected() {
+        // now_ms + i64::MAX ms exceeds i64::MAX -> reject.
+        let mut db = make_db();
+        let over = Frame::BulkString(Bytes::from(i64::MAX.to_string()));
+        let result = set(&mut db, &[bs(b"k"), bs(b"v"), bs(b"PX"), over]);
+        assert!(matches!(result, Frame::Error(ref e) if e.starts_with(b"ERR invalid expire")));
+        assert!(!db.exists(b"k"), "rejected SET PX must not create the key");
+    }
+
+    #[test]
+    fn test_psetex_i64_bound_rejected() {
+        let mut db = make_db();
+        let over = Frame::BulkString(Bytes::from(i64::MAX.to_string()));
+        let result = psetex(&mut db, &[bs(b"k"), over, bs(b"v")]);
+        assert!(matches!(result, Frame::Error(ref e) if e.starts_with(b"ERR invalid expire")));
+        assert!(!db.exists(b"k"), "rejected PSETEX must not create the key");
     }
 
     #[test]
@@ -557,6 +669,42 @@ mod tests {
         assert!(!entry.has_expiry());
     }
 
+    #[test]
+    fn test_getset_wrongtype_preserves_key() {
+        // Regression (data-loss): GETSET on a wrong-type key must return WRONGTYPE
+        // and MUST NOT overwrite it. Previously db.set_string ran unconditionally.
+        let mut db = make_db();
+        db.set(Bytes::from_static(b"myhash"), Entry::new_hash());
+        let result = getset(&mut db, &[bs(b"myhash"), bs(b"newval")]);
+        match result {
+            Frame::Error(e) => assert!(e.starts_with(b"WRONGTYPE")),
+            other => panic!("Expected WRONGTYPE error, got {other:?}"),
+        }
+        // The hash must be intact: a plain GET still reports WRONGTYPE (not the new string).
+        match get(&mut db, &[bs(b"myhash")]) {
+            Frame::Error(e) => assert!(e.starts_with(b"WRONGTYPE")),
+            other => panic!("GETSET must not overwrite a wrong-type key, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_set_get_option_wrongtype_preserves_key() {
+        // Regression (data-loss): SET key val GET on a wrong-type key must return
+        // WRONGTYPE and perform NO write (precedence over NX/XX). Previously db.set
+        // ran unconditionally, destroying the wrong-type value.
+        let mut db = make_db();
+        db.set(Bytes::from_static(b"myhash"), Entry::new_hash());
+        let result = set(&mut db, &[bs(b"myhash"), bs(b"newval"), bs(b"GET")]);
+        match result {
+            Frame::Error(e) => assert!(e.starts_with(b"WRONGTYPE")),
+            other => panic!("Expected WRONGTYPE error, got {other:?}"),
+        }
+        match get(&mut db, &[bs(b"myhash")]) {
+            Frame::Error(e) => assert!(e.starts_with(b"WRONGTYPE")),
+            other => panic!("SET..GET must not overwrite a wrong-type key, got {other:?}"),
+        }
+    }
+
     // --- GETDEL tests ---
 
     #[test]
@@ -573,6 +721,24 @@ mod tests {
         let mut db = make_db();
         let result = getdel(&mut db, &[bs(b"key")]);
         assert_eq!(result, Frame::Null);
+    }
+
+    #[test]
+    fn test_getdel_wrongtype_preserves_key() {
+        // Regression (data-loss): GETDEL on a wrong-type key must return WRONGTYPE
+        // and MUST NOT delete the key. Previously db.remove() fired before the type
+        // check, destroying the key and then returning WRONGTYPE as if nothing happened.
+        let mut db = make_db();
+        db.set(Bytes::from_static(b"myhash"), Entry::new_hash());
+        let result = getdel(&mut db, &[bs(b"myhash")]);
+        match result {
+            Frame::Error(e) => assert!(e.starts_with(b"WRONGTYPE")),
+            other => panic!("Expected WRONGTYPE error, got {other:?}"),
+        }
+        assert!(
+            db.exists(b"myhash"),
+            "GETDEL on a wrong-type key must not delete it (data-loss regression)"
+        );
     }
 
     // --- GETEX tests ---

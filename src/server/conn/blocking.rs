@@ -1261,41 +1261,48 @@ pub(crate) fn try_inline_dispatch(
         let consumed = key_end_crlf;
         let key_bytes = &buf[key_start..key_end];
         // Hot-key sampling + lookup via thread-local slice — no lock needed.
-        enum GetResult {
-            Found(Vec<u8>),
-            WrongType,
+        // Frame the reply straight from the borrowed `&[u8]` INSIDE the closure so
+        // the value is copied exactly once (borrow -> write_buf), never via an
+        // intermediate `Vec` (`val.to_vec()`). The closure writes response bytes +
+        // itoa ONLY; it must not re-enter `with_shard*` (thread-local RefCell
+        // reentrancy) and takes no `.await`.
+        enum GetOutcome {
+            // Hit or wrong-type: the response is already framed into `write_buf`.
+            Handled,
+            // Absent locally: consult the cold tier below (`cold_loc` carries where).
             Miss,
         }
-        let (inline_result, cold_loc) = crate::shard::slice::with_shard_db(selected_db, |db| {
+        let (outcome, cold_loc) = crate::shard::slice::with_shard_db(selected_db, |db| {
             if db.hot_keys().tick() {
                 db.hot_keys().observe(key_bytes);
             }
             match db.get_if_alive(key_bytes, now_ms) {
                 Some(entry) => match entry.value.as_bytes() {
-                    Some(val) => (GetResult::Found(val.to_vec()), None),
-                    None => (GetResult::WrongType, None),
+                    Some(val) => {
+                        write_buf.extend_from_slice(b"$");
+                        let mut itoa_buf = itoa::Buffer::new();
+                        write_buf.extend_from_slice(itoa_buf.format(val.len()).as_bytes());
+                        write_buf.extend_from_slice(b"\r\n");
+                        write_buf.extend_from_slice(val);
+                        write_buf.extend_from_slice(b"\r\n");
+                        (GetOutcome::Handled, None)
+                    }
+                    None => {
+                        write_buf.extend_from_slice(
+                            b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
+                        );
+                        (GetOutcome::Handled, None)
+                    }
                 },
                 None => {
                     let loc = db.cold_lookup_location(key_bytes);
-                    (GetResult::Miss, loc)
+                    (GetOutcome::Miss, loc)
                 }
             }
         });
-        match inline_result {
-            GetResult::Found(val) => {
-                write_buf.extend_from_slice(b"$");
-                let mut itoa_buf = itoa::Buffer::new();
-                write_buf.extend_from_slice(itoa_buf.format(val.len()).as_bytes());
-                write_buf.extend_from_slice(b"\r\n");
-                write_buf.extend_from_slice(&val);
-                write_buf.extend_from_slice(b"\r\n");
-            }
-            GetResult::WrongType => {
-                write_buf.extend_from_slice(
-                    b"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n",
-                );
-            }
-            GetResult::Miss => {
+        match outcome {
+            GetOutcome::Handled => {}
+            GetOutcome::Miss => {
                 let cold = cold_loc.and_then(|(loc, shard_dir)| {
                     crate::storage::tiered::cold_read::read_cold_entry_at(&shard_dir, loc, now_ms)
                 });
@@ -1315,8 +1322,6 @@ pub(crate) fn try_inline_dispatch(
                 } else {
                     write_buf.extend_from_slice(b"$-1\r\n");
                 }
-                let _ = read_buf.split_to(consumed);
-                return 1;
             }
         }
         let _ = read_buf.split_to(consumed);
@@ -1367,30 +1372,39 @@ pub(crate) fn try_inline_dispatch(
     // We must not index into `buf` after this point — use `frozen` instead.
     let frozen = read_buf.split_to(consumed).freeze();
 
-    // Eviction check + write via the thread-local slice (no lock needed).
+    // Eviction check + write via the thread-local slice. The lock-free
+    // pre-gate proves the common case (no memory pressure / no limit) without
+    // the per-SET `runtime_config.read()` lock pair; only under pressure —
+    // or before the hints are published — does the full locked path run.
     {
-        let rt = runtime_config.read();
         let budget = shard_databases.elastic_budget(shard_id);
-        let oom = crate::shard::slice::with_shard_db(selected_db, |db| {
-            crate::storage::eviction::try_evict_if_needed_budget(db, &rt, budget).is_err()
-        });
-        drop(rt);
-        if oom {
-            write_buf
-                .extend_from_slice(b"-OOM command not allowed when used memory > 'maxmemory'\r\n");
-            return 1;
+        let est = crate::shard::slice::with_shard_db(selected_db, |db| db.estimated_memory());
+        if !crate::storage::eviction::inline_write_can_skip_eviction(est, budget) {
+            let rt = runtime_config.read();
+            let oom = crate::shard::slice::with_shard_db(selected_db, |db| {
+                crate::storage::eviction::try_evict_if_needed_budget(db, &rt, budget).is_err()
+            });
+            drop(rt);
+            if oom {
+                write_buf.extend_from_slice(
+                    b"-OOM command not allowed when used memory > 'maxmemory'\r\n",
+                );
+                return 1;
+            }
         }
 
         let key = frozen.slice(key_start..key_end);
         let value = frozen.slice(val_start..val_end);
-        crate::shard::slice::with_shard_db(selected_db, |db| {
+        // `move` closure: `key` and `value` are consumed here (last use), so the
+        // entry/set take ownership — no Bytes refcount bump+drop pair per SET.
+        crate::shard::slice::with_shard_db(selected_db, move |db| {
             if db.hot_keys().tick() {
                 db.hot_keys().observe(&key);
             }
-            let mut entry = crate::storage::entry::Entry::new_string(value.clone());
+            let mut entry = crate::storage::entry::Entry::new_string(value);
             entry.set_last_access(db.now());
             entry.set_access_counter(5);
-            db.set(key.clone(), entry);
+            db.set(key, entry);
         });
     }
 

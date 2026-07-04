@@ -783,7 +783,7 @@ impl Database {
         // a None value. Annotated for the hot-path unwrap ratchet.
         #[allow(clippy::expect_used)]
         let result = self.data.insert_or_update(
-            CompactKey::from(key.clone()), // Bytes::clone is a refcount bump, not deep copy
+            CompactKey::from(key.as_ref()), // borrow: CompactKey copies the bytes either way
             |existing: &mut Entry| {
                 // Hit path: replace existing entry, bump version.
                 let new_entry = entry_cell.take().expect("update closure called once");

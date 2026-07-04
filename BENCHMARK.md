@@ -1,6 +1,6 @@
 # moon Benchmark Report
 
-**Last Updated:** 2026-06-16 (4-feature concurrent-vs-competitor pass added — §10.5 vector vs RediSearch, §11.4 graph vs FalkorDB, **new §12 Full-Text Search** vs RediSearch; honestly records where Moon trails. §2.8 = v2-1/PR #189 `db61973` K=1024 re-measurement; v0.1.6 in §2.1–2.6; §2.7 on perf/shard-dispatch-hot-path)
+**Last Updated:** 2026-07-04 (**new §6.6: multi-shard multi-connection WIN — reply-convoy fix + slot-unified replies take s4 c8 P1 from 0.44–0.64× to 1.57–2.0× Redis and c64 to 2.5×, both arches**; supersedes §6.5's c≥8 rows. Prior 2026-07-03: **§2.10: p=1 single-op WIN on both arches via `--io-busy-poll-us` poll-mode park** — ARM c4a 1.19–1.21×, x86 c3 1.65–1.66× vs Redis, n=3 instances/arch; supersedes the "loses p=1" rows in §2.7–2.9 when busy-poll is on. **New §6.5: shards × busy-poll sweep** — busy-poll recovers +22–42% of the cross-shard hop but shards>1 still loses non-pipelined; `--shards 1 --io-busy-poll-us 40` is the p=1 config. Prior: 2026-06-16 4-feature concurrent-vs-competitor pass — §10.5 vector vs RediSearch, §11.4 graph vs FalkorDB, §12 Full-Text Search; §2.8 = v2-1/PR #189 `db61973` K=1024 re-measurement; v0.1.6 in §2.1–2.6; §2.7 on perf/shard-dispatch-hot-path)
 **Platforms:** Linux (GCloud x86_64 + ARM64), macOS (Apple M4 Pro)
 **Redis:** 8.6.1 in §2.1–2.6; 7.0.15 in §2.7
 **moon:** v0.1.6 in §2.1–2.6; perf/shard-dispatch-hot-path HEAD (commit `6582fa9`) in §2.7. Monoio runtime (io_uring on Linux, kqueue on macOS), fat LTO, codegen-units=1, target-cpu=native
@@ -38,6 +38,8 @@ The SET absolute number can differ 3-4× between methodologies. Only strict-vs-s
 
 | Metric | moon vs Redis | Conditions |
 |--------|:-------------------:|------------|
+| p=1 single-op GET/SET (x86) | **1.65-1.66x Redis** | `--io-busy-poll-us 40`, GCE c3 dedicated, n=3, §2.10 |
+| p=1 single-op GET/SET (ARM) | **1.19-1.21x Redis** | `--io-busy-poll-us 40`, GCE c4a dedicated, n=3, §2.10 |
 | Peak GET (Linux x86_64) | **5.11M ops/s (1.72x)** | GCloud c3-standard-8, P=64 |
 | Peak GET (Linux ARM64) | **3.47M ops/s (2.20x)** | GCloud t2a-standard-8, P=64 |
 | Peak GET (macOS) | **7.94M ops/s (2.59x)** | OrbStack, Apple M4 Pro, P=64 |
@@ -280,6 +282,41 @@ Moon-fair vs Redis (ratio = Moon/Redis), 8-vCPU c3/t2a, best-of-3:
 
 Within VM variance of §2.8 (x86 loose P64 1.87–1.90×). Moon wins at pipeline depth, loses p=1 (TCP-RTT bound). No regression.
 
+### 2.10 2026-07-03 p=1 single-op WIN — `--io-busy-poll-us` poll-mode park (branch `perf/v3-3-p1-hotpath`, `6178a71`)
+
+The historical "loses p=1" rows (§2.7–2.9 P1 columns, 0.77–0.83×) are **superseded when busy-poll is
+enabled**. Root cause of the p=1 deficit was attributed by perf tracepoints on GCE: both engines
+sleep+wake the server thread on every non-pipelined op; Redis's 3-syscall epoll loop rode that path
+slightly cheaper than Moon's drivers (io_uring's 2 enters cost more than 3 light syscalls on GCE;
+Moon-epoll paid 4 syscalls/op from a speculative-read EAGAIN). `--io-busy-poll-us <µs>` removes the
+sleep entirely: the shard thread busy-loops zero-timeout readiness polls for the budget before
+blocking (vendored-monoio LegacyDriver patch; flag forces the epoll driver). Redis keeps paying the
+wake on every op — the win is structural, not a tuning delta.
+
+**Same-instance A/B (Moon-spin vs Moon-tuned-uring vs Redis 8.x control), GCE dedicated 4-vCPU,
+pinned disjoint cores, steal-gated, fresh-server best-of-5, loopback c=1 P=1, spin=40µs, n=3
+instances per arch:**
+
+| arch | cmd | Moon busy-poll | Redis | ratio (3 instances) |
+|------|-----|:---:|:---:|:---:|
+| **ARM c4a Axion** | SET | ~75.3k ops/s (13.3µs/op) | ~63.0k (15.9µs/op) | **1.193 / 1.196 / 1.198** |
+| **ARM c4a Axion** | GET | ~77.2k ops/s (12.9µs/op) | ~63.9k (15.6µs/op) | **1.206 / 1.205 / 1.212** |
+| **x86 c3 Intel**  | SET | ~62.0k ops/s (16.1µs/op) | ~37.4k (26.7µs/op) | **1.657 / 1.663 / 1.647** |
+| **x86 c3 Intel**  | GET | ~63.2k ops/s (15.8µs/op) | ~38.2k (26.2µs/op) | **1.657 / 1.656 / 1.646** |
+
+Sub-1% ratio spread across instances on both arches. Without busy-poll, Moon's best p=1 stance is
+`--io-driver epoll`: 0.95× ARM / 1.06× x86 (same-instance A/Bs, 2026-07-03).
+
+Multi-client (pinned-core VM probe): busy-poll also wins c=8 (+6.5%) and c=64 (+27.6%, p50 159→87µs)
+— under load the loop rarely parks, so the spin only fires where it helps. Idle cost: ~3% of a core
+(vs 1% stock) at the 40µs budget against 1ms timer parks.
+
+**Caveats:** (1) judge busy-poll ONLY on pinned/dedicated cores — on unpinned shared-core hosts
+(laptops, OrbStack defaults) the spinning thread displaces its own client and shows as a regression;
+(2) claim scope is shards=1, loopback; (3) io_uring cannot busy-poll this way (CQE posting requires
+owner-task participation — DEFER_TASKRUN, TWA_SIGNAL, and SQPOLL variants all measured worse;
+experiment ledger in `tmp/KV-FULLPROOF.md` Round 2).
+
 ---
 
 ## 3. Memory Efficiency
@@ -498,6 +535,68 @@ mirrors x86 (SET p=64 1.96×/1.86× at s1/s12; GET p=128 2.74×/2.42×). **Guida
 non-pipelined workloads; add shards only for pipelined / AOF / hash-tag-co-located workloads.** `MSET`
 degrades with shard count (0.93×→0.61× as 1→12) as its keys scatter cross-shard — `{hash-tag}` co-location
 restores it. Detail: `docs/reviews/2026-06-17/WIDER-BENCH.md`.
+
+> **Clarification (2026-07-02 KV deep review).** The **0.46–0.51×** p=1 figure above is from `bench-production.sh`, which changes three things at once *besides* shard count: distributed keys (`-r`, real cross-shard scatter — vs `bench-compare.sh`'s single hot `__rand_key__`), larger values (512B–4KB), and higher client counts (`-c 100/200` on the INCR rows). It is a **throughput artifact of {distributed keys × high concurrency × value size × multi-key scatter}, not a clean shard-count signal** — the cross-shard hop itself is ~10µs (v2-2 bare-metal), ~2% of the ~460µs p=1 baseline. The controlled `bench-compare.sh` sweep in the table above (only shard count varies) is **flat at p=1** (0.79→0.82×). Read 0.46× as "production-shaped multi-key under concurrency," not "the cross-shard hop costs 2×."
+
+### 6.5 2026-07-03 shards × busy-poll sweep (`--measure-shards`, build `74de849`)
+
+Same-instance rigor (pinned, steal-gated, fresh-server best-of-3, strict `-r 1M` keyspace so
+shards=4 really scatters), `c4a-standard-8` + `c3-standard-8`: Moon shards {1, 4} × `--io-busy-poll-us`
+{0, 40} vs one canonical single-threaded Redis; shards on cores 0–3, 3-thread client on 5–7.
+Ratio = Moon/Redis:
+
+| cell (cmd ≈ SET/GET) | ARM stock | ARM spin40 | x86 stock | x86 spin40 |
+|---|:---:|:---:|:---:|:---:|
+| **s1 c1 P1** (single-op latency) | 1.02 | **1.21 / 1.25** | 1.06 | **1.42 / 1.43** |
+| **s4 c1 P1** (cross-shard hop) | 0.70 | 0.85 / 0.88 | 0.64 | 0.88 / 0.91 |
+| **s4 c8 P1** (scattered, no pipeline) | 0.44 | 0.50 / 0.58 | 0.41 / 0.45 | 0.64 / 0.56 |
+| **s4 c8 P16 SET** (Redis server-bound) | **≥2.0×** | **≥2.0×** | ~1.0 (capped) | **≥2.0×** |
+
+Readings:
+- **The §2.10 busy-poll p=1 win replicates on the 8-vCPU shape** (5th ARM + 4th x86 instance).
+- **Busy-poll recovers a large fraction of the cross-shard hop** (the target shard normally sleeps;
+  spin removes that wake): s4 single-conn improves +22% ARM / +38–42% x86 — but shards=4 still
+  **loses** every non-pipelined cell. The SPSC dispatch cost dominates once keys scatter.
+- **Guidance unchanged, now sharper:** `--shards 1 --io-busy-poll-us 40` is the p=1 configuration
+  that beats Redis outright; add shards only for pipelined / AOF / hash-tag-co-located workloads.
+- ⚠ **Deep-pipeline cells (P16/P64) on this co-located pinned topology are mostly client-saturated**
+  — both engines plateau at ~1.2M ops/s with identical durations (the 3-thread pinned client is the
+  bottleneck), so their ≈1.00 "ties" are ceilings, not measurements. Readable exceptions: Redis SET
+  P16 is server-bound at ~599k (Moon ≥2.0× there, understated), and x86 s4 spin P64 SET burst past
+  the plateau to 1.74M (1.46×). For whole-machine peak throughput, §2.8/§6.4's methodology (client
+  gets the full core budget) remains the reference.
+- ⚠ **SUPERSEDED for c≥8 by §6.6:** the s4 c8 P1 collapse in this table was a reply-spin convoy
+  bug, fixed on `perf/v3-3-p1-hotpath`. Multi-shard now **wins** every multi-connection cell.
+
+### 6.6 2026-07-04 multi-connection WIN — convoy fix + slot-unified replies (branch `perf/v3-3-p1-hotpath`, `fd13f03`)
+
+The §6.5 s4-c8 collapse (0.44–0.64×) was diagnosed as a **reply-spin convoy**: the cross-shard
+reply busy-poll ran synchronously on the shard thread with a gate that admitted two waiters, so
+at 2 conns/shard a spinning connection starved both its sibling and the shard's own SPSC drain
+(circular cross-shard stall). Fix chain, each same-instance A/B-validated on GCE:
+solo-conn spin gate (`795c4f0`, c8 P1 **2.75×** vs pre-fix) → monoio reply path unified on the
+zero-allocation `ResponseSlotPool` (`fd13f03`, c8 P1 **+11–14%** on top). Ratio = Moon/Redis,
+s4, P1, busy-poll 40, 4-thread pinned client, best-of-5 × 500k requests, n=2 instances on x86:
+
+| cell | ARM c4a-standard-8 | x86 c3-standard-8 |
+|---|:---:|:---:|
+| **c8 GET / SET** | **1.57× / 1.71×** | **1.9× / 2.0×** (same-instance; **≥1.6×** vs Redis's best client config) |
+| **c64 GET / SET** | **2.50×** | **2.50×** (same-instance; ≥1.86× best-vs-best) |
+| c1 (structural ceiling = s1 latency) | 0.93–0.96 | 0.91–0.94 |
+
+Readings:
+- **Guidance updated:** `--shards 1` remains best for 1–4 unpipelined connections, but from
+  **8 concurrent connections up, `--shards 4` beats Redis 1.5–2.5×** even without pipelining.
+  The pipeline moat (§6.5, §7) is unchanged. See `docs/guides/tuning.md`.
+- s4 c1 P1 is **hop-bound, not fixable by tuning**: a perfect message-passing multi-shard equals
+  s1 latency (its ceiling is §2.10's s1 ratio). Executing foreign reads locally (shared-read data
+  plane) is the only lever; deferred as future work.
+- ⚠ **Instrument notes:** raw files `tmp/hp-{c4a,c3}-l3b-ab.txt`, `tmp/hp-c3-l3b-ab2.txt`,
+  `tmp/redis-threads-control.txt`. redis-benchmark `--threads 4` lowers *Redis's* x86 c8/c64
+  readings 15–20% vs `--threads 3` (Moon is thread-insensitive; ARM unaffected) — the x86 row
+  therefore also states the conservative ratio against Redis's best client config. Unpipelined
+  c64 readings quantize to attractors (333,333 / 500,000 = requests ÷ ms-quantized duration);
+  values are best-of-5 per cell.
 
 ---
 

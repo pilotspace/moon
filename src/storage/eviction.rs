@@ -23,6 +23,74 @@ use crate::storage::tiered::spill_thread::SpillRequest;
 /// the user-tunable `maxmemory-samples` (Redis default 5; we accept up to 16).
 const MAX_VICTIM_SAMPLES: usize = 16;
 
+/// Lock-free mirrors of `RuntimeConfig::{maxmemory, maxmemory_per_shard()}`
+/// for the inline write fast path, which previously paid a
+/// `parking_lot::RwLock` read pair per SET just to discover eviction had
+/// nothing to do. `usize::MAX` = not yet published — fail safe: callers must
+/// take the config lock and run the full path.
+static MAXMEMORY_HINT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(usize::MAX);
+static MAXMEMORY_PER_SHARD_HINT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(usize::MAX);
+
+/// Publish the maxmemory hints. MUST be called wherever `maxmemory` (or the
+/// shard count it is divided by) changes: server startup after the resolved
+/// `num_shards` is written, and `CONFIG SET maxmemory`. A missed publish is
+/// safe-but-slow for lowered limits only if stale-high — so this is kept to
+/// a single helper to make the write sites greppable.
+pub fn publish_maxmemory_hints(config: &RuntimeConfig) {
+    MAXMEMORY_PER_SHARD_HINT.store(
+        config.maxmemory_per_shard(),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    MAXMEMORY_HINT.store(config.maxmemory, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Lock-free pre-gate for the inline write path: `true` iff the slow path
+/// (`try_evict_if_needed_*`) would PROVABLY no-op, i.e. `maxmemory == 0` or
+/// `estimated_memory <= budget` with the budget computed exactly as the slow
+/// path does (`elastic_budget.min(maxmemory)`, else per-shard split). Any
+/// uncertainty (unpublished hints) returns `false` → caller takes the lock
+/// and runs the existing full path. Hint staleness is bounded by the same
+/// one-write-behind window the 100ms elastic-budget tick already accepts.
+#[inline]
+pub fn inline_write_can_skip_eviction(estimated_memory: usize, elastic_budget: usize) -> bool {
+    can_skip_eviction(
+        MAXMEMORY_HINT.load(std::sync::atomic::Ordering::Relaxed),
+        MAXMEMORY_PER_SHARD_HINT.load(std::sync::atomic::Ordering::Relaxed),
+        estimated_memory,
+        elastic_budget,
+    )
+}
+
+/// Pure decision core of [`inline_write_can_skip_eviction`], separated from
+/// the process-global hint statics so it can be tested deterministically
+/// (the statics race with `CONFIG SET maxmemory` tests in the parallel
+/// test binary). `usize::MAX` in either hint = unpublished → fail safe.
+#[inline]
+fn can_skip_eviction(
+    mm: usize,
+    per_shard: usize,
+    estimated_memory: usize,
+    elastic_budget: usize,
+) -> bool {
+    if mm == usize::MAX {
+        return false; // unpublished — fail safe
+    }
+    if mm == 0 {
+        return true; // unlimited: slow path early-returns
+    }
+    let budget = if elastic_budget > 0 {
+        elastic_budget.min(mm)
+    } else {
+        if per_shard == usize::MAX {
+            return false;
+        }
+        per_shard
+    };
+    estimated_memory <= budget
+}
+
 /// Reservoir-sample up to `samples` random keys from the database without
 /// materializing the entire keyspace.
 ///
@@ -1351,5 +1419,48 @@ mod tests {
         std::fs::write(data.join("heap-notanum.mpf"), b"x").unwrap();
         std::fs::write(data.join("base-000999.rdb"), b"x").unwrap();
         assert_eq!(next_spill_file_id_seed(Some(tmp.path())), 514);
+    }
+
+    /// The lock-free inline-write pre-gate must skip the runtime-config lock
+    /// ONLY when the slow path (`try_evict_if_needed_*`, no-op iff
+    /// `total <= budget`) would provably do nothing. Tests the pure decision
+    /// core — the public wrapper only adds two Relaxed loads of the
+    /// process-global hints, which race with `CONFIG SET maxmemory` tests in
+    /// the parallel test binary and are therefore not asserted on here.
+    #[test]
+    fn test_inline_write_can_skip_eviction_gate() {
+        const UNPUB: usize = usize::MAX;
+
+        // Unpublished sentinel (either hint needed) → fail safe: slow path.
+        assert!(!can_skip_eviction(UNPUB, UNPUB, 0, 0));
+        assert!(!can_skip_eviction(UNPUB, 1000, 0, 0));
+        assert!(!can_skip_eviction(1000, UNPUB, 0, 0)); // per-shard needed, missing
+
+        // maxmemory == 0 (unlimited): slow path early-returns → provable skip,
+        // even if the per-shard hint is missing.
+        assert!(can_skip_eviction(0, UNPUB, usize::MAX, 0));
+
+        // maxmemory 1000, per-shard 1000 (1 shard), no elastic budget:
+        // skip iff est <= 1000 (slow-path loop condition is `total > budget`).
+        assert!(can_skip_eviction(1000, 1000, 1000, 0));
+        assert!(!can_skip_eviction(1000, 1000, 1001, 0));
+
+        // Elastic budget overrides per-shard, capped at instance maxmemory —
+        // mirror of `budget_override.min(config.maxmemory)` in the slow path.
+        // (per-shard hint irrelevant when elastic > 0, even unpublished.)
+        assert!(can_skip_eviction(1000, UNPUB, 700, 800));
+        assert!(!can_skip_eviction(1000, UNPUB, 900, 800));
+        assert!(can_skip_eviction(1000, UNPUB, 999, 1500)); // cap: min(1500,1000)
+        assert!(!can_skip_eviction(1000, UNPUB, 1400, 1500));
+
+        // Multi-shard: per-shard budget = ceil(maxmemory / num_shards), as
+        // published from `maxmemory_per_shard()` (its rounding has its own
+        // tests in config.rs). 1000 across 4 shards → 250.
+        let mut rt = RuntimeConfig::default();
+        rt.maxmemory = 1000;
+        rt.num_shards = 4;
+        let per_shard = rt.maxmemory_per_shard();
+        assert!(can_skip_eviction(1000, per_shard, 250, 0));
+        assert!(!can_skip_eviction(1000, per_shard, 251, 0));
     }
 }

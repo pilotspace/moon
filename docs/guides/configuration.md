@@ -30,7 +30,7 @@ Moon is configured through command-line flags and an optional Redis-style config
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--appendonly` | `no` | Enable append-only file persistence (`yes`/`no`) |
+| `--appendonly` | `yes` | Enable append-only file persistence (`yes`/`no`) — Moon is durable by default |
 | `--appendfsync` | `everysec` | AOF fsync policy: `always`, `everysec`, or `no` |
 | `--appendfilename` | `appendonly.aof` | AOF filename |
 | `--save` | *(none)* | RDB auto-save rules (e.g., `"3600 1 300 100"`) |

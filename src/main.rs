@@ -803,6 +803,28 @@ fn main() -> anyhow::Result<()> {
         std::sync::Arc::new(std::sync::RwLock::new(table))
     };
 
+    // I/O driver selection — must land BEFORE any shard thread spawns so
+    // every monoio runtime observes it (clap restricts values to auto|epoll).
+    if config.io_driver == "epoll" {
+        moon::runtime::force_legacy_driver();
+        tracing::info!("I/O driver: legacy poller (epoll/kqueue) forced via --io-driver epoll");
+    }
+    if config.io_busy_poll_us > 0 {
+        // Busy-poll parks only exist in the legacy (readiness) driver: io_uring
+        // CQEs are not observable from userspace without task participation.
+        moon::runtime::force_legacy_driver();
+        #[cfg(feature = "runtime-monoio")]
+        {
+            monoio::set_legacy_spin_budget_us(config.io_busy_poll_us);
+            tracing::info!(
+                "I/O busy-poll: {}µs readiness spin before park (epoll/kqueue driver forced)",
+                config.io_busy_poll_us
+            );
+        }
+        #[cfg(not(feature = "runtime-monoio"))]
+        tracing::warn!("--io-busy-poll-us has no effect under the tokio runtime");
+    }
+
     // Build shared runtime config for sharded handlers
     let runtime_config_shared: std::sync::Arc<parking_lot::RwLock<moon::config::RuntimeConfig>> =
         { std::sync::Arc::new(parking_lot::RwLock::new(config.to_runtime_config())) };
@@ -810,6 +832,10 @@ fn main() -> anyhow::Result<()> {
     // whole-instance cap (per-shard budget = maxmemory / num_shards). Without
     // this, each shard would tolerate the full maxmemory → ~N× aggregate RSS.
     runtime_config_shared.write().num_shards = num_shards;
+    // Publish the lock-free maxmemory hints AFTER num_shards is resolved (the
+    // per-shard hint divides by it) — the inline write path's eviction
+    // pre-gate reads these instead of taking the runtime-config lock.
+    moon::storage::eviction::publish_maxmemory_hints(&runtime_config_shared.read());
     moon::config::log_maxmemory_sharding(runtime_config_shared.read().maxmemory, num_shards);
     let server_config_shared: std::sync::Arc<moon::config::ServerConfig> =
         { std::sync::Arc::new(config.clone()) };

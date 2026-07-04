@@ -247,6 +247,13 @@ both MSET mk1 "val1" mk2 "val2" mk3 "val3"
 assert_both "MGET 3 keys" MGET mk1 mk2 mk3
 assert_both "MGET with missing" MGET mk1 nonexistent mk3
 
+# MSETNX: hash-tagged ({mn}) so all keys co-locate on one shard -> atomic under
+# Moon's 1/4/12 shard configs (cross-shard MSETNX is rejected CROSSSLOT by design).
+assert_both "MSETNX all new" MSETNX "{mn}k1" "v1" "{mn}k2" "v2"
+assert_both "MGET after MSETNX" MGET "{mn}k1" "{mn}k2"
+assert_both "MSETNX one exists (0)" MSETNX "{mn}k2" "new2" "{mn}k3" "v3"
+assert_both "MSETNX no partial write" GET "{mn}k3"
+
 # ===========================================================================
 # 4. SET with options (EX, PX, NX, XX, KEEPTTL, GET)
 # ===========================================================================

@@ -177,11 +177,13 @@ pub struct ServerConfig {
 
     /// Number of shards (0 = auto-detect from CPU count).
     ///
-    /// Defaults to 1: single-shard gives the best throughput for
-    /// non-pipelined workloads (cross-shard SPSC dispatch dominates local
-    /// lookups otherwise) and a deterministic persistence layout across
-    /// hosts. Pass `--shards 0` to auto-detect from the CPU count, or pin
-    /// an explicit count for pipelined/AOF-heavy multi-core deployments.
+    /// Defaults to 1: single-shard gives the best per-op latency for
+    /// low-concurrency, non-pipelined workloads (a cross-shard hop costs
+    /// ~10µs) and a deterministic persistence layout across hosts. Pin an
+    /// explicit count (e.g. 4) for 8+ concurrent connections or pipelined
+    /// traffic — measured 1.3-1.9x Redis at 8-64 conns on 4 shards — or
+    /// pass `--shards 0` to auto-detect on a dedicated host. See
+    /// docs/guides/tuning.md.
     #[arg(long, default_value_t = 1)]
     pub shards: usize,
 
@@ -257,6 +259,25 @@ pub struct ServerConfig {
     /// gracefully if unprivileged. Linux-only; ignored on other platforms.
     #[arg(long = "uring-sqpoll")]
     pub uring_sqpoll_ms: Option<u32>,
+
+    /// I/O driver for the monoio runtime. "auto" lets FusionDriver pick
+    /// (io_uring on Linux when available, else epoll/kqueue); "epoll" forces
+    /// the legacy poller. Measured on GCE ARM (c4a Axion, 2026-07): epoll is
+    /// 2-4% faster than io_uring across ALL pipeline depths for KV workloads,
+    /// while other platforms (e.g. OrbStack aarch64) favor io_uring — bench
+    /// per platform. Equivalent env kill-switch: MOON_NO_URING=1.
+    #[arg(long = "io-driver", default_value = "auto", value_parser = ["auto", "epoll"])]
+    pub io_driver: String,
+
+    /// Busy-poll the shard event loop for N microseconds before sleeping
+    /// (0 = disabled). Implies `--io-driver epoll`. Poll-mode park: the shard
+    /// thread spins on readiness (zero-timeout polls) instead of blocking, so
+    /// the scheduler sleep+wake disappears from the request path. Best for
+    /// low-pipeline request/response workloads on dedicated cores; costs up to
+    /// ~N µs of CPU per idle park. Measured (GCE c1 GET p=1, 2026-07):
+    /// ARM c4a 0.95→1.21× vs Redis, x86 c3 1.06→1.66×. monoio runtime only.
+    #[arg(long = "io-busy-poll-us", default_value_t = 0)]
+    pub io_busy_poll_us: u64,
 
     // ── MoonStore v2: Disk Offload ──────────────────────────────────
     /// Enable disk offload (tiered storage: RAM -> mmap -> NVMe)
@@ -1165,6 +1186,25 @@ mod tests {
     fn test_shards_zero_is_explicit_auto_detect() {
         let config = ServerConfig::parse_from(["moon", "--shards", "0"]);
         assert_eq!(config.shards, 0);
+    }
+
+    #[test]
+    fn test_io_driver_flag_parses_and_rejects_unknown() {
+        let config = ServerConfig::parse_from::<[&str; 0], &str>([]);
+        assert_eq!(config.io_driver, "auto", "auto must stay the default");
+        let config = ServerConfig::parse_from(["moon", "--io-driver", "epoll"]);
+        assert_eq!(config.io_driver, "epoll");
+        // clap-level validation: anything outside auto|epoll is a parse error.
+        assert!(ServerConfig::try_parse_from(["moon", "--io-driver", "iouring"]).is_err());
+    }
+
+    #[test]
+    fn test_io_busy_poll_flag_parses_with_zero_default() {
+        let config = ServerConfig::parse_from::<[&str; 0], &str>([]);
+        assert_eq!(config.io_busy_poll_us, 0, "busy-poll must default OFF");
+        let config = ServerConfig::parse_from(["moon", "--io-busy-poll-us", "40"]);
+        assert_eq!(config.io_busy_poll_us, 40);
+        assert!(ServerConfig::try_parse_from(["moon", "--io-busy-poll-us", "x"]).is_err());
     }
 
     #[test]

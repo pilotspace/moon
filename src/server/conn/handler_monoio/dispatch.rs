@@ -835,6 +835,7 @@ pub(super) fn try_handle_client_admin(
                             in_multi: conn.in_multi,
                             blocked: false,
                         },
+                        crate::storage::entry::current_time_ms(),
                     );
                 });
                 let list = crate::client_registry::client_list();
@@ -852,6 +853,7 @@ pub(super) fn try_handle_client_admin(
                             in_multi: conn.in_multi,
                             blocked: false,
                         },
+                        crate::storage::entry::current_time_ms(),
                     );
                 });
                 let info = crate::client_registry::client_info(client_id).unwrap_or_default();
@@ -1286,6 +1288,8 @@ pub(super) async fn try_handle_cross_shard_commands(
             &ctx.dispatch_tx,
             &ctx.spsc_notifiers,
             &ctx.cached_clock,
+            ctx.aof_pool.as_ref(),
+            &ctx.repl_state,
             &(), // monoio: coordinator uses oneshot, not response_pool
         )
         .await;

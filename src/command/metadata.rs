@@ -142,6 +142,7 @@ pub static COMMAND_META: phf::Map<&'static str, CommandMeta> = phf_map! {
     "SET" => CommandMeta { name: "SET", arity: -3, flags: WF, first_key: 1, last_key: 1, step: 1, acl_categories: STR },
     "MGET" => CommandMeta { name: "MGET", arity: -2, flags: RF, first_key: 1, last_key: -1, step: 1, acl_categories: STR },
     "MSET" => CommandMeta { name: "MSET", arity: -3, flags: WF, first_key: 1, last_key: -1, step: 2, acl_categories: STR },
+    "MSETNX" => CommandMeta { name: "MSETNX", arity: -3, flags: WF, first_key: 1, last_key: -1, step: 2, acl_categories: STR },
     "SETNX" => CommandMeta { name: "SETNX", arity: 3, flags: WF, first_key: 1, last_key: 1, step: 1, acl_categories: STR },
     "SETEX" => CommandMeta { name: "SETEX", arity: 4, flags: WF, first_key: 1, last_key: 1, step: 1, acl_categories: STR },
     "PSETEX" => CommandMeta { name: "PSETEX", arity: 4, flags: WF, first_key: 1, last_key: 1, step: 1, acl_categories: STR },

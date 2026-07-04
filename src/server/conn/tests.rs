@@ -60,6 +60,64 @@ fn test_inline_get_hit() {
     assert_eq!(&write_buf[..], b"$3\r\nbar\r\n");
 }
 
+/// Byte-parity guard for the inline GET hit across the `CompactValue` SSO
+/// boundary (12B inline / 13B heap) and up to a large value. The reply must be
+/// exactly `$<len>\r\n<bytes>\r\n` for every size — this pins the response
+/// framing so the no-copy refactor (writing the value straight from the borrow
+/// into `write_buf` instead of via an intermediate `Vec`) cannot change a byte.
+#[test]
+fn test_inline_get_hit_byte_parity_sizes() {
+    for &size in &[0usize, 1, 12, 13, 65536] {
+        let dbs = make_dbs();
+        let value: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+        crate::shard::slice::with_shard_db(0, |db| {
+            db.set(
+                Bytes::from_static(b"k"),
+                Entry::new_string(Bytes::from(value.clone())),
+            );
+        });
+        let mut read_buf = BytesMut::from(&b"*2\r\n$3\r\nGET\r\n$1\r\nk\r\n"[..]);
+        let mut write_buf = BytesMut::new();
+        let aof_pool: Option<std::sync::Arc<crate::persistence::aof::AofWriterPool>> = None;
+        let rt_config = make_rt_config();
+
+        let result = try_inline_dispatch(
+            &mut read_buf,
+            &mut write_buf,
+            &dbs,
+            0,
+            0,
+            &aof_pool,
+            &None,
+            0,
+            1,
+            false,
+            &rt_config,
+        );
+
+        let mut expected = Vec::new();
+        expected.extend_from_slice(b"$");
+        expected.extend_from_slice(size.to_string().as_bytes());
+        expected.extend_from_slice(b"\r\n");
+        expected.extend_from_slice(&value);
+        expected.extend_from_slice(b"\r\n");
+
+        assert_eq!(
+            result, 1,
+            "size {size}: expected exactly one command inlined"
+        );
+        assert!(
+            read_buf.is_empty(),
+            "size {size}: read_buf not fully consumed"
+        );
+        assert_eq!(
+            &write_buf[..],
+            &expected[..],
+            "size {size}: reply byte mismatch"
+        );
+    }
+}
+
 #[test]
 fn test_inline_get_miss() {
     let dbs = make_dbs();

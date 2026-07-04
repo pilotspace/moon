@@ -709,17 +709,22 @@ pub(crate) fn handle_shard_message_shared(
                     };
 
                     if is_write && !matches!(frame, crate::protocol::Frame::Error(_)) {
-                        let serialized = aof::serialize_command(cmd_frame);
-                        wal_append_and_fanout(
-                            &serialized,
-                            wal_writer,
-                            wal_v3_writer,
-                            repl_backlog,
-                            replica_txs,
-                            repl_state,
-                            shard_id,
-                            aof_pool, // FIX-W1-2
-                        );
+                        // Skip the serialization alloc when the fanout would
+                        // no-op (persistence + replication all off) — it was
+                        // pure waste on every cross-shard write.
+                        if wal_fanout_has_work(wal_writer, wal_v3_writer, replica_txs, aof_pool) {
+                            let serialized = aof::serialize_command(cmd_frame);
+                            wal_append_and_fanout(
+                                &serialized,
+                                wal_writer,
+                                wal_v3_writer,
+                                repl_backlog,
+                                replica_txs,
+                                repl_state,
+                                shard_id,
+                                aof_pool, // FIX-W1-2
+                            );
+                        }
 
                         let needs_wake = cmd.eq_ignore_ascii_case(b"LPUSH")
                             || cmd.eq_ignore_ascii_case(b"RPUSH")
@@ -798,27 +803,31 @@ pub(crate) fn handle_shard_message_shared(
                     };
 
                     if is_write && !matches!(frame, crate::protocol::Frame::Error(_)) {
-                        let serialized = aof::serialize_command(cmd_frame);
-                        wal_append_and_fanout(
-                            &serialized,
-                            wal_writer,
-                            wal_v3_writer,
-                            repl_backlog,
-                            replica_txs,
-                            repl_state,
-                            shard_id,
-                            // C4-FOLD-FIX: AOF append MUST happen here (in the SPSC arm,
-                            // before the response is sent) so the append is already in the
-                            // AOF channel when AofFold reads sender.len(). Moving the append
-                            // to the connection handler (after awaiting the response) defers
-                            // it until AFTER drain_spsc_shared returns, so AofFold's
-                            // pending_aof_count undercount by ≥1 and that append escapes
-                            // into the NEW incr → double-apply on restart (+1 after
-                            // restart observed in test_ssm4a_fold_4shard_experimental).
-                            // The handler_monoio cross-shard AOF write is removed to avoid
-                            // the double-write that was the original reason for None.
-                            aof_pool, // FIX-C4-FOLD
-                        );
+                        // See `wal_fanout_has_work` — skip the serialization alloc
+                        // entirely when the fanout would no-op (persistence off).
+                        if wal_fanout_has_work(wal_writer, wal_v3_writer, replica_txs, aof_pool) {
+                            let serialized = aof::serialize_command(cmd_frame);
+                            wal_append_and_fanout(
+                                &serialized,
+                                wal_writer,
+                                wal_v3_writer,
+                                repl_backlog,
+                                replica_txs,
+                                repl_state,
+                                shard_id,
+                                // C4-FOLD-FIX: AOF append MUST happen here (in the SPSC arm,
+                                // before the response is sent) so the append is already in the
+                                // AOF channel when AofFold reads sender.len(). Moving the append
+                                // to the connection handler (after awaiting the response) defers
+                                // it until AFTER drain_spsc_shared returns, so AofFold's
+                                // pending_aof_count undercount by ≥1 and that append escapes
+                                // into the NEW incr → double-apply on restart (+1 after
+                                // restart observed in test_ssm4a_fold_4shard_experimental).
+                                // The handler_monoio cross-shard AOF write is removed to avoid
+                                // the double-write that was the original reason for None.
+                                aof_pool, // FIX-C4-FOLD
+                            );
+                        }
                     }
 
                     // Auto-index: if HSET succeeded, check for vector index match.
@@ -891,9 +900,8 @@ pub(crate) fn handle_shard_message_shared(
             let (cmd, args) = match extract_command_static(&command) {
                 Some(pair) => pair,
                 None => {
-                    // SAFETY: response_slot points to a valid ResponseSlot owned by the
-                    // connection's ResponseSlotPool, which outlives all dispatched messages.
-                    let slot = unsafe { &*response_slot.0 };
+                    // Arc-owned slot: deref is safe, refcount keeps it alive.
+                    let slot = &*response_slot.0;
                     slot.fill(vec![crate::protocol::Frame::Error(
                         bytes::Bytes::from_static(b"ERR invalid command format"),
                     )]);
@@ -972,8 +980,8 @@ pub(crate) fn handle_shard_message_shared(
                         frame
                     })
                 };
-                // SAFETY: response_slot points to a valid ResponseSlot (see above).
-                let slot = unsafe { &*response_slot.0 };
+                // Arc-owned slot: deref is safe, refcount keeps it alive.
+                let slot = &*response_slot.0;
                 slot.fill(vec![frame]);
             }
         }
@@ -1011,17 +1019,22 @@ pub(crate) fn handle_shard_message_shared(
                     };
 
                     if is_write && !matches!(frame, crate::protocol::Frame::Error(_)) {
-                        let serialized = aof::serialize_command(cmd_frame);
-                        wal_append_and_fanout(
-                            &serialized,
-                            wal_writer,
-                            wal_v3_writer,
-                            repl_backlog,
-                            replica_txs,
-                            repl_state,
-                            shard_id,
-                            aof_pool, // FIX-W1-2
-                        );
+                        // Skip the serialization alloc when the fanout would
+                        // no-op (persistence + replication all off) — it was
+                        // pure waste on every cross-shard write.
+                        if wal_fanout_has_work(wal_writer, wal_v3_writer, replica_txs, aof_pool) {
+                            let serialized = aof::serialize_command(cmd_frame);
+                            wal_append_and_fanout(
+                                &serialized,
+                                wal_writer,
+                                wal_v3_writer,
+                                repl_backlog,
+                                replica_txs,
+                                repl_state,
+                                shard_id,
+                                aof_pool, // FIX-W1-2
+                            );
+                        }
 
                         let needs_wake = cmd.eq_ignore_ascii_case(b"LPUSH")
                             || cmd.eq_ignore_ascii_case(b"RPUSH")
@@ -1061,8 +1074,8 @@ pub(crate) fn handle_shard_message_shared(
                     results.push(frame);
                 }
             });
-            // SAFETY: response_slot points to a valid ResponseSlot (see ExecuteSlotted).
-            let slot = unsafe { &*response_slot.0 };
+            // Arc-owned slot: deref is safe, refcount keeps it alive.
+            let slot = &*response_slot.0;
             slot.fill(results);
         }
         ShardMessage::PipelineBatchSlotted {
@@ -1101,28 +1114,32 @@ pub(crate) fn handle_shard_message_shared(
                     };
 
                     if is_write && !matches!(frame, crate::protocol::Frame::Error(_)) {
-                        let serialized = aof::serialize_command(cmd_frame);
-                        wal_append_and_fanout(
-                            &serialized,
-                            wal_writer,
-                            wal_v3_writer,
-                            repl_backlog,
-                            replica_txs,
-                            repl_state,
-                            shard_id,
-                            // C4-FOLD-FIX: AOF append MUST happen here, before the
-                            // response_slot is filled, so the append is already in the
-                            // AOF channel when AofFold reads sender.len(). Deferring to
-                            // the connection handler (after slot.fill wakes the handler
-                            // task) means the append arrives AFTER drain_spsc_shared
-                            // returns and AFTER AofFold's sender.len() snapshot, so
-                            // pending_aof_count undercounts by ≥1 → that append escapes
-                            // into the NEW incr → double-apply on restart (+1 observed
-                            // in test_ssm4a_fold_4shard_experimental). The handler's
-                            // cross-shard AOF write (handler_sharded/mod.rs) is removed
-                            // to avoid the double-write this None guard was preventing.
-                            aof_pool, // FIX-C4-FOLD
-                        );
+                        // See `wal_fanout_has_work` — skip the serialization alloc
+                        // entirely when the fanout would no-op (persistence off).
+                        if wal_fanout_has_work(wal_writer, wal_v3_writer, replica_txs, aof_pool) {
+                            let serialized = aof::serialize_command(cmd_frame);
+                            wal_append_and_fanout(
+                                &serialized,
+                                wal_writer,
+                                wal_v3_writer,
+                                repl_backlog,
+                                replica_txs,
+                                repl_state,
+                                shard_id,
+                                // C4-FOLD-FIX: AOF append MUST happen here, before the
+                                // response_slot is filled, so the append is already in the
+                                // AOF channel when AofFold reads sender.len(). Deferring to
+                                // the connection handler (after slot.fill wakes the handler
+                                // task) means the append arrives AFTER drain_spsc_shared
+                                // returns and AFTER AofFold's sender.len() snapshot, so
+                                // pending_aof_count undercounts by ≥1 → that append escapes
+                                // into the NEW incr → double-apply on restart (+1 observed
+                                // in test_ssm4a_fold_4shard_experimental). The handler's
+                                // cross-shard AOF write (handler_sharded/mod.rs) is removed
+                                // to avoid the double-write this None guard was preventing.
+                                aof_pool, // FIX-C4-FOLD
+                            );
+                        }
                     }
 
                     // Auto-index: if HSET succeeded, check for vector index match.
@@ -1182,8 +1199,8 @@ pub(crate) fn handle_shard_message_shared(
                     results.push(frame);
                 }
             });
-            // SAFETY: response_slot points to a valid ResponseSlot (see ExecuteSlotted).
-            let slot = unsafe { &*response_slot.0 };
+            // Arc-owned slot: deref is safe, refcount keeps it alive.
+            let slot = &*response_slot.0;
             slot.fill(results);
         }
         ShardMessage::PubSubPublish(payload) => {
@@ -2398,6 +2415,26 @@ pub(crate) fn cow_intercept(
 /// through the per-shard AOF pool. The SPSC drain is synchronous so we use
 /// `try_send_append` (fire-and-forget). The `appendfsync=always` rendezvous is
 /// handled by the connection handler (async context), not here.
+/// True when `wal_append_and_fanout` has any consumer for the serialized
+/// command (S3.5b criterion: WAL v2/v3, live replicas, or the AOF pool).
+/// ARM perf annotate showed the pre-S3.5b locks were ~21% of CPU on 8-shard
+/// SET p=64 with everything off; the criterion is fully derivable from the
+/// inputs — no flags or shared state. Skipping leaves shard_offset
+/// un-advanced, which is fine: with no WAL and no replicas the offsets are
+/// dead bytes (no consumer exists). Callers on the cross-shard write arms
+/// check THIS before `aof::serialize_command` so the serialization alloc +
+/// copy is also skipped when the fanout would no-op (it was pure waste on
+/// every cross-shard write with persistence off).
+#[inline]
+pub(crate) fn wal_fanout_has_work(
+    wal_writer: &Option<WalWriter>,
+    wal_v3_writer: &Option<WalWriterV3>,
+    replica_txs: &[(u64, channel::MpscSender<bytes::Bytes>)],
+    aof_pool: Option<&std::sync::Arc<crate::persistence::aof::AofWriterPool>>,
+) -> bool {
+    wal_writer.is_some() || wal_v3_writer.is_some() || !replica_txs.is_empty() || aof_pool.is_some()
+}
+
 pub(crate) fn wal_append_and_fanout(
     data: &[u8],
     wal_writer: &mut Option<WalWriter>,
@@ -2409,20 +2446,9 @@ pub(crate) fn wal_append_and_fanout(
     aof_pool: Option<&std::sync::Arc<crate::persistence::aof::AofWriterPool>>,
 ) {
     // S3.5b (2026-04-27): hot-path bypass when nothing actually has work.
-    // ARM perf annotate showed `repl_backlog.lock()` (caslb/casab) and
-    // `repl_state.read()` (RwLock CAS) were ~21% of CPU on 8-shard SET p=64
-    // even with `--appendonly no` and zero replicas connected. The criterion
-    // is fully derivable from the inputs — no flags or shared state needed.
-    // Skipping leaves shard_offset un-advanced; that is fine since with no
-    // WAL and no replicas the offsets are dead bytes (no consumer exists).
-    //
-    // FIX-W1-2: also require `aof_pool.is_none()` so that per-shard AOF
-    // entries are not skipped when WAL/replication are off but AOF is on.
-    if wal_writer.is_none()
-        && wal_v3_writer.is_none()
-        && replica_txs.is_empty()
-        && aof_pool.is_none()
-    {
+    // See `wal_fanout_has_work` — callers use the same predicate to skip the
+    // `aof::serialize_command` alloc entirely when the fanout would no-op.
+    if !wal_fanout_has_work(wal_writer, wal_v3_writer, replica_txs, aof_pool) {
         return;
     }
     // WAL v3 supersedes v2 — skip v2 append when v3 is active to avoid

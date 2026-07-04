@@ -25,6 +25,44 @@ pub mod channel;
 pub mod race;
 pub mod traits;
 
+/// Process-wide "force the epoll/kqueue LegacyDriver" switch for the monoio
+/// runtime, set ONCE from `--io-driver epoll` in main BEFORE any shard thread
+/// spawns (safe alternative to mutating `MOON_NO_URING` via unsafe `set_var`).
+/// Read by `MonoioRuntimeFactory::block_on_local` alongside the env var.
+static FORCE_LEGACY_DRIVER: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Request the legacy (epoll/kqueue) monoio driver for all shards. Must be
+/// called before shard threads spawn; later calls still apply to any runtime
+/// built afterwards but never to already-running shards.
+pub fn force_legacy_driver() {
+    FORCE_LEGACY_DRIVER.store(true, std::sync::atomic::Ordering::Release);
+}
+
+/// True when `--io-driver epoll` (or `MOON_NO_URING=1`) forces the legacy driver.
+pub fn legacy_driver_forced() -> bool {
+    FORCE_LEGACY_DRIVER.load(std::sync::atomic::Ordering::Acquire)
+        || std::env::var_os("MOON_NO_URING").is_some()
+}
+
+/// True when the epoll busy-poll park is configured — via the
+/// `--io-busy-poll-us` flag (the caller passes the config value) or the
+/// `MOON_EPOLL_SPIN_US` env fallback the vendored driver also honors. Gates
+/// the skip-notify hook registration in the shard event loop.
+pub fn epoll_spin_configured(flag_us: u64) -> bool {
+    if flag_us > 0 {
+        return true;
+    }
+    static ENV_SPIN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENV_SPIN.get_or_init(|| {
+        std::env::var("MOON_EPOLL_SPIN_US")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0)
+            > 0
+    })
+}
+
 /// Cooperatively relinquish to the shard event loop, letting co-located
 /// connections + the 1ms tick make progress, then resume.
 ///

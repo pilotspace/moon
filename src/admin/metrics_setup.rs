@@ -31,6 +31,11 @@ static CONNECTED_CLIENTS: AtomicU64 = AtomicU64::new(0);
 // per command — so plain (unsharded) atomics are fine here.
 static SPSC_NOTIFY_WAKES: AtomicU64 = AtomicU64::new(0);
 static SPSC_DRAIN_RENOTIFY: AtomicU64 = AtomicU64::new(0);
+// Busy-poll skip-notify: cross-shard notifies elided because the target
+// shard's driver advertised it is spin-polling (and will discover ringbuf
+// items via its own probe). Per-dispatch rate, but only on the cross-shard
+// path with busy-poll active — plain atomic is fine.
+static SPSC_NOTIFY_SKIPPED: AtomicU64 = AtomicU64::new(0);
 
 // ── ft-search-off-eventloop (C5): cooperative-yield observability ────────
 // Bumped once per cooperative yield taken by the FT.SEARCH local slice (the
@@ -81,6 +86,19 @@ pub fn bump_spsc_drain_renotify() {
 #[inline]
 pub fn spsc_drain_renotify() -> u64 {
     SPSC_DRAIN_RENOTIFY.load(Ordering::Relaxed)
+}
+
+/// Count a cross-shard notify elided because the target shard's busy-poll
+/// driver advertised it will discover the ringbuf push via its spin probe.
+#[inline]
+pub fn bump_spsc_notify_skipped() {
+    SPSC_NOTIFY_SKIPPED.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Total skip-wake-elided cross-shard notifies (for INFO Stats).
+#[inline]
+pub fn spsc_notify_skipped() -> u64 {
+    SPSC_NOTIFY_SKIPPED.load(Ordering::Relaxed)
 }
 
 // ── QW4 (2026-06 review finding 1.6): sharded total-commands counter ────
@@ -1455,7 +1473,7 @@ mod tests {
         record_dispatch_cross_spsc();
         let after = total_dispatch_cross_spsc();
         assert!(
-            after >= before + 1,
+            after > before,
             "counter must have increased by at least 1; before={before} after={after}"
         );
     }

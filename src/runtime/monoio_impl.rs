@@ -58,6 +58,89 @@ pub struct MonoioRuntimeFactory;
 
 impl RuntimeFactory for MonoioRuntimeFactory {
     fn block_on_local<F: Future<Output = ()> + 'static>(name: String, f: F) {
+        // Honor the documented MOON_NO_URING contract (and `--io-driver
+        // epoll`) for the monoio runtime too: FusionDriver silently
+        // auto-picks io_uring on Linux and offers no runtime introspection,
+        // so the kill-switch must force the epoll/kqueue LegacyDriver
+        // explicitly. (Previously MOON_NO_URING only gated the tokio bridge
+        // + uring_active(); the monoio driver choice ignored it — discovered
+        // during the c4a p=1 driver A/B.)
+        if crate::runtime::legacy_driver_forced() {
+            let mut rt = monoio::RuntimeBuilder::<monoio::LegacyDriver>::new()
+                .enable_timer()
+                .build()
+                .unwrap_or_else(|e| {
+                    panic!("failed to build monoio legacy runtime '{}': {}", name, e)
+                });
+            rt.block_on(f);
+            return;
+        }
+        // Tuned io_uring: COOP_TASKRUN + SINGLE_ISSUER + DEFER_TASKRUN slash
+        // io_uring_enter cost for a thread-per-core ring (created and entered
+        // only on this shard thread; moon's cross-thread signalling is fd-based
+        // — flume/eventfd/UnixStream — never a ring op from another thread,
+        // which DEFER_TASKRUN forbids). Measured need: on GCE (c4a/c3) the
+        // stock ring's enter cost made io_uring LOSE to epoll at p=1.
+        // Kernels <6.1 reject the flags -> warn once and fall back to the
+        // stock FusionDriver below. MOON_URING_PLAIN=1 skips the tuning.
+        #[cfg(target_os = "linux")]
+        if std::env::var_os("MOON_URING_PLAIN").is_none() {
+            let mut urb = io_uring_06::IoUring::builder();
+            // SQPOLL experiment gate: MOON_URING_SQPOLL=<idle_ms> starts a
+            // kernel-side submission-polling thread — submits become shared-
+            // memory writes (no io_uring_enter), dropping p=1 to ~1 syscall/op
+            // vs Redis's 3. Costs a busy core while active. SQPOLL is mutually
+            // exclusive with DEFER_TASKRUN (kernel rejects the combo), so the
+            // tuned taskrun flags are skipped in this mode.
+            // MOON_URING_SQPOLL_CPU=<n> pins the poll thread (IORING_SETUP_SQ_AFF);
+            // REQUIRED when the server process is taskset-pinned — the kthread
+            // inherits the process affinity and would otherwise fight the shard
+            // thread for its core.
+            let sqpoll_idle_ms = std::env::var("MOON_URING_SQPOLL")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok());
+            // CQ spin (vendored-monoio MOON_URING_SPIN_US) requires completions
+            // to be observable from userspace WITHOUT an io_uring_enter:
+            // DEFER_TASKRUN posts CQEs only inside enter(GETEVENTS) and
+            // COOP_TASKRUN only at kernel-entry boundaries, so either flag makes
+            // the spin burn its whole budget every park (measured: 49µs/op on
+            // c4a, a 3× regression). Spin mode therefore forces a plain ring;
+            // combined with SQPOLL the sqpoll kthread posts CQEs continuously
+            // and the spinning shard thread reaps with zero per-op syscalls.
+            let spin_active = std::env::var_os("MOON_URING_SPIN_US").is_some();
+            if let Some(idle_ms) = sqpoll_idle_ms {
+                urb.setup_sqpoll(idle_ms);
+                if let Some(cpu) = std::env::var("MOON_URING_SQPOLL_CPU")
+                    .ok()
+                    .and_then(|v| v.parse::<u32>().ok())
+                {
+                    urb.setup_sqpoll_cpu(cpu);
+                }
+            } else if !spin_active {
+                urb.setup_coop_taskrun()
+                    .setup_single_issuer()
+                    .setup_defer_taskrun();
+            }
+            match monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
+                .uring_builder(urb)
+                .enable_timer()
+                .build()
+            {
+                Ok(mut rt) => {
+                    rt.block_on(f);
+                    return;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "tuned io_uring (COOP_TASKRUN|SINGLE_ISSUER|DEFER_TASKRUN) \
+                         unavailable for '{}' ({}); falling back to stock driver",
+                        name,
+                        e
+                    );
+                }
+            }
+        }
+
         let mut rt = monoio::RuntimeBuilder::<monoio::FusionDriver>::new()
             .enable_timer()
             .build()

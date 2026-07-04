@@ -5,7 +5,7 @@ use crate::storage::Database;
 use crate::storage::entry::{Entry, current_time_ms};
 
 use super::{format_float, parse_f64, parse_i64, parse_positive_i64};
-use crate::command::helpers::{err_wrong_args, extract_bytes, ok};
+use crate::command::helpers::{err_wrong_args, expiry_ms_in_range, extract_bytes, ok};
 
 /// SET command handler with EX/PX/EXAT/PXAT/NX/XX/KEEPTTL/GET options.
 pub fn set(db: &mut Database, args: &[Frame]) -> Frame {
@@ -51,7 +51,20 @@ pub fn set(db: &mut Database, args: &[Frame]) -> Frame {
                 return Frame::Error(Bytes::from_static(b"ERR syntax error"));
             }
             match parse_positive_i64(&args[i]) {
-                Some(secs) => expires_at_ms = current_time_ms() + (secs as u64) * 1000,
+                Some(secs) => {
+                    expires_at_ms = match (secs as u64)
+                        .checked_mul(1000)
+                        .and_then(|d| current_time_ms().checked_add(d))
+                        .filter(|ms| expiry_ms_in_range(*ms))
+                    {
+                        Some(ms) => ms,
+                        None => {
+                            return Frame::Error(Bytes::from_static(
+                                b"ERR invalid expire time in 'SET' command",
+                            ));
+                        }
+                    }
+                }
                 None => {
                     return Frame::Error(Bytes::from_static(
                         b"ERR value is not an integer or out of range",
@@ -64,7 +77,19 @@ pub fn set(db: &mut Database, args: &[Frame]) -> Frame {
                 return Frame::Error(Bytes::from_static(b"ERR syntax error"));
             }
             match parse_positive_i64(&args[i]) {
-                Some(ms) => expires_at_ms = current_time_ms() + ms as u64,
+                Some(ms) => {
+                    expires_at_ms = match current_time_ms()
+                        .checked_add(ms as u64)
+                        .filter(|v| expiry_ms_in_range(*v))
+                    {
+                        Some(v) => v,
+                        None => {
+                            return Frame::Error(Bytes::from_static(
+                                b"ERR invalid expire time in 'SET' command",
+                            ));
+                        }
+                    };
+                }
                 None => {
                     return Frame::Error(Bytes::from_static(
                         b"ERR value is not an integer or out of range",
@@ -78,7 +103,17 @@ pub fn set(db: &mut Database, args: &[Frame]) -> Frame {
             }
             match parse_positive_i64(&args[i]) {
                 Some(ts) => {
-                    expires_at_ms = (ts as u64) * 1000;
+                    expires_at_ms = match (ts as u64)
+                        .checked_mul(1000)
+                        .filter(|ms| expiry_ms_in_range(*ms))
+                    {
+                        Some(ms) => ms,
+                        None => {
+                            return Frame::Error(Bytes::from_static(
+                                b"ERR invalid expire time in 'SET' command",
+                            ));
+                        }
+                    };
                 }
                 None => {
                     return Frame::Error(Bytes::from_static(
@@ -126,6 +161,13 @@ pub fn set(db: &mut Database, args: &[Frame]) -> Frame {
     } else {
         None
     };
+
+    // Check-before-mutate (Redis parity): SET ... GET on a wrong-type key returns
+    // WRONGTYPE and performs NO write. This takes precedence over NX/XX handling.
+    // Previously db.set(...) ran unconditionally, overwriting (destroying) the value.
+    if matches!(old_value, Some(Frame::Error(_))) {
+        return old_value.unwrap_or(Frame::Null);
+    }
 
     // NX + XX both set: contradictory, return nil (or old value if GET)
     if nx && xx {
@@ -197,6 +239,43 @@ pub fn mset(db: &mut Database, args: &[Frame]) -> Frame {
     ok()
 }
 
+/// MSETNX command handler (single-shard atomic).
+///
+/// Sets all key/value pairs only if NONE of the keys already exist. Returns 1 if
+/// all were set, 0 if at least one key already existed (and nothing was set).
+///
+/// Atomic on a single shard/database (the two phases run without any await point).
+/// Cross-shard atomicity is enforced by the coordinator, which rejects MSETNX when
+/// keys span shards (CROSSSLOT); see `coordinate_msetnx`.
+pub fn msetnx(db: &mut Database, args: &[Frame]) -> Frame {
+    if args.is_empty() || !args.len().is_multiple_of(2) {
+        return err_wrong_args("MSETNX");
+    }
+    // Phase 1: verify NONE of the keys exist.
+    for pair in args.chunks(2) {
+        let key = match extract_bytes(&pair[0]) {
+            Some(k) => k,
+            None => return err_wrong_args("MSETNX"),
+        };
+        if db.exists(key) {
+            return Frame::Integer(0);
+        }
+    }
+    // Phase 2: all keys absent -> set them all.
+    for pair in args.chunks(2) {
+        let key = match extract_bytes(&pair[0]) {
+            Some(k) => k.clone(),
+            None => return err_wrong_args("MSETNX"),
+        };
+        let value = match extract_bytes(&pair[1]) {
+            Some(v) => v.clone(),
+            None => return err_wrong_args("MSETNX"),
+        };
+        db.set_string(key, value);
+    }
+    Frame::Integer(1)
+}
+
 /// INCR command handler.
 pub fn incr(db: &mut Database, args: &[Frame]) -> Frame {
     if args.len() != 1 {
@@ -258,7 +337,15 @@ pub fn decrby(db: &mut Database, args: &[Frame]) -> Frame {
             ));
         }
     };
-    incrby_internal(db, key, -delta)
+    // Guard i64::MIN: -(i64::MIN) is unrepresentable. Redis returns an overflow
+    // error rather than negating with a debug panic / release wrap.
+    let neg = match delta.checked_neg() {
+        Some(n) => n,
+        None => {
+            return Frame::Error(Bytes::from_static(b"ERR decrement would overflow"));
+        }
+    };
+    incrby_internal(db, key, neg)
 }
 
 /// Internal helper for INCR/DECR/INCRBY/DECRBY.
@@ -580,7 +667,19 @@ pub fn setex(db: &mut Database, args: &[Frame]) -> Frame {
         Some(v) => v.clone(),
         None => return err_wrong_args("SETEX"),
     };
-    db.set_string_with_expiry(key, value, current_time_ms() + (seconds as u64) * 1000);
+    let expires_at_ms = match (seconds as u64)
+        .checked_mul(1000)
+        .and_then(|d| current_time_ms().checked_add(d))
+        .filter(|ms| expiry_ms_in_range(*ms))
+    {
+        Some(ms) => ms,
+        None => {
+            return Frame::Error(Bytes::from_static(
+                b"ERR invalid expire time in 'SETEX' command",
+            ));
+        }
+    };
+    db.set_string_with_expiry(key, value, expires_at_ms);
     ok()
 }
 
@@ -611,7 +710,18 @@ pub fn psetex(db: &mut Database, args: &[Frame]) -> Frame {
         Some(v) => v.clone(),
         None => return err_wrong_args("PSETEX"),
     };
-    db.set_string_with_expiry(key, value, current_time_ms() + millis as u64);
+    let expires_at_ms = match current_time_ms()
+        .checked_add(millis as u64)
+        .filter(|ms| expiry_ms_in_range(*ms))
+    {
+        Some(ms) => ms,
+        None => {
+            return Frame::Error(Bytes::from_static(
+                b"ERR invalid expire time in 'PSETEX' command",
+            ));
+        }
+    };
+    db.set_string_with_expiry(key, value, expires_at_ms);
     ok()
 }
 
@@ -636,8 +746,14 @@ pub fn getset(db: &mut Database, args: &[Frame]) -> Frame {
         )),
     });
 
-    // GETSET removes TTL (sets new entry without expiry)
-    db.set_string(key, value);
-
-    old.unwrap_or(Frame::Null)
+    // Check-before-mutate (Redis parity): a wrong-type key must return WRONGTYPE
+    // and stay untouched. Previously db.set_string ran unconditionally, destroying it.
+    match old {
+        Some(Frame::Error(e)) => Frame::Error(e),
+        other => {
+            // GETSET removes TTL (sets new entry without expiry)
+            db.set_string(key, value);
+            other.unwrap_or(Frame::Null)
+        }
+    }
 }

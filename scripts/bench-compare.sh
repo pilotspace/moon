@@ -16,6 +16,7 @@ PORT_MOON=6400
 REQUESTS=100000
 CLIENTS=50
 SHARDS=1
+KEYSPACE="${KEYSPACE:-}"   # -r random keyspace; empty = redis-benchmark default (1 hot key). Set for large-scale.
 RUST_BINARY="./target/release/moon"
 
 REDIS_PID=""
@@ -64,7 +65,9 @@ parse_rps() {
 bench() {
     local port="$1"
     shift
-    redis-benchmark -p "$port" -n "$REQUESTS" -c "$CLIENTS" -q "$@" 2>/dev/null | parse_rps
+    local rflag=()
+    [[ -n "$KEYSPACE" ]] && rflag=(-r "$KEYSPACE")   # large-scale: spread ops across a real keyspace
+    redis-benchmark -p "$port" -n "$REQUESTS" -c "$CLIENTS" -q "${rflag[@]}" "$@" 2>/dev/null | parse_rps
 }
 
 bench_cmd() {
