@@ -124,11 +124,14 @@ text-index = [
     "dep:levenshtein_automata",
 ]
 
-# Vendored monoio 0.2.4 with one experiment patch: env-gated CQ spin-poll
-# before parking (MOON_URING_SPIN_US) in the io_uring driver — poll-mode
-# reaping that removes the per-op scheduler wakeup at p=1. Diff vs upstream is
-# confined to src/driver/uring/mod.rs (search "moon patch"). Default-off env
-# => byte-identical behavior when unset.
+# Vendored monoio 0.2.4 (upstream git sha f7827ddd, see vendor/monoio/.cargo_vcs_info.json)
+# with a bounded "moon patch": env/CLI-gated poll-mode park that busy-polls readiness
+# before blocking, removing the per-op scheduler wakeup at p=1 (io_uring:
+# MOON_URING_SPIN_US; legacy epoll/kqueue: MOON_EPOLL_SPIN_US / --io-busy-poll-us),
+# plus a per-thread spin-hook handshake. Diff vs upstream is confined to FOUR files —
+# src/lib.rs, src/driver/mod.rs, src/driver/uring/mod.rs, src/driver/legacy/mod.rs
+# (search "moon patch"); adds zero new unsafe. Default-off => byte-identical behavior
+# when the MOON_* spin knobs are unset.
 [patch.crates-io]
 monoio = { path = "vendor/monoio" }
 

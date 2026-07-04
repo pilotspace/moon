@@ -1473,7 +1473,7 @@ mod tests {
         record_dispatch_cross_spsc();
         let after = total_dispatch_cross_spsc();
         assert!(
-            after >= before + 1,
+            after > before,
             "counter must have increased by at least 1; before={before} after={after}"
         );
     }
