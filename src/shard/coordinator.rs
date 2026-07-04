@@ -245,10 +245,15 @@ async fn run_on_owner(
 /// whose keys are all owned by my_shard, or a synthesized write like
 /// `SET dest <computed>` for a scatter BITOP/COPY).
 ///
-/// Persists only when the local execution did not error; sets
+/// Persists only when the local execution did not error AND `persist_if`
+/// says the response indicates an actual mutation (e.g. `SET ... NX` refusal
+/// returns Null and wrote nothing — logging it would cost a needless barrier
+/// fsync and could fail a no-op with `AOF_FSYNC_ERR`). Sets
 /// `*local_barrier_pending` when the append rides group commit under
 /// `appendfsync=always` (the handler owes ONE `fsync_barrier(my_shard)` per
 /// batch). Returns `AOF_FSYNC_ERR` when the append never reached the writer.
+// Mirrors run_on_owner's routing params + the persistence context; bundling
+// them into a struct would obscure the 1:1 correspondence with run_on_owner.
 #[allow(clippy::too_many_arguments)]
 async fn run_on_owner_persist(
     routing_key: &Bytes,
@@ -263,6 +268,7 @@ async fn run_on_owner_persist(
     aof_pool: Option<&Arc<crate::persistence::aof::AofWriterPool>>,
     repl_state: ReplStateRef<'_>,
     local_barrier_pending: &mut bool,
+    persist_if: impl Fn(&Frame) -> bool,
 ) -> Frame {
     let owner = key_to_shard(routing_key, num_shards);
     if owner != my_shard {
@@ -283,7 +289,7 @@ async fn run_on_owner_persist(
         _ => return Frame::Error(Bytes::from_static(b"ERR invalid command format")),
     };
     let resp = run_local(shard_databases, db_index, cached_clock, &cmd, args);
-    if !matches!(resp, Frame::Error(_)) {
+    if !matches!(resp, Frame::Error(_)) && persist_if(&resp) {
         let serialized = crate::persistence::aof::serialize_command(&Frame::Array(
             command_parts.to_vec().into(),
         ));
@@ -432,6 +438,7 @@ async fn coordinate_bitop(
         parts.push(bulk_static(b"BITOP"));
         parts.extend_from_slice(args);
         // Write command: the local-owner case must persist (v3-5 carried gap).
+        // Any non-error BITOP mutates dest (SET result, or DEL on empty).
         return run_on_owner_persist(
             &dest,
             &parts,
@@ -445,6 +452,7 @@ async fn coordinate_bitop(
             aof_pool,
             repl_state,
             local_barrier_pending,
+            |_| true,
         )
         .await;
     }
@@ -532,6 +540,8 @@ async fn coordinate_bitop(
                 aof_pool,
                 repl_state,
                 local_barrier_pending,
+                // DEL of an absent dest wrote nothing — skip the no-op record.
+                |r| matches!(r, Frame::Integer(n) if *n > 0),
             )
             .await;
             if let Frame::Error(e) = reply {
@@ -558,6 +568,7 @@ async fn coordinate_bitop(
                 aof_pool,
                 repl_state,
                 local_barrier_pending,
+                |_| true, // plain SET always writes on success
             )
             .await;
             if let Frame::Error(e) = reply {
@@ -638,6 +649,8 @@ async fn coordinate_copy(
             aof_pool,
             repl_state,
             local_barrier_pending,
+            // COPY :0 = refused (dst exists, no REPLACE) — nothing written.
+            |r| matches!(r, Frame::Integer(1)),
         )
         .await;
     }
@@ -707,6 +720,8 @@ async fn coordinate_copy(
         aof_pool,
         repl_state,
         local_barrier_pending,
+        // Null = NX refused (dst exists) — nothing was written.
+        |r| matches!(r, Frame::SimpleString(_)),
     )
     .await;
     match set_reply {
@@ -734,6 +749,8 @@ async fn coordinate_copy(
             aof_pool,
             repl_state,
             local_barrier_pending,
+            // :0 = key vanished between SET and PEXPIRE — no TTL was set.
+            |r| matches!(r, Frame::Integer(1)),
         )
         .await;
         if let Frame::Error(e) = reply {

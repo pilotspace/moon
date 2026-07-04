@@ -1328,6 +1328,7 @@ pub(super) async fn try_handle_blocking<S: monoio::io::AsyncWriteRent>(
     conn: &mut ConnectionState,
     ctx: &ConnectionContext,
     responses: &mut Vec<Frame>,
+    local_leg_write_idxs: &mut Vec<usize>,
     codec: &mut crate::server::codec::RespCodec,
     write_buf: &mut bytes::BytesMut,
     stream: &mut S,
@@ -1352,6 +1353,17 @@ pub(super) async fn try_handle_blocking<S: monoio::io::AsyncWriteRent>(
         responses.push(Frame::SimpleString(Bytes::from_static(b"QUEUED")));
         return BlockingResult::Queued;
     }
+
+    // Earlier frames in this batch may hold barrier-pending local-leg
+    // writes — confirm (or fail-loud) them before this early flush, and
+    // clear the indexes so the batch-end barrier never sees stale ones.
+    crate::server::conn::shared::resolve_local_leg_barrier(
+        &ctx.aof_pool,
+        ctx.shard_id,
+        local_leg_write_idxs,
+        responses,
+    )
+    .await;
 
     // Flush accumulated responses before blocking
     for resp in &*responses {

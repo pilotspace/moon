@@ -525,3 +525,39 @@ mod as_of_tests {
         }
     }
 }
+
+/// Resolve the pending v3-5 local-leg group-commit barrier, if any.
+///
+/// Coordinator local-leg writes (MSET/MSETNX/BITOP/COPY/DEL/UNLINK legs owned
+/// by the connection's own shard) enqueue their AOF append fire-and-forget
+/// under `appendfsync=always` and record their response index here; ONE
+/// `fsync_barrier` per batch confirms them all. This MUST run before ANY
+/// flush of `responses` to the client — the batch end, but also the early
+/// flushes (blocking commands, SUBSCRIBE entry, PSYNC hijack). Skipping it
+/// there would (a) ack a write whose durability was never confirmed and
+/// (b) leave stale indexes that panic or misattribute errors when the
+/// response vec is replaced (PR #213 review finding).
+///
+/// Always drains `idxs`. On barrier failure every recorded response is
+/// overwritten with `AOF_FSYNC_ERR` — never a false `+OK`.
+pub async fn resolve_local_leg_barrier(
+    aof_pool: &Option<Arc<crate::persistence::aof::AofWriterPool>>,
+    shard_id: usize,
+    idxs: &mut Vec<usize>,
+    responses: &mut [Frame],
+) {
+    if idxs.is_empty() {
+        return;
+    }
+    if let Some(pool) = aof_pool {
+        if pool.fsync_barrier(shard_id).await.is_err() {
+            for idx in idxs.iter() {
+                if let Some(slot) = responses.get_mut(*idx) {
+                    *slot =
+                        Frame::Error(Bytes::from_static(crate::persistence::aof::AOF_FSYNC_ERR));
+                }
+            }
+        }
+    }
+    idxs.clear();
+}

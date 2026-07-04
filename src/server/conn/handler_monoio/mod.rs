@@ -756,6 +756,15 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 if let Some((repl_id, offset)) =
                     dispatch::try_handle_psync(cmd, cmd_args, ctx, &mut responses)
                 {
+                    // Earlier frames in this batch may hold barrier-pending
+                    // local-leg writes — confirm them before this early flush.
+                    crate::server::conn::shared::resolve_local_leg_barrier(
+                        &ctx.aof_pool,
+                        ctx.shard_id,
+                        &mut local_leg_write_idxs,
+                        &mut responses,
+                    )
+                    .await;
                     for resp in &responses {
                         codec.encode_frame(resp, &mut write_buf);
                     }
@@ -824,6 +833,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 ctx,
                 &peer_addr,
                 &mut responses,
+                &mut local_leg_write_idxs,
                 &mut codec,
                 &mut write_buf,
                 &mut stream,
@@ -924,6 +934,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 &mut conn,
                 ctx,
                 &mut responses,
+                &mut local_leg_write_idxs,
                 &mut codec,
                 &mut write_buf,
                 &mut stream,
@@ -1813,21 +1824,20 @@ pub(crate) async fn handle_connection_sharded_monoio<
             }
         }
 
-        // v3-5 GROUP-COMMIT BARRIER: coordinator LOCAL legs (MSET/MSETNX) were
-        // enqueued fire-and-forget into MY shard's AOF writer during dispatch;
-        // one barrier here confirms every one of them with a single fsync
-        // instead of the retired per-command awaited fsync (2000ms tail stack).
-        // Runs BEFORE response serialization — the client never sees +OK for a
-        // write whose durability was not confirmed.
-        if !local_leg_write_idxs.is_empty() {
-            if let Some(ref pool) = ctx.aof_pool {
-                if pool.fsync_barrier(ctx.shard_id).await.is_err() {
-                    for idx in local_leg_write_idxs.drain(..) {
-                        responses[idx] = Frame::Error(Bytes::from_static(aof::AOF_FSYNC_ERR));
-                    }
-                }
-            }
-        }
+        // v3-5 GROUP-COMMIT BARRIER: coordinator LOCAL legs were enqueued
+        // fire-and-forget into MY shard's AOF writer during dispatch; one
+        // barrier here confirms every one of them with a single fsync instead
+        // of the retired per-command awaited fsync (2000ms tail stack). Runs
+        // BEFORE response serialization — the client never sees +OK for a
+        // write whose durability was not confirmed. Early-flush paths (PSYNC,
+        // blocking, SUBSCRIBE) resolve the same barrier before THEIR flushes.
+        crate::server::conn::shared::resolve_local_leg_barrier(
+            &ctx.aof_pool,
+            ctx.shard_id,
+            &mut local_leg_write_idxs,
+            &mut responses,
+        )
+        .await;
 
         // AUTH rate limiting: delay response to slow down brute-force attacks
         if auth_delay_ms > 0 {

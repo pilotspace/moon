@@ -11,8 +11,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The cross-shard coordinator's LOCAL-leg persist (co-located MSET/MSETNX and
   scattered-MSET local slices) awaited one fsync ack **per command**, each
   bounded by `--aof-fsync-timeout-ms` (default 2000ms) — a pipeline of
-  coordinated writes stacked these serially into the measured 2000–3000ms
-  `always` far-tail. Local legs now enqueue fire-and-forget (bounded
+  coordinated writes stacked these serially into the 2000–3000ms `always`
+  far-tail measured on Linux/GCE (c2d-standard-16, pd-ssd; see the v3-4
+  bench notes — OrbStack/macOS fsync is near-free and does not reproduce it). Local legs now enqueue fire-and-forget (bounded
   backpressure, same contract as the remote SPSC legs) and the connection
   handler confirms them with **one** `fsync_barrier` on the local shard per
   pipeline batch, before responses are serialized — so `+OK` still implies
