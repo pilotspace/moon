@@ -34,8 +34,24 @@ log(){ printf '%s\n' "$*" >&2; }
 die(){ log "FATAL: $*"; exit 1; }
 
 # ============================================================================ INNER
-wait_port(){ # host port tries
-  local t=0; until redis-cli -p "$2" ping >/dev/null 2>&1; do t=$((t+1)); [[ $t -ge 100 ]] && return 1; sleep 0.2; done
+wait_port(){ # host port tries — every probe timeout-bounded (a half-dead server
+  # that accepts but never replies must not hang the harness)
+  local t=0; until timeout 2 redis-cli -p "$2" ping 2>/dev/null | grep -q PONG; do
+    t=$((t+1)); [[ $t -ge 100 ]] && return 1; sleep 0.2
+  done
+}
+
+stop_moon(){ # $1=pid — SIGKILL + pattern backstop + wait-for-port-free.
+  # Moon handles SIGTERM gracefully and can linger; SO_REUSEPORT then lets the
+  # NEXT server bind the same port alongside the old one (two servers, split
+  # traffic, hung pings). kill -9 is the house convention (see CLAUDE.md).
+  kill -9 "$1" 2>/dev/null; wait "$1" 2>/dev/null
+  pkill -9 -f "release/moon --port $PORT" 2>/dev/null
+  local t=0
+  while pgrep -f "release/moon --port $PORT" >/dev/null 2>&1; do
+    t=$((t+1)); [[ $t -ge 50 ]] && { log "WARN: moon refused to die"; return 1; }; sleep 0.2
+  done
+  return 0
 }
 
 rps_of(){ # extract last "requests per second" (redis-benchmark 8.x \r progress trap)
@@ -62,29 +78,29 @@ measure_one(){ # $1=shards $2=walkv  -> prints a report block
   pid=$(start_moon "$shards" "$walkv" "$dir")
   wait_port localhost "$PORT" || { cat "$dir/server.log"; die "moon never accepted (volume run)"; }
   redis-benchmark -p "$PORT" -t set -n "$REQUESTS" -r "$KEYSPACE" -d 64 -c 50 -P 1 -q >/dev/null 2>&1
-  redis-cli -p "$PORT" set MARKERKEY_ZZZ9 MARKERVALUE_QQQ8 >/dev/null
+  timeout 5 redis-cli -p "$PORT" set MARKERKEY_ZZZ9 MARKERVALUE_QQQ8 >/dev/null
   sleep 3   # let 1ms-tick flush + everysec fsync settle
   local aof_b wal_b pio drops
   aof_b=$(dir_bytes "$dir" 'appendonly.*\.aof$|appendonlydir/.*\.aof$')
   wal_b=$(dir_bytes "$dir" '\.wal$')
   pio=$(awk '/^write_bytes/{print $2}' "/proc/$pid/io" 2>/dev/null || echo 0)
-  drops=$(redis-cli -p "$PORT" info persistence 2>/dev/null | tr -d '\r' | awk -F: '/aof_backpressure_dropped/{print $2}')
+  drops=$(timeout 5 redis-cli -p "$PORT" info persistence 2>/dev/null | tr -d '\r' | awk -F: '/aof_backpressure_dropped/{print $2}')
   local marker_wal=0
   if find "$dir" -name '*.wal' | head -5 | xargs -r strings 2>/dev/null | grep -q MARKERVALUE_QQQ8; then marker_wal=1; fi
   echo "volume: aof_bytes=$aof_b wal_bytes=$wal_b proc_write_bytes=$pio backpressure_dropped=${drops:-NA} marker_in_wal=$marker_wal"
 
   # -- recovery check (auto only, shards=4: prove AOF-alone recovery) --
   if [[ "$walkv" == "auto" && "$shards" == "4" ]]; then
-    local nkeys; nkeys=$(redis-cli -p "$PORT" dbsize | grep -oE '[0-9]+')
-    kill -9 "$pid"; wait "$pid" 2>/dev/null
+    local nkeys; nkeys=$(timeout 5 redis-cli -p "$PORT" dbsize | grep -oE '[0-9]+')
+    stop_moon "$pid"
     pid=$(start_moon "$shards" "$walkv" "$dir")
     wait_port localhost "$PORT" || die "moon never accepted (recovery run)"
     local nkeys2 marker2
-    nkeys2=$(redis-cli -p "$PORT" dbsize | grep -oE '[0-9]+')
-    marker2=$(redis-cli -p "$PORT" get MARKERKEY_ZZZ9)
+    nkeys2=$(timeout 5 redis-cli -p "$PORT" dbsize | grep -oE '[0-9]+')
+    marker2=$(timeout 5 redis-cli -p "$PORT" get MARKERKEY_ZZZ9)
     echo "recovery: keys_before_kill9=$nkeys keys_after_restart=$nkeys2 marker=$marker2"
   fi
-  redis-cli -p "$PORT" shutdown nosave >/dev/null 2>&1; kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+  stop_moon "$pid"
   rm -rf "$dir"
 
   # -- throughput reps (fresh server per rep; phantom-regression rule) --
@@ -94,8 +110,8 @@ measure_one(){ # $1=shards $2=walkv  -> prints a report block
     wait_port localhost "$PORT" || die "moon never accepted (rep $r)"
     rps_p1+=("$(redis-benchmark -p "$PORT" -t set -n "$REQUESTS" -r "$KEYSPACE" -d 64 -c 50 -P 1 2>/dev/null | rps_of)")
     rps_p64+=("$(redis-benchmark -p "$PORT" -t set -n "$REQUESTS" -r "$KEYSPACE" -d 64 -c 50 -P 64 2>/dev/null | rps_of)")
-    drops=$(redis-cli -p "$PORT" info persistence 2>/dev/null | tr -d '\r' | awk -F: '/aof_backpressure_dropped/{print $2}')
-    redis-cli -p "$PORT" shutdown nosave >/dev/null 2>&1; kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+    drops=$(timeout 5 redis-cli -p "$PORT" info persistence 2>/dev/null | tr -d '\r' | awk -F: '/aof_backpressure_dropped/{print $2}')
+    stop_moon "$pid"
     rm -rf "$dir"
     echo "rep$r: P1=${rps_p1[-1]:-NA} P64=${rps_p64[-1]:-NA} drops=${drops:-NA}"
   done
@@ -106,6 +122,7 @@ measure_one(){ # $1=shards $2=walkv  -> prints a report block
 measure(){
   set -e
   sudo mkdir -p /ssd-bench && sudo chmod 777 /ssd-bench
+  pkill -9 -f "release/moon --port $PORT" 2>/dev/null; rm -rf /ssd-bench/walab.* 2>/dev/null
   command -v redis-benchmark >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq redis-tools; }
   # steal gate (dedicated vCPU expected ~0)
   awk '/^cpu /{print "cpu-steal-jiffies:", $9}' /proc/stat
