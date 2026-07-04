@@ -193,8 +193,18 @@ run_one(){
   log "=== results in $rawfile; teardown follows (trap) ==="
 }
 
+measure_single(){ # $1=shards $2=walkv — one config only (chunked outer driving)
+  set +e
+  sudo mkdir -p /ssd-bench && sudo chmod 777 /ssd-bench
+  pkill -9 -f "release/moon --port $PORT" 2>/dev/null; rm -rf /ssd-bench/walab.* 2>/dev/null
+  command -v redis-benchmark >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq redis-tools; }
+  awk '/^cpu /{print "cpu-steal-jiffies:", $9}' /proc/stat
+  measure_one "$1" "$2"
+}
+
 case "${1:---one}" in
   --measure) measure ;;
+  --measure-one) measure_single "$2" "$3" ;;
   --one)     run_one ;;
   *) die "unknown subcommand: $1 (use --measure | --one)" ;;
 esac
