@@ -26,12 +26,25 @@ Moon is configured through command-line flags and an optional Redis-style config
 | `--requirepass` | *(none)* | Require clients to authenticate with this password |
 | `--check-config` | `false` | Validate configuration and exit without starting |
 
+### Defaults are tuned for the single-shard case
+
+Most deployments should run the defaults as-is: `--shards 1` gives the best
+per-op latency for low-concurrency and non-pipelined traffic (a cross-shard hop
+costs ~10µs), keeps every key co-located (no `{hash-tag}` planning), and — with
+`--appendonly yes` + `--wal-kv-log auto` — writes each KV record to disk exactly
+**once** (the AOF). Reach for more shards only with 8+ concurrent connections or
+deep pipelines (measured 1.3–2.5× Redis at 8–64 conns on 4 shards), and see
+[Tuning](tuning.md) for `--io-busy-poll-us` (a p=1 latency win **only** on
+pinned/dedicated cores).
+
 ## Persistence
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--appendonly` | `yes` | Enable append-only file persistence (`yes`/`no`) — Moon is durable by default |
 | `--appendfsync` | `everysec` | AOF fsync policy: `always`, `everysec`, or `no` |
+| `--aof-fsync-timeout-ms` | `2000` | Max time a write may block awaiting durability (fsync ack under `always`, writer-queue backpressure under `everysec`) before it fails loudly instead of parking the connection. `0` = unbounded |
+| `--wal-kv-log` | `auto` | KV command logging into the per-shard WAL. `auto`: skipped while the AOF is the recovery authority (`--appendonly yes`) and no CDC subscriber is attached — halves write volume at `--shards >= 2`; re-engages automatically when a CDC subscriber attaches. `on`: always log (pre-0.6 behavior; needed for [PITR](pitr.md) or full [CDC](cdc.md) history alongside AOF). `off`: never log KV records |
 | `--appendfilename` | `appendonly.aof` | AOF filename |
 | `--save` | *(none)* | RDB auto-save rules (e.g., `"3600 1 300 100"`) |
 | `--dbfilename` | `dump.rdb` | RDB snapshot filename |

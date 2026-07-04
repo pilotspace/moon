@@ -1422,7 +1422,17 @@ pub(crate) fn try_inline_dispatch(
             shard_id,
             frozen.len(),
         );
-        pool.try_send_append(shard_id, lsn, frozen);
+        // Bounded backpressure (not fire-and-forget): this path writes `+OK`
+        // on the next line, so a silent drop here is a client-acked write
+        // that never reached the durability machinery. Fast path is the same
+        // try_send; the block is reachable only when the writer channel is
+        // completely full.
+        pool.send_append_bounded_blocking(
+            shard_id,
+            lsn,
+            frozen,
+            crate::persistence::aof::AOF_SPSC_BACKPRESSURE_BOUND,
+        );
     }
 
     write_buf.extend_from_slice(b"+OK\r\n");

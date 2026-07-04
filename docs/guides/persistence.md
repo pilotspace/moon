@@ -44,6 +44,17 @@ Moon uses WAL v2 with:
 
 The hot-path cost of WAL append is ~5ns (`buf.extend_from_slice()`), with batch `write_all` every 1ms tick and fsync on the configured schedule.
 
+### One KV log at a time (`--wal-kv-log`)
+
+With `--appendonly yes` the **AOF is the crash-recovery authority**: startup
+replays the AOF over a wiped keyspace, discarding whatever the WAL replayed
+first. Moon therefore skips the WAL copy of each KV command by default
+(`--wal-kv-log auto`) — one durable KV log instead of two, halving on-disk
+write volume at `--shards >= 2` with zero recovery loss. The WAL still carries
+checkpoint/FPI and feature records, and KV logging re-engages automatically
+when a CDC subscriber attaches. Set `--wal-kv-log on` if you need
+point-in-time recovery or full CDC history alongside the AOF.
+
 ## RDB snapshots
 
 RDB creates point-in-time snapshots of the entire dataset.

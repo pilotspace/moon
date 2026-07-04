@@ -77,6 +77,10 @@ pub(crate) fn drain_spsc_shared(
     // FIX-W1-2: per-shard AOF writer pool. Passed through to handle_shard_message_shared
     // so cross-shard writes (MSET/MultiExecute) also land in the per-shard AOF files.
     aof_pool: Option<&std::sync::Arc<crate::persistence::aof::AofWriterPool>>,
+    // Whether KV command records should be logged to the per-shard WAL this
+    // drain cycle (`--wal-kv-log`; auto = false when the AOF is the recovery
+    // authority and no CDC subscriber is attached — see wal_append_and_fanout).
+    wal_kv_log: bool,
 ) -> bool {
     const MAX_DRAIN_PER_CYCLE: usize = 256;
     let mut drained = 0;
@@ -197,6 +201,7 @@ pub(crate) fn drain_spsc_shared(
                 graph_dead_edge_trigger,
                 autovacuum_daemon,
                 aof_pool, // FIX-W1-2: thread AOF pool through SPSC drain
+                wal_kv_log,
             );
         }
     }
@@ -228,6 +233,7 @@ pub(crate) fn drain_spsc_shared(
             graph_dead_edge_trigger,
             autovacuum_daemon,
             aof_pool, // FIX-W1-2: thread AOF pool through SPSC drain
+            wal_kv_log,
         );
     }
 
@@ -279,6 +285,9 @@ pub(crate) fn handle_shard_message_shared(
     // FIX-W1-2: per-shard AOF writer pool. When Some, each successful write command
     // is also routed to the owning shard's AOF file via fire-and-forget try_send_append.
     aof_pool: Option<&std::sync::Arc<crate::persistence::aof::AofWriterPool>>,
+    // Whether KV command records should be logged to the per-shard WAL
+    // (`--wal-kv-log`; see wal_append_and_fanout).
+    wal_kv_log: bool,
 ) {
     match msg {
         ShardMessage::Execute {
@@ -504,6 +513,7 @@ pub(crate) fn handle_shard_message_shared(
                             repl_state,
                             shard_id,
                             aof_pool, // FIX-W1-2
+                            wal_kv_log,
                         );
                     }
                     let _ = reply_tx.send(response);
@@ -550,6 +560,7 @@ pub(crate) fn handle_shard_message_shared(
                                 repl_state,
                                 shard_id,
                                 aof_pool, // FIX-W1-2
+                                wal_kv_log,
                             );
                         }
                         let _ = reply_tx.send(response);
@@ -590,6 +601,7 @@ pub(crate) fn handle_shard_message_shared(
                                 repl_state,
                                 shard_id,
                                 aof_pool, // FIX-W1-2
+                                wal_kv_log,
                             );
                         }
 
@@ -712,7 +724,13 @@ pub(crate) fn handle_shard_message_shared(
                         // Skip the serialization alloc when the fanout would
                         // no-op (persistence + replication all off) — it was
                         // pure waste on every cross-shard write.
-                        if wal_fanout_has_work(wal_writer, wal_v3_writer, replica_txs, aof_pool) {
+                        if wal_fanout_has_work(
+                            wal_writer,
+                            wal_v3_writer,
+                            replica_txs,
+                            aof_pool,
+                            wal_kv_log,
+                        ) {
                             let serialized = aof::serialize_command(cmd_frame);
                             wal_append_and_fanout(
                                 &serialized,
@@ -723,6 +741,7 @@ pub(crate) fn handle_shard_message_shared(
                                 repl_state,
                                 shard_id,
                                 aof_pool, // FIX-W1-2
+                                wal_kv_log,
                             );
                         }
 
@@ -805,7 +824,13 @@ pub(crate) fn handle_shard_message_shared(
                     if is_write && !matches!(frame, crate::protocol::Frame::Error(_)) {
                         // See `wal_fanout_has_work` — skip the serialization alloc
                         // entirely when the fanout would no-op (persistence off).
-                        if wal_fanout_has_work(wal_writer, wal_v3_writer, replica_txs, aof_pool) {
+                        if wal_fanout_has_work(
+                            wal_writer,
+                            wal_v3_writer,
+                            replica_txs,
+                            aof_pool,
+                            wal_kv_log,
+                        ) {
                             let serialized = aof::serialize_command(cmd_frame);
                             wal_append_and_fanout(
                                 &serialized,
@@ -826,6 +851,7 @@ pub(crate) fn handle_shard_message_shared(
                                 // The handler_monoio cross-shard AOF write is removed to avoid
                                 // the double-write that was the original reason for None.
                                 aof_pool, // FIX-C4-FOLD
+                                wal_kv_log,
                             );
                         }
                     }
@@ -938,6 +964,7 @@ pub(crate) fn handle_shard_message_shared(
                                 repl_state,
                                 shard_id,
                                 aof_pool, // FIX-W1-2
+                                wal_kv_log,
                             );
                         }
 
@@ -1022,7 +1049,13 @@ pub(crate) fn handle_shard_message_shared(
                         // Skip the serialization alloc when the fanout would
                         // no-op (persistence + replication all off) — it was
                         // pure waste on every cross-shard write.
-                        if wal_fanout_has_work(wal_writer, wal_v3_writer, replica_txs, aof_pool) {
+                        if wal_fanout_has_work(
+                            wal_writer,
+                            wal_v3_writer,
+                            replica_txs,
+                            aof_pool,
+                            wal_kv_log,
+                        ) {
                             let serialized = aof::serialize_command(cmd_frame);
                             wal_append_and_fanout(
                                 &serialized,
@@ -1033,6 +1066,7 @@ pub(crate) fn handle_shard_message_shared(
                                 repl_state,
                                 shard_id,
                                 aof_pool, // FIX-W1-2
+                                wal_kv_log,
                             );
                         }
 
@@ -1116,7 +1150,13 @@ pub(crate) fn handle_shard_message_shared(
                     if is_write && !matches!(frame, crate::protocol::Frame::Error(_)) {
                         // See `wal_fanout_has_work` — skip the serialization alloc
                         // entirely when the fanout would no-op (persistence off).
-                        if wal_fanout_has_work(wal_writer, wal_v3_writer, replica_txs, aof_pool) {
+                        if wal_fanout_has_work(
+                            wal_writer,
+                            wal_v3_writer,
+                            replica_txs,
+                            aof_pool,
+                            wal_kv_log,
+                        ) {
                             let serialized = aof::serialize_command(cmd_frame);
                             wal_append_and_fanout(
                                 &serialized,
@@ -1138,6 +1178,7 @@ pub(crate) fn handle_shard_message_shared(
                                 // cross-shard AOF write (handler_sharded/mod.rs) is removed
                                 // to avoid the double-write this None guard was preventing.
                                 aof_pool, // FIX-C4-FOLD
+                                wal_kv_log,
                             );
                         }
                     }
@@ -1664,6 +1705,7 @@ pub(crate) fn handle_shard_message_shared(
                 repl_state,
                 shard_id,
                 aof_pool, // FIX-W1-2
+                wal_kv_log,
             );
 
             // Perform the in-place swap via ShardSlice (thread-local, no locks needed).
@@ -2431,8 +2473,11 @@ pub(crate) fn wal_fanout_has_work(
     wal_v3_writer: &Option<WalWriterV3>,
     replica_txs: &[(u64, channel::MpscSender<bytes::Bytes>)],
     aof_pool: Option<&std::sync::Arc<crate::persistence::aof::AofWriterPool>>,
+    wal_kv_log: bool,
 ) -> bool {
-    wal_writer.is_some() || wal_v3_writer.is_some() || !replica_txs.is_empty() || aof_pool.is_some()
+    (wal_kv_log && (wal_writer.is_some() || wal_v3_writer.is_some()))
+        || !replica_txs.is_empty()
+        || aof_pool.is_some()
 }
 
 pub(crate) fn wal_append_and_fanout(
@@ -2444,22 +2489,30 @@ pub(crate) fn wal_append_and_fanout(
     repl_state: &Option<crate::replication::state::OffsetHandle>,
     shard_id: usize,
     aof_pool: Option<&std::sync::Arc<crate::persistence::aof::AofWriterPool>>,
+    wal_kv_log: bool,
 ) {
     // S3.5b (2026-04-27): hot-path bypass when nothing actually has work.
     // See `wal_fanout_has_work` — callers use the same predicate to skip the
     // `aof::serialize_command` alloc entirely when the fanout would no-op.
-    if !wal_fanout_has_work(wal_writer, wal_v3_writer, replica_txs, aof_pool) {
+    if !wal_fanout_has_work(wal_writer, wal_v3_writer, replica_txs, aof_pool, wal_kv_log) {
         return;
     }
-    // WAL v3 supersedes v2 — skip v2 append when v3 is active to avoid
-    // double-write overhead (2 write syscalls per SPSC drain batch).
-    if let Some(w3) = wal_v3_writer {
-        w3.append(
-            crate::persistence::wal_v3::record::WalRecordType::Command,
-            data,
-        );
-    } else if let Some(w) = wal_writer {
-        w.append(data);
+    // `wal_kv_log == false` (--wal-kv-log auto/off): the AOF is the recovery
+    // authority and no CDC subscriber is attached, so the WAL copy of this
+    // KV command would be written and then discarded by Phase-B recovery —
+    // pure write amplification (measured 2.7× file bytes at shards=4).
+    // FPI/checkpoint/feature records are unaffected (different entry points).
+    if wal_kv_log {
+        // WAL v3 supersedes v2 — skip v2 append when v3 is active to avoid
+        // double-write overhead (2 write syscalls per SPSC drain batch).
+        if let Some(w3) = wal_v3_writer {
+            w3.append(
+                crate::persistence::wal_v3::record::WalRecordType::Command,
+                data,
+            );
+        } else if let Some(w) = wal_writer {
+            w.append(data);
+        }
     }
     // 2. Replication backlog (in-memory circular buffer for partial resync).
     //
@@ -2488,13 +2541,22 @@ pub(crate) fn wal_append_and_fanout(
         }
     }
     // 5. Per-shard AOF pool (FIX-W1-2): route to the owning shard's writer.
-    // Uses fire-and-forget (`try_send_append`) because this function is sync
-    // and cannot await the fsync rendezvous. The `appendfsync=always` ack is
-    // handled by the async connection handler (handler_sharded / handler_single).
-    // LSN=0 is safe here: per-shard order is preserved by write order; the LSN
-    // is only meaningful for cross-shard TXN merge (RFC step 5, not yet wired).
+    // Bounded-blocking (`send_append_bounded_blocking`) because this function
+    // is sync and cannot await the fsync rendezvous: the fast path is the same
+    // try_send as before; only when the writer channel is FULL (writer >10k
+    // appends behind) does the shard thread block up to the bound instead of
+    // silently losing a record the client already got `+OK` for. The
+    // `appendfsync=always` ack is handled by the async connection handler
+    // (handler_sharded / handler_single). LSN=0 is safe here: per-shard order
+    // is preserved by write order; the LSN is only meaningful for cross-shard
+    // TXN merge (RFC step 5, not yet wired).
     if let Some(pool) = aof_pool {
-        pool.try_send_append(shard_id, 0, bytes::Bytes::copy_from_slice(data));
+        pool.send_append_bounded_blocking(
+            shard_id,
+            0,
+            bytes::Bytes::copy_from_slice(data),
+            crate::persistence::aof::AOF_SPSC_BACKPRESSURE_BOUND,
+        );
     }
 }
 
@@ -2540,6 +2602,7 @@ mod wal_append_tests {
             &None, // no repl_state
             0,
             None, // no aof_pool
+            true, // wal_kv_log
         );
 
         let final_end = backlog.lock().as_ref().unwrap().end_offset();
@@ -2568,6 +2631,7 @@ mod wal_append_tests {
             &None,
             0,
             None, // no aof_pool
+            true, // wal_kv_log
         );
 
         let end = backlog.lock().as_ref().unwrap().end_offset();
@@ -2605,6 +2669,7 @@ mod wal_append_tests {
             &None,       // no repl_state
             0,           // shard_id
             Some(&pool), // aof_pool provided — bypass must NOT fire
+            true,        // wal_kv_log
         );
 
         // The pool should have received exactly one message.
@@ -2668,6 +2733,7 @@ mod wal_append_tests {
             &None, // no repl_state
             0,     // shard_id
             None,  // PipelineBatch fix: None prevents double-write
+            true,  // wal_kv_log
         );
         assert!(
             rx0.try_recv().is_err(),
@@ -2692,6 +2758,7 @@ mod wal_append_tests {
             &None,
             0,
             Some(&pool), // MultiExecute: pool must receive this entry
+            true,        // wal_kv_log
         );
         let msg = rx0
             .try_recv()
@@ -2699,6 +2766,75 @@ mod wal_append_tests {
         assert!(
             matches!(msg, AofMessage::Append { .. }),
             "expected AofMessage::Append from MultiExecute arm, got unexpected variant",
+        );
+    }
+
+    /// `--wal-kv-log` gate (2026-07 write-path durability): with
+    /// `wal_kv_log == false` (AOF is the recovery authority, no CDC
+    /// subscriber) the KV Command record must NOT reach the WAL — startup
+    /// recovery wipes WAL-replayed state and replays the AOF, so the WAL
+    /// copy is pure 2× write amplification. The AOF pool must STILL receive
+    /// the entry (it is the surviving durability log).
+    #[test]
+    fn test_kv_append_skipped_when_wal_kv_log_false() {
+        use crate::persistence::aof::{AofMessage, AofWriterPool, FsyncPolicy};
+        use crate::runtime::channel::mpsc_bounded;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_dir = tmp.path().join("wal");
+        let mut w3 = Some(WalWriterV3::new(0, &wal_dir, 16 * 1024 * 1024).unwrap());
+        w3.as_mut().unwrap().flush_sync().unwrap();
+        let seg = wal_dir.join("000000000001.wal");
+        let base_len = std::fs::metadata(&seg).unwrap().len();
+
+        let (tx, rx) = mpsc_bounded::<AofMessage>(16);
+        let pool = AofWriterPool::top_level_with_policy(
+            tx,
+            FsyncPolicy::EverySec,
+            std::time::Duration::ZERO,
+        );
+        let backlog: SharedBacklog = std::sync::Arc::new(parking_lot::Mutex::new(None));
+        let cmd = b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n";
+
+        wal_append_and_fanout(
+            cmd,
+            &mut None,
+            &mut w3,
+            &backlog,
+            &[],
+            &None,
+            0,
+            Some(&pool),
+            false, // wal_kv_log: AOF authoritative, no CDC consumer
+        );
+        w3.as_mut().unwrap().flush_sync().unwrap();
+        assert_eq!(
+            std::fs::metadata(&seg).unwrap().len(),
+            base_len,
+            "KV Command record must be skipped when wal_kv_log is false (double-write gate)"
+        );
+        assert!(
+            matches!(rx.try_recv(), Ok(AofMessage::Append { .. })),
+            "the AOF pool must still receive the entry — it is the surviving KV log"
+        );
+
+        // Control: with wal_kv_log == true (CDC attached / --wal-kv-log on)
+        // the record must land in the WAL as before.
+        wal_append_and_fanout(
+            cmd,
+            &mut None,
+            &mut w3,
+            &backlog,
+            &[],
+            &None,
+            0,
+            Some(&pool),
+            true, // wal_kv_log
+        );
+        w3.as_mut().unwrap().flush_sync().unwrap();
+        assert!(
+            std::fs::metadata(&seg).unwrap().len() > base_len,
+            "with wal_kv_log true the KV record must be logged to the WAL"
         );
     }
 }
@@ -2774,6 +2910,7 @@ mod drain_cap_tests {
             0.2,
             &mut autovacuum,
             None,
+            true, // wal_kv_log
         );
         assert!(
             hit_cap,
@@ -2804,6 +2941,7 @@ mod drain_cap_tests {
             0.2,
             &mut autovacuum,
             None,
+            true, // wal_kv_log
         );
         assert!(
             !hit_cap2,

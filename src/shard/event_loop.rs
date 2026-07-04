@@ -393,6 +393,16 @@ impl super::Shard {
         // (stronger guarantees: per-record LSN + CRC32C), so v2 is skipped entirely
         // to avoid double-write overhead.
         let appendonly_enabled = runtime_config.read().appendonly != "no";
+        // `--wal-kv-log`: whether SPSC-executed KV writes are also logged to
+        // the per-shard WAL. Resolved per drain cycle (Auto is dynamic on the
+        // CDC registry); see wal_append_and_fanout for the rationale.
+        let wal_kv_log_mode = server_config.wal_kv_log_mode();
+        if wal_kv_log_mode == crate::config::WalKvLogMode::Off && !appendonly_enabled {
+            tracing::warn!(
+                shard_id,
+                "--wal-kv-log off with --appendonly no: KV writes have NO durability log"
+            );
+        }
         let mut wal_writer: Option<WalWriter> = match (&persistence_dir, appendonly_enabled) {
             (Some(dir), true) if !server_config.disk_offload_enabled() => {
                 match WalWriter::new(shard_id, std::path::Path::new(dir)) {
@@ -1167,6 +1177,13 @@ impl super::Shard {
                         server_config.graph_dead_edge_trigger,
                         &mut autovacuum_daemon,
                         aof_pool.as_ref(),  // FIX-W1-2
+                        match wal_kv_log_mode {
+                            crate::config::WalKvLogMode::On => true,
+                            crate::config::WalKvLogMode::Off => false,
+                            crate::config::WalKvLogMode::Auto => {
+                                !appendonly_enabled || !cdc_registry.is_empty()
+                            }
+                        },
                     );
                     if hit_cap {
                         // M3: capped drain may have left a tail — re-arm immediately
@@ -1262,6 +1279,13 @@ impl super::Shard {
                         server_config.graph_dead_edge_trigger,
                         &mut autovacuum_daemon,
                         aof_pool.as_ref(),  // FIX-W1-2
+                        match wal_kv_log_mode {
+                            crate::config::WalKvLogMode::On => true,
+                            crate::config::WalKvLogMode::Off => false,
+                            crate::config::WalKvLogMode::Auto => {
+                                !appendonly_enabled || !cdc_registry.is_empty()
+                            }
+                        },
                     );
                     if hit_cap {
                         // M3: capped drain may have left a tail — re-arm immediately
@@ -1833,6 +1857,13 @@ impl super::Shard {
                     server_config.graph_dead_edge_trigger,
                     &mut autovacuum_daemon,
                     aof_pool.as_ref(), // FIX-W1-2
+                    match wal_kv_log_mode {
+                        crate::config::WalKvLogMode::On => true,
+                        crate::config::WalKvLogMode::Off => false,
+                        crate::config::WalKvLogMode::Auto => {
+                            !appendonly_enabled || !cdc_registry.is_empty()
+                        }
+                    },
                 );
                 if hit_cap {
                     // M3: the drain stopped at its per-cycle cap (or a snapshot

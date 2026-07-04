@@ -234,10 +234,12 @@ impl AofWriterPool {
     /// vector identified in the investigation report. For `EverySec` and
     /// `No`, it stays on the fire-and-forget path (zero new latency).
     ///
-    /// Returns `Err(AofAck)` only on the Always path when the write or
-    /// fsync failed (or the writer task is gone). Callers MUST treat
-    /// `Err(_)` as a hard failure — return an error frame to the client,
-    /// do NOT respond `+OK`.
+    /// Returns `Err(AofAck)` on the Always path when the write or fsync
+    /// failed (or the writer task is gone), and on the EverySec/No path
+    /// when the append could not be enqueued within the backpressure bound
+    /// (`AofAck::ChannelFull`) or the writer is gone (`WriteFailed`).
+    /// Callers MUST treat `Err(_)` as a hard failure — return an error
+    /// frame to the client, do NOT respond `+OK`.
     ///
     /// Async because the Always branch awaits a oneshot receiver. The
     /// non-Always branch resolves immediately (no actual suspension) so
@@ -269,8 +271,13 @@ impl AofWriterPool {
                 }
             }
             FsyncPolicy::EverySec | FsyncPolicy::No => {
-                self.try_send_append(shard_id, lsn, bytes);
-                Ok(())
+                // Bounded backpressure instead of the pre-0.6 silent drop:
+                // a full writer channel used to `warn!` and lose the record
+                // while the caller still acked `+OK`. Now the caller awaits
+                // enqueue (NOT fsync) under `fsync_timeout`, and a failed
+                // enqueue surfaces as Err so the client never gets a false
+                // success for a write the durability machinery never saw.
+                self.send_append_backpressure(shard_id, lsn, bytes).await
             }
         }
     }
@@ -400,22 +407,154 @@ impl AofWriterPool {
     /// `ReplicationState::issue_lsn(shard_id, bytes.len() as u64)` for writes
     /// that participate in replication ordering; sites without a
     /// replication-state handle pass 0.
+    ///
+    /// Returns `false` when the entry was NOT enqueued (channel full or
+    /// writer gone) — the record is lost. A `Full` loss is counted in
+    /// [`AOF_BACKPRESSURE_DROPPED`]. Callers that can apply backpressure
+    /// instead of losing the record should prefer
+    /// [`Self::send_append_bounded_blocking`] (sync contexts) or
+    /// [`Self::try_send_append_durable`] (async contexts).
     #[inline]
-    pub fn try_send_append(&self, shard_id: usize, lsn: u64, bytes: Bytes) {
-        if let Err(e) = self
+    pub fn try_send_append(&self, shard_id: usize, lsn: u64, bytes: Bytes) -> bool {
+        match self
             .sender(shard_id)
             .try_send(AofMessage::Append { lsn, bytes })
         {
-            warn!(
-                "AOF append dropped for shard {} (lsn {}): channel {}",
-                shard_id,
-                lsn,
-                match e {
-                    flume::TrySendError::Full(_) => "full",
-                    flume::TrySendError::Disconnected(_) => "disconnected",
+            Ok(()) => true,
+            Err(e) => {
+                if matches!(e, flume::TrySendError::Full(_)) {
+                    AOF_BACKPRESSURE_DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
+                warn!(
+                    "AOF append dropped for shard {} (lsn {}): channel {}",
+                    shard_id,
+                    lsn,
+                    match e {
+                        flume::TrySendError::Full(_) => "full",
+                        flume::TrySendError::Disconnected(_) => "disconnected",
+                    }
+                );
+                false
+            }
+        }
+    }
+
+    /// Append with bounded *blocking* backpressure — for synchronous callers
+    /// (the shard event loop's SPSC drain) that cannot await.
+    ///
+    /// Fast path: `try_send` (zero cost while the writer keeps up). When the
+    /// channel is full, blocks the calling thread up to `bound` waiting for
+    /// the writer to drain a group-commit batch, converting what used to be
+    /// a **silent, client-acked write loss** into a short stall. Only after
+    /// the bound elapses is the record dropped — counted in
+    /// [`AOF_BACKPRESSURE_DROPPED`] and logged at `error!`.
+    ///
+    /// Deliberate trade-off: blocking the shard event loop is normally
+    /// forbidden, but the block is (a) bounded, (b) only reachable when the
+    /// AOF writer is >CHANNEL_CAP appends behind (disk badly stalled), and
+    /// (c) strictly better than diverging the AOF from memory state — a
+    /// dropped record makes every later replay of a dependent command wrong
+    /// (e.g. INCR replayed without its SET).
+    pub fn send_append_bounded_blocking(
+        &self,
+        shard_id: usize,
+        lsn: u64,
+        bytes: Bytes,
+        bound: Duration,
+    ) -> bool {
+        let mut msg = AofMessage::Append { lsn, bytes };
+        match self.sender(shard_id).try_send(msg) {
+            Ok(()) => return true,
+            Err(flume::TrySendError::Disconnected(_)) => {
+                warn!(
+                    "AOF append dropped for shard {} (lsn {}): channel disconnected",
+                    shard_id, lsn
+                );
+                return false;
+            }
+            Err(flume::TrySendError::Full(returned)) => msg = returned,
+        }
+        match self.sender(shard_id).send_timeout(msg, bound) {
+            Ok(()) => true,
+            Err(e) => {
+                if matches!(e, flume::SendTimeoutError::Timeout(_)) {
+                    AOF_BACKPRESSURE_DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                tracing::error!(
+                    "AOF append LOST for shard {} (lsn {}): writer still {} after {:?} \
+                     backpressure bound; backpressure_dropped={}",
+                    shard_id,
+                    lsn,
+                    match e {
+                        flume::SendTimeoutError::Timeout(_) => "full",
+                        flume::SendTimeoutError::Disconnected(_) => "disconnected",
+                    },
+                    bound,
+                    AOF_BACKPRESSURE_DROPPED.load(std::sync::atomic::Ordering::Relaxed),
+                );
+                false
+            }
+        }
+    }
+
+    /// Async bounded-backpressure append for `everysec`/`no` durable callers.
+    ///
+    /// Fast path: `try_send` (identical cost to the old fire-and-forget
+    /// path). When the writer channel is full, awaits `send_async` under the
+    /// pool's `fsync_timeout` bound (`Duration::ZERO` = unbounded await,
+    /// consistent with [`Self::await_ack`]) instead of silently dropping the
+    /// record and letting the caller ack `+OK` for a write that never
+    /// reached the durability machinery.
+    async fn send_append_backpressure(
+        &self,
+        shard_id: usize,
+        lsn: u64,
+        bytes: Bytes,
+    ) -> Result<(), AofAck> {
+        let mut msg = AofMessage::Append { lsn, bytes };
+        match self.sender(shard_id).try_send(msg) {
+            Ok(()) => return Ok(()),
+            Err(flume::TrySendError::Disconnected(_)) => return Err(AofAck::WriteFailed),
+            Err(flume::TrySendError::Full(returned)) => msg = returned,
+        }
+        let send_fut = self.sender(shard_id).send_async(msg);
+        let timeout = self.fsync_timeout;
+        if timeout.is_zero() {
+            return match send_fut.await {
+                Ok(()) => Ok(()),
+                Err(_) => Err(AofAck::WriteFailed),
+            };
+        }
+        let outcome: Result<(), AofAck>;
+        #[cfg(feature = "runtime-monoio")]
+        {
+            outcome = monoio::select! {
+                res = send_fut => match res {
+                    Ok(()) => Ok(()),
+                    Err(_) => Err(AofAck::WriteFailed),
+                },
+                _ = monoio::time::sleep(timeout) => Err(AofAck::ChannelFull),
+            };
+        }
+        #[cfg(all(feature = "runtime-tokio", not(feature = "runtime-monoio")))]
+        {
+            outcome = match tokio::time::timeout(timeout, send_fut).await {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(_)) => Err(AofAck::WriteFailed),
+                Err(_) => Err(AofAck::ChannelFull),
+            };
+        }
+        if outcome == Err(AofAck::ChannelFull) {
+            AOF_BACKPRESSURE_DROPPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            warn!(
+                "AOF writer channel full (shard {}): everysec append dropped after {:?} \
+                 backpressure bound; backpressure_dropped={}",
+                shard_id,
+                timeout,
+                AOF_BACKPRESSURE_DROPPED.load(std::sync::atomic::Ordering::Relaxed),
             );
         }
+        outcome
     }
 
     /// Synchronous (fsync-before-ack) append for `appendfsync=always`
@@ -1766,5 +1905,146 @@ mod pool_tests {
             AofAck::WriteFailed,
             "dead writer must resolve to WriteFailed"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Everysec fail-loud (2026-07 write-path durability): a full writer
+    // channel must surface as backpressure/Err — never a silent drop while
+    // the caller acks `+OK` to the client.
+    // -----------------------------------------------------------------------
+
+    /// RED before the fix: `try_send_append_durable` under EverySec returned
+    /// `Ok(())` while the append was silently dropped. Now the caller awaits
+    /// enqueue under `fsync_timeout` and gets `Err(AofAck::ChannelFull)` when
+    /// the writer stays full past the bound — so it returns an error frame
+    /// instead of a false `+OK`.
+    #[cfg(feature = "runtime-tokio")]
+    #[tokio::test]
+    async fn everysec_full_channel_errs_instead_of_silent_drop() {
+        use std::sync::atomic::Ordering;
+        let (tx0, _rx0) = channel::mpsc_bounded::<AofMessage>(1);
+        // Fill the only slot; keep _rx0 alive so the channel is Full, not Disconnected.
+        tx0.try_send(AofMessage::Append {
+            lsn: 0,
+            bytes: Bytes::from_static(b"x"),
+        })
+        .unwrap();
+        let pool = AofWriterPool::top_level_with_policy(
+            tx0,
+            FsyncPolicy::EverySec,
+            Duration::from_millis(50),
+        );
+
+        let before = AOF_BACKPRESSURE_DROPPED.load(Ordering::Relaxed);
+        let res = pool
+            .try_send_append_durable(0, 1, Bytes::from_static(b"SET k v"))
+            .await;
+        assert_eq!(
+            res,
+            Err(AofAck::ChannelFull),
+            "full writer channel must fail loud under everysec, not ack a lost write"
+        );
+        assert!(
+            AOF_BACKPRESSURE_DROPPED.load(Ordering::Relaxed) > before,
+            "dropped everysec append must be counted"
+        );
+    }
+
+    /// The backpressure path must WAIT, not fail, when the writer frees a
+    /// slot within the bound — converting the old silent loss into a short
+    /// stall with zero data loss.
+    #[cfg(feature = "runtime-tokio")]
+    #[tokio::test]
+    async fn everysec_backpressure_succeeds_when_writer_drains_in_time() {
+        let (tx0, rx0) = channel::mpsc_bounded::<AofMessage>(1);
+        tx0.try_send(AofMessage::Append {
+            lsn: 0,
+            bytes: Bytes::from_static(b"x"),
+        })
+        .unwrap();
+        let pool = AofWriterPool::top_level_with_policy(
+            tx0,
+            FsyncPolicy::EverySec,
+            Duration::from_millis(500),
+        );
+
+        // Mock writer: drain one message shortly after, freeing the slot.
+        let drainer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            let first = rx0.recv().expect("first queued append");
+            (first, rx0)
+        });
+
+        let res = pool
+            .try_send_append_durable(0, 1, Bytes::from_static(b"SET k v"))
+            .await;
+        assert_eq!(
+            res,
+            Ok(()),
+            "append must succeed once the writer drains within the bound"
+        );
+        let (_first, rx0) = drainer.join().unwrap();
+        assert!(
+            matches!(rx0.try_recv(), Ok(AofMessage::Append { lsn: 1, .. })),
+            "the awaited append must actually be enqueued, not lost"
+        );
+    }
+
+    /// Sync SPSC-path variant: `send_append_bounded_blocking` blocks up to
+    /// the bound, then reports the loss (false + counter) instead of
+    /// pretending success.
+    #[test]
+    fn spsc_bounded_blocking_reports_loss_after_bound() {
+        use std::sync::atomic::Ordering;
+        let (tx0, _rx0) = channel::mpsc_bounded::<AofMessage>(1);
+        tx0.try_send(AofMessage::Append {
+            lsn: 0,
+            bytes: Bytes::from_static(b"x"),
+        })
+        .unwrap();
+        let pool = AofWriterPool::top_level_with_policy(
+            tx0,
+            FsyncPolicy::EverySec,
+            DEFAULT_AOF_FSYNC_TIMEOUT,
+        );
+
+        let before = AOF_BACKPRESSURE_DROPPED.load(Ordering::Relaxed);
+        let start = std::time::Instant::now();
+        let ok = pool.send_append_bounded_blocking(
+            0,
+            7,
+            Bytes::from_static(b"SET k v"),
+            Duration::from_millis(30),
+        );
+        assert!(!ok, "still-full channel after the bound must report loss");
+        assert!(
+            start.elapsed() >= Duration::from_millis(30),
+            "the call must have blocked for the backpressure bound before giving up"
+        );
+        assert!(
+            AOF_BACKPRESSURE_DROPPED.load(Ordering::Relaxed) > before,
+            "the dropped append must be counted"
+        );
+    }
+
+    /// Fast path: capacity available → enqueued with no stall.
+    #[test]
+    fn spsc_bounded_blocking_fast_path_enqueues() {
+        let (tx0, rx0) = channel::mpsc_bounded::<AofMessage>(4);
+        let pool = AofWriterPool::top_level_with_policy(
+            tx0,
+            FsyncPolicy::EverySec,
+            DEFAULT_AOF_FSYNC_TIMEOUT,
+        );
+        assert!(pool.send_append_bounded_blocking(
+            0,
+            9,
+            Bytes::from_static(b"SET a 1"),
+            Duration::from_millis(30),
+        ));
+        assert!(matches!(
+            rx0.try_recv(),
+            Ok(AofMessage::Append { lsn: 9, .. })
+        ));
     }
 }
