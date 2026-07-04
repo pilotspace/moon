@@ -132,6 +132,32 @@ panics. Three findings surfaced (all independently re-verified against source be
   carry the *identical* local-leg non-durability and are NOT yet fixed; a focused follow-up should
   route their local legs through `persist_local_leg` too.
 
+### Performance validation   (GCloud A/B — the Finding-1 durability fix)
+The Finding-1 fix awaits an fsync on the local leg, so its cost was measured A/B on GCE
+`c2d-standard-16` (16 vCPU AMD EPYC 7B13, x86_64): `moon-post` (`cd7c51c`, fix present) vs
+`moon-pre` (`cd7c51c^`, fix absent), md5-verified distinct — isolating *the fix's own cost* from
+Moon's baseline-vs-Redis gap (a real fix cost shows consistently-signed negative; noise centers on
+zero). **Ship-clean:**
+- **`everysec` (default fsync): free** — the A/B straddles zero on every co-located + scatter cell,
+  inside the ±5% noise band.
+- **`always`, no pipeline (P1): clean −8.8%** (one extra awaited fsync) — and Moon still **beats
+  Redis 1.27×** on this cell.
+- **`always` + pipeline + co-located:** a far-tail limitation confined to that (non-default)
+  intersection — < 0.5% of writes reach multi-second latency; p50/p95/**p99 stay healthy (~28 ms)**.
+  The tail is a **bounded fsync-await stacked on upstream pipeline queue wait** (redis-benchmark
+  times send→reply, so it measures their *sum*): the 2000 ms `--aof-fsync-timeout-ms` bound
+  (`config.rs:129`, `pool.rs:262-268`) + queue wait against the *one* hot shard — n=50k ≈ 2023 ms
+  (bound-dominated), n=100k ≈ 3000 ms (2000 ms bound + ~1000 ms queue). **No silent data loss:** the
+  tail-most writes (await reaches the bound) fail *loudly* with `AOF_FSYNC_ERR`, never a false
+  `+OK`; server verified healthy post-run (PING/MSET/MGET correct, no panic/diskfull).
+
+**Follow-up (filed — HIGH):** route the coordinator local-leg persist through group-commit /
+`fsync_barrier` so the single hot shard batches fsyncs under pipeline (keeps the far tail well under
+the 2000 ms bound); the tracked BITOP/COPY/DEL/UNLINK gap should land on that same batched path.
+
+Full method + raw matrix: `tmp/V3-4-GCLOUD-BENCH.md` (local artifact). This validates *performance*
+only — durability correctness is proven by the crash-recovery tests above.
+
 ### Goal met?   (map the evidence back to this milestone's Exit criteria — read before the Exit-criteria boxes are checked)
 - [x] each Exit criterion above is satisfied by a Cross-task evidence row or a Ship-by-domain change (cited inline)
 - goal: KV writes now honor Redis data-integrity contracts — full default lib suite 3633 green + tokio

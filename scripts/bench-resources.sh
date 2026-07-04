@@ -83,7 +83,10 @@ start_servers() {
         --loglevel warning --daemonize no &>/dev/null &
     REDIS_PID=$!
 
-    "$RUST_BINARY" --port "$PORT_RUST" --shards "$SHARDS" &>/dev/null &
+    # Fair vs Redis (--save "" --appendonly no): Moon defaults appendonly=yes AND disk-offload=enable,
+    # which adds AOF buffers + cold-tier bookkeeping to RSS that Redis has no analog for — unfairly
+    # inflating Moon's memory in a per-key comparison. Match Redis: both persistence subsystems off.
+    "$RUST_BINARY" --port "$PORT_RUST" --shards "$SHARDS" --appendonly no --disk-offload disable &>/dev/null &
     RUST_PID=$!
 
     wait_for_port "$PORT_REDIS"
