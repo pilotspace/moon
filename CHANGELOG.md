@@ -6,6 +6,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-07-04
+
 Two milestones since v0.4.1:
 
 - **v3-4 KV Write Correctness & Data-Integrity Parity** — the primary KV engine now honors
