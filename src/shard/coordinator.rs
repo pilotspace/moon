@@ -46,6 +46,11 @@ pub async fn coordinate_multi_key(
     // persistence (tests / no-AOF deployments).
     aof_pool: Option<&Arc<crate::persistence::aof::AofWriterPool>>,
     repl_state: ReplStateRef<'_>,
+    // v3-5 group commit: set to true when a local-leg append was enqueued
+    // under appendfsync=always. The connection handler MUST then issue ONE
+    // `fsync_barrier(my_shard)` for the batch before acking the client, and
+    // overwrite this command's response with AOF_FSYNC_ERR on barrier failure.
+    local_barrier_pending: &mut bool,
     _response_pool: &(), // placeholder — coordinator uses oneshot internally
 ) -> Frame {
     if cmd.eq_ignore_ascii_case(b"MGET") {
@@ -73,6 +78,7 @@ pub async fn coordinate_multi_key(
             cached_clock,
             aof_pool,
             repl_state,
+            local_barrier_pending,
             _response_pool,
         )
         .await
@@ -88,6 +94,7 @@ pub async fn coordinate_multi_key(
             cached_clock,
             aof_pool,
             repl_state,
+            local_barrier_pending,
             _response_pool,
         )
         .await
@@ -227,11 +234,17 @@ type ReplStateRef<'a> =
 /// Persist a coordinator LOCAL-leg write to the owning shard's AOF, matching the
 /// local single-key write contract (the `is_write` block in
 /// `handler_monoio`/`handler_sharded`): issue an LSN off `repl_state`, then
-/// durable-append. Under `appendfsync=always` this awaits the writer's fsync ack;
-/// under everysec/no it is fire-and-forget. WAL append is external to
-/// `cmd_dispatch`, so the coordinator's in-process local legs (`run_local`,
-/// `coordinate_mset` fast path / local slice) MUST call this or their writes are
-/// lost on restart while the remote legs (via `wal_append_and_fanout`) survive.
+/// group-commit-append. WAL append is external to `cmd_dispatch`, so the
+/// coordinator's in-process local legs (`run_local`, `coordinate_mset` fast
+/// path / local slice) MUST call this or their writes are lost on restart
+/// while the remote legs (via `wal_append_and_fanout`) survive.
+///
+/// v3-5 group-commit routing: the append is ENQUEUED (bounded backpressure),
+/// never per-write fsync-awaited. `Ok(true)` means `appendfsync=always` — the
+/// connection handler MUST issue ONE `fsync_barrier(my_shard)` for the whole
+/// pipeline batch before acking the client (the same contract the remote legs
+/// use). The old per-write awaited fsync stacked one `fsync_timeout` per
+/// coordinated command in a pipeline — the measured 2000–3000ms always-tail.
 ///
 /// `serialized` MUST cover only keys OWNED by `my_shard`:
 ///   - co-located command (MSETNX; MSET fast path)  → the whole command,
@@ -239,25 +252,24 @@ type ReplStateRef<'a> =
 ///     just the local keys (never the full scattered command — `my_shard` does
 ///     not own the remote keys and replay would misapply them on this shard).
 ///
-/// Returns `Err(())` on AOF failure so the caller surfaces `AOF_FSYNC_ERR`
-/// instead of a false `+OK` (design-for-failure; matches the handler).
+/// Returns `Err(())` when the append never reached the writer so the caller
+/// surfaces `AOF_FSYNC_ERR` instead of a false `+OK` (design-for-failure).
 async fn persist_local_leg(
     aof_pool: Option<&Arc<crate::persistence::aof::AofWriterPool>>,
     repl_state: ReplStateRef<'_>,
     my_shard: usize,
     serialized: Bytes,
-) -> Result<(), ()> {
-    let Some(pool) = aof_pool else { return Ok(()) };
+) -> Result<bool, ()> {
+    let Some(pool) = aof_pool else {
+        return Ok(false);
+    };
     let lsn = crate::persistence::aof::AofWriterPool::issue_append_lsn(
         repl_state,
         my_shard,
         serialized.len(),
     );
-    match pool
-        .try_send_append_durable(my_shard, lsn, serialized)
-        .await
-    {
-        Ok(()) => Ok(()),
+    match pool.send_append_group(my_shard, lsn, serialized).await {
+        Ok(needs_barrier) => Ok(needs_barrier),
         Err(_) => Err(()),
     }
 }
@@ -809,6 +821,7 @@ async fn coordinate_mset(
     cached_clock: &CachedClock,
     aof_pool: Option<&Arc<crate::persistence::aof::AofWriterPool>>,
     repl_state: ReplStateRef<'_>,
+    local_barrier_pending: &mut bool,
     _response_pool: &(), // placeholder — coordinator uses oneshot internally
 ) -> Frame {
     if args.is_empty() || !args.len().is_multiple_of(2) {
@@ -850,11 +863,13 @@ async fn coordinate_mset(
         // owned by my_shard — matching the local single-key write contract.
         if let Some(pairs) = groups.get(&my_shard) {
             let serialized = serialize_local_mset(pairs);
-            if persist_local_leg(aof_pool, repl_state, my_shard, serialized)
-                .await
-                .is_err()
-            {
-                return Frame::Error(Bytes::from_static(crate::persistence::aof::AOF_FSYNC_ERR));
+            match persist_local_leg(aof_pool, repl_state, my_shard, serialized).await {
+                Ok(needs_barrier) => *local_barrier_pending |= needs_barrier,
+                Err(()) => {
+                    return Frame::Error(Bytes::from_static(
+                        crate::persistence::aof::AOF_FSYNC_ERR,
+                    ));
+                }
             }
         }
         return resp;
@@ -904,11 +919,11 @@ async fn coordinate_mset(
     // write keys this shard doesn't own).
     if let Some(pairs) = groups.get(&my_shard) {
         let serialized = serialize_local_mset(pairs);
-        if persist_local_leg(aof_pool, repl_state, my_shard, serialized)
-            .await
-            .is_err()
-        {
-            return Frame::Error(Bytes::from_static(crate::persistence::aof::AOF_FSYNC_ERR));
+        match persist_local_leg(aof_pool, repl_state, my_shard, serialized).await {
+            Ok(needs_barrier) => *local_barrier_pending |= needs_barrier,
+            Err(()) => {
+                return Frame::Error(Bytes::from_static(crate::persistence::aof::AOF_FSYNC_ERR));
+            }
         }
     }
 
@@ -935,6 +950,7 @@ async fn coordinate_msetnx(
     cached_clock: &CachedClock,
     aof_pool: Option<&Arc<crate::persistence::aof::AofWriterPool>>,
     repl_state: ReplStateRef<'_>,
+    local_barrier_pending: &mut bool,
     _response_pool: &(), // placeholder — coordinator uses oneshot internally
 ) -> Frame {
     if args.is_empty() || !args.len().is_multiple_of(2) {
@@ -983,11 +999,13 @@ async fn coordinate_msetnx(
         if matches!(resp, Frame::Integer(1)) {
             let serialized =
                 crate::persistence::aof::serialize_command(&Frame::Array(command_parts.into()));
-            if persist_local_leg(aof_pool, repl_state, my_shard, serialized)
-                .await
-                .is_err()
-            {
-                return Frame::Error(Bytes::from_static(crate::persistence::aof::AOF_FSYNC_ERR));
+            match persist_local_leg(aof_pool, repl_state, my_shard, serialized).await {
+                Ok(needs_barrier) => *local_barrier_pending |= needs_barrier,
+                Err(()) => {
+                    return Frame::Error(Bytes::from_static(
+                        crate::persistence::aof::AOF_FSYNC_ERR,
+                    ));
+                }
             }
         }
         resp

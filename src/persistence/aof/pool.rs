@@ -282,6 +282,32 @@ impl AofWriterPool {
         }
     }
 
+    /// Group-commit append for coordinator LOCAL legs (v3-5 local-leg fix).
+    ///
+    /// Enqueues the append under bounded backpressure and returns WITHOUT
+    /// awaiting the per-write fsync ack — under `Always` the old
+    /// `try_send_append_durable` path serialized one awaited fsync per
+    /// coordinated command, stacking up to `fsync_timeout` each in a pipeline
+    /// (the measured 2000–3000ms always-tail). This is the same
+    /// fire-and-forget-then-barrier contract the cross-shard REMOTE legs
+    /// already use (SPSC arm append + handler `fsync_barrier`).
+    ///
+    /// Returns `Ok(true)` when the caller MUST confirm durability with ONE
+    /// [`Self::fsync_barrier`]`(shard_id)` before acking the client (`Always`),
+    /// `Ok(false)` when the writer loop owns the fsync cadence
+    /// (`EverySec`/`No`), and `Err(_)` when the append never reached the
+    /// writer — the caller must surface an error frame, never `+OK`.
+    #[inline]
+    pub async fn send_append_group(
+        &self,
+        shard_id: usize,
+        lsn: u64,
+        bytes: Bytes,
+    ) -> Result<bool, AofAck> {
+        self.send_append_backpressure(shard_id, lsn, bytes).await?;
+        Ok(matches!(self.fsync_policy, FsyncPolicy::Always))
+    }
+
     /// Durability barrier for cross-shard pipelined writes under
     /// `appendfsync=always` (H1 fix, C4-FOLD-FIX follow-up).
     ///
@@ -1836,6 +1862,90 @@ mod pool_tests {
             result.is_ok(),
             "EverySec policy must be fire-and-forget (Ok), got {:?}",
             result
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // GC-LOCAL-LEG (v3-5): send_append_group must enqueue WITHOUT awaiting the
+    // per-write fsync ack, so coordinator local legs ride the batch-end
+    // fsync_barrier (ONE fsync per pipeline batch) instead of stacking one
+    // awaited fsync per command (the measured 2000-3000ms always-tail).
+    // -----------------------------------------------------------------------
+    #[test]
+    fn send_append_group_always_enqueues_without_awaiting_fsync() {
+        let (tx0, rx0) = channel::mpsc_bounded::<AofMessage>(4);
+        let (tx1, _rx1) = channel::mpsc_bounded::<AofMessage>(4);
+        // Long fsync timeout: if the implementation wrongly awaits the fsync
+        // ack (nobody acks here), the elapsed assertion below fails loudly.
+        let pool = AofWriterPool::per_shard_with_policy(
+            vec![tx0, tx1],
+            FsyncPolicy::Always,
+            Duration::from_millis(5000),
+        );
+
+        let start = std::time::Instant::now();
+        let result = futures::executor::block_on(pool.send_append_group(
+            0,
+            77,
+            Bytes::from_static(b"MSET k v"),
+        ));
+
+        assert_eq!(
+            result,
+            Ok(true),
+            "Always policy must enqueue and report that a barrier is required"
+        );
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "send_append_group must NOT await the per-write fsync ack"
+        );
+        // The append must be in the writer channel as a plain Append (no ack
+        // slot) — durability confirmation belongs to the batch-end barrier.
+        match rx0.try_recv() {
+            Ok(AofMessage::Append { lsn, .. }) => assert_eq!(lsn, 77),
+            other => panic!("expected plain Append in channel, got {:?}", other.is_ok()),
+        }
+    }
+
+    #[test]
+    fn send_append_group_everysec_needs_no_barrier() {
+        let (tx0, _rx0) = channel::mpsc_bounded::<AofMessage>(4);
+        let (tx1, _rx1) = channel::mpsc_bounded::<AofMessage>(4);
+        let pool = AofWriterPool::per_shard_with_policy(
+            vec![tx0, tx1],
+            FsyncPolicy::EverySec,
+            Duration::ZERO,
+        );
+        let result = futures::executor::block_on(pool.send_append_group(
+            0,
+            78,
+            Bytes::from_static(b"MSET k v"),
+        ));
+        assert_eq!(
+            result,
+            Ok(false),
+            "EverySec needs no barrier — writer loop owns the 1s fsync cadence"
+        );
+    }
+
+    #[test]
+    fn send_append_group_dead_writer_returns_err() {
+        let (tx0, rx0) = channel::mpsc_bounded::<AofMessage>(4);
+        let (tx1, _rx1) = channel::mpsc_bounded::<AofMessage>(4);
+        drop(rx0); // writer gone
+        let pool = AofWriterPool::per_shard_with_policy(
+            vec![tx0, tx1],
+            FsyncPolicy::Always,
+            Duration::from_millis(50),
+        );
+        let result = futures::executor::block_on(pool.send_append_group(
+            0,
+            79,
+            Bytes::from_static(b"MSET k v"),
+        ));
+        assert!(
+            result.is_err(),
+            "a dead writer must surface as Err so the caller never acks +OK"
         );
     }
 

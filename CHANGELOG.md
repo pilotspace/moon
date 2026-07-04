@@ -6,6 +6,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance — coordinator local legs ride group commit under appendfsync=always (PR #TBD)
+
+- The cross-shard coordinator's LOCAL-leg persist (co-located MSET/MSETNX and
+  scattered-MSET local slices) awaited one fsync ack **per command**, each
+  bounded by `--aof-fsync-timeout-ms` (default 2000ms) — a pipeline of
+  coordinated writes stacked these serially into the measured 2000–3000ms
+  `always` far-tail. Local legs now enqueue fire-and-forget (bounded
+  backpressure, same contract as the remote SPSC legs) and the connection
+  handler confirms them with **one** `fsync_barrier` on the local shard per
+  pipeline batch, before responses are serialized — so `+OK` still implies
+  confirmed durability, but a batch of N coordinated writes costs 1 awaited
+  fsync instead of N. `everysec`/`no` behavior is unchanged. On barrier
+  failure every affected response is replaced with `MOONERR AOF fsync`
+  (never a false `+OK`).
+
 ## [0.5.1] — 2026-07-04
 
 ### Fixed

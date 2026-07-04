@@ -374,6 +374,9 @@ pub(crate) async fn handle_connection_sharded_inner<
                 }
 
                 let mut responses: Vec<Frame> = Vec::with_capacity(batch.len());
+                // v3-5 group commit: response indexes of coordinator LOCAL-leg
+                // writes pending the batch-end fsync_barrier(ctx.shard_id).
+                let mut local_leg_write_idxs: Vec<usize> = Vec::new();
                 let mut should_quit = false;
                 let mut remote_groups: HashMap<usize, Vec<(usize, std::sync::Arc<Frame>, Option<Bytes>, Bytes, usize)>> = HashMap::with_capacity(ctx.num_shards);
                 // Accumulate cross-shard PUBLISH pairs per target shard for batch dispatch
@@ -1040,7 +1043,13 @@ pub(crate) async fn handle_connection_sharded_inner<
 
                     // --- Multi-key commands ---
                     if is_multi_key_command(cmd, cmd_args) {
-                        let response = crate::shard::coordinator::coordinate_multi_key(cmd, cmd_args, ctx.shard_id, ctx.num_shards, conn.selected_db, &ctx.shard_databases, &ctx.dispatch_tx, &ctx.spsc_notifiers, &ctx.cached_clock, ctx.aof_pool.as_ref(), &ctx.repl_state, &()).await;
+                        let mut local_barrier_pending = false;
+                        let response = crate::shard::coordinator::coordinate_multi_key(cmd, cmd_args, ctx.shard_id, ctx.num_shards, conn.selected_db, &ctx.shard_databases, &ctx.dispatch_tx, &ctx.spsc_notifiers, &ctx.cached_clock, ctx.aof_pool.as_ref(), &ctx.repl_state, &mut local_barrier_pending, &()).await;
+                        // Only successful writes join the barrier set — an error
+                        // response must not be overwritten by a barrier failure.
+                        if local_barrier_pending && !matches!(response, Frame::Error(_)) {
+                            local_leg_write_idxs.push(responses.len());
+                        }
                         responses.push(response);
                         continue;
                     }
@@ -1702,6 +1711,23 @@ pub(crate) async fn handle_connection_sharded_inner<
                                         );
                                     }
                                 }
+                            }
+                        }
+                    }
+                }
+
+                // v3-5 GROUP-COMMIT BARRIER: coordinator LOCAL legs (MSET/MSETNX)
+                // were enqueued fire-and-forget into MY shard's AOF writer during
+                // dispatch; ONE barrier confirms all of them with a single fsync
+                // instead of the retired per-command awaited fsync. Runs BEFORE
+                // response serialization — no +OK without confirmed durability.
+                if !local_leg_write_idxs.is_empty() {
+                    if let Some(ref pool) = ctx.aof_pool {
+                        if pool.fsync_barrier(ctx.shard_id).await.is_err() {
+                            for idx in local_leg_write_idxs.drain(..) {
+                                responses[idx] = Frame::Error(
+                                    Bytes::from_static(aof::AOF_FSYNC_ERR),
+                                );
                             }
                         }
                     }

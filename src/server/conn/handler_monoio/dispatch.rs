@@ -1199,6 +1199,9 @@ pub(super) async fn try_handle_cross_shard_commands(
     conn: &ConnectionState,
     ctx: &ConnectionContext,
     responses: &mut Vec<Frame>,
+    // v3-5 group commit: response indexes of local-leg writes pending the
+    // batch-end fsync_barrier(ctx.shard_id) (appendfsync=always only).
+    local_leg_write_idxs: &mut Vec<usize>,
 ) -> bool {
     if ctx.num_shards <= 1 {
         return false;
@@ -1278,6 +1281,7 @@ pub(super) async fn try_handle_cross_shard_commands(
 
     // --- Multi-key commands: MGET, MSET, DEL, UNLINK, EXISTS ---
     if is_multi_key_command(cmd, cmd_args) {
+        let mut local_barrier_pending = false;
         let response = crate::shard::coordinator::coordinate_multi_key(
             cmd,
             cmd_args,
@@ -1290,9 +1294,15 @@ pub(super) async fn try_handle_cross_shard_commands(
             &ctx.cached_clock,
             ctx.aof_pool.as_ref(),
             &ctx.repl_state,
+            &mut local_barrier_pending,
             &(), // monoio: coordinator uses oneshot, not response_pool
         )
         .await;
+        // A response that is already an error must not be overwritten by a
+        // barrier failure; only successful writes join the barrier set.
+        if local_barrier_pending && !matches!(response, Frame::Error(_)) {
+            local_leg_write_idxs.push(responses.len());
+        }
         responses.push(response);
         return true;
     }

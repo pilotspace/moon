@@ -192,6 +192,10 @@ pub(crate) async fn handle_connection_sharded_monoio<
     > = HashMap::with_capacity(ctx.num_shards);
     let mut reply_futures: Vec<(Vec<(usize, Option<Bytes>, Bytes)>, usize)> =
         Vec::with_capacity(ctx.num_shards);
+    // v3-5 group commit: response indexes of coordinator LOCAL-leg writes whose
+    // AOF append was enqueued but not yet fsync-confirmed (appendfsync=always).
+    // Drained by ONE fsync_barrier(ctx.shard_id) at end of batch.
+    let mut local_leg_write_idxs: Vec<usize> = Vec::new();
 
     // Pre-allocated response slots for zero-allocation cross-shard dispatch
     // (L3b, tokio parity — handler_sharded/mod.rs). One slot per target shard;
@@ -589,6 +593,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
         let mut should_quit = false;
         responses.clear();
         remote_groups.clear();
+        local_leg_write_idxs.clear();
         let mut publish_batches: std::collections::HashMap<usize, Vec<(usize, Bytes, Bytes)>> =
             std::collections::HashMap::new();
 
@@ -940,8 +945,15 @@ pub(crate) async fn handle_connection_sharded_monoio<
             }
 
             // --- Cross-shard aggregation commands: KEYS, SCAN, DBSIZE + multi-key ---
-            if dispatch::try_handle_cross_shard_commands(cmd, cmd_args, &conn, ctx, &mut responses)
-                .await
+            if dispatch::try_handle_cross_shard_commands(
+                cmd,
+                cmd_args,
+                &conn,
+                ctx,
+                &mut responses,
+                &mut local_leg_write_idxs,
+            )
+            .await
             {
                 continue;
             }
@@ -1796,6 +1808,22 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                     Frame::Error(Bytes::from_static(aof::AOF_FSYNC_ERR));
                             }
                         }
+                    }
+                }
+            }
+        }
+
+        // v3-5 GROUP-COMMIT BARRIER: coordinator LOCAL legs (MSET/MSETNX) were
+        // enqueued fire-and-forget into MY shard's AOF writer during dispatch;
+        // one barrier here confirms every one of them with a single fsync
+        // instead of the retired per-command awaited fsync (2000ms tail stack).
+        // Runs BEFORE response serialization — the client never sees +OK for a
+        // write whose durability was not confirmed.
+        if !local_leg_write_idxs.is_empty() {
+            if let Some(ref pool) = ctx.aof_pool {
+                if pool.fsync_barrier(ctx.shard_id).await.is_err() {
+                    for idx in local_leg_write_idxs.drain(..) {
+                        responses[idx] = Frame::Error(Bytes::from_static(aof::AOF_FSYNC_ERR));
                     }
                 }
             }
