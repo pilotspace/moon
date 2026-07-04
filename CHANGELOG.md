@@ -6,6 +6,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Docker image build** — the multi-stage `Dockerfile` now copies the vendored
+  `vendor/monoio` source into the cargo-chef planner and cook stages. The v0.5.0
+  release introduced a `[patch.crates-io] monoio = { path = "vendor/monoio" }`
+  path dependency, but the chef stages only copied `Cargo.toml`/`Cargo.lock`/`src`,
+  so `cargo chef cook` panicked (`failed to load source for dependency monoio …
+  vendor/monoio/Cargo.toml: No such file or directory`) and the `Docker Image`
+  release job failed. Adds a standalone `docker-publish.yml` workflow to
+  (re)publish only the container image for a tag whose other assets are already live.
+
 ## [0.5.0] — 2026-07-04
 
 Two milestones since v0.4.1:

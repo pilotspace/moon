@@ -50,6 +50,11 @@ FROM chef-base AS chef-planner
 
 COPY Cargo.toml Cargo.lock ./
 COPY src/ src/
+# Vendored monoio 0.2.4 is a [patch.crates-io] path dependency (see Cargo.toml).
+# cargo-chef must see its manifest+source to record it in the recipe, and the
+# cook stage must be able to read vendor/monoio/Cargo.toml or it panics
+# (cargo-chef recipe.rs: "failed to load source for dependency `monoio`").
+COPY vendor/ vendor/
 
 # Create minimal bench stubs so cargo-chef can resolve Cargo.toml
 RUN mkdir -p benches && \
@@ -67,6 +72,9 @@ RUN cargo chef prepare --recipe-path recipe.json
 FROM chef-base AS chef-cook
 
 COPY --from=chef-planner /app/recipe.json recipe.json
+# The recipe references the vendored monoio patch by path; cook reads its
+# manifest+source to compile it into the cached dependency layer.
+COPY vendor/ vendor/
 
 ARG FEATURES=runtime-monoio,jemalloc
 

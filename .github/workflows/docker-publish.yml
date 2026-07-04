@@ -1,0 +1,84 @@
+# Standalone Docker image publish (manual, fix-forward).
+#
+# WHY THIS EXISTS: release.yml's `docker` job is chained behind the full
+# release DAG (setup → build → package → sign → release). If only the Docker
+# image needs to be (re)published for a tag whose binary/package assets are
+# already live — e.g. the v0.5.0 image failed because the Dockerfile did not
+# copy the vendored `[patch.crates-io]` monoio source into the cargo-chef
+# stages — re-running release.yml would rebuild all assets and re-touch the
+# existing GitHub release. This workflow rebuilds+pushes ONLY the container
+# image, from whatever ref is dispatched (default: main, which carries the
+# Dockerfile fix), while tagging the image with the requested release version.
+#
+# The image is a full source build from the checked-out ref; the Moon source
+# at v0.5.0's commit is byte-identical to main's (the fix touches only the
+# Dockerfile), so the amd64 binary matches the v0.5.0 release.
+#
+# Usage: gh workflow run docker-publish.yml --ref main -f version=v0.5.0
+name: Docker Publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version to tag the image (e.g. v0.5.0)'
+        type: string
+        required: true
+      push:
+        description: 'Push to GHCR (false = build-only smoke test)'
+        type: boolean
+        default: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  docker:
+    name: Docker Image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Login to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute version and Docker tags
+        id: version
+        env:
+          VER: ${{ inputs.version }}
+          REPO: ${{ github.repository }}
+        run: |
+          VERSION="${VER#v}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          # Mirror release.yml: only stable versions move :latest — a
+          # prerelease tag (contains '-') pushes the versioned tag only.
+          TAGS="ghcr.io/${REPO}:${VERSION}"
+          if [[ "$VERSION" != *-* ]]; then
+            TAGS="${TAGS}"$'\n'"ghcr.io/${REPO}:latest"
+          fi
+          {
+            echo "tags<<EOF"
+            echo "$TAGS"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: ${{ inputs.push }}
+          tags: ${{ steps.version.outputs.tags }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
