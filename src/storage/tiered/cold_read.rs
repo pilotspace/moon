@@ -13,18 +13,48 @@ use crate::persistence::kv_page::{ValueType, entry_flags, read_overflow_chain};
 use crate::persistence::page::PAGE_4K;
 use crate::storage::entry::RedisValue;
 
+/// Outcome of a cold read, distinguishing EXPIRED from plain miss so the
+/// caller can reclaim the index entry (R1: expired cold entries used to leak
+/// their index entry + file refcount forever — nothing else ever reclaims
+/// them; the orphan sweep only checks hot-shadowing).
+pub enum ColdReadOutcome {
+    /// Entry found and alive.
+    Hit(RedisValue, Option<u64>),
+    /// Entry found but its TTL has passed — caller must remove the index entry.
+    Expired,
+    /// Not found / file unreadable / corrupt. The index entry is left alone:
+    /// a transient I/O error must not permanently drop the key.
+    Miss,
+}
+
 /// Attempt to read a cold KV entry from disk.
 ///
 /// Returns `Some((RedisValue, ttl_ms))` on hit, `None` on miss/expired/error.
 /// The caller is responsible for promoting the entry back to the DashTable
-/// and removing it from the cold index.
+/// and removing it from the cold index. Callers that can reclaim expired
+/// entries should prefer [`cold_read_through_outcome`].
 pub fn cold_read_through(
     cold_index: &ColdIndex,
     shard_dir: &Path,
     key: &[u8],
     now_ms: u64,
 ) -> Option<(RedisValue, Option<u64>)> {
-    let location = cold_index.lookup(key)?;
+    match cold_read_through_outcome(cold_index, shard_dir, key, now_ms) {
+        ColdReadOutcome::Hit(v, ttl) => Some((v, ttl)),
+        ColdReadOutcome::Expired | ColdReadOutcome::Miss => None,
+    }
+}
+
+/// Outcome-aware variant of [`cold_read_through`] (R1 reclaim path).
+pub fn cold_read_through_outcome(
+    cold_index: &ColdIndex,
+    shard_dir: &Path,
+    key: &[u8],
+    now_ms: u64,
+) -> ColdReadOutcome {
+    let Some(location) = cold_index.lookup(key) else {
+        return ColdReadOutcome::Miss;
+    };
     read_cold_entry(shard_dir, location, now_ms)
 }
 
@@ -37,32 +67,39 @@ pub fn read_cold_entry_at(
     location: ColdLocation,
     now_ms: u64,
 ) -> Option<(RedisValue, Option<u64>)> {
-    read_cold_entry(shard_dir, location, now_ms)
+    match read_cold_entry(shard_dir, location, now_ms) {
+        ColdReadOutcome::Hit(v, ttl) => Some((v, ttl)),
+        ColdReadOutcome::Expired | ColdReadOutcome::Miss => None,
+    }
 }
 
-fn read_cold_entry(
-    shard_dir: &Path,
-    location: ColdLocation,
-    now_ms: u64,
-) -> Option<(RedisValue, Option<u64>)> {
+fn read_cold_entry(shard_dir: &Path, location: ColdLocation, now_ms: u64) -> ColdReadOutcome {
     let file_path = shard_dir
         .join("data")
         .join(format!("heap-{:06}.mpf", location.file_id));
 
-    let file = std::fs::File::open(&file_path).ok()?;
+    let Ok(file) = std::fs::File::open(&file_path) else {
+        return ColdReadOutcome::Miss;
+    };
 
     // Read only the specific 4KB page identified by page_idx (pread, no whole-file read).
     let page_offset = (location.page_idx as u64) * (PAGE_4K as u64);
     let mut leaf_buf = [0u8; PAGE_4K];
-    crate::util::file_ext::read_exact_at(&file, &mut leaf_buf, page_offset).ok()?;
+    if crate::util::file_ext::read_exact_at(&file, &mut leaf_buf, page_offset).is_err() {
+        return ColdReadOutcome::Miss;
+    }
 
-    let page = crate::persistence::kv_page::KvLeafPage::from_bytes(leaf_buf)?;
-    let entry = page.get(location.slot_idx)?;
+    let Some(page) = crate::persistence::kv_page::KvLeafPage::from_bytes(leaf_buf) else {
+        return ColdReadOutcome::Miss;
+    };
+    let Some(entry) = page.get(location.slot_idx) else {
+        return ColdReadOutcome::Miss;
+    };
 
     // Check TTL expiry
     if let Some(ttl_ms) = entry.ttl_ms {
         if now_ms > ttl_ms {
-            return None; // Expired
+            return ColdReadOutcome::Expired;
         }
     }
 
@@ -71,12 +108,20 @@ fn read_cold_entry(
     let value_bytes = if entry.flags & entry_flags::OVERFLOW != 0 {
         // Overflow pointer: start_page_idx as u32 LE
         if entry.value.len() < 4 {
-            return None;
+            return ColdReadOutcome::Miss;
         }
-        let start_page_idx = u32::from_le_bytes(entry.value[..4].try_into().ok()?) as usize;
+        let Ok(ptr_bytes) = <[u8; 4]>::try_from(&entry.value[..4]) else {
+            return ColdReadOutcome::Miss;
+        };
+        let start_page_idx = u32::from_le_bytes(ptr_bytes) as usize;
         // Only read the full file when following an overflow chain.
-        let file_data = std::fs::read(&file_path).ok()?;
-        read_overflow_chain(&file_data, start_page_idx)?
+        let Ok(file_data) = std::fs::read(&file_path) else {
+            return ColdReadOutcome::Miss;
+        };
+        match read_overflow_chain(&file_data, start_page_idx) {
+            Some(v) => v,
+            None => return ColdReadOutcome::Miss,
+        }
     } else {
         entry.value
     };
@@ -84,10 +129,13 @@ fn read_cold_entry(
     // Convert to RedisValue based on value_type
     let redis_value = match entry.value_type {
         ValueType::String => RedisValue::String(Bytes::from(value_bytes)),
-        _ => kv_serde::deserialize_collection(&value_bytes, entry.value_type)?,
+        _ => match kv_serde::deserialize_collection(&value_bytes, entry.value_type) {
+            Some(v) => v,
+            None => return ColdReadOutcome::Miss,
+        },
     };
 
-    Some((redis_value, entry.ttl_ms))
+    ColdReadOutcome::Hit(redis_value, entry.ttl_ms)
 }
 
 #[cfg(test)]
@@ -146,6 +194,113 @@ mod tests {
             }
             _ => panic!("expected Hash, got {:?}", value.type_name()),
         }
+    }
+
+    /// Build a Database with an active cold tier holding one spilled key.
+    fn db_with_spilled_key(
+        shard_dir: &std::path::Path,
+        key: &[u8],
+        value: &[u8],
+        ttl_ms: Option<u64>,
+    ) -> crate::storage::db::Database {
+        let manifest_path = shard_dir.join("shard.manifest");
+        let mut manifest = ShardManifest::create(&manifest_path).unwrap();
+        let mut cold_index = ColdIndex::new();
+
+        let mut entry = Entry::new_string(Bytes::copy_from_slice(value));
+        if let Some(ttl) = ttl_ms {
+            entry.set_expires_at_ms(0, ttl);
+        }
+        spill_to_datafile(
+            shard_dir,
+            40,
+            key,
+            &entry,
+            &mut manifest,
+            Some(&mut cold_index),
+        )
+        .unwrap();
+
+        let mut db = crate::storage::db::Database::new();
+        db.cold_shard_dir = Some(shard_dir.to_path_buf());
+        db.cold_index = Some(cold_index);
+        db
+    }
+
+    /// D1 (PR review of tmp/OFFLOAD-COMPRESSION-REVIEW.md): DEL of a spilled
+    /// key must actually delete it — count it, drop the index entry, and make
+    /// subsequent GETs return nil instead of resurrecting the cold value.
+    #[test]
+    fn test_del_removes_cold_entry_no_resurrection() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut db = db_with_spilled_key(tmp.path(), b"doomed", b"value-on-disk", None);
+
+        // Sanity: the key is reachable via cold read-through before DEL.
+        assert!(
+            db.cold_index.as_ref().unwrap().lookup(b"doomed").is_some(),
+            "precondition: key is cold-indexed"
+        );
+
+        let frame = crate::command::key::del(
+            &mut db,
+            &[crate::protocol::Frame::BulkString(Bytes::from_static(
+                b"doomed",
+            ))],
+        );
+        assert_eq!(
+            frame,
+            crate::protocol::Frame::Integer(1),
+            "DEL of a cold-only key must count it as removed"
+        );
+        assert!(
+            db.get(b"doomed").is_none(),
+            "GET after DEL must NOT resurrect the cold value"
+        );
+        assert!(
+            db.cold_index.as_ref().unwrap().lookup(b"doomed").is_none(),
+            "cold index entry must be gone after DEL"
+        );
+        assert!(
+            db.cold_index.as_ref().unwrap().has_pending_unlink(),
+            "last referrer removed: file must be queued for unlink"
+        );
+    }
+
+    /// D1: FLUSHDB/FLUSHALL (`Database::clear`) must clear the cold tier too —
+    /// flushed keys must not remain readable from disk.
+    #[test]
+    fn test_clear_flushes_cold_tier() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut db = db_with_spilled_key(tmp.path(), b"flushed", b"value-on-disk", None);
+
+        db.clear();
+
+        assert!(
+            db.get(b"flushed").is_none(),
+            "GET after FLUSH must NOT read the cold value back from disk"
+        );
+        assert!(
+            db.cold_index.as_ref().unwrap().has_pending_unlink(),
+            "cold files must be queued for unlink after clear"
+        );
+    }
+
+    /// R1: a cold read that finds the entry EXPIRED must reclaim the index
+    /// entry (and thereby the file refcount) instead of leaking it forever.
+    #[test]
+    fn test_expired_cold_read_reclaims_index_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        // TTL 1ms in the past relative to the read below.
+        let mut db = db_with_spilled_key(tmp.path(), b"stale", b"old", Some(1));
+
+        assert!(
+            db.get(b"stale").is_none(),
+            "expired cold entry reads as nil"
+        );
+        assert!(
+            db.cold_index.as_ref().unwrap().lookup(b"stale").is_none(),
+            "expired cold entry must be reclaimed from the index on read"
+        );
     }
 
     #[test]
