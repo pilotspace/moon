@@ -2,7 +2,7 @@
   "project": "moon",
   "stage": "production",
   "active_task": null,
-  "active_milestone": "v3-4-kv-correctness",
+  "active_milestone": "v3-5-write-path-durability",
   "tasks": {
     "hotpath-lock-quickwins": {
       "title": "Eliminate per-command global locks & syscall-level quick wins",
@@ -243,10 +243,18 @@
       "status": "active",
       "created": "2026-07-02T13:45:23+00:00",
       "updated": "2026-07-02T13:45:23+00:00"
+    },
+    "v3-5-write-path-durability": {
+      "title": "Write-Path Durability & Volume",
+      "goal": "Moon's write path loses no client-acknowledged write silently, writes each KV record to disk exactly once unless a WAL consumer needs it, and appendfsync=always local legs ride group commit instead of serial fsync",
+      "stage": "production",
+      "status": "active",
+      "created": "2026-07-04T10:10:03+00:00",
+      "updated": "2026-07-04T10:10:03+00:00"
     }
   },
   "created": "2026-06-11T03:18:21+00:00",
-  "updated": "2026-07-02T13:45:23+00:00",
+  "updated": "2026-07-04T10:10:03+00:00",
   "setup": {
     "locked": true,
     "locked_at": "2026-06-11T03:28:00+00:00",

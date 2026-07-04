@@ -1,5 +1,10 @@
 # Releases
 
+## v0.5.1 — 2026-07-04
+milestones: none
+waivers: none
+evidence: recorded by add.py release
+
 ## v0.5.0 — 2026-07-04
 milestones: none
 waivers: shardslice-migration
