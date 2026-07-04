@@ -24,7 +24,8 @@ All options are available as command-line flags. Run `moon --help` for the full 
 |------|---------|-------------|
 | `--appendonly` | `yes` | Enable AOF persistence (`yes`/`no`) — Moon is durable by default |
 | `--appendfsync` | `everysec` | AOF fsync policy (`always`/`everysec`/`no`) |
-| `--aof-fsync-timeout-ms` | `2000` | Bound on a write's wait for its fsync barrier under `always` (0 = unbounded) |
+| `--aof-fsync-timeout-ms` | `2000` | Bound on a write's wait for durability — the fsync ack under `always`, writer-queue backpressure under `everysec` (0 = unbounded) |
+| `--wal-kv-log` | `auto` | KV logging into the per-shard WAL. `auto`: skipped while the AOF is the recovery authority and no CDC subscriber is attached (halves write volume at `--shards >= 2`); `on`: always log (needed for PITR / full CDC history with AOF on); `off`: never |
 | `--appendfilename` | `appendonly.aof` | AOF filename |
 | `--save` | *(none)* | RDB auto-save rules (e.g., `"3600 1 300 100"`) |
 | `--dir` | `.` | Directory for persistence files |

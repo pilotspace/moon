@@ -92,6 +92,14 @@ pub enum AofAck {
 pub static AOF_BACKPRESSURE_DROPPED: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// Bound for the SPSC-drain path's blocking AOF backpressure
+/// ([`AofWriterPool::send_append_bounded_blocking`]). Sized to cover the
+/// writer draining one group-commit batch (≤1024 msgs / 8 MiB buffered
+/// write, no fsync under everysec — low single-digit ms on a healthy disk)
+/// while keeping the worst-case shard event-loop stall small. Reached only
+/// when the writer channel (10k slots) is completely full.
+pub const AOF_SPSC_BACKPRESSURE_BOUND: std::time::Duration = std::time::Duration::from_millis(5);
+
 /// Result of awaiting an `AppendSync` ack under a bounded timeout (F2).
 ///
 /// Distinguishes the three terminal states the `Always` durability path

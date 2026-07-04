@@ -336,6 +336,20 @@ pub struct ServerConfig {
     #[arg(long = "wal-max-checkpoint-lag-ms", default_value_t = 10_000)]
     pub wal_max_checkpoint_lag_ms: u64,
 
+    /// KV command logging into the per-shard WAL: auto | on | off.
+    ///
+    /// `auto` (default): KV records are skipped while the AOF is the crash-
+    /// recovery authority (`--appendonly yes`) and no CDC subscriber is
+    /// attached — startup recovery wipes WAL-replayed state and replays the
+    /// AOF, so the WAL copy is pure write amplification (~2× disk writes at
+    /// shards>=2). Logging resumes dynamically when a CDC subscriber attaches.
+    /// `on`: always log (pre-0.6 behavior; required for point-in-time
+    /// recovery or full CDC history alongside `--appendonly yes`).
+    /// `off`: never log KV records (FPI/checkpoint/feature records still
+    /// written). With `--appendonly no` this leaves NO KV durability log.
+    #[arg(long = "wal-kv-log", default_value = "auto", value_parser = ["auto", "on", "off"])]
+    pub wal_kv_log: String,
+
     // ── MoonStore v2: Vector Warm Tier ──────────────────────────────
     /// mlock vector codes pages into RAM
     #[arg(long = "vec-codes-mlock", default_value = "enable")]
@@ -648,6 +662,19 @@ fn default_data_dir() -> Option<std::path::PathBuf> {
     )
 }
 
+/// Resolved `--wal-kv-log` mode (see the flag docs on `ServerConfig::wal_kv_log`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalKvLogMode {
+    /// Skip WAL KV records while the AOF is the recovery authority and no
+    /// CDC subscriber is attached; log otherwise. The per-drain decision is
+    /// made by the shard event loop (it owns the CDC registry).
+    Auto,
+    /// Always log KV records to the WAL (pre-0.6 behavior).
+    On,
+    /// Never log KV records to the WAL.
+    Off,
+}
+
 /// Outcome of persistence-directory auto-resolution (pure decision —
 /// IO happens in [`ServerConfig::resolve_dir`]).
 #[derive(Debug, PartialEq, Eq)]
@@ -731,6 +758,19 @@ impl ServerConfig {
     /// Returns true when disk offload is enabled.
     pub fn disk_offload_enabled(&self) -> bool {
         self.disk_offload == "enable"
+    }
+
+    /// Resolve `--wal-kv-log` into its mode. The CLI rejects unknown values
+    /// at parse time (`value_parser`, fail-fast on typos — a silent `Auto`
+    /// fallback could unexpectedly disable WAL KV history needed for
+    /// PITR/CDC); the `_ => Auto` arm below only covers programmatic
+    /// construction in tests.
+    pub fn wal_kv_log_mode(&self) -> WalKvLogMode {
+        match self.wal_kv_log.as_str() {
+            "on" => WalKvLogMode::On,
+            "off" => WalKvLogMode::Off,
+            _ => WalKvLogMode::Auto,
+        }
     }
 
     /// Returns true when WAL Full Page Images are enabled.

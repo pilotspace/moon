@@ -412,6 +412,7 @@ mod tests {
                 crate::shard::autovacuum::AutovacuumConfig::default(),
             ),
             None, // aof_pool — None in tests
+            true, // wal_kv_log — legacy behavior in tests
         );
 
         // Subscriber now receives pre-serialized RESP bytes
@@ -474,6 +475,7 @@ mod tests {
                 crate::shard::autovacuum::AutovacuumConfig::default(),
             ),
             None, // aof_pool — None in tests
+            true, // wal_kv_log — legacy behavior in tests
         );
     }
 
