@@ -392,6 +392,20 @@ fn main() -> anyhow::Result<()> {
 
     info!("Starting with {} shards", num_shards);
 
+    // FT.SEARCH intra-query worker pool: fan per-segment HNSW searches of one
+    // query across workers (threads spawn eagerly here — the pool is tiny and
+    // parks on its channel when vector search is unused).
+    let ft_workers = config.ft_search_workers.unwrap_or_else(|| {
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        moon::vector::search_pool::auto_workers(cores, num_shards)
+    });
+    moon::vector::search_pool::init_global(ft_workers);
+    if ft_workers > 0 {
+        info!("FT.SEARCH worker pool: {ft_workers} threads");
+    }
+
     // Checked cast: --shards is bounded by clap's value_parser, but `as u16`
     // would silently wrap for values > 65535. Fail loudly instead.
     // ALLOW: panic is appropriate here — this is `main`, not library code.

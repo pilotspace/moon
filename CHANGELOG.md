@@ -6,6 +6,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance — FT.SEARCH intra-query worker pool + bounded bulk compaction
+
+- **`--ft-search-workers N` worker pool** (`src/vector/search_pool.rs`): the
+  per-segment HNSW searches of ONE KNN query fan out across a pool of searcher
+  threads while the shard task scans the mutable segment; replies are awaited
+  with `flume::recv_async`, so the shard event loop is never blocked. Default
+  auto-sizes to `vCPUs − shards` (cap 8) — 0 on shards==cores deployments so
+  KV latency is never contended; `0` disables (identical results either way,
+  enforced by pooled-vs-serial identity + 8-thread concurrency stress tests).
+  Worker panics are contained per-job (empty segment result + warn, never a
+  hang). Runtime-agnostic (monoio + tokio).
+- **Bounded bulk compaction**: with a pool active and `COMPACT_THRESHOLD > 0`,
+  one compaction build freezes at most `max(threshold, len/8)` entries
+  (`MutableSegment::freeze_prefix`), so FT.COMPACT after a bulk load yields
+  several independently searchable segments instead of one giant graph —
+  bounded build memory and pool-parallel search. Pool-less deployments keep
+  single-segment builds (multi-segment serial search would be strictly
+  slower). Red/green: `test_force_compact_bulk_bounded_segments`,
+  `test_bg_compact_bulk_bounded_segments`.
+- Measured (macOS dev, 20k×384d clustered SQ8, single connection,
+  post-FT.COMPACT): p50 2.06 ms → **0.46 ms**, 473 → **2,321 QPS (4.9×)** at
+  R@10 = 1.0. Production numbers from the GCE vs-RediSearch re-run are in
+  PR #214.
+
 ### Fixed — update-churn no longer mass-deletes vectors at compact/merge install (soak-diagnostic find)
 
 - **Compact install: dead window entries no longer kill their own update.**

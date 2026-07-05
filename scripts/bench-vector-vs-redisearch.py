@@ -271,6 +271,9 @@ def main():
     ap.add_argument("--out", default="vector-vs-redisearch.json")
     ap.add_argument("--only", choices=["moon", "redisearch"],
                     help="bench a single engine (smoke tests)")
+    ap.add_argument("--moon-args", default="",
+                    help="extra CLI args appended to the moon server command "
+                         "(e.g. '--ft-search-workers 0' for A/B runs)")
     args = ap.parse_args()
     if args.only != "redisearch" and not args.moon_bin:
         ap.error("--moon-bin required")
@@ -321,11 +324,10 @@ def main():
         # ── Moon SQ8 / TQ4 ──
         for quant in ("SQ8", "TQ4") if args.only != "redisearch" else ():
             d = tempfile.mkdtemp(prefix=f"moon-{quant}-")
-            srv = Server(
-                [args.moon_bin, "--port", str(args.port), "--shards", "1",
-                 "--admin-port", "0", "--appendonly", "no", "--dir", d],
-                args.port, os.path.join(d, "log"),
-            )
+            argv = [args.moon_bin, "--port", str(args.port), "--shards", "1",
+                    "--admin-port", "0", "--appendonly", "no", "--dir", d]
+            argv += args.moon_args.split()
+            srv = Server(argv, args.port, os.path.join(d, "log"))
             try:
                 srv.wait_ready()
                 c = Resp(args.port)

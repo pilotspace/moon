@@ -12,6 +12,7 @@ pub mod index_persist;
 pub mod metrics;
 pub mod mvcc;
 pub mod persistence;
+pub mod search_pool;
 pub mod segment;
 pub mod sparse;
 pub mod store;

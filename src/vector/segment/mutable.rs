@@ -1110,10 +1110,40 @@ impl MutableSegment {
 
     /// Freeze: snapshot TQ codes and entries for compaction.
     pub fn freeze(&self) -> FrozenSegment {
+        self.freeze_prefix(usize::MAX)
+    }
+
+    /// Freeze only the first `n` entries (clamped to len) for a **bounded**
+    /// compaction build. Bulk loads compact into several threshold-sized
+    /// segments instead of one giant graph — bounding build memory/latency and
+    /// giving the intra-query search pool independent segments to fan out
+    /// over. The frozen window is the prefix `[0, n)`, so entry
+    /// `vector_offset`s (absolute from 0) stay valid; the tail survives via
+    /// `clone_suffix(n)` at install, exactly like a mid-build append.
+    pub fn freeze_prefix(&self, n: usize) -> FrozenSegment {
         let inner = self.inner.read();
+        let n = n.min(inner.entries.len());
+        let dim = inner.dimension as usize;
+        // SQ8 has no QJL/residual side data; its codes are not TQ-decodable, so
+        // the recompute paths (which assume TQ layout) must be skipped entirely.
+        let exact_tq = self.collection.build_mode
+            == crate::vector::turbo_quant::collection::BuildMode::Exact
+            && self.collection.quantization != QuantizationConfig::Sq8;
+        // Recompute is whole-buffer; truncate to the frozen window afterwards.
+        let mut qjl_signs = if exact_tq {
+            self.recompute_qjl_signs(&inner)
+        } else {
+            Vec::new()
+        };
+        qjl_signs.truncate(n * inner.qjl_bytes_per_vec);
+        let mut residual_norms = if exact_tq {
+            self.recompute_residual_norms(&inner)
+        } else {
+            Vec::new()
+        };
+        residual_norms.truncate(n);
         FrozenSegment {
-            entries: inner
-                .entries
+            entries: inner.entries[..n]
                 .iter()
                 .map(|e| MutableEntry {
                     internal_id: e.internal_id,
@@ -1125,28 +1155,25 @@ impl MutableSegment {
                     txn_id: e.txn_id,
                 })
                 .collect(),
-            tq_codes: inner.tq_codes.clone(),
-            // SQ8 has no QJL/residual side data; its codes are not TQ-decodable, so
-            // the recompute paths (which assume TQ layout) must be skipped entirely.
-            qjl_signs: if self.collection.build_mode
-                == crate::vector::turbo_quant::collection::BuildMode::Exact
-                && self.collection.quantization != QuantizationConfig::Sq8
-            {
-                self.recompute_qjl_signs(&inner)
-            } else {
+            tq_codes: inner.tq_codes[..n * inner.bytes_per_code].to_vec(),
+            qjl_signs,
+            residual_norms,
+            // empty in Light mode (nothing was appended)
+            raw_f32: if inner.raw_f32.is_empty() {
                 Vec::new()
-            },
-            residual_norms: if self.collection.build_mode
-                == crate::vector::turbo_quant::collection::BuildMode::Exact
-                && self.collection.quantization != QuantizationConfig::Sq8
-            {
-                self.recompute_residual_norms(&inner)
             } else {
-                Vec::new()
+                inner.raw_f32[..n * dim].to_vec()
             },
-            raw_f32: inner.raw_f32.clone(), // empty in Light mode (nothing was appended)
-            raw_f16: inner.raw_f16.clone(),
-            sub_centroid_signs: inner.sub_centroid_signs.clone(),
+            raw_f16: if inner.raw_f16.is_empty() {
+                Vec::new()
+            } else {
+                inner.raw_f16[..n * dim].to_vec()
+            },
+            sub_centroid_signs: if inner.sub_centroid_signs.is_empty() {
+                Vec::new()
+            } else {
+                inner.sub_centroid_signs[..n * inner.sub_sign_bytes_per_vec].to_vec()
+            },
             sub_sign_bytes_per_vec: inner.sub_sign_bytes_per_vec,
             bytes_per_code: inner.bytes_per_code,
             qjl_bytes_per_vec: inner.qjl_bytes_per_vec,

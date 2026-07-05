@@ -602,6 +602,24 @@ impl SegmentHolder {
         snap: &mut SearchSnapshot,
         budget: YieldBudget,
     ) -> SmallVec<[SearchResult; 32]> {
+        Self::search_mvcc_yielding_with_pool(snap, budget, crate::vector::search_pool::global())
+            .await
+    }
+
+    /// [`Self::search_mvcc_yielding`] with an explicit worker pool: when
+    /// `pool` is `Some` and the index holds ≥2 graph-tier (immutable/warm)
+    /// segments, the per-segment HNSW searches fan out to the pool while THIS
+    /// task runs the mutable MVCC scan — replies are awaited via
+    /// `recv_async`, which parks the task, never the shard event loop. With
+    /// `pool = None` (or <2 graph segments) the body is the exact serial path.
+    /// Results are identical either way: segment searches are independent
+    /// reads and the final `sort_unstable` under `SearchResult`'s total order
+    /// (distance, then id) makes accumulation order immaterial.
+    pub async fn search_mvcc_yielding_with_pool(
+        snap: &mut SearchSnapshot,
+        budget: YieldBudget,
+        pool: Option<&crate::vector::search_pool::SearchWorkerPool>,
+    ) -> SmallVec<[SearchResult; 32]> {
         // Capture-before-yield: move all read-only inputs into owned locals so
         // the per-chunk loops touch only `snap.scratch` (mutably) — no aliasing
         // borrow of `snap`. `key_hash_to_key` stays in `snap` for the response
@@ -650,6 +668,91 @@ impl SegmentHolder {
 
         let mut all: SmallVec<[SearchResult; 32]> = SmallVec::new();
 
+        // 0. Intra-query fan-out (search_pool): submit every graph-tier
+        //    (immutable/warm) segment search to the worker pool BEFORE the
+        //    mutable scan so workers overlap with it. Filter semantics mirror
+        //    the serial loops below: ACORN mode ships the allow-list bitmap to
+        //    the worker; HnswPostFilter mode searches unfiltered at fetch_k and
+        //    the bitmap is applied to the collected results (step 2).
+        let graph_jobs = segments.immutable.len() + segments.warm.len();
+        let pooled = pool.filter(|_| graph_jobs >= 2);
+        let mut pending_replies = 0usize;
+        let mut reply_rx = None;
+        if let Some(pool) = pooled {
+            let (tx, rx) = flume::bounded::<SmallVec<[SearchResult; 32]>>(graph_jobs);
+            // One owned query copy + optional bitmap clone per query — shared
+            // across this query's jobs via Arc (not per-segment copies).
+            let query_arc: std::sync::Arc<[f32]> = std::sync::Arc::from(query_f32);
+            let filter_arc = graph_filter.map(|bm| std::sync::Arc::new(bm.clone()));
+            // On submit failure (pool shut down at process teardown) the
+            // segment is searched inline — the query still answers correctly.
+            for seg in &segments.immutable {
+                let job = crate::vector::search_pool::SegmentSearchJob {
+                    segment: crate::vector::search_pool::GraphSegmentRef::Immutable(
+                        std::sync::Arc::clone(seg),
+                    ),
+                    query: std::sync::Arc::clone(&query_arc),
+                    fetch_k,
+                    ef_search: graph_ef,
+                    filter: filter_arc.clone(),
+                    reply: tx.clone(),
+                };
+                if pool.submit(job) {
+                    pending_replies += 1;
+                } else if graph_filter.is_some() {
+                    all.extend(seg.search_filtered(
+                        query_f32,
+                        fetch_k,
+                        graph_ef,
+                        &mut snap.scratch,
+                        graph_filter,
+                    ));
+                } else {
+                    let results = seg.search(query_f32, fetch_k, graph_ef, &mut snap.scratch);
+                    if post_filter {
+                        if let Some(bm) = filter_ref {
+                            all.extend(results.into_iter().filter(|r| bm.contains(r.id.0)));
+                        }
+                    } else {
+                        all.extend(results);
+                    }
+                }
+            }
+            for seg in &segments.warm {
+                let job = crate::vector::search_pool::SegmentSearchJob {
+                    segment: crate::vector::search_pool::GraphSegmentRef::Warm(
+                        std::sync::Arc::clone(seg),
+                    ),
+                    query: std::sync::Arc::clone(&query_arc),
+                    fetch_k,
+                    ef_search: graph_ef,
+                    filter: filter_arc.clone(),
+                    reply: tx.clone(),
+                };
+                if pool.submit(job) {
+                    pending_replies += 1;
+                } else if graph_filter.is_some() {
+                    all.extend(seg.search_filtered(
+                        query_f32,
+                        fetch_k,
+                        graph_ef,
+                        &mut snap.scratch,
+                        graph_filter,
+                    ));
+                } else {
+                    let results = seg.search(query_f32, fetch_k, graph_ef, &mut snap.scratch);
+                    if post_filter {
+                        if let Some(bm) = filter_ref {
+                            all.extend(results.into_iter().filter(|r| bm.contains(r.id.0)));
+                        }
+                    } else {
+                        all.extend(results);
+                    }
+                }
+            }
+            reply_rx = Some(rx);
+        }
+
         // 1. MVCC brute-force over the captured append-only range [0, mutable_len),
         //    chunked + cooperatively yielded between chunks. Query prep (FWHT
         //    rotation / SQ8 normalize) and the top-k heap are hoisted out of the
@@ -691,62 +794,97 @@ impl SegmentHolder {
         let seg_cap = budget.max_segments_per_chunk.max(1);
         let mut since_yield = 0usize;
 
-        // 2. HNSW search on immutable segments (committed by definition).
+        // 2. Graph-tier (immutable/warm) results.
+        //
+        // Pooled: collect the worker replies submitted in step 0 — one
+        // `recv_async` await per job parks this task (never the event loop)
+        // until that segment's results land. A dropped reply (worker death —
+        // catch_unwind already contains per-job panics) degrades to missing
+        // segment results with a warning, never a hang. HnswPostFilter mode
+        // applies the bitmap here, mirroring the serial branch below.
+        let pooled_graph = reply_rx.is_some();
+        if let Some(rx) = reply_rx {
+            for _ in 0..pending_replies {
+                match rx.recv_async().await {
+                    Ok(results) => {
+                        if post_filter {
+                            if let Some(bm) = filter_ref {
+                                all.extend(results.into_iter().filter(|r| bm.contains(r.id.0)));
+                            }
+                        } else {
+                            all.extend(results);
+                        }
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            "vector search worker reply dropped; a segment's results \
+                             are missing from this query"
+                        );
+                    }
+                }
+            }
+        }
+
+        // Serial path (no pool / <2 graph segments): identical to search_mvcc.
         // Strategy dispatch (XC-3): `graph_filter` is None under HnswPostFilter
         // (unfiltered traversal at fetch_k = 3×k, bitmap applied to results) —
         // otherwise the ACORN-filtered traversal, same as the sync path.
-        for imm in &segments.immutable {
-            if graph_filter.is_some() {
-                all.extend(imm.search_filtered(
-                    query_f32,
-                    fetch_k,
-                    graph_ef,
-                    &mut snap.scratch,
-                    graph_filter,
-                ));
-            } else {
-                let results = imm.search(query_f32, fetch_k, graph_ef, &mut snap.scratch);
-                if post_filter {
-                    if let Some(bm) = filter_ref {
-                        all.extend(results.into_iter().filter(|r| bm.contains(r.id.0)));
-                    }
+        if !pooled_graph {
+            for imm in &segments.immutable {
+                if graph_filter.is_some() {
+                    all.extend(imm.search_filtered(
+                        query_f32,
+                        fetch_k,
+                        graph_ef,
+                        &mut snap.scratch,
+                        graph_filter,
+                    ));
                 } else {
-                    all.extend(results);
+                    let results = imm.search(query_f32, fetch_k, graph_ef, &mut snap.scratch);
+                    if post_filter {
+                        if let Some(bm) = filter_ref {
+                            all.extend(results.into_iter().filter(|r| bm.contains(r.id.0)));
+                        }
+                    } else {
+                        all.extend(results);
+                    }
                 }
-            }
-            since_yield += 1;
-            if since_yield >= seg_cap {
-                since_yield = 0;
-                crate::admin::metrics_setup::bump_ft_search_cooperative_yield();
-                crate::runtime::cooperative_yield().await;
+                since_yield += 1;
+                if since_yield >= seg_cap {
+                    since_yield = 0;
+                    crate::admin::metrics_setup::bump_ft_search_cooperative_yield();
+                    crate::runtime::cooperative_yield().await;
+                }
             }
         }
 
         // 2a. Warm segment search (committed by definition, same as immutable).
-        for warm_seg in &segments.warm {
-            if graph_filter.is_some() {
-                all.extend(warm_seg.search_filtered(
-                    query_f32,
-                    fetch_k,
-                    graph_ef,
-                    &mut snap.scratch,
-                    graph_filter,
-                ));
-            } else {
-                let results = warm_seg.search(query_f32, fetch_k, graph_ef, &mut snap.scratch);
-                if post_filter {
-                    if let Some(bm) = filter_ref {
-                        all.extend(results.into_iter().filter(|r| bm.contains(r.id.0)));
-                    }
+        if !pooled_graph {
+            for warm_seg in &segments.warm {
+                if graph_filter.is_some() {
+                    all.extend(warm_seg.search_filtered(
+                        query_f32,
+                        fetch_k,
+                        graph_ef,
+                        &mut snap.scratch,
+                        graph_filter,
+                    ));
                 } else {
-                    all.extend(results);
+                    let results = warm_seg.search(query_f32, fetch_k, graph_ef, &mut snap.scratch);
+                    if post_filter {
+                        if let Some(bm) = filter_ref {
+                            all.extend(results.into_iter().filter(|r| bm.contains(r.id.0)));
+                        }
+                    } else {
+                        all.extend(results);
+                    }
                 }
-            }
-            since_yield += 1;
-            if since_yield >= seg_cap {
-                since_yield = 0;
-                crate::admin::metrics_setup::bump_ft_search_cooperative_yield();
-                crate::runtime::cooperative_yield().await;
+                since_yield += 1;
+                if since_yield >= seg_cap {
+                    since_yield = 0;
+                    crate::admin::metrics_setup::bump_ft_search_cooperative_yield();
+                    crate::runtime::cooperative_yield().await;
+                }
             }
         }
 

@@ -357,7 +357,7 @@ impl VectorIndex {
             let fs_len = fs.segments.load().mutable.len();
             if fs_len >= threshold {
                 let dim = fs.collection.dimension;
-                Self::compact_segments(&mut fs.segments, &mut fs.scratch, &fs.collection, dim);
+                Self::compact_segments(&mut fs.segments, &mut fs.scratch, &fs.collection, dim, 0);
             }
         }
     }
@@ -409,7 +409,13 @@ impl VectorIndex {
                 // Compact additional fields inline (no in-flight for those).
                 for (_, fs) in &mut self.field_segments {
                     let dim = fs.collection.dimension;
-                    Self::compact_segments(&mut fs.segments, &mut fs.scratch, &fs.collection, dim);
+                    Self::compact_segments(
+                        &mut fs.segments,
+                        &mut fs.scratch,
+                        &fs.collection,
+                        dim,
+                        0,
+                    );
                 }
                 return;
             }
@@ -422,57 +428,94 @@ impl VectorIndex {
             &mut self.scratch,
             &self.collection,
             self.meta.dimension,
+            self.meta.compact_threshold as usize,
         );
-        // Compact additional fields
+        // Compact additional fields (legacy unbounded semantics: threshold 0).
         for (_, fs) in &mut self.field_segments {
             let dim = fs.collection.dimension;
-            Self::compact_segments(&mut fs.segments, &mut fs.scratch, &fs.collection, dim);
+            Self::compact_segments(&mut fs.segments, &mut fs.scratch, &fs.collection, dim, 0);
         }
     }
 
-    /// Compact a single field's mutable segment into an immutable HNSW segment.
+    /// Compact a field's mutable segment into immutable HNSW segment(s).
+    ///
+    /// With a non-zero `compact_threshold` the mutable is drained in
+    /// `bulk_freeze_cap`-bounded prefix builds — a bulk load yields several
+    /// independently searchable segments (see `bulk_freeze_cap`). The tail
+    /// survives each install via `clone_suffix`, preserving the global ID
+    /// space, exactly like the background install path.
     fn compact_segments(
         segments: &mut SegmentHolder,
         scratch: &mut SearchScratch,
         collection: &Arc<CollectionMetadata>,
         dimension: u32,
+        compact_threshold: usize,
     ) {
-        let mutable_len = segments.load().mutable.len();
-        if mutable_len == 0 {
-            return;
-        }
-
-        let frozen = segments.load().mutable.freeze();
+        let _ = dimension;
         let seed = collection.collection_id.wrapping_mul(6364136223846793005);
-
-        match compaction::compact(&frozen, collection, seed, None) {
-            Ok(immutable) => {
-                let num_nodes = immutable.graph().num_nodes();
-                let padded = collection.padded_dimension;
-                *scratch = SearchScratch::new(num_nodes, padded);
-
-                let old = segments.load();
-                let next_global = old.mutable.next_global_id();
-                let mut imm_list = old.immutable.clone();
-                imm_list.push(Arc::new(immutable));
-                let new_mutable = Arc::new(crate::vector::segment::mutable::MutableSegment::new(
-                    dimension,
-                    collection.clone(),
-                ));
-                new_mutable.set_global_id_base(next_global);
-                let new_list = SegmentList {
-                    mutable: new_mutable,
-                    immutable: imm_list,
-                    ivf: old.ivf.clone(),
-                    warm: old.warm.clone(),
-                    cold: old.cold.clone(),
-                };
-                segments.swap(new_list);
+        loop {
+            let snap = segments.load();
+            let mutable_len = snap.mutable.len();
+            if mutable_len == 0 {
+                return;
             }
-            Err(_e) => {
-                // Compaction failed (recall too low, etc.) — fall back to brute force
+            let frozen_len = mutable_len.min(bulk_freeze_cap(mutable_len, compact_threshold));
+            let frozen = snap.mutable.freeze_prefix(frozen_len);
+            drop(snap);
+
+            match compaction::compact(&frozen, collection, seed, None) {
+                Ok(immutable) => {
+                    let num_nodes = immutable.graph().num_nodes();
+                    let padded = collection.padded_dimension;
+                    *scratch = SearchScratch::new(num_nodes, padded);
+
+                    let old = segments.load();
+                    let tail_mutable = old.mutable.clone_suffix(frozen_len);
+                    let mut imm_list = old.immutable.clone();
+                    imm_list.push(Arc::new(immutable));
+                    let new_list = SegmentList {
+                        mutable: tail_mutable,
+                        immutable: imm_list,
+                        ivf: old.ivf.clone(),
+                        warm: old.warm.clone(),
+                        cold: old.cold.clone(),
+                    };
+                    segments.swap(new_list);
+                    if frozen_len == mutable_len {
+                        return; // drained
+                    }
+                }
+                Err(_e) => {
+                    // Compaction failed (recall too low, etc.) — leave the
+                    // rest in brute-force mutable.
+                    return;
+                }
             }
         }
+    }
+}
+
+/// Max segments one bulk-loaded mutable is split into when its compact
+/// threshold can't bound the build count sensibly (huge loads). Matches the
+/// search pool's worker cap — more segments than workers adds merge overhead
+/// without more parallelism.
+const MAX_BULK_SEGMENTS: usize = 8;
+
+/// Bounded-freeze cap for one compaction build. `compact_threshold == 0`
+/// (auto-compact disabled — legacy/test indexes) keeps the historical
+/// whole-mutable single-segment semantics; otherwise a bulk-loaded mutable is
+/// compacted in `max(threshold, len/MAX_BULK_SEGMENTS)`-sized builds, so
+/// FT.COMPACT after a bulk load yields several independently searchable
+/// segments (bounded build memory; intra-query pool fan-out) instead of one
+/// giant graph.
+fn bulk_freeze_cap(mutable_len: usize, compact_threshold: usize) -> usize {
+    // Only split when an intra-query pool exists: multiple segments searched
+    // SERIALLY are strictly slower than one graph (each segment pays the full
+    // resolved ef beam), so pool-less deployments keep single-segment builds.
+    if compact_threshold == 0 || crate::vector::search_pool::global().is_none() {
+        mutable_len
+    } else {
+        compact_threshold.max(mutable_len.div_ceil(MAX_BULK_SEGMENTS))
     }
 }
 
@@ -550,12 +593,19 @@ impl VectorIndex {
             return false;
         }
         let snap = self.segments.load();
-        let frozen_len = snap.mutable.len();
-        if frozen_len == 0 {
+        let mutable_len = snap.mutable.len();
+        if mutable_len == 0 {
             return false;
         }
+        // Bounded build: a bulk-loaded mutable compacts in threshold-sized
+        // chunks (the due-gate re-fires while len >= threshold, so the tail
+        // drains across successive begin/install cycles).
+        let frozen_len = mutable_len.min(bulk_freeze_cap(
+            mutable_len,
+            self.meta.compact_threshold as usize,
+        ));
         let frozen_global_base = snap.mutable.global_id_base();
-        let frozen = snap.mutable.freeze();
+        let frozen = snap.mutable.freeze_prefix(frozen_len);
         drop(snap);
 
         let seed = self
@@ -2128,6 +2178,30 @@ fn enforce_segment_holder_budget(
     stats.segments_evicted
 }
 
+/// Minimal single-field index meta for cross-module unit tests (search_pool
+/// identity tests build multi-segment stores through the public store API).
+#[cfg(test)]
+pub(crate) fn test_index_meta(dim: u32) -> IndexMeta {
+    IndexMeta {
+        name: Bytes::from_static(b"idx"),
+        dimension: dim,
+        padded_dimension: padded_dimension(dim),
+        metric: DistanceMetric::L2,
+        hnsw_m: 8,
+        hnsw_ef_construction: 50,
+        hnsw_ef_runtime: 0,
+        compact_threshold: 0,
+        source_field: Bytes::from_static(b"vec"),
+        key_prefixes: vec![Bytes::from_static(b"doc:")],
+        quantization: QuantizationConfig::TurboQuant4,
+        build_mode: BuildMode::Light,
+        vector_fields: Vec::new(),
+        schema_fields: Vec::new(),
+        merge_mode: MergeMode::GraphUnion,
+        keep_raw: false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2581,6 +2655,95 @@ mod bg_compact_tests {
         let idx = store.indexes.get_mut(b"idx".as_ref()).unwrap();
         let results = idx.segments.search(query, k, 50, &mut idx.scratch);
         results.iter().map(|r| r.key_hash).collect()
+    }
+
+    // ── Bounded bulk compaction (search_pool enabler) ────────────────────────
+
+    /// A bulk load compacted via FT.COMPACT (force path) must produce
+    /// ceil(n/threshold) threshold-sized immutable segments, not one giant
+    /// graph — multiple segments are what the intra-query worker pool fans
+    /// out over. All keys must remain findable (self-recall probe).
+    #[test]
+    fn test_force_compact_bulk_bounded_segments() {
+        distance::init();
+        // Bounded bulk builds are gated on an active intra-query search pool.
+        crate::vector::search_pool::init_global(1);
+        let dim = 16u32;
+        let mut store = VectorStore::new();
+        let mut meta = make_idx(dim);
+        meta.compact_threshold = 100;
+        store.create_index(meta).unwrap();
+        let n = 500u64;
+        for i in 0..n {
+            insert(
+                &mut store,
+                format!("doc:{i}").as_bytes(),
+                random_vec(dim as usize, i),
+            );
+        }
+        store.force_compact_index(b"idx").unwrap();
+
+        let idx = store.indexes.get_mut(b"idx".as_ref()).unwrap();
+        let snap = idx.segments.load_full();
+        assert_eq!(
+            snap.mutable.len(),
+            0,
+            "force compact must drain the mutable"
+        );
+        assert_eq!(
+            snap.immutable.len(),
+            5,
+            "500 vectors at threshold 100 must yield 5 bounded segments"
+        );
+
+        // Self-recall: every key still findable by its own vector.
+        for i in (0..n).step_by(7) {
+            let hash = xxhash_rust::xxh64::xxh64(format!("doc:{i}").as_bytes(), 0);
+            let got = search_key_hashes(&mut store, &random_vec(dim as usize, i), 3);
+            assert!(
+                got.contains(&hash),
+                "doc:{i} lost after bounded bulk compact"
+            );
+        }
+    }
+
+    /// Background path: successive begin/poll cycles over a bulk-loaded
+    /// mutable must also chip away in threshold-bounded builds.
+    #[test]
+    fn test_bg_compact_bulk_bounded_segments() {
+        distance::init();
+        // Bounded bulk builds are gated on an active intra-query search pool.
+        crate::vector::search_pool::init_global(1);
+        let dim = 16u32;
+        let compactor = BackgroundCompactor::new(1);
+        let mut store = VectorStore::new();
+        let mut meta = make_idx(dim);
+        meta.compact_threshold = 100;
+        store.create_index(meta).unwrap();
+        for i in 0..500u64 {
+            insert(
+                &mut store,
+                format!("doc:{i}").as_bytes(),
+                random_vec(dim as usize, i),
+            );
+        }
+        // Drive begin+install until the mutable drains (bounded per build).
+        for _ in 0..64 {
+            store.begin_background_compactions(&compactor);
+            poll_until_installed(&mut store, 400);
+            let idx = store.indexes.get_mut(b"idx".as_ref()).unwrap();
+            if idx.segments.load().mutable.len() == 0 {
+                break;
+            }
+        }
+        let idx = store.indexes.get_mut(b"idx".as_ref()).unwrap();
+        let snap = idx.segments.load_full();
+        assert_eq!(snap.mutable.len(), 0, "bg compaction must eventually drain");
+        assert_eq!(
+            snap.immutable.len(),
+            5,
+            "500 vectors at threshold 100 must yield 5 bounded segments (bg path)"
+        );
     }
 
     /// Like [`make_idx`] but with a caller-chosen index name (and a matching

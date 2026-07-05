@@ -279,6 +279,15 @@ pub struct ServerConfig {
     #[arg(long = "io-busy-poll-us", default_value_t = 0)]
     pub io_busy_poll_us: u64,
 
+    /// FT.SEARCH intra-query worker threads: per-segment HNSW searches of one
+    /// KNN query fan out across this pool, cutting single-query latency on
+    /// multi-segment indexes (the pool also serves concurrent queries).
+    /// Omitted = auto (vCPUs minus shards, capped at 8 — 0 on shards==cores
+    /// deployments so KV latency is never contended). 0 = disabled (serial
+    /// per-segment loop; results are identical either way).
+    #[arg(long = "ft-search-workers")]
+    pub ft_search_workers: Option<usize>,
+
     // ── MoonStore v2: Disk Offload ──────────────────────────────────
     /// Enable disk offload (tiered storage: RAM -> mmap -> NVMe)
     #[arg(long = "disk-offload", default_value = "enable")]
@@ -1236,6 +1245,24 @@ mod tests {
         assert_eq!(config.io_driver, "epoll");
         // clap-level validation: anything outside auto|epoll is a parse error.
         assert!(ServerConfig::try_parse_from(["moon", "--io-driver", "iouring"]).is_err());
+    }
+
+    #[test]
+    fn test_ft_search_workers_flag() {
+        let config = ServerConfig::parse_from::<[&str; 0], &str>([]);
+        assert_eq!(
+            config.ft_search_workers, None,
+            "default must be auto (None)"
+        );
+        let config = ServerConfig::parse_from(["moon", "--ft-search-workers", "4"]);
+        assert_eq!(config.ft_search_workers, Some(4));
+        let config = ServerConfig::parse_from(["moon", "--ft-search-workers", "0"]);
+        assert_eq!(
+            config.ft_search_workers,
+            Some(0),
+            "0 must parse (explicit off)"
+        );
+        assert!(ServerConfig::try_parse_from(["moon", "--ft-search-workers", "x"]).is_err());
     }
 
     #[test]
