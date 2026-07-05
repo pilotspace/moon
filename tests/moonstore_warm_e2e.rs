@@ -63,9 +63,7 @@ fn test_warm_transition_end_to_end() {
         let snap = idx.segments.load();
         for i in 0..150u32 {
             let f32_vec: Vec<f32> = (0..128).map(|d| (i * 128 + d) as f32 * 0.001).collect();
-            let sq_vec: Vec<i8> = f32_vec.iter().map(|v| (v * 100.0) as i8).collect();
-            snap.mutable
-                .append(i as u64, &f32_vec, &sq_vec, 1.0, i as u64);
+            snap.mutable.append(i as u64, &f32_vec, i as u64);
         }
     }
 
@@ -199,9 +197,7 @@ fn test_warm_transition_respects_age_threshold() {
         let snap = idx.segments.load();
         for i in 0..150u32 {
             let f32_vec: Vec<f32> = (0..128).map(|d| (i * 128 + d) as f32 * 0.001).collect();
-            let sq_vec: Vec<i8> = f32_vec.iter().map(|v| (v * 100.0) as i8).collect();
-            snap.mutable
-                .append(i as u64, &f32_vec, &sq_vec, 1.0, i as u64);
+            snap.mutable.append(i as u64, &f32_vec, i as u64);
         }
     }
     {
@@ -265,9 +261,7 @@ fn test_warm_transition_search_still_works_on_mutable() {
         let snap = idx.segments.load();
         for i in 0..150u32 {
             let f32_vec: Vec<f32> = (0..128).map(|d| (i * 128 + d) as f32 * 0.001).collect();
-            let sq_vec: Vec<i8> = f32_vec.iter().map(|v| (v * 100.0) as i8).collect();
-            snap.mutable
-                .append(i as u64, &f32_vec, &sq_vec, 1.0, i as u64);
+            snap.mutable.append(i as u64, &f32_vec, i as u64);
         }
     }
     {
@@ -291,9 +285,7 @@ fn test_warm_transition_search_still_works_on_mutable() {
         let snap = idx.segments.load();
         for i in 200..210u32 {
             let f32_vec: Vec<f32> = (0..128).map(|d| (i * 128 + d) as f32 * 0.001).collect();
-            let sq_vec: Vec<i8> = f32_vec.iter().map(|v| (v * 100.0) as i8).collect();
-            snap.mutable
-                .append(i as u64, &f32_vec, &sq_vec, 1.0, i as u64);
+            snap.mutable.append(i as u64, &f32_vec, i as u64);
         }
         // Mutable segment should have the new vectors
         assert!(

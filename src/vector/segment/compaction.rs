@@ -551,7 +551,11 @@ pub fn compact(
     } else {
         &[0.0; 16]
     };
-    let code_len = bytes_per_code - 4;
+    // SQ8 slots are `dim` u8 codes + 8 params bytes (not the TQ `padded/2` nibble
+    // layout + 4-byte norm) — same ternary as the read sites at ~:1079/:1450.
+    // Without the branch this is `dim + 4` for SQ8: latent today (every SQ8 read
+    // is guarded by `codebook_opt.is_none() → continue`) but a slice-OOB landmine.
+    let code_len = if is_sq8 { dim } else { bytes_per_code - 4 };
 
     let has_raw = !frozen.raw_f32.is_empty();
     let dim = frozen.dimension as usize;
@@ -721,7 +725,11 @@ pub fn compact(
     // Sign bit = 1 if original >= centroid (upper sub-bin), 0 if below.
     let sub_bpv = (padded + 7) / 8;
     let mut sub_signs_bfs = vec![0u8; n * sub_bpv];
-    if has_raw {
+    // SQ8 has no sub-centroid refinement (no codebook): both inner branches
+    // below `continue` unconditionally, so without this gate the loop spends
+    // O(n · padded log padded) on normalize+FWHT whose results are discarded.
+    // The zero-filled buffer is exactly the SQ8 contract.
+    if has_raw && !is_sq8 {
         // Use raw f32 → FWHT rotate → compare against centroid per TQ index
         let mut work = vec![0.0f32; padded];
         for bfs_pos in 0..n {
@@ -796,7 +804,7 @@ pub fn compact(
                 }
             }
         }
-    } else if need_cpu_build && !frozen.sub_centroid_signs.is_empty() {
+    } else if need_cpu_build && !is_sq8 && !frozen.sub_centroid_signs.is_empty() {
         // Light mode with insert-time sub-centroid signs: remap to BFS order.
         // graph.to_original(bfs_pos) returns the builder's sequential ID (0..n-1),
         // which is the index into live_entries. Use it directly, not as internal_id.
@@ -1612,11 +1620,7 @@ mod tests {
         for i in 0..n {
             let mut f32_v = lcg_f32(dim, (i * 7 + 13) as u32);
             normalize(&mut f32_v);
-            let sq_v: Vec<i8> = f32_v
-                .iter()
-                .map(|&x| (x * 127.0).clamp(-128.0, 127.0) as i8)
-                .collect();
-            seg.append(i as u64, &f32_v, &sq_v, 1.0, i as u64 + 1);
+            seg.append(i as u64, &f32_v, i as u64 + 1);
         }
 
         // Mark some as deleted
@@ -1665,7 +1669,7 @@ mod tests {
         for i in 0..n {
             let mut v = lcg_f32(dim, (i * 7 + 13) as u32);
             normalize(&mut v);
-            seg.append(i as u64, &v, &[], 1.0, i as u64 + 1);
+            seg.append(i as u64, &v, i as u64 + 1);
             db.push(v);
         }
         let frozen = seg.freeze();
@@ -1734,7 +1738,7 @@ mod tests {
             let gid = id_base + i;
             let mut v = lcg_f32(dim, (gid * 7 + 13) as u32);
             normalize(&mut v);
-            seg.append(gid as u64, &v, &[], 1.0, gid as u64 + 1);
+            seg.append(gid as u64, &v, gid as u64 + 1);
             db.push(v);
         }
         let frozen = seg.freeze();

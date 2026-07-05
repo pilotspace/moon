@@ -513,7 +513,13 @@ pub(super) fn run_dense_knn(
     k: usize,
     as_of_lsn: u64,
     committed: &roaring::RoaringTreemap,
-) -> Result<(Vec<SearchResult>, std::collections::HashMap<u64, Bytes>), Frame> {
+) -> Result<
+    (
+        Vec<SearchResult>,
+        std::sync::Arc<std::collections::HashMap<u64, Bytes>>,
+    ),
+    Frame,
+> {
     let field_opt = if field_name.is_empty() {
         None
     } else {

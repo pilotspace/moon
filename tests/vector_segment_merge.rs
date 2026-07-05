@@ -555,15 +555,10 @@ fn test_merge_overlapping_ids_highest_lsn_wins() {
     let mut rng = Rng::new(42);
     let v = random_unit_vec(&mut rng, DIM as usize);
     let key_hash: u64 = 0xDEAD;
-    let sq_vec: Vec<i8> = v
-        .iter()
-        .map(|&x| (x * 127.0).clamp(-128.0, 127.0) as i8)
-        .collect();
-    let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
 
     // Insert into both with different insert_lsn (simulated via key_hash collision).
-    seg_a.append(key_hash, &v, &sq_vec, norm, 1);
-    seg_b.append(key_hash, &v, &sq_vec, norm, 2); // higher LSN in seg_b
+    seg_a.append(key_hash, &v, 1);
+    seg_b.append(key_hash, &v, 2); // higher LSN in seg_b
 
     let frozen_a = seg_a.freeze();
     let frozen_b = seg_b.freeze();

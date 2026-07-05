@@ -112,8 +112,7 @@ fn test_stress_10k_interleaved_operations() {
         if op < 40 {
             // INSERT (40%)
             fill_vectors(&mut rng, &mut f32_buf, &mut sq_buf, DIM);
-            let norm = f32_buf.iter().map(|x| x * x).sum::<f32>().sqrt();
-            let id = mutable.append(i as u64, &f32_buf, &sq_buf, norm, i as u64);
+            let id = mutable.append(i as u64, &f32_buf, i as u64);
             inserted_ids.push(id);
         } else if op < 70 {
             // SEARCH (30%)
@@ -198,8 +197,7 @@ fn test_stress_interleaved_search_during_compaction() {
     let insert_count = 5000;
     for i in 0..insert_count {
         fill_vectors(&mut rng, &mut f32_buf, &mut sq_buf, dim);
-        let norm = f32_buf.iter().map(|x| x * x).sum::<f32>().sqrt();
-        seg.append(i as u64, &f32_buf, &sq_buf, norm, i as u64);
+        seg.append(i as u64, &f32_buf, i as u64);
     }
 
     assert_eq!(seg.len(), insert_count);

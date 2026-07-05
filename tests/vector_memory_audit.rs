@@ -173,7 +173,7 @@ fn test_per_vector_overhead_breakdown() {
             f32_v.push((s as f32) / (u32::MAX as f32) * 2.0 - 1.0);
             sq_v.push((s >> 24) as i8);
         }
-        seg.append(i as u64, &f32_v, &sq_v, 1.0, i as u64);
+        seg.append(i as u64, &f32_v, i as u64);
     }
 
     assert_eq!(seg.len(), n);

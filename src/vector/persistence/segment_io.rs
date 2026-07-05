@@ -719,7 +719,7 @@ mod tests {
         for i in 0..n {
             let mut v = lcg_f32(dim, (i * 7 + 13) as u32);
             normalize(&mut v);
-            seg.append(i as u64, &v, &[], 1.0, i as u64 + 1);
+            seg.append(i as u64, &v, i as u64 + 1);
             db.push(v);
         }
         let frozen = seg.freeze();

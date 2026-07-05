@@ -274,8 +274,32 @@ impl HnswGraph {
 
         #[cfg(target_arch = "aarch64")]
         {
-            // No-op on AArch64 for now (PRFM requires nightly intrinsics).
-            let _ = (neighbor_offset, vector_offset);
+            // Stable-Rust PRFM via inline asm (the stdarch `_prefetch` intrinsic
+            // is nightly-only, but `asm!` is stable). Mirrors the x86_64 hint
+            // pattern above: 2 neighbor cache lines + 3 TQ-code cache lines.
+            let nptr = self.layer0_neighbors.as_ptr();
+            let vptr = _vectors_tq.as_ptr();
+            // SAFETY: PRFM PLDL1KEEP is an architectural hint — it never faults,
+            // never architecturally reads or writes memory, and silently ignores
+            // invalid/out-of-bounds addresses. Addresses are formed with
+            // `wrapping_add` so `pointer::add`'s in-bounds contract is never
+            // invoked; the asm only materializes each address in a register.
+            unsafe {
+                use core::arch::asm;
+                asm!(
+                    "prfm pldl1keep, [{n0}]",
+                    "prfm pldl1keep, [{n1}]",
+                    "prfm pldl1keep, [{v0}]",
+                    "prfm pldl1keep, [{v1}]",
+                    "prfm pldl1keep, [{v2}]",
+                    n0 = in(reg) nptr.wrapping_add(neighbor_offset),
+                    n1 = in(reg) nptr.wrapping_add(neighbor_offset + 16),
+                    v0 = in(reg) vptr.wrapping_add(vector_offset),
+                    v1 = in(reg) vptr.wrapping_add(vector_offset + 64),
+                    v2 = in(reg) vptr.wrapping_add(vector_offset + 128),
+                    options(nostack, preserves_flags, readonly)
+                );
+            }
         }
 
         #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]

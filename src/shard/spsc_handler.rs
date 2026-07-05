@@ -2329,13 +2329,9 @@ fn handle_vector_insert(
     for chunk in blob.chunks_exact(4) {
         f32_vec.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
     }
-    // SQ quantize
-    let mut sq_vec = vec![0i8; dim];
-    vector_search::quantize_f32_to_sq(&f32_vec, &mut sq_vec);
-    // Compute norm
-    let norm: f32 = f32_vec.iter().map(|x| x * x).sum::<f32>().sqrt();
-    // Record original Redis key for FT.SEARCH response.
-    idx.key_hash_to_key
+    // Record original Redis key for FT.SEARCH response. COW via make_mut:
+    // clones only if a search snapshot holds the map concurrently (QP-1).
+    std::sync::Arc::make_mut(&mut idx.key_hash_to_key)
         .entry(key_hash)
         .or_insert_with(|| bytes::Bytes::copy_from_slice(key));
     // Append to mutable segment. `insert_lsn` is the monotonic LSN allocated
@@ -2346,10 +2342,9 @@ fn handle_vector_insert(
     let snap = idx.segments.load();
     let internal_id = if txn_id != 0 {
         snap.mutable
-            .append_transactional(key_hash, &f32_vec, &sq_vec, norm, insert_lsn, txn_id)
+            .append_transactional(key_hash, &f32_vec, insert_lsn, txn_id)
     } else {
-        snap.mutable
-            .append(key_hash, &f32_vec, &sq_vec, norm, insert_lsn)
+        snap.mutable.append(key_hash, &f32_vec, insert_lsn)
     };
     // Use global_id for payload index so filter bitmaps match
     // search results after compaction advances global_id_base.
@@ -2399,14 +2394,9 @@ fn handle_vector_insert_field(
     for chunk in blob.chunks_exact(4) {
         f32_vec.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
     }
-    // SQ quantize
-    let mut sq_vec = vec![0i8; dim];
-    vector_search::quantize_f32_to_sq(&f32_vec, &mut sq_vec);
-    // Compute norm
-    let norm: f32 = f32_vec.iter().map(|x| x * x).sum::<f32>().sqrt();
-
-    // Record original Redis key (shared across all fields)
-    idx.key_hash_to_key
+    // Record original Redis key (shared across all fields). COW via make_mut:
+    // clones only if a search snapshot holds the map concurrently (QP-1).
+    std::sync::Arc::make_mut(&mut idx.key_hash_to_key)
         .entry(key_hash)
         .or_insert_with(|| bytes::Bytes::copy_from_slice(key));
 
@@ -2421,10 +2411,9 @@ fn handle_vector_insert_field(
     let snap = fs.segments.load();
     let _internal_id = if txn_id != 0 {
         snap.mutable
-            .append_transactional(key_hash, &f32_vec, &sq_vec, norm, insert_lsn, txn_id)
+            .append_transactional(key_hash, &f32_vec, insert_lsn, txn_id)
     } else {
-        snap.mutable
-            .append(key_hash, &f32_vec, &sq_vec, norm, insert_lsn)
+        snap.mutable.append(key_hash, &f32_vec, insert_lsn)
     };
     crate::vector::metrics::add_vectors(1);
     // Note: global_id and payload_index are NOT updated here.

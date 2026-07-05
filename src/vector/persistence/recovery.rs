@@ -150,9 +150,9 @@ fn replay_vector_wal(records: &[VectorWalRecord]) -> (HashMap<u64, MutableSegmen
                 txn_id,
                 collection_id,
                 point_id,
-                sq_vector,
+                sq_vector: _,
                 tq_code: _,
-                norm,
+                norm: _,
                 f32_vector,
             } => {
                 let dim = f32_vector.len() as u32;
@@ -173,13 +173,11 @@ fn replay_vector_wal(records: &[VectorWalRecord]) -> (HashMap<u64, MutableSegmen
                 });
 
                 let internal_id = if *txn_id != 0 {
-                    state.mutable.append_transactional(
-                        *point_id, f32_vector, sq_vector, *norm, next_lsn, *txn_id,
-                    )
-                } else {
                     state
                         .mutable
-                        .append(*point_id, f32_vector, sq_vector, *norm, next_lsn)
+                        .append_transactional(*point_id, f32_vector, next_lsn, *txn_id)
+                } else {
+                    state.mutable.append(*point_id, f32_vector, next_lsn)
                 };
                 state.point_map.insert(*point_id, internal_id);
                 if *txn_id != 0 {

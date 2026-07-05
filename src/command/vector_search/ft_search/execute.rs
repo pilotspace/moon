@@ -25,7 +25,7 @@ use super::response::build_search_response;
 pub(super) enum SearchRawResult {
     Ok {
         results: SmallVec<[SearchResult; 32]>,
-        key_hash_to_key: std::collections::HashMap<u64, Bytes>,
+        key_hash_to_key: std::sync::Arc<std::collections::HashMap<u64, Bytes>>,
     },
     Error(Frame),
 }

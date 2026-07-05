@@ -138,8 +138,9 @@ pub struct SearchSnapshot {
     pub scratch: SearchScratch,
     /// Key-hash → key map captured at START (§3 C1) so a mid-search delete cannot
     /// drop an entry this search still needs to resolve. Used by the response
-    /// builder, not the segment scan.
-    pub key_hash_to_key: std::collections::HashMap<u64, bytes::Bytes>,
+    /// builder, not the segment scan. `Arc` snapshot: capture is O(1); writers
+    /// copy-on-write via `Arc::make_mut` (QP-1).
+    pub key_hash_to_key: std::sync::Arc<std::collections::HashMap<u64, bytes::Bytes>>,
 }
 
 /// Lock-free segment holder. Searches load() once at query start and hold
@@ -631,29 +632,38 @@ impl SegmentHolder {
         let mut all: SmallVec<[SearchResult; 32]> = SmallVec::new();
 
         // 1. MVCC brute-force over the captured append-only range [0, mutable_len),
-        //    chunked + cooperatively yielded between chunks. Each chunk's top-k
-        //    merges into the same global top-k a single full scan produces.
+        //    chunked + cooperatively yielded between chunks. Query prep (FWHT
+        //    rotation / SQ8 normalize) and the top-k heap are hoisted out of the
+        //    chunk loop (QP-4): one prepare per query, one shared heap — the
+        //    accumulated result is exactly the global top-k a single full scan
+        //    produces.
         let chunk = budget.max_brute_force_vecs_per_chunk.max(1);
-        let mut start = 0usize;
-        while start < mutable_len {
-            let end = (start + chunk).min(mutable_len);
-            let part = segments.mutable.brute_force_search_mvcc(
-                query_f32,
-                query_state.as_ref(),
-                k,
-                filter_ref,
-                snapshot_lsn,
-                my_txn_id,
-                &committed,
-                start,
-                end,
-            );
-            all.extend(part);
-            start = end;
-            if start < mutable_len {
-                crate::admin::metrics_setup::bump_ft_search_cooperative_yield();
-                crate::runtime::cooperative_yield().await;
+        if mutable_len > 0 {
+            let mut bf_query =
+                segments
+                    .mutable
+                    .prepare_brute_force_query(query_f32, query_state.is_some(), k);
+            let mut start = 0usize;
+            while start < mutable_len {
+                let end = (start + chunk).min(mutable_len);
+                segments.mutable.brute_force_scan_mvcc_chunk(
+                    &mut bf_query,
+                    query_state.as_ref(),
+                    k,
+                    filter_ref,
+                    snapshot_lsn,
+                    my_txn_id,
+                    &committed,
+                    start,
+                    end,
+                );
+                start = end;
+                if start < mutable_len {
+                    crate::admin::metrics_setup::bump_ft_search_cooperative_yield();
+                    crate::runtime::cooperative_yield().await;
+                }
             }
+            all.extend(bf_query.into_results());
         }
 
         let seg_cap = budget.max_segments_per_chunk.max(1);
@@ -813,13 +823,13 @@ mod tests {
         // Insert into original mutable
         {
             let snap = holder.load();
-            snap.mutable.append(1, &[0.0f32; 128], &[0i8; 128], 1.0, 1);
+            snap.mutable.append(1, &[0.0f32; 128], 1);
         }
 
         // Swap with a new list
         let new_mutable = Arc::new(MutableSegment::new(128, collection));
-        new_mutable.append(2, &[1.0f32; 128], &[1i8; 128], 1.0, 2);
-        new_mutable.append(3, &[2.0f32; 128], &[2i8; 128], 1.0, 3);
+        new_mutable.append(2, &[1.0f32; 128], 2);
+        new_mutable.append(3, &[2.0f32; 128], 3);
 
         holder.swap(SegmentList {
             mutable: new_mutable,
@@ -844,9 +854,8 @@ mod tests {
         {
             let snap = holder.load();
             for i in 0..5u32 {
-                let sq = make_sq_vector(dim, i * 13 + 1);
                 let f32_v = vec![0.0f32; dim];
-                snap.mutable.append(i as u64, &f32_v, &sq, 1.0, i as u64);
+                snap.mutable.append(i as u64, &f32_v, i as u64);
             }
         }
 
@@ -870,9 +879,8 @@ mod tests {
         {
             let snap = holder.load();
             for i in 0..5u32 {
-                let sq = make_sq_vector(dim, i * 13 + 1);
                 let f32_v = vec![0.0f32; dim];
-                snap.mutable.append(i as u64, &f32_v, &sq, 1.0, i as u64);
+                snap.mutable.append(i as u64, &f32_v, i as u64);
             }
         }
         let _query_sq = make_sq_vector(dim, 1);
@@ -896,9 +904,8 @@ mod tests {
         {
             let snap = holder.load();
             for i in 0..5u32 {
-                let sq = make_sq_vector(dim, i * 13 + 1);
                 let f32_v = vec![0.0f32; dim];
-                snap.mutable.append(i as u64, &f32_v, &sq, 1.0, i as u64);
+                snap.mutable.append(i as u64, &f32_v, i as u64);
             }
         }
         let _query_sq = make_sq_vector(dim, 1);
@@ -932,9 +939,8 @@ mod tests {
         {
             let snap = holder.load();
             for i in 0..5u32 {
-                let sq = make_sq_vector(dim as usize, i * 13 + 1);
                 let f32_v = vec![0.0f32; dim as usize];
-                snap.mutable.append(i as u64, &f32_v, &sq, 1.0, i as u64);
+                snap.mutable.append(i as u64, &f32_v, i as u64);
             }
         }
         let _query_sq = make_sq_vector(dim as usize, 1);
@@ -968,9 +974,9 @@ mod tests {
         {
             let snap = holder.load();
             // insert_lsn=1, visible to snapshot=5
-            snap.mutable.append(0, &[0.0f32; 4], &[0i8; 4], 1.0, 1);
+            snap.mutable.append(0, &[0.0f32; 4], 1);
             // insert_lsn=10, NOT visible to snapshot=5
-            snap.mutable.append(1, &[0.0f32; 4], &[1i8; 4], 1.0, 10);
+            snap.mutable.append(1, &[0.0f32; 4], 10);
         }
         let _query_sq = vec![0i8; dim as usize];
         let query_f32 = vec![0.0f32; dim as usize];
@@ -1000,8 +1006,7 @@ mod tests {
         {
             let snap = holder.load();
             // One existing entry far from query (f32 L2 distance)
-            snap.mutable
-                .append(0, &[100.0f32; 4], &[100i8, 100, 100, 100], 1.0, 1);
+            snap.mutable.append(0, &[100.0f32; 4], 1);
         }
         let _query_sq = vec![0i8; dim];
         let query_f32 = vec![0.0f32; dim];
@@ -1062,9 +1067,8 @@ mod tests {
         {
             let snap = holder.load();
             for i in 0..5u32 {
-                let sq = make_sq_vector(dim as usize, i * 13 + 1);
                 let f32_v = vec![0.0f32; dim as usize];
-                snap.mutable.append(i as u64, &f32_v, &sq, 1.0, i as u64);
+                snap.mutable.append(i as u64, &f32_v, i as u64);
             }
         }
         let _query_sq = make_sq_vector(dim as usize, 1);
@@ -1107,14 +1111,12 @@ mod tests {
         assert_eq!(snap_before.mutable.len(), 0);
 
         // Insert into mutable (through original snapshot's Arc)
-        snap_before
-            .mutable
-            .append(1, &[0.0f32; 128], &[0i8; 128], 1.0, 1);
+        snap_before.mutable.append(1, &[0.0f32; 128], 1);
 
         // Swap with completely new list
         let new_mutable = Arc::new(MutableSegment::new(128, collection));
-        new_mutable.append(2, &[1.0f32; 128], &[1i8; 128], 1.0, 2);
-        new_mutable.append(3, &[2.0f32; 128], &[2i8; 128], 1.0, 3);
+        new_mutable.append(2, &[1.0f32; 128], 2);
+        new_mutable.append(3, &[2.0f32; 128], 3);
         holder.swap(SegmentList {
             mutable: new_mutable,
             immutable: Vec::new(),
@@ -1189,9 +1191,8 @@ mod tests {
         {
             let snap = holder.load();
             for i in 0..5u32 {
-                let sq = make_sq_vector(dim, i * 13 + 1);
                 let f32_v = vec![0.0f32; dim];
-                snap.mutable.append(i as u64, &f32_v, &sq, 1.0, i as u64);
+                snap.mutable.append(i as u64, &f32_v, i as u64);
             }
         }
 

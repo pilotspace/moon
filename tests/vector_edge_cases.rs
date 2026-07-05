@@ -104,9 +104,8 @@ fn test_zero_vector_insert_and_search() {
     let collection = make_test_collection(dim as u32);
     let seg = MutableSegment::new(dim as u32, collection);
     let zeros_f32 = vec![0.0f32; dim];
-    let zeros_sq = vec![0i8; dim];
 
-    seg.append(1, &zeros_f32, &zeros_sq, 0.0, 1);
+    seg.append(1, &zeros_f32, 1);
 
     let results = seg.brute_force_search(&zeros_f32, None, 1);
     assert_eq!(results.len(), 1, "should find the zero vector");
@@ -131,8 +130,7 @@ fn test_max_dimension_3072() {
         sq_vec.push((val.clamp(-1.0, 1.0) * 127.0) as i8);
     }
 
-    let norm = f32_vec.iter().map(|x| x * x).sum::<f32>().sqrt();
-    seg.append(1, &f32_vec, &sq_vec, norm, 1);
+    seg.append(1, &f32_vec, 1);
     assert_eq!(seg.len(), 1);
 
     let results = seg.brute_force_search(&f32_vec, None, 1);
@@ -164,8 +162,7 @@ fn test_search_k_zero() {
     let collection = make_test_collection(dim as u32);
     let seg = MutableSegment::new(dim as u32, collection);
     let f32_v = vec![1.0f32; dim];
-    let sq_v = vec![1i8; dim];
-    seg.append(1, &f32_v, &sq_v, 1.0, 1);
+    seg.append(1, &f32_v, 1);
 
     let results = seg.brute_force_search(&f32_v, None, 0);
     assert!(results.is_empty(), "k=0 should return empty results");
@@ -182,8 +179,7 @@ fn test_search_k_larger_than_index() {
         let f32_v: Vec<f32> = (0..dim)
             .map(|d| (i * 10 + d as u32) as f32 / 100.0)
             .collect();
-        let sq_v = make_sq_vec(&f32_v);
-        seg.append(i as u64, &f32_v, &sq_v, 1.0, i as u64);
+        seg.append(i as u64, &f32_v, i as u64);
     }
 
     let query = vec![0.0f32; dim];

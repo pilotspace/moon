@@ -189,7 +189,12 @@ pub struct VectorIndex {
     /// return the original Redis key (e.g., `doc:1755`) instead of the internal
     /// `vec:<internal_id>` form. Survives compaction and segment merging because
     /// it's keyed by the stable `key_hash`, not the volatile internal ID.
-    pub key_hash_to_key: std::collections::HashMap<u64, Bytes>,
+    ///
+    /// `Arc`-wrapped so search snapshots capture it in O(1) (QP-1: the previous
+    /// owned `HashMap` was deep-cloned per query — one entry per indexed vector).
+    /// Writers mutate via [`Arc::make_mut`]: copy-on-write triggers only when a
+    /// snapshot is concurrently alive, at most once per snapshot lifetime.
+    pub key_hash_to_key: Arc<std::collections::HashMap<u64, Bytes>>,
     /// Maps `key_hash` → `global_id` for metadata-only updates.
     ///
     /// When `HSET doc:1 category "science"` is called without a vector blob,
@@ -1283,7 +1288,7 @@ impl VectorStore {
                 scratch,
                 collection,
                 payload_index: PayloadIndex::new(),
-                key_hash_to_key: std::collections::HashMap::new(),
+                key_hash_to_key: Arc::new(std::collections::HashMap::new()),
                 key_hash_to_global_id: std::collections::HashMap::new(),
                 autocompact_enabled: true,
                 compaction_weight: COMPACTION_WEIGHT_DEFAULT,
@@ -1412,7 +1417,7 @@ impl VectorStore {
                 // they track LIVE keys, not historical inserts — without this
                 // they grow monotonically under key churn (~1GB / 24M deletes).
                 // A re-insert of the same key repopulates both maps.
-                idx.key_hash_to_key.remove(&key_hash);
+                Arc::make_mut(&mut idx.key_hash_to_key).remove(&key_hash);
                 idx.key_hash_to_global_id.remove(&key_hash);
                 any_deleted = true;
             }
@@ -1777,16 +1782,11 @@ impl VectorStore {
         let snap = idx.segments.load();
         let insert_lsn = snap.mutable.len() as u64 + 1;
         drop(snap);
-        let sq_vec: Vec<i8> = vector
-            .iter()
-            .map(|&x| (x * 127.0).clamp(-128.0, 127.0) as i8)
-            .collect();
-        let norm: f32 = vector.iter().map(|x| x * x).sum::<f32>().sqrt();
         idx.segments
             .load()
             .mutable
-            .append(key_hash, vector, &sq_vec, norm, insert_lsn);
-        idx.key_hash_to_key.insert(key_hash, key);
+            .append(key_hash, vector, insert_lsn);
+        Arc::make_mut(&mut idx.key_hash_to_key).insert(key_hash, key);
         Ok(())
     }
 
