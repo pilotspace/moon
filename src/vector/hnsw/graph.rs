@@ -279,11 +279,12 @@ impl HnswGraph {
             // pattern above: 2 neighbor cache lines + 3 TQ-code cache lines.
             let nptr = self.layer0_neighbors.as_ptr();
             let vptr = _vectors_tq.as_ptr();
-            // SAFETY: PRFM PLDL1KEEP is an architectural hint — it never faults,
-            // never architecturally reads or writes memory, and silently ignores
-            // invalid/out-of-bounds addresses. Addresses are formed with
-            // `wrapping_add` so `pointer::add`'s in-bounds contract is never
-            // invoked; the asm only materializes each address in a register.
+            // Addresses are formed with `wrapping_add` so `pointer::add`'s
+            // in-bounds contract is never invoked; the asm only materializes
+            // each address in a register.
+            // SAFETY: PRFM PLDL1KEEP is an architectural hint — it never
+            // faults, never architecturally reads or writes memory, and
+            // silently ignores invalid/out-of-bounds addresses.
             unsafe {
                 use core::arch::asm;
                 asm!(
