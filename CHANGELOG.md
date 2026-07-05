@@ -12,11 +12,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   per-segment HNSW searches of ONE KNN query fan out across a pool of searcher
   threads while the shard task scans the mutable segment; replies are awaited
   with `flume::recv_async`, so the shard event loop is never blocked. Default
-  auto-sizes to `vCPUs − shards` (cap 8) — 0 on shards==cores deployments so
-  KV latency is never contended; `0` disables (identical results either way,
-  enforced by pooled-vs-serial identity + 8-thread concurrency stress tests).
-  Worker panics are contained per-job (empty segment result + warn, never a
-  hang). Runtime-agnostic (monoio + tokio).
+  **0 (off, opt-in)** — each segment pays the full resolved ef, so a pooled
+  N-segment query does ~N× the CPU work for its latency win: a 4.9× QPS win on
+  physical-core-rich boxes but a measured regression on SMT-constrained ones
+  (same posture as `--io-busy-poll-us`). Good opt-in size: physical cores −
+  shards, cap 8. Results are identical pooled or serial (enforced by
+  pooled-vs-serial identity + 8-thread concurrency stress tests); worker
+  panics are contained per-job (empty segment result + warn, never a hang).
+  Runtime-agnostic (monoio + tokio).
 - **Bounded bulk compaction**: with a pool active and `COMPACT_THRESHOLD > 0`,
   one compaction build freezes at most `max(threshold, len/8)` entries
   (`MutableSegment::freeze_prefix`), so FT.COMPACT after a bulk load yields
@@ -25,10 +28,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   single-segment builds (multi-segment serial search would be strictly
   slower). Red/green: `test_force_compact_bulk_bounded_segments`,
   `test_bg_compact_bulk_bounded_segments`.
-- Measured (macOS dev, 20k×384d clustered SQ8, single connection,
-  post-FT.COMPACT): p50 2.06 ms → **0.46 ms**, 473 → **2,321 QPS (4.9×)** at
-  R@10 = 1.0. Production numbers from the GCE vs-RediSearch re-run are in
-  PR #214.
+- Measured (20k×384d clustered SQ8, single connection, post-FT.COMPACT,
+  R@10 = 1.0 in all rows): macOS 10-core p50 2.06 ms → **0.46 ms**, 473 →
+  **2,321 QPS (4.9×)**; GCE c3-standard-8 (4 physical cores) regresses at
+  default ef (1,732 → 1,165 QPS) — hence the opt-in default. The GCE probe
+  matrix also showed the per-index `EF_RUNTIME` knob alone closes most of the
+  vs-RediSearch clustered gap (ef 64: 4,493 QPS serial at R@10 = 1.0). Full
+  GCE vs-RediSearch tables in PR #214.
 
 ### Fixed — update-churn no longer mass-deletes vectors at compact/merge install (soak-diagnostic find)
 

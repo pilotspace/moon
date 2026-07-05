@@ -394,13 +394,13 @@ fn main() -> anyhow::Result<()> {
 
     // FT.SEARCH intra-query worker pool: fan per-segment HNSW searches of one
     // query across workers (threads spawn eagerly here — the pool is tiny and
-    // parks on its channel when vector search is unused).
-    let ft_workers = config.ft_search_workers.unwrap_or_else(|| {
-        let cores = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1);
-        moon::vector::search_pool::auto_workers(cores, num_shards)
-    });
+    // parks on its channel when vector search is unused). Default OFF: each
+    // segment is searched at the full resolved ef, so the pool trades ~Nseg×
+    // CPU work for the latency win — a regression on SMT-constrained boxes
+    // (GCE c3-standard-8 clustered SQ8: 1,732 → 1,165 QPS) while a real win
+    // on physical-core-rich ones (macOS 10-core: 473 → 2,321 QPS, 4.9×).
+    // Same posture as --io-busy-poll-us: measured opt-in, never a silent tax.
+    let ft_workers = config.ft_search_workers.unwrap_or(0);
     moon::vector::search_pool::init_global(ft_workers);
     if ft_workers > 0 {
         info!("FT.SEARCH worker pool: {ft_workers} threads");

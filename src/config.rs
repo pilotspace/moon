@@ -282,9 +282,13 @@ pub struct ServerConfig {
     /// FT.SEARCH intra-query worker threads: per-segment HNSW searches of one
     /// KNN query fan out across this pool, cutting single-query latency on
     /// multi-segment indexes (the pool also serves concurrent queries).
-    /// Omitted = auto (vCPUs minus shards, capped at 8 — 0 on shards==cores
-    /// deployments so KV latency is never contended). 0 = disabled (serial
-    /// per-segment loop; results are identical either way).
+    /// Default 0 = disabled (serial per-segment loop; results are identical
+    /// either way). Opt in on boxes with spare PHYSICAL cores — a good size is
+    /// cores minus shards, capped at 8 (see search_pool::auto_workers).
+    /// Measured (20k×384d clustered SQ8, single conn, R@10=1.0): macOS
+    /// 10-core 473→2,321 QPS (4.9×); GCE c3-standard-8 (4 physical cores)
+    /// REGRESSES at default ef — each segment pays the full resolved ef, so a
+    /// pooled N-segment query does ~N× the CPU work for its latency win.
     #[arg(long = "ft-search-workers")]
     pub ft_search_workers: Option<usize>,
 
