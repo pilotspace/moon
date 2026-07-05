@@ -36,6 +36,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   recall gate for unattended (background/vacuum) GraphUnion merges; default 0.70
   unchanged.
 
+### Added — exact rerank stage (deep-review HQ-1)
+
+- **FT.SEARCH distances on compacted segments are now (near-)exact.** Immutable
+  segments carry an f16 sidecar of the original vectors (built at compaction,
+  BFS-ordered); the top `4·k` beam candidates are re-scored with true metric
+  distances (L2: squared L2; Cosine/InnerProduct: normalized-pair squared L2)
+  before top-k truncation, replacing pure quantized ADC estimates — the
+  recall lever vs engines that keep full-precision vectors. SQ8, previously
+  ZERO-refinement, benefits most; TQ4 estimates improve from percent-level
+  error to f16 tolerance (~1e-3).
+- The sidecar persists (`raw_f16.bin` per segment dir, missing file = no
+  sidecar, fully backward/forward compatible), survives GraphUnion merges
+  (all-or-nothing propagation), and is MEMORY DOCTOR-accounted. Memory cost:
+  +2·dim bytes per vector in both the mutable segment and compacted segments
+  (384d ≈ +768 B/vector); an opt-out knob is a follow-up.
+
 ### Performance — SIMD SQ8 ADC kernels (deep-review HQ-2)
 
 - **SQ8 asymmetric distance is now SIMD-dispatched** (NEON / AVX2+FMA /

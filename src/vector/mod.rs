@@ -4,6 +4,7 @@ pub mod aligned_buffer;
 pub mod background_compact;
 pub mod diskann;
 pub mod distance;
+pub mod f16;
 pub mod filter;
 pub mod fusion;
 pub mod hnsw;

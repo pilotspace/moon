@@ -121,6 +121,9 @@ pub struct FrozenSegment {
     /// Raw f32 vectors for exact pairwise distance during HNSW build.
     /// Layout: dim floats per vector, contiguous. Dropped after compaction.
     pub raw_f32: Vec<f32>,
+    /// f16 originals for the exact-rerank sidecar (HQ-1). Present in BOTH
+    /// build modes; dim halves per vector, mutable-internal-id order.
+    pub raw_f16: Vec<u16>,
     /// Sub-centroid sign bits per vector (ceil(padded_dim/8) bytes each).
     /// Computed at insert time from pre-quantization FWHT values.
     pub sub_centroid_signs: Vec<u8>,
@@ -147,6 +150,11 @@ struct MutableSegmentInner {
     /// Raw f32 vectors retained for deferred QJL encoding at freeze time.
     /// Layout: dim floats per vector, contiguous.
     raw_f32: Vec<f32>,
+    /// f16 copies of the original vectors (HQ-1 exact-rerank sidecar source).
+    /// Layout: dim halves per vector, contiguous — retained in BOTH build
+    /// modes (unlike raw_f32, Exact-only) at 2·dim B/vector so compaction can
+    /// hand the immutable segment its rerank sidecar by permutation alone.
+    raw_f16: Vec<u16>,
     /// Sub-centroid sign bits computed at insert time.
     sub_centroid_signs: Vec<u8>,
     sub_sign_bytes_per_vec: usize,
@@ -241,6 +249,7 @@ impl MutableSegment {
                 qjl_signs: Vec::new(),
                 residual_norms: Vec::new(),
                 raw_f32: Vec::new(),
+                raw_f16: Vec::new(),
                 sub_centroid_signs: Vec::new(),
                 sub_sign_bytes_per_vec,
                 entries: Vec::new(),
@@ -283,14 +292,15 @@ impl MutableSegment {
 
             let is_exact = self.collection.build_mode
                 == crate::vector::turbo_quant::collection::BuildMode::Exact;
-            let mut extra_bytes = 0usize;
+            crate::vector::f16::encode_f16_slice(vector_f32, &mut inner.raw_f16);
+            let mut extra_bytes = dim * 2; // f16 sidecar source
             if is_exact {
                 let qjl_bpv = inner.qjl_bytes_per_vec;
                 let new_qjl_len = inner.qjl_signs.len() + qjl_bpv;
                 inner.qjl_signs.resize(new_qjl_len, 0u8);
                 inner.residual_norms.push(0.0);
                 inner.raw_f32.extend_from_slice(vector_f32);
-                extra_bytes = qjl_bpv + 4 + dim * 4;
+                extra_bytes += qjl_bpv + 4 + dim * 4;
             }
 
             inner.entries.push(MutableEntry {
@@ -361,14 +371,15 @@ impl MutableSegment {
         // Light mode: skip both — saves 1,536 B/vec + avoids O(M×d²) at freeze.
         let is_exact =
             self.collection.build_mode == crate::vector::turbo_quant::collection::BuildMode::Exact;
-        let mut extra_bytes = 0usize;
+        crate::vector::f16::encode_f16_slice(vector_f32, &mut inner.raw_f16);
+        let mut extra_bytes = dim * 2; // f16 sidecar source
         if is_exact {
             let qjl_bpv = inner.qjl_bytes_per_vec;
             let new_qjl_len = inner.qjl_signs.len() + qjl_bpv;
             inner.qjl_signs.resize(new_qjl_len, 0u8);
             inner.residual_norms.push(0.0);
             inner.raw_f32.extend_from_slice(vector_f32);
-            extra_bytes = qjl_bpv + 4 + dim * 4;
+            extra_bytes += qjl_bpv + 4 + dim * 4;
         }
 
         inner.entries.push(MutableEntry {
@@ -863,14 +874,15 @@ impl MutableSegment {
 
             let is_exact = self.collection.build_mode
                 == crate::vector::turbo_quant::collection::BuildMode::Exact;
-            let mut extra_bytes = 0usize;
+            crate::vector::f16::encode_f16_slice(vector_f32, &mut inner.raw_f16);
+            let mut extra_bytes = dim * 2; // f16 sidecar source
             if is_exact {
                 let qjl_bpv = inner.qjl_bytes_per_vec;
                 let new_qjl_len = inner.qjl_signs.len() + qjl_bpv;
                 inner.qjl_signs.resize(new_qjl_len, 0u8);
                 inner.residual_norms.push(0.0);
                 inner.raw_f32.extend_from_slice(vector_f32);
-                extra_bytes = qjl_bpv + 4 + dim * 4;
+                extra_bytes += qjl_bpv + 4 + dim * 4;
             }
 
             inner.entries.push(MutableEntry {
@@ -903,14 +915,15 @@ impl MutableSegment {
 
         let is_exact =
             self.collection.build_mode == crate::vector::turbo_quant::collection::BuildMode::Exact;
-        let mut extra_bytes = 0usize;
+        crate::vector::f16::encode_f16_slice(vector_f32, &mut inner.raw_f16);
+        let mut extra_bytes = dim * 2; // f16 sidecar source
         if is_exact {
             let qjl_bpv = inner.qjl_bytes_per_vec;
             let new_qjl_len = inner.qjl_signs.len() + qjl_bpv;
             inner.qjl_signs.resize(new_qjl_len, 0u8);
             inner.residual_norms.push(0.0);
             inner.raw_f32.extend_from_slice(vector_f32);
-            extra_bytes = qjl_bpv + 4 + dim * 4;
+            extra_bytes += qjl_bpv + 4 + dim * 4;
         }
 
         inner.entries.push(MutableEntry {
@@ -1132,6 +1145,7 @@ impl MutableSegment {
                 Vec::new()
             },
             raw_f32: inner.raw_f32.clone(), // empty in Light mode (nothing was appended)
+            raw_f16: inner.raw_f16.clone(),
             sub_centroid_signs: inner.sub_centroid_signs.clone(),
             sub_sign_bytes_per_vec: inner.sub_sign_bytes_per_vec,
             bytes_per_code: inner.bytes_per_code,
@@ -1198,6 +1212,12 @@ impl MutableSegment {
             let rs = start * dim;
             inner.raw_f32[rs..].to_vec()
         };
+        let raw_f16 = if inner.raw_f16.is_empty() {
+            Vec::new()
+        } else {
+            let rs = start * dim;
+            inner.raw_f16[rs..].to_vec()
+        };
 
         // ── Entries: rebase internal_id and vector_offset to 0-based ─────────
         let entries: Vec<MutableEntry> = inner.entries[start..]
@@ -1230,6 +1250,11 @@ impl MutableSegment {
                 count * dim * 4
             } else {
                 0
+            })
+            + (if !raw_f16.is_empty() {
+                count * dim * 2
+            } else {
+                0
             });
 
         let new_inner = MutableSegmentInner {
@@ -1237,6 +1262,7 @@ impl MutableSegment {
             qjl_signs,
             residual_norms,
             raw_f32,
+            raw_f16,
             sub_centroid_signs,
             sub_sign_bytes_per_vec: sub_bpv,
             entries,

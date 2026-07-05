@@ -842,6 +842,24 @@ pub fn compact(
     let total_count = frozen.entries.len() as u32;
     let live_count = n as u32;
 
+    // HQ-1: exact-rerank sidecar — f16 copies of the original vectors in BFS
+    // order (same permutation as tq_bfs), lifted verbatim from the mutable
+    // segment's f16 buffer (kept in BOTH build modes; unlike raw_f32, which is
+    // Exact-only). Disk-reloaded rebuilds have no f16 buffer and fall back to
+    // quantized ADC distances.
+    let expected_f16 = frozen.entries.len() * dim;
+    let raw_f16_bfs: Option<Vec<u16>> = if frozen.raw_f16.len() == expected_f16 && n > 0 {
+        let mut buf: Vec<u16> = Vec::with_capacity(n * dim);
+        for bfs_pos in 0..n {
+            let orig_id = graph.to_original(bfs_pos as u32) as usize;
+            let src = live_entries[orig_id].internal_id as usize * dim;
+            buf.extend_from_slice(&frozen.raw_f16[src..src + dim]);
+        }
+        Some(buf)
+    } else {
+        None
+    };
+
     let segment = ImmutableSegment::new(
         graph,
         AlignedBuffer::from_vec(tq_bfs),
@@ -854,7 +872,8 @@ pub fn compact(
         collection.clone(),
         live_count,
         total_count,
-    );
+    )
+    .with_raw_f16(raw_f16_bfs);
 
     // Step 7 (continued): persist to disk if requested
     if let Some((dir, segment_id)) = persist {
@@ -1088,10 +1107,11 @@ fn merge_graph_union(
 
     // ── Step 1: Collect live entries, deduplicate by key_hash ────────────────
     // Map key_hash → (insert_lsn, global_id, tq_code_bytes, qjl_bytes, residual_norm,
-    //                  sub_centroid_bytes)
+    //                  sub_centroid_bytes, raw_f16_bytes)
+    #[allow(clippy::type_complexity)]
     let mut by_key_hash: std::collections::HashMap<
         u64,
-        (u64, u32, Vec<u8>, Vec<u8>, f32, Vec<u8>),
+        (u64, u32, Vec<u8>, Vec<u8>, f32, Vec<u8>, Vec<u16>),
     > = std::collections::HashMap::new();
 
     let qjl_bpv = {
@@ -1112,9 +1132,15 @@ fn merge_graph_union(
     };
     let sub_bpv = (padded + 7) / 8;
 
+    // HQ-1: the merged segment keeps the exact-rerank sidecar only when every
+    // surviving entry can supply its f16 vector (all-or-nothing — a partial
+    // sidecar would silently mix exact and ADC distances within one segment).
+    let mut all_have_raw = true;
+
     for seg in segments {
         let tq_buf = seg.vectors_tq().as_slice();
         let headers = seg.mvcc_headers();
+        let seg_raw = seg.raw_f16();
 
         for hdr in headers {
             // Skip tombstoned entries.
@@ -1149,6 +1175,16 @@ fn merge_graph_union(
             // Sub-centroid sign bytes.
             let sub_bytes = seg.sub_centroid_bytes_for(bfs_pos, sub_bpv);
 
+            // Exact-rerank sidecar slice for this entry (HQ-1).
+            let raw_bytes: Vec<u16> =
+                match seg_raw.and_then(|r| r.get(bfs_pos * dim..(bfs_pos + 1) * dim)) {
+                    Some(slice) => slice.to_vec(),
+                    None => {
+                        all_have_raw = false;
+                        Vec::new()
+                    }
+                };
+
             // Deduplicate: keep highest insert_lsn.
             let entry = by_key_hash.entry(hdr.key_hash).or_insert((
                 0,
@@ -1156,6 +1192,7 @@ fn merge_graph_union(
                 Vec::new(),
                 Vec::new(),
                 0.0,
+                Vec::new(),
                 Vec::new(),
             ));
             if hdr.insert_lsn >= entry.0 {
@@ -1166,6 +1203,7 @@ fn merge_graph_union(
                     qjl_bytes,
                     norm,
                     sub_bytes,
+                    raw_bytes,
                 );
             }
         }
@@ -1188,9 +1226,12 @@ fn merge_graph_union(
 
     // ── Step 2: Lay out entries in deterministic order ───────────────────────
     // Sort by (insert_lsn asc, key_hash asc) for determinism.
-    let mut entries: Vec<(u64, u32, Vec<u8>, Vec<u8>, f32, Vec<u8>, u64)> = by_key_hash
+    #[allow(clippy::type_complexity)]
+    let mut entries: Vec<(u64, u32, Vec<u8>, Vec<u8>, f32, Vec<u8>, u64, Vec<u16>)> = by_key_hash
         .into_iter()
-        .map(|(kh, (lsn, gid, code, qjl, norm, sub))| (lsn, gid, code, qjl, norm, sub, kh))
+        .map(|(kh, (lsn, gid, code, qjl, norm, sub, raw))| {
+            (lsn, gid, code, qjl, norm, sub, kh, raw)
+        })
         .collect();
     entries.sort_by(|a, b| a.0.cmp(&b.0).then(a.6.cmp(&b.6)));
 
@@ -1200,9 +1241,17 @@ fn merge_graph_union(
     let mut residual_norms: Vec<f32> = Vec::with_capacity(n);
     let mut sub_orig: Vec<u8> = Vec::with_capacity(n * sub_bpv);
     let mut mvcc_orig: Vec<MvccHeader> = Vec::with_capacity(n);
+    let mut raw_orig: Vec<u16> = if all_have_raw {
+        Vec::with_capacity(n * dim)
+    } else {
+        Vec::new()
+    };
 
-    for (i, (lsn, gid, code, qjl, _norm, sub, kh)) in entries.iter().enumerate() {
+    for (i, (lsn, gid, code, qjl, _norm, sub, kh, raw)) in entries.iter().enumerate() {
         tq_buffer_orig.extend_from_slice(code);
+        if all_have_raw {
+            raw_orig.extend_from_slice(raw);
+        }
         if qjl_bpv > 0 {
             if qjl.len() == qjl_bpv {
                 qjl_orig.extend_from_slice(qjl);
@@ -1373,6 +1422,19 @@ fn merge_graph_union(
         mvcc_bfs.push(hdr);
     }
 
+    // BFS-reorder the exact-rerank sidecar (HQ-1), same permutation as tq_bfs.
+    let raw_f16_bfs: Option<Vec<u16>> = if all_have_raw && raw_orig.len() == n * dim {
+        let mut buf = vec![0u16; n * dim];
+        for bfs_pos in 0..n {
+            let orig_id = graph.to_original(bfs_pos as u32) as usize;
+            buf[bfs_pos * dim..(bfs_pos + 1) * dim]
+                .copy_from_slice(&raw_orig[orig_id * dim..(orig_id + 1) * dim]);
+        }
+        Some(buf)
+    } else {
+        None
+    };
+
     // ── Step 7: Recall verification ──────────────────────────────────────────
     // Sample queries from the merged TQ codes and compare against fan-out
     // search across the original segments.
@@ -1401,7 +1463,8 @@ fn merge_graph_union(
         collection.clone(),
         n as u32,
         n as u32,
-    );
+    )
+    .with_raw_f16(raw_f16_bfs);
 
     Ok(merged)
 }
