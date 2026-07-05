@@ -44,6 +44,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Bundle-5 soak diagnostic). All paths now share one `auto_delete_vectors`
   parity helper; wire-level red/green coverage in `tests/vector_del_unindex.rs`.
 
+### Added — long-run vector reliability harness
+
+- `scripts/vector-validate.py` — on-target validation driver: recall/QPS
+  comparison between two moon binaries (SQ8 + TQ4, ground-truth brute force),
+  churn soak with live-set recall / RSS / resurrection sampling, and kill -9
+  durability (settled-write survival + double-crash restart) under
+  `appendonly yes`.
+- `scripts/gcloud-vector-soak.sh` — GCE orchestration (c4a ARM + c3 x86):
+  ships the working branch via `git bundle`, builds baseline + branch binaries,
+  runs the validation driver, fetches JSON results, tears down on exit.
+
 ### Fixed — vector search correctness bundle (deep-review VEC-1/XC-SHARD-1/XC-3/VEC-4/VEC-7)
 
 - **HSET update no longer duplicates a vector** — re-indexing an existing key
