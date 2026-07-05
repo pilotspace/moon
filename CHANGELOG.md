@@ -6,6 +6,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — DEL/UNLINK now unindexes vectors on every dispatch path (soak-diagnostic find)
+
+- **Deleted keys no longer resurface in FT.SEARCH** — the vector auto-delete
+  hook (`mark_deleted_for_key`) existed only on the cross-shard SPSC `Execute`
+  arm and the tokio sharded handler. The monoio conn-local path (the default
+  runtime's only path at `--shards 1`), `handler_single`, the MULTI/EXEC batch
+  paths, and the SPSC pipeline arms never tombstoned vectors on DEL/UNLINK, so
+  deleted keys kept matching KNN searches forever (20% of results after one
+  minute of mixed churn; live-set recall collapsed 0.985 → 0.735 in the
+  Bundle-5 soak diagnostic). All paths now share one `auto_delete_vectors`
+  parity helper; wire-level red/green coverage in `tests/vector_del_unindex.rs`.
+
 ### Fixed — vector search correctness bundle (deep-review VEC-1/XC-SHARD-1/XC-3/VEC-4/VEC-7)
 
 - **HSET update no longer duplicates a vector** — re-indexing an existing key

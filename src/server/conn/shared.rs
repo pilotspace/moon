@@ -237,6 +237,15 @@ pub(crate) fn execute_transaction_sharded(
             }
         }
 
+        // Auto-delete vectors on DEL/UNLINK (parity with the HSET hook above).
+        if !matches!(response, Frame::Error(_))
+            && (cmd.eq_ignore_ascii_case(b"DEL") || cmd.eq_ignore_ascii_case(b"UNLINK"))
+        {
+            crate::shard::slice::with_shard(|s| {
+                crate::shard::spsc_handler::auto_delete_vectors(&mut s.vector_store, cmd_args);
+            });
+        }
+
         results.push(response);
     }
 

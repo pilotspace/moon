@@ -1138,6 +1138,17 @@ pub async fn handle_connection(
                                                             );
                                                         }
                                                     }
+                                                } else if (c.eq_ignore_ascii_case(b"DEL")
+                                                    || c.eq_ignore_ascii_case(b"UNLINK"))
+                                                    && i < txn_results.len()
+                                                    && !matches!(txn_results[i], Frame::Error(_))
+                                                {
+                                                    // Auto-delete vectors (parity with
+                                                    // the HSET auto-index arm above).
+                                                    crate::shard::spsc_handler::auto_delete_vectors(
+                                                        &mut vs.lock(),
+                                                        a,
+                                                    );
                                                 }
                                             }
                                         }
@@ -2219,6 +2230,20 @@ pub async fn handle_connection(
                                                 let _ = crate::shard::spsc_handler::auto_index_hset_public(&mut store, &mut fallback_ts, &key, d_args);
                                             }
                                         }
+                                    }
+                                }
+
+                                // Auto-delete vectors on DEL/UNLINK (parity with
+                                // the HSET auto-index hook above).
+                                if !matches!(&response, Frame::Error(_))
+                                    && (d_cmd.eq_ignore_ascii_case(b"DEL")
+                                        || d_cmd.eq_ignore_ascii_case(b"UNLINK"))
+                                {
+                                    if let Some(ref vs) = vector_store {
+                                        crate::shard::spsc_handler::auto_delete_vectors(
+                                            &mut vs.lock(),
+                                            d_args,
+                                        );
                                     }
                                 }
 

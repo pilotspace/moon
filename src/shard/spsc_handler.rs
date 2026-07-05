@@ -918,6 +918,14 @@ pub(crate) fn handle_shard_message_shared(
                         }
                     }
 
+                    // Auto-delete vectors on DEL/UNLINK (parity with the HSET
+                    // hook above and the Execute arm's auto-delete).
+                    if !matches!(frame, crate::protocol::Frame::Error(_))
+                        && (cmd.eq_ignore_ascii_case(b"DEL") || cmd.eq_ignore_ascii_case(b"UNLINK"))
+                    {
+                        auto_delete_vectors(&mut s.vector_store, args);
+                    }
+
                     // Post-dispatch wakeup hooks for producer commands (cross-shard blocking)
                     if !matches!(frame, crate::protocol::Frame::Error(_)) {
                         let needs_wake = cmd.eq_ignore_ascii_case(b"LPUSH")
@@ -1279,6 +1287,14 @@ pub(crate) fn handle_shard_message_shared(
                                 0,
                             );
                         }
+                    }
+
+                    // Auto-delete vectors on DEL/UNLINK (parity with the HSET
+                    // hook above and the Execute arm's auto-delete).
+                    if !matches!(frame, crate::protocol::Frame::Error(_))
+                        && (cmd.eq_ignore_ascii_case(b"DEL") || cmd.eq_ignore_ascii_case(b"UNLINK"))
+                    {
+                        auto_delete_vectors(&mut s.vector_store, args);
                     }
 
                     if !matches!(frame, crate::protocol::Frame::Error(_)) {
@@ -2129,6 +2145,19 @@ pub fn auto_index_hset_public(
     args: &[crate::protocol::Frame],
 ) -> smallvec::SmallVec<[(bytes::Bytes, u64); 4]> {
     auto_index_hset(vector_store, text_store, key, args, 0)
+}
+
+/// Tombstone auto-indexed vectors for every key argument of a successful
+/// DEL/UNLINK. Wire-parity requirement: every dispatch path that runs
+/// `auto_index_hset*` on HSET must run this on DEL/UNLINK, or deleted keys
+/// keep matching FT.SEARCH forever (resurrection + live-set recall collapse;
+/// found by the Bundle-5 soak diagnostic at shards=1).
+pub fn auto_delete_vectors(vector_store: &mut VectorStore, args: &[crate::protocol::Frame]) {
+    for arg in args {
+        if let Some(key) = crate::server::connection::extract_bytes(arg) {
+            vector_store.mark_deleted_for_key(key.as_ref());
+        }
+    }
 }
 
 /// TXN-aware variant: tags each inserted vector entry with `txn_id` so
