@@ -36,6 +36,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   recall gate for unattended (background/vacuum) GraphUnion merges; default 0.70
   unchanged.
 
+### Performance — SIMD SQ8 ADC kernels (deep-review HQ-2)
+
+- **SQ8 asymmetric distance is now SIMD-dispatched** (NEON / AVX2+FMA /
+  AVX-512F, scalar fallback) via an algebraic decomposition: per-query
+  constants `(Σq, Σq²)` computed once, per-candidate work reduced to three
+  fused widen-u8→f32 FMA sums `(Σq·c, Σc, Σc²)` combined in O(1). Wired into
+  HNSW beam search and both mutable-segment brute-force paths. Criterion
+  (aarch64 NEON): 2.7×/1.8×/1.6× faster per candidate at 128/384/768d.
+  Note: the pre-AVX2 x86 scalar fallback is ~1.65× slower than the old naive
+  loop (the decomposition only pays with SIMD); all supported targets
+  (aarch64 NEON, x86-64 AVX2+) are wins.
+
 ### Performance — vector search hot-path quick wins
 
 - Copy-on-write `Arc` key map (no full `HashMap` clone per snapshot), hoisted

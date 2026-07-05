@@ -244,6 +244,80 @@ pub unsafe fn cosine_f32(a: &[f32], b: &[f32]) -> f32 {
     1.0 - dot_sum / (norm_a * norm_b)
 }
 
+/// SQ8 ADC (HQ-2) per-candidate statistics (AVX-512F): `(Σ(q_i·c_i), Σc_i, Σc_i²)`.
+///
+/// Widens 32 u8 codes per iteration to f32 (`VPMOVZXBD` via
+/// `_mm512_cvtepu8_epi32`, 16 lanes/call, 2x unrolled, then
+/// `_mm512_cvtepi32_ps`) and FMAs against the f32 query. See
+/// `turbo_quant::sq8` module docs for how these three running sums combine
+/// (O(1), architecture-independent) into the final ADC distance.
+///
+/// # Safety
+/// Caller must ensure AVX-512F CPU feature is available.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[target_feature(enable = "avx512f")]
+pub unsafe fn sq8_stats(query: &[f32], codes: &[u8]) -> (f32, f32, f32) {
+    debug_assert_eq!(query.len(), codes.len(), "sq8_stats: dimension mismatch");
+
+    let n = query.len();
+    let mut dot0 = _mm512_setzero_ps();
+    let mut dot1 = _mm512_setzero_ps();
+    let mut sumc0 = _mm512_setzero_ps();
+    let mut sumc1 = _mm512_setzero_ps();
+    let mut sumsqc0 = _mm512_setzero_ps();
+    let mut sumsqc1 = _mm512_setzero_ps();
+
+    let pq = query.as_ptr();
+    let pc = codes.as_ptr();
+
+    let chunks = n / 32;
+    let mut i = 0usize;
+
+    for _ in 0..chunks {
+        // SAFETY: i + 32 <= n guaranteed by chunks = n / 32. `_mm_loadu_si128`
+        // reads 16 bytes (unaligned); `_mm512_cvtepu8_epi32` zero-extends all
+        // 16 lanes to i32, which `_mm512_cvtepi32_ps` converts exactly (u8
+        // values 0..=255 have exact f32 representations).
+        let c0_u8 = _mm_loadu_si128(pc.add(i) as *const __m128i);
+        let c0_f32 = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(c0_u8));
+        let q0 = _mm512_loadu_ps(pq.add(i));
+        dot0 = _mm512_fmadd_ps(q0, c0_f32, dot0);
+        sumc0 = _mm512_add_ps(sumc0, c0_f32);
+        sumsqc0 = _mm512_fmadd_ps(c0_f32, c0_f32, sumsqc0);
+
+        let c1_u8 = _mm_loadu_si128(pc.add(i + 16) as *const __m128i);
+        let c1_f32 = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(c1_u8));
+        let q1 = _mm512_loadu_ps(pq.add(i + 16));
+        dot1 = _mm512_fmadd_ps(q1, c1_f32, dot1);
+        sumc1 = _mm512_add_ps(sumc1, c1_f32);
+        sumsqc1 = _mm512_fmadd_ps(c1_f32, c1_f32, sumsqc1);
+
+        i += 32;
+    }
+
+    dot0 = _mm512_add_ps(dot0, dot1);
+    sumc0 = _mm512_add_ps(sumc0, sumc1);
+    sumsqc0 = _mm512_add_ps(sumsqc0, sumsqc1);
+
+    // SAFETY: _mm512_reduce_add_ps requires AVX-512F, verified via target_feature.
+    let mut dot_sum = _mm512_reduce_add_ps(dot0);
+    let mut sum_c_sum = _mm512_reduce_add_ps(sumc0);
+    let mut sumsq_c_sum = _mm512_reduce_add_ps(sumsqc0);
+
+    // Scalar tail
+    while i < n {
+        let cf = *codes.get_unchecked(i) as f32;
+        let qv = *query.get_unchecked(i);
+        dot_sum += qv * cf;
+        sum_c_sum += cf;
+        sumsq_c_sum += cf * cf;
+        i += 1;
+    }
+
+    (dot_sum, sum_c_sum, sumsq_c_sum)
+}
+
 #[cfg(test)]
 #[cfg(target_arch = "x86_64")]
 mod tests {
@@ -371,6 +445,60 @@ mod tests {
             assert!(
                 rel < 1e-4,
                 "dot tail len={len}: scalar={expected_dot}, avx512={got_dot}"
+            );
+        }
+    }
+
+    // ── HQ-2: SQ8 ADC stats (AVX-512 vs scalar reference) ───────────────
+
+    fn gen_u8(len: usize, seed: u32) -> Vec<u8> {
+        let mut v = Vec::with_capacity(len);
+        let mut s = seed;
+        for _ in 0..len {
+            s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+            v.push((s >> 24) as u8);
+        }
+        v
+    }
+
+    #[test]
+    fn test_sq8_stats_matches_scalar() {
+        if !has_avx512f() {
+            return;
+        }
+        use crate::vector::turbo_quant::sq8::sq8_candidate_stats_scalar;
+        let q = gen_f32(768, 42);
+        let c = gen_u8(768, 99);
+        let expected = sq8_candidate_stats_scalar(&q, &c);
+        // SAFETY: AVX-512F verified above.
+        let got = unsafe { sq8_stats(&q, &c) };
+        let rel_dot = (got.0 - expected.0).abs() / expected.0.abs().max(1.0);
+        let rel_sum = (got.1 - expected.1).abs() / expected.1.abs().max(1.0);
+        let rel_sq = (got.2 - expected.2).abs() / expected.2.abs().max(1.0);
+        assert!(
+            rel_dot < 1e-3 && rel_sum < 1e-3 && rel_sq < 1e-3,
+            "sq8_stats mismatch: scalar={expected:?}, avx512={got:?}"
+        );
+    }
+
+    #[test]
+    fn test_sq8_stats_tail_handling() {
+        if !has_avx512f() {
+            return;
+        }
+        use crate::vector::turbo_quant::sq8::sq8_candidate_stats_scalar;
+        for len in [0, 1, 3, 7, 13, 15, 31, 32, 33, 63, 100] {
+            let q = gen_f32(len, 42);
+            let c = gen_u8(len, 99);
+            let expected = sq8_candidate_stats_scalar(&q, &c);
+            // SAFETY: AVX-512F verified above.
+            let got = unsafe { sq8_stats(&q, &c) };
+            let rel_dot = (got.0 - expected.0).abs() / expected.0.abs().max(1.0);
+            let rel_sum = (got.1 - expected.1).abs() / expected.1.abs().max(1.0);
+            let rel_sq = (got.2 - expected.2).abs() / expected.2.abs().max(1.0);
+            assert!(
+                rel_dot < 1e-3 && rel_sum < 1e-3 && rel_sq < 1e-3,
+                "sq8_stats tail len={len}: scalar={expected:?}, avx512={got:?}"
             );
         }
     }

@@ -11,13 +11,16 @@ use parking_lot::RwLock;
 use roaring::RoaringBitmap;
 use smallvec::SmallVec;
 
+use crate::vector::distance;
 use crate::vector::mvcc::visibility::is_visible;
 use crate::vector::turbo_quant::collection::{CollectionMetadata, QuantizationConfig};
 use crate::vector::turbo_quant::encoder::{
     encode_tq_mse_a2, encode_tq_mse_scaled, encode_tq_mse_scaled_with_signs, padded_dimension,
 };
 use crate::vector::turbo_quant::fwht;
-use crate::vector::turbo_quant::sq8::{SQ8_PARAMS_BYTES, encode_sq8_into, sq8_l2_adc, sq8_params};
+use crate::vector::turbo_quant::sq8::{
+    SQ8_PARAMS_BYTES, encode_sq8_into, sq8_l2_from_stats, sq8_params, sq8_query_stats,
+};
 use crate::vector::turbo_quant::tq_adc::tq_l2_adc_scaled;
 use crate::vector::types::{DistanceMetric, SearchResult, VectorId};
 
@@ -74,6 +77,11 @@ pub struct BruteForceQuery {
     prepared: Vec<f32>,
     /// Whether the TQ-ADC distance path applies (resolved once at prepare).
     use_tq_adc: bool,
+    /// SQ8 (HQ-2): per-query ADC constants `(Σq_i, Σq_i²)` over the PREPARED
+    /// (possibly normalized) query — computed once here, combined per
+    /// candidate via `sq8_l2_from_stats`. Zero for non-SQ8 collections.
+    sq8_q_sum: f32,
+    sq8_q_sumsq: f32,
     /// Shared top-k accumulator across all chunks.
     heap: BinaryHeap<DistF32>,
 }
@@ -410,6 +418,11 @@ impl MutableSegment {
             // Heap-free query prep: borrow for L2, inline-normalize otherwise.
             let q = Sq8Query::prepare(query_f32, self.collection.metric);
             let q = q.as_slice();
+            // HQ-2: resolve the SIMD-dispatched ADC stats kernel and the
+            // per-query constants (Σq_i, Σq_i²) ONCE, before the candidate
+            // loop below — never per candidate.
+            let sq8_stats_fn = distance::table().sq8_stats;
+            let (q_sum, q_sumsq) = sq8_query_stats(q);
             let mut heap: BinaryHeap<DistF32> = BinaryHeap::with_capacity(k + 1);
             for entry in &inner.entries {
                 if entry.delete_lsn != 0 {
@@ -425,7 +438,9 @@ impl MutableSegment {
                 let off = id * bytes_per_code;
                 let slot = &inner.tq_codes[off..off + bytes_per_code];
                 let (min, scale) = sq8_params(slot, dim);
-                let dist = sq8_l2_adc(q, &slot[..dim], min, scale);
+                let (dot_qc, sum_c, sumsq_c) = sq8_stats_fn(q, &slot[..dim]);
+                let dist =
+                    sq8_l2_from_stats(dim, min, scale, q_sum, q_sumsq, dot_qc, sum_c, sumsq_c);
                 let global_id = inner.global_id_base + entry.internal_id;
                 if heap.len() < k {
                     heap.push(DistF32(dist, global_id, entry.key_hash));
@@ -664,9 +679,18 @@ impl MutableSegment {
                 prepared = Vec::new();
             }
         }
+        // HQ-2: per-query ADC constants over the prepared (normalized) query —
+        // the same buffer the chunk scan feeds the stats kernel.
+        let (sq8_q_sum, sq8_q_sumsq) = if self.collection.quantization == QuantizationConfig::Sq8 {
+            sq8_query_stats(&prepared)
+        } else {
+            (0.0, 0.0)
+        };
         BruteForceQuery {
             prepared,
             use_tq_adc,
+            sq8_q_sum,
+            sq8_q_sumsq,
             heap: BinaryHeap::with_capacity(k + 1),
         }
     }
@@ -697,6 +721,10 @@ impl MutableSegment {
         // SQ8: per-vector affine decode + true squared-L2 ADC (MVCC-visible scan).
         if self.collection.quantization == QuantizationConfig::Sq8 {
             let q_slice = q.prepared.as_slice();
+            // HQ-2: SIMD-dispatched stats kernel resolved once per chunk (a fn
+            // pointer read), per-query constants carried in `BruteForceQuery`.
+            let sq8_stats_fn = distance::table().sq8_stats;
+            let (q_sum, q_sumsq) = (q.sq8_q_sum, q.sq8_q_sumsq);
             let heap = &mut q.heap;
             for entry in &inner.entries[lo..hi] {
                 if !is_visible(
@@ -719,7 +747,9 @@ impl MutableSegment {
                 let off = id * bytes_per_code;
                 let slot = &inner.tq_codes[off..off + bytes_per_code];
                 let (min, scale) = sq8_params(slot, dim);
-                let dist = sq8_l2_adc(q_slice, &slot[..dim], min, scale);
+                let (dot_qc, sum_c, sumsq_c) = sq8_stats_fn(q_slice, &slot[..dim]);
+                let dist =
+                    sq8_l2_from_stats(dim, min, scale, q_sum, q_sumsq, dot_qc, sum_c, sumsq_c);
                 let global_id = inner.global_id_base + entry.internal_id;
                 if heap.len() < k {
                     heap.push(DistF32(dist, global_id, entry.key_hash));
