@@ -199,10 +199,10 @@ orb run -m moon-dev bash -c 'sudo apt-get update -qq && sudo apt-get install -y 
 
 Moon ships a native HNSW + TurboQuant vector engine exposed via a RediSearch-compatible subset (`FT.CREATE`, `FT.DROPINDEX`, `FT.INFO`, `FT.SEARCH`, `FT.COMPACT`). Source: `src/vector/` and `src/command/vector_search/`.
 
-- **Per-index knobs:** `EF_RUNTIME` (recall/QPS trade-off), `COMPACT_THRESHOLD` (when to flush mutable → immutable segment).
-- **Segment lifecycle:** auto-indexed on HSET → mutable segment (brute force) → compact → immutable segment (HNSW graph + TQ codes). Segments do not merge once immutable — lossy decode+re-encode accumulates quantization error (tested, recall collapsed 0.73 → 0.0005).
-- **Key hash map:** `key_hash_to_key: HashMap<u64, Bytes>` must be populated in `auto_index_hset` and propagated via `SearchResult.key_hash`; otherwise multi-segment search returns synthetic `vec:<id>` instead of original keys.
-- **FT.INFO `num_docs`** must sum across all segments (mutable + immutable), not just the mutable one.
+- **Per-index knobs:** `EF_RUNTIME` (recall/QPS trade-off), `COMPACT_THRESHOLD` (when to flush mutable → immutable segment), `MERGE_RECALL_TOLERANCE` (FT.CONFIG; recall gate for unattended GraphUnion merges, default 0.70).
+- **Segment lifecycle:** auto-indexed on HSET → mutable segment (brute force) → compact → immutable segment (HNSW graph + TQ codes). Immutable segments DO merge: `MERGE_MODE GRAPH_UNION` (the default) auto-merges at ≥16 segments or ≥20% dead, gated by a recall check (0.70 background / 0.90 manual FT.COMPACT). What is forbidden is *decode+re-encode* merging — re-quantizing accumulates error (tested, recall collapsed 0.73 → 0.0005); GraphUnion stitches graphs over the original codes instead. `MERGE_MODE KEEP_RAW` is rejected at FT.CREATE (unimplemented stub).
+- **Key hash map:** `key_hash_to_key: Arc<HashMap<u64, Bytes>>` (copy-on-write via `Arc::make_mut`) must be populated in `auto_index_hset` and propagated via `SearchResult.key_hash`; otherwise multi-segment search returns synthetic `vec:<id>` instead of original keys.
+- **FT.INFO `num_docs`** must sum across all segments (mutable + immutable), not just the mutable one — and across all shards: FT.INFO scatter-gathers via `scatter_ft_info` + `merge_ft_info_responses` (additive counters, per-field merge); a local-only answer under-reports by ~1/N.
 - **TQ4 at 384d loses recall** (concentration of distances + quantization noise). Use **SQ8** or FP32 HNSW for ≤384d workloads; TQ4 shines at 768d+. (There is no TQ8 — SQ8 is the real 8-bit option: per-vector affine scalar quant, normalizes for the unit-sphere metrics Cosine + InnerProduct, validated across the full lifecycle — search/merge/persistence — at ~0.90 R@10 on real MiniLM 384d. PR #166.)
 
 ## GPU / CUDA Acceleration

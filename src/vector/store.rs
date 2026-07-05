@@ -205,6 +205,11 @@ pub struct VectorIndex {
     /// Set to false via FT.CONFIG SET idx AUTOCOMPACT OFF for bulk ingestion.
     /// Manual FT.COMPACT always works regardless of this flag.
     pub autocompact_enabled: bool,
+    /// Recall-gate tolerance for UNATTENDED (background/vacuum) GraphUnion
+    /// merges (VEC-4). Default 0.70 (catastrophic-collapse guard only); the
+    /// manual FT.COMPACT merge path uses 0.90. Tunable per index via
+    /// `FT.CONFIG SET <idx> MERGE_RECALL_TOLERANCE <0.0..=1.0>`.
+    pub merge_recall_tolerance: f32,
     /// Per-index compaction priority weight for the autovacuum scheduler (W3-deep).
     ///
     /// Multiplies the raw `dead_bytes_rate` before comparison in `CompactionScheduler`.
@@ -722,9 +727,10 @@ impl VectorIndex {
             .collection_id
             .wrapping_mul(6364136223846793005);
         let mode = self.meta.merge_mode;
-        // Use 0.70 tolerance (same as vacuum_pass): catch catastrophic recall
-        // collapse without false-positives on small/medium indexes.
-        let tolerance = 0.70;
+        // Default 0.70 (same as vacuum_pass): catch catastrophic recall
+        // collapse without false-positives on small/medium indexes. Per-index
+        // override: FT.CONFIG SET <idx> MERGE_RECALL_TOLERANCE (VEC-4).
+        let tolerance = self.merge_recall_tolerance;
 
         match compactor.submit_merge(segs.clone(), self.collection.clone(), seed, mode, tolerance) {
             Ok(reply_rx) => {
@@ -1291,6 +1297,7 @@ impl VectorStore {
                 key_hash_to_key: Arc::new(std::collections::HashMap::new()),
                 key_hash_to_global_id: std::collections::HashMap::new(),
                 autocompact_enabled: true,
+                merge_recall_tolerance: 0.70,
                 compaction_weight: COMPACTION_WEIGHT_DEFAULT,
                 field_segments: extra_fields,
                 sparse_stores: HashMap::new(),
@@ -1969,9 +1976,15 @@ impl VectorStore {
         let mut stats = VacuumPassStats::default();
         for name in names {
             if self.needs_merge(&name) == Some(true) {
-                // Use 0.70 tolerance for vacuum: catch catastrophic recall collapse
-                // without false-positives on small/medium indexes.
-                match self.force_merge_index_with_tolerance(&name, 0.70) {
+                // Default 0.70: catch catastrophic recall collapse without
+                // false-positives on small/medium indexes. Per-index override:
+                // FT.CONFIG SET <idx> MERGE_RECALL_TOLERANCE (VEC-4).
+                let tolerance = self
+                    .indexes
+                    .get(&name)
+                    .map(|i| i.merge_recall_tolerance)
+                    .unwrap_or(0.70);
+                match self.force_merge_index_with_tolerance(&name, tolerance) {
                     Ok(ms) => {
                         stats.indexes_merged += 1;
                         stats.total_merged += ms.segments_merged;

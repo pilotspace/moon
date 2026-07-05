@@ -795,3 +795,50 @@ fn test_ft_create_keep_raw_default_is_false() {
         "Default KEEP_RAW must be false when not specified"
     );
 }
+
+// ── VEC-7: MERGE_MODE KEEP_RAW is an unimplemented stub — FT.CREATE must
+// reject it fail-loud instead of silently falling back to graph-union. ──
+#[test]
+fn test_ft_create_merge_mode_keep_raw_rejected() {
+    use moon::command::vector_search::ft_create;
+    use moon::protocol::Frame;
+
+    fn bulk(b: &[u8]) -> Frame {
+        Frame::BulkString(Bytes::copy_from_slice(b))
+    }
+
+    let mut store = VectorStore::new();
+    let mut text_store = moon::text::store::TextStore::new();
+
+    let args: Vec<Frame> = vec![
+        bulk(b"idx_mm_kr"),
+        bulk(b"ON"),
+        bulk(b"HASH"),
+        bulk(b"PREFIX"),
+        bulk(b"1"),
+        bulk(b"doc:"),
+        bulk(b"SCHEMA"),
+        bulk(b"vec"),
+        bulk(b"VECTOR"),
+        bulk(b"HNSW"),
+        bulk(b"8"),
+        bulk(b"TYPE"),
+        bulk(b"FLOAT32"),
+        bulk(b"DIM"),
+        bulk(b"64"),
+        bulk(b"DISTANCE_METRIC"),
+        bulk(b"L2"),
+        bulk(b"MERGE_MODE"),
+        bulk(b"KEEP_RAW"),
+    ];
+
+    let result = ft_create(&mut store, &mut text_store, &args);
+    assert!(
+        matches!(result, Frame::Error(_)),
+        "MERGE_MODE KEEP_RAW must be rejected until implemented: {result:?}"
+    );
+    assert!(
+        store.get_index(b"idx_mm_kr").is_none(),
+        "rejected FT.CREATE must not leave a partial index behind"
+    );
+}

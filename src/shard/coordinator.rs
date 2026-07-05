@@ -1749,6 +1749,67 @@ pub async fn scatter_invalidate_range(
     }
 }
 
+/// Scatter `FT.INFO` to all shards and merge the per-shard stats (XC-SHARD-1).
+///
+/// Vector data is key-hash partitioned: each shard's index holds only the
+/// vectors whose keys route there, so a single shard's FT.INFO reports ~1/N of
+/// the true document count. This helper collects every shard's response and
+/// sums the additive fields via
+/// [`crate::command::vector_search::merge_ft_info_responses`]; config fields
+/// come from the local response (identical everywhere by FT.CREATE broadcast).
+///
+/// # Lock safety
+/// Local execution is synchronous inside `with_shard` (no `.await` while the
+/// shard slice is borrowed).
+pub async fn scatter_ft_info(
+    command: std::sync::Arc<Frame>,
+    my_shard: usize,
+    num_shards: usize,
+    shard_databases: &Arc<crate::shard::shared_databases::ShardDatabases>,
+    dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
+    spsc_notifiers: &[Arc<channel::Notify>],
+) -> Frame {
+    let _ = shard_databases;
+    let mut receivers = Vec::with_capacity(num_shards.saturating_sub(1));
+    for target in 0..num_shards {
+        if target == my_shard {
+            continue;
+        }
+        let (reply_tx, reply_rx) = channel::oneshot();
+        let msg = ShardMessage::VectorCommand {
+            command: command.clone(),
+            reply_tx,
+        };
+        spsc_send(dispatch_tx, my_shard, target, msg, spsc_notifiers).await;
+        receivers.push(reply_rx);
+    }
+
+    let mut remote_responses: Vec<Frame> = Vec::with_capacity(receivers.len());
+    for rx in receivers {
+        match rx.recv().await {
+            Ok(frame) => remote_responses.push(frame),
+            Err(_) => {
+                return Frame::Error(Bytes::from_static(
+                    b"ERR FT.INFO: cross-shard reply channel closed",
+                ));
+            }
+        }
+    }
+
+    let local = crate::shard::slice::with_shard(|s| {
+        crate::shard::spsc_handler::dispatch_vector_command(
+            &mut s.vector_store,
+            &mut s.text_store,
+            #[cfg(feature = "graph")]
+            Some(&s.graph_store),
+            &command,
+            None,
+        )
+    });
+
+    crate::command::vector_search::merge_ft_info_responses(local, &remote_responses)
+}
+
 /// Two-phase DFS scatter-gather for globally accurate BM25 text search (per D-04).
 ///
 /// **Phase 1** — DocFreq scatter: collect (term, df) + total N from every shard,

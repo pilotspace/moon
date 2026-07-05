@@ -2340,6 +2340,34 @@ fn handle_vector_insert(
     // TXN snapshot isolation. When inside a TXN (txn_id != 0), use the
     // transactional variant so non-TXN readers see the entry as uncommitted.
     let snap = idx.segments.load();
+    // VEC-1: an HSET on an already-indexed key is an UPDATE — tombstone the
+    // prior version BEFORE appending, or the index accumulates stale
+    // duplicates (doc returned twice, num_docs inflating under churn).
+    // Non-txn path only: a txn's tombstone must not leak to other readers
+    // before commit (txn vector updates keep prior append-only behavior).
+    if txn_id == 0 {
+        if let Some(&old_gid) = idx.key_hash_to_global_id.get(&key_hash) {
+            let base = snap.mutable.global_id_base();
+            if old_gid >= base
+                && snap
+                    .mutable
+                    .mark_deleted_if_key(old_gid - base, key_hash, insert_lsn)
+            {
+                // O(1) fast path: old version still in the mutable segment,
+                // MVCC-tombstoned at the new version's LSN (older snapshots
+                // keep seeing the old vector; new snapshots see only the new).
+            } else {
+                // Old version was compacted (or the gid mapping was stale):
+                // steady-state interior tombstone across immutable segments —
+                // the same path DEL/UNLINK takes via `mark_deleted_for_key` —
+                // plus a defensive mutable scan for the stale-mapping case.
+                snap.mutable.mark_deleted_by_key_hash(key_hash, insert_lsn);
+                for imm in snap.immutable.iter() {
+                    imm.mark_deleted_by_key_hash(key_hash);
+                }
+            }
+        }
+    }
     let internal_id = if txn_id != 0 {
         snap.mutable
             .append_transactional(key_hash, &f32_vec, insert_lsn, txn_id)
@@ -2409,6 +2437,15 @@ fn handle_vector_insert_field(
     // so both fields share one logical write event (Phase 165 MVCC contract).
     // When inside a TXN (txn_id != 0), tag with txn_id for uncommitted visibility.
     let snap = fs.segments.load();
+    // VEC-1 (additional fields): tombstone the prior version on update. Field
+    // segments have no `key_hash → global_id` map, so this is the scan path
+    // (mutable is bounded by compact_threshold; immutables are set lookups).
+    if txn_id == 0 {
+        snap.mutable.mark_deleted_by_key_hash(key_hash, insert_lsn);
+        for imm in snap.immutable.iter() {
+            imm.mark_deleted_by_key_hash(key_hash);
+        }
+    }
     let _internal_id = if txn_id != 0 {
         snap.mutable
             .append_transactional(key_hash, &f32_vec, insert_lsn, txn_id)

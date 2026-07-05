@@ -6,6 +6,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — vector search correctness bundle (deep-review VEC-1/XC-SHARD-1/XC-3/VEC-4/VEC-7)
+
+- **HSET update no longer duplicates a vector** — re-indexing an existing key
+  tombstones the old copy first (O(1) fast path in the mutable segment via the
+  key→global-id map, scan fallback across mutable + immutable segments), so KNN
+  totals and results no longer count both the stale and the fresh vector.
+- **FT.INFO is now cluster-wide at `--shards N`** — previously answered from the
+  local shard only (~1/N of `num_docs`). Now scatter-gathers to every shard and
+  merges additively (top-level counters + per-field stats), on both the sharded
+  and monoio handlers.
+- **Filtered FT.SEARCH on the cooperative-yield path honors `FilterStrategy`** —
+  the yielding search always graph-filtered; the post-filter strategy (selective
+  filters) now searches unfiltered with 3×k oversampling and bitmap post-filter,
+  matching the non-yielding path's recall behavior.
+- **`FT.CREATE ... MERGE_MODE KEEP_RAW` is rejected fail-loud** — it silently
+  behaved as graph-union; now errors until the raw-vector sidecar is implemented
+  (the separate `KEEP_RAW ON` flag is unchanged).
+- **MEMORY DOCTOR / Prometheus KV memory no longer report 0 under unlimited
+  `maxmemory`** — the per-shard KV memory publish on the 100ms eviction tick
+  had been gated on `maxmemory > 0` since the GAP-1 elastic-budget work,
+  permanently zeroing the `DashTable + entries` line for the default config.
+  The publish (an O(1) accumulator read per DB) now runs unconditionally;
+  elastic-budget recompute stays gated on a finite cap.
+
+### Added
+
+- **`FT.CONFIG SET/GET <index> MERGE_RECALL_TOLERANCE <0.0..=1.0>`** — per-index
+  recall gate for unattended (background/vacuum) GraphUnion merges; default 0.70
+  unchanged.
+
+### Performance — vector search hot-path quick wins
+
+- Copy-on-write `Arc` key map (no full `HashMap` clone per snapshot), hoisted
+  brute-force query prep, striped search metrics counters, stable aarch64
+  `prfm` node prefetch, dead quantize removed from the insert path, SQ8
+  `code_len` fix in compaction, and raw-buffer work skipped for SQ8 segments.
+
 ## [0.5.1] — 2026-07-04
 
 ### Fixed

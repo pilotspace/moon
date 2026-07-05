@@ -35,7 +35,7 @@ pub use ft_admin::{ft_compact, ft_dropindex, ft_list};
 pub use ft_aggregate::ft_aggregate;
 pub use ft_config::ft_config;
 pub use ft_create::ft_create;
-pub use ft_info::ft_info;
+pub use ft_info::{ft_info, merge_ft_info_responses};
 #[cfg(feature = "text-index")]
 pub use ft_invalidate_range::ft_invalidate_range;
 #[cfg(feature = "graph")]

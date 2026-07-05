@@ -122,6 +122,10 @@ pub struct SearchSnapshot {
     pub ef_search: usize,
     /// Pre-evaluated payload/numeric filter bitmap (owned), or None.
     pub filter_bitmap: Option<RoaringBitmap>,
+    /// Selectivity-based filter strategy resolved at capture (XC-3), matching
+    /// the sync path's `select_strategy` dispatch. `Unfiltered` when
+    /// `filter_bitmap` is None.
+    pub filter_strategy: FilterStrategy,
     /// MVCC snapshot LSN captured at entry — governs visibility across yields.
     pub snapshot_lsn: u64,
     /// Active txn id (0 for non-transactional reads).
@@ -610,6 +614,21 @@ impl SegmentHolder {
         let filter_ref = filter_bitmap.as_ref();
         let k = snap.k;
         let ef_search = snap.ef_search;
+        // XC-3: high-selectivity filters (>80% of vectors pass) run the graph
+        // UNFILTERED with 3×k oversampling and post-filter the results —
+        // mirrors the sync path's `FilterStrategy::HnswPostFilter` branch.
+        let post_filter =
+            filter_ref.is_some() && matches!(snap.filter_strategy, FilterStrategy::HnswPostFilter);
+        let (fetch_k, graph_filter) = if post_filter {
+            (k * 3, None)
+        } else {
+            (k, filter_ref)
+        };
+        let graph_ef = if post_filter {
+            ef_search.max(k * 3)
+        } else {
+            ef_search
+        };
         let snapshot_lsn = snap.snapshot_lsn;
         let my_txn_id = snap.my_txn_id;
         let mutable_len = snap.mutable_len;
@@ -639,17 +658,20 @@ impl SegmentHolder {
         //    produces.
         let chunk = budget.max_brute_force_vecs_per_chunk.max(1);
         if mutable_len > 0 {
-            let mut bf_query =
-                segments
-                    .mutable
-                    .prepare_brute_force_query(query_f32, query_state.is_some(), k);
+            // fetch_k oversamples under HnswPostFilter (filter still applied —
+            // the mutable scan is linear, filtering there is free).
+            let mut bf_query = segments.mutable.prepare_brute_force_query(
+                query_f32,
+                query_state.is_some(),
+                fetch_k,
+            );
             let mut start = 0usize;
             while start < mutable_len {
                 let end = (start + chunk).min(mutable_len);
                 segments.mutable.brute_force_scan_mvcc_chunk(
                     &mut bf_query,
                     query_state.as_ref(),
-                    k,
+                    fetch_k,
                     filter_ref,
                     snapshot_lsn,
                     my_txn_id,
@@ -670,17 +692,27 @@ impl SegmentHolder {
         let mut since_yield = 0usize;
 
         // 2. HNSW search on immutable segments (committed by definition).
+        // Strategy dispatch (XC-3): `graph_filter` is None under HnswPostFilter
+        // (unfiltered traversal at fetch_k = 3×k, bitmap applied to results) —
+        // otherwise the ACORN-filtered traversal, same as the sync path.
         for imm in &segments.immutable {
-            if filter_ref.is_some() {
+            if graph_filter.is_some() {
                 all.extend(imm.search_filtered(
                     query_f32,
-                    k,
-                    ef_search,
+                    fetch_k,
+                    graph_ef,
                     &mut snap.scratch,
-                    filter_ref,
+                    graph_filter,
                 ));
             } else {
-                all.extend(imm.search(query_f32, k, ef_search, &mut snap.scratch));
+                let results = imm.search(query_f32, fetch_k, graph_ef, &mut snap.scratch);
+                if post_filter {
+                    if let Some(bm) = filter_ref {
+                        all.extend(results.into_iter().filter(|r| bm.contains(r.id.0)));
+                    }
+                } else {
+                    all.extend(results);
+                }
             }
             since_yield += 1;
             if since_yield >= seg_cap {
@@ -692,16 +724,23 @@ impl SegmentHolder {
 
         // 2a. Warm segment search (committed by definition, same as immutable).
         for warm_seg in &segments.warm {
-            if filter_ref.is_some() {
+            if graph_filter.is_some() {
                 all.extend(warm_seg.search_filtered(
                     query_f32,
-                    k,
-                    ef_search,
+                    fetch_k,
+                    graph_ef,
                     &mut snap.scratch,
-                    filter_ref,
+                    graph_filter,
                 ));
             } else {
-                all.extend(warm_seg.search(query_f32, k, ef_search, &mut snap.scratch));
+                let results = warm_seg.search(query_f32, fetch_k, graph_ef, &mut snap.scratch);
+                if post_filter {
+                    if let Some(bm) = filter_ref {
+                        all.extend(results.into_iter().filter(|r| bm.contains(r.id.0)));
+                    }
+                } else {
+                    all.extend(results);
+                }
             }
             since_yield += 1;
             if since_yield >= seg_cap {

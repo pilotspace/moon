@@ -131,6 +131,31 @@ fn ft_config_set(
             }
             Err(e) => Frame::Error(Bytes::from(format!("ERR {e}").into_bytes())),
         }
+    } else if param.eq_ignore_ascii_case(b"MERGE_RECALL_TOLERANCE") {
+        // VEC-4: recall gate for UNATTENDED (background/vacuum) GraphUnion
+        // merges. Default 0.70 catches only catastrophic collapse; operators
+        // running recall-sensitive workloads can tighten toward the manual
+        // FT.COMPACT gate (0.90). Raising it can make auto-merge abort
+        // repeatedly on small indexes (segments stay > threshold) — informed
+        // trade-off, hence a knob rather than a new default.
+        let parsed: f32 = match std::str::from_utf8(value)
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+        {
+            Some(v) => v,
+            None => {
+                return Frame::Error(Bytes::from_static(
+                    b"ERR MERGE_RECALL_TOLERANCE must be a number",
+                ));
+            }
+        };
+        if !(0.0..=1.0).contains(&parsed) {
+            return Frame::Error(Bytes::from_static(
+                b"ERR MERGE_RECALL_TOLERANCE must be between 0.0 and 1.0",
+            ));
+        }
+        idx.merge_recall_tolerance = parsed;
+        Frame::SimpleString(Bytes::from_static(b"OK"))
     } else {
         Frame::Error(Bytes::from_static(b"ERR unknown config parameter"))
     }
@@ -170,6 +195,11 @@ fn ft_config_get(
         let mut buf = String::with_capacity(8);
         use std::fmt::Write as _;
         let _ = write!(buf, "{}", idx.compaction_weight());
+        Frame::BulkString(Bytes::from(buf))
+    } else if param.eq_ignore_ascii_case(b"MERGE_RECALL_TOLERANCE") {
+        let mut buf = String::with_capacity(8);
+        use std::fmt::Write as _;
+        let _ = write!(buf, "{}", idx.merge_recall_tolerance);
         Frame::BulkString(Bytes::from(buf))
     } else {
         Frame::Error(Bytes::from_static(b"ERR unknown config parameter"))

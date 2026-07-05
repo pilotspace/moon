@@ -952,6 +952,23 @@ impl MutableSegment {
         }
     }
 
+    /// Tombstone the entry at `internal_id` iff its key_hash matches (VEC-1
+    /// HSET-update fast path). The key check makes the O(1) index lookup safe
+    /// even if the caller's `key_hash → global_id` mapping is stale (e.g.
+    /// remapped by a concurrent compaction install) — on mismatch the caller
+    /// falls back to the O(n) `mark_deleted_by_key_hash` scan.
+    /// Returns `true` if an entry was tombstoned.
+    pub fn mark_deleted_if_key(&self, internal_id: u32, key_hash: u64, delete_lsn: u64) -> bool {
+        let mut inner = self.inner.write();
+        if let Some(entry) = inner.entries.get_mut(internal_id as usize) {
+            if entry.key_hash == key_hash && entry.delete_lsn == 0 {
+                entry.delete_lsn = delete_lsn;
+                return true;
+            }
+        }
+        false
+    }
+
     /// Mark all entries matching a key_hash as deleted.
     pub fn mark_deleted_by_key_hash(&self, key_hash: u64, delete_lsn: u64) -> u32 {
         let mut inner = self.inner.write();
