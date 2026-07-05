@@ -793,6 +793,31 @@ impl ImmutableSegment {
         count
     }
 
+    /// Origin-filtered variant of [`mark_deleted_by_key_hash_install`]: only
+    /// tombstones entries whose `global_id` is in `source_gids`.
+    ///
+    /// Used by the merge-install tombstone replay. A source segment's interior
+    /// tombstone was recorded against the copies THAT source held; replaying it
+    /// key_hash-wide onto the merged output would also kill a NEWER same-key
+    /// copy merged in from a sibling segment (the update-then-compact case —
+    /// mass index loss under churn). Real DEL/UNLINK tombstones land in every
+    /// source's interior set, so gating by origin still kills them everywhere.
+    pub fn mark_deleted_by_key_hash_install_from(
+        &mut self,
+        key_hash: u64,
+        source_gids: &std::collections::HashSet<u32>,
+    ) -> u32 {
+        let mut count = 0u32;
+        for h in self.mvcc.iter_mut() {
+            if h.key_hash == key_hash && h.delete_lsn == 0 && source_gids.contains(&h.global_id) {
+                h.delete_lsn = 1; // sentinel: deleted during reconciliation
+                self.live_count = self.live_count.saturating_sub(1);
+                count += 1;
+            }
+        }
+        count
+    }
+
     // ── Merge-support accessors (P2) ─────────────────────────────────────────
 
     /// Clone the set of key_hashes tombstoned via steady-state interior deletion.

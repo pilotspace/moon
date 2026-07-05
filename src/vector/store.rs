@@ -501,9 +501,29 @@ fn snap_and_reconcile(
         tail_keys.insert(key_hash);
     });
 
+    // Key_hashes that still have a LIVE copy inside the window. A dead window
+    // entry whose key also has a live window sibling is an UPDATE leftover
+    // (VEC-1 tombstones the old copy in place before appending the new one) —
+    // compact() already filtered the dead copy, and the live sibling IS the
+    // current version inside `immutable`. Key_hash-wide tombstoning on that
+    // evidence would delete the current version: every key updated before the
+    // freeze vanished from search (32% of live keys in the churn soak).
+    // Only a dead entry with NO live window sibling proves the key is gone
+    // (DEL/UNLINK marks ALL copies dead; a post-freeze update lands its new
+    // copy in the tail, which the `tail_keys` arm handles).
+    let mut live_window_keys: std::collections::HashSet<u64> = std::collections::HashSet::new();
     snap.mutable
         .for_each_window_entry(frozen_len, |key_hash, delete_lsn| {
-            if delete_lsn != 0 || tail_keys.contains(&key_hash) {
+            if delete_lsn == 0 {
+                live_window_keys.insert(key_hash);
+            }
+        });
+
+    snap.mutable
+        .for_each_window_entry(frozen_len, |key_hash, delete_lsn| {
+            if (delete_lsn != 0 && !live_window_keys.contains(&key_hash))
+                || tail_keys.contains(&key_hash)
+            {
                 immutable.mark_deleted_by_key_hash_install(key_hash);
             }
         });
@@ -815,10 +835,22 @@ impl VectorIndex {
         // merge_immutable already dropped entries with mvcc.delete_lsn != 0
         // at snapshot time.  Any `mark_deleted_by_key_hash` call that landed
         // AFTER the worker snapshot only wrote to the source Arc's interior
-        // `tombstoned_keys` set.  Apply those to the merged output.
+        // `tombstoned_keys` set.  Apply those to the merged output — but gated
+        // by ORIGIN: a source's tombstone may only kill merged entries whose
+        // global_id came from that source. An HSET update interior-tombstones
+        // the OLD copy's home segment while the NEW copy lives on (mutable or
+        // a sibling segment); a hash-wide replay would kill the new copy too
+        // (mass loss under update churn). Real DEL/UNLINK tombstones are
+        // recorded in EVERY segment's interior set, so they still apply.
         for src in &inflight.merged_sources {
-            for kh in src.tombstoned_key_hashes() {
-                merged.mark_deleted_by_key_hash_install(kh);
+            let tombs = src.tombstoned_key_hashes();
+            if tombs.is_empty() {
+                continue;
+            }
+            let src_gids: std::collections::HashSet<u32> =
+                src.mvcc_headers().iter().map(|h| h.global_id).collect();
+            for kh in tombs {
+                merged.mark_deleted_by_key_hash_install_from(kh, &src_gids);
             }
         }
 
@@ -1785,10 +1817,19 @@ impl VectorStore {
         key_hash: u64,
         key: bytes::Bytes,
     ) -> Result<(), &'static str> {
-        let idx = self.indexes.get_mut(index_name).ok_or("index not found")?;
-        let snap = idx.segments.load();
-        let insert_lsn = snap.mutable.len() as u64 + 1;
-        drop(snap);
+        if !self.indexes.contains_key(index_name) {
+            return Err("index not found");
+        }
+        // Monotonic store-wide LSN, same allocator as the wire path
+        // (auto_index_hset). The previous `mutable.len() + 1` restarted after
+        // every compaction, so a RE-inserted key could carry a LOWER lsn than
+        // its compacted predecessor — merge dedup (keep highest insert_lsn)
+        // then kept the stale copy and dropped the current one.
+        let insert_lsn = self.txn_manager_mut().allocate_lsn();
+        let idx = match self.indexes.get_mut(index_name) {
+            Some(idx) => idx,
+            None => return Err("index not found"),
+        };
         idx.segments
             .load()
             .mutable
@@ -2837,6 +2878,49 @@ mod bg_compact_tests {
         );
     }
 
+    /// A key UPDATED (tombstone old + append new, VEC-1 semantics) BEFORE
+    /// begin_background_compact() must survive the install. Both the dead old
+    /// copy and the live new copy sit inside the frozen window; compact()
+    /// already filters the dead copy, so the install reconcile must NOT
+    /// key_hash-wide-tombstone the new copy out of the immutable.
+    ///
+    /// RED before the fix: snap_and_reconcile treated ANY dead window entry as
+    /// "key deleted" and killed the key's live compacted copy — every key
+    /// updated-then-compacted vanished from FT.SEARCH (32% of live keys lost
+    /// in the Bundle-5 churn soak; regression introduced with VEC-1).
+    #[test]
+    fn test_bg_compact_update_before_freeze_survives_install() {
+        distance::init();
+        let compactor = BackgroundCompactor::new(1);
+        let mut store = VectorStore::new();
+        store.create_index(make_idx(64)).unwrap();
+
+        const T: usize = 20;
+        for i in 0..T {
+            let key = format!("doc:{i}");
+            insert(&mut store, key.as_bytes(), random_vec(64, i as u64));
+        }
+
+        // UPDATE doc:5 BEFORE dispatch: dead old + live new, both in-window.
+        store.mark_deleted_for_key(b"doc:5");
+        let updated_hash = xxhash_rust::xxh64::xxh64(b"doc:5", 0);
+        let new_vec = random_vec(64, 555);
+        store
+            .insert_vector(b"idx", &new_vec, updated_hash, Bytes::from_static(b"doc:5"))
+            .unwrap();
+
+        assert_eq!(store.begin_background_compactions(&compactor), 1);
+        assert!(poll_until_installed(&mut store, 200), "must install");
+
+        // The updated key must still be findable by its NEW vector, exactly once.
+        let results = search_key_hashes(&mut store, &new_vec, T + 5);
+        let count = results.iter().filter(|&&h| h == updated_hash).count();
+        assert_eq!(
+            count, 1,
+            "updated-then-compacted key must survive install (0=lost, 2=duplicate), got {count}"
+        );
+    }
+
     // ── Test 5: steady-state HDEL tombstones installed immutable ─────────────
 
     /// mark_deleted_for_key on an already-installed immutable segment must
@@ -3051,6 +3135,60 @@ mod bg_compact_tests {
         assert_eq!(
             count, 1,
             "key_x must appear exactly once after merge dedup (got {count})"
+        );
+    }
+
+    /// A key UPDATED across segments must survive a merge: old copy in seg1
+    /// (interior-tombstoned by the update), new copy compacted into seg2, then
+    /// seg1+seg2 merged.
+    ///
+    /// RED before the fix: `poll_install_merge` replayed seg1's interior
+    /// tombstone set key_hash-WIDE onto the merged output, killing the NEW
+    /// copy that came from seg2 — the merge-side twin of the
+    /// `snap_and_reconcile` update bug (657 keys lost in the churn soak with
+    /// merges enabled even after the compact-install fix).
+    #[test]
+    fn test_bg_merge_update_across_segments_survives() {
+        distance::init();
+        let compactor = BackgroundCompactor::new(1);
+        let mut store = VectorStore::new();
+        store.create_index(make_idx(64)).unwrap();
+
+        const T: usize = 15;
+
+        // seg1: doc:0..T, including the soon-to-be-updated doc:5.
+        for i in 0..T {
+            let key = format!("doc:{i}");
+            insert(&mut store, key.as_bytes(), random_vec(64, i as u64));
+        }
+        store.force_compact_index(b"idx").unwrap();
+
+        // UPDATE doc:5 (VEC-1 semantics): interior-tombstone the old copy in
+        // the Arc'd seg1, append the new vector to the mutable segment.
+        let updated_hash = xxhash_rust::xxh64::xxh64(b"doc:5", 0);
+        store.mark_deleted_for_key(b"doc:5");
+        let new_vec = random_vec(64, 555);
+        store
+            .insert_vector(b"idx", &new_vec, updated_hash, Bytes::from_static(b"doc:5"))
+            .unwrap();
+
+        // seg2: padding + the new doc:5 copy, sealed.
+        for i in T..2 * T {
+            let key = format!("doc:{i}");
+            insert(&mut store, key.as_bytes(), random_vec(64, i as u64));
+        }
+        store.force_compact_index(b"idx").unwrap();
+
+        // Merge seg1+seg2 — seg1's tombstone must NOT kill seg2's new copy.
+        let idx = store.get_index_mut(b"idx").unwrap();
+        assert!(idx.begin_background_merge(&compactor), "merge dispatched");
+        assert!(poll_until_merged(&mut store, 500), "merge installed");
+
+        let results = search_key_hashes(&mut store, &new_vec, 2 * T + 5);
+        let count = results.iter().filter(|&&h| h == updated_hash).count();
+        assert_eq!(
+            count, 1,
+            "updated-then-merged key must survive install (0=lost, 2=duplicate), got {count}"
         );
     }
 

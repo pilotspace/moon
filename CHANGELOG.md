@@ -6,6 +6,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — update-churn no longer mass-deletes vectors at compact/merge install (soak-diagnostic find)
+
+- **Compact install: dead window entries no longer kill their own update.**
+  `snap_and_reconcile` treated ANY tombstoned entry in the frozen window as
+  "key deleted" and applied a key_hash-wide tombstone to the new immutable —
+  but since the VEC-1 update path tombstones the old copy in place, a key
+  updated before the freeze had a dead old copy AND a live new copy in the
+  same window, and the install deleted the new copy out of the segment.
+  Every key updated-then-compacted silently vanished from FT.SEARCH (32% of
+  live keys lost / live-set recall 0.985 → 0.685 in a 1-minute churn soak;
+  regression vs v0.5.1). A dead window entry now only proves deletion when
+  the key has no live window sibling.
+- **Merge install: source tombstones are origin-gated.** The merge replay
+  applied each source segment's lifetime interior tombstone set key_hash-wide
+  to the merged output, so a key whose old copy was tombstoned-by-update in
+  one source killed its current copy merged in from a sibling segment. The
+  replay now only tombstones entries whose `global_id` originated in the
+  tombstone's own source; DEL/UNLINK tombstones land in every source's set
+  and still apply everywhere.
+- **`VectorStore::insert_vector` allocates monotonic LSNs** (same allocator
+  as the wire path) instead of `mutable.len()+1`, which restarted after every
+  compaction and made merge dedup keep a stale copy over the current one.
+- Red/green: `test_bg_compact_update_before_freeze_survives_install`,
+  `test_bg_merge_update_across_segments_survives`; end-to-end churn repro
+  (24k mixed ops): LOST 1054 → 0, live-set recall 0.685 → 0.98.
+
 ### Fixed — DEL/UNLINK now unindexes vectors on every dispatch path (soak-diagnostic find)
 
 - **Deleted keys no longer resurface in FT.SEARCH** — the vector auto-delete
