@@ -54,6 +54,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `scripts/gcloud-vector-soak.sh` — GCE orchestration (c4a ARM + c3 x86):
   ships the working branch via `git bundle`, builds baseline + branch binaries,
   runs the validation driver, fetches JSON results, tears down on exit.
+- `scripts/bench-vector-vs-redisearch.py` — Moon vs RediSearch head-to-head
+  driver (same FT.* wire dialect for both engines): insert throughput, KNN-10
+  QPS/p50/p99, and R@10 vs numpy ground truth on random-Gaussian and
+  clustered-mixture 384d datasets, with an `EF_RUNTIME` sweep so QPS is
+  compared at matched recall.
 
 ### Fixed — vector search correctness bundle (deep-review VEC-1/XC-SHARD-1/XC-3/VEC-4/VEC-7)
 
