@@ -133,12 +133,14 @@ pub(crate) fn drain_spsc_shared(
     let mut drained = 0;
 
     // Batch-level eviction gate (perf parity with handler_monoio's
-    // `batch_eviction_active`): snapshot `maxmemory != 0` once per drain
-    // cycle instead of taking `runtime_config.read()` per write command. When
-    // neither maxmemory nor disk-offload is configured — the common
-    // non-memory-bound path — every write arm below skips the eviction call
-    // (and its lock acquire) entirely.
-    let evict_active = spill_sender.is_some() || runtime_config.read().maxmemory != 0;
+    // `batch_eviction_active`): snapshot "is maxmemory set?" once per drain
+    // cycle from the process-global atomic (Gap C) instead of taking
+    // `runtime_config.read()` per drain cycle. When neither maxmemory nor
+    // disk-offload is configured — the common non-memory-bound path — every
+    // write arm below skips the eviction call (and any lock acquire)
+    // entirely. `runtime_config` is still threaded through for the actual
+    // eviction pass (`spsc_eviction_gate`) when this is true.
+    let evict_active = spill_sender.is_some() || crate::storage::eviction::maxmemory_is_set();
 
     // Collect all messages first, then batch Execute/PipelineBatch under single borrow.
     //

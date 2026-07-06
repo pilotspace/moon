@@ -559,3 +559,164 @@ fn test_case_e_cross_db_copy_oom() {
          gate on the cross-shard write path"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Case F: CONFIG SET maxmemory publishes/un-publishes the process-global
+// atomic (Gap C — `crate::storage::eviction::{publish_maxmemory,
+// maxmemory_is_set}`) that the cross-shard SPSC drain (`spsc_handler.rs`)
+// and the Lua eviction bridge (`scripting/bridge.rs`) now read instead of a
+// per-drain-cycle `RuntimeConfig` lock read / per-script generation Cell.
+// Server starts WITHOUT --maxmemory (atomic unset at startup, exercising the
+// startup-publish call site's absence-of-effect) so this test isolates the
+// CONFIG SET write site specifically. Runs at shards=4 with the same
+// cross-shard oversubscribed-pipeline shape as case B, so the OOM assertion
+// specifically proves the SPSC arms observe the freshly-published atomic —
+// not just the pre-existing local/inline fast path.
+// ---------------------------------------------------------------------------
+
+fn spawn_moon_no_maxmemory(port: u16, dir: &std::path::Path, shards: u32) -> ServerGuard {
+    let child = Command::new(find_moon_binary())
+        .args([
+            "--port",
+            &port.to_string(),
+            "--dir",
+            &dir.to_string_lossy(),
+            "--shards",
+            &shards.to_string(),
+            "--appendonly",
+            "no",
+            // Disk offload defaults to `enable`, which gives every shard's
+            // SPSC drain a `spill_sender.is_some() == true` regardless of
+            // maxmemory — that ORs into `evict_active` and would mask
+            // whether the CONFIG SET call site actually published the
+            // atomic under test. Disable it so `evict_active` here is driven
+            // solely by `maxmemory_is_set()`.
+            "--disk-offload",
+            "disable",
+            // Explicit `0`, NOT omitted: omitting --maxmemory triggers the
+            // config auto-guardrail (config.rs ~1044-1101), which caps
+            // maxmemory at a nonzero fraction of detected system RAM — that
+            // nonzero value would make the STARTUP publish_maxmemory call
+            // (main.rs) publish `maxmemory_is_set() == true` immediately,
+            // making phase 2's OOM assertion pass regardless of whether the
+            // CONFIG SET call site publishes anything at all. `0` is the
+            // explicit, Redis-compatible "unlimited" escape hatch — it
+            // starts the atomic definitively unset.
+            "--maxmemory",
+            "0",
+        ])
+        .stdout(std::fs::File::create(dir.join("moon.stdout.log")).expect("stdout log"))
+        .stderr(std::fs::File::create(dir.join("moon.stderr.log")).expect("stderr log"))
+        .spawn()
+        .expect("spawn moon");
+    ServerGuard(child)
+}
+
+#[test]
+fn test_case_f_config_set_maxmemory_publishes_atomic() {
+    let dir = test_tmpdir();
+    let port = free_port();
+    let _guard = spawn_moon_no_maxmemory(port, dir.path(), 4);
+    let mut c = wait_ready(port);
+
+    const N: usize = 3000;
+    const VALUE_SIZE: usize = 4096; // 4KB, same shape as case B.
+    let value = blob(VALUE_SIZE, b'f');
+
+    // Phase 1: with no maxmemory ever configured (atomic unset at startup —
+    // no --maxmemory flag was passed), a large cross-shard pipeline must all
+    // succeed. Establishes the baseline before enabling the cap.
+    let baseline_cmds: Vec<Vec<Vec<u8>>> = (0..N)
+        .map(|i| {
+            vec![
+                b"SET".to_vec(),
+                format!("f0:{i}").into_bytes(),
+                value.clone(),
+            ]
+        })
+        .collect();
+    let baseline_replies = c.pipeline(&baseline_cmds);
+    let baseline_ok = baseline_replies
+        .iter()
+        .filter(|r| matches!(r, V::Simple(s) if s == "OK"))
+        .count();
+    assert_eq!(
+        baseline_ok, N,
+        "setup: writes should all succeed before maxmemory is ever configured"
+    );
+
+    // Phase 2: CONFIG SET maxmemory-policy + a tiny maxmemory (no restart).
+    // If `publish_maxmemory` at the CONFIG SET call site
+    // (src/command/config.rs) is missing or wrong, `maxmemory_is_set()`
+    // stays false and the SPSC drain's per-cycle `evict_active` snapshot
+    // never turns on — remote legs would keep returning +OK regardless of
+    // the now-configured cap.
+    let r = c.cmd(&[b"CONFIG", b"SET", b"maxmemory-policy", b"noeviction"]);
+    assert_eq!(
+        r,
+        V::Simple("OK".into()),
+        "CONFIG SET maxmemory-policy failed: {r:?}"
+    );
+    const MAXMEMORY: &[u8] = b"2097152"; // 2MB whole-instance cap, same as cases B/E.
+    let r = c.cmd(&[b"CONFIG", b"SET", b"maxmemory", MAXMEMORY]);
+    assert_eq!(
+        r,
+        V::Simple("OK".into()),
+        "CONFIG SET maxmemory failed: {r:?}"
+    );
+
+    let capped_cmds: Vec<Vec<Vec<u8>>> = (0..N)
+        .map(|i| {
+            vec![
+                b"SET".to_vec(),
+                format!("f1:{i}").into_bytes(),
+                value.clone(),
+            ]
+        })
+        .collect();
+    let capped_replies = c.pipeline(&capped_cmds);
+    let oom_count = capped_replies.iter().filter(|r| r.is_oom_error()).count();
+    let ok_count = capped_replies
+        .iter()
+        .filter(|r| matches!(r, V::Simple(s) if s == "OK"))
+        .count();
+    assert!(
+        oom_count >= N / 2,
+        "CONFIG SET maxmemory publish: expected the large majority of {N} \
+         oversubscribed cross-shard writes to OOM after CONFIG SET maxmemory \
+         {MAXMEMORY:?}, got only {oom_count} OOM / {ok_count} OK — the \
+         process-global maxmemory_is_set() atomic was not published at the \
+         CONFIG SET call site (Gap C)"
+    );
+
+    // Phase 3: CONFIG SET maxmemory 0 (un-publish) — writes must succeed
+    // again, proving the atomic flips back off and doesn't latch "active"
+    // forever.
+    let r = c.cmd(&[b"CONFIG", b"SET", b"maxmemory", b"0"]);
+    assert_eq!(
+        r,
+        V::Simple("OK".into()),
+        "CONFIG SET maxmemory 0 failed: {r:?}"
+    );
+
+    let unpublish_cmds: Vec<Vec<Vec<u8>>> = (0..N)
+        .map(|i| {
+            vec![
+                b"SET".to_vec(),
+                format!("f2:{i}").into_bytes(),
+                value.clone(),
+            ]
+        })
+        .collect();
+    let unpublish_replies = c.pipeline(&unpublish_cmds);
+    let unpublish_ok = unpublish_replies
+        .iter()
+        .filter(|r| matches!(r, V::Simple(s) if s == "OK"))
+        .count();
+    assert_eq!(
+        unpublish_ok, N,
+        "CONFIG SET maxmemory 0 un-publish: expected all {N} writes to \
+         succeed once maxmemory is cleared, got only {unpublish_ok} OK — \
+         the maxmemory_is_set() atomic did not flip back off"
+    );
+}

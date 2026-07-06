@@ -43,7 +43,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `drain_spsc_shared`/`handle_shard_message_shared` and gated by a
   once-per-drain-cycle `evict_active` snapshot (perf parity with
   `batch_eviction_active`: zero extra lock acquires when `maxmemory` is
-  unset).
+  unset). **Perf follow-up (same PR):** that snapshot, and the Lua bridge's
+  gate below, each used to answer "is `maxmemory` nonzero?" with either a
+  `runtime_config.read()` per drain cycle or a generation/`Cell` snapshot.
+  Both now read a single process-global `AtomicU64`
+  (`storage::eviction::{publish_maxmemory, maxmemory_is_set}`), published at
+  every production write site of `RuntimeConfig.maxmemory` (`CONFIG SET
+  maxmemory`, server startup) — one Relaxed load, no lock, no per-script
+  Cell bookkeeping.
 - **Lua `redis.call`/`redis.pcall` writes now enforce `--maxmemory`.**
   EVAL/EVALSHA carry no WRITE command flag, so the dispatch-level OOM check
   never saw them, and the bridge (`src/scripting/bridge.rs`) never ran the
@@ -92,16 +99,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   two-database intercept across every `ShardMessage` arm (or restructuring it
   as a shared helper reachable from all of them) — out of scope for this
   fix, flagged as a follow-up covering both `COPY` and `MOVE`.
-- New wire-level regression suite `tests/oom_bypass_closure.rs` (5 cases,
+- New wire-level regression suite `tests/oom_bypass_closure.rs` (6 cases,
   both runtimes): direct-SET control (A), cross-shard pipeline (B), Lua EVAL
   loop (C), read-only EVAL under pressure not blocked (D), cross-shard COPY
-  under pressure (E). B, C and E RED before this fix (E: 0/300 OOM,
-  GREEN after: 104/300). Case E pipelines `COPY`, which dispatches through
-  the same `ExecuteSlotted`/`PipelineBatchSlotted` generic-gate path as case
-  B — its RED/GREEN swing rides the *generic* gate, not the Execute-arm
-  dest-gate above; it confirms COPY drives that gate to OOM, not that the
-  Execute-arm path is independently exercised. D locks the write-only scope
-  of the Lua gate.
+  under pressure (E), `CONFIG SET maxmemory` atomic publish/un-publish (F).
+  B, C and E RED before this fix (E: 0/300 OOM, GREEN after: 104/300). Case E
+  pipelines `COPY`, which dispatches through the same
+  `ExecuteSlotted`/`PipelineBatchSlotted` generic-gate path as case B — its
+  RED/GREEN swing rides the *generic* gate, not the Execute-arm dest-gate
+  above; it confirms COPY drives that gate to OOM, not that the Execute-arm
+  path is independently exercised. D locks the write-only scope of the Lua
+  gate. Case F (added with the atomic-snapshot perf follow-up) starts the
+  server with `--maxmemory 0 --disk-offload disable` (both required so the
+  atomic starts genuinely unset — omitting `--maxmemory` trips the
+  auto-guardrail's nonzero default, and disk-offload's spill-sender presence
+  ORs into the same gate) and drives a cross-shard pipeline before and after
+  `CONFIG SET maxmemory`/`CONFIG SET maxmemory 0`; RED before the CONFIG SET
+  call site published the atomic (775/3000 OOM — the local-only share) GREEN
+  after (3000/3000).
 
 ### Added — int8 symmetric ADC for SQ8 vector search (task #13)
 

@@ -873,6 +873,10 @@ fn main() -> anyhow::Result<()> {
     // per-shard hint divides by it) — the inline write path's eviction
     // pre-gate reads these instead of taking the runtime-config lock.
     moon::storage::eviction::publish_maxmemory_hints(&runtime_config_shared.read());
+    // Publish the SPSC-drain / Lua-bridge "is maxmemory set?" atomic (Gap C).
+    // Missing this at startup would silently bypass the eviction gate for
+    // any server launched with --maxmemory (until the first CONFIG SET).
+    moon::storage::eviction::publish_maxmemory(runtime_config_shared.read().maxmemory as u64);
     moon::config::log_maxmemory_sharding(runtime_config_shared.read().maxmemory, num_shards);
     let server_config_shared: std::sync::Arc<moon::config::ServerConfig> =
         { std::sync::Arc::new(config.clone()) };

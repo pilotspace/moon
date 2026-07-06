@@ -37,11 +37,10 @@ use crate::storage::tiered::spill_thread::SpillRequest;
 /// owns cloneable handles to all of this — so it is captured directly into
 /// the `move` closure. This adds zero new `unsafe` code (the existing
 /// `CURRENT_DB` unsafe deref is untouched) and zero per-call allocation. The
-/// common case (`maxmemory` unset, no spill) is decided by a per-script
-/// snapshot (`evict_active` below), so a tight `redis.call('SET', ...)` loop
-/// pays one `Cell` read per write call — the `RuntimeConfig` lock is read at
-/// most once per script execution, mirroring the per-batch
-/// `batch_eviction_active` snapshot the connection handlers use.
+/// common case (`maxmemory` unset, no spill) is decided by a single Relaxed
+/// load of the process-global [`crate::storage::eviction::maxmemory_is_set`]
+/// atomic, so a tight `redis.call('SET', ...)` loop never takes the
+/// `RuntimeConfig` lock at all in that case.
 #[derive(Clone)]
 pub struct LuaEvictionCtx(Option<LuaEvictionInner>);
 
@@ -53,19 +52,13 @@ struct LuaEvictionInner {
     spill_sender: Option<flume::Sender<SpillRequest>>,
     spill_file_id: Rc<Cell<u64>>,
     disk_offload_dir: Option<PathBuf>,
-    /// `(script generation, evict-active)` snapshot, refreshed at most once
-    /// per script execution (generation bumped by `set_script_db`). Sentinel
-    /// generation `u64::MAX` forces a refresh on first use. Staleness is
-    /// bounded to one script run — same bound as the handlers' per-batch
-    /// snapshot.
-    evict_active: Cell<(u64, bool)>,
 }
 
 impl LuaEvictionCtx {
-    /// No-op gate. Used by unit tests (no real shard context available) and
-    /// by the FCALL path (`src/scripting/functions.rs`), which has a
-    /// pre-existing, documented gap for in-function write eviction — closing
-    /// it is out of scope for this fix (see `tmp/OOM-SHIELD-CONTEXT.md`).
+    /// No-op gate. Used by unit tests (no real shard context available).
+    /// Production call sites (Lua EVAL/EVALSHA and Lua FUNCTION/FCALL) must
+    /// build a real ctx via [`LuaEvictionCtx::new`] — see
+    /// `src/shard/conn_accept.rs` and `src/scripting/functions.rs`.
     pub fn disabled() -> Self {
         LuaEvictionCtx(None)
     }
@@ -87,7 +80,6 @@ impl LuaEvictionCtx {
             spill_sender,
             spill_file_id,
             disk_offload_dir,
-            evict_active: Cell::new((u64::MAX, false)),
         }))
     }
 
@@ -101,19 +93,9 @@ impl LuaEvictionCtx {
         let Some(inner) = self.0.as_ref() else {
             return Ok(());
         };
-        // Lock-free fast path: decide "is eviction active at all?" from a
-        // per-script snapshot so a script issuing thousands of writes takes
-        // the RuntimeConfig read lock once, not per redis.call.
-        let generation = SCRIPT_GENERATION.with(|c| c.get());
-        let (cached_generation, cached_active) = inner.evict_active.get();
-        let active = if cached_generation == generation {
-            cached_active
-        } else {
-            let active = inner.spill_sender.is_some() || inner.runtime_config.read().maxmemory != 0;
-            inner.evict_active.set((generation, active));
-            active
-        };
-        if !active {
+        // Lock-free fast path: a script issuing thousands of writes checks
+        // the process-global atomic (Gap C), not the RuntimeConfig lock.
+        if inner.spill_sender.is_none() && !crate::storage::eviction::maxmemory_is_set() {
             return Ok(());
         }
         let rt = inner.runtime_config.read();
@@ -146,10 +128,6 @@ thread_local! {
     static SCRIPT_HAD_WRITE: Cell<bool> = const { Cell::new(false) };
     /// Whether this script is running in read-only mode (FCALL_RO).
     static SCRIPT_READ_ONLY: Cell<bool> = const { Cell::new(false) };
-    /// Monotonic script-execution counter, bumped by `set_script_db`, so
-    /// per-VM caches (`LuaEvictionCtx::evict_active`) can detect a new
-    /// script run without taking any lock.
-    static SCRIPT_GENERATION: Cell<u64> = const { Cell::new(0) };
 }
 
 /// Set the thread-local database pointer before script execution.
@@ -158,7 +136,6 @@ pub fn set_script_db(db: &mut crate::storage::Database, db_idx: usize, db_count:
     CURRENT_DB_IDX.with(|c| c.set(db_idx));
     CURRENT_DB_COUNT.with(|c| c.set(db_count));
     SCRIPT_HAD_WRITE.with(|c| c.set(false));
-    SCRIPT_GENERATION.with(|c| c.set(c.get().wrapping_add(1)));
 }
 
 /// Clear the thread-local database pointer after script execution.
