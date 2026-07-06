@@ -46,6 +46,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   trade-off as the diskfull guard: `DEL`/`UNLINK`/`EXPIRE`/`FLUSHALL` are
   write-flagged and blocked too while paused — no allowlist.
 
+### Fixed — vector keymap CoW amplification + bounded snapshot queue (PR #TBD)
+
+- `VectorIndex`'s three `key_hash -> V` maps (`key_hash_to_key`, `key_hash_to_global_id`,
+  `key_hash_to_vec_checksum`) were each a single `Arc<HashMap<u64, V>>`. Under
+  `ft-search-off-eventloop`, a live FT.SEARCH snapshot holds an extra `Arc` clone of the whole
+  map while the event loop keeps processing writes; the next write's `Arc::make_mut` then sees
+  refcount > 1 and full-clones the entire map synchronously on the shard event loop (~47MB
+  @1M vectors). Replaced with `BucketedKeyMap<V>` (`src/vector/keymap.rs`): 256 fixed buckets,
+  each independently `Arc<HashMap<u64, V>>`, bucket selected by `(key_hash >> 56)`. A concurrent
+  snapshot now pins at most 1/256th of the map per write instead of the whole thing. Same
+  treatment applied to `SnapshotJob`'s mirrored fields and `SearchSnapshot.key_hash_to_key`.
+  On-disk `keymap.bin` format is unchanged (read-compatible).
+- `SnapshotPool` (`src/vector/persistence/manifest.rs`) used an unbounded `flume` queue with a
+  single worker; if compact/merge cadence outpaced the worker, queued jobs pinned every
+  submitter's `Arc`s indefinitely. Replaced with a coalescing slot keyed by index directory: a
+  new submit for an index with a job still pending (not yet dequeued) replaces it in place,
+  dropping the stale job's `Arc`s immediately; an in-flight (already-dequeued) job is unaffected.
+  Submit never blocks the caller.
+
 ### Fixed — zombie/CPU hardening wave 1 (PR #TBD)
 
 - **Busy-poll spin idle-disengages** (`--io-busy-poll-us` / vendored monoio
