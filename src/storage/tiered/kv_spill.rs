@@ -98,6 +98,9 @@ pub fn write_kv_spill_pages(
     } else {
         write_datafile_mixed(&file_path, &pages.leaf, &pages.overflow)?;
     }
+    // Fsync the directory so the new file's directory entry survives a crash —
+    // the manifest (which IS dir-fsynced) must never reference a vanished file.
+    crate::persistence::fsync::fsync_directory(&data_dir)?;
 
     Ok((pages.total_pages as u64) * (PAGE_4K as u64))
 }
@@ -354,9 +357,66 @@ pub fn write_kv_spill_batch(shard_dir: &Path, file_id: u64, batch: &BatchPages) 
     }
 
     std::fs::rename(&tmp_path, &final_path)?;
+    // Fsync the directory so the rename itself survives a crash — without it
+    // the manifest can point at a file whose directory entry was lost.
+    crate::persistence::fsync::fsync_directory(&data_dir)?;
 
     let total_pages = (batch.leaves.len() + batch.overflow.len()) as u64;
     Ok(total_pages * PAGE_4K as u64)
+}
+
+/// Startup sweep of crash-orphaned heap files in `{shard_dir}/data`.
+///
+/// Removes `heap-*.mpf` files whose `file_id` is not registered in the
+/// manifest (spill wrote the file, crash before manifest commit — invisible
+/// to the cold index, would otherwise leak disk forever) and all
+/// `heap-*.tmp` leftovers from interrupted atomic-rename batch writes.
+///
+/// Only call this AFTER the manifest has been opened successfully: with no
+/// readable manifest every heap file would look orphaned, and deleting data
+/// on a corrupt-manifest signal would be destructive.
+///
+/// Returns the number of files removed. I/O errors are logged and skipped —
+/// a sweep failure must never abort recovery.
+pub fn sweep_orphan_heap_files(shard_dir: &Path, manifest: &ShardManifest) -> usize {
+    let data_dir = shard_dir.join("data");
+    let Ok(read_dir) = std::fs::read_dir(&data_dir) else {
+        return 0;
+    };
+    let registered: std::collections::HashSet<u64> =
+        manifest.files().iter().map(|e| e.file_id).collect();
+
+    let mut removed = 0usize;
+    for dir_entry in read_dir.flatten() {
+        let path = dir_entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let orphan = if let Some(id_str) = name
+            .strip_prefix("heap-")
+            .and_then(|rest| rest.strip_suffix(".mpf"))
+        {
+            match id_str.parse::<u64>() {
+                Ok(file_id) => !registered.contains(&file_id),
+                Err(_) => false, // not our naming scheme — leave it alone
+            }
+        } else {
+            // Interrupted batch write: tmp files are always safe to remove.
+            name.strip_prefix("heap-")
+                .and_then(|rest| rest.strip_suffix(".tmp"))
+                .is_some()
+        };
+        if orphan {
+            match std::fs::remove_file(&path) {
+                Ok(()) => {
+                    removed += 1;
+                    tracing::info!("cold-tier sweep: removed crash-orphaned {}", name);
+                }
+                Err(e) => warn!("cold-tier sweep: failed to remove {}: {}", name, e),
+            }
+        }
+    }
+    removed
 }
 
 #[cfg(test)]
@@ -397,6 +457,47 @@ mod tests {
         // Verify manifest was updated
         assert_eq!(manifest.files().len(), 1);
         assert_eq!(manifest.files()[0].file_id, 1);
+    }
+
+    #[test]
+    fn test_sweep_orphan_heap_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shard_dir = tmp.path();
+        let manifest_path = shard_dir.join("shard.manifest");
+        let mut manifest = ShardManifest::create(&manifest_path).unwrap();
+
+        // Registered spill: file 1 in manifest, must survive the sweep.
+        let entry = Entry::new_string(Bytes::from_static(b"registered"));
+        spill_to_datafile(shard_dir, 1, b"livekey", &entry, &mut manifest, None).unwrap();
+
+        // Crash orphan: heap file on disk but never registered in the manifest
+        // (spill wrote the file, crash before manifest commit).
+        let data_dir = shard_dir.join("data");
+        std::fs::write(data_dir.join("heap-000099.mpf"), [0u8; PAGE_4K]).unwrap();
+        // Crash leftover: interrupted atomic-rename batch write.
+        std::fs::write(data_dir.join("heap-000050.tmp"), b"partial").unwrap();
+        // Unrelated file: must not be touched.
+        std::fs::write(data_dir.join("notes.txt"), b"keep me").unwrap();
+
+        let removed = sweep_orphan_heap_files(shard_dir, &manifest);
+
+        assert_eq!(removed, 2, "orphan .mpf + stale .tmp must both be removed");
+        assert!(
+            data_dir.join("heap-000001.mpf").exists(),
+            "registered file must survive"
+        );
+        assert!(
+            !data_dir.join("heap-000099.mpf").exists(),
+            "orphan must be unlinked"
+        );
+        assert!(
+            !data_dir.join("heap-000050.tmp").exists(),
+            "stale tmp must be unlinked"
+        );
+        assert!(
+            data_dir.join("notes.txt").exists(),
+            "unrelated files must survive"
+        );
     }
 
     #[test]
