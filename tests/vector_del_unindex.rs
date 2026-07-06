@@ -196,19 +196,32 @@ impl Client {
         self.writer.write_all(&buf).expect("send pipeline");
         cmds.iter().map(|_| self.parse()).collect()
     }
+
+    /// Fallible PING for the readiness probe: a connection accepted while the
+    /// server is still bringing up its per-shard SO_REUSEPORT listeners can be
+    /// RESET mid-read — that must retry with a fresh connection, not panic.
+    fn try_ping(&mut self) -> std::io::Result<bool> {
+        self.writer.write_all(b"*1\r\n$4\r\nPING\r\n")?;
+        let mut buf = [0u8; 7];
+        self.reader.read_exact(&mut buf)?;
+        Ok(&buf == b"+PONG\r\n")
+    }
 }
 
 fn wait_ready(port: u16) -> Client {
-    let mut c = Client::connect(port);
     let start = Instant::now();
     loop {
-        match c.cmd(&[b"PING"]) {
-            V::Simple(s) if s == "PONG" => return c,
-            _ if start.elapsed() < Duration::from_secs(30) => {
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            other => panic!("server never answered PING: {other:?}"),
+        let mut c = Client::connect(port);
+        // Any I/O error (or a non-PONG answer, which would desync the framing)
+        // drops this connection and probes again on a new one.
+        if let Ok(true) = c.try_ping() {
+            return c;
         }
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "server never answered PING on port {port}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
     }
 }
 
