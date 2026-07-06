@@ -1528,7 +1528,7 @@ impl TextStore {
                     idx.text_fields.clone(),
                     idx.tag_fields.clone(),
                     idx.numeric_fields.clone(),
-                    idx.bm25_config.clone(),
+                    idx.bm25_config,
                 );
                 any = true;
             }
