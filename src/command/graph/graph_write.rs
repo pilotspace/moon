@@ -148,11 +148,16 @@ pub fn graph_addnode(store: &mut GraphStore, args: &[Frame]) -> Frame {
 
         // Update graph stats from stored node (avoid needing moved labels).
         // Collect _key registration outside the immutable borrow of write_buf.
+        //
+        // NOTE: no insert-time property indexing here. Property indexes are
+        // per-CSR-segment, built lazily at first use from the v5 property
+        // blob (`CsrStorage::property_index`) — the old per-ADDNODE
+        // `NamedGraph.property_indexes` maintenance indexed truncated
+        // external ids (wrong row space) and was never read by any query.
         let mut pending_key_reg: Option<Bytes> = None;
         if let Some(node) = graph.write_buf.get_node(node_key) {
             graph.stats.on_node_insert(&node.labels);
 
-            // Update PropertyIndex for numeric properties.
             let key_prop_id = label_to_id(b"_key");
             for (prop_id, prop_val) in &node.properties {
                 // Track _key property for graph expansion Redis key lookup.
@@ -160,18 +165,6 @@ pub fn graph_addnode(store: &mut GraphStore, args: &[Frame]) -> Frame {
                     if let crate::graph::types::PropertyValue::String(s) = prop_val {
                         pending_key_reg = Some(s.clone());
                     }
-                }
-                let val = match prop_val {
-                    crate::graph::types::PropertyValue::Float(f) => Some(*f),
-                    crate::graph::types::PropertyValue::Int(i) => Some(*i as f64),
-                    _ => None,
-                };
-                if let Some(v) = val {
-                    graph
-                        .property_indexes
-                        .entry(*prop_id)
-                        .or_insert_with(|| crate::graph::index::PropertyIndex::new(*prop_id))
-                        .insert(v, ext_id as u32);
                 }
             }
         }

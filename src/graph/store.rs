@@ -12,7 +12,6 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
 use crate::graph::csr::CsrSegment;
-use crate::graph::index::PropertyIndex;
 use crate::graph::segment::GraphSegmentHolder;
 use crate::graph::stats::GraphStats;
 
@@ -39,9 +38,6 @@ pub struct NamedGraph {
     pub edge_threshold: usize,
     /// LSN at which this graph was created.
     pub created_lsn: u64,
-    /// Optional property indexes for cross-segment numeric range queries.
-    /// Key is the property name dictionary ID.
-    pub property_indexes: HashMap<u16, PropertyIndex>,
     /// Per-graph statistics for cost-based query planning.
     /// Updated incrementally on node/edge insert/delete.
     pub stats: GraphStats,
@@ -206,7 +202,6 @@ impl GraphStore {
                 write_buf: crate::graph::memgraph::MemGraph::new(edge_threshold),
                 edge_threshold,
                 created_lsn: lsn,
-                property_indexes: HashMap::new(),
                 stats: GraphStats::new(),
                 plan_cache: parking_lot::Mutex::new(crate::graph::cypher::planner::PlanCache::new(
                     1024,
