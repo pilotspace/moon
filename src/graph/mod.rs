@@ -13,6 +13,7 @@ pub mod manifest;
 pub mod memgraph;
 pub mod recovery;
 pub mod replay;
+pub mod row_bfs;
 pub mod scoring;
 pub mod segment;
 pub mod simd;
