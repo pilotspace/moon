@@ -269,7 +269,7 @@ mod tests {
     }
 
     fn snapshot_for(store: &mut VectorStore, query: Vec<f32>, k: usize) -> SearchSnapshot {
-        let committed = store.txn_manager().committed_treemap().clone();
+        let committed = store.txn_manager().committed_snapshot();
         let snapshot_lsn = store.txn_manager().current_lsn();
         let idx = store.get_index_mut(b"idx").unwrap();
         let segments = idx.segments.load_full();
@@ -289,6 +289,7 @@ mod tests {
             mutable_len,
             scratch: SearchScratch::new(0, padded_dimension(dim)),
             key_hash_to_key: idx.key_hash_to_key.clone(),
+            ef_defaulted: false,
         }
     }
 
@@ -344,7 +345,7 @@ mod tests {
         let idx = store.get_index_mut(b"idx").unwrap();
         let segments = idx.segments.load_full();
         let key_map = idx.key_hash_to_key.clone();
-        let committed = store.txn_manager().committed_treemap().clone();
+        let committed = store.txn_manager().committed_snapshot();
         let snapshot_lsn = store.txn_manager().current_lsn();
 
         let handles: Vec<_> = (0..8)
@@ -372,6 +373,7 @@ mod tests {
                             mutable_len: segments.mutable.len(),
                             scratch: SearchScratch::new(0, padded_dimension(dim)),
                             key_hash_to_key: key_map.clone(),
+                            ef_defaulted: false,
                         };
                         let results = futures::executor::block_on(
                             SegmentHolder::search_mvcc_yielding_with_pool(

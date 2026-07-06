@@ -65,10 +65,10 @@ pub(crate) fn build_search_response(
         items.push(Frame::BulkString(doc_id));
 
         // Score as nested array — use write! to pre-allocated buffer
-        let mut score_buf = String::with_capacity(16);
-        use std::fmt::Write;
-        let _ = write!(score_buf, "{}", r.distance);
-        let score_str = score_buf;
+        // ryu: shortest-roundtrip float formatting without Display's grisu
+        // (1.4% of a matched-recall query).
+        let mut fbuf = ryu::Buffer::new();
+        let score_str = fbuf.format(r.distance).to_owned();
         let fields = vec![
             Frame::BulkString(Bytes::from_static(b"__vec_score")),
             Frame::BulkString(Bytes::from(score_str)),
@@ -257,12 +257,11 @@ pub(crate) fn build_hybrid_response(
         items.push(Frame::BulkString(doc_id));
 
         // Score field — use absolute value of RRF score for display
-        let mut score_buf = String::with_capacity(16);
-        use std::fmt::Write;
-        let _ = write!(score_buf, "{}", r.distance.abs());
+        let mut fbuf = ryu::Buffer::new();
+        let score_str = fbuf.format(r.distance.abs()).to_owned();
         let fields = vec![
             Frame::BulkString(Bytes::from_static(b"__vec_score")),
-            Frame::BulkString(Bytes::from(score_buf)),
+            Frame::BulkString(Bytes::from(score_str)),
         ];
         items.push(Frame::Array(fields.into()));
     }
@@ -350,12 +349,11 @@ pub(crate) fn build_combined_response(
         items.push(Frame::BulkString(er.key.clone()));
         let mut hop_buf = itoa::Buffer::new();
         let hop_str = hop_buf.format(er.graph_hops);
-        let mut score_buf = String::with_capacity(8);
-        use std::fmt::Write;
-        let _ = write!(score_buf, "{}", er.vec_score);
+        let mut fbuf = ryu::Buffer::new();
+        let score_str = fbuf.format(er.vec_score).to_owned();
         let fields = vec![
             Frame::BulkString(Bytes::from_static(b"__vec_score")),
-            Frame::BulkString(Bytes::from(score_buf)),
+            Frame::BulkString(Bytes::from(score_str)),
             Frame::BulkString(Bytes::from_static(b"__graph_hops")),
             Frame::BulkString(Bytes::from(hop_str.to_owned())),
         ];

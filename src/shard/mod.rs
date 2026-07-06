@@ -168,30 +168,13 @@ impl Shard {
                             }
                         }
 
-                        // Vector recovery still uses the v2 path for now
-                        self.recover_vectors(persistence_dir);
-
-                        // Register warm segments into VectorStore so they're searchable
-                        if !result.warm_segments.is_empty() {
-                            info!(
-                                "Shard {}: registering {} warm segment(s)",
-                                self.id,
-                                result.warm_segments.len()
-                            );
-                            self.vector_store
-                                .register_warm_segments(result.warm_segments);
-                        }
-
-                        // Register cold DiskANN segments for discovery
-                        if !result.cold_segments.is_empty() {
-                            info!(
-                                "Shard {}: registering {} cold segment(s)",
-                                self.id,
-                                result.cold_segments.len()
-                            );
-                            self.vector_store
-                                .register_cold_segments(result.cold_segments);
-                        }
+                        // Vector recovery: the `Shard`-owned `vector_store`
+                        // populated here is discarded wholesale at
+                        // `event_loop.rs` (`_discarded_vector_store`) in
+                        // favor of `ShardSlice.vector_store` — see that
+                        // file's comment for the real recovery contract
+                        // (sidecar definitions + manifest/segments/keymap +
+                        // dedup rescan, B3). Nothing to do on this struct.
                         return result.commands_replayed;
                     }
                     Err(e) => {
@@ -273,43 +256,14 @@ impl Shard {
             }
         }
 
-        // Recover vector store
-        self.recover_vectors(persistence_dir);
+        // Vector store recovery does NOT happen here — see the comment in
+        // `restore_from_persistence`'s v3 branch above. The `Shard`-owned
+        // `vector_store` this method populates is discarded wholesale at
+        // `event_loop.rs`; real recovery runs later against
+        // `ShardSlice.vector_store` (sidecar definitions + B3
+        // manifest/segments/keymap load + dedup rescan).
 
         total_keys
-    }
-
-    /// Recover vector store from WAL + on-disk segments.
-    fn recover_vectors(&mut self, persistence_dir: &str) {
-        let dir = std::path::Path::new(persistence_dir);
-        let wal_file = crate::persistence::wal::wal_path(dir, self.id);
-        let vector_persist_dir = dir.join(format!("shard-{}-vectors", self.id));
-        if vector_persist_dir.exists() || wal_file.exists() {
-            match crate::vector::persistence::recovery::recover_vector_store(
-                &wal_file,
-                &vector_persist_dir,
-            ) {
-                Ok(recovered) => {
-                    let seg_count: usize = recovered
-                        .collections
-                        .values()
-                        .map(|c| c.immutable.len())
-                        .sum();
-                    if !recovered.collections.is_empty() {
-                        info!(
-                            "Shard {}: recovered {} vector collections ({} immutable segments)",
-                            self.id,
-                            recovered.collections.len(),
-                            seg_count
-                        );
-                    }
-                    self.vector_store.attach_recovered(recovered);
-                }
-                Err(e) => {
-                    tracing::error!("Shard {}: vector recovery failed: {:?}", self.id, e);
-                }
-            }
-        }
     }
 }
 

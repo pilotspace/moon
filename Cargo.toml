@@ -38,6 +38,7 @@ crc32fast = "1"
 arc-swap = "1"
 parking_lot = "0.12"
 itoa = "1"
+ryu = "1"  # float->shortest-string for RESP score replies (grisu via Display was 1.4% of FT.SEARCH)
 xxhash-rust = { version = "0.8", features = ["xxh64"] }
 ringbuf = "0.4"
 core_affinity = "0.8"

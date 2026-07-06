@@ -117,7 +117,7 @@ pub fn execute_hybrid_search_local_raw_streams(
     // multi-shard scatter. Matches the single-shard hybrid.rs pattern.
     // `as_of_lsn == 0` → no temporal filtering (treemap still snapshotted for
     // ACID-09 committed-entry visibility parity with search_local_raw).
-    let committed = vector_store.txn_manager().committed_treemap().clone();
+    let committed = vector_store.txn_manager().committed_snapshot();
     let idx = match vector_store.get_index_mut(index_name.as_ref()) {
         Some(ix) => ix,
         None => return Frame::Error(Bytes::from_static(b"ERR unknown index")),

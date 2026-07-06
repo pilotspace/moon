@@ -76,6 +76,12 @@ struct SegmentMeta {
     /// Build mode: "Light" or "Exact". Added in v1 — defaults to inferred if absent.
     #[serde(default)]
     build_mode: Option<String>,
+    /// Compact-time adaptive-ef estimate (AE-1/R6). Added post-v1 —
+    /// `#[serde(default)]` keeps segment dirs written before this field
+    /// existed readable (they simply carry `None`, same as an in-memory
+    /// segment for which the estimator declined to make a call).
+    #[serde(default)]
+    suggested_ef: Option<u32>,
 }
 
 fn segment_dir(dir: &Path, segment_id: u64) -> PathBuf {
@@ -131,6 +137,15 @@ fn string_to_quant(s: &str) -> Result<QuantizationConfig, SegmentIoError> {
 /// Write an immutable segment to disk.
 ///
 /// Creates `{dir}/segment-{id}/` with 5 files.
+///
+/// This is the low-level primitive: it writes directly under the FINAL
+/// `segment-{id}` name. Production callers that need crash-safe atomicity
+/// (a segment must never be considered "live" until it is fully durable)
+/// should use [`write_immutable_segment_staged`] instead, which writes to a
+/// `staging-{id}` name first and only `rename`s to `segment-{id}` once every
+/// file is written and fsynced. This primitive is kept for tests and any
+/// caller that already provides its own atomicity (e.g. a fresh, private
+/// scratch directory).
 pub fn write_immutable_segment(
     dir: &Path,
     segment_id: u64,
@@ -138,7 +153,52 @@ pub fn write_immutable_segment(
     collection: &CollectionMetadata,
 ) -> Result<(), SegmentIoError> {
     let seg_dir = segment_dir(dir, segment_id);
-    fs::create_dir_all(&seg_dir)?;
+    write_segment_files(&seg_dir, segment_id, segment, collection)
+}
+
+/// Write an immutable segment to disk with crash-safe atomicity.
+///
+/// Writes into `{root_dir}/staging-{id}/` (removing any stale leftover from
+/// a prior interrupted attempt first), fsyncs every file plus the staging
+/// directory itself (inside [`write_segment_files`]), then atomically
+/// `rename`s `staging-{id}` -> `segment-{id}` and fsyncs `root_dir` so the
+/// rename (a directory-entry change) is itself durable.
+///
+/// Until the `rename` completes, `segment-{id}` simply does not exist — a
+/// crash mid-write leaves only an orphan `staging-{id}` directory, which is
+/// safe to delete (never referenced by any manifest). This is the write path
+/// used by compaction/merge when a `persist_dir` is configured (B2).
+pub fn write_immutable_segment_staged(
+    root_dir: &Path,
+    segment_id: u64,
+    segment: &ImmutableSegment,
+    collection: &CollectionMetadata,
+) -> Result<(), SegmentIoError> {
+    fs::create_dir_all(root_dir)?;
+    let staging_dir = root_dir.join(format!("staging-{segment_id}"));
+    if staging_dir.exists() {
+        // Leftover from a prior crashed attempt at the same segment id.
+        // Best-effort removal — write_segment_files will recreate it.
+        let _ = fs::remove_dir_all(&staging_dir);
+    }
+    write_segment_files(&staging_dir, segment_id, segment, collection)?;
+    let final_dir = segment_dir(root_dir, segment_id);
+    fs::rename(&staging_dir, &final_dir)?;
+    fsync_directory(root_dir)?;
+    Ok(())
+}
+
+/// Shared file-writing body for both [`write_immutable_segment`] (writes
+/// directly to the final name) and [`write_immutable_segment_staged`]
+/// (writes to a staging name first). `seg_dir` is the exact target
+/// directory to create and populate.
+fn write_segment_files(
+    seg_dir: &Path,
+    segment_id: u64,
+    segment: &ImmutableSegment,
+    collection: &CollectionMetadata,
+) -> Result<(), SegmentIoError> {
+    fs::create_dir_all(seg_dir)?;
 
     // 1. hnsw_graph.bin
     let graph_bytes = segment.graph().to_bytes();
@@ -207,6 +267,7 @@ pub fn write_immutable_segment(
             crate::vector::turbo_quant::collection::BuildMode::Light => "Light".to_owned(),
             crate::vector::turbo_quant::collection::BuildMode::Exact => "Exact".to_owned(),
         }),
+        suggested_ef: segment.suggested_ef(),
     };
     let json = serde_json::to_string_pretty(&meta)
         .map_err(|e| SegmentIoError::InvalidMetadata(e.to_string()))?;
@@ -215,9 +276,126 @@ pub fn write_immutable_segment(
     fsync_file(&meta_path)?;
 
     // Fsync the segment directory to make all file entries durable
-    fsync_directory(&seg_dir)?;
+    fsync_directory(seg_dir)?;
 
     Ok(())
+}
+
+/// Parse the raw contents of an `mvcc_headers.bin` file (version-aware:
+/// v1 = 20 bytes/header with no `global_id`/`key_hash`, v2 = 32 bytes/header).
+/// Shared by [`read_immutable_segment`] (full segment read) and
+/// [`read_mvcc_headers_only`] (B3 best-effort recovery helper, used when the
+/// rest of a segment fails to load but the key_hashes it held still need to
+/// be identified so they can be dropped from the recovered keymap).
+fn parse_mvcc_headers(mvcc_bytes: &[u8]) -> Result<Vec<MvccHeader>, SegmentIoError> {
+    if mvcc_bytes.len() < 4 {
+        return Err(SegmentIoError::InvalidMetadata(
+            "mvcc_headers.bin too short".to_owned(),
+        ));
+    }
+    // Detect format version: v2 starts with version byte 2, v1 starts with count (u32 LE)
+    let (mvcc_version, mvcc_count, mut pos) = if mvcc_bytes[0] == 2 && mvcc_bytes.len() >= 5 {
+        let count = u32::from_le_bytes([mvcc_bytes[1], mvcc_bytes[2], mvcc_bytes[3], mvcc_bytes[4]])
+            as usize;
+        (2u8, count, 5usize)
+    } else {
+        let count = u32::from_le_bytes([mvcc_bytes[0], mvcc_bytes[1], mvcc_bytes[2], mvcc_bytes[3]])
+            as usize;
+        (1u8, count, 4usize)
+    };
+    let bytes_per_header: usize = if mvcc_version >= 2 { 32 } else { 20 };
+    if mvcc_bytes.len() < pos + mvcc_count * bytes_per_header {
+        return Err(SegmentIoError::InvalidMetadata(
+            "mvcc_headers.bin truncated".to_owned(),
+        ));
+    }
+    let mut mvcc = Vec::with_capacity(mvcc_count);
+    for _ in 0..mvcc_count {
+        let internal_id = u32::from_le_bytes([
+            mvcc_bytes[pos],
+            mvcc_bytes[pos + 1],
+            mvcc_bytes[pos + 2],
+            mvcc_bytes[pos + 3],
+        ]);
+        pos += 4;
+        let (global_id, key_hash) = if mvcc_version >= 2 {
+            let gid = u32::from_le_bytes([
+                mvcc_bytes[pos],
+                mvcc_bytes[pos + 1],
+                mvcc_bytes[pos + 2],
+                mvcc_bytes[pos + 3],
+            ]);
+            pos += 4;
+            let kh = u64::from_le_bytes([
+                mvcc_bytes[pos],
+                mvcc_bytes[pos + 1],
+                mvcc_bytes[pos + 2],
+                mvcc_bytes[pos + 3],
+                mvcc_bytes[pos + 4],
+                mvcc_bytes[pos + 5],
+                mvcc_bytes[pos + 6],
+                mvcc_bytes[pos + 7],
+            ]);
+            pos += 8;
+            (gid, kh)
+        } else {
+            (internal_id, 0u64) // v1 fallback: global_id = internal_id
+        };
+        let insert_lsn = u64::from_le_bytes([
+            mvcc_bytes[pos],
+            mvcc_bytes[pos + 1],
+            mvcc_bytes[pos + 2],
+            mvcc_bytes[pos + 3],
+            mvcc_bytes[pos + 4],
+            mvcc_bytes[pos + 5],
+            mvcc_bytes[pos + 6],
+            mvcc_bytes[pos + 7],
+        ]);
+        pos += 8;
+        let delete_lsn = u64::from_le_bytes([
+            mvcc_bytes[pos],
+            mvcc_bytes[pos + 1],
+            mvcc_bytes[pos + 2],
+            mvcc_bytes[pos + 3],
+            mvcc_bytes[pos + 4],
+            mvcc_bytes[pos + 5],
+            mvcc_bytes[pos + 6],
+            mvcc_bytes[pos + 7],
+        ]);
+        pos += 8;
+        mvcc.push(MvccHeader {
+            internal_id,
+            global_id,
+            key_hash,
+            insert_lsn,
+            delete_lsn,
+            hint_committed: 0,
+        });
+    }
+    Ok(mvcc)
+}
+
+/// Best-effort recovery helper (B3): read and parse ONLY the
+/// `mvcc_headers.bin` file for a segment, without touching the graph/TQ/meta
+/// files or verifying any checksum.
+///
+/// Used when a segment's full [`read_immutable_segment`] fails (corrupt
+/// graph, checksum mismatch, collection-id mismatch against the manifest) —
+/// the B3 loader still needs the `key_hash` of every entry that WAS durable
+/// in the abandoned segment, so it can drop exactly those keys from the
+/// recovered keymap (letting the rescan re-index them) instead of either
+/// resurrecting stale data or silently losing track of which keys are
+/// affected.
+///
+/// Returns `None` on ANY I/O or parse failure. The caller's fallback for
+/// that case (headers ALSO unreadable) is to abandon the entire index's
+/// on-disk state — an unattributed set of potentially-lost keys can't be
+/// safely subtracted from the keymap without risking duplicate/stale search
+/// results (see `recover_v2` module docs).
+pub fn read_mvcc_headers_only(dir: &Path, segment_id: u64) -> Option<Vec<MvccHeader>> {
+    let seg_dir = segment_dir(dir, segment_id);
+    let mvcc_bytes = fs::read(seg_dir.join("mvcc_headers.bin")).ok()?;
+    parse_mvcc_headers(&mvcc_bytes).ok()
 }
 
 /// Read an immutable segment from disk.
@@ -364,90 +542,7 @@ pub fn read_immutable_segment(
 
     // 5. Read MVCC headers (version-aware: v1 = 20 bytes/header, v2 = 32 bytes/header)
     let mvcc_bytes = fs::read(seg_dir.join("mvcc_headers.bin"))?;
-    if mvcc_bytes.len() < 4 {
-        return Err(SegmentIoError::InvalidMetadata(
-            "mvcc_headers.bin too short".to_owned(),
-        ));
-    }
-    // Detect format version: v2 starts with version byte 2, v1 starts with count (u32 LE)
-    let (mvcc_version, mvcc_count, mut pos) = if mvcc_bytes[0] == 2 && mvcc_bytes.len() >= 5 {
-        let count = u32::from_le_bytes([mvcc_bytes[1], mvcc_bytes[2], mvcc_bytes[3], mvcc_bytes[4]])
-            as usize;
-        (2u8, count, 5usize)
-    } else {
-        let count = u32::from_le_bytes([mvcc_bytes[0], mvcc_bytes[1], mvcc_bytes[2], mvcc_bytes[3]])
-            as usize;
-        (1u8, count, 4usize)
-    };
-    let bytes_per_header: usize = if mvcc_version >= 2 { 32 } else { 20 };
-    if mvcc_bytes.len() < pos + mvcc_count * bytes_per_header {
-        return Err(SegmentIoError::InvalidMetadata(
-            "mvcc_headers.bin truncated".to_owned(),
-        ));
-    }
-    let mut mvcc = Vec::with_capacity(mvcc_count);
-    for _ in 0..mvcc_count {
-        let internal_id = u32::from_le_bytes([
-            mvcc_bytes[pos],
-            mvcc_bytes[pos + 1],
-            mvcc_bytes[pos + 2],
-            mvcc_bytes[pos + 3],
-        ]);
-        pos += 4;
-        let (global_id, key_hash) = if mvcc_version >= 2 {
-            let gid = u32::from_le_bytes([
-                mvcc_bytes[pos],
-                mvcc_bytes[pos + 1],
-                mvcc_bytes[pos + 2],
-                mvcc_bytes[pos + 3],
-            ]);
-            pos += 4;
-            let kh = u64::from_le_bytes([
-                mvcc_bytes[pos],
-                mvcc_bytes[pos + 1],
-                mvcc_bytes[pos + 2],
-                mvcc_bytes[pos + 3],
-                mvcc_bytes[pos + 4],
-                mvcc_bytes[pos + 5],
-                mvcc_bytes[pos + 6],
-                mvcc_bytes[pos + 7],
-            ]);
-            pos += 8;
-            (gid, kh)
-        } else {
-            (internal_id, 0u64) // v1 fallback: global_id = internal_id
-        };
-        let insert_lsn = u64::from_le_bytes([
-            mvcc_bytes[pos],
-            mvcc_bytes[pos + 1],
-            mvcc_bytes[pos + 2],
-            mvcc_bytes[pos + 3],
-            mvcc_bytes[pos + 4],
-            mvcc_bytes[pos + 5],
-            mvcc_bytes[pos + 6],
-            mvcc_bytes[pos + 7],
-        ]);
-        pos += 8;
-        let delete_lsn = u64::from_le_bytes([
-            mvcc_bytes[pos],
-            mvcc_bytes[pos + 1],
-            mvcc_bytes[pos + 2],
-            mvcc_bytes[pos + 3],
-            mvcc_bytes[pos + 4],
-            mvcc_bytes[pos + 5],
-            mvcc_bytes[pos + 6],
-            mvcc_bytes[pos + 7],
-        ]);
-        pos += 8;
-        mvcc.push(MvccHeader {
-            internal_id,
-            global_id,
-            key_hash,
-            insert_lsn,
-            delete_lsn,
-            hint_committed: 0,
-        });
-    }
+    let mvcc = parse_mvcc_headers(&mvcc_bytes)?;
 
     // 6. Construct ImmutableSegment
     let dim = meta.dimension as usize;
@@ -489,7 +584,11 @@ pub fn read_immutable_segment(
         meta.live_count,
         meta.total_count,
     )
-    .with_raw_f16(raw_f16);
+    .with_raw_f16(raw_f16)
+    // R6: restore the compact-time estimate verbatim — never re-run the
+    // estimator on the load path (it needs the raw sidecar + a full ladder
+    // walk; that cost belongs on the compaction thread only).
+    .with_suggested_ef_raw(meta.suggested_ef);
 
     Ok((segment, collection))
 }
@@ -647,6 +746,98 @@ mod tests {
         // sq_vectors.bin and f32_vectors.bin no longer written (TQ-ADC used for search)
         assert!(seg_dir.join("mvcc_headers.bin").exists());
         assert!(seg_dir.join("segment_meta.json").exists());
+    }
+
+    /// R6: a segment carrying a measured `suggested_ef` must round-trip it
+    /// verbatim through disk — the read path restores it raw (no
+    /// re-estimation), so this also guards against `read_immutable_segment`
+    /// accidentally calling `with_adaptive_ef()` instead of
+    /// `with_suggested_ef_raw()`.
+    #[test]
+    fn test_suggested_ef_roundtrip() {
+        let (segment, collection) = build_test_segment(20, 64);
+        let segment = segment.with_suggested_ef_raw(Some(48));
+        let tmp = tempfile::tempdir().unwrap();
+
+        write_immutable_segment(tmp.path(), 1, &segment, &collection).unwrap();
+        let (restored, _) = read_immutable_segment(tmp.path(), 1).unwrap();
+
+        assert_eq!(restored.suggested_ef(), Some(48));
+    }
+
+    /// A segment with no measured estimate persists/reloads as `None`.
+    #[test]
+    fn test_suggested_ef_none_roundtrips_none() {
+        let (segment, collection) = build_test_segment(20, 64);
+        assert_eq!(segment.suggested_ef(), None);
+        let tmp = tempfile::tempdir().unwrap();
+
+        write_immutable_segment(tmp.path(), 1, &segment, &collection).unwrap();
+        let (restored, _) = read_immutable_segment(tmp.path(), 1).unwrap();
+
+        assert_eq!(restored.suggested_ef(), None);
+    }
+
+    /// Backward compatibility: a `segment_meta.json` written before the
+    /// `suggested_ef` field existed (no such key at all) must still load,
+    /// via `#[serde(default)]`, as `None` rather than erroring.
+    #[test]
+    fn test_suggested_ef_absent_key_in_old_segment_meta_loads_as_none() {
+        let (segment, collection) = build_test_segment(20, 64);
+        let tmp = tempfile::tempdir().unwrap();
+
+        write_immutable_segment(tmp.path(), 1, &segment, &collection).unwrap();
+
+        // Simulate a pre-R6 segment_meta.json by stripping the field entirely.
+        let meta_path = tmp.path().join("segment-1").join("segment_meta.json");
+        let json_str = std::fs::read_to_string(&meta_path).unwrap();
+        let mut val: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        val.as_object_mut().unwrap().remove("suggested_ef");
+        std::fs::write(&meta_path, serde_json::to_string_pretty(&val).unwrap()).unwrap();
+
+        let (restored, _) = read_immutable_segment(tmp.path(), 1).unwrap();
+        assert_eq!(restored.suggested_ef(), None);
+    }
+
+    /// `write_immutable_segment_staged` must produce a directory readable by
+    /// `read_immutable_segment` under the FINAL name, with no leftover
+    /// `staging-*` directory once the rename completes.
+    #[test]
+    fn test_staged_write_renames_to_final_and_leaves_no_staging_dir() {
+        let (segment, collection) = build_test_segment(20, 64);
+        let tmp = tempfile::tempdir().unwrap();
+
+        write_immutable_segment_staged(tmp.path(), 7, &segment, &collection).unwrap();
+
+        assert!(tmp.path().join("segment-7").exists());
+        assert!(!tmp.path().join("staging-7").exists());
+        let (restored, _) = read_immutable_segment(tmp.path(), 7).unwrap();
+        assert_eq!(restored.live_count(), segment.live_count());
+    }
+
+    /// A stale `staging-{id}` directory left over from a prior crashed write
+    /// (e.g. partial files, no `segment_meta.json`) must not block a fresh
+    /// staged write from succeeding — it is removed and rebuilt.
+    #[test]
+    fn test_staged_write_recovers_from_stale_staging_dir() {
+        let (segment, collection) = build_test_segment(20, 64);
+        let tmp = tempfile::tempdir().unwrap();
+
+        let stale_staging = tmp.path().join("staging-3");
+        std::fs::create_dir_all(&stale_staging).unwrap();
+        std::fs::write(stale_staging.join("garbage.bin"), b"not a real segment").unwrap();
+
+        write_immutable_segment_staged(tmp.path(), 3, &segment, &collection).unwrap();
+
+        assert!(
+            tmp.path()
+                .join("segment-3")
+                .join("segment_meta.json")
+                .exists()
+        );
+        assert!(!stale_staging.exists());
+        let (restored, _) = read_immutable_segment(tmp.path(), 3).unwrap();
+        assert_eq!(restored.live_count(), segment.live_count());
     }
 
     #[test]

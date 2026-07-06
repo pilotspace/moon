@@ -1336,6 +1336,26 @@ pub(crate) async fn handle_connection_sharded_monoio<
                             );
                         }
 
+                        // R4: HDEL of an indexed vector field tombstones it.
+                        if !is_error && cmd.eq_ignore_ascii_case(b"HDEL") {
+                            crate::shard::spsc_handler::auto_hdel_vectors(
+                                &mut s.vector_store,
+                                cmd_args,
+                            );
+                        }
+
+                        // R3: FLUSHALL/FLUSHDB clears index contents
+                        // (FT.CREATE definitions survive).
+                        if !is_error
+                            && (cmd.eq_ignore_ascii_case(b"FLUSHDB")
+                                || cmd.eq_ignore_ascii_case(b"FLUSHALL"))
+                        {
+                            crate::shard::spsc_handler::auto_flush_indexes(
+                                &mut s.vector_store,
+                                &mut s.text_store,
+                            );
+                        }
+
                         // Blocking wakeup: re-borrow db by index (NLL)
                         if !is_error {
                             let needs_wake = cmd.eq_ignore_ascii_case(b"LPUSH")
@@ -1490,7 +1510,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                 // Clone committed treemap to release vector_store lock
                                 // before acquiring kv_intents lock (lock ordering).
                                 let committed = crate::shard::slice::with_shard(|s| {
-                                    s.vector_store.txn_manager().committed_treemap().clone()
+                                    s.vector_store.txn_manager().committed_snapshot()
                                 });
                                 let visible = crate::shard::slice::with_shard(|s| {
                                     s.kv_write_intents.is_key_visible(

@@ -12,7 +12,10 @@ use crate::vector::aligned_buffer::AlignedBuffer;
 use crate::vector::distance;
 use crate::vector::turbo_quant::collection::{CollectionMetadata, QuantizationConfig};
 use crate::vector::turbo_quant::fwht;
-use crate::vector::turbo_quant::sq8::{sq8_l2_from_stats, sq8_params, sq8_query_stats};
+use crate::vector::turbo_quant::sq8::{
+    SQ8_INT8_QMAX, sq8_int8_dot_to_f32, sq8_l2_from_stats, sq8_params, sq8_quantize_query_scalar,
+    sq8_query_stats,
+};
 use crate::vector::types::{DistanceMetric, SearchResult, VectorId};
 
 /// Bit vector for O(1) visited tracking. 64x more cache-efficient than HashSet
@@ -131,6 +134,38 @@ impl SearchScratch {
         self.visited.clear_all(num_nodes);
         self.adc_lut.clear();
     }
+}
+
+thread_local! {
+    /// Per-thread [`SearchScratch`] recycler for the wire search path (QP-3).
+    /// The snapshot capture previously built a fresh scratch per query —
+    /// heaps, visited bitmap, and the 32–65KB ADC LUT reallocated (and
+    /// re-grown during the search) every FT.SEARCH. One slot suffices:
+    /// concurrent same-thread searches (interleaved via cooperative yields)
+    /// simply miss the cache and allocate, exactly like before.
+    static SCRATCH_TLS: std::cell::RefCell<Option<SearchScratch>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Take this thread's cached [`SearchScratch`], or build a fresh one.
+///
+/// Reuse rule mirrors the search-worker pool's cache: `query_rotated.len()`
+/// must EXACTLY equal `padded_dim` — it ACTS as the search's padded
+/// dimension (LUT sizing + code_len invariants in `hnsw_search`), so a
+/// larger buffer is just as wrong as a smaller one.
+pub fn take_thread_scratch(padded_dim: u32) -> SearchScratch {
+    let cached = SCRATCH_TLS.with(|slot| slot.borrow_mut().take());
+    match cached {
+        Some(s) if s.query_rotated.len() == padded_dim as usize => s,
+        _ => SearchScratch::new(0, padded_dim),
+    }
+}
+
+/// Return a scratch to this thread's cache for the next search to reuse.
+pub fn recycle_thread_scratch(scratch: SearchScratch) {
+    SCRATCH_TLS.with(|slot| {
+        *slot.borrow_mut() = Some(scratch);
+    });
 }
 
 /// HNSW search with 2-hop dual prefetch and TQ-ADC distance.
@@ -285,6 +320,24 @@ pub fn hnsw_search_filtered(
     } else {
         (0.0, 0.0)
     };
+    // Task #13: int8 symmetric ADC. `sq8_i8_stats_fn` is `Some` only when
+    // this CPU/build has a matching SIMD int8 kernel installed (and
+    // `MOON_SQ8_INT8_ADC` isn't `0`) — quantize the query to int8 ONCE per
+    // search in that case; the per-candidate closures below fall back to
+    // `sq8_stats_fn` (f32) whenever it's `None`. Inline buffer keeps this
+    // heap-free for dim <= 512, same VEC-HNSW-03 guarantee as `sq8_query`.
+    let sq8_i8_stats_fn = distance::table().sq8_i8_stats;
+    let mut sq8_qi8: SmallVec<[i8; 512]> = SmallVec::new();
+    let mut sq8_q_scale = 0.0f32;
+    let mut sq8_sum_qi8 = 0i32;
+    if is_sq8 {
+        if sq8_i8_stats_fn.is_some() {
+            sq8_qi8 = smallvec::smallvec![0i8; sq8_query.len()];
+            let (scale, sum) = sq8_quantize_query_scalar(&sq8_query, SQ8_INT8_QMAX, &mut sq8_qi8);
+            sq8_q_scale = scale;
+            sq8_sum_qi8 = sum;
+        }
+    }
 
     let q_rot = scratch.query_rotated.as_mut_slice();
     // Copy query and zero-pad
@@ -406,7 +459,17 @@ pub fn hnsw_search_filtered(
             // outside this per-candidate closure.
             let slot = &vectors_tq[offset..offset + bytes_per_code];
             let (min, scale) = sq8_params(slot, dim);
-            let (dot_qc, sum_c, sumsq_c) = sq8_stats_fn(&sq8_query, &slot[..dim]);
+            let (dot_qc, sum_c, sumsq_c) = if let Some(i8_stats) = sq8_i8_stats_fn {
+                let (dot_int, sum_c_int, sumsq_c_int) =
+                    i8_stats(&sq8_qi8, &slot[..dim], sq8_sum_qi8);
+                (
+                    sq8_int8_dot_to_f32(sq8_q_scale, dot_int),
+                    sum_c_int as f32,
+                    sumsq_c_int as f32,
+                )
+            } else {
+                sq8_stats_fn(&sq8_query, &slot[..dim])
+            };
             return sq8_l2_from_stats(
                 dim,
                 min,
@@ -556,7 +619,17 @@ pub fn hnsw_search_filtered(
             let _ = budget;
             let slot = &vectors_tq[offset..offset + bytes_per_code];
             let (min, scale) = sq8_params(slot, dim);
-            let (dot_qc, sum_c, sumsq_c) = sq8_stats_fn(&sq8_query, &slot[..dim]);
+            let (dot_qc, sum_c, sumsq_c) = if let Some(i8_stats) = sq8_i8_stats_fn {
+                let (dot_int, sum_c_int, sumsq_c_int) =
+                    i8_stats(&sq8_qi8, &slot[..dim], sq8_sum_qi8);
+                (
+                    sq8_int8_dot_to_f32(sq8_q_scale, dot_int),
+                    sum_c_int as f32,
+                    sumsq_c_int as f32,
+                )
+            } else {
+                sq8_stats_fn(&sq8_query, &slot[..dim])
+            };
             return sq8_l2_from_stats(
                 dim,
                 min,

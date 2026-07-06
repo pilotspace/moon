@@ -366,7 +366,7 @@ pub fn execute_hybrid_search_local(
     // v0.1.9 HYB-01: snapshot the committed treemap BEFORE get_index_mut so the
     // dense stream honors AS_OF via MVCC filtering. Non-TXN readers must see
     // entries whose owning txn has committed (matches search_local_raw pattern).
-    let committed = vector_store.txn_manager().committed_treemap().clone();
+    let committed = vector_store.txn_manager().committed_snapshot();
 
     // ── Stream 1: BM25 (per D-10 — direct use of existing BM25 ranker) ────────
     //
@@ -594,6 +594,7 @@ pub(super) fn run_dense_knn(
             committed,
             dirty_set: &[],
             dimension: dim as u32,
+            ef_defaulted: false,
         };
         idx.segments
             .search_mvcc(&query_f32, k, ef_search, &mut idx.scratch, None, &mvcc_ctx)
@@ -615,6 +616,7 @@ pub(super) fn run_dense_knn(
             committed,
             dirty_set: &[],
             dimension: dim as u32,
+            ef_defaulted: false,
         };
         fs.segments
             .search_mvcc(&query_f32, k, ef_search, &mut fs.scratch, None, &mvcc_ctx)

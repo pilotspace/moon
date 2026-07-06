@@ -24,6 +24,13 @@ use super::mutable::{MutableEntry, MutableSegment};
 /// Default number of IVF clusters to probe during search.
 const DEFAULT_NPROBE: usize = 32;
 
+// Per-segment beam policy (AE-1): every graph segment searches at the FULL
+// resolved ef unless its compact-time saturation probe certified it as
+// trivially easy (`ImmutableSegment::suggested_ef`), in which case min-ef
+// suffices. A blanket `ef/√G` split was tried first (EF-SPLIT) and REJECTED:
+// it silently cost R@10 0.9915 → 0.9295 on gaussian 5-seg — a per-segment
+// beam reduction is only safe when the segment itself proves it saturates.
+
 /// MVCC context for snapshot-isolated search. Passed by reference, zero allocation.
 pub struct MvccContext<'a> {
     pub snapshot_lsn: u64,
@@ -32,6 +39,10 @@ pub struct MvccContext<'a> {
     /// Dirty set: uncommitted entries from the active transaction.
     pub dirty_set: &'a [MutableEntry],
     pub dimension: u32,
+    /// AE-1: true when `ef_search` came from the resolution heuristic (no
+    /// user `EF_RUNTIME`) — saturation-certified segments may then run at
+    /// their min-ef estimate. Always false when the user pinned ef.
+    pub ef_defaulted: bool,
 }
 
 /// Snapshot of all segments at a point in time.
@@ -130,8 +141,11 @@ pub struct SearchSnapshot {
     pub snapshot_lsn: u64,
     /// Active txn id (0 for non-transactional reads).
     pub my_txn_id: u64,
-    /// Committed-treemap snapshot (owned) for MVCC visibility.
-    pub committed: roaring::RoaringTreemap,
+    /// Committed-treemap snapshot for MVCC visibility. `Arc` capture (QP-2):
+    /// an O(1) refcount bump per search; the treemap is cloned only on the
+    /// first capture after a commit/prune (see
+    /// `TransactionManager::committed_snapshot`).
+    pub committed: std::sync::Arc<roaring::RoaringTreemap>,
     /// Vector dimension.
     pub dimension: u32,
     /// Entry count of the mutable segment captured at entry. The append-only
@@ -145,6 +159,10 @@ pub struct SearchSnapshot {
     /// builder, not the segment scan. `Arc` snapshot: capture is O(1); writers
     /// copy-on-write via `Arc::make_mut` (QP-1).
     pub key_hash_to_key: std::sync::Arc<std::collections::HashMap<u64, bytes::Bytes>>,
+    /// AE-1: true when `ef_search` came from the resolution heuristic (no
+    /// user `EF_RUNTIME`) — saturation-certified segments may then run at
+    /// their min-ef estimate.
+    pub ef_defaulted: bool,
 }
 
 /// Lock-free segment holder. Searches load() once at query start and hold
@@ -281,6 +299,10 @@ impl SegmentHolder {
             None // Light mode: no QJL matrices, use TQ-ADC brute force
         };
 
+        // Full resolved ef per segment (no ef_defaulted context on this path,
+        // so the AE-1 per-segment reduction never applies here).
+        let graph_ef = ef_search;
+
         match strategy {
             FilterStrategy::Unfiltered => {
                 all.extend(
@@ -289,10 +311,10 @@ impl SegmentHolder {
                         .brute_force_search(query_f32, query_state.as_ref(), k),
                 );
                 for imm in &snapshot.immutable {
-                    all.extend(imm.search(query_f32, k, ef_search, _scratch));
+                    all.extend(imm.search(query_f32, k, graph_ef, _scratch));
                 }
                 for warm_seg in &snapshot.warm {
-                    all.extend(warm_seg.search(query_f32, k, ef_search, _scratch));
+                    all.extend(warm_seg.search(query_f32, k, graph_ef, _scratch));
                 }
             }
             FilterStrategy::BruteForceFiltered => {
@@ -306,7 +328,7 @@ impl SegmentHolder {
                     all.extend(imm.search_filtered(
                         query_f32,
                         k,
-                        ef_search,
+                        graph_ef,
                         _scratch,
                         filter_bitmap,
                     ));
@@ -315,7 +337,7 @@ impl SegmentHolder {
                     all.extend(warm_seg.search_filtered(
                         query_f32,
                         k,
-                        ef_search,
+                        graph_ef,
                         _scratch,
                         filter_bitmap,
                     ));
@@ -332,7 +354,7 @@ impl SegmentHolder {
                     all.extend(imm.search_filtered(
                         query_f32,
                         k,
-                        ef_search,
+                        graph_ef,
                         _scratch,
                         filter_bitmap,
                     ));
@@ -341,7 +363,7 @@ impl SegmentHolder {
                     all.extend(warm_seg.search_filtered(
                         query_f32,
                         k,
-                        ef_search,
+                        graph_ef,
                         _scratch,
                         filter_bitmap,
                     ));
@@ -355,13 +377,9 @@ impl SegmentHolder {
                     oversample_k,
                     filter_bitmap,
                 ));
+                let post_ef = ef_search.max(oversample_k);
                 for imm in &snapshot.immutable {
-                    let imm_results = imm.search(
-                        query_f32,
-                        oversample_k,
-                        ef_search.max(oversample_k),
-                        _scratch,
-                    );
+                    let imm_results = imm.search(query_f32, oversample_k, post_ef, _scratch);
                     if let Some(bm) = filter_bitmap {
                         for r in imm_results {
                             if bm.contains(r.id.0) {
@@ -373,12 +391,7 @@ impl SegmentHolder {
                     }
                 }
                 for warm_seg in &snapshot.warm {
-                    let warm_results = warm_seg.search(
-                        query_f32,
-                        oversample_k,
-                        ef_search.max(oversample_k),
-                        _scratch,
-                    );
+                    let warm_results = warm_seg.search(query_f32, oversample_k, post_ef, _scratch);
                     if let Some(bm) = filter_bitmap {
                         for r in warm_results {
                             if bm.contains(r.id.0) {
@@ -503,11 +516,23 @@ impl SegmentHolder {
         // 2. HNSW search on immutable segments (TQ-ADC distance).
         // Immutable segment entries are committed by definition (compacted only
         // after commit). No visibility post-filter needed for Phase 65.
+        // AE-1: heuristic-defaulted ef → a saturation-certified segment runs
+        // at its compact-time min-ef estimate (floored by k, capped by the
+        // resolved ef); every other segment gets the FULL resolved ef.
+        // Mirrors the yielding path's selector exactly.
+        let graph_ef = ef_search;
+        let seg_ef = |suggested: Option<u32>| -> usize {
+            match suggested {
+                Some(sug) if mvcc.ef_defaulted => (sug as usize).max(k).min(ef_search),
+                _ => graph_ef,
+            }
+        };
         for imm in &snapshot.immutable {
+            let ef_i = seg_ef(imm.suggested_ef());
             if filter_bitmap.is_some() {
-                all.extend(imm.search_filtered(query_f32, k, ef_search, _scratch, filter_bitmap));
+                all.extend(imm.search_filtered(query_f32, k, ef_i, _scratch, filter_bitmap));
             } else {
-                all.extend(imm.search(query_f32, k, ef_search, _scratch));
+                all.extend(imm.search(query_f32, k, ef_i, _scratch));
             }
         }
 
@@ -517,12 +542,12 @@ impl SegmentHolder {
                 all.extend(warm_seg.search_filtered(
                     query_f32,
                     k,
-                    ef_search,
+                    graph_ef,
                     _scratch,
                     filter_bitmap,
                 ));
             } else {
-                all.extend(warm_seg.search(query_f32, k, ef_search, _scratch));
+                all.extend(warm_seg.search(query_f32, k, graph_ef, _scratch));
             }
         }
 
@@ -647,6 +672,20 @@ impl SegmentHolder {
         } else {
             ef_search
         };
+        // AE-1: when ef was heuristic-defaulted, a saturation-certified
+        // segment runs at its compact-time min-ef estimate — floored by the
+        // merge quota, capped by the resolved ef. Every other segment gets
+        // the FULL resolved ef (see the per-segment beam policy note at the
+        // top of this file). Identical selector in the pooled jobs, inline
+        // fallbacks, and serial loops, so pooled == serial identity holds.
+        // Never active when the user pinned EF_RUNTIME.
+        let ef_defaulted = snap.ef_defaulted;
+        let seg_ef = |suggested: Option<u32>| -> usize {
+            match suggested {
+                Some(sug) if ef_defaulted => (sug as usize).max(fetch_k).min(graph_ef),
+                _ => graph_ef,
+            }
+        };
         let snapshot_lsn = snap.snapshot_lsn;
         let my_txn_id = snap.my_txn_id;
         let mutable_len = snap.mutable_len;
@@ -687,13 +726,14 @@ impl SegmentHolder {
             // On submit failure (pool shut down at process teardown) the
             // segment is searched inline — the query still answers correctly.
             for seg in &segments.immutable {
+                let ef_seg = seg_ef(seg.suggested_ef());
                 let job = crate::vector::search_pool::SegmentSearchJob {
                     segment: crate::vector::search_pool::GraphSegmentRef::Immutable(
                         std::sync::Arc::clone(seg),
                     ),
                     query: std::sync::Arc::clone(&query_arc),
                     fetch_k,
-                    ef_search: graph_ef,
+                    ef_search: ef_seg,
                     filter: filter_arc.clone(),
                     reply: tx.clone(),
                 };
@@ -703,12 +743,12 @@ impl SegmentHolder {
                     all.extend(seg.search_filtered(
                         query_f32,
                         fetch_k,
-                        graph_ef,
+                        ef_seg,
                         &mut snap.scratch,
                         graph_filter,
                     ));
                 } else {
-                    let results = seg.search(query_f32, fetch_k, graph_ef, &mut snap.scratch);
+                    let results = seg.search(query_f32, fetch_k, ef_seg, &mut snap.scratch);
                     if post_filter {
                         if let Some(bm) = filter_ref {
                             all.extend(results.into_iter().filter(|r| bm.contains(r.id.0)));
@@ -831,16 +871,17 @@ impl SegmentHolder {
         // otherwise the ACORN-filtered traversal, same as the sync path.
         if !pooled_graph {
             for imm in &segments.immutable {
+                let ef_seg = seg_ef(imm.suggested_ef());
                 if graph_filter.is_some() {
                     all.extend(imm.search_filtered(
                         query_f32,
                         fetch_k,
-                        graph_ef,
+                        ef_seg,
                         &mut snap.scratch,
                         graph_filter,
                     ));
                 } else {
-                    let results = imm.search(query_f32, fetch_k, graph_ef, &mut snap.scratch);
+                    let results = imm.search(query_f32, fetch_k, ef_seg, &mut snap.scratch);
                     if post_filter {
                         if let Some(bm) = filter_ref {
                             all.extend(results.into_iter().filter(|r| bm.contains(r.id.0)));
@@ -949,6 +990,12 @@ impl SegmentHolder {
         // 4. Merge all results, take global top-k (identical to search_mvcc).
         all.sort_unstable();
         all.truncate(k);
+        // QP-3: hand this query's scratch back to the thread cache; the next
+        // capture on this thread reuses it via take_thread_scratch.
+        crate::vector::hnsw::search::recycle_thread_scratch(std::mem::replace(
+            &mut snap.scratch,
+            crate::vector::hnsw::search::SearchScratch::new(0, 0),
+        ));
         all
     }
 }
@@ -1132,6 +1179,7 @@ mod tests {
             committed: &committed,
             dirty_set: &[],
             dimension: dim as u32,
+            ef_defaulted: false,
         };
         let mvcc = holder.search_mvcc(&query_f32, 3, 64, &mut scratch, None, &mvcc_ctx);
 
@@ -1165,6 +1213,7 @@ mod tests {
             committed: &committed,
             dirty_set: &[],
             dimension: dim as u32,
+            ef_defaulted: false,
         };
         let results = holder.search_mvcc(&query_f32, 3, 64, &mut scratch, None, &mvcc_ctx);
         assert_eq!(results.len(), 1);
@@ -1221,6 +1270,7 @@ mod tests {
             committed: &committed,
             dirty_set: std::slice::from_ref(&dirty_entry),
             dimension: dim as u32,
+            ef_defaulted: false,
         };
         let results = holder.search_mvcc(&query_f32, 3, 64, &mut scratch, None, &mvcc_ctx);
 
@@ -1259,6 +1309,7 @@ mod tests {
             committed: &committed,
             dirty_set: &[],
             dimension: dim as u32,
+            ef_defaulted: false,
         };
         let r1 = holder.search_mvcc(&query_f32, 3, 64, &mut scratch, None, &mvcc_empty);
 
@@ -1269,6 +1320,7 @@ mod tests {
             committed: &committed,
             dirty_set: &[],
             dimension: dim as u32,
+            ef_defaulted: false,
         };
         let r2 = holder.search_mvcc(&query_f32, 3, 64, &mut scratch, None, &mvcc_empty2);
 

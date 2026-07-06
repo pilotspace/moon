@@ -246,6 +246,25 @@ pub(crate) fn execute_transaction_sharded(
             });
         }
 
+        // R4: HDEL of an indexed vector field tombstones it.
+        if !matches!(response, Frame::Error(_)) && cmd.eq_ignore_ascii_case(b"HDEL") {
+            crate::shard::slice::with_shard(|s| {
+                crate::shard::spsc_handler::auto_hdel_vectors(&mut s.vector_store, cmd_args);
+            });
+        }
+
+        // R3: FLUSHALL/FLUSHDB clears index contents (definitions survive).
+        if !matches!(response, Frame::Error(_))
+            && (cmd.eq_ignore_ascii_case(b"FLUSHDB") || cmd.eq_ignore_ascii_case(b"FLUSHALL"))
+        {
+            crate::shard::slice::with_shard(|s| {
+                crate::shard::spsc_handler::auto_flush_indexes(
+                    &mut s.vector_store,
+                    &mut s.text_store,
+                );
+            });
+        }
+
         results.push(response);
     }
 

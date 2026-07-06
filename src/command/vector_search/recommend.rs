@@ -341,6 +341,7 @@ pub fn ft_recommend(store: &mut VectorStore, args: &[Frame], db: Option<&mut Dat
         committed: &empty_committed,
         dirty_set: &[],
         dimension: dim as u32,
+        ef_defaulted: false,
     };
 
     // Dispatch to correct field segments

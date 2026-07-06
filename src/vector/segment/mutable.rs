@@ -19,7 +19,8 @@ use crate::vector::turbo_quant::encoder::{
 };
 use crate::vector::turbo_quant::fwht;
 use crate::vector::turbo_quant::sq8::{
-    SQ8_PARAMS_BYTES, encode_sq8_into, sq8_l2_from_stats, sq8_params, sq8_query_stats,
+    SQ8_INT8_QMAX, SQ8_PARAMS_BYTES, encode_sq8_into, sq8_int8_dot_to_f32, sq8_l2_from_stats,
+    sq8_params, sq8_quantize_query_scalar, sq8_query_stats,
 };
 use crate::vector::turbo_quant::tq_adc::tq_l2_adc_scaled;
 use crate::vector::types::{DistanceMetric, SearchResult, VectorId};
@@ -82,6 +83,13 @@ pub struct BruteForceQuery {
     /// candidate via `sq8_l2_from_stats`. Zero for non-SQ8 collections.
     sq8_q_sum: f32,
     sq8_q_sumsq: f32,
+    /// Task #13: int8-quantized copy of `prepared`, populated only when a
+    /// SIMD int8 ADC kernel is installed for this CPU/build (empty
+    /// otherwise — `brute_force_scan_mvcc_chunk` falls back to the f32
+    /// `sq8_stats` path when `sq8_i8_stats` dispatch is `None`).
+    sq8_qi8: Vec<i8>,
+    sq8_q_scale: f32,
+    sq8_sum_qi8: i32,
     /// Shared top-k accumulator across all chunks.
     heap: BinaryHeap<DistF32>,
 }
@@ -434,6 +442,18 @@ impl MutableSegment {
             // loop below — never per candidate.
             let sq8_stats_fn = distance::table().sq8_stats;
             let (q_sum, q_sumsq) = sq8_query_stats(q);
+            // Task #13: int8 symmetric ADC — quantize once per search when a
+            // SIMD int8 kernel is installed for this CPU/build; else fall
+            // back to the f32 `sq8_stats_fn` path above.
+            let sq8_i8_stats_fn = distance::table().sq8_i8_stats;
+            let (sq8_qi8, sq8_q_scale, sq8_sum_qi8): (Vec<i8>, f32, i32) =
+                if sq8_i8_stats_fn.is_some() {
+                    let mut qi8 = vec![0i8; dim];
+                    let (scale, sum) = sq8_quantize_query_scalar(q, SQ8_INT8_QMAX, &mut qi8);
+                    (qi8, scale, sum)
+                } else {
+                    (Vec::new(), 0.0, 0)
+                };
             let mut heap: BinaryHeap<DistF32> = BinaryHeap::with_capacity(k + 1);
             for entry in &inner.entries {
                 if entry.delete_lsn != 0 {
@@ -449,7 +469,17 @@ impl MutableSegment {
                 let off = id * bytes_per_code;
                 let slot = &inner.tq_codes[off..off + bytes_per_code];
                 let (min, scale) = sq8_params(slot, dim);
-                let (dot_qc, sum_c, sumsq_c) = sq8_stats_fn(q, &slot[..dim]);
+                let (dot_qc, sum_c, sumsq_c) = if let Some(i8_stats) = sq8_i8_stats_fn {
+                    let (dot_int, sum_c_int, sumsq_c_int) =
+                        i8_stats(&sq8_qi8, &slot[..dim], sq8_sum_qi8);
+                    (
+                        sq8_int8_dot_to_f32(sq8_q_scale, dot_int),
+                        sum_c_int as f32,
+                        sumsq_c_int as f32,
+                    )
+                } else {
+                    sq8_stats_fn(q, &slot[..dim])
+                };
                 let dist =
                     sq8_l2_from_stats(dim, min, scale, q_sum, q_sumsq, dot_qc, sum_c, sumsq_c);
                 let global_id = inner.global_id_base + entry.internal_id;
@@ -697,11 +727,28 @@ impl MutableSegment {
         } else {
             (0.0, 0.0)
         };
+        // Task #13: int8 symmetric ADC — quantize once here (persists across
+        // chunks via `BruteForceQuery`, mirroring `sq8_q_sum`/`sq8_q_sumsq`
+        // above) only when a SIMD int8 kernel is installed for this
+        // CPU/build; empty otherwise (chunk scan falls back to f32 stats).
+        let (sq8_qi8, sq8_q_scale, sq8_sum_qi8): (Vec<i8>, f32, i32) =
+            if self.collection.quantization == QuantizationConfig::Sq8
+                && distance::table().sq8_i8_stats.is_some()
+            {
+                let mut qi8 = vec![0i8; prepared.len()];
+                let (scale, sum) = sq8_quantize_query_scalar(&prepared, SQ8_INT8_QMAX, &mut qi8);
+                (qi8, scale, sum)
+            } else {
+                (Vec::new(), 0.0, 0)
+            };
         BruteForceQuery {
             prepared,
             use_tq_adc,
             sq8_q_sum,
             sq8_q_sumsq,
+            sq8_qi8,
+            sq8_q_scale,
+            sq8_sum_qi8,
             heap: BinaryHeap::with_capacity(k + 1),
         }
     }
@@ -736,6 +783,13 @@ impl MutableSegment {
             // pointer read), per-query constants carried in `BruteForceQuery`.
             let sq8_stats_fn = distance::table().sq8_stats;
             let (q_sum, q_sumsq) = (q.sq8_q_sum, q.sq8_q_sumsq);
+            // Task #13: int8 symmetric ADC — resolved once per chunk like
+            // `sq8_stats_fn`; `sq8_i8_stats_fn` is `Some` only when
+            // `q.sq8_qi8` was actually populated in `prepare_brute_force_query`.
+            let sq8_i8_stats_fn = distance::table().sq8_i8_stats;
+            let sq8_qi8 = q.sq8_qi8.as_slice();
+            let sq8_q_scale = q.sq8_q_scale;
+            let sq8_sum_qi8 = q.sq8_sum_qi8;
             let heap = &mut q.heap;
             for entry in &inner.entries[lo..hi] {
                 if !is_visible(
@@ -758,7 +812,17 @@ impl MutableSegment {
                 let off = id * bytes_per_code;
                 let slot = &inner.tq_codes[off..off + bytes_per_code];
                 let (min, scale) = sq8_params(slot, dim);
-                let (dot_qc, sum_c, sumsq_c) = sq8_stats_fn(q_slice, &slot[..dim]);
+                let (dot_qc, sum_c, sumsq_c) = if let Some(i8_stats) = sq8_i8_stats_fn {
+                    let (dot_int, sum_c_int, sumsq_c_int) =
+                        i8_stats(sq8_qi8, &slot[..dim], sq8_sum_qi8);
+                    (
+                        sq8_int8_dot_to_f32(sq8_q_scale, dot_int),
+                        sum_c_int as f32,
+                        sumsq_c_int as f32,
+                    )
+                } else {
+                    sq8_stats_fn(q_slice, &slot[..dim])
+                };
                 let dist =
                     sq8_l2_from_stats(dim, min, scale, q_sum, q_sumsq, dot_qc, sum_c, sumsq_c);
                 let global_id = inner.global_id_base + entry.internal_id;

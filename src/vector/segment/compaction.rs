@@ -873,11 +873,21 @@ pub fn compact(
         live_count,
         total_count,
     )
-    .with_raw_f16(raw_f16_bfs);
+    .with_raw_f16(raw_f16_bfs)
+    // AE-1: measure this build's adaptive-ef estimate while we're on the
+    // compaction thread (no-op without a sidecar).
+    .with_adaptive_ef()
+    // B2 (durability): tag the segment with the disk id it will be persisted
+    // under (if any) BEFORE writing, so callers can read it back off the
+    // returned segment without threading the id separately.
+    .with_disk_segment_id(persist.map(|(_, segment_id)| segment_id));
 
-    // Step 7 (continued): persist to disk if requested
+    // Step 7 (continued): persist to disk if requested. Uses the staged
+    // (write-to-staging + fsync + rename + dir-fsync) writer so a segment
+    // only becomes visible under its final `segment-{id}` name once it is
+    // fully durable — see VECTOR-DURABILITY-DESIGN.md.
     if let Some((dir, segment_id)) = persist {
-        segment_io::write_immutable_segment(dir, segment_id, &segment, collection)
+        segment_io::write_immutable_segment_staged(dir, segment_id, &segment, collection)
             .map_err(|e| CompactionError::PersistFailed(format!("{e}")))?;
     }
 
@@ -1053,16 +1063,24 @@ pub struct MergeStats {
 ///
 /// Refuses to merge when the estimated live-vector TQ code bytes plus the
 /// HNSW graph overhead would exceed `MERGE_MEMORY_CEILING`.
+///
+/// `persist`: when `Some((dir, segment_id))`, writes the merged segment to
+/// disk (staged + atomic rename, see [`segment_io::write_immutable_segment_staged`])
+/// after a successful build, and tags the returned segment with `segment_id`
+/// via [`ImmutableSegment::with_disk_segment_id`] (B2, durability).
 pub fn merge_immutable(
     segments: &[Arc<ImmutableSegment>],
     collection: &Arc<CollectionMetadata>,
     seed: u64,
     mode: MergeMode,
     recall_tolerance: f32,
+    persist: Option<(&Path, u64)>,
 ) -> Result<ImmutableSegment, CompactionError> {
     match mode {
         MergeMode::None => Err(CompactionError::EmptySegment), // caller should not call
-        MergeMode::GraphUnion => merge_graph_union(segments, collection, seed, recall_tolerance),
+        MergeMode::GraphUnion => {
+            merge_graph_union(segments, collection, seed, recall_tolerance, persist)
+        }
         MergeMode::KeepRaw => {
             // KeepRaw: fall back to graph-union if no raw f32 available (warn only).
             // Full raw-vector path requires raw_f32 stored on ImmutableSegment (TODO P2.5).
@@ -1070,7 +1088,7 @@ pub fn merge_immutable(
                 "MERGE_MODE=keep_raw: raw f32 not yet persisted on ImmutableSegment; \
                  falling back to graph-union. Add KEEP_RAW sidecar in P2.5."
             );
-            merge_graph_union(segments, collection, seed, recall_tolerance)
+            merge_graph_union(segments, collection, seed, recall_tolerance, persist)
         }
     }
 }
@@ -1084,6 +1102,7 @@ fn merge_graph_union(
     collection: &Arc<CollectionMetadata>,
     seed: u64,
     recall_tolerance: f32,
+    persist: Option<(&Path, u64)>,
 ) -> Result<ImmutableSegment, CompactionError> {
     if segments.is_empty() {
         return Err(CompactionError::EmptySegment);
@@ -1234,6 +1253,24 @@ fn merge_graph_union(
         })
         .collect();
     entries.sort_by(|a, b| a.0.cmp(&b.0).then(a.6.cmp(&b.6)));
+
+    // R5 (persistence review): a dropped sidecar must be LOUD. The merged
+    // segment loses exact rerank for ALL entries when any source lacks the
+    // sidecar; without a warning this silent recall degradation is invisible
+    // (FT.INFO `segments_with_exact_rerank` exposes the steady state).
+    if !all_have_raw {
+        let with_raw = segments.iter().filter(|s| s.raw_f16().is_some()).count();
+        if with_raw > 0 {
+            tracing::warn!(
+                sources = segments.len(),
+                sources_with_sidecar = with_raw,
+                "GraphUnion merge drops the exact-rerank f16 sidecar for the \
+                 ENTIRE merged segment (all-or-nothing propagation): at least \
+                 one source segment lacks it — merged-segment queries fall \
+                 back to quantized ADC distances (recall degrades, not breaks)"
+            );
+        }
+    }
 
     // ── Step 3: Build TQ buffer (verbatim codes, no re-encode) ───────────────
     let mut tq_buffer_orig: Vec<u8> = Vec::with_capacity(n * bytes_per_code);
@@ -1464,7 +1501,19 @@ fn merge_graph_union(
         n as u32,
         n as u32,
     )
-    .with_raw_f16(raw_f16_bfs);
+    .with_raw_f16(raw_f16_bfs)
+    // AE-1: measure this build's adaptive-ef estimate while we're on the
+    // compaction thread (no-op without a sidecar).
+    .with_adaptive_ef()
+    // B2 (durability): tag with the disk id before writing, mirroring `compact()`.
+    .with_disk_segment_id(persist.map(|(_, segment_id)| segment_id));
+
+    // Persist to disk if requested — same staged (staging + fsync + rename +
+    // dir-fsync) writer as `compact()`. Merge persists identically to compact.
+    if let Some((dir, segment_id)) = persist {
+        segment_io::write_immutable_segment_staged(dir, segment_id, &merged, collection)
+            .map_err(|e| CompactionError::PersistFailed(format!("{e}")))?;
+    }
 
     Ok(merged)
 }
@@ -1619,12 +1668,22 @@ fn verify_merge_recall(
 
         // HNSW search on the merged graph using f32 decoded centroids.
         // f32_bfs_flat has BFS-ordered vectors, `eff_dim` elements each.
+        //
+        // The query IS a database point (distance 0 → always rank 1), but the
+        // ground truth above excludes it. Request k+1 and drop the self-point
+        // so both sides compare k non-self neighbors — with a plain top-k the
+        // self-point consumes one slot and caps measurable recall at (k-1)/k
+        // = 0.90, which the manual force_merge gate (0.90) can never pass.
         let hnsw_results =
-            hnsw_search_f32(graph, &f32_bfs_flat, eff_dim, query, k, ef_verify, None);
+            hnsw_search_f32(graph, &f32_bfs_flat, eff_dim, query, k + 1, ef_verify, None);
         // hnsw_search_f32 returns original IDs (pre-BFS); convert to BFS positions
         // so they match the ground-truth set (which indexes all_decoded by BFS pos).
-        let hnsw_ids: std::collections::HashSet<u32> =
-            hnsw_results.iter().map(|r| graph.to_bfs(r.id.0)).collect();
+        let hnsw_ids: std::collections::HashSet<u32> = hnsw_results
+            .iter()
+            .map(|r| graph.to_bfs(r.id.0))
+            .filter(|&b| b != query_bfs as u32)
+            .take(k)
+            .collect();
 
         let overlap = gt_ids.intersection(&hnsw_ids).count();
         total_recall += overlap as f32 / k.min(gt_ids.len()).max(1) as f32;
@@ -1837,7 +1896,7 @@ mod tests {
         let n = db.len();
 
         let segs = vec![Arc::new(imm_a), Arc::new(imm_b)];
-        let merged = merge_immutable(&segs, &collection, 42, MergeMode::GraphUnion, 0.60)
+        let merged = merge_immutable(&segs, &collection, 42, MergeMode::GraphUnion, 0.60, None)
             .expect("SQ8 merge failed");
         assert_eq!(merged.live_count(), n as u32, "merged SQ8 live_count");
 
@@ -2198,7 +2257,7 @@ mod tests {
         );
 
         let segs = vec![Arc::new(imm1), Arc::new(imm2)];
-        let result = merge_immutable(&segs, &collection, 42, MergeMode::GraphUnion, 0.80);
+        let result = merge_immutable(&segs, &collection, 42, MergeMode::GraphUnion, 0.80, None);
 
         match &result {
             Ok(m) => eprintln!(

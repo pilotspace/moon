@@ -376,6 +376,200 @@ pub unsafe fn sq8_stats(query: &[f32], codes: &[u8]) -> (f32, f32, f32) {
     (dot_sum, sum_c_sum, sumsq_c_sum)
 }
 
+/// Int8 symmetric ADC per-candidate statistics (task #13): `(Σ qi8_i·c_i,
+/// Σc_i, Σc_i²)` as exact `i64` integers, given an already-quantized `qi8`
+/// query (see `turbo_quant::sq8::sq8_quantize_query_scalar`).
+///
+/// The design doc (tmp/INT8-ADC-CONTEXT.md) originally called for
+/// `VPMADDUBSW` (u8×i8 → i16 pairwise-add) directly, clamping the query to
+/// `±63` to avoid its saturation trap (`255·127·2 = 64770 > i16::MAX`).
+/// Recall A/B testing (`turbo_quant::sq8::tests::test_int8_adc_recall_ab_*`)
+/// showed that clamp measurably regresses recall (R@10 delta ~0.017,
+/// overlap ~0.975 vs the ≥0.98 gate) while the full `±127` range passes
+/// comfortably (delta ~0.003-0.005, overlap ~0.988+). This kernel instead
+/// avoids `VPMADDUBSW` entirely: widen both operands to i16 first
+/// (`_mm256_cvtepu8_epi16` / `_mm256_cvtepi8_epi16` — exact, since u8 and
+/// the `[-127,127]` qi8 range both fit i16 losslessly), multiply with
+/// `_mm256_mullo_epi16` (exact — `|q·c| ≤ 127·255 = 32385 < i16::MAX`, a
+/// single-element product never saturates), then widen-accumulate to i32
+/// via `_mm256_madd_epi16` against an all-ones vector (`VPMADDWD` genuinely
+/// produces a 32-bit result with no saturation, unlike `VPMADDUBSW`'s
+/// 16-bit output). No offset trick needed here (unlike the NEON kernel):
+/// `cvtepu8_epi16`/`cvtepi8_epi16` already widen with the correct sign
+/// handling for u8 vs i8 — `sum_qi8` is accepted only for signature parity
+/// with [`super::neon::sq8_i8_stats`] / the scalar reference.
+///
+/// `sum_c`/`sumsq_c` reuse the same widened `c_lo16`/`c_hi16` registers (no
+/// extra widen pass), since both are query-independent.
+///
+/// # Safety
+/// Caller must ensure AVX2 is available (checked via
+/// `is_x86_feature_detected!("avx2")` at table-init time).
+///
+/// # Panics (debug only)
+/// `debug_assert_eq!(qi8.len(), codes.len())`.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[target_feature(enable = "avx2")]
+pub unsafe fn sq8_i8_stats(qi8: &[i8], codes: &[u8], _sum_qi8: i32) -> (i64, i64, i64) {
+    debug_assert_eq!(qi8.len(), codes.len(), "sq8_i8_stats: dimension mismatch");
+
+    let n = qi8.len();
+    let pq = qi8.as_ptr();
+    let pc = codes.as_ptr();
+
+    let mut dot_acc = _mm256_setzero_si256();
+    let mut sum_c_acc = _mm256_setzero_si256();
+    let mut sumsq_c_acc = _mm256_setzero_si256();
+    let ones16 = _mm256_set1_epi16(1);
+
+    let chunks = n / 32;
+    let mut i = 0usize;
+
+    for _ in 0..chunks {
+        // SAFETY: i + 32 <= n guaranteed by chunks = n / 32. Both loads are
+        // unaligned 32-byte reads within bounds (i8 query / u8 codes).
+        let qv = _mm256_loadu_si256(pq.add(i) as *const __m256i);
+        let cv = _mm256_loadu_si256(pc.add(i) as *const __m256i);
+
+        let q_lo16 = _mm256_cvtepi8_epi16(_mm256_castsi256_si128(qv));
+        let q_hi16 = _mm256_cvtepi8_epi16(_mm256_extracti128_si256(qv, 1));
+        let c_lo16 = _mm256_cvtepu8_epi16(_mm256_castsi256_si128(cv));
+        let c_hi16 = _mm256_cvtepu8_epi16(_mm256_extracti128_si256(cv, 1));
+
+        let dot_lo16 = _mm256_mullo_epi16(q_lo16, c_lo16);
+        let dot_hi16 = _mm256_mullo_epi16(q_hi16, c_hi16);
+        dot_acc = _mm256_add_epi32(dot_acc, _mm256_madd_epi16(dot_lo16, ones16));
+        dot_acc = _mm256_add_epi32(dot_acc, _mm256_madd_epi16(dot_hi16, ones16));
+
+        sum_c_acc = _mm256_add_epi32(sum_c_acc, _mm256_madd_epi16(c_lo16, ones16));
+        sum_c_acc = _mm256_add_epi32(sum_c_acc, _mm256_madd_epi16(c_hi16, ones16));
+
+        sumsq_c_acc = _mm256_add_epi32(sumsq_c_acc, _mm256_madd_epi16(c_lo16, c_lo16));
+        sumsq_c_acc = _mm256_add_epi32(sumsq_c_acc, _mm256_madd_epi16(c_hi16, c_hi16));
+
+        i += 32;
+    }
+
+    // SAFETY: hsum_i32_avx2 requires AVX2, which we have via target_feature.
+    let mut dot: i64 = hsum_i32_avx2(dot_acc) as i64;
+    let mut sum_c: i64 = hsum_i32_avx2(sum_c_acc) as i64;
+    let mut sumsq_c: i64 = hsum_i32_avx2(sumsq_c_acc) as i64;
+
+    // Scalar tail — safe indexing; at most one sub-vector-width pass, so
+    // bounds checks cost nothing and the unsafe surface stays confined to
+    // the intrinsics above (UNSAFE_POLICY).
+    for (&q, &c) in qi8[i..n].iter().zip(codes[i..n].iter()) {
+        let q = q as i64;
+        let c = c as i64;
+        dot += q * c;
+        sum_c += c;
+        sumsq_c += c * c;
+    }
+
+    (dot, sum_c, sumsq_c)
+}
+
+// ── f16 sidecar kernels (exact-rerank HQ-1) ─────────────────────────────
+
+/// Squared L2 between an f32 query and an f16-encoded sidecar vector.
+/// F16C `vcvtph2ps` decodes 8 halves per step (hardware IEEE semantics —
+/// subnormals, Inf, and NaN match scalar `f16_to_f32` exactly); FMA
+/// accumulates. 16 halves per iteration, scalar tail.
+///
+/// # Safety
+/// Caller must ensure the CPU supports AVX2, F16C, and FMA
+/// (verified via `is_x86_feature_detected!` at DistanceTable init).
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[target_feature(enable = "avx2,f16c,fma")]
+pub unsafe fn f16_l2(query: &[f32], vec_f16: &[u16]) -> f32 {
+    debug_assert_eq!(query.len(), vec_f16.len(), "f16_l2: dimension mismatch");
+    let n = query.len();
+    let mut sum0 = _mm256_setzero_ps();
+    let mut sum1 = _mm256_setzero_ps();
+    let pq = query.as_ptr();
+    let px = vec_f16.as_ptr();
+    let chunks = n / 16;
+    let mut i = 0usize;
+    for _ in 0..chunks {
+        // SAFETY: i + 16 <= n guaranteed by chunks = n / 16. Pointers are
+        // valid slices (f32 query / u16 halves) at this offset; loadu allows
+        // unaligned access.
+        let x0 = _mm256_cvtph_ps(_mm_loadu_si128(px.add(i) as *const __m128i));
+        let x1 = _mm256_cvtph_ps(_mm_loadu_si128(px.add(i + 8) as *const __m128i));
+        let q0 = _mm256_loadu_ps(pq.add(i));
+        let q1 = _mm256_loadu_ps(pq.add(i + 8));
+        let d0 = _mm256_sub_ps(q0, x0);
+        let d1 = _mm256_sub_ps(q1, x1);
+        sum0 = _mm256_fmadd_ps(d0, d0, sum0);
+        sum1 = _mm256_fmadd_ps(d1, d1, sum1);
+        i += 16;
+    }
+    // SAFETY: hsum_f32_avx2 requires AVX2, which we have via target_feature.
+    let mut result = hsum_f32_avx2(_mm256_add_ps(sum0, sum1));
+    // Scalar tail
+    while i < n {
+        let d = *query.get_unchecked(i) - crate::vector::f16::f16_to_f32(*vec_f16.get_unchecked(i));
+        result += d * d;
+        i += 1;
+    }
+    result
+}
+
+/// Fused `(Σ q_i·x_i, Σ x_i²)` between an f32 query and an f16-encoded
+/// sidecar vector (F16C decode + FMA, 16 halves per iteration; scalar
+/// tail). Feeds the unit-sphere (Cosine/InnerProduct) exact-rerank
+/// distance.
+///
+/// # Safety
+/// Caller must ensure the CPU supports AVX2, F16C, and FMA
+/// (verified via `is_x86_feature_detected!` at DistanceTable init).
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[target_feature(enable = "avx2,f16c,fma")]
+pub unsafe fn f16_dot_normsq(query: &[f32], vec_f16: &[u16]) -> (f32, f32) {
+    debug_assert_eq!(
+        query.len(),
+        vec_f16.len(),
+        "f16_dot_normsq: dimension mismatch"
+    );
+    let n = query.len();
+    let mut dot0 = _mm256_setzero_ps();
+    let mut dot1 = _mm256_setzero_ps();
+    let mut xsq0 = _mm256_setzero_ps();
+    let mut xsq1 = _mm256_setzero_ps();
+    let pq = query.as_ptr();
+    let px = vec_f16.as_ptr();
+    let chunks = n / 16;
+    let mut i = 0usize;
+    for _ in 0..chunks {
+        // SAFETY: i + 16 <= n guaranteed by chunks = n / 16. Pointers are
+        // valid slices (f32 query / u16 halves) at this offset; loadu allows
+        // unaligned access.
+        let x0 = _mm256_cvtph_ps(_mm_loadu_si128(px.add(i) as *const __m128i));
+        let x1 = _mm256_cvtph_ps(_mm_loadu_si128(px.add(i + 8) as *const __m128i));
+        let q0 = _mm256_loadu_ps(pq.add(i));
+        let q1 = _mm256_loadu_ps(pq.add(i + 8));
+        dot0 = _mm256_fmadd_ps(q0, x0, dot0);
+        dot1 = _mm256_fmadd_ps(q1, x1, dot1);
+        xsq0 = _mm256_fmadd_ps(x0, x0, xsq0);
+        xsq1 = _mm256_fmadd_ps(x1, x1, xsq1);
+        i += 16;
+    }
+    // SAFETY: hsum_f32_avx2 requires AVX2, which we have via target_feature.
+    let mut dot = hsum_f32_avx2(_mm256_add_ps(dot0, dot1));
+    let mut xsq = hsum_f32_avx2(_mm256_add_ps(xsq0, xsq1));
+    // Scalar tail
+    while i < n {
+        let x = crate::vector::f16::f16_to_f32(*vec_f16.get_unchecked(i));
+        dot += *query.get_unchecked(i) * x;
+        xsq += x * x;
+        i += 1;
+    }
+    (dot, xsq)
+}
+
 #[cfg(test)]
 #[cfg(target_arch = "x86_64")]
 mod tests {
@@ -603,5 +797,164 @@ mod tests {
         // SAFETY: AVX2+FMA verified above.
         let got = unsafe { sq8_stats(q, c) };
         assert_eq!(got, (0.0, 0.0, 0.0));
+    }
+
+    // ── task #13: int8 symmetric ADC stats (AVX2 vs scalar i64 oracle) ───
+    //
+    // Gated on `has_avx2_fma()` — compiles on this aarch64 dev host (proving
+    // the cfg discipline holds) but no-ops at runtime; exercises for real on
+    // x86_64 CI/GCE runners.
+
+    fn gen_i8_query(len: usize, seed: u32, qmax: i32) -> Vec<i8> {
+        let mut v = Vec::with_capacity(len);
+        let mut s = seed;
+        for _ in 0..len {
+            s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+            let raw = (s >> 24) as i8 as i32;
+            v.push((raw % (qmax + 1)) as i8);
+        }
+        v
+    }
+
+    #[test]
+    fn test_sq8_i8_stats_matches_scalar_oracle() {
+        if !has_avx2_fma() {
+            return;
+        }
+        use crate::vector::turbo_quant::sq8::sq8_candidate_stats_i8_scalar;
+        let qi8 = gen_i8_query(768, 42, 127);
+        let c = gen_u8(768, 99);
+        let sum_qi8: i32 = qi8.iter().map(|&x| x as i32).sum();
+        let expected = sq8_candidate_stats_i8_scalar(&qi8, &c, sum_qi8);
+        // SAFETY: AVX2 verified above.
+        let got = unsafe { sq8_i8_stats(&qi8, &c, sum_qi8) };
+        assert_eq!(
+            got, expected,
+            "sq8_i8_stats mismatch (exact int arithmetic): scalar={expected:?}, avx2={got:?}"
+        );
+    }
+
+    #[test]
+    fn test_sq8_i8_stats_tail_handling() {
+        if !has_avx2_fma() {
+            return;
+        }
+        use crate::vector::turbo_quant::sq8::sq8_candidate_stats_i8_scalar;
+        for len in [0, 1, 3, 7, 13, 15, 16, 17, 31, 32, 33, 63, 64, 100] {
+            let qi8 = gen_i8_query(len, 42, 127);
+            let c = gen_u8(len, 99);
+            let sum_qi8: i32 = qi8.iter().map(|&x| x as i32).sum();
+            let expected = sq8_candidate_stats_i8_scalar(&qi8, &c, sum_qi8);
+            // SAFETY: AVX2 verified above.
+            let got = unsafe { sq8_i8_stats(&qi8, &c, sum_qi8) };
+            assert_eq!(
+                got, expected,
+                "sq8_i8_stats tail len={len}: scalar={expected:?}, avx2={got:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_sq8_i8_stats_empty() {
+        if !has_avx2_fma() {
+            return;
+        }
+        let qi8: &[i8] = &[];
+        let c: &[u8] = &[];
+        // SAFETY: AVX2 verified above.
+        let got = unsafe { sq8_i8_stats(qi8, c, 0) };
+        assert_eq!(got, (0, 0, 0));
+    }
+
+    #[test]
+    fn test_sq8_i8_stats_extreme_values() {
+        if !has_avx2_fma() {
+            return;
+        }
+        use crate::vector::turbo_quant::sq8::sq8_candidate_stats_i8_scalar;
+        let dim = 768;
+        let qi8: Vec<i8> = (0..dim)
+            .map(|i| if i % 2 == 0 { 127i8 } else { -127i8 })
+            .collect();
+        let c: Vec<u8> = vec![255u8; dim];
+        let sum_qi8: i32 = qi8.iter().map(|&x| x as i32).sum();
+        let expected = sq8_candidate_stats_i8_scalar(&qi8, &c, sum_qi8);
+        // SAFETY: AVX2 verified above.
+        let got = unsafe { sq8_i8_stats(&qi8, &c, sum_qi8) };
+        assert_eq!(
+            got, expected,
+            "extreme-value mismatch: scalar={expected:?}, avx2={got:?}"
+        );
+    }
+
+    fn has_f16c_kernel_features() -> bool {
+        is_x86_feature_detected!("avx2")
+            && is_x86_feature_detected!("fma")
+            && is_x86_feature_detected!("f16c")
+    }
+
+    #[test]
+    fn test_f16_kernels_match_scalar_all_value_classes() {
+        use crate::vector::f16::{dot_normsq_f16, f32_to_f16, l2_sq_f16};
+        if !has_f16c_kernel_features() {
+            return;
+        }
+        // Normals, f16 subnormals, zero, and odd tails -- F16C hardware decode
+        // must agree with scalar f16_to_f32 everywhere.
+        for len in [0, 1, 3, 7, 8, 9, 15, 16, 17, 31, 33, 100, 384] {
+            let q = gen_f32(len, 21);
+            let x: Vec<u16> = gen_f32(len, 77)
+                .iter()
+                .enumerate()
+                .map(|(j, &v)| {
+                    if j % 5 == 4 {
+                        f32_to_f16(3e-6 + (j as f32) * 1.1e-7) // subnormal f16
+                    } else if j % 7 == 6 {
+                        f32_to_f16(0.0)
+                    } else {
+                        f32_to_f16(v)
+                    }
+                })
+                .collect();
+            let exp_l2 = l2_sq_f16(&q, &x);
+            // SAFETY: AVX2+F16C+FMA verified above.
+            let got_l2 = unsafe { f16_l2(&q, &x) };
+            let rel = (got_l2 - exp_l2).abs() / exp_l2.abs().max(1e-10);
+            assert!(
+                rel < 1e-4 || len == 0,
+                "f16_l2 len={len}: scalar={exp_l2}, avx2={got_l2}"
+            );
+
+            let (ed, en) = dot_normsq_f16(&q, &x);
+            // SAFETY: AVX2+F16C+FMA verified above.
+            let (gd, gn) = unsafe { f16_dot_normsq(&q, &x) };
+            assert!(
+                (gd - ed).abs() / ed.abs().max(1e-6) < 1e-3,
+                "f16_dot len={len}: scalar={ed}, avx2={gd}"
+            );
+            assert!(
+                (gn - en).abs() / en.abs().max(1e-6) < 1e-4,
+                "f16_normsq len={len}: scalar={en}, avx2={gn}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_f16_kernels_inf_nan_propagate() {
+        use crate::vector::f16::f32_to_f16;
+        if !has_f16c_kernel_features() {
+            return;
+        }
+        let q = gen_f32(24, 5);
+        let mut x: Vec<u16> = gen_f32(24, 9).iter().map(|&v| f32_to_f16(v)).collect();
+        x[10] = f32_to_f16(f32::INFINITY);
+        // SAFETY: AVX2+F16C+FMA verified above.
+        assert_eq!(unsafe { f16_l2(&q, &x) }, f32::INFINITY);
+        x[10] = f32_to_f16(f32::NAN);
+        // SAFETY: AVX2+F16C+FMA verified above.
+        assert!(unsafe { f16_l2(&q, &x) }.is_nan());
+        // SAFETY: AVX2+F16C+FMA verified above.
+        let (_, xsq) = unsafe { f16_dot_normsq(&q, &x) };
+        assert!(xsq.is_nan());
     }
 }

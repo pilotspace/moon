@@ -577,13 +577,12 @@ fn capture_dense_knn_snapshot(
     filter: Option<&crate::vector::filter::FilterExpr>,
     as_of_lsn: u64,
 ) -> Option<crate::vector::segment::holder::SearchSnapshot> {
-    use crate::vector::hnsw::search::SearchScratch;
     use crate::vector::segment::holder::SearchSnapshot;
     use crate::vector::turbo_quant::encoder::padded_dimension;
 
     // Clone committed treemap BEFORE get_index_mut (borrow-checker ordering),
     // matching search_local_raw / search_local_filtered.
-    let committed = store.txn_manager().committed_treemap().clone();
+    let committed = store.txn_manager().committed_snapshot();
     let idx = store.get_index_mut(index_name)?;
 
     // Default field only — non-default field stays on the sync path.
@@ -623,6 +622,9 @@ fn capture_dense_knn_snapshot(
     // Auto-compact (same side effect + timing as the sync path).
     idx.try_compact();
 
+    // AE-1: adaptive per-segment ef estimates apply only when ef is
+    // heuristic-defaulted, never over a user-pinned EF_RUNTIME.
+    let ef_defaulted = idx.meta.hnsw_ef_runtime == 0;
     let ef_search = if idx.meta.hnsw_ef_runtime > 0 {
         idx.meta.hnsw_ef_runtime as usize
     } else {
@@ -662,8 +664,11 @@ fn capture_dense_knn_snapshot(
         committed,
         dimension: dim as u32,
         mutable_len,
-        scratch: SearchScratch::new(0, padded_dimension(dim as u32)),
+        // QP-3: thread-cached scratch (exact padded_dim match) instead of a
+        // fresh 32-65KB allocation set per query.
+        scratch: crate::vector::hnsw::search::take_thread_scratch(padded_dimension(dim as u32)),
         key_hash_to_key: idx.key_hash_to_key.clone(),
+        ef_defaulted,
     })
 }
 

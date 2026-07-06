@@ -357,6 +357,226 @@ pub unsafe fn sq8_stats(query: &[f32], codes: &[u8]) -> (f32, f32, f32) {
     (dot_sum, sum_c_sum, sumsq_c_sum)
 }
 
+/// Int8 symmetric ADC per-candidate statistics (task #13): `(Σ qi8_i·c_i,
+/// Σc_i, Σc_i²)` as exact `i64` integers, given an already-quantized `qi8`
+/// query (see `turbo_quant::sq8::sq8_quantize_query_scalar`).
+///
+/// Baseline ARMv8-A NEON has no mixed signed×unsigned widening multiply
+/// (that needs the `dotprod`/`i8mm` extensions — `vdotq_s32`/SDOT is
+/// nightly-gated in `core::arch` as of rustc 1.94, see module docs below),
+/// so this uses the **offset trick**: reinterpret each code byte `c` (u8,
+/// `0..=255`) as `c' = c ^ 0x80` (i8, `= c - 128`), widen-multiply `qi8 * c'`
+/// with `vmull_s8` (signed×signed, always available), and undo the shift
+/// afterwards: `Σ qi8·c = Σ qi8·(c-128) + 128·Σqi8`. `sum_qi8` is the
+/// precomputed per-query `Σqi8` needed for that correction.
+///
+/// `sum_c`/`sumsq_c` are query-independent and computed directly from the
+/// u8 codes (`vmovl_u8` widen for `sum_c`, `vmull_u8` widen-square for
+/// `sumsq_c`) — both exact, no offset trick needed there.
+///
+/// # Safety
+/// Caller must ensure the CPU supports NEON (baseline on all AArch64).
+///
+/// # Panics (debug only)
+/// `debug_assert_eq!(qi8.len(), codes.len())`.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+#[target_feature(enable = "neon")]
+pub unsafe fn sq8_i8_stats(qi8: &[i8], codes: &[u8], sum_qi8: i32) -> (i64, i64, i64) {
+    debug_assert_eq!(qi8.len(), codes.len(), "sq8_i8_stats: dimension mismatch");
+
+    let n = qi8.len();
+    let pq = qi8.as_ptr();
+    let pc = codes.as_ptr();
+
+    let mut dot_acc = vdupq_n_s32(0);
+    let mut sum_c_acc = vdupq_n_u32(0);
+    let mut sumsq_c_acc = vdupq_n_u32(0);
+
+    let chunks = n / 16;
+    let mut i = 0usize;
+
+    for _ in 0..chunks {
+        // SAFETY: i + 16 <= n guaranteed by chunks = n / 16. Pointers are
+        // valid for 16 elements (i8 query / u8 codes) at this offset.
+        let qv = vld1q_s8(pq.add(i));
+        let cv_u8 = vld1q_u8(pc.add(i));
+        // Offset trick: reinterpret (c ^ 0x80) as i8 == c - 128.
+        let cv_off = vreinterpretq_s8_u8(veorq_u8(cv_u8, vdupq_n_u8(0x80)));
+
+        let dot_lo = vmull_s8(vget_low_s8(qv), vget_low_s8(cv_off));
+        let dot_hi = vmull_s8(vget_high_s8(qv), vget_high_s8(cv_off));
+        dot_acc = vpadalq_s16(dot_acc, dot_lo);
+        dot_acc = vpadalq_s16(dot_acc, dot_hi);
+
+        sum_c_acc = vpadalq_u16(sum_c_acc, vmovl_u8(vget_low_u8(cv_u8)));
+        sum_c_acc = vpadalq_u16(sum_c_acc, vmovl_u8(vget_high_u8(cv_u8)));
+
+        let sq_lo = vmull_u8(vget_low_u8(cv_u8), vget_low_u8(cv_u8));
+        let sq_hi = vmull_u8(vget_high_u8(cv_u8), vget_high_u8(cv_u8));
+        sumsq_c_acc = vpadalq_u16(sumsq_c_acc, sq_lo);
+        sumsq_c_acc = vpadalq_u16(sumsq_c_acc, sq_hi);
+
+        i += 16;
+    }
+
+    let mut dot_arr = [0i32; 4];
+    let mut sumc_arr = [0u32; 4];
+    let mut sumsq_arr = [0u32; 4];
+    // SAFETY: dot_arr/sumc_arr/sumsq_arr are stack arrays of exactly 4
+    // lanes, matching the int32x4_t/uint32x4_t store width.
+    vst1q_s32(dot_arr.as_mut_ptr(), dot_acc);
+    vst1q_u32(sumc_arr.as_mut_ptr(), sum_c_acc);
+    vst1q_u32(sumsq_arr.as_mut_ptr(), sumsq_c_acc);
+
+    // Σ qi8·(c-128) so far (offset form); corrected to Σ qi8·c below.
+    let mut dot_offset: i64 = dot_arr.iter().map(|&x| x as i64).sum();
+    let mut sum_c: i64 = sumc_arr.iter().map(|&x| x as i64).sum();
+    let mut sumsq_c: i64 = sumsq_arr.iter().map(|&x| x as i64).sum();
+
+    // Scalar tail — direct (no offset trick needed, exact i64 arithmetic).
+    // Safe indexing: at most one sub-vector-width pass, so bounds checks
+    // cost nothing and the unsafe surface stays confined to the intrinsics
+    // above (UNSAFE_POLICY).
+    for (&q, &c) in qi8[i..n].iter().zip(codes[i..n].iter()) {
+        let q = q as i64;
+        let c = c as i64;
+        dot_offset += q * (c - 128);
+        sum_c += c;
+        sumsq_c += c * c;
+    }
+
+    let dot = dot_offset + 128i64 * sum_qi8 as i64;
+    (dot, sum_c, sumsq_c)
+}
+
+// ── f16 sidecar kernels (exact-rerank HQ-1) ─────────────────────────────
+
+/// Decode 4 IEEE binary16 lanes to f32 using baseline-NEON integer ops (no
+/// ARMv8.2 FP16 intrinsics required): shift sign/magnitude into f32 bit
+/// positions, then rescale by 2^112 to re-bias the exponent (f16 bias 15 →
+/// f32 bias 127). The rescale multiply is exact — it is a power of two and
+/// every finite f16 is representable in f32 — and f16 subnormals normalize
+/// through the same multiply. Lanes with exponent 0x1F (Inf/NaN) are rebuilt
+/// explicitly via a bit-select, matching scalar `f16_to_f32` on all inputs.
+///
+/// # Safety
+/// Caller must ensure the CPU supports NEON (baseline on all AArch64).
+#[cfg(target_arch = "aarch64")]
+#[inline]
+#[target_feature(enable = "neon")]
+unsafe fn f16x4_decode(h: uint16x4_t) -> float32x4_t {
+    let bits = vmovl_u16(h);
+    let sign = vshlq_n_u32(vandq_u32(bits, vdupq_n_u32(0x8000)), 16);
+    let mag = vshlq_n_u32(vandq_u32(bits, vdupq_n_u32(0x7FFF)), 13);
+    // After the shift the f32 reads 2^(e−127)·1.m for f16 exponent e; the
+    // true f16 value is 2^(e−15)·1.m — multiply by 2^112 (bits 0x7780_0000).
+    let magf = vmulq_f32(
+        vreinterpretq_f32_u32(mag),
+        vdupq_n_f32(f32::from_bits(0x7780_0000)),
+    );
+    let is_special = vceqq_u32(vandq_u32(bits, vdupq_n_u32(0x7C00)), vdupq_n_u32(0x7C00));
+    let special = vorrq_u32(
+        vdupq_n_u32(0x7F80_0000),
+        vshlq_n_u32(vandq_u32(bits, vdupq_n_u32(0x03FF)), 13),
+    );
+    let val = vbslq_u32(is_special, special, vreinterpretq_u32_f32(magf));
+    vreinterpretq_f32_u32(vorrq_u32(val, sign))
+}
+
+/// Squared L2 between an f32 query and an f16-encoded sidecar vector
+/// (NEON, 8 halves per iteration; scalar tail).
+///
+/// # Safety
+/// Caller must ensure the CPU supports NEON (baseline on all AArch64).
+#[cfg(target_arch = "aarch64")]
+#[inline]
+#[target_feature(enable = "neon")]
+pub unsafe fn f16_l2(query: &[f32], vec_f16: &[u16]) -> f32 {
+    debug_assert_eq!(query.len(), vec_f16.len(), "f16_l2: dimension mismatch");
+    let n = query.len();
+    let mut sum0 = vdupq_n_f32(0.0);
+    let mut sum1 = vdupq_n_f32(0.0);
+    let pq = query.as_ptr();
+    let px = vec_f16.as_ptr();
+    let chunks = n / 8;
+    let mut i = 0usize;
+    for _ in 0..chunks {
+        // SAFETY: i + 8 <= n guaranteed by chunks = n / 8. Pointers are
+        // valid slices (f32 query / u16 halves) at this offset.
+        let h = vld1q_u16(px.add(i));
+        let x0 = f16x4_decode(vget_low_u16(h));
+        let x1 = f16x4_decode(vget_high_u16(h));
+        let q0 = vld1q_f32(pq.add(i));
+        let q1 = vld1q_f32(pq.add(i + 4));
+        let d0 = vsubq_f32(q0, x0);
+        let d1 = vsubq_f32(q1, x1);
+        sum0 = vfmaq_f32(sum0, d0, d0);
+        sum1 = vfmaq_f32(sum1, d1, d1);
+        i += 8;
+    }
+    // SAFETY: vaddvq_f32 requires NEON, which we have via target_feature.
+    let mut result = vaddvq_f32(vaddq_f32(sum0, sum1));
+    // Scalar tail
+    while i < n {
+        let d = *query.get_unchecked(i) - crate::vector::f16::f16_to_f32(*vec_f16.get_unchecked(i));
+        result += d * d;
+        i += 1;
+    }
+    result
+}
+
+/// Fused `(Σ q_i·x_i, Σ x_i²)` between an f32 query and an f16-encoded
+/// sidecar vector (NEON, 8 halves per iteration; scalar tail). Feeds the
+/// unit-sphere (Cosine/InnerProduct) exact-rerank distance.
+///
+/// # Safety
+/// Caller must ensure the CPU supports NEON (baseline on all AArch64).
+#[cfg(target_arch = "aarch64")]
+#[inline]
+#[target_feature(enable = "neon")]
+pub unsafe fn f16_dot_normsq(query: &[f32], vec_f16: &[u16]) -> (f32, f32) {
+    debug_assert_eq!(
+        query.len(),
+        vec_f16.len(),
+        "f16_dot_normsq: dimension mismatch"
+    );
+    let n = query.len();
+    let mut dot0 = vdupq_n_f32(0.0);
+    let mut dot1 = vdupq_n_f32(0.0);
+    let mut xsq0 = vdupq_n_f32(0.0);
+    let mut xsq1 = vdupq_n_f32(0.0);
+    let pq = query.as_ptr();
+    let px = vec_f16.as_ptr();
+    let chunks = n / 8;
+    let mut i = 0usize;
+    for _ in 0..chunks {
+        // SAFETY: i + 8 <= n guaranteed by chunks = n / 8. Pointers are
+        // valid slices (f32 query / u16 halves) at this offset.
+        let h = vld1q_u16(px.add(i));
+        let x0 = f16x4_decode(vget_low_u16(h));
+        let x1 = f16x4_decode(vget_high_u16(h));
+        let q0 = vld1q_f32(pq.add(i));
+        let q1 = vld1q_f32(pq.add(i + 4));
+        dot0 = vfmaq_f32(dot0, q0, x0);
+        dot1 = vfmaq_f32(dot1, q1, x1);
+        xsq0 = vfmaq_f32(xsq0, x0, x0);
+        xsq1 = vfmaq_f32(xsq1, x1, x1);
+        i += 8;
+    }
+    // SAFETY: vaddvq_f32 requires NEON, which we have via target_feature.
+    let mut dot = vaddvq_f32(vaddq_f32(dot0, dot1));
+    let mut xsq = vaddvq_f32(vaddq_f32(xsq0, xsq1));
+    // Scalar tail
+    while i < n {
+        let x = crate::vector::f16::f16_to_f32(*vec_f16.get_unchecked(i));
+        dot += *query.get_unchecked(i) * x;
+        xsq += x * x;
+        i += 1;
+    }
+    (dot, xsq)
+}
+
 #[cfg(test)]
 #[cfg(target_arch = "aarch64")]
 mod tests {
@@ -545,5 +765,143 @@ mod tests {
         // SAFETY: NEON is baseline on AArch64.
         let got = unsafe { sq8_stats(q, c) };
         assert_eq!(got, (0.0, 0.0, 0.0));
+    }
+
+    // ── task #13: int8 symmetric ADC stats (NEON vs scalar i64 oracle) ───
+
+    fn gen_i8_query(len: usize, seed: u32, qmax: i32) -> Vec<i8> {
+        // Values within [-qmax, qmax], mirroring what
+        // sq8_quantize_query_scalar would actually produce.
+        let mut v = Vec::with_capacity(len);
+        let mut s = seed;
+        for _ in 0..len {
+            s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+            let raw = (s >> 24) as i8 as i32;
+            v.push((raw % (qmax + 1)) as i8);
+        }
+        v
+    }
+
+    #[test]
+    fn test_sq8_i8_stats_matches_scalar_oracle() {
+        use crate::vector::turbo_quant::sq8::sq8_candidate_stats_i8_scalar;
+        let qi8 = gen_i8_query(768, 42, 127);
+        let c = gen_u8(768, 99);
+        let sum_qi8: i32 = qi8.iter().map(|&x| x as i32).sum();
+        let expected = sq8_candidate_stats_i8_scalar(&qi8, &c, sum_qi8);
+        // SAFETY: NEON is baseline on AArch64.
+        let got = unsafe { sq8_i8_stats(&qi8, &c, sum_qi8) };
+        assert_eq!(
+            got, expected,
+            "sq8_i8_stats mismatch (exact int arithmetic): scalar={expected:?}, neon={got:?}"
+        );
+    }
+
+    #[test]
+    fn test_sq8_i8_stats_tail_handling() {
+        use crate::vector::turbo_quant::sq8::sq8_candidate_stats_i8_scalar;
+        for len in [0, 1, 3, 7, 13, 15, 16, 17, 31, 33, 100] {
+            let qi8 = gen_i8_query(len, 42, 127);
+            let c = gen_u8(len, 99);
+            let sum_qi8: i32 = qi8.iter().map(|&x| x as i32).sum();
+            let expected = sq8_candidate_stats_i8_scalar(&qi8, &c, sum_qi8);
+            // SAFETY: NEON is baseline on AArch64.
+            let got = unsafe { sq8_i8_stats(&qi8, &c, sum_qi8) };
+            assert_eq!(
+                got, expected,
+                "sq8_i8_stats tail len={len}: scalar={expected:?}, neon={got:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_sq8_i8_stats_empty() {
+        let qi8: &[i8] = &[];
+        let c: &[u8] = &[];
+        // SAFETY: NEON is baseline on AArch64.
+        let got = unsafe { sq8_i8_stats(qi8, c, 0) };
+        assert_eq!(got, (0, 0, 0));
+    }
+
+    #[test]
+    fn test_sq8_i8_stats_extreme_values() {
+        // All-max-magnitude inputs (qi8=±127, c=255) stress the overflow
+        // bound: worst case |dot_offset| per element is 127*128=16256,
+        // times dim=768 ≈ 12.5M — comfortably inside i32, but this pins the
+        // exact result down against the oracle rather than trusting the
+        // arithmetic argument alone.
+        use crate::vector::turbo_quant::sq8::sq8_candidate_stats_i8_scalar;
+        let dim = 768;
+        let qi8: Vec<i8> = (0..dim)
+            .map(|i| if i % 2 == 0 { 127i8 } else { -127i8 })
+            .collect();
+        let c: Vec<u8> = vec![255u8; dim];
+        let sum_qi8: i32 = qi8.iter().map(|&x| x as i32).sum();
+        let expected = sq8_candidate_stats_i8_scalar(&qi8, &c, sum_qi8);
+        // SAFETY: NEON is baseline on AArch64.
+        let got = unsafe { sq8_i8_stats(&qi8, &c, sum_qi8) };
+        assert_eq!(
+            got, expected,
+            "extreme-value mismatch: scalar={expected:?}, neon={got:?}"
+        );
+    }
+
+    #[test]
+    fn test_f16_kernels_match_scalar_all_value_classes() {
+        use crate::vector::f16::{dot_normsq_f16, f32_to_f16, l2_sq_f16};
+        // Normals, f16 subnormals (≈3e-6..6e-5), zero, and odd tails — the
+        // integer-rescale decode must agree with scalar f16_to_f32 everywhere.
+        for len in [0, 1, 3, 7, 8, 9, 15, 16, 17, 100, 384] {
+            let q = gen_f32(len, 21);
+            let x: Vec<u16> = gen_f32(len, 77)
+                .iter()
+                .enumerate()
+                .map(|(j, &v)| {
+                    if j % 5 == 4 {
+                        f32_to_f16(3e-6 + (j as f32) * 1.1e-7) // subnormal f16
+                    } else if j % 7 == 6 {
+                        f32_to_f16(0.0)
+                    } else {
+                        f32_to_f16(v)
+                    }
+                })
+                .collect();
+            let exp_l2 = l2_sq_f16(&q, &x);
+            // SAFETY: NEON is baseline on AArch64.
+            let got_l2 = unsafe { f16_l2(&q, &x) };
+            let rel = (got_l2 - exp_l2).abs() / exp_l2.abs().max(1e-10);
+            assert!(
+                rel < 1e-4 || len == 0,
+                "f16_l2 len={len}: scalar={exp_l2}, neon={got_l2}"
+            );
+
+            let (ed, en) = dot_normsq_f16(&q, &x);
+            // SAFETY: NEON is baseline on AArch64.
+            let (gd, gn) = unsafe { f16_dot_normsq(&q, &x) };
+            assert!(
+                (gd - ed).abs() / ed.abs().max(1e-6) < 1e-3,
+                "f16_dot len={len}: scalar={ed}, neon={gd}"
+            );
+            assert!(
+                (gn - en).abs() / en.abs().max(1e-6) < 1e-4,
+                "f16_normsq len={len}: scalar={en}, neon={gn}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_f16_kernels_inf_nan_propagate() {
+        use crate::vector::f16::f32_to_f16;
+        let q = gen_f32(24, 5);
+        let mut x: Vec<u16> = gen_f32(24, 9).iter().map(|&v| f32_to_f16(v)).collect();
+        x[10] = f32_to_f16(f32::INFINITY);
+        // SAFETY: NEON is baseline on AArch64.
+        assert_eq!(unsafe { f16_l2(&q, &x) }, f32::INFINITY);
+        x[10] = f32_to_f16(f32::NAN);
+        // SAFETY: NEON is baseline on AArch64.
+        assert!(unsafe { f16_l2(&q, &x) }.is_nan());
+        // SAFETY: NEON is baseline on AArch64.
+        let (_, xsq) = unsafe { f16_dot_normsq(&q, &x) };
+        assert!(xsq.is_nan());
     }
 }

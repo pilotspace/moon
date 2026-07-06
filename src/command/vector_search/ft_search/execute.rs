@@ -47,7 +47,7 @@ pub(super) fn search_local_raw(
     // Clone committed treemap BEFORE get_index_mut to satisfy the borrow checker.
     // Non-TXN readers need this to see entries whose owning txn has committed
     // (entries tagged with txn_id by auto_index_hset_public_txn; ACID-09 fix).
-    let committed = store.txn_manager().committed_treemap().clone();
+    let committed = store.txn_manager().committed_snapshot();
     let idx = match store.get_index_mut(index_name) {
         Some(i) => i,
         None => {
@@ -96,6 +96,9 @@ pub(super) fn search_local_raw(
 
     idx.try_compact();
 
+    // AE-1: remember whether ef came from the heuristic (segment-level
+    // adaptive-ef estimates only apply then, never over a user EF_RUNTIME).
+    let ef_defaulted = idx.meta.hnsw_ef_runtime == 0;
     let ef_search = if idx.meta.hnsw_ef_runtime > 0 {
         idx.meta.hnsw_ef_runtime as usize
     } else {
@@ -123,6 +126,7 @@ pub(super) fn search_local_raw(
             committed: &committed,
             dirty_set: &[],
             dimension: dim as u32,
+            ef_defaulted,
         };
         let results = idx.segments.search_mvcc(
             &query_f32,
@@ -148,6 +152,7 @@ pub(super) fn search_local_raw(
                 committed: &committed,
                 dirty_set: &[],
                 dimension: dim as u32,
+                ef_defaulted,
             };
             let results = fs.segments.search_mvcc(
                 &query_f32,
@@ -218,7 +223,7 @@ pub fn search_local_filtered(
 ) -> Frame {
     // Clone committed treemap BEFORE get_index_mut (borrow-checker ordering).
     // Ensures non-TXN readers see entries whose owning txn has committed.
-    let committed = store.txn_manager().committed_treemap().clone();
+    let committed = store.txn_manager().committed_snapshot();
     let idx = match store.get_index_mut(index_name) {
         Some(i) => i,
         None => return Frame::Error(Bytes::from_static(b"Unknown Index name")),
@@ -269,6 +274,9 @@ pub fn search_local_filtered(
     // ef_search: user-configurable via EF_RUNTIME in FT.CREATE, or auto-computed.
     // Higher ef = better recall but lower QPS. Auto scales with k and dimension:
     // base = k*20, min 200, boosted for high-d where TQ-ADC needs wider beam.
+    // AE-1: remember whether ef came from the heuristic (segment-level
+    // adaptive-ef estimates only apply then, never over a user EF_RUNTIME).
+    let ef_defaulted = idx.meta.hnsw_ef_runtime == 0;
     let ef_search = if idx.meta.hnsw_ef_runtime > 0 {
         idx.meta.hnsw_ef_runtime as usize
     } else {
@@ -297,6 +305,7 @@ pub fn search_local_filtered(
             committed: &committed,
             dirty_set: &[],
             dimension: dim as u32,
+            ef_defaulted,
         };
         let results = idx.segments.search_mvcc(
             &query_f32,
@@ -318,6 +327,7 @@ pub fn search_local_filtered(
                 committed: &committed,
                 dirty_set: &[],
                 dimension: dim as u32,
+                ef_defaulted,
             };
             let results = fs.segments.search_mvcc(
                 &query_f32,

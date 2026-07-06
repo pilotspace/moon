@@ -1870,6 +1870,7 @@ dependencies = [
  "rust-stemmers",
  "rustls",
  "rustls-pemfile",
+ "ryu",
  "serde",
  "serde_json",
  "sha1_smol",

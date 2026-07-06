@@ -6,6 +6,173 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — int8 symmetric ADC for SQ8 vector search (task #13)
+
+- New per-candidate integer dot-product path for SQ8 asymmetric distance
+  computation (ADC), replacing the f32-widening `sq8_stats` kernel on the
+  hot per-candidate pass with exact-integer int8 dot products: NEON
+  widen-multiply (`vmull_s8` + the `c^0x80` offset trick, since baseline
+  ARMv8-A has no mixed u8×i8 widening multiply), AVX2 (`cvtepu8/cvtepi8_epi16`
+  → `mullo_epi16` → `madd_epi16`, saturation-free), and AVX512 VNNI
+  (`_mm512_dpbusd_epi32`, feature-gated behind `simd-avx512`). Query is
+  quantized to symmetric int8 once per search
+  (`turbo_quant::sq8::sq8_quantize_query_scalar`); `sum_c`/`sumsq_c` are
+  exact integers straight from the u8 codes. Combines through the unchanged
+  `sq8_l2_from_stats` — the on-disk SQ8 format and the exact-rerank sidecar
+  (HQ-1) are untouched. Wired into both `hnsw/search.rs` beam-search closures
+  and all three SQ8 call sites in `segment/mutable.rs` brute-force search.
+  Local (dev-Mac, NEON) directional speedup vs the existing f32 SIMD path:
+  ~1.5x at dim 128, ~2.0x at dim 384, ~2.15x at dim 768 (`benches/sq8_adc_bench.rs`,
+  `int8_dispatch` variant) — absolute/cross-arch numbers are GCE-validation
+  scope (task #14). Recall A/B-gated (`turbo_quant::sq8` test module):
+  R@10 delta ≤ 0.01 vs the f32 ADC path and ≥ 0.98 top-10 overlap, both L2
+  and Cosine, at dim 128/384. `MOON_SQ8_INT8_ADC=0` forces the f32 kernels
+  (bench/diagnostic escape hatch, not yet added to CLAUDE.md's env list —
+  flagged for a follow-up doc pass).
+
+### Fixed — merge recall gate self-exclusion bias (manual merges could never pass)
+
+- `verify_merge_recall` compared HNSW results **including the query point**
+  (every sampled query is a database point, distance 0 → always rank 1)
+  against a ground truth that **excluded** it, structurally capping measurable
+  recall at (k−1)/k = 0.90 — exactly the manual `FT.COMPACT`/`VACUUM VECTOR`
+  merge gate, so any manual merge of an index with ≥ 50 vectors was rejected
+  with `merge recall 0.9000 < tolerance 0.9000` regardless of actual graph
+  quality (the 0.70 background gate masked this). The merged-graph search now
+  requests k+1 and drops the self-point before comparison.
+
+### Added — vector-index durability: kill-9 crash-recovery test suite (B4)
+
+- New `tests/crash_recovery_vector_durability.rs`: five end-to-end scenarios
+  against real server processes (SIGKILL + restart): unchanged-key dedup
+  fast path, update/delete reconcile, orphan sweep on boot, collection_id
+  pin surviving a post-recovery compact + GraphUnion merge, and a
+  no-persistence regression guard. All waits are bounded condition polls;
+  servers run with `--disk-free-min-pct 0` so the suite is immune to the
+  dev volume hovering at the 5% diskfull guard.
+
+### Added — vector-index durability: startup recovery from disk (B1-B3)
+
+- **Vector indexes now persist their segments across restarts** instead of
+  paying a full re-index (TQ encode + HNSW build) of every matching hash key
+  on every restart. Each index gets an `idx-<hex(name)>/` directory holding
+  an atomically-written `manifest.json` (collection_id / segment ids /
+  id-allocator floors), a checksummed `keymap-<epoch>.bin` (key_hash →
+  global_id + vector checksum + original key), and its immutable HNSW
+  segments (staged write: `staging-<id>` → fsync → atomic rename), written
+  in the background after each compact/merge install (B1/B2).
+- **Startup now loads that state instead of discarding it**: segments are
+  read back and reattached (pinning the recreated index's `collection_id` to
+  the persisted value — required for the HNSW QJL rotation seed to match),
+  and the keyspace rescan is now a **dedup rescan**: a key whose vector
+  bytes checksum-match the last snapshot is rebuilt as metadata-only (no
+  HNSW/TQ re-encode); only genuinely changed or unknown keys are fully
+  re-indexed; keys removed from the keyspace are tombstoned (B3).
+- **Crash-safety contract**: any corrupt/missing artifact (segment,
+  checksum mismatch, unreadable headers) degrades to a rescan-rebuild of
+  exactly the affected keys, never to wrong search results; a manifest may
+  understate what's durable (costs a rescan) but never overstates. Startup
+  also sweeps orphaned segment/staging/keymap files and stale `idx-*`
+  directories left by an interrupted drop.
+- Multi-field indexes: only the default vector field's segments/checksum
+  are persisted; additional named vector fields always re-encode on
+  restart (documented gap, safe/conservative).
+- Removed the vestigial WAL-replay vector recovery path
+  (`src/vector/persistence/recovery.rs`, `VectorStore::attach_recovered`/
+  `pending_segments`): it only ever populated a `VectorStore` that was
+  discarded before the shard event loop started (recovery authority is now
+  exclusively the manifest/segment/keymap layout above).
+
+### Fixed — FLUSHALL/FLUSHDB ghost vectors + HDEL stale-vector gap
+
+- **FLUSHALL/FLUSHDB never touched the FT indexes** (persistence-review R3):
+  flushed hashes stayed searchable as ghost vectors/documents until restart.
+  Both commands now clear every vector + text index's CONTENTS (segments,
+  key-hash maps, postings, TAG/NUMERIC indexes) while KEEPING the FT.CREATE
+  definitions — matching restart semantics, where definitions come from the
+  sidecar and contents are re-derived from the (now empty) keyspace.
+  Recovered-but-unclaimed `pending_segments` are discarded too, so a
+  post-flush FT.CREATE cannot resurrect pre-flush contents.
+- **`HDEL key <vector-field>` left the vector searchable** (R4): only
+  whole-key DEL/UNLINK tombstoned. A successful HDEL that removes an
+  index's vector field now tombstones that key in exactly the affected
+  indexes (per-index `mark_deleted_for_key_in_index`; sibling indexes keyed
+  on other fields keep their entries). Known follow-ups documented in
+  `auto_hdel_vectors`: multi-vector-field indexes tombstone the whole doc,
+  and TEXT/TAG/NUMERIC field removal is not yet re-indexed.
+- Both hooks wired with wire-parity on ALL dispatch paths (single-shard,
+  monoio conn-local, tokio sharded, SPSC execute, shared batch, MULTI/EXEC).
+  New integration suite `tests/vector_flush_hdel_tombstone.rs` (red→green).
+
+### Observability — exact-rerank sidecar coverage is visible and loud (R5)
+
+- A GraphUnion merge with even one sidecar-less source segment silently
+  dropped the exact-rerank f16 sidecar for the ENTIRE merged segment
+  (all-or-nothing propagation — a partial sidecar would mix exact and ADC
+  distances within one segment). The drop now logs a `tracing::warn` with
+  source counts, and FT.INFO exposes additive `graph_segments` /
+  `segments_with_exact_rerank` counters (merged across shards) so ADC-only
+  segments are observable in the steady state.
+
+### Performance — AE-1: saturation-gated per-segment adaptive ef
+
+- With G graph segments, every segment searched at the FULL resolved ef —
+  ~G× the CPU of one ef-wide beam (the root cause of the pooled regression
+  on SMT-constrained boxes in PR #214's GCE run). Compact/GraphUnion builds
+  now run a one-time self-probe against the exact f16-sidecar ground truth
+  (leave-self-out R@10 across an ef ladder, `estimate_suggested_ef`): a
+  segment whose curve is FULLY SATURATED from the minimum rung (flat at
+  ≈1.0) is certified trivially easy and searches at min-ef (24); every
+  other segment keeps the full resolved ef. Applied identically to the
+  sync, serial-yielding, and worker-pool paths (pooled == serial identity
+  holds); never active when the user pins `EF_RUNTIME`; in-memory only
+  (reloaded segments fall back to the full beam).
+- Two weaker designs were tried and REJECTED by recall A/B (20k×384d SQ8,
+  5 segments): a blanket `ef/√G` split (EF-SPLIT) silently cost gaussian
+  R@10 0.9915 → 0.9295 (its original "recall preserved" validation had
+  exercised a stale binary), and letting the self-probe pick a mid-ladder
+  knee cost 0.9915 → 0.939 — self-sampled queries are optimistically
+  biased on unstructured data, so the probe's ONLY trustworthy verdict is
+  "saturated at min-ef".
+- Recall/latency gate (same seeds/harness end-to-end): clustered 5-seg
+  R@10 1.0000 at p50 0.79 → 0.26 ms (~3×), clustered 1-seg 1.0000 → 0.9960
+  (within the probe's ε=0.005 contract) at 1.78 → 1.46 ms; gaussian 5-seg
+  0.9915 at ~0.79 ms and 1-seg 0.7710 — byte-identical to the pre-split
+  baseline (probe self-rejects, full beam).
+
+### Performance — FT.SEARCH per-query fixed-cost cleanup (QP-2/QP-3)
+
+- **Thread-cached `SearchScratch`** (QP-3): the wire path built a fresh
+  scratch per query — heaps, visited bitmap, and the 32–65KB ADC LUT
+  reallocated every FT.SEARCH. Captures now take a thread-local recycled
+  scratch (exact padded-dim match, mirroring the worker pool's cache) and
+  the yielding search returns it on completion.
+- **Amortized committed-treemap capture** (QP-2): every search cloned the
+  MVCC committed `RoaringTreemap`; `TransactionManager::committed_snapshot()`
+  now hands out a cached `Arc` refreshed only on the first capture after a
+  commit/prune — read-heavy captures are one refcount bump, write-heavy is
+  never worse than before. All 7 capture sites switched.
+- **ryu score formatting**: RESP `__vec_score` replies formatted f32 via
+  `Display` (grisu, 1.4% of a matched-recall query); now ryu.
+- VM A/B (same box/config as the f16 kernel entry): ef64 8,468 → 8,810 QPS
+  (+4.0%; +13% cumulative with the f16 kernels).
+
+### Performance — SIMD f16 exact-rerank kernels (NEON + F16C)
+
+- The HQ-1 exact-rerank pass decoded its f16 sidecar with scalar software
+  `f16_to_f32` — 17% of a matched-recall (ef 64) query. New fused
+  decode+distance kernels in the distance dispatch table (`f16_l2`,
+  `f16_dot_normsq`): aarch64 uses a baseline-NEON integer-rescale decode
+  (no ARMv8.2 FP16 intrinsics needed; exact for all finite f16, Inf/NaN
+  bit-selected), x86_64 uses F16C `vcvtph2ps` + FMA (runtime-detected with
+  AVX2, scalar fallback). Subnormal/Inf/NaN semantics match the scalar
+  reference exactly (pinned by tests). VM A/B (20k×384d clustered SQ8,
+  single conn, ef 64): 7,795 → 8,468 QPS (+8.6%).
+- **Negative result, kept for the record**: skipping the rerank pass
+  entirely for SQ8 was A/B'd and REFUTED — it costs real recall
+  (R@10 −0.010 clustered, −0.017 gaussian 5-segment). The pass stays
+  unconditional; the SIMD kernels make it cheap instead.
+
 ### Performance — FT.SEARCH intra-query worker pool + bounded bulk compaction
 
 - **`--ft-search-workers N` worker pool** (`src/vector/search_pool.rs`): the

@@ -837,8 +837,14 @@ impl super::Shard {
         // This ensures handler_sharded FT.* commands and SPSC auto-indexing
         // (triggered by HSET) operate on the SAME VectorStore.
         //
-        // The shard-owned vector_store (from Shard struct) is discarded.
-        // All vector operations go through shard_databases.vector_store(shard_id).
+        // The shard-owned vector_store (populated by `Shard::restore_from_persistence`,
+        // BEFORE the event loop starts) is discarded here in favor of the
+        // one on `ShardSlice`. Real recovery happens below, against THIS
+        // (live) store: index *definitions* come from the
+        // `vector-indexes.meta` sidecar; index *contents* come from the B3
+        // manifest/segment/keymap durability layout when present (see
+        // `crate::vector::persistence::recover_v2`), reconciled against the
+        // live keyspace by a dedup rescan — never from the discarded store.
         let _discarded_vector_store = std::mem::replace(
             &mut self.vector_store,
             crate::vector::store::VectorStore::new(),
@@ -886,7 +892,15 @@ impl super::Shard {
                 }
             });
 
-            if let Some(ref metas) = metas {
+            // B3 (vector-index durability): threaded through the index
+            // creation loop below, the rescan loop further down, and the
+            // finalize call at the end of this block. See
+            // `crate::vector::persistence::recover_v2` module docs for the
+            // full recovery contract (manifest/segment/keymap load + dedup
+            // rescan + deletion probe + orphan sweep).
+            let mut recovery_state = crate::vector::persistence::recover_v2::RecoveryState::new();
+
+            if let (Some(metas), Some(vdir)) = (&metas, &vector_persist_dir) {
                 crate::shard::slice::with_shard(|s| {
                     info!(
                         "Shard {}: restoring {} vector index(es) from sidecar",
@@ -894,16 +908,9 @@ impl super::Shard {
                         metas.len()
                     );
                     for (meta, weight) in metas {
-                        let name = meta.name.clone();
-                        if let Err(e) = s.vector_store.create_index(meta.clone()) {
-                            tracing::warn!(
-                                "Shard {}: failed to restore index '{}': {}",
-                                shard_id,
-                                String::from_utf8_lossy(&name),
-                                e
-                            );
-                        } else if *weight != 1.0 {
-                            if let Some(idx) = s.vector_store.get_index_mut(&name) {
+                        recovery_state.create_index(&mut s.vector_store, vdir, meta);
+                        if *weight != 1.0 {
+                            if let Some(idx) = s.vector_store.get_index_mut(&meta.name) {
                                 idx.set_compaction_weight(*weight);
                             }
                         }
@@ -1004,7 +1011,14 @@ impl super::Shard {
                     if !matching.is_empty() {
                         crate::shard::slice::with_shard(|s| {
                             for (key, args) in &matching {
-                                let _ = crate::shard::spsc_handler::auto_index_hset_public(
+                                // B3 dedup rescan: verifies each matching
+                                // key against any recovered durable state
+                                // (manifest/segment/keymap) before deciding
+                                // whether to fully re-encode. Indexes with
+                                // no durable state (fresh/no manifest) fall
+                                // through to the same full-rescan behavior
+                                // this replaced. See `recover_v2` docs.
+                                recovery_state.reconcile_key(
                                     &mut s.vector_store,
                                     &mut s.text_store,
                                     key,
@@ -1021,6 +1035,18 @@ impl super::Shard {
                         shard_id, reindexed
                     );
                 }
+            }
+
+            // B3 finalize: deletion probe (keymap keys no longer present
+            // anywhere in the keyspace) + orphan sweep (segment/staging/
+            // keymap files not referenced by the loaded manifest, and
+            // unknown `idx-*` dirs with no matching sidecar index) +
+            // per-index acceptance-signal log line. No-op (does nothing,
+            // logs nothing) when no index had durable state to recover.
+            if let Some(ref vdir) = vector_persist_dir {
+                crate::shard::slice::with_shard(|s| {
+                    recovery_state.finish(&mut s.vector_store, vdir);
+                });
             }
         }
 

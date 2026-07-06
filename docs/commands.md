@@ -120,7 +120,7 @@ TXN COMMIT         -- Apply all changes atomically + WAL record
 `FT.CREATE`, `FT.DROPINDEX`, `FT.INFO`, `FT.SEARCH`, `FT.COMPACT`, `FT.RECOMMEND`, `FT.NAVIGATE`, `FT.EXPAND`, `FT.CACHESEARCH`, `FT.CONFIG SET`, `FT.CONFIG GET`
 
 !!! tip
-    Vectors are auto-indexed on `HSET`. Create an index with `FT.CREATE`, then `HSET` documents — Moon automatically inserts them into the HNSW graph. See the [vector search guide](vector-search-guide.md) for tuning parameters.
+    Vectors are auto-indexed on `HSET`. Create an index with `FT.CREATE`, then `HSET` documents — Moon automatically inserts them into the HNSW graph. `FLUSHALL`/`FLUSHDB` clear index contents (the `FT.CREATE` definition survives); `HDEL` of an indexed vector field tombstones it. See the [vector search guide](vector-search-guide.md) for tuning parameters and known limitations.
 
 ## Full-text search (2)
 
@@ -200,3 +200,4 @@ FT.NAVIGATE idx "*=>[KNN 5 @vec $q]" PARAMS 2 q <vec> HOPS 2 DECAY 0.1
 ## Known limitations
 
 - `GETRANGE` / `SETRANGE` are not yet implemented.
+- `HDEL` of a vector field on an index with multiple vector fields tombstones the whole document, not just that field; `TEXT`/`TAG`/`NUMERIC` field removal via `HDEL` is not yet re-indexed. See the [vector search guide](vector-search-guide.md#flushall--flushdb--hdel).
