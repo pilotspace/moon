@@ -15,8 +15,13 @@
 //! Linux-only (reads /proc/<pid>/stat). The busy-poll CLI flag forces the
 //! epoll/kqueue LegacyDriver, so this exercises the patched spin path on
 //! both io_uring-capable and MOON_NO_URING environments.
+//!
+//! monoio-only: under the tokio runtime `--io-busy-poll-us` is an explicit
+//! no-op (main.rs warns and skips the spin wiring), so there is no spin to
+//! measure — and a debug-build tokio server's unrelated idle-tick cost
+//! (~0.9s/3s at 4 shards on CI) would fail the bound spuriously.
 
-#![cfg(all(unix, target_os = "linux"))]
+#![cfg(all(unix, target_os = "linux", feature = "runtime-monoio"))]
 #![allow(clippy::unwrap_used)]
 
 use std::io::{Read, Write};
