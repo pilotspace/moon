@@ -25,7 +25,8 @@ fn index_scan_keys(
     let label_id = label.map(|l| label_to_id(l.as_bytes()));
     let committed = roaring::RoaringBitmap::new();
     let view = crate::graph::view::MergedNodeView::new(memgraph, csr_segs);
-    let empty_row: Row = HashMap::new();
+    let empty_table = SlotTable::default();
+    let empty_row = Row::seed(&empty_table);
 
     // Resolve each equality target to a concrete PropertyValue.
     let mut targets: Vec<(u16, PropertyValue)> = Vec::with_capacity(prop_eq.len());
@@ -167,7 +168,10 @@ pub fn execute(
     let start = std::time::Instant::now();
 
     // Seed row: one empty row to bootstrap the pipeline.
-    let mut rows: Vec<Row> = vec![HashMap::new()];
+    let slot_table = SlotTable::from_plan(plan);
+    let empty_table = SlotTable::default();
+    let empty_row = Row::seed(&empty_table);
+    let mut rows: Vec<Row> = vec![Row::seed(&slot_table)];
     let mut columns = Vec::new();
     // After Project, rows are converted to positional arrays.
     let mut projected_rows: Option<Vec<Vec<Value>>> = None;
@@ -203,7 +207,7 @@ pub fn execute(
                 for row in &rows {
                     for &key in &keys {
                         let mut new_row = row.clone();
-                        new_row.insert(variable.clone(), Value::Node(key));
+                        new_row.insert(variable, Value::Node(key));
                         new_rows.push(new_row);
                     }
                 }
@@ -221,7 +225,7 @@ pub fn execute(
                 for row in &rows {
                     for &key in &keys {
                         let mut new_row = row.clone();
-                        new_row.insert(variable.clone(), Value::Node(key));
+                        new_row.insert(variable, Value::Node(key));
                         new_rows.push(new_row);
                     }
                 }
@@ -293,11 +297,11 @@ pub fn execute(
                                 continue;
                             }
                             let mut new_row = row.clone();
-                            new_row.insert(target.clone(), Value::Node(merged.node));
+                            new_row.insert(target, Value::Node(merged.node));
                             // v0.1.9 CYP-06: bind edge variable for single-hop
                             // expansion so WHERE r.valid_to >= $asof works.
                             if let Some(evar) = edge_variable {
-                                new_row.insert(evar.clone(), Value::Edge(merged.edge));
+                                new_row.insert(evar, Value::Edge(merged.edge));
                             }
                             new_rows.push(new_row);
                         }
@@ -327,7 +331,7 @@ pub fn execute(
 
                                     if hop >= *min_hops {
                                         let mut new_row = row.clone();
-                                        new_row.insert(target.clone(), Value::Node(merged.node));
+                                        new_row.insert(target, Value::Node(merged.node));
                                         new_rows.push(new_row);
                                         if new_rows.len() >= MAX_RESULT_ROWS {
                                             break;
@@ -384,8 +388,10 @@ pub fn execute(
                             .iter()
                             .map(|item| {
                                 if matches!(item.expr, Expr::Star) {
-                                    let entries: Vec<(String, Value)> =
-                                        row.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                                    let entries: Vec<(String, Value)> = row
+                                        .iter()
+                                        .map(|(k, v)| (k.to_owned(), v.clone()))
+                                        .collect();
                                     Value::Map(entries)
                                 } else {
                                     eval_expr(
@@ -476,7 +482,7 @@ pub fn execute(
             PhysicalOp::Limit { count } => {
                 let n = match eval_expr(
                     count,
-                    &HashMap::new(),
+                    &empty_row,
                     memgraph,
                     params,
                     csr_segs,
@@ -496,7 +502,7 @@ pub fn execute(
             PhysicalOp::Skip { count } => {
                 let n = match eval_expr(
                     count,
-                    &HashMap::new(),
+                    &empty_row,
                     memgraph,
                     params,
                     csr_segs,
@@ -534,7 +540,7 @@ pub fn execute(
                     if let Value::List(items) = val {
                         for item in items {
                             let mut new_row = row.clone();
-                            new_row.insert(alias.clone(), item);
+                            new_row.insert(alias, item);
                             new_rows.push(new_row);
                         }
                     }
@@ -618,7 +624,7 @@ pub fn execute(
                         *max_hops,
                     ) {
                         let mut new_row = row.clone();
-                        new_row.insert(path_var.clone(), Value::Path(path));
+                        new_row.insert(path_var, Value::Path(path));
                         new_rows.push(new_row);
                     }
                 }
@@ -632,7 +638,7 @@ pub fn execute(
     } else {
         // No Project operator: return all row bindings as columns.
         if columns.is_empty() && !rows.is_empty() {
-            columns = rows[0].keys().cloned().collect();
+            columns = slot_table.names().to_vec();
             columns.sort();
         }
         rows.iter()
@@ -695,7 +701,10 @@ pub fn execute_profile(
 ) -> Result<ProfileResult, ExecError> {
     let start = std::time::Instant::now();
 
-    let mut rows: Vec<Row> = vec![HashMap::new()];
+    let slot_table = SlotTable::from_plan(plan);
+    let empty_table = SlotTable::default();
+    let empty_row = Row::seed(&empty_table);
+    let mut rows: Vec<Row> = vec![Row::seed(&slot_table)];
     let mut columns = Vec::new();
     let mut projected_rows: Option<Vec<Vec<Value>>> = None;
     let nodes_created: u64 = 0;
@@ -732,7 +741,7 @@ pub fn execute_profile(
                 for row in &rows {
                     for &key in &keys {
                         let mut new_row = row.clone();
-                        new_row.insert(variable.clone(), Value::Node(key));
+                        new_row.insert(variable, Value::Node(key));
                         new_rows.push(new_row);
                     }
                 }
@@ -750,7 +759,7 @@ pub fn execute_profile(
                 for row in &rows {
                     for &key in &keys {
                         let mut new_row = row.clone();
-                        new_row.insert(variable.clone(), Value::Node(key));
+                        new_row.insert(variable, Value::Node(key));
                         new_rows.push(new_row);
                     }
                 }
@@ -818,11 +827,11 @@ pub fn execute_profile(
                                 continue;
                             }
                             let mut new_row = row.clone();
-                            new_row.insert(target.clone(), Value::Node(merged.node));
+                            new_row.insert(target, Value::Node(merged.node));
                             // v0.1.9 CYP-06: bind edge variable in execute_profile
                             // single-hop path (parity with main executor).
                             if let Some(evar) = edge_variable {
-                                new_row.insert(evar.clone(), Value::Edge(merged.edge));
+                                new_row.insert(evar, Value::Edge(merged.edge));
                             }
                             new_rows.push(new_row);
                         }
@@ -852,7 +861,7 @@ pub fn execute_profile(
 
                                     if hop >= *min_hops {
                                         let mut new_row = row.clone();
-                                        new_row.insert(target.clone(), Value::Node(merged.node));
+                                        new_row.insert(target, Value::Node(merged.node));
                                         new_rows.push(new_row);
                                         if new_rows.len() >= MAX_RESULT_ROWS {
                                             break;
@@ -909,8 +918,10 @@ pub fn execute_profile(
                             .iter()
                             .map(|item| {
                                 if matches!(item.expr, Expr::Star) {
-                                    let entries: Vec<(String, Value)> =
-                                        row.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                                    let entries: Vec<(String, Value)> = row
+                                        .iter()
+                                        .map(|(k, v)| (k.to_owned(), v.clone()))
+                                        .collect();
                                     Value::Map(entries)
                                 } else {
                                     eval_expr(
@@ -999,7 +1010,7 @@ pub fn execute_profile(
             PhysicalOp::Limit { count } => {
                 let n = match eval_expr(
                     count,
-                    &HashMap::new(),
+                    &empty_row,
                     memgraph,
                     params,
                     csr_segs,
@@ -1019,7 +1030,7 @@ pub fn execute_profile(
             PhysicalOp::Skip { count } => {
                 let n = match eval_expr(
                     count,
-                    &HashMap::new(),
+                    &empty_row,
                     memgraph,
                     params,
                     csr_segs,
@@ -1057,7 +1068,7 @@ pub fn execute_profile(
                     if let Value::List(items) = val {
                         for item in items {
                             let mut new_row = row.clone();
-                            new_row.insert(alias.clone(), item);
+                            new_row.insert(alias, item);
                             new_rows.push(new_row);
                         }
                     }
@@ -1142,7 +1153,7 @@ pub fn execute_profile(
                         *max_hops,
                     ) {
                         let mut new_row = row.clone();
-                        new_row.insert(path_var.clone(), Value::Path(path));
+                        new_row.insert(path_var, Value::Path(path));
                         new_rows.push(new_row);
                     }
                 }
@@ -1167,7 +1178,7 @@ pub fn execute_profile(
         pr
     } else {
         if columns.is_empty() && !rows.is_empty() {
-            columns = rows[0].keys().cloned().collect();
+            columns = slot_table.names().to_vec();
             columns.sort();
         }
         rows.iter()

@@ -13,7 +13,7 @@ use super::*;
 /// (Phase 174 FIX-04).
 pub(crate) fn eval_expr(
     expr: &Expr,
-    row: &Row,
+    row: &Row<'_>,
     memgraph: &crate::graph::memgraph::MemGraph,
     params: &HashMap<String, Value>,
     immutable_segs: &[std::sync::Arc<crate::graph::csr::CsrStorage>],
@@ -410,7 +410,7 @@ pub(crate) fn eval_expr(
 
         Expr::Star => {
             let entries: Vec<(String, Value)> =
-                row.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                row.iter().map(|(k, v)| (k.to_owned(), v.clone())).collect();
             Value::Map(entries)
         }
 
