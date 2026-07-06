@@ -29,6 +29,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fresh connection on mid-startup connection resets (CI flake: per-shard
   SO_REUSEPORT listeners accept-then-reset during init).
 
+### Fixed — OOM eviction bypass closure (PR #TBD)
+
+- **Cross-shard SPSC write legs now enforce `--maxmemory`.** `Execute`,
+  `MultiExecute`, `PipelineBatch` and their `*Slotted` variants
+  (`src/shard/spsc_handler.rs`) executed writes against the TARGET shard's
+  `Database` directly, bypassing the connection handlers' eviction gate
+  entirely — a scatter-gather write (e.g. a pipeline of individually-routed
+  `SET`s hashing to a remote shard) could grow that shard's memory past
+  `maxmemory` without limit. A new `spsc_eviction_gate` helper mirrors
+  `run_write_eviction_gate` (`handler_monoio/mod.rs`) exactly — same elastic
+  per-shard budget (GAP-1), same spill-vs-plain branching — threaded through
+  `drain_spsc_shared`/`handle_shard_message_shared` and gated by a
+  once-per-drain-cycle `evict_active` snapshot (perf parity with
+  `batch_eviction_active`: zero extra lock acquires when `maxmemory` is
+  unset).
+- **Lua `redis.call`/`redis.pcall` writes now enforce `--maxmemory`.**
+  EVAL/EVALSHA carry no WRITE command flag, so the dispatch-level OOM check
+  never saw them, and the bridge (`src/scripting/bridge.rs`) never ran the
+  check before executing a write inside a script — a tight `redis.call('SET',
+  ...)` loop could write arbitrarily far past the cap. A new
+  `LuaEvictionCtx`, captured by value into the `redis.call`/`redis.pcall`
+  closures at VM-setup time (`setup_lua_vm`, once per shard — zero new
+  `unsafe`, zero per-call allocation), runs the same gate before a WRITE
+  `redis.call` executes; `redis.call` raises the OOM error as a Lua runtime
+  error (script aborts, matching Redis semantics), `redis.pcall` returns it
+  as an `{err = ...}` table. Read-only scripts are unaffected. FCALL-internal
+  writes (`src/scripting/functions.rs`) keep a documented, pre-existing gap
+  (no shard context threaded through the function-library loader) — tracked
+  as a follow-up, not closed by this fix.
+- **Cross-db `COPY ... DB n` now enforces `--maxmemory`.** Same SPSC
+  intercept family as above (`src/shard/spsc_handler.rs`) special-cases
+  `MOVE`/`COPY DB` ahead of the generic write path because both need two
+  `&mut Database` borrows at once; `COPY` duplicates the value into the
+  destination db and was missed by the generic gate. Now runs
+  `spsc_eviction_gate` against the destination db before `copy_core`.
+  Same-shard `MOVE` is left ungated (net-zero — the key leaves the source db
+  as it lands in the destination, same rationale as `DEL`).
+- New wire-level regression suite `tests/oom_bypass_closure.rs` (4 cases,
+  both runtimes): direct-SET control (A), cross-shard pipeline (B), Lua EVAL
+  loop (C), read-only EVAL under pressure not blocked (D) — B and C RED
+  before this fix, GREEN after; D locks the write-only scope of the Lua gate.
+
 ### Added — int8 symmetric ADC for SQ8 vector search (task #13)
 
 - New per-candidate integer dot-product path for SQ8 asymmetric distance

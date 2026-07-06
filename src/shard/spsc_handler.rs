@@ -3,7 +3,7 @@
 //! Extracted from shard/mod.rs to reduce file size. These are synchronous
 //! functions called from the event loop's select! arms.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -14,6 +14,7 @@ use tracing::info;
 use crate::blocking::BlockingRegistry;
 use crate::command::metadata;
 use crate::command::{DispatchResult, dispatch as cmd_dispatch};
+use crate::config::RuntimeConfig;
 use crate::persistence::aof;
 use crate::persistence::snapshot::SnapshotState;
 use crate::persistence::wal::WalWriter;
@@ -23,12 +24,52 @@ use crate::replication::backlog::ReplicationBacklog;
 use crate::runtime::channel;
 use crate::storage::Database;
 use crate::storage::entry::CachedClock;
+use crate::storage::eviction::{
+    try_evict_if_needed_async_spill_budget, try_evict_if_needed_budget,
+};
+use crate::storage::tiered::spill_thread::SpillRequest;
 
 use crate::command::vector_search;
 use crate::vector::store::VectorStore;
 
 use super::dispatch::ShardMessage;
 use super::shared_databases::ShardDatabases;
+
+/// SPSC-side write-path OOM/eviction gate (M2 fix).
+///
+/// Mirrors `run_write_eviction_gate` in `src/server/conn/handler_monoio/mod.rs`
+/// exactly (same elastic-budget lookup, same spill-vs-plain branching, same
+/// OOM `Frame::Error` on failure) — this file is runtime-agnostic (shared by
+/// both `runtime-monoio` and `runtime-tokio`, so it cannot call that
+/// `#[cfg(feature = "runtime-monoio")]`-gated function directly. Cross-shard
+/// SPSC legs (`Execute`/`MultiExecute`/`PipelineBatch` + their `*Slotted`
+/// variants) execute writes against the TARGET shard's `&mut Database`
+/// directly, bypassing the connection handlers' write path entirely — without
+/// this gate a scatter-gather write could grow a remote shard's memory past
+/// `maxmemory` without limit.
+fn spsc_eviction_gate(
+    db: &mut Database,
+    db_idx: usize,
+    shard_databases: &Arc<ShardDatabases>,
+    shard_id: usize,
+    runtime_config: &Arc<parking_lot::RwLock<RuntimeConfig>>,
+    spill_sender: Option<&flume::Sender<SpillRequest>>,
+    spill_file_id: &Rc<Cell<u64>>,
+    disk_offload_dir: Option<&std::path::Path>,
+) -> Result<(), crate::protocol::Frame> {
+    let rt = runtime_config.read();
+    let budget = shard_databases.elastic_budget(shard_id);
+    if let Some(sender) = spill_sender {
+        let mut fid = spill_file_id.get();
+        let dir = disk_offload_dir.unwrap_or(std::path::Path::new("."));
+        let res =
+            try_evict_if_needed_async_spill_budget(db, &rt, sender, dir, &mut fid, db_idx, budget);
+        spill_file_id.set(fid);
+        res
+    } else {
+        try_evict_if_needed_budget(db, &rt, budget)
+    }
+}
 
 /// Drain all SPSC consumer channels, processing cross-shard messages.
 ///
@@ -81,9 +122,23 @@ pub(crate) fn drain_spsc_shared(
     // drain cycle (`--wal-kv-log`; auto = false when the AOF is the recovery
     // authority and no CDC subscriber is attached — see wal_append_and_fanout).
     wal_kv_log: bool,
+    // M2 fix: OOM/eviction context for cross-shard write legs — mirrors what
+    // `ConnectionContext` carries for the local write path.
+    runtime_config: &Arc<parking_lot::RwLock<RuntimeConfig>>,
+    spill_sender: Option<&flume::Sender<SpillRequest>>,
+    spill_file_id: &Rc<Cell<u64>>,
+    disk_offload_dir: Option<&std::path::Path>,
 ) -> bool {
     const MAX_DRAIN_PER_CYCLE: usize = 256;
     let mut drained = 0;
+
+    // Batch-level eviction gate (perf parity with handler_monoio's
+    // `batch_eviction_active`): snapshot `maxmemory != 0` once per drain
+    // cycle instead of taking `runtime_config.read()` per write command. When
+    // neither maxmemory nor disk-offload is configured — the common
+    // non-memory-bound path — every write arm below skips the eviction call
+    // (and its lock acquire) entirely.
+    let evict_active = spill_sender.is_some() || runtime_config.read().maxmemory != 0;
 
     // Collect all messages first, then batch Execute/PipelineBatch under single borrow.
     //
@@ -202,6 +257,11 @@ pub(crate) fn drain_spsc_shared(
                 autovacuum_daemon,
                 aof_pool, // FIX-W1-2: thread AOF pool through SPSC drain
                 wal_kv_log,
+                evict_active,
+                runtime_config,
+                spill_sender,
+                spill_file_id,
+                disk_offload_dir,
             );
         }
     }
@@ -234,6 +294,11 @@ pub(crate) fn drain_spsc_shared(
             autovacuum_daemon,
             aof_pool, // FIX-W1-2: thread AOF pool through SPSC drain
             wal_kv_log,
+            evict_active,
+            runtime_config,
+            spill_sender,
+            spill_file_id,
+            disk_offload_dir,
         );
     }
 
@@ -288,6 +353,14 @@ pub(crate) fn handle_shard_message_shared(
     // Whether KV command records should be logged to the per-shard WAL
     // (`--wal-kv-log`; see wal_append_and_fanout).
     wal_kv_log: bool,
+    // M2 fix: precomputed `maxmemory != 0 || disk-offload configured` (see
+    // `drain_spsc_shared`) — skips the eviction gate call (and its lock
+    // acquire) entirely on the common non-memory-bound path.
+    evict_active: bool,
+    runtime_config: &Arc<parking_lot::RwLock<RuntimeConfig>>,
+    spill_sender: Option<&flume::Sender<SpillRequest>>,
+    spill_file_id: &Rc<Cell<u64>>,
+    disk_offload_dir: Option<&std::path::Path>,
 ) {
     match msg {
         ShardMessage::Execute {
@@ -535,6 +608,12 @@ pub(crate) fn handle_shard_message_shared(
                                 // Refresh expiry clock on BOTH dbs to mirror the
                                 // single-DB write path: expired src/dst keys must
                                 // resolve correctly before copy_core inspects them.
+                                // M2 fix: unlike MOVE (net-zero — the key leaves src
+                                // as it lands in dst), cross-db COPY duplicates the
+                                // value, so it must run the same eviction gate as any
+                                // other write. Gate on the DESTINATION db (the one
+                                // that grows) before copy_core, mirroring the
+                                // is_write gate below.
                                 crate::shard::slice::with_shard(|s| {
                                     ksmv::with_two_slice_dbs(
                                         &mut s.databases,
@@ -543,6 +622,20 @@ pub(crate) fn handle_shard_message_shared(
                                         |src, dst| {
                                             src.refresh_now_from_cache(cached_clock);
                                             dst.refresh_now_from_cache(cached_clock);
+                                            if evict_active {
+                                                if let Err(oom) = spsc_eviction_gate(
+                                                    dst,
+                                                    ca.dst_db,
+                                                    shard_databases,
+                                                    shard_id,
+                                                    runtime_config,
+                                                    spill_sender,
+                                                    spill_file_id,
+                                                    disk_offload_dir,
+                                                ) {
+                                                    return oom;
+                                                }
+                                            }
                                             ksmv::copy_core(
                                                 src,
                                                 dst,
@@ -584,115 +677,142 @@ pub(crate) fn handle_shard_message_shared(
 
                 // COW intercept: capture old value before write if snapshot is active
                 let is_write = metadata::is_write(cmd);
+                // M2 fix: OOM/eviction gate for the target shard, run BEFORE
+                // COW intercept/dispatch (same order as handler_monoio's
+                // write path) — a remote-shard write leg must not be able to
+                // grow memory past `maxmemory` just because it arrived via
+                // SPSC instead of a local connection.
+                let mut oom_frame: Option<crate::protocol::Frame> = None;
                 // write_db and text_store (HSET auto-index) accessed in one with_shard
                 // closure to avoid re-entrant borrow (multi-resource arm).
                 let frame = {
                     if is_write {
                         crate::shard::slice::with_shard_db(db_idx, |db| {
+                            if evict_active {
+                                if let Err(oom) = spsc_eviction_gate(
+                                    db,
+                                    db_idx,
+                                    shard_databases,
+                                    shard_id,
+                                    runtime_config,
+                                    spill_sender,
+                                    spill_file_id,
+                                    disk_offload_dir,
+                                ) {
+                                    oom_frame = Some(oom);
+                                    return;
+                                }
+                            }
                             cow_intercept(snapshot_state, db, db_idx, &command);
                         });
                     }
-                    crate::shard::slice::with_shard(|s| {
-                        let db = &mut s.databases[db_idx];
-                        db.refresh_now_from_cache(cached_clock);
-                        let mut selected = db_idx;
-                        let result = cmd_dispatch(db, cmd, args, &mut selected, db_count);
-                        let frame = match result {
-                            DispatchResult::Response(f) => f,
-                            DispatchResult::Quit(f) => f,
-                        };
+                    if let Some(oom) = oom_frame.take() {
+                        oom
+                    } else {
+                        crate::shard::slice::with_shard(|s| {
+                            let db = &mut s.databases[db_idx];
+                            db.refresh_now_from_cache(cached_clock);
+                            let mut selected = db_idx;
+                            let result = cmd_dispatch(db, cmd, args, &mut selected, db_count);
+                            let frame = match result {
+                                DispatchResult::Response(f) => f,
+                                DispatchResult::Quit(f) => f,
+                            };
 
-                        // WAL append + replication fan-out for successful write commands
-                        let mut aof_ok = true;
-                        if is_write && !matches!(frame, crate::protocol::Frame::Error(_)) {
-                            let serialized = aof::serialize_command(&command);
-                            let mut aof_budget =
-                                crate::persistence::aof::AOF_SPSC_BACKPRESSURE_BOUND;
-                            aof_ok = wal_append_and_fanout(
-                                &serialized,
-                                wal_writer,
-                                wal_v3_writer,
-                                repl_backlog,
-                                replica_txs,
-                                repl_state,
-                                shard_id,
-                                aof_pool, // FIX-W1-2
-                                wal_kv_log,
-                                &mut aof_budget,
-                            );
-                        }
+                            // WAL append + replication fan-out for successful write commands
+                            let mut aof_ok = true;
+                            if is_write && !matches!(frame, crate::protocol::Frame::Error(_)) {
+                                let serialized = aof::serialize_command(&command);
+                                let mut aof_budget =
+                                    crate::persistence::aof::AOF_SPSC_BACKPRESSURE_BOUND;
+                                aof_ok = wal_append_and_fanout(
+                                    &serialized,
+                                    wal_writer,
+                                    wal_v3_writer,
+                                    repl_backlog,
+                                    replica_txs,
+                                    repl_state,
+                                    shard_id,
+                                    aof_pool, // FIX-W1-2
+                                    wal_kv_log,
+                                    &mut aof_budget,
+                                );
+                            }
 
-                        // Post-dispatch wakeup hooks for producer commands (cross-shard blocking)
-                        if !matches!(frame, crate::protocol::Frame::Error(_)) {
-                            let needs_wake = cmd.eq_ignore_ascii_case(b"LPUSH")
-                                || cmd.eq_ignore_ascii_case(b"RPUSH")
-                                || cmd.eq_ignore_ascii_case(b"LMOVE")
-                                || cmd.eq_ignore_ascii_case(b"ZADD")
-                                || cmd.eq_ignore_ascii_case(b"XADD");
-                            if needs_wake {
-                                let wake_key = if cmd.eq_ignore_ascii_case(b"LMOVE") {
-                                    args.get(1)
-                                        .and_then(|f| crate::server::connection::extract_bytes(f))
-                                } else {
-                                    args.first()
-                                        .and_then(|f| crate::server::connection::extract_bytes(f))
-                                };
-                                if let Some(key) = wake_key {
-                                    let mut reg = blocking_registry.borrow_mut();
-                                    if cmd.eq_ignore_ascii_case(b"LPUSH")
-                                        || cmd.eq_ignore_ascii_case(b"RPUSH")
-                                        || cmd.eq_ignore_ascii_case(b"LMOVE")
-                                    {
-                                        crate::blocking::wakeup::try_wake_list_waiter(
-                                            &mut reg, db, db_idx, &key,
-                                        );
-                                    } else if cmd.eq_ignore_ascii_case(b"ZADD") {
-                                        crate::blocking::wakeup::try_wake_zset_waiter(
-                                            &mut reg, db, db_idx, &key,
-                                        );
+                            // Post-dispatch wakeup hooks for producer commands (cross-shard blocking)
+                            if !matches!(frame, crate::protocol::Frame::Error(_)) {
+                                let needs_wake = cmd.eq_ignore_ascii_case(b"LPUSH")
+                                    || cmd.eq_ignore_ascii_case(b"RPUSH")
+                                    || cmd.eq_ignore_ascii_case(b"LMOVE")
+                                    || cmd.eq_ignore_ascii_case(b"ZADD")
+                                    || cmd.eq_ignore_ascii_case(b"XADD");
+                                if needs_wake {
+                                    let wake_key = if cmd.eq_ignore_ascii_case(b"LMOVE") {
+                                        args.get(1).and_then(|f| {
+                                            crate::server::connection::extract_bytes(f)
+                                        })
                                     } else {
-                                        crate::blocking::wakeup::try_wake_stream_waiter(
-                                            &mut reg, db, db_idx, &key,
-                                        );
+                                        args.first().and_then(|f| {
+                                            crate::server::connection::extract_bytes(f)
+                                        })
+                                    };
+                                    if let Some(key) = wake_key {
+                                        let mut reg = blocking_registry.borrow_mut();
+                                        if cmd.eq_ignore_ascii_case(b"LPUSH")
+                                            || cmd.eq_ignore_ascii_case(b"RPUSH")
+                                            || cmd.eq_ignore_ascii_case(b"LMOVE")
+                                        {
+                                            crate::blocking::wakeup::try_wake_list_waiter(
+                                                &mut reg, db, db_idx, &key,
+                                            );
+                                        } else if cmd.eq_ignore_ascii_case(b"ZADD") {
+                                            crate::blocking::wakeup::try_wake_zset_waiter(
+                                                &mut reg, db, db_idx, &key,
+                                            );
+                                        } else {
+                                            crate::blocking::wakeup::try_wake_stream_waiter(
+                                                &mut reg, db, db_idx, &key,
+                                            );
+                                        }
                                     }
                                 }
                             }
-                        }
 
-                        // Auto-index: if HSET succeeded and key matches a vector index prefix,
-                        // extract the vector field and append to mutable segment.
-                        // vector_store and text_store accessed here (same with_shard closure).
-                        if cmd.eq_ignore_ascii_case(b"HSET")
-                            && !matches!(frame, crate::protocol::Frame::Error(_))
-                        {
-                            if let Some(crate::protocol::Frame::BulkString(key_bytes)) =
-                                args.first()
+                            // Auto-index: if HSET succeeded and key matches a vector index prefix,
+                            // extract the vector field and append to mutable segment.
+                            // vector_store and text_store accessed here (same with_shard closure).
+                            if cmd.eq_ignore_ascii_case(b"HSET")
+                                && !matches!(frame, crate::protocol::Frame::Error(_))
                             {
-                                // Plan 166-01: return value (index_name, key_hash)
-                                // tuples will be consumed by Plan 166-02 to record
-                                // VectorIntents on the active CrossStoreTxn. Discarded
-                                // here because this path is not txn-aware yet.
-                                let _ = auto_index_hset(
-                                    &mut s.vector_store,
-                                    &mut s.text_store,
-                                    key_bytes,
-                                    args,
-                                    0,
-                                );
+                                if let Some(crate::protocol::Frame::BulkString(key_bytes)) =
+                                    args.first()
+                                {
+                                    // Plan 166-01: return value (index_name, key_hash)
+                                    // tuples will be consumed by Plan 166-02 to record
+                                    // VectorIntents on the active CrossStoreTxn. Discarded
+                                    // here because this path is not txn-aware yet.
+                                    let _ = auto_index_hset(
+                                        &mut s.vector_store,
+                                        &mut s.text_store,
+                                        key_bytes,
+                                        args,
+                                        0,
+                                    );
+                                }
                             }
-                        }
 
-                        // Fail-loud: the mutation is applied (wake/auto-index above
-                        // ran on real state), but the client must not see success
-                        // for a write whose AOF record was dropped.
-                        if aof_ok {
-                            frame
-                        } else {
-                            crate::protocol::Frame::Error(bytes::Bytes::from_static(
-                                AOF_APPEND_LOST_ERR,
-                            ))
-                        }
-                    })
+                            // Fail-loud: the mutation is applied (wake/auto-index above
+                            // ran on real state), but the client must not see success
+                            // for a write whose AOF record was dropped.
+                            if aof_ok {
+                                frame
+                            } else {
+                                crate::protocol::Frame::Error(bytes::Bytes::from_static(
+                                    AOF_APPEND_LOST_ERR,
+                                ))
+                            }
+                        })
+                    }
                 };
 
                 // Auto-delete is a vector_store-only operation; runs outside the gate.
@@ -740,6 +860,23 @@ pub(crate) fn handle_shard_message_shared(
 
                     let is_write = metadata::is_write(cmd);
                     if is_write {
+                        // M2 fix: same gate as the Execute arm, applied per
+                        // command in this batch's shared `guard` borrow.
+                        if evict_active {
+                            if let Err(oom) = spsc_eviction_gate(
+                                guard,
+                                db_idx,
+                                shard_databases,
+                                shard_id,
+                                runtime_config,
+                                spill_sender,
+                                spill_file_id,
+                                disk_offload_dir,
+                            ) {
+                                results.push(oom);
+                                continue;
+                            }
+                        }
                         cow_intercept(snapshot_state, guard, db_idx, cmd_frame);
                     }
 
@@ -853,6 +990,23 @@ pub(crate) fn handle_shard_message_shared(
 
                     let is_write = metadata::is_write(cmd);
                     if is_write {
+                        // M2 fix: same gate as the Execute arm, applied per
+                        // command in this batch's shared `guard` borrow.
+                        if evict_active {
+                            if let Err(oom) = spsc_eviction_gate(
+                                guard,
+                                db_idx,
+                                shard_databases,
+                                shard_id,
+                                runtime_config,
+                                spill_sender,
+                                spill_file_id,
+                                disk_offload_dir,
+                            ) {
+                                results.push(oom);
+                                continue;
+                            }
+                        }
                         cow_intercept(snapshot_state, guard, db_idx, cmd_frame);
                     }
 
@@ -1010,87 +1164,110 @@ pub(crate) fn handle_shard_message_shared(
 
             {
                 let is_write = metadata::is_write(cmd);
+                // M2 fix: see the Execute arm for rationale/ordering.
+                let mut oom_frame: Option<crate::protocol::Frame> = None;
                 let frame = {
                     if is_write {
                         crate::shard::slice::with_shard_db(db_idx, |db| {
+                            if evict_active {
+                                if let Err(oom) = spsc_eviction_gate(
+                                    db,
+                                    db_idx,
+                                    shard_databases,
+                                    shard_id,
+                                    runtime_config,
+                                    spill_sender,
+                                    spill_file_id,
+                                    disk_offload_dir,
+                                ) {
+                                    oom_frame = Some(oom);
+                                    return;
+                                }
+                            }
                             cow_intercept(snapshot_state, db, db_idx, &command);
                         });
                     }
-                    crate::shard::slice::with_shard(|s| {
-                        let db = &mut s.databases[db_idx];
-                        db.refresh_now_from_cache(cached_clock);
-                        let mut selected = db_idx;
-                        let result = cmd_dispatch(db, cmd, args, &mut selected, db_count);
-                        let frame = match result {
-                            DispatchResult::Response(f) => f,
-                            DispatchResult::Quit(f) => f,
-                        };
+                    if let Some(oom) = oom_frame.take() {
+                        oom
+                    } else {
+                        crate::shard::slice::with_shard(|s| {
+                            let db = &mut s.databases[db_idx];
+                            db.refresh_now_from_cache(cached_clock);
+                            let mut selected = db_idx;
+                            let result = cmd_dispatch(db, cmd, args, &mut selected, db_count);
+                            let frame = match result {
+                                DispatchResult::Response(f) => f,
+                                DispatchResult::Quit(f) => f,
+                            };
 
-                        let mut aof_ok = true;
-                        if is_write && !matches!(frame, crate::protocol::Frame::Error(_)) {
-                            let serialized = aof::serialize_command(&command);
-                            let mut aof_budget =
-                                crate::persistence::aof::AOF_SPSC_BACKPRESSURE_BOUND;
-                            aof_ok = wal_append_and_fanout(
-                                &serialized,
-                                wal_writer,
-                                wal_v3_writer,
-                                repl_backlog,
-                                replica_txs,
-                                repl_state,
-                                shard_id,
-                                aof_pool, // FIX-W1-2
-                                wal_kv_log,
-                                &mut aof_budget,
-                            );
-                        }
+                            let mut aof_ok = true;
+                            if is_write && !matches!(frame, crate::protocol::Frame::Error(_)) {
+                                let serialized = aof::serialize_command(&command);
+                                let mut aof_budget =
+                                    crate::persistence::aof::AOF_SPSC_BACKPRESSURE_BOUND;
+                                aof_ok = wal_append_and_fanout(
+                                    &serialized,
+                                    wal_writer,
+                                    wal_v3_writer,
+                                    repl_backlog,
+                                    replica_txs,
+                                    repl_state,
+                                    shard_id,
+                                    aof_pool, // FIX-W1-2
+                                    wal_kv_log,
+                                    &mut aof_budget,
+                                );
+                            }
 
-                        if !matches!(frame, crate::protocol::Frame::Error(_)) {
-                            let needs_wake = cmd.eq_ignore_ascii_case(b"LPUSH")
-                                || cmd.eq_ignore_ascii_case(b"RPUSH")
-                                || cmd.eq_ignore_ascii_case(b"LMOVE")
-                                || cmd.eq_ignore_ascii_case(b"ZADD")
-                                || cmd.eq_ignore_ascii_case(b"XADD");
-                            if needs_wake {
-                                let wake_key = if cmd.eq_ignore_ascii_case(b"LMOVE") {
-                                    args.get(1)
-                                        .and_then(|f| crate::server::connection::extract_bytes(f))
-                                } else {
-                                    args.first()
-                                        .and_then(|f| crate::server::connection::extract_bytes(f))
-                                };
-                                if let Some(key) = wake_key {
-                                    let mut reg = blocking_registry.borrow_mut();
-                                    if cmd.eq_ignore_ascii_case(b"LPUSH")
-                                        || cmd.eq_ignore_ascii_case(b"RPUSH")
-                                        || cmd.eq_ignore_ascii_case(b"LMOVE")
-                                    {
-                                        crate::blocking::wakeup::try_wake_list_waiter(
-                                            &mut reg, db, db_idx, &key,
-                                        );
-                                    } else if cmd.eq_ignore_ascii_case(b"ZADD") {
-                                        crate::blocking::wakeup::try_wake_zset_waiter(
-                                            &mut reg, db, db_idx, &key,
-                                        );
+                            if !matches!(frame, crate::protocol::Frame::Error(_)) {
+                                let needs_wake = cmd.eq_ignore_ascii_case(b"LPUSH")
+                                    || cmd.eq_ignore_ascii_case(b"RPUSH")
+                                    || cmd.eq_ignore_ascii_case(b"LMOVE")
+                                    || cmd.eq_ignore_ascii_case(b"ZADD")
+                                    || cmd.eq_ignore_ascii_case(b"XADD");
+                                if needs_wake {
+                                    let wake_key = if cmd.eq_ignore_ascii_case(b"LMOVE") {
+                                        args.get(1).and_then(|f| {
+                                            crate::server::connection::extract_bytes(f)
+                                        })
                                     } else {
-                                        crate::blocking::wakeup::try_wake_stream_waiter(
-                                            &mut reg, db, db_idx, &key,
-                                        );
+                                        args.first().and_then(|f| {
+                                            crate::server::connection::extract_bytes(f)
+                                        })
+                                    };
+                                    if let Some(key) = wake_key {
+                                        let mut reg = blocking_registry.borrow_mut();
+                                        if cmd.eq_ignore_ascii_case(b"LPUSH")
+                                            || cmd.eq_ignore_ascii_case(b"RPUSH")
+                                            || cmd.eq_ignore_ascii_case(b"LMOVE")
+                                        {
+                                            crate::blocking::wakeup::try_wake_list_waiter(
+                                                &mut reg, db, db_idx, &key,
+                                            );
+                                        } else if cmd.eq_ignore_ascii_case(b"ZADD") {
+                                            crate::blocking::wakeup::try_wake_zset_waiter(
+                                                &mut reg, db, db_idx, &key,
+                                            );
+                                        } else {
+                                            crate::blocking::wakeup::try_wake_stream_waiter(
+                                                &mut reg, db, db_idx, &key,
+                                            );
+                                        }
                                     }
                                 }
                             }
-                        }
 
-                        // Fail-loud: mutation applied, but the client must not
-                        // see success for a write whose AOF record was dropped.
-                        if aof_ok {
-                            frame
-                        } else {
-                            crate::protocol::Frame::Error(bytes::Bytes::from_static(
-                                AOF_APPEND_LOST_ERR,
-                            ))
-                        }
-                    })
+                            // Fail-loud: mutation applied, but the client must not
+                            // see success for a write whose AOF record was dropped.
+                            if aof_ok {
+                                frame
+                            } else {
+                                crate::protocol::Frame::Error(bytes::Bytes::from_static(
+                                    AOF_APPEND_LOST_ERR,
+                                ))
+                            }
+                        })
+                    }
                 };
                 // Arc-owned slot: deref is safe, refcount keeps it alive.
                 let slot = &*response_slot.0;
@@ -1124,6 +1301,23 @@ pub(crate) fn handle_shard_message_shared(
 
                     let is_write = metadata::is_write(cmd);
                     if is_write {
+                        // M2 fix: same gate as the Execute arm, applied per
+                        // command in this batch's shared `guard` borrow.
+                        if evict_active {
+                            if let Err(oom) = spsc_eviction_gate(
+                                guard,
+                                db_idx,
+                                shard_databases,
+                                shard_id,
+                                runtime_config,
+                                spill_sender,
+                                spill_file_id,
+                                disk_offload_dir,
+                            ) {
+                                results.push(oom);
+                                continue;
+                            }
+                        }
                         cow_intercept(snapshot_state, guard, db_idx, cmd_frame);
                     }
 
@@ -1238,6 +1432,23 @@ pub(crate) fn handle_shard_message_shared(
 
                     let is_write = metadata::is_write(cmd);
                     if is_write {
+                        // M2 fix: same gate as the Execute arm, applied per
+                        // command in this batch's shared `guard` borrow.
+                        if evict_active {
+                            if let Err(oom) = spsc_eviction_gate(
+                                guard,
+                                db_idx,
+                                shard_databases,
+                                shard_id,
+                                runtime_config,
+                                spill_sender,
+                                spill_file_id,
+                                disk_offload_dir,
+                            ) {
+                                results.push(oom);
+                                continue;
+                            }
+                        }
                         cow_intercept(snapshot_state, guard, db_idx, cmd_frame);
                     }
 
@@ -3153,6 +3364,10 @@ mod drain_cap_tests {
         let mut cdc = Vec::new();
         let mut manifest = None;
         let mut autovacuum = crate::shard::autovacuum::AutovacuumDaemon::new(Default::default());
+        // M2 fix: no shard context needed for this drain-cap test — maxmemory
+        // unset (evict_active == false) is the fast, no-op path.
+        let rtcfg = Arc::new(parking_lot::RwLock::new(RuntimeConfig::default()));
+        let spill_fid = Rc::new(Cell::new(1u64));
 
         // BlockCancel messages don't touch ShardSlice, so no init_shard needed.
         // First cycle: 300 queued > 256 cap -> drains exactly 256, reports tail.
@@ -3180,6 +3395,10 @@ mod drain_cap_tests {
             &mut autovacuum,
             None,
             true, // wal_kv_log
+            &rtcfg,
+            None,
+            &spill_fid,
+            None,
         );
         assert!(
             hit_cap,
@@ -3211,6 +3430,10 @@ mod drain_cap_tests {
             &mut autovacuum,
             None,
             true, // wal_kv_log
+            &rtcfg,
+            None,
+            &spill_fid,
+            None,
         );
         assert!(
             !hit_cap2,

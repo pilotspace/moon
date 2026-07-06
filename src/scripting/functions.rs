@@ -283,8 +283,14 @@ impl FunctionRegistry {
         let lua = Rc::new(mlua::Lua::new());
         crate::scripting::sandbox::setup_sandbox(&lua)
             .map_err(|e| LoadError::LuaError(e.to_string()))?;
-        crate::scripting::sandbox::register_redis_api(&lua)
-            .map_err(|e| LoadError::LuaError(e.to_string()))?;
+        // FCALL-internal writes: pre-existing, documented gap (no shard
+        // context is threaded through the function-library loader). Closing
+        // it is out of scope here — see tmp/OOM-SHIELD-CONTEXT.md.
+        crate::scripting::sandbox::register_redis_api(
+            &lua,
+            crate::scripting::bridge::LuaEvictionCtx::disabled(),
+        )
+        .map_err(|e| LoadError::LuaError(e.to_string()))?;
 
         // Create a table to store registered functions
         let func_table = lua

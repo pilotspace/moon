@@ -1210,6 +1210,10 @@ impl super::Shard {
                                 !appendonly_enabled || !cdc_registry.is_empty()
                             }
                         },
+                        &runtime_config,
+                        spill_sender.as_ref(),
+                        &spill_file_id,
+                        disk_offload_dir.as_deref(),
                     );
                     if hit_cap {
                         // M3: capped drain may have left a tail — re-arm immediately
@@ -1312,6 +1316,10 @@ impl super::Shard {
                                 !appendonly_enabled || !cdc_registry.is_empty()
                             }
                         },
+                        &runtime_config,
+                        spill_sender.as_ref(),
+                        &spill_file_id,
+                        disk_offload_dir.as_deref(),
                     );
                     if hit_cap {
                         // M3: capped drain may have left a tail — re-arm immediately
@@ -1890,6 +1898,10 @@ impl super::Shard {
                             !appendonly_enabled || !cdc_registry.is_empty()
                         }
                     },
+                    &runtime_config,
+                    spill_sender.as_ref(),
+                    &spill_file_id,
+                    disk_offload_dir.as_deref(),
                 );
                 if hit_cap {
                     // M3: the drain stopped at its per-cycle cap (or a snapshot

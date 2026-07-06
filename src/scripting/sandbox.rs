@@ -64,19 +64,28 @@ pub fn remove_timeout_hook(lua: &Lua) {
 ///
 /// Registers: redis.call, redis.pcall, redis.log, redis.error_reply,
 /// redis.status_reply, redis.sha1hex, and LOG_* level constants.
-pub fn register_redis_api(lua: &Lua) -> mlua::Result<()> {
+///
+/// `eviction_ctx` is threaded into the `redis.call`/`redis.pcall` closures so
+/// every WRITE invoked from a script runs the same `--maxmemory` gate the
+/// connection handlers use (M3 fix). Pass
+/// [`crate::scripting::bridge::LuaEvictionCtx::disabled()`] when no shard
+/// context is available (unit tests, FCALL's pre-existing documented gap).
+pub fn register_redis_api(
+    lua: &Lua,
+    eviction_ctx: crate::scripting::bridge::LuaEvictionCtx,
+) -> mlua::Result<()> {
     let redis_table = lua.create_table()?;
 
     // redis.call -- propagate errors as Lua errors
     redis_table.set(
         "call",
-        crate::scripting::bridge::make_redis_call_fn(lua, true)?,
+        crate::scripting::bridge::make_redis_call_fn(lua, true, eviction_ctx.clone())?,
     )?;
 
     // redis.pcall -- catch errors as {err = string} table
     redis_table.set(
         "pcall",
-        crate::scripting::bridge::make_redis_call_fn(lua, false)?,
+        crate::scripting::bridge::make_redis_call_fn(lua, false, eviction_ctx)?,
     )?;
 
     // redis.log(level, message)
