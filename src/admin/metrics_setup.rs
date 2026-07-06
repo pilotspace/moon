@@ -1360,6 +1360,7 @@ fn update_moon_memory_bytes() {
     let mut csr: usize = 0;
     let wal: usize = 0; // WalWriterV3 is stack-owned; not reachable here
     let mut backlog: usize = 0;
+    let mut lua: usize = 0;
 
     if let Some(shard_dbs) = get_global_shard_databases() {
         // KV memory: sum of per-shard published atomics. Lock-free.
@@ -1372,6 +1373,8 @@ fn update_moon_memory_bytes() {
             hnsw += mem.vector.load(Ordering::Relaxed);
             // graph is cfg-gated at publish time; the atomic is always present.
             csr += mem.graph.load(Ordering::Relaxed);
+            // C4 (wave-5 hygiene): Lua script-cache byte estimate.
+            lua += mem.lua.load(Ordering::Relaxed);
         }
     }
 
@@ -1382,7 +1385,7 @@ fn update_moon_memory_bytes() {
         }
     }
 
-    let other_sum = dashtable + hnsw + csr + wal + sealed + backlog;
+    let other_sum = dashtable + hnsw + csr + wal + sealed + backlog + lua;
     let alloc_overhead = rss.saturating_sub(other_sum);
 
     gauge!("moon_memory_bytes", "kind" => "dashtable").set(dashtable as f64);
@@ -1391,6 +1394,7 @@ fn update_moon_memory_bytes() {
     gauge!("moon_memory_bytes", "kind" => "wal").set(wal as f64);
     gauge!("moon_memory_bytes", "kind" => "sealed").set(sealed as f64);
     gauge!("moon_memory_bytes", "kind" => "replication_backlog").set(backlog as f64);
+    gauge!("moon_memory_bytes", "kind" => "lua_scripts").set(lua as f64);
     gauge!("moon_memory_bytes", "kind" => "allocator_overhead").set(alloc_overhead as f64);
 
     // Update the existing RSS gauge in the same snapshot so the integration

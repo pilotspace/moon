@@ -24,6 +24,10 @@ pub struct ShardStoreMemory {
     pub text: AtomicUsize,
     /// Resident bytes of GraphStore CSR segments.
     pub graph: AtomicUsize,
+    /// Approximate resident bytes of the shard's Lua `ScriptCache` (C4 wave-5
+    /// hygiene). The cache itself stays unbounded (Redis parity -- `SCRIPT
+    /// FLUSH` is the only eviction path); this is observability only.
+    pub lua: AtomicUsize,
 }
 
 /// Shared infrastructure handle — the residual cross-shard state after M5.
@@ -103,6 +107,7 @@ impl ShardDatabases {
                     vector: AtomicUsize::new(0),
                     text: AtomicUsize::new(0),
                     graph: AtomicUsize::new(0),
+                    lua: AtomicUsize::new(0),
                 })
             })
             .collect::<Vec<_>>()

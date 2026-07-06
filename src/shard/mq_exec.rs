@@ -557,6 +557,7 @@ mod tests {
                 vector: AtomicUsize::new(0),
                 text: AtomicUsize::new(0),
                 graph: AtomicUsize::new(0),
+                lua: AtomicUsize::new(0),
             }),
         })
     }

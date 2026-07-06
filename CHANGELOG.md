@@ -64,6 +64,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Vec<usize>` snapshot of all shards' published memory on every call.
   Switched to `SmallVec<[usize; 16]>` — stack-only for the common <=16
   shard case, unchanged single heap allocation beyond that.
+- **Item C4 — Lua script-cache byte estimate exposed via INFO/MEMORY
+  DOCTOR** (`src/scripting/cache.rs`, `ScriptCache::resident_bytes()`): the
+  per-shard Lua cache was invisible to observability — its growth folded
+  silently into "allocator overhead." Added a byte-estimate accounting
+  method, published per-shard via the existing C5/M4 `ShardStoreMemory`
+  tick pattern (new `lua` atomic), and surfaced in both the Prometheus
+  `moon_memory_bytes{kind="lua_scripts"}` gauge and `MEMORY DOCTOR`'s text
+  report. The cache itself remains intentionally unbounded (Redis parity —
+  `SCRIPT FLUSH` is the only eviction path); this is observability only.
 
 ### CI — fix Windows main-push test failures (PR #TBD)
 

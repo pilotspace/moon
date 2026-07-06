@@ -339,6 +339,7 @@ pub(crate) fn run_eviction_tick(
     page_cache: &Option<PageCache>,
     next_file_id: &mut u64,
     wal_v3_writer: &mut Option<crate::persistence::wal_v3::segment::WalWriterV3>,
+    script_cache: &std::rc::Rc<std::cell::RefCell<crate::scripting::ScriptCache>>,
     spill_file_id: &std::rc::Rc<std::cell::Cell<u64>>,
 ) {
     if let Some(spill_t) = spill_thread {
@@ -387,6 +388,12 @@ pub(crate) fn run_eviction_tick(
         }
         #[cfg(not(feature = "graph"))]
         s.store_memory.graph.store(0, Ordering::Relaxed);
+        // C4 (wave-5 hygiene): publish the shard's Lua script-cache byte
+        // estimate alongside vector/text/graph so INFO/MEMORY DOCTOR and
+        // Prometheus stop reporting a permanent zero for Lua memory.
+        s.store_memory
+            .lua
+            .store(script_cache.borrow().resident_bytes(), Ordering::Relaxed);
     });
 
     if server_config.disk_offload_enabled()
