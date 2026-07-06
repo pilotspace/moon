@@ -122,10 +122,17 @@ impl core::fmt::Display for PlanError {
     }
 }
 
-/// Plan cache: maps xxhash of Cypher string to compiled plan.
+/// Plan cache: maps xxhash of the (literal-normalized) Cypher text to a
+/// compiled plan, with LRU eviction.
+///
+/// Invariant: only READ-ONLY plans may be inserted. A cache hit in
+/// `graph_query_or_write` routes straight to the read path without
+/// re-parsing, so a cached write plan would mis-route.
 pub struct PlanCache {
-    cache: HashMap<u64, Arc<PhysicalPlan>>,
+    cache: HashMap<u64, (Arc<PhysicalPlan>, u64)>,
     max_entries: usize,
+    /// Monotonic access counter backing LRU eviction.
+    tick: u64,
 }
 
 impl PlanCache {
@@ -134,23 +141,36 @@ impl PlanCache {
         Self {
             cache: HashMap::new(),
             max_entries,
+            tick: 0,
         }
     }
 
-    /// Look up a cached plan by query hash.
-    pub fn get(&self, hash: u64) -> Option<Arc<PhysicalPlan>> {
-        self.cache.get(&hash).cloned()
+    /// Look up a cached plan by query hash, marking it most-recently-used.
+    pub fn get(&mut self, hash: u64) -> Option<Arc<PhysicalPlan>> {
+        self.tick += 1;
+        let tick = self.tick;
+        self.cache.get_mut(&hash).map(|(plan, used)| {
+            *used = tick;
+            plan.clone()
+        })
     }
 
-    /// Insert a plan into the cache. Evicts an arbitrary entry if at capacity.
+    /// Insert a plan, evicting the least-recently-used entry at capacity.
     pub fn insert(&mut self, hash: u64, plan: Arc<PhysicalPlan>) {
-        if self.cache.len() >= self.max_entries {
-            // Simple eviction: remove arbitrary key (HashMap has no ordering).
-            if let Some(&first_key) = self.cache.keys().next() {
-                self.cache.remove(&first_key);
+        self.tick += 1;
+        if self.cache.len() >= self.max_entries && !self.cache.contains_key(&hash) {
+            // O(capacity) scan; eviction only fires when a full cache takes a
+            // brand-new query text, which is rare once the workload warms up.
+            let lru = self
+                .cache
+                .iter()
+                .min_by_key(|(_, (_, used))| *used)
+                .map(|(k, _)| *k);
+            if let Some(lru) = lru {
+                self.cache.remove(&lru);
             }
         }
-        self.cache.insert(hash, plan);
+        self.cache.insert(hash, (plan, self.tick));
     }
 
     /// Number of cached plans.
@@ -742,6 +762,27 @@ mod tests {
         // Fill and evict
         cache.insert(43, plan.clone());
         cache.insert(44, plan.clone());
+        assert_eq!(cache.len(), 2);
+    }
+
+    #[test]
+    fn test_plan_cache_lru_eviction_order() {
+        let mut cache = PlanCache::new(2);
+        let plan = Arc::new(PhysicalPlan { operators: vec![] });
+        cache.insert(1, plan.clone());
+        cache.insert(2, plan.clone());
+        // Touch 1 so 2 becomes the least-recently-used entry.
+        assert!(cache.get(1).is_some());
+        cache.insert(3, plan.clone());
+        assert!(
+            cache.get(1).is_some(),
+            "recently-used entry must survive eviction"
+        );
+        assert!(
+            cache.get(2).is_none(),
+            "least-recently-used entry must be evicted"
+        );
+        assert!(cache.get(3).is_some());
         assert_eq!(cache.len(), 2);
     }
 
