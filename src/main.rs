@@ -93,6 +93,29 @@ fn main() -> anyhow::Result<()> {
         )
         .init();
 
+    // Fail-fast on shard-thread panics. Shard threads are joined only at
+    // shutdown, so an unwinding panic during normal operation would leave an
+    // N-1-shard server listening and answering while every key owned by the
+    // dead shard is silently gone — worse than a crash for a database. The
+    // default hook runs first so the panic message + backtrace still print.
+    // (Guarded by thread-name prefix: panics on connection/test/aux threads
+    // keep their normal unwind behavior.)
+    {
+        let default_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            default_hook(info);
+            let thread = std::thread::current();
+            let name = thread.name().unwrap_or("");
+            if name.starts_with("shard-") {
+                eprintln!(
+                    "FATAL: shard thread '{name}' panicked; aborting the whole \
+                     process rather than serving with a dead shard"
+                );
+                std::process::abort();
+            }
+        }));
+    }
+
     // ── moon.conf integration: build merged argv before clap parse ──────────
     // `merge_conf_argv` scans argv for a positional conf path (argv[1] not
     // starting with `-`) or `--config FILE`.  When found it loads and tokenises
@@ -1684,7 +1707,12 @@ fn main() -> anyhow::Result<()> {
     }
     cancel_token.cancel();
     for handle in shard_handles {
-        let _ = handle.join();
+        // A shard panic normally aborts via the panic hook above; if one
+        // still surfaces here (hook replaced, non-unwind edge), say so
+        // instead of silently swallowing it.
+        if let Err(e) = handle.join() {
+            tracing::error!("shard thread panicked during shutdown: {e:?}");
+        }
     }
 
     info!("Server shut down");
