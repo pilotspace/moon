@@ -37,6 +37,7 @@ impl core::fmt::Display for TraversalTimeout {
 /// for all hops, ensuring consistent graph visibility across the entire traversal.
 /// Each hop should call `check_timeout()` to verify the traversal has not exceeded
 /// its time budget.
+#[derive(Debug, Clone, Copy)]
 pub struct TraversalGuard {
     snapshot_lsn: u64,
     start: Instant,

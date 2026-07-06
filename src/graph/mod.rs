@@ -7,6 +7,7 @@ pub mod cross_shard;
 pub mod csr;
 pub mod cypher;
 pub mod fasthash;
+pub mod hnsw_bridge;
 pub mod hybrid;
 pub mod index;
 pub mod manifest;

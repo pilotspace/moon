@@ -323,6 +323,37 @@ impl CsrStorage {
         }
     }
 
+    /// Get-or-build this segment's HNSW bridge over v5 node embeddings
+    /// (hybrid HnswPreFilter). Built at most once per segment, and only when
+    /// it holds >= `BRIDGE_MIN_VECTORS` usable embeddings — the negative
+    /// answer is cached too, so small segments pay the scan exactly once.
+    /// Same `OnceLock` interior-mutability pattern as `incoming_index`.
+    pub fn hnsw_bridge(&self) -> Option<&crate::graph::hnsw_bridge::GraphHnsw> {
+        let cell = match self {
+            CsrStorage::Heap(s) => &s.hnsw_bridge,
+            CsrStorage::Mmap(s) => &s.hnsw_bridge,
+        };
+        cell.get_or_init(|| {
+            crate::graph::hnsw_bridge::GraphHnsw::build(
+                self,
+                crate::graph::hnsw_bridge::BRIDGE_MIN_VECTORS,
+            )
+        })
+        .as_ref()
+    }
+
+    /// Test hook: build the bridge regardless of the production minimum, so
+    /// small fixtures can exercise the HnswPreFilter path.
+    #[cfg(test)]
+    pub fn hnsw_bridge_for_test(&self) -> Option<&crate::graph::hnsw_bridge::GraphHnsw> {
+        let cell = match self {
+            CsrStorage::Heap(s) => &s.hnsw_bridge,
+            CsrStorage::Mmap(s) => &s.hnsw_bridge,
+        };
+        cell.get_or_init(|| crate::graph::hnsw_bridge::GraphHnsw::build(self, 1))
+            .as_ref()
+    }
+
     /// Node property blob (empty for pre-v5 segments).
     pub fn node_props_blob(&self) -> &[u8] {
         match self {

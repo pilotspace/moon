@@ -88,6 +88,10 @@ pub struct CsrSegment {
     pub incoming: std::sync::OnceLock<IncomingIndex>,
     /// Lazily built per-segment property indexes (see `SegmentPropertyIndexes`).
     pub props_index: std::sync::OnceLock<crate::graph::index::SegmentPropertyIndexes>,
+    /// Lazily-built HNSW bridge over this segment's v5 embeddings (hybrid
+    /// HnswPreFilter). DERIVED, in-memory only — never persisted. `None`
+    /// cached when the segment holds too few embeddings to earn one.
+    pub hnsw_bridge: std::sync::OnceLock<Option<crate::graph::hnsw_bridge::GraphHnsw>>,
 }
 
 impl CsrSegment {
@@ -268,6 +272,7 @@ impl CsrSegment {
             created_lsn: lsn,
             incoming: std::sync::OnceLock::new(),
             props_index: std::sync::OnceLock::new(),
+            hnsw_bridge: std::sync::OnceLock::new(),
         })
     }
 
@@ -883,6 +888,7 @@ impl CsrSegment {
             created_lsn,
             incoming: std::sync::OnceLock::new(),
             props_index: std::sync::OnceLock::new(),
+            hnsw_bridge: std::sync::OnceLock::new(),
         })
     }
 

@@ -221,6 +221,9 @@ pub enum ExecErrorKind {
     NodeNotFound,
     TypeError(String),
     Unsupported(String),
+    /// Traversal exceeded its wall-clock budget (bounded epoch hold —
+    /// checked per hop in variable-length Expand and per ShortestPath run).
+    Timeout(crate::graph::traversal_guard::TraversalTimeout),
 }
 
 impl core::fmt::Display for ExecError {
@@ -230,6 +233,7 @@ impl core::fmt::Display for ExecError {
             ExecErrorKind::NodeNotFound => write!(f, "node not found"),
             ExecErrorKind::TypeError(msg) => write!(f, "type error: {msg}"),
             ExecErrorKind::Unsupported(msg) => write!(f, "unsupported: {msg}"),
+            ExecErrorKind::Timeout(t) => write!(f, "{t}"),
         }
     }
 }
@@ -340,6 +344,11 @@ pub struct ExecutionContext {
     /// parsed from `GRAPH.QUERY ... --decay <lambda_per_sec>`.
     /// None = distance-only shortest paths (current behavior).
     pub decay: Option<crate::graph::scoring::DecayConfig>,
+    /// Wall-clock budget for multi-hop traversals (bounded epoch hold).
+    /// Checked once per hop in variable-length Expand and once per row in
+    /// ShortestPath; exceeding it returns `ExecErrorKind::Timeout`.
+    /// None = unbounded (current behavior; `Default` keeps tests unchanged).
+    pub guard: Option<crate::graph::traversal_guard::TraversalGuard>,
 }
 
 // ---------------------------------------------------------------------------
@@ -510,6 +519,113 @@ mod tests {
             execute(graph, &plan, &HashMap::new(), &ExecutionContext::default()).expect("exec");
 
         assert_eq!(result.rows.len(), 3);
+    }
+
+    /// Build a 3-node KNOWS chain (a -> b -> c) in graph "test".
+    fn chain_store() -> GraphStore {
+        let mut store = GraphStore::new();
+        store
+            .create_graph(Bytes::from_static(b"test"), 64_000, 0)
+            .expect("create ok");
+        let graph_mut = store.get_graph_mut(b"test").expect("graph");
+        let label_id = label_to_id(b"Person");
+        let etype = label_to_id(b"KNOWS");
+        let keys: Vec<NodeKey> = (0..3)
+            .map(|i| {
+                graph_mut.write_buf.add_node(
+                    SmallVec::from_elem(label_id, 1),
+                    SmallVec::new(),
+                    None,
+                    i,
+                )
+            })
+            .collect();
+        for w in keys.windows(2) {
+            graph_mut
+                .write_buf
+                .add_edge(w[0], w[1], etype, 1.0, None, 3)
+                .expect("edge");
+        }
+        store
+    }
+
+    #[test]
+    fn test_guard_timeout_var_length_expand() {
+        let store = chain_store();
+        let query = crate::graph::cypher::parse_cypher(b"MATCH (a:Person)-[*1..3]->(b) RETURN b")
+            .expect("parse");
+        let plan = crate::graph::cypher::planner::compile(&query).expect("compile");
+        let graph = store.get_graph(b"test").expect("graph");
+
+        // Expired guard: the first hop's check must abort with Timeout.
+        let ctx = ExecutionContext {
+            guard: Some(crate::graph::traversal_guard::TraversalGuard::new(
+                0,
+                std::time::Duration::ZERO,
+            )),
+            ..Default::default()
+        };
+        let Err(err) = execute(graph, &plan, &HashMap::new(), &ctx) else {
+            panic!("must time out");
+        };
+        assert!(
+            matches!(err.kind, ExecErrorKind::Timeout(_)),
+            "expected Timeout, got {:?}",
+            err.kind
+        );
+        assert!(format!("{err}").contains("traversal timeout"));
+
+        // Same query under a generous guard matches the guard-less result.
+        let ctx_ok = ExecutionContext {
+            guard: Some(crate::graph::traversal_guard::TraversalGuard::with_default_timeout(0)),
+            ..Default::default()
+        };
+        let with_guard = execute(graph, &plan, &HashMap::new(), &ctx_ok).expect("exec");
+        let without =
+            execute(graph, &plan, &HashMap::new(), &ExecutionContext::default()).expect("exec");
+        assert_eq!(with_guard.rows.len(), without.rows.len());
+        assert_eq!(with_guard.rows.len(), 3, "b, c from a; c from b");
+    }
+
+    #[test]
+    fn test_guard_timeout_shortest_path() {
+        let store = chain_store();
+        let query = crate::graph::cypher::parse_cypher(
+            b"MATCH p = shortestPath((a:Person)-[*..5]->(b:Person)) RETURN p",
+        )
+        .expect("parse");
+        let plan = crate::graph::cypher::planner::compile(&query).expect("compile");
+        let graph = store.get_graph(b"test").expect("graph");
+
+        let ctx = ExecutionContext {
+            guard: Some(crate::graph::traversal_guard::TraversalGuard::new(
+                0,
+                std::time::Duration::ZERO,
+            )),
+            ..Default::default()
+        };
+        let Err(err) = execute(graph, &plan, &HashMap::new(), &ctx) else {
+            panic!("must time out");
+        };
+        assert!(
+            matches!(err.kind, ExecErrorKind::Timeout(_)),
+            "expected Timeout, got {:?}",
+            err.kind
+        );
+
+        // execute_profile shares the checks.
+        let Err(err) = execute_profile(graph, &plan, &HashMap::new(), &ctx) else {
+            panic!("must time out");
+        };
+        assert!(matches!(err.kind, ExecErrorKind::Timeout(_)));
+
+        // Generous guard: paths still found.
+        let ctx_ok = ExecutionContext {
+            guard: Some(crate::graph::traversal_guard::TraversalGuard::with_default_timeout(0)),
+            ..Default::default()
+        };
+        let ok = execute(graph, &plan, &HashMap::new(), &ctx_ok).expect("exec");
+        assert!(!ok.rows.is_empty(), "chain must yield shortest paths");
     }
 
     #[test]
