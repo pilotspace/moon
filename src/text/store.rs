@@ -1512,6 +1512,34 @@ impl TextStore {
         removed
     }
 
+    /// FLUSHALL/FLUSHDB parity (persistence-review R3): reset every text
+    /// index to an empty state (postings, term dicts, doc maps, TAG/NUMERIC
+    /// indexes) while KEEPING the FT.CREATE schema — mirroring restart
+    /// semantics. Without this, flushed hashes stayed matchable as ghost
+    /// documents until the next restart.
+    pub fn clear_all_contents(&mut self) {
+        #[cfg(feature = "text-index")]
+        {
+            let mut any = false;
+            for idx in self.indexes.values_mut() {
+                *idx = TextIndex::new_with_schema(
+                    idx.name.clone(),
+                    idx.key_prefixes.clone(),
+                    idx.text_fields.clone(),
+                    idx.tag_fields.clone(),
+                    idx.numeric_fields.clone(),
+                    idx.bm25_config.clone(),
+                );
+                any = true;
+            }
+            if any {
+                self.bump_version();
+            }
+        }
+        // Without the text-index feature no TextIndex constructor exists and
+        // no documents can have been indexed — nothing to clear.
+    }
+
     /// Get a read-only reference to a text index.
     pub fn get_index(&self, name: &[u8]) -> Option<&TextIndex> {
         self.indexes.get(name)

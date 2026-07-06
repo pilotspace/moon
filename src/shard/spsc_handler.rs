@@ -926,6 +926,21 @@ pub(crate) fn handle_shard_message_shared(
                         auto_delete_vectors(&mut s.vector_store, args);
                     }
 
+                    // R4: HDEL of an indexed vector field tombstones the vector.
+                    if !matches!(frame, crate::protocol::Frame::Error(_))
+                        && cmd.eq_ignore_ascii_case(b"HDEL")
+                    {
+                        auto_hdel_vectors(&mut s.vector_store, args);
+                    }
+
+                    // R3: FLUSHALL/FLUSHDB clears index contents (definitions kept).
+                    if !matches!(frame, crate::protocol::Frame::Error(_))
+                        && (cmd.eq_ignore_ascii_case(b"FLUSHDB")
+                            || cmd.eq_ignore_ascii_case(b"FLUSHALL"))
+                    {
+                        auto_flush_indexes(&mut s.vector_store, &mut s.text_store);
+                    }
+
                     // Post-dispatch wakeup hooks for producer commands (cross-shard blocking)
                     if !matches!(frame, crate::protocol::Frame::Error(_)) {
                         let needs_wake = cmd.eq_ignore_ascii_case(b"LPUSH")
@@ -1295,6 +1310,21 @@ pub(crate) fn handle_shard_message_shared(
                         && (cmd.eq_ignore_ascii_case(b"DEL") || cmd.eq_ignore_ascii_case(b"UNLINK"))
                     {
                         auto_delete_vectors(&mut s.vector_store, args);
+                    }
+
+                    // R4: HDEL of an indexed vector field tombstones the vector.
+                    if !matches!(frame, crate::protocol::Frame::Error(_))
+                        && cmd.eq_ignore_ascii_case(b"HDEL")
+                    {
+                        auto_hdel_vectors(&mut s.vector_store, args);
+                    }
+
+                    // R3: FLUSHALL/FLUSHDB clears index contents (definitions kept).
+                    if !matches!(frame, crate::protocol::Frame::Error(_))
+                        && (cmd.eq_ignore_ascii_case(b"FLUSHDB")
+                            || cmd.eq_ignore_ascii_case(b"FLUSHALL"))
+                    {
+                        auto_flush_indexes(&mut s.vector_store, &mut s.text_store);
                     }
 
                     if !matches!(frame, crate::protocol::Frame::Error(_)) {
@@ -2156,6 +2186,64 @@ pub fn auto_delete_vectors(vector_store: &mut VectorStore, args: &[crate::protoc
     for arg in args {
         if let Some(key) = crate::server::connection::extract_bytes(arg) {
             vector_store.mark_deleted_for_key(key.as_ref());
+        }
+    }
+}
+
+/// FLUSHALL/FLUSHDB parity (persistence-review R3): clear vector + text
+/// index CONTENTS while keeping the FT.CREATE definitions. Wire-parity
+/// requirement mirrors `auto_delete_vectors`: every dispatch path that runs
+/// the HSET auto-index hook must run this on a successful FLUSH, or flushed
+/// hashes stay searchable as ghost documents until restart.
+///
+/// Moon FT indexes are keyspace-global (the auto-index hook is not gated on
+/// the selected db), so FLUSHDB of any db clears all index contents — the
+/// same over-approximation the restart rescan would produce.
+pub fn auto_flush_indexes(
+    vector_store: &mut VectorStore,
+    text_store: &mut crate::text::store::TextStore,
+) {
+    vector_store.clear_all_contents();
+    text_store.clear_all_contents();
+}
+
+/// HDEL parity (persistence-review R4): a successful `HDEL key field...`
+/// that removes an index's VECTOR field must tombstone that key's vector in
+/// exactly the affected indexes — previously the vector stayed searchable
+/// until whole-key DEL or a re-HSET. After a successful HDEL the named
+/// fields are definitively absent from the hash, so tombstoning any index
+/// keyed on one of them always agrees with the hash state (fields that were
+/// already absent tombstone a mapping that should not exist anyway).
+///
+/// Known limitations (documented follow-ups): a multi-vector-field index
+/// tombstones the WHOLE document when any of its vector fields is removed
+/// (a later HSET re-indexes the remainder), and TEXT/TAG/NUMERIC field
+/// removal is not yet re-indexed.
+pub fn auto_hdel_vectors(vector_store: &mut VectorStore, args: &[crate::protocol::Frame]) {
+    let Some(key) = args
+        .first()
+        .and_then(crate::server::connection::extract_bytes)
+    else {
+        return;
+    };
+    let matching = vector_store.find_matching_index_names(key.as_ref());
+    for idx_name in matching {
+        let Some(idx) = vector_store.get_index(&idx_name) else {
+            continue;
+        };
+        let removed_vector_field = args[1..]
+            .iter()
+            .filter_map(crate::server::connection::extract_bytes)
+            .any(|field| {
+                idx.meta.source_field.as_ref() == field.as_ref()
+                    || idx
+                        .meta
+                        .vector_fields
+                        .iter()
+                        .any(|vf| vf.field_name.as_ref() == field.as_ref())
+            });
+        if removed_vector_field {
+            vector_store.mark_deleted_for_key_in_index(&idx_name, key.as_ref());
         }
     }
 }

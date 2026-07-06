@@ -6,6 +6,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — FLUSHALL/FLUSHDB ghost vectors + HDEL stale-vector gap
+
+- **FLUSHALL/FLUSHDB never touched the FT indexes** (persistence-review R3):
+  flushed hashes stayed searchable as ghost vectors/documents until restart.
+  Both commands now clear every vector + text index's CONTENTS (segments,
+  key-hash maps, postings, TAG/NUMERIC indexes) while KEEPING the FT.CREATE
+  definitions — matching restart semantics, where definitions come from the
+  sidecar and contents are re-derived from the (now empty) keyspace.
+  Recovered-but-unclaimed `pending_segments` are discarded too, so a
+  post-flush FT.CREATE cannot resurrect pre-flush contents.
+- **`HDEL key <vector-field>` left the vector searchable** (R4): only
+  whole-key DEL/UNLINK tombstoned. A successful HDEL that removes an
+  index's vector field now tombstones that key in exactly the affected
+  indexes (per-index `mark_deleted_for_key_in_index`; sibling indexes keyed
+  on other fields keep their entries). Known follow-ups documented in
+  `auto_hdel_vectors`: multi-vector-field indexes tombstone the whole doc,
+  and TEXT/TAG/NUMERIC field removal is not yet re-indexed.
+- Both hooks wired with wire-parity on ALL dispatch paths (single-shard,
+  monoio conn-local, tokio sharded, SPSC execute, shared batch, MULTI/EXEC).
+  New integration suite `tests/vector_flush_hdel_tombstone.rs` (red→green).
+
 ### Performance — AE-1: saturation-gated per-segment adaptive ef
 
 - With G graph segments, every segment searched at the FULL resolved ef —

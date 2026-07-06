@@ -1421,8 +1421,6 @@ pub(crate) async fn handle_connection_sharded_inner<
                                 }
                             }
                             // Auto-delete vectors on DEL/UNLINK (local write path)
-                            // Note: HDEL removes fields, not keys — it should NOT trigger
-                            // vector deletion unless the entire key is removed.
                             if !matches!(response, Frame::Error(_))
                                 && (cmd.eq_ignore_ascii_case(b"DEL") || cmd.eq_ignore_ascii_case(b"UNLINK"))
                             {
@@ -1433,6 +1431,32 @@ pub(crate) async fn handle_connection_sharded_inner<
                                             s.vector_store.mark_deleted_for_key(key.as_ref());
                                         }
                                     }
+                                });
+                            }
+                            // R4: HDEL of an indexed VECTOR field tombstones the vector
+                            // in exactly the affected indexes (whole-key deletion is the
+                            // DEL/UNLINK arm above; non-vector-field HDELs are no-ops).
+                            if !matches!(response, Frame::Error(_))
+                                && cmd.eq_ignore_ascii_case(b"HDEL")
+                            {
+                                crate::shard::slice::with_shard(|s| {
+                                    crate::shard::spsc_handler::auto_hdel_vectors(
+                                        &mut s.vector_store,
+                                        cmd_args,
+                                    );
+                                });
+                            }
+                            // R3: FLUSHALL/FLUSHDB clears vector + text index contents
+                            // (FT.CREATE definitions survive, matching restart semantics).
+                            if !matches!(response, Frame::Error(_))
+                                && (cmd.eq_ignore_ascii_case(b"FLUSHDB")
+                                    || cmd.eq_ignore_ascii_case(b"FLUSHALL"))
+                            {
+                                crate::shard::slice::with_shard(|s| {
+                                    crate::shard::spsc_handler::auto_flush_indexes(
+                                        &mut s.vector_store,
+                                        &mut s.text_store,
+                                    );
                                 });
                             }
                             // H1: durable path under appendfsync=always.

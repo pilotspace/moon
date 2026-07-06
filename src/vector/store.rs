@@ -1438,6 +1438,38 @@ impl VectorStore {
         }
     }
 
+    /// FLUSHALL/FLUSHDB parity (persistence-review R3): drop every index's
+    /// CONTENTS (segments, key-hash maps, payload/MVCC state) while KEEPING
+    /// the FT.CREATE definitions — mirroring restart semantics, where
+    /// definitions come from the sidecar and contents are re-derived from
+    /// the (now empty) keyspace. Without this, flushed hashes stayed
+    /// searchable as ghost vectors until the next restart.
+    pub fn clear_all_contents(&mut self) {
+        // FLUSH discards everything — recovered-but-unclaimed segments too,
+        // or a later FT.CREATE would resurrect pre-flush contents via the
+        // pending_segments claim in `create_index`.
+        self.pending_segments.clear();
+        let names: Vec<Bytes> = self.indexes.keys().cloned().collect();
+        for name in names {
+            let Some(index) = self.indexes.remove(&name) else {
+                continue;
+            };
+            // Tombstone warm segments so their on-disk directories are
+            // reclaimed once in-flight search snapshots drop (as drop_index).
+            let snapshot = index.segments.load();
+            for warm_seg in &snapshot.warm {
+                warm_seg.mark_tombstoned();
+            }
+            drop(snapshot);
+            let meta = index.meta.clone();
+            drop(index);
+            // Recreate from the same definition — a fresh, empty index.
+            // Also rewrites the sidecar and bumps the version token.
+            #[allow(clippy::unwrap_used)] // name was just removed above; create cannot collide
+            self.create_index(meta).unwrap();
+        }
+    }
+
     /// Get index reference by name.
     pub fn get_index(&self, name: &[u8]) -> Option<&VectorIndex> {
         self.indexes.get(name)
@@ -1493,28 +1525,49 @@ impl VectorStore {
         let key_hash = xxhash_rust::xxh64::xxh64(key, 0);
         let mut any_deleted = false;
         for idx_name in matching_names {
-            if let Some(idx) = self.indexes.get_mut(&idx_name) {
-                let snap = idx.segments.load();
-                // Tombstone in mutable segment (always present).
-                snap.mutable.mark_deleted_by_key_hash(key_hash, 1);
-                // Also tombstone any already-compacted immutable segments that
-                // may still contain the key (steady-state interior tombstone).
-                for imm in snap.immutable.iter() {
-                    imm.mark_deleted_by_key_hash(key_hash);
-                }
-                // QW7 (2026-06 review finding 6.3): prune the key-hash maps so
-                // they track LIVE keys, not historical inserts — without this
-                // they grow monotonically under key churn (~1GB / 24M deletes).
-                // A re-insert of the same key repopulates both maps.
-                Arc::make_mut(&mut idx.key_hash_to_key).remove(&key_hash);
-                idx.key_hash_to_global_id.remove(&key_hash);
-                any_deleted = true;
-            }
+            any_deleted |= self.tombstone_key_in_index(&idx_name, key_hash);
         }
         // Bump version AFTER any successful deletion mark.
         if any_deleted {
             self.bump_version();
         }
+    }
+
+    /// Per-index variant of [`Self::mark_deleted_for_key`] (persistence-review
+    /// R4): tombstones `key` in ONE named index. Used by the HDEL hook, where
+    /// only indexes whose vector field was actually removed may be touched —
+    /// a sibling index keyed on a different field must keep its entry.
+    pub fn mark_deleted_for_key_in_index(&mut self, idx_name: &[u8], key: &[u8]) {
+        let key_hash = xxhash_rust::xxh64::xxh64(key, 0);
+        let Some((name, _)) = self.indexes.get_key_value(idx_name) else {
+            return;
+        };
+        let name = name.clone();
+        if self.tombstone_key_in_index(&name, key_hash) {
+            self.bump_version();
+        }
+    }
+
+    fn tombstone_key_in_index(&mut self, idx_name: &Bytes, key_hash: u64) -> bool {
+        let Some(idx) = self.indexes.get_mut(idx_name) else {
+            return false;
+        };
+        let snap = idx.segments.load();
+        // Tombstone in mutable segment (always present).
+        snap.mutable.mark_deleted_by_key_hash(key_hash, 1);
+        // Also tombstone any already-compacted immutable segments that
+        // may still contain the key (steady-state interior tombstone).
+        for imm in snap.immutable.iter() {
+            imm.mark_deleted_by_key_hash(key_hash);
+        }
+        drop(snap);
+        // QW7 (2026-06 review finding 6.3): prune the key-hash maps so
+        // they track LIVE keys, not historical inserts — without this
+        // they grow monotonically under key churn (~1GB / 24M deletes).
+        // A re-insert of the same key repopulates both maps.
+        Arc::make_mut(&mut idx.key_hash_to_key).remove(&key_hash);
+        idx.key_hash_to_global_id.remove(&key_hash);
+        true
     }
 
     /// Dispatch background compactions for all indexes that are ready

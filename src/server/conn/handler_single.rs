@@ -1149,6 +1149,27 @@ pub async fn handle_connection(
                                                         &mut vs.lock(),
                                                         a,
                                                     );
+                                                } else if c.eq_ignore_ascii_case(b"HDEL")
+                                                    && i < txn_results.len()
+                                                    && !matches!(txn_results[i], Frame::Error(_))
+                                                {
+                                                    // R4 parity inside MULTI/EXEC.
+                                                    crate::shard::spsc_handler::auto_hdel_vectors(
+                                                        &mut vs.lock(),
+                                                        a,
+                                                    );
+                                                } else if (c.eq_ignore_ascii_case(b"FLUSHDB")
+                                                    || c.eq_ignore_ascii_case(b"FLUSHALL"))
+                                                    && i < txn_results.len()
+                                                    && !matches!(txn_results[i], Frame::Error(_))
+                                                {
+                                                    // R3 parity inside MULTI/EXEC (text
+                                                    // store cleared via its own guard or
+                                                    // the throwaway fallback store).
+                                                    vs.lock().clear_all_contents();
+                                                    if let Some(ref ts) = text_store {
+                                                        ts.lock().clear_all_contents();
+                                                    }
                                                 }
                                             }
                                         }
@@ -2244,6 +2265,32 @@ pub async fn handle_connection(
                                             &mut vs.lock(),
                                             d_args,
                                         );
+                                    }
+                                }
+
+                                // R4: HDEL of an indexed vector field tombstones it.
+                                if !matches!(&response, Frame::Error(_))
+                                    && d_cmd.eq_ignore_ascii_case(b"HDEL")
+                                {
+                                    if let Some(ref vs) = vector_store {
+                                        crate::shard::spsc_handler::auto_hdel_vectors(
+                                            &mut vs.lock(),
+                                            d_args,
+                                        );
+                                    }
+                                }
+
+                                // R3: FLUSHALL/FLUSHDB clears vector + text index
+                                // contents (FT.CREATE definitions survive).
+                                if !matches!(&response, Frame::Error(_))
+                                    && (d_cmd.eq_ignore_ascii_case(b"FLUSHDB")
+                                        || d_cmd.eq_ignore_ascii_case(b"FLUSHALL"))
+                                {
+                                    if let Some(ref vs) = vector_store {
+                                        vs.lock().clear_all_contents();
+                                    }
+                                    if let Some(ref ts) = text_store {
+                                        ts.lock().clear_all_contents();
                                     }
                                 }
 
