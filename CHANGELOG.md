@@ -77,6 +77,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`tests/quickwins_red_api.rs` broke the Windows CI leg at COMPILE time** (also red on main):
   `qw1_accepted_socket_has_nodelay` calls `apply_client_socket_opts`, which is `#[cfg(unix)]`
   (takes `AsFd`). The test (and its imports) are now unix-gated to match.
+- **`write_stall_segment_backlog`: two tests raced on the process-global
+  `RECL_SEGMENT_STALL_ACTIVE` atomic** (test harness runs same-binary tests on parallel
+  threads; observed on CI macOS as `store(1)` reading back `0`). All mutation of the global now
+  lives in one merged test.
 
 ### Fixed — FT.COMPACT left mutable residue behind when draining a background build (PR #TBD)
 
