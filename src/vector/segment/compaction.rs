@@ -1668,12 +1668,22 @@ fn verify_merge_recall(
 
         // HNSW search on the merged graph using f32 decoded centroids.
         // f32_bfs_flat has BFS-ordered vectors, `eff_dim` elements each.
+        //
+        // The query IS a database point (distance 0 → always rank 1), but the
+        // ground truth above excludes it. Request k+1 and drop the self-point
+        // so both sides compare k non-self neighbors — with a plain top-k the
+        // self-point consumes one slot and caps measurable recall at (k-1)/k
+        // = 0.90, which the manual force_merge gate (0.90) can never pass.
         let hnsw_results =
-            hnsw_search_f32(graph, &f32_bfs_flat, eff_dim, query, k, ef_verify, None);
+            hnsw_search_f32(graph, &f32_bfs_flat, eff_dim, query, k + 1, ef_verify, None);
         // hnsw_search_f32 returns original IDs (pre-BFS); convert to BFS positions
         // so they match the ground-truth set (which indexes all_decoded by BFS pos).
-        let hnsw_ids: std::collections::HashSet<u32> =
-            hnsw_results.iter().map(|r| graph.to_bfs(r.id.0)).collect();
+        let hnsw_ids: std::collections::HashSet<u32> = hnsw_results
+            .iter()
+            .map(|r| graph.to_bfs(r.id.0))
+            .filter(|&b| b != query_bfs as u32)
+            .take(k)
+            .collect();
 
         let overlap = gt_ids.intersection(&hnsw_ids).count();
         total_recall += overlap as f32 / k.min(gt_ids.len()).max(1) as f32;

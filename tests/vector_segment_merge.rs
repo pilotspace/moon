@@ -364,11 +364,17 @@ fn test_merge_mode_none_is_noop() {
     );
 }
 
-// ── Test 3a: recall gate REJECTS an impossible tolerance ──
+// ── Test 3a: recall gate REJECTS an unattainable tolerance (rollback path) ──
 //
-// The recall gate fires when n >= MIN_RECALL_SAMPLE_N (50). With 200 vectors in
-// 2 segments and tolerance=1.0 (impossible — real HNSW recall < 1.0), the gate
-// must return Err(RecallTooLow) and leave both segments intact.
+// The recall gate fires when n >= MIN_RECALL_SAMPLE_N (50). Recall is capped
+// at 1.0 by construction, so a tolerance ABOVE 1.0 deterministically trips
+// `recall < tolerance` — this test pins the Err(RecallTooLow) propagation and
+// the segments-left-intact rollback guarantee, independent of dataset
+// difficulty. (The pre-fix version used tolerance=1.0 and only rejected
+// because verify_merge_recall had a self-exclusion asymmetry capping
+// measurable recall at (k-1)/k = 0.9; honest recall on a clean merge is
+// exactly 1.0 — the merged graph is verified in the same decoded-centroid
+// space it was built in — so 1.0 no longer rejects.)
 
 #[test]
 fn test_recall_gate_rejects_impossible_tolerance() {
@@ -403,12 +409,12 @@ fn test_recall_gate_rejects_impossible_tolerance() {
         "Should have 2 segments before merge attempt"
     );
 
-    // tolerance=1.0 is impossible — HNSW recall on TQ4 @ 64d < 1.0 always.
-    // Gate must reject and return Err.
-    let result = store.force_merge_index_with_tolerance(b"idx3a", 1.0);
+    // tolerance > 1.0 is unattainable by construction (recall <= 1.0), so
+    // the gate must reject and return Err regardless of dataset difficulty.
+    let result = store.force_merge_index_with_tolerance(b"idx3a", 1.5);
     assert!(
         result.is_err(),
-        "Merge with tolerance=1.0 must be rejected by recall gate, but got: {:?}",
+        "Merge with tolerance=1.5 must be rejected by recall gate, but got: {:?}",
         result
     );
 
@@ -574,6 +580,7 @@ fn test_merge_overlapping_ids_highest_lsn_wins() {
         42,
         MergeMode::GraphUnion,
         0.90,
+        None,
     )
     .expect("merge failed");
 

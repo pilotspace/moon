@@ -6,6 +6,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — merge recall gate self-exclusion bias (manual merges could never pass)
+
+- `verify_merge_recall` compared HNSW results **including the query point**
+  (every sampled query is a database point, distance 0 → always rank 1)
+  against a ground truth that **excluded** it, structurally capping measurable
+  recall at (k−1)/k = 0.90 — exactly the manual `FT.COMPACT`/`VACUUM VECTOR`
+  merge gate, so any manual merge of an index with ≥ 50 vectors was rejected
+  with `merge recall 0.9000 < tolerance 0.9000` regardless of actual graph
+  quality (the 0.70 background gate masked this). The merged-graph search now
+  requests k+1 and drops the self-point before comparison.
+
+### Added — vector-index durability: kill-9 crash-recovery test suite (B4)
+
+- New `tests/crash_recovery_vector_durability.rs`: five end-to-end scenarios
+  against real server processes (SIGKILL + restart): unchanged-key dedup
+  fast path, update/delete reconcile, orphan sweep on boot, collection_id
+  pin surviving a post-recovery compact + GraphUnion merge, and a
+  no-persistence regression guard. All waits are bounded condition polls;
+  servers run with `--disk-free-min-pct 0` so the suite is immune to the
+  dev volume hovering at the 5% diskfull guard.
+
 ### Added — vector-index durability: startup recovery from disk (B1-B3)
 
 - **Vector indexes now persist their segments across restarts** instead of
