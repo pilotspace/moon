@@ -463,22 +463,17 @@ impl VectorIndex {
                 // submit time, if configured) — commit the keymap/manifest
                 // snapshot now that install is durable in memory.
                 self.persist_hook_after_install();
-                // After draining we're done — the data is compacted.
-                // Compact additional fields inline (no in-flight for those).
-                for (_, fs) in &mut self.field_segments {
-                    let dim = fs.collection.dimension;
-                    let mut unused_id = 0u64;
-                    Self::compact_segments(
-                        &mut fs.segments,
-                        &mut fs.scratch,
-                        &fs.collection,
-                        dim,
-                        0,
-                        None,
-                        &mut unused_id,
-                    );
-                }
-                return;
+                // Do NOT return here: inserts that landed WHILE the
+                // background build was in flight are still in the mutable
+                // tail (`clone_suffix(frozen_len)` above). An early return
+                // breaks force_compact's full-drain contract (FT.COMPACT:
+                // frozen == mutable on reply) and leaves those docs with no
+                // durable segment until some future compact fires — a kill
+                // -9 in that window relied on them being "verified
+                // unchanged" from a keymap that covers them while no
+                // segment does (the B3 phantom-entry hole). Fall through to
+                // the inline compact below, which is a no-op when the tail
+                // is empty and otherwise drains + persists it.
             }
             // Worker failed or dropped — fall through to inline compact below.
         }
@@ -3360,6 +3355,68 @@ mod bg_compact_tests {
             snap.immutable.len(),
             5,
             "500 vectors at threshold 100 must yield 5 bounded segments (bg path)"
+        );
+    }
+
+    /// Regression (red/green verified): `force_compact` draining an IN-FLIGHT
+    /// background build must ALSO compact the docs inserted while that build
+    /// was running (the `clone_suffix(frozen_len)` mutable tail). The old
+    /// early return left the tail mutable-only — no durable segment — until
+    /// some future compact fired, breaking FT.COMPACT's full-drain contract
+    /// (frozen == mutable on reply) and, combined with the B3 phantom-keymap
+    /// hole, silently losing those docs on a kill -9 (see
+    /// `crash_recovery_vector_durability` S1/S6). Deterministic regardless of
+    /// worker speed: `bg_compact_inflight` stays `Some` until installed, and
+    /// force_compact's drain blocks on the reply channel.
+    #[test]
+    fn test_force_compact_drains_tail_inserted_during_inflight_bg_build() {
+        distance::init();
+        let dim = 16u32;
+        let compactor = BackgroundCompactor::new(1);
+        let mut store = VectorStore::new();
+        let mut meta = make_idx(dim);
+        meta.compact_threshold = 100;
+        store.create_index(meta).unwrap();
+
+        // 100 docs -> due-gated background build freezes all of them.
+        for i in 0..100u64 {
+            insert(
+                &mut store,
+                format!("doc:{i}").as_bytes(),
+                random_vec(dim as usize, i),
+            );
+        }
+        store.begin_background_compactions(&compactor);
+        {
+            let idx = store.indexes.get_mut(b"idx".as_ref()).unwrap();
+            assert!(
+                idx.bg_compact_inflight.is_some(),
+                "sanity: a background build must be in flight"
+            );
+        }
+
+        // Tail: 30 more docs land while the background build is in flight.
+        for i in 100..130u64 {
+            insert(
+                &mut store,
+                format!("doc:{i}").as_bytes(),
+                random_vec(dim as usize, i),
+            );
+        }
+
+        store.force_compact_index(b"idx").unwrap();
+
+        let idx = store.indexes.get_mut(b"idx".as_ref()).unwrap();
+        let snap = idx.segments.load_full();
+        assert_eq!(
+            snap.mutable.len(),
+            0,
+            "force_compact must drain the tail inserted during the in-flight background build"
+        );
+        let live: u32 = snap.immutable.iter().map(|s| s.live_count()).sum();
+        assert_eq!(
+            live, 130,
+            "all docs must be segment-resident after force_compact"
         );
     }
 

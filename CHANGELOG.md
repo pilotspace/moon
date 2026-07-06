@@ -65,6 +65,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dropping the stale job's `Arc`s immediately; an in-flight (already-dequeued) job is unaffected.
   Submit never blocks the caller.
 
+### Fixed — FT.COMPACT left mutable residue behind when draining a background build (PR #TBD)
+
+- **Pre-existing** (`main`, not introduced by this branch): when an explicit
+  `FT.COMPACT`/`force_compact` found a background auto-compaction already in flight, it drained
+  that build, installed it, persisted, and returned — WITHOUT compacting the documents inserted
+  while the background build was running (the `clone_suffix(frozen_len)` mutable tail). Those
+  docs stayed mutable-only (no durable segment) until some future compact fired, breaking
+  force_compact's documented full-drain contract (frozen == mutable on reply) and — combined
+  with the B3 phantom-keymap hole below — silently losing them on a kill -9 (observed stuck
+  durable state: segments live=1961, keymap=2000, converging never). Load-dependent: only
+  reproduces when insert cadence keeps a background build in flight at FT.COMPACT time (this is
+  what made the crash suite's S1/S2 flake by machine load, masquerading as a branch regression).
+  `force_compact` now falls through to the inline drain loop after installing the in-flight
+  build (a no-op when the tail is empty).
+
+### Fixed — B3 vector recovery: phantom keymap entries silently dropped docs (PR #TBD)
+
+- **Pre-existing silent data loss on kill -9** (found while validating this branch against the
+  `crash_recovery_vector_durability` suite; reproduces on `main`): the durable
+  `keymap-<epoch>.bin` covers EVERY indexed key (mutable + immutable) at snapshot-submit time,
+  while the paired `manifest.json` lists only installed immutable segments. A crash landing after
+  one snapshot commits but before the next (covering a just-frozen segment) leaves the on-disk
+  keymap a strict superset of the on-disk segments. The B3 dedup rescan then "verified" those
+  uncovered keys as unchanged (keymap checksum matches the AOF blob — exactly the crash-window
+  signature) and never re-indexed them: their documents vanished from search with
+  `num_docs` under-reporting (observed: 1950/2000) while recovery logged
+  `verified unchanged` for all keys. Fix: `recover_v2::load_segments_and_keymap` now drops any
+  keymap entry whose `key_hash` is not LIVE in a loaded segment
+  (`ImmutableSegment::live_key_hashes`), so the rescan re-indexes those keys from the AOF; a
+  loud log line reports the dropped-phantom count. New deterministic unit regression
+  (`recover_reindexes_keymap_entries_not_backed_by_any_segment`, red/green verified) plus
+  integration scenario S6 (kill inside the async-snapshot window; asserts only the crash
+  contract: `num_docs == N`, every key answers its own exact-match query). S1/S2's
+  `re_indexed == 0` fast-path determinism is restored by a new full-durability pre-kill gate
+  (`wait_for_durable_docs`: manifest'd segment live-counts AND keymap entries both equal N).
+
 ### Fixed — zombie/CPU hardening wave 1 (PR #TBD)
 
 - **Busy-poll spin idle-disengages** (`--io-busy-poll-us` / vendored monoio

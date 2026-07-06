@@ -5,12 +5,14 @@
 //! persist-on-compact (B1/B2), and startup recovery + dedup rescan +
 //! deletion probe + orphan sweep (B3, `src/vector/persistence/recover_v2.rs`).
 //!
-//! Five scenarios, one `#[test]` each, sharing the harness below:
+//! Six scenarios, one `#[test]` each, sharing the harness below:
 //!   S1 unchanged-keys fast path (dedup rescan skips re-encoding)
 //!   S2 updates+deletes across a crash (reconcile + deletion probe)
 //!   S3 orphan sweep (stray staging/segment/keymap files removed on boot)
 //!   S4 collection_id pin survives a post-recovery compact+GraphUnion merge
 //!   S5 no-persist-dir regression guard (`--appendonly no`: no idx-* dirs)
+//!   S6 crash inside the async-snapshot window (durable keymap ⊃ durable
+//!      segments): uncovered keys re-index from the AOF, nothing silently lost
 //!
 //! Every wait is a bounded, condition-based poll (port accept / manifest
 //! file / log line / FT.INFO field) — never a fixed sleep as
@@ -222,8 +224,20 @@ fn spawn_moon_aof(port: u16, dir: &Path) -> ServerGuard {
         ])
         .arg(dir)
         .env("RUST_LOG", "moon=info")
-        .stdout(std::fs::File::create(dir.join("moon.stdout.log")).expect("stdout log"))
-        .stderr(std::fs::File::create(dir.join("moon.stderr.log")).expect("stderr log"))
+        .stdout(
+            std::fs::File::options()
+                .append(true)
+                .create(true)
+                .open(dir.join("moon.stdout.log"))
+                .expect("stdout log"),
+        )
+        .stderr(
+            std::fs::File::options()
+                .append(true)
+                .create(true)
+                .open(dir.join("moon.stderr.log"))
+                .expect("stderr log"),
+        )
         .spawn()
         .expect("spawn moon (run `cargo build --release` first, or set MOON_BIN)");
     ServerGuard::new(child, dir)
@@ -249,8 +263,20 @@ fn spawn_moon_no_persist(port: u16, dir: &Path) -> ServerGuard {
         ])
         .arg(dir)
         .env("RUST_LOG", "moon=info")
-        .stdout(std::fs::File::create(dir.join("moon.stdout.log")).expect("stdout log"))
-        .stderr(std::fs::File::create(dir.join("moon.stderr.log")).expect("stderr log"))
+        .stdout(
+            std::fs::File::options()
+                .append(true)
+                .create(true)
+                .open(dir.join("moon.stdout.log"))
+                .expect("stdout log"),
+        )
+        .stderr(
+            std::fs::File::options()
+                .append(true)
+                .create(true)
+                .open(dir.join("moon.stderr.log"))
+                .expect("stderr log"),
+        )
         .spawn()
         .expect("spawn moon (run `cargo build --release` first, or set MOON_BIN)");
     ServerGuard::new(child, dir)
@@ -726,6 +752,55 @@ fn wait_for_manifest_exact_segments(
     }
 }
 
+/// Bounded poll for FULL durability of an insert-only index: the manifest's
+/// segments must hold exactly `n` live docs AND the paired keymap epoch must
+/// hold exactly `n` entries. `wait_for_manifest_min_segments` is NOT enough
+/// as a pre-SIGKILL gate when a compact emits more than one snapshot job
+/// (e.g. an auto-compact install followed by the explicit FT.COMPACT's
+/// residue freeze): the min-N manifest can be a stale intermediate whose
+/// keymap covers keys its segments don't — killing there lands inside the
+/// async-snapshot window and the dedup rescan must RE-INDEX the uncovered
+/// keys (S6 asserts that contract), which breaks S1/S2's `re_indexed == 0`
+/// fast-path determinism. Insert-only: live == `delete_lsn == 0`.
+fn wait_for_durable_docs(idx_dir: &Path, n: usize, timeout: Duration) -> IndexManifest {
+    use moon::vector::persistence::segment_io;
+    let observe = |m: &IndexManifest| -> (usize, usize) {
+        let seg_live: usize = m
+            .segment_ids
+            .iter()
+            .map(|&id| {
+                segment_io::read_mvcc_headers_only(idx_dir, id)
+                    .map(|hs| hs.iter().filter(|h| h.delete_lsn == 0).count())
+                    .unwrap_or(0)
+            })
+            .sum();
+        let keymap_n = manifest::read_keymap_tolerant(idx_dir, m.keymap_epoch)
+            .map(|e| e.len())
+            .unwrap_or(0);
+        (seg_live, keymap_n)
+    };
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(m) = manifest::read_manifest_tolerant(idx_dir) {
+            let (seg_live, keymap_n) = observe(&m);
+            if seg_live == n && keymap_n == n {
+                return m;
+            }
+            if Instant::now() >= deadline {
+                panic!(
+                    "durable state at {idx_dir:?} did not reach {n} docs within {timeout:?} \
+                     (segments live={seg_live}, keymap entries={keymap_n}, \
+                     segment_ids={:?}, keymap_epoch={})",
+                    m.segment_ids, m.keymap_epoch
+                );
+            }
+        } else if Instant::now() >= deadline {
+            panic!("no manifest at {idx_dir:?} within {timeout:?}");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// Extract the 4 integer counters from a B3 recovery acceptance log line:
 /// "vector index {name}: B3 recovery — loaded {N} segment(s), {N} key(s)
 /// verified unchanged, {N} re-indexed, {N} tombstoned" (exact format string
@@ -845,6 +920,11 @@ fn build_two_segment_snapshot(c: &mut Client, idx: &str, idx_dir: &Path, n: usiz
     hset_batch(c, &format!("{idx}:"), &batch2, simple_vec_bytes);
     ft_compact(c, idx);
     wait_for_manifest_min_segments(idx_dir, 2, Duration::from_secs(10));
+    // Full-durability gate: min-2-segments alone can observe a stale
+    // intermediate snapshot (see `wait_for_durable_docs` doc) — S1/S2's
+    // `re_indexed == 0` determinism needs every doc segment-resident AND
+    // keymap-covered on disk before the SIGKILL.
+    wait_for_durable_docs(idx_dir, n, Duration::from_secs(10));
 }
 
 #[test]
@@ -1424,6 +1504,106 @@ fn s5_no_persist_dir_regression_guard() {
         sidecars_post.is_empty(),
         "post-restart, found unexpected sidecar file: {sidecars_post:?}"
     );
+
+    drop(c2);
+    drop(guard2);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// S6: crash inside the async-snapshot window — AOF is the recovery authority
+// ---------------------------------------------------------------------------
+
+/// Regression test for the B3 "phantom keymap entry" silent-loss hole.
+///
+/// The durable `keymap-<epoch>.bin` covers EVERY indexed key (mutable +
+/// immutable) at snapshot-submit time, while the paired `manifest.json` only
+/// lists installed immutable segments. A kill -9 landing after one snapshot
+/// commits but before the NEXT one (covering a just-frozen segment) leaves
+/// the on-disk keymap a strict SUPERSET of the on-disk segments. Recovery
+/// must treat those uncovered keys as "not durable" and re-index them from
+/// the AOF — a checksum match against the keymap alone must never count as
+/// "verified unchanged" (observed failure before the fix: `num_docs` 1950/
+/// 2000 with 50 docs unsearchable, `verified_unchanged == N`, `re_indexed
+/// == 0`).
+///
+/// Unlike S1, this test deliberately does NOT wait for full durability
+/// before the kill: it uses the same manifest >= 2 segment gate S1
+/// historically used (which lands inside the window whenever the final
+/// compact produced more than one snapshot job) and then asserts only the
+/// crash-safety contract: every key answers its own exact-match query and
+/// `num_docs == N`, with the verified/re-indexed split left free.
+#[test]
+#[ignore] // Requires built release binary; run explicitly.
+fn s6_crash_during_snapshot_window_reindexes_uncovered_keys() {
+    const N: usize = 2000;
+    const IDX: &str = "s6";
+
+    let port = unique_port();
+    let dir = unique_dir("s6");
+    let vdir = vector_persist_dir(&dir);
+    let idx_dir = manifest::index_persist_dir(&vdir, IDX.as_bytes());
+
+    let guard = spawn_moon_aof(port, &dir);
+    let mut c = wait_ready(port);
+
+    ft_create(&mut c, IDX, DIM, 100, None);
+
+    let batch = N / 2;
+    let batch1: Vec<u32> = (0..batch as u32).collect();
+    let batch2: Vec<u32> = (batch as u32..N as u32).collect();
+
+    hset_batch(&mut c, &format!("{IDX}:"), &batch1, simple_vec_bytes);
+    ft_compact(&mut c, IDX);
+    wait_for_manifest_min_segments(&idx_dir, 1, Duration::from_secs(10));
+
+    hset_batch(&mut c, &format!("{IDX}:"), &batch2, simple_vec_bytes);
+    ft_compact(&mut c, IDX);
+    // Kill as soon as ANY manifest with >= 2 segments is durable — if the
+    // final compact emitted more than one snapshot job, this is inside the
+    // window where the durable keymap covers keys the durable segments
+    // don't.
+    wait_for_manifest_min_segments(&idx_dir, 2, Duration::from_secs(10));
+
+    let pre_num_docs = ft_info_num_docs(&mut c, IDX);
+    assert_eq!(pre_num_docs, N as i64, "pre-crash num_docs must equal N");
+
+    drop(c);
+    let mut guard = guard;
+    sigkill(&mut guard.child);
+    wait_for_port_down(port);
+
+    // -- Restart --------------------------------------------------------
+    let guard2 = start_moon_alive(spawn_moon_aof, port, &dir);
+    let mut c2 = wait_ready(port);
+
+    // The B3 line must exist (a manifest was durable), but the
+    // verified/re-indexed split is timing-dependent — only the total is
+    // contractual: every key was observed, none tombstoned.
+    let (_loaded, verified_unchanged, re_indexed, tombstoned) =
+        wait_for_recovery_counters(&dir, IDX, Duration::from_secs(10));
+    assert_eq!(
+        verified_unchanged + re_indexed,
+        N,
+        "every key must be either verified unchanged or re-indexed"
+    );
+    assert_eq!(tombstoned, 0, "no key was deleted before the crash");
+
+    // The crash-safety contract: nothing is silently lost, regardless of
+    // which snapshot prefix made it to disk.
+    let post_num_docs = ft_info_num_docs(&mut c2, IDX);
+    assert_eq!(post_num_docs, N as i64, "post-crash num_docs must equal N");
+
+    for i in (0..N as u32).step_by(25) {
+        let blob = simple_vec_bytes(i);
+        let results = search_keys(&mut c2, IDX, 1, &blob);
+        let want_key = format!("{IDX}:{i}");
+        assert_eq!(
+            results.first().map(String::as_str),
+            Some(want_key.as_str()),
+            "exact-match query for {want_key} must return itself as top-1 after crash recovery"
+        );
+    }
 
     drop(c2);
     drop(guard2);
