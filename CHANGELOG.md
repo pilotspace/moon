@@ -70,6 +70,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it now runs `spsc_eviction_gate` against the destination db before
   `copy_core`. Same-shard `MOVE` is left ungated (net-zero — the key leaves
   the source db as it lands in the destination, same rationale as `DEL`).
+  This Execute-arm dest-gate is inspection-verified as a verbatim mirror of
+  the tested generic gate; no wire-level case isolates the Execute arm
+  specifically (the arm is only reachable via `handler_sharded`'s
+  single-key remote dispatch, not the pipelined path any test in this suite
+  drives) — see the case E caveat below.
 - **Found, NOT fixed (out of scope): cross-shard remote `COPY ... DB n`
   silently ignores the DB clause.** The two-database intercept above exists
   only in the plain `Execute` arm, not `ExecuteSlotted`/`PipelineBatchSlotted`
@@ -80,16 +85,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `COPY`s landed in the wrong db). This is a data-correctness bug independent
   of `--maxmemory` — memory growth from the (wrong) same-db copy is still
   eviction-gated by the generic path above, so it is not a new OOM bypass,
-  but the DB clause itself does not do what it says. Fixing it requires
-  replicating the two-database intercept across every `ShardMessage` arm (or
-  restructuring it as a shared helper reachable from all of them) — out of
-  scope for this fix, flagged as a follow-up.
+  but the DB clause itself does not do what it says. `MOVE` shares the same
+  structural setup (its two-database intercept also lives only in the plain
+  `Execute` arm) and likely has the same DB-target defect on the cross-shard
+  path — not independently verified here. Fixing it requires replicating the
+  two-database intercept across every `ShardMessage` arm (or restructuring it
+  as a shared helper reachable from all of them) — out of scope for this
+  fix, flagged as a follow-up covering both `COPY` and `MOVE`.
 - New wire-level regression suite `tests/oom_bypass_closure.rs` (5 cases,
   both runtimes): direct-SET control (A), cross-shard pipeline (B), Lua EVAL
   loop (C), read-only EVAL under pressure not blocked (D), cross-shard COPY
-  under pressure (E). B, C and E RED before this fix (E: 0/300 OOM
-  git-stash-verified against the pre-fix tree), GREEN after (E: 104/300); D
-  locks the write-only scope of the Lua gate.
+  under pressure (E). B, C and E RED before this fix (E: 0/300 OOM,
+  GREEN after: 104/300). Case E pipelines `COPY`, which dispatches through
+  the same `ExecuteSlotted`/`PipelineBatchSlotted` generic-gate path as case
+  B — its RED/GREEN swing rides the *generic* gate, not the Execute-arm
+  dest-gate above; it confirms COPY drives that gate to OOM, not that the
+  Execute-arm path is independently exercised. D locks the write-only scope
+  of the Lua gate.
 
 ### Added — int8 symmetric ADC for SQ8 vector search (task #13)
 
