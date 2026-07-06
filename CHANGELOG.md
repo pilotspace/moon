@@ -31,6 +31,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `core.autocrlf=true`) the split point drifted one byte per line and
   panicked slicing inside a multibyte comment char. Now uses
   `split_inclusive('\n')` for byte-exact offsets on both line endings.
+- mem_watchdog integration cases A/B (guard-engages assertions) are gated
+  to Linux/macOS for the same `get_rss_bytes()` 0-fallback reason as the
+  lib smoke test: with RSS reported as 0 the memfull guard is structurally
+  inert on Windows. Cases C/D (guard-disabled directions) still run there.
+- `sigterm_shutdown.rs` readiness deadline widened 15s → 60s behind a
+  shared `READY_TIMEOUT` constant (poll-based loop notices readiness within
+  100ms either way; the fixed 15s was a documented host-load flake,
+  observed on the macOS CI runner).
 
 ### Changed — consolidated dependency bumps (PR #TBD)
 

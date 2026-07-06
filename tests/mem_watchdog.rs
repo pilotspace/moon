@@ -271,6 +271,11 @@ fn wait_ready(port: u16) -> Client {
 // for the 5s timer tick) and the dispatch-level message-selection wiring.
 // ---------------------------------------------------------------------------
 
+/// Linux/macOS only: the watchdog reads real process RSS via
+/// `get_rss_bytes()`, which returns the documented `0` fallback on every
+/// other platform (Windows included) — RSS 0 means 0% used, so the guard
+/// can never engage and this assertion can never pass there.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn test_case_a_tiny_limit_engages_memfull_on_first_write() {
     let dir = test_tmpdir();
@@ -296,6 +301,9 @@ fn test_case_a_tiny_limit_engages_memfull_on_first_write() {
 // this locks that invariant against a future over-broad gate.
 // ---------------------------------------------------------------------------
 
+/// Linux/macOS only — same `get_rss_bytes()` 0-fallback reasoning as
+/// case A: the setup assertion needs the guard to actually engage.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn test_case_b_get_not_blocked_while_memfull_engaged() {
     let dir = test_tmpdir();
