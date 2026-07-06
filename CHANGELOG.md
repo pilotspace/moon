@@ -73,6 +73,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `moon_memory_bytes{kind="lua_scripts"}` gauge and `MEMORY DOCTOR`'s text
   report. The cache itself remains intentionally unbounded (Redis parity —
   `SCRIPT FLUSH` is the only eviction path); this is observability only.
+- **Item C5 — removed dead `parse_single_frame_zc` RESP parser**
+  (`src/protocol/parse.rs`): a full ~150-line RESP2/RESP3 parser
+  superseded by the current `validate_frame` + `parse_frame_zerocopy`
+  pipeline, with zero external callers (only self-recursion) — silently
+  masked by the file's `#![allow(dead_code)]`. Removed along with its
+  exclusively-private helper `read_decimal_zc`.
 
 ### CI — fix Windows main-push test failures (PR #TBD)
 
