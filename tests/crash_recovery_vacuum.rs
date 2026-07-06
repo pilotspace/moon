@@ -1,12 +1,12 @@
 //! MA7 — Crash-recovery test matrix for Wave-1 reclamation code.
 //!
-//! Three crash-injection scenarios, each proven with in-process simulation.
+//! Crash-injection scenarios, each proven with in-process simulation.
 //! No subprocess spawning — `std::panic::catch_unwind` and drop-based
 //! injection suffice because every code path under test is synchronous.
 //!
 //! # Approach: drop-before-commit instead of process kill
 //!
-//! The key insight for all three scenarios is that durability depends on
+//! The key insight for both remaining scenarios is that durability depends on
 //! an explicit commit (either `ShardManifest::commit()` or an analogous
 //! mutation applied to stable storage). A `drop` of the in-memory state
 //! without a prior `commit()` is formally equivalent to a SIGKILL at the
@@ -21,98 +21,28 @@
 //!
 //! # Scenarios
 //!
-//! 1. **Compaction crash** — half-written segment directory. Documents
-//!    the orphan-cleanup gap in `recover_vector_store`.
-//! 2. **Manifest GC crash** — `gc_tombstones` mutates in-memory, drop
+//! 1. **Manifest GC crash** — `gc_tombstones` mutates in-memory, drop
 //!    before commit. Dual-root protocol recovers pre-staging root.
-//! 3. **MVCC zombie sweep crash** — intents are ephemeral (not WAL-
+//! 2. **MVCC zombie sweep crash** — intents are ephemeral (not WAL-
 //!    persisted). Simulates crash mid-sweep; verifies fresh TM is clean
 //!    and sweep is idempotent. Documents the intent-durability gap.
+//!
+//! A former "compaction crash / orphan partial segment" scenario lived here,
+//! exercising the WAL-replay `recover_vector_store` function. That function
+//! (and the `src/vector/persistence/recovery.rs` module it lived in) has
+//! been deleted (vector-index durability B3): it only ever populated the
+//! `Shard`-owned `vector_store`, which is discarded wholesale at
+//! `event_loop.rs` before the live `ShardSlice.vector_store` is built — see
+//! `VECTOR-DURABILITY-DESIGN.md`. Recovery authority is now the B1/B2/B3
+//! manifest+segment+keymap durability layout, and its orphan-cleanup
+//! coverage lives in `src/vector/persistence/manifest.rs`'s
+//! `sweep_orphans_from_disk` tests (`test_orphan_sweep_correctness` et al.),
+//! which the B3 loader calls on every startup — the exact gap this deleted
+//! scenario used to document no longer exists on the live path.
 
 use std::time::{Duration, Instant};
 
-// ── Scenario 1: Half-finished compaction segment directory ──────────────────
-//
-// Simulates: compaction starts writing a new segment directory, crashes after
-// writing 2 of the required files (hnsw_graph.bin + tq_codes.bin), before
-// segment_meta.json is present.
-//
-// Expected (documented current behaviour): `recover_vector_store` silently
-// skips the partial segment (warns + returns Ok). The orphan directory is
-// NOT cleaned up — it persists across restarts and is re-attempted on every
-// recovery call.
-//
-// // BUG: orphan partial segment directories are never cleaned up after a
-// // compaction crash. `recover_vector_store` at
-// // src/vector/persistence/recovery.rs:291-293 silently continues past
-// // `read_immutable_segment` failures without removing the partial directory.
-// // Repeated restarts will keep re-enumerating and re-attempting to load the
-// // orphan, wasting I/O and cluttering the segment namespace. Fix: detect
-// // directories lacking `segment_meta.json` on startup and remove them (or
-// // rename to `segment-{id}.partial` for forensics), then NOT retry them.
-
-#[test]
-fn crash_compaction_orphan_partial_segment_silently_skipped() {
-    use moon::vector::persistence::recovery::recover_vector_store;
-
-    let tmp = tempfile::tempdir().unwrap();
-    let persist_dir = tmp.path().to_path_buf();
-
-    // Build a fully-valid segment directory (segment-1) with the minimum
-    // files that `read_immutable_segment` needs to succeed.
-    //
-    // We write only the segment_meta.json so that a minimal valid segment is
-    // recognised. `hnsw_graph.bin`, `tq_codes.bin`, and `mvcc_headers.bin`
-    // also need to exist for the full read path to work, but for our purposes
-    // the important assertion is about the orphan directory (segment-999),
-    // so we let segment-1 fail too and assert the total collections map is
-    // empty (recovery is graceful even when all segments fail to load).
-    // The orphan (segment-999) is what we are asserting about.
-
-    // Half-finished directory: exists, has some files, missing segment_meta.json
-    let orphan_dir = persist_dir.join("segment-999");
-    std::fs::create_dir_all(&orphan_dir).unwrap();
-    // Write two of the five expected files — enough to look like a real segment
-    std::fs::write(
-        orphan_dir.join("hnsw_graph.bin"),
-        b"partial hnsw graph data",
-    )
-    .unwrap();
-    std::fs::write(orphan_dir.join("tq_codes.bin"), b"partial tq codes").unwrap();
-    // segment_meta.json is deliberately absent (simulates crash mid-write)
-
-    // Create a dummy WAL path (empty — no vectors were replayed before crash)
-    let wal_path = persist_dir.join("vector.wal");
-    std::fs::write(&wal_path, &[0u8; 32]).unwrap(); // 32-byte WAL header stub
-
-    // Recovery should succeed (not panic, not return Err)
-    let result = recover_vector_store(&wal_path, &persist_dir);
-    assert!(
-        result.is_ok(),
-        "recover_vector_store must not fail on partial segment directory: {:?}",
-        result.err(),
-    );
-
-    // BUG: The orphan directory still exists after recovery — it was not cleaned up.
-    // Once the bug is fixed, this assertion should be inverted to:
-    //   assert!(!orphan_dir.exists(), "orphan partial segment dir must be removed on recovery");
-    //
-    // BUG: src/vector/persistence/recovery.rs:291-293 — warn!+skip without cleanup.
-    assert!(
-        orphan_dir.exists(),
-        "current behaviour: orphan segment-999 dir persists after recovery (not cleaned up)",
-    );
-
-    // The valid segment-999 directory should still be enumerable on re-entry
-    // (re-attempt on every restart — the other half of the bug).
-    let second_result = recover_vector_store(&wal_path, &persist_dir);
-    assert!(
-        second_result.is_ok(),
-        "repeated recovery calls must remain idempotent despite orphan directory",
-    );
-}
-
-// ── Scenario 2: Mid-GC manifest crash before commit ─────────────────────────
+// ── Scenario 1: Mid-GC manifest crash before commit ─────────────────────────
 //
 // Simulates: `gc_tombstones(0, 0, future)` is called (immediate retention →
 // all tombstones eligible for removal). The process crashes (simulated by
@@ -204,7 +134,7 @@ fn crash_manifest_gc_before_commit_recovers_pre_staging_root() {
     );
 }
 
-// ── Scenario 3: Mid-sweep MVCC zombie crash + idempotency ───────────────────
+// ── Scenario 2: Mid-sweep MVCC zombie crash + idempotency ───────────────────
 //
 // Context: `sweep_zombies_mut` drains zombie write-intents in-place (mutating
 // `write_intents` via `HashMap::retain`). Write-intents are NOT WAL-persisted
@@ -339,57 +269,5 @@ fn crash_mvcc_sweep_zombies_idempotent_and_clean_on_restart() {
         mgr_mixed.write_intent_count(),
         0,
         "commit releases the last intent",
-    );
-}
-
-// ── Scenario 1b: WAL replay after compaction crash — no double file_id spend ─
-//
-// Assert: when two recovery calls are made against the same persist_dir,
-// the segment_id namespace is not polluted (no double-spend). Since
-// `recover_vector_store` reads `enumerate_segments` (a pure directory scan),
-// the orphan segment-999 dir shows up on every call but never consumes a
-// new segment_id from the recovery layer — it is the caller's responsibility
-// to assign new IDs. This test verifies that behaviour is stable.
-
-#[test]
-fn crash_compaction_wal_replay_no_double_spend_of_segment_ids() {
-    use moon::vector::persistence::recovery::recover_vector_store;
-
-    let tmp = tempfile::tempdir().unwrap();
-    let persist_dir = tmp.path().to_path_buf();
-
-    // Orphan directory: segment-42 exists but is corrupt (missing meta)
-    let orphan_dir = persist_dir.join("segment-42");
-    std::fs::create_dir_all(&orphan_dir).unwrap();
-    std::fs::write(orphan_dir.join("tq_codes.bin"), b"garbage").unwrap();
-    // segment_meta.json absent — simulates crash mid-write
-
-    let wal_path = persist_dir.join("vector.wal");
-    std::fs::write(&wal_path, &[0u8; 32]).unwrap();
-
-    // First recovery: orphan segment-42 load fails, nothing loaded.
-    let r1 = recover_vector_store(&wal_path, &persist_dir).unwrap();
-    assert!(
-        r1.collections.is_empty(),
-        "no collections recovered when all segments fail to load",
-    );
-
-    // Second recovery call (simulating restart after second crash):
-    // must produce identical results — idempotent.
-    let r2 = recover_vector_store(&wal_path, &persist_dir).unwrap();
-    assert!(
-        r2.collections.is_empty(),
-        "repeated recovery is idempotent: no double-spend of ids, same empty result",
-    );
-
-    // The orphan dir still occupies the segment-42 slot. A new compaction job
-    // would need to pick segment-43 or check for directory existence before
-    // writing. BUG: there is no cleanup — the orphan blocks that slot.
-    // BUG: src/vector/persistence/recovery.rs:119-137 enumerate_segments does
-    // not distinguish partial vs complete segment directories. Combined with
-    // the missing cleanup at lines 291-293, the orphan persists indefinitely.
-    assert!(
-        orphan_dir.exists(),
-        "orphan dir persists — confirms the cleanup gap documented in scenario 1",
     );
 }

@@ -2402,7 +2402,13 @@ fn auto_index_hset(
 
 /// Find the vector blob in HSET args for the given source_field.
 /// Returns Some(blob) if found with correct dimension, None otherwise.
-fn find_vector_blob<'a>(
+///
+/// `pub(crate)` so the B3 recovery dedup rescan
+/// (`crate::vector::persistence::recover_v2`) can compute the CURRENT
+/// vector-field checksum through the exact same field-scan the write path
+/// uses (`handle_vector_insert`) — any divergence would mean the dedup
+/// decision silently never fires.
+pub(crate) fn find_vector_blob<'a>(
     args: &'a [crate::protocol::Frame],
     source_field: &[u8],
     dim: usize,

@@ -8,6 +8,16 @@
 //! [payload bytes]                 -- record-specific fields, all LE
 //! [u32 LE: crc32]                 -- CRC32 over record_type + payload
 //! ```
+//!
+//! **NOT wired on the live recovery path.** Vector-index recovery authority
+//! is the B1/B2/B3 durability layout instead: `manifest.json` +
+//! `keymap-<epoch>.bin` + `segment-<id>/` dirs
+//! (`crate::vector::persistence::manifest`, `segment_io`), loaded by
+//! `crate::vector::persistence::recover_v2` and reconciled by a dedup rescan
+//! of the live keyspace. These record types are kept only because unit tests
+//! in this module exercise their (de)serialization round-trip. Do not enable
+//! WAL-based vector replay without first disabling the B3 rescan — the two
+//! recovery mechanisms are not designed to run together (double-apply risk).
 
 /// Tag byte distinguishing vector WAL records from RESP block frames.
 pub const VECTOR_RECORD_TAG: u8 = 0x56; // 'V'

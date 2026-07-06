@@ -1367,9 +1367,6 @@ pub struct VectorStore {
     next_collection_id: u64,
     /// Per-shard MVCC transaction manager.
     txn_manager: TransactionManager,
-    /// Segments recovered from persistence, awaiting FT.CREATE to claim them.
-    /// Key: collection_id. Populated during crash recovery.
-    pending_segments: HashMap<u64, crate::vector::persistence::recovery::RecoveredCollection>,
     /// Shard directory for persisting index metadata sidecar.
     /// Set once during event loop init when disk-offload is enabled.
     persist_dir: Option<std::path::PathBuf>,
@@ -1393,7 +1390,6 @@ impl VectorStore {
             indexes: HashMap::new(),
             next_collection_id: 1,
             txn_manager: TransactionManager::new(),
-            pending_segments: HashMap::new(),
             persist_dir: None,
             version_token: AtomicU64::new(0),
         }
@@ -1486,26 +1482,6 @@ impl VectorStore {
             }
         }
         count
-    }
-
-    /// Attach recovered segments from persistence. Called by shard restore.
-    ///
-    /// Stores recovered collections in pending_segments, keyed by collection_id.
-    /// They will be attached to indexes when FT.CREATE runs (or immediately if
-    /// the index already exists).
-    pub fn attach_recovered(
-        &mut self,
-        recovered: crate::vector::persistence::recovery::RecoveredState,
-    ) {
-        for (collection_id, collection) in recovered.collections {
-            self.pending_segments.insert(collection_id, collection);
-        }
-    }
-
-    /// Number of pending (unattached) recovered collections.
-    #[allow(dead_code)]
-    pub fn pending_count(&self) -> usize {
-        self.pending_segments.len()
     }
 
     /// Create a new index. Returns Err(&str) if index already exists.
@@ -1616,25 +1592,133 @@ impl VectorStore {
         // Persist index metadata sidecar
         self.save_index_meta_sidecar();
 
-        // Check if recovered segments exist for this collection_id
-        if let Some(recovered) = self.pending_segments.remove(&collection_id) {
-            if let Some(index) = self.indexes.get(&name) {
-                let mut immutable_arcs: Vec<
-                    Arc<crate::vector::segment::immutable::ImmutableSegment>,
-                > = Vec::with_capacity(recovered.immutable.len());
-                for (imm, _meta) in recovered.immutable {
-                    immutable_arcs.push(Arc::new(imm));
-                }
-                let new_list = crate::vector::segment::SegmentList {
-                    mutable: Arc::new(recovered.mutable),
-                    immutable: immutable_arcs,
-                    ivf: Vec::new(),
-                    warm: Vec::new(),
-                    cold: Vec::new(),
-                };
-                index.segments.swap(new_list);
-            }
+        // Bump version AFTER successful write (monotonicity-on-success contract).
+        self.bump_version();
+
+        Ok(())
+    }
+
+    /// Create a new index, pinning its default field's `collection_id` (and
+    /// therefore its HNSW QJL rotation seed) to a value previously recorded
+    /// on disk, instead of allocating a fresh one from `next_collection_id`.
+    ///
+    /// B3 recovery-only: used exclusively by the durability loader
+    /// (`crate::vector::persistence::recover_v2`) when a `manifest.json` was
+    /// found for this index. A segment persisted under collection_id X is
+    /// only searchable if the index that owns it also has collection_id X —
+    /// see `VECTOR-DURABILITY-DESIGN.md`'s "#1 correctness trap". Mirrors
+    /// `create_index` in every other respect (additional-field segments are
+    /// always fresh — B1/B2 never persists them), and additionally seeds
+    /// `next_segment_id`/`next_snapshot_seq` from the SAME manifest instead
+    /// of a defensive re-read (the caller already loaded it).
+    ///
+    /// Does not attach any segments or keymap state — `VectorIndex.segments`,
+    /// `key_hash_to_key`, `key_hash_to_global_id`, `key_hash_to_vec_checksum`
+    /// are left at their fresh-index defaults. The caller installs recovered
+    /// state afterward via `get_index_mut` (all four fields are `pub`).
+    pub(crate) fn create_index_with_collection_id(
+        &mut self,
+        mut meta: IndexMeta,
+        manifest: &crate::vector::persistence::manifest::IndexManifest,
+    ) -> Result<(), &'static str> {
+        if self.indexes.contains_key(&meta.name) {
+            return Err("Index already exists");
         }
+
+        // Backward compatibility: if vector_fields is empty, populate from top-level fields.
+        if meta.vector_fields.is_empty() {
+            meta.vector_fields = vec![VectorFieldMeta {
+                field_name: meta.source_field.clone(),
+                dimension: meta.dimension,
+                padded_dimension: padded_dimension(meta.dimension),
+                metric: meta.metric,
+                quantization: meta.quantization,
+                build_mode: meta.build_mode,
+            }];
+        }
+
+        let collection_id = manifest.collection_id;
+        // Bump the store-wide allocator above BOTH the pinned cid and the
+        // manifest's own recorded floor (covers additional-field cids this
+        // index previously allocated — those fields are never persisted, so
+        // they get fresh cids below, but must never collide with a cid a
+        // sibling recovered index is pinning right now).
+        self.next_collection_id = self
+            .next_collection_id
+            .max(manifest.next_collection_id_floor)
+            .max(collection_id + 1);
+
+        let padded = padded_dimension(meta.dimension);
+        let collection = Arc::new(CollectionMetadata::with_build_mode(
+            collection_id,
+            meta.dimension,
+            meta.metric,
+            meta.quantization,
+            collection_id, // pinned: same value the persisted segments' QJL was seeded with
+            meta.build_mode,
+        ));
+        let segments = SegmentHolder::new(meta.dimension, collection.clone());
+        let scratch = SearchScratch::new(0, padded);
+
+        // Additional field segments: B1/B2 never persists them (AS-BUILT —
+        // `compact_segments` is always called with `persist_root: None` for
+        // `field_segments`), so they always start fresh here too, exactly
+        // like `create_index`. `next_collection_id` was already bumped above
+        // so these freshly allocated cids can't collide with the pinned one.
+        let mut extra_fields = HashMap::new();
+        for field_meta in meta.vector_fields.iter().skip(1) {
+            let field_cid = self.next_collection_id;
+            self.next_collection_id += 1;
+            let field_padded = padded_dimension(field_meta.dimension);
+            let field_collection = Arc::new(CollectionMetadata::with_build_mode(
+                field_cid,
+                field_meta.dimension,
+                field_meta.metric,
+                field_meta.quantization,
+                field_cid,
+                field_meta.build_mode,
+            ));
+            let field_segments = SegmentHolder::new(field_meta.dimension, field_collection.clone());
+            let field_scratch = SearchScratch::new(0, field_padded);
+            extra_fields.insert(
+                field_meta.field_name.clone(),
+                FieldSegments {
+                    segments: field_segments,
+                    scratch: field_scratch,
+                    collection: field_collection,
+                },
+            );
+        }
+
+        let name = meta.name.clone();
+
+        self.indexes.insert(
+            name.clone(),
+            VectorIndex {
+                meta,
+                segments,
+                scratch,
+                collection,
+                payload_index: PayloadIndex::new(),
+                key_hash_to_key: Arc::new(std::collections::HashMap::new()),
+                key_hash_to_global_id: Arc::new(std::collections::HashMap::new()),
+                key_hash_to_vec_checksum: Arc::new(std::collections::HashMap::new()),
+                persist_dir: self.persist_dir.clone(),
+                next_segment_id: manifest.next_segment_id,
+                next_snapshot_seq: manifest.keymap_epoch,
+                persist_seq_watermark: Arc::new(parking_lot::Mutex::new(manifest.keymap_epoch)),
+                autocompact_enabled: true,
+                merge_recall_tolerance: 0.70,
+                compaction_weight: COMPACTION_WEIGHT_DEFAULT,
+                field_segments: extra_fields,
+                sparse_stores: HashMap::new(),
+                bg_compact_inflight: None,
+                bg_merge_inflight: None,
+            },
+        );
+
+        // Persist index metadata sidecar
+        self.save_index_meta_sidecar();
 
         // Bump version AFTER successful write (monotonicity-on-success contract).
         self.bump_version();
@@ -1708,10 +1792,7 @@ impl VectorStore {
     /// the (now empty) keyspace. Without this, flushed hashes stayed
     /// searchable as ghost vectors until the next restart.
     pub fn clear_all_contents(&mut self) {
-        // FLUSH discards everything — recovered-but-unclaimed segments too,
-        // or a later FT.CREATE would resurrect pre-flush contents via the
-        // pending_segments claim in `create_index`.
-        self.pending_segments.clear();
+        // FLUSH discards everything.
         let names: Vec<Bytes> = self.indexes.keys().cloned().collect();
         for name in names {
             let Some(index) = self.indexes.remove(&name) else {

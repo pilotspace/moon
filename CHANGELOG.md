@@ -6,6 +6,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — vector-index durability: startup recovery from disk (B1-B3)
+
+- **Vector indexes now persist their segments across restarts** instead of
+  paying a full re-index (TQ encode + HNSW build) of every matching hash key
+  on every restart. Each index gets an `idx-<hex(name)>/` directory holding
+  an atomically-written `manifest.json` (collection_id / segment ids /
+  id-allocator floors), a checksummed `keymap-<epoch>.bin` (key_hash →
+  global_id + vector checksum + original key), and its immutable HNSW
+  segments (staged write: `staging-<id>` → fsync → atomic rename), written
+  in the background after each compact/merge install (B1/B2).
+- **Startup now loads that state instead of discarding it**: segments are
+  read back and reattached (pinning the recreated index's `collection_id` to
+  the persisted value — required for the HNSW QJL rotation seed to match),
+  and the keyspace rescan is now a **dedup rescan**: a key whose vector
+  bytes checksum-match the last snapshot is rebuilt as metadata-only (no
+  HNSW/TQ re-encode); only genuinely changed or unknown keys are fully
+  re-indexed; keys removed from the keyspace are tombstoned (B3).
+- **Crash-safety contract**: any corrupt/missing artifact (segment,
+  checksum mismatch, unreadable headers) degrades to a rescan-rebuild of
+  exactly the affected keys, never to wrong search results; a manifest may
+  understate what's durable (costs a rescan) but never overstates. Startup
+  also sweeps orphaned segment/staging/keymap files and stale `idx-*`
+  directories left by an interrupted drop.
+- Multi-field indexes: only the default vector field's segments/checksum
+  are persisted; additional named vector fields always re-encode on
+  restart (documented gap, safe/conservative).
+- Removed the vestigial WAL-replay vector recovery path
+  (`src/vector/persistence/recovery.rs`, `VectorStore::attach_recovered`/
+  `pending_segments`): it only ever populated a `VectorStore` that was
+  discarded before the shard event loop started (recovery authority is now
+  exclusively the manifest/segment/keymap layout above).
+
 ### Fixed — FLUSHALL/FLUSHDB ghost vectors + HDEL stale-vector gap
 
 - **FLUSHALL/FLUSHDB never touched the FT indexes** (persistence-review R3):

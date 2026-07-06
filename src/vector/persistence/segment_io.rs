@@ -281,6 +281,123 @@ fn write_segment_files(
     Ok(())
 }
 
+/// Parse the raw contents of an `mvcc_headers.bin` file (version-aware:
+/// v1 = 20 bytes/header with no `global_id`/`key_hash`, v2 = 32 bytes/header).
+/// Shared by [`read_immutable_segment`] (full segment read) and
+/// [`read_mvcc_headers_only`] (B3 best-effort recovery helper, used when the
+/// rest of a segment fails to load but the key_hashes it held still need to
+/// be identified so they can be dropped from the recovered keymap).
+fn parse_mvcc_headers(mvcc_bytes: &[u8]) -> Result<Vec<MvccHeader>, SegmentIoError> {
+    if mvcc_bytes.len() < 4 {
+        return Err(SegmentIoError::InvalidMetadata(
+            "mvcc_headers.bin too short".to_owned(),
+        ));
+    }
+    // Detect format version: v2 starts with version byte 2, v1 starts with count (u32 LE)
+    let (mvcc_version, mvcc_count, mut pos) = if mvcc_bytes[0] == 2 && mvcc_bytes.len() >= 5 {
+        let count = u32::from_le_bytes([mvcc_bytes[1], mvcc_bytes[2], mvcc_bytes[3], mvcc_bytes[4]])
+            as usize;
+        (2u8, count, 5usize)
+    } else {
+        let count = u32::from_le_bytes([mvcc_bytes[0], mvcc_bytes[1], mvcc_bytes[2], mvcc_bytes[3]])
+            as usize;
+        (1u8, count, 4usize)
+    };
+    let bytes_per_header: usize = if mvcc_version >= 2 { 32 } else { 20 };
+    if mvcc_bytes.len() < pos + mvcc_count * bytes_per_header {
+        return Err(SegmentIoError::InvalidMetadata(
+            "mvcc_headers.bin truncated".to_owned(),
+        ));
+    }
+    let mut mvcc = Vec::with_capacity(mvcc_count);
+    for _ in 0..mvcc_count {
+        let internal_id = u32::from_le_bytes([
+            mvcc_bytes[pos],
+            mvcc_bytes[pos + 1],
+            mvcc_bytes[pos + 2],
+            mvcc_bytes[pos + 3],
+        ]);
+        pos += 4;
+        let (global_id, key_hash) = if mvcc_version >= 2 {
+            let gid = u32::from_le_bytes([
+                mvcc_bytes[pos],
+                mvcc_bytes[pos + 1],
+                mvcc_bytes[pos + 2],
+                mvcc_bytes[pos + 3],
+            ]);
+            pos += 4;
+            let kh = u64::from_le_bytes([
+                mvcc_bytes[pos],
+                mvcc_bytes[pos + 1],
+                mvcc_bytes[pos + 2],
+                mvcc_bytes[pos + 3],
+                mvcc_bytes[pos + 4],
+                mvcc_bytes[pos + 5],
+                mvcc_bytes[pos + 6],
+                mvcc_bytes[pos + 7],
+            ]);
+            pos += 8;
+            (gid, kh)
+        } else {
+            (internal_id, 0u64) // v1 fallback: global_id = internal_id
+        };
+        let insert_lsn = u64::from_le_bytes([
+            mvcc_bytes[pos],
+            mvcc_bytes[pos + 1],
+            mvcc_bytes[pos + 2],
+            mvcc_bytes[pos + 3],
+            mvcc_bytes[pos + 4],
+            mvcc_bytes[pos + 5],
+            mvcc_bytes[pos + 6],
+            mvcc_bytes[pos + 7],
+        ]);
+        pos += 8;
+        let delete_lsn = u64::from_le_bytes([
+            mvcc_bytes[pos],
+            mvcc_bytes[pos + 1],
+            mvcc_bytes[pos + 2],
+            mvcc_bytes[pos + 3],
+            mvcc_bytes[pos + 4],
+            mvcc_bytes[pos + 5],
+            mvcc_bytes[pos + 6],
+            mvcc_bytes[pos + 7],
+        ]);
+        pos += 8;
+        mvcc.push(MvccHeader {
+            internal_id,
+            global_id,
+            key_hash,
+            insert_lsn,
+            delete_lsn,
+            hint_committed: 0,
+        });
+    }
+    Ok(mvcc)
+}
+
+/// Best-effort recovery helper (B3): read and parse ONLY the
+/// `mvcc_headers.bin` file for a segment, without touching the graph/TQ/meta
+/// files or verifying any checksum.
+///
+/// Used when a segment's full [`read_immutable_segment`] fails (corrupt
+/// graph, checksum mismatch, collection-id mismatch against the manifest) —
+/// the B3 loader still needs the `key_hash` of every entry that WAS durable
+/// in the abandoned segment, so it can drop exactly those keys from the
+/// recovered keymap (letting the rescan re-index them) instead of either
+/// resurrecting stale data or silently losing track of which keys are
+/// affected.
+///
+/// Returns `None` on ANY I/O or parse failure. The caller's fallback for
+/// that case (headers ALSO unreadable) is to abandon the entire index's
+/// on-disk state — an unattributed set of potentially-lost keys can't be
+/// safely subtracted from the keymap without risking duplicate/stale search
+/// results (see `recover_v2` module docs).
+pub fn read_mvcc_headers_only(dir: &Path, segment_id: u64) -> Option<Vec<MvccHeader>> {
+    let seg_dir = segment_dir(dir, segment_id);
+    let mvcc_bytes = fs::read(seg_dir.join("mvcc_headers.bin")).ok()?;
+    parse_mvcc_headers(&mvcc_bytes).ok()
+}
+
 /// Read an immutable segment from disk.
 ///
 /// Reads from `{dir}/segment-{id}/` directory.
@@ -425,90 +542,7 @@ pub fn read_immutable_segment(
 
     // 5. Read MVCC headers (version-aware: v1 = 20 bytes/header, v2 = 32 bytes/header)
     let mvcc_bytes = fs::read(seg_dir.join("mvcc_headers.bin"))?;
-    if mvcc_bytes.len() < 4 {
-        return Err(SegmentIoError::InvalidMetadata(
-            "mvcc_headers.bin too short".to_owned(),
-        ));
-    }
-    // Detect format version: v2 starts with version byte 2, v1 starts with count (u32 LE)
-    let (mvcc_version, mvcc_count, mut pos) = if mvcc_bytes[0] == 2 && mvcc_bytes.len() >= 5 {
-        let count = u32::from_le_bytes([mvcc_bytes[1], mvcc_bytes[2], mvcc_bytes[3], mvcc_bytes[4]])
-            as usize;
-        (2u8, count, 5usize)
-    } else {
-        let count = u32::from_le_bytes([mvcc_bytes[0], mvcc_bytes[1], mvcc_bytes[2], mvcc_bytes[3]])
-            as usize;
-        (1u8, count, 4usize)
-    };
-    let bytes_per_header: usize = if mvcc_version >= 2 { 32 } else { 20 };
-    if mvcc_bytes.len() < pos + mvcc_count * bytes_per_header {
-        return Err(SegmentIoError::InvalidMetadata(
-            "mvcc_headers.bin truncated".to_owned(),
-        ));
-    }
-    let mut mvcc = Vec::with_capacity(mvcc_count);
-    for _ in 0..mvcc_count {
-        let internal_id = u32::from_le_bytes([
-            mvcc_bytes[pos],
-            mvcc_bytes[pos + 1],
-            mvcc_bytes[pos + 2],
-            mvcc_bytes[pos + 3],
-        ]);
-        pos += 4;
-        let (global_id, key_hash) = if mvcc_version >= 2 {
-            let gid = u32::from_le_bytes([
-                mvcc_bytes[pos],
-                mvcc_bytes[pos + 1],
-                mvcc_bytes[pos + 2],
-                mvcc_bytes[pos + 3],
-            ]);
-            pos += 4;
-            let kh = u64::from_le_bytes([
-                mvcc_bytes[pos],
-                mvcc_bytes[pos + 1],
-                mvcc_bytes[pos + 2],
-                mvcc_bytes[pos + 3],
-                mvcc_bytes[pos + 4],
-                mvcc_bytes[pos + 5],
-                mvcc_bytes[pos + 6],
-                mvcc_bytes[pos + 7],
-            ]);
-            pos += 8;
-            (gid, kh)
-        } else {
-            (internal_id, 0u64) // v1 fallback: global_id = internal_id
-        };
-        let insert_lsn = u64::from_le_bytes([
-            mvcc_bytes[pos],
-            mvcc_bytes[pos + 1],
-            mvcc_bytes[pos + 2],
-            mvcc_bytes[pos + 3],
-            mvcc_bytes[pos + 4],
-            mvcc_bytes[pos + 5],
-            mvcc_bytes[pos + 6],
-            mvcc_bytes[pos + 7],
-        ]);
-        pos += 8;
-        let delete_lsn = u64::from_le_bytes([
-            mvcc_bytes[pos],
-            mvcc_bytes[pos + 1],
-            mvcc_bytes[pos + 2],
-            mvcc_bytes[pos + 3],
-            mvcc_bytes[pos + 4],
-            mvcc_bytes[pos + 5],
-            mvcc_bytes[pos + 6],
-            mvcc_bytes[pos + 7],
-        ]);
-        pos += 8;
-        mvcc.push(MvccHeader {
-            internal_id,
-            global_id,
-            key_hash,
-            insert_lsn,
-            delete_lsn,
-            hint_committed: 0,
-        });
-    }
+    let mvcc = parse_mvcc_headers(&mvcc_bytes)?;
 
     // 6. Construct ImmutableSegment
     let dim = meta.dimension as usize;
