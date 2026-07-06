@@ -127,6 +127,50 @@ fn moon_spin_probe() -> bool {
     })
 }
 
+// moon patch: idle disengage for the spin-poll. The spin exists to delete
+// wake latency UNDER TRAFFIC; without a gate an idle thread burns the full
+// budget on EVERY park forever (~budget/park-interval CPU per shard thread,
+// e.g. ~4%/core at 40µs vs 1ms timer parks — the "zombie CPU eater" when a
+// stray server is orphaned). Once this thread has seen no readiness events
+// and no host work for MOON_SPIN_IDLE_DISENGAGE_US (default 10ms; 0 = never
+// disengage), parks fall back to plain blocking polls. The next real event
+// still arrives via the normal wake path (a one-time ~µs penalty) and
+// re-arms the spin. Timer-only wakeups (empty poll after timeout) do NOT
+// count as events, so a quiescent server stays disengaged.
+thread_local! {
+    static MOON_SPIN_LAST_EVENT: std::cell::Cell<Option<std::time::Instant>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn moon_spin_idle_disengage_us() -> u64 {
+    static V: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("MOON_SPIN_IDLE_DISENGAGE_US")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(10_000)
+    })
+}
+
+fn moon_spin_engaged() -> bool {
+    let win = moon_spin_idle_disengage_us();
+    if win == 0 {
+        return true;
+    }
+    MOON_SPIN_LAST_EVENT.with(|c| match c.get() {
+        // First park on this thread: start the window now (covers startup).
+        None => {
+            c.set(Some(std::time::Instant::now()));
+            true
+        }
+        Some(t) => t.elapsed() < std::time::Duration::from_micros(win),
+    })
+}
+
+fn moon_spin_note_event() {
+    MOON_SPIN_LAST_EVENT.with(|c| c.set(Some(std::time::Instant::now())));
+}
+
 #[allow(dead_code)]
 impl LegacyDriver {
     const DEFAULT_ENTRIES: u32 = 1024;
@@ -235,7 +279,9 @@ impl LegacyDriver {
         #[cfg(unix)]
         if need_wait {
             let spin_us = moon_epoll_spin_budget_us();
-            if spin_us > 0 {
+            // Idle disengage (see MOON_SPIN_LAST_EVENT above): only pay the
+            // spin budget while events have arrived recently.
+            if spin_us > 0 && moon_spin_engaged() {
                 let budget = match timeout {
                     Some(d) => d.min(Duration::from_micros(spin_us)),
                     None => Duration::from_micros(spin_us),
@@ -262,6 +308,7 @@ impl LegacyDriver {
                     }
                     if !events.is_empty() {
                         polled = true;
+                        moon_spin_note_event();
                         break;
                     }
                     if hooks && moon_spin_probe() {
@@ -291,6 +338,7 @@ impl LegacyDriver {
                     // Host work is pending and a local wake was delivered —
                     // return to the executor instead of blocking.
                     polled = true;
+                    moon_spin_note_event();
                 }
             }
         }
@@ -301,6 +349,12 @@ impl LegacyDriver {
                 Ok(_) => {}
                 Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {}
                 Err(e) => return Err(e),
+            }
+            // moon patch: real fd/waker events (not bare timer expiry)
+            // re-arm the idle-disengaged spin for the next park.
+            #[cfg(unix)]
+            if events.iter().next().is_some() {
+                moon_spin_note_event();
             }
         }
         #[cfg(unix)]

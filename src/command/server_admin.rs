@@ -152,6 +152,7 @@ pub fn debug(db: &mut Database, args: &[Frame]) -> Frame {
     match classify_debug(args) {
         Ok(DebugCall::Object(rest)) => debug_object(db, rest),
         Ok(DebugCall::Sleep(rest)) => debug_sleep(rest),
+        Ok(DebugCall::Panic) => debug_panic(),
         Ok(DebugCall::Help) => debug_help(),
         Err(e) => e,
     }
@@ -168,6 +169,7 @@ pub fn debug_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
     match classify_debug(args) {
         Ok(DebugCall::Object(rest)) => debug_object_readonly(db, rest, now_ms),
         Ok(DebugCall::Sleep(rest)) => debug_sleep(rest),
+        Ok(DebugCall::Panic) => debug_panic(),
         Ok(DebugCall::Help) => debug_help(),
         Err(e) => e,
     }
@@ -176,6 +178,7 @@ pub fn debug_readonly(db: &Database, args: &[Frame], now_ms: u64) -> Frame {
 enum DebugCall<'a> {
     Object(&'a [Frame]),
     Sleep(&'a [Frame]),
+    Panic,
     Help,
 }
 
@@ -191,6 +194,8 @@ fn classify_debug(args: &[Frame]) -> Result<DebugCall<'_>, Frame> {
         Ok(DebugCall::Object(&args[1..]))
     } else if sub.eq_ignore_ascii_case(b"SLEEP") {
         Ok(DebugCall::Sleep(&args[1..]))
+    } else if sub.eq_ignore_ascii_case(b"PANIC") {
+        Ok(DebugCall::Panic)
     } else if sub.eq_ignore_ascii_case(b"HELP") {
         Ok(DebugCall::Help)
     } else {
@@ -210,6 +215,10 @@ fn debug_help() -> Frame {
         Frame::BulkString(Bytes::from_static(b"DEBUG SLEEP <seconds>")),
         Frame::BulkString(Bytes::from_static(
             b"  Stall this shard for <seconds> (float, capped at 30).",
+        )),
+        Frame::BulkString(Bytes::from_static(b"DEBUG PANIC")),
+        Frame::BulkString(Bytes::from_static(
+            b"  Panic this shard thread (crash-handling test aid, as in Redis).",
         )),
         Frame::BulkString(Bytes::from_static(b"DEBUG HELP")),
         Frame::BulkString(Bytes::from_static(b"  Return subcommand help.")),
@@ -254,6 +263,14 @@ fn debug_object_reply(entry: &Entry) -> Frame {
         encoding, slen,
     );
     Frame::SimpleString(Bytes::from(body))
+}
+
+/// `DEBUG PANIC` — deliberately panic the executing shard thread (Redis
+/// parity: a crash-handling test aid). The process-level panic policy
+/// (fail-fast abort, installed in main) is what a client observes; the
+/// return type exists only for the signature.
+fn debug_panic() -> Frame {
+    panic!("DEBUG PANIC requested by client");
 }
 
 fn debug_sleep(args: &[Frame]) -> Frame {

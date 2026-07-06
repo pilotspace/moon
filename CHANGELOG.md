@@ -6,6 +6,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — zombie/CPU hardening wave 1 (PR #TBD)
+
+- **Busy-poll spin idle-disengages** (`--io-busy-poll-us` / vendored monoio
+  legacy driver): an idle server no longer burns the spin budget on every
+  park forever (measured ~2.4s CPU per 3s wall on an idle 4-shard server at
+  200µs). The driver tracks the last real event per thread and skips the
+  spin window after `MOON_SPIN_IDLE_DISENGAGE_US` (default 10ms; 0 = old
+  always-spin) of quiet; the next event re-arms it via the normal wake path,
+  so steady traffic — the GCE p=1 win path — never disengages.
+- **Shard-thread panics abort the whole process** instead of leaving an
+  N-1-shard server silently answering with a dead shard's keys gone; the
+  shutdown join loop logs instead of swallowing panics. New `DEBUG PANIC`
+  subcommand (Redis parity) as the crash-handling test aid.
+- **SIGTERM shutdown regression matrix**: shards × held-connections ×
+  busy-poll × 16-writer AOF write-storm (7 cases, both runtimes, 3
+  platforms). The documented SIGTERM+SO_REUSEPORT bench hang did NOT
+  reproduce at HEAD in any composition; the matrix stays as the guard and
+  the detached monoio accept-task change is deferred until a reproducer
+  exists.
+- **`wait_ready` test harness hardening**: readiness probes retry with a
+  fresh connection on mid-startup connection resets (CI flake: per-shard
+  SO_REUSEPORT listeners accept-then-reset during init).
+
 ### Added — int8 symmetric ADC for SQ8 vector search (task #13)
 
 - New per-candidate integer dot-product path for SQ8 asymmetric distance

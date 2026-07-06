@@ -76,6 +76,26 @@ fn send_sigterm(pid: u32) {
 /// `extra_args` is appended to the base arg list so individual cases can enable
 /// optional subsystems (e.g. `--admin-port`) that spawn threads earlier in main().
 fn assert_sigterm_clean_exit(label: &str, extra_args: &[&str]) {
+    assert_sigterm_clean_exit_shards(label, 1, extra_args, ConnAtSigterm::None)
+}
+
+/// Connection state to hold when SIGTERM lands — the zombie review
+/// (tmp/RSS-CPU-REVIEW.md item 1) implicates the per-shard accept path, and
+/// the bench-harness hangs happened with recent/live connections, so the
+/// matrix covers both.
+enum ConnAtSigterm {
+    /// No client connected (beyond the readiness probe, already closed).
+    None,
+    /// One client connection held OPEN across the SIGTERM.
+    HeldOpen,
+}
+
+fn assert_sigterm_clean_exit_shards(
+    label: &str,
+    shards: u32,
+    extra_args: &[&str],
+    conn: ConnAtSigterm,
+) {
     let port = free_port();
     let dir = std::env::temp_dir().join(format!(
         "moon-sigterm-{}-{}-{}",
@@ -88,6 +108,7 @@ fn assert_sigterm_clean_exit(label: &str, extra_args: &[&str]) {
     // Bind to locals so the &str slices in base_args are not temporaries.
     let port_str = port.to_string();
     let dir_str = dir.to_string_lossy().into_owned();
+    let shards_str = shards.to_string();
 
     let mut base_args: Vec<&str> = vec![
         "--port",
@@ -97,7 +118,7 @@ fn assert_sigterm_clean_exit(label: &str, extra_args: &[&str]) {
         "--appendonly",
         "no",
         "--shards",
-        "1",
+        &shards_str,
     ];
     base_args.extend_from_slice(extra_args);
 
@@ -120,6 +141,24 @@ fn assert_sigterm_clean_exit(label: &str, extra_args: &[&str]) {
             label, port
         );
     }
+
+    // Optionally hold a live client connection across the SIGTERM (verified
+    // alive with a PING round-trip so the conn is fully registered on a shard).
+    let held = match conn {
+        ConnAtSigterm::None => None,
+        ConnAtSigterm::HeldOpen => {
+            let addr = format!("127.0.0.1:{port}");
+            let mut s =
+                TcpStream::connect_timeout(&addr.parse().expect("addr"), Duration::from_secs(2))
+                    .expect("held conn connect");
+            s.set_read_timeout(Some(Duration::from_secs(2))).ok();
+            s.write_all(b"PING\r\n").expect("held conn ping");
+            let mut buf = [0u8; 16];
+            let n = s.read(&mut buf).expect("held conn pong");
+            assert!(buf[..n].windows(4).any(|w| w == b"PONG"), "held conn PONG");
+            Some(s)
+        }
+    };
 
     // Send SIGTERM and wait for the process to exit.
     send_sigterm(pid);
@@ -147,6 +186,7 @@ fn assert_sigterm_clean_exit(label: &str, extra_args: &[&str]) {
         label,
         status
     );
+    drop(held);
 }
 
 #[test]
@@ -167,4 +207,142 @@ fn sigterm_clean_exit_with_admin_port() {
     let admin_port = free_port();
     let admin_port_str = admin_port.to_string();
     assert_sigterm_clean_exit("admin", &["--admin-port", &admin_port_str]);
+}
+
+// ── Zombie-review matrix (tmp/RSS-CPU-REVIEW.md item 1) ─────────────────────
+//
+// The detached monoio per-shard accept task never observes the shutdown
+// token; the documented bench-harness hangs involved multi-shard SO_REUSEPORT
+// servers and live/recent connections. Each ingredient gets a case.
+
+#[test]
+fn sigterm_clean_exit_shards_4_idle() {
+    assert_sigterm_clean_exit_shards("s4-idle", 4, &[], ConnAtSigterm::None);
+}
+
+#[test]
+fn sigterm_clean_exit_shards_4_held_conn() {
+    assert_sigterm_clean_exit_shards("s4-held", 4, &[], ConnAtSigterm::HeldOpen);
+}
+
+#[test]
+fn sigterm_clean_exit_shards_1_held_conn() {
+    assert_sigterm_clean_exit_shards("s1-held", 1, &[], ConnAtSigterm::HeldOpen);
+}
+
+/// The zombie-CPU-eater composition: busy-poll spin configured AND SIGTERM'd.
+#[test]
+fn sigterm_clean_exit_busy_poll() {
+    assert_sigterm_clean_exit_shards(
+        "s2-busypoll",
+        2,
+        &["--io-busy-poll-us", "40"],
+        ConnAtSigterm::HeldOpen,
+    );
+}
+
+/// Bench-harness shape: SIGTERM lands while many clients hammer pipelined
+/// writes (the documented GCE hang always involved live benchmark traffic).
+/// Writer threads tolerate every I/O error — after SIGTERM their connections
+/// are expected to die; the only assertion is that the SERVER exits cleanly.
+#[test]
+fn sigterm_clean_exit_under_write_storm() {
+    let port = free_port();
+    let dir = std::env::temp_dir().join(format!(
+        "moon-sigterm-{}-{}-storm",
+        std::process::id(),
+        port
+    ));
+    std::fs::create_dir_all(&dir).expect("mk tmpdir");
+    let port_str = port.to_string();
+    let dir_str = dir.to_string_lossy().into_owned();
+
+    let mut child = Command::new(moon_binary())
+        .args([
+            "--port",
+            &port_str,
+            "--dir",
+            &dir_str,
+            "--appendonly",
+            "yes",
+            "--shards",
+            "4",
+        ])
+        .stdout(std::fs::File::create(dir.join("moon.stdout.log")).expect("stdout log"))
+        .stderr(std::fs::File::create(dir.join("moon.stderr.log")).expect("stderr log"))
+        .spawn()
+        .expect("spawn moon");
+    let pid = child.id();
+
+    if !wait_for_ready(port, Duration::from_secs(15)) {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("[storm] server did not become ready within 15s on port {port}");
+    }
+
+    // 16 writer threads, each pipelining SETs in a tight loop until the
+    // connection dies or the stop flag flips.
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let writers: Vec<_> = (0..16)
+        .map(|t| {
+            let stop = stop.clone();
+            let addr = format!("127.0.0.1:{port}");
+            std::thread::spawn(move || {
+                let Ok(mut s) = TcpStream::connect_timeout(
+                    &addr.parse().expect("addr"),
+                    Duration::from_secs(2),
+                ) else {
+                    return;
+                };
+                s.set_write_timeout(Some(Duration::from_millis(500))).ok();
+                s.set_read_timeout(Some(Duration::from_millis(500))).ok();
+                let mut n = 0u64;
+                let mut buf = [0u8; 4096];
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    // 8-deep pipeline of SETs; ignore all errors (the server
+                    // is being killed under us — that's the point).
+                    let mut pipe = Vec::new();
+                    for i in 0..8 {
+                        pipe.extend_from_slice(
+                            format!("SET k:{t}:{}:{i} v{n}\r\n", n % 512).as_bytes(),
+                        );
+                    }
+                    if s.write_all(&pipe).is_err() {
+                        break;
+                    }
+                    let _ = s.read(&mut buf);
+                    n += 1;
+                }
+            })
+        })
+        .collect();
+
+    // Let the storm establish, then SIGTERM mid-flight.
+    std::thread::sleep(Duration::from_millis(500));
+    send_sigterm(pid);
+
+    let deadline = Instant::now();
+    let status = loop {
+        match child.try_wait().expect("try_wait") {
+            Some(s) => break s,
+            None => {
+                if deadline.elapsed() >= Duration::from_secs(10) {
+                    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("[storm] server did not exit within 10s after SIGTERM");
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    };
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    for w in writers {
+        let _ = w.join();
+    }
+    assert_eq!(
+        status.code(),
+        Some(0),
+        "[storm] expected exit code 0 after SIGTERM under load, got {status:?}"
+    );
 }
