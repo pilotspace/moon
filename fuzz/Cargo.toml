@@ -78,3 +78,8 @@ doc = false
 
 [workspace]
 members = ["."]
+
+[[bin]]
+name = "graph_props_record"
+path = "fuzz_targets/graph_props_record.rs"
+doc = false

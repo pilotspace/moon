@@ -96,9 +96,14 @@ pub struct MutableEdge {
 /// a construction site stamping a stale literal is exactly the bug class that
 /// made vacuumed segments misparse on reload (v1 stamp on v2 records).
 ///
-/// Parse-side gates stay numeric (`version >= 2`, `version >= 3`, `version >= 4`):
-/// they encode the version a feature was INTRODUCED at and must not track this constant.
-pub const CSR_CURRENT_VERSION: u32 = 4;
+/// Parse-side gates stay numeric (`version >= 2`, `version >= 3`, `version >= 4`,
+/// `version >= 5`): they encode the version a feature was INTRODUCED at and must
+/// not track this constant.
+///
+/// v5 adds two trailing variable-length sections (node/edge property blobs —
+/// see `csr::props`) so properties, embeddings, and edge weights survive the
+/// freeze boundary instead of being discarded.
+pub const CSR_CURRENT_VERSION: u32 = 5;
 
 /// On-disk CSR segment header -- cache-line aligned, zero-copy mmap.
 #[derive(Debug)]
