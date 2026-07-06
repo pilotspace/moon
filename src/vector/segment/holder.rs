@@ -130,8 +130,11 @@ pub struct SearchSnapshot {
     pub snapshot_lsn: u64,
     /// Active txn id (0 for non-transactional reads).
     pub my_txn_id: u64,
-    /// Committed-treemap snapshot (owned) for MVCC visibility.
-    pub committed: roaring::RoaringTreemap,
+    /// Committed-treemap snapshot for MVCC visibility. `Arc` capture (QP-2):
+    /// an O(1) refcount bump per search; the treemap is cloned only on the
+    /// first capture after a commit/prune (see
+    /// `TransactionManager::committed_snapshot`).
+    pub committed: std::sync::Arc<roaring::RoaringTreemap>,
     /// Vector dimension.
     pub dimension: u32,
     /// Entry count of the mutable segment captured at entry. The append-only
@@ -949,6 +952,12 @@ impl SegmentHolder {
         // 4. Merge all results, take global top-k (identical to search_mvcc).
         all.sort_unstable();
         all.truncate(k);
+        // QP-3: hand this query's scratch back to the thread cache; the next
+        // capture on this thread reuses it via take_thread_scratch.
+        crate::vector::hnsw::search::recycle_thread_scratch(std::mem::replace(
+            &mut snap.scratch,
+            crate::vector::hnsw::search::SearchScratch::new(0, 0),
+        ));
         all
     }
 }

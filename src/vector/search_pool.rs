@@ -269,7 +269,7 @@ mod tests {
     }
 
     fn snapshot_for(store: &mut VectorStore, query: Vec<f32>, k: usize) -> SearchSnapshot {
-        let committed = store.txn_manager().committed_treemap().clone();
+        let committed = store.txn_manager().committed_snapshot();
         let snapshot_lsn = store.txn_manager().current_lsn();
         let idx = store.get_index_mut(b"idx").unwrap();
         let segments = idx.segments.load_full();
@@ -344,7 +344,7 @@ mod tests {
         let idx = store.get_index_mut(b"idx").unwrap();
         let segments = idx.segments.load_full();
         let key_map = idx.key_hash_to_key.clone();
-        let committed = store.txn_manager().committed_treemap().clone();
+        let committed = store.txn_manager().committed_snapshot();
         let snapshot_lsn = store.txn_manager().current_lsn();
 
         let handles: Vec<_> = (0..8)

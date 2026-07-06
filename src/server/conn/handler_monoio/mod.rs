@@ -1490,7 +1490,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                 // Clone committed treemap to release vector_store lock
                                 // before acquiring kv_intents lock (lock ordering).
                                 let committed = crate::shard::slice::with_shard(|s| {
-                                    s.vector_store.txn_manager().committed_treemap().clone()
+                                    s.vector_store.txn_manager().committed_snapshot()
                                 });
                                 let visible = crate::shard::slice::with_shard(|s| {
                                     s.kv_write_intents.is_key_visible(

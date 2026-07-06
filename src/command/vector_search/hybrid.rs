@@ -366,7 +366,7 @@ pub fn execute_hybrid_search_local(
     // v0.1.9 HYB-01: snapshot the committed treemap BEFORE get_index_mut so the
     // dense stream honors AS_OF via MVCC filtering. Non-TXN readers must see
     // entries whose owning txn has committed (matches search_local_raw pattern).
-    let committed = vector_store.txn_manager().committed_treemap().clone();
+    let committed = vector_store.txn_manager().committed_snapshot();
 
     // ── Stream 1: BM25 (per D-10 — direct use of existing BM25 ranker) ────────
     //

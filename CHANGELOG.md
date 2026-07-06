@@ -6,6 +6,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance — FT.SEARCH per-query fixed-cost cleanup (QP-2/QP-3)
+
+- **Thread-cached `SearchScratch`** (QP-3): the wire path built a fresh
+  scratch per query — heaps, visited bitmap, and the 32–65KB ADC LUT
+  reallocated every FT.SEARCH. Captures now take a thread-local recycled
+  scratch (exact padded-dim match, mirroring the worker pool's cache) and
+  the yielding search returns it on completion.
+- **Amortized committed-treemap capture** (QP-2): every search cloned the
+  MVCC committed `RoaringTreemap`; `TransactionManager::committed_snapshot()`
+  now hands out a cached `Arc` refreshed only on the first capture after a
+  commit/prune — read-heavy captures are one refcount bump, write-heavy is
+  never worse than before. All 7 capture sites switched.
+- **ryu score formatting**: RESP `__vec_score` replies formatted f32 via
+  `Display` (grisu, 1.4% of a matched-recall query); now ryu.
+- VM A/B (same box/config as the f16 kernel entry): ef64 8,468 → 8,810 QPS
+  (+4.0%; +13% cumulative with the f16 kernels).
+
 ### Performance — SIMD f16 exact-rerank kernels (NEON + F16C)
 
 - The HQ-1 exact-rerank pass decoded its f16 sidecar with scalar software

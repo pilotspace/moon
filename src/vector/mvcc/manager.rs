@@ -64,6 +64,14 @@ pub struct TransactionManager {
     /// avoiding a treemap lookup for old transactions that are guaranteed visible.
     /// Invariant: `pruned_below <= oldest_snapshot`.
     pruned_below: u64,
+    /// Cached `Arc` snapshot of `committed` for per-search capture. Refreshed
+    /// lazily on the first `committed_snapshot()` after a mutation (QP-2):
+    /// read-heavy workloads capture with one Arc bump instead of cloning the
+    /// treemap on EVERY search; write-heavy pays at most one clone per search
+    /// — never worse than the old clone-per-search.
+    committed_snapshot: parking_lot::Mutex<std::sync::Arc<RoaringTreemap>>,
+    /// Set on every mutation of `committed`; cleared by the refresh.
+    committed_snapshot_dirty: std::sync::atomic::AtomicBool,
 }
 
 impl TransactionManager {
@@ -78,6 +86,8 @@ impl TransactionManager {
             committed: RoaringTreemap::new(),
             oldest_snapshot: 0,
             pruned_below: 0,
+            committed_snapshot: parking_lot::Mutex::new(std::sync::Arc::new(RoaringTreemap::new())),
+            committed_snapshot_dirty: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -229,6 +239,8 @@ impl TransactionManager {
             return false;
         }
         self.committed.insert(txn_id);
+        self.committed_snapshot_dirty
+            .store(true, std::sync::atomic::Ordering::Release);
         self.write_intents.retain(|_, owner| *owner != txn_id);
         #[cfg(feature = "graph")]
         self.graph_write_intents.retain(|_, owner| *owner != txn_id);
@@ -364,6 +376,8 @@ impl TransactionManager {
         // Remove all entries in [0, floor).
         let before = self.committed.len();
         self.committed.remove_range(..floor);
+        self.committed_snapshot_dirty
+            .store(true, std::sync::atomic::Ordering::Release);
         let after = self.committed.len();
         let pruned = before.saturating_sub(after);
         // Advance the floor. Never move it backwards.
@@ -454,6 +468,24 @@ impl TransactionManager {
     #[inline]
     pub fn committed_treemap(&self) -> &RoaringTreemap {
         &self.committed
+    }
+
+    /// Owned snapshot of the committed treemap for per-search capture (QP-2).
+    ///
+    /// Equivalent to `committed_treemap().clone()` — the returned value is
+    /// exactly the committed set at call time — but amortized: the clone
+    /// happens only on the first call after a commit/prune; subsequent calls
+    /// are an `Arc` refcount bump. The uncontended mutex is ~ns (per-shard
+    /// manager; brief critical section).
+    pub fn committed_snapshot(&self) -> std::sync::Arc<RoaringTreemap> {
+        let mut snap = self.committed_snapshot.lock();
+        if self
+            .committed_snapshot_dirty
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            *snap = std::sync::Arc::new(self.committed.clone());
+        }
+        std::sync::Arc::clone(&snap)
     }
 
     /// Recalculate oldest_snapshot from active non-killed transactions.
@@ -1025,5 +1057,36 @@ mod tests {
             .oldest_snapshot_age(baseline + Duration::from_secs(42))
             .expect("age must be Some");
         assert!(age.as_secs() >= 42, "age must be >= 42s; got {:?}", age);
+    }
+
+    #[test]
+    fn test_committed_snapshot_matches_and_amortizes() {
+        let mut mgr = TransactionManager::new();
+
+        // Fresh manager: empty snapshot.
+        let s0 = mgr.committed_snapshot();
+        assert!(s0.is_empty());
+
+        // Commit → snapshot reflects it (equivalent to clone-at-call).
+        let t1 = mgr.begin();
+        assert!(mgr.commit(t1.txn_id));
+        let s1 = mgr.committed_snapshot();
+        assert!(s1.contains(t1.txn_id));
+        assert_eq!(*s1, *mgr.committed_treemap());
+
+        // No mutation in between → same Arc (the amortization).
+        let s2 = mgr.committed_snapshot();
+        assert!(std::sync::Arc::ptr_eq(&s1, &s2));
+
+        // Another commit → refreshed Arc with the new id.
+        let t2 = mgr.begin();
+        assert!(mgr.commit(t2.txn_id));
+        let s3 = mgr.committed_snapshot();
+        assert!(!std::sync::Arc::ptr_eq(&s2, &s3));
+        assert!(s3.contains(t1.txn_id) && s3.contains(t2.txn_id));
+        assert_eq!(*s3, *mgr.committed_treemap());
+
+        // Earlier snapshots are unaffected by later mutations (owned view).
+        assert!(!s1.contains(t2.txn_id));
     }
 }

@@ -1484,7 +1484,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                                         // before acquiring kv_intents lock (lock ordering).
                                         // Unconditional slice path: ShardSlice is always initialized.
                                         let committed = crate::shard::slice::with_shard(|s| {
-                                            s.vector_store.txn_manager().committed_treemap().clone()
+                                            s.vector_store.txn_manager().committed_snapshot()
                                         });
                                         // ShardSlice path: kv_write_intents lives on the thread-local slice.
                                         let visible = crate::shard::slice::with_shard(|s| {

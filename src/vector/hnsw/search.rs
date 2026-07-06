@@ -133,6 +133,38 @@ impl SearchScratch {
     }
 }
 
+thread_local! {
+    /// Per-thread [`SearchScratch`] recycler for the wire search path (QP-3).
+    /// The snapshot capture previously built a fresh scratch per query —
+    /// heaps, visited bitmap, and the 32–65KB ADC LUT reallocated (and
+    /// re-grown during the search) every FT.SEARCH. One slot suffices:
+    /// concurrent same-thread searches (interleaved via cooperative yields)
+    /// simply miss the cache and allocate, exactly like before.
+    static SCRATCH_TLS: std::cell::RefCell<Option<SearchScratch>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Take this thread's cached [`SearchScratch`], or build a fresh one.
+///
+/// Reuse rule mirrors the search-worker pool's cache: `query_rotated.len()`
+/// must EXACTLY equal `padded_dim` — it ACTS as the search's padded
+/// dimension (LUT sizing + code_len invariants in `hnsw_search`), so a
+/// larger buffer is just as wrong as a smaller one.
+pub fn take_thread_scratch(padded_dim: u32) -> SearchScratch {
+    let cached = SCRATCH_TLS.with(|slot| slot.borrow_mut().take());
+    match cached {
+        Some(s) if s.query_rotated.len() == padded_dim as usize => s,
+        _ => SearchScratch::new(0, padded_dim),
+    }
+}
+
+/// Return a scratch to this thread's cache for the next search to reuse.
+pub fn recycle_thread_scratch(scratch: SearchScratch) {
+    SCRATCH_TLS.with(|slot| {
+        *slot.borrow_mut() = Some(scratch);
+    });
+}
+
 /// HNSW search with 2-hop dual prefetch and TQ-ADC distance.
 ///
 /// # Arguments
