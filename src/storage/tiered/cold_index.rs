@@ -110,16 +110,32 @@ impl ColdIndex {
         }
     }
 
-    /// Remove a key from the cold index (e.g., when promoted back to RAM).
+    /// Remove a key from the cold index (promotion back to RAM, DEL/UNLINK,
+    /// expired-on-read reclaim). Returns `true` when the key was present.
     ///
     /// Decrements the backing file's live-ref count; if this removes the file's
     /// last referrer, the `file_id` is queued for unlink by the next sweep.
-    pub fn remove(&mut self, key: &[u8]) {
+    pub fn remove(&mut self, key: &[u8]) -> bool {
         if let Some(old) = self.map.remove(key) {
             if self.ref_dec(old.file_id) {
                 self.pending_unlink.push(old.file_id);
             }
+            true
+        } else {
+            false
         }
+    }
+
+    /// Drop EVERY entry and queue every backing file for unlink (FLUSHDB /
+    /// FLUSHALL — D1: flushed keys must not stay readable from disk). The
+    /// files themselves are removed by the next orphan sweep, which holds
+    /// the manifest handle this method deliberately does not need.
+    pub fn clear_all(&mut self) {
+        self.map.clear();
+        for (&file_id, _) in self.file_refs.iter() {
+            self.pending_unlink.push(file_id);
+        }
+        self.file_refs.clear();
     }
 
     /// Look up a key's cold location.

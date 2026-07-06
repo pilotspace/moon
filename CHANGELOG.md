@@ -36,6 +36,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   nothing was written (DEL of missing keys), and confirmed by the
   batch-end fsync barrier under `appendfsync=always`.
 
+### Fixed — cold-tier (disk offload) correctness & reliability (PR #TBD)
+
+- **DEL/UNLINK/FLUSHALL now reach the cold tier** — deleting a key whose value
+  had been offloaded to disk left its `ColdIndex` entry alive, so the next GET
+  resurrected the deleted value from the `.mpf` heap file (`DEL` even returned
+  0 for cold-only keys). `Database::remove`/`clear` now drop the cold-index
+  entry (and queue file unlinks) alongside the hot entry, and `DEL`/`UNLINK`
+  count cold-only keys correctly.
+- **Expired cold reads reclaim their index entry** — a cold read that found an
+  expired entry returned nothing but left the index entry + file refcount
+  behind forever (nothing else ever reclaims them). The read path now
+  distinguishes `Expired` from `Miss` and removes the index entry on expiry;
+  transient I/O errors still leave the entry alone.
+- **Spill files survive a crash at the directory level** — spill writes fsynced
+  the file but never the directory, so after a power loss the (dir-fsynced)
+  manifest could reference a heap file whose directory entry vanished. Both the
+  batch (tmp+rename) and single-file spill paths now fsync `data/` after
+  publishing the file.
+- **Crash-orphaned heap files are swept at startup** — a crash between the
+  spill write and the manifest commit left `heap-*.mpf`/`.tmp` files on disk
+  that no manifest references (invisible to the cold index, leaked disk
+  forever). Recovery now unlinks unregistered heap files once the manifest has
+  opened successfully.
+
+### Added
+
+- **Spill-thread liveness metrics in `INFO persistence`** —
+  `spill_batches_flushed`, `spill_completions_dropped`, and
+  `spill_last_heartbeat_ms` (0 = never ran) expose a silently-dead spill
+  thread, whose only prior symptom was an unbounded eviction backlog.
+
 ## [0.5.1] — 2026-07-04
 
 ### Fixed

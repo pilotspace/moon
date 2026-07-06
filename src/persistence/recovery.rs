@@ -331,6 +331,17 @@ pub fn recover_shard_v3_pitr(
                 );
                 result.cold_index = Some(cold_idx);
             }
+            // Crash-orphan sweep: heap files written but never registered in
+            // the manifest (crash between spill write and manifest commit)
+            // leak disk forever otherwise. Manifest opened OK — safe to sweep.
+            let swept =
+                crate::storage::tiered::kv_spill::sweep_orphan_heap_files(shard_dir, &manifest);
+            if swept > 0 {
+                info!(
+                    "Shard {}: swept {} crash-orphaned heap file(s)",
+                    shard_id, swept
+                );
+            }
         }
     }
 

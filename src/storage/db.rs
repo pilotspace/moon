@@ -707,31 +707,43 @@ impl Database {
                 None
             }
             KeyState::Absent => {
+                use crate::storage::tiered::cold_read::ColdReadOutcome;
                 // Cold fallback: read from disk DataFile via cold_read helper.
                 // Extract owned result first to drop immutable borrows before mutation.
                 let cold_result = self.cold_shard_dir.as_ref().and_then(|shard_dir| {
-                    self.cold_index.as_ref().and_then(|ci| {
-                        crate::storage::tiered::cold_read::cold_read_through(
+                    self.cold_index.as_ref().map(|ci| {
+                        crate::storage::tiered::cold_read::cold_read_through_outcome(
                             ci, shard_dir, key, now_ms,
                         )
                     })
                 });
-                if let Some((redis_value, ttl_ms)) = cold_result {
-                    let key_bytes = Bytes::copy_from_slice(key);
-                    // Build an entry from the RedisValue (works for strings and collections)
-                    let mut entry = Entry::new_string(Bytes::new()); // placeholder
-                    entry.value =
-                        crate::storage::compact_value::CompactValue::from_redis_value(redis_value);
-                    if let Some(ttl) = ttl_ms {
-                        entry.set_expires_at_ms(self.base_timestamp, ttl);
+                match cold_result {
+                    Some(ColdReadOutcome::Hit(redis_value, ttl_ms)) => {
+                        let key_bytes = Bytes::copy_from_slice(key);
+                        // Build an entry from the RedisValue (works for strings and collections)
+                        let mut entry = Entry::new_string(Bytes::new()); // placeholder
+                        entry.value = crate::storage::compact_value::CompactValue::from_redis_value(
+                            redis_value,
+                        );
+                        if let Some(ttl) = ttl_ms {
+                            entry.set_expires_at_ms(self.base_timestamp, ttl);
+                        }
+                        self.set(key_bytes, entry);
+                        if let Some(ref mut ci) = self.cold_index {
+                            ci.remove(key);
+                        }
+                        self.data.get(key)
                     }
-                    self.set(key_bytes, entry);
-                    if let Some(ref mut ci) = self.cold_index {
-                        ci.remove(key);
+                    Some(ColdReadOutcome::Expired) => {
+                        // Expired on disk: reclaim the index entry now, or it leaks
+                        // (the orphan sweep only checks hot-shadowing, never TTL).
+                        if let Some(ref mut ci) = self.cold_index {
+                            ci.remove(key);
+                        }
+                        None
                     }
-                    return self.data.get(key);
+                    Some(ColdReadOutcome::Miss) | None => None,
                 }
-                None
             }
         }
     }
@@ -822,6 +834,12 @@ impl Database {
         self.used_memory = 0;
         self.maybe_has_expiring_keys = false;
         self.hot_keys.clear();
+        // D1: FLUSH must clear the cold tier too, or flushed keys stay
+        // readable via cold read-through. Files are queued for unlink and
+        // reclaimed by the orphan sweep (which holds the manifest handle).
+        if let Some(ci) = self.cold_index.as_mut() {
+            ci.clear_all();
+        }
     }
 
     /// The hot-key sketch (sampling hooks, HOTKEYS command, coordinator
@@ -880,7 +898,34 @@ impl Database {
     }
 
     /// Remove a key and return its entry. No expiry check needed (DEL removes regardless).
+    ///
+    /// Also removes any COLD (spilled) copy of the key — without this, a DEL
+    /// of an evicted key is a no-op and the next GET resurrects the value via
+    /// cold read-through (D1, tmp/OFFLOAD-COMPRESSION-REVIEW.md). A cold-only
+    /// key returns `None` (no in-RAM entry exists); callers that must COUNT
+    /// cold-only removals (DEL/UNLINK) use [`Self::remove_counting_cold`].
     pub fn remove(&mut self, key: &[u8]) -> Option<Entry> {
+        let _ = self.remove_cold_only(key);
+        self.remove_hot(key)
+    }
+
+    /// Remove hot + cold copies; returns `true` when EITHER existed, so
+    /// DEL/UNLINK count spilled keys as removed (Redis semantics: the key
+    /// logically exists). The removed hot entry, when present, is also
+    /// returned so UNLINK can size its async-drop decision.
+    pub fn remove_counting_cold(&mut self, key: &[u8]) -> (bool, Option<Entry>) {
+        let had_cold = self.remove_cold_only(key);
+        let hot = self.remove_hot(key);
+        (hot.is_some() || had_cold, hot)
+    }
+
+    #[inline]
+    fn remove_cold_only(&mut self, key: &[u8]) -> bool {
+        self.cold_index.as_mut().is_some_and(|ci| ci.remove(key))
+    }
+
+    #[inline]
+    fn remove_hot(&mut self, key: &[u8]) -> Option<Entry> {
         if let Some(entry) = self.data.remove(key) {
             self.used_memory = self.used_memory.saturating_sub(entry_overhead(key, &entry));
             Some(entry)

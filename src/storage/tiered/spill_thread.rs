@@ -47,6 +47,27 @@ pub fn spill_completion_dropped_total() -> u64 {
     SPILL_COMPLETION_DROPPED.load(Ordering::Relaxed)
 }
 
+/// Liveness heartbeat: unix millis of the most recent spill-thread loop
+/// iteration (across all shards). 0 = no spill thread has ever run. A stale
+/// value under active eviction means the spill thread died silently — the
+/// only other symptom is an unbounded eviction backlog.
+static SPILL_LAST_HEARTBEAT_MS: AtomicU64 = AtomicU64::new(0);
+
+/// Cumulative number of spill batches flushed to disk across all shards.
+static SPILL_BATCHES_FLUSHED: AtomicU64 = AtomicU64::new(0);
+
+/// Unix millis of the most recent spill-thread loop tick (0 = never ran).
+#[inline]
+pub fn spill_last_heartbeat_ms() -> u64 {
+    SPILL_LAST_HEARTBEAT_MS.load(Ordering::Relaxed)
+}
+
+/// Cumulative spill batches flushed to disk. Exposed for INFO / metrics.
+#[inline]
+pub fn spill_batches_flushed_total() -> u64 {
+    SPILL_BATCHES_FLUSHED.load(Ordering::Relaxed)
+}
+
 use bytes::Bytes;
 use tracing::warn;
 
@@ -151,6 +172,7 @@ fn flush_buffer(buffer: &mut Vec<SpillRequest>) -> Vec<SpillCompletion> {
     if buffer.is_empty() {
         return Vec::new();
     }
+    SPILL_BATCHES_FLUSHED.fetch_add(1, Ordering::Relaxed);
 
     let mut completions: Vec<SpillCompletion> = Vec::new();
 
@@ -366,6 +388,12 @@ impl SpillThread {
         let mut buffer: Vec<SpillRequest> = Vec::with_capacity(FLUSH_ENTRY_CAP);
 
         loop {
+            // Liveness heartbeat (R5): stamped every loop tick so INFO can
+            // surface a silently-dead spill thread. Relaxed max-store is
+            // enough — monotonicity across shards is not required.
+            SPILL_LAST_HEARTBEAT_MS
+                .fetch_max(crate::storage::entry::current_time_ms(), Ordering::Relaxed);
+
             // Check stop flag — drain any still-queued requests and flush them
             // before exiting, so spills queued at shutdown are not lost (their
             // keys may already be evicted from RAM).
@@ -551,6 +579,45 @@ mod tests {
         assert!(!st.request_tx.is_disconnected());
         assert!(!st.completion_rx.is_disconnected());
         let _ = st.shutdown();
+    }
+
+    /// R5 liveness: the spill thread must publish a heartbeat + batch counter
+    /// so a silently-dead spill thread is observable from INFO instead of
+    /// only via unbounded eviction backlog. Statics are process-global, so
+    /// assert relative progress, not absolute values.
+    #[test]
+    fn test_spill_thread_liveness_metrics() {
+        let tmp = tempfile::tempdir().unwrap();
+        let batches_before = spill_batches_flushed_total();
+
+        let st = SpillThread::new(9);
+        let sender = st.sender();
+        sender
+            .send(SpillRequest {
+                key: Bytes::from_static(b"liveness_key"),
+                db_index: 0,
+                value_bytes: Bytes::from_static(b"liveness_value"),
+                value_type: ValueType::String,
+                flags: 0,
+                ttl_ms: None,
+                file_id: 1,
+                shard_dir: tmp.path().to_path_buf(),
+            })
+            .unwrap();
+        drop(sender);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let completions = collect_entries(&st, 1, deadline);
+        assert!(!completions.is_empty(), "spill must complete");
+
+        assert!(
+            spill_batches_flushed_total() > batches_before,
+            "flushing a batch must increment spill_batches_flushed_total"
+        );
+        assert!(
+            spill_last_heartbeat_ms() > 0,
+            "a running spill thread must publish a heartbeat timestamp"
+        );
     }
 
     /// Single request produces a successful per-FILE completion with one entry.
