@@ -91,6 +91,15 @@ pub(crate) async fn handle_connection_sharded(
         .peer_addr()
         .map(|a| a.to_string())
         .unwrap_or_else(|_| "unknown".to_string());
+    // R-3: capture the socket fd for CLIENT KILL force-close before the stream
+    // is moved into the generic inner handler (which has no AsRawFd bound).
+    #[cfg(unix)]
+    let kill_fd = {
+        use std::os::unix::io::AsRawFd;
+        stream.as_raw_fd()
+    };
+    #[cfg(not(unix))]
+    let kill_fd = -1;
     let result = handle_connection_sharded_inner(
         stream,
         peer_addr,
@@ -105,6 +114,7 @@ pub(crate) async fn handle_connection_sharded(
         cfg!(unix),
         BytesMut::new(),
         None, // fresh connection, no migrated state
+        kill_fd,
     )
     .await;
 
@@ -228,6 +238,10 @@ pub(crate) async fn handle_connection_sharded_inner<
     can_migrate: bool,
     initial_read_buf: BytesMut,
     migrated_state: Option<&MigratedConnectionState>,
+    // Raw socket fd for CLIENT KILL force-close (R-3), or -1 if unavailable
+    // (non-unix). Threaded from the concrete spawn site; the generic `S` here
+    // has no `AsRawFd` bound.
+    kill_fd: i32,
 ) -> (HandlerResult, Option<S>) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -267,6 +281,7 @@ pub(crate) async fn handle_connection_sharded_inner<
         peer_addr.clone(),
         conn.current_user.clone(),
         ctx.shard_id,
+        kill_fd,
     );
     struct RegistryGuard(u64);
     impl Drop for RegistryGuard {

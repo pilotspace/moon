@@ -26,7 +26,7 @@ pub fn parse(buf: &mut BytesMut, config: &ParseConfig) -> Result<Option<Frame>, 
         b'+' | b'-' | b':' | b'$' | b'*' // RESP2
         | b'%' | b'~' | b',' | b'#' | b'_' | b'=' | b'(' | b'>' // RESP3
         => { /* fall through to RESP parsing below */ }
-        _ => return inline::parse_inline(buf),
+        _ => return inline::parse_inline(buf, config.max_inline_size),
     }
 
     // Pass 1: Validate structure and compute total byte length (zero allocations)
@@ -1212,6 +1212,7 @@ mod tests {
             max_bulk_string_size: 64 * 1024,
             max_array_depth: 4,
             max_array_length: 256,
+            max_inline_size: 64 * 1024,
         };
         let mut buf = BytesMut::from(data);
         // Must not panic — any combination of Ok/Err is acceptable
@@ -1278,6 +1279,7 @@ mod tests {
             max_bulk_string_size: 64 * 1024,
             max_array_depth: 4,
             max_array_length: 256,
+            max_inline_size: 64 * 1024,
         };
         for _ in 0..16 {
             if buf.is_empty() {

@@ -14,6 +14,7 @@ fuzz_target!(|data: &[u8]| {
         max_bulk_string_size: 64 * 1024,
         max_array_depth: 4,
         max_array_length: 256,
+        max_inline_size: 64 * 1024,
     };
 
     let mut buf1 = BytesMut::from(data);

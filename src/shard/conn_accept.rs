@@ -250,6 +250,15 @@ pub(crate) fn spawn_tokio_connection(
                 );
                 return;
             }
+            // R-3: capture the underlying TCP fd before the handshake moves the
+            // stream — shutdown on it force-closes the TLS session too.
+            #[cfg(unix)]
+            let kill_fd = {
+                use std::os::unix::io::AsRawFd;
+                tcp_stream.as_raw_fd()
+            };
+            #[cfg(not(unix))]
+            let kill_fd = -1;
             let acceptor = tokio_rustls::TlsAcceptor::from(tls_cfg);
             match acceptor.accept(tcp_stream).await {
                 Ok(tls_stream) => {
@@ -262,6 +271,7 @@ pub(crate) fn spawn_tokio_connection(
                         false, // can_migrate: TLS connections cannot transfer session state
                         BytesMut::new(),
                         None, // fresh connection
+                        kill_fd,
                     )
                     .await;
                 }
@@ -445,6 +455,14 @@ pub(crate) fn spawn_migrated_tokio_connection(
 
             // State restoration happens directly via migrated_state parameter —
             // no synthetic RESP commands, no leaked responses.
+            // R-3: capture the migrated socket fd for CLIENT KILL force-close.
+            #[cfg(unix)]
+            let kill_fd = {
+                use std::os::unix::io::AsRawFd;
+                tcp_stream.as_raw_fd()
+            };
+            #[cfg(not(unix))]
+            let kill_fd = -1;
             tokio::task::spawn_local(async move {
                 let _ = handle_connection_sharded_inner(
                     tcp_stream,
@@ -455,6 +473,7 @@ pub(crate) fn spawn_migrated_tokio_connection(
                     false, // can_migrate: already-migrated connections skip re-migration sampling
                     migration_buf,
                     Some(&state),
+                    kill_fd,
                 )
                 .await;
             });
@@ -516,6 +535,15 @@ pub(crate) fn spawn_monoio_connection(
 
     match monoio::net::TcpStream::from_std(std_tcp_stream) {
         Ok(tcp_stream) => {
+            // R-3: capture the socket fd for CLIENT KILL force-close before the
+            // stream is moved into a spawned handler (generic `S`, no AsRawFd).
+            #[cfg(unix)]
+            let kill_fd = {
+                use std::os::unix::io::AsRawFd;
+                tcp_stream.as_raw_fd()
+            };
+            #[cfg(not(unix))]
+            let kill_fd = -1;
             let aff = affinity_tracker.clone();
             let rsm = remote_subscriber_map.clone();
             let sdbs = shard_databases.clone();
@@ -627,6 +655,7 @@ pub(crate) fn spawn_monoio_connection(
                                 BytesMut::new(),
                                 pw,
                                 None, // fresh connection
+                                kill_fd,
                             )
                             .await;
                         }
@@ -664,6 +693,7 @@ pub(crate) fn spawn_monoio_connection(
                         BytesMut::new(),
                         pw,
                         None, // fresh connection
+                        kill_fd,
                     )
                     .await;
 
@@ -940,6 +970,14 @@ pub(crate) fn spawn_migrated_monoio_connection(
                 do_dir,
             );
 
+            // R-3: capture the migrated socket fd for CLIENT KILL force-close.
+            #[cfg(unix)]
+            let kill_fd = {
+                use std::os::unix::io::AsRawFd;
+                tcp_stream.as_raw_fd()
+            };
+            #[cfg(not(unix))]
+            let kill_fd = -1;
             monoio::spawn(async move {
                 let _ = handle_connection_sharded_monoio(
                     tcp_stream,
@@ -951,6 +989,7 @@ pub(crate) fn spawn_migrated_monoio_connection(
                     migration_buf,
                     pw,
                     Some(&state),
+                    kill_fd,
                 )
                 .await;
                 // Migrated connection: the source shard's wrapper skipped the

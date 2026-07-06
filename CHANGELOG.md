@@ -132,6 +132,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shared `READY_TIMEOUT` constant (poll-based loop notices readiness within
   100ms either way; the fixed 15s was a documented host-load flake,
   observed on the macOS CI runner).
+### Fixed — connection-plane robustness hardening (Track B) (PR #230)
+
+- **R-3 — `CLIENT KILL` force-closes idle connections** (`src/client_registry.rs`,
+  handlers, `conn_accept.rs`): `CLIENT KILL` only set a cooperative `kill_flag`
+  checked once per batch, so a connection parked in `read().await` (idle, the
+  default `timeout 0`) was never torn down until it next sent bytes. Now the
+  registry stores each connection's socket fd and `kill_clients` also
+  `shutdown(2)`s it, so the parked read returns `Ok(0)`/`Err` immediately (the
+  existing disconnect path). The raw-fd close is race-free: `kill_clients` holds
+  the registry read lock, and a connection's `RegistryGuard` deregisters (needs
+  the write lock) strictly before its stream drops — so a visible entry always
+  has a live fd. No-op on non-unix (`CLIENT KILL` stays cooperative there).
+- **R-2 — inline-command length cap** (`src/protocol/inline.rs`,
+  `frame.rs`): the RESP-less inline path had no maximum line length, so a
+  client that never sends `\r\n` (raw non-RESP bytes) grew the connection read
+  buffer without bound — a per-connection memory-exhaustion vector. Added
+  `ParseConfig::max_inline_size` (default 64 KB, mirroring Redis's
+  `PROTO_INLINE_MAX_SIZE`); `parse_inline` now rejects an over-cap line
+  (complete or incomplete) with `Protocol error: too big inline request`
+  instead of buffering forever.
+- **R-1 — bounded cross-shard `spsc_send`** (`src/shard/coordinator.rs`): the
+  single dispatch primitive behind every scatter-gather command (MGET/MSET/
+  DEL/EXISTS/SCAN/KEYS/DBSIZE, vector scatter, FT.INFO, graph traverse) retried
+  a full SPSC ring in an **unbounded** `loop { try_push; yield/sleep }` — on
+  tokio `yield_now()` reschedules with no backoff, busy-spinning a full core,
+  and a wedged target could block graceful shutdown forever. Replaced with a
+  bounded retry (`CROSS_SHARD_PUSH_MAX_RETRIES` × `CROSS_SHARD_PUSH_BACKOFF`,
+  the same budget as `push_with_backpressure`) returning `PushOutcome`. On
+  give-up the message is dropped; reply-carrying callers observe the closed
+  reply channel and synthesize a per-shard error via the path they already
+  handle.
+- **R-4 — accept-loop backoff on fd exhaustion** (`src/server/accept_backoff.rs`,
+  `listener.rs`, `shard/event_loop.rs`): all six socket-accept loops (tokio
+  and monoio; sharded, non-sharded, and TLS) retried `accept()` errors with
+  zero backoff, so `EMFILE`/`ENFILE` under a connection storm pinned a shard
+  core at 100% and flooded the log. Added `AcceptBackoff`: capped exponential
+  backoff (1 ms → 1 s) on resource-exhaustion errors only, plus rate-limited
+  logging; benign per-connection errors (e.g. `ECONNABORTED`) log without
+  sleeping. The io_uring multishot-accept resubmit (opt-in `MOON_URING=1`
+  bridge) is documented as a scoped follow-up (synchronous CQE handler, no
+  async context to sleep in).
 
 ### Changed — consolidated dependency bumps (PR #TBD)
 

@@ -31,6 +31,13 @@ pub struct ClientLiveState {
     pub flags: AtomicU8,
     /// Set by CLIENT KILL — the handler checks this and closes the connection.
     pub kill_flag: AtomicBool,
+    /// Raw socket fd for out-of-band force-close (R-1/R-3). `CLIENT KILL` sets
+    /// `kill_flag` (cooperative) AND `shutdown(2)`s this fd, so a connection
+    /// parked in `read().await` (idle, `timeout 0`) is torn down immediately
+    /// instead of waiting until it next sends bytes. `-1` = no fd (tests /
+    /// non-unix). Set once at registration; only read by `kill_clients` while
+    /// holding the registry lock (see the drop-ordering safety note there).
+    pub kill_fd: i32,
 }
 
 impl ClientLiveState {
@@ -110,7 +117,13 @@ impl ClientFlags {
 ///
 /// Returns the connection's lock-free live-state handle; the connection task
 /// keeps it for per-batch `touch()` and `is_killed()` without the registry lock.
-pub fn register(id: u64, addr: String, user: String, shard: usize) -> Arc<ClientLiveState> {
+pub fn register(
+    id: u64,
+    addr: String,
+    user: String,
+    shard: usize,
+    kill_fd: i32,
+) -> Arc<ClientLiveState> {
     let live = Arc::new(ClientLiveState {
         connected_at: Instant::now(),
         connected_at_epoch_ms: crate::storage::entry::current_time_ms(),
@@ -118,6 +131,7 @@ pub fn register(id: u64, addr: String, user: String, shard: usize) -> Arc<Client
         last_cmd_ms: AtomicU64::new(0),
         flags: AtomicU8::new(ClientFlags::default().to_bits()),
         kill_flag: AtomicBool::new(false),
+        kill_fd,
     });
     let entry = ClientEntry {
         id,
@@ -186,7 +200,20 @@ pub fn client_info(id: u64) -> Option<String> {
 }
 
 /// Kill clients matching the given filter. Returns count of killed clients.
+///
+/// Sets the cooperative `kill_flag` (checked once per batch by the handler)
+/// AND force-closes the socket via `shutdown(2)`, so a connection currently
+/// parked in `read().await` — idle with `timeout 0` — is torn down at once
+/// rather than lingering until it next sends bytes. The parked read returns
+/// `Ok(0)`/`Err`, which the handler already treats as disconnect.
 pub fn kill_clients(filter: &KillFilter) -> u64 {
+    // Hold the read lock across the whole loop. This is what makes the raw-fd
+    // `shutdown` free of a use-after-reuse race: a connection's `RegistryGuard`
+    // (a local) drops — and calls `deregister`, which needs the registry WRITE
+    // lock — strictly before its `stream` (a parameter) drops and closes the
+    // fd. So while we hold the READ lock and an entry is present, `deregister`
+    // for it is blocked, its `stream` has not dropped, and `kill_fd` is still
+    // an open socket. Once an entry is gone, we never touch its fd.
     let registry = REGISTRY.read();
     let mut count = 0u64;
     for entry in registry.values() {
@@ -197,10 +224,30 @@ pub fn kill_clients(filter: &KillFilter) -> u64 {
         };
         if matches {
             entry.live.kill_flag.store(true, Ordering::Relaxed);
+            force_close_fd(entry.live.kill_fd);
             count += 1;
         }
     }
     count
+}
+
+/// `shutdown(SHUT_RDWR)` the given socket fd to wake a parked `read`. No-op for
+/// `-1` (no fd) and on non-unix targets (CLIENT KILL stays cooperative there).
+#[inline]
+fn force_close_fd(fd: i32) {
+    #[cfg(unix)]
+    if fd >= 0 {
+        // SAFETY: `libc::shutdown` is an FFI call that cannot cause memory
+        // unsafety for any integer argument — an invalid fd merely returns
+        // `EBADF`. Per the lock-ordering note in `kill_clients`, `fd` is a live
+        // socket for the duration of this call. We intentionally ignore the
+        // return value: a already-closed/half-closed socket is a benign no-op.
+        unsafe {
+            libc::shutdown(fd, libc::SHUT_RDWR);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = fd;
 }
 
 /// Filter for CLIENT KILL.
@@ -269,7 +316,7 @@ mod tests {
     #[test]
     fn test_register_and_list() {
         let id = 999_000;
-        register(id, "127.0.0.1:12345".into(), "default".into(), 0);
+        register(id, "127.0.0.1:12345".into(), "default".into(), 0, -1);
         let list = client_list();
         assert!(list.contains("id=999000"));
         assert!(list.contains("addr=127.0.0.1:12345"));
@@ -282,7 +329,7 @@ mod tests {
     #[test]
     fn test_client_info() {
         let id = 999_001;
-        register(id, "10.0.0.1:5000".into(), "alice".into(), 1);
+        register(id, "10.0.0.1:5000".into(), "alice".into(), 1, -1);
         let info = client_info(id);
         assert!(info.is_some());
         assert!(info.as_ref().is_some_and(|s| s.contains("user=alice")));
@@ -293,7 +340,7 @@ mod tests {
     #[test]
     fn test_kill_by_id() {
         let id = 999_002;
-        let live = register(id, "10.0.0.2:6000".into(), "bob".into(), 0);
+        let live = register(id, "10.0.0.2:6000".into(), "bob".into(), 0, -1);
         assert!(!is_killed(id));
         assert!(!live.is_killed());
         let count = kill_clients(&KillFilter::Id(id));
@@ -303,12 +350,46 @@ mod tests {
         deregister(id);
     }
 
+    // R-3: CLIENT KILL must force-close the socket so a connection blocked in
+    // read() (idle, `timeout 0`) is torn down immediately, not only on its next
+    // byte. We register one end of a socketpair and assert the peer observes EOF
+    // after the kill — proving the fd was actually shut down.
+    #[cfg(unix)]
+    #[test]
+    fn test_kill_force_closes_socket_fd() {
+        use std::io::Read;
+        use std::os::unix::io::AsRawFd;
+        use std::os::unix::net::UnixStream;
+
+        let (killed_end, mut peer) = UnixStream::pair().expect("socketpair");
+        let id = 999_020;
+        let live = register(
+            id,
+            "unix:socketpair".into(),
+            "default".into(),
+            0,
+            killed_end.as_raw_fd(),
+        );
+
+        let count = kill_clients(&KillFilter::Id(id));
+        assert_eq!(count, 1);
+        assert!(live.is_killed());
+
+        // After shutdown(SHUT_RDWR) on killed_end, the peer's read returns 0 (EOF).
+        let mut buf = [0u8; 8];
+        let n = peer.read(&mut buf).expect("peer read after kill");
+        assert_eq!(n, 0, "peer must see EOF once the killed fd is shut down");
+
+        deregister(id);
+        drop(killed_end);
+    }
+
     #[test]
     fn test_kill_by_user() {
         let id1 = 999_010;
         let id2 = 999_011;
-        register(id1, "10.0.0.3:7000".into(), "eve".into(), 0);
-        register(id2, "10.0.0.4:7001".into(), "eve".into(), 1);
+        register(id1, "10.0.0.3:7000".into(), "eve".into(), 0, -1);
+        register(id2, "10.0.0.4:7001".into(), "eve".into(), 1, -1);
         let count = kill_clients(&KillFilter::User("eve".into()));
         assert_eq!(count, 2);
         assert!(is_killed(id1));
@@ -320,7 +401,7 @@ mod tests {
     #[test]
     fn test_update_and_touch() {
         let id = 999_003;
-        let live = register(id, "10.0.0.5:8000".into(), "default".into(), 0);
+        let live = register(id, "10.0.0.5:8000".into(), "default".into(), 0, -1);
         update(id, |e| {
             e.name = Some("myconn".into());
         });
@@ -334,7 +415,7 @@ mod tests {
     #[test]
     fn test_touch_uses_caller_clock_not_instant_now() {
         let id = 999_004;
-        let live = register(id, "10.0.0.6:9000".into(), "default".into(), 0);
+        let live = register(id, "10.0.0.6:9000".into(), "default".into(), 0, -1);
         // touch takes the caller's (shard-cached) epoch clock — no per-op
         // Instant::now(). last_cmd_ms stays "ms since connect".
         live.touch(2, ClientFlags::default(), live.connected_at_epoch_ms + 5000);

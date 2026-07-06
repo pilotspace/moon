@@ -119,6 +119,10 @@ pub(crate) async fn handle_connection_sharded_monoio<
     // and the event loop still sweeps it every iteration.
     _pending_wakers: Rc<RefCell<Vec<std::task::Waker>>>,
     migrated_state: Option<&MigratedConnectionState>,
+    // Raw socket fd for CLIENT KILL force-close (R-3), or -1 if unavailable
+    // (non-unix). Threaded from the concrete spawn site; the generic `S` here
+    // has no `AsRawFd` bound.
+    kill_fd: i32,
 ) -> (MonoioHandlerResult, Option<S>) {
     use monoio::io::AsyncWriteRentExt;
 
@@ -159,6 +163,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
         peer_addr.clone(),
         conn.current_user.clone(),
         ctx.shard_id,
+        kill_fd,
     );
     struct RegistryGuard(u64);
     impl Drop for RegistryGuard {
