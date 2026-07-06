@@ -509,8 +509,20 @@ impl GraphReplayCollector {
                         let src_key = node_map.get(src_id).copied();
                         let dst_key = node_map.get(dst_id).copied();
                         if let (Some(src), Some(dst)) = (src_key, dst_key) {
+                            // Cross-tier aware: endpoints seeded from CSR
+                            // segments are non-resident in `mg` — a plain
+                            // add_edge would silently drop the edge on
+                            // replay. node_map membership IS the existence
+                            // proof (replayed node or CSR row).
                             if mg
-                                .add_edge(src, dst, *edge_type, *weight, properties.clone(), 0)
+                                .add_edge_across_tiers(
+                                    src,
+                                    dst,
+                                    *edge_type,
+                                    *weight,
+                                    properties.clone(),
+                                    0,
+                                )
                                 .is_ok()
                             {
                                 *replayed += 1;

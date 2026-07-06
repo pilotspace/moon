@@ -31,6 +31,12 @@ pub struct FrozenMemGraph {
 pub struct MemGraph {
     nodes: SlotMap<NodeKey, MutableNode>,
     edges: SlotMap<EdgeKey, MutableEdge>,
+    /// Adjacency (outgoing / incoming) for cross-tier "delta" edges whose
+    /// endpoint was frozen into a CSR segment. A frozen endpoint has no
+    /// `MutableNode` to carry inline adjacency, so its edge keys live here,
+    /// keyed by the frozen NodeKey. Rebuilt at each freeze (see `freeze`).
+    ghost_out: std::collections::HashMap<NodeKey, SmallVec<[EdgeKey; 4]>>,
+    ghost_in: std::collections::HashMap<NodeKey, SmallVec<[EdgeKey; 4]>>,
     /// Count of live (non-deleted) nodes.
     live_node_count: usize,
     /// Count of live (non-deleted) edges.
@@ -46,6 +52,8 @@ impl MemGraph {
         Self {
             nodes: SlotMap::with_key(),
             edges: SlotMap::with_key(),
+            ghost_out: std::collections::HashMap::new(),
+            ghost_in: std::collections::HashMap::new(),
             live_node_count: 0,
             live_edge_count: 0,
             edge_threshold,
@@ -134,6 +142,63 @@ impl MemGraph {
         Ok(ek)
     }
 
+    /// Insert an edge whose endpoints may live in the frozen CSR tier
+    /// (a "delta" edge). Resident endpoints are validated alive and get
+    /// inline adjacency; non-resident endpoints get ghost adjacency.
+    ///
+    /// The CALLER is responsible for having verified that each non-resident
+    /// endpoint exists and is alive in an immutable segment (e.g. via
+    /// `MergedNodeView::is_visible`) — MemGraph cannot see the CSR tier.
+    pub fn add_edge_across_tiers(
+        &mut self,
+        src: NodeKey,
+        dst: NodeKey,
+        edge_type: u16,
+        weight: f64,
+        properties: Option<PropertyMap>,
+        lsn: u64,
+    ) -> Result<EdgeKey, GraphError> {
+        if self.frozen {
+            return Err(GraphError::AlreadyFrozen);
+        }
+        if src == dst {
+            return Err(GraphError::SelfLoop);
+        }
+        // Resident endpoints must be alive; non-resident are caller-verified.
+        for key in [src, dst] {
+            if let Some(n) = self.nodes.get(key) {
+                if n.deleted_lsn != u64::MAX {
+                    return Err(GraphError::NodeNotFound);
+                }
+            }
+        }
+
+        let ek = self.edges.insert(MutableEdge {
+            src,
+            dst,
+            edge_type,
+            weight,
+            properties,
+            created_lsn: lsn,
+            deleted_lsn: u64::MAX,
+            txn_id: 0,
+            valid_from: 0,
+            valid_to: i64::MAX,
+            created_ms: crate::storage::entry::current_time_ms(),
+        });
+
+        match self.nodes.get_mut(src) {
+            Some(src_node) => src_node.outgoing.push(ek),
+            None => self.ghost_out.entry(src).or_default().push(ek),
+        }
+        match self.nodes.get_mut(dst) {
+            Some(dst_node) => dst_node.incoming.push(ek),
+            None => self.ghost_in.entry(dst).or_default().push(ek),
+        }
+        self.live_edge_count += 1;
+        Ok(ek)
+    }
+
     /// Soft-delete a node and all its incident edges.
     pub fn remove_node(&mut self, key: NodeKey, lsn: u64) -> bool {
         let Some(node) = self.nodes.get_mut(key) else {
@@ -213,10 +278,28 @@ impl MemGraph {
     /// No heap allocation: iterates over borrowed SmallVec adjacency lists.
     pub fn neighbors(&self, node: NodeKey, direction: Direction, lsn: u64) -> NeighborIter<'_> {
         let Some(n) = self.nodes.get(node) else {
+            // Non-resident (frozen) node: serve delta-edge adjacency from the
+            // ghost maps so cross-tier edges are traversable from BOTH ends.
+            let ghost_out = match direction {
+                Direction::Outgoing | Direction::Both => self
+                    .ghost_out
+                    .get(&node)
+                    .map(|v| v.as_slice())
+                    .unwrap_or(&[]),
+                Direction::Incoming => &[],
+            };
+            let ghost_in = match direction {
+                Direction::Incoming | Direction::Both => self
+                    .ghost_in
+                    .get(&node)
+                    .map(|v| v.as_slice())
+                    .unwrap_or(&[]),
+                Direction::Outgoing => &[],
+            };
             return NeighborIter {
                 edges: &self.edges,
-                out_iter: [].iter(),
-                in_iter: [].iter(),
+                out_iter: ghost_out.iter(),
+                in_iter: ghost_in.iter(),
                 lsn,
                 source: node,
             };
@@ -309,11 +392,40 @@ impl MemGraph {
 
     /// Freeze the MemGraph, returning a FrozenMemGraph with all data for CSR conversion.
     /// Only includes live (non-deleted) nodes and edges.
+    ///
+    /// Cross-tier "delta" edges — edges with at least one endpoint that was
+    /// frozen into an EARLIER segment — are RETAINED in the mutable tier
+    /// (with their EdgeKeys intact) instead of being handed to CSR
+    /// conversion: `CsrSegment::from_frozen` can only encode edges whose
+    /// endpoint rows exist in the segment being built, and would silently
+    /// drop them. Their ghost adjacency is rebuilt for the post-freeze world
+    /// (every endpoint is non-resident once the nodes drain).
     pub fn freeze(&mut self) -> Result<FrozenMemGraph, GraphError> {
         if self.frozen {
             return Err(GraphError::AlreadyFrozen);
         }
         self.frozen = true;
+
+        // Partition edges BEFORE draining nodes (residency check needs the
+        // slot map): live + both endpoints resident → freeze into CSR;
+        // live + any frozen-elsewhere endpoint → retain as delta;
+        // dead → drop.
+        let mut freeze_keys: Vec<EdgeKey> = Vec::new();
+        let mut dead_keys: Vec<EdgeKey> = Vec::new();
+        for (ek, e) in self.edges.iter() {
+            if e.deleted_lsn != u64::MAX {
+                dead_keys.push(ek);
+            } else if self.nodes.contains_key(e.src) && self.nodes.contains_key(e.dst) {
+                freeze_keys.push(ek);
+            }
+        }
+        for ek in dead_keys {
+            self.edges.remove(ek);
+        }
+        let edges: Vec<(EdgeKey, MutableEdge)> = freeze_keys
+            .into_iter()
+            .filter_map(|ek| self.edges.remove(ek).map(|e| (ek, e)))
+            .collect();
 
         let nodes: Vec<(NodeKey, MutableNode)> = self
             .nodes
@@ -321,11 +433,14 @@ impl MemGraph {
             .filter(|(_, n)| n.deleted_lsn == u64::MAX)
             .collect();
 
-        let edges: Vec<(EdgeKey, MutableEdge)> = self
-            .edges
-            .drain()
-            .filter(|(_, e)| e.deleted_lsn == u64::MAX)
-            .collect();
+        // Rebuild ghost adjacency for the retained delta edges: with the
+        // node slot map drained, EVERY endpoint is now non-resident.
+        self.ghost_out.clear();
+        self.ghost_in.clear();
+        for (ek, e) in self.edges.iter() {
+            self.ghost_out.entry(e.src).or_default().push(ek);
+            self.ghost_in.entry(e.dst).or_default().push(ek);
+        }
 
         Ok(FrozenMemGraph { nodes, edges })
     }
@@ -339,8 +454,10 @@ impl MemGraph {
     /// and silently alias new nodes onto frozen rows.
     pub fn thaw(&mut self) {
         self.frozen = false;
+        // Post-freeze contents: zero nodes, retained delta edges (all live —
+        // freeze removed dead ones).
         self.live_node_count = 0;
-        self.live_edge_count = 0;
+        self.live_edge_count = self.edges.len();
     }
 }
 
@@ -531,6 +648,72 @@ mod tests {
 
         // Double freeze should fail.
         assert_eq!(g.freeze().unwrap_err(), GraphError::AlreadyFrozen);
+    }
+
+    #[test]
+    fn test_delta_edge_across_freeze_traversable_both_ends() {
+        let mut g = MemGraph::new(1000);
+        let a = g.add_node(smallvec![0], empty_props(), None, 1);
+        let b = g.add_node(smallvec![0], empty_props(), None, 1);
+        g.add_edge(a, b, 1, 1.0, None, 2).expect("ok");
+        let frozen = g.freeze().expect("freeze");
+        assert_eq!(frozen.nodes.len(), 2);
+        g.thaw();
+
+        // Plain add_edge between frozen endpoints must still refuse (caller
+        // hasn't verified segment existence)...
+        assert_eq!(
+            g.add_edge(a, b, 2, 1.0, None, 3).unwrap_err(),
+            GraphError::NodeNotFound
+        );
+        // ...while the cross-tier insert succeeds and is traversable from
+        // BOTH frozen endpoints via ghost adjacency.
+        let ek = g
+            .add_edge_across_tiers(a, b, 2, 1.0, None, 3)
+            .expect("delta edge");
+        let out: Vec<_> = g.neighbors(a, Direction::Outgoing, u64::MAX).collect();
+        assert_eq!(out, vec![(ek, b)]);
+        let inc: Vec<_> = g.neighbors(b, Direction::Incoming, u64::MAX).collect();
+        assert_eq!(inc, vec![(ek, a)]);
+        assert!(
+            g.neighbors(a, Direction::Incoming, u64::MAX)
+                .next()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_freeze_retains_delta_edges_with_stable_keys() {
+        let mut g = MemGraph::new(1000);
+        let a = g.add_node(smallvec![0], empty_props(), None, 1);
+        let b = g.add_node(smallvec![0], empty_props(), None, 1);
+        g.add_edge(a, b, 1, 1.0, None, 2).expect("ok");
+        g.freeze().expect("freeze 1");
+        g.thaw();
+
+        // Delta edge between frozen endpoints + a fresh resident pair.
+        let ek_delta = g
+            .add_edge_across_tiers(a, b, 2, 1.5, None, 3)
+            .expect("delta");
+        let c = g.add_node(smallvec![0], empty_props(), None, 4);
+        let d = g.add_node(smallvec![0], empty_props(), None, 4);
+        let ek_res = g.add_edge(c, d, 1, 1.0, None, 5).expect("resident");
+
+        // Second freeze: the resident pair + edge freezes; the delta edge is
+        // RETAINED (CSR cannot host an edge without its endpoint rows) with
+        // the SAME EdgeKey, and stays traversable.
+        let frozen = g.freeze().expect("freeze 2");
+        g.thaw();
+        assert_eq!(frozen.nodes.len(), 2, "c and d freeze");
+        assert_eq!(frozen.edges.len(), 1, "only the resident edge freezes");
+        assert_eq!(frozen.edges[0].0, ek_res);
+
+        assert!(g.get_edge(ek_delta).is_some(), "delta edge key stable");
+        let out: Vec<_> = g.neighbors(a, Direction::Outgoing, u64::MAX).collect();
+        assert_eq!(out, vec![(ek_delta, b)]);
+        // c/d froze normally: no delta adjacency left behind for them.
+        assert!(g.neighbors(c, Direction::Both, u64::MAX).next().is_none());
+        assert_eq!(g.edge_count(), 1, "live count = retained delta edge");
     }
 
     #[test]

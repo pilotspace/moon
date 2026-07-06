@@ -250,6 +250,44 @@ fn neighbors_works_on_frozen_node() {
 }
 
 #[test]
+fn neighbors_direction_arg_is_honored() {
+    let mut store = setup();
+    let handles = seed_across_freeze(&mut store);
+    // Reply layout: one edge frame + one node frame per neighbor.
+    let count = |dir: &str| -> usize {
+        let reply = graph_neighbors(
+            &store,
+            &[
+                bs(GRAPH),
+                bs(&handles[0].to_string()),
+                bs("DIRECTION"),
+                bs(dir),
+            ],
+        );
+        match reply {
+            Frame::Array(items) => items.len() / 2,
+            other => panic!("NEIGHBORS DIRECTION {dir} failed: {other:?}"),
+        }
+    };
+    assert_eq!(count("OUT"), 3, "node 0 out-neighbors: 1, 2, 3");
+    assert_eq!(count("IN"), 1, "node 0 in-neighbor: 5");
+    assert_eq!(count("BOTH"), 4, "union of both directions");
+    let bad = graph_neighbors(
+        &store,
+        &[
+            bs(GRAPH),
+            bs(&handles[0].to_string()),
+            bs("DIRECTION"),
+            bs("SIDEWAYS"),
+        ],
+    );
+    assert!(
+        matches!(bad, Frame::Error(_)),
+        "invalid DIRECTION must error, got {bad:?}"
+    );
+}
+
+#[test]
 fn addedge_between_frozen_nodes_succeeds() {
     let mut store = setup();
     let handles = seed_across_freeze(&mut store);

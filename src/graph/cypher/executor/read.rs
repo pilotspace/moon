@@ -585,7 +585,23 @@ pub fn execute_profile(
                     EdgeDirection::Both => Direction::Both,
                 };
 
+                // Cross-segment expansion (parity with the main executor —
+                // memgraph-only neighbors miss every frozen CSR edge).
+                let edge_type_filter = if type_ids.len() == 1 {
+                    Some(type_ids[0])
+                } else {
+                    None
+                };
+                let reader = SegmentMergeReader::new(
+                    Some(memgraph),
+                    csr_segs,
+                    dir,
+                    u64::MAX,
+                    edge_type_filter,
+                );
+
                 let committed = roaring::RoaringBitmap::new();
+                let view = crate::graph::view::MergedNodeView::new(memgraph, csr_segs);
                 let mut new_rows = Vec::new();
                 for row in &rows {
                     let src_key = match row.get(source) {
@@ -594,32 +610,27 @@ pub fn execute_profile(
                     };
 
                     if *max_hops <= 1 {
-                        for (edge_key, neighbor_key) in memgraph.neighbors(src_key, dir, u64::MAX) {
-                            if !type_ids.is_empty() {
-                                if let Some(edge) = memgraph.get_edge(edge_key) {
-                                    if !type_ids.contains(&edge.edge_type) {
-                                        continue;
-                                    }
-                                }
+                        for merged in reader.neighbors(src_key) {
+                            if type_ids.len() > 1 && !type_ids.contains(&merged.edge_type) {
+                                continue;
                             }
                             // Bi-temporal visibility check on target node
-                            if let Some(target_node) = memgraph.get_node(neighbor_key) {
-                                if !crate::graph::visibility::is_node_visible(
-                                    target_node,
-                                    ctx.snapshot_lsn,
-                                    ctx.my_txn_id,
-                                    &committed,
-                                    ctx.valid_time_as_of,
-                                ) {
-                                    continue;
-                                }
+                            // (merged view — parity with main executor).
+                            if !view.is_visible(
+                                merged.node,
+                                ctx.snapshot_lsn,
+                                ctx.my_txn_id,
+                                &committed,
+                                ctx.valid_time_as_of,
+                            ) {
+                                continue;
                             }
                             let mut new_row = row.clone();
-                            new_row.insert(target.clone(), Value::Node(neighbor_key));
+                            new_row.insert(target.clone(), Value::Node(merged.node));
                             // v0.1.9 CYP-06: bind edge variable in execute_profile
                             // single-hop path (parity with main executor).
                             if let Some(evar) = edge_variable {
-                                new_row.insert(evar.clone(), Value::Edge(edge_key));
+                                new_row.insert(evar.clone(), Value::Edge(merged.edge));
                             }
                             new_rows.push(new_row);
                         }
@@ -637,25 +648,19 @@ pub fn execute_profile(
                         for hop in 1..=capped_max_hops {
                             let mut next_frontier = Vec::new();
                             for &current in &frontier {
-                                for (edge_key, neighbor_key) in
-                                    memgraph.neighbors(current, dir, u64::MAX)
-                                {
-                                    if visited.contains(&neighbor_key) {
+                                for merged in reader.neighbors(current) {
+                                    if visited.contains(&merged.node) {
                                         continue;
                                     }
-                                    if !type_ids.is_empty() {
-                                        if let Some(edge) = memgraph.get_edge(edge_key) {
-                                            if !type_ids.contains(&edge.edge_type) {
-                                                continue;
-                                            }
-                                        }
+                                    if type_ids.len() > 1 && !type_ids.contains(&merged.edge_type) {
+                                        continue;
                                     }
-                                    visited.insert(neighbor_key);
-                                    next_frontier.push(neighbor_key);
+                                    visited.insert(merged.node);
+                                    next_frontier.push(merged.node);
 
                                     if hop >= *min_hops {
                                         let mut new_row = row.clone();
-                                        new_row.insert(target.clone(), Value::Node(neighbor_key));
+                                        new_row.insert(target.clone(), Value::Node(merged.node));
                                         new_rows.push(new_row);
                                         if new_rows.len() >= MAX_RESULT_ROWS {
                                             break;
