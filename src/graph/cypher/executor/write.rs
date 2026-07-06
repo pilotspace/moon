@@ -24,7 +24,15 @@ pub fn execute_mut(
 
     for op in &plan.operators {
         match op {
-            PhysicalOp::NodeScan { variable, label } => {
+            // The write path matches against the MUTABLE tier only (write
+            // operators mutate MutableNode in place; SET/DELETE on frozen
+            // rows is a separate copy-up design — known follow-up). The
+            // IndexScan arm therefore degrades to the same label scan; the
+            // residual Filter the planner emits keeps results exact.
+            PhysicalOp::NodeScan { variable, label }
+            | PhysicalOp::IndexScan {
+                variable, label, ..
+            } => {
                 let label_id = label.as_ref().map(|l| label_to_id(l.as_bytes()));
                 let mut new_rows = Vec::new();
                 for row in &rows {

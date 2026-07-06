@@ -27,6 +27,22 @@ pub enum PhysicalOp {
         variable: String,
         label: Option<String>,
     },
+    /// Scan nodes via per-segment property indexes: label bitmap ∧ property
+    /// bitmap per immutable CSR segment, plus a linear mutable-tail check.
+    ///
+    /// Emitted instead of `NodeScan` when a pattern node carries inline
+    /// equality properties whose values are literals or parameters
+    /// (`(n:L {k: 3})`, `(n:L {k: $v})`). `prop_eq` values are index LOOKUP
+    /// hints with SUPERSET semantics (string hashes can collide, Bool/Int
+    /// alias numerically) — the planner always keeps the full residual
+    /// Filter downstream, so the index only prunes, never decides.
+    IndexScan {
+        variable: String,
+        label: Option<String>,
+        /// (property name, value expression) equality conjuncts. Expressions
+        /// are literals or parameters, resolved by the executor per run.
+        prop_eq: Vec<(String, Expr)>,
+    },
     /// Expand along edges from a source variable.
     ///
     /// `edge_variable`: when `Some(name)`, the executor binds the traversed
@@ -369,25 +385,14 @@ fn compile_match(m: &MatchClause, ops: &mut Vec<PhysicalOp>) -> Result<(), PlanE
             continue;
         }
 
-        // First node becomes a scan.
+        // First node becomes a scan (index-backed when inline equality
+        // properties can drive a lookup).
         let first = &pattern.nodes[0];
         let first_var = first
             .variable
             .clone()
             .unwrap_or_else(|| "_anon".to_string());
-        ops.push(PhysicalOp::NodeScan {
-            variable: first_var.clone(),
-            label: first.labels.first().cloned(),
-        });
-        // Inline node properties `(v {k:e, …})` become an equality-conjunction
-        // Filter applied right after the op that BINDS the node — here, the
-        // scan. Without this the predicate is silently dropped and the query
-        // returns the whole label's edges (the ≈|E| full-scan bug).
-        if !first.properties.is_empty() {
-            ops.push(PhysicalOp::Filter {
-                expr: properties_to_filter(&first_var, &first.properties),
-            });
-        }
+        push_node_scan(first, &first_var, ops);
 
         // Subsequent node+edge pairs become expands.
         for (i, edge) in pattern.edges.iter().enumerate() {
@@ -456,24 +461,8 @@ fn compile_shortest_path_match(sp: &ShortestPathMatchClause, ops: &mut Vec<Physi
         .clone()
         .unwrap_or_else(|| "_sp_dst".to_string());
 
-    ops.push(PhysicalOp::NodeScan {
-        variable: src_var.clone(),
-        label: sp.src.labels.first().cloned(),
-    });
-    if !sp.src.properties.is_empty() {
-        ops.push(PhysicalOp::Filter {
-            expr: properties_to_filter(&src_var, &sp.src.properties),
-        });
-    }
-    ops.push(PhysicalOp::NodeScan {
-        variable: dst_var.clone(),
-        label: sp.dst.labels.first().cloned(),
-    });
-    if !sp.dst.properties.is_empty() {
-        ops.push(PhysicalOp::Filter {
-            expr: properties_to_filter(&dst_var, &sp.dst.properties),
-        });
-    }
+    push_node_scan(&sp.src, &src_var, ops);
+    push_node_scan(&sp.dst, &dst_var, ops);
 
     ops.push(PhysicalOp::ShortestPath {
         path_var: sp.path_var.clone(),
@@ -483,6 +472,44 @@ fn compile_shortest_path_match(sp: &ShortestPathMatchClause, ops: &mut Vec<Physi
         edge_types: sp.edge_types.clone(),
         direction: sp.direction,
     });
+}
+
+/// Emit the scan op for a pattern node, choosing `IndexScan` when the
+/// node's inline properties can drive per-segment index lookups (all
+/// values literal or parameter), else plain `NodeScan`. Either way the
+/// inline properties ALSO become an equality-conjunction Filter applied
+/// right after the op that BINDS the node — the index has superset
+/// semantics and non-indexed scans need the predicate at all (without it
+/// the inline property map is silently dropped — the ≈|E| full-scan bug).
+fn push_node_scan(node: &PatternNode, var: &str, ops: &mut Vec<PhysicalOp>) {
+    let indexable = !node.properties.is_empty()
+        && node.properties.iter().all(|(_, e)| {
+            matches!(
+                e,
+                Expr::Integer(_)
+                    | Expr::Float(_)
+                    | Expr::StringLit(_)
+                    | Expr::Bool(_)
+                    | Expr::Parameter(_)
+            )
+        });
+    if indexable {
+        ops.push(PhysicalOp::IndexScan {
+            variable: var.to_string(),
+            label: node.labels.first().cloned(),
+            prop_eq: node.properties.clone(),
+        });
+    } else {
+        ops.push(PhysicalOp::NodeScan {
+            variable: var.to_string(),
+            label: node.labels.first().cloned(),
+        });
+    }
+    if !node.properties.is_empty() {
+        ops.push(PhysicalOp::Filter {
+            expr: properties_to_filter(var, &node.properties),
+        });
+    }
 }
 
 /// Build a filter expression `var.k1 = v1 AND var.k2 = v2 ...` from a
@@ -572,21 +599,46 @@ mod tests {
     // immediately AFTER the op that binds each inline-propertied node. RED until the fix.
 
     #[test]
-    fn test_inline_prop_emits_filter_after_nodescan() {
-        // M3 — `MATCH (a:Person {id:1})-[]->(b)`: a Filter must immediately follow the NodeScan.
+    fn test_inline_prop_emits_filter_after_scan() {
+        // M3 — `MATCH (a:Person {id:1})-[]->(b)`: a Filter must immediately
+        // follow the binding scan. Literal inline props now plan as an
+        // IndexScan (v0.6 property-index lever); the residual Filter stays.
         let query =
             parse_cypher(b"MATCH (a:Person {id:1})-[]->(b) RETURN b").expect("parse failed");
         let plan = compile(&query).expect("compile failed");
         let ns = plan
             .operators
             .iter()
-            .position(|op| matches!(op, PhysicalOp::NodeScan { .. }))
-            .expect("a NodeScan is planned");
+            .position(|op| matches!(op, PhysicalOp::IndexScan { .. }))
+            .expect("an IndexScan is planned for literal inline props");
         assert!(
             matches!(plan.operators.get(ns + 1), Some(PhysicalOp::Filter { .. })),
-            "inline-property Filter must immediately follow the NodeScan; ops = {:?}",
+            "inline-property Filter must immediately follow the IndexScan; ops = {:?}",
             plan.operators
         );
+    }
+
+    #[test]
+    fn test_inline_literal_props_plan_index_scan() {
+        // Literal and parameter values are index-eligible.
+        for q in [
+            b"MATCH (a:N {id:3}) RETURN a".as_slice(),
+            b"MATCH (a:N {id:$p}) RETURN a".as_slice(),
+            b"MATCH (a:N {name:'x', id: 3}) RETURN a".as_slice(),
+        ] {
+            let query = parse_cypher(q).expect("parse failed");
+            let plan = compile(&query).expect("compile failed");
+            assert!(
+                matches!(plan.operators[0], PhysicalOp::IndexScan { .. }),
+                "expected IndexScan for {:?}; ops = {:?}",
+                core::str::from_utf8(q),
+                plan.operators
+            );
+        }
+        // No inline props: plain NodeScan, unchanged.
+        let query = parse_cypher(b"MATCH (a:N) RETURN a").expect("parse failed");
+        let plan = compile(&query).expect("compile failed");
+        assert!(matches!(plan.operators[0], PhysicalOp::NodeScan { .. }));
     }
 
     #[test]
@@ -598,11 +650,16 @@ mod tests {
         let ns = plan
             .operators
             .iter()
-            .position(|op| matches!(op, PhysicalOp::NodeScan { .. }))
-            .expect("a NodeScan is planned");
+            .position(|op| {
+                matches!(
+                    op,
+                    PhysicalOp::NodeScan { .. } | PhysicalOp::IndexScan { .. }
+                )
+            })
+            .expect("a scan is planned");
         assert!(
             matches!(plan.operators.get(ns + 1), Some(PhysicalOp::Filter { .. })),
-            "scanned node's inline Filter must follow the NodeScan; ops = {:?}",
+            "scanned node's inline Filter must follow the scan; ops = {:?}",
             plan.operators
         );
         let ex = plan
