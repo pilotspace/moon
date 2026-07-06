@@ -310,17 +310,42 @@ pub fn graph_addedge(store: &mut GraphStore, args: &[Frame]) -> Frame {
             .get_node(dst_key)
             .map_or(0, |n| (n.outgoing.len() + n.incoming.len()) as u32);
 
-        match graph
-            .write_buf
-            .add_edge(src_key, dst_key, edge_type_id, weight, props, lsn)
-        {
-            Ok(edge_key) => {
-                graph
-                    .stats
-                    .on_edge_insert(edge_type_id, src_old_degree, dst_old_degree);
-                Ok(edge_key.data().as_ffi())
+        // Endpoints may have been frozen into an immutable CSR segment
+        // (freeze DRAINS the write buffer). Verify each non-resident
+        // endpoint is alive in the frozen tier, then insert a cross-tier
+        // delta edge (ghost adjacency keeps it traversable from both ends).
+        let src_resident = graph.write_buf.get_node(src_key).is_some();
+        let dst_resident = graph.write_buf.get_node(dst_key).is_some();
+        let frozen_endpoints_ok = if src_resident && dst_resident {
+            true
+        } else {
+            let seg_guard = graph.segments.load();
+            let view =
+                crate::graph::view::MergedNodeView::new(&graph.write_buf, &seg_guard.immutable);
+            let committed = roaring::RoaringBitmap::new();
+            (src_resident || view.is_visible(src_key, 0, 0, &committed, None))
+                && (dst_resident || view.is_visible(dst_key, 0, 0, &committed, None))
+        };
+
+        if !frozen_endpoints_ok {
+            Err(crate::graph::memgraph::GraphError::NodeNotFound)
+        } else {
+            match graph.write_buf.add_edge_across_tiers(
+                src_key,
+                dst_key,
+                edge_type_id,
+                weight,
+                props,
+                lsn,
+            ) {
+                Ok(edge_key) => {
+                    graph
+                        .stats
+                        .on_edge_insert(edge_type_id, src_old_degree, dst_old_degree);
+                    Ok(edge_key.data().as_ffi())
+                }
+                Err(e) => Err(e),
             }
-            Err(e) => Err(e),
         }
     };
 

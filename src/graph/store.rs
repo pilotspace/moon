@@ -87,6 +87,14 @@ impl NamedGraph {
             Err(_) => return false,
         };
 
+        // Nothing freezable (e.g. the buffer holds only cross-tier delta
+        // edges, which freeze() retains): skip — pushing an empty segment
+        // per write attempt would churn the segment list.
+        if frozen.nodes.is_empty() && frozen.edges.is_empty() {
+            self.write_buf.thaw();
+            return false;
+        }
+
         // Convert frozen MemGraph to a CSR segment. Either way, thaw the
         // drained write_buf IN PLACE — reusing the slot maps keeps SlotMap
         // generation continuity, so post-freeze NodeKeys can never collide

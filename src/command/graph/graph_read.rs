@@ -128,7 +128,7 @@ fn json_to_graph_value(v: &serde_json::Value) -> cypher::executor::Value {
     }
 }
 
-/// GRAPH.NEIGHBORS <graph> <node_id> [TYPE <type>] [DEPTH <n>]
+/// GRAPH.NEIGHBORS <graph> <node_id> [TYPE <type>] [DEPTH <n>] [DIRECTION IN|OUT|BOTH]
 ///
 /// Returns an array of neighbor nodes/edges as RESP3 Maps.
 /// Default direction: BOTH (outgoing + incoming).
@@ -155,9 +155,10 @@ pub fn graph_neighbors(store: &GraphStore, args: &[Frame]) -> Frame {
         None => return Frame::Error(Bytes::from_static(b"ERR graph not found")),
     };
 
-    // Parse optional TYPE and DEPTH arguments.
+    // Parse optional TYPE, DEPTH, and DIRECTION arguments.
     let mut edge_type_filter: Option<u16> = None;
     let mut depth: u32 = 1;
+    let mut direction = Direction::Both;
     let mut pos = 2;
 
     while pos < args.len() {
@@ -188,6 +189,22 @@ pub fn graph_neighbors(store: &GraphStore, args: &[Frame]) -> Frame {
                 _ => return Frame::Error(Bytes::from_static(b"ERR invalid DEPTH value")),
             };
             pos += 1;
+        } else if key.eq_ignore_ascii_case(b"DIRECTION") {
+            pos += 1;
+            if pos >= args.len() {
+                return Frame::Error(Bytes::from_static(b"ERR missing DIRECTION value"));
+            }
+            direction = match extract_bulk(&args[pos]) {
+                Some(d) if d.eq_ignore_ascii_case(b"OUT") => Direction::Outgoing,
+                Some(d) if d.eq_ignore_ascii_case(b"IN") => Direction::Incoming,
+                Some(d) if d.eq_ignore_ascii_case(b"BOTH") => Direction::Both,
+                _ => {
+                    return Frame::Error(Bytes::from_static(
+                        b"ERR invalid DIRECTION value (IN|OUT|BOTH)",
+                    ));
+                }
+            };
+            pos += 1;
         } else {
             pos += 1;
         }
@@ -203,23 +220,22 @@ pub fn graph_neighbors(store: &GraphStore, args: &[Frame]) -> Frame {
 
     let memgraph = &graph.write_buf;
 
-    // Verify node exists in the mutable write buffer.
-    // Nodes in CSR segments still have MemGraph entries (freeze copies, doesn't move).
-    if memgraph.get_node(node_key).is_none() {
-        return Frame::Error(Bytes::from_static(b"ERR node not found"));
-    }
-
-    // Build a SegmentMergeReader that sees both MemGraph and immutable CSR segments.
     let lsn = u64::MAX - 1; // See all live data (MAX-1 because deleted_lsn=MAX means alive).
     let segments_guard = graph.segments.load();
     let csr_segs = &segments_guard.immutable;
-    let reader = SegmentMergeReader::new(
-        Some(memgraph),
-        csr_segs,
-        Direction::Both,
-        lsn,
-        edge_type_filter,
-    );
+
+    // Verify the start node exists in EITHER tier — freeze MOVES nodes into
+    // CSR segments (drains the write buffer), so a memgraph-only check would
+    // reject every compacted node.
+    let view = crate::graph::view::MergedNodeView::new(memgraph, csr_segs);
+    if !view.contains(node_key) {
+        return Frame::Error(Bytes::from_static(b"ERR node not found"));
+    }
+
+    // Build a SegmentMergeReader that sees both MemGraph and immutable CSR
+    // segments, honoring the requested traversal direction.
+    let reader =
+        SegmentMergeReader::new(Some(memgraph), csr_segs, direction, lsn, edge_type_filter);
 
     // TraversalGuard enforces bounded epoch hold (30s default timeout).
     let guard = crate::graph::traversal_guard::TraversalGuard::with_default_timeout(lsn);
