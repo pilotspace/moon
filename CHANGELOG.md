@@ -6,6 +6,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance — EF-SPLIT: per-segment beam reduction on multi-segment indexes
+
+- With G graph segments, every segment searched at the FULL resolved ef —
+  ~G× the CPU of one ef-wide beam (the root cause of the pooled regression
+  on SMT-constrained boxes in PR #214's GCE run). Each graph-tier segment
+  now searches at `max(ef/√G, quota, 24)` — merged candidate mass stays
+  ~ef·√G, a strict oversample of the single-graph baseline. Applied
+  identically to the sync, serial-yielding, and worker-pool paths, so
+  pooled == serial identity holds (tests unchanged and green).
+- Recall gate (same data/seeds as the sidecar A/B): 5-segment clustered
+  R@10 1.0000 → 1.0000, gaussian 0.9915 → 0.9915 — recall preserved to 4
+  decimals while per-segment ef drops 300 → 135.
+
 ### Performance — FT.SEARCH per-query fixed-cost cleanup (QP-2/QP-3)
 
 - **Thread-cached `SearchScratch`** (QP-3): the wire path built a fresh

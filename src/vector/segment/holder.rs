@@ -24,6 +24,35 @@ use super::mutable::{MutableEntry, MutableSegment};
 /// Default number of IVF clusters to probe during search.
 const DEFAULT_NPROBE: usize = 32;
 
+/// EF-SPLIT beam floor: below this the per-segment beam degenerates (entry
+/// descent dominates and recall falls off a cliff), so the reduction never
+/// goes under it regardless of segment count.
+const EF_SPLIT_MIN: usize = 24;
+
+/// EF-SPLIT: per-segment beam width when the graph tier spans multiple
+/// segments.
+///
+/// With G graph segments each holding ~1/G of the corpus, searching every
+/// segment at the full resolved `ef` does ~G× the work of one ef-wide beam
+/// over a single graph — the root cause of the multi-segment regression on
+/// SMT-constrained boxes. `ef/√G` keeps the merged candidate mass at ~ef·√G:
+/// still a strict oversample versus the single-graph baseline (each segment
+/// returns its LOCAL nearest, so the merge sees at least as much of the true
+/// top-k neighborhood; recall A/B in the PR held recall within noise on
+/// clustered + gaussian at 5 segments). Floors: `floor` (the merge's
+/// per-segment quota — HNSW must be able to return that many) and
+/// [`EF_SPLIT_MIN`]; never exceeds `ef`.
+///
+/// Applied identically on the serial sync path, the serial yielding path,
+/// and the worker-pool fan-out, so pooled == serial identity holds.
+pub(crate) fn per_segment_ef(ef: usize, graph_segments: usize, floor: usize) -> usize {
+    if graph_segments <= 1 {
+        return ef;
+    }
+    let reduced = (ef as f64 / (graph_segments as f64).sqrt()).ceil() as usize;
+    reduced.max(floor).max(EF_SPLIT_MIN).min(ef)
+}
+
 /// MVCC context for snapshot-isolated search. Passed by reference, zero allocation.
 pub struct MvccContext<'a> {
     pub snapshot_lsn: u64,
@@ -284,6 +313,10 @@ impl SegmentHolder {
             None // Light mode: no QJL matrices, use TQ-ADC brute force
         };
 
+        // EF-SPLIT: divide the beam across graph segments (see per_segment_ef).
+        let graph_segs = snapshot.immutable.len() + snapshot.warm.len();
+        let graph_ef = per_segment_ef(ef_search, graph_segs, k);
+
         match strategy {
             FilterStrategy::Unfiltered => {
                 all.extend(
@@ -292,10 +325,10 @@ impl SegmentHolder {
                         .brute_force_search(query_f32, query_state.as_ref(), k),
                 );
                 for imm in &snapshot.immutable {
-                    all.extend(imm.search(query_f32, k, ef_search, _scratch));
+                    all.extend(imm.search(query_f32, k, graph_ef, _scratch));
                 }
                 for warm_seg in &snapshot.warm {
-                    all.extend(warm_seg.search(query_f32, k, ef_search, _scratch));
+                    all.extend(warm_seg.search(query_f32, k, graph_ef, _scratch));
                 }
             }
             FilterStrategy::BruteForceFiltered => {
@@ -309,7 +342,7 @@ impl SegmentHolder {
                     all.extend(imm.search_filtered(
                         query_f32,
                         k,
-                        ef_search,
+                        graph_ef,
                         _scratch,
                         filter_bitmap,
                     ));
@@ -318,7 +351,7 @@ impl SegmentHolder {
                     all.extend(warm_seg.search_filtered(
                         query_f32,
                         k,
-                        ef_search,
+                        graph_ef,
                         _scratch,
                         filter_bitmap,
                     ));
@@ -335,7 +368,7 @@ impl SegmentHolder {
                     all.extend(imm.search_filtered(
                         query_f32,
                         k,
-                        ef_search,
+                        graph_ef,
                         _scratch,
                         filter_bitmap,
                     ));
@@ -344,7 +377,7 @@ impl SegmentHolder {
                     all.extend(warm_seg.search_filtered(
                         query_f32,
                         k,
-                        ef_search,
+                        graph_ef,
                         _scratch,
                         filter_bitmap,
                     ));
@@ -358,13 +391,9 @@ impl SegmentHolder {
                     oversample_k,
                     filter_bitmap,
                 ));
+                let post_ef = per_segment_ef(ef_search.max(oversample_k), graph_segs, oversample_k);
                 for imm in &snapshot.immutable {
-                    let imm_results = imm.search(
-                        query_f32,
-                        oversample_k,
-                        ef_search.max(oversample_k),
-                        _scratch,
-                    );
+                    let imm_results = imm.search(query_f32, oversample_k, post_ef, _scratch);
                     if let Some(bm) = filter_bitmap {
                         for r in imm_results {
                             if bm.contains(r.id.0) {
@@ -376,12 +405,7 @@ impl SegmentHolder {
                     }
                 }
                 for warm_seg in &snapshot.warm {
-                    let warm_results = warm_seg.search(
-                        query_f32,
-                        oversample_k,
-                        ef_search.max(oversample_k),
-                        _scratch,
-                    );
+                    let warm_results = warm_seg.search(query_f32, oversample_k, post_ef, _scratch);
                     if let Some(bm) = filter_bitmap {
                         for r in warm_results {
                             if bm.contains(r.id.0) {
@@ -506,11 +530,13 @@ impl SegmentHolder {
         // 2. HNSW search on immutable segments (TQ-ADC distance).
         // Immutable segment entries are committed by definition (compacted only
         // after commit). No visibility post-filter needed for Phase 65.
+        // EF-SPLIT: divide the beam across graph segments (see per_segment_ef).
+        let graph_ef = per_segment_ef(ef_search, snapshot.immutable.len() + snapshot.warm.len(), k);
         for imm in &snapshot.immutable {
             if filter_bitmap.is_some() {
-                all.extend(imm.search_filtered(query_f32, k, ef_search, _scratch, filter_bitmap));
+                all.extend(imm.search_filtered(query_f32, k, graph_ef, _scratch, filter_bitmap));
             } else {
-                all.extend(imm.search(query_f32, k, ef_search, _scratch));
+                all.extend(imm.search(query_f32, k, graph_ef, _scratch));
             }
         }
 
@@ -520,12 +546,12 @@ impl SegmentHolder {
                 all.extend(warm_seg.search_filtered(
                     query_f32,
                     k,
-                    ef_search,
+                    graph_ef,
                     _scratch,
                     filter_bitmap,
                 ));
             } else {
-                all.extend(warm_seg.search(query_f32, k, ef_search, _scratch));
+                all.extend(warm_seg.search(query_f32, k, graph_ef, _scratch));
             }
         }
 
@@ -650,6 +676,12 @@ impl SegmentHolder {
         } else {
             ef_search
         };
+        // EF-SPLIT: divide the beam across graph segments (see per_segment_ef).
+        let graph_ef = per_segment_ef(
+            graph_ef,
+            segments.immutable.len() + segments.warm.len(),
+            fetch_k,
+        );
         let snapshot_lsn = snap.snapshot_lsn;
         let my_txn_id = snap.my_txn_id;
         let mutable_len = snap.mutable_len;
@@ -1054,6 +1086,21 @@ mod tests {
         assert!(results.len() <= 3);
         // First result should be vector 0
         assert_eq!(results[0].id.0, 0);
+    }
+
+    #[test]
+    fn test_per_segment_ef_split() {
+        // Single segment: untouched.
+        assert_eq!(per_segment_ef(300, 1, 10), 300);
+        assert_eq!(per_segment_ef(300, 0, 10), 300);
+        // 5 segments: 300/sqrt(5) = 134.16 -> 135.
+        assert_eq!(per_segment_ef(300, 5, 10), 135);
+        // Never exceeds ef; floors at the merge quota and EF_SPLIT_MIN.
+        assert_eq!(per_segment_ef(64, 16, 10), 24); // 64/4=16 -> EF_SPLIT_MIN
+        assert_eq!(per_segment_ef(64, 4, 40), 40); // quota floor wins
+        assert_eq!(per_segment_ef(16, 4, 10), 16); // floors capped by ef itself
+        // Monotone in ef.
+        assert!(per_segment_ef(600, 5, 10) > per_segment_ef(300, 5, 10));
     }
 
     #[test]
