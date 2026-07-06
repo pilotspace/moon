@@ -6,6 +6,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — RSS/CPU remediation wave 5 (PR #TBD)
+
+- **Item A — mmap the exact-rerank f16 sidecar on segment reload**
+  (`src/vector/segment/raw_f16_store.rs`, new `RawF16Store` enum): a segment
+  reloaded from disk used to `fs::read` the entire `raw_f16.bin` sidecar into
+  a second heap `Vec<u16>`, doubling resident vector memory for
+  reload-heavy deployments (warm starts, segment promotion). Reload now
+  memory-maps the file (`memmap2`, already a workspace dependency) and hands
+  out a zero-copy `&[u16]` view backed by the kernel page cache — RSS only
+  grows for pages the rerank path actually touches. Freshly-built segments
+  (compaction/merge) are unaffected — they keep their owned buffer. Rerank
+  parity (Owned vs Mapped, byte-identical sidecar + identical `search()`
+  output) is pinned by
+  `test_reload_raw_f16_sidecar_uses_mmap_and_matches_owned_rerank`.
+- **Item A follow-up — text posting-list capacity reclaim**
+  (`src/text/posting.rs`): `PostingList::term_freqs`/`positions` grow to the
+  peak document count ever seen for a term and, per the existing
+  `remove_doc` contract, the `postings` HashMap entry is kept forever even
+  once a term has zero live documents. The buffers now `shrink_to_fit()`
+  once the last document leaves a posting, releasing peak capacity for
+  terms that go idle without changing the "entry survives" contract.
+
 ### CI — fix Windows main-push test failures (PR #TBD)
 
 - `test_poll_real_process_smoke` is now gated to Linux/macOS: `get_rss_bytes()`

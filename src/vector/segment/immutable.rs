@@ -21,6 +21,7 @@ use crate::vector::hnsw::search::{
 };
 #[allow(unused_imports)]
 use crate::vector::hnsw::search_sq::hnsw_search_f32;
+use crate::vector::segment::raw_f16_store::RawF16Store;
 use crate::vector::turbo_quant::collection::{CollectionMetadata, QuantizationConfig};
 use crate::vector::turbo_quant::inner_product::{prepare_query_prod, score_l2_prod};
 use crate::vector::turbo_quant::sq8::{decode_sq8, sq8_params};
@@ -92,7 +93,13 @@ pub struct ImmutableSegment {
     /// before top-k truncation — the returned distances are then true metric
     /// values to f16 tolerance instead of quantized ADC estimates. `None` for
     /// segments built without raw vectors (pre-sidecar disk segments).
-    raw_f16: Option<Vec<u16>>,
+    ///
+    /// Backed by [`RawF16Store`]: freshly-built segments own a `Vec<u16>`
+    /// (`Owned`); segments reloaded from disk memory-map `raw_f16.bin`
+    /// instead (`Mapped`) so RSS only grows for pages the rerank path
+    /// actually touches. See `raw_f16_store` module docs for the mmap
+    /// soundness contract.
+    raw_f16: Option<RawF16Store>,
 
     /// Compact-time adaptive-ef estimate (AE-1): the smallest ladder ef at
     /// which this segment's OWN sampled queries reach the target recall
@@ -143,9 +150,12 @@ impl ImmutableSegment {
         }
     }
 
-    /// Attach the exact-rerank sidecar (HQ-1): BFS-ordered f16 copies of the
-    /// original vectors, `dimension` halves per entry. Builder-style so the
-    /// many `new()` call sites without raw vectors stay untouched.
+    /// Attach the exact-rerank sidecar (HQ-1) from an owned buffer:
+    /// BFS-ordered f16 copies of the original vectors, `dimension` halves
+    /// per entry. Builder-style so the many `new()` call sites without raw
+    /// vectors stay untouched. Used by compaction/merge, which always
+    /// construct a fresh owned buffer — for the disk-reload path (which
+    /// wants to memory-map instead), see [`Self::with_raw_f16_store`].
     #[must_use]
     pub fn with_raw_f16(mut self, raw_f16: Option<Vec<u16>>) -> Self {
         if let Some(ref buf) = raw_f16 {
@@ -155,15 +165,40 @@ impl ImmutableSegment {
                 "raw_f16 sidecar must hold dimension halves per BFS entry"
             );
         }
-        self.raw_f16 = raw_f16;
+        self.raw_f16 = raw_f16.map(RawF16Store::Owned);
+        self
+    }
+
+    /// Attach the exact-rerank sidecar (HQ-1) from a pre-built
+    /// [`RawF16Store`] — used by `segment_io::read_immutable_segment` to
+    /// attach a memory-mapped sidecar without materializing a second heap
+    /// copy. See [`Self::with_raw_f16`] for the owned-buffer variant.
+    #[must_use]
+    pub fn with_raw_f16_store(mut self, store: Option<RawF16Store>) -> Self {
+        if let Some(ref s) = store {
+            debug_assert_eq!(
+                s.len(),
+                self.mvcc.len() * self.collection_meta.dimension as usize,
+                "raw_f16 sidecar must hold dimension halves per BFS entry"
+            );
+        }
+        self.raw_f16 = store;
         self
     }
 
     /// The exact-rerank sidecar, if this segment carries one (BFS-ordered,
     /// `dimension` u16 halves per entry). Used by segment persistence and
-    /// GraphUnion merge to propagate the sidecar.
+    /// GraphUnion merge to propagate the sidecar. Zero-copy in both the
+    /// heap-owned and memory-mapped case.
     pub fn raw_f16(&self) -> Option<&[u16]> {
-        self.raw_f16.as_deref()
+        self.raw_f16.as_ref().map(RawF16Store::as_slice)
+    }
+
+    /// `true` when the exact-rerank sidecar is backed by a memory map
+    /// (segment reloaded from disk) rather than a heap `Vec` (freshly built
+    /// segment). Exposed for tests/diagnostics only — not on any hot path.
+    pub fn raw_f16_is_mapped(&self) -> bool {
+        matches!(&self.raw_f16, Some(s) if s.is_mapped())
     }
 
     /// The compact-time adaptive-ef estimate for this segment (AE-1), if one
@@ -242,7 +277,7 @@ impl ImmutableSegment {
         const ADAPTIVE_EF_EPSILON: f32 = 0.005;
         const ADAPTIVE_EF_LADDER: &[usize] = &[24, 32, 48, 64, 96, 128, 192, 256];
 
-        let raw = self.raw_f16.as_deref()?;
+        let raw = self.raw_f16()?;
         let dim = self.collection_meta.dimension as usize;
         let n = self.mvcc.len();
         if dim == 0 || n < ADAPTIVE_EF_K * 8 || raw.len() < n * dim {
@@ -394,7 +429,7 @@ impl ImmutableSegment {
     /// outside a 4× ADC oversample is rare; re-scoring the full ef-wide beam
     /// costs ~ef·dim f16 decodes per segment for negligible recall beyond that.
     fn rerank_exact(&self, candidates: &mut SmallVec<[SearchResult; 32]>, query: &[f32], k: usize) {
-        let Some(raw) = self.raw_f16.as_deref() else {
+        let Some(raw) = self.raw_f16() else {
             return;
         };
         if candidates.is_empty() {
