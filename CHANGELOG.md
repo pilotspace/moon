@@ -6,6 +6,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — int8 symmetric ADC for SQ8 vector search (task #13)
+
+- New per-candidate integer dot-product path for SQ8 asymmetric distance
+  computation (ADC), replacing the f32-widening `sq8_stats` kernel on the
+  hot per-candidate pass with exact-integer int8 dot products: NEON
+  widen-multiply (`vmull_s8` + the `c^0x80` offset trick, since baseline
+  ARMv8-A has no mixed u8×i8 widening multiply), AVX2 (`cvtepu8/cvtepi8_epi16`
+  → `mullo_epi16` → `madd_epi16`, saturation-free), and AVX512 VNNI
+  (`_mm512_dpbusd_epi32`, feature-gated behind `simd-avx512`). Query is
+  quantized to symmetric int8 once per search
+  (`turbo_quant::sq8::sq8_quantize_query_scalar`); `sum_c`/`sumsq_c` are
+  exact integers straight from the u8 codes. Combines through the unchanged
+  `sq8_l2_from_stats` — the on-disk SQ8 format and the exact-rerank sidecar
+  (HQ-1) are untouched. Wired into both `hnsw/search.rs` beam-search closures
+  and all three SQ8 call sites in `segment/mutable.rs` brute-force search.
+  Local (dev-Mac, NEON) directional speedup vs the existing f32 SIMD path:
+  ~1.5x at dim 128, ~2.0x at dim 384, ~2.15x at dim 768 (`benches/sq8_adc_bench.rs`,
+  `int8_dispatch` variant) — absolute/cross-arch numbers are GCE-validation
+  scope (task #14). Recall A/B-gated (`turbo_quant::sq8` test module):
+  R@10 delta ≤ 0.01 vs the f32 ADC path and ≥ 0.98 top-10 overlap, both L2
+  and Cosine, at dim 128/384. `MOON_SQ8_INT8_ADC=0` forces the f32 kernels
+  (bench/diagnostic escape hatch, not yet added to CLAUDE.md's env list —
+  flagged for a follow-up doc pass).
+
 ### Fixed — merge recall gate self-exclusion bias (manual merges could never pass)
 
 - `verify_merge_recall` compared HNSW results **including the query point**

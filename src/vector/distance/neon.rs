@@ -357,6 +357,99 @@ pub unsafe fn sq8_stats(query: &[f32], codes: &[u8]) -> (f32, f32, f32) {
     (dot_sum, sum_c_sum, sumsq_c_sum)
 }
 
+/// Int8 symmetric ADC per-candidate statistics (task #13): `(Σ qi8_i·c_i,
+/// Σc_i, Σc_i²)` as exact `i64` integers, given an already-quantized `qi8`
+/// query (see `turbo_quant::sq8::sq8_quantize_query_scalar`).
+///
+/// Baseline ARMv8-A NEON has no mixed signed×unsigned widening multiply
+/// (that needs the `dotprod`/`i8mm` extensions — `vdotq_s32`/SDOT is
+/// nightly-gated in `core::arch` as of rustc 1.94, see module docs below),
+/// so this uses the **offset trick**: reinterpret each code byte `c` (u8,
+/// `0..=255`) as `c' = c ^ 0x80` (i8, `= c - 128`), widen-multiply `qi8 * c'`
+/// with `vmull_s8` (signed×signed, always available), and undo the shift
+/// afterwards: `Σ qi8·c = Σ qi8·(c-128) + 128·Σqi8`. `sum_qi8` is the
+/// precomputed per-query `Σqi8` needed for that correction.
+///
+/// `sum_c`/`sumsq_c` are query-independent and computed directly from the
+/// u8 codes (`vmovl_u8` widen for `sum_c`, `vmull_u8` widen-square for
+/// `sumsq_c`) — both exact, no offset trick needed there.
+///
+/// # Safety
+/// Caller must ensure the CPU supports NEON (baseline on all AArch64).
+///
+/// # Panics (debug only)
+/// `debug_assert_eq!(qi8.len(), codes.len())`.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+#[target_feature(enable = "neon")]
+pub unsafe fn sq8_i8_stats(qi8: &[i8], codes: &[u8], sum_qi8: i32) -> (i64, i64, i64) {
+    debug_assert_eq!(qi8.len(), codes.len(), "sq8_i8_stats: dimension mismatch");
+
+    let n = qi8.len();
+    let pq = qi8.as_ptr();
+    let pc = codes.as_ptr();
+
+    let mut dot_acc = vdupq_n_s32(0);
+    let mut sum_c_acc = vdupq_n_u32(0);
+    let mut sumsq_c_acc = vdupq_n_u32(0);
+
+    let chunks = n / 16;
+    let mut i = 0usize;
+
+    for _ in 0..chunks {
+        // SAFETY: i + 16 <= n guaranteed by chunks = n / 16. Pointers are
+        // valid for 16 elements (i8 query / u8 codes) at this offset.
+        let qv = vld1q_s8(pq.add(i));
+        let cv_u8 = vld1q_u8(pc.add(i));
+        // Offset trick: reinterpret (c ^ 0x80) as i8 == c - 128.
+        let cv_off = vreinterpretq_s8_u8(veorq_u8(cv_u8, vdupq_n_u8(0x80)));
+
+        let dot_lo = vmull_s8(vget_low_s8(qv), vget_low_s8(cv_off));
+        let dot_hi = vmull_s8(vget_high_s8(qv), vget_high_s8(cv_off));
+        dot_acc = vpadalq_s16(dot_acc, dot_lo);
+        dot_acc = vpadalq_s16(dot_acc, dot_hi);
+
+        sum_c_acc = vpadalq_u16(sum_c_acc, vmovl_u8(vget_low_u8(cv_u8)));
+        sum_c_acc = vpadalq_u16(sum_c_acc, vmovl_u8(vget_high_u8(cv_u8)));
+
+        let sq_lo = vmull_u8(vget_low_u8(cv_u8), vget_low_u8(cv_u8));
+        let sq_hi = vmull_u8(vget_high_u8(cv_u8), vget_high_u8(cv_u8));
+        sumsq_c_acc = vpadalq_u16(sumsq_c_acc, sq_lo);
+        sumsq_c_acc = vpadalq_u16(sumsq_c_acc, sq_hi);
+
+        i += 16;
+    }
+
+    let mut dot_arr = [0i32; 4];
+    let mut sumc_arr = [0u32; 4];
+    let mut sumsq_arr = [0u32; 4];
+    // SAFETY: dot_arr/sumc_arr/sumsq_arr are stack arrays of exactly 4
+    // lanes, matching the int32x4_t/uint32x4_t store width.
+    vst1q_s32(dot_arr.as_mut_ptr(), dot_acc);
+    vst1q_u32(sumc_arr.as_mut_ptr(), sum_c_acc);
+    vst1q_u32(sumsq_arr.as_mut_ptr(), sumsq_c_acc);
+
+    // Σ qi8·(c-128) so far (offset form); corrected to Σ qi8·c below.
+    let mut dot_offset: i64 = dot_arr.iter().map(|&x| x as i64).sum();
+    let mut sum_c: i64 = sumc_arr.iter().map(|&x| x as i64).sum();
+    let mut sumsq_c: i64 = sumsq_arr.iter().map(|&x| x as i64).sum();
+
+    // Scalar tail — direct (no offset trick needed, exact i64 arithmetic).
+    while i < n {
+        // SAFETY: i < n, within bounds of both slices (equal length,
+        // asserted by the debug_assert! above).
+        let q = *qi8.get_unchecked(i) as i64;
+        let c = *codes.get_unchecked(i) as i64;
+        dot_offset += q * (c - 128);
+        sum_c += c;
+        sumsq_c += c * c;
+        i += 1;
+    }
+
+    let dot = dot_offset + 128i64 * sum_qi8 as i64;
+    (dot, sum_c, sumsq_c)
+}
+
 // ── f16 sidecar kernels (exact-rerank HQ-1) ─────────────────────────────
 
 /// Decode 4 IEEE binary16 lanes to f32 using baseline-NEON integer ops (no
@@ -672,6 +765,85 @@ mod tests {
         // SAFETY: NEON is baseline on AArch64.
         let got = unsafe { sq8_stats(q, c) };
         assert_eq!(got, (0.0, 0.0, 0.0));
+    }
+
+    // ── task #13: int8 symmetric ADC stats (NEON vs scalar i64 oracle) ───
+
+    fn gen_i8_query(len: usize, seed: u32, qmax: i32) -> Vec<i8> {
+        // Values within [-qmax, qmax], mirroring what
+        // sq8_quantize_query_scalar would actually produce.
+        let mut v = Vec::with_capacity(len);
+        let mut s = seed;
+        for _ in 0..len {
+            s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+            let raw = (s >> 24) as i8 as i32;
+            v.push((raw % (qmax + 1)) as i8);
+        }
+        v
+    }
+
+    #[test]
+    fn test_sq8_i8_stats_matches_scalar_oracle() {
+        use crate::vector::turbo_quant::sq8::sq8_candidate_stats_i8_scalar;
+        let qi8 = gen_i8_query(768, 42, 127);
+        let c = gen_u8(768, 99);
+        let sum_qi8: i32 = qi8.iter().map(|&x| x as i32).sum();
+        let expected = sq8_candidate_stats_i8_scalar(&qi8, &c, sum_qi8);
+        // SAFETY: NEON is baseline on AArch64.
+        let got = unsafe { sq8_i8_stats(&qi8, &c, sum_qi8) };
+        assert_eq!(
+            got, expected,
+            "sq8_i8_stats mismatch (exact int arithmetic): scalar={expected:?}, neon={got:?}"
+        );
+    }
+
+    #[test]
+    fn test_sq8_i8_stats_tail_handling() {
+        use crate::vector::turbo_quant::sq8::sq8_candidate_stats_i8_scalar;
+        for len in [0, 1, 3, 7, 13, 15, 16, 17, 31, 33, 100] {
+            let qi8 = gen_i8_query(len, 42, 127);
+            let c = gen_u8(len, 99);
+            let sum_qi8: i32 = qi8.iter().map(|&x| x as i32).sum();
+            let expected = sq8_candidate_stats_i8_scalar(&qi8, &c, sum_qi8);
+            // SAFETY: NEON is baseline on AArch64.
+            let got = unsafe { sq8_i8_stats(&qi8, &c, sum_qi8) };
+            assert_eq!(
+                got, expected,
+                "sq8_i8_stats tail len={len}: scalar={expected:?}, neon={got:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_sq8_i8_stats_empty() {
+        let qi8: &[i8] = &[];
+        let c: &[u8] = &[];
+        // SAFETY: NEON is baseline on AArch64.
+        let got = unsafe { sq8_i8_stats(qi8, c, 0) };
+        assert_eq!(got, (0, 0, 0));
+    }
+
+    #[test]
+    fn test_sq8_i8_stats_extreme_values() {
+        // All-max-magnitude inputs (qi8=±127, c=255) stress the overflow
+        // bound: worst case |dot_offset| per element is 127*128=16256,
+        // times dim=768 ≈ 12.5M — comfortably inside i32, but this pins the
+        // exact result down against the oracle rather than trusting the
+        // arithmetic argument alone.
+        use crate::vector::turbo_quant::sq8::sq8_candidate_stats_i8_scalar;
+        let dim = 768;
+        let qi8: Vec<i8> = (0..dim)
+            .map(|i| if i % 2 == 0 { 127i8 } else { -127i8 })
+            .collect();
+        let c: Vec<u8> = vec![255u8; dim];
+        let sum_qi8: i32 = qi8.iter().map(|&x| x as i32).sum();
+        let expected = sq8_candidate_stats_i8_scalar(&qi8, &c, sum_qi8);
+        // SAFETY: NEON is baseline on AArch64.
+        let got = unsafe { sq8_i8_stats(&qi8, &c, sum_qi8) };
+        assert_eq!(
+            got, expected,
+            "extreme-value mismatch: scalar={expected:?}, neon={got:?}"
+        );
     }
 
     #[test]

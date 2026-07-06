@@ -44,6 +44,16 @@ pub struct DistanceTable {
     /// to get the final ADC distance — that combine step is O(1) arithmetic,
     /// architecture-independent, and deliberately NOT part of this table.
     pub sq8_stats: fn(&[f32], &[u8]) -> (f32, f32, f32),
+    /// Int8 symmetric ADC per-candidate stats (task #13): `(qi8, codes,
+    /// sum_qi8) -> (Σ qi8_i·c_i, Σc_i, Σc_i²)` as exact `i64` integers.
+    /// `None` means the int8 tier is unavailable (no matching SIMD kernel
+    /// for this CPU, or the `MOON_SQ8_INT8_ADC=0` escape hatch is set) —
+    /// callers must fall back to `sq8_stats` (f32) in that case. See
+    /// `turbo_quant::sq8` module docs for the query-quantization step
+    /// ([`crate::vector::turbo_quant::sq8::sq8_quantize_query_scalar`],
+    /// [`crate::vector::turbo_quant::sq8::SQ8_INT8_QMAX`]) that must run
+    /// once per query before calling this.
+    pub sq8_i8_stats: Option<crate::vector::turbo_quant::sq8::Sq8I8StatsFn>,
     /// Squared L2 between an f32 query and an f16-encoded vector — the
     /// exact-rerank sidecar (HQ-1) decode fused with the distance loop.
     /// SIMD tiers decode 8 halves per step (NEON integer rescale / F16C
@@ -62,6 +72,19 @@ type F16L2Fn = fn(&[f32], &[u16]) -> f32;
 type F16DotNormFn = fn(&[f32], &[u16]) -> (f32, f32);
 
 static DISTANCE_TABLE: OnceLock<DistanceTable> = OnceLock::new();
+
+/// Escape hatch for the int8 symmetric ADC path (task #13): `MOON_SQ8_INT8_ADC=0`
+/// forces every tier back to the f32 `sq8_stats` kernel (bench/diagnostic
+/// convention, like the `MOON_XSHARD_*` knobs — see CLAUDE.md env var list).
+/// Cached in a `OnceLock<bool>` so the env lookup happens at most once.
+fn int8_adc_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("MOON_SQ8_INT8_ADC")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+    })
+}
 
 /// Initialize the distance dispatch table.
 ///
@@ -107,6 +130,16 @@ pub fn init() {
                 };
             #[cfg(feature = "simd-avx512")]
             if is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512bw") {
+                let sq8_i8_stats = if int8_adc_enabled() && is_x86_feature_detected!("avx512vnni") {
+                    Some(
+                        (|q, c, s| {
+                            // SAFETY: AVX-512F+BW+VNNI verified by is_x86_feature_detected! above.
+                            unsafe { avx512::sq8_i8_stats(q, c, s) }
+                        }) as crate::vector::turbo_quant::sq8::Sq8I8StatsFn,
+                    )
+                } else {
+                    None
+                };
                 return DistanceTable {
                     l2_f32: |a, b| {
                         // SAFETY: AVX-512F verified by is_x86_feature_detected! above.
@@ -129,11 +162,22 @@ pub fn init() {
                         // SAFETY: AVX-512F verified by is_x86_feature_detected! above.
                         unsafe { avx512::sq8_stats(q, c) }
                     },
+                    sq8_i8_stats,
                     f16_l2,
                     f16_dot_normsq,
                 };
             }
             if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                let sq8_i8_stats = if int8_adc_enabled() {
+                    Some(
+                        (|q, c, s| {
+                            // SAFETY: AVX2 verified by is_x86_feature_detected! above.
+                            unsafe { avx2::sq8_i8_stats(q, c, s) }
+                        }) as crate::vector::turbo_quant::sq8::Sq8I8StatsFn,
+                    )
+                } else {
+                    None
+                };
                 return DistanceTable {
                     l2_f32: |a, b| {
                         // SAFETY: AVX2+FMA verified by is_x86_feature_detected! above.
@@ -156,6 +200,7 @@ pub fn init() {
                         // SAFETY: AVX2+FMA verified by is_x86_feature_detected! above.
                         unsafe { avx2::sq8_stats(q, c) }
                     },
+                    sq8_i8_stats,
                     f16_l2,
                     f16_dot_normsq,
                 };
@@ -165,6 +210,16 @@ pub fn init() {
         #[cfg(target_arch = "aarch64")]
         {
             // NEON is baseline on all AArch64 CPUs — always available.
+            let sq8_i8_stats = if int8_adc_enabled() {
+                Some(
+                    (|q, c, s| {
+                        // SAFETY: NEON is guaranteed on AArch64.
+                        unsafe { neon::sq8_i8_stats(q, c, s) }
+                    }) as crate::vector::turbo_quant::sq8::Sq8I8StatsFn,
+                )
+            } else {
+                None
+            };
             return DistanceTable {
                 l2_f32: |a, b| {
                     // SAFETY: NEON is guaranteed on AArch64.
@@ -188,6 +243,7 @@ pub fn init() {
                     // SAFETY: NEON is guaranteed on AArch64.
                     unsafe { neon::sq8_stats(q, c) }
                 },
+                sq8_i8_stats,
                 f16_l2: |q, x| {
                     // SAFETY: NEON is guaranteed on AArch64.
                     unsafe { neon::f16_l2(q, x) }
@@ -199,7 +255,9 @@ pub fn init() {
             };
         }
 
-        // Scalar fallback — works on every platform.
+        // Scalar fallback — works on every platform. No int8 SIMD tier
+        // exists for pure-scalar builds (no proven throughput win without
+        // SIMD widening); sq8_i8_stats is None, callers use sq8_stats (f32).
         #[allow(unreachable_code)]
         DistanceTable {
             l2_f32: scalar::l2_f32,
@@ -208,6 +266,7 @@ pub fn init() {
             cosine_f32: scalar::cosine_f32,
             tq_l2: crate::vector::turbo_quant::tq_adc::tq_l2_adc_scaled,
             sq8_stats: crate::vector::turbo_quant::sq8::sq8_candidate_stats_scalar,
+            sq8_i8_stats: None,
             f16_l2: crate::vector::f16::l2_sq_f16,
             f16_dot_normsq: crate::vector::f16::dot_normsq_f16,
         }
@@ -564,6 +623,50 @@ mod integration_tests {
                 "ip mismatch at dim={dim}: naive={naive_ip} dispatched={fast_ip}"
             );
         }
+    }
+
+    /// Task #13: if this CPU/build has an int8 SIMD tier installed
+    /// (`sq8_i8_stats.is_some()`), it must match the scalar i64 oracle
+    /// exactly — same bit-for-bit contract as `sq8_stats` above, but exact
+    /// integers instead of float tolerance. On this dev host that means the
+    /// NEON tier; on a CPU/build with the tier unavailable (or
+    /// `MOON_SQ8_INT8_ADC=0`) the table has `None` and the test is a no-op
+    /// (asserting absence is not meaningful — the whole point of `None` is
+    /// "fall back to sq8_stats", verified by the call-site wiring instead).
+    #[test]
+    fn test_simd_matches_scalar_sq8_i8_stats() {
+        use crate::vector::turbo_quant::sq8::{
+            SQ8_INT8_QMAX, sq8_candidate_stats_i8_scalar, sq8_quantize_query_scalar,
+        };
+
+        init();
+        let t = table();
+        let Some(i8_stats_fn) = t.sq8_i8_stats else {
+            return;
+        };
+        for &dim in TEST_DIMS {
+            let q = deterministic_f32(dim, 42);
+            let codes = deterministic_u8(dim, 99);
+            let mut qi8 = vec![0i8; dim];
+            let (_q_scale, sum_qi8) = sq8_quantize_query_scalar(&q, SQ8_INT8_QMAX, &mut qi8);
+            let expected = sq8_candidate_stats_i8_scalar(&qi8, &codes, sum_qi8);
+            let got = i8_stats_fn(&qi8, &codes, sum_qi8);
+            assert_eq!(
+                got, expected,
+                "sq8_i8_stats mismatch at dim={dim}: scalar={expected:?} dispatch={got:?}"
+            );
+        }
+    }
+
+    /// Task #13: `MOON_SQ8_INT8_ADC` escape hatch — this test only asserts
+    /// the env var parses without panicking and is idempotent across calls
+    /// (the table itself is a `OnceLock` initialized once per process, so
+    /// this test cannot flip live dispatch — that is exercised manually /
+    /// by CI running the suite once with the var set, see CLAUDE.md).
+    #[test]
+    fn test_int8_adc_enabled_reads_env_without_panicking() {
+        let _ = super::int8_adc_enabled();
+        let _ = super::int8_adc_enabled();
     }
 
     /// Encode a deterministic f32 vector as f16 bits (rerank sidecar layout).

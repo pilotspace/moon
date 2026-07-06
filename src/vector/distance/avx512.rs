@@ -1,9 +1,14 @@
 //! AVX-512 distance kernels with 2x loop unrolling.
 //!
 //! All functions require AVX-512F at minimum. The i8 L2 kernel uses
-//! `avx512bw` for byte-width operations. VNNI (`_mm512_dpwssd_epi32`) is not
-//! yet stabilized in `core::arch::x86_64`, so we use the portable
-//! `cvtepi8_epi16` + `madd_epi16` widening approach instead.
+//! `avx512bw` for byte-width operations. `l2_i8_vnni` predates VNNI's
+//! stabilization — despite the name, it uses the portable
+//! `cvtepi8_epi16` + `madd_epi16` widening approach, not a real VNNI
+//! instruction (left as-is; renaming is out of scope here). **Update:**
+//! `_mm512_dpbusd_epi32` (`VPDPBUSD`, real AVX-512 VNNI) IS stable in
+//! `core::arch::x86_64` as of rustc 1.94 (verified directly for task #13,
+//! see [`sq8_i8_stats`]) — the "not yet stabilized" framing above is stale
+//! for that specific intrinsic; VNNI-gated code is possible and used below.
 //!
 //! The caller (DistanceTable init) verifies AVX-512F via
 //! `is_x86_feature_detected!` before installing these function pointers.
@@ -318,6 +323,94 @@ pub unsafe fn sq8_stats(query: &[f32], codes: &[u8]) -> (f32, f32, f32) {
     (dot_sum, sum_c_sum, sumsq_c_sum)
 }
 
+/// Int8 symmetric ADC per-candidate statistics (task #13), true AVX-512
+/// VNNI: `(Σ qi8_i·c_i, Σc_i, Σc_i²)` as exact `i64` integers, given an
+/// already-quantized `qi8` query (see
+/// `turbo_quant::sq8::sq8_quantize_query_scalar`).
+///
+/// Unlike `l2_i8_vnni` above (a historical misnomer — see the module docs),
+/// this kernel uses the real VNNI instruction: `_mm512_dpbusd_epi32`
+/// (`VPDPBUSD`, u8×i8 → i32 accumulate). `VPDPBUSD` has no saturation risk
+/// (genuine 32-bit accumulate), so `dot_qc` and `sum_c` (`Σc_i·1`) both use
+/// it directly at the full `±127` query range — no clamping, unlike the
+/// AVX2 tier's originally-planned (and rejected, see `avx2::sq8_i8_stats`
+/// docs) `VPMADDUBSW` design.
+///
+/// `sumsq_c` (`Σc_i²`) can NOT reuse `_mm512_dpbusd_epi32` with `codes` as
+/// both operands: its second operand must be **signed** i8 in `[-128,127]`,
+/// and codes run `0..=255` — reinterpreting bytes above 127 as negative
+/// would silently corrupt the square for the top half of the u8 range. So
+/// `sumsq_c` instead widens `codes` to i16 (`_mm512_cvtepu8_epi16`, exact)
+/// and reduces via `_mm512_madd_epi16` against itself (same shape as the
+/// AVX2 kernel; `VPMADDWD`, no saturation risk: `255² · 2 = 130050` fits
+/// i32 trivially).
+///
+/// # Safety
+/// Caller must ensure AVX-512F, AVX-512BW, and AVX-512VNNI are all
+/// available (checked via `is_x86_feature_detected!` at table-init time).
+///
+/// # Panics (debug only)
+/// `debug_assert_eq!(qi8.len(), codes.len())`.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
+pub unsafe fn sq8_i8_stats(qi8: &[i8], codes: &[u8], _sum_qi8: i32) -> (i64, i64, i64) {
+    debug_assert_eq!(qi8.len(), codes.len(), "sq8_i8_stats: dimension mismatch");
+
+    let n = qi8.len();
+    let pq = qi8.as_ptr();
+    let pc = codes.as_ptr();
+
+    let mut dot_acc = _mm512_setzero_si512();
+    let mut sum_c_acc = _mm512_setzero_si512();
+    let mut sumsq_c_acc = _mm512_setzero_si512();
+    let ones_i8 = _mm512_set1_epi8(1);
+
+    let chunks = n / 64;
+    let mut i = 0usize;
+
+    for _ in 0..chunks {
+        // SAFETY: i + 64 <= n guaranteed by chunks = n / 64. Both loads are
+        // unaligned 64-byte reads within bounds (i8 query / u8 codes).
+        let qv = _mm512_loadu_si512(pq.add(i) as *const __m512i);
+        let cv = _mm512_loadu_si512(pc.add(i) as *const __m512i);
+
+        // dot_qc: Σ qi8·c — cv is the unsigned u8 operand, qv the signed
+        // i8 operand; exact, no saturation (VPDPBUSD accumulates directly
+        // into i32).
+        dot_acc = _mm512_dpbusd_epi32(dot_acc, cv, qv);
+        // sum_c: Σ c·1 — safe regardless of c's magnitude since the SIGNED
+        // operand is the constant 1, not c.
+        sum_c_acc = _mm512_dpbusd_epi32(sum_c_acc, cv, ones_i8);
+
+        // sumsq_c: Σ c² via widen-to-i16 + madd_epi16 (see doc comment).
+        let c_lo16 = _mm512_cvtepu8_epi16(_mm512_castsi512_si256(cv));
+        let c_hi16 = _mm512_cvtepu8_epi16(_mm512_extracti64x4_epi64(cv, 1));
+        sumsq_c_acc = _mm512_add_epi32(sumsq_c_acc, _mm512_madd_epi16(c_lo16, c_lo16));
+        sumsq_c_acc = _mm512_add_epi32(sumsq_c_acc, _mm512_madd_epi16(c_hi16, c_hi16));
+
+        i += 64;
+    }
+
+    // SAFETY: _mm512_reduce_add_epi32 requires AVX-512F, verified via target_feature.
+    let mut dot: i64 = _mm512_reduce_add_epi32(dot_acc) as i64;
+    let mut sum_c: i64 = _mm512_reduce_add_epi32(sum_c_acc) as i64;
+    let mut sumsq_c: i64 = _mm512_reduce_add_epi32(sumsq_c_acc) as i64;
+
+    // Scalar tail.
+    while i < n {
+        // SAFETY: i < n, within bounds of both equal-length slices.
+        let q = *qi8.get_unchecked(i) as i64;
+        let c = *codes.get_unchecked(i) as i64;
+        dot += q * c;
+        sum_c += c;
+        sumsq_c += c * c;
+        i += 1;
+    }
+
+    (dot, sum_c, sumsq_c)
+}
+
 #[cfg(test)]
 #[cfg(target_arch = "x86_64")]
 mod tests {
@@ -501,5 +594,98 @@ mod tests {
                 "sq8_stats tail len={len}: scalar={expected:?}, avx512={got:?}"
             );
         }
+    }
+
+    // ── task #13: int8 symmetric ADC stats (AVX-512 VNNI vs scalar oracle) ──
+    //
+    // Gated on `has_avx512vnni()` — compiles on this aarch64 dev host
+    // (proving the cfg discipline holds) but no-ops at runtime everywhere
+    // except a genuine VNNI-capable x86_64 host (Rosetta 2 does not emulate
+    // AVX-512 at all, so even x86_64-apple-darwin cross-builds no-op here).
+
+    fn has_avx512vnni() -> bool {
+        is_x86_feature_detected!("avx512vnni")
+    }
+
+    fn gen_i8_query(len: usize, seed: u32, qmax: i32) -> Vec<i8> {
+        let mut v = Vec::with_capacity(len);
+        let mut s = seed;
+        for _ in 0..len {
+            s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+            let raw = (s >> 24) as i8 as i32;
+            v.push((raw % (qmax + 1)) as i8);
+        }
+        v
+    }
+
+    #[test]
+    fn test_sq8_i8_stats_matches_scalar_oracle() {
+        if !has_avx512vnni() || !has_avx512bw() {
+            return;
+        }
+        use crate::vector::turbo_quant::sq8::sq8_candidate_stats_i8_scalar;
+        let qi8 = gen_i8_query(768, 42, 127);
+        let c = gen_u8(768, 99);
+        let sum_qi8: i32 = qi8.iter().map(|&x| x as i32).sum();
+        let expected = sq8_candidate_stats_i8_scalar(&qi8, &c, sum_qi8);
+        // SAFETY: AVX-512F+BW+VNNI verified above.
+        let got = unsafe { sq8_i8_stats(&qi8, &c, sum_qi8) };
+        assert_eq!(
+            got, expected,
+            "sq8_i8_stats mismatch (exact int arithmetic): scalar={expected:?}, avx512={got:?}"
+        );
+    }
+
+    #[test]
+    fn test_sq8_i8_stats_tail_handling() {
+        if !has_avx512vnni() || !has_avx512bw() {
+            return;
+        }
+        use crate::vector::turbo_quant::sq8::sq8_candidate_stats_i8_scalar;
+        for len in [0, 1, 3, 7, 13, 15, 31, 32, 33, 63, 64, 65, 100] {
+            let qi8 = gen_i8_query(len, 42, 127);
+            let c = gen_u8(len, 99);
+            let sum_qi8: i32 = qi8.iter().map(|&x| x as i32).sum();
+            let expected = sq8_candidate_stats_i8_scalar(&qi8, &c, sum_qi8);
+            // SAFETY: AVX-512F+BW+VNNI verified above.
+            let got = unsafe { sq8_i8_stats(&qi8, &c, sum_qi8) };
+            assert_eq!(
+                got, expected,
+                "sq8_i8_stats tail len={len}: scalar={expected:?}, avx512={got:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_sq8_i8_stats_empty() {
+        if !has_avx512vnni() || !has_avx512bw() {
+            return;
+        }
+        let qi8: &[i8] = &[];
+        let c: &[u8] = &[];
+        // SAFETY: AVX-512F+BW+VNNI verified above.
+        let got = unsafe { sq8_i8_stats(qi8, c, 0) };
+        assert_eq!(got, (0, 0, 0));
+    }
+
+    #[test]
+    fn test_sq8_i8_stats_extreme_values() {
+        if !has_avx512vnni() || !has_avx512bw() {
+            return;
+        }
+        use crate::vector::turbo_quant::sq8::sq8_candidate_stats_i8_scalar;
+        let dim = 768;
+        let qi8: Vec<i8> = (0..dim)
+            .map(|i| if i % 2 == 0 { 127i8 } else { -127i8 })
+            .collect();
+        let c: Vec<u8> = vec![255u8; dim];
+        let sum_qi8: i32 = qi8.iter().map(|&x| x as i32).sum();
+        let expected = sq8_candidate_stats_i8_scalar(&qi8, &c, sum_qi8);
+        // SAFETY: AVX-512F+BW+VNNI verified above.
+        let got = unsafe { sq8_i8_stats(&qi8, &c, sum_qi8) };
+        assert_eq!(
+            got, expected,
+            "extreme-value mismatch: scalar={expected:?}, avx512={got:?}"
+        );
     }
 }

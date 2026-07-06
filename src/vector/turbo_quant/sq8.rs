@@ -277,6 +277,120 @@ pub fn sq8_ip_from_stats(min: f32, scale: f32, q_sum: f32, dot_qc: f32) -> f32 {
     min * q_sum + scale * dot_qc
 }
 
+// ── int8 symmetric ADC (task #13) ───────────────────────────────────────
+//
+// The stats decomposition above still widens the u8 codes to `f32` for the
+// per-candidate pass (`sq8_candidate_stats_scalar` / the SIMD `sq8_stats`
+// kernels) — correct, but each candidate byte pays a u8->f32 convert plus an
+// FMA. Integer dot products (NEON widening multiply, x86 widen+madd, AVX512
+// VPDPBUSD) move 2-4x more bytes per instruction than the float path.
+//
+// Design (see tmp/INT8-ADC-CONTEXT.md): quantize the QUERY once per search
+// to symmetric int8 (no zero point, `qi8 = round(q / q_scale)`); `sum_c` and
+// `sumsq_c` are exact integers straight from the u8 codes (query-independent,
+// unaffected by quantization); `dot_qc` is the only approximate term,
+// reconstructed as `q_scale * (exact integer Σ qi8·c)`.
+//
+// `SQ8_INT8_QMAX` is shared by every SIMD tier (NEON widening multiply,
+// AVX2, AVX512-VNNI) — see `src/vector/distance/avx2.rs` module docs for why
+// the originally-planned VPMADDUBSW-with-clamped-query design (qmax=63) was
+// dropped: it measurably regresses recall (see the A/B test below), so all
+// tiers instead use a saturation-free widen-multiply-then-32-bit-accumulate
+// shape that tolerates the full `[-127, 127]` range.
+
+/// Query-quantization amplitude shared by every int8 ADC SIMD tier. Chosen so
+/// even the least-precise integer path (originally AVX2 VPMADDUBSW, now
+/// replaced by a saturation-free widening kernel — see module docs) needs no
+/// special-cased narrower range: every tier quantizes to the same
+/// `[-127, 127]`, so a single `qi8` buffer serves NEON, AVX2, and AVX512.
+pub const SQ8_INT8_QMAX: i32 = 127;
+
+/// Quantize `query` to symmetric int8 for the int8 ADC path: `qi8 =
+/// round(q / q_scale).clamp(-qmax, qmax)`, `q_scale = max|q| / qmax` (`0.0`
+/// for an all-zero query, in which case every `qi8` entry is `0`).
+///
+/// Call **once per search** (like [`sq8_query_stats`]) — this is not a
+/// per-candidate cost. Returns `(q_scale, sum_qi8)`; `sum_qi8` (exact `i32`
+/// sum of the quantized codes) is consumed only by kernels that need the
+/// NEON-style offset-trick correction internally — scalar/AVX2/AVX512
+/// callers may ignore it, but it is threaded through the shared
+/// [`Sq8I8StatsFn`] signature so every tier's kernel has it available
+/// without a second reduction pass.
+///
+/// # Panics (debug only)
+/// `debug_assert_eq!(query.len(), out.len())`.
+pub fn sq8_quantize_query_scalar(query: &[f32], qmax: i32, out: &mut [i8]) -> (f32, i32) {
+    debug_assert_eq!(query.len(), out.len());
+    debug_assert!(qmax > 0 && qmax <= 127);
+    let mut max_abs = 0.0f32;
+    for &q in query {
+        let a = q.abs();
+        if a > max_abs {
+            max_abs = a;
+        }
+    }
+    let q_scale = if max_abs > 0.0 {
+        max_abs / qmax as f32
+    } else {
+        0.0
+    };
+    let inv = if q_scale > 0.0 { 1.0 / q_scale } else { 0.0 };
+    let qmax_f = qmax as f32;
+    let mut sum_qi8 = 0i32;
+    for (o, &q) in out.iter_mut().zip(query) {
+        let qi = (q * inv).round().clamp(-qmax_f, qmax_f) as i32;
+        *o = qi as i8;
+        sum_qi8 += qi;
+    }
+    (q_scale, sum_qi8)
+}
+
+/// Shared function-pointer signature for the int8 per-candidate ADC stats
+/// pass, implemented by the scalar reference below and by the NEON/AVX2/
+/// AVX512 kernels installed into `DistanceTable::sq8_i8_stats`. Every
+/// implementation must return **exactly** `(Σ qi8_i·c_i, Σ c_i, Σ c_i²)` as
+/// exact `i64` integers — this is pure integer arithmetic (no float
+/// rounding anywhere in the per-candidate pass), so SIMD kernels are
+/// checked against the scalar reference for **bit-for-bit equality**, not
+/// float tolerance.
+///
+/// `sum_qi8` (from [`sq8_quantize_query_scalar`]) is accepted by every
+/// implementation for interface parity with the NEON offset-trick kernel,
+/// which needs it; the scalar reference and the AVX2/AVX512 kernels ignore
+/// it (their widen-multiply shapes need no offset correction).
+pub type Sq8I8StatsFn = fn(qi8: &[i8], codes: &[u8], sum_qi8: i32) -> (i64, i64, i64);
+
+/// Scalar reference / correctness oracle for the int8 per-candidate ADC
+/// stats pass. Exact integer arithmetic throughout (`i64` accumulation) —
+/// this is the ground truth every SIMD int8 kernel must reproduce exactly.
+///
+/// # Panics (debug only)
+/// `debug_assert_eq!(qi8.len(), codes.len())`.
+#[inline]
+pub fn sq8_candidate_stats_i8_scalar(qi8: &[i8], codes: &[u8], _sum_qi8: i32) -> (i64, i64, i64) {
+    debug_assert_eq!(qi8.len(), codes.len());
+    let mut dot = 0i64;
+    let mut sum_c = 0i64;
+    let mut sumsq_c = 0i64;
+    for (&q, &c) in qi8.iter().zip(codes) {
+        let qi = q as i64;
+        let ci = c as i64;
+        dot += qi * ci;
+        sum_c += ci;
+        sumsq_c += ci * ci;
+    }
+    (dot, sum_c, sumsq_c)
+}
+
+/// Reconstruct the approximate `dot_qc` term (`f32`, the only lossy value in
+/// the int8 path) from the exact integer dot product and the per-query
+/// `q_scale`. `O(1)`; call once per candidate right before
+/// [`sq8_l2_from_stats`].
+#[inline]
+pub fn sq8_int8_dot_to_f32(q_scale: f32, dot_qc_int: i64) -> f32 {
+    q_scale * dot_qc_int as f32
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -601,6 +715,306 @@ mod tests {
         assert_eq!(
             exact_best, sq8_best,
             "stats-decomposed SQ8 nearest neighbor diverged from exact"
+        );
+    }
+
+    // ── int8 symmetric ADC (task #13) ────────────────────────────────────
+
+    #[test]
+    fn test_i8_quantize_within_qmax_and_error_bounded() {
+        for &dim in &[1usize, 7, 16, 128, 384, 768] {
+            let q = pseudo_vec(42_000 + dim as u64, dim);
+            let mut qi8 = vec![0i8; dim];
+            let (q_scale, sum_qi8) = sq8_quantize_query_scalar(&q, SQ8_INT8_QMAX, &mut qi8);
+            let mut exact_sum = 0i32;
+            for (&orig, &qi) in q.iter().zip(&qi8) {
+                assert!(
+                    (qi as i32).abs() <= SQ8_INT8_QMAX,
+                    "dim={dim}: qi8 value {qi} exceeds qmax {SQ8_INT8_QMAX}"
+                );
+                exact_sum += qi as i32;
+                // round-to-nearest quantization error is bounded by half a step.
+                let reconstructed = qi as f32 * q_scale;
+                assert!(
+                    (orig - reconstructed).abs() <= q_scale * 0.5 + 1e-6,
+                    "dim={dim}: orig={orig} reconstructed={reconstructed} q_scale={q_scale}"
+                );
+            }
+            assert_eq!(sum_qi8, exact_sum, "dim={dim}: sum_qi8 mismatch");
+        }
+    }
+
+    #[test]
+    fn test_i8_quantize_all_zero_query_is_zero() {
+        let q = vec![0.0f32; 32];
+        let mut qi8 = vec![1i8; 32]; // pre-poisoned to catch a no-op quantize
+        let (q_scale, sum_qi8) = sq8_quantize_query_scalar(&q, SQ8_INT8_QMAX, &mut qi8);
+        assert_eq!(q_scale, 0.0);
+        assert_eq!(sum_qi8, 0);
+        assert!(qi8.iter().all(|&c| c == 0));
+    }
+
+    #[test]
+    fn test_i8_candidate_stats_matches_direct_i64_computation() {
+        // The scalar reference IS the i64 oracle by construction (no widening,
+        // no reassociation) — this test pins that down explicitly so a future
+        // refactor of the scalar function can't silently drift from "exact".
+        for &dim in &[0usize, 1, 3, 16, 100, 384] {
+            let q = pseudo_vec(43_000 + dim as u64, dim);
+            let v = pseudo_vec(44_000 + dim as u64, dim);
+            let mut qi8 = vec![0i8; dim];
+            let (_q_scale, sum_qi8) = sq8_quantize_query_scalar(&q, SQ8_INT8_QMAX, &mut qi8);
+            let codes = encode_sq8(&v);
+            let (dot, sum_c, sumsq_c) = sq8_candidate_stats_i8_scalar(&qi8, &codes[..dim], sum_qi8);
+
+            let mut dot_direct = 0i64;
+            let mut sum_c_direct = 0i64;
+            let mut sumsq_c_direct = 0i64;
+            for i in 0..dim {
+                let qi = qi8[i] as i64;
+                let ci = codes[i] as i64;
+                dot_direct += qi * ci;
+                sum_c_direct += ci;
+                sumsq_c_direct += ci * ci;
+            }
+            assert_eq!(
+                (dot, sum_c, sumsq_c),
+                (dot_direct, sum_c_direct, sumsq_c_direct),
+                "dim={dim}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_i8_stats_zero_dim_is_zero() {
+        let mut qi8: Vec<i8> = vec![];
+        let (q_scale, sum_qi8) = sq8_quantize_query_scalar(&[], SQ8_INT8_QMAX, &mut qi8);
+        assert_eq!((q_scale, sum_qi8), (0.0, 0));
+        assert_eq!(sq8_candidate_stats_i8_scalar(&[], &[], sum_qi8), (0, 0, 0));
+    }
+
+    /// End-to-end recall A/B: same dataset, f32-stats ADC vs int8-stats ADC,
+    /// vs an exact-f32 brute-force ground truth. Per tmp/INT8-ADC-CONTEXT.md
+    /// this is the primary safety net for the int8 path (the exact-rerank
+    /// sidecar elsewhere is a *second* layer — this test deliberately does
+    /// NOT invoke it, so it isolates the int8 ADC's own error instead of
+    /// letting the sidecar wash it out).
+    fn recall_at_10(candidate: &[usize], truth: &[usize]) -> f32 {
+        let hit = candidate.iter().filter(|c| truth.contains(c)).count();
+        hit as f32 / truth.len() as f32
+    }
+
+    fn top10_by_dist(dists: &[(usize, f32)]) -> Vec<usize> {
+        let mut v = dists.to_vec();
+        v.sort_by(|a, b| a.1.total_cmp(&b.1));
+        v.into_iter().take(10).map(|(i, _)| i).collect()
+    }
+
+    /// Shared A/B harness: builds a seeded synthetic dataset, runs ground
+    /// truth / f32-ADC / int8-ADC brute force, and returns
+    /// `(mean R@10 f32-vs-truth, mean R@10 int8-vs-truth, mean overlap
+    /// int8-vs-f32)`. `n=5000`, `n_queries=200` — enough to average out
+    /// per-query noise (30 queries is too few: a single flipped neighbor
+    /// swings the mean by 3.3 points, wide enough to make the 0.01 gate
+    /// meaningless either way).
+    fn int8_recall_ab(dim: usize) -> (f32, f32, f32) {
+        const N: usize = 5000;
+        const N_QUERIES: usize = 200;
+
+        let db: Vec<Vec<f32>> = (0..N)
+            .map(|i| pseudo_vec(500_000 + i as u64, dim))
+            .collect();
+        let encoded: Vec<Vec<u8>> = db.iter().map(|v| encode_sq8(v)).collect();
+
+        let mut r_f32 = 0.0f32;
+        let mut r_int8 = 0.0f32;
+        let mut overlap = 0.0f32;
+
+        for qi in 0..N_QUERIES {
+            let q = pseudo_vec(900_000 + qi as u64, dim);
+
+            let truth_dists: Vec<(usize, f32)> = db
+                .iter()
+                .enumerate()
+                .map(|(i, v)| (i, l2_sq(&q, v)))
+                .collect();
+            let truth_top10 = top10_by_dist(&truth_dists);
+
+            let (q_sum, q_sumsq) = sq8_query_stats(&q);
+            let f32_dists: Vec<(usize, f32)> = encoded
+                .iter()
+                .enumerate()
+                .map(|(i, slot)| {
+                    let (min, scale) = sq8_params(slot, dim);
+                    let (dot_qc, sum_c, sumsq_c) = sq8_candidate_stats_scalar(&q, &slot[..dim]);
+                    let d =
+                        sq8_l2_from_stats(dim, min, scale, q_sum, q_sumsq, dot_qc, sum_c, sumsq_c);
+                    (i, d)
+                })
+                .collect();
+            let f32_top10 = top10_by_dist(&f32_dists);
+
+            let mut qi8 = vec![0i8; dim];
+            let (q_scale, sum_qi8) = sq8_quantize_query_scalar(&q, SQ8_INT8_QMAX, &mut qi8);
+            let int8_dists: Vec<(usize, f32)> = encoded
+                .iter()
+                .enumerate()
+                .map(|(i, slot)| {
+                    let (min, scale) = sq8_params(slot, dim);
+                    let (dot_int, sum_c_int, sumsq_c_int) =
+                        sq8_candidate_stats_i8_scalar(&qi8, &slot[..dim], sum_qi8);
+                    let dot_qc = sq8_int8_dot_to_f32(q_scale, dot_int);
+                    let d = sq8_l2_from_stats(
+                        dim,
+                        min,
+                        scale,
+                        q_sum,
+                        q_sumsq,
+                        dot_qc,
+                        sum_c_int as f32,
+                        sumsq_c_int as f32,
+                    );
+                    (i, d)
+                })
+                .collect();
+            let int8_top10 = top10_by_dist(&int8_dists);
+
+            r_f32 += recall_at_10(&f32_top10, &truth_top10);
+            r_int8 += recall_at_10(&int8_top10, &truth_top10);
+            overlap += recall_at_10(&int8_top10, &f32_top10);
+        }
+
+        (
+            r_f32 / N_QUERIES as f32,
+            r_int8 / N_QUERIES as f32,
+            overlap / N_QUERIES as f32,
+        )
+    }
+
+    #[test]
+    fn test_int8_adc_recall_ab_dim128() {
+        let (r_f32, r_int8, overlap) = int8_recall_ab(128);
+        assert!(
+            overlap >= 0.98,
+            "dim128: overlap(int8 vs f32)={overlap} below 0.98 gate"
+        );
+        assert!(
+            (r_f32 - r_int8).abs() <= 0.01,
+            "dim128: R@10 f32={r_f32} int8={r_int8} delta={} exceeds 0.01",
+            (r_f32 - r_int8).abs()
+        );
+    }
+
+    #[test]
+    fn test_int8_adc_recall_ab_dim384() {
+        let (r_f32, r_int8, overlap) = int8_recall_ab(384);
+        assert!(
+            overlap >= 0.98,
+            "dim384: overlap(int8 vs f32)={overlap} below 0.98 gate"
+        );
+        assert!(
+            (r_f32 - r_int8).abs() <= 0.01,
+            "dim384: R@10 f32={r_f32} int8={r_int8} delta={} exceeds 0.01",
+            (r_f32 - r_int8).abs()
+        );
+    }
+
+    /// Cosine metric: SQ8 vectors normalized to the unit sphere, then the L2
+    /// combine is reused (the "cosine trick" — squared L2 on unit vectors is
+    /// monotonic with cosine similarity). Confirms the int8 path holds recall
+    /// under the SAME reuse the production Cosine/InnerProduct call sites
+    /// rely on (they never call `sq8_ip_from_stats` — see module docs).
+    #[test]
+    fn test_int8_adc_recall_ab_cosine_normalized() {
+        const DIM: usize = 128;
+        const N: usize = 5000;
+        const N_QUERIES: usize = 200;
+
+        fn normalize(v: &mut [f32]) {
+            let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            if norm > 0.0 {
+                for x in v.iter_mut() {
+                    *x /= norm;
+                }
+            }
+        }
+
+        let db: Vec<Vec<f32>> = (0..N)
+            .map(|i| {
+                let mut v = pseudo_vec(700_000 + i as u64, DIM);
+                normalize(&mut v);
+                v
+            })
+            .collect();
+        let encoded: Vec<Vec<u8>> = db.iter().map(|v| encode_sq8(v)).collect();
+
+        let mut r_f32 = 0.0f32;
+        let mut r_int8 = 0.0f32;
+        let mut overlap = 0.0f32;
+
+        for qi in 0..N_QUERIES {
+            let mut q = pseudo_vec(950_000 + qi as u64, DIM);
+            normalize(&mut q);
+
+            let truth_dists: Vec<(usize, f32)> = db
+                .iter()
+                .enumerate()
+                .map(|(i, v)| (i, l2_sq(&q, v)))
+                .collect();
+            let truth_top10 = top10_by_dist(&truth_dists);
+
+            let (q_sum, q_sumsq) = sq8_query_stats(&q);
+            let f32_dists: Vec<(usize, f32)> = encoded
+                .iter()
+                .enumerate()
+                .map(|(i, slot)| {
+                    let (min, scale) = sq8_params(slot, DIM);
+                    let (dot_qc, sum_c, sumsq_c) = sq8_candidate_stats_scalar(&q, &slot[..DIM]);
+                    let d =
+                        sq8_l2_from_stats(DIM, min, scale, q_sum, q_sumsq, dot_qc, sum_c, sumsq_c);
+                    (i, d)
+                })
+                .collect();
+            let f32_top10 = top10_by_dist(&f32_dists);
+
+            let mut qi8 = vec![0i8; DIM];
+            let (q_scale, sum_qi8) = sq8_quantize_query_scalar(&q, SQ8_INT8_QMAX, &mut qi8);
+            let int8_dists: Vec<(usize, f32)> = encoded
+                .iter()
+                .enumerate()
+                .map(|(i, slot)| {
+                    let (min, scale) = sq8_params(slot, DIM);
+                    let (dot_int, sum_c_int, sumsq_c_int) =
+                        sq8_candidate_stats_i8_scalar(&qi8, &slot[..DIM], sum_qi8);
+                    let dot_qc = sq8_int8_dot_to_f32(q_scale, dot_int);
+                    let d = sq8_l2_from_stats(
+                        DIM,
+                        min,
+                        scale,
+                        q_sum,
+                        q_sumsq,
+                        dot_qc,
+                        sum_c_int as f32,
+                        sumsq_c_int as f32,
+                    );
+                    (i, d)
+                })
+                .collect();
+            let int8_top10 = top10_by_dist(&int8_dists);
+
+            r_f32 += recall_at_10(&f32_top10, &truth_top10);
+            r_int8 += recall_at_10(&int8_top10, &truth_top10);
+            overlap += recall_at_10(&int8_top10, &f32_top10);
+        }
+
+        let r_f32 = r_f32 / N_QUERIES as f32;
+        let r_int8 = r_int8 / N_QUERIES as f32;
+        let overlap = overlap / N_QUERIES as f32;
+        assert!(overlap >= 0.98, "cosine: overlap={overlap} below 0.98 gate");
+        assert!(
+            (r_f32 - r_int8).abs() <= 0.01,
+            "cosine: R@10 f32={r_f32} int8={r_int8} delta={} exceeds 0.01",
+            (r_f32 - r_int8).abs()
         );
     }
 }
