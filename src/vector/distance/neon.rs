@@ -435,15 +435,15 @@ pub unsafe fn sq8_i8_stats(qi8: &[i8], codes: &[u8], sum_qi8: i32) -> (i64, i64,
     let mut sumsq_c: i64 = sumsq_arr.iter().map(|&x| x as i64).sum();
 
     // Scalar tail — direct (no offset trick needed, exact i64 arithmetic).
-    while i < n {
-        // SAFETY: i < n, within bounds of both slices (equal length,
-        // asserted by the debug_assert! above).
-        let q = *qi8.get_unchecked(i) as i64;
-        let c = *codes.get_unchecked(i) as i64;
+    // Safe indexing: at most one sub-vector-width pass, so bounds checks
+    // cost nothing and the unsafe surface stays confined to the intrinsics
+    // above (UNSAFE_POLICY).
+    for (&q, &c) in qi8[i..n].iter().zip(codes[i..n].iter()) {
+        let q = q as i64;
+        let c = c as i64;
         dot_offset += q * (c - 128);
         sum_c += c;
         sumsq_c += c * c;
-        i += 1;
     }
 
     let dot = dot_offset + 128i64 * sum_qi8 as i64;
