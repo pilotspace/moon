@@ -76,7 +76,8 @@ fn cpu_seconds(pid: u32) -> f64 {
     // After ')': field[0]=state ... utime is the 12th, stime the 13th.
     let utime: u64 = fields[11].parse().expect("utime");
     let stime: u64 = fields[12].parse().expect("stime");
-    // SAFETY-free libc call: sysconf is pure.
+    // SAFETY: sysconf(_SC_CLK_TCK) reads a static kernel constant; it takes
+    // no pointers and touches no shared state.
     let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as f64;
     (utime + stime) as f64 / hz
 }
