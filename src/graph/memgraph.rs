@@ -329,6 +329,19 @@ impl MemGraph {
 
         Ok(FrozenMemGraph { nodes, edges })
     }
+
+    /// Re-arm a drained MemGraph for writes after a successful freeze.
+    ///
+    /// Keeps the SAME slot maps (drain bumps each vacated slot's generation,
+    /// so keys handed out after thaw can never collide with the external_ids
+    /// of frozen CSR rows). Replacing the MemGraph with a fresh one instead
+    /// would restart SlotMap allocation at the same (index, generation) pairs
+    /// and silently alias new nodes onto frozen rows.
+    pub fn thaw(&mut self) {
+        self.frozen = false;
+        self.live_node_count = 0;
+        self.live_edge_count = 0;
+    }
 }
 
 /// Zero-allocation neighbor iterator. Borrows from MemGraph's SmallVec adjacency lists.

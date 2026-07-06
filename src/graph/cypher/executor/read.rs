@@ -31,24 +31,22 @@ pub fn execute(
             PhysicalOp::NodeScan { variable, label } => {
                 let label_id = label.as_ref().map(|l| label_to_id(l.as_bytes()));
                 let committed = roaring::RoaringBitmap::new();
-                let mut new_rows = Vec::new();
+                // Scan BOTH tiers: the mutable write buffer and frozen CSR
+                // segments (freeze DRAINS nodes — a memgraph-only scan loses
+                // every frozen node).
+                let view = crate::graph::view::MergedNodeView::new(memgraph, csr_segs);
+                let mut keys = Vec::new();
+                view.for_each_visible_node(
+                    label_id,
+                    ctx.snapshot_lsn,
+                    ctx.my_txn_id,
+                    &committed,
+                    ctx.valid_time_as_of,
+                    |k| keys.push(k),
+                );
+                let mut new_rows = Vec::with_capacity(rows.len() * keys.len());
                 for row in &rows {
-                    for (key, node) in memgraph.iter_nodes() {
-                        if let Some(lid) = label_id {
-                            if !node.labels.contains(&lid) {
-                                continue;
-                            }
-                        }
-                        // Bi-temporal + MVCC visibility filter
-                        if !crate::graph::visibility::is_node_visible(
-                            node,
-                            ctx.snapshot_lsn,
-                            ctx.my_txn_id,
-                            &committed,
-                            ctx.valid_time_as_of,
-                        ) {
-                            continue;
-                        }
+                    for &key in &keys {
                         let mut new_row = row.clone();
                         new_row.insert(variable.clone(), Value::Node(key));
                         new_rows.push(new_row);
@@ -93,6 +91,7 @@ pub fn execute(
                 );
 
                 let committed = roaring::RoaringBitmap::new();
+                let view = crate::graph::view::MergedNodeView::new(memgraph, csr_segs);
                 let mut new_rows = Vec::new();
                 for row in &rows {
                     let src_key = match row.get(source) {
@@ -109,16 +108,16 @@ pub fn execute(
                                 continue;
                             }
                             // Bi-temporal visibility check on target node
-                            if let Some(target_node) = memgraph.get_node(merged.node) {
-                                if !crate::graph::visibility::is_node_visible(
-                                    target_node,
-                                    ctx.snapshot_lsn,
-                                    ctx.my_txn_id,
-                                    &committed,
-                                    ctx.valid_time_as_of,
-                                ) {
-                                    continue;
-                                }
+                            // (merged view — frozen targets get the CSR
+                            // NodeMeta check instead of a free pass).
+                            if !view.is_visible(
+                                merged.node,
+                                ctx.snapshot_lsn,
+                                ctx.my_txn_id,
+                                &committed,
+                                ctx.valid_time_as_of,
+                            ) {
+                                continue;
                             }
                             let mut new_row = row.clone();
                             new_row.insert(target.clone(), Value::Node(merged.node));
@@ -544,24 +543,20 @@ pub fn execute_profile(
             PhysicalOp::NodeScan { variable, label } => {
                 let label_id = label.as_ref().map(|l| label_to_id(l.as_bytes()));
                 let committed = roaring::RoaringBitmap::new();
-                let mut new_rows = Vec::new();
+                // Merged-tier scan (parity with the main executor).
+                let view = crate::graph::view::MergedNodeView::new(memgraph, csr_segs);
+                let mut keys = Vec::new();
+                view.for_each_visible_node(
+                    label_id,
+                    ctx.snapshot_lsn,
+                    ctx.my_txn_id,
+                    &committed,
+                    ctx.valid_time_as_of,
+                    |k| keys.push(k),
+                );
+                let mut new_rows = Vec::with_capacity(rows.len() * keys.len());
                 for row in &rows {
-                    for (key, node) in memgraph.iter_nodes() {
-                        if let Some(lid) = label_id {
-                            if !node.labels.contains(&lid) {
-                                continue;
-                            }
-                        }
-                        // Bi-temporal + MVCC visibility filter
-                        if !crate::graph::visibility::is_node_visible(
-                            node,
-                            ctx.snapshot_lsn,
-                            ctx.my_txn_id,
-                            &committed,
-                            ctx.valid_time_as_of,
-                        ) {
-                            continue;
-                        }
+                    for &key in &keys {
                         let mut new_row = row.clone();
                         new_row.insert(variable.clone(), Value::Node(key));
                         new_rows.push(new_row);

@@ -154,8 +154,11 @@ impl CsrSegment {
         for edges in &edges_by_src {
             for &(dst_row, edge) in edges {
                 col_indices.push(dst_row);
-                let property_offset =
-                    props::encode_edge_record(&mut edge_props, edge.weight, edge.properties.as_ref());
+                let property_offset = props::encode_edge_record(
+                    &mut edge_props,
+                    edge.weight,
+                    edge.properties.as_ref(),
+                );
                 edge_meta.push(EdgeMeta {
                     edge_type: edge.edge_type,
                     flags: 0,
@@ -274,11 +277,7 @@ impl CsrSegment {
     }
 
     /// Single node property lookup without materializing the map.
-    pub fn node_property(
-        &self,
-        row: u32,
-        key: u16,
-    ) -> Option<crate::graph::types::PropertyValue> {
+    pub fn node_property(&self, row: u32, key: u16) -> Option<crate::graph::types::PropertyValue> {
         let nm = self.node_meta.get(row as usize)?;
         props::decode_node_prop(&self.node_props, nm.property_offset, key)
     }
@@ -480,8 +479,14 @@ impl CsrSegment {
             0
         };
 
-        let total =
-            header_size + ro_size + ci_size + em_size + nm_size + ecms_size + overflow_size + props_size;
+        let total = header_size
+            + ro_size
+            + ci_size
+            + em_size
+            + nm_size
+            + ecms_size
+            + overflow_size
+            + props_size;
         let mut buf = Vec::with_capacity(total);
 
         // Write header with computed offsets (checksum placeholder = 0).
@@ -786,18 +791,22 @@ impl CsrSegment {
             let np_len = u64::from_le_bytes(read8(data, ppos)?) as usize;
             ppos += 8;
             let node_props = data
-                .get(ppos..ppos.checked_add(np_len).ok_or_else(|| {
-                    CsrError::InvalidData("node_props length overflow".to_owned())
-                })?)
+                .get(
+                    ppos..ppos.checked_add(np_len).ok_or_else(|| {
+                        CsrError::InvalidData("node_props length overflow".to_owned())
+                    })?,
+                )
                 .ok_or_else(|| CsrError::InvalidData("node_props section truncated".to_owned()))?
                 .to_vec();
             ppos += np_len;
             let ep_len = u64::from_le_bytes(read8(data, ppos)?) as usize;
             ppos += 8;
             let edge_props = data
-                .get(ppos..ppos.checked_add(ep_len).ok_or_else(|| {
-                    CsrError::InvalidData("edge_props length overflow".to_owned())
-                })?)
+                .get(
+                    ppos..ppos.checked_add(ep_len).ok_or_else(|| {
+                        CsrError::InvalidData("edge_props length overflow".to_owned())
+                    })?,
+                )
                 .ok_or_else(|| CsrError::InvalidData("edge_props section truncated".to_owned()))?
                 .to_vec();
             (node_props, edge_props)
@@ -1213,7 +1222,10 @@ mod tests {
         let restored = CsrSegment::from_bytes(&bytes).expect("from_bytes ok");
 
         assert_eq!(restored.header.magic, *b"MNGR");
-        assert_eq!(restored.header.version, crate::graph::types::CSR_CURRENT_VERSION);
+        assert_eq!(
+            restored.header.version,
+            crate::graph::types::CSR_CURRENT_VERSION
+        );
         assert_eq!(restored.node_count(), original.node_count());
         assert_eq!(restored.edge_count(), original.edge_count());
         assert_eq!(restored.created_lsn, 42);
@@ -1523,7 +1535,10 @@ mod tests {
         // Serialize and deserialize.
         let bytes = csr.to_bytes();
         let restored = CsrSegment::from_bytes(&bytes).expect("roundtrip ok");
-        assert_eq!(restored.header.version, crate::graph::types::CSR_CURRENT_VERSION);
+        assert_eq!(
+            restored.header.version,
+            crate::graph::types::CSR_CURRENT_VERSION
+        );
 
         // Verify temporal fields survive roundtrip.
         for (i, nm) in restored.node_meta.iter().enumerate() {
