@@ -22,6 +22,150 @@ use super::group_commit::{
 #[cfg(feature = "runtime-monoio")]
 use super::group_commit::{GroupCommitSink, commit_group_commit_batch};
 
+/// Idle-adaptive wake cadence for a background AOF writer's channel poll
+/// (RSS/CPU wave 5, item B).
+///
+/// The steady-state writer loops (PerShard monoio/tokio, TopLevel tokio —
+/// TopLevel monoio blocks on an untimed `rx.recv()` and needs none of this)
+/// poll their channel with a bounded timeout so the EverySec proactive-fsync
+/// deadline check that follows every wake still fires when no new Appends
+/// ever arrive. A FIXED cadence forever (previously 50ms monoio / 200ms
+/// tokio) means an idle server's AOF writer thread wakes 5-20 times a
+/// second doing nothing. Escalating the wait once a poll times out with
+/// nothing queued costs nothing: the poll races a message against the
+/// deadline, so a real write always wakes the loop immediately regardless
+/// of how long the timeout is set — only the "still idle, re-check
+/// nothing" cadence relaxes.
+///
+/// # The one invariant that must never regress
+///
+/// The EverySec bound ("the oldest unflushed byte reaches disk within ~1s +
+/// one wake") must hold exactly as it did under the old fixed cadence.
+/// [`IdleWait`] enforces this the same way the ground rules require:
+/// escalation is refused (stays pinned at the fast floor) whenever
+/// [`Self::mark_pending`] has been called and not yet cleared by
+/// [`Self::clear_pending`] — i.e. whenever there is a write buffered under
+/// `FsyncPolicy::EverySec` that has not yet been fsynced, or a manually
+/// back-dated `last_fsync` (the F6 post-fold drain trick) representing an
+/// imminent deadline. `FsyncPolicy::Always` never buffers past its own
+/// batch (fsynced same-iteration) and `FsyncPolicy::No` has no deadline at
+/// all, so neither ever calls `mark_pending` — both escalate freely once
+/// idle, which is correct: there is nothing time-sensitive to protect.
+struct IdleWait {
+    step: usize,
+    pending: bool,
+}
+
+/// Escalation ladder: fast floor for responsiveness right after activity,
+/// capped at 1s (never longer than the EverySec deadline itself).
+const AOF_IDLE_WAIT_STEPS: &[std::time::Duration] = &[
+    std::time::Duration::from_millis(50),
+    std::time::Duration::from_millis(250),
+    std::time::Duration::from_secs(1),
+];
+
+impl IdleWait {
+    fn new() -> Self {
+        Self {
+            step: 0,
+            pending: false,
+        }
+    }
+
+    /// Wait duration to use for the next channel poll.
+    fn current(&self) -> std::time::Duration {
+        AOF_IDLE_WAIT_STEPS[self.step]
+    }
+
+    /// A message (data or control) was just received: reset to the fast
+    /// floor so the very next poll — which re-checks the EverySec deadline
+    /// — happens promptly again, exactly like the old fixed cadence did.
+    fn on_message(&mut self) {
+        self.step = 0;
+    }
+
+    /// The poll timed out with nothing queued. Escalates towards the max
+    /// step UNLESS a deadline is still pending (see struct docs) — in that
+    /// case the wait stays at its current (already-fast, since
+    /// `on_message` just reset it) step so the deadline is re-checked
+    /// promptly instead of drifting out to the escalated cadence.
+    fn on_timeout(&mut self) {
+        if !self.pending {
+            self.step = (self.step + 1).min(AOF_IDLE_WAIT_STEPS.len() - 1);
+        }
+    }
+
+    /// Mark that `last_fsync` now represents an unflushed/imminent deadline
+    /// (a batch was buffered under `FsyncPolicy::EverySec` without an
+    /// immediate fsync, or `last_fsync` was manually back-dated). Blocks
+    /// further escalation until [`Self::clear_pending`].
+    fn mark_pending(&mut self) {
+        self.pending = true;
+    }
+
+    /// The pending deadline was satisfied (a proactive or batch fsync just
+    /// succeeded) — escalation may resume from here.
+    fn clear_pending(&mut self) {
+        self.pending = false;
+    }
+}
+
+#[cfg(test)]
+mod idle_wait_tests {
+    use super::*;
+
+    #[test]
+    fn starts_at_fast_floor() {
+        let w = IdleWait::new();
+        assert_eq!(w.current(), AOF_IDLE_WAIT_STEPS[0]);
+    }
+
+    #[test]
+    fn timeouts_escalate_and_cap_at_max() {
+        let mut w = IdleWait::new();
+        w.on_timeout();
+        assert_eq!(w.current(), AOF_IDLE_WAIT_STEPS[1]);
+        w.on_timeout();
+        assert_eq!(w.current(), AOF_IDLE_WAIT_STEPS[2]);
+        // Capped: further timeouts stay at the max step.
+        w.on_timeout();
+        assert_eq!(w.current(), AOF_IDLE_WAIT_STEPS[2]);
+    }
+
+    #[test]
+    fn message_resets_to_floor_from_any_step() {
+        let mut w = IdleWait::new();
+        w.on_timeout();
+        w.on_timeout();
+        assert_eq!(w.current(), AOF_IDLE_WAIT_STEPS[2]);
+        w.on_message();
+        assert_eq!(w.current(), AOF_IDLE_WAIT_STEPS[0]);
+    }
+
+    #[test]
+    fn pending_deadline_blocks_escalation() {
+        let mut w = IdleWait::new();
+        w.mark_pending();
+        // Never escalates while a deadline is pending, no matter how many
+        // consecutive timeouts occur.
+        w.on_timeout();
+        w.on_timeout();
+        w.on_timeout();
+        assert_eq!(w.current(), AOF_IDLE_WAIT_STEPS[0]);
+    }
+
+    #[test]
+    fn clearing_pending_resumes_escalation() {
+        let mut w = IdleWait::new();
+        w.mark_pending();
+        w.on_timeout();
+        assert_eq!(w.current(), AOF_IDLE_WAIT_STEPS[0]);
+        w.clear_pending();
+        w.on_timeout();
+        assert_eq!(w.current(), AOF_IDLE_WAIT_STEPS[1]);
+    }
+}
+
 /// A sync [`GroupCommitSink`] over a `std::fs::File` for the monoio writer
 /// loops. `write_all` appends raw bytes (an empty buffer — a zero-length
 /// H1-BARRIER `AppendSync` — is a no-op); `sync` does the single per-batch
@@ -118,6 +262,12 @@ pub async fn aof_writer_task(
     // path is exercised identically under both runtimes (shards=1 TopLevel).
     #[cfg(feature = "runtime-tokio")]
     let fail_fsync_for_test = std::env::var("MOON_TEST_AOF_FSYNC_FAIL").as_deref() == Ok("1");
+    // Idle-adaptive channel-poll wake cadence (RSS/CPU wave 5, item B) — see
+    // `IdleWait` docs above. Declared outside the `loop` below (not inside
+    // the per-iteration `#[cfg(runtime-tokio)]` block) so its escalation
+    // state survives across iterations.
+    #[cfg(feature = "runtime-tokio")]
+    let mut idle_wait = IdleWait::new();
 
     // Monoio path: multi-part AOF (base RDB + incremental RESP) with sync I/O.
     //
@@ -348,16 +498,18 @@ pub async fn aof_writer_task(
     loop {
         #[cfg(feature = "runtime-tokio")]
         {
-            // Bounded recv (EverySec durability): wake at least every 200ms even
-            // when idle so the flush deadline check after this select! is honored
-            // within its 1s bound. A long-lived `interval.tick()` select arm is
+            // Bounded recv (EverySec durability): wake at least every
+            // `idle_wait.current()` (starts at 200ms, escalates to 1s while
+            // truly idle — see `IdleWait` docs) even when idle so the flush
+            // deadline check after this select! is honored within its 1s
+            // bound. A long-lived `interval.tick()` select arm is
             // fairness-starvable under sustained writes and unreliable when idle
             // (see the per-shard writer below, which hit exactly that) — the
             // bounded recv cannot starve. flume's recv future is drop-safe on
             // the Elapsed branch (no message consumed on timeout).
             let recv_result = tokio::select! {
                 r = tokio::time::timeout(
-                    std::time::Duration::from_millis(200),
+                    idle_wait.current(),
                     rx.recv_async(),
                 ) => r,
                 _ = cancel.cancelled() => {
@@ -375,7 +527,7 @@ pub async fn aof_writer_task(
             match recv_result {
                 // Timeout (Elapsed): no message — fall through to the EverySec
                 // deadline check after this block.
-                Err(_) => {}
+                Err(_) => idle_wait.on_timeout(),
                 // Channel disconnected — final sync + shut down.
                 Ok(Err(_)) => {
                     if !write_error {
@@ -386,6 +538,11 @@ pub async fn aof_writer_task(
                     break;
                 }
                 Ok(Ok(first)) => {
+                    // A message just arrived (data or control): reset the idle
+                    // wait to its fast floor so the deadline check after this
+                    // block — and every subsequent poll while there is still
+                    // buffered/pending data — happens at the tight cadence.
+                    idle_wait.on_message();
                     // Group commit: drain whatever else is queued into a bounded
                     // batch so one fsync covers all (TopLevel = plain RESP bytes).
                     let mut batch = collect_group_commit_batch(
@@ -450,6 +607,13 @@ pub async fn aof_writer_task(
                                         .any(|m| matches!(m, AofMessage::AppendSync { .. })),
                                     "everysec/no batch must contain no AppendSync"
                                 );
+                                if fsync == FsyncPolicy::EverySec {
+                                    // Bytes are buffered but not yet durable —
+                                    // pin the idle wait at its floor until the
+                                    // deadline check below (or a future
+                                    // iteration's) clears it.
+                                    idle_wait.mark_pending();
+                                }
                                 BatchAck::Synced
                             };
                             let _ = group_commit::ack_batch(&mut batch, verdict);
@@ -494,8 +658,12 @@ pub async fn aof_writer_task(
                             // Back-date so the backlog drained right after the
                             // rewrite reaches disk within ~100ms + wake floor,
                             // not a full second later (mirrors the per-shard
-                            // writer's post-rewrite back-dating).
+                            // writer's post-rewrite back-dating). This is itself
+                            // a pending deadline — pin the idle wait at its
+                            // floor so escalation cannot push the next check
+                            // past the intended window.
                             last_fsync = Instant::now() - std::time::Duration::from_millis(900);
+                            idle_wait.mark_pending();
                         }
                         Some(AofMessage::RewriteSharded(shard_dbs)) => {
                             // C4 TopLevel cooperative fold (tokio path):
@@ -538,8 +706,10 @@ pub async fn aof_writer_task(
                             // Back-date so the channel backlog that accumulated
                             // during the blocking fold reaches disk within ~100ms
                             // + wake floor — a SIGKILL shortly after rewrite
-                            // completion must not take the tail with it.
+                            // completion must not take the tail with it. Pin the
+                            // idle wait at its floor until this deadline fires.
                             last_fsync = Instant::now() - std::time::Duration::from_millis(900);
+                            idle_wait.mark_pending();
                         }
                         // [F6] TopLevel writer never owns per-shard files — routing
                         // bug. Self-abort so the countdown completes + flag clears.
@@ -564,11 +734,14 @@ pub async fn aof_writer_task(
                 }
             }
             // EverySec deadline: the oldest unflushed byte reaches disk at
-            // most ~1.2s after it was written (1s deadline + 200ms wake
-            // floor). tokio's BufWriter holds up to 8KB in userspace — a
-            // SIGKILL takes that tail with it, so the bound must hold even
-            // when the recv arm is saturated with messages. Skip if torn:
-            // syncing past a partial record cannot recover it.
+            // most ~1.2s after it was written (1s deadline + wake floor —
+            // the wake floor only, never the escalated idle cadence: see
+            // `IdleWait`, which `mark_pending`/`clear_pending` keep pinned
+            // at the floor for exactly this check). tokio's BufWriter holds
+            // up to 8KB in userspace — a SIGKILL takes that tail with it, so
+            // the bound must hold even when the recv arm is saturated with
+            // messages. Skip if torn: syncing past a partial record cannot
+            // recover it.
             if fsync == FsyncPolicy::EverySec
                 && !write_error
                 && last_fsync.elapsed() >= std::time::Duration::from_secs(1)
@@ -576,6 +749,7 @@ pub async fn aof_writer_task(
                 let _ = writer.flush().await;
                 let _ = writer.get_ref().sync_data().await;
                 last_fsync = Instant::now();
+                idle_wait.clear_pending();
             }
         }
     }
@@ -715,9 +889,13 @@ pub async fn per_shard_aof_writer_task(
 
         let mut writer = tokio::io::BufWriter::new(file);
         let mut last_fsync = Instant::now();
+        // Idle-adaptive channel-poll wake cadence (RSS/CPU wave 5, item B) —
+        // see `IdleWait` docs near the top of this file.
+        let mut idle_wait = IdleWait::new();
         // (No `interval` here: the EverySec flush deadline is enforced by the
         // timeout-bounded recv in the loop below, which wakes at least every
-        // 200ms regardless of message traffic. A long-lived `interval.tick()`
+        // `idle_wait.current()` (starts at 200ms, escalates while idle)
+        // regardless of message traffic. A long-lived `interval.tick()`
         // select arm is fairness-starvable under sustained writes and proved
         // unreliable when idle on this dedicated current-thread writer runtime.)
 
@@ -747,19 +925,21 @@ pub async fn per_shard_aof_writer_task(
 
         loop {
             tokio::select! {
-                // Bounded recv (EverySec durability): wake at least every 200ms
-                // even when idle so the flush deadline after this select! is
-                // honored within its 1s bound. flume's recv future is drop-safe
-                // on the Elapsed branch (no message consumed on timeout); the
-                // Ok(Ok(msg)) path below captures the message with no loss.
+                // Bounded recv (EverySec durability): wake at least every
+                // `idle_wait.current()` (starts at 200ms, escalates while
+                // idle — see `IdleWait`) even when idle so the flush deadline
+                // after this select! is honored within its 1s bound. flume's
+                // recv future is drop-safe on the Elapsed branch (no message
+                // consumed on timeout); the Ok(Ok(msg)) path below captures
+                // the message with no loss.
                 r = tokio::time::timeout(
-                    std::time::Duration::from_millis(200),
+                    idle_wait.current(),
                     rx.recv_async(),
                 ) => {
                     // On Elapsed (timeout) `r` is Err: skip and fall through to
                     // the EverySec deadline check after this select!.
                     match r {
-                        Err(_) => {}
+                        Err(_) => idle_wait.on_timeout(),
                         // Channel disconnected — final sync + shut down.
                         Ok(Err(_)) => {
                             let _ = writer.flush().await;
@@ -768,6 +948,9 @@ pub async fn per_shard_aof_writer_task(
                             break;
                         }
                         Ok(Ok(first)) => {
+                            // A message just arrived: reset to the fast floor
+                            // (see TopLevel writer above for the full rationale).
+                            idle_wait.on_message();
                             // Group commit: drain a bounded batch so ONE fsync
                             // makes all framed records (`[u64 lsn][u32 len][RESP]`)
                             // durable.
@@ -882,6 +1065,9 @@ pub async fn per_shard_aof_writer_task(
                                     } else {
                                         // EverySec/No: the deadline check fsyncs; no
                                         // AppendSync waiters under everysec/no.
+                                        if fsync == FsyncPolicy::EverySec {
+                                            idle_wait.mark_pending();
+                                        }
                                         BatchAck::Synced
                                     };
                                     let _ = group_commit::ack_batch(&mut batch, verdict);
@@ -980,6 +1166,7 @@ pub async fn per_shard_aof_writer_task(
                 let _ = writer.flush().await;
                 let _ = writer.get_ref().sync_data().await;
                 last_fsync = Instant::now();
+                idle_wait.clear_pending();
             }
         }
     }
@@ -1080,6 +1267,9 @@ pub async fn per_shard_aof_writer_task(
         let mut write_error = false;
         let mut _dbg_processed: u64 = 0;
         let _dbg_start = Instant::now();
+        // Idle-adaptive channel-poll wake cadence (RSS/CPU wave 5, item B) —
+        // see `IdleWait` docs near the top of this file.
+        let mut idle_wait = IdleWait::new();
         // Test-only fault injection: if MOON_TEST_AOF_FSYNC_FAIL=1 is set in
         // the environment at writer task startup, every AppendSync ack resolves
         // as FsyncFailed instead of Synced. Read once before the loop so there
@@ -1093,12 +1283,21 @@ pub async fn per_shard_aof_writer_task(
             // the 1s fsync window never fires → data loss on kill.
             // recv_timeout so the EverySec proactive fsync fires even when no new
             // Appends arrive after a fold (or when the client stops writing).
-            let first = match rx.recv_timeout(std::time::Duration::from_millis(50)) {
-                Ok(m) => Some(m),
-                // Timeout: no message in the 50ms window. Fall through (None) to
+            // The wait starts at `idle_wait`'s fast floor (50ms, matching the
+            // old fixed cadence) and escalates while genuinely idle — see
+            // `IdleWait` docs.
+            let first = match rx.recv_timeout(idle_wait.current()) {
+                Ok(m) => {
+                    idle_wait.on_message();
+                    Some(m)
+                }
+                // Timeout: no message in the window. Fall through (None) to
                 // the EverySec proactive fsync below so queued-but-unfsynced
                 // appends are durable within the everysec contract even when idle.
-                Err(flume::RecvTimeoutError::Timeout) => None,
+                Err(flume::RecvTimeoutError::Timeout) => {
+                    idle_wait.on_timeout();
+                    None
+                }
                 Err(flume::RecvTimeoutError::Disconnected) => {
                     if !write_error {
                         if let Err(e) = file.flush().and_then(|_| file.sync_data()) {
@@ -1198,6 +1397,9 @@ pub async fn per_shard_aof_writer_task(
                         } else {
                             // EverySec/No: the proactive fsync below makes the batch
                             // durable; no AppendSync waiters under everysec/no.
+                            if fsync == FsyncPolicy::EverySec {
+                                idle_wait.mark_pending();
+                            }
                             BatchAck::Synced
                         };
                         let _ = group_commit::ack_batch(&mut batch, verdict);
@@ -1275,9 +1477,15 @@ pub async fn per_shard_aof_writer_task(
                                 } else {
                                     // Back-date last_fsync by 900ms: the proactive check
                                     // (threshold=1s) fires within the next 100ms, covering
-                                    // any appends that arrived after the drain above.
+                                    // any appends that arrived after the drain above. This
+                                    // IS a pending deadline — pin the idle wait at its
+                                    // floor (`on_message` already reset it for this
+                                    // iteration; `mark_pending` keeps it there) so
+                                    // escalation cannot push the next check out past the
+                                    // ≤150ms window the comment above promises.
                                     last_fsync =
                                         Instant::now() - std::time::Duration::from_millis(900);
+                                    idle_wait.mark_pending();
                                 }
                             }
                         }
@@ -1326,6 +1534,7 @@ pub async fn per_shard_aof_writer_task(
                 } else {
                     crate::admin::metrics_setup::record_aof_fsync(t.elapsed().as_micros() as u64);
                     last_fsync = Instant::now();
+                    idle_wait.clear_pending();
                 }
             }
         }

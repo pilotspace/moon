@@ -27,6 +27,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   once a term has zero live documents. The buffers now `shrink_to_fit()`
   once the last document leaves a posting, releasing peak capacity for
   terms that go idle without changing the "entry survives" contract.
+- **Item B — AOF writer idle wake made adaptive** (`src/persistence/aof/writer_task.rs`,
+  new `IdleWait` state machine): the 3 steady-state writer loops that need a
+  bounded channel poll to service the EverySec proactive-fsync deadline
+  (TopLevel tokio, PerShard tokio, PerShard monoio — TopLevel monoio blocks
+  on an untimed `rx.recv()` and needed no change) used to poll at a FIXED
+  cadence forever (50ms monoio / 200ms tokio), waking an idle server's AOF
+  writer thread 5-20 times a second doing nothing. The wait now escalates
+  50ms → 250ms → 1s once a poll times out with nothing queued, and resets to
+  the floor the instant any message arrives — a real write always wakes the
+  loop immediately regardless of the current timeout, since the poll races
+  a message against the deadline. Escalation is refused (pinned at the
+  floor) whenever a write is buffered under `FsyncPolicy::EverySec` without
+  an immediate fsync, or `last_fsync` was manually back-dated (the F6
+  post-fold drain trick) — the ~1.2s EverySec bound is provably unchanged.
+  `FsyncPolicy::Always`/`No` have no such deadline and escalate freely once
+  idle.
 
 ### CI — fix Windows main-push test failures (PR #TBD)
 
