@@ -46,6 +46,7 @@ use tracing::{info, warn};
 
 use crate::protocol::Frame;
 use crate::text::store::TextStore;
+use crate::vector::keymap::BucketedKeyMap;
 use crate::vector::persistence::manifest::{self, IndexManifest};
 use crate::vector::persistence::segment_io;
 use crate::vector::segment::SegmentList;
@@ -414,9 +415,9 @@ fn load_segments_and_keymap(
 
     let entries =
         manifest::read_keymap_tolerant(idx_dir, manifest.keymap_epoch).unwrap_or_default();
-    let mut key_hash_to_key = std::collections::HashMap::with_capacity(entries.len());
-    let mut key_hash_to_global_id = std::collections::HashMap::with_capacity(entries.len());
-    let mut key_hash_to_vec_checksum = std::collections::HashMap::with_capacity(entries.len());
+    let mut key_hash_to_key = BucketedKeyMap::new();
+    let mut key_hash_to_global_id = BucketedKeyMap::new();
+    let mut key_hash_to_vec_checksum = BucketedKeyMap::new();
     for e in entries {
         if dropped_key_hashes.contains(&e.key_hash) {
             continue;
@@ -441,9 +442,9 @@ fn load_segments_and_keymap(
         warm: Vec::new(),
         cold: Vec::new(),
     });
-    idx.key_hash_to_key = Arc::new(key_hash_to_key);
-    idx.key_hash_to_global_id = Arc::new(key_hash_to_global_id);
-    idx.key_hash_to_vec_checksum = Arc::new(key_hash_to_vec_checksum);
+    idx.key_hash_to_key = key_hash_to_key;
+    idx.key_hash_to_global_id = key_hash_to_global_id;
+    idx.key_hash_to_vec_checksum = key_hash_to_vec_checksum;
 
     Some(IndexRecoveryCounters {
         loaded_segments,

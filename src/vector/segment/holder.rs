@@ -12,6 +12,7 @@ use smallvec::SmallVec;
 use crate::vector::diskann::segment::DiskAnnSegment;
 use crate::vector::filter::selectivity::{FilterStrategy, select_strategy};
 use crate::vector::hnsw::search::SearchScratch;
+use crate::vector::keymap::BucketedKeyMap;
 use crate::vector::persistence::warm_search::WarmSearchSegment;
 use crate::vector::segment::ivf::IvfSegment;
 use crate::vector::turbo_quant::encoder::padded_dimension;
@@ -156,9 +157,10 @@ pub struct SearchSnapshot {
     pub scratch: SearchScratch,
     /// Key-hash → key map captured at START (§3 C1) so a mid-search delete cannot
     /// drop an entry this search still needs to resolve. Used by the response
-    /// builder, not the segment scan. `Arc` snapshot: capture is O(1); writers
-    /// copy-on-write via `Arc::make_mut` (QP-1).
-    pub key_hash_to_key: std::sync::Arc<std::collections::HashMap<u64, bytes::Bytes>>,
+    /// builder, not the segment scan. Bucketed-CoW snapshot: capture is O(256)
+    /// (refcount bumps only); writers copy-on-write bucket-scoped via
+    /// `Arc::make_mut` on the single touched bucket (QP-1 + RSS/CPU wave 4).
+    pub key_hash_to_key: BucketedKeyMap<bytes::Bytes>,
     /// AE-1: true when `ef_search` came from the resolution heuristic (no
     /// user `EF_RUNTIME`) — saturation-certified segments may then run at
     /// their min-ef estimate.

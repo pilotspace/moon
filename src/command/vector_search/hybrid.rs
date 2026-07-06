@@ -40,6 +40,7 @@ use bytes::Bytes;
 
 use crate::protocol::{Frame, FrameVec};
 use crate::text::store::{TextIndex, TextSearchResult, TextStore};
+use crate::vector::keymap::BucketedKeyMap;
 use crate::vector::store::VectorStore;
 use crate::vector::types::{SearchResult, VectorId};
 
@@ -513,13 +514,7 @@ pub(super) fn run_dense_knn(
     k: usize,
     as_of_lsn: u64,
     committed: &roaring::RoaringTreemap,
-) -> Result<
-    (
-        Vec<SearchResult>,
-        std::sync::Arc<std::collections::HashMap<u64, Bytes>>,
-    ),
-    Frame,
-> {
+) -> Result<(Vec<SearchResult>, BucketedKeyMap<Bytes>), Frame> {
     let field_opt = if field_name.is_empty() {
         None
     } else {
@@ -643,7 +638,7 @@ pub(super) fn run_dense_knn(
 #[allow(clippy::too_many_arguments)]
 pub fn build_hybrid_local_response(
     fused: &[SearchResult],
-    vector_key_hash_to_key: &std::collections::HashMap<u64, Bytes>,
+    vector_key_hash_to_key: &BucketedKeyMap<Bytes>,
     text_index: &TextIndex,
     bm25_count: usize,
     dense_count: usize,
@@ -687,7 +682,7 @@ pub fn build_hybrid_local_response(
 
 pub(super) fn resolve_hybrid_doc_key(
     r: &SearchResult,
-    vector_map: &std::collections::HashMap<u64, Bytes>,
+    vector_map: &BucketedKeyMap<Bytes>,
     text_index: &TextIndex,
 ) -> Bytes {
     if r.key_hash != 0 {
@@ -1233,7 +1228,7 @@ mod tests {
     fn test_build_hybrid_response_shape() {
         // Pure-function test: fused results → response shape matches FT.SEARCH convention
         // [total, key, [__rrf_score, "N"], ..., bm25_hits, N, dense_hits, N, sparse_hits, N]
-        let mut key_map = std::collections::HashMap::new();
+        let mut key_map = BucketedKeyMap::new();
         key_map.insert(100u64, Bytes::from_static(b"doc:alpha"));
         key_map.insert(200u64, Bytes::from_static(b"doc:beta"));
 
@@ -1305,7 +1300,7 @@ mod tests {
     #[cfg(feature = "text-index")]
     fn test_build_hybrid_response_vec_fallback() {
         // key_hash present but not in vector map AND not in text index → vec:<id> fallback.
-        let key_map = std::collections::HashMap::new();
+        let key_map: BucketedKeyMap<Bytes> = BucketedKeyMap::new();
         let fused = vec![SearchResult {
             distance: -0.01,
             id: VectorId(77),
@@ -1331,7 +1326,7 @@ mod tests {
     #[cfg(feature = "text-index")]
     fn test_build_hybrid_response_pagination() {
         // offset skips results; count truncates.
-        let mut key_map = std::collections::HashMap::new();
+        let mut key_map = BucketedKeyMap::new();
         for i in 0..5 {
             key_map.insert(i as u64, Bytes::from(format!("k{i}")));
         }

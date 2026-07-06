@@ -20,6 +20,7 @@ use bytes::Bytes;
 
 use crate::protocol::{Frame, FrameVec};
 use crate::text::store::{TextIndex, TextStore};
+use crate::vector::keymap::BucketedKeyMap;
 use crate::vector::store::VectorStore;
 use crate::vector::types::{SearchResult, VectorId};
 
@@ -209,7 +210,7 @@ pub fn encode_shard_hybrid_partial(
     dense: &[SearchResult],
     sparse: &[SearchResult],
     text_index: &TextIndex,
-    vector_key_hash_to_key: &std::collections::HashMap<u64, Bytes>,
+    vector_key_hash_to_key: &BucketedKeyMap<Bytes>,
 ) -> Frame {
     let total_items = 3 + 4 * (bm25.len() + dense.len() + sparse.len());
     let mut out: Vec<Frame> = Vec::with_capacity(total_items);
@@ -317,7 +318,7 @@ mod tests {
         let dense = vec![tsr(0.1, 3, 0xCC)];
         let sparse = vec![tsr(0.2, 4, 0xDD), tsr(0.3, 5, 0xEE)];
 
-        let mut vec_map: std::collections::HashMap<u64, Bytes> = std::collections::HashMap::new();
+        let mut vec_map: BucketedKeyMap<Bytes> = BucketedKeyMap::new();
         vec_map.insert(0xCC, Bytes::from_static(b"doc:three"));
         vec_map.insert(0xDD, Bytes::from_static(b"doc:four"));
         vec_map.insert(0xEE, Bytes::from_static(b"doc:five"));
@@ -370,7 +371,7 @@ mod tests {
             ))],
             crate::text::types::BM25Config::default(),
         );
-        let vec_map: std::collections::HashMap<u64, Bytes> = std::collections::HashMap::new();
+        let vec_map: BucketedKeyMap<Bytes> = BucketedKeyMap::new();
         let frame = encode_shard_hybrid_partial(&[], &[], &[], &text_index, &vec_map);
         let decoded = decode_shard_hybrid_partial(&frame).expect("decode empty");
         assert!(decoded.bm25.is_empty());

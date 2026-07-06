@@ -12,6 +12,7 @@ use bytes::Bytes;
 use crate::storage::tiered::SegmentHandle;
 use crate::vector::filter::PayloadIndex;
 use crate::vector::hnsw::search::SearchScratch;
+use crate::vector::keymap::BucketedKeyMap;
 use crate::vector::mvcc::manager::TransactionManager;
 use crate::vector::segment::compaction;
 use crate::vector::segment::{SegmentHolder, SegmentList};
@@ -191,22 +192,24 @@ pub struct VectorIndex {
     /// `vec:<internal_id>` form. Survives compaction and segment merging because
     /// it's keyed by the stable `key_hash`, not the volatile internal ID.
     ///
-    /// `Arc`-wrapped so search snapshots capture it in O(1) (QP-1: the previous
-    /// owned `HashMap` was deep-cloned per query — one entry per indexed vector).
-    /// Writers mutate via [`Arc::make_mut`]: copy-on-write triggers only when a
-    /// snapshot is concurrently alive, at most once per snapshot lifetime.
-    pub key_hash_to_key: Arc<std::collections::HashMap<u64, Bytes>>,
+    /// Bucketed CoW (RSS/CPU wave 4, defect 1): 256 independent
+    /// `Arc<HashMap>` shards keyed by the top bits of `key_hash`, so search
+    /// snapshots still capture the whole map in O(1) (QP-1) but a concurrent
+    /// writer's `Arc::make_mut` only clones the ONE bucket its key hashes
+    /// into — not the entire multi-MB map — even while a search snapshot is
+    /// alive. See `crate::vector::keymap` module docs.
+    pub key_hash_to_key: BucketedKeyMap<Bytes>,
     /// Maps `key_hash` → `global_id` for metadata-only updates.
     ///
     /// When `HSET doc:1 category "science"` is called without a vector blob,
     /// the auto-indexer looks up the existing `global_id` here to update the
     /// PayloadIndex for that vector without re-inserting it.
     ///
-    /// `Arc`-wrapped for the same reason as `key_hash_to_key` (QP-1 O(1)
-    /// snapshot capture) — the durability write path (B2) clones this Arc
-    /// into background keymap-snapshot jobs without an O(n) copy on the
-    /// shard thread.
-    pub key_hash_to_global_id: Arc<std::collections::HashMap<u64, u32>>,
+    /// Bucketed CoW for the same reason as `key_hash_to_key` (QP-1 O(1)
+    /// snapshot capture, bucket-scoped write clone) — the durability write
+    /// path (B2) clones this into background keymap-snapshot jobs without an
+    /// O(n) copy on the shard thread.
+    pub key_hash_to_global_id: BucketedKeyMap<u32>,
     /// Maps `key_hash` → `xxh64(vector-field bytes, seed 0)` (B2, durability).
     ///
     /// Computed where the raw HSET vector blob is in hand
@@ -216,7 +219,7 @@ pub struct VectorIndex {
     /// rescan can tell "unchanged" keys (checksum matches → metadata-only
     /// rebuild) from "changed" keys (re-encode) without hashing every value
     /// twice across a restart.
-    pub key_hash_to_vec_checksum: Arc<std::collections::HashMap<u64, u64>>,
+    pub key_hash_to_vec_checksum: BucketedKeyMap<u64>,
     /// Shard-relative directory this index persists segments/manifest/keymap
     /// under, i.e. `<vector_persist_dir>/idx-<hex(xxh64(name))>/` (B2).
     /// `None` when the store has no `persist_dir` configured (disk-offload
@@ -1572,9 +1575,9 @@ impl VectorStore {
                 scratch,
                 collection,
                 payload_index: PayloadIndex::new(),
-                key_hash_to_key: Arc::new(std::collections::HashMap::new()),
-                key_hash_to_global_id: Arc::new(std::collections::HashMap::new()),
-                key_hash_to_vec_checksum: Arc::new(std::collections::HashMap::new()),
+                key_hash_to_key: BucketedKeyMap::new(),
+                key_hash_to_global_id: BucketedKeyMap::new(),
+                key_hash_to_vec_checksum: BucketedKeyMap::new(),
                 persist_dir: self.persist_dir.clone(),
                 next_segment_id: floor_next_segment_id,
                 next_snapshot_seq: floor_next_snapshot_seq,
@@ -1700,9 +1703,9 @@ impl VectorStore {
                 scratch,
                 collection,
                 payload_index: PayloadIndex::new(),
-                key_hash_to_key: Arc::new(std::collections::HashMap::new()),
-                key_hash_to_global_id: Arc::new(std::collections::HashMap::new()),
-                key_hash_to_vec_checksum: Arc::new(std::collections::HashMap::new()),
+                key_hash_to_key: BucketedKeyMap::new(),
+                key_hash_to_global_id: BucketedKeyMap::new(),
+                key_hash_to_vec_checksum: BucketedKeyMap::new(),
                 persist_dir: self.persist_dir.clone(),
                 next_segment_id: manifest.next_segment_id,
                 next_snapshot_seq: manifest.keymap_epoch,
@@ -1916,12 +1919,12 @@ impl VectorStore {
         // they track LIVE keys, not historical inserts — without this
         // they grow monotonically under key churn (~1GB / 24M deletes).
         // A re-insert of the same key repopulates all three maps.
-        Arc::make_mut(&mut idx.key_hash_to_key).remove(&key_hash);
-        Arc::make_mut(&mut idx.key_hash_to_global_id).remove(&key_hash);
+        idx.key_hash_to_key.remove(&key_hash);
+        idx.key_hash_to_global_id.remove(&key_hash);
         // B2 (durability): keep the checksum map in lockstep so it never
         // drifts from key_hash_to_key (a stale entry would be a silent
         // false-"unchanged" in the B3 dedup rescan).
-        Arc::make_mut(&mut idx.key_hash_to_vec_checksum).remove(&key_hash);
+        idx.key_hash_to_vec_checksum.remove(&key_hash);
         true
     }
 
@@ -2292,7 +2295,7 @@ impl VectorStore {
             .load()
             .mutable
             .append(key_hash, vector, insert_lsn);
-        Arc::make_mut(&mut idx.key_hash_to_key).insert(key_hash, key);
+        idx.key_hash_to_key.insert(key_hash, key);
         Ok(())
     }
 

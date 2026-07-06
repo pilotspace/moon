@@ -14,6 +14,7 @@ use smallvec::SmallVec;
 
 use crate::protocol::Frame;
 use crate::vector::filter::FilterExpr;
+use crate::vector::keymap::BucketedKeyMap;
 use crate::vector::types::SearchResult;
 
 use super::parse::{extract_param_blob, parse_filter_clause, parse_knn_query, parse_limit_clause};
@@ -30,7 +31,7 @@ use super::parse::{extract_param_blob, parse_filter_clause, parse_knn_query, par
 /// (e.g., legacy data restored from a snapshot without the key map).
 pub(crate) fn build_search_response(
     results: &SmallVec<[SearchResult; 32]>,
-    key_hash_to_key: &std::collections::HashMap<u64, Bytes>,
+    key_hash_to_key: &BucketedKeyMap<Bytes>,
     offset: usize,
     count: usize,
 ) -> Frame {
@@ -221,7 +222,7 @@ pub fn parse_ft_search_args(
 /// that stop at `total` document pairs remain backward-compatible.
 pub(crate) fn build_hybrid_response(
     results: &[SearchResult],
-    key_hash_to_key: &std::collections::HashMap<u64, Bytes>,
+    key_hash_to_key: &BucketedKeyMap<Bytes>,
     dense_count: usize,
     sparse_count: usize,
     offset: usize,
