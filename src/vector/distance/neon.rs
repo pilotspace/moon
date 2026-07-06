@@ -357,6 +357,133 @@ pub unsafe fn sq8_stats(query: &[f32], codes: &[u8]) -> (f32, f32, f32) {
     (dot_sum, sum_c_sum, sumsq_c_sum)
 }
 
+// ── f16 sidecar kernels (exact-rerank HQ-1) ─────────────────────────────
+
+/// Decode 4 IEEE binary16 lanes to f32 using baseline-NEON integer ops (no
+/// ARMv8.2 FP16 intrinsics required): shift sign/magnitude into f32 bit
+/// positions, then rescale by 2^112 to re-bias the exponent (f16 bias 15 →
+/// f32 bias 127). The rescale multiply is exact — it is a power of two and
+/// every finite f16 is representable in f32 — and f16 subnormals normalize
+/// through the same multiply. Lanes with exponent 0x1F (Inf/NaN) are rebuilt
+/// explicitly via a bit-select, matching scalar `f16_to_f32` on all inputs.
+///
+/// # Safety
+/// Caller must ensure the CPU supports NEON (baseline on all AArch64).
+#[cfg(target_arch = "aarch64")]
+#[inline]
+#[target_feature(enable = "neon")]
+unsafe fn f16x4_decode(h: uint16x4_t) -> float32x4_t {
+    let bits = vmovl_u16(h);
+    let sign = vshlq_n_u32(vandq_u32(bits, vdupq_n_u32(0x8000)), 16);
+    let mag = vshlq_n_u32(vandq_u32(bits, vdupq_n_u32(0x7FFF)), 13);
+    // After the shift the f32 reads 2^(e−127)·1.m for f16 exponent e; the
+    // true f16 value is 2^(e−15)·1.m — multiply by 2^112 (bits 0x7780_0000).
+    let magf = vmulq_f32(
+        vreinterpretq_f32_u32(mag),
+        vdupq_n_f32(f32::from_bits(0x7780_0000)),
+    );
+    let is_special = vceqq_u32(vandq_u32(bits, vdupq_n_u32(0x7C00)), vdupq_n_u32(0x7C00));
+    let special = vorrq_u32(
+        vdupq_n_u32(0x7F80_0000),
+        vshlq_n_u32(vandq_u32(bits, vdupq_n_u32(0x03FF)), 13),
+    );
+    let val = vbslq_u32(is_special, special, vreinterpretq_u32_f32(magf));
+    vreinterpretq_f32_u32(vorrq_u32(val, sign))
+}
+
+/// Squared L2 between an f32 query and an f16-encoded sidecar vector
+/// (NEON, 8 halves per iteration; scalar tail).
+///
+/// # Safety
+/// Caller must ensure the CPU supports NEON (baseline on all AArch64).
+#[cfg(target_arch = "aarch64")]
+#[inline]
+#[target_feature(enable = "neon")]
+pub unsafe fn f16_l2(query: &[f32], vec_f16: &[u16]) -> f32 {
+    debug_assert_eq!(query.len(), vec_f16.len(), "f16_l2: dimension mismatch");
+    let n = query.len();
+    let mut sum0 = vdupq_n_f32(0.0);
+    let mut sum1 = vdupq_n_f32(0.0);
+    let pq = query.as_ptr();
+    let px = vec_f16.as_ptr();
+    let chunks = n / 8;
+    let mut i = 0usize;
+    for _ in 0..chunks {
+        // SAFETY: i + 8 <= n guaranteed by chunks = n / 8. Pointers are
+        // valid slices (f32 query / u16 halves) at this offset.
+        let h = vld1q_u16(px.add(i));
+        let x0 = f16x4_decode(vget_low_u16(h));
+        let x1 = f16x4_decode(vget_high_u16(h));
+        let q0 = vld1q_f32(pq.add(i));
+        let q1 = vld1q_f32(pq.add(i + 4));
+        let d0 = vsubq_f32(q0, x0);
+        let d1 = vsubq_f32(q1, x1);
+        sum0 = vfmaq_f32(sum0, d0, d0);
+        sum1 = vfmaq_f32(sum1, d1, d1);
+        i += 8;
+    }
+    // SAFETY: vaddvq_f32 requires NEON, which we have via target_feature.
+    let mut result = vaddvq_f32(vaddq_f32(sum0, sum1));
+    // Scalar tail
+    while i < n {
+        let d = *query.get_unchecked(i) - crate::vector::f16::f16_to_f32(*vec_f16.get_unchecked(i));
+        result += d * d;
+        i += 1;
+    }
+    result
+}
+
+/// Fused `(Σ q_i·x_i, Σ x_i²)` between an f32 query and an f16-encoded
+/// sidecar vector (NEON, 8 halves per iteration; scalar tail). Feeds the
+/// unit-sphere (Cosine/InnerProduct) exact-rerank distance.
+///
+/// # Safety
+/// Caller must ensure the CPU supports NEON (baseline on all AArch64).
+#[cfg(target_arch = "aarch64")]
+#[inline]
+#[target_feature(enable = "neon")]
+pub unsafe fn f16_dot_normsq(query: &[f32], vec_f16: &[u16]) -> (f32, f32) {
+    debug_assert_eq!(
+        query.len(),
+        vec_f16.len(),
+        "f16_dot_normsq: dimension mismatch"
+    );
+    let n = query.len();
+    let mut dot0 = vdupq_n_f32(0.0);
+    let mut dot1 = vdupq_n_f32(0.0);
+    let mut xsq0 = vdupq_n_f32(0.0);
+    let mut xsq1 = vdupq_n_f32(0.0);
+    let pq = query.as_ptr();
+    let px = vec_f16.as_ptr();
+    let chunks = n / 8;
+    let mut i = 0usize;
+    for _ in 0..chunks {
+        // SAFETY: i + 8 <= n guaranteed by chunks = n / 8. Pointers are
+        // valid slices (f32 query / u16 halves) at this offset.
+        let h = vld1q_u16(px.add(i));
+        let x0 = f16x4_decode(vget_low_u16(h));
+        let x1 = f16x4_decode(vget_high_u16(h));
+        let q0 = vld1q_f32(pq.add(i));
+        let q1 = vld1q_f32(pq.add(i + 4));
+        dot0 = vfmaq_f32(dot0, q0, x0);
+        dot1 = vfmaq_f32(dot1, q1, x1);
+        xsq0 = vfmaq_f32(xsq0, x0, x0);
+        xsq1 = vfmaq_f32(xsq1, x1, x1);
+        i += 8;
+    }
+    // SAFETY: vaddvq_f32 requires NEON, which we have via target_feature.
+    let mut dot = vaddvq_f32(vaddq_f32(dot0, dot1));
+    let mut xsq = vaddvq_f32(vaddq_f32(xsq0, xsq1));
+    // Scalar tail
+    while i < n {
+        let x = crate::vector::f16::f16_to_f32(*vec_f16.get_unchecked(i));
+        dot += *query.get_unchecked(i) * x;
+        xsq += x * x;
+        i += 1;
+    }
+    (dot, xsq)
+}
+
 #[cfg(test)]
 #[cfg(target_arch = "aarch64")]
 mod tests {
@@ -545,5 +672,64 @@ mod tests {
         // SAFETY: NEON is baseline on AArch64.
         let got = unsafe { sq8_stats(q, c) };
         assert_eq!(got, (0.0, 0.0, 0.0));
+    }
+
+    #[test]
+    fn test_f16_kernels_match_scalar_all_value_classes() {
+        use crate::vector::f16::{dot_normsq_f16, f32_to_f16, l2_sq_f16};
+        // Normals, f16 subnormals (≈3e-6..6e-5), zero, and odd tails — the
+        // integer-rescale decode must agree with scalar f16_to_f32 everywhere.
+        for len in [0, 1, 3, 7, 8, 9, 15, 16, 17, 100, 384] {
+            let q = gen_f32(len, 21);
+            let x: Vec<u16> = gen_f32(len, 77)
+                .iter()
+                .enumerate()
+                .map(|(j, &v)| {
+                    if j % 5 == 4 {
+                        f32_to_f16(3e-6 + (j as f32) * 1.1e-7) // subnormal f16
+                    } else if j % 7 == 6 {
+                        f32_to_f16(0.0)
+                    } else {
+                        f32_to_f16(v)
+                    }
+                })
+                .collect();
+            let exp_l2 = l2_sq_f16(&q, &x);
+            // SAFETY: NEON is baseline on AArch64.
+            let got_l2 = unsafe { f16_l2(&q, &x) };
+            let rel = (got_l2 - exp_l2).abs() / exp_l2.abs().max(1e-10);
+            assert!(
+                rel < 1e-4 || len == 0,
+                "f16_l2 len={len}: scalar={exp_l2}, neon={got_l2}"
+            );
+
+            let (ed, en) = dot_normsq_f16(&q, &x);
+            // SAFETY: NEON is baseline on AArch64.
+            let (gd, gn) = unsafe { f16_dot_normsq(&q, &x) };
+            assert!(
+                (gd - ed).abs() / ed.abs().max(1e-6) < 1e-3,
+                "f16_dot len={len}: scalar={ed}, neon={gd}"
+            );
+            assert!(
+                (gn - en).abs() / en.abs().max(1e-6) < 1e-4,
+                "f16_normsq len={len}: scalar={en}, neon={gn}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_f16_kernels_inf_nan_propagate() {
+        use crate::vector::f16::f32_to_f16;
+        let q = gen_f32(24, 5);
+        let mut x: Vec<u16> = gen_f32(24, 9).iter().map(|&v| f32_to_f16(v)).collect();
+        x[10] = f32_to_f16(f32::INFINITY);
+        // SAFETY: NEON is baseline on AArch64.
+        assert_eq!(unsafe { f16_l2(&q, &x) }, f32::INFINITY);
+        x[10] = f32_to_f16(f32::NAN);
+        // SAFETY: NEON is baseline on AArch64.
+        assert!(unsafe { f16_l2(&q, &x) }.is_nan());
+        // SAFETY: NEON is baseline on AArch64.
+        let (_, xsq) = unsafe { f16_dot_normsq(&q, &x) };
+        assert!(xsq.is_nan());
     }
 }

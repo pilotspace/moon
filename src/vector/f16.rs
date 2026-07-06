@@ -104,6 +104,10 @@ pub fn encode_f16_slice(src: &[f32], out: &mut Vec<u16>) {
 }
 
 /// Squared L2 between an f32 query and an f16-encoded vector.
+///
+/// Scalar reference; the rerank hot path goes through
+/// `vector::distance::table().f16_l2`, which installs a SIMD variant
+/// (NEON / F16C) when available and falls back to this.
 #[inline]
 pub fn l2_sq_f16(query: &[f32], vec_f16: &[u16]) -> f32 {
     debug_assert_eq!(query.len(), vec_f16.len());
@@ -113,6 +117,25 @@ pub fn l2_sq_f16(query: &[f32], vec_f16: &[u16]) -> f32 {
         sum += d * d;
     }
     sum
+}
+
+/// Fused `(Σ q_i·x_i, Σ x_i²)` between an f32 query and an f16-encoded
+/// vector — the unit-sphere (Cosine/InnerProduct) exact-rerank pass needs
+/// both in one decode sweep.
+///
+/// Scalar reference; SIMD variants install via
+/// `vector::distance::table().f16_dot_normsq`.
+#[inline]
+pub fn dot_normsq_f16(query: &[f32], vec_f16: &[u16]) -> (f32, f32) {
+    debug_assert_eq!(query.len(), vec_f16.len());
+    let mut dot = 0.0f32;
+    let mut xsq = 0.0f32;
+    for (q, &h) in query.iter().zip(vec_f16.iter()) {
+        let x = f16_to_f32(h);
+        dot += q * x;
+        xsq += x * x;
+    }
+    (dot, xsq)
 }
 
 #[cfg(test)]

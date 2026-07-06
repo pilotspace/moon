@@ -196,6 +196,10 @@ impl ImmutableSegment {
             &q_unit
         };
 
+        // SIMD-dispatched sidecar kernels (NEON / F16C, scalar fallback) —
+        // this loop was 17% of a matched-recall query when the decode was
+        // scalar software f16_to_f32.
+        let dist_table = crate::vector::distance::table();
         for result in candidates[..rerank_n].iter_mut() {
             let bfs_pos = self.graph.to_bfs(result.id.0) as usize;
             let start = bfs_pos * dim;
@@ -203,16 +207,10 @@ impl ImmutableSegment {
                 continue; // Out-of-range id: keep the ADC estimate.
             };
             if is_l2 {
-                result.distance = crate::vector::f16::l2_sq_f16(q_ref, vec_f16);
+                result.distance = (dist_table.f16_l2)(q_ref, vec_f16);
             } else {
                 // One pass: ⟨q̂,x⟩ and ‖x‖² from the f16-decoded vector.
-                let mut dot = 0.0f32;
-                let mut xsq = 0.0f32;
-                for (q, &h) in q_ref.iter().zip(vec_f16.iter()) {
-                    let x = crate::vector::f16::f16_to_f32(h);
-                    dot += q * x;
-                    xsq += x * x;
-                }
+                let (dot, xsq) = (dist_table.f16_dot_normsq)(q_ref, vec_f16);
                 if xsq > 0.0 {
                     // f16 rounding can push cos slightly outside [-1, 1];
                     // clamp so distances stay in the metric's [0, 4] range.
@@ -327,9 +325,12 @@ impl ImmutableSegment {
             let bfs = self.graph.to_bfs(c.id.0);
             self.is_live_bfs(bfs)
         });
-        // HQ-1: exact rerank of the live beam (ef candidates) from the f16
+        // HQ-1: exact rerank of the top 4·k live beam candidates from the f16
         // sidecar — replaces quantized estimates with true metric distances
-        // before top-k truncation. No-op without a sidecar.
+        // before top-k truncation. No-op without a sidecar. Runs for SQ8
+        // too: an A/B (20k×384d, 1seg+5seg) measured skipping it costs
+        // R@10 −0.010 clustered / −0.017 gaussian-5seg — real recall, and
+        // the SIMD sidecar kernels make the pass ~3% of a query.
         self.rerank_exact(&mut candidates, query, k);
         candidates.truncate(k);
         self.remap_to_global_ids(&mut candidates);
@@ -371,7 +372,8 @@ impl ImmutableSegment {
             let bfs = self.graph.to_bfs(c.id.0);
             self.is_live_bfs(bfs)
         });
-        // HQ-1: exact rerank of the live beam from the f16 sidecar.
+        // HQ-1: exact rerank of the live beam from the f16 sidecar (see the
+        // recall A/B note in `search`).
         self.rerank_exact(&mut candidates, query, k);
         candidates.truncate(k);
         self.remap_to_global_ids(&mut candidates);

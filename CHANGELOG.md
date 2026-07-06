@@ -6,6 +6,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance — SIMD f16 exact-rerank kernels (NEON + F16C)
+
+- The HQ-1 exact-rerank pass decoded its f16 sidecar with scalar software
+  `f16_to_f32` — 17% of a matched-recall (ef 64) query. New fused
+  decode+distance kernels in the distance dispatch table (`f16_l2`,
+  `f16_dot_normsq`): aarch64 uses a baseline-NEON integer-rescale decode
+  (no ARMv8.2 FP16 intrinsics needed; exact for all finite f16, Inf/NaN
+  bit-selected), x86_64 uses F16C `vcvtph2ps` + FMA (runtime-detected with
+  AVX2, scalar fallback). Subnormal/Inf/NaN semantics match the scalar
+  reference exactly (pinned by tests). VM A/B (20k×384d clustered SQ8,
+  single conn, ef 64): 7,795 → 8,468 QPS (+8.6%).
+- **Negative result, kept for the record**: skipping the rerank pass
+  entirely for SQ8 was A/B'd and REFUTED — it costs real recall
+  (R@10 −0.010 clustered, −0.017 gaussian 5-segment). The pass stays
+  unconditional; the SIMD kernels make it cheap instead.
+
 ### Performance — FT.SEARCH intra-query worker pool + bounded bulk compaction
 
 - **`--ft-search-workers N` worker pool** (`src/vector/search_pool.rs`): the

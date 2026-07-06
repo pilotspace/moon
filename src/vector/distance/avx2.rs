@@ -376,6 +376,106 @@ pub unsafe fn sq8_stats(query: &[f32], codes: &[u8]) -> (f32, f32, f32) {
     (dot_sum, sum_c_sum, sumsq_c_sum)
 }
 
+// ── f16 sidecar kernels (exact-rerank HQ-1) ─────────────────────────────
+
+/// Squared L2 between an f32 query and an f16-encoded sidecar vector.
+/// F16C `vcvtph2ps` decodes 8 halves per step (hardware IEEE semantics —
+/// subnormals, Inf, and NaN match scalar `f16_to_f32` exactly); FMA
+/// accumulates. 16 halves per iteration, scalar tail.
+///
+/// # Safety
+/// Caller must ensure the CPU supports AVX2, F16C, and FMA
+/// (verified via `is_x86_feature_detected!` at DistanceTable init).
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[target_feature(enable = "avx2,f16c,fma")]
+pub unsafe fn f16_l2(query: &[f32], vec_f16: &[u16]) -> f32 {
+    debug_assert_eq!(query.len(), vec_f16.len(), "f16_l2: dimension mismatch");
+    let n = query.len();
+    let mut sum0 = _mm256_setzero_ps();
+    let mut sum1 = _mm256_setzero_ps();
+    let pq = query.as_ptr();
+    let px = vec_f16.as_ptr();
+    let chunks = n / 16;
+    let mut i = 0usize;
+    for _ in 0..chunks {
+        // SAFETY: i + 16 <= n guaranteed by chunks = n / 16. Pointers are
+        // valid slices (f32 query / u16 halves) at this offset; loadu allows
+        // unaligned access.
+        let x0 = _mm256_cvtph_ps(_mm_loadu_si128(px.add(i) as *const __m128i));
+        let x1 = _mm256_cvtph_ps(_mm_loadu_si128(px.add(i + 8) as *const __m128i));
+        let q0 = _mm256_loadu_ps(pq.add(i));
+        let q1 = _mm256_loadu_ps(pq.add(i + 8));
+        let d0 = _mm256_sub_ps(q0, x0);
+        let d1 = _mm256_sub_ps(q1, x1);
+        sum0 = _mm256_fmadd_ps(d0, d0, sum0);
+        sum1 = _mm256_fmadd_ps(d1, d1, sum1);
+        i += 16;
+    }
+    // SAFETY: hsum_f32_avx2 requires AVX2, which we have via target_feature.
+    let mut result = hsum_f32_avx2(_mm256_add_ps(sum0, sum1));
+    // Scalar tail
+    while i < n {
+        let d = *query.get_unchecked(i) - crate::vector::f16::f16_to_f32(*vec_f16.get_unchecked(i));
+        result += d * d;
+        i += 1;
+    }
+    result
+}
+
+/// Fused `(Σ q_i·x_i, Σ x_i²)` between an f32 query and an f16-encoded
+/// sidecar vector (F16C decode + FMA, 16 halves per iteration; scalar
+/// tail). Feeds the unit-sphere (Cosine/InnerProduct) exact-rerank
+/// distance.
+///
+/// # Safety
+/// Caller must ensure the CPU supports AVX2, F16C, and FMA
+/// (verified via `is_x86_feature_detected!` at DistanceTable init).
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[target_feature(enable = "avx2,f16c,fma")]
+pub unsafe fn f16_dot_normsq(query: &[f32], vec_f16: &[u16]) -> (f32, f32) {
+    debug_assert_eq!(
+        query.len(),
+        vec_f16.len(),
+        "f16_dot_normsq: dimension mismatch"
+    );
+    let n = query.len();
+    let mut dot0 = _mm256_setzero_ps();
+    let mut dot1 = _mm256_setzero_ps();
+    let mut xsq0 = _mm256_setzero_ps();
+    let mut xsq1 = _mm256_setzero_ps();
+    let pq = query.as_ptr();
+    let px = vec_f16.as_ptr();
+    let chunks = n / 16;
+    let mut i = 0usize;
+    for _ in 0..chunks {
+        // SAFETY: i + 16 <= n guaranteed by chunks = n / 16. Pointers are
+        // valid slices (f32 query / u16 halves) at this offset; loadu allows
+        // unaligned access.
+        let x0 = _mm256_cvtph_ps(_mm_loadu_si128(px.add(i) as *const __m128i));
+        let x1 = _mm256_cvtph_ps(_mm_loadu_si128(px.add(i + 8) as *const __m128i));
+        let q0 = _mm256_loadu_ps(pq.add(i));
+        let q1 = _mm256_loadu_ps(pq.add(i + 8));
+        dot0 = _mm256_fmadd_ps(q0, x0, dot0);
+        dot1 = _mm256_fmadd_ps(q1, x1, dot1);
+        xsq0 = _mm256_fmadd_ps(x0, x0, xsq0);
+        xsq1 = _mm256_fmadd_ps(x1, x1, xsq1);
+        i += 16;
+    }
+    // SAFETY: hsum_f32_avx2 requires AVX2, which we have via target_feature.
+    let mut dot = hsum_f32_avx2(_mm256_add_ps(dot0, dot1));
+    let mut xsq = hsum_f32_avx2(_mm256_add_ps(xsq0, xsq1));
+    // Scalar tail
+    while i < n {
+        let x = crate::vector::f16::f16_to_f32(*vec_f16.get_unchecked(i));
+        dot += *query.get_unchecked(i) * x;
+        xsq += x * x;
+        i += 1;
+    }
+    (dot, xsq)
+}
+
 #[cfg(test)]
 #[cfg(target_arch = "x86_64")]
 mod tests {
@@ -603,5 +703,76 @@ mod tests {
         // SAFETY: AVX2+FMA verified above.
         let got = unsafe { sq8_stats(q, c) };
         assert_eq!(got, (0.0, 0.0, 0.0));
+    }
+
+    fn has_f16c_kernel_features() -> bool {
+        is_x86_feature_detected!("avx2")
+            && is_x86_feature_detected!("fma")
+            && is_x86_feature_detected!("f16c")
+    }
+
+    #[test]
+    fn test_f16_kernels_match_scalar_all_value_classes() {
+        use crate::vector::f16::{dot_normsq_f16, f32_to_f16, l2_sq_f16};
+        if !has_f16c_kernel_features() {
+            return;
+        }
+        // Normals, f16 subnormals, zero, and odd tails -- F16C hardware decode
+        // must agree with scalar f16_to_f32 everywhere.
+        for len in [0, 1, 3, 7, 8, 9, 15, 16, 17, 31, 33, 100, 384] {
+            let q = gen_f32(len, 21);
+            let x: Vec<u16> = gen_f32(len, 77)
+                .iter()
+                .enumerate()
+                .map(|(j, &v)| {
+                    if j % 5 == 4 {
+                        f32_to_f16(3e-6 + (j as f32) * 1.1e-7) // subnormal f16
+                    } else if j % 7 == 6 {
+                        f32_to_f16(0.0)
+                    } else {
+                        f32_to_f16(v)
+                    }
+                })
+                .collect();
+            let exp_l2 = l2_sq_f16(&q, &x);
+            // SAFETY: AVX2+F16C+FMA verified above.
+            let got_l2 = unsafe { f16_l2(&q, &x) };
+            let rel = (got_l2 - exp_l2).abs() / exp_l2.abs().max(1e-10);
+            assert!(
+                rel < 1e-4 || len == 0,
+                "f16_l2 len={len}: scalar={exp_l2}, avx2={got_l2}"
+            );
+
+            let (ed, en) = dot_normsq_f16(&q, &x);
+            // SAFETY: AVX2+F16C+FMA verified above.
+            let (gd, gn) = unsafe { f16_dot_normsq(&q, &x) };
+            assert!(
+                (gd - ed).abs() / ed.abs().max(1e-6) < 1e-3,
+                "f16_dot len={len}: scalar={ed}, avx2={gd}"
+            );
+            assert!(
+                (gn - en).abs() / en.abs().max(1e-6) < 1e-4,
+                "f16_normsq len={len}: scalar={en}, avx2={gn}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_f16_kernels_inf_nan_propagate() {
+        use crate::vector::f16::f32_to_f16;
+        if !has_f16c_kernel_features() {
+            return;
+        }
+        let q = gen_f32(24, 5);
+        let mut x: Vec<u16> = gen_f32(24, 9).iter().map(|&v| f32_to_f16(v)).collect();
+        x[10] = f32_to_f16(f32::INFINITY);
+        // SAFETY: AVX2+F16C+FMA verified above.
+        assert_eq!(unsafe { f16_l2(&q, &x) }, f32::INFINITY);
+        x[10] = f32_to_f16(f32::NAN);
+        // SAFETY: AVX2+F16C+FMA verified above.
+        assert!(unsafe { f16_l2(&q, &x) }.is_nan());
+        // SAFETY: AVX2+F16C+FMA verified above.
+        let (_, xsq) = unsafe { f16_dot_normsq(&q, &x) };
+        assert!(xsq.is_nan());
     }
 }
