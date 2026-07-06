@@ -43,6 +43,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   post-fold drain trick) — the ~1.2s EverySec bound is provably unchanged.
   `FsyncPolicy::Always`/`No` have no such deadline and escalate freely once
   idle.
+- **Item C1 — WAL v3 write buffer shrinks after an oversized flush**
+  (`src/persistence/wal_v3/segment.rs`): a single large record (e.g. a
+  FullPageImage) grew the 8KB write buffer to fit it, and `clear()` alone
+  never released that capacity — the peak allocation was pinned for the
+  writer's lifetime. `flush_write`/`rotate_segment` now `shrink_to` the
+  8KB default once capacity exceeds 4x that, a no-op for the common
+  small-record case.
 
 ### CI — fix Windows main-push test failures (PR #TBD)
 

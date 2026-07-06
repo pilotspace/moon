@@ -43,6 +43,16 @@ pub const WAL_V3_HEADER_SIZE: usize = 64;
 /// Default segment size: 16MB.
 pub const DEFAULT_SEGMENT_SIZE: u64 = 16 * 1024 * 1024;
 
+/// Default (initial) capacity of the in-memory write buffer.
+const DEFAULT_WAL_BUF_CAPACITY: usize = 8192;
+
+/// Capacity above which the write buffer is shrunk back to
+/// [`DEFAULT_WAL_BUF_CAPACITY`] once fully drained. A single oversized
+/// record (e.g. a large FullPageImage) grows the buffer to fit it, and a
+/// plain `Vec::clear()` never releases that capacity — one big write would
+/// otherwise pin peak-sized memory for the lifetime of the writer.
+const WAL_BUF_SHRINK_THRESHOLD: usize = DEFAULT_WAL_BUF_CAPACITY * 4;
+
 /// Represents a single WAL v3 segment file.
 #[derive(Debug, Clone)]
 pub struct WalSegment {
@@ -141,7 +151,7 @@ impl WalWriterV3 {
             segment_size,
             current_sequence: next_seq,
             current_file: None,
-            buf: Vec::with_capacity(8192),
+            buf: Vec::with_capacity(DEFAULT_WAL_BUF_CAPACITY),
             write_offset: 0,
             next_lsn,
             base_lsn: 0,
@@ -182,6 +192,12 @@ impl WalWriterV3 {
             file.write_all(&self.buf)?;
             self.write_offset += self.buf.len() as u64;
             self.buf.clear();
+            // Release peak capacity from an oversized record (e.g. a large
+            // FullPageImage) rather than pinning it for the writer's
+            // lifetime; `shrink_to` is a no-op below the target capacity.
+            if self.buf.capacity() > WAL_BUF_SHRINK_THRESHOLD {
+                self.buf.shrink_to(DEFAULT_WAL_BUF_CAPACITY);
+            }
         }
 
         Ok(())
@@ -423,6 +439,9 @@ impl WalWriterV3 {
                 file.write_all(&self.buf)?;
                 self.write_offset += self.buf.len() as u64;
                 self.buf.clear();
+                if self.buf.capacity() > WAL_BUF_SHRINK_THRESHOLD {
+                    self.buf.shrink_to(DEFAULT_WAL_BUF_CAPACITY);
+                }
             }
             file.sync_data()?;
         }
@@ -743,6 +762,48 @@ mod tests {
             count += 1;
         }
         assert_eq!(count, 3);
+    }
+
+    #[test]
+    fn test_buffer_shrinks_after_flush_following_large_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_dir = tmp.path().join("wal");
+        let mut writer = WalWriterV3::new(0, &wal_dir, DEFAULT_SEGMENT_SIZE).unwrap();
+
+        assert_eq!(writer.resident_bytes(), DEFAULT_WAL_BUF_CAPACITY);
+
+        // A single oversized record forces the buffer well past the
+        // shrink threshold (4x default).
+        let huge_payload = vec![0xABu8; 100_000];
+        writer.append(WalRecordType::Command, &huge_payload);
+        assert!(writer.resident_bytes() > WAL_BUF_SHRINK_THRESHOLD);
+
+        writer.flush_sync().unwrap();
+
+        // The buffer must release the peak capacity back down to (near)
+        // default once fully drained, so one giant record doesn't pin
+        // memory forever.
+        assert!(
+            writer.resident_bytes() <= DEFAULT_WAL_BUF_CAPACITY,
+            "expected buffer to shrink back to default capacity, got {}",
+            writer.resident_bytes()
+        );
+    }
+
+    #[test]
+    fn test_buffer_does_not_shrink_below_threshold() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_dir = tmp.path().join("wal");
+        let mut writer = WalWriterV3::new(0, &wal_dir, DEFAULT_SEGMENT_SIZE).unwrap();
+
+        // Small records that never exceed the shrink threshold should
+        // never trigger a reallocation cycle (a flush is a no-op sizing
+        // decision as long as capacity stays under the threshold).
+        for i in 0..10 {
+            writer.append(WalRecordType::Command, format!("SET k{i} v{i}").as_bytes());
+        }
+        writer.flush_sync().unwrap();
+        assert!(writer.resident_bytes() <= WAL_BUF_SHRINK_THRESHOLD);
     }
 
     #[test]
