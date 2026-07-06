@@ -102,13 +102,23 @@ pub struct FunctionRegistry {
     libraries: HashMap<Bytes, Library>,
     /// Reverse index: function_name -> library_name (for fast FCALL lookup).
     func_to_lib: HashMap<Bytes, Bytes>,
+    /// OOM/eviction gate for `redis.call`/`redis.pcall` writes issued from
+    /// FCALL'd functions (Gap B). Each library gets its own sandboxed Lua VM
+    /// (`create_library` below), so this must be captured here and cloned
+    /// into every VM at creation time rather than wired once — mirrors how
+    /// `setup_lua_vm` captures the shard's `LuaEvictionCtx` for the shared
+    /// EVAL/EVALSHA VM. Production callers (`handler_monoio`/`handler_sharded`)
+    /// must pass a real ctx built from the shard's handles; only test-only
+    /// callers may pass `LuaEvictionCtx::disabled()`.
+    eviction_ctx: crate::scripting::bridge::LuaEvictionCtx,
 }
 
 impl FunctionRegistry {
-    pub fn new() -> Self {
+    pub fn new(eviction_ctx: crate::scripting::bridge::LuaEvictionCtx) -> Self {
         FunctionRegistry {
             libraries: HashMap::new(),
             func_to_lib: HashMap::new(),
+            eviction_ctx,
         }
     }
 
@@ -283,7 +293,10 @@ impl FunctionRegistry {
         let lua = Rc::new(mlua::Lua::new());
         crate::scripting::sandbox::setup_sandbox(&lua)
             .map_err(|e| LoadError::LuaError(e.to_string()))?;
-        crate::scripting::sandbox::register_redis_api(&lua)
+        // FCALL-internal writes run the same OOM/eviction gate as
+        // EVAL/EVALSHA (Gap B) — this per-library VM gets its own clone of
+        // the registry's `eviction_ctx`.
+        crate::scripting::sandbox::register_redis_api(&lua, self.eviction_ctx.clone())
             .map_err(|e| LoadError::LuaError(e.to_string()))?;
 
         // Create a table to store registered functions
@@ -526,7 +539,7 @@ mod tests {
 
     #[test]
     fn test_load_and_lookup() {
-        let mut reg = FunctionRegistry::new();
+        let mut reg = FunctionRegistry::new(crate::scripting::bridge::LuaEvictionCtx::disabled());
         let body =
             b"#!lua name=mylib\nredis.register_function('hello', function() return 'world' end)";
         let name = reg.load(body, false).unwrap();
@@ -539,7 +552,7 @@ mod tests {
 
     #[test]
     fn test_load_duplicate_without_replace() {
-        let mut reg = FunctionRegistry::new();
+        let mut reg = FunctionRegistry::new(crate::scripting::bridge::LuaEvictionCtx::disabled());
         let body =
             b"#!lua name=mylib\nredis.register_function('hello', function() return 'world' end)";
         reg.load(body, false).unwrap();
@@ -551,7 +564,7 @@ mod tests {
 
     #[test]
     fn test_load_replace() {
-        let mut reg = FunctionRegistry::new();
+        let mut reg = FunctionRegistry::new(crate::scripting::bridge::LuaEvictionCtx::disabled());
         let body1 =
             b"#!lua name=mylib\nredis.register_function('hello', function() return 'world' end)";
         let body2 =
@@ -563,7 +576,7 @@ mod tests {
 
     #[test]
     fn test_delete() {
-        let mut reg = FunctionRegistry::new();
+        let mut reg = FunctionRegistry::new(crate::scripting::bridge::LuaEvictionCtx::disabled());
         let body =
             b"#!lua name=mylib\nredis.register_function('hello', function() return 'world' end)";
         reg.load(body, false).unwrap();
@@ -573,7 +586,7 @@ mod tests {
 
     #[test]
     fn test_flush() {
-        let mut reg = FunctionRegistry::new();
+        let mut reg = FunctionRegistry::new(crate::scripting::bridge::LuaEvictionCtx::disabled());
         let body =
             b"#!lua name=mylib\nredis.register_function('hello', function() return 'world' end)";
         reg.load(body, false).unwrap();
@@ -583,7 +596,7 @@ mod tests {
 
     #[test]
     fn test_list() {
-        let mut reg = FunctionRegistry::new();
+        let mut reg = FunctionRegistry::new(crate::scripting::bridge::LuaEvictionCtx::disabled());
         let body =
             b"#!lua name=mylib\nredis.register_function('hello', function() return 'world' end)";
         reg.load(body, false).unwrap();
@@ -594,7 +607,7 @@ mod tests {
 
     #[test]
     fn test_table_form_registration() {
-        let mut reg = FunctionRegistry::new();
+        let mut reg = FunctionRegistry::new(crate::scripting::bridge::LuaEvictionCtx::disabled());
         let body = b"#!lua name=mylib\nredis.register_function{function_name='hello', callback=function() return 'world' end, description='test func'}";
         let name = reg.load(body, false).unwrap();
         assert_eq!(name, Bytes::from_static(b"mylib"));
@@ -604,7 +617,7 @@ mod tests {
 
     #[test]
     fn test_call_function() {
-        let mut reg = FunctionRegistry::new();
+        let mut reg = FunctionRegistry::new(crate::scripting::bridge::LuaEvictionCtx::disabled());
         let body =
             b"#!lua name=mylib\nredis.register_function('hello', function() return 'world' end)";
         reg.load(body, false).unwrap();
@@ -616,7 +629,7 @@ mod tests {
 
     #[test]
     fn test_call_function_not_found() {
-        let reg = FunctionRegistry::new();
+        let reg = FunctionRegistry::new(crate::scripting::bridge::LuaEvictionCtx::disabled());
         let mut db = Database::new();
         let result = reg.call_function(b"nonexistent", vec![], vec![], &mut db, 0, 1, false);
         assert!(matches!(result, Frame::Error(_)));

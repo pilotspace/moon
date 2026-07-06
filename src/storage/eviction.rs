@@ -33,6 +33,34 @@ static MAXMEMORY_HINT: std::sync::atomic::AtomicUsize =
 static MAXMEMORY_PER_SHARD_HINT: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(usize::MAX);
 
+/// Process-global "is `maxmemory` nonzero?" flag, in bytes (0 = unset /
+/// unlimited). This answers a single boolean question — distinct from
+/// [`MAXMEMORY_HINT`] above, which additionally encodes the exact budget for
+/// the inline fast path's skip-eviction arithmetic. Two call sites used to
+/// answer this same question with a lock read per drain cycle
+/// (`spsc_handler.rs`'s `drain_spsc_shared`) or a generation/`Cell` snapshot
+/// (`LuaEvictionCtx::gate`); both now read this atomic instead.
+static MAXMEMORY_GLOBAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Publish the current `maxmemory` byte count. MUST be called at every
+/// production write site of `RuntimeConfig.maxmemory`: server startup
+/// (after `ServerConfig` resolves the guardrail-capped value into
+/// `RuntimeConfig`) and `CONFIG SET maxmemory`. A missed publish is a silent
+/// eviction-gate bypass — `tests/oom_bypass_closure.rs` exercises both call
+/// sites.
+#[inline]
+pub fn publish_maxmemory(bytes: u64) {
+    MAXMEMORY_GLOBAL.store(bytes, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// `true` iff `maxmemory` is currently nonzero (i.e. a limit is configured).
+/// Lock-free: a single Relaxed atomic load, safe to call on every SPSC drain
+/// cycle or Lua `redis.call`/`redis.pcall` invocation.
+#[inline]
+pub fn maxmemory_is_set() -> bool {
+    MAXMEMORY_GLOBAL.load(std::sync::atomic::Ordering::Relaxed) != 0
+}
+
 /// Publish the maxmemory hints. MUST be called wherever `maxmemory` (or the
 /// shard count it is divided by) changes: server startup after the resolved
 /// `num_shards` is written, and `CONFIG SET maxmemory`. A missed publish is
@@ -876,6 +904,25 @@ mod tests {
     // -----------------------------------------------------------------
     // compute_elastic_budget (GAP-1)
     // -----------------------------------------------------------------
+
+    // -----------------------------------------------------------------
+    // MAXMEMORY_GLOBAL atomic (Gap C)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn maxmemory_publish_and_is_set_roundtrip() {
+        // Unset (0) => maxmemory_is_set() is false.
+        publish_maxmemory(0);
+        assert!(!maxmemory_is_set());
+        // Any nonzero byte count => true.
+        publish_maxmemory(1);
+        assert!(maxmemory_is_set());
+        publish_maxmemory(64 * 1024 * 1024);
+        assert!(maxmemory_is_set());
+        // Un-publish (CONFIG SET maxmemory 0) flips it back off.
+        publish_maxmemory(0);
+        assert!(!maxmemory_is_set());
+    }
 
     #[test]
     fn elastic_budget_balanced_load_keeps_base() {

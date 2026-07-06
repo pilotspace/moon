@@ -1024,10 +1024,26 @@ fn detect_memory_limit_bytes() -> Option<usize> {
     }
 }
 
-/// Non-Linux: no portable, dependency-free memory-limit probe. The guardrail
-/// is skipped (operator sets `--maxmemory` explicitly on dev hosts). Production
-/// targets Linux per the platform policy.
-#[cfg(not(target_os = "linux"))]
+/// macOS (first-class target): probe physical RAM via `sysctl -n hw.memsize`.
+/// A spawned command instead of `sysctlbyname` FFI keeps this free of new
+/// unsafe blocks; it runs once at startup so the fork cost is irrelevant.
+/// No container limit concept applies on macOS, so host RAM is the limit.
+#[cfg(target_os = "macos")]
+fn detect_memory_limit_bytes() -> Option<usize> {
+    let out = std::process::Command::new("sysctl")
+        .args(["-n", "hw.memsize"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    std::str::from_utf8(&out.stdout).ok()?.trim().parse().ok()
+}
+
+/// Other platforms: no portable, dependency-free memory-limit probe. The
+/// guardrail is skipped (operator sets `--maxmemory` explicitly). Production
+/// targets Linux/macOS per the platform policy.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn detect_memory_limit_bytes() -> Option<usize> {
     None
 }
@@ -1537,6 +1553,19 @@ mod tests {
             config.maxmemory = Some(0);
         }
         assert_eq!(config.to_runtime_config().maxmemory, 0);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_detects_memory_limit() {
+        // macOS is a first-class target; booting UNLIMITED + noeviction by
+        // default (guardrail Skipped) was RSS/CPU/OOM review item 4 — the
+        // hw.memsize probe must feed the same 80% guardrail as Linux.
+        let detected = detect_memory_limit_bytes();
+        assert!(
+            detected.is_some_and(|b| b > 1 << 30),
+            "hw.memsize probe failed: {detected:?}"
+        );
     }
 
     #[test]

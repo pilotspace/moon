@@ -102,6 +102,10 @@ pub fn config_set(runtime_config: &mut RuntimeConfig, args: &[Frame]) -> Frame {
                     runtime_config.maxmemory = v;
                     // Keep the inline write path's lock-free pre-gate in sync.
                     crate::storage::eviction::publish_maxmemory_hints(&*runtime_config);
+                    // Keep the SPSC-drain / Lua-bridge "is maxmemory set?" atomic
+                    // in sync (Gap C) — a missed publish here silently bypasses
+                    // the eviction gate on both paths.
+                    crate::storage::eviction::publish_maxmemory(v as u64);
                 }
                 Err(_) => {
                     return Frame::Error(Bytes::from(format!(

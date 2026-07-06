@@ -18,10 +18,15 @@ use crate::storage::Database;
 
 /// Create and return a fully sandboxed Lua 5.4 VM with redis.* API registered.
 /// Must be called on the shard thread (Lua is !Send).
-pub fn setup_lua_vm() -> mlua::Result<Rc<Lua>> {
+///
+/// `eviction_ctx` is captured into the `redis.call`/`redis.pcall` closures for
+/// the lifetime of this VM (M3 OOM-bypass fix) — pass
+/// [`bridge::LuaEvictionCtx::disabled()`] when no shard context applies
+/// (tests).
+pub fn setup_lua_vm(eviction_ctx: bridge::LuaEvictionCtx) -> mlua::Result<Rc<Lua>> {
     let lua = Rc::new(Lua::new());
     sandbox::setup_sandbox(&lua)?;
-    sandbox::register_redis_api(&lua)?;
+    sandbox::register_redis_api(&lua, eviction_ctx)?;
     Ok(lua)
 }
 
@@ -363,7 +368,7 @@ mod tests {
 
     #[test]
     fn test_setup_lua_vm() {
-        let lua = setup_lua_vm().unwrap();
+        let lua = setup_lua_vm(bridge::LuaEvictionCtx::disabled()).unwrap();
         // Should have redis table
         let redis: LuaValue = lua.globals().get("redis").unwrap();
         assert!(matches!(redis, LuaValue::Table(_)));
@@ -375,7 +380,7 @@ mod tests {
 
     #[test]
     fn test_run_script_simple() {
-        let lua = setup_lua_vm().unwrap();
+        let lua = setup_lua_vm(bridge::LuaEvictionCtx::disabled()).unwrap();
         let mut db = Database::new();
 
         let result = run_script(&lua, b"return 42", vec![], vec![], &mut db, 0, 1);
@@ -384,7 +389,7 @@ mod tests {
 
     #[test]
     fn test_run_script_keys_argv() {
-        let lua = setup_lua_vm().unwrap();
+        let lua = setup_lua_vm(bridge::LuaEvictionCtx::disabled()).unwrap();
         let mut db = Database::new();
 
         let result = run_script(
@@ -401,7 +406,7 @@ mod tests {
 
     #[test]
     fn test_run_script_with_redis_call() {
-        let lua = setup_lua_vm().unwrap();
+        let lua = setup_lua_vm(bridge::LuaEvictionCtx::disabled()).unwrap();
         let mut db = Database::new();
 
         // SET and GET via redis.call
@@ -419,7 +424,7 @@ mod tests {
 
     #[test]
     fn test_run_script_redis_pcall_catches_error() {
-        let lua = setup_lua_vm().unwrap();
+        let lua = setup_lua_vm(bridge::LuaEvictionCtx::disabled()).unwrap();
         let mut db = Database::new();
 
         // pcall should catch errors as table
@@ -438,7 +443,7 @@ mod tests {
 
     #[test]
     fn test_run_script_type_conversions() {
-        let lua = setup_lua_vm().unwrap();
+        let lua = setup_lua_vm(bridge::LuaEvictionCtx::disabled()).unwrap();
         let mut db = Database::new();
 
         // Return string
@@ -521,7 +526,7 @@ mod tests {
 
     #[test]
     fn test_handle_eval_basic() {
-        let lua = setup_lua_vm().unwrap();
+        let lua = setup_lua_vm(bridge::LuaEvictionCtx::disabled()).unwrap();
         let cache = Rc::new(RefCell::new(ScriptCache::new()));
         let mut db = Database::new();
 
@@ -536,7 +541,7 @@ mod tests {
 
     #[test]
     fn test_handle_evalsha_noscript() {
-        let lua = setup_lua_vm().unwrap();
+        let lua = setup_lua_vm(bridge::LuaEvictionCtx::disabled()).unwrap();
         let cache = Rc::new(RefCell::new(ScriptCache::new()));
         let mut db = Database::new();
 
@@ -556,7 +561,7 @@ mod tests {
 
     #[test]
     fn test_handle_evalsha_after_eval() {
-        let lua = setup_lua_vm().unwrap();
+        let lua = setup_lua_vm(bridge::LuaEvictionCtx::disabled()).unwrap();
         let cache = Rc::new(RefCell::new(ScriptCache::new()));
         let mut db = Database::new();
 

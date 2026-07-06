@@ -160,8 +160,21 @@ pub(crate) fn spawn_tokio_connection(
     let lua = {
         let mut lua_opt = lua_rc.borrow_mut();
         if lua_opt.is_none() {
-            *lua_opt =
-                Some(crate::scripting::setup_lua_vm().expect("Lua VM initialization failed"));
+            // M3 fix: bake this shard's OOM eviction context into the
+            // redis.call/pcall closures at VM-setup time (once per shard,
+            // shared by every connection landing here — shard_id/spill
+            // handles/runtime_config are identical across connections).
+            let eviction_ctx = crate::scripting::bridge::LuaEvictionCtx::new(
+                sdbs.clone(),
+                runtime_config.clone(),
+                shard_id,
+                spill_sender.clone(),
+                spill_file_id.clone(),
+                disk_offload_dir.clone(),
+            );
+            *lua_opt = Some(
+                crate::scripting::setup_lua_vm(eviction_ctx).expect("Lua VM initialization failed"),
+            );
         }
         lua_opt.as_ref().unwrap().clone()
     };
@@ -364,8 +377,18 @@ pub(crate) fn spawn_migrated_tokio_connection(
             let lua = {
                 let mut lua_opt = lua_rc.borrow_mut();
                 if lua_opt.is_none() {
+                    // M3 fix: see spawn_tokio_connection for rationale.
+                    let eviction_ctx = crate::scripting::bridge::LuaEvictionCtx::new(
+                        sdbs.clone(),
+                        runtime_config.clone(),
+                        shard_id,
+                        spill_sender.clone(),
+                        spill_file_id.clone(),
+                        disk_offload_dir.clone(),
+                    );
                     *lua_opt = Some(
-                        crate::scripting::setup_lua_vm().expect("Lua VM initialization failed"),
+                        crate::scripting::setup_lua_vm(eviction_ctx)
+                            .expect("Lua VM initialization failed"),
                     );
                 }
                 lua_opt.as_ref().unwrap().clone()
@@ -513,8 +536,18 @@ pub(crate) fn spawn_monoio_connection(
             let lua = {
                 let mut lua_opt = lua_rc.borrow_mut();
                 if lua_opt.is_none() {
+                    // M3 fix: see spawn_tokio_connection for rationale.
+                    let eviction_ctx = crate::scripting::bridge::LuaEvictionCtx::new(
+                        sdbs.clone(),
+                        runtime_config.clone(),
+                        shard_id,
+                        spill_tx.clone(),
+                        spill_fid.clone(),
+                        do_dir.clone(),
+                    );
                     *lua_opt = Some(
-                        crate::scripting::setup_lua_vm().expect("Lua VM initialization failed"),
+                        crate::scripting::setup_lua_vm(eviction_ctx)
+                            .expect("Lua VM initialization failed"),
                     );
                 }
                 lua_opt.as_ref().unwrap().clone()
@@ -840,8 +873,18 @@ pub(crate) fn spawn_migrated_monoio_connection(
             let lua = {
                 let mut lua_opt = lua_rc.borrow_mut();
                 if lua_opt.is_none() {
+                    // M3 fix: see spawn_tokio_connection for rationale.
+                    let eviction_ctx = crate::scripting::bridge::LuaEvictionCtx::new(
+                        sdbs.clone(),
+                        runtime_config.clone(),
+                        shard_id,
+                        spill_sender.clone(),
+                        spill_file_id.clone(),
+                        disk_offload_dir.clone(),
+                    );
                     *lua_opt = Some(
-                        crate::scripting::setup_lua_vm().expect("Lua VM initialization failed"),
+                        crate::scripting::setup_lua_vm(eviction_ctx)
+                            .expect("Lua VM initialization failed"),
                     );
                 }
                 lua_opt.as_ref().unwrap().clone()

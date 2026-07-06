@@ -23,6 +23,10 @@ pub mod segment_stall;
 pub mod shared_databases;
 pub mod slice;
 pub mod spsc_handler;
+/// Shared MOVE/COPY-DB two-database intercept for every `ShardMessage` SPSC
+/// arm (Gap A). Split out of `spsc_handler.rs` per the repo's file-size
+/// convention rather than growing that file further.
+pub(crate) mod spsc_two_db;
 pub mod timers;
 pub mod uring_handler;
 
@@ -367,6 +371,10 @@ mod tests {
             ),
             None, // aof_pool — None in tests
             true, // wal_kv_log — legacy behavior in tests
+            &std::sync::Arc::new(parking_lot::RwLock::new(RuntimeConfig::default())), // M2 fix: no shard context needed (maxmemory unset)
+            None,
+            &Rc::new(std::cell::Cell::new(1u64)),
+            None,
         );
 
         // Subscriber now receives pre-serialized RESP bytes
@@ -430,6 +438,10 @@ mod tests {
             ),
             None, // aof_pool — None in tests
             true, // wal_kv_log — legacy behavior in tests
+            &std::sync::Arc::new(parking_lot::RwLock::new(RuntimeConfig::default())), // M2 fix: no shard context needed (maxmemory unset)
+            None,
+            &Rc::new(std::cell::Cell::new(1u64)),
+            None,
         );
     }
 

@@ -29,6 +29,137 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fresh connection on mid-startup connection resets (CI flake: per-shard
   SO_REUSEPORT listeners accept-then-reset during init).
 
+### Fixed — OOM eviction bypass closure (PR #TBD)
+
+- **Cross-shard SPSC write legs now enforce `--maxmemory`.** `Execute`,
+  `MultiExecute`, `PipelineBatch` and their `*Slotted` variants
+  (`src/shard/spsc_handler.rs`) executed writes against the TARGET shard's
+  `Database` directly, bypassing the connection handlers' eviction gate
+  entirely — a scatter-gather write (e.g. a pipeline of individually-routed
+  `SET`s hashing to a remote shard) could grow that shard's memory past
+  `maxmemory` without limit. A new `spsc_eviction_gate` helper mirrors
+  `run_write_eviction_gate` (`handler_monoio/mod.rs`) exactly — same elastic
+  per-shard budget (GAP-1), same spill-vs-plain branching — threaded through
+  `drain_spsc_shared`/`handle_shard_message_shared` and gated by a
+  once-per-drain-cycle `evict_active` snapshot (perf parity with
+  `batch_eviction_active`: zero extra lock acquires when `maxmemory` is
+  unset). **Perf follow-up (same PR):** that snapshot, and the Lua bridge's
+  gate below, each used to answer "is `maxmemory` nonzero?" with either a
+  `runtime_config.read()` per drain cycle or a generation/`Cell` snapshot.
+  Both now read a single process-global `AtomicU64`
+  (`storage::eviction::{publish_maxmemory, maxmemory_is_set}`), published at
+  every production write site of `RuntimeConfig.maxmemory` (`CONFIG SET
+  maxmemory`, server startup) — one Relaxed load, no lock, no per-script
+  Cell bookkeeping.
+- **Lua `redis.call`/`redis.pcall` writes now enforce `--maxmemory`.**
+  EVAL/EVALSHA carry no WRITE command flag, so the dispatch-level OOM check
+  never saw them, and the bridge (`src/scripting/bridge.rs`) never ran the
+  check before executing a write inside a script — a tight `redis.call('SET',
+  ...)` loop could write arbitrarily far past the cap. A new
+  `LuaEvictionCtx`, captured by value into the `redis.call`/`redis.pcall`
+  closures at VM-setup time (`setup_lua_vm`, once per shard — zero new
+  `unsafe`, zero per-call allocation), runs the same gate before a WRITE
+  `redis.call` executes; `redis.call` raises the OOM error as a Lua runtime
+  error (script aborts, matching Redis semantics), `redis.pcall` returns it
+  as an `{err = ...}` table. Read-only scripts are unaffected.
+- **FCALL-internal `redis.call`/`redis.pcall` writes now enforce
+  `--maxmemory` too.** `FUNCTION LOAD` (`src/scripting/functions.rs`)
+  creates its own per-library sandboxed Lua VM, separate from the shard's
+  shared EVAL/EVALSHA VM — that per-library VM registered `redis.call`/
+  `redis.pcall` with `LuaEvictionCtx::disabled()` unconditionally, so a
+  `FUNCTION` whose body wrote in a loop could grow memory past the cap
+  independent of the EVAL/EVALSHA fix above. `FunctionRegistry::new` now
+  takes a `LuaEvictionCtx`, stored on the registry and cloned into every
+  library's VM at `create_library` time; both production construction sites
+  (`handler_monoio/mod.rs`, `handler_sharded/mod.rs`) build a real ctx from
+  the same shard handles `setup_lua_vm` already uses for the shared VM
+  (`ConnectionContext::{shard_databases, runtime_config, shard_id,
+  spill_sender, spill_file_id, disk_offload_dir}`); only test-only callers
+  pass `LuaEvictionCtx::disabled()`.
+- **Cross-shard `MOVE`/`COPY ... DB n` two-database intercept now runs on
+  EVERY `ShardMessage` SPSC arm, not just the plain `Execute` arm.** The
+  intercept (special-cased ahead of the generic single-db write path because
+  both commands need two `&mut Database` borrows at once) previously existed
+  only in `Execute`. Every other arm — including `PipelineBatchSlotted`, the
+  one real client traffic (`handler_monoio`/`handler_sharded`'s pipelined
+  remote-write path) actually uses — fell through to the generic single-db
+  `key_extra::copy`, which parses and silently ignores the `DB` clause: a
+  remote `COPY src dst DB n` performed a same-db copy instead (data
+  corruption, confirmed pre-fix via manual probe: 4/20 remote `COPY`s landed
+  in the wrong db), and a remote `MOVE` returned a loud-but-wrong "MOVE
+  requires handler-level dispatch (cross-db operation)" error instead of
+  moving the key. The intercept is now extracted into a shared helper
+  (`src/shard/spsc_two_db::try_two_db_intercept`) that `Execute`,
+  `MultiExecute`, `PipelineBatch`, `ExecuteSlotted`, `MultiExecuteSlotted`
+  and `PipelineBatchSlotted` all call verbatim; cross-db `COPY` still runs
+  `spsc_eviction_gate` against the destination db before `copy_core` (`COPY`
+  duplicates the value, so it needs the gate; same-shard `MOVE` is net-zero
+  and stays ungated, same rationale as `DEL`).
+- **Found, NOT fixed (out of scope): cross-shard `COPY`'s destination key is
+  only reliably retrievable when it hash-tag-colocates with the source key.**
+  Moon shards purely by key hash, with no db-awareness. A `COPY src dst DB n`
+  executes on whichever shard owns `src` (that's the routing key for the
+  whole command) and writes `dst` into that SAME shard's db space — it does
+  not (and cannot, without a real cross-shard two-phase protocol) relocate
+  the write to whichever shard `dst`'s OWN hash would naturally pick. A later
+  plain `GET dst` routes by `hash(dst)`, so it only reliably finds the value
+  when `src` and `dst` share a hash tag (or `--shards 1`). `MOVE` is exempt
+  (the key name is unchanged, so `hash(key)` is identical before and after).
+  This is a pre-existing, inherent property of the per-key-hash sharding
+  model applied to `COPY` with a renamed destination — the plain `Execute`
+  arm this fix mirrors has the identical property — not a regression from
+  extending the intercept to every arm. Fixing it is a materially larger
+  change (routing the destination write to `dst`'s own natural shard) than
+  "apply the existing intercept to more arms" and is out of scope here.
+- **Found, NOT fixed (out of scope): Moon's eviction gate is per-DATABASE,
+  not per-shard-aggregate-across-databases.** `try_evict_if_needed_budget`
+  (and every SPSC write arm, including the new cross-db `COPY` gate above)
+  measures `db.estimated_memory()` for the ONE database being written to,
+  not the sum across all 16 logical dbs a shard holds — consistent
+  throughout Moon's write path, but a deviation from real Redis's
+  instance-wide `maxmemory`. A cross-db `COPY` into a mostly-empty
+  destination db can undercount total shard pressure. Uniform, pre-existing
+  behavior; fixing it is a cross-cutting change to the eviction model, not a
+  `COPY`/`MOVE`-specific one — out of scope here.
+- New wire-level regression suite `tests/spsc_two_db.rs` (3 cases, both
+  runtimes) exercises the one arm real client traffic uses
+  (`PipelineBatchSlotted`): pipelined cross-shard `COPY ... DB n` (RED
+  before the fix — `MOVE`'s loud wrong error and `COPY`'s silent same-db
+  copy — both confirmed via a git-stash re-run against the pre-fix source),
+  pipelined cross-shard `MOVE`, and a same-db `COPY` control (routes through
+  the coordinator's multi-key scatter path, unaffected by this fix, kept as
+  a negative control). The `COPY` case uses `{i}`-hash-tagged src/dst key
+  pairs so the destination key is independently `GET`-able post-fix — see
+  the "destination hash-tag" caveat above; an untagged version of the same
+  test only succeeds for the ~1-in-4 keys where `hash(dst)` collides with
+  `hash(src)` by chance.
+- New wire-level regression suite `tests/oom_bypass_closure.rs` (8 cases,
+  both runtimes): direct-SET control (A), cross-shard pipeline (B), Lua EVAL
+  loop (C), read-only EVAL under pressure not blocked (D), cross-shard COPY
+  under pressure (E), `CONFIG SET maxmemory` atomic publish/un-publish (F),
+  FCALL-internal write loop (G), FCALL control with no maxmemory (H).
+  B, C, E and G RED before their respective fixes. D locks the write-only
+  scope of the Lua gate. Case F (added with the atomic-snapshot perf
+  follow-up) starts the server with `--maxmemory 0 --disk-offload disable`
+  (both required so the atomic starts genuinely unset — omitting
+  `--maxmemory` trips the auto-guardrail's nonzero default, and
+  disk-offload's spill-sender presence ORs into the same gate) and drives a
+  cross-shard pipeline before and after `CONFIG SET maxmemory`/`CONFIG SET
+  maxmemory 0`; RED before the CONFIG SET call site published the atomic
+  (775/3000 OOM — the local-only share) GREEN after (3000/3000). Case G
+  (FCALL) RED before the FunctionRegistry fix — a 2000-iteration
+  `redis.call('SET', ...)` loop inside an FCALL'd function completed with
+  `'DONE'` instead of an OOM error against a 2MB-capped `noeviction` server;
+  GREEN after. Case H locks the write-only/OOM-only scope of the FCALL gate,
+  mirroring case D for EVAL. Case E was revised for the cross-shard SPSC
+  intercept fix above: it now pre-loads db 1 (the `COPY` destination) with
+  the same ballast as db 0 before the OOM phase, since Moon's per-database
+  eviction gate (see the "found, not fixed" note above) needs the
+  destination db under its OWN pressure to trip — the original version
+  passed only as a side effect of the pre-fix same-db-copy bug (0/300 OOM
+  with the destination-db gate disabled and routing intact, confirmed via a
+  targeted stash of just that gate block; 76/300 fully fixed).
+
 ### Added — int8 symmetric ADC for SQ8 vector search (task #13)
 
 - New per-candidate integer dot-product path for SQ8 asymmetric distance
