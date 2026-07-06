@@ -76,63 +76,89 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`ConnectionContext::{shard_databases, runtime_config, shard_id,
   spill_sender, spill_file_id, disk_offload_dir}`); only test-only callers
   pass `LuaEvictionCtx::disabled()`.
-- **Cross-db `COPY ... DB n` eviction confirmed/hardened.** `COPY` carries
-  the generic `W` write flag, so on the cross-shard dispatch arms
-  `handler_monoio` actually uses for remote writes (`ExecuteSlotted`,
-  `PipelineBatchSlotted`) it already hit the same generic `is_write`
-  eviction gate as any other write command — no COPY-specific bypass exists
-  there. The plain `Execute` arm's `MOVE`/`COPY DB` two-database intercept
-  (special-cased ahead of the generic path because both need two `&mut
-  Database` borrows at once — used by `handler_sharded`'s single-key remote
-  dispatch) *was* missed, since it returns before reaching the generic gate;
-  it now runs `spsc_eviction_gate` against the destination db before
-  `copy_core`. Same-shard `MOVE` is left ungated (net-zero — the key leaves
-  the source db as it lands in the destination, same rationale as `DEL`).
-  This Execute-arm dest-gate is inspection-verified as a verbatim mirror of
-  the tested generic gate; no wire-level case isolates the Execute arm
-  specifically (the arm is only reachable via `handler_sharded`'s
-  single-key remote dispatch, not the pipelined path any test in this suite
-  drives) — see the case E caveat below.
-- **Found, NOT fixed (out of scope): cross-shard remote `COPY ... DB n`
-  silently ignores the DB clause.** The two-database intercept above exists
-  only in the plain `Execute` arm, not `ExecuteSlotted`/`PipelineBatchSlotted`
-  — so when the source key hashes to a different shard than the connection
-  (the common case under `handler_monoio`), `COPY ... DB n` falls through to
-  the generic single-db `key_extra::copy` and silently performs a same-db
-  copy instead of a cross-db one (confirmed via manual probe: 4/20 remote
-  `COPY`s landed in the wrong db). This is a data-correctness bug independent
-  of `--maxmemory` — memory growth from the (wrong) same-db copy is still
-  eviction-gated by the generic path above, so it is not a new OOM bypass,
-  but the DB clause itself does not do what it says. `MOVE` shares the same
-  structural setup (its two-database intercept also lives only in the plain
-  `Execute` arm) and likely has the same DB-target defect on the cross-shard
-  path — not independently verified here. Fixing it requires replicating the
-  two-database intercept across every `ShardMessage` arm (or restructuring it
-  as a shared helper reachable from all of them) — out of scope for this
-  fix, flagged as a follow-up covering both `COPY` and `MOVE`.
+- **Cross-shard `MOVE`/`COPY ... DB n` two-database intercept now runs on
+  EVERY `ShardMessage` SPSC arm, not just the plain `Execute` arm.** The
+  intercept (special-cased ahead of the generic single-db write path because
+  both commands need two `&mut Database` borrows at once) previously existed
+  only in `Execute`. Every other arm — including `PipelineBatchSlotted`, the
+  one real client traffic (`handler_monoio`/`handler_sharded`'s pipelined
+  remote-write path) actually uses — fell through to the generic single-db
+  `key_extra::copy`, which parses and silently ignores the `DB` clause: a
+  remote `COPY src dst DB n` performed a same-db copy instead (data
+  corruption, confirmed pre-fix via manual probe: 4/20 remote `COPY`s landed
+  in the wrong db), and a remote `MOVE` returned a loud-but-wrong "MOVE
+  requires handler-level dispatch (cross-db operation)" error instead of
+  moving the key. The intercept is now extracted into a shared helper
+  (`src/shard/spsc_two_db::try_two_db_intercept`) that `Execute`,
+  `MultiExecute`, `PipelineBatch`, `ExecuteSlotted`, `MultiExecuteSlotted`
+  and `PipelineBatchSlotted` all call verbatim; cross-db `COPY` still runs
+  `spsc_eviction_gate` against the destination db before `copy_core` (`COPY`
+  duplicates the value, so it needs the gate; same-shard `MOVE` is net-zero
+  and stays ungated, same rationale as `DEL`).
+- **Found, NOT fixed (out of scope): cross-shard `COPY`'s destination key is
+  only reliably retrievable when it hash-tag-colocates with the source key.**
+  Moon shards purely by key hash, with no db-awareness. A `COPY src dst DB n`
+  executes on whichever shard owns `src` (that's the routing key for the
+  whole command) and writes `dst` into that SAME shard's db space — it does
+  not (and cannot, without a real cross-shard two-phase protocol) relocate
+  the write to whichever shard `dst`'s OWN hash would naturally pick. A later
+  plain `GET dst` routes by `hash(dst)`, so it only reliably finds the value
+  when `src` and `dst` share a hash tag (or `--shards 1`). `MOVE` is exempt
+  (the key name is unchanged, so `hash(key)` is identical before and after).
+  This is a pre-existing, inherent property of the per-key-hash sharding
+  model applied to `COPY` with a renamed destination — the plain `Execute`
+  arm this fix mirrors has the identical property — not a regression from
+  extending the intercept to every arm. Fixing it is a materially larger
+  change (routing the destination write to `dst`'s own natural shard) than
+  "apply the existing intercept to more arms" and is out of scope here.
+- **Found, NOT fixed (out of scope): Moon's eviction gate is per-DATABASE,
+  not per-shard-aggregate-across-databases.** `try_evict_if_needed_budget`
+  (and every SPSC write arm, including the new cross-db `COPY` gate above)
+  measures `db.estimated_memory()` for the ONE database being written to,
+  not the sum across all 16 logical dbs a shard holds — consistent
+  throughout Moon's write path, but a deviation from real Redis's
+  instance-wide `maxmemory`. A cross-db `COPY` into a mostly-empty
+  destination db can undercount total shard pressure. Uniform, pre-existing
+  behavior; fixing it is a cross-cutting change to the eviction model, not a
+  `COPY`/`MOVE`-specific one — out of scope here.
+- New wire-level regression suite `tests/spsc_two_db.rs` (3 cases, both
+  runtimes) exercises the one arm real client traffic uses
+  (`PipelineBatchSlotted`): pipelined cross-shard `COPY ... DB n` (RED
+  before the fix — `MOVE`'s loud wrong error and `COPY`'s silent same-db
+  copy — both confirmed via a git-stash re-run against the pre-fix source),
+  pipelined cross-shard `MOVE`, and a same-db `COPY` control (routes through
+  the coordinator's multi-key scatter path, unaffected by this fix, kept as
+  a negative control). The `COPY` case uses `{i}`-hash-tagged src/dst key
+  pairs so the destination key is independently `GET`-able post-fix — see
+  the "destination hash-tag" caveat above; an untagged version of the same
+  test only succeeds for the ~1-in-4 keys where `hash(dst)` collides with
+  `hash(src)` by chance.
 - New wire-level regression suite `tests/oom_bypass_closure.rs` (8 cases,
   both runtimes): direct-SET control (A), cross-shard pipeline (B), Lua EVAL
   loop (C), read-only EVAL under pressure not blocked (D), cross-shard COPY
   under pressure (E), `CONFIG SET maxmemory` atomic publish/un-publish (F),
   FCALL-internal write loop (G), FCALL control with no maxmemory (H).
-  B, C, E and G RED before their respective fixes (E: 0/300 OOM, GREEN
-  after: 104/300). Case E pipelines `COPY`, which dispatches through the
-  same `ExecuteSlotted`/`PipelineBatchSlotted` generic-gate path as case B —
-  its RED/GREEN swing rides the *generic* gate, not the Execute-arm
-  dest-gate above; it confirms COPY drives that gate to OOM, not that the
-  Execute-arm path is independently exercised. D locks the write-only scope
-  of the Lua gate. Case F (added with the atomic-snapshot perf follow-up)
-  starts the server with `--maxmemory 0 --disk-offload disable` (both
-  required so the atomic starts genuinely unset — omitting `--maxmemory`
-  trips the auto-guardrail's nonzero default, and disk-offload's
-  spill-sender presence ORs into the same gate) and drives a cross-shard
-  pipeline before and after `CONFIG SET maxmemory`/`CONFIG SET maxmemory 0`;
-  RED before the CONFIG SET call site published the atomic (775/3000 OOM —
-  the local-only share) GREEN after (3000/3000). Case G (FCALL) RED before
-  the FunctionRegistry fix — a 2000-iteration `redis.call('SET', ...)` loop
-  inside an FCALL'd function completed with `'DONE'` instead of an OOM error
-  against a 2MB-capped `noeviction` server; GREEN after. Case H locks the
-  write-only/OOM-only scope of the FCALL gate, mirroring case D for EVAL.
+  B, C, E and G RED before their respective fixes. D locks the write-only
+  scope of the Lua gate. Case F (added with the atomic-snapshot perf
+  follow-up) starts the server with `--maxmemory 0 --disk-offload disable`
+  (both required so the atomic starts genuinely unset — omitting
+  `--maxmemory` trips the auto-guardrail's nonzero default, and
+  disk-offload's spill-sender presence ORs into the same gate) and drives a
+  cross-shard pipeline before and after `CONFIG SET maxmemory`/`CONFIG SET
+  maxmemory 0`; RED before the CONFIG SET call site published the atomic
+  (775/3000 OOM — the local-only share) GREEN after (3000/3000). Case G
+  (FCALL) RED before the FunctionRegistry fix — a 2000-iteration
+  `redis.call('SET', ...)` loop inside an FCALL'd function completed with
+  `'DONE'` instead of an OOM error against a 2MB-capped `noeviction` server;
+  GREEN after. Case H locks the write-only/OOM-only scope of the FCALL gate,
+  mirroring case D for EVAL. Case E was revised for the cross-shard SPSC
+  intercept fix above: it now pre-loads db 1 (the `COPY` destination) with
+  the same ballast as db 0 before the OOM phase, since Moon's per-database
+  eviction gate (see the "found, not fixed" note above) needs the
+  destination db under its OWN pressure to trip — the original version
+  passed only as a side effect of the pre-fix same-db-copy bug (0/300 OOM
+  with the destination-db gate disabled and routing intact, confirmed via a
+  targeted stash of just that gate block; 76/300 fully fixed).
 
 ### Added — int8 symmetric ADC for SQ8 vector search (task #13)
 

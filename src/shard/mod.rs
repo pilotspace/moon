@@ -23,6 +23,10 @@ pub mod segment_stall;
 pub mod shared_databases;
 pub mod slice;
 pub mod spsc_handler;
+/// Shared MOVE/COPY-DB two-database intercept for every `ShardMessage` SPSC
+/// arm (Gap A). Split out of `spsc_handler.rs` per the repo's file-size
+/// convention rather than growing that file further.
+pub(crate) mod spsc_two_db;
 pub mod timers;
 pub mod uring_handler;
 

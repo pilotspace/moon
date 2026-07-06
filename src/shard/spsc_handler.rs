@@ -47,7 +47,7 @@ use super::shared_databases::ShardDatabases;
 /// directly, bypassing the connection handlers' write path entirely — without
 /// this gate a scatter-gather write could grow a remote shard's memory past
 /// `maxmemory` without limit.
-fn spsc_eviction_gate(
+pub(super) fn spsc_eviction_gate(
     db: &mut Database,
     db_idx: usize,
     shard_databases: &Arc<ShardDatabases>,
@@ -549,107 +549,28 @@ pub(crate) fn handle_shard_message_shared(
                 // T2.2 MOVE — atomically moves a key between two dbs on the same shard.
                 // T2.3 COPY DB n — copies a key to a different db on the same shard.
                 // Both require two databases simultaneously; intercept before cmd_dispatch.
-                if cmd.eq_ignore_ascii_case(b"MOVE") {
-                    use crate::command::keyspace::move_cmd as ksmv;
-                    let mut response = match ksmv::parse_move_args(args, db_count) {
-                        Err(e) => e,
-                        Ok((_key, dst_db)) if dst_db == db_idx => {
-                            crate::protocol::Frame::Integer(0)
-                        }
-                        Ok((key, dst_db)) => {
-                            // SPSC runs single-threaded per shard; no concurrent MOVE can
-                            // deadlock. slice path uses split_at_mut (no locking needed).
-                            // Refresh expiry clock on BOTH databases before the move so
-                            // an expired source key behaves as "not found" and an expired
-                            // destination key doesn't shadow the insert (mirrors the
-                            // single-DB write path at line 583).
-                            crate::shard::slice::with_shard(|s| {
-                                ksmv::with_two_slice_dbs(
-                                    &mut s.databases,
-                                    db_idx,
-                                    dst_db,
-                                    |src, dst| {
-                                        src.refresh_now_from_cache(cached_clock);
-                                        dst.refresh_now_from_cache(cached_clock);
-                                        ksmv::move_core(src, dst, &key)
-                                    },
-                                )
-                            })
-                        }
-                    };
-                    if matches!(response, crate::protocol::Frame::Integer(1)) {
-                        let serialized = aof::serialize_command(&command);
-                        let mut aof_budget = crate::persistence::aof::AOF_SPSC_BACKPRESSURE_BOUND;
-                        if !wal_append_and_fanout(
-                            &serialized,
-                            wal_writer,
-                            wal_v3_writer,
-                            repl_backlog,
-                            replica_txs,
-                            repl_state,
+                // Gap A: shared with every other ShardMessage arm via
+                // spsc_two_db::try_two_db_intercept — SPSC runs single-threaded
+                // per shard, so the slice path (split_at_mut, no locking) is safe.
+                if cmd.eq_ignore_ascii_case(b"MOVE") || cmd.eq_ignore_ascii_case(b"COPY") {
+                    let intercepted = crate::shard::slice::with_shard(|s| {
+                        crate::shard::spsc_two_db::try_two_db_intercept(
+                            cmd,
+                            args,
+                            &mut s.databases,
+                            db_idx,
+                            db_count,
+                            cached_clock,
+                            evict_active,
+                            shard_databases,
                             shard_id,
-                            aof_pool, // FIX-W1-2
-                            wal_kv_log,
-                            &mut aof_budget,
-                        ) {
-                            response = crate::protocol::Frame::Error(bytes::Bytes::from_static(
-                                AOF_APPEND_LOST_ERR,
-                            ));
-                        }
-                    }
-                    let _ = reply_tx.send(response);
-                    return;
-                }
-
-                if cmd.eq_ignore_ascii_case(b"COPY") {
-                    use crate::command::keyspace::move_cmd as ksmv;
-                    if let Some(copy_result) = ksmv::parse_copy_db_args(args, db_idx, db_count) {
-                        let mut response = match copy_result {
-                            Err(e) => e,
-                            Ok(ca) => {
-                                // Refresh expiry clock on BOTH dbs to mirror the
-                                // single-DB write path: expired src/dst keys must
-                                // resolve correctly before copy_core inspects them.
-                                // M2 fix: unlike MOVE (net-zero — the key leaves src
-                                // as it lands in dst), cross-db COPY duplicates the
-                                // value, so it must run the same eviction gate as any
-                                // other write. Gate on the DESTINATION db (the one
-                                // that grows) before copy_core, mirroring the
-                                // is_write gate below.
-                                crate::shard::slice::with_shard(|s| {
-                                    ksmv::with_two_slice_dbs(
-                                        &mut s.databases,
-                                        db_idx,
-                                        ca.dst_db,
-                                        |src, dst| {
-                                            src.refresh_now_from_cache(cached_clock);
-                                            dst.refresh_now_from_cache(cached_clock);
-                                            if evict_active {
-                                                if let Err(oom) = spsc_eviction_gate(
-                                                    dst,
-                                                    ca.dst_db,
-                                                    shard_databases,
-                                                    shard_id,
-                                                    runtime_config,
-                                                    spill_sender,
-                                                    spill_file_id,
-                                                    disk_offload_dir,
-                                                ) {
-                                                    return oom;
-                                                }
-                                            }
-                                            ksmv::copy_core(
-                                                src,
-                                                dst,
-                                                &ca.src_key,
-                                                &ca.dst_key,
-                                                ca.replace,
-                                            )
-                                        },
-                                    )
-                                })
-                            }
-                        };
+                            runtime_config,
+                            spill_sender,
+                            spill_file_id,
+                            disk_offload_dir,
+                        )
+                    });
+                    if let Some(mut response) = intercepted {
                         if matches!(response, crate::protocol::Frame::Integer(1)) {
                             let serialized = aof::serialize_command(&command);
                             let mut aof_budget =
@@ -674,7 +595,11 @@ pub(crate) fn handle_shard_message_shared(
                         let _ = reply_tx.send(response);
                         return;
                     }
-                    // No DB clause or same-db: fall through to cmd_dispatch → key_extra::copy
+                    // COPY with no DB clause or same-db: fall through to
+                    // cmd_dispatch → key_extra::copy. (MOVE always returns
+                    // Some(..) from the helper — parse_move_args either
+                    // succeeds or produces an error frame — so this fall-
+                    // through is COPY-only in practice.)
                 }
 
                 // COW intercept: capture old value before write if snapshot is active
@@ -843,8 +768,8 @@ pub(crate) fn handle_shard_message_shared(
             let mut results = Vec::with_capacity(commands.len());
             let db_count = shard_databases.db_count();
             let db_idx = db_index.min(db_count.saturating_sub(1));
-            crate::shard::slice::with_shard_db(db_idx, |guard| {
-                guard.refresh_now_from_cache(cached_clock);
+            crate::shard::slice::with_shard(|s| {
+                s.databases[db_idx].refresh_now_from_cache(cached_clock);
                 // ONE backpressure budget for the whole batch: under sustained
                 // AOF backpressure the shard thread stalls at most BOUND total,
                 // not BOUND × batch-len (review finding, PR #211).
@@ -860,6 +785,64 @@ pub(crate) fn handle_shard_message_shared(
                         }
                     };
 
+                    // Gap A: MOVE / COPY-DB two-db intercept, mirroring the
+                    // plain Execute arm — needs two &mut Database borrows at
+                    // once, so it must run before `guard` narrows to a single
+                    // db below.
+                    if cmd.eq_ignore_ascii_case(b"MOVE") || cmd.eq_ignore_ascii_case(b"COPY") {
+                        if let Some(response) = crate::shard::spsc_two_db::try_two_db_intercept(
+                            cmd,
+                            args,
+                            &mut s.databases,
+                            db_idx,
+                            db_count,
+                            cached_clock,
+                            evict_active,
+                            shard_databases,
+                            shard_id,
+                            runtime_config,
+                            spill_sender,
+                            spill_file_id,
+                            disk_offload_dir,
+                        ) {
+                            let mut aof_ok = true;
+                            if matches!(response, crate::protocol::Frame::Integer(1))
+                                && wal_fanout_has_work(
+                                    wal_writer,
+                                    wal_v3_writer,
+                                    replica_txs,
+                                    aof_pool,
+                                    wal_kv_log,
+                                )
+                            {
+                                let serialized = aof::serialize_command(cmd_frame);
+                                aof_ok = wal_append_and_fanout(
+                                    &serialized,
+                                    wal_writer,
+                                    wal_v3_writer,
+                                    repl_backlog,
+                                    replica_txs,
+                                    repl_state,
+                                    shard_id,
+                                    aof_pool, // FIX-W1-2
+                                    wal_kv_log,
+                                    &mut aof_budget,
+                                );
+                            }
+                            results.push(if aof_ok {
+                                response
+                            } else {
+                                crate::protocol::Frame::Error(bytes::Bytes::from_static(
+                                    AOF_APPEND_LOST_ERR,
+                                ))
+                            });
+                            continue;
+                        }
+                        // COPY with no DB clause or same-db: fall through to
+                        // the generic single-db write path below.
+                    }
+
+                    let guard = &mut s.databases[db_idx];
                     let is_write = metadata::is_write(cmd);
                     if is_write {
                         // M2 fix: same gate as the Execute arm, applied per
@@ -973,8 +956,11 @@ pub(crate) fn handle_shard_message_shared(
             // write_db and text_store (HSET auto-index) accessed in one with_shard
             // closure to avoid re-entrant borrow (multi-resource arm).
             crate::shard::slice::with_shard(|s| {
-                let guard = &mut s.databases[db_idx];
-                guard.refresh_now_from_cache(cached_clock);
+                // One-time refresh via a scoped temporary borrow — `guard`
+                // itself moves INSIDE the loop below (Gap A) so the MOVE/
+                // COPY-DB branch can borrow `&mut s.databases` (both src and
+                // dst) for the same command.
+                s.databases[db_idx].refresh_now_from_cache(cached_clock);
                 // ONE backpressure budget for the whole batch: under sustained
                 // AOF backpressure the shard thread stalls at most BOUND total,
                 // not BOUND × batch-len (review finding, PR #211).
@@ -990,6 +976,65 @@ pub(crate) fn handle_shard_message_shared(
                         }
                     };
 
+                    // Gap A: MOVE / COPY-DB two-db intercept, mirroring the
+                    // plain Execute arm — needs two &mut Database borrows at
+                    // once. Returns BEFORE the auto-index/wake hooks below
+                    // too, mirroring the Execute arm's pre-existing behavior
+                    // (not new for this fix — see the Gap A commit body).
+                    if cmd.eq_ignore_ascii_case(b"MOVE") || cmd.eq_ignore_ascii_case(b"COPY") {
+                        if let Some(response) = crate::shard::spsc_two_db::try_two_db_intercept(
+                            cmd,
+                            args,
+                            &mut s.databases,
+                            db_idx,
+                            db_count,
+                            cached_clock,
+                            evict_active,
+                            shard_databases,
+                            shard_id,
+                            runtime_config,
+                            spill_sender,
+                            spill_file_id,
+                            disk_offload_dir,
+                        ) {
+                            let mut aof_ok = true;
+                            if matches!(response, crate::protocol::Frame::Integer(1))
+                                && wal_fanout_has_work(
+                                    wal_writer,
+                                    wal_v3_writer,
+                                    replica_txs,
+                                    aof_pool,
+                                    wal_kv_log,
+                                )
+                            {
+                                let serialized = aof::serialize_command(cmd_frame);
+                                aof_ok = wal_append_and_fanout(
+                                    &serialized,
+                                    wal_writer,
+                                    wal_v3_writer,
+                                    repl_backlog,
+                                    replica_txs,
+                                    repl_state,
+                                    shard_id,
+                                    aof_pool, // FIX-C4-FOLD
+                                    wal_kv_log,
+                                    &mut aof_budget,
+                                );
+                            }
+                            results.push(if aof_ok {
+                                response
+                            } else {
+                                crate::protocol::Frame::Error(bytes::Bytes::from_static(
+                                    AOF_APPEND_LOST_ERR,
+                                ))
+                            });
+                            continue;
+                        }
+                        // COPY with no DB clause or same-db: fall through to
+                        // the generic single-db write path below.
+                    }
+
+                    let guard = &mut s.databases[db_idx];
                     let is_write = metadata::is_write(cmd);
                     if is_write {
                         // M2 fix: same gate as the Execute arm, applied per
@@ -1164,6 +1209,56 @@ pub(crate) fn handle_shard_message_shared(
                 }
             };
 
+            // Gap A: MOVE / COPY-DB two-db intercept, mirroring the plain
+            // Execute arm — needs two &mut Database borrows at once.
+            if cmd.eq_ignore_ascii_case(b"MOVE") || cmd.eq_ignore_ascii_case(b"COPY") {
+                let intercepted = crate::shard::slice::with_shard(|s| {
+                    crate::shard::spsc_two_db::try_two_db_intercept(
+                        cmd,
+                        args,
+                        &mut s.databases,
+                        db_idx,
+                        db_count,
+                        cached_clock,
+                        evict_active,
+                        shard_databases,
+                        shard_id,
+                        runtime_config,
+                        spill_sender,
+                        spill_file_id,
+                        disk_offload_dir,
+                    )
+                });
+                if let Some(mut response) = intercepted {
+                    if matches!(response, crate::protocol::Frame::Integer(1)) {
+                        let serialized = aof::serialize_command(&command);
+                        let mut aof_budget = crate::persistence::aof::AOF_SPSC_BACKPRESSURE_BOUND;
+                        if !wal_append_and_fanout(
+                            &serialized,
+                            wal_writer,
+                            wal_v3_writer,
+                            repl_backlog,
+                            replica_txs,
+                            repl_state,
+                            shard_id,
+                            aof_pool, // FIX-W1-2
+                            wal_kv_log,
+                            &mut aof_budget,
+                        ) {
+                            response = crate::protocol::Frame::Error(bytes::Bytes::from_static(
+                                AOF_APPEND_LOST_ERR,
+                            ));
+                        }
+                    }
+                    // Arc-owned slot: deref is safe, refcount keeps it alive.
+                    let slot = &*response_slot.0;
+                    slot.fill(vec![response]);
+                    return;
+                }
+                // COPY with no DB clause or same-db: fall through to the
+                // generic single-db write path below.
+            }
+
             {
                 let is_write = metadata::is_write(cmd);
                 // M2 fix: see the Execute arm for rationale/ordering.
@@ -1284,8 +1379,8 @@ pub(crate) fn handle_shard_message_shared(
             let mut results = Vec::with_capacity(commands.len());
             let db_count = shard_databases.db_count();
             let db_idx = db_index.min(db_count.saturating_sub(1));
-            crate::shard::slice::with_shard_db(db_idx, |guard| {
-                guard.refresh_now_from_cache(cached_clock);
+            crate::shard::slice::with_shard(|s| {
+                s.databases[db_idx].refresh_now_from_cache(cached_clock);
                 // ONE backpressure budget for the whole batch: under sustained
                 // AOF backpressure the shard thread stalls at most BOUND total,
                 // not BOUND × batch-len (review finding, PR #211).
@@ -1301,6 +1396,64 @@ pub(crate) fn handle_shard_message_shared(
                         }
                     };
 
+                    // Gap A: MOVE / COPY-DB two-db intercept, mirroring the
+                    // plain Execute arm — needs two &mut Database borrows at
+                    // once, so it must run before `guard` narrows to a single
+                    // db below.
+                    if cmd.eq_ignore_ascii_case(b"MOVE") || cmd.eq_ignore_ascii_case(b"COPY") {
+                        if let Some(response) = crate::shard::spsc_two_db::try_two_db_intercept(
+                            cmd,
+                            args,
+                            &mut s.databases,
+                            db_idx,
+                            db_count,
+                            cached_clock,
+                            evict_active,
+                            shard_databases,
+                            shard_id,
+                            runtime_config,
+                            spill_sender,
+                            spill_file_id,
+                            disk_offload_dir,
+                        ) {
+                            let mut aof_ok = true;
+                            if matches!(response, crate::protocol::Frame::Integer(1))
+                                && wal_fanout_has_work(
+                                    wal_writer,
+                                    wal_v3_writer,
+                                    replica_txs,
+                                    aof_pool,
+                                    wal_kv_log,
+                                )
+                            {
+                                let serialized = aof::serialize_command(cmd_frame);
+                                aof_ok = wal_append_and_fanout(
+                                    &serialized,
+                                    wal_writer,
+                                    wal_v3_writer,
+                                    repl_backlog,
+                                    replica_txs,
+                                    repl_state,
+                                    shard_id,
+                                    aof_pool, // FIX-W1-2
+                                    wal_kv_log,
+                                    &mut aof_budget,
+                                );
+                            }
+                            results.push(if aof_ok {
+                                response
+                            } else {
+                                crate::protocol::Frame::Error(bytes::Bytes::from_static(
+                                    AOF_APPEND_LOST_ERR,
+                                ))
+                            });
+                            continue;
+                        }
+                        // COPY with no DB clause or same-db: fall through to
+                        // the generic single-db write path below.
+                    }
+
+                    let guard = &mut s.databases[db_idx];
                     let is_write = metadata::is_write(cmd);
                     if is_write {
                         // M2 fix: same gate as the Execute arm, applied per
@@ -1415,8 +1568,11 @@ pub(crate) fn handle_shard_message_shared(
             let db_idx = db_index.min(db_count.saturating_sub(1));
             // write_db and text_store (HSET auto-index) in one with_shard closure.
             crate::shard::slice::with_shard(|s| {
-                let guard = &mut s.databases[db_idx];
-                guard.refresh_now_from_cache(cached_clock);
+                // One-time refresh via a scoped temporary borrow — `guard`
+                // itself moves INSIDE the loop below (Gap A) so the MOVE/
+                // COPY-DB branch can borrow `&mut s.databases` (both src and
+                // dst) for the same command.
+                s.databases[db_idx].refresh_now_from_cache(cached_clock);
                 // ONE backpressure budget for the whole batch: under sustained
                 // AOF backpressure the shard thread stalls at most BOUND total,
                 // not BOUND × batch-len (review finding, PR #211).
@@ -1432,6 +1588,65 @@ pub(crate) fn handle_shard_message_shared(
                         }
                     };
 
+                    // Gap A: MOVE / COPY-DB two-db intercept, mirroring the
+                    // plain Execute arm — needs two &mut Database borrows at
+                    // once. Returns BEFORE the auto-index/wake hooks below
+                    // too, mirroring the Execute arm's pre-existing behavior
+                    // (not new for this fix — see the Gap A commit body).
+                    if cmd.eq_ignore_ascii_case(b"MOVE") || cmd.eq_ignore_ascii_case(b"COPY") {
+                        if let Some(response) = crate::shard::spsc_two_db::try_two_db_intercept(
+                            cmd,
+                            args,
+                            &mut s.databases,
+                            db_idx,
+                            db_count,
+                            cached_clock,
+                            evict_active,
+                            shard_databases,
+                            shard_id,
+                            runtime_config,
+                            spill_sender,
+                            spill_file_id,
+                            disk_offload_dir,
+                        ) {
+                            let mut aof_ok = true;
+                            if matches!(response, crate::protocol::Frame::Integer(1))
+                                && wal_fanout_has_work(
+                                    wal_writer,
+                                    wal_v3_writer,
+                                    replica_txs,
+                                    aof_pool,
+                                    wal_kv_log,
+                                )
+                            {
+                                let serialized = aof::serialize_command(cmd_frame);
+                                aof_ok = wal_append_and_fanout(
+                                    &serialized,
+                                    wal_writer,
+                                    wal_v3_writer,
+                                    repl_backlog,
+                                    replica_txs,
+                                    repl_state,
+                                    shard_id,
+                                    aof_pool, // FIX-C4-FOLD
+                                    wal_kv_log,
+                                    &mut aof_budget,
+                                );
+                            }
+                            results.push(if aof_ok {
+                                response
+                            } else {
+                                crate::protocol::Frame::Error(bytes::Bytes::from_static(
+                                    AOF_APPEND_LOST_ERR,
+                                ))
+                            });
+                            continue;
+                        }
+                        // COPY with no DB clause or same-db: fall through to
+                        // the generic single-db write path below.
+                    }
+
+                    let guard = &mut s.databases[db_idx];
                     let is_write = metadata::is_write(cmd);
                     if is_write {
                         // M2 fix: same gate as the Execute arm, applied per

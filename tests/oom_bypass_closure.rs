@@ -469,27 +469,33 @@ fn test_case_d_readonly_eval_not_blocked_at_oom() {
 }
 
 // ---------------------------------------------------------------------------
-// Case E: cross-db `COPY ... DB n` under memory pressure. `COPY` carries the
-// generic `W` (write) flag (src/command/metadata.rs), so on the cross-shard
-// dispatch arms handler_monoio actually uses for remote writes
-// (`ExecuteSlotted`/`PipelineBatchSlotted`) it hits the SAME generic
-// `is_write` eviction gate cases B/C already exercise — there is no
-// COPY-specific bypass on that path. This case is a targeted regression
-// check that COPY specifically (not just SET) drives that gate to a real
-// OOM under cross-shard load, and locks in the dest-db gate committed in
-// spsc_handler.rs's plain `Execute` arm (used by the single-key remote
-// dispatch path) as a defensive duplicate.
+// Case E: cross-db `COPY ... DB n` under memory pressure. This locks in the
+// destination-db eviction gate in `src/shard/spsc_two_db.rs`'s
+// `try_two_db_intercept` (Gap A), which every `ShardMessage` SPSC arm now
+// calls (previously only the plain `Execute` arm had a two-db intercept at
+// all; the other arms — including `PipelineBatchSlotted`, the one real
+// client traffic uses — silently ignored the `DB` clause and performed a
+// same-db copy, a data-correctness bug, not an eviction one; see the CHANGELOG
+// and the Gap A commit body). Moon's eviction gate is per-DATABASE (whichever
+// db a write targets — `db.estimated_memory()` alone, not a shard-wide
+// aggregate across all 16 dbs; see `try_evict_if_needed_budget`'s doc
+// comment), consistently across every write path including this one — so
+// db 1 (the COPY destination) needs its OWN pre-existing memory pressure to
+// demonstrate the gate; ballast keys below give it that.
 //
-// NOTE — separate, pre-existing, out-of-scope bug found while writing this
-// case: cross-shard remote dispatch of `COPY ... DB n` silently ignores the
-// DB clause and performs a same-db copy instead (the MOVE/COPY two-database
-// intercept in spsc_handler.rs only exists in the plain `Execute` arm, not
-// `ExecuteSlotted`/`PipelineBatchSlotted`, so remote COPY falls through to
-// the generic single-db `key_extra::copy`). This is a data-correctness bug,
-// independent of eviction — confirmed via manual probe (4/20 remote COPYs
-// landed in the wrong db). Distinct dst keys below deliberately still land
-// in db 0 for the ~3/4 of keys dispatched remotely; this case asserts only
-// on the OOM behavior, not on which db the copy actually landed in.
+// Revision note: this case originally pre-loaded ONLY db 0, then asserted
+// OOM on cross-db COPYs. That passed only because of the (now-fixed) Gap A
+// bug: pre-fix, COPY's `DB 1` clause was silently ignored and the copy
+// landed in db 0 (already loaded from phase 1), so the single-db gate
+// tripped as a side effect of the routing bug, not because the destination
+// db was actually under pressure. Post-fix, COPY correctly writes into db 1,
+// which started empty, so the exact same setup produced 0/300 OOM — a
+// regression alarm that traced back to a stale test premise, not a
+// production bug (confirmed: temporarily stashing only the `if evict_active
+// { spsc_eviction_gate(dst, ...) }` block inside `try_two_db_intercept`,
+// while keeping the destination-db routing fix, reproduces RED here — see
+// the Gap A commit body). Phase 1b below gives db 1 the same starting
+// footprint as db 0 so the destination-db gate has something to trip on.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -526,6 +532,34 @@ fn test_case_e_cross_db_copy_oom() {
          — the phase-1 sizing assumption is wrong, adjust before trusting phase 2"
     );
 
+    // Phase 1b: ballast — SET the SAME N keys (same names, so they hash to
+    // the SAME shards as their phase-1 counterparts) into db 1 too, so the
+    // COPY destination starts with the same per-shard memory footprint as
+    // the source db. Required because Moon's eviction gate is per-DATABASE
+    // (see the module doc above) — without this, phase 2's copies land in a
+    // near-empty db 1 and never cross budget, regardless of whether the
+    // destination-db gate is wired correctly.
+    assert_eq!(
+        c.cmd(&[b"SELECT", b"1"]),
+        V::Simple("OK".into()),
+        "SELECT 1 (ballast) failed"
+    );
+    let ballast_replies = c.pipeline(&set_cmds);
+    let ballast_ok = ballast_replies
+        .iter()
+        .filter(|r| matches!(r, V::Simple(s) if s == "OK"))
+        .count();
+    assert_eq!(
+        ballast_ok, N,
+        "ballast: not all {N} db-1 SETs succeeded under budget (got {ballast_ok} OK) \
+         — the phase-1b sizing assumption is wrong, adjust before trusting phase 2"
+    );
+    assert_eq!(
+        c.cmd(&[b"SELECT", b"0"]),
+        V::Simple("OK".into()),
+        "SELECT 0 (back for phase 2) failed"
+    );
+
     // Phase 2: COPY each key to a DISTINCT dst key (src != dst — required,
     // Redis rejects same-key COPY regardless of db) — doubles the value's
     // footprint, pushing per-shard usage past the cap.
@@ -547,9 +581,10 @@ fn test_case_e_cross_db_copy_oom() {
     let other_count = N - oom_count - ok_count;
 
     // Threshold picked from observed data, same methodology as case B:
-    // pre-fix (git-stashed) run = 0/300 OOM; post-fix = 104/300. N/10 (30)
-    // sits safely above the RED floor and safely below the GREEN observed
-    // count, robust to elastic-budget (GAP-1) variance across CI machines.
+    // gate-block-disabled (routing intact, see the Gap A commit body) run =
+    // 0/300 OOM; fully fixed = 76/300. N/10 (30) sits safely above the RED
+    // floor and safely below the GREEN observed count, robust to
+    // elastic-budget (GAP-1) variance across CI machines.
     assert!(
         oom_count >= N / 10,
         "cross-shard COPY bypass: expected a substantial share of {N} COPYs \
