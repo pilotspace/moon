@@ -499,8 +499,10 @@ pub async fn aof_writer_task(
         #[cfg(feature = "runtime-tokio")]
         {
             // Bounded recv (EverySec durability): wake at least every
-            // `idle_wait.current()` (starts at 200ms, escalates to 1s while
-            // truly idle — see `IdleWait` docs) even when idle so the flush
+            // `idle_wait.current()` (50ms floor, escalates to 1s while
+            // truly idle — see `IdleWait` docs; tighter than the old fixed
+            // 200ms right after activity, far looser once idle) even when
+            // idle so the flush
             // deadline check after this select! is honored within its 1s
             // bound. A long-lived `interval.tick()` select arm is
             // fairness-starvable under sustained writes and unreliable when idle
@@ -894,7 +896,7 @@ pub async fn per_shard_aof_writer_task(
         let mut idle_wait = IdleWait::new();
         // (No `interval` here: the EverySec flush deadline is enforced by the
         // timeout-bounded recv in the loop below, which wakes at least every
-        // `idle_wait.current()` (starts at 200ms, escalates while idle)
+        // `idle_wait.current()` (50ms floor, escalates to 1s while idle)
         // regardless of message traffic. A long-lived `interval.tick()`
         // select arm is fairness-starvable under sustained writes and proved
         // unreliable when idle on this dedicated current-thread writer runtime.)
@@ -926,7 +928,7 @@ pub async fn per_shard_aof_writer_task(
         loop {
             tokio::select! {
                 // Bounded recv (EverySec durability): wake at least every
-                // `idle_wait.current()` (starts at 200ms, escalates while
+                // `idle_wait.current()` (50ms floor, escalates to 1s while
                 // idle — see `IdleWait`) even when idle so the flush deadline
                 // after this select! is honored within its 1s bound. flume's
                 // recv future is drop-safe on the Elapsed branch (no message

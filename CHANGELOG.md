@@ -96,14 +96,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   incidental idle waste — escalating it would widen that bound. No code
   change; a real fix would be event-driven WAL triggering, an
   architectural change out of scope here.
-- **Item C8 — sigterm test readiness deadline widened to tolerate host
-  load** (`tests/sigterm_shutdown.rs`): both `wait_for_ready` call sites
-  hardcoded an independent fixed 15s deadline; PR #218 documented "server
-  did not become ready within 15s" as a host-load flake, not a real
-  regression (the poll loop is already load-tolerant — 100ms re-poll, no
-  fixed pre-sleep). Introduced a shared `READY_TIMEOUT` constant (60s),
-  replacing both literals; panic messages interpolate it so they can't
-  drift out of sync again. Healthy-server pass time is unaffected.
+- Item C8 (sigterm readiness deadline) landed early via the Windows-CI PR
+  (#229) — see the CI section below.
 
 ### CI — fix Windows main-push test failures (PR #TBD)
 

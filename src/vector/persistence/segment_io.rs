@@ -922,6 +922,24 @@ mod tests {
                 b.distance
             );
         }
+
+        // Memory accounting must reflect the mmap win: the mapped sidecar is
+        // kernel page cache, not pinned heap, so the reloaded segment must
+        // report at least the sidecar's bytes less than the heap-owned
+        // original (other components may also differ slightly across a
+        // reload; the exact Owned-vs-Mapped byte accounting is pinned by
+        // raw_f16_store's own unit tests). Counting mapped pages as resident
+        // would feed the elastic memory budget / eviction pipeline numbers
+        // as if the RSS win never happened.
+        let sidecar_bytes = n * dim * std::mem::size_of::<u16>();
+        assert!(
+            segment.resident_bytes() >= restored.resident_bytes() + sidecar_bytes,
+            "mapped sidecar must not count toward resident_bytes \
+             (owned={} mapped={} sidecar={})",
+            segment.resident_bytes(),
+            restored.resident_bytes(),
+            sidecar_bytes
+        );
     }
 
     #[test]

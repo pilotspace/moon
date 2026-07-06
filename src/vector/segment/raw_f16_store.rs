@@ -101,6 +101,18 @@ impl RawF16Store {
         matches!(self, Self::Mapped { .. })
     }
 
+    /// Heap bytes this store pins: the full buffer when `Owned`, `0` when
+    /// `Mapped` — mapped pages are kernel page cache, reclaimable under
+    /// memory pressure, so counting them as resident would make the elastic
+    /// memory budget / eviction pipeline behave as if the mmap RSS win never
+    /// happened for reloaded segments.
+    pub fn resident_bytes(&self) -> usize {
+        match self {
+            Self::Owned(v) => v.len() * std::mem::size_of::<u16>(),
+            Self::Mapped { .. } => 0,
+        }
+    }
+
     /// Zero-copy view of the sidecar as `&[u16]`.
     pub fn as_slice(&self) -> &[u16] {
         match self {
@@ -186,5 +198,27 @@ mod tests {
         let store = RawF16Store::Owned(vec![7, 8, 9]);
         assert!(!store.is_mapped());
         assert_eq!(store.as_slice(), &[7u16, 8, 9]);
+    }
+
+    /// Resident accounting: an Owned store pins its full buffer on the heap;
+    /// a Mapped store pins nothing (kernel page cache, reclaimable) — the
+    /// elastic memory budget / eviction pipeline must see the mmap RSS win,
+    /// not pretend the bytes are still resident.
+    #[test]
+    fn resident_bytes_owned_full_mapped_zero() {
+        let owned = RawF16Store::Owned(vec![0u16; 100]);
+        assert_eq!(owned.resident_bytes(), 200);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("raw_f16.bin");
+        let halves: Vec<u16> = (0..100u16).collect();
+        write_halves(&path, &halves);
+        let mapped = RawF16Store::map_file(&path, halves.len()).unwrap().unwrap();
+        assert!(mapped.is_mapped());
+        assert_eq!(
+            mapped.resident_bytes(),
+            0,
+            "mapped sidecar pages are page cache, not pinned heap"
+        );
     }
 }

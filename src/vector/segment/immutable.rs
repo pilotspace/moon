@@ -890,10 +890,9 @@ impl ImmutableSegment {
         let norms = self.residual_norms.len() * std::mem::size_of::<f32>();
         let sub = self.sub_centroid_signs.len();
         let mvcc = self.mvcc.len() * std::mem::size_of::<MvccHeader>();
-        let sidecar = self
-            .raw_f16
-            .as_ref()
-            .map_or(0, |v| v.len() * std::mem::size_of::<u16>());
+        // Mapped sidecars report 0: their pages are kernel page cache, not
+        // pinned heap — see RawF16Store::resident_bytes.
+        let sidecar = self.raw_f16.as_ref().map_or(0, RawF16Store::resident_bytes);
         graph + tq + qjl + norms + sub + mvcc + sidecar
     }
 
