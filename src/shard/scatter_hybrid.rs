@@ -640,7 +640,7 @@ mod tests {
             .doc_id_to_key
             .insert(2, Bytes::from_static(b"doc:second"));
 
-        let mut vec_map = std::collections::HashMap::new();
+        let mut vec_map = crate::vector::keymap::BucketedKeyMap::new();
         vec_map.insert(300u64, Bytes::from_static(b"doc:dense-only"));
         vec_map.insert(400u64, Bytes::from_static(b"doc:sparse-only"));
 

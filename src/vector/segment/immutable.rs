@@ -810,6 +810,20 @@ impl ImmutableSegment {
         })
     }
 
+    /// Iterate the `key_hash`es of all live entries — both install-time
+    /// (`delete_lsn`) and steady-state (`tombstoned_keys`) tombstones are
+    /// respected, mirroring [`Self::is_live_bfs`]. B3 recovery uses this to
+    /// gate the dedup rescan on actual segment membership: a durable keymap
+    /// entry whose doc is in NO loaded segment must be re-indexed from the
+    /// AOF, never "verified unchanged" (its keymap checksum still matching
+    /// is exactly the crash-window signature — the key was mutable-resident
+    /// when that keymap snapshot committed).
+    pub fn live_key_hashes(&self) -> impl Iterator<Item = u64> + '_ {
+        (0..self.mvcc.len() as u32)
+            .filter(|&pos| self.is_live_bfs(pos))
+            .map(|pos| self.mvcc[pos as usize].key_hash)
+    }
+
     /// Map a BFS-reordered position to the globally unique key_hash.
     /// Used for building search results that are comparable across segments.
     #[inline]

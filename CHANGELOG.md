@@ -46,6 +46,78 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   trade-off as the diskfull guard: `DEL`/`UNLINK`/`EXPIRE`/`FLUSHALL` are
   write-flagged and blocked too while paused — no allowlist.
 
+### Fixed — vector keymap CoW amplification + bounded snapshot queue (PR #TBD)
+
+- `VectorIndex`'s three `key_hash -> V` maps (`key_hash_to_key`, `key_hash_to_global_id`,
+  `key_hash_to_vec_checksum`) were each a single `Arc<HashMap<u64, V>>`. Under
+  `ft-search-off-eventloop`, a live FT.SEARCH snapshot holds an extra `Arc` clone of the whole
+  map while the event loop keeps processing writes; the next write's `Arc::make_mut` then sees
+  refcount > 1 and full-clones the entire map synchronously on the shard event loop (~47MB
+  @1M vectors). Replaced with `BucketedKeyMap<V>` (`src/vector/keymap.rs`): 256 fixed buckets,
+  each independently `Arc<HashMap<u64, V>>`, bucket selected by `(key_hash >> 56)`. A concurrent
+  snapshot now pins at most 1/256th of the map per write instead of the whole thing. Same
+  treatment applied to `SnapshotJob`'s mirrored fields and `SearchSnapshot.key_hash_to_key`.
+  On-disk `keymap.bin` format is unchanged (read-compatible).
+- `SnapshotPool` (`src/vector/persistence/manifest.rs`) used an unbounded `flume` queue with a
+  single worker; if compact/merge cadence outpaced the worker, queued jobs pinned every
+  submitter's `Arc`s indefinitely. Replaced with a coalescing slot keyed by index directory: a
+  new submit for an index with a job still pending (not yet dequeued) replaces it in place,
+  dropping the stale job's `Arc`s immediately; an in-flight (already-dequeued) job is unaffected.
+  Submit never blocks the caller.
+
+### Fixed — CI: de-flake OOM case E + Windows test-compile gate (PR #TBD)
+
+- **`test_case_e_cross_db_copy_oom` (was red on main's post-merge CI for PR #217/#218/#219,
+  0/300 OOM on both platforms while passing locally):** the single-shot statistical assert sat
+  inside the slack GAP-1's elastic budget + its 100ms-stale usage snapshots can grant. Rewritten
+  as bounded escalation: up to 8 rounds of COPYs into fresh destination keys until the
+  destination db's per-shard usage (~2.4MB) provably exceeds the ABSOLUTE budget ceiling
+  (`compute_elastic_budget ≤ maxmemory` = 2MB) — timing-independent on any runner speed, and the
+  RED floor stays exact (gate stashed = 0 OOM through all rounds; re-verified red/green).
+- **`tests/quickwins_red_api.rs` broke the Windows CI leg at COMPILE time** (also red on main):
+  `qw1_accepted_socket_has_nodelay` calls `apply_client_socket_opts`, which is `#[cfg(unix)]`
+  (takes `AsFd`). The test (and its imports) are now unix-gated to match.
+- **`write_stall_segment_backlog`: two tests raced on the process-global
+  `RECL_SEGMENT_STALL_ACTIVE` atomic** (test harness runs same-binary tests on parallel
+  threads; observed on CI macOS as `store(1)` reading back `0`). All mutation of the global now
+  lives in one merged test.
+
+### Fixed — FT.COMPACT left mutable residue behind when draining a background build (PR #TBD)
+
+- **Pre-existing** (`main`, not introduced by this branch): when an explicit
+  `FT.COMPACT`/`force_compact` found a background auto-compaction already in flight, it drained
+  that build, installed it, persisted, and returned — WITHOUT compacting the documents inserted
+  while the background build was running (the `clone_suffix(frozen_len)` mutable tail). Those
+  docs stayed mutable-only (no durable segment) until some future compact fired, breaking
+  force_compact's documented full-drain contract (frozen == mutable on reply) and — combined
+  with the B3 phantom-keymap hole below — silently losing them on a kill -9 (observed stuck
+  durable state: segments live=1961, keymap=2000, converging never). Load-dependent: only
+  reproduces when insert cadence keeps a background build in flight at FT.COMPACT time (this is
+  what made the crash suite's S1/S2 flake by machine load, masquerading as a branch regression).
+  `force_compact` now falls through to the inline drain loop after installing the in-flight
+  build (a no-op when the tail is empty).
+
+### Fixed — B3 vector recovery: phantom keymap entries silently dropped docs (PR #TBD)
+
+- **Pre-existing silent data loss on kill -9** (found while validating this branch against the
+  `crash_recovery_vector_durability` suite; reproduces on `main`): the durable
+  `keymap-<epoch>.bin` covers EVERY indexed key (mutable + immutable) at snapshot-submit time,
+  while the paired `manifest.json` lists only installed immutable segments. A crash landing after
+  one snapshot commits but before the next (covering a just-frozen segment) leaves the on-disk
+  keymap a strict superset of the on-disk segments. The B3 dedup rescan then "verified" those
+  uncovered keys as unchanged (keymap checksum matches the AOF blob — exactly the crash-window
+  signature) and never re-indexed them: their documents vanished from search with
+  `num_docs` under-reporting (observed: 1950/2000) while recovery logged
+  `verified unchanged` for all keys. Fix: `recover_v2::load_segments_and_keymap` now drops any
+  keymap entry whose `key_hash` is not LIVE in a loaded segment
+  (`ImmutableSegment::live_key_hashes`), so the rescan re-indexes those keys from the AOF; a
+  loud log line reports the dropped-phantom count. New deterministic unit regression
+  (`recover_reindexes_keymap_entries_not_backed_by_any_segment`, red/green verified) plus
+  integration scenario S6 (kill inside the async-snapshot window; asserts only the crash
+  contract: `num_docs == N`, every key answers its own exact-match query). S1/S2's
+  `re_indexed == 0` fast-path determinism is restored by a new full-durability pre-kill gate
+  (`wait_for_durable_docs`: manifest'd segment live-counts AND keymap entries both equal N).
+
 ### Fixed — zombie/CPU hardening wave 1 (PR #TBD)
 
 - **Busy-poll spin idle-disengages** (`--io-busy-poll-us` / vendored monoio

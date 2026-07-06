@@ -12,6 +12,7 @@ use smallvec::SmallVec;
 use std::collections::HashMap;
 
 use crate::storage::db::Database;
+use crate::vector::keymap::BucketedKeyMap;
 use crate::vector::types::SearchResult;
 
 /// Filter search results, removing any whose Redis key already exists in the
@@ -26,7 +27,7 @@ use crate::vector::types::SearchResult;
 pub fn filter_session_results(
     results: &SmallVec<[SearchResult; 32]>,
     session_members: &HashMap<Bytes, f64>,
-    key_hash_to_key: &HashMap<u64, Bytes>,
+    key_hash_to_key: &BucketedKeyMap<Bytes>,
 ) -> SmallVec<[SearchResult; 32]> {
     if session_members.is_empty() {
         return results.clone();
@@ -59,7 +60,7 @@ pub fn record_session_results(
     results: &SmallVec<[SearchResult; 32]>,
     db: &mut Database,
     session_key: &[u8],
-    key_hash_to_key: &HashMap<u64, Bytes>,
+    key_hash_to_key: &BucketedKeyMap<Bytes>,
     timestamp: f64,
 ) {
     if results.is_empty() {

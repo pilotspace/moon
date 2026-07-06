@@ -12,6 +12,7 @@ use bytes::Bytes;
 use crate::storage::tiered::SegmentHandle;
 use crate::vector::filter::PayloadIndex;
 use crate::vector::hnsw::search::SearchScratch;
+use crate::vector::keymap::BucketedKeyMap;
 use crate::vector::mvcc::manager::TransactionManager;
 use crate::vector::segment::compaction;
 use crate::vector::segment::{SegmentHolder, SegmentList};
@@ -191,22 +192,24 @@ pub struct VectorIndex {
     /// `vec:<internal_id>` form. Survives compaction and segment merging because
     /// it's keyed by the stable `key_hash`, not the volatile internal ID.
     ///
-    /// `Arc`-wrapped so search snapshots capture it in O(1) (QP-1: the previous
-    /// owned `HashMap` was deep-cloned per query — one entry per indexed vector).
-    /// Writers mutate via [`Arc::make_mut`]: copy-on-write triggers only when a
-    /// snapshot is concurrently alive, at most once per snapshot lifetime.
-    pub key_hash_to_key: Arc<std::collections::HashMap<u64, Bytes>>,
+    /// Bucketed CoW (RSS/CPU wave 4, defect 1): 256 independent
+    /// `Arc<HashMap>` shards keyed by the top bits of `key_hash`, so search
+    /// snapshots still capture the whole map in O(1) (QP-1) but a concurrent
+    /// writer's `Arc::make_mut` only clones the ONE bucket its key hashes
+    /// into — not the entire multi-MB map — even while a search snapshot is
+    /// alive. See `crate::vector::keymap` module docs.
+    pub key_hash_to_key: BucketedKeyMap<Bytes>,
     /// Maps `key_hash` → `global_id` for metadata-only updates.
     ///
     /// When `HSET doc:1 category "science"` is called without a vector blob,
     /// the auto-indexer looks up the existing `global_id` here to update the
     /// PayloadIndex for that vector without re-inserting it.
     ///
-    /// `Arc`-wrapped for the same reason as `key_hash_to_key` (QP-1 O(1)
-    /// snapshot capture) — the durability write path (B2) clones this Arc
-    /// into background keymap-snapshot jobs without an O(n) copy on the
-    /// shard thread.
-    pub key_hash_to_global_id: Arc<std::collections::HashMap<u64, u32>>,
+    /// Bucketed CoW for the same reason as `key_hash_to_key` (QP-1 O(1)
+    /// snapshot capture, bucket-scoped write clone) — the durability write
+    /// path (B2) clones this into background keymap-snapshot jobs without an
+    /// O(n) copy on the shard thread.
+    pub key_hash_to_global_id: BucketedKeyMap<u32>,
     /// Maps `key_hash` → `xxh64(vector-field bytes, seed 0)` (B2, durability).
     ///
     /// Computed where the raw HSET vector blob is in hand
@@ -216,7 +219,7 @@ pub struct VectorIndex {
     /// rescan can tell "unchanged" keys (checksum matches → metadata-only
     /// rebuild) from "changed" keys (re-encode) without hashing every value
     /// twice across a restart.
-    pub key_hash_to_vec_checksum: Arc<std::collections::HashMap<u64, u64>>,
+    pub key_hash_to_vec_checksum: BucketedKeyMap<u64>,
     /// Shard-relative directory this index persists segments/manifest/keymap
     /// under, i.e. `<vector_persist_dir>/idx-<hex(xxh64(name))>/` (B2).
     /// `None` when the store has no `persist_dir` configured (disk-offload
@@ -460,22 +463,17 @@ impl VectorIndex {
                 // submit time, if configured) — commit the keymap/manifest
                 // snapshot now that install is durable in memory.
                 self.persist_hook_after_install();
-                // After draining we're done — the data is compacted.
-                // Compact additional fields inline (no in-flight for those).
-                for (_, fs) in &mut self.field_segments {
-                    let dim = fs.collection.dimension;
-                    let mut unused_id = 0u64;
-                    Self::compact_segments(
-                        &mut fs.segments,
-                        &mut fs.scratch,
-                        &fs.collection,
-                        dim,
-                        0,
-                        None,
-                        &mut unused_id,
-                    );
-                }
-                return;
+                // Do NOT return here: inserts that landed WHILE the
+                // background build was in flight are still in the mutable
+                // tail (`clone_suffix(frozen_len)` above). An early return
+                // breaks force_compact's full-drain contract (FT.COMPACT:
+                // frozen == mutable on reply) and leaves those docs with no
+                // durable segment until some future compact fires — a kill
+                // -9 in that window relied on them being "verified
+                // unchanged" from a keymap that covers them while no
+                // segment does (the B3 phantom-entry hole). Fall through to
+                // the inline compact below, which is a no-op when the tail
+                // is empty and otherwise drains + persists it.
             }
             // Worker failed or dropped — fall through to inline compact below.
         }
@@ -1572,9 +1570,9 @@ impl VectorStore {
                 scratch,
                 collection,
                 payload_index: PayloadIndex::new(),
-                key_hash_to_key: Arc::new(std::collections::HashMap::new()),
-                key_hash_to_global_id: Arc::new(std::collections::HashMap::new()),
-                key_hash_to_vec_checksum: Arc::new(std::collections::HashMap::new()),
+                key_hash_to_key: BucketedKeyMap::new(),
+                key_hash_to_global_id: BucketedKeyMap::new(),
+                key_hash_to_vec_checksum: BucketedKeyMap::new(),
                 persist_dir: self.persist_dir.clone(),
                 next_segment_id: floor_next_segment_id,
                 next_snapshot_seq: floor_next_snapshot_seq,
@@ -1700,9 +1698,9 @@ impl VectorStore {
                 scratch,
                 collection,
                 payload_index: PayloadIndex::new(),
-                key_hash_to_key: Arc::new(std::collections::HashMap::new()),
-                key_hash_to_global_id: Arc::new(std::collections::HashMap::new()),
-                key_hash_to_vec_checksum: Arc::new(std::collections::HashMap::new()),
+                key_hash_to_key: BucketedKeyMap::new(),
+                key_hash_to_global_id: BucketedKeyMap::new(),
+                key_hash_to_vec_checksum: BucketedKeyMap::new(),
                 persist_dir: self.persist_dir.clone(),
                 next_segment_id: manifest.next_segment_id,
                 next_snapshot_seq: manifest.keymap_epoch,
@@ -1916,12 +1914,12 @@ impl VectorStore {
         // they track LIVE keys, not historical inserts — without this
         // they grow monotonically under key churn (~1GB / 24M deletes).
         // A re-insert of the same key repopulates all three maps.
-        Arc::make_mut(&mut idx.key_hash_to_key).remove(&key_hash);
-        Arc::make_mut(&mut idx.key_hash_to_global_id).remove(&key_hash);
+        idx.key_hash_to_key.remove(&key_hash);
+        idx.key_hash_to_global_id.remove(&key_hash);
         // B2 (durability): keep the checksum map in lockstep so it never
         // drifts from key_hash_to_key (a stale entry would be a silent
         // false-"unchanged" in the B3 dedup rescan).
-        Arc::make_mut(&mut idx.key_hash_to_vec_checksum).remove(&key_hash);
+        idx.key_hash_to_vec_checksum.remove(&key_hash);
         true
     }
 
@@ -2292,7 +2290,7 @@ impl VectorStore {
             .load()
             .mutable
             .append(key_hash, vector, insert_lsn);
-        Arc::make_mut(&mut idx.key_hash_to_key).insert(key_hash, key);
+        idx.key_hash_to_key.insert(key_hash, key);
         Ok(())
     }
 
@@ -3357,6 +3355,68 @@ mod bg_compact_tests {
             snap.immutable.len(),
             5,
             "500 vectors at threshold 100 must yield 5 bounded segments (bg path)"
+        );
+    }
+
+    /// Regression (red/green verified): `force_compact` draining an IN-FLIGHT
+    /// background build must ALSO compact the docs inserted while that build
+    /// was running (the `clone_suffix(frozen_len)` mutable tail). The old
+    /// early return left the tail mutable-only — no durable segment — until
+    /// some future compact fired, breaking FT.COMPACT's full-drain contract
+    /// (frozen == mutable on reply) and, combined with the B3 phantom-keymap
+    /// hole, silently losing those docs on a kill -9 (see
+    /// `crash_recovery_vector_durability` S1/S6). Deterministic regardless of
+    /// worker speed: `bg_compact_inflight` stays `Some` until installed, and
+    /// force_compact's drain blocks on the reply channel.
+    #[test]
+    fn test_force_compact_drains_tail_inserted_during_inflight_bg_build() {
+        distance::init();
+        let dim = 16u32;
+        let compactor = BackgroundCompactor::new(1);
+        let mut store = VectorStore::new();
+        let mut meta = make_idx(dim);
+        meta.compact_threshold = 100;
+        store.create_index(meta).unwrap();
+
+        // 100 docs -> due-gated background build freezes all of them.
+        for i in 0..100u64 {
+            insert(
+                &mut store,
+                format!("doc:{i}").as_bytes(),
+                random_vec(dim as usize, i),
+            );
+        }
+        store.begin_background_compactions(&compactor);
+        {
+            let idx = store.indexes.get_mut(b"idx".as_ref()).unwrap();
+            assert!(
+                idx.bg_compact_inflight.is_some(),
+                "sanity: a background build must be in flight"
+            );
+        }
+
+        // Tail: 30 more docs land while the background build is in flight.
+        for i in 100..130u64 {
+            insert(
+                &mut store,
+                format!("doc:{i}").as_bytes(),
+                random_vec(dim as usize, i),
+            );
+        }
+
+        store.force_compact_index(b"idx").unwrap();
+
+        let idx = store.indexes.get_mut(b"idx".as_ref()).unwrap();
+        let snap = idx.segments.load_full();
+        assert_eq!(
+            snap.mutable.len(),
+            0,
+            "force_compact must drain the tail inserted during the in-flight background build"
+        );
+        let live: u32 = snap.immutable.iter().map(|s| s.live_count()).sum();
+        assert_eq!(
+            live, 130,
+            "all docs must be segment-resident after force_compact"
         );
     }
 

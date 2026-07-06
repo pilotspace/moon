@@ -1206,12 +1206,12 @@ fn test_parse_limit_zero() {
 
 #[test]
 fn test_build_search_response_paginated() {
+    use crate::vector::keymap::BucketedKeyMap;
     use crate::vector::types::{SearchResult, VectorId};
-    use std::collections::HashMap;
 
     // Create 10 fake results
     let mut results: SmallVec<[SearchResult; 32]> = SmallVec::new();
-    let mut key_map = HashMap::new();
+    let mut key_map: BucketedKeyMap<Bytes> = BucketedKeyMap::new();
     for i in 0u32..10 {
         results.push(SearchResult {
             id: VectorId(i),
@@ -1245,8 +1245,8 @@ fn test_build_search_response_paginated() {
 
 #[test]
 fn test_build_search_response_limit_zero_zero() {
+    use crate::vector::keymap::BucketedKeyMap;
     use crate::vector::types::{SearchResult, VectorId};
-    use std::collections::HashMap;
 
     let mut results: SmallVec<[SearchResult; 32]> = SmallVec::new();
     for i in 0u32..5 {
@@ -1256,7 +1256,7 @@ fn test_build_search_response_limit_zero_zero() {
             key_hash: 0,
         });
     }
-    let key_map = HashMap::new();
+    let key_map: BucketedKeyMap<Bytes> = BucketedKeyMap::new();
 
     // LIMIT 0 0 -> count only, no docs
     let response = build_search_response(&results, &key_map, 0, 0);
@@ -2101,6 +2101,7 @@ fn test_session_parse_session_clause_no_key() {
 
 #[test]
 fn test_session_filter_results_empty_session() {
+    use crate::vector::keymap::BucketedKeyMap;
     use crate::vector::types::{SearchResult, VectorId};
     use std::collections::HashMap;
 
@@ -2117,7 +2118,7 @@ fn test_session_filter_results_empty_session() {
         },
     ];
     let session_members: HashMap<Bytes, f64> = HashMap::new();
-    let mut key_hash_to_key = HashMap::new();
+    let mut key_hash_to_key: BucketedKeyMap<Bytes> = BucketedKeyMap::new();
     key_hash_to_key.insert(100u64, Bytes::from_static(b"doc:a"));
     key_hash_to_key.insert(200u64, Bytes::from_static(b"doc:b"));
 
@@ -2127,6 +2128,7 @@ fn test_session_filter_results_empty_session() {
 
 #[test]
 fn test_session_filter_results_removes_seen() {
+    use crate::vector::keymap::BucketedKeyMap;
     use crate::vector::types::{SearchResult, VectorId};
     use std::collections::HashMap;
 
@@ -2150,7 +2152,7 @@ fn test_session_filter_results_removes_seen() {
     let mut session_members: HashMap<Bytes, f64> = HashMap::new();
     session_members.insert(Bytes::from_static(b"doc:a"), 1000.0);
 
-    let mut key_hash_to_key = HashMap::new();
+    let mut key_hash_to_key: BucketedKeyMap<Bytes> = BucketedKeyMap::new();
     key_hash_to_key.insert(100u64, Bytes::from_static(b"doc:a"));
     key_hash_to_key.insert(200u64, Bytes::from_static(b"doc:b"));
     key_hash_to_key.insert(300u64, Bytes::from_static(b"doc:c"));
@@ -2163,8 +2165,8 @@ fn test_session_filter_results_removes_seen() {
 
 #[test]
 fn test_session_record_results() {
+    use crate::vector::keymap::BucketedKeyMap;
     use crate::vector::types::{SearchResult, VectorId};
-    use std::collections::HashMap;
 
     let mut db = crate::storage::db::Database::new();
     let results: SmallVec<[SearchResult; 32]> = smallvec::smallvec![
@@ -2179,7 +2181,7 @@ fn test_session_record_results() {
             key_hash: 200
         },
     ];
-    let mut key_hash_to_key = HashMap::new();
+    let mut key_hash_to_key: BucketedKeyMap<Bytes> = BucketedKeyMap::new();
     key_hash_to_key.insert(100u64, Bytes::from_static(b"doc:a"));
     key_hash_to_key.insert(200u64, Bytes::from_static(b"doc:b"));
 
@@ -2813,7 +2815,8 @@ fn insert_hybrid_doc(
     drop(snap);
 
     // Record key mapping
-    std::sync::Arc::make_mut(&mut idx.key_hash_to_key).insert(key_hash, Bytes::from(key.to_vec()));
+    idx.key_hash_to_key
+        .insert(key_hash, Bytes::from(key.to_vec()));
 
     // Insert sparse vector
     if let Some(ss) = idx.sparse_stores.get_mut(b"sparse_vec".as_ref()) {
@@ -3351,7 +3354,7 @@ fn test_recommend_basic_with_vectors() {
             quantize_f32_to_sq(v, &mut sq);
             snap.mutable.append(key_hash, v, i as u64);
             drop(snap);
-            std::sync::Arc::make_mut(&mut idx.key_hash_to_key)
+            idx.key_hash_to_key
                 .insert(key_hash, Bytes::from(key.to_vec()));
         }
     }
@@ -3521,8 +3524,8 @@ fn test_ft_dropindex_dd_deletes_docs() {
     if let Some(idx) = store.get_index_mut(b"ddtest") {
         let h1 = xxhash_rust::xxh64::xxh64(&key1, 0);
         let h2 = xxhash_rust::xxh64::xxh64(&key2, 0);
-        std::sync::Arc::make_mut(&mut idx.key_hash_to_key).insert(h1, key1.clone());
-        std::sync::Arc::make_mut(&mut idx.key_hash_to_key).insert(h2, key2.clone());
+        idx.key_hash_to_key.insert(h1, key1.clone());
+        idx.key_hash_to_key.insert(h2, key2.clone());
     }
 
     // Verify keys exist in database
@@ -3590,7 +3593,7 @@ fn test_ft_dropindex_preserves_docs() {
     // Register key in vector index
     if let Some(idx) = store.get_index_mut(b"preservetest") {
         let h1 = xxhash_rust::xxh64::xxh64(&key1, 0);
-        std::sync::Arc::make_mut(&mut idx.key_hash_to_key).insert(h1, key1.clone());
+        idx.key_hash_to_key.insert(h1, key1.clone());
     }
 
     // Drop index WITHOUT DD flag (using None for db since we don't need it)
@@ -3642,7 +3645,7 @@ fn test_ft_dropindex_dd_case_insensitive() {
         let key = Bytes::from_static(b"c1:doc");
         db.set(key.clone(), crate::storage::entry::Entry::new_hash());
         if let Some(idx) = store.get_index_mut(b"casetest1") {
-            std::sync::Arc::make_mut(&mut idx.key_hash_to_key)
+            idx.key_hash_to_key
                 .insert(xxhash_rust::xxh64::xxh64(&key, 0), key.clone());
         }
 
@@ -3692,7 +3695,7 @@ fn test_ft_dropindex_dd_case_insensitive() {
         let key = Bytes::from_static(b"c2:doc");
         db.set(key.clone(), crate::storage::entry::Entry::new_hash());
         if let Some(idx) = store.get_index_mut(b"casetest2") {
-            std::sync::Arc::make_mut(&mut idx.key_hash_to_key)
+            idx.key_hash_to_key
                 .insert(xxhash_rust::xxh64::xxh64(&key, 0), key.clone());
         }
 

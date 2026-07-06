@@ -46,6 +46,7 @@ use tracing::{info, warn};
 
 use crate::protocol::Frame;
 use crate::text::store::TextStore;
+use crate::vector::keymap::BucketedKeyMap;
 use crate::vector::persistence::manifest::{self, IndexManifest};
 use crate::vector::persistence::segment_io;
 use crate::vector::segment::SegmentList;
@@ -412,18 +413,49 @@ fn load_segments_and_keymap(
         }
     }
 
+    // Segment-membership gate: the durable keymap covers EVERY indexed key
+    // (mutable + immutable) at snapshot-submit time, so after a crash it can
+    // be a strict SUPERSET of the durable segments — any key that was still
+    // mutable-resident when the last snapshot committed (or whose freshly
+    // installed segment's snapshot job never ran before the kill) has a
+    // keymap entry with a perfectly matching checksum but NO doc in any
+    // loaded segment. Loading such a phantom entry would make the B3 dedup
+    // rescan "verify" the key as unchanged and silently drop its document.
+    // Only keys live in a successfully loaded segment may enter the
+    // recovered maps; everything else stays unknown → full re-index from
+    // the AOF rescan.
+    let mut segment_resident: HashSet<u64> = HashSet::new();
+    for seg in &immutable {
+        segment_resident.extend(seg.live_key_hashes());
+    }
+
     let entries =
         manifest::read_keymap_tolerant(idx_dir, manifest.keymap_epoch).unwrap_or_default();
-    let mut key_hash_to_key = std::collections::HashMap::with_capacity(entries.len());
-    let mut key_hash_to_global_id = std::collections::HashMap::with_capacity(entries.len());
-    let mut key_hash_to_vec_checksum = std::collections::HashMap::with_capacity(entries.len());
+    let mut key_hash_to_key = BucketedKeyMap::new();
+    let mut key_hash_to_global_id = BucketedKeyMap::new();
+    let mut key_hash_to_vec_checksum = BucketedKeyMap::new();
+    let mut phantom_entries = 0usize;
     for e in entries {
         if dropped_key_hashes.contains(&e.key_hash) {
+            continue;
+        }
+        if !segment_resident.contains(&e.key_hash) {
+            phantom_entries += 1;
             continue;
         }
         key_hash_to_key.insert(e.key_hash, e.key);
         key_hash_to_global_id.insert(e.key_hash, e.global_id);
         key_hash_to_vec_checksum.insert(e.key_hash, e.vec_checksum);
+    }
+    if phantom_entries > 0 {
+        info!(
+            "vector index {}: {} keymap entr{} not backed by any loaded segment \
+             (crash inside the async-snapshot window) — dropped; the rescan will \
+             re-index those keys from the AOF",
+            String::from_utf8_lossy(name),
+            phantom_entries,
+            if phantom_entries == 1 { "y" } else { "ies" }
+        );
     }
 
     let loaded_segments = immutable.len();
@@ -441,9 +473,9 @@ fn load_segments_and_keymap(
         warm: Vec::new(),
         cold: Vec::new(),
     });
-    idx.key_hash_to_key = Arc::new(key_hash_to_key);
-    idx.key_hash_to_global_id = Arc::new(key_hash_to_global_id);
-    idx.key_hash_to_vec_checksum = Arc::new(key_hash_to_vec_checksum);
+    idx.key_hash_to_key = key_hash_to_key;
+    idx.key_hash_to_global_id = key_hash_to_global_id;
+    idx.key_hash_to_vec_checksum = key_hash_to_vec_checksum;
 
     Some(IndexRecoveryCounters {
         loaded_segments,
@@ -795,6 +827,153 @@ mod tests {
             post_results.first().copied(),
             Some(expected_global_id),
             "post-recovery search must return the same top-1 global_id as the pre-persist baseline"
+        );
+    }
+
+    /// Deterministic regression test for the "phantom keymap entry"
+    /// silent-loss hole (found by `tests/crash_recovery_vector_durability.rs`
+    /// S1 flaking: post-crash `num_docs` 1950/2000 with `verified_unchanged
+    /// == 2000, re_indexed == 0`).
+    ///
+    /// The durable keymap covers EVERY indexed key (mutable + immutable) at
+    /// snapshot-submit time; a kill -9 landing before the NEXT snapshot
+    /// (covering a just-frozen segment) leaves on-disk keymap ⊃ on-disk
+    /// segments. This test stages that state directly: persist n docs
+    /// normally, then rewrite the durable keymap with one EXTRA entry whose
+    /// checksum matches its AOF blob but whose doc is in NO segment. The
+    /// dedup rescan must RE-INDEX that key (making it searchable), never
+    /// "verify" it unchanged (which drops the doc silently).
+    #[test]
+    fn recover_reindexes_keymap_entries_not_backed_by_any_segment() {
+        use crate::protocol::Frame;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dim = 8usize;
+
+        // ---- Build + persist n real docs (same flow as the round-trip test) ----
+        let mut store = VectorStore::new();
+        store.set_persist_dir(tmp.path().to_path_buf());
+        let meta = make_meta("idx", dim as u32, "doc:");
+        store.create_index(meta.clone()).unwrap();
+
+        let n = 8usize;
+        for i in 0..n {
+            let key = format!("doc:{i}");
+            let blob = f32_blob(dim, i as u32 + 1);
+            let args = vec![
+                Frame::BulkString(Bytes::from(key.clone())),
+                Frame::BulkString(Bytes::from_static(b"vec")),
+                Frame::BulkString(blob),
+            ];
+            let _ = crate::shard::spsc_handler::auto_index_hset_public(
+                &mut store,
+                &mut TextStore::new(),
+                key.as_bytes(),
+                &args,
+            );
+        }
+        {
+            let idx = store.get_index_mut(b"idx").unwrap();
+            idx.force_compact();
+        }
+        let idx_dir = manifest::index_persist_dir(tmp.path(), b"idx");
+        let loaded_manifest = wait_for_manifest(&idx_dir)
+            .expect("manifest must land within the timeout via global_snapshot_pool()");
+
+        // ---- Stage the crash window: durable keymap ⊃ durable segments ----
+        // The phantom's checksum MATCHES the blob the rescan will replay
+        // (that is the crash-window signature: the key was mutable-resident
+        // and fully checksummed when this keymap snapshot committed, but its
+        // segment never reached disk).
+        let phantom_key = b"doc:phantom".to_vec();
+        let phantom_hash = xxhash_rust::xxh64::xxh64(&phantom_key, 0);
+        let phantom_blob = f32_blob(dim, 4242);
+        let max_gid = {
+            let idx = store.get_index(b"idx").unwrap();
+            idx.key_hash_to_global_id.values().copied().max().unwrap()
+        };
+        let mut entries = manifest::read_keymap_tolerant(&idx_dir, loaded_manifest.keymap_epoch)
+            .expect("keymap must be readable");
+        assert_eq!(entries.len(), n, "sanity: durable keymap covers all n docs");
+        entries.push(manifest::KeymapEntry {
+            key_hash: phantom_hash,
+            global_id: max_gid + 1,
+            vec_checksum: xxhash_rust::xxh64::xxh64(&phantom_blob, 0),
+            key: Bytes::from(phantom_key.clone()),
+        });
+        manifest::write_keymap_atomic(&idx_dir, loaded_manifest.keymap_epoch, &entries)
+            .expect("rewrite keymap with phantom entry");
+
+        // ---- Recover into a FRESH store ----
+        let mut fresh = VectorStore::new();
+        fresh.set_persist_dir(tmp.path().to_path_buf());
+        let mut state = RecoveryState::new();
+        state.create_index(&mut fresh, tmp.path(), &meta);
+        assert!(state.recovered_names.contains(&Bytes::from_static(b"idx")));
+
+        // The phantom must NOT have been loaded into the recovered maps —
+        // its doc exists in no loaded segment.
+        assert!(
+            fresh
+                .get_index(b"idx")
+                .unwrap()
+                .key_hash_to_key
+                .get(&phantom_hash)
+                .is_none(),
+            "keymap entry with no backing segment doc must be dropped at load"
+        );
+
+        // Rescan: replay all n real keys plus the phantom (its HSET is in
+        // the AOF — the key genuinely exists in the keyspace).
+        let mut text_store = TextStore::new();
+        for i in 0..n {
+            let key = format!("doc:{i}");
+            let blob = f32_blob(dim, i as u32 + 1);
+            let args = vec![
+                Frame::BulkString(Bytes::from(key.clone())),
+                Frame::BulkString(Bytes::from_static(b"vec")),
+                Frame::BulkString(blob),
+            ];
+            state.reconcile_key(&mut fresh, &mut text_store, key.as_bytes(), &args);
+        }
+        let phantom_args = vec![
+            Frame::BulkString(Bytes::from(phantom_key.clone())),
+            Frame::BulkString(Bytes::from_static(b"vec")),
+            Frame::BulkString(phantom_blob.clone()),
+        ];
+        state.reconcile_key(&mut fresh, &mut text_store, &phantom_key, &phantom_args);
+
+        let counters = *state.counters.get(&Bytes::from_static(b"idx")).unwrap();
+        assert_eq!(
+            counters.verified_unchanged, n,
+            "the n segment-backed keys dedup as unchanged"
+        );
+        assert_eq!(
+            counters.re_indexed, 1,
+            "the phantom key must take the full re-index path (checksum match \
+             without a backing segment doc must never count as unchanged)"
+        );
+
+        state.finish(&mut fresh, tmp.path());
+
+        // End-to-end: the phantom's document must actually be searchable —
+        // exact-match query returns it as top-1 (before the fix the doc was
+        // silently absent).
+        let phantom_gid = *fresh
+            .get_index(b"idx")
+            .unwrap()
+            .key_hash_to_global_id
+            .get(&phantom_hash)
+            .expect("phantom key must be indexed after the rescan");
+        let query_f32: Vec<f32> = phantom_blob
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        let results = fresh.search_index(b"idx", &query_f32, 1, 64).unwrap();
+        assert_eq!(
+            results.first().copied(),
+            Some(phantom_gid),
+            "phantom key's doc must be searchable post-recovery (was silently lost)"
         );
     }
 

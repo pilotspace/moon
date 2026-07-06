@@ -7,6 +7,7 @@
 //!   cargo test --test quickwins_red       # runs (1 red, 4 pins)
 //!   cargo test --test quickwins_red_api   # compile error = red, by design
 
+#[cfg(unix)]
 use std::net::{TcpListener, TcpStream};
 
 // ---------------------------------------------------------------------------
@@ -15,6 +16,10 @@ use std::net::{TcpListener, TcpStream};
 
 /// The accept paths (tokio + uring register) funnel socket options through one
 /// helper; applying it to an accepted fd must enable TCP_NODELAY.
+/// Unix-only like the helper itself (`apply_client_socket_opts` is
+/// `#[cfg(unix)]` — it takes `AsFd`); without this gate the whole test
+/// binary fails to COMPILE on the Windows CI leg (main has been red there).
+#[cfg(unix)]
 #[test]
 fn qw1_accepted_socket_has_nodelay() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();

@@ -15,6 +15,7 @@ use smallvec::SmallVec;
 
 use crate::protocol::Frame;
 use crate::vector::filter::FilterExpr;
+use crate::vector::keymap::BucketedKeyMap;
 use crate::vector::store::VectorStore;
 use crate::vector::types::{DistanceMetric, SearchResult};
 
@@ -25,7 +26,7 @@ use super::response::build_search_response;
 pub(super) enum SearchRawResult {
     Ok {
         results: SmallVec<[SearchResult; 32]>,
-        key_hash_to_key: std::sync::Arc<std::collections::HashMap<u64, Bytes>>,
+        key_hash_to_key: BucketedKeyMap<Bytes>,
     },
     Error(Frame),
 }

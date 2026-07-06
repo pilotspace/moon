@@ -2880,11 +2880,11 @@ fn handle_vector_insert(
     for chunk in blob.chunks_exact(4) {
         f32_vec.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
     }
-    // Record original Redis key for FT.SEARCH response. COW via make_mut:
-    // clones only if a search snapshot holds the map concurrently (QP-1).
-    std::sync::Arc::make_mut(&mut idx.key_hash_to_key)
-        .entry(key_hash)
-        .or_insert_with(|| bytes::Bytes::copy_from_slice(key));
+    // Record original Redis key for FT.SEARCH response. Bucket-scoped COW:
+    // clones only the ONE bucket if a search snapshot holds the map
+    // concurrently (QP-1 + RSS/CPU wave 4).
+    idx.key_hash_to_key
+        .get_or_insert_with(key_hash, || bytes::Bytes::copy_from_slice(key));
     // Append to mutable segment. `insert_lsn` is the monotonic LSN allocated
     // by `auto_index_hset`; MVCC visibility (src/vector/mvcc/visibility.rs)
     // compares against query snapshot_lsn to enforce FT.SEARCH AS_OF and
@@ -2931,12 +2931,12 @@ fn handle_vector_insert(
     crate::vector::metrics::add_vectors(1);
 
     // Record key_hash → global_id mapping for future metadata-only updates.
-    // COW via make_mut, mirroring key_hash_to_key (QP-1).
-    std::sync::Arc::make_mut(&mut idx.key_hash_to_global_id).insert(key_hash, global_id);
+    // Bucket-scoped COW, mirroring key_hash_to_key (QP-1 + RSS/CPU wave 4).
+    idx.key_hash_to_global_id.insert(key_hash, global_id);
     // B2 (durability): mirror the same key_hash into the checksum map so the
     // two maps never drift — the B3 dedup rescan compares this checksum
     // against a freshly-hashed current value to decide unchanged-vs-changed.
-    std::sync::Arc::make_mut(&mut idx.key_hash_to_vec_checksum)
+    idx.key_hash_to_vec_checksum
         .insert(key_hash, xxhash_rust::xxh64::xxh64(&blob, 0));
 
     // Populate payload index with all HASH fields (for filtered search)
@@ -2979,11 +2979,11 @@ fn handle_vector_insert_field(
     for chunk in blob.chunks_exact(4) {
         f32_vec.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
     }
-    // Record original Redis key (shared across all fields). COW via make_mut:
-    // clones only if a search snapshot holds the map concurrently (QP-1).
-    std::sync::Arc::make_mut(&mut idx.key_hash_to_key)
-        .entry(key_hash)
-        .or_insert_with(|| bytes::Bytes::copy_from_slice(key));
+    // Record original Redis key (shared across all fields). Bucket-scoped
+    // COW: clones only the ONE bucket if a search snapshot holds the map
+    // concurrently (QP-1 + RSS/CPU wave 4).
+    idx.key_hash_to_key
+        .get_or_insert_with(key_hash, || bytes::Bytes::copy_from_slice(key));
 
     // Look up the additional field's SegmentHolder
     let fs = match idx.field_segments.get(field_name.as_ref()) {
