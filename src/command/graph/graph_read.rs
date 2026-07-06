@@ -1429,6 +1429,8 @@ pub fn graph_vsearch(store: &GraphStore, args: &[Frame]) -> Frame {
 
     let node_key = super::graph_write::external_id_to_node_key(start_id);
     let memgraph = &graph.write_buf;
+    let segments_guard = graph.segments.load();
+    let csr_segs = &segments_guard.immutable;
     let lsn = u64::MAX - 1;
 
     let mut search =
@@ -1436,7 +1438,7 @@ pub fn graph_vsearch(store: &GraphStore, args: &[Frame]) -> Frame {
     search.threshold = threshold;
     search.edge_type_filter = edge_type_filter;
 
-    match search.execute(memgraph, lsn) {
+    match search.execute(memgraph, csr_segs, lsn) {
         Ok(results) => hybrid_results_to_frame(&results),
         Err(e) => Frame::Error(Bytes::from(format!("ERR {e}"))),
     }
@@ -1476,6 +1478,8 @@ pub fn graph_hybrid(store: &GraphStore, args: &[Frame]) -> Frame {
     };
 
     let memgraph = &graph.write_buf;
+    let segments_guard = graph.segments.load();
+    let csr_segs = &segments_guard.immutable;
     let lsn = u64::MAX - 1;
 
     if mode.eq_ignore_ascii_case(b"FILTER") {
@@ -1505,7 +1509,7 @@ pub fn graph_hybrid(store: &GraphStore, args: &[Frame]) -> Frame {
         let node_key = super::graph_write::external_id_to_node_key(start_id);
         let search =
             crate::graph::hybrid::GraphFilteredSearch::new(node_key, hops, query_vector, k);
-        match search.execute(memgraph, lsn) {
+        match search.execute(memgraph, csr_segs, lsn) {
             Ok(results) => hybrid_results_to_frame(&results),
             Err(e) => Frame::Error(Bytes::from(format!("ERR {e}"))),
         }
@@ -1543,7 +1547,7 @@ pub fn graph_hybrid(store: &GraphStore, args: &[Frame]) -> Frame {
         walk.beam_width = beam_width;
         walk.min_similarity = min_sim;
 
-        match walk.execute(memgraph, lsn) {
+        match walk.execute(memgraph, csr_segs, lsn) {
             Ok(results) => hybrid_results_to_frame(&results),
             Err(e) => Frame::Error(Bytes::from(format!("ERR {e}"))),
         }
@@ -1583,7 +1587,7 @@ pub fn graph_hybrid(store: &GraphStore, args: &[Frame]) -> Frame {
             query_vector,
             k,
         );
-        match reranker.execute(memgraph, lsn) {
+        match reranker.execute(memgraph, csr_segs, lsn) {
             Ok(results) => hybrid_results_to_frame(&results),
             Err(e) => Frame::Error(Bytes::from(format!("ERR {e}"))),
         }
@@ -1665,9 +1669,26 @@ fn extract_f32_vector(frame: &Frame) -> Option<Vec<f32>> {
         _ => return None,
     };
 
-    let text = core::str::from_utf8(bytes).ok()?;
-    let values: Result<Vec<f32>, _> = text.split_whitespace().map(|s| s.parse::<f32>()).collect();
-    values.ok()
+    // Text form first ("0.1 0.2 ..."), then binary little-endian f32 array —
+    // the SAME blob format GRAPH.ADDNODE's VECTOR argument accepts, so
+    // vectors round-trip between ADDNODE and VSEARCH/HYBRID unchanged.
+    if let Ok(text) = core::str::from_utf8(bytes) {
+        let values: Result<Vec<f32>, _> =
+            text.split_whitespace().map(|s| s.parse::<f32>()).collect();
+        match values {
+            Ok(v) if !v.is_empty() => return Some(v),
+            _ => {}
+        }
+    }
+    if bytes.is_empty() || !bytes.len().is_multiple_of(4) {
+        return None;
+    }
+    Some(
+        bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect(),
+    )
 }
 
 /// Parse an f64 from a Frame.
