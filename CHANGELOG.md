@@ -6,6 +6,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### CI — fix Windows main-push test failures (PR #TBD)
+
+- `test_poll_real_process_smoke` is now gated to Linux/macOS: `get_rss_bytes()`
+  returns the documented `0` fallback on every other platform, so asserting
+  `rss_bytes() > 0` can never pass on Windows.
+- `test_scatter_text_aggregate_single_shard_skips_spsc` now runs on a fresh
+  OS thread and calls `init_shard` itself (via a new shared
+  `slice::test_support::make_init` fixture). As a plain `#[tokio::test]` it
+  only passed when libtest scheduled it onto a harness thread where an
+  earlier test had left a `ShardSlice` behind — a latent order-dependent
+  flake on all platforms that failed deterministically on Windows CI.
+
 ### Changed — consolidated dependency bumps (PR #TBD)
 
 - Cargo: `ringbuf` 0.4.8 → 0.5.0 and `metrics-exporter-prometheus` 0.16.2 →

@@ -565,20 +565,25 @@ pub fn assert_initialized(shard_id: usize) {
     }
 }
 
-// ── Unit tests ────────────────────────────────────────────────────────────────
+// ── Test support ──────────────────────────────────────────────────────────────
 
+/// Test-only `ShardSliceInit` fixture, shared by any test module that must
+/// call `init_shard` itself (e.g. `scatter_aggregate`'s single-shard fast-path
+/// test). Tests using `with_shard` MUST NOT rely on a `ShardSlice` left behind
+/// on the harness thread by an earlier test — that "passes" or panics
+/// depending on libtest thread scheduling (caught on Windows CI).
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_support {
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::AtomicUsize;
 
-    use super::*;
+    use super::ShardSliceInit;
     use crate::storage::Database;
     use crate::text::store::TextStore;
     use crate::transaction::{DeferredHnswInserts, KvWriteIntents};
     use crate::vector::store::VectorStore;
 
-    fn make_init(shard_id: usize, db_count: usize) -> ShardSliceInit {
+    pub(crate) fn make_init(shard_id: usize, db_count: usize) -> ShardSliceInit {
         let databases: Box<[Database]> = (0..db_count).map(|_| Database::new()).collect();
         ShardSliceInit {
             shard_id,
@@ -602,6 +607,17 @@ mod tests {
             }),
         }
     }
+}
+
+// ── Unit tests ────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::test_support::make_init;
+    use super::*;
 
     /// Run a closure in a fresh OS thread whose thread-local `SHARD` is guaranteed
     /// to be uninitialized. Returns the join result.
