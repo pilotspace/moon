@@ -876,11 +876,18 @@ pub fn compact(
     .with_raw_f16(raw_f16_bfs)
     // AE-1: measure this build's adaptive-ef estimate while we're on the
     // compaction thread (no-op without a sidecar).
-    .with_adaptive_ef();
+    .with_adaptive_ef()
+    // B2 (durability): tag the segment with the disk id it will be persisted
+    // under (if any) BEFORE writing, so callers can read it back off the
+    // returned segment without threading the id separately.
+    .with_disk_segment_id(persist.map(|(_, segment_id)| segment_id));
 
-    // Step 7 (continued): persist to disk if requested
+    // Step 7 (continued): persist to disk if requested. Uses the staged
+    // (write-to-staging + fsync + rename + dir-fsync) writer so a segment
+    // only becomes visible under its final `segment-{id}` name once it is
+    // fully durable — see VECTOR-DURABILITY-DESIGN.md.
     if let Some((dir, segment_id)) = persist {
-        segment_io::write_immutable_segment(dir, segment_id, &segment, collection)
+        segment_io::write_immutable_segment_staged(dir, segment_id, &segment, collection)
             .map_err(|e| CompactionError::PersistFailed(format!("{e}")))?;
     }
 
@@ -1056,16 +1063,24 @@ pub struct MergeStats {
 ///
 /// Refuses to merge when the estimated live-vector TQ code bytes plus the
 /// HNSW graph overhead would exceed `MERGE_MEMORY_CEILING`.
+///
+/// `persist`: when `Some((dir, segment_id))`, writes the merged segment to
+/// disk (staged + atomic rename, see [`segment_io::write_immutable_segment_staged`])
+/// after a successful build, and tags the returned segment with `segment_id`
+/// via [`ImmutableSegment::with_disk_segment_id`] (B2, durability).
 pub fn merge_immutable(
     segments: &[Arc<ImmutableSegment>],
     collection: &Arc<CollectionMetadata>,
     seed: u64,
     mode: MergeMode,
     recall_tolerance: f32,
+    persist: Option<(&Path, u64)>,
 ) -> Result<ImmutableSegment, CompactionError> {
     match mode {
         MergeMode::None => Err(CompactionError::EmptySegment), // caller should not call
-        MergeMode::GraphUnion => merge_graph_union(segments, collection, seed, recall_tolerance),
+        MergeMode::GraphUnion => {
+            merge_graph_union(segments, collection, seed, recall_tolerance, persist)
+        }
         MergeMode::KeepRaw => {
             // KeepRaw: fall back to graph-union if no raw f32 available (warn only).
             // Full raw-vector path requires raw_f32 stored on ImmutableSegment (TODO P2.5).
@@ -1073,7 +1088,7 @@ pub fn merge_immutable(
                 "MERGE_MODE=keep_raw: raw f32 not yet persisted on ImmutableSegment; \
                  falling back to graph-union. Add KEEP_RAW sidecar in P2.5."
             );
-            merge_graph_union(segments, collection, seed, recall_tolerance)
+            merge_graph_union(segments, collection, seed, recall_tolerance, persist)
         }
     }
 }
@@ -1087,6 +1102,7 @@ fn merge_graph_union(
     collection: &Arc<CollectionMetadata>,
     seed: u64,
     recall_tolerance: f32,
+    persist: Option<(&Path, u64)>,
 ) -> Result<ImmutableSegment, CompactionError> {
     if segments.is_empty() {
         return Err(CompactionError::EmptySegment);
@@ -1488,7 +1504,16 @@ fn merge_graph_union(
     .with_raw_f16(raw_f16_bfs)
     // AE-1: measure this build's adaptive-ef estimate while we're on the
     // compaction thread (no-op without a sidecar).
-    .with_adaptive_ef();
+    .with_adaptive_ef()
+    // B2 (durability): tag with the disk id before writing, mirroring `compact()`.
+    .with_disk_segment_id(persist.map(|(_, segment_id)| segment_id));
+
+    // Persist to disk if requested — same staged (staging + fsync + rename +
+    // dir-fsync) writer as `compact()`. Merge persists identically to compact.
+    if let Some((dir, segment_id)) = persist {
+        segment_io::write_immutable_segment_staged(dir, segment_id, &merged, collection)
+            .map_err(|e| CompactionError::PersistFailed(format!("{e}")))?;
+    }
 
     Ok(merged)
 }
@@ -1861,7 +1886,7 @@ mod tests {
         let n = db.len();
 
         let segs = vec![Arc::new(imm_a), Arc::new(imm_b)];
-        let merged = merge_immutable(&segs, &collection, 42, MergeMode::GraphUnion, 0.60)
+        let merged = merge_immutable(&segs, &collection, 42, MergeMode::GraphUnion, 0.60, None)
             .expect("SQ8 merge failed");
         assert_eq!(merged.live_count(), n as u32, "merged SQ8 live_count");
 
@@ -2222,7 +2247,7 @@ mod tests {
         );
 
         let segs = vec![Arc::new(imm1), Arc::new(imm2)];
-        let result = merge_immutable(&segs, &collection, 42, MergeMode::GraphUnion, 0.80);
+        let result = merge_immutable(&segs, &collection, 42, MergeMode::GraphUnion, 0.80, None);
 
         match &result {
             Ok(m) => eprintln!(

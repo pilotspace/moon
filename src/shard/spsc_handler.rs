@@ -2496,8 +2496,14 @@ fn handle_vector_insert(
     let global_id = snap.mutable.global_id_base() + internal_id;
     crate::vector::metrics::add_vectors(1);
 
-    // Record key_hash → global_id mapping for future metadata-only updates
-    idx.key_hash_to_global_id.insert(key_hash, global_id);
+    // Record key_hash → global_id mapping for future metadata-only updates.
+    // COW via make_mut, mirroring key_hash_to_key (QP-1).
+    std::sync::Arc::make_mut(&mut idx.key_hash_to_global_id).insert(key_hash, global_id);
+    // B2 (durability): mirror the same key_hash into the checksum map so the
+    // two maps never drift — the B3 dedup rescan compares this checksum
+    // against a freshly-hashed current value to decide unchanged-vs-changed.
+    std::sync::Arc::make_mut(&mut idx.key_hash_to_vec_checksum)
+        .insert(key_hash, xxhash_rust::xxh64::xxh64(&blob, 0));
 
     // Populate payload index with all HASH fields (for filtered search)
     let mut j = 1;

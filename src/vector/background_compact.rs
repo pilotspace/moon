@@ -21,12 +21,20 @@
 //! `Arc<ImmutableSegment>` is `Send + Sync` — the worker only reads the source
 //! segments (graph and TQ codes); it never writes to their interior state.
 
+use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
 use crate::vector::segment::compaction::{self, CompactionError, MergeMode};
 use crate::vector::segment::immutable::ImmutableSegment;
 use crate::vector::segment::mutable::FrozenSegment;
 use crate::vector::turbo_quant::collection::CollectionMetadata;
+
+/// Where (and under what id) the worker should persist its output segment,
+/// when the index has a `persist_dir` configured (B2, durability). The
+/// segment id is allocated on the SHARD thread at submit time (never on the
+/// worker), so ids never collide even though the write happens in the
+/// background.
+type PersistTarget = (PathBuf, u64);
 
 /// The operation a worker should perform.
 ///
@@ -38,6 +46,7 @@ enum BuildOp {
         frozen: FrozenSegment,
         collection: Arc<CollectionMetadata>,
         seed: u64,
+        persist: Option<PersistTarget>,
     },
     /// Many-immutables-to-one: merge N Arc'd immutable segments into one.
     ///
@@ -50,6 +59,7 @@ enum BuildOp {
         seed: u64,
         mode: MergeMode,
         recall_tolerance: f32,
+        persist: Option<PersistTarget>,
     },
 }
 
@@ -100,19 +110,27 @@ impl BackgroundCompactor {
                                     frozen,
                                     collection,
                                     seed,
-                                } => compaction::compact(&frozen, &collection, seed, None),
+                                    persist,
+                                } => compaction::compact(
+                                    &frozen,
+                                    &collection,
+                                    seed,
+                                    persist.as_ref().map(|(p, id)| (p.as_path(), *id)),
+                                ),
                                 BuildOp::Merge {
                                     segments,
                                     collection,
                                     seed,
                                     mode,
                                     recall_tolerance,
+                                    persist,
                                 } => compaction::merge_immutable(
                                     &segments,
                                     &collection,
                                     seed,
                                     mode,
                                     recall_tolerance,
+                                    persist.as_ref().map(|(p, id)| (p.as_path(), *id)),
                                 ),
                             };
                             // If the receiver was dropped before we finished, swallow the error.
@@ -131,6 +149,12 @@ impl BackgroundCompactor {
 
     /// Submit a mutable→immutable compaction job.
     ///
+    /// `persist`: when `Some((idx_dir, segment_id))`, the worker persists the
+    /// built segment to disk (staged + atomic rename) before replying — see
+    /// `segment_io::write_immutable_segment_staged`. `segment_id` MUST be
+    /// allocated by the caller (shard thread) beforehand; ids are never
+    /// allocated on the worker.
+    ///
     /// Returns an `Err` only when all workers have exited (compactor shut down).
     /// Returns the `reply_rx` — the caller polls it with [`try_recv`](flume::Receiver::try_recv).
     pub fn submit(
@@ -138,6 +162,7 @@ impl BackgroundCompactor {
         frozen: FrozenSegment,
         collection: Arc<CollectionMetadata>,
         seed: u64,
+        persist: Option<(PathBuf, u64)>,
     ) -> Result<flume::Receiver<CompactionResult>, CompactionSubmitError> {
         let (reply_tx, reply_rx) = flume::bounded::<CompactionResult>(1);
         let job = WorkerJob {
@@ -145,6 +170,7 @@ impl BackgroundCompactor {
                 frozen,
                 collection,
                 seed,
+                persist,
             },
             reply_tx,
         };
@@ -156,6 +182,9 @@ impl BackgroundCompactor {
 
     /// Submit an immutable→immutable merge job.
     ///
+    /// `persist`: same contract as [`Self::submit`] — merge persists
+    /// identically to compact.
+    ///
     /// The worker reads the source segment Arcs but never mutates them.
     /// Returns `reply_rx` — caller polls it non-blocking with `try_recv`.
     pub fn submit_merge(
@@ -165,6 +194,7 @@ impl BackgroundCompactor {
         seed: u64,
         mode: MergeMode,
         recall_tolerance: f32,
+        persist: Option<(PathBuf, u64)>,
     ) -> Result<flume::Receiver<CompactionResult>, CompactionSubmitError> {
         let (reply_tx, reply_rx) = flume::bounded::<CompactionResult>(1);
         let job = WorkerJob {
@@ -174,6 +204,7 @@ impl BackgroundCompactor {
                 seed,
                 mode,
                 recall_tolerance,
+                persist,
             },
             reply_tx,
         };

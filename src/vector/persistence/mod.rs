@@ -1,3 +1,4 @@
+pub mod manifest;
 pub mod mmap_budget;
 pub mod recovery;
 pub mod sealed_mmap;

@@ -101,6 +101,10 @@ pub struct ImmutableSegment {
     /// `EF_RUNTIME`). In-memory only — segments reloaded from disk carry
     /// `None` and fall back to the full resolved beam.
     suggested_ef: Option<u32>,
+
+    /// Disk segment id this segment was persisted under (B2, durability write
+    /// path). See [`Self::disk_segment_id`].
+    disk_segment_id: Option<u64>,
 }
 
 impl ImmutableSegment {
@@ -135,6 +139,7 @@ impl ImmutableSegment {
             tombstoned_keys: parking_lot::RwLock::new(HashSet::new()),
             raw_f16: None,
             suggested_ef: None,
+            disk_segment_id: None,
         }
     }
 
@@ -173,6 +178,36 @@ impl ImmutableSegment {
     #[must_use]
     pub fn with_adaptive_ef(mut self) -> Self {
         self.suggested_ef = self.estimate_suggested_ef();
+        self
+    }
+
+    /// Restore a previously-measured adaptive-ef estimate (R6, durability)
+    /// verbatim, WITHOUT re-running [`Self::estimate_suggested_ef`]. Used by
+    /// `segment_io::read_immutable_segment` when loading a segment that
+    /// carries a persisted `suggested_ef` in its `segment_meta.json` — the
+    /// estimator is compaction-thread-only and must not re-run on the
+    /// (potentially hot) load path.
+    #[must_use]
+    pub fn with_suggested_ef_raw(mut self, suggested_ef: Option<u32>) -> Self {
+        self.suggested_ef = suggested_ef;
+        self
+    }
+
+    /// The disk segment id this in-memory segment was persisted under, if
+    /// any (B2, durability write path). `None` when the index has no
+    /// `persist_dir` configured, or for segments loaded before this field
+    /// existed. Used to build `IndexManifest.segment_ids` — the set of
+    /// on-disk segment directories currently referenced by the live index.
+    pub fn disk_segment_id(&self) -> Option<u64> {
+        self.disk_segment_id
+    }
+
+    /// Attach the disk segment id assigned at persist time. Builder-style,
+    /// mirrors [`Self::with_raw_f16`]. `None` when the segment was not
+    /// persisted (no `persist_dir` configured for the index).
+    #[must_use]
+    pub fn with_disk_segment_id(mut self, disk_segment_id: Option<u64>) -> Self {
+        self.disk_segment_id = disk_segment_id;
         self
     }
 

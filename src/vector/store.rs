@@ -3,6 +3,7 @@
 //! No Arc, no Mutex -- fully owned by shard thread (same pattern as PubSubRegistry).
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -200,7 +201,47 @@ pub struct VectorIndex {
     /// When `HSET doc:1 category "science"` is called without a vector blob,
     /// the auto-indexer looks up the existing `global_id` here to update the
     /// PayloadIndex for that vector without re-inserting it.
-    pub key_hash_to_global_id: std::collections::HashMap<u64, u32>,
+    ///
+    /// `Arc`-wrapped for the same reason as `key_hash_to_key` (QP-1 O(1)
+    /// snapshot capture) — the durability write path (B2) clones this Arc
+    /// into background keymap-snapshot jobs without an O(n) copy on the
+    /// shard thread.
+    pub key_hash_to_global_id: Arc<std::collections::HashMap<u64, u32>>,
+    /// Maps `key_hash` → `xxh64(vector-field bytes, seed 0)` (B2, durability).
+    ///
+    /// Computed where the raw HSET vector blob is in hand
+    /// (`spsc_handler::handle_vector_insert`) and mirrored at every site that
+    /// mirrors `key_hash_to_key` (insert, update, tombstone, wholesale
+    /// reset). Persisted into `keymap-<epoch>.bin` so the B3 recovery dedup
+    /// rescan can tell "unchanged" keys (checksum matches → metadata-only
+    /// rebuild) from "changed" keys (re-encode) without hashing every value
+    /// twice across a restart.
+    pub key_hash_to_vec_checksum: Arc<std::collections::HashMap<u64, u64>>,
+    /// Shard-relative directory this index persists segments/manifest/keymap
+    /// under, i.e. `<vector_persist_dir>/idx-<hex(xxh64(name))>/` (B2).
+    /// `None` when the store has no `persist_dir` configured (disk-offload
+    /// and on-disk persistence both disabled) — segment/manifest/keymap
+    /// writes are skipped entirely in that case, identical to the existing
+    /// sidecar gate.
+    pub persist_dir: Option<std::path::PathBuf>,
+    /// Monotonic on-disk segment id allocator for THIS index, scoped to
+    /// `persist_dir` (B2). Allocated on the shard thread at compact/merge
+    /// submit time (never on the worker thread) so ids never collide even
+    /// though the actual disk write happens on a background worker.
+    pub next_segment_id: u64,
+    /// Monotonic manifest/keymap "generation" counter for THIS index (B2).
+    /// Allocated on the shard thread each time a snapshot job is enqueued;
+    /// doubles as the keymap epoch (`keymap-<seq>.bin`) — one counter, so
+    /// there is no separate race between "job ordering" and "which keymap
+    /// file is current".
+    next_snapshot_seq: u64,
+    /// Shared watermark of the highest snapshot `seq` durably committed for
+    /// this index (B2). Cloned into every snapshot job; the worker holds
+    /// this lock across its entire write+GC critical section so a stale job
+    /// (built from an older install, possibly completed out of order by a
+    /// different worker) can never overwrite a newer manifest — see
+    /// `crate::vector::persistence::manifest` module docs.
+    persist_seq_watermark: Arc<parking_lot::Mutex<u64>>,
     /// Whether auto-compaction is enabled. Default: true.
     /// Set to false via FT.CONFIG SET idx AUTOCOMPACT OFF for bulk ingestion.
     /// Manual FT.COMPACT always works regardless of this flag.
@@ -357,7 +398,16 @@ impl VectorIndex {
             let fs_len = fs.segments.load().mutable.len();
             if fs_len >= threshold {
                 let dim = fs.collection.dimension;
-                Self::compact_segments(&mut fs.segments, &mut fs.scratch, &fs.collection, dim, 0);
+                let mut unused_id = 0u64;
+                Self::compact_segments(
+                    &mut fs.segments,
+                    &mut fs.scratch,
+                    &fs.collection,
+                    dim,
+                    0,
+                    None, // additional-field segments are not persisted (out of B2 scope)
+                    &mut unused_id,
+                );
             }
         }
     }
@@ -405,16 +455,24 @@ impl VectorIndex {
                 };
                 drop(snap);
                 self.segments.swap(new_list);
+                // B2 (durability): the worker already persisted this segment
+                // (begin_background_compact allocated persist target at
+                // submit time, if configured) — commit the keymap/manifest
+                // snapshot now that install is durable in memory.
+                self.persist_hook_after_install();
                 // After draining we're done — the data is compacted.
                 // Compact additional fields inline (no in-flight for those).
                 for (_, fs) in &mut self.field_segments {
                     let dim = fs.collection.dimension;
+                    let mut unused_id = 0u64;
                     Self::compact_segments(
                         &mut fs.segments,
                         &mut fs.scratch,
                         &fs.collection,
                         dim,
                         0,
+                        None,
+                        &mut unused_id,
                     );
                 }
                 return;
@@ -422,18 +480,35 @@ impl VectorIndex {
             // Worker failed or dropped — fall through to inline compact below.
         }
 
-        // Compact default field
+        // Compact default field. `persist_root` must be the per-INDEX dir
+        // (`idx-<hex>/`), not the bare shard-level `persist_dir` — matching
+        // `alloc_persist_target`/`persist_hook_after_install`.
+        let persist_root = self.persist_dir.as_ref().map(|dir| {
+            crate::vector::persistence::manifest::index_persist_dir(dir, self.meta.name.as_ref())
+        });
         Self::compact_segments(
             &mut self.segments,
             &mut self.scratch,
             &self.collection,
             self.meta.dimension,
             self.meta.compact_threshold as usize,
+            persist_root.as_deref(),
+            &mut self.next_segment_id,
         );
+        self.persist_hook_after_install();
         // Compact additional fields (legacy unbounded semantics: threshold 0).
         for (_, fs) in &mut self.field_segments {
             let dim = fs.collection.dimension;
-            Self::compact_segments(&mut fs.segments, &mut fs.scratch, &fs.collection, dim, 0);
+            let mut unused_id = 0u64;
+            Self::compact_segments(
+                &mut fs.segments,
+                &mut fs.scratch,
+                &fs.collection,
+                dim,
+                0,
+                None,
+                &mut unused_id,
+            );
         }
     }
 
@@ -444,12 +519,24 @@ impl VectorIndex {
     /// independently searchable segments (see `bulk_freeze_cap`). The tail
     /// survives each install via `clone_suffix`, preserving the global ID
     /// space, exactly like the background install path.
+    ///
+    /// `persist_root`/`next_segment_id`: when `persist_root` is `Some`, each
+    /// successful build in the (possibly multi-iteration, bulk-load) loop is
+    /// persisted to disk via the staged writer under a freshly-allocated id
+    /// (B2, durability write path). `next_segment_id` is always threaded
+    /// through (even when `persist_root` is `None`, in which case it is
+    /// simply never read) so callers that don't persist can pass a throwaway
+    /// counter. Callers are responsible for triggering the keymap/manifest
+    /// snapshot job (see `VectorIndex::persist_hook_after_install`) once this
+    /// returns — this function only handles the segment file itself.
     fn compact_segments(
         segments: &mut SegmentHolder,
         scratch: &mut SearchScratch,
         collection: &Arc<CollectionMetadata>,
         dimension: u32,
         compact_threshold: usize,
+        persist_root: Option<&Path>,
+        next_segment_id: &mut u64,
     ) {
         let _ = dimension;
         let seed = collection.collection_id.wrapping_mul(6364136223846793005);
@@ -463,7 +550,13 @@ impl VectorIndex {
             let frozen = snap.mutable.freeze_prefix(frozen_len);
             drop(snap);
 
-            match compaction::compact(&frozen, collection, seed, None) {
+            let persist = persist_root.map(|dir| {
+                let id = *next_segment_id;
+                *next_segment_id += 1;
+                (dir, id)
+            });
+
+            match compaction::compact(&frozen, collection, seed, persist) {
                 Ok(immutable) => {
                     let num_nodes = immutable.graph().num_nodes();
                     let padded = collection.padded_dimension;
@@ -492,6 +585,88 @@ impl VectorIndex {
                 }
             }
         }
+    }
+
+    /// One past the highest collection id used by any field of this index
+    /// (default field + additional named vector fields). Used as
+    /// `IndexManifest.next_collection_id_floor` — B3 recovery seeds the
+    /// store-wide collection-id allocator from this so a later FT.CREATE
+    /// never reuses a collection id (and therefore QJL rotation seed) that a
+    /// restored segment already depends on.
+    fn max_field_collection_id(&self) -> u64 {
+        let mut max_cid = self.collection.collection_id;
+        for fs in self.field_segments.values() {
+            max_cid = max_cid.max(fs.collection.collection_id);
+        }
+        max_cid
+    }
+
+    /// Allocate the next on-disk segment id and target directory for this
+    /// index's default field, if `persist_dir` is configured.
+    ///
+    /// Always called on the shard thread (at compact/merge SUBMIT time, or
+    /// synchronously for the inline compact path) — segment ids are never
+    /// allocated on a background worker, so two concurrently-running builds
+    /// can never collide on an id even though the actual disk write happens
+    /// off-thread.
+    fn alloc_persist_target(&mut self) -> Option<(PathBuf, u64)> {
+        let dir = self.persist_dir.as_ref()?;
+        let idx_dir =
+            crate::vector::persistence::manifest::index_persist_dir(dir, self.meta.name.as_ref());
+        let id = self.next_segment_id;
+        self.next_segment_id += 1;
+        Some((idx_dir, id))
+    }
+
+    /// After a successful default-field compact/merge install, commit a
+    /// keymap + manifest snapshot for this index in the background (B2,
+    /// durability write path). No-op when `persist_dir` is not configured.
+    ///
+    /// Cheap on the shard thread: clones 3 `Arc`s (O(1) — all three key-hash
+    /// maps are `Arc`-wrapped with copy-on-write writers) plus a handful of
+    /// scalars; the actual keymap build (iterating every live key) and all
+    /// file I/O happens on the snapshot worker thread.
+    fn persist_hook_after_install(&mut self) {
+        let Some(dir) = self.persist_dir.clone() else {
+            return;
+        };
+        let idx_dir =
+            crate::vector::persistence::manifest::index_persist_dir(&dir, self.meta.name.as_ref());
+        let snap = self.segments.load();
+        let segment_ids: Vec<u64> = snap
+            .immutable
+            .iter()
+            .filter_map(|s| s.disk_segment_id())
+            .collect();
+        let next_global_id = snap.mutable.next_global_id();
+        drop(snap);
+
+        self.next_snapshot_seq += 1;
+        let seq = self.next_snapshot_seq;
+
+        let manifest = crate::vector::persistence::manifest::IndexManifest {
+            format_version: crate::vector::persistence::manifest::MANIFEST_FORMAT_VERSION,
+            index_name_hex: crate::vector::persistence::manifest::index_name_hex(
+                self.meta.name.as_ref(),
+            ),
+            collection_id: self.collection.collection_id,
+            next_collection_id_floor: self.max_field_collection_id() + 1,
+            next_segment_id: self.next_segment_id,
+            next_global_id,
+            segment_ids,
+            keymap_epoch: seq,
+        };
+
+        let job = crate::vector::persistence::manifest::SnapshotJob {
+            idx_dir,
+            seq,
+            watermark: self.persist_seq_watermark.clone(),
+            manifest,
+            key_hash_to_key: self.key_hash_to_key.clone(),
+            key_hash_to_global_id: self.key_hash_to_global_id.clone(),
+            key_hash_to_vec_checksum: self.key_hash_to_vec_checksum.clone(),
+        };
+        crate::vector::persistence::manifest::global_snapshot_pool().submit(job);
     }
 }
 
@@ -612,7 +787,10 @@ impl VectorIndex {
             .collection
             .collection_id
             .wrapping_mul(6364136223846793005);
-        match compactor.submit(frozen, self.collection.clone(), seed) {
+        // B2 (durability): allocate the disk segment id (and target dir) HERE,
+        // on the shard thread, at submit time — never on the worker.
+        let persist = self.alloc_persist_target();
+        match compactor.submit(frozen, self.collection.clone(), seed, persist) {
             Ok(reply_rx) => {
                 self.bg_compact_inflight = Some(InFlightCompaction {
                     reply_rx,
@@ -730,6 +908,10 @@ impl VectorIndex {
         };
         drop(snap);
         self.segments.swap(new_list);
+        // B2 (durability): the worker already wrote the segment to disk (if
+        // `alloc_persist_target` handed it a target at submit time) — commit
+        // the keymap/manifest snapshot now that the install is durable.
+        self.persist_hook_after_install();
 
         true
     }
@@ -801,8 +983,19 @@ impl VectorIndex {
         // collapse without false-positives on small/medium indexes. Per-index
         // override: FT.CONFIG SET <idx> MERGE_RECALL_TOLERANCE (VEC-4).
         let tolerance = self.merge_recall_tolerance;
+        // B2 (durability): allocate the disk segment id (and target dir) HERE,
+        // on the shard thread, at submit time — never on the worker. Merge
+        // persists identically to compact.
+        let persist = self.alloc_persist_target();
 
-        match compactor.submit_merge(segs.clone(), self.collection.clone(), seed, mode, tolerance) {
+        match compactor.submit_merge(
+            segs.clone(),
+            self.collection.clone(),
+            seed,
+            mode,
+            tolerance,
+            persist,
+        ) {
             Ok(reply_rx) => {
                 self.bg_merge_inflight = Some(InFlightMerge {
                     reply_rx,
@@ -952,6 +1145,12 @@ impl VectorIndex {
         };
         drop(snap);
         self.segments.swap(new_list);
+        // B2 (durability): the worker already wrote the merged segment to
+        // disk (if `alloc_persist_target` handed it a target at submit
+        // time) — commit the keymap/manifest snapshot now that the install
+        // is durable. The GC inside the snapshot job removes the (now
+        // superseded) source segment dirs.
+        self.persist_hook_after_install();
 
         tracing::debug!(
             sources = inflight.merged_sources.len(),
@@ -1368,6 +1567,27 @@ impl VectorStore {
         }
 
         let name = meta.name.clone();
+
+        // B2 (durability): defensive id-space floor. If this index's
+        // `idx-<hex>` dir already has a manifest — e.g. FLUSHALL/DROP just
+        // recreated this index and the best-effort background directory
+        // delete (see `drop_index`/`clear_all_contents`) hasn't finished yet
+        // — seed the fresh allocators ABOVE whatever it last recorded. This
+        // guarantees the new generation's segment ids/keymap epochs can never
+        // collide with (or race a delete of) the old generation's on-disk
+        // files, independent of when that background delete completes.
+        let (floor_next_segment_id, floor_next_snapshot_seq) = self
+            .persist_dir
+            .as_ref()
+            .map(|dir| {
+                let idx_dir =
+                    crate::vector::persistence::manifest::index_persist_dir(dir, name.as_ref());
+                crate::vector::persistence::manifest::read_manifest_tolerant(&idx_dir)
+                    .map(|m| (m.next_segment_id, m.keymap_epoch))
+                    .unwrap_or((0, 0))
+            })
+            .unwrap_or((0, 0));
+
         self.indexes.insert(
             name.clone(),
             VectorIndex {
@@ -1377,7 +1597,12 @@ impl VectorStore {
                 collection,
                 payload_index: PayloadIndex::new(),
                 key_hash_to_key: Arc::new(std::collections::HashMap::new()),
-                key_hash_to_global_id: std::collections::HashMap::new(),
+                key_hash_to_global_id: Arc::new(std::collections::HashMap::new()),
+                key_hash_to_vec_checksum: Arc::new(std::collections::HashMap::new()),
+                persist_dir: self.persist_dir.clone(),
+                next_segment_id: floor_next_segment_id,
+                next_snapshot_seq: floor_next_snapshot_seq,
+                persist_seq_watermark: Arc::new(parking_lot::Mutex::new(floor_next_snapshot_seq)),
                 autocompact_enabled: true,
                 merge_recall_tolerance: 0.70,
                 compaction_weight: COMPACTION_WEIGHT_DEFAULT,
@@ -1417,6 +1642,42 @@ impl VectorStore {
         Ok(())
     }
 
+    /// Best-effort background removal of an index's whole `idx-<hex>/`
+    /// durability directory (manifest + keymaps + segments) — B2, design
+    /// doc item "Drop/flush cleanup". Fire-and-forget: runs on its own OS
+    /// thread so `drop_index`/`clear_all_contents` never block the shard on
+    /// a (possibly large) recursive directory removal. Failure is logged and
+    /// otherwise harmless — a leftover directory is swept by the B3 startup
+    /// orphan sweep, and `create_index`'s defensive manifest-floor read
+    /// guarantees a same-named index recreated before this finishes never
+    /// reuses (or races) its ids. No-op if `persist_dir` is not configured.
+    fn spawn_delete_index_persist_dir(&self, name: &Bytes) {
+        let Some(dir) = self.persist_dir.clone() else {
+            return;
+        };
+        let name = name.clone();
+        let idx_dir = crate::vector::persistence::manifest::index_persist_dir(&dir, name.as_ref());
+        let spawned = std::thread::Builder::new()
+            .name("moon-vec-idx-gc".to_owned())
+            .spawn(move || {
+                if let Err(e) = std::fs::remove_dir_all(&idx_dir) {
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        tracing::warn!(
+                            "failed to remove durability dir {} for dropped index: {e}",
+                            idx_dir.display()
+                        );
+                    }
+                }
+            });
+        if let Err(e) = spawned {
+            tracing::warn!(
+                "failed to spawn background deletion thread for dropped index {}: {e} \
+                 (durability dir left on disk; swept at next B3 startup)",
+                String::from_utf8_lossy(&name)
+            );
+        }
+    }
+
     /// Drop an index by name. Returns true if it existed.
     ///
     /// Tombstones any warm segments so their on-disk directories are cleaned up
@@ -1428,6 +1689,8 @@ impl VectorStore {
             for warm_seg in &snapshot.warm {
                 warm_seg.mark_tombstoned();
             }
+            drop(snapshot);
+            self.spawn_delete_index_persist_dir(&index.meta.name);
             // Persist index metadata sidecar
             self.save_index_meta_sidecar();
             // Bump version AFTER successful drop (monotonicity-on-success contract).
@@ -1463,6 +1726,13 @@ impl VectorStore {
             drop(snapshot);
             let meta = index.meta.clone();
             drop(index);
+            // B2 (durability): FLUSH discards contents — the whole durability
+            // dir (segments/manifest/keymaps) goes with it. Best-effort,
+            // background (see `spawn_delete_index_persist_dir`); the
+            // immediately-following `create_index` reseeds id allocators
+            // above whatever the (possibly still-being-deleted) old manifest
+            // recorded, so the recreated index never collides with it.
+            self.spawn_delete_index_persist_dir(&name);
             // Recreate from the same definition — a fresh, empty index.
             // Also rewrites the sidecar and bumps the version token.
             #[allow(clippy::unwrap_used)] // name was just removed above; create cannot collide
@@ -1564,9 +1834,13 @@ impl VectorStore {
         // QW7 (2026-06 review finding 6.3): prune the key-hash maps so
         // they track LIVE keys, not historical inserts — without this
         // they grow monotonically under key churn (~1GB / 24M deletes).
-        // A re-insert of the same key repopulates both maps.
+        // A re-insert of the same key repopulates all three maps.
         Arc::make_mut(&mut idx.key_hash_to_key).remove(&key_hash);
-        idx.key_hash_to_global_id.remove(&key_hash);
+        Arc::make_mut(&mut idx.key_hash_to_global_id).remove(&key_hash);
+        // B2 (durability): keep the checksum map in lockstep so it never
+        // drifts from key_hash_to_key (a stale entry would be a silent
+        // false-"unchanged" in the B3 dedup rescan).
+        Arc::make_mut(&mut idx.key_hash_to_vec_checksum).remove(&key_hash);
         true
     }
 
@@ -2022,6 +2296,9 @@ impl VectorStore {
                 };
                 drop(snap);
                 idx.segments.swap(new_list);
+                // B2 (durability): worker already persisted (if configured
+                // at submit time) — commit the keymap/manifest snapshot.
+                idx.persist_hook_after_install();
                 // Data is already merged — return early.
                 let new_snap = idx.segments.load();
                 let live = new_snap
@@ -2063,8 +2340,19 @@ impl VectorStore {
         let collection = idx.collection.clone();
         let seed = collection.collection_id.wrapping_mul(6364136223846793005);
         drop(snap);
+        // B2 (durability): allocate the disk segment id synchronously (this
+        // is the explicit-command path — a brief stall is acceptable, same
+        // rationale as the inline compact path).
+        let persist = idx.alloc_persist_target();
 
-        match compaction::merge_immutable(&segs, &collection, seed, mode, recall_tolerance) {
+        match compaction::merge_immutable(
+            &segs,
+            &collection,
+            seed,
+            mode,
+            recall_tolerance,
+            persist.as_ref().map(|(p, id)| (p.as_path(), *id)),
+        ) {
             Ok(merged) => {
                 let live = merged.live_count() as usize;
                 // Atomically swap: replace all immutable segments with the single merged one.
@@ -2077,6 +2365,7 @@ impl VectorStore {
                     cold: old.cold.clone(),
                 };
                 idx.segments.swap(new_list);
+                idx.persist_hook_after_install();
 
                 // Rebuild scratch for the merged segment.
                 let new_snap = idx.segments.load();
@@ -2337,6 +2626,160 @@ mod tests {
         // Drop non-existent
         assert!(!store.drop_index(b"idx"));
         assert!(!store.drop_index(b"nonexistent"));
+    }
+
+    /// Builds HSET-style args `[key, field, vector_bytes]` for
+    /// `auto_index_hset_public`, mirroring the wire format `find_vector_blob`
+    /// expects (field/value pairs starting at index 1).
+    fn hset_vector_args(key: &[u8], field: &[u8], vec: &[f32]) -> Vec<crate::protocol::Frame> {
+        let mut bytes = Vec::with_capacity(vec.len() * 4);
+        for v in vec {
+            bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        vec![
+            crate::protocol::Frame::BulkString(Bytes::copy_from_slice(key)),
+            crate::protocol::Frame::BulkString(Bytes::copy_from_slice(field)),
+            crate::protocol::Frame::BulkString(Bytes::from(bytes)),
+        ]
+    }
+
+    /// B2 (durability): `key_hash_to_vec_checksum` must be maintained in
+    /// lockstep with `key_hash_to_key` at every mutation site — insert,
+    /// update (checksum changes with the vector), and tombstone (both maps
+    /// prune the same key). A drift here would silently corrupt the B3
+    /// dedup rescan's unchanged-vs-changed decision.
+    #[test]
+    fn test_checksum_map_tracks_key_hash_to_key() {
+        let mut store = VectorStore::new();
+        store.create_index(make_meta("idx", 4, &["doc:"])).unwrap();
+        let mut text_store = crate::text::store::TextStore::new();
+
+        let key_hash = xxhash_rust::xxh64::xxh64(b"doc:1", 0);
+        let v1 = [1.0f32, 2.0, 3.0, 4.0];
+        let expected_checksum_v1 = {
+            let mut bytes = Vec::with_capacity(16);
+            for v in &v1 {
+                bytes.extend_from_slice(&v.to_le_bytes());
+            }
+            xxhash_rust::xxh64::xxh64(&bytes, 0)
+        };
+
+        // ── Insert ──────────────────────────────────────────────────────
+        crate::shard::spsc_handler::auto_index_hset_public(
+            &mut store,
+            &mut text_store,
+            b"doc:1",
+            &hset_vector_args(b"doc:1", b"vec", &v1),
+        );
+        {
+            let idx = store.get_index(b"idx").unwrap();
+            assert!(idx.key_hash_to_key.contains_key(&key_hash));
+            assert_eq!(
+                idx.key_hash_to_vec_checksum.get(&key_hash).copied(),
+                Some(expected_checksum_v1),
+                "checksum map must be populated on insert, matching xxh64 of the raw vector bytes"
+            );
+            assert_eq!(
+                idx.key_hash_to_key.len(),
+                idx.key_hash_to_vec_checksum.len(),
+                "checksum map must track key_hash_to_key 1:1"
+            );
+        }
+
+        // ── Update (different vector -> different checksum) ────────────
+        let v2 = [5.0f32, 6.0, 7.0, 8.0];
+        crate::shard::spsc_handler::auto_index_hset_public(
+            &mut store,
+            &mut text_store,
+            b"doc:1",
+            &hset_vector_args(b"doc:1", b"vec", &v2),
+        );
+        {
+            let idx = store.get_index(b"idx").unwrap();
+            let updated_checksum = idx.key_hash_to_vec_checksum.get(&key_hash).copied();
+            assert_ne!(
+                updated_checksum,
+                Some(expected_checksum_v1),
+                "checksum must change when the vector changes"
+            );
+            assert!(updated_checksum.is_some());
+            assert_eq!(
+                idx.key_hash_to_key.len(),
+                idx.key_hash_to_vec_checksum.len()
+            );
+        }
+
+        // ── Tombstone (DEL) prunes both maps together ───────────────────
+        store.mark_deleted_for_key(b"doc:1");
+        {
+            let idx = store.get_index(b"idx").unwrap();
+            assert!(!idx.key_hash_to_key.contains_key(&key_hash));
+            assert!(
+                !idx.key_hash_to_vec_checksum.contains_key(&key_hash),
+                "checksum map must be pruned alongside key_hash_to_key on delete"
+            );
+        }
+    }
+
+    /// End-to-end (B2, durability write path): `force_compact` with a
+    /// `persist_dir` configured must (a) write the compacted segment to disk
+    /// under `idx-<hex>/segment-<id>/` via the staged writer, and (b) — once
+    /// the background snapshot job lands — commit a `manifest.json` that
+    /// references that segment id and a readable `keymap-<epoch>.bin`
+    /// containing the inserted key.
+    #[test]
+    fn test_force_compact_persists_segment_and_manifest_when_persist_dir_set() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut store = VectorStore::new();
+        // set_persist_dir BEFORE create_index, mirroring event_loop.rs's
+        // startup order (create_index captures the store's persist_dir).
+        store.set_persist_dir(tmp.path().to_path_buf());
+        store.create_index(make_meta("idx", 4, &["doc:"])).unwrap();
+        let mut text_store = crate::text::store::TextStore::new();
+
+        crate::shard::spsc_handler::auto_index_hset_public(
+            &mut store,
+            &mut text_store,
+            b"doc:1",
+            &hset_vector_args(b"doc:1", b"vec", &[1.0, 2.0, 3.0, 4.0]),
+        );
+
+        store.get_index_mut(b"idx").unwrap().force_compact();
+
+        // The segment write happens synchronously (inline compact path) —
+        // must be visible immediately, no polling needed.
+        let idx_dir = crate::vector::persistence::manifest::index_persist_dir(tmp.path(), b"idx");
+        assert!(
+            idx_dir.join("segment-0").join("segment_meta.json").exists(),
+            "compacted segment must be persisted synchronously under segment-0"
+        );
+        assert!(
+            !idx_dir.join("staging-0").exists(),
+            "staged writer must leave no staging dir behind"
+        );
+
+        // The keymap/manifest snapshot is a background job — poll briefly.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let manifest = loop {
+            if let Some(m) = crate::vector::persistence::manifest::read_manifest_tolerant(&idx_dir)
+            {
+                break m;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "manifest.json never appeared within 5s"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+
+        assert_eq!(manifest.segment_ids, vec![0]);
+        let keymap = crate::vector::persistence::manifest::read_keymap_tolerant(
+            &idx_dir,
+            manifest.keymap_epoch,
+        )
+        .expect("keymap for the committed epoch must be readable");
+        assert_eq!(keymap.len(), 1);
+        assert_eq!(keymap[0].key_hash, xxhash_rust::xxh64::xxh64(b"doc:1", 0));
     }
 
     #[test]
