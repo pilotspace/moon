@@ -271,9 +271,17 @@ pub(super) async fn try_handle_ft_command(
             return true;
         }
         if cmd.eq_ignore_ascii_case(b"FT.INFO") {
-            let response = crate::shard::slice::with_shard(|s| {
-                crate::command::vector_search::ft_info(&s.vector_store, &s.text_store, cmd_args)
-            });
+            // Scatter + sum additive stats across shards (XC-SHARD-1): the local
+            // shard's index holds only its key-hash partition of the documents.
+            let response = crate::shard::coordinator::scatter_ft_info(
+                std::sync::Arc::new(frame.clone()),
+                ctx.shard_id,
+                ctx.num_shards,
+                &ctx.shard_databases,
+                &ctx.dispatch_tx,
+                &ctx.spsc_notifiers,
+            )
+            .await;
             responses.push(response);
             return true;
         }

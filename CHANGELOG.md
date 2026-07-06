@@ -6,6 +6,154 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance — FT.SEARCH intra-query worker pool + bounded bulk compaction
+
+- **`--ft-search-workers N` worker pool** (`src/vector/search_pool.rs`): the
+  per-segment HNSW searches of ONE KNN query fan out across a pool of searcher
+  threads while the shard task scans the mutable segment; replies are awaited
+  with `flume::recv_async`, so the shard event loop is never blocked. Default
+  **0 (off, opt-in)** — each segment pays the full resolved ef, so a pooled
+  N-segment query does ~N× the CPU work for its latency win: a 4.9× QPS win on
+  physical-core-rich boxes but a measured regression on SMT-constrained ones
+  (same posture as `--io-busy-poll-us`). Good opt-in size: physical cores −
+  shards, cap 8. Results are identical pooled or serial (enforced by
+  pooled-vs-serial identity + 8-thread concurrency stress tests); worker
+  panics are contained per-job (empty segment result + warn, never a hang).
+  Runtime-agnostic (monoio + tokio).
+- **Bounded bulk compaction**: with a pool active and `COMPACT_THRESHOLD > 0`,
+  one compaction build freezes at most `max(threshold, len/8)` entries
+  (`MutableSegment::freeze_prefix`), so FT.COMPACT after a bulk load yields
+  several independently searchable segments instead of one giant graph —
+  bounded build memory and pool-parallel search. Pool-less deployments keep
+  single-segment builds (multi-segment serial search would be strictly
+  slower). Red/green: `test_force_compact_bulk_bounded_segments`,
+  `test_bg_compact_bulk_bounded_segments`.
+- Measured (20k×384d clustered SQ8, single connection, post-FT.COMPACT,
+  R@10 = 1.0 in all rows): macOS 10-core p50 2.06 ms → **0.46 ms**, 473 →
+  **2,321 QPS (4.9×)**; GCE c3-standard-8 (4 physical cores) regresses at
+  default ef (1,732 → 1,165 QPS) — hence the opt-in default. The GCE probe
+  matrix also showed the per-index `EF_RUNTIME` knob alone closes most of the
+  vs-RediSearch clustered gap (ef 64: 4,493 QPS serial at R@10 = 1.0). Full
+  GCE vs-RediSearch tables in PR #214.
+
+### Fixed — update-churn no longer mass-deletes vectors at compact/merge install (soak-diagnostic find)
+
+- **Compact install: dead window entries no longer kill their own update.**
+  `snap_and_reconcile` treated ANY tombstoned entry in the frozen window as
+  "key deleted" and applied a key_hash-wide tombstone to the new immutable —
+  but since the VEC-1 update path tombstones the old copy in place, a key
+  updated before the freeze had a dead old copy AND a live new copy in the
+  same window, and the install deleted the new copy out of the segment.
+  Every key updated-then-compacted silently vanished from FT.SEARCH (32% of
+  live keys lost / live-set recall 0.985 → 0.685 in a 1-minute churn soak;
+  regression vs v0.5.1). A dead window entry now only proves deletion when
+  the key has no live window sibling.
+- **Merge install: source tombstones are origin-gated.** The merge replay
+  applied each source segment's lifetime interior tombstone set key_hash-wide
+  to the merged output, so a key whose old copy was tombstoned-by-update in
+  one source killed its current copy merged in from a sibling segment. The
+  replay now only tombstones entries whose `global_id` originated in the
+  tombstone's own source; DEL/UNLINK tombstones land in every source's set
+  and still apply everywhere.
+- **`VectorStore::insert_vector` allocates monotonic LSNs** (same allocator
+  as the wire path) instead of `mutable.len()+1`, which restarted after every
+  compaction and made merge dedup keep a stale copy over the current one.
+- Red/green: `test_bg_compact_update_before_freeze_survives_install`,
+  `test_bg_merge_update_across_segments_survives`; end-to-end churn repro
+  (24k mixed ops): LOST 1054 → 0, live-set recall 0.685 → 0.98.
+
+### Fixed — DEL/UNLINK now unindexes vectors on every dispatch path (soak-diagnostic find)
+
+- **Deleted keys no longer resurface in FT.SEARCH** — the vector auto-delete
+  hook (`mark_deleted_for_key`) existed only on the cross-shard SPSC `Execute`
+  arm and the tokio sharded handler. The monoio conn-local path (the default
+  runtime's only path at `--shards 1`), `handler_single`, the MULTI/EXEC batch
+  paths, and the SPSC pipeline arms never tombstoned vectors on DEL/UNLINK, so
+  deleted keys kept matching KNN searches forever (20% of results after one
+  minute of mixed churn; live-set recall collapsed 0.985 → 0.735 in the
+  Bundle-5 soak diagnostic). All paths now share one `auto_delete_vectors`
+  parity helper; wire-level red/green coverage in `tests/vector_del_unindex.rs`.
+
+### Added — long-run vector reliability harness
+
+- `scripts/vector-validate.py` — on-target validation driver: recall/QPS
+  comparison between two moon binaries (SQ8 + TQ4, ground-truth brute force),
+  churn soak with live-set recall / RSS / resurrection sampling, and kill -9
+  durability (settled-write survival + double-crash restart) under
+  `appendonly yes`.
+- `scripts/gcloud-vector-soak.sh` — GCE orchestration (c4a ARM + c3 x86):
+  ships the working branch via `git bundle`, builds baseline + branch binaries,
+  runs the validation driver, fetches JSON results, tears down on exit.
+- `scripts/bench-vector-vs-redisearch.py` — Moon vs RediSearch head-to-head
+  driver (same FT.* wire dialect for both engines): insert throughput, KNN-10
+  QPS/p50/p99, and R@10 vs numpy ground truth on random-Gaussian and
+  clustered-mixture 384d datasets, with an `EF_RUNTIME` sweep so QPS is
+  compared at matched recall.
+
+### Fixed — vector search correctness bundle (deep-review VEC-1/XC-SHARD-1/XC-3/VEC-4/VEC-7)
+
+- **HSET update no longer duplicates a vector** — re-indexing an existing key
+  tombstones the old copy first (O(1) fast path in the mutable segment via the
+  key→global-id map, scan fallback across mutable + immutable segments), so KNN
+  totals and results no longer count both the stale and the fresh vector.
+- **FT.INFO is now cluster-wide at `--shards N`** — previously answered from the
+  local shard only (~1/N of `num_docs`). Now scatter-gathers to every shard and
+  merges additively (top-level counters + per-field stats), on both the sharded
+  and monoio handlers.
+- **Filtered FT.SEARCH on the cooperative-yield path honors `FilterStrategy`** —
+  the yielding search always graph-filtered; the post-filter strategy (selective
+  filters) now searches unfiltered with 3×k oversampling and bitmap post-filter,
+  matching the non-yielding path's recall behavior.
+- **`FT.CREATE ... MERGE_MODE KEEP_RAW` is rejected fail-loud** — it silently
+  behaved as graph-union; now errors until the raw-vector sidecar is implemented
+  (the separate `KEEP_RAW ON` flag is unchanged).
+- **MEMORY DOCTOR / Prometheus KV memory no longer report 0 under unlimited
+  `maxmemory`** — the per-shard KV memory publish on the 100ms eviction tick
+  had been gated on `maxmemory > 0` since the GAP-1 elastic-budget work,
+  permanently zeroing the `DashTable + entries` line for the default config.
+  The publish (an O(1) accumulator read per DB) now runs unconditionally;
+  elastic-budget recompute stays gated on a finite cap.
+
+### Added
+
+- **`FT.CONFIG SET/GET <index> MERGE_RECALL_TOLERANCE <0.0..=1.0>`** — per-index
+  recall gate for unattended (background/vacuum) GraphUnion merges; default 0.70
+  unchanged.
+
+### Added — exact rerank stage (deep-review HQ-1)
+
+- **FT.SEARCH distances on compacted segments are now (near-)exact.** Immutable
+  segments carry an f16 sidecar of the original vectors (built at compaction,
+  BFS-ordered); the top `4·k` beam candidates are re-scored with true metric
+  distances (L2: squared L2; Cosine/InnerProduct: normalized-pair squared L2)
+  before top-k truncation, replacing pure quantized ADC estimates — the
+  recall lever vs engines that keep full-precision vectors. SQ8, previously
+  ZERO-refinement, benefits most; TQ4 estimates improve from percent-level
+  error to f16 tolerance (~1e-3).
+- The sidecar persists (`raw_f16.bin` per segment dir, missing file = no
+  sidecar, fully backward/forward compatible), survives GraphUnion merges
+  (all-or-nothing propagation), and is MEMORY DOCTOR-accounted. Memory cost:
+  +2·dim bytes per vector in both the mutable segment and compacted segments
+  (384d ≈ +768 B/vector); an opt-out knob is a follow-up.
+
+### Performance — SIMD SQ8 ADC kernels (deep-review HQ-2)
+
+- **SQ8 asymmetric distance is now SIMD-dispatched** (NEON / AVX2+FMA /
+  AVX-512F, scalar fallback) via an algebraic decomposition: per-query
+  constants `(Σq, Σq²)` computed once, per-candidate work reduced to three
+  fused widen-u8→f32 FMA sums `(Σq·c, Σc, Σc²)` combined in O(1). Wired into
+  HNSW beam search and both mutable-segment brute-force paths. Criterion
+  (aarch64 NEON): 2.7×/1.8×/1.6× faster per candidate at 128/384/768d.
+  Note: the pre-AVX2 x86 scalar fallback is ~1.65× slower than the old naive
+  loop (the decomposition only pays with SIMD); all supported targets
+  (aarch64 NEON, x86-64 AVX2+) are wins.
+
+### Performance — vector search hot-path quick wins
+
+- Copy-on-write `Arc` key map (no full `HashMap` clone per snapshot), hoisted
+  brute-force query prep, striped search metrics counters, stable aarch64
+  `prfm` node prefetch, dead quantize removed from the insert path, SQ8
+  `code_len` fix in compaction, and raw-buffer work skipped for SQ8 segments.
 ### Performance — coordinator local legs ride group commit under appendfsync=always (PR #TBD)
 
 - The cross-shard coordinator's LOCAL-leg persist (co-located MSET/MSETNX and

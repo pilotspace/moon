@@ -351,16 +351,20 @@ pub(crate) fn run_eviction_tick(
     // static scheme already has between eviction passes.
     {
         let rt = runtime_config.read();
+        // C5 / Phase 3: compute per-shard KV memory via ShardSlice without
+        // lock acquisitions (avoids per-DB read locks; estimated_memory() is
+        // an O(1) accumulator read). Published unconditionally: MEMORY DOCTOR
+        // and the Prometheus KV gauge read this atomic even when maxmemory is
+        // unlimited — gating it on maxmemory > 0 left them at a permanent 0.
+        let used = crate::shard::slice::with_shard(|s| {
+            s.databases
+                .iter()
+                .map(|db| db.estimated_memory())
+                .sum::<usize>()
+        });
+        shard_databases.publish_memory(shard_id, used);
+        // Elastic budgets only exist under a finite maxmemory cap.
         if rt.maxmemory > 0 {
-            // C5 / Phase 3: compute per-shard KV memory via ShardSlice without
-            // lock acquisitions (avoids per-DB read locks).
-            let used = crate::shard::slice::with_shard(|s| {
-                s.databases
-                    .iter()
-                    .map(|db| db.estimated_memory())
-                    .sum::<usize>()
-            });
-            shard_databases.publish_memory(shard_id, used);
             shard_databases.recompute_elastic_budget(shard_id, &rt);
         }
     }

@@ -54,8 +54,7 @@ fn bench_raw_append_128d() {
 
     let start = Instant::now();
     for i in 0..n {
-        let norm: f32 = vectors[i].iter().map(|x| x * x).sum::<f32>().sqrt();
-        seg.append(i as u64, &vectors[i], &sq_vecs[i], norm, 0);
+        seg.append(i as u64, &vectors[i], 0);
     }
     let elapsed = start.elapsed();
 
@@ -109,8 +108,7 @@ fn bench_raw_append_768d() {
 
     let start = Instant::now();
     for i in 0..n {
-        let norm: f32 = vectors[i].iter().map(|x| x * x).sum::<f32>().sqrt();
-        seg.append(i as u64, &vectors[i], &sq_vecs[i], norm, 0);
+        seg.append(i as u64, &vectors[i], 0);
     }
     let elapsed = start.elapsed();
 
@@ -183,7 +181,6 @@ fn bench_full_insert_pipeline_128d() {
         let mut sq_vec = vec![0i8; dim as usize];
         vector_search::quantize_f32_to_sq(&f32_vec, &mut sq_vec);
         // Norm
-        let norm: f32 = f32_vec.iter().map(|x| x * x).sum::<f32>().sqrt();
         // Key hash
         let key = format!("doc:{i}");
         let key_hash = xxhash_rust::xxh64::xxh64(key.as_bytes(), 0);
@@ -192,7 +189,7 @@ fn bench_full_insert_pipeline_128d() {
             .get_index_mut(&bytes::Bytes::from_static(b"idx"))
             .unwrap();
         let snap = idx.segments.load();
-        snap.mutable.append(key_hash, &f32_vec, &sq_vec, norm, 0);
+        snap.mutable.append(key_hash, &f32_vec, 0);
     }
     let elapsed = start.elapsed();
 
@@ -258,14 +255,13 @@ fn bench_full_insert_pipeline_768d() {
         }
         let mut sq_vec = vec![0i8; dim as usize];
         vector_search::quantize_f32_to_sq(&f32_vec, &mut sq_vec);
-        let norm: f32 = f32_vec.iter().map(|x| x * x).sum::<f32>().sqrt();
         let key = format!("doc:{i}");
         let key_hash = xxhash_rust::xxh64::xxh64(key.as_bytes(), 0);
         let idx = store
             .get_index_mut(&bytes::Bytes::from_static(b"idx"))
             .unwrap();
         let snap = idx.segments.load();
-        snap.mutable.append(key_hash, &f32_vec, &sq_vec, norm, 0);
+        snap.mutable.append(key_hash, &f32_vec, 0);
     }
     let elapsed = start.elapsed();
 

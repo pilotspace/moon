@@ -918,6 +918,14 @@ pub(crate) fn handle_shard_message_shared(
                         }
                     }
 
+                    // Auto-delete vectors on DEL/UNLINK (parity with the HSET
+                    // hook above and the Execute arm's auto-delete).
+                    if !matches!(frame, crate::protocol::Frame::Error(_))
+                        && (cmd.eq_ignore_ascii_case(b"DEL") || cmd.eq_ignore_ascii_case(b"UNLINK"))
+                    {
+                        auto_delete_vectors(&mut s.vector_store, args);
+                    }
+
                     // Post-dispatch wakeup hooks for producer commands (cross-shard blocking)
                     if !matches!(frame, crate::protocol::Frame::Error(_)) {
                         let needs_wake = cmd.eq_ignore_ascii_case(b"LPUSH")
@@ -1279,6 +1287,14 @@ pub(crate) fn handle_shard_message_shared(
                                 0,
                             );
                         }
+                    }
+
+                    // Auto-delete vectors on DEL/UNLINK (parity with the HSET
+                    // hook above and the Execute arm's auto-delete).
+                    if !matches!(frame, crate::protocol::Frame::Error(_))
+                        && (cmd.eq_ignore_ascii_case(b"DEL") || cmd.eq_ignore_ascii_case(b"UNLINK"))
+                    {
+                        auto_delete_vectors(&mut s.vector_store, args);
                     }
 
                     if !matches!(frame, crate::protocol::Frame::Error(_)) {
@@ -2131,6 +2147,19 @@ pub fn auto_index_hset_public(
     auto_index_hset(vector_store, text_store, key, args, 0)
 }
 
+/// Tombstone auto-indexed vectors for every key argument of a successful
+/// DEL/UNLINK. Wire-parity requirement: every dispatch path that runs
+/// `auto_index_hset*` on HSET must run this on DEL/UNLINK, or deleted keys
+/// keep matching FT.SEARCH forever (resurrection + live-set recall collapse;
+/// found by the Bundle-5 soak diagnostic at shards=1).
+pub fn auto_delete_vectors(vector_store: &mut VectorStore, args: &[crate::protocol::Frame]) {
+    for arg in args {
+        if let Some(key) = crate::server::connection::extract_bytes(arg) {
+            vector_store.mark_deleted_for_key(key.as_ref());
+        }
+    }
+}
+
 /// TXN-aware variant: tags each inserted vector entry with `txn_id` so
 /// non-transactional readers (snapshot_lsn == 0) see it as uncommitted and
 /// exclude it until TXN.COMMIT calls `txn_manager.commit(txn_id)`.
@@ -2329,13 +2358,9 @@ fn handle_vector_insert(
     for chunk in blob.chunks_exact(4) {
         f32_vec.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
     }
-    // SQ quantize
-    let mut sq_vec = vec![0i8; dim];
-    vector_search::quantize_f32_to_sq(&f32_vec, &mut sq_vec);
-    // Compute norm
-    let norm: f32 = f32_vec.iter().map(|x| x * x).sum::<f32>().sqrt();
-    // Record original Redis key for FT.SEARCH response.
-    idx.key_hash_to_key
+    // Record original Redis key for FT.SEARCH response. COW via make_mut:
+    // clones only if a search snapshot holds the map concurrently (QP-1).
+    std::sync::Arc::make_mut(&mut idx.key_hash_to_key)
         .entry(key_hash)
         .or_insert_with(|| bytes::Bytes::copy_from_slice(key));
     // Append to mutable segment. `insert_lsn` is the monotonic LSN allocated
@@ -2344,12 +2369,39 @@ fn handle_vector_insert(
     // TXN snapshot isolation. When inside a TXN (txn_id != 0), use the
     // transactional variant so non-TXN readers see the entry as uncommitted.
     let snap = idx.segments.load();
+    // VEC-1: an HSET on an already-indexed key is an UPDATE — tombstone the
+    // prior version BEFORE appending, or the index accumulates stale
+    // duplicates (doc returned twice, num_docs inflating under churn).
+    // Non-txn path only: a txn's tombstone must not leak to other readers
+    // before commit (txn vector updates keep prior append-only behavior).
+    if txn_id == 0 {
+        if let Some(&old_gid) = idx.key_hash_to_global_id.get(&key_hash) {
+            let base = snap.mutable.global_id_base();
+            if old_gid >= base
+                && snap
+                    .mutable
+                    .mark_deleted_if_key(old_gid - base, key_hash, insert_lsn)
+            {
+                // O(1) fast path: old version still in the mutable segment,
+                // MVCC-tombstoned at the new version's LSN (older snapshots
+                // keep seeing the old vector; new snapshots see only the new).
+            } else {
+                // Old version was compacted (or the gid mapping was stale):
+                // steady-state interior tombstone across immutable segments —
+                // the same path DEL/UNLINK takes via `mark_deleted_for_key` —
+                // plus a defensive mutable scan for the stale-mapping case.
+                snap.mutable.mark_deleted_by_key_hash(key_hash, insert_lsn);
+                for imm in snap.immutable.iter() {
+                    imm.mark_deleted_by_key_hash(key_hash);
+                }
+            }
+        }
+    }
     let internal_id = if txn_id != 0 {
         snap.mutable
-            .append_transactional(key_hash, &f32_vec, &sq_vec, norm, insert_lsn, txn_id)
+            .append_transactional(key_hash, &f32_vec, insert_lsn, txn_id)
     } else {
-        snap.mutable
-            .append(key_hash, &f32_vec, &sq_vec, norm, insert_lsn)
+        snap.mutable.append(key_hash, &f32_vec, insert_lsn)
     };
     // Use global_id for payload index so filter bitmaps match
     // search results after compaction advances global_id_base.
@@ -2399,14 +2451,9 @@ fn handle_vector_insert_field(
     for chunk in blob.chunks_exact(4) {
         f32_vec.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
     }
-    // SQ quantize
-    let mut sq_vec = vec![0i8; dim];
-    vector_search::quantize_f32_to_sq(&f32_vec, &mut sq_vec);
-    // Compute norm
-    let norm: f32 = f32_vec.iter().map(|x| x * x).sum::<f32>().sqrt();
-
-    // Record original Redis key (shared across all fields)
-    idx.key_hash_to_key
+    // Record original Redis key (shared across all fields). COW via make_mut:
+    // clones only if a search snapshot holds the map concurrently (QP-1).
+    std::sync::Arc::make_mut(&mut idx.key_hash_to_key)
         .entry(key_hash)
         .or_insert_with(|| bytes::Bytes::copy_from_slice(key));
 
@@ -2419,12 +2466,20 @@ fn handle_vector_insert_field(
     // so both fields share one logical write event (Phase 165 MVCC contract).
     // When inside a TXN (txn_id != 0), tag with txn_id for uncommitted visibility.
     let snap = fs.segments.load();
+    // VEC-1 (additional fields): tombstone the prior version on update. Field
+    // segments have no `key_hash → global_id` map, so this is the scan path
+    // (mutable is bounded by compact_threshold; immutables are set lookups).
+    if txn_id == 0 {
+        snap.mutable.mark_deleted_by_key_hash(key_hash, insert_lsn);
+        for imm in snap.immutable.iter() {
+            imm.mark_deleted_by_key_hash(key_hash);
+        }
+    }
     let _internal_id = if txn_id != 0 {
         snap.mutable
-            .append_transactional(key_hash, &f32_vec, &sq_vec, norm, insert_lsn, txn_id)
+            .append_transactional(key_hash, &f32_vec, insert_lsn, txn_id)
     } else {
-        snap.mutable
-            .append(key_hash, &f32_vec, &sq_vec, norm, insert_lsn)
+        snap.mutable.append(key_hash, &f32_vec, insert_lsn)
     };
     crate::vector::metrics::add_vectors(1);
     // Note: global_id and payload_index are NOT updated here.

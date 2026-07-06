@@ -240,9 +240,9 @@ pub fn info(db: &Database, _args: &[Frame]) -> Frame {
          vector_compaction_duration_ms:{}\r\n\
          vector_mutable_segment_bytes:{}\r\n",
         crate::vector::metrics::VECTOR_INDEXES.load(std::sync::atomic::Ordering::Relaxed),
-        crate::vector::metrics::VECTOR_TOTAL_VECTORS.load(std::sync::atomic::Ordering::Relaxed),
+        crate::vector::metrics::total_vectors(),
         crate::vector::metrics::VECTOR_MEMORY_BYTES.load(std::sync::atomic::Ordering::Relaxed),
-        crate::vector::metrics::VECTOR_SEARCH_TOTAL.load(std::sync::atomic::Ordering::Relaxed),
+        crate::vector::metrics::search_total(),
         crate::vector::metrics::VECTOR_SEARCH_LATENCY_US.load(std::sync::atomic::Ordering::Relaxed),
         crate::vector::metrics::VECTOR_COMPACTION_COUNT.load(std::sync::atomic::Ordering::Relaxed),
         crate::vector::metrics::VECTOR_COMPACTION_DURATION_MS

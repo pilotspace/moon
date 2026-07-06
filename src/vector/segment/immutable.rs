@@ -85,6 +85,14 @@ pub struct ImmutableSegment {
     // limitation — count becomes a lower bound, not exact).
     has_tombstones: AtomicBool,
     tombstoned_keys: parking_lot::RwLock<HashSet<u64>>,
+
+    /// Exact-rerank sidecar (HQ-1): f16 copy of each ORIGINAL vector,
+    /// BFS-ordered like `vectors_tq`, `dimension` halves per entry. When
+    /// present, beam candidates are re-scored with (near-)exact distances
+    /// before top-k truncation — the returned distances are then true metric
+    /// values to f16 tolerance instead of quantized ADC estimates. `None` for
+    /// segments built without raw vectors (pre-sidecar disk segments).
+    raw_f16: Option<Vec<u16>>,
 }
 
 impl ImmutableSegment {
@@ -117,7 +125,104 @@ impl ImmutableSegment {
             created_at: Instant::now(),
             has_tombstones: AtomicBool::new(false),
             tombstoned_keys: parking_lot::RwLock::new(HashSet::new()),
+            raw_f16: None,
         }
+    }
+
+    /// Attach the exact-rerank sidecar (HQ-1): BFS-ordered f16 copies of the
+    /// original vectors, `dimension` halves per entry. Builder-style so the
+    /// many `new()` call sites without raw vectors stay untouched.
+    #[must_use]
+    pub fn with_raw_f16(mut self, raw_f16: Option<Vec<u16>>) -> Self {
+        if let Some(ref buf) = raw_f16 {
+            debug_assert_eq!(
+                buf.len(),
+                self.mvcc.len() * self.collection_meta.dimension as usize,
+                "raw_f16 sidecar must hold dimension halves per BFS entry"
+            );
+        }
+        self.raw_f16 = raw_f16;
+        self
+    }
+
+    /// The exact-rerank sidecar, if this segment carries one (BFS-ordered,
+    /// `dimension` u16 halves per entry). Used by segment persistence and
+    /// GraphUnion merge to propagate the sidecar.
+    pub fn raw_f16(&self) -> Option<&[u16]> {
+        self.raw_f16.as_deref()
+    }
+
+    /// Exact rerank (HQ-1): re-score `candidates` with (near-)exact distances
+    /// decoded from the f16 sidecar, replacing their quantized ADC estimates,
+    /// then re-sort ascending. No-op when the segment has no sidecar.
+    ///
+    /// Distance conventions match the quantized paths so cross-segment merge
+    /// stays consistent:
+    /// - L2: true squared L2 on the original vectors.
+    /// - Cosine / InnerProduct (unit-sphere metrics, mirroring SQ8's encode
+    ///   normalization): squared L2 between the normalized pair,
+    ///   `2 − 2·⟨q̂,x⟩/‖x‖`.
+    ///
+    /// Candidates still carry per-segment internal ids (pre
+    /// `remap_to_global_ids`); `graph.to_bfs` maps them into the sidecar.
+    ///
+    /// Cost control: only the top `4·k` ADC-ranked candidates are re-scored
+    /// (candidates arrive nearest-first from the beam). The true top-k landing
+    /// outside a 4× ADC oversample is rare; re-scoring the full ef-wide beam
+    /// costs ~ef·dim f16 decodes per segment for negligible recall beyond that.
+    fn rerank_exact(&self, candidates: &mut SmallVec<[SearchResult; 32]>, query: &[f32], k: usize) {
+        let Some(raw) = self.raw_f16.as_deref() else {
+            return;
+        };
+        if candidates.is_empty() {
+            return;
+        }
+        let rerank_n = (4 * k.max(1)).min(candidates.len());
+        let dim = self.collection_meta.dimension as usize;
+        let is_l2 = self.collection_meta.metric == crate::vector::types::DistanceMetric::L2;
+
+        // Unit-sphere metrics: normalize the query once per call.
+        let mut q_unit: Vec<f32> = Vec::new();
+        let q_ref: &[f32] = if is_l2 {
+            query
+        } else {
+            let norm: f32 = query.iter().map(|x| x * x).sum::<f32>().sqrt();
+            if norm > 0.0 {
+                let inv = 1.0 / norm;
+                q_unit.extend(query.iter().map(|x| x * inv));
+            } else {
+                q_unit.extend_from_slice(query);
+            }
+            &q_unit
+        };
+
+        for result in candidates[..rerank_n].iter_mut() {
+            let bfs_pos = self.graph.to_bfs(result.id.0) as usize;
+            let start = bfs_pos * dim;
+            let Some(vec_f16) = raw.get(start..start + dim) else {
+                continue; // Out-of-range id: keep the ADC estimate.
+            };
+            if is_l2 {
+                result.distance = crate::vector::f16::l2_sq_f16(q_ref, vec_f16);
+            } else {
+                // One pass: ⟨q̂,x⟩ and ‖x‖² from the f16-decoded vector.
+                let mut dot = 0.0f32;
+                let mut xsq = 0.0f32;
+                for (q, &h) in q_ref.iter().zip(vec_f16.iter()) {
+                    let x = crate::vector::f16::f16_to_f32(h);
+                    dot += q * x;
+                    xsq += x * x;
+                }
+                if xsq > 0.0 {
+                    // f16 rounding can push cos slightly outside [-1, 1];
+                    // clamp so distances stay in the metric's [0, 4] range.
+                    let cos = (dot / xsq.sqrt()).clamp(-1.0, 1.0);
+                    result.distance = 2.0 - 2.0 * cos;
+                }
+                // Zero vector: normalized form undefined — keep ADC estimate.
+            }
+        }
+        candidates.sort_unstable();
     }
 
     /// Mark a key as deleted via interior mutability.
@@ -208,16 +313,24 @@ impl ImmutableSegment {
                 ef_search,
                 scratch,
             );
-            // Fallback: rerank with TQ_prod when no sub-centroid data
-            self.rerank_with_prod(&mut cands, query);
+            // Fallback: rerank with TQ_prod when no sub-centroid data AND no
+            // exact sidecar (rerank_exact below supersedes the estimator).
+            if self.raw_f16.is_none() {
+                self.rerank_with_prod(&mut cands, query);
+            }
             cands
         };
-        // Filter deleted entries before truncating so that k live results are
-        // returned even when some candidates are tombstoned.
+        // Filter deleted entries first so tombstones neither consume the
+        // exact-rerank 4·k budget nor leave stale ADC scores mixed into the
+        // post-rerank ordering.
         candidates.retain(|c| {
             let bfs = self.graph.to_bfs(c.id.0);
             self.is_live_bfs(bfs)
         });
+        // HQ-1: exact rerank of the live beam (ef candidates) from the f16
+        // sidecar — replaces quantized estimates with true metric distances
+        // before top-k truncation. No-op without a sidecar.
+        self.rerank_exact(&mut candidates, query, k);
         candidates.truncate(k);
         self.remap_to_global_ids(&mut candidates);
         candidates
@@ -248,15 +361,18 @@ impl ImmutableSegment {
         );
 
         // When sub-centroid signs are used in beam, no rerank needed.
-        // Only rerank if beam used standard 16-level scoring.
-        if self.sub_centroid_signs.is_empty() {
+        // Only rerank if beam used standard 16-level scoring (and no exact
+        // sidecar — rerank_exact below supersedes the estimator).
+        if self.sub_centroid_signs.is_empty() && self.raw_f16.is_none() {
             self.rerank_with_prod(&mut candidates, query);
         }
-        // Filter deleted entries before truncating.
+        // Filter deleted entries first (see comment in search()).
         candidates.retain(|c| {
             let bfs = self.graph.to_bfs(c.id.0);
             self.is_live_bfs(bfs)
         });
+        // HQ-1: exact rerank of the live beam from the f16 sidecar.
+        self.rerank_exact(&mut candidates, query, k);
         candidates.truncate(k);
         self.remap_to_global_ids(&mut candidates);
         candidates
@@ -500,7 +616,11 @@ impl ImmutableSegment {
         let norms = self.residual_norms.len() * std::mem::size_of::<f32>();
         let sub = self.sub_centroid_signs.len();
         let mvcc = self.mvcc.len() * std::mem::size_of::<MvccHeader>();
-        graph + tq + qjl + norms + sub + mvcc
+        let sidecar = self
+            .raw_f16
+            .as_ref()
+            .map_or(0, |v| v.len() * std::mem::size_of::<u16>());
+        graph + tq + qjl + norms + sub + mvcc + sidecar
     }
 
     /// Fraction of dead entries: (total - live) / total.
@@ -669,6 +789,31 @@ impl ImmutableSegment {
         let mut count = 0u32;
         for h in self.mvcc.iter_mut() {
             if h.key_hash == key_hash && h.delete_lsn == 0 {
+                h.delete_lsn = 1; // sentinel: deleted during reconciliation
+                self.live_count = self.live_count.saturating_sub(1);
+                count += 1;
+            }
+        }
+        count
+    }
+
+    /// Origin-filtered variant of [`mark_deleted_by_key_hash_install`]: only
+    /// tombstones entries whose `global_id` is in `source_gids`.
+    ///
+    /// Used by the merge-install tombstone replay. A source segment's interior
+    /// tombstone was recorded against the copies THAT source held; replaying it
+    /// key_hash-wide onto the merged output would also kill a NEWER same-key
+    /// copy merged in from a sibling segment (the update-then-compact case —
+    /// mass index loss under churn). Real DEL/UNLINK tombstones land in every
+    /// source's interior set, so gating by origin still kills them everywhere.
+    pub fn mark_deleted_by_key_hash_install_from(
+        &mut self,
+        key_hash: u64,
+        source_gids: &std::collections::HashSet<u32>,
+    ) -> u32 {
+        let mut count = 0u32;
+        for h in self.mvcc.iter_mut() {
+            if h.key_hash == key_hash && h.delete_lsn == 0 && source_gids.contains(&h.global_id) {
                 h.delete_lsn = 1; // sentinel: deleted during reconciliation
                 self.live_count = self.live_count.saturating_sub(1);
                 count += 1;

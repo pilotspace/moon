@@ -279,6 +279,19 @@ pub struct ServerConfig {
     #[arg(long = "io-busy-poll-us", default_value_t = 0)]
     pub io_busy_poll_us: u64,
 
+    /// FT.SEARCH intra-query worker threads: per-segment HNSW searches of one
+    /// KNN query fan out across this pool, cutting single-query latency on
+    /// multi-segment indexes (the pool also serves concurrent queries).
+    /// Default 0 = disabled (serial per-segment loop; results are identical
+    /// either way). Opt in on boxes with spare PHYSICAL cores — a good size is
+    /// cores minus shards, capped at 8 (see search_pool::auto_workers).
+    /// Measured (20k×384d clustered SQ8, single conn, R@10=1.0): macOS
+    /// 10-core 473→2,321 QPS (4.9×); GCE c3-standard-8 (4 physical cores)
+    /// REGRESSES at default ef — each segment pays the full resolved ef, so a
+    /// pooled N-segment query does ~N× the CPU work for its latency win.
+    #[arg(long = "ft-search-workers")]
+    pub ft_search_workers: Option<usize>,
+
     // ── MoonStore v2: Disk Offload ──────────────────────────────────
     /// Enable disk offload (tiered storage: RAM -> mmap -> NVMe)
     #[arg(long = "disk-offload", default_value = "enable")]
@@ -1236,6 +1249,24 @@ mod tests {
         assert_eq!(config.io_driver, "epoll");
         // clap-level validation: anything outside auto|epoll is a parse error.
         assert!(ServerConfig::try_parse_from(["moon", "--io-driver", "iouring"]).is_err());
+    }
+
+    #[test]
+    fn test_ft_search_workers_flag() {
+        let config = ServerConfig::parse_from::<[&str; 0], &str>([]);
+        assert_eq!(
+            config.ft_search_workers, None,
+            "default must be auto (None)"
+        );
+        let config = ServerConfig::parse_from(["moon", "--ft-search-workers", "4"]);
+        assert_eq!(config.ft_search_workers, Some(4));
+        let config = ServerConfig::parse_from(["moon", "--ft-search-workers", "0"]);
+        assert_eq!(
+            config.ft_search_workers,
+            Some(0),
+            "0 must parse (explicit off)"
+        );
+        assert!(ServerConfig::try_parse_from(["moon", "--ft-search-workers", "x"]).is_err());
     }
 
     #[test]

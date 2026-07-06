@@ -189,7 +189,12 @@ pub struct VectorIndex {
     /// return the original Redis key (e.g., `doc:1755`) instead of the internal
     /// `vec:<internal_id>` form. Survives compaction and segment merging because
     /// it's keyed by the stable `key_hash`, not the volatile internal ID.
-    pub key_hash_to_key: std::collections::HashMap<u64, Bytes>,
+    ///
+    /// `Arc`-wrapped so search snapshots capture it in O(1) (QP-1: the previous
+    /// owned `HashMap` was deep-cloned per query — one entry per indexed vector).
+    /// Writers mutate via [`Arc::make_mut`]: copy-on-write triggers only when a
+    /// snapshot is concurrently alive, at most once per snapshot lifetime.
+    pub key_hash_to_key: Arc<std::collections::HashMap<u64, Bytes>>,
     /// Maps `key_hash` → `global_id` for metadata-only updates.
     ///
     /// When `HSET doc:1 category "science"` is called without a vector blob,
@@ -200,6 +205,11 @@ pub struct VectorIndex {
     /// Set to false via FT.CONFIG SET idx AUTOCOMPACT OFF for bulk ingestion.
     /// Manual FT.COMPACT always works regardless of this flag.
     pub autocompact_enabled: bool,
+    /// Recall-gate tolerance for UNATTENDED (background/vacuum) GraphUnion
+    /// merges (VEC-4). Default 0.70 (catastrophic-collapse guard only); the
+    /// manual FT.COMPACT merge path uses 0.90. Tunable per index via
+    /// `FT.CONFIG SET <idx> MERGE_RECALL_TOLERANCE <0.0..=1.0>`.
+    pub merge_recall_tolerance: f32,
     /// Per-index compaction priority weight for the autovacuum scheduler (W3-deep).
     ///
     /// Multiplies the raw `dead_bytes_rate` before comparison in `CompactionScheduler`.
@@ -347,7 +357,7 @@ impl VectorIndex {
             let fs_len = fs.segments.load().mutable.len();
             if fs_len >= threshold {
                 let dim = fs.collection.dimension;
-                Self::compact_segments(&mut fs.segments, &mut fs.scratch, &fs.collection, dim);
+                Self::compact_segments(&mut fs.segments, &mut fs.scratch, &fs.collection, dim, 0);
             }
         }
     }
@@ -399,7 +409,13 @@ impl VectorIndex {
                 // Compact additional fields inline (no in-flight for those).
                 for (_, fs) in &mut self.field_segments {
                     let dim = fs.collection.dimension;
-                    Self::compact_segments(&mut fs.segments, &mut fs.scratch, &fs.collection, dim);
+                    Self::compact_segments(
+                        &mut fs.segments,
+                        &mut fs.scratch,
+                        &fs.collection,
+                        dim,
+                        0,
+                    );
                 }
                 return;
             }
@@ -412,57 +428,94 @@ impl VectorIndex {
             &mut self.scratch,
             &self.collection,
             self.meta.dimension,
+            self.meta.compact_threshold as usize,
         );
-        // Compact additional fields
+        // Compact additional fields (legacy unbounded semantics: threshold 0).
         for (_, fs) in &mut self.field_segments {
             let dim = fs.collection.dimension;
-            Self::compact_segments(&mut fs.segments, &mut fs.scratch, &fs.collection, dim);
+            Self::compact_segments(&mut fs.segments, &mut fs.scratch, &fs.collection, dim, 0);
         }
     }
 
-    /// Compact a single field's mutable segment into an immutable HNSW segment.
+    /// Compact a field's mutable segment into immutable HNSW segment(s).
+    ///
+    /// With a non-zero `compact_threshold` the mutable is drained in
+    /// `bulk_freeze_cap`-bounded prefix builds — a bulk load yields several
+    /// independently searchable segments (see `bulk_freeze_cap`). The tail
+    /// survives each install via `clone_suffix`, preserving the global ID
+    /// space, exactly like the background install path.
     fn compact_segments(
         segments: &mut SegmentHolder,
         scratch: &mut SearchScratch,
         collection: &Arc<CollectionMetadata>,
         dimension: u32,
+        compact_threshold: usize,
     ) {
-        let mutable_len = segments.load().mutable.len();
-        if mutable_len == 0 {
-            return;
-        }
-
-        let frozen = segments.load().mutable.freeze();
+        let _ = dimension;
         let seed = collection.collection_id.wrapping_mul(6364136223846793005);
-
-        match compaction::compact(&frozen, collection, seed, None) {
-            Ok(immutable) => {
-                let num_nodes = immutable.graph().num_nodes();
-                let padded = collection.padded_dimension;
-                *scratch = SearchScratch::new(num_nodes, padded);
-
-                let old = segments.load();
-                let next_global = old.mutable.next_global_id();
-                let mut imm_list = old.immutable.clone();
-                imm_list.push(Arc::new(immutable));
-                let new_mutable = Arc::new(crate::vector::segment::mutable::MutableSegment::new(
-                    dimension,
-                    collection.clone(),
-                ));
-                new_mutable.set_global_id_base(next_global);
-                let new_list = SegmentList {
-                    mutable: new_mutable,
-                    immutable: imm_list,
-                    ivf: old.ivf.clone(),
-                    warm: old.warm.clone(),
-                    cold: old.cold.clone(),
-                };
-                segments.swap(new_list);
+        loop {
+            let snap = segments.load();
+            let mutable_len = snap.mutable.len();
+            if mutable_len == 0 {
+                return;
             }
-            Err(_e) => {
-                // Compaction failed (recall too low, etc.) — fall back to brute force
+            let frozen_len = mutable_len.min(bulk_freeze_cap(mutable_len, compact_threshold));
+            let frozen = snap.mutable.freeze_prefix(frozen_len);
+            drop(snap);
+
+            match compaction::compact(&frozen, collection, seed, None) {
+                Ok(immutable) => {
+                    let num_nodes = immutable.graph().num_nodes();
+                    let padded = collection.padded_dimension;
+                    *scratch = SearchScratch::new(num_nodes, padded);
+
+                    let old = segments.load();
+                    let tail_mutable = old.mutable.clone_suffix(frozen_len);
+                    let mut imm_list = old.immutable.clone();
+                    imm_list.push(Arc::new(immutable));
+                    let new_list = SegmentList {
+                        mutable: tail_mutable,
+                        immutable: imm_list,
+                        ivf: old.ivf.clone(),
+                        warm: old.warm.clone(),
+                        cold: old.cold.clone(),
+                    };
+                    segments.swap(new_list);
+                    if frozen_len == mutable_len {
+                        return; // drained
+                    }
+                }
+                Err(_e) => {
+                    // Compaction failed (recall too low, etc.) — leave the
+                    // rest in brute-force mutable.
+                    return;
+                }
             }
         }
+    }
+}
+
+/// Max segments one bulk-loaded mutable is split into when its compact
+/// threshold can't bound the build count sensibly (huge loads). Matches the
+/// search pool's worker cap — more segments than workers adds merge overhead
+/// without more parallelism.
+const MAX_BULK_SEGMENTS: usize = 8;
+
+/// Bounded-freeze cap for one compaction build. `compact_threshold == 0`
+/// (auto-compact disabled — legacy/test indexes) keeps the historical
+/// whole-mutable single-segment semantics; otherwise a bulk-loaded mutable is
+/// compacted in `max(threshold, len/MAX_BULK_SEGMENTS)`-sized builds, so
+/// FT.COMPACT after a bulk load yields several independently searchable
+/// segments (bounded build memory; intra-query pool fan-out) instead of one
+/// giant graph.
+fn bulk_freeze_cap(mutable_len: usize, compact_threshold: usize) -> usize {
+    // Only split when an intra-query pool exists: multiple segments searched
+    // SERIALLY are strictly slower than one graph (each segment pays the full
+    // resolved ef beam), so pool-less deployments keep single-segment builds.
+    if compact_threshold == 0 || crate::vector::search_pool::global().is_none() {
+        mutable_len
+    } else {
+        compact_threshold.max(mutable_len.div_ceil(MAX_BULK_SEGMENTS))
     }
 }
 
@@ -491,9 +544,29 @@ fn snap_and_reconcile(
         tail_keys.insert(key_hash);
     });
 
+    // Key_hashes that still have a LIVE copy inside the window. A dead window
+    // entry whose key also has a live window sibling is an UPDATE leftover
+    // (VEC-1 tombstones the old copy in place before appending the new one) —
+    // compact() already filtered the dead copy, and the live sibling IS the
+    // current version inside `immutable`. Key_hash-wide tombstoning on that
+    // evidence would delete the current version: every key updated before the
+    // freeze vanished from search (32% of live keys in the churn soak).
+    // Only a dead entry with NO live window sibling proves the key is gone
+    // (DEL/UNLINK marks ALL copies dead; a post-freeze update lands its new
+    // copy in the tail, which the `tail_keys` arm handles).
+    let mut live_window_keys: std::collections::HashSet<u64> = std::collections::HashSet::new();
     snap.mutable
         .for_each_window_entry(frozen_len, |key_hash, delete_lsn| {
-            if delete_lsn != 0 || tail_keys.contains(&key_hash) {
+            if delete_lsn == 0 {
+                live_window_keys.insert(key_hash);
+            }
+        });
+
+    snap.mutable
+        .for_each_window_entry(frozen_len, |key_hash, delete_lsn| {
+            if (delete_lsn != 0 && !live_window_keys.contains(&key_hash))
+                || tail_keys.contains(&key_hash)
+            {
                 immutable.mark_deleted_by_key_hash_install(key_hash);
             }
         });
@@ -520,12 +593,19 @@ impl VectorIndex {
             return false;
         }
         let snap = self.segments.load();
-        let frozen_len = snap.mutable.len();
-        if frozen_len == 0 {
+        let mutable_len = snap.mutable.len();
+        if mutable_len == 0 {
             return false;
         }
+        // Bounded build: a bulk-loaded mutable compacts in threshold-sized
+        // chunks (the due-gate re-fires while len >= threshold, so the tail
+        // drains across successive begin/install cycles).
+        let frozen_len = mutable_len.min(bulk_freeze_cap(
+            mutable_len,
+            self.meta.compact_threshold as usize,
+        ));
         let frozen_global_base = snap.mutable.global_id_base();
-        let frozen = snap.mutable.freeze();
+        let frozen = snap.mutable.freeze_prefix(frozen_len);
         drop(snap);
 
         let seed = self
@@ -717,9 +797,10 @@ impl VectorIndex {
             .collection_id
             .wrapping_mul(6364136223846793005);
         let mode = self.meta.merge_mode;
-        // Use 0.70 tolerance (same as vacuum_pass): catch catastrophic recall
-        // collapse without false-positives on small/medium indexes.
-        let tolerance = 0.70;
+        // Default 0.70 (same as vacuum_pass): catch catastrophic recall
+        // collapse without false-positives on small/medium indexes. Per-index
+        // override: FT.CONFIG SET <idx> MERGE_RECALL_TOLERANCE (VEC-4).
+        let tolerance = self.merge_recall_tolerance;
 
         match compactor.submit_merge(segs.clone(), self.collection.clone(), seed, mode, tolerance) {
             Ok(reply_rx) => {
@@ -804,10 +885,22 @@ impl VectorIndex {
         // merge_immutable already dropped entries with mvcc.delete_lsn != 0
         // at snapshot time.  Any `mark_deleted_by_key_hash` call that landed
         // AFTER the worker snapshot only wrote to the source Arc's interior
-        // `tombstoned_keys` set.  Apply those to the merged output.
+        // `tombstoned_keys` set.  Apply those to the merged output — but gated
+        // by ORIGIN: a source's tombstone may only kill merged entries whose
+        // global_id came from that source. An HSET update interior-tombstones
+        // the OLD copy's home segment while the NEW copy lives on (mutable or
+        // a sibling segment); a hash-wide replay would kill the new copy too
+        // (mass loss under update churn). Real DEL/UNLINK tombstones are
+        // recorded in EVERY segment's interior set, so they still apply.
         for src in &inflight.merged_sources {
-            for kh in src.tombstoned_key_hashes() {
-                merged.mark_deleted_by_key_hash_install(kh);
+            let tombs = src.tombstoned_key_hashes();
+            if tombs.is_empty() {
+                continue;
+            }
+            let src_gids: std::collections::HashSet<u32> =
+                src.mvcc_headers().iter().map(|h| h.global_id).collect();
+            for kh in tombs {
+                merged.mark_deleted_by_key_hash_install_from(kh, &src_gids);
             }
         }
 
@@ -1283,9 +1376,10 @@ impl VectorStore {
                 scratch,
                 collection,
                 payload_index: PayloadIndex::new(),
-                key_hash_to_key: std::collections::HashMap::new(),
+                key_hash_to_key: Arc::new(std::collections::HashMap::new()),
                 key_hash_to_global_id: std::collections::HashMap::new(),
                 autocompact_enabled: true,
+                merge_recall_tolerance: 0.70,
                 compaction_weight: COMPACTION_WEIGHT_DEFAULT,
                 field_segments: extra_fields,
                 sparse_stores: HashMap::new(),
@@ -1412,7 +1506,7 @@ impl VectorStore {
                 // they track LIVE keys, not historical inserts — without this
                 // they grow monotonically under key churn (~1GB / 24M deletes).
                 // A re-insert of the same key repopulates both maps.
-                idx.key_hash_to_key.remove(&key_hash);
+                Arc::make_mut(&mut idx.key_hash_to_key).remove(&key_hash);
                 idx.key_hash_to_global_id.remove(&key_hash);
                 any_deleted = true;
             }
@@ -1773,20 +1867,24 @@ impl VectorStore {
         key_hash: u64,
         key: bytes::Bytes,
     ) -> Result<(), &'static str> {
-        let idx = self.indexes.get_mut(index_name).ok_or("index not found")?;
-        let snap = idx.segments.load();
-        let insert_lsn = snap.mutable.len() as u64 + 1;
-        drop(snap);
-        let sq_vec: Vec<i8> = vector
-            .iter()
-            .map(|&x| (x * 127.0).clamp(-128.0, 127.0) as i8)
-            .collect();
-        let norm: f32 = vector.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if !self.indexes.contains_key(index_name) {
+            return Err("index not found");
+        }
+        // Monotonic store-wide LSN, same allocator as the wire path
+        // (auto_index_hset). The previous `mutable.len() + 1` restarted after
+        // every compaction, so a RE-inserted key could carry a LOWER lsn than
+        // its compacted predecessor — merge dedup (keep highest insert_lsn)
+        // then kept the stale copy and dropped the current one.
+        let insert_lsn = self.txn_manager_mut().allocate_lsn();
+        let idx = match self.indexes.get_mut(index_name) {
+            Some(idx) => idx,
+            None => return Err("index not found"),
+        };
         idx.segments
             .load()
             .mutable
-            .append(key_hash, vector, &sq_vec, norm, insert_lsn);
-        idx.key_hash_to_key.insert(key_hash, key);
+            .append(key_hash, vector, insert_lsn);
+        Arc::make_mut(&mut idx.key_hash_to_key).insert(key_hash, key);
         Ok(())
     }
 
@@ -1969,9 +2067,15 @@ impl VectorStore {
         let mut stats = VacuumPassStats::default();
         for name in names {
             if self.needs_merge(&name) == Some(true) {
-                // Use 0.70 tolerance for vacuum: catch catastrophic recall collapse
-                // without false-positives on small/medium indexes.
-                match self.force_merge_index_with_tolerance(&name, 0.70) {
+                // Default 0.70: catch catastrophic recall collapse without
+                // false-positives on small/medium indexes. Per-index override:
+                // FT.CONFIG SET <idx> MERGE_RECALL_TOLERANCE (VEC-4).
+                let tolerance = self
+                    .indexes
+                    .get(&name)
+                    .map(|i| i.merge_recall_tolerance)
+                    .unwrap_or(0.70);
+                match self.force_merge_index_with_tolerance(&name, tolerance) {
                     Ok(ms) => {
                         stats.indexes_merged += 1;
                         stats.total_merged += ms.segments_merged;
@@ -2072,6 +2176,30 @@ fn enforce_segment_holder_budget(
     }
 
     stats.segments_evicted
+}
+
+/// Minimal single-field index meta for cross-module unit tests (search_pool
+/// identity tests build multi-segment stores through the public store API).
+#[cfg(test)]
+pub(crate) fn test_index_meta(dim: u32) -> IndexMeta {
+    IndexMeta {
+        name: Bytes::from_static(b"idx"),
+        dimension: dim,
+        padded_dimension: padded_dimension(dim),
+        metric: DistanceMetric::L2,
+        hnsw_m: 8,
+        hnsw_ef_construction: 50,
+        hnsw_ef_runtime: 0,
+        compact_threshold: 0,
+        source_field: Bytes::from_static(b"vec"),
+        key_prefixes: vec![Bytes::from_static(b"doc:")],
+        quantization: QuantizationConfig::TurboQuant4,
+        build_mode: BuildMode::Light,
+        vector_fields: Vec::new(),
+        schema_fields: Vec::new(),
+        merge_mode: MergeMode::GraphUnion,
+        keep_raw: false,
+    }
 }
 
 #[cfg(test)]
@@ -2529,6 +2657,95 @@ mod bg_compact_tests {
         results.iter().map(|r| r.key_hash).collect()
     }
 
+    // ── Bounded bulk compaction (search_pool enabler) ────────────────────────
+
+    /// A bulk load compacted via FT.COMPACT (force path) must produce
+    /// ceil(n/threshold) threshold-sized immutable segments, not one giant
+    /// graph — multiple segments are what the intra-query worker pool fans
+    /// out over. All keys must remain findable (self-recall probe).
+    #[test]
+    fn test_force_compact_bulk_bounded_segments() {
+        distance::init();
+        // Bounded bulk builds are gated on an active intra-query search pool.
+        crate::vector::search_pool::init_global(1);
+        let dim = 16u32;
+        let mut store = VectorStore::new();
+        let mut meta = make_idx(dim);
+        meta.compact_threshold = 100;
+        store.create_index(meta).unwrap();
+        let n = 500u64;
+        for i in 0..n {
+            insert(
+                &mut store,
+                format!("doc:{i}").as_bytes(),
+                random_vec(dim as usize, i),
+            );
+        }
+        store.force_compact_index(b"idx").unwrap();
+
+        let idx = store.indexes.get_mut(b"idx".as_ref()).unwrap();
+        let snap = idx.segments.load_full();
+        assert_eq!(
+            snap.mutable.len(),
+            0,
+            "force compact must drain the mutable"
+        );
+        assert_eq!(
+            snap.immutable.len(),
+            5,
+            "500 vectors at threshold 100 must yield 5 bounded segments"
+        );
+
+        // Self-recall: every key still findable by its own vector.
+        for i in (0..n).step_by(7) {
+            let hash = xxhash_rust::xxh64::xxh64(format!("doc:{i}").as_bytes(), 0);
+            let got = search_key_hashes(&mut store, &random_vec(dim as usize, i), 3);
+            assert!(
+                got.contains(&hash),
+                "doc:{i} lost after bounded bulk compact"
+            );
+        }
+    }
+
+    /// Background path: successive begin/poll cycles over a bulk-loaded
+    /// mutable must also chip away in threshold-bounded builds.
+    #[test]
+    fn test_bg_compact_bulk_bounded_segments() {
+        distance::init();
+        // Bounded bulk builds are gated on an active intra-query search pool.
+        crate::vector::search_pool::init_global(1);
+        let dim = 16u32;
+        let compactor = BackgroundCompactor::new(1);
+        let mut store = VectorStore::new();
+        let mut meta = make_idx(dim);
+        meta.compact_threshold = 100;
+        store.create_index(meta).unwrap();
+        for i in 0..500u64 {
+            insert(
+                &mut store,
+                format!("doc:{i}").as_bytes(),
+                random_vec(dim as usize, i),
+            );
+        }
+        // Drive begin+install until the mutable drains (bounded per build).
+        for _ in 0..64 {
+            store.begin_background_compactions(&compactor);
+            poll_until_installed(&mut store, 400);
+            let idx = store.indexes.get_mut(b"idx".as_ref()).unwrap();
+            if idx.segments.load().mutable.len() == 0 {
+                break;
+            }
+        }
+        let idx = store.indexes.get_mut(b"idx".as_ref()).unwrap();
+        let snap = idx.segments.load_full();
+        assert_eq!(snap.mutable.len(), 0, "bg compaction must eventually drain");
+        assert_eq!(
+            snap.immutable.len(),
+            5,
+            "500 vectors at threshold 100 must yield 5 bounded segments (bg path)"
+        );
+    }
+
     /// Like [`make_idx`] but with a caller-chosen index name (and a matching
     /// key prefix), so a test can create several independent indexes.
     fn make_idx_named(name: Bytes, dim: u32) -> IndexMeta {
@@ -2824,6 +3041,49 @@ mod bg_compact_tests {
         );
     }
 
+    /// A key UPDATED (tombstone old + append new, VEC-1 semantics) BEFORE
+    /// begin_background_compact() must survive the install. Both the dead old
+    /// copy and the live new copy sit inside the frozen window; compact()
+    /// already filters the dead copy, so the install reconcile must NOT
+    /// key_hash-wide-tombstone the new copy out of the immutable.
+    ///
+    /// RED before the fix: snap_and_reconcile treated ANY dead window entry as
+    /// "key deleted" and killed the key's live compacted copy — every key
+    /// updated-then-compacted vanished from FT.SEARCH (32% of live keys lost
+    /// in the Bundle-5 churn soak; regression introduced with VEC-1).
+    #[test]
+    fn test_bg_compact_update_before_freeze_survives_install() {
+        distance::init();
+        let compactor = BackgroundCompactor::new(1);
+        let mut store = VectorStore::new();
+        store.create_index(make_idx(64)).unwrap();
+
+        const T: usize = 20;
+        for i in 0..T {
+            let key = format!("doc:{i}");
+            insert(&mut store, key.as_bytes(), random_vec(64, i as u64));
+        }
+
+        // UPDATE doc:5 BEFORE dispatch: dead old + live new, both in-window.
+        store.mark_deleted_for_key(b"doc:5");
+        let updated_hash = xxhash_rust::xxh64::xxh64(b"doc:5", 0);
+        let new_vec = random_vec(64, 555);
+        store
+            .insert_vector(b"idx", &new_vec, updated_hash, Bytes::from_static(b"doc:5"))
+            .unwrap();
+
+        assert_eq!(store.begin_background_compactions(&compactor), 1);
+        assert!(poll_until_installed(&mut store, 200), "must install");
+
+        // The updated key must still be findable by its NEW vector, exactly once.
+        let results = search_key_hashes(&mut store, &new_vec, T + 5);
+        let count = results.iter().filter(|&&h| h == updated_hash).count();
+        assert_eq!(
+            count, 1,
+            "updated-then-compacted key must survive install (0=lost, 2=duplicate), got {count}"
+        );
+    }
+
     // ── Test 5: steady-state HDEL tombstones installed immutable ─────────────
 
     /// mark_deleted_for_key on an already-installed immutable segment must
@@ -3038,6 +3298,60 @@ mod bg_compact_tests {
         assert_eq!(
             count, 1,
             "key_x must appear exactly once after merge dedup (got {count})"
+        );
+    }
+
+    /// A key UPDATED across segments must survive a merge: old copy in seg1
+    /// (interior-tombstoned by the update), new copy compacted into seg2, then
+    /// seg1+seg2 merged.
+    ///
+    /// RED before the fix: `poll_install_merge` replayed seg1's interior
+    /// tombstone set key_hash-WIDE onto the merged output, killing the NEW
+    /// copy that came from seg2 — the merge-side twin of the
+    /// `snap_and_reconcile` update bug (657 keys lost in the churn soak with
+    /// merges enabled even after the compact-install fix).
+    #[test]
+    fn test_bg_merge_update_across_segments_survives() {
+        distance::init();
+        let compactor = BackgroundCompactor::new(1);
+        let mut store = VectorStore::new();
+        store.create_index(make_idx(64)).unwrap();
+
+        const T: usize = 15;
+
+        // seg1: doc:0..T, including the soon-to-be-updated doc:5.
+        for i in 0..T {
+            let key = format!("doc:{i}");
+            insert(&mut store, key.as_bytes(), random_vec(64, i as u64));
+        }
+        store.force_compact_index(b"idx").unwrap();
+
+        // UPDATE doc:5 (VEC-1 semantics): interior-tombstone the old copy in
+        // the Arc'd seg1, append the new vector to the mutable segment.
+        let updated_hash = xxhash_rust::xxh64::xxh64(b"doc:5", 0);
+        store.mark_deleted_for_key(b"doc:5");
+        let new_vec = random_vec(64, 555);
+        store
+            .insert_vector(b"idx", &new_vec, updated_hash, Bytes::from_static(b"doc:5"))
+            .unwrap();
+
+        // seg2: padding + the new doc:5 copy, sealed.
+        for i in T..2 * T {
+            let key = format!("doc:{i}");
+            insert(&mut store, key.as_bytes(), random_vec(64, i as u64));
+        }
+        store.force_compact_index(b"idx").unwrap();
+
+        // Merge seg1+seg2 — seg1's tombstone must NOT kill seg2's new copy.
+        let idx = store.get_index_mut(b"idx").unwrap();
+        assert!(idx.begin_background_merge(&compactor), "merge dispatched");
+        assert!(poll_until_merged(&mut store, 500), "merge installed");
+
+        let results = search_key_hashes(&mut store, &new_vec, 2 * T + 5);
+        let count = results.iter().filter(|&&h| h == updated_hash).count();
+        assert_eq!(
+            count, 1,
+            "updated-then-merged key must survive install (0=lost, 2=duplicate), got {count}"
         );
     }
 

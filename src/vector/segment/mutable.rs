@@ -11,13 +11,16 @@ use parking_lot::RwLock;
 use roaring::RoaringBitmap;
 use smallvec::SmallVec;
 
+use crate::vector::distance;
 use crate::vector::mvcc::visibility::is_visible;
 use crate::vector::turbo_quant::collection::{CollectionMetadata, QuantizationConfig};
 use crate::vector::turbo_quant::encoder::{
     encode_tq_mse_a2, encode_tq_mse_scaled, encode_tq_mse_scaled_with_signs, padded_dimension,
 };
 use crate::vector::turbo_quant::fwht;
-use crate::vector::turbo_quant::sq8::{SQ8_PARAMS_BYTES, encode_sq8_into, sq8_l2_adc, sq8_params};
+use crate::vector::turbo_quant::sq8::{
+    SQ8_PARAMS_BYTES, encode_sq8_into, sq8_l2_from_stats, sq8_params, sq8_query_stats,
+};
 use crate::vector::turbo_quant::tq_adc::tq_l2_adc_scaled;
 use crate::vector::types::{DistanceMetric, SearchResult, VectorId};
 
@@ -65,6 +68,35 @@ impl<'a> Sq8Query<'a> {
     }
 }
 
+/// Per-query state for the chunked MVCC brute-force scan (QP-4): the prepared
+/// query buffer and the top-k heap survive across yield chunks so neither is
+/// redone per chunk. Build via `MutableSegment::prepare_brute_force_query`.
+pub struct BruteForceQuery {
+    /// SQ8: (possibly normalized) owned query copy; TQ-ADC: FWHT-rotated padded
+    /// query; TQ-prod: empty (the caller's `TqProdQueryState` carries the prep).
+    prepared: Vec<f32>,
+    /// Whether the TQ-ADC distance path applies (resolved once at prepare).
+    use_tq_adc: bool,
+    /// SQ8 (HQ-2): per-query ADC constants `(Σq_i, Σq_i²)` over the PREPARED
+    /// (possibly normalized) query — computed once here, combined per
+    /// candidate via `sq8_l2_from_stats`. Zero for non-SQ8 collections.
+    sq8_q_sum: f32,
+    sq8_q_sumsq: f32,
+    /// Shared top-k accumulator across all chunks.
+    heap: BinaryHeap<DistF32>,
+}
+
+impl BruteForceQuery {
+    /// Drain the accumulated global top-k, ascending by distance.
+    pub fn into_results(self) -> SmallVec<[SearchResult; 32]> {
+        self.heap
+            .into_sorted_vec()
+            .into_iter()
+            .map(|DistF32(d, id, kh)| SearchResult::with_key_hash(d, VectorId(id), kh))
+            .collect()
+    }
+}
+
 /// 48 bytes. MVCC fields prepared for Phase 65.
 #[repr(C)]
 pub struct MutableEntry {
@@ -89,6 +121,9 @@ pub struct FrozenSegment {
     /// Raw f32 vectors for exact pairwise distance during HNSW build.
     /// Layout: dim floats per vector, contiguous. Dropped after compaction.
     pub raw_f32: Vec<f32>,
+    /// f16 originals for the exact-rerank sidecar (HQ-1). Present in BOTH
+    /// build modes; dim halves per vector, mutable-internal-id order.
+    pub raw_f16: Vec<u16>,
     /// Sub-centroid sign bits per vector (ceil(padded_dim/8) bytes each).
     /// Computed at insert time from pre-quantization FWHT values.
     pub sub_centroid_signs: Vec<u8>,
@@ -115,6 +150,11 @@ struct MutableSegmentInner {
     /// Raw f32 vectors retained for deferred QJL encoding at freeze time.
     /// Layout: dim floats per vector, contiguous.
     raw_f32: Vec<f32>,
+    /// f16 copies of the original vectors (HQ-1 exact-rerank sidecar source).
+    /// Layout: dim halves per vector, contiguous — retained in BOTH build
+    /// modes (unlike raw_f32, Exact-only) at 2·dim B/vector so compaction can
+    /// hand the immutable segment its rerank sidecar by permutation alone.
+    raw_f16: Vec<u16>,
     /// Sub-centroid sign bits computed at insert time.
     sub_centroid_signs: Vec<u8>,
     sub_sign_bytes_per_vec: usize,
@@ -209,6 +249,7 @@ impl MutableSegment {
                 qjl_signs: Vec::new(),
                 residual_norms: Vec::new(),
                 raw_f32: Vec::new(),
+                raw_f16: Vec::new(),
                 sub_centroid_signs: Vec::new(),
                 sub_sign_bytes_per_vec,
                 entries: Vec::new(),
@@ -228,14 +269,7 @@ impl MutableSegment {
     /// Fast path: only FWHT + quantize + nibble pack (O(d log d)).
     /// QJL encoding (O(M×d²)) is deferred to freeze() when the segment compacts.
     /// Mutable brute-force search uses TQ-MSE-only distance (no QJL correction).
-    pub fn append(
-        &self,
-        key_hash: u64,
-        vector_f32: &[f32],
-        _vector_sq: &[i8],
-        _norm: f32,
-        insert_lsn: u64,
-    ) -> u32 {
+    pub fn append(&self, key_hash: u64, vector_f32: &[f32], insert_lsn: u64) -> u32 {
         let mut inner = self.inner.write();
         let internal_id = inner.entries.len() as u32;
         let dim = inner.dimension as usize;
@@ -258,14 +292,15 @@ impl MutableSegment {
 
             let is_exact = self.collection.build_mode
                 == crate::vector::turbo_quant::collection::BuildMode::Exact;
-            let mut extra_bytes = 0usize;
+            crate::vector::f16::encode_f16_slice(vector_f32, &mut inner.raw_f16);
+            let mut extra_bytes = dim * 2; // f16 sidecar source
             if is_exact {
                 let qjl_bpv = inner.qjl_bytes_per_vec;
                 let new_qjl_len = inner.qjl_signs.len() + qjl_bpv;
                 inner.qjl_signs.resize(new_qjl_len, 0u8);
                 inner.residual_norms.push(0.0);
                 inner.raw_f32.extend_from_slice(vector_f32);
-                extra_bytes = qjl_bpv + 4 + dim * 4;
+                extra_bytes += qjl_bpv + 4 + dim * 4;
             }
 
             inner.entries.push(MutableEntry {
@@ -336,14 +371,15 @@ impl MutableSegment {
         // Light mode: skip both — saves 1,536 B/vec + avoids O(M×d²) at freeze.
         let is_exact =
             self.collection.build_mode == crate::vector::turbo_quant::collection::BuildMode::Exact;
-        let mut extra_bytes = 0usize;
+        crate::vector::f16::encode_f16_slice(vector_f32, &mut inner.raw_f16);
+        let mut extra_bytes = dim * 2; // f16 sidecar source
         if is_exact {
             let qjl_bpv = inner.qjl_bytes_per_vec;
             let new_qjl_len = inner.qjl_signs.len() + qjl_bpv;
             inner.qjl_signs.resize(new_qjl_len, 0u8);
             inner.residual_norms.push(0.0);
             inner.raw_f32.extend_from_slice(vector_f32);
-            extra_bytes = qjl_bpv + 4 + dim * 4;
+            extra_bytes += qjl_bpv + 4 + dim * 4;
         }
 
         inner.entries.push(MutableEntry {
@@ -393,6 +429,11 @@ impl MutableSegment {
             // Heap-free query prep: borrow for L2, inline-normalize otherwise.
             let q = Sq8Query::prepare(query_f32, self.collection.metric);
             let q = q.as_slice();
+            // HQ-2: resolve the SIMD-dispatched ADC stats kernel and the
+            // per-query constants (Σq_i, Σq_i²) ONCE, before the candidate
+            // loop below — never per candidate.
+            let sq8_stats_fn = distance::table().sq8_stats;
+            let (q_sum, q_sumsq) = sq8_query_stats(q);
             let mut heap: BinaryHeap<DistF32> = BinaryHeap::with_capacity(k + 1);
             for entry in &inner.entries {
                 if entry.delete_lsn != 0 {
@@ -408,7 +449,9 @@ impl MutableSegment {
                 let off = id * bytes_per_code;
                 let slot = &inner.tq_codes[off..off + bytes_per_code];
                 let (min, scale) = sq8_params(slot, dim);
-                let dist = sq8_l2_adc(q, &slot[..dim], min, scale);
+                let (dot_qc, sum_c, sumsq_c) = sq8_stats_fn(q, &slot[..dim]);
+                let dist =
+                    sq8_l2_from_stats(dim, min, scale, q_sum, q_sumsq, dot_qc, sum_c, sumsq_c);
                 let global_id = inner.global_id_base + entry.internal_id;
                 if heap.len() < k {
                     heap.push(DistF32(dist, global_id, entry.key_hash));
@@ -564,6 +607,12 @@ impl MutableSegment {
     /// a yield land at indices ≥ `end` (invisible to this scan), and deletes set
     /// `delete_lsn > snapshot_lsn` (still visible to this snapshot via
     /// `is_visible`). Full-scan callers pass `0..len`. (ft-search-off-eventloop)
+    ///
+    /// Chunked callers (the yielding path) should instead call
+    /// [`Self::prepare_brute_force_query`] once and
+    /// [`Self::brute_force_scan_mvcc_chunk`] per chunk, so the query
+    /// rotation/normalization and the top-k heap are NOT redone per chunk (QP-4).
+    #[allow(clippy::too_many_arguments)]
     pub fn brute_force_search_mvcc(
         &self,
         query_f32: &[f32],
@@ -576,19 +625,118 @@ impl MutableSegment {
         start: usize,
         end: usize,
     ) -> SmallVec<[SearchResult; 32]> {
+        let mut q = self.prepare_brute_force_query(query_f32, query_state.is_some(), k);
+        self.brute_force_scan_mvcc_chunk(
+            &mut q,
+            query_state,
+            k,
+            allow_bitmap,
+            snapshot_lsn,
+            my_txn_id,
+            committed,
+            start,
+            end,
+        );
+        q.into_results()
+    }
+
+    /// One-time per-query setup for the chunked MVCC brute-force scan (QP-4):
+    /// prepares the (possibly normalized/FWHT-rotated) query buffer and the
+    /// shared top-k heap that persist across yield chunks. A single per-query
+    /// allocation at capture — never per-chunk (G-HOTPATH SAFETY-NET clause).
+    pub fn prepare_brute_force_query(
+        &self,
+        query_f32: &[f32],
+        have_query_state: bool,
+        k: usize,
+    ) -> BruteForceQuery {
+        let dim = query_f32.len();
+        let padded = self.collection.padded_dimension as usize;
+        let prepared: Vec<f32>;
+        let use_tq_adc: bool;
+        if self.collection.quantization == QuantizationConfig::Sq8 {
+            // Mirrors `Sq8Query::prepare`, owned: copy for L2, normalize otherwise.
+            use_tq_adc = false;
+            let mut q = query_f32.to_vec();
+            if self.collection.metric != DistanceMetric::L2 {
+                let n: f32 = q.iter().map(|x| x * x).sum::<f32>().sqrt();
+                if n > 0.0 {
+                    let inv = 1.0 / n;
+                    for v in q.iter_mut() {
+                        *v *= inv;
+                    }
+                }
+            }
+            prepared = q;
+        } else {
+            let is_a2 = self.collection.quantization == QuantizationConfig::TurboQuant4A2;
+            use_tq_adc = !is_a2
+                && (!have_query_state
+                    || self.collection.build_mode
+                        == crate::vector::turbo_quant::collection::BuildMode::Light);
+            if use_tq_adc {
+                let mut buf = vec![0.0f32; padded];
+                buf[..dim].copy_from_slice(query_f32);
+                let norm: f32 = query_f32.iter().map(|x| x * x).sum::<f32>().sqrt();
+                if norm > 0.0 {
+                    let inv = 1.0 / norm;
+                    for v in buf[..dim].iter_mut() {
+                        *v *= inv;
+                    }
+                }
+                fwht::fwht(&mut buf, self.collection.fwht_sign_flips.as_slice());
+                prepared = buf;
+            } else {
+                prepared = Vec::new();
+            }
+        }
+        // HQ-2: per-query ADC constants over the prepared (normalized) query —
+        // the same buffer the chunk scan feeds the stats kernel.
+        let (sq8_q_sum, sq8_q_sumsq) = if self.collection.quantization == QuantizationConfig::Sq8 {
+            sq8_query_stats(&prepared)
+        } else {
+            (0.0, 0.0)
+        };
+        BruteForceQuery {
+            prepared,
+            use_tq_adc,
+            sq8_q_sum,
+            sq8_q_sumsq,
+            heap: BinaryHeap::with_capacity(k + 1),
+        }
+    }
+
+    /// Scan one `[start, end)` chunk, accumulating into the query's shared
+    /// top-k heap. Isolation contract identical to
+    /// [`Self::brute_force_search_mvcc`]; the inner read lock is taken per
+    /// chunk so cooperative yields between chunks never hold it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn brute_force_scan_mvcc_chunk(
+        &self,
+        q: &mut BruteForceQuery,
+        query_state: Option<&crate::vector::turbo_quant::inner_product::TqProdQueryState>,
+        k: usize,
+        allow_bitmap: Option<&RoaringBitmap>,
+        snapshot_lsn: u64,
+        my_txn_id: u64,
+        committed: &roaring::RoaringTreemap,
+        start: usize,
+        end: usize,
+    ) {
         let inner = self.inner.read();
         let hi = end.min(inner.entries.len());
         let lo = start.min(hi);
         let dim = inner.dimension as usize;
-        let padded = inner.padded_dimension as usize;
         let bytes_per_code = inner.bytes_per_code;
 
         // SQ8: per-vector affine decode + true squared-L2 ADC (MVCC-visible scan).
         if self.collection.quantization == QuantizationConfig::Sq8 {
-            // Heap-free query prep: borrow for L2, inline-normalize otherwise.
-            let q = Sq8Query::prepare(query_f32, self.collection.metric);
-            let q = q.as_slice();
-            let mut heap: BinaryHeap<DistF32> = BinaryHeap::with_capacity(k + 1);
+            let q_slice = q.prepared.as_slice();
+            // HQ-2: SIMD-dispatched stats kernel resolved once per chunk (a fn
+            // pointer read), per-query constants carried in `BruteForceQuery`.
+            let sq8_stats_fn = distance::table().sq8_stats;
+            let (q_sum, q_sumsq) = (q.sq8_q_sum, q.sq8_q_sumsq);
+            let heap = &mut q.heap;
             for entry in &inner.entries[lo..hi] {
                 if !is_visible(
                     entry.insert_lsn,
@@ -610,7 +758,9 @@ impl MutableSegment {
                 let off = id * bytes_per_code;
                 let slot = &inner.tq_codes[off..off + bytes_per_code];
                 let (min, scale) = sq8_params(slot, dim);
-                let dist = sq8_l2_adc(q, &slot[..dim], min, scale);
+                let (dot_qc, sum_c, sumsq_c) = sq8_stats_fn(q_slice, &slot[..dim]);
+                let dist =
+                    sq8_l2_from_stats(dim, min, scale, q_sum, q_sumsq, dot_qc, sum_c, sumsq_c);
                 let global_id = inner.global_id_base + entry.internal_id;
                 if heap.len() < k {
                     heap.push(DistF32(dist, global_id, entry.key_hash));
@@ -621,11 +771,7 @@ impl MutableSegment {
                     }
                 }
             }
-            return heap
-                .into_sorted_vec()
-                .into_iter()
-                .map(|DistF32(d, id, kh)| SearchResult::with_key_hash(d, VectorId(id), kh))
-                .collect();
+            return;
         }
 
         let code_len = bytes_per_code - 4;
@@ -637,27 +783,9 @@ impl MutableSegment {
             self.collection.codebook_16()
         };
 
-        let use_tq_adc = !is_a2
-            && (query_state.is_none()
-                || self.collection.build_mode
-                    == crate::vector::turbo_quant::collection::BuildMode::Light);
-        let q_rotated: Vec<f32> = if use_tq_adc {
-            let mut buf = vec![0.0f32; padded];
-            buf[..dim].copy_from_slice(query_f32);
-            let norm: f32 = query_f32.iter().map(|x| x * x).sum::<f32>().sqrt();
-            if norm > 0.0 {
-                let inv = 1.0 / norm;
-                for v in buf[..dim].iter_mut() {
-                    *v *= inv;
-                }
-            }
-            fwht::fwht(&mut buf, self.collection.fwht_sign_flips.as_slice());
-            buf
-        } else {
-            Vec::new()
-        };
-
-        let mut heap: BinaryHeap<DistF32> = BinaryHeap::with_capacity(k + 1);
+        let use_tq_adc = q.use_tq_adc;
+        let q_rotated = q.prepared.as_slice();
+        let heap = &mut q.heap;
 
         for entry in &inner.entries[lo..hi] {
             if !is_visible(
@@ -681,7 +809,7 @@ impl MutableSegment {
             let tq_code = &inner.tq_codes[tq_offset..tq_offset + code_len];
 
             let dist = if use_tq_adc {
-                tq_l2_adc_scaled(&q_rotated, tq_code, entry.norm, centroids)
+                tq_l2_adc_scaled(q_rotated, tq_code, entry.norm, centroids)
             } else {
                 let qs = query_state.unwrap();
                 let qjl_bpv = inner.qjl_bytes_per_vec;
@@ -712,11 +840,6 @@ impl MutableSegment {
                 }
             }
         }
-
-        heap.into_sorted_vec()
-            .into_iter()
-            .map(|DistF32(d, id, kh)| SearchResult::with_key_hash(d, VectorId(id), kh))
-            .collect()
     }
 
     /// Append within a transaction context.
@@ -724,8 +847,6 @@ impl MutableSegment {
         &self,
         key_hash: u64,
         vector_f32: &[f32],
-        _vector_sq: &[i8],
-        _norm: f32,
         insert_lsn: u64,
         txn_id: u64,
     ) -> u32 {
@@ -753,14 +874,15 @@ impl MutableSegment {
 
             let is_exact = self.collection.build_mode
                 == crate::vector::turbo_quant::collection::BuildMode::Exact;
-            let mut extra_bytes = 0usize;
+            crate::vector::f16::encode_f16_slice(vector_f32, &mut inner.raw_f16);
+            let mut extra_bytes = dim * 2; // f16 sidecar source
             if is_exact {
                 let qjl_bpv = inner.qjl_bytes_per_vec;
                 let new_qjl_len = inner.qjl_signs.len() + qjl_bpv;
                 inner.qjl_signs.resize(new_qjl_len, 0u8);
                 inner.residual_norms.push(0.0);
                 inner.raw_f32.extend_from_slice(vector_f32);
-                extra_bytes = qjl_bpv + 4 + dim * 4;
+                extra_bytes += qjl_bpv + 4 + dim * 4;
             }
 
             inner.entries.push(MutableEntry {
@@ -793,14 +915,15 @@ impl MutableSegment {
 
         let is_exact =
             self.collection.build_mode == crate::vector::turbo_quant::collection::BuildMode::Exact;
-        let mut extra_bytes = 0usize;
+        crate::vector::f16::encode_f16_slice(vector_f32, &mut inner.raw_f16);
+        let mut extra_bytes = dim * 2; // f16 sidecar source
         if is_exact {
             let qjl_bpv = inner.qjl_bytes_per_vec;
             let new_qjl_len = inner.qjl_signs.len() + qjl_bpv;
             inner.qjl_signs.resize(new_qjl_len, 0u8);
             inner.residual_norms.push(0.0);
             inner.raw_f32.extend_from_slice(vector_f32);
-            extra_bytes = qjl_bpv + 4 + dim * 4;
+            extra_bytes += qjl_bpv + 4 + dim * 4;
         }
 
         inner.entries.push(MutableEntry {
@@ -870,6 +993,23 @@ impl MutableSegment {
         if let Some(entry) = inner.entries.get_mut(internal_id as usize) {
             entry.delete_lsn = delete_lsn;
         }
+    }
+
+    /// Tombstone the entry at `internal_id` iff its key_hash matches (VEC-1
+    /// HSET-update fast path). The key check makes the O(1) index lookup safe
+    /// even if the caller's `key_hash → global_id` mapping is stale (e.g.
+    /// remapped by a concurrent compaction install) — on mismatch the caller
+    /// falls back to the O(n) `mark_deleted_by_key_hash` scan.
+    /// Returns `true` if an entry was tombstoned.
+    pub fn mark_deleted_if_key(&self, internal_id: u32, key_hash: u64, delete_lsn: u64) -> bool {
+        let mut inner = self.inner.write();
+        if let Some(entry) = inner.entries.get_mut(internal_id as usize) {
+            if entry.key_hash == key_hash && entry.delete_lsn == 0 {
+                entry.delete_lsn = delete_lsn;
+                return true;
+            }
+        }
+        false
     }
 
     /// Mark all entries matching a key_hash as deleted.
@@ -970,10 +1110,40 @@ impl MutableSegment {
 
     /// Freeze: snapshot TQ codes and entries for compaction.
     pub fn freeze(&self) -> FrozenSegment {
+        self.freeze_prefix(usize::MAX)
+    }
+
+    /// Freeze only the first `n` entries (clamped to len) for a **bounded**
+    /// compaction build. Bulk loads compact into several threshold-sized
+    /// segments instead of one giant graph — bounding build memory/latency and
+    /// giving the intra-query search pool independent segments to fan out
+    /// over. The frozen window is the prefix `[0, n)`, so entry
+    /// `vector_offset`s (absolute from 0) stay valid; the tail survives via
+    /// `clone_suffix(n)` at install, exactly like a mid-build append.
+    pub fn freeze_prefix(&self, n: usize) -> FrozenSegment {
         let inner = self.inner.read();
+        let n = n.min(inner.entries.len());
+        let dim = inner.dimension as usize;
+        // SQ8 has no QJL/residual side data; its codes are not TQ-decodable, so
+        // the recompute paths (which assume TQ layout) must be skipped entirely.
+        let exact_tq = self.collection.build_mode
+            == crate::vector::turbo_quant::collection::BuildMode::Exact
+            && self.collection.quantization != QuantizationConfig::Sq8;
+        // Recompute is whole-buffer; truncate to the frozen window afterwards.
+        let mut qjl_signs = if exact_tq {
+            self.recompute_qjl_signs(&inner)
+        } else {
+            Vec::new()
+        };
+        qjl_signs.truncate(n * inner.qjl_bytes_per_vec);
+        let mut residual_norms = if exact_tq {
+            self.recompute_residual_norms(&inner)
+        } else {
+            Vec::new()
+        };
+        residual_norms.truncate(n);
         FrozenSegment {
-            entries: inner
-                .entries
+            entries: inner.entries[..n]
                 .iter()
                 .map(|e| MutableEntry {
                     internal_id: e.internal_id,
@@ -985,27 +1155,25 @@ impl MutableSegment {
                     txn_id: e.txn_id,
                 })
                 .collect(),
-            tq_codes: inner.tq_codes.clone(),
-            // SQ8 has no QJL/residual side data; its codes are not TQ-decodable, so
-            // the recompute paths (which assume TQ layout) must be skipped entirely.
-            qjl_signs: if self.collection.build_mode
-                == crate::vector::turbo_quant::collection::BuildMode::Exact
-                && self.collection.quantization != QuantizationConfig::Sq8
-            {
-                self.recompute_qjl_signs(&inner)
-            } else {
+            tq_codes: inner.tq_codes[..n * inner.bytes_per_code].to_vec(),
+            qjl_signs,
+            residual_norms,
+            // empty in Light mode (nothing was appended)
+            raw_f32: if inner.raw_f32.is_empty() {
                 Vec::new()
-            },
-            residual_norms: if self.collection.build_mode
-                == crate::vector::turbo_quant::collection::BuildMode::Exact
-                && self.collection.quantization != QuantizationConfig::Sq8
-            {
-                self.recompute_residual_norms(&inner)
             } else {
-                Vec::new()
+                inner.raw_f32[..n * dim].to_vec()
             },
-            raw_f32: inner.raw_f32.clone(), // empty in Light mode (nothing was appended)
-            sub_centroid_signs: inner.sub_centroid_signs.clone(),
+            raw_f16: if inner.raw_f16.is_empty() {
+                Vec::new()
+            } else {
+                inner.raw_f16[..n * dim].to_vec()
+            },
+            sub_centroid_signs: if inner.sub_centroid_signs.is_empty() {
+                Vec::new()
+            } else {
+                inner.sub_centroid_signs[..n * inner.sub_sign_bytes_per_vec].to_vec()
+            },
             sub_sign_bytes_per_vec: inner.sub_sign_bytes_per_vec,
             bytes_per_code: inner.bytes_per_code,
             qjl_bytes_per_vec: inner.qjl_bytes_per_vec,
@@ -1071,6 +1239,12 @@ impl MutableSegment {
             let rs = start * dim;
             inner.raw_f32[rs..].to_vec()
         };
+        let raw_f16 = if inner.raw_f16.is_empty() {
+            Vec::new()
+        } else {
+            let rs = start * dim;
+            inner.raw_f16[rs..].to_vec()
+        };
 
         // ── Entries: rebase internal_id and vector_offset to 0-based ─────────
         let entries: Vec<MutableEntry> = inner.entries[start..]
@@ -1103,6 +1277,11 @@ impl MutableSegment {
                 count * dim * 4
             } else {
                 0
+            })
+            + (if !raw_f16.is_empty() {
+                count * dim * 2
+            } else {
+                0
             });
 
         let new_inner = MutableSegmentInner {
@@ -1110,6 +1289,7 @@ impl MutableSegment {
             qjl_signs,
             residual_norms,
             raw_f32,
+            raw_f16,
             sub_centroid_signs,
             sub_sign_bytes_per_vec: sub_bpv,
             entries,
@@ -1347,8 +1527,8 @@ mod tests {
         let seg = MutableSegment::new(128, col);
         let v1 = make_f32_vector(128, 1);
         let v2 = make_f32_vector(128, 2);
-        assert_eq!(seg.append(100, &v1, &[], 1.0, 1), 0);
-        assert_eq!(seg.append(200, &v2, &[], 1.0, 2), 1);
+        assert_eq!(seg.append(100, &v1, 1), 0);
+        assert_eq!(seg.append(200, &v2, 2), 1);
         assert_eq!(seg.len(), 2);
     }
 
@@ -1363,7 +1543,7 @@ mod tests {
             .map(|i| make_f32_vector(dim, i * 7 + 1))
             .collect();
         for (i, v) in vectors.iter().enumerate() {
-            seg.append(i as u64, v, &[], 1.0, i as u64);
+            seg.append(i as u64, v, i as u64);
         }
 
         let _q_rot = rotate_query(&vectors[0], &col);
@@ -1392,7 +1572,7 @@ mod tests {
         let seg = MutableSegment::new(dim as u32, collection);
         let db: Vec<Vec<f32>> = (0..50u32).map(|i| make_f32_vector(dim, 100 + i)).collect();
         for (i, v) in db.iter().enumerate() {
-            seg.append(i as u64, v, &[], 0.0, 1);
+            seg.append(i as u64, v, 1);
         }
 
         // Query == db[7]; SQ8 must rank that vector first (exact-match invariant
@@ -1454,7 +1634,7 @@ mod tests {
             for x in v.iter_mut() {
                 *x *= scale;
             }
-            seg.append(i as u64, &v, &[], 0.0, 1);
+            seg.append(i as u64, &v, 1);
             db.push(v);
         }
         // Query == db[12] scaled by a different factor: identical direction (cos = 1),
@@ -1492,7 +1672,7 @@ mod tests {
         let seg = MutableSegment::new(dim as u32, collection);
         let db: Vec<Vec<f32>> = (0..50u32).map(|i| make_f32_vector(dim, 100 + i)).collect();
         for (i, v) in db.iter().enumerate() {
-            seg.append_transactional(i as u64, v, &[], 0.0, 1, 7);
+            seg.append_transactional(i as u64, v, 1, 7);
         }
 
         // Direct stride check: n slots of exactly dim + SQ8_PARAMS_BYTES bytes.
@@ -1547,7 +1727,7 @@ mod tests {
             for x in v.iter_mut() {
                 *x *= scale;
             }
-            seg.append(i as u64, &v, &[], 0.0, 1);
+            seg.append(i as u64, &v, 1);
             db.push(v);
         }
         // Query == db[12] at a very different magnitude (same direction). With the
@@ -1575,9 +1755,9 @@ mod tests {
         let v0 = make_f32_vector(dim, 1);
         let v1 = make_f32_vector(dim, 2);
         let v2 = make_f32_vector(dim, 3);
-        seg.append(0, &v0, &[], 1.0, 1);
-        seg.append(1, &v1, &[], 1.0, 2);
-        seg.append(2, &v2, &[], 1.0, 3);
+        seg.append(0, &v0, 1);
+        seg.append(1, &v1, 2);
+        seg.append(2, &v2, 3);
 
         seg.mark_deleted(0, 10);
 
@@ -1594,8 +1774,8 @@ mod tests {
         let seg = MutableSegment::new(128, col);
         let v1 = make_f32_vector(128, 1);
         let v2 = make_f32_vector(128, 2);
-        seg.append(100, &v1, &[], 1.5, 1);
-        seg.append(200, &v2, &[], 2.5, 2);
+        seg.append(100, &v1, 1);
+        seg.append(200, &v2, 2);
 
         let frozen = seg.freeze();
         assert_eq!(frozen.entries.len(), 2);
@@ -1613,7 +1793,7 @@ mod tests {
         distance::init();
         let col = make_collection(128);
         let seg = MutableSegment::new(128, col);
-        seg.append(1, &make_f32_vector(128, 1), &[], 1.0, 1);
+        seg.append(1, &make_f32_vector(128, 1), 1);
         seg.mark_deleted(0, 42);
         let frozen = seg.freeze();
         assert_eq!(frozen.entries[0].delete_lsn, 42);
@@ -1630,7 +1810,7 @@ mod tests {
             .map(|i| make_f32_vector(dim, i * 7 + 1))
             .collect();
         for (i, v) in vectors.iter().enumerate() {
-            seg.append(i as u64, v, &[], 1.0, i as u64);
+            seg.append(i as u64, v, i as u64);
         }
 
         let _q_rot = rotate_query(&vectors[0], &col);

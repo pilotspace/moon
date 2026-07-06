@@ -692,6 +692,15 @@ fn parse_vector_field_params(args: &[Frame], pos: &mut usize) -> Result<ParsedVe
                     )));
                 }
             };
+            // VEC-7: KEEP_RAW is an unimplemented stub — merge_immutable falls
+            // back to graph-union with only a tracing::warn, so accepting it
+            // would promise a recall guarantee the engine does not deliver.
+            // Reject fail-loud until the raw-f32 sidecar (P2.5) lands.
+            if merge_mode == crate::vector::segment::compaction::MergeMode::KeepRaw {
+                return Err(Frame::Error(Bytes::from_static(
+                    b"ERR MERGE_MODE KEEP_RAW is not implemented yet (raw-vector sidecar pending); use GRAPH_UNION or NONE",
+                )));
+            }
             *pos += 1;
         } else if key.eq_ignore_ascii_case(b"KEEP_RAW") {
             let val = match extract_bulk(&args[*pos]) {

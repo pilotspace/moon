@@ -190,6 +190,131 @@ pub fn ft_info(
     Frame::Array(items.into())
 }
 
+/// Merge per-shard FT.INFO responses into one cluster-wide response
+/// (XC-SHARD-1). Data is key-hash partitioned across shards, so document
+/// counts are ADDITIVE; index configuration (dimension, metric, M, …) is
+/// identical on every shard by FT.CREATE-broadcast construction and is taken
+/// from the local response.
+///
+/// Additive top-level keys: `num_docs`, `num_terms`,
+/// `total_inverted_index_size`, and the freshness tokens
+/// `vector_version_token` / `text_version_token` (each shard's token is
+/// monotonic, so the sum is monotonic too — any shard's write bumps the
+/// aggregate).
+/// Additive per-field keys (matched by `field_name` inside `vector_fields` /
+/// `text_fields`): `num_docs`, `mutable_vectors`, `immutable_segments`.
+///
+/// Any `Frame::Error` (local or remote) is propagated unchanged (fail-loud,
+/// same semantics as `scatter_invalidate_range`).
+pub fn merge_ft_info_responses(local: Frame, remotes: &[Frame]) -> Frame {
+    const ADDITIVE_TOP: &[&[u8]] = &[
+        b"num_docs",
+        b"num_terms",
+        b"total_inverted_index_size",
+        b"vector_version_token",
+        b"text_version_token",
+    ];
+    const ADDITIVE_FIELD: &[&[u8]] = &[b"num_docs", b"mutable_vectors", b"immutable_segments"];
+
+    if matches!(local, Frame::Error(_)) {
+        return local;
+    }
+    if let Some(err) = remotes.iter().find(|r| matches!(r, Frame::Error(_))) {
+        return err.clone();
+    }
+    let mut items: Vec<Frame> = match &local {
+        Frame::Array(a) => a.to_vec(),
+        _ => return local,
+    };
+
+    // Value-index of `key` in an alternating key/value frame list.
+    fn value_idx(items: &[Frame], key: &[u8]) -> Option<usize> {
+        let mut i = 0;
+        while i + 1 < items.len() {
+            if let Frame::BulkString(k) = &items[i] {
+                if k.as_ref() == key {
+                    return Some(i + 1);
+                }
+            }
+            i += 2;
+        }
+        None
+    }
+
+    fn int_at(items: &[Frame], idx: usize) -> Option<i64> {
+        match items.get(idx) {
+            Some(Frame::Integer(n)) => Some(*n),
+            _ => None,
+        }
+    }
+
+    // `field_name` value of one per-field entry array.
+    fn entry_field_name(entry: &Frame) -> Option<Bytes> {
+        if let Frame::Array(pairs) = entry {
+            if let Some(vi) = value_idx(pairs, b"field_name") {
+                if let Some(Frame::BulkString(name)) = pairs.get(vi) {
+                    return Some(name.clone());
+                }
+            }
+        }
+        None
+    }
+
+    for remote in remotes {
+        let r_items: &[Frame] = match remote {
+            Frame::Array(a) => a,
+            _ => continue,
+        };
+        for key in ADDITIVE_TOP {
+            if let (Some(li), Some(ri)) = (value_idx(&items, key), value_idx(r_items, key)) {
+                if let (Some(lv), Some(rv)) = (int_at(&items, li), int_at(r_items, ri)) {
+                    items[li] = Frame::Integer(lv.saturating_add(rv));
+                }
+            }
+        }
+        for list_key in [b"vector_fields".as_slice(), b"text_fields".as_slice()] {
+            let (Some(li), Some(ri)) = (value_idx(&items, list_key), value_idx(r_items, list_key))
+            else {
+                continue;
+            };
+            let remote_entries: Vec<Frame> = match r_items.get(ri) {
+                Some(Frame::Array(a)) => a.to_vec(),
+                _ => continue,
+            };
+            let Some(Frame::Array(local_entries)) = items.get(li) else {
+                continue;
+            };
+            let mut local_entries: Vec<Frame> = local_entries.to_vec();
+            for le in local_entries.iter_mut() {
+                let Some(name) = entry_field_name(le) else {
+                    continue;
+                };
+                let Some(re) = remote_entries
+                    .iter()
+                    .find(|re| entry_field_name(re).as_deref() == Some(name.as_ref()))
+                else {
+                    continue;
+                };
+                let (Frame::Array(lp), Frame::Array(rp)) = (&*le, re) else {
+                    continue;
+                };
+                let mut pairs: Vec<Frame> = lp.to_vec();
+                for key in ADDITIVE_FIELD {
+                    if let (Some(lpi), Some(rpi)) = (value_idx(&pairs, key), value_idx(rp, key)) {
+                        if let (Some(lv), Some(rv)) = (int_at(&pairs, lpi), int_at(rp, rpi)) {
+                            pairs[lpi] = Frame::Integer(lv.saturating_add(rv));
+                        }
+                    }
+                }
+                *le = Frame::Array(pairs.into());
+            }
+            items[li] = Frame::Array(local_entries.into());
+        }
+    }
+
+    Frame::Array(items.into())
+}
+
 /// Full FT.INFO response for TEXT-only indexes.
 ///
 /// Returns index_name, num_docs, num_terms, per-field stats (num_docs,
@@ -284,4 +409,106 @@ fn ft_info_text_only(
     items.push(Frame::Integer(text_store.version_token() as i64));
 
     Frame::Array(items.into())
+}
+
+#[cfg(test)]
+mod merge_tests {
+    use super::*;
+
+    fn bs(s: &[u8]) -> Frame {
+        Frame::BulkString(Bytes::copy_from_slice(s))
+    }
+
+    fn info_frame(num_docs: i64, field_docs: i64, mutable: i64, imms: i64) -> Frame {
+        let field_entry = Frame::Array(
+            vec![
+                bs(b"field_name"),
+                bs(b"vec"),
+                bs(b"dimension"),
+                Frame::Integer(8),
+                bs(b"num_docs"),
+                Frame::Integer(field_docs),
+                bs(b"mutable_vectors"),
+                Frame::Integer(mutable),
+                bs(b"immutable_segments"),
+                Frame::Integer(imms),
+            ]
+            .into(),
+        );
+        Frame::Array(
+            vec![
+                bs(b"index_name"),
+                bs(b"idx"),
+                bs(b"num_docs"),
+                Frame::Integer(num_docs),
+                bs(b"dimension"),
+                Frame::Integer(8),
+                bs(b"vector_fields"),
+                Frame::Array(vec![field_entry].into()),
+                bs(b"vector_version_token"),
+                Frame::Integer(7),
+            ]
+            .into(),
+        )
+    }
+
+    fn get_int(frame: &Frame, key: &[u8]) -> i64 {
+        let Frame::Array(items) = frame else {
+            panic!("not an array")
+        };
+        let mut i = 0;
+        while i + 1 < items.len() {
+            if let Frame::BulkString(k) = &items[i] {
+                if k.as_ref() == key {
+                    if let Frame::Integer(n) = &items[i + 1] {
+                        return *n;
+                    }
+                    panic!("value for {key:?} not Integer");
+                }
+            }
+            i += 2;
+        }
+        panic!("key {key:?} not found");
+    }
+
+    #[test]
+    fn sums_additive_fields_across_shards() {
+        let local = info_frame(10, 10, 4, 1);
+        let remotes = [info_frame(5, 5, 2, 1), info_frame(3, 3, 3, 0)];
+        let merged = merge_ft_info_responses(local, &remotes);
+        assert_eq!(get_int(&merged, b"num_docs"), 18);
+        assert_eq!(get_int(&merged, b"vector_version_token"), 21);
+        // Config fields untouched.
+        assert_eq!(get_int(&merged, b"dimension"), 8);
+        // Nested per-field additivity.
+        let Frame::Array(items) = &merged else {
+            unreachable!()
+        };
+        let vf_idx = items
+            .iter()
+            .position(|f| matches!(f, Frame::BulkString(b) if b.as_ref() == b"vector_fields"))
+            .unwrap();
+        let Frame::Array(entries) = &items[vf_idx + 1] else {
+            panic!("vector_fields not array")
+        };
+        assert_eq!(get_int(&entries[0], b"num_docs"), 18);
+        assert_eq!(get_int(&entries[0], b"mutable_vectors"), 9);
+        assert_eq!(get_int(&entries[0], b"immutable_segments"), 2);
+    }
+
+    #[test]
+    fn propagates_remote_error() {
+        let local = info_frame(10, 10, 4, 1);
+        let remotes = [Frame::Error(Bytes::from_static(b"ERR boom"))];
+        let merged = merge_ft_info_responses(local, &remotes);
+        assert!(matches!(merged, Frame::Error(_)));
+    }
+
+    #[test]
+    fn no_remotes_is_identity() {
+        let local = info_frame(10, 10, 4, 1);
+        let merged = merge_ft_info_responses(local.clone(), &[]);
+        assert_eq!(get_int(&merged, b"num_docs"), 10);
+        assert_eq!(get_int(&merged, b"vector_version_token"), 7);
+    }
 }

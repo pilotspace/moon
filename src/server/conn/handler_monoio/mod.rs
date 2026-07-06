@@ -1322,6 +1322,20 @@ pub(crate) async fn handle_connection_sharded_monoio<
                             smallvec::SmallVec::new()
                         };
 
+                        // Auto-delete vectors on DEL/UNLINK (conn-local write path).
+                        // Parity with the SPSC Execute arm and the tokio sharded
+                        // handler — without this, deleted keys keep matching
+                        // FT.SEARCH at shards=1 (soak-diagnostic resurrection bug).
+                        if !is_error
+                            && (cmd.eq_ignore_ascii_case(b"DEL")
+                                || cmd.eq_ignore_ascii_case(b"UNLINK"))
+                        {
+                            crate::shard::spsc_handler::auto_delete_vectors(
+                                &mut s.vector_store,
+                                cmd_args,
+                            );
+                        }
+
                         // Blocking wakeup: re-borrow db by index (NLL)
                         if !is_error {
                             let needs_wake = cmd.eq_ignore_ascii_case(b"LPUSH")

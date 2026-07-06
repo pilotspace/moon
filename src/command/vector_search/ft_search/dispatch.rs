@@ -637,10 +637,15 @@ fn capture_dense_knn_snapshot(
         (base * dim_factor / 2).clamp(200, 1000)
     };
 
-    let filter_bitmap = filter.map(|f| {
-        let total = idx.segments.total_vectors();
-        idx.payload_index.evaluate_bitmap(f, total)
-    });
+    let total_vectors = idx.segments.total_vectors();
+    let filter_bitmap = filter.map(|f| idx.payload_index.evaluate_bitmap(f, total_vectors));
+    // XC-3: resolve the selectivity-based strategy at capture, mirroring the
+    // sync path's `select_strategy` dispatch (holder.rs `search_filtered`). The
+    // yield refactor (PR #189) originally hardcoded ACORN-filtered search for
+    // every filtered query, losing the >80%-selectivity oversample+post-filter
+    // branch.
+    let filter_strategy =
+        crate::vector::filter::selectivity::select_strategy(filter_bitmap.as_ref(), total_vectors);
 
     let segments = idx.segments.load_full();
     let mutable_len = segments.mutable.len();
@@ -651,6 +656,7 @@ fn capture_dense_knn_snapshot(
         k,
         ef_search,
         filter_bitmap,
+        filter_strategy,
         snapshot_lsn: as_of_lsn,
         my_txn_id: 0,
         committed,

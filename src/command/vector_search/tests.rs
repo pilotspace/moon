@@ -683,8 +683,7 @@ fn test_end_to_end_create_insert_search() {
     for (i, v) in vectors.iter().enumerate() {
         let mut sq = vec![0i8; dim];
         quantize_f32_to_sq(v, &mut sq);
-        let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-        snap.mutable.append(i as u64, v, &sq, norm, i as u64);
+        snap.mutable.append(i as u64, v, i as u64);
     }
     drop(snap);
 
@@ -957,7 +956,7 @@ fn test_vector_metrics_increment_decrement() {
 
     // FT.SEARCH should increment VECTOR_SEARCH_TOTAL
     crate::vector::distance::init();
-    let before_search = crate::vector::metrics::VECTOR_SEARCH_TOTAL.load(Ordering::Relaxed);
+    let before_search = crate::vector::metrics::search_total();
     let query_vec: Vec<u8> = vec![0u8; 128 * 4];
     let search_args = vec![
         bulk(b"myidx"),
@@ -968,7 +967,7 @@ fn test_vector_metrics_increment_decrement() {
         Frame::BulkString(Bytes::from(query_vec)),
     ];
     ft_search(&mut store, &search_args, None, None, 0);
-    let after_search = crate::vector::metrics::VECTOR_SEARCH_TOTAL.load(Ordering::Relaxed);
+    let after_search = crate::vector::metrics::search_total();
     assert_eq!(
         after_search,
         before_search + 1,
@@ -2420,8 +2419,7 @@ fn test_ft_search_field_targeting() {
     for (i, v) in title_vecs.iter().enumerate() {
         let mut sq = vec![0i8; 4];
         quantize_f32_to_sq(v, &mut sq);
-        let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-        snap.mutable.append(i as u64, v, &sq, norm, i as u64);
+        snap.mutable.append(i as u64, v, i as u64);
     }
     drop(snap);
 
@@ -2435,8 +2433,7 @@ fn test_ft_search_field_targeting() {
         for (i, v) in body_vecs.iter().enumerate() {
             let mut sq = vec![0i8; 8];
             quantize_f32_to_sq(v, &mut sq);
-            let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-            snap.mutable.append(i as u64, v, &sq, norm, i as u64);
+            snap.mutable.append(i as u64, v, i as u64);
         }
     }
 
@@ -2526,8 +2523,7 @@ fn test_ft_search_default_field_compat() {
     for (i, v) in vectors.iter().enumerate() {
         let mut sq = vec![0i8; 4];
         quantize_f32_to_sq(v, &mut sq);
-        let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-        snap.mutable.append(i as u64, v, &sq, norm, i as u64);
+        snap.mutable.append(i as u64, v, i as u64);
     }
     drop(snap);
 
@@ -2813,13 +2809,11 @@ fn insert_hybrid_doc(
     let snap = idx.segments.load();
     let mut sq = vec![0i8; dim];
     quantize_f32_to_sq(dense_vec, &mut sq);
-    let norm = dense_vec.iter().map(|x| x * x).sum::<f32>().sqrt();
-    snap.mutable.append(key_hash, dense_vec, &sq, norm, 0);
+    snap.mutable.append(key_hash, dense_vec, 0);
     drop(snap);
 
     // Record key mapping
-    idx.key_hash_to_key
-        .insert(key_hash, Bytes::from(key.to_vec()));
+    std::sync::Arc::make_mut(&mut idx.key_hash_to_key).insert(key_hash, Bytes::from(key.to_vec()));
 
     // Insert sparse vector
     if let Some(ss) = idx.sparse_stores.get_mut(b"sparse_vec".as_ref()) {
@@ -3157,8 +3151,7 @@ fn test_range_filter_l2_search() {
         for (i, v) in vectors.iter().enumerate() {
             let mut sq = vec![0i8; dim];
             quantize_f32_to_sq(v, &mut sq);
-            let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-            snap.mutable.append(i as u64, v, &sq, norm, i as u64);
+            snap.mutable.append(i as u64, v, i as u64);
         }
     }
 
@@ -3356,10 +3349,9 @@ fn test_recommend_basic_with_vectors() {
             let snap = idx.segments.load();
             let mut sq = vec![0i8; dim];
             quantize_f32_to_sq(v, &mut sq);
-            let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-            snap.mutable.append(key_hash, v, &sq, norm, i as u64);
+            snap.mutable.append(key_hash, v, i as u64);
             drop(snap);
-            idx.key_hash_to_key
+            std::sync::Arc::make_mut(&mut idx.key_hash_to_key)
                 .insert(key_hash, Bytes::from(key.to_vec()));
         }
     }
@@ -3529,8 +3521,8 @@ fn test_ft_dropindex_dd_deletes_docs() {
     if let Some(idx) = store.get_index_mut(b"ddtest") {
         let h1 = xxhash_rust::xxh64::xxh64(&key1, 0);
         let h2 = xxhash_rust::xxh64::xxh64(&key2, 0);
-        idx.key_hash_to_key.insert(h1, key1.clone());
-        idx.key_hash_to_key.insert(h2, key2.clone());
+        std::sync::Arc::make_mut(&mut idx.key_hash_to_key).insert(h1, key1.clone());
+        std::sync::Arc::make_mut(&mut idx.key_hash_to_key).insert(h2, key2.clone());
     }
 
     // Verify keys exist in database
@@ -3598,7 +3590,7 @@ fn test_ft_dropindex_preserves_docs() {
     // Register key in vector index
     if let Some(idx) = store.get_index_mut(b"preservetest") {
         let h1 = xxhash_rust::xxh64::xxh64(&key1, 0);
-        idx.key_hash_to_key.insert(h1, key1.clone());
+        std::sync::Arc::make_mut(&mut idx.key_hash_to_key).insert(h1, key1.clone());
     }
 
     // Drop index WITHOUT DD flag (using None for db since we don't need it)
@@ -3650,7 +3642,7 @@ fn test_ft_dropindex_dd_case_insensitive() {
         let key = Bytes::from_static(b"c1:doc");
         db.set(key.clone(), crate::storage::entry::Entry::new_hash());
         if let Some(idx) = store.get_index_mut(b"casetest1") {
-            idx.key_hash_to_key
+            std::sync::Arc::make_mut(&mut idx.key_hash_to_key)
                 .insert(xxhash_rust::xxh64::xxh64(&key, 0), key.clone());
         }
 
@@ -3700,7 +3692,7 @@ fn test_ft_dropindex_dd_case_insensitive() {
         let key = Bytes::from_static(b"c2:doc");
         db.set(key.clone(), crate::storage::entry::Entry::new_hash());
         if let Some(idx) = store.get_index_mut(b"casetest2") {
-            idx.key_hash_to_key
+            std::sync::Arc::make_mut(&mut idx.key_hash_to_key)
                 .insert(xxhash_rust::xxh64::xxh64(&key, 0), key.clone());
         }
 

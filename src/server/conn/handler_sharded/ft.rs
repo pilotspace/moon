@@ -278,6 +278,22 @@ pub(super) async fn try_handle_ft_command(
             )));
             return true;
         }
+        // FT.INFO: stats are per-shard partitions — scatter to every shard and
+        // sum the additive fields (XC-SHARD-1); broadcast_vector_command would
+        // return only the local shard's counts (~1/N of the truth).
+        if cmd.eq_ignore_ascii_case(b"FT.INFO") {
+            let response = crate::shard::coordinator::scatter_ft_info(
+                std::sync::Arc::new(frame.clone()),
+                ctx.shard_id,
+                ctx.num_shards,
+                &ctx.shard_databases,
+                &ctx.dispatch_tx,
+                &ctx.spsc_notifiers,
+            )
+            .await;
+            responses.push(response);
+            return true;
+        }
         let response = crate::shard::coordinator::broadcast_vector_command(
             std::sync::Arc::new(frame.clone()),
             ctx.shard_id,

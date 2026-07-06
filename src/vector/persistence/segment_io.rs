@@ -154,6 +154,20 @@ pub fn write_immutable_segment(
     // 3. sq_vectors.bin — skipped (SQ8 no longer stored in ImmutableSegment).
     // 3b. f32_vectors.bin — skipped (f32 no longer stored; TQ-ADC used for search).
 
+    // 3c. raw_f16.bin — exact-rerank sidecar (HQ-1): u16 LE halves, BFS-ordered,
+    // `dimension` per entry. Optional: absent when the segment was built without
+    // raw vectors. Readers treat a missing file as "no sidecar" (backward and
+    // forward compatible — old readers ignore the extra file).
+    if let Some(raw) = segment.raw_f16() {
+        let mut buf = Vec::with_capacity(raw.len() * 2);
+        for &h in raw {
+            buf.extend_from_slice(&h.to_le_bytes());
+        }
+        let raw_path = seg_dir.join("raw_f16.bin");
+        fs::write(&raw_path, &buf)?;
+        fsync_file(&raw_path)?;
+    }
+
     // 4. mvcc_headers.bin: [version:u8][count:u32 LE][MvccHeader; count]
     // v2 format: 32 bytes/header (internal_id + global_id + key_hash + insert_lsn + delete_lsn)
     let mvcc = segment.mvcc_headers();
@@ -439,6 +453,29 @@ pub fn read_immutable_segment(
     let dim = meta.dimension as usize;
     let qjl_bpv = (dim + 7) / 8;
     let sub_sign_bpv = (meta.padded_dimension as usize + 7) / 8;
+
+    // 6b. raw_f16.bin — optional exact-rerank sidecar (HQ-1). Missing file
+    // (pre-sidecar segments) or a size mismatch → no sidecar; search falls
+    // back to quantized ADC distances.
+    let raw_f16: Option<Vec<u16>> = match fs::read(seg_dir.join("raw_f16.bin")) {
+        Ok(bytes) if bytes.len() == mvcc.len() * dim * 2 => Some(
+            bytes
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect(),
+        ),
+        Ok(bytes) => {
+            tracing::warn!(
+                "segment-{segment_id}: raw_f16.bin has {} bytes, expected {} — \
+                 ignoring sidecar (search degrades to quantized distances)",
+                bytes.len(),
+                mvcc.len() * dim * 2
+            );
+            None
+        }
+        Err(_) => None,
+    };
+
     let segment = ImmutableSegment::new(
         graph,
         vectors_tq,
@@ -451,7 +488,8 @@ pub fn read_immutable_segment(
         collection.clone(),
         meta.live_count,
         meta.total_count,
-    );
+    )
+    .with_raw_f16(raw_f16);
 
     Ok((segment, collection))
 }
@@ -719,7 +757,7 @@ mod tests {
         for i in 0..n {
             let mut v = lcg_f32(dim, (i * 7 + 13) as u32);
             normalize(&mut v);
-            seg.append(i as u64, &v, &[], 1.0, i as u64 + 1);
+            seg.append(i as u64, &v, i as u64 + 1);
             db.push(v);
         }
         let frozen = seg.freeze();

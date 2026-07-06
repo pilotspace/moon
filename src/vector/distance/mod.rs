@@ -33,6 +33,17 @@ pub struct DistanceTable {
     /// Centroids must be dimension-scaled (from CollectionMetadata.codebook_16()).
     /// All tiers use scalar ADC for now; AVX2/AVX-512 VPERMPS ADC is Phase 61+ work.
     pub tq_l2: fn(&[f32], &[u8], f32, &[f32; 16]) -> f32,
+    /// SQ8 asymmetric-distance-code (ADC) per-candidate statistics:
+    /// `(query, codes) -> (Σ(q_i·c_i), Σc_i, Σc_i²)`.
+    ///
+    /// This is the SIMD-accelerated inner loop of the HQ-2 fix (see
+    /// `turbo_quant::sq8` module docs for the algebraic decomposition): u8
+    /// codes are widened to f32 and FMA'd against the query in one pass.
+    /// Combine with `turbo_quant::sq8::sq8_l2_from_stats` /
+    /// `sq8_ip_from_stats` (using per-query `turbo_quant::sq8::sq8_query_stats`)
+    /// to get the final ADC distance — that combine step is O(1) arithmetic,
+    /// architecture-independent, and deliberately NOT part of this table.
+    pub sq8_stats: fn(&[f32], &[u8]) -> (f32, f32, f32),
 }
 
 static DISTANCE_TABLE: OnceLock<DistanceTable> = OnceLock::new();
@@ -74,6 +85,10 @@ pub fn init() {
                         unsafe { avx512::cosine_f32(a, b) }
                     },
                     tq_l2: crate::vector::turbo_quant::tq_adc::tq_l2_adc_scaled,
+                    sq8_stats: |q, c| {
+                        // SAFETY: AVX-512F verified by is_x86_feature_detected! above.
+                        unsafe { avx512::sq8_stats(q, c) }
+                    },
                 };
             }
             if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
@@ -95,6 +110,10 @@ pub fn init() {
                         unsafe { avx2::cosine_f32(a, b) }
                     },
                     tq_l2: crate::vector::turbo_quant::tq_adc::tq_l2_adc_scaled,
+                    sq8_stats: |q, c| {
+                        // SAFETY: AVX2+FMA verified by is_x86_feature_detected! above.
+                        unsafe { avx2::sq8_stats(q, c) }
+                    },
                 };
             }
         }
@@ -121,6 +140,10 @@ pub fn init() {
                     unsafe { neon::cosine_f32(a, b) }
                 },
                 tq_l2: crate::vector::turbo_quant::tq_adc::tq_l2_adc_scaled,
+                sq8_stats: |q, c| {
+                    // SAFETY: NEON is guaranteed on AArch64.
+                    unsafe { neon::sq8_stats(q, c) }
+                },
             };
         }
 
@@ -132,6 +155,7 @@ pub fn init() {
             dot_f32: scalar::dot_f32,
             cosine_f32: scalar::cosine_f32,
             tq_l2: crate::vector::turbo_quant::tq_adc::tq_l2_adc_scaled,
+            sq8_stats: crate::vector::turbo_quant::sq8::sq8_candidate_stats_scalar,
         }
     });
 }
@@ -184,6 +208,16 @@ mod tests {
         let centroids = crate::vector::turbo_quant::codebook::scaled_centroids(8);
         let dist = (t.tq_l2)(&q, &code, 1.0, &centroids);
         assert!(dist >= 0.0, "tq_l2 should be non-negative, got {dist}");
+
+        // SQ8 ADC stats smoke test (HQ-2): dot=1*10+2*20+3*30=140, sum_c=60, sumsq_c=1400.
+        let codes: [u8; 3] = [10, 20, 30];
+        let (dot, sum_c, sumsq_c) = (t.sq8_stats)(&a[..3], &codes);
+        assert!((dot - 140.0).abs() < 1e-4, "sq8_stats dot={dot}");
+        assert!((sum_c - 60.0).abs() < 1e-4, "sq8_stats sum_c={sum_c}");
+        assert!(
+            (sumsq_c - 1400.0).abs() < 1e-4,
+            "sq8_stats sumsq_c={sumsq_c}"
+        );
     }
 
     #[test]
@@ -390,5 +424,91 @@ mod integration_tests {
         let ai = [42i8];
         let bi = [-10i8];
         assert_eq!(scalar::l2_i8(&ai, &bi), (t.l2_i8)(&ai, &bi));
+    }
+
+    /// Deterministic u8 codes via LCG PRNG, full 0..=255 range.
+    fn deterministic_u8(dim: usize, seed: u64) -> Vec<u8> {
+        let mut v = Vec::with_capacity(dim);
+        let mut s = seed as u32;
+        for _ in 0..dim {
+            s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+            v.push((s >> 24) as u8);
+        }
+        v
+    }
+
+    /// HQ-2: the SIMD-dispatched `sq8_stats` kernel must match the scalar
+    /// reference (`turbo_quant::sq8::sq8_candidate_stats_scalar`) at every
+    /// dimension, including SIMD-width tail remainders. On x86_64 this
+    /// exercises whichever tier `is_x86_feature_detected!` selected at
+    /// `init()` time (AVX-512 > AVX2+FMA); on aarch64, NEON (always
+    /// available); elsewhere, the scalar fallback trivially matches itself.
+    #[test]
+    fn test_simd_matches_scalar_sq8_stats() {
+        use crate::vector::turbo_quant::sq8::sq8_candidate_stats_scalar;
+
+        init();
+        let t = table();
+        for &dim in TEST_DIMS {
+            let q = deterministic_f32(dim, 42);
+            let codes = deterministic_u8(dim, 99);
+            let expected = sq8_candidate_stats_scalar(&q, &codes);
+            let got = (t.sq8_stats)(&q, &codes);
+            assert!(
+                approx_eq_f32(expected.0, got.0, 1e-3),
+                "sq8_stats dot mismatch at dim={dim}: scalar={:?} dispatch={:?}",
+                expected,
+                got
+            );
+            assert!(
+                approx_eq_f32(expected.1, got.1, 1e-3),
+                "sq8_stats sum_c mismatch at dim={dim}: scalar={:?} dispatch={:?}",
+                expected,
+                got
+            );
+            assert!(
+                approx_eq_f32(expected.2, got.2, 1e-3),
+                "sq8_stats sumsq_c mismatch at dim={dim}: scalar={:?} dispatch={:?}",
+                expected,
+                got
+            );
+        }
+    }
+
+    /// End-to-end: dispatched `sq8_stats` combined via
+    /// `sq8_l2_from_stats`/`sq8_ip_from_stats` must reproduce the original
+    /// naive per-element `sq8_l2_adc`/`sq8_ip_adc` ADC (same math,
+    /// reassociated for vectorization).
+    #[test]
+    fn test_sq8_dispatched_adc_matches_naive() {
+        use crate::vector::turbo_quant::sq8::{
+            sq8_ip_adc, sq8_ip_from_stats, sq8_l2_adc, sq8_l2_from_stats, sq8_query_stats,
+        };
+
+        init();
+        let t = table();
+        for &dim in TEST_DIMS {
+            let q = deterministic_f32(dim, 7);
+            let codes = deterministic_u8(dim, 13);
+            let min = -0.37f32;
+            let scale = 0.0123f32;
+
+            let naive_l2 = sq8_l2_adc(&q, &codes, min, scale);
+            let (q_sum, q_sumsq) = sq8_query_stats(&q);
+            let (dot_qc, sum_c, sumsq_c) = (t.sq8_stats)(&q, &codes);
+            let fast_l2 =
+                sq8_l2_from_stats(dim, min, scale, q_sum, q_sumsq, dot_qc, sum_c, sumsq_c);
+            assert!(
+                approx_eq_f32(naive_l2, fast_l2, 1e-3),
+                "l2 mismatch at dim={dim}: naive={naive_l2} dispatched={fast_l2}"
+            );
+
+            let naive_ip = sq8_ip_adc(&q, &codes, min, scale);
+            let fast_ip = sq8_ip_from_stats(min, scale, q_sum, dot_qc);
+            assert!(
+                approx_eq_f32(naive_ip, fast_ip, 1e-3),
+                "ip mismatch at dim={dim}: naive={naive_ip} dispatched={fast_ip}"
+            );
+        }
     }
 }

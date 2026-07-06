@@ -122,6 +122,10 @@ pub struct SearchSnapshot {
     pub ef_search: usize,
     /// Pre-evaluated payload/numeric filter bitmap (owned), or None.
     pub filter_bitmap: Option<RoaringBitmap>,
+    /// Selectivity-based filter strategy resolved at capture (XC-3), matching
+    /// the sync path's `select_strategy` dispatch. `Unfiltered` when
+    /// `filter_bitmap` is None.
+    pub filter_strategy: FilterStrategy,
     /// MVCC snapshot LSN captured at entry — governs visibility across yields.
     pub snapshot_lsn: u64,
     /// Active txn id (0 for non-transactional reads).
@@ -138,8 +142,9 @@ pub struct SearchSnapshot {
     pub scratch: SearchScratch,
     /// Key-hash → key map captured at START (§3 C1) so a mid-search delete cannot
     /// drop an entry this search still needs to resolve. Used by the response
-    /// builder, not the segment scan.
-    pub key_hash_to_key: std::collections::HashMap<u64, bytes::Bytes>,
+    /// builder, not the segment scan. `Arc` snapshot: capture is O(1); writers
+    /// copy-on-write via `Arc::make_mut` (QP-1).
+    pub key_hash_to_key: std::sync::Arc<std::collections::HashMap<u64, bytes::Bytes>>,
 }
 
 /// Lock-free segment holder. Searches load() once at query start and hold
@@ -597,6 +602,24 @@ impl SegmentHolder {
         snap: &mut SearchSnapshot,
         budget: YieldBudget,
     ) -> SmallVec<[SearchResult; 32]> {
+        Self::search_mvcc_yielding_with_pool(snap, budget, crate::vector::search_pool::global())
+            .await
+    }
+
+    /// [`Self::search_mvcc_yielding`] with an explicit worker pool: when
+    /// `pool` is `Some` and the index holds ≥2 graph-tier (immutable/warm)
+    /// segments, the per-segment HNSW searches fan out to the pool while THIS
+    /// task runs the mutable MVCC scan — replies are awaited via
+    /// `recv_async`, which parks the task, never the shard event loop. With
+    /// `pool = None` (or <2 graph segments) the body is the exact serial path.
+    /// Results are identical either way: segment searches are independent
+    /// reads and the final `sort_unstable` under `SearchResult`'s total order
+    /// (distance, then id) makes accumulation order immaterial.
+    pub async fn search_mvcc_yielding_with_pool(
+        snap: &mut SearchSnapshot,
+        budget: YieldBudget,
+        pool: Option<&crate::vector::search_pool::SearchWorkerPool>,
+    ) -> SmallVec<[SearchResult; 32]> {
         // Capture-before-yield: move all read-only inputs into owned locals so
         // the per-chunk loops touch only `snap.scratch` (mutably) — no aliasing
         // borrow of `snap`. `key_hash_to_key` stays in `snap` for the response
@@ -609,6 +632,21 @@ impl SegmentHolder {
         let filter_ref = filter_bitmap.as_ref();
         let k = snap.k;
         let ef_search = snap.ef_search;
+        // XC-3: high-selectivity filters (>80% of vectors pass) run the graph
+        // UNFILTERED with 3×k oversampling and post-filter the results —
+        // mirrors the sync path's `FilterStrategy::HnswPostFilter` branch.
+        let post_filter =
+            filter_ref.is_some() && matches!(snap.filter_strategy, FilterStrategy::HnswPostFilter);
+        let (fetch_k, graph_filter) = if post_filter {
+            (k * 3, None)
+        } else {
+            (k, filter_ref)
+        };
+        let graph_ef = if post_filter {
+            ef_search.max(k * 3)
+        } else {
+            ef_search
+        };
         let snapshot_lsn = snap.snapshot_lsn;
         let my_txn_id = snap.my_txn_id;
         let mutable_len = snap.mutable_len;
@@ -630,74 +668,223 @@ impl SegmentHolder {
 
         let mut all: SmallVec<[SearchResult; 32]> = SmallVec::new();
 
-        // 1. MVCC brute-force over the captured append-only range [0, mutable_len),
-        //    chunked + cooperatively yielded between chunks. Each chunk's top-k
-        //    merges into the same global top-k a single full scan produces.
-        let chunk = budget.max_brute_force_vecs_per_chunk.max(1);
-        let mut start = 0usize;
-        while start < mutable_len {
-            let end = (start + chunk).min(mutable_len);
-            let part = segments.mutable.brute_force_search_mvcc(
-                query_f32,
-                query_state.as_ref(),
-                k,
-                filter_ref,
-                snapshot_lsn,
-                my_txn_id,
-                &committed,
-                start,
-                end,
-            );
-            all.extend(part);
-            start = end;
-            if start < mutable_len {
-                crate::admin::metrics_setup::bump_ft_search_cooperative_yield();
-                crate::runtime::cooperative_yield().await;
+        // 0. Intra-query fan-out (search_pool): submit every graph-tier
+        //    (immutable/warm) segment search to the worker pool BEFORE the
+        //    mutable scan so workers overlap with it. Filter semantics mirror
+        //    the serial loops below: ACORN mode ships the allow-list bitmap to
+        //    the worker; HnswPostFilter mode searches unfiltered at fetch_k and
+        //    the bitmap is applied to the collected results (step 2).
+        let graph_jobs = segments.immutable.len() + segments.warm.len();
+        let pooled = pool.filter(|_| graph_jobs >= 2);
+        let mut pending_replies = 0usize;
+        let mut reply_rx = None;
+        if let Some(pool) = pooled {
+            let (tx, rx) = flume::bounded::<SmallVec<[SearchResult; 32]>>(graph_jobs);
+            // One owned query copy + optional bitmap clone per query — shared
+            // across this query's jobs via Arc (not per-segment copies).
+            let query_arc: std::sync::Arc<[f32]> = std::sync::Arc::from(query_f32);
+            let filter_arc = graph_filter.map(|bm| std::sync::Arc::new(bm.clone()));
+            // On submit failure (pool shut down at process teardown) the
+            // segment is searched inline — the query still answers correctly.
+            for seg in &segments.immutable {
+                let job = crate::vector::search_pool::SegmentSearchJob {
+                    segment: crate::vector::search_pool::GraphSegmentRef::Immutable(
+                        std::sync::Arc::clone(seg),
+                    ),
+                    query: std::sync::Arc::clone(&query_arc),
+                    fetch_k,
+                    ef_search: graph_ef,
+                    filter: filter_arc.clone(),
+                    reply: tx.clone(),
+                };
+                if pool.submit(job) {
+                    pending_replies += 1;
+                } else if graph_filter.is_some() {
+                    all.extend(seg.search_filtered(
+                        query_f32,
+                        fetch_k,
+                        graph_ef,
+                        &mut snap.scratch,
+                        graph_filter,
+                    ));
+                } else {
+                    let results = seg.search(query_f32, fetch_k, graph_ef, &mut snap.scratch);
+                    if post_filter {
+                        if let Some(bm) = filter_ref {
+                            all.extend(results.into_iter().filter(|r| bm.contains(r.id.0)));
+                        }
+                    } else {
+                        all.extend(results);
+                    }
+                }
             }
+            for seg in &segments.warm {
+                let job = crate::vector::search_pool::SegmentSearchJob {
+                    segment: crate::vector::search_pool::GraphSegmentRef::Warm(
+                        std::sync::Arc::clone(seg),
+                    ),
+                    query: std::sync::Arc::clone(&query_arc),
+                    fetch_k,
+                    ef_search: graph_ef,
+                    filter: filter_arc.clone(),
+                    reply: tx.clone(),
+                };
+                if pool.submit(job) {
+                    pending_replies += 1;
+                } else if graph_filter.is_some() {
+                    all.extend(seg.search_filtered(
+                        query_f32,
+                        fetch_k,
+                        graph_ef,
+                        &mut snap.scratch,
+                        graph_filter,
+                    ));
+                } else {
+                    let results = seg.search(query_f32, fetch_k, graph_ef, &mut snap.scratch);
+                    if post_filter {
+                        if let Some(bm) = filter_ref {
+                            all.extend(results.into_iter().filter(|r| bm.contains(r.id.0)));
+                        }
+                    } else {
+                        all.extend(results);
+                    }
+                }
+            }
+            reply_rx = Some(rx);
+        }
+
+        // 1. MVCC brute-force over the captured append-only range [0, mutable_len),
+        //    chunked + cooperatively yielded between chunks. Query prep (FWHT
+        //    rotation / SQ8 normalize) and the top-k heap are hoisted out of the
+        //    chunk loop (QP-4): one prepare per query, one shared heap — the
+        //    accumulated result is exactly the global top-k a single full scan
+        //    produces.
+        let chunk = budget.max_brute_force_vecs_per_chunk.max(1);
+        if mutable_len > 0 {
+            // fetch_k oversamples under HnswPostFilter (filter still applied —
+            // the mutable scan is linear, filtering there is free).
+            let mut bf_query = segments.mutable.prepare_brute_force_query(
+                query_f32,
+                query_state.is_some(),
+                fetch_k,
+            );
+            let mut start = 0usize;
+            while start < mutable_len {
+                let end = (start + chunk).min(mutable_len);
+                segments.mutable.brute_force_scan_mvcc_chunk(
+                    &mut bf_query,
+                    query_state.as_ref(),
+                    fetch_k,
+                    filter_ref,
+                    snapshot_lsn,
+                    my_txn_id,
+                    &committed,
+                    start,
+                    end,
+                );
+                start = end;
+                if start < mutable_len {
+                    crate::admin::metrics_setup::bump_ft_search_cooperative_yield();
+                    crate::runtime::cooperative_yield().await;
+                }
+            }
+            all.extend(bf_query.into_results());
         }
 
         let seg_cap = budget.max_segments_per_chunk.max(1);
         let mut since_yield = 0usize;
 
-        // 2. HNSW search on immutable segments (committed by definition).
-        for imm in &segments.immutable {
-            if filter_ref.is_some() {
-                all.extend(imm.search_filtered(
-                    query_f32,
-                    k,
-                    ef_search,
-                    &mut snap.scratch,
-                    filter_ref,
-                ));
-            } else {
-                all.extend(imm.search(query_f32, k, ef_search, &mut snap.scratch));
+        // 2. Graph-tier (immutable/warm) results.
+        //
+        // Pooled: collect the worker replies submitted in step 0 — one
+        // `recv_async` await per job parks this task (never the event loop)
+        // until that segment's results land. A dropped reply (worker death —
+        // catch_unwind already contains per-job panics) degrades to missing
+        // segment results with a warning, never a hang. HnswPostFilter mode
+        // applies the bitmap here, mirroring the serial branch below.
+        let pooled_graph = reply_rx.is_some();
+        if let Some(rx) = reply_rx {
+            for _ in 0..pending_replies {
+                match rx.recv_async().await {
+                    Ok(results) => {
+                        if post_filter {
+                            if let Some(bm) = filter_ref {
+                                all.extend(results.into_iter().filter(|r| bm.contains(r.id.0)));
+                            }
+                        } else {
+                            all.extend(results);
+                        }
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            "vector search worker reply dropped; a segment's results \
+                             are missing from this query"
+                        );
+                    }
+                }
             }
-            since_yield += 1;
-            if since_yield >= seg_cap {
-                since_yield = 0;
-                crate::admin::metrics_setup::bump_ft_search_cooperative_yield();
-                crate::runtime::cooperative_yield().await;
+        }
+
+        // Serial path (no pool / <2 graph segments): identical to search_mvcc.
+        // Strategy dispatch (XC-3): `graph_filter` is None under HnswPostFilter
+        // (unfiltered traversal at fetch_k = 3×k, bitmap applied to results) —
+        // otherwise the ACORN-filtered traversal, same as the sync path.
+        if !pooled_graph {
+            for imm in &segments.immutable {
+                if graph_filter.is_some() {
+                    all.extend(imm.search_filtered(
+                        query_f32,
+                        fetch_k,
+                        graph_ef,
+                        &mut snap.scratch,
+                        graph_filter,
+                    ));
+                } else {
+                    let results = imm.search(query_f32, fetch_k, graph_ef, &mut snap.scratch);
+                    if post_filter {
+                        if let Some(bm) = filter_ref {
+                            all.extend(results.into_iter().filter(|r| bm.contains(r.id.0)));
+                        }
+                    } else {
+                        all.extend(results);
+                    }
+                }
+                since_yield += 1;
+                if since_yield >= seg_cap {
+                    since_yield = 0;
+                    crate::admin::metrics_setup::bump_ft_search_cooperative_yield();
+                    crate::runtime::cooperative_yield().await;
+                }
             }
         }
 
         // 2a. Warm segment search (committed by definition, same as immutable).
-        for warm_seg in &segments.warm {
-            if filter_ref.is_some() {
-                all.extend(warm_seg.search_filtered(
-                    query_f32,
-                    k,
-                    ef_search,
-                    &mut snap.scratch,
-                    filter_ref,
-                ));
-            } else {
-                all.extend(warm_seg.search(query_f32, k, ef_search, &mut snap.scratch));
-            }
-            since_yield += 1;
-            if since_yield >= seg_cap {
-                since_yield = 0;
-                crate::admin::metrics_setup::bump_ft_search_cooperative_yield();
-                crate::runtime::cooperative_yield().await;
+        if !pooled_graph {
+            for warm_seg in &segments.warm {
+                if graph_filter.is_some() {
+                    all.extend(warm_seg.search_filtered(
+                        query_f32,
+                        fetch_k,
+                        graph_ef,
+                        &mut snap.scratch,
+                        graph_filter,
+                    ));
+                } else {
+                    let results = warm_seg.search(query_f32, fetch_k, graph_ef, &mut snap.scratch);
+                    if post_filter {
+                        if let Some(bm) = filter_ref {
+                            all.extend(results.into_iter().filter(|r| bm.contains(r.id.0)));
+                        }
+                    } else {
+                        all.extend(results);
+                    }
+                }
+                since_yield += 1;
+                if since_yield >= seg_cap {
+                    since_yield = 0;
+                    crate::admin::metrics_setup::bump_ft_search_cooperative_yield();
+                    crate::runtime::cooperative_yield().await;
+                }
             }
         }
 
@@ -813,13 +1000,13 @@ mod tests {
         // Insert into original mutable
         {
             let snap = holder.load();
-            snap.mutable.append(1, &[0.0f32; 128], &[0i8; 128], 1.0, 1);
+            snap.mutable.append(1, &[0.0f32; 128], 1);
         }
 
         // Swap with a new list
         let new_mutable = Arc::new(MutableSegment::new(128, collection));
-        new_mutable.append(2, &[1.0f32; 128], &[1i8; 128], 1.0, 2);
-        new_mutable.append(3, &[2.0f32; 128], &[2i8; 128], 1.0, 3);
+        new_mutable.append(2, &[1.0f32; 128], 2);
+        new_mutable.append(3, &[2.0f32; 128], 3);
 
         holder.swap(SegmentList {
             mutable: new_mutable,
@@ -844,9 +1031,8 @@ mod tests {
         {
             let snap = holder.load();
             for i in 0..5u32 {
-                let sq = make_sq_vector(dim, i * 13 + 1);
                 let f32_v = vec![0.0f32; dim];
-                snap.mutable.append(i as u64, &f32_v, &sq, 1.0, i as u64);
+                snap.mutable.append(i as u64, &f32_v, i as u64);
             }
         }
 
@@ -870,9 +1056,8 @@ mod tests {
         {
             let snap = holder.load();
             for i in 0..5u32 {
-                let sq = make_sq_vector(dim, i * 13 + 1);
                 let f32_v = vec![0.0f32; dim];
-                snap.mutable.append(i as u64, &f32_v, &sq, 1.0, i as u64);
+                snap.mutable.append(i as u64, &f32_v, i as u64);
             }
         }
         let _query_sq = make_sq_vector(dim, 1);
@@ -896,9 +1081,8 @@ mod tests {
         {
             let snap = holder.load();
             for i in 0..5u32 {
-                let sq = make_sq_vector(dim, i * 13 + 1);
                 let f32_v = vec![0.0f32; dim];
-                snap.mutable.append(i as u64, &f32_v, &sq, 1.0, i as u64);
+                snap.mutable.append(i as u64, &f32_v, i as u64);
             }
         }
         let _query_sq = make_sq_vector(dim, 1);
@@ -932,9 +1116,8 @@ mod tests {
         {
             let snap = holder.load();
             for i in 0..5u32 {
-                let sq = make_sq_vector(dim as usize, i * 13 + 1);
                 let f32_v = vec![0.0f32; dim as usize];
-                snap.mutable.append(i as u64, &f32_v, &sq, 1.0, i as u64);
+                snap.mutable.append(i as u64, &f32_v, i as u64);
             }
         }
         let _query_sq = make_sq_vector(dim as usize, 1);
@@ -968,9 +1151,9 @@ mod tests {
         {
             let snap = holder.load();
             // insert_lsn=1, visible to snapshot=5
-            snap.mutable.append(0, &[0.0f32; 4], &[0i8; 4], 1.0, 1);
+            snap.mutable.append(0, &[0.0f32; 4], 1);
             // insert_lsn=10, NOT visible to snapshot=5
-            snap.mutable.append(1, &[0.0f32; 4], &[1i8; 4], 1.0, 10);
+            snap.mutable.append(1, &[0.0f32; 4], 10);
         }
         let _query_sq = vec![0i8; dim as usize];
         let query_f32 = vec![0.0f32; dim as usize];
@@ -1000,8 +1183,7 @@ mod tests {
         {
             let snap = holder.load();
             // One existing entry far from query (f32 L2 distance)
-            snap.mutable
-                .append(0, &[100.0f32; 4], &[100i8, 100, 100, 100], 1.0, 1);
+            snap.mutable.append(0, &[100.0f32; 4], 1);
         }
         let _query_sq = vec![0i8; dim];
         let query_f32 = vec![0.0f32; dim];
@@ -1062,9 +1244,8 @@ mod tests {
         {
             let snap = holder.load();
             for i in 0..5u32 {
-                let sq = make_sq_vector(dim as usize, i * 13 + 1);
                 let f32_v = vec![0.0f32; dim as usize];
-                snap.mutable.append(i as u64, &f32_v, &sq, 1.0, i as u64);
+                snap.mutable.append(i as u64, &f32_v, i as u64);
             }
         }
         let _query_sq = make_sq_vector(dim as usize, 1);
@@ -1107,14 +1288,12 @@ mod tests {
         assert_eq!(snap_before.mutable.len(), 0);
 
         // Insert into mutable (through original snapshot's Arc)
-        snap_before
-            .mutable
-            .append(1, &[0.0f32; 128], &[0i8; 128], 1.0, 1);
+        snap_before.mutable.append(1, &[0.0f32; 128], 1);
 
         // Swap with completely new list
         let new_mutable = Arc::new(MutableSegment::new(128, collection));
-        new_mutable.append(2, &[1.0f32; 128], &[1i8; 128], 1.0, 2);
-        new_mutable.append(3, &[2.0f32; 128], &[2i8; 128], 1.0, 3);
+        new_mutable.append(2, &[1.0f32; 128], 2);
+        new_mutable.append(3, &[2.0f32; 128], 3);
         holder.swap(SegmentList {
             mutable: new_mutable,
             immutable: Vec::new(),
@@ -1189,9 +1368,8 @@ mod tests {
         {
             let snap = holder.load();
             for i in 0..5u32 {
-                let sq = make_sq_vector(dim, i * 13 + 1);
                 let f32_v = vec![0.0f32; dim];
-                snap.mutable.append(i as u64, &f32_v, &sq, 1.0, i as u64);
+                snap.mutable.append(i as u64, &f32_v, i as u64);
             }
         }
 

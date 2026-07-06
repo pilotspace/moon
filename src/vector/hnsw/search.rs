@@ -9,9 +9,10 @@ use smallvec::SmallVec;
 
 use super::graph::{HnswGraph, SENTINEL};
 use crate::vector::aligned_buffer::AlignedBuffer;
+use crate::vector::distance;
 use crate::vector::turbo_quant::collection::{CollectionMetadata, QuantizationConfig};
 use crate::vector::turbo_quant::fwht;
-use crate::vector::turbo_quant::sq8::{sq8_l2_adc, sq8_params};
+use crate::vector::turbo_quant::sq8::{sq8_l2_from_stats, sq8_params, sq8_query_stats};
 use crate::vector::types::{DistanceMetric, SearchResult, VectorId};
 
 /// Bit vector for O(1) visited tracking. 64x more cache-efficient than HashSet
@@ -274,6 +275,16 @@ pub fn hnsw_search_filtered(
     } else {
         SmallVec::new()
     };
+    // HQ-2: resolve the SIMD-dispatched ADC stats kernel ONCE per query (not
+    // per beam candidate) and precompute the query-only constants (Σq_i,
+    // Σq_i²) it feeds `sq8_l2_from_stats` with — see `turbo_quant::sq8`
+    // module docs for the algebraic decomposition.
+    let sq8_stats_fn = distance::table().sq8_stats;
+    let (sq8_q_sum, sq8_q_sumsq) = if is_sq8 {
+        sq8_query_stats(&sq8_query)
+    } else {
+        (0.0, 0.0)
+    };
 
     let q_rot = scratch.query_rotated.as_mut_slice();
     // Copy query and zero-pad
@@ -390,10 +401,22 @@ pub fn hnsw_search_filtered(
     let dist_bfs = |bfs_pos: u32| -> f32 {
         let offset = bfs_pos as usize * bytes_per_code;
         if is_sq8 {
-            // SQ8: decode (min, scale) from the slot trailer, ADC squared-L2.
+            // SQ8: decode (min, scale) from the slot trailer, SIMD-dispatched
+            // ADC squared-L2 (HQ-2). `sq8_stats_fn` was resolved once above,
+            // outside this per-candidate closure.
             let slot = &vectors_tq[offset..offset + bytes_per_code];
             let (min, scale) = sq8_params(slot, dim);
-            return sq8_l2_adc(&sq8_query, &slot[..dim], min, scale);
+            let (dot_qc, sum_c, sumsq_c) = sq8_stats_fn(&sq8_query, &slot[..dim]);
+            return sq8_l2_from_stats(
+                dim,
+                min,
+                scale,
+                sq8_q_sum,
+                sq8_q_sumsq,
+                dot_qc,
+                sum_c,
+                sumsq_c,
+            );
         }
         let code_only = &vectors_tq[offset..offset + code_len];
         let norm_bytes = &vectors_tq[offset + code_len..offset + bytes_per_code];
@@ -529,10 +552,21 @@ pub fn hnsw_search_filtered(
         let offset = bfs_pos as usize * bytes_per_code;
         if is_sq8 {
             // SQ8 ADC is cheap and exact; ignore the budget early-exit.
+            // SIMD-dispatched (HQ-2), same as `dist_bfs` above.
             let _ = budget;
             let slot = &vectors_tq[offset..offset + bytes_per_code];
             let (min, scale) = sq8_params(slot, dim);
-            return sq8_l2_adc(&sq8_query, &slot[..dim], min, scale);
+            let (dot_qc, sum_c, sumsq_c) = sq8_stats_fn(&sq8_query, &slot[..dim]);
+            return sq8_l2_from_stats(
+                dim,
+                min,
+                scale,
+                sq8_q_sum,
+                sq8_q_sumsq,
+                dot_qc,
+                sum_c,
+                sumsq_c,
+            );
         }
         let code_only = &vectors_tq[offset..offset + code_len];
         let norm_bytes = &vectors_tq[offset + code_len..offset + bytes_per_code];
