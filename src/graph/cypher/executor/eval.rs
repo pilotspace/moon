@@ -43,15 +43,15 @@ pub(crate) fn eval_expr(
             );
             match obj {
                 Value::Node(key) => {
-                    if let Some(node) = memgraph.get_node(key) {
-                        let prop_id = label_to_id(property.as_bytes());
-                        for (pid, pval) in &node.properties {
-                            if *pid == prop_id {
-                                return property_value_to_value(pval);
-                            }
-                        }
+                    // Merged-tier lookup: mutable write buffer first, then
+                    // frozen CSR segments (v5 property blob). A node lives in
+                    // exactly one tier.
+                    let prop_id = label_to_id(property.as_bytes());
+                    let view = crate::graph::view::MergedNodeView::new(memgraph, immutable_segs);
+                    match view.property(key, prop_id) {
+                        Some(pv) => property_value_to_value(&pv),
+                        None => Value::Null,
                     }
-                    Value::Null
                 }
                 Value::Edge(key) => {
                     if let Some(edge) = memgraph.get_edge(key) {
@@ -213,9 +213,13 @@ pub(crate) fn eval_expr(
                             decay,
                         );
                         if let Value::Node(k) = v {
-                            if let Some(node) = memgraph.get_node(k) {
+                            // Merged-tier labels (frozen rows decode the CSR
+                            // label bitmap + overflow).
+                            let view =
+                                crate::graph::view::MergedNodeView::new(memgraph, immutable_segs);
+                            if let Some(node_labels) = view.labels(k) {
                                 let labels: Vec<Value> =
-                                    node.labels.iter().map(|&l| Value::Int(l as i64)).collect();
+                                    node_labels.iter().map(|&l| Value::Int(l as i64)).collect();
                                 return Value::List(labels);
                             }
                         }

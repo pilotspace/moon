@@ -6,7 +6,38 @@
 
 use roaring::RoaringBitmap;
 
-use crate::graph::types::{MutableEdge, MutableNode};
+use crate::graph::types::{MutableEdge, MutableNode, NodeMeta};
+
+/// Check if a frozen (CSR-resident) node is visible at the given snapshot.
+///
+/// Same rule as [`is_node_visible`] applied to CSR [`NodeMeta`]. Frozen
+/// segments hold only committed data — `freeze()` drains the committed
+/// mutable tier — so the transaction-ownership check runs with `txn_id = 0`.
+#[inline(always)]
+pub fn is_meta_visible(
+    meta: &NodeMeta,
+    snapshot_lsn: u64,
+    my_txn_id: u64,
+    committed: &RoaringBitmap,
+    valid_at: Option<i64>,
+) -> bool {
+    if !is_entity_visible(
+        meta.created_lsn,
+        meta.deleted_lsn,
+        0,
+        snapshot_lsn,
+        my_txn_id,
+        committed,
+    ) {
+        return false;
+    }
+    if let Some(t) = valid_at {
+        if t < meta.valid_from || t > meta.valid_to {
+            return false;
+        }
+    }
+    true
+}
 
 /// Check if a node is visible at the given snapshot.
 ///

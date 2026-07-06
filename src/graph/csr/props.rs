@@ -104,11 +104,7 @@ pub fn encode_node_record(
 ///
 /// Returns the stored offset (`byte_pos + 1`), or `0` when the edge carries
 /// the default weight and no properties (nothing is written).
-pub fn encode_edge_record(
-    blob: &mut Vec<u8>,
-    weight: f64,
-    props: Option<&PropertyMap>,
-) -> u32 {
+pub fn encode_edge_record(blob: &mut Vec<u8>, weight: f64, props: Option<&PropertyMap>) -> u32 {
     let has_props = props.is_some_and(|p| !p.is_empty());
     if weight == DEFAULT_EDGE_WEIGHT && !has_props {
         return 0;
@@ -131,21 +127,15 @@ fn rd_u8(blob: &[u8], pos: usize) -> Option<u8> {
 }
 
 fn rd_u16(blob: &[u8], pos: usize) -> Option<u16> {
-    Some(u16::from_le_bytes(
-        blob.get(pos..pos + 2)?.try_into().ok()?,
-    ))
+    Some(u16::from_le_bytes(blob.get(pos..pos + 2)?.try_into().ok()?))
 }
 
 fn rd_u32(blob: &[u8], pos: usize) -> Option<u32> {
-    Some(u32::from_le_bytes(
-        blob.get(pos..pos + 4)?.try_into().ok()?,
-    ))
+    Some(u32::from_le_bytes(blob.get(pos..pos + 4)?.try_into().ok()?))
 }
 
 fn rd_u64(blob: &[u8], pos: usize) -> Option<u64> {
-    Some(u64::from_le_bytes(
-        blob.get(pos..pos + 8)?.try_into().ok()?,
-    ))
+    Some(u64::from_le_bytes(blob.get(pos..pos + 8)?.try_into().ok()?))
 }
 
 /// Decode one property at `pos`. Returns `(key, value, next_pos)`.
@@ -286,7 +276,11 @@ pub fn node_record_len(blob: &[u8], stored_offset: u32) -> Option<usize> {
     }
     let dim = rd_u32(blob, pos)? as usize;
     pos = (pos + 4).checked_add(dim.checked_mul(4)?)?;
-    if pos > blob.len() { None } else { Some(pos - start) }
+    if pos > blob.len() {
+        None
+    } else {
+        Some(pos - start)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -358,7 +352,11 @@ pub fn edge_record_len(blob: &[u8], stored_offset: u32) -> Option<usize> {
     for _ in 0..n {
         pos = skip_prop(blob, pos)?;
     }
-    if pos > blob.len() { None } else { Some(pos - start) }
+    if pos > blob.len() {
+        None
+    } else {
+        Some(pos - start)
+    }
 }
 
 /// Copy an existing record verbatim into `dst`, returning the new stored
@@ -493,7 +491,10 @@ mod tests {
         let mut dst = vec![0xAAu8; 17]; // non-empty destination with prior content
         let new_off = copy_record(&mut dst, &src, off, node_record_len);
         assert_ne!(new_off, 0);
-        assert_eq!(decode_node_props(&dst, new_off).as_slice(), props.as_slice());
+        assert_eq!(
+            decode_node_props(&dst, new_off).as_slice(),
+            props.as_slice()
+        );
         assert_eq!(
             decode_node_embedding(&dst, new_off),
             Some(vec![1.0f32, 2.0])

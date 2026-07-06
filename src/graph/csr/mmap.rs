@@ -399,11 +399,7 @@ impl MmapCsrSegment {
     }
 
     /// Single node property lookup without materializing the map.
-    pub fn node_property(
-        &self,
-        row: u32,
-        key: u16,
-    ) -> Option<crate::graph::types::PropertyValue> {
+    pub fn node_property(&self, row: u32, key: u16) -> Option<crate::graph::types::PropertyValue> {
         let nm = self.node_meta().get(row as usize)?;
         super::props::decode_node_prop(self.node_props_blob(), nm.property_offset, key)
     }
@@ -417,7 +413,9 @@ impl MmapCsrSegment {
     /// Edge weight by edge index (1.0 default / pre-v5 files).
     pub fn edge_weight(&self, edge_idx: u32) -> f64 {
         match self.edge_meta().get(edge_idx as usize) {
-            Some(em) => super::props::decode_edge_weight(self.edge_props_blob(), em.property_offset),
+            Some(em) => {
+                super::props::decode_edge_weight(self.edge_props_blob(), em.property_offset)
+            }
             None => super::props::DEFAULT_EDGE_WEIGHT,
         }
     }

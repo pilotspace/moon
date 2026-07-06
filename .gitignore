@@ -101,6 +101,7 @@ tmp/
 /target-linux/
 /target-linux-tokio/
 /target-tokio/
+/target-fast/
 /target-check-tokio/
 /target-check-monoio/
 /target-check/

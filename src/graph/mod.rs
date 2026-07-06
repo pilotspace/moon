@@ -20,6 +20,7 @@ pub mod store;
 pub mod traversal;
 pub mod traversal_guard;
 pub mod types;
+pub mod view;
 pub mod visibility;
 pub mod wal;
 
@@ -41,3 +42,4 @@ pub use stats::GraphStats;
 pub use store::GraphStore;
 pub use traversal::{BoundedBfs, BoundedDfs, DijkstraTraversal, ParallelBfs, SegmentMergeReader};
 pub use types::{Direction, EdgeKey, NodeKey, PropertyMap, PropertyValue};
+pub use view::MergedNodeView;

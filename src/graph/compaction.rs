@@ -818,8 +818,7 @@ mod tests {
         ];
         let a = mg.add_node(smallvec![0], props, Some(vec![0.5f32, 0.25]), 1);
         let b = mg.add_node(smallvec![0], smallvec![], None, 1);
-        let eprops: crate::graph::types::PropertyMap =
-            smallvec![(9u16, PropertyValue::Float(6.5))];
+        let eprops: crate::graph::types::PropertyMap = smallvec![(9u16, PropertyValue::Float(6.5))];
         mg.add_edge(a, b, 1, 3.5, Some(eprops), 2).expect("ok");
         let seg1 = Arc::new(CsrStorage::from(
             CsrSegment::from_frozen(mg.freeze().expect("ok"), 10).expect("ok"),

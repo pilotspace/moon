@@ -67,7 +67,12 @@ fn add_node(store: &mut GraphStore, id: u64) -> u64 {
 fn add_edge(store: &mut GraphStore, src: u64, dst: u64) -> Frame {
     graph_addedge(
         store,
-        &[bs(GRAPH), bs(&src.to_string()), bs(&dst.to_string()), bs("E")],
+        &[
+            bs(GRAPH),
+            bs(&src.to_string()),
+            bs(&dst.to_string()),
+            bs("E"),
+        ],
     )
 }
 
@@ -201,7 +206,11 @@ fn one_hop_expand_from_frozen_point_query() {
     let _ = seed_across_freeze(&mut store);
     // Node 0 has out-edges to 1, 2, 3.
     let rows = run_query(&store, "MATCH (a:N {id:0})-[:E]->(b) RETURN b.id");
-    assert_eq!(rows.len(), 3, "expand from compacted node must see CSR edges");
+    assert_eq!(
+        rows.len(),
+        3,
+        "expand from compacted node must see CSR edges"
+    );
 }
 
 #[test]
