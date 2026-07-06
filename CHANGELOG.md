@@ -162,6 +162,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   100ms either way; the fixed 15s was a documented host-load flake,
   observed on the macOS CI runner).
 
+### Changed — graph engine deep-review fixes + optimization waves (PR #TBD)
+
+- **Freeze-boundary correctness (P0):** CSR v5 segments now persist node
+  properties, embeddings, and edge weights/properties across freeze;
+  Cypher reads see the frozen tier via `MergedNodeView` (NodeScan/eval/
+  IndexScan); cross-tier delta edges; GRAPH.NEIGHBORS existence +
+  direction fixes; GRAPH.HYBRID/VSEARCH operate across both tiers. New
+  red/green `graph_freeze_boundary` suite (11 tests) pins the lifecycle.
+- **Point-query indexes (P1):** lazy per-segment property indexes (built
+  once at first use from freeze-time data) + `PhysicalOp::IndexScan` in
+  the planner/executor — `MATCH (n:L {p: v})` narrows instead of
+  label-scanning.
+- **Query-path cost (P2):** plan-cache auto-parameterization (literal
+  variants share one cached plan; cache hits skip parse+compile
+  entirely) with LRU eviction; slot-indexed executor rows (no per-row
+  HashMap allocation, no per-insert String clone); write-path/WAL
+  allocation cleanups (ADDNODE double WAL-encode deleted, itoa/ryu
+  statement temporaries, FxHash for slotmap-keyed sets, Dijkstra
+  three-maps-to-one merge, allocation-free neighbor iteration in Cypher
+  Expand).
+- **Traversal engine (P3):** CSR row-space BFS fast path on fully-frozen
+  graphs — dense-bitmap visited set, TRUE parallel frontier expansion
+  (thread::scope over Send+Sync CsrStorage), direction-optimizing
+  Beamer push/pull over the incoming index; `TraversalGuard` wall-clock
+  budget (30s default) now enforced per hop in Cypher variable-length
+  Expand and ShortestPath (`ExecErrorKind::Timeout`); GRAPH.HYBRID's
+  `HnswPreFilter` strategy is real — a lazy per-segment HNSW bridge
+  (`src/graph/hnsw_bridge.rs`, raw-f32 cosine over v5 embeddings, >= 4096
+  vectors) replaces the silent brute-force stub, with exact-scoring
+  fallback whenever the approximate beam under-fills.
+
 ### Changed — consolidated dependency bumps (PR #TBD)
 
 - Cargo: `ringbuf` 0.4.8 → 0.5.0 and `metrics-exporter-prometheus` 0.16.2 →
