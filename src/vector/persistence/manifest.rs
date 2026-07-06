@@ -32,7 +32,7 @@
 //! can never overwrite a newer, already-committed manifest — see that
 //! function's doc comment for the full argument.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -40,10 +40,11 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 
 use bytes::Bytes;
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use serde::{Deserialize, Serialize};
 
 use crate::persistence::fsync::{fsync_directory, fsync_file};
+use crate::vector::keymap::BucketedKeyMap;
 
 /// Current on-disk manifest format version.
 pub const MANIFEST_FORMAT_VERSION: u32 = 1;
@@ -414,9 +415,9 @@ pub struct SnapshotJob {
     /// The manifest to commit if this job is not stale. `keymap_epoch` MUST
     /// equal `seq`.
     pub manifest: IndexManifest,
-    pub key_hash_to_key: Arc<std::collections::HashMap<u64, Bytes>>,
-    pub key_hash_to_global_id: Arc<std::collections::HashMap<u64, u32>>,
-    pub key_hash_to_vec_checksum: Arc<std::collections::HashMap<u64, u64>>,
+    pub key_hash_to_key: BucketedKeyMap<Bytes>,
+    pub key_hash_to_global_id: BucketedKeyMap<u32>,
+    pub key_hash_to_vec_checksum: BucketedKeyMap<u64>,
 }
 
 /// Run one snapshot job to completion.
@@ -534,48 +535,126 @@ pub fn run_snapshot_job(job: SnapshotJob) {
 /// `background_compact::BackgroundCompactor` (different job shape — this is
 /// small, fsync-bound I/O, not CPU-bound HNSW build work) but the same
 /// lazy-init-singleton shape.
+///
+/// ## Coalescing (RSS/CPU wave 4, defect 2)
+///
+/// A [`SnapshotJob`] is a FULL-STATE snapshot of one index's keymap +
+/// manifest — a newer job for the same index strictly supersedes an older
+/// one that hasn't started yet. The original design used an *unbounded*
+/// `flume` channel: if compact/merge installs outpaced the single worker,
+/// every queued job kept its three `BucketedKeyMap` clones pinned at a
+/// refcount above one, so EVERY subsequent write on the shard thread paid
+/// the bucket-clone CoW cost until the backlog drained — unbounded, and in
+/// the worst case (a burst of installs) effectively never.
+///
+/// Instead, pending jobs live in a `Mutex<HashMap<idx_dir, SnapshotJob>>`
+/// keyed by the index's persist directory (unique per index). `submit`
+/// inserts under that key: a job already pending for the same index is
+/// REPLACED (the old job's `BucketedKeyMap`s are dropped immediately,
+/// releasing any pinned Arcs) rather than queued behind it. A single worker
+/// thread drains the map via a `Condvar`; an in-flight (already dequeued,
+/// currently executing) job is never affected by a later `submit` for the
+/// same index — the next submit simply becomes the new pending entry.
 pub struct SnapshotPool {
-    job_tx: flume::Sender<SnapshotJob>,
+    /// Pending jobs, keyed by index persist directory. At most one entry per
+    /// index — the latest submitted, not-yet-started job for that index.
+    pending: Arc<Mutex<HashMap<PathBuf, SnapshotJob>>>,
+    /// Signalled on every `submit` so an idle worker wakes immediately.
+    not_empty: Arc<Condvar>,
+    /// Set on `Drop` so worker threads exit their wait loop instead of
+    /// blocking forever (matters for test-local pools; the process-wide
+    /// singleton is never dropped).
+    shutdown: Arc<std::sync::atomic::AtomicBool>,
     _workers: Vec<std::thread::JoinHandle<()>>,
 }
 
 impl SnapshotPool {
     fn new(num_workers: usize) -> Self {
-        let (job_tx, job_rx) = flume::unbounded::<SnapshotJob>();
+        Self::new_with_runner(num_workers, run_snapshot_job)
+    }
+
+    /// Same as [`Self::new`] but with an injectable per-job runner — the
+    /// production path always passes [`run_snapshot_job`]; tests inject a
+    /// slow/instrumented stub to observe coalescing without touching disk.
+    fn new_with_runner<F>(num_workers: usize, runner: F) -> Self
+    where
+        F: Fn(SnapshotJob) + Send + Sync + 'static,
+    {
+        let pending: Arc<Mutex<HashMap<PathBuf, SnapshotJob>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let not_empty = Arc::new(Condvar::new());
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let runner = Arc::new(runner);
         let workers: Vec<_> = (0..num_workers.max(1))
             .map(|i| {
-                let rx = job_rx.clone();
+                let pending = Arc::clone(&pending);
+                let not_empty = Arc::clone(&not_empty);
+                let shutdown = Arc::clone(&shutdown);
+                let runner = Arc::clone(&runner);
                 // Startup-time OS thread spawn failure is unrecoverable
                 // (matches the existing `BackgroundCompactor::new` convention).
                 #[allow(clippy::unwrap_used)]
-                let handle = std::thread::Builder::new()
+                std::thread::Builder::new()
                     .name(format!("moon-vec-snapshot-{i}"))
                     .spawn(move || {
-                        while let Ok(job) = rx.recv() {
-                            run_snapshot_job(job);
+                        loop {
+                            let next_job = {
+                                let mut guard = pending.lock();
+                                loop {
+                                    if let Some(key) = guard.keys().next().cloned() {
+                                        break guard.remove(&key);
+                                    }
+                                    if shutdown.load(std::sync::atomic::Ordering::Acquire) {
+                                        break None;
+                                    }
+                                    not_empty.wait(&mut guard);
+                                }
+                            };
+                            match next_job {
+                                Some(job) => runner(job),
+                                None => return, // shutdown, queue drained
+                            }
                         }
                     })
-                    .expect("failed to spawn vector snapshot worker thread");
-                handle
+                    .expect("failed to spawn vector snapshot worker thread")
             })
             .collect();
         Self {
-            job_tx,
+            pending,
+            not_empty,
+            shutdown,
             _workers: workers,
         }
     }
 
-    /// Enqueue a snapshot job. Best-effort: send only fails if every worker
-    /// has exited (e.g. all panicked), in which case the job is dropped with
-    /// a warning — per the crash-safety invariant this only leaves the
-    /// on-disk state a bit more stale (understating), never wrong.
+    /// Enqueue a snapshot job. Never blocks the caller (the shard event
+    /// loop): this only takes a `parking_lot::Mutex` for the duration of one
+    /// `HashMap` insert, never waits on I/O or on the worker.
+    ///
+    /// Latest-wins coalescing: if a job for the same index (`idx_dir`) is
+    /// already pending (submitted but not yet dequeued by the worker), it is
+    /// replaced — the old job, and the `Arc`s it held into the keymap
+    /// buckets, are dropped right here. A job the worker has already
+    /// dequeued and is currently executing is unaffected; it runs to
+    /// completion (its own staleness is still checked against the shared
+    /// watermark inside `run_snapshot_job`, exactly as before).
     pub fn submit(&self, job: SnapshotJob) {
-        if self.job_tx.send(job).is_err() {
-            tracing::warn!(
-                "vector snapshot pool: all workers gone — snapshot job dropped \
-                 (index falls behind on durability, no correctness impact)"
-            );
-        }
+        let mut pending = self.pending.lock();
+        pending.insert(job.idx_dir.clone(), job);
+        drop(pending);
+        self.not_empty.notify_one();
+    }
+}
+
+impl Drop for SnapshotPool {
+    fn drop(&mut self) {
+        // Only meaningful for test-local pools (the process-wide singleton
+        // in `global_snapshot_pool` lives in a `OnceLock` and is never
+        // dropped) — lets worker threads exit their wait loop cleanly
+        // instead of blocking forever once `pending` has no other owners.
+        self.shutdown
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.not_empty.notify_all();
     }
 }
 
@@ -816,24 +895,26 @@ mod tests {
         assert!(dir.join("manifest.json").exists());
     }
 
-    fn checksum_map(entries: &[KeymapEntry]) -> Arc<std::collections::HashMap<u64, u64>> {
-        Arc::new(
-            entries
-                .iter()
-                .map(|e| (e.key_hash, e.vec_checksum))
-                .collect(),
-        )
+    fn checksum_map(entries: &[KeymapEntry]) -> BucketedKeyMap<u64> {
+        let mut m = BucketedKeyMap::new();
+        for e in entries {
+            m.insert(e.key_hash, e.vec_checksum);
+        }
+        m
     }
-    fn global_id_map(entries: &[KeymapEntry]) -> Arc<std::collections::HashMap<u64, u32>> {
-        Arc::new(entries.iter().map(|e| (e.key_hash, e.global_id)).collect())
+    fn global_id_map(entries: &[KeymapEntry]) -> BucketedKeyMap<u32> {
+        let mut m = BucketedKeyMap::new();
+        for e in entries {
+            m.insert(e.key_hash, e.global_id);
+        }
+        m
     }
-    fn key_map(entries: &[KeymapEntry]) -> Arc<std::collections::HashMap<u64, Bytes>> {
-        Arc::new(
-            entries
-                .iter()
-                .map(|e| (e.key_hash, e.key.clone()))
-                .collect(),
-        )
+    fn key_map(entries: &[KeymapEntry]) -> BucketedKeyMap<Bytes> {
+        let mut m = BucketedKeyMap::new();
+        for e in entries {
+            m.insert(e.key_hash, e.key.clone());
+        }
+        m
     }
 
     #[test]
@@ -945,5 +1026,177 @@ mod tests {
         assert_eq!(a, b);
         assert!(a.to_string_lossy().contains("idx-"));
         assert_eq!(index_name_hex(b"myidx").len(), 16);
+    }
+
+    // ── SnapshotPool coalescing (RSS/CPU wave 4, defect 2) ──────────────────
+
+    /// Minimal `SnapshotJob` for pool tests — the pool's coalescing logic
+    /// only inspects `idx_dir` and `seq`; keymap contents/manifest shape are
+    /// irrelevant here (unlike `test_run_snapshot_job_*`, which exercises the
+    /// real I/O in `run_snapshot_job`).
+    fn sample_job(idx_dir: &Path, seq: u64, watermark: Arc<Mutex<u64>>) -> SnapshotJob {
+        SnapshotJob {
+            idx_dir: idx_dir.to_path_buf(),
+            seq,
+            watermark,
+            manifest: sample_manifest("stub", vec![], seq),
+            key_hash_to_key: BucketedKeyMap::new(),
+            key_hash_to_global_id: BucketedKeyMap::new(),
+            key_hash_to_vec_checksum: BucketedKeyMap::new(),
+        }
+    }
+
+    /// THE key coalescing property: 100 rapid-fire submits for the SAME
+    /// index against a deliberately slow worker must NOT queue (and
+    /// eventually run) all 100 — coalescing must collapse them down to a
+    /// handful of executions, and the final persisted state must be the
+    /// NEWEST submitted job (seq 100), never an older one.
+    #[test]
+    fn test_snapshot_pool_coalesces_same_index_submits_under_slow_worker() {
+        let executed_seqs: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
+        let executed_seqs_cl = Arc::clone(&executed_seqs);
+        let same_dir = PathBuf::from("/fake/idx-same");
+
+        let pool = SnapshotPool::new_with_runner(1, move |job: SnapshotJob| {
+            // Slow-worker stub: models a worker whose fsync-bound I/O is
+            // slower than the shard thread's submit rate — the exact
+            // condition that used to pin every queued job's BucketedKeyMap
+            // Arcs under the old unbounded-channel design.
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            executed_seqs_cl.lock().push(job.seq);
+        });
+
+        let submit_start = std::time::Instant::now();
+        for seq in 1..=100u64 {
+            pool.submit(sample_job(&same_dir, seq, Arc::new(Mutex::new(0))));
+        }
+        let submit_elapsed = submit_start.elapsed();
+        // The submitter must never block on the (slow) worker: 100 serial
+        // 5ms-per-job executions would take ~500ms; a non-blocking submit
+        // (an uncontended Mutex + HashMap insert) finishes in well under
+        // that even with generous CI scheduling slack.
+        assert!(
+            submit_elapsed < std::time::Duration::from_millis(200),
+            "submit() must not block on the worker — took {submit_elapsed:?} for 100 submits"
+        );
+
+        // Wait for the queue to fully drain (bounded poll, never hangs the
+        // test suite even if this regresses).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let drained =
+                pool.pending.lock().is_empty() && executed_seqs.lock().last().copied() == Some(100);
+            if drained {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "snapshot pool did not drain within 5s"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        let seqs = executed_seqs.lock();
+        assert!(
+            seqs.len() < 100,
+            "coalescing must skip most of the 100 same-index submits — executed {} jobs: {seqs:?}",
+            seqs.len()
+        );
+        assert_eq!(
+            *seqs.last().unwrap(),
+            100,
+            "the final executed job for a coalesced index must be the NEWEST submitted state"
+        );
+    }
+
+    /// Jobs for DIFFERENT indexes must never coalesce with each other — each
+    /// gets its own coalescing slot (keyed by `idx_dir`), so every distinct
+    /// index's job executes exactly once.
+    #[test]
+    fn test_snapshot_pool_executes_all_distinct_index_jobs() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let executed = Arc::new(AtomicUsize::new(0));
+        let executed_cl = Arc::clone(&executed);
+        let pool = SnapshotPool::new_with_runner(1, move |_job: SnapshotJob| {
+            executed_cl.fetch_add(1, Ordering::SeqCst);
+        });
+
+        const N: usize = 10;
+        for i in 0..N {
+            let dir = PathBuf::from(format!("/fake/idx-distinct-{i}"));
+            pool.submit(sample_job(&dir, 1, Arc::new(Mutex::new(0))));
+        }
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while executed.load(Ordering::SeqCst) < N as usize {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "distinct-index jobs did not all execute within 5s (got {})",
+                executed.load(Ordering::SeqCst)
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(
+            executed.load(Ordering::SeqCst),
+            N,
+            "every distinct-index job must execute exactly once — no cross-index coalescing"
+        );
+    }
+
+    /// A job the worker has already dequeued (in-flight) must run to
+    /// completion even if a NEW job for the same index is submitted while it
+    /// executes — the new submit must land as a fresh pending entry (which
+    /// then also runs), never silently dropped and never merged into the
+    /// in-flight job.
+    #[test]
+    fn test_snapshot_pool_in_flight_job_survives_resubmit_for_same_index() {
+        let executed_seqs: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
+        let executed_cl = Arc::clone(&executed_seqs);
+        let (started_tx, started_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+
+        let pool = SnapshotPool::new_with_runner(1, move |job: SnapshotJob| {
+            if job.seq == 1 {
+                // Signal "now in-flight", then block until the test says go
+                // — simulates a slow fsync-bound write while job 1 executes.
+                let _ = started_tx.send(());
+                let _ = release_rx.lock().recv();
+            }
+            executed_cl.lock().push(job.seq);
+        });
+
+        let dir = PathBuf::from("/fake/idx-inflight");
+        pool.submit(sample_job(&dir, 1, Arc::new(Mutex::new(0))));
+
+        // Block until job 1 is confirmed in-flight (dequeued, running).
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("job 1 never started");
+
+        // Submit job 2 for the SAME index WHILE job 1 is still executing —
+        // must NOT be lost, and must NOT be merged into the in-flight job 1.
+        pool.submit(sample_job(&dir, 2, Arc::new(Mutex::new(0))));
+
+        // Let job 1 finish.
+        release_tx.send(()).expect("worker thread gone");
+
+        // Both must eventually execute, in order: job 1 (in-flight,
+        // unaffected by the resubmit) then job 2 (queued fresh once job 1's
+        // slot was empty again).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let seqs = executed_seqs.lock().clone();
+            if seqs == vec![1, 2] {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "expected in-flight job 1 then resubmitted job 2, got {seqs:?}"
+            );
+            drop(seqs);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
     }
 }
