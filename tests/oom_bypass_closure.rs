@@ -560,40 +560,65 @@ fn test_case_e_cross_db_copy_oom() {
         "SELECT 0 (back for phase 2) failed"
     );
 
-    // Phase 2: COPY each key to a DISTINCT dst key (src != dst — required,
-    // Redis rejects same-key COPY regardless of db) — doubles the value's
-    // footprint, pushing per-shard usage past the cap.
-    let copy_cmds: Vec<Vec<Vec<u8>>> = (0..N)
-        .map(|i| {
-            let src = format!("e:{i}").into_bytes();
-            let dst = format!("e:{i}:c").into_bytes();
-            vec![b"COPY".to_vec(), src, dst, b"DB".to_vec(), b"1".to_vec()]
-        })
-        .collect();
-    let copy_replies = c.pipeline(&copy_cmds);
-    assert_eq!(copy_replies.len(), N);
+    // Phase 2: escalating rounds of COPYs, each round to FRESH dst keys
+    // (src != dst — required, Redis rejects same-key COPY regardless of db),
+    // until the destination db's per-shard footprint provably exceeds ANY
+    // possible budget.
+    //
+    // Why rounds instead of the original single-shot statistical assert:
+    // one round of 300×4KB (~300KB/shard) sits inside the slack that GAP-1's
+    // elastic budget + its 100ms-stale usage snapshots can grant, so the
+    // single-shot OOM share was timing-sensitive — 76/300 locally, 28/300 on
+    // slow GitHub runners after one deflake (N/10 → N/30), and finally
+    // 0/300 EXACTLY on both CI platforms (post-merge main runs of PR
+    // #217/#218/#219 all red). Escalation removes the timing dependence via
+    // an absolute ceiling: `compute_elastic_budget` can never grant a shard
+    // more than `base + surplus ≤ maxmemory` (2MB here), and the gate is
+    // per-DATABASE (`db.estimated_memory()` vs that budget) under
+    // `noeviction` — so once db 1's per-shard usage passes 2MB, every
+    // further gate-checked COPY into it MUST OOM, on any runner speed. 8
+    // rounds × 300 × 4KB ≈ 9.6MB into db 1 (~2.4MB/shard, margin over the
+    // 2MB ceiling even for the luckiest shard of the hash spread).
+    //
+    // The RED floor is unchanged and still exact: with the Gap A gate block
+    // stashed, COPY never consults the eviction gate at ANY pressure, so
+    // the cumulative OOM count stays 0 through all rounds (re-verified
+    // red/green methodology in the Gap A commit body).
+    const ROUNDS: usize = 8;
+    let mut oom_count = 0usize;
+    let mut ok_count = 0usize;
+    let mut other_count = 0usize;
+    for round in 0..ROUNDS {
+        let copy_cmds: Vec<Vec<Vec<u8>>> = (0..N)
+            .map(|i| {
+                let src = format!("e:{i}").into_bytes();
+                let dst = format!("e:{i}:c{round}").into_bytes();
+                vec![b"COPY".to_vec(), src, dst, b"DB".to_vec(), b"1".to_vec()]
+            })
+            .collect();
+        let copy_replies = c.pipeline(&copy_cmds);
+        assert_eq!(copy_replies.len(), N);
+        oom_count += copy_replies.iter().filter(|r| r.is_oom_error()).count();
+        ok_count += copy_replies
+            .iter()
+            .filter(|r| matches!(r, V::Int(1)))
+            .count();
+        other_count = (round + 1) * N - oom_count - ok_count;
+        if oom_count >= N / 30 {
+            break; // gate demonstrably firing — no need to keep escalating
+        }
+    }
 
-    let oom_count = copy_replies.iter().filter(|r| r.is_oom_error()).count();
-    let ok_count = copy_replies
-        .iter()
-        .filter(|r| matches!(r, V::Int(1)))
-        .count();
-    let other_count = N - oom_count - ok_count;
-
-    // Threshold picked from observed data, same methodology as case B:
-    // gate-block-disabled (routing intact, see the Gap A commit body) run =
-    // 0/300 OOM EXACTLY; fully fixed = 76/300 locally but as low as 28/300
-    // on slow CI runners (GAP-1's elastic budget redistributes on a 100ms
-    // tick, so the OOM share is timing-sensitive — N/10 flaked at 28<30 on
-    // GitHub Actions). Since the RED floor is exactly 0, any clearly-nonzero
-    // threshold discriminates; N/30 (10) keeps margin both ways.
     assert!(
         oom_count >= N / 30,
-        "cross-shard COPY bypass: expected a substantial share of {N} COPYs \
-         routed via cross-shard SPSC to OOM once their shard's budget is \
-         exhausted, got only {oom_count} OOM / {ok_count} OK / \
+        "cross-shard COPY bypass: expected COPYs routed via cross-shard SPSC \
+         to OOM once the destination db's usage exceeds every possible \
+         budget (≈{}KB/shard vs the {}KB absolute budget ceiling after \
+         {ROUNDS} rounds), got only {oom_count} OOM / {ok_count} OK / \
          {other_count} other — COPY is not hitting the generic eviction \
-         gate on the cross-shard write path"
+         gate on the cross-shard write path",
+        (N / 4 * VALUE_SIZE * (ROUNDS + 1)) / 1024,
+        MAXMEMORY / 1024,
     );
 }
 

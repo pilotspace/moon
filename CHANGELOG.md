@@ -65,6 +65,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dropping the stale job's `Arc`s immediately; an in-flight (already-dequeued) job is unaffected.
   Submit never blocks the caller.
 
+### Fixed — CI: de-flake OOM case E + Windows test-compile gate (PR #TBD)
+
+- **`test_case_e_cross_db_copy_oom` (was red on main's post-merge CI for PR #217/#218/#219,
+  0/300 OOM on both platforms while passing locally):** the single-shot statistical assert sat
+  inside the slack GAP-1's elastic budget + its 100ms-stale usage snapshots can grant. Rewritten
+  as bounded escalation: up to 8 rounds of COPYs into fresh destination keys until the
+  destination db's per-shard usage (~2.4MB) provably exceeds the ABSOLUTE budget ceiling
+  (`compute_elastic_budget ≤ maxmemory` = 2MB) — timing-independent on any runner speed, and the
+  RED floor stays exact (gate stashed = 0 OOM through all rounds; re-verified red/green).
+- **`tests/quickwins_red_api.rs` broke the Windows CI leg at COMPILE time** (also red on main):
+  `qw1_accepted_socket_has_nodelay` calls `apply_client_socket_opts`, which is `#[cfg(unix)]`
+  (takes `AsFd`). The test (and its imports) are now unix-gated to match.
+
 ### Fixed — FT.COMPACT left mutable residue behind when draining a background build (PR #TBD)
 
 - **Pre-existing** (`main`, not introduced by this branch): when an explicit
