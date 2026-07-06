@@ -50,6 +50,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   writer's lifetime. `flush_write`/`rotate_segment` now `shrink_to` the
   8KB default once capacity exceeds 4x that, a no-op for the common
   small-record case.
+- **Item C2 — SearchScratch visited-set: already bitset-based (SKIP)**
+  (`src/vector/hnsw/search.rs`): the per-query search hot path already uses
+  a word-based `BitVec` (u64 words, `test_and_set`/`clear_all` memset),
+  thread-cached and reused across queries — no change needed. The other
+  `Vec<bool>` visited sets found in the vector module are all build-time/
+  compaction/merge-oracle code, not the per-query path; `search_sq.rs` in
+  particular carries an explicit comment warning that a prior BitVec
+  conversion there caused correctness issues, so it was left untouched.
+- **Item C3 — SmallVec the per-tick elastic-budget shard snapshot**
+  (`src/shard/shared_databases.rs`): `recompute_elastic_budget` (called
+  from every shard's 100ms eviction tick) `collect()`ed a fresh
+  `Vec<usize>` snapshot of all shards' published memory on every call.
+  Switched to `SmallVec<[usize; 16]>` — stack-only for the common <=16
+  shard case, unchanged single heap allocation beyond that.
 
 ### CI — fix Windows main-push test failures (PR #TBD)
 
