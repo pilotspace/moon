@@ -79,6 +79,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pipeline, with zero external callers (only self-recursion) — silently
   masked by the file's `#![allow(dead_code)]`. Removed along with its
   exclusively-private helper `read_decimal_zc`.
+- **Item C6 — jemalloc decay policy audited, docs added (SKIP code
+  change)** (`CLAUDE.md`): the baked-in `_rjem_malloc_conf` static and the
+  `--memory-arenas-cap` re-spawn override already carry byte-identical
+  `dirty_decay_ms:1000,muzzy_decay_ms:5000,background_thread:true` tuning
+  — no drift to reconcile. Added the missing operator-facing
+  `_RJEM_MALLOC_CONF` documentation (docs-only, no code changed).
 
 ### CI — fix Windows main-push test failures (PR #TBD)
 
