@@ -85,6 +85,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `dirty_decay_ms:1000,muzzy_decay_ms:5000,background_thread:true` tuning
   — no drift to reconcile. Added the missing operator-facing
   `_RJEM_MALLOC_CONF` documentation (docs-only, no code changed).
+- **Item C7 — tokio 1ms shard tick idle cost audited (SKIP)**
+  (`src/shard/event_loop.rs`, `src/shard/spsc_handler.rs`): the 1ms
+  `periodic_interval` tick's SPSC drain is already a non-blocking,
+  zero-allocation `try_pop()` loop, and every downstream side effect is
+  already gated behind a cheap conditional. The one unconditional cost
+  (`cached_clock.update()`, a single `clock_gettime`) is the documented
+  "Timestamp caching" design. Unlike item B's AOF writer poll, this 1ms
+  cadence IS the low-latency WAL-flush contract (CLAUDE.md), not
+  incidental idle waste — escalating it would widen that bound. No code
+  change; a real fix would be event-driven WAL triggering, an
+  architectural change out of scope here.
 
 ### CI — fix Windows main-push test failures (PR #TBD)
 
