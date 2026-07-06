@@ -400,3 +400,49 @@ fn graph_union_merge_preserves_exact_distances() {
         );
     }
 }
+
+// ── 8. Tombstones must not consume the exact-rerank budget ──────────────────
+
+#[test]
+fn tombstoned_candidates_do_not_eat_rerank_budget() {
+    // Regression: rerank_exact used to run BEFORE the liveness filter, so the
+    // top-4·k ADC candidates it re-scored could all be tombstones — the live
+    // results that survived the filter kept quantized ADC estimates (and the
+    // post-rerank sort mixed exact and ADC scores). Deleting the 30 nearest
+    // vectors with k=5 (budget 20) makes that failure deterministic.
+    let (mut store, vecs) = build_compacted(
+        "xr_tomb",
+        QuantizationConfig::Sq8,
+        DistanceMetric::L2,
+        64,
+        0x70B5,
+    );
+    let mut rng = Rng::new(0xD00D);
+    let q = rng.vec(DIM);
+
+    let mut order: Vec<usize> = (0..vecs.len()).collect();
+    order.sort_by(|&a, &b| l2_sq(&q, &vecs[a]).total_cmp(&l2_sq(&q, &vecs[b])));
+    let deleted: std::collections::HashSet<usize> = order[..30].iter().copied().collect();
+    for &i in &deleted {
+        store.mark_deleted_for_key(format!("doc:{i}").as_bytes());
+    }
+
+    let results = segment_search(&mut store, "xr_tomb", &q, 5);
+    assert_eq!(results.len(), 5, "expected k live results");
+    for r in &results {
+        let id = r.id.0 as usize;
+        assert!(!deleted.contains(&id), "tombstoned id {id} returned");
+        let truth = l2_sq(&q, &vecs[id]);
+        let rel = (r.distance - truth).abs() / truth.max(1e-6);
+        assert!(
+            rel < 1.5e-3,
+            "id={id} returned={} exact={truth} rel={rel} — live candidate kept \
+             its ADC estimate: tombstones consumed the rerank budget",
+            r.distance
+        );
+    }
+    // The 5 results must be the true 5 nearest live vectors, in order.
+    let expect: Vec<usize> = order[30..35].to_vec();
+    let got: Vec<usize> = results.iter().map(|r| r.id.0 as usize).collect();
+    assert_eq!(got, expect, "live top-k mismatch after tombstone filtering");
+}

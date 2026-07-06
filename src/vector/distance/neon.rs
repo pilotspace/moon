@@ -344,14 +344,14 @@ pub unsafe fn sq8_stats(query: &[f32], codes: &[u8]) -> (f32, f32, f32) {
     let mut sum_c_sum = vaddvq_f32(sum_c);
     let mut sumsq_c_sum = vaddvq_f32(sumsq_c);
 
-    // Scalar tail
-    while i < n {
-        let cf = *codes.get_unchecked(i) as f32;
-        let qv = *query.get_unchecked(i);
+    // Scalar tail — safe indexing; bounds-checked slices cost nothing here
+    // (at most one sub-vector-width pass) and keep the unsafe surface to the
+    // intrinsics above (UNSAFE_POLICY).
+    for (&c, &qv) in codes[i..n].iter().zip(query[i..n].iter()) {
+        let cf = c as f32;
         dot_sum += qv * cf;
         sum_c_sum += cf;
         sumsq_c_sum += cf * cf;
-        i += 1;
     }
 
     (dot_sum, sum_c_sum, sumsq_c_sum)

@@ -214,7 +214,10 @@ impl ImmutableSegment {
                     xsq += x * x;
                 }
                 if xsq > 0.0 {
-                    result.distance = 2.0 - 2.0 * (dot / xsq.sqrt());
+                    // f16 rounding can push cos slightly outside [-1, 1];
+                    // clamp so distances stay in the metric's [0, 4] range.
+                    let cos = (dot / xsq.sqrt()).clamp(-1.0, 1.0);
+                    result.distance = 2.0 - 2.0 * cos;
                 }
                 // Zero vector: normalized form undefined — keep ADC estimate.
             }
@@ -317,16 +320,17 @@ impl ImmutableSegment {
             }
             cands
         };
-        // HQ-1: exact rerank of the full beam (ef candidates) from the f16
-        // sidecar — replaces quantized estimates with true metric distances
-        // before top-k truncation. No-op without a sidecar.
-        self.rerank_exact(&mut candidates, query, k);
-        // Filter deleted entries before truncating so that k live results are
-        // returned even when some candidates are tombstoned.
+        // Filter deleted entries first so tombstones neither consume the
+        // exact-rerank 4·k budget nor leave stale ADC scores mixed into the
+        // post-rerank ordering.
         candidates.retain(|c| {
             let bfs = self.graph.to_bfs(c.id.0);
             self.is_live_bfs(bfs)
         });
+        // HQ-1: exact rerank of the live beam (ef candidates) from the f16
+        // sidecar — replaces quantized estimates with true metric distances
+        // before top-k truncation. No-op without a sidecar.
+        self.rerank_exact(&mut candidates, query, k);
         candidates.truncate(k);
         self.remap_to_global_ids(&mut candidates);
         candidates
@@ -362,13 +366,13 @@ impl ImmutableSegment {
         if self.sub_centroid_signs.is_empty() && self.raw_f16.is_none() {
             self.rerank_with_prod(&mut candidates, query);
         }
-        // HQ-1: exact rerank of the full beam from the f16 sidecar.
-        self.rerank_exact(&mut candidates, query, k);
-        // Filter deleted entries before truncating.
+        // Filter deleted entries first (see comment in search()).
         candidates.retain(|c| {
             let bfs = self.graph.to_bfs(c.id.0);
             self.is_live_bfs(bfs)
         });
+        // HQ-1: exact rerank of the live beam from the f16 sidecar.
+        self.rerank_exact(&mut candidates, query, k);
         candidates.truncate(k);
         self.remap_to_global_ids(&mut candidates);
         candidates

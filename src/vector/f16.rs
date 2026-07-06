@@ -74,10 +74,15 @@ pub fn f16_to_f32(bits: u16) -> f32 {
         if mant == 0 {
             sign // Signed zero.
         } else {
-            // Subnormal: normalize by shifting the mantissa up.
-            let lead = mant.leading_zeros() - 21; // Zeros above bit 9.
-            let exp32 = 127 - 15 - lead;
-            let mant32 = (mant << (lead + 1)) & 0x03FF;
+            // Subnormal: value is mant * 2^-24. Normalize: with `lead` zero
+            // bits above the 10-bit field, the leading 1 sits at bit
+            // p = 10 - lead, so mant = 1.frac * 2^p and the value is
+            // 1.frac * 2^(p - 24). Biased f32 exponent: 127 + p - 24
+            // = 113 - lead; shifting by `lead` moves the leading 1 to
+            // bit 10, where the mask drops it (it becomes implicit).
+            let lead = mant.leading_zeros() - 21;
+            let exp32 = 113 - lead;
+            let mant32 = (mant << lead) & 0x03FF;
             sign | (exp32 << 23) | (mant32 << 13)
         }
     } else if exp == 0x1F {
@@ -141,6 +146,40 @@ mod tests {
     #[test]
     fn nan_preserved() {
         assert!(f16_to_f32(f32_to_f16(f32::NAN)).is_nan());
+    }
+
+    #[test]
+    fn all_subnormals_decode_exact() {
+        // Every f16 subnormal (exp=0, mant 1..=1023) is exactly mant * 2^-24.
+        // Regression: an exponent off-by-one decoded every subnormal to HALF
+        // its value (2^-25 scale), breaking f16_to_f32's "exact" contract.
+        for mant in 1u16..=0x03FF {
+            let expected = mant as f32 * (-24f32).exp2();
+            let got = f16_to_f32(mant);
+            assert_eq!(
+                got.to_bits(),
+                expected.to_bits(),
+                "subnormal mant={mant}: got {got:e}, expected {expected:e}"
+            );
+            // Negative counterpart.
+            let got_neg = f16_to_f32(0x8000 | mant);
+            assert_eq!(got_neg.to_bits(), (-expected).to_bits());
+        }
+    }
+
+    #[test]
+    fn all_finite_patterns_roundtrip() {
+        // f16 -> f32 is exact, so re-encoding must reproduce the identical
+        // bit pattern for every finite f16 (an incorrectly-scaled decode
+        // cannot survive this).
+        for bits in 0u16..=0xFFFF {
+            let exp = (bits >> 10) & 0x1F;
+            if exp == 0x1F {
+                continue; // inf/NaN handled elsewhere
+            }
+            let back = f32_to_f16(f16_to_f32(bits));
+            assert_eq!(back, bits, "bits={bits:#06x}");
+        }
     }
 
     #[test]
