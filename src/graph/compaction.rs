@@ -571,6 +571,7 @@ pub fn compact_segments(
         created_lsn,
         incoming: std::sync::OnceLock::new(),
         props_index: std::sync::OnceLock::new(),
+        hnsw_bridge: std::sync::OnceLock::new(),
     })
 }
 

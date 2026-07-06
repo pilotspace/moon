@@ -96,9 +96,11 @@ pub struct ContextNode {
 pub enum FilterStrategy {
     /// Score all candidates via brute-force cosine similarity.
     BruteForce,
-    /// Use HNSW pre-filter (skip non-candidates during search).
-    /// For now, falls back to brute-force with candidate filtering since
-    /// the graph MemGraph embeddings are not indexed in HNSW.
+    /// Route CSR-resident candidates through the per-segment HNSW bridge
+    /// (`CsrStorage::hnsw_bridge`, built lazily over v5 embeddings) instead
+    /// of scoring each one. Approximate: a bridge beam that under-fills k
+    /// falls back to exact scoring of that group. Mutable-tier candidates
+    /// and rows without a bridge entry are always scored exactly.
     HnswPreFilter,
 }
 
@@ -186,16 +188,29 @@ impl GraphFilteredSearch {
         )?;
 
         // Step 2: Select strategy.
-        let _strategy = select_strategy(candidates.len(), self.threshold);
-        // Both strategies score the same way for tier-resident embeddings.
-        // HNSW pre-filter would be used when an external VectorStore index exists.
-        // For graph-embedded vectors, brute-force is always used.
+        let strategy = select_strategy(candidates.len(), self.threshold);
 
-        // Step 3: Score candidates by cosine similarity (embedding resolved
-        // from the mutable tier or the CSR v5 blob).
-        let mut scored: Vec<HybridResult> = Vec::with_capacity(candidates.len());
+        // Step 3: Score candidates. HnswPreFilter routes CSR-resident
+        // candidates through each segment's HNSW bridge and leaves the
+        // rest (mutable tier, bridge-less rows, dim mismatch) in
+        // `residual` for exact scoring below.
+        let mut scored: Vec<HybridResult> = Vec::with_capacity(candidates.len().min(4096));
+        let residual: Vec<(NodeKey, u32)> = match strategy {
+            FilterStrategy::BruteForce => candidates,
+            FilterStrategy::HnswPreFilter => hnsw_prefilter_score(
+                memgraph,
+                csr_segs,
+                candidates,
+                &self.query_vector,
+                self.k,
+                &mut scored,
+            ),
+        };
 
-        for (node_key, graph_dist) in &candidates {
+        // Exact scoring for whatever the pre-filter did not cover
+        // (everything, under BruteForce): embedding resolved from the
+        // mutable tier or the CSR v5 blob.
+        for (node_key, graph_dist) in &residual {
             let Some(embedding) = view.embedding(*node_key) else {
                 continue; // Skip nodes without embeddings.
             };
@@ -215,6 +230,82 @@ impl GraphFilteredSearch {
 
         Ok(scored)
     }
+}
+
+/// Route candidates through per-segment HNSW bridges (HnswPreFilter).
+///
+/// Partitions `candidates` into per-segment groups (a candidate joins a
+/// group when its segment has a bridge covering its row at the query's
+/// dimension) and searches each bridge with an allow-filter over the
+/// group's rows. Bridge hits are pushed to `scored` with their EXACT
+/// cosine (bridge vectors are unit-normalized copies of the originals).
+/// Returns the residual candidates for exact scoring: mutable-tier nodes,
+/// bridge-less rows, dim mismatches, and any whole group whose beam
+/// under-filled k (approximate-search rescue — never silently truncate).
+fn hnsw_prefilter_score(
+    memgraph: &MemGraph,
+    csr_segs: &[Arc<CsrStorage>],
+    candidates: Vec<(NodeKey, u32)>,
+    query: &[f32],
+    k: usize,
+    scored: &mut Vec<HybridResult>,
+) -> Vec<(NodeKey, u32)> {
+    use crate::graph::fasthash::FxHashMap;
+
+    let mut residual: Vec<(NodeKey, u32)> = Vec::new();
+    let mut groups: Vec<FxHashMap<u32, (NodeKey, u32)>> =
+        (0..csr_segs.len()).map(|_| FxHashMap::default()).collect();
+
+    'cand: for (key, gdist) in candidates {
+        // Mutable tier wins (same precedence as MergedNodeView::embedding).
+        if memgraph.get_node(key).is_some() {
+            residual.push((key, gdist));
+            continue;
+        }
+        for (i, seg) in csr_segs.iter().enumerate() {
+            if let Some(row) = seg.lookup_node(key) {
+                if let Some(bridge) = seg.hnsw_bridge() {
+                    if bridge.dim() == query.len() && bridge.contains_row(row) {
+                        groups[i].insert(row, (key, gdist));
+                        continue 'cand;
+                    }
+                }
+                // Resident here but not bridge-searchable: score exactly.
+                residual.push((key, gdist));
+                continue 'cand;
+            }
+        }
+        residual.push((key, gdist));
+    }
+
+    for (i, group) in groups.iter().enumerate() {
+        if group.is_empty() {
+            continue;
+        }
+        let Some(bridge) = csr_segs[i].hnsw_bridge() else {
+            // Unreachable by construction; stay exact if it ever isn't.
+            residual.extend(group.values().copied());
+            continue;
+        };
+        let hits = bridge.search(query, k, |row| group.contains_key(&row));
+        if hits.len() < k.min(group.len()) {
+            // Beam under-filled the ask: rescue with exact scoring.
+            residual.extend(group.values().copied());
+            continue;
+        }
+        for (row, sim) in hits {
+            if let Some(&(key, gdist)) = group.get(&row) {
+                scored.push(HybridResult {
+                    node: key,
+                    score: sim,
+                    graph_distance: Some(gdist),
+                    context: Vec::new(),
+                });
+            }
+        }
+    }
+
+    residual
 }
 
 // ---------------------------------------------------------------------------
@@ -1221,5 +1312,168 @@ mod tests {
         let reranker = GraphConstrainedReRanker::new(fake_key, 3, 0.5, vec![1.0, 0.0, 0.0], 10);
         let result = reranker.execute(&g, &[], u64::MAX - 1);
         assert!(matches!(result, Err(HybridError::NodeNotFound)));
+    }
+
+    // --- HnswPreFilter via the per-segment bridge ---
+
+    /// Deterministic pseudo-random embedding (LCG — no RNG in tests).
+    fn det_embedding(i: u64, dim: usize) -> Vec<f32> {
+        let mut state = i.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
+        (0..dim)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                ((state >> 33) as f32 / (1u64 << 31) as f32) - 0.5
+            })
+            .collect()
+    }
+
+    /// Frozen star (center -> 299 embedded spokes) as a CSR segment.
+    fn frozen_star_segment() -> (MemGraph, Arc<CsrStorage>, NodeKey) {
+        let mut g = MemGraph::new(1_000_000);
+        let center = g.add_node(smallvec![0], empty_props(), Some(det_embedding(0, 8)), 1);
+        for i in 1..300u64 {
+            let s = g.add_node(smallvec![0], empty_props(), Some(det_embedding(i, 8)), 1);
+            g.add_edge(center, s, 1, 1.0, None, 2).expect("edge");
+        }
+        let frozen = g.freeze().expect("freeze");
+        let seg = crate::graph::csr::CsrSegment::from_frozen(frozen, 10).expect("csr");
+        (
+            MemGraph::new(1_000_000),
+            Arc::new(CsrStorage::from(seg)),
+            center,
+        )
+    }
+
+    #[test]
+    fn test_hnsw_prefilter_matches_brute_force() {
+        let (mg, seg, center) = frozen_star_segment();
+        // Pre-build the bridge below the production minimum so the
+        // HnswPreFilter path actually engages on a 300-node fixture.
+        assert!(seg.hnsw_bridge_for_test().is_some(), "bridge must build");
+
+        let query = det_embedding(9999, 8);
+        let mut hnsw = GraphFilteredSearch::new(center, 1, query.clone(), 5);
+        hnsw.threshold = 1; // force HnswPreFilter
+        let mut brute = GraphFilteredSearch::new(center, 1, query.clone(), 5);
+        brute.threshold = usize::MAX; // force BruteForce
+
+        let segs = vec![seg.clone()];
+        let hnsw_res = hnsw.execute(&mg, &segs, u64::MAX - 1).expect("hnsw ok");
+        let brute_res = brute.execute(&mg, &segs, u64::MAX - 1).expect("brute ok");
+
+        assert_eq!(hnsw_res.len(), 5);
+        assert_eq!(brute_res.len(), 5);
+        // Every HNSW score must be the node's REAL cosine similarity and
+        // carry the BFS graph distance.
+        let view = MergedNodeView::new(&mg, &segs);
+        for r in &hnsw_res {
+            let emb = view.embedding(r.node).expect("embedding");
+            let exact = simd::cosine_similarity(&emb, &query);
+            assert!(
+                (r.score - exact).abs() < 1e-4,
+                "score {} vs exact {exact}",
+                r.score
+            );
+            assert_eq!(r.graph_distance, Some(1));
+        }
+        // Top-5 overlap with the exact ranking (approximate search).
+        let brute_set: HashSet<NodeKey> = brute_res.iter().map(|r| r.node).collect();
+        let overlap = hnsw_res
+            .iter()
+            .filter(|r| brute_set.contains(&r.node))
+            .count();
+        assert!(
+            overlap >= 4,
+            "HNSW/brute top-5 overlap too low: {overlap}/5"
+        );
+    }
+
+    #[test]
+    fn test_hnsw_prefilter_without_bridge_is_exact() {
+        // No test bridge pre-built: the production accessor refuses a
+        // 300-vector segment (min 4096), so every candidate is residual
+        // and results must EXACTLY equal brute force.
+        let (mg, seg, center) = frozen_star_segment();
+        let query = det_embedding(777, 8);
+
+        let mut hnsw = GraphFilteredSearch::new(center, 1, query.clone(), 5);
+        hnsw.threshold = 1;
+        let mut brute = GraphFilteredSearch::new(center, 1, query, 5);
+        brute.threshold = usize::MAX;
+
+        let segs = vec![seg.clone()];
+        let hnsw_res = hnsw.execute(&mg, &segs, u64::MAX - 1).expect("ok");
+        let brute_res = brute.execute(&mg, &segs, u64::MAX - 1).expect("ok");
+
+        let a: Vec<(NodeKey, u64)> = hnsw_res
+            .iter()
+            .map(|r| (r.node, r.score.to_bits()))
+            .collect();
+        let b: Vec<(NodeKey, u64)> = brute_res
+            .iter()
+            .map(|r| (r.node, r.score.to_bits()))
+            .collect();
+        assert_eq!(
+            a, b,
+            "bridge-less HnswPreFilter must be bit-exact brute force"
+        );
+    }
+
+    #[test]
+    fn test_hnsw_prefilter_partition_routes_tiers() {
+        // Partition contract of hnsw_prefilter_score: mutable-tier
+        // candidates land in `residual` (exact scoring), bridge-covered
+        // frozen candidates surface through `scored` as the group top-k.
+        let (mut mg, seg, _center) = frozen_star_segment();
+        assert!(seg.hnsw_bridge_for_test().is_some(), "bridge must build");
+
+        // A fresh MemGraph's first key ALIASES a frozen key (same slotmap
+        // sequence) -- exactly the mutable-tier-wins case the partition
+        // must route to residual.
+        let hot = mg.add_node(
+            smallvec![0],
+            empty_props(),
+            Some(vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+            20,
+        );
+
+        // Candidates: the mutable node + every OTHER frozen row.
+        let mut candidates: Vec<(NodeKey, u32)> = vec![(hot, 1)];
+        for meta in seg.node_meta() {
+            let key: NodeKey = slotmap::KeyData::from_ffi(meta.external_id).into();
+            if key != hot {
+                candidates.push((key, 1));
+            }
+        }
+        let total = candidates.len();
+
+        let query = det_embedding(55, 8);
+        let segs = vec![seg.clone()];
+        let mut scored: Vec<HybridResult> = Vec::new();
+        let residual = hnsw_prefilter_score(&mg, &segs, candidates, &query, 5, &mut scored);
+
+        // Mutable node: residual, never bridge-scored.
+        assert!(residual.iter().any(|&(k, _)| k == hot));
+        assert!(scored.iter().all(|r| r.node != hot));
+        assert_eq!(
+            residual.len(),
+            1,
+            "all frozen candidates are bridge-covered"
+        );
+        // Bridge returned the group's top-k with exact cosines.
+        assert_eq!(scored.len(), 5);
+        let view = MergedNodeView::new(&mg, &segs);
+        for r in &scored {
+            let emb = view.embedding(r.node).expect("embedding");
+            let exact = simd::cosine_similarity(&emb, &query);
+            assert!((r.score - exact).abs() < 1e-4);
+            assert_eq!(r.graph_distance, Some(1));
+        }
+        assert!(
+            total > scored.len() + residual.len(),
+            "prefilter must prune"
+        );
     }
 }

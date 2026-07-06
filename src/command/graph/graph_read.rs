@@ -485,6 +485,7 @@ fn run_read_query(
     let ctx = cypher::executor::ExecutionContext {
         valid_time_as_of: valid_at,
         decay,
+        guard: Some(crate::graph::traversal_guard::TraversalGuard::with_default_timeout(0)),
         ..Default::default()
     };
     match cypher::executor::execute(graph, plan, &params, &ctx) {
@@ -1105,6 +1106,7 @@ pub fn graph_profile(store: &GraphStore, args: &[Frame]) -> Frame {
     let ctx = cypher::executor::ExecutionContext {
         valid_time_as_of: valid_at,
         decay,
+        guard: Some(crate::graph::traversal_guard::TraversalGuard::with_default_timeout(0)),
         ..Default::default()
     };
     let profile = match cypher::executor::execute_profile(graph, &plan, &params, &ctx) {

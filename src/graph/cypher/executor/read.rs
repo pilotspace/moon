@@ -158,6 +158,21 @@ fn prop_value_loose_eq(have: &PropertyValue, want: &PropertyValue) -> bool {
     }
 }
 
+/// Per-hop wall-clock check for multi-hop operators (bounded epoch hold).
+/// No-op when the context carries no guard (`Default` / unit tests).
+#[inline]
+fn guard_check(ctx: &ExecutionContext) -> Result<(), ExecError> {
+    if let Some(guard) = &ctx.guard {
+        if let Err(t) = guard.check_timeout() {
+            return Err(ExecError {
+                kind: ExecErrorKind::Timeout(t),
+                partial_mutations: Vec::new(),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Execute a physical plan against a named graph.
 pub fn execute(
     graph: &NamedGraph,
@@ -322,6 +337,7 @@ pub fn execute(
                         visited.insert(src_key);
 
                         for hop in 1..=capped_max_hops {
+                            guard_check(ctx)?;
                             let mut next_frontier = Vec::new();
                             for &current in &frontier {
                                 reader.neighbors_into(current, &mut nb_seen, &mut nb_buf);
@@ -618,6 +634,7 @@ pub fn execute(
                         Some(Value::Node(k)) => *k,
                         _ => continue,
                     };
+                    guard_check(ctx)?;
                     if let Some(path) = super::shortest_path::run_shortest_path(
                         memgraph,
                         csr_segs,
@@ -858,6 +875,7 @@ pub fn execute_profile(
                         visited.insert(src_key);
 
                         for hop in 1..=capped_max_hops {
+                            guard_check(ctx)?;
                             let mut next_frontier = Vec::new();
                             for &current in &frontier {
                                 reader.neighbors_into(current, &mut nb_seen, &mut nb_buf);
@@ -1153,6 +1171,7 @@ pub fn execute_profile(
                         Some(Value::Node(k)) => *k,
                         _ => continue,
                     };
+                    guard_check(ctx)?;
                     if let Some(path) = super::shortest_path::run_shortest_path(
                         memgraph,
                         csr_segs,
