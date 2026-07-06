@@ -84,11 +84,11 @@ pub(crate) struct ConnectionContext {
     /// pub/sub `SUBSCRIBE` and by per-connection `AffinityTracker` migration
     /// decisions when a connection converges ≥10/16 ops on a remote shard.
     pub pubsub_affinity: Arc<parking_lot::RwLock<crate::shard::affinity::AffinityTracker>>,
-    #[allow(dead_code)] // Only used by monoio handler (tiered storage)
+    // Used by the monoio handler's tiered-storage eviction path AND by both
+    // handlers' `FunctionRegistry::new` construction site (Gap B) to build
+    // the real `LuaEvictionCtx` for FCALL-internal writes.
     pub spill_sender: Option<flume::Sender<crate::storage::tiered::spill_thread::SpillRequest>>,
-    #[allow(dead_code)] // Only used by monoio handler (tiered storage)
     pub spill_file_id: Rc<std::cell::Cell<u64>>,
-    #[allow(dead_code)] // Only used by monoio handler (tiered storage)
     pub disk_offload_dir: Option<std::path::PathBuf>,
 }
 

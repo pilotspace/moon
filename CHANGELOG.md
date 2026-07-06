@@ -61,10 +61,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `unsafe`, zero per-call allocation), runs the same gate before a WRITE
   `redis.call` executes; `redis.call` raises the OOM error as a Lua runtime
   error (script aborts, matching Redis semantics), `redis.pcall` returns it
-  as an `{err = ...}` table. Read-only scripts are unaffected. FCALL-internal
-  writes (`src/scripting/functions.rs`) keep a documented, pre-existing gap
-  (no shard context threaded through the function-library loader) — tracked
-  as a follow-up, not closed by this fix.
+  as an `{err = ...}` table. Read-only scripts are unaffected.
+- **FCALL-internal `redis.call`/`redis.pcall` writes now enforce
+  `--maxmemory` too.** `FUNCTION LOAD` (`src/scripting/functions.rs`)
+  creates its own per-library sandboxed Lua VM, separate from the shard's
+  shared EVAL/EVALSHA VM — that per-library VM registered `redis.call`/
+  `redis.pcall` with `LuaEvictionCtx::disabled()` unconditionally, so a
+  `FUNCTION` whose body wrote in a loop could grow memory past the cap
+  independent of the EVAL/EVALSHA fix above. `FunctionRegistry::new` now
+  takes a `LuaEvictionCtx`, stored on the registry and cloned into every
+  library's VM at `create_library` time; both production construction sites
+  (`handler_monoio/mod.rs`, `handler_sharded/mod.rs`) build a real ctx from
+  the same shard handles `setup_lua_vm` already uses for the shared VM
+  (`ConnectionContext::{shard_databases, runtime_config, shard_id,
+  spill_sender, spill_file_id, disk_offload_dir}`); only test-only callers
+  pass `LuaEvictionCtx::disabled()`.
 - **Cross-db `COPY ... DB n` eviction confirmed/hardened.** `COPY` carries
   the generic `W` write flag, so on the cross-shard dispatch arms
   `handler_monoio` actually uses for remote writes (`ExecuteSlotted`,
@@ -99,24 +110,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   two-database intercept across every `ShardMessage` arm (or restructuring it
   as a shared helper reachable from all of them) — out of scope for this
   fix, flagged as a follow-up covering both `COPY` and `MOVE`.
-- New wire-level regression suite `tests/oom_bypass_closure.rs` (6 cases,
+- New wire-level regression suite `tests/oom_bypass_closure.rs` (8 cases,
   both runtimes): direct-SET control (A), cross-shard pipeline (B), Lua EVAL
   loop (C), read-only EVAL under pressure not blocked (D), cross-shard COPY
-  under pressure (E), `CONFIG SET maxmemory` atomic publish/un-publish (F).
-  B, C and E RED before this fix (E: 0/300 OOM, GREEN after: 104/300). Case E
-  pipelines `COPY`, which dispatches through the same
-  `ExecuteSlotted`/`PipelineBatchSlotted` generic-gate path as case B — its
-  RED/GREEN swing rides the *generic* gate, not the Execute-arm dest-gate
-  above; it confirms COPY drives that gate to OOM, not that the Execute-arm
-  path is independently exercised. D locks the write-only scope of the Lua
-  gate. Case F (added with the atomic-snapshot perf follow-up) starts the
-  server with `--maxmemory 0 --disk-offload disable` (both required so the
-  atomic starts genuinely unset — omitting `--maxmemory` trips the
-  auto-guardrail's nonzero default, and disk-offload's spill-sender presence
-  ORs into the same gate) and drives a cross-shard pipeline before and after
-  `CONFIG SET maxmemory`/`CONFIG SET maxmemory 0`; RED before the CONFIG SET
-  call site published the atomic (775/3000 OOM — the local-only share) GREEN
-  after (3000/3000).
+  under pressure (E), `CONFIG SET maxmemory` atomic publish/un-publish (F),
+  FCALL-internal write loop (G), FCALL control with no maxmemory (H).
+  B, C, E and G RED before their respective fixes (E: 0/300 OOM, GREEN
+  after: 104/300). Case E pipelines `COPY`, which dispatches through the
+  same `ExecuteSlotted`/`PipelineBatchSlotted` generic-gate path as case B —
+  its RED/GREEN swing rides the *generic* gate, not the Execute-arm
+  dest-gate above; it confirms COPY drives that gate to OOM, not that the
+  Execute-arm path is independently exercised. D locks the write-only scope
+  of the Lua gate. Case F (added with the atomic-snapshot perf follow-up)
+  starts the server with `--maxmemory 0 --disk-offload disable` (both
+  required so the atomic starts genuinely unset — omitting `--maxmemory`
+  trips the auto-guardrail's nonzero default, and disk-offload's
+  spill-sender presence ORs into the same gate) and drives a cross-shard
+  pipeline before and after `CONFIG SET maxmemory`/`CONFIG SET maxmemory 0`;
+  RED before the CONFIG SET call site published the atomic (775/3000 OOM —
+  the local-only share) GREEN after (3000/3000). Case G (FCALL) RED before
+  the FunctionRegistry fix — a 2000-iteration `redis.call('SET', ...)` loop
+  inside an FCALL'd function completed with `'DONE'` instead of an OOM error
+  against a 2MB-capped `noeviction` server; GREEN after. Case H locks the
+  write-only/OOM-only scope of the FCALL gate, mirroring case D for EVAL.
 
 ### Added — int8 symmetric ADC for SQ8 vector search (task #13)
 

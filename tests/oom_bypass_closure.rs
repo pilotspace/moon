@@ -720,3 +720,102 @@ fn test_case_f_config_set_maxmemory_publishes_atomic() {
          the maxmemory_is_set() atomic did not flip back off"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Case G: FCALL-internal writes (Lua FUNCTION library). `FUNCTION LOAD`
+// creates its own per-library sandboxed Lua VM (src/scripting/functions.rs),
+// separate from the shard's shared EVAL/EVALSHA VM. That per-library VM
+// used to register redis.call/pcall with `LuaEvictionCtx::disabled()`
+// unconditionally, regardless of the EVAL/EVALSHA fix in case C — a
+// FUNCTION whose body writes in a loop could grow memory past `maxmemory`
+// without limit.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_case_g_fcall_internal_write_oom() {
+    let dir = test_tmpdir();
+    let port = free_port();
+    const MAXMEMORY: u64 = 2 * 1024 * 1024; // 2MB
+    let _guard = spawn_moon_oom(port, dir.path(), 1, MAXMEMORY);
+    let mut c = wait_ready(port);
+
+    // Registered functions are called with zero Lua args (`call_function` in
+    // src/scripting/functions.rs invokes `registered.call(())`) — like a
+    // plain EVAL body, they read `KEYS`/`ARGV` as globals, not parameters.
+    let lib_body: &[u8] = b"#!lua name=oomlib\n\
+        local function write_loop()\n\
+          local val = ARGV[1]\n\
+          for i = 1, 2000 do\n\
+            redis.call('SET', 'gk:' .. i, val)\n\
+          end\n\
+          return 'DONE'\n\
+        end\n\
+        redis.register_function('write_loop', write_loop)";
+
+    let load_reply = c.cmd(&[b"FUNCTION", b"LOAD", lib_body]);
+    assert_eq!(
+        load_reply,
+        V::Bulk(b"oomlib".to_vec()),
+        "FUNCTION LOAD failed: {load_reply:?}"
+    );
+
+    // 2000 * 8KB = ~16MB attempted vs a 2MB cap — comfortably oversubscribed
+    // (same shape as case C's EVAL loop).
+    let value = blob(8 * 1024, b'g');
+    let r = c.cmd(&[b"FCALL", b"write_loop", b"0", &value]);
+
+    match &r {
+        V::Err(msg) => {
+            assert!(
+                msg.to_uppercase().contains("OOM"),
+                "FCALL errored but not with OOM: {msg:?}"
+            );
+        }
+        other => panic!(
+            "FCALL-internal write bypass: FCALL completed as {other:?} \
+             instead of hitting OOM — writes inside a FUNCTION are not \
+             gated by --maxmemory"
+        ),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Case H: control — FCALL with no maxmemory configured must succeed. Locks
+// the write-only/OOM-only scope of the FCALL gate against a future
+// over-broad check (mirrors case D for EVAL).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_case_h_fcall_no_maxmemory_succeeds() {
+    let dir = test_tmpdir();
+    let port = free_port();
+    // Reuse spawn_moon_no_maxmemory (Gap C's case F helper) so this
+    // genuinely has no cap — spawn_moon_oom always sets one.
+    let _guard = spawn_moon_no_maxmemory(port, dir.path(), 1);
+    let mut c = wait_ready(port);
+
+    let lib_body: &[u8] = b"#!lua name=oklib\n\
+        local function write_loop()\n\
+          local val = ARGV[1]\n\
+          for i = 1, 50 do\n\
+            redis.call('SET', 'hk:' .. i, val)\n\
+          end\n\
+          return 'DONE'\n\
+        end\n\
+        redis.register_function('write_loop', write_loop)";
+
+    let load_reply = c.cmd(&[b"FUNCTION", b"LOAD", lib_body]);
+    assert_eq!(
+        load_reply,
+        V::Bulk(b"oklib".to_vec()),
+        "FUNCTION LOAD failed: {load_reply:?}"
+    );
+
+    let value = blob(1024, b'h');
+    let r = c.cmd(&[b"FCALL", b"write_loop", b"0", &value]);
+    assert_eq!(
+        r,
+        V::Bulk(b"DONE".to_vec()),
+        "FCALL without maxmemory configured should succeed, got {r:?}"
+    );
+}

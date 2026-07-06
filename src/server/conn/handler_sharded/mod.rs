@@ -276,9 +276,19 @@ pub(crate) async fn handle_connection_sharded_inner<
     }
     let _registry_guard = RegistryGuard(client_id);
 
-    // Functions API registry (per-shard, lazy init) — kept as local because Rc<RefCell<>> is !Send
+    // Functions API registry (per-shard, lazy init) — kept as local because Rc<RefCell<>> is !Send.
+    // Real eviction ctx (Gap B): FCALL-internal `redis.call` writes must run
+    // the same OOM gate as EVAL/EVALSHA, same handles `LuaEvictionCtx::new`
+    // uses elsewhere on this shard (conn_accept.rs's `setup_lua_vm` call).
     let func_registry = std::rc::Rc::new(std::cell::RefCell::new(
-        crate::scripting::FunctionRegistry::new(),
+        crate::scripting::FunctionRegistry::new(crate::scripting::bridge::LuaEvictionCtx::new(
+            ctx.shard_databases.clone(),
+            ctx.runtime_config.clone(),
+            ctx.shard_id,
+            ctx.spill_sender.clone(),
+            ctx.spill_file_id.clone(),
+            ctx.disk_offload_dir.clone(),
+        )),
     ));
 
     // Per-connection arena for batch processing temporaries.
