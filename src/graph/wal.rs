@@ -14,13 +14,6 @@
 
 use crate::graph::types::{PropertyMap, PropertyValue};
 
-/// Format an f64 as a string. Uses Display formatting (no external crate needed).
-/// This is only called during WAL serialization (cold path), so allocation is acceptable.
-#[inline]
-fn format_f64(val: f64) -> String {
-    format!("{val}")
-}
-
 /// Write a RESP bulk string element: `$<len>\r\n<data>\r\n`
 fn write_bulk(buf: &mut Vec<u8>, data: &[u8]) {
     buf.push(b'$');
@@ -61,8 +54,7 @@ pub fn serialize_remove_node(graph_name: &[u8], node_id: u64) -> Vec<u8> {
     write_array_header(&mut buf, 3);
     write_bulk(&mut buf, b"GRAPH.REMOVENODE");
     write_bulk(&mut buf, graph_name);
-    let id_str = itoa::Buffer::new().format(node_id).to_owned();
-    write_bulk(&mut buf, id_str.as_bytes());
+    write_bulk(&mut buf, itoa::Buffer::new().format(node_id).as_bytes());
     buf
 }
 
@@ -72,8 +64,7 @@ pub fn serialize_remove_edge(graph_name: &[u8], edge_id: u64) -> Vec<u8> {
     write_array_header(&mut buf, 3);
     write_bulk(&mut buf, b"GRAPH.REMOVEEDGE");
     write_bulk(&mut buf, graph_name);
-    let id_str = itoa::Buffer::new().format(edge_id).to_owned();
-    write_bulk(&mut buf, id_str.as_bytes());
+    write_bulk(&mut buf, itoa::Buffer::new().format(edge_id).as_bytes());
     buf
 }
 
@@ -100,31 +91,28 @@ pub fn serialize_add_node(
     write_bulk(&mut buf, graph_name);
 
     // Node ID
-    let id_str = itoa::Buffer::new().format(node_id).to_owned();
-    write_bulk(&mut buf, id_str.as_bytes());
+    write_bulk(&mut buf, itoa::Buffer::new().format(node_id).as_bytes());
 
     // Labels
-    let nlabels_str = itoa::Buffer::new().format(labels.len()).to_owned();
-    write_bulk(&mut buf, nlabels_str.as_bytes());
+    write_bulk(
+        &mut buf,
+        itoa::Buffer::new().format(labels.len()).as_bytes(),
+    );
     for &label in labels {
-        let label_str = itoa::Buffer::new().format(label).to_owned();
-        write_bulk(&mut buf, label_str.as_bytes());
+        write_bulk(&mut buf, itoa::Buffer::new().format(label).as_bytes());
     }
 
     // Properties
-    let nprops_str = itoa::Buffer::new().format(props.len()).to_owned();
-    write_bulk(&mut buf, nprops_str.as_bytes());
+    write_bulk(&mut buf, itoa::Buffer::new().format(props.len()).as_bytes());
     for (key, val) in props.iter() {
-        let key_str = itoa::Buffer::new().format(*key).to_owned();
-        write_bulk(&mut buf, key_str.as_bytes());
+        write_bulk(&mut buf, itoa::Buffer::new().format(*key).as_bytes());
         serialize_property_value(&mut buf, val);
     }
 
     // Optional embedding
     if let Some(embed) = embedding {
         write_bulk(&mut buf, b"VECTOR");
-        let dim_str = itoa::Buffer::new().format(embed.len()).to_owned();
-        write_bulk(&mut buf, dim_str.as_bytes());
+        write_bulk(&mut buf, itoa::Buffer::new().format(embed.len()).as_bytes());
         // Encode as raw f32 bytes (little-endian)
         let bytes: Vec<u8> = embed.iter().flat_map(|f| f.to_le_bytes()).collect();
         write_bulk(&mut buf, &bytes);
@@ -154,29 +142,22 @@ pub fn serialize_add_edge(
     write_bulk(&mut buf, b"GRAPH.ADDEDGE");
     write_bulk(&mut buf, graph_name);
 
-    let edge_id_str = itoa::Buffer::new().format(edge_id).to_owned();
-    write_bulk(&mut buf, edge_id_str.as_bytes());
+    write_bulk(&mut buf, itoa::Buffer::new().format(edge_id).as_bytes());
 
-    let src_str = itoa::Buffer::new().format(src_id).to_owned();
-    write_bulk(&mut buf, src_str.as_bytes());
+    write_bulk(&mut buf, itoa::Buffer::new().format(src_id).as_bytes());
 
-    let dst_str = itoa::Buffer::new().format(dst_id).to_owned();
-    write_bulk(&mut buf, dst_str.as_bytes());
+    write_bulk(&mut buf, itoa::Buffer::new().format(dst_id).as_bytes());
 
-    let type_str = itoa::Buffer::new().format(edge_type).to_owned();
-    write_bulk(&mut buf, type_str.as_bytes());
+    write_bulk(&mut buf, itoa::Buffer::new().format(edge_type).as_bytes());
 
-    // Weight as string representation
-    let weight_str = format_f64(weight);
-    write_bulk(&mut buf, weight_str.as_bytes());
+    // Weight as string representation (ryu: no intermediate String)
+    write_bulk(&mut buf, ryu::Buffer::new().format(weight).as_bytes());
 
-    let nprops_str = itoa::Buffer::new().format(prop_count).to_owned();
-    write_bulk(&mut buf, nprops_str.as_bytes());
+    write_bulk(&mut buf, itoa::Buffer::new().format(prop_count).as_bytes());
 
     if let Some(props) = props {
         for (key, val) in props.iter() {
-            let key_str = itoa::Buffer::new().format(*key).to_owned();
-            write_bulk(&mut buf, key_str.as_bytes());
+            write_bulk(&mut buf, itoa::Buffer::new().format(*key).as_bytes());
             serialize_property_value(&mut buf, val);
         }
     }
@@ -189,13 +170,11 @@ fn serialize_property_value(buf: &mut Vec<u8>, val: &PropertyValue) {
     match val {
         PropertyValue::Int(i) => {
             write_bulk(buf, b"i");
-            let s = itoa::Buffer::new().format(*i).to_owned();
-            write_bulk(buf, s.as_bytes());
+            write_bulk(buf, itoa::Buffer::new().format(*i).as_bytes());
         }
         PropertyValue::Float(f) => {
             write_bulk(buf, b"f");
-            let s = format_f64(*f);
-            write_bulk(buf, s.as_bytes());
+            write_bulk(buf, ryu::Buffer::new().format(*f).as_bytes());
         }
         PropertyValue::String(s) => {
             write_bulk(buf, b"s");

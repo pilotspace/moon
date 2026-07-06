@@ -9,13 +9,14 @@
 //! Dijkstra finds shortest weighted path using composite cost (TRAV-04).
 
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
+use std::collections::{BinaryHeap, VecDeque};
 use std::sync::Arc;
 
 use dashmap::DashSet;
 use parking_lot::Mutex;
 
 use crate::graph::csr::CsrStorage;
+use crate::graph::fasthash::{FxHashMap, FxHashSet};
 use crate::graph::memgraph::MemGraph;
 use crate::graph::scoring::WeightedCostFn;
 use crate::graph::types::{Direction, EdgeKey, NodeKey};
@@ -122,7 +123,7 @@ impl<'a> SegmentMergeReader<'a> {
     /// Allocates per call. For BFS/DFS hot loops, prefer [`neighbors_into`]
     /// which reuses caller-provided scratch buffers.
     pub fn neighbors(&self, node: NodeKey) -> Vec<MergedNeighbor> {
-        let mut seen: HashSet<NodeKey> = HashSet::new();
+        let mut seen: FxHashSet<NodeKey> = FxHashSet::default();
         let mut result: Vec<MergedNeighbor> = Vec::new();
         self.neighbors_inner(node, &mut seen, &mut result);
         result
@@ -136,7 +137,7 @@ impl<'a> SegmentMergeReader<'a> {
     pub fn neighbors_into(
         &self,
         node: NodeKey,
-        seen: &mut HashSet<NodeKey>,
+        seen: &mut FxHashSet<NodeKey>,
         out: &mut Vec<MergedNeighbor>,
     ) {
         seen.clear();
@@ -148,7 +149,7 @@ impl<'a> SegmentMergeReader<'a> {
     fn neighbors_inner(
         &self,
         node: NodeKey,
-        seen: &mut HashSet<NodeKey>,
+        seen: &mut FxHashSet<NodeKey>,
         result: &mut Vec<MergedNeighbor>,
     ) {
         // 1. Read from mutable MemGraph (highest priority -- newest data).
@@ -322,7 +323,7 @@ impl BoundedBfs {
         // Hint the OS for sequential page access on mmap'd CSR segments.
         reader.madvise_sequential();
 
-        let mut visited_set: HashSet<NodeKey> = HashSet::new();
+        let mut visited_set: FxHashSet<NodeKey> = FxHashSet::default();
         visited_set.insert(start);
 
         let mut result = Vec::new();
@@ -332,7 +333,7 @@ impl BoundedBfs {
         frontier.push_back((start, 0));
 
         // Scratch buffers reused across all neighbor lookups (avoids per-node alloc).
-        let mut nb_seen: HashSet<NodeKey> = HashSet::new();
+        let mut nb_seen: FxHashSet<NodeKey> = FxHashSet::default();
         let mut nb_buf: Vec<MergedNeighbor> = Vec::new();
 
         while let Some((current, depth)) = frontier.pop_front() {
@@ -419,7 +420,7 @@ impl ParallelBfs {
 
         reader.madvise_sequential();
 
-        let mut visited_set: HashSet<NodeKey> = HashSet::new();
+        let mut visited_set: FxHashSet<NodeKey> = FxHashSet::default();
         visited_set.insert(start);
 
         let mut result: Vec<(NodeKey, u32, Option<MergedNeighbor>)> = vec![(start, 0, None)];
@@ -427,7 +428,7 @@ impl ParallelBfs {
         let mut depth: u32 = 0;
 
         // Scratch buffers reused across all neighbor lookups.
-        let mut nb_seen: HashSet<NodeKey> = HashSet::new();
+        let mut nb_seen: FxHashSet<NodeKey> = FxHashSet::default();
         let mut nb_buf: Vec<MergedNeighbor> = Vec::new();
 
         while !frontier.is_empty() {
@@ -554,7 +555,7 @@ impl BoundedDfs {
             return Err(TraversalError::NodeNotFound);
         }
 
-        let mut visited_set: HashSet<NodeKey> = HashSet::new();
+        let mut visited_set: FxHashSet<NodeKey> = FxHashSet::default();
         let mut result = Vec::new();
 
         // Stack: (node, depth, cumulative_cost)
@@ -562,7 +563,7 @@ impl BoundedDfs {
         stack.push((start, 0, 0.0));
 
         // Scratch buffers reused across all neighbor lookups.
-        let mut nb_seen: HashSet<NodeKey> = HashSet::new();
+        let mut nb_seen: FxHashSet<NodeKey> = FxHashSet::default();
         let mut nb_buf: Vec<MergedNeighbor> = Vec::new();
 
         while let Some((current, depth, cum_cost)) = stack.pop() {
@@ -651,6 +652,14 @@ impl Ord for DijkstraEntry {
     }
 }
 
+/// Per-node Dijkstra state: the former dist/prev/depth map triple merged
+/// into one entry so each relaxation costs one hash lookup instead of three.
+struct DijkstraNodeState {
+    dist: f64,
+    prev: Option<NodeKey>,
+    depth: u32,
+}
+
 /// Dijkstra shortest weighted path traversal.
 pub struct DijkstraTraversal {
     pub cost_fn: WeightedCostFn,
@@ -676,40 +685,45 @@ impl DijkstraTraversal {
             return Err(TraversalError::NodeNotFound);
         }
 
-        let mut dist: HashMap<NodeKey, f64> = HashMap::new();
-        let mut prev: HashMap<NodeKey, NodeKey> = HashMap::new();
-        let mut depth_map: HashMap<NodeKey, u32> = HashMap::new();
+        let mut state: FxHashMap<NodeKey, DijkstraNodeState> = FxHashMap::default();
         let mut heap = BinaryHeap::new();
 
-        dist.insert(start, 0.0);
-        depth_map.insert(start, 0);
+        state.insert(
+            start,
+            DijkstraNodeState {
+                dist: 0.0,
+                prev: None,
+                depth: 0,
+            },
+        );
         heap.push(DijkstraEntry {
             node: start,
             cost: 0.0,
         });
 
         // Scratch buffers reused across all neighbor lookups.
-        let mut nb_seen: HashSet<NodeKey> = HashSet::new();
+        let mut nb_seen: FxHashSet<NodeKey> = FxHashSet::default();
         let mut nb_buf: Vec<MergedNeighbor> = Vec::new();
 
         while let Some(DijkstraEntry { node, cost }) = heap.pop() {
             // Found target -- reconstruct path.
             if node == target {
-                let path = self.reconstruct_path(&prev, start, target);
+                let path = self.reconstruct_path(&state, start, target);
                 return Ok(Some(DijkstraResult {
                     total_cost: cost,
                     path,
                 }));
             }
 
+            // One lookup where the dist/prev/depth triple used to cost three.
+            let (best, current_depth) = match state.get(&node) {
+                Some(s) => (s.dist, s.depth),
+                None => (f64::INFINITY, 0),
+            };
             // Skip if we've already found a better path.
-            if let Some(&best) = dist.get(&node) {
-                if cost > best {
-                    continue;
-                }
+            if cost > best {
+                continue;
             }
-
-            let current_depth = depth_map.get(&node).copied().unwrap_or(0);
             if current_depth >= self.max_depth {
                 continue;
             }
@@ -719,15 +733,20 @@ impl DijkstraTraversal {
                 let edge_cost = self.cost_fn.cost_ms(neighbor.created_ms, neighbor.weight);
                 let new_cost = cost + edge_cost;
 
-                let is_better = match dist.get(&neighbor.node) {
-                    Some(&existing) => new_cost < existing,
+                let is_better = match state.get(&neighbor.node) {
+                    Some(s) => new_cost < s.dist,
                     None => true,
                 };
 
                 if is_better {
-                    dist.insert(neighbor.node, new_cost);
-                    prev.insert(neighbor.node, node);
-                    depth_map.insert(neighbor.node, current_depth + 1);
+                    state.insert(
+                        neighbor.node,
+                        DijkstraNodeState {
+                            dist: new_cost,
+                            prev: Some(node),
+                            depth: current_depth + 1,
+                        },
+                    );
                     heap.push(DijkstraEntry {
                         node: neighbor.node,
                         cost: new_cost,
@@ -739,10 +758,10 @@ impl DijkstraTraversal {
         Ok(None) // No path found
     }
 
-    /// Reconstruct path from prev-pointers.
+    /// Reconstruct path from the settled states' prev-pointers.
     fn reconstruct_path(
         &self,
-        prev: &HashMap<NodeKey, NodeKey>,
+        state: &FxHashMap<NodeKey, DijkstraNodeState>,
         start: NodeKey,
         target: NodeKey,
     ) -> Vec<NodeKey> {
@@ -750,8 +769,8 @@ impl DijkstraTraversal {
         let mut current = target;
         path.push(current);
         while current != start {
-            match prev.get(&current) {
-                Some(&p) => {
+            match state.get(&current).and_then(|s| s.prev) {
+                Some(p) => {
                     current = p;
                     path.push(current);
                 }

@@ -6,6 +6,7 @@ pub mod compaction;
 pub mod cross_shard;
 pub mod csr;
 pub mod cypher;
+pub mod fasthash;
 pub mod hybrid;
 pub mod index;
 pub mod manifest;
