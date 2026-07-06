@@ -35,7 +35,10 @@ pub fn del(db: &mut Database, args: &[Frame]) -> Frame {
     let mut count: i64 = 0;
     for arg in args {
         if let Some(key) = extract_key(arg) {
-            if db.remove(key).is_some() {
+            // Counting variant: a spilled (cold-only) key logically exists
+            // and must count as removed (D1).
+            let (removed, _hot) = db.remove_counting_cold(key);
+            if removed {
                 count += 1;
             }
         }
@@ -901,8 +904,12 @@ pub fn unlink(db: &mut Database, args: &[Frame]) -> Frame {
     let mut count: i64 = 0;
     for arg in args {
         if let Some(key) = extract_key(arg) {
-            if let Some(entry) = db.remove(key) {
+            // Counting variant: cold-only keys count as removed (D1).
+            let (removed, hot) = db.remove_counting_cold(key);
+            if removed {
                 count += 1;
+            }
+            if let Some(entry) = hot {
                 if should_async_drop(&entry) {
                     // Async drop for large collections: spawn a blocking
                     // task to avoid holding the event loop.

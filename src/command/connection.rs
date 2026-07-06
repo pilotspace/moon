@@ -203,7 +203,10 @@ pub fn info(db: &Database, _args: &[Frame]) -> Frame {
          rdb_last_bgsave_status:{}\r\n\
          aof_enabled:0\r\n\
          aof_rewrite_in_progress:0\r\n\
-         aof_backpressure_dropped:{}\r\n",
+         aof_backpressure_dropped:{}\r\n\
+         spill_batches_flushed:{}\r\n\
+         spill_completions_dropped:{}\r\n\
+         spill_last_heartbeat_ms:{}\r\n",
         if crate::command::persistence::SAVE_IN_PROGRESS.load(std::sync::atomic::Ordering::Relaxed)
         {
             1
@@ -220,6 +223,9 @@ pub fn info(db: &Database, _args: &[Frame]) -> Frame {
         },
         crate::persistence::aof::AOF_BACKPRESSURE_DROPPED
             .load(std::sync::atomic::Ordering::Relaxed),
+        crate::storage::tiered::spill_thread::spill_batches_flushed_total(),
+        crate::storage::tiered::spill_thread::spill_completion_dropped_total(),
+        crate::storage::tiered::spill_thread::spill_last_heartbeat_ms(),
     ));
     sections.push_str("\r\n");
 
