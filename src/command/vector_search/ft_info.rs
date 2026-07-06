@@ -43,6 +43,16 @@ pub fn ft_info(
     for imm in snap.immutable.iter() {
         num_docs += imm.live_count() as usize;
     }
+    // HQ-1 observability (persistence-review R5): exact-rerank coverage.
+    // A segment without the f16 sidecar silently answers with quantized ADC
+    // distances only — surfacing the count makes a dropped sidecar (e.g. an
+    // all-or-nothing GraphUnion merge with one sidecar-less source) visible.
+    let graph_segments = snap.immutable.len();
+    let segments_with_exact_rerank = snap
+        .immutable
+        .iter()
+        .filter(|imm| imm.raw_f16().is_some())
+        .count();
 
     // Use itoa for numeric formatting -- no format!() on hot path.
     let ef_rt_bytes: Bytes = if idx.meta.hnsw_ef_runtime > 0 {
@@ -87,6 +97,10 @@ pub fn ft_info(
         Frame::BulkString(ct_bytes),
         Frame::BulkString(Bytes::from_static(b"QUANTIZATION")),
         Frame::BulkString(quant_bytes),
+        Frame::BulkString(Bytes::from_static(b"graph_segments")),
+        Frame::Integer(graph_segments as i64),
+        Frame::BulkString(Bytes::from_static(b"segments_with_exact_rerank")),
+        Frame::Integer(segments_with_exact_rerank as i64),
     ];
 
     // Per-field stats: vector_fields array
@@ -197,9 +211,10 @@ pub fn ft_info(
 /// from the local response.
 ///
 /// Additive top-level keys: `num_docs`, `num_terms`,
-/// `total_inverted_index_size`, and the freshness tokens
-/// `vector_version_token` / `text_version_token` (each shard's token is
-/// monotonic, so the sum is monotonic too — any shard's write bumps the
+/// `total_inverted_index_size`, the exact-rerank coverage counters
+/// `graph_segments` / `segments_with_exact_rerank` (R5), and the freshness
+/// tokens `vector_version_token` / `text_version_token` (each shard's token
+/// is monotonic, so the sum is monotonic too — any shard's write bumps the
 /// aggregate).
 /// Additive per-field keys (matched by `field_name` inside `vector_fields` /
 /// `text_fields`): `num_docs`, `mutable_vectors`, `immutable_segments`.
@@ -213,6 +228,8 @@ pub fn merge_ft_info_responses(local: Frame, remotes: &[Frame]) -> Frame {
         b"total_inverted_index_size",
         b"vector_version_token",
         b"text_version_token",
+        b"graph_segments",
+        b"segments_with_exact_rerank",
     ];
     const ADDITIVE_FIELD: &[&[u8]] = &[b"num_docs", b"mutable_vectors", b"immutable_segments"];
 
@@ -494,6 +511,32 @@ mod merge_tests {
         assert_eq!(get_int(&entries[0], b"num_docs"), 18);
         assert_eq!(get_int(&entries[0], b"mutable_vectors"), 9);
         assert_eq!(get_int(&entries[0], b"immutable_segments"), 2);
+    }
+
+    #[test]
+    fn sums_exact_rerank_coverage_counters() {
+        // R5: graph_segments / segments_with_exact_rerank are additive so a
+        // sidecar-less segment on ANY shard shows up in the aggregate
+        // (coverage < total ⇒ some segment answers with ADC-only distances).
+        fn frame_with_coverage(total: i64, with_rerank: i64) -> Frame {
+            Frame::Array(
+                vec![
+                    bs(b"index_name"),
+                    bs(b"idx"),
+                    bs(b"graph_segments"),
+                    Frame::Integer(total),
+                    bs(b"segments_with_exact_rerank"),
+                    Frame::Integer(with_rerank),
+                ]
+                .into(),
+            )
+        }
+        let merged = merge_ft_info_responses(
+            frame_with_coverage(3, 3),
+            &[frame_with_coverage(2, 1), frame_with_coverage(1, 0)],
+        );
+        assert_eq!(get_int(&merged, b"graph_segments"), 6);
+        assert_eq!(get_int(&merged, b"segments_with_exact_rerank"), 4);
     }
 
     #[test]

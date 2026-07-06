@@ -27,6 +27,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   monoio conn-local, tokio sharded, SPSC execute, shared batch, MULTI/EXEC).
   New integration suite `tests/vector_flush_hdel_tombstone.rs` (red→green).
 
+### Observability — exact-rerank sidecar coverage is visible and loud (R5)
+
+- A GraphUnion merge with even one sidecar-less source segment silently
+  dropped the exact-rerank f16 sidecar for the ENTIRE merged segment
+  (all-or-nothing propagation — a partial sidecar would mix exact and ADC
+  distances within one segment). The drop now logs a `tracing::warn` with
+  source counts, and FT.INFO exposes additive `graph_segments` /
+  `segments_with_exact_rerank` counters (merged across shards) so ADC-only
+  segments are observable in the steady state.
+
 ### Performance — AE-1: saturation-gated per-segment adaptive ef
 
 - With G graph segments, every segment searched at the FULL resolved ef —

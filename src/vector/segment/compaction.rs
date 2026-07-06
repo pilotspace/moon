@@ -1238,6 +1238,24 @@ fn merge_graph_union(
         .collect();
     entries.sort_by(|a, b| a.0.cmp(&b.0).then(a.6.cmp(&b.6)));
 
+    // R5 (persistence review): a dropped sidecar must be LOUD. The merged
+    // segment loses exact rerank for ALL entries when any source lacks the
+    // sidecar; without a warning this silent recall degradation is invisible
+    // (FT.INFO `segments_with_exact_rerank` exposes the steady state).
+    if !all_have_raw {
+        let with_raw = segments.iter().filter(|s| s.raw_f16().is_some()).count();
+        if with_raw > 0 {
+            tracing::warn!(
+                sources = segments.len(),
+                sources_with_sidecar = with_raw,
+                "GraphUnion merge drops the exact-rerank f16 sidecar for the \
+                 ENTIRE merged segment (all-or-nothing propagation): at least \
+                 one source segment lacks it — merged-segment queries fall \
+                 back to quantized ADC distances (recall degrades, not breaks)"
+            );
+        }
+    }
+
     // ── Step 3: Build TQ buffer (verbatim codes, no re-encode) ───────────────
     let mut tq_buffer_orig: Vec<u8> = Vec::with_capacity(n * bytes_per_code);
     let mut qjl_orig: Vec<u8> = Vec::with_capacity(n * qjl_bpv);
