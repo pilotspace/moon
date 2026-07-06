@@ -464,3 +464,95 @@ fn test_case_d_readonly_eval_not_blocked_at_oom() {
          writes inside a script, not reads"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Case E: cross-db `COPY ... DB n` under memory pressure. `COPY` carries the
+// generic `W` (write) flag (src/command/metadata.rs), so on the cross-shard
+// dispatch arms handler_monoio actually uses for remote writes
+// (`ExecuteSlotted`/`PipelineBatchSlotted`) it hits the SAME generic
+// `is_write` eviction gate cases B/C already exercise — there is no
+// COPY-specific bypass on that path. This case is a targeted regression
+// check that COPY specifically (not just SET) drives that gate to a real
+// OOM under cross-shard load, and locks in the dest-db gate committed in
+// spsc_handler.rs's plain `Execute` arm (used by the single-key remote
+// dispatch path) as a defensive duplicate.
+//
+// NOTE — separate, pre-existing, out-of-scope bug found while writing this
+// case: cross-shard remote dispatch of `COPY ... DB n` silently ignores the
+// DB clause and performs a same-db copy instead (the MOVE/COPY two-database
+// intercept in spsc_handler.rs only exists in the plain `Execute` arm, not
+// `ExecuteSlotted`/`PipelineBatchSlotted`, so remote COPY falls through to
+// the generic single-db `key_extra::copy`). This is a data-correctness bug,
+// independent of eviction — confirmed via manual probe (4/20 remote COPYs
+// landed in the wrong db). Distinct dst keys below deliberately still land
+// in db 0 for the ~3/4 of keys dispatched remotely; this case asserts only
+// on the OOM behavior, not on which db the copy actually landed in.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_case_e_cross_db_copy_oom() {
+    let dir = test_tmpdir();
+    let port = free_port();
+    const MAXMEMORY: u64 = 2 * 1024 * 1024; // 2MB whole-instance cap
+    let _guard = spawn_moon_oom(port, dir.path(), 4, MAXMEMORY);
+    let mut c = wait_ready(port);
+
+    const N: usize = 300;
+    const VALUE_SIZE: usize = 4096; // 4KB — N*VALUE_SIZE ~= 1.2MB, well under the 2MB cap.
+    let value = blob(VALUE_SIZE, b'e');
+
+    // Phase 1: SET N keys in db 0 (default), spread across all 4 shards.
+    // Comfortably under budget — every SET must succeed.
+    let set_cmds: Vec<Vec<Vec<u8>>> = (0..N)
+        .map(|i| {
+            vec![
+                b"SET".to_vec(),
+                format!("e:{i}").into_bytes(),
+                value.clone(),
+            ]
+        })
+        .collect();
+    let set_replies = c.pipeline(&set_cmds);
+    let set_ok = set_replies
+        .iter()
+        .filter(|r| matches!(r, V::Simple(s) if s == "OK"))
+        .count();
+    assert_eq!(
+        set_ok, N,
+        "setup: not all {N} initial SETs succeeded under budget (got {set_ok} OK) \
+         — the phase-1 sizing assumption is wrong, adjust before trusting phase 2"
+    );
+
+    // Phase 2: COPY each key to a DISTINCT dst key (src != dst — required,
+    // Redis rejects same-key COPY regardless of db) — doubles the value's
+    // footprint, pushing per-shard usage past the cap.
+    let copy_cmds: Vec<Vec<Vec<u8>>> = (0..N)
+        .map(|i| {
+            let src = format!("e:{i}").into_bytes();
+            let dst = format!("e:{i}:c").into_bytes();
+            vec![b"COPY".to_vec(), src, dst, b"DB".to_vec(), b"1".to_vec()]
+        })
+        .collect();
+    let copy_replies = c.pipeline(&copy_cmds);
+    assert_eq!(copy_replies.len(), N);
+
+    let oom_count = copy_replies.iter().filter(|r| r.is_oom_error()).count();
+    let ok_count = copy_replies
+        .iter()
+        .filter(|r| matches!(r, V::Int(1)))
+        .count();
+    let other_count = N - oom_count - ok_count;
+
+    // Threshold picked from observed data, same methodology as case B:
+    // pre-fix (git-stashed) run = 0/300 OOM; post-fix = 104/300. N/10 (30)
+    // sits safely above the RED floor and safely below the GREEN observed
+    // count, robust to elastic-budget (GAP-1) variance across CI machines.
+    assert!(
+        oom_count >= N / 10,
+        "cross-shard COPY bypass: expected a substantial share of {N} COPYs \
+         routed via cross-shard SPSC to OOM once their shard's budget is \
+         exhausted, got only {oom_count} OOM / {ok_count} OK / \
+         {other_count} other — COPY is not hitting the generic eviction \
+         gate on the cross-shard write path"
+    );
+}

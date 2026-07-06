@@ -58,18 +58,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   writes (`src/scripting/functions.rs`) keep a documented, pre-existing gap
   (no shard context threaded through the function-library loader) — tracked
   as a follow-up, not closed by this fix.
-- **Cross-db `COPY ... DB n` now enforces `--maxmemory`.** Same SPSC
-  intercept family as above (`src/shard/spsc_handler.rs`) special-cases
-  `MOVE`/`COPY DB` ahead of the generic write path because both need two
-  `&mut Database` borrows at once; `COPY` duplicates the value into the
-  destination db and was missed by the generic gate. Now runs
-  `spsc_eviction_gate` against the destination db before `copy_core`.
-  Same-shard `MOVE` is left ungated (net-zero — the key leaves the source db
-  as it lands in the destination, same rationale as `DEL`).
-- New wire-level regression suite `tests/oom_bypass_closure.rs` (4 cases,
+- **Cross-db `COPY ... DB n` eviction confirmed/hardened.** `COPY` carries
+  the generic `W` write flag, so on the cross-shard dispatch arms
+  `handler_monoio` actually uses for remote writes (`ExecuteSlotted`,
+  `PipelineBatchSlotted`) it already hit the same generic `is_write`
+  eviction gate as any other write command — no COPY-specific bypass exists
+  there. The plain `Execute` arm's `MOVE`/`COPY DB` two-database intercept
+  (special-cased ahead of the generic path because both need two `&mut
+  Database` borrows at once — used by `handler_sharded`'s single-key remote
+  dispatch) *was* missed, since it returns before reaching the generic gate;
+  it now runs `spsc_eviction_gate` against the destination db before
+  `copy_core`. Same-shard `MOVE` is left ungated (net-zero — the key leaves
+  the source db as it lands in the destination, same rationale as `DEL`).
+- **Found, NOT fixed (out of scope): cross-shard remote `COPY ... DB n`
+  silently ignores the DB clause.** The two-database intercept above exists
+  only in the plain `Execute` arm, not `ExecuteSlotted`/`PipelineBatchSlotted`
+  — so when the source key hashes to a different shard than the connection
+  (the common case under `handler_monoio`), `COPY ... DB n` falls through to
+  the generic single-db `key_extra::copy` and silently performs a same-db
+  copy instead of a cross-db one (confirmed via manual probe: 4/20 remote
+  `COPY`s landed in the wrong db). This is a data-correctness bug independent
+  of `--maxmemory` — memory growth from the (wrong) same-db copy is still
+  eviction-gated by the generic path above, so it is not a new OOM bypass,
+  but the DB clause itself does not do what it says. Fixing it requires
+  replicating the two-database intercept across every `ShardMessage` arm (or
+  restructuring it as a shared helper reachable from all of them) — out of
+  scope for this fix, flagged as a follow-up.
+- New wire-level regression suite `tests/oom_bypass_closure.rs` (5 cases,
   both runtimes): direct-SET control (A), cross-shard pipeline (B), Lua EVAL
-  loop (C), read-only EVAL under pressure not blocked (D) — B and C RED
-  before this fix, GREEN after; D locks the write-only scope of the Lua gate.
+  loop (C), read-only EVAL under pressure not blocked (D), cross-shard COPY
+  under pressure (E). B, C and E RED before this fix (E: 0/300 OOM
+  git-stash-verified against the pre-fix tree), GREEN after (E: 104/300); D
+  locks the write-only scope of the Lua gate.
 
 ### Added — int8 symmetric ADC for SQ8 vector search (task #13)
 
