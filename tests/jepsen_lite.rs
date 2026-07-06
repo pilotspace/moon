@@ -31,17 +31,16 @@ const KEYS_PER_WRITER: u64 = 50;
 
 /// Find the Moon binary. Check `target/release/moon` first, then `target/debug/moon`.
 fn find_moon_binary() -> String {
-    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
-    let release = format!("{manifest_dir}/target/release/moon");
-    if std::path::Path::new(&release).exists() {
-        return release;
+    if let Ok(bin) = std::env::var("MOON_BIN") {
+        if std::path::Path::new(&bin).exists() {
+            return bin;
+        }
     }
-    let debug = format!("{manifest_dir}/target/debug/moon");
-    if std::path::Path::new(&debug).exists() {
-        return debug;
-    }
-    // Fall back to PATH
-    "moon".to_string()
+    // The binary cargo built for THIS test run: compile-time path with the
+    // right profile, CARGO_TARGET_DIR, and .exe suffix on Windows (the old
+    // target/{release,debug}/moon probing found nothing on Windows and
+    // could pick a stale release binary).
+    env!("CARGO_BIN_EXE_moon").to_string()
 }
 
 /// Start a Moon server on the given port with AOF appendfsync=always.

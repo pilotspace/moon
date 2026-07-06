@@ -17,6 +17,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   only passed when libtest scheduled it onto a harness thread where an
   earlier test had left a `ShardSlice` behind — a latent order-dependent
   flake on all platforms that failed deterministically on Windows CI.
+- All 8 `find_moon_binary` test helpers now fall back to
+  `env!("CARGO_BIN_EXE_moon")` (after the `MOON_BIN` override) instead of
+  probing `target/{release,debug}/moon`: the old probing found nothing on
+  Windows (missing `.exe`), ignored `CARGO_TARGET_DIR`, and preferred a
+  possibly-stale release binary over the one cargo just built for the run.
+- New `MOON_DISK_FREE_MIN_PCT` env override for `--disk-free-min-pct`
+  (clap `env` feature; CLI flag still wins). Windows CI exports it as `0`:
+  windows-latest runners sit below the 5% free-disk default, so every
+  server-spawning suite failed with `MOONERR diskfull` instead of `OK`.
+- `shardslice_shape.rs::split_off_test_module` computed line offsets with a
+  1-byte `\n` assumption; on CRLF checkouts (Windows runners set
+  `core.autocrlf=true`) the split point drifted one byte per line and
+  panicked slicing inside a multibyte comment char. Now uses
+  `split_inclusive('\n')` for byte-exact offsets on both line endings.
 
 ### Changed — consolidated dependency bumps (PR #TBD)
 

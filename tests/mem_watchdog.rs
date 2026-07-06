@@ -39,16 +39,11 @@ fn find_moon_binary() -> std::path::PathBuf {
             return p;
         }
     }
-    let manifest = env!("CARGO_MANIFEST_DIR");
-    let release = std::path::PathBuf::from(format!("{manifest}/target/release/moon"));
-    if release.exists() {
-        return release;
-    }
-    let debug = std::path::PathBuf::from(format!("{manifest}/target/debug/moon"));
-    if debug.exists() {
-        return debug;
-    }
-    panic!("No moon binary found. Build first or set MOON_BIN=/path/to/moon.");
+    // Fall back to the binary cargo built for THIS test run: compile-time
+    // path with the right profile, CARGO_TARGET_DIR, and .exe suffix on
+    // Windows (the old target/{release,debug}/moon probing found nothing on
+    // Windows and could pick a stale release binary).
+    std::path::PathBuf::from(env!("CARGO_BIN_EXE_moon"))
 }
 
 /// Ports below 20000 collide with other services in CI/dev; pick a free one

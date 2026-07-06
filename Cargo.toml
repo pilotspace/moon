@@ -25,7 +25,7 @@ atomic-waker = "1"
 # runtime-tokio adds the full feature set (multi-thread, io-util, signal, etc.).
 tokio = { version = "1", features = ["rt", "net", "macros"] }
 tokio-util = { version = "0.7", features = ["codec"], optional = true }
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 anyhow = "1"
