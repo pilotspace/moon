@@ -123,7 +123,7 @@ Returns up to `k` nearest neighbors. The query vector must be a binary blob of `
 ```
 FT.INFO <index>
 ```
-Returns index configuration: name, dimension, metric, quantization, build_mode.
+Returns index configuration (name, dimension, metric, quantization, build_mode) plus observability counters, additive across shards: `graph_segments` (immutable HNSW segment count) and `segments_with_exact_rerank` (how many of those segments still carry the f16 exact-rerank sidecar). Coverage below `graph_segments` means some segments answer with quantized ADC-only distances — a GraphUnion merge that drops a sidecar logs a `tracing::warn` when it happens.
 
 ### FT.COMPACT
 ```
@@ -136,6 +136,12 @@ Force compaction of the mutable segment into an HNSW immutable segment. Normally
 FT.DROPINDEX <index>
 ```
 Drop the index and free all associated memory.
+
+### FLUSHALL / FLUSHDB / HDEL
+
+`FLUSHALL` and `FLUSHDB` clear every vector (and text) index's contents — segments, key-hash maps, postings — while KEEPING the `FT.CREATE` definition. This matches what a restart produces today: vector/text index contents are always rebuilt from the keyspace on restart (only the `FT.CREATE` definition is durable). Moon's FT indexes are keyspace-global, so `FLUSHDB` on any logical database clears all index contents.
+
+`HDEL key <vector-field>` tombstones that key in exactly the indexes whose vector field was removed (a sibling index keyed on a different field keeps its entry). Whole-key deletion (`DEL`/`UNLINK`) already tombstoned every index. Known limitations: an index with multiple vector fields tombstones the *whole* document if any one of its vector fields is removed (a later `HSET` re-indexes the remainder), and `TEXT`/`TAG`/`NUMERIC` field removal via `HDEL` is not yet re-indexed.
 
 ## How It Works
 
@@ -155,13 +161,15 @@ Triggered automatically on first search when mutable segment has ≥ `COMPACT_TH
 4. BFS-reorder for cache locality
 5. Compute sub-centroid sign bits (doubles quantization resolution: 16 → 32 levels)
 6. Create immutable segment
+7. **Adaptive-ef self-probe (AE-1):** 16 leave-self-out sample queries measure R@10 against the segment's own exact f16 sidecar across an ef ladder (24..256). A fully-saturated curve (flat ≈1.0 from the minimum rung) certifies the segment as "trivially easy" for min-ef search; every other segment keeps the full resolved ef at query time. In-memory only — not persisted, so a segment reloaded from disk always searches at the full beam.
 
 ### Search Path
 1. Query vector → normalize → FWHT rotate
 2. Build per-query LUT: precomputed distance² for each sub-centroid (32 entries × dim, fits L1 cache)
-3. **HNSW beam search** with 32-level sub-centroid LUT scoring (no separate rerank needed)
-4. Merge results from mutable (brute-force) + immutable (HNSW) segments
-5. Return top-K results
+3. **HNSW beam search** with 32-level sub-centroid LUT scoring. Beam width (`ef`) is the full resolved value, unless the segment's compact-time saturation probe (AE-1, above) certified it "trivially easy" — then it searches at min-ef (24) instead. Never overridden when the user pins `EF_RUNTIME`.
+4. **Exact rerank:** the top `4·k` beam candidates are re-scored against the segment's f16 sidecar with true metric distances (SIMD: NEON integer-rescale on aarch64, F16C+FMA on x86_64, scalar fallback) before truncation. Segments without a sidecar (pre-HQ-1 reload, or a GraphUnion merge that dropped one) fall back to quantized ADC-only distances — check `FT.INFO`'s `segments_with_exact_rerank` for coverage.
+5. Merge results from mutable (brute-force) + immutable (HNSW) segments
+6. Return top-K results
 
 ## Memory Usage
 
