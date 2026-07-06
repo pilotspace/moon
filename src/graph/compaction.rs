@@ -26,7 +26,7 @@ use smallvec::SmallVec;
 use crate::graph::csr::{CsrError, CsrSegment, CsrStorage};
 use crate::graph::index::{EdgeTypeIndex, LabelIndex, MphNodeIndex};
 use crate::graph::store::GraphStore;
-use crate::graph::types::{EdgeMeta, GraphSegmentHeader, NodeMeta};
+use crate::graph::types::{EdgeMeta, GraphSegmentHeader, NodeKey, NodeMeta};
 
 // ---------------------------------------------------------------------------
 // GraphCompactStats — returned by run_graph_vacuum_pass
@@ -225,6 +225,11 @@ struct MergedEdge {
     /// Per-edge wall-clock stamp carried through the merge (0 = unknown,
     /// e.g. input segment predates the version 3 format).
     created_ms: u64,
+    /// Index of the winning source segment (for property-record carry-over).
+    src_seg: usize,
+    /// Raw `EdgeMeta::property_offset` in the winning segment's edge blob
+    /// (offset+1 scheme; 0 = no record).
+    src_prop_offset: u32,
 }
 
 /// Compact multiple CSR segments into one with Rabbit Order reordering.
@@ -270,7 +275,7 @@ pub fn compact_segments(
     let mut edge_map: std::collections::HashMap<(u32, u32, u16), MergedEdge> =
         std::collections::HashMap::new();
 
-    for seg in segments {
+    for (seg_idx, seg) in segments.iter().enumerate() {
         let seg_node_meta = seg.node_meta();
         let seg_row_offsets = seg.row_offsets();
         let seg_col_indices = seg.col_indices();
@@ -306,6 +311,8 @@ pub fn compact_segments(
                     created_lsn: seg.created_lsn(),
                     // Checked access: empty slice for pre-v3 input segments.
                     created_ms: seg_edge_created_ms.get(edge_idx).copied().unwrap_or(0),
+                    src_seg: seg_idx,
+                    src_prop_offset: em.property_offset,
                 };
 
                 edge_map
@@ -359,16 +366,24 @@ pub fn compact_segments(
 
     let edge_count = reordered_edges.len();
 
-    // Build col_indices, edge_meta, and the parallel created_ms array.
+    // Build col_indices, edge_meta, the parallel created_ms array, and carry
+    // each winning edge's weight/property record into the merged blob (v5).
     let mut col_indices = Vec::with_capacity(edge_count);
     let mut edge_meta_vec = Vec::with_capacity(edge_count);
     let mut edge_created_ms_vec = Vec::with_capacity(edge_count);
+    let mut merged_edge_props: Vec<u8> = Vec::new();
     for e in &reordered_edges {
         col_indices.push(e.dst_row);
+        let property_offset = crate::graph::csr::props::copy_record(
+            &mut merged_edge_props,
+            segments[e.src_seg].edge_props_blob(),
+            e.src_prop_offset,
+            crate::graph::csr::props::edge_record_len,
+        );
         edge_meta_vec.push(EdgeMeta {
             edge_type: e.edge_type,
             flags: e.flags,
-            property_offset: 0,
+            property_offset,
         });
         edge_created_ms_vec.push(e.created_ms);
     }
@@ -390,7 +405,11 @@ pub fn compact_segments(
         std::collections::HashMap::with_capacity(node_count);
     let mut best_overflow: std::collections::HashMap<u64, SmallVec<[u16; 4]>> =
         std::collections::HashMap::new();
-    for seg in segments {
+    // Winning segment index per external_id, so the node's property record can
+    // be carried over from the SAME segment as its metadata (v5).
+    let mut best_node_seg: std::collections::HashMap<u64, usize> =
+        std::collections::HashMap::with_capacity(node_count);
+    for (seg_idx, seg) in segments.iter().enumerate() {
         let seg_overflow = seg.label_overflow();
         for (row, nm) in seg.node_meta().iter().enumerate() {
             // Same tie-break as before: take the first occurrence, then replace
@@ -400,12 +419,14 @@ pub fn compact_segments(
                 None => true,
             };
             if take {
+                best_node_seg.insert(nm.external_id, seg_idx);
                 best_node_meta.insert(
                     nm.external_id,
                     NodeMeta {
                         external_id: nm.external_id,
                         label_bitmap: nm.label_bitmap,
-                        property_offset: 0,
+                        // Source-segment offset, rewritten to the merged blob below.
+                        property_offset: nm.property_offset,
                         created_lsn: nm.created_lsn,
                         deleted_lsn: nm.deleted_lsn,
                         valid_from: nm.valid_from,
@@ -429,14 +450,26 @@ pub fn compact_segments(
     // Re-key label overflow from external_id -> the node's NEW merged row. (A2)
     let mut merged_overflow: std::collections::HashMap<u32, SmallVec<[u16; 4]>> =
         std::collections::HashMap::new();
+    let mut merged_node_props: Vec<u8> = Vec::new();
     for new_row in 0..node_count {
         let old_row = inv_perm[new_row] as usize;
         let ext_id = all_node_ids[old_row];
         if let Some(nm) = best_node_meta.get(&ext_id) {
+            // Carry the winning node's property/embedding record (v5) from its
+            // winning segment into the merged blob.
+            let property_offset = match best_node_seg.get(&ext_id) {
+                Some(&seg_idx) => crate::graph::csr::props::copy_record(
+                    &mut merged_node_props,
+                    segments[seg_idx].node_props_blob(),
+                    nm.property_offset,
+                    crate::graph::csr::props::node_record_len,
+                ),
+                None => 0,
+            };
             node_meta_vec.push(NodeMeta {
                 external_id: nm.external_id,
                 label_bitmap: nm.label_bitmap,
-                property_offset: 0,
+                property_offset,
                 created_lsn: nm.created_lsn,
                 deleted_lsn: nm.deleted_lsn,
                 valid_from: nm.valid_from,
@@ -464,11 +497,19 @@ pub fn compact_segments(
         validity.insert(i);
     }
 
-    // Build node_id_to_row from reordered node_meta.
-    // We don't have NodeKey here (compaction works at external_id level),
-    // so leave node_id_to_row empty -- lookup by NodeKey requires the
-    // GraphStore to maintain a separate mapping.
-    let node_id_to_row = std::collections::HashMap::new();
+    // Rebuild node_id_to_row + MPH from reordered node_meta. external_id IS
+    // the NodeKey ffi encoding (KeyData::from_ffi reverses it) — the same
+    // reconstruction from_bytes/from_mmap_file already do on load. Previously
+    // both were left EMPTY here, making a freshly merged in-memory segment
+    // unresolvable by NodeKey (lookup_node → None) until persisted + reloaded.
+    let mut node_id_to_row: std::collections::HashMap<NodeKey, u32> =
+        std::collections::HashMap::with_capacity(node_count);
+    let mut row_keys: Vec<NodeKey> = Vec::with_capacity(node_count);
+    for (row, nm) in node_meta_vec.iter().enumerate() {
+        let nk = NodeKey::from(slotmap::KeyData::from_ffi(nm.external_id));
+        node_id_to_row.insert(nk, row as u32);
+        row_keys.push(nk);
+    }
 
     // Compute min/max external IDs.
     let min_node_id = all_node_ids.first().copied().unwrap_or(0);
@@ -507,8 +548,8 @@ pub fn compact_segments(
         label_overflow_offset: 0,  // populated during serialization
     };
 
-    // Build indexes from compacted data. MPH is empty (no NodeKeys in compaction).
-    let mph = MphNodeIndex::build(&[]);
+    // Build indexes from compacted data (MPH from the reconstructed row keys).
+    let mph = MphNodeIndex::build(&row_keys);
     let label_index = LabelIndex::build(&node_meta_vec, &merged_overflow);
     let edge_type_index = EdgeTypeIndex::build(&edge_meta_vec);
 
@@ -525,6 +566,8 @@ pub fn compact_segments(
         label_index,
         label_overflow: merged_overflow,
         edge_type_index,
+        node_props: merged_node_props,
+        edge_props: merged_edge_props,
         created_lsn,
         incoming: std::sync::OnceLock::new(),
     })
@@ -756,6 +799,76 @@ mod tests {
 
         assert_eq!(merged.edge_count(), 1);
         assert_eq!(merged.edge_created_ms, vec![20_000]);
+    }
+
+    #[test]
+    fn test_compact_carries_props_and_node_key_lookup() {
+        // v5: node property/embedding records and edge weight/property records
+        // survive the merge, and the merged segment resolves NodeKeys directly
+        // (previously node_id_to_row + MPH were left EMPTY by compact_segments,
+        // so an in-memory merged segment was unreachable via lookup_node).
+        use crate::graph::types::PropertyValue;
+        let mut mg = MemGraph::new(100_000);
+        let props: crate::graph::types::PropertyMap = smallvec![
+            (1u16, PropertyValue::Int(41)),
+            (
+                3u16,
+                PropertyValue::String(bytes::Bytes::from_static(b"carol"))
+            ),
+        ];
+        let a = mg.add_node(smallvec![0], props, Some(vec![0.5f32, 0.25]), 1);
+        let b = mg.add_node(smallvec![0], smallvec![], None, 1);
+        let eprops: crate::graph::types::PropertyMap =
+            smallvec![(9u16, PropertyValue::Float(6.5))];
+        mg.add_edge(a, b, 1, 3.5, Some(eprops), 2).expect("ok");
+        let seg1 = Arc::new(CsrStorage::from(
+            CsrSegment::from_frozen(mg.freeze().expect("ok"), 10).expect("ok"),
+        ));
+        let seg2 = Arc::new(CsrStorage::from(make_csr(2, &[(1, 0)], 20)));
+
+        let config = CompactionConfig {
+            min_segments: 2,
+            max_segment_edges: 1_000_000,
+        };
+        let merged = compact_segments(&[seg1, seg2], &config).expect("ok");
+
+        // NodeKey lookup now works on the freshly merged in-memory segment.
+        let row_a = merged.lookup_node(a).expect("merged lookup_node(a)");
+        let row_b = merged.lookup_node(b).expect("merged lookup_node(b)");
+
+        let pa = merged.node_properties(row_a);
+        assert!(pa.contains(&(1u16, PropertyValue::Int(41))));
+        assert!(pa.contains(&(
+            3u16,
+            PropertyValue::String(bytes::Bytes::from_static(b"carol"))
+        )));
+        assert_eq!(merged.node_embedding(row_a), Some(vec![0.5f32, 0.25]));
+        assert!(merged.node_properties(row_b).is_empty());
+
+        // The a->b edge kept its weight + props through the merge.
+        let sa = merged.row_offsets[row_a as usize];
+        let ea = merged.row_offsets[row_a as usize + 1];
+        let mut found = false;
+        for idx in sa..ea {
+            if merged.col_indices[idx as usize] == row_b {
+                assert_eq!(merged.edge_weight(idx), 3.5);
+                assert_eq!(
+                    merged.edge_properties(idx).as_slice(),
+                    &[(9u16, PropertyValue::Float(6.5))]
+                );
+                found = true;
+            }
+        }
+        assert!(found, "a->b edge must exist in the merged segment");
+
+        // And everything survives a serialize/parse roundtrip.
+        let parsed = CsrSegment::from_bytes(&merged.to_bytes()).expect("parse ok");
+        let prow_a = parsed.lookup_node(a).expect("parsed lookup_node(a)");
+        assert_eq!(
+            parsed.node_embedding(prow_a),
+            Some(vec![0.5f32, 0.25]),
+            "embedding must survive merge + roundtrip"
+        );
     }
 
     #[test]

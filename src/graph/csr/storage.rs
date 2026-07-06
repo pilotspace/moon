@@ -305,6 +305,62 @@ impl CsrStorage {
         }
     }
 
+    /// Node property blob (empty for pre-v5 segments).
+    pub fn node_props_blob(&self) -> &[u8] {
+        match self {
+            CsrStorage::Heap(s) => &s.node_props,
+            CsrStorage::Mmap(s) => s.node_props_blob(),
+        }
+    }
+
+    /// Edge property blob (empty for pre-v5 segments).
+    pub fn edge_props_blob(&self) -> &[u8] {
+        match self {
+            CsrStorage::Heap(s) => &s.edge_props,
+            CsrStorage::Mmap(s) => s.edge_props_blob(),
+        }
+    }
+
+    /// Node properties for a CSR row (empty for none / pre-v5 segments).
+    pub fn node_properties(&self, row: u32) -> crate::graph::types::PropertyMap {
+        match self {
+            CsrStorage::Heap(s) => s.node_properties(row),
+            CsrStorage::Mmap(s) => s.node_properties(row),
+        }
+    }
+
+    /// Single node property lookup without materializing the map.
+    pub fn node_property(&self, row: u32, key: u16) -> Option<crate::graph::types::PropertyValue> {
+        match self {
+            CsrStorage::Heap(s) => s.node_property(row, key),
+            CsrStorage::Mmap(s) => s.node_property(row, key),
+        }
+    }
+
+    /// Node embedding for a CSR row (None for none / pre-v5 segments).
+    pub fn node_embedding(&self, row: u32) -> Option<Vec<f32>> {
+        match self {
+            CsrStorage::Heap(s) => s.node_embedding(row),
+            CsrStorage::Mmap(s) => s.node_embedding(row),
+        }
+    }
+
+    /// Edge weight by edge index (1.0 default / pre-v5 segments).
+    pub fn edge_weight(&self, edge_idx: u32) -> f64 {
+        match self {
+            CsrStorage::Heap(s) => s.edge_weight(edge_idx),
+            CsrStorage::Mmap(s) => s.edge_weight(edge_idx),
+        }
+    }
+
+    /// Edge properties by edge index (empty for none / pre-v5 segments).
+    pub fn edge_properties(&self, edge_idx: u32) -> crate::graph::types::PropertyMap {
+        match self {
+            CsrStorage::Heap(s) => s.edge_properties(edge_idx),
+            CsrStorage::Mmap(s) => s.edge_properties(edge_idx),
+        }
+    }
+
     /// Write the segment to a file (only supported for Heap variant).
     /// For Mmap variant, the file already exists on disk.
     pub fn write_to_file(&self, path: &Path) -> Result<(), CsrError> {
