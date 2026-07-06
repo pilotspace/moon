@@ -269,6 +269,10 @@ pub fn execute(
 
                 let committed = roaring::RoaringBitmap::new();
                 let view = crate::graph::view::MergedNodeView::new(memgraph, csr_segs);
+                // Scratch reused across every neighbor lookup in this Expand
+                // (the allocating `neighbors()` built a HashSet+Vec per call).
+                let mut nb_seen = crate::graph::fasthash::FxHashSet::default();
+                let mut nb_buf: Vec<crate::graph::traversal::MergedNeighbor> = Vec::new();
                 let mut new_rows = Vec::new();
                 for row in &rows {
                     let src_key = match row.get(source) {
@@ -278,7 +282,8 @@ pub fn execute(
 
                     if *max_hops <= 1 {
                         // Single-hop expansion via SegmentMergeReader.
-                        for merged in reader.neighbors(src_key) {
+                        reader.neighbors_into(src_key, &mut nb_seen, &mut nb_buf);
+                        for merged in &nb_buf {
                             // Multi-type filter (SegmentMergeReader handles
                             // single-type; we need extra check for multi-type).
                             if type_ids.len() > 1 && !type_ids.contains(&merged.edge_type) {
@@ -313,13 +318,14 @@ pub fn execute(
                         let capped_max_hops = (*max_hops).min(MAX_HOPS_LIMIT);
 
                         let mut frontier = vec![src_key];
-                        let mut visited = std::collections::HashSet::new();
+                        let mut visited = crate::graph::fasthash::FxHashSet::default();
                         visited.insert(src_key);
 
                         for hop in 1..=capped_max_hops {
                             let mut next_frontier = Vec::new();
                             for &current in &frontier {
-                                for merged in reader.neighbors(current) {
+                                reader.neighbors_into(current, &mut nb_seen, &mut nb_buf);
+                                for merged in &nb_buf {
                                     if visited.contains(&merged.node) {
                                         continue;
                                     }
@@ -803,6 +809,10 @@ pub fn execute_profile(
 
                 let committed = roaring::RoaringBitmap::new();
                 let view = crate::graph::view::MergedNodeView::new(memgraph, csr_segs);
+                // Scratch reused across every neighbor lookup in this Expand
+                // (the allocating `neighbors()` built a HashSet+Vec per call).
+                let mut nb_seen = crate::graph::fasthash::FxHashSet::default();
+                let mut nb_buf: Vec<crate::graph::traversal::MergedNeighbor> = Vec::new();
                 let mut new_rows = Vec::new();
                 for row in &rows {
                     let src_key = match row.get(source) {
@@ -811,7 +821,8 @@ pub fn execute_profile(
                     };
 
                     if *max_hops <= 1 {
-                        for merged in reader.neighbors(src_key) {
+                        reader.neighbors_into(src_key, &mut nb_seen, &mut nb_buf);
+                        for merged in &nb_buf {
                             if type_ids.len() > 1 && !type_ids.contains(&merged.edge_type) {
                                 continue;
                             }
@@ -843,13 +854,14 @@ pub fn execute_profile(
                         let capped_max_hops = (*max_hops).min(MAX_HOPS_LIMIT);
 
                         let mut frontier = vec![src_key];
-                        let mut visited = std::collections::HashSet::new();
+                        let mut visited = crate::graph::fasthash::FxHashSet::default();
                         visited.insert(src_key);
 
                         for hop in 1..=capped_max_hops {
                             let mut next_frontier = Vec::new();
                             for &current in &frontier {
-                                for merged in reader.neighbors(current) {
+                                reader.neighbors_into(current, &mut nb_seen, &mut nb_buf);
+                                for merged in &nb_buf {
                                     if visited.contains(&merged.node) {
                                         continue;
                                     }

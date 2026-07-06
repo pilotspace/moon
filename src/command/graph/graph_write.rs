@@ -124,17 +124,6 @@ pub fn graph_addnode(store: &mut GraphStore, args: &[Frame]) -> Frame {
 
     let lsn = store.allocate_lsn();
 
-    // Serialize WAL record first using borrowed refs (before moving into add_node).
-    // This eliminates the expensive embedding.clone() (up to 6KB for 1536-dim f32).
-    // We use external_id=0 as placeholder, then fix it after add_node.
-    let wal_record_no_id = wal::serialize_add_node(
-        graph_name,
-        0, // placeholder
-        &labels,
-        &properties,
-        embedding.as_deref(),
-    );
-
     // Scoped borrow of graph for mutation, then release for WAL push.
     let external_id = {
         let graph = match store.get_graph_mut(graph_name) {
@@ -176,12 +165,9 @@ pub fn graph_addnode(store: &mut GraphStore, args: &[Frame]) -> Frame {
         ext_id
     };
 
-    // Re-serialize the WAL record with the actual external_id.
-    // This is cheap — WAL serialization is just RESP encoding of small fields.
-    // The expensive embedding data was already consumed by add_node, but the
-    // WAL record was pre-built from refs. We drop the placeholder and rebuild
-    // from the stored node refs (no clone — just borrows).
-    drop(wal_record_no_id);
+    // Serialize the WAL record from the stored node's refs — a single
+    // serialization with the real external_id, no clones (the expensive
+    // embedding was moved into add_node and is borrowed back here).
     if let Some(graph) = store.get_graph(graph_name) {
         let nk = crate::graph::types::NodeKey::from(slotmap::KeyData::from_ffi(external_id));
         if let Some(node) = graph.write_buf.get_node(nk) {
