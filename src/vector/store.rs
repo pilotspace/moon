@@ -2664,6 +2664,43 @@ mod bg_compact_tests {
     /// graph — multiple segments are what the intra-query worker pool fans
     /// out over. All keys must remain findable (self-recall probe).
     #[test]
+    fn test_compact_measures_suggested_ef() {
+        // AE-1: a compact build with a sidecar must attach a suggested ef
+        // from the ladder; tiny/no-sidecar segments stay None (checked by
+        // the estimator's own guards).
+        distance::init();
+        crate::vector::search_pool::init_global(1);
+        let dim = 16u32;
+        let mut store = VectorStore::new();
+        let mut meta = make_idx(dim);
+        meta.compact_threshold = 200;
+        store.create_index(meta).unwrap();
+        for i in 0..400u64 {
+            insert(
+                &mut store,
+                format!("doc:{i}").as_bytes(),
+                random_vec(dim as usize, i),
+            );
+        }
+        store.force_compact_index(b"idx").unwrap();
+        let idx = store.indexes.get_mut(b"idx".as_ref()).unwrap();
+        let snap = idx.segments.load_full();
+        assert!(!snap.immutable.is_empty());
+        for seg in &snap.immutable {
+            let sug = seg.suggested_ef();
+            assert!(
+                sug.is_some(),
+                "compact build with sidecar must measure an adaptive ef"
+            );
+            let sug = sug.unwrap() as usize;
+            assert!(
+                (24..=256).contains(&sug),
+                "ladder value expected, got {sug}"
+            );
+        }
+    }
+
+    #[test]
     fn test_force_compact_bulk_bounded_segments() {
         distance::init();
         // Bounded bulk builds are gated on an active intra-query search pool.

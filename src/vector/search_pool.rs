@@ -289,6 +289,7 @@ mod tests {
             mutable_len,
             scratch: SearchScratch::new(0, padded_dimension(dim)),
             key_hash_to_key: idx.key_hash_to_key.clone(),
+            ef_defaulted: false,
         }
     }
 
@@ -372,6 +373,7 @@ mod tests {
                             mutable_len: segments.mutable.len(),
                             scratch: SearchScratch::new(0, padded_dimension(dim)),
                             key_hash_to_key: key_map.clone(),
+                            ef_defaulted: false,
                         };
                         let results = futures::executor::block_on(
                             SegmentHolder::search_mvcc_yielding_with_pool(

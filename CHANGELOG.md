@@ -6,18 +6,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Performance — EF-SPLIT: per-segment beam reduction on multi-segment indexes
+### Performance — AE-1: saturation-gated per-segment adaptive ef
 
 - With G graph segments, every segment searched at the FULL resolved ef —
   ~G× the CPU of one ef-wide beam (the root cause of the pooled regression
-  on SMT-constrained boxes in PR #214's GCE run). Each graph-tier segment
-  now searches at `max(ef/√G, quota, 24)` — merged candidate mass stays
-  ~ef·√G, a strict oversample of the single-graph baseline. Applied
-  identically to the sync, serial-yielding, and worker-pool paths, so
-  pooled == serial identity holds (tests unchanged and green).
-- Recall gate (same data/seeds as the sidecar A/B): 5-segment clustered
-  R@10 1.0000 → 1.0000, gaussian 0.9915 → 0.9915 — recall preserved to 4
-  decimals while per-segment ef drops 300 → 135.
+  on SMT-constrained boxes in PR #214's GCE run). Compact/GraphUnion builds
+  now run a one-time self-probe against the exact f16-sidecar ground truth
+  (leave-self-out R@10 across an ef ladder, `estimate_suggested_ef`): a
+  segment whose curve is FULLY SATURATED from the minimum rung (flat at
+  ≈1.0) is certified trivially easy and searches at min-ef (24); every
+  other segment keeps the full resolved ef. Applied identically to the
+  sync, serial-yielding, and worker-pool paths (pooled == serial identity
+  holds); never active when the user pins `EF_RUNTIME`; in-memory only
+  (reloaded segments fall back to the full beam).
+- Two weaker designs were tried and REJECTED by recall A/B (20k×384d SQ8,
+  5 segments): a blanket `ef/√G` split (EF-SPLIT) silently cost gaussian
+  R@10 0.9915 → 0.9295 (its original "recall preserved" validation had
+  exercised a stale binary), and letting the self-probe pick a mid-ladder
+  knee cost 0.9915 → 0.939 — self-sampled queries are optimistically
+  biased on unstructured data, so the probe's ONLY trustworthy verdict is
+  "saturated at min-ef".
+- Recall/latency gate (same seeds/harness end-to-end): clustered 5-seg
+  R@10 1.0000 at p50 0.79 → 0.26 ms (~3×), clustered 1-seg 1.0000 → 0.9960
+  (within the probe's ε=0.005 contract) at 1.78 → 1.46 ms; gaussian 5-seg
+  0.9915 at ~0.79 ms and 1-seg 0.7710 — byte-identical to the pre-split
+  baseline (probe self-rejects, full beam).
 
 ### Performance — FT.SEARCH per-query fixed-cost cleanup (QP-2/QP-3)
 

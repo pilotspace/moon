@@ -24,34 +24,12 @@ use super::mutable::{MutableEntry, MutableSegment};
 /// Default number of IVF clusters to probe during search.
 const DEFAULT_NPROBE: usize = 32;
 
-/// EF-SPLIT beam floor: below this the per-segment beam degenerates (entry
-/// descent dominates and recall falls off a cliff), so the reduction never
-/// goes under it regardless of segment count.
-const EF_SPLIT_MIN: usize = 24;
-
-/// EF-SPLIT: per-segment beam width when the graph tier spans multiple
-/// segments.
-///
-/// With G graph segments each holding ~1/G of the corpus, searching every
-/// segment at the full resolved `ef` does ~G× the work of one ef-wide beam
-/// over a single graph — the root cause of the multi-segment regression on
-/// SMT-constrained boxes. `ef/√G` keeps the merged candidate mass at ~ef·√G:
-/// still a strict oversample versus the single-graph baseline (each segment
-/// returns its LOCAL nearest, so the merge sees at least as much of the true
-/// top-k neighborhood; recall A/B in the PR held recall within noise on
-/// clustered + gaussian at 5 segments). Floors: `floor` (the merge's
-/// per-segment quota — HNSW must be able to return that many) and
-/// [`EF_SPLIT_MIN`]; never exceeds `ef`.
-///
-/// Applied identically on the serial sync path, the serial yielding path,
-/// and the worker-pool fan-out, so pooled == serial identity holds.
-pub(crate) fn per_segment_ef(ef: usize, graph_segments: usize, floor: usize) -> usize {
-    if graph_segments <= 1 {
-        return ef;
-    }
-    let reduced = (ef as f64 / (graph_segments as f64).sqrt()).ceil() as usize;
-    reduced.max(floor).max(EF_SPLIT_MIN).min(ef)
-}
+// Per-segment beam policy (AE-1): every graph segment searches at the FULL
+// resolved ef unless its compact-time saturation probe certified it as
+// trivially easy (`ImmutableSegment::suggested_ef`), in which case min-ef
+// suffices. A blanket `ef/√G` split was tried first (EF-SPLIT) and REJECTED:
+// it silently cost R@10 0.9915 → 0.9295 on gaussian 5-seg — a per-segment
+// beam reduction is only safe when the segment itself proves it saturates.
 
 /// MVCC context for snapshot-isolated search. Passed by reference, zero allocation.
 pub struct MvccContext<'a> {
@@ -61,6 +39,10 @@ pub struct MvccContext<'a> {
     /// Dirty set: uncommitted entries from the active transaction.
     pub dirty_set: &'a [MutableEntry],
     pub dimension: u32,
+    /// AE-1: true when `ef_search` came from the resolution heuristic (no
+    /// user `EF_RUNTIME`) — saturation-certified segments may then run at
+    /// their min-ef estimate. Always false when the user pinned ef.
+    pub ef_defaulted: bool,
 }
 
 /// Snapshot of all segments at a point in time.
@@ -177,6 +159,10 @@ pub struct SearchSnapshot {
     /// builder, not the segment scan. `Arc` snapshot: capture is O(1); writers
     /// copy-on-write via `Arc::make_mut` (QP-1).
     pub key_hash_to_key: std::sync::Arc<std::collections::HashMap<u64, bytes::Bytes>>,
+    /// AE-1: true when `ef_search` came from the resolution heuristic (no
+    /// user `EF_RUNTIME`) — saturation-certified segments may then run at
+    /// their min-ef estimate.
+    pub ef_defaulted: bool,
 }
 
 /// Lock-free segment holder. Searches load() once at query start and hold
@@ -313,9 +299,9 @@ impl SegmentHolder {
             None // Light mode: no QJL matrices, use TQ-ADC brute force
         };
 
-        // EF-SPLIT: divide the beam across graph segments (see per_segment_ef).
-        let graph_segs = snapshot.immutable.len() + snapshot.warm.len();
-        let graph_ef = per_segment_ef(ef_search, graph_segs, k);
+        // Full resolved ef per segment (no ef_defaulted context on this path,
+        // so the AE-1 per-segment reduction never applies here).
+        let graph_ef = ef_search;
 
         match strategy {
             FilterStrategy::Unfiltered => {
@@ -391,7 +377,7 @@ impl SegmentHolder {
                     oversample_k,
                     filter_bitmap,
                 ));
-                let post_ef = per_segment_ef(ef_search.max(oversample_k), graph_segs, oversample_k);
+                let post_ef = ef_search.max(oversample_k);
                 for imm in &snapshot.immutable {
                     let imm_results = imm.search(query_f32, oversample_k, post_ef, _scratch);
                     if let Some(bm) = filter_bitmap {
@@ -530,13 +516,23 @@ impl SegmentHolder {
         // 2. HNSW search on immutable segments (TQ-ADC distance).
         // Immutable segment entries are committed by definition (compacted only
         // after commit). No visibility post-filter needed for Phase 65.
-        // EF-SPLIT: divide the beam across graph segments (see per_segment_ef).
-        let graph_ef = per_segment_ef(ef_search, snapshot.immutable.len() + snapshot.warm.len(), k);
+        // AE-1: heuristic-defaulted ef → a saturation-certified segment runs
+        // at its compact-time min-ef estimate (floored by k, capped by the
+        // resolved ef); every other segment gets the FULL resolved ef.
+        // Mirrors the yielding path's selector exactly.
+        let graph_ef = ef_search;
+        let seg_ef = |suggested: Option<u32>| -> usize {
+            match suggested {
+                Some(sug) if mvcc.ef_defaulted => (sug as usize).max(k).min(ef_search),
+                _ => graph_ef,
+            }
+        };
         for imm in &snapshot.immutable {
+            let ef_i = seg_ef(imm.suggested_ef());
             if filter_bitmap.is_some() {
-                all.extend(imm.search_filtered(query_f32, k, graph_ef, _scratch, filter_bitmap));
+                all.extend(imm.search_filtered(query_f32, k, ef_i, _scratch, filter_bitmap));
             } else {
-                all.extend(imm.search(query_f32, k, graph_ef, _scratch));
+                all.extend(imm.search(query_f32, k, ef_i, _scratch));
             }
         }
 
@@ -676,12 +672,20 @@ impl SegmentHolder {
         } else {
             ef_search
         };
-        // EF-SPLIT: divide the beam across graph segments (see per_segment_ef).
-        let graph_ef = per_segment_ef(
-            graph_ef,
-            segments.immutable.len() + segments.warm.len(),
-            fetch_k,
-        );
+        // AE-1: when ef was heuristic-defaulted, a saturation-certified
+        // segment runs at its compact-time min-ef estimate — floored by the
+        // merge quota, capped by the resolved ef. Every other segment gets
+        // the FULL resolved ef (see the per-segment beam policy note at the
+        // top of this file). Identical selector in the pooled jobs, inline
+        // fallbacks, and serial loops, so pooled == serial identity holds.
+        // Never active when the user pinned EF_RUNTIME.
+        let ef_defaulted = snap.ef_defaulted;
+        let seg_ef = |suggested: Option<u32>| -> usize {
+            match suggested {
+                Some(sug) if ef_defaulted => (sug as usize).max(fetch_k).min(graph_ef),
+                _ => graph_ef,
+            }
+        };
         let snapshot_lsn = snap.snapshot_lsn;
         let my_txn_id = snap.my_txn_id;
         let mutable_len = snap.mutable_len;
@@ -722,13 +726,14 @@ impl SegmentHolder {
             // On submit failure (pool shut down at process teardown) the
             // segment is searched inline — the query still answers correctly.
             for seg in &segments.immutable {
+                let ef_seg = seg_ef(seg.suggested_ef());
                 let job = crate::vector::search_pool::SegmentSearchJob {
                     segment: crate::vector::search_pool::GraphSegmentRef::Immutable(
                         std::sync::Arc::clone(seg),
                     ),
                     query: std::sync::Arc::clone(&query_arc),
                     fetch_k,
-                    ef_search: graph_ef,
+                    ef_search: ef_seg,
                     filter: filter_arc.clone(),
                     reply: tx.clone(),
                 };
@@ -738,12 +743,12 @@ impl SegmentHolder {
                     all.extend(seg.search_filtered(
                         query_f32,
                         fetch_k,
-                        graph_ef,
+                        ef_seg,
                         &mut snap.scratch,
                         graph_filter,
                     ));
                 } else {
-                    let results = seg.search(query_f32, fetch_k, graph_ef, &mut snap.scratch);
+                    let results = seg.search(query_f32, fetch_k, ef_seg, &mut snap.scratch);
                     if post_filter {
                         if let Some(bm) = filter_ref {
                             all.extend(results.into_iter().filter(|r| bm.contains(r.id.0)));
@@ -866,16 +871,17 @@ impl SegmentHolder {
         // otherwise the ACORN-filtered traversal, same as the sync path.
         if !pooled_graph {
             for imm in &segments.immutable {
+                let ef_seg = seg_ef(imm.suggested_ef());
                 if graph_filter.is_some() {
                     all.extend(imm.search_filtered(
                         query_f32,
                         fetch_k,
-                        graph_ef,
+                        ef_seg,
                         &mut snap.scratch,
                         graph_filter,
                     ));
                 } else {
-                    let results = imm.search(query_f32, fetch_k, graph_ef, &mut snap.scratch);
+                    let results = imm.search(query_f32, fetch_k, ef_seg, &mut snap.scratch);
                     if post_filter {
                         if let Some(bm) = filter_ref {
                             all.extend(results.into_iter().filter(|r| bm.contains(r.id.0)));
@@ -1089,21 +1095,6 @@ mod tests {
     }
 
     #[test]
-    fn test_per_segment_ef_split() {
-        // Single segment: untouched.
-        assert_eq!(per_segment_ef(300, 1, 10), 300);
-        assert_eq!(per_segment_ef(300, 0, 10), 300);
-        // 5 segments: 300/sqrt(5) = 134.16 -> 135.
-        assert_eq!(per_segment_ef(300, 5, 10), 135);
-        // Never exceeds ef; floors at the merge quota and EF_SPLIT_MIN.
-        assert_eq!(per_segment_ef(64, 16, 10), 24); // 64/4=16 -> EF_SPLIT_MIN
-        assert_eq!(per_segment_ef(64, 4, 40), 40); // quota floor wins
-        assert_eq!(per_segment_ef(16, 4, 10), 16); // floors capped by ef itself
-        // Monotone in ef.
-        assert!(per_segment_ef(600, 5, 10) > per_segment_ef(300, 5, 10));
-    }
-
-    #[test]
     fn test_holder_search_filtered_none_same_as_unfiltered() {
         distance::init();
         let dim = 8;
@@ -1188,6 +1179,7 @@ mod tests {
             committed: &committed,
             dirty_set: &[],
             dimension: dim as u32,
+            ef_defaulted: false,
         };
         let mvcc = holder.search_mvcc(&query_f32, 3, 64, &mut scratch, None, &mvcc_ctx);
 
@@ -1221,6 +1213,7 @@ mod tests {
             committed: &committed,
             dirty_set: &[],
             dimension: dim as u32,
+            ef_defaulted: false,
         };
         let results = holder.search_mvcc(&query_f32, 3, 64, &mut scratch, None, &mvcc_ctx);
         assert_eq!(results.len(), 1);
@@ -1277,6 +1270,7 @@ mod tests {
             committed: &committed,
             dirty_set: std::slice::from_ref(&dirty_entry),
             dimension: dim as u32,
+            ef_defaulted: false,
         };
         let results = holder.search_mvcc(&query_f32, 3, 64, &mut scratch, None, &mvcc_ctx);
 
@@ -1315,6 +1309,7 @@ mod tests {
             committed: &committed,
             dirty_set: &[],
             dimension: dim as u32,
+            ef_defaulted: false,
         };
         let r1 = holder.search_mvcc(&query_f32, 3, 64, &mut scratch, None, &mvcc_empty);
 
@@ -1325,6 +1320,7 @@ mod tests {
             committed: &committed,
             dirty_set: &[],
             dimension: dim as u32,
+            ef_defaulted: false,
         };
         let r2 = holder.search_mvcc(&query_f32, 3, 64, &mut scratch, None, &mvcc_empty2);
 

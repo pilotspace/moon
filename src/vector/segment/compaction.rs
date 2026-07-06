@@ -873,7 +873,10 @@ pub fn compact(
         live_count,
         total_count,
     )
-    .with_raw_f16(raw_f16_bfs);
+    .with_raw_f16(raw_f16_bfs)
+    // AE-1: measure this build's adaptive-ef estimate while we're on the
+    // compaction thread (no-op without a sidecar).
+    .with_adaptive_ef();
 
     // Step 7 (continued): persist to disk if requested
     if let Some((dir, segment_id)) = persist {
@@ -1464,7 +1467,10 @@ fn merge_graph_union(
         n as u32,
         n as u32,
     )
-    .with_raw_f16(raw_f16_bfs);
+    .with_raw_f16(raw_f16_bfs)
+    // AE-1: measure this build's adaptive-ef estimate while we're on the
+    // compaction thread (no-op without a sidecar).
+    .with_adaptive_ef();
 
     Ok(merged)
 }

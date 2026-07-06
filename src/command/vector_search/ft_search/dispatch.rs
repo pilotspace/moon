@@ -622,6 +622,9 @@ fn capture_dense_knn_snapshot(
     // Auto-compact (same side effect + timing as the sync path).
     idx.try_compact();
 
+    // AE-1: adaptive per-segment ef estimates apply only when ef is
+    // heuristic-defaulted, never over a user-pinned EF_RUNTIME.
+    let ef_defaulted = idx.meta.hnsw_ef_runtime == 0;
     let ef_search = if idx.meta.hnsw_ef_runtime > 0 {
         idx.meta.hnsw_ef_runtime as usize
     } else {
@@ -665,6 +668,7 @@ fn capture_dense_knn_snapshot(
         // fresh 32-65KB allocation set per query.
         scratch: crate::vector::hnsw::search::take_thread_scratch(padded_dimension(dim as u32)),
         key_hash_to_key: idx.key_hash_to_key.clone(),
+        ef_defaulted,
     })
 }
 

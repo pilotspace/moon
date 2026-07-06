@@ -93,6 +93,14 @@ pub struct ImmutableSegment {
     /// values to f16 tolerance instead of quantized ADC estimates. `None` for
     /// segments built without raw vectors (pre-sidecar disk segments).
     raw_f16: Option<Vec<u16>>,
+
+    /// Compact-time adaptive-ef estimate (AE-1): the smallest ladder ef at
+    /// which this segment's OWN sampled queries reach the target recall
+    /// against exact sidecar ground truth. Applied per-segment when the
+    /// query's ef was heuristic-defaulted (never when the user pinned
+    /// `EF_RUNTIME`). In-memory only — segments reloaded from disk carry
+    /// `None` and fall back to the full resolved beam.
+    suggested_ef: Option<u32>,
 }
 
 impl ImmutableSegment {
@@ -126,6 +134,7 @@ impl ImmutableSegment {
             has_tombstones: AtomicBool::new(false),
             tombstoned_keys: parking_lot::RwLock::new(HashSet::new()),
             raw_f16: None,
+            suggested_ef: None,
         }
     }
 
@@ -150,6 +159,185 @@ impl ImmutableSegment {
     /// GraphUnion merge to propagate the sidecar.
     pub fn raw_f16(&self) -> Option<&[u16]> {
         self.raw_f16.as_deref()
+    }
+
+    /// The compact-time adaptive-ef estimate for this segment (AE-1), if one
+    /// was measured. See [`Self::with_adaptive_ef`].
+    pub fn suggested_ef(&self) -> Option<u32> {
+        self.suggested_ef
+    }
+
+    /// Measure and attach the adaptive-ef estimate (AE-1). Builder-style,
+    /// called at compact/merge time after the graph and sidecar are in place.
+    /// No-op (stays `None`) without a sidecar or for tiny segments.
+    #[must_use]
+    pub fn with_adaptive_ef(mut self) -> Self {
+        self.suggested_ef = self.estimate_suggested_ef();
+        self
+    }
+
+    /// AE-1 estimator: sample `ADAPTIVE_EF_SAMPLES` of the segment's own
+    /// vectors as queries, compute exact top-k ground truth from the f16
+    /// sidecar (SIMD kernels; same distance conventions as `rerank_exact`),
+    /// then measure R@k along the ef ladder. Returns `Some(min-ef)` ONLY
+    /// when the curve is fully saturated (see `ADAPTIVE_EF_SATURATION`);
+    /// `None` when no sidecar, the segment is too small to measure
+    /// meaningfully, or the curve shows any knee (caller falls back to the
+    /// full resolved beam).
+    ///
+    /// Cost: samples·n·dim SIMD f16 ops for ground truth (~tens of ms for a
+    /// bounded compact build) + samples·|ladder| graph searches — one-time,
+    /// on the compaction/merge thread, never on the query path.
+    fn estimate_suggested_ef(&self) -> Option<u32> {
+        const ADAPTIVE_EF_SAMPLES: usize = 16;
+        const ADAPTIVE_EF_K: usize = 10;
+        /// Acceptance requires a FULLY SATURATED ladder: the first (minimum)
+        /// rung must already sit within ε of the ladder top AND at/above the
+        /// saturation bar. Self-sampled queries are optimistically biased on
+        /// unstructured data — an absolute 0.98 gate picked catastrophically
+        /// low efs (measured R@10 0.9915 → 0.573 on gaussian 5-seg), and even
+        /// a knee-of-own-curve relative gate still over-trusted it (0.9915 →
+        /// 0.939): a segment whose self-curve shows ANY visible knee has its
+        /// true external-query knee further right, beyond what the estimator
+        /// can see. The only decision the estimator makes reliably is
+        /// "trivially easy segment" (clustered data measures flat 1.0 across
+        /// the whole ladder) — for those, min-ef is safe; everything else
+        /// falls back to the full resolved beam.
+        const ADAPTIVE_EF_SATURATION: f32 = 0.995;
+        const ADAPTIVE_EF_EPSILON: f32 = 0.005;
+        const ADAPTIVE_EF_LADDER: &[usize] = &[24, 32, 48, 64, 96, 128, 192, 256];
+
+        let raw = self.raw_f16.as_deref()?;
+        let dim = self.collection_meta.dimension as usize;
+        let n = self.mvcc.len();
+        if dim == 0 || n < ADAPTIVE_EF_K * 8 || raw.len() < n * dim {
+            return None;
+        }
+        let is_l2 = self.collection_meta.metric == crate::vector::types::DistanceMetric::L2;
+        let table = crate::vector::distance::table();
+
+        // Evenly-spaced sample rows as queries (decoded to f32; the raw
+        // vector feeds `search()` which does its own normalization).
+        let samples = ADAPTIVE_EF_SAMPLES.min(n / 4).max(4);
+        let step = (n / samples).max(1);
+        let mut queries: Vec<(usize, Vec<f32>)> = Vec::with_capacity(samples);
+        for s in 0..samples {
+            let bfs = s * step;
+            if bfs >= n {
+                break;
+            }
+            let row = &raw[bfs * dim..(bfs + 1) * dim];
+            let q: Vec<f32> = row
+                .iter()
+                .map(|&h| crate::vector::f16::f16_to_f32(h))
+                .collect();
+            queries.push((bfs, q));
+        }
+
+        // Exact ground truth per query: brute force over the sidecar with the
+        // rerank distance conventions (L2: squared L2; unit-sphere metrics:
+        // 2 − 2·⟨q̂,x⟩/‖x‖). Collect top-k GLOBAL ids.
+        let mut gts: Vec<SmallVec<[u32; 16]>> = Vec::with_capacity(queries.len());
+        for (q_bfs, q) in &queries {
+            let q_bfs = *q_bfs;
+            let mut q_unit;
+            let q_ref: &[f32] = if is_l2 {
+                q
+            } else {
+                let norm: f32 = q.iter().map(|x| x * x).sum::<f32>().sqrt();
+                if norm <= 0.0 {
+                    gts.push(SmallVec::new());
+                    continue;
+                }
+                let inv = 1.0 / norm;
+                q_unit = q.clone();
+                for v in q_unit.iter_mut() {
+                    *v *= inv;
+                }
+                &q_unit
+            };
+            // (distance, bfs) top-k via sorted Vec. Leave-self-out: the
+            // query IS row `q_bfs`, and its trivial self-hit would inflate
+            // measured recall — exclude it from ground truth and results.
+            let mut top: Vec<(f32, usize)> = Vec::with_capacity(ADAPTIVE_EF_K + 1);
+            for bfs in 0..n {
+                if bfs == q_bfs || !self.is_live_bfs(bfs as u32) {
+                    continue;
+                }
+                let x = &raw[bfs * dim..(bfs + 1) * dim];
+                let d = if is_l2 {
+                    (table.f16_l2)(q_ref, x)
+                } else {
+                    let (dot, xsq) = (table.f16_dot_normsq)(q_ref, x);
+                    if xsq > 0.0 {
+                        2.0 - 2.0 * (dot / xsq.sqrt())
+                    } else {
+                        continue;
+                    }
+                };
+                if top.len() < ADAPTIVE_EF_K {
+                    top.push((d, bfs));
+                    top.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+                } else if d < top[ADAPTIVE_EF_K - 1].0 {
+                    top[ADAPTIVE_EF_K - 1] = (d, bfs);
+                    top.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+                }
+            }
+            gts.push(
+                top.iter()
+                    .map(|&(_, bfs)| self.mvcc[bfs].global_id)
+                    .collect(),
+            );
+        }
+
+        // Ladder walk. Fetch k+1 and drop the self-hit (leave-self-out),
+        // then accept the smallest ef whose recall is BOTH ≥ the absolute
+        // target AND within ε of the ladder-top recall (the segment's own
+        // asymptote). A segment whose curve never reaches the target yields
+        // None (full-resolved-beam fallback).
+        let mut scratch = SearchScratch::new(0, self.collection_meta.padded_dimension);
+        let mut recall_at = [0f32; 8];
+        debug_assert_eq!(ADAPTIVE_EF_LADDER.len(), recall_at.len());
+        for (li, &ef) in ADAPTIVE_EF_LADDER.iter().enumerate() {
+            let mut hit = 0usize;
+            let mut total = 0usize;
+            for ((q_bfs, q), gt) in queries.iter().zip(&gts) {
+                if gt.is_empty() {
+                    continue;
+                }
+                let self_gid = self.mvcc[*q_bfs].global_id;
+                let res = self.search(q, ADAPTIVE_EF_K + 1, ef, &mut scratch);
+                hit += res
+                    .iter()
+                    .filter(|r| r.id.0 != self_gid && gt.contains(&r.id.0))
+                    .count();
+                total += gt.len();
+            }
+            recall_at[li] = if total > 0 {
+                (hit as f32) / (total as f32)
+            } else {
+                0.0
+            };
+        }
+        let top = recall_at[ADAPTIVE_EF_LADDER.len() - 1];
+        let floor = recall_at[0];
+        // Saturated-curve gate: only a segment whose MINIMUM-ef self-recall
+        // already matches its asymptote (and clears the saturation bar) gets
+        // a suggestion — and that suggestion is min-ef itself. Any visible
+        // knee in the self-curve → None (see ADAPTIVE_EF_SATURATION doc).
+        let decision = if floor >= ADAPTIVE_EF_SATURATION && floor >= top - ADAPTIVE_EF_EPSILON {
+            Some(ADAPTIVE_EF_LADDER[0] as u32)
+        } else {
+            None
+        };
+        tracing::debug!(
+            n,
+            samples = queries.len(),
+            ?recall_at,
+            ?decision,
+            "AE-1 adaptive-ef ladder"
+        );
+        decision
     }
 
     /// Exact rerank (HQ-1): re-score `candidates` with (near-)exact distances

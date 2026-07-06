@@ -594,6 +594,7 @@ pub(super) fn run_dense_knn(
             committed,
             dirty_set: &[],
             dimension: dim as u32,
+            ef_defaulted: false,
         };
         idx.segments
             .search_mvcc(&query_f32, k, ef_search, &mut idx.scratch, None, &mvcc_ctx)
@@ -615,6 +616,7 @@ pub(super) fn run_dense_knn(
             committed,
             dirty_set: &[],
             dimension: dim as u32,
+            ef_defaulted: false,
         };
         fs.segments
             .search_mvcc(&query_f32, k, ef_search, &mut fs.scratch, None, &mvcc_ctx)
