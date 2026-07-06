@@ -2,6 +2,161 @@ use std::collections::HashMap;
 
 use super::*;
 
+/// Resolve an `IndexScan` into the matching node keys across both tiers.
+///
+/// Frozen tier: per segment, intersect the property-equality bitmaps
+/// (`SegmentPropertyIndexes::rows_eq`) with the label bitmap, then apply
+/// MVCC/valid-time visibility per surviving row. Mutable tail: linear scan
+/// with an inline (numeric-coercing, superset-consistent) property check —
+/// the tail is bounded by `edge_threshold` by design.
+///
+/// `prop_eq` values are literals or parameters; if any resolves to a
+/// non-scalar the whole scan degrades to the plain merged label scan (the
+/// residual Filter downstream keeps results exact either way).
+#[allow(clippy::too_many_arguments)]
+fn index_scan_keys(
+    memgraph: &crate::graph::memgraph::MemGraph,
+    csr_segs: &[std::sync::Arc<crate::graph::csr::CsrStorage>],
+    label: Option<&String>,
+    prop_eq: &[(String, Expr)],
+    params: &HashMap<String, Value>,
+    ctx: &ExecutionContext,
+) -> Vec<NodeKey> {
+    let label_id = label.map(|l| label_to_id(l.as_bytes()));
+    let committed = roaring::RoaringBitmap::new();
+    let view = crate::graph::view::MergedNodeView::new(memgraph, csr_segs);
+    let empty_row: Row = HashMap::new();
+
+    // Resolve each equality target to a concrete PropertyValue.
+    let mut targets: Vec<(u16, PropertyValue)> = Vec::with_capacity(prop_eq.len());
+    for (name, expr) in prop_eq {
+        let v = eval_expr(
+            expr,
+            &empty_row,
+            memgraph,
+            params,
+            csr_segs,
+            ctx.snapshot_lsn,
+            ctx.decay,
+        );
+        match value_to_property_value(&v) {
+            Some(pv) => targets.push((label_to_id(name.as_bytes()), pv)),
+            None => {
+                // Unresolvable target (e.g. Null parameter): fall back to
+                // the merged label scan; the residual Filter stays exact.
+                let mut keys = Vec::new();
+                view.for_each_visible_node(
+                    label_id,
+                    ctx.snapshot_lsn,
+                    ctx.my_txn_id,
+                    &committed,
+                    ctx.valid_time_as_of,
+                    |k| keys.push(k),
+                );
+                return keys;
+            }
+        }
+    }
+
+    let mut keys = Vec::new();
+
+    // Mutable tail: inline superset-consistent property check.
+    for (key, node) in memgraph.iter_nodes() {
+        if let Some(lid) = label_id {
+            if !node.labels.contains(&lid) {
+                continue;
+            }
+        }
+        if !crate::graph::visibility::is_node_visible(
+            node,
+            ctx.snapshot_lsn,
+            ctx.my_txn_id,
+            &committed,
+            ctx.valid_time_as_of,
+        ) {
+            continue;
+        }
+        let all_match = targets.iter().all(|(pid, want)| {
+            node.properties
+                .iter()
+                .any(|(id, have)| id == pid && prop_value_loose_eq(have, want))
+        });
+        if all_match {
+            keys.push(key);
+        }
+    }
+
+    // Frozen tier: bitmap intersection per segment.
+    for seg in csr_segs {
+        let mut bm: Option<roaring::RoaringBitmap> = None;
+        for (pid, pv) in &targets {
+            let rows = seg.property_index().rows_eq(*pid, pv);
+            let acc = match bm.take() {
+                Some(acc) => acc & rows,
+                None => rows,
+            };
+            if acc.is_empty() {
+                bm = Some(acc);
+                break;
+            }
+            bm = Some(acc);
+        }
+        let Some(mut bm) = bm else { continue };
+        if bm.is_empty() {
+            continue;
+        }
+        if let Some(lid) = label_id {
+            match seg.label_index().nodes_with_label(lid) {
+                Some(lbm) => bm &= lbm,
+                None => continue,
+            }
+        }
+        let metas = seg.node_meta();
+        for row in bm {
+            let Some(meta) = metas.get(row as usize) else {
+                continue;
+            };
+            if !crate::graph::visibility::is_meta_visible(
+                meta,
+                ctx.snapshot_lsn,
+                ctx.my_txn_id,
+                &committed,
+                ctx.valid_time_as_of,
+            ) {
+                continue;
+            }
+            keys.push(NodeKey::from(slotmap::KeyData::from_ffi(meta.external_id)));
+        }
+    }
+
+    keys
+}
+
+/// Superset-consistent equality between stored and queried property values,
+/// mirroring the index's numeric normalization (Int/Float/Bool share one
+/// f64 space; String/Bytes compare bytewise). Never narrower than the
+/// residual Filter's semantics — a loose match only ADDS candidates.
+fn prop_value_loose_eq(have: &PropertyValue, want: &PropertyValue) -> bool {
+    fn as_num(v: &PropertyValue) -> Option<f64> {
+        match v {
+            PropertyValue::Int(i) => Some(*i as f64),
+            PropertyValue::Float(f) => Some(*f),
+            PropertyValue::Bool(b) => Some(u8::from(*b) as f64),
+            _ => None,
+        }
+    }
+    fn as_bytes(v: &PropertyValue) -> Option<&[u8]> {
+        match v {
+            PropertyValue::String(s) | PropertyValue::Bytes(s) => Some(s.as_ref()),
+            _ => None,
+        }
+    }
+    match (as_num(have), as_num(want)) {
+        (Some(a), Some(b)) => a == b,
+        _ => matches!((as_bytes(have), as_bytes(want)), (Some(a), Some(b)) if a == b),
+    }
+}
+
 /// Execute a physical plan against a named graph.
 pub fn execute(
     graph: &NamedGraph,
@@ -44,6 +199,24 @@ pub fn execute(
                     ctx.valid_time_as_of,
                     |k| keys.push(k),
                 );
+                let mut new_rows = Vec::with_capacity(rows.len() * keys.len());
+                for row in &rows {
+                    for &key in &keys {
+                        let mut new_row = row.clone();
+                        new_row.insert(variable.clone(), Value::Node(key));
+                        new_rows.push(new_row);
+                    }
+                }
+                rows = new_rows;
+            }
+
+            PhysicalOp::IndexScan {
+                variable,
+                label,
+                prop_eq,
+            } => {
+                let keys =
+                    index_scan_keys(memgraph, csr_segs, label.as_ref(), prop_eq, params, ctx);
                 let mut new_rows = Vec::with_capacity(rows.len() * keys.len());
                 for row in &rows {
                     for &key in &keys {
@@ -492,6 +665,7 @@ pub fn execute(
 pub(crate) fn op_name(op: &PhysicalOp) -> &'static str {
     match op {
         PhysicalOp::NodeScan { .. } => "NodeScan",
+        PhysicalOp::IndexScan { .. } => "IndexScan",
         PhysicalOp::Expand { .. } => "Expand",
         PhysicalOp::Filter { .. } => "Filter",
         PhysicalOp::Project { .. } => "Project",
@@ -554,6 +728,24 @@ pub fn execute_profile(
                     ctx.valid_time_as_of,
                     |k| keys.push(k),
                 );
+                let mut new_rows = Vec::with_capacity(rows.len() * keys.len());
+                for row in &rows {
+                    for &key in &keys {
+                        let mut new_row = row.clone();
+                        new_row.insert(variable.clone(), Value::Node(key));
+                        new_rows.push(new_row);
+                    }
+                }
+                rows = new_rows;
+            }
+
+            PhysicalOp::IndexScan {
+                variable,
+                label,
+                prop_eq,
+            } => {
+                let keys =
+                    index_scan_keys(memgraph, csr_segs, label.as_ref(), prop_eq, params, ctx);
                 let mut new_rows = Vec::with_capacity(rows.len() * keys.len());
                 for row in &rows {
                     for &key in &keys {
