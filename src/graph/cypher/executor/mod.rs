@@ -1,8 +1,10 @@
 //! Cypher execution engine -- walks PhysicalPlan operators and produces result rows.
 //!
-//! Row-based pipeline model: each operator transforms a `Vec<Row>` where
-//! `Row = HashMap<String, Value>`. The executor starts with one empty seed row
-//! and sequentially applies each `PhysicalOp` from the plan.
+//! Row-based pipeline model: each operator transforms a `Vec<Row>`. A `Row`
+//! is a slot-indexed `SmallVec<Value>` against a per-execution [`SlotTable`]
+//! (all variables a plan can bind, collected once) — no per-row HashMap
+//! allocation and no per-insert String key clone. The executor starts with
+//! one Null-filled seed row and sequentially applies each `PhysicalOp`.
 
 mod eval;
 mod read;
@@ -12,8 +14,6 @@ mod write;
 pub(crate) use eval::*;
 pub use read::*;
 pub use write::*;
-
-use std::collections::HashMap;
 
 use bytes::Bytes;
 use smallvec::SmallVec;
@@ -43,8 +43,163 @@ pub enum Value {
     Path(Vec<NodeKey>),
 }
 
-/// A single result row: variable bindings.
-pub type Row = HashMap<String, Value>;
+/// Maps variable names to row slot indices.
+///
+/// Built once per execution by walking the plan's BINDING operators
+/// (scans, expands, unwind, shortestPath, create/merge patterns). Names
+/// that are referenced but never bound simply resolve to no slot — the
+/// same as a HashMap miss in the old row model. Lookup is a linear scan:
+/// queries bind a handful of short names, which beats hashing.
+#[derive(Debug, Default)]
+pub struct SlotTable {
+    names: Vec<String>,
+}
+
+impl SlotTable {
+    /// Collect every variable the plan can bind, in first-bind order.
+    pub fn from_plan(plan: &PhysicalPlan) -> Self {
+        let mut table = SlotTable::default();
+        for op in &plan.operators {
+            match op {
+                PhysicalOp::NodeScan { variable, .. } | PhysicalOp::IndexScan { variable, .. } => {
+                    table.bind(variable)
+                }
+                PhysicalOp::Expand {
+                    source,
+                    target,
+                    edge_variable,
+                    ..
+                } => {
+                    table.bind(source);
+                    table.bind(target);
+                    if let Some(evar) = edge_variable {
+                        table.bind(evar);
+                    }
+                }
+                PhysicalOp::Unwind { alias, .. } => table.bind(alias),
+                PhysicalOp::ShortestPath {
+                    path_var,
+                    source,
+                    target,
+                    ..
+                } => {
+                    table.bind(path_var);
+                    table.bind(source);
+                    table.bind(target);
+                }
+                PhysicalOp::CreatePattern { patterns } => {
+                    for p in patterns {
+                        table.bind_pattern(p);
+                    }
+                }
+                PhysicalOp::Merge { pattern, .. } => table.bind_pattern(pattern),
+                // Reference-only operators bind nothing.
+                PhysicalOp::Filter { .. }
+                | PhysicalOp::Project { .. }
+                | PhysicalOp::Sort { .. }
+                | PhysicalOp::Limit { .. }
+                | PhysicalOp::Skip { .. }
+                | PhysicalOp::DeleteEntities { .. }
+                | PhysicalOp::SetProperties { .. }
+                | PhysicalOp::ProcedureCall { .. } => {}
+            }
+        }
+        table
+    }
+
+    fn bind(&mut self, name: &str) {
+        if !name.is_empty() && !self.names.iter().any(|n| n == name) {
+            self.names.push(name.to_owned());
+        }
+    }
+
+    fn bind_pattern(&mut self, pattern: &Pattern) {
+        for node in &pattern.nodes {
+            if let Some(v) = &node.variable {
+                self.bind(v);
+            }
+        }
+        for edge in &pattern.edges {
+            if let Some(v) = &edge.variable {
+                self.bind(v);
+            }
+        }
+    }
+
+    /// Resolve a variable name to its slot index.
+    #[inline]
+    pub fn slot(&self, name: &str) -> Option<usize> {
+        self.names.iter().position(|n| n == name)
+    }
+
+    /// Slot names in slot order.
+    pub fn names(&self) -> &[String] {
+        &self.names
+    }
+
+    /// Number of slots.
+    pub fn len(&self) -> usize {
+        self.names.len()
+    }
+
+    /// Whether the table has no slots.
+    pub fn is_empty(&self) -> bool {
+        self.names.is_empty()
+    }
+}
+
+/// A single result row: variable bindings, slot-indexed against the
+/// execution's [`SlotTable`].
+///
+/// Unbound slots hold `Value::Null`, which every pipeline consumer treats
+/// identically to the old HashMap miss: expression eval defaults a missing
+/// variable to Null, and operator sources pattern-match a concrete variant
+/// (`Some(Value::Node(_))`), which Null fails just like `None` did.
+#[derive(Debug, Clone)]
+pub struct Row<'a> {
+    table: &'a SlotTable,
+    slots: SmallVec<[Value; 4]>,
+}
+
+impl<'a> Row<'a> {
+    /// A fresh row with all slots unbound (Null).
+    pub fn seed(table: &'a SlotTable) -> Self {
+        Row {
+            table,
+            slots: smallvec::smallvec![Value::Null; table.len()],
+        }
+    }
+
+    /// Look up a binding by variable name.
+    #[inline]
+    pub fn get(&self, name: &str) -> Option<&Value> {
+        self.table.slot(name).map(|i| &self.slots[i])
+    }
+
+    /// Bind a variable. The name must be in the SlotTable (it is, for every
+    /// name a plan operator binds — `SlotTable::from_plan` walks the same
+    /// operators); an unknown name is a plan/table desync bug and the
+    /// binding is dropped, matching a read of it (None).
+    #[inline]
+    pub fn insert(&mut self, name: &str, value: Value) {
+        debug_assert!(
+            self.table.slot(name).is_some(),
+            "variable {name:?} missing from SlotTable"
+        );
+        if let Some(i) = self.table.slot(name) {
+            self.slots[i] = value;
+        }
+    }
+
+    /// Iterate (name, value) pairs in slot order.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &Value)> {
+        self.table
+            .names
+            .iter()
+            .map(String::as_str)
+            .zip(self.slots.iter())
+    }
+}
 
 /// Execution error.
 ///
@@ -198,6 +353,67 @@ mod tests {
     use crate::graph::store::GraphStore;
     use bytes::Bytes;
     use smallvec::SmallVec;
+    use std::collections::HashMap;
+
+    #[test]
+    fn test_slot_table_collects_all_binding_ops() {
+        let query = crate::graph::cypher::parse_cypher(
+            b"MATCH (a:Person {id: 1})-[r:KNOWS]->(b) RETURN a, b",
+        )
+        .expect("parse");
+        let plan = crate::graph::cypher::planner::compile(&query).expect("compile");
+        let table = SlotTable::from_plan(&plan);
+        for var in ["a", "r", "b"] {
+            assert!(
+                table.slot(var).is_some(),
+                "{var:?} must have a slot; names = {:?}",
+                table.names()
+            );
+        }
+    }
+
+    #[test]
+    fn test_slot_table_collects_pattern_vars() {
+        let query = crate::graph::cypher::parse_cypher(
+            b"CREATE (x:Person {id: 1})-[e:KNOWS]->(y:Person {id: 2})",
+        )
+        .expect("parse");
+        let plan = crate::graph::cypher::planner::compile(&query).expect("compile");
+        let table = SlotTable::from_plan(&plan);
+        for var in ["x", "e", "y"] {
+            assert!(
+                table.slot(var).is_some(),
+                "{var:?} must have a slot; names = {:?}",
+                table.names()
+            );
+        }
+    }
+
+    #[test]
+    fn test_row_get_insert_iter() {
+        let mut table = SlotTable::default();
+        table.bind("a");
+        table.bind("b");
+        table.bind("a"); // dedup
+        assert_eq!(table.len(), 2);
+
+        let mut row = Row::seed(&table);
+        // Unbound slot reads as Null; unknown name reads as None.
+        assert!(matches!(row.get("a"), Some(Value::Null)));
+        assert!(row.get("zzz").is_none());
+
+        row.insert("a", Value::Int(7));
+        assert!(matches!(row.get("a"), Some(Value::Int(7))));
+
+        let cloned = row.clone();
+        assert!(matches!(cloned.get("a"), Some(Value::Int(7))));
+
+        let pairs: Vec<(&str, bool)> = row
+            .iter()
+            .map(|(k, v)| (k, matches!(v, Value::Null)))
+            .collect();
+        assert_eq!(pairs, vec![("a", false), ("b", true)]);
+    }
 
     #[test]
     fn test_execute_simple_match_return() {
