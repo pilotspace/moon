@@ -46,7 +46,7 @@ jobs:
         # Prebuilt binary: `cargo install --locked` broke when nightly started
         # rejecting the lockfile's rustix 0.36.5 (reserved `rustc_*` attrs);
         # a binary install is immune to toolchain drift and faster.
-        uses: taiki-e/install-action@7a79fe8c3a13344501c80d99cae481c1c9085912 # v2.81.10
+        uses: taiki-e/install-action@4684b8405694ae9dd42c9f39ba901a70ae83f4a3 # v2.82.9
         with:
           tool: cargo-fuzz
       - name: Download nightly corpus
@@ -95,7 +95,7 @@ jobs:
         # Prebuilt binary: `cargo install --locked` broke when nightly started
         # rejecting the lockfile's rustix 0.36.5 (reserved `rustc_*` attrs);
         # a binary install is immune to toolchain drift and faster.
-        uses: taiki-e/install-action@7a79fe8c3a13344501c80d99cae481c1c9085912 # v2.81.10
+        uses: taiki-e/install-action@4684b8405694ae9dd42c9f39ba901a70ae83f4a3 # v2.82.9
         with:
           tool: cargo-fuzz
       - name: Download previous corpus
