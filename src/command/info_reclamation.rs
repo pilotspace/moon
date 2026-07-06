@@ -43,6 +43,15 @@ pub static RECL_WRITE_STALL_ACTIVE: AtomicU64 = AtomicU64::new(0);
 /// MA1 sets this; the INFO `write_stall_active` field reflects its OR with RECL_WRITE_STALL_ACTIVE.
 pub static RECL_SEGMENT_STALL_ACTIVE: AtomicU64 = AtomicU64::new(0);
 
+/// Latest measured process RSS in bytes. Wave 3 (`mem_monitor`) owns this;
+/// emits 0 until the monitor's first poll.
+pub static RECL_MEM_RSS_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// 1 when the RSS memory watchdog (Wave 3, `mem_monitor`) has paused writes
+/// due to memory pressure, 0 otherwise. The INFO `write_stall_active` field
+/// ORs this in alongside RECL_WRITE_STALL_ACTIVE and RECL_SEGMENT_STALL_ACTIVE.
+pub static RECL_MEM_WATCHDOG_ACTIVE: AtomicU64 = AtomicU64::new(0);
+
 /// Write-stall threshold stored as tenths-of-percent (e.g. 950 = 95.0%).
 /// TODO(P10→Wave2): wire from config flag --disk-free-min-pct (MA12).
 pub static RECL_WRITE_STALL_THRESHOLD_PCT_X10: AtomicU64 = AtomicU64::new(950);
@@ -172,6 +181,16 @@ pub fn write_reclamation_section(buf: &mut String) {
         RECL_DISK_FREE_BYTES.load(Ordering::Relaxed)
     );
 
+    // -- Memory (Wave 3 RSS watchdog) --
+    let mem_watchdog_active = RECL_MEM_WATCHDOG_ACTIVE.load(Ordering::Relaxed) != 0;
+    let _ = write!(
+        buf,
+        "reclamation_mem_rss_bytes:{}\r\n\
+         reclamation_mem_watchdog_active:{}\r\n",
+        RECL_MEM_RSS_BYTES.load(Ordering::Relaxed),
+        if mem_watchdog_active { "true" } else { "false" },
+    );
+
     // -- WAL --
     let _ = write!(
         buf,
@@ -181,9 +200,11 @@ pub fn write_reclamation_section(buf: &mut String) {
         RECL_WAL_SEGMENTS.load(Ordering::Relaxed)
     );
 
-    // -- Write stall: OR of disk-pressure (MA12) and segment-backlog (MA1) bits --
+    // -- Write stall: OR of disk-pressure (MA12), segment-backlog (MA1), and
+    //    RSS memory pressure (Wave 3) bits --
     let stall_active = RECL_WRITE_STALL_ACTIVE.load(Ordering::Relaxed)
-        | RECL_SEGMENT_STALL_ACTIVE.load(Ordering::Relaxed);
+        | RECL_SEGMENT_STALL_ACTIVE.load(Ordering::Relaxed)
+        | RECL_MEM_WATCHDOG_ACTIVE.load(Ordering::Relaxed);
     // Threshold stored as tenths-of-percent (e.g. 950 → "95.0")
     let threshold_x10 = RECL_WRITE_STALL_THRESHOLD_PCT_X10.load(Ordering::Relaxed);
     let _ = write!(
@@ -339,6 +360,8 @@ mod tests {
 
         let required_fields: &[&str] = &[
             "reclamation_disk_free_bytes:",
+            "reclamation_mem_rss_bytes:",
+            "reclamation_mem_watchdog_active:",
             "reclamation_wal_bytes:",
             "reclamation_wal_segments:",
             "reclamation_write_stall_active:",
@@ -407,6 +430,33 @@ mod tests {
         assert!(
             buf.contains("reclamation_write_stall_active:false\r\n"),
             "default write_stall_active must be false"
+        );
+    }
+
+    /// Default sentinel for the new Wave-3 `mem_watchdog_active` field must
+    /// be `false`, and setting `RECL_MEM_WATCHDOG_ACTIVE` must both flip its
+    /// own field AND OR into the aggregate `write_stall_active` — mirrors
+    /// `info_reclamation_wal_bytes_wirable`'s store/assert/restore shape.
+    #[test]
+    fn info_reclamation_mem_watchdog_wirable() {
+        let mut buf = String::new();
+        write_reclamation_section(&mut buf);
+        assert!(
+            buf.contains("reclamation_mem_watchdog_active:false\r\n"),
+            "default mem_watchdog_active must be false"
+        );
+
+        RECL_MEM_WATCHDOG_ACTIVE.store(1, Ordering::Relaxed);
+        let mut buf2 = String::new();
+        write_reclamation_section(&mut buf2);
+        RECL_MEM_WATCHDOG_ACTIVE.store(0, Ordering::Relaxed); // restore default
+        assert!(
+            buf2.contains("reclamation_mem_watchdog_active:true\r\n"),
+            "RECL_MEM_WATCHDOG_ACTIVE store must be visible in its own field"
+        );
+        assert!(
+            buf2.contains("reclamation_write_stall_active:true\r\n"),
+            "RECL_MEM_WATCHDOG_ACTIVE must OR into the aggregate write_stall_active"
         );
     }
 

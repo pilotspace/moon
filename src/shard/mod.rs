@@ -8,6 +8,9 @@ pub mod dispatch;
 pub mod event_loop;
 /// MA5: maintenance-window scheduler (cron-style budget multipliers).
 pub mod maintenance_schedule;
+/// Wave 3: proactive RSS memory watchdog ("mem-full guard") — analogue of
+/// `disk_monitor` (MA12) for process RSS vs the detected system/cgroup limit.
+pub mod mem_monitor;
 pub mod mesh;
 /// C2 (shardslice-migration Wave A1): owner-side MQ.* execution on the shard thread.
 pub(crate) mod mq_exec;
