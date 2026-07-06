@@ -437,6 +437,289 @@ fn mset_scatter_local_slice_persists_across_restart() {
 // shard runs via `run_on_owner` → `run_local` with no AOF append.
 // ---------------------------------------------------------------------------
 
+/// Like `assert_all_survive_restart`, but also asserts a set of keys is ABSENT
+/// after the restart — for DEL/UNLINK legs, where the pre-fix failure mode is
+/// RESURRECTION (the seed MSET is in the AOF, the local-leg DEL never was).
+fn assert_state_after_restart(
+    port: u16,
+    dir: &std::path::Path,
+    child1: Child,
+    present: &[(String, String)],
+    absent: &[String],
+    what: &str,
+) {
+    std::thread::sleep(Duration::from_millis(1500));
+    sigkill(child1);
+
+    let _guard = ServerGuard(spawn_moon_aof(port, dir, SHARDS));
+    wait_ready(port);
+
+    let mut c = Conn::open(port);
+    let mut missing: Vec<String> = Vec::new();
+    for (k, v) in present {
+        match c.cmd(&["GET", k]) {
+            Resp::Bulk(Some(got)) if got == v.as_bytes() => {}
+            _ => missing.push(k.clone()),
+        }
+    }
+    let mut resurrected: Vec<String> = Vec::new();
+    for k in absent {
+        match c.cmd(&["GET", k]) {
+            Resp::Bulk(None) => {}
+            _ => resurrected.push(k.clone()),
+        }
+    }
+    assert!(
+        missing.is_empty() && resurrected.is_empty(),
+        "{what}: {} kept keys missing {:?}; {} deleted keys RESURRECTED after restart \
+         (the co-located leg whose owner == the connection's own shard never hit the AOF): {:?}",
+        missing.len(),
+        missing.iter().take(5).collect::<Vec<_>>(),
+        resurrected.len(),
+        resurrected.iter().take(5).collect::<Vec<_>>(),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// DEL — scatter path (ONE DEL spanning every shard). The slice owned by the
+// connection's shard executes via cmd_dispatch in-process with no AOF append;
+// pre-fix the deleted keys RESURRECT from the seed MSET on restart.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn del_scatter_local_leg_persists_across_restart() {
+    let port = free_port();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let child1 = spawn_moon_aof(port, dir.path(), SHARDS);
+    wait_ready(port);
+
+    let tags = tags_per_shard(SHARDS as usize);
+    let mut c = Conn::open(port);
+
+    // Seed one co-located group per shard (MSET local leg persists post-v3-4).
+    let mut kept: Vec<(String, String)> = Vec::new();
+    let mut to_delete: Vec<String> = Vec::new();
+    for tag in &tags {
+        let pairs = group_pairs(tag);
+        let mut argv: Vec<&str> = vec!["MSET"];
+        for (k, v) in &pairs {
+            argv.push(k);
+            argv.push(v);
+        }
+        let resp = c.cmd(&argv);
+        if is_diskfull(&resp) {
+            eprintln!("SKIP del_scatter: MOONERR diskfull");
+            return;
+        }
+        assert_eq!(resp, Resp::Simple("OK".to_string()));
+        // First key of each group gets deleted; the rest must survive.
+        to_delete.push(pairs[0].0.clone());
+        kept.extend(pairs.into_iter().skip(1));
+    }
+
+    // ONE DEL spanning all shards → guaranteed scatter with a local slice.
+    let mut argv: Vec<&str> = vec!["DEL"];
+    for k in &to_delete {
+        argv.push(k);
+    }
+    assert_eq!(
+        c.cmd(&argv),
+        Resp::Int(SHARDS as i64),
+        "scatter DEL should count one key per shard"
+    );
+    drop(c);
+
+    assert_state_after_restart(
+        port,
+        dir.path(),
+        child1,
+        &kept,
+        &to_delete,
+        "DEL scatter local-slice",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// UNLINK — co-located fast path (all keys of one UNLINK on one shard). The
+// group whose owner == the connection's shard takes the `groups.len() == 1`
+// fast path (cmd_dispatch in-process, no AOF) → resurrection pre-fix.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn unlink_colocated_fastpath_persists_across_restart() {
+    let port = free_port();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let child1 = spawn_moon_aof(port, dir.path(), SHARDS);
+    wait_ready(port);
+
+    let tags = tags_per_shard(SHARDS as usize);
+    let mut c = Conn::open(port);
+
+    let mut deleted: Vec<String> = Vec::new();
+    for tag in &tags {
+        let pairs = group_pairs(tag);
+        let mut argv: Vec<&str> = vec!["MSET"];
+        for (k, v) in &pairs {
+            argv.push(k);
+            argv.push(v);
+        }
+        let resp = c.cmd(&argv);
+        if is_diskfull(&resp) {
+            eprintln!("SKIP unlink_colocated: MOONERR diskfull");
+            return;
+        }
+        assert_eq!(resp, Resp::Simple("OK".to_string()));
+
+        // UNLINK the whole co-located group in one command (multi-key, one shard).
+        let keys: Vec<String> = pairs.iter().map(|(k, _)| k.clone()).collect();
+        let mut argv: Vec<&str> = vec!["UNLINK"];
+        for k in &keys {
+            argv.push(k);
+        }
+        assert_eq!(
+            c.cmd(&argv),
+            Resp::Int(GROUP_SIZE as i64),
+            "co-located UNLINK on tag {tag} should count the whole group"
+        );
+        deleted.extend(keys);
+    }
+    drop(c);
+
+    assert_state_after_restart(
+        port,
+        dir.path(),
+        child1,
+        &[],
+        &deleted,
+        "UNLINK co-located fast-path",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// BITOP — the dest write leg. Scatter shape: sources on another shard force
+// the gather path, then the synthesized `SET dest <result>` runs on dest's
+// owner — in-process and un-persisted when that owner == the connection's
+// shard. Fast-path shape: all keys co-located → whole BITOP via run_on_owner.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn bitop_dest_local_leg_persists_across_restart() {
+    let port = free_port();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let child1 = spawn_moon_aof(port, dir.path(), SHARDS);
+    wait_ready(port);
+
+    let tags = tags_per_shard(SHARDS as usize);
+    let n = tags.len();
+    let mut c = Conn::open(port);
+    let mut expected: Vec<(String, String)> = Vec::new();
+
+    for (s, tag) in tags.iter().enumerate() {
+        // Scatter shape: sources live on the NEXT shard, dest on shard s.
+        let src_tag = &tags[(s + 1) % n];
+        let src1 = format!("{{{}}}:b1", src_tag);
+        let src2 = format!("{{{}}}:b2", src_tag);
+        let dest = format!("{{{}}}:bdest", tag);
+        let r = c.cmd(&["SET", &src1, "aaa"]);
+        if is_diskfull(&r) {
+            eprintln!("SKIP bitop: MOONERR diskfull");
+            return;
+        }
+        assert_eq!(r, Resp::Simple("OK".to_string()));
+        assert_eq!(
+            c.cmd(&["SET", &src2, "bbb"]),
+            Resp::Simple("OK".to_string())
+        );
+        assert_eq!(
+            c.cmd(&["BITOP", "OR", &dest, &src1, &src2]),
+            Resp::Int(3),
+            "scatter BITOP OR on dest tag {tag}"
+        );
+        // 'a' | 'b' = 0x61 | 0x62 = 0x63 = 'c'
+        expected.push((dest, "ccc".to_string()));
+
+        // Fast-path shape: sources AND dest all co-located on shard s.
+        let fsrc1 = format!("{{{}}}:f1", tag);
+        let fsrc2 = format!("{{{}}}:f2", tag);
+        let fdest = format!("{{{}}}:fdest", tag);
+        assert_eq!(
+            c.cmd(&["SET", &fsrc1, "aaa"]),
+            Resp::Simple("OK".to_string())
+        );
+        assert_eq!(
+            c.cmd(&["SET", &fsrc2, "bbb"]),
+            Resp::Simple("OK".to_string())
+        );
+        assert_eq!(
+            c.cmd(&["BITOP", "OR", &fdest, &fsrc1, &fsrc2]),
+            Resp::Int(3),
+            "co-located BITOP OR on tag {tag}"
+        );
+        expected.push((fdest, "ccc".to_string()));
+    }
+    drop(c);
+
+    assert_all_survive_restart(port, dir.path(), child1, &expected, "BITOP dest leg");
+}
+
+// ---------------------------------------------------------------------------
+// COPY — the dst write leg. Cross-shard shape: src on another shard, the
+// synthesized `SET dst <value> NX` runs on dst's owner — un-persisted when
+// that owner == the connection's shard. Same-owner shape: whole COPY forwards
+// via run_on_owner (un-persisted local case).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn copy_dst_local_leg_persists_across_restart() {
+    let port = free_port();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let child1 = spawn_moon_aof(port, dir.path(), SHARDS);
+    wait_ready(port);
+
+    let tags = tags_per_shard(SHARDS as usize);
+    let n = tags.len();
+    let mut c = Conn::open(port);
+    let mut expected: Vec<(String, String)> = Vec::new();
+
+    for (s, tag) in tags.iter().enumerate() {
+        // Cross-shard shape: src on the NEXT shard, dst on shard s.
+        let src_tag = &tags[(s + 1) % n];
+        let src = format!("{{{}}}:csrc", src_tag);
+        let dst = format!("{{{}}}:cdst", tag);
+        let val = format!("{}-copyval", src_tag);
+        let r = c.cmd(&["SET", &src, &val]);
+        if is_diskfull(&r) {
+            eprintln!("SKIP copy: MOONERR diskfull");
+            return;
+        }
+        assert_eq!(r, Resp::Simple("OK".to_string()));
+        assert_eq!(
+            c.cmd(&["COPY", &src, &dst]),
+            Resp::Int(1),
+            "cross-shard COPY to dst tag {tag}"
+        );
+        expected.push((dst, val));
+
+        // Same-owner shape: src and dst co-located on shard s.
+        let fsrc = format!("{{{}}}:fsrc", tag);
+        let fdst = format!("{{{}}}:fdst", tag);
+        let fval = format!("{}-fcopyval", tag);
+        assert_eq!(
+            c.cmd(&["SET", &fsrc, &fval]),
+            Resp::Simple("OK".to_string())
+        );
+        assert_eq!(
+            c.cmd(&["COPY", &fsrc, &fdst]),
+            Resp::Int(1),
+            "same-owner COPY on tag {tag}"
+        );
+        expected.push((fdst, fval));
+    }
+    drop(c);
+
+    assert_all_survive_restart(port, dir.path(), child1, &expected, "COPY dst leg");
+}
+
 #[test]
 fn msetnx_colocated_local_leg_persists_across_restart() {
     let port = free_port();

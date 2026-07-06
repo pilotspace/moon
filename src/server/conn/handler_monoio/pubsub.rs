@@ -124,6 +124,7 @@ pub(super) async fn try_handle_subscribe_entry<S: monoio::io::AsyncWriteRent>(
     ctx: &super::super::core::ConnectionContext,
     peer_addr: &str,
     responses: &mut Vec<Frame>,
+    local_leg_write_idxs: &mut Vec<usize>,
     codec: &mut crate::server::codec::RespCodec,
     write_buf: &mut bytes::BytesMut,
     stream: &mut S,
@@ -154,6 +155,15 @@ pub(super) async fn try_handle_subscribe_entry<S: monoio::io::AsyncWriteRent>(
     if conn.subscriber_id == 0 {
         conn.subscriber_id = crate::pubsub::next_subscriber_id();
     }
+    // Earlier frames in this batch may hold barrier-pending local-leg
+    // writes — confirm (or fail-loud) them before this early flush.
+    crate::server::conn::shared::resolve_local_leg_barrier(
+        &ctx.aof_pool,
+        ctx.shard_id,
+        local_leg_write_idxs,
+        responses,
+    )
+    .await;
     // Flush accumulated responses before entering subscriber mode
     for resp in &*responses {
         codec.encode_frame(resp, write_buf);
