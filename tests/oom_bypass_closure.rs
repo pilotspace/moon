@@ -364,17 +364,20 @@ fn test_case_b_cross_shard_pipeline_oom() {
         .count();
     let other_count = N - oom_count - ok_count;
 
-    // With eviction enforced across ALL 4 shards, ~87.5KB / (2MB / 4 =
-    // 512KB per shard budget) means each shard accepts on the order of
-    // 512KB/4KB=128 writes before OOMing => ~4*128=512 total OKs out of
-    // 3000, then OOM for the rest. Without the fix, only the ~1/4 of keys
-    // that happen to land on THIS connection's own local shard can ever OOM
-    // (the pre-existing, already-correct local path) — the other ~3/4
-    // (remote legs) keep returning +OK unconditionally. That bounds the
-    // pre-fix OOM count at roughly N/4 (~750); the threshold below sits
-    // safely above that ceiling and safely below the post-fix floor.
+    // With eviction enforced across ALL 4 shards, each shard accepts writes
+    // until its share of the 2MB cap is used, then OOMs the rest — but the
+    // exact OK count is timing-sensitive: the GAP-1 elastic budget
+    // redistributes per-shard caps on a 100ms snapshot tick, so early writes
+    // can land before budgets tighten (observed ~500-1100 OKs of 3000 across
+    // machines). Without the fix, only the ~1/4 of keys landing on THIS
+    // connection's own local shard can ever OOM (the pre-existing,
+    // already-correct local path) — the other ~3/4 (remote legs) return +OK
+    // unconditionally, bounding the pre-fix OOM count at roughly N/4 (~750).
+    // N/2 sits with wide margin above that ceiling and below the post-fix
+    // floor (~1900+ observed), so the assertion discriminates the bypass
+    // without being sensitive to eviction-tick timing.
     assert!(
-        oom_count >= (N * 2) / 3,
+        oom_count >= N / 2,
         "cross-shard SPSC bypass: expected the large majority of {N} \
          oversubscribed writes to OOM once every shard's budget is \
          exhausted, got only {oom_count} OOM / {ok_count} OK / \
