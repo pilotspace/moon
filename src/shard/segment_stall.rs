@@ -10,9 +10,11 @@
 //!
 //! - **MA12 (disk monitor):** sets `RECL_WRITE_STALL_ACTIVE` on disk-pressure events.
 //! - **MA1 (this module):** sets `RECL_SEGMENT_STALL_ACTIVE` on segment-backlog events.
-//! - **INFO `write_stall_active`:** emits `true` if EITHER bit is non-zero (OR of both).
+//! - **Wave 3 (mem monitor):** sets `RECL_MEM_WATCHDOG_ACTIVE` on RSS-pressure events.
+//! - **INFO `write_stall_active`:** emits `true` if ANY bit is non-zero (OR of all three).
 //! - **Dispatch `try_enforce_write_stall`:** calls `is_any_write_stall_active()` which
-//!   ORs `is_write_paused()` (MA12) with `is_segment_stall_active()` (MA1).
+//!   ORs `is_write_paused()` (MA12) with `is_segment_stall_active()` (MA1) with
+//!   `mem_monitor::is_write_paused()` (Wave 3).
 //!
 //! ## Hot-path cost
 //!
@@ -39,15 +41,20 @@ pub fn is_segment_stall_active() -> bool {
     RECL_SEGMENT_STALL_ACTIVE.load(Ordering::Relaxed) != 0
 }
 
-/// Returns `true` if ANY write stall is active (disk-pressure OR segment-backlog).
+/// Returns `true` if ANY write stall is active (disk-pressure OR segment-backlog
+/// OR RSS memory pressure).
 ///
-/// This is the unified check used by both dispatch paths. OR-merges MA12 and MA1:
+/// This is the unified check used by both dispatch paths. OR-merges MA12, MA1,
+/// and Wave 3:
 ///
-/// - `is_write_paused()` — MA12 disk-free monitor (AtomicBool, set every 5s).
+/// - `disk_monitor::is_write_paused()` — MA12 disk-free monitor (AtomicBool, set every 5s).
 /// - `is_segment_stall_active()` — MA1 segment backlog (AtomicU64, set every 1s).
+/// - `mem_monitor::is_write_paused()` — Wave 3 RSS watchdog (AtomicBool, set every 5s).
 #[inline]
 pub fn is_any_write_stall_active() -> bool {
-    crate::shard::disk_monitor::is_write_paused() || is_segment_stall_active()
+    crate::shard::disk_monitor::is_write_paused()
+        || is_segment_stall_active()
+        || crate::shard::mem_monitor::is_write_paused()
 }
 
 /// Update the segment-stall atomic based on the current immutable segment count.

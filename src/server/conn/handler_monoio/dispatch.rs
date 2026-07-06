@@ -687,21 +687,24 @@ pub(super) fn try_enforce_readonly(
     false
 }
 
-/// MA12 + MA1: Refuse write commands when any write stall is active.
+/// MA12 + MA1 + Wave 3: Refuse write commands when any write stall is active.
 ///
 /// Returns `true` if the command was blocked (caller should `continue`).
 ///
 /// Stall sources (OR-merged):
 /// - MA12 disk-pressure monitor (`is_write_paused`) — set every 5s.
 /// - MA1 segment-backlog stall (`is_segment_stall_active`) — set every 1s.
+/// - Wave 3 RSS memory watchdog (`mem_monitor::is_write_paused`) — set every 5s.
 ///
-/// Hot path: two `Atomic::load(Relaxed)` — no allocation, no lock.
+/// Hot path: three `Atomic::load(Relaxed)` — no allocation, no lock.
 /// Read-only commands pass through unaffected. Background compaction is exempt.
 #[inline]
 pub(super) fn try_enforce_disk_full(cmd: &[u8], responses: &mut Vec<Frame>) -> bool {
     if metadata::is_write(cmd) && crate::shard::segment_stall::is_any_write_stall_active() {
         let msg: &'static [u8] = if crate::shard::disk_monitor::is_write_paused() {
             b"MOONERR diskfull: writes paused until free space recovers"
+        } else if crate::shard::mem_monitor::is_write_paused() {
+            b"MOONERR memfull: writes paused until memory pressure recovers"
         } else {
             b"MOONERR busy: compaction backlog; too many unflushed immutable segments"
         };
