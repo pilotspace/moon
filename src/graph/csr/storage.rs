@@ -305,6 +305,24 @@ impl CsrStorage {
         }
     }
 
+    /// Get-or-build this segment's lazy property index over CSR rows.
+    /// Built once from node_meta + the v5 property blob; cached in the
+    /// segment's `OnceLock` (interior mutability — read-only derived state,
+    /// same pattern as `incoming_index`).
+    pub fn property_index(&self) -> &crate::graph::index::SegmentPropertyIndexes {
+        match self {
+            CsrStorage::Heap(s) => s.props_index.get_or_init(|| {
+                crate::graph::index::SegmentPropertyIndexes::build(&s.node_meta, &s.node_props)
+            }),
+            CsrStorage::Mmap(s) => s.props_index.get_or_init(|| {
+                crate::graph::index::SegmentPropertyIndexes::build(
+                    s.node_meta(),
+                    s.node_props_blob(),
+                )
+            }),
+        }
+    }
+
     /// Node property blob (empty for pre-v5 segments).
     pub fn node_props_blob(&self) -> &[u8] {
         match self {

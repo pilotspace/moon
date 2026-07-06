@@ -570,6 +570,7 @@ pub fn compact_segments(
         edge_props: merged_edge_props,
         created_lsn,
         incoming: std::sync::OnceLock::new(),
+        props_index: std::sync::OnceLock::new(),
     })
 }
 

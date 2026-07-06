@@ -52,6 +52,8 @@ pub struct MmapCsrSegment {
     /// arrays. NOT part of the on-disk format — rebuilt on the first Incoming/Both
     /// query. (v3-2 graph-incoming-edges.)
     pub incoming: std::sync::OnceLock<IncomingIndex>,
+    /// Lazily built per-segment property indexes (see `SegmentPropertyIndexes`).
+    pub props_index: std::sync::OnceLock<crate::graph::index::SegmentPropertyIndexes>,
     /// Pointer into mmap: node property blob (version >= 5; dangling+0 otherwise).
     node_props_ptr: *const u8,
     node_props_len: usize,
@@ -363,6 +365,7 @@ impl MmapCsrSegment {
             edge_type_index,
             created_lsn,
             incoming: std::sync::OnceLock::new(),
+            props_index: std::sync::OnceLock::new(),
             node_props_ptr: np_ptr,
             node_props_len: np_len,
             edge_props_ptr: ep_ptr,

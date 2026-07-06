@@ -86,6 +86,8 @@ pub struct CsrSegment {
     /// `col_indices`. NOT persisted (excluded from `to_bytes`/`from_bytes`) —
     /// rebuilt on the first Incoming/Both query. (v3-2 graph-incoming-edges.)
     pub incoming: std::sync::OnceLock<IncomingIndex>,
+    /// Lazily built per-segment property indexes (see `SegmentPropertyIndexes`).
+    pub props_index: std::sync::OnceLock<crate::graph::index::SegmentPropertyIndexes>,
 }
 
 impl CsrSegment {
@@ -265,6 +267,7 @@ impl CsrSegment {
             edge_props,
             created_lsn: lsn,
             incoming: std::sync::OnceLock::new(),
+            props_index: std::sync::OnceLock::new(),
         })
     }
 
@@ -879,6 +882,7 @@ impl CsrSegment {
             edge_props,
             created_lsn,
             incoming: std::sync::OnceLock::new(),
+            props_index: std::sync::OnceLock::new(),
         })
     }
 
@@ -1968,6 +1972,44 @@ mod tests {
         assert_eq!(csr.row_offsets[row_b as usize + 1] - sb, 1);
         assert_eq!(csr.edge_weight(sb), 1.0);
         assert!(csr.edge_properties(sb).is_empty());
+    }
+
+    #[test]
+    fn test_segment_property_index_eq_and_range() {
+        let (frozen, a, b) = frozen_with_props();
+        let storage = CsrStorage::from(CsrSegment::from_frozen(frozen, 10).expect("csr ok"));
+        let row_a = storage.lookup_node(a).expect("row a");
+        let row_b = storage.lookup_node(b).expect("row b");
+        let idx = storage.property_index();
+
+        // Numeric equality (Int normalized to f64).
+        let rows = idx.rows_eq(1, &PropertyValue::Int(7));
+        assert_eq!(rows.iter().collect::<Vec<_>>(), vec![row_a]);
+        assert!(idx.rows_eq(1, &PropertyValue::Int(8)).is_empty());
+        // Float form of the same value matches (single numeric B-tree).
+        let rows = idx.rows_eq(1, &PropertyValue::Float(7.0));
+        assert_eq!(rows.iter().collect::<Vec<_>>(), vec![row_a]);
+
+        // String equality via xxh64 hash.
+        let rows = idx.rows_eq(
+            2,
+            &PropertyValue::String(bytes::Bytes::from_static(b"alice")),
+        );
+        assert_eq!(rows.iter().collect::<Vec<_>>(), vec![row_a]);
+        assert!(
+            idx.rows_eq(2, &PropertyValue::String(bytes::Bytes::from_static(b"bob")))
+                .is_empty()
+        );
+
+        // Range query.
+        let rows = idx.rows_range(1, 0.0, 10.0);
+        assert!(rows.contains(row_a));
+        assert!(!rows.contains(row_b));
+        assert!(idx.rows_range(1, 8.0, 10.0).is_empty());
+
+        // Unindexed property id: the index is exhaustive over segment rows,
+        // so absence means NO row carries it — empty, not a fallback signal.
+        assert!(idx.rows_eq(99, &PropertyValue::Int(1)).is_empty());
     }
 
     #[test]
