@@ -6,6 +6,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — proactive RSS watchdog pauses writes before kernel OOM (PR #TBD)
+
+- **New `mem_monitor` guard** (`src/shard/mem_monitor.rs`), the memory
+  analogue of the existing diskfull guard (MA12): pauses writes once process
+  RSS crosses `--mem-full-pct` (default 95, 0 = disabled) of the DETECTED
+  system/cgroup memory limit, not the configured `--maxmemory` (which can be
+  an unconfigured `0`/unlimited). Mirrors `disk_monitor`'s hysteresis state
+  machine, inverted for direction (high RSS is bad): pauses at
+  `rss% >= mem_full_pct`, resumes only at `rss% <= mem_full_pct - 5`.
+  `MOONERR memfull: writes paused until memory pressure recovers` joins the
+  existing `MOONERR diskfull` / `MOONERR busy` message-selection chain in
+  both dispatch paths (order: diskfull, memfull, segment-backlog busy); the
+  hot-path cost is one additional `AtomicBool::load(Relaxed)` inside the
+  already write-gated branch. Polled on shard 0's existing 5s disk-monitor
+  timer tick (both event-loop poll sites), plus one immediate poll at
+  startup (`init_global`) so the AOF-replay/segment-load recovery peak is
+  visible before the first tick. New INFO fields
+  `reclamation_mem_rss_bytes` / `reclamation_mem_watchdog_active`
+  (OR'd into the existing `reclamation_write_stall_active`). Same accepted
+  trade-off as the diskfull guard: `DEL`/`UNLINK`/`EXPIRE`/`FLUSHALL` are
+  write-flagged and blocked too while paused — no allowlist.
+
 ### Fixed — zombie/CPU hardening wave 1 (PR #TBD)
 
 - **Busy-poll spin idle-disengages** (`--io-busy-poll-us` / vendored monoio

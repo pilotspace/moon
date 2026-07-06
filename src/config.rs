@@ -467,6 +467,25 @@ pub struct ServerConfig {
     #[arg(long = "disk-free-min-pct", default_value_t = 5, value_parser = clap::value_parser!(u8).range(0..=95))]
     pub disk_free_min_pct: u8,
 
+    // ── Wave 3: proactive RSS memory watchdog ("mem-full guard") ───────────
+    /// Pause writes when process RSS crosses this percentage of the detected
+    /// system/cgroup memory limit.
+    ///
+    /// This is the memory analogue of `--disk-free-min-pct` (MA12): it fires
+    /// on the ACTUAL RSS vs the detected limit (`detect_memory_limit_bytes`),
+    /// not on the configured `--maxmemory` (which can be an unconfigured 0).
+    /// The direction is INVERTED vs the disk guard: high RSS is bad, so
+    /// writes pause once RSS% >= `mem_full_pct` and resume only once
+    /// RSS% <= `mem_full_pct - 5` (hysteresis, prevents flapping).
+    ///
+    /// Read-only commands are never blocked. Like the diskfull guard,
+    /// DEL/UNLINK/EXPIRE/FLUSHALL are write-flagged and are blocked too while
+    /// paused — the same accepted trade-off as MA12; no allowlist.
+    ///
+    /// Set to 0 to disable the monitor entirely.
+    #[arg(long = "mem-full-pct", default_value_t = 95, value_parser = clap::value_parser!(u8).range(0..=100))]
+    pub mem_full_pct: u8,
+
     // ── P3: MVCC committed-set prune margin ────────────────────────────────
     /// Number of LSN units to keep in the MVCC committed treemap above the
     /// oldest active snapshot watermark before pruning entries below.
@@ -1004,7 +1023,7 @@ fn parse_cgroup_mem_max(contents: &str) -> Option<usize> {
 /// (v2 then v1) and host RAM. Linux-only; returns `None` elsewhere or when
 /// nothing is readable (the guardrail then fails open with a warning).
 #[cfg(target_os = "linux")]
-fn detect_memory_limit_bytes() -> Option<usize> {
+pub(crate) fn detect_memory_limit_bytes() -> Option<usize> {
     let host = std::fs::read_to_string("/proc/meminfo")
         .ok()
         .and_then(|c| parse_meminfo_memtotal(&c));
@@ -1029,7 +1048,7 @@ fn detect_memory_limit_bytes() -> Option<usize> {
 /// unsafe blocks; it runs once at startup so the fork cost is irrelevant.
 /// No container limit concept applies on macOS, so host RAM is the limit.
 #[cfg(target_os = "macos")]
-fn detect_memory_limit_bytes() -> Option<usize> {
+pub(crate) fn detect_memory_limit_bytes() -> Option<usize> {
     let out = std::process::Command::new("sysctl")
         .args(["-n", "hw.memsize"])
         .output()
@@ -1044,7 +1063,7 @@ fn detect_memory_limit_bytes() -> Option<usize> {
 /// guardrail is skipped (operator sets `--maxmemory` explicitly). Production
 /// targets Linux/macOS per the platform policy.
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn detect_memory_limit_bytes() -> Option<usize> {
+pub(crate) fn detect_memory_limit_bytes() -> Option<usize> {
     None
 }
 

@@ -1639,6 +1639,8 @@ impl super::Shard {
                 _ = disk_monitor_interval.0.tick() => {
                     if shard_id == 0 {
                         crate::shard::disk_monitor::poll_global();
+                        // Wave 3: RSS memory watchdog poll (same 5s tick).
+                        crate::shard::mem_monitor::poll_global();
                     }
                 }
                 // P4: Autovacuum daemon tick (default 30s interval).
@@ -2237,6 +2239,8 @@ impl super::Shard {
                 // MA12: Disk free-space poll (every 5000 ticks = 5s, shard 0 only).
                 if shard_id == 0 && monoio_tick_counter % 5000 == 0 {
                     crate::shard::disk_monitor::poll_global();
+                    // Wave 3: RSS memory watchdog poll (same 5s tick).
+                    crate::shard::mem_monitor::poll_global();
                 }
                 // P4: Autovacuum daemon tick (every autovacuum_interval_secs * 1000 ticks).
                 if monoio_tick_counter % (autovacuum_interval_secs * 1000) == 0

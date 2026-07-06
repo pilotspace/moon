@@ -889,6 +889,14 @@ fn main() -> anyhow::Result<()> {
         moon::shard::disk_monitor::init_global(config.disk_free_min_pct, monitor_path);
     }
 
+    // Wave 3: Initialise proactive RSS memory watchdog ("mem-full guard").
+    // Fires on ACTUAL RSS vs the detected system/cgroup limit, not on
+    // --maxmemory (which can be an unconfigured 0). When mem_full_pct == 0,
+    // the monitor is inactive (poll_global is a no-op, is_write_paused always
+    // false). Runs one immediate poll so the startup recovery peak (AOF
+    // replay + segment load) is visible before the first 5s timer tick.
+    moon::shard::mem_monitor::init_global(config.mem_full_pct);
+
     // Collect all notifiers before spawning shard threads
     let all_notifiers = mesh.all_notifiers();
 
