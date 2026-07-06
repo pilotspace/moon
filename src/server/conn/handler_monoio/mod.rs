@@ -192,6 +192,10 @@ pub(crate) async fn handle_connection_sharded_monoio<
     > = HashMap::with_capacity(ctx.num_shards);
     let mut reply_futures: Vec<(Vec<(usize, Option<Bytes>, Bytes)>, usize)> =
         Vec::with_capacity(ctx.num_shards);
+    // v3-5 group commit: response indexes of coordinator LOCAL-leg writes whose
+    // AOF append was enqueued but not yet fsync-confirmed (appendfsync=always).
+    // Drained by ONE fsync_barrier(ctx.shard_id) at end of batch.
+    let mut local_leg_write_idxs: Vec<usize> = Vec::new();
 
     // Pre-allocated response slots for zero-allocation cross-shard dispatch
     // (L3b, tokio parity — handler_sharded/mod.rs). One slot per target shard;
@@ -589,6 +593,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
         let mut should_quit = false;
         responses.clear();
         remote_groups.clear();
+        local_leg_write_idxs.clear();
         let mut publish_batches: std::collections::HashMap<usize, Vec<(usize, Bytes, Bytes)>> =
             std::collections::HashMap::new();
 
@@ -751,6 +756,15 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 if let Some((repl_id, offset)) =
                     dispatch::try_handle_psync(cmd, cmd_args, ctx, &mut responses)
                 {
+                    // Earlier frames in this batch may hold barrier-pending
+                    // local-leg writes — confirm them before this early flush.
+                    crate::server::conn::shared::resolve_local_leg_barrier(
+                        &ctx.aof_pool,
+                        ctx.shard_id,
+                        &mut local_leg_write_idxs,
+                        &mut responses,
+                    )
+                    .await;
                     for resp in &responses {
                         codec.encode_frame(resp, &mut write_buf);
                     }
@@ -819,6 +833,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 ctx,
                 &peer_addr,
                 &mut responses,
+                &mut local_leg_write_idxs,
                 &mut codec,
                 &mut write_buf,
                 &mut stream,
@@ -919,6 +934,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 &mut conn,
                 ctx,
                 &mut responses,
+                &mut local_leg_write_idxs,
                 &mut codec,
                 &mut write_buf,
                 &mut stream,
@@ -940,8 +956,15 @@ pub(crate) async fn handle_connection_sharded_monoio<
             }
 
             // --- Cross-shard aggregation commands: KEYS, SCAN, DBSIZE + multi-key ---
-            if dispatch::try_handle_cross_shard_commands(cmd, cmd_args, &conn, ctx, &mut responses)
-                .await
+            if dispatch::try_handle_cross_shard_commands(
+                cmd,
+                cmd_args,
+                &conn,
+                ctx,
+                &mut responses,
+                &mut local_leg_write_idxs,
+            )
+            .await
             {
                 continue;
             }
@@ -1800,6 +1823,21 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 }
             }
         }
+
+        // v3-5 GROUP-COMMIT BARRIER: coordinator LOCAL legs were enqueued
+        // fire-and-forget into MY shard's AOF writer during dispatch; one
+        // barrier here confirms every one of them with a single fsync instead
+        // of the retired per-command awaited fsync (2000ms tail stack). Runs
+        // BEFORE response serialization — the client never sees +OK for a
+        // write whose durability was not confirmed. Early-flush paths (PSYNC,
+        // blocking, SUBSCRIBE) resolve the same barrier before THEIR flushes.
+        crate::server::conn::shared::resolve_local_leg_barrier(
+            &ctx.aof_pool,
+            ctx.shard_id,
+            &mut local_leg_write_idxs,
+            &mut responses,
+        )
+        .await;
 
         // AUTH rate limiting: delay response to slow down brute-force attacks
         if auth_delay_ms > 0 {

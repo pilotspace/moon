@@ -6,6 +6,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance — coordinator local legs ride group commit under appendfsync=always (PR #TBD)
+
+- The cross-shard coordinator's LOCAL-leg persist (co-located MSET/MSETNX and
+  scattered-MSET local slices) awaited one fsync ack **per command**, each
+  bounded by `--aof-fsync-timeout-ms` (default 2000ms) — a pipeline of
+  coordinated writes stacked these serially into the 2000–3000ms `always`
+  far-tail measured on Linux/GCE (c2d-standard-16, pd-ssd; see the v3-4
+  bench notes — OrbStack/macOS fsync is near-free and does not reproduce it). Local legs now enqueue fire-and-forget (bounded
+  backpressure, same contract as the remote SPSC legs) and the connection
+  handler confirms them with **one** `fsync_barrier` on the local shard per
+  pipeline batch, before responses are serialized — so `+OK` still implies
+  confirmed durability, but a batch of N coordinated writes costs 1 awaited
+  fsync instead of N. `everysec`/`no` behavior is unchanged. On barrier
+  failure every affected response is replaced with `MOONERR AOF fsync`
+  (never a false `+OK`).
+
+### Fixed — BITOP/COPY/DEL/UNLINK coordinator local legs now persist (PR #TBD)
+
+- The cross-shard coordinator's in-process legs for BITOP (dest write),
+  COPY (dst write + TTL restore), and multi-key DEL/UNLINK (co-located
+  fast path AND the scattered local slice) executed in memory but never
+  reached the owning shard's AOF — deleted keys **resurrected** from
+  their seed writes on restart, and BITOP/COPY results on the
+  connection's own shard silently vanished (carried v3-4 follow-up;
+  remote legs were always durable via MultiExecute). All four now
+  persist through the same `persist_local_leg` group-commit path as
+  MSET/MSETNX: synthesized over only locally-owned keys, skipped when
+  nothing was written (DEL of missing keys), and confirmed by the
+  batch-end fsync barrier under `appendfsync=always`.
+
 ### Fixed — cold-tier (disk offload) correctness & reliability (PR #TBD)
 
 - **DEL/UNLINK/FLUSHALL now reach the cold tier** — deleting a key whose value
