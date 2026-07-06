@@ -9,6 +9,7 @@ pub mod filter;
 pub mod fusion;
 pub mod hnsw;
 pub mod index_persist;
+pub mod keymap;
 pub mod metrics;
 pub mod mvcc;
 pub mod persistence;
