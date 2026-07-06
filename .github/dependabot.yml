@@ -26,3 +26,8 @@ updates:
       day: monday
       time: "07:00"
     open-pull-requests-limit: 3
+    ignore:
+      # The rust-toolchain action pin IS the MSRV (1.94) check — bumping it
+      # to the latest stable defeats the MSRV gate. Bump only when the MSRV
+      # policy itself changes (see CLAUDE.md).
+      - dependency-name: dtolnay/rust-toolchain

@@ -582,11 +582,13 @@ fn test_case_e_cross_db_copy_oom() {
 
     // Threshold picked from observed data, same methodology as case B:
     // gate-block-disabled (routing intact, see the Gap A commit body) run =
-    // 0/300 OOM; fully fixed = 76/300. N/10 (30) sits safely above the RED
-    // floor and safely below the GREEN observed count, robust to
-    // elastic-budget (GAP-1) variance across CI machines.
+    // 0/300 OOM EXACTLY; fully fixed = 76/300 locally but as low as 28/300
+    // on slow CI runners (GAP-1's elastic budget redistributes on a 100ms
+    // tick, so the OOM share is timing-sensitive — N/10 flaked at 28<30 on
+    // GitHub Actions). Since the RED floor is exactly 0, any clearly-nonzero
+    // threshold discriminates; N/30 (10) keeps margin both ways.
     assert!(
-        oom_count >= N / 10,
+        oom_count >= N / 30,
         "cross-shard COPY bypass: expected a substantial share of {N} COPYs \
          routed via cross-shard SPSC to OOM once their shard's budget is \
          exhausted, got only {oom_count} OOM / {ok_count} OK / \

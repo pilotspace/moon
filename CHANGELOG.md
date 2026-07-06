@@ -6,6 +6,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — consolidated dependency bumps (PR #TBD)
+
+- Cargo: `ringbuf` 0.4.8 → 0.5.0 and `metrics-exporter-prometheus` 0.16.2 →
+  0.18.3 (semver-major; both compile and test green with no code changes —
+  verified by dependabot's per-bump CI runs and locally), `bytes` 1.11.1 →
+  1.12.0, `rand` 0.10.1 → 0.10.2, `lz4_flex` 0.13.0 → 0.13.1, `cmov` 0.5.3 →
+  0.5.4, `cudarc` 0.19.4 → 0.19.8 (gpu feature, not covered by CI — patch
+  bump), and `openssl` 0.10.78 → 0.10.81 in `sdk/rust` (security bump).
+- GitHub Actions: `actions/checkout` v4 → v7 (including one straggler in
+  `docker-publish.yml` dependabot missed), `actions/deploy-pages` v4 → v5.
+- Console: `vite` 7.3.2 → 7.3.5 (dev dependency).
+- Dependabot: `dtolnay/rust-toolchain` is now ignored — its pin IS the MSRV
+  (1.94) gate, so auto-bumping it to latest stable (rejected PR #195)
+  silently defeats the MSRV check.
+- Supersedes dependabot PRs #191, #194, #196–#201, #208–#210 (their Lint
+  failures were the CHANGELOG-entry gate, which this consolidated PR
+  satisfies once).
+
 ### Fixed — proactive RSS watchdog pauses writes before kernel OOM (PR #TBD)
 
 - **New `mem_monitor` guard** (`src/shard/mem_monitor.rs`), the memory
