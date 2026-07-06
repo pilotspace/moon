@@ -20,12 +20,13 @@
 //! coordinator's multi-key scatter path for MGET/MSET/multi-DEL, which
 //! never carries MOVE/COPY; `ExecuteSlotted`/`MultiExecuteSlotted` have no
 //! live constructor at all). The two wire-level cases below exercise the
-//! one arm real traffic actually uses (`PipelineBatchSlotted`); the other
-//! arms are covered by direct unit tests of the shared
-//! `try_two_db_intercept` helper in `src/shard/spsc_two_db.rs`, which every
-//! arm (including `PipelineBatchSlotted`) calls verbatim — so the wire-level
-//! coverage here transitively validates the same logic the dead/secondary
-//! arms use.
+//! one arm real traffic actually uses (`PipelineBatchSlotted`), which calls
+//! the shared `try_two_db_intercept` helper (`src/shard/spsc_two_db.rs`)
+//! verbatim — the same helper every other arm calls — so this coverage
+//! transitively validates the logic the dead/admin-only arms share, though
+//! it does not independently exercise those arms' own call sites. No direct
+//! unit test of `try_two_db_intercept` exists yet (a documented gap, not a
+//! claim of coverage that isn't there).
 //!
 //! Run alone with:
 //!   MOON_BIN=$PWD/target/release/moon cargo test --test spsc_two_db
