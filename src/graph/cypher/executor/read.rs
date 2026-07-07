@@ -541,6 +541,7 @@ pub fn execute(
                 direction,
                 min_hops,
                 max_hops,
+                optional,
             } => {
                 let type_ids: Vec<u16> = edge_types
                     .iter()
@@ -578,8 +579,16 @@ pub fn execute(
                 for row in &rows {
                     let src_key = match row.get(source) {
                         Some(Value::Node(k)) => *k,
-                        _ => continue,
+                        _ => {
+                            // W2-13: a Null/unbound source under OPTIONAL
+                            // MATCH survives null-padded instead of dropping.
+                            if *optional {
+                                push_null_padded(row, target, edge_variable, &mut new_rows);
+                            }
+                            continue;
+                        }
                     };
+                    let row_start = new_rows.len();
 
                     if *max_hops <= 1 {
                         // Single-hop expansion via SegmentMergeReader.
@@ -656,6 +665,12 @@ pub fn execute(
                             }
                         }
                     }
+
+                    // W2-13: zero matches under OPTIONAL MATCH → the source
+                    // row survives with target/edge bound to Null.
+                    if *optional && new_rows.len() == row_start {
+                        push_null_padded(row, target, edge_variable, &mut new_rows);
+                    }
                 }
                 rows = new_rows;
             }
@@ -677,7 +692,11 @@ pub fn execute(
                 });
             }
 
-            PhysicalOp::Project { items, distinct } => {
+            PhysicalOp::Project {
+                items,
+                distinct,
+                rebind,
+            } => {
                 columns = items
                     .iter()
                     .map(|item| {
@@ -738,8 +757,25 @@ pub fn execute(
                     dedup_rows(&mut projected);
                 }
 
-                projected_rows = Some(projected);
-                rows.clear();
+                if *rebind {
+                    // W2-13 WITH: re-seed the variable-binding row stream
+                    // with the projection outputs so later clauses (WHERE /
+                    // ORDER BY / MATCH / RETURN) keep executing. `columns`
+                    // stays set but the final RETURN overwrites it.
+                    let mut new_rows = Vec::with_capacity(projected.len());
+                    for vals in projected {
+                        let mut new_row = Row::seed(&slot_table);
+                        for (name, val) in columns.iter().zip(vals) {
+                            new_row.insert(name, val);
+                        }
+                        new_rows.push(new_row);
+                    }
+                    rows = new_rows;
+                    projected_rows = None;
+                } else {
+                    projected_rows = Some(projected);
+                    rows.clear();
+                }
             }
 
             PhysicalOp::Sort { items } => {
@@ -1108,6 +1144,7 @@ pub fn execute_profile(
                 direction,
                 min_hops,
                 max_hops,
+                optional,
             } => {
                 let type_ids: Vec<u16> = edge_types
                     .iter()
@@ -1145,8 +1182,15 @@ pub fn execute_profile(
                 for row in &rows {
                     let src_key = match row.get(source) {
                         Some(Value::Node(k)) => *k,
-                        _ => continue,
+                        _ => {
+                            // W2-13 OPTIONAL MATCH (parity with main executor).
+                            if *optional {
+                                push_null_padded(row, target, edge_variable, &mut new_rows);
+                            }
+                            continue;
+                        }
                     };
+                    let row_start = new_rows.len();
 
                     if *max_hops <= 1 {
                         reader.neighbors_into(src_key, &mut nb_seen, &mut nb_buf);
@@ -1219,6 +1263,10 @@ pub fn execute_profile(
                             }
                         }
                     }
+
+                    if *optional && new_rows.len() == row_start {
+                        push_null_padded(row, target, edge_variable, &mut new_rows);
+                    }
                 }
                 rows = new_rows;
             }
@@ -1240,7 +1288,11 @@ pub fn execute_profile(
                 });
             }
 
-            PhysicalOp::Project { items, distinct } => {
+            PhysicalOp::Project {
+                items,
+                distinct,
+                rebind,
+            } => {
                 columns = items
                     .iter()
                     .map(|item| {
@@ -1301,8 +1353,22 @@ pub fn execute_profile(
                     dedup_rows(&mut projected);
                 }
 
-                projected_rows = Some(projected);
-                rows.clear();
+                if *rebind {
+                    // W2-13 WITH rebind (parity with main executor).
+                    let mut new_rows = Vec::with_capacity(projected.len());
+                    for vals in projected {
+                        let mut new_row = Row::seed(&slot_table);
+                        for (name, val) in columns.iter().zip(vals) {
+                            new_row.insert(name, val);
+                        }
+                        new_rows.push(new_row);
+                    }
+                    rows = new_rows;
+                    projected_rows = None;
+                } else {
+                    projected_rows = Some(projected);
+                    rows.clear();
+                }
             }
 
             PhysicalOp::Sort { items } => {

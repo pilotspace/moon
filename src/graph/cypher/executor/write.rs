@@ -70,6 +70,7 @@ pub fn execute_mut(
                 direction,
                 min_hops,
                 max_hops,
+                optional,
             } => {
                 let type_ids: Vec<u16> = edge_types
                     .iter()
@@ -105,8 +106,15 @@ pub fn execute_mut(
                 for row in &rows {
                     let src_key = match row.get(source) {
                         Some(Value::Node(k)) => *k,
-                        _ => continue,
+                        _ => {
+                            // W2-13 OPTIONAL MATCH (parity with the read path).
+                            if *optional {
+                                push_null_padded(row, target, edge_variable, &mut new_rows);
+                            }
+                            continue;
+                        }
                     };
+                    let row_start = new_rows.len();
 
                     if *max_hops <= 1 {
                         reader.neighbors_into(src_key, &mut nb_seen, &mut nb_buf);
@@ -169,6 +177,10 @@ pub fn execute_mut(
                             }
                         }
                     }
+
+                    if *optional && new_rows.len() == row_start {
+                        push_null_padded(row, target, edge_variable, &mut new_rows);
+                    }
                 }
                 rows = new_rows;
             }
@@ -190,7 +202,11 @@ pub fn execute_mut(
                 });
             }
 
-            PhysicalOp::Project { items, distinct } => {
+            PhysicalOp::Project {
+                items,
+                distinct,
+                rebind,
+            } => {
                 columns = items
                     .iter()
                     .map(|item| {
@@ -202,6 +218,8 @@ pub fn execute_mut(
                     })
                     .collect();
 
+                // W2-12 note: aggregate-mode projection (try_project_aggregate)
+                // is read-path only; the write path keeps per-row semantics.
                 let mut projected: Vec<Vec<Value>> = rows
                     .iter()
                     .map(|row| {
@@ -234,8 +252,22 @@ pub fn execute_mut(
                     dedup_rows(&mut projected);
                 }
 
-                projected_rows = Some(projected);
-                rows.clear();
+                if *rebind {
+                    // W2-13 WITH rebind (parity with the read path).
+                    let mut new_rows = Vec::with_capacity(projected.len());
+                    for vals in projected {
+                        let mut new_row = Row::seed(&slot_table);
+                        for (name, val) in columns.iter().zip(vals) {
+                            new_row.insert(name, val);
+                        }
+                        new_rows.push(new_row);
+                    }
+                    rows = new_rows;
+                    projected_rows = None;
+                } else {
+                    projected_rows = Some(projected);
+                    rows.clear();
+                }
             }
 
             PhysicalOp::Sort { items } => {

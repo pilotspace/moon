@@ -97,9 +97,21 @@ impl SlotTable {
                     }
                 }
                 PhysicalOp::Merge { pattern, .. } => table.bind_pattern(pattern),
+                // W2-13: a rebinding projection (WITH) re-seeds the row
+                // stream with its output names; RETURN (rebind: false)
+                // still binds nothing.
+                PhysicalOp::Project { items, rebind, .. } => {
+                    if *rebind {
+                        for item in items {
+                            match &item.alias {
+                                Some(alias) => table.bind(alias),
+                                None => table.bind(&eval::expr_to_string(&item.expr)),
+                            }
+                        }
+                    }
+                }
                 // Reference-only operators bind nothing.
                 PhysicalOp::Filter { .. }
-                | PhysicalOp::Project { .. }
                 | PhysicalOp::Sort { .. }
                 | PhysicalOp::Limit { .. }
                 | PhysicalOp::Skip { .. }
@@ -203,6 +215,24 @@ impl<'a> Row<'a> {
             .map(String::as_str)
             .zip(self.slots.iter())
     }
+}
+
+/// W2-13 OPTIONAL MATCH: emit `row` with the expansion's target (and edge
+/// variable, when the pattern binds one) set to Null — the survival row for
+/// a source that matched nothing. Free function (not a closure) so the
+/// `Row<'a>` lifetime unifies between the borrowed input and the output Vec.
+fn push_null_padded<'a>(
+    row: &Row<'a>,
+    target: &str,
+    edge_variable: &Option<String>,
+    out: &mut Vec<Row<'a>>,
+) {
+    let mut new_row = row.clone();
+    new_row.insert(target, Value::Null);
+    if let Some(evar) = edge_variable {
+        new_row.insert(evar, Value::Null);
+    }
+    out.push(new_row);
 }
 
 /// Execution error.

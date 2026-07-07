@@ -7,7 +7,7 @@
 //! The cost estimator selects between graph-first and vector-first strategies
 //! based on per-graph `GraphStats` (degree distribution, node/edge counts).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::graph::cypher::ast::*;
@@ -90,6 +90,11 @@ pub enum PhysicalOp {
         direction: EdgeDirection,
         min_hops: u32,
         max_hops: u32,
+        /// W2-13 OPTIONAL MATCH: a source row whose expansion yields zero
+        /// matches survives with `target` (and `edge_variable`) bound to
+        /// Null instead of being dropped. A Null/unbound source also
+        /// null-pads instead of being filtered out.
+        optional: bool,
     },
     /// Filter rows by a predicate expression.
     Filter { expr: Expr },
@@ -97,6 +102,11 @@ pub enum PhysicalOp {
     Project {
         items: Vec<ReturnItem>,
         distinct: bool,
+        /// W2-13 WITH: instead of terminating the pipeline into positional
+        /// output rows, re-seed the variable-binding row stream with the
+        /// projection's outputs (alias or expression text) so later
+        /// MATCH/WHERE/RETURN clauses keep running. RETURN keeps `false`.
+        rebind: bool,
     },
     /// Sort by expressions.
     Sort { items: Vec<(Expr, bool)> },
@@ -344,21 +354,36 @@ pub fn select_strategy(
 /// Strategy selection is done separately via `select_strategy()`.
 pub fn compile(query: &CypherQuery) -> Result<PhysicalPlan, PlanError> {
     let mut ops = Vec::new();
+    // W2-13: variables bound so far, for OPTIONAL MATCH shape validation.
+    // WITH resets this set to its own outputs (Cypher scoping).
+    let mut bound: HashSet<String> = HashSet::new();
+    // W2-13: once a WITH has run, range-conjunct extraction must stop — a
+    // post-WITH WHERE is a HAVING over (possibly aggregated) projections
+    // and must never prune pre-aggregation scans.
+    let mut saw_with = false;
 
     for clause in &query.clauses {
         match clause {
             Clause::Match(m) => {
-                compile_match(m, &mut ops)?;
+                compile_match(m, &mut ops, &mut bound)?;
             }
             Clause::ShortestPathMatch(sp) => {
                 compile_shortest_path_match(sp, &mut ops);
+                for node in [&sp.src, &sp.dst] {
+                    if let Some(v) = &node.variable {
+                        bound.insert(v.clone());
+                    }
+                }
+                bound.insert(sp.path_var.clone());
             }
             Clause::Where(w) => {
                 // W2-3: top-level AND conjuncts of the form
                 // `var.prop <cmp> literal|param` upgrade var's scan to a
                 // range IndexScan BEFORE the residual Filter is pushed
                 // (the full WHERE stays — the index only prunes).
-                extract_range_conjuncts(&w.expr, &mut ops);
+                if !saw_with {
+                    extract_range_conjuncts(&w.expr, &mut ops);
+                }
                 ops.push(PhysicalOp::Filter {
                     expr: w.expr.clone(),
                 });
@@ -367,12 +392,16 @@ pub fn compile(query: &CypherQuery) -> Result<PhysicalPlan, PlanError> {
                 ops.push(PhysicalOp::Project {
                     items: r.items.clone(),
                     distinct: r.distinct,
+                    rebind: false,
                 });
             }
             Clause::Create(c) => {
                 ops.push(PhysicalOp::CreatePattern {
                     patterns: c.patterns.clone(),
                 });
+                for p in &c.patterns {
+                    bind_pattern_vars(p, &mut bound);
+                }
             }
             Clause::Delete(d) => {
                 ops.push(PhysicalOp::DeleteEntities {
@@ -391,18 +420,36 @@ pub fn compile(query: &CypherQuery) -> Result<PhysicalPlan, PlanError> {
                     on_create: m.on_create.clone(),
                     on_match: m.on_match.clone(),
                 });
+                bind_pattern_vars(&m.pattern, &mut bound);
             }
             Clause::With(w) => {
+                // W2-13: WITH is a rebinding projection — later clauses keep
+                // executing on the projected variable stream.
+                if w.items.iter().any(|it| matches!(it.expr, Expr::Star)) {
+                    return Err(PlanError::Unsupported(
+                        "WITH * is not yet supported — list the variables explicitly".to_string(),
+                    ));
+                }
                 ops.push(PhysicalOp::Project {
                     items: w.items.clone(),
                     distinct: w.distinct,
+                    rebind: true,
                 });
+                // Cypher scoping: only the WITH outputs remain in scope.
+                bound.clear();
+                for item in &w.items {
+                    if let Some(name) = with_output_name(item) {
+                        bound.insert(name);
+                    }
+                }
+                saw_with = true;
             }
             Clause::Unwind(u) => {
                 ops.push(PhysicalOp::Unwind {
                     expr: u.expr.clone(),
                     alias: u.alias.clone(),
                 });
+                bound.insert(u.alias.clone());
             }
             Clause::Call(c) => {
                 ops.push(PhysicalOp::ProcedureCall {
@@ -432,6 +479,35 @@ pub fn compile(query: &CypherQuery) -> Result<PhysicalPlan, PlanError> {
     Ok(PhysicalPlan { operators: ops })
 }
 
+/// The scope name a WITH item introduces, for OPTIONAL MATCH validation.
+///
+/// Alias wins; a bare identifier passes through under its own name. Any
+/// other unaliased expression produces an output column that no later
+/// identifier can reference, so it contributes nothing to the bound set.
+fn with_output_name(item: &ReturnItem) -> Option<String> {
+    if let Some(alias) = &item.alias {
+        return Some(alias.clone());
+    }
+    if let Expr::Ident(name) = &item.expr {
+        return Some(name.clone());
+    }
+    None
+}
+
+/// Record every variable a pattern binds (nodes and edges).
+fn bind_pattern_vars(pattern: &Pattern, bound: &mut HashSet<String>) {
+    for node in &pattern.nodes {
+        if let Some(v) = &node.variable {
+            bound.insert(v.clone());
+        }
+    }
+    for edge in &pattern.edges {
+        if let Some(v) = &edge.variable {
+            bound.insert(v.clone());
+        }
+    }
+}
+
 /// Compile a MATCH clause into scan + expand operators.
 ///
 /// Returns `Err(PlanError::Unsupported)` if a variable-length edge pattern
@@ -440,11 +516,27 @@ pub fn compile(query: &CypherQuery) -> Result<PhysicalPlan, PlanError> {
 /// predicates silently evaluate against Null — producing wrong results.
 /// This gate is temporary: Phase 179 (MVCC-02) will implement `Value::Path`
 /// binding and remove this restriction.
-fn compile_match(m: &MatchClause, ops: &mut Vec<PhysicalOp>) -> Result<(), PlanError> {
+///
+/// W2-13 OPTIONAL MATCH compiles to an `Expand { optional: true }` and is
+/// restricted to its dominant shape — a single relationship expanding from
+/// a previously bound bare variable, no inline properties on the optional
+/// target. Everything else (standalone patterns, multi-relationship chains
+/// whose whole-pattern null semantics need grouped execution, inline
+/// property predicates that must not drop null-padded rows) is rejected
+/// loudly instead of silently behaving like an inner MATCH.
+fn compile_match(
+    m: &MatchClause,
+    ops: &mut Vec<PhysicalOp>,
+    bound: &mut HashSet<String>,
+) -> Result<(), PlanError> {
+    if m.optional {
+        return compile_optional_match(m, ops, bound);
+    }
     for pattern in &m.patterns {
         if pattern.nodes.is_empty() {
             continue;
         }
+        bind_pattern_vars(pattern, bound);
 
         // First node becomes a scan (index-backed when inline equality
         // properties can drive a lookup).
@@ -490,6 +582,7 @@ fn compile_match(m: &MatchClause, ops: &mut Vec<PhysicalOp>) -> Result<(), PlanE
                 direction: edge.direction,
                 min_hops,
                 max_hops,
+                optional: false,
             });
             // Inline properties on the expanded target node — filter right after
             // the Expand that BINDS it (after, never before: the var is unbound
@@ -499,6 +592,97 @@ fn compile_match(m: &MatchClause, ops: &mut Vec<PhysicalOp>) -> Result<(), PlanE
                     expr: properties_to_filter(&target_var, &target.properties),
                 });
             }
+        }
+    }
+    Ok(())
+}
+
+/// Compile `OPTIONAL MATCH` (W2-13). See [`compile_match`] for the supported
+/// shape and the rationale for each rejection.
+fn compile_optional_match(
+    m: &MatchClause,
+    ops: &mut Vec<PhysicalOp>,
+    bound: &mut HashSet<String>,
+) -> Result<(), PlanError> {
+    for pattern in &m.patterns {
+        let Some(first) = pattern.nodes.first() else {
+            continue;
+        };
+        let Some(first_var) = &first.variable else {
+            return Err(PlanError::Unsupported(
+                "OPTIONAL MATCH must expand from a previously bound variable — \
+                 name the first pattern node"
+                    .to_string(),
+            ));
+        };
+        if !bound.contains(first_var) {
+            return Err(PlanError::Unsupported(format!(
+                "OPTIONAL MATCH must expand from a previously bound variable; \
+                 '{first_var}' is not bound. Standalone OPTIONAL MATCH patterns \
+                 are not yet supported."
+            )));
+        }
+        if !first.labels.is_empty() || !first.properties.is_empty() {
+            return Err(PlanError::Unsupported(format!(
+                "OPTIONAL MATCH: labels/properties on the already-bound variable \
+                 '{first_var}' are not yet supported — constrain it in the \
+                 binding MATCH instead."
+            )));
+        }
+        // `OPTIONAL MATCH (a)` with `a` bound re-matches an existing row:
+        // a no-op.
+        if pattern.edges.is_empty() {
+            continue;
+        }
+        if pattern.edges.len() > 1 {
+            return Err(PlanError::Unsupported(
+                "OPTIONAL MATCH with more than one relationship is not yet \
+                 supported (whole-pattern null semantics need grouped \
+                 execution) — split into single-hop OPTIONAL MATCH clauses"
+                    .to_string(),
+            ));
+        }
+        let edge = &pattern.edges[0];
+        // CYP-06 gate applies here too (see compile_match).
+        if edge.var_length.is_some() && edge.variable.is_some() {
+            let var_name = edge.variable.as_deref().unwrap_or("?");
+            return Err(PlanError::Unsupported(format!(
+                "CYP-06: Multi-hop edge variable binding -[{var_name}*m..n]- is not yet \
+                 supported. Remove the edge variable '{var_name}' or use a single-hop \
+                 pattern. Tracked: MVCC-02 (Phase 179)."
+            )));
+        }
+        // Parser invariant: nodes.len() == edges.len() + 1; stay panic-free
+        // on a malformed AST anyway.
+        let Some(target) = pattern.nodes.get(1) else {
+            continue;
+        };
+        if !target.properties.is_empty() {
+            return Err(PlanError::Unsupported(
+                "OPTIONAL MATCH: inline properties on the optional target are \
+                 not yet supported (a post-filter would drop null-padded rows) \
+                 — use WHERE with an explicit null check"
+                    .to_string(),
+            ));
+        }
+        let target_var = target
+            .variable
+            .clone()
+            .unwrap_or_else(|| "_anon_1".to_string());
+        let (min_hops, max_hops) = edge.var_length.unwrap_or((1, 1));
+        ops.push(PhysicalOp::Expand {
+            source: first_var.clone(),
+            target: target_var.clone(),
+            edge_variable: edge.variable.clone(),
+            edge_types: edge.edge_types.clone(),
+            direction: edge.direction,
+            min_hops,
+            max_hops,
+            optional: true,
+        });
+        bound.insert(target_var);
+        if let Some(evar) = &edge.variable {
+            bound.insert(evar.clone());
         }
     }
     Ok(())

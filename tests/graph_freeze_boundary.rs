@@ -894,3 +894,136 @@ fn aggregate_over_zero_rows() {
     let rows = run_query(&store, "MATCH (n:Nope) RETURN n.city, count(n)");
     assert!(rows.is_empty(), "grouped aggregate over zero rows is empty");
 }
+
+// ---------------------------------------------------------------------------
+// 12. W2-13: OPTIONAL MATCH null-padding + WITH mid-pipeline rebinding
+// ---------------------------------------------------------------------------
+
+/// 3 nodes (logical ids 1..=3, label N) with a single edge 1->2.
+fn optional_fixture() -> GraphStore {
+    let mut store = setup();
+    let handles: Vec<u64> = (1..=3).map(|i| add_node(&mut store, i)).collect();
+    let r = add_edge(&mut store, handles[0], handles[1]);
+    assert!(matches!(r, Frame::Integer(_)), "ADDEDGE failed: {r:?}");
+    store
+}
+
+/// Decode a two-column row as (numeric, Option<numeric>) — Null in the second
+/// column maps to None.
+fn row_pair(row: &Frame) -> (f64, Option<f64>) {
+    let Frame::Array(cells) = row else {
+        panic!("malformed row {row:?}")
+    };
+    let second = match &cells[1] {
+        Frame::Null => None,
+        other => Some(as_f64(other)),
+    };
+    (as_f64(&cells[0]), second)
+}
+
+#[test]
+fn optional_match_null_pads_missing_expansion() {
+    let store = optional_fixture();
+    let rows = run_query(
+        &store,
+        "MATCH (n:N) OPTIONAL MATCH (n)-[:E]->(m) RETURN n.id, m.id ORDER BY n.id",
+    );
+    assert_eq!(rows.len(), 3, "every source row survives OPTIONAL MATCH");
+    assert_eq!(row_pair(&rows[0]), (1.0, Some(2.0)));
+    assert_eq!(row_pair(&rows[1]), (2.0, None));
+    assert_eq!(row_pair(&rows[2]), (3.0, None));
+}
+
+#[test]
+fn optional_match_binds_edge_variable_or_null() {
+    let store = optional_fixture();
+    // Node 3 has no out-edge: n survives, m (and r) are Null.
+    let rows = run_query(
+        &store,
+        "MATCH (n:N {id: 3}) OPTIONAL MATCH (n)-[r:E]->(m) RETURN n.id, m.id",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(row_pair(&rows[0]), (3.0, None));
+}
+
+#[test]
+fn optional_match_unsupported_shapes_are_loud_errors() {
+    let store = optional_fixture();
+    for q in [
+        // Standalone pattern: first variable not previously bound.
+        "OPTIONAL MATCH (x:N)-[:E]->(y) RETURN x",
+        // Multi-relationship chain (whole-pattern null semantics unimplemented).
+        "MATCH (n:N) OPTIONAL MATCH (n)-[:E]->(a)-[:E]->(b) RETURN b",
+        // Inline properties on the optional target.
+        "MATCH (n:N) OPTIONAL MATCH (n)-[:E]->(m {id: 2}) RETURN m",
+        // Labels on the already-bound first node.
+        "MATCH (n:N) OPTIONAL MATCH (n:N)-[:E]->(m) RETURN m",
+    ] {
+        let r = graph_query(&store, &[bs(GRAPH), bs(q)]);
+        assert!(
+            matches!(r, Frame::Error(_)),
+            "{q} must be rejected loudly, got {r:?}"
+        );
+    }
+}
+
+#[test]
+fn with_aggregates_then_having_filter() {
+    let store = agg_fixture();
+    let rows = run_query(
+        &store,
+        "MATCH (n:C) WITH n.city AS city, sum(n.score) AS total WHERE total > 30 \
+         RETURN city, total",
+    );
+    assert_eq!(rows.len(), 1, "only city 'a' (60) exceeds 30");
+    let Frame::Array(cells) = &rows[0] else {
+        panic!("malformed row {:?}", rows[0])
+    };
+    match &cells[0] {
+        Frame::BulkString(b) => assert_eq!(&b[..], b"a"),
+        other => panic!("city cell {other:?}"),
+    }
+    assert_eq!(as_f64(&cells[1]), 60.0);
+}
+
+#[test]
+fn with_passthrough_binding_keeps_entity_access() {
+    let store = agg_fixture();
+    let rows = run_query(
+        &store,
+        "MATCH (n:C) WITH n AS m WHERE m.score > 12 RETURN m.score ORDER BY m.score",
+    );
+    let scores: Vec<f64> = single_cells(&rows).iter().map(as_f64).collect();
+    assert_eq!(scores, vec![15.0, 20.0, 30.0]);
+}
+
+#[test]
+fn with_order_by_limit_pipeline() {
+    let store = agg_fixture();
+    let rows = run_query(
+        &store,
+        "MATCH (n:C) WITH n.score AS s ORDER BY s DESC LIMIT 2 RETURN s",
+    );
+    let scores: Vec<f64> = single_cells(&rows).iter().map(as_f64).collect();
+    assert_eq!(scores, vec![30.0, 20.0]);
+}
+
+#[test]
+fn with_distinct_dedups() {
+    let store = agg_fixture();
+    let rows = run_query(
+        &store,
+        "MATCH (n:C) WITH DISTINCT n.city AS city RETURN city ORDER BY city",
+    );
+    assert_eq!(rows.len(), 2, "two distinct cities");
+}
+
+#[test]
+fn with_star_is_rejected() {
+    let store = agg_fixture();
+    let r = graph_query(&store, &[bs(GRAPH), bs("MATCH (n:C) WITH * RETURN n")]);
+    assert!(
+        matches!(r, Frame::Error(_)),
+        "WITH * must be a loud error, got {r:?}"
+    );
+}
