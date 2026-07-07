@@ -2,6 +2,178 @@ use std::collections::HashMap;
 
 use super::*;
 
+/// W2-12: if `expr` is a top-level aggregate call, return
+/// `(lowercase name, input expr, distinct)`. `None` input = `count(*)` /
+/// bare `count()` (counts rows, not values). Aggregates nested inside a
+/// larger expression (`count(n) + 1`) are NOT recognized — the item then
+/// evaluates per-row like any scalar (pre-existing behavior), so keep
+/// aggregates at the top level of a RETURN item.
+fn aggregate_call(expr: &Expr) -> Option<(&'static str, Option<&Expr>, bool)> {
+    let Expr::FunctionCall {
+        name,
+        args,
+        distinct,
+    } = expr
+    else {
+        return None;
+    };
+    let canon: &'static str = match name.to_ascii_lowercase().as_str() {
+        "count" => "count",
+        "sum" => "sum",
+        "avg" => "avg",
+        "min" => "min",
+        "max" => "max",
+        "collect" => "collect",
+        _ => return None,
+    };
+    let input = args.first().filter(|a| !matches!(a, Expr::Star));
+    Some((canon, input, *distinct))
+}
+
+/// W2-12: aggregate projection with implicit grouping (openCypher): the
+/// non-aggregate RETURN items form the group key; each group emits one row.
+/// No group key + zero input rows still emits ONE row (`count` = 0, `sum` =
+/// 0, `collect` = [], others Null); a present group key over zero rows
+/// emits none. Null inputs are skipped by every aggregate except `count(*)`,
+/// which counts rows. Returns `None` when no item is an aggregate (caller
+/// takes the plain per-row projection path).
+fn try_project_aggregate(
+    items: &[ReturnItem],
+    row_count: usize,
+    mut eval_at: impl FnMut(&Expr, usize) -> Value,
+) -> Option<Vec<Vec<Value>>> {
+    let specs: Vec<Option<(&'static str, Option<&Expr>, bool)>> =
+        items.iter().map(|it| aggregate_call(&it.expr)).collect();
+    if specs.iter().all(Option::is_none) {
+        return None;
+    }
+    let has_group_key = specs.iter().any(Option::is_none);
+    let agg_count = specs.iter().filter(|s| s.is_some()).count();
+
+    // Group rows by the stringified key (same "simple approach" as
+    // dedup_rows), keeping first-seen order for deterministic output.
+    struct Group {
+        key_values: Vec<Value>,
+        inputs: Vec<Vec<Value>>,
+    }
+    let mut order: Vec<String> = Vec::new();
+    let mut groups: HashMap<String, Group> = HashMap::new();
+
+    for ri in 0..row_count {
+        let mut key_values = Vec::new();
+        let mut key_str = String::new();
+        for (item, spec) in items.iter().zip(&specs) {
+            if spec.is_none() {
+                let v = eval_at(&item.expr, ri);
+                key_str.push_str(&value_to_string(&v));
+                key_str.push('\u{1f}');
+                key_values.push(v);
+            }
+        }
+        let group = groups.entry(key_str.clone()).or_insert_with(|| {
+            order.push(key_str);
+            Group {
+                key_values,
+                inputs: vec![Vec::new(); agg_count],
+            }
+        });
+        for (ai, spec) in specs.iter().flatten().enumerate() {
+            match spec.1 {
+                Some(input_expr) => {
+                    let v = eval_at(input_expr, ri);
+                    if !matches!(v, Value::Null) {
+                        group.inputs[ai].push(v);
+                    }
+                }
+                // count(*): every row counts.
+                None => group.inputs[ai].push(Value::Int(1)),
+            }
+        }
+    }
+
+    // Global aggregate over zero rows: one synthetic empty group.
+    if groups.is_empty() && !has_group_key {
+        let key = String::new();
+        order.push(key.clone());
+        groups.insert(
+            key,
+            Group {
+                key_values: Vec::new(),
+                inputs: vec![Vec::new(); agg_count],
+            },
+        );
+    }
+
+    let finalize = |name: &str, mut inputs: Vec<Value>, distinct: bool| -> Value {
+        if distinct {
+            let mut seen = std::collections::HashSet::new();
+            inputs.retain(|v| seen.insert(value_to_string(v)));
+        }
+        match name {
+            "count" => Value::Int(inputs.len() as i64),
+            "sum" => {
+                if inputs.iter().any(|v| matches!(v, Value::Float(_))) {
+                    Value::Float(inputs.iter().fold(0.0, |acc, v| match v {
+                        Value::Int(i) => acc + *i as f64,
+                        Value::Float(f) => acc + f,
+                        _ => acc,
+                    }))
+                } else {
+                    Value::Int(inputs.iter().fold(0i64, |acc, v| match v {
+                        Value::Int(i) => acc.saturating_add(*i),
+                        _ => acc,
+                    }))
+                }
+            }
+            "avg" => {
+                let numeric: Vec<f64> = inputs
+                    .iter()
+                    .filter_map(|v| match v {
+                        Value::Int(i) => Some(*i as f64),
+                        Value::Float(f) => Some(*f),
+                        _ => None,
+                    })
+                    .collect();
+                if numeric.is_empty() {
+                    Value::Null
+                } else {
+                    Value::Float(numeric.iter().sum::<f64>() / numeric.len() as f64)
+                }
+            }
+            "min" => inputs
+                .into_iter()
+                .min_by(compare_values)
+                .unwrap_or(Value::Null),
+            "max" => inputs
+                .into_iter()
+                .max_by(compare_values)
+                .unwrap_or(Value::Null),
+            "collect" => Value::List(inputs),
+            _ => Value::Null,
+        }
+    };
+
+    let mut out = Vec::with_capacity(order.len());
+    for key in &order {
+        let Some(group) = groups.remove(key) else {
+            continue;
+        };
+        let mut key_iter = group.key_values.into_iter();
+        let mut input_iter = group.inputs.into_iter();
+        let row: Vec<Value> = specs
+            .iter()
+            .map(|spec| match spec {
+                None => key_iter.next().unwrap_or(Value::Null),
+                Some((name, _, distinct)) => {
+                    finalize(name, input_iter.next().unwrap_or_default(), *distinct)
+                }
+            })
+            .collect();
+        out.push(row);
+    }
+    Some(out)
+}
+
 /// Resolve an `IndexScan` into the matching node keys across both tiers.
 ///
 /// Frozen tier: per segment, intersect the property-equality bitmaps
@@ -517,33 +689,50 @@ pub fn execute(
                     })
                     .collect();
 
-                let mut projected: Vec<Vec<Value>> = rows
-                    .iter()
-                    .map(|row| {
-                        items
-                            .iter()
-                            .map(|item| {
-                                if matches!(item.expr, Expr::Star) {
-                                    let entries: Vec<(String, Value)> = row
-                                        .iter()
-                                        .map(|(k, v)| (k.to_owned(), v.clone()))
-                                        .collect();
-                                    Value::Map(entries)
-                                } else {
-                                    eval_expr(
-                                        &item.expr,
-                                        row,
-                                        memgraph,
-                                        params,
-                                        csr_segs,
-                                        ctx.snapshot_lsn,
-                                        ctx.decay,
-                                    )
-                                }
-                            })
-                            .collect()
-                    })
-                    .collect();
+                // W2-12: aggregate items (count/sum/avg/min/max/collect)
+                // switch the projection into grouped-aggregation mode.
+                let aggregated = try_project_aggregate(items, rows.len(), |e, ri| {
+                    eval_expr(
+                        e,
+                        &rows[ri],
+                        memgraph,
+                        params,
+                        csr_segs,
+                        ctx.snapshot_lsn,
+                        ctx.decay,
+                    )
+                });
+
+                let mut projected: Vec<Vec<Value>> = match aggregated {
+                    Some(agg_rows) => agg_rows,
+                    None => rows
+                        .iter()
+                        .map(|row| {
+                            items
+                                .iter()
+                                .map(|item| {
+                                    if matches!(item.expr, Expr::Star) {
+                                        let entries: Vec<(String, Value)> = row
+                                            .iter()
+                                            .map(|(k, v)| (k.to_owned(), v.clone()))
+                                            .collect();
+                                        Value::Map(entries)
+                                    } else {
+                                        eval_expr(
+                                            &item.expr,
+                                            row,
+                                            memgraph,
+                                            params,
+                                            csr_segs,
+                                            ctx.snapshot_lsn,
+                                            ctx.decay,
+                                        )
+                                    }
+                                })
+                                .collect()
+                        })
+                        .collect(),
+                };
 
                 if *distinct {
                     dedup_rows(&mut projected);
@@ -1063,33 +1252,50 @@ pub fn execute_profile(
                     })
                     .collect();
 
-                let mut projected: Vec<Vec<Value>> = rows
-                    .iter()
-                    .map(|row| {
-                        items
-                            .iter()
-                            .map(|item| {
-                                if matches!(item.expr, Expr::Star) {
-                                    let entries: Vec<(String, Value)> = row
-                                        .iter()
-                                        .map(|(k, v)| (k.to_owned(), v.clone()))
-                                        .collect();
-                                    Value::Map(entries)
-                                } else {
-                                    eval_expr(
-                                        &item.expr,
-                                        row,
-                                        memgraph,
-                                        params,
-                                        csr_segs,
-                                        ctx.snapshot_lsn,
-                                        ctx.decay,
-                                    )
-                                }
-                            })
-                            .collect()
-                    })
-                    .collect();
+                // W2-12: aggregate items switch into grouped-aggregation
+                // mode (shared with the non-profile executor).
+                let aggregated = try_project_aggregate(items, rows.len(), |e, ri| {
+                    eval_expr(
+                        e,
+                        &rows[ri],
+                        memgraph,
+                        params,
+                        csr_segs,
+                        ctx.snapshot_lsn,
+                        ctx.decay,
+                    )
+                });
+
+                let mut projected: Vec<Vec<Value>> = match aggregated {
+                    Some(agg_rows) => agg_rows,
+                    None => rows
+                        .iter()
+                        .map(|row| {
+                            items
+                                .iter()
+                                .map(|item| {
+                                    if matches!(item.expr, Expr::Star) {
+                                        let entries: Vec<(String, Value)> = row
+                                            .iter()
+                                            .map(|(k, v)| (k.to_owned(), v.clone()))
+                                            .collect();
+                                        Value::Map(entries)
+                                    } else {
+                                        eval_expr(
+                                            &item.expr,
+                                            row,
+                                            memgraph,
+                                            params,
+                                            csr_segs,
+                                            ctx.snapshot_lsn,
+                                            ctx.decay,
+                                        )
+                                    }
+                                })
+                                .collect()
+                        })
+                        .collect(),
+                };
 
                 if *distinct {
                     dedup_rows(&mut projected);

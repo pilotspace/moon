@@ -790,3 +790,107 @@ fn timeout_argument_rejects_garbage() {
         "dangling TIMEOUT must be rejected, got {r:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// 11. W2-12: Cypher aggregations (count/sum/avg/min/max/collect + grouping)
+// ---------------------------------------------------------------------------
+
+/// 5 nodes labeled C: city 'a' scores {10,20,30}, city 'b' scores {5,15}.
+fn agg_fixture() -> GraphStore {
+    let mut store = setup();
+    for (city, score) in [("a", 10), ("a", 20), ("a", 30), ("b", 5), ("b", 15)] {
+        let q = format!("CREATE (n:C {{city: '{city}', score: {score}}})");
+        let (frame, _, _) = graph_query_or_write(&mut store, &[bs(GRAPH), bs(&q)]);
+        assert!(
+            !matches!(frame, Frame::Error(_)),
+            "CREATE failed: {frame:?}"
+        );
+    }
+    store
+}
+
+/// Decode a cell that may arrive as Integer, Double, or numeric BulkString.
+fn as_f64(cell: &Frame) -> f64 {
+    match cell {
+        Frame::Integer(i) => *i as f64,
+        Frame::Double(d) => *d,
+        Frame::BulkString(b) => String::from_utf8_lossy(b)
+            .parse()
+            .unwrap_or_else(|_| panic!("non-numeric cell {cell:?}")),
+        other => panic!("non-numeric cell {other:?}"),
+    }
+}
+
+#[test]
+fn aggregate_count_star_and_expr() {
+    let store = agg_fixture();
+    for q in ["MATCH (n:C) RETURN count(*)", "MATCH (n:C) RETURN count(n)"] {
+        let rows = run_query(&store, q);
+        assert_eq!(rows.len(), 1, "{q}: one global group");
+        let cells = single_cells(&rows);
+        assert_eq!(as_f64(&cells[0]), 5.0, "{q}");
+    }
+}
+
+#[test]
+fn aggregate_implicit_grouping_count_and_sum() {
+    let store = agg_fixture();
+    let rows = run_query(
+        &store,
+        "MATCH (n:C) RETURN n.city, count(n), sum(n.score) ORDER BY n.city",
+    );
+    assert_eq!(rows.len(), 2, "two city groups");
+    let decode = |r: &Frame| -> (String, f64, f64) {
+        let Frame::Array(cells) = r else {
+            panic!("malformed row {r:?}")
+        };
+        let city = match &cells[0] {
+            Frame::BulkString(b) => String::from_utf8_lossy(b).into_owned(),
+            other => panic!("city cell {other:?}"),
+        };
+        (city, as_f64(&cells[1]), as_f64(&cells[2]))
+    };
+    assert_eq!(decode(&rows[0]), ("a".into(), 3.0, 60.0));
+    assert_eq!(decode(&rows[1]), ("b".into(), 2.0, 20.0));
+}
+
+#[test]
+fn aggregate_sum_avg_min_max() {
+    let store = agg_fixture();
+    let rows = run_query(
+        &store,
+        "MATCH (n:C) RETURN sum(n.score), avg(n.score), min(n.score), max(n.score)",
+    );
+    assert_eq!(rows.len(), 1);
+    let Frame::Array(cells) = &rows[0] else {
+        panic!("malformed row");
+    };
+    assert_eq!(as_f64(&cells[0]), 80.0, "sum");
+    assert!((as_f64(&cells[1]) - 16.0).abs() < 1e-9, "avg");
+    assert_eq!(as_f64(&cells[2]), 5.0, "min");
+    assert_eq!(as_f64(&cells[3]), 30.0, "max");
+}
+
+#[test]
+fn aggregate_collect_distinct() {
+    let store = agg_fixture();
+    let rows = run_query(&store, "MATCH (n:C) RETURN collect(DISTINCT n.city)");
+    assert_eq!(rows.len(), 1);
+    let cells = single_cells(&rows);
+    let Frame::Array(items) = &cells[0] else {
+        panic!("collect must return a list, got {:?}", cells[0]);
+    };
+    assert_eq!(items.len(), 2, "two distinct cities");
+}
+
+#[test]
+fn aggregate_over_zero_rows() {
+    let store = agg_fixture();
+    // No grouping key → exactly one row with the empty-input aggregate.
+    let rows = run_query(&store, "MATCH (n:Nope) RETURN count(n)");
+    assert_eq!(rows.len(), 1, "global count over zero rows is one row");
+    assert_eq!(as_f64(&single_cells(&rows)[0]), 0.0);
+    // With a grouping key → zero rows.
+    let rows = run_query(&store, "MATCH (n:Nope) RETURN n.city, count(n)");
+    assert!(rows.is_empty(), "grouped aggregate over zero rows is empty");
+}
