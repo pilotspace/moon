@@ -174,19 +174,42 @@ fn guard_check(ctx: &ExecutionContext) -> Result<(), ExecError> {
 }
 
 /// Execute a physical plan against a named graph.
+///
+/// Builds a fresh `SlotTable` from `plan` on every call. Hot paths that
+/// already have a `SlotTable` on hand (e.g. a plan-cache hit, which cached
+/// the table alongside the plan at insert time) should call
+/// `execute_with_slots` directly instead to skip the rebuild.
 pub fn execute(
     graph: &NamedGraph,
     plan: &PhysicalPlan,
     params: &HashMap<String, Value>,
     ctx: &ExecutionContext,
 ) -> Result<ExecResult, ExecError> {
+    let slot_table = SlotTable::from_plan(plan);
+    execute_with_slots(graph, plan, &slot_table, params, ctx)
+}
+
+/// Execute a physical plan against a named graph, using a caller-supplied
+/// `SlotTable` instead of rebuilding one from `plan`.
+///
+/// Plan-cache hot path (see `PlanCache::get` / `graph_read.rs`): the
+/// `SlotTable` is built exactly once, when the plan is first compiled and
+/// inserted into the cache, and reused verbatim on every subsequent cache
+/// hit -- a `SlotTable` depends only on the plan's bound variables, which
+/// never change for a given `PhysicalPlan`.
+pub fn execute_with_slots(
+    graph: &NamedGraph,
+    plan: &PhysicalPlan,
+    slot_table: &SlotTable,
+    params: &HashMap<String, Value>,
+    ctx: &ExecutionContext,
+) -> Result<ExecResult, ExecError> {
     let start = std::time::Instant::now();
 
     // Seed row: one empty row to bootstrap the pipeline.
-    let slot_table = SlotTable::from_plan(plan);
     let empty_table = SlotTable::default();
     let empty_row = Row::seed(&empty_table);
-    let mut rows: Vec<Row> = vec![Row::seed(&slot_table)];
+    let mut rows: Vec<Row> = vec![Row::seed(slot_table)];
     let mut columns = Vec::new();
     // After Project, rows are converted to positional arrays.
     let mut projected_rows: Option<Vec<Vec<Value>>> = None;

@@ -271,7 +271,7 @@ mod tests {
 
         let graph = store.get_graph(b"g").expect("graph exists");
         assert_eq!(
-            graph.plan_cache.lock().len(),
+            graph.plan_cache.lock().distinct_plan_count(),
             1,
             "queries differing only in literal values must share one cached plan \
              (and write queries must not be cached)"
@@ -325,7 +325,7 @@ mod tests {
 
         let graph = store.get_graph(b"g").expect("graph exists");
         assert_eq!(
-            graph.plan_cache.lock().len(),
+            graph.plan_cache.lock().distinct_plan_count(),
             1,
             "string-literal variants must share one cached plan"
         );
@@ -373,7 +373,7 @@ mod tests {
 
         let graph = store.get_graph(b"g").expect("graph exists");
         assert_eq!(
-            graph.plan_cache.lock().len(),
+            graph.plan_cache.lock().distinct_plan_count(),
             2,
             "different hop bounds must compile to distinct cached plans"
         );
