@@ -6,6 +6,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — consolidated dependency bumps wave 2 (PR #TBD, supersedes dependabot #223–227)
+
+- Patch-level bumps rolled into one `Cargo.lock` update (no `Cargo.toml`
+  edits — all within existing ranges): `bumpalo` 3.20.2→3.20.3,
+  `uuid` 1.23.1→1.23.4, `smallvec` 1.15.1→1.15.2,
+  `unicode-segmentation` 1.13.2→1.13.3, and the crypto-tls group
+  `rustls` 0.23.40→0.23.41 + `aws-lc-rs` 1.17.0→1.17.1
+  (pulls `aws-lc-sys` 0.41.0→0.42.0).
+- **Perf side-effect verified** by same-instance p=1 KV A/B (deps vs main)
+  on GCE `c3-standard-4` (x86) + `c4a-standard-4` (ARM), shard=1, spin={0,40},
+  clients={1,8}, best-of-5, steal=0%. All single-op cells land 0.974–1.008
+  (`new_vs_base`) on both arches — no regression from `smallvec` on the
+  dispatch/protocol hot path, nor from the `aws-lc-sys` 0.42 codegen. See
+  `tmp/DEPS-WAVE2-AB.md`. CI-only Actions bumps (setup-node #220,
+  install-action #221, setup-python #222) carry no runtime effect and land
+  separately.
+
 ### Fixed — TopLevel-monoio AOF writer: EverySec fsync deferred indefinitely when idle (PR #TBD)
 
 - **`src/persistence/aof/writer_task.rs`**: the TopLevel monoio AOF writer
