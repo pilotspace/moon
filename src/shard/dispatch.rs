@@ -352,19 +352,6 @@ pub struct PubSubPublishPayload {
     pub slot: std::sync::Arc<PubSubResponseSlot>,
 }
 
-/// Boxed payload for `ShardMessage::GraphTraverse` (Phase 177, hot-path split).
-///
-/// Six fields including a Vec<u64> and Bytes — inline variant was ~80 B.
-#[cfg(feature = "graph")]
-pub struct GraphTraversePayload {
-    pub graph_name: Bytes,
-    pub node_ids: Vec<u64>,
-    pub remaining_hops: u32,
-    pub edge_type_filter: Option<u16>,
-    pub snapshot_lsn: u64,
-    pub reply_tx: channel::OneshotSender<Frame>,
-}
-
 /// Boxed payload for `ShardMessage::GraphRollback` (multi-shard TXN.ABORT).
 ///
 /// Carries the graph-undo ops and create-intents whose graph names hash to
@@ -587,12 +574,6 @@ pub enum ShardMessage {
         command: std::sync::Arc<Frame>,
         reply_tx: channel::OneshotSender<Frame>,
     },
-    /// Cross-shard graph traversal: expand the given nodes locally and return neighbors.
-    /// Used by scatter-gather coordinator for multi-shard BFS expansion.
-    ///
-    /// Boxed (Phase 177) — Vec<u64> + Bytes + oneshot pushed this past 80 B inline.
-    #[cfg(feature = "graph")]
-    GraphTraverse(Box<GraphTraversePayload>),
     /// Multi-shard TXN.ABORT: apply graph rollback (undo ops + create-intent
     /// removal) for graphs owned by this shard.
     #[cfg(feature = "graph")]
@@ -743,7 +724,7 @@ const _: () = {
     // If a new variant is added that would push size past this cap, box it
     // following the `TextAggregatePayload` pattern.
     // Phase 177 hot-path split: after boxing TextSearch / VectorSearch /
-    // BlockRegister / MigrateConnection / PubSubPublish / GraphTraverse, the
+    // BlockRegister / MigrateConnection / PubSubPublish, the
     // actual measured enum size on aarch64 / x86_64 is 64 bytes — exactly
     // one cache line. The assertion is tightened to that measured ceiling
     // so any future variant that regresses cache-line residency forces an

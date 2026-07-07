@@ -204,10 +204,6 @@ pub(crate) fn drain_spsc_shared(
                             execute_batch.push(msg);
                         }
                         #[cfg(feature = "graph")]
-                        ShardMessage::GraphTraverse(_) => {
-                            execute_batch.push(msg);
-                        }
-                        #[cfg(feature = "graph")]
                         ShardMessage::GraphRollback(_) => {
                             execute_batch.push(msg);
                         }
@@ -2096,29 +2092,6 @@ pub(crate) fn handle_shard_message_shared(
             let _ = reply_tx.send(crate::protocol::Frame::SimpleString(
                 bytes::Bytes::from_static(b"OK"),
             ));
-        }
-        #[cfg(feature = "graph")]
-        ShardMessage::GraphTraverse(payload) => {
-            let crate::shard::dispatch::GraphTraversePayload {
-                graph_name,
-                node_ids,
-                remaining_hops: _,
-                edge_type_filter,
-                snapshot_lsn,
-                reply_tx,
-            } = *payload;
-            let response = {
-                crate::shard::slice::with_shard(|s| {
-                    crate::graph::cross_shard::handle_graph_traverse(
-                        &s.graph_store,
-                        &graph_name,
-                        &node_ids,
-                        edge_type_filter,
-                        snapshot_lsn,
-                    )
-                })
-            };
-            let _ = reply_tx.send(response);
         }
         #[cfg(feature = "text-index")]
         ShardMessage::InvertedSearch(payload) => {
