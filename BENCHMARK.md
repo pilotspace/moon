@@ -744,6 +744,32 @@ target). Detail: `docs/reviews/2026-06-17/4FEATURE-VERIFIED.md`.
 Moon insert **7.5× (x86) / 14.9× (ARM)** faster; RediSearch search ~16× higher QPS at higher recall (the
 SQ8/TQ-at-384d recall trade-off). Unchanged from §10.5 — no v3-1/v3-2 regression.
 
+(Note: the search-QPS deficit above predates the vector-search optimization branch (PR #214,
+insert 24–38×, matched-recall gap 16×→~1.3×) and the HQ-1 exact-rerank sidecar — see §10.7
+below for post-optimization numbers vs Qdrant.)
+
+### 10.7 2026-07-07 vs Qdrant (OrbStack Linux VM, Docker Qdrant, same box)
+
+50K × 384d clustered gaussian (unit-normalized), COSINE, KNN10, 500 queries with exact
+ground truth, redis-py / qdrant-client (REST), 8-thread QPS. Both engines at default HNSW
+params; recall@10 is matched (≥0.999 both) so QPS compares at equal quality. Branch
+`feat/graph-engine-wave2` HEAD.
+
+| metric | Moon | Qdrant | ratio |
+|--------|:----:|:------:|:-----:|
+| Ingest rate | **65,695 vec/s** (searchable immediately, brute tier) | 7,350 vec/s accepted / 6,399 vec/s to index-green | **8.9×** |
+| Time to HNSW-quality serving | 28.7 s (`FT.COMPACT`, incl. 6 s grace) | **7.8 s** (optimizer green) | 0.27× |
+| Search QPS (HNSW, 8 threads) | **3,092** | 1,223 | **2.53×** |
+| Search p50 / p99 | **2.60 / 4.39 ms** | 6.05 / 14.66 ms | 2.3× / 3.3× |
+| Recall@10 | 0.9992 | 0.9998 | parity |
+
+Moon wins ingest 8.9× and matched-recall search 2.5×; Qdrant reaches HNSW-tier serving
+faster after bulk load (Moon serves immediately from the brute tier during that window —
+recall 0.759 there, the documented TQ-at-384d quantized-brute trade-off; low brute QPS at
+50K is expected O(N) scan). Caveats: qdrant-client REST transport (gRPC would improve
+Qdrant's client-side latency somewhat); shared-host VM — ratios are the signal, absolutes
+are indicative.
+
 ---
 
 ## 11. Graph Engine
