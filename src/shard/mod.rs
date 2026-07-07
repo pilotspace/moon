@@ -126,14 +126,13 @@ impl Shard {
     /// consistency -> ready). Falls back to the legacy path on v3 failure.
     ///
     /// When `disk_offload_dir` is `None`, uses the legacy path: load the
-    /// per-shard RRDSHARD snapshot, then replay WAL v3 (written even without
-    /// disk-offload, see `event_loop::run`) preferentially, falling back to
-    /// appendonly.aof only when WAL v3 has nothing (the WAL v2 rung was
-    /// removed in the pre-1.0 WAL-v3-only format freeze; this restores the
-    /// "prefer WAL, fall back to AOF" contract WAL v2 had, using WAL v3 as
-    /// its replacement — see `restore_from_persistence_v2`).
+    /// per-shard RRDSHARD snapshot, then replay appendonly.aof (the recovery
+    /// AUTHORITY for this mode — WAL v3's KV coverage is intentionally
+    /// partial post-#211), with WAL v3 as a last-resort fallback only when
+    /// no AOF exists (the WAL v2 rung was removed in the pre-1.0 WAL-v3-only
+    /// format freeze — see `restore_from_persistence_v2`).
     ///
-    /// Returns total keys loaded (snapshot + WAL v3/AOF replay).
+    /// Returns total keys loaded (snapshot + AOF/WAL v3 replay).
     pub fn restore_from_persistence(
         &mut self,
         persistence_dir: &str,
@@ -205,22 +204,25 @@ impl Shard {
         self.restore_from_persistence_v2(persistence_dir)
     }
 
-    /// Legacy recovery path: snapshot load + WAL v3 (preferred) / appendonly.aof
-    /// (fallback) replay.
+    /// Legacy recovery path: snapshot load + appendonly.aof (authority) /
+    /// WAL v3 (last-resort, AOF-absent-only) replay.
     ///
     /// Pre-1.0 WAL-v3-only format freeze: the per-shard WAL v2 rung
     /// (`shard-N.wal`) was removed and is no longer replayed by this build —
-    /// see the loud `tracing::error!` below if one is still on disk. WAL v3
-    /// is now ALSO written in this (non-disk-offload) mode, rooted at
-    /// `shard-N/wal-v3/` (see `event_loop::run`'s writer-creation block),
-    /// fsynced on the same 1s cadence the retired WAL v2 writer used
-    /// regardless of `--appendfsync`. To preserve the property WAL v2 gave
-    /// ("prefer the WAL, fall back to `appendonly.aof` only if the WAL
-    /// replayed zero commands" — the AOF's own fsync obeys `--appendfsync`,
-    /// so under `--appendfsync no` the WAL can be durably ahead of the AOF),
-    /// this replays WAL v3 first and only touches the AOF when WAL v3 has
-    /// nothing. See `wal_v3::replay::replay_wal_v3_dir_commands` for the
-    /// full rationale.
+    /// see the loud `tracing::error!` below if one is still on disk.
+    ///
+    /// ⚠ The AOF — NOT WAL v3 — is the recovery authority here, and the old
+    /// WAL v2 "prefer the WAL over the AOF" contract must NOT be resurrected
+    /// with WAL v3: since PR #211 (`--wal-kv-log`, default auto=off when the
+    /// AOF is the authority) WAL v3 intentionally contains NO KV command
+    /// records in the default config — it carries CDC/PITR/temporal/graph
+    /// records — and even with `--wal-kv-log on`, connection-local writes
+    /// bypass it (measured WAL-only recovery: 79.2% incomplete, see
+    /// tmp/WRITE-DIAG.md). Preferring a non-empty WAL v3 and skipping the
+    /// AOF would therefore discard the only complete KV history. WAL v3 is
+    /// replayed ONLY when no `appendonly.aof` exists at all (disaster
+    /// fallback: partial recovery beats none), with a loud warning about
+    /// its partial KV coverage.
     fn restore_from_persistence_v2(&mut self, persistence_dir: &str) -> usize {
         use crate::persistence::snapshot::shard_snapshot_load;
 
@@ -259,41 +261,47 @@ impl Shard {
             );
         }
 
-        // Prefer WAL v3 over the AOF (mirrors the retired WAL v2 contract).
-        let wal_v3_dir = dir.join(format!("shard-{}", self.id)).join("wal-v3");
-        let wal_replayed = match crate::persistence::wal_v3::replay::replay_wal_v3_dir_commands(
-            &wal_v3_dir,
-            &mut self.databases,
-            &DispatchReplayEngine::new(),
-        ) {
-            Ok(n) => n,
-            Err(e) => {
-                tracing::error!("Shard {}: WAL v3 replay failed: {}", self.id, e);
-                0
+        // AOF is the recovery authority (see doc comment: WAL v3 KV coverage
+        // is intentionally partial post-#211, so it must never shadow the AOF).
+        let aof_path = dir.join("appendonly.aof");
+        if aof_path.exists() {
+            match crate::persistence::aof::replay_aof(
+                &mut self.databases,
+                &aof_path,
+                &DispatchReplayEngine::new(),
+            ) {
+                Ok(n) => {
+                    info!("Shard {}: replayed {} AOF commands", self.id, n);
+                    total_keys += n;
+                }
+                Err(e) => {
+                    tracing::error!("Shard {}: AOF replay failed: {}", self.id, e);
+                }
             }
-        };
-
-        if wal_replayed > 0 {
-            info!(
-                "Shard {}: replayed {} WAL v3 commands (preferred over AOF)",
-                self.id, wal_replayed
-            );
-            total_keys += wal_replayed;
         } else {
-            let aof_path = dir.join("appendonly.aof");
-            if aof_path.exists() {
-                match crate::persistence::aof::replay_aof(
-                    &mut self.databases,
-                    &aof_path,
-                    &DispatchReplayEngine::new(),
-                ) {
-                    Ok(n) => {
-                        info!("Shard {}: replayed {} AOF commands", self.id, n);
-                        total_keys += n;
-                    }
-                    Err(e) => {
-                        tracing::error!("Shard {}: AOF replay failed: {}", self.id, e);
-                    }
+            // Disaster fallback ONLY: no AOF at all (lost/rebuilt/never
+            // written). Partial recovery from WAL v3 beats nothing, but its
+            // KV coverage is incomplete by design — say so loudly.
+            let wal_v3_dir = dir.join(format!("shard-{}", self.id)).join("wal-v3");
+            match crate::persistence::wal_v3::replay::replay_wal_v3_dir_commands(
+                &wal_v3_dir,
+                &mut self.databases,
+                &DispatchReplayEngine::new(),
+            ) {
+                Ok(0) => {}
+                Ok(n) => {
+                    tracing::warn!(
+                        "Shard {}: no appendonly.aof found — replayed {} WAL v3 \
+                         records as a LAST-RESORT fallback. WAL v3 KV coverage is \
+                         partial (gated by --wal-kv-log; connection-local writes \
+                         bypass it), so this recovery may be incomplete.",
+                        self.id,
+                        n
+                    );
+                    total_keys += n;
+                }
+                Err(e) => {
+                    tracing::error!("Shard {}: WAL v3 fallback replay failed: {}", self.id, e);
                 }
             }
         }
@@ -583,25 +591,26 @@ mod tests {
         );
     }
 
-    // ── restore_from_persistence_v2: WAL v3 preferred over AOF (fix for
-    // review finding P0#1) ─────────────────────────────────────────────────
+    // ── restore_from_persistence_v2: AOF is the recovery authority; WAL v3
+    // is a last-resort fallback ONLY when no AOF exists (review finding P0#1,
+    // corrected) ────────────────────────────────────────────────────────────
     //
-    // WAL v3 is written even without --disk-offload (see event_loop::run's
-    // writer-creation block), so the legacy (non-disk-offload) recovery path
-    // must replay it -- preferring it over `appendonly.aof`, mirroring the
-    // retired WAL v2 contract -- instead of only ever checking the AOF. See
-    // `src/persistence/recovery.rs`'s equivalent tests for the disk-offload
-    // path's analogous fallback fix.
+    // WAL v3 is written even without --disk-offload, but post-#211 its KV
+    // coverage is intentionally PARTIAL (`--wal-kv-log` default-off;
+    // connection-local writes bypass it), so it must never shadow the AOF.
+    // See `src/persistence/recovery.rs`'s equivalent tests for the
+    // disk-offload path's analogous fallback.
 
     #[test]
-    fn test_restore_from_persistence_v2_prefers_wal_v3_over_aof() {
+    fn test_restore_from_persistence_v2_aof_is_authority_over_wal_v3() {
         use crate::persistence::wal_v3::record::{WalRecordType, write_wal_v3_record};
 
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
 
-        // Populated `shard-0/wal-v3/` (3 records) -- written even without
-        // disk-offload.
+        // Populated `shard-0/wal-v3/` (3 records). Post-#211 the WAL may hold
+        // MORE records than the AOF while still missing KV writes entirely —
+        // record count says nothing about KV completeness.
         let wal_dir = dir.join("shard-0").join("wal-v3");
         std::fs::create_dir_all(&wal_dir).unwrap();
         let mut header = vec![0u8; 64];
@@ -618,7 +627,7 @@ mod tests {
         }
         std::fs::write(wal_dir.join("000000000001.wal"), &wal_data).unwrap();
 
-        // A shorter `appendonly.aof` (1 record) -- must NOT be preferred.
+        // The 1-record appendonly.aof is the authority and MUST win.
         std::fs::write(dir.join("appendonly.aof"), b"*1\r\n$4\r\nPING\r\n").unwrap();
 
         let config = RuntimeConfig::default();
@@ -626,11 +635,47 @@ mod tests {
         let total = shard.restore_from_persistence_v2(dir.to_str().unwrap());
 
         assert_eq!(
-            total, 3,
-            "restore_from_persistence_v2 must prefer the 3-record WAL v3 \
-             directory over the 1-record appendonly.aof -- got {} (AOF was \
-             used instead of the WAL if this is 1)",
+            total, 1,
+            "restore_from_persistence_v2 must replay the authoritative AOF \
+             and ignore WAL v3 when the AOF exists -- got {} (a non-empty \
+             but KV-incomplete WAL v3 shadowed the AOF if this is 3)",
             total
+        );
+    }
+
+    #[test]
+    fn test_restore_from_persistence_v2_wal_v3_last_resort_when_no_aof() {
+        use crate::persistence::wal_v3::record::{WalRecordType, write_wal_v3_record};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+
+        // WAL v3 present, NO appendonly.aof at all: partial recovery from
+        // the WAL beats recovering nothing.
+        let wal_dir = dir.join("shard-0").join("wal-v3");
+        std::fs::create_dir_all(&wal_dir).unwrap();
+        let mut header = vec![0u8; 64];
+        header[0..6].copy_from_slice(b"RRDWAL");
+        header[6] = 3; // version = 3
+        let mut wal_data = header;
+        for i in 1..=3u64 {
+            write_wal_v3_record(
+                &mut wal_data,
+                i,
+                WalRecordType::Command,
+                b"*1\r\n$4\r\nPING\r\n",
+            );
+        }
+        std::fs::write(wal_dir.join("000000000001.wal"), &wal_data).unwrap();
+
+        let config = RuntimeConfig::default();
+        let mut shard = Shard::new(0, 1, 1, config);
+        let total = shard.restore_from_persistence_v2(dir.to_str().unwrap());
+
+        assert_eq!(
+            total, 3,
+            "with no appendonly.aof, the WAL v3 last-resort fallback must \
+             replay what it can"
         );
     }
 

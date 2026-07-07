@@ -460,12 +460,12 @@ fn pipeline_batch_no_double_write_after_crash_recovery() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-// NOTE on NONOFFLOAD-WAL-V3-PREFERRED (dropped, see recovery.rs /
+// NOTE on NONOFFLOAD-WAL-V3-FALLBACK (dropped, see recovery.rs /
 // wal_v3::replay unit tests instead):
 //
 // An earlier version of this file had a SIGKILL-based integration test here
-// for the `restore_from_persistence_v2` / `recover_shard_v3_pitr` WAL-v3
-// preference fix (see `src/persistence/recovery.rs` and `src/shard/mod.rs`).
+// for the `restore_from_persistence_v2` / `recover_shard_v3_pitr` legacy-dir
+// recovery fix (see `src/persistence/recovery.rs` and `src/shard/mod.rs`).
 // It was removed after empirical testing (manual server runs against this
 // exact binary) showed it could not reliably exercise the fix:
 //
@@ -490,9 +490,10 @@ fn pipeline_batch_no_double_write_after_crash_recovery() {
 //    cannot be made reliable without a custom persistent-connection client
 //    pinned to a known shard.
 //
-// The fix itself (recovery preferring WAL v3 over a stale/absent AOF when
-// disk-offload is off, or the disk-offload path's AOF fallback additionally
-// checking a legacy-mode WAL v3 dir) is instead covered by deterministic
+// The fix itself (legacy-dir recovery replaying the authoritative AOF and
+// falling back to the legacy-mode WAL v3 dir ONLY when no AOF exists —
+// WAL v3's KV coverage is partial post-#211, so it must never shadow the
+// AOF) is instead covered by deterministic
 // unit tests in `src/persistence/recovery.rs` and
 // `src/persistence/wal_v3/replay.rs`, which construct WAL v3 segments
 // directly (the same pattern every other recovery test in this codebase

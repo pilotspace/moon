@@ -59,7 +59,13 @@ path (below), or replay them on a pre-freeze build first and re-persist.
   remains the recovery authority and is unaffected. `shared_databases::
   replay_graph_wal` (graph-feature boot-time WAL scan) is ported from the v2
   flat file to the v3 segment directory (`shard-N/wal-v3/*.wal`), matching
-  `replay_workspace_wal`/`replay_temporal_wal`.
+  `replay_workspace_wal`/`replay_temporal_wal`. Additionally, both legacy-dir
+  recovery paths gain a **last-resort WAL v3 fallback**: when NO
+  `appendonly.aof` exists, the legacy-mode `shard-N/wal-v3/` directory is
+  replayed (with a loud partial-coverage warning — WAL v3's KV coverage is
+  intentionally partial post-#211, so it never shadows a present AOF), and a
+  leftover legacy `shard-N.wal` (v2) file on disk now triggers a
+  `tracing::error!` naming the file instead of being silently ignored.
 - **`wal_append_and_fanout` / `wal_fanout_has_work`** (`src/shard/
   spsc_handler.rs`) drop the v2 `wal_writer` parameter and the "v3
   supersedes v2" branch — a single `Option<WalWriterV3>` parameter, renamed

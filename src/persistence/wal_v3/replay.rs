@@ -171,18 +171,20 @@ pub fn replay_wal_auto(
 ///
 /// Used by legacy (non-disk-offload) shard recovery: WAL v3 is written even
 /// when `--disk-offload` is off (rooted at `<persistence_dir>/shard-N/wal-v3`,
-/// see `event_loop::run`'s writer-creation block), fsynced on the same 1s
-/// cadence as the retired WAL v2 writer was. To preserve the pre-1.0 "no
-/// durable write lost on restart" property that WAL v2's
-/// prefer-WAL-fall-back-to-AOF contract gave, callers should treat a non-zero
-/// return here as authoritative (skip AOF) and only replay the AOF when this
-/// returns `Ok(0)` or `Err` — exactly mirroring how the disk-offload v3
-/// recovery protocol already treats its own primary WAL replay relative to
-/// its AOF fallback (see `recover_shard_v3_pitr`).
+/// see `event_loop::run`'s writer-creation block), fsynced on a 1s cadence.
 ///
-/// Returns `Ok(0)` (not an error) when `wal_dir` does not exist or is empty,
-/// so callers can use the return value directly as an "authoritative source
-/// available?" signal.
+/// ⚠ NOT a recovery authority. Post-#211 WAL v3's KV coverage is
+/// intentionally PARTIAL: `--wal-kv-log` is default-off and connection-local
+/// KV writes bypass WAL v3 entirely even when it is on (measured 79.2%
+/// incomplete WAL-only recovery, see `tmp/WRITE-DIAG.md`). The retired
+/// WAL v2 "prefer the WAL, skip the AOF" contract must NOT be applied to
+/// this helper — a non-empty return typically counts temporal/graph/txn
+/// records while ALL local KV data lives only in the AOF. Callers replay
+/// `appendonly.aof` as the authority and use this helper ONLY as a
+/// last-resort fallback when no AOF exists (partial recovery beats none),
+/// logging a loud partial-coverage warning when they do.
+///
+/// Returns `Ok(0)` (not an error) when `wal_dir` does not exist or is empty.
 pub fn replay_wal_v3_dir_commands(
     wal_dir: &Path,
     databases: &mut [crate::storage::Database],
