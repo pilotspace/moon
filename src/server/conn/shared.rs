@@ -514,7 +514,7 @@ mod as_of_tests {
     fn resolve_ft_search_as_of_lsn_uses_txn_snapshot_when_no_explicit_as_of() {
         let fixture = build_fixture();
         let args = ft_search_args(None);
-        let txn = CrossStoreTxn::new(1, 99);
+        let txn = CrossStoreTxn::new(1, 99, 0);
         let got = resolve_ft_search_as_of_lsn(&args, Some(&fixture), Some(&txn));
         assert_eq!(got, Ok(99));
     }
@@ -523,7 +523,7 @@ mod as_of_tests {
     fn resolve_ft_search_as_of_lsn_explicit_as_of_beats_txn_snapshot() {
         let fixture = build_fixture();
         let args = ft_search_args(Some(1_000));
-        let txn = CrossStoreTxn::new(1, 99);
+        let txn = CrossStoreTxn::new(1, 99, 0);
         let got = resolve_ft_search_as_of_lsn(&args, Some(&fixture), Some(&txn));
         // Registry binding at wall_ms=1_000 is lsn=42, NOT txn.snapshot_lsn=99.
         assert_eq!(got, Ok(42));

@@ -161,6 +161,107 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shared `READY_TIMEOUT` constant (poll-based loop notices readiness within
   100ms either way; the fixed 15s was a documented host-load flake,
   observed on the macOS CI runner).
+### Fixed — connection-plane durability & lifecycle wave (PR #230)
+
+- **D-2 — FLUSHDB/FLUSHALL now clear every shard, not just the local one**
+  (`src/shard/coordinator.rs` `coordinate_flush_broadcast`, both sharded
+  handlers): FLUSHDB/FLUSHALL are keyless, so key-based routing executed them
+  only on the issuing connection's shard — on `--shards 4` a FLUSHALL left
+  ~3/4 of the keyspace intact (red/green: 49/64 keys survived, now 0). The
+  originating shard now broadcasts the flush to every peer shard as a
+  `MultiExecute` leg, which reuses the existing remote dispatch + per-shard
+  AOF/WAL persistence + index-flush path. Any failed leg returns a loud
+  `MOONERR FLUSH partial` error (local shard already flushed; client should
+  retry). Known limits: the flush is not atomic across shards (same relaxed
+  semantics as SWAPDB), and a FLUSH issued inside MULTI/EXEC still executes
+  local-only (follow-up); FLUSHALL still clears only the selected db
+  (documented v0.1.5 single-active-DB behavior — all-dbs semantics is a
+  separate follow-up needing replay parity).
+- **D-1 — cross-store TXN crash replay restores into the correct db**
+  (`src/transaction/mod.rs`, `wal_v3/record.rs`, `wal_v3/replay.rs`, txn
+  handlers): `CrossStoreTxn` had no db field and WAL replay hardcoded
+  `databases[0]`, so a `TXN.BEGIN…COMMIT` issued under `SELECT n≠0` replayed
+  its KV ops into db 0 after a crash — silent recovery corruption. Commits now
+  write a new `XactCommitV2` record (`0x53`) whose header carries the
+  BEGIN-time db index; replay targets that db (out-of-range falls back to
+  db 0 with a loud warning). v1 records still replay into db 0 (faithful to
+  the builds that wrote them).
+- **R-6 — connection migration fails open** (`conn_accept.rs`,
+  `handler_sharded/mod.rs`): the source shard dropped its socket before the
+  SPSC hand-off to the target was confirmed, so a full ring lost the client —
+  precisely under the overload that triggers migration. Both runtimes now
+  keep the original stream alive until the push succeeds (bounded retry,
+  8 × 100µs) and on give-up resume serving the connection on the source shard
+  with migration disabled, using the state recovered from the undelivered
+  message. Also fixes the tokio path's `connected_clients` leak on the old
+  loss path.
+- **Observability** (`admin/metrics_setup.rs`): new
+  `moon_xshard_backpressure_drops_total{target_shard}` counter + warn on every
+  R-1 give-up, and `moon_shard_connected_clients{shard}` gauge (maintained at
+  registry register/deregister) to surface SO_REUSEPORT imbalance and
+  affinity funnels without parsing `CLIENT LIST`.
+- **P-1 — lazy per-connection `FunctionRegistry`** (both handlers,
+  `conn/core.rs`): the Functions API registry + `LuaEvictionCtx` (6 Arc/Rc
+  clones) were built eagerly for every connection; now built on first
+  FUNCTION/FCALL/FCALL_RO, cutting per-connection setup cost at high
+  connection counts.
+- **S-5 — `--tcp-backlog`** (`config.rs`, `conn_accept.rs`, `main.rs`): the
+  per-socket listen backlog was hardcoded 1024; now configurable (default
+  unchanged) for connection-storm tuning alongside `ulimit -n`.
+
+### Fixed — connection-plane robustness hardening (Track B) (PR #230)
+
+- **R-3 — `CLIENT KILL` force-closes idle connections** (`src/client_registry.rs`,
+  handlers, `conn_accept.rs`): `CLIENT KILL` only set a cooperative `kill_flag`
+  checked once per batch, so a connection parked in `read().await` (idle, the
+  default `timeout 0`) was never torn down until it next sent bytes. Now the
+  registry stores each connection's socket fd and `kill_clients` also
+  `shutdown(2)`s it, so the parked read returns `Ok(0)`/`Err` immediately (the
+  existing disconnect path). The raw-fd close is race-free: `kill_clients` holds
+  the registry read lock, and a connection's `RegistryGuard` deregisters (needs
+  the write lock) strictly before its stream drops — so a visible entry always
+  has a live fd. No-op on non-unix (`CLIENT KILL` stays cooperative there).
+  Self-kill (the filter matching the executing connection) stays cooperative —
+  flag only, no fd shutdown — so the `+count` reply is still delivered before
+  the handler closes, matching Redis's reply-first self-kill semantics.
+- **R-2 — inline-command length cap** (`src/protocol/inline.rs`,
+  `frame.rs`): the RESP-less inline path had no maximum line length, so a
+  client that never sends `\r\n` (raw non-RESP bytes) grew the connection read
+  buffer without bound — a per-connection memory-exhaustion vector. Added
+  `ParseConfig::max_inline_size` (default 64 KB, mirroring Redis's
+  `PROTO_INLINE_MAX_SIZE`); `parse_inline` now rejects an over-cap line
+  (complete or incomplete) with `Protocol error: too big inline request`
+  instead of buffering forever.
+- **R-1 — bounded cross-shard `spsc_send`** (`src/shard/coordinator.rs`): the
+  single dispatch primitive behind every scatter-gather command (MGET/MSET/
+  DEL/EXISTS/SCAN/KEYS/DBSIZE, vector scatter, FT.INFO, graph traverse) retried
+  a full SPSC ring in an **unbounded** `loop { try_push; yield/sleep }` — on
+  tokio `yield_now()` reschedules with no backoff, busy-spinning a full core,
+  and a wedged target could block graceful shutdown forever. Replaced with a
+  bounded retry (`CROSS_SHARD_PUSH_MAX_RETRIES` × `CROSS_SHARD_PUSH_BACKOFF`,
+  the same budget as `push_with_backpressure`) returning `PushOutcome`. On
+  give-up the message is dropped; reply-carrying callers observe the closed
+  reply channel and synthesize a per-shard error via the path they already
+  handle. `PushOutcome` is `#[must_use]` so no call site can drop a message
+  silently by accident, and the two side-effect-bearing senders fail loud:
+  a dropped `MqTxnMaterialize` leg turns `TXN.COMMIT`'s reply into an explicit
+  `MOONERR TXN.COMMIT partial` error (the commit is already WAL-durable; only
+  foreign MQ materialization was lost) and a dropped `GraphRollback` logs at
+  `error!`. A brief bounded spin (≤64 iterations) before the first timed
+  backoff preserves the old ~10µs-class latency when the target ring is only
+  transiently full (the 100µs timer sleep may round up to ~1ms).
+- **R-4 — accept-loop backoff on fd exhaustion** (`src/server/accept_backoff.rs`,
+  `listener.rs`, `shard/event_loop.rs`): all six socket-accept loops (tokio
+  and monoio; sharded, non-sharded, and TLS) retried `accept()` errors with
+  zero backoff, so `EMFILE`/`ENFILE` under a connection storm pinned a shard
+  core at 100% and flooded the log. Added `AcceptBackoff`: capped exponential
+  backoff (1 ms → 100 ms) on resource-exhaustion errors only, plus rate-limited
+  logging; benign per-connection errors (e.g. `ECONNABORTED`) log without
+  sleeping. The cap is 100 ms (not 1 s) because the sleep runs inside `select!`
+  arms where the shutdown branch cannot preempt it — this bounds shutdown
+  latency during a storm. The io_uring multishot-accept resubmit (opt-in `MOON_URING=1`
+  bridge) is documented as a scoped follow-up (synchronous CQE handler, no
+  async context to sleep in).
 
 ### Changed — consolidated dependency bumps (PR #TBD)
 

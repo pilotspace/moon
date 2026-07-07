@@ -34,7 +34,11 @@ pub(super) fn try_handle_txn_begin(
             // Unconditional slice path: ShardSlice is always initialized.
             let active =
                 crate::shard::slice::with_shard(|s| s.vector_store.txn_manager_mut().begin());
-            conn.active_cross_txn = Some(CrossStoreTxn::new(active.txn_id, active.snapshot_lsn));
+            conn.active_cross_txn = Some(CrossStoreTxn::new(
+                active.txn_id,
+                active.snapshot_lsn,
+                conn.selected_db,
+            ));
             responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
         }
         Err(e) => responses.push(e),
@@ -83,13 +87,16 @@ pub(super) async fn try_handle_txn_commit(
                     return true;
                 }
 
-                // Write XactCommit WAL record with committed KV state
+                // Write XactCommitV2 WAL record with committed KV state.
+                // Both the forward-image read and the record header use the
+                // txn's BEGIN-time db so commit and replay agree on the db.
                 let txn_id = txn.txn_id;
                 if !txn.kv_undo.is_empty() {
                     // Unconditional slice path: ShardSlice is always initialized.
-                    let payload = crate::shard::slice::with_shard_db(conn.selected_db, |db| {
-                        crate::persistence::wal_v3::record::encode_xact_commit_payload(
+                    let payload = crate::shard::slice::with_shard_db(txn.db_index, |db| {
+                        crate::persistence::wal_v3::record::encode_xact_commit_payload_v2(
                             txn_id,
+                            txn.db_index as u32,
                             txn.kv_undo.records(),
                             db,
                         )
@@ -98,7 +105,7 @@ pub(super) async fn try_handle_txn_commit(
                     crate::persistence::wal_v3::record::write_wal_v3_record(
                         &mut wal_buf,
                         txn_id,
-                        crate::persistence::wal_v3::record::WalRecordType::XactCommit,
+                        crate::persistence::wal_v3::record::WalRecordType::XactCommitV2,
                         &payload,
                     );
                     ctx.shard_databases
@@ -152,15 +159,21 @@ pub(super) async fn try_handle_txn_commit(
                             }
                         });
                     }
-                    // Send MqTxnMaterialize to each foreign shard and await all acks.
+                    // Send MqTxnMaterialize to each foreign shard and await all
+                    // acks. The commit is already WAL-durable at this point, so
+                    // a dropped/failed leg cannot fail the commit — but it must
+                    // fail LOUD at the client, never a silent `+OK` with lost
+                    // MQ messages.
+                    let mut mq_lost: Option<(usize, usize)> = None; // (shard, intents)
                     for (owner, intents) in foreign {
+                        let intent_count = intents.len();
                         let (reply_tx, reply_rx) = crate::runtime::channel::oneshot();
                         let msg = crate::shard::dispatch::ShardMessage::MqTxnMaterialize {
                             db_index: conn.selected_db,
                             intents,
                             reply_tx,
                         };
-                        crate::shard::coordinator::spsc_send(
+                        let outcome = crate::shard::coordinator::spsc_send(
                             &ctx.dispatch_tx,
                             ctx.shard_id,
                             owner,
@@ -168,6 +181,18 @@ pub(super) async fn try_handle_txn_commit(
                             &ctx.spsc_notifiers,
                         )
                         .await;
+                        if outcome != crate::shard::dispatch::PushOutcome::Pushed {
+                            // Message dropped (target ring never drained): the
+                            // intents were NEVER delivered. Escalate.
+                            tracing::error!(
+                                owner,
+                                intent_count,
+                                "TXN.COMMIT MQ materialize: dispatch backpressure — \
+                                 intents dropped, commit reported as partial"
+                            );
+                            mq_lost.get_or_insert((owner, intent_count));
+                            continue;
+                        }
                         match reply_rx.recv().await {
                             Ok(()) => {}
                             Err(_) => {
@@ -178,6 +203,16 @@ pub(super) async fn try_handle_txn_commit(
                                 );
                             }
                         }
+                    }
+                    if let Some((owner, intent_count)) = mq_lost {
+                        // KV/vector/graph legs of the txn ARE committed and
+                        // durable; only foreign MQ materialization was lost.
+                        responses.push(Frame::Error(Bytes::from(format!(
+                            "MOONERR TXN.COMMIT partial: committed, but {intent_count} \
+                             MQ intent(s) for shard {owner} were dropped under \
+                             dispatch backpressure"
+                        ))));
+                        return true;
                     }
                 }
 
@@ -286,7 +321,7 @@ pub(super) async fn try_handle_temporal_invalidate(
                             command: std::sync::Arc::new(frame.clone()),
                             reply_tx,
                         };
-                        crate::shard::coordinator::spsc_send(
+                        let _ = crate::shard::coordinator::spsc_send(
                             &ctx.dispatch_tx,
                             ctx.shard_id,
                             owner,

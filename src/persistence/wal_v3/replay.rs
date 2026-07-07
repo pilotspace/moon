@@ -77,6 +77,11 @@ pub fn replay_wal_auto(
                             replay_xact_commit(databases, &record.payload);
                             tracing::trace!(lsn = record.lsn, "WAL replay: XactCommit");
                         }
+                        WalRecordType::XactCommitV2 => {
+                            // XactCommitV2: db-index-aware KV replay
+                            replay_xact_commit_v2(databases, &record.payload);
+                            tracing::trace!(lsn = record.lsn, "WAL replay: XactCommitV2");
+                        }
                         WalRecordType::XactAbort => {
                             // XactAbort: no action - changes were never committed
                             tracing::trace!(lsn = record.lsn, "WAL replay: XactAbort");
@@ -310,6 +315,7 @@ pub fn replay_wal_v3_file_until(
             | WalRecordType::FileTierChange
             | WalRecordType::XactBegin
             | WalRecordType::XactCommit
+            | WalRecordType::XactCommitV2
             | WalRecordType::XactAbort
             | WalRecordType::TemporalUpsert
             | WalRecordType::GraphTemporal
@@ -446,13 +452,57 @@ fn replay_xact_commit(databases: &mut [crate::storage::Database], payload: &[u8]
 
     tracing::debug!(txn_id, kv_op_count, "Replaying XactCommit");
 
-    if kv_op_count == 0 {
+    // v1 records predate the db-index header: they were only ever written by
+    // builds that replayed into db 0, so db 0 is the faithful target.
+    replay_xact_kv_ops(&mut databases[0], payload, 12, kv_op_count);
+}
+
+/// Replay a cross-store transaction commit record, v2 (db-index-aware).
+///
+/// Payload layout (little-endian): `txn_id: u64, db_index: u32,
+/// kv_op_count: u32, ops…` — op wire format identical to v1.
+/// An out-of-range `db_index` (server restarted with fewer `--databases`)
+/// falls back to db 0 with a loud warning rather than dropping the ops.
+fn replay_xact_commit_v2(databases: &mut [crate::storage::Database], payload: &[u8]) {
+    if payload.len() < 16 {
+        tracing::warn!("XactCommitV2 payload too short: {} bytes", payload.len());
         return;
     }
 
-    let mut offset = 12;
-    let db = &mut databases[0]; // TODO: support multi-db in cross-store txn
+    let txn_id = u64::from_le_bytes([
+        payload[0], payload[1], payload[2], payload[3], payload[4], payload[5], payload[6],
+        payload[7],
+    ]);
+    let db_index = u32::from_le_bytes([payload[8], payload[9], payload[10], payload[11]]) as usize;
+    let kv_op_count =
+        u32::from_le_bytes([payload[12], payload[13], payload[14], payload[15]]) as usize;
 
+    tracing::debug!(txn_id, db_index, kv_op_count, "Replaying XactCommitV2");
+
+    let target = if db_index < databases.len() {
+        db_index
+    } else {
+        tracing::warn!(
+            txn_id,
+            db_index,
+            db_count = databases.len(),
+            "XactCommitV2 db index out of range (server restarted with fewer \
+             --databases?) — replaying into db 0"
+        );
+        0
+    };
+    replay_xact_kv_ops(&mut databases[target], payload, 16, kv_op_count);
+}
+
+/// Shared op-loop for XactCommit v1/v2: apply `kv_op_count` SET/DEL ops read
+/// from `payload` starting at `offset` to `db`. Truncation-defensive — a
+/// short payload warns and stops rather than panicking.
+fn replay_xact_kv_ops(
+    db: &mut crate::storage::Database,
+    payload: &[u8],
+    mut offset: usize,
+    kv_op_count: usize,
+) {
     for _ in 0..kv_op_count {
         if offset >= payload.len() {
             tracing::warn!("XactCommit payload truncated at op boundary");
@@ -539,6 +589,61 @@ mod tests {
         header[6] = 2; // version = 2
         header[7..9].copy_from_slice(&shard_id.to_le_bytes());
         header
+    }
+
+    // D-1: XactCommitV2 must replay KV ops into the db the transaction ran
+    // in — the v1 path hardcoded db 0, silently corrupting recovery for any
+    // TXN.BEGIN…COMMIT issued under SELECT != 0.
+    #[test]
+    fn test_xact_commit_v2_replays_into_selected_db() {
+        use crate::persistence::wal_v3::record::encode_xact_commit_payload_v2;
+        use crate::storage::Database;
+        use crate::transaction::UndoRecord;
+        use bytes::Bytes;
+
+        // Committed state lives in db 3.
+        let mut src_db = Database::new();
+        src_db.set_string(Bytes::from_static(b"txnkey"), Bytes::from_static(b"v3val"));
+        let records = vec![UndoRecord::Insert {
+            key: Bytes::from_static(b"txnkey"),
+        }];
+        let payload = encode_xact_commit_payload_v2(7, 3, &records, &src_db);
+
+        let mut databases: Vec<Database> = (0..4).map(|_| Database::new()).collect();
+        replay_xact_commit_v2(&mut databases, &payload);
+
+        assert!(
+            databases[3].data().get(b"txnkey".as_ref()).is_some(),
+            "XactCommitV2 must restore the key into db 3"
+        );
+        assert!(
+            databases[0].data().get(b"txnkey".as_ref()).is_none(),
+            "db 0 must NOT receive a db-3 transaction's keys"
+        );
+    }
+
+    #[test]
+    fn test_xact_commit_v2_out_of_range_db_falls_back_to_db0() {
+        use crate::persistence::wal_v3::record::encode_xact_commit_payload_v2;
+        use crate::storage::Database;
+        use crate::transaction::UndoRecord;
+        use bytes::Bytes;
+
+        let mut src_db = Database::new();
+        src_db.set_string(Bytes::from_static(b"k"), Bytes::from_static(b"v"));
+        let records = vec![UndoRecord::Insert {
+            key: Bytes::from_static(b"k"),
+        }];
+        // db_index 9 but the restarted server only has 2 dbs.
+        let payload = encode_xact_commit_payload_v2(8, 9, &records, &src_db);
+
+        let mut databases: Vec<Database> = (0..2).map(|_| Database::new()).collect();
+        replay_xact_commit_v2(&mut databases, &payload);
+
+        assert!(
+            databases[0].data().get(b"k".as_ref()).is_some(),
+            "out-of-range db index must fall back to db 0, not drop the ops"
+        );
     }
 
     #[test]

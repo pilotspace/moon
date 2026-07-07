@@ -10,5 +10,5 @@ use moon::protocol::inline;
 /// splits on whitespace, handles quoted strings, looks for CRLF termination.
 fuzz_target!(|data: &[u8]| {
     let mut buf = BytesMut::from(data);
-    let _ = inline::parse_inline(&mut buf);
+    let _ = inline::parse_inline(&mut buf, 64 * 1024);
 });

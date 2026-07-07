@@ -78,6 +78,14 @@ pub struct ServerConfig {
     #[arg(long, default_value_t = 16)]
     pub databases: usize,
 
+    /// TCP listen backlog per listening socket. With per-shard SO_REUSEPORT
+    /// accept the kernel splits the SYN load across shards, so this is a
+    /// per-socket bound (Redis single-socket default is 511; Moon's
+    /// historical hardcoded value was 1024). Raise for connection-storm
+    /// workloads alongside `ulimit -n` and net.core.somaxconn.
+    #[arg(long = "tcp-backlog", default_value_t = 1024)]
+    pub tcp_backlog: i32,
+
     /// Require clients to authenticate with this password
     #[arg(long)]
     pub requirepass: Option<String>,

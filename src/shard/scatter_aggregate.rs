@@ -108,7 +108,7 @@ pub async fn scatter_text_aggregate(
                 pipeline: pipeline.clone(),
                 reply_tx,
             }));
-            spsc_send(dispatch_tx, my_shard, shard_id, msg, spsc_notifiers).await;
+            let _ = spsc_send(dispatch_tx, my_shard, shard_id, msg, spsc_notifiers).await;
             receivers.push(reply_rx);
         }
     }

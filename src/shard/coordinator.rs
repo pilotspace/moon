@@ -21,7 +21,9 @@ use crate::runtime::channel;
 // Coordinator uses oneshot channels (not ResponseSlotPool) for cross-thread safety.
 // ResponseSlotPool's AtomicWaker doesn't work with monoio's !Send executor.
 // The oneshot overhead (~80ns) is negligible on the multi-key coordination path.
-use crate::shard::dispatch::{ShardMessage, key_to_shard};
+use crate::shard::dispatch::{
+    CROSS_SHARD_PUSH_BACKOFF, CROSS_SHARD_PUSH_MAX_RETRIES, PushOutcome, ShardMessage, key_to_shard,
+};
 use crate::shard::mesh::ChannelMesh;
 use crate::storage::entry::CachedClock;
 
@@ -193,7 +195,7 @@ async fn run_remote(
         commands: vec![(routing_key.clone(), command)],
         reply_tx,
     };
-    spsc_send(dispatch_tx, my_shard, target_shard, msg, spsc_notifiers).await;
+    let _ = spsc_send(dispatch_tx, my_shard, target_shard, msg, spsc_notifiers).await;
     match reply_rx.recv().await {
         Ok(mut frames) if !frames.is_empty() => frames.swap_remove(0),
         _ => Frame::Error(Bytes::from_static(b"ERR cross-shard reply channel closed")),
@@ -501,7 +503,7 @@ async fn coordinate_bitop(
                 commands,
                 reply_tx,
             };
-            spsc_send(dispatch_tx, my_shard, *shard_id, msg, spsc_notifiers).await;
+            let _ = spsc_send(dispatch_tx, my_shard, *shard_id, msg, spsc_notifiers).await;
             pending.push((indices, reply_rx));
         }
     }
@@ -768,10 +770,29 @@ fn extract_key(frame: &Frame) -> Option<Bytes> {
     }
 }
 
-/// Send a ShardMessage via SPSC with spin-retry on full buffer.
+/// Send a ShardMessage via SPSC with **bounded** backpressure retry on a full
+/// ring (R-1, design-for-failure).
 ///
-/// Calls `notify_one()` on the target shard's notifier after successful push
+/// Calls `notify_one()` on the target shard's notifier after a successful push
 /// for immediate wake (avoids relying on the 1ms periodic timer safety net).
+///
+/// Retries up to [`CROSS_SHARD_PUSH_MAX_RETRIES`] with a [`CROSS_SHARD_PUSH_BACKOFF`]
+/// sleep between attempts, then gives up and returns [`PushOutcome::Backpressure`].
+/// This replaces the previous **unbounded** `loop { try_push; yield/sleep }`,
+/// which (a) busy-spun a full core on tokio — `yield_now()` reschedules with no
+/// backoff — and (b) could block graceful shutdown forever on a wedged target.
+///
+/// **Give-up semantics:** on `Backpressure` the message (`pending`) is dropped.
+/// For a reply-carrying message (`MultiExecute`/`MultiExecuteSlotted`/…) this
+/// drops the embedded reply sender, so the awaiting caller's `reply_rx.recv()`
+/// resolves to `Err` and it synthesizes a per-shard error for that slice of the
+/// response — the same closed-channel path callers already handle. Fire-and-
+/// forget messages become best-effort: a target that stayed full for the whole
+/// ~0.5s budget is effectively wedged, so dropping is the correct failure mode
+/// rather than spinning forever.
+///
+/// The return value lets future call sites branch on the outcome explicitly;
+/// existing statement-form callers (`spsc_send(...).await;`) simply discard it.
 ///
 /// Exposed at `pub(crate)` so sibling files (e.g. `scatter_aggregate`)
 /// can dispatch via the same contention-safe path.
@@ -781,27 +802,172 @@ pub(crate) async fn spsc_send(
     target_shard: usize,
     msg: ShardMessage,
     spsc_notifiers: &[Arc<channel::Notify>],
-) {
+) -> PushOutcome {
+    spsc_send_bounded(
+        dispatch_tx,
+        my_shard,
+        target_shard,
+        msg,
+        spsc_notifiers,
+        CROSS_SHARD_PUSH_MAX_RETRIES,
+        CROSS_SHARD_PUSH_BACKOFF,
+    )
+    .await
+}
+
+/// Retry budget is parameterized so tests can drive the give-up path with a
+/// tiny bound; production always calls it via [`spsc_send`] with the shared
+/// [`CROSS_SHARD_PUSH_MAX_RETRIES`] / [`CROSS_SHARD_PUSH_BACKOFF`] constants.
+async fn spsc_send_bounded(
+    dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
+    my_shard: usize,
+    target_shard: usize,
+    msg: ShardMessage,
+    spsc_notifiers: &[Arc<channel::Notify>],
+    max_retries: u32,
+    backoff: std::time::Duration,
+) -> PushOutcome {
     let target_idx = ChannelMesh::target_index(my_shard, target_shard);
     let mut pending = msg;
-    loop {
+
+    // Fast path: try once with no sleep. The borrow is scoped to the block so
+    // it is dropped before any `.await` (a RefCell borrow must not be held
+    // across a yield) and before `notify_one`.
+    let push_result = {
+        let mut producers = dispatch_tx.borrow_mut();
+        producers[target_idx].try_push(pending)
+    };
+    match push_result {
+        Ok(()) => {
+            spsc_notifiers[target_shard].notify_one();
+            return PushOutcome::Pushed;
+        }
+        Err(val) => pending = val,
+    }
+
+    // Brief spin before the first timed sleep: the consumer is another OS
+    // thread actively draining, so a transiently-full ring often frees a slot
+    // within nanoseconds — far below the 100µs backoff (which runtime timers
+    // may round up to ~1ms). This preserves the old 10µs-class latency for
+    // bursty-but-healthy targets without touching the wedged-target budget.
+    // Bounded and tiny (≤64 iterations), so it cannot convoy siblings the way
+    // an unbounded reply-side spin did (see the C2 solo-conn gate lesson).
+    for _ in 0..64 {
+        std::hint::spin_loop();
         let push_result = {
             let mut producers = dispatch_tx.borrow_mut();
             producers[target_idx].try_push(pending)
-        }; // borrow dropped before yield
+        };
         match push_result {
             Ok(()) => {
                 spsc_notifiers[target_shard].notify_one();
-                return;
+                return PushOutcome::Pushed;
             }
-            Err(val) => {
-                pending = val;
-                // Yield to other tasks to avoid busy-spinning on full SPSC buffer.
-                #[cfg(feature = "runtime-tokio")]
-                tokio::task::yield_now().await;
-                #[cfg(feature = "runtime-monoio")]
-                monoio::time::sleep(std::time::Duration::from_micros(10)).await;
+            Err(val) => pending = val,
+        }
+    }
+
+    // Bounded retry with backoff.
+    for _ in 0..max_retries {
+        // Back off before retrying so a full ring cannot hot-spin the core.
+        // No borrow is held across this await.
+        #[cfg(feature = "runtime-tokio")]
+        tokio::time::sleep(backoff).await;
+        #[cfg(feature = "runtime-monoio")]
+        monoio::time::sleep(backoff).await;
+
+        let push_result = {
+            let mut producers = dispatch_tx.borrow_mut();
+            producers[target_idx].try_push(pending)
+        };
+        match push_result {
+            Ok(()) => {
+                spsc_notifiers[target_shard].notify_one();
+                return PushOutcome::Pushed;
             }
+            Err(val) => pending = val,
+        }
+    }
+
+    // Budget exhausted: the target ring never drained. Drop `pending` (and any
+    // embedded reply sender) so awaiting callers fail loud instead of hanging.
+    // Rare by construction (~0.5s of failed retries), so the warn + labeled
+    // counter cannot flood.
+    tracing::warn!(
+        my_shard,
+        target_shard,
+        "cross-shard dispatch dropped after backpressure budget — target not draining"
+    );
+    crate::admin::metrics_setup::record_xshard_backpressure_drop(target_shard);
+    PushOutcome::Backpressure
+}
+
+/// Broadcast a keyless flush (FLUSHDB/FLUSHALL) to every OTHER shard (D-2).
+///
+/// FLUSHDB/FLUSHALL are keyless, so `extract_primary_key` routes them
+/// local-only — a normal client's flush previously cleared just the local
+/// shard's selected db, silently leaving the other `num_shards - 1` shards'
+/// keyspaces intact (ghost keys, stale reads, DBSIZE > 0 after FLUSHALL).
+///
+/// Each remote leg is shipped as a `MultiExecute` carrying the original
+/// command frame, so the target shard runs it through its normal SPSC arm:
+/// dispatch + per-shard AOF/WAL persistence (fail-loud `AOF_APPEND_LOST`) +
+/// vector/text index clearing all apply exactly as for the local leg.
+///
+/// Legs run concurrently (all sends first, then all acks awaited). Like
+/// SWAPDB's broadcast, this is not atomic across shards: a concurrent read
+/// can observe shard A flushed while shard B is not yet — Redis-cluster-
+/// relaxed semantics. On any failed leg the caller receives an explicit
+/// partial-flush error naming the shard, never a silent partial `+OK`.
+pub(crate) async fn coordinate_flush_broadcast(
+    command: &Frame,
+    my_shard: usize,
+    num_shards: usize,
+    db_index: usize,
+    dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
+    spsc_notifiers: &[Arc<channel::Notify>],
+) -> Result<(), Frame> {
+    let mut pending = Vec::with_capacity(num_shards.saturating_sub(1));
+    for target in 0..num_shards {
+        if target == my_shard {
+            continue;
+        }
+        let (reply_tx, reply_rx) = channel::oneshot();
+        let msg = ShardMessage::MultiExecute {
+            db_index,
+            // Keyless command: the routing key is unused by the flush arm.
+            commands: vec![(Bytes::new(), command.clone())],
+            reply_tx,
+        };
+        let outcome = spsc_send(dispatch_tx, my_shard, target, msg, spsc_notifiers).await;
+        pending.push((target, reply_rx, outcome));
+    }
+
+    let mut failed: Option<usize> = None;
+    for (target, reply_rx, outcome) in pending {
+        if outcome != crate::shard::dispatch::PushOutcome::Pushed {
+            failed.get_or_insert(target);
+            continue;
+        }
+        match reply_rx.recv().await {
+            Ok(frames) if frames.iter().all(|f| !matches!(f, Frame::Error(_))) => {}
+            _ => {
+                failed.get_or_insert(target);
+            }
+        }
+    }
+    match failed {
+        None => Ok(()),
+        Some(target) => {
+            tracing::error!(
+                my_shard,
+                target,
+                "flush broadcast: remote leg failed — keyspace partially flushed"
+            );
+            Err(Frame::Error(Bytes::from(format!(
+                "MOONERR FLUSH partial: shard {target} leg failed or unreachable — \
+                 local shard flushed; retry the FLUSH command"
+            ))))
         }
     }
 }
@@ -887,7 +1053,7 @@ async fn coordinate_mget(
                 commands,
                 reply_tx,
             };
-            spsc_send(dispatch_tx, my_shard, *shard_id, msg, spsc_notifiers).await;
+            let _ = spsc_send(dispatch_tx, my_shard, *shard_id, msg, spsc_notifiers).await;
             pending_shards.push((original_indices, reply_rx));
         }
     }
@@ -1017,7 +1183,7 @@ async fn coordinate_mset(
                 commands,
                 reply_tx,
             };
-            spsc_send(dispatch_tx, my_shard, *shard_id, msg, spsc_notifiers).await;
+            let _ = spsc_send(dispatch_tx, my_shard, *shard_id, msg, spsc_notifiers).await;
             pending_shards.push(reply_rx);
         }
     }
@@ -1255,7 +1421,7 @@ async fn coordinate_multi_del_or_exists(
                 commands,
                 reply_tx,
             };
-            spsc_send(dispatch_tx, my_shard, *shard_id, msg, spsc_notifiers).await;
+            let _ = spsc_send(dispatch_tx, my_shard, *shard_id, msg, spsc_notifiers).await;
             pending_shards.push(reply_rx);
         }
     }
@@ -1336,7 +1502,7 @@ pub async fn coordinate_keys(
             command: std::sync::Arc::new(cmd_frame),
             reply_tx,
         };
-        spsc_send(dispatch_tx, my_shard, target, msg, spsc_notifiers).await;
+        let _ = spsc_send(dispatch_tx, my_shard, target, msg, spsc_notifiers).await;
         pending_shards.push(reply_rx);
     }
 
@@ -1425,7 +1591,7 @@ pub async fn coordinate_scan(
             command: std::sync::Arc::new(cmd_frame),
             reply_tx,
         };
-        spsc_send(dispatch_tx, my_shard, target_shard_id, msg, spsc_notifiers).await;
+        let _ = spsc_send(dispatch_tx, my_shard, target_shard_id, msg, spsc_notifiers).await;
         match reply_rx.recv().await {
             Ok(frame) => frame,
             Err(_) => Frame::Error(Bytes::from_static(
@@ -1507,7 +1673,7 @@ pub async fn coordinate_dbsize(
             command: std::sync::Arc::new(cmd_frame),
             reply_tx,
         };
-        spsc_send(dispatch_tx, my_shard, target, msg, spsc_notifiers).await;
+        let _ = spsc_send(dispatch_tx, my_shard, target, msg, spsc_notifiers).await;
         pending_shards.push(reply_rx);
     }
 
@@ -1567,7 +1733,7 @@ pub async fn coordinate_hotkeys(
             command: std::sync::Arc::new(cmd_frame),
             reply_tx,
         };
-        spsc_send(dispatch_tx, my_shard, target, msg, spsc_notifiers).await;
+        let _ = spsc_send(dispatch_tx, my_shard, target, msg, spsc_notifiers).await;
         pending_shards.push(reply_rx);
     }
 
@@ -1652,7 +1818,7 @@ pub async fn scatter_vector_search(
                     as_of_lsn,
                     reply_tx,
                 }));
-            spsc_send(dispatch_tx, my_shard, shard_id, msg, spsc_notifiers).await;
+            let _ = spsc_send(dispatch_tx, my_shard, shard_id, msg, spsc_notifiers).await;
             receivers.push(reply_rx);
         }
     }
@@ -1730,7 +1896,7 @@ pub async fn scatter_vector_search_remote(
                 as_of_lsn,
                 reply_tx,
             }));
-        spsc_send(dispatch_tx, my_shard, shard_id, msg, spsc_notifiers).await;
+        let _ = spsc_send(dispatch_tx, my_shard, shard_id, msg, spsc_notifiers).await;
         receivers.push(reply_rx);
     }
 
@@ -1780,7 +1946,7 @@ pub async fn broadcast_vector_command(
             command: command.clone(),
             reply_tx,
         };
-        spsc_send(dispatch_tx, my_shard, target, msg, spsc_notifiers).await;
+        let _ = spsc_send(dispatch_tx, my_shard, target, msg, spsc_notifiers).await;
         receivers.push(reply_rx);
     }
 
@@ -1876,7 +2042,7 @@ pub async fn scatter_invalidate_range(
             command: command.clone(),
             reply_tx,
         };
-        spsc_send(dispatch_tx, my_shard, target, msg, spsc_notifiers).await;
+        let _ = spsc_send(dispatch_tx, my_shard, target, msg, spsc_notifiers).await;
         receivers.push(reply_rx);
     }
 
@@ -1956,7 +2122,7 @@ pub async fn scatter_ft_info(
             command: command.clone(),
             reply_tx,
         };
-        spsc_send(dispatch_tx, my_shard, target, msg, spsc_notifiers).await;
+        let _ = spsc_send(dispatch_tx, my_shard, target, msg, spsc_notifiers).await;
         receivers.push(reply_rx);
     }
 
@@ -2128,7 +2294,7 @@ pub async fn scatter_text_search(
                 field_queries: field_queries.clone(),
                 reply_tx,
             };
-            spsc_send(dispatch_tx, my_shard, shard_id, msg, spsc_notifiers).await;
+            let _ = spsc_send(dispatch_tx, my_shard, shard_id, msg, spsc_notifiers).await;
             doc_freq_receivers.push(reply_rx);
         }
     }
@@ -2216,7 +2382,7 @@ pub async fn scatter_text_search(
                     summarize_opts: summarize_opts.clone(),
                     reply_tx,
                 }));
-            spsc_send(dispatch_tx, my_shard, shard_id, msg, spsc_notifiers).await;
+            let _ = spsc_send(dispatch_tx, my_shard, shard_id, msg, spsc_notifiers).await;
             search_receivers.push(reply_rx);
         }
     }
@@ -2335,7 +2501,7 @@ pub async fn scatter_text_search_filter(
                     reply_tx,
                 },
             ));
-            spsc_send(dispatch_tx, my_shard, shard_id, msg, spsc_notifiers).await;
+            let _ = spsc_send(dispatch_tx, my_shard, shard_id, msg, spsc_notifiers).await;
             receivers.push(reply_rx);
         }
     }
@@ -2452,7 +2618,7 @@ pub async fn coordinate_swapdb(
         }
         let (reply_tx, reply_rx) = channel::oneshot();
         let msg = ShardMessage::SwapDb { a, b, reply_tx };
-        spsc_send(dispatch_tx, my_shard, target, msg, spsc_notifiers).await;
+        let _ = spsc_send(dispatch_tx, my_shard, target, msg, spsc_notifiers).await;
         receivers.push(reply_rx);
     }
 
@@ -2539,6 +2705,90 @@ mod tests {
             shards.len(),
             1,
             "all keys with same hash tag should map to one shard"
+        );
+    }
+
+    // ── R-1: bounded spsc_send backpressure ──
+    // A single-capacity ring at `target_idx` for (my_shard=1, target_shard=0),
+    // since `ChannelMesh::target_index(1, 0) == 0`.
+    #[cfg(feature = "runtime-tokio")]
+    fn make_ring(
+        capacity: usize,
+    ) -> (
+        Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
+        ringbuf::HeapCons<ShardMessage>,
+        Vec<Arc<channel::Notify>>,
+    ) {
+        use ringbuf::HeapRb;
+        use ringbuf::traits::Split;
+        let (prod, cons) = HeapRb::<ShardMessage>::new(capacity).split();
+        let dispatch_tx = Rc::new(RefCell::new(vec![prod]));
+        let notifiers = vec![Arc::new(channel::Notify::new())];
+        (dispatch_tx, cons, notifiers)
+    }
+
+    #[cfg(feature = "runtime-tokio")]
+    #[tokio::test]
+    async fn spsc_send_pushes_when_ring_has_space() {
+        use ringbuf::traits::Consumer;
+        let (dispatch_tx, mut cons, notifiers) = make_ring(4);
+        let outcome = spsc_send(
+            &dispatch_tx,
+            1, // my_shard
+            0, // target_shard -> target_idx 0
+            ShardMessage::BlockCancel { wait_id: 42 },
+            &notifiers,
+        )
+        .await;
+        assert_eq!(outcome, PushOutcome::Pushed);
+        // The message actually landed in the ring.
+        assert!(
+            matches!(
+                cons.try_pop(),
+                Some(ShardMessage::BlockCancel { wait_id: 42 })
+            ),
+            "pushed message must be present in the target ring"
+        );
+    }
+
+    #[cfg(feature = "runtime-tokio")]
+    #[tokio::test]
+    async fn spsc_send_gives_up_when_ring_never_drains() {
+        // Fill the capacity-1 ring so every push attempt fails: a wedged target.
+        // The bounded retry MUST terminate with Backpressure rather than spin
+        // forever — a regression to the old unbounded loop would hang here. A
+        // tiny budget (5 retries × 1ms) keeps the test fast and deterministic.
+        let (dispatch_tx, _cons, notifiers) = make_ring(1);
+        // Pre-fill the ring (hold `_cons` so nothing drains it).
+        {
+            use ringbuf::traits::Producer;
+            let mut prods = dispatch_tx.borrow_mut();
+            assert!(
+                prods[0]
+                    .try_push(ShardMessage::BlockCancel { wait_id: 1 })
+                    .is_ok()
+            );
+        }
+        let start = std::time::Instant::now();
+        let outcome = spsc_send_bounded(
+            &dispatch_tx,
+            1,
+            0,
+            ShardMessage::BlockCancel { wait_id: 2 },
+            &notifiers,
+            5,
+            std::time::Duration::from_millis(1),
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            PushOutcome::Backpressure,
+            "a ring that never drains must yield Backpressure, not hang"
+        );
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "bounded retry must terminate promptly, took {:?}",
+            start.elapsed()
         );
     }
 

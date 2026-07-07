@@ -61,6 +61,10 @@ pub enum WalRecordType {
     XactCommit = 0x51,
     /// Cross-store transaction abort.
     XactAbort = 0x52,
+    /// Cross-store transaction commit, v2: header carries the logical db
+    /// index so crash replay restores KV ops into the db the transaction ran
+    /// in (v1 records replay into db 0 — the pre-multi-db behaviour).
+    XactCommitV2 = 0x53,
     /// Workspace creation record.
     WorkspaceCreate = 0x60,
     /// Workspace deletion record.
@@ -92,6 +96,7 @@ impl WalRecordType {
             0x50 => Some(Self::XactBegin),
             0x51 => Some(Self::XactCommit),
             0x52 => Some(Self::XactAbort),
+            0x53 => Some(Self::XactCommitV2),
             0x60 => Some(Self::WorkspaceCreate),
             0x61 => Some(Self::WorkspaceDrop),
             0x70 => Some(Self::MqCreate),
@@ -328,6 +333,57 @@ pub fn encode_xact_commit_payload(
 ) -> Vec<u8> {
     let mut payload = Vec::with_capacity(12 + undo_records.len() * 32);
     payload.extend_from_slice(&txn_id.to_le_bytes());
+    // Count placeholder — patched at the end
+    let count_offset = payload.len();
+    payload.extend_from_slice(&0u32.to_le_bytes());
+    let mut count = 0u32;
+
+    for record in undo_records {
+        match record {
+            crate::transaction::UndoRecord::Insert { key }
+            | crate::transaction::UndoRecord::Update { key, .. } => {
+                // Read current (post-dispatch) value for forward-image WAL
+                if let Some(entry) = db.data().get(key.as_ref()) {
+                    if let Some(value) = entry.value.as_bytes_owned() {
+                        payload.push(0u8); // op_type = SET
+                        payload.extend_from_slice(&(key.len() as u32).to_le_bytes());
+                        payload.extend_from_slice(key);
+                        payload.extend_from_slice(&(value.len() as u32).to_le_bytes());
+                        payload.extend_from_slice(&value);
+                        count += 1;
+                    }
+                }
+            }
+            crate::transaction::UndoRecord::Delete { key, .. } => {
+                payload.push(1u8); // op_type = DEL
+                payload.extend_from_slice(&(key.len() as u32).to_le_bytes());
+                payload.extend_from_slice(key);
+                count += 1;
+            }
+        }
+    }
+    // Patch count field
+    payload[count_offset..count_offset + 4].copy_from_slice(&count.to_le_bytes());
+    payload
+}
+
+/// Encode an [`WalRecordType::XactCommitV2`] payload.
+///
+/// Identical to the v1 format except the header carries the logical db index
+/// the transaction ran in, so crash replay restores the KV ops into the
+/// correct db (v1 records hardcoded db 0 on replay).
+///
+/// Layout (little-endian): `txn_id: u64, db_index: u32, kv_op_count: u32,
+/// ops…` (op wire format unchanged from v1).
+pub fn encode_xact_commit_payload_v2(
+    txn_id: u64,
+    db_index: u32,
+    undo_records: &[crate::transaction::UndoRecord],
+    db: &crate::storage::Database,
+) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(16 + undo_records.len() * 32);
+    payload.extend_from_slice(&txn_id.to_le_bytes());
+    payload.extend_from_slice(&db_index.to_le_bytes());
     // Count placeholder — patched at the end
     let count_offset = payload.len();
     payload.extend_from_slice(&0u32.to_le_bytes());

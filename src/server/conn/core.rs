@@ -166,6 +166,35 @@ impl ConnectionContext {
             disk_offload_dir,
         }
     }
+
+    /// Build the eviction context for FCALL-internal `redis.call` writes
+    /// (Gap B — same OOM gate as EVAL/EVALSHA). Used by the lazy
+    /// `FunctionRegistry` init in both connection handlers: constructing this
+    /// eagerly per connection cost 6 Arc/Rc clones for the >99% of
+    /// connections that never call FUNCTION/FCALL.
+    pub fn build_lua_eviction_ctx(&self) -> crate::scripting::bridge::LuaEvictionCtx {
+        crate::scripting::bridge::LuaEvictionCtx::new(
+            self.shard_databases.clone(),
+            self.runtime_config.clone(),
+            self.shard_id,
+            self.spill_sender.clone(),
+            self.spill_file_id.clone(),
+            self.disk_offload_dir.clone(),
+        )
+    }
+}
+
+/// Get-or-init helper for the per-connection lazy `FunctionRegistry` slot.
+/// Returns after guaranteeing the slot is `Some`.
+pub(crate) fn ensure_function_registry(
+    slot: &RefCell<Option<crate::scripting::FunctionRegistry>>,
+    ctx: &ConnectionContext,
+) {
+    if slot.borrow().is_none() {
+        *slot.borrow_mut() = Some(crate::scripting::FunctionRegistry::new(
+            ctx.build_lua_eviction_ctx(),
+        ));
+    }
 }
 
 /// Per-connection mutable state.

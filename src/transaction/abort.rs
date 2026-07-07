@@ -481,8 +481,21 @@ pub async fn abort_cross_store_txn_routed(
                 reply_tx,
             },
         ));
-        crate::shard::coordinator::spsc_send(dispatch_tx, shard_id, owner, msg, spsc_notifiers)
-            .await;
+        let outcome =
+            crate::shard::coordinator::spsc_send(dispatch_tx, shard_id, owner, msg, spsc_notifiers)
+                .await;
+        if outcome != crate::shard::dispatch::PushOutcome::Pushed {
+            // The rollback was never delivered: the owner shard keeps the
+            // txn's graph intents un-undone until its own reconcile/GC path
+            // catches them. Loud, not warn — this is leaked remote state.
+            tracing::error!(
+                txn_id,
+                owner,
+                "txn abort: remote graph rollback DROPPED under dispatch \
+                 backpressure — remote graph intents not undone"
+            );
+            continue;
+        }
         if reply_rx.recv().await.is_err() {
             tracing::warn!(
                 txn_id,

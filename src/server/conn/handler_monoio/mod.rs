@@ -119,6 +119,10 @@ pub(crate) async fn handle_connection_sharded_monoio<
     // and the event loop still sweeps it every iteration.
     _pending_wakers: Rc<RefCell<Vec<std::task::Waker>>>,
     migrated_state: Option<&MigratedConnectionState>,
+    // Raw socket fd for CLIENT KILL force-close (R-3), or -1 if unavailable
+    // (non-unix). Threaded from the concrete spawn site; the generic `S` here
+    // has no `AsRawFd` bound.
+    kill_fd: i32,
 ) -> (MonoioHandlerResult, Option<S>) {
     use monoio::io::AsyncWriteRentExt;
 
@@ -159,6 +163,7 @@ pub(crate) async fn handle_connection_sharded_monoio<
         peer_addr.clone(),
         conn.current_user.clone(),
         ctx.shard_id,
+        kill_fd,
     );
     struct RegistryGuard(u64);
     impl Drop for RegistryGuard {
@@ -168,20 +173,14 @@ pub(crate) async fn handle_connection_sharded_monoio<
     }
     let _registry_guard = RegistryGuard(client_id);
 
-    // Functions API registry (per-connection, lazy init) — kept as local because Rc<RefCell<>> is !Send.
-    // Real eviction ctx (Gap B): FCALL-internal `redis.call` writes must run
-    // the same OOM gate as EVAL/EVALSHA, same handles `LuaEvictionCtx::new`
-    // uses elsewhere on this shard (conn_accept.rs's `setup_lua_vm` call).
-    let func_registry = Rc::new(RefCell::new(crate::scripting::FunctionRegistry::new(
-        crate::scripting::bridge::LuaEvictionCtx::new(
-            ctx.shard_databases.clone(),
-            ctx.runtime_config.clone(),
-            ctx.shard_id,
-            ctx.spill_sender.clone(),
-            ctx.spill_file_id.clone(),
-            ctx.disk_offload_dir.clone(),
-        ),
-    )));
+    // Functions API registry — LAZY per connection (P-1 footprint): built on
+    // first FUNCTION/FCALL/FCALL_RO via `ensure_function_registry`, so the
+    // >99% of connections that never touch the Functions API pay zero
+    // registry + eviction-ctx cost. Kept as a local because Rc<RefCell<>> is
+    // !Send. The eviction ctx (Gap B — FCALL-internal `redis.call` writes run
+    // the same OOM gate as EVAL) is built by `ctx.build_lua_eviction_ctx()`.
+    let func_registry: Rc<RefCell<Option<crate::scripting::FunctionRegistry>>> =
+        Rc::new(RefCell::new(None));
 
     // Pre-allocate read buffer outside the loop to avoid per-read heap allocation.
     // Monoio's ownership I/O takes ownership and returns the buffer, so we reassign.
@@ -1443,6 +1442,29 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                 cmd_str,
                                 &mut conn.cached_metrics,
                             );
+                        }
+                    }
+
+                    // D-2: keyless FLUSHDB/FLUSHALL routed local-only cleared just
+                    // this shard — broadcast to every other shard (outside the
+                    // with_shard closure: this awaits). Any failed leg turns the
+                    // reply into an explicit partial-flush error, never silent +OK.
+                    if !matches!(response, Frame::Error(_))
+                        && ctx.num_shards > 1
+                        && (cmd.eq_ignore_ascii_case(b"FLUSHDB")
+                            || cmd.eq_ignore_ascii_case(b"FLUSHALL"))
+                    {
+                        if let Err(e) = crate::shard::coordinator::coordinate_flush_broadcast(
+                            &frame,
+                            ctx.shard_id,
+                            ctx.num_shards,
+                            conn.selected_db,
+                            &ctx.dispatch_tx,
+                            &ctx.spsc_notifiers,
+                        )
+                        .await
+                        {
+                            response = e;
                         }
                     }
 

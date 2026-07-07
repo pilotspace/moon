@@ -13,12 +13,41 @@ use super::frame::{Frame, FrameVec, ParseError};
 /// Returns `Ok(Some(Frame::Array(...)))` with each argument as a `BulkString`,
 /// `Ok(None)` if the buffer doesn't contain a complete line (no `\r\n` found),
 /// or `Ok(None)` for empty/whitespace-only lines (after advancing past the CRLF).
-pub fn parse_inline(buf: &mut BytesMut) -> Result<Option<Frame>, ParseError> {
+///
+/// `max_inline_size` bounds the length of a single inline line. If the buffer
+/// grows past it without a terminating `\r\n`, the line is rejected with a
+/// protocol error instead of returning `Ok(None)` forever — this is what stops
+/// a client that never sends `\r\n` from growing the read buffer without limit
+/// (mirrors Redis's `PROTO_INLINE_MAX_SIZE`).
+pub fn parse_inline(
+    buf: &mut BytesMut,
+    max_inline_size: usize,
+) -> Result<Option<Frame>, ParseError> {
     // Find the CRLF terminator
     let crlf_pos = match find_crlf_position(&buf[..]) {
         Some(pos) => pos,
-        None => return Ok(None), // Incomplete -- need more data
+        None => {
+            // No complete line yet. Reject before the buffer can grow unbounded:
+            // a non-RESP stream with no `\r\n` would otherwise "need more data"
+            // forever. Redis caps this at PROTO_INLINE_MAX_SIZE.
+            if buf.len() > max_inline_size {
+                return Err(ParseError::Invalid {
+                    message: "Protocol error: too big inline request".into(),
+                    offset: 0,
+                });
+            }
+            return Ok(None); // Incomplete -- need more data
+        }
     };
+
+    // Reject an oversize completed line too (parity with Redis, which rejects
+    // any inline request past the cap regardless of termination).
+    if crlf_pos > max_inline_size {
+        return Err(ParseError::Invalid {
+            message: "Protocol error: too big inline request".into(),
+            offset: 0,
+        });
+    }
 
     // Extract line content before CRLF
     let line = &buf[..crlf_pos];
@@ -89,9 +118,13 @@ mod tests {
     use super::*;
     use crate::framevec;
 
+    // Generous cap for the behavioural tests below; the cap itself is exercised
+    // by the dedicated tests at the end of this module.
+    const TEST_MAX_INLINE: usize = 64 * 1024;
+
     fn parse_inline_bytes(input: &[u8]) -> Result<Option<Frame>, ParseError> {
         let mut buf = BytesMut::from(input);
-        parse_inline(&mut buf)
+        parse_inline(&mut buf, TEST_MAX_INLINE)
     }
 
     #[test]
@@ -150,7 +183,7 @@ mod tests {
     #[test]
     fn test_parse_inline_sequential() {
         let mut buf = BytesMut::from(&b"GET key\r\nPING\r\n"[..]);
-        let frame1 = parse_inline(&mut buf).unwrap().unwrap();
+        let frame1 = parse_inline(&mut buf, TEST_MAX_INLINE).unwrap().unwrap();
         assert_eq!(
             frame1,
             Frame::Array(framevec![
@@ -158,7 +191,7 @@ mod tests {
                 Frame::BulkString(Bytes::from_static(b"key")),
             ])
         );
-        let frame2 = parse_inline(&mut buf).unwrap().unwrap();
+        let frame2 = parse_inline(&mut buf, TEST_MAX_INLINE).unwrap().unwrap();
         assert_eq!(
             frame2,
             Frame::Array(framevec![Frame::BulkString(Bytes::from_static(b"PING"))])
@@ -190,15 +223,62 @@ mod tests {
     #[test]
     fn test_parse_inline_buffer_consumed() {
         let mut buf = BytesMut::from(&b"PING\r\nremaining"[..]);
-        let _ = parse_inline(&mut buf).unwrap().unwrap();
+        let _ = parse_inline(&mut buf, TEST_MAX_INLINE).unwrap().unwrap();
         assert_eq!(&buf[..], b"remaining");
     }
 
     #[test]
     fn test_parse_inline_empty_line_buffer_consumed() {
         let mut buf = BytesMut::from(&b"\r\nPING\r\n"[..]);
-        let result = parse_inline(&mut buf).unwrap();
+        let result = parse_inline(&mut buf, TEST_MAX_INLINE).unwrap();
         assert!(result.is_none());
         assert_eq!(&buf[..], b"PING\r\n");
+    }
+
+    #[test]
+    fn test_parse_inline_incomplete_under_cap_needs_more_data() {
+        // A partial line shorter than the cap is still "need more data", not an error.
+        let mut buf = BytesMut::from(&b"PARTIAL WITHOUT TERMINATOR"[..]);
+        let result = parse_inline(&mut buf, TEST_MAX_INLINE).unwrap();
+        assert!(result.is_none());
+        // Buffer is untouched so the caller can append more bytes.
+        assert_eq!(&buf[..], b"PARTIAL WITHOUT TERMINATOR");
+    }
+
+    #[test]
+    fn test_parse_inline_incomplete_over_cap_rejected() {
+        // No CRLF and length exceeds the cap -> reject instead of Ok(None) forever.
+        // This is the memory-exhaustion guard: without it the read buffer grows
+        // without bound for a client that never sends `\r\n`.
+        let cap = 16;
+        let mut buf = BytesMut::from(&b"AAAAAAAAAAAAAAAAAAAAAAAAAAAA"[..]); // 28 bytes, no CRLF
+        let err = parse_inline(&mut buf, cap).unwrap_err();
+        match err {
+            ParseError::Invalid { message, .. } => {
+                assert!(message.contains("too big inline request"), "got: {message}");
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_inline_complete_over_cap_rejected() {
+        // A terminated line that is itself larger than the cap is also rejected.
+        let cap = 8;
+        let mut buf = BytesMut::from(&b"THIS LINE IS WAY TOO LONG\r\n"[..]);
+        let err = parse_inline(&mut buf, cap).unwrap_err();
+        assert!(matches!(err, ParseError::Invalid { .. }));
+    }
+
+    #[test]
+    fn test_parse_inline_exactly_at_cap_ok() {
+        // A complete line of exactly the cap length is accepted (boundary is inclusive).
+        let cap = 4;
+        let mut buf = BytesMut::from(&b"PING\r\n"[..]); // line content "PING" == 4 bytes
+        let frame = parse_inline(&mut buf, cap).unwrap().unwrap();
+        assert_eq!(
+            frame,
+            Frame::Array(framevec![Frame::BulkString(Bytes::from_static(b"PING"))])
+        );
     }
 }

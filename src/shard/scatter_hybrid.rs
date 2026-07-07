@@ -163,7 +163,7 @@ pub async fn scatter_hybrid_search(
                 field_queries: field_queries.clone(),
                 reply_tx,
             };
-            spsc_send(dispatch_tx, my_shard, shard_id, msg, spsc_notifiers).await;
+            let _ = spsc_send(dispatch_tx, my_shard, shard_id, msg, spsc_notifiers).await;
             dfs_receivers.push(reply_rx);
         }
     }
@@ -242,7 +242,7 @@ pub async fn scatter_hybrid_search(
                 reply_tx,
             };
             let msg = ShardMessage::FtHybrid(Box::new(payload));
-            spsc_send(dispatch_tx, my_shard, shard_id, msg, spsc_notifiers).await;
+            let _ = spsc_send(dispatch_tx, my_shard, shard_id, msg, spsc_notifiers).await;
             hyb_receivers.push(reply_rx);
         }
     }

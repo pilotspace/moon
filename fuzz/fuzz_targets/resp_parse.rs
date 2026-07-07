@@ -16,6 +16,7 @@ fuzz_target!(|data: &[u8]| {
         max_bulk_string_size: 64 * 1024, // 64 KB — enough to exercise bulk paths
         max_array_depth: 4,              // Prevent stack overflow from nesting
         max_array_length: 256,           // Bound allocation from large arrays
+        max_inline_size: 64 * 1024,      // Bound inline-line growth
     };
 
     let mut buf = BytesMut::from(data);
