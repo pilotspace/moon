@@ -6,6 +6,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — AOF writer polls park-free under everysec/no (PR #TBD)
+
+- The two std-thread AOF writer loops (monoio TopLevel + PerShard) no longer
+  park in `recv_timeout` under `appendfsync everysec`/`no`. A parked receiver
+  makes every producer `try_send` pay a futex WAKE **on the shard thread** —
+  measured at ~150k futex calls (63% of shard-thread syscall time) during an
+  8s non-pipelined SET run, the mechanism behind Moon's everysec P1 SET
+  deficit vs Redis (whose AOF append is a plain memcpy). The writer now polls
+  `try_recv` with adaptive sleeps (wait/16, clamped 500µs–50ms) so producer
+  sends stay pure userspace atomics; post-fix the same run shows 96 futex
+  calls. `appendfsync always` keeps the parked recv (its callers await the
+  per-batch fsync ack, so receive latency is client-visible RTT).
+- EverySec durability bound unchanged: at the 50ms fast floor the deadline is
+  re-checked within ~3ms slack; idle cost is ≤20 writer wakes/s at the 1s
+  escalated wait (vs 1/s parked — still far below the pre-wave-5 fixed 50ms
+  cadence).
+
 ### Changed — Pub/sub subscriber delivery coalesces message bursts (PR #TBD)
 
 - All three connection handlers' subscriber delivery arms (`handler_monoio`,
