@@ -237,8 +237,24 @@ pub(super) async fn run_subscriber_step<S: tokio::io::AsyncRead + tokio::io::Asy
         msg = rx.recv_async() => {
             match msg {
                 Ok(data) => {
-                    // Data is pre-serialized RESP bytes — write directly
-                    if stream.write_all(&data).await.is_err() { return SubscriberAction::BreakOuter; }
+                    // Data is pre-serialized RESP bytes. Coalesce any burst already
+                    // queued into ONE write_all (reusing write_buf) — one syscall per
+                    // burst instead of per message. Single-message case stays
+                    // zero-copy via the is_empty fast path.
+                    const MAX_COALESCE_BYTES: usize = 64 * 1024;
+                    if rx.is_empty() {
+                        if stream.write_all(&data).await.is_err() { return SubscriberAction::BreakOuter; }
+                    } else {
+                        write_buf.clear();
+                        write_buf.extend_from_slice(&data);
+                        while write_buf.len() < MAX_COALESCE_BYTES {
+                            match rx.try_recv() {
+                                Ok(next) => write_buf.extend_from_slice(&next),
+                                Err(_) => break,
+                            }
+                        }
+                        if stream.write_all(write_buf).await.is_err() { return SubscriberAction::BreakOuter; }
+                    }
                 }
                 Err(_) => return SubscriberAction::BreakOuter,
             }

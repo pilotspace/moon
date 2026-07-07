@@ -366,8 +366,25 @@ pub async fn handle_connection(
                 msg = rx.recv_async() => {
                     match msg {
                         Ok(data) => {
-                            // Data is pre-serialized RESP — wrap in PreSerialized for framed send
-                            if framed.send(Frame::PreSerialized(data)).await.is_err() {
+                            // Data is pre-serialized RESP. Coalesce any burst already
+                            // queued into ONE PreSerialized send — one flush/syscall per
+                            // burst instead of per message. Single-message case stays
+                            // zero-copy via the is_empty fast path.
+                            const MAX_COALESCE_BYTES: usize = 64 * 1024;
+                            let payload = if rx.is_empty() {
+                                data
+                            } else {
+                                let mut agg = BytesMut::with_capacity((data.len() * 4).min(MAX_COALESCE_BYTES));
+                                agg.extend_from_slice(&data);
+                                while agg.len() < MAX_COALESCE_BYTES {
+                                    match rx.try_recv() {
+                                        Ok(next) => agg.extend_from_slice(&next),
+                                        Err(_) => break,
+                                    }
+                                }
+                                agg.freeze()
+                            };
+                            if framed.send(Frame::PreSerialized(payload)).await.is_err() {
                                 break;
                             }
                         }

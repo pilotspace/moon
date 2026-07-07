@@ -6,6 +6,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — Pub/sub subscriber delivery coalesces message bursts (PR #TBD)
+
+- All three connection handlers' subscriber delivery arms (`handler_monoio`,
+  `handler_sharded`'s `run_subscriber_step`, `handler_single`) now drain the
+  subscriber queue (`try_recv`, capped at 64 KB) and deliver the burst with
+  ONE `write_all` instead of one write syscall per message — the same batched
+  write pattern the command path already uses. Raises the fan-out delivery
+  ceiling and shortens the window in which a slow subscriber's bounded queue
+  (256) overflows and drops messages. The single-message case keeps the
+  zero-copy path (`is_empty` fast path, no allocation; `handler_sharded`
+  reuses the connection's `write_buf`).
+- New wire-level integration test `tests/pubsub_burst_delivery.rs`: a
+  pipelined publish burst must arrive complete, frame-boundary-intact, and in
+  order at 1 and 4 shards (both runtimes).
+
 ### Changed — `appendfsync always`: local writes now group-commit per pipeline batch (PR #TBD)
 
 - **All three connection handlers** (`handler_monoio`, `handler_sharded`,

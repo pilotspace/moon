@@ -478,8 +478,26 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 msg = rx.recv_async() => {
                     match msg {
                         Ok(data) => {
-                            // Data is pre-serialized RESP bytes — write directly
-                            let (result, _): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(data).await;
+                            // Data is pre-serialized RESP bytes. Coalesce any burst
+                            // already queued into ONE write_all — one syscall per
+                            // burst instead of per message (the delivery ceiling
+                            // under fan-out publish load). Single-message case
+                            // stays zero-copy/zero-alloc via the is_empty fast path.
+                            const MAX_COALESCE_BYTES: usize = 64 * 1024;
+                            let payload: Bytes = if rx.is_empty() {
+                                data
+                            } else {
+                                let mut agg = BytesMut::with_capacity((data.len() * 4).min(MAX_COALESCE_BYTES));
+                                agg.extend_from_slice(&data);
+                                while agg.len() < MAX_COALESCE_BYTES {
+                                    match rx.try_recv() {
+                                        Ok(next) => agg.extend_from_slice(&next),
+                                        Err(_) => break,
+                                    }
+                                }
+                                agg.freeze()
+                            };
+                            let (result, _): (std::io::Result<usize>, bytes::Bytes) = stream.write_all(payload).await;
                             if result.is_err() { break; }
                         }
                         Err(_) => break, // all senders dropped
