@@ -604,3 +604,30 @@ fn where_range_query_correct_across_tiers_and_types() {
     );
     assert_eq!(rows.len(), 2, "ids 1,2");
 }
+
+// ---------------------------------------------------------------------------
+// 8. Binary-safe string values (W2-4): RESP bulk strings are arbitrary bytes;
+//    a non-UTF8 property must round-trip through RETURN, not degrade to "".
+// ---------------------------------------------------------------------------
+
+#[test]
+fn binary_property_roundtrips_through_return() {
+    let mut store = setup();
+    let raw: &[u8] = &[0xff, 0xfe, b'!'];
+    let r = graph_addnode(
+        &mut store,
+        &[bs(GRAPH), bs("N"), bs("data"), blob(raw.to_vec())],
+    );
+    assert!(matches!(r, Frame::Integer(_)), "ADDNODE failed: {r:?}");
+
+    let cells = single_cells(&run_query(&store, "MATCH (n:N) RETURN n.data"));
+    assert_eq!(cells.len(), 1);
+    match &cells[0] {
+        Frame::BulkString(b) => assert_eq!(
+            b.as_ref(),
+            raw,
+            "non-UTF8 property bytes must survive the reply path"
+        ),
+        other => panic!("expected bulk string, got {other:?}"),
+    }
+}

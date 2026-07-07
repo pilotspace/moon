@@ -116,7 +116,9 @@ fn json_to_graph_value(v: &serde_json::Value) -> cypher::executor::Value {
                 cypher::executor::Value::Float(n.as_f64().unwrap_or(0.0))
             }
         }
-        serde_json::Value::String(s) => cypher::executor::Value::String(s.clone()),
+        serde_json::Value::String(s) => {
+            cypher::executor::Value::String(Bytes::copy_from_slice(s.as_bytes()))
+        }
         serde_json::Value::Array(arr) => {
             cypher::executor::Value::List(arr.iter().map(json_to_graph_value).collect())
         }
@@ -1230,7 +1232,9 @@ fn value_to_frame(value: &cypher::executor::Value) -> Frame {
         Value::Null => Frame::Null,
         Value::Int(n) => Frame::Integer(*n),
         Value::Float(f) => Frame::Double(*f),
-        Value::String(s) => Frame::BulkString(Bytes::from(s.clone())),
+        // Zero-copy (W2-4): the stored property's Bytes flows straight into
+        // the reply frame — a refcount bump, not an allocation.
+        Value::String(s) => Frame::BulkString(s.clone()),
         Value::Bool(b) => Frame::Boolean(*b),
         Value::Node(key) => {
             // "node:" (5) + max u64 (20 digits) = 25 bytes max

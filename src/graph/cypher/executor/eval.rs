@@ -23,7 +23,7 @@ pub(crate) fn eval_expr(
     match expr {
         Expr::Integer(n) => Value::Int(*n),
         Expr::Float(f) => Value::Float(*f),
-        Expr::StringLit(s) => Value::String(s.clone()),
+        Expr::StringLit(s) => Value::String(Bytes::copy_from_slice(s.as_bytes())),
         Expr::Bool(b) => Value::Bool(*b),
         Expr::Null => Value::Null,
 
@@ -283,7 +283,10 @@ pub(crate) fn eval_expr(
                         match v {
                             Value::Int(n) => Value::Int(n),
                             Value::Float(f) => Value::Int(f as i64),
-                            Value::String(s) => s.parse::<i64>().map_or(Value::Null, Value::Int),
+                            Value::String(s) => core::str::from_utf8(&s)
+                                .ok()
+                                .and_then(|t| t.parse::<i64>().ok())
+                                .map_or(Value::Null, Value::Int),
                             _ => Value::Null,
                         }
                     } else {
@@ -304,7 +307,10 @@ pub(crate) fn eval_expr(
                         match v {
                             Value::Float(f) => Value::Float(f),
                             Value::Int(n) => Value::Float(n as f64),
-                            Value::String(s) => s.parse::<f64>().map_or(Value::Null, Value::Float),
+                            Value::String(s) => core::str::from_utf8(&s)
+                                .ok()
+                                .and_then(|t| t.parse::<f64>().ok())
+                                .map_or(Value::Null, Value::Float),
                             _ => Value::Null,
                         }
                     } else {
@@ -322,7 +328,7 @@ pub(crate) fn eval_expr(
                             snapshot_lsn,
                             decay,
                         );
-                        Value::String(value_to_string(&v))
+                        Value::String(Bytes::from(value_to_string(&v)))
                     } else {
                         Value::Null
                     }
@@ -503,9 +509,10 @@ pub(crate) fn eval_binary_op(left: &Value, op: BinaryOperator, right: &Value) ->
             (Value::Int(a), Value::Float(b)) => Value::Float(*a as f64 + b),
             (Value::Float(a), Value::Int(b)) => Value::Float(a + *b as f64),
             (Value::String(a), Value::String(b)) => {
-                let mut s = a.clone();
-                s.push_str(b);
-                Value::String(s)
+                let mut s = Vec::with_capacity(a.len() + b.len());
+                s.extend_from_slice(a);
+                s.extend_from_slice(b);
+                Value::String(Bytes::from(s))
             }
             _ => Value::Null,
         },
@@ -545,13 +552,14 @@ pub(crate) fn eval_binary_op(left: &Value, op: BinaryOperator, right: &Value) ->
             // suffix (prefix*), and contains (*middle*).
             match (left, right) {
                 (Value::String(text), Value::String(pattern)) => {
-                    let matched = if let Some(stripped) = pattern.strip_prefix(".*") {
-                        if let Some(middle) = stripped.strip_suffix(".*") {
-                            text.contains(middle)
+                    let (text, pattern) = (text.as_ref(), pattern.as_ref());
+                    let matched = if let Some(stripped) = pattern.strip_prefix(b".*") {
+                        if let Some(middle) = stripped.strip_suffix(b".*") {
+                            bytes_contains(text, middle)
                         } else {
                             text.ends_with(stripped)
                         }
-                    } else if let Some(stripped) = pattern.strip_suffix(".*") {
+                    } else if let Some(stripped) = pattern.strip_suffix(b".*") {
                         text.starts_with(stripped)
                     } else {
                         text == pattern
@@ -629,14 +637,21 @@ pub(crate) fn compare_values(a: &Value, b: &Value) -> std::cmp::Ordering {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Convert a PropertyValue to a runtime Value.
+/// Substring search over raw bytes (the `=~ ".*x.*"` fallback matcher).
+fn bytes_contains(haystack: &[u8], needle: &[u8]) -> bool {
+    needle.is_empty() || haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+/// Convert a PropertyValue to a runtime Value. Zero-copy for strings/bytes
+/// (refcount bump on the stored `Bytes`) — and binary-safe: pre-W2-4 this
+/// lossily degraded non-UTF8 payloads to `""`.
 pub(crate) fn property_value_to_value(pv: &PropertyValue) -> Value {
     match pv {
         PropertyValue::Int(n) => Value::Int(*n),
         PropertyValue::Float(f) => Value::Float(*f),
-        PropertyValue::String(s) => Value::String(core::str::from_utf8(s).unwrap_or("").to_owned()),
+        PropertyValue::String(s) => Value::String(s.clone()),
         PropertyValue::Bool(b) => Value::Bool(*b),
-        PropertyValue::Bytes(b) => Value::String(core::str::from_utf8(b).unwrap_or("").to_owned()),
+        PropertyValue::Bytes(b) => Value::String(b.clone()),
     }
 }
 
@@ -646,7 +661,7 @@ pub(crate) fn value_to_string(v: &Value) -> String {
         Value::Null => "null".into(),
         Value::Int(n) => n.to_string(),
         Value::Float(f) => f.to_string(),
-        Value::String(s) => s.clone(),
+        Value::String(s) => String::from_utf8_lossy(s).into_owned(),
         Value::Bool(b) => b.to_string(),
         Value::Node(k) => format!("node:{}", k.data().as_ffi()),
         Value::Edge(k) => format!("edge:{}", k.data().as_ffi()),
@@ -713,7 +728,7 @@ pub(crate) fn value_to_property_value(v: &Value) -> Option<PropertyValue> {
     match v {
         Value::Int(n) => Some(PropertyValue::Int(*n)),
         Value::Float(f) => Some(PropertyValue::Float(*f)),
-        Value::String(s) => Some(PropertyValue::String(Bytes::from(s.clone()))),
+        Value::String(s) => Some(PropertyValue::String(s.clone())),
         Value::Bool(b) => Some(PropertyValue::Bool(*b)),
         // Path is not storable as a property value (CYP-05 runtime-only).
         Value::Path(_) => None,

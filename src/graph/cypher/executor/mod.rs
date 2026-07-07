@@ -31,7 +31,11 @@ pub enum Value {
     Null,
     Int(i64),
     Float(f64),
-    String(String),
+    /// Cypher string values are RESP bulk strings — arbitrary bytes, held as
+    /// `Bytes` so a stored property flows to the reply frame without copying
+    /// (W2-4) and non-UTF8 payloads survive the round-trip. Text ops
+    /// (`toInteger`, `=~`) validate UTF-8 at their own boundary.
+    String(Bytes),
     Bool(bool),
     Node(NodeKey),
     Edge(EdgeKey),

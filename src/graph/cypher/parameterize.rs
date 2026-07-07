@@ -137,7 +137,7 @@ fn literal_value(tok: &Token) -> Option<Value> {
             let inner = &s[1..s.len() - 1];
             core::str::from_utf8(inner)
                 .ok()
-                .map(|t| Value::String(t.to_owned()))
+                .map(|t| Value::String(bytes::Bytes::copy_from_slice(t.as_bytes())))
         }
         _ => None,
     }
