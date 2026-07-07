@@ -846,6 +846,27 @@ filtering while paying per-level neighbor-list clones, a full FxHashSet→DashSe
 rebuild, and raw `thread::scope` spawns per 128-node morsel (~76 spawns/level at a 9.7K
 frontier). Candidate cleanup: retire it or fold into `BoundedBfs`.
 
+### 11.7 2026-07-07 wave-2 vs FalkorDB (OrbStack Linux VM, Docker FalkorDB)
+
+`scripts/bench-graph-compare.sh --nodes 5000` (5K nodes, 3K edges), wave-2 engine.
+⚠ Sequential redis-cli harness (one process per command) — per-op cost is dominated by
+the ~1 ms redis-cli fork on BOTH sides, so this measures single-client latency deltas,
+not server throughput; the §11.5 8-thread persistent-connection GCloud run remains the
+throughput reference. Ratios:
+
+| Operation | Moon | FalkorDB | Ratio |
+|-----------|:----:|:--------:|:-----:|
+| Node insert | 880/s | 716/s | **1.2×** |
+| Edge insert | 996/s | 580/s | **1.7×** |
+| 1-hop query | 938/s | 684/s | **1.3×** |
+| 2-hop query | 1,000/s | 724/s | **1.3×** |
+| Cypher pattern match | 862/s | 757/s | **1.1×** |
+
+Moon leads every row in this harness — including Cypher, where §11.5 (pre-wave-2,
+concurrent harness) trailed ~4×. The two harnesses are not directly comparable
+(fork-bound single client compresses server-side deltas); a fresh 8-thread GCloud run
+is the right follow-up before claiming the Cypher gap is closed.
+
 ---
 
 ## 12. Full-Text Search
