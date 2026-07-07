@@ -194,9 +194,8 @@ pub(crate) async fn handle_connection_sharded(
                             // dropping the connection. Migration disabled so the
                             // affinity tracker cannot loop.
                             use std::os::unix::io::FromRawFd;
-                            // SAFETY: fd is a valid, uniquely-owned file descriptor
-                            // obtained from TcpStream::into_raw_fd() above; the push
-                            // never succeeded so ownership stayed with us.
+                            // SAFETY: fd is a valid, uniquely-owned descriptor from
+                            // into_raw_fd(); the failed push left ownership with us.
                             let std_stream =
                                 unsafe { std::net::TcpStream::from_raw_fd(payload.fd) };
                             match tokio::net::TcpStream::from_std(std_stream) {

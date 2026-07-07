@@ -250,11 +250,12 @@ pub fn kill_clients(filter: &KillFilter, self_id: Option<u64>) -> u64 {
 fn force_close_fd(fd: i32) {
     #[cfg(unix)]
     if fd >= 0 {
+        // Per the lock-ordering note in `kill_clients`, `fd` is a live socket
+        // for the duration of this call. We intentionally ignore the return
+        // value: an already-closed/half-closed socket is a benign no-op.
         // SAFETY: `libc::shutdown` is an FFI call that cannot cause memory
         // unsafety for any integer argument — an invalid fd merely returns
-        // `EBADF`. Per the lock-ordering note in `kill_clients`, `fd` is a live
-        // socket for the duration of this call. We intentionally ignore the
-        // return value: a already-closed/half-closed socket is a benign no-op.
+        // `EBADF`.
         unsafe {
             libc::shutdown(fd, libc::SHUT_RDWR);
         }

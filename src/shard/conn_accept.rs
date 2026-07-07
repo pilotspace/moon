@@ -769,11 +769,12 @@ pub(crate) fn spawn_monoio_connection(
                         use crate::shard::mesh::ChannelMesh;
 
                         let raw_fd = stream.as_raw_fd();
-                        // SAFETY: raw_fd is a valid open socket fd from the monoio TcpStream.
-                        // dup() creates a new, independent fd that we take ownership of.
-                        // The ORIGINAL stream stays alive until the hand-off is confirmed
-                        // (R-6 fail-open): if the push cannot be delivered we keep
-                        // serving the client here instead of dropping it.
+                        // The ORIGINAL stream stays alive until the hand-off is
+                        // confirmed (R-6 fail-open): if the push cannot be delivered
+                        // we keep serving the client here instead of dropping it.
+                        // SAFETY: raw_fd is a valid open socket fd from the monoio
+                        // TcpStream; dup() creates a new, independent fd that we
+                        // take ownership of.
                         let dup_fd = unsafe { libc::dup(raw_fd) };
                         if dup_fd < 0 {
                             tracing::warn!("Shard {}: migration dup() failed: {} — keeping connection local", shard_id, std::io::Error::last_os_error());
