@@ -219,55 +219,71 @@ mod tests {
     }
 
     #[cfg(feature = "runtime-tokio")]
-    #[tokio::test]
-    async fn test_scatter_text_aggregate_single_shard_skips_spsc() {
+    #[test]
+    fn test_scatter_text_aggregate_single_shard_skips_spsc() {
         // num_shards=1 must return from execute_local_full without touching
         // dispatch_tx. We pass an empty Vec of ringbuf producers — any
         // SPSC dispatch would panic on index access, proving the fast path
         // was taken. Empty TextStore yields "ERR unknown index".
-        let dbs = vec![Database::new()];
-        let (shard_databases, _inits) = ShardDatabases::new(vec![dbs]);
+        //
+        // The fast path runs inside `with_shard`, which requires `init_shard`
+        // on the current thread. Run on a FRESH OS thread and init the slice
+        // there: as a plain `#[tokio::test]` this only passed when libtest
+        // happened to schedule it onto a harness thread where an earlier test
+        // had left a ShardSlice behind — deterministic panic on Windows CI.
+        std::thread::spawn(|| {
+            crate::shard::slice::init_shard(crate::shard::slice::ShardSlice::new(
+                crate::shard::slice::test_support::make_init(0, 1),
+            ));
 
-        let dispatch_tx: Rc<RefCell<Vec<HeapProd<ShardMessage>>>> =
-            Rc::new(RefCell::new(Vec::new()));
-        let notifiers: Vec<Arc<channel::Notify>> = Vec::new();
+            let dbs = vec![Database::new()];
+            let (shard_databases, _inits) = ShardDatabases::new(vec![dbs]);
 
-        // Simple pipeline (GROUPBY) — must not reach the merge path since
-        // single-shard is a direct execute_local_full.
-        let mut gb_fields: SmallVec<[Bytes; 4]> = SmallVec::new();
-        gb_fields.push(Bytes::from_static(b"@status"));
-        let reducers = vec![ReducerSpec {
-            fn_name: ReducerFn::Count,
-            field: None,
-            alias: Bytes::from_static(b"cnt"),
-        }];
-        let pipeline = vec![AggregateStep::GroupBy {
-            fields: gb_fields,
-            reducers,
-        }];
+            let dispatch_tx: Rc<RefCell<Vec<HeapProd<ShardMessage>>>> =
+                Rc::new(RefCell::new(Vec::new()));
+            let notifiers: Vec<Arc<channel::Notify>> = Vec::new();
 
-        let result = scatter_text_aggregate(
-            Bytes::from_static(b"nonexistent_idx"),
-            Bytes::from_static(b"*"),
-            pipeline,
-            0, // my_shard
-            1, // num_shards = 1 -> fast path
-            &shard_databases,
-            &dispatch_tx,
-            &notifiers,
-        )
-        .await;
+            // Simple pipeline (GROUPBY) — must not reach the merge path since
+            // single-shard is a direct execute_local_full.
+            let mut gb_fields: SmallVec<[Bytes; 4]> = SmallVec::new();
+            gb_fields.push(Bytes::from_static(b"@status"));
+            let reducers = vec![ReducerSpec {
+                fn_name: ReducerFn::Count,
+                field: None,
+                alias: Bytes::from_static(b"cnt"),
+            }];
+            let pipeline = vec![AggregateStep::GroupBy {
+                fields: gb_fields,
+                reducers,
+            }];
 
-        match &result {
-            Frame::Error(msg) => {
-                let s = std::str::from_utf8(msg).unwrap_or("");
-                assert!(
-                    s.contains("unknown index"),
-                    "expected 'unknown index' error, got: {s}"
-                );
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .expect("build current-thread runtime");
+            let result = rt.block_on(scatter_text_aggregate(
+                Bytes::from_static(b"nonexistent_idx"),
+                Bytes::from_static(b"*"),
+                pipeline,
+                0, // my_shard
+                1, // num_shards = 1 -> fast path
+                &shard_databases,
+                &dispatch_tx,
+                &notifiers,
+            ));
+
+            match &result {
+                Frame::Error(msg) => {
+                    let s = std::str::from_utf8(msg).unwrap_or("");
+                    assert!(
+                        s.contains("unknown index"),
+                        "expected 'unknown index' error, got: {s}"
+                    );
+                }
+                other => panic!("expected Error, got {other:?}"),
             }
-            other => panic!("expected Error, got {other:?}"),
-        }
+        })
+        .join()
+        .expect("test thread panicked");
     }
 
     #[test]

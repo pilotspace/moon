@@ -481,6 +481,12 @@ mod tests {
     /// Smoke test: poll() on the real process must not panic and must update
     /// rss_bytes from the 0 sentinel to some positive value (a live server
     /// process never legitimately has 0 RSS).
+    ///
+    /// Linux/macOS only: `get_rss_bytes()` has real implementations there
+    /// (/proc/self/statm, mach task_info); every other platform — Windows
+    /// included — gets the documented `0` fallback, so this assertion can
+    /// never hold (caught on Windows CI).
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn test_poll_real_process_smoke() {
         let m = MemMonitor::new(50, u64::MAX);

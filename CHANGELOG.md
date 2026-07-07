@@ -6,6 +6,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### CI — fix Windows main-push test failures (PR #TBD)
+
+- `test_poll_real_process_smoke` is now gated to Linux/macOS: `get_rss_bytes()`
+  returns the documented `0` fallback on every other platform, so asserting
+  `rss_bytes() > 0` can never pass on Windows.
+- `test_scatter_text_aggregate_single_shard_skips_spsc` now runs on a fresh
+  OS thread and calls `init_shard` itself (via a new shared
+  `slice::test_support::make_init` fixture). As a plain `#[tokio::test]` it
+  only passed when libtest scheduled it onto a harness thread where an
+  earlier test had left a `ShardSlice` behind — a latent order-dependent
+  flake on all platforms that failed deterministically on Windows CI.
+- All 8 `find_moon_binary` test helpers now fall back to
+  `env!("CARGO_BIN_EXE_moon")` (after the `MOON_BIN` override) instead of
+  probing `target/{release,debug}/moon`: the old probing found nothing on
+  Windows (missing `.exe`), ignored `CARGO_TARGET_DIR`, and preferred a
+  possibly-stale release binary over the one cargo just built for the run.
+- New `MOON_DISK_FREE_MIN_PCT` env override for `--disk-free-min-pct`
+  (clap `env` feature; CLI flag still wins). Windows CI exports it as `0`:
+  windows-latest runners sit below the 5% free-disk default, so every
+  server-spawning suite failed with `MOONERR diskfull` instead of `OK`.
+- `shardslice_shape.rs::split_off_test_module` computed line offsets with a
+  1-byte `\n` assumption; on CRLF checkouts (Windows runners set
+  `core.autocrlf=true`) the split point drifted one byte per line and
+  panicked slicing inside a multibyte comment char. Now uses
+  `split_inclusive('\n')` for byte-exact offsets on both line endings.
+- mem_watchdog integration cases A/B (guard-engages assertions) are gated
+  to Linux/macOS for the same `get_rss_bytes()` 0-fallback reason as the
+  lib smoke test: with RSS reported as 0 the memfull guard is structurally
+  inert on Windows. Cases C/D (guard-disabled directions) still run there.
+- `sigterm_shutdown.rs` readiness deadline widened 15s → 60s behind a
+  shared `READY_TIMEOUT` constant (poll-based loop notices readiness within
+  100ms either way; the fixed 15s was a documented host-load flake,
+  observed on the macOS CI runner).
+
 ### Changed — consolidated dependency bumps (PR #TBD)
 
 - Cargo: `ringbuf` 0.4.8 → 0.5.0 and `metrics-exporter-prometheus` 0.16.2 →

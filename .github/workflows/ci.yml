@@ -151,6 +151,13 @@ jobs:
       - name: Test (windows)
         run: cargo test --no-default-features --features runtime-tokio,graph,text-index --no-fail-fast
         timeout-minutes: 30
+        env:
+          # windows-latest images run with <5% free on C:, permanently
+          # tripping Moon's diskfull write-pause in every server-spawning
+          # suite (MOONERR diskfull instead of OK). Inherited by spawned
+          # moon processes; CLI --disk-free-min-pct still wins if a test
+          # passes it explicitly.
+          MOON_DISK_FREE_MIN_PCT: "0"
 
   # ── console feature — monoio+jemalloc+graph+text-index+console ───────
   # Catches the monoio+console (tokio-stream) interaction flagged as a risk.
