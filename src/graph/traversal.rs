@@ -339,9 +339,9 @@ impl BoundedBfs {
         reader: &SegmentMergeReader<'_>,
         start: NodeKey,
     ) -> Result<BfsResult, TraversalError> {
-        // CSR row-space fast path: a fully-frozen single-segment graph
-        // expands in u32 row space (dense visited bitmap, parallel levels,
-        // direction-optimizing pull) — see `row_bfs` module docs.
+        // CSR row-space fast path: a fully-frozen graph expands in u32 row
+        // space (dense visited bitmaps; single-segment adds parallel levels
+        // + direction-optimizing pull) — see `row_bfs` module docs.
         if let Some(res) = crate::graph::row_bfs::try_row_bfs(
             reader.memgraph,
             reader.csr_segments,
@@ -453,9 +453,9 @@ impl ParallelBfs {
         reader: &SegmentMergeReader<'_>,
         start: NodeKey,
     ) -> Result<BfsResult, TraversalError> {
-        // CSR row-space fast path: a fully-frozen single-segment graph
-        // expands in u32 row space (dense visited bitmap, parallel levels,
-        // direction-optimizing pull) — see `row_bfs` module docs.
+        // CSR row-space fast path: a fully-frozen graph expands in u32 row
+        // space (dense visited bitmaps; single-segment adds parallel levels
+        // + direction-optimizing pull) — see `row_bfs` module docs.
         if let Some(res) = crate::graph::row_bfs::try_row_bfs(
             reader.memgraph,
             reader.csr_segments,
