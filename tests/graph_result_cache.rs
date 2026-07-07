@@ -87,6 +87,10 @@ fn test_result_cache_hit_byte_identical_to_cold_run_resp2() {
     add_node(&mut store, 2);
     add_edge(&mut store, 1, 2);
 
+    // Doorkeeper warm-up: the FIRST sighting of a key only records its
+    // admission fingerprint (result_cache::should_admit) -- the entry is
+    // stored on the second sighting and hits from the third.
+    let _ = graph_query(&store, &[bs(GRAPH), bs(POINT_QUERY)], Some(2));
     let cold = graph_query(&store, &[bs(GRAPH), bs(POINT_QUERY)], Some(2));
     assert!(is_miss(&cold), "first call must be a cold miss: {cold:?}");
 
@@ -110,6 +114,10 @@ fn test_result_cache_hit_byte_identical_to_cold_run_resp3() {
     add_node(&mut store, 2);
     add_edge(&mut store, 1, 2);
 
+    // Doorkeeper warm-up: the FIRST sighting of a key only records its
+    // admission fingerprint (result_cache::should_admit) -- the entry is
+    // stored on the second sighting and hits from the third.
+    let _ = graph_query(&store, &[bs(GRAPH), bs(POINT_QUERY)], Some(3));
     let cold = graph_query(&store, &[bs(GRAPH), bs(POINT_QUERY)], Some(3));
     assert!(is_miss(&cold), "first call must be a cold miss: {cold:?}");
 
@@ -157,6 +165,10 @@ fn test_result_cache_invalidated_by_addnode() {
     add_node(&mut store, 1);
     let q = "MATCH (n:N) RETURN n.id";
 
+    // Doorkeeper warm-up: the FIRST sighting of a key only records its
+    // admission fingerprint (result_cache::should_admit) -- the entry is
+    // stored on the second sighting and hits from the third.
+    let _ = graph_query(&store, &[bs(GRAPH), bs(q)], Some(2));
     let cold = graph_query(&store, &[bs(GRAPH), bs(q)], Some(2));
     assert!(is_miss(&cold));
     let hit = graph_query(&store, &[bs(GRAPH), bs(q)], Some(2));
@@ -183,6 +195,10 @@ fn test_result_cache_invalidated_by_addedge() {
     add_node(&mut store, 2);
     let q = "MATCH (a)-[:E]->(b) RETURN b.id";
 
+    // Doorkeeper warm-up: the FIRST sighting of a key only records its
+    // admission fingerprint (result_cache::should_admit) -- the entry is
+    // stored on the second sighting and hits from the third.
+    let _ = graph_query(&store, &[bs(GRAPH), bs(q)], Some(2));
     let cold = graph_query(&store, &[bs(GRAPH), bs(q)], Some(2));
     assert!(is_miss(&cold));
     let hit = graph_query(&store, &[bs(GRAPH), bs(q)], Some(2));
@@ -204,6 +220,10 @@ fn test_result_cache_invalidated_by_cypher_create_via_query_path() {
     add_node(&mut store, 1);
     let q = "MATCH (n:N) RETURN n.id";
 
+    // Doorkeeper warm-up: the FIRST sighting of a key only records its
+    // admission fingerprint (result_cache::should_admit) -- the entry is
+    // stored on the second sighting and hits from the third.
+    let _ = graph_query(&store, &[bs(GRAPH), bs(q)], Some(2));
     let cold = graph_query(&store, &[bs(GRAPH), bs(q)], Some(2));
     assert!(is_miss(&cold));
     let hit = graph_query(&store, &[bs(GRAPH), bs(q)], Some(2));
@@ -239,6 +259,10 @@ fn test_result_cache_idempotent_merge_does_not_invalidate() {
     assert!(!matches!(r, Frame::Error(_)), "{r:?}");
 
     let q = "MATCH (n:N) RETURN n.id";
+    // Doorkeeper warm-up: the FIRST sighting of a key only records its
+    // admission fingerprint (result_cache::should_admit) -- the entry is
+    // stored on the second sighting and hits from the third.
+    let _ = graph_query(&store, &[bs(GRAPH), bs(q)], Some(2));
     let cold = graph_query(&store, &[bs(GRAPH), bs(q)], Some(2));
     assert!(is_miss(&cold));
     let hit1 = graph_query(&store, &[bs(GRAPH), bs(q)], Some(2));
@@ -265,6 +289,10 @@ fn test_result_cache_invalidated_by_cypher_set() {
     add_node(&mut store, 1);
     let q = "MATCH (n:N {id: 1}) RETURN n.tag";
 
+    // Doorkeeper warm-up: the FIRST sighting of a key only records its
+    // admission fingerprint (result_cache::should_admit) -- the entry is
+    // stored on the second sighting and hits from the third.
+    let _ = graph_query(&store, &[bs(GRAPH), bs(q)], Some(2));
     let cold = graph_query(&store, &[bs(GRAPH), bs(q)], Some(2));
     assert!(is_miss(&cold));
     let hit = graph_query(&store, &[bs(GRAPH), bs(q)], Some(2));
@@ -290,6 +318,10 @@ fn test_result_cache_invalidated_by_cypher_delete() {
     add_node(&mut store, 2);
     let q = "MATCH (n:N) RETURN n.id";
 
+    // Doorkeeper warm-up: the FIRST sighting of a key only records its
+    // admission fingerprint (result_cache::should_admit) -- the entry is
+    // stored on the second sighting and hits from the third.
+    let _ = graph_query(&store, &[bs(GRAPH), bs(q)], Some(2));
     let cold = graph_query(&store, &[bs(GRAPH), bs(q)], Some(2));
     assert!(is_miss(&cold));
     let hit = graph_query(&store, &[bs(GRAPH), bs(q)], Some(2));
@@ -334,6 +366,10 @@ fn test_result_cache_invalidated_by_temporal_invalidate() {
         bs(FAR_FUTURE_MS),
     ];
 
+    // Doorkeeper warm-up: the FIRST sighting of a key only records its
+    // admission fingerprint (result_cache::should_admit) -- the entry is
+    // stored on the second sighting and hits from the third.
+    let _ = graph_query(&store, &args, Some(2));
     let cold = graph_query(&store, &args, Some(2));
     assert!(is_miss(&cold));
     let hit = graph_query(&store, &args, Some(2));
@@ -375,6 +411,10 @@ fn test_result_cache_invalidated_by_txn_abort_create_intent() {
     let new_id = add_node(&mut store, 2);
     let q = "MATCH (n:N) RETURN n.id";
 
+    // Doorkeeper warm-up: the FIRST sighting of a key only records its
+    // admission fingerprint (result_cache::should_admit) -- the entry is
+    // stored on the second sighting and hits from the third.
+    let _ = graph_query(&store, &[bs(GRAPH), bs(q)], Some(2));
     let cold = graph_query(&store, &[bs(GRAPH), bs(q)], Some(2));
     assert!(is_miss(&cold));
     let hit = graph_query(&store, &[bs(GRAPH), bs(q)], Some(2));
@@ -428,6 +468,10 @@ fn test_result_cache_invalidated_by_txn_abort_restore_property() {
 
     let q = "MATCH (n:N {id: 1}) RETURN n.tag";
     // The SET above already bumped write_gen, so this is a cold run.
+    // Doorkeeper warm-up: the FIRST sighting of a key only records its
+    // admission fingerprint (result_cache::should_admit) -- the entry is
+    // stored on the second sighting and hits from the third.
+    let _ = graph_query(&store, &[bs(GRAPH), bs(q)], Some(2));
     let cold = graph_query(&store, &[bs(GRAPH), bs(q)], Some(2));
     assert!(is_miss(&cold));
     let hit = graph_query(&store, &[bs(GRAPH), bs(q)], Some(2));
@@ -451,6 +495,10 @@ fn test_result_cache_txn_abort_with_no_graph_ops_does_not_invalidate() {
     add_node(&mut store, 1);
     let q = "MATCH (n:N) RETURN n.id";
 
+    // Doorkeeper warm-up: the FIRST sighting of a key only records its
+    // admission fingerprint (result_cache::should_admit) -- the entry is
+    // stored on the second sighting and hits from the third.
+    let _ = graph_query(&store, &[bs(GRAPH), bs(q)], Some(2));
     let cold = graph_query(&store, &[bs(GRAPH), bs(q)], Some(2));
     assert!(is_miss(&cold));
     let hit1 = graph_query(&store, &[bs(GRAPH), bs(q)], Some(2));
@@ -480,6 +528,10 @@ fn test_result_cache_not_invalidated_by_freeze_compact() {
     add_node(&mut store, 2);
     let q = "MATCH (n:N) RETURN n.id";
 
+    // Doorkeeper warm-up: the FIRST sighting of a key only records its
+    // admission fingerprint (result_cache::should_admit) -- the entry is
+    // stored on the second sighting and hits from the third.
+    let _ = graph_query(&store, &[bs(GRAPH), bs(q)], Some(2));
     let cold = graph_query(&store, &[bs(GRAPH), bs(q)], Some(2));
     assert!(is_miss(&cold));
     let hit1 = graph_query(&store, &[bs(GRAPH), bs(q)], Some(2));
@@ -597,6 +649,9 @@ fn test_result_cache_resident_bytes_visible_to_graphstore() {
 
     let before = store.resident_bytes();
     let q = "MATCH (n:N) RETURN n.id";
+    // Two calls: the first only records the doorkeeper fingerprint, the
+    // second actually populates the cache entry.
+    let _ = graph_query(&store, &[bs(GRAPH), bs(q)], Some(2));
     let _ = graph_query(&store, &[bs(GRAPH), bs(q)], Some(2));
     let after_populate = store.resident_bytes();
     assert!(
@@ -627,6 +682,8 @@ fn test_result_cache_cleared_by_graph_delete() {
     let mut store = setup();
     add_node(&mut store, 1);
     let q = "MATCH (n:N) RETURN n.id";
+    // Two calls: doorkeeper fingerprint first, cache population second.
+    let _ = graph_query(&store, &[bs(GRAPH), bs(q)], Some(2));
     let _ = graph_query(&store, &[bs(GRAPH), bs(q)], Some(2));
     assert!(
         store

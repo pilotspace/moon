@@ -646,20 +646,26 @@ fn run_read_query(
                 {
                     if let Some(cypher_bytes) = extract_bulk(&args[1]) {
                         let key = result_cache_key(cypher_bytes, &args[2..]);
-                        let frame = exec_result_to_frame(&r);
-                        let mut buf = bytes::BytesMut::new();
-                        if protocol_version >= 3 {
-                            crate::protocol::serialize_resp3(&frame, &mut buf);
-                        } else {
-                            crate::protocol::serialize(&frame, &mut buf);
+                        // Doorkeeper: admit only keys seen before, so a
+                        // scan/cycle workload's one-shot queries never pay
+                        // the serialize+insert+evict miss cost (measured
+                        // −21% qps on cycling without this gate).
+                        if graph.result_cache.lock().should_admit(key) {
+                            let frame = exec_result_to_frame(&r);
+                            let mut buf = bytes::BytesMut::new();
+                            if protocol_version >= 3 {
+                                crate::protocol::serialize_resp3(&frame, &mut buf);
+                            } else {
+                                crate::protocol::serialize(&frame, &mut buf);
+                            }
+                            graph.result_cache.lock().put(
+                                key,
+                                write_gen_before,
+                                protocol_version,
+                                buf.freeze(),
+                            );
+                            return frame;
                         }
-                        graph.result_cache.lock().put(
-                            key,
-                            write_gen_before,
-                            protocol_version,
-                            buf.freeze(),
-                        );
-                        return frame;
                     }
                 }
             }
