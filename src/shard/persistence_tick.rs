@@ -918,9 +918,15 @@ pub(crate) fn handle_checkpoint_tick(
             let flushed = page_cache.flush_dirty_pages_with_fpi(
                 count,
                 &mut |page_lsn| {
-                    // Ensure WAL is durable past this page's LSN before writing page
+                    // HARD ordering invariant (log-before-data): the WAL must
+                    // be durable past this page's LSN before the page pwrite.
+                    // Bounded blocking wait on the off-loop sync agent; Err
+                    // aborts this flush batch (checkpoint retries next tick).
                     if wal.current_lsn() > page_lsn {
-                        wal.flush_sync()
+                        wal.wait_durable(
+                            page_lsn,
+                            crate::persistence::wal_v3::segment::WAIT_DURABLE_TIMEOUT,
+                        )
                     } else {
                         Ok(())
                     }
@@ -988,10 +994,17 @@ pub(crate) fn handle_checkpoint_tick(
             // 1. Write WAL checkpoint record with redo_lsn payload
             let mut payload = [0u8; 8];
             payload.copy_from_slice(&redo_lsn.to_le_bytes());
-            wal.append(WalRecordType::Checkpoint, &payload);
+            let ckpt_lsn = wal.append(WalRecordType::Checkpoint, &payload);
 
-            // 2. Flush WAL to disk
-            if let Err(e) = wal.flush_sync() {
+            // 2. HARD ordering invariant (WAL-before-manifest): the
+            //    checkpoint record must be durable before the manifest
+            //    commit publishes redo_lsn. Bounded wait on the off-loop
+            //    sync agent; failure aborts finalize (retried next tick),
+            //    so redo_lsn never advances past durability.
+            if let Err(e) = wal.wait_durable(
+                ckpt_lsn,
+                crate::persistence::wal_v3::segment::WAIT_DURABLE_TIMEOUT,
+            ) {
                 tracing::error!("Checkpoint WAL flush failed: {}", e);
                 return false;
             }

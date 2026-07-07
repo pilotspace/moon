@@ -6,6 +6,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — WAL v3 fsync moved off the shard event loop (PR #TBD)
+
+- **`src/persistence/wal_v3/sync_agent.rs` (new)**: per-shard `WalSyncAgent`
+  thread receives fd-dup'd sync requests over a bounded flume channel and
+  publishes a monotonic durable-LSN watermark after each `fdatasync`.
+  `WalWriterV3` gains `request_sync()` (non-blocking initiation; queue-full
+  falls back to inline fsync — a durability request is never dropped) and
+  `wait_durable(lsn, timeout)` (bounded blocking wait, used only by the two
+  checkpoint ordering invariants and shutdown). An fsync error poisons the
+  agent permanently and fails subsequent syncs loudly; the checkpoint then
+  refuses to advance `redo_lsn`.
+- **Why**: `flush_sync()` ran `fdatasync` on the shard event-loop thread.
+  Measured on GCE pd (tmp/WALV3-OFFLOOP-FSYNC.md): the everysec 1s timer
+  froze every connection on the shard for **10–16 ms once per second** when
+  the WAL held real bytes, and `appendfsync always` paid −20% RPS / ~2× tail
+  on top of the AOF cost.
+- **Call sites**: everysec timer (`timers::sync_wal_v3`) and the always-mode
+  per-drain-batch sync (both runtimes) now use `request_sync()`; the
+  checkpoint log-before-data page gate and WAL-before-manifest finalize use
+  `wait_durable` (5s bound); shutdown paths keep the inline `flush_sync()`.
+  everysec semantics are now "sync initiated every 1s, durable typically ms
+  later" — the same window the AOF everysec writers provide.
+- Loom model for the watermark/poison state machine in
+  `tests/loom_wal_sync_agent.rs`.
+
 ### Changed — consolidated dependency bumps wave 2 (PR #TBD, supersedes dependabot #223–227)
 
 - Patch-level bumps rolled into one `Cargo.lock` update (no `Cargo.toml`

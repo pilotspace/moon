@@ -1432,10 +1432,15 @@ impl super::Shard {
                         cdc_registry.fanout_tick(cached_clock.ms() as i64);
                     }
 
-                    // appendfsync=always: fsync WAL after every SPSC drain batch
+                    // appendfsync=always: initiate WAL durability after every
+                    // SPSC drain batch. The fsync runs on the off-loop sync
+                    // agent — replies are not gated on WAL v3 durability (KV
+                    // acks ride the AOF), so the drain loop no longer eats a
+                    // full fsync per batch (−20% RPS / ~2× tail measured,
+                    // tmp/WALV3-OFFLOOP-FSYNC.md §8).
                     if server_config.appendfsync == "always" {
                         if let Some(ref mut wal) = wal_writer {
-                            if let Err(e) = wal.flush_sync() {
+                            if let Err(e) = wal.request_sync() {
                                 tracing::error!("WAL appendfsync=always failed: {}", e);
                             }
                         }
@@ -2032,9 +2037,10 @@ impl super::Shard {
                     cdc_registry.fanout_tick(cached_clock.ms() as i64);
                 }
 
+                // Off-loop fsync — same rationale as the monoio branch above.
                 if server_config.appendfsync == "always" {
                     if let Some(ref mut wal) = wal_writer {
-                        if let Err(e) = wal.flush_sync() {
+                        if let Err(e) = wal.request_sync() {
                             tracing::error!("WAL appendfsync=always failed: {}", e);
                         }
                     }
