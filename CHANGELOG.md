@@ -6,6 +6,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — TopLevel-monoio AOF writer: EverySec fsync deferred indefinitely when idle (PR #TBD)
+
+- **`src/persistence/aof/writer_task.rs`**: the TopLevel monoio AOF writer
+  blocked on an **untimed** `rx.recv()`, with its EverySec deadline check
+  living only inside the batch-commit path. A batch written under
+  `appendfsync everysec` gets no per-batch fsync, so if the client stopped
+  writing right after a burst, the buffered bytes only became durable when
+  the NEXT message happened to arrive — the 1s fsync bound was deferred
+  indefinitely while idle. Exposure is host-crash-only (the per-batch
+  `flush()` already reaches the kernel page cache, so a plain process kill
+  loses nothing), which is exactly the window EverySec exists to bound.
+  The loop now mirrors the audited PerShard writers: bounded
+  `recv_timeout` on the wave-5 `IdleWait` ladder (50ms → 250ms → 1s,
+  pinned at the floor while a batch awaits its fsync) plus an end-of-loop
+  proactive fsync that runs on message AND timeout iterations. This
+  supersedes wave 5's "TopLevel monoio needs none of this" note — it was
+  the one writer loop left without the ≤ ~1s idle durability bound.
+- **`tests/crash_matrix_per_shard_aof.rs` harness hardening** (found while
+  validating the above): (1) `redis_set` asserted only redis-cli's exit
+  status, which is 0 even for server ERROR replies — a tripped diskfull
+  guard (host <5% free) turned every SET into a silent no-op and surfaced
+  as a bogus "200 keys missing after recovery"; the helper now pins the
+  reply to `+OK`. (2) The three server-spawning tests split-brain when run
+  in parallel: `unique_port()` hands out OS-sequential ephemeral ports, the
+  other tests offset +1/+2, and SO_REUSEPORT lets two tests bind the SAME
+  port without an error — one test's redis-cli traffic lands on another
+  test's server (rotating total-loss false alarms). A shared mutex now
+  serializes them.
+
 ### Fixed — RSS/CPU remediation wave 5 (PR #TBD)
 
 - **Item A — mmap the exact-rerank f16 sidecar on segment reload**

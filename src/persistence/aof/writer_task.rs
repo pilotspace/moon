@@ -25,9 +25,8 @@ use super::group_commit::{GroupCommitSink, commit_group_commit_batch};
 /// Idle-adaptive wake cadence for a background AOF writer's channel poll
 /// (RSS/CPU wave 5, item B).
 ///
-/// The steady-state writer loops (PerShard monoio/tokio, TopLevel tokio —
-/// TopLevel monoio blocks on an untimed `rx.recv()` and needs none of this)
-/// poll their channel with a bounded timeout so the EverySec proactive-fsync
+/// All four steady-state writer loops (PerShard monoio/tokio, TopLevel
+/// monoio/tokio) poll their channel with a bounded timeout so the EverySec proactive-fsync
 /// deadline check that follows every wake still fires when no new Appends
 /// ever arrive. A FIXED cadence forever (previously 50ms monoio / 200ms
 /// tokio) means an idle server's AOF writer thread wakes 5-20 times a
@@ -356,13 +355,34 @@ pub async fn aof_writer_task(
         // Read once at task startup; zero cost in production (var absent).
         let fail_fsync_for_test = std::env::var("MOON_TEST_AOF_FSYNC_FAIL").as_deref() == Ok("1");
 
+        // Idle-adaptive channel-poll wake cadence (RSS/CPU wave 5, item B) —
+        // see `IdleWait` docs near the top of this file. This loop used to
+        // block on an UNTIMED `rx.recv()`, with the EverySec deadline check
+        // only inside the batch path: a batch buffered without a per-batch
+        // fsync only became durable when the NEXT message happened to
+        // arrive, so idle-after-a-burst deferred the fsync indefinitely
+        // (host-crash exposure only — the per-batch flush already reaches
+        // the kernel page cache, so a plain process kill loses nothing).
+        // The bounded recv + end-of-loop proactive fsync below restore the
+        // ~1s EverySec bound exactly like the PerShard writers.
+        let mut idle_wait = IdleWait::new();
+
         loop {
-            // Group commit: block for one message, then opportunistically drain
-            // whatever else is already queued into a bounded batch so a single
-            // fsync makes the whole batch durable (TopLevel = plain RESP bytes).
-            let first = match rx.recv() {
-                Ok(m) => m,
-                Err(_) => {
+            // Group commit: wait (bounded) for one message, then
+            // opportunistically drain whatever else is already queued into a
+            // bounded batch so a single fsync makes the whole batch durable
+            // (TopLevel = plain RESP bytes). On timeout, fall through (None)
+            // to the EverySec proactive fsync at the end of the loop.
+            let first = match rx.recv_timeout(idle_wait.current()) {
+                Ok(m) => {
+                    idle_wait.on_message();
+                    Some(m)
+                }
+                Err(flume::RecvTimeoutError::Timeout) => {
+                    idle_wait.on_timeout();
+                    None
+                }
+                Err(flume::RecvTimeoutError::Disconnected) => {
                     // Channel disconnected — final sync + shut down.
                     if !write_error {
                         if let Err(e) = file.flush().and_then(|_| file.sync_data()) {
@@ -373,123 +393,136 @@ pub async fn aof_writer_task(
                     break;
                 }
             };
-            let mut batch = collect_group_commit_batch(
-                first,
-                || rx.try_recv().ok(),
-                AOF_GROUP_COMMIT_MAX_BATCH,
-                AOF_GROUP_COMMIT_MAX_BYTES,
-            );
 
-            // -- commit the data batch (one fsync under Always; deadline under everysec) --
-            if !batch.data.is_empty() {
-                if write_error {
-                    // Persistent I/O failure latched: drop appends and fail every
-                    // AppendSync waiter — never a false durability claim.
-                    let _ = group_commit::ack_batch(&mut batch, BatchAck::WriteFailed);
-                } else {
-                    let do_fsync = matches!(fsync, FsyncPolicy::Always);
-                    let mut sink = FileGroupSink {
-                        file: &mut file,
-                        fail_sync: fail_fsync_for_test,
-                    };
-                    let outcome = commit_group_commit_batch(&mut sink, &mut batch, do_fsync);
-                    if outcome.write_failed {
-                        // A torn write may leave a partial record — latch so no
-                        // further bytes are appended after the tear.
-                        error!(
-                            "AOF batch write failed (seq {}). Persistence degraded.",
-                            manifest.seq
-                        );
-                        write_error = true;
-                    }
-                    // EverySec: the batch was written but not per-batch-fsynced
-                    // (do_fsync=false; there are no AppendSync waiters under
-                    // everysec). Honor the 1s deadline exactly as the old
-                    // per-Append path did.
-                    if fsync == FsyncPolicy::EverySec
-                        && !write_error
-                        && last_fsync.elapsed() >= std::time::Duration::from_secs(1)
-                    {
-                        let t = Instant::now();
-                        if let Err(e) = file.flush().and_then(|_| file.sync_data()) {
-                            error!("AOF sync failed (seq {}, everysec): {}", manifest.seq, e);
-                            // Non-fatal for everysec: retry next interval
-                        } else {
-                            crate::admin::metrics_setup::record_aof_fsync(
-                                t.elapsed().as_micros() as u64
+            if let Some(first) = first {
+                let mut batch = collect_group_commit_batch(
+                    first,
+                    || rx.try_recv().ok(),
+                    AOF_GROUP_COMMIT_MAX_BATCH,
+                    AOF_GROUP_COMMIT_MAX_BYTES,
+                );
+
+                // -- commit the data batch (one fsync under Always; deadline under everysec) --
+                if !batch.data.is_empty() {
+                    if write_error {
+                        // Persistent I/O failure latched: drop appends and fail every
+                        // AppendSync waiter — never a false durability claim.
+                        let _ = group_commit::ack_batch(&mut batch, BatchAck::WriteFailed);
+                    } else {
+                        let do_fsync = matches!(fsync, FsyncPolicy::Always);
+                        let mut sink = FileGroupSink {
+                            file: &mut file,
+                            fail_sync: fail_fsync_for_test,
+                        };
+                        let outcome = commit_group_commit_batch(&mut sink, &mut batch, do_fsync);
+                        if outcome.write_failed {
+                            // A torn write may leave a partial record — latch so no
+                            // further bytes are appended after the tear.
+                            error!(
+                                "AOF batch write failed (seq {}). Persistence degraded.",
+                                manifest.seq
                             );
-                            last_fsync = Instant::now();
+                            write_error = true;
+                        }
+                        // EverySec: the batch was written but not per-batch-fsynced
+                        // (do_fsync=false; there are no AppendSync waiters under
+                        // everysec). The end-of-loop proactive fsync makes it
+                        // durable within the 1s bound — pin the idle wait at its
+                        // fast floor until that fsync clears it.
+                        if fsync == FsyncPolicy::EverySec && !write_error {
+                            idle_wait.mark_pending();
                         }
                     }
+                }
+
+                // -- handle the control message that ended the drain (if any) --
+                // A control message is NEVER absorbed into the batch: the batch above
+                // is already committed before the control message is handled
+                // (batch_straddles_control is structurally impossible).
+                match batch.deferred_control {
+                    None => {}
+                    Some(AofMessage::Shutdown) => {
+                        if !write_error {
+                            if let Err(e) = file.flush().and_then(|_| file.sync_data()) {
+                                error!("AOF final sync failed (seq {}): {}", manifest.seq, e);
+                            }
+                        }
+                        info!("AOF writer shutting down (monoio, seq {})", manifest.seq);
+                        break;
+                    }
+                    Some(AofMessage::Rewrite(db)) => {
+                        if !write_error {
+                            if let Err(e) = file.flush().and_then(|_| file.sync_data()) {
+                                error!("AOF pre-rewrite sync failed (seq {}): {}", manifest.seq, e);
+                            }
+                        }
+                        match do_rewrite_single(&db, &mut manifest, &mut file, &rx) {
+                            Ok(()) => {
+                                write_error = false; // Reset on successful rewrite
+                            }
+                            Err(e) => error!("AOF rewrite failed (seq {}): {}", manifest.seq, e),
+                        }
+                        crate::command::persistence::AOF_REWRITE_IN_PROGRESS
+                            .store(false, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    Some(AofMessage::RewriteSharded(shard_dbs)) => {
+                        if !write_error {
+                            if let Err(e) = file.flush().and_then(|_| file.sync_data()) {
+                                error!("AOF pre-rewrite sync failed (seq {}): {}", manifest.seq, e);
+                            }
+                        }
+                        // C4 TopLevel cooperative fold: pass the wired fold channels
+                        // (producer + notifier for shard 0) so do_rewrite_sharded can
+                        // use the AofFold SPSC protocol instead of the deleted RwLock
+                        // path.  `fold_channels` is `None` only if main.rs failed to
+                        // wire them at startup (Arc::get_mut race — logged at boot).
+                        match do_rewrite_sharded(
+                            &shard_dbs,
+                            &mut manifest,
+                            &mut file,
+                            &rx,
+                            fold_channels.as_ref(),
+                        ) {
+                            Ok(()) => {
+                                write_error = false;
+                            }
+                            Err(e) => error!("AOF rewrite failed (seq {}): {}", manifest.seq, e),
+                        }
+                        crate::command::persistence::AOF_REWRITE_IN_PROGRESS
+                            .store(false, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    // [F6] A TopLevel writer never owns per-shard files; receiving
+                    // RewritePerShard means a routing bug. Self-abort so the
+                    // coordinator's countdown completes and the flag clears.
+                    Some(AofMessage::RewritePerShard { coord, .. }) => {
+                        warn!(
+                            "AOF TopLevel writer received RewritePerShard — routing bug; aborting"
+                        );
+                        coord.mark_failed();
+                        coord.shard_done();
+                    }
+                    // collect_group_commit_batch only ever defers a control message.
+                    Some(_) => {}
                 }
             }
 
-            // -- handle the control message that ended the drain (if any) --
-            // A control message is NEVER absorbed into the batch: the batch above
-            // is already committed before the control message is handled
-            // (batch_straddles_control is structurally impossible).
-            match batch.deferred_control {
-                None => {}
-                Some(AofMessage::Shutdown) => {
-                    if !write_error {
-                        if let Err(e) = file.flush().and_then(|_| file.sync_data()) {
-                            error!("AOF final sync failed (seq {}): {}", manifest.seq, e);
-                        }
-                    }
-                    info!("AOF writer shutting down (monoio, seq {})", manifest.seq);
-                    break;
+            // EverySec proactive fsync — runs after every loop iteration
+            // (message processed OR timeout); the only path that guarantees
+            // the ~1s durability bound when no further messages arrive after
+            // a buffered batch (idle-after-a-burst).
+            if fsync == FsyncPolicy::EverySec
+                && !write_error
+                && last_fsync.elapsed() >= std::time::Duration::from_secs(1)
+            {
+                let t = Instant::now();
+                if let Err(e) = file.flush().and_then(|_| file.sync_data()) {
+                    error!("AOF sync failed (seq {}, everysec): {}", manifest.seq, e);
+                    // Non-fatal for everysec: retry next interval
+                } else {
+                    crate::admin::metrics_setup::record_aof_fsync(t.elapsed().as_micros() as u64);
+                    last_fsync = Instant::now();
+                    idle_wait.clear_pending();
                 }
-                Some(AofMessage::Rewrite(db)) => {
-                    if !write_error {
-                        if let Err(e) = file.flush().and_then(|_| file.sync_data()) {
-                            error!("AOF pre-rewrite sync failed (seq {}): {}", manifest.seq, e);
-                        }
-                    }
-                    match do_rewrite_single(&db, &mut manifest, &mut file, &rx) {
-                        Ok(()) => {
-                            write_error = false; // Reset on successful rewrite
-                        }
-                        Err(e) => error!("AOF rewrite failed (seq {}): {}", manifest.seq, e),
-                    }
-                    crate::command::persistence::AOF_REWRITE_IN_PROGRESS
-                        .store(false, std::sync::atomic::Ordering::SeqCst);
-                }
-                Some(AofMessage::RewriteSharded(shard_dbs)) => {
-                    if !write_error {
-                        if let Err(e) = file.flush().and_then(|_| file.sync_data()) {
-                            error!("AOF pre-rewrite sync failed (seq {}): {}", manifest.seq, e);
-                        }
-                    }
-                    // C4 TopLevel cooperative fold: pass the wired fold channels
-                    // (producer + notifier for shard 0) so do_rewrite_sharded can
-                    // use the AofFold SPSC protocol instead of the deleted RwLock
-                    // path.  `fold_channels` is `None` only if main.rs failed to
-                    // wire them at startup (Arc::get_mut race — logged at boot).
-                    match do_rewrite_sharded(
-                        &shard_dbs,
-                        &mut manifest,
-                        &mut file,
-                        &rx,
-                        fold_channels.as_ref(),
-                    ) {
-                        Ok(()) => {
-                            write_error = false;
-                        }
-                        Err(e) => error!("AOF rewrite failed (seq {}): {}", manifest.seq, e),
-                    }
-                    crate::command::persistence::AOF_REWRITE_IN_PROGRESS
-                        .store(false, std::sync::atomic::Ordering::SeqCst);
-                }
-                // [F6] A TopLevel writer never owns per-shard files; receiving
-                // RewritePerShard means a routing bug. Self-abort so the
-                // coordinator's countdown completes and the flag clears.
-                Some(AofMessage::RewritePerShard { coord, .. }) => {
-                    warn!("AOF TopLevel writer received RewritePerShard — routing bug; aborting");
-                    coord.mark_failed();
-                    coord.shard_done();
-                }
-                // collect_group_commit_batch only ever defers a control message.
-                Some(_) => {}
             }
         }
         return;
