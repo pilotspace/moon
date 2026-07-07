@@ -57,6 +57,8 @@ pub struct MmapCsrSegment {
     /// Lazily-built HNSW bridge over this segment's v5 embeddings (hybrid
     /// HnswPreFilter). DERIVED, in-memory only — never persisted.
     pub hnsw_bridge: std::sync::OnceLock<Option<crate::graph::hnsw_bridge::GraphHnsw>>,
+    /// True while a background thread is building `hnsw_bridge` (W2-5).
+    pub hnsw_building: std::sync::atomic::AtomicBool,
     /// Pointer into mmap: node property blob (version >= 5; dangling+0 otherwise).
     node_props_ptr: *const u8,
     node_props_len: usize,
@@ -370,6 +372,7 @@ impl MmapCsrSegment {
             incoming: std::sync::OnceLock::new(),
             props_index: std::sync::OnceLock::new(),
             hnsw_bridge: std::sync::OnceLock::new(),
+            hnsw_building: std::sync::atomic::AtomicBool::new(false),
             node_props_ptr: np_ptr,
             node_props_len: np_len,
             edge_props_ptr: ep_ptr,

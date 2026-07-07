@@ -208,6 +208,10 @@ pub struct VectorToGraphExpansion {
     pub expansion_hops: u32,
     /// Optional edge type filter for expansion.
     pub edge_type_filter: Option<u16>,
+    /// Strategy selection threshold (default 10K): candidate sets at or
+    /// above it route CSR-resident nodes through the per-segment HNSW
+    /// bridge (W2-5), exactly like HYB-01's HnswPreFilter.
+    pub threshold: usize,
 }
 
 impl VectorToGraphExpansion {
@@ -218,12 +222,16 @@ impl VectorToGraphExpansion {
             k,
             expansion_hops,
             edge_type_filter: None,
+            threshold: DEFAULT_STRATEGY_THRESHOLD,
         }
     }
 
     /// Execute vector-to-graph expansion.
     ///
-    /// 1. Brute-force search all nodes with embeddings for top-K by similarity
+    /// 1. Top-K candidates by cosine similarity — exact scoring for small
+    ///    sets; at >= `threshold` candidates, CSR-resident nodes route
+    ///    through the per-segment HNSW bridge (mutable-tier and
+    ///    bridge-less rows stay exact, under-filled beams rescue to exact).
     /// 2. For each result, BFS expand N hops for context
     /// 3. Return results with context neighbors
     ///
@@ -243,34 +251,54 @@ impl VectorToGraphExpansion {
         let view = MergedNodeView::new(memgraph, csr_segs);
         let committed = roaring::RoaringBitmap::new();
 
-        // Step 1: Score all candidate nodes by cosine similarity.
-        let mut scored: Vec<(NodeKey, f64)> = Vec::with_capacity(candidate_nodes.len());
+        // Step 1: visibility-filter, then score. The prefilter helper wants
+        // (key, graph_distance) pairs; HYB-02 has no graph distance, so 0
+        // stands in and the field is cleared on the final results.
+        let visible: Vec<(NodeKey, u32)> = candidate_nodes
+            .iter()
+            .copied()
+            .filter(|&k| view.is_visible(k, 0, 0, &committed, None))
+            .map(|k| (k, 0))
+            .collect();
 
-        for &node_key in candidate_nodes {
-            if !view.is_visible(node_key, 0, 0, &committed, None) {
-                continue;
-            }
-            let Some(embedding) = view.embedding(node_key) else {
+        let mut scored: Vec<HybridResult> = Vec::with_capacity(visible.len().min(4096));
+        let residual: Vec<(NodeKey, u32)> = match select_strategy(visible.len(), self.threshold) {
+            FilterStrategy::BruteForce => visible,
+            FilterStrategy::HnswPreFilter => hnsw_prefilter_score(
+                memgraph,
+                csr_segs,
+                visible,
+                &self.query_vector,
+                self.k,
+                &mut scored,
+            ),
+        };
+
+        for (node_key, _) in &residual {
+            let Some(embedding) = view.embedding(*node_key) else {
                 continue;
             };
-
             let sim = simd::cosine_similarity(&embedding, &self.query_vector);
-            scored.push((node_key, sim));
+            scored.push(HybridResult {
+                node: *node_key,
+                score: sim,
+                graph_distance: None,
+                context: Vec::new(),
+            });
         }
 
         // Top-K by similarity.
-        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+        scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
         scored.truncate(self.k);
 
         // Step 2: Expand each result by N hops.
-        let mut results: Vec<HybridResult> = Vec::with_capacity(scored.len());
-
-        for (node_key, score) in scored {
-            let context = if self.expansion_hops > 0 {
+        for result in &mut scored {
+            result.graph_distance = None;
+            result.context = if self.expansion_hops > 0 {
                 collect_context(
                     memgraph,
                     csr_segs,
-                    node_key,
+                    result.node,
                     self.expansion_hops,
                     self.edge_type_filter,
                     lsn,
@@ -278,15 +306,8 @@ impl VectorToGraphExpansion {
             } else {
                 Vec::new()
             };
-
-            results.push(HybridResult {
-                node: node_key,
-                score,
-                graph_distance: None,
-                context,
-            });
         }
 
-        Ok(results)
+        Ok(scored)
     }
 }

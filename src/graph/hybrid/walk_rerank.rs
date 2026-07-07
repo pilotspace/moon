@@ -158,6 +158,10 @@ pub struct GraphConstrainedReRanker {
     pub query_vector: Vec<f32>,
     /// Maximum frontier size for BFS to prevent OOM.
     pub frontier_cap: usize,
+    /// Strategy selection threshold (default 10K): at or above this many
+    /// total nodes, frozen segments answer through their HNSW bridge (W2-5)
+    /// instead of a full scan.
+    pub threshold: usize,
 }
 
 impl GraphConstrainedReRanker {
@@ -176,6 +180,7 @@ impl GraphConstrainedReRanker {
             k,
             query_vector,
             frontier_cap: 100_000,
+            threshold: DEFAULT_STRATEGY_THRESHOLD,
         }
     }
 
@@ -225,27 +230,165 @@ impl GraphConstrainedReRanker {
             distance_map.insert(*node_key, *dist);
         }
 
-        // Step 2: Score ALL nodes with embeddings, across both tiers.
+        // Step 2: score nodes with embeddings across both tiers. Every node
+        // OUTSIDE the BFS frontier shares the same graph term (the penalty
+        // distance), so within that class the combined ranking is monotone
+        // in cosine — which lets a large frozen segment answer with its
+        // HNSW bridge's top-k instead of a full scan (W2-5). Frontier nodes
+        // (bounded by frontier_cap) and the mutable tier (bounded by
+        // edge_threshold) are always scored exactly.
         let committed = roaring::RoaringBitmap::new();
         let mut scored: Vec<HybridResult> = Vec::with_capacity(distance_map.len());
 
-        view.for_each_visible_node(None, 0, 0, &committed, None, |node_key| {
-            let Some(embedding) = view.embedding(node_key) else {
-                return; // Skip nodes without embeddings.
+        let total_nodes: usize = memgraph.node_count()
+            + csr_segs
+                .iter()
+                .map(|s| s.node_count() as usize)
+                .sum::<usize>();
+        let use_bridge = matches!(
+            select_strategy(total_nodes, self.threshold),
+            FilterStrategy::HnswPreFilter
+        );
+
+        if !use_bridge {
+            view.for_each_visible_node(None, 0, 0, &committed, None, |node_key| {
+                let Some(embedding) = view.embedding(node_key) else {
+                    return; // Skip nodes without embeddings.
+                };
+
+                let vector_score = simd::cosine_similarity(&embedding, &self.query_vector);
+                let graph_dist = distance_map.get(&node_key).copied().unwrap_or(penalty_dist);
+                let graph_score = 1.0 / (1.0 + graph_dist as f64);
+                let combined = alpha * vector_score + (1.0 - alpha) * graph_score;
+
+                scored.push(HybridResult {
+                    node: node_key,
+                    score: combined,
+                    graph_distance: Some(graph_dist),
+                    context: Vec::new(),
+                });
+            });
+        } else {
+            let push = |scored: &mut Vec<HybridResult>, node_key: NodeKey, vector_score: f64| {
+                let graph_dist = distance_map.get(&node_key).copied().unwrap_or(penalty_dist);
+                let graph_score = 1.0 / (1.0 + graph_dist as f64);
+                scored.push(HybridResult {
+                    node: node_key,
+                    score: alpha * vector_score + (1.0 - alpha) * graph_score,
+                    graph_distance: Some(graph_dist),
+                    context: Vec::new(),
+                });
             };
 
-            let vector_score = simd::cosine_similarity(&embedding, &self.query_vector);
-            let graph_dist = distance_map.get(&node_key).copied().unwrap_or(penalty_dist);
-            let graph_score = 1.0 / (1.0 + graph_dist as f64);
-            let combined = alpha * vector_score + (1.0 - alpha) * graph_score;
+            // Mutable tier: exact.
+            for (key, node) in memgraph.iter_nodes() {
+                if !crate::graph::visibility::is_node_visible(node, 0, 0, &committed, None) {
+                    continue;
+                }
+                let Some(embedding) = view.embedding(key) else {
+                    continue;
+                };
+                push(
+                    &mut scored,
+                    key,
+                    simd::cosine_similarity(&embedding, &self.query_vector),
+                );
+            }
 
-            scored.push(HybridResult {
-                node: node_key,
-                score: combined,
-                graph_distance: Some(graph_dist),
-                context: Vec::new(),
-            });
-        });
+            for (i, seg) in csr_segs.iter().enumerate() {
+                // Row filter shared by every path below: MVCC-visible, not
+                // shadowed by a mutable copy-up (W2-2), and the NEWEST
+                // resident copy across segments (list is newest-first).
+                let row_admissible = |row: u32| -> Option<NodeKey> {
+                    let meta = seg.node_meta().get(row as usize)?;
+                    if !crate::graph::visibility::is_meta_visible(meta, 0, 0, &committed, None) {
+                        return None;
+                    }
+                    let key = NodeKey::from(slotmap::KeyData::from_ffi(meta.external_id));
+                    if memgraph.get_node(key).is_some() {
+                        return None;
+                    }
+                    if csr_segs[..i]
+                        .iter()
+                        .any(|newer| newer.lookup_node(key).is_some())
+                    {
+                        return None;
+                    }
+                    Some(key)
+                };
+                let exact_row = |scored: &mut Vec<HybridResult>, row: u32, key: NodeKey| {
+                    if let Some(emb) = seg.node_embedding(row) {
+                        push(
+                            scored,
+                            key,
+                            simd::cosine_similarity(&emb, &self.query_vector),
+                        );
+                    }
+                };
+
+                let bridge = seg
+                    .hnsw_bridge()
+                    .filter(|b| b.dim() == self.query_vector.len());
+                let Some(bridge) = bridge else {
+                    // No usable bridge (not built yet / too small / dim
+                    // mismatch): exact scan of this segment.
+                    for row in 0..seg.node_count() as u32 {
+                        if let Some(key) = row_admissible(row) {
+                            exact_row(&mut scored, row, key);
+                        }
+                    }
+                    continue;
+                };
+
+                // (a) Frontier rows resident in this segment: exact —
+                // O(frontier) lookups, not a row scan.
+                for &frontier_key in distance_map.keys() {
+                    let Some(row) = seg.lookup_node(frontier_key) else {
+                        continue;
+                    };
+                    if row_admissible(row) == Some(frontier_key) {
+                        exact_row(&mut scored, row, frontier_key);
+                    }
+                }
+
+                // (b) Embedded rows the bridge could not index: exact.
+                for &row in bridge.uncovered_embedded_rows() {
+                    let Some(key) = row_admissible(row) else {
+                        continue;
+                    };
+                    if !distance_map.contains_key(&key) {
+                        exact_row(&mut scored, row, key);
+                    }
+                }
+
+                // (c) The rest: bridge top-k among non-frontier rows.
+                let hits = bridge.search(&self.query_vector, self.k, |row| {
+                    row_admissible(row).is_some_and(|key| !distance_map.contains_key(&key))
+                });
+                if hits.len() < self.k.min(bridge.len()) {
+                    // Beam under-filled the ask (or the allowed set is just
+                    // small): rescue with an exact scan of the covered
+                    // non-frontier rows — never silently truncate.
+                    for row in 0..seg.node_count() as u32 {
+                        if !bridge.contains_row(row) {
+                            continue; // unembedded, or already exact in (b)
+                        }
+                        let Some(key) = row_admissible(row) else {
+                            continue;
+                        };
+                        if !distance_map.contains_key(&key) {
+                            exact_row(&mut scored, row, key);
+                        }
+                    }
+                    continue;
+                }
+                for (row, sim) in hits {
+                    if let Some(key) = row_admissible(row) {
+                        push(&mut scored, key, sim);
+                    }
+                }
+            }
+        }
 
         // Step 3: Sort descending by combined score, take top-K.
         scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));

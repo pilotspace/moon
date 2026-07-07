@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 
 use roaring::RoaringBitmap;
 use smallvec::SmallVec;
@@ -323,23 +324,46 @@ impl CsrStorage {
         }
     }
 
-    /// Get-or-build this segment's HNSW bridge over v5 node embeddings
-    /// (hybrid HnswPreFilter). Built at most once per segment, and only when
-    /// it holds >= `BRIDGE_MIN_VECTORS` usable embeddings — the negative
-    /// answer is cached too, so small segments pay the scan exactly once.
-    /// Same `OnceLock` interior-mutability pattern as `incoming_index`.
-    pub fn hnsw_bridge(&self) -> Option<&crate::graph::hnsw_bridge::GraphHnsw> {
-        let cell = match self {
-            CsrStorage::Heap(s) => &s.hnsw_bridge,
-            CsrStorage::Mmap(s) => &s.hnsw_bridge,
+    /// This segment's HNSW bridge over v5 node embeddings (hybrid
+    /// HnswPreFilter), if already built. The build itself runs on a
+    /// detached background thread (W2-5): the first caller kicks it off and
+    /// gets `None` — every caller already treats `None` as "score exactly",
+    /// so queries brute-force until the bridge installs instead of stalling
+    /// the shard event loop for the full HNSW construction. The negative
+    /// answer (too few embeddings) is cached the same way. Built at most
+    /// once per segment.
+    pub fn hnsw_bridge(self: &Arc<Self>) -> Option<&crate::graph::hnsw_bridge::GraphHnsw> {
+        let (cell, building) = match &**self {
+            CsrStorage::Heap(s) => (&s.hnsw_bridge, &s.hnsw_building),
+            CsrStorage::Mmap(s) => (&s.hnsw_bridge, &s.hnsw_building),
         };
-        cell.get_or_init(|| {
-            crate::graph::hnsw_bridge::GraphHnsw::build(
-                self,
-                crate::graph::hnsw_bridge::BRIDGE_MIN_VECTORS,
-            )
-        })
-        .as_ref()
+        if let Some(cached) = cell.get() {
+            return cached.as_ref();
+        }
+        if !building.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            let seg = Arc::clone(self);
+            std::thread::spawn(move || {
+                // A panicking build must still converge the cell (to None),
+                // or the segment would re-arm `building` on no future call
+                // and answer exact-only forever without a cached decision.
+                let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    crate::graph::hnsw_bridge::GraphHnsw::build(
+                        &seg,
+                        crate::graph::hnsw_bridge::BRIDGE_MIN_VECTORS,
+                    )
+                }))
+                .unwrap_or_else(|_| {
+                    tracing::warn!("graph hnsw bridge build panicked; segment stays exact-scored");
+                    None
+                });
+                let cell = match &*seg {
+                    CsrStorage::Heap(s) => &s.hnsw_bridge,
+                    CsrStorage::Mmap(s) => &s.hnsw_bridge,
+                };
+                let _ = cell.set(built);
+            });
+        }
+        None
     }
 
     /// Test hook: build the bridge regardless of the production minimum, so

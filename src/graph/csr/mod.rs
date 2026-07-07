@@ -92,6 +92,10 @@ pub struct CsrSegment {
     /// HnswPreFilter). DERIVED, in-memory only — never persisted. `None`
     /// cached when the segment holds too few embeddings to earn one.
     pub hnsw_bridge: std::sync::OnceLock<Option<crate::graph::hnsw_bridge::GraphHnsw>>,
+    /// True while a background thread is building `hnsw_bridge` (W2-5): the
+    /// build runs OFF the shard event loop; queries score exactly until the
+    /// bridge installs.
+    pub hnsw_building: std::sync::atomic::AtomicBool,
 }
 
 impl CsrSegment {
@@ -273,6 +277,7 @@ impl CsrSegment {
             incoming: std::sync::OnceLock::new(),
             props_index: std::sync::OnceLock::new(),
             hnsw_bridge: std::sync::OnceLock::new(),
+            hnsw_building: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -889,6 +894,7 @@ impl CsrSegment {
             incoming: std::sync::OnceLock::new(),
             props_index: std::sync::OnceLock::new(),
             hnsw_bridge: std::sync::OnceLock::new(),
+            hnsw_building: std::sync::atomic::AtomicBool::new(false),
         })
     }
 

@@ -53,6 +53,11 @@ pub struct GraphHnsw {
     /// Flat unit-normalized embeddings, bridge-id-major.
     vecs: Vec<f32>,
     dim: usize,
+    /// CSR rows that HAVE an embedding but are not indexed (dimension
+    /// mismatch with the majority dim, or degenerate norm). Callers doing a
+    /// whole-segment bridge scan (HYB-04) must score these exactly — the
+    /// list makes that possible without re-scanning every row.
+    uncovered: Vec<u32>,
 }
 
 impl core::fmt::Debug for GraphHnsw {
@@ -76,6 +81,7 @@ impl GraphHnsw {
         let node_count = seg.node_count();
         let mut rows: Vec<u32> = Vec::new();
         let mut vecs: Vec<f32> = Vec::new();
+        let mut uncovered: Vec<u32> = Vec::new();
         let mut dim = 0usize;
 
         for row in 0..node_count {
@@ -83,16 +89,19 @@ impl GraphHnsw {
                 continue;
             };
             if emb.is_empty() {
+                uncovered.push(row as u32);
                 continue;
             }
             if dim == 0 {
                 dim = emb.len();
             }
             if emb.len() != dim {
+                uncovered.push(row as u32);
                 continue;
             }
             let norm: f32 = emb.iter().map(|x| x * x).sum::<f32>().sqrt();
             if !(norm.is_finite() && norm > 0.0) {
+                uncovered.push(row as u32);
                 continue;
             }
             for x in &mut emb {
@@ -139,6 +148,7 @@ impl GraphHnsw {
             row_to_id,
             vecs,
             dim,
+            uncovered,
         })
     }
 
@@ -161,6 +171,13 @@ impl GraphHnsw {
     #[inline]
     pub fn contains_row(&self, row: u32) -> bool {
         self.row_to_id.contains_key(&row)
+    }
+
+    /// CSR rows with an embedding the bridge could not index (dim mismatch
+    /// / degenerate norm). Whole-segment bridge scans score these exactly.
+    #[inline]
+    pub fn uncovered_embedded_rows(&self) -> &[u32] {
+        &self.uncovered
     }
 
     #[inline]
@@ -456,5 +473,83 @@ mod tests {
                 "row {row} membership mismatch"
             );
         }
+    }
+
+    #[test]
+    fn test_bridge_tracks_uncovered_embedded_rows() {
+        // Mixed embeddings: majority dim-8, a few dim-4 + one zero-norm.
+        // The bridge indexes the dim-8 rows and must LIST the rest so a
+        // whole-segment bridge scan (HYB-04) can score them exactly.
+        let mut g = MemGraph::new(1_000_000);
+        let mut keys = Vec::new();
+        for i in 0..20u64 {
+            keys.push(g.add_node(
+                smallvec![0u16],
+                smallvec::SmallVec::new(),
+                Some(embedding(i, 8)),
+                1,
+            ));
+        }
+        for i in 20..23u64 {
+            keys.push(g.add_node(
+                smallvec![0u16],
+                smallvec::SmallVec::new(),
+                Some(embedding(i, 4)), // dim mismatch -> uncovered
+                1,
+            ));
+        }
+        keys.push(g.add_node(
+            smallvec![0u16],
+            smallvec::SmallVec::new(),
+            Some(vec![0.0; 8]), // zero norm -> uncovered
+            1,
+        ));
+        for i in 0..keys.len() - 1 {
+            g.add_edge(keys[i], keys[i + 1], 1, 1.0, None, 2)
+                .expect("edge");
+        }
+        let seg = CsrStorage::from(
+            CsrSegment::from_frozen(g.freeze().expect("freeze"), 10).expect("csr"),
+        );
+        let bridge = GraphHnsw::build(&seg, 1).expect("bridge");
+        assert_eq!(bridge.len(), 20);
+        assert_eq!(bridge.uncovered_embedded_rows().len(), 4);
+        // Covered and uncovered partition the embedded rows exactly.
+        for &row in bridge.uncovered_embedded_rows() {
+            assert!(!bridge.contains_row(row));
+            assert!(seg.node_embedding(row).is_some());
+        }
+        let embedded = (0..seg.node_count())
+            .filter(|&r| seg.node_embedding(r).is_some())
+            .count();
+        assert_eq!(
+            bridge.len() + bridge.uncovered_embedded_rows().len(),
+            embedded
+        );
+    }
+
+    #[test]
+    fn test_bridge_builds_off_thread() {
+        // The production accessor must NOT block the calling (shard event
+        // loop) thread on the HNSW construction: the first call kicks off a
+        // background build and reports "not ready"; the result installs
+        // asynchronously. 4200 embeddings clears BRIDGE_MIN_VECTORS.
+        let (seg, _) = frozen_segment(4200, 8);
+        let seg = std::sync::Arc::new(seg);
+        assert!(
+            seg.hnsw_bridge().is_none(),
+            "first call must return immediately (build runs off-thread)"
+        );
+        let mut installed = false;
+        for _ in 0..1200 {
+            if seg.hnsw_bridge().is_some() {
+                installed = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(installed, "background bridge build never installed");
+        let bridge = seg.hnsw_bridge().expect("installed");
+        assert_eq!(bridge.len(), 4200);
     }
 }

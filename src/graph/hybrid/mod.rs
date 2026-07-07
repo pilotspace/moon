@@ -942,4 +942,100 @@ mod tests {
             "prefilter must prune"
         );
     }
+
+    #[test]
+    fn test_expansion_bridge_matches_brute_force() {
+        // HYB-02 (W2-5): at >= threshold candidates the expansion routes
+        // frozen rows through the segment bridge; scores stay REAL cosines
+        // and the top-k closely tracks exact scoring.
+        let (mg, seg, _center) = frozen_star_segment();
+        assert!(seg.hnsw_bridge_for_test().is_some(), "bridge must build");
+
+        let candidates: Vec<NodeKey> = seg
+            .node_meta()
+            .iter()
+            .map(|m| slotmap::KeyData::from_ffi(m.external_id).into())
+            .collect();
+        let query = det_embedding(31337, 8);
+        let segs = vec![seg.clone()];
+
+        let mut bridged = VectorToGraphExpansion::new(query.clone(), 5, 1);
+        bridged.threshold = 1; // force HnswPreFilter
+        let mut brute = VectorToGraphExpansion::new(query.clone(), 5, 1);
+        brute.threshold = usize::MAX; // force BruteForce
+
+        let bres = bridged
+            .execute(&mg, &segs, &candidates, u64::MAX - 1)
+            .expect("bridged ok");
+        let xres = brute
+            .execute(&mg, &segs, &candidates, u64::MAX - 1)
+            .expect("brute ok");
+        assert_eq!(bres.len(), 5);
+        assert_eq!(xres.len(), 5);
+
+        let view = MergedNodeView::new(&mg, &segs);
+        for r in &bres {
+            let emb = view.embedding(r.node).expect("embedding");
+            let exact = simd::cosine_similarity(&emb, &query);
+            assert!((r.score - exact).abs() < 1e-4);
+            assert_eq!(r.graph_distance, None, "HYB-02 has no graph distance");
+            assert!(!r.context.is_empty(), "expansion context must populate");
+        }
+        let brute_set: HashSet<NodeKey> = xres.iter().map(|r| r.node).collect();
+        let overlap = bres.iter().filter(|r| brute_set.contains(&r.node)).count();
+        assert!(overlap >= 4, "HYB-02 bridge/brute overlap {overlap}/5");
+    }
+
+    #[test]
+    fn test_rerank_bridge_matches_brute_force() {
+        // HYB-04 (W2-5): non-frontier nodes share the penalty graph term,
+        // so the bridged path answers with the segment's top-k by cosine;
+        // frontier + mutable nodes stay exact. Every returned score must
+        // still be the true combined formula.
+        let (mut mg, seg, center) = frozen_star_segment();
+        assert!(seg.hnsw_bridge_for_test().is_some(), "bridge must build");
+
+        // A mutable-tier node too (must be scored exactly, never dropped).
+        let hot = mg.add_node(smallvec![0], empty_props(), Some(det_embedding(500, 8)), 20);
+
+        let query = det_embedding(4711, 8);
+        let segs = vec![seg.clone()];
+
+        let mut bridged = GraphConstrainedReRanker::new(center, 1, 0.7, query.clone(), 8);
+        bridged.threshold = 1; // force the bridge path
+        let mut brute = GraphConstrainedReRanker::new(center, 1, 0.7, query.clone(), 8);
+        brute.threshold = usize::MAX; // full exact scan
+
+        let bres = bridged.execute(&mg, &segs, u64::MAX - 1).expect("bridged");
+        let xres = brute.execute(&mg, &segs, u64::MAX - 1).expect("brute");
+        assert_eq!(bres.len(), 8);
+        assert_eq!(xres.len(), 8);
+
+        // Bridged scores must be the exact combined formula for that node.
+        let view = MergedNodeView::new(&mg, &segs);
+        for r in &bres {
+            let emb = view.embedding(r.node).expect("embedding");
+            let cos = simd::cosine_similarity(&emb, &query);
+            let gd = r.graph_distance.expect("distance always set") as f64;
+            let expect = 0.7 * cos + 0.3 * (1.0 / (1.0 + gd));
+            assert!(
+                (r.score - expect).abs() < 1e-4,
+                "node {:?}: {} vs {expect}",
+                r.node,
+                r.score
+            );
+        }
+        // The star is 1-hop from center: every spoke is IN the frontier, so
+        // bridge and brute must agree BIT-EXACTLY on the frontier class; the
+        // mutable node rides along in both.
+        let brute_set: HashSet<NodeKey> = xres.iter().map(|r| r.node).collect();
+        let overlap = bres.iter().filter(|r| brute_set.contains(&r.node)).count();
+        assert!(overlap >= 7, "HYB-04 bridge/brute overlap {overlap}/8");
+        let hot_in_bridged = bres.iter().any(|r| r.node == hot);
+        let hot_in_brute = xres.iter().any(|r| r.node == hot);
+        assert_eq!(
+            hot_in_bridged, hot_in_brute,
+            "mutable-tier node must rank identically in both paths"
+        );
+    }
 }
