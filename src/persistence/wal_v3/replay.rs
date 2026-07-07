@@ -1,9 +1,11 @@
-//! WAL v3 replay engine — v2/v3 auto-detection, LSN-based skip, FPI callback.
+//! WAL v3 replay engine — v3 is the only WAL format; auto-detection
+//! distinguishes it from raw AOF and rejects the removed v2 format.
 //!
 //! The replay engine is the recovery path after crash or restart. It handles:
-//! - v2 WAL files (version byte=2) by delegating to the existing v2 replay path
 //! - v3 WAL files (version byte=3) with per-record LSN tracking
-//! - Raw RESP (v1) by delegating to AOF replay
+//! - Raw RESP (v1 AOF) by delegating to AOF replay
+//! - v2 WAL files (version byte=2) are rejected loudly: WAL v2 was removed in
+//!   the pre-1.0 WAL-v3-only format freeze (see `WalError::UnsupportedVersion`)
 //! - Auto-detection at byte offset 6 to distinguish formats
 //!
 //! FPI (Full Page Image) records during replay unconditionally overwrite the
@@ -31,10 +33,11 @@ pub struct WalV3ReplayResult {
 /// Auto-detect WAL format and replay accordingly.
 ///
 /// Reads the first bytes of the file to determine the format:
-/// - `RRDWAL` magic + version=2 => delegate to existing v2 replay
 /// - `RRDWAL` magic + version=3 => use v3 replay engine
 /// - No `RRDWAL` magic => delegate to AOF (raw RESP v1) replay
-/// - Other version => return UnsupportedVersion error
+/// - `RRDWAL` magic + version=2 => return `UnsupportedVersion` (WAL v2 was
+///   removed in the pre-1.0 WAL-v3-only format freeze; re-ingest via AOF)
+/// - Any other version => return `UnsupportedVersion` error
 pub fn replay_wal_auto(
     databases: &mut [crate::storage::Database],
     path: &Path,
@@ -49,8 +52,18 @@ pub fn replay_wal_auto(
     if data.len() >= WAL_V3_HEADER_SIZE && data[..6] == *WAL_V3_MAGIC {
         match data[6] {
             2 => {
-                // v2 format — delegate to existing replay
-                crate::persistence::wal::replay_wal(databases, path, engine)
+                // WAL v2 was removed in the pre-1.0 WAL-v3-only format
+                // freeze -- this build cannot replay it. Fail loudly rather
+                // than silently dropping writes; the operator must re-ingest
+                // via the AOF (the recovery authority) or re-import from a
+                // pre-freeze build.
+                tracing::error!(
+                    "WAL v2 file {:?} found but WAL v2 support was removed \
+                     (pre-1.0 WAL-v3-only format freeze) — re-ingest via AOF \
+                     or replay it on a pre-freeze Moon build first",
+                    path
+                );
+                Err(crate::error::WalError::UnsupportedVersion { version: 2 }.into())
             }
             3 => {
                 // v3 format — replay commands through engine
@@ -73,14 +86,9 @@ pub fn replay_wal_auto(
                             tracing::trace!(lsn = record.lsn, "WAL replay: XactBegin");
                         }
                         WalRecordType::XactCommit => {
-                            // XactCommit: replay KV ops from payload
+                            // XactCommit: db-index-aware KV replay
                             replay_xact_commit(databases, &record.payload);
                             tracing::trace!(lsn = record.lsn, "WAL replay: XactCommit");
-                        }
-                        WalRecordType::XactCommitV2 => {
-                            // XactCommitV2: db-index-aware KV replay
-                            replay_xact_commit_v2(databases, &record.payload);
-                            tracing::trace!(lsn = record.lsn, "WAL replay: XactCommitV2");
                         }
                         WalRecordType::XactAbort => {
                             // XactAbort: no action - changes were never committed
@@ -315,7 +323,6 @@ pub fn replay_wal_v3_file_until(
             | WalRecordType::FileTierChange
             | WalRecordType::XactBegin
             | WalRecordType::XactCommit
-            | WalRecordType::XactCommitV2
             | WalRecordType::XactAbort
             | WalRecordType::TemporalUpsert
             | WalRecordType::GraphTemporal
@@ -423,49 +430,24 @@ pub fn resolve_target_time_to_lsn(
     Ok(best)
 }
 
-/// Replay a cross-store transaction commit record.
+/// Replay a cross-store transaction commit record (db-index-aware).
 ///
-/// The XactCommit payload format (little-endian):
-/// - txn_id: u64
-/// - kv_op_count: u32
-/// - For each KV op:
+/// Payload layout (little-endian): `txn_id: u64, db_index: u32,
+/// kv_op_count: u32, ops…`. Per op:
 ///   - op_type: u8 (0=SET, 1=DEL)
 ///   - key_len: u32
 ///   - key: [u8; key_len]
 ///   - value_len: u32 (only for SET)
 ///   - value: [u8; value_len] (only for SET)
 ///
+/// An out-of-range `db_index` (server restarted with fewer `--databases`)
+/// falls back to db 0 with a loud warning rather than dropping the ops.
+///
 /// Vector and graph ops are handled by their respective replay paths
 /// (VectorTxnCommit already exists).
 fn replay_xact_commit(databases: &mut [crate::storage::Database], payload: &[u8]) {
-    if payload.len() < 12 {
-        tracing::warn!("XactCommit payload too short: {} bytes", payload.len());
-        return;
-    }
-
-    let txn_id = u64::from_le_bytes([
-        payload[0], payload[1], payload[2], payload[3], payload[4], payload[5], payload[6],
-        payload[7],
-    ]);
-    let kv_op_count =
-        u32::from_le_bytes([payload[8], payload[9], payload[10], payload[11]]) as usize;
-
-    tracing::debug!(txn_id, kv_op_count, "Replaying XactCommit");
-
-    // v1 records predate the db-index header: they were only ever written by
-    // builds that replayed into db 0, so db 0 is the faithful target.
-    replay_xact_kv_ops(&mut databases[0], payload, 12, kv_op_count);
-}
-
-/// Replay a cross-store transaction commit record, v2 (db-index-aware).
-///
-/// Payload layout (little-endian): `txn_id: u64, db_index: u32,
-/// kv_op_count: u32, ops…` — op wire format identical to v1.
-/// An out-of-range `db_index` (server restarted with fewer `--databases`)
-/// falls back to db 0 with a loud warning rather than dropping the ops.
-fn replay_xact_commit_v2(databases: &mut [crate::storage::Database], payload: &[u8]) {
     if payload.len() < 16 {
-        tracing::warn!("XactCommitV2 payload too short: {} bytes", payload.len());
+        tracing::warn!("XactCommit payload too short: {} bytes", payload.len());
         return;
     }
 
@@ -477,7 +459,7 @@ fn replay_xact_commit_v2(databases: &mut [crate::storage::Database], payload: &[
     let kv_op_count =
         u32::from_le_bytes([payload[12], payload[13], payload[14], payload[15]]) as usize;
 
-    tracing::debug!(txn_id, db_index, kv_op_count, "Replaying XactCommitV2");
+    tracing::debug!(txn_id, db_index, kv_op_count, "Replaying XactCommit");
 
     let target = if db_index < databases.len() {
         db_index
@@ -486,7 +468,7 @@ fn replay_xact_commit_v2(databases: &mut [crate::storage::Database], payload: &[
             txn_id,
             db_index,
             db_count = databases.len(),
-            "XactCommitV2 db index out of range (server restarted with fewer \
+            "XactCommit db index out of range (server restarted with fewer \
              --databases?) — replaying into db 0"
         );
         0
@@ -494,7 +476,7 @@ fn replay_xact_commit_v2(databases: &mut [crate::storage::Database], payload: &[
     replay_xact_kv_ops(&mut databases[target], payload, 16, kv_op_count);
 }
 
-/// Shared op-loop for XactCommit v1/v2: apply `kv_op_count` SET/DEL ops read
+/// Shared op-loop for XactCommit: apply `kv_op_count` SET/DEL ops read
 /// from `payload` starting at `offset` to `db`. Truncation-defensive — a
 /// short payload warns and stops rather than panicking.
 fn replay_xact_kv_ops(
@@ -591,12 +573,12 @@ mod tests {
         header
     }
 
-    // D-1: XactCommitV2 must replay KV ops into the db the transaction ran
-    // in — the v1 path hardcoded db 0, silently corrupting recovery for any
-    // TXN.BEGIN…COMMIT issued under SELECT != 0.
+    // D-1: XactCommit must replay KV ops into the db the transaction ran
+    // in — the deleted pre-1.0 v1 record hardcoded db 0, silently corrupting
+    // recovery for any TXN.BEGIN…COMMIT issued under SELECT != 0.
     #[test]
-    fn test_xact_commit_v2_replays_into_selected_db() {
-        use crate::persistence::wal_v3::record::encode_xact_commit_payload_v2;
+    fn test_xact_commit_replays_into_selected_db() {
+        use crate::persistence::wal_v3::record::encode_xact_commit_payload;
         use crate::storage::Database;
         use crate::transaction::UndoRecord;
         use bytes::Bytes;
@@ -607,14 +589,14 @@ mod tests {
         let records = vec![UndoRecord::Insert {
             key: Bytes::from_static(b"txnkey"),
         }];
-        let payload = encode_xact_commit_payload_v2(7, 3, &records, &src_db);
+        let payload = encode_xact_commit_payload(7, 3, &records, &src_db);
 
         let mut databases: Vec<Database> = (0..4).map(|_| Database::new()).collect();
-        replay_xact_commit_v2(&mut databases, &payload);
+        replay_xact_commit(&mut databases, &payload);
 
         assert!(
             databases[3].data().get(b"txnkey".as_ref()).is_some(),
-            "XactCommitV2 must restore the key into db 3"
+            "XactCommit must restore the key into db 3"
         );
         assert!(
             databases[0].data().get(b"txnkey".as_ref()).is_none(),
@@ -623,8 +605,8 @@ mod tests {
     }
 
     #[test]
-    fn test_xact_commit_v2_out_of_range_db_falls_back_to_db0() {
-        use crate::persistence::wal_v3::record::encode_xact_commit_payload_v2;
+    fn test_xact_commit_out_of_range_db_falls_back_to_db0() {
+        use crate::persistence::wal_v3::record::encode_xact_commit_payload;
         use crate::storage::Database;
         use crate::transaction::UndoRecord;
         use bytes::Bytes;
@@ -635,10 +617,10 @@ mod tests {
             key: Bytes::from_static(b"k"),
         }];
         // db_index 9 but the restarted server only has 2 dbs.
-        let payload = encode_xact_commit_payload_v2(8, 9, &records, &src_db);
+        let payload = encode_xact_commit_payload(8, 9, &records, &src_db);
 
         let mut databases: Vec<Database> = (0..2).map(|_| Database::new()).collect();
-        replay_xact_commit_v2(&mut databases, &payload);
+        replay_xact_commit(&mut databases, &payload);
 
         assert!(
             databases[0].data().get(b"k".as_ref()).is_some(),
