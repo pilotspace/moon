@@ -437,7 +437,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                 // writes pending the batch-end fsync_barrier(ctx.shard_id).
                 let mut local_leg_write_idxs: Vec<usize> = Vec::new();
                 let mut should_quit = false;
-                let mut remote_groups: HashMap<usize, Vec<(usize, std::sync::Arc<Frame>, Option<Bytes>, Bytes, usize)>> = HashMap::with_capacity(ctx.num_shards);
+                let mut remote_groups: HashMap<usize, Vec<(usize, std::sync::Arc<Frame>, Option<Bytes>, Bytes, usize, Option<crate::tracking::invalidation::TrackedWriteKeys>)>> = HashMap::with_capacity(ctx.num_shards);
                 // Accumulate cross-shard PUBLISH pairs per target shard for batch dispatch
                 // Key: target shard ID -> Vec of (response_index, channel, message)
                 let mut publish_batches: HashMap<usize, Vec<(usize, Bytes, Bytes)>> = HashMap::new();
@@ -926,7 +926,22 @@ pub(crate) async fn handle_connection_sharded_inner<
                     }
 
                     // --- MULTI / EXEC_CMD / DISCARD ---
-                    if write::try_handle_multi_exec(cmd, &mut conn, ctx, &mut responses) {
+                    let mut exec_publishes: Vec<(usize, Bytes, Bytes)> = Vec::new();
+                    if write::try_handle_multi_exec(cmd, &mut conn, ctx, &mut responses, &mut exec_publishes) {
+                        // C2: PUBLISH queued inside MULTI fans out only now — after the
+                        // transaction body has been applied — and its placeholder in the
+                        // EXEC reply array is patched with the real receiver count.
+                        if !exec_publishes.is_empty() {
+                            let exec_idx = responses.len() - 1;
+                            for (inner, ch, msg) in exec_publishes.drain(..) {
+                                let total = crate::server::conn::shared::publish_post_txn(ctx, &ch, &msg).await;
+                                if let Frame::Array(items) = &mut responses[exec_idx] {
+                                    if inner < items.len() {
+                                        items[inner] = Frame::Integer(total);
+                                    }
+                                }
+                            }
+                        }
                         continue;
                     }
 
@@ -984,7 +999,12 @@ pub(crate) async fn handle_connection_sharded_inner<
                     }
 
                     // --- PUBLISH ---
-                    if pubsub::try_handle_publish(cmd, cmd_args, &conn, ctx, &mut responses, &mut publish_batches) {
+                    // C2 fix: inside MULTI, PUBLISH must fall through to the
+                    // queue (it used to execute immediately, fanning out before
+                    // the transaction's writes were applied).
+                    if !conn.in_multi
+                        && pubsub::try_handle_publish(cmd, cmd_args, &conn, ctx, &mut responses, &mut publish_batches)
+                    {
                         continue;
                     }
 
@@ -1137,6 +1157,26 @@ pub(crate) async fn handle_connection_sharded_inner<
                         // response must not be overwritten by a barrier failure.
                         if local_barrier_pending && !matches!(response, Frame::Error(_)) {
                             local_leg_write_idxs.push(responses.len());
+                        }
+                        // CLIENT TRACKING: multi-key writes (DEL/MSET/UNLINK/…)
+                        // invalidate every key; multi-key reads (MGET) by a
+                        // tracking client register every key.
+                        if !matches!(response, Frame::Error(_)) {
+                            crate::tracking::invalidation::invalidate_after_write(
+                                &ctx.tracking_table,
+                                cmd,
+                                cmd_args,
+                                client_id,
+                            );
+                            if conn.tracking_state.enabled && !conn.tracking_state.bcast {
+                                crate::tracking::invalidation::track_read_keys(
+                                    &ctx.tracking_table,
+                                    cmd,
+                                    cmd_args,
+                                    client_id,
+                                    conn.tracking_state.noloop,
+                                );
+                            }
                         }
                         responses.push(response);
                         continue;
@@ -1569,6 +1609,16 @@ pub(crate) async fn handle_connection_sharded_inner<
                                         response = e;
                                     }
                                 }
+                                // CLIENT TRACKING: a flush drops every cached
+                                // key — push the RESP3 flush invalidation
+                                // (invalidate + Null) to all tracking clients.
+                                // The table is process-global, so one hook at
+                                // the originating connection covers all shards.
+                                if !matches!(response, Frame::Error(_)) {
+                                    crate::tracking::invalidation::invalidate_flush(
+                                        &ctx.tracking_table,
+                                    );
+                                }
                             }
                             // Always-mode local writes join the per-batch group
                             // commit: append enqueued fire-and-forget, confirmed by
@@ -1598,14 +1648,16 @@ pub(crate) async fn handle_connection_sharded_inner<
                                 responses.push(response);
                                 continue;
                             }
-                            if conn.tracking_state.enabled && !matches!(response, Frame::Error(_)) {
-                                if let Some(key) = cmd_args.first().and_then(|f| extract_bytes(f)) {
-                                    let senders = ctx.tracking_table.borrow_mut().invalidate_key(&key, client_id);
-                                    if !senders.is_empty() {
-                                        let push = crate::tracking::invalidation::invalidation_push(&[key]);
-                                        for tx in senders { let _ = tx.try_send(push.clone()); }
-                                    }
-                                }
+                            // CLIENT TRACKING: any successful write (from ANY
+                            // client, tracking or not) invalidates trackers of
+                            // every written key — gated by tracking_active().
+                            if !matches!(response, Frame::Error(_)) {
+                                crate::tracking::invalidation::invalidate_after_write(
+                                    &ctx.tracking_table,
+                                    cmd,
+                                    cmd_args,
+                                    client_id,
+                                );
                             }
                             let mut response = apply_resp3_conversion(cmd, response, conn.protocol_version);
                             if let Some(ws_id) = conn.workspace_id.as_ref() {
@@ -1687,10 +1739,17 @@ pub(crate) async fn handle_connection_sharded_inner<
                                     );
                                 }
                             }
-                            if conn.tracking_state.enabled && !conn.tracking_state.bcast {
-                                if let Some(key) = cmd_args.first().and_then(|f| extract_bytes(f)) {
-                                    ctx.tracking_table.borrow_mut().track_key(client_id, &key, conn.tracking_state.noloop);
-                                }
+                            if conn.tracking_state.enabled
+                                && !conn.tracking_state.bcast
+                                && !matches!(response, Frame::Error(_))
+                            {
+                                crate::tracking::invalidation::track_read_keys(
+                                    &ctx.tracking_table,
+                                    cmd,
+                                    cmd_args,
+                                    client_id,
+                                    conn.tracking_state.noloop,
+                                );
                             }
                             let mut response = apply_resp3_conversion(cmd, response, conn.protocol_version);
                             if let Some(ws_id) = conn.workspace_id.as_ref() {
@@ -1717,6 +1776,29 @@ pub(crate) async fn handle_connection_sharded_inner<
                         // Cross-shard dispatch (reads and writes): deferred SPSC dispatch.
                         // When workspace rewriting occurred, rebuild the frame with
                         // prefixed args so the target shard stores the correct key.
+                        // CLIENT TRACKING: the frame moves into the dispatch
+                        // message, so capture the write's key set NOW (gated —
+                        // None when no tracking client exists); invalidation
+                        // fires when the remote reply confirms success.
+                        let track_keys = if crate::tracking::tracking_active()
+                            && metadata::is_write(cmd)
+                        {
+                            Some(crate::tracking::invalidation::command_keys(cmd, cmd_args))
+                        } else {
+                            None
+                        };
+                        // Remote READ by a tracking client: register the keys
+                        // now (Redis tracks reads even for missing keys, so
+                        // registering before the reply is faithful).
+                        if conn.tracking_state.enabled && !conn.tracking_state.bcast {
+                            crate::tracking::invalidation::track_read_keys(
+                                &ctx.tracking_table,
+                                cmd,
+                                cmd_args,
+                                client_id,
+                                conn.tracking_state.noloop,
+                            );
+                        }
                         let dispatch_frame = if rewritten.is_some() {
                             let mut parts = Vec::with_capacity(1 + cmd_args.len());
                             parts.push(Frame::BulkString(Bytes::copy_from_slice(cmd)));
@@ -1732,7 +1814,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                         } else {
                             Bytes::new()
                         };
-                        remote_groups.entry(target).or_default().push((resp_idx, std::sync::Arc::new(dispatch_frame), aof_bytes, cmd_bytes, conn.selected_db));
+                        remote_groups.entry(target).or_default().push((resp_idx, std::sync::Arc::new(dispatch_frame), aof_bytes, cmd_bytes, conn.selected_db, track_keys));
                         cross_spsc_dispatches = cross_spsc_dispatches.saturating_add(1);
                     }
                 }
@@ -1744,14 +1826,15 @@ pub(crate) async fn handle_connection_sharded_inner<
 
                 // Phase 2: Dispatch deferred remote commands (zero-allocation via ResponseSlotPool)
                 if !remote_groups.is_empty() {
-                    let mut reply_futures: Vec<(Vec<(usize, Option<Bytes>, Bytes)>, usize)> = Vec::with_capacity(remote_groups.len());
+                    type RemoteMeta = (usize, Option<Bytes>, Bytes, Option<crate::tracking::invalidation::TrackedWriteKeys>);
+                    let mut reply_futures: Vec<(Vec<RemoteMeta>, usize)> = Vec::with_capacity(remote_groups.len());
                     for (target, entries) in remote_groups {
                         let slot_arc = response_pool.slot_arc(target);
                         // Use the db_index captured with the first command (all commands in a
                         // pipeline batch targeting the same shard share the same db_index).
-                        let batch_db = entries.first().map(|(_, _, _, _, db)| *db).unwrap_or(conn.selected_db);
-                        let (meta, commands): (Vec<(usize, Option<Bytes>, Bytes)>, Vec<std::sync::Arc<Frame>>) =
-                            entries.into_iter().map(|(idx, arc_frame, aof, cmd, _db)| ((idx, aof, cmd), arc_frame)).unzip();
+                        let batch_db = entries.first().map(|(_, _, _, _, db, _)| *db).unwrap_or(conn.selected_db);
+                        let (meta, commands): (Vec<RemoteMeta>, Vec<std::sync::Arc<Frame>>) =
+                            entries.into_iter().map(|(idx, arc_frame, aof, cmd, _db, tk)| ((idx, aof, cmd, tk), arc_frame)).unzip();
                         let msg = ShardMessage::PipelineBatchSlotted { db_index: batch_db, commands, response_slot: crate::shard::dispatch::ResponseSlotPtr(slot_arc) };
                         let target_idx = ChannelMesh::target_index(ctx.shard_id, target);
                         // F3: bounded backpressure retry (shared helper). The
@@ -1792,7 +1875,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                                     "Shard {}: cross-shard push to shard {} gave up ({:?}); rejecting batch",
                                     ctx.shard_id, target, outcome
                                 );
-                                for (resp_idx, _, _) in &meta {
+                                for (resp_idx, _, _, _) in &meta {
                                     responses[*resp_idx] = Frame::Error(Bytes::from_static(
                                         b"ERR cross-shard dispatch backpressure",
                                     ));
@@ -1836,7 +1919,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                         // we can overwrite write responses on fsync failure below.
                         // aof_bytes is Some for write commands, None for reads.
                         let mut write_resp_idxs: Vec<usize> = Vec::new();
-                        for ((resp_idx, aof_bytes, cmd_name), resp) in meta.into_iter().zip(shard_responses) {
+                        for ((resp_idx, aof_bytes, cmd_name, track_keys), resp) in meta.into_iter().zip(shard_responses) {
                             // C4-FOLD-FIX: AOF append for cross-shard writes is now done
                             // inside the SPSC arm (PipelineBatchSlotted / PipelineBatch),
                             // BEFORE the response slot is filled. Appending here (after
@@ -1848,6 +1931,17 @@ pub(crate) async fn handle_connection_sharded_inner<
                             let converted = apply_resp3_conversion(&cmd_name, resp, proto_ver);
                             if aof_bytes.is_some() && !matches!(converted, Frame::Error(_)) {
                                 write_resp_idxs.push(resp_idx);
+                            }
+                            // CLIENT TRACKING: remote write confirmed — invalidate
+                            // the keys captured at enqueue time.
+                            if let Some(keys) = track_keys {
+                                if !matches!(converted, Frame::Error(_)) {
+                                    crate::tracking::invalidation::invalidate_keys(
+                                        &ctx.tracking_table,
+                                        &keys,
+                                        client_id,
+                                    );
+                                }
                             }
                             responses[resp_idx] = converted;
                         }
@@ -1986,6 +2080,23 @@ pub(crate) async fn handle_connection_sharded_inner<
 
                 if should_quit { break; }
             }
+            // CLIENT TRACKING: deliver invalidation Push frames while the
+            // connection is idle in read(). Pending-branch when tracking is
+            // off — zero cost for non-tracking connections.
+            push = async {
+                match conn.tracking_rx {
+                    Some(ref rx) => rx.recv_async().await.ok(),
+                    None => std::future::pending().await,
+                }
+            } => {
+                if let Some(push_frame) = push {
+                    write_buf.clear();
+                    crate::protocol::serialize_resp3(&push_frame, &mut write_buf);
+                    if stream.write_all(&write_buf).await.is_err() {
+                        break;
+                    }
+                }
+            }
             _ = shutdown.cancelled() => {
                 write_buf.clear();
                 let shutdown_err = Frame::Error(Bytes::from_static(b"ERR server shutting down"));
@@ -2055,7 +2166,7 @@ pub(crate) async fn handle_connection_sharded_inner<
     }
 
     if conn.tracking_state.enabled {
-        ctx.tracking_table.borrow_mut().untrack_all(client_id);
+        ctx.tracking_table.lock().untrack_all(client_id);
     }
 
     (HandlerResult::Done, None)

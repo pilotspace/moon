@@ -54,7 +54,7 @@ pub(crate) struct ConnectionContext {
     /// routes to the owning shard; `try_send_rewrite(msg)` rejects under
     /// PerShard until per-shard rewrite ships (step 6 of the RFC).
     pub aof_pool: Option<Arc<AofWriterPool>>,
-    pub tracking_table: Rc<RefCell<TrackingTable>>,
+    pub tracking_table: std::sync::Arc<parking_lot::Mutex<TrackingTable>>,
     pub repl_state: Option<Arc<StdRwLock<crate::replication::state::ReplicationState>>>,
     /// Lock-free mirror of `repl_state.role == Replica { .. }`.
     /// Populated once in `new()` (from `repl_state.read()`), kept in sync
@@ -103,7 +103,7 @@ impl ConnectionContext {
         blocking_registry: Rc<RefCell<BlockingRegistry>>,
         requirepass: Option<String>,
         aof_pool: Option<Arc<AofWriterPool>>,
-        tracking_table: Rc<RefCell<TrackingTable>>,
+        tracking_table: std::sync::Arc<parking_lot::Mutex<TrackingTable>>,
         repl_state: Option<Arc<StdRwLock<crate::replication::state::ReplicationState>>>,
         cluster_state: Option<Arc<StdRwLock<crate::cluster::ClusterState>>>,
         lua: Rc<mlua::Lua>,

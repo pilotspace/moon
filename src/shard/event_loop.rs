@@ -24,7 +24,6 @@ use crate::runtime::cancel::CancellationToken;
 use crate::runtime::channel;
 use crate::runtime::{TimerImpl, traits::RuntimeTimer};
 use crate::storage::entry::CachedClock;
-use crate::tracking::TrackingTable;
 
 #[cfg(all(target_os = "linux", feature = "runtime-tokio"))]
 use crate::io::{UringConfig, UringDriver};
@@ -374,7 +373,7 @@ impl super::Shard {
             let mut reg = pubsub_arc.write();
             *reg = std::mem::take(&mut self.pubsub_registry);
         }
-        let tracking_rc = Rc::new(RefCell::new(TrackingTable::new()));
+        let tracking_rc = crate::tracking::global_table();
         let shard_id = self.id;
         let blocking_rc = Rc::new(RefCell::new(BlockingRegistry::new(shard_id)));
         let remote_sub_map_arc = all_remote_sub_maps[self.id].clone();
@@ -1182,7 +1181,7 @@ impl super::Shard {
                     // takes its own flat borrow, eliminating the re-entrancy BorrowMutError
                     // that occurred when arms called with_shard inside an enclosing borrow.
                     let hit_cap = spsc_handler::drain_spsc_shared(
-                        &shard_databases, &mut consumers, &mut *pubsub_arc.write(),
+                        &shard_databases, &mut consumers, &pubsub_arc,
                         &blocking_rc, &mut pending_snapshot, &mut snapshot_state,
                         &mut wal_writer, &repl_backlog, &mut replica_txs,
                         &repl_offsets, shard_id, &script_cache_rc, &cached_clock,
@@ -1288,7 +1287,7 @@ impl super::Shard {
                     let mut pending_snapshot = None;
                     // No outer with_shard — each arm takes its own flat borrow.
                     let hit_cap = spsc_handler::drain_spsc_shared(
-                        &shard_databases, &mut consumers, &mut *pubsub_arc.write(),
+                        &shard_databases, &mut consumers, &pubsub_arc,
                         &blocking_rc, &mut pending_snapshot, &mut snapshot_state,
                         &mut wal_writer, &repl_backlog, &mut replica_txs,
                         &repl_offsets, shard_id, &script_cache_rc, &cached_clock,
@@ -1866,7 +1865,7 @@ impl super::Shard {
                 let hit_cap = spsc_handler::drain_spsc_shared(
                     &shard_databases,
                     &mut consumers.borrow_mut(),
-                    &mut *pubsub_arc.write(),
+                    &pubsub_arc,
                     &blocking_rc,
                     &mut pending_snapshot,
                     &mut snapshot_state,

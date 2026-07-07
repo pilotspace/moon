@@ -777,7 +777,7 @@ pub(super) fn try_handle_client_early(
                                 conn.tracking_state.invalidation_tx = Some(tx.clone());
                                 conn.tracking_rx = Some(rx);
 
-                                let mut table = ctx.tracking_table.borrow_mut();
+                                let mut table = ctx.tracking_table.lock();
                                 table.register_client(client_id, tx);
                                 if let Some(target) = config_parsed.redirect {
                                     table.set_redirect(client_id, target);
@@ -793,7 +793,7 @@ pub(super) fn try_handle_client_early(
                             responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
                         } else {
                             conn.tracking_state = TrackingState::default();
-                            ctx.tracking_table.borrow_mut().untrack_all(client_id);
+                            ctx.tracking_table.lock().untrack_all(client_id);
                             conn.tracking_rx = None;
                             responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
                         }
@@ -1322,6 +1322,26 @@ pub(super) async fn try_handle_cross_shard_commands(
         // barrier failure; only successful writes join the barrier set.
         if local_barrier_pending && !matches!(response, Frame::Error(_)) {
             local_leg_write_idxs.push(responses.len());
+        }
+        // CLIENT TRACKING: multi-key writes (DEL/MSET/UNLINK/…) invalidate
+        // every key; multi-key reads (MGET) by a tracking client register
+        // every key.
+        if !matches!(response, Frame::Error(_)) {
+            crate::tracking::invalidation::invalidate_after_write(
+                &ctx.tracking_table,
+                cmd,
+                cmd_args,
+                conn.client_id,
+            );
+            if conn.tracking_state.enabled && !conn.tracking_state.bcast {
+                crate::tracking::invalidation::track_read_keys(
+                    &ctx.tracking_table,
+                    cmd,
+                    cmd_args,
+                    conn.client_id,
+                    conn.tracking_state.noloop,
+                );
+            }
         }
         responses.push(response);
         return true;

@@ -1094,7 +1094,9 @@ pub async fn handle_connection(
                             break;
                         }
                         // PUBLISH
-                        if cmd.eq_ignore_ascii_case(b"PUBLISH") {
+                        // C2 fix: inside MULTI, PUBLISH must fall through to
+                        // the queue instead of executing immediately.
+                        if !conn.in_multi && cmd.eq_ignore_ascii_case(b"PUBLISH") {
                             if cmd_args.len() != 2 {
                                 responses.push(Frame::Error(
                                     Bytes::from_static(b"ERR wrong number of arguments for 'publish' command"),
@@ -1154,12 +1156,25 @@ pub async fn handle_connection(
                                 ));
                             } else {
                                 conn.in_multi = false;
-                                let (result, txn_aof_entries) = execute_transaction(
+                                let mut exec_publishes: Vec<(usize, Bytes, Bytes)> = Vec::new();
+                                let (mut result, txn_aof_entries) = execute_transaction(
                                     &db,
                                     &conn.command_queue,
                                     &conn.watched_keys,
                                     &mut conn.selected_db,
+                                    &mut exec_publishes,
                                 );
+                                // C2: fan out PUBLISHes queued in the txn only
+                                // now — after the transaction body — and patch
+                                // their placeholders with the receiver count.
+                                for (inner, ch, msg) in exec_publishes.drain(..) {
+                                    let count = pubsub_registry.lock().publish(&ch, &msg);
+                                    if let Frame::Array(items) = &mut result {
+                                        if inner < items.len() {
+                                            items[inner] = Frame::Integer(count);
+                                        }
+                                    }
+                                }
                                 // Auto-index HSETs from the transaction
                                 if let Some(ref vs) = vector_store {
                                     if let Frame::Array(ref txn_results) = result {
@@ -1959,11 +1974,19 @@ pub async fn handle_connection(
                                     DispatchResult::Response(f) => (f, false),
                                     DispatchResult::Quit(f) => (f, true),
                                 };
-                                // Track key on read for client-side caching invalidation
-                                if conn.tracking_state.enabled && !conn.tracking_state.bcast {
-                                    if let Some(key) = d_args.first().and_then(|f| extract_bytes(f)) {
-                                        tracking_table.lock().track_key(client_id, &key, conn.tracking_state.noloop);
-                                    }
+                                // Track EVERY key of a successful read for
+                                // client-side caching invalidation.
+                                if conn.tracking_state.enabled
+                                    && !conn.tracking_state.bcast
+                                    && !matches!(response, Frame::Error(_))
+                                {
+                                    crate::tracking::invalidation::track_read_keys(
+                                        &tracking_table,
+                                        d_cmd,
+                                        d_args,
+                                        client_id,
+                                        conn.tracking_state.noloop,
+                                    );
                                 }
                                 // Apply RESP3 response conversion if needed
                                 let response = apply_resp3_conversion(d_cmd, response, proto);
@@ -2351,16 +2374,22 @@ pub async fn handle_connection(
                                     }
                                 }
 
-                                // Invalidate tracked key on successful write
+                                // Invalidate EVERY tracked key of a successful
+                                // write (multi-key writes included), from any
+                                // writer — gated by tracking_active().
                                 if !matches!(&response, Frame::Error(_)) {
-                                    if let Some(key) = d_args.first().and_then(|f| extract_bytes(f)) {
-                                        let senders = tracking_table.lock().invalidate_key(&key, client_id);
-                                        if !senders.is_empty() {
-                                            let push = crate::tracking::invalidation::invalidation_push(&[key]);
-                                            for tx in senders {
-                                                let _ = tx.try_send(push.clone());
-                                            }
-                                        }
+                                    crate::tracking::invalidation::invalidate_after_write(
+                                        &tracking_table,
+                                        d_cmd,
+                                        d_args,
+                                        client_id,
+                                    );
+                                    if d_cmd.eq_ignore_ascii_case(b"FLUSHALL")
+                                        || d_cmd.eq_ignore_ascii_case(b"FLUSHDB")
+                                    {
+                                        crate::tracking::invalidation::invalidate_flush(
+                                            &tracking_table,
+                                        );
                                     }
                                     if let Some(bytes) = aof_bytes {
                                         aof_entries.push((resp_idx, bytes.clone()));

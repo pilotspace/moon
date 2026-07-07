@@ -125,6 +125,7 @@ pub(crate) fn execute_transaction(
     command_queue: &[Frame],
     watched_keys: &HashMap<Bytes, u32>,
     selected_db: &mut usize,
+    exec_publishes: &mut Vec<(usize, Bytes, Bytes)>,
 ) -> (Frame, Vec<Bytes>) {
     let mut guard = db[*selected_db].write();
     let db_count = db.len();
@@ -153,6 +154,12 @@ pub(crate) fn execute_transaction(
                 continue;
             }
         };
+
+        // C2: PUBLISH queued inside MULTI — defer fan-out to the caller so it
+        // happens after the transaction body (see execute_transaction_sharded).
+        if queue_exec_publish(cmd, cmd_args, &mut results, exec_publishes) {
+            continue;
+        }
 
         // Check if this is a write command for AOF logging
         let is_write = metadata::is_write(cmd);
@@ -195,6 +202,7 @@ pub(crate) fn execute_transaction_sharded(
     command_queue: &[Frame],
     selected_db: usize,
     cached_clock: &CachedClock,
+    exec_publishes: &mut Vec<(usize, Bytes, Bytes)>,
 ) -> Frame {
     let db_count = shard_databases.db_count();
 
@@ -211,6 +219,14 @@ pub(crate) fn execute_transaction_sharded(
                 continue;
             }
         };
+
+        // C2: PUBLISH is a connection-plane command — the keyspace dispatch
+        // table can't run it. Record it for the caller to fan out AFTER the
+        // transaction body (all preceding writes applied first) and leave a
+        // placeholder the caller patches with the receiver count.
+        if queue_exec_publish(cmd, cmd_args, &mut results, exec_publishes) {
+            continue;
+        }
 
         let result = crate::shard::slice::with_shard_db(selected, |db| {
             db.refresh_now_from_cache(cached_clock);
@@ -269,6 +285,95 @@ pub(crate) fn execute_transaction_sharded(
     }
 
     Frame::Array(results.into())
+}
+
+/// Shared PUBLISH-inside-MULTI intercept for both transaction executors (C2).
+///
+/// Returns `true` when `cmd` is PUBLISH: pushes a `Frame::Integer(0)`
+/// placeholder (or an arity error) into `results` and records
+/// `(result_index, channel, message)` in `exec_publishes` so the caller can
+/// fan the message out AFTER the transaction body and patch the placeholder
+/// with the real receiver count.
+fn queue_exec_publish(
+    cmd: &[u8],
+    cmd_args: &[Frame],
+    results: &mut Vec<Frame>,
+    exec_publishes: &mut Vec<(usize, Bytes, Bytes)>,
+) -> bool {
+    if !cmd.eq_ignore_ascii_case(b"PUBLISH") {
+        return false;
+    }
+    if cmd_args.len() != 2 {
+        results.push(Frame::Error(Bytes::from_static(
+            b"ERR wrong number of arguments for 'publish' command",
+        )));
+        return true;
+    }
+    match (
+        super::util::extract_bytes(&cmd_args[0]),
+        super::util::extract_bytes(&cmd_args[1]),
+    ) {
+        (Some(ch), Some(msg)) => {
+            exec_publishes.push((results.len(), ch, msg));
+            results.push(Frame::Integer(0)); // patched by the caller post-txn
+        }
+        _ => results.push(Frame::Error(Bytes::from_static(
+            b"ERR invalid channel or message",
+        ))),
+    }
+    true
+}
+
+/// Fan out one EXEC-queued PUBLISH (C2): local shard synchronously, remote
+/// shards via targeted `PubSubPublish` SPSC messages, awaited so the returned
+/// count matches the immediate-PUBLISH path. Called by the sharded handlers
+/// after `execute_transaction_sharded` returns — i.e. after every write queued
+/// before the PUBLISH has been applied.
+pub(crate) async fn publish_post_txn(
+    ctx: &super::core::ConnectionContext,
+    channel: &Bytes,
+    message: &Bytes,
+) -> i64 {
+    use crate::shard::mesh::ChannelMesh;
+    use ringbuf::traits::Producer;
+
+    let local_count = crate::pubsub::publish_shared(&ctx.pubsub_registry, channel, message);
+    let remote_targets: Vec<usize> = ctx
+        .remote_subscriber_map
+        .read()
+        .target_shards(channel)
+        .into_iter()
+        .filter(|&t| t != ctx.shard_id)
+        .collect();
+    if remote_targets.is_empty() {
+        return local_count;
+    }
+
+    let slot = Arc::new(crate::shard::dispatch::PubSubResponseSlot::new(
+        remote_targets.len() as u32,
+    ));
+    {
+        let mut producers = ctx.dispatch_tx.borrow_mut();
+        for target in &remote_targets {
+            let msg = crate::shard::dispatch::ShardMessage::PubSubPublish(Box::new(
+                crate::shard::dispatch::PubSubPublishPayload {
+                    channel: channel.clone(),
+                    message: message.clone(),
+                    slot: slot.clone(),
+                },
+            ));
+            let idx = ChannelMesh::target_index(ctx.shard_id, *target);
+            if producers[idx].try_push(msg).is_ok() {
+                ctx.spsc_notifiers[*target].notify_one();
+            } else {
+                // Ring full: count this target as delivered-to-zero rather
+                // than hanging the EXEC reply (mirrors the batch-flush path).
+                slot.add(0);
+            }
+        }
+    }
+    crate::shard::dispatch::PubSubResponseFuture::new(slot.clone()).await;
+    local_count + slot.get()
 }
 
 /// Extract the primary key from a parsed command for shard routing.

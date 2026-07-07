@@ -370,12 +370,12 @@ mod tests {
 
     #[test]
     fn test_pubsub_fanout_via_spsc() {
-        let mut pubsub = PubSubRegistry::new();
+        let pubsub = parking_lot::RwLock::new(PubSubRegistry::new());
         let (shard_databases, _inits) = ShardDatabases::new(vec![vec![Database::new()]]);
 
         let (tx, rx) = rt_channel::mpsc_bounded::<Bytes>(16);
         let sub = Subscriber::new(tx, 42);
-        pubsub.subscribe(Bytes::from_static(b"news"), sub);
+        pubsub.write().subscribe(Bytes::from_static(b"news"), sub);
 
         let rb = HeapRb::new(64);
         let (mut prod, cons) = rb.split();
@@ -399,7 +399,7 @@ mod tests {
         spsc_handler::drain_spsc_shared(
             &shard_databases,
             &mut [cons],
-            &mut pubsub,
+            &pubsub,
             &blocking,
             &mut pending_snap,
             &mut snap_state,
@@ -436,7 +436,7 @@ mod tests {
 
     #[test]
     fn test_drain_spsc_respects_limit() {
-        let mut pubsub = PubSubRegistry::new();
+        let pubsub = parking_lot::RwLock::new(PubSubRegistry::new());
         let (shard_databases, _inits) = ShardDatabases::new(vec![vec![Database::new()]]);
 
         let rb = HeapRb::new(512);
@@ -464,7 +464,7 @@ mod tests {
         spsc_handler::drain_spsc_shared(
             &shard_databases,
             &mut [cons],
-            &mut pubsub,
+            &pubsub,
             &blocking,
             &mut pending_snap,
             &mut snap_state,

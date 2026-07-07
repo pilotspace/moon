@@ -451,7 +451,7 @@ pub(super) fn try_handle_publish(
         }
         match (channel_arg, message_arg) {
             (Some(ch), Some(msg)) => {
-                let local_count = { ctx.pubsub_registry.write().publish(&ch, &msg) };
+                let local_count = crate::pubsub::publish_shared(&ctx.pubsub_registry, &ch, &msg);
                 // Targeted fanout: only send to shards that have subscribers
                 let targets = ctx.remote_subscriber_map.read().target_shards(&ch);
                 if targets.is_empty() {

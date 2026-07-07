@@ -518,6 +518,7 @@ pub(super) fn try_handle_multi_exec(
     conn: &mut ConnectionState,
     ctx: &ConnectionContext,
     responses: &mut Vec<Frame>,
+    exec_publishes: &mut Vec<(usize, Bytes, Bytes)>,
 ) -> bool {
     // --- MULTI ---
     if cmd.eq_ignore_ascii_case(b"MULTI") {
@@ -547,6 +548,7 @@ pub(super) fn try_handle_multi_exec(
                 &conn.command_queue,
                 conn.selected_db,
                 &ctx.cached_clock,
+                exec_publishes,
             );
             conn.command_queue.clear();
             responses.push(result);
