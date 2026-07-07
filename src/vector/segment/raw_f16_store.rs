@@ -70,11 +70,12 @@ impl RawF16Store {
             // (e.g. a segment with zero live vectors) needs no mapping.
             return Ok(Some(Self::Owned(Vec::new())));
         }
-        // SAFETY: `path` is `raw_f16.bin` inside a `segment-{id}` directory.
-        // It is written exactly once by `write_segment_files` and only made
+        // `path` is `raw_f16.bin` inside a `segment-{id}` directory. It is
+        // written exactly once by `write_segment_files` and only made
         // visible via the staged-dir -> final-dir atomic rename in
         // `write_immutable_segment_staged` (see module docs for the full
         // seal contract, including why a racing GC removal is also safe).
+        // SAFETY: read-only map of a sealed, write-once file (see above).
         let mmap = unsafe { Mmap::map(&file) }?;
         Ok(Some(Self::Mapped {
             mmap,
@@ -118,19 +119,18 @@ impl RawF16Store {
         match self {
             Self::Owned(v) => v,
             Self::Mapped { mmap, len } => {
-                // SAFETY: `mmap` maps exactly `len * 2` bytes of a file
-                // written as `len` little-endian `u16` halves (see
+                // `mmap` maps exactly `len * 2` bytes of a file written as
+                // `len` little-endian `u16` halves (see
                 // `write_segment_files`'s `h.to_le_bytes()` loop in
                 // segment_io.rs). Moon's only target architectures
                 // (x86_64, aarch64 — see CLAUDE.md "Target Platform") are
                 // little-endian, so a native `u16` read reproduces exactly
                 // the value the writer encoded; there is no target where
-                // this would silently byte-swap. `mmap.as_ptr()` is the base
-                // of a kernel-provided mapping, always page-aligned
-                // (>= 4096 bytes), which trivially satisfies `u16`'s 2-byte
-                // alignment — no unaligned-read UB is possible. This mirrors
-                // the identical `from_raw_parts` reinterpret pattern already
-                // used for mmap'd CSR arrays in `crate::graph::csr::mmap`.
+                // this would silently byte-swap. This mirrors the identical
+                // `from_raw_parts` reinterpret pattern already used for
+                // mmap'd CSR arrays in `crate::graph::csr::mmap`.
+                // SAFETY: kernel mappings are page-aligned (satisfies u16's
+                // 2-byte alignment); length verified at map time (above).
                 unsafe { std::slice::from_raw_parts(mmap.as_ptr().cast::<u16>(), *len) }
             }
         }
