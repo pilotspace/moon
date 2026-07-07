@@ -675,13 +675,27 @@ pub fn graph_query_write(store: &mut GraphStore, args: &[Frame]) -> Frame {
                         properties.as_ref(),
                     ));
             }
-            // Phase 174 FIX-01: SET/DELETE/MERGE records are only relevant
-            // for TXN rollback (handled in graph_query_or_write). The non-txn
-            // path here does not need WAL records for these — the write_buf
-            // mutation is already durable via the forward WAL.
-            cypher::executor::MutationRecord::SetProperty { .. }
-            | cypher::executor::MutationRecord::DeleteNode { .. }
-            | cypher::executor::MutationRecord::DeleteEdge { .. } => {}
+            // W2-2: DELETEs must be WAL-logged or the entity RESURRECTS at
+            // restart (replay re-adds it from its CreateNode/AddNode record;
+            // frozen-tier tombstones are pure write-buf state otherwise).
+            cypher::executor::MutationRecord::DeleteNode { node_id, .. } => {
+                store
+                    .wal_pending
+                    .push(crate::graph::wal::serialize_remove_node(
+                        graph_name, *node_id,
+                    ));
+            }
+            cypher::executor::MutationRecord::DeleteEdge { edge_id, .. } => {
+                store
+                    .wal_pending
+                    .push(crate::graph::wal::serialize_remove_edge(
+                        graph_name, *edge_id,
+                    ));
+            }
+            // SET has no WAL record format yet — a restart replays the
+            // original ADDNODE property state (known durability gap, tracked
+            // as a wave-2 follow-up).
+            cypher::executor::MutationRecord::SetProperty { .. } => {}
         }
     }
 
@@ -951,12 +965,23 @@ pub fn graph_query_or_write(
                         node_id: *node_id,
                         delete_lsn: lsn,
                     });
+                    // W2-2: WAL the delete or it resurrects at restart.
+                    store
+                        .wal_pending
+                        .push(crate::graph::wal::serialize_remove_node(
+                            graph_name, *node_id,
+                        ));
                 }
                 cypher::executor::MutationRecord::DeleteEdge { edge_id, .. } => {
                     undo_ops.push(crate::transaction::GraphUndoOp::UndeleteEdge {
                         graph_name: gname_bytes.clone(),
                         edge_id: *edge_id,
                     });
+                    store
+                        .wal_pending
+                        .push(crate::graph::wal::serialize_remove_edge(
+                            graph_name, *edge_id,
+                        ));
                 }
             }
         }

@@ -533,6 +533,15 @@ impl MemGraph {
             .filter(|(_, e)| e.deleted_lsn == u64::MAX)
     }
 
+    /// Iterate over all soft-deleted nodes in insertion order (copy-up
+    /// tombstone bookkeeping at freeze time).
+    pub fn iter_dead_nodes(&self) -> impl Iterator<Item = (NodeKey, &MutableNode)> {
+        self.node_order
+            .iter()
+            .filter_map(move |k| self.nodes.get(k).map(|n| (*k, n)))
+            .filter(|(_, n)| n.deleted_lsn != u64::MAX)
+    }
+
     /// Number of live (non-deleted) nodes. O(1) via maintained counter.
     pub fn node_count(&self) -> usize {
         self.live_node_count

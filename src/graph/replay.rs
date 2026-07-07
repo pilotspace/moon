@@ -560,6 +560,15 @@ impl GraphReplayCollector {
                         if let Some(nk) = node_map.get(node_id).copied() {
                             if mg.remove_node(nk, 0) {
                                 *replayed += 1;
+                            } else if mg.get_node(nk).is_none() {
+                                // CSR-resident node (copy-up delete, W2-2):
+                                // materialize a tombstone shadow so the frozen
+                                // row stays hidden after replay.
+                                if crate::graph::store::copy_up_into(&mut mg, &immutable, nk)
+                                    && mg.remove_node(nk, 0)
+                                {
+                                    *replayed += 1;
+                                }
                             }
                         }
                     }
@@ -928,6 +937,47 @@ mod tests {
             new_key.data().as_ffi() > n1,
             "new ids must be allocated above the replayed high-water mark"
         );
+    }
+
+    /// W2-2 copy-up delete: a WAL REMOVENODE whose target lives in a
+    /// frozen CSR segment must materialize a TOMBSTONE shadow in write_buf
+    /// (the frozen row itself is immutable).
+    #[test]
+    fn test_replay_removenode_on_frozen_node_creates_tombstone() {
+        use slotmap::Key;
+        let mut store = GraphStore::new();
+        store
+            .create_graph(Bytes::from_static(b"g"), 4, 0)
+            .expect("create");
+        let g = store.get_graph_mut(b"g").expect("graph");
+        let a = g.write_buf.add_node(
+            smallvec::smallvec![1u16],
+            smallvec::SmallVec::new(),
+            None,
+            1,
+        );
+        let b = g.write_buf.add_node(
+            smallvec::smallvec![1u16],
+            smallvec::SmallVec::new(),
+            None,
+            1,
+        );
+        g.write_buf.add_edge(a, b, 0, 1.0, None, 2).expect("edge");
+        assert!(g.freeze_and_compact(10), "freeze must succeed");
+        assert!(g.write_buf.get_node(a).is_none(), "freeze drains node a");
+
+        let mut collector = GraphReplayCollector::new();
+        let id = a.data().as_ffi().to_string();
+        assert!(collector.collect_command(b"GRAPH.REMOVENODE", &[b"g", id.as_bytes()]));
+        let replayed = collector.replay_into(&mut store);
+        assert_eq!(replayed, 1, "REMOVENODE of a frozen node must replay");
+
+        let g = store.get_graph(b"g").expect("graph");
+        let shadow = g
+            .write_buf
+            .get_node(a)
+            .expect("tombstone shadow must exist in write_buf");
+        assert_ne!(shadow.deleted_lsn, u64::MAX, "shadow must be soft-deleted");
     }
 
     #[test]

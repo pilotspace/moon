@@ -73,10 +73,28 @@ impl NamedGraph {
 
     /// Freeze the current MemGraph, convert to CSR, and push the new immutable
     /// segment into the segment holder. Thaws write_buf in place afterwards
-    /// (same slot maps — see key-uniqueness note below).
+    /// (id-allocation cursors are monotonic — see key-uniqueness note below).
     ///
     /// Returns `true` if compaction succeeded, `false` if freeze/CSR build failed.
     pub fn freeze_and_compact(&mut self, lsn: u64) -> bool {
+        // Copy-up tombstones (dead write-buf nodes that shadow a frozen CSR
+        // row) must survive the freeze: freeze() drops dead nodes, which
+        // would RESURRECT the underlying frozen row. Collect them now and
+        // re-materialize after the thaw.
+        let dead_shadows: Vec<(crate::graph::types::NodeKey, u64)> = {
+            let seg_list = self.segments.load();
+            self.write_buf
+                .iter_dead_nodes()
+                .filter(|(k, _)| {
+                    seg_list
+                        .immutable
+                        .iter()
+                        .any(|s| s.lookup_node(*k).is_some())
+                })
+                .map(|(k, n)| (k, n.deleted_lsn))
+                .collect()
+        };
+
         // Freeze: drains all live nodes/edges from write_buf.
         let frozen = match self.write_buf.freeze() {
             Ok(f) => f,
@@ -88,15 +106,15 @@ impl NamedGraph {
         // per write attempt would churn the segment list.
         if frozen.nodes.is_empty() && frozen.edges.is_empty() {
             self.write_buf.thaw();
+            self.restore_dead_shadows(&dead_shadows);
             return false;
         }
 
         // Convert frozen MemGraph to a CSR segment. Either way, thaw the
-        // drained write_buf IN PLACE — reusing the slot maps keeps SlotMap
-        // generation continuity, so post-freeze NodeKeys can never collide
-        // with the external_ids of frozen CSR rows (a fresh MemGraph would
-        // restart allocation at the same keys and alias new nodes onto
-        // frozen rows).
+        // drained write_buf IN PLACE — the monotonic id cursors are never
+        // reset, so post-freeze NodeKeys can never collide with the
+        // external_ids of frozen CSR rows (a fresh MemGraph would restart
+        // allocation at the same keys and alias new nodes onto frozen rows).
         let ok = match CsrSegment::from_frozen(frozen, lsn) {
             Ok(csr) => {
                 self.segments.add_immutable(csr);
@@ -107,8 +125,89 @@ impl NamedGraph {
             Err(_) => false,
         };
         self.write_buf.thaw();
+        self.restore_dead_shadows(&dead_shadows);
         ok
     }
+
+    /// Re-materialize copy-up tombstones after a freeze drained them:
+    /// copy the frozen row's data back into the write buffer, then re-delete
+    /// it at its ORIGINAL deletion LSN (preserves MVCC time-travel).
+    fn restore_dead_shadows(&mut self, dead_shadows: &[(crate::graph::types::NodeKey, u64)]) {
+        if dead_shadows.is_empty() {
+            return;
+        }
+        let seg_list = self.segments.load();
+        for &(key, deleted_lsn) in dead_shadows {
+            if copy_up_into(&mut self.write_buf, &seg_list.immutable, key) {
+                self.write_buf.remove_node(key, deleted_lsn);
+            }
+        }
+    }
+
+    /// Copy a frozen node's data into the write buffer under the SAME key so
+    /// it can be mutated in place ("copy-up"). No-op if the key is already
+    /// resident. Returns `false` when the key is not in any segment or the
+    /// frozen row is itself deleted.
+    ///
+    /// The shadow takes read precedence over the frozen row everywhere
+    /// (`MergedNodeView` and `SegmentMergeReader` check the mutable tier
+    /// first), so a later soft-delete of the shadow tombstones the frozen row.
+    pub fn copy_up_node(&mut self, key: crate::graph::types::NodeKey) -> bool {
+        if self.write_buf.get_node(key).is_some() {
+            return true;
+        }
+        let seg_list = self.segments.load();
+        copy_up_into(&mut self.write_buf, &seg_list.immutable, key)
+    }
+}
+
+/// Shared copy-up core: materialize `key`'s newest frozen row (labels,
+/// properties, embedding, MVCC stamps) into `write_buf` under the same key.
+/// Used by [`NamedGraph::copy_up_node`] and WAL replay (which owns the
+/// MemGraph outside the graph during replay).
+pub(crate) fn copy_up_into(
+    write_buf: &mut crate::graph::memgraph::MemGraph,
+    segments: &[std::sync::Arc<crate::graph::csr::CsrStorage>],
+    key: crate::graph::types::NodeKey,
+) -> bool {
+    use slotmap::Key;
+    if write_buf.get_node(key).is_some() {
+        return true;
+    }
+    // Newest segment wins (same precedence as MergedNodeView::segment_row;
+    // the list is ordered newest-first).
+    for seg in segments.iter() {
+        let Some(row) = seg.lookup_node(key) else {
+            continue;
+        };
+        let Some(meta) = seg.node_meta().get(row as usize) else {
+            continue;
+        };
+        if meta.deleted_lsn != u64::MAX {
+            return false;
+        }
+        let (created_lsn, valid_from, valid_to) =
+            (meta.created_lsn, meta.valid_from, meta.valid_to);
+        // Decode labels: bitmap (ids 0-31) + sparse overflow (ids >= 32).
+        let mut labels: smallvec::SmallVec<[u16; 4]> = smallvec::SmallVec::new();
+        let mut bm = meta.label_bitmap;
+        while bm != 0 {
+            labels.push(bm.trailing_zeros() as u16);
+            bm &= bm - 1;
+        }
+        if let Some(extra) = seg.label_overflow().get(&row) {
+            labels.extend_from_slice(extra);
+        }
+        let props = seg.node_properties(row);
+        let embedding = seg.node_embedding(row);
+        write_buf.add_node_with_id(key.data().as_ffi(), labels, props, embedding, created_lsn);
+        if let Some(n) = write_buf.get_node_mut(key) {
+            n.valid_from = valid_from;
+            n.valid_to = valid_to;
+        }
+        return true;
+    }
+    false
 }
 
 /// Per-shard graph store. No Arc, no Mutex -- fully owned by shard thread.

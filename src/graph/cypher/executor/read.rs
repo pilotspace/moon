@@ -87,7 +87,10 @@ fn index_scan_keys(
         }
     }
 
-    // Frozen tier: bitmap intersection per segment.
+    // Frozen tier: bitmap intersection per segment. `emitted` dedups keys a
+    // re-frozen copy-up shadow left in multiple segments (stale-index hits
+    // are dropped by the planner's residual Filter downstream).
+    let mut emitted = crate::graph::fasthash::FxHashSet::default();
     for seg in csr_segs {
         let mut bm: Option<roaring::RoaringBitmap> = None;
         for (pid, pv) in &targets {
@@ -126,7 +129,17 @@ fn index_scan_keys(
             ) {
                 continue;
             }
-            keys.push(NodeKey::from(slotmap::KeyData::from_ffi(meta.external_id)));
+            let key = NodeKey::from(slotmap::KeyData::from_ffi(meta.external_id));
+            // Copy-up shadow (W2-2): the mutable tier overrides this row —
+            // a live shadow was already scanned above (with its CURRENT
+            // property values); a dead shadow is a tombstone.
+            if memgraph.get_node(key).is_some() {
+                continue;
+            }
+            if !emitted.insert(key) {
+                continue;
+            }
+            keys.push(key);
         }
     }
 

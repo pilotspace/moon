@@ -14,6 +14,14 @@ pub fn execute_mut(
 ) -> Result<ExecResult, ExecError> {
     let start = std::time::Instant::now();
 
+    // Frozen CSR segments, cloned once (cheap Arc clones): the write path
+    // must SEE the frozen tier (scans/expands/filters) so SET/DELETE/MERGE
+    // can copy-up frozen rows instead of silently missing them. No freeze
+    // can run mid-query (freeze_and_compact is only driven by the ADDEDGE
+    // handler), so a snapshot at entry is safe.
+    let csr_segs: Vec<std::sync::Arc<crate::graph::csr::CsrStorage>> =
+        graph.segments.load().immutable.clone();
+
     let slot_table = SlotTable::from_plan(plan);
     let empty_table = SlotTable::default();
     let empty_row = Row::seed(&empty_table);
@@ -27,24 +35,25 @@ pub fn execute_mut(
 
     for op in &plan.operators {
         match op {
-            // The write path matches against the MUTABLE tier only (write
-            // operators mutate MutableNode in place; SET/DELETE on frozen
-            // rows is a separate copy-up design — known follow-up). The
-            // IndexScan arm therefore degrades to the same label scan; the
-            // residual Filter the planner emits keeps results exact.
+            // W2-2 copy-up: the write path scans BOTH tiers so SET/DELETE/
+            // MERGE can target frozen rows (the mutation arms copy the row
+            // up into the write buffer first). The IndexScan arm degrades to
+            // the same label scan; the residual Filter the planner emits
+            // keeps results exact.
             PhysicalOp::NodeScan { variable, label }
             | PhysicalOp::IndexScan {
                 variable, label, ..
             } => {
                 let label_id = label.as_ref().map(|l| label_to_id(l.as_bytes()));
-                let mut new_rows = Vec::new();
+                let committed = roaring::RoaringBitmap::new();
+                let view = crate::graph::view::MergedNodeView::new(&graph.write_buf, &csr_segs);
+                let mut keys = Vec::new();
+                view.for_each_visible_node(label_id, u64::MAX, 0, &committed, None, |k| {
+                    keys.push(k)
+                });
+                let mut new_rows = Vec::with_capacity(rows.len() * keys.len());
                 for row in &rows {
-                    for (key, node) in graph.write_buf.iter_nodes() {
-                        if let Some(lid) = label_id {
-                            if !node.labels.contains(&lid) {
-                                continue;
-                            }
-                        }
+                    for &key in &keys {
                         let mut new_row = row.clone();
                         new_row.insert(variable, Value::Node(key));
                         new_rows.push(new_row);
@@ -73,6 +82,25 @@ pub fn execute_mut(
                     EdgeDirection::Both => Direction::Both,
                 };
 
+                // Merge reader: mutable adjacency + frozen CSR edges, so
+                // MATCH...SET/DELETE finds frozen endpoints. (Frozen edges
+                // carry a placeholder EdgeKey — SET/DELETE on a frozen EDGE
+                // stays a no-op; nodes are the copy-up unit.)
+                let edge_type_filter = if type_ids.len() == 1 {
+                    Some(type_ids[0])
+                } else {
+                    None
+                };
+                let reader = crate::graph::traversal::SegmentMergeReader::new(
+                    Some(&graph.write_buf),
+                    &csr_segs,
+                    dir,
+                    u64::MAX,
+                    edge_type_filter,
+                );
+                let mut nb_seen = crate::graph::fasthash::FxHashSet::default();
+                let mut nb_buf: Vec<crate::graph::traversal::MergedNeighbor> = Vec::new();
+
                 let mut new_rows = Vec::new();
                 for row in &rows {
                     let src_key = match row.get(source) {
@@ -81,23 +109,18 @@ pub fn execute_mut(
                     };
 
                     if *max_hops <= 1 {
-                        for (edge_key, neighbor_key) in
-                            graph.write_buf.neighbors(src_key, dir, u64::MAX)
-                        {
-                            if !type_ids.is_empty() {
-                                if let Some(edge) = graph.write_buf.get_edge(edge_key) {
-                                    if !type_ids.contains(&edge.edge_type) {
-                                        continue;
-                                    }
-                                }
+                        reader.neighbors_into(src_key, &mut nb_seen, &mut nb_buf);
+                        for merged in &nb_buf {
+                            if type_ids.len() > 1 && !type_ids.contains(&merged.edge_type) {
+                                continue;
                             }
                             let mut new_row = row.clone();
-                            new_row.insert(target, Value::Node(neighbor_key));
+                            new_row.insert(target, Value::Node(merged.node));
                             // Phase 174 FIX-01: bind edge variable so DELETE r
                             // can reference it. Previously ignored (`_`), which
                             // made `DELETE r` a silent no-op.
                             if let Some(evar) = edge_variable {
-                                new_row.insert(evar, Value::Edge(edge_key));
+                                new_row.insert(evar, Value::Edge(merged.edge));
                             }
                             new_rows.push(new_row);
                         }
@@ -115,18 +138,14 @@ pub fn execute_mut(
                         for hop in 1..=capped_max_hops {
                             let mut next_frontier = Vec::new();
                             for &current in &frontier {
-                                for (edge_key, neighbor_key) in
-                                    graph.write_buf.neighbors(current, dir, u64::MAX)
-                                {
+                                reader.neighbors_into(current, &mut nb_seen, &mut nb_buf);
+                                for merged in &nb_buf {
+                                    let neighbor_key = merged.node;
                                     if visited.contains(&neighbor_key) {
                                         continue;
                                     }
-                                    if !type_ids.is_empty() {
-                                        if let Some(edge) = graph.write_buf.get_edge(edge_key) {
-                                            if !type_ids.contains(&edge.edge_type) {
-                                                continue;
-                                            }
-                                        }
+                                    if type_ids.len() > 1 && !type_ids.contains(&merged.edge_type) {
+                                        continue;
                                     }
                                     visited.insert(neighbor_key);
                                     next_frontier.push(neighbor_key);
@@ -157,7 +176,15 @@ pub fn execute_mut(
             PhysicalOp::Filter { expr } => {
                 rows.retain(|row| {
                     matches!(
-                        eval_expr(expr, row, &graph.write_buf, params, &[], 0, None),
+                        eval_expr(
+                            expr,
+                            row,
+                            &graph.write_buf,
+                            params,
+                            &csr_segs,
+                            u64::MAX,
+                            None
+                        ),
                         Value::Bool(true)
                     )
                 });
@@ -193,8 +220,8 @@ pub fn execute_mut(
                                         row,
                                         &graph.write_buf,
                                         params,
-                                        &[],
-                                        0,
+                                        &csr_segs,
+                                        u64::MAX,
                                         None,
                                     )
                                 }
@@ -242,8 +269,24 @@ pub fn execute_mut(
                 } else {
                     rows.sort_by(|a, b| {
                         for (expr, ascending) in items {
-                            let va = eval_expr(expr, a, &graph.write_buf, params, &[], 0, None);
-                            let vb = eval_expr(expr, b, &graph.write_buf, params, &[], 0, None);
+                            let va = eval_expr(
+                                expr,
+                                a,
+                                &graph.write_buf,
+                                params,
+                                &csr_segs,
+                                u64::MAX,
+                                None,
+                            );
+                            let vb = eval_expr(
+                                expr,
+                                b,
+                                &graph.write_buf,
+                                params,
+                                &csr_segs,
+                                u64::MAX,
+                                None,
+                            );
                             let ord = compare_values(&va, &vb);
                             let ord = if *ascending { ord } else { ord.reverse() };
                             if ord != std::cmp::Ordering::Equal {
@@ -256,7 +299,15 @@ pub fn execute_mut(
             }
 
             PhysicalOp::Limit { count } => {
-                let n = match eval_expr(count, &empty_row, &graph.write_buf, params, &[], 0, None) {
+                let n = match eval_expr(
+                    count,
+                    &empty_row,
+                    &graph.write_buf,
+                    params,
+                    &csr_segs,
+                    u64::MAX,
+                    None,
+                ) {
                     Value::Int(n) if n >= 0 => n as usize,
                     _ => 0,
                 };
@@ -268,7 +319,15 @@ pub fn execute_mut(
             }
 
             PhysicalOp::Skip { count } => {
-                let n = match eval_expr(count, &empty_row, &graph.write_buf, params, &[], 0, None) {
+                let n = match eval_expr(
+                    count,
+                    &empty_row,
+                    &graph.write_buf,
+                    params,
+                    &csr_segs,
+                    u64::MAX,
+                    None,
+                ) {
                     Value::Int(n) if n >= 0 => n as usize,
                     _ => 0,
                 };
@@ -288,7 +347,15 @@ pub fn execute_mut(
             PhysicalOp::Unwind { expr, alias } => {
                 let mut new_rows = Vec::new();
                 for row in &rows {
-                    let val = eval_expr(expr, row, &graph.write_buf, params, &[], 0, None);
+                    let val = eval_expr(
+                        expr,
+                        row,
+                        &graph.write_buf,
+                        params,
+                        &csr_segs,
+                        u64::MAX,
+                        None,
+                    );
                     if let Value::List(items) = val {
                         for item in items {
                             let mut new_row = row.clone();
@@ -322,8 +389,8 @@ pub fn execute_mut(
                                         &new_row,
                                         &graph.write_buf,
                                         params,
-                                        &[],
-                                        0,
+                                        &csr_segs,
+                                        u64::MAX,
                                         None,
                                     );
                                     value_to_property_value(&val)
@@ -395,12 +462,15 @@ pub fn execute_mut(
                                         row,
                                         &graph.write_buf,
                                         params,
-                                        &[],
-                                        0,
+                                        &csr_segs,
+                                        u64::MAX,
                                         None,
                                     );
                                     if let Some(pv) = value_to_property_value(&val) {
                                         let pid = label_to_id(property.as_bytes());
+                                        // W2-2: frozen target → copy the row up
+                                        // into the write buffer, then mutate.
+                                        graph.copy_up_node(*nk);
                                         if let Some(node) = graph.write_buf.get_node_mut(*nk) {
                                             // Phase 174 FIX-01: snapshot old value BEFORE
                                             // mutating so TXN.ABORT can restore it.
@@ -436,6 +506,7 @@ pub fn execute_mut(
                             SetItem::Label { variable, label } => {
                                 if let Some(Value::Node(nk)) = row.get(variable) {
                                     let lid = label_to_id(label.as_bytes());
+                                    graph.copy_up_node(*nk);
                                     if let Some(node) = graph.write_buf.get_node_mut(*nk) {
                                         if !node.labels.contains(&lid) {
                                             node.labels.push(lid);
@@ -452,9 +523,21 @@ pub fn execute_mut(
                 let _ = detach; // Detach is always implied for MemGraph soft-delete.
                 for row in &rows {
                     for expr in exprs {
-                        let val = eval_expr(expr, row, &graph.write_buf, params, &[], 0, None);
+                        let val = eval_expr(
+                            expr,
+                            row,
+                            &graph.write_buf,
+                            params,
+                            &csr_segs,
+                            u64::MAX,
+                            None,
+                        );
                         match val {
                             Value::Node(nk) => {
+                                // W2-2: frozen target → copy the row up so the
+                                // soft-delete lands in the write buffer as a
+                                // TOMBSTONE shadowing the frozen row.
+                                graph.copy_up_node(nk);
                                 // Phase 174 FIX-01: snapshot node state BEFORE
                                 // soft-delete so TXN.ABORT can un-delete.
                                 if let Some(node) = graph.write_buf.get_node(nk) {
@@ -522,8 +605,8 @@ pub fn execute_mut(
                                     &new_row,
                                     &graph.write_buf,
                                     params,
-                                    &[],
-                                    0,
+                                    &csr_segs,
+                                    u64::MAX,
                                     None,
                                 );
                                 value_to_property_value(&val)
@@ -531,30 +614,10 @@ pub fn execute_mut(
                             })
                             .collect();
 
-                        // Search for existing node matching labels + properties.
-                        let found = graph
-                            .write_buf
-                            .iter_nodes()
-                            .find(|(_, node)| {
-                                // All required labels must be present.
-                                for &lid in &label_ids {
-                                    if !node.labels.contains(&lid) {
-                                        return false;
-                                    }
-                                }
-                                // All required properties must match.
-                                for (pid, pval) in &match_props {
-                                    let has_match = node
-                                        .properties
-                                        .iter()
-                                        .any(|(np, nv)| *np == *pid && *nv == *pval);
-                                    if !has_match {
-                                        return false;
-                                    }
-                                }
-                                true
-                            })
-                            .map(|(k, _)| k);
+                        // Search BOTH tiers for an existing node matching
+                        // labels + properties (a mutable-only search would
+                        // duplicate frozen nodes on every MERGE).
+                        let found = find_node_merged(graph, &csr_segs, &label_ids, &match_props);
 
                         if let Some(existing_key) = found {
                             // MATCH path: bind variable and apply on_match.
@@ -564,7 +627,8 @@ pub fn execute_mut(
                             apply_set_items(
                                 on_match,
                                 &new_row,
-                                &mut graph.write_buf,
+                                graph,
+                                &csr_segs,
                                 params,
                                 &mut properties_set,
                                 Some(&mut mutations),
@@ -588,7 +652,8 @@ pub fn execute_mut(
                             apply_set_items(
                                 on_create,
                                 &new_row,
-                                &mut graph.write_buf,
+                                graph,
+                                &csr_segs,
                                 params,
                                 &mut properties_set,
                                 None,
@@ -600,11 +665,11 @@ pub fn execute_mut(
                         let dst_pn = &pattern.nodes[1];
                         let pe = &pattern.edges[0];
 
-                        // Resolve or find source node.
+                        // Resolve or find source node (both tiers).
                         let src_key =
-                            resolve_or_find_node(src_pn, &new_row, &graph.write_buf, params);
+                            resolve_or_find_node(src_pn, &new_row, graph, &csr_segs, params);
                         let dst_key =
-                            resolve_or_find_node(dst_pn, &new_row, &graph.write_buf, params);
+                            resolve_or_find_node(dst_pn, &new_row, graph, &csr_segs, params);
 
                         let edge_type_id = pe
                             .edge_types
@@ -614,17 +679,18 @@ pub fn execute_mut(
 
                         match (src_key, dst_key) {
                             (Some(sk), Some(dk)) => {
-                                // Check if edge exists.
-                                let edge_exists = graph
-                                    .write_buf
-                                    .neighbors(sk, Direction::Outgoing, u64::MAX)
-                                    .any(|(ek, nk)| {
-                                        nk == dk
-                                            && graph
-                                                .write_buf
-                                                .get_edge(ek)
-                                                .map_or(false, |e| e.edge_type == edge_type_id)
-                                    });
+                                // Check if edge exists in EITHER tier (frozen
+                                // edges live in CSR adjacency).
+                                let edge_exists = {
+                                    let reader = crate::graph::traversal::SegmentMergeReader::new(
+                                        Some(&graph.write_buf),
+                                        &csr_segs,
+                                        Direction::Outgoing,
+                                        u64::MAX,
+                                        Some(edge_type_id),
+                                    );
+                                    reader.neighbors(sk).iter().any(|m| m.node == dk)
+                                };
 
                                 if edge_exists {
                                     // Bind variables.
@@ -637,14 +703,15 @@ pub fn execute_mut(
                                     apply_set_items(
                                         on_match,
                                         &new_row,
-                                        &mut graph.write_buf,
+                                        graph,
+                                        &csr_segs,
                                         params,
                                         &mut properties_set,
                                         Some(&mut mutations),
                                     );
                                 } else {
                                     // Create edge.
-                                    if let Ok(ek) = graph.write_buf.add_edge(
+                                    if let Ok(ek) = graph.write_buf.add_edge_across_tiers(
                                         sk,
                                         dk,
                                         edge_type_id,
@@ -670,7 +737,8 @@ pub fn execute_mut(
                                     apply_set_items(
                                         on_create,
                                         &new_row,
-                                        &mut graph.write_buf,
+                                        graph,
+                                        &csr_segs,
                                         params,
                                         &mut properties_set,
                                         None,
@@ -696,8 +764,8 @@ pub fn execute_mut(
                                                 &new_row,
                                                 &graph.write_buf,
                                                 params,
-                                                &[],
-                                                0,
+                                                &csr_segs,
+                                                u64::MAX,
                                                 None,
                                             );
                                             value_to_property_value(&val)
@@ -733,8 +801,8 @@ pub fn execute_mut(
                                                 &new_row,
                                                 &graph.write_buf,
                                                 params,
-                                                &[],
-                                                0,
+                                                &csr_segs,
+                                                u64::MAX,
                                                 None,
                                             );
                                             value_to_property_value(&val)
@@ -753,11 +821,14 @@ pub fn execute_mut(
                                     });
                                     nk
                                 };
-                                if let Ok(ek) =
-                                    graph
-                                        .write_buf
-                                        .add_edge(sk, dk, edge_type_id, 1.0, None, lsn)
-                                {
+                                if let Ok(ek) = graph.write_buf.add_edge_across_tiers(
+                                    sk,
+                                    dk,
+                                    edge_type_id,
+                                    1.0,
+                                    None,
+                                    lsn,
+                                ) {
                                     mutations.push(MutationRecord::CreateEdge {
                                         edge_id: ek.data().as_ffi(),
                                         src_id: sk.data().as_ffi(),
@@ -776,7 +847,8 @@ pub fn execute_mut(
                                 apply_set_items(
                                     on_create,
                                     &new_row,
-                                    &mut graph.write_buf,
+                                    graph,
+                                    &csr_segs,
                                     params,
                                     &mut properties_set,
                                     None,
@@ -854,10 +926,14 @@ pub fn execute_mut(
 /// `MutationRecord::SetProperty` records for MERGE ON MATCH SET rollback.
 /// Pass `None` for ON CREATE SET paths (no rollback needed for freshly
 /// created nodes — they are removed entirely by the CreateNode intent).
+///
+/// W2-2: takes the whole `NamedGraph` (not just the write buffer) so a
+/// frozen target node can be copied up before the in-place mutation.
 pub(crate) fn apply_set_items(
     items: &[SetItem],
     row: &Row<'_>,
-    memgraph: &mut crate::graph::memgraph::MemGraph,
+    graph: &mut NamedGraph,
+    csr_segs: &[std::sync::Arc<crate::graph::csr::CsrStorage>],
     params: &HashMap<String, Value>,
     properties_set: &mut u64,
     mut mutations: Option<&mut Vec<MutationRecord>>,
@@ -870,10 +946,19 @@ pub(crate) fn apply_set_items(
                 value,
             } => {
                 if let Some(Value::Node(nk)) = row.get(variable) {
-                    let val = eval_expr(value, row, memgraph, params, &[], 0, None);
+                    let val = eval_expr(
+                        value,
+                        row,
+                        &graph.write_buf,
+                        params,
+                        csr_segs,
+                        u64::MAX,
+                        None,
+                    );
                     if let Some(pv) = value_to_property_value(&val) {
                         let pid = label_to_id(property.as_bytes());
-                        if let Some(node) = memgraph.get_node_mut(*nk) {
+                        graph.copy_up_node(*nk);
+                        if let Some(node) = graph.write_buf.get_node_mut(*nk) {
                             // Phase 174 FIX-01: snapshot old value for rollback.
                             if let Some(muts) = mutations.as_mut() {
                                 let old_value = node
@@ -908,7 +993,8 @@ pub(crate) fn apply_set_items(
             SetItem::Label { variable, label } => {
                 if let Some(Value::Node(nk)) = row.get(variable) {
                     let lid = label_to_id(label.as_bytes());
-                    if let Some(node) = memgraph.get_node_mut(*nk) {
+                    graph.copy_up_node(*nk);
+                    if let Some(node) = graph.write_buf.get_node_mut(*nk) {
                         if !node.labels.contains(&lid) {
                             node.labels.push(lid);
                         }
@@ -919,12 +1005,74 @@ pub(crate) fn apply_set_items(
     }
 }
 
+/// Find a node matching all `label_ids` + `match_props` across BOTH tiers.
+/// Mutable tier first (direct field access, no clones), then frozen segments
+/// via `MergedNodeView` (which skips rows shadowed by copy-up entries).
+pub(crate) fn find_node_merged(
+    graph: &NamedGraph,
+    csr_segs: &[std::sync::Arc<crate::graph::csr::CsrStorage>],
+    label_ids: &[u16],
+    match_props: &[(u16, PropertyValue)],
+) -> Option<NodeKey> {
+    let matches_mutable = |node: &crate::graph::types::MutableNode| {
+        label_ids.iter().all(|lid| node.labels.contains(lid))
+            && match_props.iter().all(|(pid, pval)| {
+                node.properties
+                    .iter()
+                    .any(|(np, nv)| *np == *pid && *nv == *pval)
+            })
+    };
+    if let Some(k) = graph
+        .write_buf
+        .iter_nodes()
+        .find(|(_, node)| matches_mutable(node))
+        .map(|(k, _)| k)
+    {
+        return Some(k);
+    }
+
+    let view = crate::graph::view::MergedNodeView::new(&graph.write_buf, csr_segs);
+    let committed = roaring::RoaringBitmap::new();
+    let mut found = None;
+    view.for_each_visible_node(
+        label_ids.first().copied(),
+        u64::MAX,
+        0,
+        &committed,
+        None,
+        |k| {
+            if found.is_some() {
+                return;
+            }
+            // Mutable tier already searched above.
+            if graph.write_buf.get_node(k).is_some() {
+                return;
+            }
+            let Some(labels) = view.labels(k) else {
+                return;
+            };
+            if !label_ids.iter().all(|lid| labels.contains(lid)) {
+                return;
+            }
+            for (pid, pval) in match_props {
+                match view.property(k, *pid) {
+                    Some(v) if v == *pval => {}
+                    _ => return,
+                }
+            }
+            found = Some(k);
+        },
+    );
+    found
+}
+
 /// Resolve a pattern node: if it's a bound variable in the row, return that key.
-/// Otherwise, search the memgraph for a matching node by labels + properties.
+/// Otherwise, search BOTH tiers for a matching node by labels + properties.
 pub(crate) fn resolve_or_find_node(
     pn: &PatternNode,
     row: &Row<'_>,
-    memgraph: &crate::graph::memgraph::MemGraph,
+    graph: &NamedGraph,
+    csr_segs: &[std::sync::Arc<crate::graph::csr::CsrStorage>],
     params: &HashMap<String, Value>,
 ) -> Option<NodeKey> {
     // Check if already bound.
@@ -944,29 +1092,18 @@ pub(crate) fn resolve_or_find_node(
         .properties
         .iter()
         .filter_map(|(name, expr)| {
-            let val = eval_expr(expr, row, memgraph, params, &[], 0, None);
+            let val = eval_expr(
+                expr,
+                row,
+                &graph.write_buf,
+                params,
+                csr_segs,
+                u64::MAX,
+                None,
+            );
             value_to_property_value(&val).map(|pv| (label_to_id(name.as_bytes()), pv))
         })
         .collect();
 
-    memgraph
-        .iter_nodes()
-        .find(|(_, node)| {
-            for &lid in &label_ids {
-                if !node.labels.contains(&lid) {
-                    return false;
-                }
-            }
-            for (pid, pval) in &match_props {
-                let has_match = node
-                    .properties
-                    .iter()
-                    .any(|(np, nv)| *np == *pid && *nv == *pval);
-                if !has_match {
-                    return false;
-                }
-            }
-            true
-        })
-        .map(|(k, _)| k)
+    find_node_merged(graph, csr_segs, &label_ids, &match_props)
 }

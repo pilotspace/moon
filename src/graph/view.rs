@@ -7,11 +7,12 @@
 //! property eval, GRAPH.NEIGHBORS existence, GRAPH.HYBRID) go through to see
 //! the whole graph.
 //!
-//! Tier invariant: a NodeKey lives in EXACTLY ONE tier. `freeze()` moves keys
-//! out of the slotmap, and slot reuse bumps the generation, so a drained key
-//! can never reappear in the mutable tier; `compact_segments` swaps the
-//! segment list atomically, so within one loaded snapshot the segments are
-//! pairwise disjoint too. Lookups therefore need no dedup.
+//! Tier precedence: the MUTABLE tier is authoritative. Fresh keys never alias
+//! frozen external_ids (monotonic id allocation), but copy-up writes (W2-2)
+//! deliberately re-materialize a frozen key in the write buffer to mutate or
+//! tombstone it — such a shadow OVERRIDES the frozen row. Point lookups get
+//! this for free (mutable checked first); scans must skip segment rows whose
+//! key is resident in the mutable tier.
 
 use std::sync::Arc;
 
@@ -37,9 +38,10 @@ impl<'a> MergedNodeView<'a> {
 
     /// Locate a frozen node: `(segment, CSR row)`. Mutable-tier nodes return
     /// `None` — callers that care about both tiers check `memgraph` first.
-    /// Newest segment wins on the (impossible-by-invariant) overlap.
+    /// Newest segment wins on overlap (a re-frozen copy-up shadow leaves a
+    /// stale row in an older segment); the list is ordered newest-first.
     pub fn segment_row(&self, key: NodeKey) -> Option<(&'a CsrStorage, u32)> {
-        for seg in self.segments.iter().rev() {
+        for seg in self.segments.iter() {
             if let Some(row) = seg.lookup_node(key) {
                 return Some((seg.as_ref(), row));
             }
@@ -150,6 +152,11 @@ impl<'a> MergedNodeView<'a> {
             }
             f(key);
         }
+        // Cross-segment dedup: a copy-up shadow that was later re-frozen
+        // leaves the SAME key in two segments (stale row in the old one).
+        // Property accessors resolve newest-segment-wins, so emitting the
+        // key once (whichever segment hits first) is sufficient.
+        let mut emitted = crate::graph::fasthash::FxHashSet::default();
         for seg in self.segments {
             let metas = seg.node_meta();
             match label {
@@ -164,7 +171,17 @@ impl<'a> MergedNodeView<'a> {
                         if !is_meta_visible(meta, snapshot_lsn, my_txn_id, committed, valid_at) {
                             continue;
                         }
-                        f(NodeKey::from(slotmap::KeyData::from_ffi(meta.external_id)));
+                        let key = NodeKey::from(slotmap::KeyData::from_ffi(meta.external_id));
+                        // Copy-up shadow: the mutable tier overrides this row
+                        // (live shadow already emitted above; dead shadow =
+                        // tombstone).
+                        if self.memgraph.get_node(key).is_some() {
+                            continue;
+                        }
+                        if !emitted.insert(key) {
+                            continue;
+                        }
+                        f(key);
                     }
                 }
                 None => {
@@ -172,7 +189,14 @@ impl<'a> MergedNodeView<'a> {
                         if !is_meta_visible(meta, snapshot_lsn, my_txn_id, committed, valid_at) {
                             continue;
                         }
-                        f(NodeKey::from(slotmap::KeyData::from_ffi(meta.external_id)));
+                        let key = NodeKey::from(slotmap::KeyData::from_ffi(meta.external_id));
+                        if self.memgraph.get_node(key).is_some() {
+                            continue;
+                        }
+                        if !emitted.insert(key) {
+                            continue;
+                        }
+                        f(key);
                     }
                 }
             }

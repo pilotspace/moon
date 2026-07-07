@@ -12,7 +12,9 @@
 #![cfg(feature = "graph")]
 
 use bytes::Bytes;
-use moon::command::graph::graph_read::{graph_hybrid, graph_neighbors, graph_profile, graph_query};
+use moon::command::graph::graph_read::{
+    graph_hybrid, graph_neighbors, graph_profile, graph_query, graph_query_write,
+};
 use moon::command::graph::graph_write::{graph_addedge, graph_addnode};
 use moon::graph::store::GraphStore;
 use moon::protocol::Frame;
@@ -359,4 +361,215 @@ fn hybrid_filter_sees_frozen_candidates() {
         ),
         other => panic!("unexpected HYBRID reply: {other:?}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// 6. Copy-up writes (W2-2): SET / DELETE / MERGE against frozen rows
+// ---------------------------------------------------------------------------
+
+fn run_write(store: &mut GraphStore, cypher: &str) -> Frame {
+    graph_query_write(store, &[bs(GRAPH), bs(cypher)])
+}
+
+/// Assert a write reply is not an error frame.
+fn assert_write_ok(reply: &Frame, what: &str) {
+    if let Frame::Error(e) = reply {
+        panic!("{what} failed: {}", String::from_utf8_lossy(e));
+    }
+}
+
+#[test]
+fn set_property_on_frozen_node_copies_up() {
+    let mut store = setup();
+    let _ = seed_across_freeze(&mut store);
+    let r = run_write(&mut store, "MATCH (n:N {id:3}) SET n.score = 42");
+    assert_write_ok(&r, "SET on frozen node");
+    let rows = run_query(&store, "MATCH (n:N {id:3}) RETURN n.score");
+    let cells = single_cells(&rows);
+    assert_eq!(cells.len(), 1, "SET target must remain matchable");
+    match &cells[0] {
+        Frame::Integer(i) => assert_eq!(*i, 42, "copy-up SET must be visible"),
+        Frame::BulkString(b) => assert_eq!(&b[..], b"42", "copy-up SET must be visible"),
+        other => panic!("SET on frozen node was silently dropped (got {other:?})"),
+    }
+    // Untouched frozen properties survive the copy-up.
+    let rows = run_query(&store, "MATCH (n:N {id:3}) RETURN n.id");
+    let cells = single_cells(&rows);
+    match &cells[0] {
+        Frame::Integer(i) => assert_eq!(*i, 3),
+        Frame::BulkString(b) => assert_eq!(&b[..], b"3"),
+        other => panic!("copy-up lost original properties (got {other:?})"),
+    }
+}
+
+#[test]
+fn set_label_on_frozen_node_copies_up() {
+    let mut store = setup();
+    let _ = seed_across_freeze(&mut store);
+    let r = run_write(&mut store, "MATCH (n:N {id:2}) SET n:Extra");
+    assert_write_ok(&r, "SET label on frozen node");
+    let rows = run_query(&store, "MATCH (m:Extra) RETURN m.id");
+    assert_eq!(
+        rows.len(),
+        1,
+        "label added on a frozen node must be scannable"
+    );
+}
+
+#[test]
+fn delete_frozen_node_hides_from_scan_and_neighbors() {
+    let mut store = setup();
+    let handles = seed_across_freeze(&mut store);
+    let r = run_write(&mut store, "MATCH (n:N {id:0}) DELETE n");
+    assert_write_ok(&r, "DELETE frozen node");
+
+    let rows = run_query(&store, "MATCH (n:N) RETURN n.id");
+    assert_eq!(rows.len(), 5, "deleted frozen node must vanish from scans");
+
+    // Ring: node 1 touches 0 and 2 (Both). After deleting 0 → only 2.
+    // GRAPH.NEIGHBORS emits 2 frames per neighbor (edge + node).
+    let reply = graph_neighbors(&store, &[bs(GRAPH), bs(&handles[1].to_string())]);
+    match reply {
+        Frame::Array(items) => assert_eq!(
+            items.len(),
+            2,
+            "deleted frozen node must vanish from CSR-backed traversal (got {} frames)",
+            items.len()
+        ),
+        other => panic!("unexpected NEIGHBORS reply: {other:?}"),
+    }
+}
+
+#[test]
+fn deleted_frozen_node_stays_deleted_after_refreeze() {
+    let mut store = setup();
+    let handles = seed_across_freeze(&mut store);
+    let r = run_write(&mut store, "MATCH (n:N {id:0}) DELETE n");
+    assert_write_ok(&r, "DELETE frozen node");
+
+    // Trigger a SECOND freeze: 6 new nodes in a ring + two chords (8 edges).
+    let new_handles: Vec<u64> = (10..16).map(|i| add_node(&mut store, i)).collect();
+    let edges: [(usize, usize); 8] = [
+        (0, 1),
+        (1, 2),
+        (2, 3),
+        (3, 4),
+        (4, 5),
+        (5, 0),
+        (0, 2),
+        (0, 3),
+    ];
+    for (s, d) in edges {
+        let r = add_edge(&mut store, new_handles[s], new_handles[d]);
+        assert!(
+            matches!(r, Frame::Integer(_)),
+            "second-wave ADDEDGE failed: {r:?}"
+        );
+    }
+    assert_eq!(
+        immutable_segment_count(&store),
+        2,
+        "second freeze must fire"
+    );
+
+    let rows = run_query(&store, "MATCH (n:N) RETURN n.id");
+    assert_eq!(
+        rows.len(),
+        11,
+        "tombstone must survive refreeze (node 0 stays deleted; 5 old + 6 new)"
+    );
+
+    let reply = graph_neighbors(&store, &[bs(GRAPH), bs(&handles[1].to_string())]);
+    match reply {
+        Frame::Array(items) => assert_eq!(
+            items.len(),
+            2,
+            "tombstone must keep hiding node 0 from traversal after refreeze"
+        ),
+        other => panic!("unexpected NEIGHBORS reply: {other:?}"),
+    }
+}
+
+#[test]
+fn merge_on_frozen_node_matches_instead_of_duplicating() {
+    let mut store = setup();
+    let _ = seed_across_freeze(&mut store);
+    let r = run_write(&mut store, "MERGE (n:N {id:4})");
+    assert_write_ok(&r, "MERGE on frozen node");
+    let rows = run_query(&store, "MATCH (n:N {id:4}) RETURN n.id");
+    assert_eq!(
+        rows.len(),
+        1,
+        "MERGE must match the frozen node, not create a duplicate"
+    );
+}
+
+#[test]
+fn cypher_delete_emits_removenode_wal_record() {
+    let mut store = setup();
+    let _ = seed_across_freeze(&mut store);
+    store.drain_wal(); // discard seed records
+    let r = run_write(&mut store, "MATCH (n:N {id:5}) DELETE n");
+    assert_write_ok(&r, "DELETE frozen node");
+    let records = store.drain_wal();
+    let has_remove = records.iter().any(|rec| {
+        rec.windows(b"GRAPH.REMOVENODE".len())
+            .any(|w| w.eq_ignore_ascii_case(b"GRAPH.REMOVENODE"))
+    });
+    assert!(
+        has_remove,
+        "Cypher DELETE must WAL a REMOVENODE record or the delete is lost at restart ({} records)",
+        records.len()
+    );
+}
+
+#[test]
+fn set_on_frozen_node_then_refreeze_does_not_duplicate() {
+    let mut store = setup();
+    let _ = seed_across_freeze(&mut store);
+    let r = run_write(&mut store, "MATCH (n:N {id:3}) SET n.score = 7");
+    assert_write_ok(&r, "SET on frozen node");
+
+    // Second freeze: the live copy-up shadow gets frozen into a NEW segment
+    // while the stale row remains in the old one — scans must not emit the
+    // node twice.
+    let new_handles: Vec<u64> = (10..16).map(|i| add_node(&mut store, i)).collect();
+    let edges: [(usize, usize); 8] = [
+        (0, 1),
+        (1, 2),
+        (2, 3),
+        (3, 4),
+        (4, 5),
+        (5, 0),
+        (0, 2),
+        (0, 3),
+    ];
+    for (s, d) in edges {
+        let r = add_edge(&mut store, new_handles[s], new_handles[d]);
+        assert!(
+            matches!(r, Frame::Integer(_)),
+            "second-wave ADDEDGE failed: {r:?}"
+        );
+    }
+    assert_eq!(
+        immutable_segment_count(&store),
+        2,
+        "second freeze must fire"
+    );
+
+    let rows = run_query(&store, "MATCH (n:N {id:3}) RETURN n.score");
+    assert_eq!(
+        rows.len(),
+        1,
+        "re-frozen shadow must not duplicate its stale row"
+    );
+    let cells = single_cells(&rows);
+    match &cells[0] {
+        Frame::Integer(i) => assert_eq!(*i, 7, "newest segment must win"),
+        Frame::BulkString(b) => assert_eq!(&b[..], b"7", "newest segment must win"),
+        other => panic!("SET lost across refreeze (got {other:?})"),
+    }
+
+    let rows = run_query(&store, "MATCH (n:N) RETURN n.id");
+    assert_eq!(rows.len(), 12, "6 originals + 6 new, no duplicates");
 }
