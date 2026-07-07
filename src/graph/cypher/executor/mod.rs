@@ -276,13 +276,20 @@ pub enum MutationRecord {
     // --- Phase 174 FIX-01: SET / DELETE / MERGE rollback records ---
     /// Property was changed by Cypher SET. `old_value` is the pre-SET value
     /// (None = property did not exist before SET and should be removed on
-    /// rollback).
+    /// rollback). `new_value` is the value written — serialized to the WAL
+    /// (W2-9: without it, SET was silently lost on kill -9 because replay
+    /// only re-ran the original ADDNODE property state).
     SetProperty {
         entity_id: u64,
         is_node: bool,
         key: u16,
         old_value: Option<PropertyValue>,
+        new_value: PropertyValue,
     },
+    /// Label was added by Cypher `SET n:Label` (W2-9: WAL durability; label
+    /// rollback was never captured — pre-existing Phase 174 scope — so this
+    /// record produces a WAL entry but no undo op).
+    SetLabel { node_id: u64, label: u16 },
     /// Node was soft-deleted by Cypher DETACH DELETE. Snapshot captures the
     /// full node state so rollback can un-soft-delete the node and its
     /// incident edges.

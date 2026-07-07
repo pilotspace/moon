@@ -772,10 +772,29 @@ pub fn graph_query_write(store: &mut GraphStore, args: &[Frame]) -> Frame {
                         graph_name, *edge_id,
                     ));
             }
-            // SET has no WAL record format yet — a restart replays the
-            // original ADDNODE property state (known durability gap, tracked
-            // as a wave-2 follow-up).
-            cypher::executor::MutationRecord::SetProperty { .. } => {}
+            // W2-9: SET must be WAL-logged or a restart replays the original
+            // ADDNODE property state (the crash suite's G1/G3 caught exactly
+            // this loss).
+            cypher::executor::MutationRecord::SetProperty {
+                entity_id,
+                is_node,
+                key,
+                new_value,
+                ..
+            } => {
+                store
+                    .wal_pending
+                    .push(crate::graph::wal::serialize_set_prop(
+                        graph_name, *entity_id, *is_node, *key, new_value,
+                    ));
+            }
+            cypher::executor::MutationRecord::SetLabel { node_id, label } => {
+                store
+                    .wal_pending
+                    .push(crate::graph::wal::serialize_set_label(
+                        graph_name, *node_id, *label,
+                    ));
+            }
         }
     }
 
@@ -1068,6 +1087,7 @@ fn execute_write_plan(
                 is_node,
                 key,
                 old_value,
+                new_value,
             } => {
                 undo_ops.push(crate::transaction::GraphUndoOp::RestoreProperty {
                     graph_name: gname_bytes.clone(),
@@ -1076,6 +1096,22 @@ fn execute_write_plan(
                     prop_key: *key,
                     old_value: old_value.clone(),
                 });
+                // W2-9: WAL the SET or it is silently lost on kill -9 (replay
+                // re-runs the original ADDNODE property state).
+                store
+                    .wal_pending
+                    .push(crate::graph::wal::serialize_set_prop(
+                        graph_name, *entity_id, *is_node, *key, new_value,
+                    ));
+            }
+            // W2-9: WAL-only — label rollback was never captured (pre-existing
+            // Phase 174 scope), so no undo op here.
+            cypher::executor::MutationRecord::SetLabel { node_id, label } => {
+                store
+                    .wal_pending
+                    .push(crate::graph::wal::serialize_set_label(
+                        graph_name, *node_id, *label,
+                    ));
             }
             cypher::executor::MutationRecord::DeleteNode { node_id, .. } => {
                 undo_ops.push(crate::transaction::GraphUndoOp::UndeleteNode {

@@ -484,6 +484,7 @@ pub fn execute_mut(
                                                 is_node: true,
                                                 key: pid,
                                                 old_value,
+                                                new_value: pv.clone(),
                                             });
 
                                             // Update existing or append.
@@ -510,6 +511,13 @@ pub fn execute_mut(
                                     if let Some(node) = graph.write_buf.get_node_mut(*nk) {
                                         if !node.labels.contains(&lid) {
                                             node.labels.push(lid);
+                                            // W2-9: record for WAL durability
+                                            // (idempotent — only when newly
+                                            // added).
+                                            mutations.push(MutationRecord::SetLabel {
+                                                node_id: nk.data().as_ffi(),
+                                                label: lid,
+                                            });
                                         }
                                     }
                                 }
@@ -656,7 +664,10 @@ pub fn execute_mut(
                                 &csr_segs,
                                 params,
                                 &mut properties_set,
-                                None,
+                                // W2-9: ON CREATE SET needs mutation records
+                                // too — the CreateNode WAL snapshot predates
+                                // the SET (see apply_set_items doc).
+                                Some(&mut mutations),
                             );
                         }
                     } else if !pattern.edges.is_empty() && pattern.nodes.len() >= 2 {
@@ -741,7 +752,8 @@ pub fn execute_mut(
                                         &csr_segs,
                                         params,
                                         &mut properties_set,
-                                        None,
+                                        // W2-9: see apply_set_items doc.
+                                        Some(&mut mutations),
                                     );
                                 }
                             }
@@ -924,8 +936,12 @@ pub fn execute_mut(
 ///
 /// Phase 174 FIX-01: accepts an optional `mutations` vec to emit
 /// `MutationRecord::SetProperty` records for MERGE ON MATCH SET rollback.
-/// Pass `None` for ON CREATE SET paths (no rollback needed for freshly
-/// created nodes — they are removed entirely by the CreateNode intent).
+/// W2-9: mutation records now also drive WAL generation, so ON CREATE SET
+/// paths must pass `Some` too — the CreateNode WAL record snapshots
+/// properties BEFORE the SET applies, and without a SetProperty record the
+/// ON CREATE SET values are silently lost on kill -9. (Rollback stays
+/// correct: the extra RestoreProperty undo is a no-op on a node the
+/// CreateNode intent removes entirely.)
 ///
 /// W2-2: takes the whole `NamedGraph` (not just the write buffer) so a
 /// frozen target node can be copied up before the in-place mutation.
@@ -971,6 +987,7 @@ pub(crate) fn apply_set_items(
                                     is_node: true,
                                     key: pid,
                                     old_value,
+                                    new_value: pv.clone(),
                                 });
                             }
 
@@ -997,6 +1014,14 @@ pub(crate) fn apply_set_items(
                     if let Some(node) = graph.write_buf.get_node_mut(*nk) {
                         if !node.labels.contains(&lid) {
                             node.labels.push(lid);
+                            // W2-9: WAL durability (idempotent — only when
+                            // newly added).
+                            if let Some(muts) = mutations.as_mut() {
+                                muts.push(MutationRecord::SetLabel {
+                                    node_id: nk.data().as_ffi(),
+                                    label: lid,
+                                });
+                            }
                         }
                     }
                 }
