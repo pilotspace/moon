@@ -37,7 +37,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   vectors) replaces the silent brute-force stub, with exact-scoring
   fallback whenever the approximate beam under-fills.
 
-### Changed — consolidated dependency bumps (PR #TBD)
+### Changed — graph engine wave 2: durability, Cypher coverage, hardening (PR #TBD)
+
+- **Durability:** stable external node/edge ids across WAL replay (handles
+  handed to clients before a crash resolve to the same rows after recovery);
+  Cypher `SET` property/label writes now emit WAL records
+  (`GRAPH.SETPROP`/`GRAPH.SETLABEL` — previously a documented durability gap:
+  SET mutations silently vanished on kill -9); new kill-9 crash-recovery
+  suite (`tests/crash_recovery_graph_durability.rs`: mutable tier, frozen
+  64K-edge tier rebuilt through replay-time freeze, double-crash idempotence).
+- **Cypher coverage:** aggregations `count`/`sum`/`avg`/`min`/`max`/`collect`
+  with implicit grouping, `DISTINCT`, and count-over-zero-rows semantics;
+  `OPTIONAL MATCH` null-pads unmatched expansions (previously compiled
+  silently to inner MATCH; unsupported shapes now reject loudly);
+  `WITH` rebinds the pipeline mid-query (aggregate + `WHERE`-as-HAVING,
+  `ORDER BY`/`SKIP`/`LIMIT` between WITH and RETURN; previously every clause
+  after WITH ran on an empty row stream). `WITH *` rejects loudly.
+- **Copy-up writes:** `SET`/`DELETE`/`MERGE` on frozen rows copy the row up
+  into the write buffer instead of silently missing the frozen tier.
+- **Query performance:** IndexScan range predicates (`WHERE n.p > x` prunes
+  via per-segment B-tree-ish numeric index, superset semantics + residual
+  filter); write-side plan cache (repeated write shapes skip parse+compile);
+  row-BFS fast path engages on multi-segment fully-frozen graphs (~4× vs
+  reader fallback, criterion-pinned); `Value::String` holds `Bytes` for a
+  zero-copy reply path; HYB-02/HYB-04 use the HNSW bridge with off-thread
+  bridge builds.
+- **Operability:** traversal timeout is configurable — `--graph-timeout-ms`
+  server default plus per-query `GRAPH.QUERY ... TIMEOUT <ms>` (RedisGraph
+  parity, 0 = unlimited).
+- **Dead code:** cross-shard traverse scaffolding deleted (532 lines, no
+  sender existed); the single-shard-per-graph sharding model is now
+  documented in `src/graph/mod.rs`.
 
 - Cargo: `ringbuf` 0.4.8 → 0.5.0 and `metrics-exporter-prometheus` 0.16.2 →
   0.18.3 (semver-major; both compile and test green with no code changes —
