@@ -77,6 +77,47 @@ fn parse_decay(args: &[Frame]) -> Result<Option<crate::graph::scoring::DecayConf
     }
 }
 
+/// Parse an optional `TIMEOUT <ms>` argument (RedisGraph parity).
+///
+/// `TIMEOUT 0` disables the timeout for this query. Strict validation like
+/// `parse_decay` (new surface ⇒ malformed input is an error, not a silent
+/// no-op): a dangling keyword or non-integer value is rejected. Returns
+/// `Ok(None)` when the keyword is absent.
+pub(super) fn parse_timeout_ms(args: &[Frame]) -> Result<Option<u64>, &'static str> {
+    for i in 0..args.len() {
+        if let Frame::BulkString(ref bs) = args[i] {
+            if bs.eq_ignore_ascii_case(b"TIMEOUT") {
+                let Some(Frame::BulkString(val)) = args.get(i + 1) else {
+                    return Err("ERR TIMEOUT requires a value in milliseconds");
+                };
+                let parsed = std::str::from_utf8(val)
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u64>().ok());
+                return match parsed {
+                    Some(ms) => Ok(Some(ms)),
+                    None => Err("ERR TIMEOUT must be a non-negative integer (milliseconds)"),
+                };
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// Build the traversal guard for one query: per-query `TIMEOUT <ms>` override
+/// if present (0 = unlimited), else the configured process default
+/// (`--graph-timeout-ms`, 30s unless overridden).
+fn query_guard(
+    args: &[Frame],
+    snapshot_lsn: u64,
+) -> Result<crate::graph::traversal_guard::TraversalGuard, &'static str> {
+    use crate::graph::traversal_guard::TraversalGuard;
+    Ok(match parse_timeout_ms(args)? {
+        Some(0) => TraversalGuard::new(snapshot_lsn, std::time::Duration::MAX),
+        Some(ms) => TraversalGuard::new(snapshot_lsn, std::time::Duration::from_millis(ms)),
+        None => TraversalGuard::with_default_timeout(snapshot_lsn),
+    })
+}
+
 /// Parse `--params <json_object>` from GRAPH.QUERY args into executor `Value` map.
 ///
 /// Scans args for `--params` keyword followed by a JSON string. The JSON must be
@@ -239,8 +280,12 @@ pub fn graph_neighbors(store: &GraphStore, args: &[Frame]) -> Frame {
     let reader =
         SegmentMergeReader::new(Some(memgraph), csr_segs, direction, lsn, edge_type_filter);
 
-    // TraversalGuard enforces bounded epoch hold (30s default timeout).
-    let guard = crate::graph::traversal_guard::TraversalGuard::with_default_timeout(lsn);
+    // TraversalGuard enforces bounded epoch hold (per-query TIMEOUT override,
+    // else the configured `--graph-timeout-ms` default).
+    let guard = match query_guard(args, lsn) {
+        Ok(g) => g,
+        Err(msg) => return Frame::Error(Bytes::from_static(msg.as_bytes())),
+    };
 
     // BFS expansion using SegmentMergeReader for per-node neighbor lookup.
     let mut visited = std::collections::HashSet::new();
@@ -484,10 +529,14 @@ fn run_read_query(
         Ok(d) => d,
         Err(msg) => return Frame::Error(Bytes::from_static(msg.as_bytes())),
     };
+    let guard = match query_guard(args, 0) {
+        Ok(g) => g,
+        Err(msg) => return Frame::Error(Bytes::from_static(msg.as_bytes())),
+    };
     let ctx = cypher::executor::ExecutionContext {
         valid_time_as_of: valid_at,
         decay,
-        guard: Some(crate::graph::traversal_guard::TraversalGuard::with_default_timeout(0)),
+        guard: Some(guard),
         ..Default::default()
     };
     match cypher::executor::execute(graph, plan, &params, &ctx) {
@@ -1196,10 +1245,14 @@ pub fn graph_profile(store: &GraphStore, args: &[Frame]) -> Frame {
         Ok(d) => d,
         Err(msg) => return Frame::Error(Bytes::from_static(msg.as_bytes())),
     };
+    let guard = match query_guard(args, 0) {
+        Ok(g) => g,
+        Err(msg) => return Frame::Error(Bytes::from_static(msg.as_bytes())),
+    };
     let ctx = cypher::executor::ExecutionContext {
         valid_time_as_of: valid_at,
         decay,
-        guard: Some(crate::graph::traversal_guard::TraversalGuard::with_default_timeout(0)),
+        guard: Some(guard),
         ..Default::default()
     };
     let profile = match cypher::executor::execute_profile(graph, &plan, &params, &ctx) {

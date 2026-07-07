@@ -701,3 +701,92 @@ fn or_write_cache_hit_still_produces_wal_and_intents() {
     let cells = single_cells(&run_query(&store, "MATCH (n:W) RETURN n.id"));
     assert_eq!(cells.len(), 2);
 }
+
+// ---------------------------------------------------------------------------
+// 10. W2-8: per-query TIMEOUT + configurable default traversal timeout
+// ---------------------------------------------------------------------------
+
+/// 400-node chain, no freeze (huge threshold). The all-pairs shortestPath
+/// query below runs 160k per-row BFS probes with a guard check per row —
+/// several milliseconds of work at minimum (the `Instant` reads alone exceed
+/// 1ms), so `TIMEOUT 1` must abort while the unlimited control completes.
+fn timeout_fixture() -> GraphStore {
+    let mut store = GraphStore::new();
+    let lsn = store.allocate_lsn();
+    store
+        .create_graph(Bytes::from_static(GRAPH.as_bytes()), 1_000_000, lsn)
+        .expect("create graph");
+    let handles: Vec<u64> = (0..400)
+        .map(|i| {
+            let args = vec![bs(GRAPH), bs("N"), bs("id"), bs(&i.to_string())];
+            match graph_addnode(&mut store, &args) {
+                Frame::Integer(ext) => ext as u64,
+                other => panic!("ADDNODE failed: {other:?}"),
+            }
+        })
+        .collect();
+    for w in handles.windows(2) {
+        let r = add_edge(&mut store, w[0], w[1]);
+        assert!(matches!(r, Frame::Integer(_)), "chain edge failed: {r:?}");
+    }
+    store
+}
+
+const TIMEOUT_QUERY: &str = "MATCH p = shortestPath((a:N)-[*..20]->(b:N)) RETURN p";
+
+#[test]
+fn per_query_timeout_aborts_traversal() {
+    let store = timeout_fixture();
+    let r = graph_query(
+        &store,
+        &[bs(GRAPH), bs(TIMEOUT_QUERY), bs("TIMEOUT"), bs("1")],
+    );
+    let Frame::Error(e) = r else {
+        panic!("TIMEOUT 1 must abort the all-pairs traversal, got {r:?}");
+    };
+    let msg = String::from_utf8_lossy(&e);
+    assert!(msg.contains("traversal timeout"), "unexpected error: {msg}");
+}
+
+#[test]
+fn timeout_zero_is_unlimited_and_default_completes() {
+    let store = timeout_fixture();
+    // TIMEOUT 0 = no limit (RedisGraph parity).
+    let rows = query_rows(&graph_query(
+        &store,
+        &[bs(GRAPH), bs(TIMEOUT_QUERY), bs("TIMEOUT"), bs("0")],
+    ));
+    assert!(!rows.is_empty(), "chain must yield shortest paths");
+    // No TIMEOUT arg: configured default (30s) — also completes.
+    let rows_default = run_query(&store, TIMEOUT_QUERY);
+    assert_eq!(rows.len(), rows_default.len());
+}
+
+#[test]
+fn timeout_argument_rejects_garbage() {
+    let store = setup();
+    for bad in ["abc", "-5", "1.5", ""] {
+        let r = graph_query(
+            &store,
+            &[
+                bs(GRAPH),
+                bs("MATCH (n:N) RETURN n"),
+                bs("TIMEOUT"),
+                bs(bad),
+            ],
+        );
+        assert!(
+            matches!(r, Frame::Error(_)),
+            "TIMEOUT {bad:?} must be rejected, got {r:?}"
+        );
+    }
+    // Dangling keyword with no value.
+    let r = graph_query(
+        &store,
+        &[bs(GRAPH), bs("MATCH (n:N) RETURN n"), bs("TIMEOUT")],
+    );
+    assert!(
+        matches!(r, Frame::Error(_)),
+        "dangling TIMEOUT must be rejected, got {r:?}"
+    );
+}

@@ -862,6 +862,11 @@ fn main() -> anyhow::Result<()> {
         tracing::warn!("--io-busy-poll-us has no effect under the tokio runtime");
     }
 
+    // Graph traversal timeout default — set BEFORE shard threads spawn so every
+    // TraversalGuard::with_default_timeout observes it (per-query TIMEOUT overrides).
+    #[cfg(feature = "graph")]
+    moon::graph::traversal_guard::set_default_traversal_timeout_ms(config.graph_timeout_ms);
+
     // Build shared runtime config for sharded handlers
     let runtime_config_shared: std::sync::Arc<parking_lot::RwLock<moon::config::RuntimeConfig>> =
         { std::sync::Arc::new(parking_lot::RwLock::new(config.to_runtime_config())) };

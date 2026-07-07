@@ -225,6 +225,40 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_timeout_ms() {
+        let args = |parts: &[&[u8]]| -> Vec<Frame> {
+            parts
+                .iter()
+                .map(|p| Frame::BulkString(Bytes::from(p.to_vec())))
+                .collect()
+        };
+        // Absent keyword → None.
+        assert_eq!(
+            graph_read::parse_timeout_ms(&args(&[b"g", b"MATCH (n) RETURN n"])),
+            Ok(None)
+        );
+        // Present with value (case-insensitive keyword).
+        assert_eq!(
+            graph_read::parse_timeout_ms(&args(&[b"g", b"q", b"timeout", b"250"])),
+            Ok(Some(250))
+        );
+        // 0 is valid (= unlimited).
+        assert_eq!(
+            graph_read::parse_timeout_ms(&args(&[b"g", b"q", b"TIMEOUT", b"0"])),
+            Ok(Some(0))
+        );
+        // Garbage values are errors, not silent no-ops.
+        for bad in [&b"abc"[..], b"-5", b"1.5", b""] {
+            assert!(
+                graph_read::parse_timeout_ms(&args(&[b"g", b"q", b"TIMEOUT", bad])).is_err(),
+                "TIMEOUT {bad:?} must be rejected"
+            );
+        }
+        // Dangling keyword is an error.
+        assert!(graph_read::parse_timeout_ms(&args(&[b"g", b"q", b"TIMEOUT"])).is_err());
+    }
+
+    #[test]
     fn test_plan_cache_shared_across_literal_variants() {
         let mut store = GraphStore::new();
         dispatch_graph_command(&mut store, &make_cmd(&[b"GRAPH.CREATE", b"g"]));
