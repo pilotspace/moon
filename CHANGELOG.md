@@ -6,6 +6,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed — `appendfsync always`: local writes now group-commit per pipeline batch (PR #TBD)
+
+- **All three connection handlers** (`handler_monoio`, `handler_sharded`,
+  `handler_single`): plain local writes (plus MOVE/COPY and single-shard
+  GRAPH.* WAL records) no longer await one fsync ack **per command** under
+  `appendfsync always`. Appends are enqueued fire-and-forget
+  (`send_append_group`) and the whole pipelined batch is confirmed by ONE
+  `fsync_barrier` before response serialization — the same contract
+  cross-shard writes and coordinator local legs already used (PR #213).
+  The writer processes its channel in order, so an acked barrier proves
+  every prior append durable; the fsync-before-ack H1 guarantee is
+  unchanged (a failed barrier converts every joined response to an error,
+  never a silent `+OK`).
+- **Why**: a 16-deep pipeline paid 16 serialized fsync round-trips per
+  connection while Redis fsyncs once per event-loop iteration — measured
+  8× SET-throughput deficit at P16 (Moon 5.2k vs Redis 44k ops/s, GCE
+  c3-standard-8, tmp/MOON-VS-REDIS-DURABILITY.md). Writer-side group
+  commit existed but could only batch *across* connections; the per-command
+  await defeated it *within* a connection.
+- everysec/no policies are unchanged (`send_append_group` degrades to the
+  same bounded-backpressure enqueue).
+- `flush_with_aof_ack`'s discriminating H1 ordering test updated to the
+  batch protocol (one `Append` + one `AppendSync` barrier; ack still gates
+  the first response).
+
 ### Changed — WAL v3 fsync moved off the shard event loop (PR #TBD)
 
 - **`src/persistence/wal_v3/sync_agent.rs` (new)**: per-shard `WalSyncAgent`
