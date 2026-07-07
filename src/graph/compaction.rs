@@ -795,7 +795,11 @@ mod tests {
             max_segment_edges: 1_000_000,
         };
         let merged = compact_segments(&[seg1, seg2], &config).expect("merge ok");
-        assert_eq!(merged.node_count(), 4, "all 4 distinct external ids survive the merge");
+        assert_eq!(
+            merged.node_count(),
+            4,
+            "all 4 distinct external ids survive the merge"
+        );
 
         // Scope decision: no posting-row remap -- the merged segment starts
         // with an empty text-index cell.
