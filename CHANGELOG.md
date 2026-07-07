@@ -19,9 +19,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   clients={1,8}, best-of-5, steal=0%. All single-op cells land 0.974–1.008
   (`new_vs_base`) on both arches — no regression from `smallvec` on the
   dispatch/protocol hot path, nor from the `aws-lc-sys` 0.42 codegen. See
-  `tmp/DEPS-WAVE2-AB.md`. CI-only Actions bumps (setup-node #220,
-  install-action #221, setup-python #222) carry no runtime effect and land
-  separately.
+  `tmp/DEPS-WAVE2-AB.md`.
+- **CI-only GitHub Actions bumps** folded in (no runtime effect):
+  `actions/setup-node` 4→6 (release.yml), `actions/setup-python` 5→6
+  (docs.yml), `taiki-e/install-action` 2.81.10→2.82.9 (fuzz.yml) —
+  supersedes dependabot #220/#221/#222.
 
 ### Fixed — TopLevel-monoio AOF writer: EverySec fsync deferred indefinitely when idle (PR #TBD)
 
