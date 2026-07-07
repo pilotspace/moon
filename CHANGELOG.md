@@ -365,6 +365,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reader fallback, criterion-pinned); `Value::String` holds `Bytes` for a
   zero-copy reply path; HYB-02/HYB-04 use the HNSW bridge with off-thread
   bridge builds.
+- **Query performance — mutable-tier property index (task #31):** `MATCH
+  (a:N {id: X})` on the write buffer used to degrade to a full
+  `O(live_node_count)` linear scan even though `PhysicalOp::IndexScan` was
+  already the plan (profiling on the 5K-node/15K-edge Cypher point-query
+  bench put this scan at 82.5% of shard CPU — the mutable tier never
+  freezes below `edge_threshold`, default 64,000). A new incrementally
+  maintained `MutablePropertyIndex` (`src/graph/index.rs`, mirrors the
+  frozen tier's `SegmentPropertyIndexes` numeric-BTree/string-hash split,
+  keyed by `NodeKey`) turns the mutable-tail probe into an O(log N +
+  |result|) index seed; `index_scan_keys`'s residual label/MVCC/property
+  checks are unchanged (SUPERSET contract preserved, no planner changes).
+  `MemGraph::set_node_property`/`remove_node_property`/`undelete_node` are
+  now the single source of truth for node-property mutation, replacing 5
+  previously hand-rolled call sites (Cypher `SET`, MERGE ON CREATE/MATCH
+  SET, TXN.ABORT undo, WAL replay) that could silently let the index drift
+  from live state. Closes a TXN.ABORT `UndeleteNode` gap found during
+  design review: undoing a `DELETE` inside a transaction now re-indexes the
+  restored node instead of leaving it live but permanently unreachable by
+  index probes.
 - **Operability:** traversal timeout is configurable — `--graph-timeout-ms`
   server default plus per-query `GRAPH.QUERY ... TIMEOUT <ms>` (RedisGraph
   parity, 0 = unlimited).

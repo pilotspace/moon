@@ -816,4 +816,145 @@ mod tests {
         assert_eq!(graph_ref.write_buf.node_count(), 2);
         assert_eq!(graph_ref.write_buf.edge_count(), 1);
     }
+
+    // --- Mutable-tier property index (Task #31) — executor-level correctness ---
+
+    fn run_point_match(store: &GraphStore, target: i64) -> ExecResult {
+        let query = format!("MATCH (a:N {{id: {target}}}) RETURN a.id");
+        let parsed = crate::graph::cypher::parse_cypher(query.as_bytes()).expect("parse");
+        let plan = crate::graph::cypher::planner::compile(&parsed).expect("compile");
+        let graph = store.get_graph(b"test").expect("graph");
+        execute(graph, &plan, &HashMap::new(), &ExecutionContext::default()).expect("exec")
+    }
+
+    /// Proves `MATCH (a:N {id:X})` returns exactly the one matching node at
+    /// several graph sizes — pure correctness regression guard for the
+    /// mutable-tier property index replacing the O(N) linear scan.
+    #[test]
+    fn test_index_scan_correctness_at_scale() {
+        for n in [1usize, 100, 5_000] {
+            let mut store = GraphStore::new();
+            store
+                .create_graph(Bytes::from_static(b"test"), n * 2 + 1, 0)
+                .expect("create ok");
+            let graph_mut = store.get_graph_mut(b"test").expect("graph");
+            let label_id = label_to_id(b"N");
+            let id_pid = label_to_id(b"id");
+            for i in 0..n {
+                let mut props = SmallVec::new();
+                props.push((id_pid, PropertyValue::Int(i as i64)));
+                graph_mut
+                    .write_buf
+                    .add_node(SmallVec::from_elem(label_id, 1), props, None, 1);
+            }
+
+            let target = (n as i64) / 2; // arbitrary in-range id
+
+            // Probe hook proving the linear scan is gone: `index_scan_keys`
+            // seeds its mutable-tail candidate set from EXACTLY this same
+            // accessor (`prop_index_keys_eq`). A bucket cardinality of 1
+            // regardless of `n` is the structural proof that the seeded
+            // candidate set — and therefore the executor's residual-check
+            // loop — is O(bucket size), not O(live_node_count).
+            let candidate_count = graph_mut
+                .write_buf
+                .prop_index_keys_eq(id_pid, &PropertyValue::Int(target))
+                .len();
+            assert_eq!(
+                candidate_count, 1,
+                "n={n}: index probe must return exactly the matching bucket, \
+                 not scale with graph size"
+            );
+
+            let result = run_point_match(&store, target);
+            assert_eq!(result.rows.len(), 1, "n={n}: expected exactly one match");
+            match &result.rows[0][0] {
+                Value::Int(v) => assert_eq!(*v, target, "n={n}: wrong node matched"),
+                other => panic!("n={n}: expected Int, got {other:?}"),
+            }
+        }
+    }
+
+    /// After `SET n.id = newval`, the OLD value must no longer be
+    /// index-reachable and the NEW value must be. Guards the
+    /// `set_node_property` old-bucket-eviction path.
+    #[test]
+    fn test_index_scan_eq_after_property_update() {
+        let mut store = GraphStore::new();
+        store
+            .create_graph(Bytes::from_static(b"test"), 64_000, 0)
+            .expect("create ok");
+        let graph_mut = store.get_graph_mut(b"test").expect("graph");
+        let label_id = label_to_id(b"N");
+        let id_pid = label_to_id(b"id");
+        let mut props = SmallVec::new();
+        props.push((id_pid, PropertyValue::Int(1)));
+        graph_mut
+            .write_buf
+            .add_node(SmallVec::from_elem(label_id, 1), props, None, 1);
+
+        let set_query =
+            crate::graph::cypher::parse_cypher(b"MATCH (n:N {id: 1}) SET n.id = 2 RETURN n")
+                .expect("parse");
+        let set_plan = crate::graph::cypher::planner::compile(&set_query).expect("compile");
+        let graph = store.get_graph_mut(b"test").expect("graph");
+        let set_result = execute_mut(graph, &set_plan, &HashMap::new(), 0).expect("exec");
+        assert_eq!(set_result.properties_set, 1);
+
+        assert_eq!(
+            run_point_match(&store, 2).rows.len(),
+            1,
+            "new value must match"
+        );
+        assert_eq!(
+            run_point_match(&store, 1).rows.len(),
+            0,
+            "old value must not match"
+        );
+    }
+
+    /// W2-2 copy-up interaction: freeze a node with `id: 1` into a CSR
+    /// segment, then SET it to `id: 2` (triggers copy-up into the mutable
+    /// tier). `MATCH {id: 1}` must return EMPTY (the resident-but-updated
+    /// mutable copy shadows the frozen row) and `MATCH {id: 2}` must find it
+    /// via the new mutable-tier index.
+    #[test]
+    fn test_index_scan_after_copy_up_shadows_frozen_value() {
+        let mut store = GraphStore::new();
+        store
+            .create_graph(Bytes::from_static(b"test"), 1_000, 0)
+            .expect("create ok");
+        let graph_mut = store.get_graph_mut(b"test").expect("graph");
+        let label_id = label_to_id(b"N");
+        let id_pid = label_to_id(b"id");
+        let mut props = SmallVec::new();
+        props.push((id_pid, PropertyValue::Int(1)));
+        graph_mut
+            .write_buf
+            .add_node(SmallVec::from_elem(label_id, 1), props, None, 1);
+
+        // Freeze into a CSR segment so the row lives only in the frozen tier.
+        assert!(graph_mut.freeze_and_compact(1));
+        assert_eq!(graph_mut.write_buf.node_count(), 0);
+
+        // SET copies the frozen row up into the mutable tier, then mutates.
+        let set_query =
+            crate::graph::cypher::parse_cypher(b"MATCH (n:N {id: 1}) SET n.id = 2 RETURN n")
+                .expect("parse");
+        let set_plan = crate::graph::cypher::planner::compile(&set_query).expect("compile");
+        let graph = store.get_graph_mut(b"test").expect("graph");
+        let set_result = execute_mut(graph, &set_plan, &HashMap::new(), 2).expect("exec");
+        assert_eq!(set_result.properties_set, 1);
+
+        assert_eq!(
+            run_point_match(&store, 1).rows.len(),
+            0,
+            "frozen id=1 must be shadowed by the updated mutable copy"
+        );
+        assert_eq!(
+            run_point_match(&store, 2).rows.len(),
+            1,
+            "updated id=2 must be found via the mutable-tier index"
+        );
+    }
 }

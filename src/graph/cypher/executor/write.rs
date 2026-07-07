@@ -503,34 +503,25 @@ pub fn execute_mut(
                                         // W2-2: frozen target → copy the row up
                                         // into the write buffer, then mutate.
                                         graph.copy_up_node(*nk);
-                                        if let Some(node) = graph.write_buf.get_node_mut(*nk) {
-                                            // Phase 174 FIX-01: snapshot old value BEFORE
-                                            // mutating so TXN.ABORT can restore it.
-                                            let old_value = node
-                                                .properties
-                                                .iter()
-                                                .find(|(k, _)| *k == pid)
-                                                .map(|(_, v)| v.clone());
+                                        if graph.write_buf.get_node(*nk).is_some() {
+                                            // Phase 174 FIX-01: snapshot new value
+                                            // BEFORE the move so TXN.ABORT can
+                                            // restore it. `set_node_property` is
+                                            // the single source of truth for
+                                            // node-property mutation — it keeps
+                                            // the mutable-tier property index
+                                            // (Task #31) in sync and returns the
+                                            // old value the undo record needs.
+                                            let new_value = pv.clone();
+                                            let old_value =
+                                                graph.write_buf.set_node_property(*nk, pid, pv);
                                             mutations.push(MutationRecord::SetProperty {
                                                 entity_id: nk.data().as_ffi(),
                                                 is_node: true,
                                                 key: pid,
                                                 old_value,
-                                                new_value: pv.clone(),
+                                                new_value,
                                             });
-
-                                            // Update existing or append.
-                                            let mut found = false;
-                                            for entry in node.properties.iter_mut() {
-                                                if entry.0 == pid {
-                                                    entry.1 = pv.clone();
-                                                    found = true;
-                                                    break;
-                                                }
-                                            }
-                                            if !found {
-                                                node.properties.push((pid, pv));
-                                            }
                                             properties_set += 1;
                                         }
                                     }
@@ -1006,33 +997,23 @@ pub(crate) fn apply_set_items(
                     if let Some(pv) = value_to_property_value(&val) {
                         let pid = label_to_id(property.as_bytes());
                         graph.copy_up_node(*nk);
-                        if let Some(node) = graph.write_buf.get_node_mut(*nk) {
-                            // Phase 174 FIX-01: snapshot old value for rollback.
-                            if let Some(muts) = mutations.as_mut() {
-                                let old_value = node
-                                    .properties
-                                    .iter()
-                                    .find(|(k, _)| *k == pid)
-                                    .map(|(_, v)| v.clone());
+                        if graph.write_buf.get_node(*nk).is_some() {
+                            // Phase 174 FIX-01: snapshot new value for rollback
+                            // BEFORE the move, only when a caller wants undo
+                            // tracking. `set_node_property` is the single
+                            // source of truth for node-property mutation — it
+                            // keeps the mutable-tier property index (Task #31)
+                            // in sync regardless of `mutations` tracking.
+                            let new_value = mutations.is_some().then(|| pv.clone());
+                            let old_value = graph.write_buf.set_node_property(*nk, pid, pv);
+                            if let (Some(muts), Some(new_value)) = (mutations.as_mut(), new_value) {
                                 muts.push(MutationRecord::SetProperty {
                                     entity_id: nk.data().as_ffi(),
                                     is_node: true,
                                     key: pid,
                                     old_value,
-                                    new_value: pv.clone(),
+                                    new_value,
                                 });
-                            }
-
-                            let mut found = false;
-                            for entry in node.properties.iter_mut() {
-                                if entry.0 == pid {
-                                    entry.1 = pv.clone();
-                                    found = true;
-                                    break;
-                                }
-                            }
-                            if !found {
-                                node.properties.push((pid, pv));
                             }
                             *properties_set += 1;
                         }

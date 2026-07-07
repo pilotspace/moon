@@ -10,9 +10,12 @@
 //! side vectors so iteration and freeze remain deterministic.
 
 use crate::graph::fasthash::FxHashMap;
+use crate::graph::index::MutablePropertyIndex;
 use smallvec::SmallVec;
 
-use crate::graph::types::{Direction, EdgeKey, MutableEdge, MutableNode, NodeKey, PropertyMap};
+use crate::graph::types::{
+    Direction, EdgeKey, MutableEdge, MutableNode, NodeKey, PropertyMap, PropertyValue,
+};
 
 /// First id handed out by a fresh MemGraph: index 1, version 1.
 ///
@@ -82,6 +85,13 @@ pub struct MemGraph {
     /// Edge count threshold that triggers freeze.
     edge_threshold: usize,
     frozen: bool,
+    /// Incrementally-maintained property index over the mutable tier (Task
+    /// #31 — see `tmp/DESIGN-MUTABLE-PROP-INDEX.md`). Owned here (not on
+    /// `NamedGraph`) for the same single-writer, no-lock lifetime as
+    /// `nodes`/`node_order`. Maintained by `insert_node_at`, `remove_node`,
+    /// `set_node_property`, `remove_node_property`, `undelete_node`, and
+    /// wholesale-cleared at `freeze()`.
+    prop_index: MutablePropertyIndex,
 }
 
 impl MemGraph {
@@ -110,6 +120,7 @@ impl MemGraph {
             live_edge_count: 0,
             edge_threshold,
             frozen: false,
+            prop_index: MutablePropertyIndex::default(),
         }
     }
 
@@ -196,6 +207,9 @@ impl MemGraph {
         embedding: Option<Vec<f32>>,
         lsn: u64,
     ) -> NodeKey {
+        // Index the NEW properties before the move below so a fresh insert
+        // never has a transient window with zero index presence.
+        self.prop_index.index_node(key, &properties);
         let prev = self.nodes.insert(
             key,
             MutableNode {
@@ -218,6 +232,12 @@ impl MemGraph {
                 if old.deleted_lsn != u64::MAX {
                     self.live_node_count += 1;
                 }
+                // Undo the double-index from a replace: the OLD value's
+                // bucket entry must not dangle when the same id is
+                // replayed twice under different property values. Harmless
+                // no-op if `old` was already dead (its properties were
+                // already unindexed by `remove_node`'s soft-delete).
+                self.prop_index.unindex_node(key, &old.properties);
             }
             None => {
                 self.node_order.push(key);
@@ -425,6 +445,13 @@ impl MemGraph {
             .copied()
             .collect();
 
+        // Soft-delete removes the node from live property-index candidacy.
+        // Disjoint-field borrow: `node` borrows `self.nodes` via `get_mut`,
+        // `self.prop_index` is a distinct field — legal without
+        // restructuring since both accesses go through explicit field
+        // projections, not an opaque `self.foo()` call.
+        self.prop_index.unindex_node(key, &node.properties);
+
         // Soft-delete all incident edges.
         for ek in edge_keys {
             if let Some(edge) = self.edges.get_mut(&ek) {
@@ -477,6 +504,91 @@ impl MemGraph {
     /// O(1) mutable edge lookup by key.
     pub fn get_edge_mut(&mut self, key: EdgeKey) -> Option<&mut MutableEdge> {
         self.edges.get_mut(&key)
+    }
+
+    /// Set (insert-or-overwrite) a node's property, keeping the mutable-tier
+    /// property index in sync. Returns the OLD value (`None` if the node was
+    /// missing OR the property was newly added — same "no prior value"
+    /// signal callers already treat identically for undo/WAL bookkeeping).
+    ///
+    /// Single source of truth for node-property mutation: every call site
+    /// that used to hand-roll a find-and-replace-or-push on
+    /// `MutableNode.properties` (SET clause, MERGE ON CREATE/MATCH SET,
+    /// TXN.ABORT undo, WAL replay) MUST route through this method instead,
+    /// or the property index silently goes stale.
+    pub fn set_node_property(
+        &mut self,
+        key: NodeKey,
+        pid: u16,
+        value: PropertyValue,
+    ) -> Option<PropertyValue> {
+        let node = self.nodes.get_mut(&key)?;
+        let old = node
+            .properties
+            .iter()
+            .find(|(k, _)| *k == pid)
+            .map(|(_, v)| v.clone());
+        match node.properties.iter_mut().find(|(k, _)| *k == pid) {
+            Some(entry) => entry.1 = value.clone(),
+            None => node.properties.push((pid, value.clone())),
+        }
+        if let Some(old_v) = &old {
+            self.prop_index.remove(pid, old_v, key);
+        }
+        self.prop_index.insert(pid, &value, key);
+        old
+    }
+
+    /// Remove a property entirely, keeping the mutable-tier index in sync.
+    /// Returns the removed value, if any (TXN.ABORT's "property did not
+    /// exist before SET" undo branch; also the future landing spot for a
+    /// Cypher `REMOVE n.prop` clause, which does not exist yet).
+    pub fn remove_node_property(&mut self, key: NodeKey, pid: u16) -> Option<PropertyValue> {
+        let node = self.nodes.get_mut(&key)?;
+        let removed = node
+            .properties
+            .iter()
+            .position(|(k, _)| *k == pid)
+            .map(|i| node.properties.remove(i).1);
+        if let Some(v) = &removed {
+            self.prop_index.remove(pid, v, key);
+        }
+        removed
+    }
+
+    /// Un-soft-delete a node previously removed at `delete_lsn` (TXN.ABORT's
+    /// `UndeleteNode` undo), re-indexing its CURRENT properties. Returns
+    /// `false` (no-op) unless the node is soft-deleted at EXACTLY
+    /// `delete_lsn` — idempotent re-entry guard, same contract the call site
+    /// enforced by hand before this method centralized it.
+    ///
+    /// This closes a gap a naive `deleted_lsn = u64::MAX` flip would leave:
+    /// `remove_node` unindexes on soft-delete, so undoing that delete
+    /// without re-indexing would leave the node live but permanently
+    /// invisible to `MATCH {prop: val}` index probes.
+    pub fn undelete_node(&mut self, key: NodeKey, delete_lsn: u64) -> bool {
+        let Some(node) = self.nodes.get_mut(&key) else {
+            return false;
+        };
+        if node.deleted_lsn != delete_lsn {
+            return false;
+        }
+        node.deleted_lsn = u64::MAX;
+        self.live_node_count += 1;
+        self.prop_index.index_node(key, &node.properties);
+        true
+    }
+
+    /// Zero-alloc equality probe into the mutable-tier property index. See
+    /// `MutablePropertyIndex::keys_eq`.
+    pub fn prop_index_keys_eq(&self, pid: u16, value: &PropertyValue) -> &[NodeKey] {
+        self.prop_index.keys_eq(pid, value)
+    }
+
+    /// Range probe into the mutable-tier property index (allocates). See
+    /// `MutablePropertyIndex::keys_range`.
+    pub fn prop_index_keys_range(&self, pid: u16, min: f64, max: f64) -> Vec<NodeKey> {
+        self.prop_index.keys_range(pid, min, max)
     }
 
     /// Returns neighbors of `node` visible at the given `lsn`, filtered by direction.
@@ -610,7 +722,7 @@ impl MemGraph {
         let edge_bytes = self.edges.capacity()
             * (std::mem::size_of::<MutableEdge>() + std::mem::size_of::<EdgeKey>())
             + self.edge_order.capacity() * std::mem::size_of::<EdgeKey>();
-        node_bytes + edge_bytes
+        node_bytes + edge_bytes + self.prop_index.resident_bytes()
     }
 
     /// Whether the MemGraph should be frozen (threshold reached).
@@ -633,6 +745,14 @@ impl MemGraph {
             return Err(GraphError::AlreadyFrozen);
         }
         self.frozen = true;
+
+        // The property index is derived entirely from `self.nodes`, which
+        // this function unconditionally drains in full below (dead or
+        // alive) — clear it up front rather than per-node: O(#buckets), not
+        // O(#nodes * #props), and correct because nothing reads the index
+        // between here and the drain completing (single-threaded, no
+        // background compaction thread for graphs).
+        self.prop_index.clear();
 
         // Partition edges BEFORE draining nodes (residency check needs the
         // node map): live + both endpoints resident → freeze into CSR;
@@ -689,6 +809,10 @@ impl MemGraph {
     /// (Replacing the MemGraph with a fresh one instead would restart
     /// allocation at FIRST_ID and silently alias new nodes onto frozen rows.)
     pub fn thaw(&mut self) {
+        debug_assert!(
+            self.prop_index.is_empty(),
+            "prop_index must be empty after freeze() drained all nodes"
+        );
         self.frozen = false;
         // Post-freeze contents: zero nodes, retained delta edges (all live —
         // freeze removed dead ones).
@@ -972,6 +1096,130 @@ mod tests {
         assert_eq!(
             g.add_edge(a, b, 1, 1.0, None, 3).unwrap_err(),
             GraphError::NodeNotFound
+        );
+    }
+
+    // --- MutablePropertyIndex maintenance-hook tests (Task #31) ---
+
+    use crate::graph::types::PropertyValue;
+
+    fn id_props(id: i64) -> PropertyMap {
+        smallvec![(0u16, PropertyValue::Int(id))]
+    }
+
+    #[test]
+    fn test_add_node_populates_prop_index() {
+        let mut g = MemGraph::new(1000);
+        let a = g.add_node(smallvec![0], id_props(42), None, 1);
+        assert_eq!(g.prop_index_keys_eq(0, &PropertyValue::Int(42)), &[a]);
+        assert!(g.prop_index_keys_eq(0, &PropertyValue::Int(43)).is_empty());
+    }
+
+    #[test]
+    fn test_remove_node_clears_prop_index() {
+        let mut g = MemGraph::new(1000);
+        let a = g.add_node(smallvec![0], id_props(42), None, 1);
+        g.remove_node(a, 2);
+        assert!(
+            g.prop_index_keys_eq(0, &PropertyValue::Int(42)).is_empty(),
+            "soft-deleted node must not remain an index candidate"
+        );
+    }
+
+    #[test]
+    fn test_replay_overwrite_unindexes_old_properties() {
+        // Simulates WAL replay: the SAME node id is (re-)inserted twice
+        // under different property values. This is the leak edge case the
+        // `Some(old)` branch in `insert_node_at` exists to close.
+        let mut g = MemGraph::new(1000);
+        let a = g.add_node_with_id((1u64 << 32) | 1, smallvec![0], id_props(1), None, 1);
+        assert_eq!(g.prop_index_keys_eq(0, &PropertyValue::Int(1)), &[a]);
+
+        let a2 = g.add_node_with_id((1u64 << 32) | 1, smallvec![0], id_props(2), None, 2);
+        assert_eq!(a, a2, "same ffi id must re-materialize the same NodeKey");
+
+        assert!(
+            g.prop_index_keys_eq(0, &PropertyValue::Int(1)).is_empty(),
+            "old value's bucket must not dangle after a replay overwrite"
+        );
+        assert_eq!(g.prop_index_keys_eq(0, &PropertyValue::Int(2)), &[a]);
+    }
+
+    #[test]
+    fn test_freeze_clears_prop_index() {
+        let mut g = MemGraph::new(1000);
+        g.add_node(smallvec![0], id_props(1), None, 1);
+        g.add_node(smallvec![0], id_props(2), None, 1);
+        g.freeze().expect("freeze ok");
+        assert!(g.prop_index.is_empty());
+        // thaw()'s debug_assert must not fire (stays empty post-thaw).
+        g.thaw();
+        assert!(g.prop_index.is_empty());
+    }
+
+    #[test]
+    fn test_set_node_property_moves_index_entry() {
+        let mut g = MemGraph::new(1000);
+        let a = g.add_node(smallvec![0], id_props(1), None, 1);
+        let old = g.set_node_property(a, 0, PropertyValue::Int(2));
+        assert_eq!(old, Some(PropertyValue::Int(1)));
+        assert!(g.prop_index_keys_eq(0, &PropertyValue::Int(1)).is_empty());
+        assert_eq!(g.prop_index_keys_eq(0, &PropertyValue::Int(2)), &[a]);
+    }
+
+    #[test]
+    fn test_set_node_property_new_key_returns_none() {
+        let mut g = MemGraph::new(1000);
+        let a = g.add_node(smallvec![0], empty_props(), None, 1);
+        let old = g.set_node_property(a, 5, PropertyValue::Int(9));
+        assert_eq!(old, None);
+        assert_eq!(g.prop_index_keys_eq(5, &PropertyValue::Int(9)), &[a]);
+    }
+
+    #[test]
+    fn test_remove_node_property_clears_index_entry() {
+        let mut g = MemGraph::new(1000);
+        let a = g.add_node(smallvec![0], id_props(7), None, 1);
+        let removed = g.remove_node_property(a, 0);
+        assert_eq!(removed, Some(PropertyValue::Int(7)));
+        assert!(g.prop_index_keys_eq(0, &PropertyValue::Int(7)).is_empty());
+        assert_eq!(g.get_node(a).expect("node").properties.len(), 0);
+    }
+
+    #[test]
+    fn test_undelete_node_reindexes_properties() {
+        // Targets the TXN.ABORT UndeleteNode gap (design doc risk #6): a
+        // naive `deleted_lsn = u64::MAX` flip without re-indexing would
+        // leave the node live but invisible to index probes forever.
+        let mut g = MemGraph::new(1000);
+        let a = g.add_node(smallvec![0], id_props(1), None, 1);
+        g.remove_node(a, 5);
+        assert!(g.prop_index_keys_eq(0, &PropertyValue::Int(1)).is_empty());
+
+        assert!(g.undelete_node(a, 5));
+        assert_eq!(g.prop_index_keys_eq(0, &PropertyValue::Int(1)), &[a]);
+        assert_eq!(g.get_node(a).expect("node").deleted_lsn, u64::MAX);
+    }
+
+    #[test]
+    fn test_undelete_node_wrong_lsn_is_noop() {
+        let mut g = MemGraph::new(1000);
+        let a = g.add_node(smallvec![0], id_props(1), None, 1);
+        g.remove_node(a, 5);
+        assert!(!g.undelete_node(a, 99), "delete_lsn mismatch must no-op");
+        assert!(g.prop_index_keys_eq(0, &PropertyValue::Int(1)).is_empty());
+    }
+
+    #[test]
+    fn test_resident_bytes_includes_prop_index() {
+        let mut g = MemGraph::new(1000);
+        let before = g.resident_bytes();
+        for i in 0..20 {
+            g.add_node(smallvec![0], id_props(i), None, 1);
+        }
+        assert!(
+            g.resident_bytes() > before,
+            "resident_bytes must grow as the prop_index accumulates entries"
         );
     }
 }

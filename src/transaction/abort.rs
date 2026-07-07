@@ -242,26 +242,21 @@ pub fn apply_graph_rollback(
                 };
                 if *is_node {
                     let nk = NodeKey::from(slotmap::KeyData::from_ffi(*entity_id));
-                    if let Some(node) = graph.write_buf.get_node_mut(nk) {
-                        match old_value {
-                            Some(val) => {
-                                // Restore old value.
-                                let mut found = false;
-                                for entry in node.properties.iter_mut() {
-                                    if entry.0 == *prop_key {
-                                        entry.1 = val.clone();
-                                        found = true;
-                                        break;
-                                    }
-                                }
-                                if !found {
-                                    node.properties.push((*prop_key, val.clone()));
-                                }
-                            }
-                            None => {
-                                // Property did not exist before SET — remove it.
-                                node.properties.retain(|(k, _)| *k != *prop_key);
-                            }
+                    // `set_node_property`/`remove_node_property` are the
+                    // single source of truth for node-property mutation —
+                    // they keep the mutable-tier property index (Task #31)
+                    // in sync and are no-ops (return `None`) if the node is
+                    // missing, matching the old `get_node_mut`-guarded
+                    // behavior.
+                    match old_value {
+                        Some(val) => {
+                            graph
+                                .write_buf
+                                .set_node_property(nk, *prop_key, val.clone());
+                        }
+                        None => {
+                            // Property did not exist before SET — remove it.
+                            graph.write_buf.remove_node_property(nk, *prop_key);
                         }
                     }
                 } else {
@@ -304,12 +299,12 @@ pub fn apply_graph_rollback(
                     continue;
                 };
                 let nk = NodeKey::from(slotmap::KeyData::from_ffi(*node_id));
-                if let Some(node) = graph.write_buf.get_node_mut(nk) {
-                    if node.deleted_lsn == *delete_lsn {
-                        node.deleted_lsn = u64::MAX;
-                        graph.write_buf.inc_live_node_count();
-                    }
-                }
+                // `undelete_node` centralizes the flip + live-count bump +
+                // property re-indexing (Task #31 design doc risk #6): a
+                // naive `deleted_lsn = u64::MAX` flip without re-indexing
+                // would leave the node live but permanently invisible to
+                // `MATCH {prop: val}` index probes.
+                graph.write_buf.undelete_node(nk, *delete_lsn);
                 // Un-soft-delete incident edges that were cascade-deleted
                 // at the same LSN by remove_node.
                 graph.write_buf.undelete_edges_at_lsn(nk, *delete_lsn);
@@ -506,4 +501,170 @@ pub async fn abort_cross_store_txn_routed(
     }
     #[cfg(not(feature = "graph"))]
     let _ = (txn_id, dispatch_tx, spsc_notifiers);
+}
+
+#[cfg(all(test, feature = "graph"))]
+mod tests {
+    //! TXN.ABORT graph-rollback regression tests, targeting the mutable-tier
+    //! property index (Task #31, `tmp/DESIGN-MUTABLE-PROP-INDEX.md` risk
+    //! #6). `apply_graph_rollback` is a free function whose only dependency
+    //! is a `GraphStore` — no `ShardDatabases`/`CrossStoreTxn` plumbing
+    //! needed, so these tests hand-construct `GraphUndoOp`/`GraphIntent`
+    //! directly and assert on the mutable-tier property index state via
+    //! `MemGraph::prop_index_keys_eq` after rollback.
+
+    use super::*;
+    use crate::graph::store::GraphStore;
+    use crate::graph::types::PropertyValue;
+    use crate::transaction::GraphUndoOp;
+    use slotmap::Key;
+    use smallvec::smallvec;
+
+    fn id_props(id: i64) -> crate::graph::types::PropertyMap {
+        smallvec![(0u16, PropertyValue::Int(id))]
+    }
+
+    /// TXN.ABORT undo of `SET n.id = new` must restore BOTH the raw
+    /// property value AND the mutable-tier index: the original value must
+    /// be index-reachable again, and the SET value must not be.
+    #[test]
+    fn test_rollback_restore_property_reindexes() {
+        let mut gs = GraphStore::new();
+        gs.create_graph(Bytes::from("g"), 1_000, 0)
+            .expect("create ok");
+        let graph = gs.get_graph_mut(b"g").expect("graph");
+        let nk = graph.write_buf.add_node(smallvec![0], id_props(1), None, 1);
+
+        // Simulate the live SET n.id = 2 that would have run before ABORT.
+        graph
+            .write_buf
+            .set_node_property(nk, 0, PropertyValue::Int(2));
+        assert!(
+            graph
+                .write_buf
+                .prop_index_keys_eq(0, &PropertyValue::Int(1))
+                .is_empty()
+        );
+        assert_eq!(
+            graph
+                .write_buf
+                .prop_index_keys_eq(0, &PropertyValue::Int(2)),
+            &[nk]
+        );
+
+        let undo = vec![GraphUndoOp::RestoreProperty {
+            graph_name: Bytes::from("g"),
+            entity_id: nk.data().as_ffi(),
+            is_node: true,
+            prop_key: 0,
+            old_value: Some(PropertyValue::Int(1)),
+        }];
+        apply_graph_rollback(&mut gs, 1, &undo, &[]);
+
+        let graph = gs.get_graph(b"g").expect("graph");
+        assert_eq!(
+            graph
+                .write_buf
+                .prop_index_keys_eq(0, &PropertyValue::Int(1)),
+            &[nk],
+            "rollback must restore index reachability under the ORIGINAL value"
+        );
+        assert!(
+            graph
+                .write_buf
+                .prop_index_keys_eq(0, &PropertyValue::Int(2))
+                .is_empty(),
+            "the SET value must no longer be index-reachable after rollback"
+        );
+    }
+
+    /// TXN.ABORT undo of `SET n.newprop = v` (property did not exist
+    /// before) must remove it from BOTH the raw property vec AND the index.
+    #[test]
+    fn test_rollback_restore_property_none_removes_from_index() {
+        let mut gs = GraphStore::new();
+        gs.create_graph(Bytes::from("g"), 1_000, 0)
+            .expect("create ok");
+        let graph = gs.get_graph_mut(b"g").expect("graph");
+        let nk = graph.write_buf.add_node(smallvec![0], smallvec![], None, 1);
+        graph
+            .write_buf
+            .set_node_property(nk, 7, PropertyValue::Int(99));
+        assert_eq!(
+            graph
+                .write_buf
+                .prop_index_keys_eq(7, &PropertyValue::Int(99)),
+            &[nk]
+        );
+
+        let undo = vec![GraphUndoOp::RestoreProperty {
+            graph_name: Bytes::from("g"),
+            entity_id: nk.data().as_ffi(),
+            is_node: true,
+            prop_key: 7,
+            old_value: None,
+        }];
+        apply_graph_rollback(&mut gs, 1, &undo, &[]);
+
+        let graph = gs.get_graph(b"g").expect("graph");
+        assert!(
+            graph
+                .write_buf
+                .prop_index_keys_eq(7, &PropertyValue::Int(99))
+                .is_empty(),
+            "a property that didn't exist before SET must be unindexed on rollback"
+        );
+    }
+
+    /// Regression guard for the design doc's risk #6 (§5): TXN.ABORT's
+    /// `UndeleteNode` undo must re-index the node's properties, not just
+    /// flip `deleted_lsn`. A naive port that skips re-indexing leaves the
+    /// node live but permanently invisible to `MATCH {prop: val}` index
+    /// probes — this is exactly the regression `MemGraph::undelete_node`
+    /// (memgraph.rs) exists to close.
+    #[test]
+    fn test_rollback_undelete_node_reindexes_properties() {
+        let mut gs = GraphStore::new();
+        gs.create_graph(Bytes::from("g"), 1_000, 0)
+            .expect("create ok");
+        let graph = gs.get_graph_mut(b"g").expect("graph");
+        let nk = graph.write_buf.add_node(smallvec![0], id_props(5), None, 1);
+
+        // Simulate the live DELETE that would have run before ABORT.
+        let delete_lsn = 2;
+        assert!(graph.write_buf.remove_node(nk, delete_lsn));
+        assert!(
+            graph
+                .write_buf
+                .prop_index_keys_eq(0, &PropertyValue::Int(5))
+                .is_empty(),
+            "soft-deleted node must not be index-reachable"
+        );
+
+        let undo = vec![GraphUndoOp::UndeleteNode {
+            graph_name: Bytes::from("g"),
+            node_id: nk.data().as_ffi(),
+            delete_lsn,
+        }];
+        apply_graph_rollback(&mut gs, 1, &undo, &[]);
+
+        let graph = gs.get_graph(b"g").expect("graph");
+        assert_eq!(
+            graph
+                .write_buf
+                .get_node(nk)
+                .expect("node still resident")
+                .deleted_lsn,
+            u64::MAX,
+            "rollback must un-soft-delete the node"
+        );
+        assert_eq!(
+            graph
+                .write_buf
+                .prop_index_keys_eq(0, &PropertyValue::Int(5)),
+            &[nk],
+            "rollback of a DELETE must re-index the node's properties, \
+             not just flip deleted_lsn"
+        );
+    }
 }

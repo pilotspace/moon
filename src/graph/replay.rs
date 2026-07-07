@@ -648,11 +648,13 @@ impl GraphReplayCollector {
                                 );
                                 continue;
                             }
-                            if let Some(node) = mg.get_node_mut(nk) {
-                                match node.properties.iter_mut().find(|(k, _)| k == key) {
-                                    Some(entry) => entry.1 = value.clone(),
-                                    None => node.properties.push((*key, value.clone())),
-                                }
+                            if mg.get_node(nk).is_some() {
+                                // `set_node_property` is the single source of
+                                // truth for node-property mutation — it keeps
+                                // the mutable-tier property index (Task #31)
+                                // in sync so a restarted server's index
+                                // matches live-traffic state exactly.
+                                mg.set_node_property(nk, *key, value.clone());
                                 *replayed += 1;
                             }
                         }

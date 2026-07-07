@@ -279,8 +279,41 @@ fn index_scan_keys(
 
     let mut keys = Vec::new();
 
-    // Mutable tail: inline superset-consistent property check.
-    for (key, node) in memgraph.iter_nodes() {
+    // Mutable tail: seed a small candidate set from the mutable-tier
+    // property index (Task #31) instead of scanning every live node, then
+    // apply the SAME superset-consistent label/visibility/property checks
+    // as before to that candidate set. SUPERSET contract preserved: the
+    // index only prunes candidates, never decides — these checks (and the
+    // planner's residual Filter downstream) stay authoritative.
+    //
+    // Seed from the first equality target when available (exact bucket,
+    // typically 0-1 entries for a unique id); otherwise from the full
+    // indexed value range of the first range conjunct (conservative — the
+    // `ranges_match` check below narrows it exactly). One of the two is
+    // always present here: `targets.is_empty() && ranges.is_empty()` was
+    // already handled by the early return above.
+    let candidates: Vec<NodeKey> = if let Some((pid, want)) = targets.first() {
+        memgraph.prop_index_keys_eq(*pid, want).to_vec()
+    } else if let Some((pid, cmp, threshold)) = ranges.first() {
+        // Boundary-INCLUSIVE on the threshold side regardless of Gt/Lt vs
+        // Gte/Lte — a superset seed; the exact `ranges_match` check below
+        // enforces strictness.
+        let (lo, hi) = match cmp {
+            RangeCmp::Gt | RangeCmp::Gte => (*threshold, f64::INFINITY),
+            RangeCmp::Lt | RangeCmp::Lte => (f64::NEG_INFINITY, *threshold),
+        };
+        memgraph.prop_index_keys_range(*pid, lo, hi)
+    } else {
+        // Structurally unreachable (see above) — an empty candidate set is
+        // the safe degradation if this invariant is ever violated by a
+        // future refactor, never a panic on live traffic.
+        Vec::new()
+    };
+
+    for key in candidates {
+        let Some(node) = memgraph.get_node(key) else {
+            continue; // tombstone/race guard: index entry outlived the node
+        };
         if let Some(lid) = label_id {
             if !node.labels.contains(&lid) {
                 continue;
