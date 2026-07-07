@@ -817,6 +817,35 @@ label scan** — a property index for inline-equality is a legitimate future opt
 v3-2 scope. Moon native builds 23–26× faster and native 1-hop edges out FalkorDB Cypher.
 Detail: `docs/reviews/2026-06-17/4FEATURE-VERIFIED.md`.
 
+### 11.6 2026-07-07 Graph wave-2 criterion microbenchmarks (OrbStack Linux VM, aarch64)
+
+Wave-2 engine (`feat/graph-engine-wave2`, PR #237): frozen-tier copy-up writes, IndexScan
+ranges, row-BFS multi-segment gate, write-side plan cache, Cypher aggregations,
+OPTIONAL MATCH/WITH. `-C target-cpu=native`, fat-LTO bench profile, criterion.
+VM cores are shared — treat absolutes as indicative, relatives as solid.
+
+| Benchmark | Median | Notes |
+|-----------|:------:|-------|
+| 1-hop neighbor, CSR (frozen) | **1.07 ns** | vs memgraph (mutable) 113.8 ns — frozen tier ~106× |
+| 2-hop BFS, CSR 1K / 10K | 1.01 / 1.10 µs | vs memgraph 3.47 / 3.64 µs (~3.3×) |
+| Edge insert (memgraph) | 206 ns | |
+| GRAPH.ADDNODE / ADDEDGE dispatch | 223 / 204 ns | ~4.5–4.9M ops/s per-shard ceiling |
+| GRAPH.NEIGHBORS dispatch | 429 ns | |
+| CSR freeze, 64K edges | 19.5 ms | per-dirty-graph cost of the checkpoint graph snapshot (P0 fix) |
+| Cosine similarity 384d / 768d | 31 / 57 ns SIMD | vs scalar 247 / 522 ns (~8–9×, NEON) |
+| Row-BFS frozen 1-segment, 10K depth-3 | **658 µs** | vs sequential memgraph BFS 9.44 ms (~14×) |
+| Row-BFS frozen 2-segment | 1.65 ms | W2-6 multi-segment gate ≈ 2.5× single-segment |
+| Reader BFS mixed-tier / frozen-2seg | 1.83 / 3.40 ms | |
+| `ParallelBfs` memgraph 10K depth-3 | 11.8 ms | **slower than sequential 9.44 ms — see note** |
+
+**`ParallelBfs` note:** the memgraph parallel path is a structural net loss and has **zero
+production callers** (the query path uses `BoundedBfs`; both share the row-BFS frozen fast
+path, which is where parallelism actually pays). Its neighbor collection stays sequential
+(`SegmentMergeReader` borrows `!Send` MemGraph), so it parallelizes only visited-set
+filtering while paying per-level neighbor-list clones, a full FxHashSet→DashSet visited
+rebuild, and raw `thread::scope` spawns per 128-node morsel (~76 spawns/level at a 9.7K
+frontier). Candidate cleanup: retire it or fold into `BoundedBfs`.
+
 ---
 
 ## 12. Full-Text Search
