@@ -9,7 +9,6 @@ use std::sync::Arc;
 
 use crate::blocking::BlockingRegistry;
 use crate::config::RuntimeConfig;
-use crate::persistence::wal::WalWriter;
 
 use super::shared_databases::ShardDatabases;
 
@@ -70,15 +69,6 @@ pub const CHECKPOINT_TICK_MS: u64 = 1;
 /// Warm tier transition check interval in milliseconds (10 seconds).
 /// Infrequent enough to avoid overhead, responsive enough to catch aged segments.
 pub const WARM_CHECK_INTERVAL_MS: u64 = 10_000;
-
-/// WAL fsync on 1-second interval (everysec durability).
-pub(crate) fn sync_wal(wal_writer: &mut Option<WalWriter>) {
-    if let Some(wal) = wal_writer {
-        if let Err(e) = wal.sync_to_disk() {
-            tracing::error!("WAL sync failed: {}", e);
-        }
-    }
-}
 
 /// Fire MQ triggers whose debounce window has elapsed.
 ///

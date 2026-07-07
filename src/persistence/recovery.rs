@@ -562,47 +562,35 @@ pub fn recover_shard_v3_pitr(
         }
     }
 
-    // ── Phase 4b: V2 WAL FALLBACK ──────────────────────────────────────
-    // When v3 replay produced 0 commands and a v2 persistence directory is
-    // available, fall back to replaying the v2 AOF file. This handles the
-    // common case where --disk-offload enable was used with --appendonly yes
-    // but write commands logged to the v2 AOF (standard appendonly path).
+    // ── Phase 4b: AOF FALLBACK ─────────────────────────────────────────
+    // When v3 WAL replay produced 0 commands and a legacy persistence
+    // directory is available, fall back to replaying appendonly.aof. This
+    // handles the common case where --disk-offload enable was used with
+    // --appendonly yes but write commands logged to the AOF (the recovery
+    // authority; see CLAUDE.md write-path notes). The WAL v2 rung (per-shard
+    // shard-N.wal) was removed in the pre-1.0 WAL-v3-only format freeze --
+    // WAL v3 is now the only WAL, so the only remaining fallback source is
+    // the AOF.
     if result.commands_replayed == 0 {
         if let Some(v2_dir) = v2_persistence_dir {
-            // Try all v2 persistence sources in order:
-            // 1. Per-shard binary WAL (shard-N.wal)
-            // 2. Global RESP-format AOF (appendonly.aof)
-            let v2_sources: &[(&std::path::Path, bool)] = &[
-                (&crate::persistence::wal::wal_path(v2_dir, shard_id), false),
-                (&v2_dir.join("appendonly.aof"), true),
-            ];
-            for &(ref path, is_aof) in v2_sources {
-                if !path.exists() {
-                    continue;
-                }
+            let aof_path = v2_dir.join("appendonly.aof");
+            if aof_path.exists() {
                 info!(
-                    "Shard {}: v3 WAL empty, falling back to v2 replay from {:?}",
-                    shard_id, path
+                    "Shard {}: WAL empty, falling back to AOF replay from {:?}",
+                    shard_id, aof_path
                 );
-                let replay_result = if is_aof {
-                    crate::persistence::aof::replay_aof(databases, path, engine)
-                } else {
-                    crate::persistence::wal::replay_wal(databases, path, engine)
-                };
-                match replay_result {
-                    Ok(n) if n > 0 => {
+                match crate::persistence::aof::replay_aof(databases, &aof_path, engine) {
+                    Ok(n) => {
                         result.commands_replayed = n;
-                        info!("Shard {}: v2 fallback replayed {} commands", shard_id, n);
-                        break;
-                    }
-                    Ok(_) => {
-                        info!(
-                            "Shard {}: v2 source {:?} had 0 commands, trying next",
-                            shard_id, path
-                        );
+                        info!("Shard {}: AOF fallback replayed {} commands", shard_id, n);
                     }
                     Err(e) => {
-                        tracing::error!("Shard {}: v2 fallback {:?} failed: {}", shard_id, path, e);
+                        tracing::error!(
+                            "Shard {}: AOF fallback {:?} failed: {}",
+                            shard_id,
+                            aof_path,
+                            e
+                        );
                     }
                 }
             }

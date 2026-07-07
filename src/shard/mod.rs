@@ -122,13 +122,14 @@ impl Shard {
     /// Restore shard state from per-shard snapshot and WAL files at startup.
     ///
     /// When `disk_offload_dir` is `Some`, uses the v3 recovery protocol
-    /// (6-phase: control file -> manifest -> data load -> WAL v3 replay ->
-    /// consistency -> ready). Falls back to v2 path on v3 failure.
+    /// (6-phase: control file -> manifest -> data load -> WAL replay ->
+    /// consistency -> ready). Falls back to the legacy path on v3 failure.
     ///
-    /// When `disk_offload_dir` is `None`, uses the existing v2 path:
-    /// load per-shard RRDSHARD snapshot, replay per-shard WAL v2.
+    /// When `disk_offload_dir` is `None`, uses the legacy path: load the
+    /// per-shard RRDSHARD snapshot, then fall back to appendonly.aof (the
+    /// WAL v2 rung was removed in the pre-1.0 WAL-v3-only format freeze).
     ///
-    /// Returns total keys loaded (snapshot + WAL replay).
+    /// Returns total keys loaded (snapshot + AOF replay).
     pub fn restore_from_persistence(
         &mut self,
         persistence_dir: &str,
@@ -200,10 +201,13 @@ impl Shard {
         self.restore_from_persistence_v2(persistence_dir)
     }
 
-    /// V2 recovery path: snapshot load + WAL v2 replay + vector recovery.
+    /// Legacy recovery path: snapshot load + appendonly.aof replay.
+    ///
+    /// Pre-1.0 WAL-v3-only format freeze: the per-shard WAL v2 rung
+    /// (`shard-N.wal`) was removed. The global AOF (`appendonly.aof`, written
+    /// by `aof_writer_task`) is the recovery authority for this path.
     fn restore_from_persistence_v2(&mut self, persistence_dir: &str) -> usize {
         use crate::persistence::snapshot::shard_snapshot_load;
-        use crate::persistence::wal;
 
         let dir = std::path::Path::new(persistence_dir);
         let mut total_keys = 0;
@@ -222,43 +226,19 @@ impl Shard {
             }
         }
 
-        // Replay per-shard WAL, then fall back to appendonly.aof if WAL has 0 commands.
-        // The per-shard WalWriter writes to shard-N.wal but the global AOF writer
-        // (aof_writer_task) writes to appendonly.aof. Both may exist; try both.
-        let wal_file = wal::wal_path(dir, self.id);
-        let mut wal_replayed = 0usize;
-        if wal_file.exists() {
-            match wal::replay_wal(&mut self.databases, &wal_file, &DispatchReplayEngine::new()) {
+        let aof_path = dir.join("appendonly.aof");
+        if aof_path.exists() {
+            match crate::persistence::aof::replay_aof(
+                &mut self.databases,
+                &aof_path,
+                &DispatchReplayEngine::new(),
+            ) {
                 Ok(n) => {
-                    info!("Shard {}: replayed {} WAL commands", self.id, n);
-                    wal_replayed = n;
+                    info!("Shard {}: replayed {} AOF commands", self.id, n);
                     total_keys += n;
                 }
                 Err(e) => {
-                    tracing::error!("Shard {}: WAL replay failed: {}", self.id, e);
-                }
-            }
-        }
-        // Fall back to appendonly.aof when per-shard WAL has 0 commands
-        if wal_replayed == 0 {
-            let aof_path = dir.join("appendonly.aof");
-            if aof_path.exists() {
-                info!(
-                    "Shard {}: WAL empty, falling back to appendonly.aof",
-                    self.id
-                );
-                match crate::persistence::aof::replay_aof(
-                    &mut self.databases,
-                    &aof_path,
-                    &DispatchReplayEngine::new(),
-                ) {
-                    Ok(n) => {
-                        info!("Shard {}: replayed {} AOF commands", self.id, n);
-                        total_keys += n;
-                    }
-                    Err(e) => {
-                        tracing::error!("Shard {}: AOF replay failed: {}", self.id, e);
-                    }
+                    tracing::error!("Shard {}: AOF replay failed: {}", self.id, e);
                 }
             }
         }
@@ -279,7 +259,6 @@ mod tests {
     use super::*;
     use crate::blocking::BlockingRegistry;
     use crate::framevec;
-    use crate::persistence::wal::WalWriter;
     use crate::protocol::Frame;
     use crate::pubsub::subscriber::Subscriber;
     use crate::runtime::channel as rt_channel;
@@ -343,7 +322,6 @@ mod tests {
 
         let mut pending_snap = None;
         let mut snap_state = None;
-        let mut wal_w: Option<WalWriter> = None;
         let blocking = Rc::new(RefCell::new(BlockingRegistry::new(0)));
         let script_cache = Rc::new(RefCell::new(crate::scripting::ScriptCache::new()));
         let clock = CachedClock::new();
@@ -355,8 +333,7 @@ mod tests {
             &blocking,
             &mut pending_snap,
             &mut snap_state,
-            &mut wal_w,
-            &mut None, // wal_v3_writer
+            &mut None, // wal_writer
             &backlog,
             &mut Vec::new(),
             &None,
@@ -410,7 +387,6 @@ mod tests {
 
         let mut pending_snap = None;
         let mut snap_state = None;
-        let mut wal_w: Option<WalWriter> = None;
         let blocking = Rc::new(RefCell::new(BlockingRegistry::new(0)));
         let script_cache = Rc::new(RefCell::new(crate::scripting::ScriptCache::new()));
         let clock = CachedClock::new();
@@ -422,8 +398,7 @@ mod tests {
             &blocking,
             &mut pending_snap,
             &mut snap_state,
-            &mut wal_w,
-            &mut None, // wal_v3_writer
+            &mut None, // wal_writer
             &backlog,
             &mut Vec::new(),
             &None,
