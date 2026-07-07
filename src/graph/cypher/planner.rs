@@ -156,11 +156,14 @@ impl core::fmt::Display for PlanError {
 /// Plan cache: maps xxhash of the (literal-normalized) Cypher text to a
 /// compiled plan, with LRU eviction.
 ///
-/// Invariant: only READ-ONLY plans may be inserted. A cache hit in
-/// `graph_query_or_write` routes straight to the read path without
-/// re-parsing, so a cached write plan would mis-route.
+/// Entries carry a `read_only` flag (W2-7 caches WRITE plans too). The
+/// safety invariant moved from "only read-only plans may be inserted" to
+/// "a read-path hit must check the flag": `graph_query_or_write` routes a
+/// read-only hit to the read path and a write hit to the write path, both
+/// with zero parse/compile work; the pure read handlers treat a write hit
+/// as a miss.
 pub struct PlanCache {
-    cache: HashMap<u64, (Arc<PhysicalPlan>, u64)>,
+    cache: HashMap<u64, (Arc<PhysicalPlan>, bool, u64)>,
     max_entries: usize,
     /// Monotonic access counter backing LRU eviction.
     tick: u64,
@@ -177,17 +180,19 @@ impl PlanCache {
     }
 
     /// Look up a cached plan by query hash, marking it most-recently-used.
-    pub fn get(&mut self, hash: u64) -> Option<Arc<PhysicalPlan>> {
+    /// Returns the plan and whether it is read-only — callers MUST route on
+    /// the flag (see type docs).
+    pub fn get(&mut self, hash: u64) -> Option<(Arc<PhysicalPlan>, bool)> {
         self.tick += 1;
         let tick = self.tick;
-        self.cache.get_mut(&hash).map(|(plan, used)| {
+        self.cache.get_mut(&hash).map(|(plan, read_only, used)| {
             *used = tick;
-            plan.clone()
+            (plan.clone(), *read_only)
         })
     }
 
     /// Insert a plan, evicting the least-recently-used entry at capacity.
-    pub fn insert(&mut self, hash: u64, plan: Arc<PhysicalPlan>) {
+    pub fn insert(&mut self, hash: u64, plan: Arc<PhysicalPlan>, read_only: bool) {
         self.tick += 1;
         if self.cache.len() >= self.max_entries && !self.cache.contains_key(&hash) {
             // O(capacity) scan; eviction only fires when a full cache takes a
@@ -195,13 +200,13 @@ impl PlanCache {
             let lru = self
                 .cache
                 .iter()
-                .min_by_key(|(_, (_, used))| *used)
+                .min_by_key(|(_, (_, _, used))| *used)
                 .map(|(k, _)| *k);
             if let Some(lru) = lru {
                 self.cache.remove(&lru);
             }
         }
-        self.cache.insert(hash, (plan, self.tick));
+        self.cache.insert(hash, (plan, read_only, self.tick));
     }
 
     /// Number of cached plans.
@@ -943,26 +948,38 @@ mod tests {
         assert!(cache.is_empty());
 
         let plan = Arc::new(PhysicalPlan { operators: vec![] });
-        cache.insert(42, plan.clone());
+        cache.insert(42, plan.clone(), true);
         assert_eq!(cache.len(), 1);
         assert!(cache.get(42).is_some());
         assert!(cache.get(99).is_none());
 
         // Fill and evict
-        cache.insert(43, plan.clone());
-        cache.insert(44, plan.clone());
+        cache.insert(43, plan.clone(), true);
+        cache.insert(44, plan.clone(), true);
         assert_eq!(cache.len(), 2);
+    }
+
+    #[test]
+    fn test_plan_cache_read_only_flag_round_trips() {
+        // W2-7: write plans are cached too; the flag tells the read path to
+        // treat them as misses and the write path to execute them directly.
+        let mut cache = PlanCache::new(4);
+        let plan = Arc::new(PhysicalPlan { operators: vec![] });
+        cache.insert(1, plan.clone(), true);
+        cache.insert(2, plan.clone(), false);
+        assert_eq!(cache.get(1).map(|(_, ro)| ro), Some(true));
+        assert_eq!(cache.get(2).map(|(_, ro)| ro), Some(false));
     }
 
     #[test]
     fn test_plan_cache_lru_eviction_order() {
         let mut cache = PlanCache::new(2);
         let plan = Arc::new(PhysicalPlan { operators: vec![] });
-        cache.insert(1, plan.clone());
-        cache.insert(2, plan.clone());
+        cache.insert(1, plan.clone(), true);
+        cache.insert(2, plan.clone(), true);
         // Touch 1 so 2 becomes the least-recently-used entry.
         assert!(cache.get(1).is_some());
-        cache.insert(3, plan.clone());
+        cache.insert(3, plan.clone(), true);
         assert!(
             cache.get(1).is_some(),
             "recently-used entry must survive eviction"

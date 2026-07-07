@@ -13,7 +13,8 @@
 
 use bytes::Bytes;
 use moon::command::graph::graph_read::{
-    graph_hybrid, graph_neighbors, graph_profile, graph_query, graph_query_write,
+    graph_hybrid, graph_neighbors, graph_profile, graph_query, graph_query_or_write,
+    graph_query_write,
 };
 use moon::command::graph::graph_write::{graph_addedge, graph_addnode};
 use moon::graph::store::GraphStore;
@@ -630,4 +631,73 @@ fn binary_property_roundtrips_through_return() {
         ),
         other => panic!("expected bulk string, got {other:?}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// 9. Write-side plan cache (W2-7): repeated write shapes skip parse/compile;
+//    the cached plan must resolve EACH run's literals, not replay the first.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn write_plans_cached_and_resolve_fresh_literals() {
+    let mut store = setup();
+
+    let r1 = graph_query_write(&mut store, &[bs(GRAPH), bs("CREATE (n:W {id: 7})")]);
+    assert!(
+        !matches!(r1, Frame::Error(_)),
+        "first CREATE failed: {r1:?}"
+    );
+    let cached = store
+        .get_graph(GRAPH.as_bytes())
+        .expect("graph")
+        .plan_cache
+        .lock()
+        .len();
+    assert!(cached >= 1, "write plan must land in the plan cache");
+
+    // Same normalized shape, different literal — must hit the cache AND
+    // store 8, not a replay of 7.
+    let r2 = graph_query_write(&mut store, &[bs(GRAPH), bs("CREATE (n:W {id: 8})")]);
+    assert!(
+        !matches!(r2, Frame::Error(_)),
+        "second CREATE failed: {r2:?}"
+    );
+    assert_eq!(
+        store
+            .get_graph(GRAPH.as_bytes())
+            .expect("graph")
+            .plan_cache
+            .lock()
+            .len(),
+        cached,
+        "second literal variant must reuse the cached plan, not add one"
+    );
+
+    let cells = single_cells(&run_query(&store, "MATCH (n:W) RETURN n.id"));
+    assert_eq!(cells.len(), 2, "both CREATEs must have executed");
+    let hit = single_cells(&run_query(&store, "MATCH (n:W) WHERE n.id = 8 RETURN n.id"));
+    assert_eq!(hit.len(), 1, "cached plan must resolve the SECOND literal");
+}
+
+#[test]
+fn or_write_cache_hit_still_produces_wal_and_intents() {
+    let mut store = setup();
+
+    // First run compiles + caches; second run takes the W2-7 write-hit path.
+    for id in [11, 12] {
+        let q = format!("CREATE (n:W {{id: {id}}})");
+        let (frame, intents, _undo) = graph_query_or_write(&mut store, &[bs(GRAPH), bs(&q)]);
+        assert!(!matches!(frame, Frame::Error(_)), "CREATE {id}: {frame:?}");
+        assert_eq!(
+            intents.len(),
+            1,
+            "CREATE {id} must record a txn rollback intent (cache hit included)"
+        );
+        assert!(
+            !store.drain_wal().is_empty(),
+            "CREATE {id} must WAL its mutation (cache hit included)"
+        );
+    }
+    let cells = single_cells(&run_query(&store, "MATCH (n:W) RETURN n.id"));
+    assert_eq!(cells.len(), 2);
 }

@@ -272,9 +272,9 @@ mod tests {
         let graph = store.get_graph(b"g").expect("graph exists");
         assert_eq!(
             graph.plan_cache.lock().len(),
-            1,
-            "queries differing only in literal values must share one cached plan \
-             (and write queries must not be cached)"
+            2,
+            "literal variants must share one cached plan per shape: one WRITE \
+             plan for both CREATEs (W2-7) + one READ plan for both MATCHes"
         );
     }
 
@@ -326,8 +326,9 @@ mod tests {
         let graph = store.get_graph(b"g").expect("graph exists");
         assert_eq!(
             graph.plan_cache.lock().len(),
-            1,
-            "string-literal variants must share one cached plan"
+            2,
+            "string-literal variants must share one cached plan per shape \
+             (one write, one read — W2-7 caches writes too)"
         );
     }
 

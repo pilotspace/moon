@@ -536,9 +536,11 @@ fn graph_query_readonly(store: &GraphStore, args: &[Frame], reject_writes: bool)
 
     let (effective, query_hash, auto_params) = normalize_cypher(cypher_bytes);
 
-    // Cache hit ⇒ read-only plan (PlanCache invariant) ⇒ no parse at all.
+    // Read-only cache hit ⇒ no parse at all. A cached WRITE plan (W2-7)
+    // falls through to the parse path, which reports it exactly like an
+    // uncached write query would be.
     let cached = graph.plan_cache.lock().get(query_hash);
-    if let Some(plan) = cached {
+    if let Some((plan, true)) = cached {
         return run_read_query(graph, args, &plan, auto_params);
     }
 
@@ -561,10 +563,13 @@ fn graph_query_readonly(store: &GraphStore, args: &[Frame], reject_writes: bool)
             return Frame::Error(Bytes::from(msg));
         }
     };
-    // Cache read-only plans ONLY — a cache hit skips classification, so a
-    // cached write plan would execute on the read path.
+    // Cache read-only plans only on this handler — hits above route straight
+    // to the read executor. (Write plans are cached by the write handlers.)
     if query.is_read_only() {
-        graph.plan_cache.lock().insert(query_hash, plan.clone());
+        graph
+            .plan_cache
+            .lock()
+            .insert(query_hash, plan.clone(), true);
     }
     run_read_query(graph, args, &plan, auto_params)
 }
@@ -590,11 +595,38 @@ pub fn graph_query_write(store: &mut GraphStore, args: &[Frame]) -> Frame {
         None => return Frame::Error(Bytes::from_static(b"ERR invalid Cypher query")),
     };
 
-    let query = match cypher::parse_cypher(cypher_bytes) {
-        Ok(q) => q,
-        Err(e) => {
-            let msg = format!("ERR Cypher parse error: {e}");
-            return Frame::Error(Bytes::from(msg));
+    // W2-7: literal-normalize + plan-cache for the write path too. A hit on
+    // a cached WRITE plan skips parse/compile entirely; per-run literal
+    // values arrive through the auto-extracted parameters.
+    let (effective, query_hash, auto_params) = normalize_cypher(cypher_bytes);
+    let cached = store
+        .get_graph(graph_name)
+        .and_then(|g| g.plan_cache.lock().get(query_hash));
+
+    let (plan, auto_params) = match cached {
+        Some((plan, false)) => (plan, auto_params),
+        // Read-only hit on the write handler is a dispatcher anomaly —
+        // treat as a miss so classification runs as before. Same for a
+        // genuine miss.
+        _ => {
+            let (query, query_hash, auto_params) =
+                match parse_effective(cypher_bytes, &effective, query_hash, auto_params) {
+                    Ok(t) => t,
+                    Err(msg) => return Frame::Error(Bytes::from(msg)),
+                };
+            let plan = match cypher::planner::compile(&query) {
+                Ok(p) => std::sync::Arc::new(p),
+                Err(e) => {
+                    let msg = format!("ERR Cypher plan error: {e}");
+                    return Frame::Error(Bytes::from(msg));
+                }
+            };
+            if let Some(g) = store.get_graph(graph_name) {
+                g.plan_cache
+                    .lock()
+                    .insert(query_hash, plan.clone(), query.is_read_only());
+            }
+            (plan, auto_params)
         }
     };
 
@@ -611,14 +643,6 @@ pub fn graph_query_write(store: &mut GraphStore, args: &[Frame]) -> Frame {
         Err(msg) => return Frame::Error(Bytes::from_static(msg.as_bytes())),
     }
 
-    let plan = match cypher::planner::compile(&query) {
-        Ok(p) => p,
-        Err(e) => {
-            let msg = format!("ERR Cypher plan error: {e}");
-            return Frame::Error(Bytes::from(msg));
-        }
-    };
-
     let lsn = store.allocate_lsn();
 
     // Scoped borrow: get mutable graph, execute, release borrow before WAL push.
@@ -628,7 +652,12 @@ pub fn graph_query_write(store: &mut GraphStore, args: &[Frame]) -> Frame {
             None => return Frame::Error(Bytes::from_static(b"ERR graph not found")),
         };
 
-        let params = parse_params(args);
+        // Merge auto-extracted literal values: the plan was compiled from
+        // the normalized text, so `$__pN` parameters must resolve.
+        let mut params = parse_params(args);
+        for (name, value) in auto_params {
+            params.insert(name, value);
+        }
         match cypher::executor::execute_mut(graph, &plan, &params, lsn) {
             Ok(r) => r,
             Err(e) => {
@@ -762,17 +791,31 @@ pub fn graph_query_or_write(
 
     let (effective, query_hash, auto_params) = normalize_cypher(cypher_bytes);
 
-    // Fast path: plan-cache hit ⇒ read-only plan (PlanCache invariant) ⇒
-    // route to the read path with ZERO parse/compile work.
-    if let Some(graph) = store.get_graph(graph_name) {
-        let cached = graph.plan_cache.lock().get(query_hash);
-        if let Some(plan) = cached {
+    // Fast path: plan-cache hit — a read-only plan routes to the read path,
+    // a WRITE plan (W2-7) to the write path; both with ZERO parse/compile
+    // work (per-run literal values arrive via the auto-params).
+    let cached = store
+        .get_graph(graph_name)
+        .and_then(|g| g.plan_cache.lock().get(query_hash));
+    match cached {
+        Some((plan, true)) => {
+            let Some(graph) = store.get_graph(graph_name) else {
+                return (
+                    Frame::Error(Bytes::from_static(b"ERR graph not found")),
+                    Vec::new(),
+                    Vec::new(),
+                );
+            };
             return (
                 run_read_query(graph, args, &plan, auto_params),
                 Vec::new(),
                 Vec::new(),
             );
         }
+        Some((plan, false)) => {
+            return execute_write_plan(store, graph_name, args, &plan, auto_params);
+        }
+        None => {}
     }
 
     // Slow path: parse once (normalized text, raw fallback) and classify.
@@ -802,7 +845,10 @@ pub fn graph_query_or_write(
                 return (Frame::Error(Bytes::from(msg)), Vec::new(), Vec::new());
             }
         };
-        graph.plan_cache.lock().insert(query_hash, plan.clone());
+        graph
+            .plan_cache
+            .lock()
+            .insert(query_hash, plan.clone(), true);
 
         (
             run_read_query(graph, args, &plan, auto_params),
@@ -810,190 +856,210 @@ pub fn graph_query_or_write(
             Vec::new(),
         )
     } else {
-        // Decay biases read-path traversal cost only; a write query must not
-        // silently accept (or skip validating) the flag. Reject before any
-        // side effect (LSN allocation, mutation).
-        match parse_decay(args) {
-            Ok(None) => {}
-            Ok(Some(_)) => {
-                return (
-                    Frame::Error(Bytes::from_static(
-                        b"ERR --decay requires a read-only Cypher query",
-                    )),
-                    Vec::new(),
-                    Vec::new(),
-                );
-            }
-            Err(msg) => {
-                return (
-                    Frame::Error(Bytes::from_static(msg.as_bytes())),
-                    Vec::new(),
-                    Vec::new(),
-                );
-            }
-        }
-
-        // Write path: compile plan (no cache for writes), execute with mutations.
         let plan = match cypher::planner::compile(&query) {
-            Ok(p) => p,
+            Ok(p) => std::sync::Arc::new(p),
             Err(e) => {
                 let msg = format!("ERR Cypher plan error: {e}");
                 return (Frame::Error(Bytes::from(msg)), Vec::new(), Vec::new());
             }
         };
+        // W2-7: cache the write plan so the next occurrence of this
+        // normalized text skips parse + compile entirely.
+        if let Some(g) = store.get_graph(graph_name) {
+            g.plan_cache.lock().insert(query_hash, plan.clone(), false);
+        }
+        execute_write_plan(store, graph_name, args, &plan, auto_params)
+    }
+}
 
-        let lsn = store.allocate_lsn();
+/// Write-execution tail shared by `graph_query_or_write`'s compile path and
+/// its W2-7 plan-cache hit path: decay validation (before any side effect),
+/// LSN allocation, `execute_mut` with auto-params merged, and the
+/// mutation → WAL / txn-intent / undo-op fan-out.
+fn execute_write_plan(
+    store: &mut GraphStore,
+    graph_name: &[u8],
+    args: &[Frame],
+    plan: &cypher::PhysicalPlan,
+    auto_params: Vec<(String, cypher::executor::Value)>,
+) -> (
+    Frame,
+    Vec<cypher::executor::GraphWriteIntent>,
+    Vec<crate::transaction::GraphUndoOp>,
+) {
+    // Decay biases read-path traversal cost only; a write query must not
+    // silently accept (or skip validating) the flag. Reject before any
+    // side effect (LSN allocation, mutation).
+    match parse_decay(args) {
+        Ok(None) => {}
+        Ok(Some(_)) => {
+            return (
+                Frame::Error(Bytes::from_static(
+                    b"ERR --decay requires a read-only Cypher query",
+                )),
+                Vec::new(),
+                Vec::new(),
+            );
+        }
+        Err(msg) => {
+            return (
+                Frame::Error(Bytes::from_static(msg.as_bytes())),
+                Vec::new(),
+                Vec::new(),
+            );
+        }
+    }
 
-        // Phase 174 FIX-02: extract mutations regardless of Ok/Err so that
-        // partial writes from before the error are visible to TXN.ABORT.
-        let (result_or_err, mutations) = {
-            let graph = match store.get_graph_mut(graph_name) {
-                Some(g) => g,
-                None => {
-                    return (
-                        Frame::Error(Bytes::from_static(b"ERR graph not found")),
-                        Vec::new(),
-                        Vec::new(),
-                    );
-                }
-            };
+    let lsn = store.allocate_lsn();
 
-            // Merge auto-extracted literal values: the write plan was
-            // compiled from the normalized text, so `$__pN` parameters must
-            // resolve or CREATE would store Nulls.
-            let mut params = parse_params(args);
-            for (name, value) in auto_params {
-                params.insert(name, value);
-            }
-            match cypher::executor::execute_mut(graph, &plan, &params, lsn) {
-                Ok(r) => {
-                    let muts = r.mutations;
-                    (
-                        Ok(cypher::executor::ExecResult {
-                            columns: r.columns,
-                            rows: r.rows,
-                            nodes_created: r.nodes_created,
-                            nodes_deleted: r.nodes_deleted,
-                            properties_set: r.properties_set,
-                            execution_time_us: r.execution_time_us,
-                            mutations: Vec::new(), // moved out above
-                        }),
-                        muts,
-                    )
-                }
-                Err(e) => {
-                    let msg = format!("ERR Cypher execution error: {e}");
-                    (Err(msg), e.partial_mutations)
-                }
+    // Phase 174 FIX-02: extract mutations regardless of Ok/Err so that
+    // partial writes from before the error are visible to TXN.ABORT.
+    let (result_or_err, mutations) = {
+        let graph = match store.get_graph_mut(graph_name) {
+            Some(g) => g,
+            None => {
+                return (
+                    Frame::Error(Bytes::from_static(b"ERR graph not found")),
+                    Vec::new(),
+                    Vec::new(),
+                );
             }
         };
 
-        // Phase 167: collect write intents for CrossStoreTxn rollback. Every
-        // CreateNode/CreateEdge mutation (from CreatePattern and the Merge
-        // create-branch) becomes an intent; MERGE match-branches produce no
-        // mutation and therefore no intent (idempotent rollback).
-        let mut intents: Vec<cypher::executor::GraphWriteIntent> =
-            Vec::with_capacity(mutations.len());
-
-        // Phase 174 FIX-01: collect undo ops for SET/DELETE/MERGE rollback.
-        let gname_bytes = Bytes::copy_from_slice(graph_name);
-        let mut undo_ops: Vec<crate::transaction::GraphUndoOp> = Vec::new();
-
-        // Generate WAL records for mutations + collect intents/undo ops.
-        for mutation in &mutations {
-            match mutation {
-                cypher::executor::MutationRecord::CreateNode {
-                    node_id,
-                    labels,
-                    properties,
-                    embedding,
-                } => {
-                    intents.push(cypher::executor::GraphWriteIntent {
-                        entity_id: *node_id,
-                        is_node: true,
-                    });
-                    store
-                        .wal_pending
-                        .push(crate::graph::wal::serialize_add_node(
-                            graph_name,
-                            *node_id,
-                            labels,
-                            properties,
-                            embedding.as_deref(),
-                        ));
-                }
-                cypher::executor::MutationRecord::CreateEdge {
-                    edge_id,
-                    src_id,
-                    dst_id,
-                    edge_type,
-                    weight,
-                    properties,
-                } => {
-                    intents.push(cypher::executor::GraphWriteIntent {
-                        entity_id: *edge_id,
-                        is_node: false,
-                    });
-                    store
-                        .wal_pending
-                        .push(crate::graph::wal::serialize_add_edge(
-                            graph_name,
-                            *edge_id,
-                            *src_id,
-                            *dst_id,
-                            *edge_type,
-                            *weight,
-                            properties.as_ref(),
-                        ));
-                }
-                // Phase 174 FIX-01: new variants for SET/DELETE/MERGE rollback.
-                cypher::executor::MutationRecord::SetProperty {
-                    entity_id,
-                    is_node,
-                    key,
-                    old_value,
-                } => {
-                    undo_ops.push(crate::transaction::GraphUndoOp::RestoreProperty {
-                        graph_name: gname_bytes.clone(),
-                        entity_id: *entity_id,
-                        is_node: *is_node,
-                        prop_key: *key,
-                        old_value: old_value.clone(),
-                    });
-                }
-                cypher::executor::MutationRecord::DeleteNode { node_id, .. } => {
-                    undo_ops.push(crate::transaction::GraphUndoOp::UndeleteNode {
-                        graph_name: gname_bytes.clone(),
-                        node_id: *node_id,
-                        delete_lsn: lsn,
-                    });
-                    // W2-2: WAL the delete or it resurrects at restart.
-                    store
-                        .wal_pending
-                        .push(crate::graph::wal::serialize_remove_node(
-                            graph_name, *node_id,
-                        ));
-                }
-                cypher::executor::MutationRecord::DeleteEdge { edge_id, .. } => {
-                    undo_ops.push(crate::transaction::GraphUndoOp::UndeleteEdge {
-                        graph_name: gname_bytes.clone(),
-                        edge_id: *edge_id,
-                    });
-                    store
-                        .wal_pending
-                        .push(crate::graph::wal::serialize_remove_edge(
-                            graph_name, *edge_id,
-                        ));
-                }
+        // Merge auto-extracted literal values: the write plan was
+        // compiled from the normalized text, so `$__pN` parameters must
+        // resolve or CREATE would store Nulls.
+        let mut params = parse_params(args);
+        for (name, value) in auto_params {
+            params.insert(name, value);
+        }
+        match cypher::executor::execute_mut(graph, plan, &params, lsn) {
+            Ok(r) => {
+                let muts = r.mutations;
+                (
+                    Ok(cypher::executor::ExecResult {
+                        columns: r.columns,
+                        rows: r.rows,
+                        nodes_created: r.nodes_created,
+                        nodes_deleted: r.nodes_deleted,
+                        properties_set: r.properties_set,
+                        execution_time_us: r.execution_time_us,
+                        mutations: Vec::new(), // moved out above
+                    }),
+                    muts,
+                )
+            }
+            Err(e) => {
+                let msg = format!("ERR Cypher execution error: {e}");
+                (Err(msg), e.partial_mutations)
             }
         }
+    };
 
-        // Phase 174 FIX-02: return intents/undo_ops on BOTH Ok and Err paths
-        // so TXN.ABORT can roll back partial writes from before the error.
-        match result_or_err {
-            Ok(ref result) => (exec_result_to_frame(result), intents, undo_ops),
-            Err(msg) => (Frame::Error(Bytes::from(msg)), intents, undo_ops),
+    // Phase 167: collect write intents for CrossStoreTxn rollback. Every
+    // CreateNode/CreateEdge mutation (from CreatePattern and the Merge
+    // create-branch) becomes an intent; MERGE match-branches produce no
+    // mutation and therefore no intent (idempotent rollback).
+    let mut intents: Vec<cypher::executor::GraphWriteIntent> = Vec::with_capacity(mutations.len());
+
+    // Phase 174 FIX-01: collect undo ops for SET/DELETE/MERGE rollback.
+    let gname_bytes = Bytes::copy_from_slice(graph_name);
+    let mut undo_ops: Vec<crate::transaction::GraphUndoOp> = Vec::new();
+
+    // Generate WAL records for mutations + collect intents/undo ops.
+    for mutation in &mutations {
+        match mutation {
+            cypher::executor::MutationRecord::CreateNode {
+                node_id,
+                labels,
+                properties,
+                embedding,
+            } => {
+                intents.push(cypher::executor::GraphWriteIntent {
+                    entity_id: *node_id,
+                    is_node: true,
+                });
+                store
+                    .wal_pending
+                    .push(crate::graph::wal::serialize_add_node(
+                        graph_name,
+                        *node_id,
+                        labels,
+                        properties,
+                        embedding.as_deref(),
+                    ));
+            }
+            cypher::executor::MutationRecord::CreateEdge {
+                edge_id,
+                src_id,
+                dst_id,
+                edge_type,
+                weight,
+                properties,
+            } => {
+                intents.push(cypher::executor::GraphWriteIntent {
+                    entity_id: *edge_id,
+                    is_node: false,
+                });
+                store
+                    .wal_pending
+                    .push(crate::graph::wal::serialize_add_edge(
+                        graph_name,
+                        *edge_id,
+                        *src_id,
+                        *dst_id,
+                        *edge_type,
+                        *weight,
+                        properties.as_ref(),
+                    ));
+            }
+            // Phase 174 FIX-01: new variants for SET/DELETE/MERGE rollback.
+            cypher::executor::MutationRecord::SetProperty {
+                entity_id,
+                is_node,
+                key,
+                old_value,
+            } => {
+                undo_ops.push(crate::transaction::GraphUndoOp::RestoreProperty {
+                    graph_name: gname_bytes.clone(),
+                    entity_id: *entity_id,
+                    is_node: *is_node,
+                    prop_key: *key,
+                    old_value: old_value.clone(),
+                });
+            }
+            cypher::executor::MutationRecord::DeleteNode { node_id, .. } => {
+                undo_ops.push(crate::transaction::GraphUndoOp::UndeleteNode {
+                    graph_name: gname_bytes.clone(),
+                    node_id: *node_id,
+                    delete_lsn: lsn,
+                });
+                // W2-2: WAL the delete or it resurrects at restart.
+                store
+                    .wal_pending
+                    .push(crate::graph::wal::serialize_remove_node(
+                        graph_name, *node_id,
+                    ));
+            }
+            cypher::executor::MutationRecord::DeleteEdge { edge_id, .. } => {
+                undo_ops.push(crate::transaction::GraphUndoOp::UndeleteEdge {
+                    graph_name: gname_bytes.clone(),
+                    edge_id: *edge_id,
+                });
+                store
+                    .wal_pending
+                    .push(crate::graph::wal::serialize_remove_edge(
+                        graph_name, *edge_id,
+                    ));
+            }
         }
+    }
+
+    // Phase 174 FIX-02: return intents/undo_ops on BOTH Ok and Err paths
+    // so TXN.ABORT can roll back partial writes from before the error.
+    match result_or_err {
+        Ok(ref result) => (exec_result_to_frame(result), intents, undo_ops),
+        Err(msg) => (Frame::Error(Bytes::from(msg)), intents, undo_ops),
     }
 }
 
