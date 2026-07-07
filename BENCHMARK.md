@@ -867,6 +867,30 @@ concurrent harness) trailed ~4×. The two harnesses are not directly comparable
 (fork-bound single client compresses server-side deltas); a fresh 8-thread GCloud run
 is the right follow-up before claiming the Cypher gap is closed.
 
+### 11.7b 2026-07-07 Cypher-2× wave (P1 mutable property index, P2 result cache, P3 text predicates)
+
+Follow-up to §11.7/§11.8: profiling showed 82.5% of shard CPU in `index_scan_keys`'s
+mutable-tier linear scan. Three features landed (commits `8d5794b9`, `9b38f56c`+`1abc4998`,
+`9d634607`):
+
+- **P1 — mutable-tier property index**: point queries stop scanning every memgraph node.
+  Quiet-host measurement (OrbStack, 8-thread, 5K nodes): 25,506 → **29,014 qps**, p50
+  0.30 → **0.22 ms** (−27%), shard CPU −~70% (`index_scan_keys` GONE from perf profile;
+  top symbol drops to 3.9% kernel TCP). Same-box FalkorDB ratio 2.44× → **2.78×**.
+  The win scales with graph size: the bench scans only 5K nodes; at 1M the old path is
+  ~200× more per-query while the index probe stays O(1).
+- **P2 — Cypher result cache** (write-gen invalidated, pre-encoded RESP bytes, TinyLFU
+  doorkeeper): interleaved A/B vs P1-only (noisy shared host, alternating runs):
+  cache-hostile cycling **−2.4%** (was −21% before the doorkeeper — admission on second
+  sighting removed the serialize+insert+O(n)-evict miss cost), hot-key repeat **+1.9%**.
+  Real payoff is expensive reads (a 24 ms full-graph aggregation becomes a byte-copy),
+  not client-bound point queries.
+- **P3 — text predicates via FTS reuse**: `CONTAINS` / `STARTS WITH` / `ENDS WITH` (new
+  syntax) + `=~` now prune frozen segments through a `SegmentTextIndex` (presence
+  bitmap — deliberately NOT token-postings: `CONTAINS 'rust'` must match `"trusted"`,
+  so tokenized pruning would be unsound; residual Filter stays authoritative). BM25
+  scoring path implemented + tested, Cypher surface syntax deferred.
+
 ### 11.8 2026-07-07 wave-2 vs FalkorDB — 8-thread GCloud harness: **Cypher gap CLOSED**
 
 Same harness as §11.5 (graph phase of `gce-4feature-bench.sh`: 5K nodes, 15K edges,
