@@ -6,6 +6,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — Windows build: `accept_backoff` used unix-only `libc` errnos (PR #TBD)
+
+- `is_resource_exhaustion` (accept-loop backoff, PR #230) referenced
+  `libc::EMFILE`/`ENFILE`/`ENOBUFS`/`ENOMEM` unguarded; `libc` is not linked
+  on Windows, breaking the main-push Windows check (PRs never caught it —
+  Windows CI is skipped on PRs). Now cfg-split: unix keeps the errno match,
+  Windows matches WSAEMFILE (10024) / WSAENOBUFS (10055) /
+  `ErrorKind::OutOfMemory`.
+
 ### Changed — AOF writer coalesces each group-commit batch into one write (PR #TBD)
 
 - The two monoio AOF writer paths (TopLevel via `commit_group_commit_batch`,

@@ -87,11 +87,21 @@ fn backoff_for(consecutive: u32) -> Duration {
 /// Errors that indicate the process/system is out of a resource needed to
 /// accept — retrying immediately would just spin. Everything else is treated
 /// as a transient per-connection error (logged, loop continues, no sleep).
+#[cfg(unix)]
 fn is_resource_exhaustion(err: &std::io::Error) -> bool {
     matches!(
         err.raw_os_error(),
         Some(libc::EMFILE) | Some(libc::ENFILE) | Some(libc::ENOBUFS) | Some(libc::ENOMEM)
     )
+}
+
+/// Windows variant — `libc` is not linked there. WSAEMFILE (10024) and
+/// WSAENOBUFS (10055) are winsock's fd/buffer exhaustion; `OutOfMemory`
+/// covers the ENOMEM-alikes the kind mapping recognizes.
+#[cfg(not(unix))]
+fn is_resource_exhaustion(err: &std::io::Error) -> bool {
+    matches!(err.raw_os_error(), Some(10024) | Some(10055))
+        || matches!(err.kind(), std::io::ErrorKind::OutOfMemory)
 }
 
 #[cfg(test)]
