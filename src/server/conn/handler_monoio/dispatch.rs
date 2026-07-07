@@ -1147,23 +1147,33 @@ pub(super) fn try_handle_functions(
     cmd_args: &[Frame],
     conn: &ConnectionState,
     ctx: &ConnectionContext,
-    func_registry: &Rc<RefCell<crate::scripting::FunctionRegistry>>,
+    func_registry: &Rc<RefCell<Option<crate::scripting::FunctionRegistry>>>,
     responses: &mut Vec<Frame>,
 ) -> bool {
     if conn.in_multi {
         return false;
     }
     if cmd.eq_ignore_ascii_case(b"FUNCTION") {
+        crate::server::conn::core::ensure_function_registry(func_registry, ctx);
+        let mut guard = func_registry.borrow_mut();
+        #[allow(clippy::unwrap_used)]
+        // ensure_function_registry guarantees Some
         let response =
-            crate::command::functions::handle_function(&mut func_registry.borrow_mut(), cmd_args);
+            crate::command::functions::handle_function(guard.as_mut().unwrap(), cmd_args);
+        drop(guard);
         responses.push(response);
         return true;
     }
     if cmd.eq_ignore_ascii_case(b"FCALL") {
+        crate::server::conn::core::ensure_function_registry(func_registry, ctx);
+        let guard = func_registry.borrow();
+        #[allow(clippy::unwrap_used)]
+        // ensure_function_registry guarantees Some
+        let reg = guard.as_ref().unwrap();
         let response = crate::shard::slice::with_shard(|s| {
             let db_count = s.databases.len();
             crate::command::functions::handle_fcall(
-                &func_registry.borrow(),
+                reg,
                 cmd_args,
                 &mut s.databases[conn.selected_db],
                 ctx.shard_id,
@@ -1172,14 +1182,20 @@ pub(super) fn try_handle_functions(
                 db_count,
             )
         });
+        drop(guard);
         responses.push(response);
         return true;
     }
     if cmd.eq_ignore_ascii_case(b"FCALL_RO") {
+        crate::server::conn::core::ensure_function_registry(func_registry, ctx);
+        let guard = func_registry.borrow();
+        #[allow(clippy::unwrap_used)]
+        // ensure_function_registry guarantees Some
+        let reg = guard.as_ref().unwrap();
         let response = crate::shard::slice::with_shard(|s| {
             let db_count = s.databases.len();
             crate::command::functions::handle_fcall_ro(
-                &func_registry.borrow(),
+                reg,
                 cmd_args,
                 &mut s.databases[conn.selected_db],
                 ctx.shard_id,
@@ -1188,6 +1204,7 @@ pub(super) fn try_handle_functions(
                 db_count,
             )
         });
+        drop(guard);
         responses.push(response);
         return true;
     }

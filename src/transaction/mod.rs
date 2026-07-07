@@ -97,6 +97,13 @@ pub struct CrossStoreTxn {
     pub txn_id: u64,
     /// Snapshot LSN for reads.
     pub snapshot_lsn: u64,
+    /// Logical db index the connection had SELECTed at `TXN.BEGIN`. Written
+    /// into the `XactCommitV2` WAL header so crash replay restores the KV ops
+    /// into this db (previously replay hardcoded db 0). KV writes inside the
+    /// txn use the connection's live `selected_db` per command; a mid-txn
+    /// `SELECT` is a pre-existing single-db assumption shared with the
+    /// forward-image encoder, which reads back from one db at commit.
+    pub db_index: usize,
     /// KV undo log for rollback.
     pub kv_undo: UndoLog,
     /// Vector point_ids modified in this transaction.
@@ -112,12 +119,14 @@ pub struct CrossStoreTxn {
 }
 
 impl CrossStoreTxn {
-    /// Create a new cross-store transaction.
+    /// Create a new cross-store transaction bound to the connection's
+    /// currently SELECTed logical db.
     #[inline]
-    pub fn new(txn_id: u64, snapshot_lsn: u64) -> Self {
+    pub fn new(txn_id: u64, snapshot_lsn: u64, db_index: usize) -> Self {
         Self {
             txn_id,
             snapshot_lsn,
+            db_index,
             kv_undo: UndoLog::new(),
             vector_intents: SmallVec::new(),
             graph_intents: SmallVec::new(),
@@ -215,7 +224,7 @@ mod tests {
 
     #[test]
     fn test_cross_store_txn_new() {
-        let txn = CrossStoreTxn::new(42, 41);
+        let txn = CrossStoreTxn::new(42, 41, 0);
         assert_eq!(txn.txn_id, 42);
         assert_eq!(txn.snapshot_lsn, 41);
         assert!(!txn.has_modifications());
@@ -223,7 +232,7 @@ mod tests {
 
     #[test]
     fn test_has_modifications_kv() {
-        let mut txn = CrossStoreTxn::new(1, 0);
+        let mut txn = CrossStoreTxn::new(1, 0, 0);
         assert!(!txn.has_modifications());
         txn.record_kv_insert(Bytes::from_static(b"key"));
         assert!(txn.has_modifications());
@@ -231,21 +240,21 @@ mod tests {
 
     #[test]
     fn test_has_modifications_vector() {
-        let mut txn = CrossStoreTxn::new(1, 0);
+        let mut txn = CrossStoreTxn::new(1, 0, 0);
         txn.record_vector(100, Bytes::from_static(b"idx"));
         assert!(txn.has_modifications());
     }
 
     #[test]
     fn test_has_modifications_graph() {
-        let mut txn = CrossStoreTxn::new(1, 0);
+        let mut txn = CrossStoreTxn::new(1, 0, 0);
         txn.record_graph(200, true, Bytes::from_static(b"g"));
         assert!(txn.has_modifications());
     }
 
     #[test]
     fn test_graph_intent_records_graph_name() {
-        let mut txn = CrossStoreTxn::new(1, 0);
+        let mut txn = CrossStoreTxn::new(1, 0, 0);
         txn.record_graph(10, true, Bytes::from_static(b"g1"));
         txn.record_graph(11, false, Bytes::from_static(b"g2"));
         assert_eq!(txn.graph_intents.len(), 2);
@@ -259,7 +268,7 @@ mod tests {
 
     #[test]
     fn test_graph_intent_reverse_order_is_lifo() {
-        let mut txn = CrossStoreTxn::new(1, 0);
+        let mut txn = CrossStoreTxn::new(1, 0, 0);
         // Push three intents; reverse iteration must yield them LIFO so Plan
         // 166-03 can remove edges before their endpoint nodes on rollback.
         txn.record_graph(1, true, Bytes::from_static(b"g"));
@@ -278,7 +287,7 @@ mod tests {
 
     #[test]
     fn test_mq_intent_tracking() {
-        let mut txn = CrossStoreTxn::new(10, 9);
+        let mut txn = CrossStoreTxn::new(10, 9, 0);
         assert!(!txn.has_modifications());
 
         txn.record_mq(

@@ -132,6 +132,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shared `READY_TIMEOUT` constant (poll-based loop notices readiness within
   100ms either way; the fixed 15s was a documented host-load flake,
   observed on the macOS CI runner).
+### Fixed — connection-plane durability & lifecycle wave (PR #230)
+
+- **D-1 — cross-store TXN crash replay restores into the correct db**
+  (`src/transaction/mod.rs`, `wal_v3/record.rs`, `wal_v3/replay.rs`, txn
+  handlers): `CrossStoreTxn` had no db field and WAL replay hardcoded
+  `databases[0]`, so a `TXN.BEGIN…COMMIT` issued under `SELECT n≠0` replayed
+  its KV ops into db 0 after a crash — silent recovery corruption. Commits now
+  write a new `XactCommitV2` record (`0x53`) whose header carries the
+  BEGIN-time db index; replay targets that db (out-of-range falls back to
+  db 0 with a loud warning). v1 records still replay into db 0 (faithful to
+  the builds that wrote them).
+- **R-6 — connection migration fails open** (`conn_accept.rs`,
+  `handler_sharded/mod.rs`): the source shard dropped its socket before the
+  SPSC hand-off to the target was confirmed, so a full ring lost the client —
+  precisely under the overload that triggers migration. Both runtimes now
+  keep the original stream alive until the push succeeds (bounded retry,
+  8 × 100µs) and on give-up resume serving the connection on the source shard
+  with migration disabled, using the state recovered from the undelivered
+  message. Also fixes the tokio path's `connected_clients` leak on the old
+  loss path.
+- **Observability** (`admin/metrics_setup.rs`): new
+  `moon_xshard_backpressure_drops_total{target_shard}` counter + warn on every
+  R-1 give-up, and `moon_shard_connected_clients{shard}` gauge (maintained at
+  registry register/deregister) to surface SO_REUSEPORT imbalance and
+  affinity funnels without parsing `CLIENT LIST`.
+- **P-1 — lazy per-connection `FunctionRegistry`** (both handlers,
+  `conn/core.rs`): the Functions API registry + `LuaEvictionCtx` (6 Arc/Rc
+  clones) were built eagerly for every connection; now built on first
+  FUNCTION/FCALL/FCALL_RO, cutting per-connection setup cost at high
+  connection counts.
+- **S-5 — `--tcp-backlog`** (`config.rs`, `conn_accept.rs`, `main.rs`): the
+  per-socket listen backlog was hardcoded 1024; now configurable (default
+  unchanged) for connection-storm tuning alongside `ulimit -n`.
+
 ### Fixed — connection-plane robustness hardening (Track B) (PR #230)
 
 - **R-3 — `CLIENT KILL` force-closes idle connections** (`src/client_registry.rs`,

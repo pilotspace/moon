@@ -142,12 +142,15 @@ pub fn register(
         live: Arc::clone(&live),
     };
     REGISTRY.write().insert(id, entry);
+    crate::admin::metrics_setup::record_shard_connection_delta(shard, 1.0);
     live
 }
 
 /// Deregister a client connection.
 pub fn deregister(id: u64) {
-    REGISTRY.write().remove(&id);
+    if let Some(entry) = REGISTRY.write().remove(&id) {
+        crate::admin::metrics_setup::record_shard_connection_delta(entry.shard, -1.0);
+    }
 }
 
 /// Update mutable fields for a client (CLIENT SETNAME and similar — rare,

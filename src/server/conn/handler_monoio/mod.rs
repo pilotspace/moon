@@ -173,20 +173,14 @@ pub(crate) async fn handle_connection_sharded_monoio<
     }
     let _registry_guard = RegistryGuard(client_id);
 
-    // Functions API registry (per-connection, lazy init) — kept as local because Rc<RefCell<>> is !Send.
-    // Real eviction ctx (Gap B): FCALL-internal `redis.call` writes must run
-    // the same OOM gate as EVAL/EVALSHA, same handles `LuaEvictionCtx::new`
-    // uses elsewhere on this shard (conn_accept.rs's `setup_lua_vm` call).
-    let func_registry = Rc::new(RefCell::new(crate::scripting::FunctionRegistry::new(
-        crate::scripting::bridge::LuaEvictionCtx::new(
-            ctx.shard_databases.clone(),
-            ctx.runtime_config.clone(),
-            ctx.shard_id,
-            ctx.spill_sender.clone(),
-            ctx.spill_file_id.clone(),
-            ctx.disk_offload_dir.clone(),
-        ),
-    )));
+    // Functions API registry — LAZY per connection (P-1 footprint): built on
+    // first FUNCTION/FCALL/FCALL_RO via `ensure_function_registry`, so the
+    // >99% of connections that never touch the Functions API pay zero
+    // registry + eviction-ctx cost. Kept as a local because Rc<RefCell<>> is
+    // !Send. The eviction ctx (Gap B — FCALL-internal `redis.call` writes run
+    // the same OOM gate as EVAL) is built by `ctx.build_lua_eviction_ctx()`.
+    let func_registry: Rc<RefCell<Option<crate::scripting::FunctionRegistry>>> =
+        Rc::new(RefCell::new(None));
 
     // Pre-allocate read buffer outside the loop to avoid per-read heap allocation.
     // Monoio's ownership I/O takes ownership and returns the buffer, so we reassign.

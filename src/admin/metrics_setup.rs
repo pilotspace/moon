@@ -672,6 +672,39 @@ pub fn connected_clients() -> u64 {
     CONNECTED_CLIENTS.load(Ordering::Relaxed)
 }
 
+/// Adjust the per-shard connected-clients gauge (S-6 observability): the
+/// only way to see SO_REUSEPORT imbalance or an affinity-funnel pile-up
+/// without parsing CLIENT LIST. Called from client-registry
+/// register/deregister — connect/disconnect rate, never per-command.
+#[inline]
+pub fn record_shard_connection_delta(shard: usize, delta: f64) {
+    if !METRICS_INITIALIZED.load(Ordering::Relaxed) {
+        return;
+    }
+    gauge!("moon_shard_connected_clients", "shard" => shard.to_string()).increment(delta);
+}
+
+/// Record a cross-shard dispatch message dropped after the bounded
+/// backpressure budget expired ([`PushOutcome::Backpressure`] give-up, R-1).
+///
+/// Fires only on the give-up path (target ring never drained for ~0.5s), so
+/// the label allocation is off the hot path. A non-zero rate here means a
+/// shard is wedged or persistently saturated — reply-carrying callers have
+/// surfaced per-command errors, but this counter is the aggregate signal.
+///
+/// [`PushOutcome::Backpressure`]: crate::shard::dispatch::PushOutcome::Backpressure
+#[inline]
+pub fn record_xshard_backpressure_drop(target_shard: usize) {
+    if !METRICS_INITIALIZED.load(Ordering::Relaxed) {
+        return;
+    }
+    counter!(
+        "moon_xshard_backpressure_drops_total",
+        "target_shard" => target_shard.to_string()
+    )
+    .increment(1);
+}
+
 /// Try to open a connection if under the maxclients limit.
 /// Returns true if the connection was accepted, false if at limit.
 /// When maxclients is 0, the limit is disabled (unlimited).

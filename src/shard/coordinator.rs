@@ -891,6 +891,14 @@ async fn spsc_send_bounded(
 
     // Budget exhausted: the target ring never drained. Drop `pending` (and any
     // embedded reply sender) so awaiting callers fail loud instead of hanging.
+    // Rare by construction (~0.5s of failed retries), so the warn + labeled
+    // counter cannot flood.
+    tracing::warn!(
+        my_shard,
+        target_shard,
+        "cross-shard dispatch dropped after backpressure budget — target not draining"
+    );
+    crate::admin::metrics_setup::record_xshard_backpressure_drop(target_shard);
     PushOutcome::Backpressure
 }
 

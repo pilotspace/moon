@@ -34,7 +34,11 @@ pub(super) fn try_handle_txn_begin(
             // Unconditional slice path: ShardSlice is always initialized.
             let active =
                 crate::shard::slice::with_shard(|s| s.vector_store.txn_manager_mut().begin());
-            conn.active_cross_txn = Some(CrossStoreTxn::new(active.txn_id, active.snapshot_lsn));
+            conn.active_cross_txn = Some(CrossStoreTxn::new(
+                active.txn_id,
+                active.snapshot_lsn,
+                conn.selected_db,
+            ));
             responses.push(Frame::SimpleString(Bytes::from_static(b"OK")));
         }
         Err(e) => responses.push(e),
@@ -83,13 +87,16 @@ pub(super) async fn try_handle_txn_commit(
                     return true;
                 }
 
-                // Write XactCommit WAL record with committed KV state
+                // Write XactCommitV2 WAL record with committed KV state.
+                // Both the forward-image read and the record header use the
+                // txn's BEGIN-time db so commit and replay agree on the db.
                 let txn_id = txn.txn_id;
                 if !txn.kv_undo.is_empty() {
                     // Unconditional slice path: ShardSlice is always initialized.
-                    let payload = crate::shard::slice::with_shard_db(conn.selected_db, |db| {
-                        crate::persistence::wal_v3::record::encode_xact_commit_payload(
+                    let payload = crate::shard::slice::with_shard_db(txn.db_index, |db| {
+                        crate::persistence::wal_v3::record::encode_xact_commit_payload_v2(
                             txn_id,
+                            txn.db_index as u32,
                             txn.kv_undo.records(),
                             db,
                         )
@@ -98,7 +105,7 @@ pub(super) async fn try_handle_txn_commit(
                     crate::persistence::wal_v3::record::write_wal_v3_record(
                         &mut wal_buf,
                         txn_id,
-                        crate::persistence::wal_v3::record::WalRecordType::XactCommit,
+                        crate::persistence::wal_v3::record::WalRecordType::XactCommitV2,
                         &payload,
                     );
                     ctx.shard_databases
