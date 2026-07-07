@@ -1221,15 +1221,23 @@ pub(crate) async fn handle_connection_sharded_inner<
                                 if let Some(ref bytes) = aof_bytes {
                                     if let Some(ref pool) = ctx.aof_pool {
                                         let lsn = aof::AofWriterPool::issue_append_lsn(&ctx.repl_state, ctx.shard_id, bytes.len());
-                                        if pool
-                                            .try_send_append_durable(ctx.shard_id, lsn, bytes.clone())
+                                        match pool
+                                            .send_append_group(ctx.shard_id, lsn, bytes.clone())
                                             .await
-                                            .is_err()
                                         {
-                                            responses.push(Frame::Error(Bytes::from_static(
-                                                aof::AOF_FSYNC_ERR,
-                                            )));
-                                            continue;
+                                            // Always: one fsync_barrier per batch
+                                            // (resolve_local_leg_barrier) instead of
+                                            // an awaited fsync per command.
+                                            Ok(true) => {
+                                                local_leg_write_idxs.push(responses.len())
+                                            }
+                                            Ok(false) => {}
+                                            Err(_) => {
+                                                responses.push(Frame::Error(Bytes::from_static(
+                                                    aof::AOF_FSYNC_ERR,
+                                                )));
+                                                continue;
+                                            }
                                         }
                                     }
                                 }
@@ -1271,15 +1279,23 @@ pub(crate) async fn handle_connection_sharded_inner<
                                     if let Some(ref bytes) = aof_bytes {
                                         if let Some(ref pool) = ctx.aof_pool {
                                             let lsn = aof::AofWriterPool::issue_append_lsn(&ctx.repl_state, ctx.shard_id, bytes.len());
-                                            if pool
-                                                .try_send_append_durable(ctx.shard_id, lsn, bytes.clone())
+                                            match pool
+                                                .send_append_group(ctx.shard_id, lsn, bytes.clone())
                                                 .await
-                                                .is_err()
                                             {
-                                                responses.push(Frame::Error(Bytes::from_static(
-                                                    aof::AOF_FSYNC_ERR,
-                                                )));
-                                                continue;
+                                                // Always: one fsync_barrier per batch
+                                                // (resolve_local_leg_barrier) instead of
+                                                // an awaited fsync per command.
+                                                Ok(true) => {
+                                                    local_leg_write_idxs.push(responses.len())
+                                                }
+                                                Ok(false) => {}
+                                                Err(_) => {
+                                                    responses.push(Frame::Error(Bytes::from_static(
+                                                        aof::AOF_FSYNC_ERR,
+                                                    )));
+                                                    continue;
+                                                }
                                             }
                                         }
                                     }
@@ -1554,21 +1570,26 @@ pub(crate) async fn handle_connection_sharded_inner<
                                     }
                                 }
                             }
-                            // H1: durable path under appendfsync=always.
+                            // Always-mode local writes join the per-batch group
+                            // commit: append enqueued fire-and-forget, confirmed by
+                            // ONE fsync_barrier before serialization
+                            // (resolve_local_leg_barrier) — previously each command
+                            // awaited its own fsync (the 8x P16 deficit vs Redis).
                             let mut aof_failed = false;
+                            let mut aof_barrier_pending = false;
                             if let Some(bytes) = aof_bytes {
                                 if !matches!(response, Frame::Error(_)) {
                                     if let Some(ref pool) = ctx.aof_pool {
                                         let lsn = aof::AofWriterPool::issue_append_lsn(&ctx.repl_state, ctx.shard_id, bytes.len());
-                                        if pool
-                                            .try_send_append_durable(ctx.shard_id, lsn, bytes)
-                                            .await
-                                            .is_err()
-                                        {
-                                            response = Frame::Error(Bytes::from_static(
-                                                aof::AOF_FSYNC_ERR,
-                                            ));
-                                            aof_failed = true;
+                                        match pool.send_append_group(ctx.shard_id, lsn, bytes).await {
+                                            Ok(true) => aof_barrier_pending = true,
+                                            Ok(false) => {}
+                                            Err(_) => {
+                                                response = Frame::Error(Bytes::from_static(
+                                                    aof::AOF_FSYNC_ERR,
+                                                ));
+                                                aof_failed = true;
+                                            }
                                         }
                                     }
                                 }
@@ -1589,6 +1610,11 @@ pub(crate) async fn handle_connection_sharded_inner<
                             let mut response = apply_resp3_conversion(cmd, response, conn.protocol_version);
                             if let Some(ws_id) = conn.workspace_id.as_ref() {
                                 strip_workspace_prefix_from_response(ws_id, cmd, &mut response);
+                            }
+                            // Only successful writes join the barrier set — an error
+                            // response must not be overwritten by a barrier failure.
+                            if aof_barrier_pending && !matches!(response, Frame::Error(_)) {
+                                local_leg_write_idxs.push(responses.len());
                             }
                             responses.push(response);
                         } else {

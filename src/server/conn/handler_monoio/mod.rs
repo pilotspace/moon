@@ -1163,15 +1163,19 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                 ctx.shard_id,
                                 serialized.len(),
                             );
-                            if pool
-                                .try_send_append_durable(ctx.shard_id, lsn, serialized)
-                                .await
-                                .is_err()
-                            {
-                                responses.push(Frame::Error(bytes::Bytes::from_static(
-                                    aof::AOF_FSYNC_ERR,
-                                )));
-                                continue;
+                            match pool.send_append_group(ctx.shard_id, lsn, serialized).await {
+                                // Always: durability confirmed by ONE
+                                // fsync_barrier per batch (resolve_local_leg_barrier
+                                // before serialization) instead of an awaited
+                                // fsync per pipelined command.
+                                Ok(true) => local_leg_write_idxs.push(responses.len()),
+                                Ok(false) => {}
+                                Err(_) => {
+                                    responses.push(Frame::Error(bytes::Bytes::from_static(
+                                        aof::AOF_FSYNC_ERR,
+                                    )));
+                                    continue;
+                                }
                             }
                         }
                     }
@@ -1224,15 +1228,16 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                     ctx.shard_id,
                                     serialized.len(),
                                 );
-                                if pool
-                                    .try_send_append_durable(ctx.shard_id, lsn, serialized)
-                                    .await
-                                    .is_err()
-                                {
-                                    responses.push(Frame::Error(bytes::Bytes::from_static(
-                                        aof::AOF_FSYNC_ERR,
-                                    )));
-                                    continue;
+                                match pool.send_append_group(ctx.shard_id, lsn, serialized).await {
+                                    // Same one-barrier-per-batch contract as MOVE.
+                                    Ok(true) => local_leg_write_idxs.push(responses.len()),
+                                    Ok(false) => {}
+                                    Err(_) => {
+                                        responses.push(Frame::Error(bytes::Bytes::from_static(
+                                            aof::AOF_FSYNC_ERR,
+                                        )));
+                                        continue;
+                                    }
                                 }
                             }
                         }
@@ -1475,6 +1480,14 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     // invalidation, etc.) below — the client must see
                     // the failure, not a silent inconsistency.
                     let mut aof_failed = false;
+                    // Always-mode local writes join the per-batch group commit:
+                    // the append is enqueued fire-and-forget here and confirmed
+                    // by ONE fsync_barrier before response serialization
+                    // (resolve_local_leg_barrier), amortizing the fsync across
+                    // the whole pipelined batch — previously each command
+                    // awaited its own fsync ack (~1 fsync per write, the
+                    // measured 8x deficit vs Redis at P16).
+                    let mut aof_barrier_pending = false;
                     if !matches!(response, Frame::Error(_)) && is_write {
                         if let Some(ref pool) = ctx.aof_pool {
                             let serialized = aof::serialize_command(&frame);
@@ -1483,14 +1496,14 @@ pub(crate) async fn handle_connection_sharded_monoio<
                                 ctx.shard_id,
                                 serialized.len(),
                             );
-                            if pool
-                                .try_send_append_durable(ctx.shard_id, lsn, serialized)
-                                .await
-                                .is_err()
-                            {
-                                response =
-                                    Frame::Error(bytes::Bytes::from_static(aof::AOF_FSYNC_ERR));
-                                aof_failed = true;
+                            match pool.send_append_group(ctx.shard_id, lsn, serialized).await {
+                                Ok(true) => aof_barrier_pending = true,
+                                Ok(false) => {}
+                                Err(_) => {
+                                    response =
+                                        Frame::Error(bytes::Bytes::from_static(aof::AOF_FSYNC_ERR));
+                                    aof_failed = true;
+                                }
                             }
                         }
                     }
@@ -1529,6 +1542,11 @@ pub(crate) async fn handle_connection_sharded_monoio<
                     let mut response = apply_resp3_conversion(cmd, response, conn.protocol_version);
                     if let Some(ws_id) = conn.workspace_id.as_ref() {
                         strip_workspace_prefix_from_response(ws_id, cmd, &mut response);
+                    }
+                    // Only successful writes join the barrier set — an error
+                    // response must not be overwritten by a barrier failure.
+                    if aof_barrier_pending && !matches!(response, Frame::Error(_)) {
+                        local_leg_write_idxs.push(responses.len());
                     }
                     responses.push(response);
                 } else {
