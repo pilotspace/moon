@@ -6,6 +6,7 @@
 
 pub mod incoming;
 pub mod mmap;
+pub mod props;
 pub mod storage;
 
 pub use incoming::IncomingIndex;
@@ -72,12 +73,25 @@ pub struct CsrSegment {
     pub label_overflow: HashMap<u32, SmallVec<[u16; 4]>>,
     /// Per-edge-type Roaring bitmap index for O(1) edge type filtering.
     pub edge_type_index: EdgeTypeIndex,
+    /// Node property/embedding blob (version >= 5). `NodeMeta::property_offset`
+    /// points into this (offset+1 scheme; 0 = no record). Empty for segments
+    /// loaded from pre-v5 files — properties were not persisted before v5.
+    pub node_props: Vec<u8>,
+    /// Edge weight/property blob (version >= 5). `EdgeMeta::property_offset`
+    /// points into this (offset+1 scheme; 0 = default weight, no props).
+    pub edge_props: Vec<u8>,
     /// LSN at which this segment was created.
     pub created_lsn: u64,
     /// Lazily-built reverse (incoming) adjacency, DERIVED from `row_offsets` +
     /// `col_indices`. NOT persisted (excluded from `to_bytes`/`from_bytes`) —
     /// rebuilt on the first Incoming/Both query. (v3-2 graph-incoming-edges.)
     pub incoming: std::sync::OnceLock<IncomingIndex>,
+    /// Lazily built per-segment property indexes (see `SegmentPropertyIndexes`).
+    pub props_index: std::sync::OnceLock<crate::graph::index::SegmentPropertyIndexes>,
+    /// Lazily-built HNSW bridge over this segment's v5 embeddings (hybrid
+    /// HnswPreFilter). DERIVED, in-memory only — never persisted. `None`
+    /// cached when the segment holds too few embeddings to earn one.
+    pub hnsw_bridge: std::sync::OnceLock<Option<crate::graph::hnsw_bridge::GraphHnsw>>,
 }
 
 impl CsrSegment {
@@ -137,17 +151,24 @@ impl CsrSegment {
         row_offsets.push(offset);
         let edge_count = offset as usize;
 
-        // Build col_indices, edge_meta, and the parallel created_ms array.
+        // Build col_indices, edge_meta, the parallel created_ms array, and the
+        // edge weight/property blob (v5 — weights/props previously discarded).
         let mut col_indices = Vec::with_capacity(edge_count);
         let mut edge_meta = Vec::with_capacity(edge_count);
         let mut edge_created_ms = Vec::with_capacity(edge_count);
+        let mut edge_props: Vec<u8> = Vec::new();
         for edges in &edges_by_src {
             for &(dst_row, edge) in edges {
                 col_indices.push(dst_row);
+                let property_offset = props::encode_edge_record(
+                    &mut edge_props,
+                    edge.weight,
+                    edge.properties.as_ref(),
+                );
                 edge_meta.push(EdgeMeta {
                     edge_type: edge.edge_type,
                     flags: 0,
-                    property_offset: 0,
+                    property_offset,
                 });
                 // Real wall-clock stamp from the mutable edge — survives
                 // compaction so decay scoring keeps true edge age (0 stays
@@ -160,6 +181,7 @@ impl CsrSegment {
         // (fast path), >= 32 -> the sparse `label_overflow` store keyed by row.
         let mut node_meta = Vec::with_capacity(node_count);
         let mut label_overflow: HashMap<u32, SmallVec<[u16; 4]>> = HashMap::new();
+        let mut node_props: Vec<u8> = Vec::new();
         let mut min_node_id = u64::MAX;
         let mut max_node_id = 0u64;
         for (row, (key, node)) in sorted_nodes.iter().enumerate() {
@@ -179,10 +201,18 @@ impl CsrSegment {
                     label_overflow.entry(row as u32).or_default().push(label);
                 }
             }
+            // v5: persist properties + embedding so they survive the freeze
+            // boundary (previously property_offset was hardwired to 0 and the
+            // data was silently discarded).
+            let property_offset = props::encode_node_record(
+                &mut node_props,
+                &node.properties,
+                node.embedding.as_deref(),
+            );
             node_meta.push(NodeMeta {
                 external_id: id_bits,
                 label_bitmap,
-                property_offset: 0,
+                property_offset,
                 created_lsn: node.created_lsn,
                 deleted_lsn: node.deleted_lsn,
                 valid_from: node.valid_from,
@@ -237,9 +267,49 @@ impl CsrSegment {
             label_index,
             label_overflow,
             edge_type_index,
+            node_props,
+            edge_props,
             created_lsn: lsn,
             incoming: std::sync::OnceLock::new(),
+            props_index: std::sync::OnceLock::new(),
+            hnsw_bridge: std::sync::OnceLock::new(),
         })
+    }
+
+    /// Node properties for a CSR row (empty for none / pre-v5 segments).
+    pub fn node_properties(&self, row: u32) -> crate::graph::types::PropertyMap {
+        match self.node_meta.get(row as usize) {
+            Some(nm) => props::decode_node_props(&self.node_props, nm.property_offset),
+            None => crate::graph::types::PropertyMap::new(),
+        }
+    }
+
+    /// Single node property lookup without materializing the map.
+    pub fn node_property(&self, row: u32, key: u16) -> Option<crate::graph::types::PropertyValue> {
+        let nm = self.node_meta.get(row as usize)?;
+        props::decode_node_prop(&self.node_props, nm.property_offset, key)
+    }
+
+    /// Node embedding for a CSR row (None for none / pre-v5 segments).
+    pub fn node_embedding(&self, row: u32) -> Option<Vec<f32>> {
+        let nm = self.node_meta.get(row as usize)?;
+        props::decode_node_embedding(&self.node_props, nm.property_offset)
+    }
+
+    /// Edge weight by edge index (1.0 default / pre-v5 segments).
+    pub fn edge_weight(&self, edge_idx: u32) -> f64 {
+        match self.edge_meta.get(edge_idx as usize) {
+            Some(em) => props::decode_edge_weight(&self.edge_props, em.property_offset),
+            None => props::DEFAULT_EDGE_WEIGHT,
+        }
+    }
+
+    /// Edge properties by edge index (empty for none / pre-v5 segments).
+    pub fn edge_properties(&self, edge_idx: u32) -> crate::graph::types::PropertyMap {
+        match self.edge_meta.get(edge_idx as usize) {
+            Some(em) => props::decode_edge_props(&self.edge_props, em.property_offset),
+            None => crate::graph::types::PropertyMap::new(),
+        }
     }
 
     /// Returns the slice of outgoing neighbor row indices for the given CSR row.
@@ -408,7 +478,23 @@ impl CsrSegment {
             0
         };
 
-        let total = header_size + ro_size + ci_size + em_size + nm_size + ecms_size + overflow_size;
+        // Node/edge property blobs (version >= 5): each section is
+        // [len: u64][bytes], positioned after label_overflow.
+        let write_props = self.header.version >= 5;
+        let props_size = if write_props {
+            8 + self.node_props.len() + 8 + self.edge_props.len()
+        } else {
+            0
+        };
+
+        let total = header_size
+            + ro_size
+            + ci_size
+            + em_size
+            + nm_size
+            + ecms_size
+            + overflow_size
+            + props_size;
         let mut buf = Vec::with_capacity(total);
 
         // Write header with computed offsets (checksum placeholder = 0).
@@ -498,6 +584,15 @@ impl CsrSegment {
                     buf.extend_from_slice(&label.to_le_bytes());
                 }
             }
+        }
+
+        // Write the node/edge property blobs (version >= 5): [len: u64][bytes]
+        // each, after label_overflow. Covered by the trailing CRC32.
+        if write_props {
+            buf.extend_from_slice(&(self.node_props.len() as u64).to_le_bytes());
+            buf.extend_from_slice(&self.node_props);
+            buf.extend_from_slice(&(self.edge_props.len() as u64).to_le_bytes());
+            buf.extend_from_slice(&self.edge_props);
         }
 
         // Compute CRC32 over the entire buffer (with checksum field zeroed),
@@ -690,10 +785,41 @@ impl CsrSegment {
         // row. `pos` sits right after edge_created_ms. Shared with the mmap loader
         // so the wire format has one parser; bounds-checked (never panics). The CRC
         // validated above already covers these bytes.
-        let label_overflow = if version >= 4 {
+        let (label_overflow, overflow_end) = if version >= 4 {
             parse_label_overflow(data, pos, node_count)?
         } else {
-            HashMap::new()
+            (HashMap::new(), pos)
+        };
+
+        // Parse the node/edge property blobs (version >= 5): [len: u64][bytes]
+        // each, after label_overflow. Pre-v5 files leave both empty — decoders
+        // treat offset 0 / missing blob as "no properties" (graceful fallback).
+        let (node_props, edge_props) = if version >= 5 {
+            let mut ppos = overflow_end;
+            let np_len = u64::from_le_bytes(read8(data, ppos)?) as usize;
+            ppos += 8;
+            let node_props = data
+                .get(
+                    ppos..ppos.checked_add(np_len).ok_or_else(|| {
+                        CsrError::InvalidData("node_props length overflow".to_owned())
+                    })?,
+                )
+                .ok_or_else(|| CsrError::InvalidData("node_props section truncated".to_owned()))?
+                .to_vec();
+            ppos += np_len;
+            let ep_len = u64::from_le_bytes(read8(data, ppos)?) as usize;
+            ppos += 8;
+            let edge_props = data
+                .get(
+                    ppos..ppos.checked_add(ep_len).ok_or_else(|| {
+                        CsrError::InvalidData("edge_props length overflow".to_owned())
+                    })?,
+                )
+                .ok_or_else(|| CsrError::InvalidData("edge_props section truncated".to_owned()))?
+                .to_vec();
+            (node_props, edge_props)
+        } else {
+            (Vec::new(), Vec::new())
         };
 
         // Rebuild validity bitmap: all edges valid (fresh load).
@@ -757,8 +883,12 @@ impl CsrSegment {
             label_index,
             label_overflow,
             edge_type_index,
+            node_props,
+            edge_props,
             created_lsn,
             incoming: std::sync::OnceLock::new(),
+            props_index: std::sync::OnceLock::new(),
+            hnsw_bridge: std::sync::OnceLock::new(),
         })
     }
 
@@ -819,7 +949,7 @@ pub(super) fn parse_label_overflow(
     data: &[u8],
     mut pos: usize,
     node_count: u32,
-) -> Result<HashMap<u32, SmallVec<[u16; 4]>>, CsrError> {
+) -> Result<(HashMap<u32, SmallVec<[u16; 4]>>, usize), CsrError> {
     let mut label_overflow: HashMap<u32, SmallVec<[u16; 4]>> = HashMap::new();
     let entry_count = u32::from_le_bytes(read4(data, pos)?);
     pos += 4;
@@ -849,7 +979,7 @@ pub(super) fn parse_label_overflow(
         }
         label_overflow.insert(row, labels);
     }
-    Ok(label_overflow)
+    Ok((label_overflow, pos))
 }
 
 #[cfg(test)]
@@ -890,7 +1020,7 @@ mod tests {
         assert_eq!(csr.node_count(), 5);
         assert_eq!(csr.edge_count(), 10);
         assert_eq!(csr.header.magic, *b"MNGR");
-        assert_eq!(csr.header.version, 4);
+        assert_eq!(csr.header.version, crate::graph::types::CSR_CURRENT_VERSION);
     }
 
     #[test]
@@ -948,7 +1078,7 @@ mod tests {
         // Read back header fields.
         assert_eq!(&bytes[0..4], b"MNGR");
         let version = u32::from_le_bytes(bytes[4..8].try_into().expect("4 bytes"));
-        assert_eq!(version, 4);
+        assert_eq!(version, crate::graph::types::CSR_CURRENT_VERSION);
         let nc = u32::from_le_bytes(bytes[8..12].try_into().expect("4 bytes"));
         assert_eq!(nc, 5);
         let ec = u32::from_le_bytes(bytes[12..16].try_into().expect("4 bytes"));
@@ -1102,7 +1232,10 @@ mod tests {
         let restored = CsrSegment::from_bytes(&bytes).expect("from_bytes ok");
 
         assert_eq!(restored.header.magic, *b"MNGR");
-        assert_eq!(restored.header.version, 4);
+        assert_eq!(
+            restored.header.version,
+            crate::graph::types::CSR_CURRENT_VERSION
+        );
         assert_eq!(restored.node_count(), original.node_count());
         assert_eq!(restored.edge_count(), original.edge_count());
         assert_eq!(restored.created_lsn, 42);
@@ -1300,9 +1433,9 @@ mod tests {
         let csr = CsrSegment::from_frozen(frozen, 42).expect("csr ok");
         let v3_bytes = csr.to_bytes();
 
-        // Verify the source is the current version (4).
+        // Verify the source is the current version.
         let ver = u32::from_le_bytes(v3_bytes[4..8].try_into().expect("4 bytes"));
-        assert_eq!(ver, 4);
+        assert_eq!(ver, crate::graph::types::CSR_CURRENT_VERSION);
 
         let header_size = core::mem::size_of::<GraphSegmentHeader>(); // 128
         let nc = csr.node_count() as usize;
@@ -1390,7 +1523,7 @@ mod tests {
 
         let frozen = g.freeze().expect("freeze ok");
         let csr = CsrSegment::from_frozen(frozen, 50).expect("csr ok");
-        assert_eq!(csr.header.version, 4);
+        assert_eq!(csr.header.version, crate::graph::types::CSR_CURRENT_VERSION);
 
         // Verify from_frozen propagated temporal fields.
         // Note: sorted_nodes order may differ from insertion order,
@@ -1412,7 +1545,10 @@ mod tests {
         // Serialize and deserialize.
         let bytes = csr.to_bytes();
         let restored = CsrSegment::from_bytes(&bytes).expect("roundtrip ok");
-        assert_eq!(restored.header.version, 4);
+        assert_eq!(
+            restored.header.version,
+            crate::graph::types::CSR_CURRENT_VERSION
+        );
 
         // Verify temporal fields survive roundtrip.
         for (i, nm) in restored.node_meta.iter().enumerate() {
@@ -1458,7 +1594,7 @@ mod tests {
         let frozen = build_stamped_graph();
         let csr = CsrSegment::from_frozen(frozen, 100).expect("csr ok");
 
-        assert_eq!(csr.header.version, 4);
+        assert_eq!(csr.header.version, crate::graph::types::CSR_CURRENT_VERSION);
         assert_eq!(csr.edge_created_ms.len(), csr.col_indices.len());
         let mut stamps = csr.edge_created_ms.clone();
         stamps.sort_unstable();
@@ -1496,8 +1632,10 @@ mod tests {
     fn downgrade_to_v2(csr: &CsrSegment) -> Vec<u8> {
         let cur_bytes = csr.to_bytes();
         let ec = csr.edge_count() as usize;
-        // v4 trailer = edge_created_ms (ec*8) + empty label-overflow (4 bytes).
-        let strip = ec * 8 + 4;
+        // Trailer = edge_created_ms (ec*8) + empty label-overflow (4 bytes)
+        // + the two v5 property-blob sections (8-byte length header each,
+        // plus the blob bytes — non-empty when edges carry non-default weights).
+        let strip = ec * 8 + 4 + 8 + csr.node_props.len() + 8 + csr.edge_props.len();
         let mut v2_bytes = cur_bytes[..cur_bytes.len() - strip].to_vec();
         v2_bytes[4..8].copy_from_slice(&2u32.to_le_bytes());
         // Zero edge_created_ms_offset (80..88) AND label_overflow_offset (88..96)
@@ -1765,5 +1903,202 @@ mod tests {
             CsrSegment::from_bytes(&bytes).is_err(),
             "truncated bytes must return CsrError, not panic"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // v5: node/edge property blobs (properties, embeddings, weights survive
+    // the freeze boundary — 2026-07 review P0-1)
+    // -----------------------------------------------------------------------
+
+    use crate::graph::types::PropertyValue;
+
+    /// Node A has props + embedding, edge A->B has weight + props. Shape is
+    /// 3 nodes / 2 edges so `(nc+1+ec)` is even and edge_meta lands 8-aligned —
+    /// required for the mmap loader (odd shapes fall back to the heap loader
+    /// in `CsrStorage::from_file`).
+    fn frozen_with_props() -> (FrozenMemGraph, NodeKey, NodeKey) {
+        let mut g = MemGraph::new(100);
+        let props_a: crate::graph::types::PropertyMap = smallvec![
+            (1u16, PropertyValue::Int(7)),
+            (
+                2u16,
+                PropertyValue::String(bytes::Bytes::from_static(b"alice"))
+            ),
+        ];
+        let a = g.add_node(smallvec![0], props_a, Some(vec![1.0f32, -2.5]), 1);
+        let b = g.add_node(smallvec![0], smallvec![], None, 1);
+        let c = g.add_node(smallvec![0], smallvec![], None, 1);
+        let props_e: crate::graph::types::PropertyMap =
+            smallvec![(5u16, PropertyValue::Bool(true))];
+        g.add_edge(a, b, 1, 2.5, Some(props_e), 2).expect("ok");
+        g.add_edge(b, c, 1, 1.0, None, 2).expect("ok");
+        (g.freeze().expect("freeze ok"), a, b)
+    }
+
+    fn assert_v5_content(
+        seg_props: impl Fn(u32) -> crate::graph::types::PropertyMap,
+        seg_emb: impl Fn(u32) -> Option<Vec<f32>>,
+        row_a: u32,
+        row_b: u32,
+    ) {
+        let pa = seg_props(row_a);
+        assert_eq!(pa.len(), 2, "node A props must survive");
+        assert!(pa.contains(&(1u16, PropertyValue::Int(7))));
+        assert!(pa.contains(&(
+            2u16,
+            PropertyValue::String(bytes::Bytes::from_static(b"alice"))
+        )));
+        assert_eq!(seg_emb(row_a), Some(vec![1.0f32, -2.5]));
+        assert!(seg_props(row_b).is_empty());
+        assert_eq!(seg_emb(row_b), None);
+    }
+
+    #[test]
+    fn test_v5_props_survive_from_frozen() {
+        let (frozen, a, b) = frozen_with_props();
+        let csr = CsrSegment::from_frozen(frozen, 10).expect("csr ok");
+        let row_a = csr.lookup_node(a).expect("row a");
+        let row_b = csr.lookup_node(b).expect("row b");
+        assert_v5_content(
+            |r| csr.node_properties(r),
+            |r| csr.node_embedding(r),
+            row_a,
+            row_b,
+        );
+        assert_eq!(csr.node_property(row_a, 1), Some(PropertyValue::Int(7)));
+        // Edge a->b carries weight 2.5 + a bool prop; b->a is default.
+        let sa = csr.row_offsets[row_a as usize];
+        assert_eq!(csr.row_offsets[row_a as usize + 1] - sa, 1);
+        assert_eq!(csr.edge_weight(sa), 2.5);
+        assert_eq!(
+            csr.edge_properties(sa).as_slice(),
+            &[(5u16, PropertyValue::Bool(true))]
+        );
+        let sb = csr.row_offsets[row_b as usize];
+        assert_eq!(csr.row_offsets[row_b as usize + 1] - sb, 1);
+        assert_eq!(csr.edge_weight(sb), 1.0);
+        assert!(csr.edge_properties(sb).is_empty());
+    }
+
+    #[test]
+    fn test_segment_property_index_eq_and_range() {
+        let (frozen, a, b) = frozen_with_props();
+        let storage = CsrStorage::from(CsrSegment::from_frozen(frozen, 10).expect("csr ok"));
+        let row_a = storage.lookup_node(a).expect("row a");
+        let row_b = storage.lookup_node(b).expect("row b");
+        let idx = storage.property_index();
+
+        // Numeric equality (Int normalized to f64).
+        let rows = idx.rows_eq(1, &PropertyValue::Int(7));
+        assert_eq!(rows.iter().collect::<Vec<_>>(), vec![row_a]);
+        assert!(idx.rows_eq(1, &PropertyValue::Int(8)).is_empty());
+        // Float form of the same value matches (single numeric B-tree).
+        let rows = idx.rows_eq(1, &PropertyValue::Float(7.0));
+        assert_eq!(rows.iter().collect::<Vec<_>>(), vec![row_a]);
+
+        // String equality via xxh64 hash.
+        let rows = idx.rows_eq(
+            2,
+            &PropertyValue::String(bytes::Bytes::from_static(b"alice")),
+        );
+        assert_eq!(rows.iter().collect::<Vec<_>>(), vec![row_a]);
+        assert!(
+            idx.rows_eq(2, &PropertyValue::String(bytes::Bytes::from_static(b"bob")))
+                .is_empty()
+        );
+
+        // Range query.
+        let rows = idx.rows_range(1, 0.0, 10.0);
+        assert!(rows.contains(row_a));
+        assert!(!rows.contains(row_b));
+        assert!(idx.rows_range(1, 8.0, 10.0).is_empty());
+
+        // Unindexed property id: the index is exhaustive over segment rows,
+        // so absence means NO row carries it — empty, not a fallback signal.
+        assert!(idx.rows_eq(99, &PropertyValue::Int(1)).is_empty());
+    }
+
+    #[test]
+    fn test_v5_props_survive_bytes_roundtrip() {
+        let (frozen, a, b) = frozen_with_props();
+        let csr = CsrSegment::from_frozen(frozen, 10).expect("csr ok");
+        let restored = CsrSegment::from_bytes(&csr.to_bytes()).expect("roundtrip ok");
+        assert_eq!(restored.node_props, csr.node_props);
+        assert_eq!(restored.edge_props, csr.edge_props);
+        let row_a = restored.lookup_node(a).expect("row a");
+        let row_b = restored.lookup_node(b).expect("row b");
+        assert_v5_content(
+            |r| restored.node_properties(r),
+            |r| restored.node_embedding(r),
+            row_a,
+            row_b,
+        );
+    }
+
+    #[test]
+    fn test_v5_props_survive_mmap_reload() {
+        let dir = tempfile::TempDir::new().expect("tmpdir");
+        let (frozen, a, b) = frozen_with_props();
+        let csr = CsrSegment::from_frozen(frozen, 10).expect("csr ok");
+        let path = dir.path().join("v5_props.csr");
+        csr.write_to_file(&path).expect("write ok");
+        let mm = MmapCsrSegment::from_mmap_file(&path).expect("mmap ok");
+        assert_eq!(mm.header.version, crate::graph::types::CSR_CURRENT_VERSION);
+        let row_a = mm.lookup_node(a).expect("row a");
+        let row_b = mm.lookup_node(b).expect("row b");
+        assert_v5_content(
+            |r| mm.node_properties(r),
+            |r| mm.node_embedding(r),
+            row_a,
+            row_b,
+        );
+        let sa = mm.row_offsets()[row_a as usize];
+        assert_eq!(mm.edge_weight(sa), 2.5);
+        assert_eq!(
+            mm.edge_properties(sa).as_slice(),
+            &[(5u16, PropertyValue::Bool(true))]
+        );
+    }
+
+    #[test]
+    fn test_v4_file_parses_with_empty_blobs() {
+        // Hand-build v4 bytes from a v5 segment: strip the two trailing blob
+        // sections, patch version to 4, recompute CRC. Loading must succeed
+        // with empty blobs (graceful degradation, not an error).
+        let (frozen, a, _b) = frozen_with_props();
+        let csr = CsrSegment::from_frozen(frozen, 10).expect("csr ok");
+        let v5 = csr.to_bytes();
+        let strip = 8 + csr.node_props.len() + 8 + csr.edge_props.len();
+        let mut v4 = v5[..v5.len() - strip].to_vec();
+        v4[4..8].copy_from_slice(&4u32.to_le_bytes());
+        v4[72..80].copy_from_slice(&0u64.to_le_bytes());
+        let checksum = compute_csr_checksum(&v4) as u64;
+        v4[72..80].copy_from_slice(&checksum.to_le_bytes());
+
+        let loaded = CsrSegment::from_bytes(&v4).expect("v4 parse ok");
+        assert_eq!(loaded.header.version, 4);
+        assert!(loaded.node_props.is_empty());
+        assert!(loaded.edge_props.is_empty());
+        let row_a = loaded.lookup_node(a).expect("row a");
+        // property_offset survives in NodeMeta but the blob is absent —
+        // decoders fall back to empty/None/default rather than erroring.
+        assert!(loaded.node_properties(row_a).is_empty());
+        assert_eq!(loaded.node_embedding(row_a), None);
+        assert_eq!(loaded.edge_weight(0), 1.0);
+    }
+
+    #[test]
+    fn test_v5_truncated_blob_section_errors_no_panic() {
+        let (frozen, _a, _b) = frozen_with_props();
+        let csr = CsrSegment::from_frozen(frozen, 10).expect("csr ok");
+        let v5 = csr.to_bytes();
+        // Cut inside the blob sections (CRC mismatch or section truncation —
+        // either way: error, never panic).
+        for cut in [4usize, 8, 12, 20] {
+            if v5.len() > cut {
+                let truncated = &v5[..v5.len() - cut];
+                assert!(CsrSegment::from_bytes(truncated).is_err());
+            }
+        }
     }
 }

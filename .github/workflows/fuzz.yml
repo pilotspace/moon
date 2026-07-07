@@ -33,6 +33,7 @@ jobs:
           - cypher_parse
           - conf_parse
           - csr_from_bytes
+          - graph_props_record
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
@@ -82,6 +83,7 @@ jobs:
           - cypher_parse
           - conf_parse
           - csr_from_bytes
+          - graph_props_record
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly

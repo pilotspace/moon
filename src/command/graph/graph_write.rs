@@ -124,17 +124,6 @@ pub fn graph_addnode(store: &mut GraphStore, args: &[Frame]) -> Frame {
 
     let lsn = store.allocate_lsn();
 
-    // Serialize WAL record first using borrowed refs (before moving into add_node).
-    // This eliminates the expensive embedding.clone() (up to 6KB for 1536-dim f32).
-    // We use external_id=0 as placeholder, then fix it after add_node.
-    let wal_record_no_id = wal::serialize_add_node(
-        graph_name,
-        0, // placeholder
-        &labels,
-        &properties,
-        embedding.as_deref(),
-    );
-
     // Scoped borrow of graph for mutation, then release for WAL push.
     let external_id = {
         let graph = match store.get_graph_mut(graph_name) {
@@ -148,11 +137,16 @@ pub fn graph_addnode(store: &mut GraphStore, args: &[Frame]) -> Frame {
 
         // Update graph stats from stored node (avoid needing moved labels).
         // Collect _key registration outside the immutable borrow of write_buf.
+        //
+        // NOTE: no insert-time property indexing here. Property indexes are
+        // per-CSR-segment, built lazily at first use from the v5 property
+        // blob (`CsrStorage::property_index`) — the old per-ADDNODE
+        // `NamedGraph.property_indexes` maintenance indexed truncated
+        // external ids (wrong row space) and was never read by any query.
         let mut pending_key_reg: Option<Bytes> = None;
         if let Some(node) = graph.write_buf.get_node(node_key) {
             graph.stats.on_node_insert(&node.labels);
 
-            // Update PropertyIndex for numeric properties.
             let key_prop_id = label_to_id(b"_key");
             for (prop_id, prop_val) in &node.properties {
                 // Track _key property for graph expansion Redis key lookup.
@@ -160,18 +154,6 @@ pub fn graph_addnode(store: &mut GraphStore, args: &[Frame]) -> Frame {
                     if let crate::graph::types::PropertyValue::String(s) = prop_val {
                         pending_key_reg = Some(s.clone());
                     }
-                }
-                let val = match prop_val {
-                    crate::graph::types::PropertyValue::Float(f) => Some(*f),
-                    crate::graph::types::PropertyValue::Int(i) => Some(*i as f64),
-                    _ => None,
-                };
-                if let Some(v) = val {
-                    graph
-                        .property_indexes
-                        .entry(*prop_id)
-                        .or_insert_with(|| crate::graph::index::PropertyIndex::new(*prop_id))
-                        .insert(v, ext_id as u32);
                 }
             }
         }
@@ -183,12 +165,9 @@ pub fn graph_addnode(store: &mut GraphStore, args: &[Frame]) -> Frame {
         ext_id
     };
 
-    // Re-serialize the WAL record with the actual external_id.
-    // This is cheap — WAL serialization is just RESP encoding of small fields.
-    // The expensive embedding data was already consumed by add_node, but the
-    // WAL record was pre-built from refs. We drop the placeholder and rebuild
-    // from the stored node refs (no clone — just borrows).
-    drop(wal_record_no_id);
+    // Serialize the WAL record from the stored node's refs — a single
+    // serialization with the real external_id, no clones (the expensive
+    // embedding was moved into add_node and is borrowed back here).
     if let Some(graph) = store.get_graph(graph_name) {
         let nk = crate::graph::types::NodeKey::from(slotmap::KeyData::from_ffi(external_id));
         if let Some(node) = graph.write_buf.get_node(nk) {
@@ -310,17 +289,42 @@ pub fn graph_addedge(store: &mut GraphStore, args: &[Frame]) -> Frame {
             .get_node(dst_key)
             .map_or(0, |n| (n.outgoing.len() + n.incoming.len()) as u32);
 
-        match graph
-            .write_buf
-            .add_edge(src_key, dst_key, edge_type_id, weight, props, lsn)
-        {
-            Ok(edge_key) => {
-                graph
-                    .stats
-                    .on_edge_insert(edge_type_id, src_old_degree, dst_old_degree);
-                Ok(edge_key.data().as_ffi())
+        // Endpoints may have been frozen into an immutable CSR segment
+        // (freeze DRAINS the write buffer). Verify each non-resident
+        // endpoint is alive in the frozen tier, then insert a cross-tier
+        // delta edge (ghost adjacency keeps it traversable from both ends).
+        let src_resident = graph.write_buf.get_node(src_key).is_some();
+        let dst_resident = graph.write_buf.get_node(dst_key).is_some();
+        let frozen_endpoints_ok = if src_resident && dst_resident {
+            true
+        } else {
+            let seg_guard = graph.segments.load();
+            let view =
+                crate::graph::view::MergedNodeView::new(&graph.write_buf, &seg_guard.immutable);
+            let committed = roaring::RoaringBitmap::new();
+            (src_resident || view.is_visible(src_key, 0, 0, &committed, None))
+                && (dst_resident || view.is_visible(dst_key, 0, 0, &committed, None))
+        };
+
+        if !frozen_endpoints_ok {
+            Err(crate::graph::memgraph::GraphError::NodeNotFound)
+        } else {
+            match graph.write_buf.add_edge_across_tiers(
+                src_key,
+                dst_key,
+                edge_type_id,
+                weight,
+                props,
+                lsn,
+            ) {
+                Ok(edge_key) => {
+                    graph
+                        .stats
+                        .on_edge_insert(edge_type_id, src_old_degree, dst_old_degree);
+                    Ok(edge_key.data().as_ffi())
+                }
+                Err(e) => Err(e),
             }
-            Err(e) => Err(e),
         }
     };
 

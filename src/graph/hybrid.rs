@@ -6,17 +6,24 @@
 //! 3. Vector-guided walk: beam search guided by embedding distance
 //! 4. Automatic strategy selection based on candidate set size threshold
 //!
-//! All functions take references to MemGraph (graph data + embeddings) and operate
-//! without unsafe code or unwrap. The shard command handler passes MemGraph directly
-//! since both GraphStore and VectorStore are per-shard, single-owner.
+//! All functions operate on BOTH graph tiers — the mutable MemGraph write
+//! buffer and the immutable CSR segments (traversal via `SegmentMergeReader`,
+//! node existence/embeddings via `MergedNodeView`) — without unsafe code or
+//! unwrap. The shard command handler passes the write buffer plus a loaded
+//! segment snapshot; both stores are per-shard, single-owner. Pass `&[]` for
+//! segments to operate on a bare MemGraph (tests, pre-freeze graphs).
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 
 use super::simd;
 
+use crate::graph::csr::CsrStorage;
 use crate::graph::memgraph::MemGraph;
+use crate::graph::traversal::SegmentMergeReader;
 use crate::graph::types::{Direction, NodeKey};
+use crate::graph::view::MergedNodeView;
 
 /// Default threshold for switching between brute-force and HNSW pre-filter.
 pub const DEFAULT_STRATEGY_THRESHOLD: usize = 10_000;
@@ -89,9 +96,11 @@ pub struct ContextNode {
 pub enum FilterStrategy {
     /// Score all candidates via brute-force cosine similarity.
     BruteForce,
-    /// Use HNSW pre-filter (skip non-candidates during search).
-    /// For now, falls back to brute-force with candidate filtering since
-    /// the graph MemGraph embeddings are not indexed in HNSW.
+    /// Route CSR-resident candidates through the per-segment HNSW bridge
+    /// (`CsrStorage::hnsw_bridge`, built lazily over v5 embeddings) instead
+    /// of scoring each one. Approximate: a bridge beam that under-fills k
+    /// falls back to exact scoring of that group. Mutable-tier candidates
+    /// and rows without a bridge entry are always scored exactly.
     HnswPreFilter,
 }
 
@@ -150,19 +159,27 @@ impl GraphFilteredSearch {
     /// 2. Auto-select strategy (brute-force vs pre-filter)
     /// 3. Score candidates by cosine similarity to query_vector
     /// 4. Return top-K results
-    pub fn execute(&self, memgraph: &MemGraph, lsn: u64) -> Result<Vec<HybridResult>, HybridError> {
+    pub fn execute(
+        &self,
+        memgraph: &MemGraph,
+        csr_segs: &[Arc<CsrStorage>],
+        lsn: u64,
+    ) -> Result<Vec<HybridResult>, HybridError> {
         if self.query_vector.is_empty() {
             return Err(HybridError::EmptyQueryVector);
         }
 
-        // Verify start node exists.
-        if memgraph.get_node(self.start_node).is_none() {
+        let view = MergedNodeView::new(memgraph, csr_segs);
+
+        // Verify start node exists in EITHER tier.
+        if !view.contains(self.start_node) {
             return Err(HybridError::NodeNotFound);
         }
 
         // Step 1: BFS to collect candidates with graph distance.
         let candidates = bfs_collect(
             memgraph,
+            csr_segs,
             self.start_node,
             self.hops,
             self.edge_type_filter,
@@ -171,23 +188,34 @@ impl GraphFilteredSearch {
         )?;
 
         // Step 2: Select strategy.
-        let _strategy = select_strategy(candidates.len(), self.threshold);
-        // Both strategies score the same way for MemGraph embeddings.
-        // HNSW pre-filter would be used when an external VectorStore index exists.
-        // For MemGraph-embedded vectors, brute-force is always used.
+        let strategy = select_strategy(candidates.len(), self.threshold);
 
-        // Step 3: Score candidates by cosine similarity.
-        let mut scored: Vec<HybridResult> = Vec::with_capacity(candidates.len());
+        // Step 3: Score candidates. HnswPreFilter routes CSR-resident
+        // candidates through each segment's HNSW bridge and leaves the
+        // rest (mutable tier, bridge-less rows, dim mismatch) in
+        // `residual` for exact scoring below.
+        let mut scored: Vec<HybridResult> = Vec::with_capacity(candidates.len().min(4096));
+        let residual: Vec<(NodeKey, u32)> = match strategy {
+            FilterStrategy::BruteForce => candidates,
+            FilterStrategy::HnswPreFilter => hnsw_prefilter_score(
+                memgraph,
+                csr_segs,
+                candidates,
+                &self.query_vector,
+                self.k,
+                &mut scored,
+            ),
+        };
 
-        for (node_key, graph_dist) in &candidates {
-            let Some(node) = memgraph.get_node(*node_key) else {
-                continue;
-            };
-            let Some(embedding) = node.embedding.as_ref() else {
+        // Exact scoring for whatever the pre-filter did not cover
+        // (everything, under BruteForce): embedding resolved from the
+        // mutable tier or the CSR v5 blob.
+        for (node_key, graph_dist) in &residual {
+            let Some(embedding) = view.embedding(*node_key) else {
                 continue; // Skip nodes without embeddings.
             };
 
-            let sim = simd::cosine_similarity(embedding, &self.query_vector);
+            let sim = simd::cosine_similarity(&embedding, &self.query_vector);
             scored.push(HybridResult {
                 node: *node_key,
                 score: sim,
@@ -202,6 +230,82 @@ impl GraphFilteredSearch {
 
         Ok(scored)
     }
+}
+
+/// Route candidates through per-segment HNSW bridges (HnswPreFilter).
+///
+/// Partitions `candidates` into per-segment groups (a candidate joins a
+/// group when its segment has a bridge covering its row at the query's
+/// dimension) and searches each bridge with an allow-filter over the
+/// group's rows. Bridge hits are pushed to `scored` with their EXACT
+/// cosine (bridge vectors are unit-normalized copies of the originals).
+/// Returns the residual candidates for exact scoring: mutable-tier nodes,
+/// bridge-less rows, dim mismatches, and any whole group whose beam
+/// under-filled k (approximate-search rescue — never silently truncate).
+fn hnsw_prefilter_score(
+    memgraph: &MemGraph,
+    csr_segs: &[Arc<CsrStorage>],
+    candidates: Vec<(NodeKey, u32)>,
+    query: &[f32],
+    k: usize,
+    scored: &mut Vec<HybridResult>,
+) -> Vec<(NodeKey, u32)> {
+    use crate::graph::fasthash::FxHashMap;
+
+    let mut residual: Vec<(NodeKey, u32)> = Vec::new();
+    let mut groups: Vec<FxHashMap<u32, (NodeKey, u32)>> =
+        (0..csr_segs.len()).map(|_| FxHashMap::default()).collect();
+
+    'cand: for (key, gdist) in candidates {
+        // Mutable tier wins (same precedence as MergedNodeView::embedding).
+        if memgraph.get_node(key).is_some() {
+            residual.push((key, gdist));
+            continue;
+        }
+        for (i, seg) in csr_segs.iter().enumerate() {
+            if let Some(row) = seg.lookup_node(key) {
+                if let Some(bridge) = seg.hnsw_bridge() {
+                    if bridge.dim() == query.len() && bridge.contains_row(row) {
+                        groups[i].insert(row, (key, gdist));
+                        continue 'cand;
+                    }
+                }
+                // Resident here but not bridge-searchable: score exactly.
+                residual.push((key, gdist));
+                continue 'cand;
+            }
+        }
+        residual.push((key, gdist));
+    }
+
+    for (i, group) in groups.iter().enumerate() {
+        if group.is_empty() {
+            continue;
+        }
+        let Some(bridge) = csr_segs[i].hnsw_bridge() else {
+            // Unreachable by construction; stay exact if it ever isn't.
+            residual.extend(group.values().copied());
+            continue;
+        };
+        let hits = bridge.search(query, k, |row| group.contains_key(&row));
+        if hits.len() < k.min(group.len()) {
+            // Beam under-filled the ask: rescue with exact scoring.
+            residual.extend(group.values().copied());
+            continue;
+        }
+        for (row, sim) in hits {
+            if let Some(&(key, gdist)) = group.get(&row) {
+                scored.push(HybridResult {
+                    node: key,
+                    score: sim,
+                    graph_distance: Some(gdist),
+                    context: Vec::new(),
+                });
+            }
+        }
+    }
+
+    residual
 }
 
 // ---------------------------------------------------------------------------
@@ -242,6 +346,7 @@ impl VectorToGraphExpansion {
     pub fn execute(
         &self,
         memgraph: &MemGraph,
+        csr_segs: &[Arc<CsrStorage>],
         candidate_nodes: &[NodeKey],
         lsn: u64,
     ) -> Result<Vec<HybridResult>, HybridError> {
@@ -249,21 +354,21 @@ impl VectorToGraphExpansion {
             return Err(HybridError::EmptyQueryVector);
         }
 
+        let view = MergedNodeView::new(memgraph, csr_segs);
+        let committed = roaring::RoaringBitmap::new();
+
         // Step 1: Score all candidate nodes by cosine similarity.
         let mut scored: Vec<(NodeKey, f64)> = Vec::with_capacity(candidate_nodes.len());
 
         for &node_key in candidate_nodes {
-            let Some(node) = memgraph.get_node(node_key) else {
-                continue;
-            };
-            if node.deleted_lsn != u64::MAX {
+            if !view.is_visible(node_key, 0, 0, &committed, None) {
                 continue;
             }
-            let Some(embedding) = node.embedding.as_ref() else {
+            let Some(embedding) = view.embedding(node_key) else {
                 continue;
             };
 
-            let sim = simd::cosine_similarity(embedding, &self.query_vector);
+            let sim = simd::cosine_similarity(&embedding, &self.query_vector);
             scored.push((node_key, sim));
         }
 
@@ -278,6 +383,7 @@ impl VectorToGraphExpansion {
             let context = if self.expansion_hops > 0 {
                 collect_context(
                     memgraph,
+                    csr_segs,
                     node_key,
                     self.expansion_hops,
                     self.edge_type_filter,
@@ -334,12 +440,20 @@ impl VectorGuidedWalk {
     /// At each step, expand all neighbors of the current beam, score by cosine
     /// similarity, and keep the top `beam_width` for the next step. Returns the
     /// walk path: all visited nodes with their cumulative scores.
-    pub fn execute(&self, memgraph: &MemGraph, lsn: u64) -> Result<Vec<HybridResult>, HybridError> {
+    pub fn execute(
+        &self,
+        memgraph: &MemGraph,
+        csr_segs: &[Arc<CsrStorage>],
+        lsn: u64,
+    ) -> Result<Vec<HybridResult>, HybridError> {
         if self.query_vector.is_empty() {
             return Err(HybridError::EmptyQueryVector);
         }
 
-        if memgraph.get_node(self.seed_node).is_none() {
+        let view = MergedNodeView::new(memgraph, csr_segs);
+        let reader = SegmentMergeReader::new(Some(memgraph), csr_segs, Direction::Both, lsn, None);
+
+        if !view.contains(self.seed_node) {
             return Err(HybridError::NodeNotFound);
         }
 
@@ -347,10 +461,9 @@ impl VectorGuidedWalk {
         visited.insert(self.seed_node);
 
         // Score the seed node.
-        let seed_score = memgraph
-            .get_node(self.seed_node)
-            .and_then(|n| n.embedding.as_ref())
-            .map(|emb| simd::cosine_similarity(emb, &self.query_vector))
+        let seed_score = view
+            .embedding(self.seed_node)
+            .map(|emb| simd::cosine_similarity(&emb, &self.query_vector))
             .unwrap_or(0.0);
 
         let mut results: Vec<HybridResult> = Vec::new();
@@ -368,20 +481,17 @@ impl VectorGuidedWalk {
             let mut candidates: Vec<(NodeKey, f64)> = Vec::new();
 
             for &(current, _) in &beam {
-                // Expand neighbors.
-                for (edge_key, neighbor_key) in memgraph.neighbors(current, Direction::Both, lsn) {
+                // Expand neighbors across both tiers.
+                for merged in reader.neighbors(current) {
+                    let neighbor_key = merged.node;
                     if visited.contains(&neighbor_key) {
                         continue;
                     }
 
-                    let sim = memgraph
-                        .get_node(neighbor_key)
-                        .and_then(|n| n.embedding.as_ref())
-                        .map(|emb| simd::cosine_similarity(emb, &self.query_vector))
+                    let sim = view
+                        .embedding(neighbor_key)
+                        .map(|emb| simd::cosine_similarity(&emb, &self.query_vector))
                         .unwrap_or(0.0);
-
-                    // Use edge_key to avoid unused variable warning.
-                    let _ = edge_key;
 
                     candidates.push((neighbor_key, sim));
                 }
@@ -478,13 +588,20 @@ impl GraphConstrainedReRanker {
     /// 3. Iterate ALL nodes with embeddings, compute cosine similarity.
     /// 4. Combine: `alpha * vector_score + (1-alpha) * 1/(1+graph_dist)`.
     /// 5. Sort descending, return top-K.
-    pub fn execute(&self, memgraph: &MemGraph, lsn: u64) -> Result<Vec<HybridResult>, HybridError> {
+    pub fn execute(
+        &self,
+        memgraph: &MemGraph,
+        csr_segs: &[Arc<CsrStorage>],
+        lsn: u64,
+    ) -> Result<Vec<HybridResult>, HybridError> {
         if self.query_vector.is_empty() {
             return Err(HybridError::EmptyQueryVector);
         }
 
-        // Validate reference node exists.
-        if memgraph.get_node(self.reference_node).is_none() {
+        let view = MergedNodeView::new(memgraph, csr_segs);
+
+        // Validate reference node exists in EITHER tier.
+        if !view.contains(self.reference_node) {
             return Err(HybridError::NodeNotFound);
         }
 
@@ -495,6 +612,7 @@ impl GraphConstrainedReRanker {
         // Step 1: Single batch BFS from reference node — O(frontier).
         let bfs_results = bfs_collect(
             memgraph,
+            csr_segs,
             self.reference_node,
             self.max_hops,
             None,
@@ -509,15 +627,16 @@ impl GraphConstrainedReRanker {
             distance_map.insert(*node_key, *dist);
         }
 
-        // Step 2: Score ALL nodes with embeddings.
+        // Step 2: Score ALL nodes with embeddings, across both tiers.
+        let committed = roaring::RoaringBitmap::new();
         let mut scored: Vec<HybridResult> = Vec::with_capacity(distance_map.len());
 
-        for (node_key, node) in memgraph.iter_nodes() {
-            let Some(embedding) = node.embedding.as_ref() else {
-                continue; // Skip nodes without embeddings.
+        view.for_each_visible_node(None, 0, 0, &committed, None, |node_key| {
+            let Some(embedding) = view.embedding(node_key) else {
+                return; // Skip nodes without embeddings.
             };
 
-            let vector_score = simd::cosine_similarity(embedding, &self.query_vector);
+            let vector_score = simd::cosine_similarity(&embedding, &self.query_vector);
             let graph_dist = distance_map.get(&node_key).copied().unwrap_or(penalty_dist);
             let graph_score = 1.0 / (1.0 + graph_dist as f64);
             let combined = alpha * vector_score + (1.0 - alpha) * graph_score;
@@ -528,7 +647,7 @@ impl GraphConstrainedReRanker {
                 graph_distance: Some(graph_dist),
                 context: Vec::new(),
             });
-        }
+        });
 
         // Step 3: Sort descending by combined score, take top-K.
         scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
@@ -543,15 +662,25 @@ impl GraphConstrainedReRanker {
 // ---------------------------------------------------------------------------
 
 /// BFS from a start node, collecting (NodeKey, graph_distance) pairs.
-/// Excludes the start node itself from results.
+/// Excludes the start node itself from results. Traverses BOTH tiers via
+/// `SegmentMergeReader` (frozen CSR edges + mutable/delta edges).
 fn bfs_collect(
     memgraph: &MemGraph,
+    csr_segs: &[Arc<CsrStorage>],
     start: NodeKey,
     max_depth: u32,
     edge_type_filter: Option<u16>,
     frontier_cap: usize,
     lsn: u64,
 ) -> Result<Vec<(NodeKey, u32)>, HybridError> {
+    let reader = SegmentMergeReader::new(
+        Some(memgraph),
+        csr_segs,
+        Direction::Both,
+        lsn,
+        edge_type_filter,
+    );
+
     let mut visited: HashSet<NodeKey> = HashSet::new();
     visited.insert(start);
 
@@ -564,16 +693,8 @@ fn bfs_collect(
             continue;
         }
 
-        for (edge_key, neighbor_key) in memgraph.neighbors(current, Direction::Both, lsn) {
-            // Apply edge type filter.
-            if let Some(filter_type) = edge_type_filter {
-                if let Some(edge) = memgraph.get_edge(edge_key) {
-                    if edge.edge_type != filter_type {
-                        continue;
-                    }
-                }
-            }
-
+        for merged in reader.neighbors(current) {
+            let neighbor_key = merged.node;
             if visited.contains(&neighbor_key) {
                 continue;
             }
@@ -592,14 +713,23 @@ fn bfs_collect(
     Ok(results)
 }
 
-/// Collect context neighbors for a node via BFS expansion.
+/// Collect context neighbors for a node via BFS expansion (both tiers).
 fn collect_context(
     memgraph: &MemGraph,
+    csr_segs: &[Arc<CsrStorage>],
     start: NodeKey,
     max_hops: u32,
     edge_type_filter: Option<u16>,
     lsn: u64,
 ) -> Vec<ContextNode> {
+    let reader = SegmentMergeReader::new(
+        Some(memgraph),
+        csr_segs,
+        Direction::Both,
+        lsn,
+        edge_type_filter,
+    );
+
     let mut visited: HashSet<NodeKey> = HashSet::new();
     visited.insert(start);
 
@@ -612,19 +742,8 @@ fn collect_context(
             continue;
         }
 
-        for (edge_key, neighbor_key) in memgraph.neighbors(current, Direction::Both, lsn) {
-            let edge_type = memgraph
-                .get_edge(edge_key)
-                .map(|e| e.edge_type)
-                .unwrap_or(0);
-
-            // Apply edge type filter.
-            if let Some(filter_type) = edge_type_filter {
-                if edge_type != filter_type {
-                    continue;
-                }
-            }
-
+        for merged in reader.neighbors(current) {
+            let neighbor_key = merged.node;
             if visited.contains(&neighbor_key) {
                 continue;
             }
@@ -633,7 +752,7 @@ fn collect_context(
             let next_depth = depth + 1;
             context.push(ContextNode {
                 node: neighbor_key,
-                edge_type,
+                edge_type: merged.edge_type,
                 hops: next_depth,
             });
             frontier.push_back((neighbor_key, next_depth));
@@ -769,7 +888,7 @@ mod tests {
 
         // Search within 1 hop of A, query vector close to B's embedding.
         let search = GraphFilteredSearch::new(a, 1, vec![0.8, 0.6, 0.0], 10);
-        let results = search.execute(&g, u64::MAX - 1).expect("search ok");
+        let results = search.execute(&g, &[], u64::MAX - 1).expect("search ok");
 
         // Only B is within 1 hop, and B has embedding [0.8, 0.6, 0.0].
         assert_eq!(results.len(), 1);
@@ -784,7 +903,7 @@ mod tests {
 
         // Search within 2 hops of A, query vector closest to C.
         let search = GraphFilteredSearch::new(a, 2, vec![0.0, 1.0, 0.0], 10);
-        let results = search.execute(&g, u64::MAX - 1).expect("search ok");
+        let results = search.execute(&g, &[], u64::MAX - 1).expect("search ok");
 
         // B and C are within 2 hops. C should rank first (identical to query).
         assert_eq!(results.len(), 2);
@@ -798,7 +917,7 @@ mod tests {
 
         // All spokes are 1 hop from center. Take top 3.
         let search = GraphFilteredSearch::new(center, 1, vec![1.0, 0.0, 0.0], 3);
-        let results = search.execute(&g, u64::MAX - 1).expect("search ok");
+        let results = search.execute(&g, &[], u64::MAX - 1).expect("search ok");
 
         assert_eq!(results.len(), 3);
         // Scores should be descending.
@@ -811,7 +930,7 @@ mod tests {
     fn test_graph_filtered_empty_query() {
         let (g, a, _, _, _) = build_test_graph();
         let search = GraphFilteredSearch::new(a, 1, vec![], 10);
-        let result = search.execute(&g, u64::MAX - 1);
+        let result = search.execute(&g, &[], u64::MAX - 1);
         assert!(matches!(result, Err(HybridError::EmptyQueryVector)));
     }
 
@@ -820,7 +939,7 @@ mod tests {
         let g = MemGraph::new(100_000);
         let fake_key: NodeKey = slotmap::KeyData::from_ffi(999).into();
         let search = GraphFilteredSearch::new(fake_key, 1, vec![1.0, 0.0], 10);
-        let result = search.execute(&g, u64::MAX - 1);
+        let result = search.execute(&g, &[], u64::MAX - 1);
         assert!(matches!(result, Err(HybridError::NodeNotFound)));
     }
 
@@ -832,7 +951,7 @@ mod tests {
         g.add_edge(a, b, 1, 1.0, None, 2).expect("edge");
 
         let search = GraphFilteredSearch::new(a, 1, vec![1.0, 0.0], 10);
-        let results = search.execute(&g, u64::MAX - 1).expect("ok");
+        let results = search.execute(&g, &[], u64::MAX - 1).expect("ok");
         assert!(results.is_empty()); // No embeddings -> no results.
     }
 
@@ -841,7 +960,7 @@ mod tests {
         let (g, center, _) = build_star_graph(20);
         let mut search = GraphFilteredSearch::new(center, 1, vec![1.0, 0.0, 0.0], 10);
         search.frontier_cap = 5; // Very small cap.
-        let result = search.execute(&g, u64::MAX - 1);
+        let result = search.execute(&g, &[], u64::MAX - 1);
         assert!(matches!(
             result,
             Err(HybridError::FrontierCapExceeded { .. })
@@ -857,7 +976,9 @@ mod tests {
 
         // Query closest to C. Expand 1 hop.
         let expansion = VectorToGraphExpansion::new(vec![0.0, 1.0, 0.0], 1, 1);
-        let results = expansion.execute(&g, &all_nodes, u64::MAX - 1).expect("ok");
+        let results = expansion
+            .execute(&g, &[], &all_nodes, u64::MAX - 1)
+            .expect("ok");
 
         assert_eq!(results.len(), 1); // Top-1
         assert_eq!(results[0].node, c);
@@ -872,7 +993,9 @@ mod tests {
         let all_nodes = vec![a, b, c, d];
 
         let expansion = VectorToGraphExpansion::new(vec![0.0, 1.0, 0.0], 3, 1);
-        let results = expansion.execute(&g, &all_nodes, u64::MAX - 1).expect("ok");
+        let results = expansion
+            .execute(&g, &[], &all_nodes, u64::MAX - 1)
+            .expect("ok");
 
         assert_eq!(results.len(), 3);
         // Scores descending.
@@ -887,7 +1010,9 @@ mod tests {
         let all_nodes = vec![a, b, c, d];
 
         let expansion = VectorToGraphExpansion::new(vec![1.0, 0.0, 0.0], 2, 0);
-        let results = expansion.execute(&g, &all_nodes, u64::MAX - 1).expect("ok");
+        let results = expansion
+            .execute(&g, &[], &all_nodes, u64::MAX - 1)
+            .expect("ok");
 
         // No expansion: context should be empty.
         for r in &results {
@@ -899,7 +1024,7 @@ mod tests {
     fn test_vector_expansion_empty_query() {
         let g = MemGraph::new(100_000);
         let expansion = VectorToGraphExpansion::new(vec![], 1, 1);
-        let result = expansion.execute(&g, &[], u64::MAX - 1);
+        let result = expansion.execute(&g, &[], &[], u64::MAX - 1);
         assert!(matches!(result, Err(HybridError::EmptyQueryVector)));
     }
 
@@ -911,7 +1036,7 @@ mod tests {
 
         // Walk from A toward [0.0, 1.0, 0.0] (closest to C).
         let walk = VectorGuidedWalk::new(a, vec![0.0, 1.0, 0.0], 3);
-        let results = walk.execute(&g, u64::MAX - 1).expect("walk ok");
+        let results = walk.execute(&g, &[], u64::MAX - 1).expect("walk ok");
 
         // Should visit A, then expand toward B/C/D based on similarity.
         assert!(!results.is_empty());
@@ -934,7 +1059,7 @@ mod tests {
         // High min_similarity: should stop early.
         let mut walk = VectorGuidedWalk::new(a, vec![0.0, 0.0, 1.0], 10);
         walk.min_similarity = 0.99; // Very high -- only near-identical passes.
-        let results = walk.execute(&g, u64::MAX - 1).expect("ok");
+        let results = walk.execute(&g, &[], u64::MAX - 1).expect("ok");
 
         // Only seed node (nothing else is similar enough at 0.99).
         assert_eq!(results.len(), 1);
@@ -946,7 +1071,7 @@ mod tests {
 
         let mut walk = VectorGuidedWalk::new(center, vec![1.0, 0.0, 0.0], 1);
         walk.beam_width = 3;
-        let results = walk.execute(&g, u64::MAX - 1).expect("ok");
+        let results = walk.execute(&g, &[], u64::MAX - 1).expect("ok");
 
         // Seed + up to 3 (beam_width) spokes.
         assert!(results.len() <= 4);
@@ -958,7 +1083,7 @@ mod tests {
         let g = MemGraph::new(100_000);
         let fake_key: NodeKey = slotmap::KeyData::from_ffi(999).into();
         let walk = VectorGuidedWalk::new(fake_key, vec![1.0, 0.0], 3);
-        let result = walk.execute(&g, u64::MAX - 1);
+        let result = walk.execute(&g, &[], u64::MAX - 1);
         assert!(matches!(result, Err(HybridError::NodeNotFound)));
     }
 
@@ -966,7 +1091,7 @@ mod tests {
     fn test_vector_walk_empty_query() {
         let (g, a, _, _, _) = build_test_graph();
         let walk = VectorGuidedWalk::new(a, vec![], 3);
-        let result = walk.execute(&g, u64::MAX - 1);
+        let result = walk.execute(&g, &[], u64::MAX - 1);
         assert!(matches!(result, Err(HybridError::EmptyQueryVector)));
     }
 
@@ -976,7 +1101,7 @@ mod tests {
         let a = g.add_node(smallvec![0], empty_props(), Some(vec![1.0, 0.0]), 1);
         // Isolated node.
         let walk = VectorGuidedWalk::new(a, vec![1.0, 0.0], 3);
-        let results = walk.execute(&g, u64::MAX - 1).expect("ok");
+        let results = walk.execute(&g, &[], u64::MAX - 1).expect("ok");
         assert_eq!(results.len(), 1); // Only seed.
     }
 
@@ -985,7 +1110,7 @@ mod tests {
     #[test]
     fn test_bfs_collect_basic() {
         let (g, a, b, c, _d) = build_test_graph();
-        let candidates = bfs_collect(&g, a, 2, None, 100_000, u64::MAX - 1).expect("ok");
+        let candidates = bfs_collect(&g, &[], a, 2, None, 100_000, u64::MAX - 1).expect("ok");
 
         // 2 hops from A: B (1 hop), C (2 hops).
         assert_eq!(candidates.len(), 2);
@@ -1005,7 +1130,7 @@ mod tests {
         g.add_edge(a, c, 2, 1.0, None, 2).expect("edge"); // type 2
 
         // Filter to edge type 1 only.
-        let candidates = bfs_collect(&g, a, 1, Some(1), 100_000, u64::MAX - 1).expect("ok");
+        let candidates = bfs_collect(&g, &[], a, 1, Some(1), 100_000, u64::MAX - 1).expect("ok");
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].0, b);
     }
@@ -1023,7 +1148,7 @@ mod tests {
 
         // C is disconnected from A. Only B should appear.
         let search = GraphFilteredSearch::new(a, 1, vec![1.0, 0.0], 10);
-        let results = search.execute(&g, u64::MAX - 1).expect("ok");
+        let results = search.execute(&g, &[], u64::MAX - 1).expect("ok");
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].node, b);
     }
@@ -1035,7 +1160,9 @@ mod tests {
 
         // Find C, expand 2 hops.
         let expansion = VectorToGraphExpansion::new(vec![0.0, 1.0, 0.0], 1, 2);
-        let results = expansion.execute(&g, &all_nodes, u64::MAX - 1).expect("ok");
+        let results = expansion
+            .execute(&g, &[], &all_nodes, u64::MAX - 1)
+            .expect("ok");
 
         // C is result[0]. Context should include B (1 hop) and D (1 hop),
         // and A (2 hops from C via B).
@@ -1078,7 +1205,7 @@ mod tests {
         let (g, a, _b, _c, _d, _e) = build_rerank_chain();
 
         let reranker = GraphConstrainedReRanker::new(a, 5, 1.0, vec![1.0, 0.0, 0.0], 5);
-        let results = reranker.execute(&g, u64::MAX - 1).expect("ok");
+        let results = reranker.execute(&g, &[], u64::MAX - 1).expect("ok");
 
         // A has embedding [1,0,0], query is [1,0,0] => score 1.0 (highest).
         // B has [0.7,0.7,0] => ~0.707
@@ -1099,7 +1226,7 @@ mod tests {
         let (g, a, b, c, _d, _e) = build_rerank_chain();
 
         let reranker = GraphConstrainedReRanker::new(a, 5, 0.0, vec![1.0, 0.0, 0.0], 5);
-        let results = reranker.execute(&g, u64::MAX - 1).expect("ok");
+        let results = reranker.execute(&g, &[], u64::MAX - 1).expect("ok");
 
         // Graph distances: A=0, B=1, C=2, D=3, E=4.
         // Graph score = 1/(1+d): A=1.0, B=0.5, C=0.333, D=0.25, E=0.2.
@@ -1125,7 +1252,7 @@ mod tests {
         // Query vector [1,0,0]: A is most similar but 2 hops from C.
         // B is 1 hop from C and moderately similar.
         let reranker = GraphConstrainedReRanker::new(c, 2, 0.3, vec![1.0, 0.0, 0.0], 5);
-        let results = reranker.execute(&g, u64::MAX - 1).expect("ok");
+        let results = reranker.execute(&g, &[], u64::MAX - 1).expect("ok");
 
         // A: vector_score ~1.0, graph_dist=2, graph_score=1/3=0.333
         //    combined = 0.3*1.0 + 0.7*0.333 = 0.300 + 0.233 = 0.533
@@ -1155,7 +1282,7 @@ mod tests {
 
         // max_hops=2: A can reach B(1), C(2). D and E are unreachable.
         let reranker = GraphConstrainedReRanker::new(a, 2, 0.5, vec![1.0, 0.0, 0.0], 10);
-        let results = reranker.execute(&g, u64::MAX - 1).expect("ok");
+        let results = reranker.execute(&g, &[], u64::MAX - 1).expect("ok");
 
         // E should be reachable result with graph_distance = max_hops+1 = 3.
         let e_result = results.iter().find(|r| r.node == e);
@@ -1174,7 +1301,7 @@ mod tests {
         let a = g.add_node(smallvec![0], empty_props(), None, 1);
 
         let reranker = GraphConstrainedReRanker::new(a, 3, 0.5, vec![1.0, 0.0, 0.0], 10);
-        let results = reranker.execute(&g, u64::MAX - 1).expect("ok");
+        let results = reranker.execute(&g, &[], u64::MAX - 1).expect("ok");
         assert!(results.is_empty());
     }
 
@@ -1183,7 +1310,170 @@ mod tests {
         let g = MemGraph::new(100_000);
         let fake_key: NodeKey = slotmap::KeyData::from_ffi(999).into();
         let reranker = GraphConstrainedReRanker::new(fake_key, 3, 0.5, vec![1.0, 0.0, 0.0], 10);
-        let result = reranker.execute(&g, u64::MAX - 1);
+        let result = reranker.execute(&g, &[], u64::MAX - 1);
         assert!(matches!(result, Err(HybridError::NodeNotFound)));
+    }
+
+    // --- HnswPreFilter via the per-segment bridge ---
+
+    /// Deterministic pseudo-random embedding (LCG — no RNG in tests).
+    fn det_embedding(i: u64, dim: usize) -> Vec<f32> {
+        let mut state = i.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
+        (0..dim)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                ((state >> 33) as f32 / (1u64 << 31) as f32) - 0.5
+            })
+            .collect()
+    }
+
+    /// Frozen star (center -> 299 embedded spokes) as a CSR segment.
+    fn frozen_star_segment() -> (MemGraph, Arc<CsrStorage>, NodeKey) {
+        let mut g = MemGraph::new(1_000_000);
+        let center = g.add_node(smallvec![0], empty_props(), Some(det_embedding(0, 8)), 1);
+        for i in 1..300u64 {
+            let s = g.add_node(smallvec![0], empty_props(), Some(det_embedding(i, 8)), 1);
+            g.add_edge(center, s, 1, 1.0, None, 2).expect("edge");
+        }
+        let frozen = g.freeze().expect("freeze");
+        let seg = crate::graph::csr::CsrSegment::from_frozen(frozen, 10).expect("csr");
+        (
+            MemGraph::new(1_000_000),
+            Arc::new(CsrStorage::from(seg)),
+            center,
+        )
+    }
+
+    #[test]
+    fn test_hnsw_prefilter_matches_brute_force() {
+        let (mg, seg, center) = frozen_star_segment();
+        // Pre-build the bridge below the production minimum so the
+        // HnswPreFilter path actually engages on a 300-node fixture.
+        assert!(seg.hnsw_bridge_for_test().is_some(), "bridge must build");
+
+        let query = det_embedding(9999, 8);
+        let mut hnsw = GraphFilteredSearch::new(center, 1, query.clone(), 5);
+        hnsw.threshold = 1; // force HnswPreFilter
+        let mut brute = GraphFilteredSearch::new(center, 1, query.clone(), 5);
+        brute.threshold = usize::MAX; // force BruteForce
+
+        let segs = vec![seg.clone()];
+        let hnsw_res = hnsw.execute(&mg, &segs, u64::MAX - 1).expect("hnsw ok");
+        let brute_res = brute.execute(&mg, &segs, u64::MAX - 1).expect("brute ok");
+
+        assert_eq!(hnsw_res.len(), 5);
+        assert_eq!(brute_res.len(), 5);
+        // Every HNSW score must be the node's REAL cosine similarity and
+        // carry the BFS graph distance.
+        let view = MergedNodeView::new(&mg, &segs);
+        for r in &hnsw_res {
+            let emb = view.embedding(r.node).expect("embedding");
+            let exact = simd::cosine_similarity(&emb, &query);
+            assert!(
+                (r.score - exact).abs() < 1e-4,
+                "score {} vs exact {exact}",
+                r.score
+            );
+            assert_eq!(r.graph_distance, Some(1));
+        }
+        // Top-5 overlap with the exact ranking (approximate search).
+        let brute_set: HashSet<NodeKey> = brute_res.iter().map(|r| r.node).collect();
+        let overlap = hnsw_res
+            .iter()
+            .filter(|r| brute_set.contains(&r.node))
+            .count();
+        assert!(
+            overlap >= 4,
+            "HNSW/brute top-5 overlap too low: {overlap}/5"
+        );
+    }
+
+    #[test]
+    fn test_hnsw_prefilter_without_bridge_is_exact() {
+        // No test bridge pre-built: the production accessor refuses a
+        // 300-vector segment (min 4096), so every candidate is residual
+        // and results must EXACTLY equal brute force.
+        let (mg, seg, center) = frozen_star_segment();
+        let query = det_embedding(777, 8);
+
+        let mut hnsw = GraphFilteredSearch::new(center, 1, query.clone(), 5);
+        hnsw.threshold = 1;
+        let mut brute = GraphFilteredSearch::new(center, 1, query, 5);
+        brute.threshold = usize::MAX;
+
+        let segs = vec![seg.clone()];
+        let hnsw_res = hnsw.execute(&mg, &segs, u64::MAX - 1).expect("ok");
+        let brute_res = brute.execute(&mg, &segs, u64::MAX - 1).expect("ok");
+
+        let a: Vec<(NodeKey, u64)> = hnsw_res
+            .iter()
+            .map(|r| (r.node, r.score.to_bits()))
+            .collect();
+        let b: Vec<(NodeKey, u64)> = brute_res
+            .iter()
+            .map(|r| (r.node, r.score.to_bits()))
+            .collect();
+        assert_eq!(
+            a, b,
+            "bridge-less HnswPreFilter must be bit-exact brute force"
+        );
+    }
+
+    #[test]
+    fn test_hnsw_prefilter_partition_routes_tiers() {
+        // Partition contract of hnsw_prefilter_score: mutable-tier
+        // candidates land in `residual` (exact scoring), bridge-covered
+        // frozen candidates surface through `scored` as the group top-k.
+        let (mut mg, seg, _center) = frozen_star_segment();
+        assert!(seg.hnsw_bridge_for_test().is_some(), "bridge must build");
+
+        // A fresh MemGraph's first key ALIASES a frozen key (same slotmap
+        // sequence) -- exactly the mutable-tier-wins case the partition
+        // must route to residual.
+        let hot = mg.add_node(
+            smallvec![0],
+            empty_props(),
+            Some(vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+            20,
+        );
+
+        // Candidates: the mutable node + every OTHER frozen row.
+        let mut candidates: Vec<(NodeKey, u32)> = vec![(hot, 1)];
+        for meta in seg.node_meta() {
+            let key: NodeKey = slotmap::KeyData::from_ffi(meta.external_id).into();
+            if key != hot {
+                candidates.push((key, 1));
+            }
+        }
+        let total = candidates.len();
+
+        let query = det_embedding(55, 8);
+        let segs = vec![seg.clone()];
+        let mut scored: Vec<HybridResult> = Vec::new();
+        let residual = hnsw_prefilter_score(&mg, &segs, candidates, &query, 5, &mut scored);
+
+        // Mutable node: residual, never bridge-scored.
+        assert!(residual.iter().any(|&(k, _)| k == hot));
+        assert!(scored.iter().all(|r| r.node != hot));
+        assert_eq!(
+            residual.len(),
+            1,
+            "all frozen candidates are bridge-covered"
+        );
+        // Bridge returned the group's top-k with exact cosines.
+        assert_eq!(scored.len(), 5);
+        let view = MergedNodeView::new(&mg, &segs);
+        for r in &scored {
+            let emb = view.embedding(r.node).expect("embedding");
+            let exact = simd::cosine_similarity(&emb, &query);
+            assert!((r.score - exact).abs() < 1e-4);
+            assert_eq!(r.graph_distance, Some(1));
+        }
+        assert!(
+            total > scored.len() + residual.len(),
+            "prefilter must prune"
+        );
     }
 }

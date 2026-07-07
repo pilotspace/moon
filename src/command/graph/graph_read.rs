@@ -128,7 +128,7 @@ fn json_to_graph_value(v: &serde_json::Value) -> cypher::executor::Value {
     }
 }
 
-/// GRAPH.NEIGHBORS <graph> <node_id> [TYPE <type>] [DEPTH <n>]
+/// GRAPH.NEIGHBORS <graph> <node_id> [TYPE <type>] [DEPTH <n>] [DIRECTION IN|OUT|BOTH]
 ///
 /// Returns an array of neighbor nodes/edges as RESP3 Maps.
 /// Default direction: BOTH (outgoing + incoming).
@@ -155,9 +155,10 @@ pub fn graph_neighbors(store: &GraphStore, args: &[Frame]) -> Frame {
         None => return Frame::Error(Bytes::from_static(b"ERR graph not found")),
     };
 
-    // Parse optional TYPE and DEPTH arguments.
+    // Parse optional TYPE, DEPTH, and DIRECTION arguments.
     let mut edge_type_filter: Option<u16> = None;
     let mut depth: u32 = 1;
+    let mut direction = Direction::Both;
     let mut pos = 2;
 
     while pos < args.len() {
@@ -188,6 +189,22 @@ pub fn graph_neighbors(store: &GraphStore, args: &[Frame]) -> Frame {
                 _ => return Frame::Error(Bytes::from_static(b"ERR invalid DEPTH value")),
             };
             pos += 1;
+        } else if key.eq_ignore_ascii_case(b"DIRECTION") {
+            pos += 1;
+            if pos >= args.len() {
+                return Frame::Error(Bytes::from_static(b"ERR missing DIRECTION value"));
+            }
+            direction = match extract_bulk(&args[pos]) {
+                Some(d) if d.eq_ignore_ascii_case(b"OUT") => Direction::Outgoing,
+                Some(d) if d.eq_ignore_ascii_case(b"IN") => Direction::Incoming,
+                Some(d) if d.eq_ignore_ascii_case(b"BOTH") => Direction::Both,
+                _ => {
+                    return Frame::Error(Bytes::from_static(
+                        b"ERR invalid DIRECTION value (IN|OUT|BOTH)",
+                    ));
+                }
+            };
+            pos += 1;
         } else {
             pos += 1;
         }
@@ -203,23 +220,22 @@ pub fn graph_neighbors(store: &GraphStore, args: &[Frame]) -> Frame {
 
     let memgraph = &graph.write_buf;
 
-    // Verify node exists in the mutable write buffer.
-    // Nodes in CSR segments still have MemGraph entries (freeze copies, doesn't move).
-    if memgraph.get_node(node_key).is_none() {
-        return Frame::Error(Bytes::from_static(b"ERR node not found"));
-    }
-
-    // Build a SegmentMergeReader that sees both MemGraph and immutable CSR segments.
     let lsn = u64::MAX - 1; // See all live data (MAX-1 because deleted_lsn=MAX means alive).
     let segments_guard = graph.segments.load();
     let csr_segs = &segments_guard.immutable;
-    let reader = SegmentMergeReader::new(
-        Some(memgraph),
-        csr_segs,
-        Direction::Both,
-        lsn,
-        edge_type_filter,
-    );
+
+    // Verify the start node exists in EITHER tier — freeze MOVES nodes into
+    // CSR segments (drains the write buffer), so a memgraph-only check would
+    // reject every compacted node.
+    let view = crate::graph::view::MergedNodeView::new(memgraph, csr_segs);
+    if !view.contains(node_key) {
+        return Frame::Error(Bytes::from_static(b"ERR node not found"));
+    }
+
+    // Build a SegmentMergeReader that sees both MemGraph and immutable CSR
+    // segments, honoring the requested traversal direction.
+    let reader =
+        SegmentMergeReader::new(Some(memgraph), csr_segs, direction, lsn, edge_type_filter);
 
     // TraversalGuard enforces bounded epoch hold (30s default timeout).
     let guard = crate::graph::traversal_guard::TraversalGuard::with_default_timeout(lsn);
@@ -390,11 +406,117 @@ pub fn graph_list(store: &GraphStore) -> Frame {
 // GRAPH.QUERY, GRAPH.RO_QUERY, GRAPH.EXPLAIN
 // ---------------------------------------------------------------------------
 
+/// Literal-normalize the Cypher text for plan-cache keying.
+///
+/// Returns the effective text (normalized, or the original when nothing was
+/// rewritten), its plan-cache hash, and the auto-extracted parameter values
+/// to merge into the user params before execution.
+fn normalize_cypher(
+    cypher_bytes: &[u8],
+) -> (
+    std::borrow::Cow<'_, [u8]>,
+    u64,
+    Vec<(String, cypher::executor::Value)>,
+) {
+    match cypher::parameterize::parameterize(cypher_bytes) {
+        Some(pq) => {
+            let hash = cypher::planner::hash_query(&pq.normalized);
+            (std::borrow::Cow::Owned(pq.normalized), hash, pq.auto_params)
+        }
+        None => (
+            std::borrow::Cow::Borrowed(cypher_bytes),
+            cypher::planner::hash_query(cypher_bytes),
+            Vec::new(),
+        ),
+    }
+}
+
+/// Parse the effective (possibly literal-normalized) Cypher text.
+///
+/// If the normalized text fails to parse (a rewrite edge case), falls back
+/// to the raw text so parse errors reference the user's own query — dropping
+/// the auto-params and re-keying the plan cache on the raw hash. The rewrite
+/// can therefore never turn a working query into a broken one.
+fn parse_effective(
+    raw: &[u8],
+    effective: &std::borrow::Cow<'_, [u8]>,
+    hash: u64,
+    auto_params: Vec<(String, cypher::executor::Value)>,
+) -> Result<
+    (
+        cypher::CypherQuery,
+        u64,
+        Vec<(String, cypher::executor::Value)>,
+    ),
+    String,
+> {
+    match cypher::parse_cypher(effective) {
+        Ok(q) => Ok((q, hash, auto_params)),
+        Err(e) => {
+            if matches!(effective, std::borrow::Cow::Borrowed(_)) {
+                return Err(format!("ERR Cypher parse error: {e}"));
+            }
+            match cypher::parse_cypher(raw) {
+                Ok(q) => Ok((q, cypher::planner::hash_query(raw), Vec::new())),
+                Err(e) => Err(format!("ERR Cypher parse error: {e}")),
+            }
+        }
+    }
+}
+
+/// Execute a compiled read-only plan: params (user + auto-extracted),
+/// valid-time, decay, executor, RESP encoding. Shared by GRAPH.QUERY (both
+/// handlers) and GRAPH.RO_QUERY.
+///
+/// Takes a `SlotTable` explicitly (rather than calling `cypher::executor::
+/// execute`, which rebuilds one every call) so plan-cache hits reuse the
+/// `SlotTable` cached alongside the plan (Fix 2 -- one `String` allocation
+/// per bound variable, per execution, otherwise).
+fn run_read_query(
+    graph: &crate::graph::store::NamedGraph,
+    args: &[Frame],
+    plan: &cypher::PhysicalPlan,
+    slots: &cypher::executor::SlotTable,
+    auto_params: Vec<(String, cypher::executor::Value)>,
+) -> Frame {
+    let mut params = parse_params(args);
+    for (name, value) in auto_params {
+        params.insert(name, value);
+    }
+    let valid_at = parse_valid_at(args);
+    let decay = match parse_decay(args) {
+        Ok(d) => d,
+        Err(msg) => return Frame::Error(Bytes::from_static(msg.as_bytes())),
+    };
+    let ctx = cypher::executor::ExecutionContext {
+        valid_time_as_of: valid_at,
+        decay,
+        guard: Some(crate::graph::traversal_guard::TraversalGuard::with_default_timeout(0)),
+        ..Default::default()
+    };
+    match cypher::executor::execute_with_slots(graph, plan, slots, &params, &ctx) {
+        Ok(r) => exec_result_to_frame(&r),
+        Err(e) => {
+            let msg = format!("ERR Cypher execution error: {e}");
+            Frame::Error(Bytes::from(msg))
+        }
+    }
+}
+
 /// GRAPH.QUERY <graph> <cypher_string>
 ///
-/// Parses the Cypher query, compiles to a physical plan, executes it against
-/// the named graph, and returns result rows with column headers and statistics.
+/// Normalizes literals into auto-parameters, then executes via the plan
+/// cache: a cache hit runs with ZERO parse/compile work (the cache holds
+/// read-only plans only, so a hit is safe to execute directly).
 pub fn graph_query(store: &GraphStore, args: &[Frame]) -> Frame {
+    graph_query_readonly(store, args, false)
+}
+
+/// Shared read-path core for GRAPH.QUERY / GRAPH.RO_QUERY.
+///
+/// `reject_writes`: RO_QUERY refuses write clauses with an explicit error;
+/// GRAPH.QUERY lets the read-only executor report them (it has no write lock).
+fn graph_query_readonly(store: &GraphStore, args: &[Frame], reject_writes: bool) -> Frame {
     if args.len() < 2 {
         return Frame::Error(Bytes::from_static(
             b"ERR wrong number of arguments for 'GRAPH.QUERY' command",
@@ -416,54 +538,58 @@ pub fn graph_query(store: &GraphStore, args: &[Frame]) -> Frame {
         None => return Frame::Error(Bytes::from_static(b"ERR invalid Cypher query")),
     };
 
-    let query = match cypher::parse_cypher(cypher_bytes) {
-        Ok(q) => q,
-        Err(e) => {
-            let msg = format!("ERR Cypher parse error: {e}");
-            return Frame::Error(Bytes::from(msg));
-        }
-    };
+    // Raw-hash pre-lookup (Fix 2): an EXACT repeat of a query text we've
+    // already compiled hits here without ever calling `parameterize()` (a
+    // full lexer pass + Vec/String allocations) — the raw-hash entry
+    // carries this exact text's auto_params, cached at insert time.
+    let raw_hash = cypher::planner::hash_query(cypher_bytes);
+    if let Some(cached) = graph.plan_cache.lock().get(raw_hash) {
+        let auto_params = cached.auto_params.as_ref().clone();
+        return run_read_query(graph, args, &cached.plan, &cached.slots, auto_params);
+    }
 
-    // Plan cache: check for a cached plan before compiling.
-    let query_hash = cypher::planner::hash_query(cypher_bytes);
-    let plan = {
-        let cache = graph.plan_cache.lock();
-        cache.get(query_hash)
-    };
-    let plan = if let Some(cached) = plan {
-        cached
-    } else {
-        let p = match cypher::planner::compile(&query) {
-            Ok(p) => std::sync::Arc::new(p),
-            Err(e) => {
-                let msg = format!("ERR Cypher plan error: {e}");
-                return Frame::Error(Bytes::from(msg));
-            }
+    let (effective, query_hash, auto_params) = normalize_cypher(cypher_bytes);
+
+    // Normalized-hash hit ⇒ read-only plan (PlanCache invariant) ⇒ no parse.
+    // `parameterize()` above already ran (needed to derive THIS text's
+    // auto_params and the normalized hash), but parse+compile is skipped.
+    let cached = graph.plan_cache.lock().get(query_hash);
+    if let Some(cached) = cached {
+        return run_read_query(graph, args, &cached.plan, &cached.slots, auto_params);
+    }
+
+    let (query, query_hash, auto_params) =
+        match parse_effective(cypher_bytes, &effective, query_hash, auto_params) {
+            Ok(t) => t,
+            Err(msg) => return Frame::Error(Bytes::from(msg)),
         };
-        graph.plan_cache.lock().insert(query_hash, p.clone());
-        p
-    };
 
-    let params = parse_params(args);
-    let valid_at = parse_valid_at(args);
-    let decay = match parse_decay(args) {
-        Ok(d) => d,
-        Err(msg) => return Frame::Error(Bytes::from_static(msg.as_bytes())),
-    };
-    let ctx = cypher::executor::ExecutionContext {
-        valid_time_as_of: valid_at,
-        decay,
-        ..Default::default()
-    };
-    let result = match cypher::executor::execute(graph, &plan, &params, &ctx) {
-        Ok(r) => r,
+    if reject_writes && !query.is_read_only() {
+        return Frame::Error(Bytes::from_static(
+            b"ERR GRAPH.RO_QUERY does not allow write clauses (CREATE, DELETE, SET, MERGE)",
+        ));
+    }
+
+    let plan = match cypher::planner::compile(&query) {
+        Ok(p) => std::sync::Arc::new(p),
         Err(e) => {
-            let msg = format!("ERR Cypher execution error: {e}");
+            let msg = format!("ERR Cypher plan error: {e}");
             return Frame::Error(Bytes::from(msg));
         }
     };
-
-    exec_result_to_frame(&result)
+    // Cache read-only plans ONLY — a cache hit skips classification, so a
+    // cached write plan would execute on the read path. Insert under both
+    // the raw and normalized hash so a later exact repeat of this text hits
+    // the allocation-free raw-hash path above.
+    let slots = if query.is_read_only() {
+        graph
+            .plan_cache
+            .lock()
+            .insert_both(raw_hash, query_hash, plan.clone(), auto_params.clone())
+    } else {
+        std::sync::Arc::new(cypher::executor::SlotTable::from_plan(&plan))
+    };
+    run_read_query(graph, args, &plan, &slots, auto_params)
 }
 
 /// GRAPH.QUERY <graph> <cypher_string> — write-capable variant.
@@ -643,17 +769,44 @@ pub fn graph_query_or_write(
         }
     };
 
-    // Parse once — no double-parse overhead.
-    let query = match cypher::parse_cypher(cypher_bytes) {
-        Ok(q) => q,
-        Err(e) => {
-            let msg = format!("ERR Cypher parse error: {e}");
-            return (Frame::Error(Bytes::from(msg)), Vec::new(), Vec::new());
+    // Raw-hash pre-lookup (Fix 2): an EXACT repeat of a query text we've
+    // already compiled hits here without ever calling `parameterize()`.
+    let raw_hash = cypher::planner::hash_query(cypher_bytes);
+    if let Some(graph) = store.get_graph(graph_name) {
+        if let Some(cached) = graph.plan_cache.lock().get(raw_hash) {
+            let auto_params = cached.auto_params.as_ref().clone();
+            return (
+                run_read_query(graph, args, &cached.plan, &cached.slots, auto_params),
+                Vec::new(),
+                Vec::new(),
+            );
         }
-    };
+    }
+
+    let (effective, query_hash, auto_params) = normalize_cypher(cypher_bytes);
+
+    // Fast path: normalized-hash plan-cache hit ⇒ read-only plan (PlanCache
+    // invariant) ⇒ route to the read path with ZERO parse/compile work.
+    if let Some(graph) = store.get_graph(graph_name) {
+        let cached = graph.plan_cache.lock().get(query_hash);
+        if let Some(cached) = cached {
+            return (
+                run_read_query(graph, args, &cached.plan, &cached.slots, auto_params),
+                Vec::new(),
+                Vec::new(),
+            );
+        }
+    }
+
+    // Slow path: parse once (normalized text, raw fallback) and classify.
+    let (query, query_hash, auto_params) =
+        match parse_effective(cypher_bytes, &effective, query_hash, auto_params) {
+            Ok(t) => t,
+            Err(msg) => return (Frame::Error(Bytes::from(msg)), Vec::new(), Vec::new()),
+        };
 
     if query.is_read_only() {
-        // Read path: compile plan (with cache), execute read-only.
+        // Read path: compile plan, cache it, execute read-only.
         let graph = match store.get_graph(graph_name) {
             Some(g) => g,
             None => {
@@ -665,51 +818,27 @@ pub fn graph_query_or_write(
             }
         };
 
-        let query_hash = cypher::planner::hash_query(cypher_bytes);
-        let plan = {
-            let cache = graph.plan_cache.lock();
-            cache.get(query_hash)
-        };
-        let plan = if let Some(cached) = plan {
-            cached
-        } else {
-            let p = match cypher::planner::compile(&query) {
-                Ok(p) => std::sync::Arc::new(p),
-                Err(e) => {
-                    let msg = format!("ERR Cypher plan error: {e}");
-                    return (Frame::Error(Bytes::from(msg)), Vec::new(), Vec::new());
-                }
-            };
-            graph.plan_cache.lock().insert(query_hash, p.clone());
-            p
-        };
-
-        let params = parse_params(args);
-        let valid_at = parse_valid_at(args);
-        let decay = match parse_decay(args) {
-            Ok(d) => d,
-            Err(msg) => {
-                return (
-                    Frame::Error(Bytes::from_static(msg.as_bytes())),
-                    Vec::new(),
-                    Vec::new(),
-                );
-            }
-        };
-        let ctx = cypher::executor::ExecutionContext {
-            valid_time_as_of: valid_at,
-            decay,
-            ..Default::default()
-        };
-        let result = match cypher::executor::execute(graph, &plan, &params, &ctx) {
-            Ok(r) => r,
+        let plan = match cypher::planner::compile(&query) {
+            Ok(p) => std::sync::Arc::new(p),
             Err(e) => {
-                let msg = format!("ERR Cypher execution error: {e}");
+                let msg = format!("ERR Cypher plan error: {e}");
                 return (Frame::Error(Bytes::from(msg)), Vec::new(), Vec::new());
             }
         };
+        // Insert under both hashes so a later exact repeat of this text
+        // hits the allocation-free raw-hash path above.
+        let slots = graph.plan_cache.lock().insert_both(
+            raw_hash,
+            query_hash,
+            plan.clone(),
+            auto_params.clone(),
+        );
 
-        (exec_result_to_frame(&result), Vec::new(), Vec::new())
+        (
+            run_read_query(graph, args, &plan, &slots, auto_params),
+            Vec::new(),
+            Vec::new(),
+        )
     } else {
         // Decay biases read-path traversal cost only; a write query must not
         // silently accept (or skip validating) the flag. Reject before any
@@ -759,7 +888,13 @@ pub fn graph_query_or_write(
                 }
             };
 
-            let params = parse_params(args);
+            // Merge auto-extracted literal values: the write plan was
+            // compiled from the normalized text, so `$__pN` parameters must
+            // resolve or CREATE would store Nulls.
+            let mut params = parse_params(args);
+            for (name, value) in auto_params {
+                params.insert(name, value);
+            }
             match cypher::executor::execute_mut(graph, &plan, &params, lsn) {
                 Ok(r) => {
                     let muts = r.mutations;
@@ -884,34 +1019,15 @@ pub fn graph_query_or_write(
 /// GRAPH.RO_QUERY <graph> <cypher_string>
 ///
 /// Like GRAPH.QUERY but rejects write clauses (CREATE, DELETE, SET, MERGE).
+/// Shares the single-parse read core with GRAPH.QUERY — a plan-cache hit is
+/// read-only by the cache invariant, so no classification re-parse is needed.
 pub fn graph_ro_query(store: &GraphStore, args: &[Frame]) -> Frame {
     if args.len() < 2 {
         return Frame::Error(Bytes::from_static(
             b"ERR wrong number of arguments for 'GRAPH.RO_QUERY' command",
         ));
     }
-
-    let cypher_bytes = match extract_bulk(&args[1]) {
-        Some(b) => b,
-        None => return Frame::Error(Bytes::from_static(b"ERR invalid Cypher query")),
-    };
-
-    let query = match cypher::parse_cypher(cypher_bytes) {
-        Ok(q) => q,
-        Err(e) => {
-            let msg = format!("ERR Cypher parse error: {e}");
-            return Frame::Error(Bytes::from(msg));
-        }
-    };
-
-    if !query.is_read_only() {
-        return Frame::Error(Bytes::from_static(
-            b"ERR GRAPH.RO_QUERY does not allow write clauses (CREATE, DELETE, SET, MERGE)",
-        ));
-    }
-
-    // Delegate to the regular query handler for parsing/planning.
-    graph_query(store, args)
+    graph_query_readonly(store, args, true)
 }
 
 /// GRAPH.EXPLAIN <graph> <cypher_string>
@@ -1036,6 +1152,7 @@ pub fn graph_profile(store: &GraphStore, args: &[Frame]) -> Frame {
     let ctx = cypher::executor::ExecutionContext {
         valid_time_as_of: valid_at,
         decay,
+        guard: Some(crate::graph::traversal_guard::TraversalGuard::with_default_timeout(0)),
         ..Default::default()
     };
     let profile = match cypher::executor::execute_profile(graph, &plan, &params, &ctx) {
@@ -1413,6 +1530,8 @@ pub fn graph_vsearch(store: &GraphStore, args: &[Frame]) -> Frame {
 
     let node_key = super::graph_write::external_id_to_node_key(start_id);
     let memgraph = &graph.write_buf;
+    let segments_guard = graph.segments.load();
+    let csr_segs = &segments_guard.immutable;
     let lsn = u64::MAX - 1;
 
     let mut search =
@@ -1420,7 +1539,7 @@ pub fn graph_vsearch(store: &GraphStore, args: &[Frame]) -> Frame {
     search.threshold = threshold;
     search.edge_type_filter = edge_type_filter;
 
-    match search.execute(memgraph, lsn) {
+    match search.execute(memgraph, csr_segs, lsn) {
         Ok(results) => hybrid_results_to_frame(&results),
         Err(e) => Frame::Error(Bytes::from(format!("ERR {e}"))),
     }
@@ -1460,6 +1579,8 @@ pub fn graph_hybrid(store: &GraphStore, args: &[Frame]) -> Frame {
     };
 
     let memgraph = &graph.write_buf;
+    let segments_guard = graph.segments.load();
+    let csr_segs = &segments_guard.immutable;
     let lsn = u64::MAX - 1;
 
     if mode.eq_ignore_ascii_case(b"FILTER") {
@@ -1489,7 +1610,7 @@ pub fn graph_hybrid(store: &GraphStore, args: &[Frame]) -> Frame {
         let node_key = super::graph_write::external_id_to_node_key(start_id);
         let search =
             crate::graph::hybrid::GraphFilteredSearch::new(node_key, hops, query_vector, k);
-        match search.execute(memgraph, lsn) {
+        match search.execute(memgraph, csr_segs, lsn) {
             Ok(results) => hybrid_results_to_frame(&results),
             Err(e) => Frame::Error(Bytes::from(format!("ERR {e}"))),
         }
@@ -1527,7 +1648,7 @@ pub fn graph_hybrid(store: &GraphStore, args: &[Frame]) -> Frame {
         walk.beam_width = beam_width;
         walk.min_similarity = min_sim;
 
-        match walk.execute(memgraph, lsn) {
+        match walk.execute(memgraph, csr_segs, lsn) {
             Ok(results) => hybrid_results_to_frame(&results),
             Err(e) => Frame::Error(Bytes::from(format!("ERR {e}"))),
         }
@@ -1567,7 +1688,7 @@ pub fn graph_hybrid(store: &GraphStore, args: &[Frame]) -> Frame {
             query_vector,
             k,
         );
-        match reranker.execute(memgraph, lsn) {
+        match reranker.execute(memgraph, csr_segs, lsn) {
             Ok(results) => hybrid_results_to_frame(&results),
             Err(e) => Frame::Error(Bytes::from(format!("ERR {e}"))),
         }
@@ -1649,9 +1770,26 @@ fn extract_f32_vector(frame: &Frame) -> Option<Vec<f32>> {
         _ => return None,
     };
 
-    let text = core::str::from_utf8(bytes).ok()?;
-    let values: Result<Vec<f32>, _> = text.split_whitespace().map(|s| s.parse::<f32>()).collect();
-    values.ok()
+    // Text form first ("0.1 0.2 ..."), then binary little-endian f32 array —
+    // the SAME blob format GRAPH.ADDNODE's VECTOR argument accepts, so
+    // vectors round-trip between ADDNODE and VSEARCH/HYBRID unchanged.
+    if let Ok(text) = core::str::from_utf8(bytes) {
+        let values: Result<Vec<f32>, _> =
+            text.split_whitespace().map(|s| s.parse::<f32>()).collect();
+        match values {
+            Ok(v) if !v.is_empty() => return Some(v),
+            _ => {}
+        }
+    }
+    if bytes.is_empty() || !bytes.len().is_multiple_of(4) {
+        return None;
+    }
+    Some(
+        bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect(),
+    )
 }
 
 /// Parse an f64 from a Frame.

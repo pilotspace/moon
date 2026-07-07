@@ -12,7 +12,6 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
 use crate::graph::csr::CsrSegment;
-use crate::graph::index::PropertyIndex;
 use crate::graph::segment::GraphSegmentHolder;
 use crate::graph::stats::GraphStats;
 
@@ -39,9 +38,6 @@ pub struct NamedGraph {
     pub edge_threshold: usize,
     /// LSN at which this graph was created.
     pub created_lsn: u64,
-    /// Optional property indexes for cross-segment numeric range queries.
-    /// Key is the property name dictionary ID.
-    pub property_indexes: HashMap<u16, PropertyIndex>,
     /// Per-graph statistics for cost-based query planning.
     /// Updated incrementally on node/edge insert/delete.
     pub stats: GraphStats,
@@ -76,7 +72,8 @@ impl NamedGraph {
     }
 
     /// Freeze the current MemGraph, convert to CSR, and push the new immutable
-    /// segment into the segment holder. Replaces write_buf with a fresh MemGraph.
+    /// segment into the segment holder. Thaws write_buf in place afterwards
+    /// (same slot maps — see key-uniqueness note below).
     ///
     /// Returns `true` if compaction succeeded, `false` if freeze/CSR build failed.
     pub fn freeze_and_compact(&mut self, lsn: u64) -> bool {
@@ -86,21 +83,31 @@ impl NamedGraph {
             Err(_) => return false,
         };
 
-        // Convert frozen MemGraph to a CSR segment.
-        match CsrSegment::from_frozen(frozen, lsn) {
+        // Nothing freezable (e.g. the buffer holds only cross-tier delta
+        // edges, which freeze() retains): skip — pushing an empty segment
+        // per write attempt would churn the segment list.
+        if frozen.nodes.is_empty() && frozen.edges.is_empty() {
+            self.write_buf.thaw();
+            return false;
+        }
+
+        // Convert frozen MemGraph to a CSR segment. Either way, thaw the
+        // drained write_buf IN PLACE — reusing the slot maps keeps SlotMap
+        // generation continuity, so post-freeze NodeKeys can never collide
+        // with the external_ids of frozen CSR rows (a fresh MemGraph would
+        // restart allocation at the same keys and alias new nodes onto
+        // frozen rows).
+        let ok = match CsrSegment::from_frozen(frozen, lsn) {
             Ok(csr) => {
                 self.segments.add_immutable(csr);
-                // Replace write_buf with a fresh empty MemGraph.
-                self.write_buf = crate::graph::memgraph::MemGraph::new(self.edge_threshold);
                 true
             }
-            Err(_) => {
-                // CSR build failed -- write_buf is already frozen/drained.
-                // Replace with fresh MemGraph so writes can continue.
-                self.write_buf = crate::graph::memgraph::MemGraph::new(self.edge_threshold);
-                false
-            }
-        }
+            // CSR build failed — write_buf is already drained; thaw so
+            // writes can continue.
+            Err(_) => false,
+        };
+        self.write_buf.thaw();
+        ok
     }
 }
 
@@ -195,7 +202,6 @@ impl GraphStore {
                 write_buf: crate::graph::memgraph::MemGraph::new(edge_threshold),
                 edge_threshold,
                 created_lsn: lsn,
-                property_indexes: HashMap::new(),
                 stats: GraphStats::new(),
                 plan_cache: parking_lot::Mutex::new(crate::graph::cypher::planner::PlanCache::new(
                     1024,
@@ -470,6 +476,44 @@ mod tests {
     fn test_load_metadata_missing_file() {
         let result = GraphStore::load_metadata(std::path::Path::new("/nonexistent/meta.json"));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_freeze_and_compact_preserves_key_uniqueness() {
+        use smallvec::smallvec;
+        let mut store = GraphStore::new();
+        store
+            .create_graph(Bytes::from_static(b"g"), 4, 1)
+            .expect("ok");
+        let g = store.get_graph_mut(b"g").expect("g");
+
+        let mut keys = Vec::new();
+        for i in 0..5u64 {
+            keys.push(g.write_buf.add_node(smallvec![0u16], smallvec![], None, i));
+        }
+        for w in keys.windows(2) {
+            g.write_buf
+                .add_edge(w[0], w[1], 0, 1.0, None, 10)
+                .expect("edge");
+        }
+        assert!(g.freeze_and_compact(20), "compact succeeds");
+
+        // A node added AFTER the freeze must get a key distinct from every
+        // frozen key. A fresh SlotMap restarts allocation at the same
+        // (index, generation) pairs, silently aliasing new nodes onto frozen
+        // CSR rows (external_id collision across tiers).
+        let new_key = g.write_buf.add_node(smallvec![0u16], smallvec![], None, 21);
+        assert!(
+            !keys.contains(&new_key),
+            "post-freeze NodeKey collides with a frozen node's key"
+        );
+        let snap = g.segments.load();
+        for seg in &snap.immutable {
+            assert!(
+                seg.lookup_node(new_key).is_none(),
+                "frozen segment resolves a post-freeze key"
+            );
+        }
     }
 
     #[test]

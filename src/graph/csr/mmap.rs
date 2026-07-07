@@ -52,6 +52,17 @@ pub struct MmapCsrSegment {
     /// arrays. NOT part of the on-disk format — rebuilt on the first Incoming/Both
     /// query. (v3-2 graph-incoming-edges.)
     pub incoming: std::sync::OnceLock<IncomingIndex>,
+    /// Lazily built per-segment property indexes (see `SegmentPropertyIndexes`).
+    pub props_index: std::sync::OnceLock<crate::graph::index::SegmentPropertyIndexes>,
+    /// Lazily-built HNSW bridge over this segment's v5 embeddings (hybrid
+    /// HnswPreFilter). DERIVED, in-memory only — never persisted.
+    pub hnsw_bridge: std::sync::OnceLock<Option<crate::graph::hnsw_bridge::GraphHnsw>>,
+    /// Pointer into mmap: node property blob (version >= 5; dangling+0 otherwise).
+    node_props_ptr: *const u8,
+    node_props_len: usize,
+    /// Pointer into mmap: edge property blob (version >= 5; dangling+0 otherwise).
+    edge_props_ptr: *const u8,
+    edge_props_len: usize,
 }
 
 // SAFETY: MmapCsrSegment contains raw pointers into an immutable Mmap region.
@@ -269,11 +280,44 @@ impl MmapCsrSegment {
         // (A1: NOT zero-copied — the section is variable-length, unlike the
         // fixed-stride raw-cast arrays). It begins right after edge_created_ms;
         // reuse the shared bounds-checked parser (errors, never panics).
-        let label_overflow = if version >= 4 {
+        let (label_overflow, overflow_end) = if version >= 4 {
             let overflow_start = nm_start + nc * nm_elem_size + ec * ecms_elem_size;
             parse_label_overflow(data, overflow_start, node_count)?
         } else {
-            HashMap::new()
+            (
+                HashMap::new(),
+                nm_start + nc * nm_elem_size + ec * ecms_elem_size,
+            )
+        };
+
+        // Version 5+: node/edge property blobs ([len: u64][bytes] each) after
+        // label_overflow. Zero-copy: keep pointers into the mapped region (u8
+        // slices have no alignment requirement). Pre-v5 files get dangling+0.
+        let (np_ptr, np_len, ep_ptr, ep_len) = if version >= 5 {
+            let mut ppos = overflow_end;
+            let np_len = u64::from_le_bytes(read8(data, ppos)?) as usize;
+            ppos += 8;
+            if ppos.checked_add(np_len).is_none_or(|end| end > data.len()) {
+                return Err(CsrError::InvalidData(
+                    "node_props section truncated in mmap".to_owned(),
+                ));
+            }
+            // SAFETY: bounds validated above; u8 has alignment 1; mmap alive for self.
+            let np_ptr = unsafe { base.add(ppos) };
+            ppos += np_len;
+            let ep_len = u64::from_le_bytes(read8(data, ppos)?) as usize;
+            ppos += 8;
+            if ppos.checked_add(ep_len).is_none_or(|end| end > data.len()) {
+                return Err(CsrError::InvalidData(
+                    "edge_props section truncated in mmap".to_owned(),
+                ));
+            }
+            // SAFETY: bounds validated above; u8 has alignment 1; mmap alive for self.
+            let ep_ptr = unsafe { base.add(ppos) };
+            (np_ptr, np_len, ep_ptr, ep_len)
+        } else {
+            let dangling = core::ptr::NonNull::<u8>::dangling().as_ptr() as *const u8;
+            (dangling, 0, dangling, 0)
         };
 
         let mph = MphNodeIndex::build(&sorted_keys);
@@ -324,7 +368,71 @@ impl MmapCsrSegment {
             edge_type_index,
             created_lsn,
             incoming: std::sync::OnceLock::new(),
+            props_index: std::sync::OnceLock::new(),
+            hnsw_bridge: std::sync::OnceLock::new(),
+            node_props_ptr: np_ptr,
+            node_props_len: np_len,
+            edge_props_ptr: ep_ptr,
+            edge_props_len: ep_len,
         })
+    }
+
+    /// Node property blob (borrowed from mmap; empty for pre-v5 files).
+    pub fn node_props_blob(&self) -> &[u8] {
+        if self.node_props_len == 0 {
+            return &[];
+        }
+        // SAFETY: pointer+len validated in from_mmap_file; mmap alive as long
+        // as self; the region is immutable.
+        unsafe { core::slice::from_raw_parts(self.node_props_ptr, self.node_props_len) }
+    }
+
+    /// Edge property blob (borrowed from mmap; empty for pre-v5 files).
+    pub fn edge_props_blob(&self) -> &[u8] {
+        if self.edge_props_len == 0 {
+            return &[];
+        }
+        // SAFETY: pointer+len validated in from_mmap_file; mmap alive as long
+        // as self; the region is immutable.
+        unsafe { core::slice::from_raw_parts(self.edge_props_ptr, self.edge_props_len) }
+    }
+
+    /// Node properties for a CSR row (empty for none / pre-v5 files).
+    pub fn node_properties(&self, row: u32) -> crate::graph::types::PropertyMap {
+        match self.node_meta().get(row as usize) {
+            Some(nm) => super::props::decode_node_props(self.node_props_blob(), nm.property_offset),
+            None => crate::graph::types::PropertyMap::new(),
+        }
+    }
+
+    /// Single node property lookup without materializing the map.
+    pub fn node_property(&self, row: u32, key: u16) -> Option<crate::graph::types::PropertyValue> {
+        let nm = self.node_meta().get(row as usize)?;
+        super::props::decode_node_prop(self.node_props_blob(), nm.property_offset, key)
+    }
+
+    /// Node embedding for a CSR row (None for none / pre-v5 files).
+    pub fn node_embedding(&self, row: u32) -> Option<Vec<f32>> {
+        let nm = self.node_meta().get(row as usize)?;
+        super::props::decode_node_embedding(self.node_props_blob(), nm.property_offset)
+    }
+
+    /// Edge weight by edge index (1.0 default / pre-v5 files).
+    pub fn edge_weight(&self, edge_idx: u32) -> f64 {
+        match self.edge_meta().get(edge_idx as usize) {
+            Some(em) => {
+                super::props::decode_edge_weight(self.edge_props_blob(), em.property_offset)
+            }
+            None => super::props::DEFAULT_EDGE_WEIGHT,
+        }
+    }
+
+    /// Edge properties by edge index (empty for none / pre-v5 files).
+    pub fn edge_properties(&self, edge_idx: u32) -> crate::graph::types::PropertyMap {
+        match self.edge_meta().get(edge_idx as usize) {
+            Some(em) => super::props::decode_edge_props(self.edge_props_blob(), em.property_offset),
+            None => crate::graph::types::PropertyMap::new(),
+        }
     }
 
     /// Row offsets array (borrowed from mmap).

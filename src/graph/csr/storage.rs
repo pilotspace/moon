@@ -134,13 +134,58 @@ impl CsrStorage {
 
     /// Resident bytes used by this CSR segment.
     ///
-    /// For Heap: row_offsets + col_indices + edge_meta + node_meta Vec allocations.
-    /// For Mmap: the mmap region length (kernel page-cache resident).
+    /// Follows the `RawF16Store` precedent (PR #232): mmap-backed sections
+    /// are kernel page cache (reclaimable under memory pressure) and count
+    /// as 0; heap-owned sections count in full. Previously this summed
+    /// `row_offsets`/`col_indices`/`edge_meta`/`node_meta` unconditionally
+    /// for BOTH variants (over-counting `Mmap` segments, whose backing
+    /// storage is NOT heap-resident) and omitted the v5 node/edge property
+    /// blobs, the lazily-built `SegmentPropertyIndexes`, and the lazily-built
+    /// `GraphHnsw` bridge entirely — all invisible to the shard's elastic
+    /// memory budget / eviction pipeline (`NamedGraph::resident_bytes` ->
+    /// `src/shard/persistence_tick.rs`).
+    ///
+    /// `props_index` and `hnsw_bridge` are ALWAYS heap-owned once built,
+    /// regardless of whether the underlying segment is `Heap` or `Mmap` —
+    /// they are derived structures built on top of the (possibly mmap'd)
+    /// source data, never persisted/mapped themselves.
     pub fn resident_bytes(&self) -> usize {
-        std::mem::size_of_val(self.row_offsets())
-            + std::mem::size_of_val(self.col_indices())
-            + std::mem::size_of_val(self.edge_meta())
-            + std::mem::size_of_val(self.node_meta())
+        let (core, props) = match self {
+            CsrStorage::Heap(s) => {
+                let core = std::mem::size_of_val(s.row_offsets.as_slice())
+                    + std::mem::size_of_val(s.col_indices.as_slice())
+                    + std::mem::size_of_val(s.edge_meta.as_slice())
+                    + std::mem::size_of_val(s.node_meta.as_slice());
+                (core, s.node_props.len() + s.edge_props.len())
+            }
+            CsrStorage::Mmap(_) => (0, 0),
+        };
+        let indexes = self
+            .props_index_if_built()
+            .map_or(0, |ix| ix.resident_bytes());
+        let hnsw = self
+            .hnsw_bridge_if_built()
+            .map_or(0, |b| b.resident_bytes());
+        core + props + indexes + hnsw
+    }
+
+    /// Borrow the property index ONLY if it has already been built (does
+    /// not trigger a build) — `resident_bytes` must be a cheap read, never
+    /// a lazy-init trigger.
+    fn props_index_if_built(&self) -> Option<&crate::graph::index::SegmentPropertyIndexes> {
+        match self {
+            CsrStorage::Heap(s) => s.props_index.get(),
+            CsrStorage::Mmap(s) => s.props_index.get(),
+        }
+    }
+
+    /// Borrow the HNSW bridge ONLY if it has already been built AND
+    /// succeeded (`Some(GraphHnsw)`, not the cached "too few vectors" `None`).
+    fn hnsw_bridge_if_built(&self) -> Option<&crate::graph::hnsw_bridge::GraphHnsw> {
+        match self {
+            CsrStorage::Heap(s) => s.hnsw_bridge.get().and_then(|b| b.as_ref()),
+            CsrStorage::Mmap(s) => s.hnsw_bridge.get().and_then(|b| b.as_ref()),
+        }
     }
 
     /// Created LSN for this segment.
@@ -305,6 +350,111 @@ impl CsrStorage {
         }
     }
 
+    /// Get-or-build this segment's lazy property index over CSR rows.
+    /// Built once from node_meta + the v5 property blob; cached in the
+    /// segment's `OnceLock` (interior mutability — read-only derived state,
+    /// same pattern as `incoming_index`).
+    pub fn property_index(&self) -> &crate::graph::index::SegmentPropertyIndexes {
+        match self {
+            CsrStorage::Heap(s) => s.props_index.get_or_init(|| {
+                crate::graph::index::SegmentPropertyIndexes::build(&s.node_meta, &s.node_props)
+            }),
+            CsrStorage::Mmap(s) => s.props_index.get_or_init(|| {
+                crate::graph::index::SegmentPropertyIndexes::build(
+                    s.node_meta(),
+                    s.node_props_blob(),
+                )
+            }),
+        }
+    }
+
+    /// Get-or-build this segment's HNSW bridge over v5 node embeddings
+    /// (hybrid HnswPreFilter). Built at most once per segment, and only when
+    /// it holds >= `BRIDGE_MIN_VECTORS` usable embeddings — the negative
+    /// answer is cached too, so small segments pay the scan exactly once.
+    /// Same `OnceLock` interior-mutability pattern as `incoming_index`.
+    pub fn hnsw_bridge(&self) -> Option<&crate::graph::hnsw_bridge::GraphHnsw> {
+        let cell = match self {
+            CsrStorage::Heap(s) => &s.hnsw_bridge,
+            CsrStorage::Mmap(s) => &s.hnsw_bridge,
+        };
+        cell.get_or_init(|| {
+            crate::graph::hnsw_bridge::GraphHnsw::build(
+                self,
+                crate::graph::hnsw_bridge::BRIDGE_MIN_VECTORS,
+            )
+        })
+        .as_ref()
+    }
+
+    /// Test hook: build the bridge regardless of the production minimum, so
+    /// small fixtures can exercise the HnswPreFilter path.
+    #[cfg(test)]
+    pub fn hnsw_bridge_for_test(&self) -> Option<&crate::graph::hnsw_bridge::GraphHnsw> {
+        let cell = match self {
+            CsrStorage::Heap(s) => &s.hnsw_bridge,
+            CsrStorage::Mmap(s) => &s.hnsw_bridge,
+        };
+        cell.get_or_init(|| crate::graph::hnsw_bridge::GraphHnsw::build(self, 1))
+            .as_ref()
+    }
+
+    /// Node property blob (empty for pre-v5 segments).
+    pub fn node_props_blob(&self) -> &[u8] {
+        match self {
+            CsrStorage::Heap(s) => &s.node_props,
+            CsrStorage::Mmap(s) => s.node_props_blob(),
+        }
+    }
+
+    /// Edge property blob (empty for pre-v5 segments).
+    pub fn edge_props_blob(&self) -> &[u8] {
+        match self {
+            CsrStorage::Heap(s) => &s.edge_props,
+            CsrStorage::Mmap(s) => s.edge_props_blob(),
+        }
+    }
+
+    /// Node properties for a CSR row (empty for none / pre-v5 segments).
+    pub fn node_properties(&self, row: u32) -> crate::graph::types::PropertyMap {
+        match self {
+            CsrStorage::Heap(s) => s.node_properties(row),
+            CsrStorage::Mmap(s) => s.node_properties(row),
+        }
+    }
+
+    /// Single node property lookup without materializing the map.
+    pub fn node_property(&self, row: u32, key: u16) -> Option<crate::graph::types::PropertyValue> {
+        match self {
+            CsrStorage::Heap(s) => s.node_property(row, key),
+            CsrStorage::Mmap(s) => s.node_property(row, key),
+        }
+    }
+
+    /// Node embedding for a CSR row (None for none / pre-v5 segments).
+    pub fn node_embedding(&self, row: u32) -> Option<Vec<f32>> {
+        match self {
+            CsrStorage::Heap(s) => s.node_embedding(row),
+            CsrStorage::Mmap(s) => s.node_embedding(row),
+        }
+    }
+
+    /// Edge weight by edge index (1.0 default / pre-v5 segments).
+    pub fn edge_weight(&self, edge_idx: u32) -> f64 {
+        match self {
+            CsrStorage::Heap(s) => s.edge_weight(edge_idx),
+            CsrStorage::Mmap(s) => s.edge_weight(edge_idx),
+        }
+    }
+
+    /// Edge properties by edge index (empty for none / pre-v5 segments).
+    pub fn edge_properties(&self, edge_idx: u32) -> crate::graph::types::PropertyMap {
+        match self {
+            CsrStorage::Heap(s) => s.edge_properties(edge_idx),
+            CsrStorage::Mmap(s) => s.edge_properties(edge_idx),
+        }
+    }
+
     /// Write the segment to a file (only supported for Heap variant).
     /// For Mmap variant, the file already exists on disk.
     pub fn write_to_file(&self, path: &Path) -> Result<(), CsrError> {
@@ -391,5 +541,93 @@ impl CsrStorage {
 impl From<CsrSegment> for CsrStorage {
     fn from(seg: CsrSegment) -> Self {
         CsrStorage::Heap(seg)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use smallvec::smallvec;
+
+    use super::*;
+    use crate::graph::memgraph::MemGraph;
+    use crate::graph::types::PropertyValue;
+
+    /// Deterministic pseudo-random embedding (no Math.random in tests).
+    fn embedding(i: u64, dim: usize) -> Vec<f32> {
+        let mut state = i.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
+        (0..dim)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                ((state >> 33) as f32 / (1u64 << 31) as f32) - 0.5
+            })
+            .collect()
+    }
+
+    /// A heap-backed segment with real per-node properties AND embeddings,
+    /// so both `property_index()` and `hnsw_bridge_for_test()` have
+    /// something non-trivial to build (an all-empty fixture would build
+    /// indexes that are themselves empty, masking a broken resident_bytes
+    /// count with a true-by-accident 0 -> 0 "no growth" result).
+    fn heap_segment_with_props_and_embeddings(n: usize, dim: usize) -> CsrStorage {
+        let mut g = MemGraph::new(1_000_000);
+        let mut keys = Vec::with_capacity(n);
+        for i in 0..n {
+            let props = smallvec![(0u16, PropertyValue::Int(i as i64))];
+            keys.push(g.add_node(smallvec![0u16], props, Some(embedding(i as u64, dim)), 1));
+        }
+        for i in 0..n.saturating_sub(1) {
+            g.add_edge(keys[i], keys[i + 1], 1, 1.0, None, 2)
+                .expect("edge");
+        }
+        let frozen = g.freeze().expect("freeze");
+        let seg = CsrSegment::from_frozen(frozen, 10).expect("csr");
+        CsrStorage::Heap(seg)
+    }
+
+    #[test]
+    fn test_resident_bytes_grows_after_index_and_bridge_build() {
+        let storage = heap_segment_with_props_and_embeddings(64, 8);
+
+        let baseline = storage.resident_bytes();
+
+        // Force the property index to build (get_or_init, not a call that
+        // would already have been triggered by anything above).
+        let _ = storage.property_index();
+        let after_props_index = storage.resident_bytes();
+        assert!(
+            after_props_index > baseline,
+            "resident_bytes must grow once the lazily-built SegmentPropertyIndexes \
+             is materialized: baseline={baseline}, after={after_props_index}"
+        );
+
+        // Force the HNSW bridge to build too (test hook bypasses the
+        // production BRIDGE_MIN_VECTORS gate).
+        assert!(
+            storage.hnsw_bridge_for_test().is_some(),
+            "fixture has embeddings on every node; bridge build must succeed"
+        );
+        let after_bridge = storage.resident_bytes();
+        assert!(
+            after_bridge > after_props_index,
+            "resident_bytes must grow again once the lazily-built GraphHnsw bridge \
+             is materialized: after_props_index={after_props_index}, after_bridge={after_bridge}"
+        );
+    }
+
+    #[test]
+    fn test_resident_bytes_mmap_zeroes_core_arrays_heap_counts_them() {
+        // Heap segment: row/col/edge_meta/node_meta count in full (these are
+        // genuinely heap-owned Vec allocations).
+        let heap = heap_segment_with_props_and_embeddings(16, 4);
+        let heap_core = std::mem::size_of_val(heap.row_offsets())
+            + std::mem::size_of_val(heap.col_indices())
+            + std::mem::size_of_val(heap.edge_meta())
+            + std::mem::size_of_val(heap.node_meta());
+        assert!(
+            heap.resident_bytes() >= heap_core,
+            "Heap variant must count its row/col/edge_meta/node_meta arrays in full"
+        );
     }
 }

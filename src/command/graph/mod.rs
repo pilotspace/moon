@@ -29,23 +29,36 @@ pub fn is_graph_write_cmd(cmd: &[u8]) -> bool {
         || cmd.eq_ignore_ascii_case(b"GRAPH.DROP")
 }
 
-/// Quick-parse a GRAPH.QUERY's Cypher argument to determine if it contains write clauses.
-/// Returns true if the Cypher has CREATE, DELETE, SET, or MERGE.
-/// Returns false on parse failure (fallback to read path — it will re-parse and report error).
+/// Quick-scan a GRAPH.QUERY's Cypher argument to determine if it MAY contain
+/// write clauses (CREATE, DELETE, SET, MERGE).
+///
+/// Token scan, not a parse — this is a routing predicate on the hot path and
+/// was previously a full second parse. It may FALSE-POSITIVE (e.g. a property
+/// named `set`: the lexer emits the keyword token), which only routes the
+/// query through the write-capable handler; `graph_query_or_write` then
+/// AST-classifies and executes the read path correctly. It can never
+/// false-negative for a parsable write query: a write clause always lexes to
+/// its keyword token.
 #[inline]
 pub fn is_cypher_write_query(args: &[crate::protocol::Frame]) -> bool {
-    use crate::command::graph::graph_write::extract_bulk;
+    use crate::graph::cypher::lexer::{Lexer, Token};
     if args.len() < 2 {
         return false;
     }
-    let cypher_bytes = match extract_bulk(&args[1]) {
+    let cypher_bytes = match graph_write::extract_bulk(&args[1]) {
         Some(b) => b,
         None => return false,
     };
-    match crate::graph::cypher::parse_cypher(cypher_bytes) {
-        Ok(q) => !q.is_read_only(),
-        Err(_) => false,
+    let mut lexer = Lexer::new(cypher_bytes);
+    while let Some(t) = lexer.next_token() {
+        if matches!(
+            t.token,
+            Token::Create | Token::Delete | Token::Set | Token::Merge
+        ) {
+            return true;
+        }
     }
+    false
 }
 
 /// Dispatch read-only GRAPH.* commands. Takes &GraphStore (shared).
@@ -191,6 +204,179 @@ mod tests {
             .map(|p| Frame::BulkString(Bytes::from(p.to_vec())))
             .collect();
         Frame::Array(FrameVec::from_vec(frames))
+    }
+
+    /// Decode `[headers, rows, stats]` from a GRAPH.QUERY response into rows of cells.
+    fn result_rows(resp: &Frame) -> Vec<Vec<Frame>> {
+        let Frame::Array(outer) = resp else {
+            panic!("expected result Array, got {resp:?}");
+        };
+        let Frame::Array(rows) = &outer[1] else {
+            panic!("expected rows Array, got {resp:?}");
+        };
+        rows.iter()
+            .map(|r| {
+                let Frame::Array(cells) = r else {
+                    panic!("expected row Array, got {r:?}");
+                };
+                cells.iter().cloned().collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_plan_cache_shared_across_literal_variants() {
+        let mut store = GraphStore::new();
+        dispatch_graph_command(&mut store, &make_cmd(&[b"GRAPH.CREATE", b"g"]));
+        dispatch_graph_command(
+            &mut store,
+            &make_cmd(&[b"GRAPH.QUERY", b"g", b"CREATE (:Person {id: 1})"]),
+        );
+        dispatch_graph_command(
+            &mut store,
+            &make_cmd(&[b"GRAPH.QUERY", b"g", b"CREATE (:Person {id: 2})"]),
+        );
+
+        let r1 = dispatch_graph_command(
+            &mut store,
+            &make_cmd(&[
+                b"GRAPH.QUERY",
+                b"g",
+                b"MATCH (a:Person {id: 1}) RETURN a.id",
+            ]),
+        );
+        let r2 = dispatch_graph_command(
+            &mut store,
+            &make_cmd(&[
+                b"GRAPH.QUERY",
+                b"g",
+                b"MATCH (a:Person {id: 2}) RETURN a.id",
+            ]),
+        );
+
+        let rows1 = result_rows(&r1);
+        let rows2 = result_rows(&r2);
+        assert_eq!(rows1.len(), 1, "point query id=1 returns one row: {r1:?}");
+        assert_eq!(rows2.len(), 1, "point query id=2 returns one row: {r2:?}");
+        assert!(
+            matches!(rows1[0][0], Frame::Integer(1)),
+            "id=1 query must return its own row, got {:?}",
+            rows1[0][0]
+        );
+        assert!(
+            matches!(rows2[0][0], Frame::Integer(2)),
+            "id=2 query must return its own row, got {:?}",
+            rows2[0][0]
+        );
+
+        let graph = store.get_graph(b"g").expect("graph exists");
+        assert_eq!(
+            graph.plan_cache.lock().distinct_plan_count(),
+            1,
+            "queries differing only in literal values must share one cached plan \
+             (and write queries must not be cached)"
+        );
+    }
+
+    #[test]
+    fn test_plan_cache_string_literals_share_plan_with_correct_values() {
+        let mut store = GraphStore::new();
+        dispatch_graph_command(&mut store, &make_cmd(&[b"GRAPH.CREATE", b"g"]));
+        dispatch_graph_command(
+            &mut store,
+            &make_cmd(&[b"GRAPH.QUERY", b"g", b"CREATE (:P {name: 'alice'})"]),
+        );
+        dispatch_graph_command(
+            &mut store,
+            &make_cmd(&[b"GRAPH.QUERY", b"g", b"CREATE (:P {name: 'bob'})"]),
+        );
+
+        let ra = dispatch_graph_command(
+            &mut store,
+            &make_cmd(&[
+                b"GRAPH.QUERY",
+                b"g",
+                b"MATCH (a:P {name: 'alice'}) RETURN a.name",
+            ]),
+        );
+        let rb = dispatch_graph_command(
+            &mut store,
+            &make_cmd(&[
+                b"GRAPH.QUERY",
+                b"g",
+                b"MATCH (a:P {name: 'bob'}) RETURN a.name",
+            ]),
+        );
+
+        let rows_a = result_rows(&ra);
+        let rows_b = result_rows(&rb);
+        assert_eq!(rows_a.len(), 1, "name='alice' returns one row: {ra:?}");
+        assert_eq!(rows_b.len(), 1, "name='bob' returns one row: {rb:?}");
+        assert!(
+            matches!(&rows_a[0][0], Frame::BulkString(b) if b.as_ref() == b"alice"),
+            "alice query must return 'alice', got {:?}",
+            rows_a[0][0]
+        );
+        assert!(
+            matches!(&rows_b[0][0], Frame::BulkString(b) if b.as_ref() == b"bob"),
+            "bob query must return 'bob', got {:?}",
+            rows_b[0][0]
+        );
+
+        let graph = store.get_graph(b"g").expect("graph exists");
+        assert_eq!(
+            graph.plan_cache.lock().distinct_plan_count(),
+            1,
+            "string-literal variants must share one cached plan"
+        );
+    }
+
+    #[test]
+    fn test_var_length_hops_stay_in_plan_key() {
+        // Hop bounds are baked into the compiled plan (Expand max_hops), so
+        // `*1..2` and `*1..3` must NOT normalize to the same cache entry.
+        let mut store = GraphStore::new();
+        dispatch_graph_command(&mut store, &make_cmd(&[b"GRAPH.CREATE", b"g"]));
+        let mut ids = Vec::new();
+        for _ in 0..4 {
+            let resp =
+                dispatch_graph_command(&mut store, &make_cmd(&[b"GRAPH.ADDNODE", b"g", b"N"]));
+            let Frame::Integer(id) = resp else {
+                panic!("expected node id, got {resp:?}");
+            };
+            ids.push(id.to_string());
+        }
+        for w in ids.windows(2) {
+            dispatch_graph_command(
+                &mut store,
+                &make_cmd(&[
+                    b"GRAPH.ADDEDGE",
+                    b"g",
+                    w[0].as_bytes(),
+                    w[1].as_bytes(),
+                    b"KNOWS",
+                ]),
+            );
+        }
+
+        // Chain 1->2->3->4: *1..2 reaches 5 targets, *1..3 reaches 6.
+        let r2 = dispatch_graph_command(
+            &mut store,
+            &make_cmd(&[b"GRAPH.QUERY", b"g", b"MATCH (a)-[*1..2]->(x) RETURN x"]),
+        );
+        let r3 = dispatch_graph_command(
+            &mut store,
+            &make_cmd(&[b"GRAPH.QUERY", b"g", b"MATCH (a)-[*1..3]->(x) RETURN x"]),
+        );
+        assert_eq!(result_rows(&r2).len(), 5, "*1..2 rows: {r2:?}");
+        assert_eq!(result_rows(&r3).len(), 6, "*1..3 rows: {r3:?}");
+
+        let graph = store.get_graph(b"g").expect("graph exists");
+        assert_eq!(
+            graph.plan_cache.lock().distinct_plan_count(),
+            2,
+            "different hop bounds must compile to distinct cached plans"
+        );
     }
 
     #[test]

@@ -14,7 +14,10 @@ pub fn execute_mut(
 ) -> Result<ExecResult, ExecError> {
     let start = std::time::Instant::now();
 
-    let mut rows: Vec<Row> = vec![HashMap::new()];
+    let slot_table = SlotTable::from_plan(plan);
+    let empty_table = SlotTable::default();
+    let empty_row = Row::seed(&empty_table);
+    let mut rows: Vec<Row> = vec![Row::seed(&slot_table)];
     let mut columns = Vec::new();
     let mut projected_rows: Option<Vec<Vec<Value>>> = None;
     let mut nodes_created: u64 = 0;
@@ -24,7 +27,15 @@ pub fn execute_mut(
 
     for op in &plan.operators {
         match op {
-            PhysicalOp::NodeScan { variable, label } => {
+            // The write path matches against the MUTABLE tier only (write
+            // operators mutate MutableNode in place; SET/DELETE on frozen
+            // rows is a separate copy-up design — known follow-up). The
+            // IndexScan arm therefore degrades to the same label scan; the
+            // residual Filter the planner emits keeps results exact.
+            PhysicalOp::NodeScan { variable, label }
+            | PhysicalOp::IndexScan {
+                variable, label, ..
+            } => {
                 let label_id = label.as_ref().map(|l| label_to_id(l.as_bytes()));
                 let mut new_rows = Vec::new();
                 for row in &rows {
@@ -35,7 +46,7 @@ pub fn execute_mut(
                             }
                         }
                         let mut new_row = row.clone();
-                        new_row.insert(variable.clone(), Value::Node(key));
+                        new_row.insert(variable, Value::Node(key));
                         new_rows.push(new_row);
                     }
                 }
@@ -81,12 +92,12 @@ pub fn execute_mut(
                                 }
                             }
                             let mut new_row = row.clone();
-                            new_row.insert(target.clone(), Value::Node(neighbor_key));
+                            new_row.insert(target, Value::Node(neighbor_key));
                             // Phase 174 FIX-01: bind edge variable so DELETE r
                             // can reference it. Previously ignored (`_`), which
                             // made `DELETE r` a silent no-op.
                             if let Some(evar) = edge_variable {
-                                new_row.insert(evar.clone(), Value::Edge(edge_key));
+                                new_row.insert(evar, Value::Edge(edge_key));
                             }
                             new_rows.push(new_row);
                         }
@@ -122,7 +133,7 @@ pub fn execute_mut(
 
                                     if hop >= *min_hops {
                                         let mut new_row = row.clone();
-                                        new_row.insert(target.clone(), Value::Node(neighbor_key));
+                                        new_row.insert(target, Value::Node(neighbor_key));
                                         new_rows.push(new_row);
                                         if new_rows.len() >= MAX_RESULT_ROWS {
                                             break;
@@ -171,8 +182,10 @@ pub fn execute_mut(
                             .iter()
                             .map(|item| {
                                 if matches!(item.expr, Expr::Star) {
-                                    let entries: Vec<(String, Value)> =
-                                        row.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                                    let entries: Vec<(String, Value)> = row
+                                        .iter()
+                                        .map(|(k, v)| (k.to_owned(), v.clone()))
+                                        .collect();
                                     Value::Map(entries)
                                 } else {
                                     eval_expr(
@@ -243,15 +256,7 @@ pub fn execute_mut(
             }
 
             PhysicalOp::Limit { count } => {
-                let n = match eval_expr(
-                    count,
-                    &HashMap::new(),
-                    &graph.write_buf,
-                    params,
-                    &[],
-                    0,
-                    None,
-                ) {
+                let n = match eval_expr(count, &empty_row, &graph.write_buf, params, &[], 0, None) {
                     Value::Int(n) if n >= 0 => n as usize,
                     _ => 0,
                 };
@@ -263,15 +268,7 @@ pub fn execute_mut(
             }
 
             PhysicalOp::Skip { count } => {
-                let n = match eval_expr(
-                    count,
-                    &HashMap::new(),
-                    &graph.write_buf,
-                    params,
-                    &[],
-                    0,
-                    None,
-                ) {
+                let n = match eval_expr(count, &empty_row, &graph.write_buf, params, &[], 0, None) {
                     Value::Int(n) if n >= 0 => n as usize,
                     _ => 0,
                 };
@@ -295,7 +292,7 @@ pub fn execute_mut(
                     if let Value::List(items) = val {
                         for item in items {
                             let mut new_row = row.clone();
-                            new_row.insert(alias.clone(), item);
+                            new_row.insert(alias, item);
                             new_rows.push(new_row);
                         }
                     }
@@ -344,7 +341,7 @@ pub fn execute_mut(
                                 embedding: None,
                             });
                             if let Some(ref var) = pn.variable {
-                                new_row.insert(var.clone(), Value::Node(nk));
+                                new_row.insert(var, Value::Node(nk));
                             }
                             node_keys.push(nk);
                         }
@@ -562,7 +559,7 @@ pub fn execute_mut(
                         if let Some(existing_key) = found {
                             // MATCH path: bind variable and apply on_match.
                             if let Some(ref var) = pn.variable {
-                                new_row.insert(var.clone(), Value::Node(existing_key));
+                                new_row.insert(var, Value::Node(existing_key));
                             }
                             apply_set_items(
                                 on_match,
@@ -586,7 +583,7 @@ pub fn execute_mut(
                                 embedding: None,
                             });
                             if let Some(ref var) = pn.variable {
-                                new_row.insert(var.clone(), Value::Node(nk));
+                                new_row.insert(var, Value::Node(nk));
                             }
                             apply_set_items(
                                 on_create,
@@ -632,10 +629,10 @@ pub fn execute_mut(
                                 if edge_exists {
                                     // Bind variables.
                                     if let Some(ref var) = src_pn.variable {
-                                        new_row.insert(var.clone(), Value::Node(sk));
+                                        new_row.insert(var, Value::Node(sk));
                                     }
                                     if let Some(ref var) = dst_pn.variable {
-                                        new_row.insert(var.clone(), Value::Node(dk));
+                                        new_row.insert(var, Value::Node(dk));
                                     }
                                     apply_set_items(
                                         on_match,
@@ -665,10 +662,10 @@ pub fn execute_mut(
                                         });
                                     }
                                     if let Some(ref var) = src_pn.variable {
-                                        new_row.insert(var.clone(), Value::Node(sk));
+                                        new_row.insert(var, Value::Node(sk));
                                     }
                                     if let Some(ref var) = dst_pn.variable {
-                                        new_row.insert(var.clone(), Value::Node(dk));
+                                        new_row.insert(var, Value::Node(dk));
                                     }
                                     apply_set_items(
                                         on_create,
@@ -771,10 +768,10 @@ pub fn execute_mut(
                                     });
                                 }
                                 if let Some(ref var) = src_pn.variable {
-                                    new_row.insert(var.clone(), Value::Node(sk));
+                                    new_row.insert(var, Value::Node(sk));
                                 }
                                 if let Some(ref var) = dst_pn.variable {
-                                    new_row.insert(var.clone(), Value::Node(dk));
+                                    new_row.insert(var, Value::Node(dk));
                                 }
                                 apply_set_items(
                                     on_create,
@@ -826,7 +823,7 @@ pub fn execute_mut(
         pr
     } else {
         if columns.is_empty() && !rows.is_empty() {
-            columns = rows[0].keys().cloned().collect();
+            columns = slot_table.names().to_vec();
             columns.sort();
         }
         rows.iter()
@@ -859,7 +856,7 @@ pub fn execute_mut(
 /// created nodes — they are removed entirely by the CreateNode intent).
 pub(crate) fn apply_set_items(
     items: &[SetItem],
-    row: &Row,
+    row: &Row<'_>,
     memgraph: &mut crate::graph::memgraph::MemGraph,
     params: &HashMap<String, Value>,
     properties_set: &mut u64,
@@ -926,7 +923,7 @@ pub(crate) fn apply_set_items(
 /// Otherwise, search the memgraph for a matching node by labels + properties.
 pub(crate) fn resolve_or_find_node(
     pn: &PatternNode,
-    row: &Row,
+    row: &Row<'_>,
     memgraph: &crate::graph::memgraph::MemGraph,
     params: &HashMap<String, Value>,
 ) -> Option<NodeKey> {

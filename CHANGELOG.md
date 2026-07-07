@@ -263,6 +263,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bridge) is documented as a scoped follow-up (synchronous CQE handler, no
   async context to sleep in).
 
+### Changed — graph engine deep-review fixes + optimization waves (PR #TBD)
+
+- **Freeze-boundary correctness (P0):** CSR v5 segments now persist node
+  properties, embeddings, and edge weights/properties across freeze;
+  Cypher reads see the frozen tier via `MergedNodeView` (NodeScan/eval/
+  IndexScan); cross-tier delta edges; GRAPH.NEIGHBORS existence +
+  direction fixes; GRAPH.HYBRID/VSEARCH operate across both tiers. New
+  red/green `graph_freeze_boundary` suite (11 tests) pins the lifecycle.
+- **Point-query indexes (P1):** lazy per-segment property indexes (built
+  once at first use from freeze-time data) + `PhysicalOp::IndexScan` in
+  the planner/executor — `MATCH (n:L {p: v})` narrows instead of
+  label-scanning.
+- **Query-path cost (P2):** plan-cache auto-parameterization (literal
+  variants share one cached plan; cache hits skip parse+compile
+  entirely) with LRU eviction; slot-indexed executor rows (no per-row
+  HashMap allocation, no per-insert String clone); write-path/WAL
+  allocation cleanups (ADDNODE double WAL-encode deleted, itoa/ryu
+  statement temporaries, FxHash for slotmap-keyed sets, Dijkstra
+  three-maps-to-one merge, allocation-free neighbor iteration in Cypher
+  Expand).
+- **Traversal engine (P3):** CSR row-space BFS fast path on fully-frozen
+  graphs — dense-bitmap visited set, TRUE parallel frontier expansion
+  (thread::scope over Send+Sync CsrStorage), direction-optimizing
+  Beamer push/pull over the incoming index; `TraversalGuard` wall-clock
+  budget (30s default) now enforced per hop in Cypher variable-length
+  Expand and ShortestPath (`ExecErrorKind::Timeout`); GRAPH.HYBRID's
+  `HnswPreFilter` strategy is real — a lazy per-segment HNSW bridge
+  (`src/graph/hnsw_bridge.rs`, raw-f32 cosine over v5 embeddings, >= 4096
+  vectors) replaces the silent brute-force stub, with exact-scoring
+  fallback whenever the approximate beam under-fills.
+- **Pre-merge review fixes:** (1) restart NodeKey aliasing (P0) — a fresh
+  post-recovery `MemGraph`'s deterministic SlotMap could mint keys
+  bit-identical to loaded CSR segments' `external_id`s, silently
+  shadowing frozen nodes; recovery now seeds the mutable tier via
+  `MemGraph::with_id_offset` (watermark past the largest persisted id)
+  and WAL replay dedup-skips AddNodes already resident in a loaded
+  segment (red/green `graph_restart_id_aliasing` suite). (2) Plan-cache
+  raw-hash fast path — exact-repeat queries hit the cache without the
+  `parameterize()` lexer pass, and the `SlotTable` is cached alongside
+  the plan instead of being rebuilt per execution; cache backing moved
+  to `FxHashMap`. (3) `CsrStorage::resident_bytes` now counts the v5
+  property blobs, lazily-built per-segment property indexes, and the
+  HNSW bridge (heap-owned; mmap-backed sections count 0 per the
+  `RawF16Store` precedent), keeping the elastic memory budget honest.
+
 ### Changed — consolidated dependency bumps (PR #TBD)
 
 - Cargo: `ringbuf` 0.4.8 → 0.5.0 and `metrics-exporter-prometheus` 0.16.2 →

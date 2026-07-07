@@ -316,6 +316,147 @@ impl PropertyIndex {
     pub fn is_empty(&self) -> bool {
         self.tree.is_empty()
     }
+
+    /// Approximate resident bytes: one `OrderedFloat<f64>` key plus each
+    /// bitmap's `serialized_size()` (roaring's own compressed-container
+    /// estimate -- close enough for the elastic memory budget, which only
+    /// needs a monotonic signal, not exact byte accounting).
+    pub fn resident_bytes(&self) -> usize {
+        self.tree
+            .values()
+            .map(|bm| std::mem::size_of::<OrderedFloat<f64>>() + bm.serialized_size())
+            .sum()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SegmentPropertyIndexes
+// ---------------------------------------------------------------------------
+
+/// Per-segment property indexes over CSR rows, built from the v5
+/// node-property blob at first use (segments are immutable, so the index
+/// never needs maintenance — this replaces the dead insert-time
+/// `NamedGraph.property_indexes`, which indexed the wrong row space and was
+/// never read).
+///
+/// Numeric values (Int / Float / Bool as 0-1) share one per-property B-tree
+/// for equality AND range queries; String / Bytes values index by xxh64 hash
+/// for equality. Hash collisions (and Bool-vs-Int aliasing) can only yield
+/// SUPERSET candidate sets — callers keep their residual Filter downstream,
+/// so a collision costs a re-check, never a wrong row.
+///
+/// The build is exhaustive over every row's properties, so an absent
+/// (property, value) means NO row matches: lookups return empty bitmaps,
+/// not a fall-back-to-scan signal. Pre-v5 segments have an empty blob and
+/// genuinely hold no properties, so "empty" is correct there too.
+#[derive(Debug, Default)]
+pub struct SegmentPropertyIndexes {
+    /// prop_id -> numeric B-tree (Int/Float/Bool normalized to f64).
+    numeric: HashMap<u16, PropertyIndex>,
+    /// prop_id -> xxh64(bytes) -> rows (String/Bytes equality).
+    strings: HashMap<u16, HashMap<u64, RoaringBitmap>>,
+}
+
+impl SegmentPropertyIndexes {
+    /// Build from CSR node metadata + the v5 node-property blob.
+    pub fn build(node_meta: &[NodeMeta], node_props_blob: &[u8]) -> Self {
+        use crate::graph::types::PropertyValue;
+        let mut numeric: HashMap<u16, PropertyIndex> = HashMap::new();
+        let mut strings: HashMap<u16, HashMap<u64, RoaringBitmap>> = HashMap::new();
+        for (row, nm) in node_meta.iter().enumerate() {
+            if nm.property_offset == 0 {
+                continue; // no property record for this row
+            }
+            let props =
+                crate::graph::csr::props::decode_node_props(node_props_blob, nm.property_offset);
+            for (pid, val) in &props {
+                let num = match val {
+                    PropertyValue::Int(i) => Some(*i as f64),
+                    PropertyValue::Float(f) => Some(*f),
+                    PropertyValue::Bool(b) => Some(u8::from(*b) as f64),
+                    PropertyValue::String(_) | PropertyValue::Bytes(_) => None,
+                };
+                if let Some(v) = num {
+                    numeric
+                        .entry(*pid)
+                        .or_insert_with(|| PropertyIndex::new(*pid))
+                        .insert(v, row as u32);
+                } else if let PropertyValue::String(s) | PropertyValue::Bytes(s) = val {
+                    strings
+                        .entry(*pid)
+                        .or_default()
+                        .entry(xxhash_rust::xxh64::xxh64(s, 0))
+                        .or_default()
+                        .insert(row as u32);
+                }
+            }
+        }
+        numeric.shrink_to_fit();
+        strings.shrink_to_fit();
+        Self { numeric, strings }
+    }
+
+    /// Rows whose property `prop_id` equals `value` (superset semantics for
+    /// hashed strings / Bool-Int aliasing — see type docs).
+    pub fn rows_eq(
+        &self,
+        prop_id: u16,
+        value: &crate::graph::types::PropertyValue,
+    ) -> RoaringBitmap {
+        use crate::graph::types::PropertyValue;
+        match value {
+            PropertyValue::Int(i) => self.numeric_eq(prop_id, *i as f64),
+            PropertyValue::Float(f) => self.numeric_eq(prop_id, *f),
+            PropertyValue::Bool(b) => self.numeric_eq(prop_id, u8::from(*b) as f64),
+            PropertyValue::String(s) | PropertyValue::Bytes(s) => self
+                .strings
+                .get(&prop_id)
+                .and_then(|m| m.get(&xxhash_rust::xxh64::xxh64(s, 0)))
+                .cloned()
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Rows whose numeric property `prop_id` falls in `[min, max]`.
+    pub fn rows_range(&self, prop_id: u16, min: f64, max: f64) -> RoaringBitmap {
+        self.numeric
+            .get(&prop_id)
+            .map(|ix| ix.range_query(min, max))
+            .unwrap_or_default()
+    }
+
+    /// True when no property is indexed at all (segment without v5 blob).
+    pub fn is_empty(&self) -> bool {
+        self.numeric.is_empty() && self.strings.is_empty()
+    }
+
+    /// Approximate resident bytes across every numeric B-tree and string
+    /// hash-bucket bitmap. Always heap-owned: built lazily on first use from
+    /// the (possibly mmap-backed) property blob, but the index ITSELF is
+    /// never mmap'd -- see `CsrStorage::resident_bytes`, which is the only
+    /// caller and where the mmap-vs-heap distinction for the SOURCE blob is
+    /// applied.
+    pub fn resident_bytes(&self) -> usize {
+        let numeric: usize = self
+            .numeric
+            .values()
+            .map(PropertyIndex::resident_bytes)
+            .sum();
+        let strings: usize = self
+            .strings
+            .values()
+            .flat_map(|inner| inner.values())
+            .map(|bm| std::mem::size_of::<u64>() + bm.serialized_size())
+            .sum();
+        numeric + strings
+    }
+
+    fn numeric_eq(&self, prop_id: u16, v: f64) -> RoaringBitmap {
+        self.numeric
+            .get(&prop_id)
+            .map(|ix| ix.range_query(v, v))
+            .unwrap_or_default()
+    }
 }
 
 // ---------------------------------------------------------------------------

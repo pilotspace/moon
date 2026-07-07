@@ -2,17 +2,214 @@ use std::collections::HashMap;
 
 use super::*;
 
+/// Resolve an `IndexScan` into the matching node keys across both tiers.
+///
+/// Frozen tier: per segment, intersect the property-equality bitmaps
+/// (`SegmentPropertyIndexes::rows_eq`) with the label bitmap, then apply
+/// MVCC/valid-time visibility per surviving row. Mutable tail: linear scan
+/// with an inline (numeric-coercing, superset-consistent) property check —
+/// the tail is bounded by `edge_threshold` by design.
+///
+/// `prop_eq` values are literals or parameters; if any resolves to a
+/// non-scalar the whole scan degrades to the plain merged label scan (the
+/// residual Filter downstream keeps results exact either way).
+#[allow(clippy::too_many_arguments)]
+fn index_scan_keys(
+    memgraph: &crate::graph::memgraph::MemGraph,
+    csr_segs: &[std::sync::Arc<crate::graph::csr::CsrStorage>],
+    label: Option<&String>,
+    prop_eq: &[(String, Expr)],
+    params: &HashMap<String, Value>,
+    ctx: &ExecutionContext,
+) -> Vec<NodeKey> {
+    let label_id = label.map(|l| label_to_id(l.as_bytes()));
+    let committed = roaring::RoaringBitmap::new();
+    let view = crate::graph::view::MergedNodeView::new(memgraph, csr_segs);
+    let empty_table = SlotTable::default();
+    let empty_row = Row::seed(&empty_table);
+
+    // Resolve each equality target to a concrete PropertyValue.
+    let mut targets: Vec<(u16, PropertyValue)> = Vec::with_capacity(prop_eq.len());
+    for (name, expr) in prop_eq {
+        let v = eval_expr(
+            expr,
+            &empty_row,
+            memgraph,
+            params,
+            csr_segs,
+            ctx.snapshot_lsn,
+            ctx.decay,
+        );
+        match value_to_property_value(&v) {
+            Some(pv) => targets.push((label_to_id(name.as_bytes()), pv)),
+            None => {
+                // Unresolvable target (e.g. Null parameter): fall back to
+                // the merged label scan; the residual Filter stays exact.
+                let mut keys = Vec::new();
+                view.for_each_visible_node(
+                    label_id,
+                    ctx.snapshot_lsn,
+                    ctx.my_txn_id,
+                    &committed,
+                    ctx.valid_time_as_of,
+                    |k| keys.push(k),
+                );
+                return keys;
+            }
+        }
+    }
+
+    let mut keys = Vec::new();
+
+    // Mutable tail: inline superset-consistent property check.
+    for (key, node) in memgraph.iter_nodes() {
+        if let Some(lid) = label_id {
+            if !node.labels.contains(&lid) {
+                continue;
+            }
+        }
+        if !crate::graph::visibility::is_node_visible(
+            node,
+            ctx.snapshot_lsn,
+            ctx.my_txn_id,
+            &committed,
+            ctx.valid_time_as_of,
+        ) {
+            continue;
+        }
+        let all_match = targets.iter().all(|(pid, want)| {
+            node.properties
+                .iter()
+                .any(|(id, have)| id == pid && prop_value_loose_eq(have, want))
+        });
+        if all_match {
+            keys.push(key);
+        }
+    }
+
+    // Frozen tier: bitmap intersection per segment.
+    for seg in csr_segs {
+        let mut bm: Option<roaring::RoaringBitmap> = None;
+        for (pid, pv) in &targets {
+            let rows = seg.property_index().rows_eq(*pid, pv);
+            let acc = match bm.take() {
+                Some(acc) => acc & rows,
+                None => rows,
+            };
+            if acc.is_empty() {
+                bm = Some(acc);
+                break;
+            }
+            bm = Some(acc);
+        }
+        let Some(mut bm) = bm else { continue };
+        if bm.is_empty() {
+            continue;
+        }
+        if let Some(lid) = label_id {
+            match seg.label_index().nodes_with_label(lid) {
+                Some(lbm) => bm &= lbm,
+                None => continue,
+            }
+        }
+        let metas = seg.node_meta();
+        for row in bm {
+            let Some(meta) = metas.get(row as usize) else {
+                continue;
+            };
+            if !crate::graph::visibility::is_meta_visible(
+                meta,
+                ctx.snapshot_lsn,
+                ctx.my_txn_id,
+                &committed,
+                ctx.valid_time_as_of,
+            ) {
+                continue;
+            }
+            keys.push(NodeKey::from(slotmap::KeyData::from_ffi(meta.external_id)));
+        }
+    }
+
+    keys
+}
+
+/// Superset-consistent equality between stored and queried property values,
+/// mirroring the index's numeric normalization (Int/Float/Bool share one
+/// f64 space; String/Bytes compare bytewise). Never narrower than the
+/// residual Filter's semantics — a loose match only ADDS candidates.
+fn prop_value_loose_eq(have: &PropertyValue, want: &PropertyValue) -> bool {
+    fn as_num(v: &PropertyValue) -> Option<f64> {
+        match v {
+            PropertyValue::Int(i) => Some(*i as f64),
+            PropertyValue::Float(f) => Some(*f),
+            PropertyValue::Bool(b) => Some(u8::from(*b) as f64),
+            _ => None,
+        }
+    }
+    fn as_bytes(v: &PropertyValue) -> Option<&[u8]> {
+        match v {
+            PropertyValue::String(s) | PropertyValue::Bytes(s) => Some(s.as_ref()),
+            _ => None,
+        }
+    }
+    match (as_num(have), as_num(want)) {
+        (Some(a), Some(b)) => a == b,
+        _ => matches!((as_bytes(have), as_bytes(want)), (Some(a), Some(b)) if a == b),
+    }
+}
+
+/// Per-hop wall-clock check for multi-hop operators (bounded epoch hold).
+/// No-op when the context carries no guard (`Default` / unit tests).
+#[inline]
+fn guard_check(ctx: &ExecutionContext) -> Result<(), ExecError> {
+    if let Some(guard) = &ctx.guard {
+        if let Err(t) = guard.check_timeout() {
+            return Err(ExecError {
+                kind: ExecErrorKind::Timeout(t),
+                partial_mutations: Vec::new(),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Execute a physical plan against a named graph.
+///
+/// Builds a fresh `SlotTable` from `plan` on every call. Hot paths that
+/// already have a `SlotTable` on hand (e.g. a plan-cache hit, which cached
+/// the table alongside the plan at insert time) should call
+/// `execute_with_slots` directly instead to skip the rebuild.
 pub fn execute(
     graph: &NamedGraph,
     plan: &PhysicalPlan,
     params: &HashMap<String, Value>,
     ctx: &ExecutionContext,
 ) -> Result<ExecResult, ExecError> {
+    let slot_table = SlotTable::from_plan(plan);
+    execute_with_slots(graph, plan, &slot_table, params, ctx)
+}
+
+/// Execute a physical plan against a named graph, using a caller-supplied
+/// `SlotTable` instead of rebuilding one from `plan`.
+///
+/// Plan-cache hot path (see `PlanCache::get` / `graph_read.rs`): the
+/// `SlotTable` is built exactly once, when the plan is first compiled and
+/// inserted into the cache, and reused verbatim on every subsequent cache
+/// hit -- a `SlotTable` depends only on the plan's bound variables, which
+/// never change for a given `PhysicalPlan`.
+pub fn execute_with_slots(
+    graph: &NamedGraph,
+    plan: &PhysicalPlan,
+    slot_table: &SlotTable,
+    params: &HashMap<String, Value>,
+    ctx: &ExecutionContext,
+) -> Result<ExecResult, ExecError> {
     let start = std::time::Instant::now();
 
     // Seed row: one empty row to bootstrap the pipeline.
-    let mut rows: Vec<Row> = vec![HashMap::new()];
+    let empty_table = SlotTable::default();
+    let empty_row = Row::seed(&empty_table);
+    let mut rows: Vec<Row> = vec![Row::seed(slot_table)];
     let mut columns = Vec::new();
     // After Project, rows are converted to positional arrays.
     let mut projected_rows: Option<Vec<Vec<Value>>> = None;
@@ -31,26 +228,42 @@ pub fn execute(
             PhysicalOp::NodeScan { variable, label } => {
                 let label_id = label.as_ref().map(|l| label_to_id(l.as_bytes()));
                 let committed = roaring::RoaringBitmap::new();
-                let mut new_rows = Vec::new();
+                // Scan BOTH tiers: the mutable write buffer and frozen CSR
+                // segments (freeze DRAINS nodes — a memgraph-only scan loses
+                // every frozen node).
+                let view = crate::graph::view::MergedNodeView::new(memgraph, csr_segs);
+                let mut keys = Vec::new();
+                view.for_each_visible_node(
+                    label_id,
+                    ctx.snapshot_lsn,
+                    ctx.my_txn_id,
+                    &committed,
+                    ctx.valid_time_as_of,
+                    |k| keys.push(k),
+                );
+                let mut new_rows = Vec::with_capacity(rows.len() * keys.len());
                 for row in &rows {
-                    for (key, node) in memgraph.iter_nodes() {
-                        if let Some(lid) = label_id {
-                            if !node.labels.contains(&lid) {
-                                continue;
-                            }
-                        }
-                        // Bi-temporal + MVCC visibility filter
-                        if !crate::graph::visibility::is_node_visible(
-                            node,
-                            ctx.snapshot_lsn,
-                            ctx.my_txn_id,
-                            &committed,
-                            ctx.valid_time_as_of,
-                        ) {
-                            continue;
-                        }
+                    for &key in &keys {
                         let mut new_row = row.clone();
-                        new_row.insert(variable.clone(), Value::Node(key));
+                        new_row.insert(variable, Value::Node(key));
+                        new_rows.push(new_row);
+                    }
+                }
+                rows = new_rows;
+            }
+
+            PhysicalOp::IndexScan {
+                variable,
+                label,
+                prop_eq,
+            } => {
+                let keys =
+                    index_scan_keys(memgraph, csr_segs, label.as_ref(), prop_eq, params, ctx);
+                let mut new_rows = Vec::with_capacity(rows.len() * keys.len());
+                for row in &rows {
+                    for &key in &keys {
+                        let mut new_row = row.clone();
+                        new_row.insert(variable, Value::Node(key));
                         new_rows.push(new_row);
                     }
                 }
@@ -93,6 +306,11 @@ pub fn execute(
                 );
 
                 let committed = roaring::RoaringBitmap::new();
+                let view = crate::graph::view::MergedNodeView::new(memgraph, csr_segs);
+                // Scratch reused across every neighbor lookup in this Expand
+                // (the allocating `neighbors()` built a HashSet+Vec per call).
+                let mut nb_seen = crate::graph::fasthash::FxHashSet::default();
+                let mut nb_buf: Vec<crate::graph::traversal::MergedNeighbor> = Vec::new();
                 let mut new_rows = Vec::new();
                 for row in &rows {
                     let src_key = match row.get(source) {
@@ -102,30 +320,31 @@ pub fn execute(
 
                     if *max_hops <= 1 {
                         // Single-hop expansion via SegmentMergeReader.
-                        for merged in reader.neighbors(src_key) {
+                        reader.neighbors_into(src_key, &mut nb_seen, &mut nb_buf);
+                        for merged in &nb_buf {
                             // Multi-type filter (SegmentMergeReader handles
                             // single-type; we need extra check for multi-type).
                             if type_ids.len() > 1 && !type_ids.contains(&merged.edge_type) {
                                 continue;
                             }
                             // Bi-temporal visibility check on target node
-                            if let Some(target_node) = memgraph.get_node(merged.node) {
-                                if !crate::graph::visibility::is_node_visible(
-                                    target_node,
-                                    ctx.snapshot_lsn,
-                                    ctx.my_txn_id,
-                                    &committed,
-                                    ctx.valid_time_as_of,
-                                ) {
-                                    continue;
-                                }
+                            // (merged view — frozen targets get the CSR
+                            // NodeMeta check instead of a free pass).
+                            if !view.is_visible(
+                                merged.node,
+                                ctx.snapshot_lsn,
+                                ctx.my_txn_id,
+                                &committed,
+                                ctx.valid_time_as_of,
+                            ) {
+                                continue;
                             }
                             let mut new_row = row.clone();
-                            new_row.insert(target.clone(), Value::Node(merged.node));
+                            new_row.insert(target, Value::Node(merged.node));
                             // v0.1.9 CYP-06: bind edge variable for single-hop
                             // expansion so WHERE r.valid_to >= $asof works.
                             if let Some(evar) = edge_variable {
-                                new_row.insert(evar.clone(), Value::Edge(merged.edge));
+                                new_row.insert(evar, Value::Edge(merged.edge));
                             }
                             new_rows.push(new_row);
                         }
@@ -137,13 +356,15 @@ pub fn execute(
                         let capped_max_hops = (*max_hops).min(MAX_HOPS_LIMIT);
 
                         let mut frontier = vec![src_key];
-                        let mut visited = std::collections::HashSet::new();
+                        let mut visited = crate::graph::fasthash::FxHashSet::default();
                         visited.insert(src_key);
 
                         for hop in 1..=capped_max_hops {
+                            guard_check(ctx)?;
                             let mut next_frontier = Vec::new();
                             for &current in &frontier {
-                                for merged in reader.neighbors(current) {
+                                reader.neighbors_into(current, &mut nb_seen, &mut nb_buf);
+                                for merged in &nb_buf {
                                     if visited.contains(&merged.node) {
                                         continue;
                                     }
@@ -155,7 +376,7 @@ pub fn execute(
 
                                     if hop >= *min_hops {
                                         let mut new_row = row.clone();
-                                        new_row.insert(target.clone(), Value::Node(merged.node));
+                                        new_row.insert(target, Value::Node(merged.node));
                                         new_rows.push(new_row);
                                         if new_rows.len() >= MAX_RESULT_ROWS {
                                             break;
@@ -212,8 +433,10 @@ pub fn execute(
                             .iter()
                             .map(|item| {
                                 if matches!(item.expr, Expr::Star) {
-                                    let entries: Vec<(String, Value)> =
-                                        row.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                                    let entries: Vec<(String, Value)> = row
+                                        .iter()
+                                        .map(|(k, v)| (k.to_owned(), v.clone()))
+                                        .collect();
                                     Value::Map(entries)
                                 } else {
                                     eval_expr(
@@ -304,7 +527,7 @@ pub fn execute(
             PhysicalOp::Limit { count } => {
                 let n = match eval_expr(
                     count,
-                    &HashMap::new(),
+                    &empty_row,
                     memgraph,
                     params,
                     csr_segs,
@@ -324,7 +547,7 @@ pub fn execute(
             PhysicalOp::Skip { count } => {
                 let n = match eval_expr(
                     count,
-                    &HashMap::new(),
+                    &empty_row,
                     memgraph,
                     params,
                     csr_segs,
@@ -362,7 +585,7 @@ pub fn execute(
                     if let Value::List(items) = val {
                         for item in items {
                             let mut new_row = row.clone();
-                            new_row.insert(alias.clone(), item);
+                            new_row.insert(alias, item);
                             new_rows.push(new_row);
                         }
                     }
@@ -434,6 +657,7 @@ pub fn execute(
                         Some(Value::Node(k)) => *k,
                         _ => continue,
                     };
+                    guard_check(ctx)?;
                     if let Some(path) = super::shortest_path::run_shortest_path(
                         memgraph,
                         csr_segs,
@@ -446,7 +670,7 @@ pub fn execute(
                         *max_hops,
                     ) {
                         let mut new_row = row.clone();
-                        new_row.insert(path_var.clone(), Value::Path(path));
+                        new_row.insert(path_var, Value::Path(path));
                         new_rows.push(new_row);
                     }
                 }
@@ -460,7 +684,7 @@ pub fn execute(
     } else {
         // No Project operator: return all row bindings as columns.
         if columns.is_empty() && !rows.is_empty() {
-            columns = rows[0].keys().cloned().collect();
+            columns = slot_table.names().to_vec();
             columns.sort();
         }
         rows.iter()
@@ -493,6 +717,7 @@ pub fn execute(
 pub(crate) fn op_name(op: &PhysicalOp) -> &'static str {
     match op {
         PhysicalOp::NodeScan { .. } => "NodeScan",
+        PhysicalOp::IndexScan { .. } => "IndexScan",
         PhysicalOp::Expand { .. } => "Expand",
         PhysicalOp::Filter { .. } => "Filter",
         PhysicalOp::Project { .. } => "Project",
@@ -522,7 +747,10 @@ pub fn execute_profile(
 ) -> Result<ProfileResult, ExecError> {
     let start = std::time::Instant::now();
 
-    let mut rows: Vec<Row> = vec![HashMap::new()];
+    let slot_table = SlotTable::from_plan(plan);
+    let empty_table = SlotTable::default();
+    let empty_row = Row::seed(&empty_table);
+    let mut rows: Vec<Row> = vec![Row::seed(&slot_table)];
     let mut columns = Vec::new();
     let mut projected_rows: Option<Vec<Vec<Value>>> = None;
     let nodes_created: u64 = 0;
@@ -544,26 +772,40 @@ pub fn execute_profile(
             PhysicalOp::NodeScan { variable, label } => {
                 let label_id = label.as_ref().map(|l| label_to_id(l.as_bytes()));
                 let committed = roaring::RoaringBitmap::new();
-                let mut new_rows = Vec::new();
+                // Merged-tier scan (parity with the main executor).
+                let view = crate::graph::view::MergedNodeView::new(memgraph, csr_segs);
+                let mut keys = Vec::new();
+                view.for_each_visible_node(
+                    label_id,
+                    ctx.snapshot_lsn,
+                    ctx.my_txn_id,
+                    &committed,
+                    ctx.valid_time_as_of,
+                    |k| keys.push(k),
+                );
+                let mut new_rows = Vec::with_capacity(rows.len() * keys.len());
                 for row in &rows {
-                    for (key, node) in memgraph.iter_nodes() {
-                        if let Some(lid) = label_id {
-                            if !node.labels.contains(&lid) {
-                                continue;
-                            }
-                        }
-                        // Bi-temporal + MVCC visibility filter
-                        if !crate::graph::visibility::is_node_visible(
-                            node,
-                            ctx.snapshot_lsn,
-                            ctx.my_txn_id,
-                            &committed,
-                            ctx.valid_time_as_of,
-                        ) {
-                            continue;
-                        }
+                    for &key in &keys {
                         let mut new_row = row.clone();
-                        new_row.insert(variable.clone(), Value::Node(key));
+                        new_row.insert(variable, Value::Node(key));
+                        new_rows.push(new_row);
+                    }
+                }
+                rows = new_rows;
+            }
+
+            PhysicalOp::IndexScan {
+                variable,
+                label,
+                prop_eq,
+            } => {
+                let keys =
+                    index_scan_keys(memgraph, csr_segs, label.as_ref(), prop_eq, params, ctx);
+                let mut new_rows = Vec::with_capacity(rows.len() * keys.len());
+                for row in &rows {
+                    for &key in &keys {
+                        let mut new_row = row.clone();
+                        new_row.insert(variable, Value::Node(key));
                         new_rows.push(new_row);
                     }
                 }
@@ -590,7 +832,27 @@ pub fn execute_profile(
                     EdgeDirection::Both => Direction::Both,
                 };
 
+                // Cross-segment expansion (parity with the main executor —
+                // memgraph-only neighbors miss every frozen CSR edge).
+                let edge_type_filter = if type_ids.len() == 1 {
+                    Some(type_ids[0])
+                } else {
+                    None
+                };
+                let reader = SegmentMergeReader::new(
+                    Some(memgraph),
+                    csr_segs,
+                    dir,
+                    u64::MAX,
+                    edge_type_filter,
+                );
+
                 let committed = roaring::RoaringBitmap::new();
+                let view = crate::graph::view::MergedNodeView::new(memgraph, csr_segs);
+                // Scratch reused across every neighbor lookup in this Expand
+                // (the allocating `neighbors()` built a HashSet+Vec per call).
+                let mut nb_seen = crate::graph::fasthash::FxHashSet::default();
+                let mut nb_buf: Vec<crate::graph::traversal::MergedNeighbor> = Vec::new();
                 let mut new_rows = Vec::new();
                 for row in &rows {
                     let src_key = match row.get(source) {
@@ -599,32 +861,28 @@ pub fn execute_profile(
                     };
 
                     if *max_hops <= 1 {
-                        for (edge_key, neighbor_key) in memgraph.neighbors(src_key, dir, u64::MAX) {
-                            if !type_ids.is_empty() {
-                                if let Some(edge) = memgraph.get_edge(edge_key) {
-                                    if !type_ids.contains(&edge.edge_type) {
-                                        continue;
-                                    }
-                                }
+                        reader.neighbors_into(src_key, &mut nb_seen, &mut nb_buf);
+                        for merged in &nb_buf {
+                            if type_ids.len() > 1 && !type_ids.contains(&merged.edge_type) {
+                                continue;
                             }
                             // Bi-temporal visibility check on target node
-                            if let Some(target_node) = memgraph.get_node(neighbor_key) {
-                                if !crate::graph::visibility::is_node_visible(
-                                    target_node,
-                                    ctx.snapshot_lsn,
-                                    ctx.my_txn_id,
-                                    &committed,
-                                    ctx.valid_time_as_of,
-                                ) {
-                                    continue;
-                                }
+                            // (merged view — parity with main executor).
+                            if !view.is_visible(
+                                merged.node,
+                                ctx.snapshot_lsn,
+                                ctx.my_txn_id,
+                                &committed,
+                                ctx.valid_time_as_of,
+                            ) {
+                                continue;
                             }
                             let mut new_row = row.clone();
-                            new_row.insert(target.clone(), Value::Node(neighbor_key));
+                            new_row.insert(target, Value::Node(merged.node));
                             // v0.1.9 CYP-06: bind edge variable in execute_profile
                             // single-hop path (parity with main executor).
                             if let Some(evar) = edge_variable {
-                                new_row.insert(evar.clone(), Value::Edge(edge_key));
+                                new_row.insert(evar, Value::Edge(merged.edge));
                             }
                             new_rows.push(new_row);
                         }
@@ -636,31 +894,27 @@ pub fn execute_profile(
                         let capped_max_hops = (*max_hops).min(MAX_HOPS_LIMIT);
 
                         let mut frontier = vec![src_key];
-                        let mut visited = std::collections::HashSet::new();
+                        let mut visited = crate::graph::fasthash::FxHashSet::default();
                         visited.insert(src_key);
 
                         for hop in 1..=capped_max_hops {
+                            guard_check(ctx)?;
                             let mut next_frontier = Vec::new();
                             for &current in &frontier {
-                                for (edge_key, neighbor_key) in
-                                    memgraph.neighbors(current, dir, u64::MAX)
-                                {
-                                    if visited.contains(&neighbor_key) {
+                                reader.neighbors_into(current, &mut nb_seen, &mut nb_buf);
+                                for merged in &nb_buf {
+                                    if visited.contains(&merged.node) {
                                         continue;
                                     }
-                                    if !type_ids.is_empty() {
-                                        if let Some(edge) = memgraph.get_edge(edge_key) {
-                                            if !type_ids.contains(&edge.edge_type) {
-                                                continue;
-                                            }
-                                        }
+                                    if type_ids.len() > 1 && !type_ids.contains(&merged.edge_type) {
+                                        continue;
                                     }
-                                    visited.insert(neighbor_key);
-                                    next_frontier.push(neighbor_key);
+                                    visited.insert(merged.node);
+                                    next_frontier.push(merged.node);
 
                                     if hop >= *min_hops {
                                         let mut new_row = row.clone();
-                                        new_row.insert(target.clone(), Value::Node(neighbor_key));
+                                        new_row.insert(target, Value::Node(merged.node));
                                         new_rows.push(new_row);
                                         if new_rows.len() >= MAX_RESULT_ROWS {
                                             break;
@@ -717,8 +971,10 @@ pub fn execute_profile(
                             .iter()
                             .map(|item| {
                                 if matches!(item.expr, Expr::Star) {
-                                    let entries: Vec<(String, Value)> =
-                                        row.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                                    let entries: Vec<(String, Value)> = row
+                                        .iter()
+                                        .map(|(k, v)| (k.to_owned(), v.clone()))
+                                        .collect();
                                     Value::Map(entries)
                                 } else {
                                     eval_expr(
@@ -807,7 +1063,7 @@ pub fn execute_profile(
             PhysicalOp::Limit { count } => {
                 let n = match eval_expr(
                     count,
-                    &HashMap::new(),
+                    &empty_row,
                     memgraph,
                     params,
                     csr_segs,
@@ -827,7 +1083,7 @@ pub fn execute_profile(
             PhysicalOp::Skip { count } => {
                 let n = match eval_expr(
                     count,
-                    &HashMap::new(),
+                    &empty_row,
                     memgraph,
                     params,
                     csr_segs,
@@ -865,7 +1121,7 @@ pub fn execute_profile(
                     if let Value::List(items) = val {
                         for item in items {
                             let mut new_row = row.clone();
-                            new_row.insert(alias.clone(), item);
+                            new_row.insert(alias, item);
                             new_rows.push(new_row);
                         }
                     }
@@ -938,6 +1194,7 @@ pub fn execute_profile(
                         Some(Value::Node(k)) => *k,
                         _ => continue,
                     };
+                    guard_check(ctx)?;
                     if let Some(path) = super::shortest_path::run_shortest_path(
                         memgraph,
                         csr_segs,
@@ -950,7 +1207,7 @@ pub fn execute_profile(
                         *max_hops,
                     ) {
                         let mut new_row = row.clone();
-                        new_row.insert(path_var.clone(), Value::Path(path));
+                        new_row.insert(path_var, Value::Path(path));
                         new_rows.push(new_row);
                     }
                 }
@@ -975,7 +1232,7 @@ pub fn execute_profile(
         pr
     } else {
         if columns.is_empty() && !rows.is_empty() {
-            columns = rows[0].keys().cloned().collect();
+            columns = slot_table.names().to_vec();
             columns.sort();
         }
         rows.iter()

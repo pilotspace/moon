@@ -7,10 +7,11 @@
 //! The cost estimator selects between graph-first and vector-first strategies
 //! based on per-graph `GraphStats` (degree distribution, node/edge counts).
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::graph::cypher::ast::*;
+use crate::graph::cypher::executor::{SlotTable, Value};
+use crate::graph::fasthash::FxHashMap;
 use crate::graph::stats::GraphStats;
 
 /// A compiled physical plan: a sequence of operators.
@@ -26,6 +27,22 @@ pub enum PhysicalOp {
     NodeScan {
         variable: String,
         label: Option<String>,
+    },
+    /// Scan nodes via per-segment property indexes: label bitmap ∧ property
+    /// bitmap per immutable CSR segment, plus a linear mutable-tail check.
+    ///
+    /// Emitted instead of `NodeScan` when a pattern node carries inline
+    /// equality properties whose values are literals or parameters
+    /// (`(n:L {k: 3})`, `(n:L {k: $v})`). `prop_eq` values are index LOOKUP
+    /// hints with SUPERSET semantics (string hashes can collide, Bool/Int
+    /// alias numerically) — the planner always keeps the full residual
+    /// Filter downstream, so the index only prunes, never decides.
+    IndexScan {
+        variable: String,
+        label: Option<String>,
+        /// (property name, value expression) equality conjuncts. Expressions
+        /// are literals or parameters, resolved by the executor per run.
+        prop_eq: Vec<(String, Expr)>,
     },
     /// Expand along edges from a source variable.
     ///
@@ -106,40 +123,185 @@ impl core::fmt::Display for PlanError {
     }
 }
 
-/// Plan cache: maps xxhash of Cypher string to compiled plan.
+/// A cache hit: the compiled plan, its precomputed `SlotTable`, and (for
+/// raw-bytes-hash entries only) the auto-extracted parameter values that
+/// belong to this EXACT query text.
+#[derive(Clone)]
+pub struct CachedPlan {
+    pub plan: Arc<PhysicalPlan>,
+    /// Built once via `SlotTable::from_plan` at insert time. A cache hit
+    /// reuses this instead of rebuilding it every execution (`SlotTable`
+    /// depends only on the plan's bound variables, which are fixed for a
+    /// given `PhysicalPlan`).
+    pub slots: Arc<SlotTable>,
+    /// Non-empty ONLY for entries keyed by the raw query-bytes hash:
+    /// `parameterize()` is a pure function of the exact input bytes, so a
+    /// raw-hash hit can replay these values without re-lexing. Entries keyed
+    /// by the literal-normalized hash are shared across many distinct
+    /// literal values and are always empty here -- callers must re-derive
+    /// params for that specific query text via `parameterize()`.
+    pub auto_params: Arc<Vec<(String, Value)>>,
+}
+
+struct CacheEntry {
+    plan: Arc<PhysicalPlan>,
+    slots: Arc<SlotTable>,
+    auto_params: Arc<Vec<(String, Value)>>,
+    used: u64,
+}
+
+/// Plan cache: maps a query hash to a compiled plan, with LRU eviction.
+///
+/// Two kinds of keys point at the same underlying plan (Fix 2 -- allocation
+/// -free exact repeats):
+/// - the raw query-bytes hash (`hash_query` on the client's exact text) --
+///   inserted so an exact repeat hits without running `parameterize()` at
+///   all, and carries that text's `auto_params` alongside it;
+/// - the literal-normalized hash -- the pre-existing key, shared across
+///   every raw query that normalizes to the same text (i.e. differs only in
+///   literal values), so it MUST NOT carry a fixed set of `auto_params`.
+///
+/// `FxHashMap`-keyed (not `SipHash`): the map key is already a fixed-size
+/// u64 digest (xxhash64 of query bytes), never raw attacker bytes directly
+/// -- see `crate::graph::fasthash` for the DoS-surface contract this relies
+/// on -- and the cache is bounded by `max_entries` (LRU-evicted), so even a
+/// deliberately hash-flooded cache degrades to O(max_entries) per lookup,
+/// not unbounded blowup.
+///
+/// Invariant: only READ-ONLY plans may be inserted. A cache hit in
+/// `graph_query_or_write` routes straight to the read path without
+/// re-parsing, so a cached write plan would mis-route.
 pub struct PlanCache {
-    cache: HashMap<u64, Arc<PhysicalPlan>>,
+    cache: FxHashMap<u64, CacheEntry>,
     max_entries: usize,
+    /// Monotonic access counter backing LRU eviction.
+    tick: u64,
 }
 
 impl PlanCache {
     /// Create a new plan cache with the given maximum size.
     pub fn new(max_entries: usize) -> Self {
         Self {
-            cache: HashMap::new(),
+            cache: FxHashMap::default(),
             max_entries,
+            tick: 0,
         }
     }
 
-    /// Look up a cached plan by query hash.
-    pub fn get(&self, hash: u64) -> Option<Arc<PhysicalPlan>> {
-        self.cache.get(&hash).cloned()
+    /// Look up a cached plan by query hash, marking it most-recently-used.
+    pub fn get(&mut self, hash: u64) -> Option<CachedPlan> {
+        self.tick += 1;
+        let tick = self.tick;
+        self.cache.get_mut(&hash).map(|e| {
+            e.used = tick;
+            CachedPlan {
+                plan: e.plan.clone(),
+                slots: e.slots.clone(),
+                auto_params: e.auto_params.clone(),
+            }
+        })
     }
 
-    /// Insert a plan into the cache. Evicts an arbitrary entry if at capacity.
-    pub fn insert(&mut self, hash: u64, plan: Arc<PhysicalPlan>) {
-        if self.cache.len() >= self.max_entries {
-            // Simple eviction: remove arbitrary key (HashMap has no ordering).
-            if let Some(&first_key) = self.cache.keys().next() {
-                self.cache.remove(&first_key);
+    /// Insert a plan under the literal-normalized hash, evicting the
+    /// least-recently-used entry at capacity. No `auto_params` are cached
+    /// (see `PlanCache` docs) -- callers re-derive them per query text.
+    ///
+    /// Returns the freshly-built `SlotTable` so the caller can execute
+    /// immediately without rebuilding it a second time.
+    pub fn insert(&mut self, hash: u64, plan: Arc<PhysicalPlan>) -> Arc<SlotTable> {
+        let slots = Arc::new(SlotTable::from_plan(&plan));
+        self.put(hash, plan, slots.clone(), Arc::new(Vec::new()));
+        slots
+    }
+
+    /// Insert a plan under BOTH the raw query-bytes hash and (if different)
+    /// the literal-normalized hash, sharing one `Arc`'d plan + `SlotTable`.
+    /// `raw_auto_params` are the auto-extracted values for THIS raw query
+    /// text and are cached only on the raw-hash entry.
+    ///
+    /// Returns the freshly-built `SlotTable` so the caller can execute
+    /// immediately without rebuilding it a second time.
+    pub fn insert_both(
+        &mut self,
+        raw_hash: u64,
+        normalized_hash: u64,
+        plan: Arc<PhysicalPlan>,
+        raw_auto_params: Vec<(String, Value)>,
+    ) -> Arc<SlotTable> {
+        let slots = Arc::new(SlotTable::from_plan(&plan));
+        self.put(
+            raw_hash,
+            plan.clone(),
+            slots.clone(),
+            Arc::new(raw_auto_params),
+        );
+        if normalized_hash != raw_hash {
+            self.put(normalized_hash, plan, slots.clone(), Arc::new(Vec::new()));
+        }
+        slots
+    }
+
+    fn put(
+        &mut self,
+        hash: u64,
+        plan: Arc<PhysicalPlan>,
+        slots: Arc<SlotTable>,
+        auto_params: Arc<Vec<(String, Value)>>,
+    ) {
+        self.tick += 1;
+        if self.cache.len() >= self.max_entries && !self.cache.contains_key(&hash) {
+            // O(capacity) scan; eviction only fires when a full cache takes a
+            // brand-new query text, which is rare once the workload warms up.
+            let lru = self
+                .cache
+                .iter()
+                .min_by_key(|(_, e)| e.used)
+                .map(|(k, _)| *k);
+            if let Some(lru) = lru {
+                self.cache.remove(&lru);
             }
         }
-        self.cache.insert(hash, plan);
+        self.cache.insert(
+            hash,
+            CacheEntry {
+                plan,
+                slots,
+                auto_params,
+                used: self.tick,
+            },
+        );
     }
 
-    /// Number of cached plans.
+    /// Number of hash-key entries in the cache (raw-bytes-hash and
+    /// literal-normalized-hash keys counted separately). This is what
+    /// `max_entries` bounds and what LRU eviction operates on.
+    ///
+    /// A dual-keyed insert (`insert_both`) can add up to 2 entries for a
+    /// single distinct plan — use `distinct_plan_count()` if you want "how
+    /// many different compiled plans are resident" instead.
     pub fn len(&self) -> usize {
         self.cache.len()
+    }
+
+    /// Number of *distinct* compiled plans currently cached, deduplicated by
+    /// `Arc` identity. Two hash keys inserted by the same `insert_both` call
+    /// point at the same `Arc<PhysicalPlan>` and count once here, even
+    /// though they occupy two slots in `len()` / `max_entries`.
+    ///
+    /// This is the metric callers actually care about when asserting
+    /// "queries differing only in literal values share one cached plan":
+    /// `len()` would (correctly) report 2 for that case (the raw-hash entry
+    /// for each literal variant, both aliasing one shared normalized-hash
+    /// entry) -- `distinct_plan_count()` reports 1.
+    pub fn distinct_plan_count(&self) -> usize {
+        let mut seen: Vec<*const PhysicalPlan> = Vec::with_capacity(self.cache.len());
+        for entry in self.cache.values() {
+            let ptr = Arc::as_ptr(&entry.plan);
+            if !seen.contains(&ptr) {
+                seen.push(ptr);
+            }
+        }
+        seen.len()
     }
 
     /// Whether the cache is empty.
@@ -369,25 +531,14 @@ fn compile_match(m: &MatchClause, ops: &mut Vec<PhysicalOp>) -> Result<(), PlanE
             continue;
         }
 
-        // First node becomes a scan.
+        // First node becomes a scan (index-backed when inline equality
+        // properties can drive a lookup).
         let first = &pattern.nodes[0];
         let first_var = first
             .variable
             .clone()
             .unwrap_or_else(|| "_anon".to_string());
-        ops.push(PhysicalOp::NodeScan {
-            variable: first_var.clone(),
-            label: first.labels.first().cloned(),
-        });
-        // Inline node properties `(v {k:e, …})` become an equality-conjunction
-        // Filter applied right after the op that BINDS the node — here, the
-        // scan. Without this the predicate is silently dropped and the query
-        // returns the whole label's edges (the ≈|E| full-scan bug).
-        if !first.properties.is_empty() {
-            ops.push(PhysicalOp::Filter {
-                expr: properties_to_filter(&first_var, &first.properties),
-            });
-        }
+        push_node_scan(first, &first_var, ops);
 
         // Subsequent node+edge pairs become expands.
         for (i, edge) in pattern.edges.iter().enumerate() {
@@ -456,24 +607,8 @@ fn compile_shortest_path_match(sp: &ShortestPathMatchClause, ops: &mut Vec<Physi
         .clone()
         .unwrap_or_else(|| "_sp_dst".to_string());
 
-    ops.push(PhysicalOp::NodeScan {
-        variable: src_var.clone(),
-        label: sp.src.labels.first().cloned(),
-    });
-    if !sp.src.properties.is_empty() {
-        ops.push(PhysicalOp::Filter {
-            expr: properties_to_filter(&src_var, &sp.src.properties),
-        });
-    }
-    ops.push(PhysicalOp::NodeScan {
-        variable: dst_var.clone(),
-        label: sp.dst.labels.first().cloned(),
-    });
-    if !sp.dst.properties.is_empty() {
-        ops.push(PhysicalOp::Filter {
-            expr: properties_to_filter(&dst_var, &sp.dst.properties),
-        });
-    }
+    push_node_scan(&sp.src, &src_var, ops);
+    push_node_scan(&sp.dst, &dst_var, ops);
 
     ops.push(PhysicalOp::ShortestPath {
         path_var: sp.path_var.clone(),
@@ -483,6 +618,44 @@ fn compile_shortest_path_match(sp: &ShortestPathMatchClause, ops: &mut Vec<Physi
         edge_types: sp.edge_types.clone(),
         direction: sp.direction,
     });
+}
+
+/// Emit the scan op for a pattern node, choosing `IndexScan` when the
+/// node's inline properties can drive per-segment index lookups (all
+/// values literal or parameter), else plain `NodeScan`. Either way the
+/// inline properties ALSO become an equality-conjunction Filter applied
+/// right after the op that BINDS the node — the index has superset
+/// semantics and non-indexed scans need the predicate at all (without it
+/// the inline property map is silently dropped — the ≈|E| full-scan bug).
+fn push_node_scan(node: &PatternNode, var: &str, ops: &mut Vec<PhysicalOp>) {
+    let indexable = !node.properties.is_empty()
+        && node.properties.iter().all(|(_, e)| {
+            matches!(
+                e,
+                Expr::Integer(_)
+                    | Expr::Float(_)
+                    | Expr::StringLit(_)
+                    | Expr::Bool(_)
+                    | Expr::Parameter(_)
+            )
+        });
+    if indexable {
+        ops.push(PhysicalOp::IndexScan {
+            variable: var.to_string(),
+            label: node.labels.first().cloned(),
+            prop_eq: node.properties.clone(),
+        });
+    } else {
+        ops.push(PhysicalOp::NodeScan {
+            variable: var.to_string(),
+            label: node.labels.first().cloned(),
+        });
+    }
+    if !node.properties.is_empty() {
+        ops.push(PhysicalOp::Filter {
+            expr: properties_to_filter(var, &node.properties),
+        });
+    }
 }
 
 /// Build a filter expression `var.k1 = v1 AND var.k2 = v2 ...` from a
@@ -572,21 +745,46 @@ mod tests {
     // immediately AFTER the op that binds each inline-propertied node. RED until the fix.
 
     #[test]
-    fn test_inline_prop_emits_filter_after_nodescan() {
-        // M3 — `MATCH (a:Person {id:1})-[]->(b)`: a Filter must immediately follow the NodeScan.
+    fn test_inline_prop_emits_filter_after_scan() {
+        // M3 — `MATCH (a:Person {id:1})-[]->(b)`: a Filter must immediately
+        // follow the binding scan. Literal inline props now plan as an
+        // IndexScan (v0.6 property-index lever); the residual Filter stays.
         let query =
             parse_cypher(b"MATCH (a:Person {id:1})-[]->(b) RETURN b").expect("parse failed");
         let plan = compile(&query).expect("compile failed");
         let ns = plan
             .operators
             .iter()
-            .position(|op| matches!(op, PhysicalOp::NodeScan { .. }))
-            .expect("a NodeScan is planned");
+            .position(|op| matches!(op, PhysicalOp::IndexScan { .. }))
+            .expect("an IndexScan is planned for literal inline props");
         assert!(
             matches!(plan.operators.get(ns + 1), Some(PhysicalOp::Filter { .. })),
-            "inline-property Filter must immediately follow the NodeScan; ops = {:?}",
+            "inline-property Filter must immediately follow the IndexScan; ops = {:?}",
             plan.operators
         );
+    }
+
+    #[test]
+    fn test_inline_literal_props_plan_index_scan() {
+        // Literal and parameter values are index-eligible.
+        for q in [
+            b"MATCH (a:N {id:3}) RETURN a".as_slice(),
+            b"MATCH (a:N {id:$p}) RETURN a".as_slice(),
+            b"MATCH (a:N {name:'x', id: 3}) RETURN a".as_slice(),
+        ] {
+            let query = parse_cypher(q).expect("parse failed");
+            let plan = compile(&query).expect("compile failed");
+            assert!(
+                matches!(plan.operators[0], PhysicalOp::IndexScan { .. }),
+                "expected IndexScan for {:?}; ops = {:?}",
+                core::str::from_utf8(q),
+                plan.operators
+            );
+        }
+        // No inline props: plain NodeScan, unchanged.
+        let query = parse_cypher(b"MATCH (a:N) RETURN a").expect("parse failed");
+        let plan = compile(&query).expect("compile failed");
+        assert!(matches!(plan.operators[0], PhysicalOp::NodeScan { .. }));
     }
 
     #[test]
@@ -598,11 +796,16 @@ mod tests {
         let ns = plan
             .operators
             .iter()
-            .position(|op| matches!(op, PhysicalOp::NodeScan { .. }))
-            .expect("a NodeScan is planned");
+            .position(|op| {
+                matches!(
+                    op,
+                    PhysicalOp::NodeScan { .. } | PhysicalOp::IndexScan { .. }
+                )
+            })
+            .expect("a scan is planned");
         assert!(
             matches!(plan.operators.get(ns + 1), Some(PhysicalOp::Filter { .. })),
-            "scanned node's inline Filter must follow the NodeScan; ops = {:?}",
+            "scanned node's inline Filter must follow the scan; ops = {:?}",
             plan.operators
         );
         let ex = plan
@@ -686,6 +889,139 @@ mod tests {
         cache.insert(43, plan.clone());
         cache.insert(44, plan.clone());
         assert_eq!(cache.len(), 2);
+    }
+
+    #[test]
+    fn test_plan_cache_lru_eviction_order() {
+        let mut cache = PlanCache::new(2);
+        let plan = Arc::new(PhysicalPlan { operators: vec![] });
+        cache.insert(1, plan.clone());
+        cache.insert(2, plan.clone());
+        // Touch 1 so 2 becomes the least-recently-used entry.
+        assert!(cache.get(1).is_some());
+        cache.insert(3, plan.clone());
+        assert!(
+            cache.get(1).is_some(),
+            "recently-used entry must survive eviction"
+        );
+        assert!(
+            cache.get(2).is_none(),
+            "least-recently-used entry must be evicted"
+        );
+        assert!(cache.get(3).is_some());
+        assert_eq!(cache.len(), 2);
+    }
+
+    #[test]
+    fn test_plan_cache_insert_both_shares_plan_and_slots() {
+        // Fix 2: a raw-bytes-hash entry and its literal-normalized sibling
+        // must point at the SAME Arc'd plan and SlotTable (no rebuild), and
+        // ONLY the raw-hash entry carries auto_params.
+        let mut cache = PlanCache::new(8);
+        let plan = Arc::new(PhysicalPlan {
+            operators: vec![PhysicalOp::NodeScan {
+                variable: "n".to_string(),
+                label: None,
+            }],
+        });
+        let raw_hash = 100;
+        let normalized_hash = 200;
+        let auto_params = vec![("auto0".to_string(), Value::Int(42))];
+        cache.insert_both(raw_hash, normalized_hash, plan.clone(), auto_params.clone());
+        assert_eq!(cache.len(), 2, "raw + normalized keys are distinct entries");
+
+        let raw_hit = cache.get(raw_hash).expect("raw-hash hit");
+        let norm_hit = cache.get(normalized_hash).expect("normalized-hash hit");
+
+        assert!(
+            Arc::ptr_eq(&raw_hit.plan, &norm_hit.plan),
+            "both keys must share the identical Arc'd plan (no recompile)"
+        );
+        assert!(
+            Arc::ptr_eq(&raw_hit.slots, &norm_hit.slots),
+            "both keys must share the identical Arc'd SlotTable (no rebuild)"
+        );
+        // `Value` has no `PartialEq` impl -- check shape + the one variant
+        // that matters here (Int) directly.
+        assert_eq!(raw_hit.auto_params.len(), 1);
+        assert_eq!(raw_hit.auto_params[0].0, "auto0");
+        assert!(
+            matches!(raw_hit.auto_params[0].1, Value::Int(42)),
+            "raw-hash entry replays this exact text's auto_params without re-lexing"
+        );
+        assert!(
+            norm_hit.auto_params.is_empty(),
+            "normalized-hash entry must NOT carry a fixed set of auto_params \
+             (it is shared across many distinct literal values)"
+        );
+    }
+
+    #[test]
+    fn test_plan_cache_insert_both_same_hash_dedups() {
+        // A query with no literals to extract normalizes to itself, so
+        // raw_hash == normalized_hash -- must not create two entries.
+        let mut cache = PlanCache::new(8);
+        let plan = Arc::new(PhysicalPlan { operators: vec![] });
+        cache.insert_both(50, 50, plan, Vec::new());
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn test_plan_cache_raw_hash_hit_avoids_reparse_counter() {
+        // Simulates the graph_read.rs call site: a raw-hash pre-lookup that
+        // hits must let the caller skip parameterize() entirely. Modeled
+        // here via an external "reparse" counter the caller would only
+        // increment on a raw-hash MISS.
+        let mut cache = PlanCache::new(8);
+        let plan = Arc::new(PhysicalPlan { operators: vec![] });
+        let raw_hash = hash_query(b"MATCH (n:Person {id: 7}) RETURN n");
+        let normalized_hash = hash_query(b"MATCH (n:Person {id: $auto0}) RETURN n");
+
+        let mut reparse_count = 0u32;
+        // First call: miss -> caller "parses" (increments counter) then inserts.
+        if cache.get(raw_hash).is_none() {
+            reparse_count += 1;
+            cache.insert_both(
+                raw_hash,
+                normalized_hash,
+                plan.clone(),
+                vec![("auto0".to_string(), Value::Int(7))],
+            );
+        }
+        assert_eq!(reparse_count, 1);
+
+        // Second (and third) call: exact repeat hits the raw-hash key ->
+        // no reparse.
+        for _ in 0..2 {
+            if cache.get(raw_hash).is_none() {
+                reparse_count += 1;
+            }
+        }
+        assert_eq!(
+            reparse_count, 1,
+            "exact-repeat queries must hit the raw-hash key without reparsing"
+        );
+    }
+
+    #[test]
+    fn test_plan_cache_lru_eviction_with_dual_keys() {
+        // LRU eviction must still function correctly once entries can arrive
+        // in raw+normalized pairs.
+        let mut cache = PlanCache::new(2);
+        let plan = Arc::new(PhysicalPlan { operators: vec![] });
+        cache.insert_both(1, 2, plan.clone(), vec![("a".to_string(), Value::Int(1))]);
+        assert_eq!(cache.len(), 2);
+        // Cache is now full (max_entries=2). A brand-new key must evict the
+        // least-recently-used entry (raw key 1, since normalized key 2 was
+        // inserted after it and is therefore more recently used).
+        cache.insert(3, plan);
+        assert_eq!(cache.len(), 2);
+        assert!(
+            cache.get(1).is_none(),
+            "least-recently-used raw-hash entry must be evicted"
+        );
+        assert!(cache.get(2).is_some());
+        assert!(cache.get(3).is_some());
     }
 
     #[test]
