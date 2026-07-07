@@ -336,6 +336,13 @@ impl GraphReplayCollector {
     pub fn replay_into(&self, store: &mut GraphStore) -> usize {
         let mut replayed = 0;
         self.replay_epoch_aware(store, &mut replayed);
+        // Replayed state lives only in the write buffer + the WAL records
+        // that produced it; the next checkpoint recycles those records, so
+        // it must re-snapshot the graph first (same contract as a live
+        // mutation's drain_wal).
+        if replayed > 0 {
+            store.mark_dirty();
+        }
         replayed
     }
 

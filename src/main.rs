@@ -1418,6 +1418,14 @@ fn main() -> anyhow::Result<()> {
             config.databases,
         );
     }
+    // v3 disk-offload mode logs graph records to `shard-<N>/wal-v3/` instead
+    // of the legacy per-shard WAL file — replay them with their own pass
+    // (2026-07 graph durability P0, Bug A). Runs AFTER recover_graph_stores
+    // so the per-shard graph snapshot floor (snapshot_lsn) is loaded.
+    #[cfg(feature = "graph")]
+    if let Some(ref offload_base) = disk_offload_base {
+        moon::shard::shared_databases::replay_graph_wal_v3(&mut slice_inits, offload_base);
+    }
 
     // Replay temporal WAL records (not gated on graph feature — temporal KV is core).
     if let Some(ref dir) = persistence_dir {

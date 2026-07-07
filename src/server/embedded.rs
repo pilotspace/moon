@@ -290,6 +290,12 @@ pub async fn run_embedded(
             config.databases,
         );
     }
+    // v3 disk-offload graph WAL pass (2026-07 graph durability P0, Bug A) —
+    // see the identical call in main.rs for the rationale.
+    #[cfg(feature = "graph")]
+    if let Some(ref offload_base) = disk_offload_base {
+        crate::shard::shared_databases::replay_graph_wal_v3(&mut slice_inits, offload_base);
+    }
     if let Some(ref dir) = persistence_dir {
         let dir_path = std::path::Path::new(dir);
         crate::shard::shared_databases::replay_temporal_wal(&mut slice_inits, dir_path);

@@ -234,6 +234,17 @@ pub struct GraphStore {
     /// - Counter never wraps in practice (u64::MAX ≈ 1.8 × 10¹⁹ writes).
     /// - Failed writes do NOT bump the counter.
     version_token: AtomicU64,
+    /// Set when a mutation's WAL record leaves via `drain_wal` (or when WAL
+    /// replay re-materialized data whose records may be recycled by the next
+    /// checkpoint). Cleared by `persist_graph_at_checkpoint` after a
+    /// successful freeze+save. Gates the per-checkpoint graph snapshot so a
+    /// KV-only workload never pays for graph saves.
+    dirty: bool,
+    /// WAL v3 LSN covered by the last persisted graph snapshot: every graph
+    /// record with `lsn <= snapshot_lsn` is materialized in the on-disk
+    /// segments, so recovery's graph replay skips it. Persisted in
+    /// `graph_metadata.json`; 0 = no snapshot (full replay).
+    snapshot_lsn: u64,
 }
 
 impl GraphStore {
@@ -244,7 +255,39 @@ impl GraphStore {
             next_lsn: 0,
             wal_pending: Vec::new(),
             version_token: AtomicU64::new(0),
+            dirty: false,
+            snapshot_lsn: 0,
         }
+    }
+
+    /// True when graph state has mutated since the last persisted snapshot.
+    #[inline]
+    pub fn is_dirty(&self) -> bool {
+        self.dirty
+    }
+
+    /// Mark the store as having un-persisted mutations (WAL replay path).
+    #[inline]
+    pub fn mark_dirty(&mut self) {
+        self.dirty = true;
+    }
+
+    /// Clear the dirty flag after a successful checkpoint snapshot.
+    #[inline]
+    pub fn clear_dirty(&mut self) {
+        self.dirty = false;
+    }
+
+    /// WAL v3 LSN covered by the last persisted graph snapshot (0 = none).
+    #[inline]
+    pub fn snapshot_lsn(&self) -> u64 {
+        self.snapshot_lsn
+    }
+
+    /// Record the WAL v3 LSN the next `save_graph_store` call will cover.
+    #[inline]
+    pub fn set_snapshot_lsn(&mut self, lsn: u64) {
+        self.snapshot_lsn = lsn;
     }
 
     /// Return the current GRAPH engine version token for this shard.
@@ -278,7 +321,14 @@ impl GraphStore {
     }
 
     /// Drain all pending WAL records, returning them and leaving the vec empty.
+    ///
+    /// A non-empty drain means a mutation was just dispatched — mark the
+    /// store dirty so the next checkpoint snapshots the graph before it
+    /// advances the WAL replay floor past these records.
     pub fn drain_wal(&mut self) -> Vec<Vec<u8>> {
+        if !self.wal_pending.is_empty() {
+            self.dirty = true;
+        }
         std::mem::take(&mut self.wal_pending)
     }
 
@@ -401,7 +451,10 @@ impl GraphStore {
             None => Vec::new(),
         };
 
-        let meta = GraphStoreMetadata { graphs: entries };
+        let meta = GraphStoreMetadata {
+            graphs: entries,
+            snapshot_lsn: self.snapshot_lsn,
+        };
         let json = serde_json::to_string_pretty(&meta)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         std::fs::write(path, json.as_bytes())
@@ -422,6 +475,7 @@ impl GraphStore {
             // Ignore duplicate errors (shouldn't happen from valid metadata).
             let _ = store.create_graph(name, entry.edge_threshold, entry.created_lsn);
         }
+        store.snapshot_lsn = meta.snapshot_lsn;
         Ok(store)
     }
 }
@@ -438,6 +492,11 @@ struct GraphMetadataEntry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct GraphStoreMetadata {
     graphs: Vec<GraphMetadataEntry>,
+    /// WAL v3 LSN covered by the snapshot this metadata belongs to.
+    /// `#[serde(default)]` keeps pre-snapshot-lsn dirs loadable (0 = full
+    /// graph WAL replay, the historical behavior).
+    #[serde(default)]
+    snapshot_lsn: u64,
 }
 
 #[cfg(test)]

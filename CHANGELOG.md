@@ -329,6 +329,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed — graph engine wave 2: durability, Cypher coverage, hardening (PR #TBD)
 
+- **Durability (P0, found by GCP production-hardening soak):** graph data now
+  survives kill -9 under the DEFAULT disk-offload (WAL v3) configuration.
+  Two stacked pre-existing bugs erased graphs on crash: (A) v3 recovery
+  collected graph WAL commands into a throwaway replay engine — graph replay
+  was a complete no-op in v3 mode (a dedicated `replay_graph_wal_v3` boot
+  pass now applies them); (B) the checkpoint advanced the WAL replay floor
+  and recycled segments without ever snapshotting the graph store —
+  `save_graph_store` ran only on graceful shutdown and never persisted the
+  mutable tier (checkpoint finalize now freezes each graph's write buffer,
+  persists segments + a `snapshot_lsn` replay floor, and ABORTS the
+  checkpoint if the graph snapshot fails, keeping the old floor). The prior
+  crash suite ran exclusively with `--disk-offload disable`; new G4/G5
+  scenarios cover the default config with and without a checkpoint crossing.
 - **Durability:** stable external node/edge ids across WAL replay (handles
   handed to clients before a crash resolve to the same rows after recovery);
   Cypher `SET` property/label writes now emit WAL records

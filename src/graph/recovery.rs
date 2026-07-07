@@ -13,6 +13,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use bytes::Bytes;
+
 use crate::graph::csr::{CsrError, CsrStorage};
 use crate::graph::manifest::GraphManifest;
 use crate::graph::segment::GraphSegmentList;
@@ -235,6 +237,68 @@ pub fn save_graph_store(
 /// Helper: build the shard persistence directory path.
 pub fn shard_graph_dir(persistence_dir: &Path, shard_id: usize) -> PathBuf {
     persistence_dir.join(format!("shard_{shard_id}"))
+}
+
+/// Snapshot the graph store as part of a WAL v3 checkpoint (Bug B of the
+/// 2026-07 durability P0: the checkpoint advances the WAL replay floor and
+/// recycles segments, so every graph record it covers must be materialized
+/// on disk FIRST or a crash loses the graph permanently).
+///
+/// Freezes each graph's write buffer into an immutable CSR segment (the
+/// mutable tier is never serialized directly — freeze is the only path to
+/// disk), stamps `snapshot_lsn` (the WAL LSN this snapshot covers; recovery
+/// skips graph records at or below it), and persists segments + manifests +
+/// metadata.
+///
+/// Returns `true` when the checkpoint may proceed (snapshot persisted, or
+/// nothing to do). Returns `false` on save failure — the caller MUST abort
+/// the checkpoint finalize so the control file keeps the old replay floor
+/// and the WAL segments holding the graph records are not recycled.
+///
+/// Called on the shard thread between mutations (single-threaded event
+/// loop), so the snapshot is a consistent cut: every record `<= snapshot_lsn`
+/// is in the freeze, every later record is not.
+pub fn persist_graph_at_checkpoint(
+    store: &mut GraphStore,
+    persistence_dir: Option<&Path>,
+    shard_id: usize,
+    snapshot_lsn: u64,
+) -> bool {
+    if !store.is_dirty() || store.graph_count() == 0 {
+        return true;
+    }
+    // No persistence dir (e.g. --appendonly no): graph writes carry no
+    // durability contract; let the checkpoint proceed.
+    let Some(dir) = persistence_dir else {
+        return true;
+    };
+
+    // Freeze every write buffer so the on-disk segments cover the mutable
+    // tier. Graphs whose buffer is empty (or holds only cross-tier delta
+    // edges) skip the freeze — freeze_and_compact returns false without
+    // pushing an empty segment.
+    let names: Vec<Bytes> = store.list_graphs().into_iter().cloned().collect();
+    for name in &names {
+        let lsn = store.allocate_lsn();
+        if let Some(graph) = store.get_graph_mut(name) {
+            graph.freeze_and_compact(lsn);
+        }
+    }
+
+    store.set_snapshot_lsn(snapshot_lsn);
+    match save_graph_store(store, dir, shard_id) {
+        Ok(()) => {
+            store.clear_dirty();
+            true
+        }
+        Err(e) => {
+            tracing::error!(
+                "Shard {shard_id}: checkpoint graph snapshot failed ({e}); \
+                 aborting checkpoint finalize to keep the WAL replay floor"
+            );
+            false
+        }
+    }
 }
 
 #[cfg(test)]

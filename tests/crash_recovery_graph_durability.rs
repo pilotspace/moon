@@ -770,3 +770,234 @@ fn g3_double_crash_recovery_is_idempotent() {
 
     drop(guard);
 }
+
+// ---------------------------------------------------------------------------
+// G4/G5: DEFAULT-config durability (v3 disk-offload path)
+//
+// G1-G3 pass `--disk-offload disable`, so they only validate the legacy v2
+// WAL replay path. Production runs the v3 disk-offload protocol by default,
+// where graph durability was found broken twice over (GCP soak, 2026-07-07):
+//   Bug A — `Shard::restore_from_persistence` replays WAL v3 through a
+//     TEMPORARY DispatchReplayEngine whose collected graph commands are
+//     dropped; `shared_databases::replay_graph_wal` only reads the v2 file.
+//     Graph WAL replay is a complete no-op in v3 mode.
+//   Bug B — the checkpoint (periodic / BGSAVE / WAL-overflow) advances
+//     `control.last_checkpoint_lsn` and recycles WAL segments WITHOUT any
+//     graph snapshot (`save_graph_store` runs only on graceful shutdown and
+//     persists only frozen CSR segments, never the write_buf).
+// G4 proves crash recovery works in v3 mode at all (Bug A); G5 proves it
+// still works after a checkpoint has advanced the replay floor (Bug B).
+// ---------------------------------------------------------------------------
+
+/// Spawn moon in the DEFAULT persistence configuration (v3 disk-offload
+/// active) — no `--disk-offload disable`. Everything else matches
+/// `spawn_moon`.
+fn spawn_moon_v3(port: u16, dir: &Path) -> ServerGuard {
+    std::fs::create_dir_all(dir).expect("create test dir");
+    let child = Command::new(find_moon_binary())
+        .args([
+            "--port",
+            &port.to_string(),
+            "--shards",
+            "1",
+            "--appendonly",
+            "yes",
+            "--disk-free-min-pct",
+            "0",
+            "--dir",
+        ])
+        .arg(dir)
+        .env("RUST_LOG", "moon=info")
+        .stdout(
+            std::fs::File::options()
+                .append(true)
+                .create(true)
+                .open(dir.join("moon.stdout.log"))
+                .expect("stdout log"),
+        )
+        .stderr(
+            std::fs::File::options()
+                .append(true)
+                .create(true)
+                .open(dir.join("moon.stderr.log"))
+                .expect("stderr log"),
+        )
+        .spawn()
+        .expect("spawn moon (run `cargo build --release` first, or set MOON_BIN)");
+    ServerGuard::new(child, dir)
+}
+
+/// `start_moon_alive` for the v3-default configuration.
+fn start_moon_alive_v3(port: u16, dir: &Path) -> ServerGuard {
+    for attempt in 1..=RESTART_ATTEMPTS {
+        let mut guard = spawn_moon_v3(port, dir);
+        let mut up = false;
+        for _ in 0..300 {
+            if let Ok(Some(_status)) = guard.child.try_wait() {
+                break;
+            }
+            if TcpStream::connect(format!("127.0.0.1:{port}")).is_ok() {
+                up = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        if up {
+            return guard;
+        }
+        drop(guard);
+        if attempt < RESTART_ATTEMPTS {
+            std::thread::sleep(Duration::from_millis(300));
+        }
+    }
+    panic!("moon (v3) failed to start+serve on port {port} after {RESTART_ATTEMPTS} attempts");
+}
+
+/// v3 variant of `wait_for_wal_bytes`: scan every segment under
+/// `<dir>/shard-0/wal-v3/` for `needle`.
+fn wait_for_wal_v3_bytes(dir: &Path, needle: &[u8]) {
+    let wal_dir = dir.join("shard-0").join("wal-v3");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if let Ok(entries) = std::fs::read_dir(&wal_dir) {
+            for entry in entries.flatten() {
+                if let Ok(bytes) = std::fs::read(entry.path()) {
+                    if bytes.windows(needle.len()).any(|w| w == needle) {
+                        return;
+                    }
+                }
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "WAL v3 dir {} never contained marker {:?} — graph writes are \
+             not reaching the v3 WAL",
+            wal_dir.display(),
+            String::from_utf8_lossy(needle),
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Marker write + v3-WAL durability wait.
+fn write_marker_and_sync_v3(c: &mut Client, dir: &Path, marker: &str) {
+    match c.cmd(&[b"GRAPH.ADDNODE", G, b"Marker", b"tag", marker.as_bytes()]) {
+        V::Int(_) => {}
+        other => panic!("marker ADDNODE failed: {other:?}"),
+    }
+    wait_for_wal_v3_bytes(dir, marker.as_bytes());
+}
+
+/// Shared body for G4/G5: seed a graph over both command surfaces and
+/// return the pre-crash answers to compare after recovery.
+fn seed_graph_v3(c: &mut Client) -> (BTreeSet<i64>, BTreeSet<i64>) {
+    assert_eq!(c.cmd(&[b"GRAPH.CREATE", G]), V::Simple("OK".into()));
+    let handles: Vec<i64> = (0..40).map(|i| addnode(c, "N", i)).collect();
+    for w in handles.windows(2) {
+        addedge(c, w[0], w[1]);
+    }
+    for i in 0..10 {
+        if let V::Err(e) = query(c, &format!("CREATE (:C {{id: {i}, score: {}}})", i * 3)) {
+            panic!("Cypher CREATE errored: {e}");
+        }
+    }
+    if let V::Err(e) = query(c, "MATCH (n:N {id: 5}) SET n.rank = 42") {
+        panic!("SET errored: {e}");
+    }
+    let n_ids = int_set(c, "MATCH (n:N) RETURN n.id");
+    let c_ids = int_set(c, "MATCH (n:C) RETURN n.id");
+    assert_eq!(n_ids, (0..40).collect(), "pre-crash N ids");
+    assert_eq!(c_ids, (0..10).collect(), "pre-crash C ids");
+    (n_ids, c_ids)
+}
+
+/// Post-recovery assertions shared by G4/G5.
+fn assert_graph_recovered(c: &mut Client, n_ids: &BTreeSet<i64>, c_ids: &BTreeSet<i64>) {
+    assert_eq!(
+        &int_set(c, "MATCH (n:N) RETURN n.id"),
+        n_ids,
+        "recovered N id set (v3 graph WAL replay)"
+    );
+    assert_eq!(
+        &int_set(c, "MATCH (n:C) RETURN n.id"),
+        c_ids,
+        "recovered Cypher-created C id set"
+    );
+    assert_eq!(
+        int_set(c, "MATCH (n:N {id: 5}) RETURN n.rank"),
+        BTreeSet::from([42]),
+        "recovered SET property"
+    );
+    // Edge chain intact: node 1 has exactly neighbors 0->1->2.
+    assert_eq!(
+        single_column(c, "MATCH (:N {id: 0})-[:E]->(m) RETURN m").len(),
+        1,
+        "recovered edge fan-out"
+    );
+}
+
+#[test]
+#[ignore] // Requires built release binary; run explicitly.
+fn g4_default_v3_mode_survives_kill9() {
+    let port = unique_port();
+    let dir = unique_dir("g4");
+    let guard = start_moon_alive_v3(port, &dir);
+    let mut c = Client::connect(port);
+
+    let (n_ids, c_ids) = seed_graph_v3(&mut c);
+    write_marker_and_sync_v3(&mut c, &dir, "W29-G4-MARKER");
+    crash(guard, port);
+
+    let guard = start_moon_alive_v3(port, &dir);
+    let mut c = Client::connect(port);
+    assert_graph_recovered(&mut c, &n_ids, &c_ids);
+    drop(guard);
+}
+
+#[test]
+#[ignore] // Requires built release binary; run explicitly.
+fn g5_default_v3_mode_survives_kill9_after_checkpoint() {
+    let port = unique_port();
+    let dir = unique_dir("g5");
+    let guard = start_moon_alive_v3(port, &dir);
+    let mut c = Client::connect(port);
+
+    let (mut n_ids, c_ids) = seed_graph_v3(&mut c);
+
+    // Force a checkpoint (BGSAVE requests one on the next tick) and wait
+    // for the shard control file to be (re)written — the moment the WAL
+    // replay floor advances past every record written above.
+    let control = dir.join("shard-0").join("shard-0.control");
+    let before = std::fs::read(&control).ok();
+    assert_eq!(
+        c.cmd(&[b"BGSAVE"]),
+        V::Simple("Background saving started".into())
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let now = std::fs::read(&control).ok();
+        if now.is_some() && now != before {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "control file {} never advanced after BGSAVE — checkpoint did not run",
+            control.display(),
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // Write a handful of POST-checkpoint records too, so both sides of the
+    // replay floor are represented.
+    for i in 100..105i64 {
+        addnode(&mut c, "N", i as u64);
+        n_ids.insert(i);
+    }
+    write_marker_and_sync_v3(&mut c, &dir, "W29-G5-MARKER");
+    crash(guard, port);
+
+    let guard = start_moon_alive_v3(port, &dir);
+    let mut c = Client::connect(port);
+    assert_graph_recovered(&mut c, &n_ids, &c_ids);
+    drop(guard);
+}
