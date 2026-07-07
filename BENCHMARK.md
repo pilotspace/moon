@@ -770,6 +770,29 @@ recall 0.759 there, the documented TQ-at-384d quantized-brute trade-off; low bru
 Qdrant's client-side latency somewhat); shared-host VM — ratios are the signal, absolutes
 are indicative.
 
+### 10.8 2026-07-07 vs Qdrant — GCE validation (dedicated instances, x86 + ARM)
+
+Same workload and harness as §10.7, re-run on dedicated GCE instances to validate the
+same-box VM ratios on real cloud hardware: **c3-standard-8** (Xeon Platinum 8481C, x86_64)
+and **t2a-standard-8** (Neoverse-N1, aarch64), us-central1-a. Fresh native build of branch
+HEAD `852d53a` on each instance; Docker Qdrant on the same box.
+
+| metric | x86 Moon | x86 Qdrant | ARM Moon | ARM Qdrant |
+|--------|:--------:|:----------:|:--------:|:----------:|
+| Ingest rate (vec/s) | **34,121** (searchable immediately) | 3,383 accepted / 3,167 to green | **26,034** (searchable immediately) | 2,383 accepted / 2,273 to green |
+| Time to HNSW-tier serving | 27.2 s | **15.8 s** | 47.6 s | **22.0 s** |
+| Search QPS (HNSW, 8 threads) | **2,097** | 613 | **1,422** | 531 |
+| Search p50 / p99 (ms) | **3.72 / 5.61** | 11.98 / 23.88 | **5.50 / 7.98** | 13.75 / 26.11 |
+| Recall@10 | 0.9992 | 1.0000 | 0.9992 | 0.9998 |
+
+Moon ingests **10.1× (x86) / 10.9× (ARM)** faster and serves matched-recall search
+**3.4× (x86) / 2.7× (ARM)** faster — confirming §10.7's VM reading (2.53×) on dedicated
+cloud hardware. Qdrant keeps its time-to-index-green edge after bulk load (Moon serves
+from the brute tier in that window). Recall is computed against exact ground truth
+(full-precision brute-force top-10 over all 50K vectors per query); both engines ≥0.999,
+within 0.0008 of each other, and Moon's 0.9992 reproduces bit-identically across all
+three environments (VM, GCE x86, GCE ARM).
+
 ---
 
 ## 11. Graph Engine
@@ -937,11 +960,36 @@ The June deficit — FalkorDB's property index vs Moon's filtered label scan —
 at this scale: Moon Cypher point queries improved ~3–4× relative to FalkorDB on the
 same box (wave-2 write-side plan cache + IndexScan + executor work). Moon now WINS
 2-hop at better p50 and ties 1-hop within 10% on the weakest instance class; on equal
-§11.5-class hardware the 1-hop tie likely flips too. Caveat: Moon's p99 (18.9 ms
-1-hop) trails FalkorDB's (3.1 ms) on this shared-core instance — worth a look on
-pinned cores. Interesting inversion: Moon Cypher 1-hop (3,489 qps) now beats its own
+§11.5-class hardware the 1-hop tie likely flips too (**confirmed in §11.9** — dedicated
+cores flip 1-hop to a 2.3–2.7× Moon win). Caveat: Moon's p99 (18.9 ms 1-hop) trails
+FalkorDB's (3.1 ms) on this shared-core instance — §11.9 shows this was a shared-core
+artifact (dedicated-core p99 beats FalkorDB). Interesting inversion: Moon Cypher 1-hop (3,489 qps) now beats its own
 native GRAPH.NEIGHBORS (3,185 qps) under concurrency — the plan cache amortizes
 parsing to near-zero.
+
+### 11.9 2026-07-07 Cypher-2× wave vs FalkorDB — GCE dedicated-core validation (x86 + ARM)
+
+Supersedes §11.8's shared-core e2 caveat. Same 8-thread 1-hop Cypher point-query workload
+(5K nodes / 15K edges, seed(7), 20 s measure, redis-py persistent connections), run on
+dedicated GCE instances — **c3-standard-8** (Xeon Platinum 8481C) and **t2a-standard-8**
+(Neoverse-N1) — with Docker FalkorDB on the same box, 2 interleaved reps each. Fresh
+native build of branch HEAD `852d53a` (post P1 property index / P2 result cache / P3).
+
+| metric | x86 Moon | x86 FalkorDB | ratio | ARM Moon | ARM FalkorDB | ratio |
+|--------|:--------:|:------------:|:-----:|:--------:|:------------:|:-----:|
+| cypher_1hop qps (rep1 / rep2) | **11,641 / 11,620** | 4,988 / 4,955 | **2.34×** | **10,938 / 10,867** | 4,028 / 4,135 | **2.67×** |
+| p50 (ms) | **0.54** | 1.46 | 2.7× | **0.61** | 1.81 | 2.9× |
+| p90 (ms) | **1.36** | 2.30 | — | **1.33** | 2.83 | — |
+| p99 (ms) | **2.48** | 3.33 | — | **2.26** | 4.31 | — |
+
+Moon **wins 1-hop Cypher outright on both architectures** — 2.3–2.7× the QPS at ~2.7–2.9×
+better p50 — and rep-to-rep spread is <0.2% (dedicated cores). The §11.8 p99-tail concern
+(18.9 ms on the shared-core e2) is confirmed as a shared-core artifact: on dedicated cores
+Moon's p99 *beats* FalkorDB's on both arches. Ratios also validate the same-box VM readings
+(§11.7b 2.78×, final-HEAD 2.55×). FalkorDB build rate for context: 1,009 ops/s (x86) /
+605 ops/s (ARM) via batched UNWIND — Moon's build side used the sequential single-client
+native API in this harness, so build is not compared here (see §11.5 for the 23–26×
+concurrent-build comparison).
 
 ---
 
