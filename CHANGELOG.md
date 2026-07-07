@@ -25,6 +25,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (docs.yml), `taiki-e/install-action` 2.81.10→2.82.9 (fuzz.yml) —
   supersedes dependabot #220/#221/#222.
 
+### Changed — BREAKING: WAL v3 is now the only WAL; XactCommit unified to the db-aware record (pre-1.0 format freeze)
+
+Moon is pre-release: this drops on-disk format compatibility that no shipped
+release depended on. There is no migration path — operators upgrading a node
+that still has WAL v2 files (`shard-N.wal`) or pre-freeze XactCommit(0x51)
+records on disk must let those age out via the AOF-authoritative recovery
+path (below), or replay them on a pre-freeze build first and re-persist.
+
+- **`src/persistence/wal_v3/record.rs`**: deleted the pre-1.0 `XactCommit`
+  (v1, tag `0x51`) record type, its encoder, and its replay arm. Renamed
+  `XactCommitV2` -> `XactCommit`, **keeping discriminant `0x53`** (`0x51` is
+  retired, not reused — a stray `0x51` record in a v3 stream now decodes as
+  an unrecognized tag rather than being silently reinterpreted). All
+  producers (the TXN.COMMIT WAL record in `handler_sharded`/`handler_monoio`)
+  already wrote only the v2 (now unified) record, so this is a pure
+  simplification of the read side.
+- **`src/persistence/wal.rs` deleted** — WAL v2 (`WalWriter`, `replay_wal`,
+  `wal_path`) is removed in its entirety. WAL v3 (`WalWriterV3`,
+  `src/persistence/wal_v3/`) is the only WAL, and is now also created in the
+  old v2 niche (`--appendonly yes` with `--disk-offload disable`), rooted at
+  `<persistence_dir>/shard-N/wal-v3/` instead of the old flat
+  `<persistence_dir>/shard-N.wal` file — matching the disk-offload layout.
+  This closes a latent gap: `--appendfsync always` previously only fsynced
+  WAL v3 (a no-op in non-offload mode, since only v2 existed there); it now
+  fsyncs the WAL unconditionally.
+- **`replay_wal_auto`** rejects a v2-format WAL file (`RRDWAL` magic +
+  version byte `2`) with a loud `WalError::UnsupportedVersion` instead of
+  delegating to the deleted v2 replay path.
+- **Recovery**: the `shard-N.wal` (v2) fallback rung is removed from both
+  `persistence::recovery::recover_shard_v3_pitr` (disk-offload path) and
+  `Shard::restore_from_persistence_v2` (legacy path) — `appendonly.aof`
+  remains the recovery authority and is unaffected. `shared_databases::
+  replay_graph_wal` (graph-feature boot-time WAL scan) is ported from the v2
+  flat file to the v3 segment directory (`shard-N/wal-v3/*.wal`), matching
+  `replay_workspace_wal`/`replay_temporal_wal`.
+- **`wal_append_and_fanout` / `wal_fanout_has_work`** (`src/shard/
+  spsc_handler.rs`) drop the v2 `wal_writer` parameter and the "v3
+  supersedes v2" branch — a single `Option<WalWriterV3>` parameter, renamed
+  `wal_writer`. `finalize_snapshot_success` no longer takes a WAL writer:
+  v2's per-snapshot `truncate_after_snapshot(epoch)` had no v3 analogue — v3
+  retention is LSN-driven (`WalWriterV3::recycle_aggressive` /
+  `recycle_segments_before`, run from autovacuum Pass C and the checkpoint
+  protocol) and already ran independently of legacy snapshot epochs, so
+  nothing was lost by not porting it over.
+- Deferred (unrelated to this change, found in passing): `shared_databases::
+  replay_temporal_wal` scans `shard-N/` directly for `*.wal` files instead of
+  `shard-N/wal-v3/` like its siblings — looks like a pre-existing directory
+  mismatch, left as-is pending its own investigation.
+
 ### Fixed — TopLevel-monoio AOF writer: EverySec fsync deferred indefinitely when idle (PR #TBD)
 
 - **`src/persistence/aof/writer_task.rs`**: the TopLevel monoio AOF writer
