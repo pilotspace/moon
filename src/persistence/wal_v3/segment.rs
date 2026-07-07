@@ -124,7 +124,17 @@ pub struct WalWriterV3 {
     min_wal_bytes: u64,
     /// Maximum WAL size in bytes before aggressive recycling (design section 5.5: 256MB default).
     max_wal_bytes: u64,
+    /// Off-loop fsync agent (spawned lazily on the first `request_sync`).
+    /// See `sync_agent` module docs + tmp/WALV3-OFFLOOP-FSYNC.md.
+    sync_agent: Option<super::sync_agent::WalSyncAgent>,
+    /// Set when agent spawn failed once — never retried (inline fsync
+    /// fallback, logged once).
+    sync_agent_unavailable: bool,
 }
+
+/// Bound on every blocking durability wait (checkpoint ordering gates,
+/// shutdown drain). Design-for-failure: no unbounded waits.
+pub const WAIT_DURABLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 impl WalWriterV3 {
     /// Create a new WAL v3 writer for the given shard.
@@ -158,6 +168,8 @@ impl WalWriterV3 {
             epoch: 0,
             min_wal_bytes: DEFAULT_MIN_WAL_BYTES,
             max_wal_bytes: DEFAULT_MAX_WAL_BYTES,
+            sync_agent: None,
+            sync_agent_unavailable: false,
         };
 
         writer.open_new_segment()?;
@@ -203,7 +215,9 @@ impl WalWriterV3 {
         Ok(())
     }
 
-    /// Flush the in-memory buffer to disk and fsync.
+    /// Flush the in-memory buffer to disk and fsync — INLINE, on the caller's
+    /// thread. Kept for shutdown paths and as the no-agent fallback; latency-
+    /// sensitive callers use [`Self::request_sync`] instead.
     ///
     /// After this returns, all appended records are durable on stable storage.
     pub fn flush_sync(&mut self) -> std::io::Result<()> {
@@ -211,7 +225,99 @@ impl WalWriterV3 {
         if let Some(ref mut file) = self.current_file {
             file.sync_data()?;
         }
+        // Keep the off-loop watermark honest: everything appended so far is
+        // now durable (fetch_max — never regresses a higher agent publish).
+        if let Some(agent) = &self.sync_agent {
+            agent.shared.publish(self.next_lsn.saturating_sub(1));
+        }
         Ok(())
+    }
+
+    /// Spawn the sync agent on first use; on failure, log once and fall
+    /// back to inline fsync forever (never retried per call).
+    fn spawn_agent_if_needed(&mut self) {
+        if self.sync_agent.is_none() && !self.sync_agent_unavailable {
+            match super::sync_agent::WalSyncAgent::spawn(self.shard_id) {
+                Ok(agent) => self.sync_agent = Some(agent),
+                Err(e) => {
+                    tracing::warn!(
+                        shard_id = self.shard_id,
+                        "WAL v3 sync agent spawn failed — falling back to \
+                         inline fsync permanently: {e}"
+                    );
+                    self.sync_agent_unavailable = true;
+                }
+            }
+        }
+    }
+
+    /// Initiate durability for everything appended so far WITHOUT blocking
+    /// on the fsync: write the buffer to the page cache, then hand an
+    /// fd-dup to the off-loop sync agent. Queue-full / dup-failure fall
+    /// back to an inline fsync — a durability request is never dropped.
+    ///
+    /// Errors: propagates page-cache write failures and reports a poisoned
+    /// agent (a prior off-loop fsync failed — durability can no longer be
+    /// promised on this WAL; fail loud, never silently degrade).
+    pub fn request_sync(&mut self) -> std::io::Result<()> {
+        self.flush_write()?;
+        let upto_lsn = self.next_lsn.saturating_sub(1);
+        self.spawn_agent_if_needed();
+
+        if let Some(agent) = &self.sync_agent {
+            if agent.is_poisoned() {
+                return Err(std::io::Error::other(
+                    "WAL v3 sync agent poisoned by a prior fsync failure",
+                ));
+            }
+            if agent.durable_lsn() >= upto_lsn {
+                return Ok(()); // nothing new since the last durable point
+            }
+            let Some(file) = &self.current_file else {
+                return Ok(());
+            };
+            if let Ok(dup) = file.try_clone() {
+                if agent
+                    .try_send(super::sync_agent::SyncRequest {
+                        file: dup,
+                        upto_lsn,
+                    })
+                    .is_ok()
+                {
+                    return Ok(());
+                }
+                // Queue full (disk is the bottleneck) or agent racing
+                // poison — fall through to the inline path.
+            }
+        }
+
+        // Inline fallback: no agent / dup failed / queue full.
+        self.flush_sync()
+    }
+
+    /// Block until everything up to `lsn` is durable (bounded by `timeout`).
+    ///
+    /// Used ONLY by the checkpoint ordering invariants (log-before-data,
+    /// WAL-before-manifest) and shutdown drains — hot paths use
+    /// [`Self::request_sync`].
+    pub fn wait_durable(&mut self, lsn: u64, timeout: std::time::Duration) -> std::io::Result<()> {
+        if lsn == 0 {
+            return Ok(());
+        }
+        if let Some(agent) = &self.sync_agent {
+            if agent.durable_lsn() >= lsn {
+                return Ok(());
+            }
+        }
+        // Make sure a sync covering `lsn` is in flight (or completed
+        // inline, which publishes the watermark itself).
+        self.request_sync()?;
+        match &self.sync_agent {
+            Some(agent) => agent.wait_watermark(lsn, timeout),
+            // No agent: request_sync went through the inline flush_sync
+            // path, so durability already holds.
+            None => Ok(()),
+        }
     }
 
     /// Flush if buffer exceeds a threshold — write only, no fsync.
@@ -444,6 +550,13 @@ impl WalWriterV3 {
                 }
             }
             file.sync_data()?;
+        }
+        // The old segment (holding every record < next_lsn) is now durable;
+        // the off-loop watermark can reflect that. This inline fsync at
+        // rotation is also what makes the agent's fd-dup scheme safe: a
+        // sync request only ever needs to cover the CURRENT segment.
+        if let Some(agent) = &self.sync_agent {
+            agent.shared.publish(self.next_lsn.saturating_sub(1));
         }
 
         self.current_sequence += 1;
@@ -724,6 +837,65 @@ mod tests {
         // Header should be 64 bytes
         let meta = fs::metadata(&seg_path).unwrap();
         assert_eq!(meta.len(), WAL_V3_HEADER_SIZE as u64);
+    }
+
+    #[test]
+    fn test_request_sync_then_wait_durable_covers_all_appends() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_dir = tmp.path().join("wal");
+        let mut writer = WalWriterV3::new(0, &wal_dir, DEFAULT_SEGMENT_SIZE).unwrap();
+
+        let mut last = 0;
+        for i in 0..10u32 {
+            last = writer.append(WalRecordType::Command, format!("SET k{i} v").as_bytes());
+        }
+        // Non-blocking initiation, then a bounded wait must observe
+        // durability for every appended record.
+        writer.request_sync().unwrap();
+        writer
+            .wait_durable(last, std::time::Duration::from_secs(5))
+            .unwrap();
+
+        // Bytes must actually be on disk (page-cache write happened before
+        // the agent's fsync request).
+        let data = fs::read(WalSegment::segment_path(&wal_dir, 1)).unwrap();
+        let mut offset = WAL_V3_HEADER_SIZE;
+        let mut count = 0;
+        while offset < data.len() {
+            let record = read_wal_v3_record(&data[offset..]).expect("record parses");
+            // record_len already includes its own 4-byte length prefix.
+            offset += u32::from_le_bytes([
+                data[offset],
+                data[offset + 1],
+                data[offset + 2],
+                data[offset + 3],
+            ]) as usize;
+            count += 1;
+            assert!(record.lsn <= last);
+        }
+        assert_eq!(count, 10);
+    }
+
+    #[test]
+    fn test_wait_durable_zero_and_already_durable_are_noops() {
+        let tmp = tempfile::tempdir().unwrap();
+        let wal_dir = tmp.path().join("wal");
+        let mut writer = WalWriterV3::new(0, &wal_dir, DEFAULT_SEGMENT_SIZE).unwrap();
+        // lsn 0 = "nothing to wait for" — must not spawn or block.
+        writer
+            .wait_durable(0, std::time::Duration::from_millis(10))
+            .unwrap();
+        let lsn = writer.append(WalRecordType::Command, b"SET a 1");
+        // Inline flush_sync publishes the watermark, so a subsequent
+        // wait_durable is a fast-path no-op even with an agent spawned.
+        writer.request_sync().unwrap(); // spawns agent
+        writer
+            .wait_durable(lsn, std::time::Duration::from_secs(5))
+            .unwrap();
+        writer.flush_sync().unwrap();
+        writer
+            .wait_durable(lsn, std::time::Duration::from_millis(10))
+            .unwrap();
     }
 
     #[test]
