@@ -63,6 +63,68 @@ const AOF_IDLE_WAIT_STEPS: &[std::time::Duration] = &[
     std::time::Duration::from_secs(1),
 ];
 
+/// Park-free bounded receive for the std-thread writer loops under
+/// `FsyncPolicy::EverySec`/`No`.
+///
+/// A parked `recv_timeout` registers this thread as a flume waiter, so every
+/// producer `try_send` from a shard thread pays a futex WAKE **on the shard
+/// thread** — measured at 149,718 futex calls (63% of shard-thread syscall
+/// time) during an 8s p1 SET run under everysec, the mechanism behind the
+/// esec p1 SET deficit vs Redis (whose AOF append is a plain memcpy into
+/// `aof_buf`). Polling with `try_recv` + short sleeps never registers a
+/// waiter, so producer sends stay pure userspace atomics.
+///
+/// Latency/CPU trade (why this is safe ONLY for EverySec/No): a message may
+/// sit unobserved for up to one sleep step. The step scales with the wait
+/// (`wait/16`, clamped to 500µs..50ms), so at the 50ms fast floor the
+/// EverySec deadline is still checked within ~3ms slack, and at the idle 1s
+/// escalated wait the writer wakes ≤20×/s (vs the parked recv's 1×/s —
+/// the accepted cost of this fix; still far below the pre-wave-5 fixed
+/// 50ms cadence). Under load `try_recv` returns immediately and no sleep
+/// happens at all. `Always` keeps the parked recv: its callers block on the
+/// per-batch fsync ack, so added receive latency is user-visible RTT.
+#[cfg(feature = "runtime-monoio")]
+fn poll_recv(
+    rx: &channel::MpscReceiver<AofMessage>,
+    wait: std::time::Duration,
+) -> Result<AofMessage, flume::RecvTimeoutError> {
+    let step = (wait / 16).clamp(
+        std::time::Duration::from_micros(500),
+        std::time::Duration::from_millis(50),
+    );
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        match rx.try_recv() {
+            Ok(m) => return Ok(m),
+            Err(flume::TryRecvError::Disconnected) => {
+                return Err(flume::RecvTimeoutError::Disconnected);
+            }
+            Err(flume::TryRecvError::Empty) => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(flume::RecvTimeoutError::Timeout);
+                }
+                std::thread::sleep(step);
+            }
+        }
+    }
+}
+
+/// Bounded receive for the std-thread writer loops: parked under `Always`
+/// (ack latency is client-visible), park-free polling otherwise (producer
+/// sends must not pay a futex wake — see [`poll_recv`]).
+#[cfg(feature = "runtime-monoio")]
+fn recv_next(
+    rx: &channel::MpscReceiver<AofMessage>,
+    wait: std::time::Duration,
+    park: bool,
+) -> Result<AofMessage, flume::RecvTimeoutError> {
+    if park {
+        rx.recv_timeout(wait)
+    } else {
+        poll_recv(rx, wait)
+    }
+}
+
 impl IdleWait {
     fn new() -> Self {
         Self {
@@ -106,6 +168,73 @@ impl IdleWait {
     /// succeeded) — escalation may resume from here.
     fn clear_pending(&mut self) {
         self.pending = false;
+    }
+}
+
+#[cfg(all(test, feature = "runtime-monoio"))]
+mod poll_recv_tests {
+    use super::*;
+
+    #[test]
+    fn returns_queued_message_immediately() {
+        let (tx, rx) = channel::mpsc_bounded::<AofMessage>(4);
+        assert!(
+            tx.try_send(AofMessage::Append {
+                lsn: 7,
+                bytes: bytes::Bytes::from_static(b"x"),
+            })
+            .is_ok()
+        );
+        let start = std::time::Instant::now();
+        let Ok(got) = poll_recv(&rx, std::time::Duration::from_secs(1)) else {
+            panic!("expected message");
+        };
+        assert!(matches!(got, AofMessage::Append { lsn: 7, .. }));
+        // No sleep step should have been taken for an already-queued message.
+        assert!(start.elapsed() < std::time::Duration::from_millis(50));
+    }
+
+    #[test]
+    fn picks_up_message_sent_mid_wait() {
+        let (tx, rx) = channel::mpsc_bounded::<AofMessage>(4);
+        let sender = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            assert!(
+                tx.try_send(AofMessage::Append {
+                    lsn: 1,
+                    bytes: bytes::Bytes::from_static(b"y"),
+                })
+                .is_ok()
+            );
+        });
+        let Ok(got) = poll_recv(&rx, std::time::Duration::from_secs(5)) else {
+            panic!("expected message");
+        };
+        assert!(matches!(got, AofMessage::Append { lsn: 1, .. }));
+        assert!(sender.join().is_ok());
+    }
+
+    #[test]
+    fn times_out_when_empty() {
+        let (_tx, rx) = channel::mpsc_bounded::<AofMessage>(4);
+        let start = std::time::Instant::now();
+        // AofMessage has no Debug impl — match instead of unwrap_err.
+        let Err(err) = poll_recv(&rx, std::time::Duration::from_millis(30)) else {
+            panic!("expected timeout");
+        };
+        assert!(matches!(err, flume::RecvTimeoutError::Timeout));
+        assert!(start.elapsed() >= std::time::Duration::from_millis(30));
+    }
+
+    #[test]
+    fn reports_disconnect() {
+        let (tx, rx) = channel::mpsc_bounded::<AofMessage>(4);
+        drop(tx);
+        // AofMessage has no Debug impl — match instead of unwrap_err.
+        let Err(err) = poll_recv(&rx, std::time::Duration::from_secs(1)) else {
+            panic!("expected disconnect");
+        };
+        assert!(matches!(err, flume::RecvTimeoutError::Disconnected));
     }
 }
 
@@ -373,7 +502,13 @@ pub async fn aof_writer_task(
             // bounded batch so a single fsync makes the whole batch durable
             // (TopLevel = plain RESP bytes). On timeout, fall through (None)
             // to the EverySec proactive fsync at the end of the loop.
-            let first = match rx.recv_timeout(idle_wait.current()) {
+            // Park-free under EverySec/No so producer try_sends never pay a
+            // futex wake on the shard thread — see `poll_recv`.
+            let first = match recv_next(
+                &rx,
+                idle_wait.current(),
+                matches!(fsync, FsyncPolicy::Always),
+            ) {
                 Ok(m) => {
                     idle_wait.on_message();
                     Some(m)
@@ -1320,8 +1455,14 @@ pub async fn per_shard_aof_writer_task(
             // Appends arrive after a fold (or when the client stops writing).
             // The wait starts at `idle_wait`'s fast floor (50ms, matching the
             // old fixed cadence) and escalates while genuinely idle — see
-            // `IdleWait` docs.
-            let first = match rx.recv_timeout(idle_wait.current()) {
+            // `IdleWait` docs. Park-free under EverySec/No so producer
+            // try_sends never pay a futex wake on the shard thread — see
+            // `poll_recv`.
+            let first = match recv_next(
+                &rx,
+                idle_wait.current(),
+                matches!(fsync, FsyncPolicy::Always),
+            ) {
                 Ok(m) => {
                     idle_wait.on_message();
                     Some(m)
