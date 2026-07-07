@@ -1445,6 +1445,29 @@ pub(crate) async fn handle_connection_sharded_monoio<
                         }
                     }
 
+                    // D-2: keyless FLUSHDB/FLUSHALL routed local-only cleared just
+                    // this shard — broadcast to every other shard (outside the
+                    // with_shard closure: this awaits). Any failed leg turns the
+                    // reply into an explicit partial-flush error, never silent +OK.
+                    if !matches!(response, Frame::Error(_))
+                        && ctx.num_shards > 1
+                        && (cmd.eq_ignore_ascii_case(b"FLUSHDB")
+                            || cmd.eq_ignore_ascii_case(b"FLUSHALL"))
+                    {
+                        if let Err(e) = crate::shard::coordinator::coordinate_flush_broadcast(
+                            &frame,
+                            ctx.shard_id,
+                            ctx.num_shards,
+                            conn.selected_db,
+                            &ctx.dispatch_tx,
+                            &ctx.spsc_notifiers,
+                        )
+                        .await
+                        {
+                            response = e;
+                        }
+                    }
+
                     // AOF logging for successful local writes.
                     // H1: durable path awaits fsync under appendfsync=always.
                     // On AOF failure we override `response` to an error

@@ -134,6 +134,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   observed on the macOS CI runner).
 ### Fixed — connection-plane durability & lifecycle wave (PR #230)
 
+- **D-2 — FLUSHDB/FLUSHALL now clear every shard, not just the local one**
+  (`src/shard/coordinator.rs` `coordinate_flush_broadcast`, both sharded
+  handlers): FLUSHDB/FLUSHALL are keyless, so key-based routing executed them
+  only on the issuing connection's shard — on `--shards 4` a FLUSHALL left
+  ~3/4 of the keyspace intact (red/green: 49/64 keys survived, now 0). The
+  originating shard now broadcasts the flush to every peer shard as a
+  `MultiExecute` leg, which reuses the existing remote dispatch + per-shard
+  AOF/WAL persistence + index-flush path. Any failed leg returns a loud
+  `MOONERR FLUSH partial` error (local shard already flushed; client should
+  retry). Known limits: the flush is not atomic across shards (same relaxed
+  semantics as SWAPDB), and a FLUSH issued inside MULTI/EXEC still executes
+  local-only (follow-up); FLUSHALL still clears only the selected db
+  (documented v0.1.5 single-active-DB behavior — all-dbs semantics is a
+  separate follow-up needing replay parity).
 - **D-1 — cross-store TXN crash replay restores into the correct db**
   (`src/transaction/mod.rs`, `wal_v3/record.rs`, `wal_v3/replay.rs`, txn
   handlers): `CrossStoreTxn` had no db field and WAL replay hardcoded

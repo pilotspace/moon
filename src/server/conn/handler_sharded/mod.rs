@@ -1535,6 +1535,25 @@ pub(crate) async fn handle_connection_sharded_inner<
                                         &mut s.text_store,
                                     );
                                 });
+                                // D-2: keyless flush routed local-only cleared just this
+                                // shard — broadcast to every other shard so the whole
+                                // keyspace flushes. Any failed leg turns the reply into
+                                // an explicit partial-flush error (never silent +OK).
+                                if ctx.num_shards > 1 {
+                                    if let Err(e) =
+                                        crate::shard::coordinator::coordinate_flush_broadcast(
+                                            &frame,
+                                            ctx.shard_id,
+                                            ctx.num_shards,
+                                            conn.selected_db,
+                                            &ctx.dispatch_tx,
+                                            &ctx.spsc_notifiers,
+                                        )
+                                        .await
+                                    {
+                                        response = e;
+                                    }
+                                }
                             }
                             // H1: durable path under appendfsync=always.
                             let mut aof_failed = false;

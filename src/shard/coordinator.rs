@@ -902,6 +902,76 @@ async fn spsc_send_bounded(
     PushOutcome::Backpressure
 }
 
+/// Broadcast a keyless flush (FLUSHDB/FLUSHALL) to every OTHER shard (D-2).
+///
+/// FLUSHDB/FLUSHALL are keyless, so `extract_primary_key` routes them
+/// local-only — a normal client's flush previously cleared just the local
+/// shard's selected db, silently leaving the other `num_shards - 1` shards'
+/// keyspaces intact (ghost keys, stale reads, DBSIZE > 0 after FLUSHALL).
+///
+/// Each remote leg is shipped as a `MultiExecute` carrying the original
+/// command frame, so the target shard runs it through its normal SPSC arm:
+/// dispatch + per-shard AOF/WAL persistence (fail-loud `AOF_APPEND_LOST`) +
+/// vector/text index clearing all apply exactly as for the local leg.
+///
+/// Legs run concurrently (all sends first, then all acks awaited). Like
+/// SWAPDB's broadcast, this is not atomic across shards: a concurrent read
+/// can observe shard A flushed while shard B is not yet — Redis-cluster-
+/// relaxed semantics. On any failed leg the caller receives an explicit
+/// partial-flush error naming the shard, never a silent partial `+OK`.
+pub(crate) async fn coordinate_flush_broadcast(
+    command: &Frame,
+    my_shard: usize,
+    num_shards: usize,
+    db_index: usize,
+    dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
+    spsc_notifiers: &[Arc<channel::Notify>],
+) -> Result<(), Frame> {
+    let mut pending = Vec::with_capacity(num_shards.saturating_sub(1));
+    for target in 0..num_shards {
+        if target == my_shard {
+            continue;
+        }
+        let (reply_tx, reply_rx) = channel::oneshot();
+        let msg = ShardMessage::MultiExecute {
+            db_index,
+            // Keyless command: the routing key is unused by the flush arm.
+            commands: vec![(Bytes::new(), command.clone())],
+            reply_tx,
+        };
+        let outcome = spsc_send(dispatch_tx, my_shard, target, msg, spsc_notifiers).await;
+        pending.push((target, reply_rx, outcome));
+    }
+
+    let mut failed: Option<usize> = None;
+    for (target, reply_rx, outcome) in pending {
+        if outcome != crate::shard::dispatch::PushOutcome::Pushed {
+            failed.get_or_insert(target);
+            continue;
+        }
+        match reply_rx.recv().await {
+            Ok(frames) if frames.iter().all(|f| !matches!(f, Frame::Error(_))) => {}
+            _ => {
+                failed.get_or_insert(target);
+            }
+        }
+    }
+    match failed {
+        None => Ok(()),
+        Some(target) => {
+            tracing::error!(
+                my_shard,
+                target,
+                "flush broadcast: remote leg failed — keyspace partially flushed"
+            );
+            Err(Frame::Error(Bytes::from(format!(
+                "MOONERR FLUSH partial: shard {target} leg failed or unreachable — \
+                 local shard flushed; retry the FLUSH command"
+            ))))
+        }
+    }
+}
+
 /// Coordinate MGET across shards using VLL pattern.
 ///
 /// Groups keys by shard in a BTreeMap (ascending shard-ID order), executes
