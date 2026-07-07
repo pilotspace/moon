@@ -7,11 +7,31 @@
 //! property eval, GRAPH.NEIGHBORS existence, GRAPH.HYBRID) go through to see
 //! the whole graph.
 //!
-//! Tier invariant: a NodeKey lives in EXACTLY ONE tier. `freeze()` moves keys
-//! out of the slotmap, and slot reuse bumps the generation, so a drained key
-//! can never reappear in the mutable tier; `compact_segments` swaps the
-//! segment list atomically, so within one loaded snapshot the segments are
-//! pairwise disjoint too. Lookups therefore need no dedup.
+//! Tier invariant: a NodeKey lives in EXACTLY ONE tier, so lookups here need
+//! no dedup -- but this is actively ENFORCED, not automatic, across the two
+//! ways a mutable-tier `MemGraph` comes into being.
+//!
+//! In-process freeze (`NamedGraph::freeze_and_compact`) needs no extra work:
+//! `freeze()` drains keys out of the slotmap and thaws `write_buf` IN PLACE
+//! (same underlying slot maps), so slot reuse bumps the generation and a
+//! drained key can never reappear in the mutable tier; `compact_segments`
+//! swaps the segment list atomically, so within one loaded snapshot the
+//! segments are pairwise disjoint too.
+//!
+//! Restart (`recover_graph_store` + WAL replay, `src/graph/recovery.rs` +
+//! `src/graph/replay.rs`) is different: a FRESH `MemGraph` has no history
+//! with the loaded CSR segments' generations, so its deterministic SlotMap
+//! allocation (index 0, generation 1 first) could otherwise numerically
+//! alias a persisted `external_id` -- silently shadowing a frozen node,
+//! since lookups here check the mutable tier first. The invariant is
+//! restored by two restart-only mechanisms: `recover_graph_store` seeds the
+//! post-recovery mutable tier via `MemGraph::with_id_offset` with a
+//! watermark one past the largest persisted `external_id` (so fresh keys
+//! can never collide), and `replay.rs`'s AddNode replay loop skips
+//! re-inserting any `node_id` already resident in a loaded segment (avoiding
+//! double enumeration when un-truncated WAL history replays a node that is
+//! already frozen). See `tests/graph_restart_id_aliasing.rs` for the
+//! regression coverage.
 
 use std::sync::Arc;
 

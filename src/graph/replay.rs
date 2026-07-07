@@ -480,10 +480,37 @@ impl GraphReplayCollector {
                         ..
                     } = &self.commands[idx]
                     {
-                        let nk =
-                            mg.add_node(labels.clone(), properties.clone(), embedding.clone(), 0);
-                        node_map.insert(*node_id, nk);
-                        // Track _key properties for registration after memgraph is returned.
+                        // Dedup skip (P0 fix: graph NodeKey aliasing across
+                        // restart). `node_map` is seeded from loaded CSR
+                        // segments above; if `node_id` is already present,
+                        // this AddNode is a full-history replay of a node
+                        // that is ALREADY resident in the frozen tier (the
+                        // pre-crash WAL was never truncated for it). Calling
+                        // `mg.add_node` again would duplicate the node in
+                        // the mutable tier (double enumeration via
+                        // `for_each_visible_node`, which has no dedup) even
+                        // though the fresh-vs-persisted key collision itself
+                        // is now impossible (see `node_id_watermark` /
+                        // `MemGraph::with_id_offset`). Keep the CSR-seeded
+                        // identity and skip the insert.
+                        let nk = if let Some(&existing) = node_map.get(node_id) {
+                            existing
+                        } else {
+                            let nk = mg.add_node(
+                                labels.clone(),
+                                properties.clone(),
+                                embedding.clone(),
+                                0,
+                            );
+                            node_map.insert(*node_id, nk);
+                            nk
+                        };
+                        // Track _key properties for registration after memgraph is
+                        // returned. Re-derived even for dedup-skipped (CSR-resident)
+                        // nodes: `key_to_node` is in-memory only and is not itself
+                        // reloaded from CSR, so a node's `_key` mapping would
+                        // otherwise be lost whenever its AddNode is replayed against
+                        // an already-seeded id.
                         for (prop_id, prop_val) in properties {
                             if *prop_id == key_prop_id {
                                 if let PropertyValue::String(s) = prop_val {

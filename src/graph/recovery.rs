@@ -15,8 +15,28 @@ use std::sync::Arc;
 
 use crate::graph::csr::{CsrError, CsrStorage};
 use crate::graph::manifest::GraphManifest;
+use crate::graph::memgraph::MemGraph;
 use crate::graph::segment::GraphSegmentList;
 use crate::graph::store::GraphStore;
+
+/// Compute the NodeKey index-space watermark for a set of loaded CSR
+/// segments: one past the largest SlotMap index component among all
+/// persisted `NodeMeta::external_id`s. Passed to `MemGraph::with_id_offset`
+/// so that replay (or any post-recovery write) can never mint a NodeKey
+/// that aliases a persisted external_id -- see `MemGraph::with_id_offset`
+/// for the full soundness argument. Zero (no offset) when there are no
+/// loaded segments -- there is nothing to alias against.
+fn node_id_watermark(segments: &[Arc<CsrStorage>]) -> u32 {
+    segments
+        .iter()
+        .flat_map(|seg| seg.node_meta().iter())
+        // KeyData::as_ffi() packs the SlotMap index in the low 32 bits
+        // (version occupies the high 32 bits) -- `as u32` truncation
+        // extracts exactly that index component.
+        .map(|meta| meta.external_id as u32)
+        .max()
+        .map_or(0, |max_idx| max_idx.saturating_add(1))
+}
 
 /// Result of graph recovery for a single shard.
 pub struct GraphRecoveryResult {
@@ -147,11 +167,19 @@ pub fn recover_graph_store(
             }
         }
 
-        // Inject loaded segments into the graph's segment holder.
+        // Inject loaded segments into the graph's segment holder, and
+        // fast-forward the mutable tier's key allocator (P0 fix: graph
+        // NodeKey aliasing across restart). At this point `graph.segments`
+        // still holds the pristine fresh MemGraph `create_graph` built via
+        // `GraphStore::load_metadata` -- nothing has written to it yet, so
+        // it is safe to replace outright rather than merge.
         if let Some(graph) = store.get_graph_mut(graph_name.as_bytes()) {
-            let current = graph.segments.load();
+            let watermark = node_id_watermark(&loaded_segments);
             graph.segments.swap(GraphSegmentList {
-                mutable: current.mutable.clone(),
+                mutable: Some(Arc::new(MemGraph::with_id_offset(
+                    graph.edge_threshold,
+                    watermark,
+                ))),
                 immutable: loaded_segments,
             });
         }
