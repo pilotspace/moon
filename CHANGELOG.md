@@ -13,7 +13,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   on Windows, breaking the main-push Windows check (PRs never caught it —
   Windows CI is skipped on PRs). Now cfg-split: unix keeps the errno match,
   Windows matches WSAEMFILE (10024) / WSAENOBUFS (10055) /
-  `ErrorKind::OutOfMemory`.
+  `ErrorKind::OutOfMemory`. Follow-up: the module's unit test
+  (`resource_exhaustion_classification`) also referenced `libc` errnos —
+  now cfg-split the same way (unix errnos vs WSA codes).
 
 ### Changed — AOF writer coalesces each group-commit batch into one write (PR #TBD)
 
