@@ -768,6 +768,13 @@ pub(crate) const CROSS_SHARD_PUSH_BACKOFF: std::time::Duration =
 pub(crate) const CROSS_SHARD_PUSH_MAX_RETRIES: u32 = 5_000;
 
 /// Outcome of a bounded cross-shard SPSC push ([`push_with_backpressure`], F3).
+///
+/// `#[must_use]`: on `Backpressure` the message was DROPPED (including any
+/// embedded reply sender). Reply-carrying call sites may discard with
+/// `let _ =` — their `reply_rx.recv()` observes the closed channel and fails
+/// loud — but fire-and-forget or side-effect-bearing sites (txn materialize,
+/// rollback) must branch on the outcome explicitly.
+#[must_use]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PushOutcome {
     /// The target ring accepted the message.

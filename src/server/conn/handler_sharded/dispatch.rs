@@ -148,7 +148,7 @@ pub(super) fn try_handle_client_command(
                     .collect();
                 match crate::client_registry::parse_kill_args(&raw_args) {
                     Some(filter) => {
-                        let count = crate::client_registry::kill_clients(&filter);
+                        let count = crate::client_registry::kill_clients(&filter, Some(client_id));
                         responses.push(Frame::Integer(count as i64));
                     }
                     None => {

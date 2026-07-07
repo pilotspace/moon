@@ -144,6 +144,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the registry read lock, and a connection's `RegistryGuard` deregisters (needs
   the write lock) strictly before its stream drops — so a visible entry always
   has a live fd. No-op on non-unix (`CLIENT KILL` stays cooperative there).
+  Self-kill (the filter matching the executing connection) stays cooperative —
+  flag only, no fd shutdown — so the `+count` reply is still delivered before
+  the handler closes, matching Redis's reply-first self-kill semantics.
 - **R-2 — inline-command length cap** (`src/protocol/inline.rs`,
   `frame.rs`): the RESP-less inline path had no maximum line length, so a
   client that never sends `\r\n` (raw non-RESP bytes) grew the connection read
@@ -162,15 +165,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the same budget as `push_with_backpressure`) returning `PushOutcome`. On
   give-up the message is dropped; reply-carrying callers observe the closed
   reply channel and synthesize a per-shard error via the path they already
-  handle.
+  handle. `PushOutcome` is `#[must_use]` so no call site can drop a message
+  silently by accident, and the two side-effect-bearing senders fail loud:
+  a dropped `MqTxnMaterialize` leg turns `TXN.COMMIT`'s reply into an explicit
+  `MOONERR TXN.COMMIT partial` error (the commit is already WAL-durable; only
+  foreign MQ materialization was lost) and a dropped `GraphRollback` logs at
+  `error!`. A brief bounded spin (≤64 iterations) before the first timed
+  backoff preserves the old ~10µs-class latency when the target ring is only
+  transiently full (the 100µs timer sleep may round up to ~1ms).
 - **R-4 — accept-loop backoff on fd exhaustion** (`src/server/accept_backoff.rs`,
   `listener.rs`, `shard/event_loop.rs`): all six socket-accept loops (tokio
   and monoio; sharded, non-sharded, and TLS) retried `accept()` errors with
   zero backoff, so `EMFILE`/`ENFILE` under a connection storm pinned a shard
   core at 100% and flooded the log. Added `AcceptBackoff`: capped exponential
-  backoff (1 ms → 1 s) on resource-exhaustion errors only, plus rate-limited
+  backoff (1 ms → 100 ms) on resource-exhaustion errors only, plus rate-limited
   logging; benign per-connection errors (e.g. `ECONNABORTED`) log without
-  sleeping. The io_uring multishot-accept resubmit (opt-in `MOON_URING=1`
+  sleeping. The cap is 100 ms (not 1 s) because the sleep runs inside `select!`
+  arms where the shutdown branch cannot preempt it — this bounds shutdown
+  latency during a storm. The io_uring multishot-accept resubmit (opt-in `MOON_URING=1`
   bridge) is documented as a scoped follow-up (synchronous CQE handler, no
   async context to sleep in).
 

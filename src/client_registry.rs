@@ -206,7 +206,13 @@ pub fn client_info(id: u64) -> Option<String> {
 /// parked in `read().await` — idle with `timeout 0` — is torn down at once
 /// rather than lingering until it next sends bytes. The parked read returns
 /// `Ok(0)`/`Err`, which the handler already treats as disconnect.
-pub fn kill_clients(filter: &KillFilter) -> u64 {
+///
+/// `self_id` is the id of the connection *executing* CLIENT KILL, if any.
+/// A matching self entry gets the cooperative flag only — never the fd
+/// shutdown — so the `+count` reply is still delivered before the handler's
+/// per-batch kill check closes the connection (Redis replies first on
+/// self-kill, then closes).
+pub fn kill_clients(filter: &KillFilter, self_id: Option<u64>) -> u64 {
     // Hold the read lock across the whole loop. This is what makes the raw-fd
     // `shutdown` free of a use-after-reuse race: a connection's `RegistryGuard`
     // (a local) drops — and calls `deregister`, which needs the registry WRITE
@@ -224,7 +230,11 @@ pub fn kill_clients(filter: &KillFilter) -> u64 {
         };
         if matches {
             entry.live.kill_flag.store(true, Ordering::Relaxed);
-            force_close_fd(entry.live.kill_fd);
+            // Self-kill stays cooperative: shutting down our own socket here
+            // would happen mid-command, before the reply is flushed.
+            if self_id != Some(entry.id) {
+                force_close_fd(entry.live.kill_fd);
+            }
             count += 1;
         }
     }
@@ -343,7 +353,7 @@ mod tests {
         let live = register(id, "10.0.0.2:6000".into(), "bob".into(), 0, -1);
         assert!(!is_killed(id));
         assert!(!live.is_killed());
-        let count = kill_clients(&KillFilter::Id(id));
+        let count = kill_clients(&KillFilter::Id(id), None);
         assert_eq!(count, 1);
         assert!(is_killed(id));
         assert!(live.is_killed(), "live handle observes the kill lock-free");
@@ -371,7 +381,7 @@ mod tests {
             killed_end.as_raw_fd(),
         );
 
-        let count = kill_clients(&KillFilter::Id(id));
+        let count = kill_clients(&KillFilter::Id(id), None);
         assert_eq!(count, 1);
         assert!(live.is_killed());
 
@@ -384,13 +394,51 @@ mod tests {
         drop(killed_end);
     }
 
+    // Self-kill (CLIENT KILL matching the executing connection) must stay
+    // cooperative: the fd is NOT shut down, so the `+count` reply can still be
+    // flushed; only the kill_flag is set (handler closes after the batch).
+    #[cfg(unix)]
+    #[test]
+    fn test_self_kill_does_not_force_close_socket_fd() {
+        use std::io::{Read, Write};
+        use std::os::unix::io::AsRawFd;
+        use std::os::unix::net::UnixStream;
+
+        let (self_end, mut peer) = UnixStream::pair().expect("socketpair");
+        let id = 999_021;
+        let live = register(
+            id,
+            "unix:socketpair-self".into(),
+            "default".into(),
+            0,
+            self_end.as_raw_fd(),
+        );
+
+        let count = kill_clients(&KillFilter::Id(id), Some(id));
+        assert_eq!(count, 1);
+        assert!(live.is_killed(), "cooperative flag must still be set");
+
+        // The socket must remain writable in both directions — the reply to
+        // the killer is flushed over exactly this fd after kill_clients runs.
+        (&self_end)
+            .write_all(b"+1\r\n")
+            .expect("self fd must still accept the reply write");
+        let mut buf = [0u8; 8];
+        let n = peer.read(&mut buf).expect("peer read");
+        assert_eq!(n, 4, "peer must receive the reply, not EOF");
+        assert_eq!(&buf[..4], b"+1\r\n");
+
+        deregister(id);
+        drop(self_end);
+    }
+
     #[test]
     fn test_kill_by_user() {
         let id1 = 999_010;
         let id2 = 999_011;
         register(id1, "10.0.0.3:7000".into(), "eve".into(), 0, -1);
         register(id2, "10.0.0.4:7001".into(), "eve".into(), 1, -1);
-        let count = kill_clients(&KillFilter::User("eve".into()));
+        let count = kill_clients(&KillFilter::User("eve".into()), None);
         assert_eq!(count, 2);
         assert!(is_killed(id1));
         assert!(is_killed(id2));

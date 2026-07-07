@@ -195,7 +195,7 @@ async fn run_remote(
         commands: vec![(routing_key.clone(), command)],
         reply_tx,
     };
-    spsc_send(dispatch_tx, my_shard, target_shard, msg, spsc_notifiers).await;
+    let _ = spsc_send(dispatch_tx, my_shard, target_shard, msg, spsc_notifiers).await;
     match reply_rx.recv().await {
         Ok(mut frames) if !frames.is_empty() => frames.swap_remove(0),
         _ => Frame::Error(Bytes::from_static(b"ERR cross-shard reply channel closed")),
@@ -503,7 +503,7 @@ async fn coordinate_bitop(
                 commands,
                 reply_tx,
             };
-            spsc_send(dispatch_tx, my_shard, *shard_id, msg, spsc_notifiers).await;
+            let _ = spsc_send(dispatch_tx, my_shard, *shard_id, msg, spsc_notifiers).await;
             pending.push((indices, reply_rx));
         }
     }
@@ -845,6 +845,28 @@ async fn spsc_send_bounded(
         Err(val) => pending = val,
     }
 
+    // Brief spin before the first timed sleep: the consumer is another OS
+    // thread actively draining, so a transiently-full ring often frees a slot
+    // within nanoseconds — far below the 100µs backoff (which runtime timers
+    // may round up to ~1ms). This preserves the old 10µs-class latency for
+    // bursty-but-healthy targets without touching the wedged-target budget.
+    // Bounded and tiny (≤64 iterations), so it cannot convoy siblings the way
+    // an unbounded reply-side spin did (see the C2 solo-conn gate lesson).
+    for _ in 0..64 {
+        std::hint::spin_loop();
+        let push_result = {
+            let mut producers = dispatch_tx.borrow_mut();
+            producers[target_idx].try_push(pending)
+        };
+        match push_result {
+            Ok(()) => {
+                spsc_notifiers[target_shard].notify_one();
+                return PushOutcome::Pushed;
+            }
+            Err(val) => pending = val,
+        }
+    }
+
     // Bounded retry with backoff.
     for _ in 0..max_retries {
         // Back off before retrying so a full ring cannot hot-spin the core.
@@ -953,7 +975,7 @@ async fn coordinate_mget(
                 commands,
                 reply_tx,
             };
-            spsc_send(dispatch_tx, my_shard, *shard_id, msg, spsc_notifiers).await;
+            let _ = spsc_send(dispatch_tx, my_shard, *shard_id, msg, spsc_notifiers).await;
             pending_shards.push((original_indices, reply_rx));
         }
     }
@@ -1083,7 +1105,7 @@ async fn coordinate_mset(
                 commands,
                 reply_tx,
             };
-            spsc_send(dispatch_tx, my_shard, *shard_id, msg, spsc_notifiers).await;
+            let _ = spsc_send(dispatch_tx, my_shard, *shard_id, msg, spsc_notifiers).await;
             pending_shards.push(reply_rx);
         }
     }
@@ -1321,7 +1343,7 @@ async fn coordinate_multi_del_or_exists(
                 commands,
                 reply_tx,
             };
-            spsc_send(dispatch_tx, my_shard, *shard_id, msg, spsc_notifiers).await;
+            let _ = spsc_send(dispatch_tx, my_shard, *shard_id, msg, spsc_notifiers).await;
             pending_shards.push(reply_rx);
         }
     }
@@ -1402,7 +1424,7 @@ pub async fn coordinate_keys(
             command: std::sync::Arc::new(cmd_frame),
             reply_tx,
         };
-        spsc_send(dispatch_tx, my_shard, target, msg, spsc_notifiers).await;
+        let _ = spsc_send(dispatch_tx, my_shard, target, msg, spsc_notifiers).await;
         pending_shards.push(reply_rx);
     }
 
@@ -1491,7 +1513,7 @@ pub async fn coordinate_scan(
             command: std::sync::Arc::new(cmd_frame),
             reply_tx,
         };
-        spsc_send(dispatch_tx, my_shard, target_shard_id, msg, spsc_notifiers).await;
+        let _ = spsc_send(dispatch_tx, my_shard, target_shard_id, msg, spsc_notifiers).await;
         match reply_rx.recv().await {
             Ok(frame) => frame,
             Err(_) => Frame::Error(Bytes::from_static(
@@ -1573,7 +1595,7 @@ pub async fn coordinate_dbsize(
             command: std::sync::Arc::new(cmd_frame),
             reply_tx,
         };
-        spsc_send(dispatch_tx, my_shard, target, msg, spsc_notifiers).await;
+        let _ = spsc_send(dispatch_tx, my_shard, target, msg, spsc_notifiers).await;
         pending_shards.push(reply_rx);
     }
 
@@ -1633,7 +1655,7 @@ pub async fn coordinate_hotkeys(
             command: std::sync::Arc::new(cmd_frame),
             reply_tx,
         };
-        spsc_send(dispatch_tx, my_shard, target, msg, spsc_notifiers).await;
+        let _ = spsc_send(dispatch_tx, my_shard, target, msg, spsc_notifiers).await;
         pending_shards.push(reply_rx);
     }
 
@@ -1718,7 +1740,7 @@ pub async fn scatter_vector_search(
                     as_of_lsn,
                     reply_tx,
                 }));
-            spsc_send(dispatch_tx, my_shard, shard_id, msg, spsc_notifiers).await;
+            let _ = spsc_send(dispatch_tx, my_shard, shard_id, msg, spsc_notifiers).await;
             receivers.push(reply_rx);
         }
     }
@@ -1796,7 +1818,7 @@ pub async fn scatter_vector_search_remote(
                 as_of_lsn,
                 reply_tx,
             }));
-        spsc_send(dispatch_tx, my_shard, shard_id, msg, spsc_notifiers).await;
+        let _ = spsc_send(dispatch_tx, my_shard, shard_id, msg, spsc_notifiers).await;
         receivers.push(reply_rx);
     }
 
@@ -1846,7 +1868,7 @@ pub async fn broadcast_vector_command(
             command: command.clone(),
             reply_tx,
         };
-        spsc_send(dispatch_tx, my_shard, target, msg, spsc_notifiers).await;
+        let _ = spsc_send(dispatch_tx, my_shard, target, msg, spsc_notifiers).await;
         receivers.push(reply_rx);
     }
 
@@ -1942,7 +1964,7 @@ pub async fn scatter_invalidate_range(
             command: command.clone(),
             reply_tx,
         };
-        spsc_send(dispatch_tx, my_shard, target, msg, spsc_notifiers).await;
+        let _ = spsc_send(dispatch_tx, my_shard, target, msg, spsc_notifiers).await;
         receivers.push(reply_rx);
     }
 
@@ -2022,7 +2044,7 @@ pub async fn scatter_ft_info(
             command: command.clone(),
             reply_tx,
         };
-        spsc_send(dispatch_tx, my_shard, target, msg, spsc_notifiers).await;
+        let _ = spsc_send(dispatch_tx, my_shard, target, msg, spsc_notifiers).await;
         receivers.push(reply_rx);
     }
 
@@ -2194,7 +2216,7 @@ pub async fn scatter_text_search(
                 field_queries: field_queries.clone(),
                 reply_tx,
             };
-            spsc_send(dispatch_tx, my_shard, shard_id, msg, spsc_notifiers).await;
+            let _ = spsc_send(dispatch_tx, my_shard, shard_id, msg, spsc_notifiers).await;
             doc_freq_receivers.push(reply_rx);
         }
     }
@@ -2282,7 +2304,7 @@ pub async fn scatter_text_search(
                     summarize_opts: summarize_opts.clone(),
                     reply_tx,
                 }));
-            spsc_send(dispatch_tx, my_shard, shard_id, msg, spsc_notifiers).await;
+            let _ = spsc_send(dispatch_tx, my_shard, shard_id, msg, spsc_notifiers).await;
             search_receivers.push(reply_rx);
         }
     }
@@ -2401,7 +2423,7 @@ pub async fn scatter_text_search_filter(
                     reply_tx,
                 },
             ));
-            spsc_send(dispatch_tx, my_shard, shard_id, msg, spsc_notifiers).await;
+            let _ = spsc_send(dispatch_tx, my_shard, shard_id, msg, spsc_notifiers).await;
             receivers.push(reply_rx);
         }
     }
@@ -2518,7 +2540,7 @@ pub async fn coordinate_swapdb(
         }
         let (reply_tx, reply_rx) = channel::oneshot();
         let msg = ShardMessage::SwapDb { a, b, reply_tx };
-        spsc_send(dispatch_tx, my_shard, target, msg, spsc_notifiers).await;
+        let _ = spsc_send(dispatch_tx, my_shard, target, msg, spsc_notifiers).await;
         receivers.push(reply_rx);
     }
 

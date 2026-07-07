@@ -126,6 +126,10 @@ pub(super) async fn try_handle_txn_commit(
                             crate::shard::dispatch::key_to_shard(&intent.queue_key, ctx.num_shards);
                         by_shard.entry(owner).or_default().push(intent);
                     }
+                    // The commit is already WAL-durable here: a dropped foreign
+                    // leg cannot fail the commit, but it must fail LOUD at the
+                    // client — never a silent `+OK` with lost MQ messages.
+                    let mut mq_lost: Option<(usize, usize)> = None; // (shard, intents)
                     for (owner, intents) in by_shard {
                         if owner == ctx.shard_id {
                             // Self: apply locally via slice.
@@ -141,13 +145,14 @@ pub(super) async fn try_handle_txn_commit(
                             });
                         } else {
                             // Foreign: send MqTxnMaterialize hop and await ack.
+                            let intent_count = intents.len();
                             let (reply_tx, reply_rx) = crate::runtime::channel::oneshot();
                             let msg = crate::shard::dispatch::ShardMessage::MqTxnMaterialize {
                                 db_index: conn.selected_db as usize,
                                 intents,
                                 reply_tx,
                             };
-                            crate::shard::coordinator::spsc_send(
+                            let outcome = crate::shard::coordinator::spsc_send(
                                 &ctx.dispatch_tx,
                                 ctx.shard_id,
                                 owner,
@@ -155,9 +160,30 @@ pub(super) async fn try_handle_txn_commit(
                                 &ctx.spsc_notifiers,
                             )
                             .await;
+                            if outcome != crate::shard::dispatch::PushOutcome::Pushed {
+                                // Dropped: the intents were NEVER delivered.
+                                tracing::error!(
+                                    owner,
+                                    intent_count,
+                                    "TXN.COMMIT MQ materialize: dispatch backpressure — \
+                                     intents dropped, commit reported as partial"
+                                );
+                                mq_lost.get_or_insert((owner, intent_count));
+                                continue;
+                            }
                             // Await the ack before replying OK to the client.
                             let _ = reply_rx.recv().await;
                         }
+                    }
+                    if let Some((owner, intent_count)) = mq_lost {
+                        // KV/vector/graph legs ARE committed and durable; only
+                        // foreign MQ materialization was lost.
+                        responses.push(Frame::Error(Bytes::from(format!(
+                            "MOONERR TXN.COMMIT partial: committed, but {intent_count} \
+                             MQ intent(s) for shard {owner} were dropped under \
+                             dispatch backpressure"
+                        ))));
+                        return true;
                     }
                 }
 
@@ -265,7 +291,7 @@ pub(super) async fn try_handle_temporal_invalidate(
                             command: std::sync::Arc::new(frame.clone()),
                             reply_tx,
                         };
-                        crate::shard::coordinator::spsc_send(
+                        let _ = crate::shard::coordinator::spsc_send(
                             &ctx.dispatch_tx,
                             ctx.shard_id,
                             owner,

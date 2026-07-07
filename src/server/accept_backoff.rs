@@ -10,15 +10,20 @@
 //! the project's own gotchas.
 //!
 //! [`AcceptBackoff`] rate-limits the error log and, for resource-exhaustion
-//! errors only, sleeps a capped exponential backoff (1ms → 1s). Benign
+//! errors only, sleeps a capped exponential backoff (1ms → 100ms). The cap is
+//! deliberately modest: several accept loops sleep *inside* a `select!` arm,
+//! where the shutdown branch cannot fire mid-sleep — 100ms bounds shutdown
+//! latency during a storm while still cutting the spin to ≤10 wakeups/s. Benign
 //! per-connection errors (a client that reset mid-handshake, `ECONNABORTED`)
 //! are logged but not slept on, so normal accept throughput is unaffected.
 //! Call [`AcceptBackoff::reset`] after every successful `accept()`.
 
 use std::time::Duration;
 
-/// Ceiling for the exponential backoff (1 second).
-const MAX_BACKOFF_MS: u64 = 1000;
+/// Ceiling for the exponential backoff (100ms). Bounded well below the
+/// shutdown-responsiveness budget because the sleep runs inside `select!`
+/// arms where cancellation cannot preempt it.
+const MAX_BACKOFF_MS: u64 = 100;
 
 /// Per-accept-loop backoff + log rate-limiter. One per accept loop; reset on
 /// every successful accept so a transient error never permanently slows the
@@ -99,9 +104,10 @@ mod tests {
         assert_eq!(backoff_for(2), Duration::from_millis(2));
         assert_eq!(backoff_for(3), Duration::from_millis(4));
         assert_eq!(backoff_for(4), Duration::from_millis(8));
-        // Caps at 1s and stays there regardless of streak length.
-        assert_eq!(backoff_for(11), Duration::from_millis(1000));
-        assert_eq!(backoff_for(1000), Duration::from_millis(1000));
+        // Caps at 100ms (shutdown-responsiveness bound) regardless of streak.
+        assert_eq!(backoff_for(8), Duration::from_millis(100));
+        assert_eq!(backoff_for(11), Duration::from_millis(100));
+        assert_eq!(backoff_for(1000), Duration::from_millis(100));
     }
 
     #[test]
