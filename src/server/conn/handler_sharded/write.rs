@@ -669,8 +669,14 @@ pub(super) async fn try_handle_graph_command(
                 let records = s.graph_store.drain_wal();
                 (resp, records, cypher_intents, undo_ops)
             } else {
-                let resp =
-                    crate::command::graph::dispatch_graph_read(&s.graph_store, cmd, cmd_args);
+                // Task #32: connection-local read path -- `conn.protocol_version`
+                // is known here, so the Cypher result cache is wired in.
+                let resp = crate::command::graph::dispatch_graph_read(
+                    &s.graph_store,
+                    cmd,
+                    cmd_args,
+                    Some(conn.protocol_version),
+                );
                 (resp, Vec::new(), Vec::new(), Vec::new())
             }
         });

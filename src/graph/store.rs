@@ -47,9 +47,33 @@ pub struct NamedGraph {
     /// Redis key → NodeKey mapping for O(1) lookup during graph expansion.
     /// Populated when a node has a `_key` property linking it to a Redis HASH key.
     pub key_to_node: HashMap<Bytes, crate::graph::types::NodeKey>,
+    /// Per-graph write generation (Task #32, result cache Part A). Bumped by
+    /// every mutation that changes this graph's query-visible state:
+    /// `GRAPH.ADDNODE`, `GRAPH.ADDEDGE`, a Cypher write query that produced
+    /// at least one mutation record, `TEMPORAL.INVALIDATE`, and a
+    /// `TXN.ABORT` rollback that touched this graph. Deliberately NOT bumped
+    /// by `freeze_and_compact` (storage-tier reorg, identical logical
+    /// content) or `GRAPH.CREATE`/`GRAPH.DELETE` (no cached query can exist
+    /// yet, or the whole `NamedGraph` -- and its cache -- is dropped with
+    /// it). Plain `u64` (not atomic): `NamedGraph` is shard-owned and
+    /// single-threaded, matching every other field here.
+    pub write_gen: u64,
+    /// Cypher result cache: `(query hash, args hash) -> pre-encoded RESP
+    /// reply`, invalidated by `write_gen`. See
+    /// `crate::graph::cypher::result_cache` module docs for the full design.
+    pub result_cache: parking_lot::Mutex<crate::graph::cypher::result_cache::ResultCache>,
 }
 
 impl NamedGraph {
+    /// Bump the write generation after a mutation that changes this graph's
+    /// query-visible state. Called at exactly the sites enumerated in the
+    /// `write_gen` field doc comment -- see module docs for the full
+    /// enumeration and the "must NOT invalidate" freeze/compact exception.
+    #[inline]
+    pub fn touch(&mut self) {
+        self.write_gen = self.write_gen.wrapping_add(1);
+    }
+
     /// Returns true if the mutable write buffer has exceeded the edge threshold
     /// and should be frozen + compacted into an immutable CSR segment.
     pub fn should_compact(&self) -> bool {
@@ -356,6 +380,13 @@ impl GraphStore {
                     1024,
                 )),
                 key_to_node: HashMap::new(),
+                write_gen: 0,
+                result_cache: parking_lot::Mutex::new(
+                    crate::graph::cypher::result_cache::ResultCache::new(
+                        crate::graph::cypher::result_cache::DEFAULT_MAX_ENTRIES,
+                        crate::graph::cypher::result_cache::DEFAULT_MAX_BYTES,
+                    ),
+                ),
             },
         );
         // Bump version AFTER successful graph creation (monotonicity-on-success
@@ -415,7 +446,11 @@ impl GraphStore {
     /// Resident bytes across all named graphs on this shard.
     ///
     /// Sums mutable write-buffer (MemGraph slot maps) + immutable CSR segments
-    /// (row_offsets + col_indices + edge/node metadata). O(graph_count * segment_count).
+    /// (row_offsets + col_indices + edge/node metadata) + the Cypher result
+    /// cache (Task #32 -- see `csr/storage.rs::resident_bytes` doc comment
+    /// for why a lazily-populated, per-graph cache MUST be counted here: an
+    /// invisible cache is exactly the class of bug the RSS/OOM hardening
+    /// waves were built to catch). O(graph_count * segment_count).
     pub fn resident_bytes(&self) -> usize {
         let map = match &self.graphs {
             Some(m) => m,
@@ -425,6 +460,8 @@ impl GraphStore {
         for graph in map.values() {
             // Mutable write buffer.
             total += graph.write_buf.resident_bytes();
+            // Cypher result cache.
+            total += graph.result_cache.lock().resident_bytes();
             // Immutable CSR segments.
             let snapshot = graph.segments.load();
             for csr in &snapshot.immutable {

@@ -118,6 +118,77 @@ fn query_guard(
     })
 }
 
+/// Cheap pre-check for the Cypher result cache (Task #32): does this
+/// GRAPH.QUERY carry a `--decay` flag? Decay queries are wall-clock
+/// dependent (`TemporalDecayScorer::now` captures real time at query start,
+/// not derived from graph state) and must NEVER be cached regardless of
+/// `write_gen` -- two decay queries at different real times against an
+/// unchanged graph legitimately score/order differently. Byte-scan only
+/// (not a full `parse_decay`) so a miss on this check costs nothing on the
+/// hot path; `parse_decay`'s stricter validation still runs later in
+/// `run_read_query` regardless of this pre-check's answer.
+fn has_decay_flag(args: &[Frame]) -> bool {
+    args.iter()
+        .any(|f| matches!(f, Frame::BulkString(b) if b.as_ref() == b"--decay"))
+}
+
+/// Hash the "remaining args" (everything after the graph name and Cypher
+/// text -- `--params`, `VALID_AT`, `TIMEOUT`, `--decay`, `--time-weight`)
+/// for the Cypher result-cache key (Task #32). Allocation-free: each arg's
+/// logical byte content is hashed independently via `xxh64` and folded,
+/// rather than concatenated into one buffer first. Order-sensitive (a
+/// differently-ordered but semantically-identical arg list gets a different
+/// key) -- a harmless false split of the key space, never a correctness
+/// issue, since a miss just re-executes and re-populates.
+fn hash_query_args(args: &[Frame]) -> u64 {
+    let mut acc: u64 = 0;
+    for frame in args {
+        acc = acc.rotate_left(13) ^ hash_frame_bytes(frame);
+    }
+    acc
+}
+
+/// `xxh64` of a single `Frame`'s logical byte content, used only for
+/// result-cache key derivation -- NOT a wire format. Numeric/boolean
+/// variants hash their shortest text representation (stack-buffer
+/// `itoa`/`ryu`, no allocation) rather than their binary encoding; hash
+/// collisions across variants are harmless because `ResultCacheKey`
+/// equality is a plain struct compare, not the hash alone -- a collision
+/// only costs a wasted cache miss, never a wrong answer.
+fn hash_frame_bytes(frame: &Frame) -> u64 {
+    match frame {
+        Frame::BulkString(b) | Frame::SimpleString(b) => cypher::planner::hash_query(b),
+        Frame::Integer(n) => {
+            let mut buf = itoa::Buffer::new();
+            cypher::planner::hash_query(buf.format(*n).as_bytes())
+        }
+        Frame::Double(f) => {
+            let mut buf = ryu::Buffer::new();
+            cypher::planner::hash_query(buf.format(*f).as_bytes())
+        }
+        Frame::Boolean(b) => {
+            cypher::planner::hash_query(if *b { b"\x01true" } else { b"\x01false" })
+        }
+        Frame::Null => cypher::planner::hash_query(b"\x01null"),
+        _ => cypher::planner::hash_query(b"\x01other"),
+    }
+}
+
+/// Build the Cypher result-cache key (Task #32) for `cypher_bytes` (the raw
+/// query text, `args[1]`) and `rest_args` (everything after it, `args[2..]`
+/// -- `--params`/`VALID_AT`/`TIMEOUT`/`--decay`/`--time-weight`). Shared by
+/// the pre-lookup in `graph_query_readonly` and the population step in
+/// `run_read_query` so both sides always compute the identical key.
+fn result_cache_key(
+    cypher_bytes: &[u8],
+    rest_args: &[Frame],
+) -> cypher::result_cache::ResultCacheKey {
+    cypher::result_cache::ResultCacheKey {
+        query_hash: cypher::planner::hash_query(cypher_bytes),
+        args_hash: hash_query_args(rest_args),
+    }
+}
+
 /// Parse `--params <json_object>` from GRAPH.QUERY args into executor `Value` map.
 ///
 /// Scans args for `--params` keyword followed by a JSON string. The JSON must be
@@ -519,12 +590,22 @@ fn parse_effective(
 /// execute`, which rebuilds one every call) so plan-cache hits reuse the
 /// `SlotTable` cached alongside the plan (Fix 2 -- one `String` allocation
 /// per bound variable, per execution, otherwise).
+///
+/// `cache_protocol_version` (Task #32): `Some(v)` enables result-cache
+/// POPULATION after a successful execution, encoding the reply for RESP
+/// version `v` (2 or 3) into `graph.result_cache`. `None` means this call
+/// site is not wired into the result cache at all (e.g. `graph_query_or_
+/// write`'s read branches -- see module docs for the scope boundary): no
+/// lookup happens here regardless (a hit is handled entirely by the
+/// caller, BEFORE `run_read_query` is invoked at all -- this function only
+/// ever runs on a miss), so `None` just skips the population step.
 fn run_read_query(
     graph: &crate::graph::store::NamedGraph,
     args: &[Frame],
     plan: &cypher::PhysicalPlan,
     slots: &cypher::executor::SlotTable,
     auto_params: Vec<(String, cypher::executor::Value)>,
+    cache_protocol_version: Option<u8>,
 ) -> Frame {
     let mut params = parse_params(args);
     for (name, value) in auto_params {
@@ -545,8 +626,45 @@ fn run_read_query(
         guard: Some(guard),
         ..Default::default()
     };
+    // Race guard (Task #32): capture the write generation BEFORE execution,
+    // store only if it is still unchanged AFTER -- on this shard thread
+    // nothing else can mutate `graph` while this synchronous call is
+    // running, but capturing before/comparing after costs one extra `u64`
+    // read and keeps the invariant correct-by-construction even if this
+    // function ever grows a yield point.
+    let write_gen_before = graph.write_gen;
     match cypher::executor::execute_with_slots(graph, plan, slots, &params, &ctx) {
-        Ok(r) => exec_result_to_frame(&r),
+        Ok(r) => {
+            if let Some(protocol_version) = cache_protocol_version {
+                // Never cache decay queries (wall-clock dependent) or a
+                // result computed against a graph state that mutated
+                // mid-call (write_gen_before must still hold).
+                if decay.is_none()
+                    && graph.write_gen == write_gen_before
+                    && !args.is_empty()
+                    && args.len() >= 2
+                {
+                    if let Some(cypher_bytes) = extract_bulk(&args[1]) {
+                        let key = result_cache_key(cypher_bytes, &args[2..]);
+                        let frame = exec_result_to_frame(&r);
+                        let mut buf = bytes::BytesMut::new();
+                        if protocol_version >= 3 {
+                            crate::protocol::serialize_resp3(&frame, &mut buf);
+                        } else {
+                            crate::protocol::serialize(&frame, &mut buf);
+                        }
+                        graph.result_cache.lock().put(
+                            key,
+                            write_gen_before,
+                            protocol_version,
+                            buf.freeze(),
+                        );
+                        return frame;
+                    }
+                }
+            }
+            exec_result_to_frame(&r)
+        }
         Err(e) => {
             let msg = format!("ERR Cypher execution error: {e}");
             Frame::Error(Bytes::from(msg))
@@ -559,15 +677,30 @@ fn run_read_query(
 /// Normalizes literals into auto-parameters, then executes via the plan
 /// cache: a cache hit runs with ZERO parse/compile work (the cache holds
 /// read-only plans only, so a hit is safe to execute directly).
-pub fn graph_query(store: &GraphStore, args: &[Frame]) -> Frame {
-    graph_query_readonly(store, args, false)
+///
+/// `protocol_version` (Task #32): `Some(v)` is the caller's negotiated RESP
+/// version (2 or 3), threaded through to the Cypher result cache so a hit
+/// replays correctly-encoded wire bytes and a miss populates the right
+/// slot. `None` disables the result cache entirely for this call -- used by
+/// call sites that cannot reliably determine the originating connection's
+/// protocol version (e.g. the cross-shard `ShardMessage::GraphCommand` hop);
+/// serving a wrong-protocol cached reply would be a real correctness bug
+/// (RESP2/RESP3 wire formats differ), so those sites opt out rather than
+/// guess.
+pub fn graph_query(store: &GraphStore, args: &[Frame], protocol_version: Option<u8>) -> Frame {
+    graph_query_readonly(store, args, false, protocol_version)
 }
 
 /// Shared read-path core for GRAPH.QUERY / GRAPH.RO_QUERY.
 ///
 /// `reject_writes`: RO_QUERY refuses write clauses with an explicit error;
 /// GRAPH.QUERY lets the read-only executor report them (it has no write lock).
-fn graph_query_readonly(store: &GraphStore, args: &[Frame], reject_writes: bool) -> Frame {
+fn graph_query_readonly(
+    store: &GraphStore,
+    args: &[Frame],
+    reject_writes: bool,
+    protocol_version: Option<u8>,
+) -> Frame {
     if args.len() < 2 {
         return Frame::Error(Bytes::from_static(
             b"ERR wrong number of arguments for 'GRAPH.QUERY' command",
@@ -589,6 +722,19 @@ fn graph_query_readonly(store: &GraphStore, args: &[Frame], reject_writes: bool)
         None => return Frame::Error(Bytes::from_static(b"ERR invalid Cypher query")),
     };
 
+    // Task #32: Cypher result-cache lookup BEFORE any plan-cache/parse work
+    // -- a hit skips plan lookup, param parsing, guard construction, and
+    // execution entirely. Decay queries (wall-clock dependent) never
+    // consult the cache regardless of `write_gen` freshness.
+    if let Some(pv) = protocol_version {
+        if !has_decay_flag(&args[2..]) {
+            let key = result_cache_key(cypher_bytes, &args[2..]);
+            if let Some(bytes) = graph.result_cache.lock().get(key, graph.write_gen, pv) {
+                return Frame::PreSerialized(bytes);
+            }
+        }
+    }
+
     // Raw-hash pre-lookup (Fix 2): an EXACT repeat of a query text we've
     // already compiled hits here without ever calling `parameterize()` (a
     // full lexer pass + Vec/String allocations) — the raw-hash entry
@@ -599,7 +745,14 @@ fn graph_query_readonly(store: &GraphStore, args: &[Frame], reject_writes: bool)
         // parse path, which reports it exactly like an uncached write query.
         if cached.read_only {
             let auto_params = cached.auto_params.as_ref().clone();
-            return run_read_query(graph, args, &cached.plan, &cached.slots, auto_params);
+            return run_read_query(
+                graph,
+                args,
+                &cached.plan,
+                &cached.slots,
+                auto_params,
+                protocol_version,
+            );
         }
     }
 
@@ -612,7 +765,14 @@ fn graph_query_readonly(store: &GraphStore, args: &[Frame], reject_writes: bool)
     let cached = graph.plan_cache.lock().get(query_hash);
     if let Some(cached) = cached {
         if cached.read_only {
-            return run_read_query(graph, args, &cached.plan, &cached.slots, auto_params);
+            return run_read_query(
+                graph,
+                args,
+                &cached.plan,
+                &cached.slots,
+                auto_params,
+                protocol_version,
+            );
         }
     }
 
@@ -651,7 +811,7 @@ fn graph_query_readonly(store: &GraphStore, args: &[Frame], reject_writes: bool)
     } else {
         std::sync::Arc::new(cypher::executor::SlotTable::from_plan(&plan))
     };
-    run_read_query(graph, args, &plan, &slots, auto_params)
+    run_read_query(graph, args, &plan, &slots, auto_params, protocol_version)
 }
 
 /// GRAPH.QUERY <graph> <cypher_string> — write-capable variant.
@@ -830,8 +990,14 @@ pub fn graph_query_write(store: &mut GraphStore, args: &[Frame]) -> Frame {
     }
 
     // Bump version if any mutations were executed (Cypher write query).
+    // Task #32: also invalidate the graph's cached query results -- gated
+    // on `!result.mutations.is_empty()` so an idempotent MERGE match-branch
+    // (zero mutation records) doesn't pay an invalidation for a no-op.
     if !result.mutations.is_empty() {
         store.bump_version();
+        if let Some(graph) = store.get_graph_mut(graph_name) {
+            graph.touch();
+        }
     }
 
     exec_result_to_frame(&result)
@@ -907,7 +1073,12 @@ pub fn graph_query_or_write(
                 );
             };
             return (
-                run_read_query(graph, args, &cached.plan, &cached.slots, auto_params),
+                // Task #32: this auto-routing entry point is NOT wired into
+                // the result cache (`None`) -- see module docs for the
+                // scope boundary (protocol_version is not reliably
+                // available at every caller of `graph_query_or_write`,
+                // e.g. the cross-shard `ShardMessage::GraphCommand` hop).
+                run_read_query(graph, args, &cached.plan, &cached.slots, auto_params, None),
                 Vec::new(),
                 Vec::new(),
             );
@@ -933,7 +1104,8 @@ pub fn graph_query_or_write(
                 );
             };
             return (
-                run_read_query(graph, args, &cached.plan, &cached.slots, auto_params),
+                // Task #32: see the raw-hash branch above -- not wired here.
+                run_read_query(graph, args, &cached.plan, &cached.slots, auto_params, None),
                 Vec::new(),
                 Vec::new(),
             );
@@ -979,7 +1151,8 @@ pub fn graph_query_or_write(
         );
 
         (
-            run_read_query(graph, args, &plan, &slots, auto_params),
+            // Task #32: see the raw-hash branch above -- not wired here.
+            run_read_query(graph, args, &plan, &slots, auto_params, None),
             Vec::new(),
             Vec::new(),
         )
@@ -1207,6 +1380,17 @@ fn execute_write_plan(
         }
     }
 
+    // Task #32: invalidate the graph's cached query results whenever this
+    // write actually produced mutations (mirrors the `graph_query_write`
+    // gate -- an idempotent MERGE match-branch must not pay an
+    // invalidation for a no-op). Runs on both Ok and Err (Phase 174 FIX-02:
+    // `mutations` already includes partial pre-error writes).
+    if !mutations.is_empty() {
+        if let Some(graph) = store.get_graph_mut(graph_name) {
+            graph.touch();
+        }
+    }
+
     // Phase 174 FIX-02: return intents/undo_ops on BOTH Ok and Err paths
     // so TXN.ABORT can roll back partial writes from before the error.
     match result_or_err {
@@ -1220,13 +1404,13 @@ fn execute_write_plan(
 /// Like GRAPH.QUERY but rejects write clauses (CREATE, DELETE, SET, MERGE).
 /// Shares the single-parse read core with GRAPH.QUERY — a plan-cache hit is
 /// read-only by the cache invariant, so no classification re-parse is needed.
-pub fn graph_ro_query(store: &GraphStore, args: &[Frame]) -> Frame {
+pub fn graph_ro_query(store: &GraphStore, args: &[Frame], protocol_version: Option<u8>) -> Frame {
     if args.len() < 2 {
         return Frame::Error(Bytes::from_static(
             b"ERR wrong number of arguments for 'GRAPH.RO_QUERY' command",
         ));
     }
-    graph_query_readonly(store, args, true)
+    graph_query_readonly(store, args, true, protocol_version)
 }
 
 /// GRAPH.EXPLAIN <graph> <cypher_string>

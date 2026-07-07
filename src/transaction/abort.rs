@@ -284,6 +284,10 @@ pub fn apply_graph_rollback(
                         }
                     }
                 }
+                // Task #32: RestoreProperty always changes query-visible
+                // state (either a value flip or a property removal) --
+                // invalidate this graph's cached query results.
+                graph.touch();
             }
             crate::transaction::GraphUndoOp::UndeleteNode {
                 graph_name,
@@ -308,6 +312,9 @@ pub fn apply_graph_rollback(
                 // Un-soft-delete incident edges that were cascade-deleted
                 // at the same LSN by remove_node.
                 graph.write_buf.undelete_edges_at_lsn(nk, *delete_lsn);
+                // Task #32: undelete always changes query-visible state --
+                // invalidate this graph's cached query results.
+                graph.touch();
             }
             crate::transaction::GraphUndoOp::UndeleteEdge {
                 graph_name,
@@ -326,6 +333,9 @@ pub fn apply_graph_rollback(
                     if edge.deleted_lsn != u64::MAX {
                         edge.deleted_lsn = u64::MAX;
                         graph.write_buf.inc_live_edge_count();
+                        // Task #32: only a REAL flip (edge was actually
+                        // deleted) changes query-visible state.
+                        graph.touch();
                     }
                 }
             }
@@ -361,6 +371,11 @@ pub fn apply_graph_rollback(
                         entity_id = intent.entity_id,
                         "txn abort: remove_node returned false (already deleted or invalid key)",
                     );
+                } else {
+                    // Task #32: a create-intent rollback removes an entity
+                    // that a cached query may have already returned rows
+                    // for -- invalidate.
+                    graph.touch();
                 }
             } else {
                 let ek = EdgeKey::from(slotmap::KeyData::from_ffi(intent.entity_id));
@@ -371,6 +386,8 @@ pub fn apply_graph_rollback(
                         entity_id = intent.entity_id,
                         "txn abort: remove_edge returned false (already deleted or invalid key)",
                     );
+                } else {
+                    graph.touch();
                 }
             }
         }

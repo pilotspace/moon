@@ -14,11 +14,13 @@ pub mod lexer;
 pub mod parameterize;
 pub mod parser;
 pub mod planner;
+pub mod result_cache;
 
 pub use ast::{Clause, CypherQuery, Expr};
 pub use executor::{ExecResult, OpProfile, ProfileResult, Value};
 pub use parser::{CypherError, DEFAULT_MAX_NESTING_DEPTH, Parser};
 pub use planner::{CostEstimate, PhysicalPlan, PlanCache, Strategy};
+pub use result_cache::{ResultCache, ResultCacheKey};
 
 /// Parse a Cypher query from a byte slice.
 ///

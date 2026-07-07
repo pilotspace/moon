@@ -141,7 +141,7 @@ fn query_rows(frame: &Frame) -> Vec<Frame> {
 }
 
 fn run_query(store: &GraphStore, cypher: &str) -> Vec<Frame> {
-    query_rows(&graph_query(store, &[bs(GRAPH), bs(cypher)]))
+    query_rows(&graph_query(store, &[bs(GRAPH), bs(cypher)], Some(2)))
 }
 
 /// Flatten a single-column row set into cell frames.
@@ -740,6 +740,7 @@ fn per_query_timeout_aborts_traversal() {
     let r = graph_query(
         &store,
         &[bs(GRAPH), bs(TIMEOUT_QUERY), bs("TIMEOUT"), bs("1")],
+        Some(2),
     );
     let Frame::Error(e) = r else {
         panic!("TIMEOUT 1 must abort the all-pairs traversal, got {r:?}");
@@ -755,6 +756,7 @@ fn timeout_zero_is_unlimited_and_default_completes() {
     let rows = query_rows(&graph_query(
         &store,
         &[bs(GRAPH), bs(TIMEOUT_QUERY), bs("TIMEOUT"), bs("0")],
+        Some(2),
     ));
     assert!(!rows.is_empty(), "chain must yield shortest paths");
     // No TIMEOUT arg: configured default (30s) — also completes.
@@ -774,6 +776,7 @@ fn timeout_argument_rejects_garbage() {
                 bs("TIMEOUT"),
                 bs(bad),
             ],
+            Some(2),
         );
         assert!(
             matches!(r, Frame::Error(_)),
@@ -784,6 +787,7 @@ fn timeout_argument_rejects_garbage() {
     let r = graph_query(
         &store,
         &[bs(GRAPH), bs("MATCH (n:N) RETURN n"), bs("TIMEOUT")],
+        Some(2),
     );
     assert!(
         matches!(r, Frame::Error(_)),
@@ -959,7 +963,7 @@ fn optional_match_unsupported_shapes_are_loud_errors() {
         // Labels on the already-bound first node.
         "MATCH (n:N) OPTIONAL MATCH (n:N)-[:E]->(m) RETURN m",
     ] {
-        let r = graph_query(&store, &[bs(GRAPH), bs(q)]);
+        let r = graph_query(&store, &[bs(GRAPH), bs(q)], Some(2));
         assert!(
             matches!(r, Frame::Error(_)),
             "{q} must be rejected loudly, got {r:?}"
@@ -1021,7 +1025,11 @@ fn with_distinct_dedups() {
 #[test]
 fn with_star_is_rejected() {
     let store = agg_fixture();
-    let r = graph_query(&store, &[bs(GRAPH), bs("MATCH (n:C) WITH * RETURN n")]);
+    let r = graph_query(
+        &store,
+        &[bs(GRAPH), bs("MATCH (n:C) WITH * RETURN n")],
+        Some(2),
+    );
     assert!(
         matches!(r, Frame::Error(_)),
         "WITH * must be a loud error, got {r:?}"

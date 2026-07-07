@@ -384,6 +384,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   design review: undoing a `DELETE` inside a transaction now re-indexes the
   restored node instead of leaving it live but permanently unreachable by
   index probes.
+- **Query performance — Cypher result cache (task #32):** read-only
+  `GRAPH.QUERY`/`GRAPH.RO_QUERY` now cache the fully-encoded RESP reply
+  bytes for repeated identical queries (same raw Cypher text + args),
+  keyed by `(query_hash, args_hash)` and served via the existing
+  `Frame::PreSerialized` passthrough — no new protocol variant needed, and
+  both RESP2 and RESP3 encodings are cached in separate slots so a
+  protocol-version switch is a clean miss rather than a stale re-encode.
+  Invalidation is a per-graph monotonic `write_gen: u64` bumped by
+  `NamedGraph::touch()` at every real mutation site (plain `GRAPH.ADDNODE`/
+  `GRAPH.ADDEDGE`, the Cypher write-plan mutation loop, `TS.*` temporal
+  invalidation, and TXN.ABORT rollback of graph undo-ops) — deliberately
+  NOT at `freeze_and_compact`, which reshapes storage without changing
+  query-visible content. The write_gen is captured before executing a
+  read and the encoded reply is only cached if it is still unchanged
+  after — a miss is always safe (SUPERSET semantics), so a benign race
+  just skips caching rather than serving stale data. Decayed queries and
+  errored/timed-out results are never cached. `ResultCache` is a bounded
+  per-graph LRU (256 entries / 4MiB default, `src/graph/cypher/
+  result_cache.rs`) whose resident bytes are folded into
+  `GraphStore::resident_bytes()`; dropping a graph (`GRAPH.DELETE`) drops
+  its cache with it. The cache is only consulted on the connection-local
+  dispatch path where the negotiated protocol version is reliably known
+  (`dispatch_graph_read`, threaded as `Option<u8>`); the cross-shard
+  `GraphCommand` hop and `graph_query_or_write`'s internal read-execute
+  calls pass `None` and bypass the cache entirely rather than risk an
+  unverified protocol version.
 - **Operability:** traversal timeout is configurable — `--graph-timeout-ms`
   server default plus per-query `GRAPH.QUERY ... TIMEOUT <ms>` (RedisGraph
   parity, 0 = unlimited).

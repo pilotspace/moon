@@ -62,7 +62,18 @@ pub fn is_cypher_write_query(args: &[crate::protocol::Frame]) -> bool {
 }
 
 /// Dispatch read-only GRAPH.* commands. Takes &GraphStore (shared).
-pub fn dispatch_graph_read(store: &GraphStore, cmd: &[u8], args: &[Frame]) -> Frame {
+///
+/// `protocol_version` (Task #32): forwarded to GRAPH.QUERY / GRAPH.RO_QUERY
+/// for the Cypher result cache. `None` when the caller cannot reliably
+/// determine the originating connection's negotiated RESP version (see
+/// `graph_query`'s doc comment) -- the result cache is simply not consulted
+/// or populated for that call, never a correctness risk.
+pub fn dispatch_graph_read(
+    store: &GraphStore,
+    cmd: &[u8],
+    args: &[Frame],
+    protocol_version: Option<u8>,
+) -> Frame {
     if cmd.eq_ignore_ascii_case(b"GRAPH.NEIGHBORS") {
         graph_neighbors(store, args)
     } else if cmd.eq_ignore_ascii_case(b"GRAPH.INFO") {
@@ -70,9 +81,9 @@ pub fn dispatch_graph_read(store: &GraphStore, cmd: &[u8], args: &[Frame]) -> Fr
     } else if cmd.eq_ignore_ascii_case(b"GRAPH.LIST") {
         graph_list(store)
     } else if cmd.eq_ignore_ascii_case(b"GRAPH.QUERY") {
-        graph_query(store, args)
+        graph_query(store, args, protocol_version)
     } else if cmd.eq_ignore_ascii_case(b"GRAPH.RO_QUERY") {
-        graph_ro_query(store, args)
+        graph_ro_query(store, args, protocol_version)
     } else if cmd.eq_ignore_ascii_case(b"GRAPH.EXPLAIN") {
         graph_explain(store, args)
     } else if cmd.eq_ignore_ascii_case(b"GRAPH.PROFILE") {
@@ -152,7 +163,11 @@ pub fn dispatch_graph_command(store: &mut GraphStore, command: &Frame) -> Frame 
     if is_graph_write_cmd(cmd) {
         dispatch_graph_write(store, cmd, args)
     } else {
-        dispatch_graph_read(store, cmd, args)
+        // Task #32: `None` -- this dispatch path (cross-shard GraphCommand /
+        // handler_single) has no reliable access to the originating
+        // connection's negotiated protocol_version, so the result cache is
+        // not consulted here. See `graph_query`'s doc comment.
+        dispatch_graph_read(store, cmd, args, None)
     }
 }
 
@@ -172,7 +187,11 @@ pub fn dispatch_graph_cmd_args(store: &mut GraphStore, cmd: &[u8], args: &[Frame
     if is_graph_write_cmd(cmd) {
         dispatch_graph_write(store, cmd, args)
     } else {
-        dispatch_graph_read(store, cmd, args)
+        // Task #32: `None` -- this dispatch path (cross-shard GraphCommand /
+        // handler_single) has no reliable access to the originating
+        // connection's negotiated protocol_version, so the result cache is
+        // not consulted here. See `graph_query`'s doc comment.
+        dispatch_graph_read(store, cmd, args, None)
     }
 }
 
