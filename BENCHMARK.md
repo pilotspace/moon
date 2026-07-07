@@ -867,6 +867,32 @@ concurrent harness) trailed ~4×. The two harnesses are not directly comparable
 (fork-bound single client compresses server-side deltas); a fresh 8-thread GCloud run
 is the right follow-up before claiming the Cypher gap is closed.
 
+### 11.8 2026-07-07 wave-2 vs FalkorDB — 8-thread GCloud harness: **Cypher gap CLOSED**
+
+Same harness as §11.5 (graph phase of `gce-4feature-bench.sh`: 5K nodes, 15K edges,
+redis-py, 8 threads, 6s per op class), wave-2 engine @ 1bbaec61, same-box FalkorDB
+(Docker). ⚠ Instance is **e2-standard-16** (2.2 GHz shared-core Xeon; c2d capacity
+exhausted in-zone), much weaker than §11.5's machines — cross-run absolutes are NOT
+comparable, but the same-box Moon:FalkorDB ratio is the valid metric.
+
+| metric | Moon (wave-2) | FalkorDB | ratio | §11.5 ratio (pre-wave-2) |
+|--------|:-------------:|:--------:|:-----:|:------------------------:|
+| cypher_1hop qps (p50) | 3,489 (1.77 ms) | 3,879 (2.02 ms) | **0.90×** | 0.25× |
+| cypher_2hop qps (p50) | **4,518** (0.89 ms) | 3,701 (2.11 ms) | **1.22×** | 0.26× |
+| build ops/s | **10,321** | 535 | **19×** | 26× |
+| cypher_match_rows | 5 | 5 | correct parity | 4 = 4 |
+| native_neighbors qps | 3,185 | — | — | — |
+
+The June deficit — FalkorDB's property index vs Moon's filtered label scan — is gone
+at this scale: Moon Cypher point queries improved ~3–4× relative to FalkorDB on the
+same box (wave-2 write-side plan cache + IndexScan + executor work). Moon now WINS
+2-hop at better p50 and ties 1-hop within 10% on the weakest instance class; on equal
+§11.5-class hardware the 1-hop tie likely flips too. Caveat: Moon's p99 (18.9 ms
+1-hop) trails FalkorDB's (3.1 ms) on this shared-core instance — worth a look on
+pinned cores. Interesting inversion: Moon Cypher 1-hop (3,489 qps) now beats its own
+native GRAPH.NEIGHBORS (3,185 qps) under concurrency — the plan cache amortizes
+parsing to near-zero.
+
 ---
 
 ## 12. Full-Text Search
