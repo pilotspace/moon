@@ -712,6 +712,67 @@ mod tests {
         ));
     }
 
+    /// P3 design part B (B0): CONTAINS / STARTS WITH / ENDS WITH must
+    /// produce results IDENTICAL to the equivalent `=~` dot-star shape
+    /// already supported (`eval.rs` "three recognized shapes").
+    #[test]
+    fn test_eval_contains_matches_regex_dotstar_equivalent() {
+        let text = Value::String("trusted rustacean".into());
+        let contains = eval_binary_op(
+            &text,
+            BinaryOperator::Contains,
+            &Value::String("rust".into()),
+        );
+        let regex_equiv = eval_binary_op(
+            &text,
+            BinaryOperator::RegexMatch,
+            &Value::String(".*rust.*".into()),
+        );
+        assert!(matches!(contains, Value::Bool(true)));
+        assert!(matches!(regex_equiv, Value::Bool(true)));
+
+        let starts = eval_binary_op(
+            &text,
+            BinaryOperator::StartsWith,
+            &Value::String("trust".into()),
+        );
+        let starts_regex = eval_binary_op(
+            &text,
+            BinaryOperator::RegexMatch,
+            &Value::String("trust.*".into()),
+        );
+        assert!(matches!(starts, Value::Bool(true)));
+        assert!(matches!(starts_regex, Value::Bool(true)));
+
+        let ends = eval_binary_op(
+            &text,
+            BinaryOperator::EndsWith,
+            &Value::String("rustacean".into()),
+        );
+        let ends_regex = eval_binary_op(
+            &text,
+            BinaryOperator::RegexMatch,
+            &Value::String(".*rustacean".into()),
+        );
+        assert!(matches!(ends, Value::Bool(true)));
+        assert!(matches!(ends_regex, Value::Bool(true)));
+
+        // Non-string operands and non-matches degrade to Null / false, same
+        // as `=~` already does -- never a wrong-type panic.
+        assert!(matches!(
+            eval_binary_op(&Value::Int(1), BinaryOperator::Contains, &text),
+            Value::Null
+        ));
+        assert!(matches!(
+            eval_binary_op(
+                &text,
+                BinaryOperator::StartsWith,
+                &Value::String("zzz".into())
+            ),
+            Value::Bool(false)
+        ));
+    }
+
     #[test]
     fn test_execute_merge_create_when_not_found() {
         let mut store = GraphStore::new();
@@ -956,5 +1017,225 @@ mod tests {
             1,
             "updated id=2 must be found via the mutable-tier index"
         );
+    }
+
+    // --- P3 design part B: text predicates (CONTAINS/STARTS WITH/ENDS
+    // WITH/=~), SegmentTextIndex correctness across tiers -----------------
+
+    /// How the fixture's 7 nodes are distributed across tiers.
+    enum TierShape {
+        /// All 7 nodes stay in the mutable write buffer (no freeze).
+        MutableOnly,
+        /// All 7 nodes are frozen into one CSR segment.
+        FrozenOnly,
+        /// First 4 nodes frozen into a CSR segment; remaining 3 added to
+        /// the mutable tier AFTER the freeze (genuinely mixed tiers, not
+        /// just "freeze everything then leave it").
+        Mixed,
+    }
+
+    /// Fixture: (name, bio) pairs deliberately covering the edge cases the
+    /// SUPERSET-candidate contract must survive:
+    /// - "bob"/"trusted colleague": the substring-across-token-boundary
+    ///   crux -- "trusted" tokenizes differently than "rust", so a
+    ///   token-identity index would MISS it for `CONTAINS 'rust'`; the
+    ///   presence-only `SegmentTextIndex` must not.
+    /// - "carol"/"RUSTACEAN": case-sensitivity -- present (has a string
+    ///   bio) but must be excluded by the exact residual Filter, not by
+    ///   the index (index has no opinion on case at all).
+    /// - "dave": NO bio property at all -- must never appear in any bio
+    ///   predicate result, in any tier.
+    /// - "erin"/"" (empty bio): empty-string edge case.
+    /// - "frank"/"héllo wörld": Unicode multi-byte edge case.
+    /// - "grace"/"rust": exact single-token baseline.
+    const TEXT_FIXTURE: &[(&str, Option<&str>)] = &[
+        ("alice", Some("i love rust and graphs")),
+        ("bob", Some("trusted colleague")),
+        ("carol", Some("RUSTACEAN")),
+        ("dave", None),
+        ("erin", Some("")),
+        ("frank", Some("héllo wörld")),
+        ("grace", Some("rust")),
+    ];
+
+    fn add_text_fixture_nodes(
+        graph: &mut crate::graph::store::NamedGraph,
+        entries: &[(&str, Option<&str>)],
+        lsn: u64,
+    ) {
+        let label_id = label_to_id(b"N");
+        let name_pid = label_to_id(b"name");
+        let bio_pid = label_to_id(b"bio");
+        for (name, bio) in entries {
+            let mut props: SmallVec<[(u16, PropertyValue); 4]> = SmallVec::new();
+            props.push((
+                name_pid,
+                PropertyValue::String(Bytes::copy_from_slice(name.as_bytes())),
+            ));
+            if let Some(bio) = bio {
+                props.push((
+                    bio_pid,
+                    PropertyValue::String(Bytes::copy_from_slice(bio.as_bytes())),
+                ));
+            }
+            graph
+                .write_buf
+                .add_node(SmallVec::from_elem(label_id, 1), props, None, lsn);
+        }
+    }
+
+    fn build_text_fixture_store(shape: TierShape) -> GraphStore {
+        let mut store = GraphStore::new();
+        store
+            .create_graph(Bytes::from_static(b"test"), 1_000_000, 0)
+            .expect("create ok");
+        let graph = store.get_graph_mut(b"test").expect("graph");
+        match shape {
+            TierShape::MutableOnly => {
+                add_text_fixture_nodes(graph, TEXT_FIXTURE, 1);
+            }
+            TierShape::FrozenOnly => {
+                add_text_fixture_nodes(graph, TEXT_FIXTURE, 1);
+                assert!(graph.freeze_and_compact(1), "freeze must succeed");
+                assert_eq!(graph.write_buf.node_count(), 0);
+            }
+            TierShape::Mixed => {
+                add_text_fixture_nodes(graph, &TEXT_FIXTURE[..4], 1);
+                assert!(graph.freeze_and_compact(1), "freeze must succeed");
+                add_text_fixture_nodes(graph, &TEXT_FIXTURE[4..], 2);
+            }
+        }
+        store
+    }
+
+    /// Run a Cypher query returning `n.name` and collect the sorted set of
+    /// matched names.
+    fn run_text_query(store: &GraphStore, cypher: &str) -> Vec<String> {
+        let parsed = crate::graph::cypher::parse_cypher(cypher.as_bytes()).expect("parse");
+        let plan = crate::graph::cypher::planner::compile(&parsed).expect("compile");
+        let graph = store.get_graph(b"test").expect("graph");
+        let result = execute(graph, &plan, &HashMap::new(), &ExecutionContext::default())
+            .unwrap_or_else(|e| panic!("exec failed for {cypher:?}: {e:?}"));
+        let mut names: Vec<String> = result
+            .rows
+            .iter()
+            .map(|r| match &r[0] {
+                Value::String(s) => String::from_utf8_lossy(s).into_owned(),
+                other => panic!("expected string name, got {other:?}"),
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// The single most important correctness gate for P3 design part B:
+    /// every text-predicate query must return the IDENTICAL result set
+    /// regardless of which tier(s) the matching data lives in. `IndexScan`
+    /// accelerates only the frozen tier (`SegmentTextIndex::candidate_rows`)
+    /// -- the mutable tier always falls back to an exact scan, and the
+    /// residual `Filter` is the sole authority either way, so tier
+    /// placement must be invisible to the result set.
+    #[test]
+    fn test_text_predicate_parity_across_tiers() {
+        let queries: &[(&str, &[&str])] = &[
+            (
+                "MATCH (n:N) WHERE n.bio CONTAINS 'rust' RETURN n.name",
+                &["alice", "bob", "grace"],
+            ),
+            (
+                // Empty needle: matches every row that HAS a bio (bytes_contains
+                // treats "" as always-contained), but never `dave` (no bio at all).
+                "MATCH (n:N) WHERE n.bio CONTAINS '' RETURN n.name",
+                &["alice", "bob", "carol", "erin", "frank", "grace"],
+            ),
+            (
+                "MATCH (n:N) WHERE n.bio STARTS WITH 'trust' RETURN n.name",
+                &["bob"],
+            ),
+            (
+                // Unicode multi-byte suffix.
+                "MATCH (n:N) WHERE n.bio ENDS WITH 'ld' RETURN n.name",
+                &["frank"],
+            ),
+            (
+                "MATCH (n:N) WHERE n.bio =~ '.*rust.*' RETURN n.name",
+                &["alice", "bob", "grace"],
+            ),
+            (
+                // Case-sensitivity: 'RUSTACEAN' must NOT match lowercase 'rust'
+                // -- proves the residual Filter (not the presence-only index)
+                // makes the final call.
+                "MATCH (n:N) WHERE n.bio CONTAINS 'RUST' RETURN n.name",
+                &["carol"],
+            ),
+        ];
+
+        for shape in [
+            TierShape::MutableOnly,
+            TierShape::FrozenOnly,
+            TierShape::Mixed,
+        ] {
+            let shape_name = match shape {
+                TierShape::MutableOnly => "MutableOnly",
+                TierShape::FrozenOnly => "FrozenOnly",
+                TierShape::Mixed => "Mixed",
+            };
+            let store = build_text_fixture_store(shape);
+            for (cypher, expected) in queries {
+                let mut expected: Vec<String> = expected.iter().map(|s| s.to_string()).collect();
+                expected.sort();
+                let actual = run_text_query(&store, cypher);
+                assert_eq!(
+                    actual, expected,
+                    "tier={shape_name} query={cypher:?}: got {actual:?}, want {expected:?}"
+                );
+            }
+        }
+    }
+
+    /// B1 test #5/#6: the presence-only `candidate_rows` superset must
+    /// survive a query that a naive token-identity index would get wrong.
+    /// `IndexScan` is planned (via `CONTAINS`) but the residual Filter
+    /// still produces the exact, correct row set -- this is the same
+    /// assertion as `test_text_predicate_parity_across_tiers`'s first case,
+    /// isolated here with an explicit plan-shape check.
+    #[test]
+    fn test_text_scan_superset_semantics_frozen_tier() {
+        let store = build_text_fixture_store(TierShape::FrozenOnly);
+        let query = "MATCH (n:N) WHERE n.bio CONTAINS 'rust' RETURN n.name";
+        let parsed = crate::graph::cypher::parse_cypher(query.as_bytes()).expect("parse");
+        let plan = crate::graph::cypher::planner::compile(&parsed).expect("compile");
+        assert!(
+            matches!(
+                plan.operators[0],
+                crate::graph::cypher::planner::PhysicalOp::IndexScan { .. }
+            ),
+            "CONTAINS must plan through IndexScan; ops = {:?}",
+            plan.operators
+        );
+        let mut actual = run_text_query(&store, query);
+        actual.sort();
+        // "bob" ("trusted colleague") is the false-negative-if-token-pruned
+        // case; it MUST be present because the index only prunes on
+        // presence, never on token identity.
+        assert_eq!(actual, vec!["alice", "bob", "grace"]);
+    }
+
+    /// B1 test #7: the mutable tier gets no acceleration for text
+    /// predicates (pre-approved scope decision) but must not regress
+    /// correctness -- covered by `test_text_predicate_parity_across_tiers`'s
+    /// `MutableOnly` shape; this test isolates the plan shape (still an
+    /// `IndexScan`, since the WHERE conjunct always upgrades the scan
+    /// regardless of tier -- the ACCELERATION difference is inside
+    /// `index_scan_keys`, not in the plan).
+    #[test]
+    fn test_text_scan_mutable_tier_falls_back_to_linear_scan() {
+        let store = build_text_fixture_store(TierShape::MutableOnly);
+        let mut actual = run_text_query(
+            &store,
+            "MATCH (n:N) WHERE n.bio CONTAINS 'rust' RETURN n.name",
+        );
+        actual.sort();
+        assert_eq!(actual, vec!["alice", "bob", "grace"]);
     }
 }

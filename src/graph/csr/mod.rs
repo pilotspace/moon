@@ -96,6 +96,12 @@ pub struct CsrSegment {
     /// build runs OFF the shard event loop; queries score exactly until the
     /// bridge installs.
     pub hnsw_building: std::sync::atomic::AtomicBool,
+    /// Lazily built per-segment text index for Cypher text predicates
+    /// (`SegmentTextIndex`, P3 design part B). DERIVED, in-memory only —
+    /// never persisted; a `GraphUnion`-merged segment starts with an empty
+    /// cell and rebuilds from scratch on first use (see `text_index.rs`
+    /// module docs, "GraphUnion merge" section).
+    pub text_index: std::sync::OnceLock<crate::graph::text_index::SegmentTextIndex>,
 }
 
 impl CsrSegment {
@@ -278,6 +284,7 @@ impl CsrSegment {
             props_index: std::sync::OnceLock::new(),
             hnsw_bridge: std::sync::OnceLock::new(),
             hnsw_building: std::sync::atomic::AtomicBool::new(false),
+            text_index: std::sync::OnceLock::new(),
         })
     }
 
@@ -895,6 +902,7 @@ impl CsrSegment {
             props_index: std::sync::OnceLock::new(),
             hnsw_bridge: std::sync::OnceLock::new(),
             hnsw_building: std::sync::atomic::AtomicBool::new(false),
+            text_index: std::sync::OnceLock::new(),
         })
     }
 

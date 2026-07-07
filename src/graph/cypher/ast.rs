@@ -300,6 +300,13 @@ pub enum BinaryOperator {
     Div,
     Mod,
     RegexMatch,
+    /// `CONTAINS` (P3 design part B): substring predicate, `n.prop CONTAINS
+    /// 'x'`. Desugars to the same evaluation `=~ ".*x.*"` already used.
+    Contains,
+    /// `STARTS WITH` (P3 design part B): prefix predicate.
+    StartsWith,
+    /// `ENDS WITH` (P3 design part B): suffix predicate.
+    EndsWith,
 }
 
 impl CypherQuery {

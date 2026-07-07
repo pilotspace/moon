@@ -573,6 +573,11 @@ pub fn compact_segments(
         props_index: std::sync::OnceLock::new(),
         hnsw_bridge: std::sync::OnceLock::new(),
         hnsw_building: std::sync::atomic::AtomicBool::new(false),
+        // GraphUnion merge does NOT remap/merge posting row ids across
+        // input segments (pre-approved scope decision, see
+        // `text_index.rs` module docs) -- the merged segment starts empty
+        // and rebuilds its text index lazily, from scratch, on first use.
+        text_index: std::sync::OnceLock::new(),
     })
 }
 
@@ -724,6 +729,96 @@ mod tests {
         }
         let frozen = mg.freeze().expect("ok");
         CsrSegment::from_frozen(frozen, lsn).expect("ok")
+    }
+
+    /// Like [`make_csr`] but each node carries a string `bio` property
+    /// (P3 design part B: `GraphUnion` merge text-index correctness test).
+    /// `id_base` keeps external node ids disjoint across segments being
+    /// merged in the same test -- two independently-created `MemGraph`s
+    /// both start id allocation at 0, which would silently ALIAS nodes
+    /// across segments during `compact_segments`'s `external_id`-keyed
+    /// dedup (see `view.rs`'s module docs on this exact hazard for the
+    /// production id-allocation path).
+    fn make_csr_with_bios(
+        id_base: u64,
+        bios: &[&str],
+        edges: &[(usize, usize)],
+        lsn: u64,
+    ) -> CsrSegment {
+        let mut mg = MemGraph::new(100_000);
+        let bio_pid = crate::command::graph::graph_write::label_to_id(b"bio");
+        let mut keys = Vec::with_capacity(bios.len());
+        for (i, bio) in bios.iter().enumerate() {
+            let props = smallvec![(
+                bio_pid,
+                crate::graph::types::PropertyValue::String(bytes::Bytes::copy_from_slice(
+                    bio.as_bytes()
+                )),
+            )];
+            keys.push(mg.add_node_with_id(id_base + i as u64, smallvec![0], props, None, 1));
+        }
+        for &(s, d) in edges {
+            mg.add_edge(keys[s], keys[d], 1, 1.0, None, 2).expect("ok");
+        }
+        let frozen = mg.freeze().expect("ok");
+        CsrSegment::from_frozen(frozen, lsn).expect("ok")
+    }
+
+    /// P3 design part B, B1 test #11 (the acceptance gate for the
+    /// GraphUnion scope decision documented in `text_index.rs`): a merged
+    /// segment must NOT carry over a stale/unmapped text index (there is
+    /// none to carry -- posting row ids are never remapped) and its
+    /// FRESHLY lazily-built `SegmentTextIndex` must be correct over the
+    /// merged row space, covering every node from every input segment.
+    #[test]
+    fn test_graph_union_merge_rebuilds_text_index_lazily_and_correctly() {
+        // seg1: node 0 matches `CONTAINS 'rust'` by an exact token; node 1
+        // has no bio text relevant to the query.
+        let seg1 = Arc::new(CsrStorage::from(make_csr_with_bios(
+            0,
+            &["loves rust", "no match here"],
+            &[(0, 1)],
+            10,
+        )));
+        // seg2: node 0's bio is the substring-across-token-boundary crux
+        // ("trusted" contains "rust" as a raw substring but is a DIFFERENT
+        // token); node 1 has no relevant text either.
+        let seg2 = Arc::new(CsrStorage::from(make_csr_with_bios(
+            100,
+            &["trusted friend", "unrelated text"],
+            &[(0, 1)],
+            20,
+        )));
+
+        let config = CompactionConfig {
+            min_segments: 2,
+            max_segment_edges: 1_000_000,
+        };
+        let merged = compact_segments(&[seg1, seg2], &config).expect("merge ok");
+        assert_eq!(merged.node_count(), 4, "all 4 distinct external ids survive the merge");
+
+        // Scope decision: no posting-row remap -- the merged segment starts
+        // with an empty text-index cell.
+        assert!(
+            merged.text_index.get().is_none(),
+            "GraphUnion merge must not carry over a stale/pre-merge text index"
+        );
+
+        let merged_storage = CsrStorage::from(merged);
+        let bio_pid = crate::command::graph::graph_write::label_to_id(b"bio");
+        let candidates = merged_storage
+            .text_index()
+            .candidate_rows(bio_pid)
+            .cloned()
+            .unwrap_or_default();
+        // Every merged node carries a string bio -- the presence bitmap
+        // (the correctness-critical SUPERSET source) must cover all 4,
+        // including the substring-crux row from seg2.
+        assert_eq!(
+            candidates.len(),
+            4,
+            "candidates must cover every merged row, got {candidates:?}"
+        );
     }
 
     #[test]

@@ -410,6 +410,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `GraphCommand` hop and `graph_query_or_write`'s internal read-execute
   calls pass `None` and bypass the cache entirely rather than risk an
   unverified protocol version.
+- **Query performance — FTS reuse for Cypher text predicates (task #33):**
+  first-class `CONTAINS`/`STARTS WITH`/`ENDS WITH` Cypher operators (pure
+  syntax sugar over the existing `=~` byte-level checks — `src/graph/
+  cypher/lexer.rs`, `ast.rs`, `parser/expr.rs`, `executor/eval.rs`), plus a
+  new per-frozen-segment `SegmentTextIndex` (`src/graph/text_index.rs`,
+  lazy `OnceLock` + `resident_bytes` accounting, same pattern as
+  `SegmentPropertyIndexes`/`hnsw_bridge`) that accelerates `CONTAINS`/
+  `STARTS WITH`/`ENDS WITH`/`=~` conjuncts in `WHERE` (`planner.rs`'s new
+  `extract_text_conjuncts`, mirroring W2-3's `extract_range_conjuncts`).
+  Reuses `crate::text::posting::PostingStore`/`crate::text::bm25::
+  {FieldStats, bm25_score}`/`crate::text::term_dict::TermDictionary`
+  verbatim (already ID-space-agnostic, zero-fork). **Correctness note:**
+  the index prunes on PROPERTY PRESENCE only, not token identity — a
+  tokenized/stemmed/case-folded posting lookup cannot safely decide
+  substring/prefix/suffix containment (e.g. `CONTAINS 'rust'` must also
+  match `"trusted"`, which tokenizes to a different term entirely), so
+  `candidate_rows` returns every row whose target property is a
+  String/Bytes at all, and the existing residual `Filter` remains the sole
+  decider (SUPERSET contract, same as `prop_eq`/`prop_range`). The
+  MUTABLE tier gets no acceleration (falls back to an exact scan of the
+  write buffer, pre-approved scope decision — mirrors the pre-task-#31
+  numeric story); a `GraphUnion`-merged segment does not remap posting row
+  ids and simply rebuilds its text index lazily on first use post-merge.
+  `SegmentTextIndex::bm25_score_for` is a tested-but-unwired internal BM25
+  relevance-scoring hook (no Cypher `ORDER BY` grammar was specified for
+  it) — proves the `bm25_score` reuse end-to-end; surface syntax is a
+  documented follow-up.
 - **Operability:** traversal timeout is configurable — `--graph-timeout-ms`
   server default plus per-query `GRAPH.QUERY ... TIMEOUT <ms>` (RedisGraph
   parity, 0 = unlimited).

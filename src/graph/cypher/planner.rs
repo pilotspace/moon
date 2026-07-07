@@ -75,6 +75,16 @@ pub enum PhysicalOp {
         /// same SUPERSET contract as `prop_eq` — the residual Filter
         /// downstream stays authoritative. W2-3.
         prop_range: Vec<(String, RangeCmp, Expr)>,
+        /// (property name, text operator, pattern expression) text-predicate
+        /// conjuncts extracted from top-level `WHERE` AND-chains
+        /// (`n.p CONTAINS 'x'`, `n.p STARTS WITH $prefix`, `n.p =~ '.*x.*'`).
+        /// P3 design part B. Pruned via `SegmentTextIndex::candidate_rows` —
+        /// a PRESENCE-only superset (see `text_index.rs` module docs for why
+        /// token-level pruning is unsound for substring/prefix/suffix
+        /// predicates), same SUPERSET contract as `prop_eq`/`prop_range`;
+        /// the pattern expression itself is carried for documentation/future
+        /// use but is NOT evaluated for pruning purposes.
+        text_pred: Vec<(String, BinaryOperator, Expr)>,
     },
     /// Expand along edges from a source variable.
     ///
@@ -529,6 +539,9 @@ pub fn compile(query: &CypherQuery) -> Result<PhysicalPlan, PlanError> {
                 // (the full WHERE stays — the index only prunes).
                 if !saw_with {
                     extract_range_conjuncts(&w.expr, &mut ops);
+                    // P3 design part B: same treatment for text-predicate
+                    // conjuncts (`CONTAINS`/`STARTS WITH`/`ENDS WITH`/`=~`).
+                    extract_text_conjuncts(&w.expr, &mut ops);
                 }
                 ops.push(PhysicalOp::Filter {
                     expr: w.expr.clone(),
@@ -890,6 +903,7 @@ fn push_node_scan(node: &PatternNode, var: &str, ops: &mut Vec<PhysicalOp>) {
             label: node.labels.first().cloned(),
             prop_eq: node.properties.clone(),
             prop_range: Vec::new(),
+            text_pred: Vec::new(),
         });
     } else {
         ops.push(PhysicalOp::NodeScan {
@@ -959,6 +973,7 @@ fn extract_range_conjuncts(expr: &Expr, ops: &mut Vec<PhysicalOp>) {
                             label: label.clone(),
                             prop_eq: Vec::new(),
                             prop_range: vec![(prop.to_owned(), cmp, value)],
+                            text_pred: Vec::new(),
                         };
                         return;
                     }
@@ -968,6 +983,84 @@ fn extract_range_conjuncts(expr: &Expr, ops: &mut Vec<PhysicalOp>) {
         }
         _ => {}
     }
+}
+
+/// Walk a WHERE expression's top-level AND-chain and push every
+/// `var.prop <CONTAINS|STARTS WITH|ENDS WITH|=~> literal|param` conjunct
+/// into the scan op that BINDS `var` (upgrading a plain `NodeScan` to an
+/// `IndexScan` when needed), mirroring `extract_range_conjuncts` (W2-3) for
+/// text predicates (P3 design part B).
+///
+/// Soundness: identical argument to `extract_range_conjuncts` — a top-level
+/// AND conjunct must hold for every result row, so restricting `var`'s scan
+/// to a SUPERSET of rows satisfying it can never drop a valid row. The
+/// index probe (`SegmentTextIndex::candidate_rows`) is a presence-only
+/// superset for ANY string predicate on that property — see `text_index.rs`
+/// module docs for why token-level pruning is unsound here. Disjunctions
+/// (`OR`) are never extracted.
+fn extract_text_conjuncts(expr: &Expr, ops: &mut Vec<PhysicalOp>) {
+    match expr {
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::And,
+            right,
+        } => {
+            extract_text_conjuncts(left, ops);
+            extract_text_conjuncts(right, ops);
+        }
+        Expr::BinaryOp {
+            left,
+            op: text_op,
+            right,
+        } => {
+            if !matches!(
+                text_op,
+                BinaryOperator::Contains
+                    | BinaryOperator::StartsWith
+                    | BinaryOperator::EndsWith
+                    | BinaryOperator::RegexMatch
+            ) {
+                return;
+            }
+            let Some((var, prop)) = as_prop_access(left) else {
+                return;
+            };
+            if !is_text_value(right) {
+                return;
+            }
+            for op in ops.iter_mut().rev() {
+                match op {
+                    PhysicalOp::IndexScan {
+                        variable,
+                        text_pred,
+                        ..
+                    } if variable == var => {
+                        text_pred.push((prop.to_owned(), *text_op, (**right).clone()));
+                        return;
+                    }
+                    PhysicalOp::NodeScan { variable, label } if variable == var => {
+                        *op = PhysicalOp::IndexScan {
+                            variable: variable.clone(),
+                            label: label.clone(),
+                            prop_eq: Vec::new(),
+                            prop_range: Vec::new(),
+                            text_pred: vec![(prop.to_owned(), *text_op, (**right).clone())],
+                        };
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Is this expression usable as a text-predicate pattern (resolvable
+/// without a row, mirroring `is_range_value`)? String literals and
+/// parameters only.
+fn is_text_value(expr: &Expr) -> bool {
+    matches!(expr, Expr::StringLit(_) | Expr::Parameter(_))
 }
 
 /// `n.prop` accessor on a plain variable, if the expression is one.
@@ -1177,6 +1270,103 @@ mod tests {
         // Disjunctions cannot prune a scan (a row failing one branch may
         // satisfy the other).
         let query = parse_cypher(b"MATCH (n:N) WHERE n.a > 1 OR n.b < 2 RETURN n").expect("parse");
+        let plan = compile(&query).expect("compile");
+        assert!(
+            matches!(plan.operators[0], PhysicalOp::NodeScan { .. }),
+            "OR predicate must not upgrade the scan; ops = {:?}",
+            plan.operators
+        );
+    }
+
+    // ─── P3 design part B: WHERE text predicates drive the text index ─────
+
+    #[test]
+    fn test_where_contains_upgrades_scan_to_index_text_pred() {
+        let query =
+            parse_cypher(b"MATCH (n:Person) WHERE n.bio CONTAINS 'rust' RETURN n").expect("parse");
+        let plan = compile(&query).expect("compile");
+        match &plan.operators[0] {
+            PhysicalOp::IndexScan {
+                prop_eq,
+                prop_range,
+                text_pred,
+                ..
+            } => {
+                assert!(prop_eq.is_empty());
+                assert!(prop_range.is_empty());
+                assert_eq!(text_pred.len(), 1, "one text conjunct, got {text_pred:?}");
+                assert_eq!(text_pred[0].0, "bio");
+                assert_eq!(text_pred[0].1, BinaryOperator::Contains);
+            }
+            other => panic!("expected text IndexScan, got {other:?}"),
+        }
+        // The full WHERE stays as a residual Filter (index is superset-only).
+        assert!(
+            plan.operators
+                .iter()
+                .any(|op| matches!(op, PhysicalOp::Filter { .. })),
+            "residual Filter must remain"
+        );
+    }
+
+    #[test]
+    fn test_where_starts_with_and_ends_with_upgrade_scan() {
+        for (query_bytes, expect_op) in [
+            (
+                b"MATCH (n:N) WHERE n.name STARTS WITH 'Al' RETURN n".as_slice(),
+                BinaryOperator::StartsWith,
+            ),
+            (
+                b"MATCH (n:N) WHERE n.name ENDS WITH 'ce' RETURN n".as_slice(),
+                BinaryOperator::EndsWith,
+            ),
+            (
+                b"MATCH (n:N) WHERE n.name =~ '.*x.*' RETURN n".as_slice(),
+                BinaryOperator::RegexMatch,
+            ),
+        ] {
+            let query = parse_cypher(query_bytes).expect("parse");
+            let plan = compile(&query).expect("compile");
+            match &plan.operators[0] {
+                PhysicalOp::IndexScan { text_pred, .. } => {
+                    assert_eq!(text_pred.len(), 1, "ops = {:?}", plan.operators);
+                    assert_eq!(text_pred[0].1, expect_op);
+                }
+                other => panic!(
+                    "expected text IndexScan for {:?}, got {other:?}",
+                    core::str::from_utf8(query_bytes)
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn test_where_text_and_range_conjuncts_compose() {
+        // A single WHERE mixing a numeric range and a text predicate on
+        // DIFFERENT properties of the same variable must upgrade the SAME
+        // IndexScan with both hints populated.
+        let query = parse_cypher(b"MATCH (n:N) WHERE n.age > 30 AND n.bio CONTAINS 'x' RETURN n")
+            .expect("parse");
+        let plan = compile(&query).expect("compile");
+        match &plan.operators[0] {
+            PhysicalOp::IndexScan {
+                prop_range,
+                text_pred,
+                ..
+            } => {
+                assert_eq!(prop_range.len(), 1);
+                assert_eq!(text_pred.len(), 1);
+                assert_eq!(text_pred[0].0, "bio");
+            }
+            other => panic!("expected combined IndexScan, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_where_text_or_is_not_extracted() {
+        // Disjunctions cannot prune a scan, same rule as range conjuncts.
+        let query =
+            parse_cypher(b"MATCH (n:N) WHERE n.a CONTAINS 'x' OR n.b > 1 RETURN n").expect("parse");
         let plan = compile(&query).expect("compile");
         assert!(
             matches!(plan.operators[0], PhysicalOp::NodeScan { .. }),

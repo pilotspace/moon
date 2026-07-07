@@ -479,6 +479,15 @@ impl<'a> Parser<'a> {
         self.lexer.peek().map_or(false, |t| pred(&t.token))
     }
 
+    /// Like `peek_is`, but for the token AFTER the next one -- needed for
+    /// two-keyword operators (`STARTS WITH`, `ENDS WITH`, P3 design part B).
+    pub(super) fn peek2_is<F>(&mut self, pred: F) -> bool
+    where
+        F: FnOnce(&Token<'_>) -> bool,
+    {
+        self.lexer.peek2().map_or(false, |t| pred(&t.token))
+    }
+
     pub(super) fn peek_token_ref(&mut self) -> Result<SpannedToken<'a>, CypherError> {
         self.lexer
             .peek()
@@ -726,6 +735,74 @@ mod tests {
         let q = parse("MATCH (n) WHERE n.email IS NOT NULL RETURN n").expect("parse failed");
         if let Clause::Where(w) = &q.clauses[1] {
             assert!(matches!(w.expr, Expr::IsNull { negated: true, .. }));
+        } else {
+            panic!("expected Where clause");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Text predicates (P3 design part B): CONTAINS / STARTS WITH / ENDS WITH
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_contains_operator() {
+        let q = parse("MATCH (n) WHERE n.bio CONTAINS 'rust' RETURN n").expect("parse failed");
+        if let Clause::Where(w) = &q.clauses[1] {
+            assert!(matches!(
+                w.expr,
+                Expr::BinaryOp {
+                    op: BinaryOperator::Contains,
+                    ..
+                }
+            ));
+        } else {
+            panic!("expected Where clause");
+        }
+    }
+
+    #[test]
+    fn test_parse_starts_with() {
+        let q = parse("MATCH (n) WHERE n.name STARTS WITH 'Al' RETURN n").expect("parse failed");
+        if let Clause::Where(w) = &q.clauses[1] {
+            assert!(matches!(
+                w.expr,
+                Expr::BinaryOp {
+                    op: BinaryOperator::StartsWith,
+                    ..
+                }
+            ));
+        } else {
+            panic!("expected Where clause");
+        }
+    }
+
+    #[test]
+    fn test_parse_ends_with() {
+        let q = parse("MATCH (n) WHERE n.name ENDS WITH 'ce' RETURN n").expect("parse failed");
+        if let Clause::Where(w) = &q.clauses[1] {
+            assert!(matches!(
+                w.expr,
+                Expr::BinaryOp {
+                    op: BinaryOperator::EndsWith,
+                    ..
+                }
+            ));
+        } else {
+            panic!("expected Where clause");
+        }
+    }
+
+    #[test]
+    fn test_parse_text_predicate_case_insensitive() {
+        let q = parse("MATCH (n) WHERE n.name starts with 'Al' RETURN n").expect("parse failed");
+        if let Clause::Where(w) = &q.clauses[1] {
+            assert!(matches!(
+                w.expr,
+                Expr::BinaryOp {
+                    op: BinaryOperator::StartsWith,
+                    ..
+                }
+            ));
         } else {
             panic!("expected Where clause");
         }

@@ -569,6 +569,34 @@ pub(crate) fn eval_binary_op(left: &Value, op: BinaryOperator, right: &Value) ->
                 _ => Value::Null,
             }
         }
+
+        // P3 design part B (B0): first-class CONTAINS / STARTS WITH / ENDS
+        // WITH -- pure syntax sugar over the same byte-level checks `=~`
+        // already performs for its three recognized shapes (see
+        // `test_eval_contains_matches_regex_dotstar_equivalent`). A non-
+        // String operand (including a missing property, which evaluates to
+        // Value::Null upstream) degrades to Value::Null, never a panic --
+        // this is also the correctness anchor for the SegmentTextIndex
+        // SUPERSET contract: a row without a String value at the target
+        // property can never pass any of these three predicates.
+        BinaryOperator::Contains => match (left, right) {
+            (Value::String(text), Value::String(pattern)) => {
+                Value::Bool(bytes_contains(text.as_ref(), pattern.as_ref()))
+            }
+            _ => Value::Null,
+        },
+        BinaryOperator::StartsWith => match (left, right) {
+            (Value::String(text), Value::String(pattern)) => {
+                Value::Bool(text.as_ref().starts_with(pattern.as_ref()))
+            }
+            _ => Value::Null,
+        },
+        BinaryOperator::EndsWith => match (left, right) {
+            (Value::String(text), Value::String(pattern)) => {
+                Value::Bool(text.as_ref().ends_with(pattern.as_ref()))
+            }
+            _ => Value::Null,
+        },
     }
 }
 

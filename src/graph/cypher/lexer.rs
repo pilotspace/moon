@@ -74,6 +74,15 @@ pub enum Token<'a> {
     Desc,
     #[token(b"ON", ignore(case))]
     On,
+    // --- P3 text predicates (design part B): CONTAINS is a single keyword;
+    // STARTS WITH / ENDS WITH are two keywords parsed together (WITH is
+    // reused from the WITH clause -- no new token needed for it).
+    #[token(b"CONTAINS", ignore(case))]
+    Contains,
+    #[token(b"STARTS", ignore(case))]
+    Starts,
+    #[token(b"ENDS", ignore(case))]
+    Ends,
 
     // --- Identifiers ---
     // Must come after keywords so logos prefers keyword matches.
@@ -374,6 +383,19 @@ mod tests {
         assert_eq!(lexer.next_token().map(|t| t.token), Some(Token::LBracket));
         assert_eq!(lexer.next_token().map(|t| t.token), Some(Token::RBracket));
         assert_eq!(lexer.next_token().map(|t| t.token), Some(Token::ArrowRight));
+    }
+
+    #[test]
+    fn test_text_predicate_keywords() {
+        // P3 design part B: CONTAINS / STARTS WITH / ENDS WITH keywords,
+        // case-insensitive like every other Cypher keyword.
+        let input = b"CONTAINS starts with Ends With";
+        let mut lexer = Lexer::new(input);
+        assert_eq!(lexer.next_token().map(|t| t.token), Some(Token::Contains));
+        assert_eq!(lexer.next_token().map(|t| t.token), Some(Token::Starts));
+        assert_eq!(lexer.next_token().map(|t| t.token), Some(Token::With));
+        assert_eq!(lexer.next_token().map(|t| t.token), Some(Token::Ends));
+        assert_eq!(lexer.next_token().map(|t| t.token), Some(Token::With));
     }
 
     #[test]

@@ -193,6 +193,18 @@ fn try_project_aggregate(
 /// post-W2-3 comparison semantics make cross-type / missing-property
 /// comparisons evaluate to Null (dropped by WHERE), exactly the rows the
 /// numeric index excludes.
+///
+/// `text_pred` conjuncts (`n.p CONTAINS 'x'`, `STARTS WITH`, `ENDS WITH`,
+/// `=~`; P3 design part B) prune the FROZEN tier only, via
+/// `SegmentTextIndex::candidate_rows` — a PRESENCE-only superset (rows
+/// whose value at that property is a String/Bytes at all; see
+/// `text_index.rs` module docs for why token-level pruning is unsound for
+/// substring/prefix/suffix predicates). The MUTABLE tier has no text index
+/// (pre-approved scope decision): a text-only conjunct (no `prop_eq`/
+/// `prop_range` alongside it) falls back to an exact full scan of the
+/// mutable tail, seeded from `memgraph.iter_nodes()` — correct, just
+/// unaccelerated, matching the mutable tier's existing story for numeric
+/// properties before freeze.
 #[allow(clippy::too_many_arguments)]
 fn index_scan_keys(
     memgraph: &crate::graph::memgraph::MemGraph,
@@ -200,6 +212,7 @@ fn index_scan_keys(
     label: Option<&String>,
     prop_eq: &[(String, Expr)],
     prop_range: &[(String, RangeCmp, Expr)],
+    text_pred: &[(String, BinaryOperator, Expr)],
     params: &HashMap<String, Value>,
     ctx: &ExecutionContext,
 ) -> Vec<NodeKey> {
@@ -262,9 +275,22 @@ fn index_scan_keys(
         }
     }
 
+    // Resolve each text conjunct to a bare prop_id (deduplicated). No value
+    // is evaluated: `SegmentTextIndex::candidate_rows` prunes on PRESENCE
+    // alone (see its module docs) -- valid as a superset regardless of the
+    // pattern's content, so the pattern expression is never consulted here.
+    let mut text_prop_ids: Vec<u16> = Vec::with_capacity(text_pred.len());
+    for (name, _op, _expr) in text_pred {
+        let pid = label_to_id(name.as_bytes());
+        if !text_prop_ids.contains(&pid) {
+            text_prop_ids.push(pid);
+        }
+    }
+
     // Nothing prunable (pure-range scan whose thresholds all resolved
-    // non-numeric): full merged label scan, residual Filter stays exact.
-    if targets.is_empty() && ranges.is_empty() {
+    // non-numeric, and no text conjunct either): full merged label scan,
+    // residual Filter stays exact.
+    if targets.is_empty() && ranges.is_empty() && text_prop_ids.is_empty() {
         let mut keys = Vec::new();
         view.for_each_visible_node(
             label_id,
@@ -303,6 +329,15 @@ fn index_scan_keys(
             RangeCmp::Lt | RangeCmp::Lte => (f64::NEG_INFINITY, *threshold),
         };
         memgraph.prop_index_keys_range(*pid, lo, hi)
+    } else if !text_prop_ids.is_empty() {
+        // Text-only conjunct(s): the mutable tier has no text index
+        // (pre-approved scope decision, see `text_index.rs` module docs) --
+        // fall back to a full label-scoped scan of the mutable tail. Still
+        // bounded by `edge_threshold` (freeze keeps the mutable tail
+        // small), and the generic label/visibility checks below plus the
+        // planner's residual Filter downstream stay authoritative, exactly
+        // like every other candidate source in this function.
+        memgraph.iter_nodes().map(|(key, _)| key).collect()
     } else {
         // Structurally unreachable (see above) — an empty candidate set is
         // the safe degradation if this invariant is ever violated by a
@@ -387,6 +422,21 @@ fn index_scan_keys(
                 // segment -> no row here can pass the residual comparison.
                 None => roaring::RoaringBitmap::new(),
             };
+            let acc = match bm.take() {
+                Some(acc) => acc & rows,
+                None => rows,
+            };
+            bm = Some(acc);
+        }
+        for pid in &text_prop_ids {
+            if bm.as_ref().is_some_and(roaring::RoaringBitmap::is_empty) {
+                break;
+            }
+            let rows = seg
+                .text_index()
+                .candidate_rows(*pid)
+                .cloned()
+                .unwrap_or_default();
             let acc = match bm.take() {
                 Some(acc) => acc & rows,
                 None => rows,
@@ -568,6 +618,7 @@ pub fn execute_with_slots(
                 label,
                 prop_eq,
                 prop_range,
+                text_pred,
             } => {
                 let keys = index_scan_keys(
                     memgraph,
@@ -575,6 +626,7 @@ pub fn execute_with_slots(
                     label.as_ref(),
                     prop_eq,
                     prop_range,
+                    text_pred,
                     params,
                     ctx,
                 );
@@ -1171,6 +1223,7 @@ pub fn execute_profile(
                 label,
                 prop_eq,
                 prop_range,
+                text_pred,
             } => {
                 let keys = index_scan_keys(
                     memgraph,
@@ -1178,6 +1231,7 @@ pub fn execute_profile(
                     label.as_ref(),
                     prop_eq,
                     prop_range,
+                    text_pred,
                     params,
                     ctx,
                 );

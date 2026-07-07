@@ -59,6 +59,10 @@ pub struct MmapCsrSegment {
     pub hnsw_bridge: std::sync::OnceLock<Option<crate::graph::hnsw_bridge::GraphHnsw>>,
     /// True while a background thread is building `hnsw_bridge` (W2-5).
     pub hnsw_building: std::sync::atomic::AtomicBool,
+    /// Lazily built per-segment text index (`SegmentTextIndex`, P3 design
+    /// part B). DERIVED, in-memory only — never persisted, same as
+    /// `props_index`/`hnsw_bridge`.
+    pub text_index: std::sync::OnceLock<crate::graph::text_index::SegmentTextIndex>,
     /// Pointer into mmap: node property blob (version >= 5; dangling+0 otherwise).
     node_props_ptr: *const u8,
     node_props_len: usize,
@@ -373,6 +377,7 @@ impl MmapCsrSegment {
             props_index: std::sync::OnceLock::new(),
             hnsw_bridge: std::sync::OnceLock::new(),
             hnsw_building: std::sync::atomic::AtomicBool::new(false),
+            text_index: std::sync::OnceLock::new(),
             node_props_ptr: np_ptr,
             node_props_len: np_len,
             edge_props_ptr: ep_ptr,

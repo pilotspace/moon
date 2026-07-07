@@ -31,6 +31,7 @@ pub mod segment;
 pub mod simd;
 pub mod stats;
 pub mod store;
+pub mod text_index;
 pub mod traversal;
 pub mod traversal_guard;
 pub mod types;
