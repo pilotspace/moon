@@ -164,6 +164,88 @@ pub fn replay_wal_auto(
     }
 }
 
+/// Replay every Command/XactCommit record across all segments in a WAL v3
+/// directory through `engine`, applying the same record-type dispatch as
+/// `replay_wal_auto`'s v3 branch (this function is the multi-segment,
+/// directory-scoped counterpart — `replay_wal_auto` only handles one file).
+///
+/// Used by legacy (non-disk-offload) shard recovery: WAL v3 is written even
+/// when `--disk-offload` is off (rooted at `<persistence_dir>/shard-N/wal-v3`,
+/// see `event_loop::run`'s writer-creation block), fsynced on the same 1s
+/// cadence as the retired WAL v2 writer was. To preserve the pre-1.0 "no
+/// durable write lost on restart" property that WAL v2's
+/// prefer-WAL-fall-back-to-AOF contract gave, callers should treat a non-zero
+/// return here as authoritative (skip AOF) and only replay the AOF when this
+/// returns `Ok(0)` or `Err` — exactly mirroring how the disk-offload v3
+/// recovery protocol already treats its own primary WAL replay relative to
+/// its AOF fallback (see `recover_shard_v3_pitr`).
+///
+/// Returns `Ok(0)` (not an error) when `wal_dir` does not exist or is empty,
+/// so callers can use the return value directly as an "authoritative source
+/// available?" signal.
+pub fn replay_wal_v3_dir_commands(
+    wal_dir: &Path,
+    databases: &mut [crate::storage::Database],
+    engine: &dyn crate::persistence::replay::CommandReplayEngine,
+) -> std::io::Result<usize> {
+    if !wal_dir.exists() {
+        return Ok(0);
+    }
+
+    let mut commands_replayed = 0usize;
+    let mut selected_db = 0usize;
+    let on_command = &mut |record: &WalRecord| {
+        match record.record_type {
+            WalRecordType::Command => {
+                engine.replay_command(databases, &record.payload, &[], &mut selected_db);
+            }
+            WalRecordType::XactBegin => {
+                tracing::trace!(lsn = record.lsn, "WAL replay: XactBegin");
+            }
+            WalRecordType::XactCommit => {
+                replay_xact_commit(databases, &record.payload);
+                tracing::trace!(lsn = record.lsn, "WAL replay: XactCommit");
+            }
+            WalRecordType::XactAbort => {
+                tracing::trace!(lsn = record.lsn, "WAL replay: XactAbort");
+            }
+            WalRecordType::TemporalUpsert => {
+                if decode_temporal_upsert(&record.payload).is_none() {
+                    tracing::warn!(
+                        lsn = record.lsn,
+                        "WAL replay: malformed TemporalUpsert payload"
+                    );
+                }
+                // Full state restoration happens in the temporal replay path
+                // (TemporalKvIndex lives on ShardDatabases, not on databases).
+            }
+            WalRecordType::GraphTemporal => {
+                if decode_graph_temporal(&record.payload).is_none() {
+                    tracing::warn!(
+                        lsn = record.lsn,
+                        "WAL replay: malformed GraphTemporal payload"
+                    );
+                }
+                // Full state restoration happens in the graph replay path
+                // (GraphStore lives on ShardDatabases, not on databases).
+            }
+            _ => {
+                // Other record types (Vector*, Checkpoint, etc.) are not
+                // meaningful for the legacy KV-only replay path.
+            }
+        }
+        commands_replayed += 1;
+    };
+    let on_fpi = &mut |_record: &WalRecord| {
+        // No page cache in legacy (non-disk-offload) mode; FPI records are
+        // never written there (WalWriterV3 is created without a page-cache
+        // handle), so this is unreachable in practice but kept for symmetry.
+    };
+
+    replay_wal_v3_dir(wal_dir, 0, on_command, on_fpi)?;
+    Ok(commands_replayed)
+}
+
 /// Replay all WAL v3 segment files in a directory.
 ///
 /// Scans `wal_dir` for `*.wal` files, sorts by filename (zero-padded sequence

@@ -459,3 +459,42 @@ fn pipeline_batch_no_double_write_after_crash_recovery() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// NOTE on NONOFFLOAD-WAL-V3-PREFERRED (dropped, see recovery.rs /
+// wal_v3::replay unit tests instead):
+//
+// An earlier version of this file had a SIGKILL-based integration test here
+// for the `restore_from_persistence_v2` / `recover_shard_v3_pitr` WAL-v3
+// preference fix (see `src/persistence/recovery.rs` and `src/shard/mod.rs`).
+// It was removed after empirical testing (manual server runs against this
+// exact binary) showed it could not reliably exercise the fix:
+//
+// 1. `--disk-offload` defaults to `enable`, so a plain `--shards 1
+//    --appendonly yes` server takes the DISK-OFFLOAD recovery path
+//    (`recover_shard_v3_with_fallback`), not `restore_from_persistence_v2` --
+//    the flag must be passed explicitly.
+// 2. Ordinary local (same-shard-as-connection) KV commands (SET/DEL/...) are
+//    durability-logged ONLY to the multi-part AOF
+//    (`aof_pool.try_send_append_durable`, see `handler_monoio/mod.rs`) --
+//    they never reach WAL v3's `Command` record path at all. WAL v3 only
+//    receives KV data for CROSS-SHARD SPSC-dispatched writes (gated by
+//    `--wal-kv-log`) or WS/MQ/GRAPH/cross-store-TXN records. With `--shards
+//    1` there is no cross-shard dispatch, so WAL v3 stays a bare 64-byte
+//    header regardless of `--wal-kv-log`.
+// 3. Forcing cross-shard dispatch with `--shards 2` is viable (verified: a
+//    shard's `wal-v3` segment DOES grow past the header when it receives
+//    cross-shard writes with `--wal-kv-log on`), but which shard receives
+//    "local" vs "cross-shard" traffic depends on which shard SO_REUSEPORT
+//    assigns each new connection to -- non-deterministic across separate
+//    `redis-cli` invocations, so an assertion over "every key recovered"
+//    cannot be made reliable without a custom persistent-connection client
+//    pinned to a known shard.
+//
+// The fix itself (recovery preferring WAL v3 over a stale/absent AOF when
+// disk-offload is off, or the disk-offload path's AOF fallback additionally
+// checking a legacy-mode WAL v3 dir) is instead covered by deterministic
+// unit tests in `src/persistence/recovery.rs` and
+// `src/persistence/wal_v3/replay.rs`, which construct WAL v3 segments
+// directly (the same pattern every other recovery test in this codebase
+// already uses) rather than depending on which redis-cli command happens to
+// reach WAL v3 in a live server.

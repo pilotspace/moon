@@ -126,10 +126,14 @@ impl Shard {
     /// consistency -> ready). Falls back to the legacy path on v3 failure.
     ///
     /// When `disk_offload_dir` is `None`, uses the legacy path: load the
-    /// per-shard RRDSHARD snapshot, then fall back to appendonly.aof (the
-    /// WAL v2 rung was removed in the pre-1.0 WAL-v3-only format freeze).
+    /// per-shard RRDSHARD snapshot, then replay WAL v3 (written even without
+    /// disk-offload, see `event_loop::run`) preferentially, falling back to
+    /// appendonly.aof only when WAL v3 has nothing (the WAL v2 rung was
+    /// removed in the pre-1.0 WAL-v3-only format freeze; this restores the
+    /// "prefer WAL, fall back to AOF" contract WAL v2 had, using WAL v3 as
+    /// its replacement — see `restore_from_persistence_v2`).
     ///
-    /// Returns total keys loaded (snapshot + AOF replay).
+    /// Returns total keys loaded (snapshot + WAL v3/AOF replay).
     pub fn restore_from_persistence(
         &mut self,
         persistence_dir: &str,
@@ -201,11 +205,22 @@ impl Shard {
         self.restore_from_persistence_v2(persistence_dir)
     }
 
-    /// Legacy recovery path: snapshot load + appendonly.aof replay.
+    /// Legacy recovery path: snapshot load + WAL v3 (preferred) / appendonly.aof
+    /// (fallback) replay.
     ///
     /// Pre-1.0 WAL-v3-only format freeze: the per-shard WAL v2 rung
-    /// (`shard-N.wal`) was removed. The global AOF (`appendonly.aof`, written
-    /// by `aof_writer_task`) is the recovery authority for this path.
+    /// (`shard-N.wal`) was removed and is no longer replayed by this build —
+    /// see the loud `tracing::error!` below if one is still on disk. WAL v3
+    /// is now ALSO written in this (non-disk-offload) mode, rooted at
+    /// `shard-N/wal-v3/` (see `event_loop::run`'s writer-creation block),
+    /// fsynced on the same 1s cadence the retired WAL v2 writer used
+    /// regardless of `--appendfsync`. To preserve the property WAL v2 gave
+    /// ("prefer the WAL, fall back to `appendonly.aof` only if the WAL
+    /// replayed zero commands" — the AOF's own fsync obeys `--appendfsync`,
+    /// so under `--appendfsync no` the WAL can be durably ahead of the AOF),
+    /// this replays WAL v3 first and only touches the AOF when WAL v3 has
+    /// nothing. See `wal_v3::replay::replay_wal_v3_dir_commands` for the
+    /// full rationale.
     fn restore_from_persistence_v2(&mut self, persistence_dir: &str) -> usize {
         use crate::persistence::snapshot::shard_snapshot_load;
 
@@ -226,19 +241,59 @@ impl Shard {
             }
         }
 
-        let aof_path = dir.join("appendonly.aof");
-        if aof_path.exists() {
-            match crate::persistence::aof::replay_aof(
-                &mut self.databases,
-                &aof_path,
-                &DispatchReplayEngine::new(),
-            ) {
-                Ok(n) => {
-                    info!("Shard {}: replayed {} AOF commands", self.id, n);
-                    total_keys += n;
-                }
-                Err(e) => {
-                    tracing::error!("Shard {}: AOF replay failed: {}", self.id, e);
+        // Loud failure (not silent skip) for a leftover pre-freeze WAL v2
+        // file. WAL v2 support was removed in this build; the file below is
+        // NEVER consulted by any recovery path in this binary, so an
+        // operator who upgraded over a v2-only deployment must find out
+        // immediately rather than discover a silent recovery gap later.
+        let legacy_v2_wal = dir.join(format!("shard-{}.wal", self.id));
+        if legacy_v2_wal.exists() {
+            tracing::error!(
+                "Shard {}: found legacy WAL v2 file {:?} — WAL v2 support was \
+                 removed (pre-1.0 WAL-v3-only format freeze) and this build \
+                 does NOT replay it. If its contents are not already reflected \
+                 in appendonly.aof, replay it on a pre-freeze Moon build first \
+                 (which re-persists through the AOF) before removing this file.",
+                self.id,
+                legacy_v2_wal
+            );
+        }
+
+        // Prefer WAL v3 over the AOF (mirrors the retired WAL v2 contract).
+        let wal_v3_dir = dir.join(format!("shard-{}", self.id)).join("wal-v3");
+        let wal_replayed = match crate::persistence::wal_v3::replay::replay_wal_v3_dir_commands(
+            &wal_v3_dir,
+            &mut self.databases,
+            &DispatchReplayEngine::new(),
+        ) {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::error!("Shard {}: WAL v3 replay failed: {}", self.id, e);
+                0
+            }
+        };
+
+        if wal_replayed > 0 {
+            info!(
+                "Shard {}: replayed {} WAL v3 commands (preferred over AOF)",
+                self.id, wal_replayed
+            );
+            total_keys += wal_replayed;
+        } else {
+            let aof_path = dir.join("appendonly.aof");
+            if aof_path.exists() {
+                match crate::persistence::aof::replay_aof(
+                    &mut self.databases,
+                    &aof_path,
+                    &DispatchReplayEngine::new(),
+                ) {
+                    Ok(n) => {
+                        info!("Shard {}: replayed {} AOF commands", self.id, n);
+                        total_keys += n;
+                    }
+                    Err(e) => {
+                        tracing::error!("Shard {}: AOF replay failed: {}", self.id, e);
+                    }
                 }
             }
         }
@@ -525,6 +580,105 @@ mod tests {
             &mut inflight_sends,
             None,
             &clock,
+        );
+    }
+
+    // ── restore_from_persistence_v2: WAL v3 preferred over AOF (fix for
+    // review finding P0#1) ─────────────────────────────────────────────────
+    //
+    // WAL v3 is written even without --disk-offload (see event_loop::run's
+    // writer-creation block), so the legacy (non-disk-offload) recovery path
+    // must replay it -- preferring it over `appendonly.aof`, mirroring the
+    // retired WAL v2 contract -- instead of only ever checking the AOF. See
+    // `src/persistence/recovery.rs`'s equivalent tests for the disk-offload
+    // path's analogous fallback fix.
+
+    #[test]
+    fn test_restore_from_persistence_v2_prefers_wal_v3_over_aof() {
+        use crate::persistence::wal_v3::record::{WalRecordType, write_wal_v3_record};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+
+        // Populated `shard-0/wal-v3/` (3 records) -- written even without
+        // disk-offload.
+        let wal_dir = dir.join("shard-0").join("wal-v3");
+        std::fs::create_dir_all(&wal_dir).unwrap();
+        let mut header = vec![0u8; 64];
+        header[0..6].copy_from_slice(b"RRDWAL");
+        header[6] = 3; // version = 3
+        let mut wal_data = header;
+        for i in 1..=3u64 {
+            write_wal_v3_record(
+                &mut wal_data,
+                i,
+                WalRecordType::Command,
+                b"*1\r\n$4\r\nPING\r\n",
+            );
+        }
+        std::fs::write(wal_dir.join("000000000001.wal"), &wal_data).unwrap();
+
+        // A shorter `appendonly.aof` (1 record) -- must NOT be preferred.
+        std::fs::write(dir.join("appendonly.aof"), b"*1\r\n$4\r\nPING\r\n").unwrap();
+
+        let config = RuntimeConfig::default();
+        let mut shard = Shard::new(0, 1, 1, config);
+        let total = shard.restore_from_persistence_v2(dir.to_str().unwrap());
+
+        assert_eq!(
+            total, 3,
+            "restore_from_persistence_v2 must prefer the 3-record WAL v3 \
+             directory over the 1-record appendonly.aof -- got {} (AOF was \
+             used instead of the WAL if this is 1)",
+            total
+        );
+    }
+
+    #[test]
+    fn test_restore_from_persistence_v2_falls_back_to_aof_when_wal_v3_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+
+        // No `shard-0/wal-v3/` at all -- only the AOF.
+        std::fs::write(
+            dir.join("appendonly.aof"),
+            b"*1\r\n$4\r\nPING\r\n*1\r\n$4\r\nPING\r\n",
+        )
+        .unwrap();
+
+        let config = RuntimeConfig::default();
+        let mut shard = Shard::new(0, 1, 1, config);
+        let total = shard.restore_from_persistence_v2(dir.to_str().unwrap());
+
+        assert_eq!(
+            total, 2,
+            "with no WAL v3 data at all, the AOF fallback must still work \
+             exactly as before this fix"
+        );
+    }
+
+    #[test]
+    fn test_restore_from_persistence_v2_stray_legacy_v2_wal_does_not_break_aof() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+
+        // Stray pre-freeze WAL v2 file (`shard-0.wal`, RRDWAL version=2) must
+        // be loudly logged and ignored, not crash recovery or block the AOF
+        // fallback.
+        let mut legacy_v2_wal = vec![0u8; 32];
+        legacy_v2_wal[0..6].copy_from_slice(b"RRDWAL");
+        legacy_v2_wal[6] = 2;
+        std::fs::write(dir.join("shard-0.wal"), &legacy_v2_wal).unwrap();
+        std::fs::write(dir.join("appendonly.aof"), b"*1\r\n$4\r\nPING\r\n").unwrap();
+
+        let config = RuntimeConfig::default();
+        let mut shard = Shard::new(0, 1, 1, config);
+        let total = shard.restore_from_persistence_v2(dir.to_str().unwrap());
+
+        assert_eq!(
+            total, 1,
+            "a stray legacy v2 WAL file must not prevent the AOF fallback \
+             from working"
         );
     }
 }

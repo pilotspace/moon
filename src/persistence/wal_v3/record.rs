@@ -467,8 +467,16 @@ mod tests {
         // 0x51 was the deleted pre-1.0 v1 XactCommit discriminant. It is
         // deliberately NOT reused -- a v3 stream containing a stray 0x51
         // record (e.g. written by a pre-freeze build) must decode as an
-        // unrecognized tag (warn + skip in the replay engine), not silently
-        // reinterpreted as today's XactCommit.
+        // unrecognized tag, not silently reinterpreted as today's
+        // XactCommit. Note the replay engine does NOT skip just this one
+        // record: `read_wal_v3_record` returns `None` for any unrecognized
+        // tag, and the segment replay loop (`replay_wal_v3_file_until` in
+        // `wal_v3::replay`) treats `None` identically to a corrupt/truncated
+        // record -- it warns and stops replaying the REST of that segment.
+        // (0x51 was already dead in production before this refactor -- no
+        // shipped build ever wrote it via a real TXN.COMMIT -- so this is a
+        // latent robustness note for future record-type additions, not a
+        // live data-loss path today.)
         assert!(WalRecordType::from_u8(0x51).is_none());
     }
 
