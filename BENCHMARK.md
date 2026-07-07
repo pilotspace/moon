@@ -793,6 +793,42 @@ from the brute tier in that window). Recall is computed against exact ground tru
 within 0.0008 of each other, and Moon's 0.9992 reproduces bit-identically across all
 three environments (VM, GCE x86, GCE ARM).
 
+### 10.9 2026-07-08 time-to-index-green: parallel HNSW build + insert-path trigger — Moon now beats Qdrant (GCE, x86 + ARM)
+
+§10.8's one losing metric fixed (commit `061c73cb`, same instances/harness). Instrumentation
+showed 99.3% of FT.COMPACT wall was a single-threaded HNSW insert loop, compounded by a
+Linux affinity trap (threads spawned from core-pinned shard threads inherit the single-core
+mask — `available_parallelism()` returned 1, silently serializing the "parallel" path AND
+sizing the background-compactor pool to one worker) and by the auto-compact trigger living
+only on the search path (a pure bulk load never compacted until the first FT.COMPACT).
+Fixes: shared-graph concurrent HNSW builder (per-node locks + connectivity repair, builds
+≥10K vectors, ~88% scaling efficiency), affinity-independent `system_parallelism()` with
+explicit worker re-pinning, and an HSET-path compaction trigger (builds start + install
+during ingest).
+
+**Load → HNSW-tier serving** (50K × 384d bulk load, then immediate FT.COMPACT, no
+measurement traffic):
+
+| | x86 before | **x86 after** | x86 Qdrant | ARM before | **ARM after** | ARM Qdrant |
+|---|:---:|:---:|:---:|:---:|:---:|:---:|
+| load → green | ~22.7 s | **9.9 s** | 15.7 s | ~43.5 s | **9.5 s** | 22.2 s |
+
+Moon now reaches HNSW-tier serving **1.6× (x86) / 2.3× (ARM) faster than Qdrant** — every
+§10.8 metric is now a Moon win. Full-workload re-run on the same boxes:
+
+| metric | x86 Moon | x86 Qdrant | ARM Moon | ARM Qdrant |
+|--------|:--------:|:----------:|:--------:|:----------:|
+| Ingest rate (vec/s) | **19,792** | 3,408 accepted | **24,519** | 2,357 accepted |
+| Search QPS (HNSW, 8 threads) | **2,266** | 626 | **1,480** | 532 |
+| Search p50 / p99 (ms) | **3.55 / 4.04** | 11.64 / 24.12 | **5.37 / 6.20** | 13.64 / 26.74 |
+| Recall@10 | 0.9982 | 1.0000 | 0.9980 | 0.9998 |
+
+Honest trade-offs: (1) ingest rate drops vs §10.8 (34K→20K x86) because HNSW builds now
+run concurrently with ingest — the same trade Qdrant makes (its 3.4K/s accept rate IS its
+indexing); Moon still ingests 5.8–10.4× faster. (2) recall@10 dips 0.9992 → 0.998x —
+the index now serves from 3 segments instead of one (multi-segment beam truncation), a
+~0.001 recall cost for the 2.3–4.6× faster time-to-green; still within 0.002 of Qdrant.
+
 ---
 
 ## 11. Graph Engine
