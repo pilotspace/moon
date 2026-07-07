@@ -7,10 +7,12 @@
 //! The cost estimator selects between graph-first and vector-first strategies
 //! based on per-graph `GraphStats` (degree distribution, node/edge counts).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::graph::cypher::ast::*;
+use crate::graph::cypher::executor::{SlotTable, Value};
+use crate::graph::fasthash::FxHashMap;
 use crate::graph::stats::GraphStats;
 
 /// A compiled physical plan: a sequence of operators.
@@ -163,8 +165,54 @@ impl core::fmt::Display for PlanError {
     }
 }
 
-/// Plan cache: maps xxhash of the (literal-normalized) Cypher text to a
-/// compiled plan, with LRU eviction.
+/// A cache hit: the compiled plan, its precomputed `SlotTable`, and (for
+/// raw-bytes-hash entries only) the auto-extracted parameter values that
+/// belong to this EXACT query text.
+#[derive(Clone)]
+pub struct CachedPlan {
+    pub plan: Arc<PhysicalPlan>,
+    /// Built once via `SlotTable::from_plan` at insert time. A cache hit
+    /// reuses this instead of rebuilding it every execution (`SlotTable`
+    /// depends only on the plan's bound variables, which are fixed for a
+    /// given `PhysicalPlan`).
+    pub slots: Arc<SlotTable>,
+    /// Non-empty ONLY for entries keyed by the raw query-bytes hash:
+    /// `parameterize()` is a pure function of the exact input bytes, so a
+    /// raw-hash hit can replay these values without re-lexing. Entries keyed
+    /// by the literal-normalized hash are shared across many distinct
+    /// literal values and are always empty here -- callers must re-derive
+    /// params for that specific query text via `parameterize()`.
+    pub auto_params: Arc<Vec<(String, Value)>>,
+    /// Whether the cached plan is read-only (W2-7 caches WRITE plans too) —
+    /// callers MUST route on this flag (see `PlanCache` docs).
+    pub read_only: bool,
+}
+
+struct CacheEntry {
+    plan: Arc<PhysicalPlan>,
+    slots: Arc<SlotTable>,
+    auto_params: Arc<Vec<(String, Value)>>,
+    read_only: bool,
+    used: u64,
+}
+
+/// Plan cache: maps a query hash to a compiled plan, with LRU eviction.
+///
+/// Two kinds of keys point at the same underlying plan (Fix 2 -- allocation
+/// -free exact repeats):
+/// - the raw query-bytes hash (`hash_query` on the client's exact text) --
+///   inserted so an exact repeat hits without running `parameterize()` at
+///   all, and carries that text's `auto_params` alongside it;
+/// - the literal-normalized hash -- the pre-existing key, shared across
+///   every raw query that normalizes to the same text (i.e. differs only in
+///   literal values), so it MUST NOT carry a fixed set of `auto_params`.
+///
+/// `FxHashMap`-keyed (not `SipHash`): the map key is already a fixed-size
+/// u64 digest (xxhash64 of query bytes), never raw attacker bytes directly
+/// -- see `crate::graph::fasthash` for the DoS-surface contract this relies
+/// on -- and the cache is bounded by `max_entries` (LRU-evicted), so even a
+/// deliberately hash-flooded cache degrades to O(max_entries) per lookup,
+/// not unbounded blowup.
 ///
 /// Entries carry a `read_only` flag (W2-7 caches WRITE plans too). The
 /// safety invariant moved from "only read-only plans may be inserted" to
@@ -173,7 +221,7 @@ impl core::fmt::Display for PlanError {
 /// with zero parse/compile work; the pure read handlers treat a write hit
 /// as a miss.
 pub struct PlanCache {
-    cache: HashMap<u64, (Arc<PhysicalPlan>, bool, u64)>,
+    cache: FxHashMap<u64, CacheEntry>,
     max_entries: usize,
     /// Monotonic access counter backing LRU eviction.
     tick: u64,
@@ -183,26 +231,88 @@ impl PlanCache {
     /// Create a new plan cache with the given maximum size.
     pub fn new(max_entries: usize) -> Self {
         Self {
-            cache: HashMap::new(),
+            cache: FxHashMap::default(),
             max_entries,
             tick: 0,
         }
     }
 
     /// Look up a cached plan by query hash, marking it most-recently-used.
-    /// Returns the plan and whether it is read-only — callers MUST route on
-    /// the flag (see type docs).
-    pub fn get(&mut self, hash: u64) -> Option<(Arc<PhysicalPlan>, bool)> {
+    pub fn get(&mut self, hash: u64) -> Option<CachedPlan> {
         self.tick += 1;
         let tick = self.tick;
-        self.cache.get_mut(&hash).map(|(plan, read_only, used)| {
-            *used = tick;
-            (plan.clone(), *read_only)
+        self.cache.get_mut(&hash).map(|e| {
+            e.used = tick;
+            CachedPlan {
+                plan: e.plan.clone(),
+                slots: e.slots.clone(),
+                auto_params: e.auto_params.clone(),
+                read_only: e.read_only,
+            }
         })
     }
 
-    /// Insert a plan, evicting the least-recently-used entry at capacity.
-    pub fn insert(&mut self, hash: u64, plan: Arc<PhysicalPlan>, read_only: bool) {
+    /// Insert a plan under the literal-normalized hash, evicting the
+    /// least-recently-used entry at capacity. No `auto_params` are cached
+    /// (see `PlanCache` docs) -- callers re-derive them per query text.
+    /// `read_only` marks whether the plan may run on the read path (W2-7).
+    ///
+    /// Returns the freshly-built `SlotTable` so the caller can execute
+    /// immediately without rebuilding it a second time.
+    pub fn insert(
+        &mut self,
+        hash: u64,
+        plan: Arc<PhysicalPlan>,
+        read_only: bool,
+    ) -> Arc<SlotTable> {
+        let slots = Arc::new(SlotTable::from_plan(&plan));
+        self.put(hash, plan, slots.clone(), Arc::new(Vec::new()), read_only);
+        slots
+    }
+
+    /// Insert a plan under BOTH the raw query-bytes hash and (if different)
+    /// the literal-normalized hash, sharing one `Arc`'d plan + `SlotTable`.
+    /// `raw_auto_params` are the auto-extracted values for THIS raw query
+    /// text and are cached only on the raw-hash entry.
+    ///
+    /// Returns the freshly-built `SlotTable` so the caller can execute
+    /// immediately without rebuilding it a second time.
+    pub fn insert_both(
+        &mut self,
+        raw_hash: u64,
+        normalized_hash: u64,
+        plan: Arc<PhysicalPlan>,
+        raw_auto_params: Vec<(String, Value)>,
+        read_only: bool,
+    ) -> Arc<SlotTable> {
+        let slots = Arc::new(SlotTable::from_plan(&plan));
+        self.put(
+            raw_hash,
+            plan.clone(),
+            slots.clone(),
+            Arc::new(raw_auto_params),
+            read_only,
+        );
+        if normalized_hash != raw_hash {
+            self.put(
+                normalized_hash,
+                plan,
+                slots.clone(),
+                Arc::new(Vec::new()),
+                read_only,
+            );
+        }
+        slots
+    }
+
+    fn put(
+        &mut self,
+        hash: u64,
+        plan: Arc<PhysicalPlan>,
+        slots: Arc<SlotTable>,
+        auto_params: Arc<Vec<(String, Value)>>,
+        read_only: bool,
+    ) {
         self.tick += 1;
         if self.cache.len() >= self.max_entries && !self.cache.contains_key(&hash) {
             // O(capacity) scan; eviction only fires when a full cache takes a
@@ -210,18 +320,54 @@ impl PlanCache {
             let lru = self
                 .cache
                 .iter()
-                .min_by_key(|(_, (_, _, used))| *used)
+                .min_by_key(|(_, e)| e.used)
                 .map(|(k, _)| *k);
             if let Some(lru) = lru {
                 self.cache.remove(&lru);
             }
         }
-        self.cache.insert(hash, (plan, read_only, self.tick));
+        self.cache.insert(
+            hash,
+            CacheEntry {
+                plan,
+                slots,
+                auto_params,
+                read_only,
+                used: self.tick,
+            },
+        );
     }
 
-    /// Number of cached plans.
+    /// Number of hash-key entries in the cache (raw-bytes-hash and
+    /// literal-normalized-hash keys counted separately). This is what
+    /// `max_entries` bounds and what LRU eviction operates on.
+    ///
+    /// A dual-keyed insert (`insert_both`) can add up to 2 entries for a
+    /// single distinct plan — use `distinct_plan_count()` if you want "how
+    /// many different compiled plans are resident" instead.
     pub fn len(&self) -> usize {
         self.cache.len()
+    }
+
+    /// Number of *distinct* compiled plans currently cached, deduplicated by
+    /// `Arc` identity. Two hash keys inserted by the same `insert_both` call
+    /// point at the same `Arc<PhysicalPlan>` and count once here, even
+    /// though they occupy two slots in `len()` / `max_entries`.
+    ///
+    /// This is the metric callers actually care about when asserting
+    /// "queries differing only in literal values share one cached plan":
+    /// `len()` would (correctly) report 2 for that case (the raw-hash entry
+    /// for each literal variant, both aliasing one shared normalized-hash
+    /// entry) -- `distinct_plan_count()` reports 1.
+    pub fn distinct_plan_count(&self) -> usize {
+        let mut seen: Vec<*const PhysicalPlan> = Vec::with_capacity(self.cache.len());
+        for entry in self.cache.values() {
+            let ptr = Arc::as_ptr(&entry.plan);
+            if !seen.contains(&ptr) {
+                seen.push(ptr);
+            }
+        }
+        seen.len()
     }
 
     /// Whether the cache is empty.
@@ -1151,8 +1297,8 @@ mod tests {
         let plan = Arc::new(PhysicalPlan { operators: vec![] });
         cache.insert(1, plan.clone(), true);
         cache.insert(2, plan.clone(), false);
-        assert_eq!(cache.get(1).map(|(_, ro)| ro), Some(true));
-        assert_eq!(cache.get(2).map(|(_, ro)| ro), Some(false));
+        assert_eq!(cache.get(1).map(|c| c.read_only), Some(true));
+        assert_eq!(cache.get(2).map(|c| c.read_only), Some(false));
     }
 
     #[test]
@@ -1174,6 +1320,131 @@ mod tests {
         );
         assert!(cache.get(3).is_some());
         assert_eq!(cache.len(), 2);
+    }
+
+    #[test]
+    fn test_plan_cache_insert_both_shares_plan_and_slots() {
+        // Fix 2: a raw-bytes-hash entry and its literal-normalized sibling
+        // must point at the SAME Arc'd plan and SlotTable (no rebuild), and
+        // ONLY the raw-hash entry carries auto_params.
+        let mut cache = PlanCache::new(8);
+        let plan = Arc::new(PhysicalPlan {
+            operators: vec![PhysicalOp::NodeScan {
+                variable: "n".to_string(),
+                label: None,
+            }],
+        });
+        let raw_hash = 100;
+        let normalized_hash = 200;
+        let auto_params = vec![("auto0".to_string(), Value::Int(42))];
+        cache.insert_both(
+            raw_hash,
+            normalized_hash,
+            plan.clone(),
+            auto_params.clone(),
+            true,
+        );
+        assert_eq!(cache.len(), 2, "raw + normalized keys are distinct entries");
+
+        let raw_hit = cache.get(raw_hash).expect("raw-hash hit");
+        let norm_hit = cache.get(normalized_hash).expect("normalized-hash hit");
+
+        assert!(
+            Arc::ptr_eq(&raw_hit.plan, &norm_hit.plan),
+            "both keys must share the identical Arc'd plan (no recompile)"
+        );
+        assert!(
+            Arc::ptr_eq(&raw_hit.slots, &norm_hit.slots),
+            "both keys must share the identical Arc'd SlotTable (no rebuild)"
+        );
+        // `Value` has no `PartialEq` impl -- check shape + the one variant
+        // that matters here (Int) directly.
+        assert_eq!(raw_hit.auto_params.len(), 1);
+        assert_eq!(raw_hit.auto_params[0].0, "auto0");
+        assert!(
+            matches!(raw_hit.auto_params[0].1, Value::Int(42)),
+            "raw-hash entry replays this exact text's auto_params without re-lexing"
+        );
+        assert!(
+            norm_hit.auto_params.is_empty(),
+            "normalized-hash entry must NOT carry a fixed set of auto_params \
+             (it is shared across many distinct literal values)"
+        );
+    }
+
+    #[test]
+    fn test_plan_cache_insert_both_same_hash_dedups() {
+        // A query with no literals to extract normalizes to itself, so
+        // raw_hash == normalized_hash -- must not create two entries.
+        let mut cache = PlanCache::new(8);
+        let plan = Arc::new(PhysicalPlan { operators: vec![] });
+        cache.insert_both(50, 50, plan, Vec::new(), true);
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn test_plan_cache_raw_hash_hit_avoids_reparse_counter() {
+        // Simulates the graph_read.rs call site: a raw-hash pre-lookup that
+        // hits must let the caller skip parameterize() entirely. Modeled
+        // here via an external "reparse" counter the caller would only
+        // increment on a raw-hash MISS.
+        let mut cache = PlanCache::new(8);
+        let plan = Arc::new(PhysicalPlan { operators: vec![] });
+        let raw_hash = hash_query(b"MATCH (n:Person {id: 7}) RETURN n");
+        let normalized_hash = hash_query(b"MATCH (n:Person {id: $auto0}) RETURN n");
+
+        let mut reparse_count = 0u32;
+        // First call: miss -> caller "parses" (increments counter) then inserts.
+        if cache.get(raw_hash).is_none() {
+            reparse_count += 1;
+            cache.insert_both(
+                raw_hash,
+                normalized_hash,
+                plan.clone(),
+                vec![("auto0".to_string(), Value::Int(7))],
+                true,
+            );
+        }
+        assert_eq!(reparse_count, 1);
+
+        // Second (and third) call: exact repeat hits the raw-hash key ->
+        // no reparse.
+        for _ in 0..2 {
+            if cache.get(raw_hash).is_none() {
+                reparse_count += 1;
+            }
+        }
+        assert_eq!(
+            reparse_count, 1,
+            "exact-repeat queries must hit the raw-hash key without reparsing"
+        );
+    }
+
+    #[test]
+    fn test_plan_cache_lru_eviction_with_dual_keys() {
+        // LRU eviction must still function correctly once entries can arrive
+        // in raw+normalized pairs.
+        let mut cache = PlanCache::new(2);
+        let plan = Arc::new(PhysicalPlan { operators: vec![] });
+        cache.insert_both(
+            1,
+            2,
+            plan.clone(),
+            vec![("a".to_string(), Value::Int(1))],
+            true,
+        );
+        assert_eq!(cache.len(), 2);
+        // Cache is now full (max_entries=2). A brand-new key must evict the
+        // least-recently-used entry (raw key 1, since normalized key 2 was
+        // inserted after it and is therefore more recently used).
+        cache.insert(3, plan, true);
+        assert_eq!(cache.len(), 2);
+        assert!(
+            cache.get(1).is_none(),
+            "least-recently-used raw-hash entry must be evicted"
+        );
+        assert!(cache.get(2).is_some());
+        assert!(cache.get(3).is_some());
     }
 
     #[test]

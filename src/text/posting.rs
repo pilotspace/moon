@@ -215,6 +215,21 @@ impl PostingStore {
                     }
                 }
                 removed.push((term_id, old_tf));
+                // The `postings` HashMap entry itself is kept even when empty
+                // (see doc comment on `remove_doc` — callers rely on
+                // `tf`/`doc_freq` for a "term with zero live docs" staying
+                // answerable without a fresh insert). But once the LAST doc
+                // leaves, the entry's Vec buffers have no reason to keep
+                // capacity sized for a document count of zero — release it.
+                // Reallocation on the next occurrence of this term is a
+                // one-time, bounded cost; the alternative is holding peak
+                // capacity forever for a term that may never recur.
+                if posting.doc_ids.is_empty() {
+                    posting.term_freqs.shrink_to_fit();
+                    if let Some(pos_list) = &mut posting.positions {
+                        pos_list.shrink_to_fit();
+                    }
+                }
             }
         }
         removed
@@ -266,5 +281,91 @@ impl PostingStore {
             }
         }
         total
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// RSS/CPU wave 5 (item A hygiene follow-up): a posting's `term_freqs`
+    /// (and `positions`, when tracked) grow to the peak document count ever
+    /// seen for that term. The `postings` HashMap entry is intentionally
+    /// kept forever once created (existing contract — see `remove_doc` doc
+    /// comment), but the per-entry `Vec` buffers must not hold onto peak
+    /// capacity once every document has been removed.
+    #[test]
+    fn remove_doc_shrinks_now_empty_posting_capacity() {
+        let mut store = PostingStore::new();
+        for doc_id in 0..500u32 {
+            store.add_term_occurrence(7, doc_id, None);
+        }
+        let peak_cap = store.get_posting(7).unwrap().term_freqs.capacity();
+        assert!(peak_cap >= 500, "expected growth to >=500, got {peak_cap}");
+
+        for doc_id in 0..500u32 {
+            store.remove_doc(doc_id);
+        }
+
+        // Entry survives (existing contract) ...
+        let posting = store.get_posting(7).expect("entry must survive removal");
+        assert_eq!(posting.doc_ids.len(), 0);
+        assert_eq!(posting.tf(0), 0);
+        // ... but its buffer no longer holds peak capacity.
+        assert!(
+            posting.term_freqs.capacity() < peak_cap,
+            "expected shrink after last doc removed: peak={peak_cap} still={}",
+            posting.term_freqs.capacity()
+        );
+    }
+
+    /// Same shrink must apply to the `positions` buffer when position
+    /// tracking is enabled for the term.
+    #[test]
+    fn remove_doc_shrinks_now_empty_posting_positions_capacity() {
+        let mut store = PostingStore::new();
+        for doc_id in 0..300u32 {
+            store.add_term_occurrence(3, doc_id, Some(vec![doc_id]));
+        }
+        let peak_cap = store
+            .get_posting(3)
+            .unwrap()
+            .positions
+            .as_ref()
+            .unwrap()
+            .capacity();
+        assert!(peak_cap >= 300);
+
+        for doc_id in 0..300u32 {
+            store.remove_doc(doc_id);
+        }
+
+        let posting = store.get_posting(3).unwrap();
+        let pos_cap = posting.positions.as_ref().unwrap().capacity();
+        assert!(
+            pos_cap < peak_cap,
+            "expected positions shrink: peak={peak_cap} still={pos_cap}"
+        );
+    }
+
+    /// A term that still has live documents after a removal must not be
+    /// touched by the shrink (only a fully-emptied posting shrinks).
+    #[test]
+    fn remove_doc_does_not_shrink_still_live_posting() {
+        let mut store = PostingStore::new();
+        for doc_id in 0..50u32 {
+            store.add_term_occurrence(1, doc_id, None);
+        }
+        let cap_before = store.get_posting(1).unwrap().term_freqs.capacity();
+
+        store.remove_doc(0); // one doc gone, 49 remain live
+
+        let posting = store.get_posting(1).unwrap();
+        assert_eq!(posting.doc_ids.len(), 49);
+        assert_eq!(
+            posting.term_freqs.capacity(),
+            cap_before,
+            "must not shrink while the posting still has live docs"
+        );
     }
 }

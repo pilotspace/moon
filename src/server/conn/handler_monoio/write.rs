@@ -142,7 +142,7 @@ pub(super) async fn try_handle_ws_command(
                                         prefix: prefix_bytes,
                                         reply_tx,
                                     };
-                                    crate::shard::coordinator::spsc_send(
+                                    let _ = crate::shard::coordinator::spsc_send(
                                         &ctx.dispatch_tx,
                                         ctx.shard_id,
                                         owner,
@@ -544,7 +544,7 @@ async fn mq_hop_or_local(
             reply_tx,
         };
         let msg = crate::shard::dispatch::ShardMessage::MqCommand(Box::new(payload));
-        crate::shard::coordinator::spsc_send(
+        let _ = crate::shard::coordinator::spsc_send(
             &ctx.dispatch_tx,
             ctx.shard_id,
             owner,
@@ -661,7 +661,7 @@ pub(super) async fn try_handle_graph_command(
                     command: std::sync::Arc::new(frame.clone()),
                     reply_tx,
                 };
-                crate::shard::coordinator::spsc_send(
+                let _ = crate::shard::coordinator::spsc_send(
                     &ctx.dispatch_tx,
                     ctx.shard_id,
                     owner,

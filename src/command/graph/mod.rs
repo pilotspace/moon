@@ -304,11 +304,15 @@ mod tests {
         );
 
         let graph = store.get_graph(b"g").expect("graph exists");
+        // Dual-key cache: each shape stores the first variant's raw-text hash
+        // plus the shared literal-normalized hash (2 entries/shape); the
+        // second variant hits the normalized entry, adding nothing. One WRITE
+        // plan for both CREATEs (W2-7) + one READ plan for both MATCHes.
         assert_eq!(
             graph.plan_cache.lock().len(),
-            2,
-            "literal variants must share one cached plan per shape: one WRITE \
-             plan for both CREATEs (W2-7) + one READ plan for both MATCHes"
+            4,
+            "literal variants must share one cached plan per shape \
+             (raw + normalized key each for the CREATE and MATCH shapes)"
         );
     }
 
@@ -358,9 +362,12 @@ mod tests {
         );
 
         let graph = store.get_graph(b"g").expect("graph exists");
+        // Dual-key cache: 2 entries per shape (first variant's raw hash +
+        // shared normalized hash) — see test_plan_cache_shared_across_
+        // literal_variants for the breakdown.
         assert_eq!(
             graph.plan_cache.lock().len(),
-            2,
+            4,
             "string-literal variants must share one cached plan per shape \
              (one write, one read — W2-7 caches writes too)"
         );
@@ -408,7 +415,7 @@ mod tests {
 
         let graph = store.get_graph(b"g").expect("graph exists");
         assert_eq!(
-            graph.plan_cache.lock().len(),
+            graph.plan_cache.lock().distinct_plan_count(),
             2,
             "different hop bounds must compile to distinct cached plans"
         );

@@ -78,6 +78,14 @@ pub struct ServerConfig {
     #[arg(long, default_value_t = 16)]
     pub databases: usize,
 
+    /// TCP listen backlog per listening socket. With per-shard SO_REUSEPORT
+    /// accept the kernel splits the SYN load across shards, so this is a
+    /// per-socket bound (Redis single-socket default is 511; Moon's
+    /// historical hardcoded value was 1024). Raise for connection-storm
+    /// workloads alongside `ulimit -n` and net.core.somaxconn.
+    #[arg(long = "tcp-backlog", default_value_t = 1024)]
+    pub tcp_backlog: i32,
+
     /// Require clients to authenticate with this password
     #[arg(long)]
     pub requirepass: Option<String>,
@@ -464,7 +472,13 @@ pub struct ServerConfig {
     /// Writes resume when free % > `disk_free_min_pct + 5` (hysteresis).
     ///
     /// Set to 0 to disable the monitor entirely.
-    #[arg(long = "disk-free-min-pct", default_value_t = 5, value_parser = clap::value_parser!(u8).range(0..=95))]
+    ///
+    /// Also settable via `MOON_DISK_FREE_MIN_PCT` (CLI flag wins). The env
+    /// form exists for test harnesses and CI runners whose root filesystem
+    /// legitimately sits below the 5% default (GitHub windows-latest images
+    /// do): one exported var relaxes the guard for every server a test tree
+    /// spawns, without threading the flag through each spawn helper.
+    #[arg(long = "disk-free-min-pct", env = "MOON_DISK_FREE_MIN_PCT", default_value_t = 5, value_parser = clap::value_parser!(u8).range(0..=95))]
     pub disk_free_min_pct: u8,
 
     // ── Wave 3: proactive RSS memory watchdog ("mem-full guard") ───────────
@@ -1286,6 +1300,35 @@ mod tests {
     fn test_shards_zero_is_explicit_auto_detect() {
         let config = ServerConfig::parse_from(["moon", "--shards", "0"]);
         assert_eq!(config.shards, 0);
+    }
+
+    /// `MOON_DISK_FREE_MIN_PCT` env override for `--disk-free-min-pct`.
+    ///
+    /// Test harnesses (and CI runners whose root disk legitimately sits
+    /// below the 5% default — GitHub's windows-latest images do) need a way
+    /// to relax the diskfull guard for a whole tree of spawned servers
+    /// without threading a flag through every spawn helper. The explicit
+    /// CLI flag must still win over the env var (clap semantics).
+    ///
+    /// SAFETY of env mutation in a test: no other config test reads this
+    /// var, and `set_var`/`remove_var` happen strictly around the parses.
+    #[test]
+    fn test_disk_free_min_pct_env_override() {
+        // SAFETY: single-threaded mutation scoped to this test; no other
+        // test in this binary reads MOON_DISK_FREE_MIN_PCT.
+        unsafe { std::env::set_var("MOON_DISK_FREE_MIN_PCT", "0") };
+        let config = ServerConfig::parse_from::<[&str; 0], &str>([]);
+        assert_eq!(
+            config.disk_free_min_pct, 0,
+            "env var must override the default"
+        );
+        // Explicit CLI flag beats the env var.
+        let config = ServerConfig::parse_from(["moon", "--disk-free-min-pct", "7"]);
+        assert_eq!(config.disk_free_min_pct, 7, "CLI flag must beat env var");
+        // SAFETY: see above.
+        unsafe { std::env::remove_var("MOON_DISK_FREE_MIN_PCT") };
+        let config = ServerConfig::parse_from::<[&str; 0], &str>([]);
+        assert_eq!(config.disk_free_min_pct, 5, "default restored without env");
     }
 
     #[test]

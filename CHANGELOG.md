@@ -6,6 +6,263 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — TopLevel-monoio AOF writer: EverySec fsync deferred indefinitely when idle (PR #TBD)
+
+- **`src/persistence/aof/writer_task.rs`**: the TopLevel monoio AOF writer
+  blocked on an **untimed** `rx.recv()`, with its EverySec deadline check
+  living only inside the batch-commit path. A batch written under
+  `appendfsync everysec` gets no per-batch fsync, so if the client stopped
+  writing right after a burst, the buffered bytes only became durable when
+  the NEXT message happened to arrive — the 1s fsync bound was deferred
+  indefinitely while idle. Exposure is host-crash-only (the per-batch
+  `flush()` already reaches the kernel page cache, so a plain process kill
+  loses nothing), which is exactly the window EverySec exists to bound.
+  The loop now mirrors the audited PerShard writers: bounded
+  `recv_timeout` on the wave-5 `IdleWait` ladder (50ms → 250ms → 1s,
+  pinned at the floor while a batch awaits its fsync) plus an end-of-loop
+  proactive fsync that runs on message AND timeout iterations. This
+  supersedes wave 5's "TopLevel monoio needs none of this" note — it was
+  the one writer loop left without the ≤ ~1s idle durability bound.
+- **`tests/crash_matrix_per_shard_aof.rs` harness hardening** (found while
+  validating the above): (1) `redis_set` asserted only redis-cli's exit
+  status, which is 0 even for server ERROR replies — a tripped diskfull
+  guard (host <5% free) turned every SET into a silent no-op and surfaced
+  as a bogus "200 keys missing after recovery"; the helper now pins the
+  reply to `+OK`. (2) The three server-spawning tests split-brain when run
+  in parallel: `unique_port()` hands out OS-sequential ephemeral ports, the
+  other tests offset +1/+2, and SO_REUSEPORT lets two tests bind the SAME
+  port without an error — one test's redis-cli traffic lands on another
+  test's server (rotating total-loss false alarms). A shared mutex now
+  serializes them.
+
+### Fixed — RSS/CPU remediation wave 5 (PR #TBD)
+
+- **Item A — mmap the exact-rerank f16 sidecar on segment reload**
+  (`src/vector/segment/raw_f16_store.rs`, new `RawF16Store` enum): a segment
+  reloaded from disk used to `fs::read` the entire `raw_f16.bin` sidecar into
+  a second heap `Vec<u16>`, doubling resident vector memory for
+  reload-heavy deployments (warm starts, segment promotion). Reload now
+  memory-maps the file (`memmap2`, already a workspace dependency) and hands
+  out a zero-copy `&[u16]` view backed by the kernel page cache — RSS only
+  grows for pages the rerank path actually touches. Freshly-built segments
+  (compaction/merge) are unaffected — they keep their owned buffer. Rerank
+  parity (Owned vs Mapped, byte-identical sidecar + identical `search()`
+  output) is pinned by
+  `test_reload_raw_f16_sidecar_uses_mmap_and_matches_owned_rerank`.
+- **Item A follow-up — text posting-list capacity reclaim**
+  (`src/text/posting.rs`): `PostingList::term_freqs`/`positions` grow to the
+  peak document count ever seen for a term and, per the existing
+  `remove_doc` contract, the `postings` HashMap entry is kept forever even
+  once a term has zero live documents. The buffers now `shrink_to_fit()`
+  once the last document leaves a posting, releasing peak capacity for
+  terms that go idle without changing the "entry survives" contract.
+- **Item B — AOF writer idle wake made adaptive** (`src/persistence/aof/writer_task.rs`,
+  new `IdleWait` state machine): the 3 steady-state writer loops that need a
+  bounded channel poll to service the EverySec proactive-fsync deadline
+  (TopLevel tokio, PerShard tokio, PerShard monoio — TopLevel monoio blocks
+  on an untimed `rx.recv()` and needed no change) used to poll at a FIXED
+  cadence forever (50ms monoio / 200ms tokio), waking an idle server's AOF
+  writer thread 5-20 times a second doing nothing. The wait now escalates
+  50ms → 250ms → 1s once a poll times out with nothing queued, and resets to
+  the floor the instant any message arrives — a real write always wakes the
+  loop immediately regardless of the current timeout, since the poll races
+  a message against the deadline. Escalation is refused (pinned at the
+  floor) whenever a write is buffered under `FsyncPolicy::EverySec` without
+  an immediate fsync, or `last_fsync` was manually back-dated (the F6
+  post-fold drain trick) — the ~1.2s EverySec bound is provably unchanged.
+  `FsyncPolicy::Always`/`No` have no such deadline and escalate freely once
+  idle.
+- **Item C1 — WAL v3 write buffer shrinks after an oversized flush**
+  (`src/persistence/wal_v3/segment.rs`): a single large record (e.g. a
+  FullPageImage) grew the 8KB write buffer to fit it, and `clear()` alone
+  never released that capacity — the peak allocation was pinned for the
+  writer's lifetime. `flush_write`/`rotate_segment` now `shrink_to` the
+  8KB default once capacity exceeds 4x that, a no-op for the common
+  small-record case.
+- **Item C2 — SearchScratch visited-set: already bitset-based (SKIP)**
+  (`src/vector/hnsw/search.rs`): the per-query search hot path already uses
+  a word-based `BitVec` (u64 words, `test_and_set`/`clear_all` memset),
+  thread-cached and reused across queries — no change needed. The other
+  `Vec<bool>` visited sets found in the vector module are all build-time/
+  compaction/merge-oracle code, not the per-query path; `search_sq.rs` in
+  particular carries an explicit comment warning that a prior BitVec
+  conversion there caused correctness issues, so it was left untouched.
+- **Item C3 — SmallVec the per-tick elastic-budget shard snapshot**
+  (`src/shard/shared_databases.rs`): `recompute_elastic_budget` (called
+  from every shard's 100ms eviction tick) `collect()`ed a fresh
+  `Vec<usize>` snapshot of all shards' published memory on every call.
+  Switched to `SmallVec<[usize; 16]>` — stack-only for the common <=16
+  shard case, unchanged single heap allocation beyond that.
+- **Item C4 — Lua script-cache byte estimate exposed via INFO/MEMORY
+  DOCTOR** (`src/scripting/cache.rs`, `ScriptCache::resident_bytes()`): the
+  per-shard Lua cache was invisible to observability — its growth folded
+  silently into "allocator overhead." Added a byte-estimate accounting
+  method, published per-shard via the existing C5/M4 `ShardStoreMemory`
+  tick pattern (new `lua` atomic), and surfaced in both the Prometheus
+  `moon_memory_bytes{kind="lua_scripts"}` gauge and `MEMORY DOCTOR`'s text
+  report. The cache itself remains intentionally unbounded (Redis parity —
+  `SCRIPT FLUSH` is the only eviction path); this is observability only.
+- **Item C5 — removed dead `parse_single_frame_zc` RESP parser**
+  (`src/protocol/parse.rs`): a full ~150-line RESP2/RESP3 parser
+  superseded by the current `validate_frame` + `parse_frame_zerocopy`
+  pipeline, with zero external callers (only self-recursion) — silently
+  masked by the file's `#![allow(dead_code)]`. Removed along with its
+  exclusively-private helper `read_decimal_zc`.
+- **Item C6 — jemalloc decay policy audited, docs added (SKIP code
+  change)** (`CLAUDE.md`): the baked-in `_rjem_malloc_conf` static and the
+  `--memory-arenas-cap` re-spawn override already carry byte-identical
+  `dirty_decay_ms:1000,muzzy_decay_ms:5000,background_thread:true` tuning
+  — no drift to reconcile. Added the missing operator-facing
+  `_RJEM_MALLOC_CONF` documentation (docs-only, no code changed).
+- **Item C7 — tokio 1ms shard tick idle cost audited (SKIP)**
+  (`src/shard/event_loop.rs`, `src/shard/spsc_handler.rs`): the 1ms
+  `periodic_interval` tick's SPSC drain is already a non-blocking,
+  zero-allocation `try_pop()` loop, and every downstream side effect is
+  already gated behind a cheap conditional. The one unconditional cost
+  (`cached_clock.update()`, a single `clock_gettime`) is the documented
+  "Timestamp caching" design. Unlike item B's AOF writer poll, this 1ms
+  cadence IS the low-latency WAL-flush contract (CLAUDE.md), not
+  incidental idle waste — escalating it would widen that bound. No code
+  change; a real fix would be event-driven WAL triggering, an
+  architectural change out of scope here.
+- Item C8 (sigterm readiness deadline) landed early via the Windows-CI PR
+  (#229) — see the CI section below.
+
+### CI — fix Windows main-push test failures (PR #TBD)
+
+- `test_poll_real_process_smoke` is now gated to Linux/macOS: `get_rss_bytes()`
+  returns the documented `0` fallback on every other platform, so asserting
+  `rss_bytes() > 0` can never pass on Windows.
+- `test_scatter_text_aggregate_single_shard_skips_spsc` now runs on a fresh
+  OS thread and calls `init_shard` itself (via a new shared
+  `slice::test_support::make_init` fixture). As a plain `#[tokio::test]` it
+  only passed when libtest scheduled it onto a harness thread where an
+  earlier test had left a `ShardSlice` behind — a latent order-dependent
+  flake on all platforms that failed deterministically on Windows CI.
+- All 8 `find_moon_binary` test helpers now fall back to
+  `env!("CARGO_BIN_EXE_moon")` (after the `MOON_BIN` override) instead of
+  probing `target/{release,debug}/moon`: the old probing found nothing on
+  Windows (missing `.exe`), ignored `CARGO_TARGET_DIR`, and preferred a
+  possibly-stale release binary over the one cargo just built for the run.
+- New `MOON_DISK_FREE_MIN_PCT` env override for `--disk-free-min-pct`
+  (clap `env` feature; CLI flag still wins). Windows CI exports it as `0`:
+  windows-latest runners sit below the 5% free-disk default, so every
+  server-spawning suite failed with `MOONERR diskfull` instead of `OK`.
+- `shardslice_shape.rs::split_off_test_module` computed line offsets with a
+  1-byte `\n` assumption; on CRLF checkouts (Windows runners set
+  `core.autocrlf=true`) the split point drifted one byte per line and
+  panicked slicing inside a multibyte comment char. Now uses
+  `split_inclusive('\n')` for byte-exact offsets on both line endings.
+- mem_watchdog integration cases A/B (guard-engages assertions) are gated
+  to Linux/macOS for the same `get_rss_bytes()` 0-fallback reason as the
+  lib smoke test: with RSS reported as 0 the memfull guard is structurally
+  inert on Windows. Cases C/D (guard-disabled directions) still run there.
+- `sigterm_shutdown.rs` readiness deadline widened 15s → 60s behind a
+  shared `READY_TIMEOUT` constant (poll-based loop notices readiness within
+  100ms either way; the fixed 15s was a documented host-load flake,
+  observed on the macOS CI runner).
+### Fixed — connection-plane durability & lifecycle wave (PR #230)
+
+- **D-2 — FLUSHDB/FLUSHALL now clear every shard, not just the local one**
+  (`src/shard/coordinator.rs` `coordinate_flush_broadcast`, both sharded
+  handlers): FLUSHDB/FLUSHALL are keyless, so key-based routing executed them
+  only on the issuing connection's shard — on `--shards 4` a FLUSHALL left
+  ~3/4 of the keyspace intact (red/green: 49/64 keys survived, now 0). The
+  originating shard now broadcasts the flush to every peer shard as a
+  `MultiExecute` leg, which reuses the existing remote dispatch + per-shard
+  AOF/WAL persistence + index-flush path. Any failed leg returns a loud
+  `MOONERR FLUSH partial` error (local shard already flushed; client should
+  retry). Known limits: the flush is not atomic across shards (same relaxed
+  semantics as SWAPDB), and a FLUSH issued inside MULTI/EXEC still executes
+  local-only (follow-up); FLUSHALL still clears only the selected db
+  (documented v0.1.5 single-active-DB behavior — all-dbs semantics is a
+  separate follow-up needing replay parity).
+- **D-1 — cross-store TXN crash replay restores into the correct db**
+  (`src/transaction/mod.rs`, `wal_v3/record.rs`, `wal_v3/replay.rs`, txn
+  handlers): `CrossStoreTxn` had no db field and WAL replay hardcoded
+  `databases[0]`, so a `TXN.BEGIN…COMMIT` issued under `SELECT n≠0` replayed
+  its KV ops into db 0 after a crash — silent recovery corruption. Commits now
+  write a new `XactCommitV2` record (`0x53`) whose header carries the
+  BEGIN-time db index; replay targets that db (out-of-range falls back to
+  db 0 with a loud warning). v1 records still replay into db 0 (faithful to
+  the builds that wrote them).
+- **R-6 — connection migration fails open** (`conn_accept.rs`,
+  `handler_sharded/mod.rs`): the source shard dropped its socket before the
+  SPSC hand-off to the target was confirmed, so a full ring lost the client —
+  precisely under the overload that triggers migration. Both runtimes now
+  keep the original stream alive until the push succeeds (bounded retry,
+  8 × 100µs) and on give-up resume serving the connection on the source shard
+  with migration disabled, using the state recovered from the undelivered
+  message. Also fixes the tokio path's `connected_clients` leak on the old
+  loss path.
+- **Observability** (`admin/metrics_setup.rs`): new
+  `moon_xshard_backpressure_drops_total{target_shard}` counter + warn on every
+  R-1 give-up, and `moon_shard_connected_clients{shard}` gauge (maintained at
+  registry register/deregister) to surface SO_REUSEPORT imbalance and
+  affinity funnels without parsing `CLIENT LIST`.
+- **P-1 — lazy per-connection `FunctionRegistry`** (both handlers,
+  `conn/core.rs`): the Functions API registry + `LuaEvictionCtx` (6 Arc/Rc
+  clones) were built eagerly for every connection; now built on first
+  FUNCTION/FCALL/FCALL_RO, cutting per-connection setup cost at high
+  connection counts.
+- **S-5 — `--tcp-backlog`** (`config.rs`, `conn_accept.rs`, `main.rs`): the
+  per-socket listen backlog was hardcoded 1024; now configurable (default
+  unchanged) for connection-storm tuning alongside `ulimit -n`.
+
+### Fixed — connection-plane robustness hardening (Track B) (PR #230)
+
+- **R-3 — `CLIENT KILL` force-closes idle connections** (`src/client_registry.rs`,
+  handlers, `conn_accept.rs`): `CLIENT KILL` only set a cooperative `kill_flag`
+  checked once per batch, so a connection parked in `read().await` (idle, the
+  default `timeout 0`) was never torn down until it next sent bytes. Now the
+  registry stores each connection's socket fd and `kill_clients` also
+  `shutdown(2)`s it, so the parked read returns `Ok(0)`/`Err` immediately (the
+  existing disconnect path). The raw-fd close is race-free: `kill_clients` holds
+  the registry read lock, and a connection's `RegistryGuard` deregisters (needs
+  the write lock) strictly before its stream drops — so a visible entry always
+  has a live fd. No-op on non-unix (`CLIENT KILL` stays cooperative there).
+  Self-kill (the filter matching the executing connection) stays cooperative —
+  flag only, no fd shutdown — so the `+count` reply is still delivered before
+  the handler closes, matching Redis's reply-first self-kill semantics.
+- **R-2 — inline-command length cap** (`src/protocol/inline.rs`,
+  `frame.rs`): the RESP-less inline path had no maximum line length, so a
+  client that never sends `\r\n` (raw non-RESP bytes) grew the connection read
+  buffer without bound — a per-connection memory-exhaustion vector. Added
+  `ParseConfig::max_inline_size` (default 64 KB, mirroring Redis's
+  `PROTO_INLINE_MAX_SIZE`); `parse_inline` now rejects an over-cap line
+  (complete or incomplete) with `Protocol error: too big inline request`
+  instead of buffering forever.
+- **R-1 — bounded cross-shard `spsc_send`** (`src/shard/coordinator.rs`): the
+  single dispatch primitive behind every scatter-gather command (MGET/MSET/
+  DEL/EXISTS/SCAN/KEYS/DBSIZE, vector scatter, FT.INFO, graph traverse) retried
+  a full SPSC ring in an **unbounded** `loop { try_push; yield/sleep }` — on
+  tokio `yield_now()` reschedules with no backoff, busy-spinning a full core,
+  and a wedged target could block graceful shutdown forever. Replaced with a
+  bounded retry (`CROSS_SHARD_PUSH_MAX_RETRIES` × `CROSS_SHARD_PUSH_BACKOFF`,
+  the same budget as `push_with_backpressure`) returning `PushOutcome`. On
+  give-up the message is dropped; reply-carrying callers observe the closed
+  reply channel and synthesize a per-shard error via the path they already
+  handle. `PushOutcome` is `#[must_use]` so no call site can drop a message
+  silently by accident, and the two side-effect-bearing senders fail loud:
+  a dropped `MqTxnMaterialize` leg turns `TXN.COMMIT`'s reply into an explicit
+  `MOONERR TXN.COMMIT partial` error (the commit is already WAL-durable; only
+  foreign MQ materialization was lost) and a dropped `GraphRollback` logs at
+  `error!`. A brief bounded spin (≤64 iterations) before the first timed
+  backoff preserves the old ~10µs-class latency when the target ring is only
+  transiently full (the 100µs timer sleep may round up to ~1ms).
+- **R-4 — accept-loop backoff on fd exhaustion** (`src/server/accept_backoff.rs`,
+  `listener.rs`, `shard/event_loop.rs`): all six socket-accept loops (tokio
+  and monoio; sharded, non-sharded, and TLS) retried `accept()` errors with
+  zero backoff, so `EMFILE`/`ENFILE` under a connection storm pinned a shard
+  core at 100% and flooded the log. Added `AcceptBackoff`: capped exponential
+  backoff (1 ms → 100 ms) on resource-exhaustion errors only, plus rate-limited
+  logging; benign per-connection errors (e.g. `ECONNABORTED`) log without
+  sleeping. The cap is 100 ms (not 1 s) because the sleep runs inside `select!`
+  arms where the shutdown branch cannot preempt it — this bounds shutdown
+  latency during a storm. The io_uring multishot-accept resubmit (opt-in `MOON_URING=1`
+  bridge) is documented as a scoped follow-up (synchronous CQE handler, no
+  async context to sleep in).
+
 ### Changed — graph engine deep-review fixes + optimization waves (PR #TBD)
 
 - **Freeze-boundary correctness (P0):** CSR v5 segments now persist node
@@ -36,6 +293,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`src/graph/hnsw_bridge.rs`, raw-f32 cosine over v5 embeddings, >= 4096
   vectors) replaces the silent brute-force stub, with exact-scoring
   fallback whenever the approximate beam under-fills.
+- **Pre-merge review fixes:** (1) restart NodeKey aliasing (P0) — a fresh
+  post-recovery `MemGraph`'s deterministic SlotMap could mint keys
+  bit-identical to loaded CSR segments' `external_id`s, silently
+  shadowing frozen nodes; recovery now seeds the mutable tier via
+  `MemGraph::with_id_offset` (watermark past the largest persisted id)
+  and WAL replay dedup-skips AddNodes already resident in a loaded
+  segment (red/green `graph_restart_id_aliasing` suite). (2) Plan-cache
+  raw-hash fast path — exact-repeat queries hit the cache without the
+  `parameterize()` lexer pass, and the `SlotTable` is cached alongside
+  the plan instead of being rebuilt per execution; cache backing moved
+  to `FxHashMap`. (3) `CsrStorage::resident_bytes` now counts the v5
+  property blobs, lazily-built per-segment property indexes, and the
+  HNSW bridge (heap-owned; mmap-backed sections count 0 per the
+  `RawF16Store` precedent), keeping the elastic memory budget honest.
 
 ### Changed — graph engine wave 2: durability, Cypher coverage, hardening (PR #TBD)
 

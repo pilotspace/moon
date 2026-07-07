@@ -34,6 +34,7 @@ async fn start_workspace_server(num_shards: usize) -> (u16, CancellationToken) {
     let config = ServerConfig {
         bind: "127.0.0.1".to_string(),
         port,
+        tcp_backlog: 1024,
         databases: 16,
         requirepass: None,
         appendonly: "no".to_string(),
@@ -265,6 +266,7 @@ async fn start_workspace_server_with_auth(
     let config = ServerConfig {
         bind: "127.0.0.1".to_string(),
         port,
+        tcp_backlog: 1024,
         databases: 16,
         requirepass: Some(password),
         appendonly: "no".to_string(),

@@ -86,6 +86,16 @@ pub struct MemGraph {
 
 impl MemGraph {
     /// Create an empty MemGraph with the given freeze threshold.
+    ///
+    /// Restart NodeKey-aliasing soundness (P0): node/edge ids are handed out
+    /// from explicit monotonic cursors (`next_node_id`/`next_edge_id`) that
+    /// recovery restores from the manifest AND floors past every frozen
+    /// `external_id` (`restore_id_cursors` + `ensure_node_id_floor`), while
+    /// WAL replay re-materializes nodes under their ORIGINAL logged ids
+    /// (`add_node_with_id`). A fresh post-restart insert therefore can never
+    /// mint a key that numerically aliases a persisted frozen row — the bug
+    /// the earlier SlotMap representation had (deterministic index counter
+    /// restarting at 0). See `tests/graph_restart_id_aliasing.rs`.
     pub fn new(edge_threshold: usize) -> Self {
         Self {
             nodes: FxHashMap::default(),
@@ -233,7 +243,8 @@ impl MemGraph {
         if src == dst {
             return Err(GraphError::SelfLoop);
         }
-        // Validate both nodes exist and are alive.
+        // Validate both nodes exist and are alive (`add_edge` does not
+        // support cross-tier endpoints; use `add_edge_across_tiers`).
         let src_alive = self
             .nodes
             .get(&src)
@@ -339,7 +350,8 @@ impl MemGraph {
         if src == dst {
             return Err(GraphError::SelfLoop);
         }
-        // Resident endpoints must be alive; non-resident are caller-verified.
+        // Resident endpoints must be alive; non-resident are caller-verified
+        // via the CSR tier (delta edge).
         for key in [src, dst] {
             if let Some(n) = self.nodes.get(&key) {
                 if n.deleted_lsn != u64::MAX {

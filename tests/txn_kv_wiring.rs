@@ -46,6 +46,7 @@ async fn start_txn_server(num_shards: usize, persistence_dir: &str) -> (u16, Can
     let config = ServerConfig {
         bind: "127.0.0.1".to_string(),
         port,
+        tcp_backlog: 1024,
         databases: 16,
         requirepass: None,
         appendonly,
@@ -123,6 +124,7 @@ async fn start_txn_server(num_shards: usize, persistence_dir: &str) -> (u16, Can
         autovacuum_interval_secs: 30,
         graph_merge_max_segments: 8,
         graph_dead_edge_trigger: 0.20,
+        graph_timeout_ms: 30_000,
         autovacuum_starvation_cap_secs: 300,
         vec_warm_mmap_budget: "2gb".to_string(),
         cold_orphan_sweep_interval_secs: 300,
@@ -951,16 +953,11 @@ fn find_moon_binary() -> Option<std::path::PathBuf> {
             return Some(p);
         }
     }
-    let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let release = std::path::PathBuf::from(format!("{manifest_dir}/target/release/moon"));
-    if release.exists() {
-        return Some(release);
-    }
-    let debug = std::path::PathBuf::from(format!("{manifest_dir}/target/debug/moon"));
-    if debug.exists() {
-        return Some(debug);
-    }
-    None
+    // Fall back to the binary cargo built for THIS test run: compile-time
+    // path with the right profile, CARGO_TARGET_DIR, and .exe suffix on
+    // Windows (the old target/{release,debug}/moon probing found nothing on
+    // Windows and could pick a stale release binary).
+    Some(std::path::PathBuf::from(env!("CARGO_BIN_EXE_moon")))
 }
 
 /// Open a redis-rs sync connection AND verify the server can answer PING.

@@ -7,12 +7,30 @@
 //! property eval, GRAPH.NEIGHBORS existence, GRAPH.HYBRID) go through to see
 //! the whole graph.
 //!
-//! Tier precedence: the MUTABLE tier is authoritative. Fresh keys never alias
-//! frozen external_ids (monotonic id allocation), but copy-up writes (W2-2)
+//! Tier precedence: the MUTABLE tier is authoritative. Copy-up writes (W2-2)
 //! deliberately re-materialize a frozen key in the write buffer to mutate or
 //! tombstone it — such a shadow OVERRIDES the frozen row. Point lookups get
 //! this for free (mutable checked first); scans must skip segment rows whose
 //! key is resident in the mutable tier.
+//!
+//! Fresh keys never alias frozen `external_id`s, but this is actively
+//! ENFORCED, not automatic, across the two ways a mutable-tier `MemGraph`
+//! comes into being. In-process freeze (`NamedGraph::freeze_and_compact`)
+//! needs no extra work: `freeze()` drains keys out of the slotmap and thaws
+//! `write_buf` IN PLACE (same underlying slot maps), so slot reuse bumps the
+//! generation and a drained key can never reappear in the mutable tier with
+//! a stale identity; `compact_segments` swaps the segment list atomically.
+//! Restart (`recover_graph_store` + WAL replay, `src/graph/recovery.rs` +
+//! `src/graph/replay.rs`) is different: a FRESH `MemGraph` has no history
+//! with the loaded CSR segments' generations, so its deterministic SlotMap
+//! allocation could otherwise numerically alias a persisted `external_id`.
+//! The invariant is restored on the recovery path: `recover_graph_store`
+//! restores the write buffer's id-allocation floors (manifest cursors plus
+//! every frozen `external_id`), WAL replay re-materializes nodes under their
+//! ORIGINAL logged ids (`add_node_with_id`, so client-cached handles survive
+//! a crash) and skips re-inserting any id already resident in a loaded
+//! segment. See `tests/graph_restart_id_aliasing.rs` and
+//! `tests/crash_recovery_graph_durability.rs` for the regression coverage.
 
 use std::sync::Arc;
 

@@ -326,6 +326,17 @@ impl PropertyIndex {
     pub fn is_empty(&self) -> bool {
         self.tree.is_empty()
     }
+
+    /// Approximate resident bytes: one `OrderedFloat<f64>` key plus each
+    /// bitmap's `serialized_size()` (roaring's own compressed-container
+    /// estimate -- close enough for the elastic memory budget, which only
+    /// needs a monotonic signal, not exact byte accounting).
+    pub fn resident_bytes(&self) -> usize {
+        self.tree
+            .values()
+            .map(|bm| std::mem::size_of::<OrderedFloat<f64>>() + bm.serialized_size())
+            .sum()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -427,6 +438,27 @@ impl SegmentPropertyIndexes {
     /// True when no property is indexed at all (segment without v5 blob).
     pub fn is_empty(&self) -> bool {
         self.numeric.is_empty() && self.strings.is_empty()
+    }
+
+    /// Approximate resident bytes across every numeric B-tree and string
+    /// hash-bucket bitmap. Always heap-owned: built lazily on first use from
+    /// the (possibly mmap-backed) property blob, but the index ITSELF is
+    /// never mmap'd -- see `CsrStorage::resident_bytes`, which is the only
+    /// caller and where the mmap-vs-heap distinction for the SOURCE blob is
+    /// applied.
+    pub fn resident_bytes(&self) -> usize {
+        let numeric: usize = self
+            .numeric
+            .values()
+            .map(PropertyIndex::resident_bytes)
+            .sum();
+        let strings: usize = self
+            .strings
+            .values()
+            .flat_map(|inner| inner.values())
+            .map(|bm| std::mem::size_of::<u64>() + bm.serialized_size())
+            .sum();
+        numeric + strings
     }
 
     /// The numeric B-tree for `prop_id`, if any row indexed a numeric value

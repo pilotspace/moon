@@ -109,6 +109,14 @@ pub const DEFAULT_MAX_ARRAY_DEPTH: usize = 8;
 /// Default maximum number of elements in an array.
 pub const DEFAULT_MAX_ARRAY_LENGTH: usize = 1024 * 1024;
 
+/// Default maximum size for a single inline command line (64 KB).
+///
+/// Mirrors Redis's `PROTO_INLINE_MAX_SIZE`. Bounds the RESP-less inline path,
+/// which the framed-parser limits above do not cover: without this, a client
+/// that never sends a `\r\n` (raw non-RESP bytes) grows the read buffer without
+/// limit — a per-connection memory-exhaustion vector.
+pub const DEFAULT_MAX_INLINE_SIZE: usize = 64 * 1024;
+
 /// A RESP2/RESP3 protocol frame.
 ///
 /// All string payloads use `Bytes` for zero-copy semantics.
@@ -237,6 +245,8 @@ pub struct ParseConfig {
     pub max_array_depth: usize,
     /// Maximum number of elements in a single array.
     pub max_array_length: usize,
+    /// Maximum size in bytes of a single inline (non-RESP) command line.
+    pub max_inline_size: usize,
 }
 
 impl Default for ParseConfig {
@@ -245,6 +255,7 @@ impl Default for ParseConfig {
             max_bulk_string_size: DEFAULT_MAX_BULK_STRING_SIZE,
             max_array_depth: DEFAULT_MAX_ARRAY_DEPTH,
             max_array_length: DEFAULT_MAX_ARRAY_LENGTH,
+            max_inline_size: DEFAULT_MAX_INLINE_SIZE,
         }
     }
 }

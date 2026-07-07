@@ -514,10 +514,16 @@ fn parse_effective(
 /// Execute a compiled read-only plan: params (user + auto-extracted),
 /// valid-time, decay, executor, RESP encoding. Shared by GRAPH.QUERY (both
 /// handlers) and GRAPH.RO_QUERY.
+///
+/// Takes a `SlotTable` explicitly (rather than calling `cypher::executor::
+/// execute`, which rebuilds one every call) so plan-cache hits reuse the
+/// `SlotTable` cached alongside the plan (Fix 2 -- one `String` allocation
+/// per bound variable, per execution, otherwise).
 fn run_read_query(
     graph: &crate::graph::store::NamedGraph,
     args: &[Frame],
     plan: &cypher::PhysicalPlan,
+    slots: &cypher::executor::SlotTable,
     auto_params: Vec<(String, cypher::executor::Value)>,
 ) -> Frame {
     let mut params = parse_params(args);
@@ -539,7 +545,7 @@ fn run_read_query(
         guard: Some(guard),
         ..Default::default()
     };
-    match cypher::executor::execute(graph, plan, &params, &ctx) {
+    match cypher::executor::execute_with_slots(graph, plan, slots, &params, &ctx) {
         Ok(r) => exec_result_to_frame(&r),
         Err(e) => {
             let msg = format!("ERR Cypher execution error: {e}");
@@ -583,14 +589,31 @@ fn graph_query_readonly(store: &GraphStore, args: &[Frame], reject_writes: bool)
         None => return Frame::Error(Bytes::from_static(b"ERR invalid Cypher query")),
     };
 
+    // Raw-hash pre-lookup (Fix 2): an EXACT repeat of a query text we've
+    // already compiled hits here without ever calling `parameterize()` (a
+    // full lexer pass + Vec/String allocations) — the raw-hash entry
+    // carries this exact text's auto_params, cached at insert time.
+    let raw_hash = cypher::planner::hash_query(cypher_bytes);
+    if let Some(cached) = graph.plan_cache.lock().get(raw_hash) {
+        // W2-7 caches WRITE plans too — a write hit falls through to the
+        // parse path, which reports it exactly like an uncached write query.
+        if cached.read_only {
+            let auto_params = cached.auto_params.as_ref().clone();
+            return run_read_query(graph, args, &cached.plan, &cached.slots, auto_params);
+        }
+    }
+
     let (effective, query_hash, auto_params) = normalize_cypher(cypher_bytes);
 
-    // Read-only cache hit ⇒ no parse at all. A cached WRITE plan (W2-7)
-    // falls through to the parse path, which reports it exactly like an
-    // uncached write query would be.
+    // Normalized-hash READ-ONLY hit ⇒ no parse. `parameterize()` above
+    // already ran (needed to derive THIS text's auto_params and the
+    // normalized hash), but parse+compile is skipped. A cached WRITE plan
+    // (W2-7) falls through to the parse path instead.
     let cached = graph.plan_cache.lock().get(query_hash);
-    if let Some((plan, true)) = cached {
-        return run_read_query(graph, args, &plan, auto_params);
+    if let Some(cached) = cached {
+        if cached.read_only {
+            return run_read_query(graph, args, &cached.plan, &cached.slots, auto_params);
+        }
     }
 
     let (query, query_hash, auto_params) =
@@ -612,15 +635,23 @@ fn graph_query_readonly(store: &GraphStore, args: &[Frame], reject_writes: bool)
             return Frame::Error(Bytes::from(msg));
         }
     };
-    // Cache read-only plans only on this handler — hits above route straight
-    // to the read executor. (Write plans are cached by the write handlers.)
-    if query.is_read_only() {
-        graph
-            .plan_cache
-            .lock()
-            .insert(query_hash, plan.clone(), true);
-    }
-    run_read_query(graph, args, &plan, auto_params)
+    // Cache read-only plans only on this handler — write plans are cached
+    // (flagged read_only=false) by the write handlers (W2-7), and every hit
+    // above re-checks the flag. Insert under both the raw and normalized
+    // hash so a later exact repeat of this text hits the allocation-free
+    // raw-hash path above.
+    let slots = if query.is_read_only() {
+        graph.plan_cache.lock().insert_both(
+            raw_hash,
+            query_hash,
+            plan.clone(),
+            auto_params.clone(),
+            true,
+        )
+    } else {
+        std::sync::Arc::new(cypher::executor::SlotTable::from_plan(&plan))
+    };
+    run_read_query(graph, args, &plan, &slots, auto_params)
 }
 
 /// GRAPH.QUERY <graph> <cypher_string> — write-capable variant.
@@ -653,7 +684,7 @@ pub fn graph_query_write(store: &mut GraphStore, args: &[Frame]) -> Frame {
         .and_then(|g| g.plan_cache.lock().get(query_hash));
 
     let (plan, auto_params) = match cached {
-        Some((plan, false)) => (plan, auto_params),
+        Some(cached) if !cached.read_only => (cached.plan, auto_params),
         // Read-only hit on the write handler is a dispatcher anomaly —
         // treat as a miss so classification runs as before. Same for a
         // genuine miss.
@@ -857,16 +888,17 @@ pub fn graph_query_or_write(
         }
     };
 
-    let (effective, query_hash, auto_params) = normalize_cypher(cypher_bytes);
-
-    // Fast path: plan-cache hit — a read-only plan routes to the read path,
-    // a WRITE plan (W2-7) to the write path; both with ZERO parse/compile
-    // work (per-run literal values arrive via the auto-params).
-    let cached = store
+    // Raw-hash pre-lookup (Fix 2): an EXACT repeat of a query text we've
+    // already compiled hits here without ever calling `parameterize()`.
+    // W2-7: a read-only hit routes to the read path, a WRITE hit to the
+    // write path — both with zero parse/compile work.
+    let raw_hash = cypher::planner::hash_query(cypher_bytes);
+    let raw_cached = store
         .get_graph(graph_name)
-        .and_then(|g| g.plan_cache.lock().get(query_hash));
-    match cached {
-        Some((plan, true)) => {
+        .and_then(|g| g.plan_cache.lock().get(raw_hash));
+    if let Some(cached) = raw_cached {
+        let auto_params = cached.auto_params.as_ref().clone();
+        if cached.read_only {
             let Some(graph) = store.get_graph(graph_name) else {
                 return (
                     Frame::Error(Bytes::from_static(b"ERR graph not found")),
@@ -875,15 +907,38 @@ pub fn graph_query_or_write(
                 );
             };
             return (
-                run_read_query(graph, args, &plan, auto_params),
+                run_read_query(graph, args, &cached.plan, &cached.slots, auto_params),
                 Vec::new(),
                 Vec::new(),
             );
         }
-        Some((plan, false)) => {
-            return execute_write_plan(store, graph_name, args, &plan, auto_params);
+        return execute_write_plan(store, graph_name, args, &cached.plan, auto_params);
+    }
+
+    let (effective, query_hash, auto_params) = normalize_cypher(cypher_bytes);
+
+    // Fast path: normalized-hash plan-cache hit — a read-only plan routes to
+    // the read path, a WRITE plan (W2-7) to the write path; both with ZERO
+    // parse/compile work (per-run literal values arrive via the auto-params).
+    let cached = store
+        .get_graph(graph_name)
+        .and_then(|g| g.plan_cache.lock().get(query_hash));
+    if let Some(cached) = cached {
+        if cached.read_only {
+            let Some(graph) = store.get_graph(graph_name) else {
+                return (
+                    Frame::Error(Bytes::from_static(b"ERR graph not found")),
+                    Vec::new(),
+                    Vec::new(),
+                );
+            };
+            return (
+                run_read_query(graph, args, &cached.plan, &cached.slots, auto_params),
+                Vec::new(),
+                Vec::new(),
+            );
         }
-        None => {}
+        return execute_write_plan(store, graph_name, args, &cached.plan, auto_params);
     }
 
     // Slow path: parse once (normalized text, raw fallback) and classify.
@@ -913,13 +968,18 @@ pub fn graph_query_or_write(
                 return (Frame::Error(Bytes::from(msg)), Vec::new(), Vec::new());
             }
         };
-        graph
-            .plan_cache
-            .lock()
-            .insert(query_hash, plan.clone(), true);
+        // Insert under both hashes so a later exact repeat of this text
+        // hits the allocation-free raw-hash path above.
+        let slots = graph.plan_cache.lock().insert_both(
+            raw_hash,
+            query_hash,
+            plan.clone(),
+            auto_params.clone(),
+            true,
+        );
 
         (
-            run_read_query(graph, args, &plan, auto_params),
+            run_read_query(graph, args, &plan, &slots, auto_params),
             Vec::new(),
             Vec::new(),
         )
@@ -931,10 +991,17 @@ pub fn graph_query_or_write(
                 return (Frame::Error(Bytes::from(msg)), Vec::new(), Vec::new());
             }
         };
-        // W2-7: cache the write plan so the next occurrence of this
-        // normalized text skips parse + compile entirely.
+        // W2-7: cache the write plan (flagged) so the next occurrence of
+        // this normalized text — or an exact repeat via the raw-hash
+        // pre-lookup — skips parse + compile entirely.
         if let Some(g) = store.get_graph(graph_name) {
-            g.plan_cache.lock().insert(query_hash, plan.clone(), false);
+            let _ = g.plan_cache.lock().insert_both(
+                raw_hash,
+                query_hash,
+                plan.clone(),
+                auto_params.clone(),
+                false,
+            );
         }
         execute_write_plan(store, graph_name, args, &plan, auto_params)
     }

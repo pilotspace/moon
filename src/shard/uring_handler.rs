@@ -369,7 +369,15 @@ pub(crate) fn handle_uring_event(
             let _ = driver.register_connection(raw_fd);
         }
         IoEvent::AcceptError { .. } => {
-            // Multishot accept cancelled on error -- re-submit
+            // Multishot accept cancelled on error -- re-submit.
+            //
+            // R-4 follow-up: under persistent fd exhaustion (EMFILE/ENFILE) the
+            // immediate resubmit here can hot-spin the CQ loop. The socket-based
+            // accept loops back off (see `server::accept_backoff`), but this is a
+            // *synchronous* CQE handler with no async context to sleep in, so a
+            // backoff needs deferred-resubmit state (submit after a timer CQE).
+            // Scoped separately; this bridge is opt-in (MOON_URING=1), not the
+            // default accept path.
             if let Some(lfd) = uring_listener_fd {
                 let _ = driver.submit_multishot_accept(lfd);
             }

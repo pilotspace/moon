@@ -173,6 +173,22 @@ impl GraphHnsw {
         self.row_to_id.contains_key(&row)
     }
 
+    /// Resident bytes this bridge pins: the HNSW graph structure plus the
+    /// bridge's own bookkeeping (`rows`, `row_to_id`, the raw-f32 embedding
+    /// copy). Always heap-owned -- the bridge is built lazily in-memory and
+    /// never persisted/mmap'd (see module docs), so unlike `CsrStorage`'s
+    /// mmap-backed sections there is no "0 for mapped" case here.
+    pub fn resident_bytes(&self) -> usize {
+        let rows_bytes = self.rows.len() * std::mem::size_of::<u32>();
+        // FxHashMap<u32, u32>: approximate as capacity * (key + value +
+        // hashbrown control-byte overhead); exactness isn't the goal here,
+        // just keeping the elastic memory budget honest about a
+        // multi-megabyte structure it currently sees as zero.
+        let row_to_id_bytes = self.row_to_id.capacity() * (std::mem::size_of::<u32>() * 2 + 1);
+        let vecs_bytes = self.vecs.len() * std::mem::size_of::<f32>();
+        self.graph.resident_bytes() + rows_bytes + row_to_id_bytes + vecs_bytes
+    }
+
     /// CSR rows with an embedding the bridge could not index (dim mismatch
     /// / degenerate norm). Whole-segment bridge scans score these exactly.
     #[inline]

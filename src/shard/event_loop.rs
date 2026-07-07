@@ -320,9 +320,11 @@ impl super::Shard {
                 let (tx, rx) = flume::bounded(256);
                 let shard_id_copy = self.id;
                 monoio::spawn(async move {
+                    let mut accept_backoff = crate::server::accept_backoff::AcceptBackoff::new();
                     loop {
                         match listener.accept().await {
                             Ok((stream, _addr)) => {
+                                accept_backoff.reset();
                                 let std_stream = {
                                     use std::os::unix::io::{FromRawFd, IntoRawFd};
                                     let fd = stream.into_raw_fd();
@@ -335,11 +337,10 @@ impl super::Shard {
                                 }
                             }
                             Err(e) => {
-                                tracing::error!(
-                                    "Shard {}: per-shard accept error: {}",
-                                    shard_id_copy,
-                                    e
-                                );
+                                // R-4: capped backoff + rate-limited log so an
+                                // fd-exhaustion storm can't hot-spin this shard.
+                                let ctx = format!("Shard {shard_id_copy}: per-shard accept error");
+                                accept_backoff.record_error(&ctx, &e).await;
                             }
                         }
                     }
@@ -1061,6 +1062,11 @@ impl super::Shard {
         #[cfg(feature = "runtime-monoio")]
         let pending_wakers: Rc<RefCell<Vec<std::task::Waker>>> = Rc::new(RefCell::new(Vec::new()));
 
+        // R-4: backoff for the tokio per-shard SO_REUSEPORT accept branch so an
+        // fd-exhaustion storm can't hot-spin this shard's select loop.
+        #[cfg(feature = "runtime-tokio")]
+        let mut per_shard_accept_backoff = crate::server::accept_backoff::AcceptBackoff::new();
+
         loop {
             #[cfg(feature = "runtime-tokio")]
             tokio::select! {
@@ -1111,6 +1117,7 @@ impl super::Shard {
                 } => {
                     match result {
                         Ok((tcp_stream, _addr)) => {
+                            per_shard_accept_backoff.reset();
                             conn_accept::spawn_tokio_connection(
                                 tcp_stream, false, &tls_config,
                                 &shard_databases, &dispatch_tx, &pubsub_arc, &blocking_rc,
@@ -1124,7 +1131,8 @@ impl super::Shard {
                             );
                         }
                         Err(e) => {
-                            tracing::error!("Shard {}: per-shard accept error: {}", shard_id, e);
+                            let ctx = format!("Shard {shard_id}: per-shard accept error");
+                            per_shard_accept_backoff.record_error(&ctx, &e).await;
                         }
                     }
                 }
@@ -1624,6 +1632,7 @@ impl super::Shard {
                         &page_cache,
                         &mut next_file_id,
                         &mut wal_v3_writer,
+                        &script_cache_rc,
                         &spill_file_id,
                     );
 
@@ -2127,6 +2136,7 @@ impl super::Shard {
                         &page_cache,
                         &mut next_file_id,
                         &mut wal_v3_writer,
+                        &script_cache_rc,
                         &spill_file_id,
                     );
                     // MQ trigger check: fire debounced triggers

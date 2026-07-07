@@ -41,6 +41,7 @@ async fn start_mq_server(num_shards: usize) -> (u16, CancellationToken) {
     let config = ServerConfig {
         bind: "127.0.0.1".to_string(),
         port,
+        tcp_backlog: 1024,
         databases: 16,
         requirepass: None,
         appendonly: "no".to_string(),

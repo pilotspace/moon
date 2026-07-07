@@ -410,6 +410,7 @@ fn memory_doctor() -> Frame {
     #[cfg_attr(not(feature = "graph"), allow(unused_variables))]
     let csr_bytes: usize;
     let wal_bytes: usize = 0;
+    let lua_bytes: usize;
 
     if let Some(shard_dbs) = crate::admin::metrics_setup::get_global_shard_databases() {
         // KV memory: sum of per-shard published atomics. Lock-free.
@@ -418,16 +419,21 @@ fn memory_doctor() -> Frame {
         // Store memory: sum published per-shard vector/graph atomics.
         let mut vec_total = 0usize;
         let mut csr_total = 0usize;
+        let mut lua_total = 0usize;
         for mem in shard_dbs.store_memory_per_shard.iter() {
             vec_total += mem.vector.load(Ordering::Relaxed);
             csr_total += mem.graph.load(Ordering::Relaxed);
+            // C4 (wave-5 hygiene): Lua script-cache byte estimate.
+            lua_total += mem.lua.load(Ordering::Relaxed);
         }
         hnsw_bytes = vec_total;
         csr_bytes = csr_total;
+        lua_bytes = lua_total;
     } else {
         dashtable_bytes = 0;
         hnsw_bytes = 0;
         csr_bytes = 0;
+        lua_bytes = 0;
     }
 
     // Replication backlog via global state (same pattern as INFO replication).
@@ -440,8 +446,13 @@ fn memory_doctor() -> Frame {
     let (allocator_name, arena_count) = allocator_info();
 
     // ── Computed overhead ────────────────────────────────────────────────
-    let tracked_sum =
-        dashtable_bytes + hnsw_bytes + csr_bytes + wal_bytes + sealed_bytes + repl_bytes;
+    let tracked_sum = dashtable_bytes
+        + hnsw_bytes
+        + csr_bytes
+        + wal_bytes
+        + sealed_bytes
+        + repl_bytes
+        + lua_bytes;
     let allocator_overhead = rss.saturating_sub(tracked_sum);
 
     // ── VSZ ratio recommendation ─────────────────────────────────────────
@@ -514,6 +525,12 @@ fn memory_doctor() -> Frame {
         "  Replication backlog:    {}  ({:.1}%)",
         humanize_bytes(repl_bytes),
         pct(repl_bytes, rss)
+    );
+    let _ = writeln!(
+        out,
+        "  Lua scripts:            {}  ({:.1}%)",
+        humanize_bytes(lua_bytes),
+        pct(lua_bytes, rss)
     );
     let _ = writeln!(
         out,

@@ -215,11 +215,13 @@ pub async fn run_with_shutdown(
     let graph_store: Arc<Mutex<crate::graph::store::GraphStore>> =
         Arc::new(Mutex::new(crate::graph::store::GraphStore::new()));
 
+    let mut accept_backoff = crate::server::accept_backoff::AcceptBackoff::new();
     loop {
         tokio::select! {
             result = listener.accept() => {
                 match result {
                     Ok((mut stream, addr)) => {
+                        accept_backoff.reset();
                         // Protected mode: reject non-loopback connections when no auth configured
                         if config.protected_mode == "yes"
                             && config.requirepass.is_none()
@@ -274,7 +276,7 @@ pub async fn run_with_shutdown(
                         ));
                     }
                     Err(e) => {
-                        error!("Accept error: {}", e);
+                        accept_backoff.record_error("Accept error", &e).await;
                     }
                 }
             }
@@ -364,11 +366,13 @@ pub async fn run_sharded(
         tokio::spawn(async move {
             let mut tls_next_shard: usize = 0;
             let tls_num_shards = tls_txs.len();
+            let mut accept_backoff = crate::server::accept_backoff::AcceptBackoff::new();
             loop {
                 tokio::select! {
                     result = tls_listener.accept() => {
                         match result {
                             Ok((mut stream, addr)) => {
+                                accept_backoff.reset();
                                 // Protected mode: reject non-loopback connections when no auth configured
                                 if protected_mode_active && !addr.ip().is_loopback() {
                                     tracing::warn!(
@@ -387,7 +391,7 @@ pub async fn run_sharded(
                                 tls_next_shard = (tls_next_shard + 1) % tls_num_shards;
                             }
                             Err(e) => {
-                                error!("TLS accept error: {}", e);
+                                accept_backoff.record_error("TLS accept error", &e).await;
                             }
                         }
                     }
@@ -403,6 +407,7 @@ pub async fn run_sharded(
     // When per_shard_accept is true (Linux production with SO_REUSEPORT), each shard
     // has its own listener and the central listener only handles TLS.
     // When false (tests, non-Linux), the central listener distributes via round-robin MPSC.
+    let mut accept_backoff = crate::server::accept_backoff::AcceptBackoff::new();
     loop {
         tokio::select! {
             // Plain TCP accept -- disabled when per-shard SO_REUSEPORT listeners are active.
@@ -415,6 +420,7 @@ pub async fn run_sharded(
             } => {
                 match result {
                     Ok((mut stream, addr)) => {
+                        accept_backoff.reset();
                         // Protected mode: reject non-loopback connections when no auth configured
                         if protected_mode_active && !addr.ip().is_loopback() {
                             tracing::warn!(
@@ -450,7 +456,9 @@ pub async fn run_sharded(
                         }
                     }
                     Err(e) => {
-                        error!("Accept error: {}", e);
+                        // R-4: capped backoff + rate-limited log so fd exhaustion
+                        // can't hot-spin this accept loop.
+                        accept_backoff.record_error("Accept error", &e).await;
                     }
                 }
             }
@@ -510,6 +518,7 @@ pub async fn run_sharded(
         None
     };
     let mut tls_next_shard: usize = 0;
+    let mut accept_backoff = crate::server::accept_backoff::AcceptBackoff::new();
 
     loop {
         // If TLS listener is configured, select on both plain and TLS accepts
@@ -525,6 +534,7 @@ pub async fn run_sharded(
                 } => {
                     match result {
                         Ok((mut stream, addr)) => {
+                            accept_backoff.reset();
                             if protected_mode_active && !addr.ip().is_loopback() {
                                 tracing::warn!(
                                     "Protected mode: rejected connection from {} (no password set, use --protected-mode no to disable)",
@@ -562,12 +572,13 @@ pub async fn run_sharded(
                                 error!("Failed to send connection to shard {}", target_shard);
                             }
                         }
-                        Err(e) => { error!("Accept error: {}", e); }
+                        Err(e) => { accept_backoff.record_error("Accept error", &e).await; }
                     }
                 }
                 result = tls_listener.accept() => {
                     match result {
                         Ok((mut stream, addr)) => {
+                            accept_backoff.reset();
                             // Protected mode: reject non-loopback connections when no auth configured
                             if protected_mode_active && !addr.ip().is_loopback() {
                                 tracing::warn!(
@@ -592,7 +603,7 @@ pub async fn run_sharded(
                             }
                             tls_next_shard = (tls_next_shard + 1) % num_shards;
                         }
-                        Err(e) => { error!("TLS accept error: {}", e); }
+                        Err(e) => { accept_backoff.record_error("TLS accept error", &e).await; }
                     }
                 }
                 _ = shutdown.cancelled() => {
@@ -612,6 +623,7 @@ pub async fn run_sharded(
                 } => {
                     match result {
                         Ok((mut stream, addr)) => {
+                            accept_backoff.reset();
                             if protected_mode_active && !addr.ip().is_loopback() {
                                 tracing::warn!(
                                     "Protected mode: rejected connection from {} (no password set, use --protected-mode no to disable)",
@@ -651,7 +663,7 @@ pub async fn run_sharded(
                             }
                         }
                         Err(e) => {
-                            error!("Accept error: {}", e);
+                            accept_backoff.record_error("Accept error", &e).await;
                         }
                     }
                 }

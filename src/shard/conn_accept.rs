@@ -31,6 +31,18 @@ use super::shared_databases::ShardDatabases;
 /// from parking_lot::RwLock (used for pubsub types).
 type StdRwLock<T> = std::sync::RwLock<T>;
 
+/// Process-wide TCP listen backlog (S-5, `--tcp-backlog`). Set once at
+/// startup before any listener binds; 1024 is the historical hardcoded
+/// value. A process-wide static (rather than threading a param through the
+/// four bind sites) because backlog is a bind-time server property.
+static TCP_BACKLOG: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(1024);
+
+/// Set the TCP listen backlog applied to every subsequently-bound listener.
+/// Called once from startup after config parsing.
+pub fn set_tcp_backlog(backlog: i32) {
+    TCP_BACKLOG.store(backlog.max(1), std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Create a SO_REUSEPORT TCP listener socket using socket2.
 ///
 /// Returns a `std::net::TcpListener` that can be converted to
@@ -56,7 +68,7 @@ pub(crate) fn create_reuseport_socket(addr: &str) -> std::io::Result<std::net::T
     socket.set_reuse_address(true)?;
     socket.set_nonblocking(true)?;
     socket.bind(&sock_addr.into())?;
-    socket.listen(1024)?;
+    socket.listen(TCP_BACKLOG.load(std::sync::atomic::Ordering::Relaxed))?;
     Ok(socket.into())
 }
 
@@ -250,6 +262,15 @@ pub(crate) fn spawn_tokio_connection(
                 );
                 return;
             }
+            // R-3: capture the underlying TCP fd before the handshake moves the
+            // stream — shutdown on it force-closes the TLS session too.
+            #[cfg(unix)]
+            let kill_fd = {
+                use std::os::unix::io::AsRawFd;
+                tcp_stream.as_raw_fd()
+            };
+            #[cfg(not(unix))]
+            let kill_fd = -1;
             let acceptor = tokio_rustls::TlsAcceptor::from(tls_cfg);
             match acceptor.accept(tcp_stream).await {
                 Ok(tls_stream) => {
@@ -262,6 +283,7 @@ pub(crate) fn spawn_tokio_connection(
                         false, // can_migrate: TLS connections cannot transfer session state
                         BytesMut::new(),
                         None, // fresh connection
+                        kill_fd,
                     )
                     .await;
                 }
@@ -445,6 +467,14 @@ pub(crate) fn spawn_migrated_tokio_connection(
 
             // State restoration happens directly via migrated_state parameter —
             // no synthetic RESP commands, no leaked responses.
+            // R-3: capture the migrated socket fd for CLIENT KILL force-close.
+            #[cfg(unix)]
+            let kill_fd = {
+                use std::os::unix::io::AsRawFd;
+                tcp_stream.as_raw_fd()
+            };
+            #[cfg(not(unix))]
+            let kill_fd = -1;
             tokio::task::spawn_local(async move {
                 let _ = handle_connection_sharded_inner(
                     tcp_stream,
@@ -455,6 +485,7 @@ pub(crate) fn spawn_migrated_tokio_connection(
                     false, // can_migrate: already-migrated connections skip re-migration sampling
                     migration_buf,
                     Some(&state),
+                    kill_fd,
                 )
                 .await;
             });
@@ -516,6 +547,15 @@ pub(crate) fn spawn_monoio_connection(
 
     match monoio::net::TcpStream::from_std(std_tcp_stream) {
         Ok(tcp_stream) => {
+            // R-3: capture the socket fd for CLIENT KILL force-close before the
+            // stream is moved into a spawned handler (generic `S`, no AsRawFd).
+            #[cfg(unix)]
+            let kill_fd = {
+                use std::os::unix::io::AsRawFd;
+                tcp_stream.as_raw_fd()
+            };
+            #[cfg(not(unix))]
+            let kill_fd = -1;
             let aff = affinity_tracker.clone();
             let rsm = remote_subscriber_map.clone();
             let sdbs = shard_databases.clone();
@@ -627,6 +667,7 @@ pub(crate) fn spawn_monoio_connection(
                                 BytesMut::new(),
                                 pw,
                                 None, // fresh connection
+                                kill_fd,
                             )
                             .await;
                         }
@@ -654,6 +695,10 @@ pub(crate) fn spawn_monoio_connection(
                         );
                         return;
                     }
+                    // R-6 fail-open: keep what we need to re-serve the client
+                    // locally if a migration hand-off cannot be delivered.
+                    #[cfg(target_os = "linux")]
+                    let (sd2, pw2, peer2) = (sd.clone(), pw.clone(), peer_addr.clone());
                     let _result = handle_connection_sharded_monoio(
                         tcp_stream,
                         peer_addr,
@@ -664,6 +709,7 @@ pub(crate) fn spawn_monoio_connection(
                         BytesMut::new(),
                         pw,
                         None, // fresh connection
+                        kill_fd,
                     )
                     .await;
 
@@ -723,46 +769,80 @@ pub(crate) fn spawn_monoio_connection(
                         use crate::shard::mesh::ChannelMesh;
 
                         let raw_fd = stream.as_raw_fd();
-                        // SAFETY: raw_fd is a valid open socket fd from the monoio TcpStream.
-                        // dup() creates a new, independent fd that we take ownership of.
+                        // The ORIGINAL stream stays alive until the hand-off is
+                        // confirmed (R-6 fail-open): if the push cannot be delivered
+                        // we keep serving the client here instead of dropping it.
+                        // SAFETY: raw_fd is a valid open socket fd from the monoio
+                        // TcpStream; dup() creates a new, independent fd that we
+                        // take ownership of.
                         let dup_fd = unsafe { libc::dup(raw_fd) };
-                        drop(stream); // closes original fd
                         if dup_fd < 0 {
-                            tracing::warn!("Shard {}: migration dup() failed: {}", shard_id, std::io::Error::last_os_error());
+                            tracing::warn!("Shard {}: migration dup() failed: {} — keeping connection local", shard_id, std::io::Error::last_os_error());
+                            // Fail-open: resume serving on this shard, migration
+                            // disabled so the affinity tracker cannot loop.
+                            let _ = handle_connection_sharded_monoio(
+                                stream, peer2, &conn_ctx, sd2, cid,
+                                false, // can_migrate
+                                BytesMut::new(), pw2,
+                                Some(&state), kill_fd,
+                            )
+                            .await;
                         } else {
-                            let msg = ShardMessage::MigrateConnection(Box::new(
+                            let mut pending_msg = Some(ShardMessage::MigrateConnection(Box::new(
                                 crate::shard::dispatch::MigrateConnectionPayload {
                                     fd: dup_fd,
                                     state,
                                 },
-                            ));
+                            )));
                             let target_idx = ChannelMesh::target_index(shard_id, target_shard);
-                            let push_result = {
-                                let mut producers = dtx2.borrow_mut();
-                                producers[target_idx].try_push(msg)
-                            };
-                            match push_result {
-                                Ok(()) => {
-                                    _migrated = true;
-                                    notifiers2[target_shard].notify_one();
-                                    tracing::info!(
-                                        "Shard {}: migrated connection {} to shard {} (monoio)",
-                                        shard_id, cid, target_shard
-                                    );
+                            // Bounded retry: migration is elective — a briefly-full
+                            // ring is worth a few 100µs waits, but a target that
+                            // stays full gets the fail-open path, never a lost conn.
+                            for attempt in 0..8u32 {
+                                if attempt > 0 {
+                                    monoio::time::sleep(std::time::Duration::from_micros(100)).await;
                                 }
-                                Err(returned_msg) => {
-                                    if let ShardMessage::MigrateConnection(payload) = returned_msg {
-                                        // SAFETY: fd is a valid dup'd socket from libc::dup above.
-                                        // SPSC push failed, so ownership returns to us for cleanup.
-                                        drop(unsafe {
-                                            std::os::unix::io::OwnedFd::from_raw_fd(payload.fd)
-                                        });
+                                #[allow(clippy::unwrap_used)]
+                                // pending_msg is always re-filled on Err below
+                                let msg = pending_msg.take().unwrap();
+                                let push_result = {
+                                    let mut producers = dtx2.borrow_mut();
+                                    producers[target_idx].try_push(msg)
+                                };
+                                match push_result {
+                                    Ok(()) => {
+                                        _migrated = true;
+                                        notifiers2[target_shard].notify_one();
+                                        tracing::info!(
+                                            "Shard {}: migrated connection {} to shard {} (monoio)",
+                                            shard_id, cid, target_shard
+                                        );
+                                        break;
                                     }
-                                    tracing::warn!(
-                                        "Shard {}: migration SPSC full, connection {} lost (monoio)",
-                                        shard_id, cid
-                                    );
+                                    Err(returned_msg) => pending_msg = Some(returned_msg),
                                 }
+                            }
+                            if _migrated {
+                                drop(stream); // hand-off confirmed: target owns dup_fd
+                            } else if let Some(ShardMessage::MigrateConnection(payload)) = pending_msg {
+                                // SAFETY: dup_fd is a valid dup'd socket from libc::dup
+                                // above; the push never succeeded so we still own it.
+                                drop(unsafe {
+                                    std::os::unix::io::OwnedFd::from_raw_fd(payload.fd)
+                                });
+                                tracing::warn!(
+                                    "Shard {}: migration SPSC full, keeping connection {} local (monoio)",
+                                    shard_id, cid
+                                );
+                                // Fail-open (R-6): resume serving on this shard with
+                                // the state recovered from the undelivered message.
+                                let _ = handle_connection_sharded_monoio(
+                                    stream, peer2, &conn_ctx, sd2, cid,
+                                    false, // can_migrate: pin locally, no retry loop
+                                    BytesMut::new(), pw2,
+                                    Some(&payload.state), kill_fd,
+                                )
+                                .await;
                             }
                         }
                     }
@@ -940,6 +1020,14 @@ pub(crate) fn spawn_migrated_monoio_connection(
                 do_dir,
             );
 
+            // R-3: capture the migrated socket fd for CLIENT KILL force-close.
+            #[cfg(unix)]
+            let kill_fd = {
+                use std::os::unix::io::AsRawFd;
+                tcp_stream.as_raw_fd()
+            };
+            #[cfg(not(unix))]
+            let kill_fd = -1;
             monoio::spawn(async move {
                 let _ = handle_connection_sharded_monoio(
                     tcp_stream,
@@ -951,6 +1039,7 @@ pub(crate) fn spawn_migrated_monoio_connection(
                     migration_buf,
                     pw,
                     Some(&state),
+                    kill_fd,
                 )
                 .await;
                 // Migrated connection: the source shard's wrapper skipped the

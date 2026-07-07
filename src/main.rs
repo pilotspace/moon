@@ -142,6 +142,10 @@ fn main() -> anyhow::Result<()> {
     // current directory when it already holds pre-v0.2.0 moon data.
     config.resolve_dir();
 
+    // Apply the TCP listen backlog before any listener binds (S-5,
+    // `--tcp-backlog`; per-socket — SO_REUSEPORT splits load across shards).
+    moon::shard::conn_accept::set_tcp_backlog(config.tcp_backlog);
+
     // ── AOF v1→v2 migration (FIX-W3-2): early-exit before normal boot ──
     // When `--migrate-aof-from` is set, run the migration tool and exit.
     // This must run BEFORE any shard/AOF initialization so the source

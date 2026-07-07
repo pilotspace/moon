@@ -25,6 +25,18 @@ fn moon_binary() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_BIN_EXE_moon"))
 }
 
+/// Readiness poll deadline (RSS/CPU wave 5, item C8).
+///
+/// Was a fixed 15s, hardcoded independently at each `wait_for_ready` call
+/// site — PR #218 documented this as a flake under host load (shared/
+/// contended CI runners, or the OrbStack virtiofs starvation gotcha in
+/// CLAUDE.md) rather than a real readiness regression, since the poll
+/// loop itself is already load-tolerant (100ms re-poll, no fixed sleep
+/// before the first attempt). Widened to 60s: still fails fast on an
+/// actually-broken server (the 100ms poll notices readiness within one
+/// tick of it happening), but tolerates a slow CI host without flaking.
+const READY_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Pick an ephemeral port by binding :0 and releasing it.
 ///
 /// Note: classic TOCTOU race — another process can grab the port between the
@@ -131,14 +143,15 @@ fn assert_sigterm_clean_exit_shards(
 
     let pid = child.id();
 
-    // Wait for the server to be ready (up to 15s).
-    let ready = wait_for_ready(port, Duration::from_secs(15));
+    // Wait for the server to be ready (load-tolerant deadline; see
+    // READY_TIMEOUT doc comment).
+    let ready = wait_for_ready(port, READY_TIMEOUT);
     if !ready {
         let _ = child.kill();
         let _ = child.wait();
         panic!(
-            "[{}] server did not become ready within 15s on port {}",
-            label, port
+            "[{}] server did not become ready within {:?} on port {}",
+            label, READY_TIMEOUT, port
         );
     }
 
@@ -274,10 +287,10 @@ fn sigterm_clean_exit_under_write_storm() {
         .expect("spawn moon");
     let pid = child.id();
 
-    if !wait_for_ready(port, Duration::from_secs(15)) {
+    if !wait_for_ready(port, READY_TIMEOUT) {
         let _ = child.kill();
         let _ = child.wait();
-        panic!("[storm] server did not become ready within 15s on port {port}");
+        panic!("[storm] server did not become ready within {READY_TIMEOUT:?} on port {port}");
     }
 
     // 16 writer threads, each pipelining SETs in a tight loop until the

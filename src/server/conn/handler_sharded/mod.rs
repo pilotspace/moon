@@ -91,6 +91,19 @@ pub(crate) async fn handle_connection_sharded(
         .peer_addr()
         .map(|a| a.to_string())
         .unwrap_or_else(|_| "unknown".to_string());
+    // R-3: capture the socket fd for CLIENT KILL force-close before the stream
+    // is moved into the generic inner handler (which has no AsRawFd bound).
+    #[cfg(unix)]
+    let kill_fd = {
+        use std::os::unix::io::AsRawFd;
+        stream.as_raw_fd()
+    };
+    #[cfg(not(unix))]
+    let kill_fd = -1;
+    // R-6 fail-open: keep what we need to re-serve the client locally if a
+    // migration hand-off cannot be delivered.
+    #[cfg(unix)]
+    let (shutdown2, peer_addr2) = (shutdown.clone(), peer_addr.clone());
     let result = handle_connection_sharded_inner(
         stream,
         peer_addr,
@@ -105,6 +118,7 @@ pub(crate) async fn handle_connection_sharded(
         cfg!(unix),
         BytesMut::new(),
         None, // fresh connection, no migrated state
+        kill_fd,
     )
     .await;
 
@@ -169,22 +183,58 @@ pub(crate) async fn handle_connection_sharded(
                             }
                         }
                         if let Some(ShardMessage::MigrateConnection(payload)) = pending {
+                            tracing::warn!(
+                                "Shard {}: migration SPSC full, keeping connection {} local",
+                                ctx.shard_id,
+                                client_id
+                            );
+                            // Fail-open (R-6): the target never drained — resume
+                            // serving the client on this shard with the state
+                            // recovered from the undelivered message, instead of
+                            // dropping the connection. Migration disabled so the
+                            // affinity tracker cannot loop.
                             use std::os::unix::io::FromRawFd;
-                            // SAFETY: fd is a valid, uniquely-owned file descriptor obtained
-                            // from TcpStream::into_raw_fd() above. OwnedFd closes it on drop.
-                            drop(unsafe { std::os::unix::io::OwnedFd::from_raw_fd(payload.fd) });
+                            // SAFETY: fd is a valid, uniquely-owned descriptor from
+                            // into_raw_fd(); the failed push left ownership with us.
+                            let std_stream =
+                                unsafe { std::net::TcpStream::from_raw_fd(payload.fd) };
+                            match tokio::net::TcpStream::from_std(std_stream) {
+                                Ok(tcp_stream) => {
+                                    let _ = handle_connection_sharded_inner(
+                                        tcp_stream,
+                                        peer_addr2,
+                                        ctx,
+                                        shutdown2,
+                                        client_id,
+                                        false, // can_migrate
+                                        BytesMut::new(),
+                                        Some(&payload.state),
+                                        payload.fd,
+                                    )
+                                    .await;
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "Shard {}: migration fail-open from_std failed: {} \
+                                         — connection {} lost",
+                                        ctx.shard_id,
+                                        e,
+                                        client_id
+                                    );
+                                }
+                            }
+                            // The connection has now truly ended (served locally to
+                            // completion or lost on from_std failure) — balance the
+                            // accept-side counter that the migration arm skips.
+                            crate::admin::metrics_setup::record_connection_closed();
                         }
-                        tracing::warn!(
-                            "Shard {}: migration SPSC full, connection {} lost",
-                            ctx.shard_id,
-                            client_id
-                        );
                     }
                 }
             }
             Err(e) => {
                 tracing::warn!("Shard {}: migration into_std failed: {}", ctx.shard_id, e);
-                // Stream consumed by into_std attempt, connection lost either way
+                // Stream consumed by into_std attempt, connection lost either way.
+                crate::admin::metrics_setup::record_connection_closed();
             }
         }
     } else {
@@ -228,6 +278,10 @@ pub(crate) async fn handle_connection_sharded_inner<
     can_migrate: bool,
     initial_read_buf: BytesMut,
     migrated_state: Option<&MigratedConnectionState>,
+    // Raw socket fd for CLIENT KILL force-close (R-3), or -1 if unavailable
+    // (non-unix). Threaded from the concrete spawn site; the generic `S` here
+    // has no `AsRawFd` bound.
+    kill_fd: i32,
 ) -> (HandlerResult, Option<S>) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -267,6 +321,7 @@ pub(crate) async fn handle_connection_sharded_inner<
         peer_addr.clone(),
         conn.current_user.clone(),
         ctx.shard_id,
+        kill_fd,
     );
     struct RegistryGuard(u64);
     impl Drop for RegistryGuard {
@@ -276,20 +331,14 @@ pub(crate) async fn handle_connection_sharded_inner<
     }
     let _registry_guard = RegistryGuard(client_id);
 
-    // Functions API registry (per-shard, lazy init) — kept as local because Rc<RefCell<>> is !Send.
-    // Real eviction ctx (Gap B): FCALL-internal `redis.call` writes must run
-    // the same OOM gate as EVAL/EVALSHA, same handles `LuaEvictionCtx::new`
-    // uses elsewhere on this shard (conn_accept.rs's `setup_lua_vm` call).
-    let func_registry = std::rc::Rc::new(std::cell::RefCell::new(
-        crate::scripting::FunctionRegistry::new(crate::scripting::bridge::LuaEvictionCtx::new(
-            ctx.shard_databases.clone(),
-            ctx.runtime_config.clone(),
-            ctx.shard_id,
-            ctx.spill_sender.clone(),
-            ctx.spill_file_id.clone(),
-            ctx.disk_offload_dir.clone(),
-        )),
-    ));
+    // Functions API registry — LAZY per connection (P-1 footprint): built on
+    // first FUNCTION/FCALL/FCALL_RO via `ensure_function_registry`, so the
+    // >99% of connections that never touch the Functions API pay zero
+    // registry + eviction-ctx cost. Kept as a local because Rc<RefCell<>> is
+    // !Send. The eviction ctx (Gap B — FCALL-internal `redis.call` writes run
+    // the same OOM gate as EVAL) is built by `ctx.build_lua_eviction_ctx()`.
+    let func_registry: std::rc::Rc<std::cell::RefCell<Option<crate::scripting::FunctionRegistry>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(None));
 
     // Per-connection arena for batch processing temporaries.
     // 4KB initial capacity, grows on demand (rarely exceeds 16KB per batch).
@@ -743,33 +792,50 @@ pub(crate) async fn handle_connection_sharded_inner<
                     // fall through to the MULTI queue gate instead of executing.
                     if !conn.in_multi {
                         if cmd.eq_ignore_ascii_case(b"FUNCTION") {
+                            crate::server::conn::core::ensure_function_registry(&func_registry, ctx);
+                            let mut guard = func_registry.borrow_mut();
+                            #[allow(clippy::unwrap_used)]
+                            // ensure_function_registry guarantees Some
                             let response = crate::command::functions::handle_function(
-                                &mut func_registry.borrow_mut(), cmd_args,
+                                guard.as_mut().unwrap(), cmd_args,
                             );
+                            drop(guard);
                             responses.push(response);
                             continue;
                         }
                         if cmd.eq_ignore_ascii_case(b"FCALL") {
+                            crate::server::conn::core::ensure_function_registry(&func_registry, ctx);
                             let db_count = ctx.shard_databases.db_count();
+                            let guard = func_registry.borrow();
+                            #[allow(clippy::unwrap_used)]
+                            // ensure_function_registry guarantees Some
+                            let reg = guard.as_ref().unwrap();
                             // Unconditional slice path: ShardSlice is always initialized.
                             let response = crate::shard::slice::with_shard_db(conn.selected_db, |db| {
                                 crate::command::functions::handle_fcall(
-                                    &func_registry.borrow(), cmd_args, db,
+                                    reg, cmd_args, db,
                                     ctx.shard_id, ctx.num_shards, conn.selected_db, db_count,
                                 )
                             });
+                            drop(guard);
                             responses.push(response);
                             continue;
                         }
                         if cmd.eq_ignore_ascii_case(b"FCALL_RO") {
+                            crate::server::conn::core::ensure_function_registry(&func_registry, ctx);
                             let db_count = ctx.shard_databases.db_count();
+                            let guard = func_registry.borrow();
+                            #[allow(clippy::unwrap_used)]
+                            // ensure_function_registry guarantees Some
+                            let reg = guard.as_ref().unwrap();
                             // Unconditional slice path: ShardSlice is always initialized.
                             let response = crate::shard::slice::with_shard_db(conn.selected_db, |db| {
                                 crate::command::functions::handle_fcall_ro(
-                                    &func_registry.borrow(), cmd_args, db,
+                                    reg, cmd_args, db,
                                     ctx.shard_id, ctx.num_shards, conn.selected_db, db_count,
                                 )
                             });
+                            drop(guard);
                             responses.push(response);
                             continue;
                         }
@@ -1468,6 +1534,25 @@ pub(crate) async fn handle_connection_sharded_inner<
                                         &mut s.text_store,
                                     );
                                 });
+                                // D-2: keyless flush routed local-only cleared just this
+                                // shard — broadcast to every other shard so the whole
+                                // keyspace flushes. Any failed leg turns the reply into
+                                // an explicit partial-flush error (never silent +OK).
+                                if ctx.num_shards > 1 {
+                                    if let Err(e) =
+                                        crate::shard::coordinator::coordinate_flush_broadcast(
+                                            &frame,
+                                            ctx.shard_id,
+                                            ctx.num_shards,
+                                            conn.selected_db,
+                                            &ctx.dispatch_tx,
+                                            &ctx.spsc_notifiers,
+                                        )
+                                        .await
+                                    {
+                                        response = e;
+                                    }
+                                }
                             }
                             // H1: durable path under appendfsync=always.
                             let mut aof_failed = false;

@@ -79,18 +79,52 @@ fn split_off_test_module(text: &str) -> &str {
     let mut cfg_test_pos: Option<usize> = None;
     let mut byte_offset = 0usize;
 
-    for line in text.lines() {
+    // split_inclusive keeps each line's terminator, so the offset stays
+    // byte-exact for BOTH `\n` and `\r\n` sources. Windows CI checks out
+    // with core.autocrlf=true; the old `lines()` + `line.len() + 1`
+    // accumulation lost the `\r` byte per line, drifted the split point
+    // backward, and panicked slicing inside a multibyte `─` comment char.
+    for line in text.split_inclusive('\n') {
         let trimmed = line.trim();
         if trimmed == "#[cfg(test)]" {
             cfg_test_pos = Some(byte_offset);
         }
-        byte_offset += line.len() + 1; // +1 for the '\n'
+        byte_offset += line.len();
     }
 
     match cfg_test_pos {
         Some(pos) => &text[..pos],
         None => text,
     }
+}
+
+/// Regression: `split_off_test_module` must be line-ending agnostic.
+///
+/// Windows CI checks sources out with `core.autocrlf=true` (CRLF); the old
+/// `line.len() + 1` offset accumulation assumed a 1-byte `\n` terminator,
+/// drifting one byte backward per line and eventually slicing inside a
+/// multibyte char (box-drawing `─` in section-header comments) — a panic,
+/// not even a wrong answer.
+#[test]
+fn split_off_test_module_is_crlf_safe() {
+    let unix = "//! ── header ──\n//! ── more ──\nfn prod() {}\n#[cfg(test)]\nmod tests {}\n";
+    let crlf = unix.replace('\n', "\r\n");
+
+    let split_unix = split_off_test_module(unix);
+    assert_eq!(
+        split_unix.len(),
+        unix.find("#[cfg(test)]").unwrap(),
+        "LF: split point must be exactly the marker's byte offset"
+    );
+
+    // The drifted offset lands N bytes early (N = number of preceding
+    // lines); with multibyte chars in range that's a slicing panic on CI.
+    let split_crlf = split_off_test_module(&crlf);
+    assert_eq!(
+        split_crlf.len(),
+        crlf.find("#[cfg(test)]").unwrap(),
+        "CRLF: split point must be exactly the marker's byte offset"
+    );
 }
 
 // ── Shared wrapper-shape checker (used by both ssm5 and reject_wrapper_resurrection) ─

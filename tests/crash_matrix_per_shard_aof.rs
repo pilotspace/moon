@@ -38,6 +38,22 @@ use std::time::Duration;
 
 const KEY_COUNT: usize = 200;
 
+/// Serializes the server-spawning tests in this binary. Run in parallel they
+/// intermittently SPLIT-BRAIN: `unique_port()` hands out OS-sequential
+/// ephemeral ports and the other tests offset by +1/+2, so two concurrently
+/// starting tests can land on the SAME port — and moon's per-shard
+/// SO_REUSEPORT listeners bind it without an error, silently splitting one
+/// test's redis-cli traffic across another test's server (observed as "200
+/// missing" total-loss false alarms). A shared lock costs ~seconds and kills
+/// the whole class.
+static SERVER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn serialize_server_test() -> std::sync::MutexGuard<'static, ()> {
+    SERVER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 fn unique_port() -> u16 {
     // Ask the OS to assign an available ephemeral port by binding to 0.
     // The socket is immediately dropped after reading the port — there is a
@@ -118,6 +134,20 @@ fn redis_set(port: u16, key: &str, value: &str) {
         key,
         value,
         String::from_utf8_lossy(&out.stderr)
+    );
+    // redis-cli exits 0 even for server ERROR replies (e.g. "MOONERR
+    // diskfull: writes paused"), so exit status alone silently converts a
+    // rejected write into a "key missing after recovery" false alarm at the
+    // end of the test. Pin the actual reply.
+    let reply = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        reply.trim(),
+        "OK",
+        "redis-cli SET {} {} did not reply +OK (diskfull guard tripping? \
+         set MOON_DISK_FREE_MIN_PCT=0): {:?}",
+        key,
+        value,
+        reply
     );
 }
 
@@ -207,6 +237,7 @@ fn sigkill(child: &mut Child) {
 #[test]
 #[ignore] // Requires built release binary + redis-cli; run explicitly.
 fn crash_01_lite_per_shard_aof_recovers_after_sigkill() {
+    let _serial = serialize_server_test();
     let port = unique_port();
     let dir = unique_dir("crash01");
     std::fs::create_dir_all(&dir).expect("create test dir");
@@ -288,6 +319,7 @@ fn crash_01_lite_per_shard_aof_recovers_after_sigkill() {
 #[test]
 #[ignore] // Requires built release binary + redis-cli; run explicitly.
 fn crash_01_lite_always_per_shard_aof_recovers_after_sigkill() {
+    let _serial = serialize_server_test();
     // Offset port so this test never collides with the everysec test
     // when both run on the same dev host.
     let port = unique_port().saturating_add(1);
@@ -371,6 +403,7 @@ fn crash_01_lite_always_per_shard_aof_recovers_after_sigkill() {
 #[test]
 #[ignore] // Requires built release binary + redis-cli; run explicitly.
 fn pipeline_batch_no_double_write_after_crash_recovery() {
+    let _serial = serialize_server_test();
     const N: usize = 20;
 
     let port = unique_port().saturating_add(2);
