@@ -147,8 +147,21 @@ pub fn recover_graph_store(
             }
         }
 
-        // Inject loaded segments into the graph's segment holder.
+        // Inject loaded segments into the graph's segment holder and restore
+        // the write buffer's id-allocation floors: the manifest cursors
+        // (authoritative when present; 0 in pre-cursor manifests) plus every
+        // frozen external_id (covers manifests written before cursors
+        // existed), so fresh post-recovery inserts can never alias a frozen
+        // row or a WAL-replayed id.
         if let Some(graph) = store.get_graph_mut(graph_name.as_bytes()) {
+            graph
+                .write_buf
+                .restore_id_cursors(manifest.next_node_id, manifest.next_edge_id);
+            for seg in &loaded_segments {
+                for nm in seg.node_meta() {
+                    graph.write_buf.ensure_node_id_floor(nm.external_id);
+                }
+            }
             let current = graph.segments.load();
             graph.segments.swap(GraphSegmentList {
                 mutable: current.mutable.clone(),
@@ -203,8 +216,15 @@ pub fn save_graph_store(
             }
         }
 
-        // Write manifest.
-        let manifest = GraphManifest::from_segments(&graph_name, &segments.immutable, &base_dir);
+        // Write manifest (including the write buffer's id-allocation
+        // cursors, so recovery resumes allocation past every id ever
+        // handed out even if the WAL was truncated).
+        let manifest = GraphManifest::from_segments(
+            &graph_name,
+            &segments.immutable,
+            &base_dir,
+            graph.write_buf.id_cursors(),
+        );
         let manifest_path = graph_data_dir.join("manifest.json");
         manifest.save(&manifest_path)?;
     }
@@ -221,6 +241,7 @@ pub fn shard_graph_dir(persistence_dir: &Path, shard_id: usize) -> PathBuf {
 mod tests {
     use super::*;
     use bytes::Bytes;
+    use slotmap::Key;
     use smallvec::smallvec;
     use tempfile::TempDir;
 
@@ -272,6 +293,84 @@ mod tests {
         assert_eq!(segs.immutable.len(), 1);
         assert_eq!(segs.immutable[0].node_count(), 3);
         assert_eq!(segs.immutable[0].edge_count(), 2);
+    }
+
+    /// P0-2 stable ids: recovery must restore the id-allocation cursors so
+    /// post-restart inserts can never alias frozen external_ids — via the
+    /// manifest cursors AND (for pre-cursor manifests) the frozen
+    /// external_ids themselves.
+    #[test]
+    fn test_recover_restores_id_allocation_floor() {
+        let dir = TempDir::new().expect("tmpdir");
+        let shard_id = 0;
+
+        let mut store = GraphStore::new();
+        store
+            .create_graph(Bytes::from_static(b"g"), 64_000, 10)
+            .expect("ok");
+        let graph = store.get_graph_mut(b"g").expect("exists");
+
+        // Simulate a pre-crash session: nodes allocated from the write
+        // buffer, then frozen into a CSR segment.
+        let a = graph.write_buf.add_node(smallvec![0], smallvec![], None, 1);
+        let b = graph.write_buf.add_node(smallvec![1], smallvec![], None, 1);
+        graph.write_buf.add_edge(a, b, 0, 1.0, None, 2).expect("ok");
+        let frozen = graph.write_buf.freeze().expect("ok");
+        let csr = CsrSegment::from_frozen(frozen, 100).expect("ok");
+        graph.segments.add_immutable(csr);
+        graph.write_buf.thaw();
+        let saved_cursors = graph.write_buf.id_cursors();
+        let max_frozen_id = a.data().as_ffi().max(b.data().as_ffi());
+
+        save_graph_store(&store, dir.path(), shard_id).expect("save ok");
+
+        let mut result = recover_graph_store(dir.path(), shard_id)
+            .expect("io ok")
+            .expect("result exists");
+        let graph = result.store.get_graph_mut(b"g").expect("exists");
+
+        // Cursors restored to at least the saved values.
+        let (nn, ne) = graph.write_buf.id_cursors();
+        assert!(
+            nn >= saved_cursors.0,
+            "node cursor {nn} < saved {}",
+            saved_cursors.0
+        );
+        assert!(
+            ne >= saved_cursors.1,
+            "edge cursor {ne} < saved {}",
+            saved_cursors.1
+        );
+
+        // A fresh insert must not alias any frozen row.
+        let fresh = graph.write_buf.add_node(smallvec![9], smallvec![], None, 5);
+        assert!(
+            fresh.data().as_ffi() > max_frozen_id,
+            "fresh id {} aliases frozen tier (max frozen {})",
+            fresh.data().as_ffi(),
+            max_frozen_id
+        );
+
+        // Pre-cursor manifest fallback: zero cursors, floor comes from the
+        // frozen external_ids scan.
+        let manifest_path = dir
+            .path()
+            .join(format!("shard_{shard_id}/graph_g/manifest.json"));
+        let mut manifest = GraphManifest::load(&manifest_path).expect("load ok");
+        manifest.next_node_id = 0;
+        manifest.next_edge_id = 0;
+        manifest.save(&manifest_path).expect("save ok");
+
+        let mut result = recover_graph_store(dir.path(), shard_id)
+            .expect("io ok")
+            .expect("result exists");
+        let graph = result.store.get_graph_mut(b"g").expect("exists");
+        let fresh = graph.write_buf.add_node(smallvec![9], smallvec![], None, 5);
+        assert!(
+            fresh.data().as_ffi() > max_frozen_id,
+            "pre-cursor fallback: fresh id {} aliases frozen tier",
+            fresh.data().as_ffi()
+        );
     }
 
     #[test]

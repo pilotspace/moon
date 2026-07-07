@@ -1,12 +1,39 @@
-//! MemGraph -- mutable adjacency-list write buffer backed by SlotMap.
+//! MemGraph -- mutable adjacency-list write buffer with stable external ids.
 //!
 //! Absorbs graph writes at O(1) amortized cost per insert. Freezes into a
 //! `FrozenMemGraph` when the edge threshold is reached, enabling CSR conversion.
+//!
+//! Storage is `FxHashMap` keyed by monotonically allocated ids (in slotmap
+//! ffi encoding) rather than a `SlotMap`: WAL replay must re-materialize
+//! nodes/edges under the EXACT ids that were logged, and slot maps cannot
+//! insert at a chosen (index, generation) pair. Insertion order is kept in
+//! side vectors so iteration and freeze remain deterministic.
 
-use slotmap::SlotMap;
+use crate::graph::fasthash::FxHashMap;
 use smallvec::SmallVec;
 
 use crate::graph::types::{Direction, EdgeKey, MutableEdge, MutableNode, NodeKey, PropertyMap};
+
+/// First id handed out by a fresh MemGraph: index 1, version 1.
+///
+/// Ids live in slotmap's ffi encoding (`version << 32 | index`) so they
+/// round-trip through `KeyData::from_ffi`/`as_ffi` unchanged. slotmap 1.1
+/// forces the version odd on `from_ffi` (`(value >> 32) | 1`), so allocation
+/// stays in odd-version space; index 0 is skipped to avoid the encoding's
+/// degenerate all-zero key.
+const FIRST_ID: u64 = (1 << 32) | 1;
+
+/// Next id after `id` in odd-version ffi space. Rolls the 32-bit index over
+/// into `version + 2` (stays odd) before it can reach `u32::MAX` (slotmap's
+/// null-key index).
+#[inline]
+const fn next_id(id: u64) -> u64 {
+    if id as u32 >= u32::MAX - 1 {
+        ((id >> 32) + 2) << 32 | 1
+    } else {
+        id + 1
+    }
+}
 
 /// Errors returned by MemGraph operations.
 #[derive(Debug, PartialEq, Eq)]
@@ -26,11 +53,22 @@ pub struct FrozenMemGraph {
     pub edges: Vec<(EdgeKey, MutableEdge)>,
 }
 
-/// Mutable graph segment backed by generational SlotMap indices.
+/// Mutable graph segment keyed by stable, monotonically allocated ids.
 #[derive(Debug)]
 pub struct MemGraph {
-    nodes: SlotMap<NodeKey, MutableNode>,
-    edges: SlotMap<EdgeKey, MutableEdge>,
+    nodes: FxHashMap<NodeKey, MutableNode>,
+    edges: FxHashMap<EdgeKey, MutableEdge>,
+    /// Insertion order of live-at-insert node keys (deterministic iteration
+    /// and freeze). May contain keys later removed from `nodes`.
+    node_order: Vec<NodeKey>,
+    /// Insertion order of edge keys (same contract as `node_order`).
+    edge_order: Vec<EdgeKey>,
+    /// Next node id to hand out (slotmap ffi encoding, odd version).
+    /// Monotonic across freeze/thaw — never reset, so post-freeze inserts can
+    /// never alias the external_ids of frozen CSR rows.
+    next_node_id: u64,
+    /// Next edge id to hand out (same encoding and monotonicity contract).
+    next_edge_id: u64,
     /// Adjacency (outgoing / incoming) for cross-tier "delta" edges whose
     /// endpoint was frozen into a CSR segment. A frozen endpoint has no
     /// `MutableNode` to carry inline adjacency, so its edge keys live here,
@@ -50,8 +88,12 @@ impl MemGraph {
     /// Create an empty MemGraph with the given freeze threshold.
     pub fn new(edge_threshold: usize) -> Self {
         Self {
-            nodes: SlotMap::with_key(),
-            edges: SlotMap::with_key(),
+            nodes: FxHashMap::default(),
+            edges: FxHashMap::default(),
+            node_order: Vec::new(),
+            edge_order: Vec::new(),
+            next_node_id: FIRST_ID,
+            next_edge_id: FIRST_ID,
             ghost_out: std::collections::HashMap::new(),
             ghost_in: std::collections::HashMap::new(),
             live_node_count: 0,
@@ -61,7 +103,7 @@ impl MemGraph {
         }
     }
 
-    /// Insert a new node. Returns the generational key.
+    /// Insert a new node under a freshly allocated stable id.
     pub fn add_node(
         &mut self,
         labels: SmallVec<[u16; 4]>,
@@ -69,19 +111,109 @@ impl MemGraph {
         embedding: Option<Vec<f32>>,
         lsn: u64,
     ) -> NodeKey {
-        let key = self.nodes.insert(MutableNode {
+        let id = self.next_node_id;
+        self.next_node_id = next_id(id);
+        self.insert_node_at(
+            NodeKey::from(slotmap::KeyData::from_ffi(id)),
             labels,
-            outgoing: SmallVec::new(),
-            incoming: SmallVec::new(),
             properties,
             embedding,
-            created_lsn: lsn,
-            deleted_lsn: u64::MAX,
-            txn_id: 0,
-            valid_from: 0,
-            valid_to: i64::MAX,
-        });
-        self.live_node_count += 1;
+            lsn,
+        )
+    }
+
+    /// Insert a new node under a CALLER-CHOSEN id (WAL replay: the id that
+    /// was logged at original execution). Bumps the allocation floor past
+    /// `node_id` so later `add_node` calls can never alias it. Replaces any
+    /// existing entry under the same id (replay is authoritative).
+    pub fn add_node_with_id(
+        &mut self,
+        node_id: u64,
+        labels: SmallVec<[u16; 4]>,
+        properties: PropertyMap,
+        embedding: Option<Vec<f32>>,
+        lsn: u64,
+    ) -> NodeKey {
+        self.ensure_node_id_floor(node_id);
+        self.insert_node_at(
+            NodeKey::from(slotmap::KeyData::from_ffi(node_id)),
+            labels,
+            properties,
+            embedding,
+            lsn,
+        )
+    }
+
+    /// Raise the node-id allocation floor above `node_id` (no-op if already
+    /// above). Used when frozen CSR external_ids are re-seeded at recovery.
+    pub fn ensure_node_id_floor(&mut self, node_id: u64) {
+        if node_id >= self.next_node_id {
+            self.next_node_id = next_id(node_id);
+        }
+    }
+
+    /// Raise the edge-id allocation floor above `edge_id`.
+    pub fn ensure_edge_id_floor(&mut self, edge_id: u64) {
+        if edge_id >= self.next_edge_id {
+            self.next_edge_id = next_id(edge_id);
+        }
+    }
+
+    /// Current allocation cursors `(next_node_id, next_edge_id)` — persisted
+    /// in the graph manifest so a restart resumes allocation past every id
+    /// ever handed out (WAL-truncation-safe).
+    pub fn id_cursors(&self) -> (u64, u64) {
+        (self.next_node_id, self.next_edge_id)
+    }
+
+    /// Restore persisted allocation cursors. Values are `next_*` cursors
+    /// (NOT handed-out ids — see `ensure_*_id_floor` for those). Only ever
+    /// raises; `0` (pre-cursor manifest) is a no-op.
+    pub fn restore_id_cursors(&mut self, next_node_id: u64, next_edge_id: u64) {
+        if next_node_id > self.next_node_id {
+            self.next_node_id = next_node_id;
+        }
+        if next_edge_id > self.next_edge_id {
+            self.next_edge_id = next_edge_id;
+        }
+    }
+
+    fn insert_node_at(
+        &mut self,
+        key: NodeKey,
+        labels: SmallVec<[u16; 4]>,
+        properties: PropertyMap,
+        embedding: Option<Vec<f32>>,
+        lsn: u64,
+    ) -> NodeKey {
+        let prev = self.nodes.insert(
+            key,
+            MutableNode {
+                labels,
+                outgoing: SmallVec::new(),
+                incoming: SmallVec::new(),
+                properties,
+                embedding,
+                created_lsn: lsn,
+                deleted_lsn: u64::MAX,
+                txn_id: 0,
+                valid_from: 0,
+                valid_to: i64::MAX,
+            },
+        );
+        match prev {
+            Some(old) => {
+                // Replaced-in-place (replay overwrite): order entry already
+                // present; only fix the live count if the old entry was dead.
+                if old.deleted_lsn != u64::MAX {
+                    self.live_node_count += 1;
+                }
+            }
+            None => {
+                self.node_order.push(key);
+                self.live_node_count += 1;
+            }
+        }
         key
     }
 
@@ -104,17 +236,17 @@ impl MemGraph {
         // Validate both nodes exist and are alive.
         let src_alive = self
             .nodes
-            .get(src)
+            .get(&src)
             .map_or(false, |n| n.deleted_lsn == u64::MAX);
         let dst_alive = self
             .nodes
-            .get(dst)
+            .get(&dst)
             .map_or(false, |n| n.deleted_lsn == u64::MAX);
         if !src_alive || !dst_alive {
             return Err(GraphError::NodeNotFound);
         }
 
-        let ek = self.edges.insert(MutableEdge {
+        let ek = self.insert_edge_fresh(MutableEdge {
             src,
             dst,
             edge_type,
@@ -132,14 +264,25 @@ impl MemGraph {
 
         // Push edge key into src.outgoing and dst.incoming.
         // Both are validated alive above, so get_mut is safe.
-        if let Some(src_node) = self.nodes.get_mut(src) {
+        if let Some(src_node) = self.nodes.get_mut(&src) {
             src_node.outgoing.push(ek);
         }
-        if let Some(dst_node) = self.nodes.get_mut(dst) {
+        if let Some(dst_node) = self.nodes.get_mut(&dst) {
             dst_node.incoming.push(ek);
         }
         self.live_edge_count += 1;
         Ok(ek)
+    }
+
+    /// Insert an edge under a freshly allocated stable id and record its
+    /// insertion order. Does NOT touch adjacency or live counts.
+    fn insert_edge_fresh(&mut self, edge: MutableEdge) -> EdgeKey {
+        let id = self.next_edge_id;
+        self.next_edge_id = next_id(id);
+        let ek = EdgeKey::from(slotmap::KeyData::from_ffi(id));
+        self.edges.insert(ek, edge);
+        self.edge_order.push(ek);
+        ek
     }
 
     /// Insert an edge whose endpoints may live in the frozen CSR tier
@@ -158,6 +301,38 @@ impl MemGraph {
         properties: Option<PropertyMap>,
         lsn: u64,
     ) -> Result<EdgeKey, GraphError> {
+        self.add_edge_across_tiers_at(None, src, dst, edge_type, weight, properties, lsn)
+    }
+
+    /// `add_edge_across_tiers` under a CALLER-CHOSEN edge id (WAL replay).
+    /// Bumps the edge-id allocation floor past `edge_id`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_edge_across_tiers_with_id(
+        &mut self,
+        edge_id: u64,
+        src: NodeKey,
+        dst: NodeKey,
+        edge_type: u16,
+        weight: f64,
+        properties: Option<PropertyMap>,
+        lsn: u64,
+    ) -> Result<EdgeKey, GraphError> {
+        self.ensure_edge_id_floor(edge_id);
+        let ek = EdgeKey::from(slotmap::KeyData::from_ffi(edge_id));
+        self.add_edge_across_tiers_at(Some(ek), src, dst, edge_type, weight, properties, lsn)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn add_edge_across_tiers_at(
+        &mut self,
+        chosen: Option<EdgeKey>,
+        src: NodeKey,
+        dst: NodeKey,
+        edge_type: u16,
+        weight: f64,
+        properties: Option<PropertyMap>,
+        lsn: u64,
+    ) -> Result<EdgeKey, GraphError> {
         if self.frozen {
             return Err(GraphError::AlreadyFrozen);
         }
@@ -166,14 +341,14 @@ impl MemGraph {
         }
         // Resident endpoints must be alive; non-resident are caller-verified.
         for key in [src, dst] {
-            if let Some(n) = self.nodes.get(key) {
+            if let Some(n) = self.nodes.get(&key) {
                 if n.deleted_lsn != u64::MAX {
                     return Err(GraphError::NodeNotFound);
                 }
             }
         }
 
-        let ek = self.edges.insert(MutableEdge {
+        let edge = MutableEdge {
             src,
             dst,
             edge_type,
@@ -185,13 +360,33 @@ impl MemGraph {
             valid_from: 0,
             valid_to: i64::MAX,
             created_ms: crate::storage::entry::current_time_ms(),
-        });
+        };
+        let ek = match chosen {
+            Some(ek) => {
+                match self.edges.insert(ek, edge) {
+                    None => self.edge_order.push(ek),
+                    Some(old) => {
+                        // Replay overwrite of an identical logged edge id:
+                        // adjacency already points at `ek`; keep counts
+                        // consistent (the +1 below re-adds a live entry).
+                        if old.deleted_lsn == u64::MAX {
+                            self.live_edge_count = self.live_edge_count.saturating_sub(1);
+                        }
+                        // Skip the adjacency pushes — already linked.
+                        self.live_edge_count += 1;
+                        return Ok(ek);
+                    }
+                }
+                ek
+            }
+            None => self.insert_edge_fresh(edge),
+        };
 
-        match self.nodes.get_mut(src) {
+        match self.nodes.get_mut(&src) {
             Some(src_node) => src_node.outgoing.push(ek),
             None => self.ghost_out.entry(src).or_default().push(ek),
         }
-        match self.nodes.get_mut(dst) {
+        match self.nodes.get_mut(&dst) {
             Some(dst_node) => dst_node.incoming.push(ek),
             None => self.ghost_in.entry(dst).or_default().push(ek),
         }
@@ -201,7 +396,7 @@ impl MemGraph {
 
     /// Soft-delete a node and all its incident edges.
     pub fn remove_node(&mut self, key: NodeKey, lsn: u64) -> bool {
-        let Some(node) = self.nodes.get_mut(key) else {
+        let Some(node) = self.nodes.get_mut(&key) else {
             return false;
         };
         if node.deleted_lsn != u64::MAX {
@@ -220,7 +415,7 @@ impl MemGraph {
 
         // Soft-delete all incident edges.
         for ek in edge_keys {
-            if let Some(edge) = self.edges.get_mut(ek) {
+            if let Some(edge) = self.edges.get_mut(&ek) {
                 if edge.deleted_lsn == u64::MAX {
                     edge.deleted_lsn = lsn;
                     self.live_edge_count = self.live_edge_count.saturating_sub(1);
@@ -232,7 +427,7 @@ impl MemGraph {
 
     /// Soft-delete a single edge.
     pub fn remove_edge(&mut self, key: EdgeKey, lsn: u64) -> bool {
-        let Some(edge) = self.edges.get_mut(key) else {
+        let Some(edge) = self.edges.get_mut(&key) else {
             return false;
         };
         if edge.deleted_lsn != u64::MAX {
@@ -254,22 +449,22 @@ impl MemGraph {
 
     /// O(1) node lookup by key.
     pub fn get_node(&self, key: NodeKey) -> Option<&MutableNode> {
-        self.nodes.get(key)
+        self.nodes.get(&key)
     }
 
     /// O(1) mutable node lookup by key.
     pub fn get_node_mut(&mut self, key: NodeKey) -> Option<&mut MutableNode> {
-        self.nodes.get_mut(key)
+        self.nodes.get_mut(&key)
     }
 
     /// O(1) edge lookup by key.
     pub fn get_edge(&self, key: EdgeKey) -> Option<&MutableEdge> {
-        self.edges.get(key)
+        self.edges.get(&key)
     }
 
     /// O(1) mutable edge lookup by key.
     pub fn get_edge_mut(&mut self, key: EdgeKey) -> Option<&mut MutableEdge> {
-        self.edges.get_mut(key)
+        self.edges.get_mut(&key)
     }
 
     /// Returns neighbors of `node` visible at the given `lsn`, filtered by direction.
@@ -277,7 +472,7 @@ impl MemGraph {
     /// Yields `(EdgeKey, NodeKey)` pairs -- the edge and the neighbor node.
     /// No heap allocation: iterates over borrowed SmallVec adjacency lists.
     pub fn neighbors(&self, node: NodeKey, direction: Direction, lsn: u64) -> NeighborIter<'_> {
-        let Some(n) = self.nodes.get(node) else {
+        let Some(n) = self.nodes.get(&node) else {
             // Non-resident (frozen) node: serve delta-edge adjacency from the
             // ghost maps so cross-tier edges are traversable from BOTH ends.
             let ghost_out = match direction {
@@ -320,14 +515,22 @@ impl MemGraph {
         }
     }
 
-    /// Iterate over all live (non-deleted) nodes. Yields `(NodeKey, &MutableNode)`.
+    /// Iterate over all live (non-deleted) nodes in insertion order.
+    /// Yields `(NodeKey, &MutableNode)`.
     pub fn iter_nodes(&self) -> impl Iterator<Item = (NodeKey, &MutableNode)> {
-        self.nodes.iter().filter(|(_, n)| n.deleted_lsn == u64::MAX)
+        self.node_order
+            .iter()
+            .filter_map(move |k| self.nodes.get(k).map(|n| (*k, n)))
+            .filter(|(_, n)| n.deleted_lsn == u64::MAX)
     }
 
-    /// Iterate over all live (non-deleted) edges. Yields `(EdgeKey, &MutableEdge)`.
+    /// Iterate over all live (non-deleted) edges in insertion order.
+    /// Yields `(EdgeKey, &MutableEdge)`.
     pub fn iter_edges(&self) -> impl Iterator<Item = (EdgeKey, &MutableEdge)> {
-        self.edges.iter().filter(|(_, e)| e.deleted_lsn == u64::MAX)
+        self.edge_order
+            .iter()
+            .filter_map(move |k| self.edges.get(k).map(|e| (*k, e)))
+            .filter(|(_, e)| e.deleted_lsn == u64::MAX)
     }
 
     /// Number of live (non-deleted) nodes. O(1) via maintained counter.
@@ -358,7 +561,7 @@ impl MemGraph {
     /// were cascade-deleted at `lsn` by `remove_node`. Restores `deleted_lsn`
     /// to `u64::MAX` and increments `live_edge_count` for each restored edge.
     pub fn undelete_edges_at_lsn(&mut self, node: NodeKey, lsn: u64) {
-        let Some(n) = self.nodes.get(node) else {
+        let Some(n) = self.nodes.get(&node) else {
             return;
         };
         let edge_keys: SmallVec<[EdgeKey; 16]> = n
@@ -368,7 +571,7 @@ impl MemGraph {
             .copied()
             .collect();
         for ek in edge_keys {
-            if let Some(edge) = self.edges.get_mut(ek) {
+            if let Some(edge) = self.edges.get_mut(&ek) {
                 if edge.deleted_lsn == lsn {
                     edge.deleted_lsn = u64::MAX;
                     self.live_edge_count += 1;
@@ -377,11 +580,15 @@ impl MemGraph {
         }
     }
 
-    /// Resident bytes used by the in-memory adjacency lists (nodes + edges
-    /// slot maps). Approximation based on slot-map capacity and struct sizes.
+    /// Resident bytes used by the in-memory adjacency maps (nodes + edges).
+    /// Approximation based on map capacity and struct sizes.
     pub fn resident_bytes(&self) -> usize {
-        let node_bytes = self.nodes.capacity() * std::mem::size_of::<MutableNode>();
-        let edge_bytes = self.edges.capacity() * std::mem::size_of::<MutableEdge>();
+        let node_bytes = self.nodes.capacity()
+            * (std::mem::size_of::<MutableNode>() + std::mem::size_of::<NodeKey>())
+            + self.node_order.capacity() * std::mem::size_of::<NodeKey>();
+        let edge_bytes = self.edges.capacity()
+            * (std::mem::size_of::<MutableEdge>() + std::mem::size_of::<EdgeKey>())
+            + self.edge_order.capacity() * std::mem::size_of::<EdgeKey>();
         node_bytes + edge_bytes
     }
 
@@ -407,39 +614,48 @@ impl MemGraph {
         self.frozen = true;
 
         // Partition edges BEFORE draining nodes (residency check needs the
-        // slot map): live + both endpoints resident → freeze into CSR;
+        // node map): live + both endpoints resident → freeze into CSR;
         // live + any frozen-elsewhere endpoint → retain as delta;
-        // dead → drop.
+        // dead → drop. Insertion order preserved via edge_order.
         let mut freeze_keys: Vec<EdgeKey> = Vec::new();
         let mut dead_keys: Vec<EdgeKey> = Vec::new();
-        for (ek, e) in self.edges.iter() {
+        for ek in &self.edge_order {
+            let Some(e) = self.edges.get(ek) else {
+                continue;
+            };
             if e.deleted_lsn != u64::MAX {
-                dead_keys.push(ek);
-            } else if self.nodes.contains_key(e.src) && self.nodes.contains_key(e.dst) {
-                freeze_keys.push(ek);
+                dead_keys.push(*ek);
+            } else if self.nodes.contains_key(&e.src) && self.nodes.contains_key(&e.dst) {
+                freeze_keys.push(*ek);
             }
         }
         for ek in dead_keys {
-            self.edges.remove(ek);
+            self.edges.remove(&ek);
         }
         let edges: Vec<(EdgeKey, MutableEdge)> = freeze_keys
             .into_iter()
-            .filter_map(|ek| self.edges.remove(ek).map(|e| (ek, e)))
+            .filter_map(|ek| self.edges.remove(&ek).map(|e| (ek, e)))
             .collect();
+        self.edge_order.retain(|ek| self.edges.contains_key(ek));
 
-        let nodes: Vec<(NodeKey, MutableNode)> = self
-            .nodes
-            .drain()
-            .filter(|(_, n)| n.deleted_lsn == u64::MAX)
-            .collect();
+        let mut nodes: Vec<(NodeKey, MutableNode)> = Vec::with_capacity(self.nodes.len());
+        for nk in self.node_order.drain(..) {
+            if let Some(n) = self.nodes.remove(&nk) {
+                if n.deleted_lsn == u64::MAX {
+                    nodes.push((nk, n));
+                }
+            }
+        }
 
         // Rebuild ghost adjacency for the retained delta edges: with the
-        // node slot map drained, EVERY endpoint is now non-resident.
+        // node map drained, EVERY endpoint is now non-resident.
         self.ghost_out.clear();
         self.ghost_in.clear();
-        for (ek, e) in self.edges.iter() {
-            self.ghost_out.entry(e.src).or_default().push(ek);
-            self.ghost_in.entry(e.dst).or_default().push(ek);
+        for ek in &self.edge_order {
+            if let Some(e) = self.edges.get(ek) {
+                self.ghost_out.entry(e.src).or_default().push(*ek);
+                self.ghost_in.entry(e.dst).or_default().push(*ek);
+            }
         }
 
         Ok(FrozenMemGraph { nodes, edges })
@@ -447,11 +663,10 @@ impl MemGraph {
 
     /// Re-arm a drained MemGraph for writes after a successful freeze.
     ///
-    /// Keeps the SAME slot maps (drain bumps each vacated slot's generation,
-    /// so keys handed out after thaw can never collide with the external_ids
-    /// of frozen CSR rows). Replacing the MemGraph with a fresh one instead
-    /// would restart SlotMap allocation at the same (index, generation) pairs
-    /// and silently alias new nodes onto frozen rows.
+    /// The monotonic id counters are NOT reset, so keys handed out after
+    /// thaw can never collide with the external_ids of frozen CSR rows.
+    /// (Replacing the MemGraph with a fresh one instead would restart
+    /// allocation at FIRST_ID and silently alias new nodes onto frozen rows.)
     pub fn thaw(&mut self) {
         self.frozen = false;
         // Post-freeze contents: zero nodes, retained delta edges (all live —
@@ -463,7 +678,7 @@ impl MemGraph {
 
 /// Zero-allocation neighbor iterator. Borrows from MemGraph's SmallVec adjacency lists.
 pub struct NeighborIter<'a> {
-    edges: &'a SlotMap<EdgeKey, MutableEdge>,
+    edges: &'a FxHashMap<EdgeKey, MutableEdge>,
     out_iter: core::slice::Iter<'a, EdgeKey>,
     in_iter: core::slice::Iter<'a, EdgeKey>,
     lsn: u64,
@@ -496,7 +711,7 @@ impl<'a> Iterator for NeighborIter<'a> {
         };
         loop {
             if let Some(&ek) = self.out_iter.next() {
-                if let Some(edge) = self.edges.get(ek) {
+                if let Some(edge) = self.edges.get(&ek) {
                     if is_visible(edge) {
                         return Some((ek, edge.dst));
                     }
@@ -504,7 +719,7 @@ impl<'a> Iterator for NeighborIter<'a> {
                 continue;
             }
             if let Some(&ek) = self.in_iter.next() {
-                if let Some(edge) = self.edges.get(ek) {
+                if let Some(edge) = self.edges.get(&ek) {
                     if is_visible(edge) {
                         return Some((ek, edge.src));
                     }
