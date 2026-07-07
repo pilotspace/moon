@@ -1437,6 +1437,9 @@ pub async fn per_shard_aof_writer_task(
         let mut write_error = false;
         let mut _dbg_processed: u64 = 0;
         let _dbg_start = Instant::now();
+        // Reusable frame-coalescing buffer: one contiguous write_all per
+        // group-commit batch instead of a header+body write pair per record.
+        let mut batch_buf: Vec<u8> = Vec::new();
         // Idle-adaptive channel-poll wake cadence (RSS/CPU wave 5, item B) —
         // see `IdleWait` docs near the top of this file.
         let mut idle_wait = IdleWait::new();
@@ -1510,9 +1513,15 @@ pub async fn per_shard_aof_writer_task(
                         // waiter so callers error instead of acking a corrupt write.
                         let _ = group_commit::ack_batch(&mut batch, BatchAck::WriteFailed);
                     } else {
-                        // Write each record framed, header + body, in channel order;
-                        // the single fsync below covers them all.
-                        let mut write_failed = false;
+                        // Frame each record (`[u64 lsn][u32 len]` header + body, in
+                        // channel order) into the reusable batch buffer and issue
+                        // ONE write_all for the whole batch; the single fsync below
+                        // covers it all. The old per-record header+body write_all
+                        // pair on the raw File was the dominant writer-thread cost
+                        // under always-P16 (measured 127,812 write(2) calls / 1.25s
+                        // of an 8s strace window vs 2,144 fdatasyncs / 0.2s — Redis
+                        // batches ~120 records per write via aof_buf).
+                        batch_buf.clear();
                         for msg in &batch.data {
                             let (lsn, data) = match msg {
                                 AofMessage::Append { lsn, bytes }
@@ -1529,22 +1538,24 @@ pub async fn per_shard_aof_writer_task(
                             let mut header = [0u8; 12];
                             header[..8].copy_from_slice(&lsn.to_le_bytes());
                             header[8..].copy_from_slice(&(data.len() as u32).to_le_bytes());
-                            if let Err(e) = file.write_all(&header) {
+                            batch_buf.extend_from_slice(&header);
+                            batch_buf.extend_from_slice(data);
+                        }
+                        let mut write_failed = false;
+                        if !batch_buf.is_empty() {
+                            if let Err(e) = file.write_all(&batch_buf) {
                                 error!(
-                                    "AOF header write failed shard {} (seq {}): {}. Persistence degraded.",
+                                    "AOF batch write failed shard {} (seq {}): {}. Persistence degraded.",
                                     shard_id, manifest.seq, e
                                 );
                                 write_failed = true;
-                                break;
                             }
-                            if let Err(e) = file.write_all(data) {
-                                error!(
-                                    "AOF write failed shard {} (seq {}): {}. Persistence degraded.",
-                                    shard_id, manifest.seq, e
-                                );
-                                write_failed = true;
-                                break;
-                            }
+                        }
+                        // Cap the reusable buffer's high-water mark: a rare burst of
+                        // large values (up to AOF_GROUP_COMMIT_MAX_BYTES) must not
+                        // pin megabytes on the writer thread forever.
+                        if batch_buf.capacity() > 1 << 20 {
+                            batch_buf = Vec::new();
                         }
 
                         let do_fsync = matches!(fsync, FsyncPolicy::Always);
