@@ -6,6 +6,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — Windows build: `accept_backoff` used unix-only `libc` errnos (PR #TBD)
+
+- `is_resource_exhaustion` (accept-loop backoff, PR #230) referenced
+  `libc::EMFILE`/`ENFILE`/`ENOBUFS`/`ENOMEM` unguarded; `libc` is not linked
+  on Windows, breaking the main-push Windows check (PRs never caught it —
+  Windows CI is skipped on PRs). Now cfg-split: unix keeps the errno match,
+  Windows matches WSAEMFILE (10024) / WSAENOBUFS (10055) /
+  `ErrorKind::OutOfMemory`.
+
+### Changed — AOF writer coalesces each group-commit batch into one write (PR #TBD)
+
+- The two monoio AOF writer paths (TopLevel via `commit_group_commit_batch`,
+  PerShard framed loop) wrote each record with its own `write(2)` on the raw
+  unbuffered `File` (the PerShard path even used a header+body pair). strace
+  during always-P16 SET: **127,812 write calls / 1.25 s** of an 8 s window vs
+  2,144 fdatasyncs / 0.2 s — the writer thread was write-syscall-bound, not
+  fsync-bound, while Redis batches ~120 records per write via `aof_buf`. Each
+  batch's records now coalesce into one contiguous buffer (reusable in the
+  PerShard loop, capped at 1 MB high-water) and are written with ONE
+  `write_all` before the single per-batch fsync. Single-message batches keep
+  the zero-copy direct write. Failure semantics unchanged: a failed batch
+  write acks every waiter `WriteFailed` and engages the torn-stream latch.
+- tokio writer loops already amortize via `BufWriter` — untouched.
+- `wal_group_commit` sink tests updated to the coalesced contract (one write,
+  channel-order bytes, fsync after it).
+
 ### Changed — AOF writer polls park-free under everysec/no (PR #TBD)
 
 - The two std-thread AOF writer loops (monoio TopLevel + PerShard) no longer
