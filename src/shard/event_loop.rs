@@ -1624,6 +1624,7 @@ impl super::Shard {
                         &page_cache,
                         &mut next_file_id,
                         &mut wal_v3_writer,
+                        &script_cache_rc,
                         &spill_file_id,
                     );
 
@@ -2127,6 +2128,7 @@ impl super::Shard {
                         &page_cache,
                         &mut next_file_id,
                         &mut wal_v3_writer,
+                        &script_cache_rc,
                         &spill_file_id,
                     );
                     // MQ trigger check: fire debounced triggers

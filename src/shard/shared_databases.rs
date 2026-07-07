@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use parking_lot::{Mutex, MutexGuard};
+use smallvec::SmallVec;
 
 use crate::storage::Database;
 use crate::workspace::wal::{decode_workspace_create, decode_workspace_drop};
@@ -23,6 +24,10 @@ pub struct ShardStoreMemory {
     pub text: AtomicUsize,
     /// Resident bytes of GraphStore CSR segments.
     pub graph: AtomicUsize,
+    /// Approximate resident bytes of the shard's Lua `ScriptCache` (C4 wave-5
+    /// hygiene). The cache itself stays unbounded (Redis parity -- `SCRIPT
+    /// FLUSH` is the only eviction path); this is observability only.
+    pub lua: AtomicUsize,
 }
 
 /// Shared infrastructure handle — the residual cross-shard state after M5.
@@ -102,6 +107,7 @@ impl ShardDatabases {
                     vector: AtomicUsize::new(0),
                     text: AtomicUsize::new(0),
                     graph: AtomicUsize::new(0),
+                    lua: AtomicUsize::new(0),
                 })
             })
             .collect::<Vec<_>>()
@@ -225,7 +231,10 @@ impl ShardDatabases {
             self.elastic_budgets[shard_id].store(0, Ordering::Relaxed);
             return 0;
         }
-        let used: Vec<usize> = self
+        // SmallVec: most deployments run <=16 shards, so this 100ms-tick
+        // snapshot stays fully on the stack; only larger shard counts spill
+        // to a single heap allocation (still one per call, same as before).
+        let used: SmallVec<[usize; 16]> = self
             .memory_per_shard
             .iter()
             .map(|a| a.load(Ordering::Relaxed))
@@ -746,6 +755,25 @@ mod tests {
         assert_eq!(shared.elastic_budget(0), 370);
         // Idle shards keep base.
         assert_eq!(shared.recompute_elastic_budget(1, &rt), 100);
+    }
+
+    #[test]
+    fn recompute_elastic_budget_correct_beyond_smallvec_inline_capacity() {
+        // The per-call `used` snapshot is a `SmallVec<[usize; 16]>` — pin
+        // correctness both inline (<=16 shards, covered above) and once
+        // spilled to the heap (>16 shards) so the container swap never
+        // silently truncates or reorders shard readings.
+        const N: usize = 20;
+        let shared = new_shared(N, 1);
+        let rt = rt_config(N * 100, N); // base = 100 per shard
+        shared.publish_memory(0, 150); // hot
+        for i in 1..N {
+            shared.publish_memory(i, 10);
+        }
+        // Hot shard borrows (100-10)*19 = 1710 -> budget 1810.
+        assert_eq!(shared.recompute_elastic_budget(0, &rt), 1810);
+        // An idle shard keeps base.
+        assert_eq!(shared.recompute_elastic_budget(5, &rt), 100);
     }
 
     #[test]

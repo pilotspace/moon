@@ -21,6 +21,7 @@ use crate::persistence::fsync::{fsync_directory, fsync_file};
 use crate::vector::aligned_buffer::AlignedBuffer;
 use crate::vector::hnsw::graph::HnswGraph;
 use crate::vector::segment::immutable::{ImmutableSegment, MvccHeader};
+use crate::vector::segment::raw_f16_store::RawF16Store;
 use crate::vector::turbo_quant::collection::{CollectionMetadata, QuantizationConfig};
 use crate::vector::types::DistanceMetric;
 
@@ -550,26 +551,31 @@ pub fn read_immutable_segment(
     let sub_sign_bpv = (meta.padded_dimension as usize + 7) / 8;
 
     // 6b. raw_f16.bin — optional exact-rerank sidecar (HQ-1). Missing file
-    // (pre-sidecar segments) or a size mismatch → no sidecar; search falls
-    // back to quantized ADC distances.
-    let raw_f16: Option<Vec<u16>> = match fs::read(seg_dir.join("raw_f16.bin")) {
-        Ok(bytes) if bytes.len() == mvcc.len() * dim * 2 => Some(
-            bytes
-                .chunks_exact(2)
-                .map(|c| u16::from_le_bytes([c[0], c[1]]))
-                .collect(),
-        ),
-        Ok(bytes) => {
-            tracing::warn!(
-                "segment-{segment_id}: raw_f16.bin has {} bytes, expected {} — \
-                 ignoring sidecar (search degrades to quantized distances)",
-                bytes.len(),
-                mvcc.len() * dim * 2
-            );
-            None
+    // (pre-sidecar segments), an open/read error, or a size mismatch → no
+    // sidecar; search falls back to quantized ADC distances. Reload
+    // memory-maps the file instead of buffering a second heap copy (item A,
+    // RSS/CPU wave 5) — see `raw_f16_store` module docs for the mmap
+    // soundness contract this relies on.
+    let expected_halves = mvcc.len() * dim;
+    let raw_f16_path = seg_dir.join("raw_f16.bin");
+    // missing file (pre-sidecar segment) or open/mmap error -> None, same as
+    // a size mismatch.
+    let raw_f16: Option<RawF16Store> =
+        RawF16Store::map_file(&raw_f16_path, expected_halves).unwrap_or_default();
+    if raw_f16.is_none() {
+        // Distinguish "missing file" (expected, silent) from "present but
+        // wrong size" (corruption — worth a loud warning) without doing a
+        // second `map_file` call: a cheap metadata probe is enough.
+        if let Ok(actual_len) = fs::metadata(&raw_f16_path).map(|m| m.len()) {
+            if actual_len as usize != expected_halves * 2 {
+                tracing::warn!(
+                    "segment-{segment_id}: raw_f16.bin has {actual_len} bytes, expected {} — \
+                     ignoring sidecar (search degrades to quantized distances)",
+                    expected_halves * 2
+                );
+            }
         }
-        Err(_) => None,
-    };
+    }
 
     let segment = ImmutableSegment::new(
         graph,
@@ -584,7 +590,7 @@ pub fn read_immutable_segment(
         meta.live_count,
         meta.total_count,
     )
-    .with_raw_f16(raw_f16)
+    .with_raw_f16_store(raw_f16)
     // R6: restore the compact-time estimate verbatim — never re-run the
     // estimator on the load path (it needs the raw sidecar + a full ladder
     // walk; that cost belongs on the compaction thread only).
@@ -850,6 +856,90 @@ mod tests {
 
         assert_eq!(restored.live_count(), segment.live_count());
         assert_eq!(restored.total_count(), segment.total_count());
+    }
+
+    /// Item A (RSS/CPU wave 5): a segment reloaded from disk must back its
+    /// exact-rerank sidecar with a memory map, not a second heap `Vec` —
+    /// and the mapped view must decode byte-identical halves and produce
+    /// identical `search()` results to the original heap-owned segment.
+    #[test]
+    fn test_reload_raw_f16_sidecar_uses_mmap_and_matches_owned_rerank() {
+        let n = 40;
+        let dim = 64;
+        let (segment, collection) = build_test_segment(n, dim);
+
+        // Synthetic BFS-ordered sidecar (content doesn't need to match the TQ
+        // codes for this test — only self-consistency between the Owned and
+        // Mapped views of the SAME bytes matters).
+        let mut raw_f16_bfs = vec![0u16; n * dim];
+        for bfs in 0..n {
+            let orig_id = segment.graph().to_original(bfs as u32);
+            let mut v = lcg_f32(dim, orig_id ^ 0xABCD_1234);
+            normalize(&mut v);
+            let mut halves = Vec::new();
+            crate::vector::f16::encode_f16_slice(&v, &mut halves);
+            raw_f16_bfs[bfs * dim..(bfs + 1) * dim].copy_from_slice(&halves);
+        }
+        let segment = segment.with_raw_f16(Some(raw_f16_bfs));
+        assert!(
+            !segment.raw_f16_is_mapped(),
+            "freshly-built segment must stay heap-owned"
+        );
+
+        let tmp = tempfile::tempdir().unwrap();
+        write_immutable_segment(tmp.path(), 1, &segment, &collection).unwrap();
+        let (restored, _restored_col) = read_immutable_segment(tmp.path(), 1).unwrap();
+
+        assert!(
+            restored.raw_f16_is_mapped(),
+            "reloaded segment must back its raw_f16 sidecar with a memory map"
+        );
+
+        // Round-trip byte fidelity: mapped view decodes to the exact same
+        // halves the in-memory (Owned) segment holds.
+        assert_eq!(restored.raw_f16().unwrap(), segment.raw_f16().unwrap());
+
+        // Rerank parity: identical sidecar bytes through Owned vs Mapped
+        // storage must produce identical search() output for the same query.
+        let mut query = lcg_f32(dim, 999_999);
+        normalize(&mut query);
+        let padded = collection.padded_dimension;
+        let mut scratch_owned =
+            crate::vector::hnsw::search::SearchScratch::new(segment.graph().num_nodes(), padded);
+        let mut scratch_mapped =
+            crate::vector::hnsw::search::SearchScratch::new(restored.graph().num_nodes(), padded);
+        let owned_results = segment.search(&query, 5, 64, &mut scratch_owned);
+        let mapped_results = restored.search(&query, 5, 64, &mut scratch_mapped);
+
+        assert_eq!(owned_results.len(), mapped_results.len());
+        assert!(!owned_results.is_empty());
+        for (a, b) in owned_results.iter().zip(mapped_results.iter()) {
+            assert_eq!(a.id.0, b.id.0);
+            assert!(
+                (a.distance - b.distance).abs() < 1e-4,
+                "distance mismatch: {} vs {}",
+                a.distance,
+                b.distance
+            );
+        }
+
+        // Memory accounting must reflect the mmap win: the mapped sidecar is
+        // kernel page cache, not pinned heap, so the reloaded segment must
+        // report at least the sidecar's bytes less than the heap-owned
+        // original (other components may also differ slightly across a
+        // reload; the exact Owned-vs-Mapped byte accounting is pinned by
+        // raw_f16_store's own unit tests). Counting mapped pages as resident
+        // would feed the elastic memory budget / eviction pipeline numbers
+        // as if the RSS win never happened.
+        let sidecar_bytes = n * dim * std::mem::size_of::<u16>();
+        assert!(
+            segment.resident_bytes() >= restored.resident_bytes() + sidecar_bytes,
+            "mapped sidecar must not count toward resident_bytes \
+             (owned={} mapped={} sidecar={})",
+            segment.resident_bytes(),
+            restored.resident_bytes(),
+            sidecar_bytes
+        );
     }
 
     #[test]
