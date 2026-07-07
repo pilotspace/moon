@@ -2749,6 +2749,16 @@ fn auto_index_hset(
         // `mark_deleted_by_key_hash(key_hash, rollback_lsn)`.
         if any_vector_inserted {
             inserted.push((idx_name.clone(), key_hash));
+            // Insert-path compaction trigger: poll installs + dispatch a
+            // background build when the mutable segment crosses its compact
+            // threshold. Without this, a pure bulk load (no FT.SEARCH
+            // traffic) leaves everything in the brute-force mutable tier
+            // until the autovacuum backstop's 30s tick — the whole HNSW
+            // build then lands on the first explicit FT.COMPACT. Cheap when
+            // below threshold or a build is already in flight (two
+            // non-blocking polls + a length compare, same calls the
+            // FT.SEARCH path makes per query).
+            idx.try_compact();
         }
 
         // Metadata-only path: if no vector was inserted but key already exists

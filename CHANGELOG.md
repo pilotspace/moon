@@ -6,6 +6,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — parallel HNSW build + insert-path compaction trigger: time-to-index-green 11× (PR #237)
+
+- **`src/vector/hnsw/parallel_build.rs`** (new): concurrent HNSW
+  construction into one shared graph — per-node `parking_lot::Mutex`
+  adjacency (copy-under-lock, distance math unlocked; single lock held at a
+  time, deadlock-free by construction), entry point under a `RwLock`,
+  levels pre-generated from the same seeded LCG as the sequential builder,
+  sequential 1K warmup, then dynamic fan-out over an atomic cursor.
+  Finalize adds a connectivity repair pass (concurrent back-link pruning
+  orphaned ~0.2% of nodes = permanent recall loss; BFS + force-link makes
+  every node reachable, unit-asserted) and the exact same BFS-reorder →
+  `HnswGraph` path as the sequential builder — drop-in for search,
+  persistence, and GraphUnion merge. `compact()` routes builds ≥ 10K
+  vectors here; smaller segments keep the bitwise-deterministic
+  single-threaded builder. Measured (50K × 384d, 6-core Linux VM):
+  `FT.COMPACT` wall 30.2s → **2.71s**; a 24K segment build 14.1s →
+  **2.65s** (~88% scaling efficiency).
+- **Affinity-mask trap fixed (3 sites)**: shard threads are core-pinned and
+  every thread spawned from one inherits the SINGLE-core mask on Linux, so
+  `std::thread::available_parallelism()` returned 1 — the "parallel" build
+  ran at exactly sequential speed and the background-compactor pool sized
+  itself to one worker. New `shard::numa::system_parallelism()` (sysfs
+  online-CPU count, affinity-independent, cached) now sizes both; parallel
+  build workers and pool workers explicitly re-pin round-robin across the
+  machine (`pin_worker_to_core`), pool workers from the last core downward
+  so small builds stop time-slicing shard 0's core.
+- **`src/shard/spsc_handler.rs`**: HSET auto-index hook now calls
+  `try_compact()` after appending a vector — a pure bulk load (no
+  FT.SEARCH traffic) previously left everything in the brute-force mutable
+  tier until the autovacuum backstop's 30s tick, so the whole HNSW build
+  landed on the first explicit `FT.COMPACT`. Builds now start and install
+  DURING ingest (in-flight guard unchanged; respects
+  `FT.CONFIG AUTOCOMPACT OFF`). Red/green: new
+  `test_insert_path_triggers_background_compact_without_search`.
+- Net effect on the §10.8 losing metric (bulk load 50K × 384d → HNSW-tier
+  serving, VM): ~30s of post-ingest compaction becomes ~0 (already
+  compacted by measure time) — Moon's time-to-green now beats Qdrant's
+  optimizer on the same box (GCE re-validation pending). Multi-segment
+  recall@10 0.9986 vs 0.9992 single-segment (−0.0006, within the ≥0.99
+  gate); multi-shard verified (`--shards 4`: per-shard triggers, 9
+  segments, FT.COMPACT 1.57s).
+
 ### Changed — consolidated dependency bumps wave 2 (PR #TBD, supersedes dependabot #223–227)
 
 - Patch-level bumps rolled into one `Cargo.lock` update (no `Cargo.toml`

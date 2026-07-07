@@ -1,10 +1,13 @@
 //! HNSW (Hierarchical Navigable Small World) index for approximate nearest neighbor search.
 //!
-//! Single-threaded, cache-optimized with BFS reordering and dual prefetch.
+//! Cache-optimized with BFS reordering and dual prefetch. Construction is
+//! single-threaded (`build`) for small/deterministic segments and
+//! multi-threaded (`parallel_build`) for large compaction builds.
 
 pub mod build;
 pub mod graph;
 pub mod graph_serde;
 pub mod neighbor_codec;
+pub mod parallel_build;
 pub mod search;
 pub mod search_sq;

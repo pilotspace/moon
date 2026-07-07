@@ -42,7 +42,7 @@ fn select_neighbors_simple(candidates: &[(f32, u32)], max_neighbors: usize) -> V
 /// Candidates MUST be sorted by distance ascending before calling.
 /// For each candidate: accept if dist(candidate, query) < dist(candidate, every selected neighbor).
 /// After heuristic pass, if fewer than `max_neighbors` selected, fill from pruned (`keepPrunedConnections`).
-fn select_neighbors_heuristic(
+pub(crate) fn select_neighbors_heuristic(
     candidates: &[(f32, u32)],
     max_neighbors: usize,
     dist_fn: &impl Fn(u32, u32) -> f32,
@@ -154,6 +154,13 @@ impl HnswBuilder {
     /// inter-neighbor comparisons amplify quantization noise, causing over-pruning.
     pub fn set_use_heuristic(&mut self, use_heuristic: bool) {
         self.use_heuristic = use_heuristic;
+    }
+
+    /// Per-node levels assigned so far (test-only: lets the parallel builder
+    /// assert its pre-generated level sequence matches this builder's LCG).
+    #[cfg(test)]
+    pub(crate) fn levels_for_test(&self) -> Vec<u8> {
+        self.levels.clone()
     }
 
     /// Generate random level using exponential distribution.

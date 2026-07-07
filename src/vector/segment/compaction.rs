@@ -437,6 +437,44 @@ fn add_neighbor_to_flat(
     }
 }
 
+/// Build the HNSW graph for `n` vectors, choosing the concurrent
+/// shared-graph builder for large segments and the sequential (bitwise
+/// deterministic for a given seed) builder for small ones.
+///
+/// The threshold split keeps small-segment builds — and every existing
+/// test fixture — byte-identical, while bulk-load compactions
+/// (`FT.COMPACT` after ingest, background builds) scale across cores.
+/// Thread count mirrors the background-compactor clamp (≤ 8).
+fn build_graph_auto(
+    n: usize,
+    seed: u64,
+    bytes_per_code: u32,
+    dist_fn: impl Fn(u32, u32) -> f32 + Sync,
+) -> crate::vector::hnsw::graph::HnswGraph {
+    // system_parallelism, NOT available_parallelism: compact() runs on
+    // core-pinned shard/compactor threads whose affinity mask makes
+    // available_parallelism() report 1 (which silently forced every build
+    // down the sequential path — measured at exactly sequential speed).
+    let threads = crate::shard::numa::system_parallelism().min(8);
+    if n >= PARALLEL_THRESHOLD && threads > 1 {
+        crate::vector::hnsw::parallel_build::build_parallel(
+            n as u32,
+            HNSW_M,
+            HNSW_EF_CONSTRUCTION,
+            seed,
+            threads,
+            &dist_fn,
+            bytes_per_code,
+        )
+    } else {
+        let mut builder = HnswBuilder::new(HNSW_M, HNSW_EF_CONSTRUCTION, seed);
+        for _ in 0..n {
+            builder.insert(&dist_fn);
+        }
+        builder.build(bytes_per_code)
+    }
+}
+
 /// Convert a frozen mutable segment into an optimized immutable segment.
 ///
 /// Steps: filter dead -> encode TQ -> build HNSW -> verify recall -> BFS reorder ->
@@ -635,48 +673,35 @@ pub fn compact(
         Vec::new()
     };
 
-    // Cell-parallel disabled: 2-coordinate spatial partitioning is meaningless at 384d+
-    // and produces poorly stitched graphs. TODO: replace with PCA-based partitioning.
-    // compact_parallel() is retained for tests; production always uses single-threaded builder.
-    let _parallel_threshold = PARALLEL_THRESHOLD; // suppress unused warning
+    // Cell-parallel (spatial partitioning) stays disabled: 2-coordinate
+    // partitioning is meaningless at 384d+ and produces poorly stitched
+    // graphs; compact_parallel() is retained for tests only. Large builds
+    // instead use the shared-graph concurrent builder (parallel_build):
+    // same insertion algorithm under per-node locks, near-linear scaling —
+    // the single-threaded insert loop was 99.3% of FT.COMPACT wall time
+    // (30 s at 50K × 384d, measured 2026-07-08).
     let graph = if need_cpu_build {
         let dist_table = crate::vector::distance::table();
-        let mut builder = HnswBuilder::new(HNSW_M, HNSW_EF_CONSTRUCTION, seed);
-
         if has_raw {
             // EXACT f32 L2 pairwise distance — optimal HNSW graph topology
-            for _i in 0..n {
-                builder.insert(|a: u32, b: u32| {
-                    let va = live_f32[a as usize];
-                    let vb = live_f32[b as usize];
-                    (dist_table.l2_f32)(va, vb)
-                });
-            }
-        } else if is_a2 {
-            // A2 fallback: use decoded rotated vectors with L2 (no scalar TQ-ADC for A2)
-            for _i in 0..n {
-                builder.insert(|a: u32, b: u32| {
-                    let ra = &all_rotated[a as usize];
-                    let rb = &all_rotated[b as usize];
-                    (dist_table.l2_f32)(ra, rb)
-                });
-            }
+            build_graph_auto(n, seed, bytes_per_code as u32, |a: u32, b: u32| {
+                let va = live_f32[a as usize];
+                let vb = live_f32[b as usize];
+                (dist_table.l2_f32)(va, vb)
+            })
         } else {
-            // Light mode fallback: use decoded centroid vectors with symmetric L2.
-            // TQ-ADC (asymmetric) was previously used here but its noise causes
-            // poor HNSW graph topology at 384d+ — greedy routing gets stuck.
-            // Decoded centroid L2 is symmetric, deterministic, and much more accurate
-            // for pairwise neighbor selection during graph construction.
-            for _i in 0..n {
-                builder.insert(|a: u32, b: u32| {
-                    let ra = &all_rotated[a as usize];
-                    let rb = &all_rotated[b as usize];
-                    (dist_table.l2_f32)(ra, rb)
-                });
-            }
+            // Decoded-vector fallback (A2 and scalar-TQ light mode): symmetric
+            // L2 over decoded vectors. TQ-ADC (asymmetric) was previously used
+            // here but its noise causes poor HNSW graph topology at 384d+ —
+            // greedy routing gets stuck. Decoded L2 is symmetric,
+            // deterministic, and much more accurate for pairwise neighbor
+            // selection during graph construction.
+            build_graph_auto(n, seed, bytes_per_code as u32, |a: u32, b: u32| {
+                let ra = &all_rotated[a as usize];
+                let rb = &all_rotated[b as usize];
+                (dist_table.l2_f32)(ra, rb)
+            })
         }
-
-        builder.build(bytes_per_code as u32)
     } else {
         #[cfg(feature = "gpu-cuda")]
         {
