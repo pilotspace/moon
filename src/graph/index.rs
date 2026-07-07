@@ -302,6 +302,16 @@ impl PropertyIndex {
         result
     }
 
+    /// Less-than-or-equal query: returns rows where property <= threshold.
+    pub fn lte(&self, threshold: f64) -> RoaringBitmap {
+        let key = OrderedFloat(threshold);
+        let mut result = RoaringBitmap::new();
+        for (_, bitmap) in self.tree.range(..=key) {
+            result |= bitmap;
+        }
+        result
+    }
+
     /// Number of distinct values in the index.
     pub fn distinct_values(&self) -> usize {
         self.tree.len()
@@ -417,6 +427,13 @@ impl SegmentPropertyIndexes {
     /// True when no property is indexed at all (segment without v5 blob).
     pub fn is_empty(&self) -> bool {
         self.numeric.is_empty() && self.strings.is_empty()
+    }
+
+    /// The numeric B-tree for `prop_id`, if any row indexed a numeric value
+    /// under it. `None` means no row can satisfy a numeric range on this
+    /// property (the build is exhaustive — see type docs).
+    pub fn numeric_index(&self, prop_id: u16) -> Option<&PropertyIndex> {
+        self.numeric.get(&prop_id)
     }
 
     fn numeric_eq(&self, prop_id: u16, v: f64) -> RoaringBitmap {
@@ -671,6 +688,14 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert!(result.contains(0));
         assert!(result.contains(1));
+
+        // lte(30) -> rows 0, 1, 2 (inclusive upper bound)
+        let result = idx.lte(30.0);
+        assert_eq!(result.len(), 3);
+        assert!(result.contains(2));
+
+        // lte below the minimum -> empty
+        assert!(idx.lte(9.0).is_empty());
     }
 
     #[test]

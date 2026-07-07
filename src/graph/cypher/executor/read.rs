@@ -13,12 +13,21 @@ use super::*;
 /// `prop_eq` values are literals or parameters; if any resolves to a
 /// non-scalar the whole scan degrades to the plain merged label scan (the
 /// residual Filter downstream keeps results exact either way).
+///
+/// `prop_range` conjuncts (`n.p > $x` etc.) prune via the per-segment
+/// numeric B-trees. A conjunct whose threshold resolves non-numeric is
+/// dropped (can't prune the numeric space) — never narrowed: the pruned set
+/// stays a SUPERSET of the rows the residual Filter accepts, because the
+/// post-W2-3 comparison semantics make cross-type / missing-property
+/// comparisons evaluate to Null (dropped by WHERE), exactly the rows the
+/// numeric index excludes.
 #[allow(clippy::too_many_arguments)]
 fn index_scan_keys(
     memgraph: &crate::graph::memgraph::MemGraph,
     csr_segs: &[std::sync::Arc<crate::graph::csr::CsrStorage>],
     label: Option<&String>,
     prop_eq: &[(String, Expr)],
+    prop_range: &[(String, RangeCmp, Expr)],
     params: &HashMap<String, Value>,
     ctx: &ExecutionContext,
 ) -> Vec<NodeKey> {
@@ -59,6 +68,43 @@ fn index_scan_keys(
         }
     }
 
+    // Resolve each range conjunct to (prop_id, cmp, numeric threshold). A
+    // threshold that resolves non-numeric (e.g. a String parameter) cannot
+    // prune the numeric index — drop the conjunct (superset-safe); the
+    // residual Filter stays exact.
+    let mut ranges: Vec<(u16, RangeCmp, f64)> = Vec::with_capacity(prop_range.len());
+    for (name, cmp, expr) in prop_range {
+        let v = eval_expr(
+            expr,
+            &empty_row,
+            memgraph,
+            params,
+            csr_segs,
+            ctx.snapshot_lsn,
+            ctx.decay,
+        );
+        match v {
+            Value::Int(i) => ranges.push((label_to_id(name.as_bytes()), *cmp, i as f64)),
+            Value::Float(f) => ranges.push((label_to_id(name.as_bytes()), *cmp, f)),
+            _ => {}
+        }
+    }
+
+    // Nothing prunable (pure-range scan whose thresholds all resolved
+    // non-numeric): full merged label scan, residual Filter stays exact.
+    if targets.is_empty() && ranges.is_empty() {
+        let mut keys = Vec::new();
+        view.for_each_visible_node(
+            label_id,
+            ctx.snapshot_lsn,
+            ctx.my_txn_id,
+            &committed,
+            ctx.valid_time_as_of,
+            |k| keys.push(k),
+        );
+        return keys;
+    }
+
     let mut keys = Vec::new();
 
     // Mutable tail: inline superset-consistent property check.
@@ -82,7 +128,23 @@ fn index_scan_keys(
                 .iter()
                 .any(|(id, have)| id == pid && prop_value_loose_eq(have, want))
         });
-        if all_match {
+        // Range check mirrors the index's numeric normalization (Int/Float/
+        // Bool as 0-1 in one f64 space) so both tiers prune identically.
+        let ranges_match = ranges.iter().all(|(pid, cmp, threshold)| {
+            node.properties.iter().any(|(id, have)| {
+                if id != pid {
+                    return false;
+                }
+                let num = match have {
+                    PropertyValue::Int(i) => *i as f64,
+                    PropertyValue::Float(f) => *f,
+                    PropertyValue::Bool(b) => f64::from(u8::from(*b)),
+                    _ => return false,
+                };
+                range_cmp_holds(num, *cmp, *threshold)
+            })
+        });
+        if all_match && ranges_match {
             keys.push(key);
         }
     }
@@ -103,6 +165,27 @@ fn index_scan_keys(
                 bm = Some(acc);
                 break;
             }
+            bm = Some(acc);
+        }
+        for (pid, cmp, threshold) in &ranges {
+            if bm.as_ref().is_some_and(roaring::RoaringBitmap::is_empty) {
+                break;
+            }
+            let rows = match seg.property_index().numeric_index(*pid) {
+                Some(ix) => match cmp {
+                    RangeCmp::Gt => ix.gt(*threshold),
+                    RangeCmp::Gte => ix.gte(*threshold),
+                    RangeCmp::Lt => ix.lt(*threshold),
+                    RangeCmp::Lte => ix.lte(*threshold),
+                },
+                // No numeric value ever indexed under this prop in this
+                // segment -> no row here can pass the residual comparison.
+                None => roaring::RoaringBitmap::new(),
+            };
+            let acc = match bm.take() {
+                Some(acc) => acc & rows,
+                None => rows,
+            };
             bm = Some(acc);
         }
         let Some(mut bm) = bm else { continue };
@@ -144,6 +227,16 @@ fn index_scan_keys(
     }
 
     keys
+}
+
+/// Numeric range comparison for the mutable-tail index check.
+fn range_cmp_holds(value: f64, cmp: RangeCmp, threshold: f64) -> bool {
+    match cmp {
+        RangeCmp::Gt => value > threshold,
+        RangeCmp::Gte => value >= threshold,
+        RangeCmp::Lt => value < threshold,
+        RangeCmp::Lte => value <= threshold,
+    }
 }
 
 /// Superset-consistent equality between stored and queried property values,
@@ -246,9 +339,17 @@ pub fn execute(
                 variable,
                 label,
                 prop_eq,
+                prop_range,
             } => {
-                let keys =
-                    index_scan_keys(memgraph, csr_segs, label.as_ref(), prop_eq, params, ctx);
+                let keys = index_scan_keys(
+                    memgraph,
+                    csr_segs,
+                    label.as_ref(),
+                    prop_eq,
+                    prop_range,
+                    params,
+                    ctx,
+                );
                 let mut new_rows = Vec::with_capacity(rows.len() * keys.len());
                 for row in &rows {
                     for &key in &keys {
@@ -788,9 +889,17 @@ pub fn execute_profile(
                 variable,
                 label,
                 prop_eq,
+                prop_range,
             } => {
-                let keys =
-                    index_scan_keys(memgraph, csr_segs, label.as_ref(), prop_eq, params, ctx);
+                let keys = index_scan_keys(
+                    memgraph,
+                    csr_segs,
+                    label.as_ref(),
+                    prop_eq,
+                    prop_range,
+                    params,
+                    ctx,
+                );
                 let mut new_rows = Vec::with_capacity(rows.len() * keys.len());
                 for row in &rows {
                     for &key in &keys {

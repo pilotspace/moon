@@ -573,3 +573,34 @@ fn set_on_frozen_node_then_refreeze_does_not_duplicate() {
     let rows = run_query(&store, "MATCH (n:N) RETURN n.id");
     assert_eq!(rows.len(), 12, "6 originals + 6 new, no duplicates");
 }
+
+// ---------------------------------------------------------------------------
+// 7. WHERE range predicates (W2-3): index pruning + openCypher comparison
+//    semantics (cross-type ordering is Null, not rank-ordered)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn where_range_query_correct_across_tiers_and_types() {
+    let mut store = setup();
+    let _ = seed_across_freeze(&mut store); // ids 0..=5 frozen
+    let _ = add_node(&mut store, 6); // mutable tier
+    // A node whose `id` is a STRING must never satisfy a numeric range.
+    let r = graph_addnode(&mut store, &[bs(GRAPH), bs("N"), bs("id"), bs("zzz")]);
+    assert!(
+        matches!(r, Frame::Integer(_)),
+        "string-prop ADDNODE failed: {r:?}"
+    );
+
+    let rows = run_query(&store, "MATCH (n:N) WHERE n.id > 3 RETURN n.id");
+    assert_eq!(
+        rows.len(),
+        3,
+        "ids 4,5 (frozen) + 6 (mutable); string id must NOT satisfy a numeric >"
+    );
+
+    let rows = run_query(
+        &store,
+        "MATCH (n:N) WHERE n.id >= 1 AND n.id < 3 RETURN n.id",
+    );
+    assert_eq!(rows.len(), 2, "ids 1,2");
+}

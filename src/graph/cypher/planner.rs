@@ -19,6 +19,31 @@ pub struct PhysicalPlan {
     pub operators: Vec<PhysicalOp>,
 }
 
+/// Ordering comparison for an `IndexScan` range conjunct (W2-3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RangeCmp {
+    /// `prop > threshold`
+    Gt,
+    /// `prop >= threshold`
+    Gte,
+    /// `prop < threshold`
+    Lt,
+    /// `prop <= threshold`
+    Lte,
+}
+
+impl RangeCmp {
+    /// Flip for the mirrored form (`threshold < prop` ⇔ `prop > threshold`).
+    fn flipped(self) -> Self {
+        match self {
+            RangeCmp::Gt => RangeCmp::Lt,
+            RangeCmp::Gte => RangeCmp::Lte,
+            RangeCmp::Lt => RangeCmp::Gt,
+            RangeCmp::Lte => RangeCmp::Gte,
+        }
+    }
+}
+
 /// Individual physical operators in the execution pipeline.
 #[derive(Debug, Clone)]
 pub enum PhysicalOp {
@@ -42,6 +67,12 @@ pub enum PhysicalOp {
         /// (property name, value expression) equality conjuncts. Expressions
         /// are literals or parameters, resolved by the executor per run.
         prop_eq: Vec<(String, Expr)>,
+        /// (property name, comparison, threshold expression) range conjuncts
+        /// extracted from top-level `WHERE` AND-chains (`n.p > 5`,
+        /// `10 > n.p`, `n.p >= $t`). Numeric-index pruning hints with the
+        /// same SUPERSET contract as `prop_eq` — the residual Filter
+        /// downstream stays authoritative. W2-3.
+        prop_range: Vec<(String, RangeCmp, Expr)>,
     },
     /// Expand along edges from a source variable.
     ///
@@ -318,6 +349,11 @@ pub fn compile(query: &CypherQuery) -> Result<PhysicalPlan, PlanError> {
                 compile_shortest_path_match(sp, &mut ops);
             }
             Clause::Where(w) => {
+                // W2-3: top-level AND conjuncts of the form
+                // `var.prop <cmp> literal|param` upgrade var's scan to a
+                // range IndexScan BEFORE the residual Filter is pushed
+                // (the full WHERE stays — the index only prunes).
+                extract_range_conjuncts(&w.expr, &mut ops);
                 ops.push(PhysicalOp::Filter {
                     expr: w.expr.clone(),
                 });
@@ -518,6 +554,7 @@ fn push_node_scan(node: &PatternNode, var: &str, ops: &mut Vec<PhysicalOp>) {
             variable: var.to_string(),
             label: node.labels.first().cloned(),
             prop_eq: node.properties.clone(),
+            prop_range: Vec::new(),
         });
     } else {
         ops.push(PhysicalOp::NodeScan {
@@ -530,6 +567,89 @@ fn push_node_scan(node: &PatternNode, var: &str, ops: &mut Vec<PhysicalOp>) {
             expr: properties_to_filter(var, &node.properties),
         });
     }
+}
+
+/// Walk a WHERE expression's top-level AND-chain and push every
+/// `var.prop <cmp> literal|param` conjunct (either orientation) into the
+/// scan op that BINDS `var` (upgrading a plain `NodeScan` to an
+/// `IndexScan` when needed). W2-3.
+///
+/// Soundness: a top-level AND conjunct must hold for every result row, so
+/// restricting var's scan to a SUPERSET of rows satisfying it can never
+/// drop a valid row — provided the executor's index lookup is a superset
+/// of the residual Filter's semantics for that conjunct (see
+/// `index_scan_keys`). Disjunctions (`OR`) are never extracted.
+fn extract_range_conjuncts(expr: &Expr, ops: &mut Vec<PhysicalOp>) {
+    match expr {
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::And,
+            right,
+        } => {
+            extract_range_conjuncts(left, ops);
+            extract_range_conjuncts(right, ops);
+        }
+        Expr::BinaryOp { left, op, right } => {
+            let cmp = match op {
+                BinaryOperator::GreaterThan => RangeCmp::Gt,
+                BinaryOperator::GreaterEqual => RangeCmp::Gte,
+                BinaryOperator::LessThan => RangeCmp::Lt,
+                BinaryOperator::LessEqual => RangeCmp::Lte,
+                _ => return,
+            };
+            // `var.prop <cmp> value` or the mirrored `value <cmp> var.prop`.
+            let (var, prop, value, cmp) = match (as_prop_access(left), as_prop_access(right)) {
+                (Some((var, prop)), None) if is_range_value(right) => {
+                    (var, prop, (**right).clone(), cmp)
+                }
+                (None, Some((var, prop))) if is_range_value(left) => {
+                    (var, prop, (**left).clone(), cmp.flipped())
+                }
+                _ => return,
+            };
+            // Find the scan that binds `var` and attach the conjunct.
+            for op in ops.iter_mut().rev() {
+                match op {
+                    PhysicalOp::IndexScan {
+                        variable,
+                        prop_range,
+                        ..
+                    } if variable == var => {
+                        prop_range.push((prop.to_owned(), cmp, value));
+                        return;
+                    }
+                    PhysicalOp::NodeScan { variable, label } if variable == var => {
+                        *op = PhysicalOp::IndexScan {
+                            variable: variable.clone(),
+                            label: label.clone(),
+                            prop_eq: Vec::new(),
+                            prop_range: vec![(prop.to_owned(), cmp, value)],
+                        };
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// `n.prop` accessor on a plain variable, if the expression is one.
+fn as_prop_access(expr: &Expr) -> Option<(&str, &str)> {
+    if let Expr::PropertyAccess { object, property } = expr {
+        if let Expr::Ident(var) = object.as_ref() {
+            return Some((var.as_str(), property.as_str()));
+        }
+    }
+    None
+}
+
+/// Is this expression usable as an index range threshold (resolvable
+/// without a row)? Numeric literals and parameters only — the executor
+/// skips conjuncts whose parameter resolves to a non-number.
+fn is_range_value(expr: &Expr) -> bool {
+    matches!(expr, Expr::Integer(_) | Expr::Float(_) | Expr::Parameter(_))
 }
 
 /// Build a filter expression `var.k1 = v1 AND var.k2 = v2 ...` from a
@@ -659,6 +779,75 @@ mod tests {
         let query = parse_cypher(b"MATCH (a:N) RETURN a").expect("parse failed");
         let plan = compile(&query).expect("compile failed");
         assert!(matches!(plan.operators[0], PhysicalOp::NodeScan { .. }));
+    }
+
+    // ─── W2-3: WHERE range predicates drive the property index ────────────
+
+    #[test]
+    fn test_where_range_upgrades_scan_to_index_range() {
+        let query = parse_cypher(b"MATCH (n:Person) WHERE n.age > 30 RETURN n").expect("parse");
+        let plan = compile(&query).expect("compile");
+        match &plan.operators[0] {
+            PhysicalOp::IndexScan {
+                prop_eq,
+                prop_range,
+                ..
+            } => {
+                assert!(prop_eq.is_empty(), "no inline equality props");
+                assert_eq!(prop_range.len(), 1, "one range conjunct");
+                assert_eq!(prop_range[0].0, "age");
+                assert_eq!(prop_range[0].1, RangeCmp::Gt);
+            }
+            other => panic!("expected range IndexScan, got {other:?}"),
+        }
+        // The full WHERE stays as a residual Filter (index is superset-only).
+        assert!(
+            plan.operators
+                .iter()
+                .any(|op| matches!(op, PhysicalOp::Filter { .. })),
+            "residual Filter must remain"
+        );
+    }
+
+    #[test]
+    fn test_where_range_conjuncts_compose_and_flip() {
+        let query =
+            parse_cypher(b"MATCH (n:N {id:3}) WHERE n.a >= 1 AND 10 > n.b AND n.c = 2 RETURN n")
+                .expect("parse");
+        let plan = compile(&query).expect("compile");
+        match &plan.operators[0] {
+            PhysicalOp::IndexScan {
+                prop_eq,
+                prop_range,
+                ..
+            } => {
+                assert_eq!(prop_eq.len(), 1, "inline {{id:3}} stays an eq conjunct");
+                assert_eq!(
+                    prop_range.len(),
+                    2,
+                    "two range conjuncts, got {prop_range:?}"
+                );
+                assert_eq!(prop_range[0].0, "a");
+                assert_eq!(prop_range[0].1, RangeCmp::Gte);
+                // `10 > n.b` flips to b < 10.
+                assert_eq!(prop_range[1].0, "b");
+                assert_eq!(prop_range[1].1, RangeCmp::Lt);
+            }
+            other => panic!("expected range IndexScan, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_where_or_is_not_range_extracted() {
+        // Disjunctions cannot prune a scan (a row failing one branch may
+        // satisfy the other).
+        let query = parse_cypher(b"MATCH (n:N) WHERE n.a > 1 OR n.b < 2 RETURN n").expect("parse");
+        let plan = compile(&query).expect("compile");
+        assert!(
+            matches!(plan.operators[0], PhysicalOp::NodeScan { .. }),
+            "OR predicate must not upgrade the scan; ops = {:?}",
+            plan.operators
+        );
     }
 
     #[test]

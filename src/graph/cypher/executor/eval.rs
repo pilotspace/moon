@@ -476,20 +476,25 @@ pub(crate) fn eval_binary_op(left: &Value, op: BinaryOperator, right: &Value) ->
         BinaryOperator::NotEqual => {
             Value::Bool(compare_values(left, right) != std::cmp::Ordering::Equal)
         }
-        BinaryOperator::LessThan => {
-            Value::Bool(compare_values(left, right) == std::cmp::Ordering::Less)
-        }
-        BinaryOperator::GreaterThan => {
-            Value::Bool(compare_values(left, right) == std::cmp::Ordering::Greater)
-        }
-        BinaryOperator::LessEqual => {
-            let ord = compare_values(left, right);
-            Value::Bool(ord == std::cmp::Ordering::Less || ord == std::cmp::Ordering::Equal)
-        }
-        BinaryOperator::GreaterEqual => {
-            let ord = compare_values(left, right);
-            Value::Bool(ord == std::cmp::Ordering::Greater || ord == std::cmp::Ordering::Equal)
-        }
+        // Ordering comparisons follow openCypher: only same-kind operands
+        // are comparable (Int/Float promote to one numeric space); a
+        // cross-type, Null, or NaN comparison yields Null, which WHERE
+        // drops. This is ALSO what makes numeric index-range pruning sound
+        // (W2-3): the index excludes exactly the rows whose residual
+        // comparison is non-true. `compare_values` keeps its total
+        // type-rank order for ORDER BY / equality.
+        BinaryOperator::LessThan
+        | BinaryOperator::GreaterThan
+        | BinaryOperator::LessEqual
+        | BinaryOperator::GreaterEqual => match order_values(left, right) {
+            Some(ord) => Value::Bool(match op {
+                BinaryOperator::LessThan => ord == std::cmp::Ordering::Less,
+                BinaryOperator::GreaterThan => ord == std::cmp::Ordering::Greater,
+                BinaryOperator::LessEqual => ord != std::cmp::Ordering::Greater,
+                _ => ord != std::cmp::Ordering::Less,
+            }),
+            None => Value::Null,
+        },
 
         // Arithmetic operators
         BinaryOperator::Add => match (left, right) {
@@ -562,6 +567,23 @@ pub(crate) fn eval_binary_op(left: &Value, op: BinaryOperator, right: &Value) ->
 // ---------------------------------------------------------------------------
 // Value comparison (for Sort and equality)
 // ---------------------------------------------------------------------------
+
+/// openCypher ordering comparability for `< > <= >=`: `Some(ord)` only when
+/// both operands are the same kind (Int/Float promote to one numeric space,
+/// String vs String, Bool vs Bool). Cross-type, Null, and NaN comparisons
+/// return `None` (the operator yields Null). Distinct from `compare_values`,
+/// which imposes a TOTAL type-rank order for ORDER BY.
+fn order_values(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
+    match (a, b) {
+        (Value::Int(a), Value::Int(b)) => Some(a.cmp(b)),
+        (Value::Float(a), Value::Float(b)) => a.partial_cmp(b),
+        (Value::Int(a), Value::Float(b)) => (*a as f64).partial_cmp(b),
+        (Value::Float(a), Value::Int(b)) => a.partial_cmp(&(*b as f64)),
+        (Value::String(a), Value::String(b)) => Some(a.cmp(b)),
+        (Value::Bool(a), Value::Bool(b)) => Some(a.cmp(b)),
+        _ => None,
+    }
+}
 
 /// Compare two Values for ordering.
 /// NULL < Bool < Int/Float < String < Node < Edge < List < Map.
