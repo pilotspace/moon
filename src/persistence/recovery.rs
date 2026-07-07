@@ -562,47 +562,88 @@ pub fn recover_shard_v3_pitr(
         }
     }
 
-    // ── Phase 4b: V2 WAL FALLBACK ──────────────────────────────────────
-    // When v3 replay produced 0 commands and a v2 persistence directory is
-    // available, fall back to replaying the v2 AOF file. This handles the
-    // common case where --disk-offload enable was used with --appendonly yes
-    // but write commands logged to the v2 AOF (standard appendonly path).
+    // Loud failure (not silent skip) for a leftover pre-freeze WAL v2 file
+    // in the legacy persistence dir. WAL v2 support was removed in this
+    // build; the file is never consulted by any recovery path here, so
+    // surface it unconditionally (not only when the branch below happens to
+    // run) so an operator who upgraded over a v2-only deployment finds out
+    // immediately rather than discovering a silent recovery gap later.
+    if let Some(v2_dir) = v2_persistence_dir {
+        let legacy_v2_wal = v2_dir.join(format!("shard-{}.wal", shard_id));
+        if legacy_v2_wal.exists() {
+            tracing::error!(
+                "Shard {}: found legacy WAL v2 file {:?} — WAL v2 support was \
+                 removed (pre-1.0 WAL-v3-only format freeze) and this build \
+                 does NOT replay it. If its contents are not already reflected \
+                 in appendonly.aof, replay it on a pre-freeze Moon build first \
+                 (which re-persists through the AOF) before removing this file.",
+                shard_id,
+                legacy_v2_wal
+            );
+        }
+    }
+
+    // ── Phase 4b: legacy-dir AOF / WAL v3 FALLBACK ─────────────────────
+    // When the disk-offload WAL v3 replay (Phase 4, above) produced 0
+    // commands and a legacy persistence directory is available, fall back to
+    // it. `appendonly.aof` is the AUTHORITY there (post-#211, WAL v3's KV
+    // coverage is intentionally partial: `--wal-kv-log` default-off, and
+    // connection-local writes bypass it even when on — a non-empty WAL v3
+    // must never shadow the AOF). Only when NO AOF exists at all does the
+    // legacy-mode WAL v3 directory (`v2_dir/shard-N/wal-v3/`, distinct from
+    // `shard_dir`'s Phase-4 WAL despite the shared name) serve as a
+    // last-resort partial recovery source. The WAL v2 rung (per-shard
+    // `shard-N.wal`) was removed in the pre-1.0 WAL-v3-only format freeze
+    // and is never replayed by this build.
     if result.commands_replayed == 0 {
         if let Some(v2_dir) = v2_persistence_dir {
-            // Try all v2 persistence sources in order:
-            // 1. Per-shard binary WAL (shard-N.wal)
-            // 2. Global RESP-format AOF (appendonly.aof)
-            let v2_sources: &[(&std::path::Path, bool)] = &[
-                (&crate::persistence::wal::wal_path(v2_dir, shard_id), false),
-                (&v2_dir.join("appendonly.aof"), true),
-            ];
-            for &(ref path, is_aof) in v2_sources {
-                if !path.exists() {
-                    continue;
-                }
+            let aof_path = v2_dir.join("appendonly.aof");
+            if aof_path.exists() {
                 info!(
-                    "Shard {}: v3 WAL empty, falling back to v2 replay from {:?}",
-                    shard_id, path
+                    "Shard {}: WAL empty, falling back to AOF replay from {:?}",
+                    shard_id, aof_path
                 );
-                let replay_result = if is_aof {
-                    crate::persistence::aof::replay_aof(databases, path, engine)
-                } else {
-                    crate::persistence::wal::replay_wal(databases, path, engine)
-                };
-                match replay_result {
-                    Ok(n) if n > 0 => {
+                match crate::persistence::aof::replay_aof(databases, &aof_path, engine) {
+                    Ok(n) => {
                         result.commands_replayed = n;
-                        info!("Shard {}: v2 fallback replayed {} commands", shard_id, n);
-                        break;
+                        info!("Shard {}: AOF fallback replayed {} commands", shard_id, n);
                     }
-                    Ok(_) => {
-                        info!(
-                            "Shard {}: v2 source {:?} had 0 commands, trying next",
-                            shard_id, path
+                    Err(e) => {
+                        tracing::error!(
+                            "Shard {}: AOF fallback {:?} failed: {}",
+                            shard_id,
+                            aof_path,
+                            e
+                        );
+                    }
+                }
+            } else {
+                let legacy_wal_v3_dir = v2_dir.join(format!("shard-{}", shard_id)).join("wal-v3");
+                match crate::persistence::wal_v3::replay::replay_wal_v3_dir_commands(
+                    &legacy_wal_v3_dir,
+                    databases,
+                    engine,
+                ) {
+                    Ok(0) => {}
+                    Ok(n) => {
+                        result.commands_replayed = n;
+                        tracing::warn!(
+                            "Shard {}: no appendonly.aof found — replayed {} records \
+                             from legacy-mode WAL v3 at {:?} as a LAST-RESORT \
+                             fallback. WAL v3 KV coverage is partial (gated by \
+                             --wal-kv-log; connection-local writes bypass it), so \
+                             this recovery may be incomplete.",
+                            shard_id,
+                            n,
+                            legacy_wal_v3_dir
                         );
                     }
                     Err(e) => {
-                        tracing::error!("Shard {}: v2 fallback {:?} failed: {}", shard_id, path, e);
+                        tracing::error!(
+                            "Shard {}: legacy-mode WAL v3 fallback replay failed: {}",
+                            shard_id,
+                            e
+                        );
                     }
                 }
             }
@@ -1133,5 +1174,162 @@ mod tests {
         assert_eq!(result.cold_segments.len(), 1);
         assert_eq!(result.cold_segments[0].0, 50);
         assert_eq!(result.cold_segments[0].1, seg_dir);
+    }
+
+    // ── Legacy-dir AOF authority + WAL v3 last-resort fallback (review
+    // finding P0#1, corrected) ──────────────────────────────────────────────
+    //
+    // The AOF is the recovery authority for the legacy dir: post-#211,
+    // WAL v3's KV coverage is intentionally partial (`--wal-kv-log`
+    // default-off; connection-local writes bypass it even when on), so a
+    // non-empty legacy-mode WAL v3 directory (`v2_dir/shard-N/wal-v3/`) must
+    // never shadow `appendonly.aof`. WAL v3 is only a last-resort source
+    // when NO AOF exists. A raw SIGKILL integration test cannot exercise
+    // this deterministically (see the NOTE in
+    // `tests/crash_matrix_per_shard_aof.rs`), so these test the exact
+    // function directly instead -- the same style every other test in this
+    // module already uses (construct WAL v3 segments by hand via
+    // `write_wal_v3_record`, assert on `commands_replayed`).
+
+    #[test]
+    fn test_legacy_aof_is_authority_over_wal_v3() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Disk-offload shard_dir: empty (no wal-v3 data) so Phase 4 replays 0
+        // commands and Phase 4b's fallback engages.
+        let shard_dir = tmp.path().join("shard-0");
+        std::fs::create_dir_all(&shard_dir).unwrap();
+
+        // Legacy (non-disk-offload) persistence dir: has BOTH a populated
+        // `shard-0/wal-v3/` (5 records) and a shorter `appendonly.aof`
+        // (2 records). Post-#211 the WAL routinely holds MORE records than
+        // the AOF while missing KV writes entirely — the AOF must win.
+        let v2_dir = tmp.path().join("legacy");
+        let legacy_wal_dir = v2_dir.join("shard-0").join("wal-v3");
+        std::fs::create_dir_all(&legacy_wal_dir).unwrap();
+        let mut wal_data = make_v3_header(0);
+        for i in 1..=5u64 {
+            write_wal_v3_record(
+                &mut wal_data,
+                i,
+                WalRecordType::Command,
+                b"*1\r\n$4\r\nPING\r\n",
+            );
+        }
+        std::fs::write(legacy_wal_dir.join("000000000001.wal"), &wal_data).unwrap();
+
+        std::fs::create_dir_all(&v2_dir).unwrap();
+        let aof_payload = b"*1\r\n$4\r\nPING\r\n*1\r\n$4\r\nPING\r\n"; // 2 records
+        std::fs::write(v2_dir.join("appendonly.aof"), aof_payload).unwrap();
+
+        let mut databases = vec![Database::new()];
+        let engine = crate::persistence::replay::DispatchReplayEngine::new();
+        let result =
+            recover_shard_v3_with_fallback(&mut databases, 0, &shard_dir, &engine, Some(&v2_dir))
+                .unwrap();
+
+        assert_eq!(
+            result.commands_replayed, 2,
+            "appendonly.aof (2 records, the authority) must be replayed and \
+             the KV-incomplete legacy WAL v3 (5 records) ignored -- got {} \
+             (the WAL shadowed the AOF if this is 5)",
+            result.commands_replayed
+        );
+    }
+
+    #[test]
+    fn test_legacy_wal_v3_last_resort_when_no_aof() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shard_dir = tmp.path().join("shard-0");
+        std::fs::create_dir_all(&shard_dir).unwrap();
+
+        // Legacy dir has ONLY a populated WAL v3 — no appendonly.aof at all
+        // (lost/rebuilt). Partial recovery beats none.
+        let v2_dir = tmp.path().join("legacy");
+        let legacy_wal_dir = v2_dir.join("shard-0").join("wal-v3");
+        std::fs::create_dir_all(&legacy_wal_dir).unwrap();
+        let mut wal_data = make_v3_header(0);
+        for i in 1..=5u64 {
+            write_wal_v3_record(
+                &mut wal_data,
+                i,
+                WalRecordType::Command,
+                b"*1\r\n$4\r\nPING\r\n",
+            );
+        }
+        std::fs::write(legacy_wal_dir.join("000000000001.wal"), &wal_data).unwrap();
+
+        let mut databases = vec![Database::new()];
+        let engine = crate::persistence::replay::DispatchReplayEngine::new();
+        let result =
+            recover_shard_v3_with_fallback(&mut databases, 0, &shard_dir, &engine, Some(&v2_dir))
+                .unwrap();
+
+        assert_eq!(
+            result.commands_replayed, 5,
+            "with no appendonly.aof, the legacy WAL v3 last-resort fallback \
+             must replay what it can"
+        );
+    }
+
+    #[test]
+    fn test_legacy_wal_v3_absent_falls_back_to_aof() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shard_dir = tmp.path().join("shard-0");
+        std::fs::create_dir_all(&shard_dir).unwrap();
+
+        // Legacy dir has ONLY an AOF -- no `shard-0/wal-v3/` at all (the
+        // common case: disk-offload was never used and `--wal-kv-log` never
+        // populated WAL v3, so the AOF is genuinely the only source).
+        let v2_dir = tmp.path().join("legacy");
+        std::fs::create_dir_all(&v2_dir).unwrap();
+        let aof_payload = b"*1\r\n$4\r\nPING\r\n*1\r\n$4\r\nPING\r\n*1\r\n$4\r\nPING\r\n";
+        std::fs::write(v2_dir.join("appendonly.aof"), aof_payload).unwrap();
+
+        let mut databases = vec![Database::new()];
+        let engine = crate::persistence::replay::DispatchReplayEngine::new();
+        let result =
+            recover_shard_v3_with_fallback(&mut databases, 0, &shard_dir, &engine, Some(&v2_dir))
+                .unwrap();
+
+        assert_eq!(
+            result.commands_replayed, 3,
+            "with no legacy WAL v3 data at all, the AOF fallback must still \
+             work exactly as before this fix"
+        );
+    }
+
+    #[test]
+    fn test_stray_legacy_v2_wal_file_does_not_break_recovery() {
+        // A leftover pre-freeze WAL v2 file (`shard-0.wal`, the old flat
+        // `RRDWAL` version=2 format) must not be replayed (WAL v2 support was
+        // removed) and must not crash or otherwise break recovery from the
+        // AOF -- it should just be loudly logged (see the `tracing::error!`
+        // in the Phase 4b block above) and ignored.
+        let tmp = tempfile::tempdir().unwrap();
+        let shard_dir = tmp.path().join("shard-0");
+        std::fs::create_dir_all(&shard_dir).unwrap();
+
+        let v2_dir = tmp.path().join("legacy");
+        std::fs::create_dir_all(&v2_dir).unwrap();
+        // Stray pre-freeze v2 WAL file: RRDWAL magic + version=2 header.
+        let mut legacy_v2_wal = vec![0u8; 32];
+        legacy_v2_wal[0..6].copy_from_slice(b"RRDWAL");
+        legacy_v2_wal[6] = 2;
+        std::fs::write(v2_dir.join("shard-0.wal"), &legacy_v2_wal).unwrap();
+        // A real AOF is still present and must still be used.
+        let aof_payload = b"*1\r\n$4\r\nPING\r\n";
+        std::fs::write(v2_dir.join("appendonly.aof"), aof_payload).unwrap();
+
+        let mut databases = vec![Database::new()];
+        let engine = crate::persistence::replay::DispatchReplayEngine::new();
+        let result =
+            recover_shard_v3_with_fallback(&mut databases, 0, &shard_dir, &engine, Some(&v2_dir))
+                .unwrap();
+
+        assert_eq!(
+            result.commands_replayed, 1,
+            "a stray legacy v2 WAL file must not prevent the AOF fallback \
+             from working"
+        );
     }
 }

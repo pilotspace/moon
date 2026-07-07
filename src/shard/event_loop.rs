@@ -17,7 +17,6 @@ use crate::config::RuntimeConfig;
 use crate::persistence::control::ShardControlFile;
 use crate::persistence::page_cache::PageCache;
 use crate::persistence::snapshot::SnapshotState;
-use crate::persistence::wal::WalWriter;
 use crate::persistence::wal_v3::segment::WalWriterV3;
 use crate::pubsub::PubSubRegistry;
 use crate::replication::state::ReplicationState;
@@ -389,10 +388,14 @@ impl super::Shard {
         let mut snapshot_state: Option<SnapshotState> = None;
         let mut snapshot_reply_tx: Option<channel::OneshotSender<Result<(), String>>> = None;
 
-        // Per-shard WAL v2 writer — created only when persistence is enabled AND
-        // disk-offload is disabled. When disk-offload is on, WAL v3 supersedes v2
-        // (stronger guarantees: per-record LSN + CRC32C), so v2 is skipped entirely
-        // to avoid double-write overhead.
+        // Per-shard WAL v3 writer — the only WAL (pre-1.0 format freeze dropped
+        // WAL v2). Created whenever persistence is enabled (`--appendonly yes`),
+        // rooted at:
+        //   - `<disk_offload_dir>/shard-N/wal-v3` when disk-offload is enabled
+        //     (matches the page-cache/manifest/control-file layout), or
+        //   - `<persistence_dir>/shard-N/wal-v3` otherwise — the old WAL v2
+        //     niche, now served by the v3 segment format so WAL durability/CDC
+        //     parity is preserved when disk-offload is off.
         let appendonly_enabled = runtime_config.read().appendonly != "no";
         // `--wal-kv-log`: whether SPSC-executed KV writes are also logged to
         // the per-shard WAL. Resolved per drain cycle (Auto is dynamic on the
@@ -404,63 +407,43 @@ impl super::Shard {
                 "--wal-kv-log off with --appendonly no: KV writes have NO durability log"
             );
         }
-        let mut wal_writer: Option<WalWriter> = match (&persistence_dir, appendonly_enabled) {
-            (Some(dir), true) if !server_config.disk_offload_enabled() => {
-                match WalWriter::new(shard_id, std::path::Path::new(dir)) {
-                    Ok(w) => {
-                        info!("Shard {}: WAL writer initialized", shard_id);
-                        Some(w)
-                    }
-                    Err(e) => {
-                        tracing::warn!("Shard {}: WAL init failed: {}", shard_id, e);
-                        None
-                    }
-                }
-            }
-            (Some(_), true) => {
-                info!(
-                    "Shard {}: WAL v2 skipped (disk-offload active, WAL v3 supersedes)",
-                    shard_id
-                );
-                None
-            }
-            (Some(_), false) => {
-                info!("Shard {}: WAL skipped (appendonly=no)", shard_id);
-                None
-            }
-            (None, _) => None,
-        };
 
         // Disk-offload base directory (None when disk-offload is disabled).
         let disk_offload_base: Option<std::path::PathBuf> = server_config
             .disk_offload_enabled()
             .then(|| server_config.effective_disk_offload_dir());
 
-        // Per-shard WAL v3 writer (created only when disk-offload is enabled).
-        // Provides per-record LSN tracking and FPI support for checkpoint-based recovery.
-        // WAL v2 remains active for non-disk-offload mode; both writers can coexist.
-        let mut wal_v3_writer: Option<WalWriterV3> = if server_config.disk_offload_enabled() {
-            let shard_dir = server_config
-                .effective_disk_offload_dir()
-                .join(format!("shard-{}", shard_id));
+        let wal_shard_dir: Option<std::path::PathBuf> = if !appendonly_enabled {
+            info!("Shard {}: WAL skipped (appendonly=no)", shard_id);
+            None
+        } else if server_config.disk_offload_enabled() {
+            Some(
+                server_config
+                    .effective_disk_offload_dir()
+                    .join(format!("shard-{}", shard_id)),
+            )
+        } else {
+            persistence_dir
+                .as_ref()
+                .map(|dir| std::path::Path::new(dir).join(format!("shard-{}", shard_id)))
+        };
+        let mut wal_writer: Option<WalWriterV3> = wal_shard_dir.and_then(|shard_dir| {
             let wal_dir = shard_dir.join("wal-v3");
             match WalWriterV3::new(shard_id, &wal_dir, server_config.wal_segment_size_bytes()) {
                 Ok(w) => {
                     info!(
-                        "Shard {}: WAL v3 writer initialized (segment_size={})",
+                        "Shard {}: WAL writer initialized (segment_size={})",
                         shard_id,
                         server_config.wal_segment_size_bytes()
                     );
                     Some(w)
                 }
                 Err(e) => {
-                    tracing::warn!("Shard {}: WAL v3 init failed: {}", shard_id, e);
+                    tracing::warn!("Shard {}: WAL init failed: {}", shard_id, e);
                     None
                 }
             }
-        } else {
-            None
-        };
+        });
 
         // Per-shard WAL append channel for local writes.
         // Connection handlers send serialized write commands here; we drain on the 1ms tick.
@@ -1201,7 +1184,7 @@ impl super::Shard {
                     let hit_cap = spsc_handler::drain_spsc_shared(
                         &shard_databases, &mut consumers, &mut *pubsub_arc.write(),
                         &blocking_rc, &mut pending_snapshot, &mut snapshot_state,
-                        &mut wal_writer, &mut wal_v3_writer, &repl_backlog, &mut replica_txs,
+                        &mut wal_writer, &repl_backlog, &mut replica_txs,
                         &repl_offsets, shard_id, &script_cache_rc, &cached_clock,
                         &mut pending_migrations,
                         &mut pending_cdc_subscribes,
@@ -1242,7 +1225,7 @@ impl super::Shard {
                         }
                     }
                     if !pending_cdc_subscribes.is_empty() {
-                        let wal_dir = wal_v3_writer.as_ref().map(|w| w.wal_dir());
+                        let wal_dir = wal_writer.as_ref().map(|w| w.wal_dir());
                         cdc_registry.register_pending(
                             pending_cdc_subscribes.drain(..), wal_dir,
                         );
@@ -1250,7 +1233,7 @@ impl super::Shard {
                     persistence_tick::handle_pending_snapshot(
                         pending_snapshot, &mut snapshot_state, &mut snapshot_reply_tx,
                         &shard_databases, disk_offload_base.as_deref(), shard_id,
-                        wal_v3_writer.as_ref().map(|w| w.current_lsn().saturating_sub(1)).unwrap_or(0),
+                        wal_writer.as_ref().map(|w| w.current_lsn().saturating_sub(1)).unwrap_or(0),
                     );
                     for (fd, state) in pending_migrations.drain(..) {
                         #[cfg(unix)]
@@ -1307,7 +1290,7 @@ impl super::Shard {
                     let hit_cap = spsc_handler::drain_spsc_shared(
                         &shard_databases, &mut consumers, &mut *pubsub_arc.write(),
                         &blocking_rc, &mut pending_snapshot, &mut snapshot_state,
-                        &mut wal_writer, &mut wal_v3_writer, &repl_backlog, &mut replica_txs,
+                        &mut wal_writer, &repl_backlog, &mut replica_txs,
                         &repl_offsets, shard_id, &script_cache_rc, &cached_clock,
                         &mut pending_migrations,
                         &mut pending_cdc_subscribes,
@@ -1348,7 +1331,7 @@ impl super::Shard {
                         }
                     }
                     if !pending_cdc_subscribes.is_empty() {
-                        let wal_dir = wal_v3_writer.as_ref().map(|w| w.wal_dir());
+                        let wal_dir = wal_writer.as_ref().map(|w| w.wal_dir());
                         cdc_registry.register_pending(
                             pending_cdc_subscribes.drain(..), wal_dir,
                         );
@@ -1356,7 +1339,7 @@ impl super::Shard {
                     persistence_tick::handle_pending_snapshot(
                         pending_snapshot, &mut snapshot_state, &mut snapshot_reply_tx,
                         &shard_databases, disk_offload_base.as_deref(), shard_id,
-                        wal_v3_writer.as_ref().map(|w| w.current_lsn().saturating_sub(1)).unwrap_or(0),
+                        wal_writer.as_ref().map(|w| w.current_lsn().saturating_sub(1)).unwrap_or(0),
                     );
                     for (fd, state) in pending_migrations.drain(..) {
                         #[cfg(unix)]
@@ -1406,7 +1389,7 @@ impl super::Shard {
                         &snapshot_trigger_rx, &mut last_snapshot_epoch,
                         &mut snapshot_state, &shard_databases, &persistence_dir,
                         disk_offload_base.as_deref(), shard_id,
-                        wal_v3_writer.as_ref().map(|w| w.current_lsn().saturating_sub(1)).unwrap_or(0),
+                        wal_writer.as_ref().map(|w| w.current_lsn().saturating_sub(1)).unwrap_or(0),
                     );
 
                     // Advance snapshot one segment per tick (cooperative)
@@ -1423,8 +1406,7 @@ impl super::Shard {
                                 );
                             } else {
                                 persistence_tick::finalize_snapshot_success(
-                                    &mut snapshot_state, &mut snapshot_reply_tx,
-                                    &mut wal_writer, shard_id,
+                                    &mut snapshot_state, &mut snapshot_reply_tx, shard_id,
                                 );
                                 bgsave_checkpoint_requested = true;
                             }
@@ -1434,9 +1416,6 @@ impl super::Shard {
                     // Drain local-write WAL channel (connection handler inline writes)
                     while let Ok(data) = wal_append_rx.try_recv() {
                         if let Some(ref mut wal) = wal_writer {
-                            wal.append(&data);
-                        }
-                        if let Some(ref mut wal) = wal_v3_writer {
                             wal.append(
                                 crate::persistence::wal_v3::record::WalRecordType::Command,
                                 &data,
@@ -1444,8 +1423,7 @@ impl super::Shard {
                         }
                     }
 
-                    persistence_tick::flush_wal_if_needed(&mut wal_writer);
-                    persistence_tick::flush_wal_v3_if_needed(&mut wal_v3_writer);
+                    persistence_tick::flush_wal_v3_if_needed(&mut wal_writer);
 
                     // C3b-2 — Drive CDC fan-out AFTER flush_if_needed so the
                     // tail reader sees the bytes just handed to the page
@@ -1454,18 +1432,18 @@ impl super::Shard {
                         cdc_registry.fanout_tick(cached_clock.ms() as i64);
                     }
 
-                    // appendfsync=always: fsync WAL v3 after every SPSC drain batch
+                    // appendfsync=always: fsync WAL after every SPSC drain batch
                     if server_config.appendfsync == "always" {
-                        if let Some(ref mut wal) = wal_v3_writer {
+                        if let Some(ref mut wal) = wal_writer {
                             if let Err(e) = wal.flush_sync() {
-                                tracing::error!("WAL v3 appendfsync=always failed: {}", e);
+                                tracing::error!("WAL appendfsync=always failed: {}", e);
                             }
                         }
                     }
 
                     // Checkpoint protocol tick (disk-offload only)
                     if let (Some(ckpt_mgr), Some(page_cache_inst), Some(wal_v3), Some(manifest), Some(ctrl), Some(ctrl_path)) =
-                        (&mut checkpoint_manager, &page_cache, &mut wal_v3_writer, &mut shard_manifest, &mut control_file, &control_file_path)
+                        (&mut checkpoint_manager, &page_cache, &mut wal_writer, &mut shard_manifest, &mut control_file, &control_file_path)
                     {
                         // BGSAVE-triggered forced checkpoint (bypasses trigger conditions)
                         if bgsave_checkpoint_requested && !ckpt_mgr.is_active() {
@@ -1501,8 +1479,7 @@ impl super::Shard {
                 }
                 // WAL fsync + MVCC sweep on 1-second interval
                 _ = wal_sync_interval.0.tick() => {
-                    timers::sync_wal(&mut wal_writer);
-                    timers::sync_wal_v3(&mut wal_v3_writer);
+                    timers::sync_wal_v3(&mut wal_writer);
                     // P3+MA1+MA2: prune committed + sweep zombies + kill old snapshots
                     //             + update RECL_MVCC_* + segment-stall.
                     crate::shard::slice::with_shard(|s| {
@@ -1518,7 +1495,7 @@ impl super::Shard {
                     // P6: ceiling-trigger — runs at 1s cadence to avoid the
                     // read_dir syscall overhead of wal.stats() on every 1ms tick.
                     if let (Some(ckpt_mgr), Some(page_cache_inst), Some(wal_v3), Some(manifest), Some(ctrl), Some(ctrl_path)) =
-                        (&mut checkpoint_manager, &page_cache, &mut wal_v3_writer, &mut shard_manifest, &mut control_file, &control_file_path)
+                        (&mut checkpoint_manager, &page_cache, &mut wal_writer, &mut shard_manifest, &mut control_file, &control_file_path)
                     {
                         if persistence_tick::maybe_force_checkpoint_on_wal_overflow(
                             ckpt_mgr,
@@ -1550,7 +1527,7 @@ impl super::Shard {
                                     server_config.segment_warm_after,
                                     &mut next_file_id,
                                     shard_id,
-                                    &mut wal_v3_writer,
+                                    &mut wal_writer,
                                 );
                             });
                         }
@@ -1631,7 +1608,7 @@ impl super::Shard {
                         &runtime_config,
                         &page_cache,
                         &mut next_file_id,
-                        &mut wal_v3_writer,
+                        &mut wal_writer,
                         &script_cache_rc,
                         &spill_file_id,
                     );
@@ -1660,7 +1637,7 @@ impl super::Shard {
                             #[cfg(feature = "graph")]
                             &mut s.graph_store,
                             shard_manifest.as_mut(),
-                            wal_v3_writer.as_mut(),
+                            wal_writer.as_mut(),
                             server_config.max_wal_size_bytes(),
                             server_config.manifest_tombstone_retain_epochs,
                             server_config.manifest_tombstone_retain_secs,
@@ -1681,7 +1658,7 @@ impl super::Shard {
                     );
                     // Trigger final checkpoint before shutdown (design S9)
                     if let (Some(ckpt_mgr), Some(page_cache_inst), Some(wal_v3), Some(manifest), Some(ctrl), Some(ctrl_path)) =
-                        (&mut checkpoint_manager, &page_cache, &mut wal_v3_writer, &mut shard_manifest, &mut control_file, &control_file_path)
+                        (&mut checkpoint_manager, &page_cache, &mut wal_writer, &mut shard_manifest, &mut control_file, &control_file_path)
                     {
                         persistence_tick::force_checkpoint(ckpt_mgr, page_cache_inst, wal_v3, manifest, ctrl, ctrl_path, shard_id, server_config.manifest_tombstone_retain_epochs, server_config.manifest_tombstone_retain_secs);
                     }
@@ -1705,10 +1682,7 @@ impl super::Shard {
                         });
                     }
                     if let Some(ref mut wal) = wal_writer {
-                        let _ = wal.shutdown();
-                    }
-                    if let Some(ref mut wal_v3) = wal_v3_writer {
-                        let _ = wal_v3.flush_sync();
+                        let _ = wal.flush_sync();
                     }
                     break;
                 }
@@ -1826,7 +1800,7 @@ impl super::Shard {
                     ) = (
                         &mut checkpoint_manager,
                         &page_cache,
-                        &mut wal_v3_writer,
+                        &mut wal_writer,
                         &mut shard_manifest,
                         &mut control_file,
                         &control_file_path,
@@ -1844,10 +1818,7 @@ impl super::Shard {
                         );
                     }
                     if let Some(ref mut wal) = wal_writer {
-                        let _ = wal.shutdown();
-                    }
-                    if let Some(ref mut wal_v3) = wal_v3_writer {
-                        let _ = wal_v3.flush_sync();
+                        let _ = wal.flush_sync();
                     }
                     break;
                 }
@@ -1887,7 +1858,6 @@ impl super::Shard {
                     &mut pending_snapshot,
                     &mut snapshot_state,
                     &mut wal_writer,
-                    &mut wal_v3_writer,
                     &repl_backlog,
                     &mut replica_txs,
                     &repl_offsets,
@@ -1922,7 +1892,7 @@ impl super::Shard {
                     crate::admin::metrics_setup::bump_spsc_drain_renotify();
                 }
                 if !pending_cdc_subscribes.is_empty() {
-                    let wal_dir = wal_v3_writer.as_ref().map(|w| w.wal_dir());
+                    let wal_dir = wal_writer.as_ref().map(|w| w.wal_dir());
                     cdc_registry.register_pending(pending_cdc_subscribes.drain(..), wal_dir);
                 }
                 for waker in pending_wakers.borrow_mut().drain(..) {
@@ -1935,7 +1905,7 @@ impl super::Shard {
                     &shard_databases,
                     disk_offload_base.as_deref(),
                     shard_id,
-                    wal_v3_writer
+                    wal_writer
                         .as_ref()
                         .map(|w| w.current_lsn().saturating_sub(1))
                         .unwrap_or(0),
@@ -2012,7 +1982,7 @@ impl super::Shard {
                     &persistence_dir,
                     disk_offload_base.as_deref(),
                     shard_id,
-                    wal_v3_writer
+                    wal_writer
                         .as_ref()
                         .map(|w| w.current_lsn().saturating_sub(1))
                         .unwrap_or(0),
@@ -2036,7 +2006,6 @@ impl super::Shard {
                             persistence_tick::finalize_snapshot_success(
                                 &mut snapshot_state,
                                 &mut snapshot_reply_tx,
-                                &mut wal_writer,
                                 shard_id,
                             );
                             crate::command::persistence::bgsave_shard_done(true);
@@ -2048,9 +2017,6 @@ impl super::Shard {
                 // Drain local-write WAL channel
                 while let Ok(data) = wal_append_rx.try_recv() {
                     if let Some(ref mut wal) = wal_writer {
-                        wal.append(&data);
-                    }
-                    if let Some(ref mut wal) = wal_v3_writer {
                         wal.append(
                             crate::persistence::wal_v3::record::WalRecordType::Command,
                             &data,
@@ -2058,8 +2024,7 @@ impl super::Shard {
                     }
                 }
 
-                persistence_tick::flush_wal_if_needed(&mut wal_writer);
-                persistence_tick::flush_wal_v3_if_needed(&mut wal_v3_writer);
+                persistence_tick::flush_wal_v3_if_needed(&mut wal_writer);
 
                 // C3b-2 — Drive CDC fan-out on the same monoio tick body
                 // as the tokio branch above. Zero CPU when no subscribers.
@@ -2068,9 +2033,9 @@ impl super::Shard {
                 }
 
                 if server_config.appendfsync == "always" {
-                    if let Some(ref mut wal) = wal_v3_writer {
+                    if let Some(ref mut wal) = wal_writer {
                         if let Err(e) = wal.flush_sync() {
-                            tracing::error!("WAL v3 appendfsync=always failed: {}", e);
+                            tracing::error!("WAL appendfsync=always failed: {}", e);
                         }
                     }
                 }
@@ -2086,7 +2051,7 @@ impl super::Shard {
                 ) = (
                     &mut checkpoint_manager,
                     &page_cache,
-                    &mut wal_v3_writer,
+                    &mut wal_writer,
                     &mut shard_manifest,
                     &mut control_file,
                     &control_file_path,
@@ -2135,7 +2100,7 @@ impl super::Shard {
                         &runtime_config,
                         &page_cache,
                         &mut next_file_id,
-                        &mut wal_v3_writer,
+                        &mut wal_writer,
                         &script_cache_rc,
                         &spill_file_id,
                     );
@@ -2151,8 +2116,7 @@ impl super::Shard {
                 // P6 is gated here (not per-1ms tick) to avoid the read_dir
                 // syscall overhead of wal.stats() on the hot path.
                 if monoio_tick_counter % 1000 == 0 {
-                    timers::sync_wal(&mut wal_writer);
-                    timers::sync_wal_v3(&mut wal_v3_writer);
+                    timers::sync_wal_v3(&mut wal_writer);
                     // P3+MA1+MA2: MVCC committed prune + zombie sweep + kill old snapshots
                     //             + RECL_* + segment-stall.
                     crate::shard::slice::with_shard(|s| {
@@ -2175,7 +2139,7 @@ impl super::Shard {
                     ) = (
                         &mut checkpoint_manager,
                         &page_cache,
-                        &mut wal_v3_writer,
+                        &mut wal_writer,
                         &mut shard_manifest,
                         &mut control_file,
                         &control_file_path,
@@ -2211,7 +2175,7 @@ impl super::Shard {
                                     server_config.segment_warm_after,
                                     &mut next_file_id,
                                     shard_id,
-                                    &mut wal_v3_writer,
+                                    &mut wal_writer,
                                 );
                             });
                         }
@@ -2262,7 +2226,7 @@ impl super::Shard {
                             #[cfg(feature = "graph")]
                             &mut s.graph_store,
                             shard_manifest.as_mut(),
-                            wal_v3_writer.as_mut(),
+                            wal_writer.as_mut(),
                             server_config.max_wal_size_bytes(),
                             server_config.manifest_tombstone_retain_epochs,
                             server_config.manifest_tombstone_retain_secs,

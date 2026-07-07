@@ -57,14 +57,15 @@ pub enum WalRecordType {
     FileTierChange = 0x42,
     /// Cross-store transaction begin.
     XactBegin = 0x50,
-    /// Cross-store transaction commit (contains all store operations).
-    XactCommit = 0x51,
     /// Cross-store transaction abort.
     XactAbort = 0x52,
-    /// Cross-store transaction commit, v2: header carries the logical db
-    /// index so crash replay restores KV ops into the db the transaction ran
-    /// in (v1 records replay into db 0 — the pre-multi-db behaviour).
-    XactCommitV2 = 0x53,
+    /// Cross-store transaction commit (contains all store operations). The
+    /// header carries the logical db index so crash replay restores KV ops
+    /// into the db the transaction ran in. Discriminant 0x53 is retained from
+    /// the pre-1.0 "v2" record (0x51 was the original db-0-hardcoded
+    /// encoding, deleted in the WAL-v3-only format freeze — 0x51 is not
+    /// reused).
+    XactCommit = 0x53,
     /// Workspace creation record.
     WorkspaceCreate = 0x60,
     /// Workspace deletion record.
@@ -94,9 +95,8 @@ impl WalRecordType {
             0x41 => Some(Self::FileDelete),
             0x42 => Some(Self::FileTierChange),
             0x50 => Some(Self::XactBegin),
-            0x51 => Some(Self::XactCommit),
             0x52 => Some(Self::XactAbort),
-            0x53 => Some(Self::XactCommitV2),
+            0x53 => Some(Self::XactCommit),
             0x60 => Some(Self::WorkspaceCreate),
             0x61 => Some(Self::WorkspaceDrop),
             0x70 => Some(Self::MqCreate),
@@ -313,13 +313,16 @@ pub fn decode_graph_temporal(payload: &[u8]) -> Option<(u64, bool, i64, i64)> {
     Some((entity_id, is_node, valid_to, system_from))
 }
 
-/// Encode XactCommit WAL payload for crash recovery.
+/// Encode a [`WalRecordType::XactCommit`] payload for crash recovery.
 ///
-/// Layout matches `replay_xact_commit()` decoder exactly:
-///   `[txn_id: u64 LE][kv_op_count: u32 LE][ops...]`
-///   Per op: `[op_type: u8 (0=SET, 1=DEL)]`
-///           `[key_len: u32 LE][key bytes]`
-///           `[value_len: u32 LE (SET only)][value bytes (SET only)]`
+/// The header carries the logical db index the transaction ran in, so crash
+/// replay restores the KV ops into the correct db (`replay_xact_commit` in
+/// `wal_v3::replay`).
+///
+/// Layout (little-endian): `txn_id: u64, db_index: u32, kv_op_count: u32,
+/// ops…`. Per op: `[op_type: u8 (0=SET, 1=DEL)]`
+/// `[key_len: u32 LE][key bytes]`
+/// `[value_len: u32 LE (SET only)][value bytes (SET only)]`.
 ///
 /// For SET ops, reads the CURRENT value from `db.data()` (post-commit state).
 /// For DEL ops, encodes just the key (replay calls `db.remove()`).
@@ -327,55 +330,6 @@ pub fn decode_graph_temporal(payload: &[u8]) -> Option<(u64, bool, i64, i64)> {
 /// The undo log carries before-images for rollback; the WAL needs
 /// forward-images (final committed state) for replay.
 pub fn encode_xact_commit_payload(
-    txn_id: u64,
-    undo_records: &[crate::transaction::UndoRecord],
-    db: &crate::storage::Database,
-) -> Vec<u8> {
-    let mut payload = Vec::with_capacity(12 + undo_records.len() * 32);
-    payload.extend_from_slice(&txn_id.to_le_bytes());
-    // Count placeholder — patched at the end
-    let count_offset = payload.len();
-    payload.extend_from_slice(&0u32.to_le_bytes());
-    let mut count = 0u32;
-
-    for record in undo_records {
-        match record {
-            crate::transaction::UndoRecord::Insert { key }
-            | crate::transaction::UndoRecord::Update { key, .. } => {
-                // Read current (post-dispatch) value for forward-image WAL
-                if let Some(entry) = db.data().get(key.as_ref()) {
-                    if let Some(value) = entry.value.as_bytes_owned() {
-                        payload.push(0u8); // op_type = SET
-                        payload.extend_from_slice(&(key.len() as u32).to_le_bytes());
-                        payload.extend_from_slice(key);
-                        payload.extend_from_slice(&(value.len() as u32).to_le_bytes());
-                        payload.extend_from_slice(&value);
-                        count += 1;
-                    }
-                }
-            }
-            crate::transaction::UndoRecord::Delete { key, .. } => {
-                payload.push(1u8); // op_type = DEL
-                payload.extend_from_slice(&(key.len() as u32).to_le_bytes());
-                payload.extend_from_slice(key);
-                count += 1;
-            }
-        }
-    }
-    // Patch count field
-    payload[count_offset..count_offset + 4].copy_from_slice(&count.to_le_bytes());
-    payload
-}
-
-/// Encode an [`WalRecordType::XactCommitV2`] payload.
-///
-/// Identical to the v1 format except the header carries the logical db index
-/// the transaction ran in, so crash replay restores the KV ops into the
-/// correct db (v1 records hardcoded db 0 on replay).
-///
-/// Layout (little-endian): `txn_id: u64, db_index: u32, kv_op_count: u32,
-/// ops…` (op wire format unchanged from v1).
-pub fn encode_xact_commit_payload_v2(
     txn_id: u64,
     db_index: u32,
     undo_records: &[crate::transaction::UndoRecord],
@@ -495,8 +449,8 @@ mod tests {
         assert_eq!(WalRecordType::FileDelete as u8, 0x41);
         assert_eq!(WalRecordType::FileTierChange as u8, 0x42);
         assert_eq!(WalRecordType::XactBegin as u8, 0x50);
-        assert_eq!(WalRecordType::XactCommit as u8, 0x51);
         assert_eq!(WalRecordType::XactAbort as u8, 0x52);
+        assert_eq!(WalRecordType::XactCommit as u8, 0x53);
         assert_eq!(WalRecordType::WorkspaceCreate as u8, 0x60);
         assert_eq!(WalRecordType::WorkspaceDrop as u8, 0x61);
         assert_eq!(WalRecordType::MqCreate as u8, 0x70);
@@ -505,11 +459,25 @@ mod tests {
         // from_u8 roundtrips
         for &v in &[
             0x01, 0x10, 0x20, 0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x40, 0x41, 0x42, 0x50,
-            0x51, 0x52, 0x60, 0x61, 0x70, 0x71,
+            0x52, 0x53, 0x60, 0x61, 0x70, 0x71,
         ] {
             assert!(WalRecordType::from_u8(v).is_some());
         }
         assert!(WalRecordType::from_u8(0xFF).is_none());
+        // 0x51 was the deleted pre-1.0 v1 XactCommit discriminant. It is
+        // deliberately NOT reused -- a v3 stream containing a stray 0x51
+        // record (e.g. written by a pre-freeze build) must decode as an
+        // unrecognized tag, not silently reinterpreted as today's
+        // XactCommit. Note the replay engine does NOT skip just this one
+        // record: `read_wal_v3_record` returns `None` for any unrecognized
+        // tag, and the segment replay loop (`replay_wal_v3_file_until` in
+        // `wal_v3::replay`) treats `None` identically to a corrupt/truncated
+        // record -- it warns and stops replaying the REST of that segment.
+        // (0x51 was already dead in production before this refactor -- no
+        // shipped build ever wrote it via a real TXN.COMMIT -- so this is a
+        // latent robustness note for future record-type additions, not a
+        // live data-loss path today.)
+        assert!(WalRecordType::from_u8(0x51).is_none());
     }
 
     #[test]
@@ -656,14 +624,15 @@ mod tests {
             },
         ];
 
-        let payload = encode_xact_commit_payload(42, &records, &db);
+        let payload = encode_xact_commit_payload(42, 3, &records, &db);
 
         // Verify header
         assert_eq!(u64::from_le_bytes(payload[0..8].try_into().unwrap()), 42); // txn_id
-        assert_eq!(u32::from_le_bytes(payload[8..12].try_into().unwrap()), 2); // 2 ops
+        assert_eq!(u32::from_le_bytes(payload[8..12].try_into().unwrap()), 3); // db_index
+        assert_eq!(u32::from_le_bytes(payload[12..16].try_into().unwrap()), 2); // 2 ops
 
         // Verify op 1: SET key1 committed_val
-        let mut offset = 12;
+        let mut offset = 16;
         assert_eq!(payload[offset], 0); // SET
         offset += 1;
         let key_len = u32::from_le_bytes(payload[offset..offset + 4].try_into().unwrap()) as usize;
