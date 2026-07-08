@@ -455,6 +455,7 @@ impl VectorIndex {
                 let padded = self.collection.padded_dimension;
                 self.scratch = SearchScratch::new(num_nodes, padded);
                 let mut imm_list = snap.immutable.clone();
+                immutable.mark_installed();
                 imm_list.push(Arc::new(immutable));
                 let new_list = SegmentList {
                     mutable: tail_mutable,
@@ -571,6 +572,7 @@ impl VectorIndex {
                     let old = segments.load();
                     let tail_mutable = old.mutable.clone_suffix(frozen_len);
                     let mut imm_list = old.immutable.clone();
+                    immutable.mark_installed();
                     imm_list.push(Arc::new(immutable));
                     let new_list = SegmentList {
                         mutable: tail_mutable,
@@ -905,6 +907,7 @@ impl VectorIndex {
 
         // ── Atomic swap ───────────────────────────────────────────────────────
         let mut imm_list = snap.immutable.clone();
+        immutable.mark_installed();
         imm_list.push(Arc::new(immutable));
         let new_list = SegmentList {
             mutable: tail_mutable,
@@ -1135,6 +1138,7 @@ impl VectorIndex {
                 })
                 .cloned()
                 .collect();
+        merged_arc.mark_installed();
         new_immutable.push(merged_arc.clone());
 
         // Rebuild scratch for the merged segment's graph size.
@@ -1240,7 +1244,23 @@ impl VectorIndex {
                 to_transition.push((i, false)); // -> WARM
             }
         }
-        if to_transition.is_empty() {
+
+        // WS3 round-2 fix (adversarial review #3): a WARM segment can go
+        // idle too, and previously had no path to COLD -- it just sat in
+        // `warm` (fully materialized, no RSS win) forever. This is
+        // mechanical: `UnloadedSegment::from_warm` already builds a stub
+        // from any `&WarmSearchSegment`, on-disk files already exist (WARM
+        // segments are mmap-backed), no new transition protocol needed.
+        let mut warm_to_cold: Vec<usize> = Vec::new();
+        if idle_after_secs > 0 {
+            for (i, w) in snapshot.warm.iter().enumerate() {
+                if w.idle_secs() >= idle_after_secs {
+                    warm_to_cold.push(i);
+                }
+            }
+        }
+
+        if to_transition.is_empty() && warm_to_cold.is_empty() {
             return 0;
         }
 
@@ -1248,6 +1268,25 @@ impl VectorIndex {
         let mut new_warm = snapshot.warm.clone();
         let mut new_unloaded = snapshot.unloaded.clone();
         let mut transitioned = 0usize;
+
+        // Process the WARM -> COLD sweep first (index-stable: independent of
+        // the immutable removal loop below, which mutates `new_immutable`,
+        // not `new_warm`/`new_unloaded` directly until it pushes).
+        for &idx in warm_to_cold.iter().rev() {
+            let warm_seg = &snapshot.warm[idx];
+            let stub = crate::vector::persistence::unloaded_segment::UnloadedSegment::from_warm(
+                warm_seg, false,
+            );
+            tracing::info!(
+                "WARM -> COLD idle transition: segment {} ({} vectors, idle {}s)",
+                warm_seg.segment_id(),
+                warm_seg.total_count(),
+                warm_seg.idle_secs(),
+            );
+            new_warm.remove(idx);
+            new_unloaded.push(Arc::new(stub));
+            transitioned += 1;
+        }
 
         // Process in reverse order to maintain valid indices during removal.
         for &(idx, to_cold) in to_transition.iter().rev() {
@@ -1308,6 +1347,20 @@ impl VectorIndex {
                         false, // mlock_codes: off by default for warm tier
                     ) {
                         Ok(warm_seg) => {
+                            // WS3 round-2 resurrection fix: `mvcc_raw_bytes()`
+                            // only serializes INSTALL-time deletes
+                            // (`mvcc[i].delete_lsn`) -- a steady-state HDEL
+                            // that landed against this already-Arc'd
+                            // immutable segment (interior `tombstoned_keys`,
+                            // never written back into `mvcc[]`) would
+                            // otherwise be silently dropped by this
+                            // transition and the doc would resurface once
+                            // this WARM/COLD segment is searched. Carry it
+                            // over explicitly.
+                            let src_tombs = imm.tombstoned_key_hashes();
+                            if !src_tombs.is_empty() {
+                                warm_seg.seed_tombstones(&src_tombs);
+                            }
                             if to_cold {
                                 // COLD (WS3 round 2): capture the stub, then let
                                 // `warm_seg` drop at end of scope -- this is what
@@ -1350,13 +1403,15 @@ impl VectorIndex {
         }
 
         if transitioned > 0 {
+            // Functional-update clone-and-patch (item 6, adversarial review):
+            // only the 3 fields this function actually touches are named;
+            // `mutable`/`ivf`/`cold` come along via `..(**snapshot).clone()`
+            // without being enumerated here.
             let new_list = SegmentList {
-                mutable: Arc::clone(&snapshot.mutable),
                 immutable: new_immutable,
-                ivf: snapshot.ivf.clone(),
                 warm: new_warm,
-                cold: snapshot.cold.clone(),
                 unloaded: new_unloaded,
+                ..(**snapshot).clone()
             };
             self.segments.swap(new_list);
         }
@@ -2132,6 +2187,17 @@ impl VectorStore {
         for imm in snap.immutable.iter() {
             imm.mark_deleted_by_key_hash(key_hash);
         }
+        // WS3 round-2 resurrection fix (adversarial review #1): WARM and
+        // COLD (unloaded) segments must also be tombstoned, or a HDEL'd doc
+        // resurfaces the next time that segment is searched (WARM: takes
+        // effect immediately, no reload) or reloaded (COLD: the stub queues
+        // the tombstone and replays it in `UnloadedSegment::reload`).
+        for warm in snap.warm.iter() {
+            warm.mark_deleted_by_key_hash(key_hash);
+        }
+        for stub in snap.unloaded.iter() {
+            stub.mark_deleted_by_key_hash(key_hash);
+        }
         drop(snap);
         // QW7 (2026-06 review finding 6.3): prune the key-hash maps so
         // they track LIVE keys, not historical inserts — without this
@@ -2621,6 +2687,7 @@ impl VectorStore {
                     })
                     .cloned()
                     .collect();
+                merged_arc.mark_installed();
                 new_immutable.push(merged_arc.clone());
                 idx.scratch = crate::vector::hnsw::search::SearchScratch::new(
                     merged_arc.graph().num_nodes(),
@@ -2696,6 +2763,7 @@ impl VectorStore {
             Ok(merged) => {
                 let live = merged.live_count() as usize;
                 // Atomically swap: replace all immutable segments with the single merged one.
+                merged.mark_installed();
                 let old = idx.segments.load();
                 let new_list = SegmentList {
                     mutable: Arc::clone(&old.mutable),

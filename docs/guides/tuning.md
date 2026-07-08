@@ -240,9 +240,7 @@ recall is exactly preserved — the exact-rerank sidecar is never silently
 dropped, only paged back in. The reload is single-flight per segment (a
 `parking_lot::Mutex` guards the promote-and-reload sequence), so concurrent
 queries hitting the same COLD segment block behind one reload rather than
-each re-reading the segment from disk. The cost is a one-time added latency
-on the query that triggers the reload; every subsequent query is back to
-normal HOT/immutable-segment speed until the segment goes idle again.
+each re-reading the segment from disk.
 Measured on a real server (40,000 × 768-dim vectors, SQ8, single shard):
 
 | Phase | RSS |
@@ -250,6 +248,33 @@ Measured on a real server (40,000 × 768-dim vectors, SQ8, single shard):
 | Before unload (HOT) | 400,544 KB |
 | After unload (COLD) | 295,760 KB (**−26.2%**) |
 | After reload (touched, back to WARM) | 395,376 KB |
+
+> **⚠ First-touch reload latency is a SHARD-WIDE stall, not just a
+> per-query one.** All three call sites that reload a COLD segment
+> (`SegmentHolder::search_filtered`, `SegmentHolder::search_mvcc`, and the
+> FT.SEARCH yielding/worker-pool path's snapshot capture in
+> `command/vector_search/ft_search/dispatch.rs`) run their promote-and-reload
+> step INSIDE `crate::shard::slice::with_shard(...)`, i.e. on the shard's own
+> single OS thread, before any `.await` boundary — confirmed by tracing every
+> call site, not assumed. Under monoio's thread-per-core model this means
+> the reload blocks every connection sharing that shard, not only the one
+> that triggered it, for the reload's duration (`--shards 1` makes this
+> "every connection on the server"). PR #179's off-loop worker pool
+> (`crate::vector::search_pool`) only carries the actual HNSW beam search off
+> the event loop after capture — the capture phase, including a COLD reload,
+> is deliberately synchronous by design (`SearchSnapshot` capture must run
+> under one `&mut VectorIndex` borrow). Moving the reload itself off-thread
+> would require `SegmentHolder` to be reachable from the async continuation
+> without holding open a `VectorIndex` borrow (e.g. wrapping it in an `Arc`,
+> a ~100-call-site change) — out of scope for this pass; tracked as a
+> follow-up. In practice this only matters the FIRST query after a segment
+> goes idle: measured on the 40K×768d fixture above (same-instance
+> measurement, `--shards 1`), the first-touch `FT.SEARCH` round-trip that
+> triggered the reload took **79.59 ms**, during which a concurrent `PING`
+> hammering a second connection to the same shard peaked at **76.70 ms**
+> (vs a sub-millisecond baseline) — confirming the stall is real, shard-wide,
+> and essentially the full duration of the reload itself, but bounded to a
+> single segment-reload's worth of wall time, once per idle segment touched.
 
 **WARM tier (pure-age-triggered) — does not reduce RSS by itself.**
 `WarmSearchSegment::from_files` opens each `.mpf` file's mmap only for the

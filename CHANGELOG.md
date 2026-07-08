@@ -6,6 +6,132 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — WS3 COLD/WARM tier adversarial-review fixes (round 2 follow-up, PR #TBD)
+
+An adversarial review of the round-2 COLD tier (below) found one CRITICAL
+correctness bug and several hardening gaps. All fixed on the same branch:
+
+1. **CRITICAL: DEL/HDEL resurrection through WARM/COLD.**
+   `tombstone_key_in_index` (`src/vector/store.rs`) only ever walked
+   `mutable` + `immutable` — a HDEL against a key living in a WARM or COLD
+   (unloaded) segment was silently dropped. Sequence: index idles overnight
+   -> HDEL an old doc -> next-day query resurrects it as a phantom hit, and
+   `num_docs` over-counts. Fixed by giving both tiers a live tombstone set:
+   - `WarmSearchSegment` gained the same interior-mutable
+     `tombstoned_keys`/`has_tombstones` pattern `ImmutableSegment` already
+     has (`mark_deleted_by_key_hash`, `seed_tombstones`,
+     `tombstoned_key_hashes`, `live_count`) — `search_filtered` now filters
+     tombstoned entries out before rerank/truncate, same ordering as the HOT
+     path. Takes effect immediately, no reload required.
+   - `UnloadedSegment` gained a `pending_tombstones` set — a HDEL against a
+     COLD key is queued in the stub (no reload forced just to record a
+     delete) and replayed onto the freshly-reloaded `WarmSearchSegment` in
+     `reload()` via `seed_tombstones`.
+   - `tombstone_key_in_index` now also calls `mark_deleted_by_key_hash` on
+     every `warm` and `unloaded` entry.
+   - Bonus fix found while wiring this up: `mvcc_raw_bytes()` (the HOT->WARM
+     transition's serialization of MVCC headers) only captures INSTALL-time
+     deletes (`mvcc[i].delete_lsn`), never the STEADY-STATE
+     `tombstoned_keys` interior set — so a HDEL landing shortly before a
+     transition was ALSO silently lost, independent of the round-2 COLD
+     work (this bug predates it, in the pre-existing age-based WARM path).
+     `try_warm_transitions_idle` now seeds the new `WarmSearchSegment` with
+     `imm.tombstoned_key_hashes()` right after opening it, closing this gap
+     for both WARM and COLD destinations for free.
+   - `FT.INFO`'s `num_docs` now sums `warm.live_count()` /
+     `stub.live_count()` (total minus live tombstones) instead of the raw
+     `total_count()`, at all 4 call sites (top-level + per-field, default +
+     non-default field).
+   - New tests: `tests/vector_idle_unload.rs`'s
+     `hdel_during_cold_does_not_resurrect` and
+     `hdel_during_warm_does_not_resurrect` — HDEL a doc, wait for the
+     COLD/WARM transition (or vice versa), assert `num_docs` drops
+     immediately and the doc never resurfaces in a post-transition
+     `FT.SEARCH`, in both tier orderings.
+2. **Reload thread placement — verified empirically, documented honestly.**
+   Traced all 3 `promote_unloaded` call sites
+   (`SegmentHolder::search_filtered`, `SegmentHolder::search_mvcc`, and the
+   FT.SEARCH yielding-path snapshot capture in
+   `command/vector_search/ft_search/dispatch.rs`): all three run inside
+   `crate::shard::slice::with_shard(...)`, i.e. on the shard's own OS
+   thread, before any `.await` boundary — PR #179's off-loop worker pool
+   only carries the HNSW beam search itself off-loop, not the capture phase
+   a COLD reload runs in. This means a first-touch reload is a SHARD-WIDE
+   stall (every connection sharing that shard, not just the querying one),
+   for the reload's duration. A real off-loop fix needs `SegmentHolder`
+   reachable from the async continuation without an open `VectorIndex`
+   borrow (e.g. `Arc`-wrapping it, a ~100-call-site change) — judged
+   out-of-scope / too risky for this pass and tracked as a follow-up rather
+   than attempted half-finished. `docs/guides/tuning.md` now documents this
+   precisely instead of the earlier (incorrect) "one-query latency hit"
+   framing, plus a same-instance measurement of the stall's actual duration:
+   the first-touch `FT.SEARCH` reload took 79.59 ms round-trip, during which
+   a concurrent `PING` on a second connection to the same shard peaked at
+   76.70 ms (vs sub-millisecond baseline) — confirming the block is
+   shard-wide and roughly the full reload duration, not a per-connection cost.
+3. **WARM segments could never reach COLD.** `try_warm_transitions_idle`
+   only ever scanned `snapshot.immutable` for idle/age eligibility — a
+   segment that had already demoted to WARM (age-based) had no further path
+   to COLD even if it then went idle, defeating the whole point of the COLD
+   tier for that segment permanently. Fixed: the same function now also
+   scans `snapshot.warm` (`WarmSearchSegment::idle_secs`, a new method
+   mirroring `ImmutableSegment::idle_secs`) and demotes idle WARM segments
+   straight to COLD stubs via the same `UnloadedSegment::from_warm` used for
+   the immutable path — mechanical, since a WARM segment's `.mpf` files
+   already exist on disk.
+4. **Repo-rule compliance: no per-query `SystemTime::now()` syscalls.**
+   `WarmSearchSegment::touch_last_access`/`from_files` and
+   `ImmutableSegment`'s module-level `now_micros()` called
+   `SystemTime::now()` directly on a path that runs once per query per
+   segment. Both now read `crate::storage::entry::current_time_ms()` — the
+   existing shard-tick-populated thread-local cached clock (`TL_NOW_MS`,
+   updated once per ~1ms shard tick) that already backs the KV hot path,
+   with its documented automatic syscall fallback on threads that never
+   ticked a shard clock (tests, or an off-loop FT.SEARCH worker thread).
+   Millisecond resolution (×1000 for unit parity) is sufficient since every
+   caller only compares `age_secs`/`idle_secs` at second granularity.
+5. **Tightened the RSS regression test.** `cold_unload_reduces_process_rss`
+   asserted a plain `rss_after < rss_before`, which would still pass for a
+   regression that only frees (say) the HNSW graph while leaving TQ codes +
+   sidecar resident. Now asserts `rss_after < rss_before * 0.85` (a 15%
+   floor — the real 40K×768d measurement showed −26.2%, so this has margin
+   for the smaller CI-scale fixture and jemalloc arena noise without being
+   toothless).
+6. **`SegmentList::with_unloaded` / `with_warm_and_unloaded` clone-and-patch
+   helpers.** `SegmentList` now derives `Clone` (all fields are
+   `Arc`/`Vec<Arc<_>>` — refcount bumps, never a data copy) so reconstruction
+   sites can use Rust's functional-update syntax
+   (`SegmentList { changed_field, ..old.clone() }`) instead of enumerating
+   all 6 fields by hand. Applied at `try_warm_transitions_idle`'s final
+   `swap` (the site touched by this review's item 3 fix). This does NOT
+   convert all ~17 `SegmentList { ... }` construction sites in the codebase
+   — only the ones this pass's changes already touch, verified to compile.
+   The remaining sites are left as full literals rather than converted
+   speculatively without individual verification; they will fail to compile
+   the moment a new field (e.g. WS5a's `db_index`) is added, which is itself
+   the forcing function that gets them individually attended to. The
+   pattern (derive Clone + functional update, plus the two named helpers)
+   is now established for that future pass to reuse.
+7. **Freshly compacted segments were unloaded to COLD before they were ever
+   searchable.** Two stacked bugs, found via `cold_unload_reduces_process_rss`
+   timing out 600s waiting for `graph_segments >= 1`:
+   - `ImmutableSegment` seeds `last_access_micros` at *construction* (build
+     start), but a multi-second HNSW build consumes the whole
+     `--engine-offload-idle-secs` budget before the segment is published —
+     the idle sweep then unloaded the brand-new segment in its very next
+     tick (server log: "Cold (unload) transition: segment 1 (15000 vectors,
+     idle 3s)" 4.4s after server start). Fixed with
+     `ImmutableSegment::mark_installed()`, called at every point a built
+     segment is swapped into the live `SegmentList` (inline + background
+     compaction installs, both merge installs): idle time is now measured
+     from *visibility*, not from the start of the build.
+   - `mark_installed` deliberately bypasses the cached clock (item 4 above)
+     with a real `SystemTime::now()` syscall: the inline FT.COMPACT path
+     builds ON the shard thread, so `TL_NOW_MS` hasn't advanced for the
+     entire build and stamping the cached value would be build-duration
+     stale — the first iteration of this fix did exactly that and still
+     produced "idle 9s" on a just-installed segment. Install is a cold path;
+     one syscall is fine (does not violate the per-query no-syscall rule).
 ### Added — true COLD tier: idle segments now actually free memory (WS3 round 2, PR #TBD)
 
 Round 1 (below) shipped an idle *trigger* but routed it into the pre-existing

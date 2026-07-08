@@ -4,12 +4,26 @@
 //! and HNSW graph from mmap'd .mpf files instead of in-memory buffers.
 //! This is the critical piece that makes warm-transitioned segments searchable.
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use roaring::RoaringBitmap;
 use smallvec::SmallVec;
+
+/// Microseconds since UNIX epoch, read from the shard's thread-local cached
+/// clock (`crate::storage::entry::current_time_ms`, populated once per 1ms
+/// shard-event-loop tick) instead of a raw `SystemTime::now()` syscall.
+/// Falls back to the real syscall automatically when the cache is unset
+/// (tests, or a thread that never ticked a shard clock — e.g. before this
+/// fix, an off-loop FT.SEARCH worker thread) — see `current_time_ms`'s own
+/// doc comment. Millisecond resolution (upscaled ×1000) is sufficient here:
+/// callers only ever compare `idle_secs`/`age_secs` at second granularity.
+#[inline]
+fn now_micros() -> u64 {
+    crate::storage::entry::current_time_ms() * 1000
+}
 
 use crate::persistence::page::{
     MOONPAGE_HEADER_SIZE, MoonPageHeader, PAGE_4K, PAGE_64K, page_flags,
@@ -62,6 +76,16 @@ pub struct WarmSearchSegment {
     /// LRU ordering without requiring a mutable reference to the budget.
     /// Relaxed ordering is sufficient: approximate recency is all we need.
     last_access_micros: AtomicU64,
+    /// WS3 round-2 resurrection fix: steady-state tombstones recorded
+    /// against this WARM segment after it left the HOT tier (a HDEL that
+    /// lands while the segment is already WARM or COLD). Mirrors
+    /// `ImmutableSegment::tombstoned_keys`/`has_tombstones` exactly — same
+    /// fast-path-skips-the-lock design. Seeded at construction time (via
+    /// `seed_tombstones`) with any tombstones the SOURCE immutable segment
+    /// already carried at HOT->WARM transition time, so a delete that
+    /// arrived just before the transition is not lost either.
+    has_tombstones: AtomicBool,
+    tombstoned_keys: parking_lot::RwLock<HashSet<u64>>,
     /// Exact-rerank sidecar (HQ-1 parity, WS3): f16 copy of each original
     /// vector, BFS-ordered, `dimension` halves per entry, extracted from
     /// `vectors.mpf` if the HOT->WARM transition wrote one (see
@@ -301,12 +325,9 @@ impl WarmSearchSegment {
             _handle: handle,
             created_at: std::time::Instant::now(),
             raw_f16,
-            last_access_micros: AtomicU64::new(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_micros() as u64,
-            ),
+            last_access_micros: AtomicU64::new(now_micros()),
+            has_tombstones: AtomicBool::new(false),
+            tombstoned_keys: parking_lot::RwLock::new(HashSet::new()),
         })
     }
 
@@ -354,6 +375,24 @@ impl WarmSearchSegment {
             empty_sub_signs,
             0,
         );
+
+        // WS3 round-2 resurrection fix: drop steady-state-tombstoned entries
+        // BEFORE rerank/truncate, mirroring `ImmutableSegment::search`'s
+        // ordering exactly -- a tombstone must neither consume the
+        // exact-rerank 4*k budget nor leave a stale ADC score mixed into the
+        // post-rerank top-k. Filtering here (by BFS position -> key_hash,
+        // computed the same way `remap_to_global_ids` does) means a HDEL'd
+        // doc never resurfaces, even before a reload: `mark_deleted_by_key_hash`
+        // takes effect immediately against an already-resident WarmSearchSegment.
+        if self.has_tombstones.load(Ordering::Acquire) {
+            let guard = self.tombstoned_keys.read();
+            candidates.retain(|c| {
+                let bfs = self.graph.to_bfs(c.id.0) as usize;
+                self.key_hashes
+                    .get(bfs)
+                    .is_none_or(|kh| !guard.contains(kh))
+            });
+        }
 
         // WS3 / HQ-1 parity: exact rerank from the f16 sidecar when the
         // HOT->WARM transition carried one over. No-op (falls back to ADC)
@@ -456,11 +495,75 @@ impl WarmSearchSegment {
     /// Bump the last-access timestamp. Called on every search.
     #[inline]
     fn touch_last_access(&self) {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_micros() as u64;
-        self.last_access_micros.store(now, Ordering::Relaxed);
+        self.last_access_micros
+            .store(now_micros(), Ordering::Relaxed);
+    }
+
+    /// Segment idle time in seconds since the last search touched it
+    /// (WS3 round 2: lets a WARM segment additionally qualify for the COLD
+    /// idle sweep, mirroring `ImmutableSegment::idle_secs` exactly).
+    #[inline]
+    pub fn idle_secs(&self) -> u64 {
+        let now = now_micros();
+        let last = self.last_access_micros();
+        now.saturating_sub(last) / 1_000_000
+    }
+
+    /// Mark a key as deleted via interior mutability -- the WARM-tier twin of
+    /// `ImmutableSegment::mark_deleted_by_key_hash` (WS3 round-2 resurrection
+    /// fix). Takes effect immediately: the next `search_filtered` call
+    /// filters this key_hash out, no reload required. Returns 1 if newly
+    /// tombstoned, 0 if already present.
+    pub fn mark_deleted_by_key_hash(&self, key_hash: u64) -> u32 {
+        {
+            let guard = self.tombstoned_keys.read();
+            if guard.contains(&key_hash) {
+                return 0;
+            }
+        }
+        let mut guard = self.tombstoned_keys.write();
+        if guard.insert(key_hash) {
+            self.has_tombstones.store(true, Ordering::Release);
+            1
+        } else {
+            0
+        }
+    }
+
+    /// Seed the tombstone set in bulk -- used at HOT->WARM transition time to
+    /// carry over the source immutable segment's live (steady-state)
+    /// tombstones (which `mvcc_raw_bytes` does NOT capture; see
+    /// `VectorIndex::try_warm_transitions_idle`), and by `UnloadedSegment::reload`
+    /// to replay tombstones that arrived while the segment was COLD.
+    pub fn seed_tombstones(&self, key_hashes: &[u64]) {
+        if key_hashes.is_empty() {
+            return;
+        }
+        let mut guard = self.tombstoned_keys.write();
+        for kh in key_hashes {
+            guard.insert(*kh);
+        }
+        self.has_tombstones.store(true, Ordering::Release);
+    }
+
+    /// All currently-tombstoned key hashes (WS3 round 2: used to carry
+    /// tombstones forward across a WARM -> COLD -> WARM round trip, and by
+    /// GraphUnion/merge-adjacent code that may need to propagate them).
+    pub fn tombstoned_key_hashes(&self) -> Vec<u64> {
+        self.tombstoned_keys.read().iter().copied().collect()
+    }
+
+    /// Live document count: `total_count` minus currently-tombstoned entries.
+    /// This is what `FT.INFO`'s `num_docs` must sum (WS3 round-2 resurrection
+    /// fix) -- `total_count()` alone over-reports once a delete lands against
+    /// an already-WARM/COLD segment.
+    #[inline]
+    pub fn live_count(&self) -> u32 {
+        if !self.has_tombstones.load(Ordering::Acquire) {
+            return self.total_count;
+        }
+        let dead = self.tombstoned_keys.read().len() as u32;
+        self.total_count.saturating_sub(dead)
     }
 
     /// Estimated resident bytes for this warm segment.

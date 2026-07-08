@@ -50,12 +50,12 @@ pub fn ft_info(
         num_docs += imm.live_count() as usize;
     }
     for warm in snap.warm.iter() {
-        num_docs += warm.total_count() as usize;
+        num_docs += warm.live_count() as usize;
     }
     // WS3 round 2: COLD (unloaded) segments carry their doc count in the
     // stub itself (captured at unload time), so this needs no reload.
     for stub in snap.unloaded.iter() {
-        num_docs += stub.total_count() as usize;
+        num_docs += stub.live_count() as usize;
     }
     // HQ-1 observability (persistence-review R5): exact-rerank coverage.
     // A segment without the f16 sidecar silently answers with quantized ADC
@@ -152,10 +152,10 @@ pub fn ft_info(
                 docs += imm.live_count() as usize;
             }
             for warm in s.warm.iter() {
-                docs += warm.total_count() as usize;
+                docs += warm.live_count() as usize;
             }
             for stub in s.unloaded.iter() {
-                docs += stub.total_count() as usize;
+                docs += stub.live_count() as usize;
             }
             (docs, s.mutable.len(), imm_count)
         } else if let Some(fs) = idx.field_segments.get(&field_meta.field_name) {
@@ -166,10 +166,10 @@ pub fn ft_info(
                 docs += imm.live_count() as usize;
             }
             for warm in s.warm.iter() {
-                docs += warm.total_count() as usize;
+                docs += warm.live_count() as usize;
             }
             for stub in s.unloaded.iter() {
-                docs += stub.total_count() as usize;
+                docs += stub.live_count() as usize;
             }
             (docs, s.mutable.len(), imm_count)
         } else {

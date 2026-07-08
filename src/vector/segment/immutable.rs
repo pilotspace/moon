@@ -29,17 +29,19 @@ use crate::vector::turbo_quant::sub_centroid;
 use crate::vector::types::SearchResult;
 use crate::vector::types::VectorId;
 
-/// Microseconds since UNIX epoch, `SystemTime`-based (not the shard-cached
-/// clock: this module has no access to shard state, and the call sites are
-/// FT.SEARCH-only, at most once per query per segment — not the per-KV-op
-/// hot path the shard-cached clock exists for). Mirrors
-/// `WarmSearchSegment::touch_last_access`'s existing precedent.
+/// Microseconds since UNIX epoch, read from the shard's thread-local cached
+/// clock (`crate::storage::entry::current_time_ms`, one `clock_gettime` per
+/// shard tick, ~1ms) instead of a raw per-call `SystemTime::now()` syscall
+/// (CLAUDE.md performance invariant: never call the real clock per-op on a
+/// path that can run once per query per segment). `current_time_ms` falls
+/// back to a real syscall automatically on a thread whose shard clock was
+/// never ticked (tests, or an off-loop FT.SEARCH worker thread) — see its
+/// own doc comment. Millisecond resolution (upscaled ×1000 for unit parity
+/// with the microsecond field below) is sufficient: every caller here only
+/// ever compares `age_secs`/`idle_secs` at second granularity.
 #[inline]
 fn now_micros() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_micros() as u64
+    crate::storage::entry::current_time_ms() * 1000
 }
 
 /// MVCC header for immutable segment entries.
@@ -960,6 +962,28 @@ impl ImmutableSegment {
     fn touch_last_access(&self) {
         self.last_access_micros
             .store(now_micros(), Ordering::Relaxed);
+    }
+
+    /// Reset the idle clock at install time (when the segment is swapped
+    /// into the live `SegmentList`). `last_access_micros` is seeded at
+    /// *construction*, but a multi-second background HNSW build can consume
+    /// the whole idle-unload budget before the segment is even searchable —
+    /// a freshly published segment would then be unloaded to COLD in the
+    /// very next sweep tick. Idle time must be measured from visibility,
+    /// not from the start of the build.
+    ///
+    /// Deliberately bypasses the shard's cached clock (`now_micros`): the
+    /// inline FT.COMPACT path builds ON the shard thread, so the event loop
+    /// hasn't ticked (and the cache hasn't advanced) for the entire build —
+    /// stamping the cached value here would be build-duration stale, which
+    /// is the exact bug this method exists to fix. Install is a cold path;
+    /// one real syscall is fine.
+    pub fn mark_installed(&self) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros() as u64;
+        self.last_access_micros.store(now, Ordering::Relaxed);
     }
 
     /// Serialize MVCC headers to raw bytes for warm tier .mpf writing.

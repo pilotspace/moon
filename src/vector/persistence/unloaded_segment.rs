@@ -16,6 +16,7 @@
 //! reload path is identical to the existing WARM-tier load, sidecar
 //! included.
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -41,6 +42,14 @@ pub struct UnloadedSegment {
     /// Keeps the on-disk segment directory alive (not tombstoned) until
     /// this index/segment is explicitly dropped or flushed.
     handle: SegmentHandle,
+    /// WS3 round-2 resurrection fix: key_hashes tombstoned while this
+    /// segment is COLD (a HDEL that lands after unload), plus any
+    /// tombstones the source `WarmSearchSegment` already carried at unload
+    /// time (so a WARM -> COLD transition never loses a live delete).
+    /// Applied to the freshly-reloaded `WarmSearchSegment` in [`Self::reload`]
+    /// and used by [`Self::live_count`] to keep `FT.INFO`'s `num_docs`
+    /// correct without requiring a reload just to answer the count.
+    pending_tombstones: parking_lot::RwLock<HashSet<u64>>,
 }
 
 impl UnloadedSegment {
@@ -49,6 +58,7 @@ impl UnloadedSegment {
     /// the caller drops `warm` (or lets it go out of scope), freeing the
     /// codes/graph/sidecar buffers.
     pub fn from_warm(warm: &WarmSearchSegment, mlock_codes: bool) -> Self {
+        let carried_over: HashSet<u64> = warm.tombstoned_key_hashes().into_iter().collect();
         Self {
             segment_id: warm.segment_id(),
             collection_meta: warm.collection_meta_arc(),
@@ -56,7 +66,28 @@ impl UnloadedSegment {
             had_exact_rerank: warm.raw_f16().is_some(),
             mlock_codes,
             handle: warm.handle_clone(),
+            pending_tombstones: parking_lot::RwLock::new(carried_over),
         }
+    }
+
+    /// Mark a key as deleted while this segment is COLD -- the stub records
+    /// it without requiring a reload (WS3 round-2 resurrection fix). Applied
+    /// to the reloaded `WarmSearchSegment` on the next [`Self::reload`].
+    /// Returns 1 if newly tombstoned, 0 if already present.
+    pub fn mark_deleted_by_key_hash(&self, key_hash: u64) -> u32 {
+        let mut guard = self.pending_tombstones.write();
+        if guard.insert(key_hash) { 1 } else { 0 }
+    }
+
+    /// Live document count: `doc_count` (captured at unload time) minus
+    /// pending tombstones recorded while COLD. This is what `FT.INFO`'s
+    /// `num_docs` must sum instead of [`Self::total_count`] (which is the
+    /// raw capture-time count and does not reflect deletes that arrived
+    /// afterward).
+    #[inline]
+    pub fn live_count(&self) -> u32 {
+        self.doc_count
+            .saturating_sub(self.pending_tombstones.read().len() as u32)
     }
 
     #[inline]
@@ -93,13 +124,25 @@ impl UnloadedSegment {
     /// recovery, so recall/exactness (including the f16 sidecar) is
     /// unaffected by having gone through the COLD tier.
     pub fn reload(&self) -> std::io::Result<WarmSearchSegment> {
-        WarmSearchSegment::from_files(
+        let warm = WarmSearchSegment::from_files(
             self.handle.segment_dir(),
             self.segment_id,
             self.collection_meta.clone(),
             self.handle.clone(),
             self.mlock_codes,
-        )
+        )?;
+        // WS3 round-2 resurrection fix: replay every tombstone recorded
+        // while this segment was COLD (plus whatever it already carried at
+        // unload time) onto the freshly-reloaded segment, so a HDEL'd doc
+        // does not resurface just because the segment went through the COLD
+        // tier.
+        let toms = self.pending_tombstones.read();
+        if !toms.is_empty() {
+            let list: Vec<u64> = toms.iter().copied().collect();
+            drop(toms);
+            warm.seed_tombstones(&list);
+        }
+        Ok(warm)
     }
 
     /// Approximate resident bytes of the stub itself -- a handful of scalars

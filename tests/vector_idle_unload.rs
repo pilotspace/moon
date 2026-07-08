@@ -122,6 +122,13 @@ fn sigkill(child: &mut Child) {
 /// is set low so idleness is the ONLY thing that can trigger the transition
 /// within this test.
 fn spawn_moon(port: u16, dir: &Path, idle_secs: u64) -> ServerGuard {
+    spawn_moon_full(port, dir, 3600, idle_secs)
+}
+
+/// Same as [`spawn_moon`] but with both thresholds explicit -- used by the
+/// resurrection tests to isolate the WARM-only path (idle disabled, age low)
+/// from the COLD-only path (age high, idle low).
+fn spawn_moon_full(port: u16, dir: &Path, warm_after_secs: u64, idle_secs: u64) -> ServerGuard {
     std::fs::create_dir_all(dir).expect("create test dir");
     let child = Command::new(find_moon_binary())
         .args([
@@ -132,7 +139,7 @@ fn spawn_moon(port: u16, dir: &Path, idle_secs: u64) -> ServerGuard {
             "--appendonly",
             "yes",
             "--segment-warm-after",
-            "3600",
+            &warm_after_secs.to_string(),
             "--engine-offload-idle-secs",
             &idle_secs.to_string(),
             "--disk-free-min-pct",
@@ -158,6 +165,13 @@ fn spawn_moon(port: u16, dir: &Path, idle_secs: u64) -> ServerGuard {
         .spawn()
         .expect("spawn moon (run `cargo build --release` first, or set MOON_BIN)");
     ServerGuard::new(child, dir)
+}
+
+/// WARM-only spawn: idle disabled entirely (`--engine-offload-idle-secs 0`),
+/// so only the age criterion (`--segment-warm-after`) can demote a segment --
+/// used to isolate the WARM-tier resurrection test from the COLD path.
+fn spawn_moon_warm_only(port: u16, dir: &Path, warm_after_secs: u64) -> ServerGuard {
+    spawn_moon_full(port, dir, warm_after_secs, 0)
 }
 
 // ---------------------------------------------------------------------------
@@ -571,6 +585,151 @@ fn hot_segment_idle_unloads_to_cold_and_preserves_recall() {
     );
 }
 
+/// Adversarial review #1 (CRITICAL): a HDEL that lands while a segment is
+/// COLD must not resurrect the doc once the segment reloads. Before this
+/// fix, `tombstone_key_in_index` never walked `warm`/`unloaded`, so the
+/// delete was silently dropped -- the deleted doc would resurface (and
+/// `num_docs` would over-count) the moment a search touched the index again.
+#[test]
+#[ignore] // Spawns a real server process; run explicitly with `-- --ignored`.
+fn hdel_during_cold_does_not_resurrect() {
+    let port = unique_port();
+    let dir = unique_dir("s2");
+    let idx = "colddelidx";
+
+    let _guard = spawn_moon(port, &dir, 2);
+    let mut c = wait_ready(port);
+
+    ft_create(&mut c, idx, DIM, 100);
+    let ids: Vec<u32> = (0..30).collect();
+    hset_batch(&mut c, &format!("{idx}:"), &ids);
+    ft_compact(&mut c, idx);
+
+    assert_eq!(ft_info_int(&mut c, idx, "graph_segments"), 1);
+    assert_eq!(ft_info_int(&mut c, idx, "num_docs"), 30);
+
+    let probe = fixture_vec(7, DIM);
+    let (key_before, dist_before) = search_top1(&mut c, idx, &probe);
+    assert_eq!(key_before, format!("{idx}:7"), "self-match must find id 7");
+    assert!(dist_before < 1e-3, "exact self-match pre-delete");
+
+    // Idle the segment straight to COLD.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if ft_info_int(&mut c, idx, "unloaded_segments") >= 1 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "segment never transitioned to COLD within 30s"
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
+
+    // HDEL (via DEL on the whole hash key) while the segment is COLD --
+    // must reach the stub without forcing a reload.
+    let r = c.cmd(&[b"DEL", format!("{idx}:7").as_bytes()]);
+    assert_eq!(r, V::Int(1), "DEL must report the key existed");
+
+    // num_docs must reflect the delete immediately -- no reload triggered by
+    // DEL alone (the tombstone is queued in the COLD stub, see
+    // `UnloadedSegment::mark_deleted_by_key_hash`).
+    assert_eq!(ft_info_int(&mut c, idx, "unloaded_segments"), 1);
+    assert_eq!(
+        ft_info_int(&mut c, idx, "num_docs"),
+        29,
+        "num_docs must drop immediately even while the segment stays COLD"
+    );
+
+    // Touch it: triggers the reload. The deleted doc must NOT resurrect.
+    let (key_after, _dist_after) = search_top1(&mut c, idx, &probe);
+    assert_ne!(
+        key_after,
+        format!("{idx}:7"),
+        "deleted doc must not resurrect after a COLD -> reload round trip"
+    );
+    assert_eq!(
+        ft_info_int(&mut c, idx, "unloaded_segments"),
+        0,
+        "reload promotes COLD -> WARM"
+    );
+    assert_eq!(ft_info_int(&mut c, idx, "warm_segments"), 1);
+    assert_eq!(
+        ft_info_int(&mut c, idx, "num_docs"),
+        29,
+        "num_docs must remain correct after reload"
+    );
+}
+
+/// Same shape as [`hdel_during_cold_does_not_resurrect`] but for the WARM
+/// tier directly (idle disabled -- only the age criterion fires, so the
+/// segment demotes to WARM and is never touched by the COLD path at all).
+/// `WarmSearchSegment` previously had no tombstone mechanism whatsoever; a
+/// HDEL against an already-WARM segment was a silent no-op.
+#[test]
+#[ignore] // Spawns a real server process; run explicitly with `-- --ignored`.
+fn hdel_during_warm_does_not_resurrect() {
+    let port = unique_port();
+    let dir = unique_dir("s3");
+    let idx = "warmdelidx";
+
+    let _guard = spawn_moon_warm_only(port, &dir, 2);
+    let mut c = wait_ready(port);
+
+    ft_create(&mut c, idx, DIM, 100);
+    let ids: Vec<u32> = (0..30).collect();
+    hset_batch(&mut c, &format!("{idx}:"), &ids);
+    ft_compact(&mut c, idx);
+
+    assert_eq!(ft_info_int(&mut c, idx, "graph_segments"), 1);
+
+    let probe = fixture_vec(7, DIM);
+    let (key_before, dist_before) = search_top1(&mut c, idx, &probe);
+    assert_eq!(key_before, format!("{idx}:7"));
+    assert!(dist_before < 1e-3);
+
+    // Age it to WARM (idle disabled -- only the age criterion can fire).
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if ft_info_int(&mut c, idx, "warm_segments") >= 1 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "segment never transitioned to WARM within 30s"
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    assert_eq!(
+        ft_info_int(&mut c, idx, "unloaded_segments"),
+        0,
+        "idle is disabled here -- must never visit COLD"
+    );
+
+    // HDEL while WARM -- must take effect immediately against the resident
+    // WarmSearchSegment (its own interior tombstone set), no reload needed.
+    let r = c.cmd(&[b"DEL", format!("{idx}:7").as_bytes()]);
+    assert_eq!(r, V::Int(1));
+
+    assert_eq!(
+        ft_info_int(&mut c, idx, "num_docs"),
+        29,
+        "num_docs must reflect the delete immediately against a resident WARM segment"
+    );
+
+    let (key_after, _dist_after) = search_top1(&mut c, idx, &probe);
+    assert_ne!(
+        key_after,
+        format!("{idx}:7"),
+        "deleted doc must not appear in WARM-tier search results"
+    );
+    assert_eq!(
+        ft_info_int(&mut c, idx, "warm_segments"),
+        1,
+        "still WARM -- a delete alone doesn't force any tier change"
+    );
+}
+
 /// RSS proof: a real, measurably-sized dataset (large enough that the
 /// HNSW+TQ codes dominate the process's resident set, unlike the tiny
 /// DIM=16/90-vector fixture used above) must show a REAL RSS drop once the
@@ -580,8 +739,18 @@ fn hot_segment_idle_unloads_to_cold_and_preserves_recall() {
 #[test]
 #[ignore] // Spawns a real server process; run explicitly with `-- --ignored`.
 fn cold_unload_reduces_process_rss() {
-    const BIG_DIM: usize = 256;
-    const N: u32 = 3000;
+    // Adversarial review #5 tightened the assertion below to a 15% floor
+    // (was a plain `<`). At the ORIGINAL 256d/3,000-vector fixture the hot
+    // tier (codes + graph + f16 sidecar) is only a few MB against a ~99MB
+    // process baseline (runtime/allocator/etc.) -- nowhere near 15% of RSS
+    // even when fully freed, so the tightened assertion failed even with
+    // COLD correctly freeing 100% of its own data. Scaled up so the hot
+    // tier is large enough (~35+ MB) relative to the baseline for a 15%
+    // floor to be a meaningful, reliably-passing signal instead of a flaky
+    // one -- still small enough to compact well under this test's 90s
+    // deadline.
+    const BIG_DIM: usize = 768;
+    const N: u32 = 15000;
 
     let port = unique_port();
     let dir = unique_dir("rss");
@@ -590,7 +759,7 @@ fn cold_unload_reduces_process_rss() {
     let guard = spawn_moon(port, &dir, 2);
     let mut c = wait_ready(port);
 
-    ft_create(&mut c, idx, BIG_DIM, 5000); // COMPACT_THRESHOLD > N: no auto-compact
+    ft_create(&mut c, idx, BIG_DIM, 20000); // COMPACT_THRESHOLD > N: no auto-compact
     let ids: Vec<u32> = (0..N).collect();
     // Batch the HSETs to keep the pipeline reasonable.
     for chunk in ids.chunks(200) {
@@ -598,21 +767,46 @@ fn cold_unload_reduces_process_rss() {
     }
     ft_compact(&mut c, idx);
     // Background compaction (see CLAUDE.md "FT background compaction"):
-    // FT.COMPACT returns OK immediately but the HNSW build for 3000 vectors
-    // runs on a worker thread -- poll rather than assert immediately.
-    let compact_deadline = Instant::now() + Duration::from_secs(90);
+    // FT.COMPACT returns OK immediately but the HNSW build runs on a worker
+    // thread -- poll rather than assert immediately. 15,000 x 768d measured
+    // >90s on a `release-fast` (not fully-optimized `release`) binary under
+    // this dev machine's load. Bumped 240s -> 600s after observing this
+    // exact test blow a 240s deadline while OTHER heavy `cargo test`/`cargo
+    // build` jobs were running concurrently on the same (shared, load-average
+    // 6-10) dev machine -- an isolated run (nothing else competing for CPU)
+    // reliably produces a HOT segment in single-digit seconds, so 240s is
+    // fine in isolation but not resilient to this machine's background
+    // contention. 600s is a generous ceiling since this test is `--ignored`
+    // (not part of the default `cargo test` run) and correctness matters
+    // more than speed here.
+    let compact_deadline = Instant::now() + Duration::from_secs(600);
     loop {
         if ft_info_int(&mut c, idx, "graph_segments") >= 1 {
             break;
         }
         assert!(
             Instant::now() < compact_deadline,
-            "background compaction never produced a HOT segment within 90s"
+            "background compaction never produced a HOT segment within 600s"
         );
         std::thread::sleep(Duration::from_millis(200));
     }
     assert_eq!(ft_info_int(&mut c, idx, "graph_segments"), 1);
     assert_eq!(ft_info_int(&mut c, idx, "num_docs"), N as i64);
+    // Idle-window race guard: `spawn_moon` uses a 2s idle threshold, and
+    // idleness is measured from segment creation (compaction), not from
+    // this poll loop returning. If the compaction itself (plus this poll's
+    // own round-trips) ever takes longer than 2s -- entirely plausible
+    // under this dev machine's background load -- the segment could already
+    // be eligible for (or mid-) a COLD transition by the time RSS_BEFORE is
+    // sampled below, silently corrupting the before/after delta into a
+    // false pass or a spurious failure. Fail loudly instead.
+    assert_eq!(
+        ft_info_int(&mut c, idx, "unloaded_segments"),
+        0,
+        "segment already went COLD before RSS_BEFORE could be sampled -- \
+         idle-window race (compaction took longer than the 2s idle \
+         threshold); this corrupts the RSS delta measurement below"
+    );
 
     let rss_kb = |pid: u32| -> u64 {
         let out = Command::new("ps")
@@ -646,11 +840,20 @@ fn cold_unload_reduces_process_rss() {
     std::thread::sleep(Duration::from_secs(3));
     let rss_after_unload = rss_kb(pid);
 
+    // Tightened per adversarial review #5: a plain `<` passes even for a
+    // regression that only frees the HNSW graph (leaving codes+sidecar
+    // resident) or otherwise partially unloads. The production 40K x 768d
+    // SQ8 measurement (CHANGELOG) showed a real -26.2% drop; require at
+    // least -15% here so a partial-free regression fails loudly while still
+    // tolerating this test's smaller (256d x 3,000-vector) CI-scale fixture
+    // and jemalloc arena noise.
+    let threshold = (rss_before as f64 * 0.85) as i64;
     assert!(
-        rss_after_unload < rss_before,
-        "RSS must drop materially after COLD unload: before={rss_before}KB \
-         after={rss_after_unload}KB (round-1 WARM measured a FLAT/+1.1% \
-         non-result here -- COLD must actually free the codes+graph+sidecar)"
+        (rss_after_unload as i64) < threshold,
+        "RSS must drop by at least 15% after COLD unload: before={rss_before}KB \
+         after={rss_after_unload}KB threshold={threshold}KB (round-1 WARM measured \
+         a FLAT/+1.1% non-result here -- COLD must actually free the \
+         codes+graph+sidecar, not just e.g. the graph alone)"
     );
 
     // Touch it: reload restores full residency (roughly back to pre-unload).
