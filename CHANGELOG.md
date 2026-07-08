@@ -6,6 +6,113 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — vector idle-unload with sidecar-preserving WARM transition (WS3, PR #TBD)
+
+- **`src/vector/segment/immutable.rs`**: `ImmutableSegment` gains a
+  `last_access_micros` atomic (mirrors `WarmSearchSegment`'s existing field),
+  touched on every `search`/`search_filtered`, exposed via `idle_secs()`.
+- **`src/config.rs`**: new `--engine-offload-idle-secs <secs>` (default
+  `3600`, `0` disables). A HOT segment now demotes to the mmap-backed WARM
+  tier when EITHER `--segment-warm-after` (age) OR
+  `--engine-offload-idle-secs` (idleness since last search) is reached —
+  whichever fires first — so a segment that is old but still busy stays HOT
+  instead of unloading mid-traffic. `src/vector/store.rs` adds
+  `try_warm_transitions_idle` / `try_warm_transitions_all_idle` (the
+  pre-existing age-only methods now delegate to these with idle disabled, so
+  every existing caller is unaffected). `src/shard/{persistence_tick,
+  event_loop}.rs` thread the new threshold through; the warm-check poll
+  interval also adapts to the lower of the two thresholds for fast local
+  testing.
+- **Recall fix (was silently dropped, not new WS3 behavior)**:
+  `VectorIndex::try_warm_transitions` always passed `None` for the HOT
+  segment's f16 exact-rerank sidecar when writing `vectors.mpf`, and
+  `WarmSearchSegment` had no sidecar field or rerank logic at all — every
+  HOT->WARM transition silently downgraded to quantized ADC-only distances,
+  contradicting the sidecar's whole purpose (HQ-1, PR #232). Fixed:
+  `src/vector/persistence/warm_search.rs`'s `WarmSearchSegment` now loads
+  `vectors.mpf` (when present) into a `RawF16Store`, exposes `raw_f16()`, and
+  runs the same `rerank_exact` HQ-1 logic `ImmutableSegment` does before
+  truncating to `k`. `VectorIndex::try_warm_transitions` now passes
+  `imm.raw_f16()`'s bytes through instead of `None`.
+- **Correctness fix (also pre-existing, caught by the new integration
+  test)**: `warm_search.rs`'s `parse_global_ids` assumed a 24-byte MVCC entry
+  with no `key_hash` field; the actual writer
+  (`ImmutableSegment::mvcc_raw_bytes`) emits 32-byte entries
+  (`internal_id + global_id + key_hash + insert_lsn + delete_lsn`). Every
+  entry past the first was misaligned, and `key_hash` was dropped entirely —
+  every WARM-tier FT.SEARCH hit resolved to a synthetic `vec:<id>` key
+  instead of the real Redis key. Renamed to `parse_mvcc_ids`, fixed to the
+  correct 32-byte stride, and `key_hash` now propagates onto
+  `SearchResult.key_hash` via `remap_to_global_ids`.
+- **`FT.INFO`**: new additive (scatter-gathered across shards) counters
+  `warm_segments` / `warm_segments_with_exact_rerank`, mirroring the existing
+  `graph_segments` / `segments_with_exact_rerank` for the HOT tier.
+- **Correctness fix (regression this WS3 work would otherwise have shipped,
+  caught by RSS verification below)**: `command/vector_search/ft_info.rs`'s
+  `num_docs` computation (both the top-level and per-`vector_fields` entry)
+  only summed `mutable.len()` + `imm.live_count()` over HOT segments — it
+  never counted WARM segments. Before WS3 this was latent (age-based
+  HOT->WARM demotion existed but nothing exercised it in a live num_docs
+  check); with idle-unload now demoting segments routinely, a fully-idle
+  single-segment index would report `num_docs 0` even though every document
+  was still present and searchable. Fixed by adding
+  `warm.iter().map(WarmSearchSegment::total_count)` to both sums.
+- **⚠ Known limitation — RSS does NOT drop after HOT->WARM idle-unload.**
+  Verified with a real server (`--shards 1`, SQ8, 40,000 × 768-dim vectors,
+  `ps -o rss=` sampled every 2s for 16s after the transition): RSS went from
+  395,168 KB to a flat 399,504–399,520 KB post-unload — a **1.1% increase**,
+  not a decrease, with zero decay over the observation window. Root cause is
+  pre-existing (predates this WS3 change, confirmed by the standing doc
+  comment on `WarmSearchSegment::from_files` in
+  `src/vector/persistence/warm_search.rs`): the "mmap-backed" WARM tier opens
+  each `.mpf` file's mmap only for the duration of `from_files()` and
+  immediately copies every payload out into owned `Vec<u8>` /
+  parsed-`HnswGraph` buffers of essentially the same size as the HOT
+  segment's — the mmap is then dropped. So the two structures that dominate
+  memory at scale (TQ codes + HNSW graph) are fully duplicated in heap memory
+  on the WARM side, not lazily paged in from disk. The idle-based *trigger*
+  added by this change is correct and verified end-to-end (`FT.INFO` counters
+  flip, recall/exactness preserved, `num_docs` now stays correct — see
+  `tests/vector_idle_unload.rs`), but it does not, by itself, achieve the
+  memory-reduction goal this workstream set out to prove. A genuine RSS win
+  requires reworking `WarmSearchSegment` to search directly over borrowed
+  mmap'd bytes (HNSW traversal + TQ-ADC distance kernels operating on
+  `&[u8]` instead of owned `Vec`), which is a substantially larger, higher-risk
+  change (touches SIMD distance kernels, needs careful lifetime/alignment
+  handling, and was explicitly out of scope for this pass per the "no new
+  `unsafe` without approval" constraint). Tracked as an open follow-up; see
+  `docs/guides/tuning.md`.
+- **`src/config.rs`**: corrected the `--disk-offload-threshold` doc comment,
+  which claimed "parsed but not acted upon" — the memory-pressure cascade
+  (`persistence_tick::{should_run_pressure_cascade,handle_memory_pressure}`)
+  has actually acted on it since an earlier phase; the comment was stale.
+- **`src/storage/tiered/cold_read.rs`**: new `_cached` variants
+  (`cold_read_through_outcome_cached`, `read_cold_entry_at_cached`) read the
+  cold KV leaf page through `PageCache` when given one, instead of always
+  `pread`ing — the existing (uncached) functions are now thin wrappers
+  calling these with `page_cache: None`, so their behavior and every existing
+  call site are unchanged. **Not yet wired into `Database::get()`'s live
+  cold-read path** — that needs a `PageCache` handle threaded from the
+  per-shard event loop into `Database`, a broader plumbing change deferred as
+  a follow-up; the cache-capable read path itself is implemented and tested.
+- Docs: `docs/guides/tuning.md` gains "Tiered memory offload" and
+  "Vector/FTS/graph idle-unload" sections documenting the new flags,
+  `FT.INFO` counters, and the FTS/graph limitation (no equivalent idle-unload
+  yet — FTS has no aggregate memory-accounting API, and the graph engine's
+  mmap'd `MmapCsrSegment` has no LRU-eviction-driven unload comparable to
+  vector's `MmapBudget`).
+- Red/green: `tests/vector_idle_unload.rs` (real server process, `MOON_BIN` /
+  `CARGO_BIN_EXE_moon`) — idle-out a HOT segment with `--segment-warm-after`
+  set far above the test's timeout so only `--engine-offload-idle-secs` can
+  trigger the transition; asserts `FT.INFO` counters flip HOT->WARM and a
+  post-transition `FT.SEARCH` returns the same key with the same near-zero
+  exact-rerank distance (this is what caught both fixes above — it failed on
+  the pre-fix code, first on distance, then on key identity).
+  `src/storage/tiered/cold_read.rs` unit test proves a second cold read is
+  served from `PageCache` even after the backing file is renamed away.
+  `src/vector/persistence/warm_search.rs` unit tests cover the sidecar
+  round-trip and the corrected MVCC entry parsing.
+
 ### Added — sharded MULTI/EXEC routes a single-owner-shard body to its owner (Phase B, PR #TBD)
 
 - **`src/shard/{dispatch,spsc_handler,coordinator}.rs`,

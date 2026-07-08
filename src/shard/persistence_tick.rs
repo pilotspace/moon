@@ -201,24 +201,30 @@ pub(crate) fn flush_wal_v3_if_needed(
 // Warm tier transition handler (disk-offload path)
 // ---------------------------------------------------------------------------
 
-/// Periodically check immutable segment ages and trigger HOT->WARM transitions.
+/// Periodically check immutable segment ages/idle-time and trigger HOT->WARM
+/// transitions.
 ///
 /// Called from the event loop on a slower interval (e.g., every 10 seconds)
 /// when disk-offload is enabled. Scans all VectorIndex segments, transitions
-/// those older than `warm_after_secs`.
+/// those older than `warm_after_secs` OR (WS3, when `idle_after_secs > 0`)
+/// idle for at least `idle_after_secs` since their last search — whichever
+/// threshold is reached first.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn check_warm_transitions(
     vector_store: &crate::vector::store::VectorStore,
     shard_dir: &std::path::Path,
     manifest: &mut ShardManifest,
     warm_after_secs: u64,
+    idle_after_secs: u64,
     next_file_id: &mut u64,
     shard_id: usize,
     wal: &mut Option<WalWriterV3>,
 ) {
-    let count = vector_store.try_warm_transitions_all(
+    let count = vector_store.try_warm_transitions_all_idle(
         shard_dir,
         manifest,
         warm_after_secs,
+        idle_after_secs,
         next_file_id,
         wal,
     );
@@ -1452,5 +1458,64 @@ mod tests {
         assert_eq!(s.last_lsn(), 999);
         assert_eq!(s.epoch, 5);
         assert_eq!(last_epoch, 5);
+    }
+
+    // ── WS3 priority 3: `--disk-offload-threshold` proactive spill trigger ──
+
+    /// RED (pre-fix intent)/GREEN: `should_run_pressure_cascade` must fire
+    /// exactly at `used_memory > threshold * per_shard_budget`, not only at
+    /// `maxmemory` itself -- this is what makes disk-offload "proactive
+    /// instead of edge-triggered" (WS3 priority 3). `--disk-offload-threshold`
+    /// was previously documented as "parsed but not acted upon"; this test
+    /// exercises the real call site (`run_eviction_tick` publishes
+    /// `published_shard_memory` earlier in the same tick, then this function
+    /// reads it back) end to end at the unit level, without spinning up a
+    /// real server process.
+    #[test]
+    fn test_should_run_pressure_cascade_fires_at_threshold_not_maxmemory() {
+        use clap::Parser;
+        let dbs = vec![vec![Database::new()]];
+        let (shared, _inits) = ShardDatabases::new(dbs);
+
+        // 1 shard, 1 MiB maxmemory => per-shard budget is the whole 1 MiB.
+        // disk_offload_threshold defaults to 0.85 (see config.rs).
+        let mut rt = crate::config::RuntimeConfig::default();
+        rt.maxmemory = 1024 * 1024;
+        rt.num_shards = 1;
+        let runtime_config = Arc::new(parking_lot::RwLock::new(rt));
+        let server_config = Arc::new(crate::config::ServerConfig::parse_from::<[&str; 0], &str>(
+            [],
+        ));
+        assert!((server_config.disk_offload_threshold - 0.85).abs() < f64::EPSILON);
+
+        // Below the 85% threshold (e.g. 50%): must NOT trigger the cascade.
+        shared.publish_memory(0, (1024 * 1024) / 2);
+        assert!(
+            !should_run_pressure_cascade(&runtime_config, &server_config, &shared, 0),
+            "50% used_memory must stay below the 85% disk-offload-threshold"
+        );
+
+        // Cross the threshold (e.g. 90%), still well short of maxmemory
+        // itself: this is the "proactive, not edge-triggered" case -- the
+        // whole point of WS3 priority 3.
+        shared.publish_memory(0, (1024 * 1024 * 90) / 100);
+        assert!(
+            should_run_pressure_cascade(&runtime_config, &server_config, &shared, 0),
+            "90% used_memory must cross the 85% disk-offload-threshold and \
+             trigger the pressure cascade well before maxmemory is reached"
+        );
+
+        // maxmemory == 0 (unset) must never trigger, regardless of usage.
+        {
+            let mut rt2 = crate::config::RuntimeConfig::default();
+            rt2.maxmemory = 0;
+            rt2.num_shards = 1;
+            let runtime_config2 = Arc::new(parking_lot::RwLock::new(rt2));
+            shared.publish_memory(0, usize::MAX / 2);
+            assert!(
+                !should_run_pressure_cascade(&runtime_config2, &server_config, &shared, 0),
+                "no memory limit configured => no pressure possible"
+            );
+        }
     }
 }

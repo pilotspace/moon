@@ -18,8 +18,10 @@ use crate::storage::tiered::SegmentHandle;
 use crate::vector::hnsw::graph::HnswGraph;
 use crate::vector::hnsw::search::{SearchScratch, hnsw_search_filtered};
 use crate::vector::persistence::warm_segment::{
-    VEC_CODES_SUB_HEADER_SIZE, VEC_GRAPH_SUB_HEADER_SIZE, VEC_MVCC_SUB_HEADER_SIZE,
+    VEC_CODES_SUB_HEADER_SIZE, VEC_FULL_SUB_HEADER_SIZE, VEC_GRAPH_SUB_HEADER_SIZE,
+    VEC_MVCC_SUB_HEADER_SIZE,
 };
+use crate::vector::segment::raw_f16_store::RawF16Store;
 use crate::vector::turbo_quant::collection::CollectionMetadata;
 use crate::vector::types::{SearchResult, VectorId};
 
@@ -46,6 +48,11 @@ pub struct WarmSearchSegment {
     /// Global ID offset for result remapping (MVCC headers from mvcc.mpf).
     /// Maps BFS position -> global vector ID.
     global_ids: Vec<u32>,
+    /// Original key hash per BFS position (MVCC headers from mvcc.mpf) --
+    /// propagated onto `SearchResult.key_hash` so the FT.SEARCH response
+    /// layer's `key_hash_to_key` lookup resolves the real Redis key instead
+    /// of falling back to a synthetic `vec:<id>` (see `parse_mvcc_ids`).
+    key_hashes: Vec<u64>,
     /// Segment handle prevents directory deletion while this struct is alive.
     _handle: SegmentHandle,
     /// Timestamp when this warm segment was created (for cold tier aging).
@@ -55,6 +62,14 @@ pub struct WarmSearchSegment {
     /// LRU ordering without requiring a mutable reference to the budget.
     /// Relaxed ordering is sufficient: approximate recency is all we need.
     last_access_micros: AtomicU64,
+    /// Exact-rerank sidecar (HQ-1 parity, WS3): f16 copy of each original
+    /// vector, BFS-ordered, `dimension` halves per entry, extracted from
+    /// `vectors.mpf` if the HOT->WARM transition wrote one (see
+    /// `VectorIndex::try_warm_transitions`). `None` for segments transitioned
+    /// before this sidecar was threaded through, or reloaded from a directory
+    /// that predates it — search then silently falls back to the quantized
+    /// TQ-ADC beam distance, exactly like a pre-sidecar `ImmutableSegment`.
+    raw_f16: Option<RawF16Store>,
 }
 
 /// Extract contiguous data bytes from a mmap'd .mpf file, skipping sub-headers.
@@ -112,29 +127,48 @@ fn extract_payloads(mmap: &memmap2::Mmap, page_size: usize, sub_hdr_size: usize)
     result
 }
 
-/// Parse MVCC entries from mvcc.mpf payload bytes to extract global IDs.
+/// Parse MVCC entries from mvcc.mpf payload bytes to extract global IDs and
+/// key hashes.
 ///
-/// Each MVCC entry is 24 bytes: internal_id(4) + global_id(4) + insert_lsn(8)
-/// + delete_lsn(4) + undo_ptr(4). We only need the global_id for remapping.
-fn parse_global_ids(mvcc_payload: &[u8]) -> Vec<u32> {
-    const ENTRY_SIZE: usize = 24;
+/// Each MVCC entry is 32 bytes: internal_id(u32 LE) + global_id(u32 LE) +
+/// key_hash(u64 LE) + insert_lsn(u64 LE) + delete_lsn(u64 LE) — this MUST
+/// match `ImmutableSegment::mvcc_raw_bytes`'s layout exactly, since that is
+/// the writer for the bytes this function reads back from `mvcc.mpf`
+/// (`VectorIndex::try_warm_transitions`). A prior version of this function
+/// assumed a 24-byte entry with no `key_hash` field at all (stale relative to
+/// `mvcc_raw_bytes`, which had grown a `key_hash` field) — every entry past
+/// the first was misaligned, and `key_hash` was silently dropped entirely,
+/// so `SearchResult.key_hash` stayed `0` for every WARM-tier hit and
+/// `key_hash_to_key` lookups downstream fell back to a synthetic `vec:<id>`
+/// key instead of the real one (caught by
+/// `tests/vector_idle_unload.rs`'s post-transition FT.SEARCH assertion).
+fn parse_mvcc_ids(mvcc_payload: &[u8]) -> (Vec<u32>, Vec<u64>) {
+    const ENTRY_SIZE: usize = 32;
     let count = mvcc_payload.len() / ENTRY_SIZE;
-    let mut ids = Vec::with_capacity(count);
+    let mut global_ids = Vec::with_capacity(count);
+    let mut key_hashes = Vec::with_capacity(count);
 
     for i in 0..count {
-        let offset = i * ENTRY_SIZE + 4; // skip internal_id (4 bytes)
-        if offset + 4 <= mvcc_payload.len() {
-            let global_id = u32::from_le_bytes([
-                mvcc_payload[offset],
-                mvcc_payload[offset + 1],
-                mvcc_payload[offset + 2],
-                mvcc_payload[offset + 3],
-            ]);
-            ids.push(global_id);
+        let base = i * ENTRY_SIZE;
+        let global_off = base + 4; // skip internal_id (4 bytes)
+        let key_hash_off = global_off + 4; // skip global_id (4 bytes)
+        if key_hash_off + 8 <= mvcc_payload.len() {
+            let global_id = u32::from_le_bytes(
+                mvcc_payload[global_off..global_off + 4]
+                    .try_into()
+                    .expect("4-byte slice"),
+            );
+            let key_hash = u64::from_le_bytes(
+                mvcc_payload[key_hash_off..key_hash_off + 8]
+                    .try_into()
+                    .expect("8-byte slice"),
+            );
+            global_ids.push(global_id);
+            key_hashes.push(key_hash);
         }
     }
 
-    ids
+    (global_ids, key_hashes)
 }
 
 impl WarmSearchSegment {
@@ -202,6 +236,39 @@ impl WarmSearchSegment {
         let graph_payload = extract_payloads(&graph_mmap, PAGE_4K, VEC_GRAPH_SUB_HEADER_SIZE);
         let mvcc_payload = extract_payloads(&mvcc_mmap, PAGE_4K, VEC_MVCC_SUB_HEADER_SIZE);
 
+        // Optional exact-rerank sidecar (WS3): vectors.mpf only exists when
+        // the HOT->WARM transition had a raw_f16 buffer to carry over. A
+        // missing file is the expected, silent "no sidecar" case (matches
+        // ImmutableSegment's own `RawF16Store::map_file` contract) — never
+        // fails segment load, only degrades to ADC-only distances.
+        let raw_f16 = match map_sealed_file(&segment_dir.join("vectors.mpf")) {
+            Ok(vectors_mmap) => {
+                let payload = extract_payloads(&vectors_mmap, PAGE_64K, VEC_FULL_SUB_HEADER_SIZE);
+                if payload.len() % 2 != 0 {
+                    tracing::warn!(
+                        "vectors.mpf for warm segment {segment_id} has an odd byte length \
+                         ({} bytes) — discarding malformed sidecar, falling back to ADC",
+                        payload.len()
+                    );
+                    None
+                } else {
+                    let halves: Vec<u16> = payload
+                        .chunks_exact(2)
+                        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                        .collect();
+                    Some(RawF16Store::Owned(halves))
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => {
+                tracing::warn!(
+                    "failed to open vectors.mpf for warm segment {segment_id}: {e} \
+                     (continuing without exact-rerank sidecar)"
+                );
+                None
+            }
+        };
+
         // Auto-detect compressed vs uncompressed graph format.
         // Compressed format (Phase 84+) has version_tag=0x01 at byte offset 15.
         // Uncompressed format has layer0_len (u32 LE) starting at offset 15.
@@ -221,7 +288,7 @@ impl WarmSearchSegment {
         })?;
 
         let total_count = graph.num_nodes();
-        let global_ids = parse_global_ids(&mvcc_payload);
+        let (global_ids, key_hashes) = parse_mvcc_ids(&mvcc_payload);
 
         Ok(Self {
             segment_id,
@@ -230,8 +297,10 @@ impl WarmSearchSegment {
             collection_meta,
             total_count,
             global_ids,
+            key_hashes,
             _handle: handle,
             created_at: std::time::Instant::now(),
+            raw_f16,
             last_access_micros: AtomicU64::new(
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -286,9 +355,74 @@ impl WarmSearchSegment {
             0,
         );
 
+        // WS3 / HQ-1 parity: exact rerank from the f16 sidecar when the
+        // HOT->WARM transition carried one over. No-op (falls back to ADC)
+        // when `raw_f16` is `None` — same contract as `ImmutableSegment`.
+        self.rerank_exact(&mut candidates, query, k);
+
         candidates.truncate(k);
         self.remap_to_global_ids(&mut candidates);
         candidates
+    }
+
+    /// Exact rerank (HQ-1 parity): re-score the top `4*k` ADC-ranked
+    /// candidates with (near-)exact distances decoded from the f16 sidecar,
+    /// then re-sort ascending. No-op when this segment has no sidecar.
+    ///
+    /// Mirrors `ImmutableSegment::rerank_exact` exactly (same distance
+    /// conventions: true squared L2 for `DistanceMetric::L2`, `2 - 2*cos`
+    /// for the unit-sphere metrics) so cross-segment merge stays consistent
+    /// whether a candidate came from a HOT or WARM segment.
+    fn rerank_exact(&self, candidates: &mut SmallVec<[SearchResult; 32]>, query: &[f32], k: usize) {
+        let Some(store) = self.raw_f16.as_ref() else {
+            return;
+        };
+        let raw = store.as_slice();
+        if candidates.is_empty() || raw.is_empty() {
+            return;
+        }
+        let rerank_n = (4 * k.max(1)).min(candidates.len());
+        let dim = self.collection_meta.dimension as usize;
+        let is_l2 = self.collection_meta.metric == crate::vector::types::DistanceMetric::L2;
+
+        let mut q_unit: Vec<f32> = Vec::new();
+        let q_ref: &[f32] = if is_l2 {
+            query
+        } else {
+            let norm: f32 = query.iter().map(|x| x * x).sum::<f32>().sqrt();
+            if norm > 0.0 {
+                let inv = 1.0 / norm;
+                q_unit.extend(query.iter().map(|x| x * inv));
+            } else {
+                q_unit.extend_from_slice(query);
+            }
+            &q_unit
+        };
+
+        let dist_table = crate::vector::distance::table();
+        for result in candidates[..rerank_n].iter_mut() {
+            let bfs_pos = self.graph.to_bfs(result.id.0) as usize;
+            let start = bfs_pos * dim;
+            let Some(vec_f16) = raw.get(start..start + dim) else {
+                continue; // Out-of-range id: keep the ADC estimate.
+            };
+            if is_l2 {
+                result.distance = (dist_table.f16_l2)(q_ref, vec_f16);
+            } else {
+                let (dot, xsq) = (dist_table.f16_dot_normsq)(q_ref, vec_f16);
+                if xsq > 0.0 {
+                    let cos = (dot / xsq.sqrt()).clamp(-1.0, 1.0);
+                    result.distance = 2.0 - 2.0 * cos;
+                }
+            }
+        }
+        candidates.sort_unstable();
+    }
+
+    /// Read-only access to the exact-rerank f16 sidecar, if present.
+    #[inline]
+    pub fn raw_f16(&self) -> Option<&[u16]> {
+        self.raw_f16.as_ref().map(RawF16Store::as_slice)
     }
 
     /// Total vector count in this warm segment.
@@ -331,13 +465,16 @@ impl WarmSearchSegment {
 
     /// Estimated resident bytes for this warm segment.
     ///
-    /// Accounts for the owned `codes_data` buffer, the HNSW graph heap, and
-    /// the `global_ids` vec. This is the figure tracked by [`crate::vector::persistence::mmap_budget::MmapBudget`].
+    /// Accounts for the owned `codes_data` buffer, the HNSW graph heap, the
+    /// `global_ids` vec, and (WS3) the exact-rerank sidecar if present. This
+    /// is the figure tracked by [`crate::vector::persistence::mmap_budget::MmapBudget`].
     #[inline]
     pub fn resident_bytes(&self) -> usize {
         self.codes_data.len()
             + self.graph.resident_bytes()
             + self.global_ids.len() * std::mem::size_of::<u32>()
+            + self.key_hashes.len() * std::mem::size_of::<u64>()
+            + self.raw_f16.as_ref().map_or(0, RawF16Store::resident_bytes)
     }
 
     /// Read-only access to the raw TQ codes (for PQ training during cold transition).
@@ -367,15 +504,20 @@ impl WarmSearchSegment {
         self._handle.mark_tombstoned();
     }
 
-    /// Remap per-segment internal IDs to globally unique IDs.
+    /// Remap per-segment internal IDs to globally unique IDs, and propagate
+    /// each result's original key hash (see the `key_hashes` field doc).
     ///
     /// HNSW search returns VectorId(original_id). We convert through BFS mapping
     /// to global IDs stored in the MVCC data, same pattern as ImmutableSegment.
     fn remap_to_global_ids(&self, candidates: &mut SmallVec<[SearchResult; 32]>) {
         for c in candidates.iter_mut() {
             let bfs_pos = self.graph.to_bfs(c.id.0);
-            if (bfs_pos as usize) < self.global_ids.len() {
-                c.id = VectorId(self.global_ids[bfs_pos as usize]);
+            let bfs_pos = bfs_pos as usize;
+            if bfs_pos < self.global_ids.len() {
+                c.id = VectorId(self.global_ids[bfs_pos]);
+            }
+            if bfs_pos < self.key_hashes.len() {
+                c.key_hash = self.key_hashes[bfs_pos];
             }
         }
     }
@@ -441,6 +583,72 @@ mod tests {
 
         assert_eq!(warm.total_count(), 0);
         assert_eq!(warm.segment_id(), 1);
+        assert!(
+            warm.raw_f16().is_none(),
+            "no vectors.mpf written -- sidecar must be absent, not an error"
+        );
+    }
+
+    /// WS3: a `vectors.mpf` sidecar written by the HOT->WARM transition
+    /// (`crate::storage::tiered::warm_tier::transition_to_warm`) must survive
+    /// the round trip through `WarmSearchSegment::from_files` byte-for-byte
+    /// -- this is the exact-rerank recall guarantee the idle-unload path
+    /// depends on (see `VectorIndex::try_warm_transitions_idle`).
+    #[test]
+    fn test_warm_search_segment_loads_vectors_mpf_sidecar() {
+        use crate::vector::persistence::warm_segment::write_vectors_mpf;
+        use crate::vector::segment::raw_f16_store::RawF16Store;
+
+        distance::init();
+        let dim = 8usize;
+        let collection = Arc::new(CollectionMetadata::new(
+            1,
+            dim as u32,
+            DistanceMetric::L2,
+            QuantizationConfig::TurboQuant4,
+            42,
+        ));
+
+        let empty_graph = HnswGraph::new(
+            0,
+            16,
+            32,
+            0,
+            0,
+            crate::vector::aligned_buffer::AlignedBuffer::new(0),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            68,
+        );
+        let graph_bytes = empty_graph.to_bytes();
+
+        // Two BFS-ordered "vectors" of `dim` f16 halves each (values chosen
+        // to exercise the full u16 byte range, catching any endianness bug).
+        let halves: Vec<u16> = (0..dim as u16 * 2).map(|i| i.wrapping_mul(4001)).collect();
+        let vectors_bytes = RawF16Store::le_bytes(&halves);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let seg_dir = tmp.path().join("segment-7");
+        write_test_mpf_segment(&seg_dir, 7, &[], &graph_bytes, &[]);
+        write_vectors_mpf(&seg_dir.join("vectors.mpf"), 7, &vectors_bytes).unwrap();
+
+        let handle = SegmentHandle::new(7, seg_dir.clone());
+        let warm = WarmSearchSegment::from_files(&seg_dir, 7, collection, handle, false).unwrap();
+
+        let loaded = warm
+            .raw_f16()
+            .expect("vectors.mpf was written -- sidecar must load");
+        assert_eq!(
+            loaded,
+            halves.as_slice(),
+            "sidecar halves must round-trip byte-for-byte through the .mpf page format"
+        );
+        assert!(
+            warm.resident_bytes() >= halves.len() * 2,
+            "sidecar bytes must count toward resident_bytes (MmapBudget accounting)"
+        );
     }
 
     #[test]
@@ -483,19 +691,22 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_global_ids() {
-        // Build 3 MVCC entries (24 bytes each)
-        let mut mvcc_data = Vec::with_capacity(72);
+    fn test_parse_mvcc_ids() {
+        // Build 3 MVCC entries matching `ImmutableSegment::mvcc_raw_bytes`'s
+        // actual 32-byte layout: internal_id(4) + global_id(4) + key_hash(8)
+        // + insert_lsn(8) + delete_lsn(8).
+        let mut mvcc_data = Vec::with_capacity(96);
         for i in 0u32..3 {
             mvcc_data.extend_from_slice(&i.to_le_bytes()); // internal_id
             mvcc_data.extend_from_slice(&(i + 100).to_le_bytes()); // global_id
+            mvcc_data.extend_from_slice(&(0xBEEF_0000_u64 + i as u64).to_le_bytes()); // key_hash
             mvcc_data.extend_from_slice(&0u64.to_le_bytes()); // insert_lsn
-            mvcc_data.extend_from_slice(&0u32.to_le_bytes()); // delete_lsn
-            mvcc_data.extend_from_slice(&0u32.to_le_bytes()); // undo_ptr
+            mvcc_data.extend_from_slice(&0u64.to_le_bytes()); // delete_lsn
         }
 
-        let ids = parse_global_ids(&mvcc_data);
+        let (ids, key_hashes) = parse_mvcc_ids(&mvcc_data);
         assert_eq!(ids, vec![100, 101, 102]);
+        assert_eq!(key_hashes, vec![0xBEEF_0000, 0xBEEF_0001, 0xBEEF_0002]);
     }
 
     #[test]

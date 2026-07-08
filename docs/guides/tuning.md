@@ -185,6 +185,91 @@ are fire-and-forget and never persisted, regardless of `--appendonly`.
 - Comparing per-key memory against Redis? Use `--shards 1` and a fresh server; RSS is a
   high-water mark, so measure by loading a known keyspace, not by deltas.
 
+## Tiered memory offload (KV + vector, `--disk-offload`)
+
+`--disk-offload` (default `enable`) lets cold data leave RAM instead of staying
+resident forever:
+
+- **KV**: cold values spill to `KvLeafPage` DataFiles under `--disk-offload-dir`
+  (default: same as `--dir`). `--disk-offload-threshold` (default `0.85`) is
+  the RAM-pressure trigger — once a shard's published KV memory crosses
+  `threshold × per-shard budget`, the eviction tick runs an ordered cascade
+  *before* falling back to plain LRU/LFU eviction: PageCache clock-sweep
+  eviction → force-demote the oldest HOT vector segments to WARM → proactive
+  spill via the background `SpillThread` → a `noeviction` warning if none of
+  that relieved pressure. This makes offload proactive instead of edge-
+  triggered — you don't have to hit `maxmemory` exactly to start shedding.
+- **Cold reads** (`GET` on a spilled key) go through `PageCache` when a page
+  is already cached (repeated cold reads that land on the same 4KB
+  `KvLeafPage` — several keys packed into one page, or a key churned
+  cold→hot→cold — are served without a second `pread`). A promoted key is
+  moved back into the hot DashTable on its first cold hit, same as before.
+- **Vector segments**: immutable (HOT) HNSW+TurboQuant segments transition to
+  a mmap-backed WARM tier — see the next section.
+- `--pagecache-size` (default: 25% of `--maxmemory`) sizes the buffer pool
+  backing both the KV cold-read cache and vector/graph page I/O; it starts
+  empty and grows lazily, so setting it high does not pre-commit RAM.
+
+## Vector/FTS/graph idle-unload
+
+Immutable vector segments (`ImmutableSegment`: full in-memory HNSW graph +
+TurboQuant codes + f16 exact-rerank sidecar) don't have to stay resident
+forever once a workload goes cold. Two independent triggers demote a HOT
+segment to the mmap-backed WARM tier (`WarmSearchSegment`) — whichever fires
+first:
+
+- `--segment-warm-after <secs>` (default `3600`) — age since the segment was
+  compacted, regardless of query traffic.
+- `--engine-offload-idle-secs <secs>` (default `3600`, `0` disables this
+  criterion) — seconds since the segment last served a search. This is the
+  one to lower if you want a segment that's *merely old* but still busy to
+  stay HOT, and only genuinely cold segments to unload: set
+  `--engine-offload-idle-secs` below `--segment-warm-after` so idleness is
+  the effective trigger.
+
+The WARM tier is not a lossy fallback: the f16 exact-rerank sidecar is
+carried over to the `.mpf` files at transition time, so recall is unaffected
+— a WARM segment reranks its beam candidates from the sidecar exactly like a
+HOT one. WARM segments beyond that are further bounded by
+`--vec-warm-mmap-budget` (default 2 GiB): least-recently-used `Arc`s are
+dropped entirely once the budget is exceeded, and transparently reloaded
+(mmap re-opened) on the next search that touches them — the on-disk segment
+directory is untouched by unload, only the in-process Arc is dropped.
+
+> **⚠ The HOT->WARM transition itself does not currently reduce RSS.**
+> `WarmSearchSegment::from_files` opens each `.mpf` file's mmap only for the
+> duration of loading and immediately copies every payload into owned
+> `Vec<u8>` / a parsed `HnswGraph` of essentially the same size as the HOT
+> segment it replaces — the two structures that dominate memory at scale (TQ
+> codes + the HNSW graph) are fully duplicated in heap memory, not lazily
+> paged in from disk. Measured on a real server (40,000 × 768-dim vectors,
+> SQ8): RSS was flat-to-slightly-higher (+1.1%, no decay over 16s) after an
+> idle-triggered transition, not lower. The idle/age *triggers* above are
+> real and correctly wired (`FT.INFO` counters, recall, and `num_docs` are
+> all verified correct across the transition), and the **subsequent**
+> `--vec-warm-mmap-budget` LRU eviction *does* free real memory (it drops the
+> `Arc` outright). But "demote to WARM" alone is not yet a memory-saving
+> operation — treat it as a step that only pays off once a segment later
+> falls out of the mmap budget. A true zero-copy WARM tier (HNSW traversal +
+> TQ-ADC distance kernels operating directly on borrowed mmap'd bytes instead
+> of owned buffers) is an open, larger follow-up.
+
+`FT.INFO <index>` reports tier residency (summed across shards):
+
+- `graph_segments` / `segments_with_exact_rerank` — HOT segments, and how
+  many still carry the sidecar (should equal `graph_segments`; less means
+  something dropped a sidecar somewhere upstream — see the vector search
+  guide's HQ-1 notes).
+- `warm_segments` / `warm_segments_with_exact_rerank` — same pair for the
+  WARM tier. A gap here after a fresh idle-unload is a regression: file an
+  issue, it means the exact-rerank sidecar failed to transfer.
+
+FTS (`TextStore`) and the graph engine do not yet have an equivalent
+idle-unload path — FTS has no aggregate memory-accounting API yet, and while
+the graph engine's on-disk segment (`MmapCsrSegment`) is already mmap-backed,
+it has no idle/LRU-eviction-driven unload comparable to vector's
+`MmapBudget`. Both are natural follow-ups but need their own design pass.
+
 ## Platform notes
 
 - **Linux** is the production target. The default `--io-driver auto` picks io_uring;

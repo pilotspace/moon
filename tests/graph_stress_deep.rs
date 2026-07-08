@@ -55,6 +55,7 @@ async fn start_server() -> (u16, CancellationToken) {
         disk_offload_dir: None,
         disk_offload_threshold: 0.85,
         segment_warm_after: 3600,
+        engine_offload_idle_secs: 3600,
         pagecache_size: None,
         checkpoint_timeout: 300,
         checkpoint_completion: 0.9,

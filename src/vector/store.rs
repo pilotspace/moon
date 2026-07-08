@@ -1164,12 +1164,19 @@ impl VectorIndex {
         true
     }
 
-    /// Check each immutable segment's age. If older than `warm_after_secs`,
-    /// transition it to warm tier (mmap-backed on disk).
+    /// Check each immutable segment's age AND idle time. If older than
+    /// `warm_after_secs` OR (when `idle_after_secs > 0`) idle for at least
+    /// `idle_after_secs` since its last search, transition it to warm tier
+    /// (mmap-backed on disk). The idle criterion (WS3) is what lets a
+    /// segment that is still being queried heavily stay HOT past its age
+    /// threshold's original intent doesn't apply here — age and idleness are
+    /// independent triggers, whichever fires first demotes the segment.
     ///
     /// After transition, the segment is replaced by a WarmSearchSegment that
     /// reads TQ codes and HNSW graph from mmap'd .mpf files. The segment
-    /// remains searchable -- no data loss from the user's perspective.
+    /// remains searchable -- no data loss from the user's perspective. The
+    /// exact-rerank f16 sidecar (if the HOT segment had one) is carried over
+    /// too, so recall is unaffected by the transition.
     ///
     /// Returns the number of segments transitioned.
     pub fn try_warm_transitions(
@@ -1180,10 +1187,29 @@ impl VectorIndex {
         next_file_id: &mut u64,
         wal: &mut Option<crate::persistence::wal_v3::segment::WalWriterV3>,
     ) -> usize {
+        self.try_warm_transitions_idle(shard_dir, manifest, warm_after_secs, 0, next_file_id, wal)
+    }
+
+    /// Same as [`Self::try_warm_transitions`] but also accepts an idle-time
+    /// threshold (WS3, `--engine-offload-idle-secs`). `idle_after_secs == 0`
+    /// disables the idle criterion, matching the pre-WS3 age-only behavior
+    /// exactly (kept as a separate method so the widely-used age-only
+    /// signature above and its many test call sites are untouched).
+    pub fn try_warm_transitions_idle(
+        &self,
+        shard_dir: &std::path::Path,
+        manifest: &mut crate::persistence::manifest::ShardManifest,
+        warm_after_secs: u64,
+        idle_after_secs: u64,
+        next_file_id: &mut u64,
+        wal: &mut Option<crate::persistence::wal_v3::segment::WalWriterV3>,
+    ) -> usize {
         let snapshot = self.segments.load();
         let mut to_warm: Vec<usize> = Vec::new();
         for (i, imm) in snapshot.immutable.iter().enumerate() {
-            if imm.age_secs() >= warm_after_secs {
+            let age_eligible = imm.age_secs() >= warm_after_secs;
+            let idle_eligible = idle_after_secs > 0 && imm.idle_secs() >= idle_after_secs;
+            if age_eligible || idle_eligible {
                 to_warm.push(i);
             }
         }
@@ -1204,6 +1230,15 @@ impl VectorIndex {
             let graph_bytes = imm.graph().to_bytes_compressed();
             let codes_data = imm.vectors_tq().as_slice();
             let mvcc_data = imm.mvcc_raw_bytes();
+            // WS3 / HQ-1 parity: carry the exact-rerank f16 sidecar over to
+            // the warm tier so recall does not silently degrade on
+            // HOT->WARM transition (`WarmSearchSegment` now knows how to
+            // rerank from it — see `warm_search.rs`). `None` when the
+            // segment never had one (pre-sidecar build) or has zero halves.
+            let raw_f16_bytes: Option<Vec<u8>> = imm
+                .raw_f16()
+                .filter(|halves| !halves.is_empty())
+                .map(crate::vector::segment::raw_f16_store::RawF16Store::le_bytes);
 
             match crate::storage::tiered::warm_tier::transition_to_warm(
                 shard_dir,
@@ -1211,7 +1246,7 @@ impl VectorIndex {
                 file_id,
                 codes_data,
                 &graph_bytes,
-                None, // vectors_data (f16 reranking -- not used yet)
+                raw_f16_bytes.as_deref(),
                 &mvcc_data,
                 manifest,
                 wal.as_mut(),
@@ -2189,14 +2224,36 @@ impl VectorStore {
         next_file_id: &mut u64,
         wal: &mut Option<crate::persistence::wal_v3::segment::WalWriterV3>,
     ) -> usize {
+        self.try_warm_transitions_all_idle(
+            shard_dir,
+            manifest,
+            warm_after_secs,
+            0,
+            next_file_id,
+            wal,
+        )
+    }
+
+    /// Same as [`Self::try_warm_transitions_all`] but also applies the WS3
+    /// idle-time criterion (see [`VectorIndex::try_warm_transitions_idle`]).
+    pub fn try_warm_transitions_all_idle(
+        &self,
+        shard_dir: &std::path::Path,
+        manifest: &mut crate::persistence::manifest::ShardManifest,
+        warm_after_secs: u64,
+        idle_after_secs: u64,
+        next_file_id: &mut u64,
+        wal: &mut Option<crate::persistence::wal_v3::segment::WalWriterV3>,
+    ) -> usize {
         let names: Vec<bytes::Bytes> = self.indexes.keys().cloned().collect();
         let mut total = 0;
         for name in names {
             if let Some(idx) = self.indexes.get(&name) {
-                total += idx.try_warm_transitions(
+                total += idx.try_warm_transitions_idle(
                     shard_dir,
                     manifest,
                     warm_after_secs,
+                    idle_after_secs,
                     next_file_id,
                     wal,
                 );

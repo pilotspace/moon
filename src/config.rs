@@ -343,14 +343,34 @@ pub struct ServerConfig {
     pub disk_offload_dir: Option<PathBuf>,
 
     /// RAM pressure threshold to trigger disk offload (0.0-1.0).
-    /// NOTE: Consumed by the memory pressure cascade (deferred to a future phase).
-    /// Currently parsed and stored but not acted upon at runtime.
+    /// Acted upon every 100ms eviction tick (`persistence_tick::run_eviction_tick`):
+    /// once a shard's published KV memory crosses `threshold * per-shard-budget`,
+    /// `handle_memory_pressure` runs the ordered cascade (PageCache clock-sweep
+    /// eviction -> force HOT->WARM segment demotion -> proactive KV spill via the
+    /// background `SpillThread` -> NoEviction warning) instead of waiting for the
+    /// plain LRU/LFU eviction edge.
     #[arg(long = "disk-offload-threshold", default_value_t = 0.85)]
     pub disk_offload_threshold: f64,
 
-    /// Seconds before sealed segments transition to warm tier
+    /// Seconds before sealed segments transition to warm tier (age-based).
+    /// A segment also qualifies once it hits `--engine-offload-idle-secs` of
+    /// no search traffic, whichever threshold is reached first — see that
+    /// flag's doc comment.
     #[arg(long = "segment-warm-after", default_value_t = 3600)]
     pub segment_warm_after: u64,
+
+    /// Seconds of no FT.SEARCH traffic before an immutable (HOT) vector
+    /// segment becomes eligible for HOT->WARM demotion, regardless of its
+    /// age. `0` disables this idle criterion — only `--segment-warm-after`
+    /// (age since compaction) then applies, matching pre-existing behavior.
+    /// Complements `--segment-warm-after`: a segment demotes as soon as
+    /// EITHER threshold is met, so a segment that is old but still being
+    /// queried heavily is not unloaded just because `--segment-warm-after`
+    /// disagrees with treating hot data as cold — set this lower than
+    /// `--segment-warm-after` to make idleness the effective trigger.
+    /// Default 3600s (1 hour) is conservative; `0` = disabled.
+    #[arg(long = "engine-offload-idle-secs", default_value_t = 3600)]
+    pub engine_offload_idle_secs: u64,
 
     // ── MoonStore v2: PageCache ─────────────────────────────────────
     /// PageCache memory budget (e.g., "256mb", "1gb"). Default: 25% of maxmemory.

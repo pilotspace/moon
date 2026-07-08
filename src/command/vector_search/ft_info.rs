@@ -38,11 +38,19 @@ pub fn ft_info(
         }
     };
 
-    // Count default field docs across mutable + immutable segments.
+    // Count default field docs across mutable + immutable + WARM segments.
+    // WARM (WS3 idle-unload / age-based) segments must contribute too --
+    // otherwise num_docs silently drops to 0 for an index whose only
+    // segment demoted to the mmap-backed tier, even though it is still
+    // fully searchable (see FT.INFO doc comment above re: summing across
+    // segments).
     let snap = idx.segments.load();
     let mut num_docs = snap.mutable.len();
     for imm in snap.immutable.iter() {
         num_docs += imm.live_count() as usize;
+    }
+    for warm in snap.warm.iter() {
+        num_docs += warm.total_count() as usize;
     }
     // HQ-1 observability (persistence-review R5): exact-rerank coverage.
     // A segment without the f16 sidecar silently answers with quantized ADC
@@ -54,6 +62,14 @@ pub fn ft_info(
         .iter()
         .filter(|imm| imm.raw_f16().is_some())
         .count();
+    // WS3 idle-unload observability: HOT (graph_segments, above) vs WARM
+    // (mmap-backed, unloaded from the full in-memory HNSW+TQ structures once
+    // idle/aged past the configured thresholds). `warm_segments_with_exact_rerank`
+    // mirrors `segments_with_exact_rerank`'s "coverage < total ⇒ some segments
+    // answer ADC-only" signal for the warm tier.
+    let warm_segments = snap.warm.len();
+    let warm_segments_with_exact_rerank =
+        snap.warm.iter().filter(|w| w.raw_f16().is_some()).count();
 
     // Use itoa for numeric formatting -- no format!() on hot path.
     let ef_rt_bytes: Bytes = if idx.meta.hnsw_ef_runtime > 0 {
@@ -102,6 +118,10 @@ pub fn ft_info(
         Frame::Integer(graph_segments as i64),
         Frame::BulkString(Bytes::from_static(b"segments_with_exact_rerank")),
         Frame::Integer(segments_with_exact_rerank as i64),
+        Frame::BulkString(Bytes::from_static(b"warm_segments")),
+        Frame::Integer(warm_segments as i64),
+        Frame::BulkString(Bytes::from_static(b"warm_segments_with_exact_rerank")),
+        Frame::Integer(warm_segments_with_exact_rerank as i64),
     ];
 
     // Per-field stats: vector_fields array
@@ -115,6 +135,9 @@ pub fn ft_info(
             for imm in s.immutable.iter() {
                 docs += imm.live_count() as usize;
             }
+            for warm in s.warm.iter() {
+                docs += warm.total_count() as usize;
+            }
             (docs, s.mutable.len(), imm_count)
         } else if let Some(fs) = idx.field_segments.get(&field_meta.field_name) {
             let s = fs.segments.load();
@@ -122,6 +145,9 @@ pub fn ft_info(
             let imm_count = s.immutable.len();
             for imm in s.immutable.iter() {
                 docs += imm.live_count() as usize;
+            }
+            for warm in s.warm.iter() {
+                docs += warm.total_count() as usize;
             }
             (docs, s.mutable.len(), imm_count)
         } else {
@@ -232,6 +258,8 @@ pub fn merge_ft_info_responses(local: Frame, remotes: &[Frame]) -> Frame {
         b"text_version_token",
         b"graph_segments",
         b"segments_with_exact_rerank",
+        b"warm_segments",
+        b"warm_segments_with_exact_rerank",
     ];
     const ADDITIVE_FIELD: &[&[u8]] = &[b"num_docs", b"mutable_vectors", b"immutable_segments"];
 

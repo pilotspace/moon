@@ -114,6 +114,18 @@ impl RawF16Store {
         }
     }
 
+    /// Encode a slice of f16 halves to little-endian bytes, ready to hand to
+    /// a page/sidecar writer (`raw_f16.bin`, or the warm tier's
+    /// `vectors.mpf` — WS3). Off the query hot path (compaction /
+    /// HOT->WARM transition tick only), so the allocation here is fine.
+    pub fn le_bytes(halves: &[u16]) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(halves.len() * 2);
+        for &h in halves {
+            buf.extend_from_slice(&h.to_le_bytes());
+        }
+        buf
+    }
+
     /// Zero-copy view of the sidecar as `&[u16]`.
     pub fn as_slice(&self) -> &[u16] {
         match self {
