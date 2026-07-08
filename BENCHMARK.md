@@ -980,10 +980,14 @@ reach >0.9 recall. turbovec gets no concurrency scaling (760 → 781).
 Qdrant ~620 s. Moon settle (merge to 1 segment/shard) took a further ~97 min — the
 merge-parallelism gap noted below.
 
-⚠ **Moon TQ4 on gist recorded recall 0.002–0.003 — a bug, not noise.** TQ4's
-norm²-scaled ADC assumes unit-sphere metrics; gist is unnormalized L2 and the estimator
-collapses. Fixed in this branch: `FT.CREATE` L2 indexes now **default to SQ8** (explicit
-TQ*+L2 warns); the table above is the SQ8 re-run.
+⚠ **Moon TQ4 on gist recorded recall 0.002–0.003 — a bug, not noise.** TQ's ADC ranked
+L2 by `sphere_dist·‖a‖²`, which is only rank-valid on the unit sphere; gist is
+unnormalized L2 and the estimator collapses. **Fixed in this branch** (`14a07025`): all
+TQ scoring paths reconstruct `‖a−q‖² = (‖a‖−‖q‖)² + ‖a‖‖q‖·d̂²`, and `FT.CREATE` L2
+indexes now **default to SQ8** (explicit TQ*+L2 warns). GCE re-verification with
+explicit TQ4 post-fix (same instance/harness, unsettled index so recall-only):
+ef=16 **0.784**, ef=64 **0.942**, ef=256 **0.986** — a ~350× recovery, within ~0.03 of
+SQ8 (4-bit direction precision at 960d). The main table above is the SQ8 run.
 
 #### Findings that changed Moon along the way
 
