@@ -420,7 +420,9 @@ fn restart_round_trip_preserves_db_binding() {
 /// `SCHEMA <field> TEXT` pattern used by `tests/hybrid_filter_multishard.rs`'s
 /// `ft_create_tag_idx` helper. Needed because finding 1 is specifically
 /// about the plain-text/BM25 scatter path (`scatter_text_search`), which a
-/// VECTOR-only schema never exercises.
+/// VECTOR-only schema never exercises. Gated on `text-index`: the CI tokio
+/// matrix builds without it and the server then rejects TEXT schemas.
+#[cfg(feature = "text-index")]
 fn ft_create_text(conn: &mut Connection, idx: &str, prefix: &str) -> redis::RedisResult<String> {
     redis::cmd("FT.CREATE")
         .arg(idx)
@@ -454,6 +456,7 @@ fn ft_search_text(
 /// must NOT see (let alone get real results from) a TEXT index created in
 /// db 0, once `--shards >= 2` forces the request through
 /// `scatter_text_search`'s remote-leg fan-out instead of the local fast path.
+#[cfg(feature = "text-index")]
 #[test]
 fn multishard_text_search_cross_db_invisible() {
     let Some(m) = spawn_moon(4, "ms-text") else {

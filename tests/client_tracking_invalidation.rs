@@ -30,14 +30,13 @@ fn moon_binary() -> Option<std::path::PathBuf> {
     if let Ok(p) = std::env::var("MOON_BIN") {
         return Some(std::path::PathBuf::from(p));
     }
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    for rel in ["target/release/moon", "target/debug/moon"] {
-        let p = root.join(rel);
-        if p.exists() {
-            return Some(p);
-        }
-    }
-    None
+    // CARGO_BIN_EXE_moon is the binary cargo built for THIS test invocation
+    // — guaranteed fresh and feature-matched. Never probe target/release
+    // directly: under a redirected CARGO_TARGET_DIR that path is a stale
+    // binary of unknown provenance (this exact fallback silently ran an
+    // ancient server and "failed" all 5 tests during the v0.6.0 release
+    // gate), and in a bare worktree it silently SKIPS the whole suite.
+    Some(std::path::PathBuf::from(env!("CARGO_BIN_EXE_moon")))
 }
 
 struct Moon {

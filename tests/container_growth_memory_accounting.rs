@@ -55,15 +55,17 @@ fn free_port() -> u16 {
     }
 }
 
-/// Fresh `--dir` under `/private/tmp` (never the shared `/Volumes/Games`
-/// checkout volume, which hovers near the 5% diskfull guard).
+/// Fresh `--dir` under the OS temp dir (never the shared `/Volumes/Games`
+/// checkout volume, which hovers near the 5% diskfull guard). Must be
+/// portable: a hardcoded `/private/tmp` is macOS-only and fails
+/// PermissionDenied on Linux CI runners.
 fn test_tmpdir() -> tempfile::TempDir {
-    let base = std::path::PathBuf::from("/private/tmp/moon-container-growth-tests");
+    let base = std::env::temp_dir().join("moon-container-growth-tests");
     std::fs::create_dir_all(&base).expect("create test tmp base dir");
     tempfile::Builder::new()
         .prefix("cgm-")
         .tempdir_in(&base)
-        .expect("tempdir_in /private/tmp/moon-container-growth-tests")
+        .expect("tempdir_in OS temp dir")
 }
 
 struct ServerGuard(Child);
