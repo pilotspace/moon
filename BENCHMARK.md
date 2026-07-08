@@ -1,6 +1,6 @@
 # moon Benchmark Report
 
-**Last Updated:** 2026-07-04 (**new §6.6: multi-shard multi-connection WIN — reply-convoy fix + slot-unified replies take s4 c8 P1 from 0.44–0.64× to 1.57–2.0× Redis and c64 to 2.5×, both arches**; supersedes §6.5's c≥8 rows. Prior 2026-07-03: **§2.10: p=1 single-op WIN on both arches via `--io-busy-poll-us` poll-mode park** — ARM c4a 1.19–1.21×, x86 c3 1.65–1.66× vs Redis, n=3 instances/arch; supersedes the "loses p=1" rows in §2.7–2.9 when busy-poll is on. **New §6.5: shards × busy-poll sweep** — busy-poll recovers +22–42% of the cross-shard hop but shards>1 still loses non-pipelined; `--shards 1 --io-busy-poll-us 40` is the p=1 config. Prior: 2026-06-16 4-feature concurrent-vs-competitor pass — §10.5 vector vs RediSearch, §11.4 graph vs FalkorDB, §12 Full-Text Search; §2.8 = v2-1/PR #189 `db61973` K=1024 re-measurement; v0.1.6 in §2.1–2.6; §2.7 on perf/shard-dispatch-hot-path)
+**Last Updated:** 2026-07-08 (**new §7.3: durability write-path campaign (PRs #238–#242)** — closes the AOF-on deficits vs Redis. `appendfsync always` P16 SET 0.12×→**0.91×** (per-command fsync → per-batch group commit + one coalesced write), `everysec` P1 SET 0.80×→**0.99× parity** (park-free writer poll kills a 150k/run futex-wake storm on the shard thread), `everysec` P16 SET **1.32× WIN**, and pub/sub fan-out delivery 438 msg/s (near-total drops) → **5.09M msg/s, zero drops, ~1.04× Redis**. All GCE c3-standard-8, Redis 7.0.15, 3 alternated reps, provenance-probed. Prior 2026-07-04 §6.6: multi-shard multi-connection WIN — reply-convoy fix + slot-unified replies take s4 c8 P1 from 0.44–0.64× to 1.57–2.0× Redis and c64 to 2.5×, both arches; supersedes §6.5's c≥8 rows. Prior 2026-07-03: **§2.10: p=1 single-op WIN on both arches via `--io-busy-poll-us` poll-mode park** — ARM c4a 1.19–1.21×, x86 c3 1.65–1.66× vs Redis, n=3 instances/arch; supersedes the "loses p=1" rows in §2.7–2.9 when busy-poll is on. **§6.5: shards × busy-poll sweep** — busy-poll recovers +22–42% of the cross-shard hop but shards>1 still loses non-pipelined; `--shards 1 --io-busy-poll-us 40` is the p=1 config. Prior: 2026-06-16 4-feature concurrent-vs-competitor pass — §10.5 vector vs RediSearch, §11.4 graph vs FalkorDB, §12 Full-Text Search; §2.8 = v2-1/PR #189 `db61973` K=1024 re-measurement; v0.1.6 in §2.1–2.6; §2.7 on perf/shard-dispatch-hot-path)
 **Platforms:** Linux (GCloud x86_64 + ARM64), macOS (Apple M4 Pro)
 **Redis:** 8.6.1 in §2.1–2.6; 7.0.15 in §2.7
 **moon:** v0.1.6 in §2.1–2.6; perf/shard-dispatch-hot-path HEAD (commit `6582fa9`) in §2.7. Monoio runtime (io_uring on Linux, kqueue on macOS), fat LTO, codegen-units=1, target-cpu=native
@@ -49,6 +49,10 @@ The SET absolute number can differ 3-4× between methodologies. Only strict-vs-s
 | Baseline RSS (empty) | **Identical (7.0 MB)** | 1-shard |
 | CPU efficiency at P=64 | **45x better** | 1.9% vs 43.9% CPU for similar RPS |
 | With AOF persistence | **2.75x Redis** | SET, P=64, per-shard WAL |
+| AOF everysec SET P16 | **1.32x Redis** | group commit + coalesced write, §7.3 |
+| AOF everysec SET P1 | **0.99x (parity)** | park-free writer poll, §7.3 (was 0.80x) |
+| AOF always SET P16 | **0.91x Redis** | per-batch group commit, §7.3 (was 0.12x) |
+| Pub/sub fan-out delivery | **5.09M msg/s, 1.04x Redis, 0 drops** | 8 subs, coalesced writes, §7.3 (was 438 msg/s) |
 | Multi-shard (8s P=16) | **1.84-1.99x Redis** | GET / SET |
 | p50 latency (8-shard) | **8-10x lower** | 0.031ms vs 0.26ms |
 | Data correctness | **2613+ tests pass** | All types, 1/4/12 shards |
@@ -622,6 +626,46 @@ Readings:
 | Fsync | Dedicated bio thread | Separate timer, every 1 second |
 | Under P=64 | Global AOF becomes serialization point | Per-shard WAL scales linearly |
 
+### 7.3 2026-07-08 Durability write-path campaign (PRs #238–#242)
+
+**Goal:** close every remaining Moon-vs-Redis deficit on the AOF-on write path so Moon is at parity-or-better under all durability policies, not just `--appendonly no`.
+
+**Setup:** GCE `c3-standard-8` (Sapphire Rapids, 8 vCPU, pd-ssd), Ubuntu 24.04, Redis 7.0.15, Moon `--shards 2` (its default multi-core posture on 8 vCPU) vs Redis stock single-threaded. `redis-benchmark -t set -c 8 -n 300000 -r 100000 -d 64 [-P 16]`. Fresh server + data dir per scenario, **3 alternated reps** (engine order flips each rep to cancel warm-up/thermal drift), each run **provenance-probed** (thread-name scan + `strace -c` confirming the code path under test). Numbers are 3-rep means.
+
+#### 7.3.1 Results — the four deficits, before → after
+
+| Policy / workload | Before campaign | After (this branch) | Redis | vs Redis after |
+|---|---:|---:|---:|:---:|
+| **`always` SET P16** | 5,680 | **39,621 → 40,084** | 43,898 | **0.91×** |
+| `always` SET P1 (control) | ~3,180 | 3,114 | 3,153 | parity (fsync-device-bound) |
+| **`everysec` SET P16** | 605,317 | **788,717** | 597,563 | **1.32× WIN** |
+| **`everysec` SET P1** | 116,619 (0.80×) | **134,158–135,280** | 135,888 | **0.99× parity** |
+| `nodur` SET P1 (control) | 135,795 | 135,319 | 132,185 | 1.02× (unchanged) |
+| **Pub/sub fan-out delivery** | 438 msg/s (drops ≈100%) | **5.09M msg/s (0 drops)** | 4.89M msg/s | **1.04× WIN** |
+
+`always` P16 moved in two steps: PR #239 (per-command awaited fsync → per-batch group commit) took it 0.12× → 0.85×; PR #242 (coalesced batch write) took it 0.85× → 0.91×.
+
+#### 7.3.2 What each fix changed
+
+| PR | Deficit | Root cause (measured) | Fix |
+|----|---------|----------------------|-----|
+| **#238** | `always` shard stalls | WAL v3 `fdatasync` ran on the shard event-loop thread — every fsync froze SPSC drain + conn I/O + CDC | Off-loop `WalSyncAgent` (per-shard `std::thread`, fd-dup requests, durable-LSN watermark); +18% RPS, p99/p999 −40–60% under `always` |
+| **#239** | `always` P16 **0.12×** | Handler awaited **one fsync ack per pipelined command**; a 16-deep pipeline paid 16 serialized fsync RTTs/conn while Redis fsyncs once per event-loop iter | Local writes join the per-batch group commit (fire-and-forget `send_append_group` + ONE `fsync_barrier` per batch); 0.12× → 0.85× (6.98×) |
+| **#240** | Pub/sub delivery **438 msg/s** | One `write(2)` per delivered message; under fan-out flood the 256-slot subscriber queue stayed full → near-total drops | Coalesce the queued burst (`try_recv` drain, 64 KB cap) into ONE `write_all`; 438 → 5.09M msg/s, zero drops |
+| **#241** | `everysec` P1 **0.80×** | AOF writer parked in `flume::recv_timeout`, so **every producer `try_send` paid a futex WAKE on the shard thread** — `strace -c`: **149,718 futex calls (63% of shard-thread syscall time)** in an 8 s SET run vs 2 under `nodur` | Under `everysec`/`no` the writer polls park-free (`try_recv` + adaptive sleep, `wait/16` clamped 500 µs–50 ms) so producer sends stay pure userspace atomics; **149,718 → 96 futex calls**, +15% RPS → 0.99× parity. `always` keeps the parked recv (ack latency is client-visible RTT) |
+| **#242** | `always` P16 **0.85×** residual | Writer was **write-syscall-bound, not fsync-bound**: `strace -c` on `aof-writer-0` showed **127,812 `write(2)` calls / 1.25 s** vs 2,144 `fdatasync` / 0.20 s (one write per record on the raw unbuffered file; per-shard framed path used a header+body **pair**). Redis batches ~120 records/write via `aof_buf` | Coalesce each group-commit batch into ONE contiguous `write_all` before its single fsync (reusable buffer, 1 MB high-water cap); 0.85× → 0.91×, and `everysec` P16 (shares the write path) → 1.32× |
+
+**Durability invariant held throughout.** Every change preserves fsync-before-ack (H1): the AOF writer channel is ordered, so an acked zero-length `AppendSync` barrier proves every prior `Append` is on disk; a failed batch acks every waiter an error (never a silent `+OK`) and latches the torn stream. Re-verified after each change with `crash_matrix_per_shard_aof --ignored` (SIGKILL under `appendfsync always` recovers 100% of acked writes): **3/3 green**.
+
+#### 7.3.3 Reading the numbers
+
+- **`always` P1 is a hardware floor, not a Moon limit** — ~3.1–3.4k for *all three* engines. Each write is one fsync RTT to pd-ssd; the disk, not the server, sets the rate. Parity here is the best any correct implementation can do.
+- **`always` P16 residual 0.91×** — both engines are fsync-device-bound at pipeline depth; the last ~9% is the per-batch barrier ack round-trip, and two shards' fsyncs serialize at the device rather than parallelizing. Diminishing returns.
+- **`everysec` P16 1.32× WIN** — no per-batch fsync ceiling here, so the coalesced-write + park-free-poll savings surface directly as throughput.
+- **Base column caveat** — the `everysec`/`always` "before" figures come from the pre-campaign tip; the P1 `everysec` base (116,619) predates PR #241, which is why the after-figure jumps despite the write-path work.
+
+Full method notes and per-rep tables: `tmp/MOON-VS-REDIS-DURABILITY.md`, `tmp/WALV3-OFFLOOP-FSYNC.md`.
+
 ---
 
 ## 8. Production Workload Patterns
@@ -1007,6 +1051,46 @@ redis-server --port 6399 --save "" --appendonly yes --appendfsync everysec --dae
 
 # Benchmark writes
 redis-benchmark -p PORT -c 50 -n 200000 -t SET,INCR,LPUSH,HSET -P 16 -q
+```
+
+### Durability write-path A/B (§7.3)
+
+Same-instance, alternated-rep harness that produced the §7.3 matrix. Run inside a
+Linux VM (fsync numbers are meaningless on shared-core / non-pinned macOS).
+
+```bash
+# Fresh server + dir per scenario, 3 reps, engine order flips each rep.
+# For EACH (durability, workload) pair, compare Moon --shards 2 vs Redis stock:
+for dur in nodur:'--appendonly no' \
+           esec:'--appendonly yes --appendfsync everysec' \
+           always:'--appendonly yes --appendfsync always'; do
+  moon_args=${dur#*:}
+  MOON_DISK_FREE_MIN_PCT=0 ./target/release/moon --port 6399 --shards 2 --dir "$(mktemp -d)" $moon_args &
+  redis-server --port 6399 --dir "$(mktemp -d)" --save '' $moon_args &   # matching policy
+  # p1 (no pipeline) AND p16:
+  redis-benchmark -p 6399 -t set -c 8 -n 300000 -r 100000 -d 64        # p1
+  redis-benchmark -p 6399 -t set -c 8 -n 300000 -r 100000 -d 64 -P 16  # p16
+done
+
+# Provenance probe — confirm the code path is actually engaged:
+#   park-free writer (#241): strace -c the shard-N thread; futex calls should be
+#     ~10s (esec), NOT ~150k. (parked recv = the old path; a regression.)
+#   batch-coalesced write (#242): strace -c aof-writer-N under always -P 16;
+#     write(2) count should be << record count (one write per batch, not per record).
+sudo strace -c -p "$(ps -T -p <moon_pid> -o tid,comm | awk '/shard-0/{print $1}')"
+```
+
+### Pub/sub fan-out delivery A/B (§7.3, PR #240)
+
+```bash
+# N subscribers on one channel + one pipelined publisher; metric = messages
+# DELIVERED per second across all subscribers (wire-frame count on each socket).
+# Drops are allowed by the slow-subscriber policy, so delivered-throughput IS
+# the ceiling under test. Harness: scratchpad pubsub_delivery_bench.py.
+./target/release/moon --port 6399 --shards 2 --appendonly no &
+python3 pubsub_delivery_bench.py 6399 8 5   # 8 subs, 5s
+# Coalesced build delivers ~5M msg/s at ratio 1.000; a per-message-write build
+# drops ~100% under flood (subscriber queue cap = 256).
 ```
 
 ### GCloud Linux Benchmark

@@ -6,6 +6,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Docs — durability write-path benchmark results (PR #TBD)
+
+- `BENCHMARK.md` §7.3: new section recording the 2026-07-08 durability
+  write-path campaign (PRs #238–#242) — the vs-Redis matrix (`always` P16
+  0.12×→0.91×, `everysec` P16 1.32× win, `everysec` P1 0.80×→0.99× parity,
+  pub/sub fan-out 438→5.09M msg/s), per-PR root-cause table (strace
+  diagnostics), durability-invariant note, and A/B reproduction steps.
+  Executive summary + header updated.
+- `docs/production-guide.md`, `docs/benchmarks.md`, `docs/configuration.md`:
+  AOF `appendfsync` tuning guidance updated with the measured ratios and a
+  plain-language explanation of group commit / coalesced writes / park-free
+  writer poll (all automatic; durability unchanged).
+
 ### Fixed — Windows build: `accept_backoff` used unix-only `libc` errnos (PR #TBD)
 
 - `is_resource_exhaustion` (accept-loop backoff, PR #230) referenced

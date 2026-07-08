@@ -297,11 +297,35 @@ moon --appendonly yes --appendfsync everysec --dir /data
 
 | `appendfsync` | Durability | Performance Impact |
 |---|---|---|
-| `always` | RPO = 0 (zero data loss) | Highest latency; suitable for financial data |
-| `everysec` | RPO <= 1 second | Recommended default; negligible throughput impact |
+| `always` | RPO = 0 (zero data loss) | fsync-per-batch under pipelining; P1 is fsync-device-bound (parity with any engine), P16 ~0.91x Redis |
+| `everysec` | RPO <= 1 second | Recommended default; **P16 SET ~1.32x Redis**, P1 at parity |
 | `no` | OS flush window (minutes) | Cache-mode only; do not use for primary storage |
 
 Moon's per-shard WAL avoids the global serialization bottleneck that Redis's single AOF file creates. The AOF advantage over Redis **grows** with pipeline depth (2.75x at p=64).
+
+**Write-path internals (how the AOF writer keeps up).** These are automatic — no
+tuning knobs — but understanding them explains the durability/throughput tradeoff:
+
+- **Group commit.** Under `appendfsync always`, pipelined writes are enqueued
+  fire-and-forget and the whole batch is made durable by ONE `fsync_barrier` (not
+  one fsync per command). A 16-deep pipeline therefore pays ~1 fsync, not 16.
+  The fsync still runs strictly before the client's `+OK` (RPO = 0 is preserved);
+  a failed batch returns an error to every write in it, never a silent success.
+- **Coalesced batch write.** Each group-commit batch is written to the AOF with a
+  single contiguous `write_all`, not one `write(2)` per record — so the writer
+  thread is not syscall-bound at high pipeline depth (this is what makes
+  `everysec` P16 beat Redis rather than trail it).
+- **Park-free writer poll (`everysec`/`no`).** The AOF writer thread does not park
+  in a blocking channel receive; it polls. This matters because a parked receiver
+  forces every shard thread to issue a futex wake on each write — at non-pipelined
+  `everysec` load that was ~150k wakes/sec of pure overhead on the hot path.
+  Polling keeps producer enqueues as plain userspace atomics, restoring P1 parity
+  with Redis. Under `always` the writer still parks (the client is already blocked
+  on the fsync ack, so receive latency there is client-visible RTT anyway).
+
+None of these weaken durability: `always` remains RPO = 0, `everysec` remains
+RPO ≤ 1 s, validated by the SIGKILL crash-recovery matrix (100% of acked writes
+recovered). See `BENCHMARK.md` §7.3 for the measured before/after matrix.
 
 ### RDB snapshots
 
