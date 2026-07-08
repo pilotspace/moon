@@ -404,6 +404,23 @@ both ZINCRBY z:test 10 "delta"
 assert_both "ZINCRBY then ZSCORE" ZSCORE z:test delta
 
 # ===========================================================================
+# 9b. Command parity: BITFIELD_RO / SORT_RO / GEORADIUS_RO / GEORADIUSBYMEMBER_RO
+# ===========================================================================
+log "=== 9b. Read-only command variants (WS1 parity) ==="
+
+both BITFIELD bf:test SET u8 0 255
+assert_both "BITFIELD_RO GET matches BITFIELD" BITFIELD_RO bf:test GET u8 0
+assert_both "BITFIELD_RO rejects SET" BITFIELD_RO bf:test SET u8 0 1
+
+both RPUSH sort:test 3 1 2
+assert_both "SORT_RO matches SORT" SORT_RO sort:test
+assert_both "SORT_RO rejects STORE" SORT_RO sort:test STORE sort:dest
+
+both GEOADD geo:test 13.361389 38.115556 Palermo 15.087269 37.502669 Catania
+assert_both "GEORADIUS_RO matches GEORADIUS" GEORADIUS_RO geo:test 15 37 200 km ASC
+assert_both "GEORADIUSBYMEMBER_RO matches GEORADIUSBYMEMBER" GEORADIUSBYMEMBER_RO geo:test Palermo 200 km ASC
+
+# ===========================================================================
 # 10. Bulk data consistency (redis-benchmark load + random verify)
 # ===========================================================================
 log "=== 10. Bulk data consistency (1K deterministic keys) ==="
