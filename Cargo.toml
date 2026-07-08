@@ -229,6 +229,10 @@ name = "sq8_adc_bench"
 harness = false
 
 [[bench]]
+name = "fastscan_bench"
+harness = false
+
+[[bench]]
 name = "hnsw_bench"
 harness = false
 

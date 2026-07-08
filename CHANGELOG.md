@@ -6,6 +6,108 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — CLI/moon.conf defaults for vector + graph tuning knobs (PR #TBD)
+
+- **`--vector-ef-runtime` / `--vector-rerank-mult` / `--vector-exact-beam`**
+  set the server-wide starting values every NEW vector index is created with
+  (FT.CREATE), so recall-sensitive fleets configure once instead of issuing
+  FT.CONFIG per index. Per-index `FT.CONFIG SET` always overrides. Same
+  ranges as FT.CONFIG (ef 10-4096 or 0=auto, mult 1-64), validated loudly at
+  startup. All three work as `moon.conf` keys (`vector-exact-beam yes|no`).
+- **`--graph-result-cache-entries` / `--graph-result-cache-bytes`** size the
+  per-graph Cypher result cache (previously hardcoded 256 entries / 4 MiB).
+- Startup wiring is first-write-wins process state, installed by both the
+  binary entry and `run_embedded`; unit tests and library embedders that
+  never install defaults keep the exact pre-flag behavior.
+
+### Added — Recall knobs: FT.CONFIG RERANK_MULT + EXACT_BEAM (PR #TBD)
+
+- **`FT.CONFIG SET <idx> RERANK_MULT <n>`** (1-64, default 4) deepens the HQ-1
+  exact-rerank stage: the top `n·k` beam candidates are re-scored with true f16
+  sidecar distances before top-k truncation, recovering true neighbors the
+  quantized ADC ranking dropped below the default 4·k cut. Cost ~`n·k·dim` f16
+  decodes per segment.
+- **`FT.CONFIG SET <idx> EXACT_BEAM ON|OFF`** (default OFF) navigates the HNSW
+  beam itself with exact f16 distances instead of quantized ADC estimates —
+  beam candidate *selection* becomes exact, so recall is graph-limited
+  (Qdrant-parity at equal ef) rather than quantization-limited. QPS cost grows
+  with dimension. Segments without an exact-rerank sidecar (pre-HQ-1 disk
+  reloads) silently keep the quantized beam.
+- Both knobs are per-index, apply to the next FT.SEARCH (all search paths:
+  sync, yielding, worker-pool fan-out, FT.RECOMMEND, hybrid), broadcast to all
+  shards, and persist across restarts via a new v4 index-meta sidecar format
+  (v1-v3 sidecars load with defaults).
+
+### Added — Runtime-tunable EF_RUNTIME via FT.CONFIG (PR #TBD)
+
+- **`FT.CONFIG SET <idx> EF_RUNTIME <n>`** adjusts the HNSW search beam width at
+  runtime without rebuilding the index (RediSearch parity). Range matches
+  FT.CREATE (10-4096); `0` restores the auto heuristic. Applies to the next
+  FT.SEARCH immediately and persists via the index meta sidecar. `FT.CONFIG GET
+  EF_RUNTIME` added alongside.
+- **Fixed — FT.CONFIG SET was local-shard only under monoio**: at shards>1 the
+  setting silently applied to 1/N index partitions (AUTOCOMPACT,
+  COMPACTION_WEIGHT, MERGE_RECALL_TOLERANCE were equally affected). SET now
+  broadcasts to all shards like FT.CREATE; GET stays local.
+
+### Fixed — TQ ADC estimator is now metric-faithful on raw L2 (PR #TBD)
+
+- **TQ quantization ranked L2 queries by `sphere_dist·‖a‖²`** — the unit-sphere
+  distance between normalized directions scaled by the document norm. On
+  unnormalized L2 data this makes every small-norm vector look near regardless
+  of direction (gist-960: recall 0.002). All TQ scoring paths (HNSW beam +
+  budgeted variant, mutable brute-force + FastScan pre-filter bound, flat
+  scan, multibit brute-force, A2 decoded-L2) now reconstruct the true metric:
+  `‖a−q‖² = (‖a‖−‖q‖)² + ‖a‖·‖q‖·d̂²_sphere`. COSINE/IP scoring is unchanged.
+  Unit tests pin recall on varying-norm data at both the mutable-scan and
+  HNSW-beam levels (7+/10 and 6+/10 vs exact f32 ground truth; 4/10 and worse
+  before the fix). GCE re-verification on gist-960 with explicit TQ4:
+  recall@10 0.784/0.942/0.986 at ef 16/64/256 vs 0.002-0.003 pre-fix (~350x),
+  within ~0.03 of SQ8.
+
+### Changed — FT.CREATE L2 indexes default to SQ8 quantization (PR #TBD)
+
+- **`FT.CREATE ... DISTANCE_METRIC L2` without an explicit `QUANTIZATION` now
+  defaults to SQ8** instead of TQ4. TQ's norm-scaled ADC estimator assumes
+  unit-sphere metrics (COSINE/IP) and collapses on unnormalized L2 data —
+  recall 0.002 measured on gist-960-euclidean (1M × 960d). SQ8 is
+  metric-faithful on raw L2. COSINE/IP defaults are unchanged (TQ4). An
+  explicit `QUANTIZATION TQ*` + L2 is still honored but logs a warning.
+- Benchmarks: `BENCHMARK.md` §10.10 — ANN-benchmarks 4-way campaign (Moon vs
+  RediSearch vs Qdrant vs turbovec on glove-200-angular 1.18M / gist-960 1M /
+  glove-100K). Tuning guide gains bulk-load (`--max-unflushed-immutable-segments
+  0`), settle (`VACUUM VECTOR`), and runtime-`EF_RUNTIME` recipes.
+
+### Added — FastScan SIMD vector scan: NEON TBL kernel + live-path integration (PR #TBD)
+
+- **NEON TBL FastScan kernel** (`src/vector/distance/fastscan.rs`): register-resident
+  4-bit LUT accumulation via `vqtbl1q_u8` for aarch64 — the primary platform previously
+  fell back to the scalar kernel. 32 candidate distances per block at ~2 ns/candidate
+  (128d), 17-21× faster than the per-candidate scalar ADC path.
+- **AVX2 kernel overflow fix**: nibble-pair distances were added as u8 before widening,
+  silently wrapping for LUT pairs summing past 255 and corrupting rankings. All kernels
+  now widen to u16 before adding and accumulate with saturating adds (scalar/NEON/AVX2
+  bit-identical across the full u8 LUT range; parity tests no longer mask LUTs to 0x7F).
+- **Adaptive quantized LUT builder** (`build_quantized_lut`): FAISS-style per-coordinate
+  bias + global scale chosen so entries fit u8 AND the worst-case accumulated sum fits
+  u16 (no kernel saturation for in-range data), with f32 reconstruction (`acc/scale +
+  bias`). Replaces the legacy `precompute_lut`, which hardcoded the v1 1/sqrt(768)
+  `CENTROIDS` table (encode/search codebook asymmetry — the same recall bug class fixed
+  by codebook v2) and a fixed `LUT_SCALE` that could overflow both u8 entries and the
+  u16 accumulator.
+- **Mutable-segment FastScan pre-filter** (`src/vector/segment/mutable.rs`): the MVCC
+  brute-force scan now maintains a FAISS-interleaved shadow of the TQ4 codes (32-vector
+  blocks, +padded_dim/2 B/vector) and screens candidates with the SIMD kernel; only
+  candidates whose sound lower bound (`approx − 0.5·padded_dim/scale`) beats the current
+  heap worst get the exact f32 ADC rescore. Results are bit-identical to the plain scan
+  (the bound is a true lower bound; saturation only under-estimates). Measured: top-10
+  over 20K×128d 1.25 ms → 96 µs (~13×), 5K×768d 1.66 ms → 423 µs (3.9×) on Apple
+  Silicon. Engages above 64 entries (per-query LUT build costs ~2-8 µs); SQ8/A2
+  collections and TQ-prod scoring keep the existing paths.
+- New criterion bench `benches/fastscan_bench.rs` (block kernels, LUT build, end-to-end
+  mutable scan A/B); shadow-layout + FastScan-vs-plain equality tests (full scan,
+  chunked scan, MVCC visibility + bitmap-filter paths).
+
 ## [0.6.0] — 2026-07-08
 
 **Release highlights** (full detail in the sections below; "PR #TBD" entries
