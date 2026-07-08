@@ -6,6 +6,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — sharded MULTI/EXEC routes a single-owner-shard body to its owner (Phase B, PR #TBD)
+
+- **`src/shard/{dispatch,spsc_handler,coordinator}.rs`,
+  `src/server/conn/{handler_sharded,handler_monoio}/write.rs`**: with keys routed
+  per-key to their owning shard but MULTI/EXEC executing on the connection's
+  (random, SO_REUSEPORT) accept shard, a hash-tagged `{tag}` transaction only
+  worked from the ~1/N connections that happened to land on the owning shard —
+  Phase A rejected the rest with `CROSSSLOT`. Phase B adds a boxed
+  `ShardMessage::TxnExecute` (kept within the 64-byte cache-line cap like
+  `MqCommand`) and a `coordinator::execute_txn_on_owner` hop: when
+  `analyze_txn_locality` proves every key is owned by ONE shard that isn't the
+  accept shard, the whole body is routed there, executed atomically on the
+  owner's slice, and each write persisted to the OWNER's AOF/WAL via the same
+  `wal_append_and_fanout` path as normal cross-shard writes. PUBLISH fan-out is
+  deferred back to the originating connection (returned in the reply) so it keeps
+  the normal scatter path; under `appendfsync=always` the originator issues one
+  `fsync_barrier` to the owner before acking (H1-BARRIER parity), and owner-side
+  append backpressure surfaces `AOF_APPEND_LOST_ERR`. Genuinely multi-shard
+  bodies (`CrossShard`) stay rejected — a shared-nothing engine can't commit
+  across shards atomically. Red/green: `tests/sharded_multi_exec_routing.rs`
+  (hash-tagged txn succeeds from every connection + writes visible; routed writes
+  survive kill-9 + restart via the owner's AOF; multi-shard span still CROSSSLOT).
+  WATCH in sharded mode remains an unimplemented follow-up.
+
 ### Fixed — sharded MULTI/EXEC writes are now persisted (were lost on restart) (PR #TBD)
 
 - **`src/server/conn/{shared,handler_sharded/write,handler_monoio/write}.rs`**:
@@ -42,10 +66,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   connections; CROSSSLOT ⇒ nothing was written.* No effect at `--shards 1`.
   Red/green: `tests/sharded_multi_exec_locality.rs` (silent-divergence invariant,
   multi-shard span rejection, single-shard unaffected) + `analyze_txn_locality`
-  unit tests. Phase B (route a single-owner-shard body to its owner so
-  hash-tagged transactions work from any connection) is a follow-up. Note found
-  in passing (unrelated, out of scope): a *solo* GET sent mid-MULTI on the monoio
-  single-shard handler executes immediately instead of queueing.
+  unit tests. Phase B (above) now routes single-owner-shard bodies to their owner
+  instead of rejecting them, so only genuinely cross-shard bodies still get
+  CROSSSLOT. Note found in passing (unrelated, out of scope): a *solo* GET sent
+  mid-MULTI on the monoio single-shard handler executes immediately instead of
+  queueing.
 
 ### Docs — tuning guide: vector bulk load & compaction (PR #TBD)
 

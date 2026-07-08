@@ -5,9 +5,12 @@
 //! therefore silently written to / read from the wrong shard's table — EXEC
 //! reported success while the data diverged (and WATCH-less "lost updates").
 //!
-//! Phase A closes the silent-corruption hole: a transaction whose keys aren't
-//! all owned by the executing shard is rejected with `CROSSSLOT` instead of
-//! misplacing the writes. The invariant these tests pin:
+//! Phase A closed the silent-corruption hole by rejecting such a transaction
+//! with `CROSSSLOT`; Phase B goes further and ROUTES a single-owner-shard body
+//! to its owner (so single-key and hash-tagged bodies now succeed from any
+//! connection — see `sharded_multi_exec_routing.rs`). Bodies that genuinely
+//! span shards stay rejected. Either way the golden invariant these tests pin
+//! is unchanged:
 //!
 //!   **If EXEC returns a successful array, every write in it is visible to
 //!   other connections; if EXEC returns CROSSSLOT, nothing was written.**
@@ -260,9 +263,11 @@ fn no_silent_divergence_across_shards() {
         }
     }
 
-    // Diagnostic only — placement is random, but the invariant above is what
-    // matters. (Before the fix, `saw_ok` cases silently returned Bulk(None).)
-    eprintln!("no_silent_divergence: {saw_ok} ran-local, {saw_crossslot} rejected-remote");
+    // Diagnostic only — the invariant above is what matters. Under Phase B a
+    // single-key body is routed to its owner, so `saw_ok` should be ~all 40 and
+    // `saw_crossslot` ~0 (pre-fix these "ok" cases silently returned Bulk(None);
+    // under Phase A the remote ones were CROSSSLOT).
+    eprintln!("no_silent_divergence: {saw_ok} succeeded, {saw_crossslot} rejected");
 }
 
 /// A transaction whose keys demonstrably span multiple shards is always

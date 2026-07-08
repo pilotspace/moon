@@ -596,10 +596,14 @@ pub(super) async fn try_handle_multi_exec(
             responses.push(Frame::Error(Bytes::from_static(b"ERR EXEC without MULTI")));
         } else {
             conn.in_multi = false;
-            // Phase A safety floor: the body runs on THIS shard with no per-key
-            // routing, so a foreign-owned key would be silently misplaced.
-            // Reject rather than corrupt when the keys aren't all local.
-            // (Phase B routes a single-remote-shard body to its owner instead.)
+            // The body runs on THIS shard with no per-key routing, so a
+            // foreign-owned key would be silently misplaced. Classify locality:
+            //  - CrossShard: genuinely spans shards — a shared-nothing engine
+            //    can't commit it atomically, so reject with CROSSSLOT.
+            //  - SingleShard(other): every key is owned by ONE remote shard —
+            //    Phase B routes the whole body there for atomic execution + AOF
+            //    on the owner (instead of the Phase-A CROSSSLOT rejection).
+            //  - Keyless / SingleShard(self): fall through to local execution.
             if ctx.num_shards > 1 {
                 match crate::server::conn::shared::analyze_txn_locality(
                     &conn.command_queue,
@@ -608,10 +612,53 @@ pub(super) async fn try_handle_multi_exec(
                     crate::server::conn::shared::TxnLocality::SingleShard(s)
                         if s != ctx.shard_id =>
                     {
+                        let commands: Vec<Frame> = conn.command_queue.to_vec();
                         conn.command_queue.clear();
-                        responses.push(Frame::Error(Bytes::from_static(
-                            b"CROSSSLOT MULTI/EXEC keys are owned by another shard; co-locate them with a hash tag {tag} or use --shards 1",
-                        )));
+                        let reply = crate::shard::coordinator::execute_txn_on_owner(
+                            s,
+                            ctx.shard_id,
+                            conn.selected_db,
+                            commands,
+                            &ctx.dispatch_tx,
+                            &ctx.spsc_notifiers,
+                        )
+                        .await;
+                        match reply {
+                            Some(r) => {
+                                if r.append_lost {
+                                    exec_publishes.clear();
+                                    responses.push(Frame::Error(Bytes::from_static(
+                                        crate::shard::spsc_handler::AOF_APPEND_LOST_ERR,
+                                    )));
+                                    return true;
+                                }
+                                // appendfsync=always: confirm the owner's queued
+                                // appends are on disk before acking (H1-BARRIER
+                                // parity for normal cross-shard writes). No-op
+                                // under everysec/no.
+                                if r.wrote {
+                                    if let Some(ref pool) = ctx.aof_pool {
+                                        if pool.fsync_barrier(s).await.is_err() {
+                                            exec_publishes.clear();
+                                            responses.push(Frame::Error(Bytes::from_static(
+                                                crate::persistence::aof::AOF_FSYNC_ERR,
+                                            )));
+                                            return true;
+                                        }
+                                    }
+                                }
+                                // Adopt the owner's deferred PUBLISH fan-out; the
+                                // caller's post-EXEC loop patches placeholders +
+                                // scatters from this (originating) shard.
+                                exec_publishes.extend(r.exec_publishes);
+                                responses.push(r.result);
+                            }
+                            None => {
+                                responses.push(Frame::Error(Bytes::from_static(
+                                    b"CROSSSLOT MULTI/EXEC owner shard unavailable; retry",
+                                )));
+                            }
+                        }
                         return true;
                     }
                     crate::server::conn::shared::TxnLocality::CrossShard => {
