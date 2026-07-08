@@ -49,6 +49,7 @@ async fn start_workspace_server(num_shards: usize) -> (u16, CancellationToken) {
         maxmemory: Some(0),
         maxmemory_policy: "noeviction".to_string(),
         maxmemory_samples: 5,
+        db_maxmemory: Vec::new(),
         shards: num_shards,
         cluster_enabled: false,
         cluster_node_timeout: 15000,
@@ -281,6 +282,7 @@ async fn start_workspace_server_with_auth(
         maxmemory: Some(0),
         maxmemory_policy: "noeviction".to_string(),
         maxmemory_samples: 5,
+        db_maxmemory: Vec::new(),
         shards: num_shards,
         cluster_enabled: false,
         cluster_node_timeout: 15000,
@@ -675,6 +677,240 @@ async fn test_workspace_drop() {
     assert!(
         auth_result.is_err(),
         "WS AUTH with dropped workspace should fail"
+    );
+
+    token.cancel();
+}
+
+/// WS5b regression: WS DROP must clean up workspace keys in EVERY logical
+/// db, not just db 0. WS AUTH and SELECT are orthogonal (the workspace hash
+/// tag prefixes the key regardless of which db is selected), so a
+/// workspace-bound connection that SELECTs to a non-zero db before writing
+/// leaves keys there. The original implementation's WS DROP cleanup
+/// hardcoded db 0, silently leaking those keys forever.
+#[tokio::test]
+async fn test_workspace_drop_cleans_keys_across_all_dbs() {
+    let (port, token) = start_server().await;
+
+    // Workspace-bound connection: SELECT a non-zero db, then write.
+    let mut conn_ws = connect(port).await;
+    let ws_id: String = redis::cmd("WS")
+        .arg("CREATE")
+        .arg("cross-db-drop")
+        .query_async(&mut conn_ws)
+        .await
+        .unwrap();
+    let _: String = redis::cmd("WS")
+        .arg("AUTH")
+        .arg(&ws_id)
+        .query_async(&mut conn_ws)
+        .await
+        .unwrap();
+    let _: () = redis::cmd("SELECT")
+        .arg(5)
+        .query_async(&mut conn_ws)
+        .await
+        .unwrap();
+    let _: () = redis::cmd("SET")
+        .arg("leftover")
+        .arg("v")
+        .query_async(&mut conn_ws)
+        .await
+        .unwrap();
+
+    // Unauthenticated admin connection sees the RAW (prefixed) key in db 5 —
+    // sanity check that the write actually landed where we think it did.
+    let mut conn_admin = connect(port).await;
+    let _: () = redis::cmd("SELECT")
+        .arg(5)
+        .query_async(&mut conn_admin)
+        .await
+        .unwrap();
+    let raw_keys_before: Vec<String> = redis::cmd("KEYS")
+        .arg("*")
+        .query_async(&mut conn_admin)
+        .await
+        .unwrap();
+    assert_eq!(
+        raw_keys_before.len(),
+        1,
+        "workspace key must physically exist in db 5 before DROP"
+    );
+
+    // Drop the workspace.
+    let drop_result: String = redis::cmd("WS")
+        .arg("DROP")
+        .arg(&ws_id)
+        .query_async(&mut conn_ws)
+        .await
+        .unwrap();
+    assert_eq!(drop_result, "OK");
+
+    // The raw prefixed key in db 5 must be gone — this is the regression
+    // check: before the fix, WS DROP only swept db 0 and this key survived.
+    let raw_keys_after: Vec<String> = redis::cmd("KEYS")
+        .arg("*")
+        .query_async(&mut conn_admin)
+        .await
+        .unwrap();
+    assert!(
+        raw_keys_after.is_empty(),
+        "WS DROP must remove workspace keys from db 5, not just db 0; found: {raw_keys_after:?}"
+    );
+
+    token.cancel();
+}
+
+/// WS5b hardening: KEYS must not leak a sibling workspace's keys even when
+/// both workspaces share the same db and the same shard. `workspace_rewrite_args`
+/// prefixes the KEYS glob pattern itself (`*` -> `{ws_hex}:*`), so the glob's
+/// literal prefix should make this structurally impossible — this test
+/// verifies that holds for the wire-level command, not just the unit-level
+/// `workspace_rewrite_args` tests in `src/command/workspace.rs`.
+#[tokio::test]
+async fn test_workspace_keys_no_cross_workspace_leakage() {
+    let (port, token) = start_server().await;
+
+    let mut conn_a = connect(port).await;
+    let ws_a: String = redis::cmd("WS")
+        .arg("CREATE")
+        .arg("leak-a")
+        .query_async(&mut conn_a)
+        .await
+        .unwrap();
+    let _: String = redis::cmd("WS")
+        .arg("AUTH")
+        .arg(&ws_a)
+        .query_async(&mut conn_a)
+        .await
+        .unwrap();
+    let _: () = redis::cmd("SET")
+        .arg("shared-name")
+        .arg("a-value")
+        .query_async(&mut conn_a)
+        .await
+        .unwrap();
+
+    let mut conn_b = connect(port).await;
+    let ws_b: String = redis::cmd("WS")
+        .arg("CREATE")
+        .arg("leak-b")
+        .query_async(&mut conn_b)
+        .await
+        .unwrap();
+    let _: String = redis::cmd("WS")
+        .arg("AUTH")
+        .arg(&ws_b)
+        .query_async(&mut conn_b)
+        .await
+        .unwrap();
+    let _: () = redis::cmd("SET")
+        .arg("shared-name")
+        .arg("b-value")
+        .query_async(&mut conn_b)
+        .await
+        .unwrap();
+    let _: () = redis::cmd("SET")
+        .arg("b-only-key")
+        .arg("v")
+        .query_async(&mut conn_b)
+        .await
+        .unwrap();
+
+    // Workspace A's KEYS * must see exactly its own key, never workspace B's.
+    let keys_a: Vec<String> = redis::cmd("KEYS")
+        .arg("*")
+        .query_async(&mut conn_a)
+        .await
+        .unwrap();
+    assert_eq!(
+        keys_a,
+        vec!["shared-name".to_string()],
+        "workspace A must not see workspace B's keys, even with a colliding name"
+    );
+
+    // And it must read back ITS OWN value, not workspace B's.
+    let val_a: String = redis::cmd("GET")
+        .arg("shared-name")
+        .query_async(&mut conn_a)
+        .await
+        .unwrap();
+    assert_eq!(val_a, "a-value");
+
+    token.cancel();
+}
+
+/// WS5b known-limitation documentation: FLUSHDB is a db-level operation and
+/// is NOT scoped to the calling connection's workspace — it clears every
+/// workspace's keys sharing that db (same passthrough as `NO_KEY_COMMANDS`
+/// in `src/command/workspace.rs`). This mirrors Redis's real FLUSHDB
+/// semantics (whole-db) and is a deliberate non-goal, not a bug: workspaces
+/// are a key-prefix isolation layer, not full logical databases (see
+/// docs/guides/isolation.md). This test pins the CURRENT, intentional
+/// behavior so it cannot silently change or silently "regress" into
+/// something worse without a test forcing the decision into the open.
+#[tokio::test]
+async fn test_workspace_flushdb_is_whole_db_not_workspace_scoped() {
+    let (port, token) = start_server().await;
+
+    let mut conn_a = connect(port).await;
+    let ws_a: String = redis::cmd("WS")
+        .arg("CREATE")
+        .arg("flush-a")
+        .query_async(&mut conn_a)
+        .await
+        .unwrap();
+    let _: String = redis::cmd("WS")
+        .arg("AUTH")
+        .arg(&ws_a)
+        .query_async(&mut conn_a)
+        .await
+        .unwrap();
+    let _: () = redis::cmd("SET")
+        .arg("a-key")
+        .arg("v")
+        .query_async(&mut conn_a)
+        .await
+        .unwrap();
+
+    let mut conn_b = connect(port).await;
+    let ws_b: String = redis::cmd("WS")
+        .arg("CREATE")
+        .arg("flush-b")
+        .query_async(&mut conn_b)
+        .await
+        .unwrap();
+    let _: String = redis::cmd("WS")
+        .arg("AUTH")
+        .arg(&ws_b)
+        .query_async(&mut conn_b)
+        .await
+        .unwrap();
+    let _: () = redis::cmd("SET")
+        .arg("b-key")
+        .arg("v")
+        .query_async(&mut conn_b)
+        .await
+        .unwrap();
+
+    // Workspace A calls FLUSHDB on the (shared, default) db 0.
+    let _: () = redis::cmd("FLUSHDB")
+        .query_async(&mut conn_a)
+        .await
+        .unwrap();
+
+    // Documented current behavior: workspace B's key is ALSO gone, because
+    // FLUSHDB is whole-db, not workspace-scoped.
+    let b_val: Option<String> = redis::cmd("GET")
+        .arg("b-key")
+        .query_async(&mut conn_b)
+        .await
+        .unwrap();
+    assert_eq!(
+        b_val, None,
+        "FLUSHDB from workspace A clears the WHOLE db, including workspace B's \
+         keys — this is documented, intentional behavior (see docs/guides/isolation.md), \
+         not workspace-isolated FLUSHDB"
     );
 
     token.cancel();

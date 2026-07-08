@@ -67,7 +67,14 @@ pub(super) fn spsc_eviction_gate(
         res
     } else {
         try_evict_if_needed_budget(db, &rt, budget)
-    }
+    };
+    global_result?;
+    // WS5b: per-db quota, additive and finer-grained than the whole-instance
+    // maxmemory gate above. Zero-cost when unconfigured for this db. This is
+    // the ONE gate for cross-shard scatter-gather writes (MSET/DEL/etc. and
+    // any command whose keys land on a shard other than the client's own),
+    // so a quota'd db cannot be grown past its cap via a remote leg either.
+    crate::storage::db_quota::check_db_maxmemory(db, db_idx, &rt)
 }
 
 /// Drain all SPSC consumer channels, processing cross-shard messages.
@@ -2263,18 +2270,29 @@ pub(crate) fn handle_shard_message_shared(
         ShardMessage::WsDropCleanup { prefix, reply_tx } => {
             // WS.DROP best-effort key cleanup. The connection handler routes
             // this to the shard that owns `prefix` (hash-tag co-location).
-            // db pinned to 0 — matches the lock-path behaviour in both runtimes.
-            let deleted_count = crate::shard::slice::with_shard_db(0, |db| {
-                let keys_to_delete: Vec<Vec<u8>> = db
-                    .keys()
-                    .filter(|k| k.as_bytes().starts_with(prefix.as_ref()))
-                    .map(|k| k.as_bytes().to_vec())
-                    .collect();
-                let count = keys_to_delete.len() as u64;
-                for key in &keys_to_delete {
-                    db.remove(key);
+            //
+            // Sweeps EVERY logical db on this shard, not just db 0: a
+            // workspace-bound connection can `SELECT` to any db before
+            // writing (WS AUTH and SELECT are orthogonal — the workspace
+            // hash-tag prefix composes with whichever db is currently
+            // selected), so workspace keys can legitimately live in db != 0.
+            // A db-0-only sweep (the original implementation) silently
+            // leaked those keys forever after WS DROP — found during the
+            // WS5b hardening sweep (docs/guides/isolation.md).
+            let deleted_count = crate::shard::slice::with_shard(|s| {
+                let mut total = 0u64;
+                for db in s.databases.iter_mut() {
+                    let keys_to_delete: Vec<Vec<u8>> = db
+                        .keys()
+                        .filter(|k| k.as_bytes().starts_with(prefix.as_ref()))
+                        .map(|k| k.as_bytes().to_vec())
+                        .collect();
+                    total += keys_to_delete.len() as u64;
+                    for key in &keys_to_delete {
+                        db.remove(key);
+                    }
                 }
-                count
+                total
             });
             // Ignore send failure: caller logs the count but the drop already
             // completed; losing the ack is harmless.
