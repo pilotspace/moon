@@ -341,6 +341,17 @@ fn routed_multi_exec_invalidates_tracking_client() {
         txw.clear();
         txw.cmd(&["EXEC"]);
 
+        // Disambiguate EXEC failure from invalidation-delivery loss: a routed
+        // single-key EXEC that committed returns `*1\r\n+OK\r\n`. If the routed
+        // execution itself errored (e.g. owner-shard-unavailable → CROSSSLOT),
+        // fail loudly here rather than silently under-counting `delivered` and
+        // misreporting a routing bug as an invalidation regression.
+        assert!(
+            txw.saw(b"+OK"),
+            "routed EXEC must commit the queued SET (got: {:?})",
+            String::from_utf8_lossy(&txw.buf)
+        );
+
         if reader.wait_for(INVALIDATE, Duration::from_secs(4)) && reader.saw(key.as_bytes()) {
             delivered += 1;
         }
