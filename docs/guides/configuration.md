@@ -130,6 +130,19 @@ pinned/dedicated cores).
 | `--segment-cold-min-qps` | `0.1` | Minimum QPS threshold; segments below this are COLD candidates |
 | `--vec-diskann-beam-width` | `8` | DiskANN beam width for disk-resident vector search |
 | `--vec-diskann-cache-levels` | `3` | HNSW upper levels cached in memory for DiskANN hybrid search |
+| `--vector-ef-runtime` | `0` (auto) | Default `EF_RUNTIME` for indexes created without one (10-4096; `0` = per-query auto heuristic). Per-index `FT.CONFIG SET <idx> EF_RUNTIME` overrides at runtime |
+| `--vector-rerank-mult` | `4` | Default `RERANK_MULT` for new indexes: exact-rerank depth, top `mult×k` beam candidates re-scored with true f16 distances (1-64). Per-index `FT.CONFIG` overrides |
+| `--vector-exact-beam` | off | Default `EXACT_BEAM` for new indexes: HNSW beam navigates exact f16 sidecar distances (recall ≈ graph-limited; QPS cost grows with dimension). Per-index `FT.CONFIG` overrides |
+
+## Graph
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--graph-merge-max-segments` | `8` | Immutable CSR segments per graph before autovacuum merges them |
+| `--graph-dead-edge-trigger` | `0.20` | Dead-edge fraction that triggers a segment merge early |
+| `--graph-timeout-ms` | `30000` | Default Cypher traversal timeout (0 = unlimited; per-query `TIMEOUT` overrides) |
+| `--graph-result-cache-entries` | `256` | Cypher result-cache capacity per graph (repeated read-only queries served from cache) |
+| `--graph-result-cache-bytes` | `4194304` | Cypher result-cache byte budget per graph (LRU eviction on either limit) |
 
 ## Environment Variables
 

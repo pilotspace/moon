@@ -92,6 +92,23 @@ pub async fn run_embedded(
     // cwd data) before validating it — matches the binary entry in main.rs.
     config.resolve_dir();
 
+    // Install the vector/graph tuning defaults exactly like the binary entry
+    // (first write wins — a host process that already set them keeps its
+    // values). Validation errors are startup errors here too.
+    if let Err(msg) = config.validate_tuning_defaults() {
+        anyhow::bail!(msg);
+    }
+    crate::vector::store::set_vector_create_defaults(crate::vector::store::VectorCreateDefaults {
+        ef_runtime: config.vector_ef_runtime,
+        rerank_mult: config.vector_rerank_mult,
+        exact_beam: config.vector_exact_beam,
+    });
+    #[cfg(feature = "graph")]
+    crate::graph::cypher::result_cache::set_configured_limits(
+        config.graph_result_cache_entries,
+        config.graph_result_cache_bytes,
+    );
+
     // Validate / create persistence directory up front.
     std::fs::create_dir_all(&config.dir).with_context(|| {
         format!(

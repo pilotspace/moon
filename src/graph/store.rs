@@ -381,12 +381,13 @@ impl GraphStore {
                 )),
                 key_to_node: HashMap::new(),
                 write_gen: 0,
-                result_cache: parking_lot::Mutex::new(
-                    crate::graph::cypher::result_cache::ResultCache::new(
-                        crate::graph::cypher::result_cache::DEFAULT_MAX_ENTRIES,
-                        crate::graph::cypher::result_cache::DEFAULT_MAX_BYTES,
-                    ),
-                ),
+                result_cache: parking_lot::Mutex::new({
+                    // Operator-configured limits (--graph-result-cache-*),
+                    // falling back to the compiled-in defaults.
+                    let (max_entries, max_bytes) =
+                        crate::graph::cypher::result_cache::configured_limits();
+                    crate::graph::cypher::result_cache::ResultCache::new(max_entries, max_bytes)
+                }),
             },
         );
         // Bump version AFTER successful graph creation (monotonicity-on-success

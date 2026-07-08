@@ -224,6 +224,23 @@ fn main() -> anyhow::Result<()> {
         return Err(anyhow::anyhow!(msg));
     }
 
+    // Vector/graph tuning defaults: validate the ranges loudly, then install
+    // the process-wide starting values (read by FT.CREATE and GraphStore
+    // construction; per-index FT.CONFIG still overrides at runtime).
+    if let Err(msg) = config.validate_tuning_defaults() {
+        return Err(anyhow::anyhow!(msg));
+    }
+    moon::vector::store::set_vector_create_defaults(moon::vector::store::VectorCreateDefaults {
+        ef_runtime: config.vector_ef_runtime,
+        rerank_mult: config.vector_rerank_mult,
+        exact_beam: config.vector_exact_beam,
+    });
+    #[cfg(feature = "graph")]
+    moon::graph::cypher::result_cache::set_configured_limits(
+        config.graph_result_cache_entries,
+        config.graph_result_cache_bytes,
+    );
+
     // Non-jemalloc builds: warn if operator explicitly set --memory-arenas-cap
     #[cfg(not(feature = "jemalloc"))]
     if config.memory_arenas_cap != 8 {
