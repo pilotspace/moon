@@ -537,6 +537,18 @@ pub fn tq_l2_adc_multibit_budgeted(
     if dist > budget { f32::MAX } else { dist }
 }
 
+#[inline]
+fn l2_true_from_sphere(sphere_v: f32, norm: f32, q_norm: f32) -> f32 {
+    // TQ codes are unit DIRECTIONS + a norm trailer; `sphere_v` = na^2 * d^2
+    // on the unit sphere. That ranking is only metric-valid for unit-sphere
+    // metrics (COSINE/IP). True L2: ||a-q||^2 = (na-nq)^2 + (nq/na)*sphere_v.
+    let diff = norm - q_norm;
+    if norm <= 0.0 {
+        return diff * diff;
+    }
+    diff * diff + (q_norm / norm) * sphere_v
+}
+
 /// Brute-force scan of ALL TQ codes at any bit width using ADC.
 ///
 /// `bits`: quantization bit width (1-4).
@@ -572,6 +584,7 @@ pub fn brute_force_tq_adc_multibit(
             *v *= inv;
         }
     }
+    let l2_adjust = collection.metric == crate::vector::types::DistanceMetric::L2;
     fwht::fwht(
         &mut q_rotated[..padded],
         collection.fwht_sign_flips.as_slice(),
@@ -586,7 +599,12 @@ pub fn brute_force_tq_adc_multibit(
         let code = &tq_buffer[offset..offset + code_len];
         let norm_bytes = &tq_buffer[offset + code_len..offset + code_len + 4];
         let norm = f32::from_le_bytes([norm_bytes[0], norm_bytes[1], norm_bytes[2], norm_bytes[3]]);
-        let dist = tq_l2_adc_multibit(&q_rotated, code, norm, centroids, bits);
+        let sphere_v = tq_l2_adc_multibit(&q_rotated, code, norm, centroids, bits);
+        let dist = if l2_adjust {
+            l2_true_from_sphere(sphere_v, norm, q_norm)
+        } else {
+            sphere_v
+        };
 
         if heap.len() < k {
             heap.push((ordered_float::OrderedFloat(dist), i as u32));
@@ -651,6 +669,7 @@ pub fn brute_force_tq_adc(
             *v *= inv;
         }
     }
+    let l2_adjust = collection.metric == crate::vector::types::DistanceMetric::L2;
     fwht::fwht(
         &mut q_rotated[..padded],
         collection.fwht_sign_flips.as_slice(),
@@ -665,7 +684,12 @@ pub fn brute_force_tq_adc(
         let code = &tq_buffer[offset..offset + code_len];
         let norm_bytes = &tq_buffer[offset + code_len..offset + code_len + 4];
         let norm = f32::from_le_bytes([norm_bytes[0], norm_bytes[1], norm_bytes[2], norm_bytes[3]]);
-        let dist = tq_l2_adc_scaled(&q_rotated, code, norm, codebook);
+        let sphere_v = tq_l2_adc_scaled(&q_rotated, code, norm, codebook);
+        let dist = if l2_adjust {
+            l2_true_from_sphere(sphere_v, norm, q_norm)
+        } else {
+            sphere_v
+        };
 
         if heap.len() < k {
             heap.push((ordered_float::OrderedFloat(dist), i as u32));

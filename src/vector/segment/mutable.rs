@@ -96,6 +96,12 @@ pub struct BruteForceQuery {
     /// prepare (`padded_dim * 16` entries). Empty when the segment is too
     /// small or the path doesn't apply — the chunk scan then runs the plain
     /// per-candidate loop.
+    /// L2-on-TQ metric correction (see `tq_finish` below): raw query norm
+    /// and whether the transform applies (TQ-ADC path + L2 metric). TQ ranks
+    /// by sphere_dist*norm_a^2, which is metric-unfaithful for unnormalized
+    /// L2 data (gist-960 recall collapse).
+    l2_adjust: bool,
+    l2_q_norm: f32,
     fs_lut: Vec<u8>,
     /// 1/scale from `build_quantized_lut` (f32 distance reconstruction).
     fs_inv_scale: f32,
@@ -621,6 +627,23 @@ impl MutableSegment {
             None
         };
 
+        // L2-on-TQ metric correction: TQ/A2 codes are unit DIRECTIONS + a norm
+        // trailer; sphere_dist*norm_a^2 is metric-unfaithful for unnormalized
+        // L2 data. Reconstruct ||a-q||^2 = (na-nq)^2 + (nq/na)*(na^2*d_sphere^2).
+        let l2_q_norm: f32 = query_f32.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let l2_adjust =
+            (use_tq_adc || use_a2_decoded_l2) && self.collection.metric == DistanceMetric::L2;
+        let tq_fin = |v: f32, na: f32| -> f32 {
+            if !l2_adjust {
+                return v;
+            }
+            let diff = na - l2_q_norm;
+            if na <= 0.0 {
+                return diff * diff;
+            }
+            diff * diff + (l2_q_norm / na) * v
+        };
+
         for entry in &inner.entries {
             if entry.delete_lsn != 0 {
                 continue;
@@ -656,12 +679,15 @@ impl MutableSegment {
                         let d = q_rotated[j] - decoded[j];
                         sum += d * d;
                     }
-                    sum * norm_sq
+                    tq_fin(sum * norm_sq, entry.norm)
                 } else {
                     f32::MAX
                 }
             } else if use_tq_adc {
-                tq_l2_adc_scaled(&q_rotated, tq_code, entry.norm, centroids)
+                tq_fin(
+                    tq_l2_adc_scaled(&q_rotated, tq_code, entry.norm, centroids),
+                    entry.norm,
+                )
             } else if let Some(qs) = query_state {
                 let qjl_bpv = inner.qjl_bytes_per_vec;
                 let qjl_offset = id * qjl_bpv;
@@ -834,9 +860,17 @@ impl MutableSegment {
                 (Vec::new(), 0.0, 0.0, 0.0)
             };
 
+        let l2_adjust = use_tq_adc && self.collection.metric == DistanceMetric::L2;
+        let l2_q_norm: f32 = if l2_adjust {
+            query_f32.iter().map(|x| x * x).sum::<f32>().sqrt()
+        } else {
+            0.0
+        };
         BruteForceQuery {
             prepared,
             use_tq_adc,
+            l2_adjust,
+            l2_q_norm,
             sq8_q_sum,
             sq8_q_sumsq,
             sq8_qi8,
@@ -969,6 +1003,22 @@ impl MutableSegment {
             let scan = fastscan::fastscan_dispatch().scan_block;
             let fs_lut = q.fs_lut.as_slice();
             let (inv_scale, bias, eps) = (q.fs_inv_scale, q.fs_bias, q.fs_eps);
+            // L2-on-TQ correction (see BruteForceQuery::l2_adjust): both the
+            // final distance and the pre-filter LOWER BOUND transform through
+            // ||a-q||^2 = (na-nq)^2 + (nq/na)*v. The map is affine in v with
+            // non-negative slope, so a sound lower bound stays a sound lower
+            // bound after the transform.
+            let (l2_adjust, l2_qn) = (q.l2_adjust, q.l2_q_norm);
+            let tq_fin = |v: f32, na: f32| -> f32 {
+                if !l2_adjust {
+                    return v;
+                }
+                let diff = na - l2_qn;
+                if na <= 0.0 {
+                    return diff * diff;
+                }
+                diff * diff + (l2_qn / na) * v
+            };
             let heap = &mut q.heap;
             let block_bytes = code_len * FASTSCAN_BLOCK;
             let mut block_dists = [0u16; 32];
@@ -1006,7 +1056,10 @@ impl MutableSegment {
                     }
                     let norm_sq = entry.norm * entry.norm;
                     if heap.len() >= k {
-                        let lower = (block_dists[lane] as f32 * inv_scale + bias - eps) * norm_sq;
+                        let lower = tq_fin(
+                            (block_dists[lane] as f32 * inv_scale + bias - eps) * norm_sq,
+                            entry.norm,
+                        );
                         if let Some(&DistF32(worst, _, _)) = heap.peek() {
                             if lower >= worst {
                                 continue;
@@ -1017,7 +1070,10 @@ impl MutableSegment {
                     let id = entry.internal_id as usize;
                     let tq_offset = id * bytes_per_code;
                     let tq_code = &inner.tq_codes[tq_offset..tq_offset + code_len];
-                    let dist = tq_l2_adc_scaled(q_rotated, tq_code, entry.norm, centroids);
+                    let dist = tq_fin(
+                        tq_l2_adc_scaled(q_rotated, tq_code, entry.norm, centroids),
+                        entry.norm,
+                    );
 
                     let global_id = inner.global_id_base + entry.internal_id;
                     if heap.len() < k {
@@ -1034,6 +1090,18 @@ impl MutableSegment {
             return;
         }
 
+        // L2-on-TQ correction for the plain (non-FastScan) chunk loop.
+        let (l2_adjust, l2_qn) = (q.l2_adjust, q.l2_q_norm);
+        let tq_fin = |v: f32, na: f32| -> f32 {
+            if !l2_adjust {
+                return v;
+            }
+            let diff = na - l2_qn;
+            if na <= 0.0 {
+                return diff * diff;
+            }
+            diff * diff + (l2_qn / na) * v
+        };
         let heap = &mut q.heap;
 
         for entry in &inner.entries[lo..hi] {
@@ -1058,7 +1126,10 @@ impl MutableSegment {
             let tq_code = &inner.tq_codes[tq_offset..tq_offset + code_len];
 
             let dist = if use_tq_adc {
-                tq_l2_adc_scaled(q_rotated, tq_code, entry.norm, centroids)
+                tq_fin(
+                    tq_l2_adc_scaled(q_rotated, tq_code, entry.norm, centroids),
+                    entry.norm,
+                )
             } else {
                 let qs = query_state.unwrap();
                 let qjl_bpv = inner.qjl_bytes_per_vec;
@@ -1933,6 +2004,75 @@ mod tests {
             assert_eq!(a.id, b.id, "chunked FastScan diverged");
             assert_eq!(a.distance, b.distance);
         }
+    }
+
+    #[test]
+    fn test_tq_l2_unnormalized_norm_variation_recall() {
+        // TQ encodes unit DIRECTIONS + a norm trailer. Ranking L2 by
+        // sphere_dist·‖a‖² is metric-unfaithful when norms vary (small-norm
+        // vectors look near regardless of direction) — the gist-960 recall
+        // collapse. The corrected score ‖a−q‖² = (‖a‖−‖q‖)² + ‖a‖‖q‖·d̂²
+        // must recover brute-force recall on unnormalized data.
+        distance::init();
+        let dim = 32u32;
+        let col = make_collection(dim); // L2 + TQ4
+        let seg = MutableSegment::new(dim, col);
+
+        let n = 500u32;
+        let mut raw: Vec<Vec<f32>> = Vec::new();
+        for i in 0..n {
+            // Unit direction scaled to norms spanning 0.5..40.5.
+            let mut v = make_f32_vector(dim as usize, 9000 + i);
+            let scale = 0.5 + (i % 41) as f32;
+            for x in v.iter_mut() {
+                *x *= scale;
+            }
+            seg.append(i as u64, &v, i as u64 + 1);
+            raw.push(v);
+        }
+
+        let mut query = make_f32_vector(dim as usize, 777);
+        for x in query.iter_mut() {
+            *x *= 7.5;
+        }
+
+        let k = 10;
+        let mut exact: Vec<(f32, u64)> = raw
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                let d: f32 = v
+                    .iter()
+                    .zip(query.iter())
+                    .map(|(a, b)| (a - b) * (a - b))
+                    .sum();
+                (d, i as u64)
+            })
+            .collect();
+        exact.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let want: std::collections::HashSet<u64> = exact[..k].iter().map(|(_, i)| *i).collect();
+
+        let committed = roaring::RoaringTreemap::new();
+        let mut q = seg.prepare_brute_force_query(&query, false, k);
+        seg.brute_force_scan_mvcc_chunk(
+            &mut q,
+            None,
+            k,
+            None,
+            u64::MAX,
+            0,
+            &committed,
+            0,
+            n as usize,
+        );
+        let results = q.into_results();
+        let got: std::collections::HashSet<u64> = results.iter().map(|r| r.key_hash).collect();
+        let overlap = want.intersection(&got).count();
+        assert!(
+            overlap >= 7,
+            "TQ4+L2 recall on unnormalized data: {overlap}/{k} (norm-scaled \
+             sphere ranking is metric-unfaithful)"
+        );
     }
 
     #[test]

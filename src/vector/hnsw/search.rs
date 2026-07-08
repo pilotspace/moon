@@ -365,6 +365,21 @@ pub fn hnsw_search_filtered(
 
     // Capture immutable slice of rotated query (after mutation phase is done)
     let q_rotated: &[f32] = scratch.query_rotated.as_slice();
+    // TQ's LUT sum is a UNIT-SPHERE distance d̂² between the normalized query
+    // and the decoded unit direction; scaling by ‖a‖² ranks correctly only for
+    // unit-sphere metrics (COSINE/IP, where encode normalizes too). For raw L2
+    // reconstruct the true metric from the stored document norm and the query
+    // norm: ‖a−q‖² = (‖a‖−‖q‖)² + ‖a‖·‖q‖·d̂². Without this, small-norm
+    // vectors rank near regardless of direction (gist-960 recall 0.002).
+    let l2_adjust = !is_sq8 && collection.metric == DistanceMetric::L2;
+    let finish_tq = move |sphere_sum: f32, norm: f32| -> f32 {
+        if l2_adjust {
+            let diff = norm - q_norm;
+            diff * diff + norm * q_norm * sphere_sum
+        } else {
+            sphere_sum * (norm * norm)
+        }
+    };
     // SQ8 has no shared codebook; use a zero placeholder so codebook_16() never
     // logs a spurious "empty codebook" error (the SQ8 closures ignore the LUT).
     let zero_codebook = [0.0f32; 16];
@@ -484,7 +499,6 @@ pub fn hnsw_search_filtered(
         let code_only = &vectors_tq[offset..offset + code_len];
         let norm_bytes = &vectors_tq[offset + code_len..offset + bytes_per_code];
         let norm = f32::from_le_bytes([norm_bytes[0], norm_bytes[1], norm_bytes[2], norm_bytes[3]]);
-        let norm_sq = norm * norm;
 
         if use_subcent {
             // Hot path: 90%+ of search time. Optimization strategy:
@@ -556,7 +570,7 @@ pub fn hnsw_search_filtered(
                 s0 += adc_lut[qi * 32 + (byte & 0x0F) as usize * 2 + s_lo];
                 s1 += adc_lut[(qi + 1) * 32 + (byte >> 4) as usize * 2 + s_hi];
             }
-            ((s0 + s1) + (s2 + s3) + (s4 + s5) + (s6 + s7)) * norm_sq
+            finish_tq((s0 + s1) + (s2 + s3) + (s4 + s5) + (s6 + s7), norm)
         } else {
             // 4-way unrolled with independent accumulators for ILP.
             // Uses unsafe get_unchecked to eliminate bounds checks in the hot loop.
@@ -606,7 +620,7 @@ pub fn hnsw_search_filtered(
                 s0 += adc_lut[qi * 16 + (byte & 0x0F)];
                 s1 += adc_lut[(qi + 1) * 16 + (byte >> 4)];
             }
-            ((s0 + s1) + (s2 + s3) + (s4 + s5) + (s6 + s7)) * norm_sq
+            finish_tq((s0 + s1) + (s2 + s3) + (s4 + s5) + (s6 + s7), norm)
         }
     };
 
@@ -646,9 +660,21 @@ pub fn hnsw_search_filtered(
         let norm = f32::from_le_bytes([norm_bytes[0], norm_bytes[1], norm_bytes[2], norm_bytes[3]]);
         let norm_sq = norm * norm;
         if norm_sq <= 0.0 {
-            return 0.0;
+            // Zero-norm vector: sphere distance is undefined. For L2 the true
+            // distance is exactly ||q||^2; unit-sphere metrics keep legacy 0.0.
+            return if l2_adjust { q_norm * q_norm } else { 0.0 };
         }
-        let scaled_budget = budget / norm_sq;
+        // Invert the metric transform so the early-exit check on the raw
+        // sphere sum stays valid: candidate qualifies iff
+        //   finish_tq(sum, norm) <= budget  <=>  sum <= scaled_budget.
+        let scaled_budget = if l2_adjust {
+            let diff = norm - q_norm;
+            // May go negative (candidate cannot qualify) -- the first budget
+            // check then returns MAX, which is correct.
+            (budget - diff * diff) / (norm * q_norm).max(f32::MIN_POSITIVE)
+        } else {
+            budget / norm_sq
+        };
         let mut sum = 0.0f32;
         let check_interval = 16;
         let chunks = code_only.len() / check_interval;
@@ -747,7 +773,7 @@ pub fn hnsw_search_filtered(
                 sum += adc_lut[(qi + 1) * 16 + (byte >> 4) as usize];
             }
         }
-        sum * norm_sq
+        finish_tq(sum, norm)
     };
 
     // Step 2: Upper layer greedy descent (original node ID space)
@@ -1295,6 +1321,114 @@ mod tests {
     }
 
     // ── hnsw_search tests ─────────────────────────────────────────────
+
+    /// L2-on-TQ metric correction: with UNNORMALIZED vectors (norms 0.5..17),
+    /// beam search must rank by true L2, not sphere_dist*norm^2 (the gist-960
+    /// recall-collapse bug). Ground truth is exact f32 L2.
+    #[test]
+    fn test_search_l2_unnormalized_recall() {
+        distance::init();
+        let n = 400usize;
+        let dim = 32usize;
+        let collection = CollectionMetadata::new(
+            1,
+            dim as u32,
+            DistanceMetric::L2,
+            QuantizationConfig::TurboQuant4,
+            42,
+        );
+        let padded = collection.padded_dimension as usize;
+        let signs_vec: Vec<f32> = collection.fwht_sign_flips.as_slice().to_vec();
+        let signs = signs_vec.as_slice();
+
+        // Unit directions scaled to varying norms.
+        let mut vectors = Vec::with_capacity(n);
+        let mut codes = Vec::with_capacity(n);
+        let mut work = vec![0.0f32; padded];
+        for i in 0..n {
+            let mut v = lcg_f32(dim, (i * 7 + 13) as u32);
+            normalize(&mut v);
+            let scale = 0.5 + (i % 17) as f32;
+            v.iter_mut().for_each(|x| *x *= scale);
+            let boundaries = collection.codebook_boundaries_15();
+            let code = encode_tq_mse_scaled(&v, signs, boundaries, &mut work);
+            vectors.push(v);
+            codes.push(code);
+        }
+
+        let bytes_per_code = padded / 2 + 4;
+        let mut tq_buffer_orig: Vec<u8> = Vec::with_capacity(n * bytes_per_code);
+        for code in &codes {
+            tq_buffer_orig.extend_from_slice(&code.codes);
+            tq_buffer_orig.extend_from_slice(&code.norm.to_le_bytes());
+        }
+
+        // Build graph with a TRUE-L2 pairwise oracle (exact f32) so the graph
+        // topology itself is metric-faithful; this test isolates SEARCH-side
+        // scoring.
+        let mut builder = HnswBuilder::new(16, 200, 12345);
+        for i in 0..n {
+            let a = i; // builder assigns ids in insertion order
+            let _ = a;
+            builder.insert(|a: u32, b: u32| {
+                let va = &vectors[a as usize];
+                let vb = &vectors[b as usize];
+                va.iter()
+                    .zip(vb.iter())
+                    .map(|(x, y)| (x - y) * (x - y))
+                    .sum::<f32>()
+            });
+        }
+        let graph = builder.build(bytes_per_code as u32);
+
+        let mut tq_buffer_bfs = vec![0u8; n * bytes_per_code];
+        for bfs_pos in 0..n {
+            let orig_id = graph.to_original(bfs_pos as u32) as usize;
+            let src = orig_id * bytes_per_code;
+            let dst = bfs_pos * bytes_per_code;
+            tq_buffer_bfs[dst..dst + bytes_per_code]
+                .copy_from_slice(&tq_buffer_orig[src..src + bytes_per_code]);
+        }
+
+        // Unnormalized query.
+        let mut query = lcg_f32(dim, 991);
+        normalize(&mut query);
+        query.iter_mut().for_each(|x| *x *= 6.5);
+
+        // Exact f32 L2 ground truth.
+        let k = 10;
+        let mut exact: Vec<(f32, u32)> = vectors
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                let d = v
+                    .iter()
+                    .zip(query.iter())
+                    .map(|(x, y)| (x - y) * (x - y))
+                    .sum::<f32>();
+                (d, i as u32)
+            })
+            .collect();
+        exact.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let want: std::collections::HashSet<u32> = exact[..k].iter().map(|(_, i)| *i).collect();
+
+        let mut scratch = SearchScratch::new(n as u32, padded as u32);
+        let results = hnsw_search(
+            &graph,
+            &tq_buffer_bfs,
+            &query,
+            &collection,
+            k,
+            128,
+            &mut scratch,
+        );
+        let got: std::collections::HashSet<u32> = results.iter().map(|r| r.id.0).collect();
+        let overlap = want.intersection(&got).count();
+        assert!(
+            overlap >= 6,
+            "L2 beam recall on unnormalized data: {overlap}/{k}"
+        );
+    }
 
     #[test]
     fn test_search_empty_graph() {

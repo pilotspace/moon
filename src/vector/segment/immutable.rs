@@ -1076,6 +1076,19 @@ impl ImmutableSegment {
             self.collection_meta.fwht_sign_flips.as_slice(),
         );
 
+        // L2-on-TQ correction: ||a-q||^2 = (na-nq)^2 + (nq/na)*(na^2*d_sphere^2).
+        let l2_adjust = self.collection_meta.metric == crate::vector::types::DistanceMetric::L2;
+        let tq_fin = |v: f32, na: f32| -> f32 {
+            if !l2_adjust {
+                return v;
+            }
+            let diff = na - q_norm;
+            if na <= 0.0 {
+                return diff * diff;
+            }
+            diff * diff + (q_norm / na) * v
+        };
+
         // Brute-force scan with max-heap for top-K.
         // TQ codes are in BFS order — use graph.to_original(bfs_pos) for original ID.
         let tq_buf = self.vectors_tq.as_slice();
@@ -1091,7 +1104,7 @@ impl ImmutableSegment {
             // Map BFS position → original ID (same mapping HNSW search uses)
             let original_id = self.graph.to_original(bfs_pos as u32);
 
-            let dist = tq_l2_adc_scaled(&q_rotated, code, norm, centroids);
+            let dist = tq_fin(tq_l2_adc_scaled(&q_rotated, code, norm, centroids), norm);
 
             if heap.len() < k {
                 heap.push((ordered_float::OrderedFloat(dist), original_id));
