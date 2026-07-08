@@ -392,6 +392,10 @@ single-purpose benchmark rigs.
     (pre-HQ-1 disk reloads) silently keep the quantized beam.
   - Escalation order at a fixed recall target: raise `EF_RUNTIME` → raise
     `RERANK_MULT` → `EXACT_BEAM ON`. Each step costs more QPS than the one before.
+  - Fleet-wide starting values: `--vector-ef-runtime`, `--vector-rerank-mult`, and
+    `--vector-exact-beam` (CLI or `moon.conf`) set the defaults every NEW index is
+    created with, so recall-sensitive deployments don't have to re-issue FT.CONFIG
+    per index. Per-index `FT.CONFIG SET` always overrides the server default.
 - Set `COMPACT_THRESHOLD` at or above your expected dataset size if you want a single
   final compaction; explicit `FT.COMPACT` on a small mutable segment is a no-op below
   the threshold.

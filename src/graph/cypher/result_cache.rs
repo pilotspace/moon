@@ -298,6 +298,26 @@ pub const DEFAULT_MAX_ENTRIES: usize = 256;
 /// `DEFAULT_MAX_ENTRIES` entries at both protocol versions with headroom.
 pub const DEFAULT_MAX_BYTES: usize = 4 * 1024 * 1024;
 
+/// Operator-configured cache limits (`--graph-result-cache-entries` /
+/// `--graph-result-cache-bytes`), installed once at startup. `GraphStore`
+/// construction reads these; the compiled-in defaults apply when the server
+/// never installed any (unit tests, library embedders).
+static CONFIGURED_LIMITS: std::sync::OnceLock<(usize, usize)> = std::sync::OnceLock::new();
+
+/// Install the server-wide result-cache limits. First write wins; later
+/// calls are no-ops (safe for embedded/test servers booting in-process).
+pub fn set_configured_limits(max_entries: usize, max_bytes: usize) {
+    let _ = CONFIGURED_LIMITS.set((max_entries, max_bytes));
+}
+
+/// `(max_entries, max_bytes)` for new per-graph caches.
+pub fn configured_limits() -> (usize, usize) {
+    CONFIGURED_LIMITS
+        .get()
+        .copied()
+        .unwrap_or((DEFAULT_MAX_ENTRIES, DEFAULT_MAX_BYTES))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -684,6 +684,55 @@ pub struct ServerConfig {
     #[arg(long = "graph-timeout-ms", default_value_t = 30_000)]
     pub graph_timeout_ms: u64,
 
+    /// Cypher result-cache capacity: maximum cached query results per graph.
+    ///
+    /// The cache serves repeated read-only Cypher queries without
+    /// re-executing them (doorkeeper-gated admission; invalidated on any
+    /// write to the graph). Raising it helps dashboards that cycle through
+    /// many distinct read queries; each graph gets its own cache.
+    ///
+    /// Default: 256 entries.
+    #[arg(long = "graph-result-cache-entries", default_value_t = 256)]
+    pub graph_result_cache_entries: usize,
+
+    /// Cypher result-cache memory ceiling in bytes (per graph).
+    ///
+    /// Entries are evicted LRU when either this byte budget or
+    /// `--graph-result-cache-entries` is exceeded.
+    ///
+    /// Default: 4194304 (4 MiB).
+    #[arg(long = "graph-result-cache-bytes", default_value_t = 4_194_304)]
+    pub graph_result_cache_bytes: usize,
+
+    // ── Vector search-tuning defaults (FT.CREATE / FT.CONFIG initial values) ──
+    /// Default HNSW search beam width (EF_RUNTIME) for indexes created
+    /// without an explicit `EF_RUNTIME` in FT.CREATE. `0` keeps the per-query
+    /// auto heuristic (max(k*20, 200) with dimension boost). Range: 10-4096.
+    ///
+    /// Per-index `FT.CONFIG SET <idx> EF_RUNTIME` still overrides this at
+    /// runtime; the flag only sets the starting value for NEW indexes.
+    #[arg(long = "vector-ef-runtime", default_value_t = 0)]
+    pub vector_ef_runtime: u32,
+
+    /// Default exact-rerank depth multiplier (RERANK_MULT) for new vector
+    /// indexes: the top `mult × k` beam candidates are re-scored with true
+    /// f16 sidecar distances before top-k truncation. Range: 1-64.
+    ///
+    /// Per-index `FT.CONFIG SET <idx> RERANK_MULT` still overrides this at
+    /// runtime; the flag only sets the starting value for NEW indexes.
+    #[arg(long = "vector-rerank-mult", default_value_t = 4)]
+    pub vector_rerank_mult: u32,
+
+    /// Default EXACT_BEAM state for new vector indexes: when set, the HNSW
+    /// beam navigates with exact f16 sidecar distances instead of quantized
+    /// ADC estimates — recall becomes graph-limited at a QPS cost that grows
+    /// with dimension.
+    ///
+    /// Per-index `FT.CONFIG SET <idx> EXACT_BEAM OFF` still overrides this
+    /// at runtime; the flag only sets the starting value for NEW indexes.
+    #[arg(long = "vector-exact-beam", default_value_t = false)]
+    pub vector_exact_beam: bool,
+
     // ── MA4: Weighted compaction scheduling ───────────────────────────────
     /// Minimum seconds before a stale entity is forced to be scheduled by the
     /// autovacuum daemon regardless of its compaction weight (anti-starvation cap).
@@ -836,6 +885,38 @@ impl ServerConfig {
     /// `Frame`/`anyhow::Error` — kept plain so both `main.rs`'s early-boot
     /// path and unit tests can format/assert on it directly) when the
     /// configured count exceeds `MAX_DATABASES`.
+    /// Validate the vector/graph tuning-default flags (startup error, not a
+    /// silent clamp — a typo in a fleet-wide default must be loud). Mirrors
+    /// the per-index FT.CONFIG ranges exactly so a value accepted here is
+    /// accepted there and vice versa.
+    pub fn validate_tuning_defaults(&self) -> Result<(), String> {
+        if self.vector_ef_runtime != 0 && !(10..=4096).contains(&self.vector_ef_runtime) {
+            return Err(format!(
+                "--vector-ef-runtime {} out of range (10-4096, or 0 for the auto heuristic)",
+                self.vector_ef_runtime
+            ));
+        }
+        if !(1..=64).contains(&self.vector_rerank_mult) {
+            return Err(format!(
+                "--vector-rerank-mult {} out of range (1-64)",
+                self.vector_rerank_mult
+            ));
+        }
+        if self.graph_result_cache_entries == 0 {
+            return Err(
+                "--graph-result-cache-entries must be >= 1 (the cache cannot be sized to zero                  entries; it is admission-gated, not disableable by size)"
+                    .to_string(),
+            );
+        }
+        if self.graph_result_cache_bytes < 4096 {
+            return Err(format!(
+                "--graph-result-cache-bytes {} too small (minimum 4096)",
+                self.graph_result_cache_bytes
+            ));
+        }
+        Ok(())
+    }
+
     pub fn validate_databases_bound(&self) -> Result<(), String> {
         if self.databases > MAX_DATABASES {
             return Err(format!(
@@ -1608,6 +1689,57 @@ mod tests {
     fn test_shards_zero_is_explicit_auto_detect() {
         let config = ServerConfig::parse_from(["moon", "--shards", "0"]);
         assert_eq!(config.shards, 0);
+    }
+
+    // ── Vector/graph tuning-default flags ─────────────────────────────────
+
+    #[test]
+    fn test_tuning_default_flags_parse_and_default() {
+        let config = ServerConfig::parse_from::<[&str; 0], &str>([]);
+        assert_eq!(config.vector_ef_runtime, 0);
+        assert_eq!(config.vector_rerank_mult, 4);
+        assert!(!config.vector_exact_beam);
+        assert_eq!(config.graph_result_cache_entries, 256);
+        assert_eq!(config.graph_result_cache_bytes, 4_194_304);
+        assert!(config.validate_tuning_defaults().is_ok());
+
+        let config = ServerConfig::parse_from([
+            "moon",
+            "--vector-ef-runtime",
+            "256",
+            "--vector-rerank-mult",
+            "16",
+            "--vector-exact-beam",
+            "--graph-result-cache-entries",
+            "1024",
+            "--graph-result-cache-bytes",
+            "8388608",
+        ]);
+        assert_eq!(config.vector_ef_runtime, 256);
+        assert_eq!(config.vector_rerank_mult, 16);
+        assert!(config.vector_exact_beam);
+        assert_eq!(config.graph_result_cache_entries, 1024);
+        assert_eq!(config.graph_result_cache_bytes, 8_388_608);
+        assert!(config.validate_tuning_defaults().is_ok());
+    }
+
+    #[test]
+    fn test_tuning_default_flags_out_of_range_rejected() {
+        // Same ranges as FT.CONFIG: ef 10-4096 (or 0), mult 1-64.
+        for args in [
+            vec!["moon", "--vector-ef-runtime", "5"],
+            vec!["moon", "--vector-ef-runtime", "5000"],
+            vec!["moon", "--vector-rerank-mult", "0"],
+            vec!["moon", "--vector-rerank-mult", "65"],
+            vec!["moon", "--graph-result-cache-entries", "0"],
+            vec!["moon", "--graph-result-cache-bytes", "100"],
+        ] {
+            let config = ServerConfig::parse_from(args.clone());
+            assert!(
+                config.validate_tuning_defaults().is_err(),
+                "expected startup rejection for {args:?}"
+            );
+        }
     }
 
     // ── WS5a round 2 (adversarial review finding 2): --databases bound ────

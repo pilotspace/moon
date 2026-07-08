@@ -103,6 +103,7 @@ pub const BOOL_FLAGS: &[&str] = &[
     "unsafe-multishard-aof",
     "experimental-per-shard-rewrite",
     "cluster-enabled",
+    "vector-exact-beam",
 ];
 
 /// Parse a conf file and return a list of synthesised argv tokens.
@@ -454,6 +455,23 @@ mod tests {
         // `cluster_enabled yes` normalises to `cluster-enabled` → bool flag.
         let tokens = parse_conf_contents("cluster_enabled yes\n").unwrap();
         assert_eq!(tokens, vec!["--cluster-enabled"]);
+    }
+
+    #[test]
+    fn vector_exact_beam_is_a_bool_flag() {
+        // moon.conf: `vector-exact-beam yes` must synthesise the bare flag.
+        let tokens = parse_conf_contents(
+            "vector-exact-beam yes
+",
+        )
+        .unwrap();
+        assert_eq!(tokens, vec!["--vector-exact-beam"]);
+        let tokens = parse_conf_contents(
+            "vector-exact-beam no
+",
+        )
+        .unwrap();
+        assert!(tokens.is_empty());
     }
 
     #[test]
