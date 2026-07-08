@@ -2185,4 +2185,37 @@ mod tests {
         assert_eq!(result, Frame::SimpleString(Bytes::from_static(b"OK")));
         assert_eq!(db.len(), 0);
     }
+
+    // --- OBJECT HELP regression tests (WS1 command-parity audit: found
+    // already implemented on both the mutable and read-only tracks; these
+    // tests lock in that coverage against regression). ---
+
+    #[test]
+    fn test_object_help_mutable_track() {
+        let mut db = Database::new();
+        let result = object(&mut db, &[bs(b"HELP")]);
+        match result {
+            Frame::Array(ref arr) => {
+                assert!(!arr.is_empty());
+                // First line names the command family, matching Redis's
+                // "<CMD> <subcommand> ..." HELP convention.
+                assert!(matches!(&arr[0], Frame::BulkString(b) if b.starts_with(b"OBJECT")));
+            }
+            other => panic!("expected array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_object_help_readonly_track() {
+        let db = Database::new();
+        let result = object_readonly(&db, &[bs(b"HELP")], 0);
+        assert!(matches!(result, Frame::Array(_)));
+    }
+
+    #[test]
+    fn test_object_unknown_subcommand_errors() {
+        let mut db = Database::new();
+        let result = object(&mut db, &[bs(b"BOGUS")]);
+        assert!(matches!(result, Frame::Error(_)));
+    }
 }

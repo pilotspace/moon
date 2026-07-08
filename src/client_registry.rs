@@ -305,6 +305,20 @@ pub fn parse_kill_args(args: &[&[u8]]) -> Option<KillFilter> {
     None
 }
 
+/// Format one CLIENT LIST/INFO line.
+///
+/// Field set matches real Redis (`clientCommand`/`catClientInfoString`) so
+/// tooling that parses CLIENT LIST by key (redis-cli, client libraries,
+/// `redis_exporter`) doesn't choke on missing keys. Fields Moon doesn't
+/// track yet (`laddr`, `rbs`/`rbp`/`obl`/`oll`/`omem`, `tot-net-in/out`,
+/// `cmd`, `events`) are emitted with honest placeholder values (0 / "NULL" /
+/// unknown) rather than omitted — see docs/redis-compat.md for the list of
+/// fields that are structurally present but not yet semantically populated.
+///
+/// `redir` and the tracking flag char (`t`) are intentionally left at their
+/// "off" defaults (`redir=-1`, never appended to `flags`): PR #234 is adding
+/// real CLIENT TRACKING state, and that work owns wiring these two fields to
+/// live data. Do not add tracking introspection here — it would conflict.
 fn format_client_line(buf: &mut String, entry: &ClientEntry, now: Instant) {
     use std::fmt::Write;
     let live = &*entry.live;
@@ -316,10 +330,11 @@ fn format_client_line(buf: &mut String, entry: &ClientEntry, now: Instant) {
     let db = live.db.load(Ordering::Relaxed);
     let _ = writeln!(
         buf,
-        "id={} addr={} fd=0 name={} db={} sub=0 psub=0 ssub=0 multi=-1 \
-         watch=0 qbuf=0 qbuf-free=0 argv-mem=0 tot-mem=0 net-i=0 net-o=0 \
-         age={} idle={} flags={} user={}",
-        entry.id, entry.addr, name, db, age, idle, flags, entry.user,
+        "id={} addr={} laddr=127.0.0.1:0 fd=0 name={} age={} idle={} flags={} db={} \
+         sub=0 psub=0 ssub=0 multi=-1 watch=0 qbuf=0 qbuf-free=0 argv-mem=0 multi-mem=0 \
+         tot-net-in=0 tot-net-out=0 rbs=1024 rbp=0 obl=0 oll=0 omem=0 tot-mem=0 events=r \
+         cmd=NULL user={} redir=-1 resp=2 lib-name= lib-ver=",
+        entry.id, entry.addr, name, age, idle, flags, db, entry.user,
     );
 }
 
@@ -349,6 +364,57 @@ mod tests {
         assert!(info.as_ref().is_some_and(|s| s.contains("user=alice")));
         deregister(id);
         assert!(client_info(id).is_none());
+    }
+
+    /// CLIENT LIST/INFO field-set completeness: every key real Redis emits
+    /// (`catClientInfoString`) must be present so key=value parsers (redis-cli,
+    /// client libraries, exporters) never choke on a missing field.
+    #[test]
+    fn test_client_info_field_set_matches_redis() {
+        let id = 999_030;
+        register(id, "10.0.0.3:7000".into(), "carol".into(), 0, -1);
+        let info = client_info(id).expect("registered client has info");
+        for field in [
+            "id=",
+            "addr=",
+            "laddr=",
+            "fd=",
+            "name=",
+            "age=",
+            "idle=",
+            "flags=",
+            "db=",
+            "sub=",
+            "psub=",
+            "ssub=",
+            "multi=",
+            "watch=",
+            "qbuf=",
+            "qbuf-free=",
+            "argv-mem=",
+            "multi-mem=",
+            "tot-net-in=",
+            "tot-net-out=",
+            "rbs=",
+            "rbp=",
+            "obl=",
+            "oll=",
+            "omem=",
+            "tot-mem=",
+            "events=",
+            "cmd=",
+            "user=",
+            "redir=",
+            "resp=",
+            "lib-name=",
+            "lib-ver=",
+        ] {
+            assert!(
+                info.contains(field),
+                "CLIENT INFO missing field {field:?} in {info:?}"
+            );
+        }
+        deregister(id);
     }
 
     #[test]
