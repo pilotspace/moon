@@ -1611,6 +1611,8 @@ pub(crate) async fn handle_connection_sharded_inner<
                             }
                             // R3: FLUSHALL/FLUSHDB clears vector + text index contents
                             // (FT.CREATE definitions survive, matching restart semantics).
+                            // WS5a: FLUSHDB scopes to `conn.selected_db`; FLUSHALL clears
+                            // every db.
                             if !matches!(response, Frame::Error(_))
                                 && (cmd.eq_ignore_ascii_case(b"FLUSHDB")
                                     || cmd.eq_ignore_ascii_case(b"FLUSHALL"))
@@ -1619,6 +1621,8 @@ pub(crate) async fn handle_connection_sharded_inner<
                                     crate::shard::spsc_handler::auto_flush_indexes(
                                         &mut s.vector_store,
                                         &mut s.text_store,
+                                        cmd.eq_ignore_ascii_case(b"FLUSHDB"),
+                                        conn.selected_db as u8,
                                     );
                                 });
                                 // D-2: keyless flush routed local-only cleared just this

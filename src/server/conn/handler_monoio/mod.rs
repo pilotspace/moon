@@ -1493,7 +1493,8 @@ pub(crate) async fn handle_connection_sharded_monoio<
                         }
 
                         // R3: FLUSHALL/FLUSHDB clears index contents
-                        // (FT.CREATE definitions survive).
+                        // (FT.CREATE definitions survive). WS5a: FLUSHDB
+                        // scopes to `sel_db`; FLUSHALL clears every db.
                         if !is_error
                             && (cmd.eq_ignore_ascii_case(b"FLUSHDB")
                                 || cmd.eq_ignore_ascii_case(b"FLUSHALL"))
@@ -1501,6 +1502,8 @@ pub(crate) async fn handle_connection_sharded_monoio<
                             crate::shard::spsc_handler::auto_flush_indexes(
                                 &mut s.vector_store,
                                 &mut s.text_store,
+                                cmd.eq_ignore_ascii_case(b"FLUSHDB"),
+                                sel_db as u8,
                             );
                         }
 

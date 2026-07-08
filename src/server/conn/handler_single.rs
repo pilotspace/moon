@@ -1277,9 +1277,23 @@ pub async fn handle_connection(
                                                     // R3 parity inside MULTI/EXEC (text
                                                     // store cleared via its own guard or
                                                     // the throwaway fallback store).
-                                                    vs.lock().clear_all_contents();
-                                                    if let Some(ref ts) = text_store {
-                                                        ts.lock().clear_all_contents();
+                                                    // WS5a: FLUSHDB scopes to
+                                                    // `conn.selected_db`; FLUSHALL clears
+                                                    // every db.
+                                                    if c.eq_ignore_ascii_case(b"FLUSHDB") {
+                                                        vs.lock().clear_all_contents_for_db(
+                                                            conn.selected_db as u8,
+                                                        );
+                                                        if let Some(ref ts) = text_store {
+                                                            ts.lock().clear_all_contents_for_db(
+                                                                conn.selected_db as u8,
+                                                            );
+                                                        }
+                                                    } else {
+                                                        vs.lock().clear_all_contents();
+                                                        if let Some(ref ts) = text_store {
+                                                            ts.lock().clear_all_contents();
+                                                        }
                                                     }
                                                 }
                                             }
@@ -2418,15 +2432,28 @@ pub async fn handle_connection(
 
                                 // R3: FLUSHALL/FLUSHDB clears vector + text index
                                 // contents (FT.CREATE definitions survive).
+                                // WS5a: FLUSHDB scopes to `conn.selected_db`;
+                                // FLUSHALL clears every db.
                                 if !matches!(&response, Frame::Error(_))
                                     && (d_cmd.eq_ignore_ascii_case(b"FLUSHDB")
                                         || d_cmd.eq_ignore_ascii_case(b"FLUSHALL"))
                                 {
-                                    if let Some(ref vs) = vector_store {
-                                        vs.lock().clear_all_contents();
-                                    }
-                                    if let Some(ref ts) = text_store {
-                                        ts.lock().clear_all_contents();
+                                    if d_cmd.eq_ignore_ascii_case(b"FLUSHDB") {
+                                        if let Some(ref vs) = vector_store {
+                                            vs.lock()
+                                                .clear_all_contents_for_db(conn.selected_db as u8);
+                                        }
+                                        if let Some(ref ts) = text_store {
+                                            ts.lock()
+                                                .clear_all_contents_for_db(conn.selected_db as u8);
+                                        }
+                                    } else {
+                                        if let Some(ref vs) = vector_store {
+                                            vs.lock().clear_all_contents();
+                                        }
+                                        if let Some(ref ts) = text_store {
+                                            ts.lock().clear_all_contents();
+                                        }
                                     }
                                 }
 

@@ -298,6 +298,7 @@ pub(crate) fn execute_transaction_sharded(
         }
 
         // R3: FLUSHALL/FLUSHDB clears index contents (definitions survive).
+        // WS5a: FLUSHDB scopes to `selected`; FLUSHALL clears every db.
         if !matches!(response, Frame::Error(_))
             && (cmd.eq_ignore_ascii_case(b"FLUSHDB") || cmd.eq_ignore_ascii_case(b"FLUSHALL"))
         {
@@ -305,6 +306,8 @@ pub(crate) fn execute_transaction_sharded(
                 crate::shard::spsc_handler::auto_flush_indexes(
                     &mut s.vector_store,
                     &mut s.text_store,
+                    cmd.eq_ignore_ascii_case(b"FLUSHDB"),
+                    selected as u8,
                 );
             });
         }

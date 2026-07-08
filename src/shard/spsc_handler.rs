@@ -1123,11 +1123,17 @@ pub(crate) fn handle_shard_message_shared(
                     }
 
                     // R3: FLUSHALL/FLUSHDB clears index contents (definitions kept).
+                    // WS5a: FLUSHDB scopes to `db_idx`; FLUSHALL clears every db.
                     if !matches!(frame, crate::protocol::Frame::Error(_))
                         && (cmd.eq_ignore_ascii_case(b"FLUSHDB")
                             || cmd.eq_ignore_ascii_case(b"FLUSHALL"))
                     {
-                        auto_flush_indexes(&mut s.vector_store, &mut s.text_store);
+                        auto_flush_indexes(
+                            &mut s.vector_store,
+                            &mut s.text_store,
+                            cmd.eq_ignore_ascii_case(b"FLUSHDB"),
+                            db_idx as u8,
+                        );
                     }
 
                     // Post-dispatch wakeup hooks for producer commands (cross-shard blocking)
@@ -1716,11 +1722,17 @@ pub(crate) fn handle_shard_message_shared(
                     }
 
                     // R3: FLUSHALL/FLUSHDB clears index contents (definitions kept).
+                    // WS5a: FLUSHDB scopes to `db_idx`; FLUSHALL clears every db.
                     if !matches!(frame, crate::protocol::Frame::Error(_))
                         && (cmd.eq_ignore_ascii_case(b"FLUSHDB")
                             || cmd.eq_ignore_ascii_case(b"FLUSHALL"))
                     {
-                        auto_flush_indexes(&mut s.vector_store, &mut s.text_store);
+                        auto_flush_indexes(
+                            &mut s.vector_store,
+                            &mut s.text_store,
+                            cmd.eq_ignore_ascii_case(b"FLUSHDB"),
+                            db_idx as u8,
+                        );
                     }
 
                     if !matches!(frame, crate::protocol::Frame::Error(_)) {
@@ -2644,15 +2656,30 @@ pub fn auto_delete_vectors(vector_store: &mut VectorStore, args: &[crate::protoc
 /// the HSET auto-index hook must run this on a successful FLUSH, or flushed
 /// hashes stay searchable as ghost documents until restart.
 ///
-/// Moon FT indexes are keyspace-global (the auto-index hook is not gated on
-/// the selected db), so FLUSHDB of any db clears all index contents — the
-/// same over-approximation the restart rescan would produce.
+/// WS5a (db-scoped indexes): FLUSHDB (`is_flushdb = true`) now clears ONLY
+/// the contents of indexes owned by `db_index` — every other db's index
+/// contents survive. FLUSHALL (`is_flushdb = false`) still clears every
+/// db's contents, matching Redis semantics for a whole-keyspace flush.
+///
+/// NOTE: this only fixes the CONTENTS side of FLUSHDB scoping. The
+/// auto-index HSET hook that FEEDS these indexes is not yet db-scoped (see
+/// `find_matching_index_names` call sites and the WS5a gap report in
+/// `.planning/v0.6.0-release/WS5A-NOTES.md`), so a HSET issued in another db
+/// can still repopulate an index immediately after a scoped FLUSHDB. Full
+/// closure requires migrating the auto-index hook too.
 pub fn auto_flush_indexes(
     vector_store: &mut VectorStore,
     text_store: &mut crate::text::store::TextStore,
+    is_flushdb: bool,
+    db_index: u8,
 ) {
-    vector_store.clear_all_contents();
-    text_store.clear_all_contents();
+    if is_flushdb {
+        vector_store.clear_all_contents_for_db(db_index);
+        text_store.clear_all_contents_for_db(db_index);
+    } else {
+        vector_store.clear_all_contents();
+        text_store.clear_all_contents();
+    }
 }
 
 /// HDEL parity (persistence-review R4): a successful `HDEL key field...`
