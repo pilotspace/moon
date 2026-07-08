@@ -122,6 +122,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `scripts/test-consistency.sh` (+section 9b) and `scripts/test-commands.sh`
   (key-commands category) gained coverage for all four new commands.
 
+### Fixed — WS5b fix-first adversarial review: db-quota bypass on non-inline writes
+
+- **Critical**: `--maxmemory 0` combined with `--disk-offload disable` (no
+  disk-offload spill sender) silently bypassed the per-db quota gate for
+  every non-inline write command (HSET/LPUSH/SADD/ZADD/INCR/APPEND/MSET/
+  SET-with-options/RESTORE/...) — plain `SET`/`GET` were unaffected because
+  they take a separate, always-correctly-gated inline fast path. Root cause:
+  `handler_monoio`'s `batch_eviction_active` and its cross-shard-leg twin
+  `spsc_handler`'s `evict_active` only checked
+  `spill_sender.is_some() || maxmemory != 0`, entirely skipping the
+  write-eviction-gate call (and the db-quota check nested inside it) when
+  neither was true. Fixed by adding `db_quota::db_maxmemory_any_set()` to
+  both conditions, mirroring the Lua bridge's gate (which already had this
+  term). RED/GREEN TDD via `git apply -R`; new integration test
+  `test_quota_rejects_non_inline_writes_without_spill_sender` in
+  `tests/db_maxmemory_quota.rs` (HSET + SET-with-EX). Manually re-verified
+  `RESTORE` also rides the fixed gate (rejected before payload
+  deserialization).
+- Along the way, found a second, independent, pre-existing bug: `used_memory`
+  accounting for Hash (and, by the same code pattern, List/Set/ZSet) is only
+  charged once at key-creation time for the empty container's overhead —
+  subsequent field/element inserts into an EXISTING key never update
+  `used_memory`. This defeats the *global* `--maxmemory` gate identically
+  (verified: growing one hash key's fields never trips a small
+  `--maxmemory` cap regardless of value size), so it predates and is
+  independent of db-quota. Out of scope to fix here (touches every
+  container-type mutation site, a much larger body of work); documented as
+  a known limitation. The new regression test works around it by using a
+  fresh key per HSET (each key's flat creation overhead is tracked
+  correctly) rather than growing one shared key's fields.
+- `--db-maxmemory` CLI parsing now fails fast at startup (`REFUSING TO
+  START:` + nonzero exit, matching this file's existing trusted-config
+  validation convention) instead of silently warning and dropping a
+  malformed/out-of-range entry — this is trusted operator config supplied
+  at launch, not untrusted wire input, so a typo should refuse to start
+  rather than silently leave a db unprotected. `CONFIG SET db-maxmemory`
+  was already this strict; the CLI form now matches. New
+  `config::validate_db_maxmemory_cli()`; new tests
+  `test_malformed_db_maxmemory_cli_refuses_to_start` /
+  `test_out_of_range_db_maxmemory_cli_refuses_to_start`.
+- Documented (not changed): `WS DROP`'s all-dbs cascade-delete sweep is a
+  synchronous, in-place O(total keys × `--databases`) scan on the owning
+  shard's event-loop thread — it blocks every other connection pinned to
+  that shard for the duration. Accepted trade-off for an admin-rare
+  operation at the default `--databases 16`; flagged in
+  `docs/guides/isolation.md` and inline code comments for large-keyspace,
+  large-`--databases` deployments.
+
 ### Added — per-db resource quotas + workspace hardening sweep (WS5b, PR #TBD)
 
 - New per-db memory quota: `--db-maxmemory <db>:<bytes>` (repeatable CLI

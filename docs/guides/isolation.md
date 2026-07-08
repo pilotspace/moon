@@ -63,6 +63,20 @@ if a guarantee isn't listed here, don't assume it holds.
   connections that `SELECT` non-zero dbs should treat prior `WS DROP`
   calls as having potentially leaked keys, recoverable only via manual
   `SCAN` for the `{ws_hex}:*` prefix pattern.
+- **`WS DROP`'s all-dbs sweep is synchronous and O(total keys × --databases)
+  on the owning shard's event-loop thread.** The fix above trades a
+  permanent leak for a full linear scan of every key in every logical db on
+  that shard, run inline (no yield points) during `WS DROP`'s handling —
+  it blocks that shard thread for the duration, i.e. it stalls every other
+  connection pinned to the same shard while it runs. At the default
+  `--databases 16` and typical workspace-sized keyspaces this is
+  sub-millisecond and not worth optimizing; it becomes a real latency spike
+  on a shard holding a very large keyspace (millions of keys) combined with
+  a large `--databases` count. `WS DROP` is an admin-rare operation (create
+  a tenant once, drop it once), so this is an accepted trade-off, not
+  scheduled for a fix — flagging it here so a large-`--databases`,
+  large-keyspace deployment doesn't discover it as a surprise production
+  latency blip.
 - **`FLUSHDB` does not respect workspace boundaries** — see above.
 - **Not a security boundary on its own**: `WS AUTH` requires knowing the
   workspace's UUID v7. There is no password/ACL gate on `WS AUTH` itself
@@ -135,6 +149,41 @@ if a guarantee isn't listed here, don't assume it holds.
   remain, because the bounded retry gives up first. Not introduced or
   fixed by db-quota work; noted here because it is easy to mistake for a
   db-quota bug when writing tests against a small dataset.
+- **Non-inline write commands were bypassing the quota gate entirely**
+  (fixed): `--maxmemory 0` combined with no disk-offload spill sender
+  (e.g. `--disk-offload disable`) meant `handler_monoio`'s
+  `batch_eviction_active` (and the cross-shard-leg twin `spsc_handler`'s
+  `evict_active`) never ran the write-eviction-gate call at all for any
+  command other than the byte-level inline GET/SET fast path — so HSET,
+  LPUSH, SADD, ZADD, INCR, APPEND, MSET, SET-with-options, RESTORE, and
+  every other non-inline write silently ignored a configured db quota.
+  Found via adversarial review, fixed by adding
+  `db_quota::db_maxmemory_any_set()` to both conditions (mirroring the Lua
+  bridge's gate, which already had this term). Covered by
+  `test_quota_rejects_non_inline_writes_without_spill_sender` in
+  `tests/db_maxmemory_quota.rs`.
+- **Pre-existing, independent, systemic gap: container-type memory
+  accounting doesn't track growth after key creation.** `used_memory` is
+  charged once, at key-creation time, for an empty container's fixed
+  overhead (`entry_overhead()` in `src/storage/db.rs`, called immediately
+  after `Entry::new_hash()`/equivalent, before any fields/elements are
+  inserted). Every subsequent mutation of that SAME key — `HSET`'s
+  `map.insert(field, value)`, and the equivalent direct-collection-mutation
+  pattern in List/Set/ZSet write commands — never updates `used_memory`
+  again. Growing one hash key's fields therefore never grows its accounted
+  memory, no matter how large the values are. **This defeats the global
+  `--maxmemory` gate identically** (verified empirically: repeated HSETs
+  into one key never tripped a small `--maxmemory` cap) — it is NOT a
+  db-quota-specific bug, predates this feature, and is orthogonal to it.
+  Fixing it properly means auditing and patching every container-type
+  mutation site for delta-tracking (a much larger body of work than
+  per-db quotas), so it is documented here rather than fixed. Operators
+  relying on `--maxmemory` or `--db-maxmemory` to bound memory should be
+  aware that **workloads dominated by growing existing Hash/List/Set/ZSet
+  keys are effectively invisible to both eviction gates** — only new-key
+  creation and plain string SET/APPEND are accurately accounted today. The
+  `db-quota` regression test above works around this by using a fresh
+  key per HSET rather than growing one shared key's fields.
 
 ## FT.* / vector indexes and workspaces (handoff note — WS5a scope)
 
@@ -173,4 +222,4 @@ is an observational finding for WS5a to fold in, not a WS5b fix:
 |---|---|---|
 | `SELECT` (logical db) | Keys in db N invisible to db M via normal KV ops | Auth/ACL boundary; `FLUSHDB` still whole-db |
 | Workspaces (`WS AUTH`) | No keyspace collision between workspaces, even same db | Auth boundary (no password on `WS AUTH`); not `FLUSHDB`-safe; `FT.*` indexes not workspace-scoped |
-| `db-maxmemory` quota | Per-db memory ceiling, independent of sibling dbs, zero-cost when unset | Not spill-integrated; `MOVE`/`SWAPDB` reconciled lazily not synchronously; shares the SELECT-exemption quirk with global maxmemory (both now fixed for db-quota, global left as-is) |
+| `db-maxmemory` quota | Per-db memory ceiling, independent of sibling dbs, zero-cost when unset, covers ALL write commands (inline and non-inline alike, including RESTORE) | Not spill-integrated; `MOVE`/`SWAPDB` reconciled lazily not synchronously; shares the SELECT-exemption quirk with global maxmemory (both now fixed for db-quota, global left as-is); does not see memory growth from mutating an EXISTING Hash/List/Set/ZSet key (pre-existing, systemic, also affects global `--maxmemory`) |

@@ -2288,6 +2288,14 @@ pub(crate) fn handle_shard_message_shared(
             // A db-0-only sweep (the original implementation) silently
             // leaked those keys forever after WS DROP — found during the
             // WS5b hardening sweep (docs/guides/isolation.md).
+            //
+            // Cost note: this is a synchronous, in-place O(total keys ×
+            // --databases) full scan on THIS shard's event-loop thread — no
+            // yield points, so it blocks every other connection pinned to
+            // this shard for the duration. Accepted trade-off for an
+            // admin-rare operation (create/drop a tenant); see
+            // docs/guides/isolation.md's "WS DROP" cost-note for the
+            // large-keyspace / large---databases caveat.
             let deleted_count = crate::shard::slice::with_shard(|s| {
                 let mut total = 0u64;
                 for db in s.databases.iter_mut() {

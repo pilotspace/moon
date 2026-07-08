@@ -126,7 +126,11 @@ pub(super) async fn try_handle_ws_command(
                             // legitimately live outside db 0. A db-0-only
                             // sweep leaked those keys forever after WS DROP
                             // (found during the WS5b hardening sweep; see
-                            // docs/guides/isolation.md).
+                            // docs/guides/isolation.md). Cost note:
+                            // synchronous O(keys × --databases) full scan on
+                            // this shard's event-loop thread — see the fuller
+                            // comment on the `WsDropCleanup` handler in
+                            // src/shard/spsc_handler.rs.
                             crate::shard::slice::with_shard(|s| {
                                 for db in s.databases.iter_mut() {
                                     let keys_to_delete: Vec<Vec<u8>> = db
