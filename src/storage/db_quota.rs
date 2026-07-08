@@ -131,7 +131,9 @@ fn command_exempt_from_db_quota(cmd: &[u8]) -> bool {
 ///   gate at all.
 /// - `ZREM` / `ZPOPMIN` / `ZPOPMAX` / `ZMPOP` / `BZPOPMIN` / `BZPOPMAX` /
 ///   `BZMPOP` / `ZREMRANGEBYSCORE` / `ZREMRANGEBYRANK` / `ZREMRANGEBYLEX`:
-///   sorted-set shrink.
+///   sorted-set shrink. (The three `ZREMRANGEBY*` entries are forward
+///   declarations — moon does not dispatch them yet; they are inert here
+///   until the commands exist, at which point they are already exempted.)
 /// - `GETDEL`: string delete-on-read.
 /// - `EXPIRE` / `PEXPIRE` / `EXPIREAT` / `PEXPIREAT` / `PERSIST`: can only
 ///   hasten or cancel reclamation of an already-live key; a TTL sidecar's
