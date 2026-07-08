@@ -2232,6 +2232,7 @@ pub async fn scatter_text_search(
     spsc_notifiers: &[Arc<channel::Notify>],
     highlight_opts: Option<crate::command::vector_search::HighlightOpts>,
     summarize_opts: Option<crate::command::vector_search::SummarizeOpts>,
+    db_index: u8,
 ) -> Frame {
     let _ = shard_databases; // E2 removes
 
@@ -2244,16 +2245,18 @@ pub async fn scatter_text_search(
         let parse_result: Result<
             (Vec<(Option<usize>, Vec<String>)>, Vec<String>),
             crate::protocol::Frame,
-        > = crate::shard::slice::with_shard(|s| match s.text_store.get_index(&index_name) {
-            None => Err(Frame::Error(Bytes::from_static(b"ERR no such index"))),
-            Some(text_index) => {
-                let schema = QuerySchema::from_index(text_index);
-                match crate::text::query::parse_query(&query, &schema) {
-                    Err(e) => Err(Frame::Error(Bytes::copy_from_slice(e.code().as_bytes()))),
-                    Ok(node) => {
-                        let fq = collect_df_field_terms(&node, text_index);
-                        let ts = collect_highlight_terms(&node, text_index);
-                        Ok((fq, ts))
+        > = crate::shard::slice::with_shard(|s| {
+            match s.text_store.get_index_for_db(&index_name, db_index) {
+                None => Err(Frame::Error(Bytes::from_static(b"ERR no such index"))),
+                Some(text_index) => {
+                    let schema = QuerySchema::from_index(text_index);
+                    match crate::text::query::parse_query(&query, &schema) {
+                        Err(e) => Err(Frame::Error(Bytes::copy_from_slice(e.code().as_bytes()))),
+                        Ok(node) => {
+                            let fq = collect_df_field_terms(&node, text_index);
+                            let ts = collect_highlight_terms(&node, text_index);
+                            Ok((fq, ts))
+                        }
                     }
                 }
             }
@@ -2276,7 +2279,7 @@ pub async fn scatter_text_search(
         // `with_shard` call to avoid a reentrant `with_shard*` panic.
         let result = crate::shard::slice::with_shard(|s| {
             let ts = &s.text_store;
-            let text_index = match ts.get_index(&index_name) {
+            let text_index = match ts.get_index_for_db(&index_name, db_index) {
                 Some(idx) => idx,
                 None => return Frame::Error(Bytes::from_static(b"ERR no such index")),
             };
@@ -2286,8 +2289,8 @@ pub async fn scatter_text_search(
                     text_index, &query, None, None, top_k, offset, count,
                 );
                 if highlight_opts.is_some() || summarize_opts.is_some() {
-                    // databases[0] borrowed disjointly from text_store — both live on `s`.
-                    if let Some(db) = s.databases.get_mut(0) {
+                    // databases[db_index] borrowed disjointly from text_store — both live on `s`.
+                    if let Some(db) = s.databases.get_mut(db_index as usize) {
                         crate::command::vector_search::ft_text_search::apply_post_processing(
                             &mut r,
                             &term_strings,
@@ -2320,8 +2323,8 @@ pub async fn scatter_text_search(
         if shard_id == my_shard {
             // Local: extract df/N directly — no SPSC overhead.
             // Shard slice released before any .await.
-            let response =
-                crate::shard::slice::with_shard(|s| match s.text_store.get_index(&index_name) {
+            let response = crate::shard::slice::with_shard(|s| {
+                match s.text_store.get_index_for_db(&index_name, db_index) {
                     Some(text_index) => {
                         let mut items: Vec<Frame> = Vec::new();
                         for (field_idx_opt, terms) in &field_queries {
@@ -2337,15 +2340,17 @@ pub async fn scatter_text_search(
                         Frame::Array(items.into())
                     }
                     None => Frame::Error(Bytes::from_static(b"ERR unknown index")),
-                });
+                }
+            });
             local_doc_freq = Some(response);
         } else {
             let (reply_tx, reply_rx) = channel::oneshot();
-            let msg = ShardMessage::DocFreq {
+            let msg = ShardMessage::DocFreq(Box::new(crate::shard::dispatch::DocFreqPayload {
                 index_name: index_name.clone(),
                 field_queries: field_queries.clone(),
                 reply_tx,
-            };
+                db_index,
+            }));
             let _ = spsc_send(dispatch_tx, my_shard, shard_id, msg, spsc_notifiers).await;
             doc_freq_receivers.push(reply_rx);
         }
@@ -2380,7 +2385,7 @@ pub async fn scatter_text_search(
             // text_store + databases[0] folded into a single `with_shard` to
             // avoid reentrant `with_shard*` panic. Slice released before .await.
             let response = crate::shard::slice::with_shard(|s| {
-                match s.text_store.get_index(&index_name) {
+                match s.text_store.get_index_for_db(&index_name, db_index) {
                     Some(text_index) => {
                         #[cfg(feature = "text-index")]
                         {
@@ -2394,7 +2399,7 @@ pub async fn scatter_text_search(
                                 top_k,
                             );
                             if highlight_opts.is_some() || summarize_opts.is_some() {
-                                if let Some(db) = s.databases.get_mut(0) {
+                                if let Some(db) = s.databases.get_mut(db_index as usize) {
                                     crate::command::vector_search::ft_text_search::apply_post_processing(
                                         &mut r,
                                         &term_strings,
@@ -2433,6 +2438,7 @@ pub async fn scatter_text_search(
                     highlight_opts: highlight_opts.clone(),
                     summarize_opts: summarize_opts.clone(),
                     reply_tx,
+                    db_index,
                 }));
             let _ = spsc_send(dispatch_tx, my_shard, shard_id, msg, spsc_notifiers).await;
             search_receivers.push(reply_rx);
@@ -2487,12 +2493,13 @@ pub async fn scatter_text_search_filter(
     shard_databases: &Arc<ShardDatabases>,
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
     spsc_notifiers: &[Arc<channel::Notify>],
+    db_index: u8,
 ) -> Frame {
     let _ = shard_databases; // E2 removes
     // ── Single-shard fast path ────────────────────────────────────────────────
     if num_shards == 1 {
-        let response =
-            crate::shard::slice::with_shard(|s| match s.text_store.get_index(&index_name) {
+        let response = crate::shard::slice::with_shard(|s| {
+            match s.text_store.get_index_for_db(&index_name, db_index) {
                 None => Frame::Error(Bytes::from_static(b"ERR no such index")),
                 Some(text_index) => {
                     let clause = crate::command::vector_search::ft_text_search::TextQueryClause {
@@ -2508,7 +2515,8 @@ pub async fn scatter_text_search_filter(
                         &results, offset, count,
                     )
                 }
-            });
+            }
+        });
         return response;
     }
 
@@ -2519,8 +2527,8 @@ pub async fn scatter_text_search_filter(
 
     for shard_id in 0..num_shards {
         if shard_id == my_shard {
-            let response =
-                crate::shard::slice::with_shard(|s| match s.text_store.get_index(&index_name) {
+            let response = crate::shard::slice::with_shard(|s| {
+                match s.text_store.get_index_for_db(&index_name, db_index) {
                     None => Frame::Error(Bytes::from_static(b"ERR no such index")),
                     Some(text_index) => {
                         let clause =
@@ -2539,7 +2547,8 @@ pub async fn scatter_text_search_filter(
                             &results, 0, top_k,
                         )
                     }
-                });
+                }
+            });
             local_response = Some(response);
         } else {
             let (reply_tx, reply_rx) = channel::oneshot();
@@ -2551,6 +2560,7 @@ pub async fn scatter_text_search_filter(
                     offset: 0,
                     count: top_k,
                     reply_tx,
+                    db_index,
                 },
             ));
             let _ = spsc_send(dispatch_tx, my_shard, shard_id, msg, spsc_notifiers).await;
@@ -3064,8 +3074,8 @@ mod tests {
     #[tokio::test]
     async fn test_scatter_text_search_single_shard_skips_dfs() {
         // Single-shard (num_shards==1): scatter_text_search must return immediately
-        // from execute_text_search_local without sending any DocFreq or TextSearch
-        // ShardMessages via SPSC. We verify this by:
+        // from its own inline fast path (run_text_query_on_index) without sending
+        // any DocFreq or TextSearch ShardMessages via SPSC. We verify this by:
         //   1. Passing an empty dispatch_tx (no SPSC channels — would panic if used)
         //   2. Verifying the result is an Array (success format, not a channel error)
         //
@@ -3075,7 +3085,7 @@ mod tests {
 
         let dbs = vec![Database::new()];
         let (shard_databases_inner, mut inits) = ShardDatabases::new(vec![dbs]);
-        // scatter_text_search calls execute_text_search_local which uses with_shard;
+        // scatter_text_search's single-shard fast path uses with_shard directly;
         // ShardSlice must be initialized on this thread.
         crate::shard::slice::reset_test_shard(crate::shard::slice::ShardSlice::new(
             inits.remove(0),
@@ -3100,6 +3110,7 @@ mod tests {
             &notifiers,
             None, // highlight_opts
             None, // summarize_opts
+            0,    // db_index
         )
         .await;
 

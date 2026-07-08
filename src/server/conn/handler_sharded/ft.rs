@@ -207,6 +207,7 @@ pub(super) async fn try_handle_ft_command(
                     &ctx.spsc_notifiers,
                     highlight_opts,
                     summarize_opts,
+                    conn.selected_db as u8,
                 )
                 .await;
                 if let Some(ws_id) = conn.workspace_id.as_ref() {
@@ -347,8 +348,11 @@ pub(super) async fn try_handle_ft_command(
     //
     // -- 151-03 single-shard text FT.SEARCH fast path --
     // Parity with handler_monoio.rs. Bare text queries bypass
-    // ft_search() (which only parses KNN/SPARSE/HYBRID)
-    // and route directly to execute_text_search_local.
+    // ft_search() (which only parses KNN/SPARSE/HYBRID) and route directly
+    // to run_text_query (see below) -- NOT execute_text_search_local, which
+    // is dead code outside its own test module (adversarial-review round-2
+    // hygiene fix; the real multi-shard path is scatter_text_search ->
+    // run_text_query_on_index).
     #[cfg(feature = "text-index")]
     if cmd.eq_ignore_ascii_case(b"FT.SEARCH") {
         if let Some(Frame::BulkString(query_bytes)) = cmd_args.get(1) {

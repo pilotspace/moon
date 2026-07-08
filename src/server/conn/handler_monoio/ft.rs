@@ -205,6 +205,7 @@ pub(super) async fn try_handle_ft_command(
                     &ctx.spsc_notifiers,
                     highlight_opts,
                     summarize_opts,
+                    conn.selected_db as u8,
                 )
                 .await;
                 let mut response = response;
@@ -447,10 +448,12 @@ pub(super) async fn try_handle_ft_command(
         // are not understood by `ft_search()` (which only parses
         // KNN / SPARSE / HYBRID) — they would otherwise return
         // `ERR invalid KNN query syntax`. Route them directly to
-        // `execute_text_search_local` here, the same function the
-        // multi-shard path uses once its per-shard scatter has
-        // aggregated IDFs. We skip HYBRID (existing ft_search
-        // handles it) and KNN/SPARSE (is_text_query returns false).
+        // `run_text_query` here (see below) — NOT `execute_text_search_local`,
+        // which is dead code outside its own test module (adversarial-review
+        // round-2 hygiene fix; the real multi-shard path is
+        // `scatter_text_search` → `run_text_query_on_index`). We skip HYBRID
+        // (existing ft_search handles it) and KNN/SPARSE (is_text_query
+        // returns false).
         #[cfg(feature = "text-index")]
         if cmd.eq_ignore_ascii_case(b"FT.SEARCH") {
             if let Some(Frame::BulkString(query_bytes)) = cmd_args.get(1) {

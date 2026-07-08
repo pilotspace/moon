@@ -198,6 +198,22 @@ pub fn extract_hash_tag(key: &[u8]) -> Option<&[u8]> {
     Some(&key[open + 1..open + 1 + close])
 }
 
+/// Boxed payload for `ShardMessage::DocFreq` (WS5a round 2).
+///
+/// DFS Phase 1: collect per-term document frequency from this shard.
+/// Kept as a separate struct so the enum variant stays a single pointer —
+/// adding `db_index: u8` to the previously-inline variant pushed
+/// `ShardMessage` past the 64-byte cap asserted at module bottom.
+pub struct DocFreqPayload {
+    pub index_name: Bytes,
+    /// (field_idx, terms) pairs -- None field_idx means use field 0 (all-field mode).
+    pub field_queries: Vec<(Option<usize>, Vec<String>)>,
+    pub reply_tx: channel::OneshotSender<Frame>,
+    /// WS5a: the originating connection's currently-SELECTed logical db —
+    /// forwarded so the remote shard resolves the index scoped to the RIGHT db.
+    pub db_index: u8,
+}
+
 /// Boxed payload for `ShardMessage::TextAggregate` (Phase 152 D-05/D-07).
 ///
 /// Kept as a separate struct so the enum variant stays small (single
@@ -209,6 +225,9 @@ pub struct TextAggregatePayload {
     pub query: Bytes,
     pub pipeline: Vec<crate::text::aggregate::AggregateStep>,
     pub reply_tx: channel::OneshotSender<Frame>,
+    /// WS5a: the originating connection's currently-SELECTed logical db —
+    /// forwarded so the remote shard resolves the index scoped to the RIGHT db.
+    pub db_index: u8,
 }
 
 /// Boxed payload for `ShardMessage::InvertedSearch` (Phase 152 Plan 06, B-02).
@@ -233,6 +252,9 @@ pub struct InvertedSearchPayload {
     pub offset: usize,
     pub count: usize,
     pub reply_tx: channel::OneshotSender<Frame>,
+    /// WS5a: the originating connection's currently-SELECTed logical db —
+    /// forwarded so the remote shard resolves the index scoped to the RIGHT db.
+    pub db_index: u8,
 }
 
 /// Boxed payload for `ShardMessage::FtHybrid` (Phase 152 Plan 05, D-13).
@@ -269,6 +291,9 @@ pub struct FtHybridPayload {
     /// `None` → unfiltered (backward compat).
     pub filter: Option<crate::command::vector_search::hybrid::HybridFilter>,
     pub reply_tx: channel::OneshotSender<Frame>,
+    /// WS5a: the originating connection's currently-SELECTed logical db —
+    /// forwarded so the remote shard resolves the index scoped to the RIGHT db.
+    pub db_index: u8,
 }
 
 /// Boxed payload for `ShardMessage::TextSearch` (Phase 177, hot-path split).
@@ -294,6 +319,9 @@ pub struct TextSearchPayload {
     pub highlight_opts: Option<crate::command::vector_search::ft_text_search::HighlightOpts>,
     pub summarize_opts: Option<crate::command::vector_search::ft_text_search::SummarizeOpts>,
     pub reply_tx: channel::OneshotSender<Frame>,
+    /// WS5a: the originating connection's currently-SELECTed logical db —
+    /// forwarded so the remote shard resolves the index scoped to the RIGHT db.
+    pub db_index: u8,
 }
 
 /// Boxed payload for `ShardMessage::VectorSearch` (Phase 177, hot-path split).
@@ -505,12 +533,11 @@ pub enum ShardMessage {
     /// Returns `Frame::Array` with interleaved `[term1, df1, term2, df2, ..., "N", total_docs]`
     /// for each (field_idx, terms) pair in `field_queries`.
     /// The coordinator aggregates these across all shards to compute global IDF.
-    DocFreq {
-        index_name: Bytes,
-        /// (field_idx, terms) pairs -- None field_idx means use field 0 (all-field mode).
-        field_queries: Vec<(Option<usize>, Vec<String>)>,
-        reply_tx: channel::OneshotSender<Frame>,
-    },
+    ///
+    /// Boxed (WS5a round 2): adding the `db_index` field to the previously-inline
+    /// variant pushed `ShardMessage` past the 64-byte cap asserted at module
+    /// bottom — boxing collapses it back to a single pointer.
+    DocFreq(Box<DocFreqPayload>),
     /// DFS Phase 2: execute BM25 text search with injected global IDF.
     ///
     /// Returns `Frame::Array` in the same format as `ft_text_search` response:
@@ -1232,6 +1259,7 @@ mod tests {
             query: Bytes::from_static(b"*"),
             pipeline: pipeline.clone(),
             reply_tx,
+            db_index: 0,
         }));
 
         match msg {

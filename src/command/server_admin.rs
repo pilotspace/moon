@@ -1730,9 +1730,19 @@ mod tests {
 ///   error if index not found or merge fails
 ///
 /// Wire this from the dispatch path that has access to `VectorStore`.
+///
+/// `db_index` (WS5a round 2, adversarial review finding 3): an index owned
+/// by a different db is invisible — VACUUM VECTOR must not let a connection
+/// merge/compact/probe (existence oracle) another db's index. Index names
+/// are globally unique per shard (one name = exactly one db), so once the
+/// name is confirmed to belong to `db_index` via the scoped lookups below,
+/// the remaining unscoped `VectorStore` helpers (`needs_merge`,
+/// `immutable_segment_count`, `force_merge_index`) are safe to call by name
+/// — they cannot resolve to a different db's index.
 pub fn vacuum_vector(
     vector_store: &mut crate::vector::store::VectorStore,
     args: &[Frame],
+    db_index: u8,
 ) -> Frame {
     // Args: [index_name] or [index_name WEIGHT <n>]
     let name = match args.first() {
@@ -1767,7 +1777,7 @@ pub fn vacuum_vector(
                     }
                 };
                 let set_result = {
-                    let idx = match vector_store.get_index_mut(name.as_ref()) {
+                    let idx = match vector_store.get_index_mut_for_db(name.as_ref(), db_index) {
                         Some(i) => i,
                         None => {
                             return Frame::Error(Bytes::from_static(b"ERR unknown vector index"));
@@ -1790,13 +1800,16 @@ pub fn vacuum_vector(
         }
     }
 
-    // Check the index exists.
-    if vector_store.get_index(name.as_ref()).is_none() {
+    // Check the index exists AND is owned by the caller's db.
+    if vector_store
+        .get_index_for_db(name.as_ref(), db_index)
+        .is_none()
+    {
         return Frame::Error(Bytes::from_static(b"ERR unknown vector index"));
     }
 
     // Check if merge mode is NONE.
-    if let Some(idx) = vector_store.get_index(name.as_ref()) {
+    if let Some(idx) = vector_store.get_index_for_db(name.as_ref(), db_index) {
         if idx.meta.merge_mode == crate::vector::segment::compaction::MergeMode::None {
             return Frame::SimpleString(Bytes::from_static(b"OK merge skipped (mode=none)"));
         }

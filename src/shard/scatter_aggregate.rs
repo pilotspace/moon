@@ -42,11 +42,13 @@ use crate::text::aggregate::{AggregateStep, ShardPartial, execute_pipeline, merg
 ///    SORTBY + LIMIT per D-07, and serialises the final rows.
 ///
 /// `db_index` (WS5a): the connection's currently-SELECTed logical db —
-/// scopes index visibility on both the single-shard fast path and the
-/// local leg of the multi-shard scatter below, and also selects the
-/// correct per-db hash store to materialise `@field` values from (this
-/// fixes a pre-existing bug where both paths always read `databases[0]`
-/// regardless of the caller's SELECTed db).
+/// scopes index visibility on the single-shard fast path, the local leg
+/// AND the remote leg (via `TextAggregatePayload.db_index`) of the
+/// multi-shard scatter, and also selects the correct per-db hash store to
+/// materialise `@field` values from (this fixes a pre-existing bug where
+/// both paths always read `databases[0]` regardless of the caller's
+/// SELECTed db). Adversarial-review round-2 fix — the remote leg was
+/// previously a documented gap.
 pub async fn scatter_text_aggregate(
     index_name: Bytes,
     query: Bytes,
@@ -96,11 +98,14 @@ pub async fn scatter_text_aggregate(
             // template).
             //
             let response = crate::shard::slice::with_shard(|s| {
-                // See note on previous expect — db 0 is constructor-guaranteed.
+                // Every shard slice is constructed with at least one database
+                // (db 0); see Shard::new in src/shard/mod.rs. Fall back to db 0
+                // defensively if `db_index` somehow exceeds the configured count.
                 #[allow(clippy::expect_used)]
                 let db = s
                     .databases
-                    .first()
+                    .get(db_index as usize)
+                    .or_else(|| s.databases.first())
                     .expect("shard slice must have at least db 0");
                 crate::command::vector_search::ft_aggregate::execute_local_partial(
                     &s.text_store,
@@ -108,6 +113,7 @@ pub async fn scatter_text_aggregate(
                     &query,
                     &pipeline,
                     db,
+                    db_index,
                 )
             });
             local_partial = Some(response);
@@ -118,6 +124,7 @@ pub async fn scatter_text_aggregate(
                 query: query.clone(),
                 pipeline: pipeline.clone(),
                 reply_tx,
+                db_index,
             }));
             let _ = spsc_send(dispatch_tx, my_shard, shard_id, msg, spsc_notifiers).await;
             receivers.push(reply_rx);
@@ -280,6 +287,7 @@ mod tests {
                 &shard_databases,
                 &dispatch_tx,
                 &notifiers,
+                0, // db_index
             ));
 
             match &result {

@@ -54,11 +54,11 @@ use crate::vector::types::SearchResult;
 /// fan-out → coordinator RRF merge. All guards are dropped before any
 /// `.await` point (RESEARCH Pitfall 2).
 /// `db_index` (WS5a): the connection's currently-SELECTed logical db. Fully
-/// honored on the `num_shards == 1` fast path below (the common single-shard
-/// deployment — see CLAUDE.md's shard-scaling gotcha and v0.6.0's default
-/// `--shards 1`). The `num_shards > 1` DFS scatter branch below this does
-/// NOT yet thread `db_index` through `FtHybridPayload` to remote shards —
-/// documented known gap (`.planning/v0.6.0-release/WS5A-NOTES.md`).
+/// honored on both the `num_shards == 1` fast path AND the `num_shards > 1`
+/// multi-shard DFS scatter branch — threaded through the DocFreq pre-pass
+/// (local + remote), the local raw-streams executor, and `FtHybridPayload`
+/// to remote shards (adversarial-review round-2 fix; previously the remote
+/// leg was a documented gap).
 #[allow(clippy::too_many_arguments)]
 pub async fn scatter_hybrid_search(
     query: HybridQuery,
@@ -105,7 +105,10 @@ pub async fn scatter_hybrid_search(
     // Both branches return a fully-owned ParseOutcome so
     // no borrows of the shard slice escape.
     let parse_outcome: ParseOutcome = crate::shard::slice::with_shard(|s| {
-        match s.text_store.get_index(query.index_name.as_ref()) {
+        match s
+            .text_store
+            .get_index_for_db(query.index_name.as_ref(), db_index)
+        {
             None => Err(Frame::Error(Bytes::from_static(b"ERR unknown index"))),
             Some(text_index) => match text_index.field_analyzers.first() {
                 None => Err(Frame::Error(Bytes::from_static(
@@ -145,7 +148,10 @@ pub async fn scatter_hybrid_search(
             //
             // Local DFS via slice — text_store accessed exclusively in the closure.
             let response = crate::shard::slice::with_shard(|s| {
-                match s.text_store.get_index(query.index_name.as_ref()) {
+                match s
+                    .text_store
+                    .get_index_for_db(query.index_name.as_ref(), db_index)
+                {
                     Some(text_index) => {
                         let mut items: Vec<Frame> = Vec::new();
                         for (field_idx_opt, terms) in &field_queries {
@@ -166,11 +172,12 @@ pub async fn scatter_hybrid_search(
             local_dfs = Some(response);
         } else {
             let (reply_tx, reply_rx) = channel::oneshot();
-            let msg = ShardMessage::DocFreq {
+            let msg = ShardMessage::DocFreq(Box::new(crate::shard::dispatch::DocFreqPayload {
                 index_name: query.index_name.clone(),
                 field_queries: field_queries.clone(),
                 reply_tx,
-            };
+                db_index,
+            }));
             let _ = spsc_send(dispatch_tx, my_shard, shard_id, msg, spsc_notifiers).await;
             dfs_receivers.push(reply_rx);
         }
@@ -227,6 +234,7 @@ pub async fn scatter_hybrid_search(
                     global_n,
                     as_of_lsn,
                     filter_clone.as_ref(),
+                    db_index,
                 )
             });
             local_hyb = Some(response);
@@ -248,6 +256,7 @@ pub async fn scatter_hybrid_search(
                 // CHANGE F: forward filter to remote shard payload.
                 filter: query.filter.clone(),
                 reply_tx,
+                db_index,
             };
             let msg = ShardMessage::FtHybrid(Box::new(payload));
             let _ = spsc_send(dispatch_tx, my_shard, shard_id, msg, spsc_notifiers).await;

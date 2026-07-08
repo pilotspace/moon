@@ -216,6 +216,14 @@ fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // WS5a round-2 fix (adversarial review finding 2): reject an unbounded
+    // `--databases` before shard/index init — see
+    // `ServerConfig::validate_databases_bound` for the aliasing risk this
+    // closes. Runs unconditionally (both normal boot and `--check-config`).
+    if let Err(msg) = config.validate_databases_bound() {
+        return Err(anyhow::anyhow!(msg));
+    }
+
     // Non-jemalloc builds: warn if operator explicitly set --memory-arenas-cap
     #[cfg(not(feature = "jemalloc"))]
     if config.memory_arenas_cap != 8 {

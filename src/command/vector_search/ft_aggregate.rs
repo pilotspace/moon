@@ -662,8 +662,10 @@ pub fn execute_local_partial(
     query: &Bytes,
     pipeline: &[AggregateStep],
     db: &Database,
+    db_index: u8,
 ) -> Frame {
-    let text_index = match text_store.get_index(index_name) {
+    // WS5a: db-scoped — an index owned by a different db is invisible.
+    let text_index = match text_store.get_index_for_db(index_name, db_index) {
         Some(ix) => ix,
         None => return Frame::Error(Bytes::from_static(b"ERR unknown index")),
     };
@@ -1743,6 +1745,7 @@ mod tests {
             &parsed.query,
             &parsed.pipeline,
             &db,
+            0,
         );
         let partial = decode_shard_partial(&frame).expect("decode ok");
         assert_eq!(partial.len(), 2, "two groups expected (open + closed)");
@@ -1789,6 +1792,7 @@ mod tests {
             &parsed.query,
             &parsed.pipeline,
             &db,
+            0,
         );
         match frame {
             Frame::Error(msg) => {
@@ -1963,6 +1967,7 @@ mod tests {
             &parsed.query,
             &parsed.pipeline,
             &db,
+            0,
         );
         let partial =
             decode_shard_partial(&response).expect("SPSC arm must return decodable partial");
@@ -1995,6 +2000,7 @@ mod tests {
                 query: parsed.query.clone(),
                 pipeline: parsed.pipeline.clone(),
                 reply_tx,
+                db_index: 0,
             },
         ));
         // Destructure as the arm does.
@@ -2036,6 +2042,7 @@ mod tests {
             &parsed.query,
             &parsed.pipeline,
             &db,
+            0,
         );
         match response {
             Frame::Error(msg) => {

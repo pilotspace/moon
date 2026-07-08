@@ -1103,6 +1103,7 @@ pub(crate) async fn handle_connection_sharded_inner<
                                         crate::command::server_admin::vacuum_vector(
                                             &mut s.vector_store,
                                             &cmd_args[1..],
+                                            conn.selected_db as u8,
                                         )
                                     });
                                     responses.push(response);

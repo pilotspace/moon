@@ -198,7 +198,7 @@ pub(crate) fn drain_spsc_shared(
                         | ShardMessage::MultiExecuteSlotted { .. }
                         | ShardMessage::VectorSearch(_)
                         | ShardMessage::VectorCommand { .. }
-                        | ShardMessage::DocFreq { .. }
+                        | ShardMessage::DocFreq(_)
                         | ShardMessage::TextSearch(_) => {
                             execute_batch.push(msg);
                         }
@@ -447,6 +447,7 @@ pub(crate) fn handle_shard_message_shared(
                                 crate::command::server_admin::vacuum_vector(
                                     &mut s.vector_store,
                                     idx_args,
+                                    db_idx as u8,
                                 )
                             });
                             let _ = reply_tx.send(frame);
@@ -1905,36 +1906,41 @@ pub(crate) fn handle_shard_message_shared(
             });
             let _ = reply_tx.send(response);
         }
-        ShardMessage::DocFreq {
-            index_name,
-            field_queries,
-            reply_tx,
-        } => {
+        ShardMessage::DocFreq(payload) => {
+            let crate::shard::dispatch::DocFreqPayload {
+                index_name,
+                field_queries,
+                reply_tx,
+                db_index,
+            } = *payload;
             // DFS Phase 1: collect per-term df + total N from this shard's TextIndex.
             // Returns crate::protocol::Frame::Array with interleaved [term, df, ..., "N", n] per field_query.
+            // WS5a: db-scoped — an index owned by a different db is invisible.
             let response = {
-                crate::shard::slice::with_shard(|s| match s.text_store.get_index(&index_name) {
-                    Some(text_index) => {
-                        let mut items: Vec<crate::protocol::Frame> = Vec::new();
-                        for (field_idx_opt, terms) in &field_queries {
-                            let fidx = field_idx_opt.unwrap_or(0);
-                            let (term_dfs, n) = text_index.doc_freq_for_terms(fidx, terms);
-                            for (term, df) in term_dfs {
-                                items.push(crate::protocol::Frame::BulkString(bytes::Bytes::from(
-                                    term,
-                                )));
-                                items.push(crate::protocol::Frame::Integer(i64::from(df)));
+                crate::shard::slice::with_shard(|s| {
+                    match s.text_store.get_index_for_db(&index_name, db_index) {
+                        Some(text_index) => {
+                            let mut items: Vec<crate::protocol::Frame> = Vec::new();
+                            for (field_idx_opt, terms) in &field_queries {
+                                let fidx = field_idx_opt.unwrap_or(0);
+                                let (term_dfs, n) = text_index.doc_freq_for_terms(fidx, terms);
+                                for (term, df) in term_dfs {
+                                    items.push(crate::protocol::Frame::BulkString(
+                                        bytes::Bytes::from(term),
+                                    ));
+                                    items.push(crate::protocol::Frame::Integer(i64::from(df)));
+                                }
+                                items.push(crate::protocol::Frame::BulkString(
+                                    bytes::Bytes::from_static(b"N"),
+                                ));
+                                items.push(crate::protocol::Frame::Integer(i64::from(n)));
                             }
-                            items.push(crate::protocol::Frame::BulkString(
-                                bytes::Bytes::from_static(b"N"),
-                            ));
-                            items.push(crate::protocol::Frame::Integer(i64::from(n)));
+                            crate::protocol::Frame::Array(items.into())
                         }
-                        crate::protocol::Frame::Array(items.into())
+                        None => crate::protocol::Frame::Error(bytes::Bytes::from_static(
+                            b"ERR unknown index",
+                        )),
                     }
-                    None => crate::protocol::Frame::Error(bytes::Bytes::from_static(
-                        b"ERR unknown index",
-                    )),
                 })
             };
             let _ = reply_tx.send(response);
@@ -1962,17 +1968,20 @@ pub(crate) fn handle_shard_message_shared(
                     highlight_opts,
                     summarize_opts,
                     reply_tx,
+                    db_index,
                 } = *payload;
                 // DFS Phase 2: execute BM25 text search with global IDF injected by coordinator.
                 // The raw query bytes are re-parsed here with the recursive-descent parser so the
                 // full AST (OR, multi-@clause, grouping) is evaluated correctly on this shard.
                 // After scoring, apply HIGHLIGHT/SUMMARIZE post-processing if requested. Each shard
                 // post-processes against its own local hash store (no cross-shard read, no .await —
-                // safe to hold guards). text_store + databases[0] in one with_shard (multi-resource).
+                // safe to hold guards). text_store + databases[db_index] in one with_shard
+                // (multi-resource). WS5a: db-scoped — an index owned by a different db is invisible.
                 let response = {
-                    crate::shard::slice::with_shard(|s| match s.text_store.get_index(&index_name) {
-                        Some(text_index) => {
-                            let mut result =
+                    crate::shard::slice::with_shard(|s| {
+                        match s.text_store.get_index_for_db(&index_name, db_index) {
+                            Some(text_index) => {
+                                let mut result =
                                 crate::command::vector_search::ft_text_search::run_text_query_on_index(
                                     text_index,
                                     &query,
@@ -1982,18 +1991,21 @@ pub(crate) fn handle_shard_message_shared(
                                     offset,
                                     count,
                                 );
-                            if highlight_opts.is_some() || summarize_opts.is_some() {
-                                // Re-parse to extract highlight terms for post-processing.
-                                let term_strings = crate::text::query::parse_query(
-                                    &query,
-                                    &crate::text::query::QuerySchema::from_index(text_index),
-                                )
-                                .map(|n| {
-                                    crate::text::query::collect_highlight_terms(&n, text_index)
-                                })
-                                .unwrap_or_default();
-                                let db = &s.databases[0];
-                                crate::command::vector_search::ft_text_search::apply_post_processing(
+                                if highlight_opts.is_some() || summarize_opts.is_some() {
+                                    // Re-parse to extract highlight terms for post-processing.
+                                    let term_strings = crate::text::query::parse_query(
+                                        &query,
+                                        &crate::text::query::QuerySchema::from_index(text_index),
+                                    )
+                                    .map(|n| {
+                                        crate::text::query::collect_highlight_terms(&n, text_index)
+                                    })
+                                    .unwrap_or_default();
+                                    let db = s
+                                        .databases
+                                        .get(db_index as usize)
+                                        .unwrap_or(&s.databases[0]);
+                                    crate::command::vector_search::ft_text_search::apply_post_processing(
                                     &mut result,
                                     &term_strings,
                                     text_index,
@@ -2001,12 +2013,13 @@ pub(crate) fn handle_shard_message_shared(
                                     highlight_opts.as_ref(),
                                     summarize_opts.as_ref(),
                                 );
+                                }
+                                result
                             }
-                            result
+                            None => crate::protocol::Frame::Error(bytes::Bytes::from_static(
+                                b"ERR unknown index",
+                            )),
                         }
-                        None => crate::protocol::Frame::Error(bytes::Bytes::from_static(
-                            b"ERR unknown index",
-                        )),
                     })
                 };
                 let _ = reply_tx.send(response);
@@ -2105,27 +2118,31 @@ pub(crate) fn handle_shard_message_shared(
                 offset,
                 count,
                 reply_tx,
+                db_index,
             } = *payload;
+            // WS5a: db-scoped — an index owned by a different db is invisible.
             let response = {
-                crate::shard::slice::with_shard(|s| match s.text_store.get_index(&index_name) {
-                    Some(text_index) => {
-                        let clause =
-                            crate::command::vector_search::ft_text_search::TextQueryClause {
-                                field_name: None,
-                                terms: Vec::new(),
-                                filter: Some(filter),
-                            };
-                        let results =
+                crate::shard::slice::with_shard(|s| {
+                    match s.text_store.get_index_for_db(&index_name, db_index) {
+                        Some(text_index) => {
+                            let clause =
+                                crate::command::vector_search::ft_text_search::TextQueryClause {
+                                    field_name: None,
+                                    terms: Vec::new(),
+                                    filter: Some(filter),
+                                };
+                            let results =
                             crate::command::vector_search::ft_text_search::execute_query_on_index(
                                 text_index, &clause, None, None, top_k,
                             );
-                        crate::command::vector_search::ft_text_search::build_text_response(
-                            &results, offset, count,
-                        )
+                            crate::command::vector_search::ft_text_search::build_text_response(
+                                &results, offset, count,
+                            )
+                        }
+                        None => crate::protocol::Frame::Error(bytes::Bytes::from_static(
+                            b"ERR no such index",
+                        )),
                     }
-                    None => crate::protocol::Frame::Error(bytes::Bytes::from_static(
-                        b"ERR no such index",
-                    )),
                 })
             };
             let _ = reply_tx.send(response);
@@ -2142,16 +2159,25 @@ pub(crate) fn handle_shard_message_shared(
                 query,
                 pipeline,
                 reply_tx,
+                db_index,
             } = *payload;
-            // text_store and read_db(0) accessed in one with_shard closure (multi-resource).
+            // text_store and read_db(db_index) accessed in one with_shard closure
+            // (multi-resource). WS5a: db-scoped — an index owned by a different
+            // db is invisible; falls back to db 0 defensively if `db_index`
+            // somehow exceeds the configured count (constructor-guaranteed).
             let response = {
                 crate::shard::slice::with_shard(|s| {
+                    let db = s
+                        .databases
+                        .get(db_index as usize)
+                        .unwrap_or(&s.databases[0]);
                     crate::command::vector_search::ft_aggregate::execute_local_partial(
                         &s.text_store,
                         &index_name,
                         &query,
                         &pipeline,
-                        &s.databases[0],
+                        db,
+                        db_index,
                     )
                 })
             };
@@ -2179,6 +2205,7 @@ pub(crate) fn handle_shard_message_shared(
                 as_of_lsn,
                 filter,
                 reply_tx,
+                db_index,
             } = *payload;
             let response = {
                 crate::shard::slice::with_shard(|s| {
@@ -2190,6 +2217,7 @@ pub(crate) fn handle_shard_message_shared(
                     // AS_OF LSN into the raw-streams executor so the dense branch
                     // applies MVCC filtering consistently across shards.
                     // CHANGE F: forward the filter for per-shard pre-fusion filtering.
+                    // WS5a: db-scoped — an index owned by a different db is invisible.
                     crate::command::vector_search::hybrid_multi::execute_hybrid_search_local_raw_streams(
                         &mut s.vector_store,
                         &s.text_store,
@@ -2205,6 +2233,7 @@ pub(crate) fn handle_shard_message_shared(
                         global_n,
                         as_of_lsn,
                         filter.as_ref(),
+                        db_index,
                     )
                 })
             };

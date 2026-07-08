@@ -1942,7 +1942,8 @@ pub async fn handle_connection(
                                                         crate::command::server_admin::vacuum_vector(
                                                             &mut vs_guard,
                                                             &d_args[1..],
-                                                        );
+                                                        conn.selected_db as u8,
+                                        );
                                                     drop(vs_guard);
                                                     responses[resp_idx] = response;
                                                 } else {
@@ -2228,7 +2229,8 @@ pub async fn handle_connection(
                                                         crate::command::server_admin::vacuum_vector(
                                                             &mut vs_guard,
                                                             &d_args[1..],
-                                                        );
+                                                        conn.selected_db as u8,
+                                        );
                                                     drop(vs_guard);
                                                     responses[resp_idx] = response;
                                                 } else {

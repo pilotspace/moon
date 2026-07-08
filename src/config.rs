@@ -800,7 +800,33 @@ fn decide_dir(
     }
 }
 
+/// Maximum allowed `--databases` count (WS5a round 2, adversarial review
+/// finding 2). Vector/text index `db_index` tagging downcasts the
+/// connection's SELECTed db to `u8` at ~20 call sites
+/// (`conn.selected_db as u8`); `--databases 300` + `SELECT 256` would pass
+/// SELECT's `index < db_count` range check, then silently wrap
+/// `256 as u8 == 0`, aliasing db 256's indexes onto db 0's. `u8::MAX + 1`
+/// keeps the full 0..=255 range addressable without widening `db_index` to
+/// `u16` across every `IndexMeta`/`TextIndex`/SPSC payload site.
+pub const MAX_DATABASES: usize = 256;
+
 impl ServerConfig {
+    /// Validate `--databases` fits the `u8` db_index tag used by vector/text
+    /// index scoping (WS5a round 2). Returns an error message (not a
+    /// `Frame`/`anyhow::Error` — kept plain so both `main.rs`'s early-boot
+    /// path and unit tests can format/assert on it directly) when the
+    /// configured count exceeds `MAX_DATABASES`.
+    pub fn validate_databases_bound(&self) -> Result<(), String> {
+        if self.databases > MAX_DATABASES {
+            return Err(format!(
+                "--databases {} exceeds the maximum of {MAX_DATABASES} (vector/text index db \
+                 scoping uses a u8 tag; higher values alias distinct dbs onto the same index)",
+                self.databases
+            ));
+        }
+        Ok(())
+    }
+
     /// Resolve the persistence directory when `--dir` was not given.
     ///
     /// Must run once at startup (after conf-file merge, before any
@@ -1562,6 +1588,45 @@ mod tests {
     fn test_shards_zero_is_explicit_auto_detect() {
         let config = ServerConfig::parse_from(["moon", "--shards", "0"]);
         assert_eq!(config.shards, 0);
+    }
+
+    // ── WS5a round 2 (adversarial review finding 2): --databases bound ────
+
+    #[test]
+    fn test_validate_databases_bound_default_ok() {
+        let config = ServerConfig::parse_from::<[&str; 0], &str>([]);
+        assert!(config.validate_databases_bound().is_ok());
+    }
+
+    #[test]
+    fn test_validate_databases_bound_at_max_ok() {
+        let config = ServerConfig::parse_from(["moon", "--databases", "256"]);
+        assert!(
+            config.validate_databases_bound().is_ok(),
+            "256 databases (u8::MAX + 1) must be the accepted ceiling"
+        );
+    }
+
+    #[test]
+    fn test_validate_databases_bound_over_max_rejected() {
+        let config = ServerConfig::parse_from(["moon", "--databases", "257"]);
+        let err = config
+            .validate_databases_bound()
+            .expect_err("257 databases must be rejected");
+        assert!(
+            err.contains("257") && err.contains("256"),
+            "error must name both the offending value and the ceiling: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_databases_bound_way_over_max_rejected() {
+        // The exact scenario from the review: --databases 300 + SELECT 256
+        // would silently wrap `256 as u8 == 0`, aliasing db 256's vector/text
+        // indexes onto db 0's. Must be rejected at config-validation time,
+        // not discovered later as a cross-db data leak.
+        let config = ServerConfig::parse_from(["moon", "--databases", "300"]);
+        assert!(config.validate_databases_bound().is_err());
     }
 
     /// `MOON_DISK_FREE_MIN_PCT` env override for `--disk-free-min-pct`.
