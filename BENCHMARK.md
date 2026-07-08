@@ -955,16 +955,35 @@ reach >0.9 recall. turbovec gets no concurrency scaling (760 → 781).
 
 | system | config | recall@10 | qps1 | qps8 |
 |--------|--------|:---------:|:----:|:----:|
+| **Moon** (SQ8, settled) | ef=16 | 0.816 | **995** | **2077** |
+| | ef=64 | 0.962 | **528** | **1085** |
+| | ef=256 | **0.994** | **216** | **472** |
 | Qdrant | ef=16 | 0.624 | 264 | 390 |
 | | ef=64 | 0.861 | 215 | 371 |
 | | ef=256 | 0.965 | 134 | 314 |
-| Moon (SQ8) | | *run in progress* | | |
-| RediSearch | | *run in progress* | | |
+| RediSearch | ef=16 | 0.486 | 1242 | 1827 |
+| | ef=64 | 0.757 | 591 | 798 |
+| | ef=256 | 0.927 | 246 | 270 |
+
+(turbovec omitted: IP/COSINE-only library, and its O(N) flat scan is non-viable at 1M.)
+
+**Iso-recall verdicts — Moon wins every band:**
+
+- **@ ~0.86:** Moon (ef≈24, interp.) ~**4× / ~5×** Qdrant's 215/371.
+- **@ ~0.96:** Moon 528/1085 vs Qdrant 134/314 — **3.9× / 3.5×**.
+- **@ ~0.93:** Moon *at higher recall* (0.962 @ 528/1085) vs RediSearch 0.927 @
+  246/270 — **2.1× / 4.0×**.
+- Moon is the only system measured past 0.99 recall (0.994 @ 216/472 — still faster
+  than both competitors' ~0.93–0.965 operating points).
+
+**Time-to-ready** (gist): Moon ingest 396 s → green 437 s; RediSearch 2871 s;
+Qdrant ~620 s. Moon settle (merge to 1 segment/shard) took a further ~97 min — the
+merge-parallelism gap noted below.
 
 ⚠ **Moon TQ4 on gist recorded recall 0.002–0.003 — a bug, not noise.** TQ4's
 norm²-scaled ADC assumes unit-sphere metrics; gist is unnormalized L2 and the estimator
-collapses. Filed for fix (metric guard at FT.CREATE or L2-faithful ADC); the Moon gist
-leg reruns on SQ8.
+collapses. Fixed in this branch: `FT.CREATE` L2 indexes now **default to SQ8** (explicit
+TQ*+L2 warns); the table above is the SQ8 re-run.
 
 #### Findings that changed Moon along the way
 
@@ -978,8 +997,8 @@ leg reruns on SQ8.
 3. **Unmerged segments multiply query cost**: per-query work ≈ shards × segments × ef.
    Pre-settle (57 segments) the same index ran 4–5× slower at the same ef. `VACUUM
    VECTOR` merges to 1 segment/shard but is local-shard-only over the wire and took
-   ~61 min for 1.18M vectors at only ~1.2 cores — GraphUnion merge parallelism is the
-   next optimization target.
+   ~56 min for 1.18M × 200d (and ~97 min for 1M × 960d) at only ~1.2 cores —
+   GraphUnion merge parallelism is the next optimization target.
 4. **Multi-segment search unions independent beams** → higher recall ceiling at equal
    ef (unsettled ef=256: 0.9865 vs settled 0.933). The settled index needs ef 512+ to
    reclaim the >0.95 band — at far higher qps than the unsettled equivalent.
