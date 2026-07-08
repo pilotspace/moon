@@ -298,3 +298,69 @@ fn mset_invalidates_every_second_arg_key() {
         String::from_utf8_lossy(&reader.buf)
     );
 }
+
+/// A routed (Phase B) MULTI/EXEC — whose owning shard differs from the writer's
+/// accept shard — must still invalidate tracking clients, exactly like a local
+/// EXEC or a plain write. Before the fix the routed EXEC path returned before
+/// reaching the tracking-invalidation block, so cached readers were never
+/// notified.
+///
+/// A single warmed writer connection has a fixed accept shard, so across 12
+/// distinct keys ~3/4 of the single-key bodies route to a remote owner. Delivery
+/// to an idle cross-shard reader is inherently ~75% per attempt in this suite
+/// (a documented 4-shard async-push timing property — it hits plain SET and
+/// MULTI/EXEC equally), so this asserts a MAJORITY deliver rather than all: the
+/// fix yields ~9/12, whereas the pre-fix routed-skip yields only ~2/12 (just the
+/// occasional local iteration), which the threshold cleanly rejects.
+#[test]
+fn routed_multi_exec_invalidates_tracking_client() {
+    let Some(m) = spawn_moon_4shard() else { return };
+
+    // One warmed writer (fixed accept shard → most keys route) reused for seed
+    // + commit; one reader reused across keys. Low connection churn.
+    let mut txw = Resp::connect(m.port);
+    txw.cmd(&["PING"]);
+    assert!(txw.saw(b"PONG"));
+
+    let total = 12;
+    let mut delivered = 0;
+    for i in 0..total {
+        let key = format!("ctxroute{i}");
+
+        txw.clear();
+        txw.cmd(&["SET", &key, "v1"]);
+        assert!(txw.saw(b"+OK"), "seed SET must succeed");
+
+        let mut reader = tracking_client(m.port);
+        reader.cmd(&["GET", &key]);
+        assert!(reader.saw(b"v1"), "tracked GET must return the seed value");
+        reader.clear();
+
+        txw.cmd(&["MULTI"]);
+        txw.cmd(&["SET", &key, "v2"]);
+        txw.clear();
+        txw.cmd(&["EXEC"]);
+
+        // Disambiguate EXEC failure from invalidation-delivery loss: a routed
+        // single-key EXEC that committed returns `*1\r\n+OK\r\n`. If the routed
+        // execution itself errored (e.g. owner-shard-unavailable → CROSSSLOT),
+        // fail loudly here rather than silently under-counting `delivered` and
+        // misreporting a routing bug as an invalidation regression.
+        assert!(
+            txw.saw(b"+OK"),
+            "routed EXEC must commit the queued SET (got: {:?})",
+            String::from_utf8_lossy(&txw.buf)
+        );
+
+        if reader.wait_for(INVALIDATE, Duration::from_secs(4)) && reader.saw(key.as_bytes()) {
+            delivered += 1;
+        }
+    }
+
+    assert!(
+        delivered * 2 >= total,
+        "routed MULTI/EXEC invalidation regression: only {delivered}/{total} writes \
+         invalidated the tracking client (pre-fix routed EXEC skips invalidation \
+         entirely, delivering ~2/12; the fix restores ~9/12)"
+    );
+}

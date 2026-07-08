@@ -176,6 +176,7 @@ pub(crate) fn drain_spsc_shared(
                         ShardMessage::Execute { .. }
                         | ShardMessage::PipelineBatch { .. }
                         | ShardMessage::MultiExecute { .. }
+                        | ShardMessage::TxnExecute(_)
                         | ShardMessage::ExecuteSlotted { .. }
                         | ShardMessage::PipelineBatchSlotted { .. }
                         | ShardMessage::MultiExecuteSlotted { .. }
@@ -2315,6 +2316,62 @@ pub(crate) fn handle_shard_message_shared(
             // Ignore send failure: the AOF writer dropped its receiver
             // (e.g. rewrite aborted) — the snapshot is simply discarded.
             let _ = reply_tx.send(snapshot);
+        }
+
+        // ─────────────────────────────────────────────────────────────────────
+        ShardMessage::TxnExecute(payload) => {
+            // Sharded MULTI/EXEC Phase B: the originating connection proved via
+            // `analyze_txn_locality` that every key is owned by THIS shard (its
+            // own accept shard differs), so run the whole body on our slice and
+            // persist each write to OUR AOF/WAL. `execute_transaction_sharded`
+            // manages its own `with_shard`/`with_shard_db` visits, so it must be
+            // called at the top of this arm (never nested in a slice borrow).
+            let crate::shard::dispatch::TxnExecutePayload {
+                db_index,
+                commands,
+                reply_tx,
+            } = *payload;
+            let mut exec_publishes: Vec<(usize, bytes::Bytes, bytes::Bytes)> = Vec::new();
+            let (result, aof_entries) = crate::server::conn::shared::execute_transaction_sharded(
+                shard_databases,
+                shard_id,
+                &commands,
+                db_index,
+                cached_clock,
+                &mut exec_publishes,
+            );
+            // Persist via the SAME sync path as normal cross-shard writes (the
+            // MultiExecute arm): fire-and-forget append + WAL/replica fan-out,
+            // ONE shared backpressure budget for the whole body so a stall costs
+            // at most AOF_SPSC_BACKPRESSURE_BOUND, not that per command. The
+            // always-mode fsync barrier is issued by the ORIGINATOR after the
+            // reply (mirrors the H1-BARRIER for normal cross-shard writes).
+            let mut wrote = false;
+            let mut append_lost = false;
+            let mut aof_budget = crate::persistence::aof::AOF_SPSC_BACKPRESSURE_BOUND;
+            for entry_bytes in &aof_entries {
+                wrote = true;
+                let ok = wal_append_and_fanout(
+                    entry_bytes,
+                    wal_writer,
+                    repl_backlog,
+                    replica_txs,
+                    repl_state,
+                    shard_id,
+                    aof_pool,
+                    wal_kv_log,
+                    &mut aof_budget,
+                );
+                if !ok {
+                    append_lost = true;
+                }
+            }
+            let _ = reply_tx.send(crate::shard::dispatch::TxnExecReply {
+                result,
+                exec_publishes,
+                wrote,
+                append_lost,
+            });
         }
 
         // ─────────────────────────────────────────────────────────────────────

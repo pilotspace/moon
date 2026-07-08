@@ -6,6 +6,72 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — sharded MULTI/EXEC routes a single-owner-shard body to its owner (Phase B, PR #TBD)
+
+- **`src/shard/{dispatch,spsc_handler,coordinator}.rs`,
+  `src/server/conn/{handler_sharded,handler_monoio}/write.rs`**: with keys routed
+  per-key to their owning shard but MULTI/EXEC executing on the connection's
+  (random, SO_REUSEPORT) accept shard, a hash-tagged `{tag}` transaction only
+  worked from the ~1/N connections that happened to land on the owning shard —
+  Phase A rejected the rest with `CROSSSLOT`. Phase B adds a boxed
+  `ShardMessage::TxnExecute` (kept within the 64-byte cache-line cap like
+  `MqCommand`) and a `coordinator::execute_txn_on_owner` hop: when
+  `analyze_txn_locality` proves every key is owned by ONE shard that isn't the
+  accept shard, the whole body is routed there, executed atomically on the
+  owner's slice, and each write persisted to the OWNER's AOF/WAL via the same
+  `wal_append_and_fanout` path as normal cross-shard writes. PUBLISH fan-out is
+  deferred back to the originating connection (returned in the reply) so it keeps
+  the normal scatter path; under `appendfsync=always` the originator issues one
+  `fsync_barrier` to the owner before acking (H1-BARRIER parity), and owner-side
+  append backpressure surfaces `AOF_APPEND_LOST_ERR`. Genuinely multi-shard
+  bodies (`CrossShard`) stay rejected — a shared-nothing engine can't commit
+  across shards atomically. Red/green: `tests/sharded_multi_exec_routing.rs`
+  (hash-tagged txn succeeds from every connection + writes visible; routed writes
+  survive kill-9 + restart via the owner's AOF; multi-shard span still CROSSSLOT).
+  WATCH in sharded mode remains an unimplemented follow-up.
+
+### Fixed — sharded MULTI/EXEC writes are now persisted (were lost on restart) (PR #TBD)
+
+- **`src/server/conn/{shared,handler_sharded/write,handler_monoio/write}.rs`**:
+  `execute_transaction_sharded` — the MULTI/EXEC executor used by the monoio
+  handler at **every** shard count (including `--shards 1`) and by the tokio
+  sharded handler at `--shards ≥ 2` — appended **nothing** to the AOF. Every
+  transactional write was silently lost on restart under `appendonly=yes`, while
+  an identical write issued outside MULTI survived. The executor now returns the
+  serialized AOF bytes for each successful write (mirroring the single-shard
+  tokio `execute_transaction`), and a shared `persist_txn_aof` helper appends
+  them to the owning shard's writer via the normal group-commit path, issuing one
+  `fsync_barrier` under `appendfsync=always` before EXEC is acked. On a barrier
+  failure EXEC returns `AOF_FSYNC_ERR` and suppresses any queued PUBLISH fan-out,
+  rather than acking a durability it can't guarantee. `try_handle_multi_exec` is
+  now `async` in both sharded handlers. Red/green:
+  `tests/sharded_multi_exec_durability.rs` pins *EXEC-committed write survives
+  kill-9 + restart, exactly like a non-MULTI write* (fails on the pre-fix path:
+  the txn key returns nil after restart while the plain control key survives).
+
+### Security — sharded MULTI/EXEC no longer silently misplaces cross-shard writes (Phase A, PR #TBD)
+
+- **`src/server/conn/{shared,handler_sharded/write,handler_monoio/write}.rs`**:
+  `execute_transaction_sharded` runs the whole queued body on the connection's
+  OWN shard with no per-key routing, so at `--shards ≥ 2` a key owned by another
+  shard was silently written to / read from the wrong shard's table — EXEC
+  reported success while the data diverged (silent lost updates; other
+  connections routing to the true owner saw nothing). Hash tags did **not** help:
+  they co-locate keys with each other but not with the (random, SO_REUSEPORT)
+  execution shard, and migration is disabled during MULTI. A new
+  `analyze_txn_locality` classifies the queued body via the command-metadata key
+  specs + `key_to_shard`; EXEC now **rejects** with `CROSSSLOT` any transaction
+  whose keys aren't all owned by the executing shard, instead of corrupting.
+  Invariant restored: *EXEC-success ⇒ every write is visible to other
+  connections; CROSSSLOT ⇒ nothing was written.* No effect at `--shards 1`.
+  Red/green: `tests/sharded_multi_exec_locality.rs` (silent-divergence invariant,
+  multi-shard span rejection, single-shard unaffected) + `analyze_txn_locality`
+  unit tests. Phase B (above) now routes single-owner-shard bodies to their owner
+  instead of rejecting them, so only genuinely cross-shard bodies still get
+  CROSSSLOT. Note found in passing (unrelated, out of scope): a *solo* GET sent
+  mid-MULTI on the monoio single-shard handler executes immediately instead of
+  queueing.
+
 ### Docs — tuning guide: vector bulk load & compaction (PR #TBD)
 
 - `docs/guides/tuning.md`: new "Vector bulk load and compaction" section — documents

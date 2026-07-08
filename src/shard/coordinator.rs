@@ -202,6 +202,34 @@ async fn run_remote(
     }
 }
 
+/// Route a whole MULTI/EXEC body to the shard that owns all of its keys and
+/// await the executed reply (sharded MULTI/EXEC Phase B).
+///
+/// The owner runs the body atomically on its slice and persists each write to
+/// ITS own AOF/WAL; PUBLISH fan-out is deferred back to the caller in the reply
+/// (`exec_publishes`) so the originator keeps the normal scatter path. Returns
+/// `None` if the owner's reply channel closed (the owner shard died) — the
+/// caller surfaces an error rather than a false success.
+pub(crate) async fn execute_txn_on_owner(
+    owner: usize,
+    my_shard: usize,
+    db_index: usize,
+    commands: Vec<Frame>,
+    dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
+    spsc_notifiers: &[Arc<channel::Notify>],
+) -> Option<crate::shard::dispatch::TxnExecReply> {
+    debug_assert_ne!(owner, my_shard, "execute_txn_on_owner called for own shard");
+    let (reply_tx, reply_rx) = channel::oneshot();
+    let payload = crate::shard::dispatch::TxnExecutePayload {
+        db_index,
+        commands,
+        reply_tx,
+    };
+    let msg = ShardMessage::TxnExecute(Box::new(payload));
+    let _ = spsc_send(dispatch_tx, my_shard, owner, msg, spsc_notifiers).await;
+    reply_rx.recv().await.ok()
+}
+
 /// Run one full command on whichever shard owns `routing_key`.
 #[allow(clippy::too_many_arguments)]
 async fn run_on_owner(

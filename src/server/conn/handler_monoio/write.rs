@@ -562,7 +562,12 @@ async fn mq_hop_or_local(
 }
 
 /// Handle MULTI/EXEC/DISCARD commands. Returns `true` if consumed.
-pub(super) fn try_handle_multi_exec(
+///
+/// `async` because EXEC now persists the transaction body to the shard AOF via
+/// the same group-commit path as normal writes (previously this path logged
+/// nothing, so every transactional write was lost on restart — including at
+/// `--shards 1` under the monoio TopLevel writer).
+pub(super) async fn try_handle_multi_exec(
     cmd: &[u8],
     conn: &mut ConnectionState,
     ctx: &ConnectionContext,
@@ -591,7 +596,115 @@ pub(super) fn try_handle_multi_exec(
             responses.push(Frame::Error(Bytes::from_static(b"ERR EXEC without MULTI")));
         } else {
             conn.in_multi = false;
-            let result = execute_transaction_sharded(
+            // The body runs on THIS shard with no per-key routing, so a
+            // foreign-owned key would be silently misplaced. Classify locality:
+            //  - CrossShard: genuinely spans shards — a shared-nothing engine
+            //    can't commit it atomically, so reject with CROSSSLOT.
+            //  - SingleShard(other): every key is owned by ONE remote shard —
+            //    Phase B routes the whole body there for atomic execution + AOF
+            //    on the owner (instead of the Phase-A CROSSSLOT rejection).
+            //  - Keyless / SingleShard(self): fall through to local execution.
+            if ctx.num_shards > 1 {
+                match crate::server::conn::shared::analyze_txn_locality(
+                    &conn.command_queue,
+                    ctx.num_shards,
+                ) {
+                    crate::server::conn::shared::TxnLocality::SingleShard(s)
+                        if s != ctx.shard_id =>
+                    {
+                        let commands: Vec<Frame> = conn.command_queue.to_vec();
+                        conn.command_queue.clear();
+                        // Keep a copy of the body for CLIENT TRACKING
+                        // invalidation ONLY when tracking is active — the routed
+                        // reply carries results, not the command frames, and the
+                        // owner does not invalidate (the tracking table is
+                        // process-global; invalidation is issued originating-side).
+                        let tracking_cmds =
+                            crate::tracking::tracking_active().then(|| commands.clone());
+                        let reply = crate::shard::coordinator::execute_txn_on_owner(
+                            s,
+                            ctx.shard_id,
+                            conn.selected_db,
+                            commands,
+                            &ctx.dispatch_tx,
+                            &ctx.spsc_notifiers,
+                        )
+                        .await;
+                        match reply {
+                            Some(r) => {
+                                if r.append_lost {
+                                    exec_publishes.clear();
+                                    responses.push(Frame::Error(Bytes::from_static(
+                                        crate::shard::spsc_handler::AOF_APPEND_LOST_ERR,
+                                    )));
+                                    return true;
+                                }
+                                // appendfsync=always: confirm the owner's queued
+                                // appends are on disk before acking (H1-BARRIER
+                                // parity for normal cross-shard writes). No-op
+                                // under everysec/no.
+                                if r.wrote {
+                                    if let Some(ref pool) = ctx.aof_pool {
+                                        if pool.fsync_barrier(s).await.is_err() {
+                                            exec_publishes.clear();
+                                            responses.push(Frame::Error(Bytes::from_static(
+                                                crate::persistence::aof::AOF_FSYNC_ERR,
+                                            )));
+                                            return true;
+                                        }
+                                    }
+                                }
+                                // CLIENT TRACKING: invalidate every key written by
+                                // the routed body, same as the local EXEC path
+                                // (which the early return would otherwise skip).
+                                if let Some(cmds) = tracking_cmds.as_ref() {
+                                    if let Frame::Array(ref txn_results) = r.result {
+                                        for (i, cmd_frame) in cmds.iter().enumerate() {
+                                            if i >= txn_results.len()
+                                                || matches!(txn_results[i], Frame::Error(_))
+                                            {
+                                                continue;
+                                            }
+                                            if let Some((c, a)) =
+                                                crate::server::conn::util::extract_command(
+                                                    cmd_frame,
+                                                )
+                                            {
+                                                crate::tracking::invalidation::invalidate_after_write(
+                                                    &ctx.tracking_table,
+                                                    c,
+                                                    a,
+                                                    conn.client_id,
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                                // Adopt the owner's deferred PUBLISH fan-out; the
+                                // caller's post-EXEC loop patches placeholders +
+                                // scatters from this (originating) shard.
+                                exec_publishes.extend(r.exec_publishes);
+                                responses.push(r.result);
+                            }
+                            None => {
+                                responses.push(Frame::Error(Bytes::from_static(
+                                    b"CROSSSLOT MULTI/EXEC owner shard unavailable; retry",
+                                )));
+                            }
+                        }
+                        return true;
+                    }
+                    crate::server::conn::shared::TxnLocality::CrossShard => {
+                        conn.command_queue.clear();
+                        responses.push(Frame::Error(Bytes::from_static(
+                            b"CROSSSLOT Keys in MULTI/EXEC don't hash to the same shard",
+                        )));
+                        return true;
+                    }
+                    _ => {}
+                }
+            }
+            let (result, aof_entries) = execute_transaction_sharded(
                 &ctx.shard_databases,
                 ctx.shard_id,
                 &conn.command_queue,
@@ -599,6 +712,27 @@ pub(super) fn try_handle_multi_exec(
                 &ctx.cached_clock,
                 exec_publishes,
             );
+            // DURABILITY: append every successful write in the body to THIS
+            // shard's AOF via the same group-commit path as normal writes, then
+            // issue ONE fsync barrier under appendfsync=always before acking.
+            // All keys are local here (Phase A rejected foreign-owned bodies),
+            // so ctx.shard_id is the correct AOF target. On barrier failure we
+            // surface AOF_FSYNC_ERR instead of a false EXEC success — parity
+            // with the normal write path.
+            if crate::server::conn::shared::persist_txn_aof(ctx, aof_entries)
+                .await
+                .is_err()
+            {
+                conn.command_queue.clear();
+                // Durability could not be guaranteed: report the error and
+                // suppress any queued PUBLISH fan-out — the client sees EXEC
+                // fail, so it must not observe the txn's pub/sub side effects.
+                exec_publishes.clear();
+                responses.push(Frame::Error(Bytes::from_static(
+                    crate::persistence::aof::AOF_FSYNC_ERR,
+                )));
+                return true;
+            }
             // CLIENT TRACKING: invalidate keys written inside the txn, same as
             // the normal write path (EXEC previously bypassed this). Self-gated
             // on tracking_active(); must run before command_queue is cleared.

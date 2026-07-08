@@ -658,6 +658,20 @@ pub enum ShardMessage {
     AofFold {
         reply_tx: channel::OneshotSender<AofFoldSnapshot>,
     },
+    /// Execute a queued MULTI/EXEC body atomically on this (owning) shard
+    /// (sharded MULTI/EXEC Phase B).
+    ///
+    /// Sent by a connection handler when `analyze_txn_locality` proved every key
+    /// in the transaction is owned by ONE shard that is NOT the connection's
+    /// accept shard. The owner runs the whole body on its slice, persists each
+    /// write to ITS AOF/WAL (via `wal_append_and_fanout`), and replies with the
+    /// results array. PUBLISH fan-out is deferred back to the originating
+    /// connection (returned in `TxnExecReply.exec_publishes`) so it keeps using
+    /// the normal originator-side scatter path.
+    ///
+    /// Boxed (`Box<TxnExecutePayload>`) to keep `ShardMessage` within the
+    /// 64-byte cache-line cap — mirrors `MqCommand`.
+    TxnExecute(Box<TxnExecutePayload>),
     /// Graceful shutdown signal.
     Shutdown,
 }
@@ -678,6 +692,38 @@ pub struct MqCommandPayload {
     pub command: std::sync::Arc<crate::protocol::Frame>,
     /// Oneshot channel: owner sends the response `Frame` back to the caller.
     pub reply_tx: channel::OneshotSender<crate::protocol::Frame>,
+}
+
+/// Payload for [`ShardMessage::TxnExecute`] (sharded MULTI/EXEC Phase B).
+///
+/// Boxed in the enum variant to keep `ShardMessage` within the 64-byte cap.
+pub struct TxnExecutePayload {
+    /// Target database index (the connection's `selected_db`).
+    pub db_index: usize,
+    /// The queued transaction body — the exact `command_queue` frames the
+    /// connection accumulated between MULTI and EXEC.
+    pub commands: Vec<crate::protocol::Frame>,
+    /// Oneshot channel: the owner sends the executed result + deferred
+    /// PUBLISH fan-out back to the caller.
+    pub reply_tx: channel::OneshotSender<TxnExecReply>,
+}
+
+/// Reply for [`ShardMessage::TxnExecute`].
+///
+/// Carries the executed result frame (a `Frame::Array` of per-command
+/// responses, with `Frame::Integer(0)` placeholders for any queued PUBLISH),
+/// the deferred PUBLISH fan-out list `(result_index, channel, message)` the
+/// originator patches after fanning out, and whether the body performed any
+/// durable write (so the originator can issue one `fsync_barrier` to the owner
+/// under `appendfsync=always`).
+pub struct TxnExecReply {
+    pub result: crate::protocol::Frame,
+    pub exec_publishes: Vec<(usize, Bytes, Bytes)>,
+    pub wrote: bool,
+    /// `true` iff an AOF append could not be enqueued on the owner (bounded
+    /// backpressure exhausted) — the originator surfaces `AOF_APPEND_LOST_ERR`
+    /// instead of the (in-memory-applied but non-durable) result.
+    pub append_lost: bool,
 }
 
 /// Snapshot payload for [`ShardMessage::AofFold`].

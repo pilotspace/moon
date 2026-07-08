@@ -194,8 +194,14 @@ pub(crate) fn execute_transaction(
 
 /// Execute a queued transaction on the local shard (sharded path).
 ///
-/// Transactions in the shared-nothing architecture are restricted to local-shard
-/// keys only. Cross-shard transactions require distributed coordination (future work).
+/// The caller must ensure every key in `command_queue` is owned by THIS shard
+/// (see `analyze_txn_locality`) — the body runs on the local slice with no
+/// per-key routing.
+///
+/// Returns the result Frame (an array of per-command responses) **and** the
+/// serialized AOF bytes for each successful write, in order. The caller MUST
+/// append those entries to the shard's AOF (previously this path did no
+/// persistence, so MULTI/EXEC writes were silently lost on restart).
 pub(crate) fn execute_transaction_sharded(
     shard_databases: &std::sync::Arc<crate::shard::shared_databases::ShardDatabases>,
     _shard_id: usize,
@@ -203,10 +209,11 @@ pub(crate) fn execute_transaction_sharded(
     selected_db: usize,
     cached_clock: &CachedClock,
     exec_publishes: &mut Vec<(usize, Bytes, Bytes)>,
-) -> Frame {
+) -> (Frame, Vec<Bytes>) {
     let db_count = shard_databases.db_count();
 
     let mut results = Vec::with_capacity(command_queue.len());
+    let mut aof_entries: Vec<Bytes> = Vec::new();
     let mut selected = selected_db;
 
     for cmd_frame in command_queue {
@@ -228,6 +235,19 @@ pub(crate) fn execute_transaction_sharded(
             continue;
         }
 
+        // Serialize write commands for AOF *before* dispatch (matches the
+        // single-shard `execute_transaction` path). Without this the sharded
+        // MULTI/EXEC path logged nothing, so every transactional write was
+        // silently lost on restart. Fully-qualified paths because `metadata`
+        // is only `use`d under runtime-tokio but this fn compiles under both.
+        let aof_bytes = if crate::command::metadata::is_write(cmd) {
+            let mut buf = bytes::BytesMut::new();
+            crate::protocol::serialize::serialize(cmd_frame, &mut buf);
+            Some(buf.freeze())
+        } else {
+            None
+        };
+
         let result = crate::shard::slice::with_shard_db(selected, |db| {
             db.refresh_now_from_cache(cached_clock);
             dispatch(db, cmd, cmd_args, &mut selected, db_count)
@@ -236,6 +256,14 @@ pub(crate) fn execute_transaction_sharded(
             DispatchResult::Response(f) => f,
             DispatchResult::Quit(f) => f,
         };
+
+        // Only log the write if it actually succeeded (parity with the
+        // single-shard path — an errored write must not reach the AOF).
+        if let Some(bytes) = aof_bytes {
+            if !matches!(&response, Frame::Error(_)) {
+                aof_entries.push(bytes);
+            }
+        }
 
         // Auto-index: if HSET succeeded, check for vector index match
         if cmd.eq_ignore_ascii_case(b"HSET") && !matches!(response, Frame::Error(_)) {
@@ -284,7 +312,50 @@ pub(crate) fn execute_transaction_sharded(
         results.push(response);
     }
 
-    Frame::Array(results.into())
+    (Frame::Array(results.into()), aof_entries)
+}
+
+/// Persist the AOF entries of a just-executed sharded MULTI/EXEC body.
+///
+/// Mirrors the normal write path's group-commit: each entry is enqueued
+/// fire-and-forget on the owning shard's writer (`send_append_group`), and a
+/// single `fsync_barrier` is issued at the end under `appendfsync=always`
+/// (`send_append_group` returns `Ok(true)` when a barrier is owed). All keys in
+/// the body are owned by `ctx.shard_id` (Phase A rejects foreign-owned bodies),
+/// so that is the correct AOF target.
+///
+/// Returns `Err(())` if any append or the barrier fails — the caller surfaces
+/// `AOF_FSYNC_ERR` instead of acking a durability it can't guarantee. A no-op
+/// (returns `Ok`) when AOF is disabled (`aof_pool` is `None`) or the body wrote
+/// nothing.
+pub(crate) async fn persist_txn_aof(
+    ctx: &crate::server::conn::core::ConnectionContext,
+    aof_entries: Vec<Bytes>,
+) -> Result<(), ()> {
+    if aof_entries.is_empty() {
+        return Ok(());
+    }
+    let Some(ref pool) = ctx.aof_pool else {
+        return Ok(());
+    };
+    let mut barrier_pending = false;
+    for bytes in aof_entries {
+        let lsn = crate::persistence::aof::AofWriterPool::issue_append_lsn(
+            &ctx.repl_state,
+            ctx.shard_id,
+            bytes.len(),
+        );
+        match pool.send_append_group(ctx.shard_id, lsn, bytes).await {
+            Ok(true) => barrier_pending = true,
+            Ok(false) => {}
+            Err(_) => return Err(()),
+        }
+    }
+    // appendfsync=always: one barrier confirms the whole body is on disk.
+    if barrier_pending && pool.fsync_barrier(ctx.shard_id).await.is_err() {
+        return Err(());
+    }
+    Ok(())
 }
 
 /// Shared PUBLISH-inside-MULTI intercept for both transaction executors (C2).
@@ -555,6 +626,51 @@ pub(crate) fn is_multi_key_command(cmd: &[u8], args: &[Frame]) -> bool {
     }
 }
 
+/// Shard-locality of a queued MULTI/EXEC body.
+///
+/// `execute_transaction_sharded` runs the whole body on ONE shard's slice with
+/// no per-key routing, so a key owned by a different shard is silently written
+/// to (or read from) the wrong table. This classifies a queued body so the
+/// EXEC handler can either run it locally (all keys local), route it to the
+/// owner shard (all keys on one remote shard — Phase B), or reject it
+/// (`CrossShard`: a single-process shared-nothing engine can't atomically span
+/// shards). Hash tags (`{tag}`) collapse a body to `SingleShard`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TxnLocality {
+    /// No key-bearing commands — safe to run on any shard.
+    Keyless,
+    /// Every key in the body resolves to this single shard.
+    SingleShard(usize),
+    /// Keys span more than one shard — not atomically executable.
+    CrossShard,
+}
+
+/// Classify a queued transaction body by the shard(s) its keys hash to.
+///
+/// Uses the command-metadata key specs (`command_keys`) so multi-key commands
+/// (MSET/DEL/…) contribute every key, and `key_to_shard` so `{hash tags}` are
+/// honored identically to the normal routing path.
+pub(crate) fn analyze_txn_locality(command_queue: &[Frame], num_shards: usize) -> TxnLocality {
+    let mut owner: Option<usize> = None;
+    for frame in command_queue {
+        let Some((cmd, args)) = extract_command(frame) else {
+            continue;
+        };
+        for key in crate::tracking::invalidation::command_keys(cmd, args) {
+            let s = crate::shard::dispatch::key_to_shard(&key, num_shards);
+            match owner {
+                None => owner = Some(s),
+                Some(existing) if existing != s => return TxnLocality::CrossShard,
+                _ => {}
+            }
+        }
+    }
+    match owner {
+        None => TxnLocality::Keyless,
+        Some(s) => TxnLocality::SingleShard(s),
+    }
+}
+
 #[cfg(test)]
 mod as_of_tests {
     //! Unit tests for `resolve_ft_search_as_of_lsn` (TEMP-04 + ACID-09).
@@ -714,4 +830,84 @@ pub async fn resolve_local_leg_barrier(
         }
     }
     idxs.clear();
+}
+
+#[cfg(test)]
+mod txn_locality_tests {
+    use super::{TxnLocality, analyze_txn_locality};
+    use crate::protocol::Frame;
+    use bytes::Bytes;
+
+    /// Build a queued command frame (name + args) as the wire form.
+    fn cmd(parts: &[&str]) -> Frame {
+        Frame::Array(
+            parts
+                .iter()
+                .map(|p| Frame::BulkString(Bytes::copy_from_slice(p.as_bytes())))
+                .collect::<Vec<_>>()
+                .into(),
+        )
+    }
+
+    #[test]
+    fn empty_and_keyless_are_keyless() {
+        assert_eq!(analyze_txn_locality(&[], 4), TxnLocality::Keyless);
+        let q = [cmd(&["PING"]), cmd(&["MULTI"])];
+        assert_eq!(analyze_txn_locality(&q, 4), TxnLocality::Keyless);
+    }
+
+    #[test]
+    fn single_shard_at_one_shard() {
+        // With one shard every key resolves to shard 0.
+        let q = [cmd(&["SET", "a", "1"]), cmd(&["SET", "b", "2"])];
+        assert_eq!(analyze_txn_locality(&q, 1), TxnLocality::SingleShard(0));
+    }
+
+    #[test]
+    fn hash_tags_collapse_to_one_shard() {
+        // `{t}` forces co-location regardless of the surrounding key text.
+        let q = [
+            cmd(&["SET", "user:{t}:name", "x"]),
+            cmd(&["INCR", "user:{t}:hits"]),
+            cmd(&["DEL", "user:{t}:tmp"]),
+        ];
+        let owner = crate::shard::dispatch::key_to_shard(b"t", 8);
+        assert_eq!(analyze_txn_locality(&q, 8), TxnLocality::SingleShard(owner));
+    }
+
+    #[test]
+    fn spanning_keys_are_cross_shard() {
+        // Find two keys that hash to different shards, then confirm CrossShard.
+        let num = 8;
+        let base = crate::shard::dispatch::key_to_shard(b"k0", num);
+        let mut other = None;
+        for i in 1..1000 {
+            let k = format!("k{i}");
+            if crate::shard::dispatch::key_to_shard(k.as_bytes(), num) != base {
+                other = Some(k);
+                break;
+            }
+        }
+        let other = other.expect("two keys on different shards must exist across 8 shards");
+        let q = [cmd(&["SET", "k0", "1"]), cmd(&["SET", &other, "2"])];
+        assert_eq!(analyze_txn_locality(&q, num), TxnLocality::CrossShard);
+    }
+
+    #[test]
+    fn multi_key_command_contributes_every_key() {
+        // MSET's keys are checked individually; spanning keys ⇒ CrossShard.
+        let num = 8;
+        let base = crate::shard::dispatch::key_to_shard(b"m0", num);
+        let mut other = None;
+        for i in 1..1000 {
+            let k = format!("m{i}");
+            if crate::shard::dispatch::key_to_shard(k.as_bytes(), num) != base {
+                other = Some(k);
+                break;
+            }
+        }
+        let other = other.expect("two keys on different shards must exist");
+        let q = [cmd(&["MSET", "m0", "1", &other, "2"])];
+        assert_eq!(analyze_txn_locality(&q, num), TxnLocality::CrossShard);
+    }
 }
