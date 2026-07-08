@@ -9,7 +9,6 @@ use std::sync::Arc;
 
 use crate::blocking::BlockingRegistry;
 use crate::config::RuntimeConfig;
-use crate::persistence::wal::WalWriter;
 
 use super::shared_databases::ShardDatabases;
 
@@ -70,15 +69,6 @@ pub const CHECKPOINT_TICK_MS: u64 = 1;
 /// Warm tier transition check interval in milliseconds (10 seconds).
 /// Infrequent enough to avoid overhead, responsive enough to catch aged segments.
 pub const WARM_CHECK_INTERVAL_MS: u64 = 10_000;
-
-/// WAL fsync on 1-second interval (everysec durability).
-pub(crate) fn sync_wal(wal_writer: &mut Option<WalWriter>) {
-    if let Some(wal) = wal_writer {
-        if let Err(e) = wal.sync_to_disk() {
-            tracing::error!("WAL sync failed: {}", e);
-        }
-    }
-}
 
 /// Fire MQ triggers whose debounce window has elapsed.
 ///
@@ -235,13 +225,15 @@ pub(crate) fn run_cold_orphan_sweep(
 
 /// WAL v3 fsync on 1-second interval (mirrors v2 everysec pattern).
 ///
-/// Flush any buffered WAL v3 data and fsync to stable storage.
-///
-/// Called on the 1s timer. Writes remaining buffer contents then fsyncs.
-/// Only active when disk-offload is enabled and WalWriterV3 was successfully initialized.
+/// Flush buffered WAL v3 data to the page cache and hand the fsync to the
+/// off-loop sync agent — the fsync itself no longer blocks the shard event
+/// loop (measured 10–16 ms probe stalls per second on GCE pd with real WAL
+/// bytes, tmp/WALV3-OFFLOOP-FSYNC.md §8). The everysec bound is now "sync
+/// *initiated* every 1s, durable typically ms later" — the same window the
+/// AOF everysec writers provide.
 pub(crate) fn sync_wal_v3(wal_v3: &mut Option<crate::persistence::wal_v3::segment::WalWriterV3>) {
     if let Some(wal) = wal_v3 {
-        if let Err(e) = wal.flush_sync() {
+        if let Err(e) = wal.request_sync() {
             tracing::error!("WAL v3 sync failed: {}", e);
         }
     }

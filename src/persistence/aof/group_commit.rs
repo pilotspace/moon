@@ -230,10 +230,29 @@ pub fn commit_group_commit_batch<S: GroupCommitSink + ?Sized>(
     batch: &mut GroupCommitBatch,
     do_fsync: bool,
 ) -> CommitOutcome {
-    // Step 1 — write every data message's bytes in channel order.
-    for msg in &batch.data {
-        if sink.write_all(msg_body(msg)).is_err() {
-            return ack_batch(batch, BatchAck::WriteFailed);
+    // Step 1 — write the batch's bytes in channel order. Multi-message
+    // batches are coalesced into ONE contiguous `write_all` (the sink is a
+    // raw unbuffered File on the monoio paths, so per-message writes meant
+    // one write(2) PER RECORD — measured as the dominant writer-thread cost
+    // under always-P16: 127,812 write calls / 1.25s of an 8s strace window
+    // vs 2,144 fdatasyncs / 0.2s; Redis batches ~120 records per write via
+    // aof_buf). Single-message batches keep the zero-copy direct write.
+    match batch.data.len() {
+        0 => {}
+        1 => {
+            if sink.write_all(msg_body(&batch.data[0])).is_err() {
+                return ack_batch(batch, BatchAck::WriteFailed);
+            }
+        }
+        _ => {
+            let total: usize = batch.data.iter().map(|m| msg_body(m).len()).sum();
+            let mut buf = Vec::with_capacity(total);
+            for msg in &batch.data {
+                buf.extend_from_slice(msg_body(msg));
+            }
+            if sink.write_all(&buf).is_err() {
+                return ack_batch(batch, BatchAck::WriteFailed);
+            }
         }
     }
     // Step 2 — exactly ONE fsync, AFTER all writes, only under Always.

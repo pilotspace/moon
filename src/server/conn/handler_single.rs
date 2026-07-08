@@ -67,16 +67,35 @@ pub(crate) async fn flush_with_aof_ack<S>(
 where
     S: futures::Sink<Frame> + Unpin,
 {
-    // Phase 1 — await every fsync ack; patch failed slots.
+    // Phase 1 — group commit: enqueue every append fire-and-forget, then
+    // confirm the whole batch with ONE fsync barrier (Always) instead of an
+    // awaited fsync per entry — same contract as the sharded handlers'
+    // resolve_local_leg_barrier. On barrier failure every enqueued write in
+    // the batch is unconfirmed, so every joined slot is patched.
+    let mut barrier_idxs: Vec<usize> = Vec::new();
     for (resp_idx, bytes) in aof_entries {
         let lsn =
             crate::persistence::aof::AofWriterPool::issue_append_lsn(repl_state, 0, bytes.len());
-        if pool.try_send_append_durable(0, lsn, bytes).await.is_err() && resp_idx < responses.len()
-        {
-            responses[resp_idx] = Frame::Error(Bytes::from_static(b"WRITEFAIL aof fsync failed"));
+        match pool.send_append_group(0, lsn, bytes).await {
+            Ok(true) => barrier_idxs.push(resp_idx),
+            Ok(false) => {}
+            Err(_) => {
+                if resp_idx < responses.len() {
+                    responses[resp_idx] =
+                        Frame::Error(Bytes::from_static(b"WRITEFAIL aof fsync failed"));
+                }
+            }
         }
         if let Some(counter) = change_counter {
             counter.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    if !barrier_idxs.is_empty() && pool.fsync_barrier(0).await.is_err() {
+        for resp_idx in barrier_idxs {
+            if resp_idx < responses.len() {
+                responses[resp_idx] =
+                    Frame::Error(Bytes::from_static(b"WRITEFAIL aof fsync failed"));
+            }
         }
     }
     // Phase 2 — all acks received; flush responses to client.
@@ -347,8 +366,25 @@ pub async fn handle_connection(
                 msg = rx.recv_async() => {
                     match msg {
                         Ok(data) => {
-                            // Data is pre-serialized RESP — wrap in PreSerialized for framed send
-                            if framed.send(Frame::PreSerialized(data)).await.is_err() {
+                            // Data is pre-serialized RESP. Coalesce any burst already
+                            // queued into ONE PreSerialized send — one flush/syscall per
+                            // burst instead of per message. Single-message case stays
+                            // zero-copy via the is_empty fast path.
+                            const MAX_COALESCE_BYTES: usize = 64 * 1024;
+                            let payload = if rx.is_empty() {
+                                data
+                            } else {
+                                let mut agg = BytesMut::with_capacity((data.len() * 4).min(MAX_COALESCE_BYTES));
+                                agg.extend_from_slice(&data);
+                                while agg.len() < MAX_COALESCE_BYTES {
+                                    match rx.try_recv() {
+                                        Ok(next) => agg.extend_from_slice(&next),
+                                        Err(_) => break,
+                                    }
+                                }
+                                agg.freeze()
+                            };
+                            if framed.send(Frame::PreSerialized(payload)).await.is_err() {
                                 break;
                             }
                         }
@@ -953,15 +989,26 @@ pub async fn handle_connection(
                             // failure mode discards the entire response buffer; future
                             // per-slot patching could use it.
                             let mut aof_write_failed = false;
+                            let mut aof_barrier_needed = false;
                             for (_resp_idx, bytes) in aof_entries.drain(..) {
                                 if let Some(ref pool) = aof_pool {
                                     let lsn = crate::persistence::aof::AofWriterPool::issue_append_lsn(&repl_state, 0, bytes.len());
-                                    if let Err(_aof_err) = pool.try_send_append_durable(0, lsn, bytes).await {
-                                        aof_write_failed = true;
+                                    match pool.send_append_group(0, lsn, bytes).await {
+                                        Ok(true) => aof_barrier_needed = true,
+                                        Ok(false) => {}
+                                        Err(_) => aof_write_failed = true,
                                     }
                                 }
                                 if let Some(ref counter) = change_counter {
                                     counter.fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
+                            // ONE fsync confirms the whole batch (group commit).
+                            if aof_barrier_needed {
+                                if let Some(ref pool) = aof_pool {
+                                    if pool.fsync_barrier(0).await.is_err() {
+                                        aof_write_failed = true;
+                                    }
                                 }
                             }
                             if aof_write_failed {
@@ -1558,21 +1605,31 @@ pub async fn handle_connection(
                                         (resp, records)
                                     };
                                     let mut graph_aof_failed = false;
+                                    let mut graph_barrier_needed = false;
                                     for record in wal_records {
                                         if let Some(ref pool) = aof_pool {
                                             // Single-shard mode (shard_id = 0).
-                                            // `try_send_append_durable` awaits writer
-                                            // ack under `appendfsync=always` (H1
-                                            // closure) and is fire-and-forget for
+                                            // Group commit: enqueue all records,
+                                            // ONE fsync barrier below confirms them
+                                            // (Always); fire-and-forget for
                                             // everysec/no.
                                             let bytes = bytes::Bytes::from(record);
                                             let lsn = crate::persistence::aof::AofWriterPool::issue_append_lsn(&repl_state, 0, bytes.len());
-                                            if let Err(_aof_err) = pool.try_send_append_durable(0, lsn, bytes).await {
-                                                graph_aof_failed = true;
+                                            match pool.send_append_group(0, lsn, bytes).await {
+                                                Ok(true) => graph_barrier_needed = true,
+                                                Ok(false) => {}
+                                                Err(_) => graph_aof_failed = true,
                                             }
                                         }
                                         if let Some(ref counter) = change_counter {
                                             counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        }
+                                    }
+                                    if graph_barrier_needed {
+                                        if let Some(ref pool) = aof_pool {
+                                            if pool.fsync_barrier(0).await.is_err() {
+                                                graph_aof_failed = true;
+                                            }
                                         }
                                     }
                                     if graph_aof_failed {
@@ -2462,25 +2519,20 @@ mod tests {
         }
     }
 
-    /// FIX-W1-1 r3: discriminating ordering test for `flush_with_aof_ack`.
+    /// FIX-W1-1 r3 (updated for group commit): discriminating ordering test
+    /// for `flush_with_aof_ack`.
     ///
     /// This test calls the **real** `flush_with_aof_ack` function that the
     /// production handler uses — not an inline copy.  The H1 contract is:
     ///
-    ///   All AOF fsync acks MUST be awaited BEFORE any response is sent.
+    ///   AOF durability MUST be confirmed BEFORE any response is sent.
     ///
-    /// Red state (broken ordering — send-before-ack):
-    ///   If the fn were to flush responses BEFORE awaiting acks, the mock
-    ///   60ms fsync delay would NOT gate the first response, so
-    ///   `elapsed_ms < 55` → test fails.
-    ///
-    /// Green state (ack-before-send — current production code):
-    ///   `flush_with_aof_ack` awaits the 60ms ack BEFORE any `start_send`,
-    ///   so `elapsed_ms >= 55` → test passes.
-    ///
-    /// Red verification was performed by temporarily inverting the fn body
-    /// (Phase 2 before Phase 1) and confirming `elapsed_ms ≈ 0ms` → FAIL.
-    /// The fn was then restored and the test passes consistently.
+    /// Under the group-commit protocol the writer channel carries the
+    /// entry's fire-and-forget `Append` followed by ONE zero-length
+    /// `AppendSync` barrier for the whole batch (previously: one awaited
+    /// `AppendSync` per entry). The 60ms mock fsync delay gates the barrier
+    /// ack; a broken ordering (flush responses before the barrier ack)
+    /// would send the first response at ~0ms → `elapsed_ms < 55` → FAIL.
     #[tokio::test]
     async fn flush_with_aof_ack_ack_precedes_response() {
         // Build an Always-policy pool backed by a real bounded channel.
@@ -2491,16 +2543,22 @@ mod tests {
             std::time::Duration::ZERO,
         );
 
-        // Mock writer: receives one AppendSync, sleeps 60ms to simulate fsync,
-        // then sends Synced.  Runs on a blocking thread because flume's
+        // Mock writer: receives the entry's fire-and-forget Append, then the
+        // batch's ONE AppendSync barrier; sleeps 60ms to simulate the fsync,
+        // then acks Synced. Runs on a blocking thread because flume's
         // `Receiver::recv()` is synchronous.
         let mock_writer = tokio::task::spawn_blocking(move || {
-            let msg = rx.recv().expect("mock writer: message received");
+            let first = rx.recv().expect("mock writer: append received");
+            assert!(
+                matches!(first, AofMessage::Append { .. }),
+                "group commit enqueues the entry fire-and-forget (Append first)"
+            );
+            let msg = rx.recv().expect("mock writer: barrier received");
             if let AofMessage::AppendSync { ack, .. } = msg {
                 std::thread::sleep(Duration::from_millis(60));
                 let _ = ack.send(AofAck::Synced);
             } else {
-                panic!("Always policy MUST send AppendSync; got non-AppendSync variant");
+                panic!("Always policy MUST send an AppendSync barrier");
             }
         });
 

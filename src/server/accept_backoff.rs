@@ -87,11 +87,21 @@ fn backoff_for(consecutive: u32) -> Duration {
 /// Errors that indicate the process/system is out of a resource needed to
 /// accept — retrying immediately would just spin. Everything else is treated
 /// as a transient per-connection error (logged, loop continues, no sleep).
+#[cfg(unix)]
 fn is_resource_exhaustion(err: &std::io::Error) -> bool {
     matches!(
         err.raw_os_error(),
         Some(libc::EMFILE) | Some(libc::ENFILE) | Some(libc::ENOBUFS) | Some(libc::ENOMEM)
     )
+}
+
+/// Windows variant — `libc` is not linked there. WSAEMFILE (10024) and
+/// WSAENOBUFS (10055) are winsock's fd/buffer exhaustion; `OutOfMemory`
+/// covers the ENOMEM-alikes the kind mapping recognizes.
+#[cfg(not(unix))]
+fn is_resource_exhaustion(err: &std::io::Error) -> bool {
+    matches!(err.raw_os_error(), Some(10024) | Some(10055))
+        || matches!(err.kind(), std::io::ErrorKind::OutOfMemory)
 }
 
 #[cfg(test)]
@@ -126,13 +136,26 @@ mod tests {
 
     #[test]
     fn resource_exhaustion_classification() {
-        let emfile = std::io::Error::from_raw_os_error(libc::EMFILE);
-        let enfile = std::io::Error::from_raw_os_error(libc::ENFILE);
+        // Platform-native fd-exhaustion errnos: unix EMFILE/ENFILE,
+        // Windows WSAEMFILE/WSAENOBUFS (libc is not linked on Windows).
+        #[cfg(unix)]
+        let (emfile, enfile) = (
+            std::io::Error::from_raw_os_error(libc::EMFILE),
+            std::io::Error::from_raw_os_error(libc::ENFILE),
+        );
+        #[cfg(not(unix))]
+        let (emfile, enfile) = (
+            std::io::Error::from_raw_os_error(10024), // WSAEMFILE
+            std::io::Error::from_raw_os_error(10055), // WSAENOBUFS
+        );
         assert!(is_resource_exhaustion(&emfile));
         assert!(is_resource_exhaustion(&enfile));
 
         // A reset-by-peer during accept is transient, not exhaustion.
+        #[cfg(unix)]
         let aborted = std::io::Error::from_raw_os_error(libc::ECONNABORTED);
+        #[cfg(not(unix))]
+        let aborted = std::io::Error::from_raw_os_error(10053); // WSAECONNABORTED
         assert!(!is_resource_exhaustion(&aborted));
         // A non-OS error (e.g. synthesized) is not classified as exhaustion.
         let other = std::io::Error::new(std::io::ErrorKind::Other, "synthetic");

@@ -63,6 +63,68 @@ const AOF_IDLE_WAIT_STEPS: &[std::time::Duration] = &[
     std::time::Duration::from_secs(1),
 ];
 
+/// Park-free bounded receive for the std-thread writer loops under
+/// `FsyncPolicy::EverySec`/`No`.
+///
+/// A parked `recv_timeout` registers this thread as a flume waiter, so every
+/// producer `try_send` from a shard thread pays a futex WAKE **on the shard
+/// thread** — measured at 149,718 futex calls (63% of shard-thread syscall
+/// time) during an 8s p1 SET run under everysec, the mechanism behind the
+/// esec p1 SET deficit vs Redis (whose AOF append is a plain memcpy into
+/// `aof_buf`). Polling with `try_recv` + short sleeps never registers a
+/// waiter, so producer sends stay pure userspace atomics.
+///
+/// Latency/CPU trade (why this is safe ONLY for EverySec/No): a message may
+/// sit unobserved for up to one sleep step. The step scales with the wait
+/// (`wait/16`, clamped to 500µs..50ms), so at the 50ms fast floor the
+/// EverySec deadline is still checked within ~3ms slack, and at the idle 1s
+/// escalated wait the writer wakes ≤20×/s (vs the parked recv's 1×/s —
+/// the accepted cost of this fix; still far below the pre-wave-5 fixed
+/// 50ms cadence). Under load `try_recv` returns immediately and no sleep
+/// happens at all. `Always` keeps the parked recv: its callers block on the
+/// per-batch fsync ack, so added receive latency is user-visible RTT.
+#[cfg(feature = "runtime-monoio")]
+fn poll_recv(
+    rx: &channel::MpscReceiver<AofMessage>,
+    wait: std::time::Duration,
+) -> Result<AofMessage, flume::RecvTimeoutError> {
+    let step = (wait / 16).clamp(
+        std::time::Duration::from_micros(500),
+        std::time::Duration::from_millis(50),
+    );
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        match rx.try_recv() {
+            Ok(m) => return Ok(m),
+            Err(flume::TryRecvError::Disconnected) => {
+                return Err(flume::RecvTimeoutError::Disconnected);
+            }
+            Err(flume::TryRecvError::Empty) => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(flume::RecvTimeoutError::Timeout);
+                }
+                std::thread::sleep(step);
+            }
+        }
+    }
+}
+
+/// Bounded receive for the std-thread writer loops: parked under `Always`
+/// (ack latency is client-visible), park-free polling otherwise (producer
+/// sends must not pay a futex wake — see [`poll_recv`]).
+#[cfg(feature = "runtime-monoio")]
+fn recv_next(
+    rx: &channel::MpscReceiver<AofMessage>,
+    wait: std::time::Duration,
+    park: bool,
+) -> Result<AofMessage, flume::RecvTimeoutError> {
+    if park {
+        rx.recv_timeout(wait)
+    } else {
+        poll_recv(rx, wait)
+    }
+}
+
 impl IdleWait {
     fn new() -> Self {
         Self {
@@ -106,6 +168,73 @@ impl IdleWait {
     /// succeeded) — escalation may resume from here.
     fn clear_pending(&mut self) {
         self.pending = false;
+    }
+}
+
+#[cfg(all(test, feature = "runtime-monoio"))]
+mod poll_recv_tests {
+    use super::*;
+
+    #[test]
+    fn returns_queued_message_immediately() {
+        let (tx, rx) = channel::mpsc_bounded::<AofMessage>(4);
+        assert!(
+            tx.try_send(AofMessage::Append {
+                lsn: 7,
+                bytes: bytes::Bytes::from_static(b"x"),
+            })
+            .is_ok()
+        );
+        let start = std::time::Instant::now();
+        let Ok(got) = poll_recv(&rx, std::time::Duration::from_secs(1)) else {
+            panic!("expected message");
+        };
+        assert!(matches!(got, AofMessage::Append { lsn: 7, .. }));
+        // No sleep step should have been taken for an already-queued message.
+        assert!(start.elapsed() < std::time::Duration::from_millis(50));
+    }
+
+    #[test]
+    fn picks_up_message_sent_mid_wait() {
+        let (tx, rx) = channel::mpsc_bounded::<AofMessage>(4);
+        let sender = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            assert!(
+                tx.try_send(AofMessage::Append {
+                    lsn: 1,
+                    bytes: bytes::Bytes::from_static(b"y"),
+                })
+                .is_ok()
+            );
+        });
+        let Ok(got) = poll_recv(&rx, std::time::Duration::from_secs(5)) else {
+            panic!("expected message");
+        };
+        assert!(matches!(got, AofMessage::Append { lsn: 1, .. }));
+        assert!(sender.join().is_ok());
+    }
+
+    #[test]
+    fn times_out_when_empty() {
+        let (_tx, rx) = channel::mpsc_bounded::<AofMessage>(4);
+        let start = std::time::Instant::now();
+        // AofMessage has no Debug impl — match instead of unwrap_err.
+        let Err(err) = poll_recv(&rx, std::time::Duration::from_millis(30)) else {
+            panic!("expected timeout");
+        };
+        assert!(matches!(err, flume::RecvTimeoutError::Timeout));
+        assert!(start.elapsed() >= std::time::Duration::from_millis(30));
+    }
+
+    #[test]
+    fn reports_disconnect() {
+        let (tx, rx) = channel::mpsc_bounded::<AofMessage>(4);
+        drop(tx);
+        // AofMessage has no Debug impl — match instead of unwrap_err.
+        let Err(err) = poll_recv(&rx, std::time::Duration::from_secs(1)) else {
+            panic!("expected disconnect");
+        };
+        assert!(matches!(err, flume::RecvTimeoutError::Disconnected));
     }
 }
 
@@ -373,7 +502,13 @@ pub async fn aof_writer_task(
             // bounded batch so a single fsync makes the whole batch durable
             // (TopLevel = plain RESP bytes). On timeout, fall through (None)
             // to the EverySec proactive fsync at the end of the loop.
-            let first = match rx.recv_timeout(idle_wait.current()) {
+            // Park-free under EverySec/No so producer try_sends never pay a
+            // futex wake on the shard thread — see `poll_recv`.
+            let first = match recv_next(
+                &rx,
+                idle_wait.current(),
+                matches!(fsync, FsyncPolicy::Always),
+            ) {
                 Ok(m) => {
                     idle_wait.on_message();
                     Some(m)
@@ -1302,6 +1437,9 @@ pub async fn per_shard_aof_writer_task(
         let mut write_error = false;
         let mut _dbg_processed: u64 = 0;
         let _dbg_start = Instant::now();
+        // Reusable frame-coalescing buffer: one contiguous write_all per
+        // group-commit batch instead of a header+body write pair per record.
+        let mut batch_buf: Vec<u8> = Vec::new();
         // Idle-adaptive channel-poll wake cadence (RSS/CPU wave 5, item B) —
         // see `IdleWait` docs near the top of this file.
         let mut idle_wait = IdleWait::new();
@@ -1320,8 +1458,14 @@ pub async fn per_shard_aof_writer_task(
             // Appends arrive after a fold (or when the client stops writing).
             // The wait starts at `idle_wait`'s fast floor (50ms, matching the
             // old fixed cadence) and escalates while genuinely idle — see
-            // `IdleWait` docs.
-            let first = match rx.recv_timeout(idle_wait.current()) {
+            // `IdleWait` docs. Park-free under EverySec/No so producer
+            // try_sends never pay a futex wake on the shard thread — see
+            // `poll_recv`.
+            let first = match recv_next(
+                &rx,
+                idle_wait.current(),
+                matches!(fsync, FsyncPolicy::Always),
+            ) {
                 Ok(m) => {
                     idle_wait.on_message();
                     Some(m)
@@ -1369,9 +1513,15 @@ pub async fn per_shard_aof_writer_task(
                         // waiter so callers error instead of acking a corrupt write.
                         let _ = group_commit::ack_batch(&mut batch, BatchAck::WriteFailed);
                     } else {
-                        // Write each record framed, header + body, in channel order;
-                        // the single fsync below covers them all.
-                        let mut write_failed = false;
+                        // Frame each record (`[u64 lsn][u32 len]` header + body, in
+                        // channel order) into the reusable batch buffer and issue
+                        // ONE write_all for the whole batch; the single fsync below
+                        // covers it all. The old per-record header+body write_all
+                        // pair on the raw File was the dominant writer-thread cost
+                        // under always-P16 (measured 127,812 write(2) calls / 1.25s
+                        // of an 8s strace window vs 2,144 fdatasyncs / 0.2s — Redis
+                        // batches ~120 records per write via aof_buf).
+                        batch_buf.clear();
                         for msg in &batch.data {
                             let (lsn, data) = match msg {
                                 AofMessage::Append { lsn, bytes }
@@ -1388,22 +1538,24 @@ pub async fn per_shard_aof_writer_task(
                             let mut header = [0u8; 12];
                             header[..8].copy_from_slice(&lsn.to_le_bytes());
                             header[8..].copy_from_slice(&(data.len() as u32).to_le_bytes());
-                            if let Err(e) = file.write_all(&header) {
+                            batch_buf.extend_from_slice(&header);
+                            batch_buf.extend_from_slice(data);
+                        }
+                        let mut write_failed = false;
+                        if !batch_buf.is_empty() {
+                            if let Err(e) = file.write_all(&batch_buf) {
                                 error!(
-                                    "AOF header write failed shard {} (seq {}): {}. Persistence degraded.",
+                                    "AOF batch write failed shard {} (seq {}): {}. Persistence degraded.",
                                     shard_id, manifest.seq, e
                                 );
                                 write_failed = true;
-                                break;
                             }
-                            if let Err(e) = file.write_all(data) {
-                                error!(
-                                    "AOF write failed shard {} (seq {}): {}. Persistence degraded.",
-                                    shard_id, manifest.seq, e
-                                );
-                                write_failed = true;
-                                break;
-                            }
+                        }
+                        // Cap the reusable buffer's high-water mark: a rare burst of
+                        // large values (up to AOF_GROUP_COMMIT_MAX_BYTES) must not
+                        // pin megabytes on the writer thread forever.
+                        if batch_buf.capacity() > 1 << 20 {
+                            batch_buf = Vec::new();
                         }
 
                         let do_fsync = matches!(fsync, FsyncPolicy::Always);

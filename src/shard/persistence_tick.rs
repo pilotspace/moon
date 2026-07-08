@@ -8,7 +8,6 @@ use std::sync::Arc;
 use tracing::info;
 
 use crate::persistence::snapshot::SnapshotState;
-use crate::persistence::wal::WalWriter;
 use crate::runtime::channel;
 
 use super::shared_databases::ShardDatabases;
@@ -147,33 +146,21 @@ pub(crate) fn advance_snapshot_segment(
     }
 }
 
-/// Handle successful snapshot finalization: truncate WAL and send reply.
+/// Handle successful snapshot finalization: send reply.
+///
+/// WAL v2's per-snapshot `truncate_after_snapshot(epoch)` had no v3
+/// equivalent -- v3 retention is LSN-driven (`WalWriterV3::recycle_aggressive`
+/// / `recycle_segments_before`, invoked from autovacuum Pass C and the
+/// checkpoint protocol) and runs independently of legacy RRDSHARD snapshot
+/// epochs, so this handler no longer touches the WAL writer at all.
 pub(crate) fn finalize_snapshot_success(
     snapshot_state: &mut Option<SnapshotState>,
     snapshot_reply_tx: &mut Option<channel::OneshotSender<Result<(), String>>>,
-    wal_writer: &mut Option<WalWriter>,
     shard_id: usize,
 ) {
     if let Some(snap) = snapshot_state.as_ref() {
         let epoch = snap.epoch;
         info!("Shard {}: snapshot epoch {} complete", shard_id, epoch);
-        // Truncate WAL after successful snapshot
-        if let Some(wal) = wal_writer {
-            if let Err(e) = wal.truncate_after_snapshot(epoch) {
-                tracing::error!(
-                    "Shard {}: WAL truncation after snapshot epoch {} failed: {}. \
-                     WAL and snapshot may be out of sync.",
-                    shard_id,
-                    epoch,
-                    e
-                );
-                if let Some(tx) = snapshot_reply_tx.take() {
-                    let _ = tx.send(Err(format!("WAL truncation failed: {}", e)));
-                }
-                *snapshot_state = None;
-                return;
-            }
-        }
         if let Some(tx) = snapshot_reply_tx.take() {
             let _ = tx.send(Ok(()));
         }
@@ -195,18 +182,11 @@ pub(crate) fn finalize_snapshot_error(
     *snapshot_state = None;
 }
 
-/// Flush WAL if needed (1ms tick -- write to page cache only; sync is separate).
-pub(crate) fn flush_wal_if_needed(wal_writer: &mut Option<WalWriter>) {
-    if let Some(wal) = wal_writer {
-        if let Err(e) = wal.flush_if_needed() {
-            tracing::error!("WAL flush failed: {}", e);
-        }
-    }
-}
-
-/// Flush WAL v3 if buffer exceeds threshold (1ms tick -- mirrors v2 pattern).
+/// Flush WAL if buffer exceeds threshold (1ms tick -- write to page cache
+/// only; durable sync is separate, see `timers::sync_wal_v3`).
 ///
-/// Only active when disk-offload is enabled and WalWriterV3 was successfully initialized.
+/// Only active when the per-shard WAL writer was successfully initialized
+/// (appendonly=yes; see the writer-creation block in `event_loop::run`).
 pub(crate) fn flush_wal_v3_if_needed(
     wal_v3: &mut Option<crate::persistence::wal_v3::segment::WalWriterV3>,
 ) {
@@ -985,9 +965,15 @@ pub(crate) fn handle_checkpoint_tick(
             let flushed = page_cache.flush_dirty_pages_with_fpi(
                 count,
                 &mut |page_lsn| {
-                    // Ensure WAL is durable past this page's LSN before writing page
+                    // HARD ordering invariant (log-before-data): the WAL must
+                    // be durable past this page's LSN before the page pwrite.
+                    // Bounded blocking wait on the off-loop sync agent; Err
+                    // aborts this flush batch (checkpoint retries next tick).
                     if wal.current_lsn() > page_lsn {
-                        wal.flush_sync()
+                        wal.wait_durable(
+                            page_lsn,
+                            crate::persistence::wal_v3::segment::WAIT_DURABLE_TIMEOUT,
+                        )
                     } else {
                         Ok(())
                     }
@@ -1055,10 +1041,17 @@ pub(crate) fn handle_checkpoint_tick(
             // 1. Write WAL checkpoint record with redo_lsn payload
             let mut payload = [0u8; 8];
             payload.copy_from_slice(&redo_lsn.to_le_bytes());
-            wal.append(WalRecordType::Checkpoint, &payload);
+            let ckpt_lsn = wal.append(WalRecordType::Checkpoint, &payload);
 
-            // 2. Flush WAL to disk
-            if let Err(e) = wal.flush_sync() {
+            // 2. HARD ordering invariant (WAL-before-manifest): the
+            //    checkpoint record must be durable before the manifest
+            //    commit publishes redo_lsn. Bounded wait on the off-loop
+            //    sync agent; failure aborts finalize (retried next tick),
+            //    so redo_lsn never advances past durability.
+            if let Err(e) = wal.wait_durable(
+                ckpt_lsn,
+                crate::persistence::wal_v3::segment::WAIT_DURABLE_TIMEOUT,
+            ) {
                 tracing::error!("Checkpoint WAL flush failed: {}", e);
                 return false;
             }

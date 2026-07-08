@@ -17,7 +17,6 @@ use crate::command::{DispatchResult, dispatch as cmd_dispatch};
 use crate::config::RuntimeConfig;
 use crate::persistence::aof;
 use crate::persistence::snapshot::SnapshotState;
-use crate::persistence::wal::WalWriter;
 use crate::persistence::wal_v3::segment::WalWriterV3;
 use crate::pubsub::PubSubRegistry;
 use crate::replication::backlog::ReplicationBacklog;
@@ -93,8 +92,7 @@ pub(crate) fn drain_spsc_shared(
         channel::OneshotSender<Result<(), String>>,
     )>,
     snapshot_state: &mut Option<SnapshotState>,
-    wal_writer: &mut Option<WalWriter>,
-    wal_v3_writer: &mut Option<WalWriterV3>,
+    wal_writer: &mut Option<WalWriterV3>,
     repl_backlog: &crate::replication::backlog::SharedBacklog,
     replica_txs: &mut Vec<(u64, channel::MpscSender<bytes::Bytes>)>,
     repl_state: &Option<crate::replication::state::OffsetHandle>,
@@ -216,7 +214,7 @@ pub(crate) fn drain_spsc_shared(
                             // touch the registry through handle_shard_message
                             // because the registry's WalTailReader needs the
                             // shard's wal_dir, which the event loop already
-                            // has from wal_v3_writer.wal_dir().
+                            // has from wal_writer.wal_dir().
                             pending_cdc_subscribes.push(*payload);
                         }
                         _ => other_messages.push(msg),
@@ -241,7 +239,6 @@ pub(crate) fn drain_spsc_shared(
                 pending_snapshot,
                 snapshot_state,
                 wal_writer,
-                wal_v3_writer,
                 repl_backlog,
                 replica_txs,
                 repl_state,
@@ -278,7 +275,6 @@ pub(crate) fn drain_spsc_shared(
             pending_snapshot,
             snapshot_state,
             wal_writer,
-            wal_v3_writer,
             repl_backlog,
             replica_txs,
             repl_state,
@@ -328,8 +324,7 @@ pub(crate) fn handle_shard_message_shared(
         channel::OneshotSender<Result<(), String>>,
     )>,
     snapshot_state: &mut Option<SnapshotState>,
-    wal_writer: &mut Option<WalWriter>,
-    wal_v3_writer: &mut Option<WalWriterV3>,
+    wal_writer: &mut Option<WalWriterV3>,
     repl_backlog: &crate::replication::backlog::SharedBacklog,
     replica_txs: &mut Vec<(u64, channel::MpscSender<bytes::Bytes>)>,
     repl_state: &Option<crate::replication::state::OffsetHandle>,
@@ -494,7 +489,7 @@ pub(crate) fn handle_shard_message_shared(
                         crate::command::server_admin::vacuum(
                             &mut s.vector_store,
                             shard_manifest.as_mut(),
-                            wal_v3_writer.as_mut(),
+                            wal_writer.as_mut(),
                             args,
                             mvcc_prune_margin,
                         )
@@ -513,7 +508,7 @@ pub(crate) fn handle_shard_message_shared(
                                     crate::command::server_admin::debug_reclamation(
                                         &s.vector_store,
                                         shard_manifest.as_ref(),
-                                        wal_v3_writer.as_ref(),
+                                        wal_writer.as_ref(),
                                     )
                                 });
                                 let _ = reply_tx.send(frame);
@@ -574,7 +569,6 @@ pub(crate) fn handle_shard_message_shared(
                             if !wal_append_and_fanout(
                                 &serialized,
                                 wal_writer,
-                                wal_v3_writer,
                                 repl_backlog,
                                 replica_txs,
                                 repl_state,
@@ -651,7 +645,6 @@ pub(crate) fn handle_shard_message_shared(
                                 aof_ok = wal_append_and_fanout(
                                     &serialized,
                                     wal_writer,
-                                    wal_v3_writer,
                                     repl_backlog,
                                     replica_txs,
                                     repl_state,
@@ -805,7 +798,6 @@ pub(crate) fn handle_shard_message_shared(
                             if matches!(response, crate::protocol::Frame::Integer(1))
                                 && wal_fanout_has_work(
                                     wal_writer,
-                                    wal_v3_writer,
                                     replica_txs,
                                     aof_pool,
                                     wal_kv_log,
@@ -815,7 +807,6 @@ pub(crate) fn handle_shard_message_shared(
                                 aof_ok = wal_append_and_fanout(
                                     &serialized,
                                     wal_writer,
-                                    wal_v3_writer,
                                     repl_backlog,
                                     replica_txs,
                                     repl_state,
@@ -873,18 +864,11 @@ pub(crate) fn handle_shard_message_shared(
                         // Skip the serialization alloc when the fanout would
                         // no-op (persistence + replication all off) — it was
                         // pure waste on every cross-shard write.
-                        if wal_fanout_has_work(
-                            wal_writer,
-                            wal_v3_writer,
-                            replica_txs,
-                            aof_pool,
-                            wal_kv_log,
-                        ) {
+                        if wal_fanout_has_work(wal_writer, replica_txs, aof_pool, wal_kv_log) {
                             let serialized = aof::serialize_command(cmd_frame);
                             aof_ok = wal_append_and_fanout(
                                 &serialized,
                                 wal_writer,
-                                wal_v3_writer,
                                 repl_backlog,
                                 replica_txs,
                                 repl_state,
@@ -997,7 +981,6 @@ pub(crate) fn handle_shard_message_shared(
                             if matches!(response, crate::protocol::Frame::Integer(1))
                                 && wal_fanout_has_work(
                                     wal_writer,
-                                    wal_v3_writer,
                                     replica_txs,
                                     aof_pool,
                                     wal_kv_log,
@@ -1007,7 +990,6 @@ pub(crate) fn handle_shard_message_shared(
                                 aof_ok = wal_append_and_fanout(
                                     &serialized,
                                     wal_writer,
-                                    wal_v3_writer,
                                     repl_backlog,
                                     replica_txs,
                                     repl_state,
@@ -1064,18 +1046,11 @@ pub(crate) fn handle_shard_message_shared(
                     if is_write && !matches!(frame, crate::protocol::Frame::Error(_)) {
                         // See `wal_fanout_has_work` — skip the serialization alloc
                         // entirely when the fanout would no-op (persistence off).
-                        if wal_fanout_has_work(
-                            wal_writer,
-                            wal_v3_writer,
-                            replica_txs,
-                            aof_pool,
-                            wal_kv_log,
-                        ) {
+                        if wal_fanout_has_work(wal_writer, replica_txs, aof_pool, wal_kv_log) {
                             let serialized = aof::serialize_command(cmd_frame);
                             aof_ok = wal_append_and_fanout(
                                 &serialized,
                                 wal_writer,
-                                wal_v3_writer,
                                 repl_backlog,
                                 replica_txs,
                                 repl_state,
@@ -1232,7 +1207,6 @@ pub(crate) fn handle_shard_message_shared(
                         if !wal_append_and_fanout(
                             &serialized,
                             wal_writer,
-                            wal_v3_writer,
                             repl_backlog,
                             replica_txs,
                             repl_state,
@@ -1301,7 +1275,6 @@ pub(crate) fn handle_shard_message_shared(
                                 aof_ok = wal_append_and_fanout(
                                     &serialized,
                                     wal_writer,
-                                    wal_v3_writer,
                                     repl_backlog,
                                     replica_txs,
                                     repl_state,
@@ -1416,7 +1389,6 @@ pub(crate) fn handle_shard_message_shared(
                             if matches!(response, crate::protocol::Frame::Integer(1))
                                 && wal_fanout_has_work(
                                     wal_writer,
-                                    wal_v3_writer,
                                     replica_txs,
                                     aof_pool,
                                     wal_kv_log,
@@ -1426,7 +1398,6 @@ pub(crate) fn handle_shard_message_shared(
                                 aof_ok = wal_append_and_fanout(
                                     &serialized,
                                     wal_writer,
-                                    wal_v3_writer,
                                     repl_backlog,
                                     replica_txs,
                                     repl_state,
@@ -1484,18 +1455,11 @@ pub(crate) fn handle_shard_message_shared(
                         // Skip the serialization alloc when the fanout would
                         // no-op (persistence + replication all off) — it was
                         // pure waste on every cross-shard write.
-                        if wal_fanout_has_work(
-                            wal_writer,
-                            wal_v3_writer,
-                            replica_txs,
-                            aof_pool,
-                            wal_kv_log,
-                        ) {
+                        if wal_fanout_has_work(wal_writer, replica_txs, aof_pool, wal_kv_log) {
                             let serialized = aof::serialize_command(cmd_frame);
                             aof_ok = wal_append_and_fanout(
                                 &serialized,
                                 wal_writer,
-                                wal_v3_writer,
                                 repl_backlog,
                                 replica_txs,
                                 repl_state,
@@ -1609,7 +1573,6 @@ pub(crate) fn handle_shard_message_shared(
                             if matches!(response, crate::protocol::Frame::Integer(1))
                                 && wal_fanout_has_work(
                                     wal_writer,
-                                    wal_v3_writer,
                                     replica_txs,
                                     aof_pool,
                                     wal_kv_log,
@@ -1619,7 +1582,6 @@ pub(crate) fn handle_shard_message_shared(
                                 aof_ok = wal_append_and_fanout(
                                     &serialized,
                                     wal_writer,
-                                    wal_v3_writer,
                                     repl_backlog,
                                     replica_txs,
                                     repl_state,
@@ -1676,18 +1638,11 @@ pub(crate) fn handle_shard_message_shared(
                     if is_write && !matches!(frame, crate::protocol::Frame::Error(_)) {
                         // See `wal_fanout_has_work` — skip the serialization alloc
                         // entirely when the fanout would no-op (persistence off).
-                        if wal_fanout_has_work(
-                            wal_writer,
-                            wal_v3_writer,
-                            replica_txs,
-                            aof_pool,
-                            wal_kv_log,
-                        ) {
+                        if wal_fanout_has_work(wal_writer, replica_txs, aof_pool, wal_kv_log) {
                             let serialized = aof::serialize_command(cmd_frame);
                             aof_ok = wal_append_and_fanout(
                                 &serialized,
                                 wal_writer,
-                                wal_v3_writer,
                                 repl_backlog,
                                 replica_txs,
                                 repl_state,
@@ -2214,7 +2169,7 @@ pub(crate) fn handle_shard_message_shared(
         ShardMessage::SwapDb { a, b, reply_tx } => {
             // WAL-before-swap: emit the SWAPDB record so that crash-recovery
             // replay can re-apply the swap in the correct order.  The record
-            // is written even when wal_writer/wal_v3_writer are None (the
+            // is written even when wal_writer/wal_writer are None (the
             // fast-path in wal_append_and_fanout will skip it cheaply).
             //
             // Serialise "SWAPDB <a> <b>" without heap allocation on the number
@@ -2236,7 +2191,6 @@ pub(crate) fn handle_shard_message_shared(
             let _ = wal_append_and_fanout(
                 &serialized,
                 wal_writer,
-                wal_v3_writer,
                 repl_backlog,
                 replica_txs,
                 repl_state,
@@ -3107,15 +3061,15 @@ pub(crate) fn cow_intercept(
 /// fan-out to all connected replica sender channels (non-blocking try_send), and route
 /// the entry to the per-shard AOF writer pool when AOF is enabled.
 ///
-/// CRITICAL: shard_offset in ReplicationState is SEPARATE from WalWriter::bytes_written.
-/// WalWriter::bytes_written resets on snapshot truncation; shard_offset NEVER resets.
+/// CRITICAL: shard_offset in ReplicationState is SEPARATE from WalWriterV3::bytes_written.
+/// WalWriterV3's on-disk bytes reset only on segment recycling; shard_offset NEVER resets.
 ///
 /// FIX-W1-2: `aof_pool` was added to route MSET/coordinator cross-shard writes
 /// through the per-shard AOF pool. The SPSC drain is synchronous so we use
 /// `try_send_append` (fire-and-forget). The `appendfsync=always` rendezvous is
 /// handled by the connection handler (async context), not here.
 /// True when `wal_append_and_fanout` has any consumer for the serialized
-/// command (S3.5b criterion: WAL v2/v3, live replicas, or the AOF pool).
+/// command (S3.5b criterion: WAL, live replicas, or the AOF pool).
 /// ARM perf annotate showed the pre-S3.5b locks were ~21% of CPU on 8-shard
 /// SET p=64 with everything off; the criterion is fully derivable from the
 /// inputs — no flags or shared state. Skipping leaves shard_offset
@@ -3126,15 +3080,12 @@ pub(crate) fn cow_intercept(
 /// every cross-shard write with persistence off).
 #[inline]
 pub(crate) fn wal_fanout_has_work(
-    wal_writer: &Option<WalWriter>,
-    wal_v3_writer: &Option<WalWriterV3>,
+    wal_writer: &Option<WalWriterV3>,
     replica_txs: &[(u64, channel::MpscSender<bytes::Bytes>)],
     aof_pool: Option<&std::sync::Arc<crate::persistence::aof::AofWriterPool>>,
     wal_kv_log: bool,
 ) -> bool {
-    (wal_kv_log && (wal_writer.is_some() || wal_v3_writer.is_some()))
-        || !replica_txs.is_empty()
-        || aof_pool.is_some()
+    (wal_kv_log && wal_writer.is_some()) || !replica_txs.is_empty() || aof_pool.is_some()
 }
 
 /// Error frame substituted for a write's success frame when the command
@@ -3153,8 +3104,7 @@ pub(crate) const AOF_APPEND_LOST_ERR: &[u8] =
 /// per drain arm, not per command.
 pub(crate) fn wal_append_and_fanout(
     data: &[u8],
-    wal_writer: &mut Option<WalWriter>,
-    wal_v3_writer: &mut Option<WalWriterV3>,
+    wal_writer: &mut Option<WalWriterV3>,
     repl_backlog: &crate::replication::backlog::SharedBacklog,
     replica_txs: &[(u64, channel::MpscSender<bytes::Bytes>)],
     repl_state: &Option<crate::replication::state::OffsetHandle>,
@@ -3166,7 +3116,7 @@ pub(crate) fn wal_append_and_fanout(
     // S3.5b (2026-04-27): hot-path bypass when nothing actually has work.
     // See `wal_fanout_has_work` — callers use the same predicate to skip the
     // `aof::serialize_command` alloc entirely when the fanout would no-op.
-    if !wal_fanout_has_work(wal_writer, wal_v3_writer, replica_txs, aof_pool, wal_kv_log) {
+    if !wal_fanout_has_work(wal_writer, replica_txs, aof_pool, wal_kv_log) {
         return true;
     }
     // `wal_kv_log == false` (--wal-kv-log auto/off): the AOF is the recovery
@@ -3175,15 +3125,11 @@ pub(crate) fn wal_append_and_fanout(
     // pure write amplification (measured 2.7× file bytes at shards=4).
     // FPI/checkpoint/feature records are unaffected (different entry points).
     if wal_kv_log {
-        // WAL v3 supersedes v2 — skip v2 append when v3 is active to avoid
-        // double-write overhead (2 write syscalls per SPSC drain batch).
-        if let Some(w3) = wal_v3_writer {
-            w3.append(
+        if let Some(w) = wal_writer {
+            w.append(
                 crate::persistence::wal_v3::record::WalRecordType::Command,
                 data,
             );
-        } else if let Some(w) = wal_writer {
-            w.append(data);
         }
     }
     // 2. Replication backlog (in-memory circular buffer for partial resync).
@@ -3268,8 +3214,7 @@ mod wal_append_tests {
 
         wal_append_and_fanout(
             b"hello",
-            &mut None, // no v2 writer
-            &mut None, // no v3 writer
+            &mut None, // no writer
             &backlog,
             &[],   // no replicas
             &None, // no repl_state
@@ -3298,7 +3243,6 @@ mod wal_append_tests {
 
         wal_append_and_fanout(
             b"hello",
-            &mut None,
             &mut None,
             &backlog,
             &replica_txs,
@@ -3337,8 +3281,7 @@ mod wal_append_tests {
 
         wal_append_and_fanout(
             b"world",
-            &mut None, // no v2 writer
-            &mut None, // no v3 writer
+            &mut None, // no writer
             &backlog,
             &[],         // no replicas — S3.5b bypass triggered without pool guard
             &None,       // no repl_state
@@ -3402,8 +3345,7 @@ mod wal_append_tests {
         // Pre-fix this was `aof_pool` (Some), which caused the double-write.
         wal_append_and_fanout(
             b"*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n1\r\n",
-            &mut None, // no v2 writer
-            &mut None, // no v3 writer
+            &mut None, // no writer
             &backlog,
             &[],   // no replicas
             &None, // no repl_state
@@ -3428,7 +3370,6 @@ mod wal_append_tests {
         // cross-shard MSET/DEL/EXISTS commands).
         wal_append_and_fanout(
             b"*3\r\n$4\r\nMSET\r\n$1\r\nb\r\n$1\r\n2\r\n",
-            &mut None,
             &mut None,
             &backlog,
             &[],
@@ -3476,7 +3417,6 @@ mod wal_append_tests {
 
         wal_append_and_fanout(
             cmd,
-            &mut None,
             &mut w3,
             &backlog,
             &[],
@@ -3501,7 +3441,6 @@ mod wal_append_tests {
         // the record must land in the WAL as before.
         wal_append_and_fanout(
             cmd,
-            &mut None,
             &mut w3,
             &backlog,
             &[],
@@ -3552,8 +3491,7 @@ mod drain_cap_tests {
         let blocking = Rc::new(RefCell::new(BlockingRegistry::new(0)));
         let mut pending_snapshot = None;
         let mut snapshot_state: Option<SnapshotState> = None;
-        let mut wal_writer: Option<WalWriter> = None;
-        let mut wal_v3_writer: Option<WalWriterV3> = None;
+        let mut wal_writer: Option<WalWriterV3> = None;
         let backlog: crate::replication::backlog::SharedBacklog =
             Arc::new(parking_lot::Mutex::new(None));
         let mut replica_txs = Vec::new();
@@ -3579,7 +3517,6 @@ mod drain_cap_tests {
             &mut pending_snapshot,
             &mut snapshot_state,
             &mut wal_writer,
-            &mut wal_v3_writer,
             &backlog,
             &mut replica_txs,
             &offsets,
@@ -3614,7 +3551,6 @@ mod drain_cap_tests {
             &mut pending_snapshot,
             &mut snapshot_state,
             &mut wal_writer,
-            &mut wal_v3_writer,
             &backlog,
             &mut replica_txs,
             &offsets,

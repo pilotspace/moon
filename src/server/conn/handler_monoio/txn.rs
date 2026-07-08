@@ -87,13 +87,13 @@ pub(super) async fn try_handle_txn_commit(
                     return true;
                 }
 
-                // Write XactCommitV2 WAL record with committed KV state.
+                // Write XactCommit WAL record with committed KV state.
                 // Both the forward-image read and the record header use the
                 // txn's BEGIN-time db so commit and replay agree on the db.
                 let txn_id = txn.txn_id;
                 if !txn.kv_undo.is_empty() {
                     let payload = crate::shard::slice::with_shard_db(txn.db_index, |db| {
-                        crate::persistence::wal_v3::record::encode_xact_commit_payload_v2(
+                        crate::persistence::wal_v3::record::encode_xact_commit_payload(
                             txn_id,
                             txn.db_index as u32,
                             txn.kv_undo.records(),
@@ -104,7 +104,7 @@ pub(super) async fn try_handle_txn_commit(
                     crate::persistence::wal_v3::record::write_wal_v3_record(
                         &mut wal_buf,
                         txn_id,
-                        crate::persistence::wal_v3::record::WalRecordType::XactCommitV2,
+                        crate::persistence::wal_v3::record::WalRecordType::XactCommit,
                         &payload,
                     );
                     ctx.shard_databases

@@ -48,6 +48,116 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   gate); multi-shard verified (`--shards 4`: per-shard triggers, 9
   segments, FT.COMPACT 1.57s).
 
+### Fixed — Windows build: `accept_backoff` used unix-only `libc` errnos (PR #TBD)
+
+- `is_resource_exhaustion` (accept-loop backoff, PR #230) referenced
+  `libc::EMFILE`/`ENFILE`/`ENOBUFS`/`ENOMEM` unguarded; `libc` is not linked
+  on Windows, breaking the main-push Windows check (PRs never caught it —
+  Windows CI is skipped on PRs). Now cfg-split: unix keeps the errno match,
+  Windows matches WSAEMFILE (10024) / WSAENOBUFS (10055) /
+  `ErrorKind::OutOfMemory`. Follow-up: the module's unit test
+  (`resource_exhaustion_classification`) also referenced `libc` errnos —
+  now cfg-split the same way (unix errnos vs WSA codes).
+
+### Changed — AOF writer coalesces each group-commit batch into one write (PR #TBD)
+
+- The two monoio AOF writer paths (TopLevel via `commit_group_commit_batch`,
+  PerShard framed loop) wrote each record with its own `write(2)` on the raw
+  unbuffered `File` (the PerShard path even used a header+body pair). strace
+  during always-P16 SET: **127,812 write calls / 1.25 s** of an 8 s window vs
+  2,144 fdatasyncs / 0.2 s — the writer thread was write-syscall-bound, not
+  fsync-bound, while Redis batches ~120 records per write via `aof_buf`. Each
+  batch's records now coalesce into one contiguous buffer (reusable in the
+  PerShard loop, capped at 1 MB high-water) and are written with ONE
+  `write_all` before the single per-batch fsync. Single-message batches keep
+  the zero-copy direct write. Failure semantics unchanged: a failed batch
+  write acks every waiter `WriteFailed` and engages the torn-stream latch.
+- tokio writer loops already amortize via `BufWriter` — untouched.
+- `wal_group_commit` sink tests updated to the coalesced contract (one write,
+  channel-order bytes, fsync after it).
+
+### Changed — AOF writer polls park-free under everysec/no (PR #TBD)
+
+- The two std-thread AOF writer loops (monoio TopLevel + PerShard) no longer
+  park in `recv_timeout` under `appendfsync everysec`/`no`. A parked receiver
+  makes every producer `try_send` pay a futex WAKE **on the shard thread** —
+  measured at ~150k futex calls (63% of shard-thread syscall time) during an
+  8s non-pipelined SET run, the mechanism behind Moon's everysec P1 SET
+  deficit vs Redis (whose AOF append is a plain memcpy). The writer now polls
+  `try_recv` with adaptive sleeps (wait/16, clamped 500µs–50ms) so producer
+  sends stay pure userspace atomics; post-fix the same run shows 96 futex
+  calls. `appendfsync always` keeps the parked recv (its callers await the
+  per-batch fsync ack, so receive latency is client-visible RTT).
+- EverySec durability bound unchanged: at the 50ms fast floor the deadline is
+  re-checked within ~3ms slack; idle cost is ≤20 writer wakes/s at the 1s
+  escalated wait (vs 1/s parked — still far below the pre-wave-5 fixed 50ms
+  cadence).
+
+### Changed — Pub/sub subscriber delivery coalesces message bursts (PR #TBD)
+
+- All three connection handlers' subscriber delivery arms (`handler_monoio`,
+  `handler_sharded`'s `run_subscriber_step`, `handler_single`) now drain the
+  subscriber queue (`try_recv`, capped at 64 KB) and deliver the burst with
+  ONE `write_all` instead of one write syscall per message — the same batched
+  write pattern the command path already uses. Raises the fan-out delivery
+  ceiling and shortens the window in which a slow subscriber's bounded queue
+  (256) overflows and drops messages. The single-message case keeps the
+  zero-copy path (`is_empty` fast path, no allocation; `handler_sharded`
+  reuses the connection's `write_buf`).
+- New wire-level integration test `tests/pubsub_burst_delivery.rs`: a
+  pipelined publish burst must arrive complete, frame-boundary-intact, and in
+  order at 1 and 4 shards (both runtimes).
+
+### Changed — `appendfsync always`: local writes now group-commit per pipeline batch (PR #TBD)
+
+- **All three connection handlers** (`handler_monoio`, `handler_sharded`,
+  `handler_single`): plain local writes (plus MOVE/COPY and single-shard
+  GRAPH.* WAL records) no longer await one fsync ack **per command** under
+  `appendfsync always`. Appends are enqueued fire-and-forget
+  (`send_append_group`) and the whole pipelined batch is confirmed by ONE
+  `fsync_barrier` before response serialization — the same contract
+  cross-shard writes and coordinator local legs already used (PR #213).
+  The writer processes its channel in order, so an acked barrier proves
+  every prior append durable; the fsync-before-ack H1 guarantee is
+  unchanged (a failed barrier converts every joined response to an error,
+  never a silent `+OK`).
+- **Why**: a 16-deep pipeline paid 16 serialized fsync round-trips per
+  connection while Redis fsyncs once per event-loop iteration — measured
+  8× SET-throughput deficit at P16 (Moon 5.2k vs Redis 44k ops/s, GCE
+  c3-standard-8, tmp/MOON-VS-REDIS-DURABILITY.md). Writer-side group
+  commit existed but could only batch *across* connections; the per-command
+  await defeated it *within* a connection.
+- everysec/no policies are unchanged (`send_append_group` degrades to the
+  same bounded-backpressure enqueue).
+- `flush_with_aof_ack`'s discriminating H1 ordering test updated to the
+  batch protocol (one `Append` + one `AppendSync` barrier; ack still gates
+  the first response).
+
+### Changed — WAL v3 fsync moved off the shard event loop (PR #TBD)
+
+- **`src/persistence/wal_v3/sync_agent.rs` (new)**: per-shard `WalSyncAgent`
+  thread receives fd-dup'd sync requests over a bounded flume channel and
+  publishes a monotonic durable-LSN watermark after each `fdatasync`.
+  `WalWriterV3` gains `request_sync()` (non-blocking initiation; queue-full
+  falls back to inline fsync — a durability request is never dropped) and
+  `wait_durable(lsn, timeout)` (bounded blocking wait, used only by the two
+  checkpoint ordering invariants and shutdown). An fsync error poisons the
+  agent permanently and fails subsequent syncs loudly; the checkpoint then
+  refuses to advance `redo_lsn`.
+- **Why**: `flush_sync()` ran `fdatasync` on the shard event-loop thread.
+  Measured on GCE pd (tmp/WALV3-OFFLOOP-FSYNC.md): the everysec 1s timer
+  froze every connection on the shard for **10–16 ms once per second** when
+  the WAL held real bytes, and `appendfsync always` paid −20% RPS / ~2× tail
+  on top of the AOF cost.
+- **Call sites**: everysec timer (`timers::sync_wal_v3`) and the always-mode
+  per-drain-batch sync (both runtimes) now use `request_sync()`; the
+  checkpoint log-before-data page gate and WAL-before-manifest finalize use
+  `wait_durable` (5s bound); shutdown paths keep the inline `flush_sync()`.
+  everysec semantics are now "sync initiated every 1s, durable typically ms
+  later" — the same window the AOF everysec writers provide.
+- Loom model for the watermark/poison state machine in
+  `tests/loom_wal_sync_agent.rs`.
+
 ### Changed — consolidated dependency bumps wave 2 (PR #TBD, supersedes dependabot #223–227)
 
 - Patch-level bumps rolled into one `Cargo.lock` update (no `Cargo.toml`
@@ -66,6 +176,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `actions/setup-node` 4→6 (release.yml), `actions/setup-python` 5→6
   (docs.yml), `taiki-e/install-action` 2.81.10→2.82.9 (fuzz.yml) —
   supersedes dependabot #220/#221/#222.
+
+### Changed — BREAKING: WAL v3 is now the only WAL; XactCommit unified to the db-aware record (pre-1.0 format freeze)
+
+Moon is pre-release: this drops on-disk format compatibility that no shipped
+release depended on. There is no migration path — operators upgrading a node
+that still has WAL v2 files (`shard-N.wal`) or pre-freeze XactCommit(0x51)
+records on disk must let those age out via the AOF-authoritative recovery
+path (below), or replay them on a pre-freeze build first and re-persist.
+
+- **`src/persistence/wal_v3/record.rs`**: deleted the pre-1.0 `XactCommit`
+  (v1, tag `0x51`) record type, its encoder, and its replay arm. Renamed
+  `XactCommitV2` -> `XactCommit`, **keeping discriminant `0x53`** (`0x51` is
+  retired, not reused — a stray `0x51` record in a v3 stream now decodes as
+  an unrecognized tag rather than being silently reinterpreted). All
+  producers (the TXN.COMMIT WAL record in `handler_sharded`/`handler_monoio`)
+  already wrote only the v2 (now unified) record, so this is a pure
+  simplification of the read side.
+- **`src/persistence/wal.rs` deleted** — WAL v2 (`WalWriter`, `replay_wal`,
+  `wal_path`) is removed in its entirety. WAL v3 (`WalWriterV3`,
+  `src/persistence/wal_v3/`) is the only WAL, and is now also created in the
+  old v2 niche (`--appendonly yes` with `--disk-offload disable`), rooted at
+  `<persistence_dir>/shard-N/wal-v3/` instead of the old flat
+  `<persistence_dir>/shard-N.wal` file — matching the disk-offload layout.
+  This closes a latent gap: `--appendfsync always` previously only fsynced
+  WAL v3 (a no-op in non-offload mode, since only v2 existed there); it now
+  fsyncs the WAL unconditionally.
+- **`replay_wal_auto`** rejects a v2-format WAL file (`RRDWAL` magic +
+  version byte `2`) with a loud `WalError::UnsupportedVersion` instead of
+  delegating to the deleted v2 replay path.
+- **Recovery**: the `shard-N.wal` (v2) fallback rung is removed from both
+  `persistence::recovery::recover_shard_v3_pitr` (disk-offload path) and
+  `Shard::restore_from_persistence_v2` (legacy path) — `appendonly.aof`
+  remains the recovery authority and is unaffected. `shared_databases::
+  replay_graph_wal` (graph-feature boot-time WAL scan) is ported from the v2
+  flat file to the v3 segment directory (`shard-N/wal-v3/*.wal`), matching
+  `replay_workspace_wal`/`replay_temporal_wal`. Additionally, both legacy-dir
+  recovery paths gain a **last-resort WAL v3 fallback**: when NO
+  `appendonly.aof` exists, the legacy-mode `shard-N/wal-v3/` directory is
+  replayed (with a loud partial-coverage warning — WAL v3's KV coverage is
+  intentionally partial post-#211, so it never shadows a present AOF), and a
+  leftover legacy `shard-N.wal` (v2) file on disk now triggers a
+  `tracing::error!` naming the file instead of being silently ignored.
+- **`wal_append_and_fanout` / `wal_fanout_has_work`** (`src/shard/
+  spsc_handler.rs`) drop the v2 `wal_writer` parameter and the "v3
+  supersedes v2" branch — a single `Option<WalWriterV3>` parameter, renamed
+  `wal_writer`. `finalize_snapshot_success` no longer takes a WAL writer:
+  v2's per-snapshot `truncate_after_snapshot(epoch)` had no v3 analogue — v3
+  retention is LSN-driven (`WalWriterV3::recycle_aggressive` /
+  `recycle_segments_before`, run from autovacuum Pass C and the checkpoint
+  protocol) and already ran independently of legacy snapshot epochs, so
+  nothing was lost by not porting it over.
+- Deferred (unrelated to this change, found in passing): `shared_databases::
+  replay_temporal_wal` scans `shard-N/` directly for `*.wal` files instead of
+  `shard-N/wal-v3/` like its siblings — looks like a pre-existing directory
+  mismatch, left as-is pending its own investigation.
 
 ### Fixed — TopLevel-monoio AOF writer: EverySec fsync deferred indefinitely when idle (PR #TBD)
 

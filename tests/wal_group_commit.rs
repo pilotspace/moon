@@ -207,11 +207,21 @@ fn commit_one_fsync_many_acks() {
     let outcome = commit_group_commit_batch(&mut sink, &mut batch, true);
 
     assert_eq!(sink.sync_calls, 1, "exactly ONE fsync for the whole batch");
-    assert_eq!(sink.writes.len(), 3, "all three payloads written");
+    // Multi-message batches are coalesced into ONE contiguous write (the
+    // always-P16 write-syscall fix); channel order must be preserved inside it.
+    assert_eq!(
+        sink.writes.len(),
+        1,
+        "one coalesced write for the whole batch"
+    );
+    assert_eq!(
+        sink.writes[0], b"abc",
+        "all three payloads written in channel order"
+    );
     assert_eq!(
         sink.synced_at_write_count,
-        Some(3),
-        "the fsync runs AFTER all writes (ack-after-fsync ordering)"
+        Some(1),
+        "the fsync runs AFTER the batch write (ack-after-fsync ordering)"
     );
     assert_eq!(
         outcome,
@@ -237,7 +247,9 @@ fn commit_write_fail_acks_write_failed() {
         deferred_control: None,
     };
     let mut sink = CountingSink::new();
-    sink.fail_write_at = Some(1); // the 2nd write fails
+    // Multi-message batches coalesce into a single write — fail THAT write
+    // (index 0). The whole batch fails together: no torn half-batch acks.
+    sink.fail_write_at = Some(0);
 
     let outcome = commit_group_commit_batch(&mut sink, &mut batch, true);
 
@@ -304,7 +316,8 @@ fn commit_everysec_no_fsync() {
         sink.sync_calls, 0,
         "everysec (do_fsync=false) must not fsync per batch"
     );
-    assert_eq!(sink.writes.len(), 2, "bytes are still written in order");
+    assert_eq!(sink.writes.len(), 1, "one coalesced write for the batch");
+    assert_eq!(sink.writes[0], b"xy", "bytes are still written in order");
     assert_eq!(
         outcome.synced, 0,
         "no AppendSync waiters in an everysec batch"
@@ -331,9 +344,18 @@ fn commit_barrier_covers_preceding_appends() {
         "one fsync covers the appends + the barrier"
     );
     assert_eq!(
+        sink.writes.len(),
+        1,
+        "the appends + zero-length barrier coalesce into one write"
+    );
+    assert_eq!(
+        sink.writes[0], b"onetwo",
+        "append bytes precede the fsync in channel order"
+    );
+    assert_eq!(
         sink.synced_at_write_count,
-        Some(3),
-        "the fsync runs after the two appends AND the barrier are written"
+        Some(1),
+        "the fsync runs after the appends AND the barrier are written"
     );
     assert_eq!(outcome.synced, 1, "the barrier AppendSync is acked");
     assert_eq!(rx.try_recv(), Ok(AofAck::Synced));

@@ -45,7 +45,7 @@ pub struct ShardStoreMemory {
 /// - `store_memory_per_shard`: published store-memory atomics (C5 / M4).
 pub struct ShardDatabases {
     /// Per-shard WAL append channel sender. Connection handlers send serialized
-    /// write commands here; the event loop drains into WAL v2/v3 on the 1ms tick.
+    /// write commands here; the event loop drains into WAL v3 on the 1ms tick.
     /// OnceLock: set once at event-loop startup (before connections are
     /// accepted), then every hot-path read is lock-free.
     wal_append_txs: Vec<std::sync::OnceLock<crate::runtime::channel::MpscSender<bytes::Bytes>>>,
@@ -154,7 +154,7 @@ impl ShardDatabases {
     /// Send serialized command bytes to the WAL append channel for a shard.
     ///
     /// Called by connection handlers for local write commands. The event loop
-    /// drains this channel on the 1ms tick into WAL v2/v3.
+    /// drains this channel on the 1ms tick into WAL v3.
     /// No-op when persistence is disabled.
     #[inline]
     pub fn wal_append(&self, shard_id: usize, data: bytes::Bytes) {
@@ -544,39 +544,72 @@ pub fn recover_graph_stores(
 }
 
 /// Replay graph WAL commands into graph stores for all shards.
+///
+/// Pre-1.0 WAL-v3-only format freeze: ported from the deleted WAL v2 flat
+/// file (`shard-{id}.wal`) to the v3 segment directory
+/// (`shard-{id}/wal-v3/*.wal`, matching `replay_workspace_wal` /
+/// `replay_temporal_wal` above and `recovery.rs`). `Command` records are
+/// forwarded to `DispatchReplayEngine::replay_command` exactly as
+/// `replay_wal_auto`'s v3 branch does, so this stays bug-for-bug consistent
+/// with the rest of the WAL v3 command-replay path.
 #[cfg(feature = "graph")]
 pub fn replay_graph_wal(
     inits: &mut [crate::shard::slice::ShardSliceInit],
     persistence_dir: &std::path::Path,
     db_count: usize,
 ) {
-    use crate::persistence::replay::DispatchReplayEngine;
-    use crate::persistence::wal;
+    use crate::persistence::replay::{CommandReplayEngine, DispatchReplayEngine};
+    use crate::persistence::wal_v3::record::{WalRecord, WalRecordType};
 
     for init in inits.iter_mut() {
         let shard_id = init.shard_id;
-        let wal_file = wal::wal_path(persistence_dir, shard_id);
-        if !wal_file.exists() {
+        let wal_dir = persistence_dir
+            .join(format!("shard-{}", shard_id))
+            .join("wal-v3");
+        if !wal_dir.exists() {
             continue;
         }
+
         let engine = DispatchReplayEngine::new();
         let mut dummy_dbs: Vec<Database> = (0..db_count).map(|_| Database::new()).collect();
-        match wal::replay_wal(&mut dummy_dbs, &wal_file, &engine) {
-            Ok(_) => {
-                let graph_count = engine.graph_command_count();
-                if graph_count > 0 {
-                    let applied = engine.replay_graph_commands(&mut init.graph_store);
-                    tracing::info!(
-                        "Shard {}: replayed {} graph WAL commands ({} applied)",
-                        shard_id,
-                        graph_count,
-                        applied,
-                    );
-                }
+        let mut selected_db = 0usize;
+        let on_command = &mut |record: &WalRecord| {
+            if record.record_type == WalRecordType::Command {
+                engine.replay_command(&mut dummy_dbs, &record.payload, &[], &mut selected_db);
             }
+        };
+        let on_fpi = &mut |_record: &WalRecord| {};
+
+        let mut wal_files: Vec<_> = match std::fs::read_dir(&wal_dir) {
+            Ok(entries) => entries
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_name().to_str().is_some_and(|n| n.ends_with(".wal")))
+                .map(|e| e.path())
+                .collect(),
             Err(e) => {
+                tracing::error!("Shard {}: graph WAL dir read failed: {}", shard_id, e);
+                continue;
+            }
+        };
+        wal_files.sort();
+
+        for wal_file in &wal_files {
+            if let Err(e) = crate::persistence::wal_v3::replay::replay_wal_v3_file(
+                wal_file, 0, on_command, on_fpi,
+            ) {
                 tracing::error!("Shard {}: graph WAL replay failed: {}", shard_id, e);
             }
+        }
+
+        let graph_count = engine.graph_command_count();
+        if graph_count > 0 {
+            let applied = engine.replay_graph_commands(&mut init.graph_store);
+            tracing::info!(
+                "Shard {}: replayed {} graph WAL commands ({} applied)",
+                shard_id,
+                graph_count,
+                applied,
+            );
         }
     }
 }
