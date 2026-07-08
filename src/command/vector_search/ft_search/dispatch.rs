@@ -692,6 +692,10 @@ fn capture_dense_knn_snapshot(
         scratch: crate::vector::hnsw::search::take_thread_scratch(padded_dimension(dim as u32)),
         key_hash_to_key: idx.key_hash_to_key.clone(),
         ef_defaulted,
+        tuning: crate::vector::types::SearchTuning {
+            rerank_mult: idx.meta.rerank_mult,
+            exact_beam: idx.meta.exact_beam,
+        },
     })
 }
 

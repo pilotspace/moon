@@ -147,6 +147,8 @@ fn bench_full_insert_pipeline_128d() {
         merge_mode: moon::vector::segment::compaction::MergeMode::GraphUnion,
         keep_raw: false,
         db_index: 0,
+        rerank_mult: 4,
+        exact_beam: false,
     };
     let _ = store.create_index(meta);
 
@@ -227,6 +229,8 @@ fn bench_full_insert_pipeline_768d() {
         merge_mode: moon::vector::segment::compaction::MergeMode::GraphUnion,
         keep_raw: false,
         db_index: 0,
+        rerank_mult: 4,
+        exact_beam: false,
     };
     let _ = store.create_index(meta);
 

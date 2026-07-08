@@ -433,6 +433,18 @@ pub fn ft_create(
         });
     }
 
+    // Server-wide starting values for the tuning knobs
+    // (--vector-ef-runtime / --vector-rerank-mult / --vector-exact-beam).
+    // An explicit EF_RUNTIME in FT.CREATE wins over the server default;
+    // RERANK_MULT / EXACT_BEAM have no FT.CREATE syntax, so they always
+    // start at the server default and are tuned per index via FT.CONFIG.
+    let create_defaults = crate::vector::store::vector_create_defaults();
+    let effective_ef_runtime = if first_hnsw_ef_runtime == 0 {
+        create_defaults.ef_runtime
+    } else {
+        first_hnsw_ef_runtime
+    };
+
     // Build IndexMeta from the first (default) field for backward compatibility
     let default_field = &vector_fields[0];
     let meta = IndexMeta {
@@ -442,7 +454,7 @@ pub fn ft_create(
         metric: default_field.metric,
         hnsw_m: first_hnsw_m,
         hnsw_ef_construction: first_hnsw_ef_construction,
-        hnsw_ef_runtime: first_hnsw_ef_runtime,
+        hnsw_ef_runtime: effective_ef_runtime,
         compact_threshold: first_compact_threshold,
         source_field: default_field.field_name.clone(),
         key_prefixes: prefixes.clone(),
@@ -453,6 +465,8 @@ pub fn ft_create(
         merge_mode: first_merge_mode,
         keep_raw: first_keep_raw,
         db_index,
+        rerank_mult: create_defaults.rerank_mult,
+        exact_beam: create_defaults.exact_beam,
     };
 
     let index_name_clone = meta.name.clone();

@@ -117,6 +117,56 @@ pub struct IndexMeta {
     /// field existed (v1-v3) default to `0` on load (legacy indexes become
     /// db-0-owned, matching pre-v0.6.0 global behavior for db 0 callers).
     pub db_index: u8,
+    /// Exact-rerank depth multiplier (HQ-1): re-score the top
+    /// `rerank_mult · k` beam candidates from the f16 sidecar. Default 4.
+    /// Range 1-64, set via FT.CONFIG SET <idx> RERANK_MULT.
+    pub rerank_mult: u32,
+    /// When true, the HNSW beam navigates with exact f16 sidecar distances
+    /// instead of quantized ADC (recall ≈ graph-limited, QPS cost grows with
+    /// dimension). Default false, set via FT.CONFIG SET <idx> EXACT_BEAM.
+    pub exact_beam: bool,
+}
+
+/// Server-wide starting values for the per-index search-tuning knobs,
+/// applied by FT.CREATE when the operator did not specify them
+/// (`--vector-ef-runtime`, `--vector-rerank-mult`, `--vector-exact-beam`).
+/// Per-index `FT.CONFIG SET` always overrides these at runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VectorCreateDefaults {
+    /// EF_RUNTIME for new indexes (0 = per-query auto heuristic).
+    pub ef_runtime: u32,
+    /// RERANK_MULT for new indexes (1-64).
+    pub rerank_mult: u32,
+    /// EXACT_BEAM for new indexes.
+    pub exact_beam: bool,
+}
+
+impl Default for VectorCreateDefaults {
+    fn default() -> Self {
+        Self {
+            ef_runtime: 0,
+            rerank_mult: 4,
+            exact_beam: false,
+        }
+    }
+}
+
+static VECTOR_CREATE_DEFAULTS: std::sync::OnceLock<VectorCreateDefaults> =
+    std::sync::OnceLock::new();
+
+/// Install the server-wide FT.CREATE tuning defaults from `ServerConfig`.
+/// Called once at startup (before any connection is accepted); a second call
+/// is a no-op (the first write wins — matches `OnceLock` semantics, which is
+/// what we want for embedded/test servers booting in one process).
+pub fn set_vector_create_defaults(defaults: VectorCreateDefaults) {
+    let _ = VECTOR_CREATE_DEFAULTS.set(defaults);
+}
+
+/// The server-wide FT.CREATE tuning defaults; the compiled-in baseline
+/// (auto ef, mult 4, beam off) when the server never installed any —
+/// unit tests and library embedders get pre-flag behavior unchanged.
+pub fn vector_create_defaults() -> VectorCreateDefaults {
+    VECTOR_CREATE_DEFAULTS.get().copied().unwrap_or_default()
 }
 
 impl IndexMeta {
@@ -2952,6 +3002,8 @@ pub(crate) fn test_index_meta(dim: u32) -> IndexMeta {
         merge_mode: MergeMode::GraphUnion,
         keep_raw: false,
         db_index: 0,
+        rerank_mult: 4,
+        exact_beam: false,
     }
 }
 
@@ -2981,6 +3033,8 @@ mod tests {
             merge_mode: MergeMode::GraphUnion,
             keep_raw: false,
             db_index: 0,
+            rerank_mult: 4,
+            exact_beam: false,
         }
     }
 
@@ -3003,6 +3057,8 @@ mod tests {
             merge_mode: MergeMode::GraphUnion,
             keep_raw: false,
             db_index: 0,
+            rerank_mult: 4,
+            exact_beam: false,
         }
     }
 
@@ -3698,6 +3754,8 @@ mod bg_compact_tests {
             merge_mode: MergeMode::GraphUnion,
             keep_raw: false,
             db_index: 0,
+            rerank_mult: 4,
+            exact_beam: false,
         }
     }
 

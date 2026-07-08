@@ -44,6 +44,8 @@ fn make_meta(name: &str, dim: u32) -> IndexMeta {
         merge_mode: moon::vector::segment::compaction::MergeMode::GraphUnion,
         keep_raw: false,
         db_index: 0,
+        rerank_mult: 4,
+        exact_beam: false,
     }
 }
 

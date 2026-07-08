@@ -593,6 +593,10 @@ pub(super) fn run_dense_knn(
             dirty_set: &[],
             dimension: dim as u32,
             ef_defaulted: false,
+            tuning: crate::vector::types::SearchTuning {
+                rerank_mult: idx.meta.rerank_mult,
+                exact_beam: idx.meta.exact_beam,
+            },
         };
         idx.segments
             .search_mvcc(&query_f32, k, ef_search, &mut idx.scratch, None, &mvcc_ctx)
@@ -615,6 +619,10 @@ pub(super) fn run_dense_knn(
             dirty_set: &[],
             dimension: dim as u32,
             ef_defaulted: false,
+            tuning: crate::vector::types::SearchTuning {
+                rerank_mult: idx.meta.rerank_mult,
+                exact_beam: idx.meta.exact_beam,
+            },
         };
         fs.segments
             .search_mvcc(&query_f32, k, ef_search, &mut fs.scratch, None, &mvcc_ctx)

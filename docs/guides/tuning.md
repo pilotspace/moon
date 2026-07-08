@@ -378,6 +378,20 @@ single-purpose benchmark rigs.
   applies to the next `FT.SEARCH` immediately, persists across restarts, and needs no
   index rebuild. Use it to walk the recall/QPS curve on a live index (e.g. drop ef
   during traffic spikes, raise it for offline evaluation).
+- **Chasing the last recall points (→ 1.0)?** Two more runtime knobs, both per index,
+  both persisted, both applied on the next query:
+  - `FT.CONFIG SET <idx> RERANK_MULT <n>` (1–64, default 4) deepens the exact-rerank
+    stage: the top `n·k` beam candidates are re-scored with true f16 distances before
+    truncation. Cheap (`~n·k·dim` f16 decodes per segment) and recovers true neighbors
+    the quantized ADC ranking dropped just below the default 4·k cut. Try 8–16 first.
+  - `FT.CONFIG SET <idx> EXACT_BEAM ON` goes further: the HNSW beam itself navigates
+    with exact f16 distances instead of quantized estimates, so recall becomes
+    graph-limited (~Qdrant parity at equal ef) rather than quantization-limited. QPS
+    cost grows with dimension (an f16 row is ~4× the bytes of a TQ4 code); benchmark
+    at your dim before enabling fleet-wide. Segments without an exact-rerank sidecar
+    (pre-HQ-1 disk reloads) silently keep the quantized beam.
+  - Escalation order at a fixed recall target: raise `EF_RUNTIME` → raise
+    `RERANK_MULT` → `EXACT_BEAM ON`. Each step costs more QPS than the one before.
 - Set `COMPACT_THRESHOLD` at or above your expected dataset size if you want a single
   final compaction; explicit `FT.COMPACT` on a small mutable segment is a no-op below
   the threshold.

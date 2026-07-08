@@ -188,6 +188,52 @@ fn ft_config_set(
         // Persist so the value survives a server restart.
         store.save_index_meta_sidecar();
         Frame::SimpleString(Bytes::from_static(b"OK"))
+    } else if param.eq_ignore_ascii_case(b"RERANK_MULT") {
+        // HQ-1 depth: re-score the top `mult · k` beam candidates against the
+        // f16 exact sidecar. Raising it recovers true neighbors the quantized
+        // ADC ranking pushed below the 4·k default (the main lever for the
+        // last few recall points below EXACT_BEAM); cost ~mult·k·dim f16
+        // decodes per segment. Applies to the next FT.SEARCH immediately.
+        let parsed: u32 = match std::str::from_utf8(value)
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+        {
+            Some(v) if (1..=64).contains(&v) => v,
+            Some(_) => {
+                return Frame::Error(Bytes::from_static(b"ERR RERANK_MULT must be 1-64"));
+            }
+            None => {
+                return Frame::Error(Bytes::from_static(b"ERR invalid RERANK_MULT value"));
+            }
+        };
+        idx.meta.rerank_mult = parsed;
+        // Persist so the value survives a server restart.
+        store.save_index_meta_sidecar();
+        Frame::SimpleString(Bytes::from_static(b"OK"))
+    } else if param.eq_ignore_ascii_case(b"EXACT_BEAM") {
+        // Navigate the HNSW beam with exact f16 sidecar distances instead of
+        // quantized ADC: recall becomes graph-limited (~1.0 at ef 256) at a
+        // QPS cost that grows with dimension. Segments without a sidecar
+        // (pre-HQ-1 reloads) silently keep the ADC beam.
+        let parsed = if value.eq_ignore_ascii_case(b"ON")
+            || value == b"1"
+            || value.eq_ignore_ascii_case(b"TRUE")
+        {
+            true
+        } else if value.eq_ignore_ascii_case(b"OFF")
+            || value == b"0"
+            || value.eq_ignore_ascii_case(b"FALSE")
+        {
+            false
+        } else {
+            return Frame::Error(Bytes::from_static(
+                b"ERR EXACT_BEAM value must be ON or OFF",
+            ));
+        };
+        idx.meta.exact_beam = parsed;
+        // Persist so the value survives a server restart.
+        store.save_index_meta_sidecar();
+        Frame::SimpleString(Bytes::from_static(b"OK"))
     } else {
         Frame::Error(Bytes::from_static(b"ERR unknown config parameter"))
     }
@@ -239,6 +285,14 @@ fn ft_config_get(
         use std::fmt::Write as _;
         let _ = write!(buf, "{}", idx.meta.hnsw_ef_runtime);
         Frame::BulkString(Bytes::from(buf))
+    } else if param.eq_ignore_ascii_case(b"RERANK_MULT") {
+        let mut buf = String::with_capacity(8);
+        use std::fmt::Write as _;
+        let _ = write!(buf, "{}", idx.meta.rerank_mult);
+        Frame::BulkString(Bytes::from(buf))
+    } else if param.eq_ignore_ascii_case(b"EXACT_BEAM") {
+        let val = if idx.meta.exact_beam { "ON" } else { "OFF" };
+        Frame::BulkString(Bytes::from(val))
     } else {
         Frame::Error(Bytes::from_static(b"ERR unknown config parameter"))
     }

@@ -52,6 +52,32 @@ impl SearchResult {
     }
 }
 
+/// Per-query recall/QPS knobs threaded from `IndexMeta` (set via FT.CONFIG)
+/// into the segment search paths. `Copy` so it rides in `MvccContext` /
+/// `SearchSnapshot` at zero per-query cost.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SearchTuning {
+    /// Exact-rerank depth multiplier (HQ-1): the top `rerank_mult · k`
+    /// beam candidates are re-scored against the f16 sidecar. Default 4.
+    /// Higher recovers candidates the quantized ADC ranking dropped, at
+    /// ~mult·k·dim f16 decodes per segment. Range 1-64 (FT.CONFIG RERANK_MULT).
+    pub rerank_mult: u32,
+    /// When true and the segment has an f16 sidecar, the HNSW beam itself
+    /// navigates with exact f16 distances instead of quantized ADC —
+    /// recall becomes graph-limited (~Qdrant-parity) at a QPS cost that
+    /// grows with dimension. Default false (FT.CONFIG EXACT_BEAM ON|OFF).
+    pub exact_beam: bool,
+}
+
+impl Default for SearchTuning {
+    fn default() -> Self {
+        Self {
+            rerank_mult: 4,
+            exact_beam: false,
+        }
+    }
+}
+
 impl Eq for SearchResult {}
 
 impl PartialOrd for SearchResult {

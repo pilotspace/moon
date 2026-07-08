@@ -374,6 +374,8 @@ impl WarmSearchSegment {
             allow_bitmap,
             empty_sub_signs,
             0,
+            // Warm segments carry no f16 sidecar — quantized ADC beam only.
+            None,
         );
 
         // WS3 round-2 resurrection fix: drop steady-state-tombstoned entries
