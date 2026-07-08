@@ -495,6 +495,21 @@ impl WarmSearchSegment {
         &self.collection_meta
     }
 
+    /// Cloned `Arc` to the collection metadata (WS3 round 2: needed by
+    /// `UnloadedSegment` to reload via `from_files` after being dropped).
+    #[inline]
+    pub fn collection_meta_arc(&self) -> Arc<CollectionMetadata> {
+        self.collection_meta.clone()
+    }
+
+    /// Cloned segment handle (WS3 round 2: `UnloadedSegment` keeps its own
+    /// handle so the on-disk directory survives this `WarmSearchSegment`
+    /// being dropped when it unloads to the COLD tier).
+    #[inline]
+    pub fn handle_clone(&self) -> SegmentHandle {
+        self._handle.clone()
+    }
+
     /// Mark this segment's on-disk directory for deletion.
     ///
     /// The directory is only removed once all `SegmentHandle` clones are dropped

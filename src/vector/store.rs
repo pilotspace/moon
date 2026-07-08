@@ -462,6 +462,7 @@ impl VectorIndex {
                     ivf: snap.ivf.clone(),
                     warm: snap.warm.clone(),
                     cold: snap.cold.clone(),
+                    unloaded: snap.unloaded.clone(),
                 };
                 drop(snap);
                 self.segments.swap(new_list);
@@ -577,6 +578,7 @@ impl VectorIndex {
                         ivf: old.ivf.clone(),
                         warm: old.warm.clone(),
                         cold: old.cold.clone(),
+                        unloaded: old.unloaded.clone(),
                     };
                     segments.swap(new_list);
                     if frozen_len == mutable_len {
@@ -910,6 +912,7 @@ impl VectorIndex {
             ivf: snap.ivf.clone(),
             warm: snap.warm.clone(),
             cold: snap.cold.clone(),
+            unloaded: snap.unloaded.clone(),
         };
         drop(snap);
         self.segments.swap(new_list);
@@ -1147,6 +1150,7 @@ impl VectorIndex {
             ivf: snap.ivf.clone(),
             warm: snap.warm.clone(),
             cold: snap.cold.clone(),
+            unloaded: snap.unloaded.clone(),
         };
         drop(snap);
         self.segments.swap(new_list);
@@ -1164,13 +1168,9 @@ impl VectorIndex {
         true
     }
 
-    /// Check each immutable segment's age AND idle time. If older than
-    /// `warm_after_secs` OR (when `idle_after_secs > 0`) idle for at least
-    /// `idle_after_secs` since its last search, transition it to warm tier
-    /// (mmap-backed on disk). The idle criterion (WS3) is what lets a
-    /// segment that is still being queried heavily stay HOT past its age
-    /// threshold's original intent doesn't apply here — age and idleness are
-    /// independent triggers, whichever fires first demotes the segment.
+    /// Check each immutable segment's age. If older than `warm_after_secs`,
+    /// transition it to warm tier (mmap-backed on disk). Age-only; idleness
+    /// is not considered (see [`Self::try_warm_transitions_idle`]).
     ///
     /// After transition, the segment is replaced by a WarmSearchSegment that
     /// reads TQ codes and HNSW graph from mmap'd .mpf files. The segment
@@ -1193,8 +1193,32 @@ impl VectorIndex {
     /// Same as [`Self::try_warm_transitions`] but also accepts an idle-time
     /// threshold (WS3, `--engine-offload-idle-secs`). `idle_after_secs == 0`
     /// disables the idle criterion, matching the pre-WS3 age-only behavior
-    /// exactly (kept as a separate method so the widely-used age-only
-    /// signature above and its many test call sites are untouched).
+    /// exactly.
+    ///
+    /// **Two independent tiers, two different destinations (WS3 round 2):**
+    /// - `age_eligible` (pure age, `--segment-warm-after`) -> WARM tier
+    ///   (`WarmSearchSegment`, mmap-backed on disk but fully materialized
+    ///   into owned buffers in memory -- searchable with zero reload cost,
+    ///   but does NOT reduce RSS; measured flat-to-+1.1% in practice, see
+    ///   CHANGELOG). This is unchanged pre-WS3 behavior: an old-but-still-hot
+    ///   segment structurally simplifies to disk-file-backed storage without
+    ///   promising a memory win.
+    /// - `idle_eligible` (`--engine-offload-idle-secs`, genuinely cold) ->
+    ///   COLD tier directly (`UnloadedSegment` stub -- everything in-memory
+    ///   dropped, only a handful of scalars + a `SegmentHandle` resident).
+    ///   This is the tier that actually frees memory. Reload is synchronous
+    ///   and transparent on the next search that touches the index (see
+    ///   `SegmentHolder::promote_unloaded`).
+    ///
+    /// If a segment satisfies both criteria simultaneously, COLD wins (it is
+    /// strictly more beneficial memory-wise and the segment is, by
+    /// definition, not being queried).
+    ///
+    /// Both destinations write the exact same on-disk `.mpf` files via
+    /// [`crate::storage::tiered::warm_tier::transition_to_warm`] (including
+    /// the f16 exact-rerank sidecar) -- COLD additionally drops the
+    /// in-memory `WarmSearchSegment` immediately after capturing its stub
+    /// metadata, instead of keeping it resident.
     pub fn try_warm_transitions_idle(
         &self,
         shard_dir: &std::path::Path,
@@ -1205,24 +1229,28 @@ impl VectorIndex {
         wal: &mut Option<crate::persistence::wal_v3::segment::WalWriterV3>,
     ) -> usize {
         let snapshot = self.segments.load();
-        let mut to_warm: Vec<usize> = Vec::new();
+        // (segment index, route straight to COLD instead of WARM)
+        let mut to_transition: Vec<(usize, bool)> = Vec::new();
         for (i, imm) in snapshot.immutable.iter().enumerate() {
             let age_eligible = imm.age_secs() >= warm_after_secs;
             let idle_eligible = idle_after_secs > 0 && imm.idle_secs() >= idle_after_secs;
-            if age_eligible || idle_eligible {
-                to_warm.push(i);
+            if idle_eligible {
+                to_transition.push((i, true)); // -> COLD
+            } else if age_eligible {
+                to_transition.push((i, false)); // -> WARM
             }
         }
-        if to_warm.is_empty() {
+        if to_transition.is_empty() {
             return 0;
         }
 
         let mut new_immutable = snapshot.immutable.clone();
         let mut new_warm = snapshot.warm.clone();
+        let mut new_unloaded = snapshot.unloaded.clone();
         let mut transitioned = 0usize;
 
         // Process in reverse order to maintain valid indices during removal.
-        for &idx in to_warm.iter().rev() {
+        for &(idx, to_cold) in to_transition.iter().rev() {
             let imm = &snapshot.immutable[idx];
             let file_id = *next_file_id;
             *next_file_id += 1;
@@ -1256,15 +1284,20 @@ impl VectorIndex {
                     // The ImmutableSegment is purely in-memory (no on-disk files),
                     // so it needs no SegmentHandle tombstoning -- it's simply dropped.
                     //
-                    // Tombstone lifecycle for the NEW warm segment:
+                    // Tombstone lifecycle for the NEW warm/cold segment:
                     //   1. `handle` (SegmentHandle) is passed to WarmSearchSegment below
-                    //   2. WarmSearchSegment stores it as `_handle` (Arc refcount)
-                    //   3. When later transitioned to cold: mark_tombstoned() is called
-                    //   4. On index drop: mark_tombstoned() is called
+                    //   2. WarmSearchSegment stores it as `_handle` (Arc refcount);
+                    //      for a COLD destination, `UnloadedSegment::from_warm`
+                    //      captures a clone of the same handle before the
+                    //      WarmSearchSegment is dropped.
+                    //   3. When later transitioned to cold (WARM->COLD/DiskAnn):
+                    //      mark_tombstoned() is called
+                    //   4. On index drop / FLUSH: mark_tombstoned() is called
                     //   5. Directory is deleted only when last Arc ref drops AND tombstoned
                     new_immutable.remove(idx);
 
-                    // Open mmap-backed warm search segment to keep data searchable.
+                    // Open mmap-backed warm search segment to keep data searchable
+                    // (or, for a COLD destination, to capture its stub metadata).
                     // transition_to_warm places files at shard_dir/vectors/segment-{id}/
                     let seg_dir = shard_dir.join("vectors").join(format!("segment-{file_id}"));
                     match crate::vector::persistence::warm_search::WarmSearchSegment::from_files(
@@ -1275,13 +1308,27 @@ impl VectorIndex {
                         false, // mlock_codes: off by default for warm tier
                     ) {
                         Ok(warm_seg) => {
-                            new_warm.push(Arc::new(warm_seg));
-                            tracing::info!(
-                                "Warm transition: segment {} ({} vectors, age {}s) -> searchable warm",
-                                file_id,
-                                imm.total_count(),
-                                imm.age_secs()
-                            );
+                            if to_cold {
+                                // COLD (WS3 round 2): capture the stub, then let
+                                // `warm_seg` drop at end of scope -- this is what
+                                // actually frees the codes/graph/sidecar buffers.
+                                let stub = crate::vector::persistence::unloaded_segment::UnloadedSegment::from_warm(&warm_seg, false);
+                                tracing::info!(
+                                    "Cold (unload) transition: segment {} ({} vectors, idle {}s) -> stub only, reload on next search",
+                                    file_id,
+                                    imm.total_count(),
+                                    imm.idle_secs(),
+                                );
+                                new_unloaded.push(Arc::new(stub));
+                            } else {
+                                tracing::info!(
+                                    "Warm transition: segment {} ({} vectors, age {}s) -> searchable warm",
+                                    file_id,
+                                    imm.total_count(),
+                                    imm.age_secs()
+                                );
+                                new_warm.push(Arc::new(warm_seg));
+                            }
                         }
                         Err(e) => {
                             // Transition wrote files but failed to open for search.
@@ -1309,6 +1356,7 @@ impl VectorIndex {
                 ivf: snapshot.ivf.clone(),
                 warm: new_warm,
                 cold: snapshot.cold.clone(),
+                unloaded: new_unloaded,
             };
             self.segments.swap(new_list);
         }
@@ -1393,6 +1441,7 @@ impl VectorIndex {
                 ivf: snapshot.ivf.clone(),
                 warm: new_warm,
                 cold: new_cold,
+                unloaded: snapshot.unloaded.clone(),
             };
             self.segments.swap(new_list);
         }
@@ -1825,6 +1874,13 @@ impl VectorStore {
             for warm_seg in &snapshot.warm {
                 warm_seg.mark_tombstoned();
             }
+            // WS3 round 2: COLD (unloaded) stubs also hold a `SegmentHandle`
+            // over an on-disk directory -- tombstone them too, or the
+            // directory would leak (nothing else ever tombstones it, since
+            // the stub itself is being dropped right here).
+            for stub in &snapshot.unloaded {
+                stub.mark_tombstoned();
+            }
             drop(snapshot);
             self.spawn_delete_index_persist_dir(&index.meta.name);
             // Persist index metadata sidecar
@@ -1880,6 +1936,13 @@ impl VectorStore {
             let snapshot = index.segments.load();
             for warm_seg in &snapshot.warm {
                 warm_seg.mark_tombstoned();
+            }
+            // WS3 round 2: COLD (unloaded) stubs also hold a `SegmentHandle`
+            // over an on-disk directory -- tombstone them too, or the
+            // directory would leak (nothing else ever tombstones it, since
+            // the stub itself is being dropped right here).
+            for stub in &snapshot.unloaded {
+                stub.mark_tombstoned();
             }
             drop(snapshot);
             let meta = index.meta.clone();
@@ -2315,6 +2378,7 @@ impl VectorStore {
                             ivf: old.ivf.clone(),
                             warm: new_warm,
                             cold: old.cold.clone(),
+                            unloaded: old.unloaded.clone(),
                         };
                         idx.segments.swap(new_list);
                         loaded += 1;
@@ -2568,6 +2632,7 @@ impl VectorStore {
                     ivf: snap.ivf.clone(),
                     warm: snap.warm.clone(),
                     cold: snap.cold.clone(),
+                    unloaded: snap.unloaded.clone(),
                 };
                 drop(snap);
                 idx.segments.swap(new_list);
@@ -2638,6 +2703,7 @@ impl VectorStore {
                     ivf: old.ivf.clone(),
                     warm: old.warm.clone(),
                     cold: old.cold.clone(),
+                    unloaded: old.unloaded.clone(),
                 };
                 idx.segments.swap(new_list);
                 idx.persist_hook_after_install();
@@ -2773,6 +2839,7 @@ fn enforce_segment_holder_budget(
         ivf: snapshot.ivf.clone(),
         warm: snapshot.warm.clone(),
         cold: snapshot.cold.clone(),
+        unloaded: snapshot.unloaded.clone(),
     };
 
     let stats = budget.enforce_budget(&mut list);
@@ -3344,6 +3411,7 @@ mod tests {
             ivf: Vec::new(),
             warm: Vec::new(),
             cold: Vec::new(),
+            unloaded: Vec::new(),
         };
         idx.segments.swap(new_list);
         drop(old_snap);
@@ -3429,6 +3497,7 @@ mod tests {
             ivf: Vec::new(),
             warm: Vec::new(),
             cold: Vec::new(),
+            unloaded: Vec::new(),
         });
         drop(old_snap);
 

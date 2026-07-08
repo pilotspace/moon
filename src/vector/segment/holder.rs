@@ -3,6 +3,8 @@
 //! Searches load() once at query start and hold the Arc for the query
 //! duration -- immune to concurrent swaps.
 
+mod promote;
+
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -56,6 +58,8 @@ pub struct SegmentList {
     pub warm: Vec<Arc<WarmSearchSegment>>,
     /// Cold segments: DiskANN PQ+Vamana search from NVMe.
     pub cold: Vec<Arc<DiskAnnSegment>>,
+    /// Unloaded (COLD) segments: on-disk only, reloaded into `warm` on touch.
+    pub unloaded: Vec<Arc<crate::vector::persistence::unloaded_segment::UnloadedSegment>>,
 }
 
 /// Bounded cooperative-yield cap for the FT.SEARCH local slice
@@ -171,6 +175,9 @@ pub struct SearchSnapshot {
 /// the Arc for the query duration -- immune to concurrent swaps.
 pub struct SegmentHolder {
     segments: ArcSwap<SegmentList>,
+    /// Single-flight guard for `promote_unloaded` (blocking, never held
+    /// across `.await`).
+    reload_lock: parking_lot::Mutex<()>,
 }
 
 impl SegmentHolder {
@@ -186,7 +193,9 @@ impl SegmentHolder {
                 ivf: Vec::new(),
                 warm: Vec::new(),
                 cold: Vec::new(),
+                unloaded: Vec::new(),
             }),
+            reload_lock: parking_lot::Mutex::new(()),
         }
     }
 
@@ -244,6 +253,9 @@ impl SegmentHolder {
         for cold_seg in &snapshot.cold {
             total += cold_seg.total_count();
         }
+        for stub in &snapshot.unloaded {
+            total += stub.total_count();
+        }
         total
     }
 
@@ -278,6 +290,9 @@ impl SegmentHolder {
         _scratch: &mut SearchScratch,
         filter_bitmap: Option<&RoaringBitmap>,
     ) -> SmallVec<[SearchResult; 32]> {
+        // Reload any COLD segments before searching -- correctness requires
+        // every segment participate in a KNN scan.
+        self.promote_unloaded();
         let strategy = select_strategy(filter_bitmap, self.total_vectors());
         let snapshot = self.load();
 
@@ -485,6 +500,8 @@ impl SegmentHolder {
         filter_bitmap: Option<&RoaringBitmap>,
         mvcc: &MvccContext<'_>,
     ) -> SmallVec<[SearchResult; 32]> {
+        // WS3 round 2: same reload-before-scan requirement as `search_filtered`.
+        self.promote_unloaded();
         let snapshot = self.load();
 
         // Prepare TurboQuant_prod query state for mutable search.
@@ -1063,6 +1080,7 @@ mod tests {
             ivf: Vec::new(),
             warm: Vec::new(),
             cold: Vec::new(),
+            unloaded: Vec::new(),
         });
 
         let snap = holder.load();
@@ -1354,6 +1372,7 @@ mod tests {
             ivf: Vec::new(),
             warm: Vec::new(),
             cold: Vec::new(),
+            unloaded: Vec::new(),
         });
 
         // Old snapshot still sees the original mutable (1 entry from our append)
@@ -1435,6 +1454,7 @@ mod tests {
             ivf: vec![Arc::new(ivf_seg)],
             warm: Vec::new(),
             cold: Vec::new(),
+            unloaded: Vec::new(),
         });
 
         // total_vectors should include IVF vectors.

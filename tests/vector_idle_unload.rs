@@ -350,6 +350,14 @@ fn ft_create(c: &mut Client, idx: &str, dim: usize, compact_threshold: u32) {
 }
 
 fn hset_batch(c: &mut Client, prefix: &str, ids: &[u32]) {
+    hset_batch_dim(c, prefix, ids, DIM);
+}
+
+/// Same as [`hset_batch`] but with an explicit dimension, for tests that use
+/// a bigger vector width than the file-level `DIM` constant (16) -- e.g. the
+/// RSS proxy test, which needs a large-enough dataset for the HNSW+TQ codes
+/// to actually dominate the process's resident set.
+fn hset_batch_dim(c: &mut Client, prefix: &str, ids: &[u32], dim: usize) {
     let cmds: Vec<Vec<Vec<u8>>> = ids
         .iter()
         .map(|&i| {
@@ -358,7 +366,7 @@ fn hset_batch(c: &mut Client, prefix: &str, ids: &[u32]) {
                 b"HSET".to_vec(),
                 key.into_bytes(),
                 b"vec".to_vec(),
-                fixture_vec(i, DIM),
+                fixture_vec(i, dim),
             ]
         })
         .collect();
@@ -431,9 +439,16 @@ fn ft_info_int(c: &mut Client, idx: &str, field: &str) -> i64 {
 // Test
 // ---------------------------------------------------------------------------
 
+/// Round 2 (WS3): idle now routes straight to the COLD (`unloaded_segments`)
+/// tier, not the WARM tier -- WARM (`--segment-warm-after`, age-only) does
+/// not reduce RSS (see CHANGELOG "known limitation" from round 1); COLD
+/// drops everything in-memory and is what actually frees memory. This test
+/// supersedes the round-1 version, which polled `warm_segments` (now stays 0
+/// for a purely-idle transition -- see the doc comment on
+/// `VectorIndex::try_warm_transitions_idle`).
 #[test]
 #[ignore] // Spawns a real server process; run explicitly with `-- --ignored`.
-fn hot_segment_idle_unloads_and_preserves_recall() {
+fn hot_segment_idle_unloads_to_cold_and_preserves_recall() {
     let port = unique_port();
     let dir = unique_dir("s1");
     let idx = "idleidx";
@@ -449,8 +464,8 @@ fn hot_segment_idle_unloads_and_preserves_recall() {
     hset_batch(&mut c, &format!("{idx}:"), &ids);
     ft_compact(&mut c, idx);
 
-    // Baseline: HOT segment present with an exact-rerank sidecar, no WARM
-    // segments yet.
+    // Baseline: HOT segment present with an exact-rerank sidecar, nothing in
+    // WARM or COLD yet. num_docs must already be correct here.
     assert_eq!(
         ft_info_int(&mut c, idx, "graph_segments"),
         1,
@@ -462,6 +477,12 @@ fn hot_segment_idle_unloads_and_preserves_recall() {
         "freshly compacted segment must carry the f16 sidecar"
     );
     assert_eq!(ft_info_int(&mut c, idx, "warm_segments"), 0);
+    assert_eq!(ft_info_int(&mut c, idx, "unloaded_segments"), 0);
+    assert_eq!(
+        ft_info_int(&mut c, idx, "num_docs"),
+        90,
+        "num_docs must be correct pre-transition"
+    );
 
     let probe = fixture_vec(7, DIM);
     let (key_before, dist_before) = search_top1(&mut c, idx, &probe);
@@ -473,42 +494,171 @@ fn hot_segment_idle_unloads_and_preserves_recall() {
 
     // Idle out the segment: stop querying for longer than
     // --engine-offload-idle-secs (2s) and let the warm-check tick (adapted
-    // down to ~1s by the idle threshold, see event_loop.rs) demote it.
+    // down to ~1s by the idle threshold, see event_loop.rs) demote it
+    // straight to COLD.
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        if ft_info_int(&mut c, idx, "warm_segments") >= 1 {
+        if ft_info_int(&mut c, idx, "unloaded_segments") >= 1 {
             break;
         }
         assert!(
             Instant::now() < deadline,
-            "segment never transitioned to warm tier within 30s"
+            "segment never transitioned to the COLD tier within 30s"
         );
         std::thread::sleep(Duration::from_millis(500));
     }
 
+    // Post-unload: HOT is gone, WARM never got touched (idle bypasses it
+    // entirely and goes straight to COLD), COLD holds the segment.
     assert_eq!(
         ft_info_int(&mut c, idx, "graph_segments"),
         0,
-        "HOT segment should be gone after warm transition"
+        "HOT segment should be gone after the unload transition"
+    );
+    assert_eq!(
+        ft_info_int(&mut c, idx, "warm_segments"),
+        0,
+        "idle transitions bypass WARM entirely -- straight to COLD"
+    );
+    assert_eq!(ft_info_int(&mut c, idx, "unloaded_segments"), 1);
+    assert_eq!(
+        ft_info_int(&mut c, idx, "unloaded_segments_with_exact_rerank"),
+        1,
+        "the COLD stub must remember it had a sidecar, without reloading"
+    );
+    // num_docs must stay correct with the only segment fully unloaded --
+    // this is the num_docs regression a naive COLD implementation would
+    // reintroduce (the same bug fixed for WARM in round 1).
+    assert_eq!(
+        ft_info_int(&mut c, idx, "num_docs"),
+        90,
+        "num_docs must stay correct while the segment is COLD (unloaded)"
+    );
+
+    // Touch it: FT.SEARCH must transparently reload the COLD segment,
+    // single-flight, synchronously, promoting it into WARM.
+    let (key_after, dist_after) = search_top1(&mut c, idx, &probe);
+    assert_eq!(
+        key_after, key_before,
+        "top-1 result must be unchanged across the HOT->COLD->reload round trip"
+    );
+    assert!(
+        dist_after < 1e-3,
+        "exact self-match distance should still be ~0 after reload \
+         (sidecar preserved through the COLD stub), got {dist_after}"
+    );
+
+    // After the touch, the segment must have been promoted COLD -> WARM.
+    assert_eq!(
+        ft_info_int(&mut c, idx, "unloaded_segments"),
+        0,
+        "COLD segment must be promoted out of `unloaded` on first touch"
+    );
+    assert_eq!(
+        ft_info_int(&mut c, idx, "warm_segments"),
+        1,
+        "reloaded segment lands in WARM (mirrors the age-based tier's destination)"
     );
     assert_eq!(
         ft_info_int(&mut c, idx, "warm_segments_with_exact_rerank"),
         1,
-        "the f16 sidecar must have been carried over to the WARM tier"
+        "reload must restore the sidecar, not silently fall back to ADC-only"
+    );
+    assert_eq!(
+        ft_info_int(&mut c, idx, "num_docs"),
+        90,
+        "num_docs must still be correct after reload"
+    );
+}
+
+/// RSS proof: a real, measurably-sized dataset (large enough that the
+/// HNSW+TQ codes dominate the process's resident set, unlike the tiny
+/// DIM=16/90-vector fixture used above) must show a REAL RSS drop once the
+/// segment idles into COLD -- unlike the round-1 WARM tier, which measured
+/// flat-to-+1.1% (see CHANGELOG). This is the process-level proxy requested
+/// alongside the FT.INFO counter checks above.
+#[test]
+#[ignore] // Spawns a real server process; run explicitly with `-- --ignored`.
+fn cold_unload_reduces_process_rss() {
+    const BIG_DIM: usize = 256;
+    const N: u32 = 3000;
+
+    let port = unique_port();
+    let dir = unique_dir("rss");
+    let idx = "rssidx";
+
+    let guard = spawn_moon(port, &dir, 2);
+    let mut c = wait_ready(port);
+
+    ft_create(&mut c, idx, BIG_DIM, 5000); // COMPACT_THRESHOLD > N: no auto-compact
+    let ids: Vec<u32> = (0..N).collect();
+    // Batch the HSETs to keep the pipeline reasonable.
+    for chunk in ids.chunks(200) {
+        hset_batch_dim(&mut c, &format!("{idx}:"), chunk, BIG_DIM);
+    }
+    ft_compact(&mut c, idx);
+    // Background compaction (see CLAUDE.md "FT background compaction"):
+    // FT.COMPACT returns OK immediately but the HNSW build for 3000 vectors
+    // runs on a worker thread -- poll rather than assert immediately.
+    let compact_deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        if ft_info_int(&mut c, idx, "graph_segments") >= 1 {
+            break;
+        }
+        assert!(
+            Instant::now() < compact_deadline,
+            "background compaction never produced a HOT segment within 90s"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert_eq!(ft_info_int(&mut c, idx, "graph_segments"), 1);
+    assert_eq!(ft_info_int(&mut c, idx, "num_docs"), N as i64);
+
+    let rss_kb = |pid: u32| -> u64 {
+        let out = Command::new("ps")
+            .args(["-o", "rss=", "-p", &pid.to_string()])
+            .output()
+            .expect("run ps");
+        String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse()
+            .unwrap_or(0)
+    };
+
+    let pid = guard.child.id();
+    std::thread::sleep(Duration::from_millis(500)); // let jemalloc settle post-compact
+    let rss_before = rss_kb(pid);
+    assert!(rss_before > 0, "must be able to read server RSS via ps");
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if ft_info_int(&mut c, idx, "unloaded_segments") >= 1 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "segment never transitioned to COLD within 30s"
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    // Let jemalloc's background reclaim thread (1s dirty-page decay, see
+    // CLAUDE.md's `_RJEM_MALLOC_CONF`) return freed pages to the OS.
+    std::thread::sleep(Duration::from_secs(3));
+    let rss_after_unload = rss_kb(pid);
+
+    assert!(
+        rss_after_unload < rss_before,
+        "RSS must drop materially after COLD unload: before={rss_before}KB \
+         after={rss_after_unload}KB (round-1 WARM measured a FLAT/+1.1% \
+         non-result here -- COLD must actually free the codes+graph+sidecar)"
     );
 
-    // Recall + exactness after the transition: same key, same near-zero
-    // distance. If the sidecar had been dropped (pre-WS3 behavior), the
-    // WARM segment would answer with a quantized SQ8 ADC estimate instead
-    // of the true distance, which is measurably non-zero for a self-match.
-    let (key_after, dist_after) = search_top1(&mut c, idx, &probe);
-    assert_eq!(
-        key_after, key_before,
-        "top-1 result must be unchanged across the HOT->WARM transition"
-    );
-    assert!(
-        dist_after < 1e-3,
-        "exact self-match distance should still be ~0 post-transition \
-         (sidecar preserved), got {dist_after}"
-    );
+    // Touch it: reload restores full residency (roughly back to pre-unload).
+    let probe = fixture_vec(1, BIG_DIM);
+    let _ = search_top1(&mut c, idx, &probe);
+    assert_eq!(ft_info_int(&mut c, idx, "unloaded_segments"), 0);
+    assert_eq!(ft_info_int(&mut c, idx, "warm_segments"), 1);
+    assert_eq!(ft_info_int(&mut c, idx, "num_docs"), N as i64);
+
+    drop(guard);
 }

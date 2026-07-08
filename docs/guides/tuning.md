@@ -214,45 +214,69 @@ resident forever:
 
 Immutable vector segments (`ImmutableSegment`: full in-memory HNSW graph +
 TurboQuant codes + f16 exact-rerank sidecar) don't have to stay resident
-forever once a workload goes cold. Two independent triggers demote a HOT
-segment to the mmap-backed WARM tier (`WarmSearchSegment`) — whichever fires
-first:
+forever once a workload goes cold. Two independent, differently-behaved
+tiers can receive a HOT segment — **COLD wins if both would fire at once**:
 
-- `--segment-warm-after <secs>` (default `3600`) — age since the segment was
-  compacted, regardless of query traffic.
 - `--engine-offload-idle-secs <secs>` (default `3600`, `0` disables this
-  criterion) — seconds since the segment last served a search. This is the
-  one to lower if you want a segment that's *merely old* but still busy to
-  stay HOT, and only genuinely cold segments to unload: set
-  `--engine-offload-idle-secs` below `--segment-warm-after` so idleness is
-  the effective trigger.
+  criterion) — seconds since the segment last served a search. Idle segments
+  go straight to a **COLD** stub: the HNSW graph, TQ/SQ8 codes, and f16
+  sidecar are dropped from memory entirely, keeping only the segment
+  directory path, doc count, and enough metadata to reload. This is the one
+  to lower if you want genuinely cold segments to actually free RAM.
+- `--segment-warm-after <secs>` (default `3600`) — age since the segment was
+  compacted, regardless of query traffic. Segments that age out *without*
+  also being idle go to the **WARM** tier (`WarmSearchSegment`) instead —
+  see the caveat below.
 
-The WARM tier is not a lossy fallback: the f16 exact-rerank sidecar is
-carried over to the `.mpf` files at transition time, so recall is unaffected
-— a WARM segment reranks its beam candidates from the sidecar exactly like a
-HOT one. WARM segments beyond that are further bounded by
-`--vec-warm-mmap-budget` (default 2 GiB): least-recently-used `Arc`s are
-dropped entirely once the budget is exceeded, and transparently reloaded
-(mmap re-opened) on the next search that touches them — the on-disk segment
-directory is untouched by unload, only the in-process Arc is dropped.
+Set `--engine-offload-idle-secs` below `--segment-warm-after` if you want
+idleness to be the effective, memory-freeing trigger for most segments (the
+common case); a segment that's old-but-still-busy will hit `--segment-
+warm-after` first and land on WARM, which does not free memory (below).
 
-> **⚠ The HOT->WARM transition itself does not currently reduce RSS.**
-> `WarmSearchSegment::from_files` opens each `.mpf` file's mmap only for the
-> duration of loading and immediately copies every payload into owned
-> `Vec<u8>` / a parsed `HnswGraph` of essentially the same size as the HOT
-> segment it replaces — the two structures that dominate memory at scale (TQ
-> codes + the HNSW graph) are fully duplicated in heap memory, not lazily
-> paged in from disk. Measured on a real server (40,000 × 768-dim vectors,
-> SQ8): RSS was flat-to-slightly-higher (+1.1%, no decay over 16s) after an
-> idle-triggered transition, not lower. The idle/age *triggers* above are
-> real and correctly wired (`FT.INFO` counters, recall, and `num_docs` are
-> all verified correct across the transition), and the **subsequent**
-> `--vec-warm-mmap-budget` LRU eviction *does* free real memory (it drops the
-> `Arc` outright). But "demote to WARM" alone is not yet a memory-saving
-> operation — treat it as a step that only pays off once a segment later
-> falls out of the mmap budget. A true zero-copy WARM tier (HNSW traversal +
-> TQ-ADC distance kernels operating directly on borrowed mmap'd bytes instead
-> of owned buffers) is an open, larger follow-up.
+**COLD tier (idle-triggered) — real memory savings.** On the next query that
+touches a COLD segment, it is synchronously reloaded via the same on-disk
+`.mpf`-file path used at server boot (`WarmSearchSegment::from_files`), so
+recall is exactly preserved — the exact-rerank sidecar is never silently
+dropped, only paged back in. The reload is single-flight per segment (a
+`parking_lot::Mutex` guards the promote-and-reload sequence), so concurrent
+queries hitting the same COLD segment block behind one reload rather than
+each re-reading the segment from disk. The cost is a one-time added latency
+on the query that triggers the reload; every subsequent query is back to
+normal HOT/immutable-segment speed until the segment goes idle again.
+Measured on a real server (40,000 × 768-dim vectors, SQ8, single shard):
+
+| Phase | RSS |
+|---|---|
+| Before unload (HOT) | 400,544 KB |
+| After unload (COLD) | 295,760 KB (**−26.2%**) |
+| After reload (touched, back to WARM) | 395,376 KB |
+
+**WARM tier (pure-age-triggered) — does not reduce RSS by itself.**
+`WarmSearchSegment::from_files` opens each `.mpf` file's mmap only for the
+duration of loading and immediately copies every payload into owned
+`Vec<u8>` / a parsed `HnswGraph` of essentially the same size as the HOT
+segment it replaces — the two structures that dominate memory at scale (TQ
+codes + the HNSW graph) are fully duplicated in heap memory, not lazily
+paged in from disk. The idle/age *triggers* are both correctly wired
+(`FT.INFO` counters, recall, and `num_docs` are verified correct across
+both transitions), and the **subsequent** `--vec-warm-mmap-budget` LRU
+eviction *does* free real memory (it drops the `Arc` outright, same as COLD
+— but without a promote-on-touch reload path, see the known bug below). But
+"demote to WARM" alone is not a memory-saving operation — it exists so an
+old-but-still-queried segment doesn't pay the COLD reload latency on every
+touch. A true zero-copy WARM tier (HNSW traversal + TQ-ADC distance kernels
+operating directly on borrowed mmap'd bytes instead of owned buffers) is an
+open, larger follow-up; until then, prefer tuning
+`--engine-offload-idle-secs` (COLD) over `--segment-warm-after` (WARM) when
+the goal is lower RSS.
+
+> **⚠ Known pre-existing bug, not introduced by the COLD tier:**
+> `MmapBudget::enforce_budget`'s WARM-tier LRU eviction drops the `Arc<WarmSearchSegment>`
+> outright with no reload-on-touch mechanism, despite its own doc comment
+> claiming one exists — once a WARM segment is evicted by the mmap budget it
+> stops being searched until restart. This is a correctness gap in the
+> pre-existing WARM path, not the new COLD path (COLD always reloads on
+> touch). Tracked for a follow-up fix.
 
 `FT.INFO <index>` reports tier residency (summed across shards):
 
@@ -263,6 +287,27 @@ directory is untouched by unload, only the in-process Arc is dropped.
 - `warm_segments` / `warm_segments_with_exact_rerank` — same pair for the
   WARM tier. A gap here after a fresh idle-unload is a regression: file an
   issue, it means the exact-rerank sidecar failed to transfer.
+- `unloaded_segments` / `unloaded_segments_with_exact_rerank` — same pair
+  for the COLD tier. `unloaded_segments_with_exact_rerank` reflects whether
+  the *stub* remembers it had a sidecar before unload (used to detect drift
+  after reload), not whether the sidecar is currently resident (it isn't —
+  that's the point of COLD).
+
+Both tiers correctly participate in `FLUSHALL`/`FLUSHDB`/`FT.DROPINDEX`
+(their on-disk directories are tombstoned/removed like any other segment),
+survive server restart cleanly (COLD/WARM segments are just on-disk data —
+they're rediscovered fresh as HOT by the existing boot-recovery scan, no
+special-cased restoration needed), and are skipped by GraphUnion background
+merge scheduling (`needs_merge`/`begin_background_merge` only ever consider
+`immutable`, never `warm`/`unloaded`, so a COLD segment can't be corrupted
+by a concurrent merge attempt).
+
+**Known limitation shared by both tiers (pre-existing, not introduced by
+this work):** per-key tombstoning (`DEL`/`HDEL` on an indexed vector field)
+does not currently walk WARM or COLD segments — a delete against a key that
+lives only in a WARM/COLD segment does not take effect until that segment
+is later merged or dropped. This is an existing gap in the tombstone path,
+not something the COLD tier introduces or worsens.
 
 FTS (`TextStore`) and the graph engine do not yet have an equivalent
 idle-unload path — FTS has no aggregate memory-accounting API yet, and while

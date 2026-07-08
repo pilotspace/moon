@@ -8,6 +8,7 @@ pub mod mmap_budget;
 pub mod recover_v2;
 pub mod sealed_mmap;
 pub mod segment_io;
+pub mod unloaded_segment;
 pub mod wal_record;
 pub mod warm_search;
 pub mod warm_segment;

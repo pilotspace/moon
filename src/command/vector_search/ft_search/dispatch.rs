@@ -667,6 +667,11 @@ fn capture_dense_knn_snapshot(
     let filter_strategy =
         crate::vector::filter::selectivity::select_strategy(filter_bitmap.as_ref(), total_vectors);
 
+    // WS3 round 2: the yielding (worker-pool) search path captures its
+    // segment snapshot here, separately from `SegmentHolder::search_filtered`'s
+    // own promote-before-search call -- must reload any COLD segments before
+    // this capture too, or a query on this path would silently skip them.
+    idx.segments.promote_unloaded();
     let segments = idx.segments.load_full();
     let mutable_len = segments.mutable.len();
 

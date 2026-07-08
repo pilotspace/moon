@@ -52,6 +52,11 @@ pub fn ft_info(
     for warm in snap.warm.iter() {
         num_docs += warm.total_count() as usize;
     }
+    // WS3 round 2: COLD (unloaded) segments carry their doc count in the
+    // stub itself (captured at unload time), so this needs no reload.
+    for stub in snap.unloaded.iter() {
+        num_docs += stub.total_count() as usize;
+    }
     // HQ-1 observability (persistence-review R5): exact-rerank coverage.
     // A segment without the f16 sidecar silently answers with quantized ADC
     // distances only — surfacing the count makes a dropped sidecar (e.g. an
@@ -63,13 +68,20 @@ pub fn ft_info(
         .filter(|imm| imm.raw_f16().is_some())
         .count();
     // WS3 idle-unload observability: HOT (graph_segments, above) vs WARM
-    // (mmap-backed, unloaded from the full in-memory HNSW+TQ structures once
-    // idle/aged past the configured thresholds). `warm_segments_with_exact_rerank`
-    // mirrors `segments_with_exact_rerank`'s "coverage < total ⇒ some segments
-    // answer ADC-only" signal for the warm tier.
+    // (mmap-backed, fully materialized in memory once aged past
+    // `--segment-warm-after`) vs COLD/unloaded (WS3 round 2: everything
+    // in-memory dropped once idle past `--engine-offload-idle-secs`, only a
+    // stub resident). `*_with_exact_rerank` mirrors `segments_with_exact_rerank`'s
+    // "coverage < total ⇒ some segments answer ADC-only" signal for each tier.
     let warm_segments = snap.warm.len();
     let warm_segments_with_exact_rerank =
         snap.warm.iter().filter(|w| w.raw_f16().is_some()).count();
+    let unloaded_segments = snap.unloaded.len();
+    let unloaded_segments_with_exact_rerank = snap
+        .unloaded
+        .iter()
+        .filter(|s| s.had_exact_rerank())
+        .count();
 
     // Use itoa for numeric formatting -- no format!() on hot path.
     let ef_rt_bytes: Bytes = if idx.meta.hnsw_ef_runtime > 0 {
@@ -122,6 +134,10 @@ pub fn ft_info(
         Frame::Integer(warm_segments as i64),
         Frame::BulkString(Bytes::from_static(b"warm_segments_with_exact_rerank")),
         Frame::Integer(warm_segments_with_exact_rerank as i64),
+        Frame::BulkString(Bytes::from_static(b"unloaded_segments")),
+        Frame::Integer(unloaded_segments as i64),
+        Frame::BulkString(Bytes::from_static(b"unloaded_segments_with_exact_rerank")),
+        Frame::Integer(unloaded_segments_with_exact_rerank as i64),
     ];
 
     // Per-field stats: vector_fields array
@@ -138,6 +154,9 @@ pub fn ft_info(
             for warm in s.warm.iter() {
                 docs += warm.total_count() as usize;
             }
+            for stub in s.unloaded.iter() {
+                docs += stub.total_count() as usize;
+            }
             (docs, s.mutable.len(), imm_count)
         } else if let Some(fs) = idx.field_segments.get(&field_meta.field_name) {
             let s = fs.segments.load();
@@ -148,6 +167,9 @@ pub fn ft_info(
             }
             for warm in s.warm.iter() {
                 docs += warm.total_count() as usize;
+            }
+            for stub in s.unloaded.iter() {
+                docs += stub.total_count() as usize;
             }
             (docs, s.mutable.len(), imm_count)
         } else {
@@ -260,6 +282,8 @@ pub fn merge_ft_info_responses(local: Frame, remotes: &[Frame]) -> Frame {
         b"segments_with_exact_rerank",
         b"warm_segments",
         b"warm_segments_with_exact_rerank",
+        b"unloaded_segments",
+        b"unloaded_segments_with_exact_rerank",
     ];
     const ADDITIVE_FIELD: &[&[u8]] = &[b"num_docs", b"mutable_vectors", b"immutable_segments"];
 

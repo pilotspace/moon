@@ -6,6 +6,123 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added — true COLD tier: idle segments now actually free memory (WS3 round 2, PR #TBD)
+
+Round 1 (below) shipped an idle *trigger* but routed it into the pre-existing
+WARM tier, which copies `.mpf` payloads into owned buffers of the same size
+as the HOT segment it replaces -- measured flat-to-+1.1% RSS, not a
+reduction. Round 2 fixes the actual memory problem:
+
+- **New tier, `SegmentList.unloaded: Vec<Arc<UnloadedSegment>>`**
+  (`src/vector/persistence/unloaded_segment.rs`, new file): a COLD segment
+  stub holding only a handful of scalars (segment id, doc count, whether it
+  had an exact-rerank sidecar, an `mlock_codes` flag) plus a cloned
+  `SegmentHandle` keeping the on-disk directory alive. Nothing else --
+  no TQ/SQ8 codes, no HNSW graph, no f16 sidecar buffer.
+- **Idle now routes straight to COLD, not WARM**
+  (`VectorIndex::try_warm_transitions_idle`, `src/vector/store.rs`): the two
+  triggers now have different destinations. `age_eligible`
+  (`--segment-warm-after`) still demotes to WARM exactly as before (an
+  old-but-still-hot segment structurally simplifies to disk-backed storage,
+  no memory-reduction promise). `idle_eligible`
+  (`--engine-offload-idle-secs`, genuinely cold) now demotes straight to
+  COLD -- this is the one that actually frees memory. If a segment
+  satisfies both simultaneously, COLD wins. Both destinations write the
+  identical `.mpf` files via the existing `warm_tier::transition_to_warm`
+  (sidecar included); COLD additionally drops the materialized
+  `WarmSearchSegment` immediately after capturing the stub, instead of
+  keeping it resident.
+- **Transparent, synchronous, single-flight reload on touch**
+  (`SegmentHolder::promote_unloaded`, `src/vector/segment/holder/promote.rs`
+  -- split out as a child module to keep `holder.rs` under the 1500-line
+  cap): every search path (`search_filtered`, `search_mvcc`, and the
+  yielding worker-pool capture in
+  `command/vector_search/ft_search/dispatch.rs`) calls this before scanning
+  -- a KNN query must consider every segment for correctness, so a COLD
+  segment cannot stay unloaded and still participate. Fast path (nothing
+  unloaded) is a single `is_empty()` check, no lock, no allocation. When
+  there IS something to reload, a blocking (never `try_lock`, never held
+  across `.await`) `reload_lock` mutex makes it single-flight: N concurrent
+  callers touching the same COLD segment all wait for the one reload
+  (double-checked re-load after acquiring the lock) rather than racing
+  ahead with a stale, missing-segment snapshot. Reload reuses
+  `WarmSearchSegment::from_files` -- the same function the WARM tier and
+  server-boot recovery already use -- so recall/exactness (sidecar
+  included) is unaffected; a segment that fails to reload (corrupt/missing
+  files) stays in `unloaded` and is retried on the next touch without
+  poisoning the rest of the batch.
+- **`FT.INFO`**: new additive counters `unloaded_segments` /
+  `unloaded_segments_with_exact_rerank` (the latter answered from the stub,
+  no reload needed), and `num_docs` (both top-level and per-field) now also
+  sums `unloaded.iter().map(UnloadedSegment::total_count)` -- the same
+  regression class fixed for WARM in round 1, this time for COLD.
+- **Lifecycle**: `VectorStore::drop_index` / `clear_all_contents` (FLUSHALL/
+  FLUSHDB) now also tombstone every `unloaded` stub's `SegmentHandle`, or
+  its on-disk directory would leak once the stub itself is dropped (WARM
+  segments already got this treatment; COLD needed the same). GraphUnion
+  merge scheduling (`VectorIndex::needs_merge` / `begin_background_merge`)
+  only ever reads/filters `snapshot.immutable` (HOT segments) -- it never
+  touches `warm`, `cold` (DiskAnn), or `unloaded`, so COLD segments are
+  skipped by construction, not by added special-casing. Server restart:
+  COLD segments have no restart-time restoration path, same as WARM already
+  didn't -- the segment directories they point at are simply reloaded as
+  fresh HOT/immutable segments by the existing boot-recovery scan
+  (`persistence/recover_v2.rs`); "should be free" per the original ask.
+- **RSS re-measurement** (same methodology as round 1: real server,
+  `--shards 1`, 40,000 x 768-dim vectors, SQ8, `ps -o rss=`) -- this time a
+  real drop, not the round-1 flat-to-increase result:
+
+  | Phase | RSS (KB) | Delta |
+  |---|---|---|
+  | Before unload (HOT) | 400,544 | -- |
+  | After unload (COLD) | 295,760 | -104,784 KB (-26.2%) |
+  | After reload (touched, back to WARM) | 395,376 | +99,616 KB vs COLD |
+
+  The reload number lands just under the original HOT figure because the
+  segment reloads into the WARM (owned-buffer) representation, which is
+  itself ~1.3% smaller than the original HOT `ImmutableSegment` layout in
+  this run -- consistent with round 1's WARM-vs-HOT measurement, not a new
+  effect.
+- Red/green: `tests/vector_idle_unload.rs`'s
+  `hot_segment_idle_unloads_to_cold_and_preserves_recall` (supersedes round
+  1's `hot_segment_idle_unloads_and_preserves_recall`, which polled
+  `warm_segments` -- now stays 0 for a purely-idle transition) walks HOT ->
+  COLD -> reload -> WARM, asserting `FT.INFO` counters at every stage
+  (`graph_segments`, `warm_segments`, `unloaded_segments`,
+  `*_with_exact_rerank`, `num_docs`) plus recall/exactness before and after.
+  `cold_unload_reduces_process_rss` is the process-level RSS proxy (40,000 →
+  scaled down to a CI-reasonable 3,000 × 256-dim fixture -- see the full
+  40K×768d numbers below for the production-scale claim) asserting a real
+  `ps` RSS drop, not just a counter flip. `unloaded_segment.rs`'s own unit
+  tests cover stub-capture + reload round-trip and tombstone-triggers-
+  directory-removal.
+- **Correctness edges considered and their disposition**: concurrent search
+  during unload -- covered by single-flight `reload_lock` above; writes/
+  tombstones arriving for a COLD segment's key -- `WarmSearchSegment` (and
+  therefore also the COLD stub, which reloads into one) has **no per-key
+  tombstone mechanism at all**, a pre-existing gap discovered during this
+  work (`tombstone_key_in_index` only ever touches `mutable` and
+  `immutable`) -- COLD inherits exactly the same behavior as WARM already
+  had, so this is a documented pre-existing limitation, not a regression;
+  see "Known limitation" below. FLUSHALL/FLUSHDB/DROPINDEX -- handled (see
+  Lifecycle above). GraphUnion merge -- skipped by construction (see
+  Lifecycle above). Single-flight reload -- handled (see above).
+
+- **⚠ Known limitation (pre-existing, not introduced by WS3): no per-key
+  tombstoning for WARM or COLD segments.** `tombstone_key_in_index`
+  (`src/vector/store.rs`) only marks deletions in the `mutable` and
+  `immutable` (HOT) segments; `WarmSearchSegment` has no delete-bitmap or
+  MVCC-visibility mechanism of its own. A key deleted (DEL/HDEL/UNLINK)
+  after its vector's HOT segment has demoted to WARM or COLD stays
+  returned by that segment's own local search until the segment is later
+  merged away or the whole index is dropped/flushed. This predates WS3
+  (round 1's WARM tier already had it) and reloading a COLD stub does not
+  make it worse or better -- it inherits WARM's exact behavior. Flagged
+  here because implementing the new COLD tier required reading this code
+  path closely enough to notice it; fixing it is out of scope for this
+  workstream (adding per-segment tombstone tracking to `WarmSearchSegment`
+  is its own, separately-scoped change) and is recorded as a follow-up.
+
 ### Added — vector idle-unload with sidecar-preserving WARM transition (WS3, PR #TBD)
 
 - **`src/vector/segment/immutable.rs`**: `ImmutableSegment` gains a
