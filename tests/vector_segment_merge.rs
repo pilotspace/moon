@@ -79,6 +79,7 @@ fn make_meta(name: &str, dim: u32) -> IndexMeta {
         schema_fields: Vec::new(),
         merge_mode: MergeMode::GraphUnion,
         keep_raw: false,
+        db_index: 0,
     }
 }
 
@@ -102,6 +103,7 @@ fn make_meta_sq8(name: &str, dim: u32) -> IndexMeta {
         schema_fields: Vec::new(),
         merge_mode: MergeMode::GraphUnion,
         keep_raw: false,
+        db_index: 0,
     }
 }
 

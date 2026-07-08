@@ -43,6 +43,7 @@ fn make_meta(name: &str, dim: u32) -> IndexMeta {
         schema_fields: Vec::new(),
         merge_mode: moon::vector::segment::compaction::MergeMode::GraphUnion,
         keep_raw: false,
+        db_index: 0,
     }
 }
 

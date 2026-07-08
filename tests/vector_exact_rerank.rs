@@ -57,6 +57,7 @@ fn make_meta(name: &str, quant: QuantizationConfig, metric: DistanceMetric) -> I
         schema_fields: Vec::new(),
         merge_mode: MergeMode::GraphUnion,
         keep_raw: false,
+        db_index: 0,
     }
 }
 

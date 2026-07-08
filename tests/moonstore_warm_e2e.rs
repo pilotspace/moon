@@ -37,6 +37,7 @@ fn make_test_meta(name: &str, dim: u32, compact_threshold: u32) -> IndexMeta {
         schema_fields: Vec::new(),
         merge_mode: moon::vector::segment::compaction::MergeMode::GraphUnion,
         keep_raw: false,
+        db_index: 0,
     }
 }
 

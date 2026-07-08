@@ -110,6 +110,13 @@ pub struct IndexMeta {
     /// lossless re-quantization during merge. Default: false.
     /// Set via FT.CREATE … KEEP_RAW ON.
     pub keep_raw: bool,
+    /// Logical database (SELECT/`--databases`) this index was created in
+    /// (WS5a db-scoped indexes). The index's definition AND contents belong
+    /// exclusively to this db: FT.SEARCH/FT.INFO/FT._LIST/auto-indexing from
+    /// any other db must not see it. Persisted sidecars written before this
+    /// field existed (v1-v3) default to `0` on load (legacy indexes become
+    /// db-0-owned, matching pre-v0.6.0 global behavior for db 0 callers).
+    pub db_index: u8,
 }
 
 impl IndexMeta {
@@ -1760,10 +1767,22 @@ impl VectorStore {
         }
     }
 
+    /// Db-scoped variant of [`Self::drop_index`] (WS5a): refuses to drop an
+    /// index owned by a different db (returns `false`, matching the
+    /// "unknown index" outcome a same-db caller would see as `NOTFOUND`).
+    pub fn drop_index_for_db(&mut self, name: &[u8], db_index: u8) -> bool {
+        match self.indexes.get(name) {
+            Some(idx) if idx.meta.db_index == db_index => self.drop_index(name),
+            _ => false,
+        }
+    }
+
     /// Drop an index by name. Returns true if it existed.
     ///
     /// Tombstones any warm segments so their on-disk directories are cleaned up
     /// once all in-flight search references (Arc snapshots) are dropped.
+    ///
+    /// NOTE (WS5a): NOT db-scoped — see [`Self::drop_index_for_db`].
     pub fn drop_index(&mut self, name: &[u8]) -> bool {
         if let Some(index) = self.indexes.remove(name) {
             // Tombstone warm segments: mark for deletion on last Arc drop.
@@ -1789,9 +1808,34 @@ impl VectorStore {
     /// definitions come from the sidecar and contents are re-derived from
     /// the (now empty) keyspace. Without this, flushed hashes stayed
     /// searchable as ghost vectors until the next restart.
+    ///
+    /// Clears indexes in EVERY logical db — this is the correct primitive
+    /// for FLUSHALL. FLUSHDB must use [`Self::clear_all_contents_for_db`]
+    /// instead (WS5a): the two commands are not yet differentiated at the
+    /// call sites — see the WS5a gap report.
     pub fn clear_all_contents(&mut self) {
-        // FLUSH discards everything.
-        let names: Vec<Bytes> = self.indexes.keys().cloned().collect();
+        self.clear_contents_matching(|_| true);
+    }
+
+    /// Db-scoped variant of [`Self::clear_all_contents`] for FLUSHDB
+    /// (WS5a): only clears contents of indexes owned by `db_index`, leaving
+    /// every other db's index contents untouched.
+    pub fn clear_all_contents_for_db(&mut self, db_index: u8) {
+        self.clear_contents_matching(|meta| meta.db_index == db_index);
+    }
+
+    /// Shared implementation for [`Self::clear_all_contents`] /
+    /// [`Self::clear_all_contents_for_db`]: recreate every index whose
+    /// `IndexMeta` satisfies `predicate` from its own definition, discarding
+    /// contents but keeping the FT.CREATE definition (see
+    /// `clear_all_contents` doc for the rationale).
+    fn clear_contents_matching(&mut self, predicate: impl Fn(&IndexMeta) -> bool) {
+        let names: Vec<Bytes> = self
+            .indexes
+            .iter()
+            .filter(|(_, idx)| predicate(&idx.meta))
+            .map(|(name, _)| name.clone())
+            .collect();
         for name in names {
             let Some(index) = self.indexes.remove(&name) else {
                 continue;
@@ -1820,22 +1864,62 @@ impl VectorStore {
     }
 
     /// Get index reference by name.
+    ///
+    /// NOTE (WS5a): this is the pre-existing, NOT db-scoped lookup — it
+    /// ignores `IndexMeta::db_index` entirely and will return an index
+    /// created in ANY logical db. Command handlers that need db isolation
+    /// MUST migrate to [`Self::get_index_for_db`] (see
+    /// `.planning/v0.6.0-release/WS5A-NOTES.md` for the call-site punch
+    /// list — this migration is NOT yet complete).
     pub fn get_index(&self, name: &[u8]) -> Option<&VectorIndex> {
         self.indexes.get(name)
     }
 
+    /// Db-scoped variant of [`Self::get_index`]: returns `None` if the index
+    /// exists but was created in a different logical db (WS5a isolation —
+    /// makes an index invisible outside its owning db, matching Redis-style
+    /// NOTFOUND semantics for a name that "doesn't exist" from this db's
+    /// point of view).
+    pub fn get_index_for_db(&self, name: &[u8], db_index: u8) -> Option<&VectorIndex> {
+        self.indexes
+            .get(name)
+            .filter(|idx| idx.meta.db_index == db_index)
+    }
+
     /// Get mutable index reference by name.
+    ///
+    /// NOTE (WS5a): NOT db-scoped — see [`Self::get_index`].
     pub fn get_index_mut(&mut self, name: &[u8]) -> Option<&mut VectorIndex> {
         self.indexes.get_mut(name)
     }
 
+    /// Db-scoped variant of [`Self::get_index_mut`].
+    pub fn get_index_mut_for_db(&mut self, name: &[u8], db_index: u8) -> Option<&mut VectorIndex> {
+        self.indexes
+            .get_mut(name)
+            .filter(|idx| idx.meta.db_index == db_index)
+    }
+
     /// List all index names.
+    ///
+    /// NOTE (WS5a): NOT db-scoped — returns names across every logical db.
     pub fn index_names(&self) -> Vec<&Bytes> {
         self.indexes.keys().collect()
     }
 
+    /// Db-scoped variant of [`Self::index_names`] (for FT._LIST).
+    pub fn index_names_for_db(&self, db_index: u8) -> Vec<&Bytes> {
+        self.indexes
+            .iter()
+            .filter(|(_, idx)| idx.meta.db_index == db_index)
+            .map(|(name, _)| name)
+            .collect()
+    }
+
     /// Find indexes whose key_prefixes match the given key.
     /// Returns refs to matching VectorIndex entries.
+    ///
+    /// NOTE (WS5a): NOT db-scoped.
     pub fn find_matching_indexes(&self, key: &[u8]) -> Vec<&VectorIndex> {
         self.indexes
             .values()
@@ -1845,11 +1929,34 @@ impl VectorStore {
 
     /// Find matching index names for auto-indexing.
     /// Caller must collect names first to avoid borrow issues.
+    ///
+    /// NOTE (WS5a): NOT db-scoped — the HSET auto-index hook
+    /// (`auto_index_hset` in `src/shard/spsc_handler.rs`) still calls this
+    /// unscoped variant, so a HSET issued in db 3 can still feed an index
+    /// created in db 0 if the key matches its PREFIX. Migrating the caller
+    /// to [`Self::find_matching_index_names_for_db`] is open follow-up work.
     pub fn find_matching_index_names(&self, key: &[u8]) -> Vec<Bytes> {
         self.indexes
             .iter()
             .filter_map(|(name, idx)| {
                 if idx.meta.key_prefixes.iter().any(|p| key.starts_with(p)) {
+                    Some(name.clone())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Db-scoped variant of [`Self::find_matching_index_names`]: only
+    /// considers indexes owned by `db_index`.
+    pub fn find_matching_index_names_for_db(&self, key: &[u8], db_index: u8) -> Vec<Bytes> {
+        self.indexes
+            .iter()
+            .filter_map(|(name, idx)| {
+                if idx.meta.db_index == db_index
+                    && idx.meta.key_prefixes.iter().any(|p| key.starts_with(p))
+                {
                     Some(name.clone())
                 } else {
                     None
@@ -1866,6 +1973,8 @@ impl VectorStore {
     ///
     /// NOTE: Vec allocation for matching_names is acceptable -- this only fires
     /// when a deleted key matches an index prefix (rare per-operation).
+    ///
+    /// NOTE (WS5a): NOT db-scoped — see [`Self::find_matching_index_names`].
     pub fn mark_deleted_for_key(&mut self, key: &[u8]) {
         let matching_names = self.find_matching_index_names(key);
         if matching_names.is_empty() {
@@ -1877,6 +1986,22 @@ impl VectorStore {
             any_deleted |= self.tombstone_key_in_index(&idx_name, key_hash);
         }
         // Bump version AFTER any successful deletion mark.
+        if any_deleted {
+            self.bump_version();
+        }
+    }
+
+    /// Db-scoped variant of [`Self::mark_deleted_for_key`].
+    pub fn mark_deleted_for_key_for_db(&mut self, key: &[u8], db_index: u8) {
+        let matching_names = self.find_matching_index_names_for_db(key, db_index);
+        if matching_names.is_empty() {
+            return;
+        }
+        let key_hash = xxhash_rust::xxh64::xxh64(key, 0);
+        let mut any_deleted = false;
+        for idx_name in matching_names {
+            any_deleted |= self.tombstone_key_in_index(&idx_name, key_hash);
+        }
         if any_deleted {
             self.bump_version();
         }
@@ -2027,8 +2152,22 @@ impl VectorStore {
     }
 
     /// Collect references to all active IndexMeta for persistence.
+    ///
+    /// Deliberately NOT db-scoped: the sidecar (`vector-indexes.meta`) must
+    /// persist every logical db's index definitions so a restart restores
+    /// all of them (see `save_index_meta_sidecar`).
     pub fn collect_index_metas(&self) -> Vec<&IndexMeta> {
         self.indexes.values().map(|idx| &idx.meta).collect()
+    }
+
+    /// Db-scoped variant of [`Self::collect_index_metas`] (for FT._LIST /
+    /// scatter_ft_info at the command layer — WS5a).
+    pub fn collect_index_metas_for_db(&self, db_index: u8) -> Vec<&IndexMeta> {
+        self.indexes
+            .values()
+            .map(|idx| &idx.meta)
+            .filter(|meta| meta.db_index == db_index)
+            .collect()
     }
 
     /// Collect `(meta, compaction_weight)` pairs for v3 sidecar persistence (W3-deep).
@@ -2620,6 +2759,7 @@ pub(crate) fn test_index_meta(dim: u32) -> IndexMeta {
         schema_fields: Vec::new(),
         merge_mode: MergeMode::GraphUnion,
         keep_raw: false,
+        db_index: 0,
     }
 }
 
@@ -2648,6 +2788,7 @@ mod tests {
             schema_fields: Vec::new(),
             merge_mode: MergeMode::GraphUnion,
             keep_raw: false,
+            db_index: 0,
         }
     }
 
@@ -2669,6 +2810,7 @@ mod tests {
             schema_fields: Vec::new(),
             merge_mode: MergeMode::GraphUnion,
             keep_raw: false,
+            db_index: 0,
         }
     }
 
@@ -2705,6 +2847,174 @@ mod tests {
         // Drop non-existent
         assert!(!store.drop_index(b"idx"));
         assert!(!store.drop_index(b"nonexistent"));
+    }
+
+    /// WS5a (db-scoped indexes): db-tagged variants of the lookup/listing/
+    /// deletion primitives must be invisible/inert across logical dbs, while
+    /// the pre-existing unscoped methods keep their historical (global)
+    /// behavior for callers not yet migrated.
+    mod ws5a_db_scoping {
+        use super::*;
+
+        fn make_meta_for_db(name: &str, db_index: u8) -> IndexMeta {
+            let mut meta = make_meta(name, 32, &["doc:"]);
+            meta.db_index = db_index;
+            meta
+        }
+
+        #[test]
+        fn get_index_for_db_is_invisible_cross_db() {
+            let mut store = VectorStore::new();
+            store.create_index(make_meta_for_db("idx", 3)).unwrap();
+
+            // Owning db sees it.
+            assert!(store.get_index_for_db(b"idx", 3).is_some());
+            assert!(store.get_index_mut_for_db(b"idx", 3).is_some());
+            // Every other db does not -- this is the core WS5a guarantee.
+            assert!(store.get_index_for_db(b"idx", 0).is_none());
+            assert!(store.get_index_mut_for_db(b"idx", 0).is_none());
+            // The legacy unscoped accessor is intentionally untouched
+            // (documents the current, NOT-yet-migrated global behavior).
+            assert!(store.get_index(b"idx").is_some());
+        }
+
+        #[test]
+        fn index_names_for_db_filters_by_owner() {
+            let mut store = VectorStore::new();
+            store.create_index(make_meta_for_db("a", 0)).unwrap();
+            store.create_index(make_meta_for_db("b", 1)).unwrap();
+            store.create_index(make_meta_for_db("c", 1)).unwrap();
+
+            let db0: Vec<&[u8]> = store
+                .index_names_for_db(0)
+                .into_iter()
+                .map(|b| b.as_ref())
+                .collect();
+            assert_eq!(db0, vec![b"a".as_ref()]);
+
+            let mut db1: Vec<&[u8]> = store
+                .index_names_for_db(1)
+                .into_iter()
+                .map(|b| b.as_ref())
+                .collect();
+            db1.sort();
+            assert_eq!(db1, vec![b"b".as_ref(), b"c".as_ref()]);
+
+            // Unscoped listing still returns all three (documents current
+            // FT._LIST behavior pending call-site migration).
+            assert_eq!(store.index_names().len(), 3);
+        }
+
+        #[test]
+        fn find_matching_index_names_for_db_scopes_auto_index() {
+            let mut store = VectorStore::new();
+            store.create_index(make_meta_for_db("db0idx", 0)).unwrap();
+            store.create_index(make_meta_for_db("db1idx", 1)).unwrap();
+
+            let db0_matches = store.find_matching_index_names_for_db(b"doc:1", 0);
+            assert_eq!(db0_matches, vec![Bytes::from_static(b"db0idx")]);
+
+            let db1_matches = store.find_matching_index_names_for_db(b"doc:1", 1);
+            assert_eq!(db1_matches, vec![Bytes::from_static(b"db1idx")]);
+
+            // Unscoped variant still matches both (documents the HSET
+            // auto-index hook's current global behavior pending migration).
+            assert_eq!(store.find_matching_index_names(b"doc:1").len(), 2);
+        }
+
+        #[test]
+        fn mark_deleted_for_key_for_db_only_tombstones_owning_db() {
+            let mut store = VectorStore::new();
+            store.create_index(make_meta_for_db("db0idx", 0)).unwrap();
+            store.create_index(make_meta_for_db("db1idx", 1)).unwrap();
+
+            let key = b"doc:1";
+            let vec = vec![0.1f32; 32];
+            let hash = xxhash_rust::xxh64::xxh64(key, 0);
+            store
+                .insert_vector(b"db0idx", &vec, hash, Bytes::copy_from_slice(key))
+                .unwrap();
+            store
+                .insert_vector(b"db1idx", &vec, hash, Bytes::copy_from_slice(key))
+                .unwrap();
+
+            // Deleting the key from db 0 must not affect db 1's copy.
+            store.mark_deleted_for_key_for_db(key, 0);
+
+            let db0_alive = store
+                .get_index(b"db0idx")
+                .unwrap()
+                .key_hash_to_key
+                .contains_key(&hash);
+            let db1_alive = store
+                .get_index(b"db1idx")
+                .unwrap()
+                .key_hash_to_key
+                .contains_key(&hash);
+            assert!(!db0_alive, "db0's entry must be tombstoned");
+            assert!(db1_alive, "db1's entry must survive a db0-scoped delete");
+        }
+
+        #[test]
+        fn clear_all_contents_for_db_leaves_other_dbs_untouched() {
+            let mut store = VectorStore::new();
+            store.create_index(make_meta_for_db("db0idx", 0)).unwrap();
+            store.create_index(make_meta_for_db("db1idx", 1)).unwrap();
+
+            let key = b"doc:1";
+            let vec = vec![0.1f32; 32];
+            let hash = xxhash_rust::xxh64::xxh64(key, 0);
+            store
+                .insert_vector(b"db0idx", &vec, hash, Bytes::copy_from_slice(key))
+                .unwrap();
+            store
+                .insert_vector(b"db1idx", &vec, hash, Bytes::copy_from_slice(key))
+                .unwrap();
+
+            // FLUSHDB on db 0 only.
+            store.clear_all_contents_for_db(0);
+
+            // Definitions survive in both dbs (FLUSH keeps FT.CREATE defs).
+            assert_eq!(store.len(), 2);
+            // db0's content is gone; db1's is untouched.
+            assert!(
+                !store
+                    .get_index(b"db0idx")
+                    .unwrap()
+                    .key_hash_to_key
+                    .contains_key(&hash)
+            );
+            assert!(
+                store
+                    .get_index(b"db1idx")
+                    .unwrap()
+                    .key_hash_to_key
+                    .contains_key(&hash)
+            );
+        }
+
+        #[test]
+        fn drop_index_for_db_refuses_cross_db_drop() {
+            let mut store = VectorStore::new();
+            store.create_index(make_meta_for_db("idx", 3)).unwrap();
+
+            // Wrong db: refused, index survives.
+            assert!(!store.drop_index_for_db(b"idx", 0));
+            assert_eq!(store.len(), 1);
+
+            // Owning db: succeeds.
+            assert!(store.drop_index_for_db(b"idx", 3));
+            assert_eq!(store.len(), 0);
+        }
+
+        #[test]
+        fn legacy_persisted_index_defaults_to_db_zero() {
+            // v1-v3 sidecar formats have no db_index byte; the field defaults
+            // to 0 via `IndexMeta { db_index: 0, .. }` in the deserializer,
+            // matching pre-v0.6.0 global (db-0-visible) behavior.
+            let meta = make_meta("legacyidx", 64, &["doc:"]);
+            assert_eq!(meta.db_index, 0);
+        }
     }
 
     /// Builds HSET-style args `[key, field, vector_bytes]` for
@@ -3190,6 +3500,7 @@ mod bg_compact_tests {
             schema_fields: Vec::new(),
             merge_mode: MergeMode::GraphUnion,
             keep_raw: false,
+            db_index: 0,
         }
     }
 

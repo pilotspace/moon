@@ -580,6 +580,7 @@ mod tests {
             schema_fields: Vec::new(),
             merge_mode: crate::vector::store::MergeMode::default(),
             keep_raw: false,
+            db_index: 0,
         }
     }
 

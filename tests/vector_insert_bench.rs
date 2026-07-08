@@ -146,6 +146,7 @@ fn bench_full_insert_pipeline_128d() {
         schema_fields: Vec::new(),
         merge_mode: moon::vector::segment::compaction::MergeMode::GraphUnion,
         keep_raw: false,
+        db_index: 0,
     };
     let _ = store.create_index(meta);
 
@@ -225,6 +226,7 @@ fn bench_full_insert_pipeline_768d() {
         schema_fields: Vec::new(),
         merge_mode: moon::vector::segment::compaction::MergeMode::GraphUnion,
         keep_raw: false,
+        db_index: 0,
     };
     let _ = store.create_index(meta);
 

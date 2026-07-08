@@ -440,6 +440,13 @@ pub fn ft_create(
         schema_fields,
         merge_mode: first_merge_mode,
         keep_raw: first_keep_raw,
+        // WS5a: `ft_create` does not yet receive the connection's selected
+        // db (see `.planning/v0.6.0-release/WS5A-NOTES.md` gap report for
+        // the exact threading path through `dispatch_vector_command` and
+        // its 3 dispatch-path call sites). Every index is tagged db 0 until
+        // that follow-up lands — behavior-preserving with pre-WS5a (global)
+        // semantics, NOT yet the db-scoped guarantee.
+        db_index: 0,
     };
 
     let index_name_clone = meta.name.clone();
