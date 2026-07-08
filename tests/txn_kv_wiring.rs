@@ -134,6 +134,11 @@ async fn start_txn_server(num_shards: usize, persistence_dir: &str) -> (u16, Can
         migrate_aof_from: None,
         migrate_aof_to: None,
         migrate_aof_shards: 0,
+        graph_result_cache_entries: 256,
+        graph_result_cache_bytes: 4_194_304,
+        vector_ef_runtime: 0,
+        vector_rerank_mult: 4,
+        vector_exact_beam: false,
     };
 
     let cancel = token.clone();

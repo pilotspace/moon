@@ -219,12 +219,14 @@ fn write_v1_per_index(buf: &mut Vec<u8>, m: &IndexMeta) {
     }
 }
 
-/// Deserialize IndexMeta list from bytes. Handles v1, v2, and v3 formats.
+/// Deserialize IndexMeta list from bytes. Handles v1 through v5 formats.
 ///
-/// v1/v2 data is auto-migrated:
+/// Older data is auto-migrated:
 /// - v1: single source_field wrapped into 1-element `vector_fields`.
 /// - v2: full field array; `compaction_weight` defaults to 1.0.
 /// - v3: full field array + explicit `compaction_weight` per index.
+/// - v4: v3 + `db_index` per index (pre-v4 defaults to 0).
+/// - v5: v4 + `rerank_mult`/`exact_beam` (pre-v5 defaults to 4 / OFF).
 ///
 /// Returns `(IndexMeta, compaction_weight)` pairs.
 pub fn deserialize_index_metas_with_weights(data: &[u8]) -> io::Result<Vec<(IndexMeta, f32)>> {
