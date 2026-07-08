@@ -402,6 +402,205 @@ fn restart_round_trip_preserves_db_binding() {
 }
 
 // ---------------------------------------------------------------------------
+// (f) Multi-shard db-isolation — the finding-1 regression suite.
+// ---------------------------------------------------------------------------
+//
+// All tests above use `spawn_moon(1, ..)` (single shard), which is exactly
+// why the multi-shard `scatter_text_search` / `scatter_hybrid_search` /
+// `scatter_text_aggregate` gap (adversarial review finding 1) went
+// undetected: on 1 shard, "scatter" degenerates to the local fast path,
+// which was already correctly `db_index`-scoped. `--shards >= 2` is the
+// only way to force a real cross-shard fan-out and exercise the
+// previously-unscoped remote leg.
+
+/// `FT.CREATE` with a TEXT field (not just VECTOR), matching the
+/// `SCHEMA <field> TEXT` pattern used by `tests/hybrid_filter_multishard.rs`'s
+/// `ft_create_tag_idx` helper. Needed because finding 1 is specifically
+/// about the plain-text/BM25 scatter path (`scatter_text_search`), which a
+/// VECTOR-only schema never exercises.
+fn ft_create_text(conn: &mut Connection, idx: &str, prefix: &str) -> redis::RedisResult<String> {
+    redis::cmd("FT.CREATE")
+        .arg(idx)
+        .arg("ON")
+        .arg("HASH")
+        .arg("PREFIX")
+        .arg("1")
+        .arg(prefix)
+        .arg("SCHEMA")
+        .arg("title")
+        .arg("TEXT")
+        .query(conn)
+}
+
+/// Bare (non-KNN) `FT.SEARCH` — the plain-text BM25 path that
+/// `scatter_text_search` implements, as distinct from `ft_search_knn`'s
+/// `*=>[KNN ...]` vector clause.
+fn ft_search_text(
+    conn: &mut Connection,
+    idx: &str,
+    query: &str,
+) -> redis::RedisResult<redis::Value> {
+    redis::cmd("FT.SEARCH")
+        .arg(idx)
+        .arg(query)
+        .query::<redis::Value>(conn)
+}
+
+/// (f1) Plain-text FT.SEARCH cross-db invisibility on a multi-shard server —
+/// the exact scenario from adversarial review finding 1: a db-3 connection
+/// must NOT see (let alone get real results from) a TEXT index created in
+/// db 0, once `--shards >= 2` forces the request through
+/// `scatter_text_search`'s remote-leg fan-out instead of the local fast path.
+#[test]
+fn multishard_text_search_cross_db_invisible() {
+    let Some(m) = spawn_moon(4, "ms-text") else {
+        return;
+    };
+    let mut c0 = m.conn(0);
+    let mut c3 = m.conn(3);
+
+    assert_eq!(
+        ft_create_text(&mut c0, "ms_text_idx", "mstxt:").unwrap(),
+        "OK"
+    );
+
+    // NOTE: avoid common English words ("hello"/"world") — Moon's default
+    // analyzer (`src/text/analyzer.rs`) applies the standard English
+    // stopword list at both index and query time, so those specific tokens
+    // never match anything regardless of db scoping. Use uncommon tokens.
+    let mut set = false;
+    for i in 0..8 {
+        let key = format!("mstxt:{i}");
+        let _: i64 = redis::cmd("HSET")
+            .arg(&key)
+            .arg("title")
+            .arg("xylophone quokka moon")
+            .query(&mut c0)
+            .unwrap();
+        set = true;
+    }
+    assert!(set);
+    // Cross-shard auto-indexing lands asynchronously (see
+    // `hybrid_filter_multishard.rs`'s identical 150ms settle before its
+    // first FT.SEARCH) — give it a moment before querying.
+    thread::sleep(Duration::from_millis(200));
+
+    // A db-3 connection must NEVER see real hits from db-0's index. Under
+    // multi-shard fan-out, `merge_search_results`/text-merge deliberately
+    // "skip errored shards" (each shard independently returns "Unknown Index
+    // name" / "no such index" for a foreign db_index, then the coordinator
+    // merges the survivors) — so the wire-visible outcome here is a
+    // zero-result OK array, not a propagated error (that differs from the
+    // single-shard fast path, which surfaces the error directly; see
+    // `headline_index_created_in_one_db_invisible_from_another`). Either
+    // outcome is SAFE (no data leak); what would be the finding-1 regression
+    // is if `ms_text_idx`'s real documents showed up here.
+    let resp = ft_search_text(&mut c3, "ms_text_idx", "xylophone");
+    match resp {
+        Err(_) => {} // NOTFOUND — also acceptable.
+        Ok(redis::Value::Array(items)) => {
+            assert!(
+                matches!(items.first(), Some(redis::Value::Int(0)) | None),
+                "ms_text_idx (created in db 0) leaked real hits to db 3 on a \
+                 4-shard server: {items:?} — this is adversarial review finding 1 \
+                 (scatter_text_search unscoped by db_index)"
+            );
+        }
+        other => panic!("unexpected FT.SEARCH reply shape from foreign db: {other:?}"),
+    }
+
+    // Sanity: still searchable, with real hits, from its own db.
+    let r0 = ft_search_text(&mut c0, "ms_text_idx", "xylophone").unwrap();
+    match &r0 {
+        redis::Value::Array(items) => {
+            let total = items.first();
+            assert!(
+                !matches!(total, Some(redis::Value::Int(0)) | None),
+                "ms_text_idx must return real hits from its own db 0, got {r0:?}"
+            );
+        }
+        other => panic!("unexpected FT.SEARCH reply shape: {other:?}"),
+    }
+}
+
+/// (f2) KNN cross-db invisibility on a multi-shard server — reuses the
+/// existing VECTOR-only helpers, just at `--shards 4` instead of 1, to prove
+/// the already-correct `scatter_vector_search` path stays correct under
+/// this suite's new higher shard count (regression guard, not a new bug).
+#[test]
+fn multishard_knn_search_cross_db_invisible() {
+    let Some(m) = spawn_moon(4, "ms-knn") else {
+        return;
+    };
+    let mut c0 = m.conn(0);
+    let mut c3 = m.conn(3);
+
+    assert_eq!(ft_create(&mut c0, "ms_knn_idx", "msknn:").unwrap(), "OK");
+    hset_vec(&mut c0, "msknn:1", [1.0, 0.0, 0.0, 0.0]).unwrap();
+    thread::sleep(Duration::from_millis(200));
+
+    // Same merge-skips-errored-shards nuance as the text case above: a
+    // foreign db_index yields an empty OK array (all 4 shards independently
+    // returned "Unknown Index name" for db 3, and the coordinator's
+    // `merge_search_results` drops errored-shard responses rather than
+    // propagating them) rather than a hard error. Either shape is safe; the
+    // regression to guard against is `msknn:1` actually appearing.
+    let resp = ft_search_knn(&mut c3, "ms_knn_idx", [1.0, 0.0, 0.0, 0.0]);
+    match resp {
+        Err(_) => {}
+        Ok(redis::Value::Array(items)) => {
+            assert!(
+                matches!(items.first(), Some(redis::Value::Int(0)) | None),
+                "ms_knn_idx (created in db 0) leaked real hits to db 3 on a \
+                 4-shard server: {items:?}"
+            );
+        }
+        other => panic!("unexpected FT.SEARCH reply shape from foreign db: {other:?}"),
+    }
+
+    let r0 = ft_search_count(&mut c0, "ms_knn_idx", [1.0, 0.0, 0.0, 0.0]);
+    assert!(
+        !matches!(r0, redis::Value::Nil),
+        "ms_knn_idx must remain searchable from its own db 0 on a 4-shard server"
+    );
+}
+
+/// (f3) `FT._LIST` scoping on a multi-shard server — the list-merge path
+/// (`scatter_ft_list` or equivalent) must stay per-db scoped once results
+/// are gathered across shards, not just on the single-shard fast path.
+#[test]
+fn multishard_ft_list_scoped_per_db() {
+    let Some(m) = spawn_moon(4, "ms-list") else {
+        return;
+    };
+    let mut c0 = m.conn(0);
+    let mut c1 = m.conn(1);
+
+    assert_eq!(ft_create(&mut c0, "ms_list_idx0", "msl0:").unwrap(), "OK");
+    assert_eq!(ft_create(&mut c1, "ms_list_idx1", "msl1:").unwrap(), "OK");
+
+    let list0: Vec<String> = redis::cmd("FT._LIST").query(&mut c0).unwrap();
+    assert!(
+        list0.iter().any(|n| n == "ms_list_idx0"),
+        "db 0's FT._LIST must show its own index on a 4-shard server: {list0:?}"
+    );
+    assert!(
+        !list0.iter().any(|n| n == "ms_list_idx1"),
+        "db 0's FT._LIST must NOT show db 1's index on a 4-shard server: {list0:?}"
+    );
+
+    let list1: Vec<String> = redis::cmd("FT._LIST").query(&mut c1).unwrap();
+    assert!(
+        list1.iter().any(|n| n == "ms_list_idx1"),
+        "db 1's FT._LIST must show its own index on a 4-shard server: {list1:?}"
+    );
+    assert!(
+        !list1.iter().any(|n| n == "ms_list_idx0"),
+        "db 1's FT._LIST must NOT show db 0's index on a 4-shard server: {list1:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // (e) Legacy sidecar loads to db 0 — already covered by unit tests.
 // ---------------------------------------------------------------------------
 //
