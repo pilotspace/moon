@@ -599,6 +599,27 @@ pub(super) fn try_handle_multi_exec(
                 &ctx.cached_clock,
                 exec_publishes,
             );
+            // CLIENT TRACKING: invalidate keys written inside the txn, same as
+            // the normal write path (EXEC previously bypassed this). Self-gated
+            // on tracking_active(); must run before command_queue is cleared.
+            if crate::tracking::tracking_active() {
+                if let Frame::Array(ref txn_results) = result {
+                    for (i, cmd_frame) in conn.command_queue.iter().enumerate() {
+                        if i >= txn_results.len() || matches!(txn_results[i], Frame::Error(_)) {
+                            continue;
+                        }
+                        if let Some((c, a)) = crate::server::conn::util::extract_command(cmd_frame)
+                        {
+                            crate::tracking::invalidation::invalidate_after_write(
+                                &ctx.tracking_table,
+                                c,
+                                a,
+                                conn.client_id,
+                            );
+                        }
+                    }
+                }
+            }
             conn.command_queue.clear();
             responses.push(result);
         }

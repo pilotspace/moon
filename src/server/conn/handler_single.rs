@@ -1106,8 +1106,18 @@ pub async fn handle_connection(
                                 let message = extract_bytes(&cmd_args[1]);
                                 match (channel, message) {
                                     (Some(ch), Some(msg)) => {
-                                        let count = pubsub_registry.lock().publish(&ch, &msg);
-                                        responses.push(Frame::Integer(count));
+                                        // Channel ACL (parity with sharded/monoio
+                                        // handlers, which already gate PUBLISH).
+                                        if let Some(err) = crate::server::conn::shared::publish_channel_acl_deny(
+                                            &acl_table,
+                                            &conn.current_user,
+                                            &ch,
+                                        ) {
+                                            responses.push(err);
+                                        } else {
+                                            let count = pubsub_registry.lock().publish(&ch, &msg);
+                                            responses.push(Frame::Integer(count));
+                                        }
                                     }
                                     _ => responses.push(Frame::Error(
                                         Bytes::from_static(b"ERR invalid channel or message"),
@@ -1167,11 +1177,42 @@ pub async fn handle_connection(
                                 // C2: fan out PUBLISHes queued in the txn only
                                 // now — after the transaction body — and patch
                                 // their placeholders with the receiver count.
+                                // Channel ACL gates this path too (C2 security):
+                                // a denied channel is patched with NOPERM and
+                                // never delivered, matching the immediate path.
                                 for (inner, ch, msg) in exec_publishes.drain(..) {
-                                    let count = pubsub_registry.lock().publish(&ch, &msg);
+                                    let patched = match crate::server::conn::shared::publish_channel_acl_deny(
+                                        &acl_table,
+                                        &conn.current_user,
+                                        &ch,
+                                    ) {
+                                        Some(err) => err,
+                                        None => Frame::Integer(pubsub_registry.lock().publish(&ch, &msg)),
+                                    };
                                     if let Frame::Array(items) = &mut result {
                                         if inner < items.len() {
-                                            items[inner] = Frame::Integer(count);
+                                            items[inner] = patched;
+                                        }
+                                    }
+                                }
+                                // CLIENT TRACKING: writes applied inside the txn
+                                // must invalidate tracked keys, same as the normal
+                                // write path (EXEC previously bypassed this, so a
+                                // SET/DEL/MSET inside MULTI left cached readers
+                                // stale). Self-gated on tracking_active().
+                                if crate::tracking::tracking_active() {
+                                    if let Frame::Array(ref txn_results) = result {
+                                        for (i, cmd_frame) in conn.command_queue.iter().enumerate() {
+                                            if i >= txn_results.len()
+                                                || matches!(txn_results[i], Frame::Error(_))
+                                            {
+                                                continue;
+                                            }
+                                            if let Some((c, a)) = extract_command(cmd_frame) {
+                                                crate::tracking::invalidation::invalidate_after_write(
+                                                    &tracking_table, c, a, client_id,
+                                                );
+                                            }
                                         }
                                     }
                                 }

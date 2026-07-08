@@ -324,6 +324,27 @@ fn queue_exec_publish(
     true
 }
 
+/// Channel-ACL gate for PUBLISH. Returns the `NOPERM` error frame when `user`
+/// lacks permission on `channel` (caller must skip the fan-out and patch the
+/// reply with it), or `None` when allowed.
+///
+/// Used by both the immediate single-handler PUBLISH and the transactional
+/// (MULTI/EXEC) fan-out in all three handlers, so a client denied a channel
+/// cannot wrap `PUBLISH` in `MULTI/EXEC` to bypass the check. Moon has no
+/// queue-time EXECABORT machinery, so the transactional check runs at fan-out
+/// time rather than at queue time.
+pub(crate) fn publish_channel_acl_deny(
+    acl_table: &std::sync::RwLock<crate::acl::AclTable>,
+    user: &str,
+    channel: &[u8],
+) -> Option<Frame> {
+    #[allow(clippy::unwrap_used)] // std RwLock: poison = prior panic = unrecoverable
+    let guard = acl_table.read().unwrap();
+    guard
+        .check_channel_permission(user, channel)
+        .map(|reason| Frame::Error(Bytes::from(format!("NOPERM {reason}"))))
+}
+
 /// Fan out one EXEC-queued PUBLISH (C2): local shard synchronously, remote
 /// shards via targeted `PubSubPublish` SPSC messages, awaited so the returned
 /// count matches the immediate-PUBLISH path. Called by the sharded handlers

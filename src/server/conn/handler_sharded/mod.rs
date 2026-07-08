@@ -934,10 +934,22 @@ pub(crate) async fn handle_connection_sharded_inner<
                         if !exec_publishes.is_empty() {
                             let exec_idx = responses.len() - 1;
                             for (inner, ch, msg) in exec_publishes.drain(..) {
-                                let total = crate::server::conn::shared::publish_post_txn(ctx, &ch, &msg).await;
+                                // Channel ACL gates the txn PUBLISH path (C2
+                                // security): a denied channel is patched with
+                                // NOPERM and never fanned out.
+                                let patched = match crate::server::conn::shared::publish_channel_acl_deny(
+                                    &ctx.acl_table,
+                                    &conn.current_user,
+                                    &ch,
+                                ) {
+                                    Some(err) => err,
+                                    None => Frame::Integer(
+                                        crate::server::conn::shared::publish_post_txn(ctx, &ch, &msg).await,
+                                    ),
+                                };
                                 if let Frame::Array(items) = &mut responses[exec_idx] {
                                     if inner < items.len() {
-                                        items[inner] = Frame::Integer(total);
+                                        items[inner] = patched;
                                     }
                                 }
                             }

@@ -311,6 +311,36 @@ path (below), or replay them on a pre-freeze build first and re-persist.
   across a 4-shard server. (P2 of the review — event-loop/scheduler coupling
   benchmark — deferred to a Linux box; macOS numbers are not decision-grade.)
 
+### Security — channel ACL enforced on the transactional PUBLISH path (C2 follow-up, PR #TBD)
+
+- **`src/server/conn/{shared,handler_single,handler_sharded/mod,handler_monoio/mod}.rs`**:
+  the C2 ordering fix queues `PUBLISH` inside `MULTI` and fans it out after the
+  transaction body, but the fan-out skipped the per-channel ACL check that the
+  immediate path enforces — so a client denied a channel could wrap `PUBLISH`
+  in `MULTI/EXEC` to reach it. A shared `publish_channel_acl_deny` helper now
+  gates every fan-out site (all three handlers); a denied channel is patched
+  into the EXEC reply slot as `NOPERM` and never delivered. The check runs at
+  fan-out time because Moon has no queue-time EXECABORT machinery. Also closes a
+  pre-existing gap where the single-handler *immediate* PUBLISH never checked
+  channel ACLs at all (the sharded/monoio immediate paths already did).
+  Red/green: `tests/pubsub_multi_channel_acl.rs` (2 tests, 1- and 4-shard) —
+  a restricted user's `MULTI; PUBLISH denied m; EXEC` returned `:0` on the old
+  binary, `NOPERM` on the fixed one.
+
+### Fixed — CLIENT TRACKING invalidation + cleanup edge cases (review follow-up, PR #TBD)
+
+- **EXEC now invalidates tracked keys**: `SET`/`DEL`/`MSET` applied inside
+  `MULTI/EXEC` bypassed the post-write invalidation hook, leaving RESP3
+  client-side caches stale until the next non-txn write. All three handlers now
+  run `invalidate_after_write` for each successful queued write (self-gated on
+  `tracking_active()`, so no cost when tracking is unused).
+- **monoio disconnect releases tracking registration**: a client that
+  disconnected without `CLIENT TRACKING OFF` left `ACTIVE_TRACKERS` nonzero and
+  kept `tracking_active()` hot for the rest of the process (the single/sharded
+  handlers already cleaned up on close). The monoio disconnect path now calls
+  `untrack_all`, gated on `tracking_active()` to keep the common no-tracking
+  close lock-free.
+
 ### Fixed — TopLevel-monoio AOF writer: EverySec fsync deferred indefinitely when idle (PR #TBD)
 
 - **`src/persistence/aof/writer_task.rs`**: the TopLevel monoio AOF writer

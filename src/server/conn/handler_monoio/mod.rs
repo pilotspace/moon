@@ -1013,11 +1013,21 @@ pub(crate) async fn handle_connection_sharded_monoio<
                 if !exec_publishes.is_empty() {
                     let exec_idx = responses.len() - 1;
                     for (inner, ch, msg) in exec_publishes.drain(..) {
-                        let total =
-                            crate::server::conn::shared::publish_post_txn(ctx, &ch, &msg).await;
+                        // Channel ACL gates the txn PUBLISH path (C2 security):
+                        // a denied channel is patched with NOPERM, never sent.
+                        let patched = match crate::server::conn::shared::publish_channel_acl_deny(
+                            &ctx.acl_table,
+                            &conn.current_user,
+                            &ch,
+                        ) {
+                            Some(err) => err,
+                            None => Frame::Integer(
+                                crate::server::conn::shared::publish_post_txn(ctx, &ch, &msg).await,
+                            ),
+                        };
                         if let Frame::Array(items) = &mut responses[exec_idx] {
                             if inner < items.len() {
-                                items[inner] = Frame::Integer(total);
+                                items[inner] = patched;
                             }
                         }
                     }
@@ -2201,6 +2211,16 @@ pub(crate) async fn handle_connection_sharded_monoio<
         if let Ok(addr) = peer_addr.parse::<std::net::SocketAddr>() {
             ctx.pubsub_affinity.write().remove_pubsub(&addr.ip());
         }
+    }
+
+    // --- Disconnect cleanup: release CLIENT TRACKING registration ---
+    // A client that disconnects without `CLIENT TRACKING OFF` would otherwise
+    // leave `ACTIVE_TRACKERS` nonzero and keep `tracking_active()` hot for the
+    // rest of the process (single/sharded handlers already do this on close).
+    // `untrack_all` only decrements when the client was actually tracked, so
+    // gating on `tracking_active()` keeps the common no-tracking close lock-free.
+    if crate::tracking::tracking_active() {
+        ctx.tracking_table.lock().untrack_all(client_id);
     }
 
     // NOTE: connection close is recorded by the caller (conn_accept.rs) to
