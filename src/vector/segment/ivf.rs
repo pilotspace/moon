@@ -251,6 +251,14 @@ impl IvfSegment {
     ) -> SmallVec<[SearchResult; 32]> {
         // Build the quantized u8 distance LUT from the rotated query using the
         // same dimension-scaled codebook the stored codes were encoded with.
+        //
+        // TODO(metric-faithful L2): this scorer still ranks by unit-sphere
+        // distance scaled by norm² and lacks the l2_adjust/tq_fin correction
+        // that mutable.rs and hnsw/search.rs apply for raw-L2 queries. IVF
+        // segments are not yet built on any production path (holder.ivf is
+        // only populated by tests) — the correction MUST be added here before
+        // wiring IVF into compaction, or L2 recall collapses on
+        // high-magnitude datasets (see the gist-960 TQ-L2 fix).
         let lut_params = fastscan::build_quantized_lut(q_rotated, &self.lut_centroids, lut_buf);
 
         let dim = self.dimension as usize;

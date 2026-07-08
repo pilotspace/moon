@@ -1415,6 +1415,7 @@ fn test_ft_create_l2_defaults_to_sq8() {
         &mut store,
         &mut crate::text::store::TextStore::new(),
         &ft_create_args(),
+        0,
     );
     #[allow(clippy::unwrap_used)] // index just created
     let idx = store.get_index_mut(b"myidx").unwrap();
@@ -1433,6 +1434,7 @@ fn test_ft_create_l2_defaults_to_sq8() {
         &mut store2,
         &mut crate::text::store::TextStore::new(),
         &args,
+        0,
     );
     #[allow(clippy::unwrap_used)] // index just created
     let idx2 = store2.get_index_mut(b"cosidx").unwrap();
@@ -1453,6 +1455,7 @@ fn test_ft_create_l2_defaults_to_sq8() {
         &mut store3,
         &mut crate::text::store::TextStore::new(),
         &args3,
+        0,
     );
     #[allow(clippy::unwrap_used)] // index just created
     let idx3 = store3.get_index_mut(b"tq4idx").unwrap();
@@ -1466,7 +1469,12 @@ fn test_ft_config_ef_runtime_set_get() {
     let _metrics_guard = METRICS_LOCK.read();
     let mut store = VectorStore::new();
     let args = ft_create_args();
-    ft_create(&mut store, &mut crate::text::store::TextStore::new(), &args);
+    ft_create(
+        &mut store,
+        &mut crate::text::store::TextStore::new(),
+        &args,
+        0,
+    );
 
     // SET a pinned beam width; the query path reads meta.hnsw_ef_runtime live.
     let set_args = vec![
@@ -1479,6 +1487,7 @@ fn test_ft_config_ef_runtime_set_get() {
         &mut store,
         &mut crate::text::store::TextStore::new(),
         &set_args,
+        0,
     );
     assert!(matches!(result, Frame::SimpleString(_)), "{result:?}");
     #[allow(clippy::unwrap_used)] // index just created above
@@ -1491,6 +1500,7 @@ fn test_ft_config_ef_runtime_set_get() {
         &mut store,
         &mut crate::text::store::TextStore::new(),
         &get_args,
+        0,
     );
     match &result {
         Frame::BulkString(b) => assert_eq!(&b[..], b"64"),
@@ -1508,6 +1518,7 @@ fn test_ft_config_ef_runtime_set_get() {
         &mut store,
         &mut crate::text::store::TextStore::new(),
         &set_args,
+        0,
     );
     assert!(matches!(result, Frame::SimpleString(_)));
     #[allow(clippy::unwrap_used)] // index exists
@@ -1521,6 +1532,7 @@ fn test_ft_config_ef_runtime_set_get() {
             &mut store,
             &mut crate::text::store::TextStore::new(),
             &set_args,
+            0,
         );
         assert!(matches!(result, Frame::Error(_)), "{bad:?} -> {result:?}");
     }
@@ -1531,7 +1543,12 @@ fn test_ft_config_rerank_mult_set_get() {
     let _metrics_guard = METRICS_LOCK.read();
     let mut store = VectorStore::new();
     let args = ft_create_args();
-    ft_create(&mut store, &mut crate::text::store::TextStore::new(), &args);
+    ft_create(
+        &mut store,
+        &mut crate::text::store::TextStore::new(),
+        &args,
+        0,
+    );
 
     // Default is 4 (the HQ-1 baseline oversample).
     let get_args = vec![bulk(b"GET"), bulk(b"myidx"), bulk(b"RERANK_MULT")];
@@ -1539,6 +1556,7 @@ fn test_ft_config_rerank_mult_set_get() {
         &mut store,
         &mut crate::text::store::TextStore::new(),
         &get_args,
+        0,
     );
     match &result {
         Frame::BulkString(b) => assert_eq!(&b[..], b"4"),
@@ -1556,6 +1574,7 @@ fn test_ft_config_rerank_mult_set_get() {
         &mut store,
         &mut crate::text::store::TextStore::new(),
         &set_args,
+        0,
     );
     assert!(matches!(result, Frame::SimpleString(_)), "{result:?}");
     #[allow(clippy::unwrap_used)] // index just created above
@@ -1567,6 +1586,7 @@ fn test_ft_config_rerank_mult_set_get() {
         &mut store,
         &mut crate::text::store::TextStore::new(),
         &get_args,
+        0,
     );
     match &result {
         Frame::BulkString(b) => assert_eq!(&b[..], b"16"),
@@ -1585,8 +1605,76 @@ fn test_ft_config_rerank_mult_set_get() {
             &mut store,
             &mut crate::text::store::TextStore::new(),
             &set_args,
+            0,
         );
         assert!(matches!(result, Frame::Error(_)), "{bad:?} -> {result:?}");
+    }
+}
+
+#[test]
+fn test_ft_config_tuning_knobs_are_db_scoped() {
+    // WS5a interplay: an index created in db 1 is invisible to FT.CONFIG
+    // from any other db — RERANK_MULT / EXACT_BEAM can only be set (and
+    // read) through the owning db.
+    let _metrics_guard = METRICS_LOCK.read();
+    let mut store = VectorStore::new();
+    let args = ft_create_args();
+    ft_create(
+        &mut store,
+        &mut crate::text::store::TextStore::new(),
+        &args,
+        1,
+    );
+
+    // SET from db 0 (wrong db) must not resolve the index.
+    let set_args = vec![
+        bulk(b"SET"),
+        bulk(b"myidx"),
+        bulk(b"RERANK_MULT"),
+        bulk(b"32"),
+    ];
+    let result = ft_config(
+        &mut store,
+        &mut crate::text::store::TextStore::new(),
+        &set_args,
+        0,
+    );
+    assert!(matches!(result, Frame::Error(_)), "{result:?}");
+
+    // SET from db 1 (owning db) succeeds; knob lands on the db-1 index.
+    for (param, val) in [(&b"RERANK_MULT"[..], &b"32"[..]), (b"EXACT_BEAM", b"ON")] {
+        let set_args = vec![bulk(b"SET"), bulk(b"myidx"), bulk(param), bulk(val)];
+        let result = ft_config(
+            &mut store,
+            &mut crate::text::store::TextStore::new(),
+            &set_args,
+            1,
+        );
+        assert!(matches!(result, Frame::SimpleString(_)), "{result:?}");
+    }
+    #[allow(clippy::unwrap_used)] // created above
+    let idx_db1 = store.get_index_mut_for_db(b"myidx", 1).unwrap();
+    assert_eq!(idx_db1.meta.rerank_mult, 32);
+    assert!(idx_db1.meta.exact_beam);
+
+    // GET is db-scoped too: wrong db errors, owning db reads the knob.
+    let get_args = vec![bulk(b"GET"), bulk(b"myidx"), bulk(b"EXACT_BEAM")];
+    let r0 = ft_config(
+        &mut store,
+        &mut crate::text::store::TextStore::new(),
+        &get_args,
+        0,
+    );
+    assert!(matches!(r0, Frame::Error(_)), "{r0:?}");
+    let r1 = ft_config(
+        &mut store,
+        &mut crate::text::store::TextStore::new(),
+        &get_args,
+        1,
+    );
+    match &r1 {
+        Frame::BulkString(b) => assert_eq!(&b[..], b"ON"),
+        other => panic!("expected BulkString ON, got {other:?}"),
     }
 }
 
@@ -1595,7 +1683,12 @@ fn test_ft_config_exact_beam_on_off() {
     let _metrics_guard = METRICS_LOCK.read();
     let mut store = VectorStore::new();
     let args = ft_create_args();
-    ft_create(&mut store, &mut crate::text::store::TextStore::new(), &args);
+    ft_create(
+        &mut store,
+        &mut crate::text::store::TextStore::new(),
+        &args,
+        0,
+    );
 
     // Default is OFF.
     let get_args = vec![bulk(b"GET"), bulk(b"myidx"), bulk(b"EXACT_BEAM")];
@@ -1603,6 +1696,7 @@ fn test_ft_config_exact_beam_on_off() {
         &mut store,
         &mut crate::text::store::TextStore::new(),
         &get_args,
+        0,
     );
     match &result {
         Frame::BulkString(b) => assert_eq!(&b[..], b"OFF"),
@@ -1622,6 +1716,7 @@ fn test_ft_config_exact_beam_on_off() {
             &mut store,
             &mut crate::text::store::TextStore::new(),
             &set_args,
+            0,
         );
         assert!(
             matches!(result, Frame::SimpleString(_)),
@@ -1643,6 +1738,7 @@ fn test_ft_config_exact_beam_on_off() {
         &mut store,
         &mut crate::text::store::TextStore::new(),
         &set_args,
+        0,
     );
     assert!(matches!(result, Frame::Error(_)), "{result:?}");
 }
