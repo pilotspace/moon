@@ -50,7 +50,6 @@ pub static malloc_conf: MallocConfPtr = MallocConfPtr(
 
 use std::path::PathBuf;
 
-use clap::Parser;
 use moon::config::ServerConfig;
 use moon::config::conf_file::merge_conf_argv;
 use moon::persistence::aof::{self, AofMessage, AofWriterPool, FsyncPolicy};
@@ -127,14 +126,45 @@ fn main() -> anyhow::Result<()> {
     // argv — it will NOT see a `memory-arenas-cap` value that comes from the
     // conf file.  That setting must be given on the CLI if the jemalloc
     // respawn is needed.  This is documented behaviour.
-    let mut config = match merge_conf_argv(std::env::args_os()) {
-        Ok(Some(merged)) => ServerConfig::parse_from(merged),
-        Ok(None) => ServerConfig::parse(),
+    let (mut config, arg_matches) = match merge_conf_argv(std::env::args_os()) {
+        Ok(Some(merged)) => ServerConfig::parse_from_with_matches(merged),
+        Ok(None) => ServerConfig::parse_from_with_matches(std::env::args_os()),
         Err(e) => {
             eprintln!("moon: conf file error: {e}");
             std::process::exit(1);
         }
     };
+
+    // ── --profile tuning presets (WS4, v0.6.0) ──────────────────────────────
+    // Fill-only: a preset only sets flags the operator left at their default
+    // (see `ServerConfig::apply_profile`); anything explicitly passed on the
+    // CLI/moon.conf always wins. Must run before RuntimeConfig construction
+    // and shard spawn so `shards` / `io_busy_poll_us` / `io_driver` are
+    // resolved for every downstream reader.
+    match config.apply_profile(&arg_matches) {
+        Ok(moon::config::ProfileOutcome::Applied { profile, fields }) => {
+            info!(
+                "--profile {profile}: set {} (unset flags only; pass a flag \
+                 explicitly on the CLI to override the preset)",
+                fields.join(", ")
+            );
+            if profile == "standalone" {
+                tracing::warn!(
+                    "--profile standalone enables busy-poll parking \
+                     (--io-busy-poll-us 40), which REGRESSES throughput on \
+                     shared/unpinned cores (OrbStack default, laptops, \
+                     noisy-neighbor cloud VMs). Only use this profile on a \
+                     host with dedicated/pinned CPU cores for the moon \
+                     process. See docs/guides/tuning.md#profiles."
+                );
+            }
+        }
+        Ok(moon::config::ProfileOutcome::None) => {}
+        Err(e) => {
+            eprintln!("moon: {e}");
+            std::process::exit(2);
+        }
+    }
 
     // Resolve the persistence directory before anything reads config.dir
     // (check-config validation, persistence init, WAL). Empty --dir

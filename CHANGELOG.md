@@ -72,6 +72,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mid-MULTI on the monoio single-shard handler executes immediately instead of
   queueing.
 
+### Added — `--profile standalone` tuning preset (v0.6.0 WS4)
+
+- New `--profile <name>` flag (`src/config.rs`). `standalone` fills the proven
+  single-instance p=1 recipe — `--shards 1`, `--io-busy-poll-us 40` (implying
+  `--io-driver epoll`) — for any of those flags the operator left unset.
+  Fill-only precedence: an explicitly-passed flag (CLI or `moon.conf`) always
+  wins over the preset. Startup logs exactly which flags the profile set;
+  an unknown profile name is a startup error (exit 2), never a silent no-op.
+- `ServerConfig::parse_from_with_matches` + `ServerConfig::apply_profile` use
+  `clap::ArgMatches::value_source` to distinguish explicit flags from
+  defaults; `FromArgMatches::from_arg_matches` (non-consuming, clones
+  internally) is used instead of `from_arg_matches_mut`, which removes
+  consumed entries from `ArgMatches` and would erase this provenance.
+- **Safety:** `--io-busy-poll-us` busy-polls the shard thread and REGRESSES
+  throughput on shared/unpinned cores (OrbStack default, laptops,
+  noisy-neighbor cloud VMs) — `standalone` prints a prominent startup warning
+  requiring pinned/dedicated cores, and `docs/guides/tuning.md#profiles` +
+  `docs/configuration.md` document the same caveat. No raw flag default
+  changed.
+- Tests: profile expansion, explicit-flag-wins precedence, no-profile no-op,
+  and unknown-profile error (`src/config.rs` `tests::test_profile_*`).
+
 ### Docs — tuning guide: vector bulk load & compaction (PR #TBD)
 
 - `docs/guides/tuning.md`: new "Vector bulk load and compaction" section — documents

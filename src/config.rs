@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use clap::Parser;
+use clap::{CommandFactory, FromArgMatches, Parser};
 
 // NOTE: `src/config.rs` (this file) co-exists with `src/config/conf_file.rs`
 // using the Rust "file + directory-sibling" layout.  We add `conf_file` as a
@@ -286,6 +286,20 @@ pub struct ServerConfig {
     /// ARM c4a 0.95→1.21× vs Redis, x86 c3 1.06→1.66×. monoio runtime only.
     #[arg(long = "io-busy-poll-us", default_value_t = 0)]
     pub io_busy_poll_us: u64,
+
+    /// Apply a named tuning preset. A profile only fills flags the operator
+    /// left at their default — any flag passed explicitly on the CLI (or via
+    /// `moon.conf`) always wins over the preset's value.
+    ///
+    /// Currently supported: `standalone` — single dedicated instance, tuned
+    /// for the "beat Redis at p=1" latency path (`--shards 1`,
+    /// `--io-busy-poll-us 40`, implying `--io-driver epoll`). REQUIRES
+    /// pinned/dedicated CPU cores: the busy-poll park REGRESSES throughput on
+    /// shared or unpinned cores (OrbStack default, laptops, noisy-neighbor
+    /// cloud VMs) — see docs/guides/tuning.md#profiles. Unknown profile names
+    /// are a startup error.
+    #[arg(long)]
+    pub profile: Option<String>,
 
     /// FT.SEARCH intra-query worker threads: per-segment HNSW searches of one
     /// KNN query fan out across this pool, cutting single-query latency on
@@ -949,6 +963,91 @@ impl ServerConfig {
         outcome
     }
 
+    /// Parse argv into a `ServerConfig`, also returning the `clap::ArgMatches`
+    /// used to produce it.
+    ///
+    /// Callers need the `ArgMatches` alongside the parsed struct so
+    /// [`Self::apply_profile`] can tell explicitly-passed flags apart from
+    /// ones that only hold their `default_value`/`default_value_t` — a plain
+    /// `ServerConfig::parse_from` throws that provenance away. Exits the
+    /// process on parse error (or `--help`/`--version`), matching
+    /// `clap::Parser::parse_from`'s behavior exactly.
+    ///
+    /// Uses [`FromArgMatches::from_arg_matches`] (the non-consuming variant,
+    /// which clones internally) rather than `from_arg_matches_mut`: the
+    /// `_mut` builder removes consumed entries from `ArgMatches` as it goes
+    /// (an optimization to avoid extra clones), which would silently erase
+    /// `value_source` provenance for every field before `apply_profile` ever
+    /// gets to inspect it.
+    pub fn parse_from_with_matches<I, T>(args: I) -> (Self, clap::ArgMatches)
+    where
+        I: IntoIterator<Item = T>,
+        T: Into<std::ffi::OsString> + Clone,
+    {
+        let matches = match Self::command().try_get_matches_from(args) {
+            Ok(m) => m,
+            Err(e) => e.exit(),
+        };
+        let config = match Self::from_arg_matches(&matches) {
+            Ok(c) => c,
+            Err(e) => e.exit(),
+        };
+        (config, matches)
+    }
+
+    /// Apply a named `--profile` tuning preset, mutating `self` in place.
+    ///
+    /// Fill-only semantics: a preset field is written ONLY when the
+    /// corresponding flag's [`clap::ValueSource`] is not `CommandLine` (i.e.
+    /// the operator did not pass it explicitly — on the real CLI or via the
+    /// `moon.conf`-merged argv, both of which land in the same `ArgMatches`
+    /// fed to clap). An explicitly-passed flag always wins over the profile.
+    ///
+    /// `matches` MUST be the `ArgMatches` produced by parsing the SAME argv
+    /// that produced `self` (see [`Self::parse_from_with_matches`]).
+    ///
+    /// MUST be called once at startup, after parsing and before any code
+    /// reads `shards` / `io_busy_poll_us` / `io_driver` (shard spawn,
+    /// `to_runtime_config`, etc.).
+    pub fn apply_profile(
+        &mut self,
+        matches: &clap::ArgMatches,
+    ) -> Result<ProfileOutcome, ProfileError> {
+        let Some(name) = self.profile.clone() else {
+            return Ok(ProfileOutcome::None);
+        };
+        if name != "standalone" {
+            return Err(ProfileError::Unknown(name));
+        }
+
+        let mut fields: Vec<&'static str> = Vec::new();
+        if !Self::flag_was_explicit(matches, "shards") {
+            self.shards = 1;
+            fields.push("--shards=1");
+        }
+        if !Self::flag_was_explicit(matches, "io_busy_poll_us") {
+            self.io_busy_poll_us = 40;
+            fields.push("--io-busy-poll-us=40");
+        }
+        if !Self::flag_was_explicit(matches, "io_driver") {
+            self.io_driver = "epoll".to_string();
+            fields.push("--io-driver=epoll (implied by io-busy-poll-us)");
+        }
+        Ok(ProfileOutcome::Applied {
+            profile: name,
+            fields,
+        })
+    }
+
+    /// True when `id`'s value came from the parsed argv rather than a
+    /// `default_value`/`default_value_t`/env fallback.
+    fn flag_was_explicit(matches: &clap::ArgMatches, id: &str) -> bool {
+        matches!(
+            matches.value_source(id),
+            Some(clap::parser::ValueSource::CommandLine)
+        )
+    }
+
     /// Create a RuntimeConfig from this server config, copying mutable parameters.
     ///
     /// `maxmemory` resolves `None`/`Some(0)` → `0` (the downstream "unlimited"
@@ -1008,6 +1107,27 @@ pub enum GuardrailOutcome {
     /// non-Linux dev host, or `/proc`/`/sys` unreadable). Left UNLIMITED — the
     /// caller warns the operator to set `--maxmemory` explicitly.
     Skipped,
+}
+
+/// Result of resolving `--profile` — drives the startup transparency log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProfileOutcome {
+    /// No `--profile` flag was given; nothing to do.
+    None,
+    /// `profile` was applied; `fields` lists exactly what it set (only
+    /// fields the operator left unset — see [`ServerConfig::apply_profile`]).
+    Applied {
+        profile: String,
+        fields: Vec<&'static str>,
+    },
+}
+
+/// `--profile` resolution failure: an unrecognised profile name.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ProfileError {
+    /// `name` does not match any known preset.
+    #[error("unknown --profile '{0}' (supported: standalone)")]
+    Unknown(String),
 }
 
 /// Parse the `MemTotal:` line of `/proc/meminfo` contents into bytes.
@@ -1366,6 +1486,74 @@ mod tests {
         let config = ServerConfig::parse_from(["moon", "--io-busy-poll-us", "40"]);
         assert_eq!(config.io_busy_poll_us, 40);
         assert!(ServerConfig::try_parse_from(["moon", "--io-busy-poll-us", "x"]).is_err());
+    }
+
+    /// `--profile standalone` with no other flags fills the single-instance
+    /// preset (shards=1, io-busy-poll-us=40, io-driver=epoll) and reports
+    /// exactly what it set.
+    #[test]
+    fn test_profile_standalone_fills_unset_fields() {
+        let (mut config, matches) =
+            ServerConfig::parse_from_with_matches(["moon", "--profile", "standalone"]);
+        let outcome = config.apply_profile(&matches).expect("known profile");
+        assert_eq!(config.shards, 1);
+        assert_eq!(config.io_busy_poll_us, 40);
+        assert_eq!(config.io_driver, "epoll");
+        match outcome {
+            ProfileOutcome::Applied { profile, fields } => {
+                assert_eq!(profile, "standalone");
+                assert!(!fields.is_empty(), "must report what it set");
+            }
+            ProfileOutcome::None => panic!("expected Applied outcome"),
+        }
+    }
+
+    /// An explicitly-passed flag ALWAYS overrides the profile's value — the
+    /// profile only fills fields left at their default.
+    #[test]
+    fn test_profile_standalone_explicit_flag_wins() {
+        let (mut config, matches) = ServerConfig::parse_from_with_matches([
+            "moon",
+            "--profile",
+            "standalone",
+            "--shards",
+            "4",
+            "--io-busy-poll-us",
+            "0",
+        ]);
+        config.apply_profile(&matches).expect("known profile");
+        assert_eq!(config.shards, 4, "explicit --shards must beat the profile");
+        assert_eq!(
+            config.io_busy_poll_us, 0,
+            "explicit --io-busy-poll-us must beat the profile"
+        );
+        // io_driver was NOT passed explicitly, so the profile still fills it.
+        assert_eq!(config.io_driver, "epoll");
+    }
+
+    /// No `--profile` flag → no-op, `ProfileOutcome::None`.
+    #[test]
+    fn test_profile_absent_is_noop() {
+        let (mut config, matches) = ServerConfig::parse_from_with_matches::<[&str; 0], &str>([]);
+        let outcome = config.apply_profile(&matches).expect("no profile is Ok");
+        assert_eq!(outcome, ProfileOutcome::None);
+        assert_eq!(config.shards, 1, "unmodified default");
+        assert_eq!(config.io_busy_poll_us, 0, "unmodified default");
+    }
+
+    /// Unknown profile name is a clear startup error, not a silent no-op.
+    #[test]
+    fn test_profile_unknown_name_errors() {
+        let (mut config, matches) =
+            ServerConfig::parse_from_with_matches(["moon", "--profile", "bogus"]);
+        let err = config
+            .apply_profile(&matches)
+            .expect_err("unknown profile must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("bogus"),
+            "error must name the offending profile: {msg}"
+        );
     }
 
     #[test]
