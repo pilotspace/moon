@@ -1816,6 +1816,7 @@ pub async fn scatter_vector_search(
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
     spsc_notifiers: &[Arc<channel::Notify>],
     vector_store: &mut crate::vector::store::VectorStore,
+    db_index: u8,
 ) -> Frame {
     let mut receivers = Vec::with_capacity(num_shards);
     let mut local_result: Option<Frame> = None;
@@ -1825,6 +1826,7 @@ pub async fn scatter_vector_search(
             // Execute locally -- avoid SPSC overhead for local shard.
             // Phase 171 SCAT-01: thread as_of_lsn through the local branch so
             // the coordinator honors temporal filtering on its own shard too.
+            // WS5a: db_index scopes index visibility on this shard too.
             local_result = Some(crate::command::vector_search::search_local_filtered(
                 vector_store,
                 &index_name,
@@ -1835,6 +1837,7 @@ pub async fn scatter_vector_search(
                 usize::MAX,
                 None,
                 as_of_lsn,
+                db_index,
             ));
         } else {
             let (reply_tx, reply_rx) = channel::oneshot();
@@ -1845,6 +1848,7 @@ pub async fn scatter_vector_search(
                     k,
                     as_of_lsn,
                     reply_tx,
+                    db_index,
                 }));
             let _ = spsc_send(dispatch_tx, my_shard, shard_id, msg, spsc_notifiers).await;
             receivers.push(reply_rx);
@@ -1889,12 +1893,14 @@ pub async fn scatter_vector_search_remote(
     shard_databases: &Arc<crate::shard::shared_databases::ShardDatabases>,
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
     spsc_notifiers: &[Arc<channel::Notify>],
+    db_index: u8,
 ) -> Frame {
     let _ = shard_databases; // E2 removes
     // LOCAL: direct vector store access (avoids SPSC self-send).
     // Phase 171 SCAT-01: honor AS_OF on the coordinator's own shard by
     // routing through `search_local_filtered` with the resolved LSN rather
-    // than the AS_OF-unaware `search_local` helper.
+    // than the AS_OF-unaware `search_local` helper. WS5a: db_index scopes
+    // index visibility here too.
     let local_result = crate::shard::slice::with_shard(|s| {
         crate::command::vector_search::search_local_filtered(
             &mut s.vector_store,
@@ -1906,6 +1912,7 @@ pub async fn scatter_vector_search_remote(
             usize::MAX,
             None,
             as_of_lsn,
+            db_index,
         )
     });
 
@@ -1923,6 +1930,7 @@ pub async fn scatter_vector_search_remote(
                 k,
                 as_of_lsn,
                 reply_tx,
+                db_index,
             }));
         let _ = spsc_send(dispatch_tx, my_shard, shard_id, msg, spsc_notifiers).await;
         receivers.push(reply_rx);
@@ -1952,6 +1960,10 @@ pub async fn scatter_vector_search_remote(
 /// Local shard: direct VectorStore access via shard_databases.
 /// Remote shards: SPSC dispatch with VectorCommand message.
 /// Single-shard (num_shards == 1): local-only, no SPSC needed.
+/// `db_index` (WS5a): the originating connection's currently-SELECTed
+/// logical db — forwarded to every remote shard via `ShardMessage::VectorCommand`
+/// so FT.CREATE tags the new index to the right db everywhere, and
+/// FT.DROPINDEX / FT.COMPACT / FT.CONFIG resolve/mutate only the caller's db.
 pub async fn broadcast_vector_command(
     command: std::sync::Arc<Frame>,
     my_shard: usize,
@@ -1959,6 +1971,7 @@ pub async fn broadcast_vector_command(
     shard_databases: &Arc<crate::shard::shared_databases::ShardDatabases>,
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
     spsc_notifiers: &[Arc<channel::Notify>],
+    db_index: u8,
 ) -> Frame {
     let _ = shard_databases; // E2 removes
     // REMOTE FIRST: send to all other shards via SPSC before local mutation.
@@ -1973,6 +1986,7 @@ pub async fn broadcast_vector_command(
         let msg = ShardMessage::VectorCommand {
             command: command.clone(),
             reply_tx,
+            db_index,
         };
         let _ = spsc_send(dispatch_tx, my_shard, target, msg, spsc_notifiers).await;
         receivers.push(reply_rx);
@@ -2016,8 +2030,11 @@ pub async fn broadcast_vector_command(
             }
             db_slice = &mut s.databases;
         }
+        // WS5a / Gap 8: use the caller's real db, not a hardcoded db 0 —
+        // FT.DROPINDEX DD deletes indexed docs from the SAME db the index
+        // is scoped to.
         let db_opt = if is_dropindex {
-            db_slice.get_mut(0)
+            db_slice.get_mut(db_index as usize)
         } else {
             None
         };
@@ -2028,6 +2045,7 @@ pub async fn broadcast_vector_command(
             Some(graph_ref),
             &command,
             db_opt,
+            db_index,
         )
     });
     local_result
@@ -2051,6 +2069,7 @@ pub async fn scatter_invalidate_range(
     shard_databases: &Arc<crate::shard::shared_databases::ShardDatabases>,
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
     spsc_notifiers: &[Arc<channel::Notify>],
+    db_index: u8,
 ) -> Frame {
     let _ = shard_databases; // E2 removes
     // PARTIAL-STATE: sends fire to all remotes in parallel, then we collect
@@ -2069,6 +2088,7 @@ pub async fn scatter_invalidate_range(
         let msg = ShardMessage::VectorCommand {
             command: command.clone(),
             reply_tx,
+            db_index,
         };
         let _ = spsc_send(dispatch_tx, my_shard, target, msg, spsc_notifiers).await;
         receivers.push(reply_rx);
@@ -2104,6 +2124,7 @@ pub async fn scatter_invalidate_range(
             Some(&s.graph_store),
             &command,
             None,
+            db_index,
         )
     });
 
@@ -2138,6 +2159,7 @@ pub async fn scatter_ft_info(
     shard_databases: &Arc<crate::shard::shared_databases::ShardDatabases>,
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
     spsc_notifiers: &[Arc<channel::Notify>],
+    db_index: u8,
 ) -> Frame {
     let _ = shard_databases;
     let mut receivers = Vec::with_capacity(num_shards.saturating_sub(1));
@@ -2149,6 +2171,7 @@ pub async fn scatter_ft_info(
         let msg = ShardMessage::VectorCommand {
             command: command.clone(),
             reply_tx,
+            db_index,
         };
         let _ = spsc_send(dispatch_tx, my_shard, target, msg, spsc_notifiers).await;
         receivers.push(reply_rx);
@@ -2174,6 +2197,7 @@ pub async fn scatter_ft_info(
             Some(&s.graph_store),
             &command,
             None,
+            db_index,
         )
     });
 

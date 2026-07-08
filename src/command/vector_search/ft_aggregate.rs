@@ -384,12 +384,14 @@ pub fn ft_aggregate(
     text_store: &TextStore,
     args: &[Frame],
     db: &Database,
+    db_index: u8,
 ) -> Frame {
     let parsed = match parse_aggregate_args(args) {
         Ok(p) => p,
         Err(e) => return e,
     };
-    let text_index = match text_store.get_index(&parsed.index_name) {
+    // WS5a: db-scoped — an index owned by a different db is invisible.
+    let text_index = match text_store.get_index_for_db(&parsed.index_name, db_index) {
         Some(ix) => ix,
         None => return Frame::Error(Bytes::from_static(b"ERR unknown index")),
     };
@@ -627,8 +629,10 @@ pub fn execute_local_full(
     query: &Bytes,
     pipeline: &[AggregateStep],
     db: &Database,
+    db_index: u8,
 ) -> Frame {
-    let text_index = match text_store.get_index(index_name) {
+    // WS5a: db-scoped — an index owned by a different db is invisible.
+    let text_index = match text_store.get_index_for_db(index_name, db_index) {
         Some(ix) => ix,
         None => return Frame::Error(Bytes::from_static(b"ERR unknown index")),
     };
@@ -1325,7 +1329,7 @@ mod tests {
             b"count",
         ]);
 
-        let resp = ft_aggregate(&mut vs, &ts, &args, &db);
+        let resp = ft_aggregate(&mut vs, &ts, &args, &db, 0);
         let items = match resp {
             Frame::Array(a) => a,
             other => panic!("expected Array, got {other:?}"),
@@ -1394,7 +1398,7 @@ mod tests {
             b"myidx", b"*", b"GROUPBY", b"0", b"REDUCE", b"SUM", b"1", b"@price", b"AS", b"total",
             b"REDUCE", b"AVG", b"1", b"@price", b"AS", b"avg",
         ]);
-        let resp = ft_aggregate(&mut vs, &ts, &args, &db);
+        let resp = ft_aggregate(&mut vs, &ts, &args, &db, 0);
         let items = match resp {
             Frame::Array(a) => a,
             other => panic!("expected Array, got {other:?}"),
@@ -1447,7 +1451,7 @@ mod tests {
             b"myidx", b"*", b"GROUPBY", b"1", b"@status", b"REDUCE", b"COUNT", b"0", b"AS",
             b"count", b"SORTBY", b"2", b"@count", b"DESC", b"LIMIT", b"0", b"3",
         ]);
-        let resp = ft_aggregate(&mut vs, &ts, &args, &db);
+        let resp = ft_aggregate(&mut vs, &ts, &args, &db, 0);
         let items = match resp {
             Frame::Array(a) => a,
             other => panic!("expected Array, got {other:?}"),
@@ -1504,7 +1508,7 @@ mod tests {
             b"AS",
             b"distinct_users",
         ]);
-        let resp = ft_aggregate(&mut vs, &ts, &args, &db);
+        let resp = ft_aggregate(&mut vs, &ts, &args, &db, 0);
         let items = match resp {
             Frame::Array(a) => a,
             other => panic!("expected Array, got {other:?}"),
@@ -1533,7 +1537,7 @@ mod tests {
         let ts = TextStore::new();
         let db = Database::new();
         let args = args_from(&[b"no_such_idx", b"*"]);
-        match ft_aggregate(&mut vs, &ts, &args, &db) {
+        match ft_aggregate(&mut vs, &ts, &args, &db, 0) {
             Frame::Error(msg) => {
                 let s = std::str::from_utf8(&msg).unwrap();
                 assert!(s.contains("unknown index"), "got: {s}");
@@ -1553,7 +1557,7 @@ mod tests {
         ts.create_index(Bytes::from_static(b"myidx"), idx).unwrap();
 
         let args = args_from(&[b"myidx", b"*"]);
-        let resp = ft_aggregate(&mut vs, &ts, &args, &db);
+        let resp = ft_aggregate(&mut vs, &ts, &args, &db, 0);
         let items = match resp {
             Frame::Array(a) => a,
             other => panic!("expected Array, got {other:?}"),
@@ -1582,7 +1586,7 @@ mod tests {
             b"myidx", b"*", b"GROUPBY", b"1", b"@status", b"REDUCE", b"COUNT", b"0", b"AS",
             b"count", b"LIMIT", b"10", b"5",
         ]);
-        let resp = ft_aggregate(&mut vs, &ts, &args, &db);
+        let resp = ft_aggregate(&mut vs, &ts, &args, &db, 0);
         let items = match resp {
             Frame::Array(a) => a,
             other => panic!("expected Array, got {other:?}"),
@@ -1618,7 +1622,7 @@ mod tests {
             b"myidx", b"*", b"GROUPBY", b"1", b"@status", b"REDUCE", b"COUNT", b"0", b"AS",
             b"count", b"SORTBY", b"1", b"@status",
         ]);
-        let resp = ft_aggregate(&mut vs, &ts, &args, &db);
+        let resp = ft_aggregate(&mut vs, &ts, &args, &db, 0);
         let items = match resp {
             Frame::Array(a) => a,
             other => panic!("expected Array, got {other:?}"),
@@ -1665,7 +1669,7 @@ mod tests {
             b"myidx", b"*", b"GROUPBY", b"1", b"@status", b"REDUCE", b"COUNT", b"0", b"AS",
             b"count",
         ]);
-        let expected = ft_aggregate(&mut vs, &ts, &raw_args, &db);
+        let expected = ft_aggregate(&mut vs, &ts, &raw_args, &db, 0);
         let parsed = parse_aggregate_args(&raw_args).expect("parse ok");
 
         let actual = execute_local_full(
@@ -1675,6 +1679,7 @@ mod tests {
             &parsed.query,
             &parsed.pipeline,
             &db,
+            0,
         );
 
         // Compare the two Frames by content, not raw formatted order —

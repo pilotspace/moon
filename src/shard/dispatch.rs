@@ -307,6 +307,9 @@ pub struct VectorSearchPayload {
     pub k: usize,
     pub as_of_lsn: u64,
     pub reply_tx: channel::OneshotSender<Frame>,
+    /// WS5a: the originating connection's currently-SELECTed logical db —
+    /// forwarded so the remote shard resolves the index scoped to the RIGHT db.
+    pub db_index: u8,
 }
 
 /// Boxed payload for `ShardMessage::BlockRegister` (Phase 177, hot-path split).
@@ -525,6 +528,10 @@ pub enum ShardMessage {
     VectorCommand {
         command: std::sync::Arc<Frame>,
         reply_tx: channel::OneshotSender<Frame>,
+        /// WS5a: the originating connection's currently-SELECTed logical db —
+        /// forwarded so the remote shard resolves/creates/lists indexes
+        /// scoped to the RIGHT db instead of always db 0.
+        db_index: u8,
     },
     /// FT.AGGREGATE phase 1: execute pipeline UP TO post-GROUPBY on this shard
     /// and ship the resulting `ShardPartial` back for coordinator-side merge

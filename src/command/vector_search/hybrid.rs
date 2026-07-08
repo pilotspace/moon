@@ -361,6 +361,7 @@ pub fn execute_hybrid_search_local(
     text_store: &TextStore,
     query: &HybridQuery,
     as_of_lsn: u64,
+    db_index: u8,
 ) -> Frame {
     let k_per_stream = query.effective_k_per_stream();
 
@@ -378,7 +379,8 @@ pub fn execute_hybrid_search_local(
     // on TextIndex (src/text/store.rs) filters post-snapshot rows before RRF
     // fusion. Lunaris SDK no longer needs the client-side RRF fallback
     // documented in LUNARIS-CYPHER-GAPS.md §V2 for AS_OF workloads.
-    let text_index = match text_store.get_index(query.index_name.as_ref()) {
+    // WS5a: db-scoped — an index owned by a different db is invisible.
+    let text_index = match text_store.get_index_for_db(query.index_name.as_ref(), db_index) {
         Some(ix) => ix,
         None => return Frame::Error(Bytes::from_static(b"ERR unknown index")),
     };
@@ -414,7 +416,8 @@ pub fn execute_hybrid_search_local(
         );
 
     // ── Stream 2: Dense KNN (per D-11 — existing KNN against the vector index) ─
-    let idx = match vector_store.get_index_mut(query.index_name.as_ref()) {
+    // WS5a: db-scoped.
+    let idx = match vector_store.get_index_mut_for_db(query.index_name.as_ref(), db_index) {
         Some(ix) => ix,
         None => return Frame::Error(Bytes::from_static(b"ERR unknown index")),
     };
@@ -1211,7 +1214,7 @@ mod tests {
             count: 10,
             filter: None,
         };
-        let result = execute_hybrid_search_local(&mut vs, &ts, &query, 0);
+        let result = execute_hybrid_search_local(&mut vs, &ts, &query, 0, 0);
         match result {
             Frame::Error(msg) => {
                 let s = std::str::from_utf8(&msg).unwrap();

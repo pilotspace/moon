@@ -40,6 +40,13 @@ use crate::text::aggregate::{AggregateStep, ShardPartial, execute_pipeline, merg
 ///    shard and runs `execute_local_partial` locally (no SPSC self-send).
 /// 3. Collects `ShardPartial`s, merges associatively, applies global
 ///    SORTBY + LIMIT per D-07, and serialises the final rows.
+///
+/// `db_index` (WS5a): the connection's currently-SELECTed logical db —
+/// scopes index visibility on both the single-shard fast path and the
+/// local leg of the multi-shard scatter below, and also selects the
+/// correct per-db hash store to materialise `@field` values from (this
+/// fixes a pre-existing bug where both paths always read `databases[0]`
+/// regardless of the caller's SELECTed db).
 pub async fn scatter_text_aggregate(
     index_name: Bytes,
     query: Bytes,
@@ -49,17 +56,20 @@ pub async fn scatter_text_aggregate(
     shard_databases: &Arc<ShardDatabases>,
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
     spsc_notifiers: &[Arc<channel::Notify>],
+    db_index: u8,
 ) -> Frame {
     let _ = shard_databases; // E2 removes
     // ─── Single-shard fast path ───────────────────────────────────────────
     if num_shards == 1 {
         let result = crate::shard::slice::with_shard(|s| {
             // Every shard slice is constructed with at least one database
-            // (db 0); see Shard::new in src/shard/mod.rs.
+            // (db 0); see Shard::new in src/shard/mod.rs. Fall back to db 0
+            // defensively if `db_index` somehow exceeds the configured count.
             #[allow(clippy::expect_used)]
             let db = s
                 .databases
-                .first()
+                .get(db_index as usize)
+                .or_else(|| s.databases.first())
                 .expect("shard slice must have at least db 0");
             crate::command::vector_search::ft_aggregate::execute_local_full(
                 &mut s.vector_store,
@@ -68,6 +78,7 @@ pub async fn scatter_text_aggregate(
                 &query,
                 &pipeline,
                 db,
+                db_index,
             )
         });
         return result;

@@ -295,7 +295,12 @@ fn test_ft_create_parse_full_syntax() {
     let _metrics_guard = METRICS_LOCK.read();
     let mut store = VectorStore::new();
     let args = ft_create_args();
-    let result = ft_create(&mut store, &mut crate::text::store::TextStore::new(), &args);
+    let result = ft_create(
+        &mut store,
+        &mut crate::text::store::TextStore::new(),
+        &args,
+        0,
+    );
     match &result {
         Frame::SimpleString(s) => assert_eq!(&s[..], b"OK"),
         other => panic!("expected OK, got {other:?}"),
@@ -330,7 +335,12 @@ fn test_ft_create_missing_dim() {
         bulk(b"DISTANCE_METRIC"),
         bulk(b"L2"),
     ];
-    let result = ft_create(&mut store, &mut crate::text::store::TextStore::new(), &args);
+    let result = ft_create(
+        &mut store,
+        &mut crate::text::store::TextStore::new(),
+        &args,
+        0,
+    );
     match &result {
         Frame::Error(_) => {} // expected
         other => panic!("expected error, got {other:?}"),
@@ -342,7 +352,12 @@ fn test_ft_create_duplicate() {
     let _metrics_guard = METRICS_LOCK.read();
     let mut store = VectorStore::new();
     let args = ft_create_args();
-    let r1 = ft_create(&mut store, &mut crate::text::store::TextStore::new(), &args);
+    let r1 = ft_create(
+        &mut store,
+        &mut crate::text::store::TextStore::new(),
+        &args,
+        0,
+    );
     assert!(matches!(r1, Frame::SimpleString(_)));
 
     let args2 = ft_create_args();
@@ -350,6 +365,7 @@ fn test_ft_create_duplicate() {
         &mut store,
         &mut crate::text::store::TextStore::new(),
         &args2,
+        0,
     );
     match &r2 {
         Frame::Error(e) => assert!(e.starts_with(b"ERR")),
@@ -362,7 +378,12 @@ fn test_ft_dropindex() {
     let _metrics_guard = METRICS_LOCK.read();
     let mut store = VectorStore::new();
     let args = ft_create_args();
-    ft_create(&mut store, &mut crate::text::store::TextStore::new(), &args);
+    ft_create(
+        &mut store,
+        &mut crate::text::store::TextStore::new(),
+        &args,
+        0,
+    );
 
     // Drop existing (no DD flag, no db needed)
     let result = ft_dropindex(
@@ -370,6 +391,7 @@ fn test_ft_dropindex() {
         &mut crate::text::store::TextStore::new(),
         None,
         &[bulk(b"myidx")],
+        0,
     );
     assert!(matches!(result, Frame::SimpleString(_)));
     assert!(store.is_empty());
@@ -380,6 +402,7 @@ fn test_ft_dropindex() {
         &mut crate::text::store::TextStore::new(),
         None,
         &[bulk(b"myidx")],
+        0,
     );
     assert!(matches!(result, Frame::Error(_)));
 }
@@ -525,7 +548,12 @@ fn test_ft_search_dimension_mismatch() {
     let _metrics_guard = METRICS_LOCK.read();
     let mut store = VectorStore::new();
     let args = ft_create_args();
-    ft_create(&mut store, &mut crate::text::store::TextStore::new(), &args);
+    ft_create(
+        &mut store,
+        &mut crate::text::store::TextStore::new(),
+        &args,
+        0,
+    );
 
     // Build a query with wrong dimension (4 bytes instead of 128*4)
     let search_args = vec![
@@ -536,7 +564,7 @@ fn test_ft_search_dimension_mismatch() {
         bulk(b"query"),
         bulk(b"tooshort"),
     ];
-    let result = ft_search(&mut store, &search_args, None, None, 0);
+    let result = ft_search(&mut store, &search_args, None, None, 0, 0);
     match &result {
         Frame::Error(e) => assert!(
             e.starts_with(b"ERR query vector dimension"),
@@ -552,7 +580,12 @@ fn test_ft_search_empty_index() {
     let _metrics_guard = METRICS_LOCK.read();
     let mut store = VectorStore::new();
     let args = ft_create_args();
-    ft_create(&mut store, &mut crate::text::store::TextStore::new(), &args);
+    ft_create(
+        &mut store,
+        &mut crate::text::store::TextStore::new(),
+        &args,
+        0,
+    );
 
     // Build valid query for dim=128
     let query_vec: Vec<u8> = vec![0u8; 128 * 4]; // 128 floats, all zero
@@ -565,7 +598,7 @@ fn test_ft_search_empty_index() {
         Frame::BulkString(Bytes::from(query_vec)),
     ];
     crate::vector::distance::init();
-    let result = ft_search(&mut store, &search_args, None, None, 0);
+    let result = ft_search(&mut store, &search_args, None, None, 0, 0);
     match result {
         Frame::Array(items) => {
             assert_eq!(items[0], Frame::Integer(0)); // no results
@@ -579,12 +612,18 @@ fn test_ft_info() {
     let _metrics_guard = METRICS_LOCK.read();
     let mut store = VectorStore::new();
     let args = ft_create_args();
-    ft_create(&mut store, &mut crate::text::store::TextStore::new(), &args);
+    ft_create(
+        &mut store,
+        &mut crate::text::store::TextStore::new(),
+        &args,
+        0,
+    );
 
     let result = ft_info(
         &store,
         &crate::text::store::TextStore::new(),
         &[bulk(b"myidx")],
+        0,
     );
     match result {
         Frame::Array(items) => {
@@ -617,6 +656,7 @@ fn test_ft_info() {
         &store,
         &crate::text::store::TextStore::new(),
         &[bulk(b"nonexistent")],
+        0,
     );
     assert!(matches!(result, Frame::Error(_)));
 }
@@ -665,6 +705,7 @@ fn test_end_to_end_create_insert_search() {
         &mut store,
         &mut crate::text::store::TextStore::new(),
         &create_args,
+        0,
     );
     assert!(
         matches!(result, Frame::SimpleString(_)),
@@ -700,7 +741,7 @@ fn test_end_to_end_create_insert_search() {
         Frame::BulkString(Bytes::from(query_blob)),
     ];
 
-    let result = ft_search(&mut store, &search_args, None, None, 0);
+    let result = ft_search(&mut store, &search_args, None, None, 0, 0);
     match &result {
         Frame::Array(items) => {
             // First element is count
@@ -746,10 +787,15 @@ fn test_ft_info_returns_correct_data() {
     let _metrics_guard = METRICS_LOCK.read();
     let mut store = VectorStore::new();
     let args = build_ft_create_args("testidx", "test:", "vec", 128, "COSINE");
-    ft_create(&mut store, &mut crate::text::store::TextStore::new(), &args);
+    ft_create(
+        &mut store,
+        &mut crate::text::store::TextStore::new(),
+        &args,
+        0,
+    );
 
     let info_args = [Frame::BulkString(Bytes::from_static(b"testidx"))];
-    let result = ft_info(&store, &crate::text::store::TextStore::new(), &info_args);
+    let result = ft_info(&store, &crate::text::store::TextStore::new(), &info_args, 0);
     match result {
         Frame::Array(items) => {
             assert!(items.len() >= 6, "FT.INFO should return at least 6 items");
@@ -782,7 +828,7 @@ fn test_ft_search_unknown_index() {
         Frame::BulkString(Bytes::from_static(b"query")),
         Frame::BulkString(Bytes::from(vec![0u8; 16])),
     ];
-    let result = ft_search(&mut store, &args, None, None, 0);
+    let result = ft_search(&mut store, &args, None, None, 0, 0);
     assert!(
         matches!(result, Frame::Error(_)),
         "Should error on unknown index, got {result:?}"
@@ -902,7 +948,12 @@ fn test_ft_search_with_filter_no_regression() {
     crate::vector::distance::init();
     let mut store = VectorStore::new();
     let args = ft_create_args();
-    ft_create(&mut store, &mut crate::text::store::TextStore::new(), &args);
+    ft_create(
+        &mut store,
+        &mut crate::text::store::TextStore::new(),
+        &args,
+        0,
+    );
 
     let query_vec: Vec<u8> = vec![0u8; 128 * 4];
     let search_args = vec![
@@ -913,7 +964,7 @@ fn test_ft_search_with_filter_no_regression() {
         bulk(b"query"),
         Frame::BulkString(Bytes::from(query_vec)),
     ];
-    let result = ft_search(&mut store, &search_args, None, None, 0);
+    let result = ft_search(&mut store, &search_args, None, None, 0, 0);
     match result {
         Frame::Array(items) => {
             assert_eq!(items[0], Frame::Integer(0));
@@ -927,7 +978,12 @@ fn test_vector_index_has_payload_index() {
     let _metrics_guard = METRICS_LOCK.read();
     let mut store = VectorStore::new();
     let args = ft_create_args();
-    ft_create(&mut store, &mut crate::text::store::TextStore::new(), &args);
+    ft_create(
+        &mut store,
+        &mut crate::text::store::TextStore::new(),
+        &args,
+        0,
+    );
     let idx = store.get_index(b"myidx").unwrap();
     // payload_index should exist -- insert and evaluate should work
     let _ = &idx.payload_index;
@@ -946,7 +1002,12 @@ fn test_vector_metrics_increment_decrement() {
     // write guard excludes every lock-respecting mutator, so the delta is
     // deterministic (no concurrent ft_create/ft_dropindex can perturb it).
     let before_create = crate::vector::metrics::VECTOR_INDEXES.load(Ordering::Relaxed);
-    ft_create(&mut store, &mut crate::text::store::TextStore::new(), &args);
+    ft_create(
+        &mut store,
+        &mut crate::text::store::TextStore::new(),
+        &args,
+        0,
+    );
     let after_create = crate::vector::metrics::VECTOR_INDEXES.load(Ordering::Relaxed);
     assert_eq!(
         after_create,
@@ -966,7 +1027,7 @@ fn test_vector_metrics_increment_decrement() {
         bulk(b"query"),
         Frame::BulkString(Bytes::from(query_vec)),
     ];
-    ft_search(&mut store, &search_args, None, None, 0);
+    ft_search(&mut store, &search_args, None, None, 0, 0);
     let after_search = crate::vector::metrics::search_total();
     assert_eq!(
         after_search,
@@ -983,6 +1044,7 @@ fn test_vector_metrics_increment_decrement() {
         &mut crate::text::store::TextStore::new(),
         None,
         &[bulk(b"myidx")],
+        0,
     );
     let after_drop = crate::vector::metrics::VECTOR_INDEXES.load(Ordering::Relaxed);
     assert_eq!(
@@ -1348,7 +1410,12 @@ fn test_ft_config_autocompact_on_off() {
     let _metrics_guard = METRICS_LOCK.read();
     let mut store = VectorStore::new();
     let args = ft_create_args();
-    ft_create(&mut store, &mut crate::text::store::TextStore::new(), &args);
+    ft_create(
+        &mut store,
+        &mut crate::text::store::TextStore::new(),
+        &args,
+        0,
+    );
 
     // Default should be ON
     let get_args = vec![bulk(b"GET"), bulk(b"myidx"), bulk(b"AUTOCOMPACT")];
@@ -1356,6 +1423,7 @@ fn test_ft_config_autocompact_on_off() {
         &mut store,
         &mut crate::text::store::TextStore::new(),
         &get_args,
+        0,
     );
     match &result {
         Frame::BulkString(b) => assert_eq!(&b[..], b"ON"),
@@ -1373,6 +1441,7 @@ fn test_ft_config_autocompact_on_off() {
         &mut store,
         &mut crate::text::store::TextStore::new(),
         &set_args,
+        0,
     );
     assert!(matches!(result, Frame::SimpleString(_)));
 
@@ -1381,6 +1450,7 @@ fn test_ft_config_autocompact_on_off() {
         &mut store,
         &mut crate::text::store::TextStore::new(),
         &get_args,
+        0,
     );
     match &result {
         Frame::BulkString(b) => assert_eq!(&b[..], b"OFF"),
@@ -1398,6 +1468,7 @@ fn test_ft_config_autocompact_on_off() {
         &mut store,
         &mut crate::text::store::TextStore::new(),
         &set_args,
+        0,
     );
     assert!(matches!(result, Frame::SimpleString(_)));
 
@@ -1406,6 +1477,7 @@ fn test_ft_config_autocompact_on_off() {
         &mut store,
         &mut crate::text::store::TextStore::new(),
         &get_args,
+        0,
     );
     match &result {
         Frame::BulkString(b) => assert_eq!(&b[..], b"ON"),
@@ -1418,13 +1490,19 @@ fn test_ft_config_unknown_param() {
     let _metrics_guard = METRICS_LOCK.read();
     let mut store = VectorStore::new();
     let args = ft_create_args();
-    ft_create(&mut store, &mut crate::text::store::TextStore::new(), &args);
+    ft_create(
+        &mut store,
+        &mut crate::text::store::TextStore::new(),
+        &args,
+        0,
+    );
 
     let get_args = vec![bulk(b"GET"), bulk(b"myidx"), bulk(b"NOSUCHPARAM")];
     let result = ft_config(
         &mut store,
         &mut crate::text::store::TextStore::new(),
         &get_args,
+        0,
     );
     assert!(
         matches!(result, Frame::Error(_)),
@@ -1441,6 +1519,7 @@ fn test_ft_config_unknown_param() {
         &mut store,
         &mut crate::text::store::TextStore::new(),
         &set_args,
+        0,
     );
     assert!(
         matches!(result, Frame::Error(_)),
@@ -1457,6 +1536,7 @@ fn test_ft_config_unknown_index() {
         &mut store,
         &mut crate::text::store::TextStore::new(),
         &get_args,
+        0,
     );
     assert!(
         matches!(result, Frame::Error(_)),
@@ -1492,7 +1572,7 @@ fn test_insert_path_triggers_background_compact_without_search() {
         bulk(b"COMPACT_THRESHOLD"),
         bulk(b"100"),
     ];
-    let result = ft_create(&mut store, &mut text, &args);
+    let result = ft_create(&mut store, &mut text, &args, 0);
     assert!(matches!(result, Frame::SimpleString(_)), "{result:?}");
 
     let hset = |store: &mut VectorStore, text: &mut _, i: usize| {
@@ -1539,7 +1619,12 @@ fn test_ft_config_autocompact_guards_try_compact() {
     let _metrics_guard = METRICS_LOCK.read();
     let mut store = VectorStore::new();
     let args = ft_create_args();
-    ft_create(&mut store, &mut crate::text::store::TextStore::new(), &args);
+    ft_create(
+        &mut store,
+        &mut crate::text::store::TextStore::new(),
+        &args,
+        0,
+    );
 
     // Disable autocompact
     let set_args = vec![
@@ -1552,6 +1637,7 @@ fn test_ft_config_autocompact_guards_try_compact() {
         &mut store,
         &mut crate::text::store::TextStore::new(),
         &set_args,
+        0,
     );
 
     // Verify the flag is set correctly on the index
@@ -1569,6 +1655,7 @@ fn test_ft_config_autocompact_guards_try_compact() {
         &mut store,
         &mut crate::text::store::TextStore::new(),
         &set_args,
+        0,
     );
     let idx = store.get_index(b"myidx").unwrap();
     assert!(idx.autocompact_enabled, "autocompact should be enabled");
@@ -1579,7 +1666,12 @@ fn test_ft_config_autocompact_accepts_variants() {
     let _metrics_guard = METRICS_LOCK.read();
     let mut store = VectorStore::new();
     let args = ft_create_args();
-    ft_create(&mut store, &mut crate::text::store::TextStore::new(), &args);
+    ft_create(
+        &mut store,
+        &mut crate::text::store::TextStore::new(),
+        &args,
+        0,
+    );
 
     // Test "0" and "1"
     let set_args = vec![
@@ -1592,6 +1684,7 @@ fn test_ft_config_autocompact_accepts_variants() {
         &mut store,
         &mut crate::text::store::TextStore::new(),
         &set_args,
+        0,
     );
     assert!(matches!(result, Frame::SimpleString(_)));
     let idx = store.get_index(b"myidx").unwrap();
@@ -1607,6 +1700,7 @@ fn test_ft_config_autocompact_accepts_variants() {
         &mut store,
         &mut crate::text::store::TextStore::new(),
         &set_args,
+        0,
     );
     assert!(matches!(result, Frame::SimpleString(_)));
     let idx = store.get_index(b"myidx").unwrap();
@@ -1623,6 +1717,7 @@ fn test_ft_config_autocompact_accepts_variants() {
         &mut store,
         &mut crate::text::store::TextStore::new(),
         &set_args,
+        0,
     );
     assert!(matches!(result, Frame::SimpleString(_)));
     let idx = store.get_index(b"myidx").unwrap();
@@ -1639,6 +1734,7 @@ fn test_ft_config_autocompact_accepts_variants() {
         &mut store,
         &mut crate::text::store::TextStore::new(),
         &set_args,
+        0,
     );
     assert!(matches!(result, Frame::Error(_)));
 }
@@ -2021,10 +2117,11 @@ mod cache_search_tests {
             &mut store,
             &mut crate::text::store::TextStore::new(),
             &create_args,
+            0,
         );
 
         let args = make_valid_cachesearch_args();
-        let result = cache_search::ft_cachesearch(&mut store, &args);
+        let result = cache_search::ft_cachesearch(&mut store, &args, 0);
 
         // Should return cache miss with cache_hit: "false" (empty results)
         match &result {
@@ -2047,7 +2144,7 @@ mod cache_search_tests {
         let mut store = VectorStore::new();
         // Don't create any index
         let args = make_valid_cachesearch_args();
-        let result = cache_search::ft_cachesearch(&mut store, &args);
+        let result = cache_search::ft_cachesearch(&mut store, &args, 0);
         match &result {
             Frame::Error(e) => assert!(
                 e.starts_with(b"Unknown Index") || e.starts_with(b"ERR"),
@@ -2308,7 +2405,12 @@ fn test_ft_create_multi_field() {
     let _metrics_guard = METRICS_LOCK.read();
     let mut store = VectorStore::new();
     let args = ft_create_multi_field_args();
-    let result = ft_create(&mut store, &mut crate::text::store::TextStore::new(), &args);
+    let result = ft_create(
+        &mut store,
+        &mut crate::text::store::TextStore::new(),
+        &args,
+        0,
+    );
     match &result {
         Frame::SimpleString(s) => assert_eq!(&s[..], b"OK"),
         other => panic!("expected OK, got {other:?}"),
@@ -2363,7 +2465,12 @@ fn test_ft_create_duplicate_field_rejected() {
         bulk(b"DISTANCE_METRIC"),
         bulk(b"COSINE"),
     ];
-    let result = ft_create(&mut store, &mut crate::text::store::TextStore::new(), &args);
+    let result = ft_create(
+        &mut store,
+        &mut crate::text::store::TextStore::new(),
+        &args,
+        0,
+    );
     match &result {
         Frame::Error(e) => assert!(
             e.starts_with(b"ERR duplicate"),
@@ -2401,7 +2508,12 @@ fn test_ft_create_exceeds_max_fields() {
         args.push(bulk(b"DISTANCE_METRIC"));
         args.push(bulk(b"L2"));
     }
-    let result = ft_create(&mut store, &mut crate::text::store::TextStore::new(), &args);
+    let result = ft_create(
+        &mut store,
+        &mut crate::text::store::TextStore::new(),
+        &args,
+        0,
+    );
     match &result {
         Frame::Error(e) => assert!(
             e.starts_with(b"ERR too many"),
@@ -2417,12 +2529,18 @@ fn test_ft_info_multi_field() {
     let _metrics_guard = METRICS_LOCK.read();
     let mut store = VectorStore::new();
     let args = ft_create_multi_field_args();
-    ft_create(&mut store, &mut crate::text::store::TextStore::new(), &args);
+    ft_create(
+        &mut store,
+        &mut crate::text::store::TextStore::new(),
+        &args,
+        0,
+    );
 
     let result = ft_info(
         &store,
         &crate::text::store::TextStore::new(),
         &[bulk(b"multiidx")],
+        0,
     );
     match result {
         Frame::Array(items) => {
@@ -2482,7 +2600,12 @@ fn test_ft_search_field_targeting() {
 
     let mut store = VectorStore::new();
     let args = ft_create_multi_field_args();
-    ft_create(&mut store, &mut crate::text::store::TextStore::new(), &args);
+    ft_create(
+        &mut store,
+        &mut crate::text::store::TextStore::new(),
+        &args,
+        0,
+    );
 
     // Insert vectors into the default (title_vec) field (dim=4)
     let idx = store.get_index_mut(b"multiidx").unwrap();
@@ -2522,7 +2645,7 @@ fn test_ft_search_field_targeting() {
         bulk(b"query"),
         Frame::BulkString(Bytes::from(query_vec_4)),
     ];
-    let result = ft_search(&mut store, &search_args, None, None, 0);
+    let result = ft_search(&mut store, &search_args, None, None, 0, 0);
     match &result {
         Frame::Array(items) => {
             assert!(
@@ -2547,7 +2670,7 @@ fn test_ft_search_field_targeting() {
         bulk(b"query"),
         Frame::BulkString(Bytes::from(query_vec_8)),
     ];
-    let result = ft_search(&mut store, &search_args, None, None, 0);
+    let result = ft_search(&mut store, &search_args, None, None, 0, 0);
     match &result {
         Frame::Array(items) => {
             assert!(
@@ -2572,7 +2695,7 @@ fn test_ft_search_field_targeting() {
         bulk(b"query"),
         Frame::BulkString(Bytes::from(wrong_dim)),
     ];
-    let result = ft_search(&mut store, &search_args, None, None, 0);
+    let result = ft_search(&mut store, &search_args, None, None, 0, 0);
     assert!(
         matches!(&result, Frame::Error(_)),
         "expected dimension mismatch error for body_vec, got {result:?}"
@@ -2587,7 +2710,12 @@ fn test_ft_search_default_field_compat() {
     let mut store = VectorStore::new();
     // Single-field index
     let args = build_ft_create_args("singleidx", "doc:", "vec", 4, "L2");
-    ft_create(&mut store, &mut crate::text::store::TextStore::new(), &args);
+    ft_create(
+        &mut store,
+        &mut crate::text::store::TextStore::new(),
+        &args,
+        0,
+    );
 
     let idx = store.get_index_mut(b"singleidx").unwrap();
     let vectors: Vec<[f32; 4]> = vec![[1.0, 0.0, 0.0, 0.0]];
@@ -2613,7 +2741,7 @@ fn test_ft_search_default_field_compat() {
         bulk(b"query"),
         Frame::BulkString(Bytes::from(query_vec)),
     ];
-    let result = ft_search(&mut store, &search_args, None, None, 0);
+    let result = ft_search(&mut store, &search_args, None, None, 0, 0);
     match &result {
         Frame::Array(items) => {
             assert!(
@@ -2631,7 +2759,12 @@ fn test_ft_search_unknown_field_error() {
     let _metrics_guard = METRICS_LOCK.read();
     let mut store = VectorStore::new();
     let args = ft_create_args();
-    ft_create(&mut store, &mut crate::text::store::TextStore::new(), &args);
+    ft_create(
+        &mut store,
+        &mut crate::text::store::TextStore::new(),
+        &args,
+        0,
+    );
 
     let query_vec: Vec<u8> = vec![0u8; 128 * 4];
     let search_args = vec![
@@ -2643,7 +2776,7 @@ fn test_ft_search_unknown_field_error() {
         Frame::BulkString(Bytes::from(query_vec)),
     ];
     crate::vector::distance::init();
-    let result = ft_search(&mut store, &search_args, None, None, 0);
+    let result = ft_search(&mut store, &search_args, None, None, 0, 0);
     match &result {
         Frame::Error(e) => assert!(
             e.starts_with(b"ERR unknown vector field"),
@@ -2901,7 +3034,12 @@ fn test_hybrid_search_basic() {
 
     let mut store = VectorStore::new();
     let args = ft_create_hybrid_args();
-    let result = ft_create(&mut store, &mut crate::text::store::TextStore::new(), &args);
+    let result = ft_create(
+        &mut store,
+        &mut crate::text::store::TextStore::new(),
+        &args,
+        0,
+    );
     assert!(
         matches!(result, Frame::SimpleString(_)),
         "create failed: {result:?}"
@@ -2948,7 +3086,7 @@ fn test_hybrid_search_basic() {
         Frame::BulkString(Bytes::from(sparse_query)),
     ];
 
-    let result = ft_search(&mut store, &search_args, None, None, 0);
+    let result = ft_search(&mut store, &search_args, None, None, 0, 0);
     match &result {
         Frame::Array(items) => {
             let total = match &items[0] {
@@ -2983,7 +3121,12 @@ fn test_hybrid_search_sparse_only() {
 
     let mut store = VectorStore::new();
     let args = ft_create_hybrid_args();
-    ft_create(&mut store, &mut crate::text::store::TextStore::new(), &args);
+    ft_create(
+        &mut store,
+        &mut crate::text::store::TextStore::new(),
+        &args,
+        0,
+    );
 
     insert_hybrid_doc(&mut store, b"doc:1", &[1.0, 0.0, 0.0, 0.0], &[(0, 1.0)]);
     insert_hybrid_doc(&mut store, b"doc:2", &[0.0, 1.0, 0.0, 0.0], &[(0, 0.5)]);
@@ -3003,7 +3146,7 @@ fn test_hybrid_search_sparse_only() {
         Frame::BulkString(Bytes::from(sparse_query)),
     ];
 
-    let result = ft_search(&mut store, &search_args, None, None, 0);
+    let result = ft_search(&mut store, &search_args, None, None, 0, 0);
     match &result {
         Frame::Array(items) => {
             let total = match &items[0] {
@@ -3029,7 +3172,12 @@ fn test_hybrid_search_dense_only_backward_compat() {
 
     let mut store = VectorStore::new();
     let args = ft_create_args(); // standard index, no SPARSE field
-    ft_create(&mut store, &mut crate::text::store::TextStore::new(), &args);
+    ft_create(
+        &mut store,
+        &mut crate::text::store::TextStore::new(),
+        &args,
+        0,
+    );
 
     // Standard dense-only search (no SPARSE clause) -- should work as before
     let query_vec: Vec<u8> = vec![0u8; 128 * 4];
@@ -3041,7 +3189,7 @@ fn test_hybrid_search_dense_only_backward_compat() {
         bulk(b"query"),
         Frame::BulkString(Bytes::from(query_vec)),
     ];
-    let result = ft_search(&mut store, &search_args, None, None, 0);
+    let result = ft_search(&mut store, &search_args, None, None, 0, 0);
     match &result {
         Frame::Array(items) => {
             assert_eq!(items[0], Frame::Integer(0)); // empty index
@@ -3059,7 +3207,12 @@ fn test_hybrid_search_hit_counts() {
 
     let mut store = VectorStore::new();
     let args = ft_create_hybrid_args();
-    ft_create(&mut store, &mut crate::text::store::TextStore::new(), &args);
+    ft_create(
+        &mut store,
+        &mut crate::text::store::TextStore::new(),
+        &args,
+        0,
+    );
 
     // Insert 5 docs
     for i in 0..5u32 {
@@ -3090,7 +3243,7 @@ fn test_hybrid_search_hit_counts() {
         Frame::BulkString(Bytes::from(sparse_query)),
     ];
 
-    let result = ft_search(&mut store, &search_args, None, None, 0);
+    let result = ft_search(&mut store, &search_args, None, None, 0, 0);
     match &result {
         Frame::Array(items) => {
             let len = items.len();
@@ -3202,6 +3355,7 @@ fn test_range_filter_l2_search() {
         &mut store,
         &mut crate::text::store::TextStore::new(),
         &create_args,
+        0,
     );
     assert!(
         matches!(result, Frame::SimpleString(_)),
@@ -3243,7 +3397,7 @@ fn test_range_filter_l2_search() {
         Frame::BulkString(Bytes::from(query_blob.clone())),
     ];
 
-    let result = ft_search(&mut store, &search_args, None, None, 0);
+    let result = ft_search(&mut store, &search_args, None, None, 0, 0);
     match &result {
         Frame::Array(items) => {
             let count = match &items[0] {
@@ -3282,7 +3436,7 @@ fn test_range_filter_l2_search() {
         Frame::BulkString(Bytes::from(query_blob)),
     ];
 
-    let result = ft_search(&mut store, &search_args_zero, None, None, 0);
+    let result = ft_search(&mut store, &search_args_zero, None, None, 0, 0);
     match &result {
         Frame::Array(items) => {
             let count = match &items[0] {
@@ -3309,7 +3463,7 @@ fn test_range_filter_l2_search() {
 fn test_recommend_no_db() {
     let mut store = VectorStore::new();
     let args = vec![bulk(b"myidx"), bulk(b"POSITIVE"), bulk(b"doc:1")];
-    let result = recommend::ft_recommend(&mut store, &args, None);
+    let result = recommend::ft_recommend(&mut store, &args, None, 0);
     match result {
         Frame::Error(e) => {
             assert!(
@@ -3332,7 +3486,7 @@ fn test_recommend_missing_positive_keyword() {
         bulk(b"doc:1"), // missing POSITIVE keyword
         bulk(b"doc:2"),
     ];
-    let result = recommend::ft_recommend(&mut store, &args, Some(&mut db));
+    let result = recommend::ft_recommend(&mut store, &args, Some(&mut db), 0);
     match result {
         Frame::Error(e) => {
             assert!(
@@ -3350,7 +3504,7 @@ fn test_recommend_unknown_index() {
     let mut store = VectorStore::new();
     let mut db = crate::storage::db::Database::new();
     let args = vec![bulk(b"nonexistent"), bulk(b"POSITIVE"), bulk(b"doc:1")];
-    let result = recommend::ft_recommend(&mut store, &args, Some(&mut db));
+    let result = recommend::ft_recommend(&mut store, &args, Some(&mut db), 0);
     match result {
         Frame::Error(e) => {
             assert!(
@@ -3374,12 +3528,13 @@ fn test_recommend_missing_key_vectors() {
         &mut store,
         &mut crate::text::store::TextStore::new(),
         &create_args,
+        0,
     );
 
     let mut db = crate::storage::db::Database::new();
     // doc:1 does NOT exist in db -- so no vectors can be read
     let args = vec![bulk(b"recidx"), bulk(b"POSITIVE"), bulk(b"doc:1")];
-    let result = recommend::ft_recommend(&mut store, &args, Some(&mut db));
+    let result = recommend::ft_recommend(&mut store, &args, Some(&mut db), 0);
     match result {
         Frame::Error(e) => {
             assert!(
@@ -3404,6 +3559,7 @@ fn test_recommend_basic_with_vectors() {
         &mut store,
         &mut crate::text::store::TextStore::new(),
         &create_args,
+        0,
     );
 
     // Insert 5 vectors into the index
@@ -3449,7 +3605,7 @@ fn test_recommend_basic_with_vectors() {
         bulk(b"K"),
         bulk(b"3"),
     ];
-    let result = recommend::ft_recommend(&mut store, &args, Some(&mut db));
+    let result = recommend::ft_recommend(&mut store, &args, Some(&mut db), 0);
     match &result {
         Frame::Array(items) => {
             let count = match &items[0] {
@@ -3491,7 +3647,7 @@ mod ft_navigate_tests {
             bulk(b"v"),
             bulk(b"blob"),
         ];
-        let result = navigate::ft_navigate(&mut store, None, &args, None);
+        let result = navigate::ft_navigate(&mut store, None, &args, None, 0);
         match result {
             Frame::Error(e) => {
                 assert!(
@@ -3509,7 +3665,7 @@ mod ft_navigate_tests {
         let mut store = VectorStore::new();
         let gs = crate::graph::store::GraphStore::new();
         let args = vec![bulk(b"myidx"), bulk(b"*=>[KNN 10 @vec $v]")];
-        let result = navigate::ft_navigate(&mut store, Some(&gs), &args, None);
+        let result = navigate::ft_navigate(&mut store, Some(&gs), &args, None, 0);
         match result {
             Frame::Error(e) => {
                 assert!(
@@ -3534,7 +3690,7 @@ mod ft_navigate_tests {
             bulk(b"v"),
             bulk(b"blob"),
         ];
-        let result = navigate::ft_navigate(&mut store, Some(&gs), &args, None);
+        let result = navigate::ft_navigate(&mut store, Some(&gs), &args, None, 0);
         match result {
             Frame::Error(e) => {
                 assert!(
@@ -3582,7 +3738,7 @@ fn test_ft_dropindex_dd_deletes_docs() {
         bulk(b"DISTANCE_METRIC"),
         bulk(b"L2"),
     ];
-    ft_create(&mut store, &mut text_store, &create_args);
+    ft_create(&mut store, &mut text_store, &create_args, 0);
 
     // Insert document into database (simulating HSET)
     let key1 = Bytes::from_static(b"dd:1");
@@ -3608,6 +3764,7 @@ fn test_ft_dropindex_dd_deletes_docs() {
         &mut text_store,
         Some(&mut db),
         &[bulk(b"ddtest"), bulk(b"DD")],
+        0,
     );
     assert!(
         matches!(result, Frame::SimpleString(_)),
@@ -3654,7 +3811,7 @@ fn test_ft_dropindex_preserves_docs() {
         bulk(b"DISTANCE_METRIC"),
         bulk(b"L2"),
     ];
-    ft_create(&mut store, &mut text_store, &create_args);
+    ft_create(&mut store, &mut text_store, &create_args, 0);
 
     // Insert document into database
     let key1 = Bytes::from_static(b"pres:1");
@@ -3667,7 +3824,13 @@ fn test_ft_dropindex_preserves_docs() {
     }
 
     // Drop index WITHOUT DD flag (using None for db since we don't need it)
-    let result = ft_dropindex(&mut store, &mut text_store, None, &[bulk(b"preservetest")]);
+    let result = ft_dropindex(
+        &mut store,
+        &mut text_store,
+        None,
+        &[bulk(b"preservetest")],
+        0,
+    );
     assert!(
         matches!(result, Frame::SimpleString(_)),
         "FT.DROPINDEX should return OK"
@@ -3710,7 +3873,7 @@ fn test_ft_dropindex_dd_case_insensitive() {
             bulk(b"DISTANCE_METRIC"),
             bulk(b"L2"),
         ];
-        ft_create(&mut store, &mut text_store, &create_args);
+        ft_create(&mut store, &mut text_store, &create_args, 0);
 
         let key = Bytes::from_static(b"c1:doc");
         db.set(key.clone(), crate::storage::entry::Entry::new_hash());
@@ -3724,6 +3887,7 @@ fn test_ft_dropindex_dd_case_insensitive() {
             &mut text_store,
             Some(&mut db),
             &[bulk(b"casetest1"), bulk(b"dd")], // lowercase
+            0,
         );
         assert!(
             matches!(result, Frame::SimpleString(_)),
@@ -3760,7 +3924,7 @@ fn test_ft_dropindex_dd_case_insensitive() {
             bulk(b"DISTANCE_METRIC"),
             bulk(b"L2"),
         ];
-        ft_create(&mut store, &mut text_store, &create_args);
+        ft_create(&mut store, &mut text_store, &create_args, 0);
 
         let key = Bytes::from_static(b"c2:doc");
         db.set(key.clone(), crate::storage::entry::Entry::new_hash());
@@ -3774,6 +3938,7 @@ fn test_ft_dropindex_dd_case_insensitive() {
             &mut text_store,
             Some(&mut db),
             &[bulk(b"casetest2"), bulk(b"Dd")], // mixed case
+            0,
         );
         assert!(
             matches!(result, Frame::SimpleString(_)),
@@ -3801,6 +3966,7 @@ fn test_ft_dropindex_dd_unknown_index() {
         &mut text_store,
         Some(&mut db),
         &[bulk(b"nonexistent"), bulk(b"DD")],
+        0,
     );
 
     assert!(
@@ -3832,7 +3998,7 @@ fn test_ft_dropindex_extra_args_error() {
         bulk(b"DISTANCE_METRIC"),
         bulk(b"L2"),
     ];
-    ft_create(&mut store, &mut text_store, &create_args);
+    ft_create(&mut store, &mut text_store, &create_args, 0);
 
     // Try with extra arguments beyond DD
     let result = ft_dropindex(
@@ -3840,6 +4006,7 @@ fn test_ft_dropindex_extra_args_error() {
         &mut text_store,
         None,
         &[bulk(b"extratest"), bulk(b"DD"), bulk(b"EXTRA")],
+        0,
     );
 
     assert!(

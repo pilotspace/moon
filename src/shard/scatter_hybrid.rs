@@ -53,6 +53,12 @@ use crate::vector::types::SearchResult;
 /// For `num_shards > 1`, the three-phase scatter runs DFS → raw-streams
 /// fan-out → coordinator RRF merge. All guards are dropped before any
 /// `.await` point (RESEARCH Pitfall 2).
+/// `db_index` (WS5a): the connection's currently-SELECTed logical db. Fully
+/// honored on the `num_shards == 1` fast path below (the common single-shard
+/// deployment — see CLAUDE.md's shard-scaling gotcha and v0.6.0's default
+/// `--shards 1`). The `num_shards > 1` DFS scatter branch below this does
+/// NOT yet thread `db_index` through `FtHybridPayload` to remote shards —
+/// documented known gap (`.planning/v0.6.0-release/WS5A-NOTES.md`).
 #[allow(clippy::too_many_arguments)]
 pub async fn scatter_hybrid_search(
     query: HybridQuery,
@@ -62,6 +68,7 @@ pub async fn scatter_hybrid_search(
     shard_databases: &Arc<ShardDatabases>,
     dispatch_tx: &Rc<RefCell<Vec<HeapProd<ShardMessage>>>>,
     spsc_notifiers: &[Arc<channel::Notify>],
+    db_index: u8,
 ) -> Frame {
     let _ = shard_databases; // E2 removes
     let top_k = query.top_k;
@@ -73,13 +80,14 @@ pub async fn scatter_hybrid_search(
         // the fused local path (identical to the non-HYBRID-routing code).
         // Phase 171 HYB-02 / SCAT-02: thread coordinator-resolved AS_OF LSN
         // through the single-shard fast path so callers routed here still
-        // honor temporal snapshots.
+        // honor temporal snapshots. WS5a: db_index fully honored here.
         return crate::shard::slice::with_shard(|s| {
             crate::command::vector_search::hybrid::execute_hybrid_search_local(
                 &mut s.vector_store,
                 &s.text_store,
                 &query,
                 as_of_lsn,
+                db_index,
             )
         });
     }

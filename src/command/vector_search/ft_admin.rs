@@ -18,6 +18,9 @@ use super::extract_bulk;
 /// - `text_store`: The TextStore containing text indexes
 /// - `db`: Optional database reference (required when DD flag is used)
 /// - `args`: Command arguments: `[index_name]` or `[index_name, DD]`
+/// - `db_index` (WS5a): the connection's currently-SELECTed logical db —
+///   an index owned by a different db is invisible (`Unknown Index name`),
+///   matching NOTFOUND semantics rather than "empty".
 ///
 /// # Returns
 /// - `OK` on success
@@ -27,6 +30,7 @@ pub fn ft_dropindex(
     text_store: &mut crate::text::store::TextStore,
     db: Option<&mut Database>,
     args: &[Frame],
+    db_index: u8,
 ) -> Frame {
     // Accept 1 argument (index_name) or 2 arguments (index_name DD)
     if args.is_empty() || args.len() > 2 {
@@ -51,9 +55,11 @@ pub fn ft_dropindex(
         ));
     }
 
-    // Check if index exists before attempting deletion
-    let vector_exists = store.get_index(&name).is_some();
-    let text_exists = text_store.get_index(name.as_ref()).is_some();
+    // Check if index exists before attempting deletion (db-scoped: WS5a).
+    let vector_exists = store.get_index_for_db(&name, db_index).is_some();
+    let text_exists = text_store
+        .get_index_for_db(name.as_ref(), db_index)
+        .is_some();
 
     if !vector_exists && !text_exists {
         return Frame::Error(Bytes::from_static(b"Unknown Index name"));
@@ -67,13 +73,13 @@ pub fn ft_dropindex(
 
         // Collect keys from vector index (key_hash_to_key maps hash -> original key bytes)
         let mut keys_to_delete: Vec<Bytes> = Vec::new();
-        if let Some(idx) = store.get_index(&name) {
+        if let Some(idx) = store.get_index_for_db(&name, db_index) {
             keys_to_delete.extend(idx.key_hash_to_key.values().cloned());
         }
 
         // Collect keys from text index (doc_id_to_key maps doc_id -> original key bytes)
         // Deduplicate with vector keys to avoid double-deletion
-        if let Some(idx) = text_store.get_index(name.as_ref()) {
+        if let Some(idx) = text_store.get_index_for_db(name.as_ref(), db_index) {
             for key in idx.doc_id_to_key.values() {
                 if !keys_to_delete.iter().any(|k| k == key) {
                     keys_to_delete.push(key.clone());
@@ -87,9 +93,10 @@ pub fn ft_dropindex(
         }
     }
 
-    // Drop the index metadata (existing logic)
-    let vector_dropped = store.drop_index(&name);
-    let text_dropped = text_store.drop_index(&name);
+    // Drop the index metadata (existing logic, db-scoped: WS5a — refuses to
+    // drop an index owned by a different db, matching the existence check above).
+    let vector_dropped = store.drop_index_for_db(&name, db_index);
+    let text_dropped = text_store.drop_index_for_db(&name, db_index);
 
     if vector_dropped {
         crate::vector::metrics::decrement_indexes();
@@ -118,6 +125,7 @@ pub fn ft_compact(
     store: &mut VectorStore,
     text_store: &mut crate::text::store::TextStore,
     args: &[Frame],
+    db_index: u8,
 ) -> Frame {
     if args.len() != 1 {
         return Frame::Error(Bytes::from_static(
@@ -130,7 +138,8 @@ pub fn ft_compact(
     };
 
     // Vector compaction (may be a no-op if no vector index with this name).
-    if let Some(idx) = store.get_index_mut(&name) {
+    // WS5a: db-scoped — an index owned by a different db is not compacted.
+    if let Some(idx) = store.get_index_mut_for_db(&name, db_index) {
         // FT.COMPACT is explicit user intent: compact unconditionally, ignoring threshold.
         // Without this, when compact_threshold >= mutable_len, FT.COMPACT silently no-ops,
         // leaving all vectors in brute-force mutable segment (O(n) search instead of HNSW O(log n)).
@@ -141,14 +150,18 @@ pub fn ft_compact(
     // Build FST for the text index with the same name (if one exists).
     // Single-threaded per-shard: swap is atomic, no locking needed (D-14).
     #[cfg(feature = "text-index")]
-    if let Some(text_idx) = text_store.get_index_mut(name.as_ref()) {
+    if let Some(text_idx) = text_store.get_index_mut_for_db(name.as_ref(), db_index) {
         text_idx.build_fst();
         // Persist FST sidecar to disk so it survives server restart (FUZ-02).
         text_store.save_fst_sidecar_for_index(name.as_ref());
     }
 
-    // Return OK if either a vector index or text index exists with this name.
-    if store.get_index(&name).is_some() || text_store.get_index(name.as_ref()).is_some() {
+    // Return OK if either a vector index or text index exists with this name (db-scoped).
+    if store.get_index_for_db(&name, db_index).is_some()
+        || text_store
+            .get_index_for_db(name.as_ref(), db_index)
+            .is_some()
+    {
         Frame::SimpleString(Bytes::from_static(b"OK"))
     } else {
         Frame::Error(Bytes::from_static(b"Unknown Index name"))
@@ -157,10 +170,11 @@ pub fn ft_compact(
 
 /// FT._LIST
 ///
-/// Returns an array of all index names. Compatible with the Redis
-/// `FT._LIST` internal command used by tools and the Moon Console.
-pub fn ft_list(store: &VectorStore) -> Frame {
-    let names = store.index_names();
+/// Returns an array of all index names owned by the caller's currently
+/// SELECTed db (WS5a). Compatible with the Redis `FT._LIST` internal
+/// command used by tools and the Moon Console.
+pub fn ft_list(store: &VectorStore, db_index: u8) -> Frame {
+    let names = store.index_names_for_db(db_index);
     let elements: Vec<Frame> = names
         .into_iter()
         .map(|n| Frame::BulkString(n.clone()))

@@ -13,10 +13,21 @@ use super::{extract_bulk, matches_keyword, parse_u32};
 ///
 /// Parses the FT.CREATE syntax and creates a vector index in the store.
 /// args[0] = index_name, args[1..] = ON HASH PREFIX ... SCHEMA ...
+///
+/// `db_index` (WS5a) is the connection's currently-SELECTed logical db —
+/// the new index is bound to it. Index NAMES stay globally unique per
+/// shard (the underlying map is still keyed by name only): creating a
+/// name that already exists in ANY db — including the same db — errors
+/// with "Index already exists", exactly as it did before WS5a. An index's
+/// db binding is fixed at creation and is not itself namespaced; this is
+/// the documented WS5a design decision (see
+/// `.planning/v0.6.0-release/WS5A-NOTES.md` §2) traded for a minimal,
+/// non-invasive change over a composite `(db, name)` key.
 pub fn ft_create(
     store: &mut VectorStore,
     text_store: &mut crate::text::store::TextStore,
     args: &[Frame],
+    db_index: u8,
 ) -> Frame {
     // Relaxed: TEXT-only indexes need fewer args (e.g., FT.CREATE idx ON HASH PREFIX 1 doc: SCHEMA title TEXT = 9 args)
     if args.len() < 8 {
@@ -367,7 +378,7 @@ pub fn ft_create(
                 k1: bm25_k1,
                 b: bm25_b,
             };
-            let text_index = crate::text::store::TextIndex::new_with_schema(
+            let mut text_index = crate::text::store::TextIndex::new_with_schema(
                 index_name.clone(),
                 prefixes,
                 text_field_defs,
@@ -375,6 +386,7 @@ pub fn ft_create(
                 numeric_field_defs.clone(),
                 bm25_config,
             );
+            text_index.db_index = db_index;
             if let Err(e) = text_store.create_index(index_name, text_index) {
                 let mut buf = Vec::with_capacity(4 + e.len());
                 buf.extend_from_slice(b"ERR ");
@@ -440,13 +452,7 @@ pub fn ft_create(
         schema_fields,
         merge_mode: first_merge_mode,
         keep_raw: first_keep_raw,
-        // WS5a: `ft_create` does not yet receive the connection's selected
-        // db (see `.planning/v0.6.0-release/WS5A-NOTES.md` gap report for
-        // the exact threading path through `dispatch_vector_command` and
-        // its 3 dispatch-path call sites). Every index is tagged db 0 until
-        // that follow-up lands — behavior-preserving with pre-WS5a (global)
-        // semantics, NOT yet the db-scoped guarantee.
-        db_index: 0,
+        db_index,
     };
 
     let index_name_clone = meta.name.clone();
@@ -475,7 +481,7 @@ pub fn ft_create(
                     k1: bm25_k1,
                     b: bm25_b,
                 };
-                let text_index = crate::text::store::TextIndex::new_with_schema(
+                let mut text_index = crate::text::store::TextIndex::new_with_schema(
                     index_name_clone.clone(),
                     prefixes,
                     text_field_defs,
@@ -483,6 +489,7 @@ pub fn ft_create(
                     numeric_field_defs,
                     bm25_config,
                 );
+                text_index.db_index = db_index;
                 if let Err(e) = text_store.create_index(index_name_clone.clone(), text_index) {
                     // Log but don't fail — vector index already created
                     tracing::warn!("Failed to create text index: {}", e);

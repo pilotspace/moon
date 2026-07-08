@@ -16,6 +16,7 @@ pub fn ft_info(
     store: &VectorStore,
     text_store: &crate::text::store::TextStore,
     args: &[Frame],
+    db_index: u8,
 ) -> Frame {
     if args.len() != 1 {
         return Frame::Error(Bytes::from_static(
@@ -26,11 +27,11 @@ pub fn ft_info(
         Some(b) => b,
         None => return Frame::Error(Bytes::from_static(b"ERR invalid index name")),
     };
-    let idx = match store.get_index(&name) {
+    let idx = match store.get_index_for_db(&name, db_index) {
         Some(i) => i,
         None => {
-            // Check TextStore for TEXT-only indexes
-            if let Some(text_idx) = text_store.get_index(&name) {
+            // Check TextStore for TEXT-only indexes (db-scoped: WS5a)
+            if let Some(text_idx) = text_store.get_index_for_db(&name, db_index) {
                 return ft_info_text_only(text_idx, text_store);
             }
             return Frame::Error(Bytes::from_static(b"Unknown Index name"));
@@ -161,7 +162,8 @@ pub fn ft_info(
     items.push(Frame::Integer(store.version_token() as i64));
 
     // Hybrid index: append text field stats if this index also has a TextIndex
-    if let Some(text_idx) = text_store.get_index(&name) {
+    // (db-scoped: WS5a — same name in a different db must not leak in here).
+    if let Some(text_idx) = text_store.get_index_for_db(&name, db_index) {
         let mut text_field_entries: Vec<Frame> = Vec::with_capacity(text_idx.text_fields.len());
         for (i, field_def) in text_idx.text_fields.iter().enumerate() {
             let stats = &text_idx.field_stats[i];

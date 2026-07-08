@@ -51,6 +51,7 @@ pub(super) async fn try_handle_ft_command(
                 &ctx.shard_databases,
                 &ctx.dispatch_tx,
                 &ctx.spsc_notifiers,
+                conn.selected_db as u8,
             )
             .await;
             responses.push(response);
@@ -137,6 +138,7 @@ pub(super) async fn try_handle_ft_command(
                             &ctx.shard_databases,
                             &ctx.dispatch_tx,
                             &ctx.spsc_notifiers,
+                            conn.selected_db as u8,
                         )
                         .await;
                         let mut response = response;
@@ -241,6 +243,7 @@ pub(super) async fn try_handle_ft_command(
                                     &ctx.shard_databases,
                                     &ctx.dispatch_tx,
                                     &ctx.spsc_notifiers,
+                                    conn.selected_db as u8,
                                 )
                                 .await
                             }
@@ -265,6 +268,7 @@ pub(super) async fn try_handle_ft_command(
                 &ctx.shard_databases,
                 &ctx.dispatch_tx,
                 &ctx.spsc_notifiers,
+                conn.selected_db as u8,
             )
             .await;
             responses.push(response);
@@ -280,45 +284,53 @@ pub(super) async fn try_handle_ft_command(
                 &ctx.shard_databases,
                 &ctx.dispatch_tx,
                 &ctx.spsc_notifiers,
+                conn.selected_db as u8,
             )
             .await;
             responses.push(response);
             return true;
         }
         if cmd.eq_ignore_ascii_case(b"FT._LIST") {
+            let db_index = conn.selected_db as u8;
             let response = crate::shard::slice::with_shard(|s| {
-                crate::command::vector_search::ft_list(&s.vector_store)
+                crate::command::vector_search::ft_list(&s.vector_store, db_index)
             });
             responses.push(response);
             return true;
         }
         if cmd.eq_ignore_ascii_case(b"FT.COMPACT") {
+            let db_index = conn.selected_db as u8;
             let response = crate::shard::slice::with_shard(|s| {
                 crate::command::vector_search::ft_compact(
                     &mut s.vector_store,
                     &mut s.text_store,
                     cmd_args,
+                    db_index,
                 )
             });
             responses.push(response);
             return true;
         }
         if cmd.eq_ignore_ascii_case(b"FT.CACHESEARCH") {
+            let db_index = conn.selected_db as u8;
             let response = crate::shard::slice::with_shard(|s| {
                 crate::command::vector_search::cache_search::ft_cachesearch(
                     &mut s.vector_store,
                     cmd_args,
+                    db_index,
                 )
             });
             responses.push(response);
             return true;
         }
         if cmd.eq_ignore_ascii_case(b"FT.CONFIG") {
+            let db_index = conn.selected_db as u8;
             let response = crate::shard::slice::with_shard(|s| {
                 crate::command::vector_search::ft_config(
                     &mut s.vector_store,
                     &mut s.text_store,
                     cmd_args,
+                    db_index,
                 )
             });
             responses.push(response);
@@ -329,12 +341,14 @@ pub(super) async fn try_handle_ft_command(
             || cmd.eq_ignore_ascii_case(b"FT.NAVIGATE")
             || cmd.eq_ignore_ascii_case(b"FT.EXPAND")
         {
+            let db_index = conn.selected_db as u8;
             let response = crate::shard::slice::with_shard(|s| {
                 if cmd.eq_ignore_ascii_case(b"FT.RECOMMEND") {
                     crate::command::vector_search::recommend::ft_recommend(
                         &mut s.vector_store,
                         cmd_args,
-                        Some(&mut s.databases[0]),
+                        s.databases.get_mut(db_index as usize),
+                        db_index,
                     )
                 } else if cmd.eq_ignore_ascii_case(b"FT.NAVIGATE") {
                     #[cfg(feature = "graph")]
@@ -344,6 +358,7 @@ pub(super) async fn try_handle_ft_command(
                             Some(&s.graph_store),
                             cmd_args,
                             None,
+                            db_index,
                         )
                     }
                     #[cfg(not(feature = "graph"))]
@@ -376,6 +391,7 @@ pub(super) async fn try_handle_ft_command(
                 &ctx.shard_databases,
                 &ctx.dispatch_tx,
                 &ctx.spsc_notifiers,
+                conn.selected_db as u8,
             )
             .await;
             responses.push(response);
@@ -419,6 +435,7 @@ pub(super) async fn try_handle_ft_command(
                 &ctx.shard_databases,
                 &ctx.dispatch_tx,
                 &ctx.spsc_notifiers,
+                conn.selected_db as u8,
             )
             .await;
             responses.push(response);
@@ -478,6 +495,7 @@ pub(super) async fn try_handle_ft_command(
                                 crate::command::vector_search::parse_summarize_clause(cmd_args);
                             let need_hl = highlight_opts.is_some() || summarize_opts.is_some();
 
+                            let db_index = conn.selected_db as u8;
                             let mut response = crate::shard::slice::with_shard(|s| {
                                 #[cfg(feature = "text-index")]
                                 {
@@ -488,10 +506,11 @@ pub(super) async fn try_handle_ft_command(
                                         top_k,
                                         offset,
                                         count,
+                                        db_index,
                                     );
                                     if need_hl {
                                         if let Some(text_index) =
-                                            s.text_store.get_index(&index_name)
+                                            s.text_store.get_index_for_db(&index_name, db_index)
                                         {
                                             if let Ok(node) = crate::text::query::parse_query(
                                                 query_bytes.as_ref(),
@@ -565,14 +584,16 @@ pub(super) async fn try_handle_ft_command(
                     false
                 }
             });
+            let db_index = conn.selected_db as u8;
             let plan = crate::shard::slice::with_shard(|s| {
                 if has_session {
                     crate::command::vector_search::ft_search_capture(
                         &mut s.vector_store,
                         cmd_args,
-                        Some(&mut s.databases[0]),
+                        s.databases.get_mut(db_index as usize),
                         Some(&s.text_store),
                         as_of_lsn,
+                        db_index,
                     )
                 } else {
                     crate::command::vector_search::ft_search_capture(
@@ -581,6 +602,7 @@ pub(super) async fn try_handle_ft_command(
                         None,
                         Some(&s.text_store),
                         as_of_lsn,
+                        db_index,
                     )
                 }
             }); // shard-slice borrow released here — snapshot is owned ('static)
@@ -611,46 +633,58 @@ pub(super) async fn try_handle_ft_command(
             responses.push(response);
             return true;
         }
+        let db_index = conn.selected_db as u8;
         let response = crate::shard::slice::with_shard(|s| {
             if cmd.eq_ignore_ascii_case(b"FT.CREATE") {
                 crate::command::vector_search::ft_create(
                     &mut s.vector_store,
                     &mut s.text_store,
                     cmd_args,
+                    db_index,
                 )
             } else if cmd.eq_ignore_ascii_case(b"FT.DROPINDEX") {
                 crate::command::vector_search::ft_dropindex(
                     &mut s.vector_store,
                     &mut s.text_store,
-                    Some(&mut s.databases[0]),
+                    s.databases.get_mut(db_index as usize),
                     cmd_args,
+                    db_index,
                 )
             } else if cmd.eq_ignore_ascii_case(b"FT.INFO") {
-                crate::command::vector_search::ft_info(&s.vector_store, &s.text_store, cmd_args)
+                crate::command::vector_search::ft_info(
+                    &s.vector_store,
+                    &s.text_store,
+                    cmd_args,
+                    db_index,
+                )
             } else if cmd.eq_ignore_ascii_case(b"FT._LIST") {
-                crate::command::vector_search::ft_list(&s.vector_store)
+                crate::command::vector_search::ft_list(&s.vector_store, db_index)
             } else if cmd.eq_ignore_ascii_case(b"FT.COMPACT") {
                 crate::command::vector_search::ft_compact(
                     &mut s.vector_store,
                     &mut s.text_store,
                     cmd_args,
+                    db_index,
                 )
             } else if cmd.eq_ignore_ascii_case(b"FT.CACHESEARCH") {
                 crate::command::vector_search::cache_search::ft_cachesearch(
                     &mut s.vector_store,
                     cmd_args,
+                    db_index,
                 )
             } else if cmd.eq_ignore_ascii_case(b"FT.CONFIG") {
                 crate::command::vector_search::ft_config(
                     &mut s.vector_store,
                     &mut s.text_store,
                     cmd_args,
+                    db_index,
                 )
             } else if cmd.eq_ignore_ascii_case(b"FT.RECOMMEND") {
                 crate::command::vector_search::recommend::ft_recommend(
                     &mut s.vector_store,
                     cmd_args,
-                    Some(&mut s.databases[0]),
+                    s.databases.get_mut(db_index as usize),
+                    db_index,
                 )
             } else if cmd.eq_ignore_ascii_case(b"FT.NAVIGATE") {
                 #[cfg(feature = "graph")]
@@ -660,6 +694,7 @@ pub(super) async fn try_handle_ft_command(
                         Some(&s.graph_store),
                         cmd_args,
                         None,
+                        db_index,
                     )
                 }
                 #[cfg(not(feature = "graph"))]
@@ -680,7 +715,11 @@ pub(super) async fn try_handle_ft_command(
             } else if cmd.eq_ignore_ascii_case(b"FT.INVALIDATE_RANGE") {
                 #[cfg(feature = "text-index")]
                 {
-                    crate::command::vector_search::ft_invalidate_range(&mut s.text_store, cmd_args)
+                    crate::command::vector_search::ft_invalidate_range(
+                        &mut s.text_store,
+                        cmd_args,
+                        db_index,
+                    )
                 }
                 #[cfg(not(feature = "text-index"))]
                 {

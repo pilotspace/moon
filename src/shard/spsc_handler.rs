@@ -413,8 +413,11 @@ pub(crate) fn handle_shard_message_shared(
                                 || ((cmd.eq_ignore_ascii_case(b"FT.SEARCH")
                                     || cmd.eq_ignore_ascii_case(b"FT.NAVIGATE"))
                                     && has_session_keyword(&command));
+                            // WS5a: use the message's own selected db, not a
+                            // hardcoded db 0 — this is the ShardMessage::Execute
+                            // console-gateway path, which carries a real db_index.
                             let db_opt: Option<&mut crate::storage::db::Database> = if needs_db {
-                                Some(&mut s.databases[0])
+                                s.databases.get_mut(db_idx)
                             } else {
                                 None
                             };
@@ -425,6 +428,7 @@ pub(crate) fn handle_shard_message_shared(
                                 Some(&s.graph_store),
                                 &command,
                                 db_opt,
+                                db_idx as u8,
                             )
                         })
                     };
@@ -1876,6 +1880,7 @@ pub(crate) fn handle_shard_message_shared(
                 k,
                 as_of_lsn,
                 reply_tx,
+                db_index,
             } = *payload;
             // Phase 171 SCAT-01: honor coordinator-resolved AS_OF / TXN LSN
             // for multi-shard FT.SEARCH. When `as_of_lsn == 0` the filter is a
@@ -1883,6 +1888,7 @@ pub(crate) fn handle_shard_message_shared(
             // `search_local_filtered` with AS_OF threaded in to apply MVCC
             // filtering against the committed treemap inside `search_local_raw`.
             // Flat with_shard borrow — no outer borrow active, no re-entrancy.
+            // WS5a: db_index forwarded from the originating connection.
             let response = crate::shard::slice::with_shard(|s| {
                 vector_search::search_local_filtered(
                     &mut s.vector_store,
@@ -1894,6 +1900,7 @@ pub(crate) fn handle_shard_message_shared(
                     usize::MAX,
                     None,
                     as_of_lsn,
+                    db_index,
                 )
             });
             let _ = reply_tx.send(response);
@@ -2005,7 +2012,11 @@ pub(crate) fn handle_shard_message_shared(
                 let _ = reply_tx.send(response);
             }
         }
-        ShardMessage::VectorCommand { command, reply_tx } => {
+        ShardMessage::VectorCommand {
+            command,
+            reply_tx,
+            db_index,
+        } => {
             // All slice fields (vector_store, text_store, graph_store, databases)
             // acquired in one flat with_shard closure — no outer borrow active.
             let response = {
@@ -2015,9 +2026,11 @@ pub(crate) fn handle_shard_message_shared(
                         .map(|c| c.eq_ignore_ascii_case(b"FT.DROPINDEX"))
                         .unwrap_or(false);
                     let has_session = has_session_keyword(&command);
+                    // WS5a: db_index comes from the originating connection
+                    // (threaded through the message), not hardcoded db 0.
                     let db_opt: Option<&mut crate::storage::db::Database> =
                         if has_session || is_dropindex {
-                            Some(&mut s.databases[0])
+                            s.databases.get_mut(db_index as usize)
                         } else {
                             None
                         };
@@ -2028,6 +2041,7 @@ pub(crate) fn handle_shard_message_shared(
                         Some(&s.graph_store),
                         &command,
                         db_opt,
+                        db_index,
                     )
                 })
             };
@@ -2477,6 +2491,7 @@ pub(crate) fn dispatch_vector_command(
     #[cfg(feature = "graph")] graph_store: Option<&crate::graph::store::GraphStore>,
     command: &crate::protocol::Frame,
     db: Option<&mut crate::storage::db::Database>,
+    db_index: u8,
 ) -> crate::protocol::Frame {
     let (cmd, args) = match extract_command_static(command) {
         Some(pair) => pair,
@@ -2488,7 +2503,7 @@ pub(crate) fn dispatch_vector_command(
     };
 
     if cmd.eq_ignore_ascii_case(b"FT.CREATE") {
-        vector_search::ft_create(vector_store, text_store, args)
+        vector_search::ft_create(vector_store, text_store, args, db_index)
     } else if cmd.eq_ignore_ascii_case(b"FT.SEARCH") {
         // Check if this is a text query (no KNN/SPARSE markers) before
         // dispatching to the vector search path. Text queries are handled
@@ -2500,7 +2515,7 @@ pub(crate) fn dispatch_vector_command(
         if query_bytes.map_or(false, vector_search::is_text_query)
             && !vector_search::has_sparse_clause(args)
         {
-            return vector_search::ft_text_search(text_store, args);
+            return vector_search::ft_text_search(text_store, args, db_index);
         }
         // Existing vector search path (KNN / SPARSE / hybrid).
         #[cfg(feature = "graph")]
@@ -2512,20 +2527,21 @@ pub(crate) fn dispatch_vector_command(
                 db,
                 Some(text_store),
                 0,
+                db_index,
             )
         }
         #[cfg(not(feature = "graph"))]
         {
-            vector_search::ft_search(vector_store, args, db, Some(text_store), 0)
+            vector_search::ft_search(vector_store, args, db, Some(text_store), 0, db_index)
         }
     } else if cmd.eq_ignore_ascii_case(b"FT.DROPINDEX") {
-        vector_search::ft_dropindex(vector_store, text_store, db, args)
+        vector_search::ft_dropindex(vector_store, text_store, db, args, db_index)
     } else if cmd.eq_ignore_ascii_case(b"FT.INFO") {
-        vector_search::ft_info(vector_store, text_store, args)
+        vector_search::ft_info(vector_store, text_store, args, db_index)
     } else if cmd.eq_ignore_ascii_case(b"FT._LIST") {
-        vector_search::ft_list(vector_store)
+        vector_search::ft_list(vector_store, db_index)
     } else if cmd.eq_ignore_ascii_case(b"FT.COMPACT") {
-        vector_search::ft_compact(vector_store, text_store, args)
+        vector_search::ft_compact(vector_store, text_store, args, db_index)
     } else if cmd.eq_ignore_ascii_case(b"FT.AGGREGATE") {
         // FT.AGGREGATE (Phase 152, Plan 02) — linear else-if branch per W8.
         // D-19's phf reference is superseded by the established FT.* dispatch
@@ -2534,7 +2550,9 @@ pub(crate) fn dispatch_vector_command(
         #[cfg(feature = "text-index")]
         {
             match db.as_deref() {
-                Some(db_ref) => vector_search::ft_aggregate(vector_store, text_store, args, db_ref),
+                Some(db_ref) => {
+                    vector_search::ft_aggregate(vector_store, text_store, args, db_ref, db_index)
+                }
                 None => crate::protocol::Frame::Error(bytes::Bytes::from_static(
                     b"ERR FT.AGGREGATE requires Database access",
                 )),
@@ -2547,9 +2565,9 @@ pub(crate) fn dispatch_vector_command(
             ))
         }
     } else if cmd.eq_ignore_ascii_case(b"FT.CONFIG") {
-        vector_search::ft_config(vector_store, text_store, args)
+        vector_search::ft_config(vector_store, text_store, args, db_index)
     } else if cmd.eq_ignore_ascii_case(b"FT.CACHESEARCH") {
-        vector_search::cache_search::ft_cachesearch(vector_store, args)
+        vector_search::cache_search::ft_cachesearch(vector_store, args, db_index)
     } else if cmd.eq_ignore_ascii_case(b"FT.EXPAND") {
         #[cfg(feature = "graph")]
         {
@@ -2569,7 +2587,7 @@ pub(crate) fn dispatch_vector_command(
     } else if cmd.eq_ignore_ascii_case(b"FT.NAVIGATE") {
         #[cfg(feature = "graph")]
         {
-            vector_search::navigate::ft_navigate(vector_store, graph_store, args, db)
+            vector_search::navigate::ft_navigate(vector_store, graph_store, args, db, db_index)
         }
         #[cfg(not(feature = "graph"))]
         {
@@ -2578,13 +2596,13 @@ pub(crate) fn dispatch_vector_command(
             ))
         }
     } else if cmd.eq_ignore_ascii_case(b"FT.RECOMMEND") {
-        vector_search::recommend::ft_recommend(vector_store, args, db)
+        vector_search::recommend::ft_recommend(vector_store, args, db, db_index)
     } else if cmd.eq_ignore_ascii_case(b"FT.INVALIDATE_RANGE") {
         // FT.INVALIDATE_RANGE: bulk-delete by (TAG ∩ NUMERIC range); bumps text_version_token.
         // Requires text-index feature for TAG + NUMERIC bitmap indexes.
         #[cfg(feature = "text-index")]
         {
-            vector_search::ft_invalidate_range(text_store, args)
+            vector_search::ft_invalidate_range(text_store, args, db_index)
         }
         #[cfg(not(feature = "text-index"))]
         {
