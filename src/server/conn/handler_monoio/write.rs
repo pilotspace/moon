@@ -614,6 +614,13 @@ pub(super) async fn try_handle_multi_exec(
                     {
                         let commands: Vec<Frame> = conn.command_queue.to_vec();
                         conn.command_queue.clear();
+                        // Keep a copy of the body for CLIENT TRACKING
+                        // invalidation ONLY when tracking is active — the routed
+                        // reply carries results, not the command frames, and the
+                        // owner does not invalidate (the tracking table is
+                        // process-global; invalidation is issued originating-side).
+                        let tracking_cmds =
+                            crate::tracking::tracking_active().then(|| commands.clone());
                         let reply = crate::shard::coordinator::execute_txn_on_owner(
                             s,
                             ctx.shard_id,
@@ -644,6 +651,32 @@ pub(super) async fn try_handle_multi_exec(
                                                 crate::persistence::aof::AOF_FSYNC_ERR,
                                             )));
                                             return true;
+                                        }
+                                    }
+                                }
+                                // CLIENT TRACKING: invalidate every key written by
+                                // the routed body, same as the local EXEC path
+                                // (which the early return would otherwise skip).
+                                if let Some(cmds) = tracking_cmds.as_ref() {
+                                    if let Frame::Array(ref txn_results) = r.result {
+                                        for (i, cmd_frame) in cmds.iter().enumerate() {
+                                            if i >= txn_results.len()
+                                                || matches!(txn_results[i], Frame::Error(_))
+                                            {
+                                                continue;
+                                            }
+                                            if let Some((c, a)) =
+                                                crate::server::conn::util::extract_command(
+                                                    cmd_frame,
+                                                )
+                                            {
+                                                crate::tracking::invalidation::invalidate_after_write(
+                                                    &ctx.tracking_table,
+                                                    c,
+                                                    a,
+                                                    conn.client_id,
+                                                );
+                                            }
                                         }
                                     }
                                 }
