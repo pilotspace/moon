@@ -878,6 +878,112 @@ indexing); Moon still ingests 5.8–10.4× faster. (2) recall@10 dips 0.9992 →
 the index now serves from 3 segments instead of one (multi-segment beam truncation), a
 ~0.001 recall cost for the 2.3–4.6× faster time-to-green; still within 0.002 of Qdrant.
 
+### 10.10 2026-07-08 ANN-benchmarks 4-way: Moon vs RediSearch vs Qdrant vs turbovec (GCE ARM, 1.18M/1M vectors)
+
+First campaign on the **standard ANN-benchmarks datasets with bundled ground truth**
+(previous sections used synthetic/MiniLM corpora ≤50K). Full recall/QPS trade-off curves
+via the new runtime `FT.CONFIG SET <idx> EF_RUNTIME` (commit `0afac2c4`) — one ingest,
+one settled index, N query points.
+
+**Environment:** GCE t2a-standard-8 (ARM Ampere, 8 vCPU, us-central1-a), Moon
+`0afac2c4` (feat/vector-fastscan, `-C target-cpu=native`, monoio, `--shards 8
+--appendonly no --disk-offload disable --max-unflushed-immutable-segments 0`);
+RediSearch = `redis/redis-stack-server:latest` (Docker, HNSW M=16 EF_CONSTRUCTION=200);
+Qdrant = `qdrant/qdrant:latest` (Docker, default HNSW, wait-for-optimizer green);
+turbovec = github.com/RyanCodrai/turbovec (in-process Rust/Python TurboQuant flat index).
+Harness: redis-py / qdrant-client / native API, 1000 test queries, recall@10 vs bundled
+ground truth, qps1/qps8 = 1/8 client threads (no pipelining). Moon "settled" = ingest →
+green → `VACUUM VECTOR` merge loop to 1 segment/shard (8 total).
+
+#### glove-200-angular — 1,183,514 × 200d, COSINE, k=10
+
+| system | config | recall@10 | qps (1 client) | qps (8 clients) |
+|--------|--------|:---------:|:----:|:----:|
+| **Moon** (SQ8, settled) | ef=16 | 0.648 | **1448** | **2907** |
+| | ef=64 | 0.827 | **888** | **1899** |
+| | ef=128 | 0.887 | **612** | **1309** |
+| | ef=256 | 0.933 | **400** | **876** |
+| RediSearch | ef=16 | 0.496 | 2328 | 3618 |
+| | ef=64 | 0.694 | 1202 | 1704 |
+| | ef=128 | 0.771 | 816 | 1074 |
+| | ef=256 | 0.836 | 524 | 602 |
+| Qdrant | ef=16 | 0.570 | 410 | 574 |
+| | ef=64 | 0.768 | 335 | 544 |
+| | ef=256 | 0.887 | 214 | 426 |
+| turbovec | 4-bit | 0.875 | 63 | 62 |
+| | 2-bit | 0.625 | 105 | — |
+
+**Iso-recall verdicts (the only fair read):**
+
+- **vs RediSearch @ ~0.83 recall:** Moon 888/1899 vs 524/602 — **1.7× / 3.2× win**.
+  (RediSearch's 2328-qps ef=16 row is at 0.50 recall — not a comparable operating point.)
+- **vs Qdrant @ ~0.887 recall:** Moon 612/1309 vs 214/426 — **2.9× / 3.1× win**.
+- **vs turbovec @ ~0.875 recall:** Moon ~700+/1500+ vs 63/62 — **>10× win**; the flat
+  scan is O(N) and collapses at 1.18M vectors.
+
+**Time-to-ready** (same dataset): Moon ingest 165 s → **green (HNSW-tier, 0.85+ recall
+available) at 277 s**; RediSearch 1498 s; Qdrant ~390 s. Moon's *fully-settled* state
+(merge to 1 segment/shard) took a further ~61 min — see trade-offs below.
+
+#### glove subset 100K (turbovec's native scale), COSINE
+
+k=64 (turbovec's README config):
+
+| system | config | recall@64 | qps1 | qps8 |
+|--------|--------|:---------:|:----:|:----:|
+| **Moon** (SQ8, settled) | ef=64 | 0.886 | 647 | **1318** |
+| | ef=128 | 0.952 | 524 | 1103 |
+| | ef=512 | 0.998 | 272 | 639 |
+| turbovec | 4-bit | 0.895 | **760** | 781 |
+| | 2-bit | 0.663 | 1191 | 1243 |
+
+k=10:
+
+| system | config | recall@10 | qps1 | qps8 |
+|--------|--------|:---------:|:----:|:----:|
+| **Moon** (SQ8, settled) | ef=16 | 0.765 | 1787 | 3211 |
+| | ef=64 | **0.930** | **1076** | **2286** |
+| | ef=256 | 0.995 | 527 | 1139 |
+| turbovec | 4-bit | 0.877 | 787 | 802 |
+
+At k=10 Moon wins both axes (higher recall AND higher qps1, 2.9× qps8). At k=64 the
+in-process flat scan edges Moon on single-client qps (no network hop, cost amortized
+over large k) while Moon wins 8-client throughput 1.7× and is the only one that can
+reach >0.9 recall. turbovec gets no concurrency scaling (760 → 781).
+
+#### gist-960-euclidean — 1,000,000 × 960d, L2, k=10
+
+| system | config | recall@10 | qps1 | qps8 |
+|--------|--------|:---------:|:----:|:----:|
+| Qdrant | ef=16 | 0.624 | 264 | 390 |
+| | ef=64 | 0.861 | 215 | 371 |
+| | ef=256 | 0.965 | 134 | 314 |
+| Moon (SQ8) | | *run in progress* | | |
+| RediSearch | | *run in progress* | | |
+
+⚠ **Moon TQ4 on gist recorded recall 0.002–0.003 — a bug, not noise.** TQ4's
+norm²-scaled ADC assumes unit-sphere metrics; gist is unnormalized L2 and the estimator
+collapses. Filed for fix (metric guard at FT.CREATE or L2-faithful ADC); the Moon gist
+leg reruns on SQ8.
+
+#### Findings that changed Moon along the way
+
+1. **`EF_RUNTIME` was FT.CREATE-frozen** → recall/QPS curves needed one full index
+   rebuild per point. Now runtime-tunable via `FT.CONFIG SET` (also fixed FT.CONFIG SET
+   being silently local-shard-only under monoio at shards>1).
+2. **MA1 write-stall guard fires on TOTAL immutable segments (>20), not unflushed
+   ones** — a 1M+ bulk load sits above the threshold while merges lag, throttling
+   ingest to ~190 vec/s (24× slowdown) on idle hardware. Workaround
+   `--max-unflushed-immutable-segments 0` during bulk loads; semantics fix pending.
+3. **Unmerged segments multiply query cost**: per-query work ≈ shards × segments × ef.
+   Pre-settle (57 segments) the same index ran 4–5× slower at the same ef. `VACUUM
+   VECTOR` merges to 1 segment/shard but is local-shard-only over the wire and took
+   ~61 min for 1.18M vectors at only ~1.2 cores — GraphUnion merge parallelism is the
+   next optimization target.
+4. **Multi-segment search unions independent beams** → higher recall ceiling at equal
+   ef (unsettled ef=256: 0.9865 vs settled 0.933). The settled index needs ef 512+ to
+   reclaim the >0.95 band — at far higher qps than the unsettled equivalent.
+
 ---
 
 ## 11. Graph Engine

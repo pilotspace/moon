@@ -548,6 +548,7 @@ fn parse_vector_field_params(args: &[Frame], pos: &mut usize) -> Result<ParsedVe
     let mut hnsw_ef_runtime: u32 = 0;
     let mut compact_threshold: u32 = 0;
     let mut quantization = QuantizationConfig::TurboQuant4;
+    let mut quantization_explicit = false;
     let mut build_mode = crate::vector::turbo_quant::collection::BuildMode::Light;
     let mut merge_mode = crate::vector::segment::compaction::MergeMode::GraphUnion;
     let mut keep_raw = false;
@@ -671,6 +672,7 @@ fn parse_vector_field_params(args: &[Frame], pos: &mut usize) -> Result<ParsedVe
                     )));
                 }
             };
+            quantization_explicit = true;
             quantization = if val.eq_ignore_ascii_case(b"TQ1") {
                 QuantizationConfig::TurboQuant1
             } else if val.eq_ignore_ascii_case(b"TQ2") {
@@ -729,6 +731,26 @@ fn parse_vector_field_params(args: &[Frame], pos: &mut usize) -> Result<ParsedVe
             *pos += 1;
         } else {
             *pos += 1; // skip unknown param value
+        }
+    }
+
+    // TQ's ADC distance estimator is norm-scaled and assumes unit-sphere
+    // metrics (COSINE / IP). On unnormalized L2 data it collapses (recall
+    // < 0.01 measured on gist-960). The out-of-the-box combination of the
+    // L2 default metric + TQ4 default quantization must not be that trap:
+    // when the user did not explicitly pick a quantizer, L2 indexes default
+    // to SQ8 (per-vector affine quant, metric-faithful on raw L2). An
+    // explicit TQ choice is honored — the data may be unit-normalized, where
+    // L2 is monotonic with cosine — but warns.
+    if metric == DistanceMetric::L2 {
+        if !quantization_explicit {
+            quantization = QuantizationConfig::Sq8;
+        } else if quantization != QuantizationConfig::Sq8 {
+            tracing::warn!(
+                "FT.CREATE: TQ quantization with DISTANCE_METRIC L2 — TQ's \
+                 norm-scaled estimator degrades badly on unnormalized vectors; \
+                 use SQ8 unless the data is unit-normalized"
+            );
         }
     }
 
