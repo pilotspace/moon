@@ -373,13 +373,23 @@ single-purpose benchmark rigs.
 
 ## Vector search (FT.*)
 
-- `EF_RUNTIME` (per index) trades recall for QPS at query time.
+- `EF_RUNTIME` (per index) trades recall for QPS at query time — and is now
+  **runtime-tunable**: `FT.CONFIG SET <idx> EF_RUNTIME <n>` (10–4096, `0` = auto)
+  applies to the next `FT.SEARCH` immediately, persists across restarts, and needs no
+  index rebuild. Use it to walk the recall/QPS curve on a live index (e.g. drop ef
+  during traffic spikes, raise it for offline evaluation).
 - Set `COMPACT_THRESHOLD` at or above your expected dataset size if you want a single
   final compaction; explicit `FT.COMPACT` on a small mutable segment is a no-op below
   the threshold.
-- Match quantization to dimension: **SQ8** (or full-precision HNSW) for ≤ 384-d
-  embeddings; **TQ4** shines at 768-d and above. Validate recall with real embeddings,
-  not random vectors.
+- Match quantization to dimension **and metric**: **SQ8** (or full-precision HNSW) for
+  ≤ 384-d embeddings; **TQ4** shines at 768-d and above **but only on unit-sphere
+  metrics (COSINE / IP)** — on unnormalized L2 data (e.g. gist-960) TQ4's norm-scaled
+  distance estimator collapses (recall < 0.01 measured); use SQ8 for raw-L2 workloads.
+  Validate recall with real embeddings, not random vectors.
+- **Query cost scales with segment count**: each FT.SEARCH runs the full ef beam on
+  *every* graph segment on *every* shard (cost ≈ shards × segments × ef). An index
+  that accumulated 50+ segments during a bulk load answers the same query 4–5× slower
+  than the same index merged to 1 segment per shard. See the settle recipe below.
 - Details: [Vector search guide](../vector-search-guide.md).
 
 ## Vector bulk load and compaction
@@ -418,3 +428,25 @@ knob only in these cases:
   fires per shard, so bulk loads parallelize across shards automatically. Co-locate
   related vectors with hash tags only if you also do multi-key KV ops on them; vector
   search itself scatter-gathers across shards regardless.
+- **`--max-unflushed-immutable-segments 0` during million-scale bulk loads.** The
+  write-stall guard (default 20) counts **total** immutable segments, not just
+  unflushed ones. A 1M+ load accumulates segments faster than background merges retire
+  them, so the guard trips permanently and every write returns `MOONERR busy` —
+  measured 24× ingest slowdown (4,500 → 190 vec/s) on otherwise-idle hardware. Disable
+  it for the load, restore the default for steady-state serving (it exists to bound
+  memory under pathological churn). Loaders must still retry on `MOONERR busy` — it is
+  backpressure, not an error.
+- **Settle before latency-sensitive serving.** After a bulk load, merge each shard's
+  segments to one: `VACUUM VECTOR <idx>` force-merges all immutable segments
+  (recall-gated GraphUnion). Two caveats: (1) over the wire it acts on the
+  **connection's local shard only** — with SO_REUSEPORT per-shard listeners, issue it
+  over ~8× more fresh connections than shards and repeat until `FT.INFO
+  graph_segments` stops shrinking; (2) merging is currently slow at scale (~1 h for
+  1.18M × 200-d on 8 ARM vCPUs, largely single-threaded). The payoff on that dataset:
+  same index, same ef, **4–5× higher QPS** (e.g. 888 vs 336 qps at recall 0.83). The
+  index serves correct results throughout — settle when you can, not before you must.
+- **Merged indexes need higher ef for the same recall ceiling.** Multi-segment search
+  unions independent per-segment beams, so an unmerged index over-scans and reaches
+  higher recall at a given ef (0.9865 vs 0.933 at ef=256 on glove-1.18M). After
+  settling, raise `FT.CONFIG SET <idx> EF_RUNTIME` (e.g. 512) to reclaim the >0.95
+  band — still several× faster than the unmerged equivalent.

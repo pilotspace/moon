@@ -1403,6 +1403,62 @@ fn test_parse_ft_search_args_without_limit() {
     assert_eq!(count, usize::MAX);
 }
 
+#[test]
+fn test_ft_create_l2_defaults_to_sq8() {
+    let _metrics_guard = METRICS_LOCK.read();
+    use crate::vector::turbo_quant::collection::QuantizationConfig;
+
+    // L2 + no explicit QUANTIZATION → SQ8 (TQ's norm-scaled ADC collapses on
+    // unnormalized L2 data; recall < 0.01 measured on gist-960).
+    let mut store = VectorStore::new();
+    ft_create(
+        &mut store,
+        &mut crate::text::store::TextStore::new(),
+        &ft_create_args(),
+    );
+    #[allow(clippy::unwrap_used)] // index just created
+    let idx = store.get_index_mut(b"myidx").unwrap();
+    assert_eq!(idx.meta.quantization, QuantizationConfig::Sq8);
+
+    // COSINE + no explicit QUANTIZATION → TQ4 default unchanged.
+    let mut args = ft_create_args();
+    args[0] = bulk(b"cosidx");
+    let l2_pos = args
+        .iter()
+        .position(|f| matches!(f, Frame::BulkString(b) if b.as_ref() == b"L2"))
+        .expect("L2 arg present");
+    args[l2_pos] = bulk(b"COSINE");
+    let mut store2 = VectorStore::new();
+    ft_create(
+        &mut store2,
+        &mut crate::text::store::TextStore::new(),
+        &args,
+    );
+    #[allow(clippy::unwrap_used)] // index just created
+    let idx2 = store2.get_index_mut(b"cosidx").unwrap();
+    assert_eq!(idx2.meta.quantization, QuantizationConfig::TurboQuant4);
+
+    // Explicit TQ4 + L2 is honored (warns, not rejected).
+    let mut args3 = ft_create_args();
+    args3[0] = bulk(b"tq4idx");
+    let cnt_pos = args3
+        .iter()
+        .position(|f| matches!(f, Frame::BulkString(b) if b.as_ref() == b"6"))
+        .expect("param count present");
+    args3[cnt_pos] = bulk(b"8");
+    args3.push(bulk(b"QUANTIZATION"));
+    args3.push(bulk(b"TQ4"));
+    let mut store3 = VectorStore::new();
+    ft_create(
+        &mut store3,
+        &mut crate::text::store::TextStore::new(),
+        &args3,
+    );
+    #[allow(clippy::unwrap_used)] // index just created
+    let idx3 = store3.get_index_mut(b"tq4idx").unwrap();
+    assert_eq!(idx3.meta.quantization, QuantizationConfig::TurboQuant4);
+}
+
 // -- FT.CONFIG tests --
 
 #[test]
