@@ -210,6 +210,74 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cross-workspace KEYS non-leakage, FLUSHDB-is-whole-db pin), and a new
   `tests/db_maxmemory_quota.rs` real-server integration test.
 
+### Fixed — WS5a round 4: write-path db-isolation leak in auto-index/auto-delete hooks (adversarial review)
+
+A follow-up adversarial delta-review of round 3 (below) confirmed all of
+round 3's fixes, then found one more **CRITICAL, data-integrity-severity**
+gap: the auto-index/auto-unindex WRITE-path hooks were never db-scoped,
+despite the round-2 CHANGELOG entry (further below) explicitly claiming
+they were. Unlike the read-path leak fixed in round 3 (a foreign db could
+merely *see* another db's search results), this gap let a foreign db
+*corrupt or erase* another db's index contents — and it triggers at
+`--shards 1` (no multi-shard fan-out required):
+
+- **`auto_index_hset`** (`src/shard/spsc_handler.rs`, private; reached via
+  `auto_index_hset_public`/`_public_txn` from `handler_single.rs`,
+  `handler_monoio/mod.rs`, `handler_sharded/mod.rs`, `server/conn/shared.rs`,
+  and the sharded MULTI/EXEC replay path) called UNSCOPED
+  `vector_store.find_matching_index_names(key)` /
+  `text_store.find_matching_index_names(key)`. An `HSET` issued from ANY db
+  whose key happened to match another db's index PREFIX silently fed that
+  foreign index. Fixed via `find_matching_index_names_for_db`, with
+  `db_index: u8` threaded through both public wrappers and every call site
+  (`conn.selected_db as u8` / `sel_db as u8` / `db_idx as u8`, matching the
+  idiom already established for FLUSHDB scoping at each of those sites).
+- **`auto_delete_vectors`** (same file) called UNSCOPED
+  `vector_store.mark_deleted_for_key`, so a `DEL`/`UNLINK` issued from ANY
+  db could tombstone another db's vector entry for a same-named key — the
+  already-existing, already-unit-tested `mark_deleted_for_key_for_db` had
+  **zero production callers** before this fix. Now threaded the same way.
+- **`auto_hdel_vectors`** (bonus fix, same bug class, not explicitly named
+  by the review but caught while auditing the surrounding code): also
+  called unscoped `find_matching_index_names`; now uses
+  `find_matching_index_names_for_db`.
+- **The inline `DEL`/`UNLINK` unindex path** inside `ShardMessage::Execute`
+  (`spsc_handler.rs` ~line 747) called unscoped `mark_deleted_for_key`
+  directly (not through `auto_delete_vectors`) — fixed to
+  `mark_deleted_for_key_for_db(key, db_idx)`.
+- **Restart-time reconciliation** (`RecoveryState::reconcile_key` in
+  `src/vector/persistence/recover_v2.rs`, called from `event_loop.rs`'s
+  per-db rescan loop) had the SAME unscoped `find_matching_index_names`
+  call and delegated to the unscoped `auto_index_hset_public`. Left
+  unfixed, this would have silently RE-INTRODUCED the exact write-path leak
+  on every server restart even after the live-write fix above — closed by
+  threading `db_index: u8` through `reconcile_key`, sourced from
+  `event_loop.rs`'s existing `for db_idx in 0..db_count` loop (the caller
+  already had the right value; it just wasn't being passed in).
+- **Checked and cleared**: active expiry (`expire_cycle`/`expire_cycle_direct`
+  in `src/server/expiration.rs`, ticked per-db by `run_active_expiry` in
+  `src/shard/timers.rs`) and hash-field lazy/active expiry do not call any
+  vector/text unindex hook at all — `Database::remove` is a pure KV-layer
+  operation with no vector_store/text_store hook. There is therefore no
+  unscoped call to fix on the expiry path; this is a separate, pre-existing
+  "TTL'd keys never get unindexed at all" gap (vectors/text entries for an
+  expired key linger until an explicit DEL or HDEL), out of scope for a
+  db-isolation fix and not new in this pass.
+- New integration tests in `tests/vector_db_isolation.rs`:
+  `write_path_auto_index_does_not_leak_across_db` (FT.CREATE in db 0, HSET
+  of a prefix-matching key from db 5, assert db 0's `FT.INFO num_docs`
+  unchanged and FT.SEARCH does not return the foreign doc) and
+  `write_path_auto_delete_does_not_leak_across_db` (HSET in db 0, DEL of
+  the same key name from db 5, assert the db-0 document remains
+  searchable). Both verified RED against the unfixed hooks (real
+  cross-db corruption reproduced with the exact documented symptoms),
+  GREEN after the fix. Note: `FT.INFO num_docs` is `mutable_segment.len()`
+  (append-only; a tombstone doesn't decrement it), so the DEL-side test
+  asserts on `FT.SEARCH` hit count instead — an early draft of that
+  assertion only checked "not Nil", which a foreign-db tombstone's
+  empty-but-OK `[0]` result also satisfies, and silently passed against
+  the unfixed code; corrected to check for a real (`> 0`) hit count.
+
 ### Fixed — WS5a round 3: multi-shard text-search db-isolation leak + hardening (adversarial review)
 
 A fix-first adversarial review of round 2 (below) found the headline
@@ -290,9 +358,15 @@ dispatch paths (`handler_single`, `handler_sharded`/tokio,
   `get_index_for_db`/`get_index_mut_for_db` (or the equivalent scoped
   helper), no new hot-path allocations (same `O(n)` filter shape as the
   unscoped originals).
-- **Write-path scoping**: `auto_index_hset` (HSET auto-index hook) and the
-  DEL/HDEL/expiry auto-unindex hooks (`mark_deleted_for_key_for_db`) only
-  touch indexes bound to the write's db.
+- **Write-path scoping (claim corrected by round 4 below): this entry
+  originally claimed `auto_index_hset` and the DEL/HDEL auto-unindex hooks
+  only touched indexes bound to the write's db via
+  `mark_deleted_for_key_for_db`. That claim was FALSE — the round-4
+  adversarial review found `auto_index_hset`, `auto_delete_vectors`, and
+  `auto_hdel_vectors` all called their UNSCOPED counterparts
+  (`find_matching_index_names`/`mark_deleted_for_key`), and
+  `mark_deleted_for_key_for_db` had zero production callers at the time
+  this was written. See the "WS5a round 4" entry above for the actual fix.**
 - **Cross-shard scatter/broadcast fully threaded**: `ShardMessage::VectorCommand`
   and `VectorSearchPayload` now carry `db_index` across the SPSC boundary;
   `broadcast_vector_command`, `scatter_ft_info`, `scatter_invalidate_range`,
