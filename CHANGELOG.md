@@ -210,6 +210,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cross-workspace KEYS non-leakage, FLUSHDB-is-whole-db pin), and a new
   `tests/db_maxmemory_quota.rs` real-server integration test.
 
+### Fixed — WS5a round 3: multi-shard text-search db-isolation leak + hardening (adversarial review)
+
+A fix-first adversarial review of round 2 (below) found the headline
+"index created in db N is invisible from every other db" promise still
+had a **critical multi-shard gap**: `scatter_text_search` (the plain-text/
+BM25 FT.SEARCH scatter path), plus the remote legs of `scatter_hybrid_search`
+and `scatter_text_aggregate`, took no `db_index` at all — on `--shards >= 2`
+a connection on any db got real results from another db's TEXT index. Round
+2's own suite only spawned single-shard servers, so the bug was invisible
+to CI (single-shard scatter degenerates to the already-scoped local path).
+
+- **`scatter_text_search`** (`src/shard/coordinator.rs`) now threads
+  `db_index` through its `num_shards == 1` fast path AND its true
+  multi-shard DFS fan-out (both the local DocFreq/TextSearch legs and the
+  remote `DocFreq`/`TextSearch` SPSC legs), via new `db_index: u8` fields
+  on `TextSearchPayload`, `InvertedSearchPayload`, and a newly-boxed
+  `DocFreqPayload` (boxing was required to keep `ShardMessage` within its
+  64-byte cache-line cap after adding the field to the previously-inline
+  `DocFreq` variant). The dead `scatter_text_search_filter` was scoped the
+  same way rather than left as a latent unscoped copy.
+- **`scatter_hybrid_search`'s remote leg** and **`scatter_text_aggregate`'s
+  remote leg** — previously documented below as an open residual gap — are
+  now also `db_index`-scoped (`FtHybridPayload`/`TextAggregatePayload` gain
+  the field; `execute_hybrid_search_local_raw_streams` and
+  `execute_local_partial` take it as a parameter). **The "known gap" note
+  in the round-2 entry below is superseded: both legs are closed.**
+- **`VACUUM VECTOR`** (`src/command/server_admin.rs::vacuum_vector`) was an
+  unscoped existence oracle — any db could merge/compact/probe another
+  db's vector index by name. Now takes `db_index` and resolves ownership
+  via `get_index_for_db`/`get_index_mut_for_db` before any mutation or
+  existence check; the subsequent unscoped `needs_merge`/
+  `immutable_segment_count`/`force_merge_index` calls are safe unchanged
+  (index names are globally unique per shard, so an ownership check by
+  name is sufficient once performed).
+- **`--databases` is now bounded to 256** (`ServerConfig::MAX_DATABASES`,
+  `validate_databases_bound()`, checked unconditionally at both normal
+  boot and `--check-config`). Vector/text index db-scoping uses a `u8`
+  tag; an unbounded `--databases` (e.g. 300) silently aliased `SELECT 256`
+  onto db 0's indexes. Deliberately NOT widened to `u16` — 256 dbs is
+  already far beyond Redis's default of 16.
+- **New multi-shard coverage** in `tests/vector_db_isolation.rs`
+  (`--shards 4`): plain-text FT.SEARCH cross-db invisibility (the exact
+  finding-1 scenario), KNN cross-db invisibility, and FT._LIST scoping,
+  all under real multi-shard fan-out. Verified RED (real cross-db hits
+  leaked) against the unfixed `scatter_text_search`, GREEN after the fix.
+- Stale comments in `handler_monoio/ft.rs` / `handler_sharded/ft.rs` /
+  `coordinator.rs`'s test module claiming `execute_text_search_local` is
+  the multi-shard path were corrected — that function is dead code outside
+  its own unit tests; the real multi-shard path is `scatter_text_search`
+  → `run_text_query_on_index`.
+
 ### Fixed — WS5a: db-scoped vector/text index isolation (headline bug closed)
 
 Round 1 shipped only the data model (see below) — FT.CREATE still tagged
@@ -248,9 +299,11 @@ dispatch paths (`handler_single`, `handler_sharded`/tokio,
   `scatter_vector_search`/`_remote` all honor it. `scatter_hybrid_search`
   and `scatter_text_aggregate`'s multi-shard DFS legs honor it on the
   `num_shards == 1` fast path; the true multi-shard remote leg of hybrid
-  search and FT.AGGREGATE's `execute_local_partial` remain unscoped —
-  documented residual gap (affects only >1-shard deployments using those
-  two specific commands with db ≠ 0).
+  search and FT.AGGREGATE's `execute_local_partial`, **and the
+  plain-text/BM25 `scatter_text_search` scatter path itself, were left
+  fully unscoped** — a critical gap an adversarial review caught (single-
+  shard-only test coverage hid it). **Closed in the WS5a round 3 entry
+  above** — do not treat this note as still-open.
 - **Bonus fix found in the same code path**: `scatter_text_aggregate`'s
   single-shard fast path always hardcoded `s.databases.first()` (db 0)
   for `@field` value materialization regardless of the caller's SELECTed
