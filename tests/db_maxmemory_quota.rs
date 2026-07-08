@@ -42,15 +42,16 @@ fn free_port() -> u16 {
     }
 }
 
-/// Fresh `--dir` under `/private/tmp` per WS5b execution context (small,
-/// low-diskfull-risk, never the shared `/Volumes/Games` checkout volume).
+/// Fresh `--dir` under the OS temp dir (small, low-diskfull-risk, never the
+/// shared `/Volumes/Games` checkout volume). Must be portable: a hardcoded
+/// `/private/tmp` is macOS-only and fails PermissionDenied on Linux CI.
 fn test_tmpdir() -> tempfile::TempDir {
-    let base = std::path::PathBuf::from("/private/tmp/moon-db-maxmemory-quota-tests");
+    let base = std::env::temp_dir().join("moon-db-maxmemory-quota-tests");
     std::fs::create_dir_all(&base).expect("create test tmp base dir");
     tempfile::Builder::new()
         .prefix("dbmm-")
         .tempdir_in(&base)
-        .expect("tempdir_in /private/tmp/moon-db-maxmemory-quota-tests")
+        .expect("tempdir_in OS temp dir")
 }
 
 struct ServerGuard(Child);
