@@ -6,6 +6,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security — sharded MULTI/EXEC no longer silently misplaces cross-shard writes (Phase A, PR #TBD)
+
+- **`src/server/conn/{shared,handler_sharded/write,handler_monoio/write}.rs`**:
+  `execute_transaction_sharded` runs the whole queued body on the connection's
+  OWN shard with no per-key routing, so at `--shards ≥ 2` a key owned by another
+  shard was silently written to / read from the wrong shard's table — EXEC
+  reported success while the data diverged (silent lost updates; other
+  connections routing to the true owner saw nothing). Hash tags did **not** help:
+  they co-locate keys with each other but not with the (random, SO_REUSEPORT)
+  execution shard, and migration is disabled during MULTI. A new
+  `analyze_txn_locality` classifies the queued body via the command-metadata key
+  specs + `key_to_shard`; EXEC now **rejects** with `CROSSSLOT` any transaction
+  whose keys aren't all owned by the executing shard, instead of corrupting.
+  Invariant restored: *EXEC-success ⇒ every write is visible to other
+  connections; CROSSSLOT ⇒ nothing was written.* No effect at `--shards 1`.
+  Red/green: `tests/sharded_multi_exec_locality.rs` (silent-divergence invariant,
+  multi-shard span rejection, single-shard unaffected) + `analyze_txn_locality`
+  unit tests. Phase B (route a single-owner-shard body to its owner so
+  hash-tagged transactions work from any connection) is a follow-up. Note found
+  in passing (unrelated, out of scope): a *solo* GET sent mid-MULTI on the monoio
+  single-shard handler executes immediately instead of queueing.
+
 ### Docs — tuning guide: vector bulk load & compaction (PR #TBD)
 
 - `docs/guides/tuning.md`: new "Vector bulk load and compaction" section — documents

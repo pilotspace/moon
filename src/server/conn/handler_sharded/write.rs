@@ -542,6 +542,34 @@ pub(super) fn try_handle_multi_exec(
             responses.push(Frame::Error(Bytes::from_static(b"ERR EXEC without MULTI")));
         } else {
             conn.in_multi = false;
+            // Phase A safety floor: the body runs on THIS shard with no per-key
+            // routing, so a foreign-owned key would be silently misplaced.
+            // Reject rather than corrupt when the keys aren't all local.
+            // (Phase B routes a single-remote-shard body to its owner instead.)
+            if ctx.num_shards > 1 {
+                match crate::server::conn::shared::analyze_txn_locality(
+                    &conn.command_queue,
+                    ctx.num_shards,
+                ) {
+                    crate::server::conn::shared::TxnLocality::SingleShard(s)
+                        if s != ctx.shard_id =>
+                    {
+                        conn.command_queue.clear();
+                        responses.push(Frame::Error(Bytes::from_static(
+                            b"CROSSSLOT MULTI/EXEC keys are owned by another shard; co-locate them with a hash tag {tag} or use --shards 1",
+                        )));
+                        return true;
+                    }
+                    crate::server::conn::shared::TxnLocality::CrossShard => {
+                        conn.command_queue.clear();
+                        responses.push(Frame::Error(Bytes::from_static(
+                            b"CROSSSLOT Keys in MULTI/EXEC don't hash to the same shard",
+                        )));
+                        return true;
+                    }
+                    _ => {}
+                }
+            }
             let result = execute_transaction_sharded(
                 &ctx.shard_databases,
                 ctx.shard_id,
